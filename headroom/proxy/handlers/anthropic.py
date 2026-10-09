@@ -54,6 +54,7 @@ from headroom.proxy.buffered_ccr_response import (
 )
 from headroom.proxy.compression_decision import CompressionDecision
 from headroom.proxy.handlers._debug_dump import _debug_dump_mode, _redact_debug_value
+from headroom.proxy.handlers._hook_failures import log_hook_failure
 from headroom.proxy.helpers import (
     extract_tags,
     invalid_request_body_message,
@@ -337,8 +338,13 @@ def _dump_prefix_mismatch(request_id: str, current: list, previous: list) -> Non
                 fh,
                 default=str,
             )
-    except Exception:  # noqa: BLE001 - debug aid only
-        pass
+    except Exception:  # noqa: BLE001 - debug aid only, never fails the request
+        logger.warning(
+            "[%s] prefix_mismatch_debug dump to %s failed",
+            request_id,
+            os.environ.get("HEADROOM_DEBUG_PREFIX_MISMATCH"),
+            exc_info=True,
+        )
 
 
 class AnthropicHandlerMixin:
@@ -1633,7 +1639,7 @@ class AnthropicHandlerMixin:
                 try:
                     messages = self.config.hooks.pre_compress(messages, _hook_ctx)
                 except Exception as e:
-                    logger.debug(f"[{request_id}] pre_compress hook error: {e}")
+                    log_hook_failure(request_id, "pre_compress", e)
             else:
                 _hook_ctx = None
 
@@ -2327,8 +2333,12 @@ class AnthropicHandlerMixin:
                             # enabled" with Before == After (issue #2357).
                             tags["passthrough_reason"] = "cache_mode_prefix_mismatch"
                             logger.info(
-                                "[%s] Compression skipped: reason=cache_mode_prefix_mismatch",
+                                "[%s] Compression skipped: reason=cache_mode_prefix_mismatch "
+                                "model=%s current_len=%d previous_len=%d",
                                 request_id,
+                                model,
+                                len(original_client_messages),
+                                len(previous_original_messages),
                             )
                             if os.environ.get("HEADROOM_DEBUG_PREFIX_MISMATCH"):
                                 _dump_prefix_mismatch(
@@ -2575,7 +2585,7 @@ class AnthropicHandlerMixin:
                         )
                     )
                 except Exception as e:
-                    logger.debug(f"[{request_id}] post_compress hook error: {e}")
+                    log_hook_failure(request_id, "post_compress", e)
 
             # CCR Tool Injection: Inject retrieval tool if compression occurred
             # OR if this session has previously done CCR (PR-B7 sticky-on).
@@ -3094,6 +3104,11 @@ class AnthropicHandlerMixin:
                 try:
                     return tokenizer.count_text(json.dumps(value, default=str))
                 except Exception:
+                    logger.debug(
+                        "[%s] tool token count failed; tool savings not counted",
+                        request_id,
+                        exc_info=True,
+                    )
                     return 0
 
             _tools_compaction_started = time.time()
@@ -4550,7 +4565,8 @@ class AnthropicHandlerMixin:
 
                                 # Reuse main client for CCR continuations (connection pooling)
                                 logger.info(
-                                    f"CCR: Making continuation request with {len(msgs)} messages"
+                                    f"[{request_id}] CCR: Making continuation request "
+                                    f"with {len(msgs)} messages"
                                 )
                                 assert self.http_client is not None, "HTTP client not initialized"
                                 # Byte-faithful (PR-A3, fixes P0-2). The CCR
@@ -4589,6 +4605,7 @@ class AnthropicHandlerMixin:
                                     request_id=request_id,
                                     source=ccr_outbound_source,
                                 )
+                                cont_response: httpx.Response | None = None
                                 try:
                                     cont_response = await self.http_client.post(
                                         url,
@@ -4597,7 +4614,8 @@ class AnthropicHandlerMixin:
                                         timeout=self._anthropic_buffered_request_timeout(),
                                     )
                                     logger.info(
-                                        f"CCR: Got response status={cont_response.status_code}, "
+                                        f"[{request_id}] CCR: Got response "
+                                        f"status={cont_response.status_code}, "
                                         f"content-encoding={cont_response.headers.get('content-encoding')}"
                                     )
                                     if not 200 <= cont_response.status_code < 300:
@@ -4606,16 +4624,22 @@ class AnthropicHandlerMixin:
                                             f"{cont_response.status_code}"
                                         )
                                     result: dict[str, Any] = cont_response.json()
-                                    logger.info("CCR: Parsed JSON successfully")
+                                    logger.info(f"[{request_id}] CCR: Parsed JSON successfully")
                                     return result
                                 except Exception as e:
-                                    resp_headers: str | dict[str, str] = "N/A"
-                                    try:
-                                        resp_headers = dict(cont_response.headers)
-                                    except Exception:
-                                        pass
+                                    # Status and the upstream request id only:
+                                    # the other response headers are not ours
+                                    # to copy into a log.
+                                    upstream_request_id = (
+                                        cont_response.headers.get("request-id")
+                                        if cont_response is not None
+                                        else None
+                                    )
                                     logger.error(
-                                        f"CCR: API call failed: {e}, response headers: {resp_headers}"
+                                        f"[{request_id}] CCR: API call failed: "
+                                        f"{type(e).__name__}: {e} "
+                                        f"status={getattr(cont_response, 'status_code', None)} "
+                                        f"upstream_request_id={upstream_request_id}"
                                     )
                                     raise
 
@@ -5443,8 +5467,15 @@ class AnthropicHandlerMixin:
                 raise
             except Exception as e:
                 await self.metrics.record_failed(provider=provider_name)
-                # Log full error details internally for debugging
-                logger.error(f"[{request_id}] Request failed: {type(e).__name__}: {e}")
+                # Log full error details internally for debugging. `model` is
+                # unbound when the failure precedes body parsing. Upstream
+                # transport errors are one line; anything else is a bug and
+                # gets its traceback.
+                logger.error(
+                    f"[{request_id}] Request failed: provider={provider_name} "
+                    f"model={locals().get('model')} {type(e).__name__}: {e}",
+                    exc_info=not isinstance(e, httpx.HTTPError),
+                )
 
                 # An untrusted TLS-inspection root is the one failure worth
                 # spelling out: it is environmental, never transient, and the
@@ -5956,7 +5987,10 @@ class AnthropicHandlerMixin:
 
         except Exception as e:
             await self.metrics.record_failed(provider="anthropic")
-            logger.error(f"[{request_id}] Batch request failed: {type(e).__name__}: {e}")
+            logger.error(
+                f"[{request_id}] Anthropic batch request failed: {type(e).__name__}: {e}",
+                exc_info=not isinstance(e, httpx.HTTPError),
+            )
             return JSONResponse(
                 status_code=502,
                 content={

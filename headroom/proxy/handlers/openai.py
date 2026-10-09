@@ -26,6 +26,7 @@ from typing import TYPE_CHECKING, Any
 from urllib.parse import quote, unquote, urlparse
 
 from headroom.proxy.conversation_savings import savings_conversation_key
+from headroom.proxy.handlers._hook_failures import log_hook_failure
 from headroom.proxy.helpers import (
     COMPRESSION_TIMEOUT_SECONDS,
     _headroom_bypass_enabled,
@@ -3118,7 +3119,11 @@ class OpenAIHandlerMixin:
                 )
                 _add_timing("compression_tool_schema_token_count", tool_token_started)
             except Exception:
-                pass
+                logger.debug(
+                    "[%s] tool schema compaction token count failed; savings not counted",
+                    request_id,
+                    exc_info=True,
+                )
             if debug_enabled:
                 _log_codex_compression_debug(
                     "codex_tool_schema_compaction",
@@ -3158,7 +3163,11 @@ class OpenAIHandlerMixin:
                             - tokenizer.count_text(_json_debug_dumps(working.get("tools"))),
                         )
                     except Exception:
-                        pass
+                        logger.debug(
+                            "[%s] tool desc compaction token count failed; savings not counted",
+                            request_id,
+                            exc_info=True,
+                        )
                     if debug_enabled:
                         _log_codex_compression_debug(
                             "codex_tool_desc_compaction",
@@ -3171,7 +3180,11 @@ class OpenAIHandlerMixin:
                             tools_bytes_saved=desc_before - desc_after,
                         )
         except Exception:
-            pass
+            logger.warning(
+                "[%s] tool desc compaction step failed",
+                request_id,
+                exc_info=True,
+            )
 
         # Server-side Tool Search deferral (OpenAI Responses, gpt-5.4+): mark
         # non-core function/MCP tools defer_loading + inject {"type": "tool_search"}
@@ -3294,7 +3307,11 @@ class OpenAIHandlerMixin:
                     if _mt_after < _mt_before:
                         tokens_saved += _mt_before - _mt_after
                 except Exception:
-                    pass
+                    logger.debug(
+                        "[%s] turn-hook message fold token count failed; savings not counted",
+                        request_id,
+                        exc_info=True,
+                    )
             modified = True
             transforms.append("openai:responses:turn_hook")
 
@@ -3345,7 +3362,11 @@ class OpenAIHandlerMixin:
                     attempted_token_started,
                 )
             except Exception:
-                pass
+                logger.debug(
+                    "[%s] tool schema attempted-token count failed",
+                    request_id,
+                    exc_info=True,
+                )
 
         dedupe_started = time.perf_counter()
         deduped: list[str] = []
@@ -4032,7 +4053,7 @@ class OpenAIHandlerMixin:
                 _hook_biases = self.config.hooks.compute_biases(messages, _hook_ctx)
                 _hook_protect = collect_protected(self.config.hooks, messages, _hook_ctx)
             except Exception as e:
-                logger.debug(f"[{request_id}] Hook error: {e}")
+                log_hook_failure(request_id, "pre_compress/compute_biases/protect_messages", e)
 
         # x-headroom-keep-last-turns: N — trim history before optimization.
         # Consumed here (after bypass check, after _strip_internal_headers)
@@ -4437,7 +4458,7 @@ class OpenAIHandlerMixin:
                     )
                 )
             except Exception as e:
-                logger.debug(f"[{request_id}] post_compress hook error: {e}")
+                log_hook_failure(request_id, "post_compress", e)
 
         # CCR Tool Injection: Inject retrieval tool if compression occurred
         # OR if this session has previously done CCR (PR-B7 sticky-on).
@@ -5260,7 +5281,11 @@ class OpenAIHandlerMixin:
                                 ),
                             )
                     except Exception:
-                        pass
+                        logger.debug(
+                            "[%s] cache observation (openai chat, backend) failed",
+                            request_id,
+                            exc_info=True,
+                        )
 
                     openai_prefix_tracker.update_from_response(
                         cache_read_tokens=cache_read_tokens,
@@ -5760,7 +5785,11 @@ class OpenAIHandlerMixin:
                             ),
                         )
                 except Exception:
-                    pass
+                    logger.debug(
+                        "[%s] cache observation (openai chat, direct) failed",
+                        request_id,
+                        exc_info=True,
+                    )
 
                 openai_prefix_tracker.update_from_response(
                     cache_read_tokens=cache_read_tokens,
@@ -5954,7 +5983,11 @@ class OpenAIHandlerMixin:
         except Exception as e:
             await self.metrics.record_failed(provider=openai_chat_outcome_provider)
             # Log full error details internally for debugging
-            logger.error(f"[{request_id}] OpenAI request failed: {type(e).__name__}: {e}")
+            logger.error(
+                f"[{request_id}] OpenAI request failed: provider={openai_chat_outcome_provider} "
+                f"model={model} {type(e).__name__}: {e}",
+                exc_info=not isinstance(e, httpx.HTTPError),
+            )
             # Return sanitized error message to client (don't expose internal details)
             return JSONResponse(
                 status_code=502,
@@ -7391,7 +7424,11 @@ class OpenAIHandlerMixin:
             return await _buffered_ccr_operation()
         except Exception as e:
             await self.metrics.record_failed(provider="openai")
-            logger.error(f"[{request_id}] OpenAI responses request failed: {type(e).__name__}: {e}")
+            logger.error(
+                f"[{request_id}] OpenAI responses request failed: model={model} "
+                f"{type(e).__name__}: {e}",
+                exc_info=not isinstance(e, httpx.HTTPError),
+            )
             return JSONResponse(
                 status_code=502,
                 content={

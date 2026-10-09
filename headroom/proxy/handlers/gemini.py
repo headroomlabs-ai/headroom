@@ -12,6 +12,8 @@ import time
 from typing import TYPE_CHECKING, Any
 from urllib.parse import unquote_plus
 
+import httpx
+
 if TYPE_CHECKING:
     from fastapi import Request
     from fastapi.responses import JSONResponse, Response, StreamingResponse
@@ -1116,7 +1118,11 @@ class GeminiHandlerMixin:
             return Response(content=e.content, status_code=e.status_code, headers=response_headers)
         except Exception as e:
             await self.metrics.record_failed(provider=provider_name)
-            logger.error(f"[{request_id}] Gemini request failed: {type(e).__name__}: {e}")
+            logger.error(
+                f"[{request_id}] Gemini request failed: provider={provider_name} model={model} "
+                f"{type(e).__name__}: {e}",
+                exc_info=not isinstance(e, httpx.HTTPError),
+            )
             return JSONResponse(
                 status_code=502,
                 content={
@@ -1586,7 +1592,11 @@ class GeminiHandlerMixin:
             )
         except Exception as e:
             await self.metrics.record_failed(provider=provider_name)
-            logger.error(f"[{request_id}] Gemini countTokens failed: {type(e).__name__}: {e}")
+            logger.error(
+                f"[{request_id}] Gemini countTokens failed: provider={provider_name} "
+                f"model={model} {type(e).__name__}: {e}",
+                exc_info=not isinstance(e, httpx.HTTPError),
+            )
             return JSONResponse(
                 status_code=502,
                 content={

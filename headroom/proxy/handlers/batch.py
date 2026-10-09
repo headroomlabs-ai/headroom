@@ -10,6 +10,8 @@ import logging
 import time
 from typing import TYPE_CHECKING, Any
 
+import httpx
+
 if TYPE_CHECKING:
     from fastapi import Request
     from fastapi.responses import Response
@@ -392,7 +394,11 @@ class BatchHandlerMixin:
             )
 
         except Exception as e:
-            logger.error(f"[{request_id}] Google batch request failed: {e}")
+            logger.error(
+                f"[{request_id}] Google batch request failed: model={model} "
+                f"{type(e).__name__}: {e}",
+                exc_info=not isinstance(e, httpx.HTTPError),
+            )
             return JSONResponse(
                 status_code=500,
                 content={
