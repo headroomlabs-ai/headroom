@@ -268,6 +268,37 @@ class TestDetectWasteSignals:
         assert signals.base64_tokens == 0
         assert signals.json_bloat_tokens == 0
 
+    def test_html_comment_counted_once(self, mock_tokenizer):
+        """A comment matches both HTML_TAG_PATTERN and HTML_COMMENT_PATTERN;
+        it must contribute its token count once, not twice."""
+        comment = "<!--" + "x" * 600 + "-->"
+        text = "before " + comment + " after"
+        signals = detect_waste_signals(text, mock_tokenizer)
+        assert signals.html_noise_tokens == (len(comment) // 4 + 1)
+
+    def test_tags_inside_comments_not_counted(self, mock_tokenizer):
+        """Tags inside a comment are part of the comment, not extra noise."""
+        comment = '<!-- <img src="diagram.png" alt="chart"> -->'
+        text = "text " + comment + " end"
+        signals = detect_waste_signals(text, mock_tokenizer)
+        assert signals.html_noise_tokens == (len(comment) // 4 + 1)
+
+    def test_mixed_tags_and_comments_counted_once_each(self, mock_tokenizer):
+        """Plain tags and comments each contribute exactly once."""
+        tag_open = '<div class="a">'
+        tag_close = "</div>"
+        comment = "<!-- note -->"
+        text = tag_open + "content" + tag_close + comment + tag_open + "more" + tag_close
+        signals = detect_waste_signals(text, mock_tokenizer)
+        expected = 2 * len(tag_open) + 2 * len(tag_close) + len(comment)
+        assert signals.html_noise_tokens == (expected // 4 + 1)
+
+    def test_plain_tags_unchanged(self, mock_tokenizer):
+        """Regular tags keep their existing count when no comments are present."""
+        text = "<div>Hello</div>"
+        signals = detect_waste_signals(text, mock_tokenizer)
+        assert signals.html_noise_tokens == (len("<div>") + len("</div>")) // 4 + 1
+
 
 # --- TestIsRagContent ---
 

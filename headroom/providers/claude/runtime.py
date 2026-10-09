@@ -159,6 +159,24 @@ def remote_control_gate_message(source: str, *, version: tuple[int, int, int] | 
     )
 
 
+def remote_control_gate_short_message(*, version: tuple[int, int, int] | None = None) -> str:
+    """One-line Remote Control notice for the default ``wrap claude`` banner (#3426).
+
+    Same accuracy rule as :func:`remote_control_gate_message` (issue #1779):
+    with a known gated version state the disable as fact; with an unknown
+    version name the threshold rather than assert the user's build.
+    """
+    scope = (
+        ""
+        if version is not None and version >= REMOTE_CONTROL_GATED_MIN_VERSION
+        else f" on Claude Code {_version_str(REMOTE_CONTROL_GATED_MIN_VERSION)}+"
+    )
+    return (
+        f"{REMOTE_CONTROL_FEATURE} (/rc) is disabled{scope} while routed through "
+        "Headroom — run `claude` directly (no wrap) for sessions that need it."
+    )
+
+
 def is_custom_anthropic_base_url(value: str | None) -> bool:
     """Return whether ANTHROPIC_BASE_URL is custom from Claude's Remote Control gate view.
 

@@ -150,6 +150,9 @@ class ProxyConfig:
     # Server
     host: str = "127.0.0.1"
     port: int = 8787
+    # Serve on this Unix domain socket instead of host:port. POSIX only; see
+    # headroom/proxy/uds.py for why a socket transport exists at all (GH #1779).
+    uds: str | None = None
     # Resolved at this configuration boundary and then injected unchanged.
     rollout: RolloutSnapshot | None = None
     anthropic_api_url: str | None = None  # Custom Anthropic API URL override
@@ -283,8 +286,10 @@ class ProxyConfig:
     # prefix-cache zone. Enable for OpenAI/Azure chat workloads where the bulk
     # of input lives in user messages (pasted code/text, RAG context) and the
     # router would otherwise have nothing eligible to compress.
-    # CLI: --compress-user-messages; env: HEADROOM_COMPRESS_USER_MESSAGES=1.
-    compress_user_messages: bool = False
+    # None follows the savings profile (`coding` turns it on); an explicit
+    # True/False overrides the profile either way.
+    # CLI: --compress-user-messages; env: HEADROOM_COMPRESS_USER_MESSAGES=1/0.
+    compress_user_messages: bool | None = None
     # Named savings policy shared across Claude/Codex/Cursor proxy handlers.
     # CLI/env: HEADROOM_SAVINGS_PROFILE=agent-90.
     savings_profile: str | None = None
@@ -307,8 +312,8 @@ class ProxyConfig:
     # Read lifecycle management
     read_lifecycle: bool = True
 
-    # Mechanism B: activity-based read maturation (hold fresh Reads out of
-    # the provider prefix cache; compress once their file quiesces).
+    # Mechanism B: activity-based read maturation (hold fresh Reads
+    # verbatim; compress once their file quiesces, unless already cached).
     # Experimental — default off. CLI: --read-maturation;
     # env: HEADROOM_READ_MATURATION=1
     read_maturation: bool = False
