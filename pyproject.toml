@@ -325,7 +325,9 @@ dev = [
     "cryptography>=50.0.0",
     "respx>=0.20.0",    # HTTP mock transport for passthrough handler tests
 ]
-# All optional dependencies (everything you need).
+# All optional dependencies for the default CLI/proxy feature set.
+# PyTorch-backed features stay opt-in because Linux PyPI wheels include CUDA
+# runtime packages and dependency metadata cannot detect installed hardware.
 #
 # The EleutherAI lm-evaluation-harness is intentionally not exposed as a
 # project extra. Headroom invokes it as an external subprocess
@@ -335,24 +337,9 @@ dev = [
 # who need standard accuracy benchmarks can install `lm-eval[api]` in their
 # benchmark environment separately.
 all = [
-    "headroom-ai[proxy,code,ml,memory,relevance,image,reports,otel,evals,voice,html,mcp,spreadsheet]",
+    "headroom-ai[proxy,code,relevance,image,reports,otel,html,mcp,spreadsheet]",
 ]
-# Sandbox: a lean proxy with ALL torch-free capability — for running Headroom in
-# a locked-down/low-resource sandbox and offloading heavy ML elsewhere.
-#
-# = [all] MINUS:
-#   - image  (SigLIP/OCR — excluded by request)
-#   - ml     (torch — the PyTorch Kompress backend; ONNX path in [proxy] still
-#             runs Kompress locally with no torch, or offload it entirely via
-#             HEADROOM_KOMPRESS_ENDPOINT)
-#   - voice  (excluded by request)
-#   - memory + evals  (both pull sentence-transformers -> torch, i.e. the very
-#             ML weight a sandbox avoids; evals is a dev/test harness, not a
-#             runtime feature). Opt back in explicitly if you accept torch:
-#             pip install headroom-ai[sandbox,memory]
-#
-# Everything kept here is torch-free: code-aware compression (tree-sitter),
-# embedding relevance (fastembed), HTML/spreadsheet ingestion, reports, OTel.
+# Lean torch-free profile for constrained environments that offload heavy ML.
 sandbox = [
     "headroom-ai[proxy,code,relevance,reports,otel,html,mcp,spreadsheet]",
 ]
