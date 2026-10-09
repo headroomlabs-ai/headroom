@@ -49,9 +49,6 @@ logger = logging.getLogger(__name__)
 
 _DEFAULT_POLL_INTERVAL_S = 300
 _DEFAULT_ACTIVE_WINDOW_S = 60
-_PERSIST_FILE_ENV = _paths.HEADROOM_SUBSCRIPTION_STATE_PATH_ENV
-_DEFAULT_PERSIST_DIR = ".headroom"
-_DEFAULT_PERSIST_FILE = "subscription_state.json"
 
 # Singleton on-demand poll floor (seconds): the dashboard may request a fresh
 # poll if the cached snapshot is stale, but we cap how often we will actually
@@ -127,7 +124,6 @@ class SubscriptionTracker(QuotaTracker):
         self._lock = threading.Lock()
         self._state = SubscriptionState()
         self._current_token: str | None = None
-        self._full_tokens: dict[str, int] = {}  # token_prefix -> count of requests
 
         self._stop_event: asyncio.Event | None = None
         self._poll_task: asyncio.Task[None] | None = None
@@ -200,8 +196,6 @@ class SubscriptionTracker(QuotaTracker):
             if not from_local_operator:
                 return
             self._current_token = raw
-            prefix = raw[:8]
-            self._full_tokens[prefix] = self._full_tokens.get(prefix, 0) + 1
 
     def update_contribution(
         self,

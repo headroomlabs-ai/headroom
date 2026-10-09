@@ -59,7 +59,6 @@ def test_tracker_notify_active_update_and_basic_state(monkeypatch: pytest.Monkey
 
     tracker.notify_active("Bearer oauth-token-123", from_local_operator=True)
     assert tracker._current_token == "oauth-token-123"
-    assert tracker._full_tokens["oauth-to"] == 1
     assert tracker.is_active() is True
 
     tracker.update_contribution(
