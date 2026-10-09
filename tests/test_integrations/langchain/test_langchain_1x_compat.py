@@ -33,14 +33,26 @@ except ImportError:
 pytestmark = pytest.mark.skipif(not LANGCHAIN_AVAILABLE, reason="LangChain not installed")
 
 
+# Repeated rows require a real transformation, not serialization-only savings.
 BIG_RESULT = json.dumps(
     {
         "results": [
-            {"id": i, "user": f"user{i}", "plan": "pro", "status": "active"} for i in range(300)
+            {"id": i % 10, "user": f"user{i % 10}", "plan": "pro", "status": "active"}
+            for i in range(300)
         ],
         "total": 300,
     }
 )
+
+
+def _assert_compressed_rows(output: str) -> None:
+    original = json.loads(BIG_RESULT)
+    compressed = json.loads(output)
+    kept = [row for row in compressed["results"] if "id" in row]
+    assert compressed["total"] == original["total"]
+    assert {row["id"]: row for row in kept} == {row["id"]: row for row in original["results"]}
+    assert len(kept) < len(original["results"])
+    assert len(output) < len(BIG_RESULT)
 
 
 @tool
@@ -110,8 +122,7 @@ class TestWrappedToolIsUsable:
         wrapped = wrap_tools_with_headroom([query_database], min_chars_to_compress=1000)[0]
         out = wrapped.invoke({"query": "signups"})
 
-        assert isinstance(out, str) and out
-        assert len(out) < len(BIG_RESULT)
+        _assert_compressed_rows(out)
 
     def test_argument_schema_is_preserved(self):
         from headroom.integrations import wrap_tools_with_headroom
@@ -129,7 +140,7 @@ class TestWrappedToolIsUsable:
         wrapped = wrap_tools_with_headroom([query_database], min_chars_to_compress=1000)[0]
         out = asyncio.run(wrapped.ainvoke({"query": "signups"}))
 
-        assert len(out) < len(BIG_RESULT)
+        _assert_compressed_rows(out)
 
     def test_unusable_args_schema_falls_back_to_inference(self):
         """A tool carrying a schema LangChain cannot use must still wrap."""
