@@ -17,7 +17,7 @@ import json
 import logging
 import os
 import uuid
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Callable
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -824,6 +824,7 @@ class LiteLLMBackend(Backend):
         self,
         provider: str = "bedrock",
         region: str | None = None,
+        bedrock_client_factory: Callable[[str | None], Any] | None = None,
         profile_name: str | None = None,
         **kwargs: Any,
     ):
@@ -832,6 +833,16 @@ class LiteLLMBackend(Backend):
         Args:
             provider: LiteLLM provider prefix (bedrock, vertex_ai, openrouter, etc.)
             region: Cloud region (provider-specific)
+            bedrock_client_factory: Optional callable that returns a
+                ``boto3.session.Session.client('bedrock-runtime', ...)``
+                instance. When provided for the ``bedrock`` provider, the
+                returned client is reused across requests and passed to
+                ``litellm.acompletion(..., aws_bedrock_client=client)`` so
+                callers can plug in custom sessions (e.g.
+                ``boto3-refresh-session``) that refresh STS credentials
+                transparently. Returning ``None`` (or omitting the
+                argument) preserves the default behavior: litellm
+                creates its own client from the process environment.
             profile_name: AWS named profile for credential resolution (bedrock only).
                           When set, boto3 uses this profile (e.g. an SSO profile) instead
                           of the ambient credentials. Ignored for non-bedrock providers.
@@ -846,6 +857,10 @@ class LiteLLMBackend(Backend):
         self.region = region
         self.profile_name = profile_name
         self.kwargs = kwargs
+        self._bedrock_client_factory = bedrock_client_factory
+        # Eagerly built only when provider == "bedrock"; the default
+        # env-based client is what runs in every other case.
+        self._bedrock_client: Any = None
 
         # Get provider config from registry
         self._config = get_provider_config(provider)
@@ -866,6 +881,9 @@ class LiteLLMBackend(Backend):
                     "pip install 'headroom-ai[bedrock]' (or pip install botocore)."
                 )
             self._model_map = _fetch_bedrock_inference_profiles(region, profile_name=profile_name)
+            # Eagerly create the Bedrock client so the first request
+            # doesn't pay the connect cost.
+            self._bedrock_client = self._build_bedrock_client()
             litellm.set_verbose = False  # Reduce noise
         else:
             self._model_map = self._config.model_map
@@ -894,6 +912,42 @@ class LiteLLMBackend(Backend):
         )
 
         logger.info(f"LiteLLM backend initialized (provider={provider}, region={region})")
+
+    def _build_bedrock_client(self) -> Any:
+        """Return a ``bedrock-runtime`` boto3 client.
+
+        Delegates to ``bedrock_client_factory`` when one is provided.
+        Returning ``None`` lets ``litellm`` build the client from the
+        process environment (the default behavior).
+        """
+        factory = self._bedrock_client_factory
+        if factory is None:
+            return None
+        # Let exceptions propagate to the caller — they already get a
+        # full traceback via the default excepthook, no need to log
+        # the message here (which would duplicate the output).
+        client = factory(self.region)
+        if client is None:
+            return None
+        if not hasattr(client, "converse") and not hasattr(client, "invoke_model"):
+            raise TypeError(
+                "bedrock_client_factory must return a boto3 bedrock-runtime "
+                f"client (got {type(client).__name__})"
+            )
+        return client
+
+    def _inject_bedrock_client(self, kwargs: dict[str, Any]) -> None:
+        """Forward the custom ``bedrock-runtime`` boto3 client to litellm.
+
+        litellm accepts an external client and reuses it across
+        calls, which is what makes custom-session hooks (e.g.
+        ``boto3-refresh-session``) viable: the session object can
+        transparently refresh STS credentials without the caller
+        having to know. When no custom client was built, this is a
+        no-op and litellm falls back to the env-based default.
+        """
+        if self._bedrock_client is not None:
+            kwargs["aws_bedrock_client"] = self._bedrock_client
 
     @property
     def name(self) -> str:
@@ -1303,6 +1357,7 @@ class LiteLLMBackend(Backend):
 
             if self.provider == "bedrock" and self.profile_name:
                 kwargs["aws_profile_name"] = self.profile_name
+            self._inject_bedrock_client(kwargs)
 
             # Forward API key from request headers if present.
             # Skip for Bedrock/Vertex: they use env-based auth (AWS SigV4 / Google ADC).
@@ -1424,6 +1479,7 @@ class LiteLLMBackend(Backend):
 
             if self.provider == "bedrock" and self.profile_name:
                 kwargs["aws_profile_name"] = self.profile_name
+            self._inject_bedrock_client(kwargs)
 
             # Forward API key from request headers if present.
             # Skip for Bedrock/Vertex: they use env-based auth (AWS SigV4 / Google ADC).
@@ -1827,6 +1883,7 @@ class LiteLLMBackend(Backend):
 
             if self.provider == "bedrock" and self.profile_name:
                 kwargs["aws_profile_name"] = self.profile_name
+            self._inject_bedrock_client(kwargs)
 
             # Forward API key from request headers if present.
             # Skip for Bedrock/Vertex: they use env-based auth (AWS SigV4 / Google ADC).
@@ -2037,6 +2094,7 @@ class LiteLLMBackend(Backend):
 
             if self.provider == "bedrock" and self.profile_name:
                 kwargs["aws_profile_name"] = self.profile_name
+            self._inject_bedrock_client(kwargs)
 
             # Forward API key from request headers if present.
             # Skip for Bedrock/Vertex: they use env-based auth (AWS SigV4 / Google ADC).
