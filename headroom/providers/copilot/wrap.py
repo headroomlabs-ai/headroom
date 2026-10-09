@@ -11,6 +11,8 @@ from typing import Any
 
 import click
 
+from headroom.proxy.project_context import with_project_prefix
+
 
 def resolve_provider_type(
     backend: str | None, provider_type: str, environ: Mapping[str, str] | None = None
