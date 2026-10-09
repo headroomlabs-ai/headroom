@@ -7,6 +7,8 @@ import json
 import os
 import re
 import subprocess
+import sys
+from hashlib import sha256
 from pathlib import Path
 from typing import Any
 
@@ -44,6 +46,21 @@ _ORPHAN_HEADROOM_TABLE = re.compile(
 _TOML_TABLE_HEADER_RE = re.compile(r"^[ \t]*(?:\[\[[^\]\r\n]+\]\]|\[[^\]\r\n]+\])[ \t]*(?:#.*)?$")
 _ROOT_MODEL_PROVIDER_RE = re.compile(r"^[ \t]*model_provider[ \t]*=")
 _ROOT_OPENAI_BASE_URL_RE = re.compile(r"^[ \t]*openai_base_url[ \t]*=")
+_CODEX_API_KEY_HELPER = """from pathlib import Path
+import json
+
+
+try:
+    auth = json.loads(Path(__file__).with_name("auth.json").read_text(encoding="utf-8"))
+except (OSError, ValueError):
+    raise SystemExit(2)
+
+key = auth.get("OPENAI_API_KEY") if isinstance(auth, dict) else None
+if not isinstance(key, str) or not key.strip():
+    raise SystemExit(2)
+
+print(key, end="")
+"""
 
 
 def _codex_credential_store(config_dir: Path) -> str | None:
@@ -107,6 +124,158 @@ def codex_uses_chatgpt_auth(auth_path: Path) -> bool:
     return False
 
 
+def codex_uses_api_key_auth(auth_path: Path) -> bool:
+    """Whether Codex has a file-backed OpenAI API key.
+
+    A custom provider does not read Codex's ``auth.json`` when
+    ``requires_openai_auth`` is false.  Detect the API-key shape separately so
+    the generated provider can use Codex's command-backed bearer-token config
+    without forcing API-key users into the OAuth login flow.
+    """
+    try:
+        data = json.loads(auth_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return False
+    return (
+        isinstance(data, dict)
+        and isinstance(data.get("OPENAI_API_KEY"), str)
+        and bool(data["OPENAI_API_KEY"].strip())
+    )
+
+
+class CodexAuthConfigError(RuntimeError):
+    """A file-backed API key cannot be safely wired into the provider."""
+
+
+def codex_auth_helper_path(auth_path: Path, *, config_path: Path | None = None) -> Path:
+    """Give each provider config its own helper beside the credential file.
+
+    Local and user configs can share credentials without sharing a helper's
+    lifetime. The old fixed-name helper is deliberately never deleted: other
+    project configs may still reference it.
+    """
+    config_path = config_path or auth_path.parent / "config.toml"
+    identity = os.path.normcase(str(config_path.resolve()))
+    digest = sha256(identity.encode("utf-8")).hexdigest()
+    return auth_path.parent / f".headroom-codex-auth-{digest}.py"
+
+
+def build_codex_auth_config(auth_path: Path | None, *, config_path: Path | None = None) -> str:
+    """Build a Codex provider auth command for a file-backed API key.
+
+    The helper is generated next to ``auth.json`` and emits only the token at
+    runtime.  The token is never copied into Headroom's environment or the
+    generated TOML configuration.
+    """
+    if auth_path is None or codex_uses_chatgpt_auth(auth_path):
+        return ""
+    if not codex_uses_api_key_auth(auth_path):
+        return ""
+
+    helper_path = codex_auth_helper_path(auth_path, config_path=config_path)
+    if not _ensure_codex_auth_helper(helper_path):
+        raise CodexAuthConfigError(
+            f"Cannot create or validate Codex auth helper {helper_path}. "
+            "Check directory permissions and move any conflicting file or symlink, "
+            "then retry. Codex provider configuration was not updated."
+        )
+
+    config = (
+        "auth = { command = "
+        f"{json.dumps(sys.executable, ensure_ascii=False)}, "
+        f"args = [{json.dumps(str(helper_path.resolve()), ensure_ascii=False)}], "
+        "refresh_interval_ms = 300000 }\n"
+    )
+    tomllib.loads(config)
+    return config
+
+
+def _ensure_codex_auth_helper(helper_path: Path) -> bool:
+    """Create or validate the private, Headroom-owned auth helper."""
+    created = False
+    try:
+        # Never follow a user-created link or overwrite an unrelated file.
+        if helper_path.is_symlink():
+            return False
+        if helper_path.exists():
+            if not helper_path.is_file():
+                return False
+            if helper_path.read_text(encoding="utf-8") != _CODEX_API_KEY_HELPER:
+                return False
+            helper_path.chmod(0o600)
+            return True
+
+        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+        flags |= getattr(os, "O_NOFOLLOW", 0)
+        fd = os.open(helper_path, flags, 0o600)
+        created = True
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8", newline="") as handle:
+                fd = -1
+                handle.write(_CODEX_API_KEY_HELPER)
+                handle.flush()
+                os.fsync(handle.fileno())
+        finally:
+            if fd >= 0:
+                os.close(fd)
+        helper_path.chmod(0o600)
+        return True
+    except (OSError, UnicodeError):
+        if created:
+            try:
+                if helper_path.is_file() and not helper_path.is_symlink():
+                    helper_path.unlink()
+            except OSError:
+                pass
+        return False
+
+
+def cleanup_codex_auth_helper(auth_path: Path, *, config_path: Path | None = None) -> None:
+    """Remove this config's helper only when no retained provider uses it."""
+    config_path = config_path or auth_path.parent / "config.toml"
+    helper_path = codex_auth_helper_path(auth_path, config_path=config_path)
+    try:
+        if (
+            config_path.exists()
+            and codex_auth_helper_is_referenced(
+                config_path.read_text(encoding="utf-8"), str(helper_path.resolve())
+            )
+            is not False
+        ):
+            return
+        if (
+            helper_path.is_symlink()
+            or not helper_path.is_file()
+            or helper_path.read_text(encoding="utf-8") != _CODEX_API_KEY_HELPER
+        ):
+            return
+        helper_path.unlink()
+    except (OSError, UnicodeError):
+        return
+
+
+def codex_auth_helper_is_referenced(content: str, helper_path: str) -> bool | None:
+    """Whether any parsed Codex provider names this exact generated helper.
+
+    ``None`` means the configuration is not parseable, so callers can retain
+    the helper instead of risking deletion of a pre-existing user file.
+    """
+    try:
+        document = tomllib.loads(content)
+    except (tomllib.TOMLDecodeError, TypeError):
+        return None
+
+    providers = document.get("model_providers")
+    if not isinstance(providers, dict):
+        return False
+    for provider in providers.values():
+        auth = provider.get("auth") if isinstance(provider, dict) else None
+        args = auth.get("args") if isinstance(auth, dict) else None
+        if isinstance(args, list) and helper_path in args:
+            return True
+    return False
+
+
 def _id_token_carries_chatgpt_account(raw: Any) -> bool:
     """Whether an ``id_token`` carries the ChatGPT account claim (#3206).
 
@@ -150,6 +319,8 @@ def build_provider_section(
     marker_end: str = _CODEX_MARKER_END,
     include_markers: bool = True,
     requires_openai_auth: bool = False,
+    auth_path: Path | None = None,
+    config_path: Path | None = None,
 ) -> str:
     """Build a managed Codex provider block.
 
@@ -163,6 +334,7 @@ def build_provider_section(
         f'name = "{name}"\n'
         f'base_url = "{proxy_base_url(port)}"\n'
         "supports_websockets = true\n"
+        f"{build_codex_auth_config(auth_path, config_path=config_path)}"
     )
     if requires_openai_auth:
         body += "requires_openai_auth = true\n"
@@ -228,6 +400,8 @@ def apply_provider_scope(manifest: DeploymentManifest) -> ManagedMutation | None
             name="Headroom persistent proxy",
             include_markers=False,
             requires_openai_auth=codex_uses_chatgpt_auth(path.parent / "auth.json"),
+            auth_path=path.parent / "auth.json",
+            config_path=path,
         )
         + f"{_CODEX_MARKER_END}\n"
     )
@@ -237,6 +411,7 @@ def apply_provider_scope(manifest: DeploymentManifest) -> ManagedMutation | None
     existing = _CODEX_PATTERN.sub("", existing)
     existing = _strip_root_provider_assignments(existing)
     merged = _insert_block_at_root(existing, section)
+    tomllib.loads(merged)
     path.write_text(merged, encoding="utf-8")
     # Pull existing native threads into the headroom-provider menu so Codex's
     # history list stays whole once it routes through Headroom. Best-effort.
@@ -253,6 +428,8 @@ def revert_provider_scope(mutation: ManagedMutation, manifest: DeploymentManifes
     if not path.exists():
         return
     content = path.read_text(encoding="utf-8")
+    helper_path = codex_auth_helper_path(path.parent / "auth.json", config_path=path)
+    helper_was_referenced = codex_auth_helper_is_referenced(content, str(helper_path.resolve()))
     # Remove the managed marker block.
     if _CODEX_MARKER_START in content:
         content = _CODEX_PATTERN.sub("", content)
@@ -262,6 +439,8 @@ def revert_provider_scope(mutation: ManagedMutation, manifest: DeploymentManifes
     content = _ORPHAN_OPENAI_BASE_URL.sub("", content)
     content = _ORPHAN_HEADROOM_TABLE.sub("", content)
     path.write_text(content.strip() + "\n", encoding="utf-8")
+    if helper_was_referenced is True:
+        cleanup_codex_auth_helper(path.parent / "auth.json", config_path=path)
     # Hand the threads back to the native-provider menu so the full history stays
     # visible once Codex no longer routes through Headroom. Best-effort.
     retag_to_native(path.parent)

@@ -18,7 +18,7 @@ from typing import Any
 from headroom import fsutil
 
 from .base import MCPRegistrar, RegisterResult, RegisterStatus, ServerSpec
-from .codex import _evict_foreign_tables, _only_server_changed
+from .codex import _evict_foreign_tables, _only_server_changed, _toml_str
 
 if sys.version_info >= (3, 11):
     import tomllib
@@ -199,11 +199,6 @@ def _render_block(spec: ServerSpec) -> str:
             lines.append(f"{k} = {_toml_str(v)}")
     lines.append(_marker_end(spec.name))
     return "\n".join(lines)
-
-
-def _toml_str(s: str) -> str:
-    escaped = s.replace("\\", "\\\\").replace('"', '\\"')
-    return f'"{escaped}"'
 
 
 def _entry_to_spec(name: str, entry: dict[str, Any]) -> ServerSpec:

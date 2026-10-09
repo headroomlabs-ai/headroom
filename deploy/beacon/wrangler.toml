@@ -53,6 +53,14 @@ subrequests = 100000
 [observability]
 enabled = true
 
+# Invocation logs record every request's headers and Cloudflare metadata,
+# which includes the sender's IP address (cf-connecting-ip, x-real-ip) and
+# their city, postal code and coordinates. worker.js never reads these, but
+# with invocation logs on, Cloudflare writes them to Workers Logs for every
+# beacon POST anyway. Keep them off; errors and console.log still appear.
+[observability.logs]
+invocation_logs = false
+
 # Rate limiting is configured in the Cloudflare dashboard, not here — this
 # endpoint is unauthenticated by design (anonymity is the product), so it is
 # the only thing between the Worker and a bored stranger:

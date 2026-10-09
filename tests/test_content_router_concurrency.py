@@ -673,3 +673,53 @@ def test_concurrent_apply_calls_with_internal_fanout_do_not_cross_contaminate(
             f"reqB fan-out worker saw kompress_model={kompress_model!r} instead of "
             "reqB's own 'model-B' -- cross-request contamination from reqA"
         )
+
+
+@pytest.mark.parametrize("workers_env", ["abc", ""])
+def test_unparseable_compress_workers_env_falls_back_to_default(
+    tokenizer, monkeypatch, workers_env
+):
+    """An unparseable ``HEADROOM_COMPRESS_WORKERS`` must not raise out of
+    ``apply()``.
+
+    It used to go through a bare ``int()``, so every request that reached the
+    Pass 2 fan-out raised ``ValueError``. The proxy fails open on that, so the
+    request was forwarded uncompressed and, after a few of them, the pipeline
+    circuit breaker opened -- compression silently stopped. Like the sibling
+    env knobs (``HEADROOM_COMPRESSION_DEADLINE_MS`` etc.) it now falls back to
+    its default of 4, so the fan-out still runs on worker threads.
+    """
+    router = ContentRouter(ContentRouterConfig(min_section_tokens=10))
+    monkeypatch.setattr(router, "_get_kompress", lambda: _FakeKompress())
+    monkeypatch.setenv("HEADROOM_COMPRESS_WORKERS", workers_env)
+
+    main_thread_ident = threading.get_ident()
+    compress_threads: list[int] = []
+    compress_threads_lock = threading.Lock()
+    original_compress = ContentRouter.compress
+
+    def spy_compress(self, content, *args, **kwargs):
+        with compress_threads_lock:
+            compress_threads.append(threading.get_ident())
+        return original_compress(self, content, *args, **kwargs)
+
+    monkeypatch.setattr(ContentRouter, "compress", spy_compress)
+
+    result = router.apply(
+        _two_distinct_tool_messages(),
+        tokenizer,
+        force_kompress=True,
+        min_tokens_to_compress=10,
+    )
+
+    assert len(compress_threads) == 2, (
+        f"expected both messages to reach compress(), got {compress_threads}"
+    )
+    assert all(ident != main_thread_ident for ident in compress_threads), (
+        "compress() ran on the apply()-calling thread -- the fallback did not "
+        "restore the default parallel fan-out"
+    )
+    for out, original in zip(result.messages, _two_distinct_tool_messages(), strict=True):
+        assert len(out["content"]) < len(original["content"]), (
+            f"tool message {original['tool_call_id']} was not compressed"
+        )
