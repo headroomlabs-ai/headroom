@@ -340,6 +340,11 @@ def _windows_health_trigger() -> str:
 def _parse_windows_task_xml(raw: bytes | str) -> ElementTree.Element:
     """Parse schtasks XML when its declaration does not match stdout bytes."""
     if isinstance(raw, bytes):
+        try:
+            return ElementTree.fromstring(raw)
+        except ElementTree.ParseError as exc:
+            if "encoding specified in xml declaration is incorrect" not in str(exc).lower():
+                raise
         raw_bytes = raw
         if b"\x00" in raw_bytes:
             try:

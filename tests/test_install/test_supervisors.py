@@ -131,6 +131,32 @@ def test_parse_windows_task_xml_accepts_utf16_encoded_bytes() -> None:
     assert task.find(".//{*}LogonType").text == "S4U"
 
 
+def test_parse_windows_task_xml_accepts_utf16be_without_bom() -> None:
+    xml = (
+        '<?xml version="1.0" encoding="UTF-16"?>\n'
+        '<Task xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">'
+        "<Principals><Principal><LogonType>S4U</LogonType></Principal></Principals>"
+        "</Task>"
+    )
+    task = _parse_windows_task_xml(xml.encode("utf-16-be"))
+    assert task is not None
+    assert task.find(".//{*}LogonType").text == "S4U"
+
+
+def test_parse_windows_task_xml_preserves_declared_windows_codepage() -> None:
+    xml = (
+        '<?xml version="1.0" encoding="windows-1252"?>\n'
+        '<Task xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">'
+        "<Name>Caf\xe9</Name>"
+        "<Principals><Principal><LogonType>S4U</LogonType></Principal></Principals>"
+        "</Task>"
+    )
+    task = _parse_windows_task_xml(xml.encode("windows-1252"))
+    assert task is not None
+    assert task.find(".//{*}Name").text == "Caf\xe9"
+    assert task.find(".//{*}LogonType").text == "S4U"
+
+
 def test_parse_windows_task_xml_accepts_utf8_bom_bytes() -> None:
     xml = (
         '<?xml version="1.0" encoding="UTF-16"?>\n'
