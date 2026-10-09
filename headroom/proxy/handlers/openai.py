@@ -10972,6 +10972,11 @@ class OpenAIHandlerMixin:
             if _turn is not None:
                 _turn.prepare(model_name=model_name, tags=tags, config=self.config)
 
+            # Whether the returned ``tokens_after`` was counted over the FINAL,
+            # post-hook messages (so it already includes any text a hook added).
+            # Set by whichever closure runs; read after the executor.
+            _after_counts_hook = [False]
+
             def _run_stateless():
                 result = pipeline.apply(messages=messages, model=model, **pipeline_kwargs)
                 final = result.messages
@@ -10980,6 +10985,7 @@ class OpenAIHandlerMixin:
                     final = _turn.transform(final)
                     if _turn.folded_messages:
                         tokens_after = _turn.count_messages(final, tokens_after)
+                        _after_counts_hook[0] = True
                 return (
                     result,
                     final,
@@ -11069,6 +11075,7 @@ class OpenAIHandlerMixin:
                         _tok = get_tokenizer(model_name)
                         raw_tokens_before = _tok.count_messages(messages)
                         final_tokens_after = _tok.count_messages(final)
+                        _after_counts_hook[0] = True
                     except Exception as e:
                         # Fail-open, but LOUD: this fallback reverts to the
                         # pipeline's counts of the cache-swapped input, which
@@ -11124,7 +11131,9 @@ class OpenAIHandlerMixin:
             _hook_tool_saved = 0
             if _turn is not None:
                 tokens_after += max(0, int(getattr(_turn, "tool_growth_tokens", 0) or 0))
-                if not _turn.folded_messages:  # a recount already includes it
+                # Only a count of pre-hook messages lacks the text a hook added;
+                # a recount of the final messages (stateless fold, session) has it.
+                if not _after_counts_hook[0]:
                     tokens_after += max(0, int(getattr(_turn, "message_growth_tokens", 0) or 0))
                 _hook_tool_saved = int(getattr(_turn, "hook_tool_saved_tokens", 0) or 0)
             tokens_saved = net_hook_tool_saving(

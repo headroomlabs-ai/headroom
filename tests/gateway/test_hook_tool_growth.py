@@ -75,9 +75,10 @@ class _AddTextRemoveTools:
         ctx.tools = []
 
 
+@pytest.mark.parametrize("session", [False, True], ids=["stateless", "session"])
 @pytest.mark.parametrize("repeat", [5, 2_000], ids=["net-positive", "net-negative"])
 def test_message_growth_offsets_tools_a_hook_removed(
-    make_headroom_client, outcome_spy, repeat
+    make_headroom_client, outcome_spy, repeat, session
 ) -> None:
     """The opposite signed case on /v1/compress: a hook appends message text
     and drops the tools. The headline is removed tools minus added text,
@@ -95,6 +96,10 @@ def test_message_growth_offsets_tools_a_hook_removed(
         "tools": [dict(_ADDED_TOOL)],
         "gateway": {"can_redrive": False, "can_relay_response": False},
     }
+    if session:
+        # Session turns recount the final (post-hook) messages: the added
+        # text must not be counted a second time on top of that.
+        body["config"] = {"session_id": f"growth-{repeat}"}
     resp = compress(client, body)
     assert resp.status_code == 200, resp.text
     tok = get_tokenizer("claude-sonnet-4-5")
