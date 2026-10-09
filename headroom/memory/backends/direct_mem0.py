@@ -60,6 +60,7 @@ from typing import Any
 from headroom.memory import qdrant_env
 from headroom.memory.models import Memory
 from headroom.memory.ports import MemorySearchResult
+from headroom.offline import guard_egress
 
 logger = logging.getLogger(__name__)
 
@@ -169,7 +170,12 @@ class DirectMem0Adapter:
         if self._initialized:
             return
 
-        # Initialize embedder (OpenAI)
+        # Initialize embedder (OpenAI). The air-gap switch outranks the
+        # backend configuration: this embeds the user's memories by shipping
+        # them to api.openai.com, which is precisely what an operator who set
+        # HEADROOM_OFFLINE is refusing. Use the ONNX or Ollama embedder
+        # instead on an air-gapped box.
+        guard_egress("OpenAI embedding API (direct mem0 backend)", "api.openai.com")
         try:
             from openai import OpenAI
 

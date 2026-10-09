@@ -52,6 +52,8 @@ def test_anthropic_passthrough_routes_model_endpoint_intent() -> None:
             "anthropic",
             "count_tokens",
         ),
+        ProviderPassthroughRoute("GET", "/api/hello", "anthropic", "api/hello"),
+        ProviderPassthroughRoute("HEAD", "/api/hello", "anthropic", "api/hello"),
     )
 
 
@@ -83,6 +85,9 @@ def test_direct_handler_routes_model_endpoint_intent() -> None:
     assert OPENAI_HANDLER_ROUTES == (
         ProviderHandlerRoute("POST", "/v1/chat/completions", "handle_openai_chat"),
         ProviderHandlerRoute("POST", "/chat/completions", "handle_openai_chat"),
+        # Wrap-registry targets append their declared nonstandard chat paths
+        # (IBM Bob posts under its /inference/v1 gateway prefix).
+        ProviderHandlerRoute("POST", "/inference/v1/chat/completions", "handle_openai_chat"),
     )
     assert GEMINI_HANDLER_ROUTES == (
         ProviderHandlerRoute(
@@ -90,18 +95,21 @@ def test_direct_handler_routes_model_endpoint_intent() -> None:
             "/v1beta/models/{model}:generateContent",
             "handle_gemini_generate_content",
             "model",
+            True,
         ),
         ProviderHandlerRoute(
             "POST",
             "/v1beta/models/{model}:streamGenerateContent",
             "handle_gemini_stream_generate_content",
             "model",
+            True,
         ),
         ProviderHandlerRoute(
             "POST",
             "/v1beta/models/{model}:countTokens",
             "handle_gemini_count_tokens",
             "model",
+            True,
         ),
     )
     assert CLOUDCODE_HANDLER_ROUTES == (
@@ -116,6 +124,31 @@ def test_direct_handler_routes_model_endpoint_intent() -> None:
             "handle_google_cloudcode_stream",
         ),
     )
+
+
+def test_gemini_model_routes_all_follow_the_tagged_upstream() -> None:
+    """All three Gemini model endpoints must agree on which upstream they reach.
+
+    Counting tokens against one host and generating against another gives the
+    client counts for a model the serving host may not have, and sends the
+    tagged gateway's credential to Google.
+    """
+    assert {
+        (spec.path, spec.handler_name)
+        for spec in GEMINI_HANDLER_ROUTES
+        if spec.supports_custom_base_url
+    } == {
+        ("/v1beta/models/{model}:generateContent", "handle_gemini_generate_content"),
+        ("/v1beta/models/{model}:streamGenerateContent", "handle_gemini_stream_generate_content"),
+        ("/v1beta/models/{model}:countTokens", "handle_gemini_count_tokens"),
+    }
+
+
+def test_non_gemini_handler_routes_do_not_opt_into_the_custom_base() -> None:
+    for spec in PROVIDER_HANDLER_ROUTES:
+        if spec in GEMINI_HANDLER_ROUTES:
+            continue
+        assert not spec.supports_custom_base_url, spec.path
 
 
 def test_batch_handler_routes_model_endpoint_intent() -> None:

@@ -1,10 +1,9 @@
-//! Three universal crushers for non-dict-array JSON shapes.
+//! Two universal crushers for non-dict-array JSON shapes.
 //!
 //! Direct ports from `headroom/transforms/smart_crusher.py`:
 //!
 //! - `crush_string_array`  ← `_crush_string_array`  (line 2727)
 //! - `crush_number_array`  ← `_crush_number_array`  (line 2810) — has BUG #1
-//! - `crush_object`        ← `_crush_object`        (line 3015)
 //!
 //! Each takes a `&SmartCrusherConfig`, a `bias` multiplier, and returns
 //! `(crushed_items, strategy_string)`. Schema-preserving: the output
@@ -30,7 +29,7 @@
 //! the bug-doc test below flips to pin the corrected behavior and the
 //! fixtures are regenerated.
 
-use serde_json::{Map, Value};
+use serde_json::Value;
 use std::collections::{BTreeSet, HashSet};
 
 use super::config::SmartCrusherConfig;
@@ -379,141 +378,6 @@ pub fn crush_number_array(
     (kept_values, strategy)
 }
 
-/// Crush a JSON object by selecting the most informative keys.
-///
-/// Mirrors `_crush_object`. Treats key-value pairs as items and applies
-/// `compute_optimal_k` directly on `f"{k}: {json.dumps(v)}"` strings.
-/// Always-kept rules:
-/// - keys whose value contains an error keyword.
-/// - keys with small total token estimate (<=12 tokens via the rough
-///   `len(str)/4 + len(key)/4 + 2` heuristic).
-/// - first K_first and last K_last keys (insertion order — `IndexMap`
-///   preserves it via the `serde_json/preserve_order` feature).
-pub fn crush_object(
-    obj: &Map<String, Value>,
-    config: &SmartCrusherConfig,
-    bias: f64,
-) -> (Map<String, Value>, String) {
-    let n = obj.len();
-    if n <= 8 {
-        return (obj.clone(), "object:passthrough".to_string());
-    }
-
-    // Estimate tokens per key-value pair. Python: `len(str)/4 + len(key)/4 + 2`.
-    let mut kv_tokens: Vec<(String, usize)> = Vec::with_capacity(n);
-    let mut total_tokens: usize = 0;
-    for (key, val) in obj {
-        let val_str = serde_json::to_string(val).unwrap_or_default();
-        let tokens = val_str.len() / 4 + key.len() / 4 + 2;
-        kv_tokens.push((key.clone(), tokens));
-        total_tokens += tokens;
-    }
-
-    if total_tokens < config.min_tokens_to_crush {
-        return (obj.clone(), "object:passthrough".to_string());
-    }
-
-    // Strict lossless mode: dropped keys get no CCR marker, so keep them all.
-    if config.lossless_only {
-        return (obj.clone(), "object:lossless_only".to_string());
-    }
-
-    // Compute adaptive K on key-value string representations.
-    let keys: Vec<&String> = obj.keys().collect();
-    let kv_strings: Vec<String> = keys
-        .iter()
-        .map(|k| {
-            format!(
-                "{}: {}",
-                k,
-                serde_json::to_string(&obj[k.as_str()]).unwrap_or_default()
-            )
-        })
-        .collect();
-    let kv_refs: Vec<&str> = kv_strings.iter().map(|s| s.as_str()).collect();
-
-    let max_k = if config.max_items_after_crush > 0 {
-        Some(config.max_items_after_crush)
-    } else {
-        None
-    };
-    let k_total = compute_optimal_k(&kv_refs, bias, 3, max_k);
-
-    if k_total >= n {
-        return (obj.clone(), "object:passthrough".to_string());
-    }
-
-    // Always keep: error-keyword values.
-    let mut keep_keys: HashSet<String> = HashSet::new();
-    for (key, val) in obj {
-        let val_str = serde_json::to_string(val)
-            .unwrap_or_default()
-            .to_lowercase();
-        if ERROR_KEYWORDS.iter().any(|kw| val_str.contains(kw)) {
-            keep_keys.insert(key.clone());
-        }
-    }
-
-    // Always keep: small values (cheap to keep).
-    // Python: `if tokens <= small_threshold // 4` where small_threshold=50,
-    // so tokens <= 12.
-    let small_threshold_tokens = 50_usize / 4;
-    for (key, tokens) in &kv_tokens {
-        if *tokens <= small_threshold_tokens {
-            keep_keys.insert(key.clone());
-        }
-    }
-
-    // Boundary: first K_first and last K_last (over the key insertion order).
-    let k_first = 1_usize.max(round_ties_even(k_total as f64 * config.first_fraction) as usize);
-    let k_last = 1_usize.max(round_ties_even(k_total as f64 * config.last_fraction) as usize);
-    for k in keys.iter().take(k_first) {
-        keep_keys.insert((*k).clone());
-    }
-    for k in keys.iter().rev().take(k_last) {
-        keep_keys.insert((*k).clone());
-    }
-
-    // Stride fill. Python's cap recomputes the error-keyword count each
-    // iteration (inefficient but deterministic). We can compute once
-    // because once a key is in keep_keys, the count of error-flagged
-    // entries grows monotonically — which means the cap effectively
-    // grows. Mirror Python's behavior by recomputing.
-    let remaining = k_total.saturating_sub(keep_keys.len());
-    if remaining > 0 {
-        let stride = ((n.saturating_sub(1)) / (remaining + 1)).max(1);
-        let mut i: usize = 0;
-        while i < n {
-            // Python: `if len(keep_keys) >= k_total + len([k for k in keep_keys if any(kw in json.dumps(obj[k]).lower() for kw in keywords)])`
-            let error_kept_count = keep_keys
-                .iter()
-                .filter(|k| {
-                    let s = serde_json::to_string(&obj[k.as_str()])
-                        .unwrap_or_default()
-                        .to_lowercase();
-                    ERROR_KEYWORDS.iter().any(|kw| s.contains(kw))
-                })
-                .count();
-            if keep_keys.len() >= k_total + error_kept_count {
-                break;
-            }
-            keep_keys.insert(keys[i].clone());
-            i += stride;
-        }
-    }
-
-    // Build output preserving original key insertion order.
-    let mut result: Map<String, Value> = Map::new();
-    for k in &keys {
-        if keep_keys.contains(k.as_str()) {
-            result.insert((*k).clone(), obj[k.as_str()].clone());
-        }
-    }
-
-    let strategy = format!("object:adaptive({}->{} keys)", n, result.len());
-    (result, strategy)
-}
-
 // ---------- helpers ----------
 
 /// Linear-interpolation percentile (numpy "linear" method).
@@ -745,97 +609,6 @@ mod tests {
         assert!(strat.contains("p75="));
     }
 
-    // ---------- crush_object ----------
-
-    #[test]
-    fn object_passthrough_when_few_keys() {
-        let mut obj = Map::new();
-        for i in 0..5 {
-            obj.insert(format!("k{}", i), json!(i));
-        }
-        let (out, strat) = crush_object(&obj, &cfg(), 1.0);
-        assert_eq!(out.len(), 5);
-        assert_eq!(strat, "object:passthrough");
-    }
-
-    #[test]
-    fn object_passthrough_when_total_tokens_below_min() {
-        // Many tiny keys/values: total_tokens stays below
-        // min_tokens_to_crush=200.
-        let mut obj = Map::new();
-        for i in 0..30 {
-            obj.insert(format!("k{}", i), json!(i));
-        }
-        let (_out, strat) = crush_object(&obj, &cfg(), 1.0);
-        assert_eq!(strat, "object:passthrough");
-    }
-
-    #[test]
-    fn object_crushes_when_token_budget_exceeded() {
-        // 30 keys, each with a long string value → total tokens > 200,
-        // and unique k_total < n → actual crushing happens.
-        let mut obj = Map::new();
-        for i in 0..30 {
-            obj.insert(
-                format!("k{:02}", i),
-                json!(format!(
-                    "this is a relatively long value string for entry number {} with content",
-                    i
-                )),
-            );
-        }
-        let (out, strat) = crush_object(&obj, &cfg(), 1.0);
-        // Either the optimizer kept all (if it deems them all distinct
-        // enough — strategy = passthrough), or it crushed.
-        if strat == "object:passthrough" {
-            assert_eq!(out.len(), 30);
-        } else {
-            assert!(strat.starts_with("object:adaptive("));
-            assert!(out.len() <= 30);
-        }
-    }
-
-    #[test]
-    fn object_keeps_small_values() {
-        // Mix of small + large values; small ones (<=12 tokens) always survive.
-        let mut obj = Map::new();
-        obj.insert("tiny".to_string(), json!(1));
-        for i in 0..30 {
-            obj.insert(
-                format!("big{:02}", i),
-                json!(format!(
-                    "this is a long string with content for entry number {} that exceeds the small threshold",
-                    i
-                )),
-            );
-        }
-        let (out, _) = crush_object(&obj, &cfg(), 1.0);
-        assert!(
-            out.contains_key("tiny"),
-            "tiny key (small value) must survive"
-        );
-    }
-
-    #[test]
-    fn object_keeps_error_keywords() {
-        let mut obj = Map::new();
-        obj.insert(
-            "msg1".to_string(),
-            json!(format!("FATAL: {}", "x".repeat(200))),
-        );
-        for i in 0..30 {
-            obj.insert(
-                format!("k{:02}", i),
-                json!(format!("padding content for entry {} with text", i)),
-            );
-        }
-        let (out, _) = crush_object(&obj, &cfg(), 1.0);
-        assert!(
-            out.contains_key("msg1"),
-            "key with error-keyword value must survive"
-        );
-    }
-
     // ---------- lossless_only (#3625) ----------
     //
     // These crushers drop items with no CCR marker at all, so strict
@@ -873,26 +646,6 @@ mod tests {
         let (out, strat) = crush_number_array(&items, &lossless_only_cfg(), 1.0);
         assert_eq!(out, items, "lossless_only must keep every number");
         assert_eq!(strat, "number:lossless_only");
-    }
-
-    #[test]
-    fn object_lossless_only_keeps_every_key() {
-        let mut obj = Map::new();
-        for i in 0..40 {
-            obj.insert(
-                format!("k{i:02}"),
-                json!(format!(
-                    "long description for entry {i}, above the small-value floor"
-                )),
-            );
-        }
-
-        let (lossy, _) = crush_object(&obj, &cfg(), 1.0);
-        assert!(lossy.len() < obj.len(), "default config should drop keys");
-
-        let (out, strat) = crush_object(&obj, &lossless_only_cfg(), 1.0);
-        assert_eq!(out, obj, "lossless_only must keep every key");
-        assert_eq!(strat, "object:lossless_only");
     }
 
     // ---------- BUG #1 documentation test ----------

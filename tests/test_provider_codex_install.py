@@ -1,8 +1,27 @@
 from __future__ import annotations
 
+import json
+import subprocess
+import sys
 from pathlib import Path
 
-from headroom.providers.codex.install import build_provider_section, codex_uses_chatgpt_auth
+import pytest
+
+if sys.version_info >= (3, 11):
+    import tomllib
+else:  # pragma: no cover - exercised only on Python 3.10
+    import tomli as tomllib  # type: ignore[no-redef]
+
+from headroom.providers.codex.install import (
+    CodexAuthConfigError,
+    build_codex_auth_config,
+    build_provider_section,
+    cleanup_codex_auth_helper,
+    codex_auth_helper_is_referenced,
+    codex_auth_helper_path,
+    codex_uses_api_key_auth,
+    codex_uses_chatgpt_auth,
+)
 
 
 def test_codex_provider_section_omits_requires_openai_auth_by_default() -> None:
@@ -16,9 +35,9 @@ def test_codex_provider_section_omits_requires_openai_auth_by_default() -> None:
 
     assert 'name = "OpenAI via Headroom proxy"' in section
     assert 'base_url = "http://127.0.0.1:8787/v1"' in section
-    assert (
-        "requires_openai_auth" not in section
-    ), f"requires_openai_auth must be absent by default; got:\n{section}"
+    assert "requires_openai_auth" not in section, (
+        f"requires_openai_auth must be absent by default; got:\n{section}"
+    )
     assert "supports_websockets = true" in section
     assert 'env_key = "OPENAI_API_KEY"' not in section
 
@@ -57,6 +76,169 @@ def test_codex_uses_chatgpt_auth_false_for_api_key(tmp_path: Path) -> None:
     auth.write_text('{"auth_mode": "apikey", "OPENAI_API_KEY": "sk-x"}', encoding="utf-8")
 
     assert codex_uses_chatgpt_auth(auth) is False
+
+
+def test_codex_uses_api_key_auth_detects_file_backed_key(tmp_path: Path) -> None:
+    auth = tmp_path / "auth.json"
+    auth.write_text('{"OPENAI_API_KEY": "sk-x"}', encoding="utf-8")
+
+    assert codex_uses_api_key_auth(auth) is True
+
+
+def test_codex_uses_api_key_auth_rejects_missing_or_blank_key(tmp_path: Path) -> None:
+    auth = tmp_path / "auth.json"
+    for document in ("{}", '{"OPENAI_API_KEY": "  "}', "not json"):
+        auth.write_text(document, encoding="utf-8")
+        assert codex_uses_api_key_auth(auth) is False
+
+
+def test_build_codex_auth_config_generates_helper_without_copying_key(tmp_path: Path) -> None:
+    auth = tmp_path / "auth.json"
+    auth.write_text('{"OPENAI_API_KEY": "sk-test-only"}', encoding="utf-8")
+
+    config = build_codex_auth_config(auth)
+    helper = codex_auth_helper_path(auth)
+
+    assert "auth = { command =" in config
+    assert tomllib.loads(config)["auth"]["args"] == [str(helper.resolve())]
+    assert "sk-test-only" not in config
+    assert helper.read_text(encoding="utf-8").count("OPENAI_API_KEY") == 1
+    if sys.platform != "win32":
+        assert helper.stat().st_mode & 0o777 == 0o600
+    result = subprocess.run(
+        [sys.executable, str(helper)], capture_output=True, text=True, check=True
+    )
+    assert result.stdout == "sk-test-only"
+
+
+def test_codex_auth_helper_reference_parses_toml_escaped_windows_path() -> None:
+    helper = r"C:\Users\example\.codex\.headroom-codex-auth.py"
+    config = (
+        "[model_providers.headroom]\n"
+        f'auth = {{ command = "python", args = [{json.dumps(helper)}] }}\n'
+    )
+
+    assert codex_auth_helper_is_referenced(config, helper) is True
+
+
+def test_build_codex_auth_config_does_not_overwrite_existing_helper(
+    tmp_path: Path,
+) -> None:
+    auth = tmp_path / "auth.json"
+    auth.write_text('{"OPENAI_API_KEY": "sk-test-only"}', encoding="utf-8")
+    helper = codex_auth_helper_path(auth)
+    helper.write_text("user content", encoding="utf-8")
+
+    with pytest.raises(CodexAuthConfigError, match="conflicting file or symlink"):
+        build_codex_auth_config(auth)
+    assert helper.read_text(encoding="utf-8") == "user content"
+
+
+def test_build_codex_auth_config_rejects_helper_symlink(tmp_path: Path) -> None:
+    auth = tmp_path / "auth.json"
+    auth.write_text('{"OPENAI_API_KEY": "sk-test-only"}', encoding="utf-8")
+    target = tmp_path / "user-file.txt"
+    target.write_text("user content", encoding="utf-8")
+    helper = codex_auth_helper_path(auth)
+    try:
+        helper.symlink_to(target)
+    except OSError:
+        pytest.skip("symlinks are unavailable")
+
+    with pytest.raises(CodexAuthConfigError, match="conflicting file or symlink"):
+        build_codex_auth_config(auth)
+    assert target.read_text(encoding="utf-8") == "user content"
+    assert helper.is_symlink()
+
+
+def test_build_codex_auth_config_handles_invalid_existing_helper(tmp_path: Path) -> None:
+    auth = tmp_path / "auth.json"
+    auth.write_text('{"OPENAI_API_KEY": "sk-test-only"}', encoding="utf-8")
+    helper = codex_auth_helper_path(auth)
+    helper.write_bytes(b"\xff\xfe")
+
+    with pytest.raises(CodexAuthConfigError, match="conflicting file or symlink"):
+        build_codex_auth_config(auth)
+    assert helper.read_bytes() == b"\xff\xfe"
+
+
+def test_cleanup_codex_auth_helper_only_removes_headroom_file(tmp_path: Path) -> None:
+    auth = tmp_path / "auth.json"
+    auth.write_text('{"OPENAI_API_KEY": "sk-test-only"}', encoding="utf-8")
+    build_codex_auth_config(auth)
+    helper = codex_auth_helper_path(auth)
+
+    cleanup_codex_auth_helper(auth)
+
+    assert not helper.exists()
+
+
+def test_build_codex_auth_config_skips_chatgpt_auth(tmp_path: Path) -> None:
+    auth = tmp_path / "auth.json"
+    auth.write_text('{"auth_mode": "chatgpt"}', encoding="utf-8")
+
+    assert build_codex_auth_config(auth) == ""
+
+
+def test_auth_command_round_trips_astral_paths(tmp_path: Path, monkeypatch) -> None:
+    home = tmp_path / "😀"
+    home.mkdir()
+    auth = home / "auth.json"
+    auth.write_text('{"OPENAI_API_KEY": "sk-test-only"}', encoding="utf-8")
+    executable = str(home / "python-🐍")
+    monkeypatch.setattr(sys, "executable", executable)
+
+    command = tomllib.loads(build_codex_auth_config(auth))["auth"]
+
+    assert command["command"] == executable
+    assert Path(command["args"][0]).parent == home.resolve()
+
+
+def test_auth_helpers_are_scoped_to_the_provider_config(tmp_path: Path) -> None:
+    auth = tmp_path / "auth.json"
+    auth.write_text('{"OPENAI_API_KEY": "sk-test-only"}', encoding="utf-8")
+    first = tmp_path / "config.toml"
+    second = tmp_path / "project" / ".codex" / "config.toml"
+    first_command = tomllib.loads(build_codex_auth_config(auth, config_path=first))["auth"]
+    second_command = tomllib.loads(build_codex_auth_config(auth, config_path=second))["auth"]
+    first_helper = Path(first_command["args"][0])
+    second_helper = Path(second_command["args"][0])
+
+    assert first_helper != second_helper
+    cleanup_codex_auth_helper(auth, config_path=first)
+
+    assert not first_helper.exists()
+    result = subprocess.run(
+        [sys.executable, str(second_helper)], capture_output=True, text=True, check=True
+    )
+    assert result.stdout == "sk-test-only"
+
+
+def test_auth_helper_creation_failure_is_explicit(tmp_path: Path, monkeypatch) -> None:
+    auth = tmp_path / "auth.json"
+    auth.write_text('{"OPENAI_API_KEY": "sk-test-only"}', encoding="utf-8")
+
+    def denied(*args, **kwargs):
+        raise PermissionError("read-only directory")
+
+    monkeypatch.setattr("headroom.providers.codex.install.os.open", denied)
+    with pytest.raises(CodexAuthConfigError, match="Check directory permissions"):
+        build_codex_auth_config(auth)
+    assert not codex_auth_helper_path(auth).exists()
+
+
+@pytest.mark.parametrize("content", ["invalid TOML", "[model_providers.other]\n{auth}"])
+def test_cleanup_preserves_helper_for_retained_or_unparseable_config(
+    tmp_path: Path, content: str
+) -> None:
+    auth = tmp_path / "auth.json"
+    auth.write_text('{"OPENAI_API_KEY": "sk-test-only"}', encoding="utf-8")
+    fragment = build_codex_auth_config(auth)
+    (tmp_path / "config.toml").write_text(content.replace("{auth}", fragment), encoding="utf-8")
+
+    cleanup_codex_auth_helper(auth)
+
+    assert codex_auth_helper_path(auth).exists()
 
 
 def test_codex_uses_chatgpt_auth_false_for_missing_or_malformed(tmp_path: Path) -> None:

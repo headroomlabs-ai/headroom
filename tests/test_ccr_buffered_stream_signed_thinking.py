@@ -27,6 +27,7 @@ httpx = pytest.importorskip("httpx")
 from fastapi.testclient import TestClient  # noqa: E402
 
 from headroom.proxy.models import CacheEntry  # noqa: E402
+from headroom.proxy.semantic_cache_key_policy import compute_cache_partition  # noqa: E402
 from headroom.proxy.server import ProxyConfig, create_app  # noqa: E402
 
 RETRIEVE_TOOL = {
@@ -314,6 +315,9 @@ def test_cache_hit_never_replays_a_foreign_content_type() -> None:
         key = proxy.cache._compute_key(
             body["messages"],
             body["model"],
+            # Same partition the handler derives for this caller (01-F15).
+            partition=compute_cache_partition(_headers()),
+            upstream_base_url=None,
             system=None,
             tools=None,
             tool_choice=None,

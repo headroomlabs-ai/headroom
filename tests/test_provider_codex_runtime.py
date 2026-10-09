@@ -335,9 +335,9 @@ def test_init_codex_config_routes_messages_through_headroom(
     content = config_path.read_text(encoding="utf-8")
     assert 'env_key = "OPENAI_API_KEY"' not in content
     # Bug 3 (#406): requires_openai_auth must be absent from headroom provider blocks.
-    assert (
-        "requires_openai_auth" not in content
-    ), f"requires_openai_auth must not appear in init-generated Codex config:\n{content}"
+    assert "requires_openai_auth" not in content, (
+        f"requires_openai_auth must not appear in init-generated Codex config:\n{content}"
+    )
 
     _assert_delivery(
         codex_proxy_stack,

@@ -103,20 +103,54 @@ rate(headroom_cache_bust_total[5m])
 
 | Metric | What it shows |
 |---|---|
-| `headroom_requests_total` | Requests handled. Unlabelled. |
-| `headroom_requests_by_provider{provider}` | Traffic split by provider — `anthropic`, `openai`, `gemini`, `bedrock`… |
-| `headroom_requests_by_model{model}` | Traffic split by model. Capped at 1024 distinct; overflow lands in `model="other"`. |
-| `headroom_requests_failed_total` | Upstream 5xx errors. |
-| `headroom_requests_rate_limited_total` | Requests **Headroom** rejected via its own rate limiter (not upstream 429s). |
+| `headroom_requests_total` | **Completed** requests — the denominator for success-side stats, not total traffic. A request that ended in a 4xx, 5xx or 429 never reaches it. Unlabelled. |
+| `headroom_inbound_requests_total` | Every inbound HTTP request the proxy accepted, whatever the outcome. This is the all-traffic counter. |
+| `headroom_requests_by_provider{provider}` | Traffic split by provider — `anthropic`, `openai`, `gemini`, `bedrock`… **Completed requests only**, same denominator as `headroom_requests_total`. Use `headroom_requests_failed_total{provider}` for the failure side. |
+| `headroom_requests_by_model{model}` | Traffic split by model. Capped at 1024 distinct; overflow lands in `model="other"`. Completed requests only. |
+| `headroom_requests_failed_total{provider}` | Requests that failed upstream — **4xx and 5xx**, excluding 429. Excluded from `headroom_requests_total`, so add it back when you compute a rate. |
+| `headroom_requests_rate_limited_total{source}` | Requests rejected with 429, by **either** Headroom's own rate limiter (`source="headroom"`) or the upstream provider (`source="upstream"`). Excluded from `headroom_requests_total`. |
 | `headroom_compression_failed_total{reason}` | Compression failures — `timeout` or `error`. Fails open, so traffic keeps flowing but savings quietly stop. **Worth an alert.** |
 | `headroom_compression_quarantine_total{event}` | Compression disabled after repeated timeouts — `activated`, `skipped`, `released`. |
 | `headroom_inbound_requests_active` | In-flight requests, gauge. Counts all HTTP including `/metrics`. |
 | `headroom_active_ws_sessions` | Live Codex WebSocket sessions, gauge. |
 
+### `headroom_requests_total` is a denominator, not traffic
+
+`headroom_requests_total` counts requests that **completed** — it has always been
+incremented only on the success path, and since the outcome funnel started short-circuiting
+at `>= 400`, every 4xx, 5xx and 429 drops out of it. So:
+
+- `headroom_requests_total` + `headroom_requests_failed_total` + `headroom_requests_rate_limited_total`
+  ≈ the requests the proxy forwarded upstream.
+- `headroom_inbound_requests_total` is the honest all-traffic counter (it also counts
+  `/metrics`, `/stats` and other non-proxy HTTP).
+
+That is why the failure-rate query below adds `failed` back into its own denominator, and
+why you should not "simplify" it to `… / rate(headroom_requests_total[5m])`: failures are
+not in `requests_total`, so that form divides failures by successes and over-reports the
+rate — badly, during exactly the incident you wrote it for (at 100% failures the denominator
+goes to zero).
+
 ```promql
-# Failure rate
+# Failure rate. The denominator deliberately re-adds `failed`: a failed request
+# is NOT in headroom_requests_total, so requests_total alone is successes-only.
 rate(headroom_requests_failed_total[5m])
   / clamp_min(rate(headroom_requests_total[5m]) + rate(headroom_requests_failed_total[5m]), 1)
+
+# Failure rate by provider — which upstream is actually broken.
+sum by (provider) (rate(headroom_requests_failed_total[5m]))
+  / clamp_min(
+      sum by (provider) (rate(headroom_requests_by_provider[5m]))
+        + sum by (provider) (rate(headroom_requests_failed_total[5m])),
+      1
+    )
+
+# Who is throttling you: your own limiter (raise the cap) vs the provider
+# (back off, shard keys). Alert on these separately — they are different actions.
+sum by (source) (rate(headroom_requests_rate_limited_total[5m]))
+
+# Provider throttling only — the one that means "slow down".
+rate(headroom_requests_rate_limited_total{source="upstream"}[5m])
 
 # Savings silently stopped
 sum by (reason) (rate(headroom_compression_failed_total[5m]))
@@ -124,6 +158,22 @@ sum by (reason) (rate(headroom_compression_failed_total[5m]))
 # Traffic mix
 sum by (provider) (rate(headroom_requests_by_provider[5m]))
 ```
+
+> **Migration — these two counters gained labels.** `headroom_requests_failed_total` is now
+> labelled by `provider` and `headroom_requests_rate_limited_total` by `source`, so an
+> unaggregated query that used to return one series now returns several, and a panel or
+> alert that graphed the bare counter will fan out into one line per label value.
+> `sum without (provider) (rate(headroom_requests_failed_total[5m]))` and
+> `sum without (source) (rate(headroom_requests_rate_limited_total[5m]))` reproduce the old
+> single-series behaviour exactly. Both `source` series are exported from process start
+> (including at zero); `failed` exports one series per provider that has actually failed, so
+> it has no series at all until the first failure.
+>
+> The same split is available outside Prometheus: `/stats` carries
+> `requests.rate_limited_by_source` and `requests.failed_by_provider` alongside the
+> unlabelled `requests.rate_limited` / `requests.failed` totals (which are unchanged), the
+> lifetime aggregate carries the same two maps, and the OTel counters
+> `headroom.proxy.requests.rate_limited` / `.failed` carry `source` / `provider` attributes.
 
 ---
 
@@ -177,7 +227,7 @@ These rows *explain* the headline total — they are never added to it.
 
 4. **A 5xx erases its own savings.** Requests that fail upstream are dropped from every savings and token counter. During a provider incident, savings rates look artificially clean while throughput falls.
 
-5. **`/metrics` needs auth if you set a proxy token.** With `HEADROOM_PROXY_TOKEN` set, any non-loopback scraper must send `Authorization: Bearer <token>`. Loopback is always exempt.
+5. **`/metrics` needs auth if you set a proxy token.** With `HEADROOM_PROXY_TOKEN` set, any non-loopback scraper must send `Authorization: Bearer <token>` (or `X-Headroom-Proxy-Token: <token>`). Loopback is always exempt. The proxy removes the token from every request before forwarding it, so it never reaches a model provider.
 
 ---
 
@@ -218,6 +268,17 @@ Verify with `curl -s localhost:8787/stats | jq .otel`.
 
 **Multi-tenant labels:** `register_otel_metric_attribute_provider()` adds request-scoped attributes (tenant, team, cost centre) to every OTel datapoint. Max 16 attributes, 256 chars each.
 
-**Air-gapped deployments:** `HEADROOM_OFFLINE=1` disables all outbound traffic — the anonymous usage beacon (which is **on by default**), the update check, and model downloads.
+**Air-gapped deployments:** `HEADROOM_OFFLINE=1` refuses every connection Headroom itself decides to make to a destination Headroom itself chose. That is the whole list, not a sample: the anonymous usage beacon (which is **on by default**), the update check, the license/usage reporter, **OTLP metric and Langfuse trace export**, HuggingFace / Kompress / fastembed model and tokenizer downloads (Python and Rust), the remote Kompress endpoint, the `headroom install` release-binary and codebase-memory-mcp downloads, the BFCL eval-dataset fetch and the provider SDK clients the eval harness drives, GitHub Copilot device-flow auth and token exchange, the Anthropic / Codex / Copilot subscription pollers, the OpenAI embedders, the Headroom Cloud compression modes in the ASGI and LiteLLM integrations, and the TLS diagnostics (`headroom doctor --network` endpoint checks and the certificate-chain re-probe after an upstream TLS failure).
+
+Four things are deliberately still allowed, and they are the complete set of exceptions:
+
+1. **Your traffic through the proxy.** Requests you send *through* Headroom are still forwarded to the upstream you configured. That is your traffic, not Headroom's, and an air-gapped deployment points it at an on-prem endpoint — refusing it would mean refusing to be a proxy.
+2. **Operator-configured local endpoints.** Today that is exactly one thing: the Ollama embedder, whose address comes entirely from your configuration and defaults to `http://localhost:11434`. No hard-coded internet host is permitted under this exception.
+3. **Loopback.** Health and readiness probes against your own proxy on `127.0.0.1` (`headroom doctor`, the installers, the MCP sidecar).
+4. **Paths an `is_offline()` check already makes unreachable**, where no connection is ever built in the first place.
+
+Those four are enumerated with written reasons in `_EGRESS_ALLOWLIST` in `tests/test_offline_egress_chokepoint.py`, which fails the build if a new egress path appears that is neither guarded nor one of them. There is no category for "known violation": a path that can dial the internet with the flag set is a bug. A refusal reaches you as a message — a Click error on the CLI, a named "model unavailable" from a model loader, a logged line from a background poller — never as a traceback and never as a silent degradation. Enforcing the same policy at the network layer as well is still good practice; it is no longer the only thing standing between you and Headroom-initiated egress.
+
+OTLP export is refused loudly: with `HEADROOM_OFFLINE=1` set, `HEADROOM_OTEL_METRICS_ENABLED=1` plus the default `otlp_http` exporter makes the proxy exit 78 at startup with an explanation, rather than quietly dropping metrics. There is no exemption for a collector that looks local — an in-cluster address is not reliably distinguishable from an internet one. For metrics under an air-gap, either scrape `localhost:8787/metrics` or set `HEADROOM_OTEL_METRICS_EXPORTER=console`, both of which stay on-box. `HEADROOM_KOMPRESS_ENDPOINT` and `HEADROOM_LANGFUSE_ENABLED` are refused the same way, for the same reason.
 
 ---

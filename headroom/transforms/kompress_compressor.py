@@ -17,19 +17,24 @@ from __future__ import annotations
 import contextlib
 import gc
 import hashlib
+import itertools
 import logging
 import os
 import re
 import threading
 import time
 from dataclasses import dataclass
+from functools import lru_cache
 from typing import Any, Literal
 
 from ..config import TransformResult
+from ..offline import OFFLINE_ENV, OfflineEgressBlocked
 from ..onnx_runtime import (
     ONNX_CPU_ARENA_ENV,
+    _resolve_revision,
     create_cpu_session_options,
     hf_entry_known_absent,
+    hf_from_pretrained_local_first,
     hf_hub_download_local_first,
     trim_process_heap,
 )
@@ -68,6 +73,16 @@ _KOMPRESS_MUST_KEEP_RE = re.compile(
     r"|(?i:\b(?:not|never|none|cannot|can't|don't|doesn't|didn't|won't|shouldn't"
     r"|mustn't|isn't|aren't|avoid|refuse|prohibited|forbidden|disallow|unless"
     r"|except|without|must|should|shall|required|always|only|mandatory)\b)"
+    # Boolean connectives, for the same reason as the directive words above:
+    # they decide WHICH predicates have to hold, so dropping one does not
+    # weaken the statement, it changes the condition. Negation was pinned but
+    # conjunction was not, so one line could lose its `or` and keep its `not`
+    # (issue #3545: 12 of 40 `or` lost from a repeated Python return line,
+    # while the same word survived 48/48 in prose). The surviving text is the
+    # dangerous part -- `a == b not c.startswith(d)` still reads as code, and
+    # nothing marks it as altered. Uppercase `AND`/`OR` were already held by
+    # the ALLCAPS class; only the lowercase forms leaked.
+    r"|(?i:\b(?:and|or|nor|xor)\b)"
 )
 _KOMPRESS_MUST_KEEP_ENV = "HEADROOM_KOMPRESS_MUST_KEEP"
 KOMPRESS_BACKEND_ENV = "HEADROOM_KOMPRESS_BACKEND"
@@ -85,6 +100,56 @@ def _add_kompress_must_keep_words(
     for word_idx, word in enumerate(chunk_words):
         if _KOMPRESS_MUST_KEEP_RE.search(word):
             kept_ids.add(word_idx + chunk_start)
+
+
+_TABULAR_ROW_SPLIT_RE = re.compile(r"\s{2,}")
+
+
+def _words_by_line(content: str) -> tuple[list[str], list[int]]:
+    """Split into words like content.split(), plus each word's source line index.
+
+    Reconstruction must never join words that came from different source lines
+    onto one line -- doing so can glue unrelated facts together (#3099).
+    """
+    words: list[str] = []
+    line_ids: list[int] = []
+    for line_idx, line in enumerate(content.split("\n")):
+        for word in line.split():
+            words.append(word)
+            line_ids.append(line_idx)
+    return words, line_ids
+
+
+def _join_kept_words_by_line(words: list[str], line_ids: list[int], kept_ids: set[int]) -> str:
+    """Rejoin kept words, starting a new line wherever they crossed a line boundary."""
+    parts: list[str] = []
+    prev_line: int | None = None
+    for i in sorted(kept_ids):
+        if prev_line is not None:
+            parts.append("\n" if line_ids[i] != prev_line else " ")
+        parts.append(words[i])
+        prev_line = line_ids[i]
+    return "".join(parts)
+
+
+def _tabular_protected_line_ids(content: str) -> set[int]:
+    """Flag lines in a run of >=3 consecutive lines with a consistent fixed-width
+    column count (ls -l, ps, etc.), so compression keeps each such row whole
+    instead of dropping individual fields inconsistently row to row (#3099).
+    Shares the must-keep toggle: HEADROOM_KOMPRESS_MUST_KEEP=0 disables this too.
+    """
+    if os.environ.get(_KOMPRESS_MUST_KEEP_ENV, "1") == "0":
+        return set()
+    cols_per_line = [
+        len(_TABULAR_ROW_SPLIT_RE.split(line.strip())) if line.strip() else 0
+        for line in content.split("\n")
+    ]
+    protected: set[int] = set()
+    for cols, group in itertools.groupby(enumerate(cols_per_line), key=lambda p: p[1]):
+        indices = [idx for idx, _ in group]
+        if cols >= 3 and len(indices) >= 3:
+            protected.update(indices)
+    return protected
 
 
 # ONNX artifacts are resolved against the model repo in this order, falling
@@ -155,6 +220,70 @@ class KompressModelNotCached(RuntimeError):
     defer the download to first use instead of blocking the proxy startup path
     on a network fetch.
     """
+
+
+def _hf_artifact(model_id: str, filename: str, *, allow_network: bool) -> str:
+    """``hf_hub_download_local_first`` with the air-gap refusal translated.
+
+    ``OfflineEgressBlocked`` is a ``BaseException`` so that no ``except
+    Exception:`` can silently degrade an air-gap refusal into "that feature
+    stopped working". At THIS boundary that degradation is the correct
+    behaviour and is written down rather than inherited: a model download is
+    not data leaving the box, every caller below already handles
+    "the model is not available locally", and failing a user's request because
+    an optional compressor could not fetch public weights would punish the
+    request for a decision the operator made about the host.
+
+    So the refusal is logged with the switch named and re-raised as
+    :class:`KompressModelNotCached`, which is exactly what it means: under
+    ``HEADROOM_OFFLINE`` the only artifacts that will ever be available are the
+    cached ones. The original refusal is chained, so it is still in the
+    traceback.
+    """
+    try:
+        return hf_hub_download_local_first(model_id, filename, allow_network=allow_network)
+    except OfflineEgressBlocked as blocked:
+        logger.warning(
+            "Kompress: %r for %s is not cached and %s forbids fetching it (%s). "
+            "Compression falls back to the non-ML path.",
+            filename,
+            model_id,
+            OFFLINE_ENV,
+            blocked,
+        )
+        raise KompressModelNotCached(model_id) from blocked
+
+
+def _hf_pretrained(
+    loader: Any, name: str, *, purpose: str, allow_download: bool, **kwargs: Any
+) -> Any:
+    """``hf_from_pretrained_local_first`` with Kompress's two translations.
+
+    The ``from_pretrained`` counterpart of :func:`_hf_artifact`: cache first,
+    ``guard_egress`` before any remote attempt, and both "not cached while
+    downloads are disallowed" and "not cached while ``HEADROOM_OFFLINE`` is set"
+    surface as :class:`KompressModelNotCached` — the error every Kompress caller
+    already treats as "use the non-ML path". A genuine remote failure while
+    downloads are allowed propagates unchanged.
+    """
+    try:
+        return hf_from_pretrained_local_first(
+            loader, name, purpose=purpose, allow_network=allow_download, **kwargs
+        )
+    except OfflineEgressBlocked as blocked:
+        logger.warning(
+            "Kompress: the %s (%s) is not cached and %s forbids fetching it (%s). "
+            "Compression falls back to the non-ML path.",
+            purpose,
+            name,
+            OFFLINE_ENV,
+            blocked,
+        )
+        raise KompressModelNotCached(name) from blocked
+    except _NOT_CACHED_ERRORS as exc:
+        if allow_download:
+            raise
+        raise KompressModelNotCached(name) from exc
 
 
 # Model cache: model_id -> (model, tokenizer, backend)
@@ -310,6 +439,21 @@ def _time_budget_seconds() -> float | None:
     if raw is None:
         return _DEFAULT_TIME_BUDGET_SECONDS
     return raw if raw > 0 else None
+
+
+def _capped_time_budget(cap: float | None) -> float | None:
+    """The per-call budget, lowered to *cap* when the caller has less to give.
+
+    The router passes what is left of its request-scoped ML budget, so a call
+    -- including the first one of a request, which has no measured cost to be
+    refused on -- stops at a chunk boundary when that budget runs out instead
+    of running to its own, larger, per-call budget.
+    """
+    budget = _time_budget_seconds()
+    if cap is None:
+        return budget
+    cap = max(0.0, cap)
+    return cap if budget is None else min(budget, cap)
 
 
 def _canary_threshold_seconds() -> float | None:
@@ -484,6 +628,7 @@ def _kompress_content_signature(content: str) -> Any:
     )
 
 
+@lru_cache(maxsize=1)
 def _is_onnx_available() -> bool:
     """Check if ONNX Runtime is available (lightweight, no torch needed)."""
     try:
@@ -491,10 +636,13 @@ def _is_onnx_available() -> bool:
         import transformers  # noqa: F401
 
         return True
-    except ImportError:
+    except (ImportError, OSError):
+        # OSError: the package is installed but its native library will not
+        # load. See _is_pytorch_available for the full case.
         return False
 
 
+@lru_cache(maxsize=1)
 def _is_pytorch_available() -> bool:
     """Check if full PyTorch stack is available (requires [ml] extra)."""
     try:
@@ -503,7 +651,14 @@ def _is_pytorch_available() -> bool:
         import transformers  # noqa: F401
 
         return True
-    except ImportError:
+    except (ImportError, OSError):
+        # An installed-but-unloadable native dependency raises OSError, not
+        # ImportError: on Windows without the MSVC redistributable, importing
+        # torch fails with WinError 126 loading c10.dll. Catching only
+        # ImportError let that escape a probe whose contract is to return a
+        # bool, and callers guard the call with `except ImportError` too, so it
+        # propagated into the request path instead of degrading to "no
+        # kompress".
         return False
 
 
@@ -527,9 +682,25 @@ def _get_model_class() -> type:
     class HeadroomCompressorModel(nn.Module):
         """Dual-head ModernBERT: token classification + span importance CNN."""
 
-        def __init__(self, model_name: str = "answerdotai/ModernBERT-base"):
+        def __init__(
+            self,
+            model_name: str = "answerdotai/ModernBERT-base",
+            *,
+            revision: str | None = None,
+            allow_download: bool = True,
+        ):
             super().__init__()
-            self.encoder = AutoModel.from_pretrained(model_name, attn_implementation="eager")
+            # Same pin as the tokenizer: the fine-tuned heads were trained on
+            # this encoder snapshot. Unknown repos resolve to None (floating).
+            # Cache first, air-gap guard before any download (see _hf_pretrained).
+            self.encoder = _hf_pretrained(
+                AutoModel.from_pretrained,
+                model_name,
+                purpose="Kompress PyTorch encoder",
+                allow_download=allow_download,
+                attn_implementation="eager",
+                revision=_resolve_revision(model_name, revision),
+            )
             hidden_size = self.encoder.config.hidden_size  # 768
 
             # Head 1: Token keep/discard
@@ -663,12 +834,19 @@ def _create_onnx_session(
     """
     last_err: Exception | None = None
     cache_miss = False
+    refused: KompressModelNotCached | None = None
     ort: Any = None
     for filename in _onnx_filename_candidates():
         try:
-            onnx_path = hf_hub_download_local_first(
-                model_id, filename, allow_network=allow_download
+            onnx_path = _hf_artifact(
+                model_id, filename, allow_network=allow_download and refused is None
             )
+        except KompressModelNotCached as exc:
+            # Only _hf_artifact's air-gap translation raises this here. It says
+            # THIS candidate is not cached; a later one may be. Keep looking,
+            # cache-only, so the refusal is logged once and never retried.
+            refused = exc
+            continue
         except Exception as exc:
             last_err = exc
             cache_miss = cache_miss or isinstance(exc, _NOT_CACHED_ERRORS)
@@ -694,6 +872,8 @@ def _create_onnx_session(
                 model_id,
                 exc,
             )
+    if refused is not None:
+        raise refused
     if not allow_download and cache_miss:
         raise KompressModelNotCached(model_id) from last_err
     raise FileNotFoundError(
@@ -758,6 +938,9 @@ def _load_kompress_onnx(
         return model, tokenizer, backend
 
 
+_MODERNBERT_TOKENIZER_REPO = "answerdotai/ModernBERT-base"
+
+
 def _load_modernbert_tokenizer(auto_tokenizer: Any, *, allow_download: bool) -> Any:
     """Load the ModernBERT tokenizer, cache-only when ``allow_download`` is False.
 
@@ -770,16 +953,25 @@ def _load_modernbert_tokenizer(auto_tokenizer: Any, *, allow_download: bool) -> 
 
     Same files, same tokenizer, so the loaded object is identical; this only
     changes whether the Hub is consulted to confirm what is already on disk.
-    Mirrors ``onnx_runtime.hf_hub_download_local_first``, which the ONNX half of
-    this loader already uses.
+    Goes through ``onnx_runtime.hf_from_pretrained_local_first`` (via
+    :func:`_hf_pretrained`), the ``from_pretrained`` twin of the
+    ``hf_hub_download_local_first`` the ONNX half of this loader uses, so a cache
+    miss under ``HEADROOM_OFFLINE`` is refused before any remote attempt even
+    when ``HF_HUB_OFFLINE=0`` is set explicitly.
+
+    The load is pinned to the same immutable revision as the model artifacts
+    (``onnx_runtime._PINNED_REVISIONS``): the ONNX export was produced against
+    that tokenizer snapshot, so a floating ``main`` could shift token ids under
+    the shipped weights without any code change. ``HEADROOM_HF_PIN=off`` floats
+    it, exactly as for the weights.
     """
-    try:
-        return auto_tokenizer.from_pretrained("answerdotai/ModernBERT-base", local_files_only=True)
-    except _NOT_CACHED_ERRORS as exc:
-        if not allow_download:
-            raise KompressModelNotCached("answerdotai/ModernBERT-base") from exc
-    # Genuine cache miss and downloading is permitted: fetch it.
-    return auto_tokenizer.from_pretrained("answerdotai/ModernBERT-base", local_files_only=False)
+    return _hf_pretrained(
+        auto_tokenizer.from_pretrained,
+        _MODERNBERT_TOKENIZER_REPO,
+        purpose="ModernBERT tokenizer",
+        allow_download=allow_download,
+        revision=_resolve_revision(_MODERNBERT_TOKENIZER_REPO, None),
+    )
 
 
 # Sub-state-dict keys inside a merged v2-style checkpoint (see
@@ -853,7 +1045,7 @@ def _load_pytorch_weights(model: Any, model_id: str, *, allow_download: bool) ->
     HuggingFace Hub's own cache of confirmed-404 lookups.
     """
     try:
-        ckpt_path = hf_hub_download_local_first(model_id, "merged.pt", allow_network=allow_download)
+        ckpt_path = _hf_artifact(model_id, "merged.pt", allow_network=allow_download)
     except _NOT_CACHED_ERRORS as exc:
         if not allow_download:
             if not hf_entry_known_absent(model_id, "merged.pt"):
@@ -870,9 +1062,7 @@ def _load_pytorch_weights(model: Any, model_id: str, *, allow_download: bool) ->
             # merged.pt genuinely does not exist in this repo (confirmed by a
             # real network lookup, not just a cache miss) - fall back to the
             # plain format instead of treating it as a download failure.
-            weights_path = hf_hub_download_local_first(
-                model_id, "model.safetensors", allow_network=allow_download
-            )
+            weights_path = _hf_artifact(model_id, "model.safetensors", allow_network=allow_download)
             _load_plain_state_dict(model, weights_path, model_id)
             return
         raise
@@ -898,7 +1088,12 @@ def _load_kompress_pytorch(
         logger.info("Downloading Kompress PyTorch model from %s ...", model_id)
 
         HeadroomCompressorModel = _get_model_class()
-        model = HeadroomCompressorModel()
+        try:
+            model = HeadroomCompressorModel(allow_download=allow_download)
+        except _NOT_CACHED_ERRORS as exc:
+            if allow_download:
+                raise
+            raise KompressModelNotCached(_MODERNBERT_TOKENIZER_REPO) from exc
 
         _load_pytorch_weights(model, model_id, allow_download=allow_download)
 
@@ -1097,10 +1292,13 @@ def _download_retry_blocked(model_id: str) -> bool:
     if entry is None:
         return False
     failures, last_attempt = entry
-    window = min(
-        _DOWNLOAD_RETRY_MAX_SECONDS,
-        _DOWNLOAD_RETRY_BASE_SECONDS * (2 ** (failures - 1)),
-    )
+    # Stop doubling at the cap: computing 2 ** (failures - 1) first can
+    # overflow when converted to float after a long run of failed downloads.
+    window = min(_DOWNLOAD_RETRY_BASE_SECONDS, _DOWNLOAD_RETRY_MAX_SECONDS)
+    for _ in range(failures - 1):
+        if window >= _DOWNLOAD_RETRY_MAX_SECONDS:
+            break
+        window = min(window * 2, _DOWNLOAD_RETRY_MAX_SECONDS)
     return bool((time.monotonic() - last_attempt) < window)
 
 
@@ -1109,6 +1307,21 @@ def _background_download(model_id: str, device: str) -> None:
         logger.info("Kompress: downloading model %s in the background ...", model_id)
         _load_kompress(model_id, device, allow_download=True)
         logger.info("Kompress: background model download complete for %s", model_id)
+    except OfflineEgressBlocked as blocked:
+        # Explicit, because OfflineEgressBlocked is a BaseException and would
+        # otherwise reach threading.excepthook as a bare traceback on every
+        # air-gapped startup with a cold cache. This is a background *refresh*,
+        # not the request path: the refusal is reported once, at WARNING, and
+        # the compressor keeps whatever is already cached. Do NOT widen this to
+        # `except Exception` — that is the shape the guard exists to defeat.
+        _record_download_failure(model_id)
+        logger.warning(
+            "Kompress: background model download refused for %s (%s is set): %s. "
+            "The model will only load if its artifacts are already cached.",
+            model_id,
+            OFFLINE_ENV,
+            blocked,
+        )
     except Exception as exc:
         _record_download_failure(model_id)
         logger.warning("Kompress: background model download failed for %s: %s", model_id, exc)
@@ -1168,6 +1381,18 @@ def prefetch_kompress_artifacts(model_id: str = HF_MODEL_ID) -> bool:
         try:
             hf_hub_download_local_first(model_id, filename, allow_network=True)
             return True
+        except OfflineEgressBlocked as blocked:
+            # Same reasoning as _background_download: explicit because it is a
+            # BaseException, reported rather than swallowed, and terminal for
+            # the whole loop — every candidate would be refused for the same
+            # reason, so retrying them just logs the same refusal four times.
+            logger.warning(
+                "Kompress: artifact prefetch refused for %s (%s is set): %s",
+                model_id,
+                OFFLINE_ENV,
+                blocked,
+            )
+            return False
         except Exception as exc:
             logger.debug("Kompress prefetch: %r unavailable for %s: %s", filename, model_id, exc)
     return False
@@ -1345,6 +1570,7 @@ def ccr_retrieval_marker(
     return (
         f"\n[{n_words} words compressed to {compressed_count}"
         f" (from {source_lines} source {line_word})."
+        " Original content preserved."
         f" Retrieve more: hash={cache_key}]"
     )
 
@@ -1402,6 +1628,18 @@ class KompressCompressor(Transform):
     """
 
     name: str = "kompress_compressor"
+
+    # ``compress()`` accepts ``_deadline_started_at``, so a caller that
+    # compresses many blocks for ONE request can hand every call the same
+    # origin and have the deadline bound the request. It also accepts
+    # ``_time_budget_cap_seconds``, which lowers this call's time budget to
+    # what the caller's request-scoped ML budget has left. Duck-typed rather than
+    # isinstance-checked at the call site because ``RemoteKompressCompressor``
+    # is the other compressor the router may get back: its ``compress()`` takes
+    # the cap (flagged by ``accepts_time_budget_cap``) but not the deadline
+    # origin.
+    shares_request_deadline: bool = True
+    accepts_time_budget_cap: bool = True
 
     def __init__(self, config: KompressConfig | None = None):
         self.config = config or KompressConfig()
@@ -1543,6 +1781,7 @@ class KompressCompressor(Transform):
         allow_download: bool = True,
         ccr_original: str | None = None,
         _deadline_started_at: float | None = None,
+        _time_budget_cap_seconds: float | None = None,
     ) -> KompressResult:
         """Compress content using Kompress model.
 
@@ -1568,11 +1807,13 @@ class KompressCompressor(Transform):
             KompressResult with compressed text.
         """
         t_deadline = time.perf_counter() if _deadline_started_at is None else _deadline_started_at
-        words = content.split()
+        words, line_ids = _words_by_line(content)
         n_words = len(words)
 
         if n_words < max(10, self.config.min_input_words) or self._degraded_reason is not None:
             return self._passthrough(content, n_words)
+
+        protected_line_ids = _tabular_protected_line_ids(content)
 
         # Cooperative wall-clock budget (#1171): kompress ONNX inference is
         # O(tokens) and non-preemptible once the request's asyncio timeout fires,
@@ -1603,6 +1844,7 @@ class KompressCompressor(Transform):
                     batch_size=_batch_size(),
                     ccr_originals=[ccr_original],
                     _deadline_started_at=t_deadline,
+                    _time_budget_cap_seconds=_time_budget_cap_seconds,
                 )
                 if batch_result:
                     return batch_result[0]
@@ -1613,7 +1855,7 @@ class KompressCompressor(Transform):
             chunk_count = 0
 
             acquire_timeout = _acquire_timeout_seconds()
-            budget = _time_budget_seconds()
+            budget = _capped_time_budget(_time_budget_cap_seconds)
             deadline = time.monotonic() + budget if budget is not None else None
 
             for chunk_start in range(0, n_words, max_chunk_words):
@@ -1754,6 +1996,10 @@ class KompressCompressor(Transform):
                 # reconstruct from context. Disable via HEADROOM_KOMPRESS_MUST_KEEP=0.
                 _add_kompress_must_keep_words(kept_ids, chunk_words, chunk_start)
 
+            for i, line_id in enumerate(line_ids):
+                if line_id in protected_line_ids:
+                    kept_ids.add(i)
+
             if not kept_ids:
                 if inference_ms >= 1000.0:
                     logger.info(
@@ -1768,7 +2014,7 @@ class KompressCompressor(Transform):
                 return self._passthrough(content, n_words)
 
             compressed_words = [words[w] for w in sorted(kept_ids) if w < n_words]
-            compressed = " ".join(compressed_words)
+            compressed = _join_kept_words_by_line(words, line_ids, kept_ids)
             compressed_count = len(compressed_words)
             cache_key: str | None = None
             original_tokens = n_words
@@ -1879,6 +2125,7 @@ class KompressCompressor(Transform):
         *,
         ccr_originals: list[str | None] | None = None,
         _deadline_started_at: float | None = None,
+        _time_budget_cap_seconds: float | None = None,
     ) -> list[KompressResult]:
         """Compress multiple texts. Uses batched inference on GPU, sequential on CPU.
 
@@ -1973,6 +2220,12 @@ class KompressCompressor(Transform):
         # per-item slowdown measured on ONNX CPU (~0.7-0.9x vs sequential).
         # GPU users still benefit from the batched forward pass below.
         if self._should_use_sequential_fallback():
+            # The cap is for the whole batch, so each item gets what is left.
+            cap_ends_at = (
+                None
+                if _time_budget_cap_seconds is None
+                else time.monotonic() + _time_budget_cap_seconds
+            )
             return [
                 self.compress(
                     content,
@@ -1982,12 +2235,22 @@ class KompressCompressor(Transform):
                     target_ratio=r,
                     ccr_original=ccr_source,
                     _deadline_started_at=t_deadline,
+                    _time_budget_cap_seconds=(
+                        None if cap_ends_at is None else cap_ends_at - time.monotonic()
+                    ),
                 )
                 for content, r, ccr_source in zip(contents, ratios, ccr_sources, strict=True)
             ]
 
         results: list[KompressResult | None] = [None] * n
-        word_lists: list[list[str]] = [c.split() for c in contents]
+        word_lists: list[list[str]] = []
+        line_id_lists: list[list[int]] = []
+        protected_line_ids_list: list[set[int]] = []
+        for c in contents:
+            words, line_ids = _words_by_line(c)
+            word_lists.append(words)
+            line_id_lists.append(line_ids)
+            protected_line_ids_list.append(_tabular_protected_line_ids(c))
 
         # Short texts short-circuit to passthrough — no model call needed.
         max_chunk_words = self.config.chunk_words
@@ -2025,7 +2288,7 @@ class KompressCompressor(Transform):
             self._deadline_s = deadline_s
 
         acquire_timeout = _acquire_timeout_seconds()
-        budget = _time_budget_seconds()
+        budget = _capped_time_budget(_time_budget_cap_seconds)
         deadline = time.monotonic() + budget if budget is not None else None
 
         def _bail_remaining(reason: str, batch_start: int) -> None:
@@ -2169,14 +2432,19 @@ class KompressCompressor(Transform):
                 continue
             content = contents[text_idx]
             words = word_lists[text_idx]
+            line_ids = line_id_lists[text_idx]
             n_words = len(words)
+
+            for i, line_id in enumerate(line_ids):
+                if line_id in protected_line_ids_list[text_idx]:
+                    kept_ids.add(i)
 
             if not kept_ids:
                 results[text_idx] = self._passthrough(content, n_words)
                 continue
 
             compressed_words = [words[w] for w in sorted(kept_ids) if w < n_words]
-            compressed = " ".join(compressed_words)
+            compressed = _join_kept_words_by_line(words, line_ids, kept_ids)
             compressed_count = len(compressed_words)
             cache_key: str | None = None
             original_tokens = n_words
