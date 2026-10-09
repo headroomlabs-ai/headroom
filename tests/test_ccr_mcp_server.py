@@ -539,43 +539,91 @@ def test_run_stdio_reaps_process_on_parent_death(monkeypatch) -> None:
     assert cleaned["done"] is True
 
 
-@pytest.mark.parametrize("token", ["s3cret", ""])
-def test_mcp_proxy_client_sends_proxy_token_header(
-    monkeypatch: pytest.MonkeyPatch, token: str
+class _ProxyGateClient:
+    """``httpx.AsyncClient`` stand-in that sends through the real proxy app.
+
+    Built with the same ``headers`` the MCP server passes, from a fixed peer,
+    so each request crosses the proxy's token gate and loopback guard.
+    """
+
+    def __init__(self, client, headers: dict[str, str] | None) -> None:  # noqa: ANN001
+        self._client = client
+        self._headers = headers
+        self.statuses: list[tuple[str, int]] = []
+
+    async def post(self, url: str, json: object):  # noqa: ANN201
+        return self._record(url, self._client.post(url, json=json, headers=self._headers))
+
+    async def get(self, url: str):  # noqa: ANN201
+        return self._record(url, self._client.get(url, headers=self._headers))
+
+    def _record(self, url: str, response):  # noqa: ANN001, ANN201
+        self.statuses.append((url.rsplit("/", 1)[-1], response.status_code))
+        return response
+
+    async def aclose(self) -> None:
+        return None
+
+
+@pytest.mark.parametrize("mcp_token", ["s3cret", ""], ids=["token", "no-token"])
+def test_mcp_server_against_a_token_gated_remote_proxy(
+    monkeypatch: pytest.MonkeyPatch, mcp_token: str
 ) -> None:
-    """A token-gated remote proxy needs x-headroom-proxy-token on /v1/retrieve and /stats."""
-    seen: list[dict[str, str] | None] = []
+    """Through the real gates: the token opens /stats to a remote MCP server,
+    while /v1/retrieve stays loopback-only and the miss says so."""
+    pytest.importorskip("fastapi")
+    from fastapi.testclient import TestClient
 
-    class Response:
-        status_code = 200
+    from headroom.proxy.server import ProxyConfig, create_app
 
-        @staticmethod
-        def json() -> dict[str, object]:
-            return {}
+    compression_store_module.reset_compression_store()
+    proxy = create_app(
+        ProxyConfig(
+            optimize=False,
+            cache_enabled=False,
+            rate_limit_enabled=False,
+            cost_tracking_enabled=False,
+            proxy_token="s3cret",
+        )
+    )
+    monkeypatch.setenv("HEADROOM_PROXY_TOKEN", mcp_token)
+    clients: list[_ProxyGateClient] = []
 
-        @staticmethod
-        def raise_for_status() -> None:
-            return None
+    # One lifespan; the loopback client only sends requests through the same app.
+    local = TestClient(proxy, base_url="http://127.0.0.1:8787", client=("127.0.0.1", 12345))
+    with TestClient(proxy, client=("203.0.113.5", 44444)) as remote:
 
-    class RecordingClient:
-        def __init__(self, *, timeout: float, headers: dict[str, str] | None = None) -> None:
-            seen.append(headers)
+        def client_factory(*, timeout: float, headers: dict[str, str] | None = None):  # noqa: ANN202
+            clients.append(_ProxyGateClient(remote, headers))
+            return clients[-1]
 
-        async def post(self, url: str, json: object) -> Response:
-            return Response()
+        monkeypatch.setattr(mcp_server.httpx, "AsyncClient", client_factory)
+        server = mcp_server.HeadroomMCPServer(
+            proxy_url="http://proxy.example:8787", check_proxy=False
+        )
 
-        async def get(self, url: str) -> Response:
-            return Response()
+        stats = asyncio.run(server._fetch_full_proxy_stats())
+        assert (stats is not None) == bool(mcp_token)
+        assert clients[0].statuses == [("stats", 200 if mcp_token else 401)]
 
-    monkeypatch.setenv("HEADROOM_PROXY_TOKEN", token)
-    monkeypatch.setattr(mcp_server.httpx, "AsyncClient", RecordingClient)
+        # Content the proxy holds: loopback reads it, the remote MCP server cannot.
+        hash_key = compression_store_module.get_compression_store().store(
+            "original tool output", "compressed"
+        )
+        assert local.post("/v1/retrieve", json={"hash": hash_key}).status_code == 200
 
-    for call in ("retrieve", "stats"):
-        server = mcp_server.HeadroomMCPServer(proxy_url="https://proxy.example", check_proxy=False)
-        if call == "retrieve":
-            asyncio.run(server._retrieve_via_proxy("abc"))
-        else:
-            asyncio.run(server._fetch_full_proxy_stats())
+        server.check_proxy = True
+        monkeypatch.setattr(
+            server, "_get_local_store", lambda: compression_store_module.CompressionStore()
+        )
+        result = asyncio.run(server._retrieve_content(hash_key))
 
-    expected = {"x-headroom-proxy-token": token} if token else None
-    assert seen == [expected, expected]
+    assert "original tool output" not in json.dumps(result)
+    if not mcp_token:
+        # The token gate answers first.
+        assert clients[0].statuses[-1] == ("retrieve", 401)
+        return
+    # Past the token gate, the loopback guard hides the route.
+    assert clients[0].statuses[-1] == ("retrieve", 404)
+    assert result["status"] == "proxy_retrieval_loopback_only"
+    assert "loopback" in result["error"]
