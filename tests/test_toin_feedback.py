@@ -65,7 +65,6 @@ def test_kompress_ccr_retrieval_updates_toin():
     hash_key = compressor._store_in_ccr(
         original,
         compressed,
-        original_tokens=len(original.split()),
     )
 
     assert hash_key is not None
