@@ -21,6 +21,7 @@ from typing import Any
 
 import httpx
 
+from headroom.offline import OfflineEgressBlocked, guard_egress, note_refusal
 from headroom.subscription.models import SubscriptionSnapshot
 
 logger = logging.getLogger(__name__)
@@ -106,6 +107,10 @@ class SubscriptionClient:
         }
 
         try:
+            # First statement in the block that opens the socket, so the guard
+            # provably runs before the client is built (which is also what the
+            # egress meta-test's dominance rule checks).
+            guard_egress("Anthropic subscription usage polling", _USAGE_URL)
             async with httpx.AsyncClient(timeout=self._timeout) as client:
                 resp = await client.get(_USAGE_URL, headers=headers)
 
@@ -123,6 +128,14 @@ class SubscriptionClient:
             data: dict[str, Any] = resp.json()
             return SubscriptionSnapshot.from_api_response(data, token=resolved)
 
+        except OfflineEgressBlocked as blocked:
+            # Refuse, but as a sentence in the log rather than an unhandled
+            # BaseException inside a background poll. The caller reads `None`
+            # as "no window data", which is the truth here: an air-gapped box
+            # cannot know the subscription window, and pretending otherwise
+            # would be worse than saying so once and moving on.
+            note_refusal(blocked, logger)
+            return None
         except httpx.TimeoutException:
             logger.debug("Timeout fetching Anthropic subscription window")
             return None

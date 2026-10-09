@@ -14,6 +14,7 @@ unchanged. Nothing here raises.
 
 from __future__ import annotations
 
+import os
 import re
 
 __all__ = [
@@ -58,6 +59,21 @@ _FOLD_MAX_LINES = 20_000
 _GREP_ROW_RE = re.compile(r"^(?P<path>[^\n:]+):(?P<line>\d+):(?P<content>.*)$")
 # heading-form data row (``line:content``) produced by search_heading.
 _HEADING_ROW_RE = re.compile(r"^(?P<line>\d+):(?P<content>.*)$")
+
+# A timestamped log line is NOT a grep row, but it has the same colon-delimited
+# shape: ``2026-09-02 14:30:00 [FATAL] ...`` splits as path=``2026-09-02 14``,
+# line=``30``, content=``00 [FATAL] ...``. Folding it hoists the date+hour into
+# a heading and strips it from every row, so the model sees ``30:00 [FATAL]``
+# and has to reconstruct the clock itself. The fold round-trips exactly, so the
+# inverse-check in compact_lossless cannot catch it -- it must be excluded here.
+_TIMESTAMP_ROW_RE = re.compile(
+    r"^\s*\[?(?:"
+    r"\d{4}-\d{2}-\d{2}[ T]\d{1,2}:\d{2}"  # 2026-09-02 14:30 / ISO 8601 'T'
+    r"|\d{2}/\d{2}/\d{2,4}[ T]\d{1,2}:\d{2}"  # 09/02/2026 14:30
+    r"|[A-Z][a-z]{2}\s+\d{1,2}\s+\d{1,2}:\d{2}"  # syslog: Aug 16 11:02
+    r"|\d{1,2}:\d{2}:\d{2}(?:[.,]\d+)?(?:\s|\]|$)"  # bare 15:03:53 / [15:03:53]
+    r")"
+)
 
 # unified-diff ``index <sha>..<sha> <mode>`` line. The diff still applies
 # without it (git only uses it for rename/blob bookkeeping).
@@ -234,7 +250,7 @@ def search_heading(text: str) -> str:
     out: list[str] = []
     current_path: str | None = None
     for line in lines:
-        m = _GREP_ROW_RE.match(line)
+        m = None if _TIMESTAMP_ROW_RE.match(line) else _GREP_ROW_RE.match(line)
         if m:
             path = m.group("path")
             if path != current_path:
@@ -307,7 +323,7 @@ def search_dir_heading(text: str) -> str:
     out: list[str] = []
     current_dir: str | None = None
     for line in lines:
-        m = _GREP_ROW_RE.match(line)
+        m = None if _TIMESTAMP_ROW_RE.match(line) else _GREP_ROW_RE.match(line)
         if m and "/" in m.group("path"):
             path = m.group("path")
             cut = path.rindex("/") + 1
@@ -435,6 +451,19 @@ def _smaller(candidate: str, original: str) -> bool:
     return len(candidate) < len(original)
 
 
+#: Env kill-switch for every fold in this module. Read per call (not cached at
+#: import) so the proxy's live ``POST /admin/runtime-env`` hot-sync applies
+#: without a restart, matching how the output-shaper switches behave.
+_LOSSLESS_COMPACTION_ENV = "HEADROOM_LOSSLESS_COMPACTION"
+
+
+def _lossless_compaction_enabled() -> bool:
+    raw = os.environ.get(_LOSSLESS_COMPACTION_ENV)
+    if raw is None:
+        return True
+    return raw.strip().lower() not in ("0", "false", "no", "off")
+
+
 def compact_lossless(content: str, kind: str) -> str:
     """Dispatch format-native lossless compaction by ``kind``.
 
@@ -443,8 +472,15 @@ def compact_lossless(content: str, kind: str) -> str:
     non-semantic bits, e.g. ANSI color for logs); if verification fails or the
     result is not smaller, the original content is returned unchanged. Never
     raises; unknown kinds pass through.
+
+    Set ``HEADROOM_LOSSLESS_COMPACTION=0`` to disable every fold here while
+    leaving the rest of the pipeline (Kompress, SmartCrusher, CCR) active. The
+    folds are byte-reversible, but the model only ever sees the folded side and
+    must reconstruct the original shape itself, which costs output tokens on
+    reasoning models. Operators need to be able to turn that off without
+    resorting to ``--no-optimize`` (which disables all compression).
     """
-    if not content:
+    if not content or not _lossless_compaction_enabled():
         return content
     try:
         if kind == "log":

@@ -1,7 +1,7 @@
 # headroom-oauth2
 
 Generic **OAuth2 client-credentials** upstream-auth extension for the
-[Headroom](https://github.com/chopratejas/headroom) proxy.
+[Headroom](https://github.com/headroomlabs-ai/headroom) proxy.
 
 When Headroom routes to an OpenAI-compatible backend that is protected by an
 OAuth2 client-credentials flow (enterprise AI gateways, Azure AD / Entra, Okta,
@@ -41,3 +41,19 @@ ignore it, so this extension is a no-op there (it logs a warning at startup).
 **Transport:** `token_url` must be `https` (loopback `http` is allowed for tests; set
 `HEADROOM_OAUTH2_ALLOW_INSECURE=1` to override). Tokens are minted with the standard library
 (`urllib`, system cert store), so a corporate-injected CA is trusted without bundling roots.
+
+## What gets the upstream bearer
+
+The minted token is injected only on requests that **go upstream**. Routes the
+proxy answers itself — `/health`, `/livez`, `/readyz`, `/stats*`, `/metrics`,
+`/quota`, `/settings*`, `/dashboard*`, `/admin/*`, `/debug/*`, `/v1/compress*`,
+`/v1/usage`, `/v1/retrieve*`, `/v1/telemetry*`, `/v1/toin*`, `/v1/feedback*`,
+and any extension route under `/ext/` — are passed through untouched, so an
+unreachable IdP never turns a health probe into a 502 and management calls never
+cost a token mint. A `/p/<project>/` base-URL prefix is stripped before the
+check.
+
+Requires `headroom-ai` ≥ 0.40, where extension middleware runs inside the
+proxy's `HEADROOM_PROXY_TOKEN` gate: clients may then authenticate with
+`Authorization: Bearer <proxy token>` and the gate checks it before this
+extension replaces it with the upstream bearer.

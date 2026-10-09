@@ -287,5 +287,28 @@ class TestAnthropicCostEstimation:
         opus = anthropic_provider._get_pricing("claude-opus-4-8")
         assert opus == {"input": 5.00, "output": 25.00, "cached_input": 0.50}
 
+        # The scheduled rise to $3/$15 on 2026-09-01 was cancelled; $2/$10 is standard.
         sonnet = anthropic_provider._get_pricing("claude-sonnet-5")
-        assert sonnet == {"input": 3.00, "output": 15.00, "cached_input": 0.30}
+        assert sonnet == {"input": 2.00, "output": 10.00, "cached_input": 0.20}
+
+    @pytest.mark.parametrize(
+        ("model", "expected"),
+        [
+            ("claude-fable-5-1", {"input": 10.00, "output": 50.00, "cached_input": 0.25}),
+            ("claude-opus-5-5", {"input": 4.00, "output": 20.00, "cached_input": 0.20}),
+            ("claude-opus-5", {"input": 5.00, "output": 25.00, "cached_input": 0.50}),
+            ("claude-sonnet-5-5", {"input": 2.00, "output": 10.00, "cached_input": 0.20}),
+            # Suffixed ids must resolve to their own row, not a shorter prefix's.
+            ("claude-sonnet-5-5[1m]", {"input": 2.00, "output": 10.00, "cached_input": 0.20}),
+            ("claude-fable-5-1-20261001", {"input": 10.00, "output": 50.00, "cached_input": 0.25}),
+            ("claude-opus-5-5-20261001", {"input": 4.00, "output": 20.00, "cached_input": 0.20}),
+        ],
+    )
+    def test_pricing_claude_5_point_releases(self, anthropic_provider, model, expected):
+        assert anthropic_provider._get_pricing(model) == expected
+
+    @pytest.mark.parametrize(
+        "model", ["claude-fable-5-1", "claude-opus-5-5", "claude-opus-5", "claude-sonnet-5-5"]
+    )
+    def test_context_limit_claude_5_point_releases(self, anthropic_provider, model):
+        assert anthropic_provider.get_context_limit(model) == 1_000_000

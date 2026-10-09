@@ -43,6 +43,7 @@ from headroom.memory.storage_router import (
     RequestContext,
     ResolvedScope,
 )
+from headroom.proxy.public_errors import tool_result_error
 
 if TYPE_CHECKING:
     from headroom.memory.backends.local import LocalBackend
@@ -240,8 +241,11 @@ class MemoryHandler:
 
             self._native_memory_dir = _paths.native_memory_dir()
 
-        # Create directory if it doesn't exist
-        self._native_memory_dir.mkdir(parents=True, exist_ok=True)
+        # Create the directory owner-only (and narrow it if an earlier run left
+        # it wider): it holds the model's memory files verbatim.
+        from headroom import fileperms as _fileperms
+
+        _fileperms.private_dir(self._native_memory_dir)
         logger.info(f"Memory: Native memory directory: {self._native_memory_dir}")
 
     def get_beta_headers(self) -> dict[str, str]:
@@ -316,6 +320,27 @@ class MemoryHandler:
             self._initialized = False
             logger.info(f"Memory: backend initialization cancelled (backend={self.config.backend})")
             raise
+        except Exception as exc:
+            # Fail-open for ANY init failure, not just timeout. Memory is an
+            # optional subsystem: a backend that cannot open (e.g. a SQLite
+            # ``unable to open database file`` on a Docker Desktop macOS
+            # bind-mount, issue #3251) must NOT propagate and 500 the whole
+            # request — the docstring's fail-open contract has to hold here too.
+            # Null the possibly-half-assigned backend (same reasoning as the
+            # timeout branch) and leave ``_initialized=False`` so a later
+            # request can retry once the environment recovers.
+            existing_backend = self._backend
+            if existing_backend is not None:
+                await self._close_backend_instance(existing_backend, reason="init_error")
+            self._backend = None
+            self._initialized = False
+            logger.error(
+                "Memory: backend initialization failed (backend=%s); "
+                "serving requests without memory context. Subsequent requests will retry: %s",
+                self.config.backend,
+                exc,
+            )
+            return
 
     async def _init_backend_locked(self) -> None:
         """Actual backend-init body. Must be called with ``_init_lock`` held."""
@@ -654,6 +679,21 @@ class MemoryHandler:
         return self._backend, scope, composed
 
     @staticmethod
+    def _unresolved_project_error(scope: ResolvedScope | None) -> str | None:
+        if (
+            scope is not None
+            and scope.mode is MemoryStorageMode.PROJECT
+            and scope.project_key is None
+        ):
+            return json.dumps(
+                {
+                    "status": "error",
+                    "error": "Memory operation refused because the project could not be resolved",
+                }
+            )
+        return None
+
+    @staticmethod
     def _format_memory_block_header(scope: ResolvedScope | None) -> str:
         """Workspace / scope provenance header for the injected memory block.
 
@@ -748,9 +788,10 @@ class MemoryHandler:
         # PROJECT mode and `unresolved_project_fallback="empty"` (the
         # default after the 2026-05-26 incident). The sentinel signal is
         # `mode=PROJECT` + `project_key=None`: project mode was requested
-        # but no x-headroom-project-id / x-headroom-cwd / system-prompt
-        # cwd: was available, so we have no idea which project this
-        # request belongs to. Returning None here skips injection
+        # but no x-headroom-project-id / x-headroom-cwd /
+        # system-prompt cwd: was available, so we
+        # have no idea which project this request belongs to. Returning
+        # None here skips injection
         # entirely — better than pooling into GLOBAL and surfacing
         # memories from unrelated past sessions (the TAM-550 imperative-
         # misread bug).
@@ -1195,7 +1236,7 @@ your responses, not to drive new actions."""
 
         except Exception as e:
             logger.error(f"Memory: Tool {tool_name} failed: {e}")
-            return json.dumps({"status": "error", "error": str(e)})
+            return json.dumps(tool_result_error(e))
 
     async def _execute_save(
         self,
@@ -1218,6 +1259,8 @@ your responses, not to drive new actions."""
         extracted_relationships = input_data.get("extracted_relationships")
 
         backend, scope, effective_user_id = self._resolve_for_request(user_id, request_context)
+        if error := self._unresolved_project_error(scope):
+            return error
 
         # Agent provenance metadata. Workspace lineage is recorded on
         # the memory itself so cross-project leaks (if any ever
@@ -1311,6 +1354,8 @@ your responses, not to drive new actions."""
         entities_filter = input_data.get("entities")
 
         backend, _scope, effective_user_id = self._resolve_for_request(user_id, request_context)
+        if error := self._unresolved_project_error(_scope):
+            return error
 
         results = await backend.search_memories(
             query=query,
@@ -1367,6 +1412,8 @@ your responses, not to drive new actions."""
         }
 
         backend, _scope, effective_user_id = self._resolve_for_request(user_id, request_context)
+        if error := self._unresolved_project_error(_scope):
+            return error
 
         # Check if backend has update_memory method
         if hasattr(backend, "update_memory"):
@@ -1427,6 +1474,8 @@ your responses, not to drive new actions."""
             return json.dumps({"status": "error", "error": "memory_id is required"})
 
         backend, _scope, _effective = self._resolve_for_request(user_id, request_context)
+        if error := self._unresolved_project_error(_scope):
+            return error
         deleted = await backend.delete_memory(memory_id)
 
         return json.dumps(
@@ -1465,6 +1514,8 @@ your responses, not to drive new actions."""
             return json.dumps({"status": "error", "error": "Memory backend not initialized"})
 
         backend, _scope, effective_user_id = self._resolve_for_request(user_id, request_context)
+        if error := self._unresolved_project_error(_scope):
+            return error
 
         # Prefer a native list_memories if the backend has one (LocalBackend
         # does); fall back to a recency-keyed search when not available.
@@ -1474,7 +1525,7 @@ your responses, not to drive new actions."""
                 results = await list_fn(user_id=effective_user_id, limit=limit)
             except Exception as e:
                 logger.warning(f"Memory: list_memories failed for user {effective_user_id}: {e}")
-                return json.dumps({"status": "error", "error": str(e)})
+                return json.dumps(tool_result_error(e))
         else:
             try:
                 results = await backend.search_memories(
@@ -1484,7 +1535,7 @@ your responses, not to drive new actions."""
                 )
             except Exception as e:
                 logger.warning(f"Memory: list fallback search failed: {e}")
-                return json.dumps({"status": "error", "error": str(e)})
+                return json.dumps(tool_result_error(e))
 
         entries: list[dict[str, Any]] = []
         for r in results:
