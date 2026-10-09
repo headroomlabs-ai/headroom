@@ -2426,8 +2426,7 @@ def serialize_tool_definition_canonical(tool_definition: dict[str, Any]) -> byte
     no ASCII escaping). Python 3.7+ dict insertion order is preserved by
     ``json.dumps`` so callers must construct the tool definition with a
     stable key order — which the static schemas in
-    ``headroom/proxy/memory_handler.py`` and
-    ``headroom/proxy/memory_tool_adapter.py`` already do.
+    ``headroom/proxy/memory_handler.py`` already do.
 
     Returned bytes pin the golden tool definition for a session: every
     follow-up turn must inject byte-equal output to keep the prefix
