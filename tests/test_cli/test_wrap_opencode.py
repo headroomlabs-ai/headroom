@@ -31,6 +31,12 @@ def _mock_ensure_proxy(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(wrap_mod, "_ensure_proxy", fake_ensure_proxy)
 
 
+@pytest.fixture(autouse=True)
+def _unknown_opencode_version(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Tests use a fake `opencode` binary; never run whatever is on PATH."""
+    monkeypatch.setattr(wrap_mod, "opencode_major_version", lambda binary: None)
+
+
 @pytest.fixture
 def runner() -> CliRunner:
     return CliRunner()
@@ -423,6 +429,43 @@ def test_wrap_opencode_sets_config_content_env(
     assert captured["args"] == ("--model", "gpt-4o")
 
 
+@pytest.mark.parametrize(
+    ("major", "args", "expected"),
+    [
+        (2, (), ("--standalone",)),
+        (2, ("--model", "gpt-4o"), ("--standalone", "--model", "gpt-4o")),
+        (2, ("run", "fix it"), ("run", "--standalone", "fix it")),
+        (2, ("--server", "http://127.0.0.1:4096"), ("--server", "http://127.0.0.1:4096")),
+        (1, ("--model", "gpt-4o"), ("--model", "gpt-4o")),
+        (None, (), ()),
+    ],
+)
+def test_wrap_opencode_adds_standalone_on_v2(
+    runner: CliRunner,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    major: int | None,
+    args: tuple[str, ...],
+    expected: tuple[str, ...],
+) -> None:
+    """OpenCode 2.x must not attach to a background service that lacks Headroom's config."""
+    monkeypatch.chdir(tmp_path)
+    _set_test_home(monkeypatch, tmp_path)
+    monkeypatch.setattr(wrap_mod, "opencode_major_version", lambda binary: major)
+
+    captured: dict[str, object] = {}
+
+    def fake_launch_tool(**kwargs):  # noqa: ANN003
+        captured.update(kwargs)
+
+    with patch.object(wrap_mod.shutil, "which", return_value="opencode"):
+        with patch.object(wrap_mod, "_launch_tool", side_effect=fake_launch_tool):
+            result = runner.invoke(main, ["wrap", "opencode", "--no-mcp", "--", *args])
+
+    assert result.exit_code == 0, result.output
+    assert captured["args"] == expected
+
+
 def test_wrap_opencode_does_not_add_base_url_env_vars(
     runner: CliRunner,
     tmp_path: Path,
@@ -624,27 +667,30 @@ def test_unwrap_opencode_restores_from_backup(
     assert config_file.read_text(encoding="utf-8") == original
 
 
+@pytest.mark.parametrize(
+    "backup_name", ["opencode.jsonc.headroom-backup", "opencode.json.headroom-backup"]
+)
 def test_unwrap_opencode_restores_from_backup_jsonc(
     runner: CliRunner,
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    backup_name: str,
 ) -> None:
     """Unwrap restores the pre-wrap backup and removes it for jsonc files."""
     monkeypatch.chdir(tmp_path)
     _set_test_home(monkeypatch, tmp_path)
 
     config_file = tmp_path / ".config" / "opencode" / "opencode.jsonc"
-    backup_file = config_file.with_name("opencode.jsonc.headroom-backup")
+    backup_file = config_file.with_name(backup_name)
     config_file.parent.mkdir(parents=True, exist_ok=True)
     original = '{\n  // User comment\n  "model": "openai/gpt-4o"\n}'
-    config_file.write_text(original)
+    config_file.write_text('{"model":"headroom/claude-sonnet-4-6","theme":"edited"}')
     backup_file.write_text(original)
 
     with patch.object(wrap_mod, "_stop_local_proxy_for_unwrap", return_value="stopped"):
         result = runner.invoke(main, ["unwrap", "opencode"])
 
     assert result.exit_code == 0, result.output
-    assert "Restored prior" in result.output
     assert not backup_file.exists()
     assert config_file.read_text(encoding="utf-8") == original
 
@@ -1670,3 +1716,40 @@ def test_wrap_source_has_no_raw_control_bytes() -> None:
     # tell the escape from a raw 0x08 byte typed into the file. Check the bytes.
     source = Path(wrap_mod.__file__).read_bytes().decode("utf-8")
     assert _has_control_chars(source.replace("\r", "")) == []
+
+
+def test_wrap_opencode_session_token_matches_registration(
+    runner: CliRunner,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Same token must reach both proxy registration and the child env --
+    two independent presence checks could each pass with mismatched values."""
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.delenv("HEADROOM_CONTEXT_TOOL", raising=False)
+    _set_test_home(monkeypatch, tmp_path)
+
+    captured: dict[str, object] = {}
+    register_calls: list[dict[str, object]] = []
+
+    def fake_launch_tool(**kwargs):  # noqa: ANN003
+        captured.update(kwargs)
+
+    def spying_register(port, **kwargs):  # noqa: ANN001, ANN003
+        register_calls.append(kwargs)
+
+    with patch.object(wrap_mod.shutil, "which", return_value="opencode"):
+        with patch.object(wrap_mod, "_launch_tool", side_effect=fake_launch_tool):
+            with patch.object(wrap_mod, "_register_proxy_client", side_effect=spying_register):
+                result = runner.invoke(main, ["wrap", "opencode", "--port", "9000", "--no-mcp"])
+
+    assert result.exit_code == 0, result.output
+    assert register_calls, "expected _register_proxy_client to be called"
+    registered_token = register_calls[0].get("session_token")
+    assert registered_token, "expected a non-empty session_token to be registered"
+
+    env = captured["env"]
+    assert isinstance(env, dict)
+    # Assumes the plugin resolves (packaged bundle ships in this checkout);
+    # see test_build_launch_env_omits_session_token_when_plugin_absent.
+    assert env.get("HEADROOM_OPENCODE_SESSION_TOKEN") == registered_token

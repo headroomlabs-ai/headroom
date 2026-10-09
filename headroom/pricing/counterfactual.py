@@ -55,11 +55,13 @@ beats precise and wrong.
 from __future__ import annotations
 
 import logging
+import math
 from dataclasses import dataclass
 from enum import Enum
 from functools import lru_cache
 from typing import Any
 
+from headroom.cache_economics import CACHE_ECONOMICS
 from headroom.pricing.cache_ttl import CACHE_WRITE_MULTIPLIERS
 
 logger = logging.getLogger(__name__)
@@ -71,30 +73,8 @@ LONG_CONTEXT_THRESHOLD_TOKENS = 200_000
 
 #: Provider-level cache discount ratios, as a fraction of the base input price.
 #: FALLBACK ONLY — the per-model LiteLLM catalog is always preferred, because
-#: these go stale per model and per context tier. Kept here (rather than in
-#: ``proxy/cost.py``, where they used to live) so every consumer shares one copy.
-CACHE_ECONOMICS: dict[str, dict[str, Any]] = {
-    "anthropic": {
-        "read_multiplier": 0.1,
-        "write_multiplier": 1.25,
-        "label": "Explicit breakpoints, 5-min TTL",
-    },
-    "openai": {
-        "read_multiplier": 0.5,
-        "write_multiplier": 1.0,
-        "label": "Automatic, no TTL control",
-    },
-    "gemini": {
-        "read_multiplier": 0.1,
-        "write_multiplier": 1.0,
-        "label": "Explicit cachedContent, configurable TTL",
-    },
-    "bedrock": {
-        "read_multiplier": 0.1,
-        "write_multiplier": 1.25,
-        "label": "Same as Anthropic (Bedrock)",
-    },
-}
+#: these go stale per model and per context tier. The lightweight shared table
+#: is also used by the dashboard, without importing the pricing package there.
 
 
 class Region(str, Enum):
@@ -338,6 +318,8 @@ class CacheRates:
     write_1h: float
     uncached: float
     basis: str = BASIS_CATALOG
+    read_is_catalog: bool = True
+    write_is_catalog: bool = True
 
     def price(self, split: TokenSplit) -> float:
         return (
@@ -373,14 +355,37 @@ def _litellm() -> Any | None:
 _RATE_CACHE_MAXSIZE = 256
 
 
+def _canonical_cache_rate(litellm: Any, model: str, field: str, *, long_context: bool) -> float:
+    """Resolve an absent catalog slice through the model's billing calculator.
+
+    LiteLLM versions and model adapters differ: missing rates can contribute
+    zero, list price, or a model-specific discount. Never invent our own ratio.
+    The result is cached with the other resolved rates, not probed per request.
+    """
+    tokens = LONG_CONTEXT_THRESHOLD_TOKENS + 1 if long_context else 1
+    try:
+        input_cost, _ = litellm.cost_per_token(
+            model=model, prompt_tokens=tokens, completion_tokens=0, **{field: tokens}
+        )
+        rate = float(input_cost) / tokens
+    except Exception:
+        return 0.0
+    return rate if math.isfinite(rate) and rate >= 0 else 0.0
+
+
 @lru_cache(maxsize=_RATE_CACHE_MAXSIZE)
 def resolve_rates(
     model: str,
     *,
     long_context: bool = False,
     provider: str | None = None,
+    for_billing: bool = False,
 ) -> CacheRates | None:
     """Resolve per-bucket input rates for ``model``, or ``None`` if unpriceable.
+
+    ``for_billing`` resolves absent cache rates through LiteLLM's model-specific
+    billing calculation. Savings estimates use the default fallbacks below
+    instead; those estimates must not manufacture billed cache charges.
 
     Preference order, strongest first:
 
@@ -414,7 +419,8 @@ def resolve_rates(
     try:
         from headroom.pricing.litellm_pricing import resolve_litellm_model
 
-        info = litellm.model_cost.get(resolve_litellm_model(model), {}) or {}
+        resolved_model = resolve_litellm_model(model)
+        info = litellm.model_cost.get(resolved_model, {}) or {}
     except Exception:
         return None
 
@@ -432,16 +438,33 @@ def resolve_rates(
         """Read ``field``, preferring its above-200k variant on long requests."""
         if long_context:
             hi = info.get(f"{field}_above_200k_tokens")
-            if hi:
+            if hi is not None:
                 return float(hi)
         value = info.get(field)
         return float(value) if value is not None else default
 
-    read = _tier("cache_read_input_token_cost", base)
-    # A provider that does not bill cache writes leaves this absent; writes then
-    # cost the same as ordinary input, which is exactly OpenAI's and Gemini's
-    # actual behaviour.
-    write_5m = _tier("cache_creation_input_token_cost", base)
+    # Counterfactual savings retain their existing, labelled estimate fallback.
+    # Billed slices consult the canonical model calculator below when the
+    # catalog omits a rate; missing metadata does not imply free cache.
+    missing_cache_rate = 0.0 if for_billing else base
+    read = _tier("cache_read_input_token_cost", missing_cache_rate)
+    # Savings estimates value otherwise unpriced writes at ordinary input;
+    # billed provider-reported writes require their own catalog rate.
+    write_5m = _tier("cache_creation_input_token_cost", missing_cache_rate)
+    read_is_catalog = info.get("cache_read_input_token_cost") is not None or (
+        long_context and info.get("cache_read_input_token_cost_above_200k_tokens") is not None
+    )
+    write_is_catalog = info.get("cache_creation_input_token_cost") is not None or (
+        long_context and info.get("cache_creation_input_token_cost_above_200k_tokens") is not None
+    )
+    if for_billing and not read_is_catalog:
+        read = _canonical_cache_rate(
+            litellm, resolved_model, "cache_read_input_tokens", long_context=long_context
+        )
+    if for_billing and not write_is_catalog:
+        write_5m = _canonical_cache_rate(
+            litellm, resolved_model, "cache_creation_input_tokens", long_context=long_context
+        )
 
     basis = BASIS_CATALOG
     write_1h_raw = info.get("cache_creation_input_token_cost_above_1hr")
@@ -449,7 +472,7 @@ def resolve_rates(
         # No catalog publishes a combined 1h + above-200k rate, so the long
         # tier always derives. Ratio basis, and labelled as such.
         write_1h_raw = None
-    if write_1h_raw:
+    if write_1h_raw is not None:
         write_1h = float(write_1h_raw)
     elif write_5m > base:
         # Real write premium present but no 1h rate: derive structurally.
@@ -460,10 +483,25 @@ def resolve_rates(
         # price; a 1h write costs what any write costs.
         write_1h = write_5m
 
-    if read == base and write_5m == base and base > 0:
+    if (
+        not for_billing
+        and not read_is_catalog
+        and not write_is_catalog
+        and read == base
+        and write_5m == base
+        and base > 0
+    ):
         # Catalog priced the model but published no cache rates. Fall back to
         # the provider ratio table if we can identify the provider.
-        econ = CACHE_ECONOMICS.get((provider or "").split(":")[-1].strip().lower())
+        # Model-only cost consumers do not have a request provider to pass.
+        # Prefer explicit routing context, otherwise use the catalog identity.
+        resolved_provider = provider or info.get("litellm_provider") or ""
+        provider_key = (
+            resolved_provider.split(":")[-1].strip().lower()
+            if isinstance(resolved_provider, str)
+            else ""
+        )
+        econ = CACHE_ECONOMICS.get(provider_key)
         if econ:
             return CacheRates(
                 read=base * float(econ["read_multiplier"]),
@@ -471,9 +509,19 @@ def resolve_rates(
                 write_1h=base * float(econ["write_multiplier"]),
                 uncached=base,
                 basis=BASIS_PROVIDER_RATIO,
+                read_is_catalog=read_is_catalog,
+                write_is_catalog=write_is_catalog,
             )
 
-    return CacheRates(read=read, write_5m=write_5m, write_1h=write_1h, uncached=base, basis=basis)
+    return CacheRates(
+        read=read,
+        write_5m=write_5m,
+        write_1h=write_1h,
+        uncached=base,
+        basis=basis,
+        read_is_catalog=read_is_catalog,
+        write_is_catalog=write_is_catalog,
+    )
 
 
 @dataclass(frozen=True)

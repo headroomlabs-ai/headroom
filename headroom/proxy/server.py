@@ -183,6 +183,7 @@ from headroom.proxy.probe_recorder import probe_recorder_from_env
 from headroom.proxy.project_context import (
     classify_project,
     set_current_project,
+    set_registered_cwd,
     strip_project_path_prefix,
 )
 from headroom.proxy.prometheus_metrics import PrometheusMetrics  # noqa: F401
@@ -200,6 +201,7 @@ from headroom.proxy.tcp_keepalive import install_tcp_keepalive
 from headroom.proxy.tool_schema_savings_policy import tool_schema_saved_from_tags
 from headroom.proxy.upstream_pinning import install_upstream_pinning
 from headroom.proxy.warmup import WarmupRegistry
+from headroom.proxy.workspace_registry import resolve_registered_cwd
 from headroom.proxy.ws_session_registry import WebSocketSessionRegistry
 from headroom.subscription.base import get_quota_registry, reset_quota_registry
 from headroom.subscription.codex_rate_limits import get_codex_rate_limit_state
@@ -1791,7 +1793,12 @@ class HeadroomProxy(
                         remaining,
                     )
 
-        future = loop.run_in_executor(self._compression_executor, _wrapped)
+        # run_in_executor doesn't copy contextvars into the worker thread
+        # (unlike asyncio.to_thread) -- without this, get_registered_cwd()
+        # etc. would silently see the ContextVar default, not what the
+        # request middleware bound.
+        ctx = contextvars.copy_context()
+        future = loop.run_in_executor(self._compression_executor, ctx.run, _wrapped)
         try:
             return await asyncio.wait_for(future, timeout=timeout)
         except asyncio.TimeoutError:
@@ -1816,7 +1823,9 @@ class HeadroomProxy(
         Runs on the dedicated single-thread background executor.
         """
         loop = asyncio.get_running_loop()
-        return await loop.run_in_executor(self._background_compression_executor, fn)
+        # Same context-propagation fix as _run_compression_in_executor above.
+        ctx = contextvars.copy_context()
+        return await loop.run_in_executor(self._background_compression_executor, ctx.run, fn)
 
     # How often the lazy TTL sweep in `_get_compression_cache` may run.
     _COMPRESSION_CACHE_CLEANUP_INTERVAL_SECONDS = 60.0
@@ -3180,11 +3189,13 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
     # Installed here (not at module import) so importing headroom.proxy.server
     # in tests or library contexts does not silently attach a RotatingFileHandler
     # to the user's live proxy log. Multi-worker processes add their PID so
-    # same-port workers never share a RotatingFileHandler target.
-    _setup_file_logging(
-        config.port,
-        process_id=os.getpid() if config.worker_processes > 1 else None,
-    )
+    # same-port workers never share a RotatingFileHandler target. Stateless
+    # mode must not create a log directory or file.
+    if not config.stateless:
+        _setup_file_logging(
+            config.port,
+            process_id=os.getpid() if config.worker_processes > 1 else None,
+        )
 
     # Defensive re-apply of file-backed settings for embedded/non-CLI callers
     # that construct the app without going through the `headroom` CLI entrypoint
@@ -3847,6 +3858,13 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
                     "min_tokens_to_compress",
                     config.min_tokens_to_crush,
                 ),
+                "exclude_tools": sorted(
+                    {
+                        *DEFAULT_EXCLUDE_TOOLS,
+                        *(config.exclude_tools or ()),
+                        *(config.protect_tool_results or ()),
+                    }
+                ),
                 "max_items_after_crush": profile_kwargs.get(
                     "max_items_after_crush",
                     config.max_items_after_crush,
@@ -3976,6 +3994,12 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
         query = request.url.query
         headers = dict(request.headers.items())
         set_current_project(classify_project(headers) or prefix_project)
+        # Non-None only if a live wrap session registered this exact token
+        # (workspace_registry.py) -- the caller-supplied x-headroom-cwd
+        # header is never itself sufficient authority.
+        set_registered_cwd(
+            resolve_registered_cwd(config.port, headers.get("x-headroom-session-token"))
+        )
         # Path-based Codex identification: stamp X-Client: codex on the
         # Responses endpoint for callers that don't otherwise classify (e.g.
         # Codex Desktop, whose User-Agent isn't a known codex UA). Without it
@@ -5126,6 +5150,19 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
             },
             "tokens": {
                 "input": m.tokens_input_total,
+                # Provenance of "input": the provider's own billed count versus
+                # Headroom's tokenizer estimate. Only the first reconciles with
+                # the provider console (input + cache read + cache write).
+                "input_provider_reported": m.tokens_input_provider_reported_total,
+                "input_estimated": m.tokens_input_estimated_total,
+                "input_provider_reported_percent": round(
+                    (m.tokens_input_provider_reported_total / m.tokens_input_total * 100)
+                    if m.tokens_input_total > 0
+                    else 0,
+                    2,
+                ),
+                "requests_input_provider_reported": m.requests_input_provider_reported,
+                "requests_input_estimated": m.requests_input_estimated,
                 "output": m.tokens_output_total,
                 "output_saved": output_reduction.get("tokens_saved", 0),
                 "output_reduction_percent": output_reduction.get("reduction_percent", 0),

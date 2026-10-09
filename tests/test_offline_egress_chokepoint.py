@@ -57,6 +57,27 @@ PACKAGE_ROOT = REPO_ROOT / "headroom"
 # ──────────────────────────── socket booby trap ────────────────────────────
 
 
+class TestUpdateCheckOffline:
+    def test_explicit_update_check_never_constructs_request(self, monkeypatch, offline, no_sockets):
+        from click.testing import CliRunner
+
+        from headroom import update_check
+        from headroom.cli import main
+
+        attempts = []
+
+        def refuse_request(*args, **kwargs):
+            attempts.append((args, kwargs))
+            raise SocketOpened("update check constructed a request while offline")
+
+        monkeypatch.setenv("HEADROOM_UPDATE_CHECK", "on")
+        monkeypatch.setattr(update_check.urllib.request, "Request", refuse_request)
+        result = CliRunner().invoke(main, ["update", "--check"])
+
+        assert attempts == []
+        assert result.exit_code == 1
+
+
 class SocketOpened(AssertionError):
     """Raised from the patched socket entry points.
 
@@ -2271,11 +2292,6 @@ _EGRESS_ALLOWLIST: dict[str, tuple[int, str]] = {
         "deployment that points Headroom at an on-prem model endpoint, which "
         "is the main reason such a deployment exists.",
     ),
-    "update_check.py": (
-        1,
-        "gated: is_update_check_enabled() returns False when is_offline(), so "
-        "the request is never built. See headroom/update_check.py.",
-    ),
     "telemetry/session.py": (
         1,
         "gated: the beacon upload is reached only via is_telemetry_enabled(), "
@@ -2298,8 +2314,9 @@ _EGRESS_ALLOWLIST: dict[str, tuple[int, str]] = {
         "the locally running proxy (/health and /admin/runtime-env).",
     ),
     "cli/learn.py": (
-        1,
-        "loopback: hard-coded http://127.0.0.1:<port>/admin/runtime-env on the local proxy.",
+        2,
+        "loopback: both sites are hard-coded http://127.0.0.1:<port> calls to "
+        "the locally running proxy (/health and /admin/runtime-env).",
     ),
     "cli/mcp.py": (
         1,

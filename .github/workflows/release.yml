@@ -789,7 +789,10 @@ jobs:
           # recommended pattern for release workflows that may run
           # multiple times against the same version.
           skip-existing: true
-          attestations: false
+          # PEP 740 attestations from this job's trusted-publishing identity
+          # (needs only `id-token: write`, granted above). Off since #2405 with
+          # no recorded root cause; if a release fails on them, revert this line.
+          attestations: true
 
   publish-npm:
     needs: [detect-version, build]

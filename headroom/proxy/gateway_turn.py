@@ -51,6 +51,7 @@ from typing import Any
 
 from headroom.proxy.gateway_responses import VIEW_MARKER as GATEWAY_RESPONSES_VIEW_MARKER
 from headroom.proxy.outcome import RequestOutcome
+from headroom.proxy.tool_schema_savings_policy import without_deferral_flags
 from headroom.proxy.turn_hooks import (
     TurnContext,
     merge_provider_headers,
@@ -893,7 +894,7 @@ class RequestTransformer:
         )
         if hooks:
             msg_before = _safe_count(count_messages, messages)
-            tools_before = _safe_count(count_tools, tools)
+            tools_before = _safe_count(count_tools, without_deferral_flags(tools))
             deferred_before = self.tags.get("tool_search_deferred_tools")
             run_request_hooks(ctx, stream_safe_only=not self.caps.redrive_allowed)
             messages = ctx.messages
@@ -911,7 +912,7 @@ class RequestTransformer:
             if msg_before is not None and msg_after is not None and msg_after < msg_before:
                 transforms.append("turn_hook")
                 messages_rewritten = True
-            tools_after = _safe_count(count_tools, tools)
+            tools_after = _safe_count(count_tools, without_deferral_flags(tools))
             if tools_before is not None and tools_after is not None:
                 saved = max(0, tools_before - tools_after)
                 if saved > 0:
