@@ -2314,8 +2314,9 @@ _EGRESS_ALLOWLIST: dict[str, tuple[int, str]] = {
         "the locally running proxy (/health and /admin/runtime-env).",
     ),
     "cli/learn.py": (
-        1,
-        "loopback: hard-coded http://127.0.0.1:<port>/admin/runtime-env on the local proxy.",
+        2,
+        "loopback: both sites are hard-coded http://127.0.0.1:<port> calls to "
+        "the locally running proxy (/health and /admin/runtime-env).",
     ),
     "cli/mcp.py": (
         1,

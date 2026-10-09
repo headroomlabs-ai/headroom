@@ -41,6 +41,8 @@ CUSTOM_BASE_CHAT_PROVIDERS = {
     "api.openai.com": "openai",
     "api.z.ai": "zai",
     "api.meta.ai": "meta",
+    # Grok Build: kept apart from OpenAI so savings rollups get their own row.
+    "api.x.ai": "xai",
 }
 
 # Fixed label for chat traffic on any other custom base.
@@ -72,7 +74,8 @@ def custom_base_passthrough_telemetry(method: str, path: str, base_url: str) -> 
     if method.upper() != "POST":
         return "", ""
     try:
-        host = (urlparse(base_url.strip()).hostname or "").lower()
+        # A fully qualified name (trailing dot) is the same host.
+        host = (urlparse(base_url.strip()).hostname or "").lower().rstrip(".")
     except ValueError:
         return "", ""
     normalized_path = path[1:] if path.startswith("/") else path
