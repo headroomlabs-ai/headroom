@@ -130,6 +130,12 @@ class JSONLStorage(Storage):
         if limit == 0:
             return []
 
+        # Stored timestamps are naive UTC; apply the same normalization to filters.
+        if start_time is not None:
+            start_time = parse_timestamp(format_timestamp(start_time))
+        if end_time is not None:
+            end_time = parse_timestamp(format_timestamp(end_time))
+
         def _matches(metrics: RequestMetrics) -> bool:
             if start_time is not None and metrics.timestamp < start_time:
                 return False
@@ -156,6 +162,11 @@ class JSONLStorage(Storage):
         mode: str | None = None,
     ) -> int:
         """Count metrics matching filters."""
+        if start_time is not None:
+            start_time = parse_timestamp(format_timestamp(start_time))
+        if end_time is not None:
+            end_time = parse_timestamp(format_timestamp(end_time))
+
         count = 0
 
         for metrics in self.iter_all():
@@ -194,6 +205,11 @@ class JSONLStorage(Storage):
         end_time: datetime | None = None,
     ) -> dict[str, Any]:
         """Get summary statistics."""
+        if start_time is not None:
+            start_time = parse_timestamp(format_timestamp(start_time))
+        if end_time is not None:
+            end_time = parse_timestamp(format_timestamp(end_time))
+
         total_requests = 0
         total_tokens_before = 0
         total_tokens_after = 0

@@ -1,6 +1,7 @@
 """Tests for JSONL storage query paging (shared newest-first contract)."""
 
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone, tzinfo
+from pathlib import Path
 
 import pytest
 
@@ -62,6 +63,52 @@ def _expected_page(
 
 def _ids(metrics: list[RequestMetrics]) -> list[str]:
     return [m.request_id for m in metrics]
+
+
+@pytest.mark.parametrize("storage_cls", [JSONLStorage, SQLiteStorage])
+@pytest.mark.parametrize("method", ["query", "count", "get_summary_stats"])
+@pytest.mark.parametrize(
+    "bound_tz",
+    [None, timezone.utc, timezone(timedelta(hours=5, minutes=30)), timezone(timedelta(hours=-7))],
+    ids=["naive-utc", "utc", "positive-offset", "negative-offset"],
+)
+@pytest.mark.parametrize("bounds", ["start", "end", "both", "mixed"])
+def test_storage_time_filters_use_utc(
+    storage_cls: type[JSONLStorage] | type[SQLiteStorage],
+    method: str,
+    bound_tz: tzinfo | None,
+    bounds: str,
+    tmp_path: Path,
+) -> None:
+    """Time filters include UTC boundary rows regardless of the caller's timezone."""
+    boundary = datetime(2026, 4, 23, 23, 59, 59, 500000)
+    aware_boundary = boundary.replace(tzinfo=timezone.utc)
+    local_boundary = boundary if bound_tz is None else aware_boundary.astimezone(bound_tz)
+    if bounds == "start":
+        filters = {"start_time": local_boundary}
+        expected = ["after", "boundary"]
+    elif bounds == "end":
+        filters = {"end_time": local_boundary}
+        expected = ["boundary", "before"]
+    elif bounds == "both":
+        filters = {"start_time": local_boundary, "end_time": local_boundary}
+        expected = ["boundary"]
+    else:
+        filters = {"start_time": local_boundary, "end_time": boundary}
+        expected = ["boundary"]
+
+    with storage_cls(str(tmp_path / "metrics")) as storage:
+        for request_id, delta in [("before", -1), ("boundary", 0), ("after", 1)]:
+            storage.save(_metrics(request_id, aware_boundary + timedelta(seconds=delta)))
+        result = getattr(storage, method)(**filters)
+        if method == "query":
+            assert _ids(result) == expected
+        elif method == "count":
+            assert result == len(expected)
+        else:
+            assert result["total_requests"] == len(expected)
+            assert result["total_tokens_before"] == 1000 * len(expected)
+            assert result["total_tokens_after"] == 800 * len(expected)
 
 
 def _assert_timestamp_desc(metrics: list[RequestMetrics]) -> None:
