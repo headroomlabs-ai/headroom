@@ -22,7 +22,11 @@ from headroom.proxy.helpers import (
     overload_retry_is_futile,
     retry_after_ms,
 )
-from headroom.proxy.provider_usage import billed_input_for_provider
+from headroom.proxy.provider_usage import (
+    anthropic_cache_ttl_buckets,
+    billed_input_for_provider,
+    usage_int,
+)
 from headroom.proxy.token_counting import gemini_output_tokens
 
 if TYPE_CHECKING:
@@ -38,7 +42,6 @@ from headroom.proxy.memory_tool_stream import (
     MemoryToolStreamOverflowError,
 )
 from headroom.proxy.stream_output_tokens import estimate_output_tokens
-from headroom.proxy.thinking_tokens import ThinkingTokens, extract_thinking_tokens
 from headroom.utils import format_exception_message
 
 logger = logging.getLogger("headroom.proxy")
@@ -132,15 +135,6 @@ def _sse_event_outcome(event_name: str | None, data_str: str, dialect: str) -> t
     return failed, terminal
 
 
-def _sse_contains_error_event(payload: bytes) -> bool:
-    from headroom.proxy.helpers import parse_sse_events_from_byte_buffer
-
-    return any(
-        _sse_event_outcome(event_name, data, "chat")[0]
-        for event_name, data in parse_sse_events_from_byte_buffer(bytearray(payload))
-    )
-
-
 _ROUND_USAGE_KEYS = (
     "input_tokens",
     "output_tokens",
@@ -179,23 +173,6 @@ def _upstream_error_frame(error_bytes: bytes, request_id: str) -> bytes:
             public_errors.INTERNAL_ERROR, request_id=request_id
         )
     return f"event: error\ndata: {json.dumps(payload)}\n\n".encode()
-
-
-def _thinking_for_stream(payload: object) -> ThinkingTokens:
-    """Thinking-token split for a reassembled streaming response.
-
-    Shares the estimator with the non-streaming path so a streamed and an
-    unstreamed response of the same shape produce the same number — otherwise
-    the stratum would mix two different rulers.
-
-    Never raises: accounting must not cost a caller their response.
-    """
-    try:
-        from headroom.proxy.handlers.anthropic import _thinking_estimator
-
-        return extract_thinking_tokens(payload, estimator=_thinking_estimator())
-    except Exception:  # noqa: BLE001 - accounting must never break a response
-        return ThinkingTokens()
 
 
 def _sse_dict(value: Any) -> dict[str, Any]:
@@ -310,108 +287,7 @@ class StreamingMixin:
     @staticmethod
     def _extract_anthropic_cache_ttl_metrics(usage: dict[str, Any] | None) -> tuple[int, int]:
         """Extract observed Anthropic cache-write TTL bucket usage."""
-        if not isinstance(usage, dict):
-            return (0, 0)
-        cache_creation = usage.get("cache_creation")
-        if not isinstance(cache_creation, dict):
-            return (0, 0)
-        return (
-            int(cache_creation.get("ephemeral_5m_input_tokens", 0) or 0),
-            int(cache_creation.get("ephemeral_1h_input_tokens", 0) or 0),
-        )
-
-    def _parse_sse_usage(self, chunk: bytes, provider: str) -> dict[str, int] | None:
-        """Parse usage information from SSE chunk.
-
-        For Anthropic: Looks for message_start (input tokens) and message_delta (output tokens)
-        For OpenAI: Looks for final chunk with usage object (requires stream_options.include_usage=true)
-        For Gemini: Looks for usageMetadata in each chunk
-
-        Returns dict with keys: input_tokens, output_tokens, cache_read_input_tokens,
-        cache_creation_input_tokens, cache_creation_ephemeral_5m_input_tokens,
-        cache_creation_ephemeral_1h_input_tokens
-        Returns None if no usage found in this chunk.
-
-        PR-A8 / P1-8: Decoded via the bytes-buffer SSE splitter so multi-byte
-        characters split across TCP reads do not corrupt downstream parsing.
-        Only complete events (terminated by ``\\n\\n``) are decoded; partial
-        bytes are dropped (this method is single-chunk only — the buffered
-        path is in ``_parse_sse_usage_from_buffer``).
-        """
-        from headroom.proxy.helpers import parse_sse_events_from_byte_buffer
-
-        try:
-            buf = bytearray(chunk)
-            events = parse_sse_events_from_byte_buffer(buf)
-            for _event_name, data_str in events:
-                if not data_str or data_str == "[DONE]":
-                    continue
-
-                try:
-                    data = json.loads(data_str)
-                except json.JSONDecodeError:
-                    continue
-                if not isinstance(data, dict):
-                    continue
-
-                usage = {}
-
-                if provider == "anthropic":
-                    # Anthropic sends message_start with input tokens
-                    # and message_delta with output tokens
-                    event_type = data.get("type", "")
-
-                    if event_type == "message_start":
-                        msg_usage = _sse_dict(_sse_dict(data.get("message")).get("usage"))
-                        if msg_usage:
-                            usage["input_tokens"] = msg_usage.get("input_tokens", 0)
-                            usage["cache_read_input_tokens"] = msg_usage.get(
-                                "cache_read_input_tokens", 0
-                            )
-                            usage["cache_creation_input_tokens"] = msg_usage.get(
-                                "cache_creation_input_tokens", 0
-                            )
-                            cache_write_5m, cache_write_1h = (
-                                self._extract_anthropic_cache_ttl_metrics(msg_usage)
-                            )
-                            usage["cache_creation_ephemeral_5m_input_tokens"] = cache_write_5m
-                            usage["cache_creation_ephemeral_1h_input_tokens"] = cache_write_1h
-
-                    elif event_type == "message_delta":
-                        delta_usage = _sse_dict(data.get("usage"))
-                        if delta_usage:
-                            usage["output_tokens"] = delta_usage.get("output_tokens", 0)
-
-                elif provider == "openai":
-                    # OpenAI sends usage in final chunk (when stream_options.include_usage=true)
-                    chunk_usage = _sse_dict(data.get("usage"))
-                    if chunk_usage:
-                        usage["input_tokens"] = chunk_usage.get("prompt_tokens", 0)
-                        usage["output_tokens"] = chunk_usage.get("completion_tokens", 0)
-                        # OpenAI has cached tokens in prompt_tokens_details
-                        details = _sse_dict(chunk_usage.get("prompt_tokens_details"))
-                        usage["cache_read_input_tokens"] = details.get("cached_tokens", 0)
-
-                elif provider == "gemini":
-                    # Gemini sends usageMetadata in each streaming chunk
-                    # Format: {"usageMetadata": {"promptTokenCount": N, "candidatesTokenCount": M}}
-                    usage_meta = _sse_dict(data.get("usageMetadata"))
-                    if usage_meta:
-                        usage["input_tokens"] = usage_meta.get("promptTokenCount", 0)
-                        usage["output_tokens"] = gemini_output_tokens(usage_meta)
-                        # Gemini also has cachedContentTokenCount for context caching
-                        usage["cache_read_input_tokens"] = usage_meta.get(
-                            "cachedContentTokenCount", 0
-                        )
-
-                if usage:
-                    return usage
-
-        except (UnicodeDecodeError, KeyError, TypeError) as e:
-            # Don't fail streaming on parse errors
-            logger.debug(f"SSE usage parsing error for {provider}: {e}")
-
-        return None
+        return anthropic_cache_ttl_buckets(usage)
 
     def _parse_sse_usage_from_buffer(
         self, stream_state: dict[str, Any], provider: str
@@ -504,13 +380,6 @@ class StreamingMixin:
                     if isinstance(response, dict):
                         chunk_usage = response.get("usage")
                 if isinstance(chunk_usage, dict):
-
-                    def _usage_int(value: Any) -> int:
-                        try:
-                            return max(int(value), 0)
-                        except (TypeError, ValueError):
-                            return 0
-
                     # Chat Completions streams report prompt/completion tokens.
                     # Responses streams report input/output tokens under
                     # response.usage on response.completed.
@@ -520,15 +389,15 @@ class StreamingMixin:
                     output_tokens = chunk_usage.get("completion_tokens")
                     if output_tokens is None:
                         output_tokens = chunk_usage.get("output_tokens", 0)
-                    usage_found["input_tokens"] = _usage_int(input_tokens)
-                    usage_found["output_tokens"] = _usage_int(output_tokens)
+                    usage_found["input_tokens"] = usage_int(input_tokens)
+                    usage_found["output_tokens"] = usage_int(output_tokens)
                     details = (
                         chunk_usage.get("prompt_tokens_details")
                         or chunk_usage.get("input_tokens_details")
                         or {}
                     )
                     if isinstance(details, dict):
-                        usage_found["cache_read_input_tokens"] = _usage_int(
+                        usage_found["cache_read_input_tokens"] = usage_int(
                             details.get("cached_tokens")
                         )
 
@@ -1104,8 +973,11 @@ class StreamingMixin:
         #
         # ``parsed_response`` is the reassembled SSE body: it carries the content
         # blocks (thinking among them) and stop_reason, which the raw usage chunk
-        # does not.
-        _stream_thinking = _thinking_for_stream(parsed_response)
+        # does not. Same helper as the non-streaming path, so a streamed and an
+        # unstreamed response of the same shape count the same.
+        from headroom.proxy.handlers.anthropic import _thinking_tokens_for
+
+        _stream_thinking = _thinking_tokens_for(parsed_response)
         _stream_stop_reason = (
             parsed_response.get("stop_reason") if isinstance(parsed_response, dict) else None
         )

@@ -170,6 +170,26 @@ def test_register_server_preserves_malformed_config(tmp_path: Path, contents: st
     assert config_path.read_text(encoding="utf-8") == contents
 
 
+def test_non_utf8_config_fails_cleanly_and_is_left_untouched(tmp_path: Path) -> None:
+    """An opencode.json saved in a non-UTF-8 locale encoding (GBK here) must not
+    crash with a raw UnicodeDecodeError; it is treated as malformed and never
+    rewritten."""
+    from headroom.mcp_registry.base import ServerSpec
+
+    config_path = tmp_path / "opencode.json"
+    original = '{"theme": "主题"}'.encode("gbk")
+    config_path.write_bytes(original)
+    registrar = _registrar(tmp_path)
+
+    spec = ServerSpec(name="headroom", command="headroom", args=("mcp", "serve"))
+    result = registrar.register_server(spec)
+
+    assert result.status == RegisterStatus.FAILED
+    assert "not valid JSON" in result.detail
+    assert registrar.unregister_server("headroom") is False
+    assert config_path.read_bytes() == original
+
+
 def test_register_server_preserves_other_keys(tmp_path: Path) -> None:
     """The happy path merges: theme/model and an existing MCP server survive."""
     from headroom.mcp_registry.base import ServerSpec

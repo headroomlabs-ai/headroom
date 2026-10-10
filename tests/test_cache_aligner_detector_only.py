@@ -335,3 +335,17 @@ def test_no_regex_imported() -> None:
     assert "re" not in mod.__dict__, (
         "headroom.transforms.cache_aligner must not depend on the regex module"
     )
+
+
+def test_align_for_cache_is_deprecated_and_still_works() -> None:
+    from headroom.transforms.cache_aligner import align_for_cache
+
+    messages = [
+        {"role": "system", "content": "You are a helpful assistant."},
+        {"role": "user", "content": "hi"},
+    ]
+    with pytest.warns(DeprecationWarning, match="align_for_cache is deprecated") as record:
+        out, stable_hash = align_for_cache(messages)
+    assert record[0].filename == __file__
+    assert out == messages
+    assert isinstance(stable_hash, str)

@@ -46,7 +46,6 @@ try:
     litellm.set_verbose = False
 
     from litellm import get_model_info as litellm_get_model_info
-    from litellm import model_cost as litellm_model_cost
     from litellm import token_counter as litellm_token_counter
 
     LITELLM_AVAILABLE = True
@@ -54,7 +53,6 @@ except ImportError:
     LITELLM_AVAILABLE = False
     litellm = None  # type: ignore[assignment]
     litellm_token_counter = None  # type: ignore[assignment]
-    litellm_model_cost = None  # type: ignore[assignment]
     litellm_get_model_info = None  # type: ignore[assignment]
 
 

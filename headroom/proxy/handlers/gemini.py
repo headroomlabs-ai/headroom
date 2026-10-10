@@ -62,11 +62,6 @@ class GeminiHandlerMixin:
 
         return await count_tokens_offloaded(self, model, messages)
 
-    async def _count_texts_offloaded(self, model, texts):  # noqa: ANN001, ANN201
-        from headroom.proxy.token_counting import count_texts_offloaded
-
-        return await count_texts_offloaded(self, model, texts)
-
     def _gemini_replay_forwarded_prefix(
         self,
         optimized_messages: list[dict],
