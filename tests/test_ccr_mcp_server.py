@@ -356,6 +356,67 @@ def test_mcp_retrieve_expired_local_hash_can_still_hit_proxy(
     assert result["original_content"] == "from proxy"
 
 
+def test_mcp_retrieve_removal_after_available_is_not_reported_as_expiry(
+    monkeypatch,
+    fresh_store,
+) -> None:
+    """An entry kept alive by access can be older than its idle TTL. If another
+    worker removes it between the status check and the retrieve, that miss is
+    not proof of expiry (#2604)."""
+    current_time = [1000.0]
+
+    def fake_time() -> float:
+        return current_time[0]
+
+    monkeypatch.setattr(mcp_server.time, "time", fake_time)
+    monkeypatch.setattr(compression_store_module.time, "time", fake_time)
+
+    store = get_compression_store()
+    hash_key = store.store("hot content", "<<small>>", ttl=10)
+    for t in (1008.0, 1016.0):
+        current_time[0] = t
+        assert store.retrieve(hash_key) is not None
+    current_time[0] = 1020.0  # age 20s > ttl 10s, idle only 4s
+
+    original_get_entry_status = store.get_entry_status
+
+    def status_then_sibling_delete(*args, **kwargs):
+        result = original_get_entry_status(*args, **kwargs)
+        store._backend.delete(hash_key)
+        return result
+
+    monkeypatch.setattr(store, "get_entry_status", status_then_sibling_delete)
+
+    server = mcp_server.HeadroomMCPServer(check_proxy=False)
+    result = asyncio.run(server._retrieve_content(hash_key))
+
+    assert result.get("status") is None
+    assert "Entry expired" not in result["error"]
+
+
+def test_mcp_retrieve_evicted_hash_reports_capacity(monkeypatch, fresh_store) -> None:
+    """A recorded eviction reaches the MCP caller instead of a generic miss."""
+    current_time = [1000.0]
+
+    def fake_time() -> float:
+        return current_time[0]
+
+    monkeypatch.setattr(compression_store_module.time, "time", fake_time)
+
+    store = get_compression_store()
+    monkeypatch.setattr(store, "_max_entries", 1)
+    hash_key = store.store("first content", "<<small>>")
+    current_time[0] = 1001.0
+    store.store("second content", "<<small>>")
+
+    server = mcp_server.HeadroomMCPServer(check_proxy=False)
+    result = asyncio.run(server._retrieve_content(hash_key))
+
+    assert result["status"] == "evicted"
+    assert "evicted for capacity" in result["error"]
+    assert "do not retry the same hash" in result["error"].lower()
+
+
 def test_mcp_retrieve_missing_hash_still_errors(fresh_store) -> None:
     """A never-stored hash must stay on the generic missing path, not expired guidance."""
     server = mcp_server.HeadroomMCPServer(check_proxy=False)

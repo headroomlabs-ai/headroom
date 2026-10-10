@@ -7,17 +7,23 @@ worker processes — neither holds for the in-memory dict.
 
 from __future__ import annotations
 
+import json
 import os
 import sqlite3
 import time
+from dataclasses import asdict
 
 import pytest
 
 from headroom.cache.backends.sqlite import SQLiteBackend
-from headroom.cache.compression_store import CompressionEntry, CompressionStore
+from headroom.cache.compression_store import (
+    CompressionEntry,
+    CompressionStore,
+    format_retrieval_miss_detail,
+)
 
 
-def make_entry(hash_key: str = "h1", content: str = "x" * 600, ttl: int = 1800) -> CompressionEntry:
+def make_entry(hash_key: str = "h1", content: str = "x" * 600, ttl: int = 3600) -> CompressionEntry:
     return CompressionEntry(
         hash=hash_key,
         original_content=content,
@@ -49,7 +55,7 @@ class TestSQLiteBackend:
         assert got is not None
         assert got.original_content == entry.original_content
         assert got.tool_name == "Read"
-        assert got.ttl == 1800
+        assert got.ttl == 3600
 
         assert b.exists("h1")
         assert b.count() == 1
@@ -177,10 +183,42 @@ class TestSQLiteBackend:
                 "SELECT name FROM sqlite_master WHERE type = 'index' AND name LIKE 'idx_%'"
             )
         }
-        assert indexes == {"idx_ccr_expiry_deadline"}
+        assert "idx_ccr_expiry" not in indexes
+        assert {"idx_ccr_expiry_deadline", "idx_ccr_expires_at"} <= indexes
         entry = b.get("h1")
         assert entry is not None
         assert entry.original_content == make_entry("h1").original_content
+
+    def test_pre_migration_rows_get_an_access_aware_deadline(self, db_path):
+        # A file from before the expires_at column: the purge must honor the
+        # stored last_accessed, not the legacy created_at + ttl wall clock.
+        now = time.time()
+        conn = sqlite3.connect(db_path)
+        conn.execute(
+            "CREATE TABLE ccr_entries (hash TEXT PRIMARY KEY, entry_json TEXT NOT NULL, "
+            "created_at REAL NOT NULL, ttl INTEGER NOT NULL)"
+        )
+        for hash_key, last_accessed in (("warm", now - 10), ("cold", now - 100)):
+            entry = make_entry(hash_key, ttl=60)
+            entry.created_at = now - 100
+            entry.last_accessed = last_accessed
+            data = asdict(entry)
+            del data["max_lifetime"]  # absent from pre-#2604 rows
+            conn.execute(
+                "INSERT INTO ccr_entries VALUES (?, ?, ?, ?)",
+                (hash_key, json.dumps(data), entry.created_at, entry.ttl),
+            )
+        conn.commit()
+        conn.close()
+
+        b = SQLiteBackend(db_path)
+
+        assert b.get("warm") is not None
+        assert b.get("cold") is None
+        (expires_at,) = b._conn.execute(
+            "SELECT expires_at FROM ccr_entries WHERE hash = 'warm'"
+        ).fetchone()
+        assert expires_at == pytest.approx(now + 50)
 
     def test_purge_expired_deletes_by_deadline_and_keeps_the_boundary_row(self, db_path):
         b = SQLiteBackend(db_path)
@@ -363,6 +401,30 @@ class TestMultiWorkerSafety:
         assert not reopened.exists("old")  # swept at open
         assert reopened.exists("fresh")
 
+    def test_backend_purge_leaves_no_reason_and_the_miss_says_so(self, db_path):
+        """A restart loses the removal reason, and the miss text must admit it.
+
+        CompressionStore's tombstone ring is process-local, and the sweep above
+        runs inside the *backend*: by the time a restarted process asks about
+        the hash, the row is gone and nothing recorded why. Reporting the bare
+        "never stored by this store" there would be a lie — the entry was
+        stored, and it expired. The miss has to name both possibilities.
+        """
+        first = CompressionStore(backend=SQLiteBackend(db_path))
+        expired = make_entry(ttl=1)
+        expired.created_at = time.time() - 10
+        first._backend.set("h1", expired)
+        del first  # the tombstone ring does not outlive the process
+
+        # Restart: a fresh backend sweeps "h1" on open, into a fresh store.
+        restarted = CompressionStore(backend=SQLiteBackend(db_path))
+        status = restarted.get_entry_status("h1")
+
+        assert status["status"] == "missing"
+        detail = format_retrieval_miss_detail(status)
+        assert "Entry not found" in detail
+        assert "expired/evicted with no reason recorded" in detail
+
     @pytest.mark.skipif(os.name != "posix", reason="POSIX permissions")
     def test_database_file_is_private(self, db_path):
         SQLiteBackend(db_path)
@@ -375,9 +437,9 @@ class TestDefaults:
         """CCRConfig, CompressionEntry, and CompressionStore must agree."""
         from headroom.config import CCRConfig
 
-        assert CCRConfig().store_ttl_seconds == 1800
-        assert CompressionEntry.__dataclass_fields__["ttl"].default == 1800
-        assert CompressionStore()._default_ttl == 1800
+        assert CCRConfig().store_ttl_seconds == 3600
+        assert CompressionEntry.__dataclass_fields__["ttl"].default == 3600
+        assert CompressionStore()._default_ttl == 3600
 
     def test_default_backend_is_sqlite(self, monkeypatch, tmp_path):
         from headroom.cache.compression_store import _create_default_ccr_backend

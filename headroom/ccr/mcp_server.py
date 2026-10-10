@@ -35,7 +35,10 @@ from typing import TYPE_CHECKING, Any
 
 from headroom import paths as _paths
 from headroom import savings_ledger
-from headroom.cache.compression_store import format_retrieval_miss_detail
+from headroom.cache.compression_store import (
+    DEFAULT_CCR_TTL_SECONDS,
+    format_retrieval_miss_detail,
+)
 from headroom.telemetry import session as telemetry_session
 
 if TYPE_CHECKING:
@@ -196,9 +199,11 @@ def _format_session_summary(
     return "\n".join(lines)
 
 
-# Session-scoped TTL: content persists for the session (1 hour), not 5 minutes.
-# The MCP server process lives as long as the coding session.
-MCP_SESSION_TTL = 3600
+# Session-scoped TTL: an idle window (restarted on every retrieval), so
+# content the session keeps using never expires under it. The MCP server
+# process lives as long as the coding session. Kept equal to the store
+# default so proxy-compressed and MCP-compressed entries age alike (#2604).
+MCP_SESSION_TTL = DEFAULT_CCR_TTL_SECONDS
 
 # Shared stats file: all MCP instances (main + sub-agents) append here.
 # headroom_stats aggregates across all instances within the session window.
@@ -507,19 +512,14 @@ class HeadroomMCPServer:
                 "compressed_item_count": entry.compressed_item_count,
                 "retrieval_count": entry.retrieval_count,
             }
-        if entry_status.get("status") == "expired":
+        if entry_status.get("status") == "available":
+            # retrieve() missed although the entry was live a moment ago: it
+            # expired in between (retrieve() records why) or another worker
+            # removed it. Re-read rather than infer expiry from creation age,
+            # which an idle-window TTL no longer implies (#2604).
+            entry_status = store.get_entry_status(hash_key, clean_expired=False)
+        if entry_status.get("status") in ("expired", "expired_and_purged"):
             expired_entry_status = entry_status
-        elif entry_status.get("status") == "available":
-            created_at = entry_status.get("created_at")
-            ttl_seconds = entry_status.get("ttl_seconds")
-            if isinstance(created_at, (int, float)) and isinstance(ttl_seconds, (int, float)):
-                age_seconds = time.time() - created_at
-                if age_seconds > ttl_seconds:
-                    expired_entry_status = {
-                        **entry_status,
-                        "status": "expired",
-                        "age_seconds": age_seconds,
-                    }
 
         # Fall back to proxy if available
         if self.check_proxy and HTTPX_AVAILABLE:
@@ -546,6 +546,20 @@ class HeadroomMCPServer:
                 "status": "expired",
                 "ttl_seconds": ttl_seconds,
                 "age_seconds": expired_entry_status.get("age_seconds"),
+                "hint": (
+                    "Use the source of truth to regenerate fresh content. "
+                    "Re-run the command or re-read the file."
+                ),
+            }
+
+        if entry_status.get("status") == "evicted":
+            return {
+                "error": (
+                    f"{format_retrieval_miss_detail(entry_status)}. "
+                    "Do not retry the same hash. Re-run the source command or re-read the source file."
+                ),
+                "hash": hash_key,
+                "status": "evicted",
                 "hint": (
                     "Use the source of truth to regenerate fresh content. "
                     "Re-run the command or re-read the file."
