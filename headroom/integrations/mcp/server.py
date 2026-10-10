@@ -38,11 +38,11 @@ Example - Standalone Function:
     )
     ```
 
-Example - Middleware (for MCP client libraries):
+Example - Client wrapper (for MCP client libraries):
     ```python
-    # Wrap your MCP client's transport
-    middleware = HeadroomMCPMiddleware(config)
-    client = MCPClient(transport=middleware.wrap(base_transport))
+    # Wrap your MCP client; tool results come back compressed
+    client = HeadroomMCPClientWrapper(base_client, config=config)
+    result = await client.call_tool("search_logs", {"service": "api"})
     ```
 """
 

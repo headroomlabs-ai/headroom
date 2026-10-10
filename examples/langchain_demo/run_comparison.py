@@ -242,7 +242,7 @@ def run_agent_headroom(scenario: dict, api_key: str) -> AgentRun:
     """Run agent WITH Headroom optimization."""
 
     # Import Headroom integration
-    from headroom import HeadroomConfig
+    from headroom import CacheAlignerConfig, HeadroomConfig, SmartCrusherConfig
     from headroom.integrations import HeadroomChatModel
 
     tools = create_langchain_tools()
@@ -256,15 +256,16 @@ def run_agent_headroom(scenario: dict, api_key: str) -> AgentRun:
 
     # Wrap with Headroom
     config = HeadroomConfig(
-        smart_crusher_threshold=500,  # Compress tool outputs > 500 tokens
-        smart_crusher_max_items=20,  # Keep max 20 items
-        cache_alignment=True,
-        rolling_window=True,
+        smart_crusher=SmartCrusherConfig(
+            min_tokens_to_crush=500,  # Compress tool outputs > 500 tokens
+            max_items_after_crush=20,  # Keep max 20 items
+        ),
+        cache_aligner=CacheAlignerConfig(enabled=True),
     )
 
     headroom_model = HeadroomChatModel(
         wrapped_model=base_model,
-        headroom_config=config,
+        config=config,
     ).bind_tools(tools)
 
     # Build conversation
@@ -327,7 +328,7 @@ def run_agent_headroom(scenario: dict, api_key: str) -> AgentRun:
     duration_ms = (time.time() - start_time) * 1000
 
     # Get Headroom metrics
-    tokens_saved = headroom_model.get_total_tokens_saved()
+    tokens_saved = headroom_model.total_tokens_saved
 
     return AgentRun(
         scenario=scenario["name"],
