@@ -518,6 +518,22 @@ PyPI at most once a day, in the background, and never blocks. Opt out with
 
 </details>
 
+## Uninstall
+
+One command reverses everything Headroom set up — it unwraps each wrapped tool (Codex, Claude, OpenClaw), removes MCP registrations, tears down any persistent supervisor, and stops the local proxy:
+
+```bash
+headroom uninstall                # preview first with: headroom uninstall --dry-run
+headroom uninstall --purge-state  # also delete ~/.headroom (savings history, caches)
+```
+
+Then remove the package with your package manager:
+
+```bash
+pip uninstall headroom-ai
+npm uninstall -g headroom-ai      # if you installed the Node package
+```
+
 <details>
 <summary><b>Corporate networks and SSL inspection</b></summary>
 

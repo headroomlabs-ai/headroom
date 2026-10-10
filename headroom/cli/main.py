@@ -120,6 +120,7 @@ def _register_commands() -> None:
         savings,  # noqa: F401
         telemetry,  # noqa: F401
         tools,  # noqa: F401
+        uninstall,  # noqa: F401
         update,  # noqa: F401
         wrap,  # noqa: F401
     )
