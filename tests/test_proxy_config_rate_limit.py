@@ -28,3 +28,11 @@ def test_zero_rpm_is_inert_when_limiting_disabled():
 def test_valid_rpm_is_accepted():
     config = ProxyConfig(rate_limit_enabled=True, rate_limit_requests_per_minute=60)
     assert config.rate_limit_requests_per_minute == 60
+
+
+def test_anthropic_auto_continue_wait_must_be_positive():
+    with pytest.raises(
+        ValueError,
+        match="anthropic_auto_continue_max_wait_seconds must be > 0",
+    ):
+        ProxyConfig(anthropic_auto_continue_max_wait_seconds=0)
