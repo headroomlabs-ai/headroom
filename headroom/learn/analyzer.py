@@ -1162,18 +1162,3 @@ def _safe_int(val: object) -> int:
         except (ValueError, TypeError):
             return 0
     return 0
-
-
-# =============================================================================
-# Legacy compatibility alias
-# =============================================================================
-
-
-class FailureAnalyzer:
-    """Legacy alias for SessionAnalyzer — used by existing CLI code."""
-
-    def __init__(self) -> None:
-        self._analyzer = SessionAnalyzer()
-
-    def analyze(self, project: ProjectInfo, sessions: list[SessionData]) -> AnalysisResult:
-        return self._analyzer.analyze(project, sessions)

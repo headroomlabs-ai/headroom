@@ -11,10 +11,6 @@ is now a thin shim that:
 2. Routes `SearchCompressor.compress()` entirely through the Rust
    implementation, picking up the parser bug fixes and the
    `signals::LineImportanceDetector` trait consumer pattern.
-3. Implements legacy internals (`_parse_search_results`,
-   `_score_matches`, `_select_matches`, `_format_output`) on top of
-   the same Rust building blocks so the existing 49 unit tests keep
-   covering meaningful code paths.
 
 # Bug fixes the Rust port carries (and this shim therefore inherits)
 
@@ -47,37 +43,6 @@ from dataclasses import dataclass, field
 from typing import cast
 
 from .base import persist_rust_ccr_entry
-
-
-def _is_cjk_char(c: str) -> bool:
-    """True for CJK ideographs, kana, and Hangul. Code-point ranges kept
-    byte-identical with the Rust `is_cjk_char` for search-compressor parity."""
-    o = ord(c)
-    return (
-        0x3040 <= o <= 0x30FF
-        or 0x3400 <= o <= 0x4DBF
-        or 0x4E00 <= o <= 0x9FFF
-        or 0xAC00 <= o <= 0xD7AF
-        or 0xF900 <= o <= 0xFAFF
-    )
-
-
-def _cjk_bigrams(text: str) -> set[str]:
-    """CJK character bigrams from the CJK runs of a (lowercased) query, so a
-    spaceless CJK query can match content. Mirrors the Rust `cjk_bigrams`."""
-    out: set[str] = set()
-    run: list[str] = []
-    for c in text:
-        if _is_cjk_char(c):
-            run.append(c)
-        else:
-            for i in range(len(run) - 1):
-                out.add(run[i] + run[i + 1])
-            run = []
-    for i in range(len(run) - 1):
-        out.add(run[i] + run[i + 1])
-    return out
-
 
 # ─── Public dataclasses (preserve existing import surface) ──────────────────
 
@@ -158,11 +123,8 @@ class SearchCompressionResult:
 class SearchCompressor:
     """Compresses grep/ripgrep search results via the Rust port.
 
-    Drop-in replacement for the retired Python class. The main
-    `compress()` method delegates to Rust end-to-end. The internal
-    helpers used by the existing test surface are preserved and route
-    through the same Rust parser so the bug fixes (Windows paths,
-    dashes-in-filename) land everywhere.
+    Drop-in replacement for the retired Python class. `compress()`
+    delegates to Rust end-to-end.
     """
 
     def __init__(self, config: SearchCompressorConfig | None = None) -> None:
@@ -227,153 +189,6 @@ class SearchCompressor:
             cache_key=cache_key,
             summaries=summaries,
         )
-
-    # ─── Legacy internal helpers (test surface compat) ──────────────────
-
-    def _parse_search_results(self, content: str) -> dict[str, FileMatches]:
-        """Parse via the Rust parser, build legacy Python dataclasses."""
-        from headroom._core import parse_search_lines
-
-        out: dict[str, FileMatches] = {}
-        for file_path, line_no, body in parse_search_lines(content):
-            if file_path not in out:
-                out[file_path] = FileMatches(file=file_path)
-            out[file_path].matches.append(
-                SearchMatch(file=file_path, line_number=int(line_no), content=body)
-            )
-        return out
-
-    def _score_matches(
-        self,
-        file_matches: dict[str, FileMatches],
-        context: str,
-    ) -> None:
-        """Score matches by relevance to context.
-
-        Stays Python so the legacy direct-call test surface keeps
-        working without rebuilding through Rust on every test. The
-        scoring constants mirror Rust `SearchCompressor::score_matches`,
-        pinned by Rust unit tests and Python tests over the same inputs:
-        word-overlap and CJK-bigram scoring are byte-equal. (The error-
-        boost keyword set still diverges for a few terms fixed only on
-        the Rust side -- see keyword_detector; there is no cross-impl
-        assertion, so this equality is test-pinned, not mechanically
-        enforced.)
-        """
-        from headroom.transforms.error_detection import PRIORITY_PATTERNS_SEARCH
-
-        context_lower = context.lower()
-        # Dedup whitespace words (len>2 by codepoints), and add CJK char bigrams
-        # so a spaceless CJK query can match content.
-        context_words = {w for w in context_lower.split() if len(w) > 2}
-        context_words |= _cjk_bigrams(context_lower)
-
-        for fm in file_matches.values():
-            for match in fm.matches:
-                score = 0.0
-                content_lower = match.content.lower()
-
-                for word in context_words:
-                    if word in content_lower:
-                        score += 0.3
-
-                if self.config.boost_errors:
-                    for i, pattern in enumerate(PRIORITY_PATTERNS_SEARCH):
-                        if pattern.search(match.content):
-                            score += 0.5 - (i * 0.1)
-                            break  # only one priority boost per line, matches Rust
-
-                for keyword in self.config.context_keywords:
-                    if keyword.lower() in content_lower:
-                        score += 0.4
-
-                match.score = min(1.0, score)
-
-    def _select_matches(
-        self,
-        file_matches: dict[str, FileMatches],
-        bias: float = 1.0,
-    ) -> dict[str, FileMatches]:
-        """Select top matches per file and globally."""
-        from headroom.transforms.adaptive_sizer import compute_optimal_k
-
-        sorted_files = sorted(
-            file_matches.items(),
-            key=lambda x: sum(m.score for m in x[1].matches),
-            reverse=True,
-        )[: self.config.max_files]
-
-        all_match_strings = [
-            f"{file_path}:{m.line_number}:{m.content}"
-            for file_path, fm in sorted_files
-            for m in fm.matches
-        ]
-        adaptive_total = compute_optimal_k(
-            all_match_strings,
-            bias=bias,
-            min_k=5,
-            max_k=self.config.max_total_matches,
-        )
-
-        selected: dict[str, FileMatches] = {}
-        total_selected = 0
-        for file_path, fm in sorted_files:
-            if total_selected >= adaptive_total:
-                break
-
-            sorted_matches = sorted(fm.matches, key=lambda m: m.score, reverse=True)
-
-            file_selected: list[SearchMatch] = []
-            remaining_slots = min(
-                self.config.max_matches_per_file,
-                adaptive_total - total_selected,
-            )
-
-            if self.config.always_keep_first and fm.first:
-                file_selected.append(fm.first)
-                remaining_slots -= 1
-
-            if (
-                self.config.always_keep_last
-                and fm.last
-                and fm.last is not fm.first
-                and remaining_slots > 0
-            ):
-                file_selected.append(fm.last)
-                remaining_slots -= 1
-
-            for match in sorted_matches:
-                if remaining_slots <= 0:
-                    break
-                if match not in file_selected:
-                    file_selected.append(match)
-                    remaining_slots -= 1
-
-            file_selected.sort(key=lambda m: m.line_number)
-            selected[file_path] = FileMatches(file=file_path, matches=file_selected)
-            total_selected += len(file_selected)
-
-        return selected
-
-    def _format_output(
-        self,
-        selected: dict[str, FileMatches],
-        original: dict[str, FileMatches],
-    ) -> tuple[str, dict[str, str]]:
-        lines: list[str] = []
-        summaries: dict[str, str] = {}
-
-        for file_path, fm in sorted(selected.items()):
-            for match in fm.matches:
-                lines.append(f"{match.file}:{match.line_number}:{match.content}")
-            original_fm = original.get(file_path)
-            if original_fm and len(original_fm.matches) > len(fm.matches):
-                omitted = len(original_fm.matches) - len(fm.matches)
-                summary = f"[... and {omitted} more matches in {file_path}]"
-                lines.append(summary)
-                summaries[file_path] = summary
-
-        return "\n".join(lines), summaries
 
 
 __all__ = [

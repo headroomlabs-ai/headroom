@@ -642,46 +642,6 @@ class HeadroomClient:
             self._storage.save(metrics)
             raise
 
-    def _call_openai(
-        self,
-        *,
-        model: str,
-        messages: list[dict[str, Any]],
-        stream: bool,
-        metrics: RequestMetrics,
-        **kwargs: Any,
-    ) -> Any:
-        """Call OpenAI-style API."""
-        return call_client_transport(
-            "openai",
-            self,
-            model=model,
-            messages=messages,
-            stream=stream,
-            metrics=metrics,
-            **kwargs,
-        )
-
-    def _call_anthropic(
-        self,
-        *,
-        model: str,
-        messages: list[dict[str, Any]],
-        stream: bool,
-        metrics: RequestMetrics,
-        **kwargs: Any,
-    ) -> Any:
-        """Call Anthropic-style API."""
-        return call_client_transport(
-            "anthropic",
-            self,
-            model=model,
-            messages=messages,
-            stream=stream,
-            metrics=metrics,
-            **kwargs,
-        )
-
     def _wrap_stream(
         self,
         stream: Iterator[Any],

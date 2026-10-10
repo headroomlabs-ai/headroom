@@ -20,6 +20,7 @@ fallback. Build it locally with `scripts/build_rust_extension.sh`
 
 from __future__ import annotations
 
+import warnings
 from dataclasses import dataclass
 from typing import Any
 
@@ -133,7 +134,19 @@ class DiffCompressor:
         etc.) alongside the result. Stats is the raw PyO3 wrapper — no
         Python equivalent to mirror to. Typed as `Any` because the PyO3
         class has no Python type stub.
+
+        .. deprecated::
+            Unused inside Headroom; will be removed in a future release. Use
+            :meth:`compress`. Unlike ``compress()``, this method does not write
+            the CCR entry to the compression store, so a retrieval marker in
+            its output may not resolve.
         """
+        warnings.warn(
+            "DiffCompressor.compress_with_stats is deprecated and will be removed in a future "
+            "release; use DiffCompressor.compress instead.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
         r, stats = self._rust.compress_with_stats(content, context)
         result = DiffCompressionResult(
             compressed=r.compressed,
