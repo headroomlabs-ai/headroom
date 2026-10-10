@@ -136,3 +136,64 @@ async def test_ccr_continuation_present_null_usage_does_not_502(
     # The pre-continuation count (100) survives as the fallback.
     assert handler.outcomes[0].optimized_tokens == 100
     assert handler.outcomes[0].cache_read_tokens == 0
+
+
+class _NoUsageResponse:
+    """A successful 200 whose usageMetadata carries no promptTokenCount."""
+
+    status_code = 200
+    content = json.dumps(
+        {"candidates": [{"content": {"parts": [{"text": "hi"}]}}], "usageMetadata": {}}
+    ).encode()
+    headers = {"content-type": "application/json"}
+
+    def json(self) -> object:
+        return json.loads(self.content)
+
+
+class _NoCcrHandler(_CcrHandler):
+    def has_ccr_tool_calls(self, resp_json, provider) -> bool:  # noqa: ANN001
+        return False
+
+
+@pytest.mark.asyncio
+async def test_missing_prompt_token_count_is_not_reported_as_provider_input(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def payload(request):  # noqa: ANN001, ANN201
+        return {"contents": [{"role": "user", "parts": [{"text": "hello"}]}]}
+
+    monkeypatch.setattr("headroom.proxy.helpers._read_request_json", payload)
+
+    handler = _Handler()
+    handler.ccr_response_handler = _NoCcrHandler()
+
+    async def no_usage(method, url, headers, body):  # noqa: ANN001, ANN202
+        return _NoUsageResponse()
+
+    handler._retry_request = no_usage
+    response = await handler.handle_gemini_generate_content(_FakeRequest(), "gemini-pro")
+
+    assert response.status_code == 200
+    (outcome,) = handler.outcomes
+    # Volume still falls back to the local estimate...
+    assert outcome.optimized_tokens == 100
+    # ...but it must not be labelled as Gemini's own billed count.
+    assert outcome.provider_input_tokens == 0
+
+
+@pytest.mark.asyncio
+async def test_reported_prompt_token_count_is_provider_input(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def payload(request):  # noqa: ANN001, ANN201
+        return {"contents": [{"role": "user", "parts": [{"text": "hello"}]}]}
+
+    monkeypatch.setattr("headroom.proxy.helpers._read_request_json", payload)
+
+    handler = _Handler()
+    handler.ccr_response_handler = _NoCcrHandler()
+    response = await handler.handle_gemini_generate_content(_FakeRequest(), "gemini-pro")
+
+    assert response.status_code == 200
+    assert handler.outcomes[0].provider_input_tokens == 100
