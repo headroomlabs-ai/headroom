@@ -141,6 +141,9 @@ class PrometheusMetrics:
         # unlabelled total that /stats and the session summary read.
         self.requests_rate_limited_by_source: dict[str, int] = dict.fromkeys(RATE_LIMIT_SOURCES, 0)
         self.requests_failed = 0
+
+        self.tool_loops_detected = 0
+
         # Per-provider failure attribution. #3615 moved 4xx out of the success
         # funnel, which also took them out of ``requests_by_provider`` (only
         # record_request touches that), leaving Prometheus with no way to tell
@@ -156,6 +159,7 @@ class PrometheusMetrics:
         # healthy proxies. "unknown" is a real bucket -- record_failed uses it
         # when no provider is attributed -- so seeding it invents no provider.
         self.requests_failed_by_provider: dict[str, int] = defaultdict(int, {_PROVIDER_UNKNOWN: 0})
+
         self.inbound_requests_total = 0
         self.inbound_requests_completed = 0
         self.inbound_requests_active = 0
@@ -509,7 +513,11 @@ class PrometheusMetrics:
             self.prefix_freeze_compression_foregone = 0
             self.cache_bust_tokens_lost = 0
             self.cache_bust_count = 0
+
+            self.tool_loops_detected = 0
+
             self._net_tokens_negative = False
+
             self.cache_miss_attribution_by_provider.clear()
             self.savings_history = []
 
@@ -1270,6 +1278,16 @@ class PrometheusMetrics:
         self.savings_tracker.record_lifetime_cache_bust(tokens_lost=tokens_lost)
         self._get_otel_metrics().record_proxy_cache_bust(tokens_lost=tokens_lost)
 
+    async def record_tool_loop_detected(
+        self,
+        tool: str | None = None,
+        period: int = 1,
+    ) -> None:
+        """Record a detected runaway tool repetition loop."""
+        async with self._lock:
+            self.tool_loops_detected += 1
+        self._get_otel_metrics().record_tool_loop_detected(tool=tool, period=period)
+
     def _check_net_tokens_crossing_locked(self) -> tuple[int, int] | None:
         """Return (saved, lost) the first time busts overtake savings, else None.
 
@@ -1439,6 +1457,13 @@ class PrometheusMetrics:
                     f'{_escape_label_value(str(_provider))}"}} {_count}'
                 )
             lines.append("")
+            _append_metric(
+                lines,
+                name="headroom_tool_loop_detected_total",
+                metric_type="counter",
+                help_text="Runaway tool repetition loops detected",
+                value=self.tool_loops_detected,
+            )
             _append_metric(
                 lines,
                 name="headroom_inbound_requests_total",
