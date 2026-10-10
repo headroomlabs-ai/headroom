@@ -84,6 +84,9 @@ class TestErrorClassification:
             ("Killed\nexit code 0", False),
             # The wrapper's zero status belongs to its own line.
             ("worker exited with an error\nwrapper exit code 0", True),
+            # One status phrase wrapped across lines is still one zero status.
+            ("Process exited with\nexit code 0", False),
+            ("Killed: 9", True),
             # Case-insensitive signals the shared is_error_content would miss.
             ("zsh: no such file or directory: ./run.sh", True),
             ("fatal: path 'x' does not exist in 'HEAD'", True),
@@ -127,6 +130,7 @@ class TestErrorClassification:
             ("ConnectionError: [Errno 111] Connection refused", "connection_error"),
             ("task killed by signal SIGKILL", "exit_code"),
             ("python train.py\nKilled", "exit_code"),
+            ("Killed: 9", "exit_code"),
         ],
     )
     async def test_error_category_recorded(

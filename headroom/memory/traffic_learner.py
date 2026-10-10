@@ -243,7 +243,8 @@ _ERROR_SIGNALS: tuple[re.Pattern[str], ...] = (
 # nonzero (signed codes such as -9 included). Status evidence belongs to its own
 # line: a zero code never hides a separate explicit failure elsewhere in the
 # output (a nonzero code, "non-zero", a signal kill, or an "exited with ..." line
-# that carries no code of its own).
+# that carries no code of its own). A line that ends at "exited with" continues
+# on the next line ("Process exited with\nexit code 0"), so it is not a failure.
 # A standalone "Killed" line is the shell's SIGKILL message, but a successful
 # command can also print that word, so it counts only when no exit status is
 # reported at all. It is recognized even below the short-content cut-off.
@@ -252,7 +253,7 @@ _EXIT_STATUS_RE = re.compile(
 )
 _EXIT_FAILURE_RE = re.compile(r"non-zero|nonzero|exited with signal|killed by signal", re.I)
 _KILLED_LINE_RE = re.compile(r"^\s*Killed(?::\s*\d+)?\s*$", re.M)
-_EXITED_WITH_RE = re.compile(r"exited with", re.I)
+_EXITED_WITH_RE = re.compile(r"exited with(?=\s*\S)", re.I)
 
 
 def _exit_status_is_error(snippet: str) -> bool:
