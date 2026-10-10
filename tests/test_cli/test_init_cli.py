@@ -1797,7 +1797,9 @@ def test_ensure_profile_running_logs_a_failed_recovery(monkeypatch, caplog) -> N
     monkeypatch.setattr(init_cli, "runtime_status", lambda manifest: "stopped")
     monkeypatch.setattr(init_cli, "runtime_ownership", lambda manifest: "service")
     monkeypatch.setattr(
-        init_cli, "wait_ready", lambda manifest, timeout_seconds, require_identity: False
+        init_cli,
+        "wait_ready",
+        lambda manifest, timeout_seconds, require_identity: timeout_seconds == 45,
     )
     monkeypatch.setattr(init_cli, "start_supervisor", lambda manifest: None)
 
@@ -1817,4 +1819,39 @@ def test_ensure_profile_running_logs_a_failed_recovery(monkeypatch, caplog) -> N
     assert messages == [
         "headroom: could not start persistent proxy 'service-profile': launchctl bootstrap "
         "failed. Check it with `headroom install status --profile service-profile`."
+    ]
+
+
+def test_ensure_profile_running_logs_a_recovery_that_never_becomes_ready(
+    monkeypatch, caplog
+) -> None:
+    init_cli, _ = _load_init_module(monkeypatch)
+    manifest = SimpleNamespace(
+        preset=init_cli.InstallPreset.PERSISTENT_TASK.value,
+        supervisor_kind=init_cli.SupervisorKind.NONE.value,
+        profile="task-profile",
+    )
+    started: list[str] = []
+
+    @contextmanager
+    def fake_start_lock(profile: str):
+        yield True
+
+    monkeypatch.setattr(init_cli, "load_manifest", lambda profile: manifest)
+    monkeypatch.setattr(init_cli, "acquire_runtime_start_lock", fake_start_lock)
+    monkeypatch.setattr(init_cli, "runtime_status", lambda manifest: "stopped")
+    monkeypatch.setattr(init_cli, "runtime_ownership", lambda manifest: "task")
+    monkeypatch.setattr(
+        init_cli, "wait_ready", lambda manifest, timeout_seconds, require_identity: False
+    )
+    monkeypatch.setattr(init_cli, "start_detached_agent", started.append)
+
+    with caplog.at_level("WARNING", logger="headroom.cli.init"):
+        init_cli._ensure_profile_running("task-profile")
+
+    assert started == ["task-profile"]
+    messages = [r.getMessage() for r in caplog.records if r.name == "headroom.cli.init"]
+    assert messages == [
+        "headroom: could not start persistent proxy 'task-profile': it did not become ready "
+        "within 45s. Check it with `headroom install status --profile task-profile`."
     ]

@@ -875,7 +875,7 @@ def _ensure_profile_running(profile: str) -> None:
         return
     if manifest is None:
         return
-    failure: Exception | None = None
+    failure: str | None = None
     with _suppress_hook_output():
         if wait_ready(manifest, timeout_seconds=1, require_identity=True):
             return
@@ -899,12 +899,13 @@ def _ensure_profile_running(profile: str) -> None:
                     start_supervisor(manifest)
                 else:
                     start_detached_agent(manifest.profile)
-                wait_ready(manifest, timeout_seconds=45, require_identity=True)
+                if not wait_ready(manifest, timeout_seconds=45, require_identity=True):
+                    failure = "it did not become ready within 45s"
         except (click.ClickException, RuntimeError, OSError, subprocess.SubprocessError) as exc:
             # Supervisor and runtime starts raise these; anything else is a bug
             # and should surface. Report outside the suppressed block so the
             # one line reaches stderr while stdout stays clean for the hook.
-            failure = exc
+            failure = str(exc)
     if failure is not None:
         logger.warning(
             "headroom: could not start persistent proxy %r: %s. "
