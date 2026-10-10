@@ -33,6 +33,8 @@ from enum import Enum
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, ClassVar
 
+from headroom.learn._shared import classify_error
+
 if TYPE_CHECKING:
     from headroom.learn.models import ProjectInfo
     from headroom.memory.backends.local import LocalBackend
@@ -218,40 +220,49 @@ def _strip_leading_cd(cmd: str) -> str:
 
 
 # =============================================================================
-# Error Classification (reused from learn/scanner.py patterns)
+# Error Detection
 # =============================================================================
 
-_ERROR_PATTERNS: list[tuple[re.Pattern[str], str]] = [
-    (
-        re.compile(r"No such file or directory|ENOENT|FileNotFoundError|does not exist", re.I),
-        "file_not_found",
-    ),
-    (re.compile(r"ModuleNotFoundError|ImportError|No module named", re.I), "module_not_found"),
-    (re.compile(r"command not found", re.I), "command_not_found"),
-    (re.compile(r"Permission denied|EACCES|EPERM|auto-denied", re.I), "permission_denied"),
-    (re.compile(r"file is too large|too many lines|exceeds.*limit", re.I), "file_too_large"),
-    (re.compile(r"SyntaxError|IndentationError", re.I), "syntax_error"),
-    (re.compile(r"Traceback \(most recent|Exception:|Error:", re.I), "runtime_error"),
-    (re.compile(r"timed? ?out|TimeoutError|deadline exceeded", re.I), "timeout"),
-    (re.compile(r"exit code|non-zero|exited with", re.I), "exit_code"),
-    (re.compile(r"BUILD FAILED|compilation error|compile error", re.I), "build_failure"),
-]
+# OpenAI-format tool results carry no is_error flag, so failures are sniffed
+# from the output. Categories come from headroom.learn._shared.classify_error;
+# these patterns only decide *whether* the output is an error.
+_ERROR_SIGNALS: tuple[re.Pattern[str], ...] = (
+    re.compile(r"No such file or directory|ENOENT|FileNotFoundError|does not exist", re.I),
+    re.compile(r"ModuleNotFoundError|ImportError|No module named", re.I),
+    re.compile(r"command not found", re.I),
+    re.compile(r"Permission denied|EACCES|EPERM|auto-denied", re.I),
+    re.compile(r"file is too large|too many lines|exceeds.*limit", re.I),
+    re.compile(r"SyntaxError|IndentationError", re.I),
+    re.compile(r"Traceback \(most recent|Exception:|Error:", re.I),
+    re.compile(r"timed? ?out|TimeoutError|deadline exceeded", re.I),
+    re.compile(r"BUILD FAILED|compilation error|compile error", re.I),
+)
+
+# Agent harnesses (Codex, Grok, opencode, ...) append "exit code 0" to every
+# SUCCESSFUL shell command, so an exit code only signals an error when it is
+# nonzero. "non-zero" and a bare "exited with ..." (no code) still count.
+_EXIT_STATUS_RE = re.compile(
+    r"\bexit(?:ed)?(?:\s+with)?(?:\s+exit)?\s+(?:code|status)\s*:?\s*(\d+)", re.I
+)
+_EXIT_FAILURE_RE = re.compile(r"non-zero|nonzero", re.I)
+_EXITED_WITH_RE = re.compile(r"exited with", re.I)
 
 
-def _classify_error(content: str) -> str | None:
-    """Classify error content. Returns category or None if not an error."""
-    snippet = content[:2000]
-    for pattern, category in _ERROR_PATTERNS:
-        if pattern.search(snippet):
-            return category
-    return None
+def _exit_status_is_error(snippet: str) -> bool:
+    codes = _EXIT_STATUS_RE.findall(snippet)
+    if any(int(code) != 0 for code in codes) or _EXIT_FAILURE_RE.search(snippet):
+        return True
+    return not codes and bool(_EXITED_WITH_RE.search(snippet))
 
 
 def _is_error(content: str) -> bool:
     """Quick check if tool output looks like an error."""
     if not content or len(content) < 10:
         return False
-    return _classify_error(content) is not None
+    snippet = content[:2000]
+    if any(pattern.search(snippet) for pattern in _ERROR_SIGNALS):
+        return True
+    return _exit_status_is_error(snippet)
 
 
 # =============================================================================
@@ -793,7 +804,7 @@ class TrafficLearner:
             "input": tool_input,
             "output": tool_output[:2000],  # Cap for memory
             "is_error": is_error,
-            "error_category": _classify_error(tool_output) if is_error else None,
+            "error_category": classify_error(tool_output).value if is_error else None,
             "timestamp": time.time(),
             "agent_type": agent_type,
         }

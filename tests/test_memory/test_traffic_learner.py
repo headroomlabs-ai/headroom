@@ -18,10 +18,8 @@ from headroom.memory.traffic_learner import (
     TrafficLearner,
     _bash_binaries_match,
     _bash_first_binary,
-    _classify_error,
     _commands_related_as_retry,
     _drop_contradictions,
-    _is_error,
     _levenshtein,
     _load_persisted_patterns_from_sqlite,
     _normalize_bash_for_hash,
@@ -40,28 +38,97 @@ UTC = timezone.utc
 
 
 class TestErrorClassification:
-    def test_file_not_found(self):
-        assert _classify_error("No such file or directory: foo.py") == "file_not_found"
-        assert _classify_error("FileNotFoundError: [Errno 2]") == "file_not_found"
+    """The learner classifies tool output with the shared learn classifier."""
 
-    def test_command_not_found(self):
-        assert _classify_error("zsh: command not found: ruff") == "command_not_found"
+    @pytest.fixture
+    def learner(self):
+        return TrafficLearner(backend=None, user_id="test-user", min_evidence=1)
 
-    def test_module_not_found(self):
-        assert _classify_error("ModuleNotFoundError: No module named 'foo'") == "module_not_found"
+    @staticmethod
+    def _openai_result(learner: TrafficLearner, output: str) -> dict:
+        messages = [
+            {
+                "role": "assistant",
+                "tool_calls": [
+                    {"id": "c1", "function": {"name": "shell", "arguments": '{"command": "ls"}'}}
+                ],
+            },
+            {"role": "tool", "tool_call_id": "c1", "content": output},
+        ]
+        return learner.extract_tool_results_from_openai_messages(messages)[0]
 
-    def test_permission_denied(self):
-        assert _classify_error("Permission denied: /etc/shadow") == "permission_denied"
+    @pytest.mark.parametrize(
+        ("output", "is_error"),
+        [
+            # Successful shell commands from Codex/Grok/opencode end in "exit code 0".
+            ("Process exited with exit code 0\nall tests passed", False),
+            ("README.md\nsrc\nexit code 0", False),
+            # Nonzero exit codes and other exit-failure wording.
+            ("Exit code: 1\nWall time: 0.2s\nOutput:\nfail", True),
+            ("exit code 2", True),
+            ("Command failed with non-zero status 1", True),
+            ("process exited with status 1", True),
+            ("x" * 1500 + "\nexit code 3", True),
+            # Case-insensitive signals the shared is_error_content would miss.
+            ("zsh: no such file or directory: ./run.sh", True),
+            ("fatal: path 'x' does not exist in 'HEAD'", True),
+            ("open /etc/shadow: permission denied", True),
+            ("EACCES: permission denied, open '/x'", True),
+            ("Operation not permitted (EPERM) on /x", True),
+            ("File content exceeds maximum allowed tokens limit (25000)", True),
+            ("file is too large to read", True),
+            ("Exception: something broke badly", True),
+            ("context deadline exceeded while dialing", True),
+            ("x" * 1500 + "\nTraceback (most recent call last):\nValueError: late", True),
+            # Signals the old detector already caught.
+            ("No such file or directory: foo.py", True),
+            ("ModuleNotFoundError: No module named 'foo'", True),
+            ("zsh: command not found: ruff", True),
+            ("Tool call auto-denied by policy", True),
+            ("IndentationError: unexpected indent here", True),
+            ("TimeoutError: deadline exceeded after 30s", True),
+            ("Command timed out after 120s", True),
+            ("BUILD FAILED in 3s", True),
+            # Not errors.
+            ("All tests passed, everything is fine", False),
+            ("2 failed, 10 passed in 1.2s", False),
+            ("Checked 4 files, no errors found in output", False),
+            ("short", False),
+            ("", False),
+        ],
+    )
+    def test_error_detection(self, learner: TrafficLearner, output: str, is_error: bool):
+        assert self._openai_result(learner, output)["is_error"] is is_error
 
-    def test_not_an_error(self):
-        assert _classify_error("Everything is fine, tests passed!") is None
-        assert _classify_error("") is None
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("output", "category"),
+        [
+            ("No such file or directory: foo.py", "file_not_found"),
+            ("zsh: command not found: ruff", "command_not_found"),
+            ("ModuleNotFoundError: No module named 'foo'", "module_not_found"),
+            ("Permission denied: /etc/shadow", "permission_denied"),
+            ("TimeoutError: deadline exceeded after 30s", "timeout"),
+            ("ConnectionError: [Errno 111] Connection refused", "connection_error"),
+        ],
+    )
+    async def test_error_category_recorded(
+        self, learner: TrafficLearner, output: str, category: str
+    ):
+        await learner.on_tool_result(
+            tool_name="Bash", tool_input={"command": "x"}, tool_output=output, is_error=True
+        )
+        assert learner._tool_history[-1]["error_category"] == category
 
-    def test_is_error_helper(self):
-        assert _is_error("No such file or directory")
-        assert not _is_error("All tests passed")
-        assert not _is_error("")
-        assert not _is_error("short")
+    @pytest.mark.asyncio
+    async def test_success_has_no_error_category(self, learner: TrafficLearner):
+        await learner.on_tool_result(
+            tool_name="Bash",
+            tool_input={"command": "x"},
+            tool_output="Everything is fine, tests passed!",
+            is_error=False,
+        )
+        assert learner._tool_history[-1]["error_category"] is None
 
 
 # =============================================================================
