@@ -1289,6 +1289,9 @@ class LiteLLMBackend(Backend):
                 kwargs["tools"] = [_convert_anthropic_tool(t) for t in tools_in]
             if "tool_choice" in body:
                 kwargs["tool_choice"] = _convert_tool_choice(body["tool_choice"])
+            # Standard provider param — forward it instead of silently dropping.
+            if "service_tier" in body:
+                kwargs["service_tier"] = body["service_tier"]
 
             # System prompt (Anthropic puts it in body, OpenAI in messages)
             if "system" in body:

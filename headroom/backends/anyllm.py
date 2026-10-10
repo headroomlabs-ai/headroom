@@ -302,6 +302,8 @@ class AnyLLMBackend(Backend):
                 kwargs["tools"] = [_convert_anthropic_tool(t) for t in body["tools"]]
             if "tool_choice" in body:
                 kwargs["tool_choice"] = _convert_tool_choice(body["tool_choice"])
+            if "service_tier" in body:
+                kwargs["service_tier"] = body["service_tier"]
 
             logger.debug(f"any-llm request: provider={self.provider}, model={original_model}")
 
@@ -352,6 +354,8 @@ class AnyLLMBackend(Backend):
                 kwargs["tools"] = [_convert_anthropic_tool(t) for t in body["tools"]]
             if "tool_choice" in body:
                 kwargs["tool_choice"] = _convert_tool_choice(body["tool_choice"])
+            if "service_tier" in body:
+                kwargs["service_tier"] = body["service_tier"]
 
             msg_id = f"msg_{uuid.uuid4().hex[:24]}"
 
@@ -538,6 +542,7 @@ class AnyLLMBackend(Backend):
                 "response_format",
                 "seed",
                 "n",
+                "service_tier",
             ]:
                 if param in body:
                     kwargs[param] = body[param]
@@ -659,6 +664,7 @@ class AnyLLMBackend(Backend):
                 "response_format",
                 "seed",
                 "n",
+                "service_tier",
             ]:
                 if param in body:
                     kwargs[param] = body[param]

@@ -761,3 +761,23 @@ async def test_close_is_noop(monkeypatch: pytest.MonkeyPatch) -> None:
     backend, _instance = make_backend(monkeypatch)
     assert await backend.close() is None
     assert isinstance(StreamEvent(event_type="message_start", data={}), StreamEvent)
+
+
+@pytest.mark.asyncio
+async def test_send_message_forwards_service_tier(monkeypatch: pytest.MonkeyPatch) -> None:
+    """service_tier is a standard provider param — forward it, don't drop it."""
+    backend, instance = make_backend(monkeypatch)
+    instance.response = make_response(
+        make_choice("done", "stop"),
+        usage=SimpleNamespace(prompt_tokens=1, completion_tokens=1),
+    )
+    await backend.send_message(
+        {
+            "model": "claude-3-7-sonnet",
+            "messages": [{"role": "user", "content": [{"type": "text", "text": "hi"}]}],
+            "max_tokens": 16,
+            "service_tier": "standard_only",
+        },
+        {},
+    )
+    assert instance.calls[0]["service_tier"] == "standard_only"
