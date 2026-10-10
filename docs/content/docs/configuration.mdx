@@ -408,6 +408,24 @@ headroom proxy --learn --min-evidence 3
 
 For provider-only proxying, prefer `HEADROOM_HTTP_PROXY` over process-wide variables such as `HTTP_PROXY`, `HTTPS_PROXY`, `ALL_PROXY`, or `NO_PROXY`. HTTPX reads those global variables, but Headroom also passes them through to tool executions.
 
+### Model-prefix upstream routes
+
+Set `HEADROOM_UPSTREAM_ROUTES` to a JSON array to route multiple model families through one proxy and share its savings history:
+
+```bash
+export HEADROOM_UPSTREAM_ROUTES='[{"model_prefix":"glm-","upstream":"https://ollama.com","auth":"env:OLLAMA_API_KEY"},{"model_prefix":"claude-","protocol":"anthropic","auth":"passthrough"},{"model_prefix":"*","auth":"passthrough"}]'
+```
+
+Routes match the request model by case-insensitive prefix, in array order; `*` matches any model. `upstream` overrides the base URL and must not contain credentials, a query, or a fragment. Without `upstream`, `protocol` selects the configured `openai` or `anthropic` target. Omitted `protocol` defaults to `openai` for every handler; set `"protocol":"anthropic"` for Anthropic destinations, including catch-all routes. Routes select a destination without translating the request protocol.
+
+This applies to direct Chat Completions, Responses, Anthropic Messages, and Responses WebSocket-to-HTTP fallback requests. Native WebSocket connections retain their existing destination: the handshake precedes the model-bearing payload. Explicit per-request upstream overrides and ChatGPT session routing retain their existing handling.
+
+`auth: "passthrough"` retains client credentials. `auth: "env:VARNAME"` removes inbound `Authorization`, `x-api-key`, `api-key`, `Cookie`, `Proxy-Authorization`, and `x-goog-api-key` headers, then injects the environment value as a bearer token. Tokens are read per request; missing or empty tokens reject the request before contacting the route. Rate limiting uses the inbound caller's identity, not the substituted upstream credential.
+
+Configured extra headers use the existing operator-designated host policy: provider target hosts and `HEADROOM_UPSTREAM_ALLOWED_HOSTS` may receive them. Adding a route does not automatically add its host to this set, and client overrides bypass route auth. Operator-configured routes support HTTP and HTTPS, like the existing provider targets. Use HTTPS for credential-bearing upstreams; HTTP requires a trusted local transport or network layer to protect those credentials.
+
+Unset or empty routes preserve existing routing. Unmatched models use the existing destination. Route configuration is parsed at startup; invalid configuration prevents startup rather than silently falling back. Restart the proxy after changing the route array.
+
 ### Cold-prefix hook & reasoning compaction
 
 Two related optimizations target tokens that agent harnesses re-send every turn:

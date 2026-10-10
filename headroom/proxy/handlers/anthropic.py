@@ -36,6 +36,7 @@ from headroom.ccr.marker_resolution import resolve_markers_in_response
 from headroom.ccr.tool_calls import has_ccr_retrieve_tool
 from headroom.copilot_auth import apply_copilot_api_auth, is_copilot_upstream_url
 from headroom.pipeline import PipelineStage, summarize_routing_markers
+from headroom.providers.registry import UpstreamAuthUnavailable
 from headroom.proxy import public_errors
 from headroom.proxy.anthropic_wire import (
     build_anthropic_upstream_url,
@@ -405,6 +406,28 @@ class AnthropicHandlerMixin:
         from headroom.proxy.token_counting import count_tokens_offloaded
 
         return await count_tokens_offloaded(self, model, messages)
+
+    def _anthropic_route_auth_error(self) -> Any:
+        """502 returned when a matched multi-upstream BearerAuth route has
+        no token (``UpstreamAuthUnavailable``). Fails closed before the
+        upstream is contacted; the message is generic so the env-var name
+        is never leaked to the client.
+        """
+        from fastapi.responses import JSONResponse
+
+        return JSONResponse(
+            status_code=502,
+            content={
+                "type": "error",
+                "error": {
+                    "type": "server_error",
+                    "message": (
+                        "Upstream route is not configured with a valid "
+                        "credential. Please contact the proxy operator."
+                    ),
+                },
+            },
+        )
 
     def _resolve_ccr_workspace(
         self,
@@ -1260,6 +1283,21 @@ class AnthropicHandlerMixin:
             # user turn later in this handler to preserve Anthropic prefix caching.
             # Extract headers and tags
             headers = dict(request.headers.items())
+            if (
+                self.anthropic_backend is None
+                and upstream_base_url is None
+                and getattr(self, "provider_runtime", None) is not None
+                and self.provider_runtime.match_upstream_route(model) is not None
+            ):
+                try:
+                    upstream_base_url, headers = self.resolve_upstream(
+                        protocol="anthropic",
+                        model=model,
+                        headers=headers,
+                        default_url=self.ANTHROPIC_API_URL,
+                    )
+                except UpstreamAuthUnavailable:
+                    return self._anthropic_route_auth_error()
             headers.pop("host", None)
             headers.pop("content-length", None)
             # read_request_json_with_bytes already content-decoded the inbound
@@ -1339,7 +1377,7 @@ class AnthropicHandlerMixin:
                 # One identity rule for every provider: peer-owned, and
                 # credential-scoped only for proxy-token / direct loopback
                 # callers (headroom/proxy/rate_limit_identity.py).
-                rate_key = rate_limit_identity(request, headers)
+                rate_key = rate_limit_identity(request)
                 allowed, wait_seconds = await self.rate_limiter.check_request(rate_key)
                 if not allowed:
                     await self.metrics.record_rate_limited(

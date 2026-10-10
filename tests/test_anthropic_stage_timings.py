@@ -55,6 +55,12 @@ class _ResponseStub:
 class _DummyAnthropicHandler(AnthropicHandlerMixin):
     ANTHROPIC_API_URL = "https://api.anthropic.com"
 
+    def resolve_upstream(self, *, protocol, model, headers):
+        # Legacy single-upstream resolve. HEADROOM_UPSTREAM_ROUTES routing
+        # is covered in test_multi_upstream_*; here we reproduce the
+        # pre-routing behavior (ANTHROPIC_API_URL, headers unchanged).
+        return self.ANTHROPIC_API_URL, headers
+
     def __init__(self) -> None:
         self.rate_limiter = None
         self.metrics = _DummyMetrics()

@@ -1201,7 +1201,7 @@ def test_openai_chat_custom_base_flood_cannot_grow_the_provider_set(
     # ``limited_auth``; the identity rule itself is covered by its own tests.
     monkeypatch.setattr(
         "headroom.proxy.handlers.openai.rate_limit_identity",
-        lambda request, headers: headers.get("authorization", ""),
+        lambda request: request.headers.get("authorization", ""),
     )
     # Isolated sinks: a fresh lifetime store and workspace, so the exact
     # counts below are this test's traffic and nothing reaches ~/.headroom.

@@ -87,6 +87,7 @@ from headroom.providers.codex.runtime import (
 from headroom.providers.copilot import model_prefers_responses_api
 from headroom.providers.grok.runtime import DEFAULT_API_URL as XAI_API_URL
 from headroom.providers.proxy_targets import route_grok_to_xai
+from headroom.providers.registry import UpstreamAuthUnavailable
 from headroom.proxy import public_errors
 from headroom.proxy.auth_mode import (
     classify_auth_mode,
@@ -1716,6 +1717,28 @@ class OpenAIHandlerMixin:
     OPENAI_RESPONSES_MESSAGE_ROUTER_MIN_BYTES = 8192
     OPENAI_RESPONSES_OUTPUT_TYPES = _RESPONSES_OUTPUT_ITEM_TYPES
 
+    def _openai_route_auth_error(self) -> Any:
+        """502 returned when a matched multi-upstream BearerAuth route has
+        no token (``UpstreamAuthUnavailable``). Fails closed before the
+        upstream is contacted; the message is generic so the env-var name
+        is never leaked to the client.
+        """
+        from fastapi.responses import JSONResponse
+
+        return JSONResponse(
+            status_code=502,
+            content={
+                "error": {
+                    "message": (
+                        "Upstream route is not configured with a valid "
+                        "credential. Please contact the proxy operator."
+                    ),
+                    "type": "server_error",
+                    "code": "upstream_auth_unavailable",
+                }
+            },
+        )
+
     def _openai_responses_unit_cache(self) -> tuple[Any, OrderedDict[str, Any]]:
         with _OPENAI_RESPONSES_UNIT_CACHE_INIT_LOCK:
             lock = getattr(self, "_openai_responses_unit_cache_lock", None)
@@ -3145,6 +3168,22 @@ class OpenAIHandlerMixin:
         )
         custom_upstream_base_url = _resolve_openai_upstream_base(request.headers)
         upstream_base_url = self._resolve_openai_upstream(request)
+        routed_headers: dict[str, str] | None = None
+        if (
+            self.anthropic_backend is None
+            and custom_upstream_base_url is None
+            and getattr(self, "provider_runtime", None) is not None
+            and self.provider_runtime.match_upstream_route(model) is not None
+        ):
+            try:
+                upstream_base_url, routed_headers = self.resolve_upstream(
+                    protocol="openai",
+                    model=model,
+                    headers=dict(request.headers.items()),
+                    default_url=upstream_base_url,
+                )
+            except UpstreamAuthUnavailable:
+                return self._openai_route_auth_error()
         handler_path_suffix = _resolve_openai_chat_handler_path(
             upstream_base_url,
             model,
@@ -3238,7 +3277,7 @@ class OpenAIHandlerMixin:
                 if compressor and hasattr(compressor, "close"):
                     compressor.close()
 
-        headers = dict(request.headers.items())
+        headers = routed_headers if routed_headers is not None else dict(request.headers.items())
         headers.pop("host", None)
         headers.pop("content-length", None)
         # The parsed body was already content-decoded upstream, so the bytes we
@@ -3284,7 +3323,13 @@ class OpenAIHandlerMixin:
             self.config.openai_extra_headers
             if self.anthropic_backend is not None
             else self._openai_extra_headers_for_upstream(upstream_base_url),
-            upstream_url=(None if self.anthropic_backend is not None else custom_upstream_base_url),
+            upstream_url=(
+                None
+                if self.anthropic_backend is not None
+                else upstream_base_url
+                if routed_headers is not None
+                else custom_upstream_base_url
+            ),
             config=self.config,
         )
         log_outbound_headers(
@@ -3361,7 +3406,7 @@ class OpenAIHandlerMixin:
 
         # Rate limiting
         if self.rate_limiter:
-            rate_key = rate_limit_identity(request, headers)
+            rate_key = rate_limit_identity(request)
             allowed, wait_seconds = await self.rate_limiter.check_request(rate_key)
             if not allowed:
                 await self.metrics.record_rate_limited(
@@ -5610,6 +5655,9 @@ class OpenAIHandlerMixin:
 
         _pre_strip_count_resp = sum(1 for k in headers if k.lower().startswith("x-headroom-"))
         headers = _strip_internal_headers(headers)
+        # Classify subscription routing before an env-auth route can replace
+        # the inbound OAuth bearer containing the ChatGPT account claim.
+        headers, is_chatgpt_auth = _resolve_codex_routing_headers(headers)
         # Client header and resolved candidate are different values. CCR and
         # the secret-header gate see only x-headroom-base-url (None when the
         # client did not set one). Routing uses the resolved candidate:
@@ -5621,10 +5669,32 @@ class OpenAIHandlerMixin:
         custom_upstream_base_url = _resolve_openai_upstream_base(request.headers)
         upstream_base_url = custom_upstream_base_url
         openai_upstream_base_url = self._resolve_openai_upstream(request)
+        if (
+            custom_upstream_base_url is None
+            and not is_chatgpt_auth
+            and getattr(self, "provider_runtime", None) is not None
+            and self.provider_runtime.match_upstream_route(model) is not None
+        ):
+            try:
+                openai_upstream_base_url, headers = self.resolve_upstream(
+                    protocol="openai",
+                    model=model,
+                    headers=headers,
+                    default_url=openai_upstream_base_url,
+                )
+            except UpstreamAuthUnavailable:
+                return self._openai_route_auth_error()
         headers = merge_extra_headers(
             headers,
             self._openai_extra_headers_for_upstream(openai_upstream_base_url),
-            upstream_url=custom_upstream_base_url,
+            upstream_url=(
+                openai_upstream_base_url
+                if (
+                    getattr(self, "provider_runtime", None) is not None
+                    and self.provider_runtime.match_upstream_route(model) is not None
+                )
+                else custom_upstream_base_url
+            ),
             config=self.config,
         )
         # Mirror the WS handler: never forward Codex's client-only lite header
@@ -5644,7 +5714,6 @@ class OpenAIHandlerMixin:
             stripped_count=_pre_strip_count_resp,
             request_id=request_id,
         )
-        headers, is_chatgpt_auth = _resolve_codex_routing_headers(headers)
         if is_chatgpt_auth:
             client = "codex"
         codex_project = None
@@ -5770,7 +5839,7 @@ class OpenAIHandlerMixin:
 
         # Rate limiting
         if self.rate_limiter:
-            rate_key = rate_limit_identity(request, headers)
+            rate_key = rate_limit_identity(request)
             allowed, wait_seconds = await self.rate_limiter.check_request(rate_key)
             if not allowed:
                 await self.metrics.record_rate_limited(provider="openai", source="headroom")
@@ -9799,7 +9868,39 @@ class OpenAIHandlerMixin:
         if is_chatgpt_fallback:
             http_url = codex_responses_http_url()
         else:
-            http_url = build_copilot_upstream_url(self.OPENAI_API_URL, "/v1/responses")
+            ws_payload = body.get("response", body) if isinstance(body, dict) else {}
+            ws_model = ws_payload.get("model") if isinstance(ws_payload, dict) else None
+            try:
+                if (
+                    getattr(self, "provider_runtime", None) is not None
+                    and self.provider_runtime.match_upstream_route(ws_model) is not None
+                ):
+                    base_url, resolved_headers = self.resolve_upstream(
+                        protocol="openai",
+                        model=ws_model,
+                        headers=upstream_headers,
+                        default_url=self.OPENAI_API_URL,
+                    )
+                else:
+                    base_url, resolved_headers = self.OPENAI_API_URL, upstream_headers
+            except UpstreamAuthUnavailable:
+                # Fail closed before contacting the upstream: relay a WS
+                # error event (the HTTP-101 is already accepted on this arm,
+                # so we cannot return a 502) and stop.
+                error_event = {
+                    "type": "error",
+                    "error": {
+                        "type": "server_error",
+                        "message": (
+                            "Upstream route is not configured with a valid "
+                            "credential. Please contact the proxy operator."
+                        ),
+                    },
+                }
+                await websocket.send_text(json.dumps(error_event))
+                return (0, 0, 0, 0, 0)
+            http_url = build_copilot_upstream_url(base_url, "/v1/responses")
+            upstream_headers = resolved_headers
 
         # Build HTTP body from the WS response.create payload.
         # WS messages use {"type": "response.create", "response": {...}} wrapper.
