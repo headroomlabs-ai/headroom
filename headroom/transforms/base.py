@@ -35,12 +35,14 @@ def persist_rust_ccr_entry(original: str, compressed: str, cache_key: str, *, so
         # key explicitly so retrieving the marker hash finds the entry (#816).
         store.store(original, compressed, explicit_hash=cache_key)
     except Exception as e:
+        # Store backends can echo the payload in errors, so the detail goes to DEBUG only.
         logger.warning(
-            "CCR store write failed (%s); cache_key %s remains in-marker only: %s",
+            "CCR store write failed (%s, %s); cache_key %s remains in-marker only",
             source,
+            type(e).__name__,
             cache_key,
-            e,
         )
+        logger.debug("CCR store write failure detail", exc_info=True)
 
 
 def split_frozen(

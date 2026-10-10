@@ -26,8 +26,6 @@ from headroom.cache.compression_store import (
 )
 from headroom.transforms.base import persist_rust_ccr_entry
 
-pytest.importorskip("headroom._core", reason="Rust extension required")
-
 
 @pytest.fixture(autouse=True)
 def _fresh_store():
@@ -73,3 +71,35 @@ def test_persist_stores_under_marker_key(source: str, original: str) -> None:
         original, f"compressed {source} output", _rust_marker_key(original), source=source
     )
     _assert_round_trip(original)
+
+
+def test_persist_failure_warns_without_exception_text(monkeypatch: pytest.MonkeyPatch) -> None:
+    import logging
+
+    import headroom.cache.compression_store as compression_store
+    import headroom.transforms.base as base
+
+    class _Store:
+        def store(self, *_args: object, **_kwargs: object) -> str:
+            raise RuntimeError("backend echoed sk-test-secret")
+
+    monkeypatch.setattr(compression_store, "get_compression_store", lambda: _Store())
+    records: list[logging.LogRecord] = []
+
+    class _Capture(logging.Handler):
+        def emit(self, record: logging.LogRecord) -> None:
+            records.append(record)
+
+    handler = _Capture(level=logging.DEBUG)
+    base.logger.addHandler(handler)
+    monkeypatch.setattr(base.logger, "level", logging.DEBUG)
+    try:
+        persist_rust_ccr_entry("orig", "comp", "a" * 24, source="diff")
+    finally:
+        base.logger.removeHandler(handler)
+
+    warnings = [r for r in records if r.levelno == logging.WARNING]
+    assert len(warnings) == 1
+    assert "(diff, RuntimeError)" in warnings[0].getMessage()
+    assert "sk-test-secret" not in warnings[0].getMessage()
+    assert any(r.levelno == logging.DEBUG and r.exc_info for r in records)
