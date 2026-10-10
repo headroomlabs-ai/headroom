@@ -161,7 +161,9 @@ def _capture_policy_logs(monkeypatch):
     policy.logger.addHandler(handler)
     old_level = policy.logger.level
     policy.logger.setLevel(logging.DEBUG)
-    monkeypatch.setattr(policy, "_reconcile_warned", WarnOnce(32, "test reconcile types"))
+    monkeypatch.setattr(
+        policy, "_reconcile_warned", WarnOnce(32, "test reconcile types"), raising=False
+    )
     monkeypatch.delenv("HEADROOM_DEBUG_DUMP", raising=False)
     return policy, records, handler, old_level
 
