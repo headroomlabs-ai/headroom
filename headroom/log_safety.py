@@ -16,6 +16,7 @@ from __future__ import annotations
 import logging
 import os
 import threading
+import time
 import traceback
 from collections.abc import Hashable
 from urllib.parse import urlsplit, urlunsplit
@@ -61,7 +62,7 @@ def _describe_one(exc: BaseException) -> str:
     if isinstance(exc, OSError) and isinstance(exc.errno, int):
         # The system's own text for the errno; exc.strerror is free text in some
         # subclasses (ssl.SSLError) and can quote a path or a peer's message.
-        text += f" [Errno {exc.errno}] {os.strerror(exc.errno)}"
+        text += f" [Errno {exc.errno}] {_errno_text(exc.errno)}"
     frames = traceback.extract_tb(exc.__traceback__)[-_MAX_FRAMES:]
     if frames:
         where = " <- ".join(
@@ -70,6 +71,13 @@ def _describe_one(exc: BaseException) -> str:
         )
         text += f" at {where}"
     return text
+
+
+def _errno_text(errno: int) -> str:
+    try:
+        return os.strerror(errno)
+    except (ValueError, OverflowError):
+        return "unknown error"
 
 
 def _short_path(path: str) -> str:
@@ -112,23 +120,26 @@ def safe_id(value: object) -> str:
 
 
 class WarnOnce:
-    """Warn once per key, for at most ``limit`` keys over the process lifetime.
+    """Warn once per key, for at most ``limit`` keys per ``window_seconds``.
 
-    Past the limit it logs one overflow WARNING and then stays quiet, so a
-    failure that hits many distinct keys (paths, rows, models) cannot flood the
-    log on every pass. A key is used up only when WARNING is enabled, so a
-    warning suppressed by the log level is still emitted later. ``forget``
-    re-arms a key once its failure has cleared; after the overflow notice the
-    guard stays quiet for good, so forgetting cannot reopen the cap.
+    Past the limit it logs one overflow WARNING and stays quiet for the rest of
+    the window, so a failure that hits many distinct keys (paths, rows, models)
+    cannot flood the log on every pass: at most ``limit + 1`` warnings per
+    window. After the window the guard starts over, so a newly broken key in a
+    long-lived process still warns. A key is used up only when WARNING is
+    enabled, so a warning suppressed by the log level is still emitted later.
+    ``forget`` re-arms a key once its failure has cleared; it cannot reopen the
+    cap during an overflow window.
     """
 
-    def __init__(self, limit: int, what: str) -> None:
+    def __init__(self, limit: int, what: str, *, window_seconds: float = 3600.0) -> None:
         if limit < 1:
             raise ValueError(f"WarnOnce limit must be at least 1, got {limit}")
         self._limit = limit
         self._what = what
+        self._window = window_seconds
         self._keys: set[Hashable] = set()
-        self._overflowed = False
+        self._overflowed_at: float | None = None
         self._lock = threading.Lock()
 
     def first(self, key: Hashable, log: logging.Logger) -> bool:
@@ -138,16 +149,23 @@ class WarnOnce:
         with self._lock:
             if key in self._keys:
                 return False
-            if not self._overflowed and len(self._keys) < self._limit:
+            now = time.monotonic()
+            if self._overflowed_at is not None and now - self._overflowed_at >= self._window:
+                self._keys.clear()
+                self._overflowed_at = None
+            if self._overflowed_at is None and len(self._keys) < self._limit:
                 self._keys.add(key)
                 return True
-            report_overflow = not self._overflowed
-            self._overflowed = True
+            report_overflow = self._overflowed_at is None
+            if report_overflow:
+                self._overflowed_at = now
         if report_overflow:
             log.warning(
-                "More than %d distinct %s; further ones are logged at debug only",
+                "More than %d distinct %s; further ones are logged at debug only "
+                "for the next %d minutes",
                 self._limit,
                 self._what,
+                max(1, round(self._window / 60)),
             )
         return False
 
