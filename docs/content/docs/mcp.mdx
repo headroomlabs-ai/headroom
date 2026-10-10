@@ -157,6 +157,10 @@ For multiple proxy instances, register one stdio MCP server per proxy URL:
 }
 ```
 
+If the proxy is remote and enforces `HEADROOM_PROXY_TOKEN`, set `HEADROOM_PROXY_TOKEN` in the MCP server's `env` to the same value. `headroom mcp serve` then sends it as `x-headroom-proxy-token`, so `headroom_stats` can read the proxy's `/stats`. Without it that call gets `401` and the stats fall back to local-only.
+
+The token does not enable remote retrieval. The proxy serves `/v1/retrieve` to loopback callers only and answers `404` to any other caller, with or without a token. `headroom_retrieve` reports this as a loopback-only miss. To retrieve proxy-side content, run the MCP server on the proxy's host, or reach the proxy over loopback (a port-forward or a sidecar).
+
 If you need Streamable HTTP instead of stdio, run `headroom mcp serve --transport http` and point your MCP host at that endpoint. The default path is `/mcp`, and the default port is `8788`.
 
 Do not assume that a running proxy exposes an HTTP MCP endpoint at `/mcp`. The proxy serves its own API; it does not automatically provide the MCP HTTP transport.

@@ -92,6 +92,57 @@ _READ_ENABLED = os.environ.get("HEADROOM_MCP_READ", "off").lower().strip() in (
 
 DEFAULT_PROXY_URL = os.environ.get("HEADROOM_PROXY_URL", "http://127.0.0.1:8787")
 
+
+def _proxy_auth_headers() -> dict[str, str] | None:
+    """Proxy credential for a token-gated remote proxy's ``/stats``.
+
+    Sent as ``x-headroom-proxy-token``, never ``Authorization``, matching what
+    the proxy's gate reads first. Read per client so the env set by the MCP
+    host at launch applies; ``None`` keeps loopback proxies header-free.
+
+    The token does not open ``/v1/retrieve`` to a remote caller: the proxy
+    serves retrieval to loopback peers only and answers 404 to anyone else.
+    """
+    token = os.environ.get("HEADROOM_PROXY_TOKEN", "").strip()
+    return {"x-headroom-proxy-token": token} if token else None
+
+
+_PROXY_RETRIEVAL_LOOPBACK_ONLY = "proxy_retrieval_loopback_only"
+
+
+def _is_hidden_route_404(response: Any) -> bool:
+    """True for the loopback guard's bare 404, not a store miss.
+
+    A miss carries the store's reason ("Entry not found ...", "Entry expired
+    ..."); the guard answers FastAPI's default ``Not Found`` so the route looks
+    absent. The proxy URL can't tell them apart: a reverse proxy or
+    port-forward may reach the proxy over loopback behind a public URL.
+    """
+    try:
+        detail = response.json().get("detail")
+    except Exception:
+        return False
+    return bool(detail == "Not Found")
+
+
+def _proxy_retrieval_loopback_only_payload(proxy_url: str, hash_key: str) -> dict[str, Any]:
+    """The proxy hid /v1/retrieve from this caller, which only loopback peers may use."""
+    return {
+        "error": (
+            f"The proxy at {proxy_url} did not serve /v1/retrieve to this caller. It "
+            "serves retrieval to loopback callers only and answers 404 to any other "
+            "caller, with or without HEADROOM_PROXY_TOKEN."
+        ),
+        "hash": hash_key,
+        "status": _PROXY_RETRIEVAL_LOOPBACK_ONLY,
+        "hint": (
+            "Run the MCP server on the proxy's host, or reach the proxy over loopback "
+            "(a port-forward or a sidecar). Otherwise re-run the command or re-read "
+            "the file that produced the compressed content."
+        ),
+    }
+
+
 # How often the parent-death watchdog polls os.getppid() (seconds). When the
 # launching MCP client is SIGKILLed, stdin EOF may never arrive and the SDK's
 # blocking stdin-reader thread wedges server.run() forever, orphaning this
@@ -523,6 +574,7 @@ class HeadroomMCPServer:
                     }
 
         # Fall back to proxy if available
+        proxy_miss: dict[str, Any] | None = None
         if self.check_proxy and HTTPX_AVAILABLE:
             try:
                 result = await self._retrieve_via_proxy(hash_key)
@@ -530,6 +582,7 @@ class HeadroomMCPServer:
                     result["source"] = "proxy"
                     self._stats.record_retrieval(hash_key)
                     return result
+                proxy_miss = result
             except Exception:
                 pass  # Proxy unavailable, that's fine
 
@@ -553,6 +606,9 @@ class HeadroomMCPServer:
                 ),
             }
 
+        if proxy_miss is not None and proxy_miss.get("status") == _PROXY_RETRIEVAL_LOOPBACK_ONLY:
+            return proxy_miss
+
         return {
             "error": "Content not found. It may have expired or the hash may be incorrect.",
             "hash": hash_key,
@@ -569,7 +625,7 @@ class HeadroomMCPServer:
     ) -> dict[str, Any]:
         """Retrieve full content by hash via proxy's HTTP endpoint."""
         if self._http_client is None:
-            self._http_client = httpx.AsyncClient(timeout=15.0)
+            self._http_client = httpx.AsyncClient(timeout=15.0, headers=_proxy_auth_headers())
 
         url = f"{self.proxy_url}/v1/retrieve"
         payload: dict[str, str] = {"hash": hash_key}
@@ -577,6 +633,8 @@ class HeadroomMCPServer:
         response = await self._http_client.post(url, json=payload)
 
         if response.status_code == 404:
+            if _is_hidden_route_404(response):
+                return _proxy_retrieval_loopback_only_payload(self.proxy_url, hash_key)
             return {"error": "Not found in proxy store", "hash": hash_key}
 
         response.raise_for_status()
@@ -940,7 +998,7 @@ class HeadroomMCPServer:
         """Fetch full stats from the proxy (includes summary)."""
         try:
             if self._http_client is None:
-                self._http_client = httpx.AsyncClient(timeout=15.0)
+                self._http_client = httpx.AsyncClient(timeout=15.0, headers=_proxy_auth_headers())
             response = await self._http_client.get(f"{self.proxy_url}/stats")
             if response.status_code != 200:
                 return None
