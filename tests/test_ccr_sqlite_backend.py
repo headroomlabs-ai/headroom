@@ -358,7 +358,7 @@ class TestSQLiteBackend:
         row_warnings = [m for m in warnings if "is unreadable" in m]
         assert len(row_warnings) == 2
         assert all("JSONDecodeError" in m for m in row_warnings)
-        assert len([m for m in warnings if "More than 2 distinct" in m]) == 1
+        assert len([m for m in warnings if "More than 2 warnings about" in m]) == 1
         assert len(warnings) == 3
 
     def test_store_ttl_enforcement_via_compression_store(self, db_path):
