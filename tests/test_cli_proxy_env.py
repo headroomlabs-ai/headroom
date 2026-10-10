@@ -847,7 +847,10 @@ class TestCLIProxyBackend:
         def mock_run_server(config, **kwargs):
             captured_config["config"] = config
 
-        with patch("headroom.proxy.server.run_server", mock_run_server):
+        with (
+            patch("headroom.proxy.server.run_server", mock_run_server),
+            patch("headroom.providers.vertex.diagnostics.vertex_sdk_available", return_value=True),
+        ):
             result = runner.invoke(
                 main,
                 ["proxy", "--backend", "litellm-vertex"],
