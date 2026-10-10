@@ -64,14 +64,6 @@ def headroom_provider_entry(port: int) -> dict[str, Any]:
     }
 
 
-def _opencode_home_dir() -> Path:
-    """Return the OpenCode home/config directory."""
-    env_path = os.environ.get("OPENCODE_HOME", "").strip()
-    if env_path:
-        return Path(env_path).expanduser()
-    return Path.home() / ".config" / "opencode"
-
-
 def opencode_config_paths() -> tuple[Path, Path]:
     """Return the selected config and its canonical Headroom backup path."""
     config_file = opencode_config_path()
@@ -132,17 +124,6 @@ def strip_opencode_headroom_blocks(content: str, *, remove_mcp: bool = True) -> 
     # Collapse multiple blank lines left behind by block removal.
     content = re.sub(r"\n{3,}", "\n\n", content)
     return content.strip()
-
-
-def _render_provider_block(port: int) -> str:
-    """Render a Headroom provider block as a JSON comment-wrapped snippet."""
-    provider = {"headroom": headroom_provider_entry(port)}
-    lines = [
-        _PROVIDER_MARKER_START,
-        f'"provider": {json.dumps(provider, indent=2)},',
-        _PROVIDER_MARKER_END,
-    ]
-    return "\n".join(lines)
 
 
 def _strip_jsonc_comments(text: str) -> str:
@@ -243,26 +224,6 @@ def _inject_key_into_json(data: dict[str, Any], key: str, value: Any) -> dict[st
     else:
         data[key] = value
     return data
-
-
-def append_headroom_plugin(config: dict[str, object]) -> bool:
-    """Append the optional OpenCode plugin entry if it is not already present."""
-    plugin = config.get("plugin")
-    if plugin is None:
-        config["plugin"] = [HEADROOM_OPENCODE_PLUGIN]
-        return True
-
-    if not isinstance(plugin, list):
-        return False
-
-    for entry in plugin:
-        if entry == HEADROOM_OPENCODE_PLUGIN:
-            return False
-        if isinstance(entry, list) and entry and entry[0] == HEADROOM_OPENCODE_PLUGIN:
-            return False
-
-    plugin.append(HEADROOM_OPENCODE_PLUGIN)
-    return True
 
 
 def inject_opencode_provider_config(port: int, *, keep_user_entries: bool = False) -> None:

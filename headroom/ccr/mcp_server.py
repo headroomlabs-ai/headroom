@@ -402,7 +402,6 @@ class HeadroomMCPServer:
         self._stats = SessionStats()
         self._local_store: Any = None  # Lazy-initialized CompressionStore
         self._token_estimator: EstimatingTokenCounter | None = None
-        self._compressor_initialized = False
         # File read cache: path → (content_hash, ccr_hash, line_count, token_count)
         self._file_cache: dict[str, tuple[str, str, int, int]] = {}
 

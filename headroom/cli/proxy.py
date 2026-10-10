@@ -195,16 +195,6 @@ def _get_env_int(name: str, default: int) -> int:
     return default if value is None else value
 
 
-def _get_env_float_optional(name: str) -> float | None:
-    val = os.environ.get(name)
-    if val is None or val == "":
-        return None
-    try:
-        return float(val)
-    except ValueError:
-        raise click.ClickException(f"{name} must be a number, got {val!r}") from None
-
-
 @main.command()
 @click.option(
     "--port",
