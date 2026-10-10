@@ -7057,7 +7057,7 @@ def _prepare_codex_wrap_state(
 ) -> None:
     """Prepare the active Codex home for a wrap or prepare-only invocation."""
     # Ensure the Codex home exists before anything tries to detect or write it.
-    # ``CodexRegistrar.detect()`` is just ``self._codex_dir.is_dir()``, and until
+    # ``CodexRegistrar.detect()`` is just ``self._config_dir.is_dir()``, and until
     # now the directory was created as a *side effect* of injecting the rtk
     # guidance into ``$CODEX_HOME/AGENTS.md``. With the CLI context tools removed
     # nothing creates it, so on a machine where Codex is installed but has never
