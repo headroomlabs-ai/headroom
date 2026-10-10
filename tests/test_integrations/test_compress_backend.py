@@ -91,7 +91,15 @@ def test_cloud_error_logs_no_echoed_content_at_any_level(
         backend = HeadroomCallback(api_key=_KEY_CANARY, api_url=api_url)
     messages = [{"role": "user", "content": f"my secret is {_PROMPT_CANARY}"}]
     echo = f"bad request: {json.dumps(messages)} key={_KEY_CANARY}"
-    _serve(backend, lambda request: httpx.Response(503, text=echo))
+    _serve(
+        backend,
+        lambda request: httpx.Response(
+            503,
+            text=echo,
+            # A header can echo content too: only the bare media type may be logged.
+            headers={"content-type": f"text/plain; note={_PROMPT_CANARY}"},
+        ),
+    )
     # Attach to the module logger itself: proxy startup elsewhere in the suite can
     # stop headroom.* records from reaching pytest's root-level caplog handler.
     handler = _Records()
@@ -109,7 +117,7 @@ def test_cloud_error_logs_no_echoed_content_at_any_level(
         f"Headroom Cloud API error: HTTP 503 from {shown_url}; request sent uncompressed"
     ]
     if level == logging.DEBUG:
-        assert any("content-type=" in line for line in formatted)
+        assert any("content-type=text/plain," in line for line in formatted)
     for line in formatted:
         for canary in (_PROMPT_CANARY, _KEY_CANARY, _URL_CANARY, _PATH_CANARY, "%50RIVATE"):
             assert canary not in line

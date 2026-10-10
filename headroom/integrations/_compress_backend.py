@@ -13,13 +13,27 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 from typing import Any
 
-from headroom.log_safety import redact_url, safe_id
+from headroom.log_safety import redact_url
 from headroom.offline import guard_egress
 
 _DEFAULT_CLOUD_URL = "https://api.headroomlabs.ai"
 _DEFAULT_MODEL = "claude-sonnet-4-5-20250929"
+
+
+_MEDIA_TYPE_RE = re.compile(r"[A-Za-z0-9!#$&^_.+-]{1,64}/[A-Za-z0-9!#$&^_.+-]{1,64}")
+
+
+def _media_type(content_type: str) -> str:
+    """Return just the ``type/subtype`` of a Content-Type header, or ``<other>``.
+
+    Parameters and anything that is not a plain media type are dropped, so an
+    error response cannot smuggle echoed content into the log through a header.
+    """
+    media = content_type.split(";", 1)[0].strip()
+    return media.lower() if _MEDIA_TYPE_RE.fullmatch(media) else "<other>"
 
 
 class CompressBackend:
@@ -121,7 +135,7 @@ class CompressBackend:
             )
             self._log.debug(
                 "Headroom Cloud API error response: content-type=%s, %d bytes",
-                safe_id(resp.headers.get("content-type", "")),
+                _media_type(resp.headers.get("content-type", "")),
                 len(resp.content),
             )
             return None
