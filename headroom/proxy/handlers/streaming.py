@@ -22,6 +22,7 @@ from headroom.proxy.helpers import (
     overload_retry_is_futile,
     retry_after_ms,
 )
+from headroom.proxy.provider_usage import billed_input_for_provider
 from headroom.proxy.token_counting import gemini_output_tokens
 
 if TYPE_CHECKING:
@@ -1001,6 +1002,24 @@ class StreamingMixin:
                 effective_optimized_tokens - cache_read_tokens - cache_write_tokens, 0
             )
 
+        # The provider's own billed input for this turn. Without it the outcome
+        # falls back to ``optimized_tokens`` — Headroom's tokenizer estimate of
+        # the forwarded messages only (no system prompt, no tool definitions) —
+        # and every volume/cost total downstream (dashboard, licence usage
+        # report) silently reports the estimate as if it were the bill. Every
+        # Claude Code turn is a streamed Anthropic turn, so this was the bulk of
+        # Claude traffic.
+        billed_provider_input = (
+            billed_input_for_provider(
+                provider,
+                provider_input_tokens,
+                cache_read=cache_read_tokens,
+                cache_write=cache_write_tokens,
+            )
+            if isinstance(provider_input_tokens, int)
+            else 0
+        )
+
         # Prefix-tracker mutation is provider-specific state that lives
         # outside the metric funnel. Run it before the funnel so the next
         # request inherits correct prefix state regardless of metric path.
@@ -1100,6 +1119,7 @@ class StreamingMixin:
             request_id=request_id,
             original_tokens=effective_original_tokens,
             optimized_tokens=effective_optimized_tokens,
+            provider_input_tokens=billed_provider_input,
             output_tokens=output_tokens,
             tokens_saved=tokens_saved,
             transforms_applied=transforms_applied,
@@ -2189,8 +2209,22 @@ class StreamingMixin:
                     # already reported by the backend is preserved untouched.
                     if event.event_type == "message_start" and not event.raw_sse:
                         msg_usage = event.data.setdefault("message", {}).setdefault("usage", {})
-                        if not msg_usage.get("input_tokens") and optimized_tokens > 0:
+                        # A zero with cache usage beside it is a real count: a
+                        # fully cached prompt bills only the cache buckets. Only
+                        # a bare zero is LiteLLM's unknown placeholder.
+                        _cached = any(
+                            isinstance(msg_usage.get(k), int) and msg_usage.get(k) > 0
+                            for k in ("cache_read_input_tokens", "cache_creation_input_tokens")
+                        )
+                        if (
+                            not msg_usage.get("input_tokens")
+                            and not _cached
+                            and optimized_tokens > 0
+                        ):
                             msg_usage["input_tokens"] = optimized_tokens
+                            # The client-bound backfill is Headroom's estimate,
+                            # not backend usage: never report it as billed.
+                            stream_state["input_tokens_backfilled"] = True
 
                     # Format as SSE
                     if event.raw_sse:
@@ -2208,6 +2242,8 @@ class StreamingMixin:
                         usage = msg.get("usage", {})
                         if "input_tokens" in usage:
                             stream_state["input_tokens"] = usage["input_tokens"]
+                            if not stream_state.get("input_tokens_backfilled"):
+                                stream_state["backend_input_tokens"] = usage["input_tokens"]
                         stream_state["cache_read_input_tokens"] = usage.get(
                             "cache_read_input_tokens", 0
                         )
@@ -2225,6 +2261,7 @@ class StreamingMixin:
                             stream_state["output_tokens"] = usage["output_tokens"]
                         if "input_tokens" in usage:
                             stream_state["input_tokens"] = usage["input_tokens"]
+                            stream_state["backend_input_tokens"] = usage["input_tokens"]
                         if "cache_read_input_tokens" in usage:
                             stream_state["cache_read_input_tokens"] = usage[
                                 "cache_read_input_tokens"
@@ -2309,6 +2346,11 @@ class StreamingMixin:
                 # ``from_stream`` as ``optimized + saved``. Bedrock
                 # doesn't propagate frozen_message_count either — same
                 # fallback as the SSE finalizer (#455).
+                # Bedrock forwards Anthropic-shape usage: input_tokens is the
+                # uncached tail only, cache buckets are disjoint. Only a count
+                # the backend itself reported qualifies; the message_start
+                # backfill above is Headroom's estimate.
+                _bedrock_input = stream_state.get("backend_input_tokens")
                 outcome = RequestOutcome.from_stream(
                     body=body,
                     provider=_backend_name,
@@ -2316,6 +2358,16 @@ class StreamingMixin:
                     request_id=request_id,
                     original_tokens=original_tokens,
                     optimized_tokens=optimized_tokens,
+                    provider_input_tokens=(
+                        billed_input_for_provider(
+                            "anthropic",
+                            _bedrock_input,
+                            cache_read=stream_state["cache_read_input_tokens"],
+                            cache_write=stream_state["cache_creation_input_tokens"],
+                        )
+                        if isinstance(_bedrock_input, int)
+                        else 0
+                    ),
                     output_tokens=stream_state["output_tokens"],
                     tokens_saved=tokens_saved,
                     transforms_applied=transforms_applied,
@@ -2543,6 +2595,12 @@ class StreamingMixin:
                     request_id=request_id,
                     original_tokens=original_tokens,
                     optimized_tokens=optimized_tokens,
+                    # OpenAI-shape usage from the backend: the headline figure
+                    # already includes cached tokens (cache_write above is
+                    # subtracted from it, not added).
+                    provider_input_tokens=(
+                        upstream_input if isinstance(upstream_input, int) else 0
+                    ),
                     output_tokens=output_tokens,
                     tokens_saved=tokens_saved,
                     transforms_applied=transforms_applied,

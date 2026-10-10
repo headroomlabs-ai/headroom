@@ -5150,6 +5150,19 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
             },
             "tokens": {
                 "input": m.tokens_input_total,
+                # Provenance of "input": the provider's own billed count versus
+                # Headroom's tokenizer estimate. Only the first reconciles with
+                # the provider console (input + cache read + cache write).
+                "input_provider_reported": m.tokens_input_provider_reported_total,
+                "input_estimated": m.tokens_input_estimated_total,
+                "input_provider_reported_percent": round(
+                    (m.tokens_input_provider_reported_total / m.tokens_input_total * 100)
+                    if m.tokens_input_total > 0
+                    else 0,
+                    2,
+                ),
+                "requests_input_provider_reported": m.requests_input_provider_reported,
+                "requests_input_estimated": m.requests_input_estimated,
                 "output": m.tokens_output_total,
                 "output_saved": output_reduction.get("tokens_saved", 0),
                 "output_reduction_percent": output_reduction.get("reduction_percent", 0),
