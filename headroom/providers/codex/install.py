@@ -334,6 +334,8 @@ def build_provider_section(
         f'name = "{name}"\n'
         f'base_url = "{proxy_base_url(port)}"\n'
         "supports_websockets = true\n"
+        'experimental_realtime_ws_base_url = "https://api.openai.com/v1"\n'
+        'experimental_realtime_webrtc_call_base_url = "https://api.openai.com/v1"\n'
         f"{build_codex_auth_config(auth_path, config_path=config_path)}"
     )
     if requires_openai_auth:
