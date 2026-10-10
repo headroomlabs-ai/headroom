@@ -288,9 +288,13 @@ def dedup_blocks(
 
         return out_blocks, stats
     except Exception as e:  # never break the proxy
+        # The exception text can quote tool output, so it goes to DEBUG only.
         logger.warning(
-            "Cross-turn dedup failed on %d blocks; leaving them as-is: %s", len(blocks), e
+            "Cross-turn dedup failed (%s) on %d blocks; leaving them as-is",
+            type(e).__name__,
+            len(blocks),
         )
+        logger.debug("Cross-turn dedup failure detail", exc_info=True)
         return blocks, {"spans_folded": 0, "lines_removed": 0, "chars_removed": 0, "error": True}
 
 

@@ -258,11 +258,13 @@ def compress_batch_with_router(
             bias=batch.entries[0].routed.unit.bias,
         )
     except Exception as e:
+        # The exception text can quote tool output, so it goes to DEBUG only.
         logger.warning(
-            "Batch compression failed; passing %d units through uncompressed: %s",
+            "Batch compression failed (%s); passing %d units through uncompressed",
+            type(e).__name__,
             len(batch.entries),
-            e,
         )
+        logger.debug("Batch compression failure detail", exc_info=True)
         return _passthrough_batch_results(
             batch,
             tokenizer=tokenizer,

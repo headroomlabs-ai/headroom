@@ -1617,7 +1617,11 @@ def store_kompress_in_ccr(original: str, compressed: str, original_tokens: int) 
             )
         return cache_key
     except Exception as e:
-        logger.warning("Kompress CCR store write failed; output is not retrievable: %s", e)
+        # Store backends can echo the payload in errors, so the detail goes to DEBUG only.
+        logger.warning(
+            "Kompress CCR store write failed (%s); output is not retrievable", type(e).__name__
+        )
+        logger.debug("Kompress CCR store failure detail", exc_info=True)
         return None
 
 

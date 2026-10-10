@@ -1196,8 +1196,12 @@ class SmartCrusher(Transform):
                 "CCR mirror: invalid hash %r from rendered marker",
                 ccr_hash,
             )
-        except Exception as e:  # pragma: no cover - defensive
-            logger.warning("CCR mirror: store write failed for hash %s: %s", ccr_hash, e)
+        except Exception as e:
+            # Store backends can echo the payload in errors, so the detail goes to DEBUG only.
+            logger.warning(
+                "CCR mirror: store write failed (%s) for hash %s", type(e).__name__, ccr_hash
+            )
+            logger.debug("CCR mirror store failure detail", exc_info=True)
 
     def _extract_context_from_messages(self, messages: list[dict[str, Any]]) -> str:
         """Build a query string from the last 5 user messages + recent

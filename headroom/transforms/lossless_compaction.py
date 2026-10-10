@@ -537,11 +537,13 @@ def compact_lossless(content: str, kind: str) -> str:
                 return content
             return candidate if _smaller(candidate, content) else content
     except Exception as e:
+        # The exception text can quote the content, so it goes to DEBUG only.
         logger.warning(
-            "Lossless compaction (%s) failed on %d chars; leaving content as-is: %s",
+            "Lossless compaction (%s) failed (%s) on %d chars; leaving content as-is",
             kind,
+            type(e).__name__,
             len(content),
-            e,
         )
+        logger.debug("Lossless compaction failure detail", exc_info=True)
         return content
     return content
