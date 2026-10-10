@@ -26,7 +26,7 @@ from typing import TYPE_CHECKING, Any
 from urllib.parse import quote, unquote, urlparse
 
 from headroom.proxy.conversation_savings import savings_conversation_key
-from headroom.proxy.handlers._hook_failures import log_hook_failure
+from headroom.proxy.handlers._failure_logging import log_hook_failure, log_request_failure
 from headroom.proxy.helpers import (
     COMPRESSION_TIMEOUT_SECONDS,
     _headroom_bypass_enabled,
@@ -3179,12 +3179,12 @@ class OpenAIHandlerMixin:
                             tools_bytes_after=desc_after,
                             tools_bytes_saved=desc_before - desc_after,
                         )
-        except Exception:
+        except Exception as e:
+            # Tool schemas are client content: the error text stays at debug.
             logger.warning(
-                "[%s] tool desc compaction step failed",
-                request_id,
-                exc_info=True,
+                "[%s] tool desc compaction step failed: %s", request_id, type(e).__name__
             )
+            logger.debug("[%s] tool desc compaction failure detail", request_id, exc_info=True)
 
         # Server-side Tool Search deferral (OpenAI Responses, gpt-5.4+): mark
         # non-core function/MCP tools defer_loading + inject {"type": "tool_search"}
@@ -4048,12 +4048,15 @@ class OpenAIHandlerMixin:
             from headroom.hooks import CompressContext, collect_protected
 
             _hook_ctx = CompressContext(model=model, provider="openai")
+            _hook_stage = "pre_compress"
             try:
                 messages = self.config.hooks.pre_compress(messages, _hook_ctx)
+                _hook_stage = "compute_biases"
                 _hook_biases = self.config.hooks.compute_biases(messages, _hook_ctx)
+                _hook_stage = "protect_messages"
                 _hook_protect = collect_protected(self.config.hooks, messages, _hook_ctx)
             except Exception as e:
-                log_hook_failure(request_id, "pre_compress/compute_biases/protect_messages", e)
+                log_hook_failure(request_id, _hook_stage, self.config.hooks, e)
 
         # x-headroom-keep-last-turns: N — trim history before optimization.
         # Consumed here (after bypass check, after _strip_internal_headers)
@@ -4458,7 +4461,7 @@ class OpenAIHandlerMixin:
                     )
                 )
             except Exception as e:
-                log_hook_failure(request_id, "post_compress", e)
+                log_hook_failure(request_id, "post_compress", self.config.hooks, e)
 
         # CCR Tool Injection: Inject retrieval tool if compression occurred
         # OR if this session has previously done CCR (PR-B7 sticky-on).
@@ -5982,11 +5985,13 @@ class OpenAIHandlerMixin:
                 )
         except Exception as e:
             await self.metrics.record_failed(provider=openai_chat_outcome_provider)
-            # Log full error details internally for debugging
-            logger.error(
-                f"[{request_id}] OpenAI request failed: provider={openai_chat_outcome_provider} "
-                f"model={model} {type(e).__name__}: {e}",
-                exc_info=not isinstance(e, httpx.HTTPError),
+            # Error names the failure; text and traceback go to debug.
+            log_request_failure(
+                request_id,
+                "OpenAI request",
+                e,
+                provider=openai_chat_outcome_provider,
+                model=model,
             )
             # Return sanitized error message to client (don't expose internal details)
             return JSONResponse(
@@ -7424,11 +7429,7 @@ class OpenAIHandlerMixin:
             return await _buffered_ccr_operation()
         except Exception as e:
             await self.metrics.record_failed(provider="openai")
-            logger.error(
-                f"[{request_id}] OpenAI responses request failed: model={model} "
-                f"{type(e).__name__}: {e}",
-                exc_info=not isinstance(e, httpx.HTTPError),
-            )
+            log_request_failure(request_id, "OpenAI responses request", e, model=model)
             return JSONResponse(
                 status_code=502,
                 content={

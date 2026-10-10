@@ -10,13 +10,12 @@ import logging
 import time
 from typing import TYPE_CHECKING, Any
 
-import httpx
-
 if TYPE_CHECKING:
     from fastapi import Request
     from fastapi.responses import Response
 
 from headroom.proxy.auth_mode import classify_client
+from headroom.proxy.handlers._failure_logging import log_request_failure
 from headroom.proxy.helpers import (
     COMPRESSION_TIMEOUT_SECONDS,
     _headroom_bypass_enabled,
@@ -394,11 +393,7 @@ class BatchHandlerMixin:
             )
 
         except Exception as e:
-            logger.error(
-                f"[{request_id}] Google batch request failed: model={model} "
-                f"{type(e).__name__}: {e}",
-                exc_info=not isinstance(e, httpx.HTTPError),
-            )
+            log_request_failure(request_id, "Google batch request", e, model=model)
             return JSONResponse(
                 status_code=500,
                 content={

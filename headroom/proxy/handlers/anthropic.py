@@ -54,7 +54,7 @@ from headroom.proxy.buffered_ccr_response import (
 )
 from headroom.proxy.compression_decision import CompressionDecision
 from headroom.proxy.handlers._debug_dump import _debug_dump_mode, _redact_debug_value
-from headroom.proxy.handlers._hook_failures import log_hook_failure
+from headroom.proxy.handlers._failure_logging import log_hook_failure, log_request_failure
 from headroom.proxy.helpers import (
     extract_tags,
     invalid_request_body_message,
@@ -338,13 +338,17 @@ def _dump_prefix_mismatch(request_id: str, current: list, previous: list) -> Non
                 fh,
                 default=str,
             )
-    except Exception:  # noqa: BLE001 - debug aid only, never fails the request
+    except (OSError, TypeError, ValueError, RecursionError) as e:  # debug aid; never fail the turn
+        # An OSError names only the local dump path; other errors could quote
+        # message content, so their text stays at debug.
         logger.warning(
-            "[%s] prefix_mismatch_debug dump to %s failed",
+            "[%s] prefix_mismatch_debug dump to %s failed: %s%s",
             request_id,
             os.environ.get("HEADROOM_DEBUG_PREFIX_MISMATCH"),
-            exc_info=True,
+            type(e).__name__,
+            f": {e}" if isinstance(e, OSError) else "",
         )
+        logger.debug("[%s] prefix_mismatch_debug dump failure detail", request_id, exc_info=True)
 
 
 class AnthropicHandlerMixin:
@@ -1639,7 +1643,7 @@ class AnthropicHandlerMixin:
                 try:
                     messages = self.config.hooks.pre_compress(messages, _hook_ctx)
                 except Exception as e:
-                    log_hook_failure(request_id, "pre_compress", e)
+                    log_hook_failure(request_id, "pre_compress", self.config.hooks, e)
             else:
                 _hook_ctx = None
 
@@ -1937,21 +1941,25 @@ class AnthropicHandlerMixin:
                             scope=credential_scope_from_headers(headers),
                         )
                     result = None
-                    biases = (
-                        self.config.hooks.compute_biases(messages, _hook_ctx)
-                        if self.config.hooks and _hook_ctx is not None
-                        else None
-                    )
+                    biases = None
                     # Hard per-message veto. Separate from ``biases`` because a
                     # bias is a soft multiplier that several strategies clamp or
                     # ignore, so it cannot express "leave this one alone".
-                    from headroom.hooks import collect_protected
+                    protect = None
+                    if self.config.hooks and _hook_ctx is not None:
+                        from headroom.hooks import collect_protected
 
-                    protect = (
-                        collect_protected(self.config.hooks, messages, _hook_ctx)
-                        if self.config.hooks and _hook_ctx is not None
-                        else None
-                    )
+                        # A failure still aborts optimization for this request (the
+                        # outer handler forwards it uncompressed); this only names
+                        # the stage. Compressing without a veto would be unsafe.
+                        _hook_stage = "compute_biases"
+                        try:
+                            biases = self.config.hooks.compute_biases(messages, _hook_ctx)
+                            _hook_stage = "protect_messages"
+                            protect = collect_protected(self.config.hooks, messages, _hook_ctx)
+                        except Exception as e:
+                            log_hook_failure(request_id, _hook_stage, self.config.hooks, e)
+                            raise
 
                     # F2.1 c5/5: derive the per-request CompressionPolicy
                     # from the auth_mode classified at request entry. The
@@ -2585,7 +2593,7 @@ class AnthropicHandlerMixin:
                         )
                     )
                 except Exception as e:
-                    log_hook_failure(request_id, "post_compress", e)
+                    log_hook_failure(request_id, "post_compress", self.config.hooks, e)
 
             # CCR Tool Injection: Inject retrieval tool if compression occurred
             # OR if this session has previously done CCR (PR-B7 sticky-on).
@@ -4635,11 +4643,12 @@ class AnthropicHandlerMixin:
                                         if cont_response is not None
                                         else None
                                     )
-                                    logger.error(
-                                        f"[{request_id}] CCR: API call failed: "
-                                        f"{type(e).__name__}: {e} "
-                                        f"status={getattr(cont_response, 'status_code', None)} "
-                                        f"upstream_request_id={upstream_request_id}"
+                                    log_request_failure(
+                                        request_id,
+                                        "CCR continuation",
+                                        e,
+                                        status=getattr(cont_response, "status_code", None),
+                                        upstream_request_id=upstream_request_id,
                                     )
                                     raise
 
@@ -5467,14 +5476,10 @@ class AnthropicHandlerMixin:
                 raise
             except Exception as e:
                 await self.metrics.record_failed(provider=provider_name)
-                # Log full error details internally for debugging. `model` is
-                # unbound when the failure precedes body parsing. Upstream
-                # transport errors are one line; anything else is a bug and
-                # gets its traceback.
-                logger.error(
-                    f"[{request_id}] Request failed: provider={provider_name} "
-                    f"model={locals().get('model')} {type(e).__name__}: {e}",
-                    exc_info=not isinstance(e, httpx.HTTPError),
+                # Error names the failure; text and traceback go to debug.
+                # `model` is unbound when the failure precedes body parsing.
+                log_request_failure(
+                    request_id, "Request", e, provider=provider_name, model=locals().get("model")
                 )
 
                 # An untrusted TLS-inspection root is the one failure worth
@@ -5987,10 +5992,7 @@ class AnthropicHandlerMixin:
 
         except Exception as e:
             await self.metrics.record_failed(provider="anthropic")
-            logger.error(
-                f"[{request_id}] Anthropic batch request failed: {type(e).__name__}: {e}",
-                exc_info=not isinstance(e, httpx.HTTPError),
-            )
+            log_request_failure(request_id, "Anthropic batch request", e)
             return JSONResponse(
                 status_code=502,
                 content={

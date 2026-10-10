@@ -1,13 +1,17 @@
-"""A failing compression hook is visible once at warning, then quiet at debug."""
+"""Request-path failure logging: visible at warning/error, content only at debug."""
 
 from __future__ import annotations
 
 import logging
 
+import httpx
 import pytest
 
-from headroom.proxy.handlers import _hook_failures
-from headroom.proxy.handlers._hook_failures import log_hook_failure
+from headroom.hooks import CompressionHooks
+from headroom.proxy.handlers import _failure_logging
+from headroom.proxy.handlers._failure_logging import log_hook_failure, log_request_failure
+
+SECRET = "SECRET-USER-CONTENT"
 
 
 class _Capture(logging.Handler):
@@ -18,10 +22,13 @@ class _Capture(logging.Handler):
     def emit(self, record: logging.LogRecord) -> None:
         self.records.append(record)
 
+    def at(self, level: int) -> list[logging.LogRecord]:
+        return [r for r in self.records if r.levelno == level]
+
 
 @pytest.fixture
 def capture(monkeypatch: pytest.MonkeyPatch):
-    monkeypatch.setattr(_hook_failures, "_WARNED", set())
+    monkeypatch.setattr(_failure_logging, "_WARNED", set())
     log = logging.getLogger("headroom.proxy")
     handler = _Capture()
     old_level = log.level
@@ -34,28 +41,117 @@ def capture(monkeypatch: pytest.MonkeyPatch):
         log.setLevel(old_level)
 
 
-def test_first_failure_warns_with_traceback_and_repeats_drop_to_debug(capture) -> None:
+class _HooksA(CompressionHooks):
+    pass
+
+
+class _HooksB(CompressionHooks):
+    pass
+
+
+def test_hook_failure_warns_once_without_the_error_text(capture) -> None:
     for request_id in ("req-1", "req-2"):
-        try:
-            raise ValueError("bad bias")
-        except ValueError as err:
-            log_hook_failure(request_id, "compute_biases", err)
+        log_hook_failure(request_id, "compute_biases", _HooksA(), ValueError(SECRET))
 
-    first, second = capture.records
-    assert first.levelno == logging.WARNING
-    assert first.exc_info is not None
-    assert "[req-1] compute_biases hook failed" in first.getMessage()
-    assert "ValueError: bad bias" in first.getMessage()
-    assert second.levelno == logging.DEBUG
-    assert not second.exc_info
-    assert "[req-2]" in second.getMessage()
+    (warning,) = capture.at(logging.WARNING)
+    assert "[req-1] hook" in warning.getMessage()
+    assert "_HooksA compute_biases failed" in warning.getMessage()
+    assert "ValueError" in warning.getMessage()
+    assert SECRET not in warning.getMessage()
+    assert warning.exc_info is None
+    # The detail, text and traceback included, is at debug for both failures.
+    debug = capture.at(logging.DEBUG)
+    assert len(debug) == 2
+    assert all(r.exc_info and SECRET in str(r.exc_info[1]) for r in debug)
 
 
-def test_a_different_stage_or_error_type_warns_again(capture) -> None:
-    log_hook_failure("req-1", "pre_compress", ValueError("x"))
-    log_hook_failure("req-2", "post_compress", ValueError("x"))
-    log_hook_failure("req-3", "pre_compress", KeyError("x"))
-    log_hook_failure("req-4", "pre_compress", ValueError("y"))
+def test_hook_identity_stage_and_error_type_each_get_their_own_warning(capture) -> None:
+    log_hook_failure("r1", "pre_compress", _HooksA(), ValueError("x"))
+    log_hook_failure("r2", "pre_compress", _HooksB(), ValueError("x"))  # other hook
+    log_hook_failure("r3", "post_compress", _HooksA(), ValueError("x"))  # other stage
+    log_hook_failure("r4", "pre_compress", _HooksA(), KeyError("x"))  # other type
+    log_hook_failure("r5", "pre_compress", _HooksA(), ValueError("y"))  # repeat
 
-    levels = [r.levelno for r in capture.records]
-    assert levels == [logging.WARNING, logging.WARNING, logging.WARNING, logging.DEBUG]
+    warned = [r.getMessage().split()[0] for r in capture.at(logging.WARNING)]
+    assert warned == ["[r1]", "[r2]", "[r3]", "[r4]"]
+
+
+def test_a_suppressed_warning_does_not_use_up_the_once_slot(capture) -> None:
+    log = logging.getLogger("headroom.proxy")
+    log.setLevel(logging.ERROR)
+    log_hook_failure("r1", "post_compress", _HooksA(), ValueError("x"))
+    log.setLevel(logging.DEBUG)
+    log_hook_failure("r2", "post_compress", _HooksA(), ValueError("x"))
+
+    assert [r.getMessage().split()[0] for r in capture.at(logging.WARNING)] == ["[r2]"]
+
+
+def test_the_once_set_is_bounded(capture, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(_failure_logging, "_MAX_WARNED", 2)
+    for stage in ("a", "b", "c"):
+        log_hook_failure("r", stage, _HooksA(), ValueError("x"))
+    assert len(_failure_logging._WARNED) <= 2
+
+
+def test_request_failure_keeps_transport_text_and_hides_other_text(capture) -> None:
+    log_request_failure("r1", "Request", ValueError(SECRET), provider="anthropic", model="m")
+    log_request_failure("r2", "Request", httpx.ConnectError("Connection refused"), model="m")
+
+    first, second = capture.at(logging.ERROR)
+    assert first.getMessage() == "[r1] Request failed: provider=anthropic model=m ValueError"
+    assert second.getMessage() == "[r2] Request failed: model=m ConnectError: Connection refused"
+    assert first.exc_info is None and second.exc_info is None
+    assert any(r.exc_info and SECRET in str(r.exc_info[1]) for r in capture.at(logging.DEBUG))
+
+
+def test_openai_chat_names_the_failing_hook_stage(capture) -> None:
+    """Through the real handler: the stage that raised is the one logged."""
+    fastapi = pytest.importorskip("fastapi")  # noqa: F841
+    from fastapi.testclient import TestClient
+
+    from headroom.proxy.server import ProxyConfig, create_app
+
+    class BrokenBiases(CompressionHooks):
+        def compute_biases(self, messages, ctx):  # noqa: ANN001, ANN201
+            raise ValueError(SECRET)
+
+    async def fake_retry(method, url, headers, body, *args, **kwargs):  # noqa: ANN001, ANN202
+        return httpx.Response(
+            200,
+            json={
+                "id": "c",
+                "object": "chat.completion",
+                "model": "gpt-4o",
+                "choices": [
+                    {
+                        "index": 0,
+                        "message": {"role": "assistant", "content": "ok"},
+                        "finish_reason": "stop",
+                    }
+                ],
+                "usage": {"prompt_tokens": 5, "completion_tokens": 1, "total_tokens": 6},
+            },
+        )
+
+    config = ProxyConfig(
+        optimize=False, cache_enabled=False, rate_limit_enabled=False, hooks=BrokenBiases()
+    )
+    app = create_app(config)
+    with TestClient(app) as client:
+        # Proxy startup may reset logger levels; re-assert capture afterwards.
+        logging.getLogger("headroom.proxy").setLevel(logging.DEBUG)
+        client.app.state.proxy._retry_request = fake_retry
+        resp = client.post(
+            "/v1/chat/completions",
+            json={"model": "gpt-4o", "messages": [{"role": "user", "content": SECRET}]},
+            headers={"Authorization": "Bearer test-key"},
+        )
+
+    assert resp.status_code == 200, resp.text
+    hook_warnings = [r for r in capture.at(logging.WARNING) if "hook" in r.getMessage()]
+    assert len(hook_warnings) == 1
+    assert "BrokenBiases compute_biases failed" in hook_warnings[0].getMessage()
+    assert "pre_compress" not in hook_warnings[0].getMessage()
+    assert all(
+        SECRET not in r.getMessage() for r in capture.records if r.levelno >= logging.WARNING
+    )

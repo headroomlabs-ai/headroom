@@ -12,8 +12,6 @@ import time
 from typing import TYPE_CHECKING, Any
 from urllib.parse import unquote_plus
 
-import httpx
-
 if TYPE_CHECKING:
     from fastapi import Request
     from fastapi.responses import JSONResponse, Response, StreamingResponse
@@ -24,6 +22,7 @@ from headroom.agent_savings import proxy_pipeline_kwargs
 from headroom.copilot_auth import build_copilot_upstream_url
 from headroom.proxy.auth_mode import classify_client
 from headroom.proxy.compression_decision import CompressionDecision
+from headroom.proxy.handlers._failure_logging import log_request_failure
 from headroom.proxy.helpers import (
     COMPRESSION_TIMEOUT_SECONDS,
     extract_tags,
@@ -1118,10 +1117,8 @@ class GeminiHandlerMixin:
             return Response(content=e.content, status_code=e.status_code, headers=response_headers)
         except Exception as e:
             await self.metrics.record_failed(provider=provider_name)
-            logger.error(
-                f"[{request_id}] Gemini request failed: provider={provider_name} model={model} "
-                f"{type(e).__name__}: {e}",
-                exc_info=not isinstance(e, httpx.HTTPError),
+            log_request_failure(
+                request_id, "Gemini request", e, provider=provider_name, model=model
             )
             return JSONResponse(
                 status_code=502,
@@ -1592,10 +1589,8 @@ class GeminiHandlerMixin:
             )
         except Exception as e:
             await self.metrics.record_failed(provider=provider_name)
-            logger.error(
-                f"[{request_id}] Gemini countTokens failed: provider={provider_name} "
-                f"model={model} {type(e).__name__}: {e}",
-                exc_info=not isinstance(e, httpx.HTTPError),
+            log_request_failure(
+                request_id, "Gemini countTokens", e, provider=provider_name, model=model
             )
             return JSONResponse(
                 status_code=502,
