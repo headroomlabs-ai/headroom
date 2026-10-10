@@ -128,8 +128,15 @@ def load_manifest(profile: str = "default") -> DeploymentManifest | None:
     # command and the auto-run `init hook ensure` route through here. Raise a
     # typed error so callers can report cleanly or degrade gracefully.
     try:
-        return _manifest_from_payload(json.loads(path.read_text(encoding="utf-8")))
-    except (json.JSONDecodeError, ValueError, TypeError, OSError) as e:
+        text = path.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError) as e:
+        raise ManifestError(
+            f"deployment profile '{profile}' could not be read ({path}): {e}. "
+            "Check the file's permissions and that it is UTF-8."
+        ) from e
+    try:
+        return _manifest_from_payload(json.loads(text))
+    except (ValueError, TypeError) as e:
         raise ManifestError(f"deployment profile '{profile}' is corrupt ({path}): {e}") from e
 
 
@@ -143,10 +150,18 @@ def list_manifests() -> list[DeploymentManifest]:
     manifests: list[DeploymentManifest] = []
     for candidate in sorted(root.glob("*/manifest.json")):
         try:
-            manifests.append(
-                _manifest_from_payload(json.loads(candidate.read_text(encoding="utf-8")))
+            text = candidate.read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError) as e:
+            logger.warning(
+                "Skipping unreadable deployment manifest %s: %s. Check the file's "
+                "permissions and that it is UTF-8.",
+                candidate,
+                e,
             )
-        except (OSError, ValueError, TypeError) as e:
+            continue
+        try:
+            manifests.append(_manifest_from_payload(json.loads(text)))
+        except (ValueError, TypeError) as e:
             logger.warning(
                 "Skipping corrupt deployment manifest %s: %s. Fix or delete the file to "
                 "restore that profile.",
