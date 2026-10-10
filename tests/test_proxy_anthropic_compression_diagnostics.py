@@ -142,7 +142,7 @@ def test_optimization_failure_logs_exception_type() -> None:
 
         assert response.status_code == 200, response.text
         warning_msgs = [
-            call.args[0]
+            str(call.args[0]) % call.args[1:]
             for call in mock_warning.call_args_list
             if call.args and "Optimization failed" in str(call.args[0])
         ]

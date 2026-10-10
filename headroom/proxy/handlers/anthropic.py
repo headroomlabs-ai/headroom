@@ -34,6 +34,7 @@ from headroom.agent_savings import proxy_pipeline_kwargs
 from headroom.ccr.context_tracker import looks_like_claude_code_compact_summary
 from headroom.ccr.marker_resolution import resolve_markers_in_response
 from headroom.copilot_auth import apply_copilot_api_auth, is_copilot_upstream_url
+from headroom.log_safety import describe_exception
 from headroom.pipeline import PipelineStage, summarize_routing_markers
 from headroom.proxy import public_errors
 from headroom.proxy.anthropic_wire import (
@@ -339,16 +340,14 @@ def _dump_prefix_mismatch(request_id: str, current: list, previous: list) -> Non
                 default=str,
             )
     except (OSError, TypeError, ValueError, RecursionError) as e:  # debug aid; never fail the turn
-        # An OSError names only the local dump path; other errors could quote
-        # message content, so their text stays at debug.
+        # describe_exception keeps an OSError's errno and strerror; other errors
+        # could quote message content, so no message is logged.
         logger.warning(
-            "[%s] prefix_mismatch_debug dump to %s failed: %s%s",
+            "[%s] prefix_mismatch_debug dump to %s failed: %s",
             request_id,
             os.environ.get("HEADROOM_DEBUG_PREFIX_MISMATCH"),
-            type(e).__name__,
-            f": {e}" if isinstance(e, OSError) else "",
+            describe_exception(e),
         )
-        logger.debug("[%s] prefix_mismatch_debug dump failure detail", request_id, exc_info=True)
 
 
 class AnthropicHandlerMixin:
@@ -2371,9 +2370,11 @@ class AnthropicHandlerMixin:
                     if result and result.waste_signals:
                         waste_signals_dict = result.waste_signals.to_dict()
                 except Exception as e:
-                    # Include type so TimeoutError vs other failures is distinguishable
-                    # in bug reports — str(asyncio.TimeoutError()) is empty otherwise.
-                    logger.warning(f"[{request_id}] Optimization failed: {type(e).__name__}: {e}")
+                    # Types and code locations only: a compressor or hook error can
+                    # quote the messages it was given.
+                    logger.warning(
+                        "[%s] Optimization failed: %s", request_id, describe_exception(e)
+                    )
                     # Flag compression failure for observability
                     _compression_failed = True
                     # Split timeout from other errors: a timeout means the
@@ -3117,11 +3118,11 @@ class AnthropicHandlerMixin:
             def _count_tool_tokens(value: object) -> int:
                 try:
                     return tokenizer.count_text(json.dumps(value, default=str))
-                except Exception:
+                except Exception as e:
                     logger.debug(
-                        "[%s] tool token count failed; tool savings not counted",
+                        "[%s] tool token count failed; tool savings not counted: %s",
                         request_id,
-                        exc_info=True,
+                        describe_exception(e),
                     )
                     return 0
 

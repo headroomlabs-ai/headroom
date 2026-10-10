@@ -25,6 +25,7 @@ from datetime import datetime
 from typing import TYPE_CHECKING, Any
 from urllib.parse import quote, unquote, urlparse
 
+from headroom.log_safety import describe_exception
 from headroom.proxy.conversation_savings import savings_conversation_key
 from headroom.proxy.handlers._failure_logging import log_hook_failure, log_request_failure
 from headroom.proxy.helpers import (
@@ -3118,11 +3119,11 @@ class OpenAIHandlerMixin:
                     - tokenizer.count_text(_json_debug_dumps(working.get("tools"))),
                 )
                 _add_timing("compression_tool_schema_token_count", tool_token_started)
-            except Exception:
+            except Exception as e:
                 logger.debug(
-                    "[%s] tool schema compaction token count failed; savings not counted",
+                    "[%s] tool schema compaction token count failed; savings not counted: %s",
                     request_id,
-                    exc_info=True,
+                    describe_exception(e),
                 )
             if debug_enabled:
                 _log_codex_compression_debug(
@@ -3162,11 +3163,11 @@ class OpenAIHandlerMixin:
                             tokenizer.count_text(_json_debug_dumps(payload.get("tools")))
                             - tokenizer.count_text(_json_debug_dumps(working.get("tools"))),
                         )
-                    except Exception:
+                    except Exception as e:
                         logger.debug(
-                            "[%s] tool desc compaction token count failed; savings not counted",
+                            "[%s] tool desc compaction token count failed; savings not counted: %s",
                             request_id,
-                            exc_info=True,
+                            describe_exception(e),
                         )
                     if debug_enabled:
                         _log_codex_compression_debug(
@@ -3180,11 +3181,10 @@ class OpenAIHandlerMixin:
                             tools_bytes_saved=desc_before - desc_after,
                         )
         except Exception as e:
-            # Tool schemas are client content: the error text stays at debug.
+            # Tool schemas are client content: log the failure, never its message.
             logger.warning(
-                "[%s] tool desc compaction step failed: %s", request_id, type(e).__name__
+                "[%s] tool desc compaction step failed: %s", request_id, describe_exception(e)
             )
-            logger.debug("[%s] tool desc compaction failure detail", request_id, exc_info=True)
 
         # Server-side Tool Search deferral (OpenAI Responses, gpt-5.4+): mark
         # non-core function/MCP tools defer_loading + inject {"type": "tool_search"}
@@ -3306,11 +3306,11 @@ class OpenAIHandlerMixin:
                     )
                     if _mt_after < _mt_before:
                         tokens_saved += _mt_before - _mt_after
-                except Exception:
+                except Exception as e:
                     logger.debug(
-                        "[%s] turn-hook message fold token count failed; savings not counted",
+                        "[%s] turn-hook message fold token count failed; savings not counted: %s",
                         request_id,
-                        exc_info=True,
+                        describe_exception(e),
                     )
             modified = True
             transforms.append("openai:responses:turn_hook")
@@ -3361,11 +3361,11 @@ class OpenAIHandlerMixin:
                     "compression_tool_schema_attempted_token_count",
                     attempted_token_started,
                 )
-            except Exception:
+            except Exception as e:
                 logger.debug(
-                    "[%s] tool schema attempted-token count failed",
+                    "[%s] tool schema attempted-token count failed: %s",
                     request_id,
-                    exc_info=True,
+                    describe_exception(e),
                 )
 
         dedupe_started = time.perf_counter()
@@ -5283,11 +5283,11 @@ class OpenAIHandlerMixin:
                                     current_forwarded_messages=optimized_messages,
                                 ),
                             )
-                    except Exception:
+                    except Exception as e:
                         logger.debug(
-                            "[%s] cache observation (openai chat, backend) failed",
+                            "[%s] cache observation (openai chat, backend) failed: %s",
                             request_id,
-                            exc_info=True,
+                            describe_exception(e),
                         )
 
                     openai_prefix_tracker.update_from_response(
@@ -5787,11 +5787,11 @@ class OpenAIHandlerMixin:
                                 current_forwarded_messages=optimized_messages,
                             ),
                         )
-                except Exception:
+                except Exception as e:
                     logger.debug(
-                        "[%s] cache observation (openai chat, direct) failed",
+                        "[%s] cache observation (openai chat, direct) failed: %s",
                         request_id,
-                        exc_info=True,
+                        describe_exception(e),
                     )
 
                 openai_prefix_tracker.update_from_response(
