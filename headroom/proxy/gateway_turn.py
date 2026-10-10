@@ -1498,14 +1498,12 @@ async def handle_compress_response(proxy: Any, request: Any) -> Any:
     """``POST /v1/compress/response`` — finish or re-drive a pending turn."""
     from fastapi.responses import JSONResponse
 
-    from headroom.proxy.helpers import _read_request_json
+    from headroom.proxy.helpers import _read_request_json, invalid_request_body_message
 
     try:
         body = await _read_request_json(request)
-    except Exception:
-        return _error(400, "invalid_request", "Invalid JSON in request body.")
-    if not isinstance(body, dict):
-        return _error(400, "invalid_request", "Request body must be a JSON object.")
+    except Exception as exc:
+        return _error(400, "invalid_request", invalid_request_body_message(exc))
 
     turn_id = body.get("turn_id")
     if not isinstance(turn_id, str) or not turn_id.strip() or len(turn_id) > 128:
