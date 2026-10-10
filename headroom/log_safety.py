@@ -35,11 +35,16 @@ _ID_MAX_CHARS = 80
 _MAX_ERRNO = 2**31 - 1
 # Schemes whose URLs have no host ("file:///path").
 _LOCAL_SCHEMES = frozenset({"file", "sqlite", "unix"})
-# DNS labels, with "_" allowed for container and service names (model_gateway).
+# Strict DNS labels. "_" is left out on purpose: it is not valid in a public
+# hostname but is common in keys (sk_live_...), so a host with it is masked.
 _HOSTNAME = re.compile(
-    r"[a-z0-9_](?:[a-z0-9_-]{0,61}[a-z0-9_])?(?:\.[a-z0-9_](?:[a-z0-9_-]{0,61}[a-z0-9_])?)*\.?"
+    r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)*\.?"
 )
-_HOSTLESS_URL = re.compile(r"[A-Za-z][A-Za-z0-9+.-]*:///")
+_HOSTLESS_URL = re.compile(r"([A-Za-z][A-Za-z0-9+.-]*):///")
+# What urlsplit removes before parsing: leading C0 controls and spaces, and
+# every tab and newline. The hostless check must look at the same text.
+_URL_LEADING_JUNK = "".join(chr(code) for code in range(33))
+_URL_REMOVED = str.maketrans("", "", "\t\r\n")
 _HEADROOM_MODULE = re.compile(r"headroom(?:\.[A-Za-z_][A-Za-z0-9_]*)*")
 _IDENTIFIER = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
 # A class's __qualname__: identifiers joined by dots, with <locals> for nested ones.
@@ -209,17 +214,14 @@ def redact_url(url: str) -> str:
         return "<unparseable url>"
     # Without "//" urlsplit reads "sk-key:secret" as scheme "sk-key", so a string
     # with no host is logged only for the hostless schemes ("file:///path").
-    if not parts.netloc and not (
-        parts.scheme in _LOCAL_SCHEMES and _HOSTLESS_URL.match(url.strip())
-    ):
+    if not parts.netloc and not _is_hostless_local_url(url, parts.scheme):
         return "<unparseable url>"
     if parts.netloc:
-        checked = _checked_host(host)
-        if checked is None:
-            return "<unparseable url>"
-        host = checked
+        # A host that is not an IP or a strict DNS name may be a pasted secret;
+        # it is masked, and scheme and port still say which endpoint was meant.
+        host = _checked_host(host) or "<host>"
     scheme = parts.scheme if parts.scheme in _KNOWN_SCHEMES else "<scheme>"
-    if ":" in host:
+    if ":" in host and host != "<host>":
         host = f"[{host}]"
     netloc = f"{host}:{port}" if port is not None else host
     if content_logging_enabled():
@@ -228,6 +230,13 @@ def redact_url(url: str) -> str:
         path = "/<path>" if parts.path not in ("", "/") else parts.path
     redacted = f"{scheme}://{netloc}{path}"
     return f"{redacted}?<redacted>" if parts.query else redacted
+
+
+def _is_hostless_local_url(url: str, scheme: str) -> bool:
+    """True for ``file:///…``, ``sqlite:///…`` or ``unix:///…`` as urlsplit read it."""
+    cleaned = url.lstrip(_URL_LEADING_JUNK).translate(_URL_REMOVED)
+    match = _HOSTLESS_URL.match(cleaned)
+    return scheme in _LOCAL_SCHEMES and match is not None and match.group(1).lower() == scheme
 
 
 def _checked_host(host: str) -> str | None:
@@ -285,7 +294,9 @@ def _int_repr(value: int) -> str:
     bits = int.bit_length(value)
     # Digits an int of this many bits can have, against the process's own limit
     # (sys.set_int_max_str_digits); past it, repr raises ValueError.
-    limit = sys.get_int_max_str_digits()
+    # The limit and its getter arrived in 3.10.7; earlier releases have no limit.
+    get_limit = getattr(sys, "get_int_max_str_digits", None)
+    limit = get_limit() if get_limit is not None else 0
     if bits > _MAX_ID_INT_BITS or (limit and bits * 0.30103 + 1 >= limit):
         return f"<int of {bits} bits>"
     return int.__repr__(value)
