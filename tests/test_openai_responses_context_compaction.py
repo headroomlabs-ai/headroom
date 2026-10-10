@@ -302,7 +302,7 @@ def test_compression_pass_debug_logs_are_suppressed(caplog) -> None:
     handler._compress_openai_responses_payload(
         payload_b, model="gpt-5.5", request_id="hr_shared_request"
     )
-    # Same content twice → same pass_id (deterministic + idempotent).
+    # A repeat of the first payload, as a re-entrant pass would send.
     handler._compress_openai_responses_payload(
         payload_a, model="gpt-5.5", request_id="hr_shared_request"
     )
