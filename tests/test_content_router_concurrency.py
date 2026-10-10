@@ -102,6 +102,11 @@ def _kompress_forcing_tool_message() -> list[dict]:
         for i in range(160)
     )
     return [
+        # Naming tool_use: an unnamed tool_result is treated as an excluded tool.
+        {
+            "role": "assistant",
+            "content": [{"type": "tool_use", "id": "toolu_search_1", "name": "Bash", "input": {}}],
+        },
         {
             "role": "user",
             "content": [
@@ -111,7 +116,7 @@ def _kompress_forcing_tool_message() -> list[dict]:
                     "content": tool_content,
                 }
             ],
-        }
+        },
     ]
 
 

@@ -28,6 +28,14 @@ from headroom.proxy.provider_usage import (
     usage_int,
 )
 from headroom.proxy.token_counting import gemini_output_tokens
+from headroom.tool_name_registry import (
+    ThreadPinned,
+    message_id_from_sse,
+    record_pending_results,
+    record_thread_alias,
+    thread_pinned_of,
+)
+from headroom.tool_name_registry import record_from_sse as _record_tool_names
 
 if TYPE_CHECKING:
     from fastapi.responses import Response, StreamingResponse
@@ -489,6 +497,9 @@ class StreamingMixin:
         server_memory_tool_names: frozenset[str],
         stream_state: dict[str, Any],
         request_id: str,
+        thread_scope: str = "",
+        thread_forwarded: ThreadPinned | None = None,
+        first_message_id: str | None = None,
     ) -> AsyncIterator[bytes]:
         """Execute withheld memory tool calls and stream continuation rounds.
 
@@ -500,8 +511,6 @@ class StreamingMixin:
         client tool still has its memory calls executed, but the turn goes back
         to the client, which cannot carry the memory results.
         """
-        from headroom.proxy.helpers import MAX_SSE_BUFFER_SIZE
-
         try:
             base_body = json.loads(outbound_bytes)
         except (json.JSONDecodeError, UnicodeDecodeError):
@@ -510,6 +519,66 @@ class StreamingMixin:
         if not isinstance(messages, list):
             messages = None
         headers = {k: v for k, v in outbound_headers.items() if k.lower() != "content-length"}
+
+        # The client keeps round one's message id (its message_start is the only one
+        # forwarded); on a Thread turn the next continue must name the LAST round's.
+        shown_id = (response.get("id") if isinstance(response, dict) else None) or first_message_id
+        last_id = shown_id
+        pending: list[dict[str, Any]] = []
+        rounds = self._memory_rounds(
+            memory_filter,
+            response,
+            base_body=base_body,
+            messages=messages,
+            headers=headers,
+            url=url,
+            memory_user_id=memory_user_id,
+            memory_request_ctx=memory_request_ctx,
+            server_memory_tool_names=server_memory_tool_names,
+            stream_state=stream_state,
+            request_id=request_id,
+            thread_scope=thread_scope,
+            thread_forwarded=thread_forwarded,
+        )
+        try:
+            async with contextlib.aclosing(rounds):
+                async for frame in rounds:
+                    if isinstance(frame, str):  # the next round started: upstream took
+                        last_id = frame  # the previous round's results
+                        pending = []
+                    elif isinstance(frame, list):
+                        pending = frame
+                    else:
+                        yield frame
+        finally:
+            if thread_forwarded is not None:
+                if shown_id and last_id and last_id != shown_id:
+                    record_thread_alias(thread_scope, shown_id, last_id)
+                if pending and last_id:
+                    record_pending_results(thread_scope, last_id, pending)
+
+    async def _memory_rounds(
+        self,
+        memory_filter: MemoryToolStreamFilter,
+        response: dict[str, Any] | None,
+        *,
+        base_body: Any,
+        messages: list[Any] | None,
+        headers: dict[str, str],
+        url: str,
+        memory_user_id: str | None,
+        memory_request_ctx: Any | None,
+        server_memory_tool_names: frozenset[str],
+        stream_state: dict[str, Any],
+        request_id: str,
+        thread_scope: str,
+        thread_forwarded: ThreadPinned | None,
+    ) -> AsyncIterator[bytes | str | list[dict[str, Any]]]:
+        """The round loop of ``_continue_memory_tool_stream``: yields client frames, each
+        continuation round's upstream message id (a ``str``, from its message_start), and
+        on a Thread turn that ends with proxy memory calls not sent back, their
+        tool_result blocks (a ``list``) for the next continue to carry."""
+        from headroom.proxy.helpers import MAX_SSE_BUFFER_SIZE
 
         def is_memory_call(block: Any) -> bool:
             return (
@@ -544,6 +613,32 @@ class StreamingMixin:
             # round could not be reconstructed. Only the proxy's own calls: a
             # memory-named tool the client declared is the client's to run.
             memory_calls = memory_filter.hidden_calls()
+
+            hidden_ids = memory_filter.hidden_ids()
+
+            def answers(
+                results: list[dict[str, Any]], ids: list[str] = hidden_ids
+            ) -> list[dict[str, Any]]:
+                """One tool_result per withheld call (also one cut off mid-input, which
+                never runs): its result, else an error result."""
+                done = {r.get("tool_use_id"): r for r in results if isinstance(r, dict)}
+                return [
+                    done.get(i)
+                    or {
+                        "type": "tool_result",
+                        "tool_use_id": i,
+                        "content": "Memory tool result unavailable.",
+                        "is_error": True,
+                    }
+                    for i in ids
+                ]
+
+            if thread_forwarded is not None and hidden_ids:
+                # Upstream already stores this round with its memory tool_use. Until the
+                # next round's message_start proves the results were accepted, keep an
+                # answer for the next continue: errors first (execution or the send may
+                # be cancelled or fail), the real results once they exist.
+                yield answers([])
             tool_results: list[dict[str, Any]] = []
             if memory_calls and memory_user_id is not None and self.memory_handler is not None:
                 tool_results = await self.memory_handler.handle_memory_tool_calls(
@@ -552,6 +647,8 @@ class StreamingMixin:
                     "anthropic",
                     request_context=memory_request_ctx,
                 )
+            if thread_forwarded is not None and hidden_ids:
+                yield answers(tool_results)
             logger.info(
                 f"[{request_id}] Memory: Executed {len(tool_results)}/"
                 f"{len(memory_filter.hidden_tool_names)} proxy-handled tool call(s) "
@@ -623,7 +720,18 @@ class StreamingMixin:
                 # Same cap as the first round's buffer; past it the round is
                 # still streamed, just not rebuilt for a further continuation.
                 round_bytes: bytearray | None = bytearray()
+                sse_rest = b""
+                round_id: str | None = None
+                id_rest = b""
                 async for chunk in upstream.aiter_bytes():
+                    if round_id is None:  # from message_start: known even when the
+                        # round is too big to rebuild
+                        round_id, id_rest = message_id_from_sse(id_rest + chunk)
+                        if round_id is not None:
+                            yield round_id
+                    # A client tool called in a later round is run by the client and
+                    # answered on a Thread continue turn: learn its name here too.
+                    sse_rest = _record_tool_names(thread_scope, sse_rest + chunk, thread_forwarded)
                     if round_bytes is not None:
                         round_bytes.extend(chunk)
                         if len(round_bytes) > MAX_SSE_BUFFER_SIZE:
@@ -1043,6 +1151,8 @@ class StreamingMixin:
         session_key: str | None = None,
         conversation_key: str | None = None,
         conversation_tokens_saved: int | None = None,
+        thread_scope: str = "",
+        thread_inherited: dict[str, Any] | None = None,
         server_memory_tool_names: frozenset[str] | None = None,
         client_beta: str | None = None,
     ) -> Response | StreamingResponse:
@@ -1090,6 +1200,8 @@ class StreamingMixin:
                 session_key=session_key,
                 conversation_key=conversation_key,
                 conversation_tokens_saved=conversation_tokens_saved,
+                thread_scope=thread_scope,
+                thread_inherited=thread_inherited,
                 server_memory_tool_names=server_memory_tool_names,
                 client_beta=client_beta,
             )
@@ -1124,6 +1236,8 @@ class StreamingMixin:
         session_key: str,
         conversation_key: str | None = None,
         conversation_tokens_saved: int | None = None,
+        thread_scope: str = "",
+        thread_inherited: dict[str, Any] | None = None,
         server_memory_tool_names: frozenset[str] | None = None,
         client_beta: str | None = None,
     ) -> Response | StreamingResponse:
@@ -1628,8 +1742,26 @@ class StreamingMixin:
             try:
                 async with contextlib.aclosing(upstream_response) as response:
                     sse_chunk_index = 0
+                    _sse_rest = b""
+                    _thread_forwarded = thread_pinned_of(
+                        body, thread_inherited, server_memory_tool_names
+                    )
+                    # Round one's id from its message_start: known even when the round
+                    # is too big to rebuild (the memory rounds key their alias on it).
+                    _first_message_id: str | None = None
+                    _first_rest = b""
                     async for chunk in response.aiter_bytes():
                         sse_chunk_index += 1
+                        if provider == "anthropic":
+                            # Learn tool_use_id -> name for Thread continue turns
+                            # (tool_use is upstream there); carry the partial line.
+                            _sse_rest = _record_tool_names(
+                                thread_scope, _sse_rest + chunk, _thread_forwarded
+                            )
+                            if _first_message_id is None:
+                                _first_message_id, _first_rest = message_id_from_sse(
+                                    _first_rest + chunk
+                                )
                         # Record TTFB on first chunk
                         if stream_state["ttfb_ms"] is None:
                             stream_state["ttfb_ms"] = (time.time() - start_time) * 1000
@@ -1767,6 +1899,9 @@ class StreamingMixin:
                             server_memory_tool_names=server_memory_tool_names or frozenset(),
                             stream_state=stream_state,
                             request_id=request_id,
+                            thread_scope=thread_scope,
+                            thread_forwarded=_thread_forwarded,
+                            first_message_id=_first_message_id,
                         ):
                             guarded_frame = _guard_client_bytes(frame)
                             if guarded_frame:
@@ -1812,6 +1947,9 @@ class StreamingMixin:
                         server_memory_tool_names=server_memory_tool_names or frozenset(),
                         stream_state=stream_state,
                         request_id=request_id,
+                        thread_scope=thread_scope,
+                        thread_forwarded=_thread_forwarded,
+                        first_message_id=_first_message_id,
                     ):
                         guarded_frame = _guard_client_bytes(frame)
                         if guarded_frame:

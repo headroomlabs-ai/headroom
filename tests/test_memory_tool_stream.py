@@ -298,6 +298,217 @@ class TestStreamingMemoryContinuation:
         assert events == _events(raw)
 
 
+class TestThreadToolNamesAcrossRounds:
+    @pytest.mark.asyncio
+    async def test_client_tool_called_in_a_continuation_round_is_named_for_the_thread(
+        self,
+    ) -> None:
+        """A Bash call made after a server-side memory round is answered on a Thread
+        continue turn whose tool_use lives upstream: its name must be recorded too."""
+        from headroom import tool_name_registry
+
+        bash2 = {**BASH, "id": "toolu_bash_round2"}
+        proxy = _proxy(
+            [_sse([TEXT, SAVE], "tool_use"), _sse([bash2], "tool_use")],
+            SAVE_RESULT,
+        )
+        await _client_view(proxy, server_memory_tool_names=MEMORY_TOOLS, thread_scope="scope-r2")
+        assert tool_name_registry.lookup("scope-r2", "toolu_mem") == "memory_save"
+        assert tool_name_registry.lookup("scope-r2", "toolu_bash_round2") == "Bash"
+
+
+class TestThreadMemoryRounds:
+    @pytest.mark.asyncio
+    async def test_the_next_continue_is_routed_to_the_last_rounds_message(self) -> None:
+        """The client only saw round one's id; the thread continues from the last round."""
+        from headroom import tool_name_registry
+
+        bash2 = {**BASH, "id": "toolu_round2"}
+        proxy = _proxy(
+            [
+                _sse([TEXT, SAVE], "tool_use"),
+                _sse([bash2], "tool_use").replace(b'"msg_1"', b'"msg_round2"'),
+            ],
+            SAVE_RESULT,
+        )
+        result = await proxy._stream_response(
+            url="https://api.anthropic.com/v1/messages",
+            headers={"x-api-key": "sk-test"},
+            body={
+                "model": "claude-test",
+                "max_tokens": 100,
+                "stream": True,
+                "thread": {"type": "continue", "previous_message_id": "msg_p"},
+                "messages": [{"role": "user", "content": "remember the deploy region"}],
+            },
+            provider="anthropic",
+            model="claude-test",
+            request_id="test-mem-thread",
+            original_tokens=10,
+            optimized_tokens=10,
+            tokens_saved=0,
+            transforms_applied=[],
+            tags={},
+            optimization_latency=0.0,
+            memory_user_id="user-1",
+            server_memory_tool_names=MEMORY_TOOLS,
+            thread_scope="scope-alias",
+        )
+        events = _events(b"".join([chunk async for chunk in result.body_iterator]))
+        shown = [e["message"]["id"] for e in events if e["type"] == "message_start"]
+        assert shown == ["msg_1"]
+        assert tool_name_registry.resolve_thread_alias("scope-alias", "msg_1") == "msg_round2"
+        assert tool_name_registry.resolve_thread_alias("other-scope", "msg_1") == "msg_1"
+        assert tool_name_registry.lookup("scope-alias", "toolu_round2") == "Bash"
+
+    async def _thread_stream(self, proxy: HeadroomProxy, scope: str, **kwargs: Any) -> list:
+        result = await proxy._stream_response(
+            url="https://api.anthropic.com/v1/messages",
+            headers={"x-api-key": "sk-test"},
+            body={
+                "model": "claude-test",
+                "max_tokens": 100,
+                "stream": True,
+                "thread": {"type": "continue", "previous_message_id": "msg_p"},
+                "messages": [{"role": "user", "content": "remember the deploy region"}],
+            },
+            provider="anthropic",
+            model="claude-test",
+            request_id="test-mem-thread",
+            original_tokens=10,
+            optimized_tokens=10,
+            tokens_saved=0,
+            transforms_applied=[],
+            tags={},
+            optimization_latency=0.0,
+            server_memory_tool_names=MEMORY_TOOLS,
+            thread_scope=scope,
+            **kwargs,
+        )
+        return _events(b"".join([chunk async for chunk in result.body_iterator]))
+
+    @pytest.mark.asyncio
+    async def test_a_round_too_big_to_rebuild_still_gets_its_alias(self, monkeypatch) -> None:  # noqa: ANN001
+        from headroom import tool_name_registry
+
+        monkeypatch.setattr("headroom.proxy.helpers.MAX_SSE_BUFFER_SIZE", 4000)
+        big = {"type": "text", "text": "x" * 6000}
+        proxy = _proxy(
+            [
+                _sse([TEXT, SAVE], "tool_use"),
+                _sse([big], "end_turn").replace(b'"msg_1"', b'"msg_big2"'),
+            ],
+            SAVE_RESULT,
+        )
+        await self._thread_stream(proxy, "scope-big", memory_user_id="user-1")
+        assert tool_name_registry.resolve_thread_alias("scope-big", "msg_1") == "msg_big2"
+
+    @pytest.mark.asyncio
+    async def test_memory_results_not_sent_back_are_kept_for_the_next_continue(self) -> None:
+        """A round that also calls a client tool returns the turn to the client; upstream
+        stores the memory tool_use unanswered, so its result must ride the next turn."""
+        from headroom import tool_name_registry
+
+        save2 = {**SAVE, "id": "toolu_mem2"}
+        bash2 = {**BASH, "id": "toolu_bash2"}
+        result2 = [{"type": "tool_result", "tool_use_id": "toolu_mem2", "content": "saved"}]
+        proxy = _proxy(
+            [
+                _sse([TEXT, SAVE], "tool_use"),
+                _sse([save2, bash2], "tool_use").replace(b'"msg_1"', b'"msg_mixed2"'),
+            ],
+            SAVE_RESULT,
+        )
+        proxy.memory_handler.handle_memory_tool_calls = AsyncMock(
+            side_effect=[SAVE_RESULT, result2]
+        )
+        await self._thread_stream(proxy, "scope-pend", memory_user_id="user-1")
+        assert tool_name_registry.resolve_thread_alias("scope-pend", "msg_1") == "msg_mixed2"
+        assert tool_name_registry.pending_results("scope-pend", "msg_mixed2") == result2
+
+    @pytest.mark.asyncio
+    async def test_memory_calls_without_a_result_get_an_error_result_on_a_thread(self) -> None:
+        from headroom import tool_name_registry
+
+        proxy = _proxy([_sse([SAVE, BASH], "tool_use")], [])  # the memory backend returned nothing
+        await self._thread_stream(proxy, "scope-nouser", memory_user_id="user-1")
+        pending = tool_name_registry.pending_results("scope-nouser", "msg_1")
+        assert [(r["tool_use_id"], r.get("is_error")) for r in pending] == [("toolu_mem", True)]
+
+    @pytest.mark.asyncio
+    async def test_a_failed_continuation_round_keeps_the_answers_for_round_one(self) -> None:
+        """Round one is stored upstream with its memory tool_use; the round that would
+        have answered it failed, so the next continue must carry the answer."""
+        from headroom import tool_name_registry
+
+        proxy = _proxy([_sse([TEXT, SAVE], "tool_use")], SAVE_RESULT)
+        failed = MagicMock()
+        failed.status_code = 529
+        failed.aread = AsyncMock(return_value=b'{"type":"error"}')
+        failed.aclose = AsyncMock()
+        first = proxy.http_client.send.side_effect
+        proxy.http_client.send = AsyncMock(side_effect=[next(iter(first)), failed])
+        await self._thread_stream(proxy, "scope-fail", memory_user_id="user-1")
+        assert tool_name_registry.resolve_thread_alias("scope-fail", "msg_1") == "msg_1"
+        assert tool_name_registry.pending_results("scope-fail", "msg_1") == SAVE_RESULT
+
+    @pytest.mark.asyncio
+    async def test_answers_are_dropped_once_the_next_round_starts(self) -> None:
+        from headroom import tool_name_registry
+
+        proxy = _proxy(
+            [
+                _sse([TEXT, SAVE], "tool_use"),
+                _sse([TEXT], "end_turn").replace(b'"msg_1"', b'"msg_ok2"'),
+            ],
+            SAVE_RESULT,
+        )
+        await self._thread_stream(proxy, "scope-ok", memory_user_id="user-1")
+        assert tool_name_registry.pending_results("scope-ok", "msg_1") == []
+        assert tool_name_registry.pending_results("scope-ok", "msg_ok2") == []
+
+    @pytest.mark.asyncio
+    async def test_round_one_too_big_to_rebuild_still_keys_its_answers(self, monkeypatch) -> None:  # noqa: ANN001
+        from headroom import tool_name_registry
+
+        monkeypatch.setattr("headroom.proxy.helpers.MAX_SSE_BUFFER_SIZE", 500)
+        big = {"type": "text", "text": "x" * 2000}
+        proxy = _proxy([_sse([big, SAVE, BASH], "tool_use")], SAVE_RESULT)
+        await self._thread_stream(proxy, "scope-big1", memory_user_id="user-1")
+        assert [
+            r["tool_use_id"] for r in tool_name_registry.pending_results("scope-big1", "msg_1")
+        ] == ["toolu_mem"]
+
+    @pytest.mark.asyncio
+    async def test_a_memory_call_cut_off_mid_input_still_gets_an_answer(self) -> None:
+        """max_tokens inside the call's input: it never runs, but the stored message may
+        hold the tool_use, so the next continue answers it with an error result."""
+        from headroom import tool_name_registry
+
+        cut = _sse([TEXT, SAVE], "max_tokens")
+        full = json.dumps(json.dumps(SAVE["input"]))[1:-1].encode()
+        assert full in cut
+        proxy = _proxy([cut.replace(full, full[:10])], SAVE_RESULT)
+        await self._thread_stream(proxy, "scope-cut", memory_user_id="user-1")
+        pending = tool_name_registry.pending_results("scope-cut", "msg_1")
+        assert [(r["tool_use_id"], r.get("is_error")) for r in pending] == [("toolu_mem", True)]
+        proxy.memory_handler.handle_memory_tool_calls.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_no_alias_without_a_thread(self) -> None:
+        from headroom import tool_name_registry
+
+        proxy = _proxy(
+            [
+                _sse([TEXT, SAVE], "tool_use"),
+                _sse([TEXT], "end_turn").replace(b'"msg_1"', b'"msg_plain2"'),
+            ],
+            SAVE_RESULT,
+        )
+        await _client_view(proxy, server_memory_tool_names=MEMORY_TOOLS, thread_scope="scope-np")
+        assert tool_name_registry.resolve_thread_alias("scope-np", "msg_1") == "msg_1"
+
+
 class TestRecordedMemoryCalls:
     def test_hidden_call_input_is_rebuilt_from_stream(self) -> None:
         flt = MemoryToolStreamFilter(MEMORY_TOOLS)
@@ -838,6 +1049,80 @@ class TestHandlerPassesServerMemoryTools:
             )
 
         assert captured["server_memory_tool_names"] == MEMORY_TOOLS
+
+    def test_a_continue_without_tools_keeps_the_threads_proxy_memory_tools(self) -> None:
+        """The create turn's stored tools include the proxy's memory tools; a continue that
+        omits tools must still withhold and run their calls, not hand them to the client."""
+        from types import SimpleNamespace
+
+        from fastapi.responses import StreamingResponse
+        from fastapi.testclient import TestClient
+
+        from headroom import tool_name_registry
+        from headroom.proxy.anthropic_threads import thread_scope
+        from headroom.proxy.server import ProxyConfig, create_app
+
+        headers = {
+            "x-api-key": "test-key",
+            "anthropic-version": "2023-06-01",
+            "x-headroom-user-id": "u1",
+        }
+        scope = thread_scope(headers, "global", "https://api.anthropic.com")
+        stored_tools = [
+            {"name": n, "input_schema": {"type": "object"}} for n in ("Bash", *sorted(MEMORY_TOOLS))
+        ]
+        tool_name_registry.record_thread_pinned(
+            scope,
+            "msg_mem_create",
+            tool_name_registry.thread_pinned_of(
+                {"thread": {"type": "create"}, "tools": stored_tools}, None, MEMORY_TOOLS
+            ),
+        )
+        config = ProxyConfig(
+            optimize=False,
+            cache_enabled=False,
+            rate_limit_enabled=False,
+            cost_tracking_enabled=False,
+            log_requests=False,
+            ccr_inject_tool=False,
+            ccr_handle_responses=False,
+            ccr_context_tracking=False,
+            image_optimize=False,
+        )
+        captured: dict[str, Any] = {}
+
+        async def fake_stream_response(*args: Any, **kwargs: Any) -> StreamingResponse:
+            captured.update(kwargs, args=args)
+
+            async def gen() -> Any:
+                yield b""
+
+            return StreamingResponse(gen(), media_type="text/event-stream")
+
+        with TestClient(create_app(config)) as client:
+            proxy = client.app.state.proxy
+            proxy.memory_handler = SimpleNamespace(
+                config=SimpleNamespace(inject_context=False, inject_tools=True),
+                compute_memory_tool_definitions=lambda provider: [],
+                get_beta_headers=lambda: {},
+                has_memory_tool_calls=lambda resp, provider: False,
+            )
+            proxy._stream_response = fake_stream_response
+            client.post(
+                "/v1/messages",
+                headers=headers,
+                json={
+                    "model": "claude-sonnet-4-6",
+                    "max_tokens": 64,
+                    "stream": True,
+                    "thread": {"type": "continue", "previous_message_id": "msg_mem_create"},
+                    "messages": [{"role": "user", "content": "and the region?"}],
+                },
+            )
+
+        assert captured["server_memory_tool_names"] == MEMORY_TOOLS
+        body = captured.get("body") or captured["args"][2]
+        assert "tools" not in body
 
 
 class TestStreamingRetainedByteLimit:

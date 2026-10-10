@@ -130,6 +130,11 @@ class MemoryToolStreamFilter:
     def hidden_tool_names(self) -> list[str]:
         return [block["name"] for block, _ in self._hidden.values()]
 
+    def hidden_ids(self) -> list[str]:
+        """The id of every withheld ``tool_use`` block, finished or not: on a Thread the
+        stored message may hold each one, and every one needs a tool_result."""
+        return [b["id"] for b, _ in self._hidden.values() if isinstance(b.get("id"), str)]
+
     def hidden_calls(self) -> list[dict[str, Any]]:
         """The withheld ``tool_use`` blocks that finished with a complete input.
 

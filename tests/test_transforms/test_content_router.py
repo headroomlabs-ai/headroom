@@ -177,6 +177,11 @@ def test_force_kompress_routes_anthropic_tool_result_to_targeted_kompress(
         for i in range(160)
     )
     messages = [
+        # Naming tool_use: an unnamed tool_result is treated as an excluded tool.
+        {
+            "role": "assistant",
+            "content": [{"type": "tool_use", "id": "toolu_search_1", "name": "Bash", "input": {}}],
+        },
         {
             "role": "user",
             "content": [
@@ -186,7 +191,7 @@ def test_force_kompress_routes_anthropic_tool_result_to_targeted_kompress(
                     "content": tool_content,
                 }
             ],
-        }
+        },
     ]
 
     result = router.apply(
@@ -199,7 +204,7 @@ def test_force_kompress_routes_anthropic_tool_result_to_targeted_kompress(
         read_protection_window=0,
     )
 
-    assert result.messages[0]["content"][0]["content"] != tool_content
+    assert result.messages[-1]["content"][0]["content"] != tool_content
     assert result.transforms_applied == ["router:tool_result:kompress"]
     assert captured["target_ratio"] == 0.10
 

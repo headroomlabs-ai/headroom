@@ -2002,11 +2002,19 @@ def _block_out(router: ContentRouter, content: str, model_limit: int) -> str:
     """Run apply() for a tool_result content-block and return the (possibly
     compressed) string content of that block."""
     result = router.apply(
-        [_tool_result_block_msg(content)],
+        [
+            # The naming tool_use: a tool_result with no known name is treated
+            # as an excluded tool (Thread continue turns), so keep it resolvable.
+            {
+                "role": "assistant",
+                "content": [{"type": "tool_use", "id": "tu1", "name": "Bash", "input": {}}],
+            },
+            _tool_result_block_msg(content),
+        ],
         _ChurnTokenizer(),
         model_limit=model_limit,
     )
-    return result.messages[0]["content"][0]["content"]
+    return result.messages[-1]["content"][0]["content"]
 
 
 @pytest.mark.parametrize(

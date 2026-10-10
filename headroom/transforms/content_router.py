@@ -5460,7 +5460,12 @@ class ContentRouter(Transform):
 
     # Transform interface
 
-    def _build_tool_name_map(self, messages: list[dict[str, Any]]) -> dict[str, str]:
+    def _build_tool_name_map(
+        self,
+        messages: list[dict[str, Any]],
+        thread_continue: bool = False,
+        tool_scope: str = "",
+    ) -> dict[str, str]:
         """Build mapping from tool_call_id to tool_name.
 
         Scans assistant messages to find tool calls and extract their names.
@@ -5524,6 +5529,32 @@ class ContentRouter(Transform):
                             command = _tool_call_command_text(call_input)
                             if command:
                                 commands_map[tc_id] = command
+
+        # Thread continue turns resend only tool_results; the naming tool_use is
+        # upstream. Fall back to names learned from responses, and for Anthropic
+        # tool_results to "Read" (an excluded tool, so lossless-only) when unknown:
+        # fail safe, never lossy. OpenAI role=tool has no Threads, so it only
+        # gets the registry hit and keeps its existing orphan behavior.
+        from headroom.tool_name_registry import lookup as _lookup_tool_name
+
+        for msg in messages:
+            content = msg.get("content")
+            if msg.get("role") == "tool":
+                tid = msg.get("tool_call_id")
+                if tid and tid not in mapping and (known := _lookup_tool_name(tool_scope, tid)):
+                    mapping[tid] = known
+            elif isinstance(content, list):
+                for b in content:
+                    if isinstance(b, dict) and b.get("type") == "tool_result":
+                        tid = b.get("tool_use_id")
+                        if tid and tid not in mapping:
+                            # Unknown id: only a Thread continue turn legitimately has
+                            # its tool_use upstream, so only there fail safe to "Read".
+                            known = _lookup_tool_name(tool_scope, tid) or (
+                                "Read" if thread_continue else None
+                            )
+                            if known:
+                                mapping[tid] = known
 
         self._tool_call_args = args_map
         self._tool_call_commands = commands_map
@@ -5827,7 +5858,11 @@ class ContentRouter(Transform):
         }
 
         # Build tool name map for exclusion checking
-        tool_name_map = self._build_tool_name_map(messages)
+        tool_name_map = self._build_tool_name_map(
+            messages,
+            thread_continue=bool(kwargs.get("thread_continue", False)),
+            tool_scope=str(kwargs.get("tool_scope") or ""),
+        )
 
         # Compute excluded tool IDs based on config
         exclude_tools = (
