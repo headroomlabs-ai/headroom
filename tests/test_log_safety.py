@@ -278,7 +278,7 @@ def test_text_that_is_not_a_url_never_reaches_the_log(value: str) -> None:
 
 @pytest.mark.parametrize("host", ["a b", "a\x0bb\x0cc", "a\x85b"])
 def test_hosts_with_line_breaks_are_not_logged(host: str) -> None:
-    assert redact_url(f"http://{host}/") == "<unparseable url>"
+    assert redact_url(f"http://{host}/") == "http://<host>/"
 
 
 def test_class_names_cannot_forge_a_log_line(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -460,9 +460,10 @@ def test_deep_tracebacks_keep_only_the_innermost_headroom_frames() -> None:
         ("file:///var/lib/headroom/ledger.db", "file:///<path>"),
         ("sqlite:///tmp/x.db", "sqlite:///<path>"),
         ("unix:///run/headroom.sock", "unix:///<path>"),
-        ("https://sk_live_CANARY@/v1", "<unparseable url>"),
-        ("https://abcDEF+ghi=/v1", "<unparseable url>"),
-        ("http://model_gateway:8000/v1", "http://model_gateway:8000/<path>"),
+        ("https://sk_live_CANARY@/v1", "https://<host>/<path>"),
+        ("https://sk_live_CANARY/v1", "https://<host>/<path>"),
+        ("https://abcDEF+ghi=/v1", "https://<host>/<path>"),
+        ("http://model_gateway:8000/v1", "http://<host>:8000/<path>"),
         ("https://bücher.example/v1", "https://xn--bcher-kva.example/<path>"),
         ("http://[fe80::1%25sk-ZONE-CANARY]:8787/", "http://[fe80::1]:8787/"),
         ("https://upstream.example/file:///etc", "https://upstream.example/<path>"),
@@ -541,3 +542,14 @@ def test_class_names_must_be_plain_identifiers(name: str) -> None:
 
     assert describe_exception(cls("x")) == "<exception>"
     assert safe_id(cls("x")) == "<object>"
+
+
+@pytest.mark.parametrize("url", [" \x01file:///var/x", "fi\tle:///var/x", "file:/\n//var/x"])
+def test_hostless_check_reads_the_url_the_way_urlsplit_does(url: str) -> None:
+    assert redact_url(url) == "file:///<path>"
+
+
+def test_int_ids_work_without_a_digit_limit_getter(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delattr(sys, "get_int_max_str_digits")
+
+    assert safe_id(12345) == "12345"
