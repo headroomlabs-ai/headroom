@@ -117,8 +117,12 @@ snapshot in response metadata (for example, a request for `gpt-5.5` returned
 Copilot plan and organization policy.
 
 The proxy supports the native Copilot OpenAI-compatible request paths used by
-GPT and Claude models. Headroom's upstream auth hook replaces local client auth
-with the current Copilot API token on every Copilot-bound request.
+GPT and Claude models. Inline completions retain the editor's own `ghu_` OAuth
+bearer and native integration metadata on the completions host, including an
+operator-configured gateway with a base-path prefix. Headroom does not replace
+that editor identity with the proxy operator's Copilot seat or add chat-specific
+headers. Chat and Responses retain their existing managed Copilot API-token
+policy; a raw OAuth bearer on those routes does not gain the inline exception.
 
 ## Stop and undo
 
