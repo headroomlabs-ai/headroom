@@ -8,33 +8,61 @@ import warnings
 
 import pytest
 
+import headroom.compression as compression
 
-def test_package_exports_warn(monkeypatch: pytest.MonkeyPatch) -> None:
+
+@pytest.fixture
+def fresh(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Drop cached exports and the universal module; monkeypatch restores both."""
+    for name in compression.__all__:
+        monkeypatch.delitem(compression.__dict__, name, raising=False)
     monkeypatch.delitem(sys.modules, "headroom.compression.universal", raising=False)
-    import headroom.compression as compression
+    monkeypatch.delattr(compression, "universal", raising=False)
 
+
+@pytest.mark.usefixtures("fresh")
+def test_attribute_access_warns_once() -> None:
     with pytest.warns(
         DeprecationWarning, match="compression.UniversalCompressor is deprecated"
     ) as record:
         compressor_cls = compression.UniversalCompressor
+        assert compression.UniversalCompressor is compressor_cls  # cached: no second warning
     assert compressor_cls.__name__ == "UniversalCompressor"
     # One warning, attributed to this file rather than to importlib.
     assert len(record) == 1
     assert record[0].filename == __file__
 
-    with pytest.warns(DeprecationWarning, match="use headroom.compress"):
-        from headroom.compression import compress  # noqa: F401
+
+@pytest.mark.usefixtures("fresh")
+def test_from_import_warns_once() -> None:
+    with warnings.catch_warnings(record=True) as record:
+        warnings.simplefilter("always")
+        from headroom.compression import ContentType  # noqa: F401
+    deprecations = [w for w in record if issubclass(w.category, DeprecationWarning)]
+    assert len(deprecations) == 1
+    assert "use headroom.compress" in str(deprecations[0].message)
 
 
-def test_universal_module_import_warns(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.delitem(sys.modules, "headroom.compression.universal", raising=False)
+@pytest.mark.usefixtures("fresh")
+def test_wildcard_import_warns_once_per_name() -> None:
+    namespace: dict[str, object] = {}
+    with warnings.catch_warnings(record=True) as record:
+        warnings.simplefilter("always")
+        exec("from headroom.compression import *", namespace)
+    messages = [str(w.message) for w in record if issubclass(w.category, DeprecationWarning)]
+    assert len(messages) == len(compression.__all__)
+    assert set(compression.__all__) <= set(namespace)
+
+
+@pytest.mark.usefixtures("fresh")
+def test_universal_module_import_warns() -> None:
     with pytest.warns(DeprecationWarning, match="compression.universal is deprecated"):
         importlib.import_module("headroom.compression.universal")
 
 
 def test_detector_import_stays_quiet(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.delitem(sys.modules, "headroom.compression", raising=False)
     monkeypatch.delitem(sys.modules, "headroom.compression.detector", raising=False)
+    monkeypatch.delattr(compression, "detector", raising=False)
     with warnings.catch_warnings():
         warnings.simplefilter("error", DeprecationWarning)
         detector = importlib.import_module("headroom.compression.detector")
