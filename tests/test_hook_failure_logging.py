@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
+import contextlib
 import logging
+import socket
+import threading
 
 import httpx
 import pytest
@@ -109,18 +112,63 @@ def test_request_failure_names_the_failure_without_payload(capture) -> None:
     log_request_failure(
         "r1", "Request", _raised(ValueError(CONTENT)), provider="anthropic", model="m"
     )
-    transport = httpx.ConnectError(
-        f"cannot reach https://user:{CREDENTIAL}@upstream.example/v1?key={CREDENTIAL}"
-    )
-    log_request_failure("r2", "Request", transport, model="m")
 
-    first, second = (r.getMessage() for r in capture.at(logging.ERROR))
-    assert first.startswith("[r1] Request failed: provider='anthropic' model='m' ValueError at ")
-    assert second == (
-        "[r2] Request failed: model='m' ConnectError"
-        " (cannot reach https://upstream.example/v1?<redacted>)"
-    )
+    (error,) = (r.getMessage() for r in capture.at(logging.ERROR))
+    assert error.startswith("[r1] Request failed: provider='anthropic' model='m' ValueError at ")
     capture.assert_no_canaries()
+
+
+@contextlib.contextmanager
+def _proxy_rejecting_connect(reason: str):
+    """A real local HTTP proxy that answers every CONNECT with ``502 <reason>``."""
+    server = socket.socket()
+    server.bind(("127.0.0.1", 0))
+    server.listen()
+    server.settimeout(5)
+
+    def serve() -> None:
+        try:
+            conn, _ = server.accept()
+        except OSError:  # closed before a client came
+            return
+        with conn:
+            conn.recv(65536)
+            conn.sendall(f"HTTP/1.1 502 {reason}\r\nContent-Length: 0\r\n\r\n".encode())
+
+    thread = threading.Thread(target=serve, daemon=True)
+    thread.start()
+    try:
+        yield f"http://127.0.0.1:{server.getsockname()[1]}"
+    finally:
+        server.close()
+        thread.join(timeout=5)
+
+
+def _proxy_error(reason: str) -> httpx.ProxyError:
+    with _proxy_rejecting_connect(reason) as proxy_url:
+        with httpx.Client(proxy=proxy_url, timeout=5) as client:
+            with pytest.raises(httpx.ProxyError) as caught:
+                client.get("https://upstream.example/v1/messages")
+    assert reason in str(caught.value)  # the peer's text really is in the exception
+    return caught.value
+
+
+def test_a_proxy_reason_phrase_stays_out_of_the_request_failure_line(capture) -> None:
+    log_request_failure("r1", "Request", _proxy_error(CONTENT), provider="anthropic", model="m")
+
+    (error,) = (r.getMessage() for r in capture.at(logging.ERROR))
+    assert error.startswith("[r1] Request failed: provider='anthropic' model='m' ProxyError at ")
+    capture.assert_no_canaries()
+
+
+def test_the_content_opt_in_restores_the_proxy_text(
+    capture, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("HEADROOM_DEBUG_DUMP", "full")
+    log_request_failure("r1", "Request", _proxy_error(CONTENT), model="m")
+
+    (error,) = capture.at(logging.ERROR)
+    assert CONTENT in logging.Formatter().format(error)
 
 
 def _proxy_app(hooks: CompressionHooks, fake_retry, *, optimize: bool):  # noqa: ANN001, ANN202

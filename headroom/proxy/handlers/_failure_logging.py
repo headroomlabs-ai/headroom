@@ -4,28 +4,23 @@ Exceptions on this path can carry request content: a compression hook sees the
 messages, and a catch-all handler catches whatever a compressor or router raised.
 So no line, at any level, carries an exception message or a traceback. A failure
 is named by the request id, provider, model, hook, stage and
-``describe_exception`` (exception types and code locations). Upstream transport
-errors keep their text, which httpx writes and which diagnoses an outage, with
-any URL in it redacted.
+``describe_exception`` (exception types, code locations, errno). That holds for
+upstream transport errors too: an httpx ``ProxyError`` quotes the proxy's reason
+phrase, which a peer controls. Messages and tracebacks appear only under the
+operator's content opt-in, ``HEADROOM_DEBUG_DUMP=full``.
 """
 
 from __future__ import annotations
 
 import logging
-import re
 
-import httpx
-
-from headroom.log_safety import WarnOnce, describe_exception, redact_url, safe_id
+from headroom.log_safety import WarnOnce, describe_exception, safe_id
 
 logger = logging.getLogger("headroom.proxy")
 
 # One warning per (hook class, stage, exception type), so a hook failing on
 # every request warns once and a different hook or stage still warns.
 _HOOK_WARNINGS = WarnOnce(256, "failing compression hooks")
-
-_URL_RE = re.compile(r"[A-Za-z][A-Za-z0-9+.-]*://[^\s'\"<>]+")
-_TRANSPORT_TEXT_MAX = 200
 
 
 def _hook_name(hooks: object) -> str:
@@ -58,11 +53,6 @@ def log_hook_failure(
     )
 
 
-def _transport_text(err: httpx.TransportError) -> str:
-    text = _URL_RE.sub(lambda m: redact_url(m.group(0)), str(err))
-    return text[:_TRANSPORT_TEXT_MAX]
-
-
 def log_request_failure(request_id: str, what: str, err: BaseException, **context: object) -> None:
     """Log a request-path failure at error.
 
@@ -70,7 +60,4 @@ def log_request_failure(request_id: str, what: str, err: BaseException, **contex
     adds ``key=value`` fields such as provider and model.
     """
     fields = "".join(f"{key}={safe_id(value)} " for key, value in context.items())
-    detail = f" ({_transport_text(err)})" if isinstance(err, httpx.TransportError) else ""
-    logger.error(
-        "[%s] %s failed: %s%s%s", request_id, what, fields, describe_exception(err), detail
-    )
+    logger.error("[%s] %s failed: %s%s", request_id, what, fields, describe_exception(err))
