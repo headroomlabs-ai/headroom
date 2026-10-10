@@ -16,11 +16,13 @@ from __future__ import annotations
 import logging
 import math
 import os
+import sys
 import threading
 import time
 import traceback
 from collections.abc import Hashable
-from urllib.parse import urlsplit, urlunsplit
+from types import FrameType, ModuleType, TracebackType
+from urllib.parse import urlsplit
 
 CONTENT_OPT_IN_ENV = "HEADROOM_DEBUG_DUMP"
 _CONTENT_OPT_IN_VALUES = frozenset({"full", "all", "content"})
@@ -28,7 +30,32 @@ _MAX_FRAMES = 3
 _MAX_CHAIN = 4
 _ID_MAX_CHARS = 80
 _MAX_ERRNO = 2**31 - 1
-_PACKAGE_DIR = os.path.dirname(os.path.abspath(__file__)).replace("\\", "/")
+# The module __dict__ descriptor itself, so a ModuleType subclass cannot override it.
+_MODULE_DICT = vars(ModuleType)["__dict__"]
+# Schemes a log may name; any other text before "://" could be a key someone
+# pasted where a URL belongs, so it is replaced.
+_KNOWN_SCHEMES = frozenset(
+    {
+        "http",
+        "https",
+        "ws",
+        "wss",
+        "grpc",
+        "grpcs",
+        "redis",
+        "rediss",
+        "postgres",
+        "postgresql",
+        "mysql",
+        "mongodb",
+        "mongodb+srv",
+        "sqlite",
+        "file",
+        "unix",
+        "s3",
+        "gs",
+    }
+)
 
 
 def content_logging_enabled() -> bool:
@@ -47,6 +74,13 @@ def describe_exception(exc: BaseException) -> str:
     """
     if content_logging_enabled():
         return "".join(traceback.format_exception(exc)).rstrip()
+    try:
+        return _describe_chain(exc)
+    except Exception:  # a log helper must never raise; odd objects get a fixed token
+        return "<exception description unavailable>"
+
+
+def _describe_chain(exc: BaseException) -> str:
     parts: list[str] = []
     seen: set[int] = set()
     current: BaseException | None = exc
@@ -60,8 +94,11 @@ def describe_exception(exc: BaseException) -> str:
 
 
 def _describe_one(exc: BaseException) -> str:
-    text = type(exc).__qualname__
-    if isinstance(exc, OSError) and isinstance(exc.errno, int):
+    # A class name is chosen by whoever defined it (type("Err\nforged", ...)).
+    qualname = type(exc).__qualname__
+    text = qualname if type(qualname) is str and qualname.isprintable() else "<exception>"
+    # An int subclass errno could format itself as anything, so only a plain int.
+    if isinstance(exc, OSError) and type(exc.errno) is int:
         # The system's own text for the errno; exc.strerror is free text in some
         # subclasses (ssl.SSLError) and can quote a path or a peer's message.
         # An out-of-range errno is not formatted at all: converting a huge int
@@ -73,9 +110,9 @@ def _describe_one(exc: BaseException) -> str:
             text += f" [Errno {exc.errno}]"
         else:
             text += " [Errno out of range]"
-    frames = traceback.extract_tb(exc.__traceback__)[-_MAX_FRAMES:]
+    frames = _innermost_frames(exc.__traceback__)
     if frames:
-        where = " <- ".join(_frame_location(frame) for frame in reversed(frames))
+        where = " <- ".join(_frame_location(frame, line) for frame, line in reversed(frames))
         text += f" at {where}"
     return text
 
@@ -87,24 +124,54 @@ def _errno_text(errno: int) -> str:
         return "unknown error"
 
 
-def _frame_location(frame: traceback.FrameSummary) -> str:
-    """``file:line in function`` for code on disk, a fixed token for anything else.
+def _innermost_frames(tb: TracebackType | None) -> list[tuple[FrameType, int]]:
+    frames: list[tuple[FrameType, int]] = []
+    while tb is not None:
+        frames.append((tb.tb_frame, tb.tb_lineno))
+        tb = tb.tb_next
+    return frames[-_MAX_FRAMES:]
 
-    Code compiled at runtime (``exec``, ``compile``, templates) chooses its own
-    file and function names, which can quote request data, so neither is logged.
+
+def _frame_location(frame: FrameType, lineno: int) -> str:
+    """``file:line in function`` for a frame of an imported module, a fixed token otherwise.
+
+    Code compiled at runtime (``exec``, ``compile``, template engines) chooses its
+    own file and function names, which can quote request data, and it can claim
+    the name of a real file. Such code runs in a namespace of its own, so a frame
+    is trusted only when its globals are the namespace of the module that
+    ``sys.modules`` holds under that name. The file comes from that namespace,
+    not the code object, which keeps sourceless (``.pyc``-only) and zip installs
+    readable. The function name still comes from the code object, so code exec'd
+    into a real module's own namespace (dataclass-generated methods) shows its
+    generated name; it must still be printable.
     """
-    filename, name = frame.filename, frame.name
-    if not (os.path.isfile(filename) and filename.isprintable() and name.isprintable()):
+    namespace = frame.f_globals
+    # Read through dict's own methods: globals can be a dict subclass.
+    name = dict.get(namespace, "__name__")
+    if type(name) is not str:
         return "<dynamic code>"
-    return f"{_short_path(filename)}:{frame.lineno} in {name}"
+    module = sys.modules.get(name)
+    function = frame.f_code.co_name
+    if (
+        not isinstance(module, ModuleType)
+        or _MODULE_DICT.__get__(module) is not namespace
+        or type(function) is not str
+        or not function.isprintable()
+    ):
+        return "<dynamic code>"
+    return f"{_module_path(name, namespace)}:{lineno} in {function}"
 
 
-def _short_path(path: str) -> str:
-    """``headroom/<module path>`` for Headroom's own files, the file name for anything else."""
-    normalized = path.replace("\\", "/")
-    if normalized.startswith(_PACKAGE_DIR + "/"):
-        return "headroom/" + normalized[len(_PACKAGE_DIR) + 1 :]
-    return normalized.rsplit("/", 1)[-1]
+def _module_path(name: str, namespace: dict[str, object]) -> str:
+    """``headroom/<module path>`` for Headroom's own modules, the file name for others."""
+    if name == "headroom" or name.startswith("headroom."):
+        path = name.replace(".", "/")
+        return path + ("/__init__.py" if dict.__contains__(namespace, "__path__") else ".py")
+    filename = dict.get(namespace, "__file__")
+    if type(filename) is not str:
+        return "<module>"
+    base = filename.replace("\\", "/").rsplit("/", 1)[-1]
+    return base if base and base.isprintable() else "<module>"
 
 
 def redact_url(url: str) -> str:
@@ -122,6 +189,11 @@ def redact_url(url: str) -> str:
         port = parts.port
     except ValueError:
         return "<unparseable url>"
+    # No "//" means no host: urlsplit then reads "sk-key:secret" as scheme
+    # "sk-key", so nothing of such a string is logged.
+    if not parts.netloc or not host.isprintable():
+        return "<unparseable url>"
+    scheme = parts.scheme if parts.scheme in _KNOWN_SCHEMES else "<scheme>"
     if ":" in host:
         host = f"[{host}]"
     netloc = f"{host}:{port}" if port is not None else host
@@ -129,7 +201,7 @@ def redact_url(url: str) -> str:
         path = parts.path
     else:
         path = "/<path>" if parts.path not in ("", "/") else parts.path
-    redacted = urlunsplit((parts.scheme, netloc, path, "", ""))
+    redacted = f"{scheme}://{netloc}{path}"
     return f"{redacted}?<redacted>" if parts.query else redacted
 
 
@@ -139,7 +211,10 @@ def safe_id(value: object) -> str:
     Uses ``repr`` so a newline in the id cannot forge a second log line, and
     cuts it to a fixed length so an oversized id cannot flood the log.
     """
-    text = repr(value)
+    try:
+        text = repr(value)
+    except Exception:  # a log helper must never raise (repr of a 5000-digit int does)
+        return "<unrepresentable id>"
     if len(text) <= _ID_MAX_CHARS:
         return text
     return f"{text[:_ID_MAX_CHARS]}…(+{len(text) - _ID_MAX_CHARS} chars)"
@@ -163,8 +238,10 @@ class WarnOnce:
     def __init__(self, limit: int, what: str, *, window_seconds: float = 3600.0) -> None:
         if limit < 1:
             raise ValueError(f"WarnOnce limit must be at least 1, got {limit}")
-        if window_seconds <= 0:
-            raise ValueError(f"WarnOnce window_seconds must be positive, got {window_seconds}")
+        if not 0 < window_seconds < math.inf:  # also rejects nan
+            raise ValueError(
+                f"WarnOnce window_seconds must be positive and finite, got {window_seconds}"
+            )
         self._limit = limit
         self._what = what
         self._window = window_seconds
