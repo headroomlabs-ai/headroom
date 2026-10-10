@@ -1111,38 +1111,6 @@ def _ensure_chatgpt_responses_store_false(
     return False
 
 
-def _responses_input_item_text_bytes(item: Any) -> int:
-    if not isinstance(item, dict):
-        return _json_byte_len(item)
-
-    output = item.get("output")
-    if isinstance(output, str):
-        return len(output.encode("utf-8", errors="replace"))
-    if isinstance(output, list):
-        total = 0
-        for part in output:
-            if isinstance(part, str):
-                total += len(part.encode("utf-8", errors="replace"))
-            elif isinstance(part, dict) and isinstance(part.get("text"), str):
-                total += len(part["text"].encode("utf-8", errors="replace"))
-        if total > 0:
-            return total
-
-    content = item.get("content")
-    if isinstance(content, str):
-        return len(content.encode("utf-8", errors="replace"))
-    if isinstance(content, list):
-        total = 0
-        for part in content:
-            if isinstance(part, str):
-                total += len(part.encode("utf-8", errors="replace"))
-            elif isinstance(part, dict) and isinstance(part.get("text"), str):
-                total += len(part["text"].encode("utf-8", errors="replace"))
-        return total
-
-    return _json_byte_len(item)
-
-
 _RESPONSES_OUTPUT_ITEM_TYPES = frozenset(
     {
         "custom_tool_call_output",
@@ -1678,47 +1646,6 @@ def _shape_openai_response_create_frame(
         parsed["response"] = payload
         return json.dumps(parsed), True, labels, None
     return json.dumps(payload), True, labels, None
-
-
-def _openai_responses_context_budget(payload: dict[str, Any]) -> dict[str, Any]:
-    payload_bytes = _json_byte_len(payload)
-    buckets: dict[str, int] = {}
-    for key in ("instructions", "tools", "input", "messages", "client_metadata"):
-        if key in payload:
-            buckets[key] = _json_byte_len(payload.get(key))
-
-    other_bytes = max(payload_bytes - sum(buckets.values()), 0)
-    if other_bytes:
-        buckets["other"] = other_bytes
-
-    input_breakdown: dict[str, dict[str, int]] = {}
-    items = payload.get("input") or payload.get("messages")
-    if isinstance(items, list):
-        for item in items:
-            item_type = item.get("type", "unknown") if isinstance(item, dict) else "non_dict"
-            row = input_breakdown.setdefault(
-                str(item_type),
-                {"items": 0, "bytes": 0, "text_bytes": 0},
-            )
-            row["items"] += 1
-            row["bytes"] += _json_byte_len(item)
-            row["text_bytes"] += _responses_input_item_text_bytes(item)
-
-    return {
-        "payload_bytes": payload_bytes,
-        "buckets": {
-            key: {
-                "bytes": value,
-                "pct": (value / payload_bytes * 100.0) if payload_bytes else 0.0,
-            }
-            for key, value in sorted(
-                buckets.items(),
-                key=lambda item: item[1],
-                reverse=True,
-            )
-        },
-        "input_breakdown": input_breakdown,
-    }
 
 
 # Interactive Responses turns are latency-sensitive. Fail open quickly rather
@@ -3065,33 +2992,6 @@ class OpenAIHandlerMixin:
         input_serialization_started = time.perf_counter()
         input_bytes = json.dumps(payload).encode("utf-8")
         _add_timing("compression_input_json_dump", input_serialization_started)
-        # Codex/Responses requests can re-enter this method many times per
-        # request_id (one per turn over the same websocket). Tag every
-        # event in this single pass with a content-derived id so dashboards
-        # can attribute each unit_result to its originating pass.
-        # Aggregation note: per-pass `tokens_saved` SHOULD sum across
-        # passes — every pass independently avoided sending those tokens
-        # upstream, regardless of any prefix cache the upstream applies.
-        # Identical pass_ids within one request_id indicate idempotent
-        # retries on the same input bytes and are the only thing that
-        # should be deduped.
-        debug_enabled = _codex_compression_debug_enabled()
-        pass_id = hashlib.sha256(input_bytes).hexdigest()[:12] if debug_enabled else None
-        input_context_budget: dict[str, Any] | None = None
-        if debug_enabled:
-            input_context_budget = _openai_responses_context_budget(payload)
-            _log_codex_compression_debug(
-                "codex_compression_payload_input",
-                request_id=request_id,
-                pass_id=pass_id,
-                model=model,
-                input_bytes=len(input_bytes),
-                context_budget=input_context_budget,
-                input_top_level_keys=list(payload.keys()),
-                input_field_type=type(payload.get("input")).__name__,
-                messages_field_type=type(payload.get("messages")).__name__,
-                payload=payload,
-            )
         working = payload
         modified = False
         tokens_saved = 0
@@ -3119,17 +3019,6 @@ class OpenAIHandlerMixin:
                 _add_timing("compression_tool_schema_token_count", tool_token_started)
             except Exception:
                 pass
-            if debug_enabled:
-                _log_codex_compression_debug(
-                    "codex_tool_schema_compaction",
-                    request_id=request_id,
-                    pass_id=pass_id,
-                    model=model,
-                    modified=True,
-                    tools_bytes_before=tools_before_bytes,
-                    tools_bytes_after=tools_after_bytes,
-                    tools_bytes_saved=tools_before_bytes - tools_after_bytes,
-                )
 
         # Layer 2: Tool description truncation (opt-in via
         # HEADROOM_TOOL_DESC_MAX_CHARS).
@@ -3159,17 +3048,6 @@ class OpenAIHandlerMixin:
                         )
                     except Exception:
                         pass
-                    if debug_enabled:
-                        _log_codex_compression_debug(
-                            "codex_tool_desc_compaction",
-                            request_id=request_id,
-                            pass_id=pass_id,
-                            model=model,
-                            modified=True,
-                            tools_bytes_before=desc_before,
-                            tools_bytes_after=desc_after,
-                            tools_bytes_saved=desc_before - desc_after,
-                        )
         except Exception:
             pass
 
@@ -3311,7 +3189,6 @@ class OpenAIHandlerMixin:
             working,
             model=model,
             request_id=request_id,
-            pass_id=pass_id,
             timing=timing_sink,
             deadline_started_at=deadline_started_at,
         )
@@ -3357,66 +3234,6 @@ class OpenAIHandlerMixin:
         output_serialization_started = time.perf_counter()
         output_bytes = json.dumps(working).encode("utf-8")
         _add_timing("compression_output_json_dump", output_serialization_started)
-        output_context_budget = _openai_responses_context_budget(working) if debug_enabled else None
-        # One-line summary at INFO — the single event a human reading
-        # logs should scan first to understand "what happened on this
-        # pass". All the verbose per-event debug data stays available
-        # but at DEBUG level. Contains: byte totals, savings, the
-        # strategy chain we walked, unit-outcome counts by category,
-        # and the transforms applied.
-        savings_pct = (
-            (1.0 - len(output_bytes) / len(input_bytes)) * 100.0 if len(input_bytes) else 0.0
-        )
-        # Active-compression ratio: savings as a fraction of what we
-        # *attempted* to compress, not of the whole request. The whole-
-        # request ratio is in `savings_pct`; this one is the metric the
-        # dashboard should display (otherwise frozen prefix bytes drown
-        # the wins from the compressible tail).
-        #
-        # Math note: `attempted_input_tokens` is the pre-compression
-        # size of the eligible content (sum of unit.tokens_before +
-        # original tool schema). `tokens_saved` is what we removed
-        # from it. So the savings rate is plain `saved / attempted` —
-        # NOT `saved / (attempted + saved)`, which would double-count.
-        attempted_pct = (
-            (tokens_saved / attempted_input_tokens) * 100.0 if attempted_input_tokens > 0 else 0.0
-        )
-        if debug_enabled:
-            _log_codex_compression_debug(
-                "codex_compression_pass_summary",
-                request_id=request_id,
-                pass_id=pass_id,
-                model=model,
-                modified=modified,
-                reason=reason,
-                input_bytes=len(input_bytes),
-                output_bytes=len(output_bytes),
-                bytes_saved=len(input_bytes) - len(output_bytes),
-                savings_pct=round(savings_pct, 2),
-                tokens_saved=tokens_saved,
-                attempted_input_tokens=attempted_input_tokens,
-                attempted_pct=round(attempted_pct, 2),
-                strategy_chain=strategy_chain,
-                units_by_category=units_by_category,
-                transforms=deduped,
-            )
-            _log_codex_compression_debug(
-                "codex_compression_payload_output",
-                request_id=request_id,
-                pass_id=pass_id,
-                model=model,
-                modified=modified,
-                reason=reason,
-                tokens_saved=tokens_saved,
-                attempted_input_tokens=attempted_input_tokens,
-                transforms=deduped,
-                input_bytes=len(input_bytes),
-                output_bytes=len(output_bytes),
-                context_budget_before=input_context_budget,
-                context_budget_after=output_context_budget,
-                input_payload=payload,
-                output_payload=working,
-            )
         return (
             working,
             modified,
