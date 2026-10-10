@@ -191,6 +191,12 @@ from headroom.proxy.rate_limiter import TokenBucketRateLimiter  # noqa: F401
 from headroom.proxy.request_body_limit import RequestBodyLimitMiddleware
 from headroom.proxy.request_logger import RequestLogger  # noqa: F401
 from headroom.proxy.savings_tracker import LITELLM_AVAILABLE
+from headroom.proxy.sdk_contracts import (
+    RetrievalError,
+    RetrieveRequest,
+    RetrieveResponse,
+    sdk_operation,
+)
 from headroom.proxy.semantic_cache import SemanticCache  # noqa: F401
 from headroom.proxy.ssl_context import (
     build_httpx_verify,
@@ -5707,6 +5713,13 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
         "/v1/retrieve",
         dependencies=[Depends(_require_loopback), Depends(_require_same_origin)],
     )
+    @sdk_operation(
+        operation_id="retrieve",
+        request=RetrieveRequest,
+        response=RetrieveResponse,
+        access="loopback-same-origin",
+        errors={400: RetrievalError, 404: RetrievalError},
+    )
     async def ccr_retrieve(request: Request):
         """Retrieve original content from CCR compression cache.
 
@@ -6057,6 +6070,12 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
         )
 
     @app.get("/v1/retrieve/{hash_key}", dependencies=[Depends(_require_loopback)])
+    @sdk_operation(
+        operation_id="retrieve_get",
+        response=RetrieveResponse,
+        access="loopback",
+        errors={404: RetrievalError},
+    )
     async def ccr_retrieve_get(hash_key: str):
         """GET version of CCR retrieve for easier testing."""
         store = get_compression_store()

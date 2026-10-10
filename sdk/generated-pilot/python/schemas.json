@@ -1,0 +1,69 @@
+{
+  "RetrievalError": {
+    "additionalProperties": true,
+    "properties": {
+      "detail": {
+        "type": "string"
+      }
+    },
+    "required": [
+      "detail"
+    ],
+    "type": "object"
+  },
+  "RetrieveRequest": {
+    "additionalProperties": true,
+    "properties": {
+      "hash": {
+        "type": "string"
+      }
+    },
+    "required": [
+      "hash"
+    ],
+    "type": "object"
+  },
+  "RetrieveResponse": {
+    "additionalProperties": true,
+    "properties": {
+      "compressed_item_count": {
+        "type": "integer"
+      },
+      "hash": {
+        "type": "string"
+      },
+      "original_content": {
+        "type": "string"
+      },
+      "original_item_count": {
+        "type": "integer"
+      },
+      "original_tokens": {
+        "type": "integer"
+      },
+      "retrieval_count": {
+        "type": "integer"
+      },
+      "tool_name": {
+        "anyOf": [
+          {
+            "type": "string"
+          },
+          {
+            "type": "null"
+          }
+        ]
+      }
+    },
+    "required": [
+      "compressed_item_count",
+      "hash",
+      "original_content",
+      "original_item_count",
+      "original_tokens",
+      "retrieval_count",
+      "tool_name"
+    ],
+    "type": "object"
+  }
+}

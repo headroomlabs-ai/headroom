@@ -1,0 +1,24 @@
+{
+  "profile": "tested-reference-toolchain-not-a-hermetic-dependency-lock",
+  "python": "3.13.5",
+  "go": "1.23.2",
+  "node": "22.16.0",
+  "typescript": "5.8.3",
+  "rust": "1.95.0",
+  "rust_edition": "2021",
+  "dotnet_sdk": "10.0.303",
+  "dotnet_target_framework": "net10.0",
+  "ruff": "0.16.3",
+  "mypy": "1.19.1",
+  "tested_local": {
+    "python": "3.13.13",
+    "go": "1.26.4",
+    "node": "22.22.0",
+    "typescript": "5.8.3",
+    "rust": "1.95.0",
+    "dotnet_sdk": "10.0.303"
+  },
+  "reviewed_main_sha": "c46e74d06b5ffa9643f420f28d2da6686fb7e487",
+  "reviewed_pr_405_sha": "2851cbc964ac24d51e825361d23c857f671ffb8f",
+  "notes": "Generation is stdlib-only. Language package dependencies are exact direct versions but this pilot is not a complete digest-locked supply chain. Full proxy and supported-platform qualification remain required."
+}
