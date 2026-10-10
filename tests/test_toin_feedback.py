@@ -65,7 +65,6 @@ def test_kompress_ccr_retrieval_updates_toin():
     hash_key = compressor._store_in_ccr(
         original,
         compressed,
-        original_tokens=len(original.split()),
     )
 
     assert hash_key is not None
@@ -450,3 +449,72 @@ class TestParseSSEToolUse:
         proxy = HeadroomProxy.__new__(HeadroomProxy)
         result = proxy._parse_sse_to_response("data: {}", "openai")
         assert result is None
+
+
+def test_kompress_prose_feedback_does_not_learn_token_sized_item_limits(monkeypatch):
+    from headroom.transforms.kompress_compressor import store_kompress_in_ccr
+
+    metrics = []
+    config = _make_config(min_samples=10)
+    config.metrics_callback = lambda name, data: metrics.append((name, data))
+    toin = ToolIntelligenceNetwork(config=config)
+    monkeypatch.setattr("headroom.telemetry.get_toin", lambda: toin)
+    monkeypatch.setattr("headroom.telemetry.toin.get_toin", lambda: toin)
+    original = "authentication_middleware_handler_" * 40
+    compressed = "authentication_middleware_handler"
+    key = store_kompress_in_ccr(original, compressed)
+    assert key is not None
+    entry = get_compression_store().retrieve(key)
+    assert entry is not None and entry.tool_signature_hash is not None
+    initial = toin.get_pattern(entry.tool_signature_hash)
+    assert initial is not None
+
+    for _ in range(10):
+        key = store_kompress_in_ccr(original, compressed)
+        assert key is not None
+        recovered = get_compression_store().retrieve(key)
+        assert recovered is not None and recovered.original_content == original
+
+    pattern = toin.get_pattern(entry.tool_signature_hash)
+    assert pattern is not None
+    assert pattern.total_items_seen == 0
+    assert pattern.total_items_kept == 0
+    assert pattern.optimal_max_items == initial.optimal_max_items
+    assert pattern.skip_compression_recommended is True
+    assert pattern.avg_token_reduction == pytest.approx(
+        1 - entry.compressed_tokens / entry.original_tokens
+    )
+    expected_ratio = entry.compressed_tokens / entry.original_tokens
+    assert pattern.avg_compression_ratio == pytest.approx(expected_ratio)
+    compression_events = [data for name, data in metrics if name == "toin.compression"]
+    assert compression_events[0]["compression_ratio"] == pytest.approx(expected_ratio)
+
+
+@pytest.mark.parametrize(("kept_count", "expected_ratio"), [(0, 0.0), (4, 0.4)])
+def test_structural_compression_ratio_takes_precedence_over_tokens(kept_count, expected_ratio):
+    metrics = []
+    config = _make_config()
+    config.metrics_callback = lambda name, data: metrics.append((name, data))
+    toin = ToolIntelligenceNetwork(config=config)
+    signature = _make_signature()
+
+    toin.record_compression(signature, 10, kept_count, 100, 80, "top_n")
+
+    pattern = toin.get_pattern(signature.structure_hash)
+    assert pattern is not None
+    assert pattern.avg_compression_ratio == pytest.approx(expected_ratio)
+    assert pattern.avg_token_reduction == pytest.approx(0.2)
+    compression_events = [data for name, data in metrics if name == "toin.compression"]
+    assert compression_events[0]["compression_ratio"] == pytest.approx(expected_ratio)
+
+
+def test_compression_ratio_without_items_or_tokens_remains_zero():
+    toin = ToolIntelligenceNetwork(config=_make_config())
+    signature = _make_signature()
+
+    toin.record_compression(signature, 0, 0, 0, 0, "top_n")
+
+    pattern = toin.get_pattern(signature.structure_hash)
+    assert pattern is not None
+    assert pattern.avg_compression_ratio == 0.0
+    assert pattern.total_items_seen == pattern.total_items_kept == 0

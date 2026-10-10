@@ -1575,7 +1575,7 @@ def ccr_retrieval_marker(
     )
 
 
-def store_kompress_in_ccr(original: str, compressed: str, original_tokens: int) -> str | None:
+def store_kompress_in_ccr(original: str, compressed: str) -> str | None:
     """Store an original->compressed mapping in the proxy-local CCR store and
     return its retrieval hash (or None on any failure).
 
@@ -1588,7 +1588,8 @@ def store_kompress_in_ccr(original: str, compressed: str, original_tokens: int) 
         from ..cache.compression_store import get_compression_store
 
         signature = _kompress_content_signature(original)
-        compressed_tokens = len(compressed.split())
+        original_tokens = payload_tokens(original)
+        compressed_tokens = payload_tokens(compressed)
         store = get_compression_store()
         cache_key = store.store(
             original,
@@ -1609,8 +1610,8 @@ def store_kompress_in_ccr(original: str, compressed: str, original_tokens: int) 
 
             get_toin().record_compression(
                 tool_signature=signature,
-                original_count=original_tokens,
-                compressed_count=compressed_tokens,
+                original_count=0,
+                compressed_count=0,
                 original_tokens=original_tokens,
                 compressed_tokens=compressed_tokens,
                 strategy="kompress",
@@ -2028,8 +2029,7 @@ class KompressCompressor(Transform):
             # the shipped payload rather than a word count.
             if self.config.enable_ccr:
                 ccr_source = ccr_original if ccr_original is not None else content
-                ccr_source_tokens = len(ccr_source.split())
-                cache_key = self._store_in_ccr(ccr_source, compressed, ccr_source_tokens)
+                cache_key = self._store_in_ccr(ccr_source, compressed)
                 if cache_key:
                     # Report the source line span so a reader can tell content was
                     # compressed away rather than absent — "items" counts words, which
@@ -2455,8 +2455,7 @@ class KompressCompressor(Transform):
                 ccr_source = ccr_sources[text_idx]
                 if ccr_source is None:
                     ccr_source = content
-                ccr_source_tokens = len(ccr_source.split())
-                cache_key = self._store_in_ccr(ccr_source, compressed, ccr_source_tokens)
+                cache_key = self._store_in_ccr(ccr_source, compressed)
                 if cache_key:
                     # Report the source line span so a reader can tell content was
                     # compressed away rather than absent — "items" counts words, which
@@ -2600,5 +2599,5 @@ class KompressCompressor(Transform):
             transforms_applied=transforms_applied or ["kompress:noop"],
         )
 
-    def _store_in_ccr(self, original: str, compressed: str, original_tokens: int) -> str | None:
-        return store_kompress_in_ccr(original, compressed, original_tokens)
+    def _store_in_ccr(self, original: str, compressed: str) -> str | None:
+        return store_kompress_in_ccr(original, compressed)

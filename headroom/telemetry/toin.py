@@ -666,6 +666,14 @@ class ToolIntelligenceNetwork:
             tenant_key = _get_current_tenant_key_or_default()
         key = _make_pattern_key(auth_mode, model_family, sig_hash, tenant_key)
 
+        # Prose has no item population; use retained tokens for its ratio.
+        if original_count > 0:
+            compression_ratio = compressed_count / original_count
+        elif original_tokens > 0:
+            compression_ratio = compressed_tokens / original_tokens
+        else:
+            compression_ratio = 0.0
+
         # LOW FIX #22: Emit compression metric
         self._emit_metric(
             "toin.compression",
@@ -679,7 +687,7 @@ class ToolIntelligenceNetwork:
                 "original_tokens": original_tokens,
                 "compressed_tokens": compressed_tokens,
                 "strategy": strategy,
-                "compression_ratio": compressed_count / original_count if original_count > 0 else 0,
+                "compression_ratio": compression_ratio,
             },
         )
 
@@ -703,7 +711,6 @@ class ToolIntelligenceNetwork:
 
             # Update rolling averages
             n = pattern.total_compressions
-            compression_ratio = compressed_count / original_count if original_count > 0 else 0.0
             token_reduction = (
                 1 - (compressed_tokens / original_tokens) if original_tokens > 0 else 0.0
             )
@@ -1159,18 +1166,25 @@ class ToolIntelligenceNetwork:
         # Calculate optimal max_items based on retrieval rate
         retrieval_rate = pattern.retrieval_rate
 
-        if retrieval_rate > self._config.high_retrieval_threshold:
-            if pattern.full_retrieval_rate > 0.8:
-                pattern.skip_compression_recommended = True
+        skip_compression = (
+            retrieval_rate > self._config.high_retrieval_threshold
+            and pattern.full_retrieval_rate > 0.8
+        )
+        if skip_compression:
+            pattern.skip_compression_recommended = True
+
+        # Prose has token statistics, but no item population to learn a limit from.
+        if pattern.total_items_seen > 0:
+            if skip_compression:
                 pattern.optimal_max_items = pattern.total_items_seen // max(
                     1, pattern.total_compressions
                 )
-            else:
+            elif retrieval_rate > self._config.high_retrieval_threshold:
                 pattern.optimal_max_items = 50
-        elif retrieval_rate > self._config.medium_retrieval_threshold:
-            pattern.optimal_max_items = 30
-        else:
-            pattern.optimal_max_items = 20
+            elif retrieval_rate > self._config.medium_retrieval_threshold:
+                pattern.optimal_max_items = 30
+            else:
+                pattern.optimal_max_items = 20
 
         # Update preserve_fields from frequently retrieved fields
         if pattern.field_retrieval_frequency:
