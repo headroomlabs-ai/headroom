@@ -185,6 +185,7 @@ from headroom.proxy.ssl_context import (
     build_httpx_verify,
     describe_trust_policy,
     ensure_process_trust_if_owned,
+    find_system_proxy,
 )
 from headroom.proxy.tcp_keepalive import install_tcp_keepalive
 from headroom.proxy.tool_schema_savings_policy import tool_schema_saved_from_tags
@@ -849,9 +850,10 @@ def _provider_httpx_client_options(
         ),
         "verify": verify,
     }
-    if config.http_proxy:
-        client_kwargs["proxy"] = config.http_proxy
-    return config.http2 and not config.http_proxy, client_kwargs
+    proxy = config.http_proxy or find_system_proxy()
+    if proxy:
+        client_kwargs["proxy"] = proxy
+    return config.http2 and not proxy, client_kwargs
 
 
 # Recognized built-in compressor names → the `ContentRouterConfig` `enable_*`
