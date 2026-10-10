@@ -29,6 +29,8 @@ _RELATION = [{"source": "user", "relationship": "works_at", "destination": "Netf
         # The legacy names do not select the optimized path.
         ({"entities": ["Netflix"]}, True),
         ({"relationships": _RELATION}, True),
+        # Empty pre-extracted inputs do not count either.
+        ({"facts": [], "extracted_entities": [], "extracted_relationships": []}, True),
     ],
 )
 async def test_direct_adapter_skips_mem0_extraction_only_for_pre_extracted_args(
