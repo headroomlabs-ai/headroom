@@ -187,9 +187,9 @@ def _register_openai_responses_subpath_route(
     spec: OpenAIResponsesSubpathRoute,
 ) -> None:
     async def openai_responses_subpath(request: Request, sub_path: str):
-        assert proxy.http_client is not None
+        codex_subpath_client = getattr(proxy, "http_client_h1", None) or proxy.http_client
         chatgpt_response = await handle_chatgpt_codex_responses_subpath(
-            proxy.http_client,
+            codex_subpath_client,
             request,
             sub_path,
         )
