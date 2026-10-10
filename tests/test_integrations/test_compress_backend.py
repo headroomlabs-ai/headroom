@@ -63,18 +63,28 @@ class _Records(logging.Handler):
 _PROMPT_CANARY = "PROMPT-CANARY-7f3e"
 _KEY_CANARY = "hdr_KEY-CANARY-91ab"
 _URL_CANARY = "URL-CANARY-c0de"
+_PATH_CANARY = "PRIVATE_PATH_CANARY"
+
+# (api_url, how the WARNING shows it); every canary must stay out of every record.
+_API_URLS = {
+    "query": (f"https://cloud.test/?token={_URL_CANARY}", "https://cloud.test/?<redacted>"),
+    "path": (f"https://cloud.test/bot{_PATH_CANARY}", "https://cloud.test/<path>"),
+    # %50 is "P": the encoded form must not slip through either.
+    "encoded-path": ("https://cloud.test/bot%50RIVATE_PATH_CANARY", "https://cloud.test/<path>"),
+}
 
 
 @pytest.mark.parametrize("kind", ["asgi", "litellm"])
 @pytest.mark.parametrize("level", [logging.DEBUG, logging.WARNING])
+@pytest.mark.parametrize("url_case", sorted(_API_URLS))
 def test_cloud_error_logs_no_echoed_content_at_any_level(
-    kind: str, level: int, monkeypatch: pytest.MonkeyPatch
+    kind: str, level: int, url_case: str, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """An error response echoing the prompt must not put it, the key or URL
-    credentials in any formatted record, with DEBUG on or off."""
+    """An error response echoing the prompt must not put it, the key, or URL
+    credentials (query or path) in any formatted record, with DEBUG on or off."""
     monkeypatch.delenv("HEADROOM_OFFLINE", raising=False)
     monkeypatch.delenv("HEADROOM_DEBUG_DUMP", raising=False)
-    api_url = f"https://cloud.test/?token={_URL_CANARY}"
+    api_url, shown_url = _API_URLS[url_case]
     if kind == "asgi":
         backend = CompressionMiddleware(app=None, api_key=_KEY_CANARY, api_url=api_url)
     else:
@@ -96,11 +106,10 @@ def test_cloud_error_logs_no_echoed_content_at_any_level(
     formatted = [logging.Formatter().format(r) for r in handler.records]
     warnings = [r.getMessage() for r in handler.records if r.levelno == logging.WARNING]
     assert warnings == [
-        "Headroom Cloud API error: HTTP 503 from https://cloud.test/?<redacted>; "
-        "request sent uncompressed"
+        f"Headroom Cloud API error: HTTP 503 from {shown_url}; request sent uncompressed"
     ]
     if level == logging.DEBUG:
         assert any("content-type=" in line for line in formatted)
     for line in formatted:
-        for canary in (_PROMPT_CANARY, _KEY_CANARY, _URL_CANARY):
+        for canary in (_PROMPT_CANARY, _KEY_CANARY, _URL_CANARY, _PATH_CANARY, "%50RIVATE"):
             assert canary not in line
