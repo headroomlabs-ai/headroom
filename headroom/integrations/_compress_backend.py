@@ -111,7 +111,13 @@ class CompressBackend:
         )
 
         if resp.status_code != 200:
-            self._log.warning("Headroom Cloud API error: %d %s", resp.status_code, resp.text[:200])
+            # The response body can echo request content, so it is DEBUG-only.
+            self._log.warning(
+                "Headroom Cloud API error: HTTP %d from %s; request sent uncompressed",
+                resp.status_code,
+                self._api_url,
+            )
+            self._log.debug("Headroom Cloud API error body: %s", resp.text[:200])
             return None
 
         result: dict[str, Any] = resp.json()
