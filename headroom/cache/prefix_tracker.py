@@ -23,7 +23,8 @@ import json
 import logging
 import os
 import time
-from collections import OrderedDict
+from collections import OrderedDict, deque
+from contextvars import ContextVar
 from dataclasses import dataclass
 from typing import Any
 
@@ -62,6 +63,22 @@ _PROVIDER_CACHE_TTL_SECONDS = {
 # Keep tracker state through the same post-TTL confidence margin used by
 # cold-prefix detection, but never below the configured session cleanup floor.
 _CACHE_TTL_CLEANUP_MARGIN_SECONDS = 60
+
+# Recent request snapshots kept per lineage. A Claude Code fork (the subagent
+# progress summary, the parent's side query) re-sends the history plus one
+# prompt, so the next real turn extends the snapshot BEFORE the fork. A
+# request that resumes an older snapshot keeps it next-newest, so any number
+# of forks off one turn leaves that turn resumable.
+_LINEAGE_HISTORY = 3
+
+# (tracker, turn, resumed state) the current request resolved to. Each proxied
+# request runs in its own asyncio task, so it reads the state it resumed and
+# ``update_from_response`` records its response against its own turn, even
+# while a fork of the same conversation is in flight on the same tracker. Same
+# pattern as the request-scoped tenant key and CCR store.
+_resolved_turn: ContextVar[tuple[Any, int, tuple[Any, ...] | None] | None] = ContextVar(
+    "headroom_resolved_lineage_turn", default=None
+)
 
 
 @dataclass
@@ -1123,6 +1140,11 @@ class PrefixCacheTracker:
         # net-cost/TTL P_alive gate could never see idle time. The handler reads
         # this and forwards it to the pipeline as `idle_seconds`.
         self._idle_seconds_at_fetch: float = 0.0
+        # Turn state after each recent request's response (None while it is in
+        # flight), keyed by the turn SessionTrackerStore issued it. A request
+        # resumes the state of the turn it extends, so a fork's response never
+        # becomes the main line's frozen prefix or replay source.
+        self._turn_states: dict[int, tuple[Any, ...] | None] = {}
 
         # Session-scoped ReadMaturationManager (Mechanism B), created
         # lazily by the handler when read maturation is enabled. Rides
@@ -1139,13 +1161,14 @@ class PrefixCacheTracker:
 
         Returns 0 on turn 0 (cold start) or if caching is disabled/below threshold.
         """
+        turn_number, cached_tokens, cached_messages, _, _ = self._request_turn_state()
         if not self.config.enabled:
             return 0
-        if self._turn_number == 0:
+        if turn_number == 0:
             return 0
-        if self._cached_token_count < self.config.min_cached_tokens:
+        if cached_tokens < self.config.min_cached_tokens:
             return 0
-        return self._cached_message_count
+        return int(cached_messages)
 
     def update_from_response(
         self,
@@ -1178,6 +1201,7 @@ class PrefixCacheTracker:
         if total_cached == 0:
             self._cached_token_count = 0
             self._cached_message_count = 0
+            self._record_turn_state()
             return
 
         # Estimate per-message token counts if not provided
@@ -1197,6 +1221,7 @@ class PrefixCacheTracker:
 
         self._cached_token_count = total_cached
         self._cached_message_count = frozen_count
+        self._record_turn_state()
 
         logger.debug(
             "PrefixCacheTracker[%s]: turn=%d, cached=%d tokens, "
@@ -1211,10 +1236,56 @@ class PrefixCacheTracker:
         )
 
     def get_last_original_messages(self) -> list[dict[str, Any]]:
-        return copy.deepcopy(self._last_original_messages)
+        return copy.deepcopy(self._request_turn_state()[3])
 
     def get_last_forwarded_messages(self) -> list[dict[str, Any]]:
-        return copy.deepcopy(self._last_forwarded_messages)
+        return copy.deepcopy(self._request_turn_state()[4])
+
+    def _turn_state(self) -> tuple[Any, ...]:
+        return (
+            self._turn_number,
+            self._cached_token_count,
+            self._cached_message_count,
+            self._last_original_messages,
+            self._last_forwarded_messages,
+        )
+
+    def _request_turn_state(self) -> tuple[Any, ...]:
+        """The state this request resumed at resolve time, else the current one.
+
+        A handler may read after an ``await`` (OpenAI's overlay runs after
+        compression), by which time a sibling request on this lineage may have
+        resumed a different turn.
+        """
+        resolved = _resolved_turn.get()
+        if resolved is not None and resolved[0] is self and resolved[2] is not None:
+            return resolved[2]
+        return self._turn_state()
+
+    def _record_turn_state(self) -> None:
+        """Remember this response's state under the turn that sent it."""
+        resolved = _resolved_turn.get()
+        if resolved is not None and resolved[0] is self:
+            if resolved[1] in self._turn_states:
+                self._turn_states[resolved[1]] = self._turn_state()
+            # The request has its response; later reads see the current state.
+            _resolved_turn.set((self, resolved[1], None))
+
+    def _resume_turn(self, turn: int | None) -> None:
+        """Continue from ``turn``'s response, not whichever response came last.
+
+        A turn still in flight (or one recorded before turn tracking) has no
+        state yet; the current state stands, as it did before.
+        """
+        state = self._turn_states.get(turn) if turn is not None else None
+        if state is not None:
+            (
+                self._turn_number,
+                self._cached_token_count,
+                self._cached_message_count,
+                self._last_original_messages,
+                self._last_forwarded_messages,
+            ) = state
 
     def record_returned(
         self,
@@ -1281,7 +1352,8 @@ class PrefixCacheTracker:
         if idle_seconds is None:
             idle_seconds = self.seconds_since_activity()
         ttl = self.resolved_cache_ttl_seconds()
-        expected = self._cached_token_count
+        # The turn this request resumed, not whichever sibling answered last.
+        expected = self._request_turn_state()[1]
 
         # Nothing was cached last turn → cold start, not a miss.
         if expected <= 0:
@@ -1336,7 +1408,7 @@ class PrefixCacheTracker:
         content. Anything else (a frozen message rewritten, the prefix
         reordered, the list now shorter) counts as a prefix change.
         """
-        prev = self._last_forwarded_messages
+        prev: list[dict[str, Any]] = self._request_turn_state()[4]
         if not prev:
             # No recorded prefix to compare — can't claim it changed.
             return True
@@ -1535,6 +1607,10 @@ class SessionTrackerStore:
         # but different tool profiles must never share frozen-prefix state.
         self._lineage_affinities: dict[str, str | None] = {}
         self._lineage_counter = itertools.count(1)
+        # Recent (snapshot, turn) per tracker key, newest first; the newest
+        # snapshot is the one in ``_lineages``.
+        self._lineage_history: dict[str, deque[tuple[list[Any], int]]] = {}
+        self._turn_counter = itertools.count(1)
 
     def peek(self, session_id: str) -> PrefixCacheTracker | None:
         """Return the live tracker for ``session_id``, else None.
@@ -1584,6 +1660,7 @@ class SessionTrackerStore:
     def _discard_tracker(self, tracker_key: str) -> None:
         """Remove a tracker and any lineage indexes that point to it."""
         self._trackers.pop(tracker_key, None)
+        self._lineage_history.pop(tracker_key, None)
         for session_id, family in list(self._lineages.items()):
             family.pop(tracker_key, None)
             self._lineage_affinities.pop(tracker_key, None)
@@ -1677,22 +1754,48 @@ class SessionTrackerStore:
         for key in expired_keys:
             family.pop(key, None)
             self._lineage_affinities.pop(key, None)
+            self._lineage_history.pop(key, None)
             self._trackers.pop(key, None)
         by_length = sorted(family.items(), key=lambda item: len(item[1]), reverse=True)
-        best_key: str | None = None
-        for accepted in (
-            (RELATION_EXACT, RELATION_MESSAGE_APPEND),
-            (RELATION_BLOCK_APPEND,),
-        ):
-            for key, chain in by_length:
-                if self._lineage_affinities.get(key) != cache_affinity:
-                    continue
-                relation = _classify_history_canonical(snap, chain)
-                if relation.kind in accepted:
-                    best_key = key
-                    break
-            if best_key is not None:
-                break
+
+        def continuation(
+            candidates: list[tuple[str, list[Any], int | None]],
+        ) -> tuple[str | None, int | None]:
+            for accepted in (
+                (RELATION_EXACT, RELATION_MESSAGE_APPEND),
+                (RELATION_BLOCK_APPEND,),
+            ):
+                for key, chain, turn in candidates:
+                    if self._lineage_affinities.get(key) != cache_affinity:
+                        continue
+                    if _classify_history_canonical(snap, chain).kind in accepted:
+                        return key, turn
+            return None, None
+
+        def latest_turn(key: str) -> int | None:
+            history = self._lineage_history.get(key)
+            return history[0][1] if history else None
+
+        best_key, best_turn = continuation(
+            [(key, chain, latest_turn(key)) for key, chain in by_length]
+        )
+        if best_key is None:
+            # A fork (Claude Code's subagent summary or side query: the
+            # history plus one prompt) became a lineage's latest snapshot, so
+            # this turn extends the snapshot before it. Resume that turn
+            # instead of starting a cold lineage that recompresses history the
+            # provider already cached.
+            best_key, best_turn = continuation(
+                sorted(
+                    (
+                        (key, chain, turn)
+                        for key in family
+                        for chain, turn in list(self._lineage_history.get(key, ()))[1:]
+                    ),
+                    key=lambda item: len(item[1]),
+                    reverse=True,
+                )
+            )
 
         if best_key is None:
             rewrite_candidates: list[tuple[tuple[int, int, int], str]] = []
@@ -1778,6 +1881,22 @@ class SessionTrackerStore:
         family = self._lineages.setdefault(session_id, family)
         family[best_key] = snap
         self._lineage_affinities[best_key] = cache_affinity
+        if isinstance(tracker, PrefixCacheTracker):  # test stubs keep no turns
+            tracker._resume_turn(best_turn if best_turn is not None else latest_turn(best_key))
+            turn = next(self._turn_counter)
+            history = self._lineage_history.setdefault(best_key, deque(maxlen=_LINEAGE_HISTORY))
+            branch = next((entry for entry in history if entry[1] == best_turn), None)
+            if branch is not None and branch is not history[0]:
+                # A fork off an older turn: that turn stays the branch point the
+                # next main turn extends, so keep it behind this request rather
+                # than let successive forks push it out.
+                history.remove(branch)
+                history.appendleft(branch)
+            history.appendleft((snap, turn))
+            live = {t for _, t in history}
+            tracker._turn_states = {t: s for t, s in tracker._turn_states.items() if t in live}
+            tracker._turn_states[turn] = None
+            _resolved_turn.set((tracker, turn, tracker._turn_state()))
         return tracker
 
     def compute_session_id(
@@ -1847,6 +1966,7 @@ class SessionTrackerStore:
                 for key in [k for k in family if k not in self._trackers]:
                     del family[key]
                     self._lineage_affinities.pop(key, None)
+                    self._lineage_history.pop(key, None)
                 if not family:
                     del self._lineages[base]
             logger.debug("SessionTrackerStore: cleaned up %d expired sessions", len(expired))

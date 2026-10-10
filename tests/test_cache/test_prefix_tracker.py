@@ -1,5 +1,6 @@
 """Tests for PrefixCacheTracker — cache-aware compression."""
 
+import contextvars
 import time
 
 import pytest
@@ -744,33 +745,50 @@ class TestConversationLineageResolution:
         assert trackers["A"]._turn_number == 4
         assert trackers["B"]._turn_number == 4
 
-    def test_identical_first_turns_share_until_divergence_then_split(self, store):
-        """Templated fan-outs send byte-identical first turns. While histories
-        are identical, sharing a tracker is harmless (the provider cache line
-        is identical too); they must split as soon as the histories diverge."""
+    def test_identical_first_turns_keep_per_line_state_after_divergence(self, store):
+        """Templated fan-outs send byte-identical first turns, then diverge.
+        Each line extends its own earlier snapshot and must resume that turn's
+        frozen prefix and replay source, never its sibling's. (A sibling that
+        extends an earlier snapshot is indistinguishable from a main turn after
+        a Claude Code fork, so they share the lineage rather than split.)
+
+        Each request runs in its own context, as each proxied request runs in
+        its own asyncio task."""
         sid = "shared"
         first = [{"role": "user", "content": "verify the fix " + "p" * 300}]
         t_a1 = store.resolve_tracker(sid, "anthropic", messages=first)
         t_b1 = store.resolve_tracker(sid, "anthropic", messages=first)
         assert t_b1 is t_a1
 
-        a2 = first + [
-            {"role": "assistant", "content": "answer A"},
-            {"role": "user", "content": "next A"},
-        ]
-        b2 = first + [
-            {"role": "assistant", "content": "answer B"},
-            {"role": "user", "content": "next B"},
-        ]
-        t_a2 = store.resolve_tracker(sid, "anthropic", messages=a2)
-        t_b2 = store.resolve_tracker(sid, "anthropic", messages=b2)
-        assert t_a2 is not t_b2
+        def turn(history: list[dict], frozen: int) -> PrefixCacheTracker:
+            def send() -> PrefixCacheTracker:
+                tracker = store.resolve_tracker(sid, "anthropic", messages=history)
+                tracker.update_from_response(
+                    cache_read_tokens=2000 * frozen,
+                    cache_write_tokens=0,
+                    messages=history,
+                    message_token_counts=[2000] * len(history),
+                )
+                return tracker
 
-        a3 = a2 + [
-            {"role": "assistant", "content": "answer A2"},
-            {"role": "user", "content": "next A2"},
-        ]
-        assert store.resolve_tracker(sid, "anthropic", messages=a3) is t_a2
+            return contextvars.Context().run(send)
+
+        def reply(history: list[dict], text: str) -> list[dict]:
+            return history + [
+                {"role": "assistant", "content": f"answer {text}"},
+                {"role": "user", "content": f"next {text}"},
+            ]
+
+        a2, b2 = reply(first, "A"), reply(first, "B")
+        turn(a2, frozen=3)
+        turn(b2, frozen=2)
+
+        a3 = store.resolve_tracker(sid, "anthropic", messages=reply(a2, "A2"))
+        assert a3.get_last_original_messages() == a2
+        assert a3.get_frozen_message_count() == 3
+        b3 = store.resolve_tracker(sid, "anthropic", messages=reply(b2, "B2"))
+        assert b3.get_last_original_messages() == b2
+        assert b3.get_frozen_message_count() == 2
 
     @pytest.mark.parametrize(
         "cc_turn2",
