@@ -7,6 +7,7 @@ from abc import ABC, abstractmethod
 from typing import Any
 
 from ..config import TransformResult
+from ..log_safety import describe_exception
 from ..tokenizer import Tokenizer
 
 logger = logging.getLogger(__name__)
@@ -25,7 +26,10 @@ def persist_rust_ccr_entry(original: str, compressed: str, cache_key: str, *, so
         from ..cache.compression_store import get_compression_store
     except ImportError as e:
         logger.warning(
-            "CCR store import failed (%s); cache_key %s won't persist: %s", source, cache_key, e
+            "CCR store import failed (%s); cache_key %s won't persist: %s",
+            source,
+            cache_key,
+            describe_exception(e),
         )
         return
     try:
@@ -35,14 +39,15 @@ def persist_rust_ccr_entry(original: str, compressed: str, cache_key: str, *, so
         # key explicitly so retrieving the marker hash finds the entry (#816).
         store.store(original, compressed, explicit_hash=cache_key)
     except Exception as e:
-        # Store backends can echo the payload in errors, so the detail goes to DEBUG only.
+        # Store backends can echo the payload in errors, so no level logs it;
+        # describe_exception keeps only types and code locations.
         logger.warning(
             "CCR store write failed (%s, %s); cache_key %s remains in-marker only",
             source,
             type(e).__name__,
             cache_key,
         )
-        logger.debug("CCR store write failure detail", exc_info=True)
+        logger.debug("CCR store write failure detail: %s", describe_exception(e))
 
 
 def split_frozen(

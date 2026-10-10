@@ -73,16 +73,25 @@ def test_persist_stores_under_marker_key(source: str, original: str) -> None:
     _assert_round_trip(original)
 
 
-def test_persist_failure_warns_without_exception_text(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_persist_failure_logs_no_exception_text_at_any_level(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     import logging
 
     import headroom.cache.compression_store as compression_store
     import headroom.transforms.base as base
 
-    class _Store:
-        def store(self, *_args: object, **_kwargs: object) -> str:
-            raise RuntimeError("backend echoed sk-test-secret")
+    content = "def private_source_canary_4c1e(): pass"
+    credential = "sk-test-credential-canary-91bd"
 
+    class _Store:
+        def store(self, original: str, *_args: object, **_kwargs: object) -> str:
+            try:
+                raise ValueError(f"backend rejected key {credential}")
+            except ValueError as cause:
+                raise RuntimeError(f"cannot store {original}") from cause
+
+    monkeypatch.delenv("HEADROOM_DEBUG_DUMP", raising=False)
     monkeypatch.setattr(compression_store, "get_compression_store", lambda: _Store())
     records: list[logging.LogRecord] = []
 
@@ -94,12 +103,21 @@ def test_persist_failure_warns_without_exception_text(monkeypatch: pytest.Monkey
     base.logger.addHandler(handler)
     monkeypatch.setattr(base.logger, "level", logging.DEBUG)
     try:
-        persist_rust_ccr_entry("orig", "comp", "a" * 24, source="diff")
+        persist_rust_ccr_entry(content, "comp", "a" * 24, source="diff")
     finally:
         base.logger.removeHandler(handler)
+
+    formatter = logging.Formatter()
+    for record in records:
+        rendered = formatter.format(record)
+        assert content not in rendered
+        assert credential not in rendered
 
     warnings = [r for r in records if r.levelno == logging.WARNING]
     assert len(warnings) == 1
     assert "(diff, RuntimeError)" in warnings[0].getMessage()
-    assert "sk-test-secret" not in warnings[0].getMessage()
-    assert any(r.levelno == logging.DEBUG and r.exc_info for r in records)
+    assert "a" * 24 in warnings[0].getMessage()
+    details = [r for r in records if r.levelno == logging.DEBUG]
+    assert len(details) == 1
+    assert "RuntimeError" in details[0].getMessage()
+    assert "caused by ValueError" in details[0].getMessage()
