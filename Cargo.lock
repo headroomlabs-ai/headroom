@@ -2009,7 +2009,7 @@ dependencies = [
  "aws-sigv4",
  "aws-smithy-runtime-api",
  "axum",
- "base64 0.22.1",
+ "base64 0.23.1",
  "bytes",
  "bytesize",
  "clap",
