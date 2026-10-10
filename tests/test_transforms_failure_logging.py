@@ -191,3 +191,43 @@ def test_failure_skips_the_detail_when_debug_is_off(
     monkeypatch.setattr(sys.modules[logger.name], "describe_exception", _not_called)
     monkeypatch.setattr(logger, "level", logging.WARNING)
     run(monkeypatch)
+
+
+@pytest.mark.parametrize("unlimited_digits", [False, True], ids=["digit-limit", "no-digit-limit"])
+@pytest.mark.parametrize(
+    "errno_value",
+    [2**31, 10 ** int("10000")],
+    ids=["strerror-overflow", "huge-errno"],
+)
+def test_lossless_fallback_survives_out_of_range_errno(
+    capture: Callable[[logging.Logger], _Capture],
+    monkeypatch: pytest.MonkeyPatch,
+    errno_value: int,
+    unlimited_digits: bool,
+) -> None:
+    set_digits = getattr(sys, "set_int_max_str_digits", None)
+    if unlimited_digits:
+        if set_digits is None:
+            pytest.skip("this interpreter has no integer digit limit to disable")
+        previous = sys.get_int_max_str_digits()
+        set_digits(0)
+
+    def _raise_os_error(_content: str) -> str:
+        raise OSError(errno_value, f"backend failed on {CONTENT}")
+
+    monkeypatch.delenv("HEADROOM_DEBUG_DUMP", raising=False)
+    monkeypatch.setattr(lossless_compaction, "collapse_runs", _raise_os_error)
+    handler = capture(lossless_compaction.logger)
+    log = "worker 7 retrying connection to upstream\n" * 5
+    try:
+        assert lossless_compaction.compact_lossless(log, "log") == log
+    finally:
+        if unlimited_digits and set_digits is not None:
+            set_digits(previous)
+
+    details = [r for r in handler.records if r.levelno == logging.DEBUG]
+    assert len(details) == 1
+    rendered = logging.Formatter().format(details[0])
+    assert "OSError [Errno out of range]" in rendered
+    assert CONTENT not in rendered
+    assert len(rendered) < 1000
