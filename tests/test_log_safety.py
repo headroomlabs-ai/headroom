@@ -114,7 +114,8 @@ def test_warn_once_stays_bounded_across_repeated_passes(caplog: pytest.LogCaptur
     messages = _warnings(caplog)
     assert len(messages) == 65  # 64 keys plus one overflow notice, not 65 per pass
     assert messages[-1] == (
-        "More than 64 distinct unwritable ledgers; further ones are not logged at WARNING "
+        "More than 64 warnings about unwritable ledgers this window; further ones are not logged "
+        "at WARNING "
         "for the next 60 minutes"
     )
 
@@ -267,3 +268,20 @@ def test_forget_cycles_cannot_exceed_the_window_budget(caplog: pytest.LogCapture
 
     assert issued == 3
     assert len(_warnings(caplog)) == 4  # three warnings plus one overflow notice
+
+
+def test_dynamic_code_locations_are_not_logged(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("HEADROOM_DEBUG_DUMP", raising=False)
+    code = compile(
+        "def sk_CANARY():\n    raise ValueError('x')\n", "sk-FILE-CANARY\nforged", "exec"
+    )
+    namespace: dict[str, object] = {}
+    exec(code, namespace)
+    try:
+        namespace["sk_CANARY"]()  # type: ignore[operator]
+    except ValueError as exc:
+        text = describe_exception(exc)
+
+    assert "CANARY" not in text
+    assert "<dynamic code>" in text
+    assert "tests/test_log_safety.py" in text or "test_log_safety.py" in text
