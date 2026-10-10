@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import heapq
 import json
+import warnings
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -1032,9 +1033,20 @@ class HNSWVectorIndex:
 
         Higher values give better recall but slower search.
 
+        .. deprecated::
+            Nothing in Headroom calls this. Set ``MemoryConfig.hnsw_ef_search``
+            (or the ``ef_search`` constructor argument) instead.
+
         Args:
             ef_search: New ef_search value.
         """
+        warnings.warn(
+            "HNSWVectorIndex.set_ef_search is deprecated and will be removed in a future "
+            "release; set MemoryConfig.hnsw_ef_search (or the ef_search constructor "
+            "argument) instead.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
         with self._lock:
             self._ef_search = ef_search
             self._index.set_ef(ef_search)
