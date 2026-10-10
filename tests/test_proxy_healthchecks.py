@@ -333,3 +333,21 @@ def test_health_includes_upstream_check_result(monkeypatch):
     assert "enabled" in upstream
     assert "ready" in upstream
     assert "status" in upstream
+
+
+def test_health_reports_enabled_proxy_extensions():
+    """`headroom wrap` reads this to carry the shared proxy's extensions over to a
+    dedicated proxy it has to start beside it."""
+    config = ProxyConfig(
+        optimize=False,
+        cache_enabled=False,
+        rate_limit_enabled=False,
+        cost_tracking_enabled=False,
+        proxy_extensions=["routemegood", "observability"],
+    )
+    app = create_app(config)
+
+    with TestClient(app, base_url="http://127.0.0.1", client=("127.0.0.1", 12345)) as client:
+        reported = client.get("/health").json()["config"]
+
+    assert reported["proxy_extensions"] == ["observability", "routemegood"]

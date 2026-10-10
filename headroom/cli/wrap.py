@@ -712,6 +712,7 @@ def _start_proxy(
     copilot_api_token: str | None = None,
     copilot_refresh_oauth_token: str | None = None,
     copilot_api_token_expires_at: float | None = None,
+    proxy_extensions: list[str] | None = None,
 ) -> subprocess.Popen:
     """Start Headroom proxy as a background subprocess.
 
@@ -772,6 +773,12 @@ def _start_proxy(
 
     if vertex_api_url:
         cmd.extend(["--vertex-api-url", vertex_api_url])
+
+    # Extensions carried over from the proxy this one replaces (see
+    # ``_dedicated_proxy_extensions``). An explicit HEADROOM_PROXY_EXTENSIONS
+    # in the environment is inherited by the subprocess and wins over this.
+    if proxy_extensions:
+        cmd.extend(["--proxy-extension", ",".join(proxy_extensions)])
 
     timeout_seconds = _resolve_wrap_proxy_timeout_seconds()
     log_path = _get_log_path(port)
@@ -4527,6 +4534,50 @@ def _echo_unwrap_proxy_stop_status(status: str, port: int) -> None:
         click.echo(f"  Warning: failed to stop Headroom proxy on port {port}; stop it manually.")
 
 
+def _manifest_proxy_extensions(manifest: Any) -> list[str]:
+    """Extension names a persistent deployment was installed with.
+
+    The installer records them either as ``HEADROOM_PROXY_EXTENSIONS`` in the
+    deployment's environment or as ``--proxy-extension`` in its proxy args.
+    """
+    base_env = getattr(manifest, "base_env", None)
+    configured = base_env.get("HEADROOM_PROXY_EXTENSIONS") if isinstance(base_env, dict) else None
+    names: list[str] = []
+    if isinstance(configured, str):
+        names.extend(configured.split(","))
+    args = getattr(manifest, "proxy_args", None)
+    if isinstance(args, list):
+        for index, arg in enumerate(args):
+            if arg == "--proxy-extension" and index + 1 < len(args):
+                names.extend(str(args[index + 1]).split(","))
+            elif isinstance(arg, str) and arg.startswith("--proxy-extension="):
+                names.extend(arg.split("=", 1)[1].split(","))
+    return sorted({name.strip() for name in names if name.strip()})
+
+
+def _dedicated_proxy_extensions(port: int, manifest: Any) -> list[str] | None:
+    """Extensions the proxy owning *port* runs with, for a dedicated proxy to carry.
+
+    A wrap that cannot reuse the proxy on its port (a Copilot subscription
+    seed, or a persistent deployment with other routing) starts a dedicated
+    proxy from the shell environment alone. An enterprise install enables its
+    savings sinks on the shared proxy as ``--proxy-extension``, so without
+    this the dedicated proxy would report nothing upstream while its local
+    dashboard fills (#3716). Prefers the running proxy's own answer over the
+    manifest. Returns ``None`` when neither says.
+    """
+    helpers = _live_wrap_module()
+    running = helpers._proxy_health_config(helpers._query_proxy_health(port))
+    if running is not None:
+        found = running.get("proxy_extensions")
+        if isinstance(found, list):
+            return sorted(str(name) for name in found)
+        return None  # a proxy too old to report them
+    if manifest is not None:
+        return _manifest_proxy_extensions(manifest)
+    return None
+
+
 def _find_persistent_manifest(port: int) -> Any:
     """Return a matching persistent deployment manifest for the requested port."""
     from headroom.install.state import list_manifests
@@ -5166,6 +5217,22 @@ def _ensure_proxy_unlocked(
             else:
                 click.echo(f"  Port {port} is in use, using port {actual_port} instead.")
 
+        proxy_extensions: list[str] | None = None
+        if (
+            isolated_copilot_subscription_proxy or persistent_routing_mismatch
+        ) and not os.environ.get("HEADROOM_PROXY_EXTENSIONS"):
+            proxy_extensions = helpers._dedicated_proxy_extensions(port, manifest)
+            if proxy_extensions is None:
+                click.echo(
+                    f"  Warning: could not read the extensions of the proxy on port {port}; "
+                    f"the dedicated proxy on port {actual_port} starts without any. "
+                    "Set HEADROOM_PROXY_EXTENSIONS=<names> to carry them."
+                )
+            elif proxy_extensions:
+                click.echo(
+                    f"  Extensions carried over from the proxy on port {port}: "
+                    f"{','.join(proxy_extensions)}"
+                )
         click.echo(f"  Starting Headroom proxy on port {actual_port}...")
         try:
             proc = cast(
@@ -5186,6 +5253,7 @@ def _ensure_proxy_unlocked(
                     copilot_api_token=copilot_api_token,
                     copilot_refresh_oauth_token=copilot_refresh_oauth_token,
                     copilot_api_token_expires_at=copilot_api_token_expires_at,
+                    proxy_extensions=proxy_extensions or None,
                 ),
             )
             click.echo(_proxy_status_line("Proxy ready", actual_port))
