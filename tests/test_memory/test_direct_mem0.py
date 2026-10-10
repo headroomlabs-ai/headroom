@@ -200,7 +200,7 @@ class _RaisingClient:
 @pytest.mark.parametrize(
     ("op", "exc", "warns"),
     [
-        ("delete_memory", ValueError("Memory with id m1 not found"), False),
+        ("delete_memory", ValueError("Memory with id m1\nFAKE LOG LINE not found"), False),
         ("delete_memory", ValueError("payload user:secret rejected"), True),
         ("delete_memory", ValueError("Collection mem0 not found"), True),
         ("delete_memory", ValueError("Memory with id other-id not found"), True),
@@ -229,7 +229,8 @@ async def test_backend_failures_warn_without_exception_text(
     logger.addHandler(handler)
     logger.setLevel(logging.DEBUG)
     try:
-        result = await getattr(adapter, op)("m1")
+        # Model-supplied id with a newline: must not split the log line.
+        result = await getattr(adapter, op)("m1\nFAKE LOG LINE")
     finally:
         logger.removeHandler(handler)
         logger.setLevel(previous)
@@ -241,6 +242,7 @@ async def test_backend_failures_warn_without_exception_text(
         assert type(exc).__name__ in warnings[0].getMessage()
         assert "secret" not in warnings[0].getMessage()
         assert warnings[0].exc_info is None
+        assert "\n" not in warnings[0].getMessage()
     else:
         assert warnings == []
         assert any("not found" in r.getMessage() for r in records)

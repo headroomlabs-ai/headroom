@@ -929,12 +929,12 @@ class DirectMem0Adapter:
             if isinstance(e, ValueError) and str(e).startswith(
                 f"Memory with id {memory_id} not found"
             ):
-                logger.debug("DirectMem0: delete_memory(%s): memory not found", memory_id)
+                logger.debug("DirectMem0: delete_memory(%r): memory not found", memory_id)
                 return False
             # Backend exception text can carry stored memory or connection details,
             # so only its type goes to WARNING; the detail is DEBUG-only.
-            logger.warning("DirectMem0: delete_memory(%s) failed (%s)", memory_id, type(e).__name__)
-            logger.debug("DirectMem0: delete_memory(%s) failure", memory_id, exc_info=True)
+            logger.warning("DirectMem0: delete_memory(%r) failed (%s)", memory_id, type(e).__name__)
+            logger.debug("DirectMem0: delete_memory(%r) failure", memory_id, exc_info=True)
             return False
 
     async def get_memory(self, memory_id: str) -> Memory | None:
@@ -963,8 +963,8 @@ class DirectMem0Adapter:
                 metadata=result.get("metadata") or {},
             )
         except Exception as e:
-            logger.warning("DirectMem0: get_memory(%s) failed (%s)", memory_id, type(e).__name__)
-            logger.debug("DirectMem0: get_memory(%s) failure", memory_id, exc_info=True)
+            logger.warning("DirectMem0: get_memory(%r) failed (%s)", memory_id, type(e).__name__)
+            logger.debug("DirectMem0: get_memory(%r) failure", memory_id, exc_info=True)
             return None
 
     @property
