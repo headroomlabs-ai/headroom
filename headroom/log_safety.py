@@ -35,11 +35,15 @@ _ID_MAX_CHARS = 80
 _MAX_ERRNO = 2**31 - 1
 # Schemes whose URLs have no host ("file:///path").
 _LOCAL_SCHEMES = frozenset({"file", "sqlite", "unix"})
+# DNS labels, with "_" allowed for container and service names (model_gateway).
 _HOSTNAME = re.compile(
-    r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)*\.?"
+    r"[a-z0-9_](?:[a-z0-9_-]{0,61}[a-z0-9_])?(?:\.[a-z0-9_](?:[a-z0-9_-]{0,61}[a-z0-9_])?)*\.?"
 )
+_HOSTLESS_URL = re.compile(r"[A-Za-z][A-Za-z0-9+.-]*:///")
 _HEADROOM_MODULE = re.compile(r"headroom(?:\.[A-Za-z_][A-Za-z0-9_]*)*")
 _IDENTIFIER = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
+# A class's __qualname__: identifiers joined by dots, with <locals> for nested ones.
+_QUALIFIED_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_]*(?:\.(?:<locals>|[A-Za-z_][A-Za-z0-9_]*))*")
 _FIXED_CODE_NAMES = frozenset(
     {"<module>", "<lambda>", "<genexpr>", "<listcomp>", "<dictcomp>", "<setcomp>"}
 )
@@ -112,8 +116,7 @@ def describe_exception(exc: BaseException) -> str:
 
 def _describe_one(exc: BaseException) -> str:
     # A class name is chosen by whoever defined it (type("Err\nforged", ...)).
-    qualname = _QUALNAME.__get__(type(exc))
-    text = qualname if type(qualname) is str and qualname.isprintable() else "<exception>"
+    text = _class_name(type(exc)) or "<exception>"
     # An int subclass errno could format itself as anything, so only a plain int.
     errno = _ERRNO.__get__(exc) if issubclass(type(exc), OSError) else None
     if type(errno) is int:
@@ -206,10 +209,15 @@ def redact_url(url: str) -> str:
         return "<unparseable url>"
     # Without "//" urlsplit reads "sk-key:secret" as scheme "sk-key", so a string
     # with no host is logged only for the hostless schemes ("file:///path").
-    if not parts.netloc and not (parts.scheme in _LOCAL_SCHEMES and "://" in url):
+    if not parts.netloc and not (
+        parts.scheme in _LOCAL_SCHEMES and _HOSTLESS_URL.match(url.strip())
+    ):
         return "<unparseable url>"
-    if parts.netloc and not _is_host(host):
-        return "<unparseable url>"
+    if parts.netloc:
+        checked = _checked_host(host)
+        if checked is None:
+            return "<unparseable url>"
+        host = checked
     scheme = parts.scheme if parts.scheme in _KNOWN_SCHEMES else "<scheme>"
     if ":" in host:
         host = f"[{host}]"
@@ -222,13 +230,24 @@ def redact_url(url: str) -> str:
     return f"{redacted}?<redacted>" if parts.query else redacted
 
 
-def _is_host(host: str) -> bool:
-    """True for a DNS name or IP address; anything else could be a pasted secret."""
+def _checked_host(host: str) -> str | None:
+    """``host`` as a loggable name or address, or None when it may not be one.
+
+    An IPv6 zone id (``fe80::1%eth0``) is free text, so it is dropped. A
+    non-ASCII name is given in its ASCII (IDNA) form.
+    """
+    address = host.split("%", 1)[0]
     try:
-        ipaddress.ip_address(host)
+        ipaddress.ip_address(address)
     except ValueError:
-        return _HOSTNAME.fullmatch(host) is not None
-    return True
+        pass
+    else:
+        return address
+    try:
+        ascii_host = host.encode("idna").decode("ascii").lower()
+    except UnicodeError:
+        return None
+    return ascii_host if _HOSTNAME.fullmatch(ascii_host) else None
 
 
 def safe_id(value: object) -> str:
@@ -246,20 +265,40 @@ def safe_id(value: object) -> str:
 
 
 def _builtin_repr(value: object) -> str:
-    if value is None or type(value) is bool:
-        return repr(value)
-    if isinstance(value, str):
-        return str.__repr__(value)
-    if isinstance(value, bytes):
-        return bytes.__repr__(value)
-    if isinstance(value, int):
-        if int.bit_length(value) > _MAX_ID_INT_BITS:
-            return f"<int of {int.bit_length(value)} bits>"
-        return int.__repr__(value)
-    if isinstance(value, float):
-        return float.__repr__(value)
-    name = _QUALNAME.__get__(type(value))
-    return f"<{name}>" if type(name) is str and name.isprintable() else "<object>"
+    # type() rather than isinstance: isinstance consults a __class__ the object
+    # can fake, and then a built-in repr would run on the wrong type.
+    kind = type(value)
+    if value is None or kind is bool:
+        return "None" if value is None else ("True" if value else "False")
+    if issubclass(kind, str):
+        return str.__repr__(value)  # type: ignore[arg-type]
+    if issubclass(kind, bytes):
+        return bytes.__repr__(value)  # type: ignore[arg-type]
+    if issubclass(kind, int):
+        return _int_repr(value)  # type: ignore[arg-type]
+    if issubclass(kind, float):
+        return float.__repr__(value)  # type: ignore[arg-type]
+    return f"<{_class_name(kind) or 'object'}>"
+
+
+def _int_repr(value: int) -> str:
+    bits = int.bit_length(value)
+    # Digits an int of this many bits can have, against the process's own limit
+    # (sys.set_int_max_str_digits); past it, repr raises ValueError.
+    limit = sys.get_int_max_str_digits()
+    if bits > _MAX_ID_INT_BITS or (limit and bits * 0.30103 + 1 >= limit):
+        return f"<int of {bits} bits>"
+    return int.__repr__(value)
+
+
+def _class_name(cls: type) -> str | None:
+    """The class's qualified name when it is plain identifiers, else None.
+
+    Whoever defines a class chooses its name (``type("sk-...\\r", ...)``), so only
+    names shaped like source identifiers are logged.
+    """
+    name = _QUALNAME.__get__(cls)
+    return name if type(name) is str and _QUALIFIED_NAME.fullmatch(name) else None
 
 
 class WarnOnce:
