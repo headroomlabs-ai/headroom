@@ -58,7 +58,7 @@ def update_plugin_manifest(file_path: Path, version: str) -> None:
 
 
 def update_marketplace_manifest(file_path: Path, version: str) -> None:
-    """Update marketplace metadata and plugin entry versions."""
+    """Sync repository releases while preserving independently versioned plugins."""
     with open(file_path, encoding="utf-8") as f:
         data = json.load(f)
     metadata = data.get("metadata")
@@ -67,7 +67,11 @@ def update_marketplace_manifest(file_path: Path, version: str) -> None:
     plugins = data.get("plugins")
     if isinstance(plugins, list):
         for plugin in plugins:
-            if isinstance(plugin, dict):
+            if isinstance(plugin, dict) and plugin.get("name") in {
+                "headroom",
+                "headroom-agent-hooks",
+                "headroom-snip",
+            }:
                 plugin["version"] = version
     with open(file_path, "w", encoding="utf-8") as f:
         json.dump(data, f, indent=2, ensure_ascii=False)

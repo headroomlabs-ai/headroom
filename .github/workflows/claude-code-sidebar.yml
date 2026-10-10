@@ -1,0 +1,86 @@
+name: Claude Code Sidebar
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - "integrations/claude-code-mod/**"
+      - "headroom/proxy/**"
+      - ".claude-plugin/marketplace.json"
+      - ".github/plugin/marketplace.json"
+      - "tests/test_plugin_manifests.py"
+      - "scripts/version-sync.py"
+      - "scripts/verify-versions.py"
+      - "scripts/tests/test_independent_plugin_versions.py"
+      - ".github/workflows/claude-code-sidebar.yml"
+  push:
+    branches: [main]
+    paths:
+      - "integrations/claude-code-mod/**"
+      - "headroom/proxy/**"
+      - ".claude-plugin/marketplace.json"
+      - ".github/plugin/marketplace.json"
+      - "tests/test_plugin_manifests.py"
+      - "scripts/version-sync.py"
+      - "scripts/verify-versions.py"
+      - "scripts/tests/test_independent_plugin_versions.py"
+      - ".github/workflows/claude-code-sidebar.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: unit + real proxy E2E (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    env:
+      HF_HUB_OFFLINE: "1"
+      HEADROOM_DETECT_BACKEND: python
+      HEADROOM_DISABLE_KOMPRESS: "1"
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+      - uses: actions/setup-node@v7
+        with:
+          node-version: "24"
+      # Published proxy dependencies; the E2E harness loads checkout proxy source.
+      - name: Install proxy dependencies and companion
+        run: python -m pip install "headroom-ai[proxy]==0.40.0" ./integrations/claude-code-mod/companion pytest
+      # Proxy startup requires Rust; Python modules still come from this checkout.
+      # This PR does not modify the native extension.
+      - name: Supply release native extension to the source checkout
+        run: >-
+          python -c "from importlib.metadata import distribution; from pathlib import Path; import shutil;
+          d=distribution('headroom-ai'); files=[f for f in d.files if f.name.startswith('_core.') and f.suffix in {'.so','.pyd'}];
+          assert len(files)==1, files; shutil.copy2(d.locate_file(files[0]), Path('headroom')/files[0].name)"
+      - name: JavaScript unit tests
+        working-directory: integrations/claude-code-mod
+        run: npm test
+      - name: Companion unit and real Headroom contract tests
+        env:
+          PYTHONPATH: .
+        run: python -m pytest -q -c integrations/claude-code-mod/companion/pyproject.toml integrations/claude-code-mod/companion/tests
+      - name: HTTP bridge smoke
+        run: python integrations/claude-code-mod/scripts/run-http-smoke.py
+      - name: Marketplace manifests
+        run: >-
+          python -m pytest -q tests/test_plugin_manifests.py
+          scripts/tests/test_independent_plugin_versions.py
+          scripts/tests/test_version_sync.py scripts/tests/test_sync_plugin_versions.py
+
+      - name: Release version consistency
+        run: python scripts/verify-versions.py
+      - name: Real proxy compression to sidebar E2E
+        run: python integrations/claude-code-mod/scripts/run-proxy-e2e.py
+      - name: Real proxy E2E without message capture
+        run: python integrations/claude-code-mod/scripts/run-proxy-e2e.py --no-capture
+      - name: Build installable companion wheel
+        run: python integrations/claude-code-mod/scripts/build-wheel.py

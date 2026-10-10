@@ -25,6 +25,15 @@
         "claude-code",
         "copilot-cli"
       ]
+    },
+    {
+      "name": "headroom-sidebar",
+      "source": "./integrations/claude-code-mod/plugins/headroom-sidebar",
+      "description": "Read-only conversation compression metrics and message inspection; requires the opt-in claude_mod proxy extension.",
+      "version": "0.1.3",
+      "author": {
+        "name": "Headroom Contributors"
+      }
     }
   ]
 }

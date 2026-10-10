@@ -1,0 +1,24 @@
+[build-system]
+requires = ["setuptools>=77.0.3"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "headroom-claude-mod"
+version = "0.1.1"
+description = "Conversation-scoped Headroom controls and telemetry for a Claude Code sidebar mod"
+requires-python = ">=3.10"
+license = "MIT"
+dependencies = ["fastapi>=0.100.0", "pydantic>=2.0.0"]
+
+[project.entry-points."headroom.proxy_extension"]
+claude_mod = "headroom_claude_mod.extension:install"
+
+[project.scripts]
+headroom-mod = "headroom_claude_mod.launcher:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+testpaths = ["tests"]

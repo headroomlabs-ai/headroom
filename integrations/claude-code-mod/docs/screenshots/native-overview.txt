@@ -1,0 +1,30 @@
+HEADROOM                                  LIVE
+
+[ Overview ● ] [ Requests ] [ Refresh ]
+
+COMPRESSION ON
+[ Pause ] [ Reset stats ]
+
+Window [ 15m ] [ 1h ] [ 24h ] [ All ● ]
+
+╭────────────────────────────────────────────╮
+│                                            │
+│ SAVINGS                                    │
+│ 118 tokens removed                         │
+│ ░░░░░░░░░░░░░░░░░░░░░░░░ 0.3%              │
+│ 8 requests · All retained                  │
+│                                            │
+╰────────────────────────────────────────────╯
+
+LATEST REQUEST
+8.9k → 8.9k tokens
+0 removed · 0.0% reduction
+
+CLAUDE CONTEXT
+14.1k / 1M tokens
+░░░░░░░░░░░░░░░░░░░░░░░░ 1.0%
+
+[ More details ▾ ]
+
+────────────────────────────────────────────
+Local · refreshes every 5s

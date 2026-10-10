@@ -1455,7 +1455,9 @@ class AnthropicHandlerMixin:
             # Only resolved when the cache can be used, so streaming and
             # cache-disabled requests never pay for identity resolution.
             cache_partition = (
-                compute_request_cache_partition(request) if self.cache and not stream else None
+                compute_request_cache_partition(request)
+                if self.cache and not stream and not _bypass
+                else None
             )
             # Check cache (non-streaming only)
             cache_hit = False
