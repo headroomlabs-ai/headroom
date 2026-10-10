@@ -147,7 +147,8 @@ class WarnOnce:
     keeps recurring, or a newly broken key, warns again once an hour. A key is
     used up only when WARNING is enabled, so a warning suppressed by the log
     level is still emitted later. ``forget`` re-arms a key once its failure has
-    cleared; it cannot reopen the cap after the overflow notice.
+    cleared; a re-armed key that fails again counts against the same window's
+    budget, so forgetting can never push a window past ``limit + 1`` warnings.
     """
 
     def __init__(self, limit: int, what: str, *, window_seconds: float = 3600.0) -> None:
@@ -159,6 +160,7 @@ class WarnOnce:
         self._what = what
         self._window = window_seconds
         self._keys: set[Hashable] = set()
+        self._issued = 0  # warnings issued this window; forget() does not refund them
         self._window_start: float | None = None
         self._overflowed = False
         self._lock = threading.Lock()
@@ -171,12 +173,14 @@ class WarnOnce:
             now = time.monotonic()
             if self._window_start is not None and now - self._window_start >= self._window:
                 self._keys.clear()
+                self._issued = 0
                 self._overflowed = False
                 self._window_start = None
             if key in self._keys:
                 return False
-            if not self._overflowed and len(self._keys) < self._limit:
+            if not self._overflowed and self._issued < self._limit:
                 self._keys.add(key)
+                self._issued += 1
                 if self._window_start is None:
                     self._window_start = now
                 return True
@@ -186,7 +190,7 @@ class WarnOnce:
             remaining = self._window - (now - started)
         if report_overflow:
             log.warning(
-                "More than %d distinct %s; further ones are logged at debug only "
+                "More than %d distinct %s; further ones are not logged at WARNING "
                 "for the next %d minutes",
                 self._limit,
                 self._what,
