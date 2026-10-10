@@ -363,6 +363,47 @@ async def test_maybe_poll_runs_transcript_scan_off_event_loop(
     assert seen["thread_id"] != loop_thread_id
 
 
+@pytest.mark.asyncio
+async def test_maybe_poll_logs_a_failed_otel_update(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A broken OTEL exporter must not break polling, but must leave a trace."""
+    monkeypatch.setattr(SubscriptionTracker, "_load_persisted_state", lambda self: None)
+    tracker = SubscriptionTracker()
+    tracker.notify_active("Bearer live-oauth-token", from_local_operator=True)
+    monkeypatch.setattr("headroom.subscription.client.read_cached_oauth_token", lambda: None)
+    snapshot = _make_snapshot()
+
+    async def fetch_snapshot(token: str | None) -> SubscriptionSnapshot:
+        return snapshot
+
+    def broken_exporter(state: dict) -> None:
+        raise RuntimeError("exporter down")
+
+    tracker._client = SimpleNamespace(fetch=fetch_snapshot)
+    monkeypatch.setattr(
+        tracker_module, "_compute_window_tokens_for_snapshot", lambda snap: WindowTokens(input=7)
+    )
+    monkeypatch.setattr(tracker_module, "_detect_discrepancies", lambda snap, tokens: [])
+    monkeypatch.setattr(tracker, "_persist_state", lambda: None)
+    monkeypatch.setitem(
+        sys.modules,
+        "headroom.observability.metrics",
+        SimpleNamespace(
+            get_otel_metrics=lambda: SimpleNamespace(record_subscription_window=broken_exporter)
+        ),
+    )
+
+    with caplog.at_level("DEBUG", logger="headroom.subscription.tracker"):
+        await tracker._maybe_poll()
+
+    assert tracker.latest_snapshot is snapshot
+    assert tracker._state.last_error is None
+    assert "Subscription OTEL metrics update failed: exporter down" in [
+        r.getMessage() for r in caplog.records if r.name == "headroom.subscription.tracker"
+    ]
+
+
 def test_persist_and_load_state_round_trip(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     persist_path = tmp_path / "tracker-state.json"
     tracker = SubscriptionTracker(persist_path=persist_path)

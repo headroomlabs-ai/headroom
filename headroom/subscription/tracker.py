@@ -457,8 +457,8 @@ class SubscriptionTracker(QuotaTracker):
             from headroom.observability.metrics import get_otel_metrics
 
             get_otel_metrics().record_subscription_window(self._state.to_dict())
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.debug("Subscription OTEL metrics update failed: %s", exc)
 
     def _maybe_reset_contribution(self, snapshot: SubscriptionSnapshot) -> None:
         """Reset contribution counters when the 5h window rolls over."""
