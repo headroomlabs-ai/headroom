@@ -550,25 +550,6 @@ def _execution_semaphore(backend: str, device_type: str) -> threading.BoundedSem
         return semaphore
 
 
-def _acquire_bounded(
-    semaphore: threading.BoundedSemaphore,
-    acquire_timeout: float | None,
-    remaining_budget: float | None,
-) -> bool:
-    """Acquire ``semaphore``, waiting at most the tighter of the two bounds.
-
-    Returns False on timeout. An unbounded wait here is how one stuck
-    inference (e.g. degraded ONNX on Windows) used to wedge every other
-    compression in the process: abandoned executor threads queued forever
-    on the semaphore. With both bounds disabled (<=0) this degrades to the
-    legacy blocking acquire.
-    """
-    bounds = [b for b in (acquire_timeout, remaining_budget) if b is not None]
-    if not bounds:
-        return semaphore.acquire()
-    return semaphore.acquire(timeout=max(0.0, min(bounds)))
-
-
 def _batch_size() -> int:
     return _env_int(KOMPRESS_BATCH_SIZE_ENV) or 32
 

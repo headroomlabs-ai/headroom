@@ -8,7 +8,7 @@ deployment exists to carry.
 Refused (this is not a sample — it is the rule, and the meta-test enforces it):
 the telemetry beacon, the update check, the license/usage reporter, OTLP and
 Langfuse export, HuggingFace/Kompress/fastembed model downloads, release-binary
-and codebase-memory-mcp downloads, eval dataset downloads and the provider SDK
+downloads (codebase-memory-mcp among them), eval dataset downloads and the provider SDK
 clients the eval harness drives, GitHub Copilot device-flow auth and token
 exchange, the Anthropic / Codex / Copilot subscription pollers, the OpenAI
 embedders, both Headroom Cloud compression integrations, and the TLS

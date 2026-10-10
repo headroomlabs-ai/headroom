@@ -41,13 +41,36 @@ __all__ = [
 _ANTHROPIC_SHAPE = frozenset({"anthropic", "bedrock", "vertex", "vertex_ai", "claude"})
 
 
-def _int(value: Any) -> int:
+def usage_int(value: Any, default: int = 0) -> int:
+    """One token count from a provider usage block, as a non-negative int.
+
+    Missing (``None``), non-numeric and boolean values give ``default``;
+    negative counts clamp to 0. Never raises: usage fields are
+    upstream-controlled and must not fail a response.
+    """
     if isinstance(value, bool):
-        return 0
+        return default
     try:
         return max(int(value), 0)
     except (TypeError, ValueError):
-        return 0
+        return default
+
+
+def anthropic_cache_ttl_buckets(usage: Any) -> tuple[int, int]:
+    """Cache-write tokens by TTL bucket ``(5m, 1h)`` from an Anthropic usage block.
+
+    Reads ``usage.cache_creation.ephemeral_{5m,1h}_input_tokens``; returns
+    ``(0, 0)`` when the block or its ``cache_creation`` object is absent.
+    """
+    if not isinstance(usage, dict):
+        return (0, 0)
+    cache_creation = usage.get("cache_creation")
+    if not isinstance(cache_creation, dict):
+        return (0, 0)
+    return (
+        int(cache_creation.get("ephemeral_5m_input_tokens", 0) or 0),
+        int(cache_creation.get("ephemeral_1h_input_tokens", 0) or 0),
+    )
 
 
 def is_anthropic_dialect(provider: str | None) -> bool:
@@ -64,7 +87,7 @@ def is_anthropic_dialect(provider: str | None) -> bool:
 
 def anthropic_billed_input(input_tokens: Any, cache_read: Any = 0, cache_write: Any = 0) -> int:
     """Billed input for an Anthropic-shape usage block: the three disjoint buckets."""
-    return _int(input_tokens) + _int(cache_read) + _int(cache_write)
+    return usage_int(input_tokens) + usage_int(cache_read) + usage_int(cache_write)
 
 
 def billed_input_for_provider(
@@ -88,7 +111,7 @@ def billed_input_for_provider(
         # message_start can carry input_tokens=0 alongside real cache buckets
         # on a fully cached turn; that is still a provider-reported count.
         return total
-    return _int(input_tokens)
+    return usage_int(input_tokens)
 
 
 def billed_input_from_usage(payload: Mapping[str, Any] | None, provider: str | None) -> int:
@@ -104,14 +127,14 @@ def billed_input_from_usage(payload: Mapping[str, Any] | None, provider: str | N
 
     meta = payload.get("usageMetadata")
     if isinstance(meta, Mapping):
-        return _int(meta.get("promptTokenCount"))
+        return usage_int(meta.get("promptTokenCount"))
 
     usage = payload.get("usage") if isinstance(payload.get("usage"), Mapping) else payload
     if not isinstance(usage, Mapping):
         return 0
 
     if "promptTokenCount" in usage:
-        return _int(usage.get("promptTokenCount"))
+        return usage_int(usage.get("promptTokenCount"))
 
     if is_anthropic_dialect(provider):
         if "input_tokens" not in usage:
@@ -124,7 +147,7 @@ def billed_input_from_usage(payload: Mapping[str, Any] | None, provider: str | N
 
     # OpenAI and OpenAI-compatible dialects: the headline figure is inclusive.
     if "prompt_tokens" in usage:
-        return _int(usage.get("prompt_tokens"))
+        return usage_int(usage.get("prompt_tokens"))
     if "input_tokens" in usage:
-        return _int(usage.get("input_tokens"))
+        return usage_int(usage.get("input_tokens"))
     return 0

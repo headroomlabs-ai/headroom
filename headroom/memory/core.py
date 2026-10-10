@@ -894,15 +894,6 @@ class HierarchicalMemory:
             f"Bubbled memory {memory.id} from {current_scope.value} to {target_scope.value}"
         )
 
-    def _scope_level_value(self, level: ScopeLevel) -> int:
-        """Get numeric value for scope level (lower = broader scope)."""
-        return {
-            ScopeLevel.USER: 0,
-            ScopeLevel.SESSION: 1,
-            ScopeLevel.AGENT: 2,
-            ScopeLevel.TURN: 3,
-        }[level]
-
     # =========================================================================
     # Properties
     # =========================================================================

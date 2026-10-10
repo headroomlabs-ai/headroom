@@ -1145,3 +1145,33 @@ def test_no_proxy_does_not_create_startup_lock(monkeypatch: pytest.MonkeyPatch) 
 
     assert wrap_mod._ensure_proxy(8787, True) == (None, 8787)
     assert entered is False
+
+
+@pytest.mark.parametrize(
+    ("argv", "expected"),
+    [
+        (
+            ["wrap", "aider"],
+            "Error: 'aider' not found in PATH.\nInstall aider: pip install aider-chat",
+        ),
+        (["wrap", "goose"], "Error: 'goose' not found in PATH."),
+        (["wrap", "kimi"], "Error: 'kimi' (or 'kimi-cli') not found in PATH."),
+    ],
+)
+def test_missing_binary_error_goes_to_stderr_only(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, argv: list[str], expected: str
+) -> None:
+    """The missing-binary error is a ClickException on stderr; stdout stays empty."""
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(wrap_mod.shutil, "which", lambda name: None)
+
+    def no_proxy(*args: Any, **kwargs: Any) -> None:
+        raise AssertionError("a missing binary must fail before any proxy start")
+
+    monkeypatch.setattr(wrap_mod, "_ensure_proxy", no_proxy)
+
+    result = CliRunner().invoke(main, argv)
+
+    assert result.exit_code == 1
+    assert result.stdout == ""
+    assert result.stderr.startswith(expected)

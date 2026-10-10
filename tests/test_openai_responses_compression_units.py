@@ -882,14 +882,12 @@ def test_openai_responses_adapter_never_folds_a_file_read(tool, as_content_part)
     assert new_payload["input"][1]["output"] == output
 
 
-def test_openai_responses_adapter_excludes_tool_case_insensitively_with_debug(monkeypatch):
-    """Excluded match is case-insensitive, and the debug path stays exercised.
+def test_openai_responses_adapter_excludes_tool_case_insensitively():
+    """Excluded match is case-insensitive.
 
     The configured name is lowercase only; the call advertises a mixed-case
-    name, so the protection must hit via the lowercased fallback. Debug logging
-    is enabled so the protected-extraction debug record is also covered.
+    name, so the protection must hit via the lowercased fallback.
     """
-    monkeypatch.setattr(openai_handler, "_log_codex_compression_debug", lambda *_a, **_k: None)
     router = ContentRouter()
     router.config.exclude_tools = {"serena.find_symbol"}
 

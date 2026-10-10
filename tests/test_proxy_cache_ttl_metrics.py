@@ -313,7 +313,7 @@ def test_streaming_parser_extracts_anthropic_ttl_bucket_usage() -> None:
         b'"cache_read_input_tokens":3,"cache_creation_input_tokens":9,'
         b'"cache_creation":{"ephemeral_5m_input_tokens":4,"ephemeral_1h_input_tokens":5}}}}\n\n'
     )
-    usage = proxy._parse_sse_usage(chunk, "anthropic")
+    usage = proxy._parse_sse_usage_from_buffer({"sse_buffer": bytearray(chunk)}, "anthropic")
 
     assert usage is not None
     assert usage["cache_creation_ephemeral_5m_input_tokens"] == 4

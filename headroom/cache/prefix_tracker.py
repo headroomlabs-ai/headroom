@@ -589,6 +589,36 @@ def extract_cache_stable_delta(
     )
 
 
+def restore_frozen_prefix(
+    original_messages: list[dict[str, Any]],
+    candidate_messages: list[dict[str, Any]],
+    *,
+    frozen_message_count: int,
+) -> tuple[list[dict[str, Any]], int]:
+    """Force the frozen prefix of ``candidate_messages`` to match the original bytes.
+
+    Returns ``(restored_messages, restored_count)``. Messages a transform dropped
+    from the prefix are put back; any frozen message it changed is replaced by
+    the original. ``restored_count`` is how many prefix messages were restored.
+    """
+    if frozen_message_count <= 0 or not original_messages:
+        return candidate_messages, 0
+
+    frozen = min(frozen_message_count, len(original_messages))
+    restored = list(candidate_messages)
+
+    # Defensive: if a transform dropped prefix messages, restore them.
+    if len(restored) < frozen:
+        return list(original_messages[:frozen]) + restored, frozen
+
+    changed = 0
+    for idx in range(frozen):
+        if restored[idx] != original_messages[idx]:
+            restored[idx] = original_messages[idx]
+            changed += 1
+    return restored, changed
+
+
 def overlay_cached_prefix(
     optimized_messages: list[dict[str, Any]],
     current_original_messages: list[dict[str, Any]],

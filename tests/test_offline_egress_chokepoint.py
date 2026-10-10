@@ -1698,7 +1698,7 @@ class TestDoctorNetworkOffline:
 
 
 class TestInstallDownloadsOffline:
-    """`headroom install`'s two release downloads.
+    """`headroom install`'s release download.
 
     `binaries.py` already had `HEADROOM_BINARIES_OFFLINE`, which is exactly the
     kind of second, differently-named flag an operator should not have to
@@ -1717,13 +1717,6 @@ class TestInstallDownloadsOffline:
                 progress=False,
             )
         assert _refused_hostname(excinfo.value) == "github.com"
-
-    def test_cbm_download_opens_no_socket(self, offline: None, no_sockets: None) -> None:
-        from headroom.graph import installer
-
-        with pytest.raises(OfflineEgressBlocked) as excinfo:
-            installer.download_cbm()
-        assert "HEADROOM_OFFLINE" in str(excinfo.value)
 
     def test_the_binaries_specific_switch_still_wins_first(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path

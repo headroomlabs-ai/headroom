@@ -23,7 +23,7 @@ from __future__ import annotations
 import json
 import logging
 from dataclasses import dataclass
-from typing import Any, Protocol
+from typing import Any
 
 import httpx
 
@@ -32,19 +32,6 @@ from .response_handler import CCRResponseHandler, ResponseHandlerConfig
 from .tool_injection import CCR_TOOL_NAME
 
 logger = logging.getLogger(__name__)
-
-
-class APIClient(Protocol):
-    """Protocol for making API calls."""
-
-    async def post(
-        self,
-        url: str,
-        headers: dict[str, str],
-        json: dict[str, Any],
-    ) -> httpx.Response:
-        """Make a POST request."""
-        ...
 
 
 @dataclass
