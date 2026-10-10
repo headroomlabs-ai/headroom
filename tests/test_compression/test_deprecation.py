@@ -78,22 +78,19 @@ def test_detector_import_stays_quiet(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 @pytest.mark.usefixtures("fresh")
-def test_reload_drops_cached_exports(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_reload_drops_cached_exports() -> None:
     import headroom.compression.detector as detector
 
+    real = detector.ContentType
     with pytest.warns(DeprecationWarning):
-        old_content_type = compression.ContentType
-    monkeypatch.setattr(detector, "ContentType", type("ReloadedContentType", (), {}))
+        assert compression.ContentType is real
+    stand_in = type("ReloadedContentType", (), {})
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(detector, "ContentType", stand_in)
+        importlib.reload(compression)
+        with pytest.warns(DeprecationWarning):
+            assert compression.ContentType is stand_in
+    # Back on the real class: a second reload must drop the cached stand-in.
     importlib.reload(compression)
     with pytest.warns(DeprecationWarning):
-        assert compression.ContentType is detector.ContentType
-    assert compression.ContentType is not old_content_type
-
-
-def test_reload_test_leaves_no_stale_export() -> None:
-    # Runs after the reload test in file order: the cached export must be the real one.
-    from headroom.compression.detector import ContentType
-
-    with warnings.catch_warnings():
-        warnings.simplefilter("ignore", DeprecationWarning)
-        assert compression.ContentType is ContentType
+        assert compression.ContentType is real
