@@ -554,6 +554,8 @@ class _RecordList(logging.Handler):
 @pytest.mark.parametrize("level", [logging.DEBUG, logging.WARNING])
 def test_proxy_stats_failure_keeps_url_credentials_out_of_logs(level) -> None:
     canary = "pw-canary-7c1e"
+    # A path segment can carry a token too, plain or %-encoded (%50 is "P").
+    path_canaries = ("PLAIN_PATH_CANARY", "%50RIVATE_PATH_CANARY", "PRIVATE_PATH_CANARY")
 
     class _MalformedJson(http.server.BaseHTTPRequestHandler):
         def do_GET(self) -> None:  # noqa: N802 - stdlib handler name
@@ -579,7 +581,8 @@ def test_proxy_stats_failure_keeps_url_credentials_out_of_logs(level) -> None:
     try:
         port = httpd.server_address[1]
         server = mcp_server.HeadroomMCPServer(
-            proxy_url=f"http://user:{canary}@127.0.0.1:{port}", check_proxy=True
+            proxy_url=f"http://user:{canary}@127.0.0.1:{port}/bot{path_canaries[0]}/{path_canaries[1]}",
+            check_proxy=True,
         )
 
         async def fetch() -> object:
@@ -597,7 +600,8 @@ def test_proxy_stats_failure_keeps_url_credentials_out_of_logs(level) -> None:
         httpd.server_close()
 
     formatted = [logging.Formatter().format(record) for record in handler.records]
-    assert all(canary not in line for line in formatted)
+    for secret in (canary, *path_canaries):
+        assert all(secret not in line for line in formatted)
     if level == logging.DEBUG:
         # The failure is still diagnosable: the redacted URL and the exception type.
         assert any(f"127.0.0.1:{port}" in line and "JSONDecodeError" in line for line in formatted)
