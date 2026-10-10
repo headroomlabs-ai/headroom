@@ -2066,6 +2066,41 @@ def merge_extra_headers(
     return merged
 
 
+def apply_openai_api_key_fallback(
+    headers: dict[str, str],
+    *,
+    upstream_url: str | None,
+    config: Any = None,
+    request_id: str | None = None,
+) -> dict[str, str]:
+    """Add the process OpenAI key only for a configured HTTPS OpenAI upstream.
+
+    The WebSocket OpenAI handshake has always used ``OPENAI_API_KEY`` as a
+    fallback. Keep the HTTP behavior aligned, but only send the process key to
+    the configured OpenAI target. A request-controlled custom base URL must not
+    redirect that credential to another provider or a plaintext HTTP endpoint.
+    """
+    if any(key.lower() in {"authorization", "api-key"} for key in headers):
+        return headers
+
+    api_key = os.environ.get("OPENAI_API_KEY")
+    if not api_key:
+        return headers
+
+    from headroom.proxy.upstream_trust import is_trusted_openai_upstream
+
+    if not is_trusted_openai_upstream(upstream_url, config):
+        return headers
+
+    authenticated = dict(headers)
+    authenticated["Authorization"] = f"Bearer {api_key}"
+    logger.debug(
+        "[%s] applied OPENAI_API_KEY fallback for trusted HTTP upstream",
+        request_id or "",
+    )
+    return authenticated
+
+
 def log_outbound_headers(
     *,
     forwarder: str,

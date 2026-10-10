@@ -18,6 +18,7 @@ from headroom.proxy.auth_mode import classify_client, supports_mid_turn_coalesci
 from headroom.proxy.handlers._debug_dump import write_upstream_error_dump
 from headroom.proxy.helpers import (
     RETRYABLE_OVERLOAD_STATUSES,
+    apply_openai_api_key_fallback,
     jitter_delay_ms,
     overload_retry_is_futile,
     retry_after_ms,
@@ -1150,6 +1151,13 @@ class StreamingMixin:
         # Before the guard: its learned-limit lookup is keyed on the credential
         # actually sent, the same one the 400 learning below keys on.
         headers = await apply_copilot_api_auth(headers, url=url)
+        if provider == "openai":
+            headers = apply_openai_api_key_fallback(
+                headers,
+                upstream_url=url,
+                config=self.config,
+                request_id=request_id,
+            )
 
         # Context-limit guard (see headroom/proxy/context_guard.py): rewrites
         # only the client-bound message_start bytes when the forwarded request

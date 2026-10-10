@@ -126,6 +126,20 @@ def is_trusted_upstream(url: str | None, config: Any = None) -> bool:
     return host in trusted_upstream_hosts(config)
 
 
+def is_trusted_openai_upstream(url: str | None, config: Any = None) -> bool:
+    """Whether the process OpenAI key may be sent to this HTTPS destination."""
+
+    configured_url = getattr(config, "openai_api_url", None)
+    candidate = url or configured_url or "https://api.openai.com"
+    parsed = urlparse(candidate)
+    if parsed.scheme.lower() != "https" or not parsed.hostname:
+        return False
+
+    host = parsed.hostname.lower()
+    configured_host = url_host(configured_url)
+    return host == "api.openai.com" or host == configured_host
+
+
 def warn_untrusted_once(url: str | None, *, request_id: str | None = None) -> None:
     """Log the refusal once per host, with the remedy in the message."""
 
