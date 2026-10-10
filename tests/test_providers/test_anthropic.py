@@ -138,16 +138,21 @@ class TestLongContextPricing:
 
     def test_premium_survives_litellm_dropping_the_long_context_rate(self, provider, monkeypatch):
         """A LiteLLM entry without the above-200K rate must not bill a long prompt at the base tier."""
+        litellm = pytest.importorskip("litellm")
         import headroom.providers.anthropic as anthropic_module
 
-        base_only = {
-            "claude-sonnet-4-5": {
+        # One map for both readers: the guard and litellm's own cost_per_token.
+        monkeypatch.setitem(
+            litellm.model_cost,
+            "claude-sonnet-4-5",
+            {
+                "litellm_provider": "anthropic",
+                "mode": "chat",
                 "input_cost_per_token": 3e-06,
                 "output_cost_per_token": 1.5e-05,
                 "cache_read_input_token_cost": 3e-07,
-            }
-        }
-        monkeypatch.setattr(anthropic_module, "get_litellm_model_cost", lambda: base_only)
+            },
+        )
 
         assert provider.estimate_cost(300_000, 5_000, "claude-sonnet-4-5", 0) == pytest.approx(
             1.9125, rel=1e-4
