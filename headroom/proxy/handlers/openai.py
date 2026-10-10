@@ -104,7 +104,11 @@ from headroom.proxy.handlers._debug_dump import _debug_dump_mode, _redact_debug_
 from headroom.proxy.image_isolation import run_image_compression_isolated
 from headroom.proxy.outcome import RequestOutcome
 from headroom.proxy.output_shaper import shaper_enabled_for, steering_allowed_for
-from headroom.proxy.passthrough import CUSTOM_BASE_PROVIDER, is_opencode_zen_base
+from headroom.proxy.passthrough import (
+    CUSTOM_BASE_PROVIDER,
+    is_opencode_zen_base,
+    provider_label_from_model,
+)
 from headroom.proxy.passthrough import (
     custom_base_passthrough_telemetry as _custom_base_passthrough_telemetry,
 )
@@ -3306,16 +3310,13 @@ class OpenAIHandlerMixin:
             handler_path,
             custom_upstream_base_url or "",
         )
-        # Fixed taxonomy from the shared helper (zen, zai, meta, openai, xai);
-        # any other custom base is the shared "custom" bucket. Never derive the
-        # label from the request-controlled hostname — see the review on #3759.
-        # Grok CLI routed to xAI without a base-url header is still xai.
+        # Keep upstream labels and xAI routing ahead of model-based DeepSeek reporting.
+        # Unknown custom hosts remain in the fixed custom bucket.
         openai_chat_outcome_provider = custom_chat_provider or (
-            CUSTOM_BASE_PROVIDER
-            if custom_upstream_base_url
-            else "xai"
+            "xai"
             if _is_xai_upstream(upstream_base_url)
-            else "openai"
+            else provider_label_from_model(model)
+            or (CUSTOM_BASE_PROVIDER if custom_upstream_base_url else "openai")
         )
 
         # Memory: Get user ID when memory is enabled. Reads `request.headers`
