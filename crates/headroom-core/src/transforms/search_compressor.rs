@@ -111,6 +111,14 @@ pub struct SearchMatch {
     pub content: String,
     /// Relevance score in [0.0, 1.0]; populated by [`SearchCompressor::score_matches`].
     pub score: f32,
+    /// The `<sep><digits><sep>` text exactly as it appeared between path and
+    /// content. Output reuses it so a context line (`-`) stays a context line
+    /// and the digits are never re-formatted.
+    pub marker: String,
+    /// Leading whitespace before the path, as it appeared (usually empty).
+    /// Parsing runs on the line without it, so an indented row splits like
+    /// any other; output puts it back.
+    pub indent: String,
 }
 
 impl SearchMatch {
@@ -120,7 +128,17 @@ impl SearchMatch {
             line_number,
             content: content.into(),
             score: 0.0,
+            marker: format!(":{line_number}:"),
+            indent: String::new(),
         }
+    }
+
+    /// `indent file<marker>content`, byte-identical to the parsed line.
+    pub fn render(&self) -> String {
+        format!(
+            "{}{}{}{}",
+            self.indent, self.file, self.marker, self.content
+        )
     }
 }
 
@@ -129,6 +147,9 @@ impl SearchMatch {
 pub struct FileMatches {
     pub file: String,
     pub matches: Vec<SearchMatch>,
+    /// Position of the file's first row among the input's files: output
+    /// follows it, and it breaks score ties (key order is not input order).
+    pub order: usize,
 }
 
 impl FileMatches {
@@ -136,6 +157,7 @@ impl FileMatches {
         Self {
             file: file.into(),
             matches: Vec::new(),
+            order: 0,
         }
     }
 
@@ -371,18 +393,30 @@ impl SearchCompressor {
         stats: &mut SearchCompressorStats,
     ) -> BTreeMap<String, FileMatches> {
         let mut out: BTreeMap<String, FileMatches> = BTreeMap::new();
-        for raw in content.split('\n') {
-            let line = raw.trim();
-            if line.is_empty() {
+        for line in content.split('\n') {
+            // Keep the trailing whitespace (and any `\r`): trimming it made
+            // kept rows differ from the input. Leading whitespace is set
+            // aside instead: the colon/dash tiers stop at whitespace before a
+            // separator, so an indented row would fall to the permissive tier
+            // and split inside its path (`  logs/2026-12-13/app.log:12:x`).
+            if line.trim().is_empty() {
                 continue;
             }
             stats.lines_scanned += 1;
-            match parse_match_line(line) {
+            let rest = line.trim_start();
+            match parse_match_line(rest) {
                 Some((file, line_no, body)) => {
+                    let mut m = SearchMatch::new(file, line_no, body);
+                    m.marker = rest[file.len()..rest.len() - body.len()].to_string();
+                    m.indent = line[..line.len() - rest.len()].to_string();
+                    let order = out.len();
                     out.entry(file.to_string())
-                        .or_insert_with(|| FileMatches::new(file))
+                        .or_insert_with(|| FileMatches {
+                            order,
+                            ..FileMatches::new(file)
+                        })
                         .matches
-                        .push(SearchMatch::new(file, line_no, body));
+                        .push(m);
                 }
                 None => stats.lines_unparsed += 1,
             }
@@ -458,6 +492,7 @@ impl SearchCompressor {
             b.1.total_score()
                 .partial_cmp(&a.1.total_score())
                 .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| a.1.order.cmp(&b.1.order))
         });
 
         if by_score.len() > self.config.max_files {
@@ -467,11 +502,7 @@ impl SearchCompressor {
 
         let all_match_strings: Vec<String> = by_score
             .iter()
-            .flat_map(|(file, fm)| {
-                fm.matches
-                    .iter()
-                    .map(move |m| format!("{}:{}:{}", file, m.line_number, m.content))
-            })
+            .flat_map(|(_, fm)| fm.matches.iter().map(|m| m.render()))
             .collect();
         let all_refs: Vec<&str> = all_match_strings.iter().map(|s| s.as_str()).collect();
         let adaptive_total =
@@ -489,18 +520,21 @@ impl SearchCompressor {
             // Sort by score desc, ties broken by line number asc for
             // determinism (Python's `sorted` is stable; order in is
             // line-asc by construction so highest-score-first picks the
-            // earliest line on ties).
-            let mut sorted = fm.matches.clone();
-            sorted.sort_by(|a, b| {
+            // earliest line on ties). Rows are handled by input index so
+            // the output emits exactly the occurrence that was selected.
+            let mut sorted: Vec<usize> = (0..fm.matches.len()).collect();
+            sorted.sort_by(|&a, &b| {
+                let (a, b) = (&fm.matches[a], &fm.matches[b]);
                 b.score
                     .partial_cmp(&a.score)
                     .unwrap_or(std::cmp::Ordering::Equal)
                     .then_with(|| a.line_number.cmp(&b.line_number))
             });
 
-            let mut file_selected: Vec<SearchMatch> = Vec::new();
-            // BTreeSet for O(log n) "already in selection" check (Python
-            // uses linear `not in` — quadratic for big files).
+            // Selected input indices, plus the (line, content) keys already
+            // taken: a row repeating a selected row's number and content is
+            // still skipped (BTreeSet: O(log n), Python uses linear `not in`).
+            let mut picked: BTreeSet<usize> = BTreeSet::new();
             let mut seen: BTreeSet<(u64, u64)> = BTreeSet::new();
 
             let remaining_cap = self
@@ -508,43 +542,36 @@ impl SearchCompressor {
                 .max_matches_per_file
                 .min(adaptive_total.saturating_sub(total_selected));
 
-            let push_unique = |m: &SearchMatch,
-                               file_selected: &mut Vec<SearchMatch>,
-                               seen: &mut BTreeSet<(u64, u64)>| {
-                let key = (m.line_number, hash_u64(&m.content));
-                if seen.insert(key) {
-                    file_selected.push(m.clone());
-                    true
-                } else {
-                    false
-                }
-            };
-
-            if self.config.always_keep_first {
-                if let Some(first) = fm.first() {
-                    if file_selected.len() < remaining_cap {
-                        push_unique(first, &mut file_selected, &mut seen);
+            let push_unique =
+                |i: usize, picked: &mut BTreeSet<usize>, seen: &mut BTreeSet<(u64, u64)>| {
+                    let m = &fm.matches[i];
+                    if seen.insert((m.line_number, hash_u64(&m.content))) {
+                        picked.insert(i);
                     }
-                }
+                };
+
+            let n = fm.matches.len();
+            if self.config.always_keep_first && n > 0 && picked.len() < remaining_cap {
+                push_unique(0, &mut picked, &mut seen);
             }
 
-            if self.config.always_keep_last && fm.matches.len() > 1 {
-                if let Some(last) = fm.last() {
-                    if file_selected.len() < remaining_cap {
-                        push_unique(last, &mut file_selected, &mut seen);
-                    }
-                }
+            if self.config.always_keep_last && n > 1 && picked.len() < remaining_cap {
+                push_unique(n - 1, &mut picked, &mut seen);
             }
 
-            for m in &sorted {
-                if file_selected.len() >= remaining_cap {
+            for &i in &sorted {
+                if picked.len() >= remaining_cap {
                     break;
                 }
-                push_unique(m, &mut file_selected, &mut seen);
+                push_unique(i, &mut picked, &mut seen);
             }
 
-            // Restore line order for output.
-            file_selected.sort_by_key(|m| m.line_number);
+            // Restore INPUT order for output (grep emits line order, so this is
+            // line order for real grep). Sorting by line number alone put the
+            // forced first/last rows ahead of any rows sharing their number,
+            // e.g. `api:12:00:03 ...` log rows whose "line" is the hour.
+            let file_selected: Vec<SearchMatch> =
+                picked.iter().map(|&i| fm.matches[i].clone()).collect();
 
             let dropped_here = fm.matches.len().saturating_sub(file_selected.len());
             stats.matches_dropped_by_per_file_cap += dropped_here;
@@ -555,6 +582,7 @@ impl SearchCompressor {
                 FileMatches {
                     file: file.clone(),
                     matches: file_selected,
+                    order: fm.order,
                 },
             );
         }
@@ -571,7 +599,9 @@ impl SearchCompressor {
         let mut summaries: BTreeMap<String, String> = BTreeMap::new();
         let grouped = self.config.group_by_file;
 
-        for (file, fm) in selected {
+        let mut in_order: Vec<(&String, &FileMatches)> = selected.iter().collect();
+        in_order.sort_by_key(|(_, fm)| fm.order);
+        for (file, fm) in in_order {
             if grouped {
                 // `rg --heading` style: path once, then line:content rows.
                 if !lines.is_empty() {
@@ -579,11 +609,11 @@ impl SearchCompressor {
                 }
                 lines.push(file.clone());
                 for m in &fm.matches {
-                    lines.push(format!("{}:{}", m.line_number, m.content));
+                    lines.push(format!("{}{}", &m.marker[1..], m.content));
                 }
             } else {
                 for m in &fm.matches {
-                    lines.push(format!("{}:{}:{}", m.file, m.line_number, m.content));
+                    lines.push(m.render());
                 }
             }
             if let Some(orig_fm) = original.get(file) {
@@ -867,7 +897,14 @@ fn scan_marker(line: &str, tier: ScanTier) -> Option<(Marker, bool)> {
             }
             // The closing separator must match the opening one: grep
             // emits `file:12:body` or `file-12-body`, never a mix.
+            // grep/ripgrep line numbers start at 1 and never carry a leading
+            // zero. A `0`-led run is a clock or date field (`12:00:01`,
+            // `2026-10-03 12:05:00`), not a line marker; accepting it would
+            // group the row under a made-up file and line number.
+            // Cost: `grep -b` without `-n` prints byte offset 0 for a file's
+            // first line; that one row is left unparsed.
             let closes = j > digits_start
+                && bytes[digits_start] != b'0'
                 && j < bytes.len()
                 && match tier {
                     ScanTier::Permissive => bytes[j] == b':' || bytes[j] == b'-',
@@ -1316,6 +1353,214 @@ logs/2026-05-04/app.log:7:ERROR bang";
         assert!(parse_line("src/file.py:-1:invalid").is_none());
         // Equivalent form with the dash adjacent to the dash separator.
         assert!(parse_line("src/file.py--1-invalid").is_none());
+    }
+
+    #[test]
+    fn the_selected_occurrence_is_emitted_not_its_twin() {
+        // A match row and a context row sharing number and content: keeping
+        // only the last row must emit the context row, not the match.
+        let c = SearchCompressor::new(SearchCompressorConfig {
+            always_keep_first: false,
+            always_keep_last: true,
+            max_matches_per_file: 1,
+            ..SearchCompressorConfig::default()
+        });
+        let mut stats = SearchCompressorStats::default();
+        let files = c.parse_search_results("a.py:12:x\na.py-12-x\n", &mut stats);
+        let mut files = files;
+        for fm in files.values_mut() {
+            for m in &mut fm.matches {
+                m.score = 0.5;
+            }
+        }
+        let picked = c.select_matches(&files, 1.0, &mut stats);
+        let rows: Vec<String> = picked["a.py"].matches.iter().map(|m| m.render()).collect();
+        assert_eq!(rows, vec!["a.py-12-x".to_string()]);
+    }
+
+    #[test]
+    fn indented_rows_split_at_the_real_marker_and_render_verbatim() {
+        let c = SearchCompressor::new(SearchCompressorConfig::default());
+        let mut stats = SearchCompressorStats::default();
+        let input =
+            "  logs/2026-12-13/app.log:12:ERROR one\n  src/my-2-x.py:12:y\nsrc/my-2-x.py:13:z\n";
+        let files = c.parse_search_results(input, &mut stats);
+        let log = &files["logs/2026-12-13/app.log"].matches[0];
+        assert_eq!((log.line_number, log.content.as_str()), (12, "ERROR one"));
+        assert_eq!(log.render(), "  logs/2026-12-13/app.log:12:ERROR one");
+        let py = &files["src/my-2-x.py"].matches;
+        assert_eq!(
+            py.len(),
+            2,
+            "indented and unindented rows share one file group"
+        );
+        assert_eq!(py[0].render(), "  src/my-2-x.py:12:y");
+        assert_eq!(py[1].render(), "src/my-2-x.py:13:z");
+    }
+
+    #[test]
+    fn rejects_zero_led_line_numbers() {
+        // Clock/date fields are `0`-padded; grep line numbers never are.
+        // Parsing `12:00:01` as file `12`, line `00` printed it back as
+        // `12:0:01`, silently rewriting the time.
+        for line in [
+            "12:00:01.123Z ERROR worker failed job 1",
+            "app|12:00:01|ERROR job 1 failed",
+            "2026-10-03 12:05:00 INFO step",
+            "<td>12:00:01</td><td>ERROR</td>",
+        ] {
+            if let Some(m) = parse_line(line) {
+                assert!(
+                    !m.0.bytes().all(|b| b.is_ascii_digit()) || m.1 >= 10,
+                    "{line:?} parsed a clock field as a line number: {m:?}"
+                );
+            }
+        }
+        assert!(parse_line("src/a.py:012:x").is_none());
+        // Real rows still parse, including one whose content is a time.
+        let m = parse_line("src/a.py:12:12:00:01 is noon").unwrap();
+        assert_eq!(
+            (m.0.as_str(), m.1, m.2.as_str()),
+            ("src/a.py", 12, "12:00:01 is noon")
+        );
+        assert_eq!(parse_line("src/a.py:120:x").unwrap().1, 120);
+    }
+
+    #[test]
+    fn compress_output_rows_are_verbatim_and_in_input_order() {
+        // Through `compress` in both layouts: every kept row is one of the
+        // input lines unchanged, kept rows keep their input order (rows
+        // sharing a number included), and the old renderers would fail.
+        let mut lines: Vec<String> = Vec::new();
+        for i in 1..60 {
+            // trailing spaces on some rows: kept rows must keep them
+            let pad = "  ";
+            lines.push(format!("src/a.py:{i}:def f{i}(): pass{pad}"));
+            lines.push(format!("src/a.py-{}-ctx {i}", i + 100));
+        }
+        for s in 1..60 {
+            let svc = ["api", "db", "web"][s % 3];
+            lines.push(format!("{svc}:12:{:02}:{:02} job {s} done", s / 60, s % 60));
+        }
+        lines.push("2026-10-03 12:05:00 INFO step".into());
+        let content = lines.join("\n");
+        let pos = |l: &str| lines.iter().position(|x| x == l);
+        for grouped in [false, true] {
+            let cfg = SearchCompressorConfig {
+                group_by_file: grouped,
+                ..SearchCompressorConfig::default()
+            };
+            let (r, _) = SearchCompressor::new(cfg).compress(&content, "", 1.0);
+            let mut heading = String::new();
+            // Rows keep input order per file; files keep first-appearance order.
+            let mut last: BTreeMap<String, usize> = BTreeMap::new();
+            let mut files_seen: Vec<String> = Vec::new();
+            let mut kept = 0;
+            // Grouped: a heading is the first line or follows a blank line.
+            let mut at_heading = true;
+            for row in r.compressed.lines() {
+                if row.is_empty() {
+                    at_heading = true;
+                    continue;
+                }
+                if row.starts_with('[') {
+                    continue;
+                }
+                let full = if grouped && at_heading {
+                    heading = row.to_string();
+                    at_heading = false;
+                    continue;
+                } else if grouped {
+                    // The heading drops the marker's leading separator.
+                    [':', '-']
+                        .iter()
+                        .map(|s| format!("{heading}{s}{row}"))
+                        .find(|f| pos(f).is_some())
+                        .unwrap_or_else(|| format!("{heading}?{row}"))
+                } else {
+                    row.to_string()
+                };
+                let p = pos(&full)
+                    .unwrap_or_else(|| panic!("grouped={grouped}: {full:?} is not an input line"));
+                let file = parse_match_line(&full).unwrap().0.to_string();
+                if !files_seen.contains(&file) {
+                    files_seen.push(file.clone());
+                }
+                if let Some(l) = last.insert(file, p) {
+                    assert!(l < p, "grouped={grouped}: {full:?} out of input order");
+                }
+                kept += 1;
+            }
+            assert!(kept > 10, "grouped={grouped}: only {kept} rows kept");
+            let first_at = |f: &String| {
+                lines
+                    .iter()
+                    .position(|l| parse_match_line(l).unwrap().0 == f)
+            };
+            let mut sorted_files = files_seen.clone();
+            sorted_files.sort_by_key(first_at);
+            assert_eq!(
+                files_seen, sorted_files,
+                "grouped={grouped}: files out of input order"
+            );
+            assert!(r.compressed.contains("pass  "), "trailing spaces lost");
+            assert!(
+                r.compressed.contains("-ctx "),
+                "a context row should survive"
+            );
+        }
+    }
+
+    #[test]
+    fn max_files_keeps_the_earliest_files_on_equal_scores() {
+        // Key order (`pkg10` < `pkg2`) used to decide which tied files the
+        // `max_files` cap dropped; it is the first files in the input now.
+        let content: String = (0..20)
+            .map(|i| format!("pkg{i}/mod.py:7:value = {i}\n"))
+            .collect();
+        let cfg = SearchCompressorConfig {
+            max_files: 5,
+            ..SearchCompressorConfig::default()
+        };
+        let (r, _) = SearchCompressor::new(cfg).compress(&content, "", 1.0);
+        let kept: Vec<&str> = r
+            .compressed
+            .lines()
+            .filter_map(|l| parse_match_line(l).map(|m| m.0))
+            .collect();
+        assert_eq!(
+            kept,
+            [
+                "pkg0/mod.py",
+                "pkg1/mod.py",
+                "pkg2/mod.py",
+                "pkg3/mod.py",
+                "pkg4/mod.py"
+            ]
+        );
+    }
+
+    #[test]
+    fn rendering_reproduces_each_parsed_line_byte_for_byte() {
+        // Output used to be re-assembled as `file:N:content`, turning a
+        // context line into a match line and a date into `2026:10:03`.
+        let content = "src/a.py:12:match\nsrc/a.py-13-context\n2026-10-03 12:05:00 INFO step\nC:\\x\\b.rs:7:win";
+        let compressor = SearchCompressor::new(SearchCompressorConfig::default());
+        let mut stats = SearchCompressorStats::default();
+        let parsed = compressor.parse_search_results(content, &mut stats);
+        let mut rendered: Vec<String> = parsed
+            .values()
+            .flat_map(|fm| fm.matches.iter().map(|m| m.render()))
+            .collect();
+        let mut want: Vec<&str> = content.split('\n').collect();
+        rendered.sort();
+        want.sort();
+        assert_eq!(rendered, want);
+        let a = &parsed["src/a.py"].matches;
+        assert_eq!(
+            format!("{}{}", &a[1].marker[1..], a[1].content),
+            "13-context"
+        );
     }
 
     #[test]
