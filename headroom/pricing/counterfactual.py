@@ -422,6 +422,7 @@ def resolve_rates(
         resolved_model = resolve_litellm_model(model)
         info = litellm.model_cost.get(resolved_model, {}) or {}
     except Exception:
+        logger.debug("counterfactual: LiteLLM catalog lookup failed for %s", model, exc_info=True)
         return None
 
     base = info.get("input_cost_per_token")

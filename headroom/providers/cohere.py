@@ -284,8 +284,8 @@ class CohereProvider(Provider):
                         result = info["max_tokens"]
                         if result is not None:
                             return int(result)
-                except Exception:
-                    pass
+                except Exception as e:
+                    logger.debug(f"LiteLLM get_model_info failed for {model_variant}: {e}")
 
         # Fallback to built-in limits
         model_lower = model.lower()

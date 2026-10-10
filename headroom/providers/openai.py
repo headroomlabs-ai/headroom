@@ -603,8 +603,8 @@ class OpenAIProvider(Provider):
                     max_tokens = info["max_input_tokens"]
                     if max_tokens is not None:
                         return int(max_tokens)
-            except Exception:
-                pass
+            except Exception as e:
+                logger.debug(f"LiteLLM get_model_info failed for {model}: {e}")
 
         # Fall back to hardcoded
         return self._get_context_limit_manual(model)
