@@ -1770,7 +1770,7 @@ requires-dist = [
     { name = "datasets", marker = "extra == 'voice-train'", specifier = ">=5.0.1" },
     { name = "fastapi", marker = "extra == 'dev'", specifier = ">=0.100.0" },
     { name = "fastapi", marker = "extra == 'proxy'", specifier = ">=0.100.0" },
-    { name = "fastembed", marker = "(python_full_version < '3.14' and extra == 'relevance') or (platform_machine != 'x86_64' and extra == 'relevance') or (sys_platform != 'darwin' and extra == 'relevance')", specifier = ">=0.4.0" },
+    { name = "fastembed", marker = "(python_full_version < '3.14' and extra == 'relevance') or (platform_machine != 'x86_64' and extra == 'relevance') or (sys_platform != 'darwin' and extra == 'relevance')", specifier = ">=0.6.0" },
     { name = "gunicorn", marker = "sys_platform != 'win32' and extra == 'proxy-prod'", specifier = ">=21.0.0" },
     { name = "headroom-ai", extras = ["proxy"], marker = "extra == 'proxy-prod'" },
     { name = "headroom-ai", extras = ["proxy", "code", "ml", "memory", "relevance", "image", "reports", "otel", "evals", "voice", "html", "mcp", "spreadsheet"], marker = "extra == 'all'" },

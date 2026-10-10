@@ -627,13 +627,16 @@ fn hf_cache_file(repo: &str, rel: &[&str]) -> Option<PathBuf> {
     None
 }
 
-/// HuggingFace hub cache roots in resolution precedence. Cross-platform so
-/// the cache-only loader works on Windows (native `headroom-proxy.exe`) as
-/// well as Linux: `HF_HUB_CACHE` (the hub dir directly) → `HF_HOME/hub` →
-/// `{HOME|USERPROFILE}/.cache/huggingface/hub`. `HOME` is the unix home; on
-/// Windows the process sees `USERPROFILE` (and often no `HOME`), so both are
-/// tried. Honoring `HF_HOME` also lets a Windows proxy point at a WSL cache.
-fn hf_hub_roots() -> Vec<PathBuf> {
+/// HuggingFace hub cache roots in resolution precedence, the same order
+/// Python's `huggingface_hub` resolves its cache in, so a cache Python seeded
+/// is found here. Cross-platform so the cache-only loader works on Windows
+/// (native `headroom-proxy.exe`) as well as Linux: `HF_HUB_CACHE` (the hub
+/// dir directly) → `HUGGINGFACE_HUB_CACHE` (its legacy name) → `HF_HOME/hub`
+/// → `XDG_CACHE_HOME/huggingface/hub` → `{HOME|USERPROFILE}/.cache/huggingface/hub`.
+/// `HOME` is the unix home; on Windows the process sees `USERPROFILE` (and
+/// often no `HOME`), so both are tried. Honoring `HF_HOME` also lets a
+/// Windows proxy point at a WSL cache.
+pub(crate) fn hf_hub_roots() -> Vec<PathBuf> {
     let mut roots = Vec::new();
     let push_env = |roots: &mut Vec<PathBuf>, var: &str, suffix: &[&str]| {
         if let Ok(v) = std::env::var(var) {
@@ -647,7 +650,9 @@ fn hf_hub_roots() -> Vec<PathBuf> {
         }
     };
     push_env(&mut roots, "HF_HUB_CACHE", &[]);
+    push_env(&mut roots, "HUGGINGFACE_HUB_CACHE", &[]);
     push_env(&mut roots, "HF_HOME", &["hub"]);
+    push_env(&mut roots, "XDG_CACHE_HOME", &["huggingface", "hub"]);
     push_env(&mut roots, "HOME", &[".cache", "huggingface", "hub"]);
     push_env(&mut roots, "USERPROFILE", &[".cache", "huggingface", "hub"]);
     roots
