@@ -553,7 +553,7 @@ mod tests {
     #[test]
     fn string_array_dedup_count_appears_in_strategy() {
         // Lots of duplicates that survive stride sampling get deduped.
-        let items: Vec<&str> = std::iter::repeat("dup").take(50).collect();
+        let items: Vec<&str> = std::iter::repeat_n("dup", 50).collect();
         let (_out, strat) = crush_string_array(&items, &cfg(), 1.0);
         // 50 identical items: unique-by-simhash = 1, fast-path returns 3.
         // So k_total=3. Stride loop runs but every item is "dup" already

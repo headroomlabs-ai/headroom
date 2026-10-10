@@ -47,8 +47,8 @@ if [ "$need_install" = "1" ]; then
   echo "▶ installing pip+maturin, then headroom-ai[sandbox] + license + 5 plugins (editable)…"
   "$PY" -m pip install -U pip maturin
   # litellm >=1.92 ships an sdist-only Rust bridge whose AWS-SDK crates need rustc>=1.94.1;
-  # the default rustup toolchain here is older (pip builds litellm in a temp dir that misses
-  # the repo's 1.95 pin), so pin to the last pure-Python wheel line (1.91.4). Satisfies
+  # the default rustup toolchain here is pinned to the repo's 1.98.1, so pin to the last
+  # pure-Python wheel line (1.91.4). Satisfies
   # headroom's litellm>=1.86.2,<2.0 and skips the Rust build entirely.
   "$PY" -m pip install "litellm<1.92"
   "$PY" -m pip install -e "${HR}[sandbox]" "litellm<1.92"
