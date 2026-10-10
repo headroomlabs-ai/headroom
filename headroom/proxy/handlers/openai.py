@@ -712,6 +712,32 @@ def _openai_responses_result_with_cache_hit(result: Any) -> Any:
     return replace(result, router_result=replace(router_result, cache_hit=True))
 
 
+def _openai_responses_cached_ccr_markers_live(result: Any) -> bool:
+    """Return whether every CCR marker in a cached unit result is still retrievable.
+
+    The unit-result cache outlives CCR entries: it has no TTL, while a CCR entry
+    expires after the CCR TTL and is written only when the unit is compressed.
+    Reusing a cached result after its entry expired ships a marker the model can
+    never redeem. Such a result is treated as a miss, so the unit is compressed
+    again and its entry stored again. A store that cannot be consulted keeps the
+    previous behaviour (reuse).
+    """
+    compressed = getattr(result, "compressed", None)
+    if not isinstance(compressed, str):
+        return True
+    hashes = {match.group(1).lower() for match in _CCR_HASH_RE.finditer(compressed)}
+    if not hashes:
+        return True
+    try:
+        from headroom.cache.compression_store import get_compression_store
+
+        store = get_compression_store()
+        return all(store.exists(hash_key) for hash_key in hashes)
+    except Exception:
+        logger.debug("CCR liveness check for a cached Responses unit failed", exc_info=True)
+        return True
+
+
 def _codex_ws_text_shape(text: str) -> str:
     stripped = text.strip()
     if not stripped:
@@ -1735,6 +1761,11 @@ class OpenAIHandlerMixin:
             if result is None:
                 return None
             cache.move_to_end(key)
+        if not _openai_responses_cached_ccr_markers_live(result):
+            with lock:
+                if cache.get(key) is result:
+                    del cache[key]
+            return None
         return _openai_responses_result_with_cache_hit(result)
 
     def _store_openai_responses_cached_unit(self, key: str, result: Any) -> None:
