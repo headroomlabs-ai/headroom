@@ -236,6 +236,9 @@ async def test_backend_failures_warn_without_exception_text(
         logger.setLevel(previous)
 
     assert not result
+    # No level may carry the exception text, rendered as a handler would.
+    for record in records:
+        assert "secret" not in logging.Formatter().format(record)
     warnings = [r for r in records if r.levelname == "WARNING"]
     if warns:
         assert len(warnings) == 1

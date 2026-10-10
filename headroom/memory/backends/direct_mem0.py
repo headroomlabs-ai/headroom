@@ -57,11 +57,11 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any
 
+from headroom.log_safety import describe_exception, safe_id
 from headroom.memory import qdrant_env
 from headroom.memory.models import Memory
 from headroom.memory.ports import MemorySearchResult
 from headroom.offline import guard_egress
-from headroom.utils import log_safe_id
 
 logger = logging.getLogger(__name__)
 
@@ -930,19 +930,19 @@ class DirectMem0Adapter:
             if isinstance(e, ValueError) and str(e).startswith(
                 f"Memory with id {memory_id} not found"
             ):
-                logger.debug(
-                    "DirectMem0: delete_memory(%s): memory not found", log_safe_id(memory_id)
-                )
+                logger.debug("DirectMem0: delete_memory(%s): memory not found", safe_id(memory_id))
                 return False
             # Backend exception text can carry stored memory or connection details,
-            # so only its type goes to WARNING; the detail is DEBUG-only.
+            # so no level logs its message; DEBUG gets describe_exception.
             logger.warning(
                 "DirectMem0: delete_memory(%s) failed (%s)",
-                log_safe_id(memory_id),
+                safe_id(memory_id),
                 type(e).__name__,
             )
             logger.debug(
-                "DirectMem0: delete_memory(%s) failure", log_safe_id(memory_id), exc_info=True
+                "DirectMem0: delete_memory(%s) failure: %s",
+                safe_id(memory_id),
+                describe_exception(e),
             )
             return False
 
@@ -973,10 +973,10 @@ class DirectMem0Adapter:
             )
         except Exception as e:
             logger.warning(
-                "DirectMem0: get_memory(%s) failed (%s)", log_safe_id(memory_id), type(e).__name__
+                "DirectMem0: get_memory(%s) failed (%s)", safe_id(memory_id), type(e).__name__
             )
             logger.debug(
-                "DirectMem0: get_memory(%s) failure", log_safe_id(memory_id), exc_info=True
+                "DirectMem0: get_memory(%s) failure: %s", safe_id(memory_id), describe_exception(e)
             )
             return None
 

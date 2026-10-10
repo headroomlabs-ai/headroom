@@ -26,19 +26,6 @@ def format_exception_message(exc: BaseException) -> str:
     return message or f"{type(exc).__name__} (no message)"
 
 
-def log_safe_id(value: object, limit: int = 80) -> str:
-    """Return a single-line, bounded form of an untrusted id for log messages.
-
-    Ids that come from the model (memory ids, CCR keys) can hold newlines or be
-    huge. ``repr`` escapes control characters; anything past ``limit`` characters
-    is cut and replaced with a ``…(+N chars)`` suffix.
-    """
-    text = repr(value)
-    if len(text) <= limit:
-        return text
-    return f"{text[:limit]}…(+{len(text) - limit} chars)"
-
-
 def compute_hash(data: str | bytes) -> str:
     """Compute SHA256 hash, returning hex string."""
     if isinstance(data, str):

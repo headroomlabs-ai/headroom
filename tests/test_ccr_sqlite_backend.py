@@ -321,8 +321,9 @@ class TestSQLiteBackend:
         finally:
             logger.removeHandler(handler)
 
-    def test_unreadable_report_set_clears_when_full(self, db_path, monkeypatch):
-        """Past the cap the once-per-hash set resets, so new bad rows still warn."""
+    def test_repeated_scans_over_the_cap_stay_bounded(self, db_path, monkeypatch):
+        """More bad rows than the cap, scanned twice: at most cap row warnings plus
+        one overflow warning in total, and the rows stay in place and still miss."""
         import headroom.cache.backends.sqlite as sqlite_mod
 
         monkeypatch.setattr(sqlite_mod, "_MAX_REPORTED_UNREADABLE", 2)
@@ -335,23 +336,30 @@ class TestSQLiteBackend:
         handler = _Collect(level=logging.DEBUG)
         logger = logging.getLogger("headroom.cache.backends.sqlite")
         logger.addHandler(handler)
+        keys = [f"bad{i}" for i in range(5)]
         try:
             b = SQLiteBackend(db_path)
             with b._lock:
-                for key in ("bad1", "bad2", "bad3"):
+                for key in keys:
                     b._conn.execute(
                         "INSERT OR REPLACE INTO ccr_entries "
                         "(hash, entry_json, created_at, ttl) VALUES (?, ?, ?, ?)",
                         (key, "{not json", time.time(), 1800),
                     )
                 b._conn.commit()
-            for key in ("bad1", "bad2", "bad3"):
-                assert b.get(key) is None
-            warned = [r.getMessage() for r in records if "unreadable" in r.getMessage()]
-            assert [m.split()[3] for m in warned] == ["'bad1'", "'bad2'", "'bad3'"]
-            assert all("JSONDecodeError" in m for m in warned)
+            assert b.items() == []
+            assert b.items() == []
+            assert b.get("bad4") is None
+            assert b.count() == len(keys)
         finally:
             logger.removeHandler(handler)
+
+        warnings = [r.getMessage() for r in records if r.levelno == logging.WARNING]
+        row_warnings = [m for m in warnings if "is unreadable" in m]
+        assert len(row_warnings) == 2
+        assert all("JSONDecodeError" in m for m in row_warnings)
+        assert len([m for m in warnings if "More than 2 distinct" in m]) == 1
+        assert len(warnings) == 3
 
     def test_store_ttl_enforcement_via_compression_store(self, db_path):
         """TTL checks stay in CompressionStore; expired entries miss."""

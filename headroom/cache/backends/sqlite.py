@@ -29,7 +29,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from ...fileperms import ensure_private_file
-from ...utils import log_safe_id
+from ...log_safety import WarnOnce, safe_id
 
 if TYPE_CHECKING:
     from ..compression_store import CompressionEntry
@@ -52,9 +52,8 @@ DROP INDEX IF EXISTS idx_ccr_expiry;
 # Purge expired rows at most this often (seconds). Purging is hygiene,
 # not correctness — CompressionStore checks TTL on every get().
 _PURGE_INTERVAL = 60.0
-# items() decodes every row on each eviction pass, so an unreadable row is
-# reported once per hash rather than on every request. The set is cleared when
-# full, so a long-running proxy keeps reporting new bad rows.
+# items() decodes every row on each eviction pass, so an unreadable row warns
+# once per hash, for at most this many hashes; further ones log at debug only.
 _MAX_REPORTED_UNREADABLE = 1000
 
 
@@ -88,7 +87,9 @@ class SQLiteBackend:
         self._path.parent.mkdir(parents=True, exist_ok=True)
         self._lock = threading.Lock()
         self._last_purge = 0.0
-        self._reported_unreadable: set[str] = set()
+        self._unreadable_warned = WarnOnce(
+            _MAX_REPORTED_UNREADABLE, "unreadable CCR SQLite entries"
+        )
         self._conn = self._open()
 
     @staticmethod
@@ -169,18 +170,17 @@ class SQLiteBackend:
         except Exception:  # noqa: BLE001 - best-effort close on corrupt handle
             pass
         self._path.unlink(missing_ok=True)
-        self._reported_unreadable.clear()
+        self._unreadable_warned = WarnOnce(
+            _MAX_REPORTED_UNREADABLE, "unreadable CCR SQLite entries"
+        )
         self._conn = self._open()
 
     def _report_unreadable(self, hash_key: str, reason: object) -> None:
-        if hash_key in self._reported_unreadable or not logger.isEnabledFor(logging.WARNING):
-            return
-        if len(self._reported_unreadable) >= _MAX_REPORTED_UNREADABLE:
-            self._reported_unreadable.clear()
-        self._reported_unreadable.add(hash_key)
-        logger.warning(
+        first = self._unreadable_warned.first(hash_key, logger)
+        logger.log(
+            logging.WARNING if first else logging.DEBUG,
             "CCR SQLite entry %s in %s is unreadable (%s); treating as a miss",
-            log_safe_id(hash_key),
+            safe_id(hash_key),
             self._path,
             reason,
         )
@@ -242,7 +242,7 @@ class SQLiteBackend:
                     (hash_key,),
                 ).fetchone()
             except sqlite3.DatabaseError as e:
-                self._handle_db_error(e, f"get {log_safe_id(hash_key)}")
+                self._handle_db_error(e, f"get {safe_id(hash_key)}")
                 return None
         if row is None:
             return None
@@ -260,7 +260,7 @@ class SQLiteBackend:
                 self._conn.commit()
                 self._maybe_purge()
             except sqlite3.DatabaseError as e:
-                self._handle_db_error(e, f"set {log_safe_id(hash_key)}")
+                self._handle_db_error(e, f"set {safe_id(hash_key)}")
 
     def delete(self, hash_key: str) -> bool:
         with self._lock:
@@ -272,7 +272,7 @@ class SQLiteBackend:
                 self._conn.commit()
                 return cur.rowcount > 0
             except sqlite3.DatabaseError as e:
-                self._handle_db_error(e, f"delete {log_safe_id(hash_key)}")
+                self._handle_db_error(e, f"delete {safe_id(hash_key)}")
                 return False
 
     def exists(self, hash_key: str) -> bool:
@@ -283,7 +283,7 @@ class SQLiteBackend:
                     (hash_key,),
                 ).fetchone()
             except sqlite3.DatabaseError as e:
-                self._handle_db_error(e, f"exists {log_safe_id(hash_key)}")
+                self._handle_db_error(e, f"exists {safe_id(hash_key)}")
                 return False
         return row is not None
 

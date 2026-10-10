@@ -3,6 +3,8 @@
 import logging
 import os
 
+from headroom.log_safety import describe_exception
+
 from .base import Storage
 from .jsonl import JSONLStorage
 from .sqlite import SQLiteStorage
@@ -74,13 +76,13 @@ def create_storage(store_url: str) -> Storage:
                 )
             except Exception as e:
                 # The plugin's exception can echo the store URL, credentials included,
-                # so only its type goes to WARNING; the traceback is DEBUG-only.
+                # so no level logs its message; DEBUG gets describe_exception (types and frames).
                 logger.warning(
                     "Failed to load storage backend for scheme %r (%s); "
                     "falling back to SQLite storage",
                     scheme,
                     type(e).__name__,
                 )
-                logger.debug("Storage backend %r load failure", scheme, exc_info=True)
+                logger.debug("Storage backend %r load failure: %s", scheme, describe_exception(e))
         # Default to SQLite (legacy behavior)
         return SQLiteStorage(store_url)

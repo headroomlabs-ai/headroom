@@ -226,7 +226,7 @@ def test_create_storage_warns_when_a_backend_plugin_fails_to_load(
     assert any("'other'" in w for w in _fallback_warnings(storage_log))
 
     def _rejecting_factory(url: str) -> DummyStorage:
-        raise ValueError(f"cannot connect to {url}")
+        raise ValueError(f"cannot connect to {url} while storing CONTENT_CANARY")
 
     monkeypatch.setattr(
         "importlib.metadata.entry_points",
@@ -239,6 +239,14 @@ def test_create_storage_warns_when_a_backend_plugin_fails_to_load(
     assert "ValueError" in warning_records[0].getMessage()
     assert "secret" not in warning_records[0].getMessage()
     assert warning_records[0].exc_info is None
+    # Every level, rendered the way a log handler would (exc_info included).
+    assert storage_log.records
+    for record in storage_log.records:
+        rendered = logging.Formatter().format(record)
+        assert "secret" not in rendered
+        assert "CONTENT_CANARY" not in rendered
+    debug = [r for r in storage_log.records if r.levelno == logging.DEBUG]
+    assert debug and "ValueError" in logging.Formatter().format(debug[0])
 
     storage_log.records.clear()
     create_storage("metrics.db")
