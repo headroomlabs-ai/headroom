@@ -1841,3 +1841,262 @@ def test_ensure_proxy_recovered_feature_restart_failure_raises(monkeypatch) -> N
 
     with pytest.raises(click.ClickException, match="could not be restarted"):
         wrap_cli._ensure_proxy(8787, False, memory=True)
+
+
+# ---------------------------------------------------------------------------
+# Shared-proxy ownership contract: the Copilot credential is routing identity
+# ---------------------------------------------------------------------------
+
+_COPILOT_HOST = "https://api.githubcopilot.com"
+
+
+def _seeded_health(*, fingerprint: str | None, anthropic_api_url: str | None = _COPILOT_HOST):
+    config: dict[str, object] = {
+        "pid": 12345,
+        "memory": False,
+        "learn": False,
+        "code_graph": False,
+        "openai_api_url": _COPILOT_HOST,
+        "anthropic_api_url": anthropic_api_url,
+    }
+    if fingerprint is not None:
+        config["copilot_token_fingerprint"] = fingerprint
+    return {
+        "version": wrap_cli._HEADROOM_VERSION,
+        "runtime": {"websocket_sessions": {"active_sessions": 0, "active_relay_tasks": 0}},
+        "config": config,
+    }
+
+
+def _drive_running_proxy(monkeypatch, health, *, attached: list[int], calls: list[object]):
+    monkeypatch.setattr(wrap_cli, "_find_persistent_manifest", lambda port: None)
+    monkeypatch.setattr(wrap_cli, "_check_proxy", lambda port: True)
+    monkeypatch.setattr(wrap_cli, "_query_proxy_health", lambda port: health)
+    monkeypatch.setattr(wrap_cli, "_live_proxy_clients", lambda *a, **kw: list(attached))
+    monkeypatch.setattr(wrap_cli, "_port_bind_error", lambda port: None)
+    monkeypatch.setattr(
+        wrap_cli,
+        "_find_available_port",
+        lambda start_port, **kw: (
+            calls.append(("find_port", start_port)) or (start_port if not attached else 8799)
+        ),
+    )
+    monkeypatch.setattr(
+        wrap_cli,
+        "_kill_proxy_by_pid",
+        lambda pid, port: calls.append(("kill", pid, port)) or True,
+    )
+    monkeypatch.setattr(
+        wrap_cli,
+        "_start_proxy",
+        lambda *args, **kwargs: calls.append(("start", args, kwargs)),
+    )
+
+
+def test_proxy_routing_mismatches_flags_copilot_credential(monkeypatch) -> None:
+    from headroom.copilot_auth import token_fingerprint
+
+    check = wrap_cli._proxy_routing_mismatches
+    mine, theirs = token_fingerprint("gho_me"), token_fingerprint("gho_other")
+
+    # Seeded proxy, unseeded session: never compatible.
+    assert check(
+        {"copilot_token_fingerprint": mine}, backend=None, requested_copilot_fingerprint=None
+    ) == ["copilot_credential"]
+    # Unseeded (or unknown) proxy, seeded session: unknown counts as different.
+    assert check({}, backend=None, requested_copilot_fingerprint=mine) == ["copilot_credential"]
+    # Same account on both sides: compatible.
+    assert (
+        check({"copilot_token_fingerprint": mine}, backend=None, requested_copilot_fingerprint=mine)
+        == []
+    )
+    # Different accounts: never compatible.
+    assert check(
+        {"copilot_token_fingerprint": theirs}, backend=None, requested_copilot_fingerprint=mine
+    ) == ["copilot_credential"]
+    # Neither side seeded (absent key or explicit None): compatible.
+    assert check({}, backend=None) == []
+    assert check({"copilot_token_fingerprint": None}, backend=None) == []
+    assert check({"copilot_seeded": False}, backend=None) == []
+    # Seeded with an API token alone has no fingerprint, but it is still not
+    # an unseeded proxy.
+    assert check({"copilot_seeded": True}, backend=None) == ["copilot_credential"]
+    assert (
+        check(
+            {"copilot_seeded": True, "copilot_token_fingerprint": mine},
+            backend=None,
+            requested_copilot_fingerprint=mine,
+            requested_copilot_seeded=True,
+        )
+        == []
+    )
+
+
+def test_ensure_proxy_shares_proxy_seeded_with_the_same_account(monkeypatch) -> None:
+    """`wrap copilot --native` and `wrap vscode-chat` of one account share one proxy."""
+    from headroom.copilot_auth import token_fingerprint
+
+    calls: list[object] = []
+    health = _seeded_health(fingerprint=token_fingerprint("gho_me"))
+    _drive_running_proxy(monkeypatch, health, attached=[], calls=calls)
+
+    proc, actual_port = wrap_cli._ensure_proxy(
+        8787,
+        False,
+        openai_api_url=_COPILOT_HOST,
+        anthropic_api_url=_COPILOT_HOST,
+        copilot_api_token="tid-session-token",
+        copilot_refresh_oauth_token="gho_me",
+    )
+
+    assert (proc, actual_port) == (None, 8787)
+    assert calls == [], "a proxy already serving this account must be reused as-is"
+
+
+def test_ensure_proxy_same_account_but_different_routing_isolates_when_attached(
+    monkeypatch,
+) -> None:
+    from headroom.copilot_auth import token_fingerprint
+
+    calls: list[object] = []
+    health = _seeded_health(fingerprint=token_fingerprint("gho_me"), anthropic_api_url=None)
+    _drive_running_proxy(monkeypatch, health, attached=[999], calls=calls)
+
+    proc, actual_port = wrap_cli._ensure_proxy(
+        8787,
+        False,
+        openai_api_url=_COPILOT_HOST,
+        anthropic_api_url=_COPILOT_HOST,
+        copilot_api_token="tid-session-token",
+        copilot_refresh_oauth_token="gho_me",
+    )
+
+    assert actual_port == 8799
+    assert not [c for c in calls if c[0] == "kill"], "an attached proxy must never be killed"
+    start = next(c for c in calls if c[0] == "start")
+    assert start[1][0] == 8799
+    assert start[2]["copilot_refresh_oauth_token"] == "gho_me"
+
+
+def test_ensure_proxy_same_account_but_different_routing_restarts_when_idle(
+    monkeypatch,
+) -> None:
+    from headroom.copilot_auth import token_fingerprint
+
+    calls: list[object] = []
+    health = _seeded_health(fingerprint=token_fingerprint("gho_me"), anthropic_api_url=None)
+    _drive_running_proxy(monkeypatch, health, attached=[], calls=calls)
+
+    proc, actual_port = wrap_cli._ensure_proxy(
+        8787,
+        False,
+        openai_api_url=_COPILOT_HOST,
+        anthropic_api_url=_COPILOT_HOST,
+        copilot_api_token="tid-session-token",
+        copilot_refresh_oauth_token="gho_me",
+    )
+
+    assert actual_port == 8787
+    assert ("kill", 12345, 8787) in calls
+    start = next(c for c in calls if c[0] == "start")
+    assert start[1][0] == 8787
+    assert start[2]["anthropic_api_url"] == _COPILOT_HOST
+    assert start[2]["copilot_refresh_oauth_token"] == "gho_me"
+
+
+def test_ensure_proxy_different_account_seed_never_shares_or_kills(monkeypatch) -> None:
+    from headroom.copilot_auth import token_fingerprint
+
+    calls: list[object] = []
+    health = _seeded_health(fingerprint=token_fingerprint("gho_other"))
+    _drive_running_proxy(monkeypatch, health, attached=[], calls=calls)
+
+    proc, actual_port = wrap_cli._ensure_proxy(
+        8787,
+        False,
+        openai_api_url=_COPILOT_HOST,
+        anthropic_api_url=_COPILOT_HOST,
+        copilot_api_token="tid-session-token",
+        copilot_refresh_oauth_token="gho_me",
+    )
+
+    assert calls[0] == ("find_port", 8788), "a seeded session must not claim the shared port"
+    assert not [c for c in calls if c[0] == "kill"]
+    start = next(c for c in calls if c[0] == "start")
+    assert start[1][0] == 8788 == actual_port
+    assert start[2]["copilot_refresh_oauth_token"] == "gho_me"
+
+
+@pytest.mark.parametrize("attached", [[999], []], ids=["attached", "idle"])
+def test_ensure_proxy_unseeded_session_never_reuses_a_seeded_proxy(
+    monkeypatch, attached: list[int]
+) -> None:
+    """Upstream URLs coincide on purpose: only the credential tells them apart."""
+    from headroom.copilot_auth import token_fingerprint
+
+    calls: list[object] = []
+    health = _seeded_health(fingerprint=token_fingerprint("gho_me"), anthropic_api_url=None)
+    _drive_running_proxy(monkeypatch, health, attached=attached, calls=calls)
+
+    proc, actual_port = wrap_cli._ensure_proxy(8787, False, openai_api_url=_COPILOT_HOST)
+
+    start = next(c for c in calls if c[0] == "start")
+    assert not start[2].get("copilot_api_token")
+    assert not start[2].get("copilot_refresh_oauth_token")
+    if attached:
+        assert actual_port == 8799
+        assert not [c for c in calls if c[0] == "kill"]
+    else:
+        assert actual_port == 8787
+        assert ("kill", 12345, 8787) in calls
+
+
+def test_ensure_proxy_unseeded_session_never_reuses_an_api_token_only_seed(monkeypatch) -> None:
+    """No fingerprint to compare, yet still credential-bearing: never shared."""
+    calls: list[object] = []
+    health = _seeded_health(fingerprint=None, anthropic_api_url=None)
+    health["config"]["copilot_seeded"] = True
+    _drive_running_proxy(monkeypatch, health, attached=[999], calls=calls)
+
+    proc, actual_port = wrap_cli._ensure_proxy(8787, False, openai_api_url=_COPILOT_HOST)
+
+    assert actual_port == 8799
+    assert not [c for c in calls if c[0] == "kill"]
+
+
+def test_ensure_proxy_unseeded_session_diverts_from_seeded_persistent_deployment(
+    monkeypatch,
+) -> None:
+    from headroom.copilot_auth import token_fingerprint
+
+    calls: list[object] = []
+    health = _seeded_health(fingerprint=token_fingerprint("gho_me"), anthropic_api_url=None)
+    monkeypatch.setattr(wrap_cli, "_find_persistent_manifest", lambda port: _Manifest())
+    monkeypatch.setattr("headroom.install.health.probe_ready", lambda url: True)
+    monkeypatch.setattr(wrap_cli, "_query_proxy_health", lambda port: health)
+    monkeypatch.setattr(wrap_cli, "_check_proxy", lambda port: True)
+    monkeypatch.setattr(
+        wrap_cli,
+        "_find_available_port",
+        lambda start_port, **kw: calls.append(("find_port", start_port)) or 8799,
+    )
+    for name in ("_kill_proxy_by_pid", "_restart_persistent_proxy"):
+        monkeypatch.setattr(
+            wrap_cli,
+            name,
+            lambda *a, _name=name, **k: (_ for _ in ()).throw(
+                AssertionError(f"{_name} must not touch the persistent deployment")
+            ),
+        )
+    monkeypatch.setattr(
+        wrap_cli,
+        "_start_proxy",
+        lambda *args, **kwargs: calls.append(("start", args, kwargs)),
+    )
+
+    proc, actual_port = wrap_cli._ensure_proxy(8787, False, openai_api_url=_COPILOT_HOST)
+
+    assert actual_port == 8799
+    assert calls[0] == ("find_port", 8787)
+    assert calls[1][0] == "start"
+    assert not calls[1][2].get("copilot_refresh_oauth_token")

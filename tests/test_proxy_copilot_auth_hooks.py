@@ -281,3 +281,53 @@ def test_openai_chat_routes_copilot_requests_per_model(monkeypatch: pytest.Monke
     assert gpt54_mini_url == "https://api.githubcopilot.com/responses"
     assert claude_url == "https://api.githubcopilot.com/chat/completions"
     assert openai_url == "https://api.openai.com/v1/chat/completions"
+
+
+def test_openai_responses_routes_copilot_requests_per_model(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Mirror image of the chat-completions case above (#1745 follow-up).
+
+    A Copilot session pins one wire API for the whole process based on the
+    *main* model. When the main model is a reasoning model (gpt-5.4), the CLI
+    sends every request -- including subagent requests for a non-reasoning
+    model such as a Claude model -- to ``/v1/responses``. Those must be
+    routed back to ``/chat/completions`` on GitHub's hosted API, since it
+    only serves gpt-5*/o1*/o3* via ``/responses``.
+    """
+    openai_mod = _load_handler_module(
+        monkeypatch,
+        "tests.headroom_proxy_handlers_openai",
+        "headroom/proxy/handlers/openai.py",
+    )
+
+    copilot_base = "https://api.githubcopilot.com"
+    gpt54_url = openai_mod.build_copilot_upstream_url(
+        copilot_base,
+        openai_mod._resolve_openai_handler_path(
+            {},
+            handler_path=openai_mod._resolve_openai_responses_handler_path(copilot_base, "gpt-5.4"),
+        ),
+    )
+    claude_subagent_url = openai_mod.build_copilot_upstream_url(
+        copilot_base,
+        openai_mod._resolve_openai_handler_path(
+            {},
+            handler_path=openai_mod._resolve_openai_responses_handler_path(
+                copilot_base, "claude-sonnet-4.6"
+            ),
+        ),
+    )
+    openai_url = openai_mod.build_copilot_upstream_url(
+        "https://api.openai.com",
+        openai_mod._resolve_openai_handler_path(
+            {},
+            handler_path=openai_mod._resolve_openai_responses_handler_path(
+                "https://api.openai.com", "claude-sonnet-4.6"
+            ),
+        ),
+    )
+
+    assert gpt54_url == "https://api.githubcopilot.com/responses"
+    assert claude_subagent_url == "https://api.githubcopilot.com/chat/completions"
+    assert openai_url == "https://api.openai.com/v1/responses"

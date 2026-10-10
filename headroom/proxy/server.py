@@ -3699,6 +3699,40 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
         app.state.previous_loop_exception_handler = previous_handler
         return previous_handler
 
+    def _copilot_seed_fingerprint() -> str | None:
+        """Non-secret digest identifying *whose* Copilot credential seeded this proxy.
+
+        Derived from the long-lived OAuth token, not the Copilot API token: the
+        latter is re-minted by every token exchange, so two wrap sessions for the
+        same account hold different API tokens and would look like different
+        users. The OAuth token is the durable identity.
+
+        Returns ``None`` when no OAuth seed was handed over, which callers must
+        treat as "unknown" -- never as "matches".
+        """
+        token = os.environ.get("GITHUB_COPILOT_REFRESH_OAUTH_TOKEN", "").strip()
+        if not token:
+            return None
+        try:
+            from headroom.copilot_auth import token_fingerprint
+
+            return token_fingerprint(token)
+        except Exception:  # noqa: BLE001 — health must never fail on this
+            return None
+
+    def _copilot_seeded() -> bool:
+        """Whether this proxy was handed a Copilot credential at launch.
+
+        Reported next to the fingerprint because a seed can be an API token
+        alone, which has no durable identity to digest. A wrapper must still
+        treat such a proxy as credential-bearing, never as unseeded. Checks
+        presence only; no credential value is read.
+        """
+        return any(
+            name in os.environ
+            for name in ("GITHUB_COPILOT_API_TOKEN", "GITHUB_COPILOT_REFRESH_OAUTH_TOKEN")
+        )
+
     def _health_payload(*, include_config: bool) -> dict[str, Any]:
         checks = _health_checks()
         # Kompress is an optional soft component: model downloads lazily on
@@ -3758,6 +3792,13 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
                 "gemini_api_url": config.gemini_api_url,
                 "cloudcode_api_url": config.cloudcode_api_url,
                 "vertex_api_url": config.vertex_api_url,
+                # Which Copilot credential this proxy was seeded with, as the
+                # same non-secret digest `headroom copilot-auth` already prints.
+                # A wrapper uses it to tell "already serving my account" from
+                # "serving someone else's": the first is safe to share, the
+                # second must never be. Absent when no seed was handed over.
+                "copilot_token_fingerprint": _copilot_seed_fingerprint(),
+                "copilot_seeded": _copilot_seeded(),
                 "savings_profile": config.savings_profile,
                 "target_ratio": effective_target_ratio,
                 "target_savings_percent": (

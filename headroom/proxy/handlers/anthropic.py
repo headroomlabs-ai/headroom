@@ -3232,6 +3232,14 @@ class AnthropicHandlerMixin:
             # Anthropic-compatible gateways reject that shape, so third-party routes
             # strip client-originated tool_search_tool_* entries above and skip
             # Headroom's own injector here.
+            #
+            # Pointing this wire at GitHub Copilot counts as custom, which is what
+            # `wrap copilot --native` and the VS Code CAPI redirect both do so that
+            # Claude models work there. Those requests still arrive as provider
+            # "anthropic", and before this guard existed the deferral fired against
+            # an API that does not implement it: VS Code Copilot Chat lost all ~200
+            # of its tools, because the core-tool allowlist is Claude Code's names
+            # and matches none of VS Code's.
             if (
                 provider_name == "anthropic"
                 and anthropic_first_party_tool_search_supported(_anthropic_target_base_url)
@@ -3927,6 +3935,59 @@ class AnthropicHandlerMixin:
                 request.url.path,
                 request.url.query,
             )
+
+            # Never answer an Anthropic-keyed client on someone's Copilot seat.
+            #
+            # One proxy has one default destination for this wire, so a proxy
+            # pinned at Copilot (what `wrap copilot --native` needs, and what the
+            # shared Copilot CLI + VS Code proxy uses) would send this client's
+            # request to GitHub. For a Copilot host the forwarder drops the
+            # client's `x-api-key` and substitutes the proxy's own Copilot token
+            # (`apply_copilot_api_auth`), so the request would be silently served
+            # on that credential instead of the Anthropic account the client
+            # chose. `wrap claude` pins its own upstream per request to avoid
+            # that; this is the backstop for anything that does not, so a
+            # dropped pin degrades to a clear local error.
+            #
+            # Scoped to Copilot hosts on purpose: an Anthropic-compatible
+            # gateway the user configured (LiteLLM, Foundry, an inherited
+            # ANTHROPIC_BASE_URL -- see #1358) is *meant* to receive that key.
+            # An Anthropic credential arrives either as `x-api-key` or as an
+            # `Authorization: Bearer sk-ant-...` (Claude Code's OAuth / API key).
+            # Copilot's own clients never send either -- they authenticate with a
+            # Copilot or GitHub bearer, and BYOK sessions with a placeholder the
+            # proxy replaces -- so this cannot fire on the traffic the pin exists for.
+            _inbound_authorization = str(headers.get("authorization") or "")
+            _auth_scheme, _, _auth_value = _inbound_authorization.partition(" ")
+            _anthropic_bearer = _auth_scheme.lower() == "bearer" and _auth_value.strip().startswith(
+                "sk-ant-"
+            )
+            if (
+                not upstream_base_url
+                and is_copilot_upstream_url(self.ANTHROPIC_API_URL)
+                and ((headers.get("x-api-key") and not _inbound_authorization) or _anthropic_bearer)
+            ):
+                logger.error(
+                    "Refusing to forward an Anthropic credential to Copilot upstream %s",
+                    self.ANTHROPIC_API_URL,
+                )
+                return JSONResponse(
+                    status_code=502,
+                    content={
+                        "type": "error",
+                        "error": {
+                            "type": "api_error",
+                            "message": (
+                                "This Headroom proxy's Anthropic upstream is "
+                                f"{self.ANTHROPIC_API_URL} (GitHub Copilot), so this request "
+                                "would be served on the proxy's Copilot credential instead of "
+                                "your Anthropic credential. Use a proxy "
+                                "port of your own, or send "
+                                "'X-Headroom-Base-Url: https://api.anthropic.com'."
+                            ),
+                        },
+                    },
+                )
 
             try:
                 ccr_handler_config = getattr(self.ccr_response_handler, "config", None)

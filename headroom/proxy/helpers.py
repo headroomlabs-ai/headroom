@@ -4555,6 +4555,12 @@ def strip_unsupported_ccr_retrieve_blocks(messages: Any, tools: Any) -> tuple[An
 _OPENAI_TOOL_SEARCH_TYPE = _RESPONSES_TOOL_SEARCH_TYPE
 _OPENAI_TOOL_SEARCH_MIN_TOOLS = 12
 _OPENAI_TOOL_SEARCH_RESIDENT_NAMES = frozenset({"terminal"})
+#: Namespaces the upstream reserves for its own built-in tool types. In
+#: namespaced-tools mode a user function may not occupy one, so a client that
+#: names a tool after a built-in makes the whole request invalid.
+_OPENAI_TOOL_SEARCH_RESERVED_NAMESPACES = frozenset(
+    {"file_search", "web_search", "web_search_preview", "code_interpreter", "computer", "image_gen"}
+)
 _OPENAI_TOOL_SEARCH_UNSUPPORTED_CLIENTS = frozenset({"codex", "opencode"})
 # gpt-5.4 is the first model with Responses tool_search (OpenAI docs). Version-
 # gated by default; overridable per deployment via a regex in
@@ -4633,6 +4639,26 @@ def inject_tool_search_deferral_openai(
         # a client that is already deferring suppresses ITS mechanism and
         # inlines the catalog we were trying to keep out.
         return tools
+
+    # Injecting the search tool switches the upstream into namespaced-tools mode
+    # for the WHOLE array, and there a function name is read as
+    # `namespace.function`: it may not contain a second "." and may not sit in a
+    # namespace reserved for a built-in tool type. VS Code Copilot Chat names
+    # tools `file_search.file_search`, which violates both, so the request is
+    # rejected outright -- 400, every tool lost, whether or not that particular
+    # tool was the one deferred.
+    #
+    # Leaving such a tool merely resident is not enough; the mode is what
+    # validates. So the whole optimisation is skipped when any name cannot be a
+    # namespace, which keeps the request byte-identical to what the client would
+    # have sent on its own. Losing some context saving is strictly better than
+    # losing the request.
+    for tool in tools:
+        if not isinstance(tool, dict) or tool.get("type") != "function":
+            continue
+        name = str(tool.get("name") or "")
+        if "." in name or name.lower() in _OPENAI_TOOL_SEARCH_RESERVED_NAMESPACES:
+            return tools
 
     out: list[Any] = [{"type": _OPENAI_TOOL_SEARCH_TYPE}]
     deferred = 0

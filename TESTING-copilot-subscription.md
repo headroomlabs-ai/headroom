@@ -54,6 +54,56 @@ the intended path is to resolve it from GitHub's token-exchange endpoint (the
 source the official Copilot client uses), and we'd want to validate it against a
 real enterprise tenant.
 
+## Model selection: one model per session (BYOK constraint)
+
+**`/models` inside a wrapped session lists only the model you launched with, and
+that is expected.** Headroom reaches into the request path through the Copilot
+CLI's BYOK provider override — its only interposition hook — and `copilot help
+providers` is explicit that BYOK *replaces* Copilot's own model routing and
+requires exactly one model:
+
+> A model is required for BYOK. Set `COPILOT_MODEL`, `COPILOT_PROVIDER_MODEL_ID`,
+> or `--model`.
+
+Every one of those variables is singular; there is no list form. The CLI also
+never asks the provider for a catalog (no `/v1/models` request reaches the proxy),
+so Headroom cannot populate the picker even by serving one.
+
+**Consequences:**
+
+- **Switching models means relaunching** with a different `--model`. Any model
+  your account is served works, and Headroom picks the correct wire API for it
+  from the provider's published endpoints (so `/responses`-only models such as
+  `mai-code-1-flash-picker` work as a main model, not just gpt-5.x).
+- **Subagents on other models do work.** The CLI sends a distinct model per
+  subagent request, and the proxy routes and body-bridges each one independently.
+  This is the mixed-model case Headroom fixes.
+- **Native `copilot` is unaffected** — its picker is fully populated. This
+  constraint applies only while routing through Headroom.
+
+### Finding out which models you can actually use
+
+```bash
+headroom models                  # everything this account is served
+headroom models --tier powerful  # the high-capability ones
+headroom models --json           # machine-readable, for agents and scripts
+```
+
+Read live from the provider, so it reflects entitlements rather than a
+hardcoded list.
+
+Because BYOK hides the model set from the agent, `wrap copilot` also writes that
+list into `.github/copilot-instructions.md` at launch (marker-guarded, refreshed
+each launch, removed by `unwrap copilot`, skip with `--no-model-list`). Without
+it, an agent asked to "use a different model" has nothing authoritative to
+consult and invents names — observed live reporting `claude-fable-5`,
+`claude-opus-4.8-fast` and `grok-4.5` as available, none of which are Copilot
+models.
+
+If you would like GitHub to support multiple BYOK models (a model list, or the
+CLI querying the provider's `/v1/models`), that is an upstream Copilot CLI
+feature request — it cannot be fixed from Headroom's side.
+
 ## Status
 
 | Platform | Mechanism (compress + forward) | Token **auto-discovery** from the OS secret store |
