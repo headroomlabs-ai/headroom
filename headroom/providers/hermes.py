@@ -20,12 +20,17 @@ _CLAUDE_TEXT_PART_TYPES = frozenset({"text"})
 _RESPONSES_TEXT_PART_TYPES = frozenset({"text", "input_text", "output_text"})
 _CODEX_RESPONSES_SUFFIX = "/v1/responses"
 _CLAUDE_MESSAGES_SUFFIX = "/v1/messages"
+# Hermes Studio's scoped proxy prefixes. They live under `/api/`, so a
+# Factory-mode proxy must keep every path below them on the normal catch-all.
+CODEX_PROXY_PREFIX = "/api/codex-proxy/"
+CLAUDE_CODE_PROXY_PREFIX = "/api/claude-code-proxy/"
+SCOPED_PATH_PREFIXES = (CODEX_PROXY_PREFIX, CLAUDE_CODE_PROXY_PREFIX)
 
 
 def is_scoped_coding_agent_path(path: str) -> bool:
     """Return whether *path* is a Hermes scoped coding-agent endpoint."""
-    return (path.startswith("/api/codex-proxy/") and path.endswith(_CODEX_RESPONSES_SUFFIX)) or (
-        path.startswith("/api/claude-code-proxy/") and path.endswith(_CLAUDE_MESSAGES_SUFFIX)
+    return (path.startswith(CODEX_PROXY_PREFIX) and path.endswith(_CODEX_RESPONSES_SUFFIX)) or (
+        path.startswith(CLAUDE_CODE_PROXY_PREFIX) and path.endswith(_CLAUDE_MESSAGES_SUFFIX)
     )
 
 
@@ -53,7 +58,7 @@ def compress_scoped_passthrough_body(
         if not model:
             return body
 
-        if path.startswith("/api/claude-code-proxy/"):
+        if path.startswith(CLAUDE_CODE_PROXY_PREFIX):
             field_name = "messages"
             route_name = "claude-code"
         else:

@@ -19,6 +19,7 @@ from headroom.providers.codex.live import (
 )
 from headroom.providers.codex.responses import handle_chatgpt_codex_responses_subpath
 from headroom.providers.codex.runtime import resolve_codex_routing
+from headroom.providers.hermes import SCOPED_PATH_PREFIXES as HERMES_SCOPED_PATH_PREFIXES
 from headroom.providers.model_metadata import (
     MODEL_METADATA_LIST_ENDPOINT,
     handle_model_metadata_endpoint,
@@ -281,6 +282,46 @@ def _register_openai_image_routes(app: FastAPI, proxy: Any) -> None:
 def register_provider_routes(app: FastAPI, proxy: Any) -> None:
     """Register provider-specific proxy endpoints."""
 
+    async def _default_passthrough(request: Request, path: str):
+        """Catch-all forwarding for paths no provider route claims.
+
+        ``path`` is the request path without its leading slash, as the
+        ``/{path:path}`` catch-all captures it.
+        """
+        custom_base = request.headers.get("x-headroom-base-url")
+        if custom_base:
+            if not await is_safe_upstream_url_async(custom_base):
+                logger.warning("rejecting unsafe x-headroom-base-url: %r", custom_base)
+                raise HTTPException(status_code=400, detail="Rejected unsafe upstream base URL")
+            base_url = custom_base.rstrip("/")
+            endpoint_name, provider_name = _custom_base_passthrough_telemetry(
+                request.method,
+                path,
+                base_url,
+            )
+            return await proxy.handle_passthrough(
+                request,
+                base_url,
+                endpoint_name,
+                provider_name,
+            )
+
+        normalized_cloudcode_path = normalize_cloudcode_passthrough_path(path)
+        if normalized_cloudcode_path is not None:
+            normalize_request_path(request, normalized_cloudcode_path)
+
+            return await proxy.handle_passthrough(
+                request,
+                _api_target(proxy, "cloudcode"),
+            )
+
+        return await proxy.handle_passthrough(
+            request,
+            # The path matters here: this is where unrouted paths land, and
+            # Copilot's inline completions are one of them (#3076).
+            _select_passthrough_base_url(proxy, dict(request.headers), request.url.path),
+        )
+
     async def vertex_publisher_passthrough(request: Request, publisher: str, action: str):
         return await proxy.handle_passthrough(
             request,
@@ -326,6 +367,41 @@ def register_provider_routes(app: FastAPI, proxy: Any) -> None:
         @app.post("/model/{model_id:path}/invoke-with-response-stream")
         async def bedrock_invoke_stream(request: Request, model_id: str):
             return await proxy.handle_bedrock_invoke(request, model_id, stream=True)
+
+    # Factory Droid. Registered ONLY when an upstream is configured
+    # (`--factory-api-url` / FACTORY_TARGET_API_URL, set by `headroom wrap
+    # droid`). Droid sends everything under `/api/`; nothing outside `/api/`
+    # ever goes to Factory, so another tool still pointed at this port (a
+    # leftover Codex/Claude config) keeps its usual upstream and its
+    # credentials never reach Factory.
+    factory_api_url = getattr(proxy.config, "factory_api_url", None)
+    if factory_api_url:
+        factory_base = factory_api_url.rstrip("/")
+
+        @app.post("/api/llm/a/v1/messages")
+        async def factory_anthropic_messages(request: Request):
+            # Anthropic-shaped inference: compressed, then forwarded to
+            # `{factory}/api/llm/a/v1/messages`. A client-sent
+            # `x-headroom-base-url` is deliberately ignored (the handler strips
+            # `x-headroom-*`), and Factory is not a trusted host, so operator
+            # Anthropic extra headers are withheld.
+            return await proxy.handle_anthropic_messages(
+                request, upstream_base_url=factory_base, provider_name="factory"
+            )
+
+        @app.api_route(
+            "/api/{path:path}", methods=["GET", "POST", "PUT", "PATCH", "DELETE", "HEAD"]
+        )
+        async def factory_passthrough(request: Request, path: str):
+            # Hermes Studio's scoped proxies and callers that name their own
+            # upstream are not Droid traffic: keep the catch-all behaviour.
+            if request.headers.get(
+                "x-headroom-base-url", ""
+            ).strip() or request.url.path.startswith(HERMES_SCOPED_PATH_PREFIXES):
+                return await _default_passthrough(request, request.url.path[1:])
+            # Factory REST (and, for now, OpenAI-shaped `/api/llm/o/*`):
+            # verbatim and buffered. No endpoint name, so no LLM telemetry.
+            return await proxy.handle_passthrough(request, factory_base, None, "factory")
 
     _register_openai_responses_routes(app, proxy)
 
@@ -558,36 +634,4 @@ def register_provider_routes(app: FastAPI, proxy: Any) -> None:
 
     @app.api_route("/{path:path}", methods=["GET", "POST", "PUT", "DELETE", "HEAD"])
     async def passthrough(request: Request, path: str):
-        custom_base = request.headers.get("x-headroom-base-url")
-        if custom_base:
-            if not await is_safe_upstream_url_async(custom_base):
-                logger.warning("rejecting unsafe x-headroom-base-url: %r", custom_base)
-                raise HTTPException(status_code=400, detail="Rejected unsafe upstream base URL")
-            base_url = custom_base.rstrip("/")
-            endpoint_name, provider_name = _custom_base_passthrough_telemetry(
-                request.method,
-                path,
-                base_url,
-            )
-            return await proxy.handle_passthrough(
-                request,
-                base_url,
-                endpoint_name,
-                provider_name,
-            )
-
-        normalized_cloudcode_path = normalize_cloudcode_passthrough_path(path)
-        if normalized_cloudcode_path is not None:
-            normalize_request_path(request, normalized_cloudcode_path)
-
-            return await proxy.handle_passthrough(
-                request,
-                _api_target(proxy, "cloudcode"),
-            )
-
-        return await proxy.handle_passthrough(
-            request,
-            # The path matters here: this is where unrouted paths land, and
-            # Copilot's inline completions are one of them (#3076).
-            _select_passthrough_base_url(proxy, dict(request.headers), request.url.path),
-        )
+        return await _default_passthrough(request, path)
