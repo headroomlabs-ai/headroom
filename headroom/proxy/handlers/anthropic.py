@@ -2727,40 +2727,80 @@ class AnthropicHandlerMixin:
                 # the 2026-05-26 leak report (Python from tamag0
                 # injected into a daphni-rails Ruby session).
                 ccr_workspace_key, ccr_workspace_label = self._resolve_ccr_workspace(request, body)
+                ccr_conversation_turn = 0
+                ccr_compression_turns: dict[str, int] = {}
 
                 if injector.has_compressed_content:
-                    # Track compression in context tracker for multi-turn awareness.
-                    # Gated on a resolved workspace: tracking under an empty
-                    # workspace would create entries that the workspace-filter
-                    # in analyze_query can never match. Fail-closed per
-                    # `feedback_no_silent_fallbacks`.
+                    # Gated on the existing project identity; preserve fail-closed scoping.
                     if self.ccr_context_tracker and ccr_workspace_key:
+                        from headroom.cache.context_clock import (
+                            context_conversation_key,
+                            context_conversation_namespace,
+                        )
+
+                        # Retain the process-wide count as telemetry only. Event age uses
+                        # the original conversation's clock, retained by its store.
                         self._turn_counter += 1
+                        store = get_compression_store()
+                        conversation_key = context_conversation_key(
+                            session_id,
+                            ccr_workspace_key,
+                            original_client_messages,
+                            explicit_session=bool(request.headers.get("x-headroom-session-id")),
+                        )
+                        turn_snapshot = store.observe_context_turn(
+                            conversation_key,
+                            injector.detected_hashes,
+                            namespace_key=(
+                                None
+                                if request.headers.get("x-headroom-session-id")
+                                else context_conversation_namespace(session_id, ccr_workspace_key)
+                            ),
+                        )
+                        if turn_snapshot is not None:
+                            ccr_conversation_turn = turn_snapshot.current_turn
                         for hash_key in injector.detected_hashes:
-                            # Get compression metadata from store
-                            store = get_compression_store()
                             entry = store.get_metadata(hash_key)
-                            if entry:
-                                if looks_like_claude_code_compact_summary(
-                                    entry.get("query_context"),
-                                    entry.get("compressed_content"),
-                                    entry.get("original_content_preview"),
-                                ):
-                                    logger.info(
-                                        f"[{request_id}] CCR: skipping proactive "
-                                        f"tracking for Claude Code compact summary {hash_key}"
-                                    )
-                                    continue
-                                self.ccr_context_tracker.track_compression(
-                                    hash_key=hash_key,
-                                    turn_number=self._turn_counter,
-                                    tool_name=entry.get("tool_name"),
-                                    original_count=entry.get("original_item_count", 0),
-                                    compressed_count=entry.get("compressed_item_count", 0),
-                                    workspace_key=ccr_workspace_key,
-                                    query_context=entry.get("query_context", ""),
-                                    sample_content=entry.get("compressed_content", "")[:500],
+                            if not entry:
+                                continue
+                            observed = (
+                                None
+                                if turn_snapshot is None
+                                else turn_snapshot.compression_turns.get(hash_key)
+                            )
+                            if (
+                                observed is None
+                                or turn_snapshot is None
+                                or turn_snapshot.compression_event_ids.get(hash_key)
+                                != entry.get("event_id")
+                            ):
+                                # Unknown age or concurrent recompression: skip proactive
+                                # expansion; explicit retrieval remains available.
+                                continue
+                            if looks_like_claude_code_compact_summary(
+                                entry.get("query_context"),
+                                entry.get("compressed_content"),
+                                entry.get("original_content_preview"),
+                            ):
+                                logger.info(
+                                    f"[{request_id}] CCR: skipping proactive "
+                                    f"tracking for Claude Code compact summary {hash_key}"
                                 )
+                                continue
+                            ccr_compression_turns[hash_key] = observed[1]
+                            self.ccr_context_tracker.track_compression(
+                                hash_key=hash_key,
+                                turn_number=observed[1],
+                                tool_name=entry.get("tool_name"),
+                                original_count=entry.get("original_item_count", 0),
+                                compressed_count=entry.get("compressed_item_count", 0),
+                                workspace_key=ccr_workspace_key,
+                                query_context=entry.get("query_context", ""),
+                                sample_content=entry.get("compressed_content", "")[:500],
+                                compression_created_at=entry.get("created_at"),
+                                compression_event_id=entry.get("event_id"),
+                                current_turn=ccr_conversation_turn,
+                            )
                     elif self.ccr_context_tracker and not ccr_workspace_key:
                         logger.info(
                             f"[{request_id}] CCR: workspace unresolved; skipping "
@@ -2784,12 +2824,13 @@ class AnthropicHandlerMixin:
                 if user_query:
                     recommendations = self.ccr_context_tracker.analyze_query(
                         user_query,
-                        self._turn_counter,
+                        ccr_conversation_turn,
                         workspace_key=ccr_workspace_key,
                         # Only this conversation's own compressions: a
                         # same-cwd teammate must not receive the lead's
                         # tool output (#1174).
                         present_hashes=ccr_present_hashes,
+                        compression_turns=ccr_compression_turns,
                     )
                     if recommendations:
                         expansions = self.ccr_context_tracker.execute_expansions(recommendations)

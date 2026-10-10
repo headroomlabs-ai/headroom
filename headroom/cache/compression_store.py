@@ -34,14 +34,19 @@ import hashlib
 import heapq
 import json
 import logging
+import math
 import os
 import re
 import threading
 import time
+import uuid
 from collections import deque
+from collections.abc import Collection
 from contextvars import ContextVar
 from dataclasses import dataclass, field, replace
 from typing import TYPE_CHECKING, Any
+
+from .context_clock import ContextClockBackend, ContextTurnSnapshot
 
 if TYPE_CHECKING:
     from ..memory.tracker import ComponentStats
@@ -179,6 +184,11 @@ class CompressionEntry:
     # This MUST match the hash used by SmartCrusher when recording compression
     tool_signature_hash: str | None = None
     compression_strategy: str | None = None  # Strategy used for compression
+    event_id: str = ""  # Empty only for payloads written before durable event IDs.
+
+    @property
+    def event_identity(self) -> str:
+        return self.event_id or f"legacy:{float(self.created_at)!r}"
 
     # Feedback tracking
     retrieval_count: int = 0
@@ -256,6 +266,7 @@ class CompressionStore:
         self._max_entries = max_entries
         self._default_ttl = default_ttl
         self._enable_feedback = enable_feedback
+        self._warned_context_clock_backend = False
 
         # Feedback tracking. maxlen caps the display history, replacing an
         # append-then-reslice that re-copied 1000 pointers on every retrieval.
@@ -400,6 +411,7 @@ class CompressionStore:
             tool_call_id=tool_call_id,
             query_context=query_context,
             created_at=time.time(),
+            event_id=uuid.uuid4().hex,
             ttl=ttl if ttl is not None else self._default_ttl,
             tool_signature_hash=tool_signature_hash,
             compression_strategy=compression_strategy,
@@ -421,6 +433,11 @@ class CompressionStore:
             # The CCR mirror bridge re-stores the same explicit_hash on every
             # turn a marker is re-encountered, so duplicate stores are common.
             existing = self._backend.get(hash_key)
+            if existing is not None and entry.created_at <= existing.created_at:
+                # A coarse clock (or clock rollback) must not give a fresh
+                # same-hash store the old event's identity and turn age.
+                entry.created_at = math.nextafter(existing.created_at, math.inf)
+                expires_at = self._expiration_time(entry)
             if existing is None:
                 self._evict_if_needed()
             else:
@@ -443,7 +460,11 @@ class CompressionStore:
                 # Mark old heap entry as stale since we're replacing it.
                 self._mark_heap_entries_stale()
 
-            self._backend.set(hash_key, entry)
+            # Built-in backends assign fresh event identity under their shared
+            # write lock/transaction; CRUD-only custom backends retain set().
+            set_new = getattr(self._backend, "set_new", self._backend.set)
+            set_new(hash_key, entry)
+            expires_at = self._expiration_time(entry)
             # MEDIUM FIX #16: Add to eviction heap for O(log n) eviction
             heapq.heappush(self._eviction_heap, (entry.created_at, hash_key))
             heapq.heappush(
@@ -482,9 +503,12 @@ class CompressionStore:
                 return None
 
             # Track access for feedback
-            entry.record_access(query)
-            # Update the backend with the modified entry
-            self._backend.set(hash_key, entry)
+            record_retrieval = getattr(self._backend, "record_retrieval", None)
+            if callable(record_retrieval):
+                record_retrieval(hash_key, entry, query)
+            else:
+                entry.record_access(query)
+                self._backend.set(hash_key, entry)
 
             # Log retrieval event
             if self._enable_feedback:
@@ -517,6 +541,36 @@ class CompressionStore:
             self.process_pending_feedback()
 
         return result_entry
+
+    def observe_context_turn(
+        self, conversation_key: str, hash_keys: Collection[str], *, namespace_key: str | None = None
+    ) -> ContextTurnSnapshot | None:
+        """Observe one request using backend-scoped, durable event turns.
+
+        Built-in memory/SQLite backends share this capability. A custom backend
+        without it retains explicit retrieval but cannot safely authorize
+        proactive expansion from an unverified conversation clock.
+        """
+        if not isinstance(self._backend, ContextClockBackend):
+            if not self._warned_context_clock_backend:
+                logger.warning(
+                    "CCR backend lacks conversation clocks; proactive expansion skipped. "
+                    "Explicit retrieval remains available."
+                )
+                self._warned_context_clock_backend = True
+            return None
+        with self._lock:
+            if namespace_key is None:
+                return self._backend.observe_context_turn(conversation_key, hash_keys)
+            try:
+                return self._backend.observe_context_turn(
+                    conversation_key, hash_keys, namespace_key=namespace_key
+                )
+            except TypeError:
+                logger.warning(
+                    "CCR backend cannot verify fallback lineage; proactive expansion skipped"
+                )
+                return None
 
     def get_metadata(
         self,
@@ -553,6 +607,7 @@ class CompressionStore:
                 "compressed_content": entry.compressed_content,
                 "original_content_preview": entry.original_content[:2000],
                 "created_at": entry.created_at,
+                "event_id": entry.event_identity,
                 "ttl": entry.ttl,
             }
 

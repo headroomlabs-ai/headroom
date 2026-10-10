@@ -177,7 +177,11 @@ class TestSQLiteBackend:
                 "SELECT name FROM sqlite_master WHERE type = 'index' AND name LIKE 'idx_%'"
             )
         }
-        assert indexes == {"idx_ccr_expiry_deadline"}
+        assert indexes == {
+            "idx_ccr_expiry_deadline",
+            "idx_ccr_context_expiry",
+            "idx_ccr_context_namespace",
+        }
         entry = b.get("h1")
         assert entry is not None
         assert entry.original_content == make_entry("h1").original_content

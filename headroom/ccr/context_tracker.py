@@ -23,7 +23,7 @@ from __future__ import annotations
 import logging
 import re
 import time
-from collections.abc import Collection
+from collections.abc import Collection, Mapping
 from dataclasses import dataclass
 from typing import Any
 
@@ -89,6 +89,8 @@ class CompressedContext:
     query_context: str  # The query/context when compression happened
     sample_content: str  # Preview of what was compressed (for relevance matching)
     workspace_key: str  # Stable per-project identity (see ProjectResolver in storage_router)
+    compression_created_at: float | None = None
+    compression_event_id: str | None = None
 
 
 @dataclass
@@ -115,6 +117,9 @@ class ContextTrackerConfig:
 
     # Maximum age for contexts (seconds) - older contexts less likely to expand
     max_context_age_seconds: float = 300.0  # 5 minutes
+
+    # Maximum number of compressing turns before a context is stale
+    max_turn_distance: int = 10
 
     # Whether to proactively expand based on query analysis
     proactive_expansion: bool = True
@@ -170,6 +175,9 @@ class ContextTracker:
         workspace_key: str,
         query_context: str = "",
         sample_content: str = "",
+        compression_created_at: float | None = None,
+        compression_event_id: str | None = None,
+        current_turn: int | None = None,
     ) -> None:
         """Track a compression event.
 
@@ -186,6 +194,12 @@ class ContextTracker:
                 explicitly exercise the no-scoping path.
             query_context: The user query when compression happened.
             sample_content: Sample of the content for relevance matching.
+            compression_created_at: Store event timestamp, allowing replayed
+                history markers to retain their original wall-clock age.
+            compression_event_id: Immutable store event identity, including
+                re-stores after eviction at the same creation timestamp.
+            current_turn: When supplied, turn_number is the durable first turn
+                in this conversation. Reject stale events before tracking them.
         """
         if not self.config.enabled:
             return
@@ -197,16 +211,57 @@ class ContextTracker:
             )
             return
 
+        previous = self._contexts.get(hash_key)
+        # The proxy supplies a durable first turn plus this conversation's
+        # current turn. Reject expired replay before it can occupy capacity,
+        # including after a restart or in-process cache eviction.
+        if current_turn is not None and (
+            max(0, current_turn - turn_number) > self.config.max_turn_distance
+            or (
+                compression_created_at is not None
+                and time.time() - compression_created_at > self.config.max_context_age_seconds
+            )
+        ):
+            return
+        if (
+            compression_created_at is not None
+            and previous is not None
+            and previous.workspace_key == workspace_key
+            and (
+                previous.compression_created_at == compression_created_at
+                if compression_event_id is None
+                else previous.compression_event_id == compression_event_id
+            )
+        ):
+            # A replay preserves the event's age. Only an eligible event may
+            # gain eviction priority; otherwise stale history can crowd out
+            # context that the model can still proactively expand.
+            if (
+                time.time() - previous.timestamp <= self.config.max_context_age_seconds
+                and max(
+                    0,
+                    turn_number - previous.turn_number
+                    if current_turn is None
+                    else current_turn - turn_number,
+                )
+                <= self.config.max_turn_distance
+            ):
+                self._turn_order.remove(hash_key)
+                self._turn_order.append(hash_key)
+            return
+
         context = CompressedContext(
             hash_key=hash_key,
             turn_number=turn_number,
-            timestamp=time.time(),
+            timestamp=time.time() if compression_created_at is None else compression_created_at,
             tool_name=tool_name,
             original_item_count=original_count,
             compressed_item_count=compressed_count,
             query_context=query_context,
             sample_content=sample_content[:2000],  # Limit sample size
             workspace_key=workspace_key,
+            compression_created_at=compression_created_at,
+            compression_event_id=compression_event_id,
         )
 
         # Add or update context
@@ -234,6 +289,7 @@ class ContextTracker:
         *,
         workspace_key: str,
         present_hashes: Collection[str] | None = None,
+        compression_turns: Mapping[str, int] | None = None,
     ) -> list[ExpansionRecommendation]:
         """Analyze a query to find relevant compressed contexts.
 
@@ -255,6 +311,9 @@ class ContextTracker:
                 compression the requesting conversation never received is
                 another conversation's tool output, not context it lost
                 (#1174). ``None`` skips this filter.
+            compression_turns: Durable first turns for the current conversation.
+                These override cached turns from other conversations sharing a
+                hash. Missing hashes fail closed. None preserves direct callers.
 
         Returns:
             List of expansion recommendations, sorted by relevance.
@@ -289,18 +348,43 @@ class ContextTracker:
                 continue
             if present_hashes is not None and hash_key not in present_hashes:
                 continue
+            if compression_turns is not None and hash_key not in compression_turns:
+                continue
 
             # Check age
             age = now - context.timestamp
             if age > self.config.max_context_age_seconds:
                 continue
 
+            # Fast agentic sessions can advance through many compressing turns
+            # before the wall-clock limit expires. Conversational distance is
+            # therefore an independent staleness boundary.
+            turn_distance = 0
+            if current_turn is not None:
+                first_turn = (
+                    context.turn_number
+                    if compression_turns is None
+                    else compression_turns[hash_key]
+                )
+                turn_distance = max(0, current_turn - first_turn)
+                if turn_distance > self.config.max_turn_distance:
+                    continue
+
             # Calculate relevance
             relevance = self._calculate_relevance(query, context)
 
             # Age discount: older contexts get lower scores
             age_factor = 1.0 - (age / self.config.max_context_age_seconds) * 0.5
-            relevance *= age_factor
+            turn_factor = 1.0
+            if current_turn is not None:
+                if self.config.max_turn_distance <= 0:
+                    turn_factor = 1.0 if turn_distance == 0 else 0.0
+                else:
+                    turn_factor = max(
+                        0.2,
+                        1.0 - (turn_distance / self.config.max_turn_distance) * 0.8,
+                    )
+            relevance *= age_factor * turn_factor
 
             if relevance >= self.config.relevance_threshold:
                 recommendations.append(
