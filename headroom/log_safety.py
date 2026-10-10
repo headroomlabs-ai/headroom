@@ -75,10 +75,7 @@ def _describe_one(exc: BaseException) -> str:
             text += " [Errno out of range]"
     frames = traceback.extract_tb(exc.__traceback__)[-_MAX_FRAMES:]
     if frames:
-        where = " <- ".join(
-            f"{_short_path(frame.filename)}:{frame.lineno} in {frame.name}"
-            for frame in reversed(frames)
-        )
+        where = " <- ".join(_frame_location(frame) for frame in reversed(frames))
         text += f" at {where}"
     return text
 
@@ -88,6 +85,18 @@ def _errno_text(errno: int) -> str:
         return os.strerror(errno)
     except (ValueError, OverflowError):
         return "unknown error"
+
+
+def _frame_location(frame: traceback.FrameSummary) -> str:
+    """``file:line in function`` for code on disk, a fixed token for anything else.
+
+    Code compiled at runtime (``exec``, ``compile``, templates) chooses its own
+    file and function names, which can quote request data, so neither is logged.
+    """
+    filename, name = frame.filename, frame.name
+    if not (os.path.isfile(filename) and filename.isprintable() and name.isprintable()):
+        return "<dynamic code>"
+    return f"{_short_path(filename)}:{frame.lineno} in {name}"
 
 
 def _short_path(path: str) -> str:
@@ -141,7 +150,7 @@ class WarnOnce:
 
     The first warning opens a window of ``window_seconds`` (an hour by
     default). Inside it each key warns once; past ``limit`` keys it logs one
-    overflow WARNING and stays quiet, so a failure that hits many distinct keys
+    overflow WARNING and stays quiet, so a failure that hits many keys
     (paths, rows, models) cannot flood the log: at most ``limit + 1`` warnings
     per window. When the window ends the guard starts over, so a failure that
     keeps recurring, or a newly broken key, warns again once an hour. A key is
@@ -190,7 +199,8 @@ class WarnOnce:
             remaining = self._window - (now - started)
         if report_overflow:
             log.warning(
-                "More than %d distinct %s; further ones are not logged at WARNING "
+                "More than %d warnings about %s this window; further ones are not logged "
+                "at WARNING "
                 "for the next %d minutes",
                 self._limit,
                 self._what,
