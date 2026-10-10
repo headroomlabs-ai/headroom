@@ -1874,14 +1874,29 @@ def test_dedicated_copilot_proxy_carries_the_shared_proxys_extensions(monkeypatc
     )
 
 
-def test_dedicated_copilot_proxy_env_extensions_win(monkeypatch, capsys) -> None:
-    monkeypatch.setenv("HEADROOM_PROXY_EXTENSIONS", "teams")
+@pytest.mark.parametrize("configured", ["teams", ""])
+def test_dedicated_copilot_proxy_env_extensions_win(monkeypatch, capsys, configured) -> None:
+    """The env var is inherited by the subprocess and outranks the carry-over;
+    an empty value is the documented way to start a bare dedicated proxy."""
+    monkeypatch.setenv("HEADROOM_PROXY_EXTENSIONS", configured)
     health = {"config": {"pid": "1", "proxy_extensions": ["observability"]}}
 
     kwargs = _dedicated_start(monkeypatch, health=health)
 
-    assert kwargs["proxy_extensions"] is None  # the subprocess inherits the env var
-    assert "carried over" not in capsys.readouterr().out
+    assert kwargs["proxy_extensions"] is None
+    out = capsys.readouterr().out
+    assert "carried over" not in out
+    assert "could not read the extensions" not in out
+
+
+def test_dedicated_copilot_proxy_ignores_a_foreign_port_holder(monkeypatch, capsys) -> None:
+    """A non-Headroom service on the port ran no extensions: nothing to carry, no warning."""
+    monkeypatch.delenv("HEADROOM_PROXY_EXTENSIONS", raising=False)
+
+    kwargs = _dedicated_start(monkeypatch, health={"status": "ok"})
+
+    assert not kwargs["proxy_extensions"]
+    assert "could not read the extensions" not in capsys.readouterr().out
 
 
 def test_dedicated_copilot_proxy_warns_when_the_shared_proxy_hides_its_extensions(
@@ -1900,16 +1915,15 @@ def test_dedicated_copilot_proxy_warns_when_the_shared_proxy_hides_its_extension
 
 
 def test_dedicated_copilot_proxy_reads_extensions_from_the_manifest(monkeypatch) -> None:
-    """With no reachable /health, the persistent manifest's own args say what ran."""
+    """With no reachable /health, the manifest's recorded environment says what ran."""
     monkeypatch.delenv("HEADROOM_PROXY_EXTENSIONS", raising=False)
 
     class _ExtManifest(_Manifest):
-        base_env = {"HEADROOM_PROXY_EXTENSIONS": "lossless_guard"}
-        proxy_args = ["--port", "8787", "--proxy-extension", "observability,tool_search"]
+        base_env = {"HEADROOM_PROXY_EXTENSIONS": "observability, lossless_guard"}
 
     kwargs = _dedicated_start(monkeypatch, health=None, manifest=_ExtManifest())
 
-    assert kwargs["proxy_extensions"] == ["lossless_guard", "observability", "tool_search"]
+    assert kwargs["proxy_extensions"] == ["lossless_guard", "observability"]
 
 
 def test_plain_start_passes_no_extensions(monkeypatch) -> None:

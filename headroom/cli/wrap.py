@@ -775,8 +775,9 @@ def _start_proxy(
         cmd.extend(["--vertex-api-url", vertex_api_url])
 
     # Extensions carried over from the proxy this one replaces (see
-    # ``_dedicated_proxy_extensions``). An explicit HEADROOM_PROXY_EXTENSIONS
-    # in the environment is inherited by the subprocess and wins over this.
+    # ``_dedicated_proxy_extensions``). The flag outranks the envvar in click,
+    # so callers must not pass this when HEADROOM_PROXY_EXTENSIONS is set;
+    # ``_ensure_proxy_unlocked`` checks that before asking.
     if proxy_extensions:
         cmd.extend(["--proxy-extension", ",".join(proxy_extensions)])
 
@@ -4537,22 +4538,15 @@ def _echo_unwrap_proxy_stop_status(status: str, port: int) -> None:
 def _manifest_proxy_extensions(manifest: Any) -> list[str]:
     """Extension names a persistent deployment was installed with.
 
-    The installer records them either as ``HEADROOM_PROXY_EXTENSIONS`` in the
-    deployment's environment or as ``--proxy-extension`` in its proxy args.
+    The installer has no extension flag of its own; the only way to enable
+    extensions on a persistent deployment is ``headroom install --env
+    HEADROOM_PROXY_EXTENSIONS=...``, recorded in the manifest's ``base_env``.
     """
     base_env = getattr(manifest, "base_env", None)
     configured = base_env.get("HEADROOM_PROXY_EXTENSIONS") if isinstance(base_env, dict) else None
-    names: list[str] = []
-    if isinstance(configured, str):
-        names.extend(configured.split(","))
-    args = getattr(manifest, "proxy_args", None)
-    if isinstance(args, list):
-        for index, arg in enumerate(args):
-            if arg == "--proxy-extension" and index + 1 < len(args):
-                names.extend(str(args[index + 1]).split(","))
-            elif isinstance(arg, str) and arg.startswith("--proxy-extension="):
-                names.extend(arg.split("=", 1)[1].split(","))
-    return sorted({name.strip() for name in names if name.strip()})
+    if not isinstance(configured, str):
+        return []
+    return sorted({name.strip() for name in configured.split(",") if name.strip()})
 
 
 def _dedicated_proxy_extensions(port: int, manifest: Any) -> list[str] | None:
@@ -4567,7 +4561,10 @@ def _dedicated_proxy_extensions(port: int, manifest: Any) -> list[str] | None:
     manifest. Returns ``None`` when neither says.
     """
     helpers = _live_wrap_module()
-    running = helpers._proxy_health_config(helpers._query_proxy_health(port))
+    payload = helpers._query_proxy_health(port)
+    if payload is not None and not helpers._is_headroom_health(payload):
+        return []  # a foreign service holds the port; it ran no extensions
+    running = helpers._proxy_health_config(payload)
     if running is not None:
         found = running.get("proxy_extensions")
         if isinstance(found, list):
@@ -5220,7 +5217,7 @@ def _ensure_proxy_unlocked(
         proxy_extensions: list[str] | None = None
         if (
             isolated_copilot_subscription_proxy or persistent_routing_mismatch
-        ) and not os.environ.get("HEADROOM_PROXY_EXTENSIONS"):
+        ) and "HEADROOM_PROXY_EXTENSIONS" not in os.environ:
             proxy_extensions = helpers._dedicated_proxy_extensions(port, manifest)
             if proxy_extensions is None:
                 click.echo(
@@ -5253,7 +5250,7 @@ def _ensure_proxy_unlocked(
                     copilot_api_token=copilot_api_token,
                     copilot_refresh_oauth_token=copilot_refresh_oauth_token,
                     copilot_api_token_expires_at=copilot_api_token_expires_at,
-                    proxy_extensions=proxy_extensions or None,
+                    proxy_extensions=proxy_extensions,
                 ),
             )
             click.echo(_proxy_status_line("Proxy ready", actual_port))
