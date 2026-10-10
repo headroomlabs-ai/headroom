@@ -9,6 +9,7 @@ import json
 import logging
 import math
 import os
+import re
 import tempfile
 import time
 from collections.abc import Mapping
@@ -1648,6 +1649,120 @@ def _token_kind(token: str) -> str:
     return "unknown" if t else "empty"
 
 
+_URL_IN_TEXT_RE = re.compile(r"\b[A-Za-z][A-Za-z0-9+.-]*://[^\s\"'<>]+")
+
+
+def _url_display_parts(url: object) -> tuple[str, str, str]:
+    """Split *url* into the parts that are safe to show: scheme, host[:port], path.
+
+    Userinfo, params, query and fragment are dropped because they can carry
+    credentials. A value without a scheme (``host.example/path``) is parsed as a
+    network location. Raises on input ``urlparse`` cannot handle; callers that
+    must never raise go through :func:`display_url`.
+    """
+
+    text = str(url or "").strip()
+    parsed = urlparse(text if "://" in text or text.startswith("//") else f"//{text}")
+    host = parsed.hostname or ""
+    if ":" in host:  # IPv6 literal
+        host = f"[{host}]"
+    try:
+        port = parsed.port
+    except ValueError:  # out-of-range or non-numeric port: show none of it
+        port = None
+    if port is not None and host:
+        host = f"{host}:{port}"
+    return parsed.scheme, host, parsed.path
+
+
+def display_url(url: object) -> str:
+    """Return *url* reduced to scheme, host, port and path, safe for display.
+
+    Userinfo, query and fragment are dropped. Never raises: malformed input
+    yields a fixed placeholder instead of the raw value. Use the original URL for
+    requests; this is for output only.
+    """
+
+    try:
+        if not str(url or "").strip():
+            return ""
+        scheme, host, path = _url_display_parts(url)
+        shown = f"{scheme}://{host}{path}" if scheme else f"{host}{path}"
+        return shown or "(unparseable URL)"
+    except Exception:  # noqa: BLE001 - display must never fail
+        return "(unparseable URL)"
+
+
+def scrub_urls(text: object) -> str:
+    """Replace every URL inside free *text* (e.g. an exception message) with
+    :func:`display_url` of it. Never raises."""
+
+    try:
+        return _URL_IN_TEXT_RE.sub(lambda m: display_url(m.group(0)), str(text))
+    except Exception:  # noqa: BLE001 - display must never fail
+        return "(unprintable)"
+
+
+def _maybe_capture_outbound(url: str, headers: dict[str, str]) -> None:
+    """Debug hook: when ``HEADROOM_COPILOT_DEBUG_OUTBOUND`` is set, append a
+    secret-free record of the request Headroom is about to forward to the Copilot
+    API. Lets us tell a Headroom bug (wrong host / integration-id / token kind)
+    apart from an upstream entitlement 400.
+
+    Records only the host + URL path + fixed credential labels (scheme + token
+    type prefix). URL userinfo, query and fragment are dropped. No token bytes
+    and no request headers are written or logged — the auth header is reduced
+    to constant labels via prefix tests, never a slice.
+    (The integration-id / editor-version a request carries are surfaced by the
+    read-only doctor's reconstruction instead.)
+    """
+
+    if os.environ.get("HEADROOM_COPILOT_DEBUG_OUTBOUND", "").strip().lower() not in (
+        "1",
+        "true",
+        "yes",
+        "on",
+    ):
+        return
+    try:
+        auth = next((v for k, v in headers.items() if k.lower() == "authorization"), "")
+        # Constant labels only — `scheme_label`/`token_label` are literals chosen by
+        # prefix tests, so no token-derived string reaches the file or the log sink.
+        if not auth:
+            scheme_label, token_label = "(none)", "none"
+        else:
+            scheme_label = "Bearer" if auth[:7].lower() == "bearer " else "(other)"
+            rest = auth.partition(" ")[2]
+            token_label = "present"
+            for known in ("tid_", "gho_", "ghs_", "ghp_", "github_pat_"):
+                if rest.startswith(known):
+                    token_label = known + "***"
+                    break
+        # Keep only scheme, hostname, port and path: userinfo, query and fragment can
+        # carry credentials, and must not reach the file or the log.
+        scheme, host, path = _url_display_parts(url)
+        record = {
+            "host": host,
+            "url": f"{scheme}://{host}{path}" if scheme else f"{host}{path}",
+            "auth_scheme": scheme_label,
+            "token_kind": token_label,
+        }
+        default_path = Path.home() / ".headroom" / "copilot_outbound.jsonl"
+        out = Path(os.environ.get("HEADROOM_COPILOT_DEBUG_OUTBOUND_FILE", str(default_path)))
+        out.parent.mkdir(parents=True, exist_ok=True)
+        with out.open("a", encoding="utf-8") as fh:
+            fh.write(json.dumps(record) + "\n")
+        logger.warning(
+            "[copilot-outbound] host=%s url=%s token=%s/%s",
+            record["host"],
+            record["url"],
+            scheme_label,
+            token_label,
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("copilot outbound capture failed: %s", exc)
+
+
 def _is_managed_copilot_seeded_bearer(token: str) -> bool:
     """Return True when the incoming bearer is the proxy's seeded wrapper token."""
 
@@ -1702,6 +1817,7 @@ async def apply_copilot_api_auth(headers: dict[str, str], *, url: str) -> dict[s
                 for key in list(resolved):
                     if key.lower() == "x-api-key":
                         resolved.pop(key)
+                _maybe_capture_outbound(url, resolved)
                 return resolved
         logger.info(
             "apply_copilot_api_auth: incoming token not suitable (kind=%s), will replace",
@@ -1727,4 +1843,5 @@ async def apply_copilot_api_auth(headers: dict[str, str], *, url: str) -> dict[s
     # the client's own ID beside the client's own token, which is equally the
     # matched pair.
     _overwrite_header(resolved, "Copilot-Integration-Id", integration_id)
+    _maybe_capture_outbound(url, resolved)
     return resolved
