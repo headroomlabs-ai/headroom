@@ -53,7 +53,9 @@ DROP INDEX IF EXISTS idx_ccr_expiry;
 # not correctness — CompressionStore checks TTL on every get().
 _PURGE_INTERVAL = 60.0
 # items() decodes every row on each eviction pass, so an unreadable row warns
-# once per hash, for at most this many hashes; further ones log at debug only.
+# once per hash per hour (WarnOnce's window), for at most this many hashes per
+# hour; further ones log at debug only. A row that stays broken warns again
+# about once an hour, which keeps it visible without flooding.
 _MAX_REPORTED_UNREADABLE = 1000
 
 
