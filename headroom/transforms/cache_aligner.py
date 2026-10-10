@@ -30,6 +30,7 @@ import binascii
 import json
 import logging
 import uuid as _uuid
+import warnings
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Any
@@ -395,9 +396,21 @@ def align_for_cache(
 ) -> tuple[list[dict[str, Any]], str]:
     """Convenience wrapper that runs detection and returns the unchanged messages.
 
-    Kept as a stable public API; the second tuple element is the stable
-    prefix hash for callers that want to track cache prefix drift.
+    The second tuple element is the stable prefix hash for callers that want
+    to track cache prefix drift.
+
+    .. deprecated::
+        Unused inside Headroom; will be removed in a future release. Use
+        ``CacheAligner(config).apply(messages, tokenizer)`` and read the
+        ``stable_prefix_hash:`` marker from ``markers_inserted``.
     """
+    warnings.warn(
+        "align_for_cache is deprecated and will be removed in a future release; use "
+        "CacheAligner(config).apply(messages, tokenizer) and read the stable_prefix_hash: "
+        "marker from markers_inserted.",
+        DeprecationWarning,
+        stacklevel=2,
+    )
     cfg = config or CacheAlignerConfig()
     aligner = CacheAligner(cfg)
     tokenizer = Tokenizer(EstimatingTokenCounter())  # type: ignore[arg-type]

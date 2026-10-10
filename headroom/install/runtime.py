@@ -369,11 +369,6 @@ def _proxy_deployment_markers_match(cmdline: list[str], manifest: DeploymentMani
     return True
 
 
-def _process_matches_runtime(pid: int, manifest: DeploymentManifest) -> bool:
-    """Verify the PID's deployment identity before lifecycle operations."""
-    return _process_identity(pid, manifest) is True
-
-
 def _process_identity(pid: int, manifest: DeploymentManifest) -> bool | None:
     """Return whether a PID matches, or ``None`` when identity is unavailable."""
     if pid == os.getpid():

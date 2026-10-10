@@ -21,7 +21,6 @@ from headroom.learn.analyzer import (
     _strip_fenced_json,
 )
 from headroom.learn.models import (
-    AnalysisResult,
     ErrorCategory,
     ProjectInfo,
     RecommendationTarget,
@@ -1445,20 +1444,3 @@ class TestCallLlmRouting:
         mock_cli.return_value = {}
         _call_llm("digest", "codex-cli")
         mock_cli.assert_called_once_with("digest", "codex-cli", on_progress=None)
-
-
-# =============================================================================
-# Legacy Compatibility
-# =============================================================================
-
-
-class TestFailureAnalyzerCompat:
-    @patch("headroom.learn.analyzer._call_llm")
-    def test_legacy_alias_works(self, mock_call_llm: MagicMock):
-        from headroom.learn.analyzer import FailureAnalyzer
-
-        mock_call_llm.return_value = {"context_file_rules": [], "memory_file_rules": []}
-
-        analyzer = FailureAnalyzer()
-        result = analyzer.analyze(_project(), [])
-        assert isinstance(result, AnalysisResult)

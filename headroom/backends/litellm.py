@@ -649,6 +649,8 @@ def _anthropic_usage_from_litellm(litellm_usage: Any) -> dict[str, Any]:
 def _convert_anthropic_tool(tool: dict[str, Any]) -> dict[str, Any]:
     """Convert Anthropic tool format to OpenAI function format.
 
+    Shared with the any-llm backend, so both OpenAI-compatible backends send the same shape.
+
     Anthropic: {"name": "...", "description": "...", "input_schema": {...}}
     OpenAI:    {"type": "function", "function": {"name": "...", "description": "...", "parameters": {...}}}
     """
@@ -661,7 +663,7 @@ def _convert_anthropic_tool(tool: dict[str, Any]) -> dict[str, Any]:
 
 
 def _convert_tool_choice(choice: Any) -> Any:
-    """Convert Anthropic tool_choice to OpenAI format.
+    """Convert Anthropic tool_choice to OpenAI format (shared with the any-llm backend).
 
     Anthropic: {"type": "auto"}, {"type": "any"}, {"type": "none"}, {"type": "tool", "name": "..."}
     OpenAI:    "auto", "required", "none", {"type": "function", "function": {"name": "..."}}
