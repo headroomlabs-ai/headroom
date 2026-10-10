@@ -1,5 +1,10 @@
 """Dynamic anchor selection for SmartCrusher.
 
+.. deprecated::
+    This Python implementation is unused: SmartCrusher's anchor selection
+    runs in Rust (``crates/headroom-core/src/transforms/anchor_selector.rs``).
+    It will be removed in a future release and has no replacement.
+
 This module provides intelligent position-based anchor selection for array
 compression. Instead of using fixed first-K/last-K rules, it dynamically
 allocates anchor positions based on:
@@ -37,6 +42,7 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import warnings
 from collections import Counter
 from dataclasses import dataclass
 from enum import Enum
@@ -45,6 +51,13 @@ from typing import Any
 from ..config import AnchorConfig
 
 logger = logging.getLogger(__name__)
+
+_DEPRECATION_MESSAGE = (
+    "headroom.transforms.anchor_selector is deprecated and will be removed in a "
+    "future release; it has no replacement (SmartCrusher's anchor selection runs in Rust)."
+)
+
+warnings.warn(_DEPRECATION_MESSAGE, DeprecationWarning, stacklevel=2)
 
 
 class DataPattern(Enum):
