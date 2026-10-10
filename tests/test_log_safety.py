@@ -227,3 +227,27 @@ def test_out_of_range_errno_never_breaks_the_description(digits: int) -> None:
     exc.errno = 10 ** (digits - 1)  # computed, not a literal, so collection never formats it
 
     assert describe_exception(exc) == "OSError [Errno out of range]"
+
+
+def test_negative_dns_error_codes_are_kept() -> None:
+    import socket
+
+    assert describe_exception(socket.gaierror(-2, "Name or service not known")) == (
+        "gaierror [Errno -2]"
+    )
+
+
+def test_overflow_notice_states_the_time_left_in_the_window(
+    caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    log = logging.getLogger("headroom.test_log_safety.remaining")
+    guard = WarnOnce(limit=1, what="failures", window_seconds=3600)
+    clock = [0.0]
+    monkeypatch.setattr(log_safety.time, "monotonic", lambda: clock[0])
+
+    with caplog.at_level(logging.INFO, logger=log.name):
+        guard.first("a", log)
+        clock[0] = 3000.0  # ten minutes left in the window
+        guard.first("b", log)
+
+    assert _warnings(caplog)[-1].endswith("for the next 10 minutes")
