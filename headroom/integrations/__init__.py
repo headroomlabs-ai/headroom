@@ -34,7 +34,7 @@ Example:
     from headroom.integrations.langchain import HeadroomChatModel
 
     # Agno integration
-    from headroom.integrations.agno import HeadroomAgnoModel
+    from headroom.integrations import HeadroomAgnoModel
     # or explicitly:
     from headroom.integrations.agno import HeadroomAgnoModel
 
