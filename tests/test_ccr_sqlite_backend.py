@@ -348,7 +348,7 @@ class TestSQLiteBackend:
             for key in ("bad1", "bad2", "bad3"):
                 assert b.get(key) is None
             warned = [r.getMessage() for r in records if "unreadable" in r.getMessage()]
-            assert [m.split()[3] for m in warned] == ["bad1", "bad2", "bad3"]
+            assert [m.split()[3] for m in warned] == ["'bad1'", "'bad2'", "'bad3'"]
             assert all("JSONDecodeError" in m for m in warned)
         finally:
             logger.removeHandler(handler)

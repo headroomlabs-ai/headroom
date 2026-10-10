@@ -246,3 +246,31 @@ async def test_backend_failures_warn_without_exception_text(
     else:
         assert warnings == []
         assert any("not found" in r.getMessage() for r in records)
+
+
+@pytest.mark.asyncio
+async def test_huge_model_supplied_id_is_capped_in_the_warning() -> None:
+    """A model can invent an id of any size; the warning must stay bounded."""
+    adapter = _adapter()
+    adapter._ensure_initialized = AsyncMock()  # type: ignore[method-assign]
+    adapter._mem0_client = _RaisingClient(RuntimeError("backend down"))
+
+    records: list[logging.LogRecord] = []
+
+    class _Collect(logging.Handler):
+        def emit(self, record: logging.LogRecord) -> None:
+            records.append(record)
+
+    logger = logging.getLogger("headroom.memory.backends.direct_mem0")
+    handler = _Collect(level=logging.WARNING)
+    logger.addHandler(handler)
+    try:
+        assert await adapter.delete_memory("x" * 100_000) is False
+        assert await adapter.delete_memory("short-id") is False
+    finally:
+        logger.removeHandler(handler)
+
+    huge, short = (r.getMessage() for r in records)
+    assert len(huge) < 200
+    assert "…(+" in huge
+    assert "'short-id'" in short and "…" not in short

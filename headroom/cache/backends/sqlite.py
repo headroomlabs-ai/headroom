@@ -29,6 +29,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from ...fileperms import ensure_private_file
+from ...utils import log_safe_id
 
 if TYPE_CHECKING:
     from ..compression_store import CompressionEntry
@@ -55,15 +56,6 @@ _PURGE_INTERVAL = 60.0
 # reported once per hash rather than on every request. The set is cleared when
 # full, so a long-running proxy keeps reporting new bad rows.
 _MAX_REPORTED_UNREADABLE = 1000
-
-
-def _log_key(hash_key: str) -> str:
-    """Return a single-line, bounded form of a CCR key for log messages.
-
-    Keys reach ``get``/``exists`` from model-issued retrieve calls, so they are
-    untrusted text.
-    """
-    return hash_key[:64].replace("\r", "").replace("\n", "")
 
 
 def default_db_path() -> Path:
@@ -188,7 +180,7 @@ class SQLiteBackend:
         self._reported_unreadable.add(hash_key)
         logger.warning(
             "CCR SQLite entry %s in %s is unreadable (%s); treating as a miss",
-            _log_key(hash_key),
+            log_safe_id(hash_key),
             self._path,
             reason,
         )
@@ -250,7 +242,7 @@ class SQLiteBackend:
                     (hash_key,),
                 ).fetchone()
             except sqlite3.DatabaseError as e:
-                self._handle_db_error(e, f"get {_log_key(hash_key)}")
+                self._handle_db_error(e, f"get {log_safe_id(hash_key)}")
                 return None
         if row is None:
             return None
@@ -268,7 +260,7 @@ class SQLiteBackend:
                 self._conn.commit()
                 self._maybe_purge()
             except sqlite3.DatabaseError as e:
-                self._handle_db_error(e, f"set {_log_key(hash_key)}")
+                self._handle_db_error(e, f"set {log_safe_id(hash_key)}")
 
     def delete(self, hash_key: str) -> bool:
         with self._lock:
@@ -280,7 +272,7 @@ class SQLiteBackend:
                 self._conn.commit()
                 return cur.rowcount > 0
             except sqlite3.DatabaseError as e:
-                self._handle_db_error(e, f"delete {_log_key(hash_key)}")
+                self._handle_db_error(e, f"delete {log_safe_id(hash_key)}")
                 return False
 
     def exists(self, hash_key: str) -> bool:
@@ -291,7 +283,7 @@ class SQLiteBackend:
                     (hash_key,),
                 ).fetchone()
             except sqlite3.DatabaseError as e:
-                self._handle_db_error(e, f"exists {_log_key(hash_key)}")
+                self._handle_db_error(e, f"exists {log_safe_id(hash_key)}")
                 return False
         return row is not None
 
