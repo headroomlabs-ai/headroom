@@ -60,3 +60,37 @@ Cost avoided is the dollar value of the saved **input** tokens. Headroom uses [l
 <Callout type="info">
   `headroom savings` is distinct from `headroom_stats` (a per-session, in-memory snapshot) and from the proxy's live `/stats` endpoint (backed by `proxy_savings.json`). The savings ledger is the durable, cross-process source of truth.
 </Callout>
+
+## Proxy lifetime pricing migration
+
+The proxy's `proxy_savings.json` is separate from the event ledger above.
+Its schema v7 records `pricing_basis="cache-region-v1"` on compression
+aggregates and history points. This identifies the pricing **method**;
+`savings_basis` still describes estimate quality, such as catalog or list-price
+fallback, and is not a method version.
+
+Earlier files did not persist the per-request cache mix needed to distinguish
+flat-list history from later cache-aware or mixed totals. On upgrade, those
+unversioned compression and tool-schema dollars move to
+`legacy_compression_savings_usd` and `legacy_tool_schema_savings_usd`. They are
+excluded from the priced headline in lifetime, session, model, project, and
+history views. Requests, tokens, spend, and retained history are not reset.
+The same exclusion applies to the durable `/stats-lifetime` cost aggregate.
+New qualified prices accumulate separately and remain separate after restart.
+
+History and rollup JSON/CSV exports retain the legacy audit amounts.
+Legacy tool-schema values may overlap the legacy compression total: older
+schemas differed in what they folded into that total. Treat both as audit
+values, not additive priced savings. `compression_savings_list_usd` remains a nominal
+list-price ceiling, including historical nominal values; it is not the priced
+headline. This migration does not change `savings_events.jsonl` or
+`headroom savings`.
+
+Cache-region dollar savings are estimates, not a reconciliation of provider
+invoices. Region or blended rates can overstate marginal avoided spend when
+compression changes the cache behavior of later requests.
+
+Before downgrading to an older proxy, stop it and back up `proxy_savings.json`.
+Older writers do not retain the new version and legacy audit fields when they
+save. Keep the v7 file for audit; restoring an older file also restores its
+unqualified dollar totals until this migration runs again.
