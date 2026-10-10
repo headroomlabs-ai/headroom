@@ -43,6 +43,13 @@ def test_oserror_keeps_errno_but_not_its_filename(monkeypatch: pytest.MonkeyPatc
     assert text == "PermissionError [Errno 13] Permission denied"
 
 
+def test_oserror_free_text_strerror_is_replaced_by_the_system_text() -> None:
+    text = describe_exception(OSError(2, f"token={CANARY}"))
+
+    assert "CANARY" not in text
+    assert text == f"FileNotFoundError [Errno 2] {os.strerror(2)}"
+
+
 def test_content_opt_in_gives_the_full_traceback(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("HEADROOM_DEBUG_DUMP", "full")
 
@@ -152,3 +159,19 @@ def test_a_cause_cycle_is_described_once() -> None:
     second.__cause__ = first
 
     assert describe_exception(first) == "ValueError; caused by KeyError"
+
+
+def test_forgetting_after_overflow_does_not_reopen_the_cap(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    log = logging.getLogger("headroom.test_log_safety.reopen")
+    guard = WarnOnce(limit=2, what="failures")
+
+    with caplog.at_level(logging.INFO, logger=log.name):
+        assert guard.first("a", log) and guard.first("b", log)
+        assert guard.first("c", log) is False  # overflow notice
+        for cycle in range(5):
+            guard.forget("a")
+            assert guard.first(f"new-{cycle}", log) is False
+
+    assert len(_warnings(caplog)) == 1
