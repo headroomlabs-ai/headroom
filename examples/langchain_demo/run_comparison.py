@@ -453,7 +453,9 @@ def run_simulation():
 
         print(f"\n  Total tool output: {total_tool_tokens:,} tokens")
         print(f"  With 3 iterations, baseline input would be: ~{total_tool_tokens * 2:,} tokens")
-        print(f"  With Headroom (20 items max), estimated: ~{total_tool_tokens // 5:,} tokens")
+        print(
+            f"  With Headroom (default cap ~15 items), estimated: ~{total_tool_tokens // 5:,} tokens"
+        )
         print(
             f"  Estimated savings: ~{total_tool_tokens * 2 - total_tool_tokens // 5:,} tokens (~80%)"
         )
@@ -495,8 +497,8 @@ def print_summary(baseline_runs: list[AgentRun], headroom_runs: list[AgentRun]):
 Headroom reduced input tokens by {pct_saved:.1f}% across all scenarios.
 
 Key optimizations applied:
-- SmartCrusher: Compressed tool outputs from 50-200 items to ~20 relevant items
-- CacheAligner: Stabilized system prompt for better cache hits
+- SmartCrusher: Compressed tool outputs from 50-200 items to the most relevant
+  ones (the default router keeps about 15)
 - Context preserved: Agent still found the right information
 
 This translates to:
