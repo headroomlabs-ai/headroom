@@ -4675,8 +4675,19 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
     _stats_snapshot: dict[str, Any] = {"expires_at": 0.0, "value": None}
 
     THROUGHPUT_CACHE_TTL_SECONDS = 10.0
+    # The /stats throughput probe re-parses the proxy logs. On a long-lived
+    # proxy those are hundreds of MB, so cap the per-file tail it reads and
+    # put a wall-clock ceiling on the whole scan: /stats backs dashboard and
+    # health polling, where a current-ish number beats a complete one.
+    STATS_THROUGHPUT_LOG_TAIL_BYTES = 1_000_000
+    STATS_THROUGHPUT_TIMEOUT_SECONDS = 1.0
     _throughput_cache_lock = asyncio.Lock()
     _throughput_cache: dict[str, Any] = {"expires_at": 0.0, "value": None}
+    # Holds the one in-flight throughput scan, if any. The cache gate also
+    # fires on a null value, so without this a scan that timed out before ever
+    # producing a value would be restarted by every later /stats call while
+    # the first one is still running.
+    _throughput_scan: dict[str, Any] = {"task": None}
 
     RECENT_REQUEST_LOG_WINDOW = 100
 
@@ -4770,14 +4781,39 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
                 def _compute_throughput():
                     from headroom.perf.analyzer import build_perf_summary, parse_log_files
 
-                    perf_report = parse_log_files(last_n_hours=1.0)
+                    perf_report = parse_log_files(
+                        last_n_hours=1.0,
+                        max_tail_bytes_per_file=STATS_THROUGHPUT_LOG_TAIL_BYTES,
+                    )
                     return build_perf_summary(perf_report).get("throughput")
 
+                scan = _throughput_scan["task"]
+                if scan is None:
+                    scan = asyncio.ensure_future(asyncio.to_thread(_compute_throughput))
+                    _throughput_scan["task"] = scan
+
                 try:
-                    throughput = await asyncio.to_thread(_compute_throughput)
+                    # Shielded on purpose. A timeout here cannot stop the work:
+                    # the executor thread behind it is not cancellable, so
+                    # cancelling the scan would only lose its result. Keeping
+                    # the scan and re-awaiting it means a later /stats picks up
+                    # the same one instead of adding another thread to the
+                    # default executor.
+                    throughput = await asyncio.wait_for(
+                        asyncio.shield(scan),
+                        timeout=STATS_THROUGHPUT_TIMEOUT_SECONDS,
+                    )
+                    _throughput_scan["task"] = None
                     _throughput_cache["value"] = throughput
                     _throughput_cache["expires_at"] = now + THROUGHPUT_CACHE_TTL_SECONDS
+                except TimeoutError:
+                    logger.warning(
+                        "Timed out calculating throughput for stats after %.2fs; "
+                        "the scan continues and a later /stats serves its result",
+                        STATS_THROUGHPUT_TIMEOUT_SECONDS,
+                    )
                 except Exception as e:
+                    _throughput_scan["task"] = None
                     logger.warning("Failed to calculate throughput for stats: %s", e, exc_info=True)
                     if _throughput_cache["value"] is None:
                         _throughput_cache["value"] = None

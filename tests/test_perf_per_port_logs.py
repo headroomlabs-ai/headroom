@@ -253,3 +253,82 @@ def test_parse_log_files_aggregates_per_port_and_legacy(workspace: Path) -> None
     # Non-PERF files never ingested.
     assert models.isdisjoint({"model-STDIO", "model-STDIO2", "model-ERR"})
     assert rids.isdisjoint({"hr_stdio", "hr_stdio2", "hr_err"})
+
+
+def test_parse_log_files_tail_cap_reads_only_the_trailing_bytes(workspace: Path) -> None:
+    """``max_tail_bytes_per_file`` bounds the read; ``None`` still reads it all.
+
+    /stats calls ``parse_log_files`` on every (cache-expired) request, and on
+    a long-lived proxy the log is hundreds of MB. Without a cap the endpoint
+    pays for a full historical scan.
+    """
+    log_path = workspace / "logs" / "proxy-8787.log"
+    lines = [
+        _perf_line("2026-10-09 00:00:00,000", f"req-{i:05d}", "claude-opus-4-6") for i in range(400)
+    ]
+    log_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    total_bytes = log_path.stat().st_size
+    assert total_bytes > 4000, total_bytes
+
+    full = analyzer.parse_log_files(last_n_hours=0)
+    assert len(full.perf_records) == 400
+
+    capped = analyzer.parse_log_files(last_n_hours=0, max_tail_bytes_per_file=total_bytes // 4)
+    # Bounded: roughly the last quarter, and strictly fewer than everything.
+    assert 0 < len(capped.perf_records) < 400
+    # It is the TAIL, not the head: the final record must survive.
+    assert capped.perf_records[-1].request_id == "req-00399"
+    # The partial line the seek landed inside is discarded, not mis-parsed.
+    assert all(r.request_id.startswith("req-") for r in capped.perf_records)
+    assert capped.perf_records[0].request_id > "req-00000"
+
+
+def test_open_log_tail_keeps_a_record_starting_exactly_at_the_window(workspace: Path) -> None:
+    """An offset that lands on a line start must not discard that line.
+
+    The window begins at ``size - cap``. When that offset is itself a line
+    start, the byte before it is the previous line's newline, so there is no
+    partial record to drop — discarding unconditionally would lose a complete
+    record that fits entirely inside the requested cap.
+    """
+    log_path = workspace / "logs" / "proxy-8787.log"
+    lines = [
+        _perf_line("2026-10-09 00:00:00,000", f"req-{i:05d}", "claude-opus-4-6") for i in range(6)
+    ]
+    body = "\n".join(lines) + "\n"
+    log_path.write_text(body, encoding="utf-8")
+
+    # Cap exactly the last three records, so the window starts on a boundary.
+    encoded = [(line + "\n").encode("utf-8") for line in lines]
+    cap = sum(len(chunk) for chunk in encoded[3:])
+
+    with analyzer._open_log_tail(log_path, cap) as handle:
+        got = [line for line in handle if line.strip()]
+
+    assert len(got) == 3, got
+    assert "req-00003" in got[0]
+    assert "req-00005" in got[-1]
+
+
+def test_open_log_tail_ignores_bytes_appended_while_parsing(workspace: Path) -> None:
+    """The window ends at the size observed on entry, not at EOF.
+
+    Yielding a live handle and streaming to EOF keeps following a log that is
+    still being written, so the scan reads past the window it sized itself to.
+    Reading one bounded window up front fixes the size of the work.
+    """
+    log_path = workspace / "logs" / "proxy-8787.log"
+    lines = [
+        _perf_line("2026-10-09 00:00:00,000", f"req-{i:05d}", "claude-opus-4-6") for i in range(40)
+    ]
+    log_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+    with analyzer._open_log_tail(log_path, 2048) as handle:
+        with log_path.open("a", encoding="utf-8") as appending:
+            appending.write(
+                _perf_line("2026-10-09 00:00:00,000", "req-99999", "claude-opus-4-6") + "\n"
+            )
+        got = "".join(handle)
+
+    assert "req-99999" not in got
+    assert "req-00039" in got
