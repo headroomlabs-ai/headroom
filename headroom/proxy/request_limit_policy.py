@@ -5,6 +5,9 @@ from __future__ import annotations
 SSE_EVENT_MAX_BYTES_ENV = "HEADROOM_SSE_BUFFER_MAX_BYTES"
 SSE_EVENT_MAX_BYTES_DEFAULT = 1 * 1024 * 1024
 
+REQUEST_BODY_MAX_BYTES_ENV = "HEADROOM_REQUEST_BODY_MAX_BYTES"
+REQUEST_BODY_MAX_BYTES_DEFAULT = 16 * 1024 * 1024
+
 BODY_TOO_LARGE_STATUS_ENV = "HEADROOM_PROXY_BODY_TOO_LARGE_STATUS"
 BODY_TOO_LARGE_STATUS_DEFAULT = 413
 
@@ -19,6 +22,19 @@ def resolve_sse_event_max_bytes(raw: str | None) -> int:
         raise ValueError(f"{SSE_EVENT_MAX_BYTES_ENV} must be an integer, got {raw!r}") from exc
     if value <= 0:
         raise ValueError(f"{SSE_EVENT_MAX_BYTES_ENV} must be positive, got {value}")
+    return value
+
+
+def resolve_request_body_max_bytes(raw: str | None) -> int:
+    """Resolve the whole-request ceiling before the proxy starts."""
+    if raw is None or raw == "":
+        return REQUEST_BODY_MAX_BYTES_DEFAULT
+    try:
+        value = int(raw)
+    except ValueError as exc:
+        raise ValueError(f"{REQUEST_BODY_MAX_BYTES_ENV} must be an integer, got {raw!r}") from exc
+    if value <= 0:
+        raise ValueError(f"{REQUEST_BODY_MAX_BYTES_ENV} must be positive, got {value}")
     return value
 
 
