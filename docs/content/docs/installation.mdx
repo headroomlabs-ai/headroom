@@ -116,7 +116,7 @@ pip install "headroom-ai[all]"
 | `pytorch-mps` | Apple-GPU (MPS) memory-embedder offload — **macOS only**, not in `[all]` (torch + sentence-transformers); opt in with `HEADROOM_EMBEDDER_RUNTIME=pytorch_mps` | `pip install "headroom-ai[pytorch-mps]"` |
 | `html` | HTML main-content extraction with trafilatura | `pip install "headroom-ai[html]"` |
 | `spreadsheet` | `.xlsx` / `.xls` ingestion with openpyxl and xlrd | `pip install "headroom-ai[spreadsheet]"` |
-| `sandbox` | Torch-free proxy bundle for constrained environments | `pip install "headroom-ai[sandbox]"` |
+| `lean` | Torch-free proxy bundle for constrained environments (a dependency profile; it provides no isolation). `sandbox` is a deprecated alias | `pip install "headroom-ai[lean]"` |
 | `all` | Runtime bundle: `proxy,code,ml,memory,relevance,image,reports,otel,evals,voice,html,mcp,spreadsheet` | `pip install "headroom-ai[all]"` |
 
 `[all]` is the full built-in runtime bundle, not every integration or optional
