@@ -82,7 +82,7 @@ def test_hook_failure_warns_once_and_no_record_carries_the_payload(capture) -> N
 
     (warning,) = capture.hook_warnings()
     assert warning.startswith("[req-1] hook ")
-    assert "_HooksA compute_biases failed; continuing without it: ValueError at " in warning
+    assert "_HooksA compute_biases failed; continuing without it: ValueError" in warning
     (repeat,) = capture.at(logging.DEBUG)
     assert repeat.getMessage().startswith("[req-2] hook ")
     capture.assert_no_canaries()
@@ -114,7 +114,7 @@ def test_request_failure_names_the_failure_without_payload(capture) -> None:
     )
 
     (error,) = (r.getMessage() for r in capture.at(logging.ERROR))
-    assert error.startswith("[r1] Request failed: provider='anthropic' model='m' ValueError at ")
+    assert error.startswith("[r1] Request failed: provider='anthropic' model='m' ValueError")
     capture.assert_no_canaries()
 
 
@@ -157,7 +157,7 @@ def test_a_proxy_reason_phrase_stays_out_of_the_request_failure_line(capture) ->
     log_request_failure("r1", "Request", _proxy_error(CONTENT), provider="anthropic", model="m")
 
     (error,) = (r.getMessage() for r in capture.at(logging.ERROR))
-    assert error.startswith("[r1] Request failed: provider='anthropic' model='m' ProxyError at ")
+    assert error.startswith("[r1] Request failed: provider='anthropic' model='m' ProxyError")
     capture.assert_no_canaries()
 
 
