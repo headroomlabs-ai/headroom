@@ -4828,11 +4828,20 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
         # Build prefix cache stats once (used in both prefix_cache and cost)
         prefix_cache_stats = build_prefix_cache_stats(m, proxy.cost_tracker)
 
+        # LeanContext is an in-process layer, so its counters are read without
+        # reviving the retired external CLI-context-tool polling path.
+        from headroom.proxy.helpers import get_leanctx_python_stats
+
+        leanctx_py_stats = get_leanctx_python_stats()
+        leanctx_tokens_saved = int(leanctx_py_stats.get("tokens_saved", 0) or 0)
+
         # Calculate total tokens before Headroom-side reduction.
         proxy_compression_tokens = m.tokens_saved_total
         # "All layers" must include tool-schema deferral (the tool_search layer
         # enumerated in by_layer below) — otherwise the advertised total omits it.
-        all_layers_tokens_saved = proxy_compression_tokens + m.tool_search_saved_total
+        all_layers_tokens_saved = (
+            proxy_compression_tokens + m.tool_search_saved_total + leanctx_tokens_saved
+        )
         total_tokens_before = m.tokens_input_total + all_layers_tokens_saved
         proxy_total_before_compression = m.tokens_input_total + proxy_compression_tokens
         # `attempted_input_tokens` is the compressible-only denominator
@@ -5056,6 +5065,13 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
                             "had tool search enabled. Token and request counts use "
                             "the recent request window; lifetime_usd covers the "
                             "full process lifetime."
+                        ),
+                    },
+                    "lean_context": {
+                        **leanctx_py_stats,
+                        "tokens": leanctx_tokens_saved,
+                        "description": (
+                            "Tokens removed by the in-process LeanContext window truncator."
                         ),
                     },
                 },
