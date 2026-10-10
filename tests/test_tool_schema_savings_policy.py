@@ -142,7 +142,7 @@ def test_tool_schema_compaction_saves_real_tokens_not_just_bytes() -> None:
     assert headline_tokens_saved(tokens_saved, {}) == tokens_saved
 
 
-def test_reconcile_failure_is_logged_warning_once_then_debug() -> None:
+def test_reconcile_failure_warns_once_per_type_without_exception_text() -> None:
     import logging
 
     from headroom.proxy import tool_schema_savings_policy as policy
@@ -154,7 +154,10 @@ def test_reconcile_failure_is_logged_warning_once_then_debug() -> None:
             records.append(record)
 
     def _broken_count(tools: object) -> int:
-        raise RuntimeError("tokenizer exploded")
+        raise RuntimeError("tokenizer exploded on secret-schema-text")
+
+    def _other_broken_count(tools: object) -> int:
+        raise ValueError("different failure")
 
     tool = {"name": "Read", "defer_loading": True, "description": "x"}
     tags = {"tool_search_deferred_tokens": 100}
@@ -164,7 +167,7 @@ def test_reconcile_failure_is_logged_warning_once_then_debug() -> None:
     policy.logger.addHandler(handler)
     old_level = policy.logger.level
     policy.logger.setLevel(logging.DEBUG)
-    policy._reconcile_failure_warned = False
+    policy._reconcile_warned_types.clear()
     try:
         # A healthy reconcile logs nothing.
         policy.reconcile_deferred_tokens(dict(tags), booking, [dict(tool)], lambda t: 10)
@@ -172,11 +175,33 @@ def test_reconcile_failure_is_logged_warning_once_then_debug() -> None:
 
         policy.reconcile_deferred_tokens(dict(tags), booking, [dict(tool)], _broken_count)
         policy.reconcile_deferred_tokens(dict(tags), booking, [dict(tool)], _broken_count)
+        policy.reconcile_deferred_tokens(dict(tags), booking, [dict(tool)], _other_broken_count)
     finally:
         policy.logger.removeHandler(handler)
         policy.logger.setLevel(old_level)
-        policy._reconcile_failure_warned = False
+        policy._reconcile_warned_types.clear()
 
-    assert [r.levelno for r in records] == [logging.WARNING, logging.DEBUG]
-    assert "100 booked tokens" in records[0].getMessage()
-    assert records[0].exc_info is not None
+    warnings = [r for r in records if r.levelno == logging.WARNING]
+    debugs = [r for r in records if r.levelno == logging.DEBUG]
+    # One warning per exception type, a debug record (with traceback) per failure.
+    assert [w.getMessage().split("(")[1].split(")")[0] for w in warnings] == [
+        "RuntimeError",
+        "ValueError",
+    ]
+    assert "100 booked tokens" in warnings[0].getMessage()
+    assert all(w.exc_info is None for w in warnings)
+    assert not any("secret-schema-text" in w.getMessage() for w in warnings)
+    assert len(debugs) == 3
+    assert all(d.exc_info is not None for d in debugs)
+
+
+def test_reconcile_warned_set_is_bounded() -> None:
+    from headroom.proxy import tool_schema_savings_policy as policy
+
+    policy._reconcile_warned_types.clear()
+    try:
+        for i in range(policy._RECONCILE_WARNED_MAX + 5):
+            policy._log_reconcile_failure(type(f"Err{i}", (Exception,), {})(), 1)
+        assert len(policy._reconcile_warned_types) <= policy._RECONCILE_WARNED_MAX
+    finally:
+        policy._reconcile_warned_types.clear()

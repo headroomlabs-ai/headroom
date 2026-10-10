@@ -72,3 +72,15 @@ def test_broken_price_entry_logs_with_traceback(captured) -> None:
     assert len(failures) == 1
     assert failures[0].exc_info is not None
     assert not any("No litellm" in r.getMessage() for r in captured)
+
+
+def test_unpriced_model_set_is_bounded(captured) -> None:
+    for i in range(st._UNPRICED_MODELS_LOGGED_MAX + 10):
+        st._estimate_compression_savings_usd(f"alias-{i}", 10)
+    assert len(st._unpriced_models_logged) <= st._UNPRICED_MODELS_LOGGED_MAX
+
+
+def test_unpriced_model_not_marked_when_debug_disabled(captured) -> None:
+    st.logger.setLevel(logging.INFO)
+    st._estimate_compression_savings_usd("quiet-model", 10)
+    assert "quiet-model" not in st._unpriced_models_logged

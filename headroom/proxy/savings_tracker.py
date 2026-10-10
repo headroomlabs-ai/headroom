@@ -393,14 +393,19 @@ def _resolve_litellm_model(model: str) -> str:
 
 # An unpriced model (a local model, a gateway alias, a model newer than the
 # bundled litellm) is an expected case, and the estimators below run on every
-# request, so each model is logged once per process. Debug, not warning:
-# proxy/cost.py already warns once per unpriceable model on the live path.
+# request, so each model is logged once. Debug, not warning: proxy/cost.py
+# already warns once per unpriceable model on the live path. Model names come
+# from clients, so the set is capped like _resolve_litellm_model's cache and
+# cleared when full (a model may then be logged again).
+_UNPRICED_MODELS_LOGGED_MAX = _MODEL_RESOLUTION_CACHE_MAXSIZE
 _unpriced_models_logged: set[str] = set()
 
 
 def _log_unpriced_model_once(model: str, field: str) -> None:
-    if model in _unpriced_models_logged:
+    if model in _unpriced_models_logged or not logger.isEnabledFor(logging.DEBUG):
         return
+    if len(_unpriced_models_logged) >= _UNPRICED_MODELS_LOGGED_MAX:
+        _unpriced_models_logged.clear()
     _unpriced_models_logged.add(model)
     logger.debug("No litellm %s for model=%s; savings and cost use the fallback rate", field, model)
 

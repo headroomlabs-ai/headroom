@@ -3210,13 +3210,16 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
 
         settings_file = _hr_paths.settings_path()
         settings_store.apply_to_environ(settings_store.load())
-    except Exception:  # noqa: BLE001 — settings load must never break startup
+    except Exception as exc:  # noqa: BLE001 — settings load must never break startup
+        # Settings values can hold credentials, so only the exception type is
+        # logged at warning; the full detail stays at debug.
         logger.warning(
-            "Could not apply saved settings from %s; continuing with env and defaults. "
-            "Fix or remove that file and restart the proxy.",
+            "Could not apply saved settings from %s (%s); continuing with env and "
+            "defaults. Fix or remove that file and restart the proxy.",
             settings_file,
-            exc_info=True,
+            type(exc).__name__,
         )
+        logger.debug("Saved settings apply failed for %s", settings_file, exc_info=True)
 
     # Air-gap master switch. Propagate config.offline to the env so the
     # env-based egress predicates (telemetry, update check, license) all honor
@@ -4230,14 +4233,15 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
                     action="admin_request",
                     status_code=response.status_code,
                 )
-        except Exception:
+        except Exception as exc:
             logger.warning(
-                "Admin audit record not written for %s %s; this request is missing from "
-                "the headroom.audit trail. Report this with the traceback.",
+                "Admin audit record not written for %s %s (%s); this request is missing "
+                "from the headroom.audit trail. Please report this as a bug.",
                 request.method,
                 request.url.path,
-                exc_info=True,
+                type(exc).__name__,
             )
+            logger.debug("Admin audit emission failed", exc_info=True)
         return response
 
     # The gate above is http-only (BaseHTTPMiddleware ignores every other
