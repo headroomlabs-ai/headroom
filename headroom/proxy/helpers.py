@@ -18,6 +18,7 @@ import random
 import re
 import threading
 import time
+import warnings
 from collections import OrderedDict
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass
@@ -1986,7 +1987,19 @@ def _setup_file_logging(
 
 
 def is_anthropic_auth(headers: dict[str, str]) -> bool:
-    """Detect Anthropic auth signals in request headers."""
+    """Detect Anthropic auth signals in request headers.
+
+    .. deprecated::
+        Request routing does not use this. It uses the classifier in
+        ``headroom.providers.registry``, which also recognises Claude Code's
+        user-agent.
+    """
+    warnings.warn(
+        "is_anthropic_auth is deprecated and will be removed in a future release; "
+        "request routing uses the auth classifier in headroom.providers.registry.",
+        DeprecationWarning,
+        stacklevel=2,
+    )
     if headers.get("x-api-key") or headers.get("anthropic-version"):
         return True
     auth = headers.get("authorization", "")
