@@ -50,6 +50,12 @@ _DEPRECATED_EXPORTS: dict[str, tuple[str, str]] = {
     "StructureMask": ("headroom.compression.masks", "StructureMask"),
 }
 
+# On importlib.reload() the module dict is reused; drop cached exports so the
+# next access resolves (and warns) against the current submodules.
+for _name in _DEPRECATED_EXPORTS:
+    globals().pop(_name, None)
+del _name
+
 
 def __getattr__(name: str) -> object:
     try:

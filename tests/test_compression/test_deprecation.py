@@ -67,3 +67,16 @@ def test_detector_import_stays_quiet(monkeypatch: pytest.MonkeyPatch) -> None:
         warnings.simplefilter("error", DeprecationWarning)
         detector = importlib.import_module("headroom.compression.detector")
     assert callable(detector._magika_available)
+
+
+@pytest.mark.usefixtures("fresh")
+def test_reload_drops_cached_exports(monkeypatch: pytest.MonkeyPatch) -> None:
+    import headroom.compression.detector as detector
+
+    with pytest.warns(DeprecationWarning):
+        old_content_type = compression.ContentType
+    monkeypatch.setattr(detector, "ContentType", type("ReloadedContentType", (), {}))
+    importlib.reload(compression)
+    with pytest.warns(DeprecationWarning):
+        assert compression.ContentType is detector.ContentType
+    assert compression.ContentType is not old_content_type
