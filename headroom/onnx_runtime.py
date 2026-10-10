@@ -81,6 +81,11 @@ _PINNED_REVISIONS: dict[str, str] = {
     "chopratejas/siglip-image-encoder-onnx": "d0a9fbd66d4bd8c761bff592d44831f7c2ae184e",
     # Third-party repo — pinning matters most here.
     "Qdrant/all-MiniLM-L6-v2-onnx": "5f1b8cd78bc4fb444dd171e59b18f3a3af89a079",
+    # Default relevance embedder (BAAI/bge-small-en-v1.5), third-party too.
+    # The Rust scorer loads the same snapshot: keep this SHA equal to
+    # DEFAULT_MODEL_REVISION in crates/headroom-core/src/relevance/embedding.rs
+    # (tests/test_fastembed_pinned_snapshot.py enforces it).
+    "Qdrant/bge-small-en-v1.5-onnx-Q": "52398278842ec682c6f32300af41344b1c0b0bb2",
 }
 
 

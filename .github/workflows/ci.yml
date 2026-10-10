@@ -459,8 +459,11 @@ jobs:
       - name: Cache fastembed model
         uses: actions/cache@v6
         with:
-          path: ${{ github.workspace }}/.fastembed-cache
-          key: ${{ runner.os }}-fastembed-bge-small-v1
+          # The default relevance model loads from its pinned snapshot in the
+          # HuggingFace hub cache (headroom/onnx_runtime.py _PINNED_REVISIONS);
+          # the key carries the pinned SHA so a bump re-fetches.
+          path: ~/.cache/huggingface/hub/models--Qdrant--bge-small-en-v1.5-onnx-Q
+          key: ${{ runner.os }}-hf-bge-small-en-v1.5-onnx-Q-52398278842e
       - name: Download prebuilt wheel
         uses: actions/download-artifact@v8
         with:
@@ -481,17 +484,19 @@ jobs:
           HF_HUB_DISABLE_TELEMETRY: "1"
         run: |
           for i in 1 2 3 4 5; do
-            if python -c "from fastembed import TextEmbedding; TextEmbedding('BAAI/bge-small-en-v1.5')"; then exit 0; fi
+            if python -c "from headroom.relevance.embedding import _resolve_default_model_snapshot as r; print(r())"; then exit 0; fi
             echo "::warning::fastembed fetch attempt $i failed; backing off"; sleep $((i * 20))
           done
           echo "::error::could not fetch fastembed model from HuggingFace"; exit 1
       - name: Run relevance tests
         # Offline so fastembed reads the cache the prefetch step just warmed,
         # without an unauthenticated cache-validation HEAD that could 429.
+        # RUN_FASTEMBED_TESTS runs the Python half of the embedding parity check.
         env:
           HF_HUB_OFFLINE: "1"
           TRANSFORMERS_OFFLINE: "1"
-        run: pytest tests/test_relevance.py -v
+          RUN_FASTEMBED_TESTS: "1"
+        run: pytest tests/test_relevance.py tests/test_fastembed_pinned_snapshot.py -v
 
       - name: Run HTML extraction and tool reversibility tests
         run: |
