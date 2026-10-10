@@ -581,6 +581,72 @@ def test_handle_openai_responses_api_auth_store_false_injects_stateless_memory_t
     assert memory_handler.compute_calls == 1
 
 
+def test_handle_openai_responses_memory_lookup_exception_fails_open_and_forwards_original_request(
+    monkeypatch,
+):
+    import sqlite3
+
+    class _FailingContextMemoryHandler:
+        def __init__(self) -> None:
+            self.config = SimpleNamespace(
+                inject_context=True,
+                inject_tools=False,
+                project_root_override=str(Path(".").resolve()),
+            )
+            self.call_count = 0
+
+        async def search_and_format_context(self, user_id, messages, **kwargs):
+            self.call_count += 1
+            raise sqlite3.OperationalError("unable to open database file")
+
+        def compute_memory_tool_definitions(self, provider: str) -> list[dict]:
+            return []
+
+        def has_memory_tool_calls(self, response, provider: str) -> bool:
+            return False
+
+    handler = _DummyOpenAIHandler()
+    memory_handler = _FailingContextMemoryHandler()
+    handler.memory_handler = memory_handler
+    handler.session_tracker_store = SimpleNamespace(
+        compute_session_id=lambda *a, **k: "sess-api-memory-fallback",
+    )
+
+    monkeypatch.setattr("headroom.tokenizers.get_tokenizer", lambda model: _DummyTokenizer())
+
+    req1 = _build_request(
+        {"model": "gpt-4o-mini", "input": "turn 1 original", "store": False},
+        {
+            "Authorization": "Bearer sk-test",
+            "User-Agent": "codex-cli/0.5",
+            "x-headroom-user-id": "user-1",
+        },
+    )
+    req2 = _build_request(
+        {"model": "gpt-4o-mini", "input": "turn 2 original", "store": False},
+        {
+            "Authorization": "Bearer sk-test",
+            "User-Agent": "codex-cli/0.5",
+            "x-headroom-user-id": "user-1",
+        },
+    )
+
+    # First request: lookup fails, original body forwarded without memory, response succeeds
+    res1 = anyio.run(handler.handle_openai_responses, req1)
+    assert res1.status_code == 200
+    assert handler.captured_request is not None
+    _, _, _, body1 = handler.captured_request
+    assert body1["input"] == "turn 1 original"
+
+    # Subsequent request: handler continues serving traffic normally
+    res2 = anyio.run(handler.handle_openai_responses, req2)
+    assert res2.status_code == 200
+    assert handler.captured_request is not None
+    _, _, _, body2 = handler.captured_request
+    assert body2["input"] == "turn 2 original"
+    assert memory_handler.call_count == 2
+
+
 @pytest.mark.parametrize("store", [pytest.param(None, id="omitted"), True, False])
 @pytest.mark.parametrize(
     "include",

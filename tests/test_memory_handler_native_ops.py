@@ -1414,3 +1414,17 @@ async def test_memory_list_dispatched_via_execute_memory_tool(handler: MemoryHan
     payload = json.loads(out)
     assert payload["status"] == "ok"
     assert payload["memories"][0]["id"] == "m1"
+
+
+@pytest.mark.asyncio
+async def test_search_and_format_context_degrades_gracefully_on_backend_error(
+    handler: MemoryHandler, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import sqlite3
+
+    async def fail_init() -> None:
+        raise sqlite3.OperationalError("unable to open database file")
+
+    monkeypatch.setattr(handler, "_ensure_initialized", fail_init)
+    result = await handler.search_and_format_context("u1", [{"role": "user", "content": "hello"}])
+    assert result is None

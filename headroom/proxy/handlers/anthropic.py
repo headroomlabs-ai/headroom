@@ -2844,6 +2844,12 @@ class AnthropicHandlerMixin:
                             f"{self.config.anthropic_pre_upstream_memory_context_timeout_seconds:.1f}s; "
                             "continuing without it"
                         )
+                    except Exception as e:
+                        memory_context = None
+                        logger.warning(
+                            f"[{request_id}] Memory: Context lookup failed: {e}; "
+                            "continuing without it"
+                        )
                     try:
                         if memory_context:
                             from headroom.proxy.helpers import (
