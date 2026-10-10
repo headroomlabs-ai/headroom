@@ -777,27 +777,6 @@ def _codex_compression_debug_enabled() -> bool:
     return _log_codex_compression_debug is not _CODEX_COMPRESSION_DEBUG_NOOP
 
 
-def _json_shape(value: str) -> dict[str, Any]:
-    try:
-        parsed = json.loads(value)
-    except Exception as exc:
-        return {"is_json": False, "error": type(exc).__name__}
-    if isinstance(parsed, dict):
-        return {
-            "is_json": True,
-            "kind": "object",
-            "keys": list(parsed.keys()),
-            "length": len(parsed),
-        }
-    if isinstance(parsed, list):
-        return {"is_json": True, "kind": "array", "length": len(parsed)}
-    return {"is_json": True, "kind": type(parsed).__name__}
-
-
-def _routing_log_debug(_router_result: Any) -> list[dict[str, Any]]:
-    return []
-
-
 _OPENAI_TOOL_SCHEMA_DROP_KEYS = {
     "$id",
     "$schema",
@@ -2138,7 +2117,6 @@ class OpenAIHandlerMixin:
         *,
         model: str,
         request_id: str,
-        pass_id: str | None = None,
         timing: dict[str, float] | None = None,
         deadline_started_at: float | None = None,
     ) -> tuple[dict[str, Any], bool, int, list[str], dict[str, int], list[str], int]:
@@ -2151,18 +2129,6 @@ class OpenAIHandlerMixin:
         items such as reasoning, compaction, tool calls, and non-string outputs
         are intentionally not exposed as text units.
         """
-
-        debug_enabled = _codex_compression_debug_enabled()
-
-        def _log(_event: str, **_fields: Any) -> None:
-            if debug_enabled:
-                _log_codex_compression_debug(
-                    _event,
-                    request_id=request_id,
-                    pass_id=pass_id,
-                    model=model,
-                    **_fields,
-                )
 
         input_items = payload.get("input")
         messages_items = payload.get("messages")
@@ -2408,7 +2374,6 @@ class OpenAIHandlerMixin:
         # (item_index, slot_ref, folded_text, original_text). Spliced after the
         # normal candidate compression — no ML, byte/data-lossless only.
         lossless_excluded: list[tuple[int, tuple[str, int | None], str, str]] = []
-        extraction_debug: list[dict[str, Any]] = []
         last_user_item_idx = max(
             (
                 idx
@@ -2421,65 +2386,20 @@ class OpenAIHandlerMixin:
         )
         for idx, item in enumerate(items):
             if not isinstance(item, dict):
-                if debug_enabled:
-                    extraction_debug.append(
-                        {
-                            "index": idx,
-                            "eligible": False,
-                            "reason": "item_not_dict",
-                            "item_type": type(item).__name__,
-                            "item": item,
-                        }
-                    )
                 continue
             item_type = item.get("type")
             if item_type in self.OPENAI_RESPONSES_OUTPUT_TYPES:
                 call_id = item.get("call_id")
                 if isinstance(call_id, str) and call_id in headroom_retrieve_call_ids:
-                    if debug_enabled:
-                        extraction_debug.append(
-                            {
-                                "index": idx,
-                                "eligible": False,
-                                "reason": "headroom_retrieve_output_protected",
-                                "item_type": item_type,
-                                "call_id": call_id,
-                                "item": item,
-                            }
-                        )
                     continue
                 if isinstance(call_id, str) and call_id in read_command_by_call_id:
                     # Finalize by CONTENT (same gate as ContentRouter.apply):
                     # protect unless the output is confidently non-code DATA.
                     if _read_output_should_be_protected(_responses_part_text(item.get("output"))):
                         read_protected_call_ids.add(call_id)
-                        if debug_enabled:
-                            extraction_debug.append(
-                                {
-                                    "index": idx,
-                                    "eligible": False,
-                                    "reason": "read_command_protected",
-                                    "item_type": item_type,
-                                    "call_id": call_id,
-                                    "command": read_command_by_call_id[call_id],
-                                    "item": item,
-                                }
-                            )
                         continue
                 if isinstance(call_id, str) and call_id in excluded_call_ids:
                     if call_id in verbatim_excluded_call_ids:
-                        if debug_enabled:
-                            extraction_debug.append(
-                                {
-                                    "index": idx,
-                                    "eligible": False,
-                                    "reason": "exclude_tools_verbatim",
-                                    "item_type": item_type,
-                                    "call_id": call_id,
-                                    "tool_name": function_name_by_call_id.get(call_id),
-                                    "item": item,
-                                }
-                            )
                         continue
                     # Protected from lossy compression — but grep/log/json output
                     # can still be losslessly compacted. Reuse the router helper
@@ -2490,10 +2410,9 @@ class OpenAIHandlerMixin:
                     # A file read skips the fold entirely: this is the Codex wire,
                     # where `read` really does return raw file bytes, so a fold here
                     # is exactly what breaks the next `Edit(old_string=…)`.
-                    excluded_folded = False
                     raw_output = item.get("output")
                     if call_id in byte_exact_call_ids:
-                        pass  # byte-exact: no fold, fall through to the debug record
+                        pass  # byte-exact: no fold
                     elif isinstance(raw_output, list):
                         for pidx, part in enumerate(raw_output):
                             if (
@@ -2504,7 +2423,6 @@ class OpenAIHandlerMixin:
                                 part_text = part["text"]
                                 pf = router._lossless_compact_excluded(part_text)
                                 if pf is not None:
-                                    excluded_folded = True
                                     lossless_excluded.append(
                                         (idx, ("output_part", pidx), pf[0], part_text)
                                     )
@@ -2512,128 +2430,20 @@ class OpenAIHandlerMixin:
                         excl_out = _responses_part_text(raw_output)
                         fold = router._lossless_compact_excluded(excl_out) if excl_out else None
                         if fold is not None:
-                            excluded_folded = True
                             lossless_excluded.append((idx, ("output", None), fold[0], excl_out))
-                    if debug_enabled:
-                        extraction_debug.append(
-                            {
-                                "index": idx,
-                                "eligible": False,
-                                "reason": (
-                                    "exclude_tools_lossless_fold"
-                                    if excluded_folded
-                                    else "exclude_tools_protected"
-                                ),
-                                "item_type": item_type,
-                                "call_id": call_id,
-                                "tool_name": function_name_by_call_id.get(call_id),
-                                "item": item,
-                            }
-                        )
-                    continue
-                slots = _slot_texts(item)
-                if slots:
-                    for text, slot_ref in slots:
-                        candidates.append((idx, slot_ref, text))
-                        if debug_enabled:
-                            extraction_debug.append(
-                                {
-                                    "index": idx,
-                                    "eligible": True,
-                                    "item_type": item_type,
-                                    "role": item.get("role"),
-                                    "slot": slot_ref,
-                                    "text_chars": len(text),
-                                    "text_bytes": len(text.encode("utf-8", errors="replace")),
-                                    "text_json_shape": _json_shape(text),
-                                    "item": item,
-                                    "text": text,
-                                }
-                            )
-                else:
-                    if debug_enabled:
-                        extraction_debug.append(
-                            {
-                                "index": idx,
-                                "eligible": False,
-                                "reason": "output_type_without_text_slot",
-                                "item_type": item_type,
-                                "item": item,
-                            }
-                        )
-            elif item_type == "message":
-                if item.get("role") == "user" and idx == last_user_item_idx:
-                    if debug_enabled:
-                        extraction_debug.append(
-                            {
-                                "index": idx,
-                                "eligible": False,
-                                "reason": "current_user_message_protected",
-                                "item_type": item_type,
-                                "role": item.get("role"),
-                                "item": item,
-                            }
-                        )
                     continue
                 slots = _slot_texts(item)
                 for text, slot_ref in slots:
                     candidates.append((idx, slot_ref, text))
-                    if debug_enabled:
-                        extraction_debug.append(
-                            {
-                                "index": idx,
-                                "eligible": True,
-                                "item_type": item_type,
-                                "role": item.get("role"),
-                                "slot": slot_ref,
-                                "text_chars": len(text),
-                                "text_bytes": len(text.encode("utf-8", errors="replace")),
-                                "text_json_shape": _json_shape(text),
-                                "item": item,
-                                "text": text,
-                            }
-                        )
-                if not slots and debug_enabled:
-                    extraction_debug.append(
-                        {
-                            "index": idx,
-                            "eligible": False,
-                            "reason": "supported_type_without_text_slot",
-                            "item_type": item_type,
-                            "item": item,
-                        }
-                    )
-            else:
-                if debug_enabled:
-                    extraction_debug.append(
-                        {
-                            "index": idx,
-                            "eligible": False,
-                            "reason": "unsupported_item_type",
-                            "item_type": item_type,
-                            "role": item.get("role"),
-                            "item": item,
-                        }
-                    )
+            elif item_type == "message":
+                if item.get("role") == "user" and idx == last_user_item_idx:
+                    continue
+                slots = _slot_texts(item)
+                for text, slot_ref in slots:
+                    candidates.append((idx, slot_ref, text))
 
         _add_timing("compression_live_unit_extraction", extraction_started)
-        _log(
-            "codex_compression_extraction",
-            item_count=len(items),
-            candidate_count=len(candidates),
-            payload=payload,
-            extraction=extraction_debug,
-        )
         if not candidates and not lossless_excluded:
-            _log(
-                "codex_compression_payload_result",
-                modified=False,
-                reason="no_candidates",
-                tokens_saved_total=0,
-                transforms=[],
-                input_payload=payload,
-                output_payload=payload,
-            )
             return payload, False, 0, [], {}, [], 0
 
         deepcopy_started = time.perf_counter()
@@ -2662,7 +2472,6 @@ class OpenAIHandlerMixin:
         routed_units: list[RoutedCompressionUnit] = []
 
         unit_build_started = time.perf_counter()
-        unit_debug: list[dict[str, Any]] = []
         for item_idx, slot_ref, original_text in candidates:
             item = items[item_idx] if item_idx < len(items) else {}
             item_type = item.get("type", "unknown") if isinstance(item, dict) else "unknown"
@@ -2689,34 +2498,10 @@ class OpenAIHandlerMixin:
                 metadata=metadata,
             )
             routed_units.append(RoutedCompressionUnit(unit=unit, slot=(item_idx, slot_ref)))
-            if debug_enabled:
-                unit_debug.append(
-                    {
-                        "item_index": item_idx,
-                        "slot": slot_ref,
-                        "provider": unit.provider,
-                        "endpoint": unit.endpoint,
-                        "role": unit.role,
-                        "item_type": unit.item_type,
-                        "cache_zone": unit.cache_zone,
-                        "mutable": unit.mutable,
-                        "min_bytes": unit.min_bytes,
-                        "text_chars": len(unit.text),
-                        "text_bytes": len(unit.text.encode("utf-8", errors="replace")),
-                        "text_json_shape": _json_shape(unit.text),
-                        "text": unit.text,
-                    }
-                )
         _add_timing("compression_unit_build", unit_build_started)
 
-        _log(
-            "codex_compression_units",
-            units=unit_debug,
-        )
-
-        # Tally per-category counts as units stream in so the pass_summary
-        # event below can emit a one-line breakdown — log readers shouldn't
-        # have to re-aggregate from scattered unit_result events.
+        # Per-category unit counts and the union of strategy chains, returned
+        # to the caller with the compressed payload.
         units_by_category: dict[str, int] = {}
         strategy_chain_union: list[str] = []
 
@@ -2937,33 +2722,6 @@ class OpenAIHandlerMixin:
             # role-protected, or in a frozen cache_zone don't count.
             if result.router_result is not None or result.modified:
                 attempted_input_tokens += result.tokens_before
-            if debug_enabled:
-                _log(
-                    "codex_compression_unit_result",
-                    item_index=item_idx,
-                    slot=slot_ref,
-                    modified=result.modified,
-                    reason=result.reason,
-                    reason_category=cat,
-                    text_bytes=result.text_bytes,
-                    min_bytes=result.min_bytes,
-                    strategy=result.strategy,
-                    strategy_chain=router_chain,
-                    tokens_before=result.tokens_before,
-                    tokens_after=result.tokens_after,
-                    tokens_saved=result.tokens_saved,
-                    transforms_applied=result.transforms_applied,
-                    router_strategy=(
-                        result.router_result.strategy_used.value if result.router_result else None
-                    ),
-                    router_summary=result.router_result.summary() if result.router_result else None,
-                    router_routing_log=_routing_log_debug(result.router_result),
-                    router_cache_hit=(
-                        result.router_result.cache_hit if result.router_result else False
-                    ),
-                    original=result.original,
-                    compressed=result.compressed,
-                )
             if not result.modified:
                 continue
 
@@ -3015,17 +2773,6 @@ class OpenAIHandlerMixin:
                 if "router:responses_cross_turn_dedup" not in transforms:
                     transforms.append("router:responses_cross_turn_dedup")
 
-        _log(
-            "codex_compression_payload_result",
-            modified=modified,
-            tokens_saved_total=tokens_saved_total,
-            attempted_input_tokens=attempted_input_tokens,
-            transforms=transforms,
-            units_by_category=units_by_category,
-            strategy_chain=strategy_chain_union,
-            input_payload=payload,
-            output_payload=updated if modified else payload,
-        )
         return (
             updated,
             modified,
@@ -3311,7 +3058,6 @@ class OpenAIHandlerMixin:
             working,
             model=model,
             request_id=request_id,
-            pass_id=pass_id,
             timing=timing_sink,
             deadline_started_at=deadline_started_at,
         )
