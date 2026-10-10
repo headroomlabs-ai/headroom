@@ -600,16 +600,14 @@ class LogCompressor:
             for level, count in omitted_counts.items():
                 if count > 0:
                     summary_parts.append(f"{count} {level.name}")
-            if summary_parts:
-                omitted_names = ""
-                if omitted_short_summary_ids:
-                    omitted_names = "; omitted: " + ", ".join(omitted_short_summary_ids[:5])
-                    overflow = len(omitted_short_summary_ids) - 5
-                    if overflow > 0:
-                        omitted_names += f", +{overflow} more"
-                output_lines.append(
-                    f"[{omitted} lines omitted: {', '.join(summary_parts)}{omitted_names}]"
-                )
+            omitted_names = ""
+            if omitted_short_summary_ids:
+                omitted_names = "; omitted: " + ", ".join(omitted_short_summary_ids[:5])
+                overflow = len(omitted_short_summary_ids) - 5
+                if overflow > 0:
+                    omitted_names += f", +{overflow} more"
+            summary = f": {', '.join(summary_parts)}" if summary_parts else ""
+            output_lines.append(f"[{omitted} lines omitted{summary}{omitted_names}]")
         return "\n".join(output_lines), stats
 
     def _store_in_ccr(self, original: str, compressed: str, original_count: int) -> str | None:

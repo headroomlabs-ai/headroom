@@ -573,3 +573,35 @@ def test_omitted_marker_mirror_preserves_input_totals(selected_indices: tuple[in
         "total": 8,
         "selected": len(selected),
     }
+
+
+@pytest.mark.parametrize("prefix", ["DEBUG ", "TRACE ", ""])
+def test_non_severity_omissions_keep_count_notice_on_native_path(prefix: str) -> None:
+    error = "ERROR retained failure"
+    original = "\n".join([f"{prefix}progress step {i}" for i in range(100)] + [error])
+    result = LogCompressor(LogCompressorConfig(enable_ccr=False)).compress(original)
+    marker = re.search(r"(?m)^\[(\d+) lines omitted[^\]]*\]$", result.compressed)
+    assert marker is not None
+    assert int(marker[1]) == result.lines_omitted
+    assert not re.search(r"\d+ (ERROR|FAIL|WARN|INFO)\b", marker[0])
+    assert error in result.compressed.splitlines()
+    assert result.stats["errors"] == 1
+    assert result.stats["total"] == 101
+
+
+def test_non_severity_omissions_keep_count_notice_in_mirror() -> None:
+    error = LogLine(0, "ERROR retained failure", level=LogLevel.ERROR)
+    all_lines = [
+        error,
+        LogLine(1, "DEBUG progress", level=LogLevel.DEBUG),
+        LogLine(2, "TRACE progress", level=LogLevel.TRACE),
+        LogLine(3, "unclassified progress", level=LogLevel.UNKNOWN),
+    ]
+    output, stats = LogCompressor()._format_output([error], all_lines)
+    marker = re.search(r"(?m)^\[(\d+) lines omitted[^\]]*\]$", output)
+    assert marker is not None
+    assert int(marker[1]) == 3
+    assert not re.search(r"\d+ (ERROR|FAIL|WARN|INFO)\b", marker[0])
+    assert error.content in output.splitlines()
+    assert stats["errors"] == 1
+    assert stats["total"] == 4

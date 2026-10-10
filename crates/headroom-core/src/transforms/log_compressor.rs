@@ -1557,23 +1557,25 @@ impl LogCompressor {
                     summary_parts.push(format!("{} {}", n, label));
                 }
             }
-            if !summary_parts.is_empty() {
-                let omitted_names = if omitted_short_summary_ids.is_empty() {
-                    String::new()
+            let omitted_names = if omitted_short_summary_ids.is_empty() {
+                String::new()
+            } else {
+                let shown = omitted_short_summary_ids
+                    .iter()
+                    .take(5)
+                    .copied()
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                let overflow = omitted_short_summary_ids.len().saturating_sub(5);
+                if overflow > 0 {
+                    format!("; omitted: {shown}, +{overflow} more")
                 } else {
-                    let shown = omitted_short_summary_ids
-                        .iter()
-                        .take(5)
-                        .copied()
-                        .collect::<Vec<_>>()
-                        .join(", ");
-                    let overflow = omitted_short_summary_ids.len().saturating_sub(5);
-                    if overflow > 0 {
-                        format!("; omitted: {shown}, +{overflow} more")
-                    } else {
-                        format!("; omitted: {shown}")
-                    }
-                };
+                    format!("; omitted: {shown}")
+                }
+            };
+            if summary_parts.is_empty() {
+                output.push(format!("[{} lines omitted{}]", omitted, omitted_names));
+            } else {
                 output.push(format!(
                     "[{} lines omitted: {}{}]",
                     omitted,
@@ -2354,6 +2356,38 @@ mod tests {
         assert!(level_counts.next().is_none());
         assert_eq!(result.stats["errors"], 1);
         assert_eq!(result.stats["info"], 400);
+    }
+
+    #[test]
+    fn omitted_non_severity_lines_keep_count_notice_on_live_path() {
+        use std::fmt::Write as _;
+
+        let count_pattern = Regex::new(r"(?m)^\[(\d+) lines omitted[^\]]*\]$").unwrap();
+        let level_pattern = Regex::new(r"\d+ (ERROR|FAIL|WARN|INFO)\b").unwrap();
+        let error = "ERROR retained failure";
+        for prefix in ["DEBUG ", "TRACE ", ""] {
+            let mut input = String::with_capacity(4096);
+            for i in 0..100 {
+                writeln!(input, "{prefix}progress step {i}").unwrap();
+            }
+            input.push_str(error);
+            let c = LogCompressor::new(LogCompressorConfig {
+                enable_ccr: false,
+                ..Default::default()
+            });
+            let (result, _) = c.compress(&input, 1.0);
+            let marker = count_pattern
+                .captures(&result.compressed)
+                .expect("dropped lines must retain an omission count");
+            assert_eq!(
+                marker[1].parse::<usize>().unwrap(),
+                result.original_line_count - result.compressed_line_count
+            );
+            assert!(!level_pattern.is_match(marker.get(0).unwrap().as_str()));
+            assert!(result.compressed.lines().any(|line| line == error));
+            assert_eq!(result.stats["errors"], 1);
+            assert_eq!(result.stats["total"], 101);
+        }
     }
 
     #[test]
