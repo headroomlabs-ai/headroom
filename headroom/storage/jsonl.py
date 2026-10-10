@@ -5,13 +5,24 @@ from __future__ import annotations
 import heapq
 import json
 from collections.abc import Iterator
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
 from ..config import RequestMetrics
 from ..utils import format_timestamp, parse_timestamp
 from .base import Storage
+
+
+def _naive_utc(dt: datetime) -> datetime:
+    """Normalize a filter bound to naive UTC, matching stored timestamps.
+
+    Stored metrics are parsed from UTC strings without an offset, so passing a
+    timezone-aware bound would otherwise raise on the first comparison.
+    """
+    if dt.tzinfo is not None:
+        return dt.astimezone(timezone.utc).replace(tzinfo=None)
+    return dt
 
 
 class JSONLStorage(Storage):
@@ -130,6 +141,9 @@ class JSONLStorage(Storage):
         if limit == 0:
             return []
 
+        start_time = _naive_utc(start_time) if start_time is not None else None
+        end_time = _naive_utc(end_time) if end_time is not None else None
+
         def _matches(metrics: RequestMetrics) -> bool:
             if start_time is not None and metrics.timestamp < start_time:
                 return False
@@ -156,6 +170,8 @@ class JSONLStorage(Storage):
         mode: str | None = None,
     ) -> int:
         """Count metrics matching filters."""
+        start_time = _naive_utc(start_time) if start_time is not None else None
+        end_time = _naive_utc(end_time) if end_time is not None else None
         count = 0
 
         for metrics in self.iter_all():
@@ -194,6 +210,8 @@ class JSONLStorage(Storage):
         end_time: datetime | None = None,
     ) -> dict[str, Any]:
         """Get summary statistics."""
+        start_time = _naive_utc(start_time) if start_time is not None else None
+        end_time = _naive_utc(end_time) if end_time is not None else None
         total_requests = 0
         total_tokens_before = 0
         total_tokens_after = 0

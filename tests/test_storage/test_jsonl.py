@@ -244,3 +244,38 @@ class TestJSONLQuerySingleRowRegression:
 
         jsonl.close()
         sqlite.close()
+
+
+class TestJSONLTimezoneAwareFilters:
+    """Aware filter bounds must not reject stored naive UTC timestamps (issue #4062)."""
+
+    def _save_boundary_record(self, tmp_path):
+        from datetime import timezone
+
+        stamp = datetime(2026, 4, 23, 12, tzinfo=timezone.utc)
+        store = JSONLStorage(f"{tmp_path}/metrics.jsonl")
+        store.save(_metrics("boundary", stamp))
+        return store, stamp
+
+    def test_aware_bound_matches_stored_record(self, tmp_path):
+
+        store, stamp = self._save_boundary_record(tmp_path)
+        assert store.count(start_time=stamp) == 1
+        assert _ids(store.query(start_time=stamp)) == ["boundary"]
+        assert store.get_summary_stats(start_time=stamp)["total_requests"] == 1
+
+    def test_aware_bound_converted_to_utc(self, tmp_path):
+        from datetime import timezone
+
+        store, stamp = self._save_boundary_record(tmp_path)
+        # +05:00 of the same instant: 17:00+05:00 == 12:00Z.
+        shifted = stamp.astimezone(timezone(timedelta(hours=5)))
+        assert store.count(start_time=shifted) == 1
+        assert store.count(start_time=stamp + timedelta(seconds=1)) == 0
+
+    def test_naive_and_aware_bounds_agree(self, tmp_path):
+
+        store, stamp = self._save_boundary_record(tmp_path)
+        naive_utc = stamp.replace(tzinfo=None)
+        assert store.count(start_time=stamp) == store.count(start_time=naive_utc)
+        assert _ids(store.query(start_time=stamp)) == _ids(store.query(start_time=naive_utc))
