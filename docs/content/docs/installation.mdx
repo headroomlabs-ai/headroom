@@ -83,7 +83,7 @@ The core package includes the `compress()` function, SmartCrusher, CacheAligner,
 
 ### Extras
 
-Install only what you need, or grab everything with `[all]`:
+Install only what you need, or use `[all]` for the default CLI/proxy feature set:
 
 ```bash
 pip install "headroom-ai[all]"
@@ -93,16 +93,16 @@ pip install "headroom-ai[all]"
 |---|---|---|
 | `proxy` | Proxy server, HTTP API, MCP runtime, local ONNX Kompress path | `pip install "headroom-ai[proxy]"` |
 | `proxy-prod` | `proxy` plus gunicorn on Unix production hosts | `pip install "headroom-ai[proxy,proxy-prod]"` |
-| `ml` | PyTorch/Hugging Face Kompress backend and model tooling | `pip install "headroom-ai[ml]"` |
+| `ml` | PyTorch/Hugging Face Kompress backend and model tooling; opt-in, not in `[all]` | `pip install "headroom-ai[ml]"` |
 | `code` | CodeCompressor (tree-sitter AST parsing) | `pip install "headroom-ai[code]"` |
-| `memory` | Persistent memory (sqlite-vec, sentence-transformers) — pure-Python default backend, no compiler | `pip install "headroom-ai[memory]"` |
+| `memory` | Persistent memory (sqlite-vec, sentence-transformers); opt-in, not in `[all]` | `pip install "headroom-ai[memory]"` |
 | `vector` | Optional HNSW vector backend (hnswlib) — needs a C++ toolchain; **not in `[all]`** | `pip install "headroom-ai[vector]"` |
 | `memory-stack` | Optional Qdrant + Neo4j memory backend helpers; **not in `[all]`** | `pip install "headroom-ai[memory-stack]"` |
 | `relevance` | fastembed-based relevance scoring (BAAI/bge-small-en-v1.5, ONNX) | `pip install "headroom-ai[relevance]"` |
 | `image` | Image compression (Pillow, ONNX runtime, OCR) | `pip install "headroom-ai[image]"` |
 | `reports` | HTML/Markdown report generation (Jinja2) | `pip install "headroom-ai[reports]"` |
 | `otel` | OpenTelemetry exporter (OTLP) | `pip install "headroom-ai[otel]"` |
-| `voice` | Voice/audio support | `pip install "headroom-ai[voice]"` |
+| `voice` | Voice/audio support; opt-in, not in `[all]` | `pip install "headroom-ai[voice]"` |
 | `voice-train` | Voice training dependencies; **not in `[all]`** | `pip install "headroom-ai[voice-train]"` |
 | `mcp` | MCP server tools (`headroom_compress`, `headroom_retrieve`, `headroom_stats`) | `pip install "headroom-ai[mcp]"` |
 | `langchain` | LangChain `HeadroomChatModel` wrapper; **not in `[all]`** | `pip install "headroom-ai[langchain]"` |
@@ -112,15 +112,16 @@ pip install "headroom-ai[all]"
 | `autogen` | AutoGen AgentChat integration; **not in `[all]`** | `pip install "headroom-ai[autogen]"` |
 | `anyllm` | any-llm multi-provider backend (Python 3.11+); **not in `[all]`** | `pip install "headroom-ai[anyllm]"` |
 | `bedrock` | Native AWS Bedrock credentials/backend support; **not in `[all]`** | `pip install "headroom-ai[bedrock]"` |
-| `evals` | Evaluation framework (GSM8K, SQuAD, BFCL benchmarks) | `pip install "headroom-ai[evals]"` |
+| `evals` | Evaluation framework (GSM8K, SQuAD, BFCL benchmarks); opt-in, not in `[all]` | `pip install "headroom-ai[evals]"` |
 | `pytorch-mps` | Apple-GPU (MPS) memory-embedder offload — **macOS only**, not in `[all]` (torch + sentence-transformers); opt in with `HEADROOM_EMBEDDER_RUNTIME=pytorch_mps` | `pip install "headroom-ai[pytorch-mps]"` |
 | `html` | HTML main-content extraction with trafilatura | `pip install "headroom-ai[html]"` |
 | `spreadsheet` | `.xlsx` / `.xls` ingestion with openpyxl and xlrd | `pip install "headroom-ai[spreadsheet]"` |
-| `sandbox` | Torch-free proxy bundle for constrained environments | `pip install "headroom-ai[sandbox]"` |
-| `all` | Runtime bundle: `proxy,code,ml,memory,relevance,image,reports,otel,evals,voice,html,mcp,spreadsheet` | `pip install "headroom-ai[all]"` |
+| `all` | CLI/proxy feature set without PyTorch-backed dependencies | `pip install "headroom-ai[all]"` |
+| `sandbox` | Lean torch-free proxy bundle without image support | `pip install "headroom-ai[sandbox]"` |
 
-`[all]` is the full built-in runtime bundle, not every integration or optional
-backend. The rows marked “not in `[all]`” must be requested explicitly.
+`[all]` is the built-in CLI/proxy feature set, not every integration or
+PyTorch-backed feature. The rows marked “not in `[all]`” must be requested
+explicitly. PyPI's Linux PyTorch wheels can include CUDA runtime packages.
 
 You can combine extras:
 
