@@ -581,15 +581,57 @@ def test_unreadable_ledger_warns_instead_of_reporting_zero_silently(tmp_path, le
     assert str(tmp_path) in warnings[0]
 
 
-def test_first_failed_append_warns_once_per_process(monkeypatch, tmp_path, ledger_records):
-    monkeypatch.setattr(L, "_append_failure_warned", False, raising=False)
+def test_failed_append_warns_once_per_ledger_path(monkeypatch, tmp_path, ledger_records):
+    monkeypatch.setattr(L, "_append_warned_paths", set(), raising=False)
+    first = tmp_path / "a"
+    second = tmp_path / "b"
+    first.mkdir()
+    second.mkdir()
 
     # A directory where the ledger file should be: every append fails.
-    assert not L.record_savings_event(tokens_before=1000, tokens_after=400, path=tmp_path)
-    assert not L.record_savings_event(tokens_before=1000, tokens_after=400, path=tmp_path)
+    assert not L.record_savings_event(tokens_before=1000, tokens_after=400, path=first)
+    assert not L.record_savings_event(tokens_before=1000, tokens_after=400, path=first)
+    assert not L.record_savings_event(tokens_before=1000, tokens_after=400, path=second)
 
     warnings = _warnings(ledger_records)
-    assert len(warnings) == 1  # one WARNING; the second failure goes to DEBUG
-    assert "append to" in warnings[0]
-    assert str(tmp_path) in warnings[0]
+    # One WARNING per path; the repeat on `first` goes to DEBUG only.
+    assert len(warnings) == 2
+    assert str(first) in warnings[0] and "append to" in warnings[0]
+    assert str(second) in warnings[1]
     assert any(r.levelno == logging.DEBUG and "append to" in r.getMessage() for r in ledger_records)
+
+
+def test_successful_append_rearms_the_warning(monkeypatch, tmp_path, ledger_records):
+    monkeypatch.setattr(L, "_append_warned_paths", set(), raising=False)
+    ledger = tmp_path / "savings_events.jsonl"
+    ledger.mkdir()
+
+    assert not L.record_savings_event(tokens_before=1000, tokens_after=400, path=ledger)
+    ledger.rmdir()
+    assert L.record_savings_event(tokens_before=1000, tokens_after=400, path=ledger)
+    ledger.unlink()
+    ledger.mkdir()
+    assert not L.record_savings_event(tokens_before=1000, tokens_after=400, path=ledger)
+
+    # The failure after a recovery is a new episode and warns again.
+    assert len(_warnings(ledger_records)) == 2
+
+
+def test_append_warning_names_only_the_type_of_a_non_os_error(
+    monkeypatch, tmp_path, ledger_records
+):
+    monkeypatch.setattr(L, "_append_warned_paths", set(), raising=False)
+
+    def fail(*_args, **_kwargs):
+        raise TypeError("secret-looking event payload")
+
+    # Shadow open() inside the module only, so nothing else is affected.
+    monkeypatch.setattr(L, "open", fail, raising=False)
+    assert not L.record_savings_event(
+        tokens_before=1000, tokens_after=400, path=tmp_path / "savings_events.jsonl"
+    )
+
+    warnings = _warnings(ledger_records)
+    assert len(warnings) == 1
+    assert "TypeError" in warnings[0]
+    assert "secret-looking" not in warnings[0]

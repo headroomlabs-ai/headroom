@@ -71,9 +71,33 @@ except ImportError:
 
 logger = logging.getLogger(__name__)
 
-# The first failed append per process is a WARNING so an unwritable ledger is
-# visible; later ones drop to DEBUG so a persistent failure cannot flood logs.
-_append_failure_warned = False
+# The first failed append to each ledger path is a WARNING so an unwritable
+# ledger is visible; repeats drop to DEBUG so a persistent failure cannot flood
+# logs. A successful append re-arms the path. Capped: cleared when full.
+_APPEND_WARNED_PATHS_MAX = 64
+_append_warned_paths: set[str] = set()
+
+
+def _describe_error(exc: BaseException) -> str:
+    # An OSError names a local path; any other exception text may echo event
+    # data, so only its type is logged above DEBUG.
+    return str(exc) if isinstance(exc, OSError) else type(exc).__name__
+
+
+def _warn_append_failure(target: Path, exc: BaseException) -> None:
+    key = str(target)
+    if key not in _append_warned_paths and logger.isEnabledFor(logging.WARNING):
+        if len(_append_warned_paths) >= _APPEND_WARNED_PATHS_MAX:
+            _append_warned_paths.clear()
+        _append_warned_paths.add(key)
+        logger.warning(
+            "savings ledger: append to %s failed: %s; savings will not be recorded. "
+            "Make the directory writable or set HEADROOM_SAVINGS_EVENTS_PATH.",
+            target,
+            _describe_error(exc),
+        )
+    logger.debug("savings ledger: append to %s failed", target, exc_info=True)
+
 
 SCHEMA_VERSION = 2
 UNKNOWN = "unknown"
@@ -422,19 +446,10 @@ def record_savings_event(
                 if _HAS_FCNTL and fcntl is not None:
                     fcntl.flock(handle, fcntl.LOCK_UN)
     except Exception as exc:
-        global _append_failure_warned
-        if not _append_failure_warned:
-            _append_failure_warned = True
-            logger.warning(
-                "savings ledger: append to %s failed: %s; savings will not be recorded. "
-                "Make the directory writable or set HEADROOM_SAVINGS_EVENTS_PATH.",
-                target,
-                exc,
-            )
-        else:
-            logger.debug("savings ledger: append to %s failed", target, exc_info=True)
+        _warn_append_failure(target, exc)
         return False
 
+    _append_warned_paths.discard(str(target))
     _maybe_compact(target)
     return True
 
@@ -479,8 +494,9 @@ def _read_events(
             "savings ledger: could not read %s: %s. Check that it is a readable file, "
             "or set HEADROOM_SAVINGS_EVENTS_PATH.",
             target,
-            exc,
+            _describe_error(exc),
         )
+        logger.debug("savings ledger: reading %s failed", target, exc_info=True)
         return []
     return events
 
