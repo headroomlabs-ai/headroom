@@ -26,7 +26,12 @@ from headroom.memory.writers.generic_writer import GenericMemoryWriter
 
 
 def test_importing_the_writers_package_warns_deprecated(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.delitem(sys.modules, "headroom.memory.writers")
+    # Restore both the sys.modules entry and the parent attribute afterwards, so
+    # later tests see the original package object whatever the import form.
+    import headroom.memory
+
+    monkeypatch.delitem(sys.modules, "headroom.memory.writers", raising=False)
+    monkeypatch.delattr(headroom.memory, "writers", raising=False)
     with pytest.warns(DeprecationWarning, match="headroom.memory.writers is deprecated"):
         importlib.import_module("headroom.memory.writers")
 
