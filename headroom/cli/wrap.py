@@ -727,7 +727,7 @@ def _proxy_startup_failure_excerpt(stdio_log_path: Path, start: int) -> str:
     across runs): the first ``_PROXY_STARTUP_READ_BYTES`` of it and, when the run
     wrote more and the head has no error, the last ``_PROXY_STARTUP_READ_BYTES``.
     Prefers the first ERROR/CRITICAL/Traceback line onwards, and falls back to
-    the last few hundred characters read.
+    the last few hundred characters of the head.
     """
     try:
         with open(stdio_log_path, "rb") as fh:
@@ -742,16 +742,16 @@ def _proxy_startup_failure_excerpt(stdio_log_path: Path, start: int) -> str:
                 windows.append(fh.read(_PROXY_STARTUP_READ_BYTES))
     except OSError:
         return "(no log output)"
-    output = ""
-    for raw in windows:
-        output = raw.decode("utf-8", errors="replace").strip()
+    texts = [raw.decode("utf-8", errors="replace").strip() for raw in windows]
+    for output in texts:
         match = _PROXY_STARTUP_ERROR_RE.search(output)
         if match is not None:
             line_start = output.rfind("\n", 0, match.start()) + 1
             return output[line_start : line_start + _PROXY_STARTUP_EXCERPT_CHARS]
-    if not output:
+    # No recognised error: the end of the startup head is the most telling part.
+    if not texts[0]:
         return "(no log output)"
-    return output[-_PROXY_STARTUP_EXCERPT_CHARS:]
+    return texts[0][-_PROXY_STARTUP_EXCERPT_CHARS:]
 
 
 def _start_proxy(

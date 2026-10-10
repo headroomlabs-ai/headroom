@@ -307,6 +307,17 @@ class TestCLIWrapProxyTimeout:
 
         assert excerpt.startswith("ERROR: early failure")
 
+    def test_startup_excerpt_without_error_quotes_the_end_of_the_head(self, tmp_path):
+        """No recognised error line: quote the end of this run's first 64 KiB,
+        even when the tail window is blank."""
+        stdio_log = tmp_path / "proxy-stdio-8787.log"
+        head = "INFO noise line\n" * 3000 + "INFO last startup line\n"  # < 64 KiB
+        stdio_log.write_text(head + " \n" * 70000)
+
+        excerpt = wrap_mod._proxy_startup_failure_excerpt(stdio_log, 0)
+
+        assert excerpt.endswith("INFO last startup line")
+
     def test_timeout_error_names_configured_timeout_and_env_var(self, monkeypatch, tmp_path):
         fake_proc = _FakeProxyProcess()
 
