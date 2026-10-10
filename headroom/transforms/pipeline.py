@@ -12,7 +12,6 @@ from contextlib import nullcontext
 from typing import TYPE_CHECKING, Any, TypeVar
 
 from ..config import (
-    CacheAlignerConfig,
     DiffArtifact,
     HeadroomConfig,
     TransformDiff,
@@ -597,23 +596,3 @@ class TransformPipeline:
         """
         # apply() already works on a copy, so this is safe
         return self.apply(messages, model, record_metrics=False, **kwargs)
-
-
-def create_pipeline(
-    cache_aligner_config: CacheAlignerConfig | None = None,
-) -> TransformPipeline:
-    """
-    Create a pipeline with specific configurations.
-
-    Args:
-        cache_aligner_config: Cache aligner configuration.
-
-    Returns:
-        Configured TransformPipeline.
-    """
-    config = HeadroomConfig()
-
-    if cache_aligner_config is not None:
-        config.cache_aligner = cache_aligner_config
-
-    return TransformPipeline(config)

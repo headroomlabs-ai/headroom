@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import time
+import warnings
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -200,6 +201,17 @@ class EvalSuite:
         self.cases: list[EvalCase] = cases or []
 
     def add_case(self, case: EvalCase) -> None:
+        """Append a case to the suite.
+
+        .. deprecated:: 0.41.0
+            Pass ``cases`` to the constructor, or append to ``suite.cases``.
+        """
+        warnings.warn(
+            "EvalSuite.add_case is deprecated and will be removed in a future release; "
+            "pass cases to EvalSuite(...) or append to suite.cases.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
         self.cases.append(case)
 
     def __len__(self) -> int:
@@ -371,7 +383,17 @@ class CompressionEvaluator:
 
         Returns:
             Aggregated results with statistics
+
+        .. deprecated:: 0.41.0
+            Call ``evaluate_case`` per case, or use a runner from
+            ``headroom.evals.runners``.
         """
+        warnings.warn(
+            "CompressionEvaluator.evaluate_suite is deprecated and will be removed in a future "
+            "release; call evaluate_case per case or use a runner from headroom.evals.runners.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
         start_time = time.time()
         results: list[EvalResult] = []
 

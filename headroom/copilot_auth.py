@@ -281,17 +281,6 @@ def _configured_api_url() -> str:
     return DEFAULT_API_URL
 
 
-def copilot_api_url() -> str:
-    """Return the configured Copilot API base URL without any network calls.
-
-    Resolves ``GITHUB_COPILOT_API_URL``, then the configured enterprise domain,
-    then ``api.githubcopilot.com``. Unlike :func:`resolve_copilot_api_url` this
-    performs no token exchange, so it is safe to call while routing a request.
-    """
-
-    return _configured_api_url()
-
-
 # GitHub's token exchange advertises the host that serves inline completions
 # under ``endpoints.proxy``, alongside the ``endpoints.api`` chat host. It is
 # recorded here when observed so completions routing uses GitHub's own answer

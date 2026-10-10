@@ -11,7 +11,6 @@ from headroom.providers.opencode.config import (
     HEADROOM_OPENCODE_PLUGIN,
     _inject_key_into_json,
     _parse_json_loose,
-    append_headroom_plugin,
     inject_opencode_provider_config,
     opencode_config_paths,
     snapshot_opencode_config_if_unwrapped,
@@ -475,24 +474,6 @@ def test_inject_provider_config_preserves_unrelated_top_level_keys(
     assert config["plugin"] == ["some-plugin"]
     assert config["permission"] == {"bash": {"*": "ask"}}
     assert "headroom" in config.get("provider", {})
-
-
-def test_append_headroom_plugin_adds_plugin_once() -> None:
-    config: dict[str, object] = {"plugin": ["some-plugin"]}
-
-    assert append_headroom_plugin(config) is True
-    assert append_headroom_plugin(config) is False
-
-    assert config["plugin"] == ["some-plugin", HEADROOM_OPENCODE_PLUGIN]
-
-
-def test_append_headroom_plugin_preserves_configured_tuple_entry() -> None:
-    config: dict[str, object] = {
-        "plugin": [[HEADROOM_OPENCODE_PLUGIN, {"proxyUrl": "http://127.0.0.1:8787"}]]
-    }
-
-    assert append_headroom_plugin(config) is False
-    assert config["plugin"] == [[HEADROOM_OPENCODE_PLUGIN, {"proxyUrl": "http://127.0.0.1:8787"}]]
 
 
 def test_inject_provider_config_no_crash_on_unwriteable_dir(

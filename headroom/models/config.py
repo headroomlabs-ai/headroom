@@ -106,40 +106,6 @@ class MLModelConfig:
         """
         return self._memory_estimates.get(model_name, 100)
 
-    def total_memory_estimate(self) -> int:
-        """Get total estimated memory if all configured models are loaded.
-
-        Returns:
-            Total estimated memory in MB.
-        """
-        return (
-            self.get_memory_estimate(self.sentence_transformer)
-            + self.get_memory_estimate(self.siglip)
-            + self.get_memory_estimate(self.spacy)
-            + self.get_memory_estimate(self.technique_router)
-        )
-
 
 # Singleton instance - import this to get defaults
 ML_MODEL_DEFAULTS = MLModelConfig()
-
-
-# Convenience accessors for common use cases
-def get_default_embedding_model() -> str:
-    """Get the default sentence transformer model name."""
-    return ML_MODEL_DEFAULTS.sentence_transformer
-
-
-def get_default_embedding_dim() -> int:
-    """Get the default embedding dimension."""
-    return ML_MODEL_DEFAULTS.sentence_transformer_dim
-
-
-def get_default_spacy_model() -> str:
-    """Get the default spaCy model name."""
-    return ML_MODEL_DEFAULTS.spacy
-
-
-def get_default_siglip_model() -> str:
-    """Get the default SIGLIP model name."""
-    return ML_MODEL_DEFAULTS.siglip
