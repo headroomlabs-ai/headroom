@@ -6,6 +6,7 @@ import {
   openAIToAnthropic,
   geminiToOpenAI,
   openAIToGemini,
+  fromOpenAI,
 } from "../../src/utils/format.js";
 import type { OpenAIMessage } from "../../src/types.js";
 
@@ -838,3 +839,375 @@ describe("openAIToVercel tool names", () => {
   });
 });
 
+describe("vercelToOpenAI media parts", () => {
+  it("converts a provider-prompt file part (image bytes) to an image_url data URI", () => {
+    const result = vercelToOpenAI([
+      {
+        role: "user",
+        content: [
+          { type: "text", text: "what is this?" },
+          { type: "file", mediaType: "image/png", data: new Uint8Array([137, 80, 78, 71]) },
+        ],
+      },
+    ]);
+    expect(result).toEqual([
+      {
+        role: "user",
+        content: [
+          { type: "text", text: "what is this?" },
+          { type: "image_url", image_url: { url: "data:image/png;base64,iVBORw==", part: "file" } },
+        ],
+      },
+    ]);
+  });
+
+  it("keeps a file-only turn (pdf) and carries its filename", () => {
+    const result = vercelToOpenAI([
+      { role: "user", content: [{ type: "file", mediaType: "application/pdf", data: "JVBERi0=", filename: "a.pdf" }] },
+    ]);
+    expect(result).toEqual([
+      {
+        role: "user",
+        content: [
+          { type: "image_url", image_url: { url: "data:application/pdf;base64,JVBERi0=", part: "file", filename: "a.pdf" } },
+        ],
+      },
+    ]);
+  });
+
+  it("encodes a Uint8Array image as a data URI instead of String(bytes)", () => {
+    const result = vercelToOpenAI([
+      { role: "user", content: [{ type: "image", image: new Uint8Array([137, 80, 78, 71]), mediaType: "image/png" }] },
+    ]);
+    expect(result).toEqual([
+      { role: "user", content: [{ type: "image_url", image_url: { url: "data:image/png;base64,iVBORw==" } }] },
+    ]);
+  });
+
+  it("treats a bare base64 string image as data, not a URL", () => {
+    const result = vercelToOpenAI([
+      { role: "user", content: [{ type: "image", image: "iVBORw==", mediaType: "image/png" }] },
+    ]);
+    expect(result).toEqual([
+      { role: "user", content: [{ type: "image_url", image_url: { url: "data:image/png;base64,iVBORw==" } }] },
+    ]);
+  });
+
+  it("carries the MIME type of a URL-backed file part", () => {
+    const result = vercelToOpenAI([
+      { role: "user", content: [{ type: "file", mediaType: "application/pdf", data: new URL("https://example.com/a.pdf") }] },
+    ]);
+    expect(result).toEqual([
+      {
+        role: "user",
+        content: [
+          { type: "image_url", image_url: { url: "https://example.com/a.pdf", part: "file", mime_type: "application/pdf" } },
+        ],
+      },
+    ]);
+  });
+});
+
+describe("openAIToVercel media parts", () => {
+  it("restores a data URI marked part=file as a file part with base64 data", () => {
+    const msgs = [
+      {
+        role: "user",
+        content: [
+          { type: "image_url", image_url: { url: "data:application/pdf;base64,JVBERi0=", part: "file", filename: "a.pdf" } },
+        ],
+      },
+    ] as OpenAIMessage[];
+    expect(openAIToVercel(msgs)).toEqual([
+      { role: "user", content: [{ type: "file", mediaType: "application/pdf", data: "JVBERi0=", filename: "a.pdf" }] },
+    ]);
+  });
+
+  it("restores an image data URI as an image part with base64 data and mediaType", () => {
+    const msgs: OpenAIMessage[] = [
+      { role: "user", content: [{ type: "image_url", image_url: { url: "data:image/png;base64,iVBORw==" } }] },
+    ];
+    expect(openAIToVercel(msgs)).toEqual([
+      { role: "user", content: [{ type: "image", image: "iVBORw==", mediaType: "image/png" }] },
+    ]);
+  });
+
+  it("restores a URL-backed file part from the carried MIME type", () => {
+    const msgs = [
+      {
+        role: "user",
+        content: [
+          { type: "image_url", image_url: { url: "https://example.com/a.pdf", part: "file", mime_type: "application/pdf" } },
+        ],
+      },
+    ] as OpenAIMessage[];
+    const part = openAIToVercel(msgs)[0].content[0];
+    expect(part.type).toBe("file");
+    expect(part.mediaType).toBe("application/pdf");
+    expect(part.data).toBeInstanceOf(URL);
+    expect(part.data.toString()).toBe("https://example.com/a.pdf");
+  });
+
+  it("never throws on an unparseable url and keeps it as a string", () => {
+    const msgs: OpenAIMessage[] = [
+      { role: "user", content: [{ type: "image_url", image_url: { url: "137,80,78,71" } }] },
+    ];
+    expect(() => openAIToVercel(msgs)).not.toThrow();
+    expect(openAIToVercel(msgs)[0].content[0]).toEqual({ type: "image", image: "137,80,78,71" });
+  });
+});
+
+describe("round-trip: vercelToOpenAI then openAIToVercel (media)", () => {
+  it("round-trips a provider-prompt text+file turn into a valid file part", () => {
+    const original = [
+      {
+        role: "user",
+        content: [
+          { type: "text", text: "what is this?" },
+          { type: "file", mediaType: "image/png", data: new Uint8Array([137, 80, 78, 71]) },
+        ],
+      },
+    ];
+    expect(openAIToVercel(vercelToOpenAI(original))).toEqual([
+      {
+        role: "user",
+        content: [
+          { type: "text", text: "what is this?" },
+          { type: "file", mediaType: "image/png", data: "iVBORw==" },
+        ],
+      },
+    ]);
+  });
+
+  it("round-trips a byte image without throwing", () => {
+    const original = [
+      { role: "user", content: [{ type: "image", image: new Uint8Array([137, 80, 78, 71]), mediaType: "image/png" }] },
+    ];
+    expect(openAIToVercel(vercelToOpenAI(original))).toEqual([
+      { role: "user", content: [{ type: "image", image: "iVBORw==", mediaType: "image/png" }] },
+    ]);
+  });
+});
+
+describe("vercelToOpenAI / openAIToVercel assistant file parts", () => {
+  it("keeps an assistant file part (generated image) alongside its text", () => {
+    const result = vercelToOpenAI([
+      {
+        role: "assistant",
+        content: [
+          { type: "text", text: "generated image" },
+          { type: "file", mediaType: "image/png", data: new Uint8Array([137, 80, 78, 71]), filename: "cat.png" },
+        ],
+      },
+    ]);
+    expect(result).toEqual([
+      {
+        role: "assistant",
+        content: [
+          { type: "text", text: "generated image" },
+          { type: "image_url", image_url: { url: "data:image/png;base64,iVBORw==", part: "file", filename: "cat.png" } },
+        ],
+      },
+    ]);
+  });
+
+  it("restores an assistant content array as text and file parts with the assistant role", () => {
+    const msgs = [
+      {
+        role: "assistant",
+        content: [
+          { type: "text", text: "generated image" },
+          { type: "image_url", image_url: { url: "data:image/png;base64,iVBORw==", part: "file", filename: "cat.png" } },
+        ],
+      },
+    ] as OpenAIMessage[];
+    expect(openAIToVercel(msgs)).toEqual([
+      {
+        role: "assistant",
+        content: [
+          { type: "text", text: "generated image" },
+          { type: "file", mediaType: "image/png", data: "iVBORw==", filename: "cat.png" },
+        ],
+      },
+    ]);
+  });
+
+  it("round-trips an assistant text+file turn", () => {
+    const original = [
+      {
+        role: "assistant",
+        content: [
+          { type: "text", text: "generated image" },
+          { type: "file", mediaType: "image/png", data: new Uint8Array([137, 80, 78, 71]) },
+        ],
+      },
+    ];
+    expect(openAIToVercel(vercelToOpenAI(original))).toEqual([
+      {
+        role: "assistant",
+        content: [
+          { type: "text", text: "generated image" },
+          { type: "file", mediaType: "image/png", data: "iVBORw==" },
+        ],
+      },
+    ]);
+  });
+
+  it("leaves text-only assistant turns as a string (backward compat)", () => {
+    expect(
+      vercelToOpenAI([{ role: "assistant", content: [{ type: "text", text: "a" }, { type: "text", text: "b" }] }]),
+    ).toEqual([{ role: "assistant", content: "ab" }]);
+  });
+});
+
+describe("assistant media across formats", () => {
+  it("openAIToAnthropic keeps an assistant image as an image block after the text", () => {
+    const msgs = [
+      {
+        role: "assistant",
+        content: [
+          { type: "text", text: "generated image" },
+          { type: "image_url", image_url: { url: "data:image/png;base64,iVBORw==" } },
+        ],
+      },
+    ] as OpenAIMessage[];
+    expect(openAIToAnthropic(msgs)).toEqual([
+      {
+        role: "assistant",
+        content: [
+          { type: "text", text: "generated image" },
+          { type: "image", source: { type: "base64", media_type: "image/png", data: "iVBORw==" } },
+        ],
+      },
+    ]);
+  });
+
+  it("openAIToAnthropic maps an assistant PDF to a document block (base64 and url sources)", () => {
+    const msgs = [
+      {
+        role: "assistant",
+        content: [
+          { type: "image_url", image_url: { url: "data:application/pdf;base64,JVBERi0=", part: "file" } },
+          { type: "image_url", image_url: { url: "https://example.com/a.pdf", part: "file", mime_type: "application/pdf" } },
+        ],
+      },
+    ] as OpenAIMessage[];
+    expect(openAIToAnthropic(msgs)).toEqual([
+      {
+        role: "assistant",
+        content: [
+          { type: "document", source: { type: "base64", media_type: "application/pdf", data: "JVBERi0=" } },
+          { type: "document", source: { type: "url", url: "https://example.com/a.pdf" } },
+        ],
+      },
+    ]);
+  });
+
+  it("openAIToAnthropic leaves a text-only assistant array as a string (backward compat)", () => {
+    const msgs = [{ role: "assistant", content: [{ type: "text", text: "a" }] }] as OpenAIMessage[];
+    expect(openAIToAnthropic(msgs)).toEqual([{ role: "assistant", content: "a" }]);
+  });
+
+  it("openAIToGemini keeps an assistant image as an inlineData part after the text", () => {
+    const msgs = [
+      {
+        role: "assistant",
+        content: [
+          { type: "text", text: "generated image" },
+          { type: "image_url", image_url: { url: "data:image/png;base64,iVBORw==" } },
+        ],
+      },
+    ] as OpenAIMessage[];
+    expect(openAIToGemini(msgs)).toEqual([
+      { role: "model", parts: [{ text: "generated image" }, { inlineData: { mimeType: "image/png", data: "iVBORw==" } }] },
+    ]);
+  });
+
+  it("openAIToGemini maps a URL-backed assistant file to fileData with its MIME type", () => {
+    const msgs = [
+      {
+        role: "assistant",
+        content: [{ type: "image_url", image_url: { url: "https://example.com/a.pdf", part: "file", mime_type: "application/pdf" } }],
+      },
+    ] as OpenAIMessage[];
+    expect(openAIToGemini(msgs)).toEqual([
+      { role: "model", parts: [{ fileData: { mimeType: "application/pdf", fileUri: "https://example.com/a.pdf" } }] },
+    ]);
+  });
+
+  it("anthropicToOpenAI keeps assistant image and document blocks as ordered parts", () => {
+    const result = anthropicToOpenAI([
+      {
+        role: "assistant",
+        content: [
+          { type: "text", text: "generated image" },
+          { type: "image", source: { type: "base64", media_type: "image/png", data: "iVBORw==" } },
+          { type: "document", source: { type: "base64", media_type: "application/pdf", data: "JVBERi0=" } },
+        ],
+      },
+    ]);
+    expect(result).toEqual([
+      {
+        role: "assistant",
+        content: [
+          { type: "text", text: "generated image" },
+          { type: "image_url", image_url: { url: "data:image/png;base64,iVBORw==" } },
+          { type: "image_url", image_url: { url: "data:application/pdf;base64,JVBERi0=" } },
+        ],
+      },
+    ]);
+  });
+
+  it("geminiToOpenAI keeps model-turn inlineData as an ordered image_url part", () => {
+    const result = geminiToOpenAI([
+      { role: "model", parts: [{ text: "generated image" }, { inlineData: { mimeType: "image/png", data: "iVBORw==" } }] },
+    ]);
+    expect(result).toEqual([
+      {
+        role: "assistant",
+        content: [
+          { type: "text", text: "generated image" },
+          { type: "image_url", image_url: { url: "data:image/png;base64,iVBORw==" } },
+        ],
+      },
+    ]);
+  });
+
+  it("round-trips an Anthropic assistant text+image turn exactly", () => {
+    const original = [
+      {
+        role: "assistant",
+        content: [
+          { type: "text", text: "generated image" },
+          { type: "image", source: { type: "base64", media_type: "image/png", data: "iVBORw==" } },
+        ],
+      },
+    ];
+    expect(openAIToAnthropic(anthropicToOpenAI(original))).toEqual(original);
+  });
+
+  it("round-trips a Gemini model text+inlineData turn exactly", () => {
+    const original = [
+      { role: "model", parts: [{ text: "generated image" }, { inlineData: { mimeType: "image/png", data: "iVBORw==" } }] },
+    ];
+    expect(openAIToGemini(geminiToOpenAI(original))).toEqual(original);
+  });
+
+  it("carries a Vercel assistant file into Gemini and Anthropic media parts", () => {
+    const openai = vercelToOpenAI([
+      { role: "assistant", content: [{ type: "text", text: "generated image" }, { type: "file", mediaType: "image/png", data: "iVBORw==" }] },
+    ]);
+    expect(fromOpenAI(openai, "gemini")).toEqual([
+      { role: "model", parts: [{ text: "generated image" }, { inlineData: { mimeType: "image/png", data: "iVBORw==" } }] },
+    ]);
+    expect(fromOpenAI(openai, "anthropic")).toEqual([
+      {
+        role: "assistant",
+        content: [
+          { type: "text", text: "generated image" },
+          { type: "image", source: { type: "base64", media_type: "image/png", data: "iVBORw==" } },
+        ],
+      },
+    ]);
+  });
+});

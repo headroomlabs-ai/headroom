@@ -131,3 +131,41 @@ describe("detectFormat", () => {
     expect(detectFormat(messages)).toBe("vercel");
   });
 });
+
+describe("detectFormat: Vercel media parts", () => {
+  it("detects a media-only Vercel turn with a file part", () => {
+    expect(
+      detectFormat([
+        {
+          role: "user",
+          content: [
+            { type: "text", text: "what is this?" },
+            { type: "file", mediaType: "image/png", data: new Uint8Array([137, 80, 78, 71]) },
+          ],
+        },
+      ]),
+    ).toBe("vercel");
+  });
+
+  it("detects a media-only Vercel turn with an image part", () => {
+    expect(
+      detectFormat([
+        { role: "user", content: [{ type: "image", image: new Uint8Array([137, 80, 78, 71]), mediaType: "image/png" }] },
+      ]),
+    ).toBe("vercel");
+  });
+
+  it("still treats OpenAI image_url parts as openai", () => {
+    expect(
+      detectFormat([{ role: "user", content: [{ type: "image_url", image_url: { url: "https://example.com/a.png" } }] }]),
+    ).toBe("openai");
+  });
+
+  it("still treats Anthropic image blocks (with a source) as anthropic", () => {
+    expect(
+      detectFormat([
+        { role: "user", content: [{ type: "image", source: { type: "base64", media_type: "image/png", data: "AAAA" } }] },
+      ]),
+    ).toBe("anthropic");
+  });
+});

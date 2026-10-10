@@ -66,9 +66,9 @@ describe("Message types", () => {
     >();
   });
 
-  it("AssistantMessage content can be string or null", () => {
+  it("AssistantMessage content can be a string, content parts, or null", () => {
     expectTypeOf<AssistantMessage["role"]>().toEqualTypeOf<"assistant">();
-    expectTypeOf<AssistantMessage["content"]>().toEqualTypeOf<string | null>();
+    expectTypeOf<AssistantMessage["content"]>().toEqualTypeOf<string | ContentPart[] | null>();
   });
 
   it("AssistantMessage tool_calls is optional", () => {

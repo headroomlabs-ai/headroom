@@ -135,3 +135,46 @@ describe("compress()", () => {
     expect(body.config.target_ratio).toBe(0.25);
   });
 });
+
+describe("compress() autodetects Vercel media-only conversations", () => {
+  beforeEach(() => {
+    mockFetch.mockReset();
+  });
+
+  it("sends binary file parts as image_url data URIs and restores Vercel file parts", async () => {
+    mockFetch.mockResolvedValueOnce(
+      okResponse({
+        messages: [
+          {
+            role: "user",
+            content: [
+              { type: "text", text: "compressed" },
+              { type: "image_url", image_url: { url: "data:image/png;base64,iVBORw==", part: "file" } },
+            ],
+          },
+        ],
+      }),
+    );
+
+    const result = await compress(
+      [
+        {
+          role: "user",
+          content: [
+            { type: "text", text: "what is this?" },
+            { type: "file", mediaType: "image/png", data: new Uint8Array([137, 80, 78, 71]) },
+          ],
+        },
+      ],
+      { baseUrl: "http://localhost:8787" },
+    );
+
+    const body = JSON.parse(mockFetch.mock.calls[0][1].body);
+    expect(body.messages[0].content[1]).toEqual({
+      type: "image_url",
+      image_url: { url: "data:image/png;base64,iVBORw==", part: "file" },
+    });
+    expect(JSON.stringify(body)).not.toContain('"0":137');
+    expect(result.messages[0].content[1]).toEqual({ type: "file", mediaType: "image/png", data: "iVBORw==" });
+  });
+});
