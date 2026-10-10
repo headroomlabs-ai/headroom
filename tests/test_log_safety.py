@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import importlib
+import importlib.machinery
+import importlib.util
 import json
 import logging
 import math
@@ -11,6 +13,7 @@ import py_compile
 import sys
 import types
 import zipfile
+import zipimport
 from pathlib import Path
 
 import pytest
@@ -38,10 +41,9 @@ def test_exception_description_names_types_and_places_but_not_messages(
     text = describe_exception(_raise_chain())
 
     assert "CANARY" not in text
-    assert text.startswith("ValueError at ")
-    assert "test_log_safety.py:" in text
-    assert "in _raise_chain" in text
-    assert "; caused by KeyError at " in text
+    # The chain is raised from this test file, which is not Headroom's code,
+    # so only the types are named.
+    assert text == "ValueError; caused by KeyError"
 
 
 def test_oserror_keeps_errno_but_not_its_filename(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -148,17 +150,6 @@ def test_forget_rearms_a_key() -> None:
     assert guard.first("path", log) is True
     guard.forget("path")
     assert guard.first("path", log) is True
-
-
-def test_frame_paths_are_package_relative_for_headroom_and_bare_otherwise() -> None:
-    with pytest.raises(ValueError) as headroom_error:
-        WarnOnce(limit=0, what="failures")
-    with pytest.raises(json.JSONDecodeError) as stdlib_error:
-        json.loads("{")
-
-    assert "at headroom/log_safety.py:" in describe_exception(headroom_error.value)
-    assert " in __init__" in describe_exception(headroom_error.value)
-    assert "decoder.py:" in describe_exception(stdlib_error.value)
 
 
 def test_raise_from_none_hides_the_suppressed_context(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -276,58 +267,6 @@ def test_forget_cycles_cannot_exceed_the_window_budget(caplog: pytest.LogCapture
 
 
 @pytest.mark.parametrize(
-    ("filename", "module_name"),
-    [
-        ("sk-FILE-CANARY\nforged", None),
-        (os.__file__, "os"),
-        (log_safety.__file__, "headroom.log_safety"),
-    ],
-    ids=["forged-name", "claims-stdlib-file", "claims-headroom-module"],
-)
-def test_runtime_compiled_frames_are_not_logged(
-    monkeypatch: pytest.MonkeyPatch, filename: str, module_name: str | None
-) -> None:
-    """Runtime code may claim a real file and module name; its own names still stay out."""
-    monkeypatch.delenv("HEADROOM_DEBUG_DUMP", raising=False)
-    code = compile("def sk_FUNC_CANARY():\n    raise ValueError('x')\n", filename, "exec")
-    namespace: dict[str, object] = {} if module_name is None else {"__name__": module_name}
-    exec(code, namespace)
-    with pytest.raises(ValueError) as caught:
-        namespace["sk_FUNC_CANARY"]()  # type: ignore[operator]
-
-    text = describe_exception(caught.value)
-    assert "CANARY" not in text
-    assert "<dynamic code>" in text
-    assert "test_log_safety.py:" in text  # the calling test frame keeps its location
-
-
-def test_zip_and_sourceless_modules_keep_their_locations(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    source = "def boom():\n    raise ValueError('x')\n"
-    with zipfile.ZipFile(tmp_path / "bundle.zip", "w") as bundle:
-        bundle.writestr("zipped_mod.py", source)
-    (tmp_path / "pyc_mod.py").write_text(source)
-    py_compile.compile(str(tmp_path / "pyc_mod.py"), cfile=str(tmp_path / "pyc_mod.pyc"))
-    (tmp_path / "pyc_mod.py").unlink()
-    monkeypatch.syspath_prepend(str(tmp_path / "bundle.zip"))
-    monkeypatch.syspath_prepend(str(tmp_path))
-    importlib.invalidate_caches()
-    for name in ("zipped_mod", "pyc_mod"):
-        monkeypatch.delitem(sys.modules, name, raising=False)
-
-    texts = []
-    for name in ("zipped_mod", "pyc_mod"):
-        module = importlib.import_module(name)
-        with pytest.raises(ValueError) as caught:
-            module.boom()
-        texts.append(describe_exception(caught.value))
-
-    assert "zipped_mod.py:2 in boom" in texts[0]
-    assert "pyc_mod.pyc:2 in boom" in texts[1]
-
-
-@pytest.mark.parametrize(
     "value",
     ["sk-ant-abc123:x", "AKIAABCDEFGH:secret", "myuser:hunter2@db:5432", "AKIASECRET://host/x"],
 )
@@ -373,7 +312,7 @@ def test_odd_errno_and_module_objects_never_break_the_description(
     exec(compile("def boom():\n    raise ValueError('x')\n", "<x>", "exec"), namespace)
     with pytest.raises(ValueError) as caught:
         namespace["boom"]()
-    assert "<dynamic code>" in describe_exception(caught.value)
+    assert " at " not in describe_exception(caught.value)
 
     lazy = types.ModuleType("lazy_sk_mod")
 
@@ -402,3 +341,133 @@ def test_safe_id_never_raises() -> None:
 def test_warn_once_needs_a_finite_positive_window(window: float) -> None:
     with pytest.raises(ValueError, match="window_seconds must be positive and finite"):
         WarnOnce(limit=1, what="failures", window_seconds=window)
+
+
+def test_headroom_frames_are_named_by_module_path() -> None:
+    with pytest.raises(ValueError) as caught:
+        WarnOnce(limit=0, what="failures")
+
+    assert describe_exception(caught.value) == (
+        f"ValueError at headroom/log_safety.py:{caught.traceback[-1].lineno + 1} in __init__"
+    )
+
+
+def test_library_frames_are_skipped_but_the_headroom_caller_is_kept() -> None:
+    with pytest.raises(json.JSONDecodeError) as caught:
+        json.loads("{")
+
+    assert describe_exception(caught.value) == "JSONDecodeError"
+
+
+@pytest.mark.parametrize(
+    ("filename", "module_name"),
+    [
+        ("sk-FILE-CANARY\nforged", None),
+        (os.__file__, "os"),
+        (log_safety.__file__, "headroom.log_safety"),
+    ],
+    ids=["forged-name", "claims-stdlib-file", "claims-headroom-module"],
+)
+def test_runtime_compiled_frames_are_not_logged(
+    monkeypatch: pytest.MonkeyPatch, filename: str, module_name: str | None
+) -> None:
+    """Runtime code may claim a real file and module name; it is still not named."""
+    monkeypatch.delenv("HEADROOM_DEBUG_DUMP", raising=False)
+    code = compile("def sk_FUNC_CANARY():\n    raise ValueError('x')\n", filename, "exec")
+    namespace: dict[str, object] = {} if module_name is None else {"__name__": module_name}
+    exec(code, namespace)
+    with pytest.raises(ValueError) as caught:
+        namespace["sk_FUNC_CANARY"]()  # type: ignore[operator]
+
+    assert describe_exception(caught.value) == "ValueError"
+
+
+def test_code_execd_into_a_headroom_module_is_not_named(monkeypatch: pytest.MonkeyPatch) -> None:
+    namespace = vars(log_safety)
+    code = compile("def sk_GEN_CANARY():\n    raise ValueError('x')\n", "<generated>", "exec")
+    exec(code, namespace)
+    monkeypatch.delitem(namespace, "sk_GEN_CANARY")
+    function = code.co_consts[0]
+    generated = types.FunctionType(function, namespace)
+
+    with pytest.raises(ValueError) as caught:
+        generated()
+
+    assert describe_exception(caught.value) == "ValueError"
+
+
+@pytest.mark.parametrize(
+    "module_name", ["headroom.x\nWARNING forged", "headroom.sk-live-CANARY", "headroomx"]
+)
+def test_odd_module_names_are_not_named(monkeypatch: pytest.MonkeyPatch, module_name: str) -> None:
+    module = types.ModuleType(module_name)
+    module.__file__ = "probe.py"
+    monkeypatch.setitem(sys.modules, module_name, module)
+    exec(compile("def boom():\n    raise ValueError('x')\n", "probe.py", "exec"), vars(module))
+
+    with pytest.raises(ValueError) as caught:
+        module.boom()
+
+    assert describe_exception(caught.value) == "ValueError"
+
+
+def test_zip_and_sourceless_headroom_modules_keep_their_locations(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source = "def boom():\n    raise ValueError('x')\n"
+    with zipfile.ZipFile(tmp_path / "bundle.zip", "w") as bundle:
+        bundle.writestr("_zip_probe.py", source)
+    (tmp_path / "_pyc_probe.py").write_text(source)
+    py_compile.compile(str(tmp_path / "_pyc_probe.py"), cfile=str(tmp_path / "_pyc_probe.pyc"))
+    (tmp_path / "_pyc_probe.py").unlink()
+
+    zip_spec = zipimport.zipimporter(str(tmp_path / "bundle.zip")).find_spec("headroom._zip_probe")
+    pyc_loader = importlib.machinery.SourcelessFileLoader(
+        "headroom._pyc_probe", str(tmp_path / "_pyc_probe.pyc")
+    )
+    pyc_spec = importlib.util.spec_from_loader("headroom._pyc_probe", pyc_loader)
+    texts = []
+    for spec in (zip_spec, pyc_spec):
+        assert spec is not None and spec.loader is not None
+        module = importlib.util.module_from_spec(spec)
+        monkeypatch.setitem(sys.modules, spec.name, module)
+        spec.loader.exec_module(module)
+        with pytest.raises(ValueError) as caught:
+            module.boom()
+        texts.append(describe_exception(caught.value))
+
+    assert texts == [
+        "ValueError at headroom/_zip_probe.py:2 in boom",
+        "ValueError at headroom/_pyc_probe.py:2 in boom",
+    ]
+
+
+def test_deep_tracebacks_keep_only_the_innermost_headroom_frames() -> None:
+    def recurse(depth: int) -> None:
+        if depth == 0:
+            WarnOnce(limit=0, what="failures")
+        recurse(depth - 1)
+
+    with pytest.raises(ValueError) as caught:
+        recurse(500)
+
+    assert describe_exception(caught.value).count(" in ") == 1
+
+
+@pytest.mark.parametrize(
+    ("url", "expected"),
+    [
+        ("file:///var/lib/headroom/ledger.db", "file:///<path>"),
+        ("sqlite:///tmp/x.db", "sqlite:///<path>"),
+        ("unix:///run/headroom.sock", "unix:///<path>"),
+        ("https://sk_live_CANARY@/v1", "<unparseable url>"),
+        ("https://sk_live_CANARY/v1", "<unparseable url>"),
+        ("https://xn--bcher-kva.example:8443/v1", "https://xn--bcher-kva.example:8443/<path>"),
+        ("http://10.0.0.7:8787", "http://10.0.0.7:8787"),
+    ],
+)
+def test_redact_url_hosts_and_hostless_schemes(
+    url: str, expected: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.delenv("HEADROOM_DEBUG_DUMP", raising=False)
+    assert redact_url(url) == expected
