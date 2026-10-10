@@ -1,0 +1,55 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://headroom.dev/schemas/release/v1/policy.schema.json",
+  "title": "Headroom versioned release policy",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "policy_version", "effective_at", "risk_classes"],
+  "properties": {
+    "schema_version": { "$ref": "common.schema.json#/$defs/schemaVersion" },
+    "policy_version": { "$ref": "common.schema.json#/$defs/releasePolicyVersion" },
+    "effective_at": { "type": "string", "format": "date-time" },
+    "risk_classes": {
+      "type": "object",
+      "minProperties": 1,
+      "propertyNames": { "$ref": "common.schema.json#/$defs/riskClass" },
+      "additionalProperties": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["gate_a", "gate_b"],
+        "properties": {
+          "gate_a": { "$ref": "#/$defs/gatePolicy" },
+          "gate_b": { "$ref": "#/$defs/gatePolicy" }
+        }
+      }
+    }
+  },
+  "$defs": {
+    "gatePolicy": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["required_evidence", "rules", "missing_data_status"],
+      "properties": {
+        "required_evidence": {
+          "type": "array",
+          "items": { "$ref": "common.schema.json#/$defs/nonEmptyString" },
+          "uniqueItems": true
+        },
+        "rules": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["rule_id", "kind", "parameters"],
+            "properties": {
+              "rule_id": { "$ref": "common.schema.json#/$defs/nonEmptyString" },
+              "kind": { "$ref": "common.schema.json#/$defs/nonEmptyString" },
+              "parameters": { "type": "object" }
+            }
+          }
+        },
+        "missing_data_status": { "const": "inconclusive" }
+      }
+    }
+  }
+}

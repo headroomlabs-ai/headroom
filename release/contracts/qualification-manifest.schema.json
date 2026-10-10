@@ -1,0 +1,101 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://headroom.dev/schemas/release/v1/qualification-manifest.schema.json",
+  "title": "Headroom release qualification manifest",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "qualification_id",
+    "created_at",
+    "candidate",
+    "rollout",
+    "policy_version",
+    "risk_class",
+    "status",
+    "evidence",
+    "gate_a"
+  ],
+  "properties": {
+    "schema_version": { "$ref": "common.schema.json#/$defs/schemaVersion" },
+    "qualification_id": { "$ref": "common.schema.json#/$defs/nonEmptyString" },
+    "created_at": { "type": "string", "format": "date-time" },
+    "candidate": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["source_sha", "artifact", "candidate_manifest"],
+      "properties": {
+        "source_sha": { "$ref": "common.schema.json#/$defs/gitSha" },
+        "artifact": { "$ref": "common.schema.json#/$defs/artifactIdentity" },
+        "runtime_payload_sha256": { "$ref": "common.schema.json#/$defs/sha256" },
+        "candidate_manifest": { "$ref": "common.schema.json#/$defs/evidenceReference" }
+      }
+    },
+    "rollout": { "$ref": "common.schema.json#/$defs/rolloutIdentity" },
+    "policy_version": { "$ref": "common.schema.json#/$defs/releasePolicyVersion" },
+    "risk_class": { "$ref": "common.schema.json#/$defs/riskClass" },
+    "status": { "$ref": "common.schema.json#/$defs/decisionStatus" },
+    "evidence": {
+      "type": "array",
+      "items": { "$ref": "common.schema.json#/$defs/evidenceReference" },
+      "minItems": 1
+    },
+    "gate_a": { "$ref": "common.schema.json#/$defs/evidenceReference" },
+    "gate_b": { "$ref": "common.schema.json#/$defs/evidenceReference" },
+    "revocation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["revoked_at", "revoked_by", "reason"],
+      "properties": {
+        "revoked_at": { "type": "string", "format": "date-time" },
+        "revoked_by": { "$ref": "common.schema.json#/$defs/nonEmptyString" },
+        "reason": { "$ref": "common.schema.json#/$defs/nonEmptyString" },
+        "ticket_uri": { "type": "string", "format": "uri" }
+      }
+    }
+  },
+  "allOf": [
+    {
+      "if": { "properties": { "status": { "const": "pass" } }, "required": ["status"] },
+      "then": {
+        "properties": {
+          "candidate": {
+            "properties": {
+              "candidate_manifest": {
+                "properties": { "status": { "const": "pass" } },
+                "required": ["status"]
+              }
+            }
+          },
+          "evidence": {
+            "items": {
+              "properties": { "status": { "const": "pass" } },
+              "required": ["status"]
+            }
+          },
+          "gate_a": {
+            "properties": { "status": { "const": "pass" } },
+            "required": ["status"]
+          }
+        },
+        "not": { "required": ["revocation"] }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "rollout": {
+            "properties": { "qualification_eligible": { "const": false } },
+            "required": ["qualification_eligible"]
+          }
+        },
+        "required": ["rollout"]
+      },
+      "then": { "properties": { "status": { "not": { "const": "pass" } } } }
+    },
+    {
+      "if": { "required": ["revocation"] },
+      "then": { "properties": { "status": { "not": { "const": "pass" } } } }
+    }
+  ]
+}
