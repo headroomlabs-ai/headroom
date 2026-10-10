@@ -36,6 +36,7 @@ from typing import Any
 
 from ..config import CacheAlignerConfig, CachePrefixMetrics, TransformResult
 from ..tokenizer import Tokenizer
+from ..tokenizers import EstimatingTokenCounter
 from ..utils import compute_short_hash, deep_copy_messages
 from .base import Transform
 
@@ -386,3 +387,27 @@ class CacheAligner(Transform):
             findings = detect_volatile_content(content)
             score -= len(findings) * 10
         return max(0.0, min(100.0, score))
+
+
+def align_for_cache(
+    messages: list[dict[str, Any]],
+    config: CacheAlignerConfig | None = None,
+) -> tuple[list[dict[str, Any]], str]:
+    """Convenience wrapper that runs detection and returns the unchanged messages.
+
+    Kept as a stable public API; the second tuple element is the stable
+    prefix hash for callers that want to track cache prefix drift.
+    """
+    cfg = config or CacheAlignerConfig()
+    aligner = CacheAligner(cfg)
+    tokenizer = Tokenizer(EstimatingTokenCounter())  # type: ignore[arg-type]
+
+    result = aligner.apply(messages, tokenizer)
+
+    stable_hash = ""
+    for marker in result.markers_inserted:
+        if marker.startswith("stable_prefix_hash:"):
+            stable_hash = marker.split(":", 1)[1]
+            break
+
+    return result.messages, stable_hash
