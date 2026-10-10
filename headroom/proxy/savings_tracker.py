@@ -25,7 +25,11 @@ from typing import Any
 
 from headroom import paths as _paths
 from headroom.proxy import project_name_policy
-from headroom.proxy.persistent_metrics import PersistentMetricsState
+from headroom.proxy.persistent_metrics import (
+    PRICING_BASIS,
+    PersistentMetricsState,
+    normalize_compression_prices,
+)
 
 PROJECT_NAME_MAX_LENGTH = project_name_policy.PROJECT_NAME_MAX_LENGTH
 sanitize_project_name = project_name_policy.sanitize_project_name
@@ -67,21 +71,10 @@ def estimate_co2_saved_mg(tokens_saved: int, model: str = "") -> float:
 HEADROOM_SAVINGS_PATH_ENV_VAR = _paths.HEADROOM_SAVINGS_PATH_ENV
 DEFAULT_SAVINGS_DIR = ".headroom"
 DEFAULT_SAVINGS_FILE = "proxy_savings.json"
-# v6: ``compression_savings_usd`` changed BASIS (not shape). It now holds the
-# cache-aware counterfactual — what the removed tokens would actually have been
-# billed at, given the cache mix of the requests they came out of — instead of
-# flat list price. ``compression_savings_list_usd`` carries the old list-priced
-# figure alongside it as the upper bound.
-#
-# The basis flip is deliberately made in place rather than in a new field. The
-# mix was never persisted, so pre-v6 dollars cannot be re-derived either way;
-# a parallel field would have to be SEEDED from the same list-priced history and
-# would blend exactly as much, only in a field nothing reads. Flipping in place
-# means every existing surface (dashboard tiles, per-model table, per-project
-# rows, the history chart) reports the right number with no change of its own.
-# ``savings_basis_migrated_at`` records when the flip happened so a reader can
-# tell which part of a lifetime total predates it.
-SCHEMA_VERSION = 6
+# v7 separates unversioned historical prices from the cache-region estimate.
+# Cache mixes were not persisted, so legacy prices cannot be honestly
+# recomputed. They remain in legacy_* audit fields, never the priced headline.
+SCHEMA_VERSION = 7
 DEFAULT_MAX_HISTORY_POINTS = 5000
 DEFAULT_MAX_PROJECTS = 50
 DEFAULT_MAX_HISTORY_AGE_DAYS = 365
@@ -103,10 +96,7 @@ DEFAULT_FALLBACK_OUTPUT_COST_PER_TOKEN = 15.0 / 1_000_000
 #: outright instead of being dragged down to it forever.
 BASIS_UNKNOWN = "unknown"
 
-#: Basis stamped on state migrated from a schema older than v6. Those dollars
-#: were accumulated at flat list price and the cache mix that produced them was
-#: never persisted, so they cannot be re-derived — the total stays honestly
-#: labelled as containing list-priced history for the life of the install.
+#: List-priced fallback for a request whose cache mix cannot be priced.
 BASIS_LIST = "list"
 
 LITELLM_AVAILABLE = importlib.util.find_spec("litellm") is not None
@@ -662,7 +652,6 @@ def _normalize_history_entry(entry: Any) -> dict[str, Any] | None:
     output_tokens_saved = 0
     output_savings_usd = 0.0
     tool_tokens_saved = 0
-    tool_schema_savings_usd = 0.0
     total_output_cost_usd = 0.0
     provider = PROVIDER_UNKNOWN
     model = MODEL_UNKNOWN
@@ -671,7 +660,6 @@ def _normalize_history_entry(entry: Any) -> dict[str, Any] | None:
     if isinstance(entry, dict):
         timestamp = _parse_timestamp(entry.get("timestamp"))
         total_tokens_saved = _coerce_int(entry.get("total_tokens_saved"))
-        compression_savings_usd = _coerce_float(entry.get("compression_savings_usd"))
         # Older history points predate cache-savings tracking and omit these
         # keys entirely; default to 0/0.0 rather than raising or dropping the
         # entry, matching how every other field here handles legacy shapes.
@@ -682,7 +670,6 @@ def _normalize_history_entry(entry: Any) -> dict[str, Any] | None:
         output_tokens_saved = _coerce_int(entry.get("output_tokens_saved"))
         output_savings_usd = _coerce_float(entry.get("output_savings_usd"))
         tool_tokens_saved = _coerce_int(entry.get("tool_tokens_saved"))
-        tool_schema_savings_usd = _coerce_float(entry.get("tool_schema_savings_usd"))
         total_output_cost_usd = _coerce_float(entry.get("total_output_cost_usd"))
         provider = _normalize_provider(entry.get("provider"))
         model = _normalize_model(entry.get("model"))
@@ -702,13 +689,17 @@ def _normalize_history_entry(entry: Any) -> dict[str, Any] | None:
     if timestamp is None:
         return None
 
+    prices = normalize_compression_prices(
+        entry if isinstance(entry, dict) else {"compression_savings_usd": compression_savings_usd}
+    )
+
     return {
         "timestamp": _to_utc_iso(timestamp),
         "provider": provider,
         "model": model,
         "agent": agent,
         "total_tokens_saved": total_tokens_saved,
-        "compression_savings_usd": round(compression_savings_usd, 6),
+        **prices,
         "cache_read_tokens": cache_read_tokens,
         "cache_savings_usd": round(cache_savings_usd, 6),
         "total_input_tokens": total_input_tokens,
@@ -716,7 +707,8 @@ def _normalize_history_entry(entry: Any) -> dict[str, Any] | None:
         "output_tokens_saved": output_tokens_saved,
         "output_savings_usd": round(output_savings_usd, 6),
         "tool_tokens_saved": tool_tokens_saved,
-        "tool_schema_savings_usd": round(tool_schema_savings_usd, 6),
+        "tool_schema_savings_usd": prices.get("tool_schema_savings_usd", 0.0),
+        "legacy_tool_schema_savings_usd": prices.get("legacy_tool_schema_savings_usd", 0.0),
         "total_output_cost_usd": round(total_output_cost_usd, 6),
     }
 
@@ -726,6 +718,9 @@ def _empty_display_session() -> dict[str, Any]:
         "requests": 0,
         "tokens_saved": 0,
         "compression_savings_usd": 0.0,
+        "pricing_basis": PRICING_BASIS,
+        "legacy_compression_savings_usd": 0.0,
+        "legacy_tool_schema_savings_usd": 0.0,
         "compression_savings_list_usd": 0.0,
         "savings_basis": BASIS_UNKNOWN,
         "tool_tokens_saved": 0,
@@ -754,6 +749,8 @@ def _empty_by_model_entry() -> dict[str, Any]:
         # larger half -- 589,206 of 625,277 in the report that prompted this.
         "tool_tokens_saved": 0,
         "compression_savings_usd": 0.0,
+        "pricing_basis": PRICING_BASIS,
+        "legacy_compression_savings_usd": 0.0,
         "total_input_tokens": 0,
         "total_input_cost_usd": 0.0,
     }
@@ -764,6 +761,8 @@ def _empty_project_entry() -> dict[str, Any]:
         "requests": 0,
         "tokens_saved": 0,
         "compression_savings_usd": 0.0,
+        "pricing_basis": PRICING_BASIS,
+        "legacy_compression_savings_usd": 0.0,
         "total_input_tokens": 0,
         "total_input_cost_usd": 0.0,
         "last_activity_at": None,
@@ -781,9 +780,7 @@ def _normalize_projects(raw: Any) -> dict[str, dict[str, Any]]:
         normalized = _empty_project_entry()
         normalized["requests"] = _coerce_int(entry.get("requests"))
         normalized["tokens_saved"] = _coerce_int(entry.get("tokens_saved"))
-        normalized["compression_savings_usd"] = round(
-            _coerce_signed_float(entry.get("compression_savings_usd")), 6
-        )
+        normalized.update(normalize_compression_prices(entry, include_tool_schema=False))
         normalized["total_input_tokens"] = _coerce_int(entry.get("total_input_tokens"))
         normalized["total_input_cost_usd"] = round(
             _coerce_float(entry.get("total_input_cost_usd")), 6
@@ -816,9 +813,7 @@ def _normalize_by_model(raw: Any) -> dict[str, dict[str, Any]]:
         normalized["tokens_saved"] = _coerce_int(entry.get("tokens_saved"))
         # Absent in state files written before this field existed -> 0.
         normalized["tool_tokens_saved"] = _coerce_int(entry.get("tool_tokens_saved"))
-        normalized["compression_savings_usd"] = round(
-            _coerce_signed_float(entry.get("compression_savings_usd")), 6
-        )
+        normalized.update(normalize_compression_prices(entry, include_tool_schema=False))
         normalized["total_input_tokens"] = _coerce_int(entry.get("total_input_tokens"))
         normalized["total_input_cost_usd"] = round(
             _coerce_float(entry.get("total_input_cost_usd")), 6
@@ -845,32 +840,25 @@ def _normalize_display_session(entry: Any) -> dict[str, Any]:
         2,
     )
 
-    # Presence of the list column is what distinguishes a v6+ session from one
-    # written before cache-aware pricing existed. A pre-v6 session's single
-    # dollar figure WAS the list figure, so it seeds both columns exactly, and
-    # the session is labelled `list` because its mix was never persisted and
-    # cannot be recovered. Written out rather than inlined into the dict below:
-    # a money path should not hinge on the reader parsing a nested ternary.
-    is_pre_v6 = "compression_savings_list_usd" not in entry
-    savings_usd = _coerce_signed_float(entry.get("compression_savings_usd"))
-    if is_pre_v6:
-        savings_list_usd = savings_usd
-        savings_basis = BASIS_LIST
-    else:
-        savings_list_usd = _coerce_signed_float(entry.get("compression_savings_list_usd"))
-        savings_basis = str(entry.get("savings_basis") or BASIS_UNKNOWN)
+    savings_list_usd = _coerce_signed_float(
+        entry.get("compression_savings_list_usd", entry.get("compression_savings_usd"))
+    )
+    savings_basis = (
+        str(entry.get("savings_basis") or BASIS_UNKNOWN)
+        if entry.get("pricing_basis") == PRICING_BASIS
+        else BASIS_UNKNOWN
+    )
 
+    prices = normalize_compression_prices(entry)
     return {
         "requests": _coerce_int(entry.get("requests")),
         "tokens_saved": tokens_saved,
-        "compression_savings_usd": round(savings_usd, 6),
+        **prices,
         "compression_savings_list_usd": round(savings_list_usd, 6),
         "savings_basis": savings_basis,
         "tool_tokens_saved": _coerce_int(entry.get("tool_tokens_saved")),
-        "tool_schema_savings_usd": round(
-            _coerce_float(entry.get("tool_schema_savings_usd")),
-            6,
-        ),
+        "tool_schema_savings_usd": prices.get("tool_schema_savings_usd", 0.0),
+        "legacy_tool_schema_savings_usd": prices.get("legacy_tool_schema_savings_usd", 0.0),
         "cache_read_tokens": _coerce_int(entry.get("cache_read_tokens")),
         "cache_savings_usd": round(
             _coerce_float(entry.get("cache_savings_usd")),
@@ -1352,6 +1340,13 @@ class SavingsTracker:
                         "model": _normalize_model(model),
                         "total_tokens_saved": lifetime["tokens_saved"],
                         "compression_savings_usd": lifetime["compression_savings_usd"],
+                        "pricing_basis": PRICING_BASIS,
+                        "legacy_compression_savings_usd": lifetime[
+                            "legacy_compression_savings_usd"
+                        ],
+                        "legacy_tool_schema_savings_usd": lifetime[
+                            "legacy_tool_schema_savings_usd"
+                        ],
                         "cache_read_tokens": lifetime["cache_read_tokens"],
                         "cache_savings_usd": lifetime["cache_savings_usd"],
                         "total_input_tokens": lifetime["total_input_tokens"],
@@ -1684,6 +1679,9 @@ class SavingsTracker:
                 "timestamp",
                 "total_tokens_saved",
                 "compression_savings_usd",
+                "pricing_basis",
+                "legacy_compression_savings_usd",
+                "legacy_tool_schema_savings_usd",
                 "total_input_tokens",
                 "total_input_cost_usd",
             ]
@@ -1694,6 +1692,9 @@ class SavingsTracker:
                 "compression_savings_usd_delta",
                 "total_tokens_saved",
                 "compression_savings_usd",
+                "pricing_basis",
+                "legacy_compression_savings_usd",
+                "legacy_tool_schema_savings_usd",
                 "total_input_tokens_delta",
                 "total_input_tokens",
                 "total_input_cost_usd_delta",
@@ -1740,6 +1741,9 @@ class SavingsTracker:
                 "requests": 0,
                 "tokens_saved": 0,
                 "compression_savings_usd": 0.0,
+                "pricing_basis": PRICING_BASIS,
+                "legacy_compression_savings_usd": 0.0,
+                "legacy_tool_schema_savings_usd": 0.0,
                 "compression_savings_list_usd": 0.0,
                 "savings_basis": BASIS_UNKNOWN,
                 "tool_tokens_saved": 0,
@@ -1806,6 +1810,11 @@ class SavingsTracker:
         normalized_history.sort(key=lambda item: item["timestamp"])
 
         lifetime_raw = raw.get("lifetime", {})
+        lifetime_prices = normalize_compression_prices(
+            lifetime_raw if isinstance(lifetime_raw, dict) else {}
+        )
+        legacy_savings_usd = lifetime_prices["legacy_compression_savings_usd"]
+        legacy_tool_savings_usd = lifetime_prices.get("legacy_tool_schema_savings_usd", 0.0)
         lifetime_requests = 0
         lifetime_tokens_saved = 0
         lifetime_savings_usd = 0.0
@@ -1825,9 +1834,9 @@ class SavingsTracker:
         if isinstance(lifetime_raw, dict):
             lifetime_requests = _coerce_int(lifetime_raw.get("requests"))
             lifetime_tokens_saved = _coerce_int(lifetime_raw.get("tokens_saved"))
-            lifetime_savings_usd = _coerce_float(lifetime_raw.get("compression_savings_usd"))
+            lifetime_savings_usd = lifetime_prices["compression_savings_usd"]
             lifetime_tool_tokens_saved = _coerce_int(lifetime_raw.get("tool_tokens_saved"))
-            lifetime_tool_savings_usd = _coerce_float(lifetime_raw.get("tool_schema_savings_usd"))
+            lifetime_tool_savings_usd = lifetime_prices.get("tool_schema_savings_usd", 0.0)
             lifetime_cache_read_tokens = _coerce_int(lifetime_raw.get("cache_read_tokens"))
             lifetime_cache_savings_usd = _coerce_float(lifetime_raw.get("cache_savings_usd"))
             lifetime_input_tokens = _coerce_int(lifetime_raw.get("total_input_tokens"))
@@ -1838,7 +1847,8 @@ class SavingsTracker:
                 lifetime_savings_list_usd = _coerce_float(
                     lifetime_raw.get("compression_savings_list_usd")
                 )
-                lifetime_basis = str(lifetime_raw.get("savings_basis") or BASIS_UNKNOWN)
+                if lifetime_raw.get("pricing_basis") == PRICING_BASIS:
+                    lifetime_basis = str(lifetime_raw.get("savings_basis") or BASIS_UNKNOWN)
             lifetime_output_tokens_saved = _coerce_int(lifetime_raw.get("output_tokens_saved"))
             lifetime_output_savings_usd = _coerce_float(lifetime_raw.get("output_savings_usd"))
             lifetime_output_cost_usd = _coerce_float(lifetime_raw.get("total_output_cost_usd"))
@@ -1849,18 +1859,48 @@ class SavingsTracker:
                 lifetime_tokens_saved,
                 last["total_tokens_saved"],
             )
-            lifetime_savings_usd = max(
-                lifetime_savings_usd,
-                _coerce_float(last["compression_savings_usd"]),
-            )
+            if (
+                not isinstance(lifetime_raw, dict)
+                or lifetime_raw.get("pricing_basis") != PRICING_BASIS
+                or "compression_savings_usd" not in lifetime_raw
+            ):
+                lifetime_savings_usd = _coerce_signed_float(last["compression_savings_usd"])
+            if not isinstance(lifetime_raw, dict) or (
+                "compression_savings_usd" not in lifetime_raw
+                and "legacy_compression_savings_usd" not in lifetime_raw
+            ):
+                legacy_savings_usd = _coerce_signed_float(
+                    last.get("legacy_compression_savings_usd")
+                )
+            else:
+                legacy_savings_usd = max(
+                    legacy_savings_usd,
+                    _coerce_signed_float(last.get("legacy_compression_savings_usd")),
+                )
             lifetime_tool_tokens_saved = max(
                 lifetime_tool_tokens_saved,
                 _coerce_int(last.get("tool_tokens_saved")),
             )
-            lifetime_tool_savings_usd = max(
-                lifetime_tool_savings_usd,
-                _coerce_float(last.get("tool_schema_savings_usd")),
-            )
+            if (
+                not isinstance(lifetime_raw, dict)
+                or lifetime_raw.get("pricing_basis") != PRICING_BASIS
+                or "tool_schema_savings_usd" not in lifetime_raw
+            ):
+                lifetime_tool_savings_usd = _coerce_signed_float(
+                    last.get("tool_schema_savings_usd")
+                )
+            if not isinstance(lifetime_raw, dict) or (
+                "tool_schema_savings_usd" not in lifetime_raw
+                and "legacy_tool_schema_savings_usd" not in lifetime_raw
+            ):
+                legacy_tool_savings_usd = _coerce_signed_float(
+                    last.get("legacy_tool_schema_savings_usd")
+                )
+            else:
+                legacy_tool_savings_usd = max(
+                    legacy_tool_savings_usd,
+                    _coerce_signed_float(last.get("legacy_tool_schema_savings_usd")),
+                )
             lifetime_input_tokens = max(
                 lifetime_input_tokens,
                 _coerce_int(last.get("total_input_tokens")),
@@ -1886,25 +1926,11 @@ class SavingsTracker:
                 _coerce_float(last.get("total_output_cost_usd")),
             )
 
-        # v6 migration seed. Runs HERE, after the history back-fill above, not
-        # beside the lifetime read: a state whose `lifetime` block is missing or
-        # empty still recovers its totals from the last history point, and
-        # seeding before that ran left the list column at 0 while the effective
-        # column carried the recovered dollars — a total that reads as a 100%
-        # cache-aware saving on data that was entirely list-priced.
-        #
-        # Everything a pre-v6 install accumulated was flat list price, so it
-        # seeds BOTH columns: for that history they genuinely are the same
-        # number. The cache mix that would let us re-derive the honest value was
-        # never persisted — which is the whole reason v6 exists — so the total
-        # stays labelled `list` for the life of the install, and
-        # `savings_basis_migrated_at` marks where the honest numbers begin.
-        if not is_v6_lifetime and (lifetime_requests or lifetime_savings_usd):
-            lifetime_savings_list_usd = lifetime_savings_usd
-            lifetime_basis = BASIS_LIST
-            if not migrated_at:
-                migrated_at = _to_utc_iso(_utc_now())
-                self._needs_schema_save = True
+        if not is_v6_lifetime:
+            lifetime_savings_list_usd = lifetime_savings_usd + legacy_savings_usd
+        if legacy_savings_usd and not migrated_at:
+            migrated_at = _to_utc_iso(_utc_now())
+            self._needs_schema_save = True
 
         state = {
             "schema_version": SCHEMA_VERSION,
@@ -1912,6 +1938,9 @@ class SavingsTracker:
                 "requests": lifetime_requests,
                 "tokens_saved": lifetime_tokens_saved,
                 "compression_savings_usd": round(lifetime_savings_usd, 6),
+                "pricing_basis": PRICING_BASIS,
+                "legacy_compression_savings_usd": round(legacy_savings_usd, 6),
+                "legacy_tool_schema_savings_usd": round(legacy_tool_savings_usd, 6),
                 "compression_savings_list_usd": round(lifetime_savings_list_usd, 6),
                 "savings_basis": lifetime_basis,
                 "savings_basis_migrated_at": migrated_at,
@@ -1978,6 +2007,10 @@ class SavingsTracker:
             "cost": {
                 "input_usd": legacy["total_input_cost_usd"],
                 "compression_savings_usd": legacy["compression_savings_usd"],
+                "pricing_basis": PRICING_BASIS,
+                "legacy_compression_savings_usd": legacy["legacy_compression_savings_usd"],
+                "compression_savings_list_usd": legacy["compression_savings_list_usd"],
+                "savings_basis": legacy["savings_basis"],
                 "cache_savings_usd": legacy["cache_savings_usd"],
             },
             "models": {
@@ -2304,6 +2337,7 @@ class SavingsTracker:
                     "compression_savings_usd_delta": 0.0,
                     "total_tokens_saved": total_tokens_saved,
                     "compression_savings_usd": total_usd,
+                    "pricing_basis": PRICING_BASIS,
                     "total_input_tokens_delta": 0,
                     "total_input_tokens": total_input_tokens,
                     "total_input_cost_usd_delta": 0.0,
@@ -2334,6 +2368,12 @@ class SavingsTracker:
             )
             entry["total_tokens_saved"] = total_tokens_saved
             entry["compression_savings_usd"] = round(total_usd, 6)
+            entry["legacy_compression_savings_usd"] = _coerce_signed_float(
+                point.get("legacy_compression_savings_usd")
+            )
+            entry["legacy_tool_schema_savings_usd"] = _coerce_signed_float(
+                point.get("legacy_tool_schema_savings_usd")
+            )
             entry["total_input_tokens"] = total_input_tokens
             entry["total_input_cost_usd"] = round(total_input_cost_usd, 6)
             entry["output_tokens_saved_delta"] += delta_output_tokens

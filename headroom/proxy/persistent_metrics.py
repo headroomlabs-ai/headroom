@@ -9,6 +9,7 @@ from datetime import datetime, timezone
 from typing import Any
 
 SCHEMA_VERSION = 5
+PRICING_BASIS = "cache-region-v1"
 MAX_PROVIDER_VALUES = 32
 MAX_STACK_VALUES = 64
 MAX_TRACKED_MODELS = 200
@@ -61,6 +62,38 @@ def _coerce_float(value: Any) -> float:
     except (TypeError, ValueError, OverflowError):
         return 0.0
     return result if math.isfinite(result) and result >= 0 else 0.0
+
+
+def _coerce_signed_float(value: Any) -> float:
+    try:
+        result = float(value)
+    except (TypeError, ValueError, OverflowError):
+        return 0.0
+    return result if math.isfinite(result) else 0.0
+
+
+def normalize_compression_prices(
+    source: dict[str, Any], *, include_tool_schema: bool = True
+) -> dict[str, Any]:
+    """Separate unversioned dollars without inventing their missing cache mix.
+
+    The method version qualifies the priced fields, independently of the
+    quality label (``savings_basis``). Legacy dollars remain available for
+    audit but cannot seed a current estimate, including on subsequent loads.
+    """
+    current = source.get("pricing_basis") == PRICING_BASIS
+    result: dict[str, Any] = {"pricing_basis": PRICING_BASIS}
+    for key in ("compression_savings_usd", "tool_schema_savings_usd"):
+        legacy_key = f"legacy_{key}"
+        if key == "tool_schema_savings_usd" and (
+            not include_tool_schema or (key not in source and legacy_key not in source)
+        ):
+            continue
+        dollars = _coerce_signed_float(source.get(key))
+        legacy = _coerce_signed_float(source.get(legacy_key))
+        result[key] = round(dollars if current else 0.0, 6)
+        result[legacy_key] = round(legacy if current else legacy + dollars, 6)
+    return result
 
 
 def _label(value: Any) -> str:
@@ -125,6 +158,8 @@ def _empty_state() -> dict[str, Any]:
         "cost": {
             "input_usd": 0.0,
             "compression_savings_usd": 0.0,
+            "pricing_basis": PRICING_BASIS,
+            "legacy_compression_savings_usd": 0.0,
             "compression_savings_list_usd": 0.0,
             "cache_savings_usd": 0.0,
             "savings_basis": "unknown",
@@ -238,22 +273,13 @@ class PersistentMetricsState:
             "cache_savings_usd",
         ):
             result["cost"][key] = round(_coerce_float(raw_cost.get(key)), 6)
-        # A state written before cache-aware pricing has no list column and its
-        # dollars WERE list-priced, so that one figure seeds both and the
-        # aggregate stays honestly labelled.
-        #
-        # The `has_priced_history` guard matters: a FRESH state also has no list
-        # column, and labelling that "list" would tell every new install its
-        # untouched $0.00 total was list-priced. Only a state that actually
-        # accumulated dollars has history to migrate.
-        has_priced_history = result["cost"]["compression_savings_usd"] > 0
-        if "compression_savings_list_usd" in raw_cost:
+        if "compression_savings_list_usd" not in raw_cost:
+            result["cost"]["compression_savings_list_usd"] = round(
+                _coerce_signed_float(raw_cost.get("compression_savings_usd")), 6
+            )
+        result["cost"].update(normalize_compression_prices(raw_cost))
+        if raw_cost.get("pricing_basis") == PRICING_BASIS:
             result["cost"]["savings_basis"] = str(raw_cost.get("savings_basis") or "unknown")
-        elif has_priced_history:
-            result["cost"]["compression_savings_list_usd"] = result["cost"][
-                "compression_savings_usd"
-            ]
-            result["cost"]["savings_basis"] = "list"
         # Record-time puts unrecognised names in ``other`` (see
         # ``record_request``); load-time must do the same, or every restart
         # relabels the whole ``other`` bucket as ``unknown`` and the two
