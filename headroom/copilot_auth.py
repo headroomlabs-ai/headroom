@@ -1672,6 +1672,34 @@ async def apply_copilot_api_auth(headers: dict[str, str], *, url: str) -> dict[s
     if not is_copilot_upstream_url(url):
         return resolved
 
+    incoming_auth = next((v for k, v in resolved.items() if k.lower() == "authorization"), None)
+    scheme, _, raw_token = incoming_auth.partition(" ") if incoming_auth else ("", "", "")
+    # Inline completions accept the editor's own OAuth credential. Keep its
+    # account and integration metadata rather than substituting the operator's
+    # seat or adding chat-specific defaults (#3352).
+    if (
+        scheme.lower() == "bearer"
+        and raw_token.startswith("ghu_")
+        and is_copilot_completions_host(url)
+        and not _is_managed_copilot_seeded_bearer(raw_token)
+    ):
+        upstream = urlparse(url)
+        base = urlparse(copilot_completions_base_url())
+        path = upstream.path
+        prefix = base.path.rstrip("/")
+        if (
+            prefix
+            and upstream.scheme == base.scheme
+            and upstream.netloc.lower() == base.netloc.lower()
+            and path.startswith(prefix + "/")
+        ):
+            path = path[len(prefix) :]
+        if is_copilot_completions_path(path):
+            for key in list(resolved):
+                if key.lower() == "x-api-key":
+                    resolved.pop(key)
+            return resolved
+
     # Read the CLIENT's integration ID before any default is applied, so the
     # credential we mint below can be bound to the surface that actually made
     # the call rather than to whatever this proxy happens to default to.
@@ -1681,9 +1709,7 @@ async def apply_copilot_api_auth(headers: dict[str, str], *, url: str) -> dict[s
     for name, value in _copilot_chat_header_defaults(integration_id).items():
         _set_header_default(resolved, name, value)
 
-    incoming_auth = next((v for k, v in resolved.items() if k.lower() == "authorization"), None)
     if incoming_auth:
-        scheme, _, raw_token = incoming_auth.partition(" ")
         if (
             scheme.lower() == "bearer"
             and raw_token
