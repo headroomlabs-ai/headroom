@@ -114,7 +114,7 @@ def test_warn_once_stays_bounded_across_repeated_passes(caplog: pytest.LogCaptur
     messages = _warnings(caplog)
     assert len(messages) == 65  # 64 keys plus one overflow notice, not 65 per pass
     assert messages[-1] == (
-        "More than 64 distinct unwritable ledgers; further ones are logged at debug only "
+        "More than 64 distinct unwritable ledgers; further ones are not logged at WARNING "
         "for the next 60 minutes"
     )
 
@@ -251,3 +251,19 @@ def test_overflow_notice_states_the_time_left_in_the_window(
         guard.first("b", log)
 
     assert _warnings(caplog)[-1].endswith("for the next 10 minutes")
+
+
+def test_forget_cycles_cannot_exceed_the_window_budget(caplog: pytest.LogCaptureFixture) -> None:
+    log = logging.getLogger("headroom.test_log_safety.forget_budget")
+    guard = WarnOnce(limit=3, what="failures")
+
+    with caplog.at_level(logging.INFO, logger=log.name):
+        issued = 0
+        for cycle in range(50):
+            if guard.first(f"path-{cycle}", log):
+                issued += 1
+                log.warning("path-%d failed", cycle)
+            guard.forget(f"path-{cycle}")
+
+    assert issued == 3
+    assert len(_warnings(caplog)) == 4  # three warnings plus one overflow notice
