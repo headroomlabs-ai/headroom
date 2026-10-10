@@ -83,6 +83,71 @@ class TestCompressEndpointValidation:
         data = response.json()
         assert data["error"]["type"] == "invalid_request"
 
+    @pytest.mark.parametrize("biases", [None, [], "0:2.0"])
+    def test_biases_must_be_an_object(self, client, biases):
+        response = client.post(
+            "/v1/compress",
+            json={
+                "messages": [{"role": "user", "content": "hello"}],
+                "model": "gpt-4",
+                "biases": biases,
+            },
+        )
+
+        assert response.status_code == 400
+        assert response.json()["error"] == {
+            "type": "invalid_request",
+            "message": "biases must be an object mapping message indices to positive numbers",
+        }
+
+    @pytest.mark.parametrize("index", ["-1", "01", "message"])
+    def test_bias_keys_must_be_canonical_non_negative_indices(self, client, index):
+        response = client.post(
+            "/v1/compress",
+            json={
+                "messages": [{"role": "user", "content": "hello"}],
+                "model": "gpt-4",
+                "biases": {index: 1.5},
+            },
+        )
+
+        assert response.status_code == 400
+        assert response.json()["error"]["type"] == "invalid_request"
+        assert "canonical non-negative integer" in response.json()["error"]["message"]
+
+    def test_bias_index_must_reference_an_existing_message(self, client):
+        response = client.post(
+            "/v1/compress",
+            json={
+                "messages": [{"role": "user", "content": "hello"}],
+                "model": "gpt-4",
+                "biases": {"1": 1.5},
+            },
+        )
+
+        assert response.status_code == 400
+        assert response.json()["error"] == {
+            "type": "invalid_request",
+            "message": "bias index 1 is out of range for 1 messages",
+        }
+
+    @pytest.mark.parametrize("bias", [None, True, "high", 0, -0.5])
+    def test_bias_values_must_be_finite_positive_numbers(self, client, bias):
+        response = client.post(
+            "/v1/compress",
+            json={
+                "messages": [{"role": "user", "content": "hello"}],
+                "model": "gpt-4",
+                "biases": {"0": bias},
+            },
+        )
+
+        assert response.status_code == 400
+        assert response.json()["error"] == {
+            "type": "invalid_request",
+            "message": "bias for message index 0 must be a finite positive number",
+        }
+
 
 class TestCompressEndpointBasic:
     """Test basic compress endpoint behavior."""
@@ -291,6 +356,38 @@ class TestCompressEndpointCompression:
         assert data["tokens_before"] >= 0
         assert data["tokens_after"] >= 0
         assert isinstance(data["transforms_applied"], list)
+
+    def test_biases_are_normalized_and_forwarded_to_pipeline(self, client, monkeypatch):
+        proxy = client.app.state.proxy
+        result = SimpleNamespace(
+            messages=[{"role": "user", "content": "compressed"}],
+            tokens_before=12,
+            tokens_after=7,
+            transforms_applied=["test_transform"],
+            transforms_summary={"test_transform": 1},
+            markers_inserted=[],
+        )
+        apply_pipeline = Mock(return_value=result)
+        monkeypatch.setattr(
+            proxy,
+            "_no_ccr_pipeline",
+            Mock(return_value=SimpleNamespace(apply=apply_pipeline)),
+        )
+
+        response = client.post(
+            "/v1/compress",
+            json={
+                "messages": [
+                    {"role": "system", "content": "preserve this"},
+                    {"role": "user", "content": "compress this"},
+                ],
+                "model": "gpt-4",
+                "biases": {"0": 2.0, "1": 0.5},
+            },
+        )
+
+        assert response.status_code == 200
+        assert apply_pipeline.call_args.kwargs["biases"] == {0: 2.0, 1: 0.5}
 
     def test_success_records_request_outcome(self, client, monkeypatch):
         """A completed compression should update request metrics."""
