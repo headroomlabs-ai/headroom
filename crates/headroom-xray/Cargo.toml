@@ -1,0 +1,36 @@
+[package]
+name = "headroom-xray"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "headroom xray — multi-CLI context-bloat diagnostics (Phase 1: thin CodeBurn wrapper + Headroom footer)."
+
+[[bin]]
+name = "headroom-xray"
+path = "src/main.rs"
+
+[lib]
+name = "headroom_xray"
+path = "src/lib.rs"
+
+[dependencies]
+# Workspace `clap` already has `derive`; we add `env` for env-var flag support.
+clap = { workspace = true, features = ["env"] }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+anyhow = { workspace = true }
+# Workspace `tokio` has macros/rt-multi-thread/signal; we add process/io-util/fs.
+tokio = { workspace = true, features = ["process", "io-util", "fs"] }
+tracing = { workspace = true }
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+# Tokenization: tiktoken-rs gives us cl100k_base / o200k_base used by Anthropic/OpenAI.
+# Pinned to a specific minor to avoid API churn surprises (the crate is pre-1.0).
+tiktoken-rs = "0.5.9"
+
+[dev-dependencies]
+assert_cmd = "2"
+predicates = "3"
+tempfile = "3"
