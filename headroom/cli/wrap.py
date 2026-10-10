@@ -709,6 +709,7 @@ def _start_proxy(
     anthropic_api_url: str | None = None,
     vertex_api_url: str | None = None,
     clear_vertex_api_url: bool = False,
+    factory_api_url: str | None = None,
     copilot_api_token: str | None = None,
     copilot_refresh_oauth_token: str | None = None,
     copilot_api_token_expires_at: float | None = None,
@@ -773,6 +774,9 @@ def _start_proxy(
     if vertex_api_url:
         cmd.extend(["--vertex-api-url", vertex_api_url])
 
+    if factory_api_url:
+        cmd.extend(["--factory-api-url", factory_api_url])
+
     timeout_seconds = _resolve_wrap_proxy_timeout_seconds()
     log_path = _get_log_path(port)
     stdio_log_path = _get_proxy_stdio_log_path(port)
@@ -820,6 +824,8 @@ def _start_proxy(
         proxy_env.pop("VERTEX_TARGET_API_URL", None)
     if vertex_api_url:
         proxy_env["VERTEX_TARGET_API_URL"] = vertex_api_url
+    if factory_api_url:
+        proxy_env["FACTORY_TARGET_API_URL"] = factory_api_url
     # Pin the wrapper-validated Copilot token for this proxy instance only.
     # Injected into the subprocess env here (not the parent's os.environ) so it
     # never leaks into shared state. The proxy's CopilotTokenProvider honours
@@ -4254,6 +4260,7 @@ def _effective_requested_proxy_routing(
     anthropic_api_url: str | None,
     vertex_api_url: str | None,
     clear_vertex_api_url: bool,
+    factory_api_url: str | None = None,
 ) -> tuple[str, dict[str, str | None]]:
     """Resolve the routing a newly started proxy would inherit."""
     from headroom.providers.registry import resolve_api_overrides
@@ -4274,7 +4281,7 @@ def _effective_requested_proxy_routing(
             "cloudcode_api_url": overrides.cloudcode,
             "vertex_api_url": None if clear_vertex_api_url else overrides.vertex,
             "augment_api_url": os.environ.get("AUGMENT_TARGET_API_URL"),
-            "factory_api_url": os.environ.get("FACTORY_TARGET_API_URL"),
+            "factory_api_url": factory_api_url or os.environ.get("FACTORY_TARGET_API_URL"),
         },
     )
 
@@ -4733,6 +4740,7 @@ def _ensure_proxy_unlocked(
     anthropic_api_url: str | None = None,
     vertex_api_url: str | None = None,
     clear_vertex_api_url: bool = False,
+    factory_api_url: str | None = None,
     copilot_api_token: str | None = None,
     copilot_refresh_oauth_token: str | None = None,
     copilot_api_token_expires_at: float | None = None,
@@ -4756,6 +4764,7 @@ def _ensure_proxy_unlocked(
         anthropic_api_url=anthropic_api_url,
         vertex_api_url=vertex_api_url,
         clear_vertex_api_url=clear_vertex_api_url,
+        factory_api_url=factory_api_url,
     )
     # Set True when the proxy on the requested port belongs to a persistent
     # deployment whose routing config does not match this wrap: the deployment
@@ -5053,12 +5062,48 @@ def _ensure_proxy_unlocked(
                     and running_config.get("savings_profile") != expected_savings_profile
                 ):
                     missing.append("savings-profile")
+                if openai_api_url:
+                    running_openai_url = _normalize_proxy_api_url(
+                        running_config.get("openai_api_url")
+                    )
+                    requested_openai_url = _normalize_proxy_api_url(openai_api_url)
+                    if running_openai_url != requested_openai_url:
+                        missing.append("openai-api-url")
+                if vertex_api_url or clear_vertex_api_url:
+                    running_vertex_url = _normalize_proxy_api_url(
+                        running_config.get("vertex_api_url")
+                    )
+                    requested_vertex_url = _normalize_proxy_api_url(vertex_api_url)
+                    if running_vertex_url != requested_vertex_url:
+                        missing.append("vertex-api-url")
+                if factory_api_url:
+                    running_factory_url = _normalize_proxy_api_url(
+                        running_config.get("factory_api_url")
+                    )
+                    requested_factory_url = _normalize_proxy_api_url(factory_api_url)
+                    if running_factory_url != requested_factory_url:
+                        missing.append("factory-api-url")
 
                 if missing and not routing_mismatches:
                     flags_str = ", ".join(
                         f if f.startswith("--") else f"--{f.replace('_', '-')}" for f in missing
                     )
                     other_wrappers = helpers._live_proxy_clients(port, exclude_self=True)
+                    if other_wrappers and "factory-api-url" in missing:
+                        # A non-Factory proxy has no `/api/llm/a/v1/messages`
+                        # route, so Droid's traffic would fall through to the
+                        # catch-all and hit the wrong upstream (404). Unlike
+                        # feature flags (memory/learn), reusing as-is here is not
+                        # "degraded" but broken, and we cannot restart into
+                        # Factory mode without dropping the attached wrapper(s)'
+                        # in-flight requests. Fail loud with a fix instead.
+                        raise click.ClickException(
+                            f"Proxy on port {port} is not in Factory mode and "
+                            f"{len(other_wrappers)} other wrapper(s) are attached, so it cannot "
+                            f"be upgraded without disrupting them. Droid needs a Factory-mode "
+                            f"proxy; rerun on a dedicated port, e.g. "
+                            f"`headroom wrap droid --port {port + 1}`."
+                        )
                     if other_wrappers:
                         # Another wrapper is attached to this proxy; restarting it
                         # to add flags would drop their in-flight requests. Reuse
@@ -5183,6 +5228,7 @@ def _ensure_proxy_unlocked(
                     anthropic_api_url=anthropic_api_url,
                     vertex_api_url=vertex_api_url,
                     clear_vertex_api_url=clear_vertex_api_url,
+                    factory_api_url=factory_api_url,
                     copilot_api_token=copilot_api_token,
                     copilot_refresh_oauth_token=copilot_refresh_oauth_token,
                     copilot_api_token_expires_at=copilot_api_token_expires_at,
@@ -5194,6 +5240,29 @@ def _ensure_proxy_unlocked(
             click.echo(f"  Error: {e}")
             raise SystemExit(1) from e
     else:
+        if factory_api_url:
+            from headroom.providers.droid import canonical_factory_api_url
+
+            health_payload = (
+                helpers._query_proxy_health(port) if helpers._check_proxy(port) else None
+            )
+            running_config = (
+                helpers._proxy_health_config(health_payload)
+                if health_payload is not None and health_payload.get("service") == "headroom-proxy"
+                else None
+            )
+            running_factory = (
+                canonical_factory_api_url(running_config.get("factory_api_url"))
+                if running_config is not None
+                else None
+            )
+            requested_factory = canonical_factory_api_url(factory_api_url)
+            if requested_factory is None or running_factory != requested_factory:
+                raise click.ClickException(
+                    f"--no-proxy requires a compatible Factory proxy on port {port}. "
+                    "Start one for the requested Factory upstream or omit --no-proxy."
+                )
+
         if require_openai_api_url and openai_api_url:
             # A user-chosen upstream cannot be applied to a proxy wrap does
             # not own; fail closed unless the running one already matches.
@@ -5453,6 +5522,7 @@ def _launch_tool(
     region: str | None = None,
     openai_api_url: str | None = None,
     anthropic_api_url: str | None = None,
+    factory_api_url: str | None = None,
     copilot_api_token: str | None = None,
     copilot_refresh_oauth_token: str | None = None,
     copilot_api_token_expires_at: float | None = None,
@@ -5496,6 +5566,7 @@ def _launch_tool(
             region=region,
             openai_api_url=openai_api_url,
             anthropic_api_url=anthropic_api_url,
+            factory_api_url=factory_api_url,
             copilot_api_token=copilot_api_token,
             copilot_refresh_oauth_token=copilot_refresh_oauth_token,
             copilot_api_token_expires_at=copilot_api_token_expires_at,
@@ -8975,6 +9046,121 @@ def omp(
         memory=memory,
         agent_type="omp",
         code_graph=code_graph,
+    )
+
+
+# =============================================================================
+# Factory Droid
+# =============================================================================
+
+
+@wrap.command(context_settings={"ignore_unknown_options": True})
+@_retired_context_tool_option
+@proxy_port_option()
+@click.option("--no-proxy", is_flag=True, help="Skip proxy startup (use existing proxy)")
+@click.option("--learn", is_flag=True, help="Enable live traffic learning")
+@click.option("--memory", is_flag=True, help="Enable persistent cross-session memory")
+@click.option(
+    "--factory-api-url",
+    default=None,
+    help="Factory upstream to forward to (default: existing FACTORY_API_BASE_URL or https://api.factory.ai)",
+)
+@click.option("--verbose", "-v", is_flag=True, help="Verbose output")
+@click.option("--prepare-only", is_flag=True, hidden=True)
+@click.argument("droid_args", nargs=-1, type=click.UNPROCESSED)
+def droid(
+    port: int,
+    no_proxy: bool,
+    learn: bool,
+    memory: bool,
+    factory_api_url: str | None,
+    verbose: bool,
+    prepare_only: bool,
+    droid_args: tuple,
+) -> None:
+    """Launch Factory Droid through Headroom proxy.
+
+    \b
+    Droid talks to Factory's gateway and honors ``FACTORY_API_BASE_URL`` to
+    redirect that traffic. This command starts the proxy in Factory mode and
+    launches ``droid`` with ``FACTORY_API_BASE_URL`` pointed at the local proxy.
+    The proxy compresses the Anthropic-shaped ``/api/llm/a/v1/messages`` and the
+    OpenAI-shaped ``/api/llm/o/v1/chat/completions`` inference routes and
+    forwards every other Factory REST path verbatim to the real upstream,
+    passing the Factory session credential through untouched. Use Droid
+    normally: any model, including Droid Core, is compressed on your Factory
+    subscription. No ``customModels`` edits and no API keys.
+
+    \b
+    Examples:
+        headroom wrap droid                     # Start proxy + droid
+        headroom wrap droid -- exec "say hi"    # Pass args to droid
+        headroom wrap droid --port 9999         # Custom proxy port
+    """
+    from headroom.providers.droid import (
+        canonical_factory_api_url,
+        proxy_base_url,
+        resolve_factory_upstream,
+    )
+
+    factory_upstream = canonical_factory_api_url(resolve_factory_upstream(factory_api_url))
+    if factory_upstream is None:
+        raise click.ClickException(
+            "Factory upstream must be an HTTP(S) URL with a non-loopback host and "
+            "no credentials, query, or fragment."
+        )
+
+    if prepare_only:
+        click.echo(f"FACTORY_API_BASE_URL={proxy_base_url(port)}")
+        click.echo(f"upstream={factory_upstream}")
+        return
+
+    droid_bin = shutil.which("droid")
+    if not droid_bin:
+        click.echo("Error: 'droid' not found in PATH.")
+        click.echo("Install Factory Droid: https://docs.factory.ai")
+        raise SystemExit(1)
+
+    # Automatic port selection (no --port needed). Reuse a running Factory proxy
+    # for the same upstream; otherwise a proxy on this port belongs to a
+    # different session (a shared `wrap claude`, or a Factory proxy for another
+    # upstream) whose routes would misroute Droid, so start a dedicated proxy on
+    # the next free port instead of disrupting it or failing. `_launch_tool`
+    # rewrites FACTORY_API_BASE_URL to the actual port, so Droid follows.
+    if not no_proxy and _check_proxy(port):
+        running_config = _query_proxy_config(port)
+        running_factory = (
+            canonical_factory_api_url(running_config.get("factory_api_url"))
+            if running_config
+            else None
+        )
+        if running_factory != factory_upstream:
+            new_port = _find_available_port(port + 1)
+            click.echo(
+                f"  Port {port} is serving a different session; using port "
+                f"{new_port} for this Droid session."
+            )
+            port = new_port
+
+    env = os.environ.copy()
+    env["FACTORY_API_BASE_URL"] = proxy_base_url(port)
+    env_vars_display = [
+        f"FACTORY_API_BASE_URL={proxy_base_url(port)}",
+        f"Factory upstream: {factory_upstream}",
+    ]
+
+    _launch_tool(
+        binary=droid_bin,
+        args=droid_args,
+        env=env,
+        port=port,
+        no_proxy=no_proxy,
+        tool_label="DROID",
+        env_vars_display=env_vars_display,
+        learn=learn,
+        memory=memory,
+        agent_type="droid",
+        factory_api_url=factory_upstream,
     )
 
 

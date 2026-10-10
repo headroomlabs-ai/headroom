@@ -52,6 +52,8 @@ def custom_base_passthrough_telemetry(method: str, path: str, base_url: str) -> 
     except ValueError:
         return "", ""
     normalized_path = path[1:] if path.startswith("/") else path
+    if normalized_path == "api/llm/o/v1/chat/completions":
+        return "chat/completions", "factory"
     if host in OPENCODE_ZEN_HOSTS:
         if normalized_path == "zen/v1/chat/completions":
             return "chat/completions", "zen"
