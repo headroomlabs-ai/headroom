@@ -202,6 +202,8 @@ class _RaisingClient:
     [
         ("delete_memory", ValueError("Memory with id m1 not found"), False),
         ("delete_memory", ValueError("payload user:secret rejected"), True),
+        ("delete_memory", ValueError("Collection mem0 not found"), True),
+        ("delete_memory", ValueError("Memory with id other-id not found"), True),
         ("delete_memory", RuntimeError("qdrant at user:secret@host down"), True),
         ("get_memory", RuntimeError("qdrant at user:secret@host down"), True),
     ],
