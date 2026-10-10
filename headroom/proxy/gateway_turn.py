@@ -1178,7 +1178,6 @@ def shape_gateway_body(
     and the block is re-appended deterministically. Never raises.
     """
     try:
-        from headroom.proxy import runtime_env
         from headroom.proxy.output_savings import (
             assign_arm,
             conversation_key_from_body,
@@ -1188,6 +1187,7 @@ def shape_gateway_body(
         from headroom.proxy.output_shaper import (
             OutputShaperSettings,
             classify_turn,
+            output_holdout_fraction,
             resolve_verbosity_level,
             shape_openai_chat_request,
             shape_request,
@@ -1201,11 +1201,7 @@ def shape_gateway_body(
         )
         if not settings.enabled:
             return False
-        try:
-            holdout = float(runtime_env.getenv("HEADROOM_OUTPUT_HOLDOUT", "0") or "0")
-        except ValueError:
-            holdout = 0.0
-        arm = assign_arm(conversation_key_from_body(provider_body), holdout)
+        arm = assign_arm(conversation_key_from_body(provider_body), output_holdout_fraction())
         messages = provider_body.get("messages")
         turn_kind = classify_turn(messages if isinstance(messages, list) else []).value
         stratum = stratum_key(

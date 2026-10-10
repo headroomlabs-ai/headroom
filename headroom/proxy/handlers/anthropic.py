@@ -3558,6 +3558,7 @@ class AnthropicHandlerMixin:
                 from headroom.proxy.output_shaper import (
                     OutputShaperSettings,
                     classify_turn,
+                    output_holdout_fraction,
                     resolve_verbosity_level,
                     shape_request,
                 )
@@ -3571,15 +3572,8 @@ class AnthropicHandlerMixin:
                     # conversation is treatment or control. This keeps the A/B
                     # comparison clean AND keeps the prefix cache stable (we
                     # never flip a conversation's system-prompt tail mid-stream).
-                    from headroom.proxy import runtime_env
-
-                    _holdout = 0.0
-                    try:
-                        _holdout = float(runtime_env.getenv("HEADROOM_OUTPUT_HOLDOUT", "0") or "0")
-                    except ValueError:
-                        _holdout = 0.0
                     _conversation = conversation_key_from_body(body)
-                    _arm = assign_arm(_conversation, _holdout)
+                    _arm = assign_arm(_conversation, output_holdout_fraction())
 
                     # Stratum from request features observable now (mirrors the
                     # offline baseline so live and learned strata line up).

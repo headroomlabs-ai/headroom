@@ -840,7 +840,6 @@ def _shape_openai_responses_payload(
     must not be able to break request forwarding.
     """
     try:
-        from headroom.proxy import runtime_env
         from headroom.proxy.output_savings import (
             assign_arm,
             conversation_key_from_responses_body,
@@ -851,6 +850,7 @@ def _shape_openai_responses_payload(
         from headroom.proxy.output_shaper import (
             OutputShaperSettings,
             classify_responses_turn,
+            output_holdout_fraction,
             resolve_verbosity_level,
             shape_responses_request,
         )
@@ -859,10 +859,7 @@ def _shape_openai_responses_payload(
         if not settings.enabled:
             return [], False
 
-        try:
-            holdout = float(runtime_env.getenv("HEADROOM_OUTPUT_HOLDOUT", "0") or "0")
-        except ValueError:
-            holdout = 0.0
+        holdout = output_holdout_fraction()
         conversation = conversation_key_from_responses_body(payload)
         arm = assign_arm(conversation, holdout)
 
@@ -1550,15 +1547,6 @@ def _openai_responses_from_sse(sse_text: str) -> dict[str, Any] | None:
     return completed
 
 
-def _output_shaping_holdout_fraction() -> float:
-    from headroom.proxy import runtime_env
-
-    try:
-        return float(runtime_env.getenv("HEADROOM_OUTPUT_HOLDOUT", "0") or "0")
-    except ValueError:
-        return 0.0
-
-
 def _shape_openai_responses_for_output(
     payload: dict[str, Any],
     *,
@@ -1578,6 +1566,7 @@ def _shape_openai_responses_for_output(
         OutputShaperSettings,
         ShapeResult,
         classify_openai_responses_input,
+        output_holdout_fraction,
         resolve_verbosity_level,
         shape_openai_responses_request,
     )
@@ -1589,7 +1578,7 @@ def _shape_openai_responses_for_output(
 
     assert result.labels is not None
     key = conversation_key or conversation_key_from_body(payload)
-    arm = assign_arm(key, _output_shaping_holdout_fraction())
+    arm = assign_arm(key, output_holdout_fraction())
     turn_kind = classify_openai_responses_input(payload.get("input")).value
     stratum = stratum_key(
         turn_kind=turn_kind,
@@ -4932,7 +4921,6 @@ class OpenAIHandlerMixin:
         # Mutating `body` in place is sufficient here — the outbound request
         # serializes `body` fresh, so no body-mutation tracker is needed.
         if not _bypass:
-            from headroom.proxy import runtime_env
             from headroom.proxy.output_savings import (
                 assign_arm,
                 conversation_key_from_body,
@@ -4943,6 +4931,7 @@ class OpenAIHandlerMixin:
             from headroom.proxy.output_shaper import (
                 OutputShaperSettings,
                 classify_turn,
+                output_holdout_fraction,
                 resolve_verbosity_level,
                 shape_openai_chat_request,
             )
@@ -4956,13 +4945,8 @@ class OpenAIHandlerMixin:
                 # or control, which keeps the A/B comparison clean and the
                 # provider prefix cache stable (the steering block never flips
                 # mid-conversation).
-                _holdout = 0.0
-                try:
-                    _holdout = float(runtime_env.getenv("HEADROOM_OUTPUT_HOLDOUT", "0") or "0")
-                except ValueError:
-                    _holdout = 0.0
                 _conversation = conversation_key_from_body(body)
-                _arm = assign_arm(_conversation, _holdout)
+                _arm = assign_arm(_conversation, output_holdout_fraction())
                 _turn_kind = classify_turn(body.get("messages", [])).value
                 _stratum = stratum_key(
                     turn_kind=_turn_kind,
