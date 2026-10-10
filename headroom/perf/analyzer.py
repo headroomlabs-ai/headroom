@@ -67,12 +67,11 @@ _STAGE_TIMINGS_RE = re.compile(
 
 
 # ---------------------------------------------------------------------------
-# Cache-aware pricing via LiteLLM
+# List pricing via LiteLLM
 # ---------------------------------------------------------------------------
 
-# LiteLLM already knows per-token costs for 100+ models including
-# cache_read and cache_creation pricing.  We call it directly instead
-# of maintaining our own pricing tables.
+# LiteLLM already knows per-token costs for 100+ models.  We read it
+# directly instead of maintaining our own pricing tables.
 
 try:
     import litellm as _litellm
@@ -80,32 +79,6 @@ try:
     _LITELLM_AVAILABLE = True
 except ImportError:
     _LITELLM_AVAILABLE = False
-
-
-def _litellm_cost(
-    model: str,
-    prompt_tokens: int,
-    cache_read_tokens: int = 0,
-    cache_write_tokens: int = 0,
-) -> float | None:
-    """Compute input cost via litellm.cost_per_token (cache-aware).
-
-    Returns total input cost in USD, or None if model not found.
-    """
-    if not _LITELLM_AVAILABLE:
-        return None
-    resolved = resolve_litellm_model(model)
-    try:
-        input_cost, _ = _litellm.cost_per_token(
-            model=resolved,
-            prompt_tokens=prompt_tokens,
-            completion_tokens=0,
-            cache_read_input_tokens=cache_read_tokens,
-            cache_creation_input_tokens=cache_write_tokens,
-        )
-        return float(input_cost)
-    except Exception:
-        return None
 
 
 def _get_list_price(model: str) -> float | None:

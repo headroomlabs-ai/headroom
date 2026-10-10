@@ -23,8 +23,6 @@ _PYTHON_FORWARDER_MODE_ENV = python_forwarder_mode_policy.PYTHON_FORWARDER_MODE_
 PythonForwarderMode = python_forwarder_mode_policy.PythonForwarderMode
 OutboundBodySource = Literal["passthrough", "canonical", "legacy"]
 
-_PYTHON_FORWARDER_MODE_DEFAULT = python_forwarder_mode_policy.PYTHON_FORWARDER_MODE_DEFAULT
-
 
 @dataclass(frozen=True, slots=True)
 class OutboundBody:
@@ -146,11 +144,6 @@ def _parse_original_body(original_body_bytes: bytes | None) -> dict[str, Any] | 
     except (json.JSONDecodeError, UnicodeDecodeError, ValueError, MemoryError, RecursionError):
         return None
     return original if isinstance(original, dict) else None
-
-
-def _original_body_has_signed_thinking_blocks(original_body_bytes: bytes | None) -> bool:
-    original = _parse_original_body(original_body_bytes)
-    return original is not None and has_signed_thinking_blocks(original)
 
 
 #: Allow canonical re-serialization on a thinking-bearing request when every

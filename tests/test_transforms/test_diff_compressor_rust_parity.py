@@ -94,7 +94,8 @@ def test_compress_with_stats_returns_python_dataclass_and_pyo3_stats():
     diff = (
         "diff --git a/a.py b/a.py\n--- a/a.py\n+++ b/a.py\n@@ -1 +1 @@\n-old\n+new\n"
     ) + "# pad\n" * 60
-    result, stats = DiffCompressor(DiffCompressorConfig()).compress_with_stats(diff)
+    with pytest.warns(DeprecationWarning, match="compress_with_stats is deprecated"):
+        result, stats = DiffCompressor(DiffCompressorConfig()).compress_with_stats(diff)
 
     assert isinstance(result, DiffCompressionResult)
     assert stats.input_lines >= 60

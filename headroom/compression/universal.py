@@ -1,5 +1,10 @@
 """Universal compressor with ML-based detection and structure preservation.
 
+.. deprecated::
+    Nothing in Headroom uses this module. It will be removed in a future
+    release. Use ``headroom.compress()`` for one-call compression, or
+    ``ContentRouter`` from ``headroom.transforms``.
+
 This is the main entry point for compression. It:
 1. Detects content type using Magika (ML)
 2. Extracts structure using appropriate handler
@@ -20,6 +25,7 @@ Usage:
 from __future__ import annotations
 
 import logging
+import warnings
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any
@@ -43,6 +49,13 @@ from headroom.compression.masks import (
 )
 
 logger = logging.getLogger(__name__)
+
+warnings.warn(
+    "headroom.compression.universal is deprecated and will be removed in a future release; "
+    "use headroom.compress() for one-call compression, or ContentRouter from headroom.transforms.",
+    DeprecationWarning,
+    stacklevel=2,
+)
 
 
 @dataclass

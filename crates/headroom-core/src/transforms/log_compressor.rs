@@ -1781,6 +1781,54 @@ mod tests {
     }
 
     #[test]
+    fn level_classifier_covers_every_level() {
+        let c = cmp();
+        let cases: &[(&str, LogLevel)] = &[
+            ("ERROR: something went wrong", LogLevel::Error),
+            ("error: file not found", LogLevel::Error),
+            ("Error: Invalid input", LogLevel::Error),
+            ("FATAL: system crash", LogLevel::Error),
+            ("fatal error occurred", LogLevel::Error),
+            ("CRITICAL: database down", LogLevel::Error),
+            ("FAIL tests/test_foo.py", LogLevel::Fail),
+            ("FAILED to connect", LogLevel::Fail),
+            ("Test failed", LogLevel::Fail),
+            ("WARN: deprecated function", LogLevel::Warn),
+            ("WARNING: low disk space", LogLevel::Warn),
+            ("warning: unused variable", LogLevel::Warn),
+            ("INFO: starting process", LogLevel::Info),
+            ("info starting", LogLevel::Info),
+            ("DEBUG: variable x = 5", LogLevel::Debug),
+            ("debug mode enabled", LogLevel::Debug),
+            ("TRACE: entering function", LogLevel::Trace),
+            ("Just some regular text", LogLevel::Unknown),
+        ];
+        for (line, expected) in cases {
+            let parsed = c.parse_lines(&[line]);
+            assert_eq!(parsed[0].level, *expected, "level for {line:?}");
+        }
+    }
+
+    #[test]
+    fn score_line_orders_levels_and_boosts() {
+        let line = |level: LogLevel, is_stack_trace: bool, is_summary: bool| LogLine {
+            line_number: 0,
+            content: String::new(),
+            level,
+            is_stack_trace,
+            is_summary,
+            score: 0.0,
+        };
+        let info = score_log_line(&line(LogLevel::Info, false, false));
+        assert!(score_log_line(&line(LogLevel::Error, false, false)) > info);
+        assert!(score_log_line(&line(LogLevel::Fail, false, false)) > info);
+        assert_eq!(score_log_line(&line(LogLevel::Warn, false, false)), 0.5);
+        let plain = score_log_line(&line(LogLevel::Unknown, false, false));
+        assert!(score_log_line(&line(LogLevel::Unknown, true, false)) > plain);
+        assert!(score_log_line(&line(LogLevel::Unknown, false, true)) > plain);
+    }
+
+    #[test]
     fn recognizes_pytest_short_summary_entries_by_section_and_line_number() {
         let lines = [
             "FAILED outside.py::test_lookalike",
