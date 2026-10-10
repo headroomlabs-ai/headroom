@@ -437,7 +437,7 @@ class TestCompressEndpointLossyInlineMode:
     NO CCR marker / retrieval round-trip, so the output is safe to forward
     straight to a provider (Kong-sidecar use case)."""
 
-    def _big_tool_message(self):
+    def _big_tool_message(self, repetitions=20):
         large_data = json.dumps(
             [
                 {
@@ -448,8 +448,9 @@ class TestCompressEndpointLossyInlineMode:
                     f"category=electronics, price={i * 10.99:.2f}, stock={i * 5}.",
                     "tags": ["electronics", "sale", "featured", "new-arrival"],
                 }
-                for i in range(200)
+                for i in range(200 // repetitions)
             ]
+            * repetitions
         )
         return [
             {"role": "user", "content": "What items are available?"},
@@ -496,6 +497,30 @@ class TestCompressEndpointLossyInlineMode:
         assert data["tokens_saved"] > 0
         assert data["tokens_after"] < data["tokens_before"]
         assert data["tokens_saved"] == data["tokens_before"] - data["tokens_after"]
+
+        original_rows = json.loads(messages[1]["content"])
+        tool = next(message for message in data["messages"] if message["role"] == "tool")
+        compressed_rows, _ = json.JSONDecoder().raw_decode(tool["content"])
+        assert len(compressed_rows) < len(original_rows)
+        assert {json.dumps(row, sort_keys=True) for row in compressed_rows} == {
+            json.dumps(row, sort_keys=True) for row in original_rows
+        }
+
+    def test_lossy_inline_preserves_no_op_tool_content(self, client):
+        messages = self._big_tool_message(repetitions=1)
+        original = messages[1]["content"]
+        response = client.post(
+            "/v1/compress",
+            json={"messages": messages, "model": "gpt-4", "config": {"mode": "lossy_inline"}},
+        )
+        assert response.status_code == 200
+        data = response.json()
+
+        tool = next(message for message in data["messages"] if message["role"] == "tool")
+        assert tool["content"] == original
+        assert data["tokens_saved"] == 0
+        assert data["tokens_after"] == data["tokens_before"]
+        assert data["ccr_hashes"] == []
 
     def test_lossless_then_lossy_alias(self, client):
         """The spelled-out alias selects the same mode."""

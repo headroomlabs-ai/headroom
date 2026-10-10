@@ -32,6 +32,40 @@ On that path, the target size is `max_items_after_crush` (15 by default): a 1,00
 | Relevant | Top K | Match user's query |
 | Others | Sampled | Statistical representation |
 
+### JSON objects and unchanged values
+
+Object keys are never sampled or dropped: named fields are not interchangeable
+array rows. Removing a key without a retrieval marker would make its value
+unrecoverable. SmartCrusher instead recurses into each value, so nested arrays
+can still use lossless table compaction or CCR-backed row offload, and opaque
+strings can still be replaced by retrievable CCR references.
+
+A wide object containing only unchanged values therefore has **zero structural
+compression savings**, regardless of how many keys it contains. This is a
+deliberate reversibility tradeoff, not a promise that every large JSON object
+will shrink. Key-level offload would need its own retrieval contract before
+object-key sampling could safely return.
+
+When recursive processing leaves a valid JSON value unchanged, SmartCrusher
+returns its original bytes and sets `was_modified=False`. This applies to
+objects, arrays, and scalars, including whitespace, Unicode escapes, and numeric
+representations. Whitespace-only minification is not advertised as compression.
+Actual transformations still use compact JSON serialization.
+
+### Comparing historical TOIN data
+
+Unchanged values do not produce new TOIN compression records, even when the
+strategy contains a diagnostic about a skipped transformation. Older TOIN
+aggregates may include object-scoring strategies, formatting-only changes, or
+zero-savings `lossless_only` decisions from different implementations.
+
+Do not compare those aggregates directly with current object-key-preserving
+results or treat zero-savings decisions as successful compression. Compare the
+same corpus and configuration on both revisions, report unchanged wide objects
+separately from objects with transformed descendants, and identify the engine
+revision. Existing TOIN history is retained; this change does not rewrite or
+delete a user's learned state.
+
 ## Quick Start
 
 <Tabs groupId="lang" items={['TypeScript', 'Python']}>
