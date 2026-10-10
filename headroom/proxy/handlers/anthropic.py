@@ -1958,7 +1958,13 @@ class AnthropicHandlerMixin:
                             _hook_stage = "protect_messages"
                             protect = collect_protected(self.config.hooks, messages, _hook_ctx)
                         except Exception as e:
-                            log_hook_failure(request_id, _hook_stage, self.config.hooks, e)
+                            log_hook_failure(
+                                request_id,
+                                _hook_stage,
+                                self.config.hooks,
+                                e,
+                                outcome="skipping compression for this turn",
+                            )
                             raise
 
                     # F2.1 c5/5: derive the per-request CompressionPolicy

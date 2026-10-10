@@ -155,3 +155,58 @@ def test_openai_chat_names_the_failing_hook_stage(capture) -> None:
     assert all(
         SECRET not in r.getMessage() for r in capture.records if r.levelno >= logging.WARNING
     )
+
+
+def test_anthropic_bias_failure_says_compression_is_skipped(capture) -> None:
+    """Through the real handler: Anthropic aborts optimization when a bias hook fails,
+    so the warning must say compression is skipped, not that it continues."""
+    pytest.importorskip("fastapi")
+    from fastapi.testclient import TestClient
+
+    from headroom.proxy.server import ProxyConfig, create_app
+
+    class BrokenBiases(CompressionHooks):
+        def compute_biases(self, messages, ctx):  # noqa: ANN001, ANN201
+            raise ValueError(SECRET)
+
+    sent: list[dict] = []
+
+    async def fake_retry(method, url, headers, body, *args, **kwargs):  # noqa: ANN001, ANN202
+        sent.append(body)
+        return httpx.Response(
+            200,
+            json={
+                "id": "msg_1",
+                "type": "message",
+                "role": "assistant",
+                "model": "claude-sonnet-4-5",
+                "content": [{"type": "text", "text": "ok"}],
+                "stop_reason": "end_turn",
+                "usage": {"input_tokens": 5, "output_tokens": 1},
+            },
+        )
+
+    app = create_app(
+        ProxyConfig(
+            optimize=True, cache_enabled=False, rate_limit_enabled=False, hooks=BrokenBiases()
+        )
+    )
+    with TestClient(app) as client:
+        logging.getLogger("headroom.proxy").setLevel(logging.DEBUG)
+        client.app.state.proxy._retry_request = fake_retry
+        resp = client.post(
+            "/v1/messages",
+            json={
+                "model": "claude-sonnet-4-5",
+                "max_tokens": 16,
+                "messages": [{"role": "user", "content": SECRET}],
+            },
+            headers={"x-api-key": "sk-ant-test", "anthropic-version": "2023-06-01"},
+        )
+
+    assert resp.status_code == 200, resp.text
+    (warning,) = [r for r in capture.at(logging.WARNING) if "hook" in r.getMessage()]
+    message = warning.getMessage()
+    assert "BrokenBiases compute_biases failed; skipping compression for this turn" in message
+    assert "continuing without it" not in message
+    assert SECRET not in message

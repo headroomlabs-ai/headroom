@@ -30,8 +30,17 @@ def _hook_name(hooks: object) -> str:
     return f"{cls.__module__}.{cls.__qualname__}"
 
 
-def log_hook_failure(request_id: str, stage: str, hooks: object, err: BaseException) -> None:
-    """Log one compression-hook failure: a warning the first time per key, else debug."""
+def log_hook_failure(
+    request_id: str,
+    stage: str,
+    hooks: object,
+    err: BaseException,
+    outcome: str = "continuing without it",
+) -> None:
+    """Log one compression-hook failure: a warning the first time per key, else debug.
+
+    ``outcome`` says what the caller does next, e.g. that it skips compression.
+    """
     hook = _hook_name(hooks)
     error_type = type(err).__name__
     key = (hook, stage, error_type)
@@ -46,11 +55,12 @@ def log_hook_failure(request_id: str, stage: str, hooks: object, err: BaseExcept
                 warn = True
     if warn:
         logger.warning(
-            "[%s] hook %s %s failed; continuing without it: %s "
+            "[%s] hook %s %s failed; %s: %s "
             "(repeats log at debug; enable debug logging for the error text)",
             request_id,
             hook,
             stage,
+            outcome,
             error_type,
         )
     logger.debug("[%s] hook %s %s failed: %s", request_id, hook, stage, error_type, exc_info=err)
