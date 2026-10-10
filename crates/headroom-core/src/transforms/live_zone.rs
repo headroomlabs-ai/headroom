@@ -92,12 +92,10 @@
 //!
 //! # AuthMode
 //!
-//! The `AuthMode` parameter is taken in B3 but unused — Phase F
-//! PR-F2 wires the gate (PAYG/OAuth/Subscription each demand
-//! different policies; see project memory
-//! `project_auth_mode_compression_nuances.md`). Keeping the
-//! parameter in the signature now means later PRs are pure
-//! implementation swaps, not signature redesigns.
+//! The `AuthMode` parameter selects both the static compression policy and
+//! the tenant slice of startup-published TOIN recommendations. Legacy rows
+//! recorded before tenant wiring remain available only as lower-priority
+//! `unknown` fallbacks.
 
 use std::{collections::HashSet, sync::OnceLock};
 
@@ -115,6 +113,7 @@ use super::diff_compressor::{DiffCompressor, DiffCompressorConfig};
 #[cfg(feature = "ml")]
 use super::kompress::{Kompress, KompressConfig};
 use super::log_compressor::{LogCompressor, LogCompressorConfig};
+use super::recommendations::{self, RecommendationStore};
 use super::search_compressor::{SearchCompressor, SearchCompressorConfig};
 use super::smart_crusher::{SmartCrusher, SmartCrusherConfig};
 use crate::ccr::{compute_key, marker_for, CcrStore};
@@ -221,9 +220,8 @@ pub const fn threshold_for(content_type: ContentType) -> usize {
 
 // ─── Public types ──────────────────────────────────────────────────────
 
-/// Authentication mode of the originating request. Passed through to
-/// the dispatcher so PR-F2 can vary policy without re-shaping the
-/// public API. PR-B3 ignores the value (always treated as `Payg`).
+/// Authentication mode of the originating request. Selects static policy and
+/// scopes startup-published recommendations.
 ///
 /// Also reused by [`super::recommendations`] (PR-B5) as the lookup
 /// key prefix — keeping one canonical enum avoids drift between the
@@ -371,6 +369,16 @@ pub enum BlockAction {
         /// Threshold (in bytes) the content failed to clear.
         threshold_bytes: usize,
     },
+    /// Published retrieval evidence says compressing this structural pattern
+    /// costs more than forwarding it unchanged.
+    SkippedByRecommendation {
+        /// Python-compatible structural signature used for the lookup.
+        structure_hash: String,
+        /// Confidence recorded at publish time.
+        confidence: f64,
+        /// Compression observations supporting the recommendation.
+        observations: u64,
+    },
     /// Block type is intentionally outside the live zone (e.g.
     /// `tool_use` → cache hot zone) and is excluded from dispatch.
     Excluded { reason: ExclusionReason },
@@ -480,6 +488,7 @@ pub fn summarize_openai_responses_no_change_reason(manifest: &CompressionManifes
     let mut saw_below_plain_text_floor = false;
     let mut saw_rejected_not_smaller = false;
     let mut saw_compressor_error = false;
+    let mut saw_recommendation_skip = false;
 
     for outcome in &manifest.block_outcomes {
         match &outcome.action {
@@ -493,12 +502,15 @@ pub fn summarize_openai_responses_no_change_reason(manifest: &CompressionManifes
                 }
             }
             BlockAction::NoCompressionApplied { .. } => saw_no_compression_applied = true,
+            BlockAction::SkippedByRecommendation { .. } => saw_recommendation_skip = true,
             BlockAction::Excluded { .. } => saw_excluded = true,
             BlockAction::Compressed { .. } => {}
         }
     }
 
-    if saw_compressor_error {
+    if saw_recommendation_skip {
+        "toin_skip_recommendation"
+    } else if saw_compressor_error {
         "compressor_error"
     } else if saw_rejected_not_smaller {
         "rejected_not_smaller"
@@ -945,9 +957,32 @@ pub fn compress_anthropic_live_zone(
 pub fn compress_anthropic_live_zone_with_ccr(
     body_raw: &[u8],
     frozen_message_count: usize,
-    _auth_mode: AuthMode,
+    auth_mode: AuthMode,
     model: &str,
     ccr_store: Option<&dyn CcrStore>,
+) -> Result<LiveZoneOutcome, LiveZoneError> {
+    compress_anthropic_live_zone_with_recommendations(
+        body_raw,
+        frozen_message_count,
+        auth_mode,
+        model,
+        ccr_store,
+        recommendations::load_default(),
+    )
+}
+
+/// Live-zone dispatch with an explicit startup recommendation snapshot.
+///
+/// Production uses [`compress_anthropic_live_zone_with_ccr`]. Accepting the
+/// snapshot explicitly here makes recommendation behavior deterministic and
+/// testable without replacing the process-wide startup store.
+pub fn compress_anthropic_live_zone_with_recommendations(
+    body_raw: &[u8],
+    frozen_message_count: usize,
+    auth_mode: AuthMode,
+    model: &str,
+    ccr_store: Option<&dyn CcrStore>,
+    recommendation_store: &RecommendationStore,
 ) -> Result<LiveZoneOutcome, LiveZoneError> {
     let parsed: Value = serde_json::from_slice(body_raw).map_err(LiveZoneError::BodyNotJson)?;
     let messages = parsed
@@ -1039,6 +1074,9 @@ pub fn compress_anthropic_live_zone_with_ccr(
                     tokenizer.as_ref(),
                     &mut replacements,
                     ccr_store,
+                    recommendation_store,
+                    auth_mode,
+                    model,
                 );
                 outcome
             }
@@ -1057,6 +1095,9 @@ pub fn compress_anthropic_live_zone_with_ccr(
                     tokenizer.as_ref(),
                     &mut replacements,
                     ccr_store,
+                    recommendation_store,
+                    auth_mode,
+                    model,
                 )
             }
         };
@@ -1131,6 +1172,9 @@ fn compress_one_block(
     tokenizer: &dyn crate::tokenizer::Tokenizer,
     replacements: &mut Vec<Replacement>,
     ccr_store: Option<&dyn CcrStore>,
+    recommendation_store: &RecommendationStore,
+    auth_mode: AuthMode,
+    model: &str,
 ) -> BlockOutcome {
     // 1. Byte-threshold gate. Empty content always falls through to
     //    `dispatch_compressor` (which short-circuits on empty), so
@@ -1147,6 +1191,27 @@ fn compress_one_block(
                 threshold_bytes: threshold_for(content_type),
             },
         };
+    }
+
+    if let Some(structure_hash) = recommendations::structure_hash(content_type, content_text) {
+        if let Some(recommendation) =
+            recommendation_store.lookup_for_request(auth_mode, model, &structure_hash)
+        {
+            if recommendation.skip_compression_recommended
+                || recommendation.strategy_hint == "skip_compression"
+            {
+                return BlockOutcome {
+                    message_index,
+                    block_index,
+                    block_type,
+                    action: BlockAction::SkippedByRecommendation {
+                        structure_hash,
+                        confidence: recommendation.confidence,
+                        observations: recommendation.observations,
+                    },
+                };
+            }
+        }
     }
 
     match dispatch_compressor(content_text, content_type) {
@@ -2218,8 +2283,24 @@ mod tests {
 /// equality on the prefix and suffix.
 pub fn compress_openai_chat_live_zone(
     body_raw: &[u8],
-    _auth_mode: AuthMode,
+    auth_mode: AuthMode,
     model: &str,
+) -> Result<LiveZoneOutcome, LiveZoneError> {
+    compress_openai_chat_live_zone_with_recommendations(
+        body_raw,
+        auth_mode,
+        model,
+        recommendations::load_default(),
+    )
+}
+
+/// Deterministic variant of [`compress_openai_chat_live_zone`] with an
+/// explicitly supplied recommendation snapshot.
+pub fn compress_openai_chat_live_zone_with_recommendations(
+    body_raw: &[u8],
+    auth_mode: AuthMode,
+    model: &str,
+    recommendation_store: &recommendations::RecommendationStore,
 ) -> Result<LiveZoneOutcome, LiveZoneError> {
     let parsed: Value = serde_json::from_slice(body_raw).map_err(LiveZoneError::BodyNotJson)?;
     let messages = parsed
@@ -2298,6 +2379,9 @@ pub fn compress_openai_chat_live_zone(
             tokenizer.as_ref(),
             &mut replacements,
             None, // PR-C2: no CCR store yet on the OpenAI path.
+            recommendation_store,
+            auth_mode,
+            model,
         );
         block_outcomes.push(outcome);
     }
@@ -2675,8 +2759,24 @@ const RESPONSES_OUTPUT_MIN_BYTES: usize = 512;
 /// input, never re-serialized.
 pub fn compress_openai_responses_live_zone(
     body_raw: &[u8],
-    _auth_mode: AuthMode,
+    auth_mode: AuthMode,
     model: &str,
+) -> Result<LiveZoneOutcome, LiveZoneError> {
+    compress_openai_responses_live_zone_with_recommendations(
+        body_raw,
+        auth_mode,
+        model,
+        recommendations::load_default(),
+    )
+}
+
+/// Deterministic variant of [`compress_openai_responses_live_zone`] with an
+/// explicitly supplied recommendation snapshot.
+pub fn compress_openai_responses_live_zone_with_recommendations(
+    body_raw: &[u8],
+    auth_mode: AuthMode,
+    model: &str,
+    recommendation_store: &recommendations::RecommendationStore,
 ) -> Result<LiveZoneOutcome, LiveZoneError> {
     let parsed: Value = serde_json::from_slice(body_raw).map_err(LiveZoneError::BodyNotJson)?;
 
@@ -2808,6 +2908,9 @@ pub fn compress_openai_responses_live_zone(
             tokenizer.as_ref(),
             &mut replacements,
             None, // PR-C3: no CCR store on the Responses path yet.
+            recommendation_store,
+            auth_mode,
+            model,
         );
         block_outcomes.push(outcome);
     }
