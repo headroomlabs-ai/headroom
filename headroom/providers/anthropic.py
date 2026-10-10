@@ -30,7 +30,8 @@ from headroom.pricing.deepseek_tiers import (
     OFF_PEAK_RATES_PER_1M,
     off_peak_rates,
 )
-from headroom.pricing.litellm_pricing import estimate_cost_from_tokens
+from headroom.pricing.litellm_model_resolution import pricing_lookup_candidates
+from headroom.pricing.litellm_pricing import estimate_cost_from_tokens, get_litellm_model_cost
 from headroom.tokenizers.base import (
     TokenCountCache,
     coerce_countable_text,
@@ -108,8 +109,12 @@ def sanitize_anthropic_model_metadata(value: Any) -> Any:
 # Anthropic model context limits
 # All Claude 3+ models have 200K context
 ANTHROPIC_CONTEXT_LIMITS: dict[str, int] = {
-    # Claude Fable 5 - 1M context
+    # Claude Fable 5.1 / Fable 5 - 1M context
+    "claude-fable-5-1": 1000000,
     "claude-fable-5": 1000000,
+    # Claude Opus 5.5 / Opus 5 - 1M context
+    "claude-opus-5-5": 1000000,
+    "claude-opus-5": 1000000,
     # Claude Opus 4.8 - 1M context
     "claude-opus-4-8": 1000000,
     # Claude 4.7 (Opus 4.7) - 1M context
@@ -118,7 +123,8 @@ ANTHROPIC_CONTEXT_LIMITS: dict[str, int] = {
     "claude-opus-4-6": 1000000,
     # Claude 4.5 (Opus 4.5)
     "claude-opus-4-5-20251101": 200000,
-    # Claude Sonnet 5 - 1M context
+    # Claude Sonnet 5.5 / Sonnet 5 - 1M context
+    "claude-sonnet-5-5": 1000000,
     "claude-sonnet-5": 1000000,
     # Claude Sonnet 4.6 - 1M context window
     "claude-sonnet-4-6": 1000000,
@@ -145,10 +151,20 @@ ANTHROPIC_CONTEXT_LIMITS: dict[str, int] = {
 
 # Fallback pricing - LiteLLM is preferred source
 # NOTE: These are ESTIMATES. Always verify against actual Anthropic billing.
-# Last updated: 2026-07-04
+# Last updated: 2026-09-29 (platform.claude.com/docs/en/about-claude/pricing)
+#
+# Newer ids come before their prefixes: `_get_pricing` falls back to substring
+# matching in insertion order, so a dated or suffixed "claude-sonnet-5-5-..."
+# must hit the Sonnet 5.5 row before it can hit "claude-sonnet-5".
 ANTHROPIC_PRICING: dict[str, dict[str, float]] = {
+    # Claude Fable 5.1: $10 in / $50 out, cache read $0.25 (0.025x input).
+    "claude-fable-5-1": {"input": 10.00, "output": 50.00, "cached_input": 0.25},
     # Claude Fable 5 (anthropic.com/pricing): $10 in / $50 out, cache read $1.
     "claude-fable-5": {"input": 10.00, "output": 50.00, "cached_input": 1.00},
+    # Claude Opus 5.5: $4 in / $20 out, cache read $0.20 (0.05x input).
+    "claude-opus-5-5": {"input": 4.00, "output": 20.00, "cached_input": 0.20},
+    # Claude Opus 5: $5 in / $25 out, cache read $0.50.
+    "claude-opus-5": {"input": 5.00, "output": 25.00, "cached_input": 0.50},
     # Claude Opus 4.8 — current Opus tier: $5 in / $25 out, cache read $0.50.
     "claude-opus-4-8": {"input": 5.00, "output": 25.00, "cached_input": 0.50},
     # Claude 4.7 (current Opus tier)
@@ -157,8 +173,12 @@ ANTHROPIC_PRICING: dict[str, dict[str, float]] = {
     "claude-opus-4-6": {"input": 5.00, "output": 25.00, "cached_input": 0.50},
     # Claude 4.5 (current Opus tier — same rates as 4.6–4.8)
     "claude-opus-4-5-20251101": {"input": 5.00, "output": 25.00, "cached_input": 0.50},
-    # Claude Sonnet 5 / 4.6 / 4.5 (current Sonnet tier): $3 in / $15 out, cache read $0.30
-    "claude-sonnet-5": {"input": 3.00, "output": 15.00, "cached_input": 0.30},
+    # Claude Sonnet 5.5 / 5: $2 in / $10 out, cache read $0.20. Sonnet 5's
+    # launch rate became its standard price; the scheduled 2026-09-01 rise to
+    # $3/$15 was cancelled.
+    "claude-sonnet-5-5": {"input": 2.00, "output": 10.00, "cached_input": 0.20},
+    "claude-sonnet-5": {"input": 2.00, "output": 10.00, "cached_input": 0.20},
+    # Claude Sonnet 4.6 / 4.5: $3 in / $15 out, cache read $0.30
     "claude-sonnet-4-6": {"input": 3.00, "output": 15.00, "cached_input": 0.30},
     "claude-sonnet-4-5": {"input": 3.00, "output": 15.00, "cached_input": 0.30},
     # Claude 4 (Sonnet/Haiku tier pricing)
@@ -200,14 +220,35 @@ def _apply_long_context_premium(
 ) -> dict[str, float]:
     """Return ``pricing`` scaled by the long-context premium where it applies.
 
-    Used only on the manual fallback path; the LiteLLM path already applies the
-    published above-threshold rates itself.
+    Used on the manual path, which also serves long-context requests whose
+    LiteLLM entry has no above-threshold rate (see
+    ``_litellm_lacks_long_context_rate``).
     """
     if input_tokens <= _LONG_CONTEXT_THRESHOLD:
         return pricing
     if not any(model.startswith(tiered) for tiered in _LONG_CONTEXT_TIERED_MODELS):
         return pricing
     return {key: rate * _LONG_CONTEXT_PREMIUM.get(key, 1.0) for key, rate in pricing.items()}
+
+
+def _litellm_lacks_long_context_rate(model: str, input_tokens: int) -> bool:
+    """True when this request needs the long-context premium but LiteLLM has no rate for it.
+
+    LiteLLM's live price map has dropped ``input_cost_per_token_above_200k_tokens``
+    from the bare Anthropic ids before, and pricing such a request through it then
+    bills the base tier: about half the real cost of a long session. The manual
+    table still carries the premium, so the caller uses it instead.
+    """
+    if input_tokens <= _LONG_CONTEXT_THRESHOLD:
+        return False
+    if not any(model.startswith(tiered) for tiered in _LONG_CONTEXT_TIERED_MODELS):
+        return False
+    cost_data = get_litellm_model_cost()
+    for candidate in pricing_lookup_candidates(model):
+        info = cost_data.get(candidate)
+        if isinstance(info, dict):
+            return "input_cost_per_token_above_200k_tokens" not in info
+    return False  # LiteLLM doesn't know the model; it returns None and we fall back anyway
 
 
 # Default limits for pattern-based inference
@@ -818,16 +859,18 @@ class AnthropicProvider(Provider):
         """
         model = sanitize_anthropic_model_id(model)
         # LiteLLM knows per-model cache and long-context rates, so let it price
-        # the whole request rather than rebuilding the rate card here.
-        cost = estimate_cost_from_tokens(
-            model,
-            input_tokens=input_tokens,
-            output_tokens=output_tokens,
-            cached_tokens=cached_tokens,
-            now=now,
-        )
-        if cost is not None:
-            return cost
+        # the whole request rather than rebuilding the rate card here -- unless
+        # its entry is missing the long-context rate this request needs.
+        if not _litellm_lacks_long_context_rate(model, input_tokens):
+            cost = estimate_cost_from_tokens(
+                model,
+                input_tokens=input_tokens,
+                output_tokens=output_tokens,
+                cached_tokens=cached_tokens,
+                now=now,
+            )
+            if cost is not None:
+                return cost
 
         # Fall back to manual pricing
         pricing = self._get_pricing(model)

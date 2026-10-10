@@ -24,6 +24,15 @@ dependencies may impose their own Python/platform limits. Platforms outside
 that matrix fall back to the source distribution and need a Rust/native
 toolchain.
 
+On Intel macOS, ONNX Runtime wheels are available through Python 3.13, using
+the pre-1.24 runtime. Python 3.14 and newer omit optional ONNX backends from
+`proxy`, `voice`, `relevance`, and `image` extras because compatible wheels are
+unavailable. Core compression and the proxy remain available; ML content
+detection, local ONNX Kompress, embedding relevance, and ONNX OCR are unavailable
+on that combination. Use Python 3.13 if you need those Python ONNX features.
+Rust ML detection requires ONNX Runtime 1.24 or newer and therefore remains
+disabled on Intel macOS even with the older Python runtime.
+
 ### CLI install with uv
 
 For a host-level `headroom` command on macOS Apple Silicon or Linux, prefer
@@ -99,7 +108,7 @@ pip install "headroom-ai[all]"
 | `langchain` | LangChain `HeadroomChatModel` wrapper; **not in `[all]`** | `pip install "headroom-ai[langchain]"` |
 | `agno` | Agno `HeadroomAgnoModel` wrapper; **not in `[all]`** | `pip install "headroom-ai[agno]"` |
 | `strands` | AWS Strands Agents integration; **not in `[all]`** | `pip install "headroom-ai[strands]"` |
-| `crewai` | CrewAI integration; **not in `[all]`** | `pip install "headroom-ai[crewai]"` |
+| *(none)* | CrewAI integration: no extra, install CrewAI alongside Headroom | `pip install headroom-ai crewai` |
 | `autogen` | AutoGen AgentChat integration; **not in `[all]`** | `pip install "headroom-ai[autogen]"` |
 | `anyllm` | any-llm multi-provider backend (Python 3.11+); **not in `[all]`** | `pip install "headroom-ai[anyllm]"` |
 | `bedrock` | Native AWS Bedrock credentials/backend support; **not in `[all]`** | `pip install "headroom-ai[bedrock]"` |

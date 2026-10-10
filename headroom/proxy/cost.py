@@ -15,6 +15,7 @@ from collections import deque
 from datetime import datetime, timedelta
 from typing import TYPE_CHECKING, Any, NamedTuple
 
+from headroom.cache_economics import CACHE_ECONOMICS as _CACHE_ECONOMICS
 from headroom.proxy.budget_basis_policy import (
     BUDGET_BASIS_BLOCK,
     BUDGET_BASIS_IGNORE,
@@ -109,28 +110,6 @@ class CostEntry(NamedTuple):
 # source for cache economics, and these ratios stand in when a model publishes
 # no cache pricing. Hardcoded ratios go stale per model and per context tier
 # (Anthropic's >200k rates differ), so they are never preferred over the catalog.
-_CACHE_ECONOMICS = {
-    "anthropic": {
-        "read_multiplier": 0.1,
-        "write_multiplier": 1.25,
-        "label": "Explicit breakpoints, 5-min TTL",
-    },
-    "openai": {
-        "read_multiplier": 0.5,
-        "write_multiplier": 1.0,
-        "label": "Automatic, no TTL control",
-    },
-    "gemini": {
-        "read_multiplier": 0.1,
-        "write_multiplier": 1.0,
-        "label": "Explicit cachedContent, configurable TTL",
-    },
-    "bedrock": {
-        "read_multiplier": 0.1,
-        "write_multiplier": 1.25,
-        "label": "Same as Anthropic (Bedrock)",
-    },
-}
 
 
 #: Context size at which the major catalogs publish a second, higher price
@@ -285,22 +264,32 @@ def build_prefix_cache_stats(
                     (provider in ("anthropic", "vertex:anthropic") and "claude" in model_name)
                     or (provider == "openai" and any(p in model_name for p in _openai_prefixes))
                     or (provider == "gemini" and "gemini" in model_name)
+                    or (provider == "xai" and "grok" in model_name)
                     or (provider == "bedrock" and "claude" in model_name)
                 )
                 if is_match and tokens_sent > best_tokens:
                     price_per_1m = cost_tracker._get_list_price(model_name)
                     if price_per_1m:
                         input_price_per_token = price_per_1m / 1_000_000
-                        cache_prices = cost_tracker._get_cache_prices(model_name)
+                        try:
+                            from headroom.pricing.counterfactual import resolve_rates
+
+                            cache_prices = resolve_rates(model_name)
+                        except Exception:
+                            cache_prices = None
                         best_tokens = tokens_sent
 
         # Catalog rates win; the provider ratio table is the fallback for a model
         # that publishes no cache pricing.
         pricing_source = "provider_default"
         if cache_prices and input_price_per_token:
-            _cr_price, _cw5_price, _cw1h_price, _uncached_price = cache_prices
+            _cr_price = cache_prices.read
+            _cw5_price = cache_prices.write_5m
+            _cw1h_price = cache_prices.write_1h
+            _uncached_price = cache_prices.uncached
             if _uncached_price:
-                read_mult = _cr_price / _uncached_price
+                if cache_prices.read_is_catalog:
+                    read_mult = _cr_price / _uncached_price
                 # Blend the two write rates by the TTL mix this provider
                 # actually wrote at, rather than charging every write the 5m
                 # rate. Falls back to the 5m rate when nothing was written yet.
@@ -309,8 +298,12 @@ def build_prefix_cache_stats(
                 _w5 = max(0, _w_all - _w1h)
                 _w_cost = _w5 * _cw5_price + _w1h * _cw1h_price
                 _blended_write = (_w_cost / _w_all) if _w_all > 0 else _cw5_price
-                write_mult = _blended_write / _uncached_price
-                pricing_source = "catalog"
+                if cache_prices.write_is_catalog:
+                    write_mult = _blended_write / _uncached_price
+                if cache_prices.read_is_catalog and (cache_prices.write_is_catalog or not _w_all):
+                    pricing_source = "catalog"
+                elif cache_prices.read_is_catalog or cache_prices.write_is_catalog:
+                    pricing_source = "mixed"
 
         # Calculate savings:
         # Cache reads save (1.0 - read_mult) per token vs uncached input price.
@@ -907,6 +900,12 @@ class CostTracker:
         self._tool_saved_write_1h_by_model: dict[str, float] = {}
         self._tool_saved_list_by_model: dict[str, float] = {}
         self._tokens_sent_by_model: dict[str, int] = {}
+        # Of _tokens_sent_by_model: the part that is the provider's own billed
+        # count (the rest is Headroom's tokenizer estimate), and how many
+        # requests it came from. The licence usage report sends both so the
+        # cloud side can tell a billed figure from an estimate.
+        self._provider_tokens_sent_by_model: dict[str, int] = {}
+        self._provider_requests_by_model: dict[str, int] = {}
         # Completion tokens keyed by ``(model, long_context)`` — same reason as
         # the savings buckets: the >200k completion rate is a different number.
         self._output_tokens_by_tier: dict[tuple[str, bool], int] = {}
@@ -937,6 +936,8 @@ class CostTracker:
         self._tool_saved_write_1h_by_model.clear()
         self._tool_saved_list_by_model.clear()
         self._tokens_sent_by_model.clear()
+        self._provider_tokens_sent_by_model.clear()
+        self._provider_requests_by_model.clear()
         self._output_tokens_by_tier.clear()
         self._requests_by_model.clear()
         self._api_cache_read_by_model.clear()
@@ -965,6 +966,9 @@ class CostTracker:
             cache_read_tokens: Tokens served from cache (~10% of input rate)
             cache_write_tokens: Tokens written to cache (~125% of input rate)
         """
+        if model.startswith("passthrough:"):
+            return None
+
         litellm = _get_litellm_module()
         if litellm is None:
             _warn_pricing_once(
@@ -1027,13 +1031,15 @@ class CostTracker:
         output_tokens: int = 0,
         cache_inferred: bool = False,
         tool_schema_saved: int = 0,
+        provider_reported: bool = False,
     ):
         """Record token counts per model and accumulate request cost for budget enforcement.
 
         Args:
             model: Model name.
             tokens_saved: Tokens removed by compression (Headroom's count).
-            tokens_sent: Compressed message tokens sent (Headroom's count).
+            tokens_sent: Input tokens sent: the provider's billed count when
+                ``provider_reported``, else Headroom's local estimate.
             cache_read_tokens: Cache read tokens from API response usage.
             cache_write_tokens: Cache write tokens from API response usage.
             uncached_tokens: Non-cached input tokens from API response usage.
@@ -1051,6 +1057,8 @@ class CostTracker:
                 attributed. The dashboard's per-model "Tokens Saved" column
                 therefore showed compression only, while the headline above it
                 counted both.
+            provider_reported: True when ``tokens_sent`` is the provider's own
+                billed input (uncached + cache read + cache write).
         """
         # Post-guard invariant (all providers): Headroom never forwards a request
         # larger than the original (handlers revert any inflation before sending),
@@ -1138,6 +1146,13 @@ class CostTracker:
                 self._tool_saved_list_by_model.get(model, 0.0) + list_part
             )
         self._tokens_sent_by_model[model] = self._tokens_sent_by_model.get(model, 0) + tokens_sent
+        if provider_reported:
+            self._provider_tokens_sent_by_model[model] = (
+                self._provider_tokens_sent_by_model.get(model, 0) + tokens_sent
+            )
+            self._provider_requests_by_model[model] = (
+                self._provider_requests_by_model.get(model, 0) + 1
+            )
         okey = (model, long_context)
         self._output_tokens_by_tier[okey] = self._output_tokens_by_tier.get(okey, 0) + max(
             0, output_tokens
@@ -1147,13 +1162,13 @@ class CostTracker:
             self._api_cache_read_by_model.get(model, 0) + cache_read_tokens
         )
         self._api_cache_write_by_model[model] = (
-            self._api_cache_write_by_model.get(model, 0) + cache_write_tokens
+            self._api_cache_write_by_model.get(model, 0) + write_eff
         )
         self._api_cache_write_5m_by_model[model] = (
-            self._api_cache_write_5m_by_model.get(model, 0) + cache_write_5m_tokens
+            self._api_cache_write_5m_by_model.get(model, 0) + write_5m_eff
         )
         self._api_cache_write_1h_by_model[model] = (
-            self._api_cache_write_1h_by_model.get(model, 0) + cache_write_1h_tokens
+            self._api_cache_write_1h_by_model.get(model, 0) + write_1h_eff
         )
         self._api_uncached_by_model[model] = (
             self._api_uncached_by_model.get(model, 0) + uncached_tokens
@@ -1398,7 +1413,7 @@ class CostTracker:
         return w5m * w5m_price + w1h * w1h_price
 
     def _get_cache_prices(
-        self, model: str, *, long_context: bool = False
+        self, model: str, *, long_context: bool = False, for_billing: bool = True
     ) -> tuple[float, float, float, float] | None:
         """Per-token prices for (cache read, 5m write, 1h write, uncached input).
 
@@ -1407,6 +1422,10 @@ class CostTracker:
         place cache rates are resolved — for the live cost card here, the
         persisted tracker, and the durable ledger alike, so the three cannot
         drift apart again.
+
+        ``for_billing`` resolves missing cache catalog rates through LiteLLM's
+        billing calculator. Savings consumers opt out to keep the resolver's
+        counterfactual estimates.
 
         The 1h write rate is new: LiteLLM publishes it per model as
         ``cache_creation_input_token_cost_above_1hr`` (Sonnet: 2.00x base), and
@@ -1424,7 +1443,7 @@ class CostTracker:
         try:
             from headroom.pricing.counterfactual import resolve_rates
 
-            rates = resolve_rates(model, long_context=long_context)
+            rates = resolve_rates(model, long_context=long_context, for_billing=for_billing)
         except Exception:
             return None
         if rates is None or not rates.uncached:
@@ -1479,6 +1498,8 @@ class CostTracker:
         # ``_tokens_saved_by_model`` alone would drop such a model from the table
         # entirely rather than merely under-report it.
         for model in sorted(set(self._tokens_saved_by_model) | set(self._tool_saved_by_model)):
+            if model.startswith("passthrough:"):
+                continue
             compression_saved = self._tokens_saved_by_model.get(model, 0)
             tool_saved = self._tool_saved_by_model.get(model, 0)
             # What the "Tokens Saved" column means: everything Headroom kept off
@@ -1513,6 +1534,8 @@ class CostTracker:
         total_billed_input_tokens = 0
         total_input_tokens = 0
         for model in self._tokens_saved_by_model:
+            if model.startswith("passthrough:"):
+                continue
             saved = self._tokens_saved_by_model[model]
             sent = self._tokens_sent_by_model.get(model, 0)
             cr = self._api_cache_read_by_model.get(model, 0)
@@ -1546,6 +1569,8 @@ class CostTracker:
         # cache-aware valuation below is reported alongside it.
         savings_usd = 0.0
         for model in self._tokens_saved_by_model:
+            if model.startswith("passthrough:"):
+                continue
             saved = self._tokens_saved_by_model[model]
             if saved <= 0:
                 continue
@@ -1577,7 +1602,7 @@ class CostTracker:
             | set(self._saved_list_by_tier)
         ):
             model, long_context = key
-            prices = self._get_cache_prices(model, long_context=long_context)
+            prices = self._get_cache_prices(model, long_context=long_context, for_billing=False)
             if not prices:
                 continue
             _cr_price, cw5_price, cw1h_price, uncached_price = prices
@@ -1613,7 +1638,7 @@ class CostTracker:
             | set(self._tool_saved_list_by_model)
         )
         for model in tool_models:
-            prices = self._get_cache_prices(model)
+            prices = self._get_cache_prices(model, for_billing=False)
             if not prices:
                 continue
             cr_price, cw5_price, cw1h_price, uncached_price = prices
@@ -1635,8 +1660,16 @@ class CostTracker:
             "total_tool_tokens_saved": total_tool_saved,
             "total_input_tokens": total_input_tokens,
             "total_input_cost_usd": round(cost_with_headroom, 4),
-            "cache_write_5m_tokens": sum(self._api_cache_write_5m_by_model.values()),
-            "cache_write_1h_tokens": sum(self._api_cache_write_1h_by_model.values()),
+            "cache_write_5m_tokens": sum(
+                tokens
+                for model, tokens in self._api_cache_write_5m_by_model.items()
+                if not model.startswith("passthrough:")
+            ),
+            "cache_write_1h_tokens": sum(
+                tokens
+                for model, tokens in self._api_cache_write_1h_by_model.items()
+                if not model.startswith("passthrough:")
+            ),
             "per_model": per_model,
             # Input-only, unchanged: budgets, the per-model table and the
             # persistent savings tracker all read it as input spend.

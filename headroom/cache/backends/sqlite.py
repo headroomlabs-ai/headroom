@@ -22,12 +22,13 @@ import json
 import logging
 import os
 import sqlite3
-import stat
 import threading
 import time
 from dataclasses import asdict, fields
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
+
+from ...fileperms import ensure_private_file
 
 if TYPE_CHECKING:
     from ..compression_store import CompressionEntry
@@ -90,65 +91,13 @@ class SQLiteBackend:
 
         The originals stored here can contain sensitive tool output (file
         contents, command output). ``mkdir`` created the parent at the umask
-        default (typically world-traversable ``0o755``), and sqlite would
-        otherwise create the db file itself at the umask default too — leaving it
-        world/group readable. This creates the file with an explicit ``0o600``
-        mode before ``sqlite3.connect`` runs (a *new* db is private from birth;
-        sqlite treats the empty file as a fresh database), or narrows a
-        pre-existing db.
-
-        A store of raw tool output must not be opened world-readable, so a
-        failure to create or narrow it privately **raises** rather than silently
-        proceeding to open a wide file.
-
-        The existing-file path is symlink-race resistant. ``O_EXCL`` on the
-        create refuses to reuse an attacker-planted file or symlink. When the
-        file already exists it is re-opened with ``O_NOFOLLOW`` and narrowed
-        through that descriptor (``fstat`` to confirm a regular file, ``fchmod``
-        to set the mode) rather than by re-resolving the path: a symlink is
-        refused at the ``open`` syscall, and operating on the verified
-        descriptor closes the check-then-chmod TOCTOU that a ``chmod(path)``
-        (which follows symlinks) would leave open. On Windows POSIX permission
-        bits and ``O_NOFOLLOW`` do not apply, so there is nothing to narrow.
+        default and sqlite would create the db at the umask default too, so the
+        file is created (or an existing one narrowed) through
+        :func:`headroom.fileperms.ensure_private_file`, which is symlink-race
+        resistant and raises :class:`PermissionError` rather than opening a
+        wide file. See that function for the exact guarantee per platform.
         """
-        # Fast path: create the file ourselves. O_EXCL (plus O_NOFOLLOW where
-        # available) refuses to reuse an existing file or follow a planted
-        # symlink, so a brand-new db is private from birth at 0o600.
-        create_flags = os.O_CREAT | os.O_EXCL | os.O_WRONLY
-        if hasattr(os, "O_NOFOLLOW"):
-            create_flags |= os.O_NOFOLLOW
-        try:
-            os.close(os.open(path, create_flags, 0o600))
-            return
-        except FileExistsError:
-            pass
-
-        # The file already exists. Without POSIX no-follow/fd primitives
-        # (Windows) permission bits do not apply and there is no symlink-race
-        # hardening to perform; sqlite opens by path as before.
-        if not (hasattr(os, "O_NOFOLLOW") and hasattr(os, "fchmod")):
-            return
-
-        # Narrow the existing file, but only after proving — through a single
-        # no-follow descriptor — that it is a real regular file. A symlink is
-        # refused by O_NOFOLLOW (fail closed), and chmod-ing the descriptor
-        # rather than the path means an attacker cannot swap the inode we
-        # verified between the check and the narrow.
-        try:
-            fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
-        except OSError as exc:
-            raise PermissionError(
-                f"refusing to open CCR store at {path}: not a regular file "
-                f"(symlink or open error: {exc})"
-            ) from exc
-        try:
-            if not stat.S_ISREG(os.fstat(fd).st_mode):
-                raise PermissionError(f"refusing to open CCR store at {path}: not a regular file")
-            # os.fchmod is POSIX-only (guarded by the hasattr check above); the
-            # ignore keeps type-checking clean on Windows where it is absent.
-            os.fchmod(fd, 0o600)  # type: ignore[attr-defined]
-        finally:
-            os.close(fd)
+        ensure_private_file(path, what="CCR store")
 
     def _open(self) -> sqlite3.Connection:
         self._ensure_private(self._path)
@@ -221,8 +170,18 @@ class SQLiteBackend:
             data = json.loads(raw)
         except (json.JSONDecodeError, TypeError):
             return None
+        if not isinstance(data, dict):
+            return None
         known = {f.name for f in fields(CompressionEntry)}
-        return CompressionEntry(**{k: v for k, v in data.items() if k in known})
+        try:
+            return CompressionEntry(**{k: v for k, v in data.items() if k in known})
+        except (TypeError, ValueError):
+            # A blob that parses as JSON but is missing a required field (schema
+            # drift across an upgrade, a partially written row) must degrade to a
+            # miss, not raise. Otherwise a single bad row crashes get() — and,
+            # via items(), _clean_expired() runs it on every store's eviction, so
+            # one poison row would break all reads, evictions, and stores.
+            return None
 
     def _purge_expired(self, now: float) -> int:
         """Delete expired rows using metadata; caller holds ``_lock``."""

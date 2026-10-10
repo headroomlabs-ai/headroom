@@ -73,6 +73,11 @@ def _scrub_developer_headroom_env(monkeypatch, tmp_path):
     # test its own store so proxy/CLI startup cannot load developer settings and
     # saves cannot rewrite them. Tests of path precedence can override this.
     monkeypatch.setenv("HEADROOM_SETTINGS_PATH", str(tmp_path / "headroom-settings.json"))
+    # The scrub also deletes the HEADROOM_HARD_WATCHDOG_SECS=0 opt-out CI sets
+    # (#3845), so every test that enters the proxy lifespan armed the 90s
+    # production watchdog inside pytest; it hard-exits the process with code 1
+    # and no summary. Tests of the watchdog set the variable themselves.
+    monkeypatch.setenv("HEADROOM_HARD_WATCHDOG_SECS", "0")
 
 
 # The scrub above deletes every HEADROOM_* var — which includes HEADROOM_BEACON,
@@ -88,6 +93,17 @@ def _scrub_developer_headroom_env(monkeypatch, tmp_path):
 @pytest.fixture(autouse=True)
 def _disable_telemetry_beacon(monkeypatch, _scrub_developer_headroom_env):
     monkeypatch.setenv("HEADROOM_BEACON", "off")
+
+
+# `wrap`/`init`/`doctor` probe loopback ports (and read deployment manifests)
+# to find a live Headroom proxy when --port is left at its default. A
+# developer's running proxy would make CLI tests non-deterministic, so
+# discovery is off unless a test turns it back on. A developer's CODEX_HOME
+# would likewise redirect every Codex path helper away from the test's tmp home.
+@pytest.fixture(autouse=True)
+def _disable_live_proxy_discovery(monkeypatch, _scrub_developer_headroom_env):
+    monkeypatch.setenv("HEADROOM_PORT_DISCOVERY", "0")
+    monkeypatch.delenv("CODEX_HOME", raising=False)
 
 
 # The MCP install ledger defaults to ``~/.headroom/mcp_installs.json``, so any
@@ -234,13 +250,11 @@ def _null_binary_pins():
 def _reset_headroom_logger_propagation():
     """Keep `headroom.*` log records flowing to pytest's caplog handler.
 
-    Two sources disable propagation on the headroom logger tree and never
-    restore it, which then makes later `caplog`-based assertions flaky in
+    A benchmark helper disables propagation on the headroom logger tree and
+    never restores it, which then makes later `caplog`-based assertions flaky in
     full-suite runs (caplog attaches to root, so a `propagate=False` anywhere
     on the chain silently drops the records):
 
-    - ``headroom.proxy.helpers._setup_file_logging`` sets
-      ``getLogger("headroom").propagate = False`` on proxy startup.
     - ``benchmarks.claude_session_mode_benchmark._disable_headroom_benchmark_logging``
       (exercised by ``test_claude_session_mode_benchmark``) sets
       ``propagate = False`` + ``CRITICAL`` on ``headroom``, ``headroom.proxy``,

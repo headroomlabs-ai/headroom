@@ -44,8 +44,9 @@ git checkout upstream/pr-3382 -- docs/adr/0001-main-release-branch-semantics.md 
 
 - [ ] **Step 2: Verify documentation integrity**
 
-Run: `git diff --check; rg -n 'TB[D]|TO[D]O' docs/adr docs/superpowers`
-Expected: `git diff --check` exits 0 and no unresolved placeholder is present in the new files.
+Run both `git diff --check` and `git diff --cached --check`; stop if either exits nonzero. The restore command stages the ADRs, so the cached check is required to inspect those files.
+Run `rg -n 'TB[D]|TO[D]O'` against the five restored ADRs and this split's specification and plan. Exit 1 means no placeholders; exit 0 reports unresolved markers, and exit 2 is a scan error.
+Expected: both whitespace checks exit 0 and no unresolved placeholder is present in these seven documents. Unrelated plans and ADRs are outside this slice's placeholder check.
 
 - [ ] **Step 3: Commit the documentation slice**
 
@@ -153,7 +154,7 @@ Commit as `feat(release): add qualification evidence contracts`.
 **Files:**
 - Create: `scripts/candidate_manifest.py`
 - Create: `tests/test_candidate_manifest.py`
-- Modify: `.gitignore`
+- Modify: `.gitignore` to unignore `scripts/candidate_manifest.py`
 
 **Interfaces:**
 - Consumes: `release/contracts/candidate-manifest.schema.json` and common definitions.

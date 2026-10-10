@@ -52,7 +52,7 @@ def _make_bedrock_backend(events: list[StreamEvent]) -> MagicMock:
     return mock
 
 
-def _bedrock_events(input_tokens: int) -> list[StreamEvent]:
+def _bedrock_events(input_tokens: int, **cache: int) -> list[StreamEvent]:
     """Build a minimal Anthropic streaming sequence as LiteLLM emits it."""
     message_start = {
         "type": "message_start",
@@ -63,7 +63,7 @@ def _bedrock_events(input_tokens: int) -> list[StreamEvent]:
             "type": "message",
             "content": [],
             # LiteLLM hardcodes this to 0 — the bug under test.
-            "usage": {"input_tokens": input_tokens, "output_tokens": 0},
+            "usage": {"input_tokens": input_tokens, "output_tokens": 0, **cache},
         },
     }
     block_start = {
@@ -150,3 +150,64 @@ def test_bedrock_streaming_preserves_nonzero_upstream_input_tokens() -> None:
     upstream_input_tokens = 777
     body = _post_stream(_make_bedrock_backend(_bedrock_events(input_tokens=upstream_input_tokens)))
     assert _message_start_input_tokens(body) == upstream_input_tokens
+
+
+def _post_stream_stats(backend: MagicMock) -> dict:
+    """Run one streamed turn and return /stats tokens (provenance counters)."""
+    config = ProxyConfig(
+        optimize=False,
+        cache_enabled=False,
+        rate_limit_enabled=False,
+        backend="anyllm",
+        anyllm_provider="anthropic",
+    )
+    with patch("headroom.proxy.server.AnyLLMBackend", return_value=backend):
+        app = create_app(config)
+        with TestClient(app) as client:
+            resp = client.post(
+                "/v1/messages",
+                json={
+                    "model": "claude-3-5-sonnet-20241022",
+                    "messages": [{"role": "user", "content": "hello there general"}],
+                    "max_tokens": 64,
+                    "stream": True,
+                },
+                headers={"x-api-key": "sk-ant-test", "anthropic-version": "2023-06-01"},
+            )
+            assert resp.status_code == 200, resp.text[:200]
+            return client.get("/stats").json()["tokens"]
+
+
+def test_bedrock_backfilled_input_is_reported_as_estimated() -> None:
+    """The #1132 backfill is Headroom's estimate: it must not count as billed input."""
+    tokens = _post_stream_stats(_make_bedrock_backend(_bedrock_events(input_tokens=0)))
+    assert tokens["input"] > 0
+    assert tokens["input_provider_reported"] == 0
+    assert tokens["input_estimated"] == tokens["input"]
+
+
+def test_bedrock_reported_input_is_provider_reported() -> None:
+    tokens = _post_stream_stats(_make_bedrock_backend(_bedrock_events(input_tokens=777)))
+    assert tokens["input_provider_reported"] == 777
+    assert tokens["input_estimated"] == 0
+
+
+def test_bedrock_fully_cached_zero_is_billed_input_not_a_placeholder() -> None:
+    """input_tokens=0 beside a cache bucket is a real count (a fully cached
+    prompt), not LiteLLM's placeholder: it is not backfilled, and the cache
+    buckets count as provider-reported billed input."""
+    events = _bedrock_events(input_tokens=0, cache_read_input_tokens=8857)
+    assert _message_start_input_tokens(_post_stream(_make_bedrock_backend(events))) == 0
+    tokens = _post_stream_stats(
+        _make_bedrock_backend(_bedrock_events(input_tokens=0, cache_read_input_tokens=8857))
+    )
+    assert tokens["input_provider_reported"] == 8857
+    assert tokens["input_estimated"] == 0
+
+
+def test_bedrock_cache_write_alone_also_counts_as_reported() -> None:
+    tokens = _post_stream_stats(
+        _make_bedrock_backend(_bedrock_events(input_tokens=0, cache_creation_input_tokens=1200))
+    )
+    assert tokens["input_provider_reported"] == 1200
+    assert tokens["input_estimated"] == 0

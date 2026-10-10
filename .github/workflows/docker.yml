@@ -124,6 +124,7 @@ jobs:
       - name: Build and push by digest (single platform)
         id: bake
         uses: docker/bake-action@v7
+        continue-on-error: true
         with:
           files: |
             ./docker-bake.hcl
@@ -147,7 +148,33 @@ jobs:
             *.platform=${{ matrix.arch.platform }}
             *.output=type=image,name=${{ env.REGISTRY }}/${{ steps.image-name.outputs.image_name }},push-by-digest=true,name-canonical=true,push=true
             *.cache-from=type=gha,scope=${{ matrix.variant.name || 'root' }}-${{ matrix.arch.name }}
-            *.cache-to=type=gha,mode=max,scope=${{ matrix.variant.name || 'root' }}-${{ matrix.arch.name }}
+            *.cache-to=type=gha,mode=max,ignore-error=true,scope=${{ matrix.variant.name || 'root' }}-${{ matrix.arch.name }}
+
+      # BuildKit can load a valid GHA cache index whose backing blob has
+      # since been evicted. The resulting lazy-copy 404 is fatal to cache
+      # import. Use a fresh daemon for the retry so the failed builder's
+      # imported records cannot be selected from its local state.
+      - name: Set up clean Docker Buildx fallback
+        id: fallback-buildx
+        if: steps.bake.outcome == 'failure'
+        uses: docker/setup-buildx-action@v4
+
+      # A real build failure remains fatal on this uncached attempt.
+      - name: Retry build without remote cache
+        id: bake-fallback
+        if: steps.bake.outcome == 'failure'
+        uses: docker/bake-action@v7
+        with:
+          builder: ${{ steps.fallback-buildx.outputs.name }}
+          no-cache: true
+          files: |
+            ./docker-bake.hcl
+            cwd://${{ steps.meta.outputs.bake-file-labels }}
+          targets: ${{ matrix.variant.bake_target }}
+          push: true
+          set: |
+            *.platform=${{ matrix.arch.platform }}
+            *.output=type=image,name=${{ env.REGISTRY }}/${{ steps.image-name.outputs.image_name }},push-by-digest=true,name-canonical=true,push=true
 
       - name: Export digest
         id: digest
@@ -159,7 +186,7 @@ jobs:
           # runner exports every env entry at bash spawn, so a large
           # metadata blob fails the step with E2BIG before it runs.
           cat > "${RUNNER_TEMP}/bake_meta.json" <<'__HEADROOM_BAKE_META_EOF__'
-          ${{ steps.bake.outputs.metadata }}
+          ${{ steps.bake.outcome == 'success' && steps.bake.outputs.metadata || steps.bake-fallback.outputs.metadata }}
           __HEADROOM_BAKE_META_EOF__
           digest="$(jq -r 'to_entries[0].value."containerimage.digest" // empty' \
               "${RUNNER_TEMP}/bake_meta.json")"
@@ -220,7 +247,7 @@ jobs:
   # tags, and that manifest is what users pull by `:tag`.
   docker-manifest:
     needs: docker-build
-    if: ${{ always() }}
+    if: ${{ success() }}
     runs-on: ubuntu-24.04
     timeout-minutes: 20
     strategy:

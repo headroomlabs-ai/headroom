@@ -30,6 +30,15 @@ logger = logging.getLogger("headroom.proxy")
 # client-supplied model cardinality stays bounded (see record_request).
 _OTHER_MODEL = "other"
 
+# Same idea for inbound request paths (see record_inbound_request). ``path`` is
+# client-controlled and effectively unbounded — ID-bearing passthrough routes
+# such as ``/v1/files/{id}`` or ``/v1/responses/{id}`` mint a distinct key per
+# request. Past this many distinct paths, further paths collapse into
+# ``_OTHER_PATH`` so the counter (and its exported Prometheus series) can't grow
+# without bound. The cap sits well above a proxy's real route count.
+MAX_DISTINCT_PATHS = 256
+_OTHER_PATH = "other"
+
 # Closed label set for headroom_requests_rate_limited_total{source}. Two 429s
 # mean opposite things to an operator: "headroom" is OUR limiter refusing the
 # request (raise the cap), "upstream" is the provider refusing it (back off or
@@ -152,9 +161,18 @@ class PrometheusMetrics:
         self.inbound_requests_active = 0
         self.inbound_requests_by_method: dict[str, int] = defaultdict(int)
         self.inbound_requests_by_path: dict[str, int] = defaultdict(int)
+        self._path_cardinality_warned = False
         self.inbound_responses_by_status: dict[str, int] = defaultdict(int)
 
         self.tokens_input_total = 0
+        # Of tokens_input_total: how much is the provider's own billed count
+        # versus Headroom's local tokenizer estimate (provider reported no
+        # usage, or the path never parsed it). Reported beside every input
+        # total so nobody reads an estimate as the bill.
+        self.tokens_input_provider_reported_total = 0
+        self.tokens_input_estimated_total = 0
+        self.requests_input_provider_reported = 0
+        self.requests_input_estimated = 0
         self.tokens_output_total = 0
         self.tokens_saved_total = 0
         # Tool-schema savings (deferral + turn-hook tool shrink), aggregated from
@@ -413,9 +431,14 @@ class PrometheusMetrics:
             self.inbound_requests_active = 0
             self.inbound_requests_by_method.clear()
             self.inbound_requests_by_path.clear()
+            self._path_cardinality_warned = False
             self.inbound_responses_by_status.clear()
 
             self.tokens_input_total = 0
+            self.tokens_input_provider_reported_total = 0
+            self.tokens_input_estimated_total = 0
+            self.requests_input_provider_reported = 0
+            self.requests_input_estimated = 0
             self.tokens_output_total = 0
             self.tokens_saved_total = 0
             self.tool_search_saved_total = 0
@@ -773,7 +796,23 @@ class PrometheusMetrics:
         self.inbound_requests_total += 1
         self.inbound_requests_active += 1
         self.inbound_requests_by_method[method.upper()] += 1
-        self.inbound_requests_by_path[path] += 1
+        # Cap client-controlled path cardinality, mirroring the model cap in
+        # record_request. A membership test (never a defaultdict index) keeps an
+        # over-cap path from materializing a new key and defeating the bound.
+        if path in self.inbound_requests_by_path or (
+            len(self.inbound_requests_by_path) < MAX_DISTINCT_PATHS
+        ):
+            bounded_path = path
+        else:
+            bounded_path = _OTHER_PATH
+            if not self._path_cardinality_warned:
+                self._path_cardinality_warned = True
+                logger.warning(
+                    "metrics.record: inbound path cardinality cap (%d) reached; "
+                    'bucketing further paths into "other"',
+                    MAX_DISTINCT_PATHS,
+                )
+        self.inbound_requests_by_path[bounded_path] += 1
 
     def record_inbound_response(self, *, status_code: int | str) -> None:
         self.inbound_requests_completed += 1
@@ -827,6 +866,10 @@ class PrometheusMetrics:
         # ``CacheMix.normalized``. Defaults False, preserving behaviour for the
         # providers that report disjoint buckets.
         cache_inferred: bool = False,
+        # True when ``input_tokens`` is the provider's own billed count, False
+        # when it is Headroom's local estimate. None (callers predating the
+        # split) records nothing in either bucket.
+        input_provider_reported: bool | None = None,
     ):
         """Record metrics for a request.
 
@@ -904,6 +947,12 @@ class PrometheusMetrics:
                 self.requests_cached += 1
 
             self.tokens_input_total += input_tokens
+            if input_provider_reported is True:
+                self.tokens_input_provider_reported_total += input_tokens
+                self.requests_input_provider_reported += 1
+            elif input_provider_reported is False and input_tokens > 0:
+                self.tokens_input_estimated_total += input_tokens
+                self.requests_input_estimated += 1
             self.tokens_output_total += output_tokens
             self.tokens_saved_total += tokens_saved
             self.tool_search_saved_total += max(0, int(tool_search_saved))
@@ -1038,6 +1087,7 @@ class PrometheusMetrics:
                 # saved next to "0 tokens saved".
                 tool_search_saved=tool_search_saved,
                 provider=provider,
+                agent=client,
                 project=project,
                 cache_read_tokens=cache_read_tokens,
                 cache_write_tokens=cache_write_tokens,

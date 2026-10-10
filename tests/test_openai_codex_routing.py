@@ -3,6 +3,7 @@ import base64
 import json
 import sys
 from copy import deepcopy
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -279,7 +280,7 @@ class _MemoryToolsOnlyHandler:
         self.config = SimpleNamespace(
             inject_context=False,
             inject_tools=True,
-            project_root_override="",
+            project_root_override=str(Path(__file__).resolve().parent),
         )
         self.compute_calls = 0
 
@@ -401,7 +402,7 @@ class _ZdrResponsesHandler(_DummyOpenAIHandler):
         )
 
 
-def _build_request(body: dict, headers: dict[str, str]) -> Request:
+def _build_request(body: dict, headers: dict[str, str], path: str = "/v1/responses") -> Request:
     payload = json.dumps(body).encode("utf-8")
 
     async def receive():
@@ -413,8 +414,8 @@ def _build_request(body: dict, headers: dict[str, str]) -> Request:
         "http_version": "1.1",
         "method": "POST",
         "scheme": "https",
-        "path": "/v1/responses",
-        "raw_path": b"/v1/responses",
+        "path": path,
+        "raw_path": path.encode("utf-8"),
         "query_string": b"",
         "headers": [
             (key.lower().encode("utf-8"), value.encode("utf-8")) for key, value in headers.items()
@@ -553,7 +554,11 @@ def test_handle_openai_responses_chatgpt_codex_timeout_fails_open(monkeypatch):
 def test_handle_openai_responses_api_auth_store_false_injects_stateless_memory_tools(monkeypatch):
     request = _build_request(
         {"model": "gpt-4o-mini", "input": "hello", "store": False},
-        {"Authorization": "Bearer sk-test", "x-headroom-user-id": "user-1"},
+        {
+            "Authorization": "Bearer sk-test",
+            "User-Agent": "codex-cli/0.5",
+            "x-headroom-user-id": "user-1",
+        },
     )
     handler = _DummyOpenAIHandler()
     memory_handler = _MemoryToolsOnlyHandler()
@@ -618,7 +623,11 @@ def test_openai_responses_memory_continuation_is_zdr_safe(store, include, monkey
         body["store"] = store
     request = _build_request(
         body,
-        {"Authorization": "Bearer sk-test", "x-headroom-user-id": "user-1"},
+        {
+            "Authorization": "Bearer sk-test",
+            "User-Agent": "codex-cli/0.5",
+            "x-headroom-user-id": "user-1",
+        },
     )
     handler = _ZdrResponsesHandler()
 

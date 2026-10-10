@@ -119,3 +119,14 @@ def test_failed_base_file_comparison_does_not_clear_the_rebase_label() -> None:
     dispatch = workflow[start : workflow.index("\n            fi\n", start)]
     assert 'elif [[ "$drift" == "current" ]]; then' in dispatch
     assert "else" not in dispatch
+
+
+def test_checkouts_use_the_commit_the_workflow_runs_from() -> None:
+    # pull_request_target runs this workflow file from the default branch.
+    # Checking out the PR's recorded base.sha instead pairs it with whatever
+    # helper scripts existed when the PR was last synced, so a new flag here
+    # fails every older PR's run with "unrecognized arguments".
+    workflow = Path(".github/workflows/pr-health.yml").read_text(encoding="utf-8")
+
+    assert "pull_request.base.sha" not in workflow
+    assert workflow.count("ref: ${{ github.sha }}") == workflow.count("actions/checkout@")
