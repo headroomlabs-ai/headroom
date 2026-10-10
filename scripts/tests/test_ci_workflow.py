@@ -26,6 +26,22 @@ def test_sharded_ci_uploads_only_explicit_coverage_reports() -> None:
     assert "if: ${{ !cancelled() }}" in upload_step.split("uses:", 1)[0]
 
 
+def test_ci_checks_documented_environment_variables_for_source_changes() -> None:
+    workflow = Path(".github/workflows/ci.yml").read_text(encoding="utf-8")
+
+    assert "env_docs: ${{ steps.filter.outputs.env_docs }}" in workflow
+    assert "env-doc-consistency:" in workflow
+    assert "python scripts/ci/verify_documented_env_vars.py" in workflow
+
+
+def test_docs_workflow_checks_environment_variables_for_documentation_changes() -> None:
+    workflow = Path(".github/workflows/docs.yml").read_text(encoding="utf-8")
+
+    assert "- 'README.md'" in workflow
+    assert "- 'SECURITY.md'" in workflow
+    assert "python scripts/ci/verify_documented_env_vars.py" in workflow
+
+
 def test_sharded_ci_disables_process_killing_hard_watchdog() -> None:
     """Pytest must report a stalled test instead of being hard-exited."""
     workflow = yaml.safe_load(Path(".github/workflows/ci.yml").read_text(encoding="utf-8"))
