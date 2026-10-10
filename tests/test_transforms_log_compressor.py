@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from types import SimpleNamespace
 
 import pytest
@@ -134,14 +135,6 @@ def test_malformed_short_summary_diagnostic_does_not_affect_legacy_helpers(
 
     output, _ = compressor._format_output(selected, parsed)
     assert "; omitted: " not in output
-    if not keep_summary_lines:
-        assert output == (
-            "FAILED outside.py::test_0\n"
-            "FAILED outside.py::test_9\n"
-            "ERROR outside.py::test_10\n"
-            "ERROR outside.py::test_19\n"
-            "[67 lines omitted: 10 ERROR, 10 FAIL, 51 INFO]"
-        )
 
 
 def test_select_dedupe_add_context_and_format_output(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -198,7 +191,7 @@ def test_select_dedupe_add_context_and_format_output(monkeypatch: pytest.MonkeyP
     )
     assert len(similar) == 1
 
-    output, stats = compressor._format_output(selected, log_lines)
+    _output, stats = compressor._format_output(selected, log_lines)
     assert stats == {
         "errors": 1,
         "fails": 1,
@@ -207,7 +200,6 @@ def test_select_dedupe_add_context_and_format_output(monkeypatch: pytest.MonkeyP
         "total": 9,
         "selected": 6,
     }
-    assert output.endswith("[3 lines omitted: 1 ERROR, 1 FAIL, 2 WARN, 1 INFO]")
 
 
 @pytest.mark.parametrize(
@@ -305,7 +297,7 @@ def test_short_summary_omission_naming_is_bounded(count: int, suffix: str) -> No
 
     output, _ = compressor._format_output(selected, all_lines)
 
-    assert output.endswith(f"[{count} lines omitted: {count} FAIL, 1 INFO{suffix}]")
+    assert output.endswith(f"{suffix}]")
 
 
 def test_short_summary_omission_naming_uses_ids_and_preserves_duplicates() -> None:
@@ -324,7 +316,7 @@ def test_short_summary_omission_naming_uses_ids_and_preserves_duplicates() -> No
     output, stats = compressor._format_output([all_lines[0], all_lines[4], all_lines[5]], all_lines)
 
     assert output.endswith(
-        "[3 lines omitted: 1 ERROR, 3 FAIL, 1 INFO; omitted: tests/test_ids.py::test_error, "
+        "; omitted: tests/test_ids.py::test_error, "
         "tests/test_ids.py::test_repeat, tests/test_ids.py::test_repeat]"
     )
     assert stats["errors"] == 1
@@ -493,13 +485,15 @@ def test_real_compress_ignores_malformed_short_summary_diagnostic() -> None:
     result = compressor.compress(content, bias=1_000)
 
     assert result.compressed_line_count < result.original_line_count
-    assert result.compressed == (
-        "FAILED outside.py::test_0\n"
-        "FAILED outside.py::test_9\n"
-        "ERROR outside.py::test_10\n"
-        "ERROR outside.py::test_19\n"
-        "[67 lines omitted: 10 ERROR, 10 FAIL, 51 INFO]"
-    )
+    retained = [
+        line for line in result.compressed.splitlines() if line.startswith(("FAILED ", "ERROR "))
+    ]
+    assert retained == [
+        "FAILED outside.py::test_0",
+        "FAILED outside.py::test_9",
+        "ERROR outside.py::test_10",
+        "ERROR outside.py::test_19",
+    ]
 
 
 def test_store_in_ccr_and_result_properties(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -535,3 +529,79 @@ def test_store_in_ccr_and_result_properties(monkeypatch: pytest.MonkeyPatch) -> 
     )
     assert result.tokens_saved_estimate > 0
     assert result.lines_omitted == 15
+
+
+def test_omitted_marker_counts_only_dropped_lines_on_native_path() -> None:
+    lines = [f"INFO worker processed item {i}" for i in range(400)]
+    error = "ERROR worker failed: connection reset"
+    lines.insert(200, error)
+    result = LogCompressor(LogCompressorConfig(enable_ccr=False)).compress("\n".join(lines))
+    marker = next(line for line in result.compressed.splitlines() if "lines omitted:" in line)
+    counts = {
+        level: int(count) for count, level in re.findall(r"(\d+) (ERROR|FAIL|WARN|INFO)", marker)
+    }
+
+    assert error in result.compressed.splitlines()
+    assert counts == {"INFO": result.lines_omitted}
+    assert result.stats["errors"] == 1
+    assert result.stats["info"] == 400
+
+
+@pytest.mark.parametrize("selected_indices", [(0, 2, 4, 6), (), tuple(range(8))])
+def test_omitted_marker_mirror_preserves_input_totals(selected_indices: tuple[int, ...]) -> None:
+    levels = (LogLevel.ERROR, LogLevel.FAIL, LogLevel.WARN, LogLevel.INFO)
+    all_lines = [
+        LogLine(index, f"{level.name} repeated", level=level)
+        for index, level in enumerate(level for level in levels for _ in range(2))
+    ]
+    selected = [all_lines[index] for index in selected_indices]
+    output, stats = LogCompressor()._format_output(selected, all_lines)
+    counts = {
+        level: int(count) for count, level in re.findall(r"(\d+) (ERROR|FAIL|WARN|INFO)", output)
+    }
+
+    if len(selected) == len(all_lines):
+        assert "lines omitted:" not in output
+    else:
+        expected_count = 2 if not selected else 1
+        assert counts == {level.name: expected_count for level in levels}
+    assert stats == {
+        "errors": 2,
+        "fails": 2,
+        "warnings": 2,
+        "info": 2,
+        "total": 8,
+        "selected": len(selected),
+    }
+
+
+@pytest.mark.parametrize("prefix", ["DEBUG ", "TRACE ", ""])
+def test_non_severity_omissions_keep_count_notice_on_native_path(prefix: str) -> None:
+    error = "ERROR retained failure"
+    original = "\n".join([f"{prefix}progress step {i}" for i in range(100)] + [error])
+    result = LogCompressor(LogCompressorConfig(enable_ccr=False)).compress(original)
+    marker = re.search(r"(?m)^\[(\d+) lines omitted[^\]]*\]$", result.compressed)
+    assert marker is not None
+    assert int(marker[1]) == result.lines_omitted
+    assert not re.search(r"\d+ (ERROR|FAIL|WARN|INFO)\b", marker[0])
+    assert error in result.compressed.splitlines()
+    assert result.stats["errors"] == 1
+    assert result.stats["total"] == 101
+
+
+def test_non_severity_omissions_keep_count_notice_in_mirror() -> None:
+    error = LogLine(0, "ERROR retained failure", level=LogLevel.ERROR)
+    all_lines = [
+        error,
+        LogLine(1, "DEBUG progress", level=LogLevel.DEBUG),
+        LogLine(2, "TRACE progress", level=LogLevel.TRACE),
+        LogLine(3, "unclassified progress", level=LogLevel.UNKNOWN),
+    ]
+    output, stats = LogCompressor()._format_output([error], all_lines)
+    marker = re.search(r"(?m)^\[(\d+) lines omitted[^\]]*\]$", output)
+    assert marker is not None
+    assert int(marker[1]) == 3
+    assert not re.search(r"\d+ (ERROR|FAIL|WARN|INFO)\b", marker[0])
+    assert error.content in output.splitlines()
+    assert stats["errors"] == 1
+    assert stats["total"] == 4

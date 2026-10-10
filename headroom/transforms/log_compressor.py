@@ -589,26 +589,25 @@ class LogCompressor:
         output_lines = [line.content for line in selected]
         omitted = len(all_lines) - len(selected)
         if omitted > 0:
+            # Public stats remain input totals; marker counts follow omitted identities.
+            omitted_counts = dict.fromkeys(
+                (LogLevel.ERROR, LogLevel.FAIL, LogLevel.WARN, LogLevel.INFO), 0
+            )
+            for line in all_lines:
+                if line.line_number not in selected_numbers and line.level in omitted_counts:
+                    omitted_counts[line.level] += 1
             summary_parts: list[str] = []
-            for label, key in (
-                ("ERROR", "errors"),
-                ("FAIL", "fails"),
-                ("WARN", "warnings"),
-                ("INFO", "info"),
-            ):
-                count = stats[key]
+            for level, count in omitted_counts.items():
                 if count > 0:
-                    summary_parts.append(f"{count} {label}")
-            if summary_parts:
-                omitted_names = ""
-                if omitted_short_summary_ids:
-                    omitted_names = "; omitted: " + ", ".join(omitted_short_summary_ids[:5])
-                    overflow = len(omitted_short_summary_ids) - 5
-                    if overflow > 0:
-                        omitted_names += f", +{overflow} more"
-                output_lines.append(
-                    f"[{omitted} lines omitted: {', '.join(summary_parts)}{omitted_names}]"
-                )
+                    summary_parts.append(f"{count} {level.name}")
+            omitted_names = ""
+            if omitted_short_summary_ids:
+                omitted_names = "; omitted: " + ", ".join(omitted_short_summary_ids[:5])
+                overflow = len(omitted_short_summary_ids) - 5
+                if overflow > 0:
+                    omitted_names += f", +{overflow} more"
+            summary = f": {', '.join(summary_parts)}" if summary_parts else ""
+            output_lines.append(f"[{omitted} lines omitted{summary}{omitted_names}]")
         return "\n".join(output_lines), stats
 
     def _store_in_ccr(self, original: str, compressed: str, original_count: int) -> str | None:

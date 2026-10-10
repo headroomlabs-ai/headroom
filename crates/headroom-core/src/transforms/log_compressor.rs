@@ -1532,35 +1532,50 @@ impl LogCompressor {
 
         let omitted = all_lines.len().saturating_sub(selected.len());
         if omitted > 0 {
+            // Keep public stats as input totals; describe only dropped identities here.
+            let mut omitted_levels = [0u64; 4];
+            for line in all_lines {
+                if selected_numbers.contains(&line.line_number) {
+                    continue;
+                }
+                match line.level {
+                    LogLevel::Error => omitted_levels[0] += 1,
+                    LogLevel::Fail => omitted_levels[1] += 1,
+                    LogLevel::Warn => omitted_levels[2] += 1,
+                    LogLevel::Info => omitted_levels[3] += 1,
+                    _ => {}
+                }
+            }
             let mut summary_parts: Vec<String> = Vec::new();
-            for (label, key) in [
-                ("ERROR", "errors"),
-                ("FAIL", "fails"),
-                ("WARN", "warnings"),
-                ("INFO", "info"),
+            for (label, n) in [
+                ("ERROR", omitted_levels[0]),
+                ("FAIL", omitted_levels[1]),
+                ("WARN", omitted_levels[2]),
+                ("INFO", omitted_levels[3]),
             ] {
-                let n = stats.get(key).copied().unwrap_or(0);
                 if n > 0 {
                     summary_parts.push(format!("{} {}", n, label));
                 }
             }
-            if !summary_parts.is_empty() {
-                let omitted_names = if omitted_short_summary_ids.is_empty() {
-                    String::new()
+            let omitted_names = if omitted_short_summary_ids.is_empty() {
+                String::new()
+            } else {
+                let shown = omitted_short_summary_ids
+                    .iter()
+                    .take(5)
+                    .copied()
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                let overflow = omitted_short_summary_ids.len().saturating_sub(5);
+                if overflow > 0 {
+                    format!("; omitted: {shown}, +{overflow} more")
                 } else {
-                    let shown = omitted_short_summary_ids
-                        .iter()
-                        .take(5)
-                        .copied()
-                        .collect::<Vec<_>>()
-                        .join(", ");
-                    let overflow = omitted_short_summary_ids.len().saturating_sub(5);
-                    if overflow > 0 {
-                        format!("; omitted: {shown}, +{overflow} more")
-                    } else {
-                        format!("; omitted: {shown}")
-                    }
-                };
+                    format!("; omitted: {shown}")
+                }
+            };
+            if summary_parts.is_empty() {
+                output.push(format!("[{} lines omitted{}]", omitted, omitted_names));
+            } else {
                 output.push(format!(
                     "[{} lines omitted: {}{}]",
                     omitted,
@@ -1915,12 +1930,6 @@ mod tests {
 
             let (output, _) = c.format_output(&selected, &parsed);
             assert!(!output.contains("; omitted: "));
-            if !keep_summary_lines {
-                assert_eq!(
-                    output,
-                    "FAILED outside.py::test_0\nFAILED outside.py::test_9\nERROR outside.py::test_10\nERROR outside.py::test_19\n[67 lines omitted: 10 ERROR, 10 FAIL, 51 INFO]"
-                );
-            }
         }
     }
 
@@ -2318,7 +2327,71 @@ mod tests {
     }
 
     #[test]
-    fn format_output_emits_summary_with_omitted_count() {
+    fn omitted_marker_counts_only_dropped_lines_on_live_path() {
+        let mut lines = (0..400)
+            .map(|i| format!("INFO worker processed item {i}"))
+            .collect::<Vec<_>>();
+        let error = "ERROR worker failed: connection reset";
+        lines.insert(200, error.to_string());
+        let c = LogCompressor::new(LogCompressorConfig {
+            enable_ccr: false,
+            ..Default::default()
+        });
+        let (result, _) = c.compress(&lines.join("\n"), 1.0);
+        let marker = result
+            .compressed
+            .lines()
+            .find(|line| line.contains("lines omitted:"))
+            .expect("large input must have omitted lines");
+        let pattern = Regex::new(r"(\d+) (ERROR|FAIL|WARN|INFO)").unwrap();
+        let mut level_counts = pattern.captures_iter(marker);
+        let count = level_counts.next().expect("omitted INFO count");
+
+        assert!(result.compressed.lines().any(|line| line == error));
+        assert_eq!(&count[2], "INFO");
+        assert_eq!(
+            count[1].parse::<usize>().unwrap(),
+            result.original_line_count - result.compressed_line_count
+        );
+        assert!(level_counts.next().is_none());
+        assert_eq!(result.stats["errors"], 1);
+        assert_eq!(result.stats["info"], 400);
+    }
+
+    #[test]
+    fn omitted_non_severity_lines_keep_count_notice_on_live_path() {
+        use std::fmt::Write as _;
+
+        let count_pattern = Regex::new(r"(?m)^\[(\d+) lines omitted[^\]]*\]$").unwrap();
+        let level_pattern = Regex::new(r"\d+ (ERROR|FAIL|WARN|INFO)\b").unwrap();
+        let error = "ERROR retained failure";
+        for prefix in ["DEBUG ", "TRACE ", ""] {
+            let mut input = String::with_capacity(4096);
+            for i in 0..100 {
+                writeln!(input, "{prefix}progress step {i}").unwrap();
+            }
+            input.push_str(error);
+            let c = LogCompressor::new(LogCompressorConfig {
+                enable_ccr: false,
+                ..Default::default()
+            });
+            let (result, _) = c.compress(&input, 1.0);
+            let marker = count_pattern
+                .captures(&result.compressed)
+                .expect("dropped lines must retain an omission count");
+            assert_eq!(
+                marker[1].parse::<usize>().unwrap(),
+                result.original_line_count - result.compressed_line_count
+            );
+            assert!(!level_pattern.is_match(marker.get(0).unwrap().as_str()));
+            assert!(result.compressed.lines().any(|line| line == error));
+            assert_eq!(result.stats["errors"], 1);
+            assert_eq!(result.stats["total"], 101);
+        }
+    }
+
+    #[test]
+    fn format_output_preserves_input_totals() {
         let c = cmp();
         let all_lines = vec![
             LogLine::new(0, "ERROR a"),
@@ -2339,8 +2412,7 @@ mod tests {
         })
         .collect::<Vec<_>>();
         let selected = vec![all_lines[0].clone()];
-        let (output, stats) = c.format_output(&selected, &all_lines);
-        assert!(output.contains("[3 lines omitted: 1 ERROR, 1 WARN, 2 INFO]"));
+        let (_output, stats) = c.format_output(&selected, &all_lines);
         assert_eq!(stats["errors"], 1);
         assert_eq!(stats["info"], 2);
     }
@@ -2367,12 +2439,7 @@ mod tests {
             } else {
                 String::new()
             };
-            assert!(
-                output.ends_with(&format!(
-                    "[{count} lines omitted: {count} FAIL, 1 INFO; omitted: {shown}{overflow}]"
-                )),
-                "{output}"
-            );
+            assert!(output.ends_with(&format!("; omitted: {shown}{overflow}]")));
         }
     }
 
@@ -2394,12 +2461,9 @@ mod tests {
         ];
 
         let (output, stats) = cmp().format_output(&selected, &all_lines);
-        assert!(
-            output.ends_with(
-                "[3 lines omitted: 1 ERROR, 3 FAIL, 1 INFO; omitted: tests/test_ids.py::test_error, tests/test_ids.py::test_repeat, tests/test_ids.py::test_repeat]"
-            ),
-            "{output}"
-        );
+        assert!(output.ends_with(
+            "; omitted: tests/test_ids.py::test_error, tests/test_ids.py::test_repeat, tests/test_ids.py::test_repeat]"
+        ));
         assert_eq!(stats["errors"], 1);
         assert_eq!(stats["fails"], 3);
     }
@@ -2435,23 +2499,8 @@ mod tests {
 
         let (output, _) = c.format_output(&selected, &all_lines);
         assert!(
-            output.ends_with(
-                "[4 lines omitted: 4 FAIL, 1 INFO; omitted: tests/test_ids.py::test_1, tests/test_ids.py::test_2]"
-            ),
-            "{output}"
+            output.ends_with("; omitted: tests/test_ids.py::test_1, tests/test_ids.py::test_2]")
         );
-    }
-
-    #[test]
-    fn format_output_marker_is_unchanged_without_omitted_short_summary_entries() {
-        let c = cmp();
-        let mut error = LogLine::new(0, "ERROR a");
-        error.level = LogLevel::Error;
-        let mut info = LogLine::new(1, "INFO b");
-        info.level = LogLevel::Info;
-
-        let (output, _) = c.format_output(&[error.clone()], &[error, info]);
-        assert_eq!(output, "ERROR a\n[1 lines omitted: 1 ERROR, 1 INFO]");
     }
 
     #[test]

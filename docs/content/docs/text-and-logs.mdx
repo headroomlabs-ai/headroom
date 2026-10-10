@@ -93,6 +93,11 @@ print(f"Compression ratio: {result.compression_ratio:.1%}")
 - Verbose success output
 - Repeated patterns
 
+Omission markers count `ERROR`, `FAIL`, `WARN`, and `INFO` levels only among the dropped lines, not the full input. An error retained in the compressed output is therefore not advertised as omitted. Debug, trace, and unclassified lines are not listed in the level breakdown.
+When only debug, trace, or unclassified lines are dropped, the marker still reports the omitted-line count without a severity breakdown.
+
+`result.stats` continues to report whole-input totals; the marker's narrower counts do not change those statistics. CCR still retains the exact original log when enabled.
+
 ## DiffCompressor
 
 Compresses unified diffs while keeping the actual changes and enough context to understand them.
