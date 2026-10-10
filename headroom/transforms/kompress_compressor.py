@@ -1623,7 +1623,8 @@ def store_kompress_in_ccr(original: str, compressed: str, original_tokens: int) 
         logger.warning(
             "Kompress CCR store write failed (%s); output is not retrievable", type(e).__name__
         )
-        logger.debug("Kompress CCR store failure detail: %s", describe_exception(e))
+        if logger.isEnabledFor(logging.DEBUG):
+            logger.debug("Kompress CCR store failure detail: %s", describe_exception(e))
         return None
 
 

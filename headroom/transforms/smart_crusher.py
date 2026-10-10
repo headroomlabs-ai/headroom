@@ -1203,7 +1203,8 @@ class SmartCrusher(Transform):
             logger.warning(
                 "CCR mirror: store write failed (%s) for hash %s", type(e).__name__, ccr_hash
             )
-            logger.debug("CCR mirror store failure detail: %s", describe_exception(e))
+            if logger.isEnabledFor(logging.DEBUG):
+                logger.debug("CCR mirror store failure detail: %s", describe_exception(e))
 
     def _extract_context_from_messages(self, messages: list[dict[str, Any]]) -> str:
         """Build a query string from the last 5 user messages + recent

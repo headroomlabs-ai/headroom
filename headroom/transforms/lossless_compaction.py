@@ -547,6 +547,7 @@ def compact_lossless(content: str, kind: str) -> str:
             type(e).__name__,
             len(content),
         )
-        logger.debug("Lossless compaction failure detail: %s", describe_exception(e))
+        if logger.isEnabledFor(logging.DEBUG):
+            logger.debug("Lossless compaction failure detail: %s", describe_exception(e))
         return content
     return content

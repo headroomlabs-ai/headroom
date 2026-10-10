@@ -9,6 +9,7 @@ cause chain) can quote tool output, stored payloads or credentials.
 from __future__ import annotations
 
 import logging
+import sys
 from collections.abc import Callable, Iterator
 
 import pytest
@@ -130,7 +131,7 @@ def _run_crusher_mirror(monkeypatch: pytest.MonkeyPatch) -> None:
     crusher._mirror_single_hash_to_python_store("a" * 24, "smart_crusher", "", None)
 
 
-@pytest.mark.parametrize(
+_PATHS = pytest.mark.parametrize(
     ("logger", "run", "expected"),
     [
         (compression_batches.logger, _run_batch, "Batch compression failed (RuntimeError)"),
@@ -145,6 +146,9 @@ def _run_crusher_mirror(monkeypatch: pytest.MonkeyPatch) -> None:
     ],
     ids=["batch", "dedup", "lossless", "kompress-ccr", "crusher-mirror"],
 )
+
+
+@_PATHS
 def test_failure_logs_no_exception_text_at_any_level(
     capture: Callable[[logging.Logger], _Capture],
     monkeypatch: pytest.MonkeyPatch,
@@ -172,3 +176,18 @@ def test_failure_logs_no_exception_text_at_any_level(
     assert len(details) == 1
     assert "RuntimeError" in details[0].getMessage()
     assert "caused by ValueError" in details[0].getMessage()
+
+
+@_PATHS
+def test_failure_skips_the_detail_when_debug_is_off(
+    monkeypatch: pytest.MonkeyPatch,
+    logger: logging.Logger,
+    run: Callable[[pytest.MonkeyPatch], None],
+    expected: str,
+) -> None:
+    def _not_called(_exc: BaseException) -> str:
+        raise AssertionError("describe_exception ran with DEBUG disabled")
+
+    monkeypatch.setattr(sys.modules[logger.name], "describe_exception", _not_called)
+    monkeypatch.setattr(logger, "level", logging.WARNING)
+    run(monkeypatch)

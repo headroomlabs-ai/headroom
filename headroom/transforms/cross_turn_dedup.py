@@ -297,7 +297,8 @@ def dedup_blocks(
             type(e).__name__,
             len(blocks),
         )
-        logger.debug("Cross-turn dedup failure detail: %s", describe_exception(e))
+        if logger.isEnabledFor(logging.DEBUG):
+            logger.debug("Cross-turn dedup failure detail: %s", describe_exception(e))
         return blocks, {"spans_folded": 0, "lines_removed": 0, "chars_removed": 0, "error": True}
 
 

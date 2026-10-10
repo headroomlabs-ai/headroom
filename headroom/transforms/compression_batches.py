@@ -266,7 +266,8 @@ def compress_batch_with_router(
             type(e).__name__,
             len(batch.entries),
         )
-        logger.debug("Batch compression failure detail: %s", describe_exception(e))
+        if logger.isEnabledFor(logging.DEBUG):
+            logger.debug("Batch compression failure detail: %s", describe_exception(e))
         return _passthrough_batch_results(
             batch,
             tokenizer=tokenizer,
