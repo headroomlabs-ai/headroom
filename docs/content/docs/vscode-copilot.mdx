@@ -124,6 +124,10 @@ that editor identity with the proxy operator's Copilot seat or add chat-specific
 headers. Chat and Responses retain their existing managed Copilot API-token
 policy; a raw OAuth bearer on those routes does not gain the inline exception.
 
+A configured base path is removed only for the same scheme and authority, at a
+complete path-segment boundary. Other recognized completions endpoints keep
+their native `/v1` paths.
+
 ## Stop and undo
 
 Press `Ctrl+C` to stop the session proxy. The VS Code endpoint setting remains so

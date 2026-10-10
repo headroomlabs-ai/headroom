@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import httpx
 import pytest
 
 from headroom import copilot_auth
@@ -67,3 +68,45 @@ async def test_inline_editor_keeps_its_seat_through_a_prefixed_gateway(
 
     assert headers["authorization"] == "Bearer ghu_editor_seat_fixture"
     assert headers["Copilot-Integration-Id"] == "vscode"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("gateway", "upstream"),
+    [
+        (
+            "https://gateway.example.invalid/v1",
+            "https://proxy.business.githubcopilot.com/v1/engines/gpt-41-copilot/completions",
+        ),
+        (
+            "https://proxy.business.githubcopilot.com/v1",
+            "http://proxy.business.githubcopilot.com/v1/engines/gpt-41-copilot/completions",
+        ),
+        (
+            "https://proxy.business.githubcopilot.com:8443/v1",
+            "https://proxy.business.githubcopilot.com/v1/engines/gpt-41-copilot/completions",
+        ),
+        (
+            "https://gateway.example.invalid/v",
+            "https://gateway.example.invalid/v1/engines/gpt-41-copilot/completions",
+        ),
+    ],
+    ids=["other-host", "other-scheme", "other-port", "segment-boundary"],
+)
+async def test_gateway_prefix_cannot_rewrite_an_unrelated_native_path(
+    monkeypatch: pytest.MonkeyPatch, gateway: str, upstream: str
+) -> None:
+    monkeypatch.setenv("GITHUB_COPILOT_PROXY_URL", gateway)
+    headers = await copilot_auth.apply_copilot_api_auth(
+        {
+            "authorization": "Bearer ghu_editor_seat_fixture",
+            "Copilot-Integration-Id": "vscode",
+            "x-api-key": "unrelated-provider-secret",
+        },
+        url=upstream,
+    )
+
+    header_view = httpx.Headers(headers)
+    assert header_view["authorization"] == "Bearer ghu_editor_seat_fixture"
+    assert header_view["Copilot-Integration-Id"] == "vscode"
+    assert "x-api-key" not in header_view

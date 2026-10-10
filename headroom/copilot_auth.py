@@ -1692,17 +1692,24 @@ async def apply_copilot_api_auth(headers: dict[str, str], *, url: str) -> dict[s
         scheme.lower() == "bearer"
         and raw_token.startswith("ghu_")
         and is_copilot_completions_host(url)
-        and is_copilot_completions_path(
-            urlparse(url).path.removeprefix(
-                urlparse(copilot_completions_base_url()).path.rstrip("/")
-            )
-        )
         and not _is_managed_copilot_seeded_bearer(raw_token)
     ):
-        for key in list(resolved):
-            if key.lower() == "x-api-key":
-                resolved.pop(key)
-        return resolved
+        upstream = urlparse(url)
+        base = urlparse(copilot_completions_base_url())
+        path = upstream.path
+        prefix = base.path.rstrip("/")
+        if (
+            prefix
+            and upstream.scheme == base.scheme
+            and upstream.netloc.lower() == base.netloc.lower()
+            and path.startswith(prefix + "/")
+        ):
+            path = path[len(prefix) :]
+        if is_copilot_completions_path(path):
+            for key in list(resolved):
+                if key.lower() == "x-api-key":
+                    resolved.pop(key)
+            return resolved
 
     # Read the CLIENT's integration ID before any default is applied, so the
     # credential we mint below can be bound to the surface that actually made
