@@ -461,7 +461,12 @@ def test_deep_tracebacks_keep_only_the_innermost_headroom_frames() -> None:
         ("sqlite:///tmp/x.db", "sqlite:///<path>"),
         ("unix:///run/headroom.sock", "unix:///<path>"),
         ("https://sk_live_CANARY@/v1", "<unparseable url>"),
-        ("https://sk_live_CANARY/v1", "<unparseable url>"),
+        ("https://abcDEF+ghi=/v1", "<unparseable url>"),
+        ("http://model_gateway:8000/v1", "http://model_gateway:8000/<path>"),
+        ("https://bücher.example/v1", "https://xn--bcher-kva.example/<path>"),
+        ("http://[fe80::1%25sk-ZONE-CANARY]:8787/", "http://[fe80::1]:8787/"),
+        ("https://upstream.example/file:///etc", "https://upstream.example/<path>"),
+        ("sk-key-CANARY:file:///x", "<unparseable url>"),
         ("https://xn--bcher-kva.example:8443/v1", "https://xn--bcher-kva.example:8443/<path>"),
         ("http://10.0.0.7:8787", "http://10.0.0.7:8787"),
     ],
@@ -506,3 +511,33 @@ def test_broken_exception_attributes_never_break_the_description(
     assert describe_exception(error) == (
         f"{Broken.__qualname__} [Errno 2] {os.strerror(2)}; caused by KeyError"
     )
+
+
+def test_hostless_urls_need_the_triple_slash_right_after_the_scheme() -> None:
+    assert redact_url("file:sk-CANARY-x://y") == "<unparseable url>"
+    assert redact_url("file:///var/x") == "file:///<path>"
+
+
+def test_int_ids_respect_the_process_digit_limit(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(sys, "get_int_max_str_digits", lambda: 640)
+    big = 10 ** int("700")
+
+    assert safe_id(big) == f"<int of {big.bit_length()} bits>"
+    assert safe_id(12345) == "12345"
+
+
+def test_safe_id_ignores_a_faked_class() -> None:
+    class Pretender:
+        @property  # type: ignore[misc]
+        def __class__(self) -> type:
+            return str
+
+    assert safe_id(Pretender()) == f"<{Pretender.__qualname__}>"
+
+
+@pytest.mark.parametrize("name", ["Err\rforged", "sk-live-CANARY", "Err\u2028x"])
+def test_class_names_must_be_plain_identifiers(name: str) -> None:
+    cls = type(name, (Exception,), {})
+
+    assert describe_exception(cls("x")) == "<exception>"
+    assert safe_id(cls("x")) == "<object>"
