@@ -876,6 +876,37 @@ def test_wrap_copilot_oauth_keeps_generic_endpoint_when_account_advertised(
     assert env["GITHUB_COPILOT_API_URL"] == DEFAULT_API_URL
 
 
+def test_wrap_copilot_implicit_oauth_stays_on_generic_host_for_enterprise_seat(
+    runner: CliRunner,
+    wrap_modules: tuple[types.ModuleType, click.Group],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The implicit OAuth lane does no token exchange at launch, so it never
+    sees the plan host; only --subscription / wrap vscode honour it. Pinned so
+    the guide's split between the lanes stays true."""
+    _wrap_cli, main = wrap_modules
+    _clear_copilot_env(monkeypatch)
+    captured: dict[str, object] = {}
+
+    def fake_launch_tool(**kwargs):  # noqa: ANN003
+        captured.update(kwargs)
+
+    with (
+        patch("headroom.cli.wrap.shutil.which", return_value="copilot"),
+        patch("headroom.cli.wrap.resolve_client_bearer_token", return_value="gho-oauth"),
+        patch("headroom.cli.wrap.has_oauth_auth", return_value=True),
+        patch(
+            "headroom.copilot_auth._fetch_copilot_user_info",
+            return_value={"endpoints": {"api": "https://api.enterprise.githubcopilot.com"}},
+        ),
+        patch("headroom.cli.wrap._launch_tool", side_effect=fake_launch_tool),
+    ):
+        result = runner.invoke(main, ["wrap", "copilot", "--", "--model", "gpt-5.4"])
+
+    assert result.exit_code == 0, result.output
+    assert captured["openai_api_url"] == DEFAULT_API_URL
+
+
 def test_wrap_copilot_oauth_honors_api_url_override(
     runner: CliRunner,
     wrap_modules: tuple[types.ModuleType, click.Group],

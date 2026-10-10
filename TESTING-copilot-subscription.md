@@ -26,19 +26,25 @@ default — with your token.)
 
 ## API host & Enterprise / data-residency
 
-Individual seats route to GitHub's **generic public host**,
-`https://api.githubcopilot.com`, for both `--subscription` and the implicit
-OAuth path. The `api.individual.githubcopilot.com` host advertised by
-`/copilot_internal/user` does **not** serve newer models on the responses API,
-and using it regressed `headroom wrap copilot` after 0.22.4
-([#610](https://github.com/headroomlabs-ai/headroom/issues/610)).
+Which host a wrapped session talks to depends on the lane:
 
-Business and Enterprise seats route to the host GitHub advertises for the plan
-(`api.business.githubcopilot.com` / `api.enterprise.githubcopilot.com`), which is
-what GitHub's own clients use and the only host an enterprise firewall on
-GitHub's subscription-based network routing allows. If that host rejects a model
-the generic host serves, set `GITHUB_COPILOT_USE_ADVERTISED_HOST=0` to fold back
-to the generic host. An explicit `GITHUB_COPILOT_API_URL` wins over both.
+- **`--subscription`, `headroom wrap vscode`, and OpenCode `--copilot-subscription`**
+  resolve the host from GitHub's token exchange. Business and Enterprise seats
+  route to the plan host GitHub advertises (`api.business.githubcopilot.com` /
+  `api.enterprise.githubcopilot.com`), which is what GitHub's own clients use and
+  the only host an enterprise firewall on GitHub's subscription-based network
+  routing allows. If that host rejects a model the generic host serves, set
+  `GITHUB_COPILOT_USE_ADVERTISED_HOST=0` to fold back to the generic host.
+  Individual seats route to the generic host: `api.individual.githubcopilot.com`
+  does **not** serve newer models on the responses API, and using it regressed
+  `headroom wrap copilot` after 0.22.4
+  ([#610](https://github.com/headroomlabs-ai/headroom/issues/610)).
+- **The implicit OAuth path** (plain `headroom wrap copilot` with a GitHub login
+  and no provider key) performs no token exchange at launch and always uses the
+  **generic public host** `https://api.githubcopilot.com`. On a firewall that
+  allows only the plan host, use `--subscription` or pin the host as below.
+
+An explicit `GITHUB_COPILOT_API_URL` wins over all of the above.
 
 **Enterprise / data-residency:** if your organization is provisioned on a
 dedicated Copilot API host (GitHub Enterprise Cloud with data residency, or an
