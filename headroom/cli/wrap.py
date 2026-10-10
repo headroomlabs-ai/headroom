@@ -4565,11 +4565,11 @@ def _dedicated_proxy_extensions(port: int, manifest: Any) -> list[str] | None:
     if payload is not None and not helpers._is_headroom_health(payload):
         return []  # a foreign service holds the port; it ran no extensions
     running = helpers._proxy_health_config(payload)
-    if running is not None:
-        found = running.get("proxy_extensions")
-        if isinstance(found, list):
-            return sorted(str(name) for name in found)
-        return None  # a proxy too old to report them
+    found = running.get("proxy_extensions") if running is not None else None
+    if isinstance(found, list):
+        return sorted(str(name) for name in found)
+    # No config, or a proxy too old to report the field: the manifest is the
+    # next best witness.
     if manifest is not None:
         return _manifest_proxy_extensions(manifest)
     return None
@@ -5006,13 +5006,13 @@ def _ensure_proxy_unlocked(
                 f"  Port {port} is in use by a non-Headroom service; selecting another port..."
             )
             proxy_listener = False
+        # Set False when the running proxy must not serve this session at all
+        # (unverifiable config, or a routing-level mismatch with live clients
+        # attached): fall through to a fresh start on a different port.
+        reuse_running = True
         if proxy_listener:
             # Proxy is running — check if it has the features we need
             needs_restart = False
-            # Set False when the running proxy must not serve this session at
-            # all (routing-level mismatch with live clients attached): fall
-            # through to a fresh start on a different port.
-            reuse_running = True
             routing_mismatches = (
                 None
                 if running_config is None
@@ -5214,10 +5214,18 @@ def _ensure_proxy_unlocked(
             else:
                 click.echo(f"  Port {port} is in use, using port {actual_port} instead.")
 
+        # This start leaves a running proxy on `port` in place and serves the
+        # session from `actual_port` beside it. Whatever that proxy reports
+        # through (an enterprise install's extensions) must come along, or the
+        # session's traffic vanishes from the team's dashboard while the local
+        # one fills (#3716).
+        replaces_running_proxy = (
+            isolated_copilot_subscription_proxy
+            or persistent_routing_mismatch
+            or (proxy_listener and not reuse_running)
+        )
         proxy_extensions: list[str] | None = None
-        if (
-            isolated_copilot_subscription_proxy or persistent_routing_mismatch
-        ) and "HEADROOM_PROXY_EXTENSIONS" not in os.environ:
+        if replaces_running_proxy and "HEADROOM_PROXY_EXTENSIONS" not in os.environ:
             proxy_extensions = helpers._dedicated_proxy_extensions(port, manifest)
             if proxy_extensions is None:
                 click.echo(

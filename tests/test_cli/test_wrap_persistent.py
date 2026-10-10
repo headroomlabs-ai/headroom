@@ -1926,6 +1926,60 @@ def test_dedicated_copilot_proxy_reads_extensions_from_the_manifest(monkeypatch)
     assert kwargs["proxy_extensions"] == ["lossless_guard", "observability"]
 
 
+def test_dedicated_copilot_proxy_falls_back_to_the_manifest_for_an_older_proxy(
+    monkeypatch, capsys
+) -> None:
+    """A running proxy that predates the /health field is not the last word when
+    the deployment's manifest records what it was installed with."""
+    monkeypatch.delenv("HEADROOM_PROXY_EXTENSIONS", raising=False)
+
+    class _ExtManifest(_Manifest):
+        base_env = {"HEADROOM_PROXY_EXTENSIONS": "control_plane"}
+
+    kwargs = _dedicated_start(monkeypatch, health={"config": {"pid": "1"}}, manifest=_ExtManifest())
+
+    assert kwargs["proxy_extensions"] == ["control_plane"]
+    assert "could not read the extensions" not in capsys.readouterr().out
+
+
+def test_attached_routing_mismatch_carries_the_shared_proxys_extensions(
+    monkeypatch, capsys
+) -> None:
+    """The non-persistent shared proxy with live clients and other routing is
+    left running; the dedicated proxy started beside it keeps its extensions."""
+    monkeypatch.delenv("HEADROOM_PROXY_EXTENSIONS", raising=False)
+    calls: list[object] = []
+    health = {
+        "version": wrap_cli._HEADROOM_VERSION,
+        "runtime": {"websocket_sessions": {"active_sessions": 0, "active_relay_tasks": 0}},
+        "config": {
+            "pid": "12345",
+            "backend": "anthropic",
+            "augment_api_url": "https://xlb.api.augmentcode.com",
+            "proxy_extensions": ["control_plane", "observability"],
+        },
+    }
+    monkeypatch.setattr(wrap_cli, "_find_persistent_manifest", lambda port: None)
+    monkeypatch.setattr(wrap_cli, "_check_proxy", lambda port: port == 8787)
+    monkeypatch.setattr(wrap_cli, "_query_proxy_health", lambda port: health)
+    monkeypatch.setattr(wrap_cli, "_live_proxy_clients", lambda *a, **kw: [999])
+    monkeypatch.setattr(wrap_cli, "_find_available_port", lambda start_port, **kw: 8799)
+    monkeypatch.setattr(
+        wrap_cli,
+        "_kill_proxy_by_pid",
+        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("must not be killed")),
+    )
+    monkeypatch.setattr(
+        wrap_cli, "_start_proxy", lambda *args, **kwargs: calls.append(("start", args, kwargs))
+    )
+
+    proc, actual_port = wrap_cli._ensure_proxy(8787, False)
+
+    assert (proc, actual_port) == (None, 8799)
+    assert calls[0][2]["proxy_extensions"] == ["control_plane", "observability"]
+    assert "Extensions carried over from the proxy on port 8787" in capsys.readouterr().out
+
+
 def test_plain_start_passes_no_extensions(monkeypatch) -> None:
     """Nothing owns the port: the proxy starts from the shell env as before."""
     monkeypatch.delenv("HEADROOM_PROXY_EXTENSIONS", raising=False)
