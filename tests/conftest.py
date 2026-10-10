@@ -63,6 +63,22 @@ def _skip_proxy_dependency_gate_unless_exercised(
     monkeypatch.setattr(proxy, "ensure_proxy_dependencies", lambda: None)
 
 
+# `headroom proxy` refuses to start when its port is already bound. Tests that
+# invoke it with a stubbed run_server use the default 8787, which a developer's
+# own running proxy holds, so the check is off unless a test exercises it.
+@pytest.fixture(autouse=True)
+def _skip_proxy_port_preflight_unless_exercised(
+    request: pytest.FixtureRequest, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    if request.node.get_closest_marker("proxy_port_preflight") is not None:
+        return
+    try:
+        from headroom.cli import proxy
+    except ModuleNotFoundError:
+        return
+    monkeypatch.setattr(proxy, "_refuse_busy_port", lambda *args, **kwargs: None)
+
+
 @pytest.fixture(autouse=True)
 def _scrub_developer_headroom_env(monkeypatch, tmp_path):
     for key in list(os.environ):

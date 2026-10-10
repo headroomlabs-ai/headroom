@@ -709,6 +709,35 @@ def _get_proxy_stdio_log_path(port: int | None = None) -> Path:
     return _get_log_path(port).with_name(_paths.proxy_stdio_log_path(port).name)
 
 
+# A proxy that dies during startup logs its shutdown summary after the error,
+# so the end of the log is the summary box, not the cause. Quote from the first
+# error-looking line instead.
+_PROXY_STARTUP_ERROR_RE = re.compile(r"\b(?:ERROR|CRITICAL)\b|Traceback \(most recent call last\)")
+_PROXY_STARTUP_EXCERPT_CHARS = 500
+
+
+def _proxy_startup_failure_excerpt(stdio_log_path: Path, start: int) -> str:
+    """Return the part of this run's stdio log that best explains a startup exit.
+
+    Reads only what was written after byte offset ``start`` (the log is shared
+    across runs). Prefers the first ERROR/CRITICAL/Traceback line onwards, and
+    falls back to the last few hundred characters.
+    """
+    try:
+        with open(stdio_log_path, "rb") as fh:
+            fh.seek(start)
+            output = fh.read().decode("utf-8", errors="replace").strip()
+    except OSError:
+        return "(no log output)"
+    if not output:
+        return "(no log output)"
+    match = _PROXY_STARTUP_ERROR_RE.search(output)
+    if match is None:
+        return output[-_PROXY_STARTUP_EXCERPT_CHARS:]
+    line_start = output.rfind("\n", 0, match.start()) + 1
+    return output[line_start : line_start + _PROXY_STARTUP_EXCERPT_CHARS]
+
+
 def _start_proxy(
     port: int,
     *,
@@ -790,6 +819,12 @@ def _start_proxy(
     timeout_seconds = _resolve_wrap_proxy_timeout_seconds()
     log_path = _get_log_path(port)
     stdio_log_path = _get_proxy_stdio_log_path(port)
+    # The stdio log is appended to across runs; remember where this run starts
+    # so a startup failure quotes this run's output, not an earlier one.
+    try:
+        stdio_log_start = stdio_log_path.stat().st_size
+    except OSError:
+        stdio_log_start = 0
     stdio_log_file = open(stdio_log_path, "a", encoding="utf-8")  # noqa: SIM115
 
     # Ensure proxy subprocess uses UTF-8 (Windows defaults to cp1252)
@@ -910,17 +945,17 @@ def _start_proxy(
                 return proc
             # Check if process died
             if proc.poll() is not None:
-                # Read last few lines of log for error context
-                try:
-                    tail = _read_text(stdio_log_path)[-500:]
-                except Exception:
-                    tail = "(no log output)"
-                raise RuntimeError(f"Proxy exited with code {proc.returncode}: {tail}")
+                excerpt = _proxy_startup_failure_excerpt(stdio_log_path, stdio_log_start)
+                raise RuntimeError(
+                    f"Proxy exited with code {proc.returncode}: {excerpt}\n"
+                    f"  Full log: {stdio_log_path}"
+                )
 
         proc.kill()
         raise RuntimeError(
             f"Proxy failed to start on port {port} within {timeout_seconds} seconds. "
-            f"Set {_WRAP_PROXY_TIMEOUT_ENV} to a larger number of seconds for slow startup."
+            f"Set {_WRAP_PROXY_TIMEOUT_ENV} to a larger number of seconds for slow startup.\n"
+            f"  Full log: {stdio_log_path}"
         )
     finally:
         stdio_log_file.close()

@@ -1,8 +1,10 @@
 """Proxy server CLI commands."""
 
+import errno
 import logging
 import os
 import platform
+import socket
 import sys
 import warnings
 from importlib.util import find_spec
@@ -203,6 +205,66 @@ def _get_env_float_optional(name: str) -> float | None:
         return float(val)
     except ValueError:
         raise click.ClickException(f"{name} must be a number, got {val!r}") from None
+
+
+def _tcp_port_in_use(host: str, port: int, *, workers: int) -> OSError | None:
+    """Return the EADDRINUSE error uvicorn would hit binding ``host:port``, else None.
+
+    Mirrors uvicorn's own bind so the probe never refuses a bind uvicorn would
+    accept: ``SO_REUSEADDR`` (both uvicorn paths set it on POSIX, so a port in
+    TIME_WAIT after a restart is not "in use"); a single process binds every
+    address ``host`` resolves to (asyncio ``create_server``), while
+    ``--workers > 1`` binds one AF_INET/AF_INET6 socket in the parent.
+    Windows ``SO_REUSEADDR`` semantics differ, so Windows is left to uvicorn,
+    as is any error other than EADDRINUSE (unresolvable host, address not on
+    this machine); uvicorn reports those as before.
+    """
+    if sys.platform == "win32":
+        return None
+    if workers > 1:
+        family = socket.AF_INET6 if ":" in host else socket.AF_INET
+        targets: list[tuple[Any, Any]] = [(family, (host, port))]
+    else:
+        try:
+            infos = socket.getaddrinfo(
+                host or None, port, type=socket.SOCK_STREAM, flags=socket.AI_PASSIVE
+            )
+        except (OSError, UnicodeError):
+            return None
+        targets = [(info[0], info[4]) for info in infos]
+    for family, address in targets:
+        try:
+            with socket.socket(family, socket.SOCK_STREAM) as probe:
+                probe.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                if family == socket.AF_INET6 and workers <= 1:
+                    # asyncio binds v4 and v6 separately; match it.
+                    probe.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 1)
+                probe.bind(address)
+        except OSError as exc:
+            if exc.errno == errno.EADDRINUSE:
+                return exc
+    return None
+
+
+def _refuse_busy_port(host: str, port: int, *, workers: int) -> None:
+    """Fail before the banner when ``host:port`` is already taken.
+
+    Without this the banner prints "Press Ctrl+C to stop", then uvicorn's bind
+    error is buried among startup and shutdown log lines.
+    """
+    error = _tcp_port_in_use(host, port, workers=workers)
+    if error is None:
+        return
+    from headroom.cli.port_discovery import probe_headroom_proxy
+
+    if probe_headroom_proxy(port):
+        holder = "a running Headroom proxy (reuse it, or stop it first)"
+    else:
+        holder = f"another process ({error.strerror or error})"
+    raise click.ClickException(
+        f"Port {port} on {host} is already in use by {holder}. "
+        "Start this proxy on another port with --port N (env: HEADROOM_PORT)."
+    )
 
 
 @main.command()
@@ -1695,6 +1757,8 @@ Memory (Multi-Provider):
     _bind = evaluate_bind_policy(config.host, config.proxy_token)
     if _bind.refused:
         raise click.ClickException(_bind.message())
+    if not config.uds:
+        _refuse_busy_port(config.host, config.port, workers=workers)
     _auth_on = _bind.token_configured
     _open_bind_note = (
         f" · WARNING open bind, /v1/* UNAUTHENTICATED (acknowledged via {OPEN_BIND_ACK_ENV}=1)"

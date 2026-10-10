@@ -203,10 +203,15 @@ class TestCLIWrapProxyTimeout:
         monkeypatch.setattr(wrap_mod, "_get_log_path", lambda port=None: tmp_path / "proxy.log")
         monkeypatch.setattr(wrap_mod, "_check_proxy", lambda _port: False)
         monkeypatch.setattr(wrap_mod.time, "sleep", lambda _seconds: None)
-        monkeypatch.setattr(wrap_mod.subprocess, "Popen", lambda *args, **kwargs: fake_proc)
+
+        def popen_writing_stdio(*args, **kwargs):
+            kwargs["stdout"].write("proxy stdio startup output\n")
+            kwargs["stdout"].flush()
+            return fake_proc
+
+        monkeypatch.setattr(wrap_mod.subprocess, "Popen", popen_writing_stdio)
 
         (tmp_path / "proxy.log").write_text("canonical runtime log output")
-        (tmp_path / "proxy-stdio-8787.log").write_text("proxy stdio startup output")
 
         with pytest.raises(RuntimeError) as excinfo:
             wrap_mod._start_proxy(8787, agent_type="codex")
@@ -215,6 +220,52 @@ class TestCLIWrapProxyTimeout:
         assert "Proxy exited with code 1" in message
         assert "proxy stdio startup output" in message
         assert "canonical runtime log output" not in message
+
+    def test_start_proxy_exit_quotes_this_runs_error_not_summary_or_old_runs(
+        self, monkeypatch, tmp_path
+    ):
+        """The startup error names the cause and the log path.
+
+        The proxy logs its shutdown summary after the error, and the stdio log
+        is appended across runs, so the old ``[-500:]`` tail quoted the summary
+        box (or an earlier run) and never said where the full log was.
+        """
+        fake_proc = _FakeProxyProcess()
+        fake_proc.returncode = 1
+        fake_proc.poll = lambda: fake_proc.returncode
+
+        monkeypatch.setenv(wrap_mod._WRAP_PROXY_TIMEOUT_ENV, "2")
+        monkeypatch.setattr(wrap_mod, "_get_log_path", lambda port=None: tmp_path / "proxy.log")
+        monkeypatch.setattr(wrap_mod, "_check_proxy", lambda _port: False)
+        monkeypatch.setattr(wrap_mod.time, "sleep", lambda _seconds: None)
+
+        stdio_log = tmp_path / "proxy-stdio-8787.log"
+        stdio_log.write_text("ERROR: stale failure from an earlier run\n")
+        summary = "".join(
+            f"2026-10-09 16:19:23,665 - headroom.proxy - INFO - Summary line {i}: 0\n"
+            for i in range(20)
+        )
+
+        def popen_failing_to_bind(*args, **kwargs):
+            kwargs["stdout"].write(
+                "2026-10-09 16:19:23,659 - headroom.proxy - INFO - Local telemetry: DISABLED\n"
+                "ERROR:    [Errno 48] error while attempting to bind on address "
+                "('127.0.0.1', 8787): address already in use\n" + summary
+            )
+            kwargs["stdout"].flush()
+            return fake_proc
+
+        monkeypatch.setattr(wrap_mod.subprocess, "Popen", popen_failing_to_bind)
+
+        with pytest.raises(RuntimeError) as excinfo:
+            wrap_mod._start_proxy(8787, agent_type="codex")
+
+        message = str(excinfo.value)
+        assert "Proxy exited with code 1" in message
+        assert "[Errno 48] error while attempting to bind" in message
+        assert "stale failure from an earlier run" not in message
+        assert "Local telemetry" not in message
+        assert f"Full log: {stdio_log}" in message
 
     def test_timeout_error_names_configured_timeout_and_env_var(self, monkeypatch, tmp_path):
         fake_proc = _FakeProxyProcess()
@@ -231,6 +282,7 @@ class TestCLIWrapProxyTimeout:
         message = str(excinfo.value)
         assert "within 2 seconds" in message
         assert wrap_mod._WRAP_PROXY_TIMEOUT_ENV in message
+        assert f"Full log: {tmp_path / 'proxy-stdio-8787.log'}" in message
         assert fake_proc.killed is True
 
 
