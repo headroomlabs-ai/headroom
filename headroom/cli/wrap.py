@@ -1180,6 +1180,42 @@ _code_memory_scope_option = click.option(
 )
 
 
+def _legacy_code_memory_options(command: Any) -> Any:
+    """Hidden pre-``--code-memory`` flags, still accepted by claude/codex/grok."""
+    for decorator in (
+        click.option(
+            "--no-serena",
+            is_flag=True,
+            hidden=True,
+            help="Deprecated: use --code-memory none. Register no code-memory MCP.",
+        ),
+        click.option(
+            "--serena",
+            is_flag=True,
+            hidden=True,
+            help="Deprecated: use --code-memory serena. Force the Serena MCP compressor on.",
+        ),
+        click.option(
+            "--no-tokensave",
+            is_flag=True,
+            hidden=True,
+            help="Deprecated and ignored: tokensave was retired; Serena is the default code memory.",
+        ),
+    ):
+        command = decorator(command)
+    return command
+
+
+def _require_binary(*names: str, install_hint: str) -> str:
+    """Return the first of ``names`` on PATH, or fail with how to install it."""
+    for name in names:
+        found = shutil.which(name)
+        if found:
+            return found
+    shown = f"'{names[0]}'" + "".join(f" (or '{name}')" for name in names[1:])
+    raise click.ClickException(f"{shown} not found in PATH.\n{install_hint}")
+
+
 # Hook-command markers Headroom manages in Claude settings.json. unwrap drops
 # any hook entry whose command contains one of these. (Retired rtk / lean-ctx
 # hooks are removed separately, by
@@ -5947,24 +5983,7 @@ def _detect_inbound_anthropic_upstream(port: int) -> str | None:
 )
 @_code_memory_option
 @_code_memory_scope_option
-@click.option(
-    "--no-tokensave",
-    is_flag=True,
-    hidden=True,
-    help="Deprecated and ignored: tokensave was retired; Serena is the default code memory.",
-)
-@click.option(
-    "--serena",
-    is_flag=True,
-    hidden=True,
-    help="Deprecated: use --code-memory serena. Force the Serena MCP compressor on.",
-)
-@click.option(
-    "--no-serena",
-    is_flag=True,
-    hidden=True,
-    help="Deprecated: use --code-memory none. Register no code-memory MCP.",
-)
+@_legacy_code_memory_options
 @click.option(
     "--code-graph",
     is_flag=True,
@@ -6064,11 +6083,9 @@ def claude(
     if prepare_only:
         return
 
-    claude_bin = shutil.which("claude")
-    if not claude_bin:
-        click.echo("Error: 'claude' not found in PATH.")
-        click.echo("Install Claude Code: https://docs.anthropic.com/en/docs/claude-code")
-        raise SystemExit(1)
+    claude_bin = _require_binary(
+        "claude", install_hint="Install Claude Code: https://docs.anthropic.com/en/docs/claude-code"
+    )
 
     # Validate --tool-search up front so a typo fails before we start the proxy.
     if tool_search is not None:
@@ -6662,14 +6679,13 @@ def copilot(
     explicitly with GITHUB_COPILOT_API_URL (the override flows through to upstream).
     See TESTING-copilot-subscription.md for details.
     """
-    copilot_bin = shutil.which("copilot")
-    if not copilot_bin:
-        click.echo("Error: 'copilot' not found in PATH.")
-        click.echo(
+    copilot_bin = _require_binary(
+        "copilot",
+        install_hint=(
             "Install GitHub Copilot CLI: "
             "https://docs.github.com/en/copilot/how-tos/copilot-cli/set-up-copilot-cli/install-copilot-cli"
-        )
-        raise SystemExit(1)
+        ),
+    )
 
     explicit_subscription = subscription
     effective_backend = backend or os.environ.get("HEADROOM_BACKEND")
@@ -7271,11 +7287,9 @@ def _run_codex_wrap(
         )
         return
 
-    codex_bin = shutil.which("codex")
-    if not codex_bin:
-        click.echo("Error: 'codex' not found in PATH.")
-        click.echo("Install Codex CLI: npm install -g @openai/codex")
-        raise SystemExit(1)
+    codex_bin = _require_binary(
+        "codex", install_hint="Install Codex CLI: npm install -g @openai/codex"
+    )
 
     active_codex_home = _codex_home_dir()
     _offer_dangling_codex_recovery(active_codex_home)
@@ -7335,24 +7349,7 @@ def _run_codex_wrap(
     help="Skip headroom MCP server registration (compression markers will be unactionable)",
 )
 @_code_memory_option
-@click.option(
-    "--no-tokensave",
-    is_flag=True,
-    hidden=True,
-    help="Deprecated and ignored: tokensave was retired; Serena is the default code memory.",
-)
-@click.option(
-    "--serena",
-    is_flag=True,
-    hidden=True,
-    help="Deprecated: use --code-memory serena. Force the Serena MCP compressor on.",
-)
-@click.option(
-    "--no-serena",
-    is_flag=True,
-    hidden=True,
-    help="Deprecated: use --code-memory none. Register no code-memory MCP.",
-)
+@_legacy_code_memory_options
 @click.option(
     "--code-graph",
     is_flag=True,
@@ -7483,11 +7480,7 @@ def aider(
     if prepare_only:
         return
 
-    aider_bin = shutil.which("aider")
-    if not aider_bin:
-        click.echo("Error: 'aider' not found in PATH.")
-        click.echo("Install aider: pip install aider-chat")
-        raise SystemExit(1)
+    aider_bin = _require_binary("aider", install_hint="Install aider: pip install aider-chat")
 
     env, env_vars_display = _build_aider_launch_env(
         port, os.environ, project=_project_name_from_cwd()
@@ -7554,11 +7547,9 @@ def vibe(
     if prepare_only:
         return
 
-    vibe_bin = shutil.which("vibe")
-    if not vibe_bin:
-        click.echo("Error: 'vibe' not found in PATH.")
-        click.echo("Install Mistral Vibe: https://github.com/mistralai/mistral-vibe")
-        raise SystemExit(1)
+    vibe_bin = _require_binary(
+        "vibe", install_hint="Install Mistral Vibe: https://github.com/mistralai/mistral-vibe"
+    )
 
     env, env_vars_display = _build_mistral_vibe_launch_env(
         port, os.environ, project=_project_name_from_cwd()
@@ -7633,11 +7624,9 @@ def kimi(
     if prepare_only:
         return
 
-    kimi_bin = shutil.which("kimi") or shutil.which("kimi-cli")
-    if not kimi_bin:
-        click.echo("Error: 'kimi' (or 'kimi-cli') not found in PATH.")
-        click.echo("Install Kimi CLI: https://github.com/MoonshotAI/kimi-cli")
-        raise SystemExit(1)
+    kimi_bin = _require_binary(
+        "kimi", "kimi-cli", install_hint="Install Kimi CLI: https://github.com/MoonshotAI/kimi-cli"
+    )
 
     project = _project_name_from_cwd()
     env, env_vars_display = _build_kimi_launch_env(port, os.environ, project=project)
@@ -7682,24 +7671,7 @@ def kimi(
 @proxy_port_option()
 @click.option("--no-mcp", is_flag=True, help="Skip headroom MCP server registration")
 @_code_memory_option
-@click.option(
-    "--no-tokensave",
-    is_flag=True,
-    hidden=True,
-    help="Deprecated and ignored: tokensave was retired; Serena is the default code memory.",
-)
-@click.option(
-    "--serena",
-    is_flag=True,
-    hidden=True,
-    help="Deprecated: use --code-memory serena. Force the Serena MCP compressor on.",
-)
-@click.option(
-    "--no-serena",
-    is_flag=True,
-    hidden=True,
-    help="Deprecated: use --code-memory none. Register no code-memory MCP.",
-)
+@_legacy_code_memory_options
 @click.option(
     "--code-graph",
     is_flag=True,
@@ -7772,11 +7744,9 @@ def grok(
     if prepare_only:
         return
 
-    grok_bin = shutil.which("grok")
-    if not grok_bin:
-        click.echo("Error: 'grok' not found in PATH.")
-        click.echo("Install Grok CLI: https://docs.x.ai/docs/grok-cli")
-        raise SystemExit(1)
+    grok_bin = _require_binary(
+        "grok", install_hint="Install Grok CLI: https://docs.x.ai/docs/grok-cli"
+    )
 
     env, env_vars_display = _build_grok_launch_env(
         port, os.environ, project=_project_name_from_cwd()
@@ -8571,11 +8541,9 @@ def opencode(
     # config without launching, so it is exempt.
     opencode_bin: str | None = None
     if not prepare_only:
-        opencode_bin = shutil.which("opencode")
-        if not opencode_bin:
-            click.echo("Error: 'opencode' not found in PATH.")
-            click.echo("Install OpenCode: https://opencode.ai")
-            raise SystemExit(1)
+        opencode_bin = _require_binary(
+            "opencode", install_hint="Install OpenCode: https://opencode.ai"
+        )
 
     # Likewise refuse a reused proxy that cannot honor --openai-api-url before
     # touching OpenCode's config or registering a client marker; the same check
@@ -9087,11 +9055,9 @@ def omp(
         _inject_omp_models_override(port, _project_name_from_cwd())
         return
 
-    omp_bin = shutil.which("omp")
-    if not omp_bin:
-        click.echo("Error: 'omp' not found in PATH.")
-        click.echo("Install Oh My Pi: npm install -g @oh-my-pi/pi-coding-agent")
-        raise SystemExit(1)
+    omp_bin = _require_binary(
+        "omp", install_hint="Install Oh My Pi: npm install -g @oh-my-pi/pi-coding-agent"
+    )
 
     env, env_vars_display = _build_omp_launch_env(
         port, os.environ, project=_project_name_from_cwd()
@@ -9316,11 +9282,7 @@ def _make_registry_command(target: WrapTarget) -> click.Command:
         if prepare_only:
             return
 
-        tool_bin = shutil.which(target.binary)
-        if not tool_bin:
-            click.echo(f"Error: '{target.binary}' not found in PATH.")
-            click.echo(target.install_hint)
-            raise SystemExit(1)
+        tool_bin = _require_binary(target.binary, install_hint=target.install_hint)
 
         # Exported before proxy startup so _start_proxy forwards it as --mode;
         # an explicit HEADROOM_MODE always wins.
