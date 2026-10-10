@@ -1301,8 +1301,11 @@ def append_text_to_latest_user_input_item(
     return body_input, 0
 
 
-# Maximum request body size (100MB - increased to support image-heavy requests)
-MAX_REQUEST_BODY_SIZE = 100 * 1024 * 1024
+# Bound the entire history before JSON parsing or compression. Larger image-heavy
+# bodies can amplify far beyond their wire size during preprocessing (#4139).
+MAX_REQUEST_BODY_SIZE = request_limit_policy.resolve_request_body_max_bytes(
+    os.environ.get(request_limit_policy.REQUEST_BODY_MAX_BYTES_ENV)
+)
 
 # A *decompressed* body obeys the same ceiling as an uncompressed one. The
 # Content-Length gate at the handlers only ever saw the compressed wire size, so

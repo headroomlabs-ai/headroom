@@ -4,6 +4,7 @@ These tests verify that the compression-only endpoint works correctly
 for the TypeScript SDK and other HTTP clients.
 """
 
+import gzip
 import json
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock
@@ -82,6 +83,36 @@ class TestCompressEndpointValidation:
         assert response.status_code == 400
         data = response.json()
         assert data["error"]["type"] == "invalid_request"
+
+    @pytest.mark.parametrize("bypass", [False, True])
+    def test_expanded_image_history_is_refused_before_compression(self, client, bypass):
+        body = {
+            "model": "gpt-4o",
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "image_url",
+                            "image_url": {
+                                "url": "data:image/png;base64," + "YQ==" * (5 * 1024 * 1024)
+                            },
+                        }
+                    ],
+                }
+            ],
+        }
+        headers = {"content-type": "application/json", "content-encoding": "gzip"}
+        if bypass:
+            headers["x-headroom-bypass"] = "true"
+        response = client.post(
+            "/v1/compress",
+            content=gzip.compress(json.dumps(body).encode()),
+            headers=headers,
+        )
+
+        assert response.status_code == 413
+        assert response.json()["error"]["code"] == "request_too_large"
 
 
 class TestCompressEndpointBasic:

@@ -21,6 +21,32 @@ See [Runtime Rollouts](/docs/runtime-rollouts) for policy, provenance, and
 contributor rules.
 If Codex history disappeared after using an older wrapper, see [Recover Codex State](/docs/codex-recovery) before wrapping Codex again.
 
+## Proxy request-body admission
+
+| Variable | Default | Purpose |
+|----------|---------|---------|
+| `HEADROOM_REQUEST_BODY_MAX_BYTES` | `16777216` (16 MiB) | Whole-request size ceiling, resolved at process startup. Must be a positive integer. |
+
+The ceiling applies to the complete history, not each message or text chunk.
+Declared oversized HTTP bodies are rejected before reading them; chunked bodies
+are metered as they arrive. Oversized wire bodies return HTTP 413 by default,
+before JSON parsing, image classification, tokenization, or compression.
+Decompressed gzip, deflate, Brotli, and Zstandard bodies obey the same ceiling;
+`/v1/compress` returns the same size refusal for oversized decoded bodies,
+including requests with `x-headroom-bypass: true`.
+
+This replaces the previous fixed 100 MiB ceiling. If your deployment intentionally
+accepts larger image histories, set an explicit ceiling and restart the proxy:
+
+```bash
+HEADROOM_REQUEST_BODY_MAX_BYTES=104857600 headroom proxy
+```
+
+Raise it only with enough memory for JSON and compression allocations beyond the
+wire size. This is an admission bound, not a limit on model memory or a mechanism
+for cancelling workers already running. Use a lower value on small hosts and
+bound compression concurrency separately.
+
 ## SDK Modes (`default_mode` / `headroom_mode`)
 
 These modes apply to SDK usage via `HeadroomClient(default_mode=...)` or per-request `headroom_mode=...`. They are **not** the same as the proxy `--mode` flag.

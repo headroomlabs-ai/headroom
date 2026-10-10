@@ -10637,7 +10637,7 @@ class OpenAIHandlerMixin:
         from headroom.proxy.gateway_responses import build_view as build_responses_view
         from headroom.proxy.gateway_responses import is_responses_body
         from headroom.proxy.gateway_responses import mark_view as mark_responses_view
-        from headroom.proxy.helpers import _read_request_json
+        from headroom.proxy.helpers import RequestBodyTooLarge, _read_request_json
 
         def _gateway_invalid(e: CompressTurnError) -> JSONResponse:
             return JSONResponse(
@@ -10659,6 +10659,8 @@ class OpenAIHandlerMixin:
         if request.headers.get("x-headroom-bypass", "").lower() == "true":
             try:
                 body = await _read_request_json(request)
+            except RequestBodyTooLarge:
+                raise
             except (json.JSONDecodeError, ValueError) as e:
                 return JSONResponse(
                     status_code=400,
@@ -10684,6 +10686,8 @@ class OpenAIHandlerMixin:
 
         try:
             body = await _read_request_json(request)
+        except RequestBodyTooLarge:
+            raise
         except Exception:
             return JSONResponse(
                 status_code=400,
