@@ -437,6 +437,27 @@ class TestCodexMemoryMcpConfig:
 class TestInjectAndRestoreRoundTrip:
     """End-to-end wrap → unwrap cycle operating directly on a temp $HOME."""
 
+    def test_invalid_user_config_is_named_and_left_untouched(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """A broken config.toml is reported by path, with the user's own line.
+
+        The merged candidate used to be the first thing parsed, so the warning
+        named a line in Headroom's generated text and no file at all.
+        """
+        _set_test_home(monkeypatch, tmp_path)
+        config_file = tmp_path / ".codex" / "config.toml"
+        config_file.parent.mkdir(parents=True)
+        config_file.write_text("model = [unterminated\n", encoding="utf-8")
+
+        assert wrap_mod._inject_codex_provider_config(8787) is None
+
+        out = capsys.readouterr().out
+        assert f"could not update Codex config {config_file}: it is not valid TOML" in out
+        assert "line 1" in out
+        assert "Fix or remove the file, then re-run." in out
+        assert config_file.read_text(encoding="utf-8") == "model = [unterminated\n"
+
     def test_wrap_unwrap_restores_empty_state(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
     ) -> None:

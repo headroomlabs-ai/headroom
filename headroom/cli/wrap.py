@@ -172,6 +172,7 @@ from headroom.providers.grok import (
 )
 from headroom.providers.grok_build import render_setup_lines as _render_grok_build_setup_lines
 from headroom.providers.grok_build.config import (
+    grok_config_paths,
     inject_grok_provider_config,
     restore_grok_provider_config,
 )
@@ -3639,11 +3640,30 @@ def _inject_codex_provider_config(port: int) -> str | None:
         _snapshot_codex_config_if_unwrapped(config_file, backup_file)
 
         if config_file.exists():
-            content = _read_text(config_file)
+            original = _read_text(config_file)
             # Remove any prior Headroom-managed blocks before re-injecting so
             # the operation is idempotent and supports port changes.
-            content = _strip_codex_headroom_blocks(content)
+            content = _strip_codex_headroom_blocks(original)
             content = _strip_existing_codex_headroom_provider_table(content)
+
+            # Report a broken file in the user's own terms. The candidate
+            # validated below is the merged text, so its parse error would
+            # name a line the user never wrote. Only the user's part has to
+            # parse: stripping a stale Headroom block may be what repairs it.
+            try:
+                tomllib.loads(content)
+            except tomllib.TOMLDecodeError:
+                try:
+                    tomllib.loads(original)
+                    reason = "it is no longer valid TOML once Headroom's block is removed"
+                except tomllib.TOMLDecodeError as exc:
+                    reason = f"it is not valid TOML ({exc})"
+                click.echo(
+                    f"  Warning: could not update Codex config {config_file}: {reason}; "
+                    "Codex WebSocket traffic will bypass Headroom. Fix or remove the file, "
+                    "then re-run."
+                )
+                return None
 
             # Bare top-level keys must precede any [section] in TOML, and
             # TOML rejects duplicate top-level keys.  Rewrite any existing
@@ -3695,7 +3715,7 @@ def _inject_codex_provider_config(port: int) -> str | None:
         # history list stays whole once it routes through Headroom. Best-effort.
         retag_to_headroom(_codex_home_dir())
     except Exception as e:
-        click.echo(f"  Warning: could not update Codex config: {e}")
+        click.echo(f"  Warning: could not update Codex config {config_file}: {e}")
         return None
 
     return custom_upstream_base_url
@@ -4584,17 +4604,6 @@ def _find_persistent_manifest(port: int) -> Any:
     return manifests[0] if manifests else None
 
 
-def _wait_for_runtime_ready(manifest: Any, timeout_seconds: int) -> bool:
-    """Keep wrap recovery gated by both readiness and runtime identity."""
-    from headroom.install.runtime import wait_ready
-
-    try:
-        return wait_ready(manifest, timeout_seconds=timeout_seconds, require_identity=True)
-    except TypeError:
-        # Compatibility for test doubles that predate the keyword-only guard.
-        return wait_ready(manifest, timeout_seconds=timeout_seconds)
-
-
 def _recover_persistent_proxy(port: int) -> bool:
     """Start or recover a matching persistent deployment for the requested port."""
     from headroom.install.models import SupervisorKind
@@ -4603,6 +4612,7 @@ def _recover_persistent_proxy(port: int) -> bool:
         runtime_ready,
         start_detached_agent,
         start_persistent_docker,
+        wait_ready,
     )
     from headroom.install.supervisors import start_supervisor
 
@@ -4637,7 +4647,7 @@ def _recover_persistent_proxy(port: int) -> bool:
         )
         return False
 
-    if _wait_for_runtime_ready(manifest, 45):
+    if wait_ready(manifest, timeout_seconds=45, require_identity=True):
         click.echo(f"  Recovered persistent deployment '{manifest.profile}' on port {port}")
         return True
 
@@ -4653,6 +4663,7 @@ def _restart_persistent_proxy(manifest: Any, port: int) -> bool:
         start_detached_agent,
         start_persistent_docker,
         stop_runtime,
+        wait_ready,
     )
     from headroom.install.supervisors import start_supervisor
 
@@ -4677,7 +4688,7 @@ def _restart_persistent_proxy(manifest: Any, port: int) -> bool:
         )
         return False
 
-    if _wait_for_runtime_ready(manifest, 45):
+    if wait_ready(manifest, timeout_seconds=45, require_identity=True):
         click.echo(f"  Restarted persistent deployment '{manifest.profile}' on port {port}")
         return True
 
@@ -7954,7 +7965,7 @@ def grok_build(
             config_file = inject_grok_provider_config(port, project=project)
             click.echo(f"  Grok config: injected Headroom proxy override into {config_file}")
         except Exception as e:
-            click.echo(f"  Warning: could not update Grok config: {e}")
+            click.echo(f"  Warning: could not update Grok config {grok_config_paths()[0]}: {e}")
         return
 
     def _print_grok_build_setup(actual_port: int) -> None:
@@ -7963,7 +7974,7 @@ def grok_build(
             click.echo(f"  Grok config: injected Headroom proxy override into {config_file}")
             click.echo()
         except Exception as e:
-            click.echo(f"  Warning: could not update Grok config: {e}")
+            click.echo(f"  Warning: could not update Grok config {grok_config_paths()[0]}: {e}")
             click.echo()
         for line in _render_grok_build_setup_lines(actual_port, project=project):
             click.echo(line)
