@@ -99,7 +99,8 @@ def test_warn_once_stays_bounded_across_repeated_passes(caplog: pytest.LogCaptur
     messages = _warnings(caplog)
     assert len(messages) == 65  # 64 keys plus one overflow notice, not 65 per pass
     assert messages[-1] == (
-        "More than 64 distinct unwritable ledgers; further ones are logged at debug only"
+        "More than 64 distinct unwritable ledgers; further ones are logged at debug only "
+        "for the next 60 minutes"
     )
 
 
@@ -175,3 +176,30 @@ def test_forgetting_after_overflow_does_not_reopen_the_cap(
             assert guard.first(f"new-{cycle}", log) is False
 
     assert len(_warnings(caplog)) == 1
+
+
+def test_warn_once_starts_over_after_the_overflow_window(
+    caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    log = logging.getLogger("headroom.test_log_safety.window")
+    guard = WarnOnce(limit=2, what="hook failures", window_seconds=600)
+    clock = [1000.0]
+    monkeypatch.setattr(log_safety.time, "monotonic", lambda: clock[0])
+
+    results = []
+    with caplog.at_level(logging.INFO, logger=log.name):
+        for key, advance in (("a", 0), ("b", 0), ("c", 0), ("d", 599), ("new-hook", 1)):
+            clock[0] += advance
+            results.append(guard.first(key, log))
+
+    # a and b warn, c triggers the overflow notice, d is inside the window,
+    # and a newly broken key after the window warns again.
+    assert results == [True, True, False, False, True]
+    assert len(_warnings(caplog)) == 1
+
+
+def test_huge_errno_does_not_break_the_description() -> None:
+    exc = OSError()
+    exc.errno = 2**63
+
+    assert describe_exception(exc) == f"OSError [Errno {2**63}] unknown error"
