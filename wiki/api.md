@@ -77,7 +77,6 @@ from headroom import SmartCrusherConfig
 
 config = SmartCrusherConfig(
     min_tokens_to_crush=200,
-    max_items_after_crush=50,
     keep_first=3,
     keep_last=2,
     relevance_threshold=0.3,

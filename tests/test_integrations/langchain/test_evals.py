@@ -58,7 +58,6 @@ def smart_crusher():
     config = SmartCrusherConfig(
         enabled=True,
         min_tokens_to_crush=200,
-        max_items_after_crush=20,
     )
     return SmartCrusher(config=config, with_compaction=False)
 

@@ -19,13 +19,12 @@ from headroom.transforms.smart_crusher import SmartCrusher
 # ---------------------------------------------------------------------------
 
 
-def _make_crusher(max_items: int = 10, min_items: int = 3) -> SmartCrusher:
+def _make_crusher(min_items: int = 3) -> SmartCrusher:
     """Build a SmartCrusher with deterministic small-K config for tests."""
     config = SmartCrusherConfig(
         enabled=True,
         min_items_to_analyze=min_items,
         min_tokens_to_crush=0,
-        max_items_after_crush=max_items,
         variance_threshold=2.0,
     )
     return SmartCrusher(config=config)
@@ -54,7 +53,7 @@ class TestFieldSemanticsThreadSafety:
 
     def test_concurrent_crushes_no_cross_contamination(self) -> None:
         """Two concurrent crushes must not share field_semantics state."""
-        crusher = _make_crusher(max_items=5)
+        crusher = _make_crusher()
 
         # Two different array payloads
         payload_a = json.dumps([{"name": f"item_{i}", "value": i} for i in range(20)])
