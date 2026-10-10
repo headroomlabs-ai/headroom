@@ -144,10 +144,19 @@ remote, and profile-specific settings should use `--settings-file` explicitly.
 
 ## Enterprise
 
-GitHub.com Enterprise Cloud normally requires no override; Headroom uses the API
-URL advertised during token exchange. For GitHub Enterprise Server/custom domains,
-set `GITHUB_COPILOT_ENTERPRISE_URL` or `GITHUB_COPILOT_ENTERPRISE_DOMAIN` before
-both `copilot-auth login` and `wrap vscode`.
+GitHub.com Enterprise Cloud normally requires no override. Copilot Business and
+Enterprise seats are routed to the host GitHub advertises during token exchange
+(`api.business.githubcopilot.com` or `api.enterprise.githubcopilot.com`), which is
+the host GitHub's own clients use. This matters on networks that follow GitHub's
+[subscription-based network routing](https://docs.github.com/en/copilot/how-tos/administer-copilot/manage-for-enterprise/manage-access/manage-network-access):
+their firewall allows only the plan host, and the generic `api.githubcopilot.com`
+is blocked. If the plan host rejects a model the generic host serves, set
+`GITHUB_COPILOT_USE_ADVERTISED_HOST=0` to route through the generic host again.
+An explicit `GITHUB_COPILOT_API_URL` still wins over both.
+
+For GitHub Enterprise Server/custom domains, set `GITHUB_COPILOT_ENTERPRISE_URL`
+or `GITHUB_COPILOT_ENTERPRISE_DOMAIN` before both `copilot-auth login` and
+`wrap vscode`.
 
 ## Verification and troubleshooting
 

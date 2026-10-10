@@ -1065,6 +1065,28 @@ def _api_url_from_payload(payload: dict[str, Any] | None) -> str | None:
     return None
 
 
+#: Opt-out: ``0``/``false``/``no``/``off`` folds the Business and Enterprise
+#: hosts below back into the generic host, for seats where the segmented host
+#: still lags on model availability (#2455 folded them after a Business seat
+#: got "model not supported" for Claude models on its plan host).
+_USE_ADVERTISED_HOST_ENV = "GITHUB_COPILOT_USE_ADVERTISED_HOST"
+
+#: Per-plan chat hosts GitHub advertises in ``endpoints.api`` for Business and
+#: Enterprise seats. Honoured by default: they are the hosts GitHub's own
+#: clients route with, and an enterprise on GitHub's subscription-based network
+#: routing allows only its own plan host, so the generic host is unreachable
+#: there and the failure looks like a random connection error. The individual
+#: host is still folded (#610: it did not serve newer models on the Responses
+#: API). An explicit ``GITHUB_COPILOT_API_URL`` or enterprise domain wins over
+#: both.
+_ADVERTISED_PLAN_HOSTS: frozenset[str] = frozenset(
+    {
+        "api.business.githubcopilot.com",
+        "api.enterprise.githubcopilot.com",
+    }
+)
+
+
 def _subscription_api_url_from_user_info_payload(payload: dict[str, Any] | None) -> str:
     configured = _configured_api_url_override()
     if configured:
@@ -1075,12 +1097,21 @@ def _subscription_api_url_from_user_info_payload(payload: dict[str, Any] | None)
         return DEFAULT_API_URL
 
     host = urlparse(api_url).netloc.lower()
-    if host in {
-        "api.githubcopilot.com",
-        "api.individual.githubcopilot.com",
-        "api.business.githubcopilot.com",
-        "api.enterprise.githubcopilot.com",
-    }:
+    if host in _ADVERTISED_PLAN_HOSTS:
+        opt_out = os.environ.get(_USE_ADVERTISED_HOST_ENV, "").strip().lower()
+        if opt_out in {"0", "false", "no", "off"}:
+            return DEFAULT_API_URL
+        # Named in the log so a "model not supported" 400 from the plan host
+        # sits next to the escape hatch instead of looking like a proxy fault.
+        logger.info(
+            "Routing Copilot subscription traffic to the advertised plan host %s "
+            "(set %s=0 to use %s instead)",
+            api_url,
+            _USE_ADVERTISED_HOST_ENV,
+            DEFAULT_API_URL,
+        )
+        return api_url
+    if host in {"api.githubcopilot.com", "api.individual.githubcopilot.com"}:
         return DEFAULT_API_URL
     if host.endswith(".githubcopilot.com"):
         return api_url
@@ -1406,14 +1437,14 @@ def resolve_copilot_api_url(oauth_token: str | None = None) -> str:
        (corporate proxy, enterprise / data-residency host, tests).
     2. The generic public host ``https://api.githubcopilot.com``.
 
-    The account-specific ``endpoints.api`` advertised by ``/copilot_internal/user``
-    is intentionally NOT used to route. It returns a segmented host (e.g.
-    ``api.individual.githubcopilot.com``) that does not serve newer models on the
-    responses API — wrapping such a request regressed after 0.22.4 (#610) — and it
-    is not the host the official Copilot client routes with (that comes from the
-    token-exchange endpoint, not user info). Accounts that genuinely require a
-    dedicated host set ``GITHUB_COPILOT_API_URL`` explicitly. ``oauth_token`` is
-    accepted for call-site compatibility but no longer triggers a network lookup.
+    This path performs no network lookup, so it cannot see the per-plan host a
+    token exchange advertises. The subscription lanes (``wrap vscode``,
+    ``wrap copilot --subscription``, OpenCode) resolve that host through
+    :func:`resolve_subscription_bearer_token_details` and pin it into the proxy
+    as ``GITHUB_COPILOT_API_URL``, which step 1 then honours. The
+    ``api.individual.githubcopilot.com`` host is never routed to (#610: it did
+    not serve newer models on the Responses API). ``oauth_token`` is accepted
+    for call-site compatibility but no longer triggers a network lookup.
     """
 
     del oauth_token  # reserved; routing no longer depends on a user-info lookup

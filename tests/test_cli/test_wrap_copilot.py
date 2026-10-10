@@ -982,11 +982,13 @@ def test_wrap_copilot_subscription_uses_resolved_subscription_endpoint(
     assert env["COPILOT_PROVIDER_BEARER_TOKEN"] == "copilot-api"
 
 
-def test_wrap_copilot_subscription_normalizes_enterprise_host(
+def test_wrap_copilot_subscription_honours_advertised_enterprise_host(
     runner: CliRunner,
     wrap_modules: tuple[types.ModuleType, click.Group],
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    """An Enterprise seat routes to the host its token exchange advertised; a
+    firewall on GitHub's subscription-based routing allows only that host."""
     _wrap_cli, main = wrap_modules
     _clear_copilot_env(monkeypatch)
     captured: dict[str, object] = {}
@@ -1028,9 +1030,10 @@ def test_wrap_copilot_subscription_normalizes_enterprise_host(
     assert result.exit_code == 0, result.output
     env = captured["env"]
     assert isinstance(env, dict)
-    assert captured["openai_api_url"] == DEFAULT_API_URL
-    assert env["OPENAI_TARGET_API_URL"] == DEFAULT_API_URL
-    assert env["GITHUB_COPILOT_API_URL"] == DEFAULT_API_URL
+    enterprise_api = "https://api.enterprise.githubcopilot.com"
+    assert captured["openai_api_url"] == enterprise_api
+    assert env["OPENAI_TARGET_API_URL"] == enterprise_api
+    assert env["GITHUB_COPILOT_API_URL"] == enterprise_api
 
 
 def test_wrap_copilot_subscription_honors_api_url_override(

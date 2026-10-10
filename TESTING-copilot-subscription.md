@@ -26,17 +26,19 @@ default — with your token.)
 
 ## API host & Enterprise / data-residency
 
-Headroom routes wrapped Copilot traffic to GitHub's **generic public host**,
+Individual seats route to GitHub's **generic public host**,
 `https://api.githubcopilot.com`, for both `--subscription` and the implicit
-OAuth path. That host serves the full model set (including newer models on the
-responses API) and matches the routing that worked before 0.23.
-
-Headroom deliberately does **not** auto-select a per-account host from
-`/copilot_internal/user`. That endpoint advertises a segmented host (e.g.
-`api.individual.githubcopilot.com`) that does **not** serve newer models on the
-responses API and is not the host the official Copilot client routes with — using
-it regressed `headroom wrap copilot` after 0.22.4
+OAuth path. The `api.individual.githubcopilot.com` host advertised by
+`/copilot_internal/user` does **not** serve newer models on the responses API,
+and using it regressed `headroom wrap copilot` after 0.22.4
 ([#610](https://github.com/headroomlabs-ai/headroom/issues/610)).
+
+Business and Enterprise seats route to the host GitHub advertises for the plan
+(`api.business.githubcopilot.com` / `api.enterprise.githubcopilot.com`), which is
+what GitHub's own clients use and the only host an enterprise firewall on
+GitHub's subscription-based network routing allows. If that host rejects a model
+the generic host serves, set `GITHUB_COPILOT_USE_ADVERTISED_HOST=0` to fold back
+to the generic host. An explicit `GITHUB_COPILOT_API_URL` wins over both.
 
 **Enterprise / data-residency:** if your organization is provisioned on a
 dedicated Copilot API host (GitHub Enterprise Cloud with data residency, or an
@@ -48,11 +50,8 @@ export GITHUB_COPILOT_API_URL=https://api.<your-host>.githubcopilot.com
 headroom wrap copilot --subscription -- --model gpt-5.4
 ```
 
-If you operate such an environment and would like Headroom to **auto-detect** the
-correct host instead of pinning it, please [open an issue](https://github.com/headroomlabs-ai/headroom/issues/new) —
-the intended path is to resolve it from GitHub's token-exchange endpoint (the
-source the official Copilot client uses), and we'd want to validate it against a
-real enterprise tenant.
+The Business and Enterprise plan hosts are detected from GitHub's token-exchange
+endpoint (see above); only data-residency and egress-proxy hosts still need the pin.
 
 ## Status
 
