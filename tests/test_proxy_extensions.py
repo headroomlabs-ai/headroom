@@ -76,7 +76,8 @@ def test_discover_warns_when_entry_point_enumeration_fails(monkeypatch) -> None:
 
     assert len(warnings) == 1
     assert "no proxy extensions will be installed" in warnings[0]
-    assert "corrupt dist-info" in warnings[0]
+    assert "RuntimeError" in warnings[0]
+    assert "corrupt dist-info" not in warnings[0]  # detail stays at DEBUG
 
 
 def test_discover_is_quiet_when_nothing_is_installed(monkeypatch) -> None:

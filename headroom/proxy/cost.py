@@ -58,16 +58,29 @@ logger = logging.getLogger("headroom.proxy")
 # unresolvable model (a custom / OpenAI-compatible name LiteLLM can't price,
 # e.g. glm-5.2) floods proxy.log with an identical WARNING every single request
 # (#2504). Track which models have already been warned so each fires once per
-# process; the set is tiny and bounded by the number of distinct models seen.
+# process. Model names come from clients, so the set is capped: when it fills it
+# is cleared, which at worst repeats a warning instead of growing without bound.
 _warned_pricing_models: set[str] = set()
+_WARNED_PRICING_MODELS_MAX = 1024
 
 
-def _warn_pricing_once(model: str, message: str) -> None:
-    """Emit ``message`` at WARNING only the first time ``model`` fails pricing."""
-    if model in _warned_pricing_models:
+def _warn_pricing_once(model: str, message: str, exc: BaseException | None = None) -> None:
+    """Emit ``message`` at WARNING only the first time ``model`` fails pricing.
+
+    With ``exc``, the WARNING names only the exception type: pricing errors can
+    echo the client's model string or provider internals. The full exception
+    goes to DEBUG.
+    """
+    if model in _warned_pricing_models or not logger.isEnabledFor(logging.WARNING):
         return
+    if len(_warned_pricing_models) >= _WARNED_PRICING_MODELS_MAX:
+        _warned_pricing_models.clear()
     _warned_pricing_models.add(model)
-    logger.warning(message)
+    if exc is None:
+        logger.warning(message)
+        return
+    logger.warning("%s (%s)", message, type(exc).__name__)
+    logger.debug("%s", message, exc_info=exc)
 
 
 # A route whose responses never carry a usage breakdown hits the estimated-basis
@@ -278,7 +291,8 @@ def build_prefix_cache_stats(
                         except Exception as e:
                             _warn_pricing_once(
                                 f"__cache_rates__:{model_name}",
-                                f"Failed to resolve cache rates for model {model_name}: {e}",
+                                f"Failed to resolve cache rates for model {model_name}",
+                                e,
                             )
                             cache_prices = None
                         best_tokens = tokens_sent
@@ -1000,7 +1014,7 @@ class CostTracker:
             return float(total_cost) if total_cost > 0 else None
 
         except Exception as e:
-            _warn_pricing_once(model, f"Failed to get pricing for model {model}: {e}")
+            _warn_pricing_once(model, f"Failed to get pricing for model {model}", e)
             return None
 
     def _prune_old_costs(self):
@@ -1375,7 +1389,7 @@ class CostTracker:
             return cost_per_token * 1_000_000 if cost_per_token else None
         except Exception as e:
             _warn_pricing_once(
-                f"__list_price__:{model}", f"Failed to get list price for model {model}: {e}"
+                f"__list_price__:{model}", f"Failed to get list price for model {model}", e
             )
             return None
 
@@ -1399,7 +1413,7 @@ class CostTracker:
             return base or None
         except Exception as e:
             _warn_pricing_once(
-                f"__output_price__:{model}", f"Failed to get output price for model {model}: {e}"
+                f"__output_price__:{model}", f"Failed to get output price for model {model}", e
             )
             return None
 
@@ -1456,7 +1470,7 @@ class CostTracker:
             rates = resolve_rates(model, long_context=long_context, for_billing=for_billing)
         except Exception as e:
             _warn_pricing_once(
-                f"__cache_rates__:{model}", f"Failed to resolve cache rates for model {model}: {e}"
+                f"__cache_rates__:{model}", f"Failed to resolve cache rates for model {model}", e
             )
             return None
         if rates is None or not rates.uncached:

@@ -46,8 +46,8 @@ def test_distinct_models_each_warn_once(cost_tracker, caplog):
         cost_tracker.estimate_cost("mystery-model", 10, 5)
 
     msgs = [r.getMessage() for r in caplog.records if "Failed to get pricing" in r.getMessage()]
-    assert sum("for model glm-5.2:" in m for m in msgs) == 1
-    assert sum("for model mystery-model:" in m for m in msgs) == 1
+    assert sum("for model glm-5.2 (" in m for m in msgs) == 1
+    assert sum("for model mystery-model (" in m for m in msgs) == 1
 
 
 def test_litellm_unavailable_warns_once_per_model(monkeypatch, caplog):

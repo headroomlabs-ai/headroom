@@ -396,4 +396,5 @@ def test_cache_rate_failure_warns_once_per_model(monkeypatch: pytest.MonkeyPatch
 
     warnings = [r.getMessage() for r in capture.records if r.levelno == logging.WARNING]
     assert len(warnings) == 1
-    assert "for model m:" in warnings[0] and "pricing table corrupt" in warnings[0]
+    assert "for model m" in warnings[0] and "RuntimeError" in warnings[0]
+    assert "pricing table corrupt" not in warnings[0]  # exception text stays at DEBUG

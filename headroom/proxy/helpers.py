@@ -4662,10 +4662,10 @@ def _model_supports_openai_tool_search(model: str | None) -> bool:
     override = os.environ.get("HEADROOM_OPENAI_TOOL_SEARCH_MODELS", "").strip()
     if override:
         try:
-            return re.search(override, model) is not None
+            matched = re.search(override, model) is not None
         except re.error as exc:
             # Malformed override → fall back to the version gate.
-            if override != _openai_tool_search_bad_pattern:
+            if override != _openai_tool_search_bad_pattern and logger.isEnabledFor(logging.WARNING):
                 _openai_tool_search_bad_pattern = override
                 logger.warning(
                     "Ignoring invalid HEADROOM_OPENAI_TOOL_SEARCH_MODELS regex %r (%s); "
@@ -4673,6 +4673,10 @@ def _model_supports_openai_tool_search(model: str | None) -> bool:
                     override,
                     exc,
                 )
+        else:
+            # A valid pattern re-arms the warning for the next bad one.
+            _openai_tool_search_bad_pattern = None
+            return matched
     match = re.match(r"gpt-(\d+)(?:\.(\d+))?", model.strip().lower())
     if not match:
         return False

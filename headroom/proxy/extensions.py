@@ -124,11 +124,11 @@ def discover() -> Iterator[tuple[str, ProxyExtension]]:
         entries = importlib.metadata.entry_points(group=ENTRY_POINT_GROUP)
     except Exception as exc:  # noqa: BLE001 — importlib.metadata can raise varied types
         log.warning(
-            "proxy extensions: entry-point enumeration failed, so no proxy extensions "
-            "will be installed: %s",
-            exc,
-            exc_info=True,
+            "proxy extensions: entry-point enumeration failed (%s), so no proxy "
+            "extensions will be installed; enable debug logging for the traceback",
+            type(exc).__name__,
         )
+        log.debug("proxy extensions: entry-point enumeration failure detail", exc_info=True)
         return
     for entry in entries:
         try:

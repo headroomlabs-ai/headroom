@@ -89,6 +89,24 @@ def test_malformed_override_warns_once_not_per_request(monkeypatch):
     assert "[unclosed" in warnings[0].getMessage()
 
 
+def test_valid_override_rearms_the_malformed_warning(monkeypatch):
+    """Bad A, valid B, bad A again: the second A is reported too."""
+    from headroom.proxy import helpers
+
+    monkeypatch.setattr(helpers, "_openai_tool_search_bad_pattern", None)
+    capture = _Capture()
+    proxy_logger = logging.getLogger("headroom.proxy")
+    proxy_logger.addHandler(capture)
+    try:
+        for pattern in ("[unclosed", r"^gpt-5\.4", "[unclosed"):
+            monkeypatch.setenv("HEADROOM_OPENAI_TOOL_SEARCH_MODELS", pattern)
+            assert _model_supports_openai_tool_search("gpt-5.4") is True
+    finally:
+        proxy_logger.removeHandler(capture)
+
+    assert [r.levelno for r in capture.records] == [logging.WARNING, logging.WARNING]
+
+
 # --- deferral behavior -------------------------------------------------------
 
 
