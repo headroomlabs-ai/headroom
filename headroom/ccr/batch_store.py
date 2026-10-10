@@ -126,7 +126,6 @@ class BatchContextStore:
         self._ttl = ttl
         self._max_contexts = max_contexts
         self._lock = asyncio.Lock()
-        self._cleanup_task: asyncio.Task | None = None
 
     async def store(self, context: BatchContext) -> None:
         """Store a batch context.

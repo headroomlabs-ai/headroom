@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import importlib.util
+import warnings
 from importlib import import_module
 from typing import TYPE_CHECKING
 
@@ -209,6 +210,10 @@ _LAZY_EXPORTS: dict[str, tuple[str, str]] = {
 }
 
 
+# Lazy exports that are deprecated: accessing them warns at the caller.
+_DEPRECATED_MODULES = frozenset({"headroom.transforms.anchor_selector"})
+
+
 def __getattr__(name: str) -> object:
     if name == "__path__":
         raise AttributeError(name)
@@ -219,6 +224,23 @@ def __getattr__(name: str) -> object:
         module_name, attr_name = _LAZY_EXPORTS[name]
     except KeyError as exc:
         raise AttributeError(f"module {__name__!r} has no attribute {name!r}") from exc
+
+    if module_name in _DEPRECATED_MODULES:
+        warnings.warn(
+            f"headroom.transforms.{name} is deprecated and will be removed in a future "
+            "release; it has no replacement (SmartCrusher's anchor selection runs in Rust).",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+        # Warn once, here, rather than again from the module's own import-time warning.
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", DeprecationWarning)
+            module = import_module(module_name)
+        value = getattr(module, attr_name)
+        # Cache it, so `from headroom.transforms import X` (which looks the
+        # name up twice) warns once, and later accesses stay quiet.
+        globals()[name] = value
+        return value
 
     module = import_module(module_name)
     value = getattr(module, attr_name)

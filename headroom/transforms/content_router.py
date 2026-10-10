@@ -2489,7 +2489,6 @@ class ContentRouter(Transform):
         # skip — i.e. revert it to original text and bust the provider prefix
         # cache. Counting pins isolates the freeze's attributable payoff.
         self._freeze_pin_hits = 0
-        self._freeze_pin_chars = 0
 
     # ── #3486: per-request runtime state accessors ──────────────────────
     #
@@ -2624,7 +2623,6 @@ class ContentRouter(Transform):
         preserved = max(0, int(len(content) * (1.0 - cached_ratio)))
         with self._frozen_lock:
             self._freeze_pin_hits += 1
-            self._freeze_pin_chars += preserved
             hits = self._freeze_pin_hits
         logger.info(
             f"FREEZE-PIN: pins={hits} cached_ratio={cached_ratio:.3f} "
@@ -7885,24 +7883,3 @@ class ContentRouter(Transform):
         Always returns True - the router handles all content types.
         """
         return True
-
-
-def route_and_compress(
-    content: str,
-    context: str = "",
-) -> str:
-    """Convenience function for one-off routing and compression.
-
-    Args:
-        content: Content to compress.
-        context: Optional context for relevance-aware compression.
-
-    Returns:
-        Compressed content.
-
-    Example:
-        >>> compressed = route_and_compress(mixed_content)
-    """
-    router = ContentRouter()
-    result = router.compress(content, context=context)
-    return result.compressed

@@ -234,7 +234,8 @@ class CodexRegistrar(MCPRegistrar):
             return False
         try:
             fsutil.write_text(self._config_file, new_content)
-        except OSError:
+        except OSError as exc:
+            logger.warning("could not remove %r from %s: %s", server_name, self._config_file, exc)
             return False
         return True
 

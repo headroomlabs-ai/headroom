@@ -39,7 +39,11 @@ from headroom.proxy.helpers import (
 from headroom.proxy.identity import resolve_memory_identity
 from headroom.proxy.loopback_guard import is_loopback_host
 from headroom.proxy.modes import is_cache_mode
-from headroom.proxy.provider_usage import billed_input_for_provider, billed_input_from_usage
+from headroom.proxy.provider_usage import (
+    billed_input_for_provider,
+    billed_input_from_usage,
+    usage_int,
+)
 from headroom.proxy.rate_limit_identity import rate_limit_identity
 from headroom.proxy.semantic_cache_key_policy import compute_request_cache_partition
 from headroom.proxy.stage_timer import StageTimer, emit_stage_timings_log
@@ -62,6 +66,7 @@ import httpx
 
 from headroom.agent_savings import proxy_pipeline_kwargs
 from headroom.ccr.marker_resolution import resolve_markers_in_response
+from headroom.ccr.tool_calls import has_ccr_retrieve_tool
 from headroom.config import is_tool_excluded, unwrap_tool_call_name
 from headroom.copilot_auth import (
     apply_copilot_api_auth,
@@ -363,20 +368,14 @@ class TurnHookUsage:
         500 a request by returning an odd shape."""
         usage = payload.get("usage") if isinstance(payload, dict) else None
 
-        def _int(value: Any) -> int:
-            try:
-                return max(int(value), 0)
-            except (TypeError, ValueError):
-                return 0
-
         if isinstance(usage, dict):
             details = usage.get(details_key)
-            cached = _int(details.get("cached_tokens")) if isinstance(details, dict) else 0
+            cached = usage_int(details.get("cached_tokens")) if isinstance(details, dict) else 0
             entry = (
                 id(payload),
                 payload,
-                _int(usage.get(input_key)),
-                _int(usage.get(output_key)),
+                usage_int(usage.get(input_key)),
+                usage_int(usage.get(output_key)),
                 cached,
             )
         else:
@@ -580,13 +579,6 @@ def _is_allowed_websocket_origin(headers: dict[str, str]) -> bool:
     return normalized_origin in normalized_allowed
 
 
-def _usage_int(value: Any) -> int:
-    try:
-        return max(int(value), 0)
-    except (TypeError, ValueError):
-        return 0
-
-
 def _passthrough_usage_from_json(payload: Any, provider: str | None = None) -> dict[str, int]:
     """Normalize usage from pass-through provider response shapes."""
     if not isinstance(payload, dict):
@@ -595,9 +587,9 @@ def _passthrough_usage_from_json(payload: Any, provider: str | None = None) -> d
     usage_meta = payload.get("usageMetadata")
     if isinstance(usage_meta, dict):
         return {
-            "input_tokens": _usage_int(usage_meta.get("promptTokenCount")),
+            "input_tokens": usage_int(usage_meta.get("promptTokenCount")),
             "output_tokens": gemini_output_tokens(usage_meta),
-            "cache_read_input_tokens": _usage_int(usage_meta.get("cachedContentTokenCount")),
+            "cache_read_input_tokens": usage_int(usage_meta.get("cachedContentTokenCount")),
         }
 
     usage = payload.get("usage")
@@ -615,10 +607,10 @@ def _passthrough_usage_from_json(payload: Any, provider: str | None = None) -> d
             # the uncached tail only (cache buckets are disjoint); OpenAI's
             # headline figure is already inclusive. Callers derive uncached as
             # total - read - write, which is only right on the total.
-            "input_tokens": billed_input_from_usage(usage, provider) or _usage_int(input_tokens),
-            "output_tokens": _usage_int(output_tokens),
-            "cache_read_input_tokens": _usage_int(usage.get("cache_read_input_tokens", cache_read)),
-            "cache_creation_input_tokens": _usage_int(usage.get("cache_creation_input_tokens")),
+            "input_tokens": billed_input_from_usage(usage, provider) or usage_int(input_tokens),
+            "output_tokens": usage_int(output_tokens),
+            "cache_read_input_tokens": usage_int(usage.get("cache_read_input_tokens", cache_read)),
+            "cache_creation_input_tokens": usage_int(usage.get("cache_creation_input_tokens")),
         }
 
     return {}
@@ -779,27 +771,6 @@ def _codex_compression_debug_enabled() -> bool:
     return _log_codex_compression_debug is not _CODEX_COMPRESSION_DEBUG_NOOP
 
 
-def _json_shape(value: str) -> dict[str, Any]:
-    try:
-        parsed = json.loads(value)
-    except Exception as exc:
-        return {"is_json": False, "error": type(exc).__name__}
-    if isinstance(parsed, dict):
-        return {
-            "is_json": True,
-            "kind": "object",
-            "keys": list(parsed.keys()),
-            "length": len(parsed),
-        }
-    if isinstance(parsed, list):
-        return {"is_json": True, "kind": "array", "length": len(parsed)}
-    return {"is_json": True, "kind": type(parsed).__name__}
-
-
-def _routing_log_debug(_router_result: Any) -> list[dict[str, Any]]:
-    return []
-
-
 _OPENAI_TOOL_SCHEMA_DROP_KEYS = {
     "$id",
     "$schema",
@@ -842,7 +813,6 @@ def _shape_openai_responses_payload(
     must not be able to break request forwarding.
     """
     try:
-        from headroom.proxy import runtime_env
         from headroom.proxy.output_savings import (
             assign_arm,
             conversation_key_from_responses_body,
@@ -853,6 +823,7 @@ def _shape_openai_responses_payload(
         from headroom.proxy.output_shaper import (
             OutputShaperSettings,
             classify_responses_turn,
+            output_holdout_fraction,
             resolve_verbosity_level,
             shape_responses_request,
         )
@@ -861,10 +832,7 @@ def _shape_openai_responses_payload(
         if not settings.enabled:
             return [], False
 
-        try:
-            holdout = float(runtime_env.getenv("HEADROOM_OUTPUT_HOLDOUT", "0") or "0")
-        except ValueError:
-            holdout = 0.0
+        holdout = output_holdout_fraction()
         conversation = conversation_key_from_responses_body(payload)
         arm = assign_arm(conversation, holdout)
 
@@ -898,16 +866,6 @@ def _shape_openai_responses_payload(
     except Exception:  # pragma: no cover - defensive; never break forwarding
         logger.warning("[%s] OutputShaper(responses) failed; skipping", request_id, exc_info=True)
         return [], False
-
-
-def _compact_openai_tool_schema_value(
-    value: Any,
-    _parent_key: str | None = None,
-) -> Any:
-    # Delegate to shared compaction logic.
-    from headroom.proxy.tool_schema_compaction import compact_tool_schema_value
-
-    return compact_tool_schema_value(value, _parent_key)
 
 
 def _compact_openai_responses_tools(
@@ -1113,38 +1071,6 @@ def _ensure_chatgpt_responses_store_false(
     return False
 
 
-def _responses_input_item_text_bytes(item: Any) -> int:
-    if not isinstance(item, dict):
-        return _json_byte_len(item)
-
-    output = item.get("output")
-    if isinstance(output, str):
-        return len(output.encode("utf-8", errors="replace"))
-    if isinstance(output, list):
-        total = 0
-        for part in output:
-            if isinstance(part, str):
-                total += len(part.encode("utf-8", errors="replace"))
-            elif isinstance(part, dict) and isinstance(part.get("text"), str):
-                total += len(part["text"].encode("utf-8", errors="replace"))
-        if total > 0:
-            return total
-
-    content = item.get("content")
-    if isinstance(content, str):
-        return len(content.encode("utf-8", errors="replace"))
-    if isinstance(content, list):
-        total = 0
-        for part in content:
-            if isinstance(part, str):
-                total += len(part.encode("utf-8", errors="replace"))
-            elif isinstance(part, dict) and isinstance(part.get("text"), str):
-                total += len(part["text"].encode("utf-8", errors="replace"))
-        return total
-
-    return _json_byte_len(item)
-
-
 _RESPONSES_OUTPUT_ITEM_TYPES = frozenset(
     {
         "custom_tool_call_output",
@@ -1285,29 +1211,6 @@ def _responses_input_to_learner_messages(
     return messages
 
 
-def _has_headroom_retrieve_tool_responses(tools: Any) -> bool:
-    """Return True when the Responses API tool list includes CCR retrieve.
-
-    Responses API tool defs are flat (``{"type": "function", "name": ...}``)
-    rather than nested under a "function" key like chat-completions
-    tool_calls, so this can't reuse the chat-completions tool-list check.
-    Mirrors ``AnthropicHandler._has_headroom_retrieve_tool``.
-    """
-    from headroom.ccr import CCR_TOOL_NAME
-
-    if not isinstance(tools, list):
-        return False
-    for tool in tools:
-        if not isinstance(tool, dict):
-            continue
-        if tool.get("name") == CCR_TOOL_NAME:
-            return True
-        function = tool.get("function")
-        if isinstance(function, dict) and function.get("name") == CCR_TOOL_NAME:
-            return True
-    return False
-
-
 def _should_buffer_openai_responses_stream_ccr(
     *,
     stream: bool,
@@ -1329,7 +1232,7 @@ def _should_buffer_openai_responses_stream_ccr(
         and ccr_response_handler_enabled
         and not is_chatgpt_auth
         and not is_opencode_zen_base(upstream_base_url)
-        and _has_headroom_retrieve_tool_responses(tools)
+        and has_ccr_retrieve_tool(tools)
     )
 
 
@@ -1552,15 +1455,6 @@ def _openai_responses_from_sse(sse_text: str) -> dict[str, Any] | None:
     return completed
 
 
-def _output_shaping_holdout_fraction() -> float:
-    from headroom.proxy import runtime_env
-
-    try:
-        return float(runtime_env.getenv("HEADROOM_OUTPUT_HOLDOUT", "0") or "0")
-    except ValueError:
-        return 0.0
-
-
 def _shape_openai_responses_for_output(
     payload: dict[str, Any],
     *,
@@ -1580,6 +1474,7 @@ def _shape_openai_responses_for_output(
         OutputShaperSettings,
         ShapeResult,
         classify_openai_responses_input,
+        output_holdout_fraction,
         resolve_verbosity_level,
         shape_openai_responses_request,
     )
@@ -1591,7 +1486,7 @@ def _shape_openai_responses_for_output(
 
     assert result.labels is not None
     key = conversation_key or conversation_key_from_body(payload)
-    arm = assign_arm(key, _output_shaping_holdout_fraction())
+    arm = assign_arm(key, output_holdout_fraction())
     turn_kind = classify_openai_responses_input(payload.get("input")).value
     stratum = stratum_key(
         turn_kind=turn_kind,
@@ -1680,47 +1575,6 @@ def _shape_openai_response_create_frame(
         parsed["response"] = payload
         return json.dumps(parsed), True, labels, None
     return json.dumps(payload), True, labels, None
-
-
-def _openai_responses_context_budget(payload: dict[str, Any]) -> dict[str, Any]:
-    payload_bytes = _json_byte_len(payload)
-    buckets: dict[str, int] = {}
-    for key in ("instructions", "tools", "input", "messages", "client_metadata"):
-        if key in payload:
-            buckets[key] = _json_byte_len(payload.get(key))
-
-    other_bytes = max(payload_bytes - sum(buckets.values()), 0)
-    if other_bytes:
-        buckets["other"] = other_bytes
-
-    input_breakdown: dict[str, dict[str, int]] = {}
-    items = payload.get("input") or payload.get("messages")
-    if isinstance(items, list):
-        for item in items:
-            item_type = item.get("type", "unknown") if isinstance(item, dict) else "non_dict"
-            row = input_breakdown.setdefault(
-                str(item_type),
-                {"items": 0, "bytes": 0, "text_bytes": 0},
-            )
-            row["items"] += 1
-            row["bytes"] += _json_byte_len(item)
-            row["text_bytes"] += _responses_input_item_text_bytes(item)
-
-    return {
-        "payload_bytes": payload_bytes,
-        "buckets": {
-            key: {
-                "bytes": value,
-                "pct": (value / payload_bytes * 100.0) if payload_bytes else 0.0,
-            }
-            for key, value in sorted(
-                buckets.items(),
-                key=lambda item: item[1],
-                reverse=True,
-            )
-        },
-        "input_breakdown": input_breakdown,
-    }
 
 
 # Interactive Responses turns are latency-sensitive. Fail open quickly rather
@@ -1831,16 +1685,10 @@ def _extract_responses_usage(event: dict[str, Any]) -> tuple[int, int, int, int,
     if not isinstance(usage, dict):
         return 0, 0, 0, 0, 0
 
-    def _int(value: Any) -> int:
-        try:
-            return max(int(value), 0)
-        except (TypeError, ValueError):
-            return 0
-
-    input_tokens = _int(usage.get("input_tokens"))
-    output_tokens = _int(usage.get("output_tokens"))
+    input_tokens = usage_int(usage.get("input_tokens"))
+    output_tokens = usage_int(usage.get("output_tokens"))
     details = usage.get("input_tokens_details")
-    cached_tokens = _int(details.get("cached_tokens")) if isinstance(details, dict) else 0
+    cached_tokens = usage_int(details.get("cached_tokens")) if isinstance(details, dict) else 0
     cache_write_tokens = _infer_openai_cache_write_tokens(input_tokens, cached_tokens)
     uncached_tokens = max(input_tokens - cached_tokens, 0)
     return input_tokens, output_tokens, cached_tokens, cache_write_tokens, uncached_tokens
@@ -2117,22 +1965,14 @@ class OpenAIHandlerMixin:
         *,
         frozen_message_count: int,
     ) -> tuple[list[dict[str, Any]], int]:
-        """Force frozen prefix bytes to match original request exactly."""
-        if frozen_message_count <= 0 or not original_messages:
-            return candidate_messages, 0
+        """Force frozen prefix bytes to match the original request exactly."""
+        from headroom.cache.prefix_tracker import restore_frozen_prefix
 
-        frozen = min(frozen_message_count, len(original_messages))
-        restored = list(candidate_messages)
-
-        if len(restored) < frozen:
-            return list(original_messages[:frozen]) + restored, frozen
-
-        changed = 0
-        for idx in range(frozen):
-            if restored[idx] != original_messages[idx]:
-                restored[idx] = original_messages[idx]
-                changed += 1
-        return restored, changed
+        return restore_frozen_prefix(
+            original_messages,
+            candidate_messages,
+            frozen_message_count=frozen_message_count,
+        )
 
     def _compress_openai_responses_live_text_units_with_router(
         self,
@@ -2140,7 +1980,6 @@ class OpenAIHandlerMixin:
         *,
         model: str,
         request_id: str,
-        pass_id: str | None = None,
         timing: dict[str, float] | None = None,
         deadline_started_at: float | None = None,
     ) -> tuple[dict[str, Any], bool, int, list[str], dict[str, int], list[str], int]:
@@ -2153,18 +1992,6 @@ class OpenAIHandlerMixin:
         items such as reasoning, compaction, tool calls, and non-string outputs
         are intentionally not exposed as text units.
         """
-
-        debug_enabled = _codex_compression_debug_enabled()
-
-        def _log(_event: str, **_fields: Any) -> None:
-            if debug_enabled:
-                _log_codex_compression_debug(
-                    _event,
-                    request_id=request_id,
-                    pass_id=pass_id,
-                    model=model,
-                    **_fields,
-                )
 
         input_items = payload.get("input")
         messages_items = payload.get("messages")
@@ -2410,7 +2237,6 @@ class OpenAIHandlerMixin:
         # (item_index, slot_ref, folded_text, original_text). Spliced after the
         # normal candidate compression — no ML, byte/data-lossless only.
         lossless_excluded: list[tuple[int, tuple[str, int | None], str, str]] = []
-        extraction_debug: list[dict[str, Any]] = []
         last_user_item_idx = max(
             (
                 idx
@@ -2423,65 +2249,20 @@ class OpenAIHandlerMixin:
         )
         for idx, item in enumerate(items):
             if not isinstance(item, dict):
-                if debug_enabled:
-                    extraction_debug.append(
-                        {
-                            "index": idx,
-                            "eligible": False,
-                            "reason": "item_not_dict",
-                            "item_type": type(item).__name__,
-                            "item": item,
-                        }
-                    )
                 continue
             item_type = item.get("type")
             if item_type in self.OPENAI_RESPONSES_OUTPUT_TYPES:
                 call_id = item.get("call_id")
                 if isinstance(call_id, str) and call_id in headroom_retrieve_call_ids:
-                    if debug_enabled:
-                        extraction_debug.append(
-                            {
-                                "index": idx,
-                                "eligible": False,
-                                "reason": "headroom_retrieve_output_protected",
-                                "item_type": item_type,
-                                "call_id": call_id,
-                                "item": item,
-                            }
-                        )
                     continue
                 if isinstance(call_id, str) and call_id in read_command_by_call_id:
                     # Finalize by CONTENT (same gate as ContentRouter.apply):
                     # protect unless the output is confidently non-code DATA.
                     if _read_output_should_be_protected(_responses_part_text(item.get("output"))):
                         read_protected_call_ids.add(call_id)
-                        if debug_enabled:
-                            extraction_debug.append(
-                                {
-                                    "index": idx,
-                                    "eligible": False,
-                                    "reason": "read_command_protected",
-                                    "item_type": item_type,
-                                    "call_id": call_id,
-                                    "command": read_command_by_call_id[call_id],
-                                    "item": item,
-                                }
-                            )
                         continue
                 if isinstance(call_id, str) and call_id in excluded_call_ids:
                     if call_id in verbatim_excluded_call_ids:
-                        if debug_enabled:
-                            extraction_debug.append(
-                                {
-                                    "index": idx,
-                                    "eligible": False,
-                                    "reason": "exclude_tools_verbatim",
-                                    "item_type": item_type,
-                                    "call_id": call_id,
-                                    "tool_name": function_name_by_call_id.get(call_id),
-                                    "item": item,
-                                }
-                            )
                         continue
                     # Protected from lossy compression — but grep/log/json output
                     # can still be losslessly compacted. Reuse the router helper
@@ -2492,10 +2273,9 @@ class OpenAIHandlerMixin:
                     # A file read skips the fold entirely: this is the Codex wire,
                     # where `read` really does return raw file bytes, so a fold here
                     # is exactly what breaks the next `Edit(old_string=…)`.
-                    excluded_folded = False
                     raw_output = item.get("output")
                     if call_id in byte_exact_call_ids:
-                        pass  # byte-exact: no fold, fall through to the debug record
+                        pass  # byte-exact: no fold
                     elif isinstance(raw_output, list):
                         for pidx, part in enumerate(raw_output):
                             if (
@@ -2506,7 +2286,6 @@ class OpenAIHandlerMixin:
                                 part_text = part["text"]
                                 pf = router._lossless_compact_excluded(part_text)
                                 if pf is not None:
-                                    excluded_folded = True
                                     lossless_excluded.append(
                                         (idx, ("output_part", pidx), pf[0], part_text)
                                     )
@@ -2514,128 +2293,20 @@ class OpenAIHandlerMixin:
                         excl_out = _responses_part_text(raw_output)
                         fold = router._lossless_compact_excluded(excl_out) if excl_out else None
                         if fold is not None:
-                            excluded_folded = True
                             lossless_excluded.append((idx, ("output", None), fold[0], excl_out))
-                    if debug_enabled:
-                        extraction_debug.append(
-                            {
-                                "index": idx,
-                                "eligible": False,
-                                "reason": (
-                                    "exclude_tools_lossless_fold"
-                                    if excluded_folded
-                                    else "exclude_tools_protected"
-                                ),
-                                "item_type": item_type,
-                                "call_id": call_id,
-                                "tool_name": function_name_by_call_id.get(call_id),
-                                "item": item,
-                            }
-                        )
-                    continue
-                slots = _slot_texts(item)
-                if slots:
-                    for text, slot_ref in slots:
-                        candidates.append((idx, slot_ref, text))
-                        if debug_enabled:
-                            extraction_debug.append(
-                                {
-                                    "index": idx,
-                                    "eligible": True,
-                                    "item_type": item_type,
-                                    "role": item.get("role"),
-                                    "slot": slot_ref,
-                                    "text_chars": len(text),
-                                    "text_bytes": len(text.encode("utf-8", errors="replace")),
-                                    "text_json_shape": _json_shape(text),
-                                    "item": item,
-                                    "text": text,
-                                }
-                            )
-                else:
-                    if debug_enabled:
-                        extraction_debug.append(
-                            {
-                                "index": idx,
-                                "eligible": False,
-                                "reason": "output_type_without_text_slot",
-                                "item_type": item_type,
-                                "item": item,
-                            }
-                        )
-            elif item_type == "message":
-                if item.get("role") == "user" and idx == last_user_item_idx:
-                    if debug_enabled:
-                        extraction_debug.append(
-                            {
-                                "index": idx,
-                                "eligible": False,
-                                "reason": "current_user_message_protected",
-                                "item_type": item_type,
-                                "role": item.get("role"),
-                                "item": item,
-                            }
-                        )
                     continue
                 slots = _slot_texts(item)
                 for text, slot_ref in slots:
                     candidates.append((idx, slot_ref, text))
-                    if debug_enabled:
-                        extraction_debug.append(
-                            {
-                                "index": idx,
-                                "eligible": True,
-                                "item_type": item_type,
-                                "role": item.get("role"),
-                                "slot": slot_ref,
-                                "text_chars": len(text),
-                                "text_bytes": len(text.encode("utf-8", errors="replace")),
-                                "text_json_shape": _json_shape(text),
-                                "item": item,
-                                "text": text,
-                            }
-                        )
-                if not slots and debug_enabled:
-                    extraction_debug.append(
-                        {
-                            "index": idx,
-                            "eligible": False,
-                            "reason": "supported_type_without_text_slot",
-                            "item_type": item_type,
-                            "item": item,
-                        }
-                    )
-            else:
-                if debug_enabled:
-                    extraction_debug.append(
-                        {
-                            "index": idx,
-                            "eligible": False,
-                            "reason": "unsupported_item_type",
-                            "item_type": item_type,
-                            "role": item.get("role"),
-                            "item": item,
-                        }
-                    )
+            elif item_type == "message":
+                if item.get("role") == "user" and idx == last_user_item_idx:
+                    continue
+                slots = _slot_texts(item)
+                for text, slot_ref in slots:
+                    candidates.append((idx, slot_ref, text))
 
         _add_timing("compression_live_unit_extraction", extraction_started)
-        _log(
-            "codex_compression_extraction",
-            item_count=len(items),
-            candidate_count=len(candidates),
-            payload=payload,
-            extraction=extraction_debug,
-        )
         if not candidates and not lossless_excluded:
-            _log(
-                "codex_compression_payload_result",
-                modified=False,
-                reason="no_candidates",
-                tokens_saved_total=0,
-                transforms=[],
-                input_payload=payload,
-                output_payload=payload,
-            )
             return payload, False, 0, [], {}, [], 0
 
         deepcopy_started = time.perf_counter()
@@ -2664,7 +2335,6 @@ class OpenAIHandlerMixin:
         routed_units: list[RoutedCompressionUnit] = []
 
         unit_build_started = time.perf_counter()
-        unit_debug: list[dict[str, Any]] = []
         for item_idx, slot_ref, original_text in candidates:
             item = items[item_idx] if item_idx < len(items) else {}
             item_type = item.get("type", "unknown") if isinstance(item, dict) else "unknown"
@@ -2691,34 +2361,10 @@ class OpenAIHandlerMixin:
                 metadata=metadata,
             )
             routed_units.append(RoutedCompressionUnit(unit=unit, slot=(item_idx, slot_ref)))
-            if debug_enabled:
-                unit_debug.append(
-                    {
-                        "item_index": item_idx,
-                        "slot": slot_ref,
-                        "provider": unit.provider,
-                        "endpoint": unit.endpoint,
-                        "role": unit.role,
-                        "item_type": unit.item_type,
-                        "cache_zone": unit.cache_zone,
-                        "mutable": unit.mutable,
-                        "min_bytes": unit.min_bytes,
-                        "text_chars": len(unit.text),
-                        "text_bytes": len(unit.text.encode("utf-8", errors="replace")),
-                        "text_json_shape": _json_shape(unit.text),
-                        "text": unit.text,
-                    }
-                )
         _add_timing("compression_unit_build", unit_build_started)
 
-        _log(
-            "codex_compression_units",
-            units=unit_debug,
-        )
-
-        # Tally per-category counts as units stream in so the pass_summary
-        # event below can emit a one-line breakdown — log readers shouldn't
-        # have to re-aggregate from scattered unit_result events.
+        # Per-category unit counts and the union of strategy chains, returned
+        # to the caller with the compressed payload.
         units_by_category: dict[str, int] = {}
         strategy_chain_union: list[str] = []
 
@@ -2939,33 +2585,6 @@ class OpenAIHandlerMixin:
             # role-protected, or in a frozen cache_zone don't count.
             if result.router_result is not None or result.modified:
                 attempted_input_tokens += result.tokens_before
-            if debug_enabled:
-                _log(
-                    "codex_compression_unit_result",
-                    item_index=item_idx,
-                    slot=slot_ref,
-                    modified=result.modified,
-                    reason=result.reason,
-                    reason_category=cat,
-                    text_bytes=result.text_bytes,
-                    min_bytes=result.min_bytes,
-                    strategy=result.strategy,
-                    strategy_chain=router_chain,
-                    tokens_before=result.tokens_before,
-                    tokens_after=result.tokens_after,
-                    tokens_saved=result.tokens_saved,
-                    transforms_applied=result.transforms_applied,
-                    router_strategy=(
-                        result.router_result.strategy_used.value if result.router_result else None
-                    ),
-                    router_summary=result.router_result.summary() if result.router_result else None,
-                    router_routing_log=_routing_log_debug(result.router_result),
-                    router_cache_hit=(
-                        result.router_result.cache_hit if result.router_result else False
-                    ),
-                    original=result.original,
-                    compressed=result.compressed,
-                )
             if not result.modified:
                 continue
 
@@ -3017,17 +2636,6 @@ class OpenAIHandlerMixin:
                 if "router:responses_cross_turn_dedup" not in transforms:
                     transforms.append("router:responses_cross_turn_dedup")
 
-        _log(
-            "codex_compression_payload_result",
-            modified=modified,
-            tokens_saved_total=tokens_saved_total,
-            attempted_input_tokens=attempted_input_tokens,
-            transforms=transforms,
-            units_by_category=units_by_category,
-            strategy_chain=strategy_chain_union,
-            input_payload=payload,
-            output_payload=updated if modified else payload,
-        )
         return (
             updated,
             modified,
@@ -3067,33 +2675,6 @@ class OpenAIHandlerMixin:
         input_serialization_started = time.perf_counter()
         input_bytes = json.dumps(payload).encode("utf-8")
         _add_timing("compression_input_json_dump", input_serialization_started)
-        # Codex/Responses requests can re-enter this method many times per
-        # request_id (one per turn over the same websocket). Tag every
-        # event in this single pass with a content-derived id so dashboards
-        # can attribute each unit_result to its originating pass.
-        # Aggregation note: per-pass `tokens_saved` SHOULD sum across
-        # passes — every pass independently avoided sending those tokens
-        # upstream, regardless of any prefix cache the upstream applies.
-        # Identical pass_ids within one request_id indicate idempotent
-        # retries on the same input bytes and are the only thing that
-        # should be deduped.
-        debug_enabled = _codex_compression_debug_enabled()
-        pass_id = hashlib.sha256(input_bytes).hexdigest()[:12] if debug_enabled else None
-        input_context_budget: dict[str, Any] | None = None
-        if debug_enabled:
-            input_context_budget = _openai_responses_context_budget(payload)
-            _log_codex_compression_debug(
-                "codex_compression_payload_input",
-                request_id=request_id,
-                pass_id=pass_id,
-                model=model,
-                input_bytes=len(input_bytes),
-                context_budget=input_context_budget,
-                input_top_level_keys=list(payload.keys()),
-                input_field_type=type(payload.get("input")).__name__,
-                messages_field_type=type(payload.get("messages")).__name__,
-                payload=payload,
-            )
         working = payload
         modified = False
         tokens_saved = 0
@@ -3124,17 +2705,6 @@ class OpenAIHandlerMixin:
                     "[%s] tool schema compaction token count failed; savings not counted: %s",
                     request_id,
                     describe_exception(e),
-                )
-            if debug_enabled:
-                _log_codex_compression_debug(
-                    "codex_tool_schema_compaction",
-                    request_id=request_id,
-                    pass_id=pass_id,
-                    model=model,
-                    modified=True,
-                    tools_bytes_before=tools_before_bytes,
-                    tools_bytes_after=tools_after_bytes,
-                    tools_bytes_saved=tools_before_bytes - tools_after_bytes,
                 )
 
         # Layer 2: Tool description truncation (opt-in via
@@ -3168,17 +2738,6 @@ class OpenAIHandlerMixin:
                             "[%s] tool desc compaction token count failed; savings not counted: %s",
                             request_id,
                             describe_exception(e),
-                        )
-                    if debug_enabled:
-                        _log_codex_compression_debug(
-                            "codex_tool_desc_compaction",
-                            request_id=request_id,
-                            pass_id=pass_id,
-                            model=model,
-                            modified=True,
-                            tools_bytes_before=desc_before,
-                            tools_bytes_after=desc_after,
-                            tools_bytes_saved=desc_before - desc_after,
                         )
         except Exception as e:
             # Tool schemas are client content: log the failure, never its message.
@@ -3328,7 +2887,6 @@ class OpenAIHandlerMixin:
             working,
             model=model,
             request_id=request_id,
-            pass_id=pass_id,
             timing=timing_sink,
             deadline_started_at=deadline_started_at,
         )
@@ -3378,66 +2936,6 @@ class OpenAIHandlerMixin:
         output_serialization_started = time.perf_counter()
         output_bytes = json.dumps(working).encode("utf-8")
         _add_timing("compression_output_json_dump", output_serialization_started)
-        output_context_budget = _openai_responses_context_budget(working) if debug_enabled else None
-        # One-line summary at INFO — the single event a human reading
-        # logs should scan first to understand "what happened on this
-        # pass". All the verbose per-event debug data stays available
-        # but at DEBUG level. Contains: byte totals, savings, the
-        # strategy chain we walked, unit-outcome counts by category,
-        # and the transforms applied.
-        savings_pct = (
-            (1.0 - len(output_bytes) / len(input_bytes)) * 100.0 if len(input_bytes) else 0.0
-        )
-        # Active-compression ratio: savings as a fraction of what we
-        # *attempted* to compress, not of the whole request. The whole-
-        # request ratio is in `savings_pct`; this one is the metric the
-        # dashboard should display (otherwise frozen prefix bytes drown
-        # the wins from the compressible tail).
-        #
-        # Math note: `attempted_input_tokens` is the pre-compression
-        # size of the eligible content (sum of unit.tokens_before +
-        # original tool schema). `tokens_saved` is what we removed
-        # from it. So the savings rate is plain `saved / attempted` —
-        # NOT `saved / (attempted + saved)`, which would double-count.
-        attempted_pct = (
-            (tokens_saved / attempted_input_tokens) * 100.0 if attempted_input_tokens > 0 else 0.0
-        )
-        if debug_enabled:
-            _log_codex_compression_debug(
-                "codex_compression_pass_summary",
-                request_id=request_id,
-                pass_id=pass_id,
-                model=model,
-                modified=modified,
-                reason=reason,
-                input_bytes=len(input_bytes),
-                output_bytes=len(output_bytes),
-                bytes_saved=len(input_bytes) - len(output_bytes),
-                savings_pct=round(savings_pct, 2),
-                tokens_saved=tokens_saved,
-                attempted_input_tokens=attempted_input_tokens,
-                attempted_pct=round(attempted_pct, 2),
-                strategy_chain=strategy_chain,
-                units_by_category=units_by_category,
-                transforms=deduped,
-            )
-            _log_codex_compression_debug(
-                "codex_compression_payload_output",
-                request_id=request_id,
-                pass_id=pass_id,
-                model=model,
-                modified=modified,
-                reason=reason,
-                tokens_saved=tokens_saved,
-                attempted_input_tokens=attempted_input_tokens,
-                transforms=deduped,
-                input_bytes=len(input_bytes),
-                output_bytes=len(output_bytes),
-                context_budget_before=input_context_budget,
-                context_budget_after=output_context_budget,
-                input_payload=payload,
-                output_payload=working,
-            )
         return (
             working,
             modified,
@@ -4956,7 +4454,6 @@ class OpenAIHandlerMixin:
         # Mutating `body` in place is sufficient here — the outbound request
         # serializes `body` fresh, so no body-mutation tracker is needed.
         if not _bypass:
-            from headroom.proxy import runtime_env
             from headroom.proxy.output_savings import (
                 assign_arm,
                 conversation_key_from_body,
@@ -4967,6 +4464,7 @@ class OpenAIHandlerMixin:
             from headroom.proxy.output_shaper import (
                 OutputShaperSettings,
                 classify_turn,
+                output_holdout_fraction,
                 resolve_verbosity_level,
                 shape_openai_chat_request,
             )
@@ -4980,13 +4478,8 @@ class OpenAIHandlerMixin:
                 # or control, which keeps the A/B comparison clean and the
                 # provider prefix cache stable (the steering block never flips
                 # mid-conversation).
-                _holdout = 0.0
-                try:
-                    _holdout = float(runtime_env.getenv("HEADROOM_OUTPUT_HOLDOUT", "0") or "0")
-                except ValueError:
-                    _holdout = 0.0
                 _conversation = conversation_key_from_body(body)
-                _arm = assign_arm(_conversation, _holdout)
+                _arm = assign_arm(_conversation, output_holdout_fraction())
                 _turn_kind = classify_turn(body.get("messages", [])).value
                 _stratum = stratum_key(
                     turn_kind=_turn_kind,
@@ -5226,12 +4719,12 @@ class OpenAIHandlerMixin:
                     # absent; a present-but-null count (some OpenAI-compatible
                     # backends emit these on a stopped/empty turn) would return
                     # None and crash the downstream `max(...)` arithmetic and the
-                    # int-typed outcome/metrics. `_usage_int` coerces both cases,
+                    # int-typed outcome/metrics. `usage_int` coerces both cases,
                     # matching the streaming path and the guarded cache keys below
                     # (same class as the gemini fix in #2347).
-                    output_tokens = _usage_int(usage.get("completion_tokens"))
+                    output_tokens = usage_int(usage.get("completion_tokens"))
                     _thinking = extract_from_usage(usage)
-                    total_input_tokens = _usage_int(usage.get("prompt_tokens")) or optimized_tokens
+                    total_input_tokens = usage_int(usage.get("prompt_tokens")) or optimized_tokens
 
                     # Cache stats: prefer the Anthropic/Bedrock top-level
                     # keys when present (authoritative). Fall back to
@@ -5737,13 +5230,13 @@ class OpenAIHandlerMixin:
                     # outside this try, so a null `prompt_tokens`/`cached_tokens`
                     # would otherwise raise an uncaught TypeError and 500 the
                     # request (same class as the gemini fix in #2347).
-                    total_input_tokens = _usage_int(usage.get("prompt_tokens")) or optimized_tokens
-                    output_tokens = _usage_int(usage.get("completion_tokens"))
+                    total_input_tokens = usage_int(usage.get("prompt_tokens")) or optimized_tokens
+                    output_tokens = usage_int(usage.get("completion_tokens"))
                     _thinking = extract_from_usage(usage)
                     # OpenAI returns cached_tokens in prompt_tokens_details
                     # These are charged at 50% of the input price
                     prompt_details = usage.get("prompt_tokens_details") or {}
-                    cache_read_tokens = _usage_int(prompt_details.get("cached_tokens"))
+                    cache_read_tokens = usage_int(prompt_details.get("cached_tokens"))
                 except (KeyError, TypeError, AttributeError) as e:
                     logger.debug(
                         f"[{request_id}] Failed to extract cached tokens from OpenAI response: {e}"
@@ -7021,21 +6514,15 @@ class OpenAIHandlerMixin:
                         resp_json = response.json()
                         usage = resp_json.get("usage", {})
 
-                        def _usage_int(value: Any, default: int = 0) -> int:
-                            try:
-                                return max(int(value), 0)
-                            except (TypeError, ValueError):
-                                return default
-
-                        total_input_tokens = _usage_int(
+                        total_input_tokens = usage_int(
                             usage.get("input_tokens"),
                             original_tokens,
                         )
-                        output_tokens = _usage_int(usage.get("output_tokens"))
+                        output_tokens = usage_int(usage.get("output_tokens"))
                         _thinking = extract_from_usage(usage)
                         details = usage.get("input_tokens_details")
                         if isinstance(details, dict):
-                            cache_read_tokens = _usage_int(details.get("cached_tokens"))
+                            cache_read_tokens = usage_int(details.get("cached_tokens"))
                     except (
                         json.JSONDecodeError,
                         ValueError,

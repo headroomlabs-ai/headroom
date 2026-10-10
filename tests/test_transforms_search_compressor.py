@@ -5,21 +5,20 @@ from types import SimpleNamespace
 import pytest
 
 from headroom.transforms.search_compressor import (
-    FileMatches,
     SearchCompressionResult,
     SearchCompressor,
     SearchCompressorConfig,
-    SearchMatch,
 )
 
 
-def test_parse_score_select_and_format_search_results(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_compress_scores_caps_and_summarizes_search_results() -> None:
     compressor = SearchCompressor(
         SearchCompressorConfig(
             max_matches_per_file=3,
             max_total_matches=4,
             max_files=2,
             context_keywords=["auth"],
+            enable_ccr=False,
         )
     )
     content = "\n".join(
@@ -27,45 +26,21 @@ def test_parse_score_select_and_format_search_results(monkeypatch: pytest.Monkey
             "src/auth.py:10:ERROR auth failed",
             "src/auth.py-11-warning auth retry",
             "src/auth.py:12:plain auth line",
+            "src/auth.py:13:another auth line",
             "src/db.py:2:warning token expired",
             "not a match",
         ]
     )
-    parsed = compressor._parse_search_results(content)
-    assert set(parsed) == {"src/auth.py", "src/db.py"}
-    assert parsed["src/auth.py"].first == SearchMatch(
-        file="src/auth.py", line_number=10, content="ERROR auth failed"
-    )
-    assert parsed["src/auth.py"].last.line_number == 12
+    result = compressor.compress(content, context="find auth error")
 
-    compressor._score_matches(parsed, "find auth error")
-    assert parsed["src/auth.py"].matches[0].score == 1.0
-    assert parsed["src/db.py"].matches[0].score > 0
-
-    monkeypatch.setitem(
-        __import__("sys").modules,
-        "headroom.transforms.adaptive_sizer",
-        SimpleNamespace(compute_optimal_k=lambda items, **kwargs: 4),
-    )
-    selected = compressor._select_matches(parsed, bias=1.2)
-    assert list(selected) == ["src/auth.py", "src/db.py"]
-    assert [m.line_number for m in selected["src/auth.py"].matches] == [10, 11, 12]
-
-    formatted, summaries = compressor._format_output(
-        selected,
-        {
-            **parsed,
-            "src/db.py": FileMatches(
-                file="src/db.py",
-                matches=[
-                    SearchMatch(file="src/db.py", line_number=2, content="warning token expired"),
-                    SearchMatch(file="src/db.py", line_number=3, content="another line"),
-                ],
-            ),
-        },
-    )
-    assert "src/auth.py:10:ERROR auth failed" in formatted
-    assert summaries["src/db.py"] == "[... and 1 more matches in src/db.py]"
+    # "not a match" is not a search row; both files are parsed.
+    assert result.original_match_count == 5
+    assert result.files_affected == 2
+    # The error line ranks first and is kept; auth.py is capped at 3 matches.
+    assert "src/auth.py:10:ERROR auth failed" in result.compressed
+    assert "src/db.py:2:warning token expired" in result.compressed
+    assert result.summaries == {"src/auth.py": "[... and 1 more matches in src/auth.py]"}
+    assert "[... and 1 more matches in src/auth.py]" in result.compressed
 
 
 def test_search_compressor_compress_paths_and_ccr() -> None:
