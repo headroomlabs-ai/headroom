@@ -115,7 +115,11 @@ fallback applies if the encoder is unavailable. Prose has no structural item
 count, so Kompress leaves `original_item_count` and `compressed_item_count` at
 zero. Retrieval-marker word counts remain explicitly labelled as words.
 TOIN also receives zero structural counts for prose and learns token reduction
-from the token fields. Item-limit learning requires an observed item population;
+from the token fields. With no item population and a positive original-token
+count, its published compression ratio and rolling average use retained tokens
+divided by original tokens. Structured
+outputs continue to use their item ratio, including a measured zero when no
+items remain. Item-limit learning requires an observed item population;
 full-retrieval feedback can still recommend skipping compression.
 Previously persisted entries are not rewritten by this change.
 

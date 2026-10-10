@@ -666,6 +666,14 @@ class ToolIntelligenceNetwork:
             tenant_key = _get_current_tenant_key_or_default()
         key = _make_pattern_key(auth_mode, model_family, sig_hash, tenant_key)
 
+        # Prose has no item population; use retained tokens for its ratio.
+        if original_count > 0:
+            compression_ratio = compressed_count / original_count
+        elif original_tokens > 0:
+            compression_ratio = compressed_tokens / original_tokens
+        else:
+            compression_ratio = 0.0
+
         # LOW FIX #22: Emit compression metric
         self._emit_metric(
             "toin.compression",
@@ -679,7 +687,7 @@ class ToolIntelligenceNetwork:
                 "original_tokens": original_tokens,
                 "compressed_tokens": compressed_tokens,
                 "strategy": strategy,
-                "compression_ratio": compressed_count / original_count if original_count > 0 else 0,
+                "compression_ratio": compression_ratio,
             },
         )
 
@@ -703,7 +711,6 @@ class ToolIntelligenceNetwork:
 
             # Update rolling averages
             n = pattern.total_compressions
-            compression_ratio = compressed_count / original_count if original_count > 0 else 0.0
             token_reduction = (
                 1 - (compressed_tokens / original_tokens) if original_tokens > 0 else 0.0
             )
