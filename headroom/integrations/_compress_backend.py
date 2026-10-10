@@ -15,6 +15,7 @@ import logging
 import os
 from typing import Any
 
+from headroom.log_safety import redact_url, safe_id
 from headroom.offline import guard_egress
 
 _DEFAULT_CLOUD_URL = "https://api.headroomlabs.ai"
@@ -111,13 +112,18 @@ class CompressBackend:
         )
 
         if resp.status_code != 200:
-            # The response body can echo request content, so it is DEBUG-only.
+            # The response body can echo request content: log metadata only, at
+            # every level.
             self._log.warning(
                 "Headroom Cloud API error: HTTP %d from %s; request sent uncompressed",
                 resp.status_code,
-                self._api_url,
+                redact_url(self._api_url),
             )
-            self._log.debug("Headroom Cloud API error body: %s", resp.text[:200])
+            self._log.debug(
+                "Headroom Cloud API error response: content-type=%s, %d bytes",
+                safe_id(resp.headers.get("content-type", "")),
+                len(resp.content),
+            )
             return None
 
         result: dict[str, Any] = resp.json()

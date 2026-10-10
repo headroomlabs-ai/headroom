@@ -60,22 +60,47 @@ class _Records(logging.Handler):
         self.records.append(record)
 
 
-def test_cloud_error_warns_with_status_only(backend, monkeypatch: pytest.MonkeyPatch) -> None:
-    _serve(backend, lambda request: httpx.Response(503, text="echo: secret prompt text"))
+_PROMPT_CANARY = "PROMPT-CANARY-7f3e"
+_KEY_CANARY = "hdr_KEY-CANARY-91ab"
+_URL_CANARY = "URL-CANARY-c0de"
+
+
+@pytest.mark.parametrize("kind", ["asgi", "litellm"])
+@pytest.mark.parametrize("level", [logging.DEBUG, logging.WARNING])
+def test_cloud_error_logs_no_echoed_content_at_any_level(
+    kind: str, level: int, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An error response echoing the prompt must not put it, the key or URL
+    credentials in any formatted record, with DEBUG on or off."""
+    monkeypatch.delenv("HEADROOM_OFFLINE", raising=False)
+    monkeypatch.delenv("HEADROOM_DEBUG_DUMP", raising=False)
+    api_url = f"https://cloud.test/?token={_URL_CANARY}"
+    if kind == "asgi":
+        backend = CompressionMiddleware(app=None, api_key=_KEY_CANARY, api_url=api_url)
+    else:
+        backend = HeadroomCallback(api_key=_KEY_CANARY, api_url=api_url)
+    messages = [{"role": "user", "content": f"my secret is {_PROMPT_CANARY}"}]
+    echo = f"bad request: {json.dumps(messages)} key={_KEY_CANARY}"
+    _serve(backend, lambda request: httpx.Response(503, text=echo))
     # Attach to the module logger itself: proxy startup elsewhere in the suite can
     # stop headroom.* records from reaching pytest's root-level caplog handler.
     handler = _Records()
-    monkeypatch.setattr(backend._log, "level", logging.DEBUG)
+    monkeypatch.setattr(backend._log, "level", level)
     monkeypatch.setattr(backend._log, "disabled", False)
     backend._log.addHandler(handler)
     try:
-        assert asyncio.run(backend._cloud_compress(_MESSAGES, "gpt-4o")) is None
+        assert asyncio.run(backend._cloud_compress(messages, "gpt-4o")) is None
     finally:
         backend._log.removeHandler(handler)
 
-    by_level = {r.levelno: r.getMessage() for r in handler.records}
-    assert by_level[logging.WARNING] == (
-        "Headroom Cloud API error: HTTP 503 from https://cloud.test; request sent uncompressed"
-    )
-    assert "secret prompt text" not in by_level[logging.WARNING]
-    assert by_level[logging.DEBUG] == "Headroom Cloud API error body: echo: secret prompt text"
+    formatted = [logging.Formatter().format(r) for r in handler.records]
+    warnings = [r.getMessage() for r in handler.records if r.levelno == logging.WARNING]
+    assert warnings == [
+        "Headroom Cloud API error: HTTP 503 from https://cloud.test/?<redacted>; "
+        "request sent uncompressed"
+    ]
+    if level == logging.DEBUG:
+        assert any("content-type=" in line for line in formatted)
+    for line in formatted:
+        for canary in (_PROMPT_CANARY, _KEY_CANARY, _URL_CANARY):
+            assert canary not in line

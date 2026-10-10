@@ -28,7 +28,10 @@ def _import_callback() -> type:
     # Load the module files directly to avoid triggering headroom/integrations/__init__.py,
     # which pulls in langchain and the native .so extension. litellm_callback imports
     # _compress_backend by its dotted name, so register a file-loaded copy for that one
-    # import; with the name already in sys.modules, the parent package is not imported.
+    # import; with the name already in sys.modules, the integrations package is not
+    # imported. Both files still import the top-level headroom package and its
+    # stdlib-only helpers (headroom.offline, headroom.log_safety); the subprocess test
+    # below checks that neither langchain nor headroom._core is loaded.
     saved = sys.modules.get(_BACKEND)
     sys.modules[_BACKEND] = _load_file(_BACKEND, "_compress_backend.py")
     try:
@@ -98,13 +101,13 @@ class TestHeadroomCallbackClientLifecycle:
 
 
 def test_direct_load_does_not_import_the_integrations_package() -> None:
-    """The loader above must keep this file isolated from LangChain and the
-    integrations package; check it in a fresh interpreter."""
+    """The loader above must keep this file isolated from LangChain, the native
+    extension and the integrations package; check it in a fresh interpreter."""
     code = (
         "import importlib.util, sys\n"
         f"spec = importlib.util.spec_from_file_location('t', {str(Path(__file__))!r})\n"
         "mod = importlib.util.module_from_spec(spec); spec.loader.exec_module(mod)\n"
-        "bad = [m for m in sys.modules if m == 'headroom.integrations'"
+        "bad = [m for m in sys.modules if m in ('headroom.integrations', 'headroom._core')"
         " or m.startswith('langchain')]\n"
         "print(bad)\n"
     )
