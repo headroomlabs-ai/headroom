@@ -26,7 +26,31 @@ name to :data:`TOOL_SCHEMA_SAVINGS_TAGS` and every surface picks it up.
 from __future__ import annotations
 
 import copy
+import logging
 from typing import Any
+
+from headroom.log_safety import WarnOnce, describe_exception
+
+logger = logging.getLogger(__name__)
+
+# A failure that repeats on every request warns once per exception type; every
+# occurrence also goes to debug.
+_reconcile_warned = WarnOnce(32, "tool-schema reconcile failure types")
+
+
+def _log_reconcile_failure(exc: Exception, booked: int) -> None:
+    # The exception comes from tokenizing client tool schemas and can quote
+    # them, so it is described by type and code location only, at every level.
+    where = describe_exception(exc)
+    if _reconcile_warned.first(type(exc).__qualname__, logger):
+        logger.warning(
+            "tool-schema deferral reconcile failed (%s); credit left at %d booked tokens, "
+            "so /stats over-reports tool-search savings for this request. Please report "
+            "this as a bug.",
+            where,
+            booked,
+        )
+    logger.debug("tool-schema deferral reconcile failed; booked=%d: %s", booked, where)
 
 
 def without_deferral_flags(tools: object) -> object:
@@ -128,7 +152,8 @@ def reconcile_deferred_tokens(
         tags["tool_search_deferred_tools"] = len(kept)
         if isinstance(entry, dict):
             entry["tokens"] = max(0, int(entry.get("tokens") or 0) - released)
-    except Exception:  # accounting must never break a request
+    except Exception as exc:  # accounting must never break a request
+        _log_reconcile_failure(exc, booked)
         return
 
 

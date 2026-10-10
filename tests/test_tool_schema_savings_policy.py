@@ -140,3 +140,95 @@ def test_tool_schema_compaction_saves_real_tokens_not_just_bytes() -> None:
     assert tokens_saved == tool_before - tool_after
     assert original_tokens - optimized_tokens == tokens_saved
     assert headline_tokens_saved(tokens_saved, {}) == tokens_saved
+
+
+SCHEMA_CANARY = "PRIVATE-SCHEMA-CANARY-7f3a"
+
+
+def _capture_policy_logs(monkeypatch):
+    import logging
+
+    from headroom.log_safety import WarnOnce
+    from headroom.proxy import tool_schema_savings_policy as policy
+
+    records: list[logging.LogRecord] = []
+
+    class _Capture(logging.Handler):
+        def emit(self, record: logging.LogRecord) -> None:
+            records.append(record)
+
+    handler = _Capture(level=logging.DEBUG)
+    policy.logger.addHandler(handler)
+    old_level = policy.logger.level
+    policy.logger.setLevel(logging.DEBUG)
+    monkeypatch.setattr(
+        policy, "_reconcile_warned", WarnOnce(32, "test reconcile types"), raising=False
+    )
+    monkeypatch.delenv("HEADROOM_DEBUG_DUMP", raising=False)
+    return policy, records, handler, old_level
+
+
+def test_reconcile_failure_keeps_private_schema_out_of_every_log_record(monkeypatch) -> None:
+    import logging
+
+    policy, records, handler, old_level = _capture_policy_logs(monkeypatch)
+
+    tool = {"name": "Read", "defer_loading": True, "description": SCHEMA_CANARY}
+
+    def _tokenizer_echoes_schema(tools: object) -> int:
+        # A tokenizer error that quotes the schema it choked on.
+        raise ValueError(f"cannot tokenize {tools!r}")
+
+    tags = {"tool_search_deferred_tokens": 100}
+    booking = (100, {"Read": dict(tool)}, None)
+    try:
+        policy.reconcile_deferred_tokens(tags, booking, [dict(tool)], _tokenizer_echoes_schema)
+        policy.reconcile_deferred_tokens(tags, booking, [dict(tool)], _tokenizer_echoes_schema)
+    finally:
+        policy.logger.removeHandler(handler)
+        policy.logger.setLevel(old_level)
+
+    # The booked credit is left as it was.
+    assert tags["tool_search_deferred_tokens"] == 100
+
+    levels = [r.levelno for r in records]
+    assert levels.count(logging.WARNING) == 1, "warns once per exception type"
+    assert levels.count(logging.DEBUG) == 2, "every failure is recorded at debug"
+    formatter = logging.Formatter()
+    for record in records:
+        rendered = formatter.format(record)
+        assert SCHEMA_CANARY not in rendered
+        assert "ValueError" in rendered
+    assert "100 booked tokens" in records[0].getMessage()
+
+
+def test_reconcile_warns_again_for_a_new_exception_type(monkeypatch) -> None:
+    import logging
+
+    policy, records, handler, old_level = _capture_policy_logs(monkeypatch)
+    tool = {"name": "Read", "defer_loading": True, "description": "x"}
+    booking = (100, {"Read": dict(tool)}, None)
+
+    def _runtime(tools: object) -> int:
+        raise RuntimeError("boom")
+
+    def _value(tools: object) -> int:
+        raise ValueError("boom")
+
+    try:
+        # A healthy reconcile logs nothing.
+        policy.reconcile_deferred_tokens(
+            {"tool_search_deferred_tokens": 100}, booking, [dict(tool)], lambda t: 10
+        )
+        assert records == []
+        for counter in (_runtime, _runtime, _value):
+            policy.reconcile_deferred_tokens(
+                {"tool_search_deferred_tokens": 100}, booking, [dict(tool)], counter
+            )
+    finally:
+        policy.logger.removeHandler(handler)
+        policy.logger.setLevel(old_level)
+
+    warnings = [r.getMessage() for r in records if r.levelno == logging.WARNING]
+    assert len(warnings) == 2
+    assert "RuntimeError" in warnings[0] and "ValueError" in warnings[1]

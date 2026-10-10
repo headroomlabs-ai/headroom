@@ -86,6 +86,7 @@ from headroom.config import (
     ReadLifecycleConfig,
 )
 from headroom.dashboard import get_dashboard_html
+from headroom.log_safety import describe_exception, safe_id
 from headroom.observability import (
     LangfuseTracingConfig,
     OTelMetricsConfig,
@@ -3129,12 +3130,24 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
     # that construct the app without going through the `headroom` CLI entrypoint
     # (which already applies them before Click parsing). setdefault keeps
     # explicit env exports authoritative; fail-open so it never blocks startup.
+    # settings_store.load() already reports an unreadable or corrupt file; this
+    # catches anything else that goes wrong while applying it.
+    settings_file: object = "the saved settings file"
     try:
+        from headroom import paths as _hr_paths
         from headroom import settings_store
 
+        settings_file = _hr_paths.settings_path()
         settings_store.apply_to_environ(settings_store.load())
-    except Exception:  # noqa: BLE001 — settings load must never break startup
-        pass
+    except Exception as exc:  # noqa: BLE001 — settings load must never break startup
+        # Settings values can hold credentials, so the exception is described by
+        # type and code location only, never its message.
+        logger.warning(
+            "Could not apply saved settings from %s (%s); continuing with env and "
+            "defaults. Fix or remove that file and restart the proxy.",
+            settings_file,
+            describe_exception(exc),
+        )
 
     # Air-gap master switch. Propagate config.offline to the env so the
     # env-based egress predicates (telemetry, update check, license) all honor
@@ -4148,8 +4161,14 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
                     action="admin_request",
                     status_code=response.status_code,
                 )
-        except Exception:
-            logger.debug("admin audit emission failed", exc_info=True)
+        except Exception as exc:
+            logger.warning(
+                "Admin audit record not written for %s %s (%s); this request is missing "
+                "from the headroom.audit trail. Please report this as a bug.",
+                request.method,
+                safe_id(request.url.path),
+                describe_exception(exc),
+            )
         return response
 
     # The gate above is http-only (BaseHTTPMiddleware ignores every other
@@ -4994,8 +5013,8 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
 
             _oest = get_recorder().estimate(_olevel)
             output_reduction = _output_reduction_payload(_shaper_active, _oest)
-        except Exception:  # pragma: no cover - defensive
-            pass
+        except Exception as exc:  # pragma: no cover - defensive
+            logger.debug("/stats output_reduction section failed: %s", describe_exception(exc))
 
         # Model-routing section: populated only when an extension registered a
         # routing-stats provider (headroom.proxy.routing_stats); None otherwise.
