@@ -1174,7 +1174,8 @@ def _create_default_ccr_backend() -> CompressionStoreBackend | None:
             backend_type,
             type(e).__name__,
         )
-        logger.debug("CCR backend %s load failure: %s", backend_type, describe_exception(e))
+        if logger.isEnabledFor(logging.DEBUG):
+            logger.debug("CCR backend %s load failure: %s", backend_type, describe_exception(e))
         return None
 
 

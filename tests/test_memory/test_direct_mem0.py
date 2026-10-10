@@ -277,3 +277,36 @@ async def test_huge_model_supplied_id_is_capped_in_the_warning() -> None:
     assert len(huge) < 200
     assert "…(+" in huge
     assert "'short-id'" in short and "…" not in short
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("level", [logging.INFO, logging.DEBUG])
+async def test_get_memory_survives_an_out_of_range_errno(level: int) -> None:
+    """An OSError whose errno does not fit a C int must not escape get_memory,
+    whether or not DEBUG (which builds the exception description) is on."""
+    errno_value = 10 ** len("x" * 10000)  # built at runtime, far past any C int
+    adapter = _adapter()
+    adapter._ensure_initialized = AsyncMock()  # type: ignore[method-assign]
+    adapter._mem0_client = _RaisingClient(OSError(errno_value, "backend down"))
+
+    logger = logging.getLogger("headroom.memory.backends.direct_mem0")
+    records: list[logging.LogRecord] = []
+
+    class _Collect(logging.Handler):
+        def emit(self, record: logging.LogRecord) -> None:
+            records.append(record)
+
+    handler = _Collect(level=logging.DEBUG)
+    previous = logger.level
+    logger.addHandler(handler)
+    logger.setLevel(level)
+    try:
+        assert await adapter.get_memory("m1") is None
+    finally:
+        logger.removeHandler(handler)
+        logger.setLevel(previous)
+
+    assert [r.levelno for r in records if r.levelno == logging.WARNING] == [logging.WARNING]
+    assert any(r.levelno == logging.DEBUG for r in records) is (level == logging.DEBUG)
+    for record in records:
+        logging.Formatter().format(record)

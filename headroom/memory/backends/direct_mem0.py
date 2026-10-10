@@ -939,11 +939,12 @@ class DirectMem0Adapter:
                 safe_id(memory_id),
                 type(e).__name__,
             )
-            logger.debug(
-                "DirectMem0: delete_memory(%s) failure: %s",
-                safe_id(memory_id),
-                describe_exception(e),
-            )
+            if logger.isEnabledFor(logging.DEBUG):
+                logger.debug(
+                    "DirectMem0: delete_memory(%s) failure: %s",
+                    safe_id(memory_id),
+                    describe_exception(e),
+                )
             return False
 
     async def get_memory(self, memory_id: str) -> Memory | None:
@@ -975,9 +976,12 @@ class DirectMem0Adapter:
             logger.warning(
                 "DirectMem0: get_memory(%s) failed (%s)", safe_id(memory_id), type(e).__name__
             )
-            logger.debug(
-                "DirectMem0: get_memory(%s) failure: %s", safe_id(memory_id), describe_exception(e)
-            )
+            if logger.isEnabledFor(logging.DEBUG):
+                logger.debug(
+                    "DirectMem0: get_memory(%s) failure: %s",
+                    safe_id(memory_id),
+                    describe_exception(e),
+                )
             return None
 
     @property

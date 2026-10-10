@@ -83,6 +83,9 @@ def create_storage(store_url: str) -> Storage:
                     scheme,
                     type(e).__name__,
                 )
-                logger.debug("Storage backend %r load failure: %s", scheme, describe_exception(e))
+                if logger.isEnabledFor(logging.DEBUG):
+                    logger.debug(
+                        "Storage backend %r load failure: %s", scheme, describe_exception(e)
+                    )
         # Default to SQLite (legacy behavior)
         return SQLiteStorage(store_url)
