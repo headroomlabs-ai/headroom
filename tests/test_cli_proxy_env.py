@@ -274,7 +274,9 @@ class TestCLIWrapProxyTimeout:
         earlier = "ERROR: an earlier run\n" * 1000
         noise = "INFO noise line\n" * 16000  # ~256 KiB, no error line
         late = "ERROR: late startup failure\n"
-        stdio_log.write_text(earlier + noise + late + "INFO shutdown summary\n")
+        # Bytes, not text: the offset is a byte offset, and write_text would turn
+        # "\n" into "\r\n" on Windows.
+        stdio_log.write_bytes((earlier + noise + late + "INFO shutdown summary\n").encode())
         read_sizes: list[int] = []
         real_open = open
 
@@ -292,7 +294,7 @@ class TestCLIWrapProxyTimeout:
 
         monkeypatch.setattr(wrap_mod, "open", tracking_open, raising=False)
 
-        excerpt = wrap_mod._proxy_startup_failure_excerpt(stdio_log, len(earlier))
+        excerpt = wrap_mod._proxy_startup_failure_excerpt(stdio_log, len(earlier.encode()))
 
         assert "earlier run" not in excerpt
         assert excerpt.startswith("ERROR: late startup failure")
@@ -301,7 +303,7 @@ class TestCLIWrapProxyTimeout:
     def test_startup_excerpt_prefers_an_error_in_the_first_64_kib(self, tmp_path):
         stdio_log = tmp_path / "proxy-stdio-8787.log"
         noise = "INFO noise line\n" * 16000
-        stdio_log.write_text("ERROR: early failure\n" + noise + "ERROR: later echo\n")
+        stdio_log.write_bytes(("ERROR: early failure\n" + noise + "ERROR: later echo\n").encode())
 
         excerpt = wrap_mod._proxy_startup_failure_excerpt(stdio_log, 0)
 
@@ -312,17 +314,26 @@ class TestCLIWrapProxyTimeout:
         even when the tail window is blank."""
         stdio_log = tmp_path / "proxy-stdio-8787.log"
         head = "INFO noise line\n" * 3000 + "INFO last startup line\n"  # < 64 KiB
-        stdio_log.write_text(head + " \n" * 70000)
+        stdio_log.write_bytes((head + " \n" * 70000).encode())
 
         excerpt = wrap_mod._proxy_startup_failure_excerpt(stdio_log, 0)
 
         assert excerpt.endswith("INFO last startup line")
 
+    def test_startup_excerpt_falls_back_to_a_useful_tail_after_a_blank_head(self, tmp_path):
+        """A whitespace-only head must not hide a useful tail line."""
+        stdio_log = tmp_path / "proxy-stdio-8787.log"
+        stdio_log.write_bytes(b" " * (192 * 1024) + b"initialization could not bind the port\n")
+
+        excerpt = wrap_mod._proxy_startup_failure_excerpt(stdio_log, 0)
+
+        assert excerpt == "initialization could not bind the port"
+
     def test_startup_excerpt_quotes_click_error_before_a_blank_tail(self, tmp_path):
         """A Click ``Error:`` line followed by a whitespace-only tail is quoted,
         not reported as "(no log output)"."""
         stdio_log = tmp_path / "proxy-stdio-8787.log"
-        stdio_log.write_text("Error: address already in use\n" + " " * (192 * 1024))
+        stdio_log.write_bytes(("Error: address already in use\n" + " " * (192 * 1024)).encode())
 
         excerpt = wrap_mod._proxy_startup_failure_excerpt(stdio_log, 0)
 
@@ -330,10 +341,10 @@ class TestCLIWrapProxyTimeout:
 
     def test_startup_excerpt_starts_at_a_click_style_error_line(self, tmp_path):
         stdio_log = tmp_path / "proxy-stdio-8787.log"
-        stdio_log.write_text(
-            "INFO starting\nINFO loading config\n"
-            "Error: Port 8787 on 127.0.0.1 is already in use by another process.\n"
-            "INFO shutdown summary\n"
+        stdio_log.write_bytes(
+            b"INFO starting\nINFO loading config\n"
+            b"Error: Port 8787 on 127.0.0.1 is already in use by another process.\n"
+            b"INFO shutdown summary\n"
         )
 
         excerpt = wrap_mod._proxy_startup_failure_excerpt(stdio_log, 0)
