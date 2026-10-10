@@ -712,7 +712,11 @@ def _get_proxy_stdio_log_path(port: int | None = None) -> Path:
 # A proxy that dies during startup logs its shutdown summary after the error,
 # so the end of the log is the summary box, not the cause. Quote from the first
 # error-looking line instead.
-_PROXY_STARTUP_ERROR_RE = re.compile(r"\b(?:ERROR|CRITICAL)\b|Traceback \(most recent call last\)")
+# Click's own failures (``click.ClickException``) print ``Error: ...`` at the
+# start of a line.
+_PROXY_STARTUP_ERROR_RE = re.compile(
+    r"\b(?:ERROR|CRITICAL)\b|Traceback \(most recent call last\)|^Error: ", re.MULTILINE
+)
 _PROXY_STARTUP_EXCERPT_CHARS = 500
 # Never read a runaway log whole: look at most at the first and the last 64 KiB
 # of this run's output. The error usually comes early, before the shutdown

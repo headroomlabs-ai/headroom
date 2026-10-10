@@ -318,6 +318,29 @@ class TestCLIWrapProxyTimeout:
 
         assert excerpt.endswith("INFO last startup line")
 
+    def test_startup_excerpt_quotes_click_error_before_a_blank_tail(self, tmp_path):
+        """A Click ``Error:`` line followed by a whitespace-only tail is quoted,
+        not reported as "(no log output)"."""
+        stdio_log = tmp_path / "proxy-stdio-8787.log"
+        stdio_log.write_text("Error: address already in use\n" + " " * (192 * 1024))
+
+        excerpt = wrap_mod._proxy_startup_failure_excerpt(stdio_log, 0)
+
+        assert excerpt == "Error: address already in use"
+
+    def test_startup_excerpt_starts_at_a_click_style_error_line(self, tmp_path):
+        stdio_log = tmp_path / "proxy-stdio-8787.log"
+        stdio_log.write_text(
+            "INFO starting\nINFO loading config\n"
+            "Error: Port 8787 on 127.0.0.1 is already in use by another process.\n"
+            "INFO shutdown summary\n"
+        )
+
+        excerpt = wrap_mod._proxy_startup_failure_excerpt(stdio_log, 0)
+
+        assert excerpt.startswith("Error: Port 8787 on 127.0.0.1 is already in use")
+        assert "INFO starting" not in excerpt
+
     def test_timeout_error_names_configured_timeout_and_env_var(self, monkeypatch, tmp_path):
         fake_proc = _FakeProxyProcess()
 
