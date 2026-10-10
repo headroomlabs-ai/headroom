@@ -24,6 +24,7 @@ from pathlib import Path
 from typing import Any
 
 from headroom import paths as _paths
+from headroom.log_safety import WarnOnce, describe_exception, safe_id
 from headroom.proxy import project_name_policy
 from headroom.proxy.persistent_metrics import PersistentMetricsState
 
@@ -355,8 +356,12 @@ def _resolve_litellm_model(model: str) -> str:
         info = litellm.model_cost.get(resolved)
         if info and info.get("input_cost_per_token") is not None:
             return resolved
-    except Exception:
-        logger.debug("Shared litellm model resolution failed for model=%s", model, exc_info=True)
+    except Exception as exc:
+        logger.debug(
+            "Shared litellm model resolution failed for model=%s: %s",
+            safe_id(model),
+            describe_exception(exc),
+        )
 
     # litellm raises a bare Exception for a model it has not mapped, so this is
     # the narrowest catch that works. A miss means "not this spelling, try the
@@ -365,7 +370,9 @@ def _resolve_litellm_model(model: str) -> str:
         litellm.cost_per_token(model=model, prompt_tokens=1, completion_tokens=0)
         return model
     except Exception as exc:
-        logger.debug("litellm cannot price model=%s as given: %s", model, exc)
+        logger.debug(
+            "litellm cannot price model=%s as given: %s", safe_id(model), describe_exception(exc)
+        )
 
     prefixes = {
         "claude-": "anthropic/",
@@ -395,19 +402,19 @@ def _resolve_litellm_model(model: str) -> str:
 # bundled litellm) is an expected case, and the estimators below run on every
 # request, so each model is logged once. Debug, not warning: proxy/cost.py
 # already warns once per unpriceable model on the live path. Model names come
-# from clients, so the set is capped like _resolve_litellm_model's cache and
-# cleared when full (a model may then be logged again).
-_UNPRICED_MODELS_LOGGED_MAX = _MODEL_RESOLUTION_CACHE_MAXSIZE
-_unpriced_models_logged: set[str] = set()
+# from clients, so the guard is bounded like _resolve_litellm_model's cache.
+_unpriced_models_logged = WarnOnce(_MODEL_RESOLUTION_CACHE_MAXSIZE, "unpriced models")
 
 
 def _log_unpriced_model_once(model: str, field: str) -> None:
-    if model in _unpriced_models_logged or not logger.isEnabledFor(logging.DEBUG):
+    if not logger.isEnabledFor(logging.DEBUG):
         return
-    if len(_unpriced_models_logged) >= _UNPRICED_MODELS_LOGGED_MAX:
-        _unpriced_models_logged.clear()
-    _unpriced_models_logged.add(model)
-    logger.debug("No litellm %s for model=%s; savings and cost use the fallback rate", field, model)
+    if _unpriced_models_logged.first(model, logger):
+        logger.debug(
+            "No litellm %s for model=%s; savings and cost use the fallback rate",
+            field,
+            safe_id(model),
+        )
 
 
 def _estimate_compression_savings_usd(model: str, tokens_saved: int) -> float:
@@ -430,9 +437,11 @@ def _estimate_compression_savings_usd(model: str, tokens_saved: int) -> float:
             _log_unpriced_model_once(model, "input_cost_per_token")
             return float(tokens_saved) * float(DEFAULT_FALLBACK_INPUT_COST_PER_TOKEN)
         return float(tokens_saved) * float(input_cost_per_token)
-    except Exception:
+    except Exception as exc:
         logger.debug(
-            "Compression savings priced at the fallback rate for model=%s", model, exc_info=True
+            "Compression savings priced at the fallback rate for model=%s: %s",
+            safe_id(model),
+            describe_exception(exc),
         )
         return float(tokens_saved) * float(DEFAULT_FALLBACK_INPUT_COST_PER_TOKEN)
 
@@ -461,9 +470,11 @@ def _estimate_output_savings_usd(model: str, tokens_saved: int) -> float:
             _log_unpriced_model_once(model, "output_cost_per_token")
             return float(tokens_saved) * float(DEFAULT_FALLBACK_OUTPUT_COST_PER_TOKEN)
         return float(tokens_saved) * float(output_cost_per_token)
-    except Exception:
+    except Exception as exc:
         logger.debug(
-            "Output savings priced at the fallback rate for model=%s", model, exc_info=True
+            "Output savings priced at the fallback rate for model=%s: %s",
+            safe_id(model),
+            describe_exception(exc),
         )
         return float(tokens_saved) * float(DEFAULT_FALLBACK_OUTPUT_COST_PER_TOKEN)
 
@@ -511,8 +522,12 @@ def _estimate_cache_savings_usd(model: str, cache_read_tokens: int) -> float:
         if discount <= 0:
             return 0.0
         return float(cache_read_tokens) * discount
-    except Exception:
-        logger.debug("Cache savings pricing failed for model=%s; booking 0", model, exc_info=True)
+    except Exception as exc:
+        logger.debug(
+            "Cache savings pricing failed for model=%s; booking 0: %s",
+            safe_id(model),
+            describe_exception(exc),
+        )
         return 0.0
 
 
@@ -678,8 +693,12 @@ def _estimate_input_cost_usd(
             )
 
         return float(total_input_tokens) * float(input_cost_per_token)
-    except Exception:
-        logger.debug("Input cost priced at the fallback rate for model=%s", model, exc_info=True)
+    except Exception as exc:
+        logger.debug(
+            "Input cost priced at the fallback rate for model=%s: %s",
+            safe_id(model),
+            describe_exception(exc),
+        )
         return float(chargeable_tokens) * float(DEFAULT_FALLBACK_INPUT_COST_PER_TOKEN)
 
 

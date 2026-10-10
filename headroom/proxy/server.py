@@ -86,6 +86,7 @@ from headroom.config import (
     ReadLifecycleConfig,
 )
 from headroom.dashboard import get_dashboard_html
+from headroom.log_safety import describe_exception, safe_id
 from headroom.observability import (
     LangfuseTracingConfig,
     OTelMetricsConfig,
@@ -3139,15 +3140,14 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
         settings_file = _hr_paths.settings_path()
         settings_store.apply_to_environ(settings_store.load())
     except Exception as exc:  # noqa: BLE001 — settings load must never break startup
-        # Settings values can hold credentials, so only the exception type is
-        # logged at warning; the full detail stays at debug.
+        # Settings values can hold credentials, so the exception is described by
+        # type and code location only, never its message.
         logger.warning(
             "Could not apply saved settings from %s (%s); continuing with env and "
             "defaults. Fix or remove that file and restart the proxy.",
             settings_file,
-            type(exc).__name__,
+            describe_exception(exc),
         )
-        logger.debug("Saved settings apply failed for %s", settings_file, exc_info=True)
 
     # Air-gap master switch. Propagate config.offline to the env so the
     # env-based egress predicates (telemetry, update check, license) all honor
@@ -4166,10 +4166,9 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
                 "Admin audit record not written for %s %s (%s); this request is missing "
                 "from the headroom.audit trail. Please report this as a bug.",
                 request.method,
-                request.url.path,
-                type(exc).__name__,
+                safe_id(request.url.path),
+                describe_exception(exc),
             )
-            logger.debug("Admin audit emission failed", exc_info=True)
         return response
 
     # The gate above is http-only (BaseHTTPMiddleware ignores every other
@@ -5014,8 +5013,8 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
 
             _oest = get_recorder().estimate(_olevel)
             output_reduction = _output_reduction_payload(_shaper_active, _oest)
-        except Exception:  # pragma: no cover - defensive
-            logger.debug("/stats output_reduction section failed", exc_info=True)
+        except Exception as exc:  # pragma: no cover - defensive
+            logger.debug("/stats output_reduction section failed: %s", describe_exception(exc))
 
         # Model-routing section: populated only when an extension registered a
         # routing-stats provider (headroom.proxy.routing_stats); None otherwise.

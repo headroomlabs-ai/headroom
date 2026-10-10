@@ -31,6 +31,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any
 
+from headroom.log_safety import describe_exception
 from headroom.proxy.conversation_savings import get_conversation_savings
 from headroom.proxy.tool_schema_savings_policy import (
     headline_tokens_saved,
@@ -629,11 +630,11 @@ async def emit_request_outcome(handler: Any, outcome: RequestOutcome) -> None:
             # does a full read-modify-write of the ledger file — run them
             # together off the event loop (#18) so a slow flush can't stall it.
             output_tokens_saved_est = await asyncio.to_thread(_record_and_estimate)
-        except Exception:  # pragma: no cover - defensive
+        except Exception as exc:  # pragma: no cover - defensive
             logger.debug(
-                "Output savings record/estimate failed for request %s; booking 0",
+                "Output savings record/estimate failed for request %s; booking 0: %s",
                 outcome.request_id,
-                exc_info=True,
+                describe_exception(exc),
             )
 
     # Project attribution: explicit outcome field wins, else the value the

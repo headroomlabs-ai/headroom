@@ -29,31 +29,28 @@ import copy
 import logging
 from typing import Any
 
+from headroom.log_safety import WarnOnce, describe_exception
+
 logger = logging.getLogger(__name__)
 
-# Exception types already warned about. A failure that repeats on every request
-# warns once per type; the full detail always goes to debug. Capped and cleared
-# when full, so it cannot grow without limit.
-_RECONCILE_WARNED_MAX = 32
-_reconcile_warned_types: set[str] = set()
+# A failure that repeats on every request warns once per exception type; every
+# occurrence also goes to debug.
+_reconcile_warned = WarnOnce(32, "tool-schema reconcile failure types")
 
 
 def _log_reconcile_failure(exc: Exception, booked: int) -> None:
-    kind = type(exc).__name__
-    if kind not in _reconcile_warned_types and logger.isEnabledFor(logging.WARNING):
-        if len(_reconcile_warned_types) >= _RECONCILE_WARNED_MAX:
-            _reconcile_warned_types.clear()
-        _reconcile_warned_types.add(kind)
-        # The exception comes from tokenizing client tool schemas, so only its
-        # type is logged here; the traceback stays at debug.
+    # The exception comes from tokenizing client tool schemas and can quote
+    # them, so it is described by type and code location only, at every level.
+    where = describe_exception(exc)
+    if _reconcile_warned.first(type(exc).__qualname__, logger):
         logger.warning(
             "tool-schema deferral reconcile failed (%s); credit left at %d booked tokens, "
             "so /stats over-reports tool-search savings for this request. Please report "
             "this as a bug.",
-            kind,
+            where,
             booked,
         )
-    logger.debug("tool-schema deferral reconcile failed; booked=%d", booked, exc_info=True)
+    logger.debug("tool-schema deferral reconcile failed; booked=%d: %s", booked, where)
 
 
 def without_deferral_flags(tools: object) -> object:
