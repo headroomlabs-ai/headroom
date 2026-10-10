@@ -162,7 +162,7 @@ def test_state_normalizes_invalid_values_and_unknown_dimension_labels() -> None:
     assert snapshot["requests"]["by_provider"] == {"other": 1}
     assert snapshot["requests"]["by_stack"] == {"other": 1}
     assert snapshot["by_model"]["other"]["input_tokens"] == 7
-    assert snapshot["waste_signals"] == {"other": 9}
+    assert snapshot["waste_signals"] == {"unknown": 9}
 
 
 def test_json_bloat_waste_signal_is_a_named_bucket() -> None:
@@ -180,23 +180,28 @@ def test_json_bloat_waste_signal_is_a_named_bucket() -> None:
     assert snapshot["waste_signals"] == {"json_bloat": 500, "html_noise": 20}
 
 
-def test_waste_signal_other_bucket_survives_reload() -> None:
-    """Reloading persisted state must keep ``other`` as ``other``, not relabel it ``unknown``.
-
-    Before this fix, unrecognised names went to ``other`` at record time but to
-    ``unknown`` at load time, so every restart moved the whole ``other`` bucket
-    into a new ``unknown`` bucket and the two grew side by side.
-    """
+def test_state_canonicalizes_lifetime_waste_signal_aliases_and_fallbacks() -> None:
     state = PersistentMetricsState(
         {
-            "waste_signals": {"other": 40, "unknown": 60, "html_noise": 5, "bogus": 3},
+            "waste_signals": {
+                "json_noise": 10,
+                "json_bloat": 20,
+                "other": 7,
+                "unrecognized_persisted": 3,
+            },
         },
         now=lambda: FIXED_NOW,
+    )
+    state.record_request(
+        provider="openai",
+        stack="codex",
+        model="gpt-test",
+        waste_signals={"json_bloat": 5, "unrecognized_runtime": 2},
     )
 
     snapshot = state.snapshot(persistence={"enabled": True, "healthy": True})
 
-    assert snapshot["waste_signals"] == {"other": 103, "html_noise": 5}
+    assert snapshot["waste_signals"] == {"json_bloat": 35, "unknown": 12}
 
 
 def test_miss_reasons_still_fall_back_to_unknown_on_reload() -> None:
