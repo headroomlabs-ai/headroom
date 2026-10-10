@@ -709,6 +709,55 @@ def _get_proxy_stdio_log_path(port: int | None = None) -> Path:
     return _get_log_path(port).with_name(_paths.proxy_stdio_log_path(port).name)
 
 
+# A proxy that dies during startup logs its shutdown summary after the error,
+# so the end of the log is the summary box, not the cause. Quote from the first
+# error-looking line instead.
+# Click's own failures (``click.ClickException``) print ``Error: ...`` at the
+# start of a line.
+_PROXY_STARTUP_ERROR_RE = re.compile(
+    r"\b(?:ERROR|CRITICAL)\b|Traceback \(most recent call last\)|^Error: ", re.MULTILINE
+)
+_PROXY_STARTUP_EXCERPT_CHARS = 500
+# Never read a runaway log whole: look at most at the first and the last 64 KiB
+# of this run's output. The error usually comes early, before the shutdown
+# summary; the tail catches one that follows a long burst of startup output.
+_PROXY_STARTUP_READ_BYTES = 64 * 1024
+
+
+def _proxy_startup_failure_excerpt(stdio_log_path: Path, start: int) -> str:
+    """Return the part of this run's stdio log that best explains a startup exit.
+
+    Reads only what was written after byte offset ``start`` (the log is shared
+    across runs): the first ``_PROXY_STARTUP_READ_BYTES`` of it and, when the run
+    wrote more and the head has no error, the last ``_PROXY_STARTUP_READ_BYTES``.
+    Prefers the first ERROR/CRITICAL/Traceback line onwards, and falls back to
+    the last few hundred characters of the head.
+    """
+    try:
+        with open(stdio_log_path, "rb") as fh:
+            fh.seek(start)
+            windows = [fh.read(_PROXY_STARTUP_READ_BYTES)]
+            end = fh.seek(0, os.SEEK_END)
+            tail_start = max(start + _PROXY_STARTUP_READ_BYTES, end - _PROXY_STARTUP_READ_BYTES)
+            if end > tail_start and not _PROXY_STARTUP_ERROR_RE.search(
+                windows[0].decode("utf-8", errors="replace")
+            ):
+                fh.seek(tail_start)
+                windows.append(fh.read(_PROXY_STARTUP_READ_BYTES))
+    except OSError:
+        return "(no log output)"
+    texts = [raw.decode("utf-8", errors="replace").strip() for raw in windows]
+    for output in texts:
+        match = _PROXY_STARTUP_ERROR_RE.search(output)
+        if match is not None:
+            line_start = output.rfind("\n", 0, match.start()) + 1
+            return output[line_start : line_start + _PROXY_STARTUP_EXCERPT_CHARS]
+    # No recognised error: the end of the startup head is the most telling part.
+    if not texts[0]:
+        return "(no log output)"
+    return texts[0][-_PROXY_STARTUP_EXCERPT_CHARS:]
+
+
 def _start_proxy(
     port: int,
     *,
@@ -790,6 +839,12 @@ def _start_proxy(
     timeout_seconds = _resolve_wrap_proxy_timeout_seconds()
     log_path = _get_log_path(port)
     stdio_log_path = _get_proxy_stdio_log_path(port)
+    # The stdio log is appended to across runs; remember where this run starts
+    # so a startup failure quotes this run's output, not an earlier one.
+    try:
+        stdio_log_start = stdio_log_path.stat().st_size
+    except OSError:
+        stdio_log_start = 0
     stdio_log_file = open(stdio_log_path, "a", encoding="utf-8")  # noqa: SIM115
 
     # Ensure proxy subprocess uses UTF-8 (Windows defaults to cp1252)
@@ -910,17 +965,17 @@ def _start_proxy(
                 return proc
             # Check if process died
             if proc.poll() is not None:
-                # Read last few lines of log for error context
-                try:
-                    tail = _read_text(stdio_log_path)[-500:]
-                except Exception:
-                    tail = "(no log output)"
-                raise RuntimeError(f"Proxy exited with code {proc.returncode}: {tail}")
+                excerpt = _proxy_startup_failure_excerpt(stdio_log_path, stdio_log_start)
+                raise RuntimeError(
+                    f"Proxy exited with code {proc.returncode}: {excerpt}\n"
+                    f"  Full log: {stdio_log_path}"
+                )
 
         proc.kill()
         raise RuntimeError(
             f"Proxy failed to start on port {port} within {timeout_seconds} seconds. "
-            f"Set {_WRAP_PROXY_TIMEOUT_ENV} to a larger number of seconds for slow startup."
+            f"Set {_WRAP_PROXY_TIMEOUT_ENV} to a larger number of seconds for slow startup.\n"
+            f"  Full log: {stdio_log_path}"
         )
     finally:
         stdio_log_file.close()

@@ -203,10 +203,15 @@ class TestCLIWrapProxyTimeout:
         monkeypatch.setattr(wrap_mod, "_get_log_path", lambda port=None: tmp_path / "proxy.log")
         monkeypatch.setattr(wrap_mod, "_check_proxy", lambda _port: False)
         monkeypatch.setattr(wrap_mod.time, "sleep", lambda _seconds: None)
-        monkeypatch.setattr(wrap_mod.subprocess, "Popen", lambda *args, **kwargs: fake_proc)
+
+        def popen_writing_stdio(*args, **kwargs):
+            kwargs["stdout"].write("proxy stdio startup output\n")
+            kwargs["stdout"].flush()
+            return fake_proc
+
+        monkeypatch.setattr(wrap_mod.subprocess, "Popen", popen_writing_stdio)
 
         (tmp_path / "proxy.log").write_text("canonical runtime log output")
-        (tmp_path / "proxy-stdio-8787.log").write_text("proxy stdio startup output")
 
         with pytest.raises(RuntimeError) as excinfo:
             wrap_mod._start_proxy(8787, agent_type="codex")
@@ -215,6 +220,126 @@ class TestCLIWrapProxyTimeout:
         assert "Proxy exited with code 1" in message
         assert "proxy stdio startup output" in message
         assert "canonical runtime log output" not in message
+
+    def test_start_proxy_exit_quotes_this_runs_error_not_summary_or_old_runs(
+        self, monkeypatch, tmp_path
+    ):
+        """The startup error names the cause and the log path.
+
+        The proxy logs its shutdown summary after the error, and the stdio log
+        is appended across runs, so the old ``[-500:]`` tail quoted the summary
+        box (or an earlier run) and never said where the full log was.
+        """
+        fake_proc = _FakeProxyProcess()
+        fake_proc.returncode = 1
+        fake_proc.poll = lambda: fake_proc.returncode
+
+        monkeypatch.setenv(wrap_mod._WRAP_PROXY_TIMEOUT_ENV, "2")
+        monkeypatch.setattr(wrap_mod, "_get_log_path", lambda port=None: tmp_path / "proxy.log")
+        monkeypatch.setattr(wrap_mod, "_check_proxy", lambda _port: False)
+        monkeypatch.setattr(wrap_mod.time, "sleep", lambda _seconds: None)
+
+        stdio_log = tmp_path / "proxy-stdio-8787.log"
+        stdio_log.write_text("ERROR: stale failure from an earlier run\n")
+        summary = "".join(
+            f"2026-10-09 16:19:23,665 - headroom.proxy - INFO - Summary line {i}: 0\n"
+            for i in range(20)
+        )
+
+        def popen_failing_to_bind(*args, **kwargs):
+            kwargs["stdout"].write(
+                "2026-10-09 16:19:23,659 - headroom.proxy - INFO - Local telemetry: DISABLED\n"
+                "ERROR:    [Errno 48] error while attempting to bind on address "
+                "('127.0.0.1', 8787): address already in use\n" + summary
+            )
+            kwargs["stdout"].flush()
+            return fake_proc
+
+        monkeypatch.setattr(wrap_mod.subprocess, "Popen", popen_failing_to_bind)
+
+        with pytest.raises(RuntimeError) as excinfo:
+            wrap_mod._start_proxy(8787, agent_type="codex")
+
+        message = str(excinfo.value)
+        assert "Proxy exited with code 1" in message
+        assert "[Errno 48] error while attempting to bind" in message
+        assert "stale failure from an earlier run" not in message
+        assert "Local telemetry" not in message
+        assert f"Full log: {stdio_log}" in message
+
+    def test_startup_excerpt_reads_at_most_64_kib_of_this_run(self, monkeypatch, tmp_path):
+        """A runaway stdio log is never read whole: this run's first and last 64 KiB
+        at most, so an error after a long burst of output is still quoted."""
+        stdio_log = tmp_path / "proxy-stdio-8787.log"
+        earlier = "ERROR: an earlier run\n" * 1000
+        noise = "INFO noise line\n" * 16000  # ~256 KiB, no error line
+        late = "ERROR: late startup failure\n"
+        stdio_log.write_text(earlier + noise + late + "INFO shutdown summary\n")
+        read_sizes: list[int] = []
+        real_open = open
+
+        def tracking_open(*args, **kwargs):
+            handle = real_open(*args, **kwargs)
+            real_read = handle.read
+
+            def read(size=-1):
+                data = real_read(size)
+                read_sizes.append(len(data))
+                return data
+
+            handle.read = read
+            return handle
+
+        monkeypatch.setattr(wrap_mod, "open", tracking_open, raising=False)
+
+        excerpt = wrap_mod._proxy_startup_failure_excerpt(stdio_log, len(earlier))
+
+        assert "earlier run" not in excerpt
+        assert excerpt.startswith("ERROR: late startup failure")
+        assert sum(read_sizes) <= 2 * wrap_mod._PROXY_STARTUP_READ_BYTES
+
+    def test_startup_excerpt_prefers_an_error_in_the_first_64_kib(self, tmp_path):
+        stdio_log = tmp_path / "proxy-stdio-8787.log"
+        noise = "INFO noise line\n" * 16000
+        stdio_log.write_text("ERROR: early failure\n" + noise + "ERROR: later echo\n")
+
+        excerpt = wrap_mod._proxy_startup_failure_excerpt(stdio_log, 0)
+
+        assert excerpt.startswith("ERROR: early failure")
+
+    def test_startup_excerpt_without_error_quotes_the_end_of_the_head(self, tmp_path):
+        """No recognised error line: quote the end of this run's first 64 KiB,
+        even when the tail window is blank."""
+        stdio_log = tmp_path / "proxy-stdio-8787.log"
+        head = "INFO noise line\n" * 3000 + "INFO last startup line\n"  # < 64 KiB
+        stdio_log.write_text(head + " \n" * 70000)
+
+        excerpt = wrap_mod._proxy_startup_failure_excerpt(stdio_log, 0)
+
+        assert excerpt.endswith("INFO last startup line")
+
+    def test_startup_excerpt_quotes_click_error_before_a_blank_tail(self, tmp_path):
+        """A Click ``Error:`` line followed by a whitespace-only tail is quoted,
+        not reported as "(no log output)"."""
+        stdio_log = tmp_path / "proxy-stdio-8787.log"
+        stdio_log.write_text("Error: address already in use\n" + " " * (192 * 1024))
+
+        excerpt = wrap_mod._proxy_startup_failure_excerpt(stdio_log, 0)
+
+        assert excerpt == "Error: address already in use"
+
+    def test_startup_excerpt_starts_at_a_click_style_error_line(self, tmp_path):
+        stdio_log = tmp_path / "proxy-stdio-8787.log"
+        stdio_log.write_text(
+            "INFO starting\nINFO loading config\n"
+            "Error: Port 8787 on 127.0.0.1 is already in use by another process.\n"
+            "INFO shutdown summary\n"
+        )
+
+        excerpt = wrap_mod._proxy_startup_failure_excerpt(stdio_log, 0)
+
+        assert excerpt.startswith("Error: Port 8787 on 127.0.0.1 is already in use")
+        assert "INFO starting" not in excerpt
 
     def test_timeout_error_names_configured_timeout_and_env_var(self, monkeypatch, tmp_path):
         fake_proc = _FakeProxyProcess()
@@ -231,6 +356,7 @@ class TestCLIWrapProxyTimeout:
         message = str(excinfo.value)
         assert "within 2 seconds" in message
         assert wrap_mod._WRAP_PROXY_TIMEOUT_ENV in message
+        assert f"Full log: {tmp_path / 'proxy-stdio-8787.log'}" in message
         assert fake_proc.killed is True
 
 
