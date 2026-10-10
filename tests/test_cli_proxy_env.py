@@ -267,18 +267,45 @@ class TestCLIWrapProxyTimeout:
         assert "Local telemetry" not in message
         assert f"Full log: {stdio_log}" in message
 
-    def test_startup_excerpt_reads_at_most_64_kib_of_this_run(self, tmp_path):
-        """A runaway stdio log is never read whole: only this run's first 64 KiB."""
+    def test_startup_excerpt_reads_at_most_64_kib_of_this_run(self, monkeypatch, tmp_path):
+        """A runaway stdio log is never read whole: this run's first and last 64 KiB
+        at most, so an error after a long burst of output is still quoted."""
         stdio_log = tmp_path / "proxy-stdio-8787.log"
         earlier = "ERROR: an earlier run\n" * 1000
-        noise = "INFO noise line\n" * 8000  # ~128 KiB, no error line
-        stdio_log.write_text(earlier + noise + "END-OF-RUN-MARKER\n")
+        noise = "INFO noise line\n" * 16000  # ~256 KiB, no error line
+        late = "ERROR: late startup failure\n"
+        stdio_log.write_text(earlier + noise + late + "INFO shutdown summary\n")
+        read_sizes: list[int] = []
+        real_open = open
+
+        def tracking_open(*args, **kwargs):
+            handle = real_open(*args, **kwargs)
+            real_read = handle.read
+
+            def read(size=-1):
+                data = real_read(size)
+                read_sizes.append(len(data))
+                return data
+
+            handle.read = read
+            return handle
+
+        monkeypatch.setattr(wrap_mod, "open", tracking_open, raising=False)
 
         excerpt = wrap_mod._proxy_startup_failure_excerpt(stdio_log, len(earlier))
 
         assert "earlier run" not in excerpt
-        assert "END-OF-RUN-MARKER" not in excerpt
-        assert excerpt.endswith("INFO noise line")
+        assert excerpt.startswith("ERROR: late startup failure")
+        assert sum(read_sizes) <= 2 * wrap_mod._PROXY_STARTUP_READ_BYTES
+
+    def test_startup_excerpt_prefers_an_error_in_the_first_64_kib(self, tmp_path):
+        stdio_log = tmp_path / "proxy-stdio-8787.log"
+        noise = "INFO noise line\n" * 16000
+        stdio_log.write_text("ERROR: early failure\n" + noise + "ERROR: later echo\n")
+
+        excerpt = wrap_mod._proxy_startup_failure_excerpt(stdio_log, 0)
+
+        assert excerpt.startswith("ERROR: early failure")
 
     def test_timeout_error_names_configured_timeout_and_env_var(self, monkeypatch, tmp_path):
         fake_proc = _FakeProxyProcess()

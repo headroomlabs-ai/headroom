@@ -714,8 +714,9 @@ def _get_proxy_stdio_log_path(port: int | None = None) -> Path:
 # error-looking line instead.
 _PROXY_STARTUP_ERROR_RE = re.compile(r"\b(?:ERROR|CRITICAL)\b|Traceback \(most recent call last\)")
 _PROXY_STARTUP_EXCERPT_CHARS = 500
-# The startup error comes before the shutdown summary, so the first 64 KiB of
-# this run's output is enough; never read a runaway log whole.
+# Never read a runaway log whole: look at most at the first and the last 64 KiB
+# of this run's output. The error usually comes early, before the shutdown
+# summary; the tail catches one that follows a long burst of startup output.
 _PROXY_STARTUP_READ_BYTES = 64 * 1024
 
 
@@ -723,24 +724,34 @@ def _proxy_startup_failure_excerpt(stdio_log_path: Path, start: int) -> str:
     """Return the part of this run's stdio log that best explains a startup exit.
 
     Reads only what was written after byte offset ``start`` (the log is shared
-    across runs), and at most the first ``_PROXY_STARTUP_READ_BYTES`` of it.
+    across runs): the first ``_PROXY_STARTUP_READ_BYTES`` of it and, when the run
+    wrote more and the head has no error, the last ``_PROXY_STARTUP_READ_BYTES``.
     Prefers the first ERROR/CRITICAL/Traceback line onwards, and falls back to
     the last few hundred characters read.
     """
     try:
         with open(stdio_log_path, "rb") as fh:
             fh.seek(start)
-            raw = fh.read(_PROXY_STARTUP_READ_BYTES)
-        output = raw.decode("utf-8", errors="replace").strip()
+            windows = [fh.read(_PROXY_STARTUP_READ_BYTES)]
+            end = fh.seek(0, os.SEEK_END)
+            tail_start = max(start + _PROXY_STARTUP_READ_BYTES, end - _PROXY_STARTUP_READ_BYTES)
+            if end > tail_start and not _PROXY_STARTUP_ERROR_RE.search(
+                windows[0].decode("utf-8", errors="replace")
+            ):
+                fh.seek(tail_start)
+                windows.append(fh.read(_PROXY_STARTUP_READ_BYTES))
     except OSError:
         return "(no log output)"
+    output = ""
+    for raw in windows:
+        output = raw.decode("utf-8", errors="replace").strip()
+        match = _PROXY_STARTUP_ERROR_RE.search(output)
+        if match is not None:
+            line_start = output.rfind("\n", 0, match.start()) + 1
+            return output[line_start : line_start + _PROXY_STARTUP_EXCERPT_CHARS]
     if not output:
         return "(no log output)"
-    match = _PROXY_STARTUP_ERROR_RE.search(output)
-    if match is None:
-        return output[-_PROXY_STARTUP_EXCERPT_CHARS:]
-    line_start = output.rfind("\n", 0, match.start()) + 1
-    return output[line_start : line_start + _PROXY_STARTUP_EXCERPT_CHARS]
+    return output[-_PROXY_STARTUP_EXCERPT_CHARS:]
 
 
 def _start_proxy(
