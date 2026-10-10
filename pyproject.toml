@@ -127,7 +127,7 @@ ml = [
     # makes `headroom-ai[all]` unsatisfiable on Intel Macs (#1931).
     "torch>=2.12.1; sys_platform != 'darwin' or platform_machine != 'x86_64'",
     "transformers>=5.5.0,<6.0",
-    # transformers >= 5.x requires huggingface-hub >= 1.5.0,<2.0; pinning
+    # transformers >= 5.x requires huggingface-hub >= 1.5.0,< 3.0; pinning
     # the floor here prevents Kompress from silently falling back to
     # "unavailable" when a sibling install (e.g. `pip install
     # strands-agents`) drags huggingface-hub backwards.
