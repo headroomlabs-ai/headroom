@@ -1705,6 +1705,8 @@ class CompressionStrategy(Enum):
     HTML = "html"
     TABULAR = "tabular"
     CONFIG = "config"
+    BOOLEAN = "boolean"
+    NL_BOOLEAN = "nl_boolean"
     MIXED = "mixed"
     PASSTHROUGH = "passthrough"
 
@@ -2334,6 +2336,8 @@ class ContentRouter(Transform):
         self._search_compressor: Any = None
         self._log_compressor: Any = None
         self._diff_compressor: Any = None
+        self._boolean_compressor: Any = None
+        self._nl_boolean_compressor: Any = None
         self._html_extractor: Any = None
         self._tabular_compressor: Any = None
         self._config_compressor: Any = None
@@ -3103,6 +3107,8 @@ class ContentRouter(Transform):
             ContentType.HTML: CompressionStrategy.HTML,
             ContentType.TABULAR: CompressionStrategy.TABULAR,
             ContentType.STRUCTURED_CONFIG: CompressionStrategy.CONFIG,
+            ContentType.BOOLEAN_LOGIC: CompressionStrategy.BOOLEAN,
+            ContentType.NL_BOOLEAN_LOGIC: CompressionStrategy.NL_BOOLEAN,
             ContentType.PLAIN_TEXT: CompressionStrategy.TEXT,
         }
 
@@ -4199,6 +4205,45 @@ class ContentRouter(Transform):
                         compressed_tokens = _estimate_tokens(compressed) if compressed else 0
                         decision_reason = "html_extractor"
 
+            elif strategy == CompressionStrategy.BOOLEAN:
+                compressor = self._get_boolean_compressor()
+                if compressor:
+                    compressor_name = type(compressor).__name__
+                    bool_result = compressor.compress(content)
+                    if bool_result is not None:
+                        compressed = bool_result.compressed
+                        compressed_tokens = bool_result.compressed_tokens
+                        decision_reason = f"boolean_{bool_result.strategy}"
+                if compressed is None:
+                    # Fallback to Kompress when boolean-algebra-engine unavailable
+                    compressed, compressed_tokens = self._try_ml_compressor(
+                        content, context, question
+                    )
+                    strategy = CompressionStrategy.KOMPRESS
+                    actual_strategy = strategy
+                    compressor_name = "KompressCompressor"
+                    decision_reason = "boolean_unavailable_fallback_kompress"
+                    strategy_chain.append(CompressionStrategy.KOMPRESS.value)
+
+            elif strategy == CompressionStrategy.NL_BOOLEAN:
+                compressor = self._get_nl_boolean_compressor()
+                if compressor:
+                    compressor_name = type(compressor).__name__
+                    bool_result = compressor.compress(content)
+                    if bool_result is not None:
+                        compressed = bool_result.compressed
+                        compressed_tokens = bool_result.compressed_tokens
+                        decision_reason = "nl_boolean"
+                if compressed is None:
+                    compressed, compressed_tokens = self._try_ml_compressor(
+                        content, context, question
+                    )
+                    strategy = CompressionStrategy.KOMPRESS
+                    actual_strategy = strategy
+                    compressor_name = "KompressCompressor"
+                    decision_reason = "nl_boolean_unavailable_fallback_kompress"
+                    strategy_chain.append(CompressionStrategy.KOMPRESS.value)
+
             elif strategy == CompressionStrategy.KOMPRESS:
                 # Registry-resolved dispatch: the built-in "kompress" adapter
                 # delegates to the SAME ``_try_ml_compressor(content, context,
@@ -4839,6 +4884,8 @@ class ContentRouter(Transform):
             ContentType.HTML: CompressionStrategy.HTML,
             ContentType.TABULAR: CompressionStrategy.TABULAR,
             ContentType.STRUCTURED_CONFIG: CompressionStrategy.CONFIG,
+            ContentType.BOOLEAN_LOGIC: CompressionStrategy.BOOLEAN,
+            ContentType.NL_BOOLEAN_LOGIC: CompressionStrategy.NL_BOOLEAN,
             ContentType.PLAIN_TEXT: CompressionStrategy.TEXT,
         }
         return mapping.get(content_type, self.config.fallback_strategy)
@@ -4854,6 +4901,8 @@ class ContentRouter(Transform):
             CompressionStrategy.HTML: ContentType.HTML,
             CompressionStrategy.TABULAR: ContentType.TABULAR,
             CompressionStrategy.CONFIG: ContentType.STRUCTURED_CONFIG,
+            CompressionStrategy.BOOLEAN: ContentType.BOOLEAN_LOGIC,
+            CompressionStrategy.NL_BOOLEAN: ContentType.NL_BOOLEAN_LOGIC,
             CompressionStrategy.TEXT: ContentType.PLAIN_TEXT,
             CompressionStrategy.KOMPRESS: ContentType.PLAIN_TEXT,
             CompressionStrategy.PASSTHROUGH: ContentType.PLAIN_TEXT,
@@ -5097,6 +5146,32 @@ class ContentRouter(Transform):
             except ImportError:  # pragma: no cover - defensive; module is pure stdlib
                 logger.debug("ConfigCompressor not available")
         return self._config_compressor
+
+    def _get_boolean_compressor(self) -> Any:
+        """Get BooleanCompressor (lazy load). Requires boolean-algebra-engine."""
+        if self._boolean_compressor is None:
+            try:
+                from .boolean_compressor import BooleanCompressor
+
+                self._boolean_compressor = BooleanCompressor()
+            except ImportError:
+                logger.debug(
+                    "BooleanCompressor not available — install boolean-algebra-engine[cli]"
+                )
+        return self._boolean_compressor
+
+    def _get_nl_boolean_compressor(self) -> Any:
+        """Get NLBooleanCompressor (lazy load). Requires boolean-algebra-engine[nl-*] + API key."""
+        if self._nl_boolean_compressor is None:
+            try:
+                from .boolean_compressor import NLBooleanCompressor
+
+                self._nl_boolean_compressor = NLBooleanCompressor()
+            except ImportError:
+                logger.debug(
+                    "NLBooleanCompressor not available — install boolean-algebra-engine[nl-anthropic]"
+                )
+        return self._nl_boolean_compressor
 
     def _get_diff_compressor(self) -> Any:
         """Get DiffCompressor (lazy load). Rust-only — Python implementation

@@ -439,6 +439,23 @@ wheels = [
 ]
 
 [[package]]
+name = "boolean-algebra-engine"
+version = "0.3.21"
+source = { registry = "https://pypi.org/simple/" }
+sdist = { url = "https://files.pythonhosted.org/packages/2d/10/39770979c896e5e64adc899ca5247c560b6662c591e957af94c54749d82b/boolean_algebra_engine-0.3.21.tar.gz", hash = "sha256:7295e84bdc539c17b9ff3b126deb30f5b6951b34eff21cafe1ab362ec9636917", size = 54233, upload-time = "2026-06-08T15:58:29.407Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/7d/d0/537c57f3ce06e703a2e17ed90874cad764070bb41afe1f35ded6c085ed08/boolean_algebra_engine-0.3.21-py3-none-any.whl", hash = "sha256:2c943115eda4c0aa614986618813b59109fe20c222e87dd4cc424c64683c5ff4", size = 48737, upload-time = "2026-06-08T15:58:28.166Z" },
+]
+
+[package.optional-dependencies]
+nl-anthropic = [
+    { name = "anthropic" },
+]
+nl-openai = [
+    { name = "openai" },
+]
+
+[[package]]
 name = "boto3"
 version = "1.43.96"
 source = { registry = "https://pypi.org/simple/" }
@@ -1568,6 +1585,15 @@ bedrock = [
     { name = "boto3" },
     { name = "botocore", extra = ["crt"] },
 ]
+boolean = [
+    { name = "boolean-algebra-engine" },
+]
+boolean-nl-anthropic = [
+    { name = "boolean-algebra-engine", extra = ["nl-anthropic"] },
+]
+boolean-nl-openai = [
+    { name = "boolean-algebra-engine", extra = ["nl-openai"] },
+]
 code = [
     { name = "tree-sitter" },
     { name = "tree-sitter-language-pack" },
@@ -1762,6 +1788,9 @@ requires-dist = [
     { name = "any-llm-sdk", marker = "python_full_version >= '3.11' and extra == 'anyllm'", specifier = ">=1.0.0" },
     { name = "ast-grep-cli", specifier = ">=0.30.0,!=0.44.1" },
     { name = "autogen-agentchat", marker = "extra == 'autogen'", specifier = ">=0.7" },
+    { name = "boolean-algebra-engine", marker = "extra == 'boolean'", specifier = ">=0.3.0" },
+    { name = "boolean-algebra-engine", extras = ["nl-anthropic"], marker = "extra == 'boolean-nl-anthropic'", specifier = ">=0.3.0" },
+    { name = "boolean-algebra-engine", extras = ["nl-openai"], marker = "extra == 'boolean-nl-openai'", specifier = ">=0.3.0" },
     { name = "boto3", marker = "extra == 'bedrock'", specifier = ">=1.41.0" },
     { name = "botocore", extras = ["crt"], marker = "extra == 'bedrock'", specifier = ">=1.41.0" },
     { name = "click", specifier = ">=8.3.3" },
@@ -1865,7 +1894,7 @@ requires-dist = [
     { name = "xlwt", marker = "extra == 'dev'", specifier = ">=1.3.0" },
     { name = "zstandard", marker = "extra == 'proxy'", specifier = ">=0.20.0" },
 ]
-provides-extras = ["proxy", "proxy-prod", "code", "ml", "memory", "vector", "memory-stack", "pytorch-mps", "relevance", "image", "reports", "spreadsheet", "otel", "anyllm", "langchain", "langgraph", "agno", "strands", "autogen", "mcp", "voice", "voice-train", "evals", "bedrock", "html", "dev", "all", "sandbox"]
+provides-extras = ["proxy", "proxy-prod", "code", "ml", "memory", "vector", "memory-stack", "pytorch-mps", "relevance", "image", "reports", "spreadsheet", "otel", "anyllm", "langchain", "boolean", "boolean-nl-anthropic", "boolean-nl-openai", "langgraph", "agno", "strands", "autogen", "mcp", "voice", "voice-train", "evals", "bedrock", "html", "dev", "all", "sandbox"]
 
 [[package]]
 name = "hf-xet"
