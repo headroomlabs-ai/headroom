@@ -3,6 +3,10 @@
 from __future__ import annotations
 
 import json
+import os
+import subprocess
+import sys
+import textwrap
 
 import pytest
 
@@ -74,3 +78,49 @@ def test_invalid_request_body_ceiling_is_rejected(raw: str) -> None:
 
     with pytest.raises(ValueError):
         resolve_request_body_max_bytes(raw)
+
+
+def test_startup_override_changes_http_admission_after_restart() -> None:
+    program = textwrap.dedent(
+        """
+        import json
+        from starlette.applications import Starlette
+        from starlette.responses import JSONResponse
+        from starlette.routing import Route
+        from starlette.testclient import TestClient
+        from headroom.proxy.request_body_limit import RequestBodyLimitMiddleware
+
+        async def preprocess(request):
+            await request.json()
+            return JSONResponse({"preprocessed": True})
+
+        app = Starlette(routes=[Route("/v1/compress", preprocess, methods=["POST"])])
+        app.add_middleware(RequestBodyLimitMiddleware)
+        with TestClient(app) as client:
+            response = client.post(
+                "/v1/compress",
+                json={"model": "gpt-4o", "messages": [{"role": "user", "content": "a" * 1500}]},
+            )
+            print(json.dumps({"status": response.status_code, "body": response.json()}))
+        """
+    )
+    results = []
+    for ceiling in (1024, 2048):
+        process = subprocess.run(
+            [sys.executable, "-c", program],
+            env={
+                **os.environ,
+                "HEADROOM_REQUEST_BODY_MAX_BYTES": str(ceiling),
+                "DO_NOT_TRACK": "1",
+                "HEADROOM_TELEMETRY": "off",
+            },
+            capture_output=True,
+            text=True,
+            check=True,
+            timeout=120,
+        )
+        results.append(json.loads(process.stdout))
+
+    assert results[0]["status"] == 413
+    assert results[0]["body"]["error"]["code"] == "request_too_large"
+    assert results[1] == {"status": 200, "body": {"preprocessed": True}}
