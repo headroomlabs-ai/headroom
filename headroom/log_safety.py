@@ -38,8 +38,8 @@ def describe_exception(exc: BaseException) -> str:
 
     Gives each exception in the cause chain as its type plus the innermost code
     locations, e.g. ``ValueError at headroom/x.py:12 in parse; caused by
-    KeyError at ...``. An ``OSError`` keeps its errno and strerror, which never
-    carry payload. With ``HEADROOM_DEBUG_DUMP=full`` it returns the full
+    KeyError at ...``. An ``OSError`` keeps its errno and the system's text for
+    it, never the exception's own strerror. With ``HEADROOM_DEBUG_DUMP=full`` it returns the full
     traceback, messages included.
     """
     if content_logging_enabled():
@@ -58,9 +58,10 @@ def describe_exception(exc: BaseException) -> str:
 
 def _describe_one(exc: BaseException) -> str:
     text = type(exc).__qualname__
-    if isinstance(exc, OSError) and exc.errno is not None:
-        # strerror is free text in some OSError subclasses (ssl.SSLError), so bound it.
-        text += f" [Errno {exc.errno}] {str(exc.strerror)[:_ID_MAX_CHARS]}"
+    if isinstance(exc, OSError) and isinstance(exc.errno, int):
+        # The system's own text for the errno; exc.strerror is free text in some
+        # subclasses (ssl.SSLError) and can quote a path or a peer's message.
+        text += f" [Errno {exc.errno}] {os.strerror(exc.errno)}"
     frames = traceback.extract_tb(exc.__traceback__)[-_MAX_FRAMES:]
     if frames:
         where = " <- ".join(
@@ -117,7 +118,8 @@ class WarnOnce:
     failure that hits many distinct keys (paths, rows, models) cannot flood the
     log on every pass. A key is used up only when WARNING is enabled, so a
     warning suppressed by the log level is still emitted later. ``forget``
-    re-arms a key once its failure has cleared.
+    re-arms a key once its failure has cleared; after the overflow notice the
+    guard stays quiet for good, so forgetting cannot reopen the cap.
     """
 
     def __init__(self, limit: int, what: str) -> None:
@@ -136,7 +138,7 @@ class WarnOnce:
         with self._lock:
             if key in self._keys:
                 return False
-            if len(self._keys) < self._limit:
+            if not self._overflowed and len(self._keys) < self._limit:
                 self._keys.add(key)
                 return True
             report_overflow = not self._overflowed
