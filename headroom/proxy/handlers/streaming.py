@@ -22,7 +22,11 @@ from headroom.proxy.helpers import (
     overload_retry_is_futile,
     retry_after_ms,
 )
-from headroom.proxy.provider_usage import billed_input_for_provider
+from headroom.proxy.provider_usage import (
+    anthropic_cache_ttl_buckets,
+    billed_input_for_provider,
+    usage_int,
+)
 from headroom.proxy.token_counting import gemini_output_tokens
 
 if TYPE_CHECKING:
@@ -38,7 +42,6 @@ from headroom.proxy.memory_tool_stream import (
     MemoryToolStreamOverflowError,
 )
 from headroom.proxy.stream_output_tokens import estimate_output_tokens
-from headroom.proxy.thinking_tokens import ThinkingTokens, extract_thinking_tokens
 from headroom.utils import format_exception_message
 
 logger = logging.getLogger("headroom.proxy")
@@ -181,23 +184,6 @@ def _upstream_error_frame(error_bytes: bytes, request_id: str) -> bytes:
     return f"event: error\ndata: {json.dumps(payload)}\n\n".encode()
 
 
-def _thinking_for_stream(payload: object) -> ThinkingTokens:
-    """Thinking-token split for a reassembled streaming response.
-
-    Shares the estimator with the non-streaming path so a streamed and an
-    unstreamed response of the same shape produce the same number — otherwise
-    the stratum would mix two different rulers.
-
-    Never raises: accounting must not cost a caller their response.
-    """
-    try:
-        from headroom.proxy.handlers.anthropic import _thinking_estimator
-
-        return extract_thinking_tokens(payload, estimator=_thinking_estimator())
-    except Exception:  # noqa: BLE001 - accounting must never break a response
-        return ThinkingTokens()
-
-
 def _sse_dict(value: Any) -> dict[str, Any]:
     """Return an upstream SSE object, or an empty object for a wrong-shaped value."""
     return value if isinstance(value, dict) else {}
@@ -310,15 +296,7 @@ class StreamingMixin:
     @staticmethod
     def _extract_anthropic_cache_ttl_metrics(usage: dict[str, Any] | None) -> tuple[int, int]:
         """Extract observed Anthropic cache-write TTL bucket usage."""
-        if not isinstance(usage, dict):
-            return (0, 0)
-        cache_creation = usage.get("cache_creation")
-        if not isinstance(cache_creation, dict):
-            return (0, 0)
-        return (
-            int(cache_creation.get("ephemeral_5m_input_tokens", 0) or 0),
-            int(cache_creation.get("ephemeral_1h_input_tokens", 0) or 0),
-        )
+        return anthropic_cache_ttl_buckets(usage)
 
     def _parse_sse_usage(self, chunk: bytes, provider: str) -> dict[str, int] | None:
         """Parse usage information from SSE chunk.
@@ -504,13 +482,6 @@ class StreamingMixin:
                     if isinstance(response, dict):
                         chunk_usage = response.get("usage")
                 if isinstance(chunk_usage, dict):
-
-                    def _usage_int(value: Any) -> int:
-                        try:
-                            return max(int(value), 0)
-                        except (TypeError, ValueError):
-                            return 0
-
                     # Chat Completions streams report prompt/completion tokens.
                     # Responses streams report input/output tokens under
                     # response.usage on response.completed.
@@ -520,15 +491,15 @@ class StreamingMixin:
                     output_tokens = chunk_usage.get("completion_tokens")
                     if output_tokens is None:
                         output_tokens = chunk_usage.get("output_tokens", 0)
-                    usage_found["input_tokens"] = _usage_int(input_tokens)
-                    usage_found["output_tokens"] = _usage_int(output_tokens)
+                    usage_found["input_tokens"] = usage_int(input_tokens)
+                    usage_found["output_tokens"] = usage_int(output_tokens)
                     details = (
                         chunk_usage.get("prompt_tokens_details")
                         or chunk_usage.get("input_tokens_details")
                         or {}
                     )
                     if isinstance(details, dict):
-                        usage_found["cache_read_input_tokens"] = _usage_int(
+                        usage_found["cache_read_input_tokens"] = usage_int(
                             details.get("cached_tokens")
                         )
 
@@ -1104,8 +1075,11 @@ class StreamingMixin:
         #
         # ``parsed_response`` is the reassembled SSE body: it carries the content
         # blocks (thinking among them) and stop_reason, which the raw usage chunk
-        # does not.
-        _stream_thinking = _thinking_for_stream(parsed_response)
+        # does not. Same helper as the non-streaming path, so a streamed and an
+        # unstreamed response of the same shape count the same.
+        from headroom.proxy.handlers.anthropic import _thinking_tokens_for
+
+        _stream_thinking = _thinking_tokens_for(parsed_response)
         _stream_stop_reason = (
             parsed_response.get("stop_reason") if isinstance(parsed_response, dict) else None
         )

@@ -37,7 +37,11 @@ from headroom.proxy.helpers import (
 from headroom.proxy.identity import resolve_memory_identity
 from headroom.proxy.loopback_guard import is_loopback_host
 from headroom.proxy.modes import is_cache_mode
-from headroom.proxy.provider_usage import billed_input_for_provider, billed_input_from_usage
+from headroom.proxy.provider_usage import (
+    billed_input_for_provider,
+    billed_input_from_usage,
+    usage_int,
+)
 from headroom.proxy.rate_limit_identity import rate_limit_identity
 from headroom.proxy.semantic_cache_key_policy import compute_request_cache_partition
 from headroom.proxy.stage_timer import StageTimer, emit_stage_timings_log
@@ -60,6 +64,7 @@ import httpx
 
 from headroom.agent_savings import proxy_pipeline_kwargs
 from headroom.ccr.marker_resolution import resolve_markers_in_response
+from headroom.ccr.tool_calls import has_ccr_retrieve_tool
 from headroom.config import is_tool_excluded, unwrap_tool_call_name
 from headroom.copilot_auth import (
     apply_copilot_api_auth,
@@ -361,20 +366,14 @@ class TurnHookUsage:
         500 a request by returning an odd shape."""
         usage = payload.get("usage") if isinstance(payload, dict) else None
 
-        def _int(value: Any) -> int:
-            try:
-                return max(int(value), 0)
-            except (TypeError, ValueError):
-                return 0
-
         if isinstance(usage, dict):
             details = usage.get(details_key)
-            cached = _int(details.get("cached_tokens")) if isinstance(details, dict) else 0
+            cached = usage_int(details.get("cached_tokens")) if isinstance(details, dict) else 0
             entry = (
                 id(payload),
                 payload,
-                _int(usage.get(input_key)),
-                _int(usage.get(output_key)),
+                usage_int(usage.get(input_key)),
+                usage_int(usage.get(output_key)),
                 cached,
             )
         else:
@@ -578,13 +577,6 @@ def _is_allowed_websocket_origin(headers: dict[str, str]) -> bool:
     return normalized_origin in normalized_allowed
 
 
-def _usage_int(value: Any) -> int:
-    try:
-        return max(int(value), 0)
-    except (TypeError, ValueError):
-        return 0
-
-
 def _passthrough_usage_from_json(payload: Any, provider: str | None = None) -> dict[str, int]:
     """Normalize usage from pass-through provider response shapes."""
     if not isinstance(payload, dict):
@@ -593,9 +585,9 @@ def _passthrough_usage_from_json(payload: Any, provider: str | None = None) -> d
     usage_meta = payload.get("usageMetadata")
     if isinstance(usage_meta, dict):
         return {
-            "input_tokens": _usage_int(usage_meta.get("promptTokenCount")),
+            "input_tokens": usage_int(usage_meta.get("promptTokenCount")),
             "output_tokens": gemini_output_tokens(usage_meta),
-            "cache_read_input_tokens": _usage_int(usage_meta.get("cachedContentTokenCount")),
+            "cache_read_input_tokens": usage_int(usage_meta.get("cachedContentTokenCount")),
         }
 
     usage = payload.get("usage")
@@ -613,10 +605,10 @@ def _passthrough_usage_from_json(payload: Any, provider: str | None = None) -> d
             # the uncached tail only (cache buckets are disjoint); OpenAI's
             # headline figure is already inclusive. Callers derive uncached as
             # total - read - write, which is only right on the total.
-            "input_tokens": billed_input_from_usage(usage, provider) or _usage_int(input_tokens),
-            "output_tokens": _usage_int(output_tokens),
-            "cache_read_input_tokens": _usage_int(usage.get("cache_read_input_tokens", cache_read)),
-            "cache_creation_input_tokens": _usage_int(usage.get("cache_creation_input_tokens")),
+            "input_tokens": billed_input_from_usage(usage, provider) or usage_int(input_tokens),
+            "output_tokens": usage_int(output_tokens),
+            "cache_read_input_tokens": usage_int(usage.get("cache_read_input_tokens", cache_read)),
+            "cache_creation_input_tokens": usage_int(usage.get("cache_creation_input_tokens")),
         }
 
     return {}
@@ -1283,29 +1275,6 @@ def _responses_input_to_learner_messages(
     return messages
 
 
-def _has_headroom_retrieve_tool_responses(tools: Any) -> bool:
-    """Return True when the Responses API tool list includes CCR retrieve.
-
-    Responses API tool defs are flat (``{"type": "function", "name": ...}``)
-    rather than nested under a "function" key like chat-completions
-    tool_calls, so this can't reuse the chat-completions tool-list check.
-    Mirrors ``AnthropicHandler._has_headroom_retrieve_tool``.
-    """
-    from headroom.ccr import CCR_TOOL_NAME
-
-    if not isinstance(tools, list):
-        return False
-    for tool in tools:
-        if not isinstance(tool, dict):
-            continue
-        if tool.get("name") == CCR_TOOL_NAME:
-            return True
-        function = tool.get("function")
-        if isinstance(function, dict) and function.get("name") == CCR_TOOL_NAME:
-            return True
-    return False
-
-
 def _should_buffer_openai_responses_stream_ccr(
     *,
     stream: bool,
@@ -1327,7 +1296,7 @@ def _should_buffer_openai_responses_stream_ccr(
         and ccr_response_handler_enabled
         and not is_chatgpt_auth
         and not is_opencode_zen_base(upstream_base_url)
-        and _has_headroom_retrieve_tool_responses(tools)
+        and has_ccr_retrieve_tool(tools)
     )
 
 
@@ -1829,16 +1798,10 @@ def _extract_responses_usage(event: dict[str, Any]) -> tuple[int, int, int, int,
     if not isinstance(usage, dict):
         return 0, 0, 0, 0, 0
 
-    def _int(value: Any) -> int:
-        try:
-            return max(int(value), 0)
-        except (TypeError, ValueError):
-            return 0
-
-    input_tokens = _int(usage.get("input_tokens"))
-    output_tokens = _int(usage.get("output_tokens"))
+    input_tokens = usage_int(usage.get("input_tokens"))
+    output_tokens = usage_int(usage.get("output_tokens"))
     details = usage.get("input_tokens_details")
-    cached_tokens = _int(details.get("cached_tokens")) if isinstance(details, dict) else 0
+    cached_tokens = usage_int(details.get("cached_tokens")) if isinstance(details, dict) else 0
     cache_write_tokens = _infer_openai_cache_write_tokens(input_tokens, cached_tokens)
     uncached_tokens = max(input_tokens - cached_tokens, 0)
     return input_tokens, output_tokens, cached_tokens, cache_write_tokens, uncached_tokens
@@ -2115,22 +2078,14 @@ class OpenAIHandlerMixin:
         *,
         frozen_message_count: int,
     ) -> tuple[list[dict[str, Any]], int]:
-        """Force frozen prefix bytes to match original request exactly."""
-        if frozen_message_count <= 0 or not original_messages:
-            return candidate_messages, 0
+        """Force frozen prefix bytes to match the original request exactly."""
+        from headroom.cache.prefix_tracker import restore_frozen_prefix
 
-        frozen = min(frozen_message_count, len(original_messages))
-        restored = list(candidate_messages)
-
-        if len(restored) < frozen:
-            return list(original_messages[:frozen]) + restored, frozen
-
-        changed = 0
-        for idx in range(frozen):
-            if restored[idx] != original_messages[idx]:
-                restored[idx] = original_messages[idx]
-                changed += 1
-        return restored, changed
+        return restore_frozen_prefix(
+            original_messages,
+            candidate_messages,
+            frozen_message_count=frozen_message_count,
+        )
 
     def _compress_openai_responses_live_text_units_with_router(
         self,
@@ -5202,12 +5157,12 @@ class OpenAIHandlerMixin:
                     # absent; a present-but-null count (some OpenAI-compatible
                     # backends emit these on a stopped/empty turn) would return
                     # None and crash the downstream `max(...)` arithmetic and the
-                    # int-typed outcome/metrics. `_usage_int` coerces both cases,
+                    # int-typed outcome/metrics. `usage_int` coerces both cases,
                     # matching the streaming path and the guarded cache keys below
                     # (same class as the gemini fix in #2347).
-                    output_tokens = _usage_int(usage.get("completion_tokens"))
+                    output_tokens = usage_int(usage.get("completion_tokens"))
                     _thinking = extract_from_usage(usage)
-                    total_input_tokens = _usage_int(usage.get("prompt_tokens")) or optimized_tokens
+                    total_input_tokens = usage_int(usage.get("prompt_tokens")) or optimized_tokens
 
                     # Cache stats: prefer the Anthropic/Bedrock top-level
                     # keys when present (authoritative). Fall back to
@@ -5709,13 +5664,13 @@ class OpenAIHandlerMixin:
                     # outside this try, so a null `prompt_tokens`/`cached_tokens`
                     # would otherwise raise an uncaught TypeError and 500 the
                     # request (same class as the gemini fix in #2347).
-                    total_input_tokens = _usage_int(usage.get("prompt_tokens")) or optimized_tokens
-                    output_tokens = _usage_int(usage.get("completion_tokens"))
+                    total_input_tokens = usage_int(usage.get("prompt_tokens")) or optimized_tokens
+                    output_tokens = usage_int(usage.get("completion_tokens"))
                     _thinking = extract_from_usage(usage)
                     # OpenAI returns cached_tokens in prompt_tokens_details
                     # These are charged at 50% of the input price
                     prompt_details = usage.get("prompt_tokens_details") or {}
-                    cache_read_tokens = _usage_int(prompt_details.get("cached_tokens"))
+                    cache_read_tokens = usage_int(prompt_details.get("cached_tokens"))
                 except (KeyError, TypeError, AttributeError) as e:
                     logger.debug(
                         f"[{request_id}] Failed to extract cached tokens from OpenAI response: {e}"
@@ -6983,21 +6938,15 @@ class OpenAIHandlerMixin:
                         resp_json = response.json()
                         usage = resp_json.get("usage", {})
 
-                        def _usage_int(value: Any, default: int = 0) -> int:
-                            try:
-                                return max(int(value), 0)
-                            except (TypeError, ValueError):
-                                return default
-
-                        total_input_tokens = _usage_int(
+                        total_input_tokens = usage_int(
                             usage.get("input_tokens"),
                             original_tokens,
                         )
-                        output_tokens = _usage_int(usage.get("output_tokens"))
+                        output_tokens = usage_int(usage.get("output_tokens"))
                         _thinking = extract_from_usage(usage)
                         details = usage.get("input_tokens_details")
                         if isinstance(details, dict):
-                            cache_read_tokens = _usage_int(details.get("cached_tokens"))
+                            cache_read_tokens = usage_int(details.get("cached_tokens"))
                     except (
                         json.JSONDecodeError,
                         ValueError,

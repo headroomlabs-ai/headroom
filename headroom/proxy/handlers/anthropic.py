@@ -33,6 +33,7 @@ import httpx
 from headroom.agent_savings import proxy_pipeline_kwargs
 from headroom.ccr.context_tracker import looks_like_claude_code_compact_summary
 from headroom.ccr.marker_resolution import resolve_markers_in_response
+from headroom.ccr.tool_calls import has_ccr_retrieve_tool
 from headroom.copilot_auth import apply_copilot_api_auth, is_copilot_upstream_url
 from headroom.pipeline import PipelineStage, summarize_routing_markers
 from headroom.proxy import public_errors
@@ -68,6 +69,7 @@ from headroom.proxy.model_router import estimate_input_tokens, request_max_token
 from headroom.proxy.nonstream_sse_policy import should_recover_sse_reply
 from headroom.proxy.outcome import RequestOutcome
 from headroom.proxy.output_shaper import shaper_enabled_for, steering_allowed_for
+from headroom.proxy.provider_usage import anthropic_cache_ttl_buckets, usage_int
 from headroom.proxy.rate_limit_identity import rate_limit_identity
 from headroom.proxy.semantic_cache_key_policy import compute_request_cache_partition
 from headroom.proxy.tenant_key import resolve_tenant_key, set_request_tenant_key
@@ -171,28 +173,21 @@ class _AnthropicTurnHookUsage:
         self.cache_write_1h_tokens = 0
         self.extra_calls = 0
 
-    @staticmethod
-    def _int(value: Any) -> int:
-        try:
-            return max(0, int(value or 0))
-        except (TypeError, ValueError):
-            return 0
-
     def record(self, payload: Any) -> None:
         usage = payload.get("usage") if isinstance(payload, dict) else None
         if not isinstance(usage, dict):
             self._seen.append((payload, 0, 0, 0, 0, 0, 0))
             return
-        cache_read = self._int(usage.get("cache_read_input_tokens"))
-        cache_write = self._int(usage.get("cache_creation_input_tokens"))
+        cache_read = usage_int(usage.get("cache_read_input_tokens"))
+        cache_write = usage_int(usage.get("cache_creation_input_tokens"))
         creation = usage.get("cache_creation")
         cache_write_5m = (
-            self._int(creation.get("ephemeral_5m_input_tokens"))
+            usage_int(creation.get("ephemeral_5m_input_tokens"))
             if isinstance(creation, dict)
             else 0
         )
         cache_write_1h = (
-            self._int(creation.get("ephemeral_1h_input_tokens"))
+            usage_int(creation.get("ephemeral_1h_input_tokens"))
             if isinstance(creation, dict)
             else 0
         )
@@ -200,7 +195,7 @@ class _AnthropicTurnHookUsage:
             (
                 payload,
                 _anthropic_provider_input_tokens(usage),
-                self._int(usage.get("output_tokens")),
+                usage_int(usage.get("output_tokens")),
                 cache_read,
                 cache_write,
                 cache_write_5m,
@@ -240,7 +235,7 @@ def _anthropic_provider_input_tokens(usage: Any) -> int:
     if not isinstance(usage, dict):
         return 0
     return sum(
-        _AnthropicTurnHookUsage._int(usage.get(key))
+        usage_int(usage.get(key))
         for key in (
             "input_tokens",
             "cache_read_input_tokens",
@@ -505,21 +500,6 @@ class AnthropicHandlerMixin:
             and name not in client_tool_names
         )
 
-    @staticmethod
-    def _has_headroom_retrieve_tool(tools: Any) -> bool:
-        """Return True when the final Anthropic tool list includes CCR retrieve."""
-        if not isinstance(tools, list):
-            return False
-        for tool in tools:
-            if not isinstance(tool, dict):
-                continue
-            if tool.get("name") == "headroom_retrieve":
-                return True
-            function = tool.get("function")
-            if isinstance(function, dict) and function.get("name") == "headroom_retrieve":
-                return True
-        return False
-
     def _can_salvage_buffered_upstream(self, resp_json: Any) -> bool:
         """May this upstream response be relayed when post-processing failed?
 
@@ -590,19 +570,10 @@ class AnthropicHandlerMixin:
     def _extract_anthropic_cache_ttl_metrics(usage: dict[str, Any] | None) -> tuple[int, int]:
         """Extract observed Anthropic cache-write TTL bucket usage.
 
-        HeadroomProxy also inherits StreamingMixin, which exposes the same
-        helper for SSE usage parsing. Keep this local copy so the Anthropic
-        handler remains safe when tested or embedded without StreamingMixin.
+        StreamingMixin defines the same method; both delegate to one helper so
+        this handler stays usable without StreamingMixin (tests, embedding).
         """
-        if not isinstance(usage, dict):
-            return (0, 0)
-        cache_creation = usage.get("cache_creation")
-        if not isinstance(cache_creation, dict):
-            return (0, 0)
-        return (
-            int(cache_creation.get("ephemeral_5m_input_tokens", 0) or 0),
-            int(cache_creation.get("ephemeral_1h_input_tokens", 0) or 0),
-        )
+        return anthropic_cache_ttl_buckets(usage)
 
     def _anthropic_buffered_request_timeout(self) -> httpx.Timeout:
         """Timeout for buffered Anthropic reads."""
@@ -790,22 +761,13 @@ class AnthropicHandlerMixin:
         frozen_message_count: int,
     ) -> tuple[list[dict[str, Any]], int]:
         """Force frozen prefix bytes to match the original request exactly."""
-        if frozen_message_count <= 0 or not original_messages:
-            return candidate_messages, 0
+        from headroom.cache.prefix_tracker import restore_frozen_prefix
 
-        frozen = min(frozen_message_count, len(original_messages))
-        restored = list(candidate_messages)
-
-        # Defensive: if a transform dropped prefix messages, restore them.
-        if len(restored) < frozen:
-            return list(original_messages[:frozen]) + restored, frozen
-
-        changed = 0
-        for idx in range(frozen):
-            if restored[idx] != original_messages[idx]:
-                restored[idx] = original_messages[idx]
-                changed += 1
-        return restored, changed
+        return restore_frozen_prefix(
+            original_messages,
+            candidate_messages,
+            frozen_message_count=frozen_message_count,
+        )
 
     @staticmethod
     def _extract_cache_stable_delta(
@@ -4012,9 +3974,7 @@ class AnthropicHandlerMixin:
                 retrieve_tool_is_offered = (
                     stream
                     and ccr_response_handler_enabled
-                    and self._has_headroom_retrieve_tool(
-                        tools if tools is not None else body.get("tools")
-                    )
+                    and has_ccr_retrieve_tool(tools if tools is not None else body.get("tools"))
                 )
                 buffered_retrieval_can_help = (
                     retrieve_tool_is_offered and self._outgoing_body_has_redeemable_marker(body)
