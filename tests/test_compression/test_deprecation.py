@@ -5,6 +5,7 @@ from __future__ import annotations
 import importlib
 import sys
 import warnings
+from collections.abc import Iterator
 
 import pytest
 
@@ -12,12 +13,19 @@ import headroom.compression as compression
 
 
 @pytest.fixture
-def fresh(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Drop cached exports and the universal module; monkeypatch restores both."""
+def fresh(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
+    """Drop cached exports and the universal module for the test.
+
+    Exports cached during the test are dropped again afterwards; monkeypatch
+    then restores whatever was cached before.
+    """
     for name in compression.__all__:
         monkeypatch.delitem(compression.__dict__, name, raising=False)
     monkeypatch.delitem(sys.modules, "headroom.compression.universal", raising=False)
     monkeypatch.delattr(compression, "universal", raising=False)
+    yield
+    for name in compression.__all__:
+        compression.__dict__.pop(name, None)
 
 
 @pytest.mark.usefixtures("fresh")
@@ -80,3 +88,12 @@ def test_reload_drops_cached_exports(monkeypatch: pytest.MonkeyPatch) -> None:
     with pytest.warns(DeprecationWarning):
         assert compression.ContentType is detector.ContentType
     assert compression.ContentType is not old_content_type
+
+
+def test_reload_test_leaves_no_stale_export() -> None:
+    # Runs after the reload test in file order: the cached export must be the real one.
+    from headroom.compression.detector import ContentType
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", DeprecationWarning)
+        assert compression.ContentType is ContentType
