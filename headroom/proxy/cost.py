@@ -16,6 +16,7 @@ from datetime import datetime, timedelta
 from typing import TYPE_CHECKING, Any, NamedTuple
 
 from headroom.cache_economics import CACHE_ECONOMICS as _CACHE_ECONOMICS
+from headroom.log_safety import WarnOnce, describe_exception, safe_id
 from headroom.proxy.budget_basis_policy import (
     BUDGET_BASIS_BLOCK,
     BUDGET_BASIS_IGNORE,
@@ -57,30 +58,26 @@ logger = logging.getLogger("headroom.proxy")
 # Pricing-lookup warnings are emitted on the per-request cost path, so an
 # unresolvable model (a custom / OpenAI-compatible name LiteLLM can't price,
 # e.g. glm-5.2) floods proxy.log with an identical WARNING every single request
-# (#2504). Track which models have already been warned so each fires once per
-# process. Model names come from clients, so the set is capped: when it fills it
-# is cleared, which at worst repeats a warning instead of growing without bound.
-_warned_pricing_models: set[str] = set()
-_WARNED_PRICING_MODELS_MAX = 1024
+# (#2504). Each (lookup, model) pair warns once; model names come from clients,
+# so WarnOnce also caps how many distinct models can warn.
+_pricing_warnings = WarnOnce(1024, "unpriceable models")
 
 
-def _warn_pricing_once(model: str, message: str, exc: BaseException | None = None) -> None:
-    """Emit ``message`` at WARNING only the first time ``model`` fails pricing.
+def _warn_pricing_once(
+    lookup: str, what: str, model: str, exc: BaseException | None = None
+) -> None:
+    """Warn once per ``(lookup, model)`` that pricing failed, payload-safe.
 
-    With ``exc``, the WARNING names only the exception type: pricing errors can
-    echo the client's model string or provider internals. The full exception
-    goes to DEBUG.
+    A pricing backend's exception can quote provider responses or credentials,
+    so only :func:`describe_exception` (types and code locations) is logged, at
+    every level.
     """
-    if model in _warned_pricing_models or not logger.isEnabledFor(logging.WARNING):
+    if not _pricing_warnings.first((lookup, model), logger):
         return
-    if len(_warned_pricing_models) >= _WARNED_PRICING_MODELS_MAX:
-        _warned_pricing_models.clear()
-    _warned_pricing_models.add(model)
     if exc is None:
-        logger.warning(message)
-        return
-    logger.warning("%s (%s)", message, type(exc).__name__)
-    logger.debug("%s", message, exc_info=exc)
+        logger.warning("%s for model %s", what, safe_id(model))
+    else:
+        logger.warning("%s for model %s: %s", what, safe_id(model), describe_exception(exc))
 
 
 # A route whose responses never carry a usage breakdown hits the estimated-basis
@@ -290,9 +287,7 @@ def build_prefix_cache_stats(
                             cache_prices = resolve_rates(model_name)
                         except Exception as e:
                             _warn_pricing_once(
-                                f"__cache_rates__:{model_name}",
-                                f"Failed to resolve cache rates for model {model_name}",
-                                e,
+                                "cache_rates", "Failed to resolve cache rates", model_name, e
                             )
                             cache_prices = None
                         best_tokens = tokens_sent
@@ -990,8 +985,7 @@ class CostTracker:
         litellm = _get_litellm_module()
         if litellm is None:
             _warn_pricing_once(
-                f"__litellm_unavailable__:{model}",
-                f"LiteLLM not available - cannot calculate costs for model {model}",
+                "litellm_unavailable", "LiteLLM not available - cannot calculate costs", model
             )
             return None
 
@@ -1014,7 +1008,7 @@ class CostTracker:
             return float(total_cost) if total_cost > 0 else None
 
         except Exception as e:
-            _warn_pricing_once(model, f"Failed to get pricing for model {model}", e)
+            _warn_pricing_once("estimate", "Failed to get pricing", model, e)
             return None
 
     def _prune_old_costs(self):
@@ -1388,9 +1382,7 @@ class CostTracker:
             cost_per_token = info.get("input_cost_per_token")
             return cost_per_token * 1_000_000 if cost_per_token else None
         except Exception as e:
-            _warn_pricing_once(
-                f"__list_price__:{model}", f"Failed to get list price for model {model}", e
-            )
+            _warn_pricing_once("list_price", "Failed to get list price", model, e)
             return None
 
     def _get_output_price(self, model: str, *, long_context: bool = False) -> float | None:
@@ -1412,9 +1404,7 @@ class CostTracker:
                 return info.get("output_cost_per_token_above_200k_tokens") or base or None
             return base or None
         except Exception as e:
-            _warn_pricing_once(
-                f"__output_price__:{model}", f"Failed to get output price for model {model}", e
-            )
+            _warn_pricing_once("output_price", "Failed to get output price", model, e)
             return None
 
     def _write_cost_usd(self, model: str, w5m_price: float, w1h_price: float) -> float:
@@ -1469,9 +1459,7 @@ class CostTracker:
 
             rates = resolve_rates(model, long_context=long_context, for_billing=for_billing)
         except Exception as e:
-            _warn_pricing_once(
-                f"__cache_rates__:{model}", f"Failed to resolve cache rates for model {model}", e
-            )
+            _warn_pricing_once("cache_rates", "Failed to resolve cache rates", model, e)
             return None
         if rates is None or not rates.uncached:
             return None

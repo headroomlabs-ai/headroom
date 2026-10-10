@@ -10,13 +10,15 @@ import logging
 
 import pytest
 
+from headroom.log_safety import WarnOnce
+
 
 @pytest.fixture
 def cost_tracker(monkeypatch: pytest.MonkeyPatch):
     import headroom.proxy.cost as cost_mod
 
-    # Reset the per-process dedup set so tests are order-independent.
-    cost_mod._warned_pricing_models.clear()
+    # A fresh dedup guard so tests are order-independent.
+    monkeypatch.setattr(cost_mod, "_pricing_warnings", WarnOnce(1024, "unpriceable models"))
 
     class _FakeLiteLLM:
         @staticmethod
@@ -33,7 +35,7 @@ def test_pricing_failure_warns_once_per_model(cost_tracker, caplog):
             assert cost_tracker.estimate_cost("glm-5.2", 100, 50) is None
 
     warnings = [
-        r for r in caplog.records if "Failed to get pricing for model glm-5.2" in r.getMessage()
+        r for r in caplog.records if "Failed to get pricing for model 'glm-5.2'" in r.getMessage()
     ]
     assert len(warnings) == 1
 
@@ -46,14 +48,14 @@ def test_distinct_models_each_warn_once(cost_tracker, caplog):
         cost_tracker.estimate_cost("mystery-model", 10, 5)
 
     msgs = [r.getMessage() for r in caplog.records if "Failed to get pricing" in r.getMessage()]
-    assert sum("for model glm-5.2 (" in m for m in msgs) == 1
-    assert sum("for model mystery-model (" in m for m in msgs) == 1
+    assert sum("for model 'glm-5.2':" in m for m in msgs) == 1
+    assert sum("for model 'mystery-model':" in m for m in msgs) == 1
 
 
 def test_litellm_unavailable_warns_once_per_model(monkeypatch, caplog):
     import headroom.proxy.cost as cost_mod
 
-    cost_mod._warned_pricing_models.clear()
+    monkeypatch.setattr(cost_mod, "_pricing_warnings", WarnOnce(1024, "unpriceable models"))
     monkeypatch.setattr(cost_mod, "_get_litellm_module", lambda: None)
     tracker = cost_mod.CostTracker()
 

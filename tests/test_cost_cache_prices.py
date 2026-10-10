@@ -14,6 +14,7 @@ from types import SimpleNamespace
 
 import pytest
 
+from headroom.log_safety import WarnOnce
 from headroom.pricing.counterfactual import resolve_rates
 from headroom.proxy.cost import CostTracker
 
@@ -374,7 +375,7 @@ def test_cache_rate_failure_warns_once_per_model(monkeypatch: pytest.MonkeyPatch
     """A raising rate resolver used to read as 'unpriced' ($0) with no trace."""
     from headroom.proxy import cost
 
-    monkeypatch.setattr(cost, "_warned_pricing_models", set())
+    monkeypatch.setattr(cost, "_pricing_warnings", WarnOnce(1024, "unpriceable models"))
     _patch_litellm(
         monkeypatch,
         {"m": {"input_cost_per_token": 1e-6, "litellm_provider": "anthropic"}},
@@ -396,5 +397,42 @@ def test_cache_rate_failure_warns_once_per_model(monkeypatch: pytest.MonkeyPatch
 
     warnings = [r.getMessage() for r in capture.records if r.levelno == logging.WARNING]
     assert len(warnings) == 1
-    assert "for model m" in warnings[0] and "RuntimeError" in warnings[0]
-    assert "pricing table corrupt" not in warnings[0]  # exception text stays at DEBUG
+    assert "for model 'm'" in warnings[0] and "RuntimeError" in warnings[0]
+    assert "pricing table corrupt" not in warnings[0]
+
+
+_CREDENTIAL_CANARY = "Authorization: Bearer sk-canary-7f3a9c"
+
+
+def test_pricing_error_never_logs_its_text_at_any_level(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A pricing backend error quoting a credential must not reach any log record.
+
+    Formats every WARNING and DEBUG record with a real Formatter, which renders
+    exc_info too, so a traceback carrying the text would be caught.
+    """
+    from headroom.proxy import cost
+
+    class _LeakyLiteLLM:
+        model_cost: dict = {}
+
+        @staticmethod
+        def cost_per_token(**_kwargs):
+            raise RuntimeError(f"upstream rejected request ({_CREDENTIAL_CANARY})")
+
+    monkeypatch.setattr(cost, "_pricing_warnings", WarnOnce(1024, "unpriceable models"))
+    monkeypatch.setattr(cost, "_get_litellm_module", lambda: _LeakyLiteLLM())
+    monkeypatch.delenv("HEADROOM_DEBUG_DUMP", raising=False)
+    capture = _Capture()
+    previous_level = cost.logger.level
+    cost.logger.setLevel(logging.DEBUG)
+    cost.logger.addHandler(capture)
+    try:
+        assert CostTracker().estimate_cost("gpt-4o", 100, 10) is None
+    finally:
+        cost.logger.removeHandler(capture)
+        cost.logger.setLevel(previous_level)
+
+    formatter = logging.Formatter()
+    rendered = [formatter.format(r) for r in capture.records if r.levelno >= logging.DEBUG]
+    assert any("Failed to get pricing for model 'gpt-4o'" in line for line in rendered)
+    assert all("sk-canary" not in line for line in rendered), rendered
