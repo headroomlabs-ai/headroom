@@ -665,4 +665,4 @@ def test_many_unwritable_ledgers_do_not_warn_on_every_cycle(
     # 64 per-path warnings plus one overflow notice, over all three cycles.
     assert len(warnings) == 65
     assert sum("append to" in w for w in warnings) == 64
-    assert "More than 64 distinct unwritable savings ledgers" in warnings[-1]
+    assert "More than 64 warnings about unwritable savings ledgers" in warnings[-1]
