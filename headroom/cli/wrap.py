@@ -87,7 +87,6 @@ from headroom.providers.antigravity import (
     render_setup_lines as _render_antigravity_setup_lines,
 )
 from headroom.providers.claude import (
-    CONTEXT_1M_SUFFIX,
     DEFAULT_1M_MODEL,
     HEADROOM_1M_MODEL_ENV,
     REMOTE_CONTROL_BASE_URL_ENV,
@@ -172,6 +171,7 @@ from headroom.providers.grok import (
 )
 from headroom.providers.grok_build import render_setup_lines as _render_grok_build_setup_lines
 from headroom.providers.grok_build.config import (
+    grok_config_paths,
     inject_grok_provider_config,
     restore_grok_provider_config,
 )
@@ -192,9 +192,6 @@ from headroom.providers.openclaw import (
 )
 from headroom.providers.openclaw import (
     decode_entry_json as _decode_openclaw_entry_json_impl,
-)
-from headroom.providers.openclaw import (
-    normalize_gateway_provider_ids as _normalize_openclaw_gateway_provider_ids_impl,
 )
 from headroom.providers.opencode import build_launch_env as _build_opencode_launch_env
 from headroom.providers.opencode.config import (
@@ -331,15 +328,6 @@ def _append_text(path: Path, content: str) -> None:
     fsutil.append_text(path, content)
 
 
-_AGENT_SAVINGS_TARGET_AGENTS = {
-    "antigravity",
-    "claude",
-    "codex",
-    "cursor",
-    "grok",
-    "grok_build",
-    "opencode",
-}
 _WRAP_PROXY_TIMEOUT_ENV = "HEADROOM_WRAP_PROXY_TIMEOUT"
 _WRAP_PROXY_TIMEOUT_DEFAULT_SECONDS = 45
 _WRAP_PROXY_TIMEOUT_ML_DEFAULT_SECONDS = 90
@@ -373,10 +361,8 @@ _CLAUDE_PROJECT_SETTINGS_ENV = "HEADROOM_CLAUDE_PROJECT_SETTINGS"
 _ANTHROPIC_MODEL_ENV = "ANTHROPIC_MODEL"
 # Private aliases preserve the standalone wrapper's existing test and import
 # surface while the provider runtime owns the 1M selection contract.
-_CONTEXT_1M_SUFFIX = CONTEXT_1M_SUFFIX
 _1M_MODEL_ENV = HEADROOM_1M_MODEL_ENV
 _DEFAULT_1M_MODEL = DEFAULT_1M_MODEL
-_OPENCLAUDE_INSTRUCTIONS_FILE = "CONVENTIONS.md"
 
 
 _resolve_1m_model = resolve_1m_model
@@ -1180,6 +1166,42 @@ _code_memory_scope_option = click.option(
 )
 
 
+def _legacy_code_memory_options(command: Any) -> Any:
+    """Hidden pre-``--code-memory`` flags, still accepted by claude/codex/grok."""
+    for decorator in (
+        click.option(
+            "--no-serena",
+            is_flag=True,
+            hidden=True,
+            help="Deprecated: use --code-memory none. Register no code-memory MCP.",
+        ),
+        click.option(
+            "--serena",
+            is_flag=True,
+            hidden=True,
+            help="Deprecated: use --code-memory serena. Force the Serena MCP compressor on.",
+        ),
+        click.option(
+            "--no-tokensave",
+            is_flag=True,
+            hidden=True,
+            help="Deprecated and ignored: tokensave was retired; Serena is the default code memory.",
+        ),
+    ):
+        command = decorator(command)
+    return command
+
+
+def _require_binary(*names: str, install_hint: str) -> str:
+    """Return the first of ``names`` on PATH, or fail with how to install it."""
+    for name in names:
+        found = shutil.which(name)
+        if found:
+            return found
+    shown = f"'{names[0]}'" + "".join(f" (or '{name}')" for name in names[1:])
+    raise click.ClickException(f"{shown} not found in PATH.\n{install_hint}")
+
+
 # Hook-command markers Headroom manages in Claude settings.json. unwrap drops
 # any hook entry whose command contains one of these. (Retired rtk / lean-ctx
 # hooks are removed separately, by
@@ -1701,25 +1723,6 @@ def _wrap_proxy_alive(port: int, *, attempts: int = 3, delay: float = 0.25) -> b
         if attempt < attempts - 1:
             time.sleep(delay)
     return False
-
-
-def _wrap_marker_proxy_is_dead(marker: dict[str, Any]) -> bool:
-    """True if ``marker`` records a proxy ``port`` that no longer accepts
-    connections.
-
-    Port liveness is the authoritative signal for a wrap session that vanished
-    without running its cleanup (hard reboot / SIGKILL, issue #2221): the
-    recorded PID is unreliable because a reboot can recycle it onto an
-    unrelated live process, so a PID that still looks alive does not prove the
-    proxy is up. A marker with no recorded port returns False here (fall back
-    to PID-based staleness); a marker whose port IS responding is a live
-    session and must never be treated as dead. Uses the retry-hardened
-    ``_wrap_proxy_alive`` so a momentary blip never reads as dead.
-    """
-    port = marker.get("port")
-    if not isinstance(port, int):
-        return False
-    return not _wrap_proxy_alive(port)
 
 
 def _clear_wrap_marker(settings_path: Path, *, key: str) -> None:
@@ -3639,11 +3642,30 @@ def _inject_codex_provider_config(port: int) -> str | None:
         _snapshot_codex_config_if_unwrapped(config_file, backup_file)
 
         if config_file.exists():
-            content = _read_text(config_file)
+            original = _read_text(config_file)
             # Remove any prior Headroom-managed blocks before re-injecting so
             # the operation is idempotent and supports port changes.
-            content = _strip_codex_headroom_blocks(content)
+            content = _strip_codex_headroom_blocks(original)
             content = _strip_existing_codex_headroom_provider_table(content)
+
+            # Report a broken file in the user's own terms. The candidate
+            # validated below is the merged text, so its parse error would
+            # name a line the user never wrote. Only the user's part has to
+            # parse: stripping a stale Headroom block may be what repairs it.
+            try:
+                tomllib.loads(content)
+            except tomllib.TOMLDecodeError:
+                try:
+                    tomllib.loads(original)
+                    reason = "it is no longer valid TOML once Headroom's block is removed"
+                except tomllib.TOMLDecodeError as exc:
+                    reason = f"it is not valid TOML ({exc})"
+                click.echo(
+                    f"  Warning: could not update Codex config {config_file}: {reason}; "
+                    "Codex WebSocket traffic will bypass Headroom. Fix or remove the file, "
+                    "then re-run."
+                )
+                return None
 
             # Bare top-level keys must precede any [section] in TOML, and
             # TOML rejects duplicate top-level keys.  Rewrite any existing
@@ -3695,7 +3717,7 @@ def _inject_codex_provider_config(port: int) -> str | None:
         # history list stays whole once it routes through Headroom. Best-effort.
         retag_to_headroom(_codex_home_dir())
     except Exception as e:
-        click.echo(f"  Warning: could not update Codex config: {e}")
+        click.echo(f"  Warning: could not update Codex config {config_file}: {e}")
         return None
 
     return custom_upstream_base_url
@@ -4067,76 +4089,6 @@ def _proxy_health_config(payload: dict[str, Any] | None) -> dict[str, Any] | Non
 
 def _env_bool_value(value: str) -> bool:
     return value.strip().lower() in {"1", "true", "yes", "on"}
-
-
-def _agent_savings_config_mismatches(
-    running_config: dict[str, Any],
-    agent_type: str,
-) -> list[str]:
-    """Return restart reasons when a running proxy lacks target agent savings."""
-
-    if agent_type not in _AGENT_SAVINGS_TARGET_AGENTS:
-        return []
-
-    if _wrap_agent_savings_profile(agent_type) is None:
-        return []
-
-    desired_env = os.environ.copy()
-    apply_agent_savings_env_defaults(desired_env)
-    checks: tuple[tuple[str, str, str, str], ...] = (
-        ("HEADROOM_SAVINGS_PROFILE", "savings_profile", "savings-profile", "str"),
-        ("HEADROOM_TARGET_RATIO", "target_ratio", "target-ratio", "float"),
-        (
-            "HEADROOM_COMPRESS_USER_MESSAGES",
-            "compress_user_messages",
-            "compress-user-messages",
-            "bool",
-        ),
-        (
-            "HEADROOM_COMPRESS_SYSTEM_MESSAGES",
-            "compress_system_messages",
-            "compress-system-messages",
-            "bool",
-        ),
-        ("HEADROOM_PROTECT_RECENT", "protect_recent", "protect-recent", "int"),
-        (
-            "HEADROOM_PROTECT_ANALYSIS_CONTEXT",
-            "protect_analysis_context",
-            "protect-analysis-context",
-            "bool",
-        ),
-        ("HEADROOM_MIN_TOKENS", "min_tokens_to_crush", "min-tokens", "int"),
-        ("HEADROOM_MAX_ITEMS", "max_items_after_crush", "max-items", "int"),
-        (
-            "HEADROOM_SMART_CRUSHER_COMPACTION",
-            "smart_crusher_with_compaction",
-            "smart-crusher-compaction",
-            "bool",
-        ),
-        ("HEADROOM_ACCURACY_GUARD", "accuracy_guard", "accuracy-guard", "str"),
-    )
-
-    mismatches: list[str] = []
-    for env_key, config_key, label, value_type in checks:
-        expected = desired_env.get(env_key)
-        if expected is None:
-            continue
-        actual = running_config.get(config_key)
-        try:
-            if value_type == "float":
-                matches = actual is not None and abs(float(actual) - float(expected)) < 1e-9
-            elif value_type == "int":
-                matches = actual is not None and int(actual) == int(expected)
-            elif value_type == "bool":
-                matches = actual is not None and bool(actual) is _env_bool_value(expected)
-            else:
-                matches = str(actual or "").strip().lower() == expected.strip().lower()
-        except (TypeError, ValueError):
-            matches = False
-        if not matches:
-            mismatches.append(label)
-
-    return mismatches
 
 
 def _proxy_active_session_count(payload: dict[str, Any] | None) -> int:
@@ -4584,17 +4536,6 @@ def _find_persistent_manifest(port: int) -> Any:
     return manifests[0] if manifests else None
 
 
-def _wait_for_runtime_ready(manifest: Any, timeout_seconds: int) -> bool:
-    """Keep wrap recovery gated by both readiness and runtime identity."""
-    from headroom.install.runtime import wait_ready
-
-    try:
-        return wait_ready(manifest, timeout_seconds=timeout_seconds, require_identity=True)
-    except TypeError:
-        # Compatibility for test doubles that predate the keyword-only guard.
-        return wait_ready(manifest, timeout_seconds=timeout_seconds)
-
-
 def _recover_persistent_proxy(port: int) -> bool:
     """Start or recover a matching persistent deployment for the requested port."""
     from headroom.install.models import SupervisorKind
@@ -4603,6 +4544,7 @@ def _recover_persistent_proxy(port: int) -> bool:
         runtime_ready,
         start_detached_agent,
         start_persistent_docker,
+        wait_ready,
     )
     from headroom.install.supervisors import start_supervisor
 
@@ -4637,7 +4579,7 @@ def _recover_persistent_proxy(port: int) -> bool:
         )
         return False
 
-    if _wait_for_runtime_ready(manifest, 45):
+    if wait_ready(manifest, timeout_seconds=45, require_identity=True):
         click.echo(f"  Recovered persistent deployment '{manifest.profile}' on port {port}")
         return True
 
@@ -4653,6 +4595,7 @@ def _restart_persistent_proxy(manifest: Any, port: int) -> bool:
         start_detached_agent,
         start_persistent_docker,
         stop_runtime,
+        wait_ready,
     )
     from headroom.install.supervisors import start_supervisor
 
@@ -4677,7 +4620,7 @@ def _restart_persistent_proxy(manifest: Any, port: int) -> bool:
         )
         return False
 
-    if _wait_for_runtime_ready(manifest, 45):
+    if wait_ready(manifest, timeout_seconds=45, require_identity=True):
         click.echo(f"  Restarted persistent deployment '{manifest.profile}' on port {port}")
         return True
 
@@ -5642,11 +5585,6 @@ def _resolve_openclaw_extensions_dir(openclaw_bin: str) -> Path:
     return config_path.parent / "extensions"
 
 
-def _normalize_openclaw_gateway_provider_ids(provider_ids: tuple[str, ...] | None) -> list[str]:
-    """Normalize configured OpenClaw provider ids, defaulting to openai-codex."""
-    return _normalize_openclaw_gateway_provider_ids_impl(provider_ids)
-
-
 def _read_openclaw_config_value(openclaw_bin: str, path: str) -> Any | None:
     """Read an OpenClaw config value when present, returning None on missing paths."""
     result = run(
@@ -5947,24 +5885,7 @@ def _detect_inbound_anthropic_upstream(port: int) -> str | None:
 )
 @_code_memory_option
 @_code_memory_scope_option
-@click.option(
-    "--no-tokensave",
-    is_flag=True,
-    hidden=True,
-    help="Deprecated and ignored: tokensave was retired; Serena is the default code memory.",
-)
-@click.option(
-    "--serena",
-    is_flag=True,
-    hidden=True,
-    help="Deprecated: use --code-memory serena. Force the Serena MCP compressor on.",
-)
-@click.option(
-    "--no-serena",
-    is_flag=True,
-    hidden=True,
-    help="Deprecated: use --code-memory none. Register no code-memory MCP.",
-)
+@_legacy_code_memory_options
 @click.option(
     "--code-graph",
     is_flag=True,
@@ -6064,11 +5985,9 @@ def claude(
     if prepare_only:
         return
 
-    claude_bin = shutil.which("claude")
-    if not claude_bin:
-        click.echo("Error: 'claude' not found in PATH.")
-        click.echo("Install Claude Code: https://docs.anthropic.com/en/docs/claude-code")
-        raise SystemExit(1)
+    claude_bin = _require_binary(
+        "claude", install_hint="Install Claude Code: https://docs.anthropic.com/en/docs/claude-code"
+    )
 
     # Validate --tool-search up front so a typo fails before we start the proxy.
     if tool_search is not None:
@@ -6662,14 +6581,13 @@ def copilot(
     explicitly with GITHUB_COPILOT_API_URL (the override flows through to upstream).
     See TESTING-copilot-subscription.md for details.
     """
-    copilot_bin = shutil.which("copilot")
-    if not copilot_bin:
-        click.echo("Error: 'copilot' not found in PATH.")
-        click.echo(
+    copilot_bin = _require_binary(
+        "copilot",
+        install_hint=(
             "Install GitHub Copilot CLI: "
             "https://docs.github.com/en/copilot/how-tos/copilot-cli/set-up-copilot-cli/install-copilot-cli"
-        )
-        raise SystemExit(1)
+        ),
+    )
 
     explicit_subscription = subscription
     effective_backend = backend or os.environ.get("HEADROOM_BACKEND")
@@ -7271,11 +7189,9 @@ def _run_codex_wrap(
         )
         return
 
-    codex_bin = shutil.which("codex")
-    if not codex_bin:
-        click.echo("Error: 'codex' not found in PATH.")
-        click.echo("Install Codex CLI: npm install -g @openai/codex")
-        raise SystemExit(1)
+    codex_bin = _require_binary(
+        "codex", install_hint="Install Codex CLI: npm install -g @openai/codex"
+    )
 
     active_codex_home = _codex_home_dir()
     _offer_dangling_codex_recovery(active_codex_home)
@@ -7335,24 +7251,7 @@ def _run_codex_wrap(
     help="Skip headroom MCP server registration (compression markers will be unactionable)",
 )
 @_code_memory_option
-@click.option(
-    "--no-tokensave",
-    is_flag=True,
-    hidden=True,
-    help="Deprecated and ignored: tokensave was retired; Serena is the default code memory.",
-)
-@click.option(
-    "--serena",
-    is_flag=True,
-    hidden=True,
-    help="Deprecated: use --code-memory serena. Force the Serena MCP compressor on.",
-)
-@click.option(
-    "--no-serena",
-    is_flag=True,
-    hidden=True,
-    help="Deprecated: use --code-memory none. Register no code-memory MCP.",
-)
+@_legacy_code_memory_options
 @click.option(
     "--code-graph",
     is_flag=True,
@@ -7483,11 +7382,7 @@ def aider(
     if prepare_only:
         return
 
-    aider_bin = shutil.which("aider")
-    if not aider_bin:
-        click.echo("Error: 'aider' not found in PATH.")
-        click.echo("Install aider: pip install aider-chat")
-        raise SystemExit(1)
+    aider_bin = _require_binary("aider", install_hint="Install aider: pip install aider-chat")
 
     env, env_vars_display = _build_aider_launch_env(
         port, os.environ, project=_project_name_from_cwd()
@@ -7554,11 +7449,9 @@ def vibe(
     if prepare_only:
         return
 
-    vibe_bin = shutil.which("vibe")
-    if not vibe_bin:
-        click.echo("Error: 'vibe' not found in PATH.")
-        click.echo("Install Mistral Vibe: https://github.com/mistralai/mistral-vibe")
-        raise SystemExit(1)
+    vibe_bin = _require_binary(
+        "vibe", install_hint="Install Mistral Vibe: https://github.com/mistralai/mistral-vibe"
+    )
 
     env, env_vars_display = _build_mistral_vibe_launch_env(
         port, os.environ, project=_project_name_from_cwd()
@@ -7633,11 +7526,9 @@ def kimi(
     if prepare_only:
         return
 
-    kimi_bin = shutil.which("kimi") or shutil.which("kimi-cli")
-    if not kimi_bin:
-        click.echo("Error: 'kimi' (or 'kimi-cli') not found in PATH.")
-        click.echo("Install Kimi CLI: https://github.com/MoonshotAI/kimi-cli")
-        raise SystemExit(1)
+    kimi_bin = _require_binary(
+        "kimi", "kimi-cli", install_hint="Install Kimi CLI: https://github.com/MoonshotAI/kimi-cli"
+    )
 
     project = _project_name_from_cwd()
     env, env_vars_display = _build_kimi_launch_env(port, os.environ, project=project)
@@ -7682,24 +7573,7 @@ def kimi(
 @proxy_port_option()
 @click.option("--no-mcp", is_flag=True, help="Skip headroom MCP server registration")
 @_code_memory_option
-@click.option(
-    "--no-tokensave",
-    is_flag=True,
-    hidden=True,
-    help="Deprecated and ignored: tokensave was retired; Serena is the default code memory.",
-)
-@click.option(
-    "--serena",
-    is_flag=True,
-    hidden=True,
-    help="Deprecated: use --code-memory serena. Force the Serena MCP compressor on.",
-)
-@click.option(
-    "--no-serena",
-    is_flag=True,
-    hidden=True,
-    help="Deprecated: use --code-memory none. Register no code-memory MCP.",
-)
+@_legacy_code_memory_options
 @click.option(
     "--code-graph",
     is_flag=True,
@@ -7772,11 +7646,9 @@ def grok(
     if prepare_only:
         return
 
-    grok_bin = shutil.which("grok")
-    if not grok_bin:
-        click.echo("Error: 'grok' not found in PATH.")
-        click.echo("Install Grok CLI: https://docs.x.ai/docs/grok-cli")
-        raise SystemExit(1)
+    grok_bin = _require_binary(
+        "grok", install_hint="Install Grok CLI: https://docs.x.ai/docs/grok-cli"
+    )
 
     env, env_vars_display = _build_grok_launch_env(
         port, os.environ, project=_project_name_from_cwd()
@@ -7954,7 +7826,7 @@ def grok_build(
             config_file = inject_grok_provider_config(port, project=project)
             click.echo(f"  Grok config: injected Headroom proxy override into {config_file}")
         except Exception as e:
-            click.echo(f"  Warning: could not update Grok config: {e}")
+            click.echo(f"  Warning: could not update Grok config {grok_config_paths()[0]}: {e}")
         return
 
     def _print_grok_build_setup(actual_port: int) -> None:
@@ -7963,7 +7835,7 @@ def grok_build(
             click.echo(f"  Grok config: injected Headroom proxy override into {config_file}")
             click.echo()
         except Exception as e:
-            click.echo(f"  Warning: could not update Grok config: {e}")
+            click.echo(f"  Warning: could not update Grok config {grok_config_paths()[0]}: {e}")
             click.echo()
         for line in _render_grok_build_setup_lines(actual_port, project=project):
             click.echo(line)
@@ -8571,11 +8443,9 @@ def opencode(
     # config without launching, so it is exempt.
     opencode_bin: str | None = None
     if not prepare_only:
-        opencode_bin = shutil.which("opencode")
-        if not opencode_bin:
-            click.echo("Error: 'opencode' not found in PATH.")
-            click.echo("Install OpenCode: https://opencode.ai")
-            raise SystemExit(1)
+        opencode_bin = _require_binary(
+            "opencode", install_hint="Install OpenCode: https://opencode.ai"
+        )
 
     # Likewise refuse a reused proxy that cannot honor --openai-api-url before
     # touching OpenCode's config or registering a client marker; the same check
@@ -8736,14 +8606,6 @@ def opencode(
                     _opencode_proxy.wait(timeout=5)
                 except subprocess.TimeoutExpired:
                     _opencode_proxy.kill()
-
-
-def _opencode_home_dir() -> Path:
-    """Return the OpenCode home/config directory."""
-    env_path = os.environ.get("OPENCODE_HOME", "").strip()
-    if env_path:
-        return Path(env_path).expanduser()
-    return Path.home() / ".config" / "opencode"
 
 
 # =============================================================================
@@ -9087,11 +8949,9 @@ def omp(
         _inject_omp_models_override(port, _project_name_from_cwd())
         return
 
-    omp_bin = shutil.which("omp")
-    if not omp_bin:
-        click.echo("Error: 'omp' not found in PATH.")
-        click.echo("Install Oh My Pi: npm install -g @oh-my-pi/pi-coding-agent")
-        raise SystemExit(1)
+    omp_bin = _require_binary(
+        "omp", install_hint="Install Oh My Pi: npm install -g @oh-my-pi/pi-coding-agent"
+    )
 
     env, env_vars_display = _build_omp_launch_env(
         port, os.environ, project=_project_name_from_cwd()
@@ -9316,11 +9176,7 @@ def _make_registry_command(target: WrapTarget) -> click.Command:
         if prepare_only:
             return
 
-        tool_bin = shutil.which(target.binary)
-        if not tool_bin:
-            click.echo(f"Error: '{target.binary}' not found in PATH.")
-            click.echo(target.install_hint)
-            raise SystemExit(1)
+        tool_bin = _require_binary(target.binary, install_hint=target.install_hint)
 
         # Exported before proxy startup so _start_proxy forwards it as --mode;
         # an explicit HEADROOM_MODE always wins.

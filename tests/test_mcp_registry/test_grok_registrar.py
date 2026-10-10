@@ -43,6 +43,27 @@ def test_register_uses_grok_home_env(monkeypatch: pytest.MonkeyPatch, tmp_path: 
     assert "[mcp_servers.headroom]" in config.read_text()
 
 
+def test_register_writes_marker_block(tmp_path: Path) -> None:
+    reg = _make_registrar(tmp_path)
+
+    result = reg.register_server(_spec(), force=True)
+
+    assert result.status == RegisterStatus.REGISTERED
+    content = (tmp_path / ".grok" / "config.toml").read_text(encoding="utf-8")
+    assert "[mcp_servers.headroom]" in content
+    assert "# --- Headroom MCP server ---" in content
+
+
+def test_unregister_removes_marker_block(tmp_path: Path) -> None:
+    reg = _make_registrar(tmp_path)
+    reg.register_server(_spec(), force=True)
+    cfg = tmp_path / ".grok" / "config.toml"
+
+    assert reg.unregister_server("headroom") is True
+
+    assert not cfg.exists() or "Headroom MCP server" not in cfg.read_text(encoding="utf-8")
+
+
 def test_unregister_keeps_foreign_table_inside_span(tmp_path: Path) -> None:
     """A table another writer appended before our end marker survives unregister."""
     import tomllib

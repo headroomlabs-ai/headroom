@@ -117,3 +117,20 @@ def test_record_install_recovers_from_unsafe_ledger_shape(tmp_path, contents):
     record_install("claude", _spec(), path=ledger)
 
     assert headroom_installed_matching("claude", _spec(), path=ledger)
+
+
+def test_failed_ledger_write_keeps_the_previous_ledger(monkeypatch, tmp_path):
+    """ENOSPC mid-write must not truncate the ledger or leave a temp file."""
+    ledger = tmp_path / "mcp_installs.json"
+    record_install("claude", _spec(), path=ledger)
+    before = ledger.read_bytes()
+
+    def no_space(fd: int) -> None:
+        raise OSError(28, "No space left on device")
+
+    monkeypatch.setattr("headroom.fsutil.os.fsync", no_space)
+    with pytest.raises(OSError, match="No space left"):
+        clear_install("claude", "serena", path=ledger)
+
+    assert ledger.read_bytes() == before
+    assert [p.name for p in tmp_path.iterdir()] == ["mcp_installs.json"]

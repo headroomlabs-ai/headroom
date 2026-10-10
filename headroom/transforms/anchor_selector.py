@@ -1,5 +1,10 @@
 """Dynamic anchor selection for SmartCrusher.
 
+.. deprecated::
+    This Python implementation is unused: SmartCrusher's anchor selection
+    runs in Rust (``crates/headroom-core/src/transforms/anchor_selector.rs``).
+    It will be removed in a future release and has no replacement.
+
 This module provides intelligent position-based anchor selection for array
 compression. Instead of using fixed first-K/last-K rules, it dynamically
 allocates anchor positions based on:
@@ -35,8 +40,12 @@ Example usage:
 from __future__ import annotations
 
 import hashlib
+import importlib
 import json
 import logging
+import os
+import sys
+import warnings
 from collections import Counter
 from dataclasses import dataclass
 from enum import Enum
@@ -45,6 +54,22 @@ from typing import Any
 from ..config import AnchorConfig
 
 logger = logging.getLogger(__name__)
+
+_DEPRECATION_MESSAGE = (
+    "headroom.transforms.anchor_selector is deprecated and will be removed in a "
+    "future release; it has no replacement (SmartCrusher's anchor selection runs in Rust)."
+)
+
+if sys.version_info >= (3, 12):
+    # Skip importlib's own frames too, so `importlib.import_module(...)` is
+    # attributed to its caller, like a plain `import` statement.
+    warnings.warn(
+        _DEPRECATION_MESSAGE,
+        DeprecationWarning,
+        skip_file_prefixes=(os.path.dirname(importlib.__file__) + os.sep,),
+    )
+else:  # pragma: no cover - Python 3.10/3.11 lack skip_file_prefixes
+    warnings.warn(_DEPRECATION_MESSAGE, DeprecationWarning, stacklevel=2)
 
 
 class DataPattern(Enum):

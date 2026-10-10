@@ -845,12 +845,6 @@ class TestTOINHighPriorityFixes:
             # (auto-save happens inside record_compression)
             assert not toin._dirty
 
-    @pytest.mark.skip(
-        reason="PR-B5: get_recommendation retired; preserve_fields lives on the aggregated ToolPattern instead"
-    )
-    def test_toin_preserves_fields_returns_list(self):
-        """Retired in PR-B5 along with the request-time hint API."""
-
 
 class TestCompressionStoreHighPriorityFixes:
     """Additional HIGH priority tests for CompressionStore."""

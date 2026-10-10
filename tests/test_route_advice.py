@@ -26,6 +26,17 @@ class _Req:
 DEFAULT = object()  # stands in for the configured backend
 
 
+def _sse_contains_error_event(payload: bytes) -> bool:
+    """True when any complete SSE event in ``payload`` is a failure event."""
+    from headroom.proxy.handlers.streaming import _sse_event_outcome
+    from headroom.proxy.helpers import parse_sse_events_from_byte_buffer
+
+    return any(
+        _sse_event_outcome(event_name, data, "chat")[0]
+        for event_name, data in parse_sse_events_from_byte_buffer(bytearray(payload))
+    )
+
+
 # --- reading what an extension published ------------------------------------
 
 
@@ -336,22 +347,16 @@ def test_stream_outcome_status_preserves_success_and_reclassifies_failure():
 
 
 def test_sse_error_detection_handles_native_and_split_events():
-    from headroom.proxy.handlers.streaming import _sse_contains_error_event
-
     assert _sse_contains_error_event(b'event: error\ndata: {"type":"error"}\n\n')
     assert _sse_contains_error_event(b'data: {"type":"er' + b'ror"}\n\n')
     assert not _sse_contains_error_event(b'data: {"type":"message"}\n\n')
 
 
 def test_sse_error_text_in_response_content_is_not_an_error():
-    from headroom.proxy.handlers.streaming import _sse_contains_error_event
-
     assert not _sse_contains_error_event(b'data: {"text":"event: error"}\n\n')
 
 
 def test_responses_failed_envelope_is_an_error():
-    from headroom.proxy.handlers.streaming import _sse_contains_error_event
-
     assert _sse_contains_error_event(
         b'data: {"type":"response.failed","response":{"status":"failed",'
         b'"error":{"code":"server_error"}}}\n\n'
@@ -476,8 +481,6 @@ def test_responses_terminal_semantics(event, data, expected_failed, expected_ter
 
 @pytest.mark.parametrize("event_type", ['["error"]', '{"unexpected":true}', "7", "true"])
 def test_malformed_event_type_is_not_interpreted_as_a_protocol_marker(event_type):
-    from headroom.proxy.handlers.streaming import _sse_contains_error_event
-
     payload = ('data: {"type":' + event_type + "}\n\ndata: [DONE]\n\n").encode()
     assert not _sse_contains_error_event(payload)
 

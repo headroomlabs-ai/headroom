@@ -1,7 +1,7 @@
 """Malformed-upstream tolerance for SSE event parsing.
 
-Three parsers read upstream-controlled SSE bodies: ``_parse_sse_usage``,
-``_parse_sse_usage_from_buffer`` and ``_parse_sse_to_response``. A valid-JSON
+Two parsers read upstream-controlled SSE bodies: ``_parse_sse_usage_from_buffer``
+and ``_parse_sse_to_response``. A valid-JSON
 event of unexpected *shape* must be skipped rather than raise. In
 ``_parse_sse_to_response`` the raise escapes into ``_finalize_stream_response``
 and tears down a stream the client is already reading.
@@ -231,11 +231,6 @@ def _usage(payload: str, provider: str = "anthropic") -> dict[str, int] | None:
     return _Handler()._parse_sse_usage_from_buffer(
         {"sse_buffer": bytearray(payload.encode())}, provider
     )
-
-
-def _usage_chunk(payload: str, provider: str = "anthropic") -> dict[str, int] | None:
-    """Run the single-chunk usage parser (the third, previously unguarded one)."""
-    return _Handler()._parse_sse_usage(payload.encode(), provider)
 
 
 def _response(payload: str, provider: str = "anthropic") -> dict[str, Any] | None:
@@ -552,7 +547,7 @@ def test_message_start_wrong_shape_still_yields_later_usage(bad: Any) -> None:
 
 
 # ---------------------------------------------------------------------------
-# The two usage parsers, across every provider branch.
+# The usage parser, across every provider branch.
 # ---------------------------------------------------------------------------
 
 _USAGE_POSITIONS = [
@@ -573,18 +568,11 @@ def test_buffered_usage_parser_survives_wrong_shape(provider: str, build: Any, b
     _usage(_frame("x", build(bad)), provider)
 
 
-@pytest.mark.parametrize("provider,build", _USAGE_POSITIONS)
-@pytest.mark.parametrize("bad", _WRONG_TYPES, ids=repr)
-def test_chunk_usage_parser_survives_wrong_shape(provider: str, build: Any, bad: Any) -> None:
-    _usage_chunk(_frame("x", build(bad)), provider)
-
-
 @pytest.mark.parametrize("provider", ["anthropic", "openai", "gemini"])
 @pytest.mark.parametrize("bad", _WRONG_TYPES, ids=repr)
-def test_both_usage_parsers_skip_non_object_events(provider: str, bad: Any) -> None:
+def test_usage_parser_skips_non_object_events(provider: str, bad: Any) -> None:
     payload = f"data: {json.dumps(bad)}\n\n"
     assert not _usage(payload, provider)
-    assert not _usage_chunk(payload, provider)
 
 
 def test_gemini_usage_still_parses(provider: str = "gemini") -> None:

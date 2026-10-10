@@ -34,6 +34,7 @@ import shutil
 from pathlib import Path
 from typing import Any
 
+from headroom import fsutil
 from headroom._subprocess import run
 
 from .base import (
@@ -193,6 +194,10 @@ class ClaudeRegistrar(MCPRegistrar):
                 raise ClaudeConfigMutationError(
                     f"could not read Claude config {config_path}: {exc}"
                 ) from exc
+            except UnicodeDecodeError as exc:
+                raise ClaudeConfigMutationError(
+                    f"Claude config {config_path} is not valid UTF-8; refusing to mutate"
+                ) from exc
             try:
                 config = json.loads(raw)
             except json.JSONDecodeError as exc:
@@ -330,27 +335,22 @@ class ClaudeRegistrar(MCPRegistrar):
     def _remove_from_file(self, path: Path, server_name: str, scope: str) -> bool:
         if not path.exists():
             return False
-        try:
-            config = _read_json(path)
-        except OSError:
-            return False
+        config = _read_json(path)
         servers = self._servers_map(config, scope)
         if servers is None or server_name not in servers:
             return False
         del servers[server_name]
         try:
             _write_json(path, config)
-        except OSError:
+        except OSError as exc:
+            logger.warning("could not remove %r from %s: %s", server_name, path, exc)
             return False
         return True
 
     def _read_server_entry(self, path: Path, server_name: str, scope: str) -> ServerSpec | None:
         if not path.exists():
             return None
-        try:
-            config = _read_json(path)
-        except OSError:
-            return None
+        config = _read_json(path)
         servers = self._servers_map(config, scope)
         if servers is None:
             return None
@@ -507,7 +507,7 @@ def _read_json(path: Path) -> dict[str, Any]:
     try:
         with open(path, encoding="utf-8") as f:
             data = json.load(f)
-    except (OSError, json.JSONDecodeError):
+    except (OSError, json.JSONDecodeError, UnicodeDecodeError):
         return {}
     if not isinstance(data, dict):
         return {}
@@ -570,7 +570,10 @@ def _read_json_for_write(path: Path) -> dict[str, Any]:
     """
     if not path.exists():
         return {}
-    raw = path.read_text(encoding="utf-8")  # OSError propagates to the caller
+    try:
+        raw = path.read_text(encoding="utf-8")  # OSError propagates to the caller
+    except UnicodeDecodeError as exc:
+        raise _MalformedConfigError(f"not valid UTF-8: {exc}") from exc
     if not raw.strip():
         return {}
     try:
@@ -584,6 +587,4 @@ def _read_json_for_write(path: Path) -> dict[str, Any]:
 
 def _write_json(path: Path, data: dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump(data, f, indent=2)
-        f.write("\n")
+    fsutil.write_text(path, json.dumps(data, indent=2) + "\n")
