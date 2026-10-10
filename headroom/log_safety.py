@@ -14,6 +14,7 @@ Content is logged only when the operator opts in to it explicitly with
 from __future__ import annotations
 
 import logging
+import math
 import os
 import threading
 import time
@@ -65,8 +66,11 @@ def _describe_one(exc: BaseException) -> str:
         # subclasses (ssl.SSLError) and can quote a path or a peer's message.
         # An out-of-range errno is not formatted at all: converting a huge int
         # to text can itself raise, and a log helper must never raise.
+        # Negative codes (socket.gaierror's EAI_*) have no os.strerror text.
         if 0 <= exc.errno <= _MAX_ERRNO:
             text += f" [Errno {exc.errno}] {_errno_text(exc.errno)}"
+        elif -_MAX_ERRNO - 1 <= exc.errno < 0:
+            text += f" [Errno {exc.errno}]"
         else:
             text += " [Errno out of range]"
     frames = traceback.extract_tb(exc.__traceback__)[-_MAX_FRAMES:]
@@ -178,13 +182,15 @@ class WarnOnce:
                 return True
             report_overflow = not self._overflowed
             self._overflowed = True
+            started = now if self._window_start is None else self._window_start
+            remaining = self._window - (now - started)
         if report_overflow:
             log.warning(
                 "More than %d distinct %s; further ones are logged at debug only "
                 "for the next %d minutes",
                 self._limit,
                 self._what,
-                max(1, round(self._window / 60)),
+                max(1, math.ceil(remaining / 60)),
             )
         return False
 
