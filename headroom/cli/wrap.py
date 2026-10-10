@@ -714,19 +714,24 @@ def _get_proxy_stdio_log_path(port: int | None = None) -> Path:
 # error-looking line instead.
 _PROXY_STARTUP_ERROR_RE = re.compile(r"\b(?:ERROR|CRITICAL)\b|Traceback \(most recent call last\)")
 _PROXY_STARTUP_EXCERPT_CHARS = 500
+# The startup error comes before the shutdown summary, so the first 64 KiB of
+# this run's output is enough; never read a runaway log whole.
+_PROXY_STARTUP_READ_BYTES = 64 * 1024
 
 
 def _proxy_startup_failure_excerpt(stdio_log_path: Path, start: int) -> str:
     """Return the part of this run's stdio log that best explains a startup exit.
 
     Reads only what was written after byte offset ``start`` (the log is shared
-    across runs). Prefers the first ERROR/CRITICAL/Traceback line onwards, and
-    falls back to the last few hundred characters.
+    across runs), and at most the first ``_PROXY_STARTUP_READ_BYTES`` of it.
+    Prefers the first ERROR/CRITICAL/Traceback line onwards, and falls back to
+    the last few hundred characters read.
     """
     try:
         with open(stdio_log_path, "rb") as fh:
             fh.seek(start)
-            output = fh.read().decode("utf-8", errors="replace").strip()
+            raw = fh.read(_PROXY_STARTUP_READ_BYTES)
+        output = raw.decode("utf-8", errors="replace").strip()
     except OSError:
         return "(no log output)"
     if not output:

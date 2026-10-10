@@ -267,6 +267,19 @@ class TestCLIWrapProxyTimeout:
         assert "Local telemetry" not in message
         assert f"Full log: {stdio_log}" in message
 
+    def test_startup_excerpt_reads_at_most_64_kib_of_this_run(self, tmp_path):
+        """A runaway stdio log is never read whole: only this run's first 64 KiB."""
+        stdio_log = tmp_path / "proxy-stdio-8787.log"
+        earlier = "ERROR: an earlier run\n" * 1000
+        noise = "INFO noise line\n" * 8000  # ~128 KiB, no error line
+        stdio_log.write_text(earlier + noise + "END-OF-RUN-MARKER\n")
+
+        excerpt = wrap_mod._proxy_startup_failure_excerpt(stdio_log, len(earlier))
+
+        assert "earlier run" not in excerpt
+        assert "END-OF-RUN-MARKER" not in excerpt
+        assert excerpt.endswith("INFO noise line")
+
     def test_timeout_error_names_configured_timeout_and_env_var(self, monkeypatch, tmp_path):
         fake_proc = _FakeProxyProcess()
 

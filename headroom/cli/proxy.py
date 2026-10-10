@@ -1,6 +1,7 @@
 """Proxy server CLI commands."""
 
 import errno
+import ipaddress
 import logging
 import os
 import platform
@@ -207,8 +208,10 @@ def _get_env_float_optional(name: str) -> float | None:
         raise click.ClickException(f"{name} must be a number, got {val!r}") from None
 
 
-def _tcp_port_in_use(host: str, port: int, *, workers: int) -> OSError | None:
-    """Return the EADDRINUSE error uvicorn would hit binding ``host:port``, else None.
+def _tcp_port_in_use(host: str, port: int, *, workers: int) -> tuple[OSError, Any] | None:
+    """Return ``(EADDRINUSE error, busy address)`` uvicorn would hit binding ``host:port``.
+
+    Returns None when the bind would succeed.
 
     Mirrors uvicorn's own bind so the probe never refuses a bind uvicorn would
     accept: ``SO_REUSEADDR`` (both uvicorn paths set it on POSIX, so a port in
@@ -242,8 +245,34 @@ def _tcp_port_in_use(host: str, port: int, *, workers: int) -> OSError | None:
                 probe.bind(address)
         except OSError as exc:
             if exc.errno == errno.EADDRINUSE:
-                return exc
+                return exc, address
     return None
+
+
+_WILDCARD_PROBE_HOSTS = {"": "127.0.0.1", "0.0.0.0": "127.0.0.1", "::": "::1"}
+
+
+def _probe_host_for(address: Any) -> str | None:
+    """The numeric address to ask "is this Headroom?", or None when it can't be targeted.
+
+    A wildcard bind is reached through loopback of the same family. A
+    hostname (the ``--workers > 1`` path binds it unresolved) is resolved for
+    IPv4. A scoped IPv6 address cannot go in a probe URL.
+    """
+    host = str(address[0])
+    if host in _WILDCARD_PROBE_HOSTS:
+        return _WILDCARD_PROBE_HOSTS[host]
+    if "%" in host:
+        return None
+    try:
+        ipaddress.ip_address(host)
+    except ValueError:
+        try:
+            infos = socket.getaddrinfo(host, None, socket.AF_INET, socket.SOCK_STREAM)
+        except (OSError, UnicodeError):
+            return None
+        return str(infos[0][4][0]) if infos else None
+    return host
 
 
 def _refuse_busy_port(host: str, port: int, *, workers: int) -> None:
@@ -252,17 +281,22 @@ def _refuse_busy_port(host: str, port: int, *, workers: int) -> None:
     Without this the banner prints "Press Ctrl+C to stop", then uvicorn's bind
     error is buried among startup and shutdown log lines.
     """
-    error = _tcp_port_in_use(host, port, workers=workers)
-    if error is None:
+    busy = _tcp_port_in_use(host, port, workers=workers)
+    if busy is None:
         return
+    error, address = busy
     from headroom.cli.port_discovery import probe_headroom_proxy
 
-    if probe_headroom_proxy(port):
-        holder = "a running Headroom proxy (reuse it, or stop it first)"
+    reason = error.strerror or str(error)
+    probe_host = _probe_host_for(address)
+    if probe_host is None:
+        holder = f"({reason})"
+    elif probe_headroom_proxy(port, host=probe_host):
+        holder = "by a running Headroom proxy (reuse it, or stop it first)"
     else:
-        holder = f"another process ({error.strerror or error})"
+        holder = f"by another process ({reason})"
     raise click.ClickException(
-        f"Port {port} on {host} is already in use by {holder}. "
+        f"Port {port} on {host} is already in use {holder}. "
         "Start this proxy on another port with --port N (env: HEADROOM_PORT)."
     )
 
