@@ -5329,9 +5329,10 @@ class OpenAIHandlerMixin:
         # local ``custom_upstream_base_url`` above is custom-header only, and the
         # same value already decided which extra headers were merged, so routing
         # and header policy cannot drift apart.
+        upstream_path = getattr(request.state, "upstream_path", None) or handler_path
         url = build_copilot_upstream_url(
             upstream_base_url,
-            handler_path,
+            upstream_path,
         )
         url = _append_request_query(url, request.url.query)
 

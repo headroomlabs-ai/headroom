@@ -452,6 +452,29 @@ def test_install_apply_explicit_env_overrides_captured(monkeypatch) -> None:
     assert captured["extra_env"]["ANTHROPIC_TARGET_API_URL"] == "https://explicit.internal/v1"
 
 
+def test_install_apply_codebuddy_target_selects_manual_mode_and_backend(monkeypatch) -> None:
+    captured = _apply_capturing_build_manifest(monkeypatch)
+
+    result = CliRunner().invoke(main, ["install", "apply", "--target", "codebuddy"])
+
+    assert result.exit_code == 0, result.output
+    assert captured["targets"] == ["codebuddy"]
+    assert captured["provider_mode"] == "manual"
+    assert captured["backend"] == "codebuddy"
+
+
+def test_install_apply_codebuddy_respects_explicit_backend(monkeypatch) -> None:
+    captured = _apply_capturing_build_manifest(monkeypatch)
+
+    result = CliRunner().invoke(
+        main,
+        ["install", "apply", "--target", "codebuddy", "--backend", "anthropic"],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert captured["backend"] == "anthropic"
+
+
 @pytest.mark.parametrize(
     ("anthropic_url", "openai_url", "anthropic_target", "openai_target"),
     [
@@ -2133,3 +2156,32 @@ def test_opencode_reactivation_preserves_edits(
     assert actual["provider"]["other"] == {"name": "User provider"}
     assert actual["provider"]["headroom"]["options"]["baseURL"] == ("http://127.0.0.1:8787/v1")
     assert actual["mcp"]["remote"] == {"url": "https://example.test"}
+
+
+def test_install_status_includes_backend_from_health_probe(monkeypatch) -> None:
+    runner = CliRunner()
+
+    class Manifest:
+        profile = "default"
+        preset = "persistent-service"
+        runtime_kind = "python"
+        supervisor_kind = "service"
+        scope = "user"
+        port = 8787
+        backend = "anthropic"
+        health_url = "http://127.0.0.1:8787/readyz"
+
+    monkeypatch.setattr("headroom.cli.install.load_manifest", lambda profile: Manifest())
+    monkeypatch.setattr("headroom.cli.install.runtime_status", lambda manifest: "running")
+    monkeypatch.setattr("headroom.cli.install.probe_ready", lambda url: True)
+    monkeypatch.setattr(
+        "headroom.cli.install.probe_json",
+        lambda url: {"config": {"backend": "anthropic"}},
+    )
+
+    result = runner.invoke(main, ["install", "status"])
+
+    assert result.exit_code == 0, result.output
+    assert "Status:     running" in result.output
+    assert "Healthy:    yes" in result.output
+    assert "Default backend:  anthropic" in result.output

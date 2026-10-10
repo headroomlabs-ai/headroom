@@ -51,6 +51,7 @@ class ToolTarget(str, Enum):
     """Supported tool targets for persistent proxy wiring."""
 
     CLAUDE = "claude"
+    CODEBUDDY = "codebuddy"
     COPILOT = "copilot"
     CODEX = "codex"
     AIDER = "aider"

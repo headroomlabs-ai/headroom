@@ -9,6 +9,7 @@ from headroom.install.runtime import resolve_headroom_command
 from .antigravity import AntigravityRegistrar
 from .base import MCPRegistrar, RegisterResult, RegisterStatus, ServerSpec
 from .claude import ClaudeRegistrar
+from .codebuddy import CodeBuddyRegistrar
 from .codex import CodexRegistrar
 from .grok import GrokRegistrar
 from .opencode import OpencodeRegistrar
@@ -26,6 +27,7 @@ def get_all_registrars() -> list[MCPRegistrar]:
     return [
         AntigravityRegistrar(),
         ClaudeRegistrar(),
+        CodeBuddyRegistrar(),
         CodexRegistrar(),
         GrokRegistrar(),
         OpencodeRegistrar(),
