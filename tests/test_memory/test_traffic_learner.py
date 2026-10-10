@@ -69,6 +69,13 @@ class TestErrorClassification:
             ("Command failed with non-zero status 1", True),
             ("process exited with status 1", True),
             ("x" * 1500 + "\nexit code 3", True),
+            ("command terminated\nexit code -9", True),
+            ("Process exited with exit code -1", True),
+            # A zero wrapper status must not hide a separate failure.
+            ("worker exited with signal 9\nexit code 0", True),
+            ("child exit code 2\nwrapper exit code 0", True),
+            ("python train.py\nKilled\nexit code 0", True),
+            ("task killed by signal SIGKILL\nexit code 0", True),
             # Case-insensitive signals the shared is_error_content would miss.
             ("zsh: no such file or directory: ./run.sh", True),
             ("fatal: path 'x' does not exist in 'HEAD'", True),

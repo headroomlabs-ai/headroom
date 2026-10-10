@@ -240,11 +240,16 @@ _ERROR_SIGNALS: tuple[re.Pattern[str], ...] = (
 
 # Agent harnesses (Codex, Grok, opencode, ...) append "exit code 0" to every
 # SUCCESSFUL shell command, so an exit code only signals an error when it is
-# nonzero. "non-zero" and a bare "exited with ..." (no code) still count.
+# nonzero (signed codes such as -9 included). A zero code never hides another
+# failure signal in the same output: a nonzero code, "non-zero", a signal or
+# a "Killed" line. A bare "exited with ..." (no code) still counts.
 _EXIT_STATUS_RE = re.compile(
-    r"\bexit(?:ed)?(?:\s+with)?(?:\s+exit)?\s+(?:code|status)\s*:?\s*(\d+)", re.I
+    r"\bexit(?:ed)?(?:\s+with)?(?:\s+exit)?\s+(?:code|status)\s*:?\s*([+-]?\d+)", re.I
 )
-_EXIT_FAILURE_RE = re.compile(r"non-zero|nonzero", re.I)
+_EXIT_FAILURE_RE = re.compile(
+    r"non-zero|nonzero|exited with signal|killed by signal|^\s*Killed(?::\s*\d+)?\s*$",
+    re.I | re.M,
+)
 _EXITED_WITH_RE = re.compile(r"exited with", re.I)
 
 
