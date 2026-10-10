@@ -27,7 +27,9 @@ REREAD_MIN_TOKENS = 50
 # Canonical CCR retrieval-marker shapes. Mirrors the alternation in
 # transforms/compression_units._CCR_MARKER_RE; kept local because the parser
 # is a base module and importing from transforms would create a cycle.
-CCR_RETRIEVAL_MARKER_RE = re.compile(r"Retrieve more: hash=|Retrieve original: hash=|<<ccr:[^>]+>>")
+CCR_RETRIEVAL_MARKER_RE = re.compile(
+    r"Retrieve more: hash=|Retrieve original: hash=|<<ccr:[^>]+>>|\[ccr:[^\]\s]+\]"
+)
 
 # Repeats this close (in message positions) to the previous serve are
 # polling, not re-reads. Consecutive tool turns sit 2 apart (the

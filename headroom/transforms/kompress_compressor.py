@@ -27,6 +27,7 @@ from dataclasses import dataclass
 from functools import lru_cache
 from typing import Any, Literal
 
+from ..ccr.marker import terse_marker, terse_markers_enabled
 from ..config import TransformResult
 from ..offline import OFFLINE_ENV, OfflineEgressBlocked
 from ..onnx_runtime import (
@@ -1565,6 +1566,8 @@ def ccr_retrieval_marker(
     line span is reported so a reader can tell content was compressed
     away rather than absent (#2586).
     """
+    if terse_markers_enabled():
+        return f"\n{terse_marker(cache_key)}"
     source_lines = ccr_source.count("\n") + 1
     line_word = "line" if source_lines == 1 else "lines"
     return (
