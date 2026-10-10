@@ -381,13 +381,16 @@ when they are enabled.
   only, and so is every rotated backup (`proxy-8000.log.1`, …). This is not
   conditional on which content switch is on. If the log path already exists as a
   symlink, Headroom refuses to log rather than write through it, and says so.
-- **Windows:** **Headroom does not restrict the log file.** Read access on NTFS is
-  decided by the file's ACL; `chmod` there only toggles the read-only attribute,
-  and Python has no API for setting an ACL, so Headroom does not claim a
-  protection it cannot establish. The log inherits the ACL of the directory it
-  is written into, and the proxy logs a warning at startup saying so. Keep
-  `%USERPROFILE%\.headroom` (or your chosen `--log-file` path) off shared
-  volumes and out of directories with broadened permissions.
+- **Windows:** Headroom restricts the log file too, through an NTFS ACL —
+  Python has no ACL API, so this goes directly through `ctypes` rather than a
+  third-party dependency. The DACL it sets grants access to exactly the
+  current user, replacing (not merging with) whatever was inherited from the
+  parent directory. This can fail for reasons unrelated to Headroom's own
+  code — a non-NTFS volume, a missing privilege — so the proxy re-reads the
+  file afterward to confirm, and only logs a warning at startup if that
+  check fails. If you see that warning, keep `%USERPROFILE%\.headroom` (or
+  your chosen `--log-file` path) off shared volumes and out of directories
+  with broadened permissions.
 
 A log shipper or sidecar running as a different user or group cannot read the
 runtime log on Linux/macOS. Run the collector as the same user, or copy the file

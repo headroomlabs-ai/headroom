@@ -1885,22 +1885,26 @@ class _OwnerOnlyRotatingFileHandler(RotatingFileHandler):
 _owner_only_warning_emitted = False
 
 
-def _warn_once_if_owner_only_unsupported(log_path: Path) -> None:
-    """Say plainly, once per process, when the file cannot be made owner-only.
+def _warn_once_if_not_protected(log_path: Path) -> None:
+    """Say plainly, once per process, when the file is not actually owner-only.
 
-    A security control that quietly does nothing on a supported platform is
-    worse than no control, so Windows gets told rather than left to assume the
-    0600 in the docs applies to it.
+    Checks the file itself (:func:`headroom.fileperms.verify_owner_only`)
+    rather than assuming from the platform: on Windows the ACL restriction
+    (:mod:`headroom._fileperms_windows`) usually succeeds, in which case this
+    stays silent, but it can fail for reasons that have nothing to do with
+    Headroom's own code — a non-NTFS volume, a missing privilege — and a
+    control that quietly does nothing is worse than no control.
     """
     global _owner_only_warning_emitted
-    if _fileperms.OWNER_ONLY_SUPPORTED or _owner_only_warning_emitted:
+    if _owner_only_warning_emitted or _fileperms.verify_owner_only(log_path):
         return
     _owner_only_warning_emitted = True
     logger.warning(
-        "Headroom cannot create %s owner-only on this platform: file modes do not "
-        "control read access here, and Headroom does not set an ACL. The runtime log "
-        "can contain request and response content (--log-messages, wire debug, "
-        "HEADROOM_LOG_PAYLOAD_PREVIEW) — protect the log directory itself.",
+        "Headroom could not restrict %s to the current user — other accounts "
+        "on this machine may be able to read it. The runtime log can contain "
+        "request and response content (--log-messages, wire debug, "
+        "HEADROOM_LOG_PAYLOAD_PREVIEW); move HEADROOM_WORKSPACE_DIR somewhere "
+        "only you can access, or restrict the containing directory yourself.",
         log_path,
     )
 
@@ -1946,7 +1950,6 @@ def _setup_file_logging(
                 log_path,
             )
             return
-        _warn_once_if_owner_only_unsupported(log_path)
         # Attach to the headroom root logger so all sub-loggers are captured.
         # Keep root propagation enabled for container stdout/stderr while
         # this handler writes the separate port/worker-specific proxy log.
@@ -1980,6 +1983,11 @@ def _setup_file_logging(
             headroom_logger.removeHandler(stale)
             stale.close()
         headroom_logger.addHandler(handler)
+        # After, not before: the handler's _open() is what actually attempts
+        # the protection (mode bits on POSIX, the ACL call on Windows), so
+        # only now is there something real to verify rather than a platform
+        # guess.
+        _warn_once_if_not_protected(log_path)
     except OSError:
         # Non-fatal: can't write logs (read-only fs, permissions, etc.)
         pass

@@ -746,6 +746,30 @@ jobs:
             tests/test_cli/test_wrap_opencode.py \
             tests/test_proxy_workspace_registration_middleware.py -q
 
+  windows-file-permissions:
+    # Verifies the Windows NTFS-ACL path in headroom._fileperms_windows for
+    # real: those tests were previously skipped everywhere, so the module
+    # was asserted correct but never run (#4058). The mode-bits (POSIX)
+    # assertions in the same file stay skipped here deliberately.
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
+    runs-on: windows-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v6
+        with:
+          python-version: ${{ env.PY_VERSION }}
+      - name: Install headroom-ai[dev] (published wheel; local source shadows it)
+        run: |
+          python -m pip install --upgrade pip
+          pip install torch --index-url https://download.pytorch.org/whl/cpu
+          pip install "headroom-ai[dev]"
+      - name: Run the owner-only file-permission tests
+        shell: bash
+        run: |
+          pytest tests/test_cache_breakpoint_diagnostics.py tests/test_private_state_files.py -v
+
   macos-native-wrapper:
     needs: changes
     if: needs.changes.outputs.native == 'true'
