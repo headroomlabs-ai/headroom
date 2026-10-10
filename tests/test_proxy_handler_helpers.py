@@ -333,7 +333,17 @@ def test_relocate_system_messages_noop_without_system_entry() -> None:
     assert system == "A"
 
 
-def test_relocate_system_messages_preserves_valid_mid_conversation_section() -> None:
+@pytest.mark.parametrize(
+    "model",
+    [
+        "claude-opus-5",
+        # Claude Haiku 5.5 supports mid-conversation system messages too; it was
+        # missing here, so Claude Code's Haiku subagent traffic had every valid
+        # section hoisted into the top-level system prompt.
+        "claude-haiku-5-5",
+    ],
+)
+def test_relocate_system_messages_preserves_valid_mid_conversation_section(model: str) -> None:
     messages = [
         {"role": "user", "content": "Run the tests."},
         {
@@ -343,9 +353,7 @@ def test_relocate_system_messages_preserves_valid_mid_conversation_section() -> 
         {"role": "assistant", "content": "I will do both."},
     ]
 
-    clean, system, changed = relocate_system_messages_to_top_level(
-        messages, "base", "claude-opus-5"
-    )
+    clean, system, changed = relocate_system_messages_to_top_level(messages, "base", model)
 
     assert changed is False
     assert clean is messages
@@ -392,15 +400,14 @@ def test_relocate_system_messages_still_moves_invalid_mid_conversation_placement
     assert system == [{"type": "text", "text": messages[1]["content"]}]
 
 
-def test_relocate_system_messages_moves_valid_shape_for_unsupported_model() -> None:
+@pytest.mark.parametrize("model", ["claude-sonnet-4-6", "claude-haiku-4-5"])
+def test_relocate_system_messages_moves_valid_shape_for_unsupported_model(model: str) -> None:
     messages = [
         {"role": "user", "content": "question"},
         {"role": "system", "content": "mid-turn instruction"},
     ]
 
-    clean, system, changed = relocate_system_messages_to_top_level(
-        messages, None, "claude-sonnet-4-6"
-    )
+    clean, system, changed = relocate_system_messages_to_top_level(messages, None, model)
 
     assert changed is True
     assert clean == [{"role": "user", "content": "question"}]

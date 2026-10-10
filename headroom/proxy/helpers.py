@@ -1095,6 +1095,7 @@ def relocate_system_messages_to_top_level(
         family in model_id
         for family in (
             "claude-fable-5",
+            "claude-haiku-5",
             "claude-mythos-5",
             "claude-opus-4-8",
             "claude-opus-5",
