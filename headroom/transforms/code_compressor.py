@@ -2686,33 +2686,3 @@ def _has_syntax_issues(node: Any) -> bool:
         if _has_syntax_issues(child):
             return True
     return False
-
-
-def compress_code(
-    code: str,
-    language: str | None = None,
-    target_rate: float = 0.2,
-    context: str = "",
-) -> str:
-    """Convenience function for one-off code compression.
-
-    Args:
-        code: Source code to compress.
-        language: Language hint (auto-detected if None).
-        target_rate: Target compression rate (0.2 = keep 20%).
-        context: Optional context for relevance.
-
-    Returns:
-        Compressed code string.
-
-    Example:
-        >>> compressed = compress_code(large_python_file)
-        >>> print(compressed)  # Valid Python code
-    """
-    config = CodeCompressorConfig(
-        target_compression_rate=target_rate,
-        language_hint=language,
-    )
-    compressor = CodeAwareCompressor(config)
-    result = compressor.compress(code, language=language, context=context)
-    return result.compressed

@@ -13,7 +13,6 @@ from headroom.transforms.content_detector import (
     _try_detect_log,
     _try_detect_search,
     detect_content_type,
-    is_json_array_of_dicts,
     normalize_concatenated_json,
 )
 from headroom.transforms.error_detection import (
@@ -65,8 +64,6 @@ def test_json_detection_distinguishes_dict_arrays_and_other_lists() -> None:
     assert object_result.metadata == {"is_dict_array": False, "is_object": True}
 
     assert _try_detect_json("[not valid json") is None
-    assert is_json_array_of_dicts('[{"id": 1}]') is True
-    assert is_json_array_of_dicts('["value"]') is False
 
 
 def test_space_separated_json_objects_detected_as_array() -> None:
@@ -81,8 +78,9 @@ def test_space_separated_json_objects_detected_as_array() -> None:
     assert result.metadata == {"item_count": 3, "is_dict_array": True, "concatenated": True}
 
     # Reaches the same verdict through the top-level detector (not PLAIN_TEXT).
-    assert detect_content_type(content).content_type is ContentType.JSON_ARRAY
-    assert is_json_array_of_dicts(content) is True
+    top_level = detect_content_type(content)
+    assert top_level.content_type is ContentType.JSON_ARRAY
+    assert top_level.metadata.get("is_dict_array") is True
 
     # Newline separation is just as common and must also be recognized.
     newline_sep = "\n".join(json.dumps({"id": i, "snippet": "x"}) for i in range(2))
