@@ -324,6 +324,40 @@ def test_response_to_sse_emits_unknown_content_block_verbatim() -> None:
     assert not any(ev["type"] == "content_block_delta" for ev in events)
 
 
+def test_response_to_sse_tolerates_malformed_content_and_usage() -> None:
+    # `_response_to_sse` runs on provider/reconstruction-controlled JSON and is
+    # reached from a call site (anthropic.py buffered CCR path) that only catches
+    # ValueError, so a present-but-null `content`/`usage` or a non-dict block must
+    # not raise a TypeError/AttributeError that would 500 the streamed request.
+    # The sibling `_record_ccr_feedback_from_response` guards `content` the same
+    # way. Each of these once crashed the unguarded loop.
+    parser = _Parser()
+
+    for response in (
+        {"content": None, "usage": {"output_tokens": 5}},
+        {"content": "not-a-list"},
+        {"content": [None, {"type": "text", "text": "hi"}]},
+        {"content": [], "usage": None},
+    ):
+        sse_text = b"".join(parser._response_to_sse(response, "anthropic")).decode("utf-8")
+        # Always a well-formed envelope, regardless of the malformed body.
+        assert "event: message_start" in sse_text
+        assert "event: message_stop" in sse_text
+
+    # The one valid block alongside a null element is still rendered.
+    sse_text = b"".join(
+        parser._response_to_sse({"content": [None, {"type": "text", "text": "hi"}]}, "anthropic")
+    ).decode("utf-8")
+    events = _sse_events(sse_text)
+    text_deltas = [
+        ev
+        for ev in events
+        if ev["type"] == "content_block_delta" and ev["delta"].get("type") == "text_delta"
+    ]
+    assert len(text_deltas) == 1
+    assert text_deltas[0]["delta"]["text"] == "hi"
+
+
 def test_response_to_sse_emits_server_tool_use_without_delta() -> None:
     parser = _Parser()
     server_tool_use = {

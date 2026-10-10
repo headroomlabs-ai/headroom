@@ -6,6 +6,7 @@ import logging
 import os
 import threading
 import time
+import traceback
 from collections.abc import Callable
 from contextlib import nullcontext
 from typing import TYPE_CHECKING, Any, TypeVar
@@ -29,6 +30,25 @@ if TYPE_CHECKING:
     from ..providers.base import Provider
 
 logger = logging.getLogger(__name__)
+
+
+def _log_transform_failure(transform_name: str, log_prefix: str, exc: Exception) -> None:
+    """Keep stack diagnostics without logging payload-bearing exception text."""
+    # Log frame locations only: source lines can embed literal payloads too.
+    # Exception messages, notes, cause/context chains, and locals stay out.
+    frames = "".join(
+        f'  File "{frame.filename}", line {frame.lineno}, in {frame.name}\n'
+        for frame in traceback.extract_tb(exc.__traceback__)
+    )
+    logger.error(
+        "%sTransform %s failed; aborting compression pipeline\n"
+        "Traceback (most recent call last):\n%s%s: exception message redacted",
+        log_prefix,
+        transform_name,
+        frames,
+        type(exc).__name__,
+    )
+
 
 # Waste-signal detection re-parses the *original* messages for telemetry only
 # (it never changes the compression result). On very large transcripts that
@@ -138,15 +158,10 @@ class TransformPipeline:
 
         # 0. Tool-result interceptors (ast-grep Read outline, etc.) run first
         # so downstream compressors operate on the already-shrunk content.
-        # OPT-IN: enable via HeadroomConfig.intercept_tool_results, or for
-        # non-config callers (CLI / SDK / tests) the env var
-        # HEADROOM_INTERCEPT_ENABLED=1. Off by default while this ships — lets
-        # users try it and compare before we make it the default.
-        import os as _os
-
-        if getattr(self.config, "intercept_tool_results", False) or _os.environ.get(
-            "HEADROOM_INTERCEPT_ENABLED"
-        ):
+        # Rollout was resolved once by HeadroomConfig. Never re-read process
+        # environment here: this pipeline must match its recorded provenance.
+        assert self.config.rollout is not None
+        if self.config.rollout.is_enabled("tool_result_interceptors"):
             from headroom.proxy.interceptors import ToolResultInterceptorTransform
 
             transforms.append(ToolResultInterceptorTransform())
@@ -163,7 +178,13 @@ class TransformPipeline:
         # - Logs -> LogCompressor
         # - Search results -> SearchCompressor
         # - HTML -> HTMLExtractor
-        transforms.append(ContentRouter())
+        # observer: the proxy passes PrometheusMetrics; this bare pipeline is
+        # used by the library/adapter paths, which would otherwise report
+        # tokens.saved with an empty by_strategy. Imported here rather than at
+        # module scope — transforms sits below telemetry in the import graph.
+        from headroom.telemetry.session import BeaconCompressionObserver
+
+        transforms.append(ContentRouter(observer=BeaconCompressionObserver()))
         logger.info("Pipeline using ContentRouter for intelligent content-aware compression")
 
         return transforms
@@ -316,6 +337,7 @@ class TransformPipeline:
             all_markers: list[str] = []
             all_warnings: list[str] = []
             all_timing: dict[str, float] = {}  # transform_name → ms
+            all_message_decisions: list[Any] = []
 
             # Track transform diffs if enabled
             transform_diffs: list[TransformDiff] = []
@@ -344,7 +366,13 @@ class TransformPipeline:
 
             for transform in self.transforms:
                 # Check if transform should run
-                if not transform.should_apply(current_messages, tokenizer, **kwargs):
+                try:
+                    eligible = transform.should_apply(current_messages, tokenizer, **kwargs)
+                except Exception as exc:
+                    _log_transform_failure(transform.name, log_prefix, exc)
+                    self._breaker_record_failure()
+                    raise
+                if not eligible:
                     continue
 
                 transform_span_context = (
@@ -365,7 +393,8 @@ class TransformPipeline:
                     t0 = time.perf_counter()
                     try:
                         result = transform.apply(current_messages, tokenizer, **kwargs)
-                    except Exception:
+                    except Exception as exc:
+                        _log_transform_failure(transform.name, log_prefix, exc)
                         self._breaker_record_failure()
                         raise
                     duration_ms = (time.perf_counter() - t0) * 1000
@@ -400,6 +429,8 @@ class TransformPipeline:
                     all_markers.extend(result.markers_inserted)
                     all_warnings.extend(result.warnings)
                     all_timing[transform.name] = duration_ms
+                    if result.message_decisions:
+                        all_message_decisions.extend(result.message_decisions)
 
                     # Merge sub-transform timing (e.g. ContentRouter's per-compressor breakdown)
                     if result.timing:
@@ -542,6 +573,7 @@ class TransformPipeline:
             diff_artifact=diff_artifact,
             timing=all_timing,
             waste_signals=waste_signals,
+            message_decisions=all_message_decisions,
         )
 
     def simulate(

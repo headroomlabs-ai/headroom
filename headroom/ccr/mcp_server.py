@@ -31,11 +31,15 @@ import os
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from headroom import paths as _paths
 from headroom import savings_ledger
 from headroom.cache.compression_store import format_retrieval_miss_detail
+from headroom.telemetry import session as telemetry_session
+
+if TYPE_CHECKING:
+    from headroom.tokenizers.estimator import EstimatingTokenCounter
 
 # fcntl is Unix-only; on Windows we skip file locking (stats are best-effort).
 # Keep the module typed as Any so Windows mypy runs don't try to resolve Unix-only attrs.
@@ -205,7 +209,13 @@ SESSION_WINDOW_SECONDS = 7200  # 2 hours — events older than this are pruned
 
 
 def _append_shared_event(event: dict[str, Any]) -> None:
-    """Append an event to the shared stats file (cross-process, file-locked)."""
+    """Append an event to the shared stats file (cross-process, file-locked).
+
+    No-op in stateless mode (``HEADROOM_STATELESS``): the aggregate then covers
+    only this process, which is the documented stateless trade-off.
+    """
+    if not _paths.persistence_allowed("MCP session stats"):
+        return
     try:
         SHARED_STATS_DIR.mkdir(parents=True, exist_ok=True)
         event["pid"] = os.getpid()
@@ -245,8 +255,9 @@ def _read_shared_events(window_seconds: int = SESSION_WINDOW_SECONDS) -> list[di
                     keep_lines.append(line + "\n")
             except json.JSONDecodeError:
                 continue
-        # Prune old entries (only if we dropped some)
-        if len(keep_lines) < len(lines):
+        # Prune old entries (only if we dropped some). Never rewrite the file in
+        # stateless mode — reading is fine, writing is not.
+        if len(keep_lines) < len(lines) and _paths.persistence_allowed("MCP session stats"):
             try:
                 with open(SHARED_STATS_FILE, "w") as f:
                     if _HAS_FCNTL:
@@ -376,6 +387,7 @@ class HeadroomMCPServer:
         self._http_client: httpx.AsyncClient | None = None  # type: ignore[assignment]
         self._stats = SessionStats()
         self._local_store: Any = None  # Lazy-initialized CompressionStore
+        self._token_estimator: EstimatingTokenCounter | None = None
         self._compressor_initialized = False
         # File read cache: path → (content_hash, ccr_hash, line_count, token_count)
         self._file_cache: dict[str, tuple[str, str, int, int]] = {}
@@ -399,6 +411,23 @@ class HeadroomMCPServer:
 
             self._local_store = get_compression_store()
         return self._local_store
+
+    def _estimate_tokens(self, text: str) -> int:
+        """Price file content in tokens, the way the rest of the pipeline does.
+
+        Whitespace splitting is a word count, not a token count. Measured on
+        real files it under-reports by 1.43x on prose, 1.30x on source, and
+        691x for the 2.2 KB single-line JSON array in the regression test -- a
+        compact document has no spaces, so the whole file is one "word". That
+        figure is stored as ``original_tokens`` (which the savings totals sum
+        over) and echoed back to the agent as ``~N tokens`` in the
+        already-in-context note it uses to decide whether to re-read the file.
+        """
+        if self._token_estimator is None:
+            from headroom.tokenizers.estimator import EstimatingTokenCounter
+
+            self._token_estimator = EstimatingTokenCounter()
+        return max(1, self._token_estimator.count_text(text))
 
     def _compress_content(self, content: str) -> dict[str, Any]:
         """Compress content using Headroom's pipeline.
@@ -775,7 +804,7 @@ class HeadroomMCPServer:
             result["proxy"] = proxy_status
             result["warning"] = proxy_status["warning"]
 
-        return [TextContent(type="text", text=json.dumps(result, indent=2))]
+        return [TextContent(type="text", text=json.dumps(result, indent=2, ensure_ascii=False))]
 
     def _record_savings(self, result: dict[str, Any]) -> None:
         """Append a durable savings event for a completed compression."""
@@ -794,6 +823,16 @@ class HeadroomMCPServer:
             model=os.environ.get("HEADROOM_MCP_MODEL"),
             client=self._current_client(),
             source="mcp",
+        )
+        # Anonymous beacon (opt-out; no-op unless enabled). Without this the MCP
+        # path is invisible to aggregate stats even though it is a first-class
+        # way to use Headroom — and subagents make that worse, since each runs
+        # its own MCP server. Swallows its own errors; the caller's try/except
+        # is a second net, not the first.
+        telemetry_session.record_mcp_compression(
+            original_tokens=before,
+            compressed_tokens=after,
+            model=os.environ.get("HEADROOM_MCP_MODEL"),
         )
 
     def _current_client(self) -> str:
@@ -830,7 +869,7 @@ class HeadroomMCPServer:
             json.dumps(result, ensure_ascii=False, default=str),
         )
 
-        return [TextContent(type="text", text=json.dumps(result, indent=2))]
+        return [TextContent(type="text", text=json.dumps(result, indent=2, ensure_ascii=False))]
 
     async def _handle_stats(self) -> list[TextContent]:
         """Handle headroom_stats tool call."""
@@ -895,7 +934,7 @@ class HeadroomMCPServer:
                     stats["proxy"] = proxy_status
                     stats["warning"] = proxy_status["warning"]
 
-        return [TextContent(type="text", text=json.dumps(stats, indent=2))]
+        return [TextContent(type="text", text=json.dumps(stats, indent=2, ensure_ascii=False))]
 
     async def _fetch_full_proxy_stats(self) -> dict[str, Any] | None:
         """Fetch full stats from the proxy (includes summary)."""
@@ -1018,16 +1057,16 @@ class HeadroomMCPServer:
 
         # Fresh read: store in CCR and cache the hash
         store = self._get_local_store()
+        token_estimate = self._estimate_tokens(content)
         ccr_hash = store.store(
             original=content,
             compressed=f"[File: {path.name}, {line_count} lines]",
-            original_tokens=len(content.split()),
+            original_tokens=token_estimate,
             compressed_tokens=5,
             tool_name="headroom_read",
             ttl=MCP_SESSION_TTL,
         )
 
-        token_estimate = len(content.split())
         self._file_cache[str_path] = (content_hash, ccr_hash, line_count, token_estimate)
 
         # Return full content with line numbers (like Claude Code's Read tool)

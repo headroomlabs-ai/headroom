@@ -279,7 +279,15 @@ const hints = await client.feedback.getHints('list_servers');
 // TOIN (Tool Output Intelligence Network)
 const toinStats = await client.toin.getStats();
 const patterns = await client.toin.getPatterns(20);
+const pattern = patterns[0] && await client.toin.getPattern(patterns[0].hash);
 ```
+
+Each `hash` is the complete scoped aggregation key, including tenant, auth mode,
+model family, and tool signature. Pass it back unchanged for an exact lookup;
+the client URL-encodes it. Shorter aggregation-key prefixes are accepted only
+when they identify one pattern; ambiguous prefixes return HTTP 409 rather than
+an arbitrary pattern.
+
 
 ## Configuration Types
 

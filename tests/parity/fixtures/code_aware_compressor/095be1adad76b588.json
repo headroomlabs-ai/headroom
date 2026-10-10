@@ -1,0 +1,37 @@
+{
+  "config": {
+    "ccr_ttl": 300,
+    "compress_comments": true,
+    "docstring_mode": "first_line",
+    "enable_ccr": false,
+    "fallback_to_kompress": false,
+    "language_hint": null,
+    "max_body_lines": 5,
+    "min_tokens_for_compression": 100,
+    "preserve_decorators": true,
+    "preserve_imports": true,
+    "preserve_signatures": true,
+    "preserve_type_annotations": true,
+    "semantic_analysis": true,
+    "target_compression_rate": 0.2
+  },
+  "input": "#include <stdio.h>\n#include <stdlib.h>\n#include <string.h>\n\ntypedef struct {\n    char name[64];\n    int count;\n} Processor;\n\nint process(Processor *p, const char **items, int n) {\n    int kept = 0;\n    for (int i = 0; i < n; i++) {\n        if (items[i] == NULL || strlen(items[i]) == 0) {\n            continue;\n        }\n        kept++;\n        p->count++;\n    }\n    return kept;\n}\n\nint main(void) {\n    Processor p = {\"main\", 0};\n    const char *items[] = {\"a\", \"b\"};\n    printf(\"%d\\n\", process(&p, items, 2));\n    return 0;\n}\n",
+  "input_sha256": "095be1adad76b588f996e2c39b843e28ef41ec58b2ca8bb963c4fe9389027413",
+  "output": {
+    "cache_key": null,
+    "compressed": "#include <stdio.h>\n\n#include <stdlib.h>\n\n#include <string.h>\n\n\ntypedef struct {\n    char name[64];\n    int count;\n} Processor;\n\nint process(Processor *p, const char **items, int n) {\n    int kept = 0;\n    // [8 lines omitted]\n}\nint main(void) {\n    Processor p = {\"main\", 0};\n    const char *items[] = {\"a\", \"b\"};\n    printf(\"%d\\n\", process(&p, items, 2));\n    return 0;\n}",
+    "compressed_bodies": 0,
+    "compressed_tokens": 93,
+    "compression_ratio": 0.7045454545454546,
+    "language": "cpp",
+    "language_confidence": 1.0,
+    "original": "#include <stdio.h>\n#include <stdlib.h>\n#include <string.h>\n\ntypedef struct {\n    char name[64];\n    int count;\n} Processor;\n\nint process(Processor *p, const char **items, int n) {\n    int kept = 0;\n    for (int i = 0; i < n; i++) {\n        if (items[i] == NULL || strlen(items[i]) == 0) {\n            continue;\n        }\n        kept++;\n        p->count++;\n    }\n    return kept;\n}\n\nint main(void) {\n    Processor p = {\"main\", 0};\n    const char *items[] = {\"a\", \"b\"};\n    printf(\"%d\\n\", process(&p, items, 2));\n    return 0;\n}\n",
+    "original_tokens": 132,
+    "preserved_imports": 3,
+    "preserved_signatures": 2,
+    "symbol_scores": {},
+    "syntax_valid": true
+  },
+  "recorded_at": "2026-06-19T00:15:16.333831+00:00",
+  "transform": "code_aware_compressor"
+}

@@ -8,11 +8,14 @@ import os
 import sys
 from typing import Any
 
+from headroom.offline import guard_egress
+
 logger = logging.getLogger(__name__)
 
 # Override for the CPU memory-arena default below: "1"/"true" forces the
 # arena ON, "0"/"false" forces it OFF, unset/"auto" uses the platform default.
 ONNX_CPU_ARENA_ENV = "HEADROOM_ONNX_CPU_ARENA"
+ONNX_ALLOW_SPINNING_ENV = "HEADROOM_ONNX_ALLOW_SPINNING"
 
 _TRUTHY = frozenset({"1", "true", "yes", "on"})
 _FALSY = frozenset({"0", "false", "no", "off"})
@@ -46,6 +49,22 @@ def cpu_arena_enabled() -> bool:
     return sys.platform == "win32"
 
 
+def onnx_thread_spinning_enabled() -> bool:
+    """Whether ONNX Runtime intra/inter-op thread pools may spin-wait when idle.
+
+    ORT's thread pools spin-wait on every core between inferences by default, so
+    a long-lived proxy that keeps compression/embedding models loaded pegs all
+    cores even while completely idle — the machine slows to a crawl after a
+    while (#2495). Default to blocking idle threads (spinning off). Set
+    ``HEADROOM_ONNX_ALLOW_SPINNING=1`` to restore ORT's spinning for peak
+    throughput on a dedicated/batch box.
+    """
+    override = _env_flag(ONNX_ALLOW_SPINNING_ENV)
+    if override is not None:
+        return override
+    return False
+
+
 # Pin model artifacts to immutable commit SHAs so a changed or compromised
 # upstream HuggingFace repo cannot be pulled silently (supply-chain integrity).
 # Repos not listed here fall back to the floating default ref. Set
@@ -54,6 +73,10 @@ def cpu_arena_enabled() -> bool:
 _PINNED_REVISIONS: dict[str, str] = {
     # chopratejas/kompress-v2-base @ 2026-06-10
     "chopratejas/kompress-v2-base": "b1563631b35bfdcee37587ad530147497d820d4c",
+    # Kompress tokenizer + torch-path encoder base. The ONNX artifacts were
+    # exported against this snapshot; a silently updated tokenizer would shift
+    # token ids under the shipped weights.
+    "answerdotai/ModernBERT-base": "8949b909ec900327062f0ebf497f51aef5e6f0c8",
     "chopratejas/technique-router-onnx": "27b0b4bfa510a1cff66d888072c0b807082721a8",
     "chopratejas/siglip-image-encoder-onnx": "d0a9fbd66d4bd8c761bff592d44831f7c2ae184e",
     # Third-party repo — pinning matters most here.
@@ -100,6 +123,10 @@ def hf_hub_download_local_first(
         Absolute path to the local cached file.
 
     Raises:
+        OfflineEgressBlocked: when ``HEADROOM_OFFLINE`` is set and the file is
+            not already cached. A cache HIT still succeeds — the guard sits on
+            the network fallback only, so a pre-seeded air-gapped deployment
+            keeps working, which is the whole point of pre-seeding.
         Any exception raised by ``hf_hub_download`` on a genuine download failure,
         or the local-lookup error when ``allow_network`` is ``False`` and the
         file is not cached.
@@ -114,7 +141,107 @@ def hf_hub_download_local_first(
     except (LocalEntryNotFoundError, EntryNotFoundError, OSError):
         if not allow_network:
             raise
+        # Air-gap chokepoint: this is the Python half of the HuggingFace fetch
+        # the Rust core already guards. ``apply_offline_env`` sets
+        # ``HF_HUB_OFFLINE=1``, but only with ``setdefault`` (an explicit
+        # ``HF_HUB_OFFLINE=0`` wins) and only inside the proxy process — the CLI
+        # and library entry points never call it, so the flag alone is not the
+        # guarantee. Guarding here is, and it costs nothing on the cache-hit
+        # path above.
+        guard_egress(
+            f"HuggingFace download of {repo_id}/{filename}",
+            "huggingface.co",
+        )
         return str(hf_hub_download(repo_id, filename, revision=revision))
+
+
+def hf_entry_known_absent(repo_id: str, filename: str, *, revision: str | None = None) -> bool:
+    """True only if a prior network lookup already confirmed ``filename`` does
+    not exist in ``repo_id`` at the resolved revision.
+
+    Backed by ``huggingface_hub``'s own cache of negative lookups (the
+    ``.no_exist`` marker written after a real 404), so this never makes a
+    network call itself. Returns ``False`` both when the file is cached and
+    when nothing is known yet about it, on purpose: callers in a cache-only
+    (``allow_network=False``) code path can use this to tell "confirmed
+    missing upstream, safe to use a fallback file" apart from "just never
+    checked yet, do not guess."
+    """
+    from huggingface_hub import _CACHED_NO_EXIST, try_to_load_from_cache
+
+    revision = _resolve_revision(repo_id, revision)
+    result = try_to_load_from_cache(repo_id, filename, revision=revision)
+    return result is _CACHED_NO_EXIST
+
+
+def _hf_not_cached_errors() -> tuple[type[BaseException], ...]:
+    """Errors a ``local_files_only=True`` load raises on a plain cache miss.
+
+    Transformers and sentence-transformers both surface a miss as ``OSError``;
+    huggingface_hub's own lookup errors are listed explicitly in case a loader
+    lets one through unwrapped.
+    """
+    try:
+        from huggingface_hub.errors import EntryNotFoundError, LocalEntryNotFoundError
+    except Exception:  # pragma: no cover - huggingface_hub ships with every HF loader
+        return (OSError,)
+    return (LocalEntryNotFoundError, EntryNotFoundError, OSError)
+
+
+def hf_from_pretrained_local_first(
+    loader: Any,
+    name_or_path: str,
+    *,
+    purpose: str,
+    allow_network: bool = True,
+    **kwargs: Any,
+) -> Any:
+    """Load a HuggingFace model/tokenizer/processor, local cache first.
+
+    The ``from_pretrained`` twin of :func:`hf_hub_download_local_first`, for
+    every loader that takes ``local_files_only`` — ``AutoModel.from_pretrained``,
+    ``AutoTokenizer.from_pretrained``, ``AutoProcessor.from_pretrained``,
+    ``SentenceTransformer`` and friends. ``loader`` is that callable, passed
+    uncalled; ``kwargs`` are forwarded to both attempts.
+
+    1. ``local_files_only=True``: a pure cache lookup that cannot open a socket.
+       A warm (or pre-seeded air-gapped) cache loads here and never touches the
+       network, which also skips the Hub re-validation round-trips a plain
+       ``from_pretrained`` makes on every load.
+    2. On a cache miss, :func:`guard_egress` runs BEFORE the remote attempt.
+
+    Why the guard and not ``HF_HUB_OFFLINE``: ``apply_offline_env`` sets it with
+    ``setdefault``, so an explicit ``HF_HUB_OFFLINE=0`` wins, and only the proxy
+    process calls it at all. Under that configuration huggingface_hub's offline
+    constant is false even with ``TRANSFORMERS_OFFLINE=1``, and a bare
+    ``from_pretrained`` downloads. ``HEADROOM_OFFLINE`` is the master switch;
+    this guard is what makes it one for model loaders.
+
+    Args:
+        loader: The ``from_pretrained``-style callable.
+        name_or_path: Hub repo id or local directory.
+        purpose: What is being loaded, for the refusal message ("SigLIP model").
+        allow_network: When ``False`` a cache miss re-raises the local-lookup
+            error instead of falling back to a download.
+        **kwargs: Forwarded to ``loader`` (``revision=``, ``device=``, ...).
+
+    Raises:
+        OfflineEgressBlocked: ``HEADROOM_OFFLINE`` is set and the model is not
+            cached. Callers translate this into their own "model unavailable".
+        The loader's own error on a cache miss when ``allow_network`` is
+        ``False``, when ``name_or_path`` is a local directory (nothing remote
+        to fall back to), or when the remote attempt itself fails.
+    """
+    kwargs.pop("local_files_only", None)
+    try:
+        return loader(name_or_path, local_files_only=True, **kwargs)
+    except _hf_not_cached_errors():
+        # A local directory that failed to load has no remote to fall back to;
+        # surface the real error rather than a download attempt or a refusal.
+        if not allow_network or os.path.isdir(name_or_path):
+            raise
+    guard_egress(f"HuggingFace download of {purpose} ({name_or_path})", "huggingface.co")
+    return loader(name_or_path, local_files_only=False, **kwargs)
 
 
 def create_cpu_session_options(
@@ -139,6 +266,20 @@ def create_cpu_session_options(
         sess_options.intra_op_num_threads = intra_op_num_threads
     if inter_op_num_threads is not None:
         sess_options.inter_op_num_threads = inter_op_num_threads
+
+    if not onnx_thread_spinning_enabled():
+        # ORT's thread pools spin-wait on all cores between inferences by
+        # default, so idle-but-loaded models peg every core in a long-lived
+        # proxy (#2495). Make idle threads block instead. Best-effort: older ORT
+        # builds may not recognize a key.
+        for spin_key in (
+            "session.intra_op.allow_spinning",
+            "session.inter_op.allow_spinning",
+        ):
+            try:
+                sess_options.add_session_config_entry(spin_key, "0")
+            except Exception:
+                pass
 
     if not cpu_arena_enabled():
         if hasattr(sess_options, "enable_cpu_mem_arena"):

@@ -82,35 +82,9 @@ require_cmd() {
   command -v "$1" >/dev/null 2>&1 || die "Missing required command: $1"
 }
 
-detect_rtk_target() {
-  local system
-  local machine
-  system="$(uname -s)"
-  machine="$(uname -m)"
-
-  case "${system}" in
-    Darwin)
-      if [[ "${machine}" == "arm64" ]]; then
-        printf 'aarch64-apple-darwin'
-      else
-        printf 'x86_64-apple-darwin'
-      fi
-      ;;
-    Linux)
-      if [[ "${machine}" == "aarch64" ]]; then
-        printf 'aarch64-unknown-linux-gnu'
-      else
-        printf 'x86_64-unknown-linux-musl'
-      fi
-      ;;
-    *)
-      die "Unsupported host platform for Docker-native wrapper: ${system}/${machine}"
-      ;;
-  esac
-}
-
 ensure_host_dirs() {
   mkdir -p \
+    "${HEADROOM_HOST_HOME}/.config/opencode" \
     "${HEADROOM_HOST_HOME}/.headroom" \
     "${HEADROOM_HOST_HOME}/.claude" \
     "${HEADROOM_HOST_HOME}/.codex" \
@@ -130,6 +104,18 @@ append_passthrough_envs() {
   done
 }
 
+# Publish the proxy on host loopback only. The container itself must bind
+# 0.0.0.0 for Docker port forwarding to reach it, and the proxy refuses a
+# token-less non-loopback bind unless the operator states that the runtime
+# already confines the port. This helper is the only place that statement is
+# made, and it is made together with the 127.0.0.1 publication it relies on,
+# so the acknowledgement can never be added without the loopback restriction.
+append_loopback_publish_args() {
+  local -n _target="$1"
+  local port="$2"
+  _target+=(-p "127.0.0.1:${port}:${port}" --env "HEADROOM_ALLOW_UNAUTHENTICATED_BIND=1")
+}
+
 append_common_container_args() {
   local -n ref=$1
 
@@ -146,6 +132,7 @@ append_common_container_args() {
   ref+=(-v "${HEADROOM_HOST_HOME}/.claude:${HEADROOM_CONTAINER_HOME}/.claude")
   ref+=(-v "${HEADROOM_HOST_HOME}/.codex:${HEADROOM_CONTAINER_HOME}/.codex")
   ref+=(-v "${HEADROOM_HOST_HOME}/.gemini:${HEADROOM_CONTAINER_HOME}/.gemini")
+  ref+=(-v "${HEADROOM_HOST_HOME}/.config/opencode:${HEADROOM_CONTAINER_HOME}/.config/opencode")
 
   if command -v id >/dev/null 2>&1; then
     ref+=(--user "$(id -u):$(id -g)")
@@ -211,7 +198,8 @@ start_proxy_container() {
 
   local container_name="headroom-proxy-${port}-$$"
   local args=()
-  args=(docker run -d --rm --name "${container_name}" -p "${port}:${port}")
+  args=(docker run -d --rm --name "${container_name}")
+  append_loopback_publish_args args "${port}"
   append_common_container_args args
   args+=("${HEADROOM_IMAGE}" --host 0.0.0.0 --port "${port}" "$@")
   "${args[@]}" >/dev/null
@@ -317,6 +305,29 @@ append_persistent_container_args() {
   fi
 
   append_passthrough_envs "$1"
+}
+
+append_dashboard_gateway_env() {
+  local -n ref=$1
+
+  # This default is safe only because the published dashboard port is bound
+  # to the host loopback interface below. A host request published through
+  # Docker's default bridge reaches the
+  # container from the bridge gateway (for example, 172.17.0.1), not from
+  # 127.0.0.1. Trust only that exact gateway by default so the dashboard's
+  # metadata gate works for the first-party persistent Docker preset while
+  # preserving an explicitly configured allowlist.
+  if [[ -n "${HEADROOM_PROXY_TRUSTED_DASHBOARD_CLIENT_CIDRS+x}" ]]; then
+    return
+  fi
+
+  local gateway
+  gateway="$(docker network inspect bridge --format '{{(index .IPAM.Config 0).Gateway}}' 2>/dev/null || true)"
+  if [[ -n "${gateway}" ]]; then
+    ref+=(--env "HEADROOM_PROXY_TRUSTED_DASHBOARD_CLIENT_CIDRS=${gateway}/32")
+  else
+    warn "Could not determine Docker bridge gateway; dashboard metadata remains restricted"
+  fi
 }
 
 build_manifest_proxy_args() {
@@ -493,8 +504,10 @@ start_persistent_docker_install() {
 
   docker rm -f "${container_name}" >/dev/null 2>&1 || true
 
-  args=(docker run -d --restart unless-stopped --name "${container_name}" -p "${port}:${port}")
+  args=(docker run -d --restart unless-stopped --name "${container_name}")
+  append_loopback_publish_args args "${port}"
   append_persistent_container_args args
+  append_dashboard_gateway_env args
   args+=(
     --env "HEADROOM_DEPLOYMENT_PROFILE=${profile}"
     --env "HEADROOM_DEPLOYMENT_PRESET=persistent-docker"
@@ -619,6 +632,7 @@ Supported commands:
   aider
   cursor
   openclaw
+  opencode
 
 Notes:
   - GitHub Copilot CLI wrapping is not supported by the Docker-native wrapper.
@@ -785,66 +799,20 @@ parse_install_profile_arg() {
   done
 }
 
-run_claude_rtk_init() {
-  local rtk_bin="${HEADROOM_HOST_HOME}/.headroom/bin/rtk"
-  if [[ ! -x "${rtk_bin}" ]]; then
-    warn "rtk was not installed at ${rtk_bin}; Claude hooks were not registered"
-    return
-  fi
-
-  if ! "${rtk_bin}" init --global --auto-patch >/dev/null 2>&1; then
-    warn "Failed to register Claude hooks with rtk; continuing without hook registration"
-  fi
-}
-
-selected_context_tool() {
-  local value="${HEADROOM_CONTEXT_TOOL:-rtk}"
-  value="${value,,}"
-  value="${value//_/-}"
-  if [[ -z "${value}" ]]; then
-    value="rtk"
-  elif [[ "${value}" == "leanctx" ]]; then
-    value="lean-ctx"
-  fi
-
-  case "${value}" in
-    rtk|lean-ctx)
-      printf '%s\n' "${value}"
-      ;;
-    *)
-      die "HEADROOM_CONTEXT_TOOL must be one of: lean-ctx, rtk"
-      ;;
-  esac
-}
-
-run_lean_ctx_init() {
-  local agent="$1"
-  if ! command -v lean-ctx >/dev/null 2>&1; then
-    warn "lean-ctx is not installed on PATH; ${agent} lean-ctx setup was skipped"
-    return
-  fi
-
-  if ! lean-ctx init --agent "${agent}" >/dev/null 2>&1; then
-    warn "Failed to initialize lean-ctx for ${agent}; continuing without lean-ctx setup"
-  fi
-}
-
 parse_wrap_args() {
   local -n out_known=$1
   local -n out_host=$2
   local -n out_port=$3
-  local -n out_no_rtk=$4
-  local -n out_no_proxy=$5
-  local -n out_learn=$6
-  local -n out_backend=$7
-  local -n out_anyllm=$8
-  local -n out_region=$9
-  shift 9
+  local -n out_no_proxy=$4
+  local -n out_learn=$5
+  local -n out_backend=$6
+  local -n out_anyllm=$7
+  local -n out_region=$8
+  shift 8
 
   out_known=()
   out_host=()
   out_port=8787
-  out_no_rtk=0
   out_no_proxy=0
   out_learn=0
   out_backend=""
@@ -868,11 +836,6 @@ parse_wrap_args() {
       --port=*)
         out_port="${1#*=}"
         validate_port "${out_port}"
-        out_known+=("$1")
-        shift
-        ;;
-      --no-rtk)
-        out_no_rtk=1
         out_known+=("$1")
         shift
         ;;
@@ -923,6 +886,13 @@ parse_wrap_args() {
         out_known+=("$1")
         shift
         ;;
+      --rtk|--no-rtk|--no-project-rtk|--keep-rtk|--context-tool|--no-context-tool|--context-tool=*)
+        # Retired CLI context tools (rtk, lean-ctx). Reject explicitly: the
+        # catch-all below forwards the first unknown flag AND everything after it
+        # to the wrapped tool, so a leftover --no-rtk in a script would silently
+        # swallow a following --port and be ignored by the wrapped CLI.
+        die "CLI context tools (rtk, lean-ctx) have been removed from Headroom. Drop $1 and unset HEADROOM_CONTEXT_TOOL; 'headroom wrap' uninstalls what they left behind on first run."
+        ;;
       *)
         out_host+=("$@")
         break
@@ -939,7 +909,6 @@ run_prepare_only() {
   args=(docker run --rm)
   append_tty_args args
   append_common_container_args args
-  args+=(--env "HEADROOM_RTK_TARGET=$(detect_rtk_target)")
   args+=(--entrypoint headroom "${HEADROOM_IMAGE}" wrap "${tool}" --prepare-only "$@")
   "${args[@]}"
 }
@@ -1502,9 +1471,8 @@ main() {
         return
       fi
 
-      local known_args host_args port no_rtk no_proxy learn backend anyllm region context_tool
-      parse_wrap_args known_args host_args port no_rtk no_proxy learn backend anyllm region "$@"
-      context_tool="$(selected_context_tool)"
+      local known_args host_args port no_proxy learn backend anyllm region
+      parse_wrap_args known_args host_args port no_proxy learn backend anyllm region "$@"
 
       local proxy_args=()
       if [[ "${learn}" -eq 1 ]]; then
@@ -1520,30 +1488,22 @@ main() {
         proxy_args+=(--region "${region}")
       fi
 
-      local container_name=""
+      # Keep this in the wrapper's global scope so the EXIT trap can still
+      # stop the proxy after main returns.
+      container_name=""
       if [[ "${no_proxy}" -eq 0 ]]; then
         container_name="$(start_proxy_container "${port}" "${proxy_args[@]}")"
       fi
-      trap 'stop_proxy_container "${container_name}"' EXIT INT TERM
+      trap 'stop_proxy_container "${container_name:-}"' EXIT INT TERM
 
       local prep_args=("${known_args[@]}")
       if [[ "${no_proxy}" -eq 0 ]]; then
         prep_args+=(--no-proxy)
       fi
-      if [[ "${no_rtk}" -eq 0 && "${context_tool}" == "lean-ctx" ]]; then
-        prep_args+=(--no-rtk)
-      fi
       run_prepare_only "${tool}" "${prep_args[@]}"
-
-      if [[ "${no_rtk}" -eq 0 && "${context_tool}" == "lean-ctx" ]]; then
-        run_lean_ctx_init "${tool}"
-      fi
 
       case "${tool}" in
         claude)
-          if [[ "${no_rtk}" -eq 0 && "${context_tool}" == "rtk" ]]; then
-            run_claude_rtk_init
-          fi
           ANTHROPIC_BASE_URL="http://127.0.0.1:${port}" run_host_tool claude "${host_args[@]}"
           ;;
         codex)
@@ -1566,6 +1526,15 @@ EOF
           while true; do
             sleep 1
           done
+          ;;
+        opencode)
+          local opencode_config_file="${HEADROOM_HOST_HOME}/.config/opencode/opencode.json"
+          if [[ -f "${opencode_config_file}" ]]; then
+            OPENCODE_CONFIG_CONTENT="$(<"${opencode_config_file}")" \
+              run_host_tool opencode "${host_args[@]}"
+          else
+            run_host_tool opencode "${host_args[@]}"
+          fi
           ;;
       esac
       ;;
@@ -1616,8 +1585,8 @@ EOF
       run_args=(docker run --rm)
       append_tty_args run_args
       append_common_container_args run_args
-      run_args+=(-p "${port}:${port}")
-      run_args+=(--entrypoint headroom "${HEADROOM_IMAGE}" "${args[@]}")
+      append_loopback_publish_args run_args "${port}"
+      run_args+=(--entrypoint headroom "${HEADROOM_IMAGE}" proxy --host 0.0.0.0 --port "${port}" "${args[@]:1}")
       "${run_args[@]}"
       ;;
     *)
@@ -1666,7 +1635,7 @@ Installed wrapper:
 Next steps:
   1. Restart your shell or run: export PATH="${INSTALL_DIR}:\$PATH"
   2. Try: headroom proxy
-  3. Docs: https://github.com/chopratejas/headroom/blob/main/docs/docker-install.md
+  3. Docs: https://docs.headroomlabs.ai/docs/docker-install
 EOF
 }
 

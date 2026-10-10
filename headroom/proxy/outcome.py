@@ -25,10 +25,17 @@ actually reports.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any
+
+from headroom.proxy.conversation_savings import get_conversation_savings
+from headroom.proxy.tool_schema_savings_policy import (
+    headline_tokens_saved,
+    tool_schema_saved_from_tags,
+)
 
 logger = logging.getLogger("headroom.proxy")
 
@@ -52,8 +59,24 @@ class RequestOutcome:
 
     # ── Tokens (required — every site has these) ──────────────────────
     # original_tokens: pre-compression request size, for `tok_before`
-    # optimized_tokens: post-compression bytes actually forwarded, for
-    #     ``input_tokens`` and ``tok_after``
+    # optimized_tokens: post-compression size actually forwarded, for
+    #     ``tok_after``. MUST be counted with the SAME tokenizer as
+    #     ``original_tokens`` — every derived quantity is a delta between the
+    #     two (``tokens_saved``, ``tokens_inflated``, ``attempted_input_tokens``,
+    #     and the beacon's ``eligible_pct`` / ``yield_pct``), so mixing scales
+    #     silently corrupts all of them. Handlers used to pass the provider's
+    #     ``usage.prompt_tokens`` here because it also fed billing; that made
+    #     ``tok_after`` a provider count against a locally-estimated
+    #     ``tok_before``. On a gpt-4o-mini turn where our estimator undercounted
+    #     by 2 tokens that shipped as ``eligible_pct: 120`` — a structurally
+    #     impossible ratio — plus a phantom ``tok_inflated``. Provider-reported
+    #     input now lives in ``provider_input_tokens``.
+    # provider_input_tokens: the provider's own prompt-token count for this
+    #     request, when it reported one (0 otherwise). This is the billed
+    #     quantity, so cost and volume totals use it in preference to
+    #     ``optimized_tokens``. Kept separate precisely because it is on the
+    #     provider's tokenizer scale and must never be differenced against
+    #     ``original_tokens``.
     # output_tokens: response tokens from upstream
     # tokens_saved: original - optimized (or 0 if compression bypassed)
     # attempted_input_tokens: denominator for active-savings-percent.
@@ -66,6 +89,16 @@ class RequestOutcome:
     output_tokens: int
     tokens_saved: int
     attempted_input_tokens: int
+    # Optional correlation id for the human-readable PERF line. Most requests
+    # use ``request_id`` for both storage identity and log correlation. A
+    # long-lived WebSocket session is different: each emitted feed row needs a
+    # unique request id, while operators still need every line from the socket
+    # under one greppable session prefix.
+    perf_request_id: str | None = None
+    # Optional so the 18 existing emit sites need no change: a handler that has
+    # no provider count (or whose optimized_tokens is already provider-scaled)
+    # leaves it 0 and billing falls back to optimized_tokens, exactly as before.
+    provider_input_tokens: int = 0
 
     # ── Cache (provider-agnostic; unused fields stay 0) ───────────────
     # Anthropic populates all five (read + write + 5m + 1h + uncached).
@@ -86,6 +119,34 @@ class RequestOutcome:
     # never reached the provider at all. Used to drive the
     # Prometheus ``cached`` counter and dashboard "response cache" row.
     from_response_cache: bool = False
+
+    # ── Output composition ────────────────────────────────────────────
+    # ``output_tokens`` pools two quantities that different levers move in
+    # opposite directions: reasoning-effort routing cuts thinking, verbosity
+    # steering cuts visible text. Summed, neither can be attributed — a turn
+    # whose thinking dropped 4,000 tokens while its prose grew 200 is
+    # indistinguishable from one where nothing happened.
+    #
+    # ``None`` means "we could not tell", which is NOT zero: Anthropic reports
+    # no thinking count at all, so claiming 0 there would assert that no
+    # thinking occurred and corrupt any average over mixed-provider traffic.
+    # ``thinking_inferred`` marks a count Headroom derived by tokenizing the
+    # response's thinking blocks rather than one the provider reported — the
+    # same distinction ``cache_inferred`` draws on the input side.
+    thinking_tokens: int | None = None
+    thinking_inferred: bool = False
+    # Why the model stopped. ``"max_tokens"`` (Anthropic) / ``"length"``
+    # (OpenAI) mean a token ceiling cut the response off — the one unambiguous,
+    # provider-supplied feedback signal an adaptive ceiling can run a control
+    # loop on. The verbosity signals (user interrupted, user replied too fast to
+    # have read it) need transcript inference, which is why the verbosity
+    # controller was written and never wired to anything.
+    stop_reason: str | None = None
+    # 0-based position of this turn in its conversation. An output token is
+    # billed once at the output rate and again as input on every later turn,
+    # so what a wasted token actually costs depends on how much conversation
+    # is left — which cannot be computed without knowing where we are in it.
+    turn_index: int = 0
 
     # Upstream HTTP status for this request (200 on success or response-cache
     # hit). When >= 500 (e.g. a 529 Overloaded returned after retry
@@ -128,6 +189,20 @@ class RequestOutcome:
     #     one-field-add that proves the refactor pays out: per-
     #     harness visibility appears across EVERY handler with zero
     #     new bookkeeping at the call sites.
+    # conversation_key: stable across every turn of one conversation, from
+    #     ``conversation_key_from_body``. Paired with
+    #     ``conversation_tokens_saved`` it lets the funnel tell a first-time
+    #     removal from a re-run of one already counted. Both stay ``None`` on
+    #     paths whose ``tokens_saved`` is already novel-only -- every provider
+    #     that freezes its cached prefix, which is all of them except OpenAI's
+    #     ``/v1/responses``. See ``conversation_savings``.
+    # conversation_tokens_saved: the conversation's RUNNING removed-token
+    #     total as of this request, which on ``/v1/responses`` is what the
+    #     compressor reports every turn because it recompresses the whole
+    #     transcript. Not the same quantity as ``tokens_saved`` on the WS
+    #     path, where the outcome carries a per-turn delta.
+    conversation_key: str | None = None
+    conversation_tokens_saved: int | None = None
     transforms_applied: tuple[str, ...] = ()
     waste_signals: dict[str, int] | None = None
     num_messages: int = 0
@@ -139,7 +214,7 @@ class RequestOutcome:
     # (``original_messages``); otherwise ``request_messages`` carries the sent
     # body for backward compatibility and this stays ``None``.
     compressed_messages: list[dict[str, Any]] | None = None
-    tags: dict[str, str] = field(default_factory=dict)
+    tags: dict[str, Any] = field(default_factory=dict)
     client: str | None = None
     project: str | None = None
 
@@ -159,6 +234,25 @@ class RequestOutcome:
         makes "I forgot to compute it" structurally impossible.
         """
         return self.cache_read_tokens > 0 or self.from_response_cache
+
+    @property
+    def visible_output_tokens(self) -> int | None:
+        """Output tokens excluding thinking, or ``None`` when the split is
+        unknown.
+
+        The quantity verbosity steering actually targets. Callers must handle
+        ``None`` rather than defaulting it to ``output_tokens``: on a provider
+        that reports no thinking count, treating the whole output as visible
+        would credit steering with reductions that reasoning-effort routing
+        produced.
+
+        Clamped at zero because an inferred count comes from Headroom's
+        tokenizer while ``output_tokens`` is on the provider's scale; the two
+        can disagree by a token or two on a short response.
+        """
+        if self.thinking_tokens is None:
+            return None
+        return max(0, self.output_tokens - self.thinking_tokens)
 
     @property
     def cache_hit_pct(self) -> int:
@@ -186,6 +280,28 @@ class RequestOutcome:
             return 0.0
         return self.tokens_saved / self.original_tokens * 100.0
 
+    @property
+    def tokens_inflated(self) -> int:
+        """Tokens the forwarded request grew by, if it ended up larger.
+
+        ``tokens_saved`` is clamped at zero, so a request that leaves the
+        proxy *bigger* than it arrived is indistinguishable from one the
+        proxy simply could not compress: both report ``tok_saved=0``. That
+        ambiguity hides real regressions — anything that adds to the body
+        after compression (proactive context expansion, memory injection)
+        can outweigh the compression it sits on top of and still look like
+        a neutral turn.
+
+        Report the swallowed amount alongside it so the two cases are
+        distinguishable. This is diagnostic only: it deliberately does not
+        feed ``tokens_saved`` or ``attempted_input_tokens``, because
+        ``attempted_input_tokens = optimized_tokens + tokens_saved`` is a
+        size, not a signed delta, and because injection paths already book
+        their own cost through the retrieval-drawback channel — letting a
+        negative land here too would count it twice.
+        """
+        return max(0, self.optimized_tokens - self.original_tokens)
+
     @classmethod
     def from_stream(
         cls,
@@ -203,6 +319,7 @@ class RequestOutcome:
         overhead_ms: float,
         tags: dict[str, str] | None,
         client: str | None,
+        status_code: int = 200,
         log_full_messages: bool = False,
         cache_read_tokens: int = 0,
         cache_write_tokens: int = 0,
@@ -210,10 +327,17 @@ class RequestOutcome:
         cache_write_1h_tokens: int = 0,
         uncached_input_tokens: int = 0,
         cache_inferred: bool = False,
+        thinking_tokens: int | None = None,
+        thinking_inferred: bool = False,
+        stop_reason: str | None = None,
+        turn_index: int = 0,
         ttfb_ms: float = 0.0,
         pipeline_timing: dict[str, float] | None = None,
         waste_signals: dict[str, int] | None = None,
         original_messages: list[dict] | None = None,
+        conversation_key: str | None = None,
+        conversation_tokens_saved: int | None = None,
+        provider_input_tokens: int = 0,
     ) -> RequestOutcome:
         """Construct an outcome from the locals available at streaming
         finalize. Three streaming finalizers
@@ -284,15 +408,23 @@ class RequestOutcome:
             model=model,
             original_tokens=original_tokens,
             optimized_tokens=optimized_tokens,
+            provider_input_tokens=max(int(provider_input_tokens or 0), 0),
             output_tokens=output_tokens,
             tokens_saved=tokens_saved,
+            conversation_key=conversation_key,
+            conversation_tokens_saved=conversation_tokens_saved,
             attempted_input_tokens=optimized_tokens + tokens_saved,
+            status_code=status_code,
             cache_read_tokens=cache_read_tokens,
             cache_write_tokens=cache_write_tokens,
             cache_write_5m_tokens=cache_write_5m_tokens,
             cache_write_1h_tokens=cache_write_1h_tokens,
             uncached_input_tokens=uncached_input_tokens,
             cache_inferred=cache_inferred,
+            thinking_tokens=thinking_tokens,
+            thinking_inferred=thinking_inferred,
+            stop_reason=stop_reason,
+            turn_index=turn_index,
             total_latency_ms=total_latency_ms,
             overhead_ms=overhead_ms,
             ttfb_ms=ttfb_ms,
@@ -311,11 +443,37 @@ class RequestOutcome:
 # ── The funnel ───────────────────────────────────────────────────────
 
 
+_estimated_input_warned: set[tuple[str, str]] = set()
+
+
+def _warn_estimated_input(provider: str, model: str) -> None:
+    """Log once per (provider, model) when a request's input volume is an estimate.
+
+    Every successful response from Anthropic, OpenAI and Gemini carries usage,
+    so landing here on those providers means a code path dropped it. The
+    request still records (fail open), but the volume it contributes is
+    Headroom's tokenizer estimate, not the bill, and the coverage counters say so.
+    """
+    key = (str(provider), str(model))
+    if key in _estimated_input_warned or len(_estimated_input_warned) >= 256:
+        return
+    _estimated_input_warned.add(key)
+    logger.warning(
+        "event=input_tokens_estimated provider=%s model=%s: no provider usage on this "
+        "request; input volume recorded from Headroom's local tokenizer estimate",
+        provider,
+        model,
+    )
+
+
 async def emit_request_outcome(handler: Any, outcome: RequestOutcome) -> None:
     """Single funnel for per-request bookkeeping. The contract.
 
-    Owns the four downstream effects in canonical order:
+    Owns the downstream effects in canonical order:
 
+      0. ``telemetry.session.record_outcome(...)`` — anonymous session beacon
+         (opt-in, no-op unless ``HEADROOM_TELEMETRY`` is on). Runs ahead of the
+         5xx guard below so session error rates see upstream failures.
       1. ``handler.metrics.record_request(...)`` — Prometheus / SavingsTracker
       2. ``handler.cost_tracker.record_tokens(...)`` — cost dashboard
          (skipped when cost_tracker is None, i.e. ``--no-cost``)
@@ -323,9 +481,10 @@ async def emit_request_outcome(handler: Any, outcome: RequestOutcome) -> None:
          (skipped when logger is None, i.e. ``--no-request-logging``)
       4. structured PERF log line — consumed by ``headroom perf``
 
-    A failure outcome (``status_code >= 500``, e.g. a 529 surfaced after retry
-    exhaustion) short-circuits before these four effects: it records a failed
-    request and returns, so an upstream failure cannot feed the success stats.
+    A rejected outcome (``status_code >= 400``, e.g. a 429 rate limit or a 529
+    surfaced after retry exhaustion) short-circuits before effects 1-4: it
+    records the request under the counter that names what happened and returns,
+    so a turn the provider never billed cannot feed the success stats.
 
     Takes the handler as a free argument rather than ``self`` so this
     function is callable from:
@@ -343,6 +502,13 @@ async def emit_request_outcome(handler: Any, outcome: RequestOutcome) -> None:
     from headroom.proxy.cost import _summarize_transforms
     from headroom.proxy.models import RequestLog
     from headroom.proxy.project_context import get_current_project
+    from headroom.proxy.savings_attribution import (
+        encode,
+        from_tags,
+        public_tags,
+        timings_from_tags,
+    )
+    from headroom.telemetry.session import record_outcome
 
     # GitHub Copilot: requests routed to the Copilot API travel on the OpenAI or
     # Anthropic wire, so the handlers stamp the wire provider. Relabel to
@@ -357,15 +523,90 @@ async def emit_request_outcome(handler: Any, outcome: RequestOutcome) -> None:
 
         outcome = dataclasses.replace(outcome, provider="copilot")
 
-    # Upstream failure (>= 500, e.g. a 529 Overloaded surfaced after retry
-    # exhaustion) must not feed the savings/cost/log success stats; that would
-    # let a failed request inflate the save-rate. Record it as failed and stop,
-    # mirroring the pre-passthrough behaviour where an exhausted 5xx raised and
-    # was counted via record_failed. 4xx stay on the normal funnel: they are
-    # client errors the proxy still served.
-    if outcome.status_code >= 500:
-        await handler.metrics.record_failed(provider=outcome.provider)
+    # 0. Anonymous session beacon. Opt-in and a no-op unless HEADROOM_TELEMETRY
+    #    is explicitly on, in which case it folds this outcome into an in-memory
+    #    per-session aggregate and POSTs one content-free event when the session
+    #    goes idle (off-thread — see telemetry.session.post_session_event).
+    #
+    #    Placed before the 5xx short-circuit, for the same reason the Copilot
+    #    relabel above is: a session's failure count has to see upstream
+    #    failures, and per-session error rate is exactly the signal that shows a
+    #    provider going flaky for real users. Everything below this point is
+    #    success-only bookkeeping.
+    #
+    #    Synchronous but allocation-light, and swallows its own exceptions — the
+    #    beacon must never add latency to, or take down, the request path.
+    record_outcome(outcome)
+
+    # A rejected turn must not feed the savings/cost/log success stats; that
+    # would let a request the provider never billed inflate the save-rate.
+    # Record it under the counter that names what happened, and stop.
+    #
+    # This covers 4xx as well as 5xx. A 4xx is an error the PROXY served but the
+    # PROVIDER did not: nothing was generated, so nothing was billed, so
+    # compression on that turn saved exactly nothing. Counting it anyway is not a
+    # rounding error — measured on a real session where 143 of 300 turns came
+    # back 429 ("Usage credits are required for fast mode"), 46.5% of the
+    # headline `total_saved` was compression on turns Anthropic rejected, and
+    # `requests.rate_limited` still read 0 because only Headroom's own limiter
+    # ever incremented it. The 60M `tokens.input` and the $8.90 compression
+    # savings shown against a $2.26 measured spend came from the same place.
+    #
+    # 429 goes to record_rate_limited rather than record_failed: an upstream rate
+    # limit is the one 4xx a user is expected to act on (back off, raise a cap),
+    # and folding it into a generic failure count hides exactly that. Both
+    # counters are already exported and neither feeds savings.
+    #
+    # source="upstream": this funnel only ever sees a 429 the PROVIDER returned.
+    # Headroom's own limiter rejects before a request is ever sent and records
+    # source="headroom" from the handler. The two are acted on differently —
+    # raise our cap vs. back off / shard keys — so they must stay separable
+    # (issue #3696). ``outcome.provider`` is the already-Copilot-relabelled
+    # value, matching every other provider-labelled metric on this path.
+    if outcome.status_code >= 400:
+        if outcome.status_code == 429:
+            await handler.metrics.record_rate_limited(provider=outcome.provider, source="upstream")
+        else:
+            await handler.metrics.record_failed(provider=outcome.provider)
         return
+
+    # Outcome stage: hand the meter's reading to any pipeline extension that
+    # adapts to it — a ceiling that was hit, an effort setting that did or did
+    # not pay off. The snapshot is frozen, so an extension can learn from the
+    # measurement without being able to rewrite it: extensions declare what
+    # they did, the core records what happened, and attribution is the core's
+    # arithmetic over both.
+    #
+    # Best-effort and last in line: a handler without a pipeline manager, or an
+    # extension that raises, must not affect the response or the stats below.
+    _pipeline = getattr(handler, "pipeline_extensions", None)
+    if _pipeline is not None and getattr(_pipeline, "enabled", False):
+        try:
+            from headroom.pipeline import OutcomeSnapshot, PipelineStage
+
+            _pipeline.emit(
+                PipelineStage.OUTCOME_OBSERVED,
+                operation="proxy.outcome",
+                request_id=outcome.request_id,
+                provider=outcome.provider,
+                model=outcome.model,
+                outcome=OutcomeSnapshot(
+                    request_id=outcome.request_id,
+                    provider=outcome.provider,
+                    model=outcome.model,
+                    output_tokens=outcome.output_tokens,
+                    thinking_tokens=outcome.thinking_tokens,
+                    thinking_inferred=outcome.thinking_inferred,
+                    stop_reason=outcome.stop_reason,
+                    input_tokens=outcome.provider_input_tokens or outcome.optimized_tokens,
+                    cache_read_tokens=outcome.cache_read_tokens,
+                    cache_write_tokens=outcome.cache_write_tokens,
+                    turn_index=outcome.turn_index,
+                    transforms_applied=tuple(str(t) for t in (outcome.transforms_applied or ())),
+                ),
+            )
+        except Exception:  # noqa: BLE001 - telemetry must never break a response
+            logger.debug("OUTCOME_OBSERVED emit failed", exc_info=True)
 
     # Output-shaping savings ledger (counterfactual estimator). The shaper
     # tags each request's (arm, stratum) onto ``transforms_applied``; feed the
@@ -377,10 +618,17 @@ async def emit_request_outcome(handler: Any, outcome: RequestOutcome) -> None:
             from headroom.proxy.output_savings import get_recorder
 
             _rec = get_recorder()
-            _rec.record_from_labels(outcome.transforms_applied, outcome.output_tokens)
-            output_tokens_saved_est = _rec.estimate_request_savings(
-                outcome.transforms_applied, outcome.output_tokens
-            )
+
+            def _record_and_estimate() -> int:
+                _rec.record_from_labels(outcome.transforms_applied, outcome.output_tokens)
+                return _rec.estimate_request_savings(
+                    outcome.transforms_applied, outcome.output_tokens
+                )
+
+            # Both calls take the recorder lock, and the every-Nth record also
+            # does a full read-modify-write of the ledger file — run them
+            # together off the event loop (#18) so a slow flush can't stall it.
+            output_tokens_saved_est = await asyncio.to_thread(_record_and_estimate)
         except Exception:  # pragma: no cover - defensive
             pass
 
@@ -388,18 +636,63 @@ async def emit_request_outcome(handler: Any, outcome: RequestOutcome) -> None:
     # HTTP middleware / WS accept captured from ``X-Headroom-Project``.
     project = outcome.project or get_current_project()
 
+    # Savings that are new to this conversation. Per-request descriptions
+    # below keep ``outcome.tokens_saved`` -- the wire truth for THIS request --
+    # while everything that accumulates across turns uses this, so a removed
+    # token is counted once per conversation instead of once per turn. Falls
+    # back to ``tokens_saved`` on paths that do not distinguish, which is
+    # already the novel figure there. See ``conversation_savings``.
+    novel_tokens_saved = get_conversation_savings().novel(
+        outcome.conversation_key, outcome.conversation_tokens_saved
+    )
+    if novel_tokens_saved is None:
+        novel_tokens_saved = outcome.tokens_saved
+
+    # Tool-schema savings (deferral + turn-hook tool shrink) live in per-request
+    # tags and never move tok_before/after; aggregate them into Metrics so the
+    # session summary / cost summary / all-layers total can surface the layer.
+    tool_search_saved = tool_schema_saved_from_tags(outcome.tags or {})
+    savings_breakdown = from_tags(outcome.tags)
+
+    # Stage timings contributed from OUTSIDE the handler, folded in here rather
+    # than in each handler so every provider picks them up from one place.
+    #
+    # The handler's own timings win a name collision, which cannot happen while
+    # extension stages carry the ``ext:`` prefix but is the safe way round if
+    # that ever changes: a plugin must not be able to overwrite a measurement
+    # the pipeline made of itself.
+    extension_timing = timings_from_tags(outcome.tags)
+    pipeline_timing = (
+        {**extension_timing, **(outcome.pipeline_timing or {})}
+        if extension_timing
+        else outcome.pipeline_timing
+    )
+
+    # Billed input volume. Prefer the provider's own count where it reported one
+    # — that is what the invoice charges for, and it is the number cache math is
+    # already expressed in. Falls back to our local ``optimized_tokens`` when the
+    # provider stayed silent (streaming without usage, or a non-reporting
+    # backend), which is the pre-split behaviour for every handler.
+    #
+    # Deliberately NOT used for any delta: differencing this against
+    # ``original_tokens`` mixes tokenizer scales. See the field docs.
+    billed_input_tokens = outcome.provider_input_tokens or outcome.optimized_tokens
+    input_provider_reported = outcome.provider_input_tokens > 0
+    if not input_provider_reported and billed_input_tokens > 0:
+        _warn_estimated_input(outcome.provider, outcome.model)
+
     # 1. Prometheus / SavingsTracker.
     await handler.metrics.record_request(
         provider=outcome.provider,
         model=outcome.model,
-        input_tokens=outcome.optimized_tokens,
+        input_tokens=billed_input_tokens,
         output_tokens=outcome.output_tokens,
-        tokens_saved=outcome.tokens_saved,
+        tokens_saved=novel_tokens_saved,
         latency_ms=outcome.total_latency_ms,
         cached=outcome.cache_hit,
         overhead_ms=outcome.overhead_ms,
         ttfb_ms=outcome.ttfb_ms,
-        pipeline_timing=outcome.pipeline_timing,
+        pipeline_timing=pipeline_timing,
         waste_signals=outcome.waste_signals,
         cache_read_tokens=outcome.cache_read_tokens,
         cache_write_tokens=outcome.cache_write_tokens,
@@ -410,6 +703,16 @@ async def emit_request_outcome(handler: Any, outcome: RequestOutcome) -> None:
         output_tokens_saved=output_tokens_saved_est,
         project=project,
         client=outcome.client,
+        tool_search_saved=tool_search_saved,
+        local_input_tokens=outcome.optimized_tokens,
+        savings_attribution=savings_breakdown,
+        # Already handed to the cost tracker below; the metrics path needs it
+        # too now that it prices savings cache-aware. An inferred write is the
+        # same tokens as `uncached_input_tokens` and carries no write premium,
+        # so counting it as a write would both double it and apply a premium
+        # OpenAI never charges.
+        cache_inferred=outcome.cache_inferred,
+        input_provider_reported=input_provider_reported,
     )
 
     # 2. Cost tracker (optional).
@@ -417,14 +720,20 @@ async def emit_request_outcome(handler: Any, outcome: RequestOutcome) -> None:
     if cost_tracker is not None:
         cost_tracker.record_tokens(
             outcome.model,
-            outcome.tokens_saved,
-            outcome.optimized_tokens,
+            novel_tokens_saved,
+            billed_input_tokens,
             cache_read_tokens=outcome.cache_read_tokens,
             cache_write_tokens=outcome.cache_write_tokens,
             cache_write_5m_tokens=outcome.cache_write_5m_tokens,
             cache_write_1h_tokens=outcome.cache_write_1h_tokens,
             uncached_tokens=outcome.uncached_input_tokens,
+            cache_inferred=outcome.cache_inferred,
             output_tokens=outcome.output_tokens,
+            # Same figure already handed to metrics.record_request above. The
+            # cost tracker feeds the dashboard's per-model table, which read
+            # compression only while its own headline counted both layers.
+            tool_schema_saved=tool_search_saved,
+            provider_reported=input_provider_reported,
         )
 
     # 3. Per-request log (optional). The ``client`` outcome field is
@@ -434,7 +743,7 @@ async def emit_request_outcome(handler: Any, outcome: RequestOutcome) -> None:
     #    dict is not mutated (frozen dataclass + defensive copy).
     request_logger = getattr(handler, "logger", None)
     if request_logger is not None:
-        log_tags = dict(outcome.tags)
+        log_tags = public_tags(outcome.tags)
         if outcome.client:
             log_tags["client"] = outcome.client
         if project:
@@ -442,7 +751,10 @@ async def emit_request_outcome(handler: Any, outcome: RequestOutcome) -> None:
         request_logger.log(
             RequestLog(
                 request_id=outcome.request_id,
-                timestamp=datetime.now().isoformat(),
+                # Request logs are consumed by browsers in arbitrary time zones.
+                # Include the UTC offset so relative-age calculations represent
+                # the same instant regardless of where the proxy runs.
+                timestamp=datetime.now(timezone.utc).isoformat(),
                 provider=outcome.provider,
                 model=outcome.model,
                 input_tokens_original=outcome.original_tokens,
@@ -458,6 +770,7 @@ async def emit_request_outcome(handler: Any, outcome: RequestOutcome) -> None:
                 cache_write_tokens=outcome.cache_write_tokens,
                 uncached_input_tokens=outcome.uncached_input_tokens,
                 transforms_applied=list(outcome.transforms_applied),
+                savings_breakdown=savings_breakdown,
                 waste_signals=outcome.waste_signals,
                 request_messages=outcome.request_messages,
                 compressed_messages=outcome.compressed_messages,
@@ -470,17 +783,45 @@ async def emit_request_outcome(handler: Any, outcome: RequestOutcome) -> None:
     #    line unchanged, and gives ``headroom perf --client X``
     #    parsers a clean key to filter on.
     client_part = f" client={outcome.client}" if outcome.client else ""
+    # Only when it differs: on every path that reports novel-only savings the
+    # two are equal and a second identical number is noise.
+    novel_part = (
+        f"tok_novel={novel_tokens_saved} " if novel_tokens_saved != outcome.tokens_saved else ""
+    )
+    # ``cached=1`` marks a turn answered from Headroom's own response cache.
+    # Such a turn never contacts the upstream, so it has no outbound_request
+    # line, no upstream stage timings, and all-zero token counters — which
+    # made it indistinguishable in the logs from a turn that died silently
+    # (#3019). Appended only on a hit, so every other PERF line is unchanged
+    # and existing parsers keep working (``_parse_kv`` reads trailing
+    # key=value pairs after ``transforms=`` the same way it reads
+    # ``client=``).
+    cached_part = " cached=1" if outcome.from_response_cache else ""
+    # Tool-schema DEFERRAL savings can't move tok_before/after (those count messages
+    # only), so a tool-heavy turn shows tok_saved=0 while genuinely saving thousands of
+    # tool-definition tokens. `tool_saved` carries that component and `total_saved` is
+    # the sum every user-facing surface reports — see tool_schema_savings_policy for why
+    # compaction is already inside tok_saved and must not be added twice.
+    tool_saved = tool_schema_saved_from_tags(outcome.tags or {})
+    total_saved = headline_tokens_saved(outcome.tokens_saved, outcome.tags or {})
+    encoded_savings = encode(savings_breakdown)
     logger.info(
-        f"[{outcome.request_id}] PERF "
+        f"[{outcome.perf_request_id or outcome.request_id}] PERF "
         f"model={outcome.model} msgs={outcome.num_messages} "
         f"tok_before={outcome.original_tokens} tok_after={outcome.optimized_tokens} "
         f"tok_saved={outcome.tokens_saved} "
+        f"{novel_part}"
+        f"tok_inflated={outcome.tokens_inflated} "
+        f"tool_saved={tool_saved} "
+        f"total_saved={total_saved} "
         f"cache_read={outcome.cache_read_tokens} cache_write={outcome.cache_write_tokens} "
         f"cache_hit_pct={outcome.cache_hit_pct} "
         f"opt_ms={outcome.overhead_ms:.0f} "
         f"total_ms={outcome.total_latency_ms:.0f} "
         f"tok_out={outcome.output_tokens} "
         f"ttfb_ms={outcome.ttfb_ms:.0f} "
+        f"savings={encoded_savings} "
         f"transforms={_summarize_transforms(list(outcome.transforms_applied))}"
         f"{client_part}"
+        f"{cached_part}"
     )

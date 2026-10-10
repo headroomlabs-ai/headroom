@@ -21,6 +21,8 @@ import re
 from dataclasses import dataclass
 from enum import Enum
 
+from .lossless_compaction import _TIMESTAMP_ROW_RE
+
 
 class ContentType(Enum):
     """Types of content that can be compressed."""
@@ -49,6 +51,16 @@ class DetectionResult:
 _SEARCH_RESULT_PATTERN = re.compile(
     r"^[^\s:]+:\d+:"  # file:line: format (grep -n style)
 )
+
+# ``path-NN-content`` shape of grep -A/-B/-C context lines (#3580). The path
+# group is non-greedy so the earliest ``-digits-`` marker wins, mirroring the
+# search parser that anchors on the first line-number marker in the line.
+_GREP_CONTEXT_PATTERN = re.compile(r"^(?P<path>[^\s:]+?)-(?P<line>\d+)-")
+
+# Same idea with the path/line separator left as ``:``: ``path:NN-content``.
+# Real GNU grep emits dashes in both positions, but the reported repro builds
+# context lines this way, so both shapes must route identically.
+_GREP_COLON_DASH_PATTERN = re.compile(r"^(?P<path>[^\s:]+):(?P<line>\d+)-")
 
 # A markdown table separator row, e.g. "| --- | :--: |" or "---|---".
 # Every cell must be dashes with optional alignment colons.
@@ -111,6 +123,13 @@ _CODE_PATTERNS = {
         ),
         re.compile(r"^.*\b(get|set|init);"),  # auto-property accessors
     ],
+    "php": [
+        re.compile(r"<\?php\b"),
+        re.compile(r"^\s*namespace\s+[\w\\]+\s*;"),
+        re.compile(r"^\s*use\s+[\w\\]+(\s+as\s+\w+)?\s*;"),
+        re.compile(r"^\s*(public|private|protected|static|abstract|final)?\s*function\s+\w+\s*\("),
+        re.compile(r"\$this->"),
+    ],
 }
 
 # Structured-config (YAML/TOML/INI) patterns. TOML and INI share the
@@ -150,6 +169,13 @@ _LOG_PATTERNS = [
     re.compile(r"^\s*at .+\) in .+:line \d+"),  # .NET frame with PDB info
     re.compile(r"^Caused by: "),  # Java exception chain head
     re.compile(r"^\s*\.\.\. \d+ more$"),  # Java elided-frames summary
+    # CMTrace record opener -- the log format SCCM, MDT and Intune Win32
+    # app/script deployments write on Windows. Every record is
+    # `<![LOG[message]LOG]!><time="..." date="..." ...>`, which matches none of
+    # the patterns above: the timestamp sits in an attribute *after* the
+    # message, so the anchored date/time/separator patterns cannot fire, and a
+    # record need not contain ERROR/WARN/INFO.
+    re.compile(r"^<!\[LOG\["),  # CMTrace (SCCM/Intune) log record
 ]
 
 
@@ -189,17 +215,23 @@ def detect_content_type(content: str) -> DetectionResult:
     if html_result and html_result.confidence >= 0.7:
         return html_result
 
-    # 4. Check for search results (file:line: format)
+    # Git's human-readable status is structured state, not prose. Recognize it
+    # before the lossy search/log/plain-text routes.
+    git_status_result = _try_detect_git_status(content)
+    if git_status_result:
+        return git_status_result
+
+    # 5. Check for search results (file:line: format)
     search_result = _try_detect_search(content)
     if search_result and search_result.confidence >= 0.6:
         return search_result
 
-    # 5. Check for build/log output
+    # 6. Check for build/log output
     log_result = _try_detect_log(content)
     if log_result and log_result.confidence >= 0.5:
         return log_result
 
-    # 6. Check for tabular data (CSV/TSV, markdown tables). Runs after
+    # 7. Check for tabular data (CSV/TSV, markdown tables). Runs after
     #    search/log so colon-delimited search output and freeform logs claim
     #    their content first; tabular requires a consistent multi-column
     #    delimiter or a markdown header+separator pair.
@@ -207,20 +239,73 @@ def detect_content_type(content: str) -> DetectionResult:
     if tabular_result and tabular_result.confidence >= 0.6:
         return tabular_result
 
-    # 7. Check for structured config (YAML/TOML/INI). Runs after tabular so
+    # 8. Check for structured config (YAML/TOML/INI). Runs after tabular so
     #    delimited data keeps its claim, and before code so config files with
     #    code-ish lines route to the structure-aware config compressor.
     config_result = _try_detect_structured_config(content)
     if config_result and config_result.confidence >= 0.6:
         return config_result
 
-    # 8. Check for source code
+    # 9. Check for source code
     code_result = _try_detect_code(content)
     if code_result and code_result.confidence >= 0.5:
         return code_result
 
-    # 9. Fallback to plain text
+    # 10. Space-aligned command output is last, only claims what would
+    #     otherwise be plain text.
+    fixed_width_result = _try_detect_fixed_width(content)
+    if fixed_width_result:
+        return fixed_width_result
+
+    # 11. Fallback to plain text
     return DetectionResult(ContentType.PLAIN_TEXT, 0.5, {})
+
+
+_GIT_STATUS_HEADERS = frozenset(
+    {
+        "Changes to be committed:",
+        "Changes not staged for commit:",
+        "Untracked files:",
+        "Unmerged paths:",
+    }
+)
+_GIT_STATUS_ENTRY_RE = re.compile(
+    r"^\s+(?:new file|modified|deleted|renamed|copied|typechange|"
+    r"both modified|both added|both deleted|added by us|deleted by us|"
+    r"added by them|deleted by them):\s+\S"
+)
+
+
+def _try_detect_git_status(content: str) -> DetectionResult | None:
+    """Recognize standard ``git status`` headings and path entries narrowly."""
+    first = content.partition("\n")[0]
+    if not first.startswith(("On branch ", "HEAD detached at ", "HEAD detached from ")):
+        return None
+    lines = content.splitlines()
+
+    has_heading = False
+    has_path = False
+    section: str | None = None
+    for line in lines[1:]:
+        if line in _GIT_STATUS_HEADERS:
+            has_heading = True
+            section = line
+        elif line in {"", "Changes not staged for commit:", "nothing to commit"}:
+            continue
+        elif line.startswith("Your branch ") or line.startswith("  (use "):
+            continue
+        elif section == "Untracked files:" and line.startswith("\t") and line[1:].strip():
+            has_path = True
+        elif section in {
+            "Changes to be committed:",
+            "Changes not staged for commit:",
+            "Unmerged paths:",
+        } and _GIT_STATUS_ENTRY_RE.match(line):
+            has_path = True
+
+    if not (has_heading and has_path):
+        return None
+    return DetectionResult(ContentType.TABULAR, 1.0, {"format": "git_status"})
 
 
 _JSON_DECODER = json.JSONDecoder()
@@ -450,6 +535,67 @@ def _try_detect_html(content: str) -> DetectionResult | None:
     )
 
 
+def _prefix_looks_like_path(prefix: str) -> bool:
+    """Shared path-shape guard for every grep-line shape.
+
+    Rules out markup tags and ``key=value`` log prefixes; a single helper so
+    the three shapes cannot drift apart.
+    """
+    return "<" not in prefix and ">" not in prefix and "=" not in prefix
+
+
+def _is_grep_context_line(line: str) -> bool:
+    """True when a line looks like ``path-NN-content`` grep context output.
+
+    GNU grep (and ripgrep / git grep) separate ``-A``/``-B``/``-C`` context
+    lines with ``-`` where match lines use ``:``. Without this branch those
+    lines read as prose, and code in them reaches the word-dropping Kompress
+    compressor (#3580). The colon branch runs first; this is tried after.
+
+    The prefix must additionally look like a file path: the same ``</>=``
+    exclusions as the colon branch, plus it must contain ``/`` or ``.`` —
+    which keeps dates (``2026-09-14``) and dashed prose (``version-2-release``)
+    out while accepting real paths, including dashed names (``my-file.py``).
+    """
+    match = _GREP_CONTEXT_PATTERN.match(line)
+    if not match:
+        return False
+    prefix = match.group("path")
+    if not _prefix_looks_like_path(prefix):
+        return False
+    return "/" in prefix or "." in prefix
+
+
+def _is_search_result_line(line: str) -> bool:
+    """True when a line looks like ``path:line:content`` grep output.
+
+    The bare ``^[^\\s:]+:\\d+:`` shape also matches ISO-8601 timestamps
+    (``…T09:57:59…``) and XML-ish wrappers harnesses prepend to user turns
+    (Copilot CLI's ``<current_datetime>…`` line), which misroutes prose to
+    the SearchCompressor — and that compressor keeps only matching lines,
+    deleting the rest. So the pre-colon segment must additionally look like
+    a file path: no angle brackets and no ``=`` (rules out markup tags and
+    ``key=value:12:`` log lines).
+
+    A timestamped log row is never grep output: since #3419 the lossless
+    fold skips those rows, so a payload classified as search here falls
+    through to the lossy SearchCompressor, which keeps 5 rows per "file"
+    and prints the minute back as an integer (#3736). Reject any line the
+    lossless fold already knows is a timestamp row, reusing the same regex
+    so the two guards cannot drift apart.
+
+    ``grep -A``/``-B``/``-C`` context lines — both the real GNU shape
+    (``path-NN-content``) and the reported ``path:NN-content`` shape — are
+    accepted via the context predicates so code in them routes to the search
+    compressor instead of the prose path (#3580).
+    """
+    if _TIMESTAMP_ROW_RE.match(line):
+        return False
+    if _SEARCH_RESULT_PATTERN.match(line) or _GREP_COLON_DASH_PATTERN.match(line):
+        return _prefix_looks_like_path(line.split(":", 1)[0])
+    return _is_grep_context_line(line)
+
+
 def _try_detect_search(content: str) -> DetectionResult | None:
     """Try to detect grep/ripgrep search results."""
     lines = content.split("\n")[:100]  # Check first 100 lines
@@ -458,10 +604,16 @@ def _try_detect_search(content: str) -> DetectionResult | None:
 
     matching_lines = 0
     for line in lines:
-        if line.strip() and _SEARCH_RESULT_PATTERN.match(line):
+        if line.strip() and _is_search_result_line(line):
             matching_lines += 1
 
-    if matching_lines == 0:
+    # Absolute floor: a single coincidental `word:digits:` line (a timestamp,
+    # a URL, a time literal inside prose) must not classify a whole payload as
+    # search results — the SearchCompressor drops every non-matching line, so
+    # a false positive is data loss. A genuine one-line grep result loses
+    # nothing by staying uncompressed: all of its lines match, so the
+    # compressor would have kept it verbatim anyway.
+    if matching_lines < 2:
         return None
 
     # Calculate confidence based on proportion of matching lines
@@ -621,6 +773,82 @@ def _try_detect_tabular(content: str) -> DetectionResult | None:
         return md_result
 
     return _try_detect_delimited(lines)
+
+
+# Fixed-width (space-aligned) command output: `ls -l`, `ps aux`, `df -h`,
+# `docker ps`, `kubectl get`. These rows have no delimiter, so without this
+# check they fall through to PLAIN_TEXT and the prose compressor drops fields
+# out of individual rows with nothing marking which row lost what (#3652).
+_FIXED_WIDTH_LIST_RE = re.compile(r"^\s*(?:[-*+•]|\d{1,3}[.)])\s")
+_FIXED_WIDTH_PROSE_END_RE = re.compile(r"[A-Za-z][.!?][\"')\]]?$")
+_FIXED_WIDTH_CODE_ENDS = ("{", "}", ";", "(", ")", ",", ":", "\\")
+_FIXED_WIDTH_CODE_STARTS = ("#", "//", "/*", "--")
+_FIXED_WIDTH_MAX_COLS = 400
+
+
+def _fixed_width_gutters(lines: list[str]) -> int:
+    """Count the column gaps shared by at least 90% of ``lines``.
+
+    A gutter is a character position that holds a space strictly inside the
+    text (after the first non-space character; lines are right-stripped) on
+    nearly every line. Adjacent gutter positions count as one gap, so a table
+    with N columns has N - 1 gaps. Prose and code line up by accident on one
+    position at most, not on several.
+    """
+    need = -(-9 * len(lines) // 10)  # ceil(0.9 * n)
+    hits = [0] * _FIXED_WIDTH_MAX_COLS
+    for ln in lines:
+        start = len(ln) - len(ln.lstrip(" "))
+        for i in range(start, min(len(ln), _FIXED_WIDTH_MAX_COLS)):
+            if ln[i] == " ":
+                hits[i] += 1
+    gaps = 0
+    in_gap = False
+    for count in hits:
+        is_gutter = count >= need
+        if is_gutter and not in_gap:
+            gaps += 1
+        in_gap = is_gutter
+    return gaps
+
+
+def _try_detect_fixed_width(content: str) -> DetectionResult | None:
+    """Detect space-aligned columns (>= 3 of them) in command output.
+
+    Runs last, only for content that would otherwise be PLAIN_TEXT, so it
+    never takes content away from another detector. A false positive costs
+    savings, not correctness: the tabular compressor passes rows it cannot
+    split cleanly through verbatim.
+    """
+    lines = [ln.rstrip() for ln in content.split("\n") if ln.strip()][:50]
+    if len(lines) < 4 or any("\t" in ln for ln in lines):
+        return None
+
+    n = len(lines)
+    if sum(1 for ln in lines if _FIXED_WIDTH_LIST_RE.match(ln)) / n >= 0.5:
+        return None
+    if sum(1 for ln in lines if _FIXED_WIDTH_PROSE_END_RE.search(ln)) / n >= 0.3:
+        return None
+    code_like = sum(
+        1
+        for ln in lines
+        if ln.endswith(_FIXED_WIDTH_CODE_ENDS) or ln.lstrip().startswith(_FIXED_WIDTH_CODE_STARTS)
+    )
+    if code_like / n >= 0.3:
+        return None
+
+    gaps = _fixed_width_gutters(lines)
+    if gaps < 2 and n >= 5:
+        # A one-line preamble (`total 480` above `ls -l` rows) has no gaps of
+        # its own; measure the rows without it.
+        gaps = _fixed_width_gutters(lines[1:])
+    if gaps < 2:
+        return None
+    return DetectionResult(
+        ContentType.TABULAR,
+        0.7,
+        {"format": "fixed_width", "columns": gaps + 1},
+    )
 
 
 def _try_parse_toml(content: str) -> bool:

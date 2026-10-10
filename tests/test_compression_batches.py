@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import re
+import time
 
 from headroom.transforms.compression_batches import (
     CompressionBatchEntry,
@@ -229,3 +230,27 @@ def test_batch_uses_utf8_bytes_for_cjk_small_units():
     assert batches[0].text_bytes == 1800
     assert all(result.modified for _, result in results)
     assert [result.compressed for _, result in results] == ["短"] * 4
+
+
+def test_batch_after_the_request_deadline_passes_through_without_routing(monkeypatch):
+    from headroom.transforms.content_router import ContentRouter
+
+    monkeypatch.setenv("HEADROOM_COMPRESSION_DEADLINE_MS", "20000")
+    entries = [_entry(index, "x" * 150) for index in range(4)]
+    batches, _ = build_compression_batches(entries, min_batch_bytes=512)
+    router = ContentRouter()
+
+    def _not_called(*_args, **_kwargs):
+        raise AssertionError("a batch past the deadline must not enter the router")
+
+    router.compress = _not_called
+
+    results = compress_batch_with_router(
+        batches[0],
+        router=router,
+        tokenizer=_CharacterCounter(),
+        deadline_started_at=time.perf_counter() - 21,
+    )
+
+    assert [result.compressed for _, result in results] == ["x" * 150] * 4
+    assert {result.reason for _, result in results} == {"deadline_exceeded"}

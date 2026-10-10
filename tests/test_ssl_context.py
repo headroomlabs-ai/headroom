@@ -17,10 +17,12 @@ import ssl
 
 import pytest
 
+from headroom import binaries, update_check
 from headroom.proxy import ssl_context
 from headroom.proxy.ssl_context import (
     apply_global_tls_relaxation,
     build_httpx_verify,
+    build_urlopen_context,
     find_ca_bundle,
     tls_strict_disabled,
 )
@@ -49,6 +51,7 @@ Tfx2hBGZ0UogmREaXFi099rmaueZ0HIBn51b3kYqc7of5TI0fHwSHF4GdXXs2OZi
 kF9agIt8Q8t/2kviMn2roInGTwTyPYOEQV0m
 -----END CERTIFICATE-----
 """
+_TEST_CA_COUNT = 1
 
 
 @pytest.fixture()
@@ -60,14 +63,25 @@ def ca_pem_file(tmp_path):
 
 
 def _clean_env(monkeypatch):
-    """Remove all CA-bundle env vars + the strict toggle for a clean state."""
+    """Remove all CA-bundle env vars + the strict toggle for a clean state.
+
+    Pins ``HEADROOM_CERT_STORE=bundled`` so these tests keep covering the
+    certifi / env-bundle resolution without the OS trust store in front of it;
+    the OS-store default is covered in ``test_corporate_tls.py``.
+    """
     for var in (
         "SSL_CERT_FILE",
         "REQUESTS_CA_BUNDLE",
         "NODE_EXTRA_CA_CERTS",
+        "HEADROOM_CA_BUNDLE",
         "HEADROOM_TLS_STRICT",
     ):
         monkeypatch.delenv(var, raising=False)
+    monkeypatch.setenv("HEADROOM_CERT_STORE", "bundled")
+
+
+def _default_x509_ca_count() -> int:
+    return ssl.create_default_context().cert_store_stats()["x509_ca"]
 
 
 class FakeSSLContext:
@@ -136,9 +150,10 @@ class TestFindCaBundleWithValidPem:
         ctx = find_ca_bundle()
         assert isinstance(ctx, ssl.SSLContext)
         stats = ctx.cert_store_stats()
-        # The default trust store has dozens of CAs; if only the test cert
-        # were loaded (replacement), x509_ca would be 1.
-        assert stats["x509_ca"] > 1
+        # Additive loading preserves whatever the runner's default trust store
+        # contains. Some minimal CI images have a tiny or empty default store, so
+        # compare against the local baseline instead of assuming "dozens" of CAs.
+        assert stats["x509_ca"] >= _default_x509_ca_count() + _TEST_CA_COUNT
 
 
 class TestFindCaBundlePriority:
@@ -249,10 +264,20 @@ class TestTlsStrictDisabled:
 
 
 class TestBuildHttpxVerify:
-    def test_default_returns_true(self, monkeypatch):
-        """No CA bundle, strict on → httpx's own default verification."""
+    def test_default_is_httpx_equivalent_certifi_context(self, monkeypatch):
+        """No CA bundle, strict on → what httpx builds for verify=True (certifi).
+
+        Always a concrete verifying context, never a boolean.
+        """
+        import certifi
+
         _clean_env(monkeypatch)
-        assert build_httpx_verify() is True
+        ctx = build_httpx_verify()
+        assert isinstance(ctx, ssl.SSLContext)
+        assert ctx.verify_mode == ssl.CERT_REQUIRED
+        assert ctx.check_hostname is True
+        expected = ssl.create_default_context(cafile=certifi.where())
+        assert ctx.cert_store_stats()["x509_ca"] == expected.cert_store_stats()["x509_ca"]
 
     def test_toggle_off_returns_relaxed_context(self, monkeypatch):
         """No CA bundle, strict OFF → default trust store with strict cleared."""
@@ -265,8 +290,9 @@ class TestBuildHttpxVerify:
             assert ctx.verify_flags & strict_flag == 0
         # Still a real verifying context — NOT verify=False.
         assert ctx.verify_mode == ssl.CERT_REQUIRED
-        # Default trust store retained (additive, not a 1-cert replacement).
-        assert ctx.cert_store_stats()["x509_ca"] > 1
+        # Default trust store retained for this runner, not replaced by a custom
+        # one-cert bundle.
+        assert ctx.cert_store_stats()["x509_ca"] == _default_x509_ca_count()
 
     def test_custom_ca_takes_precedence_over_toggle(self, monkeypatch, ca_pem_file):
         """A configured CA bundle wins; the result is that bundle's context."""
@@ -277,6 +303,90 @@ class TestBuildHttpxVerify:
         assert isinstance(ctx, ssl.SSLContext)
         # Replacement bundle → only the single test CA is trusted.
         assert ctx.cert_store_stats()["x509_ca"] == 1
+
+
+class TestBuildUrlopenContext:
+    def test_custom_ca_context_only_offers_http_1_1(self, monkeypatch, ca_pem_file):
+        _clean_env(monkeypatch)
+        monkeypatch.setenv("SSL_CERT_FILE", ca_pem_file)
+        created_context = FakeSSLContext()
+
+        def fake_create_default_context(*, cafile: str | None = None):
+            assert cafile == ca_pem_file
+            return created_context
+
+        monkeypatch.setattr(ssl_context.ssl, "SSLContext", FakeSSLContext)
+        monkeypatch.setattr(ssl_context.ssl, "create_default_context", fake_create_default_context)
+
+        ctx = build_urlopen_context()
+
+        assert ctx is created_context
+        assert created_context.alpn_protocols == ["http/1.1"]
+
+    def test_default_returns_none(self, monkeypatch):
+        """No CA bundle, strict on → no configured context; urlopen keeps its default."""
+        _clean_env(monkeypatch)
+        assert build_urlopen_context() is None
+
+    def test_toggle_off_context_only_offers_http_1_1(self, monkeypatch):
+        """No CA bundle, strict OFF → still a real context, still restricted to http/1.1."""
+        _clean_env(monkeypatch)
+        monkeypatch.setenv("HEADROOM_TLS_STRICT", "0")
+        created_context = FakeSSLContext()
+        monkeypatch.setattr(ssl_context.ssl, "SSLContext", FakeSSLContext)
+        monkeypatch.setattr(ssl_context.ssl, "create_default_context", lambda: created_context)
+
+        ctx = build_urlopen_context()
+
+        assert ctx is created_context
+        assert created_context.alpn_protocols == ["http/1.1"]
+
+
+@pytest.mark.parametrize(
+    "context_helper",
+    [
+        pytest.param(binaries._ssl_context, id="binary-download"),
+        pytest.param(update_check._urlopen_ssl_context, id="update-check"),
+    ],
+)
+def test_urlopen_context_helpers_use_valid_configured_bundle(
+    monkeypatch, ca_pem_file, context_helper
+):
+    _clean_env(monkeypatch)
+    monkeypatch.setenv("REQUESTS_CA_BUNDLE", ca_pem_file)
+
+    context = context_helper()
+
+    assert isinstance(context, ssl.SSLContext)
+    assert context.verify_mode == ssl.CERT_REQUIRED
+
+
+@pytest.mark.parametrize(
+    "context_helper",
+    [
+        pytest.param(binaries._ssl_context, id="binary-download"),
+        pytest.param(update_check._urlopen_ssl_context, id="update-check"),
+    ],
+)
+def test_urlopen_context_helpers_propagate_invalid_configured_bundle(
+    monkeypatch, tmp_path, context_helper
+):
+    _clean_env(monkeypatch)
+    invalid_bundle = tmp_path / "invalid.pem"
+    invalid_bundle.write_text("not a PEM certificate", encoding="ascii")
+    monkeypatch.setenv("REQUESTS_CA_BUNDLE", str(invalid_bundle))
+
+    with pytest.raises(ssl.SSLError):
+        context_helper()
+
+
+def test_update_check_returns_none_when_configured_bundle_is_invalid(monkeypatch, tmp_path):
+    _clean_env(monkeypatch)
+    invalid_bundle = tmp_path / "invalid.pem"
+    invalid_bundle.write_text("not a PEM certificate", encoding="ascii")
+    monkeypatch.setenv("REQUESTS_CA_BUNDLE", str(invalid_bundle))
+
+    assert update_check.fetch_latest_version() is None
 
 
 class TestApplyGlobalTlsRelaxation:
