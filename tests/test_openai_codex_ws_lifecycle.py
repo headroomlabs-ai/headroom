@@ -14,7 +14,7 @@ import logging
 import sys
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock, PropertyMock, patch
 
 import pytest
 
@@ -96,6 +96,9 @@ class _MemoryWsHandler:
     async def _ensure_initialized(self) -> None:
         self._backend = True
 
+    def is_project_unresolved(self, request_context) -> bool:
+        return False
+
     async def _execute_memory_tool(
         self,
         name: str,
@@ -105,6 +108,9 @@ class _MemoryWsHandler:
         *,
         request_context=None,
     ) -> str:
+        await self._ensure_initialized()
+        if not self._backend:
+            return '{"error": "backend not ready"}'
         assert (name, args, user_id, provider) == (
             "memory_search",
             {},
@@ -2045,6 +2051,249 @@ async def test_ws_late_memory_call_after_streamed_message_passes_through():
     assert client_ws.sent_text == upstream_events
     assert len(upstream.sent) == 1
     assert executed == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("preinitialized", [False, True])
+async def test_ws_unresolved_project_memory_tool_skips_backend_initialization(
+    tmp_path, monkeypatch, preinitialized
+):
+    from headroom.memory.storage_router import MemoryStorageMode
+    from headroom.proxy.memory_handler import MemoryConfig, MemoryHandler
+
+    function_call = {
+        "type": "function_call",
+        "id": "fc-1",
+        "call_id": "call-1",
+        "name": "memory_search",
+        "arguments": '{"query": "private memory"}',
+    }
+    upstream = _FakeUpstream(
+        [
+            json.dumps({"type": "response.created", "response": {"id": "r-1"}}),
+            json.dumps({"type": "response.output_item.added", "item": function_call}),
+            json.dumps({"type": "response.output_item.done", "item": function_call}),
+            json.dumps({"type": "response.completed", "response": {"id": "r-1"}}),
+        ]
+    )
+    first_frame = json.loads(_first_frame())
+    first_frame["response"]["tools"] = [
+        {"type": "function", "name": "client_tool", "parameters": {"type": "object"}}
+    ]
+    client_ws = _FakeWebSocket(
+        frames=[json.dumps(first_frame)],
+        headers={
+            "authorization": "Bearer test",
+            "user-agent": "generic-ws-client",
+            "x-headroom-user-id": "user-1",
+        },
+        hold_after_initial=True,
+    )
+    handler = _DummyOpenAIHandler()
+    memory_handler = MemoryHandler(
+        MemoryConfig(
+            enabled=True,
+            inject_context=False,
+            inject_tools=True,
+            storage_mode=MemoryStorageMode.PROJECT,
+            db_path=str(tmp_path / "global.db"),
+        )
+    )
+    handler.memory_handler = memory_handler
+    global_backend = object() if preinitialized else None
+    memory_handler._backend = global_backend
+    memory_handler._initialized = preinitialized
+    learner = MagicMock()
+    learner._backend = None
+    handler.traffic_learner = learner
+    initialized = []
+    executed = []
+    execute_memory_tool = memory_handler._execute_memory_tool
+
+    async def _unexpected_initialization():
+        initialized.append(True)
+        raise AssertionError("Unresolved project initialized the global memory backend")
+
+    async def _execute_memory_tool(name, args, user_id, provider, *, request_context=None):
+        executed.append((name, args, user_id, provider, request_context))
+        return await execute_memory_tool(
+            name, args, user_id, provider, request_context=request_context
+        )
+
+    monkeypatch.setattr(memory_handler, "_ensure_initialized", _unexpected_initialization)
+    monkeypatch.setattr(memory_handler, "_execute_memory_tool", _execute_memory_tool)
+    monkeypatch.setenv("HEADROOM_MEMORY_INJECTION_MODE", "live_zone_tail")
+    with (
+        patch.dict(sys.modules, {"websockets": _make_fake_websockets_module(upstream)}),
+        patch.object(MemoryHandler, "backend", new_callable=PropertyMock) as backend_access,
+    ):
+        backend_access.return_value = global_backend
+        await asyncio.wait_for(handler.handle_openai_responses_ws(client_ws), timeout=2.0)
+
+    backend_access.assert_not_called()
+    learner.set_backend.assert_not_called()
+    learner.extract_tool_results_from_messages.assert_not_called()
+    assert learner._backend is None
+    assert initialized == []
+    assert memory_handler._backend is global_backend
+    assert not (tmp_path / "global.db").exists()
+    assert len(executed) == 1
+    name, args, user_id, provider, request_context = executed[0]
+    assert (name, args, user_id, provider) == (
+        "memory_search",
+        {"query": "private memory"},
+        "user-1",
+        "openai",
+    )
+    assert memory_handler.is_project_unresolved(request_context)
+    assert request_context.project_root_override is None
+    assert len(upstream.sent) == 2
+    assert "memory_search" in [
+        tool["name"] for tool in json.loads(upstream.sent[0])["response"]["tools"]
+    ]
+    continuation = json.loads(upstream.sent[1])["response"]
+    assert continuation["input"][-2] == function_call
+    assert continuation["input"][-1]["call_id"] == "call-1"
+    assert json.loads(continuation["input"][-1]["output"]) == {
+        "status": "skipped",
+        "reason": "project_unresolved",
+    }
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("change_at", ["before-completion", "during-initialization"])
+async def test_ws_workspace_and_user_change_discards_stale_memory_response(
+    tmp_path, monkeypatch, change_at
+):
+    from headroom.memory.storage_router import MemoryStorageMode
+    from headroom.proxy.memory_handler import MemoryConfig, MemoryHandler
+
+    function_call = {
+        "type": "function_call",
+        "id": "fc-1",
+        "call_id": "call-1",
+        "name": "memory_search",
+        "arguments": "{}",
+    }
+    events = [
+        json.dumps({"type": "response.created", "response": {"id": "r-1"}}),
+        json.dumps({"type": "response.output_item.added", "item": function_call}),
+        json.dumps({"type": "response.output_item.done", "item": function_call}),
+        json.dumps({"type": "response.completed", "response": {"id": "r-1"}}),
+    ]
+    workspaces = [tmp_path / "workspace-one", tmp_path / "workspace-two"]
+    for workspace in workspaces:
+        workspace.mkdir()
+    frames = [
+        json.dumps(
+            {
+                "type": "response.create",
+                "response": {
+                    "model": "gpt-5.4",
+                    "input": workspace.name,
+                    "instructions": f"Working directory: {workspace}",
+                    "tools": [
+                        {
+                            "type": "function",
+                            "name": "client_tool",
+                            "parameters": {"type": "object"},
+                        }
+                    ],
+                },
+            }
+        )
+        for workspace in workspaces
+    ]
+    client_ws = _FakeWebSocket(
+        frames=[frames[0]],
+        headers={
+            "authorization": "Bearer test",
+            "user-agent": "generic-ws-client",
+            "x-headroom-user-id": "user-1",
+        },
+        hold_after_initial=True,
+    )
+    upstream = _FakeUpstream([])
+    handler = _DummyOpenAIHandler()
+    memory_handler = MemoryHandler(
+        MemoryConfig(
+            enabled=True,
+            inject_context=False,
+            inject_tools=True,
+            storage_mode=MemoryStorageMode.PROJECT,
+            db_path=str(tmp_path / "global.db"),
+        )
+    )
+    handler.memory_handler = memory_handler
+    change_ready = asyncio.Event()
+    changed_frame_sent = asyncio.Event()
+    initialized = []
+    executed = []
+    identities = []
+    resolve_identity = openai_module.resolve_memory_identity
+    receive_text = client_ws.receive_text
+    send = upstream.send
+    execute_memory_tool = memory_handler._execute_memory_tool
+
+    def _resolve_identity(websocket):
+        user_id = resolve_identity(websocket)
+        identities.append(user_id)
+        return user_id
+
+    async def _receive_text():
+        if client_ws._frames:
+            return await receive_text()
+        await change_ready.wait()
+        client_ws.headers["x-headroom-user-id"] = "user-2"
+        monkeypatch.setattr(client_ws, "receive_text", receive_text)
+        return frames[1]
+
+    async def _send(payload):
+        await send(payload)
+        if json.loads(payload)["response"]["input"] == workspaces[1].name:
+            changed_frame_sent.set()
+
+    async def _iter():
+        for event in events[:-1]:
+            yield event
+        if change_at == "before-completion":
+            change_ready.set()
+            await changed_frame_sent.wait()
+        yield events[-1]
+
+    async def _ensure_initialized():
+        initialized.append(True)
+        change_ready.set()
+        await changed_frame_sent.wait()
+
+    async def _execute_memory_tool(name, args, user_id, provider, *, request_context=None):
+        executed.append((name, args, user_id, provider, request_context))
+        return await execute_memory_tool(
+            name, args, user_id, provider, request_context=request_context
+        )
+
+    monkeypatch.setattr(openai_module, "resolve_memory_identity", _resolve_identity)
+    monkeypatch.setattr(client_ws, "receive_text", _receive_text)
+    monkeypatch.setattr(upstream, "send", _send)
+    monkeypatch.setattr(upstream, "_iter", _iter)
+    monkeypatch.setattr(memory_handler, "_ensure_initialized", _ensure_initialized)
+    monkeypatch.setattr(memory_handler, "_execute_memory_tool", _execute_memory_tool)
+    monkeypatch.setenv("HEADROOM_MEMORY_INJECTION_MODE", "live_zone_tail")
+    with patch.dict(sys.modules, {"websockets": _make_fake_websockets_module(upstream)}):
+        await asyncio.wait_for(handler.handle_openai_responses_ws(client_ws), timeout=2.0)
+
+    assert changed_frame_sent.is_set()
+    assert identities == ["user-1", "user-2"]
+    assert initialized == ([True] if change_at == "during-initialization" else [])
+    assert executed == []
+    assert len(upstream.sent) == 2
+    assert [json.loads(frame)["response"]["input"] for frame in upstream.sent] == [
+        workspace.name for workspace in workspaces
+    ]
+    assert json.loads(upstream.sent[1])["response"]["instructions"].startswith(
+        f"Working directory: {workspaces[1]}"
+    )
+    assert client_ws.sent_text == events
 
 
 @pytest.mark.asyncio

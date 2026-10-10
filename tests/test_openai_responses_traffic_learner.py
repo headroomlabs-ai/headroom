@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+from types import SimpleNamespace
 from typing import Any
 
 import httpx
@@ -48,6 +49,24 @@ class _RecordingLearner:
 
     async def on_messages(self, messages: list[dict[str, Any]]) -> None:
         self.message_batches.append(messages)
+
+
+def test_responses_traffic_skips_unresolved_project() -> None:
+    handler = OpenAIHandlerMixin()
+    learner = _RecordingLearner()
+    handler.traffic_learner = learner
+    handler.memory_handler = SimpleNamespace(is_project_unresolved=lambda _ctx: True)
+
+    asyncio.run(
+        handler._observe_openai_responses_traffic(
+            {"input": _responses_input()},
+            request_id="r",
+            request_context=object(),
+        )
+    )
+
+    assert learner.tool_results == []
+    assert learner.message_batches == []
 
 
 def _responses_input() -> list[dict[str, Any]]:

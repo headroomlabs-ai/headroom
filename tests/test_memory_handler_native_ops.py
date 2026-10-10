@@ -27,6 +27,7 @@ def handler(tmp_path: Path) -> MemoryHandler:
 class FakeBackend:
     def __init__(self) -> None:
         self.search_results: list[object] = []
+        self.searched: list[dict[str, object]] = []
         self.saved: list[dict[str, object]] = []
         self.updated: list[dict[str, object]] = []
         self.deleted: list[str] = []
@@ -34,6 +35,7 @@ class FakeBackend:
         self.raise_on: str | None = None
 
     async def search_memories(self, **kwargs):  # noqa: ANN003
+        self.searched.append(kwargs)
         if self.raise_on == "search":
             raise RuntimeError("search failed")
         return self.search_results
@@ -245,11 +247,13 @@ async def test_execute_native_memory_tool_dispatches_and_wraps_errors(
     async def fake_ensure_initialized() -> None:
         return None
 
-    async def fake_view(input_data, user_id):  # noqa: ANN001
+    async def fake_view(input_data, user_id, *, backend):  # noqa: ANN001
+        assert backend is handler._backend
         called.append(("view", input_data, user_id))
         return "viewed"
 
-    async def fake_create(input_data, user_id):  # noqa: ANN001
+    async def fake_create(input_data, user_id, *, backend):  # noqa: ANN001
+        assert backend is handler._backend
         called.append(("create", input_data, user_id))
         return "created"
 
@@ -264,7 +268,7 @@ async def test_execute_native_memory_tool_dispatches_and_wraps_errors(
         == "Error: Unknown command 'bad'"
     )
 
-    async def boom(input_data, user_id):  # noqa: ANN001
+    async def boom(input_data, user_id, *, backend):  # noqa: ANN001
         raise RuntimeError("oops")
 
     monkeypatch.setattr(handler, "_native_view_semantic", boom)
@@ -287,44 +291,87 @@ async def test_semantic_search_recent_all_and_overview(handler: MemoryHandler) -
         make_result("m2", "Bob prefers ramen", score=0.83),
     ]
 
-    search_text = await handler._semantic_search("pizza", "u1")
+    search_text = await handler._semantic_search("pizza", "u1", backend=handler._backend)
     assert "Found 2 memories matching 'pizza'" in search_text
     assert "[91% match] Alice likes pizza and pasta" in search_text
     assert "Related: Alice, pizza" in search_text
 
-    recent_text = await handler._get_recent_memories("u1", limit=2)
+    recent_text = await handler._get_recent_memories("u1", limit=2, backend=handler._backend)
     assert "Recent memories:" in recent_text
     assert "(2026-04-22)" in recent_text
 
-    all_text = await handler._list_all_memories("u1", limit=2)
+    all_text = await handler._list_all_memories("u1", limit=2, backend=handler._backend)
     assert "Showing up to 2 memories:" in all_text
     assert "Showing first 2" in all_text
 
-    overview = await handler._get_memory_overview("u1")
+    overview = await handler._get_memory_overview("u1", backend=handler._backend)
     assert "Memory System (2 memories stored)" in overview
     assert "view /memories/search/<your query>" in overview
 
 
 @pytest.mark.asyncio
 async def test_semantic_helpers_handle_empty_backend_and_errors(handler: MemoryHandler) -> None:
-    assert await handler._semantic_search("x", "u1") == "Error: Memory backend not initialized"
-    assert await handler._get_recent_memories("u1") == "Error: Memory backend not initialized"
-    assert await handler._list_all_memories("u1") == "Error: Memory backend not initialized"
-    assert await handler._get_memory_overview("u1") == "Error: Memory backend not initialized"
+    assert (
+        await handler._semantic_search(
+            "x",
+            "u1",
+            backend=handler._backend,
+        )
+        == "Error: Memory backend not initialized"
+    )
+    assert (
+        await handler._get_recent_memories(
+            "u1",
+            backend=handler._backend,
+        )
+        == "Error: Memory backend not initialized"
+    )
+    assert (
+        await handler._list_all_memories(
+            "u1",
+            backend=handler._backend,
+        )
+        == "Error: Memory backend not initialized"
+    )
+    assert (
+        await handler._get_memory_overview(
+            "u1",
+            backend=handler._backend,
+        )
+        == "Error: Memory backend not initialized"
+    )
 
     backend = FakeBackend()
     handler._backend = backend
-    assert "No memories found matching 'x'" in await handler._semantic_search("x", "u1")
-    assert "No memories stored yet." in await handler._list_all_memories("u1")
-    assert "No memories stored yet." in await handler._get_recent_memories("u1")
+    assert "No memories found matching 'x'" in await handler._semantic_search(
+        "x",
+        "u1",
+        backend=handler._backend,
+    )
+    assert "No memories stored yet." in await handler._list_all_memories(
+        "u1",
+        backend=handler._backend,
+    )
+    assert "No memories stored yet." in await handler._get_recent_memories(
+        "u1",
+        backend=handler._backend,
+    )
 
     backend.raise_on = "search"
-    assert "Error searching memories: search failed" == await handler._semantic_search("x", "u1")
-    assert "Error getting recent memories: search failed" == await handler._get_recent_memories(
-        "u1"
+    assert "Error searching memories: search failed" == await handler._semantic_search(
+        "x",
+        "u1",
+        backend=handler._backend,
     )
-    assert "Error listing memories: search failed" == await handler._list_all_memories("u1")
-    overview = await handler._get_memory_overview("u1")
+    assert "Error getting recent memories: search failed" == await handler._get_recent_memories(
+        "u1",
+        backend=handler._backend,
+    )
+    assert "Error listing memories: search failed" == await handler._list_all_memories(
+        "u1",
+        backend=handler._backend,
+    )
+    overview = await handler._get_memory_overview("u1", backend=handler._backend)
     assert "📁 Memory System" in overview
     assert "To SEARCH memories" in overview
 
@@ -335,19 +382,23 @@ async def test_native_view_semantic_routes_paths(
 ) -> None:
     seen: list[tuple[str, object]] = []
 
-    async def fake_search(query, user_id, top_k=5):  # noqa: ANN001
+    async def fake_search(query, user_id, top_k=5, *, backend):  # noqa: ANN001
+        assert backend is handler._backend
         seen.append(("search", query))
         return "search-result"
 
-    async def fake_recent(user_id, limit=10):  # noqa: ANN001
+    async def fake_recent(user_id, limit=10, *, backend):  # noqa: ANN001
+        assert backend is handler._backend
         seen.append(("recent", limit))
         return "recent-result"
 
-    async def fake_all(user_id, limit=20):  # noqa: ANN001
+    async def fake_all(user_id, limit=20, *, backend):  # noqa: ANN001
+        assert backend is handler._backend
         seen.append(("all", limit))
         return "all-result"
 
-    async def fake_overview(user_id):  # noqa: ANN001
+    async def fake_overview(user_id, *, backend):  # noqa: ANN001
+        assert backend is handler._backend
         seen.append(("overview", user_id))
         return "overview-result"
 
@@ -357,21 +408,52 @@ async def test_native_view_semantic_routes_paths(
     monkeypatch.setattr(handler, "_get_memory_overview", fake_overview)
 
     assert (
-        await handler._native_view_semantic({"path": "/memories/search/pizza"}, "u1")
+        await handler._native_view_semantic(
+            {"path": "/memories/search/pizza"},
+            "u1",
+            backend=handler._backend,
+        )
         == "search-result"
     )
     assert (
-        await handler._native_view_semantic({"path": "/memories/recent"}, "u1") == "recent-result"
+        await handler._native_view_semantic(
+            {"path": "/memories/recent"},
+            "u1",
+            backend=handler._backend,
+        )
+        == "recent-result"
     )
-    assert await handler._native_view_semantic({"path": "/memories/all"}, "u1") == "all-result"
-    assert await handler._native_view_semantic({"path": "/memories"}, "u1") == "overview-result"
     assert (
-        await handler._native_view_semantic({"path": "/memories/work/projects"}, "u1")
+        await handler._native_view_semantic(
+            {"path": "/memories/all"},
+            "u1",
+            backend=handler._backend,
+        )
+        == "all-result"
+    )
+    assert (
+        await handler._native_view_semantic(
+            {"path": "/memories"},
+            "u1",
+            backend=handler._backend,
+        )
+        == "overview-result"
+    )
+    assert (
+        await handler._native_view_semantic(
+            {"path": "/memories/work/projects"},
+            "u1",
+            backend=handler._backend,
+        )
         == "search-result"
     )
-    assert (await handler._native_view_semantic({"path": "/memories/search/"}, "u1")).startswith(
-        "Error: Please provide a search query"
-    )
+    assert (
+        await handler._native_view_semantic(
+            {"path": "/memories/search/"},
+            "u1",
+            backend=handler._backend,
+        )
+    ).startswith("Error: Please provide a search query")
     assert seen == [
         ("search", "pizza"),
         ("recent", 10),
@@ -386,15 +468,27 @@ async def test_native_semantic_create_append_delete_and_rename(handler: MemoryHa
     backend = FakeBackend()
     handler._backend = backend
 
-    assert await handler._native_create_semantic({}, "u1") == "Error: path is required"
     assert (
-        await handler._native_create_semantic({"path": "/memories/topic.txt"}, "u1")
+        await handler._native_create_semantic(
+            {},
+            "u1",
+            backend=handler._backend,
+        )
+        == "Error: path is required"
+    )
+    assert (
+        await handler._native_create_semantic(
+            {"path": "/memories/topic.txt"},
+            "u1",
+            backend=handler._backend,
+        )
         == "Error: file_text is required (the memory content)"
     )
 
     created = await handler._native_create_semantic(
         {"path": "/memories/topic.txt", "file_text": "prefers pizza"},
         "u1",
+        backend=handler._backend,
     )
     assert created == "File created successfully at: /memories/topic.txt"
     assert backend.saved[-1]["metadata"] == {
@@ -402,14 +496,26 @@ async def test_native_semantic_create_append_delete_and_rename(handler: MemoryHa
         "topic": "topic",
     }
 
-    assert await handler._native_append_semantic({}, "u1") == "Error: path is required"
     assert (
-        await handler._native_append_semantic({"path": "/memories/topic.txt"}, "u1")
+        await handler._native_append_semantic(
+            {},
+            "u1",
+            backend=handler._backend,
+        )
+        == "Error: path is required"
+    )
+    assert (
+        await handler._native_append_semantic(
+            {"path": "/memories/topic.txt"},
+            "u1",
+            backend=handler._backend,
+        )
         == "Error: insert_text is required"
     )
     appended = await handler._native_append_semantic(
         {"path": "/memories/topic.txt", "insert_text": "and pasta"},
         "u1",
+        backend=handler._backend,
     )
     assert appended == "The file /memories/topic.txt has been edited."
     assert backend.saved[-1]["metadata"]["appended"] is True
@@ -420,7 +526,11 @@ async def test_native_semantic_create_append_delete_and_rename(handler: MemoryHa
         ),
         make_result("m2", "prefers pasta", metadata={}, score=0.91),
     ]
-    deleted = await handler._native_delete_semantic({"path": "/memories/topic.txt"}, "u1")
+    deleted = await handler._native_delete_semantic(
+        {"path": "/memories/topic.txt"},
+        "u1",
+        backend=handler._backend,
+    )
     assert deleted == "Successfully deleted /memories/topic.txt"
     assert backend.deleted == ["m1", "m2"]
 
@@ -432,6 +542,7 @@ async def test_native_semantic_create_append_delete_and_rename(handler: MemoryHa
     renamed = await handler._native_rename_semantic(
         {"old_path": "/memories/old.txt", "new_path": "/memories/new/topic.txt"},
         "u1",
+        backend=handler._backend,
     )
     assert renamed == "Successfully renamed /memories/old.txt to /memories/new/topic.txt"
     assert backend.deleted[-1] == "m3"
@@ -448,9 +559,20 @@ async def test_native_semantic_update_delete_rename_and_backend_errors(
     backend = FakeBackend()
     handler._backend = backend
 
-    assert await handler._native_update_semantic({}, "u1") == "Error: path is required"
     assert (
-        await handler._native_update_semantic({"path": "/memories/t.txt"}, "u1")
+        await handler._native_update_semantic(
+            {},
+            "u1",
+            backend=handler._backend,
+        )
+        == "Error: path is required"
+    )
+    assert (
+        await handler._native_update_semantic(
+            {"path": "/memories/t.txt"},
+            "u1",
+            backend=handler._backend,
+        )
         == "Error: old_str is required"
     )
 
@@ -460,6 +582,7 @@ async def test_native_semantic_update_delete_rename_and_backend_errors(
     multi = await handler._native_update_semantic(
         {"path": "/memories/t.txt", "old_str": "hello", "new_str": "bye"},
         "u1",
+        backend=handler._backend,
     )
     assert "Multiple occurrences of old_str `hello`" in multi
 
@@ -469,6 +592,7 @@ async def test_native_semantic_update_delete_rename_and_backend_errors(
     edited = await handler._native_update_semantic(
         {"path": "/memories/t.txt", "old_str": "hello", "new_str": "bye"},
         "u1",
+        backend=handler._backend,
     )
     assert "The memory file has been edited." in edited
     assert backend.updated[-1]["new_content"] == "bye world"
@@ -498,6 +622,7 @@ async def test_native_semantic_update_delete_rename_and_backend_errors(
     fallback = await handler._native_update_semantic(
         {"path": "/memories/t.txt", "old_str": "alpha", "new_str": "omega"},
         "u1",
+        backend=handler._backend,
     )
     assert "The memory file has been edited." in fallback
     assert no_update_backend.deleted[-1] == "m2"
@@ -505,20 +630,43 @@ async def test_native_semantic_update_delete_rename_and_backend_errors(
 
     backend = FakeBackend()
     handler._backend = backend
-    assert await handler._native_delete_semantic({}, "u1") == "Error: path is required"
-    assert await handler._native_rename_semantic({}, "u1") == "Error: old_path is required"
     assert (
-        await handler._native_rename_semantic({"old_path": "/memories/a.txt"}, "u1")
+        await handler._native_delete_semantic(
+            {},
+            "u1",
+            backend=handler._backend,
+        )
+        == "Error: path is required"
+    )
+    assert (
+        await handler._native_rename_semantic(
+            {},
+            "u1",
+            backend=handler._backend,
+        )
+        == "Error: old_path is required"
+    )
+    assert (
+        await handler._native_rename_semantic(
+            {"old_path": "/memories/a.txt"},
+            "u1",
+            backend=handler._backend,
+        )
         == "Error: new_path is required"
     )
     assert (
-        await handler._native_delete_semantic({"path": "/memories/x.txt"}, "u1")
+        await handler._native_delete_semantic(
+            {"path": "/memories/x.txt"},
+            "u1",
+            backend=handler._backend,
+        )
         == "Error: The path /memories/x.txt does not exist"
     )
     assert (
         await handler._native_rename_semantic(
             {"old_path": "/memories/x.txt", "new_path": "/memories/y.txt"},
             "u1",
+            backend=handler._backend,
         )
         == "Error: The path /memories/x.txt does not exist"
     )
@@ -527,13 +675,18 @@ async def test_native_semantic_update_delete_rename_and_backend_errors(
         make_result("m9", "content", metadata={"virtual_path": "/memories/other.txt"}, score=0.1)
     ]
     assert (
-        await handler._native_delete_semantic({"path": "/memories/x.txt"}, "u1")
+        await handler._native_delete_semantic(
+            {"path": "/memories/x.txt"},
+            "u1",
+            backend=handler._backend,
+        )
         == "Error: The path /memories/x.txt does not exist"
     )
     assert (
         await handler._native_rename_semantic(
             {"old_path": "/memories/x.txt", "new_path": "/memories/y.txt"},
             "u1",
+            backend=handler._backend,
         )
         == "Error: The path /memories/x.txt does not exist"
     )
@@ -543,35 +696,275 @@ async def test_native_semantic_update_delete_rename_and_backend_errors(
         await handler._native_create_semantic(
             {"path": "/memories/topic.txt", "file_text": "content"},
             "u1",
+            backend=handler._backend,
         )
         == "File created successfully at: /memories/topic.txt"
     )
     backend.raise_on = "save"
     assert (
         await handler._native_create_semantic(
-            {"path": "/memories/topic.txt", "file_text": "content"}, "u1"
+            {"path": "/memories/topic.txt", "file_text": "content"},
+            "u1",
+            backend=handler._backend,
         )
     ).startswith("Error: ")
     assert (
         await handler._native_append_semantic(
-            {"path": "/memories/topic.txt", "insert_text": "content"}, "u1"
+            {"path": "/memories/topic.txt", "insert_text": "content"},
+            "u1",
+            backend=handler._backend,
         )
     ).startswith("Error: ")
     backend.raise_on = "search"
     assert (
         await handler._native_update_semantic(
-            {"path": "/memories/t.txt", "old_str": "a", "new_str": "b"}, "u1"
+            {"path": "/memories/t.txt", "old_str": "a", "new_str": "b"},
+            "u1",
+            backend=handler._backend,
         )
     ).startswith("Error: ")
-    assert (await handler._native_delete_semantic({"path": "/memories/x.txt"}, "u1")).startswith(
-        "Error: "
-    )
+    assert (
+        await handler._native_delete_semantic(
+            {"path": "/memories/x.txt"},
+            "u1",
+            backend=handler._backend,
+        )
+    ).startswith("Error: ")
     assert (
         await handler._native_rename_semantic(
             {"old_path": "/memories/x.txt", "new_path": "/memories/y.txt"},
             "u1",
+            backend=handler._backend,
         )
     ).startswith("Error: ")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "command",
+    [
+        pytest.param(
+            {"command": "create", "path": "/memories/topic.txt", "file_text": "new"},
+            id="create",
+        ),
+        pytest.param({"command": "view", "path": "/memories/search/hello"}, id="search"),
+        pytest.param({"command": "view", "path": "/memories/recent"}, id="recent"),
+        pytest.param({"command": "view", "path": "/memories/all"}, id="all"),
+        pytest.param({"command": "view", "path": "/memories"}, id="overview"),
+        pytest.param({"command": "view", "path": "/memories/topic.txt"}, id="topic"),
+        pytest.param(
+            {
+                "command": "str_replace",
+                "path": "/memories/topic.txt",
+                "old_str": "hello",
+                "new_str": "bye",
+            },
+            id="update",
+        ),
+        pytest.param(
+            {"command": "insert", "path": "/memories/topic.txt", "insert_text": "more"},
+            id="insert",
+        ),
+        pytest.param({"command": "delete", "path": "/memories/topic.txt"}, id="delete"),
+        pytest.param(
+            {
+                "command": "rename",
+                "old_path": "/memories/topic.txt",
+                "new_path": "/memories/new.txt",
+            },
+            id="rename",
+        ),
+    ],
+)
+async def test_native_commands_use_only_the_resolved_project_backend(
+    handler: MemoryHandler, monkeypatch: pytest.MonkeyPatch, command: dict
+) -> None:
+    from headroom.memory.storage_router import RequestContext
+
+    global_backend = FakeBackend()
+    handler._backend = global_backend
+    handler._initialized = True
+    contexts = [
+        RequestContext(
+            headers={"x-headroom-project-id": project},
+            system_prompt="",
+            base_user_id="same-user",
+        )
+        for project in ("project-one", "project-two")
+    ]
+    backends = [FakeBackend(), FakeBackend()]
+    scopes = [handler._router.scope_for(context) for context in contexts]
+    routed = []
+
+    def _get_or_create_backend(db_path):
+        routed.append(db_path)
+        return backends[[scope.db_path for scope in scopes].index(db_path)]
+
+    monkeypatch.setattr(handler._router, "_get_or_create_backend", _get_or_create_backend)
+    operation_fields = ("searched", "saved", "updated", "deleted", "accessed")
+    for index, backend in enumerate(backends):
+        backend.search_results = [
+            make_result(
+                f"memory-{index}",
+                f"hello project-{index}",
+                metadata={"virtual_path": "/memories/topic.txt"},
+            )
+        ]
+
+    for index, (context, backend) in enumerate(zip(contexts, backends)):
+        other_backend = backends[1 - index]
+        other_counts = [len(getattr(other_backend, field)) for field in operation_fields]
+        result = await handler._execute_native_memory_tool(
+            command, "same-user", request_context=context
+        )
+        assert not result.startswith("Error:"), result
+        assert routed == [scope.db_path for scope in scopes[: index + 1]]
+        assert [len(getattr(other_backend, field)) for field in operation_fields] == other_counts
+        assert handler._backend is global_backend
+        assert all(getattr(global_backend, field) == [] for field in operation_fields)
+        assert all(
+            operation["user_id"] == "same-user"
+            for operation in backend.searched + backend.saved + backend.updated
+        )
+        if command["command"] == "view":
+            assert f"hello project-{index}" in result
+            assert f"hello project-{1 - index}" not in result
+            assert backend.searched
+        elif command["command"] in {"create", "insert"}:
+            assert len(backend.saved) == 1
+        elif command["command"] == "str_replace":
+            assert backend.updated == [
+                {
+                    "memory_id": f"memory-{index}",
+                    "new_content": f"bye project-{index}",
+                    "user_id": "same-user",
+                }
+            ]
+        elif command["command"] == "delete":
+            assert backend.deleted == [f"memory-{index}"]
+        else:
+            assert backend.deleted == [f"memory-{index}"]
+            assert backend.saved[-1]["content"] == f"hello project-{index}"
+            assert backend.saved[-1]["metadata"]["virtual_path"] == "/memories/new.txt"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("scope_mode", ["no-context", "global", "user", "composite"])
+async def test_native_dispatch_preserves_legacy_scope_and_composite_identity(
+    handler: MemoryHandler, monkeypatch: pytest.MonkeyPatch, scope_mode: str
+) -> None:
+    from headroom.memory.storage_router import MemoryStorageMode, RequestContext
+
+    global_backend = FakeBackend()
+    selected_backend = FakeBackend()
+    handler._backend = global_backend
+    handler._initialized = True
+    context = None
+    expected_backend = global_backend
+    expected_user_id = "same-user"
+    if scope_mode != "no-context":
+        handler._router._config.mode = {
+            "global": MemoryStorageMode.GLOBAL,
+            "user": MemoryStorageMode.USER,
+            "composite": MemoryStorageMode.PROJECT,
+        }[scope_mode]
+        context = RequestContext(
+            headers={"x-headroom-project-id": "selected-project"},
+            system_prompt="",
+            base_user_id="same-user",
+        )
+        if scope_mode == "composite":
+            handler.config.backend = "qdrant-neo4j"
+            scope = handler._router.scope_for(context)
+            expected_user_id = f"same-user::{scope.project_key}"
+        else:
+            expected_backend = selected_backend
+            monkeypatch.setattr(
+                handler._router, "_get_or_create_backend", lambda db_path: selected_backend
+            )
+
+    result = await handler._execute_native_memory_tool(
+        {"command": "create", "path": "/memories/topic.txt", "file_text": "content"},
+        "same-user",
+        request_context=context,
+    )
+    assert result == "File created successfully at: /memories/topic.txt"
+    assert len(expected_backend.saved) == 1
+    assert expected_backend.saved[0]["user_id"] == expected_user_id
+    other_backend = selected_backend if expected_backend is global_backend else global_backend
+    assert other_backend.saved == []
+    assert handler._backend is global_backend
+
+
+@pytest.mark.asyncio
+async def test_overlapping_native_rename_keeps_its_selected_backend(
+    handler: MemoryHandler, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from headroom.memory.storage_router import RequestContext
+
+    global_backend = FakeBackend()
+    handler._backend = global_backend
+    handler._initialized = True
+    contexts = [
+        RequestContext(
+            headers={"x-headroom-project-id": project}, system_prompt="", base_user_id=user_id
+        )
+        for project, user_id in (("project-one", "user-one"), ("project-two", "user-two"))
+    ]
+    backends = [FakeBackend(), FakeBackend()]
+    scopes = [handler._router.scope_for(context) for context in contexts]
+    monkeypatch.setattr(
+        handler._router,
+        "_get_or_create_backend",
+        lambda db_path: backends[[scope.db_path for scope in scopes].index(db_path)],
+    )
+    backends[0].search_results = [
+        make_result(
+            "private-one", "private content", metadata={"virtual_path": "/memories/old.txt"}
+        )
+    ]
+    search_started = asyncio.Event()
+    second_request_finished = asyncio.Event()
+    search = backends[0].search_memories
+
+    async def _blocked_search(**kwargs):
+        search_started.set()
+        await second_request_finished.wait()
+        return await search(**kwargs)
+
+    monkeypatch.setattr(backends[0], "search_memories", _blocked_search)
+    first_request = asyncio.create_task(
+        handler._execute_native_memory_tool(
+            {"command": "rename", "old_path": "/memories/old.txt", "new_path": "/memories/new.txt"},
+            "user-one",
+            request_context=contexts[0],
+        )
+    )
+    try:
+        await asyncio.wait_for(search_started.wait(), timeout=2.0)
+        second_result = await handler._execute_native_memory_tool(
+            {"command": "create", "path": "/memories/two.txt", "file_text": "second content"},
+            "user-two",
+            request_context=contexts[1],
+        )
+        assert second_result == "File created successfully at: /memories/two.txt"
+        second_request_finished.set()
+        first_result = await asyncio.wait_for(first_request, timeout=2.0)
+    finally:
+        second_request_finished.set()
+        first_request.cancel()
+        await asyncio.gather(first_request, return_exceptions=True)
+
+    assert first_result == "Successfully renamed /memories/old.txt to /memories/new.txt"
+    assert backends[0].deleted == ["private-one"]
+    assert backends[0].saved[0]["content"] == "private content"
+    assert backends[0].saved[0]["user_id"] == "user-one"
+    assert backends[0].searched[0]["user_id"] == "user-one"
+    assert len(backends[1].saved) == 1
+    assert backends[1].saved[0]["user_id"] == "user-two"
+    assert backends[1].deleted == []
+    assert handler._backend is global_backend
+    assert global_backend.searched == global_backend.saved == global_backend.deleted == []
 
 
 @pytest.mark.asyncio
@@ -1007,7 +1400,7 @@ async def test_search_and_format_context_and_handle_memory_tool_calls(
     ):  # noqa: ANN001
         return f"ran:{tool_name}:{user_id}:{provider}:{input_data}"
 
-    async def fake_execute_native(input_data, user_id):  # noqa: ANN001
+    async def fake_execute_native(input_data, user_id, request_context=None):  # noqa: ANN001
         return f"native:{user_id}:{input_data}"
 
     monkeypatch.setattr(handler, "_ensure_initialized", fake_ensure_initialized)

@@ -12,6 +12,7 @@ import httpx
 import pytest
 from fastapi import Request
 
+from headroom.memory.storage_router import RequestContext
 from headroom.proxy.handlers.openai import (
     OpenAIHandlerMixin,
     _is_allowed_websocket_origin,
@@ -312,7 +313,11 @@ class _MemoryContinuationHandler(_MemoryToolsOnlyHandler):
         args: dict,
         user_id: str,
         provider: str,
+        *,
+        request_context: RequestContext | None = None,
     ) -> str:
+        assert request_context is not None
+        assert request_context.base_user_id == user_id
         assert (name, args, user_id, provider) == (
             "memory_search",
             {},
