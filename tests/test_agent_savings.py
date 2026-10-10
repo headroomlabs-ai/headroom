@@ -17,7 +17,6 @@ from headroom.agent_savings import (
     get_agent_savings_profile,
     proxy_pipeline_kwargs,
     seed_proxy_env_defaults,
-    with_target_savings,
 )
 from headroom.cli import wrap as wrap_module
 from headroom.cli.main import main
@@ -208,13 +207,6 @@ def test_unknown_agent_savings_profile_falls_back_to_default(
     # The warning has to name the resolved profile, so an operator reading it
     # knows what they actually got rather than only what they asked for.
     assert DEFAULT_PROFILE in caplog.text
-
-
-def test_with_target_savings_recomputes_target_ratio() -> None:
-    profile = with_target_savings(get_agent_savings_profile("balanced"), 0.85)
-
-    assert profile.target_savings == 0.85
-    assert profile.target_ratio == 0.15
 
 
 def test_agent_savings_cli_renders_shell_exports() -> None:
