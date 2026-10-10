@@ -40,8 +40,11 @@ Example usage:
 from __future__ import annotations
 
 import hashlib
+import importlib
 import json
 import logging
+import os
+import sys
 import warnings
 from collections import Counter
 from dataclasses import dataclass
@@ -57,7 +60,16 @@ _DEPRECATION_MESSAGE = (
     "future release; it has no replacement (SmartCrusher's anchor selection runs in Rust)."
 )
 
-warnings.warn(_DEPRECATION_MESSAGE, DeprecationWarning, stacklevel=2)
+if sys.version_info >= (3, 12):
+    # Skip importlib's own frames too, so `importlib.import_module(...)` is
+    # attributed to its caller, like a plain `import` statement.
+    warnings.warn(
+        _DEPRECATION_MESSAGE,
+        DeprecationWarning,
+        skip_file_prefixes=(os.path.dirname(importlib.__file__) + os.sep,),
+    )
+else:  # pragma: no cover - Python 3.10/3.11 lack skip_file_prefixes
+    warnings.warn(_DEPRECATION_MESSAGE, DeprecationWarning, stacklevel=2)
 
 
 class DataPattern(Enum):

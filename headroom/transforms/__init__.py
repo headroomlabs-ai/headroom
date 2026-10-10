@@ -236,7 +236,11 @@ def __getattr__(name: str) -> object:
         with warnings.catch_warnings():
             warnings.simplefilter("ignore", DeprecationWarning)
             module = import_module(module_name)
-        return getattr(module, attr_name)
+        value = getattr(module, attr_name)
+        # Cache it, so `from headroom.transforms import X` (which looks the
+        # name up twice) warns once, and later accesses stay quiet.
+        globals()[name] = value
+        return value
 
     module = import_module(module_name)
     value = getattr(module, attr_name)
