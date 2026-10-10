@@ -410,6 +410,47 @@ class TestCCREntryPointLoading:
 
         assert _create_default_ccr_backend() is None
 
+    def test_failing_backend_plugin_logs_no_credentials_at_any_level(self, monkeypatch):
+        """A plugin error that quotes HEADROOM_REDIS_URL must not reach the log, at
+        WARNING or DEBUG, rendered the way a handler would (exc_info included)."""
+        import logging
+        from types import SimpleNamespace
+
+        from headroom.cache.compression_store import _create_default_ccr_backend
+
+        def _factory(url: str, tenant_prefix: str) -> None:
+            raise ConnectionError(f"cannot reach {url} holding CONTENT_CANARY")
+
+        monkeypatch.setenv("HEADROOM_CCR_BACKEND", "redisx")
+        monkeypatch.setenv("HEADROOM_REDIS_URL", "redis://user:CRED_CANARY@cache:6379/0")
+        monkeypatch.setattr(
+            "importlib.metadata.entry_points",
+            lambda group: [SimpleNamespace(name="redisx", load=lambda: _factory)],
+        )
+        records: list[logging.LogRecord] = []
+
+        class _Collect(logging.Handler):
+            def emit(self, record: logging.LogRecord) -> None:
+                records.append(record)
+
+        logger = logging.getLogger("headroom.cache.compression_store")
+        handler = _Collect(level=logging.DEBUG)
+        previous = logger.level
+        logger.addHandler(handler)
+        logger.setLevel(logging.DEBUG)
+        try:
+            assert _create_default_ccr_backend() is None
+        finally:
+            logger.removeHandler(handler)
+            logger.setLevel(previous)
+
+        assert {r.levelno for r in records} >= {logging.WARNING, logging.DEBUG}
+        for record in records:
+            rendered = logging.Formatter().format(record)
+            assert "CRED_CANARY" not in rendered
+            assert "CONTENT_CANARY" not in rendered
+        assert any("ConnectionError" in r.getMessage() for r in records)
+
     def test_inmemory_backend_satisfies_protocol(self):
         """InMemoryBackend satisfies the CompressionStoreBackend protocol."""
         backend = InMemoryBackend()

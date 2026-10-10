@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import contextlib
+import importlib
+import logging
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -108,6 +110,40 @@ class TestExternalPlugin:
             reg = get_registry()
             assert "cursor" in reg
             assert reg["cursor"].name == "cursor"
+
+
+class TestBuiltinLoadFailure:
+    def test_broken_builtin_plugin_is_logged_as_a_warning(self):
+        records: list[logging.LogRecord] = []
+
+        class _Collect(logging.Handler):
+            def emit(self, record: logging.LogRecord) -> None:
+                records.append(record)
+
+        handler = _Collect(level=logging.DEBUG)
+        logger = logging.getLogger("headroom.learn.registry")
+        logger.addHandler(handler)
+        real_import = importlib.import_module
+
+        def _import(name: str, *args, **kwargs):  # noqa: ANN002, ANN003, ANN202
+            if name == "headroom.learn.plugins.grok":
+                raise ImportError("simulated breakage")
+            return real_import(name, *args, **kwargs)
+
+        try:
+            get_registry()
+            assert [r for r in records if r.levelno >= logging.WARNING] == []
+
+            reset_registry()
+            with patch("headroom.learn.registry.importlib.import_module", _import):
+                reg = get_registry()
+            assert "grok" not in reg
+            assert "claude" in reg
+            warnings = [r for r in records if r.levelno == logging.WARNING]
+            assert len(warnings) == 1
+            assert "grok" in warnings[0].getMessage()
+        finally:
+            logger.removeHandler(handler)
 
 
 class TestResetRegistry:

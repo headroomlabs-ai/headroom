@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import threading
 from unittest.mock import AsyncMock, MagicMock
 
@@ -182,3 +183,130 @@ async def test_wait_for_task_timeout_does_not_cancel_background_write() -> None:
         "status": "completed",
         "result": True,
     }
+
+
+class _RaisingClient:
+    def __init__(self, exc: Exception) -> None:
+        self._exc = exc
+
+    def delete(self, memory_id: str) -> None:
+        raise self._exc
+
+    def get(self, memory_id: str) -> None:
+        raise self._exc
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("op", "exc", "warns"),
+    [
+        ("delete_memory", ValueError("Memory with id m1\nFAKE LOG LINE not found"), False),
+        ("delete_memory", ValueError("payload user:secret rejected"), True),
+        ("delete_memory", ValueError("Collection mem0 not found"), True),
+        ("delete_memory", ValueError("Memory with id other-id not found"), True),
+        ("delete_memory", RuntimeError("qdrant at user:secret@host down"), True),
+        ("get_memory", RuntimeError("qdrant at user:secret@host down"), True),
+    ],
+)
+async def test_backend_failures_warn_without_exception_text(
+    op: str, exc: Exception, warns: bool
+) -> None:
+    """A missing id on delete is expected (DEBUG); other failures warn with the
+    exception type only, never its text."""
+    adapter = _adapter()
+    adapter._ensure_initialized = AsyncMock()  # type: ignore[method-assign]
+    adapter._mem0_client = _RaisingClient(exc)
+
+    records: list[logging.LogRecord] = []
+
+    class _Collect(logging.Handler):
+        def emit(self, record: logging.LogRecord) -> None:
+            records.append(record)
+
+    logger = logging.getLogger("headroom.memory.backends.direct_mem0")
+    handler = _Collect(level=logging.DEBUG)
+    previous = logger.level
+    logger.addHandler(handler)
+    logger.setLevel(logging.DEBUG)
+    try:
+        # Model-supplied id with a newline: must not split the log line.
+        result = await getattr(adapter, op)("m1\nFAKE LOG LINE")
+    finally:
+        logger.removeHandler(handler)
+        logger.setLevel(previous)
+
+    assert not result
+    # No level may carry the exception text, rendered as a handler would.
+    for record in records:
+        assert "secret" not in logging.Formatter().format(record)
+    warnings = [r for r in records if r.levelname == "WARNING"]
+    if warns:
+        assert len(warnings) == 1
+        assert type(exc).__name__ in warnings[0].getMessage()
+        assert "secret" not in warnings[0].getMessage()
+        assert warnings[0].exc_info is None
+        assert "\n" not in warnings[0].getMessage()
+    else:
+        assert warnings == []
+        assert any("not found" in r.getMessage() for r in records)
+
+
+@pytest.mark.asyncio
+async def test_huge_model_supplied_id_is_capped_in_the_warning() -> None:
+    """A model can invent an id of any size; the warning must stay bounded."""
+    adapter = _adapter()
+    adapter._ensure_initialized = AsyncMock()  # type: ignore[method-assign]
+    adapter._mem0_client = _RaisingClient(RuntimeError("backend down"))
+
+    records: list[logging.LogRecord] = []
+
+    class _Collect(logging.Handler):
+        def emit(self, record: logging.LogRecord) -> None:
+            records.append(record)
+
+    logger = logging.getLogger("headroom.memory.backends.direct_mem0")
+    handler = _Collect(level=logging.WARNING)
+    logger.addHandler(handler)
+    try:
+        assert await adapter.delete_memory("x" * 100_000) is False
+        assert await adapter.delete_memory("short-id") is False
+    finally:
+        logger.removeHandler(handler)
+
+    huge, short = (r.getMessage() for r in records)
+    assert len(huge) < 200
+    assert "…(+" in huge
+    assert "'short-id'" in short and "…" not in short
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("level", [logging.INFO, logging.DEBUG])
+async def test_get_memory_survives_an_out_of_range_errno(level: int) -> None:
+    """An OSError whose errno does not fit a C int must not escape get_memory,
+    whether or not DEBUG (which builds the exception description) is on."""
+    errno_value = 10 ** len("x" * 10000)  # built at runtime, far past any C int
+    adapter = _adapter()
+    adapter._ensure_initialized = AsyncMock()  # type: ignore[method-assign]
+    adapter._mem0_client = _RaisingClient(OSError(errno_value, "backend down"))
+
+    logger = logging.getLogger("headroom.memory.backends.direct_mem0")
+    records: list[logging.LogRecord] = []
+
+    class _Collect(logging.Handler):
+        def emit(self, record: logging.LogRecord) -> None:
+            records.append(record)
+
+    handler = _Collect(level=logging.DEBUG)
+    previous = logger.level
+    logger.addHandler(handler)
+    logger.setLevel(level)
+    try:
+        assert await adapter.get_memory("m1") is None
+    finally:
+        logger.removeHandler(handler)
+        logger.setLevel(previous)
+
+    assert [r.levelno for r in records if r.levelno == logging.WARNING] == [logging.WARNING]
+    assert any(r.levelno == logging.DEBUG for r in records) is (level == logging.DEBUG)
+    for record in records:
+        logging.Formatter().format(record)

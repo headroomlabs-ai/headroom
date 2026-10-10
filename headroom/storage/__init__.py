@@ -1,6 +1,9 @@
 """Storage modules for Headroom SDK."""
 
+import logging
 import os
+
+from headroom.log_safety import describe_exception
 
 from .base import Storage
 from .jsonl import JSONLStorage
@@ -11,6 +14,8 @@ __all__ = [
     "SQLiteStorage",
     "JSONLStorage",
 ]
+
+logger = logging.getLogger(__name__)
 
 
 def _builtin_storage_path(store_url: str, scheme: str) -> str:
@@ -64,7 +69,23 @@ def create_storage(store_url: str) -> Storage:
                     create_fn = ep.load()
                     result: Storage = create_fn(store_url)
                     return result
-            except Exception:
-                pass
+                logger.warning(
+                    "No headroom.storage_backend entry point for scheme %r; "
+                    "falling back to SQLite storage",
+                    scheme,
+                )
+            except Exception as e:
+                # The plugin's exception can echo the store URL, credentials included,
+                # so no level logs its message; DEBUG gets describe_exception (types and frames).
+                logger.warning(
+                    "Failed to load storage backend for scheme %r (%s); "
+                    "falling back to SQLite storage",
+                    scheme,
+                    type(e).__name__,
+                )
+                if logger.isEnabledFor(logging.DEBUG):
+                    logger.debug(
+                        "Storage backend %r load failure: %s", scheme, describe_exception(e)
+                    )
         # Default to SQLite (legacy behavior)
         return SQLiteStorage(store_url)

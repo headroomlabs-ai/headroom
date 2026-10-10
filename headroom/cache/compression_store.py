@@ -43,6 +43,8 @@ from contextvars import ContextVar
 from dataclasses import dataclass, field, replace
 from typing import TYPE_CHECKING, Any
 
+from ..log_safety import describe_exception
+
 if TYPE_CHECKING:
     from ..memory.tracker import ComponentStats
     from .backends import CompressionStoreBackend
@@ -1164,7 +1166,16 @@ def _create_default_ccr_backend() -> CompressionStoreBackend | None:
         backend: CompressionStoreBackend = fn(**kwargs)
         return backend
     except Exception as e:
-        logger.warning("Failed to load CCR backend %s: %s", backend_type, e)
+        # The backend's exception can echo HEADROOM_REDIS_URL (credentials included),
+        # so no level logs its message; DEBUG gets describe_exception (types and frames).
+        logger.warning(
+            "Failed to load CCR backend %s (%s); falling back to the in-process store. "
+            "Retrieval will not survive proxy restarts or cross worker processes.",
+            backend_type,
+            type(e).__name__,
+        )
+        if logger.isEnabledFor(logging.DEBUG):
+            logger.debug("CCR backend %s load failure: %s", backend_type, describe_exception(e))
         return None
 
 
