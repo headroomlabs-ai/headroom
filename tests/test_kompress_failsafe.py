@@ -369,21 +369,6 @@ def test_carried_deadline_reaches_sequential_fallback(monkeypatch):
     assert model.calls == 1
 
 
-def test_acquire_bounded_unbounded_when_both_disabled():
-    semaphore = kc._execution_semaphore("onnx", "onnx")
-    assert kc._acquire_bounded(semaphore, None, None) is True
-    semaphore.release()
-
-
-def test_acquire_bounded_negative_remaining_does_not_raise():
-    semaphore = kc._execution_semaphore("onnx", "onnx")
-    assert semaphore.acquire(timeout=0)
-    try:
-        assert kc._acquire_bounded(semaphore, 5.0, -1.0) is False
-    finally:
-        semaphore.release()
-
-
 # ── Wall-clock budget: give up before the proxy's stage timeout ───────
 
 

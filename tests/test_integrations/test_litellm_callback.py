@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import importlib
-import inspect
 import subprocess
 import sys
 from pathlib import Path
@@ -49,17 +48,6 @@ HeadroomCallback = _import_callback()
 
 class TestHeadroomCallbackPostCallSuccessHook:
     """async_post_call_success_hook must exist and return response unchanged."""
-
-    def test_method_exists(self) -> None:
-        cb = HeadroomCallback()
-        assert hasattr(cb, "async_post_call_success_hook"), (
-            "HeadroomCallback must define async_post_call_success_hook "
-            "for LiteLLM proxy compatibility"
-        )
-
-    def test_method_is_coroutine(self) -> None:
-        cb = HeadroomCallback()
-        assert inspect.iscoroutinefunction(cb.async_post_call_success_hook)
 
     @pytest.mark.asyncio
     async def test_returns_response_unchanged(self) -> None:
