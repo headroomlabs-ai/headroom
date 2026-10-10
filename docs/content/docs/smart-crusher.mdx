@@ -73,6 +73,22 @@ print(result.strategy)  # e.g. "lossless:table(...)" or "smart_sample(1000->15)"
 </Tab>
 </Tabs>
 
+### Recovered tool output in the Python message transform
+
+`SmartCrusher.apply(messages, tokenizer)` preserves recognized
+`headroom_retrieve` results byte for byte when their call ID matches the
+originating assistant call. The originating identity is resolved with the
+shared wrapper parser for both OpenAI `tool_calls`/`arguments` and Anthropic
+`tool_use`/`input`, including Hermes `tool_call` bridges and retrieval calls
+inside `execute`, `exec`, or `functions.exec`.
+
+Other wrapper output remains compressible; an unrecognized or ambiguous
+wrapper does not gain a blanket recovery exemption. Keep the originating
+assistant call in the message history so the result can be identified.
+The context-free `crush(json_string)` API has no originating-call history and
+does not provide this message-level exemption.
+
+
 ## Configuration
 
 <Tabs groupId="lang" items={['TypeScript', 'Python']}>

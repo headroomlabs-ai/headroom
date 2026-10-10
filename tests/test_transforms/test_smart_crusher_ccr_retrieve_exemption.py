@@ -80,29 +80,6 @@ class TestHeadroomRetrieveExemptionOpenAI:
         # No CCR transforms should have fired
         assert not any("smart_crush" in t for t in result.transforms_applied)
 
-    def test_non_retrieve_tool_still_compressed(self):
-        """Normal tool results are still compressed — exemption is narrow."""
-        content = _big_content()
-        messages = [
-            {
-                "role": "assistant",
-                "tool_calls": [
-                    {
-                        "id": "call_xyz",
-                        "function": {"name": "Bash", "arguments": '{"cmd":"ls"}'},
-                    }
-                ],
-            },
-            {"role": "tool", "tool_call_id": "call_xyz", "content": content},
-        ]
-        crusher = _make_crusher(min_tokens=0)
-        tokenizer = _get_tokenizer()
-        result = crusher.apply(messages, tokenizer)
-
-        tool_msg = result.messages[1]
-        # Content should have been modified (compressed)
-        assert tool_msg["content"] != content or result.tokens_after <= result.tokens_before
-
 
 class TestHeadroomRetrieveExemptionAnthropic:
     """Anthropic-style tool_result content blocks from headroom_retrieve must not be crushed."""
@@ -144,42 +121,6 @@ class TestHeadroomRetrieveExemptionAnthropic:
             "headroom_retrieve Anthropic tool_result was re-compressed (#1077)"
         )
         assert not any("smart_crush" in t for t in result.transforms_applied)
-
-    def test_non_retrieve_anthropic_tool_still_compressed(self):
-        """Normal Anthropic tool_result blocks are still compressed."""
-        content = _big_content()
-        messages = [
-            {
-                "role": "assistant",
-                "content": [
-                    {
-                        "type": "tool_use",
-                        "id": "toolu_bash_1",
-                        "name": "Bash",
-                        "input": {"cmd": "ls"},
-                    }
-                ],
-            },
-            {
-                "role": "user",
-                "content": [
-                    {
-                        "type": "tool_result",
-                        "tool_use_id": "toolu_bash_1",
-                        "content": content,
-                    }
-                ],
-            },
-        ]
-        crusher = _make_crusher(min_tokens=0)
-        tokenizer = _get_tokenizer()
-        result = crusher.apply(messages, tokenizer)
-
-        # Either the content changed (compressed) or tokens went down
-        tool_result_block = result.messages[1]["content"][0]
-        assert (
-            tool_result_block["content"] != content or result.tokens_after <= result.tokens_before
-        )
 
     def test_mixed_retrieve_and_normal_only_normal_compressed(self):
         """With two tool_results in one user turn, only the non-CCR one is compressed."""
@@ -224,11 +165,78 @@ class TestHeadroomRetrieveExemptionAnthropic:
 
         blocks = result.messages[1]["content"]
         ccr_block = blocks[0]
-        bash_block = blocks[1]
 
         # headroom_retrieve result must be untouched
         assert ccr_block["content"] == content, (
             "headroom_retrieve result was compressed — infinite loop bug #1077"
         )
-        # The bash result should differ (or at least the crush count > 0)
-        assert bash_block["content"] != content or result.tokens_after < result.tokens_before
+
+
+@pytest.mark.parametrize("wire", ["openai", "anthropic"])
+@pytest.mark.parametrize("wrapper", ["tool_call", "functions.exec"])
+def test_wrapped_retrieval_is_exact_and_unrelated_wrapper_remains_compressible(wire, wrapper):
+    content = json.dumps([{"id": i, "value": "sample record " * 8} for i in range(200)])
+    retrieval_args = (
+        {"name": CCR_TOOL_NAME, "arguments": {"hash": "abc123def456"}}
+        if wrapper == "tool_call"
+        else {"code": 'text(await tools.mcp__headroom__headroom_retrieve({hash: "abc123def456"}))'}
+    )
+    ordinary_args = (
+        {"name": "Bash", "arguments": {"command": "echo sample"}}
+        if wrapper == "tool_call"
+        else {"code": 'text(await tools.exec_command({cmd: "echo sample"}))'}
+    )
+    if wire == "openai":
+        messages = [
+            {
+                "role": "assistant",
+                "tool_calls": [
+                    {
+                        "id": "retrieved",
+                        "function": {"name": wrapper, "arguments": json.dumps(retrieval_args)},
+                    },
+                    {
+                        "id": "ordinary",
+                        "function": {"name": wrapper, "arguments": json.dumps(ordinary_args)},
+                    },
+                ],
+            },
+            {"role": "tool", "tool_call_id": "retrieved", "content": content},
+            {"role": "tool", "tool_call_id": "ordinary", "content": content},
+        ]
+    else:
+        messages = [
+            {
+                "role": "assistant",
+                "content": [
+                    {
+                        "type": "tool_use",
+                        "id": "retrieved",
+                        "name": wrapper,
+                        "input": retrieval_args,
+                    },
+                    {
+                        "type": "tool_use",
+                        "id": "ordinary",
+                        "name": wrapper,
+                        "input": ordinary_args,
+                    },
+                ],
+            },
+            {
+                "role": "user",
+                "content": [
+                    {"type": "tool_result", "tool_use_id": "retrieved", "content": content},
+                    {"type": "tool_result", "tool_use_id": "ordinary", "content": content},
+                ],
+            },
+        ]
+    result = _make_crusher(min_tokens=0).apply(messages, _get_tokenizer())
+    if wire == "openai":
+        recovered = result.messages[1]["content"]
+        ordinary = result.messages[2]["content"]
+    else:
+        recovered = result.messages[1]["content"][0]["content"]
+        ordinary = result.messages[1]["content"][1]["content"]
+    assert recovered == content
+    assert ordinary != content

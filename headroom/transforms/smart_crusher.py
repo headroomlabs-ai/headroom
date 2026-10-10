@@ -52,7 +52,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from ..ccr.tool_injection import CCR_TOOL_NAME
-from ..config import CCRConfig, TransformResult, is_tool_excluded
+from ..config import CCRConfig, TransformResult, is_tool_excluded, unwrap_tool_call_name
 from ..tokenizer import Tokenizer
 from ..utils import compute_short_hash, create_tool_digest_marker, deep_copy_messages
 from .base import Transform
@@ -129,7 +129,7 @@ def strip_ccr_sentinels(items: Any) -> Any:
 
 
 def _build_tool_name_index(messages: list[dict[str, Any]]) -> dict[str, str]:
-    """Map tool_call_id/tool_use_id → tool name across OpenAI + Anthropic formats.
+    """Map tool_call_id/tool_use_id → effective tool name in both wire formats.
 
     Skips entries where id or name is missing; those calls still crush, but
     won't contribute a tool-name to the ``smart_crush`` tag.
@@ -140,9 +140,10 @@ def _build_tool_name_index(messages: list[dict[str, Any]]) -> dict[str, str]:
             continue
         for tc in msg.get("tool_calls") or []:
             tc_id = tc.get("id")
-            name = (tc.get("function") or {}).get("name")
+            function = tc.get("function") or {}
+            name = function.get("name")
             if tc_id and name:
-                index[tc_id] = name
+                index[tc_id] = unwrap_tool_call_name(name, function.get("arguments"))
         content = msg.get("content")
         if isinstance(content, list):
             for block in content:
@@ -151,7 +152,7 @@ def _build_tool_name_index(messages: list[dict[str, Any]]) -> dict[str, str]:
                 bid = block.get("id")
                 name = block.get("name")
                 if bid and name:
-                    index[bid] = name
+                    index[bid] = unwrap_tool_call_name(name, block.get("input"))
     return index
 
 
