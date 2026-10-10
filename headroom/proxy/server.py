@@ -2917,6 +2917,33 @@ def read_proxy_token(headers: Mapping[str, str]) -> str | None:
     return None
 
 
+def _auth_rejection_log_value(raw: str | None, limit: int = 100) -> str:
+    """Quote a caller-controlled header for a ``proxy_auth_rejected`` line.
+
+    Truncated, and anything outside printable ASCII (CR/LF included) or a
+    double quote becomes ``?``, so a caller can neither forge extra log lines
+    nor break the ``key="value"`` field it lands in.
+    """
+    clipped = (raw or "")[:limit]
+    return '"' + "".join(c if " " <= c <= "~" and c != '"' else "?" for c in clipped) + '"'
+
+
+def _auth_rejection_context(headers: Mapping[str, str]) -> tuple[str, str]:
+    """``(ua, xff)`` for a rejection log line, both quoted and sanitized.
+
+    ``xff`` is the leftmost ``X-Forwarded-For`` hop exactly as received: it is
+    unverified (a client can set it), so it only helps attribute rejected
+    callers behind a gateway whose peer address is all the gate sees. It is
+    never used for any decision. Credentials are never read here.
+    """
+    from headroom.proxy.forwarded_policy import header_first
+
+    return (
+        _auth_rejection_log_value(headers.get("user-agent")),
+        _auth_rejection_log_value(header_first(str(headers.get("x-forwarded-for") or "")), 64),
+    )
+
+
 _PROXY_TOKEN_HEADER = b"x-headroom-proxy-token"
 
 
@@ -3041,11 +3068,15 @@ class WebSocketAuthMiddleware:
             await self.app(scope, receive, send)
             return
 
+        user_agent, forwarded_for = _auth_rejection_context(headers)
         logger.warning(
-            "event=proxy_auth_rejected transport=websocket path=%s client=%s reason=%s",
+            "event=proxy_auth_rejected transport=websocket path=%s client=%s reason=%s "
+            "ua=%s xff=%s",
             scope.get("path"),
             client_host,
             "missing_token" if provided is None else "bad_token",
+            user_agent,
+            forwarded_for,
         )
         # Receive the handshake before refusing it: ASGI servers send
         # ``websocket.connect`` and wait for the application to answer, and
@@ -4113,17 +4144,32 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
             path = request.url.path
             client = getattr(request, "client", None)
             client_host = getattr(client, "host", None) if client is not None else None
+            # Anthropic SDK clients (Claude Code among them) probe reachability
+            # with an unauthenticated GET/HEAD /api/hello that never carries
+            # custom headers, so it cannot hold the proxy token. Answer it here,
+            # empty, instead of 401ing every correctly configured client. It is
+            # deliberately not in _AUTH_EXEMPT_PATHS: that would hand the probe
+            # to the passthrough relay, i.e. an anonymous upstream request.
+            if path == "/api/hello" and request.method in ("GET", "HEAD"):
+                probe = Response(status_code=200)
+                _apply_security_headers(probe)
+                return probe
             exempt = request.method == "GET" and path in _AUTH_EXEMPT_PATHS
             if not exempt and not is_loopback_host(client_host):
                 provided = _extract_proxy_token(request.headers)
                 if provided is None or not hmac.compare_digest(
                     provided.encode("utf-8", "replace"), _proxy_token_bytes
                 ):
+                    user_agent, forwarded_for = _auth_rejection_context(request.headers)
                     logger.warning(
-                        "event=proxy_auth_rejected path=%s client=%s reason=%s",
+                        "event=proxy_auth_rejected method=%s path=%s client=%s reason=%s "
+                        "ua=%s xff=%s",
+                        request.method,
                         path,
                         client_host,
                         "missing_token" if provided is None else "bad_token",
+                        user_agent,
+                        forwarded_for,
                     )
                     rejection = JSONResponse(status_code=401, content={"error": "unauthorized"})
                     _apply_security_headers(rejection)

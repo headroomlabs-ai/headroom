@@ -159,6 +159,165 @@ class TestInboundAuthToken:
         assert resp.status_code == 401
         assert relayed == []
 
+    @pytest.mark.parametrize("method", ["GET", "HEAD"])
+    def test_api_hello_probe_is_answered_locally(self, monkeypatch, method):
+        """The SDK reachability probe never carries custom headers, so it can't
+        hold the token. The gate answers it itself: 200, empty, never relayed."""
+        relayed: list[tuple[str, str]] = []
+
+        async def _spy_passthrough(self, request, base_url, *args, **kwargs):
+            relayed.append((request.method, request.url.path))
+            return JSONResponse({"relayed_to": base_url})
+
+        monkeypatch.setattr(OpenAIHandlerMixin, "handle_passthrough", _spy_passthrough)
+        app = _make_app(proxy_token="s3cr3t-token")
+        with TestClient(app, base_url="http://testserver", client=NONLOOPBACK) as c:
+            resp = c.request(method, "/api/hello")
+        assert resp.status_code == 200
+        assert resp.content == b""
+        assert resp.headers["X-Content-Type-Options"] == "nosniff"
+        assert relayed == []
+
+    @pytest.mark.parametrize(
+        ("method", "path"),
+        [
+            ("POST", "/api/hello"),
+            ("GET", "/api/hello/x"),
+            ("GET", "/api/hello/"),
+            ("GET", "/stats"),
+        ],
+    )
+    def test_api_hello_answer_is_exact(self, monkeypatch, method, path):
+        """Only GET/HEAD on exactly /api/hello skips the token."""
+        relayed: list[tuple[str, str]] = []
+
+        async def _spy_passthrough(self, request, base_url, *args, **kwargs):
+            relayed.append((request.method, request.url.path))
+            return JSONResponse({"relayed_to": base_url})
+
+        monkeypatch.setattr(OpenAIHandlerMixin, "handle_passthrough", _spy_passthrough)
+        app = _make_app(proxy_token="s3cr3t-token")
+        with TestClient(app, base_url="http://testserver", client=NONLOOPBACK) as c:
+            resp = c.request(method, path)
+        assert resp.status_code == 401
+        assert relayed == []
+
+    def test_api_hello_without_token_is_left_to_the_passthrough(self, monkeypatch):
+        """No token configured: the probe keeps its normal Anthropic route."""
+        relayed: list[tuple[str, str]] = []
+
+        async def _spy_passthrough(self, request, base_url, *args, **kwargs):
+            relayed.append((request.method, request.url.path))
+            return JSONResponse({"relayed_to": base_url})
+
+        monkeypatch.setattr(OpenAIHandlerMixin, "handle_passthrough", _spy_passthrough)
+        app = _make_app()
+        with TestClient(app, base_url="http://127.0.0.1", client=LOOPBACK) as c:
+            c.get("/api/hello")
+        assert relayed == [("GET", "/api/hello")]
+
+
+@contextlib.contextmanager
+def _captured_proxy_warnings():
+    """Collect ``headroom.proxy`` log messages (attached to the logger itself:
+    the proxy's logging setup controls propagation, so caplog can miss them)."""
+    messages: list[str] = []
+
+    class _Capture(logging.Handler):
+        def emit(self, record: logging.LogRecord) -> None:
+            messages.append(record.getMessage())
+
+    handler = _Capture(level=logging.WARNING)
+    proxy_logger = logging.getLogger("headroom.proxy")
+    previous_level = proxy_logger.level
+    proxy_logger.setLevel(logging.WARNING)
+    proxy_logger.addHandler(handler)
+    try:
+        yield messages
+    finally:
+        proxy_logger.removeHandler(handler)
+        proxy_logger.setLevel(previous_level)
+
+
+def _rejections(messages: list[str]) -> list[str]:
+    return [m for m in messages if "event=proxy_auth_rejected" in m]
+
+
+class TestAuthRejectionLog:
+    """``proxy_auth_rejected`` carries enough to attribute a caller behind a
+    gateway (method, User-Agent, leftmost X-Forwarded-For hop), and never a
+    credential."""
+
+    def test_line_carries_method_user_agent_and_first_forwarded_hop(self):
+        app = _make_app(proxy_token="s3cr3t-token")
+        with _captured_proxy_warnings() as messages:
+            with TestClient(app, base_url="http://testserver", client=NONLOOPBACK) as c:
+                c.get(
+                    "/stats",
+                    headers={
+                        "User-Agent": "statusline/1.0",
+                        "X-Forwarded-For": "198.51.100.7, 10.0.0.9",
+                    },
+                )
+        (line,) = _rejections(messages)
+        assert "method=GET path=/stats" in line
+        assert "reason=missing_token" in line
+        assert 'ua="statusline/1.0"' in line
+        assert 'xff="198.51.100.7"' in line
+
+    def test_absent_headers_log_as_empty(self):
+        app = _make_app(proxy_token="s3cr3t-token")
+        with _captured_proxy_warnings() as messages:
+            with TestClient(app, base_url="http://testserver", client=NONLOOPBACK) as c:
+                c.get("/stats", headers={"User-Agent": ""})
+        (line,) = _rejections(messages)
+        assert line.endswith('ua="" xff=""')
+
+    def test_user_agent_is_truncated_and_cannot_forge_log_lines(self):
+        app = _make_app(proxy_token="s3cr3t-token")
+        hostile = 'evil" xff="203.0.113.99\x1b[2J' + "A" * 500
+        with _captured_proxy_warnings() as messages:
+            with TestClient(app, base_url="http://testserver", client=NONLOOPBACK) as c:
+                c.get("/stats", headers={"User-Agent": hostile})
+        (line,) = _rejections(messages)
+        assert "\x1b" not in line
+        # The caller's quote is neutralised, so its fake field stays inside ua="…"
+        # and the real xff is still the last field on the line.
+        ua = line.split(' ua="', 1)[1].rsplit('" xff=', 1)[0]
+        assert ua == ("evil? xff=?203.0.113.99?[2J" + "A" * 500)[:100]
+        assert line.endswith(' xff=""')
+
+    def test_log_value_neutralises_line_breaks_and_non_ascii(self):
+        # Exercised directly: an HTTP client refuses to send CR/LF in a header,
+        # but an ASGI server in front of the proxy is not guaranteed to.
+        from headroom.proxy.server import _auth_rejection_log_value
+
+        assert _auth_rejection_log_value("a\r\nevent=forged\u2028\u00e9") == '"a??event=forged??"'
+        assert _auth_rejection_log_value(None) == '""'
+        assert _auth_rejection_log_value("x" * 10, limit=4) == '"xxxx"'
+
+    @pytest.mark.parametrize(
+        "headers",
+        [
+            {"Authorization": "Bearer wrong-bearer-value"},
+            {
+                "x-headroom-proxy-token": "wrong-header-value",
+                "Authorization": "Bearer sk-ant-oat01-upstream-oauth",
+            },
+            {"x-api-key": "sk-ant-api03-provider-key"},
+        ],
+    )
+    def test_no_credential_ever_reaches_the_line(self, headers):
+        app = _make_app(proxy_token="s3cr3t-token")
+        with _captured_proxy_warnings() as messages:
+            with TestClient(app, base_url="http://testserver", client=NONLOOPBACK) as c:
+                c.post("/v1/messages", headers={"User-Agent": "claude-cli/2.1", **headers})
+        (line,) = _rejections(messages)
+        assert "method=POST" in line
+        for secret in ("s3cr3t-token", *headers.values()):
+            assert secret.removeprefix("Bearer ") not in line
+        assert "authorization" not in line.lower()
+
 
 # ──────────────────── 2.1b inbound auth token over WebSocket ──────────────
 
@@ -230,6 +389,24 @@ class TestWebSocketAuthMiddleware:
 
         assert downstream.called is False
         assert _closed_with_policy_violation(sent)
+
+    async def test_rejection_log_matches_the_http_gate(self):
+        mw = WebSocketAuthMiddleware(_SpyApp(), proxy_token="s3cr3t-token")
+        scope = _ws_scope(
+            headers=[
+                ("user-agent", "ws-client/1.0"),
+                ("x-forwarded-for", "198.51.100.8, 10.0.0.1"),
+                ("authorization", "Bearer wrong-ws-bearer"),
+            ]
+        )
+
+        with _captured_proxy_warnings() as messages:
+            await _drive(mw, scope)
+
+        (line,) = _rejections(messages)
+        assert "transport=websocket" in line and "reason=bad_token" in line
+        assert line.endswith('ua="ws-client/1.0" xff="198.51.100.8"')
+        assert "wrong-ws-bearer" not in line and "s3cr3t-token" not in line
 
     async def test_accepts_correct_bearer(self):
         downstream = _SpyApp()
