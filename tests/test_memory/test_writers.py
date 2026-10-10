@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import asyncio
+import importlib
+import sys
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -21,6 +23,13 @@ from headroom.memory.writers.claude_writer import ClaudeCodeMemoryWriter
 from headroom.memory.writers.codex_writer import CodexMemoryWriter
 from headroom.memory.writers.cursor_writer import CursorMemoryWriter
 from headroom.memory.writers.generic_writer import GenericMemoryWriter
+
+
+def test_importing_the_writers_package_warns_deprecated(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delitem(sys.modules, "headroom.memory.writers")
+    with pytest.warns(DeprecationWarning, match="headroom.memory.writers is deprecated"):
+        importlib.import_module("headroom.memory.writers")
+
 
 # =============================================================================
 # Test Data
