@@ -26,6 +26,7 @@ _CONTENT_OPT_IN_VALUES = frozenset({"full", "all", "content"})
 _MAX_FRAMES = 3
 _MAX_CHAIN = 4
 _ID_MAX_CHARS = 80
+_MAX_ERRNO = 2**31 - 1
 _PACKAGE_DIR = os.path.dirname(os.path.abspath(__file__)).replace("\\", "/")
 
 
@@ -62,7 +63,12 @@ def _describe_one(exc: BaseException) -> str:
     if isinstance(exc, OSError) and isinstance(exc.errno, int):
         # The system's own text for the errno; exc.strerror is free text in some
         # subclasses (ssl.SSLError) and can quote a path or a peer's message.
-        text += f" [Errno {exc.errno}] {_errno_text(exc.errno)}"
+        # An out-of-range errno is not formatted at all: converting a huge int
+        # to text can itself raise, and a log helper must never raise.
+        if 0 <= exc.errno <= _MAX_ERRNO:
+            text += f" [Errno {exc.errno}] {_errno_text(exc.errno)}"
+        else:
+            text += " [Errno out of range]"
     frames = traceback.extract_tb(exc.__traceback__)[-_MAX_FRAMES:]
     if frames:
         where = " <- ".join(
@@ -89,10 +95,13 @@ def _short_path(path: str) -> str:
 
 
 def redact_url(url: str) -> str:
-    """Return ``url`` without userinfo, query or fragment, which can hold credentials.
+    """Return ``url`` as scheme, host and port only, safe for any log line.
 
-    The path is kept, so do not pass URLs that carry a secret in the path
-    (webhook URLs, ``/bot<token>/``). The host comes back lowercased.
+    Userinfo, query and fragment are always dropped, and so is the path, since
+    a path segment can carry a credential (``/bot<token>/``, webhook URLs) and
+    no rule tells such a segment from a route name. The path is kept only with
+    the explicit content opt-in, ``HEADROOM_DEBUG_DUMP=full``. The host comes
+    back lowercased.
     """
     try:
         parts = urlsplit(url)
@@ -103,7 +112,11 @@ def redact_url(url: str) -> str:
     if ":" in host:
         host = f"[{host}]"
     netloc = f"{host}:{port}" if port is not None else host
-    redacted = urlunsplit((parts.scheme, netloc, parts.path, "", ""))
+    if content_logging_enabled():
+        path = parts.path
+    else:
+        path = "/<path>" if parts.path not in ("", "/") else parts.path
+    redacted = urlunsplit((parts.scheme, netloc, path, "", ""))
     return f"{redacted}?<redacted>" if parts.query else redacted
 
 
@@ -120,26 +133,30 @@ def safe_id(value: object) -> str:
 
 
 class WarnOnce:
-    """Warn once per key, for at most ``limit`` keys per ``window_seconds``.
+    """Warn once per key per window, for at most ``limit`` keys per window.
 
-    Past the limit it logs one overflow WARNING and stays quiet for the rest of
-    the window, so a failure that hits many distinct keys (paths, rows, models)
-    cannot flood the log on every pass: at most ``limit + 1`` warnings per
-    window. After the window the guard starts over, so a newly broken key in a
-    long-lived process still warns. A key is used up only when WARNING is
-    enabled, so a warning suppressed by the log level is still emitted later.
-    ``forget`` re-arms a key once its failure has cleared; it cannot reopen the
-    cap during an overflow window.
+    The first warning opens a window of ``window_seconds`` (an hour by
+    default). Inside it each key warns once; past ``limit`` keys it logs one
+    overflow WARNING and stays quiet, so a failure that hits many distinct keys
+    (paths, rows, models) cannot flood the log: at most ``limit + 1`` warnings
+    per window. When the window ends the guard starts over, so a failure that
+    keeps recurring, or a newly broken key, warns again once an hour. A key is
+    used up only when WARNING is enabled, so a warning suppressed by the log
+    level is still emitted later. ``forget`` re-arms a key once its failure has
+    cleared; it cannot reopen the cap after the overflow notice.
     """
 
     def __init__(self, limit: int, what: str, *, window_seconds: float = 3600.0) -> None:
         if limit < 1:
             raise ValueError(f"WarnOnce limit must be at least 1, got {limit}")
+        if window_seconds <= 0:
+            raise ValueError(f"WarnOnce window_seconds must be positive, got {window_seconds}")
         self._limit = limit
         self._what = what
         self._window = window_seconds
         self._keys: set[Hashable] = set()
-        self._overflowed_at: float | None = None
+        self._window_start: float | None = None
+        self._overflowed = False
         self._lock = threading.Lock()
 
     def first(self, key: Hashable, log: logging.Logger) -> bool:
@@ -147,18 +164,20 @@ class WarnOnce:
         if not log.isEnabledFor(logging.WARNING):
             return False
         with self._lock:
+            now = time.monotonic()
+            if self._window_start is not None and now - self._window_start >= self._window:
+                self._keys.clear()
+                self._overflowed = False
+                self._window_start = None
             if key in self._keys:
                 return False
-            now = time.monotonic()
-            if self._overflowed_at is not None and now - self._overflowed_at >= self._window:
-                self._keys.clear()
-                self._overflowed_at = None
-            if self._overflowed_at is None and len(self._keys) < self._limit:
+            if not self._overflowed and len(self._keys) < self._limit:
                 self._keys.add(key)
+                if self._window_start is None:
+                    self._window_start = now
                 return True
-            report_overflow = self._overflowed_at is None
-            if report_overflow:
-                self._overflowed_at = now
+            report_overflow = not self._overflowed
+            self._overflowed = True
         if report_overflow:
             log.warning(
                 "More than %d distinct %s; further ones are logged at debug only "

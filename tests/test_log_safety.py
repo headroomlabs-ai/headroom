@@ -64,15 +64,30 @@ def test_content_opt_in_gives_the_full_traceback(monkeypatch: pytest.MonkeyPatch
     [
         (
             "https://user:hunter2@proxy.example:8443/v1?key=abc#frag",
-            "https://proxy.example:8443/v1?<redacted>",
+            "https://proxy.example:8443/<path>?<redacted>",
         ),
-        ("http://127.0.0.1:8787/stats", "http://127.0.0.1:8787/stats"),
+        ("https://upstream.example/botSECRET/v1/messages", "https://upstream.example/<path>"),
+        ("https://upstream.example/bot%53ECRET/v1", "https://upstream.example/<path>"),
+        ("http://127.0.0.1:8787", "http://127.0.0.1:8787"),
         ("http://[::1]:8787/", "http://[::1]:8787/"),
         ("http://[::1", "<unparseable url>"),
     ],
 )
-def test_redact_url_drops_userinfo_and_query(url: str, expected: str) -> None:
+def test_redact_url_keeps_only_scheme_host_and_port(
+    url: str, expected: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.delenv("HEADROOM_DEBUG_DUMP", raising=False)
     assert redact_url(url) == expected
+
+
+def test_content_opt_in_keeps_the_path_but_never_credentials(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("HEADROOM_DEBUG_DUMP", "full")
+
+    assert redact_url("https://u:pw@upstream.example/v1/messages?key=abc") == (
+        "https://upstream.example/v1/messages?<redacted>"
+    )
 
 
 def test_safe_id_escapes_newlines_and_bounds_length() -> None:
@@ -178,7 +193,7 @@ def test_forgetting_after_overflow_does_not_reopen_the_cap(
     assert len(_warnings(caplog)) == 1
 
 
-def test_warn_once_starts_over_after_the_overflow_window(
+def test_warn_once_starts_over_after_the_window(
     caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     log = logging.getLogger("headroom.test_log_safety.window")
@@ -188,18 +203,27 @@ def test_warn_once_starts_over_after_the_overflow_window(
 
     results = []
     with caplog.at_level(logging.INFO, logger=log.name):
-        for key, advance in (("a", 0), ("b", 0), ("c", 0), ("d", 599), ("new-hook", 1)):
+        steps = (("a", 0), ("b", 0), ("c", 0), ("a", 300), ("d", 299), ("a", 1), ("new-hook", 0))
+        for key, advance in steps:
             clock[0] += advance
             results.append(guard.first(key, log))
 
-    # a and b warn, c triggers the overflow notice, d is inside the window,
-    # and a newly broken key after the window warns again.
-    assert results == [True, True, False, False, True]
+    # a and b warn and c is the overflow notice; inside the window a stays quiet
+    # and d is suppressed; once the window ends, the still-recurring a and a
+    # newly broken key both warn again.
+    assert results == [True, True, False, False, False, True, True]
     assert len(_warnings(caplog)) == 1
 
 
-def test_huge_errno_does_not_break_the_description() -> None:
-    exc = OSError()
-    exc.errno = 2**63
+def test_warn_once_needs_a_positive_window() -> None:
+    with pytest.raises(ValueError, match="window_seconds must be positive"):
+        WarnOnce(limit=1, what="failures", window_seconds=0)
 
-    assert describe_exception(exc) == f"OSError [Errno {2**63}] unknown error"
+
+@pytest.mark.parametrize("digits", [19, 10_001])
+def test_out_of_range_errno_never_breaks_the_description(digits: int) -> None:
+    """An errno too large to print (Python caps int-to-text at 4300 digits) is not printed."""
+    exc = OSError()
+    exc.errno = 10 ** (digits - 1)  # computed, not a literal, so collection never formats it
+
+    assert describe_exception(exc) == "OSError [Errno out of range]"
