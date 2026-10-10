@@ -240,11 +240,13 @@ _ERROR_SIGNALS: tuple[re.Pattern[str], ...] = (
 
 # Agent harnesses (Codex, Grok, opencode, ...) append "exit code 0" to every
 # SUCCESSFUL shell command, so an exit code only signals an error when it is
-# nonzero (signed codes such as -9 included). A zero code never hides another
-# failure signal in the same output: a nonzero code, "non-zero" or a signal kill.
-# A standalone "Killed" line (the shell's SIGKILL message) counts only when no
-# zero exit status is reported, since a successful command can print that word.
-# A bare "exited with ..." (no code) still counts.
+# nonzero (signed codes such as -9 included). Status evidence belongs to its own
+# line: a zero code never hides a separate explicit failure elsewhere in the
+# output (a nonzero code, "non-zero", a signal kill, or an "exited with ..." line
+# that carries no code of its own).
+# A standalone "Killed" line is the shell's SIGKILL message, but a successful
+# command can also print that word, so it counts only when no exit status is
+# reported at all. It is recognized even below the short-content cut-off.
 _EXIT_STATUS_RE = re.compile(
     r"\bexit(?:ed)?(?:\s+with)?(?:\s+exit)?\s+(?:code|status)\s*:?\s*([+-]?\d+)", re.I
 )
@@ -257,15 +259,20 @@ def _exit_status_is_error(snippet: str) -> bool:
     codes = _EXIT_STATUS_RE.findall(snippet)
     if any(int(code) != 0 for code in codes) or _EXIT_FAILURE_RE.search(snippet):
         return True
-    if _KILLED_LINE_RE.search(snippet) and not codes:
+    if any(
+        _EXITED_WITH_RE.search(line) and not _EXIT_STATUS_RE.search(line)
+        for line in snippet.splitlines()
+    ):
         return True
-    return not codes and bool(_EXITED_WITH_RE.search(snippet))
+    return not codes and bool(_KILLED_LINE_RE.search(snippet))
 
 
 def _is_error(content: str) -> bool:
     """Quick check if tool output looks like an error."""
-    if not content or len(content) < 10:
+    if not content:
         return False
+    if len(content) < 10:
+        return bool(_KILLED_LINE_RE.fullmatch(content))
     snippet = content[:2000]
     if any(pattern.search(snippet) for pattern in _ERROR_SIGNALS):
         return True

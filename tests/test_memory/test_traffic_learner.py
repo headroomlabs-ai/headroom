@@ -78,6 +78,12 @@ class TestErrorClassification:
             # A successful command may print the word; exit code 0 then wins.
             ("grep result:\nKilled\nexit code 0", False),
             ("task killed by signal SIGKILL\nexit code 0", True),
+            # A bare Killed is an error even below the short-content cut-off,
+            # but a reported zero status wins over a printed "Killed".
+            ("Killed", True),
+            ("Killed\nexit code 0", False),
+            # The wrapper's zero status belongs to its own line.
+            ("worker exited with an error\nwrapper exit code 0", True),
             # Case-insensitive signals the shared is_error_content would miss.
             ("zsh: no such file or directory: ./run.sh", True),
             ("fatal: path 'x' does not exist in 'HEAD'", True),
@@ -130,6 +136,33 @@ class TestErrorClassification:
             tool_name="Bash", tool_input={"command": "x"}, tool_output=output, is_error=True
         )
         assert learner._tool_history[-1]["error_category"] == category
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("output", "is_error", "category"),
+        [
+            ("Killed", True, "exit_code"),
+            ("worker exited with an error\nwrapper exit code 0", True, "exit_code"),
+            ("Killed\nexit code 0", False, None),
+            ("README.md\nsrc\nexit code 0", False, None),
+            ("worker killed by signal SIGKILL\nwrapper exit code 0", True, "exit_code"),
+            ("command terminated\nexit code -9", True, "exit_code"),
+        ],
+    )
+    async def test_openai_result_recorded_through_on_tool_result(
+        self, learner: TrafficLearner, output: str, is_error: bool, category: str | None
+    ):
+        """End to end: the OpenAI extractor's verdict is what on_tool_result records."""
+        result = self._openai_result(learner, output)
+        await learner.on_tool_result(
+            tool_name=result["tool_name"],
+            tool_input=result["input"],
+            tool_output=result["output"],
+            is_error=result["is_error"],
+        )
+        recorded = learner._tool_history[-1]
+        assert recorded["is_error"] is is_error
+        assert recorded["error_category"] == category
 
     @pytest.mark.asyncio
     async def test_success_has_no_error_category(self, learner: TrafficLearner):
