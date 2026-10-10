@@ -1159,18 +1159,25 @@ class ToolIntelligenceNetwork:
         # Calculate optimal max_items based on retrieval rate
         retrieval_rate = pattern.retrieval_rate
 
-        if retrieval_rate > self._config.high_retrieval_threshold:
-            if pattern.full_retrieval_rate > 0.8:
-                pattern.skip_compression_recommended = True
+        skip_compression = (
+            retrieval_rate > self._config.high_retrieval_threshold
+            and pattern.full_retrieval_rate > 0.8
+        )
+        if skip_compression:
+            pattern.skip_compression_recommended = True
+
+        # Prose has token statistics, but no item population to learn a limit from.
+        if pattern.total_items_seen > 0:
+            if skip_compression:
                 pattern.optimal_max_items = pattern.total_items_seen // max(
                     1, pattern.total_compressions
                 )
-            else:
+            elif retrieval_rate > self._config.high_retrieval_threshold:
                 pattern.optimal_max_items = 50
-        elif retrieval_rate > self._config.medium_retrieval_threshold:
-            pattern.optimal_max_items = 30
-        else:
-            pattern.optimal_max_items = 20
+            elif retrieval_rate > self._config.medium_retrieval_threshold:
+                pattern.optimal_max_items = 30
+            else:
+                pattern.optimal_max_items = 20
 
         # Update preserve_fields from frequently retrieved fields
         if pattern.field_retrieval_frequency:

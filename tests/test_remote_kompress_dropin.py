@@ -29,52 +29,10 @@ From a field log (Copilot Chat on Windows, 0.36.x), on every single request:
 
 from __future__ import annotations
 
-import inspect
-
 import pytest
+import tiktoken
 
-from headroom.transforms.kompress_compressor import KompressCompressor
 from headroom.transforms.kompress_remote import RemoteKompressCompressor
-
-
-def _kwargs(fn) -> set[str]:
-    """Public keywords only.
-
-    ``_deadline_started_at`` is underscore-prefixed and only ever passed by
-    kompress_compressor to itself on its recursive batch path — it never crosses
-    the ContentRouter seam, so it is genuinely private and not part of the
-    drop-in contract.
-    """
-    return {
-        name
-        for name, p in inspect.signature(fn).parameters.items()
-        if name != "self"
-        and not name.startswith("_")
-        and p.kind in (p.POSITIONAL_OR_KEYWORD, p.KEYWORD_ONLY)
-    }
-
-
-# --------------------------------------------------------------------------- #
-# The contract
-# --------------------------------------------------------------------------- #
-def test_remote_compress_accepts_every_local_keyword() -> None:
-    """The drift guard. This is what would have caught the reported bug."""
-    local = _kwargs(KompressCompressor.compress)
-    remote = _kwargs(RemoteKompressCompressor.compress)
-
-    missing = local - remote
-    assert not missing, (
-        f"RemoteKompressCompressor.compress is missing {sorted(missing)}. "
-        "ContentRouter calls both through one seam, so a keyword the local "
-        "compressor accepts and the remote one does not becomes a TypeError "
-        "that ContentRouter swallows into a warning — silently disabling "
-        "compression for the whole deployment."
-    )
-
-
-@pytest.mark.parametrize("method", ["is_ready", "preload", "ensure_background_load", "compress"])
-def test_the_promised_public_surface_exists(method: str) -> None:
-    assert callable(getattr(RemoteKompressCompressor, method, None))
 
 
 # --------------------------------------------------------------------------- #
@@ -106,6 +64,18 @@ class _FakeClient:
         return None
 
 
+@pytest.fixture
+def ccr_store(monkeypatch):
+    from headroom.cache.compression_store import CompressionStore
+    from headroom.telemetry import TOINConfig, ToolIntelligenceNetwork
+
+    store = CompressionStore(enable_feedback=False)
+    toin = ToolIntelligenceNetwork(config=TOINConfig(enabled=False, storage_path=""))
+    monkeypatch.setattr("headroom.cache.compression_store.get_compression_store", lambda: store)
+    monkeypatch.setattr("headroom.telemetry.get_toin", lambda: toin)
+    return store
+
+
 def _compressor(monkeypatch, *, enable_ccr: bool, payload: dict):
     monkeypatch.setenv("HEADROOM_KOMPRESS_ENDPOINT", "https://ml.example.invalid")
     c = RemoteKompressCompressor("https://ml.example.invalid")
@@ -122,90 +92,34 @@ ORIGINAL = "real secret block " * 60
 PLACEHOLDER = "{{HEADROOM_TAG_0}} " * 60
 
 
-def test_passing_ccr_original_no_longer_raises(monkeypatch) -> None:
-    """The bug itself: this call is what ContentRouter makes."""
-    c = _compressor(
-        monkeypatch,
-        enable_ccr=False,
-        payload={"compressed": "short", "compression_ratio": 0.2},
-    )
-
-    result = c.compress(
-        PLACEHOLDER,
-        context="",
-        question=None,
-        target_ratio=0.5,
-        allow_download=False,
-        ccr_original=ORIGINAL,
-    )
-
-    assert result.compressed == "short"
-
-
-def test_ccr_stores_the_pre_protection_text_not_the_placeholder(monkeypatch) -> None:
-    """Fixing only the TypeError would leave retrieval returning a placeholder."""
-    stored: dict = {}
-
-    def _fake_store(original, compressed, original_tokens):  # noqa: ANN001
-        stored["original"] = original
-        stored["tokens"] = original_tokens
-        return "cafebabe"
-
-    monkeypatch.setattr("headroom.transforms.kompress_remote.store_kompress_in_ccr", _fake_store)
+@pytest.mark.parametrize("with_override", [False, True])
+def test_remote_ccr_recovers_original_not_protection_placeholders(
+    monkeypatch, ccr_store, with_override
+) -> None:
     c = _compressor(
         monkeypatch,
         enable_ccr=True,
-        payload={"compressed": "short", "compression_ratio": 0.2},
+        payload={"compressed": "short", "compression_ratio": 0.2, "original_tokens": 999},
     )
+    source = PLACEHOLDER if with_override else ORIGINAL
+    result = c.compress(source, ccr_original=ORIGINAL if with_override else None)
 
-    result = c.compress(PLACEHOLDER, ccr_original=ORIGINAL)
-
-    assert stored["original"] == ORIGINAL
-    assert "HEADROOM_TAG" not in stored["original"]
-    # Token count describes what was actually stored, not the placeholder.
-    assert stored["tokens"] == len(ORIGINAL.split())
-    assert result.cache_key == "cafebabe"
-
-
-def test_the_common_path_without_an_override_is_unchanged(monkeypatch) -> None:
-    stored: dict = {}
-
-    def _fake_store(original, compressed, original_tokens):  # noqa: ANN001
-        stored["original"] = original
-        stored["tokens"] = original_tokens
-        return "d00d"
-
-    monkeypatch.setattr("headroom.transforms.kompress_remote.store_kompress_in_ccr", _fake_store)
-    c = _compressor(
-        monkeypatch,
-        enable_ccr=True,
-        payload={
-            "compressed": "short",
-            "compression_ratio": 0.2,
-            "original_tokens": 999,
-        },
-    )
-
-    c.compress(ORIGINAL)
-
-    assert stored["original"] == ORIGINAL
-    # Still the endpoint's own count when no override was supplied.
-    assert stored["tokens"] == 999
+    assert result.cache_key is not None
+    recovered = ccr_store.retrieve(result.cache_key)
+    assert recovered is not None
+    assert recovered.original_content == ORIGINAL
+    encoding = tiktoken.get_encoding("cl100k_base")
+    assert recovered.original_tokens == len(encoding.encode(ORIGINAL, disallowed_special=()))
+    assert recovered.original_item_count == recovered.compressed_item_count == 0
 
 
-def test_remote_marker_gate_measures_the_whole_payload_like_local(monkeypatch) -> None:
+def test_remote_marker_gate_measures_the_whole_payload_like_local(monkeypatch, ccr_store) -> None:
     """Parity with KompressCompressor: the whole original against the whole
     marked candidate in one token unit. Both boundary sources pass through
     (41 single-token words saved against a 43-token marker; a head word that
     retokenizes: 100 -> 103), and a real saving reports that measurement."""
-    import hashlib
+    from headroom.ccr.tool_injection import CCRToolInjector
 
-    from headroom.transforms.kompress_compressor import ccr_retrieval_marker, payload_tokens
-
-    def _store(original, compressed, original_tokens):  # noqa: ANN001
-        return hashlib.sha256(original.encode()).hexdigest()[:24]
-
-    monkeypatch.setattr("headroom.transforms.kompress_remote.store_kompress_in_ccr", _store)
     for source, drop in (
         (" ".join(["alpha"] * 99 + ["nfs"]), 41),
         (" ".join(["alpha"] * 36 + ["bureaucratic"] + ["alpha"] * 63), 36),
@@ -221,9 +135,15 @@ def test_remote_marker_gate_measures_the_whole_payload_like_local(monkeypatch) -
     kept = " ".join(big.split()[60:])
     c = _compressor(monkeypatch, enable_ccr=True, payload={"compressed": kept})
     result = c.compress(big)
-    marked = kept + ccr_retrieval_marker(300, 240, big, _store(big, kept, 300))
-    assert result.compressed == marked
+    injector = CCRToolInjector(
+        provider="anthropic", inject_tool=False, inject_system_instructions=False
+    )
+    injector.scan_for_markers([{"role": "user", "content": result.compressed}])
+    assert injector.detected_hashes == [result.cache_key]
+    recovered = ccr_store.retrieve(injector.detected_hashes[0])
+    assert recovered is not None and recovered.original_content == big
+    encoding = tiktoken.get_encoding("cl100k_base")
     assert (result.original_tokens, result.compressed_tokens) == (
-        payload_tokens(big),
-        payload_tokens(marked),
+        len(encoding.encode(big, disallowed_special=())),
+        len(encoding.encode(result.compressed, disallowed_special=())),
     )

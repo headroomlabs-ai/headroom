@@ -114,6 +114,9 @@ estimates can differ from the provider's tokenizer; the existing character-count
 fallback applies if the encoder is unavailable. Prose has no structural item
 count, so Kompress leaves `original_item_count` and `compressed_item_count` at
 zero. Retrieval-marker word counts remain explicitly labelled as words.
+TOIN also receives zero structural counts for prose and learns token reduction
+from the token fields. Item-limit learning requires an observed item population;
+full-retrieval feedback can still recommend skipping compression.
 Previously persisted entries are not rewritten by this change.
 
 <Tabs groupId="lang" items={['TypeScript', 'Python']}>

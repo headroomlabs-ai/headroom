@@ -449,3 +449,35 @@ class TestParseSSEToolUse:
         proxy = HeadroomProxy.__new__(HeadroomProxy)
         result = proxy._parse_sse_to_response("data: {}", "openai")
         assert result is None
+
+
+def test_kompress_prose_feedback_does_not_learn_token_sized_item_limits(monkeypatch):
+    from headroom.transforms.kompress_compressor import store_kompress_in_ccr
+
+    toin = ToolIntelligenceNetwork(config=_make_config(min_samples=10))
+    monkeypatch.setattr("headroom.telemetry.get_toin", lambda: toin)
+    monkeypatch.setattr("headroom.telemetry.toin.get_toin", lambda: toin)
+    original = "authentication_middleware_handler_" * 40
+    compressed = "authentication_middleware_handler"
+    key = store_kompress_in_ccr(original, compressed)
+    assert key is not None
+    entry = get_compression_store().retrieve(key)
+    assert entry is not None and entry.tool_signature_hash is not None
+    initial = toin.get_pattern(entry.tool_signature_hash)
+    assert initial is not None
+
+    for _ in range(10):
+        key = store_kompress_in_ccr(original, compressed)
+        assert key is not None
+        recovered = get_compression_store().retrieve(key)
+        assert recovered is not None and recovered.original_content == original
+
+    pattern = toin.get_pattern(entry.tool_signature_hash)
+    assert pattern is not None
+    assert pattern.total_items_seen == 0
+    assert pattern.total_items_kept == 0
+    assert pattern.optimal_max_items == initial.optimal_max_items
+    assert pattern.skip_compression_recommended is True
+    assert pattern.avg_token_reduction == pytest.approx(
+        1 - entry.compressed_tokens / entry.original_tokens
+    )

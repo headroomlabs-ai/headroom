@@ -1610,8 +1610,8 @@ def store_kompress_in_ccr(original: str, compressed: str) -> str | None:
 
             get_toin().record_compression(
                 tool_signature=signature,
-                original_count=original_tokens,
-                compressed_count=compressed_tokens,
+                original_count=0,
+                compressed_count=0,
                 original_tokens=original_tokens,
                 compressed_tokens=compressed_tokens,
                 strategy="kompress",
