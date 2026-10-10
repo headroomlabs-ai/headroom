@@ -9,6 +9,7 @@ from datetime import datetime, timedelta, timezone
 import pytest
 
 from headroom import savings_ledger as L
+from headroom.log_safety import WarnOnce
 from tests._pricing_models import anthropic_pricing_model
 
 MODEL = anthropic_pricing_model()
@@ -559,6 +560,11 @@ def ledger_records():
     logger.setLevel(previous)
 
 
+@pytest.fixture
+def fresh_append_warnings(monkeypatch):
+    monkeypatch.setattr(L, "_append_warnings", WarnOnce(64, "unwritable savings ledgers"))
+
+
 def _warnings(records: list[logging.LogRecord]) -> list[str]:
     return [r.getMessage() for r in records if r.levelno == logging.WARNING]
 
@@ -581,8 +587,7 @@ def test_unreadable_ledger_warns_instead_of_reporting_zero_silently(tmp_path, le
     assert str(tmp_path) in warnings[0]
 
 
-def test_failed_append_warns_once_per_ledger_path(monkeypatch, tmp_path, ledger_records):
-    monkeypatch.setattr(L, "_append_warned_paths", set(), raising=False)
+def test_failed_append_warns_once_per_ledger_path(tmp_path, ledger_records, fresh_append_warnings):
     first = tmp_path / "a"
     second = tmp_path / "b"
     first.mkdir()
@@ -601,8 +606,7 @@ def test_failed_append_warns_once_per_ledger_path(monkeypatch, tmp_path, ledger_
     assert any(r.levelno == logging.DEBUG and "append to" in r.getMessage() for r in ledger_records)
 
 
-def test_successful_append_rearms_the_warning(monkeypatch, tmp_path, ledger_records):
-    monkeypatch.setattr(L, "_append_warned_paths", set(), raising=False)
+def test_successful_append_rearms_the_warning(tmp_path, ledger_records, fresh_append_warnings):
     ledger = tmp_path / "savings_events.jsonl"
     ledger.mkdir()
 
@@ -618,9 +622,8 @@ def test_successful_append_rearms_the_warning(monkeypatch, tmp_path, ledger_reco
 
 
 def test_append_warning_names_only_the_type_of_a_non_os_error(
-    monkeypatch, tmp_path, ledger_records
+    monkeypatch, tmp_path, ledger_records, fresh_append_warnings
 ):
-    monkeypatch.setattr(L, "_append_warned_paths", set(), raising=False)
 
     def fail(*_args, **_kwargs):
         raise TypeError("secret-looking event payload")
@@ -634,4 +637,32 @@ def test_append_warning_names_only_the_type_of_a_non_os_error(
     warnings = _warnings(ledger_records)
     assert len(warnings) == 1
     assert "TypeError" in warnings[0]
-    assert "secret-looking" not in warnings[0]
+    formatted = [logging.Formatter().format(record) for record in ledger_records]
+    assert all("secret-looking" not in line for line in formatted)
+
+    # The repeat goes to DEBUG, and DEBUG carries no payload either.
+    assert not L.record_savings_event(
+        tokens_before=1000, tokens_after=400, path=tmp_path / "savings_events.jsonl"
+    )
+    formatted = [logging.Formatter().format(record) for record in ledger_records]
+    assert any(r.levelno == logging.DEBUG and "TypeError" in r.getMessage() for r in ledger_records)
+    assert all("secret-looking" not in line for line in formatted)
+
+
+def test_many_unwritable_ledgers_do_not_warn_on_every_cycle(
+    tmp_path, ledger_records, fresh_append_warnings
+):
+    # A directory where each ledger file should be: every append fails.
+    ledgers = [tmp_path / f"ledger-{i}" for i in range(65)]
+    for ledger in ledgers:
+        ledger.mkdir()
+
+    for _cycle in range(3):
+        for ledger in ledgers:
+            assert not L.record_savings_event(tokens_before=1000, tokens_after=400, path=ledger)
+
+    warnings = _warnings(ledger_records)
+    # 64 per-path warnings plus one overflow notice, over all three cycles.
+    assert len(warnings) == 65
+    assert sum("append to" in w for w in warnings) == 64
+    assert "More than 64 distinct unwritable savings ledgers" in warnings[-1]

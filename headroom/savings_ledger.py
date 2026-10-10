@@ -49,6 +49,7 @@ from pathlib import Path
 from typing import Any
 
 from headroom import paths as _paths
+from headroom.log_safety import WarnOnce, describe_exception, safe_id
 
 # Reuse the proxy tracker's pricing + normalization so MCP and proxy events
 # bucket models identically and price them through one implementation.
@@ -73,30 +74,20 @@ logger = logging.getLogger(__name__)
 
 # The first failed append to each ledger path is a WARNING so an unwritable
 # ledger is visible; repeats drop to DEBUG so a persistent failure cannot flood
-# logs. A successful append re-arms the path. Capped: cleared when full.
-_APPEND_WARNED_PATHS_MAX = 64
-_append_warned_paths: set[str] = set()
-
-
-def _describe_error(exc: BaseException) -> str:
-    # An OSError names a local path; any other exception text may echo event
-    # data, so only its type is logged above DEBUG.
-    return str(exc) if isinstance(exc, OSError) else type(exc).__name__
+# logs. A successful append re-arms the path.
+_append_warnings = WarnOnce(64, "unwritable savings ledgers")
 
 
 def _warn_append_failure(target: Path, exc: BaseException) -> None:
-    key = str(target)
-    if key not in _append_warned_paths and logger.isEnabledFor(logging.WARNING):
-        if len(_append_warned_paths) >= _APPEND_WARNED_PATHS_MAX:
-            _append_warned_paths.clear()
-        _append_warned_paths.add(key)
+    if _append_warnings.first(str(target), logger):
         logger.warning(
             "savings ledger: append to %s failed: %s; savings will not be recorded. "
             "Make the directory writable or set HEADROOM_SAVINGS_EVENTS_PATH.",
             target,
-            _describe_error(exc),
+            describe_exception(exc),
         )
-    logger.debug("savings ledger: append to %s failed", target, exc_info=True)
+    else:
+        logger.debug("savings ledger: append to %s failed: %s", target, describe_exception(exc))
 
 
 SCHEMA_VERSION = 2
@@ -232,8 +223,8 @@ def _price_event(
     """
     try:
         from headroom.pricing.counterfactual import CacheMix, Region, price_savings
-    except Exception:  # pragma: no cover - defensive
-        logger.debug("savings ledger: pricing module failed to import", exc_info=True)
+    except Exception as exc:  # pragma: no cover - defensive
+        logger.debug("savings ledger: pricing module failed to import: %s", describe_exception(exc))
         return None
 
     cache = event.get("cache") or {}
@@ -276,8 +267,12 @@ def _price_event(
             total += priced.usd
             total_list += priced.usd_list
             bases.append(priced.basis)
-    except Exception:  # pragma: no cover - defensive
-        logger.debug("savings ledger: pricing failed for model=%s", model, exc_info=True)
+    except Exception as exc:  # pragma: no cover - defensive
+        logger.debug(
+            "savings ledger: pricing failed for model=%s: %s",
+            safe_id(model),
+            describe_exception(exc),
+        )
         return None
 
     if not bases:
@@ -449,7 +444,7 @@ def record_savings_event(
         _warn_append_failure(target, exc)
         return False
 
-    _append_warned_paths.discard(str(target))
+    _append_warnings.forget(str(target))
     _maybe_compact(target)
     return True
 
@@ -494,9 +489,8 @@ def _read_events(
             "savings ledger: could not read %s: %s. Check that it is a readable file, "
             "or set HEADROOM_SAVINGS_EVENTS_PATH.",
             target,
-            _describe_error(exc),
+            describe_exception(exc),
         )
-        logger.debug("savings ledger: reading %s failed", target, exc_info=True)
         return []
     return events
 
@@ -595,8 +589,8 @@ def _weakest(existing: str | None, incoming: str | None) -> str | None:
         from headroom.pricing.counterfactual import weakest_basis
 
         return weakest_basis(existing, incoming)
-    except Exception:  # pragma: no cover - defensive
-        logger.debug("savings ledger: could not compare pricing bases", exc_info=True)
+    except Exception as exc:  # pragma: no cover - defensive
+        logger.debug("savings ledger: could not compare pricing bases: %s", describe_exception(exc))
         return existing
 
 
@@ -801,8 +795,8 @@ def _maybe_compact(target: Path) -> None:
             finally:
                 if _HAS_FCNTL and fcntl is not None:
                     fcntl.flock(handle, fcntl.LOCK_UN)
-    except Exception:
-        logger.debug("savings ledger: compaction of %s failed", target, exc_info=True)
+    except Exception as exc:
+        logger.debug("savings ledger: compaction of %s failed: %s", target, describe_exception(exc))
         return
 
 

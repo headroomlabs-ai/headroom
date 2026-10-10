@@ -2,7 +2,10 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import http.server
 import json
+import logging
+import threading
 
 import pytest
 
@@ -537,3 +540,64 @@ def test_run_stdio_reaps_process_on_parent_death(monkeypatch) -> None:
 
     assert excinfo.value.args[0] == 0
     assert cleaned["done"] is True
+
+
+class _RecordList(logging.Handler):
+    def __init__(self) -> None:
+        super().__init__(level=logging.DEBUG)
+        self.records: list[logging.LogRecord] = []
+
+    def emit(self, record: logging.LogRecord) -> None:
+        self.records.append(record)
+
+
+@pytest.mark.parametrize("level", [logging.DEBUG, logging.WARNING])
+def test_proxy_stats_failure_keeps_url_credentials_out_of_logs(level) -> None:
+    canary = "pw-canary-7c1e"
+
+    class _MalformedJson(http.server.BaseHTTPRequestHandler):
+        def do_GET(self) -> None:  # noqa: N802 - stdlib handler name
+            body = b"{not json"
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, *_args: object) -> None:
+            pass
+
+    httpd = http.server.ThreadingHTTPServer(("127.0.0.1", 0), _MalformedJson)
+    thread = threading.Thread(target=httpd.serve_forever, daemon=True)
+    thread.start()
+    # Attach directly: caplog misses `headroom.*` loggers once logging is configured.
+    logger = logging.getLogger("headroom.ccr.mcp")
+    handler = _RecordList()
+    previous = logger.level
+    logger.addHandler(handler)
+    logger.setLevel(level)
+    try:
+        port = httpd.server_address[1]
+        server = mcp_server.HeadroomMCPServer(
+            proxy_url=f"http://user:{canary}@127.0.0.1:{port}", check_proxy=True
+        )
+
+        async def fetch() -> object:
+            try:
+                return await server._fetch_full_proxy_stats()
+            finally:
+                if server._http_client is not None:
+                    await server._http_client.aclose()
+
+        assert asyncio.run(fetch()) is None
+    finally:
+        logger.removeHandler(handler)
+        logger.setLevel(previous)
+        httpd.shutdown()
+        httpd.server_close()
+
+    formatted = [logging.Formatter().format(record) for record in handler.records]
+    assert all(canary not in line for line in formatted)
+    if level == logging.DEBUG:
+        # The failure is still diagnosable: the redacted URL and the exception type.
+        assert any(f"127.0.0.1:{port}" in line and "JSONDecodeError" in line for line in formatted)
