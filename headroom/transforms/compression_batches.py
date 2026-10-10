@@ -7,6 +7,7 @@ import logging
 import re
 from dataclasses import dataclass
 
+from ..log_safety import describe_exception
 from .compression_units import (
     _CCR_MARKER_RE,
     _LOSSY_UNMARKED_STRATEGIES,
@@ -258,13 +259,14 @@ def compress_batch_with_router(
             bias=batch.entries[0].routed.unit.bias,
         )
     except Exception as e:
-        # The exception text can quote tool output, so it goes to DEBUG only.
+        # The exception text can quote tool output, so no level logs it;
+        # describe_exception keeps only types and code locations.
         logger.warning(
             "Batch compression failed (%s); passing %d units through uncompressed",
             type(e).__name__,
             len(batch.entries),
         )
-        logger.debug("Batch compression failure detail", exc_info=True)
+        logger.debug("Batch compression failure detail: %s", describe_exception(e))
         return _passthrough_batch_results(
             batch,
             tokenizer=tokenizer,

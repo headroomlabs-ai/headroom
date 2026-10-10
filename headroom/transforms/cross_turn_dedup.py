@@ -34,6 +34,8 @@ from dataclasses import dataclass
 
 __all__ = ["DedupBlock", "dedup_blocks", "is_prefix_monotonic"]
 
+from ..log_safety import describe_exception
+
 logger = logging.getLogger(__name__)
 
 # A run must be at least this many lines AND this many chars to be worth a
@@ -288,13 +290,14 @@ def dedup_blocks(
 
         return out_blocks, stats
     except Exception as e:  # never break the proxy
-        # The exception text can quote tool output, so it goes to DEBUG only.
+        # The exception text can quote tool output, so no level logs it;
+        # describe_exception keeps only types and code locations.
         logger.warning(
             "Cross-turn dedup failed (%s) on %d blocks; leaving them as-is",
             type(e).__name__,
             len(blocks),
         )
-        logger.debug("Cross-turn dedup failure detail", exc_info=True)
+        logger.debug("Cross-turn dedup failure detail: %s", describe_exception(e))
         return blocks, {"spans_folded": 0, "lines_removed": 0, "chars_removed": 0, "error": True}
 
 

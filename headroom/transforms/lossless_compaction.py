@@ -33,6 +33,8 @@ __all__ = [
     "compact_lossless",
 ]
 
+from ..log_safety import describe_exception
+
 logger = logging.getLogger(__name__)
 
 # ANSI CSI SGR (color/style) escape sequences: ESC [ ... m. Color is
@@ -537,13 +539,14 @@ def compact_lossless(content: str, kind: str) -> str:
                 return content
             return candidate if _smaller(candidate, content) else content
     except Exception as e:
-        # The exception text can quote the content, so it goes to DEBUG only.
+        # The exception text can quote the content, so no level logs it;
+        # describe_exception keeps only types and code locations.
         logger.warning(
             "Lossless compaction (%s) failed (%s) on %d chars; leaving content as-is",
             kind,
             type(e).__name__,
             len(content),
         )
-        logger.debug("Lossless compaction failure detail", exc_info=True)
+        logger.debug("Lossless compaction failure detail: %s", describe_exception(e))
         return content
     return content

@@ -1,8 +1,9 @@
-"""Compression failure paths log a WARNING without the exception text.
+"""Compression failure paths log no exception text at any level.
 
 Each path catches the failure and passes content through unchanged. The
-WARNING names the exception type and counts; the exception text (which can
-quote tool output or stored payloads) appears only in the DEBUG detail line.
+WARNING names the exception type and counts, and the DEBUG detail line gives
+only exception types and code locations, because the exception text (and its
+cause chain) can quote tool output, stored payloads or credentials.
 """
 
 from __future__ import annotations
@@ -27,7 +28,8 @@ from headroom.transforms.compression_batches import (
 )
 from headroom.transforms.compression_units import CompressionUnit, RoutedCompressionUnit
 
-SECRET = "sk-test-secret-in-tool-output"
+CONTENT = "customer-tool-output-canary-7f3a"
+CREDENTIAL = "sk-test-credential-canary-91bd"
 
 
 class _Capture(logging.Handler):
@@ -57,7 +59,10 @@ def capture() -> Iterator[Callable[[logging.Logger], _Capture]]:
 
 
 def _boom(*_args: object, **_kwargs: object) -> object:
-    raise RuntimeError(f"failed while handling {SECRET}")
+    try:
+        raise ValueError(f"backend rejected {CONTENT} for key {CREDENTIAL}")
+    except ValueError as cause:
+        raise RuntimeError(f"failed while handling {CONTENT} with {CREDENTIAL}") from cause
 
 
 def _run_batch(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -140,24 +145,30 @@ def _run_crusher_mirror(monkeypatch: pytest.MonkeyPatch) -> None:
     ],
     ids=["batch", "dedup", "lossless", "kompress-ccr", "crusher-mirror"],
 )
-def test_failure_logs_warning_without_exception_text(
+def test_failure_logs_no_exception_text_at_any_level(
     capture: Callable[[logging.Logger], _Capture],
     monkeypatch: pytest.MonkeyPatch,
     logger: logging.Logger,
     run: Callable[[pytest.MonkeyPatch], None],
     expected: str,
 ) -> None:
+    monkeypatch.delenv("HEADROOM_DEBUG_DUMP", raising=False)
     handler = capture(logger)
     run(monkeypatch)
+
+    formatter = logging.Formatter()
+    for record in handler.records:
+        rendered = formatter.format(record)
+        assert CONTENT not in rendered
+        assert CREDENTIAL not in rendered
 
     warnings = [r for r in handler.records if r.levelno == logging.WARNING]
     assert len(warnings) == 1
     message = warnings[0].getMessage()
     assert expected in message
     assert "RuntimeError" in message
-    assert SECRET not in message
-    assert warnings[0].exc_info is None
 
-    debug = [r for r in handler.records if r.levelno == logging.DEBUG and r.exc_info]
-    assert len(debug) == 1
-    assert SECRET in str(debug[0].exc_info[1])
+    details = [r for r in handler.records if r.levelno == logging.DEBUG]
+    assert len(details) == 1
+    assert "RuntimeError" in details[0].getMessage()
+    assert "caused by ValueError" in details[0].getMessage()
