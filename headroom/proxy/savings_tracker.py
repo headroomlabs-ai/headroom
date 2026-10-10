@@ -2364,6 +2364,7 @@ class SavingsTracker:
             if (
                 delta_tokens
                 or delta_usd
+                or delta_cache_savings_usd
                 or delta_input_tokens
                 or delta_input_cost_usd
                 or delta_cache_read_tokens
