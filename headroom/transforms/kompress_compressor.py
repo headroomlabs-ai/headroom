@@ -28,6 +28,7 @@ from functools import lru_cache
 from typing import Any, Literal
 
 from ..config import TransformResult
+from ..log_safety import describe_exception
 from ..offline import OFFLINE_ENV, OfflineEgressBlocked
 from ..onnx_runtime import (
     ONNX_CPU_ARENA_ENV,
@@ -1597,7 +1598,14 @@ def store_kompress_in_ccr(original: str, compressed: str, original_tokens: int) 
                 strategy="kompress",
             )
         return cache_key
-    except Exception:
+    except Exception as e:
+        # Store backends can echo the payload in errors, so no level logs it;
+        # describe_exception keeps only types and code locations.
+        logger.warning(
+            "Kompress CCR store write failed (%s); output is not retrievable", type(e).__name__
+        )
+        if logger.isEnabledFor(logging.DEBUG):
+            logger.debug("Kompress CCR store failure detail: %s", describe_exception(e))
         return None
 
 

@@ -28,10 +28,15 @@ Pure stdlib, deterministic, never raises (returns input unchanged on any error).
 
 from __future__ import annotations
 
+import logging
 import re
 from dataclasses import dataclass
 
 __all__ = ["DedupBlock", "dedup_blocks", "is_prefix_monotonic"]
+
+from ..log_safety import describe_exception
+
+logger = logging.getLogger(__name__)
 
 # A run must be at least this many lines AND this many chars to be worth a
 # pointer. Small dups are left alone (fragmenting context is not worth it) —
@@ -284,7 +289,16 @@ def dedup_blocks(
             out_blocks.append(DedupBlock(text="\n".join(out), turn=blk.turn, protected=False))
 
         return out_blocks, stats
-    except Exception:  # never break the proxy
+    except Exception as e:  # never break the proxy
+        # The exception text can quote tool output, so no level logs it;
+        # describe_exception keeps only types and code locations.
+        logger.warning(
+            "Cross-turn dedup failed (%s) on %d blocks; leaving them as-is",
+            type(e).__name__,
+            len(blocks),
+        )
+        if logger.isEnabledFor(logging.DEBUG):
+            logger.debug("Cross-turn dedup failure detail: %s", describe_exception(e))
         return blocks, {"spans_folded": 0, "lines_removed": 0, "chars_removed": 0, "error": True}
 
 
