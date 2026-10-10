@@ -74,13 +74,6 @@ def describe_exception(exc: BaseException) -> str:
     """
     if content_logging_enabled():
         return "".join(traceback.format_exception(exc)).rstrip()
-    try:
-        return _describe_chain(exc)
-    except Exception:  # a log helper must never raise; odd objects get a fixed token
-        return "<exception description unavailable>"
-
-
-def _describe_chain(exc: BaseException) -> str:
     parts: list[str] = []
     seen: set[int] = set()
     current: BaseException | None = exc
@@ -213,7 +206,9 @@ def safe_id(value: object) -> str:
     """
     try:
         text = repr(value)
-    except Exception:  # a log helper must never raise (repr of a 5000-digit int does)
+    # repr of a >4300-digit int raises ValueError; a broken __repr__ usually
+    # raises one of the others. A log helper must not raise for them.
+    except (ValueError, TypeError, AttributeError, RuntimeError):
         return "<unrepresentable id>"
     if len(text) <= _ID_MAX_CHARS:
         return text
