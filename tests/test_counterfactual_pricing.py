@@ -170,15 +170,48 @@ def test_untagged_writes_default_to_the_five_minute_ttl():
     assert mix.write_1h == 0
 
 
-def test_long_context_derives_the_one_hour_rate_and_says_so():
-    """No catalog publishes a combined 1h + above-200k rate, so it derives."""
+def test_long_context_reads_a_published_one_hour_rate():
+    """A row's combined 1h + long-tier write rate is read, not derived."""
+    import litellm
+
+    from headroom.pricing.litellm_pricing import resolve_litellm_model
+
     model = anthropic_pricing_model("input_cost_per_token_above_200k_tokens")
+    info = litellm.model_cost.get(resolve_litellm_model(model), {})
+    published = info.get("cache_creation_input_token_cost_above_1hr_above_200k_tokens")
+    if not published:
+        pytest.skip("catalog row publishes no combined 1h + above-200k rate")
     rates = resolve_rates(model, long_context=True)
 
-    assert rates.basis == BASIS_CATALOG_TTL_RATIO
-    assert rates.write_1h / rates.uncached == pytest.approx(2.00, abs=1e-6)
+    assert rates.basis == BASIS_CATALOG
+    assert rates.write_1h == pytest.approx(float(published))
     # And it is the EXPENSIVE tier, not the base one.
     assert rates.uncached > resolve_rates(model).uncached
+
+
+def test_long_context_derives_a_missing_one_hour_rate_and_says_so():
+    """A long tier without its own 1h write rate derives it from the tier's input."""
+    import litellm
+
+    from headroom.pricing.litellm_pricing import resolve_litellm_model
+
+    model = "tiered-model-without-1h-for-test"
+    litellm.model_cost[resolve_litellm_model(model)] = {
+        "input_cost_per_token": 3e-6,
+        "cache_creation_input_token_cost": 3.75e-6,
+        "cache_creation_input_token_cost_above_1hr": 6e-6,
+        "input_cost_per_token_above_200k_tokens": 6e-6,
+        "cache_creation_input_token_cost_above_200k_tokens": 7.5e-6,
+    }
+    resolve_rates.cache_clear()
+    try:
+        rates = resolve_rates(model, long_context=True)
+        assert rates.basis == BASIS_CATALOG_TTL_RATIO
+        assert rates.uncached == pytest.approx(6e-6)
+        assert rates.write_1h / rates.uncached == pytest.approx(2.00, abs=1e-6)
+    finally:
+        litellm.model_cost.pop(resolve_litellm_model(model), None)
+        resolve_rates.cache_clear()
 
 
 # ── Provider agnosticism: every harness, every backend ────────────────────

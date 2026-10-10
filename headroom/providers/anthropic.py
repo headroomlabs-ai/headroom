@@ -130,6 +130,8 @@ ANTHROPIC_CONTEXT_LIMITS: dict[str, int] = {
     "claude-sonnet-4-6": 1000000,
     # Claude Sonnet 4.5
     "claude-sonnet-4-5": 200000,
+    # Claude Haiku 5.5 - 1M context
+    "claude-haiku-5-5": 1000000,
     # Claude 4 (Sonnet 4, Haiku 4)
     "claude-sonnet-4-20250514": 200000,
     "claude-haiku-4-5-20251001": 200000,
@@ -153,9 +155,9 @@ ANTHROPIC_CONTEXT_LIMITS: dict[str, int] = {
 # NOTE: These are ESTIMATES. Always verify against actual Anthropic billing.
 # Last updated: 2026-09-29 (platform.claude.com/docs/en/about-claude/pricing)
 #
-# Newer ids come before their prefixes: `_get_pricing` falls back to substring
-# matching in insertion order, so a dated or suffixed "claude-sonnet-5-5-..."
-# must hit the Sonnet 5.5 row before it can hit "claude-sonnet-5".
+# Newer ids still come before their prefixes, but order no longer decides a
+# match: `_is_release_of` refuses to read "claude-sonnet-5-5-..." as a release
+# of "claude-sonnet-5".
 ANTHROPIC_PRICING: dict[str, dict[str, float]] = {
     # Claude Fable 5.1: $10 in / $50 out, cache read $0.25 (0.025x input).
     "claude-fable-5-1": {"input": 10.00, "output": 50.00, "cached_input": 0.25},
@@ -181,6 +183,9 @@ ANTHROPIC_PRICING: dict[str, dict[str, float]] = {
     # Claude Sonnet 4.6 / 4.5: $3 in / $15 out, cache read $0.30
     "claude-sonnet-4-6": {"input": 3.00, "output": 15.00, "cached_input": 0.30},
     "claude-sonnet-4-5": {"input": 3.00, "output": 15.00, "cached_input": 0.30},
+    # Claude Haiku 5.5: $0.10 in / $0.50 out, cache read $0.01, for prompts up
+    # to 100K tokens; longer prompts use a 5x rate card (`_LONG_CONTEXT_TIERS`).
+    "claude-haiku-5-5": {"input": 0.10, "output": 0.50, "cached_input": 0.01},
     # Claude 4 (Sonnet/Haiku tier pricing)
     "claude-sonnet-4-20250514": {"input": 3.00, "output": 15.00, "cached_input": 0.30},
     "claude-haiku-4-5-20251001": {"input": 1.00, "output": 5.00, "cached_input": 0.10},
@@ -202,10 +207,10 @@ ANTHROPIC_PRICING: dict[str, dict[str, float]] = {
 # derived from LiteLLM's `*_above_200k_tokens` fields ($3->$6 in, $15->$22.50
 # out, $0.30->$0.60 cache read).
 #
-# Only the Sonnet 4 / 4.5 family is tiered: Opus, and Sonnet 4.6 onward, are
-# flat-rated across their whole window. This is the same population that needs
-# the `[1m]` suffix to reach 1M at all, so a session that fills the window this
-# unlocks is billed at these rates.
+# Among the 200K-threshold models only the Sonnet 4 / 4.5 family is tiered:
+# Opus, and Sonnet 4.6 onward, are flat-rated across their whole window. This
+# is the same population that needs the `[1m]` suffix to reach 1M at all, so a
+# session that fills the window this unlocks is billed at these rates.
 _LONG_CONTEXT_THRESHOLD = 200_000
 _LONG_CONTEXT_PREMIUM: dict[str, float] = {"input": 2.0, "output": 1.5, "cached_input": 2.0}
 _LONG_CONTEXT_TIERED_MODELS = (
@@ -213,6 +218,55 @@ _LONG_CONTEXT_TIERED_MODELS = (
     "claude-sonnet-4-20250514",
     "claude-4-sonnet-20250514",
 )
+
+# Claude Haiku 5.5 has its own rate card for prompts above 100K tokens: every
+# rate is 5x (LiteLLM's `*_above_100k_tokens` fields: $0.10->$0.50 in,
+# $0.50->$2.50 out, $0.01->$0.05 cache read).
+_HAIKU_5_5_LONG_PROMPT_THRESHOLD = 100_000
+_HAIKU_5_5_LONG_PROMPT_PREMIUM: dict[str, float] = {
+    "input": 5.0,
+    "output": 5.0,
+    "cached_input": 5.0,
+}
+
+# (model ids, prompt-token threshold, per-rate multipliers above it). Ids match
+# releases and provider-wrapped forms too (`_long_context_tier`).
+_LONG_CONTEXT_TIERS: tuple[tuple[tuple[str, ...], int, dict[str, float]], ...] = (
+    (_LONG_CONTEXT_TIERED_MODELS, _LONG_CONTEXT_THRESHOLD, _LONG_CONTEXT_PREMIUM),
+    (("claude-haiku-5-5",), _HAIKU_5_5_LONG_PROMPT_THRESHOLD, _HAIKU_5_5_LONG_PROMPT_PREMIUM),
+)
+
+
+# A dated release (`-20250929`) or `-latest` alias of a model id.
+_RELEASE_SUFFIX_RE = re.compile(r"-(?:\d{8}|latest)")
+# A further version segment (the `-5` in `claude-haiku-5-5`): another model.
+_VERSION_SEGMENT_RE = re.compile(r"-\d{1,2}(?!\d)")
+
+
+def _is_release_of(model: str, known_model: str) -> bool:
+    """True when ``model`` names ``known_model``, or a release or alias of it.
+
+    The fallback tables are keyed by a mix of undated and dated ids, so a
+    lookup accepts:
+
+    - a longer id containing ``known_model``: a dated release or a provider
+      wrapped id (``claude-sonnet-4-5-20250929``,
+      ``anthropic.claude-haiku-5-5-v1:0``);
+    - an undated alias of a dated key (``claude-3-5-sonnet`` for
+      ``claude-3-5-sonnet-20241022``), or its ``-latest`` form.
+
+    An id one version segment away is a different model and does not match:
+    ``claude-haiku-5`` is not ``claude-haiku-5-5``, and ``claude-sonnet-5-5``
+    is not ``claude-sonnet-5``.
+    """
+    if model == known_model:
+        return True
+    if known_model.startswith(model):
+        return bool(_RELEASE_SUFFIX_RE.fullmatch(known_model[len(model) :]))
+    at = model.find(known_model)
+    if at < 0:
+        return False
+    return not _VERSION_SEGMENT_RE.match(model, at + len(known_model))
 
 
 def _apply_long_context_premium(
@@ -224,11 +278,24 @@ def _apply_long_context_premium(
     LiteLLM entry has no above-threshold rate (see
     ``_litellm_lacks_long_context_rate``).
     """
-    if input_tokens <= _LONG_CONTEXT_THRESHOLD:
+    tier = _long_context_tier(model)
+    if tier is None or input_tokens <= tier[0]:
         return pricing
-    if not any(model.startswith(tiered) for tiered in _LONG_CONTEXT_TIERED_MODELS):
-        return pricing
-    return {key: rate * _LONG_CONTEXT_PREMIUM.get(key, 1.0) for key, rate in pricing.items()}
+    _threshold, premium = tier
+    return {key: rate * premium.get(key, 1.0) for key, rate in pricing.items()}
+
+
+def _long_context_tier(model: str) -> tuple[int, dict[str, float]] | None:
+    """Return the ``(threshold, premium)`` of the long-context tier ``model`` is in.
+
+    Matches with ``_is_release_of``, as the manual rate lookup does, so a
+    Bedrock id such as ``us.anthropic.claude-haiku-5-5-v1:0`` that the manual
+    table prices as Haiku 5.5 also gets Haiku 5.5's long-prompt card.
+    """
+    for known_models, threshold, premium in _LONG_CONTEXT_TIERS:
+        if any(_is_release_of(model, known) for known in known_models):
+            return threshold, premium
+    return None
 
 
 def _litellm_lacks_long_context_rate(model: str, input_tokens: int) -> bool:
@@ -238,17 +305,29 @@ def _litellm_lacks_long_context_rate(model: str, input_tokens: int) -> bool:
     from the bare Anthropic ids before, and pricing such a request through it then
     bills the base tier: about half the real cost of a long session. The manual
     table still carries the premium, so the caller uses it instead.
+
+    Each tier is checked against its own field, named after its threshold
+    (``*_above_200k_tokens`` for Sonnet 4 / 4.5, ``*_above_100k_tokens`` for
+    Haiku 5.5).
+
+    The row is resolved as ``estimate_cost_from_tokens`` resolves it, so a
+    gateway id such as ``anthropic/claude-haiku-5-5`` is checked against the
+    bare row it is billed from. Only Anthropic's own rows count: a reseller row
+    without the field (``perplexity/anthropic/claude-haiku-5-5``) is
+    deliberately flat-rated, not a dropped rate.
     """
-    if input_tokens <= _LONG_CONTEXT_THRESHOLD:
-        return False
-    if not any(model.startswith(tiered) for tiered in _LONG_CONTEXT_TIERED_MODELS):
-        return False
     cost_data = get_litellm_model_cost()
-    for candidate in pricing_lookup_candidates(model):
-        info = cost_data.get(candidate)
-        if isinstance(info, dict):
-            return "input_cost_per_token_above_200k_tokens" not in info
-    return False  # LiteLLM doesn't know the model; it returns None and we fall back anyway
+    row = next((c for c in pricing_lookup_candidates(model) if c in cost_data), None)
+    if row is None:
+        return False  # LiteLLM doesn't know the model; it returns None and we fall back anyway
+    info = cost_data[row]
+    if not isinstance(info, dict) or info.get("litellm_provider") != "anthropic":
+        return False
+    tier = _long_context_tier(row)
+    if tier is None or input_tokens <= tier[0]:
+        return False
+    threshold, _premium = tier
+    return f"input_cost_per_token_above_{threshold // 1000}k_tokens" not in info
 
 
 # Default limits for pattern-based inference
@@ -776,9 +855,10 @@ class AnthropicProvider(Provider):
         if model in self._context_limits:
             return self._context_limits[model]
 
-        # Check for partial matches (e.g., "claude-3-5-sonnet" matches "claude-3-5-sonnet-20241022")
+        # Releases and aliases of a known id (e.g. "claude-3-5-sonnet" matches
+        # "claude-3-5-sonnet-20241022"); see `_is_release_of`.
         for known_model, limit in self._context_limits.items():
-            if model in known_model or known_model in model:
+            if _is_release_of(model, known_model):
                 return limit
 
         # Try LiteLLM for context limit
@@ -851,8 +931,8 @@ class AnthropicProvider(Provider):
 
         Tries LiteLLM first for up-to-date pricing, falls back to manual pricing.
         Both paths apply Anthropic's long-context premium: on the Sonnet 4 / 4.5
-        family a prompt over 200K re-prices the whole request (see
-        ``_LONG_CONTEXT_PREMIUM``).
+        family a prompt over 200K, and on Haiku 5.5 a prompt over 100K,
+        re-prices the whole request (see ``_LONG_CONTEXT_TIERS``).
 
         ``now`` selects a DeepSeek peak/off-peak tier (see
         :mod:`headroom.pricing.deepseek_tiers`); ``None`` reads the wall clock.
@@ -896,9 +976,9 @@ class AnthropicProvider(Provider):
         if model in self._pricing:
             return self._pricing[model]
 
-        # Partial match
+        # Releases and aliases of a known id; see `_is_release_of`.
         for known_model, prices in self._pricing.items():
-            if model in known_model or known_model in model:
+            if _is_release_of(model, known_model):
                 return prices
 
         # Pattern-based inference

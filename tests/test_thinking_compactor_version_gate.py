@@ -32,6 +32,7 @@ from headroom.transforms.thinking_compactor import bills_prior_thinking
         ("claude-opus-4-8", True),
         ("claude-sonnet-5", True),
         ("claude-sonnet-5-20260101", True),
+        ("claude-haiku-5-5", True),
         # Legacy 3.x naming (with date) stays below threshold.
         ("claude-3-5-sonnet-20241022", False),
         ("claude-3-opus-20240229", False),

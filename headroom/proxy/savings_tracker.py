@@ -491,6 +491,7 @@ def estimate_request_savings_usd(
     compression_tokens_saved: int = 0,
     tool_schema_tokens_saved: int = 0,
     output_tokens_saved: int = 0,
+    output_tokens: int = 0,
     cache_read_tokens: int = 0,
     cache_write_tokens: int = 0,
     cache_write_5m_tokens: int = 0,
@@ -536,6 +537,8 @@ def estimate_request_savings_usd(
         CacheMix,
         PricedSavings,
         Region,
+        long_context_premium_avoided_usd,
+        long_context_threshold,
         price_savings,
         weakest_basis,
     )
@@ -548,26 +551,45 @@ def estimate_request_savings_usd(
         uncached_input_tokens=uncached_input_tokens,
         cache_inferred=cache_inferred,
     )
-    long_context = mix.is_long_context(local_tokens=local_input_tokens)
+    threshold = long_context_threshold(model)
+    long_context = mix.is_long_context(local_tokens=local_input_tokens, threshold=threshold)
+    # Compression that kept the prompt under the threshold avoided the long
+    # card on the whole request: the removed tokens are priced at that card,
+    # and the forwarded input and generated output premiums are added on top.
+    forwarded = max(mix.billed, max(_coerce_int(local_input_tokens), 0))
+    crossed = (
+        not long_context and forwarded + max(_coerce_int(compression_tokens_saved), 0) > threshold
+    )
 
-    def _price(tokens: Any, region: Region) -> PricedSavings:
+    def _price(tokens: Any, region: Region, *, long_tier: bool) -> PricedSavings:
         return price_savings(
             max(_coerce_int(tokens), 0),
             model=model,
             mix=mix,
             region=region,
-            long_context=long_context,
+            long_context=long_tier,
             provider=provider,
             # Matches the blended rate the flat estimators fall back to, so an
             # unpriceable model reports the same dollars it always has.
             fallback_rate_per_token=DEFAULT_FALLBACK_INPUT_COST_PER_TOKEN,
         )
 
-    compression = _price(compression_tokens_saved, Region.LIVE_ZONE)
-    tool_schema = _price(tool_schema_tokens_saved, Region.PREFIX)
+    compression = _price(
+        compression_tokens_saved, Region.LIVE_ZONE, long_tier=long_context or crossed
+    )
+    tool_schema = _price(tool_schema_tokens_saved, Region.PREFIX, long_tier=long_context)
+    compression_usd = compression.usd
+    if crossed:
+        compression_usd += long_context_premium_avoided_usd(
+            model,
+            mix,
+            local_tokens=local_input_tokens,
+            output_tokens=output_tokens,
+            provider=provider,
+        )
 
     return {
-        "compression": compression.usd,
+        "compression": compression_usd,
         "compression_list": compression.usd_list,
         "tool_schema": tool_schema.usd,
         "tool_schema_list": tool_schema.usd_list,
@@ -1403,6 +1425,7 @@ class SavingsTracker:
             priced = estimate_request_savings_usd(
                 model,
                 compression_tokens_saved=_coerce_int(metrics.get("tokens_saved")),
+                output_tokens=_coerce_int(metrics.get("output_tokens")),
                 cache_read_tokens=cache_read_tokens,
                 cache_write_tokens=cache_write_tokens,
                 cache_write_5m_tokens=_coerce_int(metrics.get("cache_write_5m_tokens")),

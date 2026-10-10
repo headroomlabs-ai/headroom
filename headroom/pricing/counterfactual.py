@@ -56,6 +56,7 @@ from __future__ import annotations
 
 import logging
 import math
+import re
 from dataclasses import dataclass
 from enum import Enum
 from functools import lru_cache
@@ -66,10 +67,15 @@ from headroom.pricing.cache_ttl import CACHE_WRITE_MULTIPLIERS
 
 logger = logging.getLogger(__name__)
 
-#: Context size at which the major catalogs publish a second, higher price tier
-#: (LiteLLM spells it ``*_above_200k_tokens``). A request's billed prompt is
-#: compared against this to pick which rate applies.
+#: Prompt size at which most catalog rows publish a second, higher price tier
+#: (LiteLLM spells it ``*_above_200k_tokens``). The default for
+#: :func:`long_context_threshold`, which reads each model's own threshold from
+#: its row: Claude Haiku 5.5's tier starts at 100K, GPT-5.x's at 272K.
 LONG_CONTEXT_THRESHOLD_TOKENS = 200_000
+
+#: A catalog row's long-context input rate; the number is the threshold in
+#: thousands of tokens. Each row publishes at most one.
+_LONG_CONTEXT_INPUT_FIELD = re.compile(r"^input_cost_per_token_above_(\d+)k_tokens$")
 
 #: Provider-level cache discount ratios, as a fraction of the base input price.
 #: FALLBACK ONLY — the per-model LiteLLM catalog is always preferred, because
@@ -235,15 +241,18 @@ class CacheMix:
         """
         return self.billed > 0
 
-    def is_long_context(self, *, local_tokens: int = 0) -> bool:
-        """True when this request billed above the catalogs' 200k price tier.
+    def is_long_context(
+        self, *, local_tokens: int = 0, threshold: int = LONG_CONTEXT_THRESHOLD_TOKENS
+    ) -> bool:
+        """True when this request billed above ``threshold``, the model's long-context tier.
 
         ``local_tokens`` lets a caller contribute its own forwarded-token count
         for requests where the provider reported no breakdown; the larger of the
         two decides, so a long request is never priced at the cheap tier merely
-        because usage was missing.
+        because usage was missing. Pass :func:`long_context_threshold` for the
+        model so a tier that starts below 200K (Haiku 5.5: 100K) is honoured.
         """
-        return max(self.billed, _coerce_int(local_tokens)) > LONG_CONTEXT_THRESHOLD_TOKENS
+        return max(self.billed, _coerce_int(local_tokens)) > threshold
 
 
 @dataclass(frozen=True)
@@ -355,6 +364,46 @@ def _litellm() -> Any | None:
 _RATE_CACHE_MAXSIZE = 256
 
 
+def _catalog_row(model: str) -> dict[str, Any] | None:
+    """``model``'s LiteLLM catalog row, ``{}`` when unlisted, ``None`` without LiteLLM."""
+    litellm = _litellm()
+    if litellm is None:
+        return None
+    try:
+        from headroom.pricing.litellm_pricing import resolve_litellm_model
+
+        return litellm.model_cost.get(resolve_litellm_model(model), {}) or {}
+    except Exception:
+        return None
+
+
+def long_context_tier(info: dict[str, Any]) -> tuple[int, str] | None:
+    """The row's long-context tier as ``(threshold_tokens, field_suffix)``, if any."""
+    for key in info:
+        match = _LONG_CONTEXT_INPUT_FIELD.match(key)
+        if match:
+            thousands = int(match.group(1))
+            return thousands * 1000, f"_above_{thousands}k_tokens"
+    return None
+
+
+@lru_cache(maxsize=_RATE_CACHE_MAXSIZE)
+def long_context_threshold(model: str) -> int:
+    """Billed-prompt size above which ``model`` pays its long-context rates.
+
+    Read from the catalog row's ``*_above_<N>k_tokens`` fields: 100K for Claude
+    Haiku 5.5, 200K for Sonnet 4 / 4.5, 272K for GPT-5.x. A model with no tier,
+    or one the catalog does not list, gets :data:`LONG_CONTEXT_THRESHOLD_TOKENS`;
+    that is harmless, because :func:`resolve_rates` then has no tier to switch
+    to and returns the base rates either way.
+
+    Memoized on the same bounded LRU as :func:`resolve_rates`, for the same
+    reason; tests that swap the catalog clear both.
+    """
+    tier = long_context_tier(_catalog_row(model) or {})
+    return tier[0] if tier else LONG_CONTEXT_THRESHOLD_TOKENS
+
+
 def _canonical_cache_rate(litellm: Any, model: str, field: str, *, long_context: bool) -> float:
     """Resolve an absent catalog slice through the model's billing calculator.
 
@@ -362,7 +411,7 @@ def _canonical_cache_rate(litellm: Any, model: str, field: str, *, long_context:
     zero, list price, or a model-specific discount. Never invent our own ratio.
     The result is cached with the other resolved rates, not probed per request.
     """
-    tokens = LONG_CONTEXT_THRESHOLD_TOKENS + 1 if long_context else 1
+    tokens = long_context_threshold(model) + 1 if long_context else 1
     try:
         input_cost, _ = litellm.cost_per_token(
             model=model, prompt_tokens=tokens, completion_tokens=0, **{field: tokens}
@@ -390,11 +439,12 @@ def resolve_rates(
     Preference order, strongest first:
 
     1. **Catalog** — LiteLLM's per-model published rates, including the
-       long-context tier and, where the row has it,
+       long-context tier (the row's own ``*_above_<N>k_tokens`` fields, see
+       :func:`long_context_threshold`) and, where the row has it,
        ``cache_creation_input_token_cost_above_1hr``. Anthropic publishes a real
        1h write rate (Sonnet: 2.00x base), and reading it beats deriving it.
     2. **Catalog + TTL ratio** — a catalog row that prices 5m writes but not 1h
-       ones, which is every row at the above-200k tier. The 1h rate is derived
+       ones, which is every row at its long-context tier. The 1h rate is derived
        from the tier's base input price and the structural multiplier in
        :mod:`headroom.pricing.cache_ttl`. Only applied when the row shows a real
        write premium: a provider that does not bill for cache writes at all
@@ -430,14 +480,17 @@ def resolve_rates(
     # savings on a model that costs nothing.
     if base is None:
         return None
-    if long_context:
-        base = info.get("input_cost_per_token_above_200k_tokens") or base
+    tier = long_context_tier(info) if long_context else None
+    if tier:
+        long_base = info.get(f"input_cost_per_token{tier[1]}")
+        if long_base is not None:
+            base = long_base
     base = float(base)
 
     def _tier(field: str, default: float) -> float:
-        """Read ``field``, preferring its above-200k variant on long requests."""
-        if long_context:
-            hi = info.get(f"{field}_above_200k_tokens")
+        """Read ``field``, preferring its long-context variant on long requests."""
+        if tier:
+            hi = info.get(f"{field}{tier[1]}")
             if hi is not None:
                 return float(hi)
         value = info.get(field)
@@ -452,10 +505,10 @@ def resolve_rates(
     # billed provider-reported writes require their own catalog rate.
     write_5m = _tier("cache_creation_input_token_cost", missing_cache_rate)
     read_is_catalog = info.get("cache_read_input_token_cost") is not None or (
-        long_context and info.get("cache_read_input_token_cost_above_200k_tokens") is not None
+        tier is not None and info.get(f"cache_read_input_token_cost{tier[1]}") is not None
     )
     write_is_catalog = info.get("cache_creation_input_token_cost") is not None or (
-        long_context and info.get("cache_creation_input_token_cost_above_200k_tokens") is not None
+        tier is not None and info.get(f"cache_creation_input_token_cost{tier[1]}") is not None
     )
     if for_billing and not read_is_catalog:
         read = _canonical_cache_rate(
@@ -468,10 +521,12 @@ def resolve_rates(
 
     basis = BASIS_CATALOG
     write_1h_raw = info.get("cache_creation_input_token_cost_above_1hr")
-    if long_context:
-        # No catalog publishes a combined 1h + above-200k rate, so the long
-        # tier always derives. Ratio basis, and labelled as such.
-        write_1h_raw = None
+    if tier:
+        # The long tier's 1h rate is its own field
+        # (``cache_creation_input_token_cost_above_1hr_above_100k_tokens``);
+        # most tiered rows omit it, and the rate then derives below. Ratio
+        # basis, and labelled as such.
+        write_1h_raw = info.get(f"cache_creation_input_token_cost_above_1hr{tier[1]}")
     if write_1h_raw is not None:
         write_1h = float(write_1h_raw)
     elif write_5m > base:
@@ -522,6 +577,62 @@ def resolve_rates(
         read_is_catalog=read_is_catalog,
         write_is_catalog=write_is_catalog,
     )
+
+
+def long_context_premium_avoided_usd(
+    model: str,
+    mix: CacheMix,
+    *,
+    local_tokens: int = 0,
+    output_tokens: int = 0,
+    provider: str | None = None,
+) -> float:
+    """Long-context premium a request's forwarded input and output avoided, in USD.
+
+    For a request whose uncompressed prompt would have passed ``model``'s
+    long-context threshold but whose forwarded prompt did not: the provider
+    re-prices the WHOLE request above the threshold, so compression saved the
+    long card on every forwarded input token, on top of the removed tokens
+    themselves. This is that difference, forwarded input at the long card minus
+    the same input at the base card. When ``output_tokens`` is supplied, include
+    the premium avoided on that generated output too. These tokens were still
+    generated; this is compression savings, not output-shaping savings.
+
+    ``local_tokens`` stands in as uncached input when the provider reported no
+    breakdown. Returns 0.0 for a model with no tier or no catalog row.
+    """
+    try:
+        long_rates = resolve_rates(model, long_context=True, provider=provider)
+        base_rates = resolve_rates(model, long_context=False, provider=provider)
+    except Exception:  # pragma: no cover - defensive; pricing must never raise
+        return 0.0
+    if long_rates is None or base_rates is None:
+        return 0.0
+    if mix.has_signal():
+        n = mix.normalized()
+        split = TokenSplit(
+            read=float(n.read),
+            write_5m=float(n.write_5m),
+            write_1h=float(n.write_1h),
+            uncached=float(n.uncached),
+        )
+    else:
+        split = TokenSplit(uncached=float(max(_coerce_int(local_tokens), 0)))
+    input_premium = max(0.0, long_rates.price(split) - base_rates.price(split))
+    output_premium = 0.0
+    if max(_coerce_int(output_tokens), 0):
+        try:
+            info = _catalog_row(model) or {}
+            tier = long_context_tier(info)
+            base_output = info.get("output_cost_per_token")
+            long_output = info.get(f"output_cost_per_token{tier[1]}") if tier else None
+            if base_output is not None and long_output is not None:
+                output_premium = max(0.0, float(long_output) - float(base_output)) * max(
+                    _coerce_int(output_tokens), 0
+                )
+        except Exception:  # Pricing metadata must not break telemetry.
+            pass
+    return input_premium + output_premium
 
 
 @dataclass(frozen=True)
@@ -584,7 +695,9 @@ def price_savings(
 
     mix = (mix or CacheMix()).normalized()
     if long_context is None:
-        long_context = mix.is_long_context(local_tokens=local_tokens)
+        long_context = mix.is_long_context(
+            local_tokens=local_tokens, threshold=long_context_threshold(model)
+        )
 
     try:
         rates = resolve_rates(model, long_context=long_context, provider=provider)
@@ -635,6 +748,9 @@ __all__ = [
     "PricedSavings",
     "Region",
     "TokenSplit",
+    "long_context_premium_avoided_usd",
+    "long_context_threshold",
+    "long_context_tier",
     "price_savings",
     "resolve_rates",
     "split_tokens",

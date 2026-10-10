@@ -112,10 +112,21 @@ class CostEntry(NamedTuple):
 # (Anthropic's >200k rates differ), so they are never preferred over the catalog.
 
 
-#: Context size at which the major catalogs publish a second, higher price
-#: tier (LiteLLM spells it ``*_above_200k_tokens``). A request's billed prompt
-#: is compared against this to pick which rate applies.
-_LONG_CONTEXT_THRESHOLD_TOKENS = 200_000
+def _long_context_threshold(model: str) -> int:
+    """Billed-prompt size above which ``model`` pays its long-context rates.
+
+    Delegates to :func:`headroom.pricing.counterfactual.long_context_threshold`,
+    which reads the model's own tier from the catalog (Haiku 5.5: 100K, Sonnet
+    4.5: 200K). Imported at call time, like ``_get_cache_prices``: importing
+    ``headroom.pricing`` pulls in litellm (~4s) and this module is on the
+    proxy's startup path. Falls back to 200K if the lookup fails.
+    """
+    try:
+        from headroom.pricing.counterfactual import long_context_threshold
+
+        return long_context_threshold(model)
+    except Exception:
+        return 200_000
 
 
 def _bucket_by_cache_mix(
@@ -880,6 +891,13 @@ class CostTracker:
         self._saved_write_5m_by_tier: dict[tuple[str, bool], float] = {}
         self._saved_write_1h_by_tier: dict[tuple[str, bool], float] = {}
         self._saved_list_by_tier: dict[tuple[str, bool], float] = {}
+        # Forwarded tokens of requests that compression kept under the model's
+        # long-context threshold (their uncompressed prompt would have crossed
+        # it), as [read, write 5m, write 1h, uncached, output]. The provider
+        # re-prices the whole request above the threshold, so these tokens
+        # avoided the long card's premium; stats() prices that premium into
+        # the cache-aware savings.
+        self._tier_crossing_by_model: dict[str, list[float]] = {}
         # Tool-schema deferral per model, DISJOINT from _tokens_saved_by_model
         # (deferred schemas are never in the message counts). Tracked separately
         # so the compression-only figure stays available; `stats()` reports both
@@ -930,6 +948,7 @@ class CostTracker:
         self._saved_write_5m_by_tier.clear()
         self._saved_write_1h_by_tier.clear()
         self._saved_list_by_tier.clear()
+        self._tier_crossing_by_model.clear()
         self._tool_saved_by_model.clear()
         self._tool_saved_read_by_model.clear()
         self._tool_saved_write_5m_by_model.clear()
@@ -1092,7 +1111,24 @@ class CostTracker:
         write_5m_eff = 0 if cache_inferred else max(0, cache_write_5m_tokens)
         write_1h_eff = 0 if cache_inferred else max(0, cache_write_1h_tokens)
         billed_prompt = max(0, cache_read_tokens) + write_eff + max(0, uncached_tokens)
-        long_context = max(billed_prompt, tokens_sent) > _LONG_CONTEXT_THRESHOLD_TOKENS
+        threshold = _long_context_threshold(model)
+        forwarded_prompt = max(billed_prompt, tokens_sent)
+        long_context = forwarded_prompt > threshold
+        # Compression that kept the prompt under the threshold: the removed
+        # tokens would have billed at the long card, and so would everything
+        # forwarded (see `_tier_crossing_by_model`).
+        crossed = not long_context and forwarded_prompt + tokens_saved > threshold
+        if crossed:
+            w1h = min(write_1h_eff, write_eff)
+            row = self._tier_crossing_by_model.setdefault(model, [0.0] * 5)
+            if billed_prompt > 0:
+                row[0] += max(0, cache_read_tokens)
+                row[1] += write_eff - w1h
+                row[2] += w1h
+                row[3] += max(0, uncached_tokens)
+            else:
+                row[3] += max(0, tokens_sent)
+            row[4] += max(0, output_tokens)
         if tokens_saved > 0:
             # Message compression works the LIVE ZONE only: handlers freeze the
             # cached prefix (system + prior turns) byte-for-byte for prefix-cache
@@ -1114,7 +1150,7 @@ class CostTracker:
                 uncached_tokens=uncached_tokens,
                 region="live_zone",
             )
-            wkey = (model, long_context)
+            wkey = (model, long_context or crossed)
             self._saved_write_5m_by_tier[wkey] = self._saved_write_5m_by_tier.get(wkey, 0.0) + c_w5m
             self._saved_write_1h_by_tier[wkey] = self._saved_write_1h_by_tier.get(wkey, 0.0) + c_w1h
             self._saved_list_by_tier[wkey] = self._saved_list_by_tier.get(wkey, 0.0) + c_list
@@ -1375,8 +1411,9 @@ class CostTracker:
     def _get_output_price(self, model: str, *, long_context: bool = False) -> float | None:
         """Get the per-token completion price for a model, or None if unpriced.
 
-        ``long_context`` selects the catalog's above-200k completion rate where
-        the model publishes one (Anthropic charges 1.5x there).
+        ``long_context`` selects the completion rate of the model's
+        long-context tier where it publishes one (Sonnet 4.5 above 200K: 1.5x;
+        Haiku 5.5 above 100K: 5x).
         """
         litellm = _get_litellm_module()
         if litellm is None:
@@ -1388,7 +1425,11 @@ class CostTracker:
             info = litellm.model_cost.get(resolved, {})
             base = info.get("output_cost_per_token")
             if long_context:
-                return info.get("output_cost_per_token_above_200k_tokens") or base or None
+                from headroom.pricing.counterfactual import long_context_tier
+
+                tier = long_context_tier(info)
+                if tier:
+                    return info.get(f"output_cost_per_token{tier[1]}") or base or None
             return base or None
         except Exception:
             return None
@@ -1433,9 +1474,9 @@ class CostTracker:
         ``headroom.pricing.cache_ttl`` derives it. Previously every 1h write was
         priced at the 5m rate.
 
-        ``long_context`` picks the above-200k tier for each rate, falling back
-        per rate to the base one for a model that publishes no long-context
-        price.
+        ``long_context`` picks the model's long-context tier for each rate,
+        falling back per rate to the base one for a model that publishes no
+        long-context price.
 
         Imported at call time: ``headroom.pricing`` eagerly imports litellm
         (~4s) and this module is on the proxy's startup path.
@@ -1611,6 +1652,23 @@ class CostTracker:
                 + self._saved_write_1h_by_tier.get(key, 0.0) * cw1h_price
                 + self._saved_list_by_tier.get(key, 0.0) * uncached_price
             )
+
+        # The long card's premium that tier-crossing requests' forwarded
+        # tokens avoided (see `_tier_crossing_by_model`).
+        for model, crossing in self._tier_crossing_by_model.items():
+            long_prices = self._get_cache_prices(model, long_context=True)
+            base_prices = self._get_cache_prices(model)
+            if not long_prices or not base_prices:
+                continue
+            premium = sum(
+                tokens * max(0.0, hi - lo)
+                for tokens, hi, lo in zip(crossing[:4], long_prices, base_prices, strict=True)
+            )
+            long_out = self._get_output_price(model, long_context=True)
+            base_out = self._get_output_price(model)
+            if long_out and base_out:
+                premium += crossing[4] * max(0.0, long_out - base_out)
+            cache_aware_savings_usd += premium
 
         # Tool-schema deferral, priced CACHE-AWARE rather than flat at list:
         # had the schemas shipped they would have been part of the same prefix

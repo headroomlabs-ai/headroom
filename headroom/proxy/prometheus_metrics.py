@@ -909,6 +909,7 @@ class PrometheusMetrics:
             compression_tokens_saved=tokens_saved,
             tool_schema_tokens_saved=tool_search_saved,
             output_tokens_saved=output_tokens_saved,
+            output_tokens=output_tokens,
             cache_read_tokens=cache_read_tokens,
             cache_write_tokens=cache_write_tokens,
             cache_write_5m_tokens=cache_write_5m_tokens,
