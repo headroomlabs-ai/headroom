@@ -46,12 +46,13 @@ def fast_hash(data: str | bytes, length: int = 16) -> str:
     content-addressable lookups in compression caches, prefix tracking, etc.
 
     .. deprecated::
-        Use :func:`headroom.parser.compute_hash`, which is the same MD5
-        truncated to 16 hex characters.
+        Use ``hashlib.md5(data).hexdigest()[:length]``, encoding ``str``
+        input as UTF-8 first. For ``str`` input and the default length,
+        :func:`headroom.parser.compute_hash` returns the same value.
     """
     warnings.warn(
         "fast_hash is deprecated and will be removed in a future release; "
-        "use headroom.parser.compute_hash instead.",
+        "use hashlib.md5(data).hexdigest()[:length], encoding str input as UTF-8 first.",
         DeprecationWarning,
         stacklevel=2,
     )

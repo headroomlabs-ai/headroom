@@ -131,6 +131,12 @@ def test_format_timestamp_normalizes_aware_datetimes() -> None:
     ("name", "args", "expected"),
     [
         ("fast_hash", ("hello", 8), "5d41402a"),
+        ("fast_hash", (b"hello",), "5d41402abc4b2a76"),
+        (
+            "create_dropped_context_marker",
+            ("budget",),
+            '<headroom:dropped_context reason="budget">',
+        ),
         (
             "create_dropped_context_marker",
             ("budget", 4),
@@ -143,9 +149,16 @@ def test_format_timestamp_normalizes_aware_datetimes() -> None:
         ),
         (
             "extract_markers",
-            ('x <headroom:tool_digest sha256="abc">',),
-            [{"type": "tool_digest", "attributes": {"sha256": "abc"}}],
+            (
+                'x <headroom:tool_digest sha256="abc"> y '
+                '<headroom:dropped_context reason="budget" count="2">',
+            ),
+            [
+                {"type": "tool_digest", "attributes": {"sha256": "abc"}},
+                {"type": "dropped_context", "attributes": {"reason": "budget", "count": "2"}},
+            ],
         ),
+        ("safe_json_loads", ('{"ok": true}',), ({"ok": True}, True)),
         ("safe_json_loads", ("{bad",), (None, False)),
         ("safe_json_dumps", ({"emoji": "café"},), '{"emoji":"café"}'),
     ],
