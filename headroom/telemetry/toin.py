@@ -78,10 +78,6 @@ logger = logging.getLogger(__name__)
 # Environment variable for custom TOIN storage path
 TOIN_PATH_ENV_VAR = "HEADROOM_TOIN_PATH"
 
-# Default TOIN storage directory and file
-DEFAULT_TOIN_DIR = ".headroom"
-DEFAULT_TOIN_FILE = "toin.json"
-
 # ── Aggregation-key defaults ────────────────────────────────────────────
 # Used when callers haven't plumbed auth-mode / model-family detection
 # (PR-F3 wires the real detectors). Shipping a real `"unknown"` slice is

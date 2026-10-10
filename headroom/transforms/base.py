@@ -9,24 +9,6 @@ from ..config import TransformResult
 from ..tokenizer import Tokenizer
 
 
-def split_frozen(
-    messages: list[dict[str, Any]],
-    frozen_message_count: int,
-) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
-    """Split messages into frozen (cached prefix) and mutable portions.
-
-    Args:
-        messages: All messages.
-        frozen_message_count: Number of leading messages to freeze.
-
-    Returns:
-        (frozen, mutable) — frozen messages must not be modified.
-    """
-    if frozen_message_count <= 0 or frozen_message_count >= len(messages):
-        return [], messages
-    return messages[:frozen_message_count], messages[frozen_message_count:]
-
-
 class Transform(ABC):
     """Abstract base class for message transforms."""
 

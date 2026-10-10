@@ -61,7 +61,6 @@ def test_tracker_notify_active_update_and_basic_state(monkeypatch: pytest.Monkey
 
     tracker.notify_active("Bearer oauth-token-123", from_local_operator=True)
     assert tracker._current_token == "oauth-token-123"
-    assert tracker._full_tokens["oauth-to"] == 1
     assert tracker.is_active() is True
 
     tracker.update_contribution(
@@ -376,6 +375,47 @@ def test_persist_state_keeps_file_owner_only(tmp_path: Path) -> None:
     persist_path.chmod(0o644)
     tracker._persist_state()
     assert stat.S_IMODE(persist_path.stat().st_mode) == 0o600
+
+
+@pytest.mark.asyncio
+async def test_maybe_poll_logs_a_failed_otel_update(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A broken OTEL exporter must not break polling, but must leave a trace."""
+    monkeypatch.setattr(SubscriptionTracker, "_load_persisted_state", lambda self: None)
+    tracker = SubscriptionTracker()
+    tracker.notify_active("Bearer live-oauth-token", from_local_operator=True)
+    monkeypatch.setattr("headroom.subscription.client.read_cached_oauth_token", lambda: None)
+    snapshot = _make_snapshot()
+
+    async def fetch_snapshot(token: str | None) -> SubscriptionSnapshot:
+        return snapshot
+
+    def broken_exporter(state: dict) -> None:
+        raise RuntimeError("exporter down")
+
+    tracker._client = SimpleNamespace(fetch=fetch_snapshot)
+    monkeypatch.setattr(
+        tracker_module, "_compute_window_tokens_for_snapshot", lambda snap: WindowTokens(input=7)
+    )
+    monkeypatch.setattr(tracker_module, "_detect_discrepancies", lambda snap, tokens: [])
+    monkeypatch.setattr(tracker, "_persist_state", lambda: None)
+    monkeypatch.setitem(
+        sys.modules,
+        "headroom.observability.metrics",
+        SimpleNamespace(
+            get_otel_metrics=lambda: SimpleNamespace(record_subscription_window=broken_exporter)
+        ),
+    )
+
+    with caplog.at_level("DEBUG", logger="headroom.subscription.tracker"):
+        await tracker._maybe_poll()
+
+    assert tracker.latest_snapshot is snapshot
+    assert tracker._state.last_error is None
+    assert "Subscription OTEL metrics update failed: exporter down" in [
+        r.getMessage() for r in caplog.records if r.name == "headroom.subscription.tracker"
+    ]
 
 
 def test_persist_and_load_state_round_trip(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:

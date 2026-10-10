@@ -33,6 +33,8 @@ from enum import Enum
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, ClassVar
 
+from headroom.learn._shared import classify_error
+
 if TYPE_CHECKING:
     from headroom.learn.models import ProjectInfo
     from headroom.memory.backends.local import LocalBackend
@@ -125,17 +127,6 @@ class PatternCategory(str, Enum):
     ARCHITECTURE = "architecture"  # File structure, dependencies, conventions
 
 
-class AgentType(str, Enum):
-    """Supported coding agent types."""
-
-    CLAUDE = "claude"
-    CURSOR = "cursor"
-    CODEX = "codex"
-    AIDER = "aider"
-    GEMINI = "gemini"
-    UNKNOWN = "unknown"
-
-
 # =============================================================================
 # Extracted Pattern Model
 # =============================================================================
@@ -218,51 +209,70 @@ def _strip_leading_cd(cmd: str) -> str:
 
 
 # =============================================================================
-# Error Classification (reused from learn/scanner.py patterns)
+# Error Detection
 # =============================================================================
 
-_ERROR_PATTERNS: list[tuple[re.Pattern[str], str]] = [
-    (
-        re.compile(r"No such file or directory|ENOENT|FileNotFoundError|does not exist", re.I),
-        "file_not_found",
-    ),
-    (re.compile(r"ModuleNotFoundError|ImportError|No module named", re.I), "module_not_found"),
-    (re.compile(r"command not found", re.I), "command_not_found"),
-    (re.compile(r"Permission denied|EACCES|EPERM|auto-denied", re.I), "permission_denied"),
-    (re.compile(r"file is too large|too many lines|exceeds.*limit", re.I), "file_too_large"),
-    (re.compile(r"SyntaxError|IndentationError", re.I), "syntax_error"),
-    (re.compile(r"Traceback \(most recent|Exception:|Error:", re.I), "runtime_error"),
-    (re.compile(r"timed? ?out|TimeoutError|deadline exceeded", re.I), "timeout"),
-    (re.compile(r"exit code|non-zero|exited with", re.I), "exit_code"),
-    (re.compile(r"BUILD FAILED|compilation error|compile error", re.I), "build_failure"),
-]
+# OpenAI-format tool results carry no is_error flag, so failures are sniffed
+# from the output. Categories come from headroom.learn._shared.classify_error;
+# these patterns only decide *whether* the output is an error.
+_ERROR_SIGNALS: tuple[re.Pattern[str], ...] = (
+    re.compile(r"No such file or directory|ENOENT|FileNotFoundError|does not exist", re.I),
+    re.compile(r"ModuleNotFoundError|ImportError|No module named", re.I),
+    re.compile(r"command not found", re.I),
+    re.compile(r"Permission denied|EACCES|EPERM|auto-denied", re.I),
+    re.compile(r"file is too large|too many lines|exceeds.*limit", re.I),
+    re.compile(r"SyntaxError|IndentationError", re.I),
+    re.compile(r"Traceback \(most recent|Exception:|Error:", re.I),
+    re.compile(r"timed? ?out|TimeoutError|deadline exceeded", re.I),
+    re.compile(r"BUILD FAILED|compilation error|compile error", re.I),
+)
+
+# Agent harnesses (Codex, Grok, opencode, ...) append "exit code 0" to every
+# SUCCESSFUL shell command, so an exit code only signals an error when it is
+# nonzero (signed codes such as -9 included). Status evidence belongs to its own
+# line: a zero code never hides a separate explicit failure elsewhere in the
+# output (a nonzero code, "non-zero", a signal kill, or an "exited with ..." line
+# that carries no code of its own). A line that ends at "exited with" continues
+# on the next line ("Process exited with\nexit code 0"), so it is not a failure.
+# A standalone "Killed" line is the shell's SIGKILL message, but a successful
+# command can also print that word, so it counts only when no exit status is
+# reported at all. It is recognized even below the short-content cut-off.
+_EXIT_STATUS_RE = re.compile(
+    r"\bexit(?:ed)?(?:\s+with)?(?:\s+exit)?\s+(?:code|status)\s*:?\s*([+-]?\d+)", re.I
+)
+_EXIT_FAILURE_RE = re.compile(r"non-zero|nonzero|exited with signal|killed by signal", re.I)
+_KILLED_LINE_RE = re.compile(r"^\s*Killed(?::\s*\d+)?\s*$", re.M)
+_EXITED_WITH_RE = re.compile(r"exited with(?=\s*\S)", re.I)
 
 
-def _classify_error(content: str) -> str | None:
-    """Classify error content. Returns category or None if not an error."""
-    snippet = content[:2000]
-    for pattern, category in _ERROR_PATTERNS:
-        if pattern.search(snippet):
-            return category
-    return None
+def _exit_status_is_error(snippet: str) -> bool:
+    codes = _EXIT_STATUS_RE.findall(snippet)
+    if any(int(code) != 0 for code in codes) or _EXIT_FAILURE_RE.search(snippet):
+        return True
+    if any(
+        _EXITED_WITH_RE.search(line) and not _EXIT_STATUS_RE.search(line)
+        for line in snippet.splitlines()
+    ):
+        return True
+    return not codes and bool(_KILLED_LINE_RE.search(snippet))
 
 
 def _is_error(content: str) -> bool:
     """Quick check if tool output looks like an error."""
-    if not content or len(content) < 10:
+    if not content:
         return False
-    return _classify_error(content) is not None
+    if len(content) < 10:
+        return bool(_KILLED_LINE_RE.fullmatch(content))
+    snippet = content[:2000]
+    if any(pattern.search(snippet) for pattern in _ERROR_SIGNALS):
+        return True
+    return _exit_status_is_error(snippet)
 
 
 # =============================================================================
 # Tool Call Extractors
 # =============================================================================
 
-# Extract command from Bash tool calls
-_COMMAND_RE = re.compile(r"^(?:source\s+\S+\s*&&\s*)?(.+)", re.I)
-
-# Extract file paths
-_FILE_PATH_RE = re.compile(r"(?:/[\w./-]+(?:\.\w+)?)")
 
 # Extract package/module names from errors
 _MODULE_RE = re.compile(r"No module named ['\"]?(\w[\w.]*)['\"]?")
@@ -758,14 +768,6 @@ class TrafficLearner:
 
         return list(by_hash.values())
 
-    def get_learned_patterns(self) -> list[ExtractedPattern]:
-        """Return patterns from the in-memory accumulator.
-
-        Retained for backwards compatibility. Reads only the accumulator;
-        does not consult persisted rows. Use flush_to_file() for full data.
-        """
-        return [pattern for pattern, count in self._pattern_counts.values() if count >= 1]
-
     async def on_tool_result(
         self,
         tool_name: str,
@@ -793,7 +795,7 @@ class TrafficLearner:
             "input": tool_input,
             "output": tool_output[:2000],  # Cap for memory
             "is_error": is_error,
-            "error_category": _classify_error(tool_output) if is_error else None,
+            "error_category": classify_error(tool_output).value if is_error else None,
             "timestamp": time.time(),
             "agent_type": agent_type,
         }
