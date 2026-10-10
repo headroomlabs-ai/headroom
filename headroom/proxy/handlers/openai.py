@@ -41,7 +41,10 @@ from headroom.proxy.provider_usage import billed_input_for_provider, billed_inpu
 from headroom.proxy.rate_limit_identity import rate_limit_identity
 from headroom.proxy.semantic_cache_key_policy import compute_request_cache_partition
 from headroom.proxy.stage_timer import StageTimer, emit_stage_timings_log
-from headroom.proxy.tool_schema_savings_policy import without_deferral_flags
+from headroom.proxy.tool_schema_savings_policy import (
+    net_hook_tool_saving,
+    without_deferral_flags,
+)
 from headroom.proxy.upstream_guard import is_safe_upstream_url
 from headroom.proxy.ws_headers import WS_HOP_BY_HOP_HEADERS
 from headroom.proxy.ws_session_registry import (
@@ -4391,6 +4394,7 @@ class OpenAIHandlerMixin:
         )
 
         _th_ctx: TurnContext | None = None
+        _th_raw_saved = None
         if registered_turn_hooks():
             _th_tools_before = body.get("tools")
             _th_tok_before = (
@@ -4438,7 +4442,17 @@ class OpenAIHandlerMixin:
                 optimized_tokens = _th_msg_after
                 if 0 < tool_tokens_after_compaction < tool_tokens_before_compaction:
                     optimized_tokens += tool_tokens_after_compaction
-                tokens_saved = max(0, original_tokens - optimized_tokens)
+                # A tool the hook added is sent too: it reduces the saving.
+                _th_tools_after_count = (
+                    tokenizer.count_text(
+                        json.dumps(without_deferral_flags(_th_ctx.tools), default=str)
+                    )
+                    if _th_ctx.tools
+                    else 0
+                )
+                optimized_tokens += max(0, _th_tools_after_count - _th_tok_before)
+                _th_raw_saved: int | None = original_tokens - optimized_tokens
+                tokens_saved = max(0, _th_raw_saved)
                 # Attribute to the hook ONLY when the hook itself reduced tokens.
                 if _th_msg_before is not None and _th_msg_after < _th_msg_before:
                     transforms_applied.append("turn_hook")
@@ -4455,6 +4469,10 @@ class OpenAIHandlerMixin:
                     int(tags.get("turn_hook_tools_saved_tokens", 0) or 0) + _th_saved
                 )
                 transforms_applied.append(f"turn_hook:tools:{_th_saved}tok")
+            # Signed, then clamped once: message text a hook added offsets the
+            # tool definitions it removed.
+            if _th_raw_saved is not None:
+                tokens_saved = net_hook_tool_saving(_th_raw_saved, tags, _th_saved)
 
         # Compatibility shim: GPT-5 / o-series chat models REJECT the legacy
         # `max_tokens` ("Unsupported parameter … Use 'max_completion_tokens'
@@ -10518,6 +10536,11 @@ class OpenAIHandlerMixin:
             if _turn is not None:
                 _turn.prepare(model_name=model_name, tags=tags, config=self.config)
 
+            # Whether the returned ``tokens_after`` was counted over the FINAL,
+            # post-hook messages (so it already includes any text a hook added).
+            # Set by whichever closure runs; read after the executor.
+            _after_counts_hook = [False]
+
             def _run_stateless():
                 result = pipeline.apply(messages=messages, model=model, **pipeline_kwargs)
                 final = result.messages
@@ -10526,6 +10549,7 @@ class OpenAIHandlerMixin:
                     final = _turn.transform(final)
                     if _turn.folded_messages:
                         tokens_after = _turn.count_messages(final, tokens_after)
+                        _after_counts_hook[0] = True
                 return (
                     result,
                     final,
@@ -10615,6 +10639,7 @@ class OpenAIHandlerMixin:
                         _tok = get_tokenizer(model_name)
                         raw_tokens_before = _tok.count_messages(messages)
                         final_tokens_after = _tok.count_messages(final)
+                        _after_counts_hook[0] = True
                     except Exception as e:
                         # Fail-open, but LOUD: this fallback reverts to the
                         # pipeline's counts of the cache-swapped input, which
@@ -10665,7 +10690,19 @@ class OpenAIHandlerMixin:
 
             ccr_hashes = _response_ccr_hashes(final_messages, result.markers_inserted)
 
-            tokens_saved = max(0, tokens_before - tokens_after)
+            # Tools and message text a turn hook added are sent too: they reduce
+            # the saving, and offset tools the hook removed (signed, clamped once).
+            _hook_tool_saved = 0
+            if _turn is not None:
+                tokens_after += max(0, int(getattr(_turn, "tool_growth_tokens", 0) or 0))
+                # Only a count of pre-hook messages lacks the text a hook added;
+                # a recount of the final messages (stateless fold, session) has it.
+                if not _after_counts_hook[0]:
+                    tokens_after += max(0, int(getattr(_turn, "message_growth_tokens", 0) or 0))
+                _hook_tool_saved = int(getattr(_turn, "hook_tool_saved_tokens", 0) or 0)
+            tokens_saved = net_hook_tool_saving(
+                tokens_before - tokens_after, tags, _hook_tool_saved
+            )
             latency_ms = (time.time() - start_time) * 1000
             _transforms_applied = list(result.transforms_applied or ())
             # The claimed turn adds its labels and response fields BEFORE the
