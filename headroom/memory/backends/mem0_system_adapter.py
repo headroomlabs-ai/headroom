@@ -2,12 +2,18 @@
 
 This adapter bridges the Mem0Backend interface to the MemoryBackend protocol
 required by MemorySystem, enabling Mem0 to be used with the memory tools system.
+
+.. deprecated::
+    Nothing in Headroom uses this adapter. Use ``DirectMem0Adapter``
+    (``headroom.memory.backends.direct_mem0``), which also satisfies the
+    MemoryBackend protocol and skips Mem0's internal LLM extraction.
 """
 
 from __future__ import annotations
 
 import asyncio
 import uuid
+import warnings
 from datetime import datetime, timezone
 from typing import Any
 
@@ -23,6 +29,9 @@ def _utcnow() -> datetime:
 
 class Mem0SystemAdapter:
     """Adapter that makes Mem0Backend conform to MemorySystem's MemoryBackend protocol.
+
+    .. deprecated::
+        Use ``DirectMem0Adapter`` instead.
 
     This adapter wraps Mem0Backend and provides the interface expected by
     MemorySystem, enabling LLM-driven memory tools (memory_save, memory_search,
@@ -53,6 +62,12 @@ class Mem0SystemAdapter:
         Args:
             config: Configuration for Mem0. If None, uses default local config.
         """
+        warnings.warn(
+            "Mem0SystemAdapter is deprecated and will be removed in a future release; "
+            "use DirectMem0Adapter (headroom.memory.backends.direct_mem0) instead.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
         self._backend = Mem0Backend(config)
         self._config = config or Mem0Config()
 
