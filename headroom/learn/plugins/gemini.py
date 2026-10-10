@@ -1,12 +1,17 @@
-"""Google Gemini CLI plugin for headroom learn.
+"""Google Gemini CLI & Antigravity plugin for headroom learn.
 
-Reads session logs from ~/.gemini/tmp/<project_hash>/chats/ (JSON and JSONL).
+Reads session logs from ~/.gemini/tmp/<project_hash>/chats/ (JSON and JSONL),
+as well as Google Antigravity CLI and IDE brain transcripts (~/.gemini/antigravity-*/brain/).
 """
 
 from __future__ import annotations
 
 import json
 import logging
+import re
+from collections import Counter
+from collections.abc import Callable
+from datetime import datetime
 from pathlib import Path
 
 from .._shared import classify_error, is_error_content, normalize_tool_name
@@ -23,23 +28,27 @@ from ._paths import path_exists
 
 logger = logging.getLogger(__name__)
 
+# Antigravity tool argument names -> the shared schema ToolCall.input_summary reads.
+_ANTIGRAVITY_ARG_ALIASES = {
+    "CommandLine": "command",
+    "AbsolutePath": "file_path",
+    "DirectoryPath": "path",
+}
+
 
 class GeminiPlugin(LearnPlugin, ConversationScanner):
-    """Reads Google Gemini CLI session logs from ~/.gemini/tmp/<project>/chats/.
+    """Reads Google Gemini CLI & Antigravity session logs from ~/.gemini/.
 
-    Gemini CLI stores sessions as JSON or JSONL files with messages in the
-    Gemini API format:
-    - role: "user" or "model"
-    - parts[]: array containing text, functionCall, or functionResponse objects
-
-    Tool calls use:
-    - functionCall: {name, args}  (in model messages)
-    - functionResponse: {name, response}  (in user messages)
+    Supports:
+    - Gemini CLI sessions in ~/.gemini/tmp/<project>/chats/ (JSON and JSONL).
+    - Antigravity CLI & IDE transcripts in ~/.gemini/antigravity-*/brain/.
     """
 
     def __init__(self, gemini_dir: Path | None = None):
         self.gemini_dir = gemini_dir or Path.home() / ".gemini"
         self.tmp_dir = self.gemini_dir / "tmp"
+        self.antigravity_cli_dir = self.gemini_dir / "antigravity-cli"
+        self.antigravity_ide_dir = self.gemini_dir / "antigravity-ide"
 
     # --- LearnPlugin identity ---
 
@@ -49,18 +58,22 @@ class GeminiPlugin(LearnPlugin, ConversationScanner):
 
     @property
     def display_name(self) -> str:
-        return "Google Gemini CLI"
+        return "Google Gemini / Antigravity"
 
     @property
     def description(self) -> str:
-        return "Google Gemini CLI (~/.gemini/)"
+        return "Google Gemini CLI & Antigravity (~/.gemini/)"
 
     def detect(self) -> bool:
-        if not self.tmp_dir.exists():
-            return False
-        return bool(
+        if self.tmp_dir.exists() and (
             any(self.tmp_dir.rglob("session-*.json")) or any(self.tmp_dir.rglob("session-*.jsonl"))
-        )
+        ):
+            return True
+        for agy_dir in (self.antigravity_cli_dir, self.antigravity_ide_dir):
+            brain_dir = agy_dir / "brain"
+            if brain_dir.exists() and any(brain_dir.rglob("transcript.jsonl")):
+                return True
+        return False
 
     def create_writer(self) -> ContextWriter:
         return GeminiWriter()
@@ -68,72 +81,399 @@ class GeminiPlugin(LearnPlugin, ConversationScanner):
     # --- ConversationScanner interface ---
 
     def discover_projects(self) -> list[ProjectInfo]:
-        """Discover all projects with Gemini session data."""
-        if not self.tmp_dir.exists():
-            return []
+        """Discover all projects with Gemini or Antigravity session data."""
+        discovered: dict[Path, dict] = {}
+        unmapped_projects: list[ProjectInfo] = []
 
-        projects = []
-        for project_dir in sorted(self.tmp_dir.iterdir()):
-            if not project_dir.is_dir():
+        # 1. Legacy Gemini CLI projects (~/.gemini/tmp/<project>/chats/)
+        if self.tmp_dir.exists():
+            for project_dir in sorted(self.tmp_dir.iterdir()):
+                if not project_dir.is_dir():
+                    continue
+
+                chats_dir = project_dir / "chats"
+                if not chats_dir.exists():
+                    continue
+
+                session_files = list(chats_dir.glob("session-*.json")) + list(
+                    chats_dir.glob("session-*.jsonl")
+                )
+                if not session_files:
+                    continue
+
+                project_path = self._detect_project_path(session_files[0])
+                if project_path:
+                    entry = discovered.setdefault(
+                        project_path,
+                        {
+                            "name": project_path.name,
+                            "project_path": project_path,
+                            "data_paths": [],
+                        },
+                    )
+                    if chats_dir not in entry["data_paths"]:
+                        entry["data_paths"].append(chats_dir)
+                else:
+                    unmapped_projects.append(
+                        ProjectInfo(
+                            name=project_dir.name,
+                            project_path=Path.cwd(),
+                            data_path=chats_dir,
+                            context_file=None,
+                            memory_file=None,
+                        )
+                    )
+
+        # 2. Antigravity CLI and IDE projects (~/.gemini/antigravity-*/brain/)
+        unmapped_transcripts: list[Path] = []
+        for agy_dir in (self.antigravity_cli_dir, self.antigravity_ide_dir):
+            brain_dir = agy_dir / "brain"
+            if not brain_dir.exists():
                 continue
 
-            chats_dir = project_dir / "chats"
-            if not chats_dir.exists():
+            transcripts = sorted(brain_dir.rglob("transcript.jsonl"))
+            if not transcripts:
                 continue
 
-            session_files = list(chats_dir.glob("session-*.json")) + list(
-                chats_dir.glob("session-*.jsonl")
-            )
-            if not session_files:
-                continue
+            for tf in transcripts:
+                detected_path = self._detect_antigravity_project_path(tf)
+                if detected_path:
+                    entry = discovered.setdefault(
+                        detected_path,
+                        {
+                            "name": detected_path.name,
+                            "project_path": detected_path,
+                            "data_paths": [],
+                        },
+                    )
+                    if brain_dir not in entry["data_paths"]:
+                        entry["data_paths"].append(brain_dir)
+                else:
+                    unmapped_transcripts.append(tf)
 
-            project_path = self._detect_project_path(session_files[0])
+        projects: list[ProjectInfo] = []
+        for proj_path, info in discovered.items():
+            context_file = None
+            if path_exists(proj_path):
+                candidate_gemini = proj_path / "GEMINI.md"
+                candidate_agents = proj_path / "AGENTS.md"
+                if path_exists(candidate_gemini):
+                    context_file = candidate_gemini
+                elif path_exists(candidate_agents):
+                    context_file = candidate_agents
 
-            gemini_md = None
-            if project_path and path_exists(project_path):
-                candidate = project_path / "GEMINI.md"
-                if path_exists(candidate):
-                    gemini_md = candidate
-
+            data_paths = info["data_paths"]
             projects.append(
                 ProjectInfo(
-                    name=project_path.name if project_path else project_dir.name,
-                    project_path=project_path or Path.cwd(),
-                    data_path=chats_dir,
-                    context_file=gemini_md,
+                    name=info["name"],
+                    project_path=proj_path,
+                    data_path=data_paths[0] if data_paths else proj_path,
+                    context_file=context_file,
                     memory_file=None,
+                    extra_data_paths=data_paths[1:],
                 )
             )
 
+        projects.extend(unmapped_projects)
+
+        # Conversations with no detectable workspace learn into the global
+        # ~/.gemini/GEMINI.md instead of being guessed into some project.
+        if unmapped_transcripts:
+            global_context = self.gemini_dir / "GEMINI.md"
+            projects.append(
+                ProjectInfo(
+                    name="antigravity (no workspace)",
+                    project_path=self.gemini_dir,
+                    data_path=unmapped_transcripts[0],
+                    context_file=global_context if path_exists(global_context) else None,
+                    memory_file=None,
+                    extra_data_paths=unmapped_transcripts[1:],
+                )
+            )
         return projects
 
     def scan_project(
         self, project: ProjectInfo, max_workers: int = 1, include_subagents: bool = True
     ) -> list[SessionData]:
-        """Scan all Gemini session files for a project.
+        """Scan all session files for a project (Gemini CLI and/or Antigravity)."""
+        paths = [project.data_path, *project.extra_data_paths]
+        scan_items: list[tuple[Path, Callable[[Path], SessionData | None]]] = []
+        seen_files: set[Path] = set()
 
-        ``include_subagents`` is accepted for a uniform plugin contract but is a
-        no-op: Gemini stores sessions flat, with no nested transcript hierarchy.
-        """
-        session_files = sorted(project.data_path.glob("session-*.json")) + sorted(
-            project.data_path.glob("session-*.jsonl")
-        )
-        if not session_files:
+        for p in paths:
+            if not p.exists():
+                continue
+
+            # 1. Gemini CLI sessions
+            if p.is_file() and p.name.startswith("session-") and p.suffix in (".json", ".jsonl"):
+                if p not in seen_files:
+                    seen_files.add(p)
+                    scan_items.append((p, self._scan_session))
+            elif p.is_dir() and (
+                p.name == "chats" or any(p.glob("session-*.json")) or any(p.glob("session-*.jsonl"))
+            ):
+                gemini_files = sorted(p.glob("session-*.json")) + sorted(p.glob("session-*.jsonl"))
+                for gf in gemini_files:
+                    if gf not in seen_files:
+                        seen_files.add(gf)
+                        scan_items.append((gf, self._scan_session))
+
+            # 2. Antigravity transcripts
+            if p.is_file() and p.name == "transcript.jsonl":
+                if p not in seen_files:
+                    detected = self._detect_antigravity_project_path(p)
+                    if detected is None or detected == project.project_path:
+                        seen_files.add(p)
+                        scan_items.append((p, self._scan_antigravity_transcript))
+            elif p.is_dir():
+                transcripts = sorted(p.rglob("transcript.jsonl"))
+                for tf in transcripts:
+                    if tf not in seen_files:
+                        if self._detect_antigravity_project_path(tf) == project.project_path:
+                            seen_files.add(tf)
+                            scan_items.append((tf, self._scan_antigravity_transcript))
+
+        if not scan_items:
             return []
 
-        if max_workers <= 1 or len(session_files) <= 1:
-            return [s for f in session_files if (s := self._scan_session(f)) and s.tool_calls]
+        def _run_scanner(
+            item: tuple[Path, Callable[[Path], SessionData | None]],
+        ) -> SessionData | None:
+            fpath, fn = item
+            return fn(fpath)
+
+        if max_workers <= 1 or len(scan_items) <= 1:
+            return [s for item in scan_items if (s := _run_scanner(item)) and s.tool_calls]
 
         from concurrent.futures import ThreadPoolExecutor, as_completed
 
         sessions: list[SessionData] = []
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
-            futures = {executor.submit(self._scan_session, f): f for f in session_files}
+            futures = {executor.submit(_run_scanner, item): item for item in scan_items}
             for future in as_completed(futures):
                 session = future.result()
                 if session and session.tool_calls:
                     sessions.append(session)
         return sessions
+
+    @staticmethod
+    def _detect_antigravity_project_path(transcript_path: Path) -> Path | None:
+        """Extract the workspace an Antigravity transcript belongs to.
+
+        A workspace declared in a user step wins; otherwise the most frequent
+        command ``Cwd`` does. Search and listing targets are not workspaces,
+        and tool output is never parsed for paths: it routinely echoes
+        unrelated ``Workspace:`` or ``path ->`` text (git output, file bodies).
+        Directories inside Antigravity's own data dir (per-conversation
+        scratch folders) are never a project.
+        """
+        brain_dir = next((p for p in transcript_path.parents if p.name == "brain"), None)
+        app_dir = brain_dir.parent if brain_dir else None
+
+        def is_workspace(p: Path) -> bool:
+            return not (app_dir is not None and p.is_relative_to(app_dir)) and path_exists(p)
+
+        cwd_counts: Counter[Path] = Counter()
+        try:
+            with open(transcript_path, encoding="utf-8", errors="replace") as f:
+                for line in f:
+                    if not line.strip():
+                        continue
+                    try:
+                        step = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+
+                    if not isinstance(step, dict):
+                        continue
+
+                    content = step.get("content")
+                    if isinstance(content, str) and (
+                        step.get("type") == "USER_INPUT"
+                        or step.get("source") in ("USER_EXPLICIT", "USER_SYSTEM")
+                    ):
+                        for pattern in (
+                            r"([A-Za-z]:[\\/][^\r\n\t]+?|/[^\r\n\t]+?)\s*->",
+                            r"Workspace:\s*([^\r\n]+)",
+                        ):
+                            m = re.search(pattern, content)
+                            if m:
+                                p = Path(m.group(1).strip().strip("[]'\""))
+                                if is_workspace(p):
+                                    return p
+
+                    tool_calls = step.get("tool_calls")
+                    if isinstance(tool_calls, list):
+                        for tc in tool_calls:
+                            if not isinstance(tc, dict):
+                                continue
+                            args = tc.get("args")
+                            if isinstance(args, str):
+                                try:
+                                    args = json.loads(args)
+                                except json.JSONDecodeError:
+                                    args = {}
+                            if isinstance(args, dict):
+                                cwd = args.get("Cwd")
+                                if isinstance(cwd, str) and cwd.strip():
+                                    cwd_counts[Path(cwd.strip().strip("\"'"))] += 1
+        except (OSError, UnicodeDecodeError):
+            pass
+
+        return next((cwd for cwd, _ in cwd_counts.most_common() if is_workspace(cwd)), None)
+
+    @staticmethod
+    def _extract_antigravity_identity(transcript_path: Path) -> str:
+        """Derive a stable session identity from the conversation and source."""
+        parts = transcript_path.parts
+        source = ""
+        conv_id = ""
+
+        if "brain" in parts:
+            b_idx = parts.index("brain")
+            if b_idx > 0:
+                source = parts[b_idx - 1]
+            if b_idx + 1 < len(parts):
+                conv_id = parts[b_idx + 1]
+
+        if not conv_id:
+            cur = transcript_path.parent
+            if cur.name == "logs":
+                cur = cur.parent
+            if cur.name == ".system_generated":
+                cur = cur.parent
+            conv_id = cur.name if cur.name else transcript_path.stem
+
+        if source and conv_id:
+            return f"{source}_{conv_id}"
+        return conv_id or transcript_path.stem
+
+    def _scan_antigravity_transcript(self, transcript_path: Path) -> SessionData | None:
+        """Parse an Antigravity transcript.jsonl file into SessionData."""
+        tool_calls: list[ToolCall] = []
+        events: list[SessionEvent] = []
+        session_id = self._extract_antigravity_identity(transcript_path)
+        session_timestamp: datetime | None = None
+
+        steps: list = []
+        try:
+            with open(transcript_path, encoding="utf-8", errors="replace") as f:
+                for line in f:
+                    if not line.strip():
+                        continue
+                    try:
+                        steps.append(json.loads(line))
+                    except json.JSONDecodeError:
+                        continue
+        except (OSError, UnicodeDecodeError) as e:
+            logger.debug("Failed to read Antigravity transcript %s: %s", transcript_path, e)
+            return None
+
+        if not steps:
+            return None
+
+        msg_idx = 0
+        pending_tool_calls: list[ToolCall] = []
+
+        for step in steps:
+            if not isinstance(step, dict):
+                continue
+
+            step_type = step.get("type", "")
+            source = step.get("source", "")
+            content = step.get("content", "")
+            created_at = step.get("created_at")
+
+            if session_timestamp is None and isinstance(created_at, str):
+                try:
+                    session_timestamp = datetime.fromisoformat(created_at.replace("Z", "+00:00"))
+                except ValueError:
+                    pass
+
+            # User input
+            if step_type == "USER_INPUT" or source in ("USER_EXPLICIT", "USER_SYSTEM"):
+                if isinstance(content, str) and content.strip():
+                    m = re.search(r"<USER_REQUEST>\s*([\s\S]*?)\s*</USER_REQUEST>", content)
+                    user_text = m.group(1).strip() if m else content.strip()
+                    events.append(
+                        SessionEvent(
+                            type="user_message",
+                            msg_index=msg_idx,
+                            text=user_text,
+                            timestamp=created_at,
+                        )
+                    )
+                    msg_idx += 1
+
+            # Model tool calls
+            elif step.get("tool_calls"):
+                # Each planner step's results follow it directly, so calls
+                # still pending here were interrupted and never got a result.
+                pending_tool_calls.clear()
+                tcs = step.get("tool_calls")
+                if isinstance(tcs, list):
+                    for tc_item in tcs:
+                        if not isinstance(tc_item, dict):
+                            continue
+                        raw_name = str(tc_item.get("name", "unknown"))
+                        tool_name = normalize_tool_name(raw_name)
+                        call_id = str(tc_item.get("id") or f"ag_{session_id}_{len(tool_calls)}")
+                        raw_args = tc_item.get("args") or {}
+                        if isinstance(raw_args, str):
+                            try:
+                                raw_args = json.loads(raw_args)
+                            except json.JSONDecodeError:
+                                raw_args = {"raw": raw_args}
+                        elif not isinstance(raw_args, dict):
+                            raw_args = {}
+                        if isinstance(raw_args, dict):
+                            for agy_key, shared_key in _ANTIGRAVITY_ARG_ALIASES.items():
+                                if agy_key in raw_args:
+                                    raw_args.setdefault(shared_key, raw_args[agy_key])
+
+                        tc = ToolCall(
+                            name=tool_name,
+                            tool_call_id=call_id,
+                            input_data=raw_args,
+                            output="",
+                            is_error=False,
+                            error_category=ErrorCategory.UNKNOWN,
+                            msg_index=msg_idx,
+                        )
+                        pending_tool_calls.append(tc)
+                        tool_calls.append(tc)
+                        events.append(
+                            SessionEvent(
+                                type="tool_call",
+                                msg_index=msg_idx,
+                                timestamp=created_at,
+                                tool_call=tc,
+                            )
+                        )
+                        msg_idx += 1
+
+            # Output / error matching. Only model-sourced execution steps carry
+            # tool output; planner commentary, system notices and API errors
+            # must not consume a pending call.
+            elif pending_tool_calls and source == "MODEL" and step_type != "PLANNER_RESPONSE":
+                status = step.get("status", "")
+                is_err = status == "ERROR"
+                tc = pending_tool_calls.pop(0)
+                if isinstance(content, str):
+                    tc.output = content
+                    tc.output_bytes = len(content.encode("utf-8", errors="replace"))
+                    if is_error_content(content):
+                        is_err = True
+                if is_err:
+                    tc.is_error = True
+                    tc.error_category = classify_error(tc.output or "")
+
+        return SessionData(
+            session_id=session_id,
+            tool_calls=tool_calls,
+            events=events,
+            timestamp=session_timestamp,
+        )
 
     def _scan_session(self, session_path: Path) -> SessionData | None:
         """Parse a single Gemini session file (JSON or JSONL)."""
