@@ -1858,6 +1858,54 @@ def _warn_once_if_owner_only_unsupported(log_path: Path) -> None:
     )
 
 
+def _headroom_log_level() -> int:
+    """Level for the ``headroom`` logger and the proxy.log handler.
+
+    ``HEADROOM_LOG_LEVEL=debug`` (or ``trace``) turns on Headroom's own debug
+    lines as well as uvicorn's; anything else keeps the INFO default, so the
+    default (``warning``, which only quiets uvicorn) never hides Headroom's
+    INFO events.
+    """
+    raw = os.environ.get("HEADROOM_LOG_LEVEL", "").strip().lower()
+    return logging.DEBUG if raw in ("debug", "trace") else logging.INFO
+
+
+class _HeadroomDebugStaysInProxyLog(logging.Filter):
+    """Drop ``headroom.*`` DEBUG records on every handler except proxy.log.
+
+    Headroom's debug lines can carry request-derived data (error messages that
+    quote a request; with HEADROOM_DEBUG_DUMP=full, the tool output the router
+    compresses). proxy.log is owner-only; stdout, container logs
+    and wrap's stdio capture are not, so debug stays out of them, exactly as
+    when debug was unreachable.
+    """
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        if record.levelno >= logging.INFO:
+            return True
+        return record.name != "headroom" and not record.name.startswith("headroom.")
+
+
+def _keep_headroom_debug_out_of_other_handlers() -> None:
+    """Filter every handler that can see ``headroom.*`` records except proxy.log.
+
+    That is the root handlers, plus any handler already attached to ``headroom``
+    or a child logger (e.g. an extension's). Records stop at proxy.log only.
+    """
+    loggers: list[logging.Logger] = [logging.getLogger(), logging.getLogger("headroom")]
+    loggers += [
+        candidate
+        for name, candidate in logging.Logger.manager.loggerDict.items()
+        if name.startswith("headroom.") and isinstance(candidate, logging.Logger)
+    ]
+    for each in loggers:
+        for handler in each.handlers:
+            if handler.get_name() == _PROXY_LOG_HANDLER_NAME:
+                continue
+            if not any(isinstance(f, _HeadroomDebugStaysInProxyLog) for f in handler.filters):
+                handler.addFilter(_HeadroomDebugStaysInProxyLog())
+
+
 def _setup_file_logging(
     port: int | None = None,
     *,
@@ -1904,7 +1952,8 @@ def _setup_file_logging(
         # Keep root propagation enabled for container stdout/stderr while
         # this handler writes the separate port/worker-specific proxy log.
         headroom_logger = logging.getLogger("headroom")
-        headroom_logger.setLevel(logging.INFO)
+        level = _headroom_log_level()
+        headroom_logger.setLevel(level)
         # Decide BEFORE constructing the handler: constructing a
         # RotatingFileHandler opens (creates) the file, so building one only to
         # discard it would leave an empty stray worker log and leak
@@ -1916,7 +1965,12 @@ def _setup_file_logging(
             for h in headroom_logger.handlers
             if isinstance(h, RotatingFileHandler) and h.name == _PROXY_LOG_HANDLER_NAME
         ]
-        if any(Path(h.baseFilename) == log_path for h in existing):
+        if level == logging.DEBUG:
+            _keep_headroom_debug_out_of_other_handlers()
+        reused = [h for h in existing if Path(h.baseFilename) == log_path]
+        if reused:
+            for h in reused:
+                h.setLevel(level)
             return
         handler = handler_cls(
             log_path,
@@ -1925,7 +1979,7 @@ def _setup_file_logging(
             encoding="utf-8",
         )
         handler.set_name(_PROXY_LOG_HANDLER_NAME)
-        handler.setLevel(logging.INFO)
+        handler.setLevel(level)
         handler.setFormatter(
             logging.Formatter("%(asctime)s - %(name)s - %(levelname)s - %(message)s")
         )
@@ -1933,6 +1987,15 @@ def _setup_file_logging(
             headroom_logger.removeHandler(stale)
             stale.close()
         headroom_logger.addHandler(handler)
+        if level == logging.DEBUG:
+            logger.warning(
+                "Headroom debug logging is on (HEADROOM_LOG_LEVEL). %s now records "
+                "request-derived data such as error messages that can quote requests; the "
+                "file is owner-only and debug lines stay out of stdout. Full tool-output "
+                "dumps also need HEADROOM_DEBUG_DUMP=full. Unset HEADROOM_LOG_LEVEL when "
+                "you finish diagnosing.",
+                log_path,
+            )
     except OSError:
         # Non-fatal: can't write logs (read-only fs, permissions, etc.)
         pass

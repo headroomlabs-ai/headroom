@@ -253,3 +253,151 @@ def test_parse_log_files_aggregates_per_port_and_legacy(workspace: Path) -> None
     # Non-PERF files never ingested.
     assert models.isdisjoint({"model-STDIO", "model-STDIO2", "model-ERR"})
     assert rids.isdisjoint({"hr_stdio", "hr_stdio2", "hr_err"})
+
+
+@pytest.fixture
+def headroom_log_state(request: pytest.FixtureRequest):
+    """Restore the headroom logger level and drop the debug filter from root handlers."""
+    from headroom.proxy import helpers
+
+    headroom_logger = logging.getLogger("headroom")
+    level = headroom_logger.level
+
+    def restore() -> None:
+        headroom_logger.setLevel(level)
+        loggers = [logging.getLogger(), headroom_logger] + [
+            lg
+            for name, lg in logging.Logger.manager.loggerDict.items()
+            if name.startswith("headroom.") and isinstance(lg, logging.Logger)
+        ]
+        for handler in [h for lg in loggers for h in lg.handlers]:
+            for f in list(handler.filters):
+                if isinstance(f, helpers._HeadroomDebugStaysInProxyLog):
+                    handler.removeFilter(f)
+
+    request.addfinalizer(restore)
+    return headroom_logger
+
+
+def _flush(headroom_logger: logging.Logger) -> None:
+    for handler in headroom_logger.handlers:
+        handler.flush()
+
+
+@pytest.mark.parametrize(
+    ("env", "debug_written"),
+    [("debug", True), ("TRACE", True), ("warning", False), ("info", False), (None, False)],
+)
+def test_headroom_log_level_debug_reaches_proxy_log(
+    workspace: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    headroom_log_state: logging.Logger,
+    env: str | None,
+    debug_written: bool,
+) -> None:
+    """``HEADROOM_LOG_LEVEL=debug`` must surface Headroom's own debug lines, not only uvicorn's."""
+    if env is None:
+        monkeypatch.delenv("HEADROOM_LOG_LEVEL", raising=False)
+    else:
+        monkeypatch.setenv("HEADROOM_LOG_LEVEL", env)
+
+    _setup_file_logging(port=9911)
+    probe = logging.getLogger("headroom.proxy.log_level_probe")
+    probe.debug("debug-probe")
+    probe.info("info-probe")
+    _flush(headroom_log_state)
+
+    text = _paths.proxy_log_path(9911).read_text()
+    assert "info-probe" in text
+    assert ("debug-probe" in text) is debug_written
+    assert ("Headroom debug logging is on" in text) is debug_written
+
+
+def test_headroom_debug_stays_out_of_stdout(
+    workspace: Path, monkeypatch: pytest.MonkeyPatch, headroom_log_state: logging.Logger
+) -> None:
+    """Debug lines can carry tool output: only the owner-only proxy.log may receive them."""
+    import io
+
+    stdout = io.StringIO()
+    root_handler = logging.StreamHandler(stdout)
+    logging.getLogger().addHandler(root_handler)
+    try:
+        monkeypatch.setenv("HEADROOM_LOG_LEVEL", "debug")
+        _setup_file_logging(port=9912)
+        probe = logging.getLogger("headroom.transforms.log_level_probe")
+        probe.debug("secret-tool-output")
+        probe.info("info-probe")
+        logging.getLogger("thirdparty.log_level_probe").warning("thirdparty-warning")
+        _flush(headroom_log_state)
+    finally:
+        logging.getLogger().removeHandler(root_handler)
+
+    assert "secret-tool-output" in _paths.proxy_log_path(9912).read_text()
+    assert "secret-tool-output" not in stdout.getvalue()
+    assert "info-probe" in stdout.getvalue()
+    assert "thirdparty-warning" in stdout.getvalue()
+
+
+def test_reused_proxy_log_picks_up_debug(
+    workspace: Path, monkeypatch: pytest.MonkeyPatch, headroom_log_state: logging.Logger
+) -> None:
+    """A second same-port setup after switching to debug must not keep the old INFO handler."""
+    monkeypatch.setenv("HEADROOM_LOG_LEVEL", "info")
+    _setup_file_logging(port=9913)
+    monkeypatch.setenv("HEADROOM_LOG_LEVEL", "debug")
+    _setup_file_logging(port=9913)
+
+    logging.getLogger("headroom.proxy.log_level_probe").debug("debug-after-reuse")
+    _flush(headroom_log_state)
+
+    assert "debug-after-reuse" in _paths.proxy_log_path(9913).read_text()
+
+
+def test_headroom_debug_stays_out_of_child_logger_handlers(
+    workspace: Path, monkeypatch: pytest.MonkeyPatch, headroom_log_state: logging.Logger
+) -> None:
+    """A handler on a headroom.* logger (e.g. an extension's) must not receive debug lines either."""
+    import io
+
+    stream = io.StringIO()
+    child = logging.getLogger("headroom.extension_probe")
+    child_handler = logging.StreamHandler(stream)
+    child.addHandler(child_handler)
+    try:
+        monkeypatch.setenv("HEADROOM_LOG_LEVEL", "debug")
+        _setup_file_logging(port=9914)
+        child.debug("secret-tool-output")
+        child.info("info-probe")
+        _flush(headroom_log_state)
+    finally:
+        child.removeHandler(child_handler)
+
+    assert "secret-tool-output" in _paths.proxy_log_path(9914).read_text()
+    assert "secret-tool-output" not in stream.getvalue()
+    assert "info-probe" in stream.getvalue()
+
+
+@pytest.mark.parametrize(("dump", "logged"), [("", False), ("full", True)])
+def test_router_content_dump_needs_the_content_opt_in(
+    monkeypatch: pytest.MonkeyPatch, headroom_log_state: logging.Logger, dump: str, logged: bool
+) -> None:
+    """HEADROOM_LOG_LEVEL=debug alone must not write the tool output the router compresses."""
+    import io
+
+    from headroom.transforms import content_router
+
+    monkeypatch.setenv("HEADROOM_DEBUG_DUMP", dump)
+    stream = io.StringIO()
+    handler = logging.StreamHandler(stream)
+    router_logger = logging.getLogger(content_router.__name__)
+    previous = router_logger.level
+    router_logger.addHandler(handler)
+    router_logger.setLevel(logging.DEBUG)
+    try:
+        content_router._log_router_debug("routing_decision", content="secret-tool-output")
+    finally:
+        router_logger.removeHandler(handler)
+        router_logger.setLevel(previous)
+
+    assert ("secret-tool-output" in stream.getvalue()) is logged

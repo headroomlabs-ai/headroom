@@ -63,6 +63,7 @@ from ..config import (
     is_tool_excluded,
     unwrap_tool_call,
 )
+from ..log_safety import content_logging_enabled
 from ..offline import OfflineEgressBlocked
 from ..parser import CCR_RETRIEVAL_MARKER_RE
 from ..tokenizer import Tokenizer
@@ -953,8 +954,14 @@ def _bash_command_is_search(command: str, search_commands: frozenset[str]) -> bo
     return prog in search_commands
 
 
+def _router_debug_enabled() -> bool:
+    """Router debug events carry the tool output being routed, so DEBUG alone is
+    not enough: they also need the explicit content opt-in."""
+    return logger.isEnabledFor(logging.DEBUG) and content_logging_enabled()
+
+
 def _log_router_debug(event: str, **payload: Any) -> None:
-    if not logger.isEnabledFor(logging.DEBUG):
+    if not _router_debug_enabled():
         return
     payload = {"event": event, **payload}
     logger.debug("event=%s %s", event, _router_debug_dumps(payload))
@@ -2871,7 +2878,7 @@ class ContentRouter(Transform):
             RouterCompressionResult with compressed content and routing metadata.
         """
         context = context or ""
-        debug_enabled = logger.isEnabledFor(logging.DEBUG)
+        debug_enabled = _router_debug_enabled()
         request_debug = (
             {
                 "chars": len(content),
@@ -3169,7 +3176,7 @@ class ContentRouter(Transform):
             sections_source,
             isolate=tuple(placeholder for placeholder, _ in protected),
         )
-        if logger.isEnabledFor(logging.DEBUG):
+        if _router_debug_enabled():
             _log_router_debug(
                 "content_router_mixed_sections",
                 section_count=len(sections),
@@ -4391,7 +4398,7 @@ class ContentRouter(Transform):
                     compressed, compressed_tokens = dense
                     strategy_chain.append("dense_elide")
                     decision_reason = f"{decision_reason}_dense_elide"
-            if logger.isEnabledFor(logging.DEBUG):
+            if _router_debug_enabled():
                 _log_router_debug(
                     "content_router_strategy_result",
                     requested_strategy=requested_strategy.value,
@@ -4451,7 +4458,7 @@ class ContentRouter(Transform):
                 )
                 return elided, elided_tokens, strategy_chain
         strategy_chain.append(CompressionStrategy.PASSTHROUGH.value)
-        if logger.isEnabledFor(logging.DEBUG):
+        if _router_debug_enabled():
             _log_router_debug(
                 "content_router_strategy_result",
                 requested_strategy=requested_strategy.value,
