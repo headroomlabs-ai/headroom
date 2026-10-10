@@ -898,16 +898,6 @@ def _shape_openai_responses_payload(
         return [], False
 
 
-def _compact_openai_tool_schema_value(
-    value: Any,
-    _parent_key: str | None = None,
-) -> Any:
-    # Delegate to shared compaction logic.
-    from headroom.proxy.tool_schema_compaction import compact_tool_schema_value
-
-    return compact_tool_schema_value(value, _parent_key)
-
-
 def _compact_openai_responses_tools(
     payload: dict[str, Any],
 ) -> tuple[dict[str, Any], bool, int, int]:

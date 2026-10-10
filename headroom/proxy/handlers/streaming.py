@@ -132,15 +132,6 @@ def _sse_event_outcome(event_name: str | None, data_str: str, dialect: str) -> t
     return failed, terminal
 
 
-def _sse_contains_error_event(payload: bytes) -> bool:
-    from headroom.proxy.helpers import parse_sse_events_from_byte_buffer
-
-    return any(
-        _sse_event_outcome(event_name, data, "chat")[0]
-        for event_name, data in parse_sse_events_from_byte_buffer(bytearray(payload))
-    )
-
-
 _ROUND_USAGE_KEYS = (
     "input_tokens",
     "output_tokens",
@@ -319,99 +310,6 @@ class StreamingMixin:
             int(cache_creation.get("ephemeral_5m_input_tokens", 0) or 0),
             int(cache_creation.get("ephemeral_1h_input_tokens", 0) or 0),
         )
-
-    def _parse_sse_usage(self, chunk: bytes, provider: str) -> dict[str, int] | None:
-        """Parse usage information from SSE chunk.
-
-        For Anthropic: Looks for message_start (input tokens) and message_delta (output tokens)
-        For OpenAI: Looks for final chunk with usage object (requires stream_options.include_usage=true)
-        For Gemini: Looks for usageMetadata in each chunk
-
-        Returns dict with keys: input_tokens, output_tokens, cache_read_input_tokens,
-        cache_creation_input_tokens, cache_creation_ephemeral_5m_input_tokens,
-        cache_creation_ephemeral_1h_input_tokens
-        Returns None if no usage found in this chunk.
-
-        PR-A8 / P1-8: Decoded via the bytes-buffer SSE splitter so multi-byte
-        characters split across TCP reads do not corrupt downstream parsing.
-        Only complete events (terminated by ``\\n\\n``) are decoded; partial
-        bytes are dropped (this method is single-chunk only — the buffered
-        path is in ``_parse_sse_usage_from_buffer``).
-        """
-        from headroom.proxy.helpers import parse_sse_events_from_byte_buffer
-
-        try:
-            buf = bytearray(chunk)
-            events = parse_sse_events_from_byte_buffer(buf)
-            for _event_name, data_str in events:
-                if not data_str or data_str == "[DONE]":
-                    continue
-
-                try:
-                    data = json.loads(data_str)
-                except json.JSONDecodeError:
-                    continue
-                if not isinstance(data, dict):
-                    continue
-
-                usage = {}
-
-                if provider == "anthropic":
-                    # Anthropic sends message_start with input tokens
-                    # and message_delta with output tokens
-                    event_type = data.get("type", "")
-
-                    if event_type == "message_start":
-                        msg_usage = _sse_dict(_sse_dict(data.get("message")).get("usage"))
-                        if msg_usage:
-                            usage["input_tokens"] = msg_usage.get("input_tokens", 0)
-                            usage["cache_read_input_tokens"] = msg_usage.get(
-                                "cache_read_input_tokens", 0
-                            )
-                            usage["cache_creation_input_tokens"] = msg_usage.get(
-                                "cache_creation_input_tokens", 0
-                            )
-                            cache_write_5m, cache_write_1h = (
-                                self._extract_anthropic_cache_ttl_metrics(msg_usage)
-                            )
-                            usage["cache_creation_ephemeral_5m_input_tokens"] = cache_write_5m
-                            usage["cache_creation_ephemeral_1h_input_tokens"] = cache_write_1h
-
-                    elif event_type == "message_delta":
-                        delta_usage = _sse_dict(data.get("usage"))
-                        if delta_usage:
-                            usage["output_tokens"] = delta_usage.get("output_tokens", 0)
-
-                elif provider == "openai":
-                    # OpenAI sends usage in final chunk (when stream_options.include_usage=true)
-                    chunk_usage = _sse_dict(data.get("usage"))
-                    if chunk_usage:
-                        usage["input_tokens"] = chunk_usage.get("prompt_tokens", 0)
-                        usage["output_tokens"] = chunk_usage.get("completion_tokens", 0)
-                        # OpenAI has cached tokens in prompt_tokens_details
-                        details = _sse_dict(chunk_usage.get("prompt_tokens_details"))
-                        usage["cache_read_input_tokens"] = details.get("cached_tokens", 0)
-
-                elif provider == "gemini":
-                    # Gemini sends usageMetadata in each streaming chunk
-                    # Format: {"usageMetadata": {"promptTokenCount": N, "candidatesTokenCount": M}}
-                    usage_meta = _sse_dict(data.get("usageMetadata"))
-                    if usage_meta:
-                        usage["input_tokens"] = usage_meta.get("promptTokenCount", 0)
-                        usage["output_tokens"] = gemini_output_tokens(usage_meta)
-                        # Gemini also has cachedContentTokenCount for context caching
-                        usage["cache_read_input_tokens"] = usage_meta.get(
-                            "cachedContentTokenCount", 0
-                        )
-
-                if usage:
-                    return usage
-
-        except (UnicodeDecodeError, KeyError, TypeError) as e:
-            # Don't fail streaming on parse errors
-            logger.debug(f"SSE usage parsing error for {provider}: {e}")
-
-        return None
 
     def _parse_sse_usage_from_buffer(
         self, stream_state: dict[str, Any], provider: str
