@@ -466,6 +466,91 @@ def test_openai_responses_adapter_reuses_exact_tool_output_cache():
     assert new_payload_two["input"][1]["output"] == "cached output summary"
 
 
+def _marker_compressing_handler(store):
+    """Handler whose router stores each original in ``store`` and emits a kompress marker."""
+    router = ContentRouter()
+    calls = {"count": 0}
+
+    def compress(self, content: str, **_kwargs):
+        calls["count"] += 1
+        hash_key = store.store(content, "summary", compression_strategy="kompress")
+        return RouterCompressionResult(
+            compressed=f"summary [Retrieve more: hash={hash_key}]",
+            original=content,
+            strategy_used=CompressionStrategy.KOMPRESS,
+        )
+
+    router.compress = MethodType(compress, router)
+    return _handler_with_router(router), calls
+
+
+def _compress_shell_output(handler, text: str, request_id: str):
+    payload = {
+        "model": "gpt-5",
+        "input": [{"type": "local_shell_call_output", "call_id": request_id, "output": text}],
+    }
+    new_payload, *_ = handler._compress_openai_responses_live_text_units_with_router(
+        payload,
+        model="gpt-5",
+        request_id=request_id,
+    )
+    return new_payload["input"][0]["output"]
+
+
+def test_openai_responses_unit_cache_recompresses_when_ccr_entry_expired():
+    # The unit cache has no TTL; the CCR entry behind its marker does. Reusing the
+    # cached result after the entry expired would ship a marker no retrieval can
+    # redeem, so the unit must be compressed (and its entry stored) again.
+    from headroom.cache.compression_store import (
+        CompressionStore,
+        clear_request_compression_store,
+        set_request_compression_store,
+    )
+
+    store = CompressionStore(max_entries=100, default_ttl=60)
+    set_request_compression_store(store)
+    try:
+        handler, calls = _marker_compressing_handler(store)
+        long_text = " ".join(f"word{i}" for i in range(180))
+
+        first = _compress_shell_output(handler, long_text, "req_expire_one")
+        hash_key = first.rsplit("hash=", 1)[1].rstrip("]")
+        assert store.exists(hash_key)
+
+        store._backend.delete(hash_key)  # what TTL expiry does to the entry
+        assert not store.exists(hash_key)
+
+        second = _compress_shell_output(handler, long_text, "req_expire_two")
+
+        assert calls["count"] == 2
+        assert second == first
+        assert store.exists(hash_key)
+    finally:
+        clear_request_compression_store()
+
+
+def test_openai_responses_unit_cache_reuses_result_while_ccr_entry_live():
+    from headroom.cache.compression_store import (
+        CompressionStore,
+        clear_request_compression_store,
+        set_request_compression_store,
+    )
+
+    store = CompressionStore(max_entries=100, default_ttl=60)
+    set_request_compression_store(store)
+    try:
+        handler, calls = _marker_compressing_handler(store)
+        long_text = " ".join(f"word{i}" for i in range(180))
+
+        first = _compress_shell_output(handler, long_text, "req_live_one")
+        second = _compress_shell_output(handler, long_text, "req_live_two")
+
+        assert calls["count"] == 1
+        assert second == first
+    finally:
+        clear_request_compression_store()
+
+
 def test_openai_responses_adapter_reuses_identical_tool_output_in_same_request():
     router = ContentRouter()
     calls = {"count": 0}
