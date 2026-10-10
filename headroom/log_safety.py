@@ -43,6 +43,17 @@ _IDENTIFIER = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
 _FIXED_CODE_NAMES = frozenset(
     {"<module>", "<lambda>", "<genexpr>", "<listcomp>", "<dictcomp>", "<setcomp>"}
 )
+# The base classes' own attribute descriptors. Reading through them means no
+# subclass property (a __cause__ or errno that raises, a __qualname__ chosen by
+# a metaclass) can run while a failure is being described.
+_CAUSE = vars(BaseException)["__cause__"]
+_CONTEXT = vars(BaseException)["__context__"]
+_SUPPRESS_CONTEXT = vars(BaseException)["__suppress_context__"]
+_TRACEBACK = vars(BaseException)["__traceback__"]
+_ERRNO = vars(OSError)["errno"]
+_QUALNAME = vars(type)["__qualname__"]
+# Ints above this many bits have more than 4300 digits, which repr refuses.
+_MAX_ID_INT_BITS = 14_000
 # The module __dict__ descriptor itself, so a ModuleType subclass cannot override it.
 _MODULE_DICT = vars(ModuleType)["__dict__"]
 # Schemes a log may name; any other text before "://" could be a key someone
@@ -93,30 +104,31 @@ def describe_exception(exc: BaseException) -> str:
     while current is not None and id(current) not in seen and len(parts) < _MAX_CHAIN:
         seen.add(id(current))
         parts.append(_describe_one(current))
-        current = current.__cause__ or (
-            None if current.__suppress_context__ else current.__context__
+        current = _CAUSE.__get__(current) or (
+            None if _SUPPRESS_CONTEXT.__get__(current) else _CONTEXT.__get__(current)
         )
     return "; caused by ".join(parts)
 
 
 def _describe_one(exc: BaseException) -> str:
     # A class name is chosen by whoever defined it (type("Err\nforged", ...)).
-    qualname = type(exc).__qualname__
+    qualname = _QUALNAME.__get__(type(exc))
     text = qualname if type(qualname) is str and qualname.isprintable() else "<exception>"
     # An int subclass errno could format itself as anything, so only a plain int.
-    if isinstance(exc, OSError) and type(exc.errno) is int:
+    errno = _ERRNO.__get__(exc) if issubclass(type(exc), OSError) else None
+    if type(errno) is int:
         # The system's own text for the errno; exc.strerror is free text in some
         # subclasses (ssl.SSLError) and can quote a path or a peer's message.
         # An out-of-range errno is not formatted at all: converting a huge int
         # to text can itself raise, and a log helper must never raise.
         # Negative codes (socket.gaierror's EAI_*) have no os.strerror text.
-        if 0 <= exc.errno <= _MAX_ERRNO:
-            text += f" [Errno {exc.errno}] {_errno_text(exc.errno)}"
-        elif -_MAX_ERRNO - 1 <= exc.errno < 0:
-            text += f" [Errno {exc.errno}]"
+        if 0 <= errno <= _MAX_ERRNO:
+            text += f" [Errno {errno}] {_errno_text(errno)}"
+        elif -_MAX_ERRNO - 1 <= errno < 0:
+            text += f" [Errno {errno}]"
         else:
             text += " [Errno out of range]"
-    frames = _innermost_headroom_frames(exc.__traceback__)
+    frames = _innermost_headroom_frames(_TRACEBACK.__get__(exc))
     if frames:
         text += " at " + " <- ".join(reversed(frames))
     return text
@@ -222,18 +234,32 @@ def _is_host(host: str) -> bool:
 def safe_id(value: object) -> str:
     """Render a client- or model-supplied id as one bounded log token.
 
-    Uses ``repr`` so a newline in the id cannot forge a second log line, and
-    cuts it to a fixed length so an oversized id cannot flood the log.
+    Uses the built-in ``repr`` of ``str``, ``bytes`` and numbers, so a newline
+    in the id cannot forge a second log line and no ``__repr__`` of the
+    caller's object runs; any other type is shown by its name. Cuts the result
+    to a fixed length so an oversized id cannot flood the log.
     """
-    try:
-        text = repr(value)
-    # repr of a >4300-digit int raises ValueError; a broken __repr__ usually
-    # raises one of the others. A log helper must not raise for them.
-    except (ValueError, TypeError, AttributeError, RuntimeError):
-        return "<unrepresentable id>"
+    text = _builtin_repr(value)
     if len(text) <= _ID_MAX_CHARS:
         return text
     return f"{text[:_ID_MAX_CHARS]}…(+{len(text) - _ID_MAX_CHARS} chars)"
+
+
+def _builtin_repr(value: object) -> str:
+    if value is None or type(value) is bool:
+        return repr(value)
+    if isinstance(value, str):
+        return str.__repr__(value)
+    if isinstance(value, bytes):
+        return bytes.__repr__(value)
+    if isinstance(value, int):
+        if int.bit_length(value) > _MAX_ID_INT_BITS:
+            return f"<int of {int.bit_length(value)} bits>"
+        return int.__repr__(value)
+    if isinstance(value, float):
+        return float.__repr__(value)
+    name = _QUALNAME.__get__(type(value))
+    return f"<{name}>" if type(name) is str and name.isprintable() else "<object>"
 
 
 class WarnOnce:

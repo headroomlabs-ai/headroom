@@ -333,8 +333,8 @@ def test_safe_id_never_raises() -> None:
             raise RuntimeError("repr")
 
     huge = 10 ** int("5000")
-    assert safe_id(huge) == "<unrepresentable id>"
-    assert safe_id(BadRepr()) == "<unrepresentable id>"
+    assert safe_id(huge) == "<int of 16610 bits>"
+    assert safe_id(BadRepr()) == f"<{BadRepr.__qualname__}>"
 
 
 @pytest.mark.parametrize("window", [math.inf, math.nan, 0, -1])
@@ -471,3 +471,38 @@ def test_redact_url_hosts_and_hostless_schemes(
 ) -> None:
     monkeypatch.delenv("HEADROOM_DEBUG_DUMP", raising=False)
     assert redact_url(url) == expected
+
+
+@pytest.mark.parametrize("error", [RuntimeError, LookupError, OSError, OverflowError, KeyError])
+def test_safe_id_never_runs_the_callers_repr(error: type[Exception]) -> None:
+    class RaisingStr(str):
+        def __repr__(self) -> str:
+            raise error("repr")
+
+    assert safe_id(RaisingStr("model-x")) == "'model-x'"
+
+
+def test_broken_exception_attributes_never_break_the_description(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("HEADROOM_DEBUG_DUMP", raising=False)
+
+    class Broken(OSError):
+        @property  # type: ignore[override]
+        def __cause__(self) -> BaseException:
+            raise LookupError("cause")
+
+        @property  # type: ignore[override]
+        def __traceback__(self) -> None:
+            raise RuntimeError("traceback")
+
+        @property  # type: ignore[override]
+        def errno(self) -> int:
+            raise OverflowError("errno")
+
+    error = Broken(2, "x")
+    error.__context__ = KeyError("k")
+
+    assert describe_exception(error) == (
+        f"{Broken.__qualname__} [Errno 2] {os.strerror(2)}; caused by KeyError"
+    )
