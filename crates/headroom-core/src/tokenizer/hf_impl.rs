@@ -371,7 +371,17 @@ mod tests {
         // request. Locks in that we propagate Hub errors as `Hub`, not
         // `Load`, so callers can distinguish "couldn't fetch" from
         // "fetched but malformed".
+        //
+        // Runs online: hold the env lock so a parallel test's
+        // `HEADROOM_OFFLINE=1` can't turn this into `Offline`, and clear an
+        // inherited value for the same reason.
+        let _guard = crate::test_support::env_lock();
+        let inherited = std::env::var_os(crate::offline::OFFLINE_ENV);
+        std::env::remove_var(crate::offline::OFFLINE_ENV);
         let r = HfTokenizer::from_pretrained("");
+        if let Some(value) = inherited {
+            std::env::set_var(crate::offline::OFFLINE_ENV, value);
+        }
         assert!(
             matches!(r, Err(HfTokenizerError::Hub { .. })),
             "expected HfTokenizerError::Hub, got {r:?}"
