@@ -5,14 +5,14 @@
   },
   "metadata": {
     "description": "Headroom marketplace for Claude Code and GitHub Copilot CLI plugins.",
-    "version": "0.37.0"
+    "version": "0.40.0"
   },
   "plugins": [
     {
       "name": "headroom",
       "source": "./plugins/headroom-agent-hooks",
       "description": "Headroom startup hooks for Claude Code and GitHub Copilot CLI.",
-      "version": "0.37.0",
+      "version": "0.40.0",
       "author": {
         "name": "Headroom Contributors",
         "url": "https://github.com/headroomlabs-ai/headroom"
@@ -24,6 +24,25 @@
         "hooks",
         "claude-code",
         "copilot-cli"
+      ]
+    },
+    {
+      "name": "headroom-snip",
+      "source": "./plugins/headroom-snip",
+      "description": "Claude Code mod: watch Headroom snip tokens off every request, with an animated band, a /headroom log and a running total.",
+      "version": "0.40.0",
+      "author": {
+        "name": "Headroom Contributors",
+        "url": "https://github.com/headroomlabs-ai/headroom"
+      },
+      "homepage": "https://github.com/headroomlabs-ai/headroom",
+      "repository": "https://github.com/headroomlabs-ai/headroom",
+      "keywords": [
+        "headroom",
+        "claude-code",
+        "tokens",
+        "compression",
+        "mod"
       ]
     }
   ]

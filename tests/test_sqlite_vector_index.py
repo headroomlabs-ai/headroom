@@ -78,6 +78,36 @@ class TestSQLiteVectorIndex:
         assert results[0].similarity > 0.99  # Should be ~1.0 for exact match
 
     @pytest.mark.asyncio
+    async def test_search_skips_corrupt_row_instead_of_aborting(self, index):
+        """A single vec_metadata row with an unparseable created_at (or malformed
+        metadata_json) must not abort the whole search. #2947 healed the
+        entity_refs shape for this reason, but created_at/metadata_json in the
+        same loop were unguarded, so one bad row lost every other result."""
+        np.random.seed(1)
+        good = Memory(
+            content="good", user_id="alice", embedding=np.random.randn(384).astype(np.float32)
+        )
+        bad = Memory(
+            content="bad", user_id="alice", embedding=np.random.randn(384).astype(np.float32)
+        )
+        await index.index(good)
+        await index.index(bad)
+
+        # Simulate a schema-drift / partially written row on disk.
+        conn = index._get_conn()
+        conn.execute(
+            "UPDATE vec_metadata SET created_at=? WHERE memory_id=?", ("not-a-date", bad.id)
+        )
+        conn.commit()
+
+        filter = VectorFilter(query_vector=good.embedding, top_k=5, user_id="alice")
+        results = await index.search(filter)  # must not raise
+
+        ids = {r.memory.id for r in results}
+        assert good.id in ids  # the good result survives
+        assert bad.id not in ids  # the corrupt row is skipped, not fatal
+
+    @pytest.mark.asyncio
     async def test_true_delete(self, index):
         """Test that delete actually removes entries."""
         np.random.seed(42)

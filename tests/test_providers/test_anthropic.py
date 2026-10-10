@@ -136,6 +136,32 @@ class TestLongContextPricing:
         )
         assert cost == pytest.approx(expected, rel=1e-4)
 
+    def test_premium_survives_litellm_dropping_the_long_context_rate(self, provider, monkeypatch):
+        """A LiteLLM entry without the above-200K rate must not bill a long prompt at the base tier."""
+        litellm = pytest.importorskip("litellm")
+        import headroom.providers.anthropic as anthropic_module
+
+        # One map for both readers: the guard and litellm's own cost_per_token.
+        monkeypatch.setitem(
+            litellm.model_cost,
+            "claude-sonnet-4-5",
+            {
+                "litellm_provider": "anthropic",
+                "mode": "chat",
+                "input_cost_per_token": 3e-06,
+                "output_cost_per_token": 1.5e-05,
+                "cache_read_input_token_cost": 3e-07,
+            },
+        )
+
+        assert provider.estimate_cost(300_000, 5_000, "claude-sonnet-4-5", 0) == pytest.approx(
+            1.9125, rel=1e-4
+        )
+        # Below the threshold the LiteLLM path still prices it.
+        assert (
+            anthropic_module._litellm_lacks_long_context_rate("claude-sonnet-4-5", 100_000) is False
+        )
+
     def test_untiered_model_is_not_charged_a_premium(self, manual_provider):
         # Opus is flat-rated across its whole window: 300K*$5 + 5K*$25 = $1.625.
         cost = manual_provider.estimate_cost(300_000, 5_000, "claude-opus-4-5-20251101", 0)
@@ -287,5 +313,28 @@ class TestAnthropicCostEstimation:
         opus = anthropic_provider._get_pricing("claude-opus-4-8")
         assert opus == {"input": 5.00, "output": 25.00, "cached_input": 0.50}
 
+        # The scheduled rise to $3/$15 on 2026-09-01 was cancelled; $2/$10 is standard.
         sonnet = anthropic_provider._get_pricing("claude-sonnet-5")
-        assert sonnet == {"input": 3.00, "output": 15.00, "cached_input": 0.30}
+        assert sonnet == {"input": 2.00, "output": 10.00, "cached_input": 0.20}
+
+    @pytest.mark.parametrize(
+        ("model", "expected"),
+        [
+            ("claude-fable-5-1", {"input": 10.00, "output": 50.00, "cached_input": 0.25}),
+            ("claude-opus-5-5", {"input": 4.00, "output": 20.00, "cached_input": 0.20}),
+            ("claude-opus-5", {"input": 5.00, "output": 25.00, "cached_input": 0.50}),
+            ("claude-sonnet-5-5", {"input": 2.00, "output": 10.00, "cached_input": 0.20}),
+            # Suffixed ids must resolve to their own row, not a shorter prefix's.
+            ("claude-sonnet-5-5[1m]", {"input": 2.00, "output": 10.00, "cached_input": 0.20}),
+            ("claude-fable-5-1-20261001", {"input": 10.00, "output": 50.00, "cached_input": 0.25}),
+            ("claude-opus-5-5-20261001", {"input": 4.00, "output": 20.00, "cached_input": 0.20}),
+        ],
+    )
+    def test_pricing_claude_5_point_releases(self, anthropic_provider, model, expected):
+        assert anthropic_provider._get_pricing(model) == expected
+
+    @pytest.mark.parametrize(
+        "model", ["claude-fable-5-1", "claude-opus-5-5", "claude-opus-5", "claude-sonnet-5-5"]
+    )
+    def test_context_limit_claude_5_point_releases(self, anthropic_provider, model):
+        assert anthropic_provider.get_context_limit(model) == 1_000_000

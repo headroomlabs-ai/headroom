@@ -31,6 +31,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any
 
+from headroom.proxy.conversation_savings import get_conversation_savings
 from headroom.proxy.tool_schema_savings_policy import (
     headline_tokens_saved,
     tool_schema_saved_from_tags,
@@ -188,6 +189,20 @@ class RequestOutcome:
     #     one-field-add that proves the refactor pays out: per-
     #     harness visibility appears across EVERY handler with zero
     #     new bookkeeping at the call sites.
+    # conversation_key: stable across every turn of one conversation, from
+    #     ``conversation_key_from_body``. Paired with
+    #     ``conversation_tokens_saved`` it lets the funnel tell a first-time
+    #     removal from a re-run of one already counted. Both stay ``None`` on
+    #     paths whose ``tokens_saved`` is already novel-only -- every provider
+    #     that freezes its cached prefix, which is all of them except OpenAI's
+    #     ``/v1/responses``. See ``conversation_savings``.
+    # conversation_tokens_saved: the conversation's RUNNING removed-token
+    #     total as of this request, which on ``/v1/responses`` is what the
+    #     compressor reports every turn because it recompresses the whole
+    #     transcript. Not the same quantity as ``tokens_saved`` on the WS
+    #     path, where the outcome carries a per-turn delta.
+    conversation_key: str | None = None
+    conversation_tokens_saved: int | None = None
     transforms_applied: tuple[str, ...] = ()
     waste_signals: dict[str, int] | None = None
     num_messages: int = 0
@@ -304,6 +319,7 @@ class RequestOutcome:
         overhead_ms: float,
         tags: dict[str, str] | None,
         client: str | None,
+        status_code: int = 200,
         log_full_messages: bool = False,
         cache_read_tokens: int = 0,
         cache_write_tokens: int = 0,
@@ -319,6 +335,9 @@ class RequestOutcome:
         pipeline_timing: dict[str, float] | None = None,
         waste_signals: dict[str, int] | None = None,
         original_messages: list[dict] | None = None,
+        conversation_key: str | None = None,
+        conversation_tokens_saved: int | None = None,
+        provider_input_tokens: int = 0,
     ) -> RequestOutcome:
         """Construct an outcome from the locals available at streaming
         finalize. Three streaming finalizers
@@ -389,9 +408,13 @@ class RequestOutcome:
             model=model,
             original_tokens=original_tokens,
             optimized_tokens=optimized_tokens,
+            provider_input_tokens=max(int(provider_input_tokens or 0), 0),
             output_tokens=output_tokens,
             tokens_saved=tokens_saved,
+            conversation_key=conversation_key,
+            conversation_tokens_saved=conversation_tokens_saved,
             attempted_input_tokens=optimized_tokens + tokens_saved,
+            status_code=status_code,
             cache_read_tokens=cache_read_tokens,
             cache_write_tokens=cache_write_tokens,
             cache_write_5m_tokens=cache_write_5m_tokens,
@@ -420,6 +443,29 @@ class RequestOutcome:
 # ── The funnel ───────────────────────────────────────────────────────
 
 
+_estimated_input_warned: set[tuple[str, str]] = set()
+
+
+def _warn_estimated_input(provider: str, model: str) -> None:
+    """Log once per (provider, model) when a request's input volume is an estimate.
+
+    Every successful response from Anthropic, OpenAI and Gemini carries usage,
+    so landing here on those providers means a code path dropped it. The
+    request still records (fail open), but the volume it contributes is
+    Headroom's tokenizer estimate, not the bill, and the coverage counters say so.
+    """
+    key = (str(provider), str(model))
+    if key in _estimated_input_warned or len(_estimated_input_warned) >= 256:
+        return
+    _estimated_input_warned.add(key)
+    logger.warning(
+        "event=input_tokens_estimated provider=%s model=%s: no provider usage on this "
+        "request; input volume recorded from Headroom's local tokenizer estimate",
+        provider,
+        model,
+    )
+
+
 async def emit_request_outcome(handler: Any, outcome: RequestOutcome) -> None:
     """Single funnel for per-request bookkeeping. The contract.
 
@@ -435,9 +481,10 @@ async def emit_request_outcome(handler: Any, outcome: RequestOutcome) -> None:
          (skipped when logger is None, i.e. ``--no-request-logging``)
       4. structured PERF log line — consumed by ``headroom perf``
 
-    A failure outcome (``status_code >= 500``, e.g. a 529 surfaced after retry
-    exhaustion) short-circuits before effects 1-4: it records a failed request
-    and returns, so an upstream failure cannot feed the success stats.
+    A rejected outcome (``status_code >= 400``, e.g. a 429 rate limit or a 529
+    surfaced after retry exhaustion) short-circuits before effects 1-4: it
+    records the request under the counter that names what happened and returns,
+    so a turn the provider never billed cannot feed the success stats.
 
     Takes the handler as a free argument rather than ``self`` so this
     function is callable from:
@@ -491,14 +538,36 @@ async def emit_request_outcome(handler: Any, outcome: RequestOutcome) -> None:
     #    beacon must never add latency to, or take down, the request path.
     record_outcome(outcome)
 
-    # Upstream failure (>= 500, e.g. a 529 Overloaded surfaced after retry
-    # exhaustion) must not feed the savings/cost/log success stats; that would
-    # let a failed request inflate the save-rate. Record it as failed and stop,
-    # mirroring the pre-passthrough behaviour where an exhausted 5xx raised and
-    # was counted via record_failed. 4xx stay on the normal funnel: they are
-    # client errors the proxy still served.
-    if outcome.status_code >= 500:
-        await handler.metrics.record_failed(provider=outcome.provider)
+    # A rejected turn must not feed the savings/cost/log success stats; that
+    # would let a request the provider never billed inflate the save-rate.
+    # Record it under the counter that names what happened, and stop.
+    #
+    # This covers 4xx as well as 5xx. A 4xx is an error the PROXY served but the
+    # PROVIDER did not: nothing was generated, so nothing was billed, so
+    # compression on that turn saved exactly nothing. Counting it anyway is not a
+    # rounding error — measured on a real session where 143 of 300 turns came
+    # back 429 ("Usage credits are required for fast mode"), 46.5% of the
+    # headline `total_saved` was compression on turns Anthropic rejected, and
+    # `requests.rate_limited` still read 0 because only Headroom's own limiter
+    # ever incremented it. The 60M `tokens.input` and the $8.90 compression
+    # savings shown against a $2.26 measured spend came from the same place.
+    #
+    # 429 goes to record_rate_limited rather than record_failed: an upstream rate
+    # limit is the one 4xx a user is expected to act on (back off, raise a cap),
+    # and folding it into a generic failure count hides exactly that. Both
+    # counters are already exported and neither feeds savings.
+    #
+    # source="upstream": this funnel only ever sees a 429 the PROVIDER returned.
+    # Headroom's own limiter rejects before a request is ever sent and records
+    # source="headroom" from the handler. The two are acted on differently —
+    # raise our cap vs. back off / shard keys — so they must stay separable
+    # (issue #3696). ``outcome.provider`` is the already-Copilot-relabelled
+    # value, matching every other provider-labelled metric on this path.
+    if outcome.status_code >= 400:
+        if outcome.status_code == 429:
+            await handler.metrics.record_rate_limited(provider=outcome.provider, source="upstream")
+        else:
+            await handler.metrics.record_failed(provider=outcome.provider)
         return
 
     # Outcome stage: hand the meter's reading to any pipeline extension that
@@ -567,6 +636,18 @@ async def emit_request_outcome(handler: Any, outcome: RequestOutcome) -> None:
     # HTTP middleware / WS accept captured from ``X-Headroom-Project``.
     project = outcome.project or get_current_project()
 
+    # Savings that are new to this conversation. Per-request descriptions
+    # below keep ``outcome.tokens_saved`` -- the wire truth for THIS request --
+    # while everything that accumulates across turns uses this, so a removed
+    # token is counted once per conversation instead of once per turn. Falls
+    # back to ``tokens_saved`` on paths that do not distinguish, which is
+    # already the novel figure there. See ``conversation_savings``.
+    novel_tokens_saved = get_conversation_savings().novel(
+        outcome.conversation_key, outcome.conversation_tokens_saved
+    )
+    if novel_tokens_saved is None:
+        novel_tokens_saved = outcome.tokens_saved
+
     # Tool-schema savings (deferral + turn-hook tool shrink) live in per-request
     # tags and never move tok_before/after; aggregate them into Metrics so the
     # session summary / cost summary / all-layers total can surface the layer.
@@ -596,6 +677,9 @@ async def emit_request_outcome(handler: Any, outcome: RequestOutcome) -> None:
     # Deliberately NOT used for any delta: differencing this against
     # ``original_tokens`` mixes tokenizer scales. See the field docs.
     billed_input_tokens = outcome.provider_input_tokens or outcome.optimized_tokens
+    input_provider_reported = outcome.provider_input_tokens > 0
+    if not input_provider_reported and billed_input_tokens > 0:
+        _warn_estimated_input(outcome.provider, outcome.model)
 
     # 1. Prometheus / SavingsTracker.
     await handler.metrics.record_request(
@@ -603,7 +687,7 @@ async def emit_request_outcome(handler: Any, outcome: RequestOutcome) -> None:
         model=outcome.model,
         input_tokens=billed_input_tokens,
         output_tokens=outcome.output_tokens,
-        tokens_saved=outcome.tokens_saved,
+        tokens_saved=novel_tokens_saved,
         latency_ms=outcome.total_latency_ms,
         cached=outcome.cache_hit,
         overhead_ms=outcome.overhead_ms,
@@ -622,6 +706,13 @@ async def emit_request_outcome(handler: Any, outcome: RequestOutcome) -> None:
         tool_search_saved=tool_search_saved,
         local_input_tokens=outcome.optimized_tokens,
         savings_attribution=savings_breakdown,
+        # Already handed to the cost tracker below; the metrics path needs it
+        # too now that it prices savings cache-aware. An inferred write is the
+        # same tokens as `uncached_input_tokens` and carries no write premium,
+        # so counting it as a write would both double it and apply a premium
+        # OpenAI never charges.
+        cache_inferred=outcome.cache_inferred,
+        input_provider_reported=input_provider_reported,
     )
 
     # 2. Cost tracker (optional).
@@ -629,7 +720,7 @@ async def emit_request_outcome(handler: Any, outcome: RequestOutcome) -> None:
     if cost_tracker is not None:
         cost_tracker.record_tokens(
             outcome.model,
-            outcome.tokens_saved,
+            novel_tokens_saved,
             billed_input_tokens,
             cache_read_tokens=outcome.cache_read_tokens,
             cache_write_tokens=outcome.cache_write_tokens,
@@ -642,6 +733,7 @@ async def emit_request_outcome(handler: Any, outcome: RequestOutcome) -> None:
             # cost tracker feeds the dashboard's per-model table, which read
             # compression only while its own headline counted both layers.
             tool_schema_saved=tool_search_saved,
+            provider_reported=input_provider_reported,
         )
 
     # 3. Per-request log (optional). The ``client`` outcome field is
@@ -691,6 +783,11 @@ async def emit_request_outcome(handler: Any, outcome: RequestOutcome) -> None:
     #    line unchanged, and gives ``headroom perf --client X``
     #    parsers a clean key to filter on.
     client_part = f" client={outcome.client}" if outcome.client else ""
+    # Only when it differs: on every path that reports novel-only savings the
+    # two are equal and a second identical number is noise.
+    novel_part = (
+        f"tok_novel={novel_tokens_saved} " if novel_tokens_saved != outcome.tokens_saved else ""
+    )
     # ``cached=1`` marks a turn answered from Headroom's own response cache.
     # Such a turn never contacts the upstream, so it has no outbound_request
     # line, no upstream stage timings, and all-zero token counters — which
@@ -713,6 +810,7 @@ async def emit_request_outcome(handler: Any, outcome: RequestOutcome) -> None:
         f"model={outcome.model} msgs={outcome.num_messages} "
         f"tok_before={outcome.original_tokens} tok_after={outcome.optimized_tokens} "
         f"tok_saved={outcome.tokens_saved} "
+        f"{novel_part}"
         f"tok_inflated={outcome.tokens_inflated} "
         f"tool_saved={tool_saved} "
         f"total_saved={total_saved} "

@@ -41,9 +41,14 @@ class TokenCountCache:
     characters are capped.
 
     No lock: ``dict`` get/set/clear are atomic under the GIL, and the pipeline
-    runs on a thread pool. An LRU would need ``move_to_end``, which is not
-    atomic — hence clear-on-full rather than eviction. A cleared cache costs one
-    re-encode, never a wrong answer.
+    runs on a thread pool. A true LRU would need ``move_to_end`` on every hit,
+    which is not atomic — hence no per-key eviction. A full cache still clears,
+    but only on the one put that admits a new key past the cap: repeated
+    re-counts of *known* texts (an agent loop re-counting a stable prefix on
+    every request) are pure dict hits and never trip the eviction, so the
+    classic storm — one fresh tool_result per request evicting the whole
+    cache and forcing a full-prefix re-encode — cannot happen. A cleared
+    cache costs one re-encode, never a wrong answer.
     """
 
     __slots__ = ("_chars", "_counts", "_max_chars", "_max_entries", "_min_chars")
@@ -66,7 +71,17 @@ class TokenCountCache:
         return self._counts.get(text)
 
     def put(self, text: str, count: int) -> None:
-        """Store *count* for *text* if it is worth caching."""
+        """Store *count* for *text* if it is worth caching.
+
+        A re-count of an entry already in the cache is a hit, not an
+        admission: updating the stored value cannot grow the cache, so it
+        must not run the eviction check (a dict hit would clear the whole
+        cache and force a full re-encode of every cached message on the
+        next miss — the storm this exists to prevent).
+        """
+        if text in self._counts:
+            self._counts[text] = count
+            return
         if len(text) < self._min_chars:
             return
         if len(self._counts) >= self._max_entries or self._chars >= self._max_chars:
@@ -328,6 +343,23 @@ class BaseTokenizer(ABC):
                         total += frames * 1000
                     else:
                         total += 3200
+                elif part_type == "thinking":
+                    # Anthropic extended thinking replayed by the client. The
+                    # ``signature`` is the encrypted full reasoning: on the
+                    # keep-all-turns models (Opus 4.5+, Sonnet 4.6+, the 5.x
+                    # line) the server decrypts it into the prompt and bills
+                    # it as input, and under ``display: "omitted"`` (the 5.x
+                    # default) the ``thinking`` text is empty, so text alone
+                    # is not the input. Nor is the base64: the JSON catch-all
+                    # below priced it as prose at ~3 chars/token, and on a
+                    # 369-message Claude Code session 99 signatures counted
+                    # 256K of 414K tokens against ~313K provider-reported.
+                    # Price the text plus the decoded signature bytes at
+                    # ~4 bytes/token (len * 3/4 / 4), which lands that session
+                    # near the provider figure and never prices an omitted
+                    # block at zero.
+                    total += self.count_text(part.get("thinking", "") or "")
+                    total += len(part.get("signature") or "") * 3 // 16
                 else:
                     # Unknown type - estimate from JSON
                     total += self._count_serialized(part)

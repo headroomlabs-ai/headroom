@@ -206,12 +206,15 @@ temp/
 .benchmarks/
 benchmark_results.json
 benchmark_results/
+examples/vertex_gemini_benchmark/results.json
 
 # DeepEval cache
 .deepeval/
 
 # Headroom specific
 .headroom/
+.claude/.headroom_wrap_*.json
+.claude/.headroom_wrap_settings.lock
 headroom.db
 headroom_*.db
 *.jsonl

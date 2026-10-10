@@ -4,6 +4,7 @@ import json
 import logging
 from importlib import import_module
 from types import SimpleNamespace
+from unittest.mock import MagicMock
 
 import pytest
 from click.testing import CliRunner
@@ -15,6 +16,7 @@ from headroom.agent_savings import (
     apply_agent_savings_profile,
     get_agent_savings_profile,
     proxy_pipeline_kwargs,
+    seed_proxy_env_defaults,
     with_target_savings,
 )
 from headroom.cli import wrap as wrap_module
@@ -167,6 +169,18 @@ def test_agent_savings_env_defaults_preserve_user_overrides() -> None:
     assert env["HEADROOM_SMART_CRUSHER_COMPACTION"] == "0"
 
 
+def test_seed_proxy_env_defaults_reports_only_generated_keys() -> None:
+    env = {"HEADROOM_MODE": "token", "HEADROOM_LOSSLESS": "1"}
+
+    seeded = seed_proxy_env_defaults(env)
+
+    assert "HEADROOM_MODE" not in seeded
+    assert "HEADROOM_LOSSLESS" not in seeded
+    assert "HEADROOM_SAVINGS_PROFILE" in seeded
+    assert env["HEADROOM_MODE"] == "token"
+    assert env["HEADROOM_LOSSLESS"] == "1"
+
+
 def test_unknown_agent_savings_profile_falls_back_to_default(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
@@ -285,6 +299,35 @@ def test_compress_savings_profile_does_not_mutate_supplied_config(monkeypatch) -
     assert config.min_tokens_to_compress == 999
 
 
+def test_force_kompress_falls_back_to_structural_compression_when_cold(monkeypatch):
+    """A cold forced-ML profile must not hide safe content routing."""
+    import headroom.transforms.content_router as router_mod
+
+    router = ContentRouter(ContentRouterConfig())
+    compressor = SimpleNamespace(is_ready=lambda: False, ensure_background_load=MagicMock())
+    log_compressor = SimpleNamespace(
+        compress=lambda content, bias=1.0: SimpleNamespace(compressed="ERROR: compacted")
+    )
+    router._get_kompress = lambda: compressor
+    router._get_log_compressor = lambda: log_compressor
+    router._runtime_force_kompress = True
+    router._runtime_skip_kompress = False
+    router._runtime_target_ratio = None
+    router.config.enable_log_compressor = True
+    monkeypatch.setattr(
+        router_mod,
+        "_detect_content",
+        lambda content: router_mod.DetectionResult(router_mod.ContentType.BUILD_OUTPUT, 1.0, {}),
+    )
+    monkeypatch.setattr(router_mod, "is_mixed_content", lambda content: False)
+
+    result = router.compress("ERROR: repeated output\\n" * 40)
+
+    assert result.compressed == "ERROR: compacted"
+    assert result.strategy_used == CompressionStrategy.LOG
+    compressor.ensure_background_load.assert_called_once()
+
+
 def test_wrap_agent_savings_profile_is_opt_in(monkeypatch) -> None:
     monkeypatch.delenv("HEADROOM_SAVINGS_PROFILE", raising=False)
 
@@ -318,7 +361,7 @@ def test_start_proxy_does_not_inject_agent_savings_by_default(monkeypatch, tmp_p
     monkeypatch.setattr(wrap_module.subprocess, "Popen", popen)
     monkeypatch.setattr(wrap_module.time, "sleep", lambda seconds: None)
     monkeypatch.setattr(wrap_module, "_check_proxy", lambda port: True)
-    monkeypatch.setattr(wrap_module, "_get_log_path", lambda: tmp_path / "proxy.log")
+    monkeypatch.setattr(wrap_module, "_get_log_path", lambda port=None: tmp_path / "proxy.log")
 
     wrap_module._start_proxy(8787, agent_type="codex")
 
@@ -343,7 +386,7 @@ def test_start_proxy_injects_explicit_agent_savings_profile(monkeypatch, tmp_pat
     monkeypatch.setattr(wrap_module.subprocess, "Popen", popen)
     monkeypatch.setattr(wrap_module.time, "sleep", lambda seconds: None)
     monkeypatch.setattr(wrap_module, "_check_proxy", lambda port: True)
-    monkeypatch.setattr(wrap_module, "_get_log_path", lambda: tmp_path / "proxy.log")
+    monkeypatch.setattr(wrap_module, "_get_log_path", lambda port=None: tmp_path / "proxy.log")
 
     wrap_module._start_proxy(8787, agent_type="codex")
 
@@ -447,6 +490,17 @@ def test_proxy_explicit_config_overrides_agent_90_profile() -> None:
     assert kwargs["target_ratio"] == 0.25
     assert kwargs["protect_recent"] == 5
     assert kwargs["min_tokens_to_compress"] == 300
+
+
+def test_proxy_explicit_compress_user_messages_off_overrides_coding_profile() -> None:
+    # coding turns user-message compression on; an explicit off
+    # (HEADROOM_COMPRESS_USER_MESSAGES=0) must win like every other override,
+    # and leaving it unset must keep the profile default.
+    explicit_off = ProxyConfig(savings_profile="coding", compress_user_messages=False)
+    unset = ProxyConfig(savings_profile="coding")
+
+    assert proxy_pipeline_kwargs(explicit_off)["compress_user_messages"] is False
+    assert proxy_pipeline_kwargs(unset)["compress_user_messages"] is True
 
 
 def test_agent_90_router_uses_ccr_sampling_not_lossless_table() -> None:

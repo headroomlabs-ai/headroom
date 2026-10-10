@@ -73,7 +73,10 @@ _SAVINGS_EVENTS_FILE = "savings_events.jsonl"
 _SYNC_STATE_FILE = "sync_state.json"
 _BRIDGE_STATE_FILE = "bridge_state.json"
 _LOGS_DIR = "logs"
+# Legacy shared runtime-log filename. Kept only as the readers' backward-compat
+# fallback; live proxies now write per-port files (see ``proxy_log_path``).
 _PROXY_LOG_FILE = "proxy.log"
+_PROXY_STDIO_LOG_FILE = "proxy-stdio.log"
 _DEBUG_400_DIR = "debug_400"
 _CODEX_WIRE_DEBUG_DIR = "codex_wire"
 _BIN_DIR = "bin"
@@ -120,6 +123,46 @@ def process_is_stateless() -> bool:
     if _PROCESS_STATELESS:
         return True
     return _env("HEADROOM_STATELESS").lower() in ("1", "true", "yes", "on")
+
+
+# Purposes for which a "skipped because stateless" notice has already been
+# logged, so a busy proxy says it once per persister, not once per turn.
+_PERSISTENCE_NOTICED: set[str] = set()
+
+
+def persistence_allowed(purpose: str) -> bool:
+    """Whether a runtime persister may write *purpose* to the workspace now.
+
+    This is the one predicate every on-disk store consults before it creates or
+    writes a file under the workspace: the CCR retrieval store, the licence
+    cache, MCP session stats, the savings ledger, subscription state, memory
+    sync state, the update-check cache. Returns ``False`` in stateless mode
+    (``--stateless`` or ``HEADROOM_STATELESS``), in which case the caller keeps
+    its in-memory state and skips the write. The first refusal for each
+    *purpose* is logged at INFO so an operator can see what stateless mode
+    turned off; later refusals are silent.
+
+    Use this rather than checking :func:`process_is_stateless` inline so the
+    stateless guarantee ("writes nothing to the workspace") is enforced in one
+    place and its coverage can be read off the call sites.
+    """
+
+    if not process_is_stateless():
+        return True
+    if purpose not in _PERSISTENCE_NOTICED:
+        _PERSISTENCE_NOTICED.add(purpose)
+        import logging
+
+        logging.getLogger(__name__).info(
+            "Stateless mode: not persisting %s to disk (kept in memory only).", purpose
+        )
+    return False
+
+
+def _reset_persistence_notices() -> None:
+    """Forget which stateless notices were logged. For tests."""
+
+    _PERSISTENCE_NOTICED.clear()
 
 
 def _resolve(explicit: str | os.PathLike[str] | None, env_var: str, derived: Path) -> Path:
@@ -300,10 +343,33 @@ def log_dir() -> Path:
     return workspace_dir() / _LOGS_DIR
 
 
-def proxy_log_path() -> Path:
-    """Return the path for the proxy log file."""
+def proxy_log_path(port: int | None = None, *, process_id: int | None = None) -> Path:
+    """Return the path for the proxy runtime log file.
 
-    return log_dir() / _PROXY_LOG_FILE
+    Multi-worker processes pass both values and write
+    ``proxy-<port>-<pid>.log``. Omitting *process_id* returns the standard
+    per-port name; omitting *port* returns the legacy shared name. Readers
+    honor all three.
+    """
+
+    if port is None:
+        name = _PROXY_LOG_FILE
+    elif process_id is None:
+        name = f"proxy-{port}.log"
+    else:
+        name = f"proxy-{port}-{process_id}.log"
+    return log_dir() / name
+
+
+def proxy_stdio_log_path(port: int | None = None) -> Path:
+    """Return the path for the proxy stdout/stderr capture file.
+
+    Per-port for the same reason as :func:`proxy_log_path`; the legacy
+    ``proxy-stdio.log`` name is used when *port* is omitted.
+    """
+
+    name = f"proxy-stdio-{port}.log" if port is not None else _PROXY_STDIO_LOG_FILE
+    return log_dir() / name
 
 
 def debug_400_dir() -> Path:
@@ -415,6 +481,7 @@ __all__ = [
     "HEADROOM_SETTINGS_PATH_ENV",
     "set_process_stateless",
     "process_is_stateless",
+    "persistence_allowed",
     "config_dir",
     "workspace_dir",
     "ensure_config_dir",
@@ -432,6 +499,7 @@ __all__ = [
     "bridge_state_path",
     "log_dir",
     "proxy_log_path",
+    "proxy_stdio_log_path",
     "debug_400_dir",
     "codex_wire_debug_dir",
     "bin_dir",
