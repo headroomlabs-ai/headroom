@@ -13,13 +13,16 @@ Content is logged only when the operator opts in to it explicitly with
 
 from __future__ import annotations
 
+import ipaddress
 import logging
 import math
 import os
+import re
 import sys
 import threading
 import time
 import traceback
+from collections import deque
 from collections.abc import Hashable
 from types import FrameType, ModuleType, TracebackType
 from urllib.parse import urlsplit
@@ -30,6 +33,16 @@ _MAX_FRAMES = 3
 _MAX_CHAIN = 4
 _ID_MAX_CHARS = 80
 _MAX_ERRNO = 2**31 - 1
+# Schemes whose URLs have no host ("file:///path").
+_LOCAL_SCHEMES = frozenset({"file", "sqlite", "unix"})
+_HOSTNAME = re.compile(
+    r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)*\.?"
+)
+_HEADROOM_MODULE = re.compile(r"headroom(?:\.[A-Za-z_][A-Za-z0-9_]*)*")
+_IDENTIFIER = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
+_FIXED_CODE_NAMES = frozenset(
+    {"<module>", "<lambda>", "<genexpr>", "<listcomp>", "<dictcomp>", "<setcomp>"}
+)
 # The module __dict__ descriptor itself, so a ModuleType subclass cannot override it.
 _MODULE_DICT = vars(ModuleType)["__dict__"]
 # Schemes a log may name; any other text before "://" could be a key someone
@@ -103,10 +116,9 @@ def _describe_one(exc: BaseException) -> str:
             text += f" [Errno {exc.errno}]"
         else:
             text += " [Errno out of range]"
-    frames = _innermost_frames(exc.__traceback__)
+    frames = _innermost_headroom_frames(exc.__traceback__)
     if frames:
-        where = " <- ".join(_frame_location(frame, line) for frame, line in reversed(frames))
-        text += f" at {where}"
+        text += " at " + " <- ".join(reversed(frames))
     return text
 
 
@@ -117,54 +129,51 @@ def _errno_text(errno: int) -> str:
         return "unknown error"
 
 
-def _innermost_frames(tb: TracebackType | None) -> list[tuple[FrameType, int]]:
-    frames: list[tuple[FrameType, int]] = []
+def _innermost_headroom_frames(tb: TracebackType | None) -> list[str]:
+    """Locations of the innermost Headroom frames, at most ``_MAX_FRAMES``, in memory bounded by that."""
+    frames: deque[str] = deque(maxlen=_MAX_FRAMES)
     while tb is not None:
-        frames.append((tb.tb_frame, tb.tb_lineno))
+        location = _headroom_frame_location(tb.tb_frame, tb.tb_lineno)
+        if location is not None:
+            frames.append(location)
         tb = tb.tb_next
-    return frames[-_MAX_FRAMES:]
+    return list(frames)
 
 
-def _frame_location(frame: FrameType, lineno: int) -> str:
-    """``file:line in function`` for a frame of an imported module, a fixed token otherwise.
+def _headroom_frame_location(frame: FrameType, lineno: int) -> str | None:
+    """``headroom/<module>.py:line in function`` for a frame of Headroom's own code, else None.
 
-    Code compiled at runtime (``exec``, ``compile``, template engines) chooses its
-    own file and function names, which can quote request data, and it can claim
-    the name of a real file. Such code runs in a namespace of its own, so a frame
-    is trusted only when its globals are the namespace of the module that
-    ``sys.modules`` holds under that name. The file comes from that namespace,
-    not the code object, which keeps sourceless (``.pyc``-only) and zip installs
-    readable. The function name still comes from the code object, so code exec'd
-    into a real module's own namespace (dataclass-generated methods) shows its
-    generated name; it must still be printable.
+    Only Headroom's own frames are named; library and stdlib frames are skipped,
+    since any text a frame carries (file, module or function name) can be set by
+    code compiled at runtime and quote request data. A frame counts as Headroom's
+    only when all of these hold, so none of its text is chosen at runtime:
+    its globals are the namespace of the module ``sys.modules`` holds under that
+    name; that name is a plain dotted ``headroom.*`` identifier; the code's file
+    is the module's own file (compared by stem, so ``.pyc``-only and zip installs
+    match); and the function name is a plain identifier. Headroom never execs code.
     """
     namespace = frame.f_globals
     # Read through dict's own methods: globals can be a dict subclass.
     name = dict.get(namespace, "__name__")
-    if type(name) is not str:
-        return "<dynamic code>"
+    if type(name) is not str or not _HEADROOM_MODULE.fullmatch(name):
+        return None
     module = sys.modules.get(name)
-    function = frame.f_code.co_name
-    if (
-        not isinstance(module, ModuleType)
-        or _MODULE_DICT.__get__(module) is not namespace
-        or type(function) is not str
-        or not function.isprintable()
-    ):
-        return "<dynamic code>"
-    return f"{_module_path(name, namespace)}:{lineno} in {function}"
+    if not isinstance(module, ModuleType) or _MODULE_DICT.__get__(module) is not namespace:
+        return None
+    code = frame.f_code
+    module_file = dict.get(namespace, "__file__")
+    if type(module_file) is not str or _stem(module_file) != _stem(code.co_filename):
+        return None
+    function = code.co_name
+    if not (_IDENTIFIER.fullmatch(function) or function in _FIXED_CODE_NAMES):
+        return None
+    package = dict.__contains__(namespace, "__path__")
+    path = name.replace(".", "/") + ("/__init__.py" if package else ".py")
+    return f"{path}:{lineno} in {function}"
 
 
-def _module_path(name: str, namespace: dict[str, object]) -> str:
-    """``headroom/<module path>`` for Headroom's own modules, the file name for others."""
-    if name == "headroom" or name.startswith("headroom."):
-        path = name.replace(".", "/")
-        return path + ("/__init__.py" if dict.__contains__(namespace, "__path__") else ".py")
-    filename = dict.get(namespace, "__file__")
-    if type(filename) is not str:
-        return "<module>"
-    base = filename.replace("\\", "/").rsplit("/", 1)[-1]
-    return base if base and base.isprintable() else "<module>"
+def _stem(path: str) -> str:
+    return os.path.splitext(path.replace("\\", "/").rsplit("/", 1)[-1])[0]
 
 
 def redact_url(url: str) -> str:
@@ -174,7 +183,8 @@ def redact_url(url: str) -> str:
     a path segment can carry a credential (``/bot<token>/``, webhook URLs) and
     no rule tells such a segment from a route name. The path is kept only with
     the explicit content opt-in, ``HEADROOM_DEBUG_DUMP=full``. The host comes
-    back lowercased.
+    back lowercased, and only when it is a DNS name or IP address; a URL with
+    no host is accepted only for ``file``, ``sqlite`` and ``unix``.
     """
     try:
         parts = urlsplit(url)
@@ -182,9 +192,11 @@ def redact_url(url: str) -> str:
         port = parts.port
     except ValueError:
         return "<unparseable url>"
-    # No "//" means no host: urlsplit then reads "sk-key:secret" as scheme
-    # "sk-key", so nothing of such a string is logged.
-    if not parts.netloc or not host.isprintable():
+    # Without "//" urlsplit reads "sk-key:secret" as scheme "sk-key", so a string
+    # with no host is logged only for the hostless schemes ("file:///path").
+    if not parts.netloc and not (parts.scheme in _LOCAL_SCHEMES and "://" in url):
+        return "<unparseable url>"
+    if parts.netloc and not _is_host(host):
         return "<unparseable url>"
     scheme = parts.scheme if parts.scheme in _KNOWN_SCHEMES else "<scheme>"
     if ":" in host:
@@ -196,6 +208,15 @@ def redact_url(url: str) -> str:
         path = "/<path>" if parts.path not in ("", "/") else parts.path
     redacted = f"{scheme}://{netloc}{path}"
     return f"{redacted}?<redacted>" if parts.query else redacted
+
+
+def _is_host(host: str) -> bool:
+    """True for a DNS name or IP address; anything else could be a pasted secret."""
+    try:
+        ipaddress.ip_address(host)
+    except ValueError:
+        return _HOSTNAME.fullmatch(host) is not None
+    return True
 
 
 def safe_id(value: object) -> str:
