@@ -285,6 +285,27 @@ def _looks_like_sse_response(response: httpx.Response) -> bool:
     return head.startswith(b"event:") or head.startswith(b"data:")
 
 
+def _context_budget_counting_messages(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Expose retained backend thinking to the existing content-block estimator."""
+    view = []
+    for message in messages:
+        blocks = message.get("thinking_blocks")
+        if not blocks:
+            view.append(message)
+            continue
+        copied = dict(message)
+        copied.pop("thinking_blocks")
+        content = message.get("content")
+        parts = (
+            list(content)
+            if isinstance(content, list)
+            else ([{"type": "text", "text": content}] if isinstance(content, str) else [])
+        )
+        copied["content"] = [*parts, *blocks]
+        view.append(copied)
+    return view
+
+
 def _dump_prefix_mismatch(request_id: str, current: list, previous: list) -> None:
     """Debug aid (HEADROOM_DEBUG_PREFIX_MISMATCH=<dir>): log where the client's
     history stopped matching the last turn, and dump both sides for diffing.
@@ -401,10 +422,16 @@ class AnthropicHandlerMixin:
         )
         return httpx.Response(200, json=parsed, headers=headers)
 
-    async def _count_tokens_offloaded(self, model, messages):  # noqa: ANN001, ANN201
+    async def _count_tokens_offloaded(  # noqa: ANN201
+        self,
+        model,
+        messages,
+        *,
+        fail_open: bool = True,  # noqa: ANN001
+    ):
         from headroom.proxy.token_counting import count_tokens_offloaded
 
-        return await count_tokens_offloaded(self, model, messages)
+        return await count_tokens_offloaded(self, model, messages, fail_open=fail_open)
 
     def _resolve_ccr_workspace(
         self,
@@ -954,7 +981,10 @@ class AnthropicHandlerMixin:
 
         from headroom.cache.compression_store import get_compression_store
         from headroom.ccr import CCRToolInjector
-        from headroom.providers.anthropic import sanitize_anthropic_model_id
+        from headroom.providers.anthropic import (
+            has_context_1m_suffix,
+            sanitize_anthropic_model_id,
+        )
         from headroom.proxy.body_forwarding import BodyMutationTracker
         from headroom.proxy.helpers import (
             MAX_MESSAGE_ARRAY_LENGTH,
@@ -3652,6 +3682,219 @@ class AnthropicHandlerMixin:
             ):
                 headers["anthropic-beta"] = _client_beta_value
 
+            async def _context_budget_rejection(
+                final_body: dict[str, Any],
+                outgoing_model: str | None = None,
+                *,
+                outbound_beta: str = "",
+            ) -> Response | None:
+                """Reject only after routing and byte-faithful restoration are final."""
+                if _bypass or not getattr(self.anthropic_provider, "_operator_context_limits", {}):
+                    return None
+                _cbp_mode = "observe"
+                try:
+                    from headroom.proxy.context_budget_policy import (
+                        evaluate as _cbp_evaluate,
+                    )
+                    from headroom.proxy.context_budget_policy import (
+                        resolve_mode as _cbp_resolve_mode,
+                    )
+                    from headroom.proxy.context_budget_policy import (
+                        resolve_safety_margin as _cbp_resolve_safety_margin,
+                    )
+
+                    _cbp_model = outgoing_model or final_body.get("model") or model or "unknown"
+                    if not isinstance(_cbp_model, str):
+                        return None
+                    if (
+                        isinstance(raw_model, str)
+                        and "context-1m" in outbound_beta.lower()
+                        and has_context_1m_suffix(raw_model)
+                        and sanitize_anthropic_model_id(_cbp_model)
+                        == sanitize_anthropic_model_id(raw_model)
+                    ):
+                        _cbp_model = raw_model
+
+                    _cbp_declared = self.anthropic_provider.get_operator_context_limit(_cbp_model)
+                    if _cbp_declared is None:
+                        return None
+
+                    try:
+                        _cbp_mode = _cbp_resolve_mode()
+                    except ValueError as exc:
+                        logger.warning(
+                            "[%s] context_budget_guard: %s; forwarding in observe mode",
+                            request_id,
+                            exc,
+                        )
+                        return None
+                    _cbp_outbound_beta = outbound_beta
+                    _cbp_has_context1m = "context-1m" in _cbp_outbound_beta.lower()
+                    if _cbp_has_context1m and not (
+                        self.anthropic_provider.has_raw_operator_context_limit(_cbp_model)
+                    ):
+                        _cbp_mode = "observe"
+                        logger.warning(
+                            "[%s] context_budget_guard: context-1m beta has no raw model "
+                            "declaration for %s; forwarding in observe mode",
+                            request_id,
+                            _cbp_model,
+                        )
+
+                    _cbp_margin = _cbp_resolve_safety_margin()
+                    _cbp_max_out = int(final_body.get("max_tokens") or 0)
+
+                    _cbp_final_messages = _context_budget_counting_messages(
+                        final_body.get("messages", [])
+                    )
+                    if final_body.get("system") is not None:
+                        _cbp_final_messages = [
+                            {"role": "system", "content": final_body["system"]},
+                            *_cbp_final_messages,
+                        ]
+
+                    _cbp_tokenizer_model = sanitize_anthropic_model_id(_cbp_model)
+                    if (
+                        _cbp_mode != "reject"
+                        and isinstance(model, str)
+                        and sanitize_anthropic_model_id(model) == _cbp_tokenizer_model
+                    ):
+                        _cbp_tokenizer = tokenizer
+                        _cbp_counted_tokens = _cbp_tokenizer.count_messages(_cbp_final_messages)
+                    else:
+                        _cbp_tokenizer, _cbp_counted_tokens = await self._count_tokens_offloaded(
+                            _cbp_tokenizer_model,
+                            _cbp_final_messages,
+                            fail_open=_cbp_mode != "reject",
+                        )
+                    if final_body.get("tools"):
+                        _cbp_counted_tokens += _cbp_tokenizer.count_text(
+                            json.dumps(final_body["tools"], default=str)
+                        )
+
+                    _cbp_decision = _cbp_evaluate(
+                        counted_tokens=_cbp_counted_tokens,
+                        declared_limit=_cbp_declared,
+                        max_output_tokens=_cbp_max_out,
+                        mode=_cbp_mode,
+                        safety_margin=_cbp_margin,
+                    )
+
+                    if _cbp_decision.reason in ("over_threshold", "degenerate_threshold"):
+                        logger.warning(
+                            "[%s] context_budget_guard: model=%s declared_limit=%d "
+                            "reserve=%d threshold=%d counted=%d overage=%d mode=%s %s",
+                            request_id,
+                            _cbp_model,
+                            _cbp_decision.declared_limit,
+                            _cbp_decision.reserve,
+                            _cbp_decision.threshold,
+                            _cbp_decision.counted_tokens,
+                            _cbp_decision.overage,
+                            _cbp_mode,
+                            "; set HEADROOM_CONTEXT_LIMIT_MODE=reject to refuse locally or "
+                            "adjust HEADROOM_MODEL_LIMITS",
+                        )
+
+                    if _cbp_decision.should_reject:
+                        await _finalize_pre_upstream()
+                        return JSONResponse(
+                            status_code=400,
+                            content={
+                                "type": "error",
+                                "error": {
+                                    "type": "invalid_request_error",
+                                    "message": (
+                                        f"Request exceeds the declared context limit for {_cbp_model}: "
+                                        f"{_cbp_decision.counted_tokens} tokens counted, "
+                                        f"{_cbp_decision.threshold} available "
+                                        f"(declared {_cbp_decision.declared_limit}, "
+                                        f"reserve {_cbp_decision.reserve}, overage {_cbp_decision.overage}). "
+                                        "Set HEADROOM_CONTEXT_LIMIT_MODE=observe to log only."
+                                    ),
+                                },
+                            },
+                        )
+                except Exception:
+                    logger.warning(
+                        "[%s] context_budget_guard: evaluation unavailable",
+                        request_id,
+                        exc_info=True,
+                    )
+                    if _cbp_mode == "reject":
+                        return await _budget_evaluation_unavailable()
+                return None
+
+            async def _budget_evaluation_unavailable():
+                await _finalize_pre_upstream()
+                return JSONResponse(
+                    status_code=500,
+                    content={
+                        "type": "error",
+                        "error": {
+                            "type": "api_error",
+                            "message": "Context budget evaluation unavailable for the configured reject request.",
+                        },
+                    },
+                )
+
+            from headroom.proxy.body_forwarding import select_outbound_body
+
+            def _select_budget_outbound(final_body, *, initial=False):
+                if initial and (
+                    _bypass or not getattr(self.anthropic_provider, "_operator_context_limits", {})
+                ):
+                    return None
+                return select_outbound_body(
+                    body=final_body,
+                    original_body_bytes=original_body_bytes if initial else None,
+                    body_mutated=body_mutation_tracker.mutated if initial else True,
+                    mutation_reasons=body_mutation_tracker.reasons if initial else [],
+                )
+
+            pending_budget_error: Response | None = None
+
+            async def _guard_continuation(final_body, continuation_headers):
+                nonlocal pending_budget_error
+                if pending_budget_error is not None:
+                    raise RuntimeError("Context budget continuation already refused")
+                if _bypass or not getattr(self.anthropic_provider, "_operator_context_limits", {}):
+                    return None
+                selected = _select_budget_outbound(final_body)
+                refusal = await _context_budget_rejection(
+                    json.loads(selected.content),
+                    model_override,
+                    outbound_beta=continuation_headers.get("anthropic-beta", ""),
+                )
+                if refusal is not None:
+                    pending_budget_error = refusal
+                    raise RuntimeError("Context budget continuation refused")
+                return selected
+
+            async def _prepare_budget_backend(backend):
+                if _bypass or not getattr(self.anthropic_provider, "_operator_context_limits", {}):
+                    return None, None
+                try:
+                    candidate = backend.map_model_id(body.get("model") or model)
+                except Exception:
+                    return None, None
+                if self.anthropic_provider.get_operator_context_limit(candidate) is None:
+                    return None, None
+                try:
+                    prepared = backend.prepare_message(body, headers, stream=stream)
+                except Exception:
+                    from headroom.proxy.context_budget_policy import resolve_mode
+
+                    try:
+                        rejecting = resolve_mode() == "reject"
+                    except ValueError:
+                        rejecting = False
+                    if rejecting:
+                        return None, await _budget_evaluation_unavailable()
+                    return None, None
+                refusal = await _context_budget_rejection(prepared, prepared.get("model"))
+                return prepared, refusal
+
             # Forward request - use Bedrock backend if configured, otherwise direct API
             #
             # An extension may have published a per-request routing decision on
@@ -3677,6 +3920,9 @@ class AnthropicHandlerMixin:
                             tools=tools,
                             metadata={"path": pipeline_path, "stream": True},
                         )
+                        prepared, budget_response = await _prepare_budget_backend(request_backend)
+                        if budget_response is not None:
+                            return budget_response
                         await _finalize_pre_upstream()
                         return await self._stream_response_bedrock(
                             body,
@@ -3695,10 +3941,18 @@ class AnthropicHandlerMixin:
                             prefix_tracker=prefix_tracker,
                             optimized_messages=optimized_messages,
                             backend=request_backend,
+                            **({"prepared": prepared} if prepared is not None else {}),
                         )
                     else:
+                        prepared, budget_response = await _prepare_budget_backend(request_backend)
+                        if budget_response is not None:
+                            return budget_response
                         async with stage_timer.measure("upstream_connect"):
-                            backend_response = await request_backend.send_message(body, headers)
+                            backend_response = await request_backend.send_message(
+                                body,
+                                headers,
+                                **({"prepared": prepared} if prepared is not None else {}),
+                            )
                         self.pipeline_extensions.emit(
                             PipelineStage.POST_SEND,
                             operation="proxy.request",
@@ -4109,6 +4363,18 @@ class AnthropicHandlerMixin:
                         tools=tools,
                         metadata={"path": pipeline_path, "stream": True},
                     )
+                    selected_outbound = _select_budget_outbound(body, initial=True)
+                    budget_response = (
+                        await _context_budget_rejection(
+                            json.loads(selected_outbound.content),
+                            outgoing_model=model_override,
+                            outbound_beta=headers.get("anthropic-beta", ""),
+                        )
+                        if selected_outbound is not None
+                        else None
+                    )
+                    if budget_response is not None:
+                        return budget_response
                     await _finalize_pre_upstream()
                     explicit_session_header = request.headers.get("x-headroom-session-id")
                     session_key = self._get_session_key(
@@ -4148,6 +4414,9 @@ class AnthropicHandlerMixin:
                         pipeline_timing=pipeline_timing,
                         prefix_tracker=prefix_tracker,
                         original_messages=original_client_messages,
+                        **(
+                            {"outbound": selected_outbound} if selected_outbound is not None else {}
+                        ),
                         original_body_bytes=original_body_bytes,
                         body_mutated=body_mutation_tracker.mutated,
                         mutation_reasons=body_mutation_tracker.reasons,
@@ -4181,6 +4450,19 @@ class AnthropicHandlerMixin:
                             headers.pop(_accept_key, None)
                         headers["accept"] = "application/json"
 
+                    selected_outbound = _select_budget_outbound(body, initial=True)
+                    budget_response = (
+                        await _context_budget_rejection(
+                            json.loads(selected_outbound.content),
+                            outgoing_model=model_override,
+                            outbound_beta=headers.get("anthropic-beta", ""),
+                        )
+                        if selected_outbound is not None
+                        else None
+                    )
+                    if budget_response is not None:
+                        return budget_response
+
                     # Copilot auth is applied per-URL, and until now only the
                     # streaming forwarder did it (``_stream_response``). This
                     # buffered arm sends via ``_retry_request``, which forwards
@@ -4213,6 +4495,11 @@ class AnthropicHandlerMixin:
                                 url,
                                 headers,
                                 body,
+                                **(
+                                    {"outbound": selected_outbound}
+                                    if selected_outbound is not None
+                                    else {}
+                                ),
                                 original_body_bytes=original_body_bytes,
                                 body_mutated=body_mutation_tracker.mutated,
                                 mutation_reasons=body_mutation_tracker.reasons,
@@ -4511,17 +4798,16 @@ class AnthropicHandlerMixin:
                                 # continuation body is synthesized by Headroom
                                 # so it is treated as mutated and goes through
                                 # the canonical serializer.
-                                from headroom.proxy.body_forwarding import (
-                                    prepare_outbound_body_bytes,
-                                )
                                 from headroom.proxy.helpers import log_outbound_request
 
+                                ccr_outbound = await _guard_continuation(
+                                    continuation_body, continuation_headers
+                                )
+                                if ccr_outbound is None:
+                                    ccr_outbound = _select_budget_outbound(continuation_body)
                                 ccr_outbound_bytes, ccr_outbound_source = (
-                                    prepare_outbound_body_bytes(
-                                        body=continuation_body,
-                                        original_body_bytes=None,
-                                        body_mutated=True,
-                                    )
+                                    ccr_outbound.content,
+                                    ccr_outbound.source,
                                 )
                                 # A continuation is a non-streaming call, so it
                                 # needs a matching Accept for the same reason the
@@ -4582,6 +4868,9 @@ class AnthropicHandlerMixin:
                                     api_call_fn,
                                     provider="anthropic",
                                 )
+                                if pending_budget_error is not None:
+                                    await _finalize_pre_upstream()
+                                    return pending_budget_error
                                 if final_resp_json is resp_json:
                                     # The handler intentionally returns the same
                                     # object for both a failed continuation and
@@ -4660,6 +4949,9 @@ class AnthropicHandlerMixin:
                                             f"[{request_id}] CCR: Retrieval handled successfully"
                                         )
                             except Exception as e:
+                                if pending_budget_error is not None:
+                                    await _finalize_pre_upstream()
+                                    return pending_budget_error
                                 import traceback
 
                                 logger.error(
@@ -4754,11 +5046,19 @@ class AnthropicHandlerMixin:
                                     if tools:
                                         continuation_body["tools"] = tools
 
+                                    continuation_outbound = await _guard_continuation(
+                                        continuation_body, headers
+                                    )
                                     cont_response = await self._retry_request(
                                         "POST",
                                         url,
                                         headers,
                                         continuation_body,
+                                        **(
+                                            {"outbound": continuation_outbound}
+                                            if continuation_outbound is not None
+                                            else {}
+                                        ),
                                         timeout=self._anthropic_buffered_request_timeout(),
                                     )
 
@@ -4782,6 +5082,10 @@ class AnthropicHandlerMixin:
                                 )
                                 # Continue with original response
 
+                        if pending_budget_error is not None:
+                            await _finalize_pre_upstream()
+                            return pending_budget_error
+
                         # Buffered response hooks run for every successful turn,
                         # not only the CCR branch. Reuse the request context so
                         # observers close the exact turn they opened and a
@@ -4796,11 +5100,19 @@ class AnthropicHandlerMixin:
                                 hook_messages: list[dict[str, Any]],
                             ) -> dict[str, Any]:
                                 continuation_body = {**body, "messages": hook_messages}
+                                continuation_outbound = await _guard_continuation(
+                                    continuation_body, headers
+                                )
                                 continuation_response = await self._retry_request(
                                     "POST",
                                     url,
                                     headers,
                                     continuation_body,
+                                    **(
+                                        {"outbound": continuation_outbound}
+                                        if continuation_outbound is not None
+                                        else {}
+                                    ),
                                     timeout=self._anthropic_buffered_request_timeout(),
                                 )
                                 continuation_json = continuation_response.json()
@@ -4810,6 +5122,9 @@ class AnthropicHandlerMixin:
                             hooked_json = await run_response_hooks(
                                 _req_ctx, resp_json, _turn_hook_call_model
                             )
+                            if pending_budget_error is not None:
+                                await _finalize_pre_upstream()
+                                return pending_budget_error
                             _hook_usage.settle(hooked_json)
                             if hooked_json is not resp_json:
                                 resp_json = hooked_json
@@ -5334,6 +5649,9 @@ class AnthropicHandlerMixin:
                     except asyncio.CancelledError:
                         raise
                     except Exception:
+                        if pending_budget_error is not None:
+                            await _finalize_pre_upstream()
+                            return pending_budget_error
                         salvaged = _salvageable_upstream.get("resp_json")
                         if salvaged is None or not self._can_salvage_buffered_upstream(salvaged):
                             raise
