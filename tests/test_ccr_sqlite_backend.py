@@ -321,6 +321,38 @@ class TestSQLiteBackend:
         finally:
             logger.removeHandler(handler)
 
+    def test_unreadable_report_set_clears_when_full(self, db_path, monkeypatch):
+        """Past the cap the once-per-hash set resets, so new bad rows still warn."""
+        import headroom.cache.backends.sqlite as sqlite_mod
+
+        monkeypatch.setattr(sqlite_mod, "_MAX_REPORTED_UNREADABLE", 2)
+        records: list[logging.LogRecord] = []
+
+        class _Collect(logging.Handler):
+            def emit(self, record: logging.LogRecord) -> None:
+                records.append(record)
+
+        handler = _Collect(level=logging.DEBUG)
+        logger = logging.getLogger("headroom.cache.backends.sqlite")
+        logger.addHandler(handler)
+        try:
+            b = SQLiteBackend(db_path)
+            with b._lock:
+                for key in ("bad1", "bad2", "bad3"):
+                    b._conn.execute(
+                        "INSERT OR REPLACE INTO ccr_entries "
+                        "(hash, entry_json, created_at, ttl) VALUES (?, ?, ?, ?)",
+                        (key, "{not json", time.time(), 1800),
+                    )
+                b._conn.commit()
+            for key in ("bad1", "bad2", "bad3"):
+                assert b.get(key) is None
+            warned = [r.getMessage() for r in records if "unreadable" in r.getMessage()]
+            assert [m.split()[3] for m in warned] == ["bad1", "bad2", "bad3"]
+            assert all("JSONDecodeError" in m for m in warned)
+        finally:
+            logger.removeHandler(handler)
+
     def test_store_ttl_enforcement_via_compression_store(self, db_path):
         """TTL checks stay in CompressionStore; expired entries miss."""
         store = CompressionStore(backend=SQLiteBackend(db_path))

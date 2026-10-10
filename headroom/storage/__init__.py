@@ -72,11 +72,15 @@ def create_storage(store_url: str) -> Storage:
                     "falling back to SQLite storage",
                     scheme,
                 )
-            except Exception:
+            except Exception as e:
+                # The plugin's exception can echo the store URL, credentials included,
+                # so only its type goes to WARNING; the traceback is DEBUG-only.
                 logger.warning(
-                    "Failed to load storage backend for scheme %r; falling back to SQLite storage",
+                    "Failed to load storage backend for scheme %r (%s); "
+                    "falling back to SQLite storage",
                     scheme,
-                    exc_info=True,
+                    type(e).__name__,
                 )
+                logger.debug("Storage backend %r load failure", scheme, exc_info=True)
         # Default to SQLite (legacy behavior)
         return SQLiteStorage(store_url)

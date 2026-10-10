@@ -52,8 +52,18 @@ DROP INDEX IF EXISTS idx_ccr_expiry;
 # not correctness — CompressionStore checks TTL on every get().
 _PURGE_INTERVAL = 60.0
 # items() decodes every row on each eviction pass, so an unreadable row is
-# reported once per hash rather than on every request.
+# reported once per hash rather than on every request. The set is cleared when
+# full, so a long-running proxy keeps reporting new bad rows.
 _MAX_REPORTED_UNREADABLE = 1000
+
+
+def _log_key(hash_key: str) -> str:
+    """Return a single-line, bounded form of a CCR key for log messages.
+
+    Keys reach ``get``/``exists`` from model-issued retrieve calls, so they are
+    untrusted text.
+    """
+    return hash_key[:64].replace("\r", "").replace("\n", "")
 
 
 def default_db_path() -> Path:
@@ -171,15 +181,14 @@ class SQLiteBackend:
         self._conn = self._open()
 
     def _report_unreadable(self, hash_key: str, reason: object) -> None:
-        if (
-            hash_key in self._reported_unreadable
-            or len(self._reported_unreadable) >= _MAX_REPORTED_UNREADABLE
-        ):
+        if hash_key in self._reported_unreadable or not logger.isEnabledFor(logging.WARNING):
             return
+        if len(self._reported_unreadable) >= _MAX_REPORTED_UNREADABLE:
+            self._reported_unreadable.clear()
         self._reported_unreadable.add(hash_key)
         logger.warning(
             "CCR SQLite entry %s in %s is unreadable (%s); treating as a miss",
-            hash_key,
+            _log_key(hash_key),
             self._path,
             reason,
         )
@@ -190,7 +199,7 @@ class SQLiteBackend:
         try:
             data = json.loads(raw)
         except (json.JSONDecodeError, TypeError) as e:
-            self._report_unreadable(hash_key, e)
+            self._report_unreadable(hash_key, type(e).__name__)
             return None
         if not isinstance(data, dict):
             self._report_unreadable(hash_key, "not a JSON object")
@@ -204,7 +213,7 @@ class SQLiteBackend:
             # miss, not raise. Otherwise a single bad row crashes get() — and,
             # via items(), _clean_expired() runs it on every store's eviction, so
             # one poison row would break all reads, evictions, and stores.
-            self._report_unreadable(hash_key, e)
+            self._report_unreadable(hash_key, type(e).__name__)
             return None
 
     def _purge_expired(self, now: float) -> int:
@@ -241,7 +250,7 @@ class SQLiteBackend:
                     (hash_key,),
                 ).fetchone()
             except sqlite3.DatabaseError as e:
-                self._handle_db_error(e, f"get {hash_key}")
+                self._handle_db_error(e, f"get {_log_key(hash_key)}")
                 return None
         if row is None:
             return None
@@ -259,7 +268,7 @@ class SQLiteBackend:
                 self._conn.commit()
                 self._maybe_purge()
             except sqlite3.DatabaseError as e:
-                self._handle_db_error(e, f"set {hash_key}")
+                self._handle_db_error(e, f"set {_log_key(hash_key)}")
 
     def delete(self, hash_key: str) -> bool:
         with self._lock:
@@ -271,7 +280,7 @@ class SQLiteBackend:
                 self._conn.commit()
                 return cur.rowcount > 0
             except sqlite3.DatabaseError as e:
-                self._handle_db_error(e, f"delete {hash_key}")
+                self._handle_db_error(e, f"delete {_log_key(hash_key)}")
                 return False
 
     def exists(self, hash_key: str) -> bool:
@@ -282,7 +291,7 @@ class SQLiteBackend:
                     (hash_key,),
                 ).fetchone()
             except sqlite3.DatabaseError as e:
-                self._handle_db_error(e, f"exists {hash_key}")
+                self._handle_db_error(e, f"exists {_log_key(hash_key)}")
                 return False
         return row is not None
 

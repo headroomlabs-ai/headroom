@@ -225,6 +225,21 @@ def test_create_storage_warns_when_a_backend_plugin_fails_to_load(
     create_storage("other://host/db")
     assert any("'other'" in w for w in _fallback_warnings(storage_log))
 
+    def _rejecting_factory(url: str) -> DummyStorage:
+        raise ValueError(f"cannot connect to {url}")
+
+    monkeypatch.setattr(
+        "importlib.metadata.entry_points",
+        lambda group: [SimpleNamespace(name="leaky", load=lambda: _rejecting_factory)],
+    )
+    storage_log.records.clear()
+    create_storage("leaky://user:secret@host/db")
+    warning_records = [r for r in storage_log.records if r.levelno == logging.WARNING]
+    assert len(warning_records) == 1
+    assert "ValueError" in warning_records[0].getMessage()
+    assert "secret" not in warning_records[0].getMessage()
+    assert warning_records[0].exc_info is None
+
     storage_log.records.clear()
     create_storage("metrics.db")
     assert _fallback_warnings(storage_log) == []

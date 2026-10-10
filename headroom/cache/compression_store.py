@@ -1164,12 +1164,15 @@ def _create_default_ccr_backend() -> CompressionStoreBackend | None:
         backend: CompressionStoreBackend = fn(**kwargs)
         return backend
     except Exception as e:
+        # The backend's exception can echo HEADROOM_REDIS_URL (credentials included),
+        # so only its type goes to WARNING; the traceback is DEBUG-only.
         logger.warning(
             "Failed to load CCR backend %s (%s); falling back to the in-process store. "
             "Retrieval will not survive proxy restarts or cross worker processes.",
             backend_type,
-            e,
+            type(e).__name__,
         )
+        logger.debug("CCR backend %s load failure", backend_type, exc_info=True)
         return None
 
 

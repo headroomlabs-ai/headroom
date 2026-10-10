@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import threading
 from unittest.mock import AsyncMock, MagicMock
 
@@ -182,3 +183,62 @@ async def test_wait_for_task_timeout_does_not_cancel_background_write() -> None:
         "status": "completed",
         "result": True,
     }
+
+
+class _RaisingClient:
+    def __init__(self, exc: Exception) -> None:
+        self._exc = exc
+
+    def delete(self, memory_id: str) -> None:
+        raise self._exc
+
+    def get(self, memory_id: str) -> None:
+        raise self._exc
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("op", "exc", "warns"),
+    [
+        ("delete_memory", ValueError("Memory with id m1 not found"), False),
+        ("delete_memory", ValueError("payload user:secret rejected"), True),
+        ("delete_memory", RuntimeError("qdrant at user:secret@host down"), True),
+        ("get_memory", RuntimeError("qdrant at user:secret@host down"), True),
+    ],
+)
+async def test_backend_failures_warn_without_exception_text(
+    op: str, exc: Exception, warns: bool
+) -> None:
+    """A missing id on delete is expected (DEBUG); other failures warn with the
+    exception type only, never its text."""
+    adapter = _adapter()
+    adapter._ensure_initialized = AsyncMock()  # type: ignore[method-assign]
+    adapter._mem0_client = _RaisingClient(exc)
+
+    records: list[logging.LogRecord] = []
+
+    class _Collect(logging.Handler):
+        def emit(self, record: logging.LogRecord) -> None:
+            records.append(record)
+
+    logger = logging.getLogger("headroom.memory.backends.direct_mem0")
+    handler = _Collect(level=logging.DEBUG)
+    previous = logger.level
+    logger.addHandler(handler)
+    logger.setLevel(logging.DEBUG)
+    try:
+        result = await getattr(adapter, op)("m1")
+    finally:
+        logger.removeHandler(handler)
+        logger.setLevel(previous)
+
+    assert not result
+    warnings = [r for r in records if r.levelname == "WARNING"]
+    if warns:
+        assert len(warnings) == 1
+        assert type(exc).__name__ in warnings[0].getMessage()
+        assert "secret" not in warnings[0].getMessage()
+        assert warnings[0].exc_info is None
+    else:
+        assert warnings == []
+        assert any("not found" in r.getMessage() for r in records)

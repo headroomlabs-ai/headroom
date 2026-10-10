@@ -921,13 +921,16 @@ class DirectMem0Adapter:
         try:
             await asyncio.to_thread(self._mem0_client.delete, memory_id=memory_id)
             return True
-        except ValueError as e:
-            # mem0 raises ValueError for an unknown id; the delete is model-driven,
-            # so a stale or invented id is expected.
-            logger.debug("DirectMem0: delete_memory(%s): not found: %s", memory_id, e)
-            return False
         except Exception as e:
-            logger.warning("DirectMem0: delete_memory(%s) failed: %s", memory_id, e)
+            # mem0 raises ValueError("Memory with id <id> not found") for an unknown
+            # id. The delete is model-driven, so a stale or invented id is expected.
+            if isinstance(e, ValueError) and "not found" in str(e):
+                logger.debug("DirectMem0: delete_memory(%s): memory not found", memory_id)
+                return False
+            # Backend exception text can carry stored memory or connection details,
+            # so only its type goes to WARNING; the detail is DEBUG-only.
+            logger.warning("DirectMem0: delete_memory(%s) failed (%s)", memory_id, type(e).__name__)
+            logger.debug("DirectMem0: delete_memory(%s) failure", memory_id, exc_info=True)
             return False
 
     async def get_memory(self, memory_id: str) -> Memory | None:
@@ -956,7 +959,8 @@ class DirectMem0Adapter:
                 metadata=result.get("metadata") or {},
             )
         except Exception as e:
-            logger.warning("DirectMem0: get_memory(%s) failed: %s", memory_id, e)
+            logger.warning("DirectMem0: get_memory(%s) failed (%s)", memory_id, type(e).__name__)
+            logger.debug("DirectMem0: get_memory(%s) failure", memory_id, exc_info=True)
             return None
 
     @property
