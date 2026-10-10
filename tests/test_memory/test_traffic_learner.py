@@ -74,7 +74,9 @@ class TestErrorClassification:
             # A zero wrapper status must not hide a separate failure.
             ("worker exited with signal 9\nexit code 0", True),
             ("child exit code 2\nwrapper exit code 0", True),
-            ("python train.py\nKilled\nexit code 0", True),
+            ("python train.py\nKilled\n", True),
+            # A successful command may print the word; exit code 0 then wins.
+            ("grep result:\nKilled\nexit code 0", False),
             ("task killed by signal SIGKILL\nexit code 0", True),
             # Case-insensitive signals the shared is_error_content would miss.
             ("zsh: no such file or directory: ./run.sh", True),
@@ -117,6 +119,8 @@ class TestErrorClassification:
             ("Permission denied: /etc/shadow", "permission_denied"),
             ("TimeoutError: deadline exceeded after 30s", "timeout"),
             ("ConnectionError: [Errno 111] Connection refused", "connection_error"),
+            ("task killed by signal SIGKILL", "exit_code"),
+            ("python train.py\nKilled", "exit_code"),
         ],
     )
     async def test_error_category_recorded(

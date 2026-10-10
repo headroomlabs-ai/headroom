@@ -241,21 +241,23 @@ _ERROR_SIGNALS: tuple[re.Pattern[str], ...] = (
 # Agent harnesses (Codex, Grok, opencode, ...) append "exit code 0" to every
 # SUCCESSFUL shell command, so an exit code only signals an error when it is
 # nonzero (signed codes such as -9 included). A zero code never hides another
-# failure signal in the same output: a nonzero code, "non-zero", a signal or
-# a "Killed" line. A bare "exited with ..." (no code) still counts.
+# failure signal in the same output: a nonzero code, "non-zero" or a signal kill.
+# A standalone "Killed" line (the shell's SIGKILL message) counts only when no
+# zero exit status is reported, since a successful command can print that word.
+# A bare "exited with ..." (no code) still counts.
 _EXIT_STATUS_RE = re.compile(
     r"\bexit(?:ed)?(?:\s+with)?(?:\s+exit)?\s+(?:code|status)\s*:?\s*([+-]?\d+)", re.I
 )
-_EXIT_FAILURE_RE = re.compile(
-    r"non-zero|nonzero|exited with signal|killed by signal|^\s*Killed(?::\s*\d+)?\s*$",
-    re.I | re.M,
-)
+_EXIT_FAILURE_RE = re.compile(r"non-zero|nonzero|exited with signal|killed by signal", re.I)
+_KILLED_LINE_RE = re.compile(r"^\s*Killed(?::\s*\d+)?\s*$", re.M)
 _EXITED_WITH_RE = re.compile(r"exited with", re.I)
 
 
 def _exit_status_is_error(snippet: str) -> bool:
     codes = _EXIT_STATUS_RE.findall(snippet)
     if any(int(code) != 0 for code in codes) or _EXIT_FAILURE_RE.search(snippet):
+        return True
+    if _KILLED_LINE_RE.search(snippet) and not codes:
         return True
     return not codes and bool(_EXITED_WITH_RE.search(snippet))
 
