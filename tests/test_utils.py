@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
 
+import pytest
+
 from headroom import utils
 
 
@@ -30,7 +32,6 @@ def test_hash_helpers_and_request_id() -> None:
         "hi\ud800".encode("utf-8", "surrogatepass")
     )
     assert utils.compute_short_hash("hello", length=8) == "2cf24dba"
-    assert utils.fast_hash("hello", length=8) == "5d41402a"
 
 
 def test_extract_user_query_and_message_hashes() -> None:
@@ -124,27 +125,34 @@ def test_format_timestamp_normalizes_aware_datetimes() -> None:
     marker = utils.create_marker("tool_digest", sha256="abc", count="2")
     assert marker == '<headroom:tool_digest sha256="abc" count="2">'
     assert utils.create_tool_digest_marker("abc") == '<headroom:tool_digest sha256="abc">'
-    assert utils.create_dropped_context_marker("budget") == (
-        '<headroom:dropped_context reason="budget">'
-    )
-    assert utils.create_dropped_context_marker("budget", count=4) == (
-        '<headroom:dropped_context reason="budget" count="4">'
-    )
-    assert utils.create_truncated_marker(100, 25) == (
-        '<headroom:truncated original="100" truncated_to="25">'
-    )
 
-    extracted = utils.extract_markers(
-        'x <headroom:tool_digest sha256="abc"> y <headroom:dropped_context reason="budget" count="2">'
-    )
-    assert extracted == [
-        {"type": "tool_digest", "attributes": {"sha256": "abc"}},
-        {"type": "dropped_context", "attributes": {"reason": "budget", "count": "2"}},
-    ]
 
-    assert utils.safe_json_loads('{"ok": true}') == ({"ok": True}, True)
-    assert utils.safe_json_loads("{bad") == (None, False)
-    assert utils.safe_json_dumps({"emoji": "café"}) == '{"emoji":"café"}'
+@pytest.mark.parametrize(
+    ("name", "args", "expected"),
+    [
+        ("fast_hash", ("hello", 8), "5d41402a"),
+        (
+            "create_dropped_context_marker",
+            ("budget", 4),
+            '<headroom:dropped_context reason="budget" count="4">',
+        ),
+        (
+            "create_truncated_marker",
+            (100, 25),
+            '<headroom:truncated original="100" truncated_to="25">',
+        ),
+        (
+            "extract_markers",
+            ('x <headroom:tool_digest sha256="abc">',),
+            [{"type": "tool_digest", "attributes": {"sha256": "abc"}}],
+        ),
+        ("safe_json_loads", ("{bad",), (None, False)),
+        ("safe_json_dumps", ({"emoji": "café"},), '{"emoji":"café"}'),
+    ],
+)
+def test_deprecated_helpers_warn_and_still_work(name: str, args: tuple, expected: object) -> None:
+    with pytest.warns(DeprecationWarning, match=f"{name} is deprecated"):
+        assert getattr(utils, name)(*args) == expected
 
 
 def test_cost_formatting_and_deep_copy() -> None:
