@@ -141,6 +141,117 @@ def test_bash_tool_result_passthrough_when_protected() -> None:
     assert "router:excluded:tool" in result.transforms_applied
 
 
+@pytest.mark.parametrize("shape", ["openai", "openai-list", "anthropic"])
+def test_ignored_read_output_stays_verbatim_after_protection_window(shape: str, tmp_path) -> None:
+    """Ignored Reads stay verbatim after age-decay and cross-turn deduplication."""
+    pytest.importorskip("tiktoken")
+
+    from headroom.ignore import IgnorePolicy
+    from headroom.providers import OpenAIProvider
+    from headroom.tokenizer import Tokenizer
+    from headroom.transforms.content_router import ContentRouter, ContentRouterConfig
+
+    (tmp_path / ".headroomignore").write_text("CLAUDE.md\n")
+    config = ContentRouterConfig(
+        ignore_policy=IgnorePolicy.load(tmp_path),
+        protect_recent_reads_fraction=0.3,
+        enable_cross_turn_dedup=True,
+    )
+    router = ContentRouter(config)
+    tokenizer = Tokenizer(OpenAIProvider().get_token_counter("gpt-4o"), "gpt-4o")
+    read_output = "\n".join(f"line {i}: protected source content" for i in range(120))
+    messages = []
+    for read_number in range(2):
+        tool_id = f"call_read_{read_number}"
+        if shape in ("openai", "openai-list"):
+            read_content = (
+                [{"type": "text", "text": read_output}] if shape == "openai-list" else read_output
+            )
+            messages.extend(
+                [
+                    {
+                        "role": "assistant",
+                        "content": None,
+                        "tool_calls": [
+                            {
+                                "id": tool_id,
+                                "type": "function",
+                                "function": {
+                                    "name": "Read",
+                                    "arguments": '{"file_path":"CLAUDE.md"}',
+                                },
+                            }
+                        ],
+                    },
+                    {
+                        "role": "tool",
+                        "tool_call_id": tool_id,
+                        "content": read_content,
+                    },
+                ]
+            )
+        else:
+            messages.extend(
+                [
+                    {
+                        "role": "assistant",
+                        "content": [
+                            {
+                                "type": "tool_use",
+                                "id": tool_id,
+                                "name": "Read",
+                                "input": {"file_path": "CLAUDE.md"},
+                            }
+                        ],
+                    },
+                    {
+                        "role": "user",
+                        "content": [
+                            {
+                                "type": "tool_result",
+                                "tool_use_id": tool_id,
+                                "content": read_output,
+                            }
+                        ],
+                    },
+                ]
+            )
+    for i in range(10):
+        messages.extend(
+            [
+                {"role": "user", "content": f"follow-up {i}"},
+                {"role": "assistant", "content": f"response {i}"},
+            ]
+        )
+
+    result = router.apply(messages, tokenizer)
+
+    if shape in ("openai", "openai-list"):
+        read_messages = [
+            m for m in result.messages if m.get("tool_call_id") in {"call_read_0", "call_read_1"}
+        ]
+        assert len(read_messages) == 2
+        for read_message in read_messages:
+            if shape == "openai-list":
+                assert read_message["content"] == [{"type": "text", "text": read_output}]
+            else:
+                assert read_message["content"] == read_output
+    else:
+        read_messages = [
+            m
+            for m in result.messages
+            if isinstance(m.get("content"), list)
+            and any(
+                block.get("tool_use_id") in {"call_read_0", "call_read_1"}
+                for block in m["content"]
+                if isinstance(block, dict)
+            )
+        ]
+        assert len(read_messages) == 2
+        assert all(m["content"][0]["content"] == read_output for m in read_messages)
+    assert "router:excluded:ignore.compress" in result.transforms_applied
+
+
 # ---------------------------------------------------------------------------
 # Test 4: protect_tool_results sentinel survives a profile-derived
 # read_protection_window kwarg, even when the protected output is old

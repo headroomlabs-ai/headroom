@@ -391,6 +391,28 @@ class TestMemoryExportImport:
             data = json.load(f)
         assert len(data) == 6
 
+    def test_export_refuses_ignored_output_file(
+        self,
+        runner: CliRunner,
+        populated_db: str,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        output_file = tmp_path / "backup.json"
+        original = b"keep this protected file\n"
+        output_file.write_bytes(original)
+        (tmp_path / ".headroomignore").write_text("backup.json\n")
+        monkeypatch.chdir(tmp_path)
+
+        result = runner.invoke(
+            main,
+            ["memory", "export", "--db-path", populated_db, "--output", str(output_file)],
+        )
+
+        assert result.exit_code != 0
+        assert output_file.read_bytes() == original
+        assert "ignored for mutation" in result.output
+
     def test_import_from_file(self, runner: CliRunner, temp_db: str, tmp_path: Path) -> None:
         """Import memories from file."""
         # Create import file

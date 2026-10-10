@@ -1062,6 +1062,56 @@ def _estimated_basis_note(cost: dict[str, Any]) -> str:
     return note
 
 
+def check_ignore_rules(
+    project_dir: Path | None = None, config: object | None = None
+) -> CheckResult:
+    """Surface the ``.headroomignore`` file / ``ignore.*`` config rules in effect.
+
+    Purely local (no proxy needed): always runs so users can see which paths
+    are shielded from compress/learn/mutate/memory before wiring up routing.
+
+    ``headroom doctor`` (the CLI) has no way to load a caller's in-process
+    ``HeadroomConfig`` — there is no on-disk config file format today — so it
+    only ever sees the ``.headroomignore`` file at ``project_dir``. Passing
+    ``config`` (e.g. from a programmatic caller that already holds a
+    ``HeadroomConfig``) additionally reports ``HeadroomConfig.ignore`` rules.
+    """
+    from headroom.ignore import IgnorePolicy
+
+    policy = IgnorePolicy.load(project_dir or Path.cwd(), config)
+    rules = policy.active_rules()
+    if policy.warnings:
+        hint_parts = list(policy.warnings)
+        if rules:
+            hint_parts.append("active rules: " + "; ".join(policy.describe()))
+        return CheckResult(
+            name="ignore-rules",
+            status=WARN,
+            summary=(
+                f"{len(policy.warnings)} problem(s) loading ignore rules"
+                + (f"; {len(rules)} active rule(s)" if rules else "")
+            ),
+            hint="; ".join(hint_parts),
+        )
+    if not rules:
+        return CheckResult(
+            name="ignore-rules",
+            status=PASS,
+            summary="no ignore rules configured",
+            hint=(
+                "add a .headroomignore file to protect generated files "
+                "(this check cannot see HeadroomConfig(ignore=...) unless a "
+                "caller passes it in — the CLI has no config-file loader today)"
+            ),
+        )
+    return CheckResult(
+        name="ignore-rules",
+        status=PASS,
+        summary=f"{len(rules)} active rule(s)",
+        hint="; ".join(policy.describe()),
+    )
+
+
 def check_deployments(manifests: list[Any], probe: Any = probe_json) -> CheckResult | None:
     """Probe persistent deployment health URLs. None when no deployments."""
     if not manifests:
@@ -1241,6 +1291,7 @@ def doctor(
         check_kompress_health(health),
         check_savings(stats, savings_path()),
         check_budget(stats),
+        check_ignore_rules(),
     ]
     from headroom.proxy.ssl_context import describe_trust_policy
 

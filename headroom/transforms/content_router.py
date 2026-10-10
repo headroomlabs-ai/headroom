@@ -2084,6 +2084,13 @@ class ContentRouterConfig:
     # Read lifecycle management (stale/superseded detection)
     read_lifecycle: ReadLifecycleConfig = field(default_factory=ReadLifecycleConfig)
 
+    # Central compress-ignore policy (issue #1150): a `headroom.ignore.IgnorePolicy`
+    # built by the caller (SDK `TransformPipeline` from `HeadroomConfig.ignore` /
+    # `.headroomignore`, or the proxy from `ProxyConfig.ignore`). When set, paths
+    # extracted from Read tool calls are protected from lifecycle and
+    # age-based tool-result compression. None preserves prior behavior.
+    ignore_policy: Any | None = None
+
     # Per-tool compression profiles (tool_name → CompressionProfile)
     # Set to None to use DEFAULT_TOOL_PROFILES from config
     tool_profiles: dict[str, Any] | None = None
@@ -5743,6 +5750,7 @@ class ContentRouter(Transform):
             lifecycle_mgr = ReadLifecycleManager(
                 self.config.read_lifecycle,
                 compression_store=injected_store,
+                ignore_policy=self.config.ignore_policy,
             )
             lifecycle_result = lifecycle_mgr.apply(
                 messages,
@@ -5863,6 +5871,18 @@ class ContentRouter(Transform):
             for tool_id, name in tool_name_map.items()
             if is_tool_excluded(name, ("headroom_retrieve",))
         }
+
+        ignored_compress_tool_ids: set[str] = set()
+        ignore_policy = self.config.ignore_policy
+        if ignore_policy is not None and any(
+            rule.applies_to("compress") for rule in ignore_policy.active_rules()
+        ):
+            from .read_lifecycle import ReadLifecycleManager
+
+            ignored_compress_tool_ids = ReadLifecycleManager(
+                self.config.read_lifecycle,
+                ignore_policy=ignore_policy,
+            ).ignored_read_tool_ids(messages)
 
         # Read protection (HEADROOM_PROTECT_READS=1): for bash-family agents the
         # exclude-by-tool-NAME set above never catches file reads (they are `bash`
@@ -6143,6 +6163,14 @@ class ContentRouter(Transform):
                 route_counts["hook_protected"] = route_counts.get("hook_protected", 0) + 1
                 continue
 
+            tool_call_id = message.get("tool_call_id", "") if role in ("tool", "function") else ""
+            if tool_call_id in ignored_compress_tool_ids:
+                result_slots[i] = message
+                transforms_applied.append("router:excluded:ignore.compress")
+                if collect_diagnostics:
+                    _diag[i] = "protected:ignore.compress"
+                continue
+
             messages_from_end = num_messages - i
             # The caller's own words stay verbatim on a replaying path even
             # when user messages are compressible for their tool observations:
@@ -6184,6 +6212,7 @@ class ContentRouter(Transform):
                     compress_assistant_text_blocks=compress_assistant_text_blocks,
                     prefix_replay_guaranteed=prefix_replay_guaranteed,
                     protect_prompt_text=prompt_turn,
+                    ignored_compress_tool_ids=ignored_compress_tool_ids,
                 )
                 result_slots[i] = transformed_message
                 route_counts["content_blocks"] += 1
@@ -6213,7 +6242,6 @@ class ContentRouter(Transform):
             # tool_call_id -> ccr_retrieve_tool_ids, precomputed above) and legacy
             # role:"function" (that shape carries no call id -- the tool name is on
             # the message itself via "name", per OpenAI's pre-parallel-tool-calls API).
-            tool_call_id = message.get("tool_call_id", "") if role in ("tool", "function") else ""
             if role in ("tool", "function") and (
                 tool_call_id in ccr_retrieve_tool_ids
                 or (
@@ -6771,7 +6799,11 @@ class ContentRouter(Transform):
         # cache_control blocks are reference targets only (never rewritten).
         if self._cross_turn_dedup_enabled and dedup_pointers_recoverable:
             transformed_messages = self._cross_turn_dedup_messages(
-                transformed_messages, frozen_message_count, transforms_applied, route_counts
+                transformed_messages,
+                frozen_message_count,
+                transforms_applied,
+                route_counts,
+                ignored_compress_tool_ids=ignored_compress_tool_ids,
             )
 
         tokens_after = sum(
@@ -7034,6 +7066,7 @@ class ContentRouter(Transform):
         frozen_message_count: int,
         transforms_applied: list[str],
         route_counts: dict[str, int] | None,
+        ignored_compress_tool_ids: set[str] | None = None,
     ) -> list[dict[str, Any]]:
         """Whole-conversation verbatim de-dup pass (cache-safe, information-lossless).
 
@@ -7057,6 +7090,7 @@ class ContentRouter(Transform):
                 for tool_id, name in tool_name_map.items()
                 if is_tool_excluded(name, DEFAULT_VERBATIM_EXCLUDE_TOOLS)
             }
+            ignored_tool_ids = ignored_compress_tool_ids or set()
 
             def _is_user_read_observation(idx: int) -> bool:
                 # A file read can land in a plain ``role:user`` STRING (text
@@ -7087,6 +7121,7 @@ class ContentRouter(Transform):
                             frozen
                             or ("cache_control" in block)
                             or block.get("tool_use_id") in verbatim_tool_ids
+                            or block.get("tool_use_id") in ignored_tool_ids
                         )
                         if isinstance(tc, str) and tc:
                             locs.append((i, bidx, None))
@@ -7125,6 +7160,7 @@ class ContentRouter(Transform):
                             frozen
                             or ("cache_control" in msg)
                             or msg.get("tool_call_id") in verbatim_tool_ids
+                            or msg.get("tool_call_id") in ignored_tool_ids
                         )
                         locs.append((i, None, None))
                         dblocks.append(DedupBlock(text=content, turn=i, protected=protected))
@@ -7196,6 +7232,7 @@ class ContentRouter(Transform):
         compress_assistant_text_blocks: bool = False,
         prefix_replay_guaranteed: bool = False,
         protect_prompt_text: bool = False,
+        ignored_compress_tool_ids: set[str] | None = None,
     ) -> dict[str, Any]:
         """Process content blocks (Anthropic format) for compression.
 
@@ -7314,6 +7351,13 @@ class ContentRouter(Transform):
             if block_type == "tool_result":
                 # Check if tool is excluded from compression
                 tool_use_id = block.get("tool_use_id", "")
+                if tool_use_id in (ignored_compress_tool_ids or set()):
+                    new_blocks.append(block)
+                    transforms_applied.append("router:excluded:ignore.compress")
+                    if route_counts is not None:
+                        route_counts["excluded_tool"] += 1
+                    continue
+
                 # Flatten OpenAI-style list-form content up front (see fix-7 note below)
                 # so both the read-protection content check and the compressor see the
                 # same text.
