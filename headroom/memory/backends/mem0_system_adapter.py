@@ -7,7 +7,7 @@ required by MemorySystem, enabling Mem0 to be used with the memory tools system.
     Nothing in Headroom uses this adapter. For local mode (Qdrant + Neo4j), use
     ``DirectMem0Adapter`` (``headroom.memory.backends.direct_mem0``), which also
     satisfies the MemoryBackend protocol. ``save_memory`` skips Mem0's LLM
-    extraction only when the caller passes pre-extracted ``facts``,
+    extraction only when the caller passes non-empty pre-extracted ``facts``,
     ``extracted_entities`` or ``extracted_relationships``. Passing only ``content``
     with ``entities``/``relationships`` still runs Mem0's extraction. Cloud mode
     (``Mem0Config(mode="cloud")``) has no replacement in Headroom; use the ``mem0``
