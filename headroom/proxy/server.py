@@ -166,8 +166,8 @@ from headroom.proxy.models import (  # noqa: F401
     ProxyConfig,
     RateLimitState,
     RequestLog,
-    warn_if_max_items_configured,
     default_periodic_malloc_trim,
+    warn_if_max_items_configured,
 )
 from headroom.proxy.modes import (
     PROXY_MODE_CACHE,
