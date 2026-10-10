@@ -1,7 +1,7 @@
 """Tests for the declarative WrapTarget registry and its generated commands.
 
 Every target gets the same end-to-end checks (missing binary, --prepare-only,
-env routing on launch); the rest pins the banner, parity with the aider builder
+env routing on launch, Bob included); the rest pins the banner, parity with the aider builder
 openclaude used to call, and the option surface. Bob's preflight has its own
 suite in test_wrap_bob.
 """
@@ -55,6 +55,14 @@ def _project_prefix(cwd: Path) -> str:
     ("name", "args", "expected_env"),
     [
         (
+            "bob",
+            ("--port", "9000", "--", "-p", "hello"),
+            lambda cwd: {
+                # Bare origin: Bob appends /inference/v1/... itself.
+                "BOB_GATEWAY_URL": f"http://127.0.0.1:9000{_project_prefix(cwd)}",
+            },
+        ),
+        (
             "goose",
             ("--port", "9000", "--", "session"),
             lambda _cwd: {
@@ -93,6 +101,8 @@ def test_launch_routes_tool_env_through_proxy(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.chdir(tmp_path)
+    # Bob's preflight reads ~/.bob/settings; keep it off the real home.
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
     monkeypatch.setattr(wrap_mod.shutil, "which", lambda binary: f"/usr/bin/{binary}")
     captured: dict = {}
     monkeypatch.setattr(wrap_mod, "_launch_tool", lambda **kw: captured.update(kw))
