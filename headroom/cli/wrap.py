@@ -722,17 +722,24 @@ def _start_proxy(
     The caller is responsible for ensuring *port* is available
     (see ``_find_available_port``).
     """
-
-    cmd = [
-        sys.executable,
-        "-m",
-        "headroom.cli",
-        "proxy",
-        "--port",
-        str(port),
-        "--workers",
-        "1",
-    ]
+    # Keep the launching process's cwd out of the proxy's sys.path. Without
+    # this, a checkout with a top-level `headroom/` package (e.g. this repo)
+    # shadows the installed package and drops its compiled `headroom._core`
+    # extension. Python 3.11+ supports -P (PYTHONSAFEPATH); on Python 3.10,
+    # `-c` puts cwd at sys.path[0], so remove it before running the CLI module.
+    if sys.version_info < (3, 11):
+        cmd = [
+            sys.executable,
+            "-c",
+            (
+                "import runpy, sys; sys.path.pop(0); "
+                "runpy.run_module('headroom.cli', run_name='__main__', alter_sys=True)"
+            ),
+        ]
+    else:
+        # Python 3.11+ honors PYTHONSAFEPATH=1 in proxy_env below.
+        cmd = [sys.executable, "-m", "headroom.cli"]
+    cmd.extend(["proxy", "--port", str(port), "--workers", "1"])
 
     # Forward HEADROOM_MODE env var so the proxy respects the user's mode choice
     headroom_mode = os.environ.get("HEADROOM_MODE")
