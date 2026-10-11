@@ -1929,11 +1929,13 @@ def test_dedicated_copilot_proxy_reads_extensions_from_the_manifest(monkeypatch)
 def test_dedicated_copilot_proxy_reads_extensions_from_the_manifest_proxy_args(monkeypatch) -> None:
     """A manifest edited by hand can enable extensions as ``--proxy-extension``
     flags in ``proxy_args``; the runtime passes them to the proxy verbatim, so
-    they count, in both flag forms and alongside ``base_env``."""
+    they count, in both flag forms. Click lets the flag outrank
+    ``HEADROOM_PROXY_EXTENSIONS``, so a ``base_env`` value next to the flags is
+    not something the shared proxy ran and must not be carried."""
     monkeypatch.delenv("HEADROOM_PROXY_EXTENSIONS", raising=False)
 
     class _ArgsManifest(_Manifest):
-        base_env = {"HEADROOM_PROXY_EXTENSIONS": "control_plane"}
+        base_env = {"HEADROOM_PROXY_EXTENSIONS": "skill_search"}
         proxy_args = [
             "--host",
             "127.0.0.1",

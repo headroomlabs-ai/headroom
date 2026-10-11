@@ -4538,33 +4538,35 @@ def _echo_unwrap_proxy_stop_status(status: str, port: int) -> None:
 def _manifest_proxy_extensions(manifest: Any) -> list[str] | None:
     """Extension names a persistent deployment was installed with.
 
-    Two places in the manifest can say: ``HEADROOM_PROXY_EXTENSIONS`` in
+    Two places in the manifest can say: ``--proxy-extension`` flags in
+    ``proxy_args``, which the runtime passes to the proxy verbatim (an operator
+    who edited the manifest by hand), and ``HEADROOM_PROXY_EXTENSIONS`` in
     ``base_env`` (``headroom install --env ...``, the only form the installer
-    writes) and ``--proxy-extension`` flags in ``proxy_args``, which the
-    runtime passes to the proxy verbatim, so an operator who edited the
-    manifest by hand gets the extensions they named. The two are combined.
+    writes). They are read the way the proxy reads them: click lets the flag
+    outrank the environment variable, so when ``proxy_args`` names any
+    extension that list is the whole answer and ``base_env`` is ignored.
     A manifest with neither is no evidence either way: the deployment's
     runtime env is layered on the launch environment, so the proxy may still
     have inherited a set. Only an explicit value (possibly empty) is an answer.
     """
-    values: list[str] = []
-    found = False
-    base_env = getattr(manifest, "base_env", None)
-    configured = base_env.get("HEADROOM_PROXY_EXTENSIONS") if isinstance(base_env, dict) else None
-    if isinstance(configured, str):
-        found = True
-        values.append(configured)
+    flags: list[str] = []
     args = getattr(manifest, "proxy_args", None)
     if isinstance(args, (list, tuple)):
         for i, arg in enumerate(args):
             if arg == "--proxy-extension" and i + 1 < len(args):
-                found = True
-                values.append(str(args[i + 1]))
+                flags.append(str(args[i + 1]))
             elif isinstance(arg, str) and arg.startswith("--proxy-extension="):
-                found = True
-                values.append(arg.partition("=")[2])
-    if not found:
-        return None
+                flags.append(arg.partition("=")[2])
+    if flags:
+        values = flags
+    else:
+        base_env = getattr(manifest, "base_env", None)
+        configured = (
+            base_env.get("HEADROOM_PROXY_EXTENSIONS") if isinstance(base_env, dict) else None
+        )
+        if not isinstance(configured, str):
+            return None
+        values = [configured]
     return sorted({name.strip() for value in values for name in value.split(",") if name.strip()})
 
 
