@@ -556,12 +556,11 @@ pub(crate) async fn forward_http(
     // (not just auth_mode) in extensions lets downstream stages read
     // the gate they need directly — no per-stage `for_mode` call.
     //
-    // c3/6: when `auth_mode_policy_enforcement` is `Disabled` (default
-    // until c6/6), force the policy to PAYG regardless of classifier
-    // output. This means c4/6 + c5/6 only ship behaviour change when
-    // an operator opts in via the env var, so the PR sequence is
-    // safely landed in main without flipping the live wire on default
-    // users until the final commit.
+    // When `auth_mode_policy_enforcement` is `Disabled`, force the
+    // policy to PAYG regardless of classifier output. The default is
+    // `Enabled` (see `config.rs`); operators opt out via
+    // `HEADROOM_PROXY_AUTH_MODE_POLICY_ENFORCEMENT=disabled`, the same
+    // env var the Python proxy reads.
     let policy = if state.config.auth_mode_policy_enforcement.is_enabled() {
         CompressionPolicy::for_mode(auth_mode)
     } else {
