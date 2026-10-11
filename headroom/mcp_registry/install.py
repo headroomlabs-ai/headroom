@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import os
+import shutil
 from collections.abc import Iterable
 
 from headroom.install.runtime import resolve_headroom_command
@@ -16,6 +18,9 @@ from .opencode import OpencodeRegistrar
 #: Default proxy URL used when none is given.
 DEFAULT_PROXY_URL = "http://127.0.0.1:8787"
 CLAUDE_SERENA_CONTEXT = "claude-code"
+
+#: Name Ix's own ``ix mcp install`` registers its MCP server under.
+IX_MCP_SERVER_NAME = "ix-memory"
 
 
 def get_all_registrars() -> list[MCPRegistrar]:
@@ -81,6 +86,40 @@ def build_serena_spec(context: str) -> ServerSpec:
             "False",
         ),
     )
+
+
+def _ix_launcher() -> str:
+    """Return the command an agent should spawn to run ``ix``.
+
+    Mirrors Ix's own ``ix mcp install`` so the two produce the same entry: the
+    bare name on POSIX (it survives an upgrade that moves the install), and on
+    Windows the resolved path of an executable ``where ix`` match. npm ships
+    ``ix.cmd`` but no ``ix.exe``, and an agent spawning the bare name through
+    CreateProcess never consults PATHEXT, so the bare name cannot start there.
+    """
+    if os.name != "nt":
+        return "ix"
+    found = shutil.which("ix")
+    extensions = [
+        ext.strip().lower()
+        for ext in os.environ.get("PATHEXT", ".COM;.EXE;.BAT;.CMD").split(";")
+        if ext.strip()
+    ]
+    if found and any(found.lower().endswith(ext) for ext in extensions):
+        return found
+    return "ix"
+
+
+def build_ix_spec() -> ServerSpec:
+    """Construct the Ix code-graph MCP server spec.
+
+    Ix (https://github.com/ix-infrastructure/Ix) serves its code graph over
+    stdio with ``ix mcp``. The name and command match what ``ix mcp install``
+    writes, so a user who already registered Ix themselves gets "already
+    registered" rather than a mismatch. Ix keeps its own graph current; the
+    repository only has to be mapped once with ``ix map``.
+    """
+    return ServerSpec(name=IX_MCP_SERVER_NAME, command=_ix_launcher(), args=("mcp",))
 
 
 def install_everywhere(

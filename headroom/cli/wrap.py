@@ -1047,14 +1047,16 @@ _serena_instructions_option = click.option(
 
 
 # --- Code-memory MCP selection ------------------------------------------------
-# The code-memory MCP is Serena by default; turn it off with --code-memory none.
+# The code-memory MCP is Serena by default; --code-memory ix registers the Ix
+# code-graph MCP instead, and --code-memory none turns it off.
 # Selection flows through HEADROOM_CODE_MEMORY (set by the eager --code-memory
 # callback) so it works the same on every agent without threading a param
 # through each subcommand — the same approach as _serena_instructions_option above.
 _CODE_MEMORY_ENV = "HEADROOM_CODE_MEMORY"
 _CODE_MEMORY_SERENA = "serena"
+_CODE_MEMORY_IX = "ix"
 _CODE_MEMORY_NONE = "none"
-_VALID_CODE_MEMORY = {_CODE_MEMORY_SERENA, _CODE_MEMORY_NONE}
+_VALID_CODE_MEMORY = {_CODE_MEMORY_SERENA, _CODE_MEMORY_IX, _CODE_MEMORY_NONE}
 
 
 def _resolve_code_memory(kwargs: dict[str, Any]) -> str:
@@ -1063,7 +1065,8 @@ def _resolve_code_memory(kwargs: dict[str, Any]) -> str:
     Precedence: the explicit selector (``--code-memory`` / ``HEADROOM_CODE_MEMORY``)
     wins; otherwise the deprecated ``--serena`` / ``--no-serena`` flags map into
     it; otherwise the default is ``serena`` — mature, offline, symbol-level code
-    navigation. The retired ``tokensave`` option is accepted gracefully: an
+    navigation (``ix`` selects the Ix code-graph MCP instead). The retired
+    ``tokensave`` option is accepted gracefully: an
     explicit ``tokensave`` selector (or the deprecated ``--no-tokensave`` flag)
     now resolves to Serena.
     """
@@ -1096,13 +1099,14 @@ def _code_memory_flag_callback(ctx: Any, param: Any, value: str | None) -> str |
 # through HEADROOM_CODE_MEMORY.
 _code_memory_option = click.option(
     "--code-memory",
-    type=click.Choice([_CODE_MEMORY_SERENA, _CODE_MEMORY_NONE]),
+    type=click.Choice([_CODE_MEMORY_SERENA, _CODE_MEMORY_IX, _CODE_MEMORY_NONE]),
     default=None,
     expose_value=False,
     is_eager=True,
     callback=_code_memory_flag_callback,
     help=(
-        "Code-memory MCP to register: 'serena' (default) or 'none'. "
+        "Code-memory MCP to register: 'serena' (default), 'ix' (the Ix code-graph "
+        "MCP; needs `ix` on PATH and a repo mapped with `ix map`) or 'none'. "
         "Also set by HEADROOM_CODE_MEMORY. Replaces --serena/--no-serena."
     ),
 )
@@ -2734,34 +2738,63 @@ def _retire_user_scope_serena(registrar: Any) -> None:
     registrars without scopes (Codex, Grok, OpenCode) and when the user asked
     for user scope explicitly.
     """
+    _retire_user_scope_entry(registrar, "serena", label="Serena MCP")
+
+
+def _retire_user_scope_entry(registrar: Any, server_name: str, *, label: str) -> None:
+    """Remove a Headroom-installed machine-wide ``server_name`` entry.
+
+    Runs once the project-scoped entry is in place, so the global copy is
+    redundant. Only an entry the ledger proves Headroom installed is removed.
+
+    Args:
+        registrar: Agent registrar; a no-op unless it writes at Claude Code's
+            ``local`` scope.
+        server_name: MCP server name to retire (e.g. ``"serena"``).
+        label: Display label used in the confirmation line.
+    """
     from headroom.mcp_registry.claude import SCOPE_LOCAL, SCOPE_USER
     from headroom.mcp_registry.ledger import clear_install, headroom_installed_matching
 
     if getattr(registrar, "scope", None) != SCOPE_LOCAL:
         return
     try:
-        global_entry = registrar.get_server("serena", scope=SCOPE_USER)
+        global_entry = registrar.get_server(server_name, scope=SCOPE_USER)
     except TypeError:  # registrar predates scoped reads
         return
     if not headroom_installed_matching(registrar.name, global_entry):
         return
-    if registrar.unregister_server("serena", scope=SCOPE_USER):
+    if registrar.unregister_server(server_name, scope=SCOPE_USER):
         # Clear the legacy ledger record along with the config entry it
         # authorized — otherwise its fingerprint outlives the migration and
         # can later be mistaken for proof that Headroom owns a same-named
         # entry the user installs globally themselves.
-        clear_install(registrar.name, "serena")
+        clear_install(registrar.name, server_name)
         click.echo(
-            "  Serena MCP: removed the machine-wide entry an earlier wrap installed "
+            f"  {label}: removed the machine-wide entry an earlier wrap installed "
             "(it now loads only in this project)"
         )
 
 
 def _remove_headroom_installed_serena_mcp(registrar: Any) -> str:
     """Remove Serena MCP only if the ledger proves Headroom installed it."""
+    return _remove_headroom_installed_mcp(registrar, "serena")
+
+
+def _remove_headroom_installed_mcp(registrar: Any, server_name: str) -> str:
+    """Remove a code-memory MCP entry only if the ledger proves Headroom installed it.
+
+    Args:
+        registrar: Agent registrar to remove the entry from.
+        server_name: MCP server name (e.g. ``"serena"`` or ``"ix-memory"``).
+
+    Returns:
+        ``"removed"``, ``"not_headroom_owned"`` (absent, or user-managed and
+        left in place) or ``"failed"``.
+    """
     from headroom.mcp_registry.ledger import clear_install, headroom_installed_matching
 
-    # Claude can own one Serena entry per project plus a legacy user entry.
+    # Claude can own one entry per project plus a legacy user entry.
     # Examine each relevant scope independently: an unscoped delete would
     # remove entries whose scope-specific ledger record did not authorize it.
     if hasattr(registrar, "ownership_key"):
@@ -2769,28 +2802,28 @@ def _remove_headroom_installed_serena_mcp(registrar: Any) -> str:
 
         found_owned = False
         for scope in (SCOPE_LOCAL, SCOPE_USER):
-            current = registrar.get_server("serena", scope=scope)
-            ownership_key = registrar.ownership_key("serena", scope=scope)
+            current = registrar.get_server(server_name, scope=scope)
+            ownership_key = registrar.ownership_key(server_name, scope=scope)
             if current is None:
                 # Nothing left to protect — an ownership record must not
                 # outlive the entry it authorized.
-                clear_install(registrar.name, "serena", ownership_key=ownership_key)
+                clear_install(registrar.name, server_name, ownership_key=ownership_key)
                 continue
             if not headroom_installed_matching(
                 registrar.name, current, ownership_key=ownership_key
             ):
                 continue
             found_owned = True
-            if not registrar.unregister_server("serena", scope=scope):
+            if not registrar.unregister_server(server_name, scope=scope):
                 return "failed"
-            clear_install(registrar.name, "serena", ownership_key=ownership_key)
+            clear_install(registrar.name, server_name, ownership_key=ownership_key)
         return "removed" if found_owned else "not_headroom_owned"
 
-    current = registrar.get_server("serena")
+    current = registrar.get_server(server_name)
     if not headroom_installed_matching(registrar.name, current):
         return "not_headroom_owned"
-    if registrar.unregister_server("serena"):
-        clear_install(registrar.name, "serena")
+    if registrar.unregister_server(server_name):
+        clear_install(registrar.name, server_name)
         return "removed"
     return "failed"
 
@@ -2899,16 +2932,184 @@ def _disable_tokensave_mcp(registrar: Any, *, verbose: bool = False) -> None:
         )
 
 
+# =============================================================================
+# Ix — opt-in code-graph MCP (--code-memory ix). Ix indexes the repository
+# itself (``ix map``) and keeps its graph current, so Headroom only registers
+# the ``ix mcp`` stdio server and never runs any indexing.
+# =============================================================================
+
+_IX_INSTALL_URL = "https://github.com/ix-infrastructure/Ix"
+
+
+def _ix_specs_equivalent(a: Any, b: Any) -> bool:
+    """Whether two MCP specs launch the same server."""
+    return a.command == b.command and tuple(a.args) == tuple(b.args) and dict(a.env) == dict(b.env)
+
+
+def _user_scope_ix_left_in_place(registrar: Any, spec: Any) -> bool:
+    """Leave a user-managed machine-wide ``ix-memory`` entry alone (Claude only).
+
+    ``ix mcp install`` registers Ix at Claude Code's ``user`` scope. Adding a
+    project-scope copy on top would duplicate a matching entry, or shadow one
+    the user pointed elsewhere, so when the user already has their own
+    machine-wide entry (absent from our ledger) and this project has none,
+    Headroom reports it and writes nothing.
+
+    Returns:
+        True when such an entry exists and registration should be skipped.
+    """
+    from headroom.mcp_registry.claude import SCOPE_LOCAL, SCOPE_USER
+    from headroom.mcp_registry.ledger import headroom_installed_matching
+
+    if getattr(registrar, "scope", None) != SCOPE_LOCAL:
+        return False
+    try:
+        if registrar.get_server(spec.name, scope=SCOPE_LOCAL) is not None:
+            return False
+        global_entry = registrar.get_server(spec.name, scope=SCOPE_USER)
+    except TypeError:  # registrar predates scoped reads
+        return False
+    if global_entry is None or headroom_installed_matching(registrar.name, global_entry):
+        return False
+    if _ix_specs_equivalent(global_entry, spec):
+        click.echo(
+            "  Ix MCP: already registered for every Claude Code session "
+            "(user-managed, e.g. by `ix mcp install`) — leaving it in place"
+        )
+    else:
+        click.echo(
+            f"  Ix MCP: a user-managed '{spec.name}' entry is registered for every "
+            f"Claude Code session ({global_entry.command} {' '.join(global_entry.args)}) "
+            "— leaving it in place"
+        )
+    return True
+
+
+def _setup_ix_mcp(registrar: Any, *, verbose: bool = False, force: bool = False) -> None:
+    """Register the Ix code-graph MCP (``ix-memory``) with the given agent (idempotent).
+
+    The entry matches what Ix's own ``ix mcp install`` writes (name
+    ``ix-memory``, command ``ix mcp``), so a user who registered Ix themselves
+    sees "already registered" rather than a mismatch. Ownership follows the
+    same ledger rules as Serena: an entry Headroom installed is migrated to
+    the current spec, a user-managed one is never overwritten (the mismatch
+    is reported instead).
+
+    Args:
+        registrar: Agent registrar to write the entry with.
+        verbose: Also print quiet outcomes (already registered, skips).
+        force: Accepted for parity with :func:`_setup_serena_mcp`. It never
+            overrides a user-managed ``ix-memory``: only an entry the ledger
+            proves Headroom installed is replaced, which already happens
+            without it.
+    """
+    from headroom.mcp_registry import build_ix_spec, format_result
+    from headroom.mcp_registry.base import RegisterStatus
+    from headroom.mcp_registry.ledger import headroom_installed_matching, record_install
+
+    del force  # see docstring: ownership, not the flag, decides overwrites
+    spec = build_ix_spec()
+    ownership_key = getattr(registrar, "ownership_key", lambda name: name)(spec.name)
+
+    if not registrar.detect():
+        if verbose:
+            click.echo(f"  Ix MCP: {registrar.display_name} not detected — skipping")
+        return
+
+    if shutil.which("ix") is None:
+        click.echo(f"  Ix MCP: `ix` not found on PATH — install Ix ({_IX_INSTALL_URL}); skipping")
+        return
+
+    if _user_scope_ix_left_in_place(registrar, spec):
+        return
+
+    scope_kw: dict[str, Any] = {}
+    if hasattr(registrar, "ownership_key"):
+        scope_kw = {"scope": registrar.scope}
+
+    result = registrar.register_server(spec, force=False)
+    owned_drift = result.status == RegisterStatus.MISMATCH and headroom_installed_matching(
+        registrar.name, registrar.get_server(spec.name, **scope_kw), ownership_key=ownership_key
+    )
+    # Migrate an entry Headroom installed from an older spec; never a user's.
+    if owned_drift:
+        result = registrar.register_server(spec, force=True)
+        if result.status == RegisterStatus.REGISTERED:
+            click.echo("  Ix MCP: migrated previously-installed entry to current spec")
+
+    # Must run before record_install: the ledger still holds the fingerprint of
+    # a machine-wide entry an earlier --code-memory-scope user wrap installed.
+    if result.ok:
+        _retire_user_scope_entry(registrar, spec.name, label="Ix MCP")
+
+    if result.status == RegisterStatus.REGISTERED:
+        record_install(registrar.name, spec, ownership_key=ownership_key)
+
+    line = format_result(
+        registrar.name,
+        result,
+        label="Ix MCP",
+        verbose=verbose,
+        overwrite_hint=(
+            "run headroom wrap again"
+            if owned_drift
+            else f"update or remove the existing {spec.name} MCP entry, then rerun headroom wrap"
+        ),
+        restart_hint=f"restart {registrar.display_name} if it was already running",
+    )
+    if line is not None:
+        click.echo(line)
+
+    if result.status == RegisterStatus.REGISTERED or verbose:
+        _echo_serena_scope_note(registrar)
+    if result.status == RegisterStatus.REGISTERED:
+        click.echo("    map this repository once with `ix map`; Ix keeps the graph current")
+
+
+def _disable_ix_mcp(registrar: Any, *, verbose: bool = False, reason: str) -> None:
+    """Remove a Headroom-installed ``ix-memory`` entry; leave a user's own in place.
+
+    Args:
+        registrar: Agent registrar to remove the entry from.
+        verbose: Also print quiet outcomes.
+        reason: Why it is being removed, surfaced in the message
+            (e.g. ``"--code-memory serena"``).
+    """
+    from headroom.mcp_registry import IX_MCP_SERVER_NAME
+
+    if not registrar.detect() or registrar.get_server(IX_MCP_SERVER_NAME) is None:
+        return
+
+    status = _remove_headroom_installed_mcp(registrar, IX_MCP_SERVER_NAME)
+    if status == "removed":
+        click.echo(f"  Removed previously-installed Ix MCP ({reason})")
+        click.echo(f"    restart {registrar.display_name} if it was already running")
+    elif status == "not_headroom_owned":
+        if verbose:
+            click.echo(
+                "  Ix MCP is present but user-managed — leaving it in place "
+                "(Headroom only removes entries it installed)"
+            )
+    else:  # "failed"
+        click.echo(
+            f"  Ix MCP: removal failed — remove the '{IX_MCP_SERVER_NAME}' entry "
+            "from your MCP config manually"
+        )
+
+
 def _setup_coding_compressor(registrar: Any, *, serena_context: str, **kwargs: Any) -> None:
     """Set up the code-memory MCP, selected via ``--code-memory`` (default serena).
 
     Selection (see :func:`_resolve_code_memory`):
 
     * ``serena`` (default) — register Serena (mature, offline, symbol-level).
+    * ``ix`` — register the Ix code-graph MCP (``ix mcp``) instead of Serena.
     * ``none`` — register nothing.
 
-    Either way, any Headroom-installed ``tokensave`` entry from a prior release
-    is removed (tokensave was retired in favour of Serena). The deprecated
+    Whatever the selection, any Headroom-installed ``tokensave`` entry from a
+    prior release is removed (tokensave was retired in favour of Serena), and
+    the code-memory MCP that was not selected is removed if Headroom installed
+    it (Serena for ``ix``, Ix for ``serena`` / ``none``). The deprecated
     ``--serena`` / ``--no-serena`` flags map into the selector; user-managed MCP
     entries are always left untouched (ledger).
     """
@@ -2918,6 +3119,13 @@ def _setup_coding_compressor(registrar: Any, *, serena_context: str, **kwargs: A
 
     # Retire any tokensave entry a prior release installed, whatever the selection.
     _disable_tokensave_mcp(registrar, verbose=verbose)
+
+    if selection == _CODE_MEMORY_IX:
+        _disable_serena_mcp(registrar, verbose=verbose, reason="--code-memory ix")
+        _setup_ix_mcp(registrar, verbose=verbose, force=force)
+        return
+
+    _disable_ix_mcp(registrar, verbose=verbose, reason=f"--code-memory {selection}")
 
     if selection == _CODE_MEMORY_NONE:
         _disable_serena_mcp(registrar, verbose=verbose, reason="--code-memory none")
@@ -5979,6 +6187,7 @@ def claude(
         headroom wrap claude --no-mcp           # Skip MCP retrieve tool registration
         headroom wrap claude --project-settings # Persist proxy routing in .claude/settings.local.json
         headroom wrap claude --code-memory none # No code-memory MCP
+        headroom wrap claude --code-memory ix   # Ix code-graph MCP instead of Serena
         headroom wrap claude --code-memory-scope user  # Serena in every session, not just here
         headroom wrap claude --1m               # Preserve the 1M context window
     """
@@ -6411,6 +6620,7 @@ def unwrap_claude(
             removed_code_graph = registrar.unregister_server(_CBM_MCP_SERVER_NAME)
             tokensave_status = _remove_headroom_installed_tokensave_mcp(registrar)
             serena_status = _remove_headroom_installed_serena_mcp(registrar)
+            ix_status = _remove_headroom_installed_mcp(registrar, "ix-memory")
             if removed_headroom:
                 click.echo("  Removed Headroom MCP retrieve tool from Claude.")
             else:
@@ -6427,6 +6637,10 @@ def unwrap_claude(
                 click.echo("  Removed Headroom-installed Serena MCP server from Claude.")
             elif serena_status == "failed":
                 click.echo("  Serena MCP server matched Headroom ledger but could not be removed.")
+            if ix_status == "removed":
+                click.echo("  Removed Headroom-installed Ix MCP server from Claude.")
+            elif ix_status == "failed":
+                click.echo("  Ix MCP server matched Headroom ledger but could not be removed.")
         else:
             click.echo("  Claude Code not detected; skipped MCP cleanup.")
     else:
@@ -8885,6 +9099,12 @@ def unwrap_codex(port: int, no_stop_proxy: bool) -> None:
         elif serena_status == "failed":
             click.echo("  Serena MCP server matched Headroom ledger but could not be removed.")
 
+        ix_status = _remove_headroom_installed_mcp(codex_registrar, "ix-memory")
+        if ix_status == "removed":
+            click.echo("  Removed Headroom-installed Ix MCP server from Codex.")
+        elif ix_status == "failed":
+            click.echo("  Ix MCP server matched Headroom ledger but could not be removed.")
+
     if status in {"restored", "cleaned", "removed"}:
         # Hand the threads back to the native-provider menu so the full history
         # stays visible once Codex no longer routes through Headroom. Best-effort.
@@ -9047,6 +9267,13 @@ def unwrap_grok(port: int, no_stop_proxy: bool) -> None:
             removed_any = True
         elif serena_status == "failed":
             click.echo("  Serena MCP server matched Headroom ledger but could not be removed.")
+
+        ix_status = _remove_headroom_installed_mcp(grok_registrar, "ix-memory")
+        if ix_status == "removed":
+            click.echo("  Removed Headroom-installed Ix MCP server from Grok.")
+            removed_any = True
+        elif ix_status == "failed":
+            click.echo("  Ix MCP server matched Headroom ledger but could not be removed.")
 
         if grok_registrar.unregister_server("headroom"):
             click.echo("  Removed Headroom MCP server from Grok config.")
