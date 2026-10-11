@@ -175,6 +175,7 @@ from headroom.proxy.project_context import (
     set_registered_cwd,
     strip_project_path_prefix,
 )
+from headroom.proxy.project_policy import split_project_path
 from headroom.proxy.prometheus_metrics import PrometheusMetrics
 from headroom.proxy.rate_limiter import TokenBucketRateLimiter
 from headroom.proxy.request_body_limit import RequestBodyLimitMiddleware
@@ -4146,15 +4147,18 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
             client_host = getattr(client, "host", None) if client is not None else None
             # Anthropic SDK clients (Claude Code among them) probe reachability
             # with an unauthenticated GET/HEAD /api/hello that never carries
-            # custom headers, so it cannot hold the proxy token. Answer it here,
-            # empty, instead of 401ing every correctly configured client. It is
-            # deliberately not in _AUTH_EXEMPT_PATHS: that would hand the probe
-            # to the passthrough relay, i.e. an anonymous upstream request.
-            if path == "/api/hello" and request.method in ("GET", "HEAD"):
-                probe = Response(status_code=200)
-                _apply_security_headers(probe)
-                return probe
-            exempt = request.method == "GET" and path in _AUTH_EXEMPT_PATHS
+            # custom headers, so it cannot hold the proxy token. Let it past
+            # the token check, marked so its passthrough route answers it
+            # locally and empty instead of relaying an anonymous request
+            # upstream. It still runs through extension middleware, which sits
+            # inside this gate and may refuse it. The path is matched as
+            # routed: a /p/<project> prefix is only stripped further in.
+            hello_probe = (
+                request.method in ("GET", "HEAD") and split_project_path(path)[1] == "/api/hello"
+            )
+            if hello_probe:
+                request.state.headroom_local_hello_probe = True
+            exempt = hello_probe or (request.method == "GET" and path in _AUTH_EXEMPT_PATHS)
             if not exempt and not is_loopback_host(client_host):
                 provided = _extract_proxy_token(request.headers)
                 if provided is None or not hmac.compare_digest(
