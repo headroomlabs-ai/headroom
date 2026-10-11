@@ -1942,6 +1942,41 @@ def test_dedicated_copilot_proxy_falls_back_to_the_manifest_for_an_older_proxy(
     assert "could not read the extensions" not in capsys.readouterr().out
 
 
+def test_dedicated_copilot_proxy_warns_for_an_older_proxy_whose_manifest_is_silent(
+    monkeypatch, capsys
+) -> None:
+    """A manifest without HEADROOM_PROXY_EXTENSIONS does not prove the running
+    proxy has none (its runtime env layers on the launch environment), so an
+    older proxy plus a silent manifest is unknown and warns."""
+    monkeypatch.delenv("HEADROOM_PROXY_EXTENSIONS", raising=False)
+
+    class _SilentManifest(_Manifest):
+        base_env = {"ANTHROPIC_API_KEY": "sk-ant-redacted"}
+
+    kwargs = _dedicated_start(
+        monkeypatch, health={"config": {"pid": "1"}}, manifest=_SilentManifest()
+    )
+
+    assert kwargs["proxy_extensions"] is None
+    assert "Warning: could not read the extensions of the proxy on port 8787" in (
+        capsys.readouterr().out
+    )
+
+
+def test_dedicated_copilot_proxy_trusts_an_explicitly_empty_manifest_value(
+    monkeypatch, capsys
+) -> None:
+    monkeypatch.delenv("HEADROOM_PROXY_EXTENSIONS", raising=False)
+
+    class _BareManifest(_Manifest):
+        base_env = {"HEADROOM_PROXY_EXTENSIONS": ""}
+
+    kwargs = _dedicated_start(monkeypatch, health=None, manifest=_BareManifest())
+
+    assert not kwargs["proxy_extensions"]
+    assert "could not read the extensions" not in capsys.readouterr().out
+
+
 def test_attached_routing_mismatch_carries_the_shared_proxys_extensions(
     monkeypatch, capsys
 ) -> None:

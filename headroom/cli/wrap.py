@@ -4535,17 +4535,20 @@ def _echo_unwrap_proxy_stop_status(status: str, port: int) -> None:
         click.echo(f"  Warning: failed to stop Headroom proxy on port {port}; stop it manually.")
 
 
-def _manifest_proxy_extensions(manifest: Any) -> list[str]:
+def _manifest_proxy_extensions(manifest: Any) -> list[str] | None:
     """Extension names a persistent deployment was installed with.
 
     The installer has no extension flag of its own; the only way to enable
     extensions on a persistent deployment is ``headroom install --env
     HEADROOM_PROXY_EXTENSIONS=...``, recorded in the manifest's ``base_env``.
+    A manifest without that entry is no evidence either way: the deployment's
+    runtime env is layered on the launch environment, so the proxy may still
+    have inherited a set. Only an explicit value (possibly empty) is an answer.
     """
     base_env = getattr(manifest, "base_env", None)
     configured = base_env.get("HEADROOM_PROXY_EXTENSIONS") if isinstance(base_env, dict) else None
     if not isinstance(configured, str):
-        return []
+        return None
     return sorted({name.strip() for name in configured.split(",") if name.strip()})
 
 
@@ -4558,7 +4561,8 @@ def _dedicated_proxy_extensions(port: int, manifest: Any) -> list[str] | None:
     savings sinks on the shared proxy as ``--proxy-extension``, so without
     this the dedicated proxy would report nothing upstream while its local
     dashboard fills (#3716). Prefers the running proxy's own answer over the
-    manifest. Returns ``None`` when neither says.
+    manifest. Returns ``None`` when neither says, so the caller warns rather
+    than start bare on a guess.
     """
     helpers = _live_wrap_module()
     payload = helpers._query_proxy_health(port)
