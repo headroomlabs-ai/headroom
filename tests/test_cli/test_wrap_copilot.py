@@ -6,7 +6,7 @@ import importlib
 import sys
 import types
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 from urllib.parse import quote
 
 import click
@@ -892,37 +892,30 @@ def test_wrap_copilot_implicit_oauth_stays_generic_and_does_no_account_lookup(
     def fake_launch_tool(**kwargs):  # noqa: ANN003
         captured.update(kwargs)
 
-    def enterprise_user_info(_token: str) -> dict[str, object]:
-        return {"endpoints": {"api": "https://api.enterprise.githubcopilot.com"}}
-
-    def enterprise_exchange(_headers: dict[str, str]) -> dict[str, object]:
-        return {
-            "token": "copilot-api",
-            "endpoints": {"api": "https://api.enterprise.githubcopilot.com"},
-        }
+    enterprise = {"endpoints": {"api": "https://api.enterprise.githubcopilot.com"}}
+    user_info = MagicMock(return_value=enterprise)
+    exchange = MagicMock(return_value={"token": "copilot-api", **enterprise})
 
     with (
         patch("headroom.cli.wrap.shutil.which", return_value="copilot"),
         patch("headroom.cli.wrap.resolve_client_bearer_token", return_value="gho-oauth"),
         patch("headroom.cli.wrap.has_oauth_auth", return_value=True),
-        patch(
-            "headroom.copilot_auth._fetch_copilot_user_info", side_effect=enterprise_user_info
-        ) as user_info,
+        patch("headroom.copilot_auth._fetch_copilot_user_info", user_info),
         patch(
             "headroom.copilot_auth.CopilotTokenProvider._exchange_token_sync",
-            staticmethod(enterprise_exchange),
+            staticmethod(exchange),
         ),
-        patch("headroom.copilot_auth._urlopen") as urlopen,
         patch("headroom.cli.wrap._launch_tool", side_effect=fake_launch_tool),
     ):
         result = runner.invoke(main, ["wrap", "copilot", "--", "--model", "gpt-5.4"])
 
     assert result.exit_code == 0, result.output
     assert captured["openai_api_url"] == DEFAULT_API_URL
-    # The lane never asks GitHub which host the seat is on: the fixtures that
-    # would advertise the Enterprise host are never consulted.
+    # The lane never asks GitHub which host the seat is on: neither the
+    # user-info lookup nor the token exchange that would advertise the
+    # Enterprise host is consulted.
     assert user_info.call_count == 0
-    assert urlopen.call_count == 0
+    assert exchange.call_count == 0
 
 
 def test_wrap_copilot_oauth_honors_api_url_override(
