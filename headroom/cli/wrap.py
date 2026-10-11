@@ -6575,11 +6575,13 @@ def copilot(
         headroom wrap copilot --subscription -- --model gpt-4.1
 
     \b
-    Copilot hosted API (--subscription and the implicit OAuth path) routes to the
-    generic host https://api.githubcopilot.com, which serves the full model set.
-    Enterprise / data-residency accounts provisioned on a dedicated host pin it
-    explicitly with GITHUB_COPILOT_API_URL (the override flows through to upstream).
-    See TESTING-copilot-subscription.md for details.
+    Copilot hosted API: --subscription routes Business / Enterprise seats to
+    the plan host GitHub advertises (GITHUB_COPILOT_USE_ADVERTISED_HOST=0 folds
+    them back to the generic host) and individual seats to the generic host
+    https://api.githubcopilot.com; the implicit OAuth path always uses the
+    generic host. Data-residency accounts provisioned on a dedicated host pin
+    it explicitly with GITHUB_COPILOT_API_URL (the override flows through to
+    upstream). See TESTING-copilot-subscription.md for details.
     """
     copilot_bin = _require_binary(
         "copilot",
