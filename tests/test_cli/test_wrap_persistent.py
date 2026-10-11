@@ -1926,6 +1926,27 @@ def test_dedicated_copilot_proxy_reads_extensions_from_the_manifest(monkeypatch)
     assert kwargs["proxy_extensions"] == ["lossless_guard", "observability"]
 
 
+def test_dedicated_copilot_proxy_reads_extensions_from_the_manifest_proxy_args(monkeypatch) -> None:
+    """A manifest edited by hand can enable extensions as ``--proxy-extension``
+    flags in ``proxy_args``; the runtime passes them to the proxy verbatim, so
+    they count, in both flag forms and alongside ``base_env``."""
+    monkeypatch.delenv("HEADROOM_PROXY_EXTENSIONS", raising=False)
+
+    class _ArgsManifest(_Manifest):
+        base_env = {"HEADROOM_PROXY_EXTENSIONS": "control_plane"}
+        proxy_args = [
+            "--host",
+            "127.0.0.1",
+            "--proxy-extension",
+            "observability,control_plane",
+            "--proxy-extension=lossless_guard",
+        ]
+
+    kwargs = _dedicated_start(monkeypatch, health=None, manifest=_ArgsManifest())
+
+    assert kwargs["proxy_extensions"] == ["control_plane", "lossless_guard", "observability"]
+
+
 def test_dedicated_copilot_proxy_falls_back_to_the_manifest_for_an_older_proxy(
     monkeypatch, capsys
 ) -> None:
