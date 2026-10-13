@@ -270,7 +270,7 @@ class TestAuthRejectionLog:
         (line,) = _rejections(messages)
         assert "method=GET path=/stats" in line
         assert "reason=missing_token" in line
-        assert line.endswith("ua=claude-cli xff=198.51.100.7")
+        assert line.endswith("ua=claude-code xff=198.51.100.7")
 
     def test_absent_headers_log_as_none(self):
         app = _make_app(proxy_token="s3cr3t-token")
@@ -287,6 +287,7 @@ class TestAuthRejectionLog:
             (f"{CANARY}/1.0", "192.0.2.1", "ua=other xff=192.0.2.1"),
             (f'curl" xff="{CANARY}', f"fe80::1%{CANARY}", "ua=other xff=invalid"),
             ("node", f"192.0.2.1:{CANARY}", "ua=node xff=invalid"),
+            (f"{CANARY}/9 opencode/1.2.3", "192.0.2.1", "ua=opencode xff=192.0.2.1"),
         ],
     )
     def test_caller_text_never_reaches_the_line(self, user_agent, forwarded_for, tail):
@@ -312,6 +313,31 @@ class TestAuthRejectionLog:
             {"user-agent": "Mozilla/5.0 (Windows NT 10.0)", "x-forwarded-for": "2001:DB8::1"}
         ) == ("mozilla", "2001:db8::1")
         assert _auth_rejection_context({}) == ("none", "none")
+        # X-Client is free text, so it never names the client here.
+        assert _auth_rejection_context({"user-agent": "x", "x-client": "claude-code"}) == (
+            "other",
+            "none",
+        )
+
+    @pytest.mark.parametrize(
+        ("user_agent", "client"),
+        [
+            ("claude-cli/2.1.0 (external, cli)", "claude-code"),
+            ("claude-code/2.0.14", "claude-code"),
+            ("codex-cli/0.46.0", "codex"),
+            ("Cursor/1.7.0", "cursor"),
+            ("opencode/1.2.3", "opencode"),
+            ("CorpWrapper/3.1 aider/0.86", "aider"),
+            ("Anthropic/Python 0.69.0", "anthropic"),
+            ("node", "node"),
+        ],
+    )
+    def test_known_clients_keep_their_proxy_wide_name(self, user_agent, client):
+        # Harnesses log under the same name the rest of the proxy gives them
+        # (CLIENT_UA_MAP); generic HTTP clients under their product token.
+        from headroom.proxy.server import _auth_rejection_context
+
+        assert _auth_rejection_context({"user-agent": user_agent}) == (client, "none")
 
     @pytest.mark.parametrize(
         "headers",
