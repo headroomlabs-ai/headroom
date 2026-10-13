@@ -2918,31 +2918,53 @@ def read_proxy_token(headers: Mapping[str, str]) -> str | None:
     return None
 
 
-def _auth_rejection_log_value(raw: str | None, limit: int = 100) -> str:
-    """Quote a caller-controlled header for a ``proxy_auth_rejected`` line.
-
-    Truncated, and anything outside printable ASCII (CR/LF included) or a
-    double quote becomes ``?``, so a caller can neither forge extra log lines
-    nor break the ``key="value"`` field it lands in.
-    """
-    clipped = (raw or "")[:limit]
-    return '"' + "".join(c if " " <= c <= "~" and c != '"' else "?" for c in clipped) + '"'
+# User-Agent product tokens a ``proxy_auth_rejected`` line may name. Any other
+# User-Agent logs as ``other``: the header is caller-controlled text.
+_AUTH_REJECTION_CLIENTS = frozenset(
+    {
+        "anthropic",
+        "axios",
+        "claude-cli",
+        "codex_cli_rs",
+        "curl",
+        "go-http-client",
+        "mozilla",
+        "node",
+        "okhttp",
+        "openai",
+        "python-httpx",
+        "python-requests",
+        "python-urllib",
+        "wget",
+    }
+)
 
 
 def _auth_rejection_context(headers: Mapping[str, str]) -> tuple[str, str]:
-    """``(ua, xff)`` for a rejection log line, both quoted and sanitized.
+    """``(ua, xff)`` for a rejection log line, drawn from a fixed vocabulary.
 
-    ``xff`` is the leftmost ``X-Forwarded-For`` hop exactly as received: it is
-    unverified (a client can set it), so it only helps attribute rejected
-    callers behind a gateway whose peer address is all the gate sees. It is
-    never used for any decision. Credentials are never read here.
+    Both headers are caller-controlled, so neither is logged as received.
+    ``ua`` is the User-Agent's product token when it names a known client in
+    ``_AUTH_REJECTION_CLIENTS``, else ``other``. ``xff`` is the leftmost
+    ``X-Forwarded-For`` hop when it is a plain IP address, else ``invalid``.
+    Either is ``none`` when its header is absent. ``xff`` is unverified, so it
+    only helps attribute rejected callers behind a gateway whose peer address
+    is all the gate sees. It is never used for any decision. Credentials are
+    never read here.
     """
     from headroom.proxy.forwarded_policy import header_first
 
-    return (
-        _auth_rejection_log_value(headers.get("user-agent")),
-        _auth_rejection_log_value(header_first(str(headers.get("x-forwarded-for") or "")), 64),
-    )
+    user_agent = str(headers.get("user-agent") or "")
+    product = user_agent.partition("/")[0].strip().lower()
+    ua = "none" if not user_agent else product if product in _AUTH_REJECTION_CLIENTS else "other"
+
+    hop = header_first(str(headers.get("x-forwarded-for") or ""))
+    try:
+        address = ipaddress.ip_address(hop)
+    except ValueError:
+        return ua, "invalid" if hop else "none"
+    # An IPv6 zone index (fe80::1%<zone>) is free text, so refuse it too.
+    return ua, "invalid" if getattr(address, "scope_id", None) else str(address)
 
 
 _PROXY_TOKEN_HEADER = b"x-headroom-proxy-token"

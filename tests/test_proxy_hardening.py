@@ -247,58 +247,71 @@ def _rejections(messages: list[str]) -> list[str]:
     return [m for m in messages if "event=proxy_auth_rejected" in m]
 
 
+# Stands in for anything sensitive a caller may put in a header.
+CANARY = "PRIVATE_CREDENTIAL_CANARY"
+
+
 class TestAuthRejectionLog:
     """``proxy_auth_rejected`` carries enough to attribute a caller behind a
     gateway (method, User-Agent, leftmost X-Forwarded-For hop), and never a
     credential."""
 
-    def test_line_carries_method_user_agent_and_first_forwarded_hop(self):
+    def test_line_carries_method_client_and_first_forwarded_hop(self):
         app = _make_app(proxy_token="s3cr3t-token")
         with _captured_proxy_warnings() as messages:
             with TestClient(app, base_url="http://testserver", client=NONLOOPBACK) as c:
                 c.get(
                     "/stats",
                     headers={
-                        "User-Agent": "statusline/1.0",
+                        "User-Agent": "claude-cli/2.1.0 (external, cli)",
                         "X-Forwarded-For": "198.51.100.7, 10.0.0.9",
                     },
                 )
         (line,) = _rejections(messages)
         assert "method=GET path=/stats" in line
         assert "reason=missing_token" in line
-        assert 'ua="statusline/1.0"' in line
-        assert 'xff="198.51.100.7"' in line
+        assert line.endswith("ua=claude-cli xff=198.51.100.7")
 
-    def test_absent_headers_log_as_empty(self):
+    def test_absent_headers_log_as_none(self):
         app = _make_app(proxy_token="s3cr3t-token")
         with _captured_proxy_warnings() as messages:
             with TestClient(app, base_url="http://testserver", client=NONLOOPBACK) as c:
                 c.get("/stats", headers={"User-Agent": ""})
         (line,) = _rejections(messages)
-        assert line.endswith('ua="" xff=""')
+        assert line.endswith("ua=none xff=none")
 
-    def test_user_agent_is_truncated_and_cannot_forge_log_lines(self):
+    @pytest.mark.parametrize(
+        ("user_agent", "forwarded_for", "tail"),
+        [
+            (CANARY, f"{CANARY}, 192.0.2.1", "ua=other xff=invalid"),
+            (f"{CANARY}/1.0", "192.0.2.1", "ua=other xff=192.0.2.1"),
+            (f'curl" xff="{CANARY}', f"fe80::1%{CANARY}", "ua=other xff=invalid"),
+            ("node", f"192.0.2.1:{CANARY}", "ua=node xff=invalid"),
+        ],
+    )
+    def test_caller_text_never_reaches_the_line(self, user_agent, forwarded_for, tail):
         app = _make_app(proxy_token="s3cr3t-token")
-        hostile = 'evil" xff="203.0.113.99\x1b[2J' + "A" * 500
         with _captured_proxy_warnings() as messages:
             with TestClient(app, base_url="http://testserver", client=NONLOOPBACK) as c:
-                c.get("/stats", headers={"User-Agent": hostile})
+                c.get(
+                    "/stats", headers={"User-Agent": user_agent, "X-Forwarded-For": forwarded_for}
+                )
         (line,) = _rejections(messages)
-        assert "\x1b" not in line
-        # The caller's quote is neutralised, so its fake field stays inside ua="…"
-        # and the real xff is still the last field on the line.
-        ua = line.split(' ua="', 1)[1].rsplit('" xff=', 1)[0]
-        assert ua == ("evil? xff=?203.0.113.99?[2J" + "A" * 500)[:100]
-        assert line.endswith(' xff=""')
+        assert CANARY not in line
+        assert line.endswith(tail)
 
-    def test_log_value_neutralises_line_breaks_and_non_ascii(self):
+    def test_context_is_a_fixed_vocabulary(self):
         # Exercised directly: an HTTP client refuses to send CR/LF in a header,
         # but an ASGI server in front of the proxy is not guaranteed to.
-        from headroom.proxy.server import _auth_rejection_log_value
+        from headroom.proxy.server import _auth_rejection_context
 
-        assert _auth_rejection_log_value("a\r\nevent=forged\u2028\u00e9") == '"a??event=forged??"'
-        assert _auth_rejection_log_value(None) == '""'
-        assert _auth_rejection_log_value("x" * 10, limit=4) == '"xxxx"'
+        assert _auth_rejection_context(
+            {"user-agent": "curl\r\nevent=forged", "x-forwarded-for": "192.0.2.1\r\nevent=forged"}
+        ) == ("other", "invalid")
+        assert _auth_rejection_context(
+            {"user-agent": "Mozilla/5.0 (Windows NT 10.0)", "x-forwarded-for": "2001:DB8::1"}
+        ) == ("mozilla", "2001:db8::1")
+        assert _auth_rejection_context({}) == ("none", "none")
 
     @pytest.mark.parametrize(
         "headers",
@@ -398,7 +411,7 @@ class TestWebSocketAuthMiddleware:
         mw = WebSocketAuthMiddleware(_SpyApp(), proxy_token="s3cr3t-token")
         scope = _ws_scope(
             headers=[
-                ("user-agent", "ws-client/1.0"),
+                ("user-agent", "node"),
                 ("x-forwarded-for", "198.51.100.8, 10.0.0.1"),
                 ("authorization", "Bearer wrong-ws-bearer"),
             ]
@@ -409,7 +422,23 @@ class TestWebSocketAuthMiddleware:
 
         (line,) = _rejections(messages)
         assert "transport=websocket" in line and "reason=bad_token" in line
-        assert line.endswith('ua="ws-client/1.0" xff="198.51.100.8"')
+        assert line.endswith("ua=node xff=198.51.100.8")
+
+    async def test_rejection_log_keeps_caller_text_out(self):
+        mw = WebSocketAuthMiddleware(_SpyApp(), proxy_token="s3cr3t-token")
+        scope = _ws_scope(
+            headers=[
+                ("user-agent", CANARY),
+                ("x-forwarded-for", f"{CANARY}, 192.0.2.1"),
+            ]
+        )
+
+        with _captured_proxy_warnings() as messages:
+            await _drive(mw, scope)
+
+        (line,) = _rejections(messages)
+        assert CANARY not in line
+        assert line.endswith("ua=other xff=invalid")
         assert "wrong-ws-bearer" not in line and "s3cr3t-token" not in line
 
     async def test_accepts_correct_bearer(self):
