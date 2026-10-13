@@ -140,3 +140,18 @@ def test_register_escapes_control_chars_in_env_value(tmp_path: Path) -> None:
     parsed = tomllib.loads(reg._config_file.read_text())
     assert parsed["mcp_servers"]["headroom"]["env"]["PEM"] == pem
     assert reg.get_server("headroom").env["PEM"] == pem
+
+
+def test_register_refuses_unparseable_config(tmp_path: Path) -> None:
+    """Grok shares the codex merge guard: an unparseable config.toml is refused
+    with a reason that names the file, and left byte-for-byte untouched."""
+    cfg = tmp_path / ".grok" / "config.toml"
+    cfg.parent.mkdir()
+    original = "this = is = not = valid\n"
+    cfg.write_text(original)
+
+    result = _make_registrar(tmp_path).register_server(_spec())
+
+    assert result.status == RegisterStatus.FAILED
+    assert "not valid TOML" in result.detail
+    assert cfg.read_text() == original

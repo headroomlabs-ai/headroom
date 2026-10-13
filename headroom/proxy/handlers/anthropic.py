@@ -19,6 +19,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 from urllib.parse import urlsplit
 
+from headroom.proxy.session_affinity import session_affinity_headers
 from headroom.proxy.stage_timer import StageTimer, emit_stage_timings_log
 from headroom.proxy.tool_schema_savings_policy import without_deferral_flags
 
@@ -3927,6 +3928,9 @@ class AnthropicHandlerMixin:
                 request.url.path,
                 request.url.query,
             )
+            # Keep a conversation on one replica of providers that route on a
+            # header (Fireworks), so each turn finds the previous turn's cache.
+            headers.update(session_affinity_headers(url, session_id, headers))
 
             try:
                 ccr_handler_config = getattr(self.ccr_response_handler, "config", None)

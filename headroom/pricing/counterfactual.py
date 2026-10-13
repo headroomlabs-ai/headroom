@@ -62,6 +62,7 @@ from functools import lru_cache
 from typing import Any
 
 from headroom.cache_economics import CACHE_ECONOMICS
+from headroom.log_safety import describe_exception, safe_id
 from headroom.pricing.cache_ttl import CACHE_WRITE_MULTIPLIERS
 
 logger = logging.getLogger(__name__)
@@ -421,7 +422,12 @@ def resolve_rates(
 
         resolved_model = resolve_litellm_model(model)
         info = litellm.model_cost.get(resolved_model, {}) or {}
-    except Exception:
+    except Exception as exc:
+        logger.debug(
+            "counterfactual: LiteLLM catalog lookup failed for %s: %s",
+            safe_id(model),
+            describe_exception(exc),
+        )
         return None
 
     base = info.get("input_cost_per_token")

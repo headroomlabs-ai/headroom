@@ -372,6 +372,27 @@ class StreamingMixin:
                     delta_usage = _sse_dict(data.get("usage"))
                     if delta_usage:
                         usage_found["output_tokens"] = delta_usage.get("output_tokens", 0)
+                        # Usage here is cumulative. Some Anthropic-compatible
+                        # upstreams (Fireworks) send zeros in message_start and
+                        # the real input and cache counts only here; without
+                        # them the prefix tracker sees no cache and freezes
+                        # nothing.
+                        for key in (
+                            "input_tokens",
+                            "cache_read_input_tokens",
+                            "cache_creation_input_tokens",
+                        ):
+                            value = usage_int(delta_usage.get(key))
+                            if value > usage_int(usage_found.get(key)):
+                                usage_found[key] = value
+                        # Their TTL split too, or one-hour writes price as five-minute.
+                        delta_5m, delta_1h = self._extract_anthropic_cache_ttl_metrics(delta_usage)
+                        for key, value in (
+                            ("cache_creation_ephemeral_5m_input_tokens", delta_5m),
+                            ("cache_creation_ephemeral_1h_input_tokens", delta_1h),
+                        ):
+                            if value > usage_int(usage_found.get(key)):
+                                usage_found[key] = value
 
             elif provider == "openai":
                 chunk_usage = data.get("usage")

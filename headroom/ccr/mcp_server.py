@@ -36,6 +36,7 @@ from typing import TYPE_CHECKING, Any
 from headroom import paths as _paths
 from headroom import savings_ledger
 from headroom.cache.compression_store import format_retrieval_miss_detail
+from headroom.log_safety import describe_exception, redact_url, safe_id
 from headroom.telemetry import session as telemetry_session
 
 if TYPE_CHECKING:
@@ -226,8 +227,13 @@ def _append_shared_event(event: dict[str, Any]) -> None:
             f.write(line)
             if _HAS_FCNTL:
                 fcntl.flock(f, fcntl.LOCK_UN)
-    except Exception:
-        pass  # Never break compression because of stats
+    except Exception as exc:
+        # Never break compression because of stats
+        logger.debug(
+            "MCP session stats: append to %s failed: %s",
+            SHARED_STATS_FILE,
+            describe_exception(exc),
+        )
 
 
 def _read_shared_events(window_seconds: int = SESSION_WINDOW_SECONDS) -> list[dict[str, Any]]:
@@ -265,10 +271,18 @@ def _read_shared_events(window_seconds: int = SESSION_WINDOW_SECONDS) -> list[di
                     f.writelines(keep_lines)
                     if _HAS_FCNTL:
                         fcntl.flock(f, fcntl.LOCK_UN)
-            except Exception:
-                pass
-    except Exception:
-        pass
+            except Exception as exc:
+                logger.debug(
+                    "MCP session stats: pruning %s failed: %s",
+                    SHARED_STATS_FILE,
+                    describe_exception(exc),
+                )
+    except Exception as exc:
+        logger.debug(
+            "MCP session stats: reading %s failed: %s",
+            SHARED_STATS_FILE,
+            describe_exception(exc),
+        )
     return events
 
 
@@ -529,8 +543,14 @@ class HeadroomMCPServer:
                     result["source"] = "proxy"
                     self._stats.record_retrieval(hash_key)
                     return result
-            except Exception:
-                pass  # Proxy unavailable, that's fine
+            except Exception as exc:
+                # Proxy unavailable is expected; log so a bug here is not silent.
+                logger.debug(
+                    "MCP retrieve: proxy fallback failed for hash=%s via %s: %s",
+                    safe_id(hash_key),
+                    redact_url(self.proxy_url),
+                    describe_exception(exc),
+                )
 
         if expired_entry_status:
             ttl_seconds = expired_entry_status.get(
@@ -795,8 +815,8 @@ class HeadroomMCPServer:
         # restarts. Best-effort: never let savings bookkeeping break the tool.
         try:
             self._record_savings(result)
-        except Exception:
-            logger.debug("durable savings recording failed", exc_info=True)
+        except Exception as exc:
+            logger.debug("durable savings recording failed: %s", describe_exception(exc))
 
         proxy_status = await self._probe_proxy_unreachable()
         if proxy_status:
@@ -845,8 +865,11 @@ class HeadroomMCPServer:
             name = getattr(info, "name", None)
             if name:
                 return str(name)
-        except Exception:
-            pass
+        except (LookupError, AttributeError) as exc:
+            # Outside a request there is no request context; fall back to "unknown".
+            logger.debug(
+                "MCP client name unavailable; reporting 'unknown': %s", describe_exception(exc)
+            )
         return "unknown"
 
     async def _handle_retrieve(self, arguments: dict[str, Any]) -> list[TextContent]:
@@ -945,7 +968,12 @@ class HeadroomMCPServer:
                 return None
             result: dict[str, Any] = response.json()
             return result
-        except Exception:
+        except Exception as exc:
+            logger.debug(
+                "MCP stats: proxy /stats fetch failed via %s: %s",
+                redact_url(self.proxy_url),
+                describe_exception(exc),
+            )
             return None
 
     @staticmethod
@@ -1113,7 +1141,7 @@ class HeadroomMCPServer:
         watchdog forces shutdown once we are reparented.
         """
         async with stdio_server() as (read_stream, write_stream):
-            logger.info(f"Headroom MCP Server starting (proxy: {self.proxy_url})")
+            logger.info("Headroom MCP Server starting (proxy: %s)", redact_url(self.proxy_url))
             serve_task = asyncio.create_task(
                 self.server.run(
                     read_stream,

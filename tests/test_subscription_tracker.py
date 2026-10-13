@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import os
+import stat
 import sys
 import threading
 from datetime import datetime, timedelta
@@ -360,6 +362,19 @@ async def test_maybe_poll_runs_transcript_scan_off_event_loop(
 
     # The blocking scan ran on a worker thread, not the event-loop thread.
     assert seen["thread_id"] != loop_thread_id
+
+
+@pytest.mark.skipif(os.name != "posix", reason="mode bits decide access only on POSIX")
+def test_persist_state_keeps_file_owner_only(tmp_path: Path) -> None:
+    persist_path = tmp_path / "tracker-state.json"
+    tracker = SubscriptionTracker(persist_path=persist_path)
+    tracker._persist_state()
+    assert stat.S_IMODE(persist_path.stat().st_mode) == 0o600
+
+    # A state file left group/world-readable is tightened on the next write.
+    persist_path.chmod(0o644)
+    tracker._persist_state()
+    assert stat.S_IMODE(persist_path.stat().st_mode) == 0o600
 
 
 @pytest.mark.asyncio
