@@ -13,8 +13,9 @@
 //! call + ONNX session init). Construct the scorer once per process
 //! and reuse — `try_new` returns a `Result` because the first
 //! construction may need network access to fetch the model. The files
-//! live in the standard HuggingFace hub cache (`HF_HUB_CACHE`,
-//! `HF_HOME/hub`, `~/.cache/huggingface/hub`), shared with Python.
+//! live in the HuggingFace hub cache directory Python's `huggingface_hub`
+//! would pick (`HF_HUB_CACHE`, `HF_HOME/hub`, `~/.cache/huggingface/hub`,
+//! …; see `hf_hub_cache_dir`), shared with Python.
 //!
 //! When constructed, `is_available()` returns `true` and `HybridScorer`
 //! switches off the BM25-fallback path automatically. If construction
@@ -101,29 +102,66 @@ fn default_model_revision() -> &'static str {
     }
 }
 
-/// Find a cached snapshot of [`DEFAULT_MODEL_REPO`] at `revision` that holds
-/// every file in [`DEFAULT_MODEL_FILES`]. Never touches the network.
+/// The HuggingFace hub cache directory, resolved the way Python's
+/// `huggingface_hub` resolves `constants.HF_HUB_CACHE`, so both languages look
+/// up and download into the same place: `HF_HUB_CACHE`, then
+/// `HUGGINGFACE_HUB_CACHE` (its legacy name), then `HF_HOME/hub`, then
+/// `XDG_CACHE_HOME/huggingface/hub`, then `~/.cache/huggingface/hub`.
+///
+/// It is exactly one directory. A snapshot in a lower-priority cache is not
+/// used when a higher one is configured, which is also what Python does: with
+/// `HF_HUB_CACHE` set, a model under `~/.cache` is neither found nor reused.
+///
+/// A leading `~` is expanded like Python's `expanduser`; `$VAR` references
+/// (Python's `expandvars`) are not. The home directory comes from
+/// `std::env::home_dir`, which falls back to the user database when `HOME`
+/// is unset, as `expanduser` does. An empty variable counts as unset; Python
+/// would treat it as a path relative to the working directory.
+#[cfg(feature = "ml")]
+fn hf_hub_cache_dir() -> Option<PathBuf> {
+    let var = |name: &str| {
+        std::env::var_os(name)
+            .filter(|v| !v.is_empty())
+            .map(PathBuf::from)
+    };
+    let home = std::env::home_dir();
+    let dir = var("HF_HUB_CACHE")
+        .or_else(|| var("HUGGINGFACE_HUB_CACHE"))
+        .or_else(|| var("HF_HOME").map(|dir| dir.join("hub")))
+        .or_else(|| var("XDG_CACHE_HOME").map(|dir| dir.join("huggingface").join("hub")))
+        .or_else(|| {
+            home.as_ref()
+                .map(|home| home.join(".cache").join("huggingface").join("hub"))
+        })?;
+    // Only a bare `~` component expands; `~user` stays as written, which is
+    // also what `expanduser` does when it cannot resolve the user.
+    Some(match (dir.strip_prefix("~"), &home) {
+        (Ok(rest), Some(home)) => home.join(rest),
+        _ => dir,
+    })
+}
+
+/// Find a snapshot of [`DEFAULT_MODEL_REPO`] at `revision` in the hub cache
+/// `cache` that holds every file in [`DEFAULT_MODEL_FILES`]. Never touches the
+/// network.
 ///
 /// Looks the snapshot up by directory rather than through `hf_hub::Cache`:
 /// that resolves every revision through `refs/<revision>`, which Python's
 /// `huggingface_hub` does not write for a commit SHA, so a snapshot Python
 /// downloaded would be missed. A branch name still goes through its ref.
 #[cfg(feature = "ml")]
-fn cached_snapshot(roots: &[PathBuf], revision: &str) -> Option<PathBuf> {
-    let repo_dir = format!("models--{}", DEFAULT_MODEL_REPO.replace('/', "--"));
-    roots.iter().find_map(|root| {
-        let repo = root.join(&repo_dir);
-        let commit = std::fs::read_to_string(repo.join("refs").join(revision))
-            .map(|c| c.trim().to_string())
-            .unwrap_or_else(|_| revision.to_string());
-        let snapshot = repo.join("snapshots").join(commit);
-        // `is_file` follows the snapshot's symlinks, so blobs deleted from
-        // under it count as a miss rather than a load failure.
-        DEFAULT_MODEL_FILES
-            .iter()
-            .all(|name| snapshot.join(name).is_file())
-            .then_some(snapshot)
-    })
+fn cached_snapshot(cache: &Path, revision: &str) -> Option<PathBuf> {
+    let repo = cache.join(format!("models--{}", DEFAULT_MODEL_REPO.replace('/', "--")));
+    let commit = std::fs::read_to_string(repo.join("refs").join(revision))
+        .map(|c| c.trim().to_string())
+        .unwrap_or_else(|_| revision.to_string());
+    let snapshot = repo.join("snapshots").join(commit);
+    // `is_file` follows the snapshot's symlinks, so blobs deleted from under
+    // it count as a miss rather than a load failure.
+    DEFAULT_MODEL_FILES
+        .iter()
+        .all(|name| snapshot.join(name).is_file())
+        .then_some(snapshot)
 }
 
 /// The Hub handle for [`DEFAULT_MODEL_REPO`] at `revision`, caching under
@@ -292,27 +330,28 @@ impl EmbeddingScorer {
     /// offline, network failure during download, missing ONNX runtime
     /// binaries, etc.).
     pub fn try_new() -> Result<Self, String> {
-        Self::try_new_pinned(&crate::transforms::kompress::hf_hub_roots())
+        let cache = hf_hub_cache_dir().ok_or_else(|| {
+            "EmbeddingScorer: no HuggingFace cache directory (set HF_HUB_CACHE or HF_HOME)"
+                .to_string()
+        })?;
+        Self::try_new_pinned(&cache)
     }
 
-    /// [`Self::try_new`] against explicit HF hub cache roots, searched in
-    /// order; a download lands in the first. Split out so tests can point it
-    /// at a temporary cache.
-    fn try_new_pinned(roots: &[PathBuf]) -> Result<Self, String> {
+    /// [`Self::try_new`] against an explicit hub cache directory, used for
+    /// both the lookup and any download. Split out so tests can point it at a
+    /// temporary cache.
+    fn try_new_pinned(cache: &Path) -> Result<Self, String> {
         let revision = default_model_revision();
-        let snapshot = match cached_snapshot(roots, revision) {
+        let snapshot = match cached_snapshot(cache, revision) {
             Some(dir) => {
                 onnx_runtime_ready()?;
                 dir
             }
             None => {
-                let root = roots.first().ok_or_else(|| {
-                    "EmbeddingScorer: no HuggingFace cache directory (set HF_HOME)".to_string()
-                })?;
                 // Built (and so guarded) ahead of the AVX2 and ort-loader
                 // probes, so an air-gapped box reports the policy refusal
                 // rather than whichever local prerequisite was missing too.
-                let repo = default_model_repo(root, revision)?;
+                let repo = default_model_repo(cache, revision)?;
                 onnx_runtime_ready()?;
                 download_snapshot(&repo, revision)?
             }
@@ -567,7 +606,7 @@ mod tests {
         let cache = tempfile::tempdir().unwrap();
         let _guard = crate::test_support::env_lock();
         std::env::set_var(crate::offline::OFFLINE_ENV, "1");
-        let result = EmbeddingScorer::try_new_pinned(&[cache.path().to_path_buf()]);
+        let result = EmbeddingScorer::try_new_pinned(cache.path());
         std::env::remove_var(crate::offline::OFFLINE_ENV);
 
         let err = result.err().expect("guard must refuse while offline");
@@ -589,7 +628,7 @@ mod tests {
         let pin = std::env::var_os("HEADROOM_HF_PIN");
         std::env::remove_var("HEADROOM_HF_PIN");
         std::env::set_var(crate::offline::OFFLINE_ENV, "1");
-        let result = EmbeddingScorer::try_new_pinned(&[cache.path().to_path_buf()]);
+        let result = EmbeddingScorer::try_new_pinned(cache.path());
         std::env::remove_var(crate::offline::OFFLINE_ENV);
         if let Some(pin) = pin {
             std::env::set_var("HEADROOM_HF_PIN", pin);
@@ -606,9 +645,8 @@ mod tests {
     fn cached_snapshot_finds_the_pinned_commit() {
         let cache = tempfile::tempdir().unwrap();
         let snapshot = fake_snapshot(cache.path(), DEFAULT_MODEL_REVISION, &DEFAULT_MODEL_FILES);
-        let roots = [cache.path().join("empty-root"), cache.path().to_path_buf()];
         assert_eq!(
-            cached_snapshot(&roots, DEFAULT_MODEL_REVISION),
+            cached_snapshot(cache.path(), DEFAULT_MODEL_REVISION),
             Some(snapshot)
         );
     }
@@ -624,11 +662,10 @@ mod tests {
         let refs = snapshot.parent().unwrap().parent().unwrap().join("refs");
         std::fs::create_dir_all(&refs).unwrap();
         std::fs::write(refs.join("main"), main_commit).unwrap();
-        let roots = [cache.path().to_path_buf()];
 
-        assert_eq!(cached_snapshot(&roots, DEFAULT_MODEL_REVISION), None);
+        assert_eq!(cached_snapshot(cache.path(), DEFAULT_MODEL_REVISION), None);
         // `main` still resolves through its ref, for HEADROOM_HF_PIN=off.
-        assert_eq!(cached_snapshot(&roots, "main"), Some(snapshot));
+        assert_eq!(cached_snapshot(cache.path(), "main"), Some(snapshot));
     }
 
     #[cfg(feature = "ml")]
@@ -640,10 +677,152 @@ mod tests {
             DEFAULT_MODEL_REVISION,
             &DEFAULT_MODEL_FILES[..DEFAULT_MODEL_FILES.len() - 1],
         );
+        assert_eq!(cached_snapshot(cache.path(), DEFAULT_MODEL_REVISION), None);
+    }
+
+    /// Every variable `hf_hub_cache_dir` reads.
+    #[cfg(feature = "ml")]
+    const CACHE_ENV: [&str; 6] = [
+        "HF_HUB_CACHE",
+        "HUGGINGFACE_HUB_CACHE",
+        "HF_HOME",
+        "XDG_CACHE_HOME",
+        "HOME",
+        "USERPROFILE",
+    ];
+
+    /// Saves [`CACHE_ENV`], clears it, and puts it back on drop, so a failing
+    /// assertion cannot leak a fake cache into later tests. Take
+    /// `env_lock()` first.
+    #[cfg(feature = "ml")]
+    struct CacheEnv(Vec<(&'static str, Option<std::ffi::OsString>)>);
+
+    #[cfg(feature = "ml")]
+    impl CacheEnv {
+        fn cleared() -> Self {
+            let saved = CACHE_ENV
+                .iter()
+                .map(|&name| (name, std::env::var_os(name)))
+                .collect();
+            for name in CACHE_ENV {
+                std::env::remove_var(name);
+            }
+            CacheEnv(saved)
+        }
+    }
+
+    #[cfg(feature = "ml")]
+    impl Drop for CacheEnv {
+        fn drop(&mut self) {
+            for (name, value) in &self.0 {
+                match value {
+                    Some(value) => std::env::set_var(name, value),
+                    None => std::env::remove_var(name),
+                }
+            }
+        }
+    }
+
+    /// Same order as `huggingface_hub.constants.HF_HUB_CACHE`: each variable
+    /// wins over every one after it, and only one directory comes back.
+    #[cfg(feature = "ml")]
+    #[test]
+    fn hf_hub_cache_dir_follows_huggingface_hub_precedence() {
+        let _guard = crate::test_support::env_lock();
+        let _env = CacheEnv::cleared();
+        let t = tempfile::tempdir().unwrap();
+        let p = |name: &str| t.path().join(name);
+        std::env::set_var("HOME", p("home"));
+        std::env::set_var("USERPROFILE", p("home"));
+        std::env::set_var("XDG_CACHE_HOME", p("xdg"));
+        std::env::set_var("HF_HOME", p("hf-home"));
+        std::env::set_var("HUGGINGFACE_HUB_CACHE", p("legacy"));
+        std::env::set_var("HF_HUB_CACHE", p("explicit"));
+
+        assert_eq!(hf_hub_cache_dir(), Some(p("explicit")));
+        std::env::remove_var("HF_HUB_CACHE");
+        assert_eq!(hf_hub_cache_dir(), Some(p("legacy")));
+        std::env::remove_var("HUGGINGFACE_HUB_CACHE");
+        assert_eq!(hf_hub_cache_dir(), Some(p("hf-home").join("hub")));
+        std::env::remove_var("HF_HOME");
         assert_eq!(
-            cached_snapshot(&[cache.path().to_path_buf()], DEFAULT_MODEL_REVISION),
-            None
+            hf_hub_cache_dir(),
+            Some(p("xdg").join("huggingface").join("hub"))
         );
+        std::env::remove_var("XDG_CACHE_HOME");
+        assert_eq!(
+            hf_hub_cache_dir(),
+            Some(p("home").join(".cache").join("huggingface").join("hub"))
+        );
+
+        // An empty variable counts as unset, and a leading `~` expands.
+        std::env::set_var("HF_HUB_CACHE", "");
+        std::env::set_var("HF_HOME", "~/models");
+        assert_eq!(
+            hf_hub_cache_dir(),
+            Some(p("home").join("models").join("hub"))
+        );
+    }
+
+    /// With no `HOME` (a service started with a bare environment) the home
+    /// directory still comes from the user database, as Python's
+    /// `expanduser` does, instead of leaving the scorer with no cache.
+    #[cfg(all(feature = "ml", unix))]
+    #[test]
+    fn hf_hub_cache_dir_without_home_uses_the_user_database() {
+        let _guard = crate::test_support::env_lock();
+        let _env = CacheEnv::cleared();
+        let dir = hf_hub_cache_dir().expect("a cache directory without HOME");
+        assert!(dir.is_absolute(), "{}", dir.display());
+        assert!(
+            dir.ends_with(Path::new(".cache").join("huggingface").join("hub")),
+            "{}",
+            dir.display()
+        );
+    }
+
+    /// The case from review: an explicit, empty `HF_HUB_CACHE` next to a
+    /// complete snapshot in the default cache under `HOME`. Python looks only
+    /// in the explicit cache and downloads there, so Rust must not find the
+    /// `HOME` copy, for the pinned revision or for floating `main`
+    /// (`HEADROOM_HF_PIN=off`). `try_new` is `try_new_pinned` on
+    /// `hf_hub_cache_dir()`, which looks up and downloads only in the
+    /// directory it is given (see the two offline tests above), so checking
+    /// the resolver and the lookup here covers it without flipping
+    /// `HEADROOM_OFFLINE` for a long stretch of the parallel run.
+    #[cfg(feature = "ml")]
+    #[test]
+    fn an_empty_explicit_cache_ignores_a_lower_priority_snapshot() {
+        let _guard = crate::test_support::env_lock();
+        let _env = CacheEnv::cleared();
+        let explicit = tempfile::tempdir().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        let default_cache = home.path().join(".cache").join("huggingface").join("hub");
+        // A complete pinned snapshot, plus an older `main` behind refs/main.
+        let pinned = fake_snapshot(&default_cache, DEFAULT_MODEL_REVISION, &DEFAULT_MODEL_FILES);
+        let main_commit = "aa8f8b060edb00e03bfdd08813a2949946c8ba55";
+        let main = fake_snapshot(&default_cache, main_commit, &DEFAULT_MODEL_FILES);
+        let refs = main.parent().unwrap().parent().unwrap().join("refs");
+        std::fs::create_dir_all(&refs).unwrap();
+        std::fs::write(refs.join("main"), main_commit).unwrap();
+        std::env::set_var("HOME", home.path());
+        std::env::set_var("USERPROFILE", home.path());
+
+        std::env::set_var("HF_HUB_CACHE", explicit.path());
+        let cache = hf_hub_cache_dir().expect("cache directory");
+        assert_eq!(cache, explicit.path());
+        assert_eq!(cached_snapshot(&cache, DEFAULT_MODEL_REVISION), None);
+        assert_eq!(cached_snapshot(&cache, "main"), None);
+
+        // Without the explicit cache, the same HOME snapshots are the cache.
+        std::env::remove_var("HF_HUB_CACHE");
+        let cache = hf_hub_cache_dir().expect("cache directory");
+        assert_eq!(cache, default_cache);
+        assert_eq!(
+            cached_snapshot(&cache, DEFAULT_MODEL_REVISION),
+            Some(pinned)
+        );
+        assert_eq!(cached_snapshot(&cache, "main"), Some(main));
     }
 
     /// The download asks the Hub for the pinned commit. This is what Python's
