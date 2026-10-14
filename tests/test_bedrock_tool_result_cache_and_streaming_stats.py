@@ -114,6 +114,40 @@ class TestToolResultCacheControlPreserved:
         assert converted[0]["cache_control"] == {"type": "ephemeral"}
 
 
+class TestTextBlockCacheControlPreserved:
+    """Plain text blocks must keep cache_control too: a new user prompt puts the
+    breakpoint on a text block, and #1390 (which covered this branch) was closed."""
+
+    def test_marked_text_block_becomes_a_converse_cache_point(self):
+        from litellm.litellm_core_utils.prompt_templates.factory import (
+            _bedrock_converse_messages_pt,
+        )
+
+        backend = _backend()
+        marked = {"type": "text", "text": "Stable prefix.", "cache_control": {"type": "ephemeral"}}
+        messages = [{"role": "user", "content": [marked, {"type": "text", "text": "Question?"}]}]
+        converted = backend._convert_messages_for_litellm(messages)
+
+        converse = _bedrock_converse_messages_pt(
+            messages=converted,
+            model="global.anthropic.claude-sonnet-5",
+            llm_provider="bedrock_converse",
+        )
+        assert converse[0]["content"] == [
+            {"text": "Stable prefix."},
+            {"cachePoint": {"type": "default"}},
+            {"text": "Question?"},
+        ]
+
+    def test_marked_assistant_turn_still_drops_its_image(self):
+        backend = _backend()
+        image = {"type": "image", "source": {"type": "url", "url": "https://x/a.png"}}
+        marked = {"type": "text", "text": "Here is one.", "cache_control": {"type": "ephemeral"}}
+        messages = [{"role": "assistant", "content": [image, marked]}]
+        converted = backend._convert_messages_for_litellm(messages)
+        assert converted[0]["content"] == [marked]
+
+
 class TestStreamingCacheStatsCompletion:
     """stream_message must request usage and re-surface real cache stats."""
 
