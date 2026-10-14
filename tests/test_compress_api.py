@@ -261,6 +261,41 @@ class TestASGIMiddleware:
         resp = client.get("/v1/chat/completions")
         assert resp.status_code in (200, 405)
 
+    def test_client_disconnect_mid_body_stops_buffering(self):
+        """A client that sends part of a body and disconnects must not hang the worker.
+
+        After a disconnect, uvicorn answers every receive() with http.disconnect
+        without suspending, so the buffering loop used to spin forever at full
+        CPU, starving the event loop (GHSA-mc2f-vg4v-2fh4).
+        """
+        import asyncio
+
+        app_called = False
+
+        async def app(scope, receive, send):
+            nonlocal app_called
+            app_called = True
+
+        calls = 0
+
+        async def receive():
+            nonlocal calls
+            calls += 1
+            if calls > 100:
+                raise AssertionError("middleware kept reading after http.disconnect")
+            if calls == 1:
+                return {"type": "http.request", "body": b'{"partial"', "more_body": True}
+            return {"type": "http.disconnect"}
+
+        async def send(message):
+            raise AssertionError(f"nothing should be sent to a gone client: {message}")
+
+        scope = {"type": "http", "method": "POST", "path": "/x/v1/chat/completions"}
+        asyncio.run(CompressionMiddleware(app)(scope, receive, send))
+
+        assert calls == 2
+        assert not app_called
+
 
 # =============================================================================
 # Tests: LiteLLM Callback

@@ -114,6 +114,11 @@ class CompressionMiddleware(CompressBackend):
         # Read the full body
         while True:
             msg = await buffering_receive()
+            # After a disconnect the server answers every receive() with
+            # http.disconnect at once, so looping on it would spin forever
+            # without yielding. Nobody is left to answer; stop here.
+            if msg.get("type") == "http.disconnect":
+                return
             if msg.get("type") == "http.request":
                 if not msg.get("more_body", False):
                     break
