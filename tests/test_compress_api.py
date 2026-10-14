@@ -1,5 +1,6 @@
 """Tests for the one-function compress() API and integrations."""
 
+import asyncio
 import json
 from dataclasses import replace as _dc_replace
 
@@ -261,15 +262,15 @@ class TestASGIMiddleware:
         resp = client.get("/v1/chat/completions")
         assert resp.status_code in (200, 405)
 
-    def test_client_disconnect_mid_body_stops_buffering(self):
+    @pytest.mark.parametrize("after_partial", ["http.disconnect", "http.bogus"])
+    def test_client_disconnect_mid_body_stops_buffering(self, after_partial):
         """A client that sends part of a body and disconnects must not hang the worker.
 
         After a disconnect, uvicorn answers every receive() with http.disconnect
         without suspending, so the buffering loop used to spin forever at full
-        CPU, starving the event loop (GHSA-mc2f-vg4v-2fh4).
+        CPU, starving the event loop (GHSA-mc2f-vg4v-2fh4). Any message other
+        than more body ends buffering the same way.
         """
-        import asyncio
-
         app_called = False
 
         async def app(scope, receive, send):
@@ -285,7 +286,7 @@ class TestASGIMiddleware:
                 raise AssertionError("middleware kept reading after http.disconnect")
             if calls == 1:
                 return {"type": "http.request", "body": b'{"partial"', "more_body": True}
-            return {"type": "http.disconnect"}
+            return {"type": after_partial}
 
         async def send(message):
             raise AssertionError(f"nothing should be sent to a gone client: {message}")
