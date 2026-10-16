@@ -74,6 +74,12 @@ use tokenizers::{EncodeInput, InputSequence, Tokenizer};
 pub const DEFAULT_MODEL_ID: &str = "chopratejas/kompress-v2-base";
 /// HuggingFace repo holding the tokenizer Kompress reuses.
 pub const DEFAULT_TOKENIZER_REPO: &str = "answerdotai/ModernBERT-base";
+/// Pinned commits of [`DEFAULT_MODEL_ID`] and [`DEFAULT_TOKENIZER_REPO`], the
+/// snapshots the cache-only loader reads. Keep each equal to its entry in
+/// `_PINNED_REVISIONS` (`headroom/onnx_runtime.py`), which is what the Python
+/// side downloads; `tests/test_kompress_rust_pins.py` enforces it.
+pub const DEFAULT_MODEL_REVISION: &str = "b1563631b35bfdcee37587ad530147497d820d4c";
+pub const DEFAULT_TOKENIZER_REVISION: &str = "8949b909ec900327062f0ebf497f51aef5e6f0c8";
 /// Words per inference chunk. Coupled to the model's training window;
 /// kompress-v2-base was trained for 350.
 pub const DEFAULT_CHUNK_WORDS: usize = 350;
@@ -333,17 +339,19 @@ impl Kompress {
     pub fn from_cache(config: KompressConfig) -> Result<Option<Self>, KompressError> {
         let Some(tok_path) = hf_cache_file(&config.tokenizer_repo, &["tokenizer.json"]) else {
             // Diagnostic: a `None` here is the #1 cause of a silent
-            // `kompress_ready=false`. Name the repo + the roots searched so
-            // operators don't have to guess between "not downloaded" and
+            // `kompress_ready=false`. Name the repo, the cache and the revision
+            // looked in so operators don't have to guess between "not
+            // downloaded" and
             // "present but unreadable" (e.g. HF symlinks over `\\wsl$`, which
-            // native Windows can't follow — `path.exists()` returns false on
+            // native Windows can't follow — `is_file()` returns false on
             // the unresolved symlink). Cache-only, so this is a defer, not an
             // error: the caller passes plain text through.
             tracing::warn!(
                 event = "kompress_cache_miss",
                 stage = "tokenizer",
                 tokenizer_repo = %config.tokenizer_repo,
-                searched_roots = ?hf_hub_roots(),
+                revision = %cache_revision(&config.tokenizer_repo),
+                hub_cache = ?crate::hf_cache::hub_cache_dir(),
                 "Kompress deferred: tokenizer.json not found in HF cache \
                  (not downloaded, or present but unreadable — e.g. HF symlinks \
                  over \\\\wsl$ which native Windows cannot follow)"
@@ -384,7 +392,8 @@ impl Kompress {
             model_id = %config.model_id,
             candidates = ?ONNX_CANDIDATES,
             any_onnx_found = found_onnx,
-            searched_roots = ?hf_hub_roots(),
+            revision = %cache_revision(&config.model_id),
+            hub_cache = ?crate::hf_cache::hub_cache_dir(),
             "Kompress deferred: no usable ONNX session \
              (no candidate file in cache, or every candidate failed to build)"
         );
@@ -603,59 +612,208 @@ fn build_session(path: &Path) -> Result<Session, Box<dyn std::error::Error + Sen
     Ok(session)
 }
 
-/// Resolve `rel` (e.g. `["tokenizer.json"]` or `["onnx", "kompress-int8-wo.onnx"]`)
-/// inside the local HuggingFace cache for `repo` (`"owner/name"`), searching
-/// every snapshot under every candidate cache root. Returns `None` if not
-/// present — never touches the network.
-fn hf_cache_file(repo: &str, rel: &[&str]) -> Option<PathBuf> {
-    let repo_dir = format!("models--{}", repo.replace('/', "--"));
-    for hub in hf_hub_roots() {
-        let snapshots = hub.join(&repo_dir).join("snapshots");
-        let Ok(entries) = std::fs::read_dir(&snapshots) else {
-            continue;
-        };
-        for snap in entries.flatten() {
-            let mut cand = snap.path();
-            for part in rel {
-                cand = cand.join(part);
-            }
-            if cand.exists() {
-                return Some(cand);
-            }
-        }
+/// The revision of `repo` to load from the cache: its pin when it is one of
+/// Kompress's default repos (see [`DEFAULT_MODEL_REVISION`]), otherwise
+/// `main`, which is also what Python's `_resolve_revision` gives an unpinned
+/// repo. `HEADROOM_HF_PIN=off` floats the pinned ones on `main` too.
+fn cache_revision(repo: &str) -> &str {
+    match repo {
+        DEFAULT_MODEL_ID => crate::hf_cache::pinned_or_main(DEFAULT_MODEL_REVISION),
+        DEFAULT_TOKENIZER_REPO => crate::hf_cache::pinned_or_main(DEFAULT_TOKENIZER_REVISION),
+        _ => "main",
     }
-    None
 }
 
-/// HuggingFace hub cache roots in resolution precedence. Cross-platform so
-/// the cache-only loader works on Windows (native `headroom-proxy.exe`) as
-/// well as Linux: `HF_HUB_CACHE` (the hub dir directly) → `HF_HOME/hub` →
-/// `{HOME|USERPROFILE}/.cache/huggingface/hub`. `HOME` is the unix home; on
-/// Windows the process sees `USERPROFILE` (and often no `HOME`), so both are
-/// tried. Honoring `HF_HOME` also lets a Windows proxy point at a WSL cache.
-fn hf_hub_roots() -> Vec<PathBuf> {
-    let mut roots = Vec::new();
-    let push_env = |roots: &mut Vec<PathBuf>, var: &str, suffix: &[&str]| {
-        if let Ok(v) = std::env::var(var) {
-            if !v.is_empty() {
-                let mut p = PathBuf::from(v);
-                for s in suffix {
-                    p = p.join(s);
-                }
-                roots.push(p);
-            }
-        }
-    };
-    push_env(&mut roots, "HF_HUB_CACHE", &[]);
-    push_env(&mut roots, "HF_HOME", &["hub"]);
-    push_env(&mut roots, "HOME", &[".cache", "huggingface", "hub"]);
-    push_env(&mut roots, "USERPROFILE", &[".cache", "huggingface", "hub"]);
-    roots
+/// Resolve `rel` (e.g. `["tokenizer.json"]` or `["onnx", "kompress-int8-wo.onnx"]`)
+/// in `repo`'s snapshot at [`cache_revision`], inside the one hub cache
+/// directory Python's `huggingface_hub` would use
+/// ([`crate::hf_cache::hub_cache_dir`]). Returns `None` if not present —
+/// never touches the network.
+///
+/// One snapshot, not the first file found in any: with several revisions in
+/// the cache (every pin bump leaves the old one behind), which one a
+/// directory scan returned depended on filesystem order, and the tokenizer
+/// and the ONNX file could come from different snapshots. And one cache, not
+/// every root that exists: Python does not fall back to `~/.cache` when
+/// `HF_HUB_CACHE` names another directory, so neither does this. `is_file`
+/// follows the cache's symlinks, so a blob missing under a snapshot (or a
+/// symlink native Windows cannot follow over `\\wsl$`) is a miss.
+fn hf_cache_file(repo: &str, rel: &[&str]) -> Option<PathBuf> {
+    let cache = crate::hf_cache::hub_cache_dir()?;
+    let mut path = crate::hf_cache::snapshot_path(&cache, repo, cache_revision(repo));
+    for part in rel {
+        path.push(part);
+    }
+    path.is_file().then_some(path)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::hf_cache::tests::CacheEnv;
+
+    /// Lay out `rel` under `repo`'s snapshot `commit` in the hub cache `cache`.
+    fn cached_file(cache: &Path, repo: &str, commit: &str, rel: &str) -> PathBuf {
+        let path = cache
+            .join(format!("models--{}", repo.replace('/', "--")))
+            .join("snapshots")
+            .join(commit)
+            .join(rel);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, commit).unwrap();
+        path
+    }
+
+    /// The cache after a pin bump: the pinned snapshot sits between an older
+    /// one and a newer `main`, and both other snapshots hold the same files.
+    fn cache_with_three_snapshots(cache: &Path) {
+        for repo in [DEFAULT_MODEL_ID, DEFAULT_TOKENIZER_REPO] {
+            let pin = cache_revision(repo).to_string();
+            for commit in [
+                "0000000000000000000000000000000000000000",
+                &pin,
+                "ffffffffffffffffffffffffffffffffffffffff",
+            ] {
+                cached_file(cache, repo, commit, "tokenizer.json");
+                cached_file(cache, repo, commit, ONNX_CANDIDATES[1]);
+            }
+            let refs = cache
+                .join(format!("models--{}", repo.replace('/', "--")))
+                .join("refs");
+            std::fs::create_dir_all(&refs).unwrap();
+            std::fs::write(
+                refs.join("main"),
+                "ffffffffffffffffffffffffffffffffffffffff",
+            )
+            .unwrap();
+        }
+    }
+
+    /// Python loads the pinned snapshot of both repos; so must the cache-only
+    /// loader, whatever order the filesystem lists the snapshots in.
+    #[test]
+    fn the_cache_lookup_reads_the_pinned_snapshot() {
+        let _guard = crate::test_support::env_lock();
+        let _env = CacheEnv::cleared_with(["HEADROOM_HF_PIN".to_string()]);
+        let cache = tempfile::tempdir().unwrap();
+        std::env::set_var("HF_HUB_CACHE", cache.path());
+        cache_with_three_snapshots(cache.path());
+
+        let tokenizer = hf_cache_file(DEFAULT_TOKENIZER_REPO, &["tokenizer.json"]).unwrap();
+        assert!(tokenizer.ends_with(Path::new(DEFAULT_TOKENIZER_REVISION).join("tokenizer.json")));
+        let rel: Vec<&str> = ONNX_CANDIDATES[1].split('/').collect();
+        let onnx = hf_cache_file(DEFAULT_MODEL_ID, &rel).unwrap();
+        assert!(onnx.ends_with(Path::new(DEFAULT_MODEL_REVISION).join(ONNX_CANDIDATES[1])));
+
+        // A candidate the pinned snapshot lacks is a miss, even when another
+        // snapshot has it.
+        cached_file(
+            cache.path(),
+            DEFAULT_MODEL_ID,
+            "ffffffffffffffffffffffffffffffffffffffff",
+            ONNX_CANDIDATES[2],
+        );
+        let rel: Vec<&str> = ONNX_CANDIDATES[2].split('/').collect();
+        assert_eq!(hf_cache_file(DEFAULT_MODEL_ID, &rel), None);
+    }
+
+    /// `HEADROOM_HF_PIN=off` floats on `main` through `refs/main`, and a repo
+    /// Kompress does not pin (a domain model) always does, as in Python.
+    #[test]
+    fn unpinned_lookups_follow_refs_main() {
+        let _guard = crate::test_support::env_lock();
+        let _env = CacheEnv::cleared_with(["HEADROOM_HF_PIN".to_string()]);
+        let cache = tempfile::tempdir().unwrap();
+        std::env::set_var("HF_HUB_CACHE", cache.path());
+        cache_with_three_snapshots(cache.path());
+        let newest = Path::new("ffffffffffffffffffffffffffffffffffffffff").join("tokenizer.json");
+
+        std::env::set_var("HEADROOM_HF_PIN", "off");
+        let tokenizer = hf_cache_file(DEFAULT_TOKENIZER_REPO, &["tokenizer.json"]).unwrap();
+        assert!(tokenizer.ends_with(&newest));
+
+        std::env::remove_var("HEADROOM_HF_PIN");
+        let domain = "acme/kompress-legal";
+        cached_file(
+            cache.path(),
+            domain,
+            "ffffffffffffffffffffffffffffffffffffffff",
+            "tokenizer.json",
+        );
+        let refs = cache
+            .path()
+            .join("models--acme--kompress-legal")
+            .join("refs");
+        std::fs::create_dir_all(&refs).unwrap();
+        std::fs::write(
+            refs.join("main"),
+            "ffffffffffffffffffffffffffffffffffffffff",
+        )
+        .unwrap();
+        assert!(hf_cache_file(domain, &["tokenizer.json"])
+            .unwrap()
+            .ends_with(&newest));
+    }
+
+    /// The Kompress lookup now names the directory Python would, including
+    /// the cases the old root list missed: the legacy `HUGGINGFACE_HUB_CACHE`,
+    /// `XDG_CACHE_HOME` and a `${VAR}` reference. And it reads only that one
+    /// directory: a copy under `HOME` is not used when `HF_HUB_CACHE` points
+    /// elsewhere.
+    #[test]
+    fn the_cache_lookup_uses_the_one_directory_python_uses() {
+        let _guard = crate::test_support::env_lock();
+        let _env = CacheEnv::cleared_with([
+            "HEADROOM_HF_PIN".to_string(),
+            "KOMPRESS_TEST_ROOT".to_string(),
+        ]);
+        let t = tempfile::tempdir().unwrap();
+        let pin = cache_revision(DEFAULT_TOKENIZER_REPO).to_string();
+        let lookup = || hf_cache_file(DEFAULT_TOKENIZER_REPO, &["tokenizer.json"]);
+        std::env::set_var("HOME", t.path().join("home"));
+        std::env::set_var("USERPROFILE", t.path().join("home"));
+
+        let legacy = t.path().join("legacy");
+        let want = cached_file(&legacy, DEFAULT_TOKENIZER_REPO, &pin, "tokenizer.json");
+        std::env::set_var("HUGGINGFACE_HUB_CACHE", &legacy);
+        assert_eq!(lookup(), Some(want));
+        std::env::remove_var("HUGGINGFACE_HUB_CACHE");
+
+        let xdg = t.path().join("xdg");
+        let want = cached_file(
+            &xdg.join("huggingface").join("hub"),
+            DEFAULT_TOKENIZER_REPO,
+            &pin,
+            "tokenizer.json",
+        );
+        std::env::set_var("XDG_CACHE_HOME", &xdg);
+        assert_eq!(lookup(), Some(want));
+        std::env::remove_var("XDG_CACHE_HOME");
+
+        let root = t.path().join("root");
+        let want = cached_file(
+            &root.join("hub"),
+            DEFAULT_TOKENIZER_REPO,
+            &pin,
+            "tokenizer.json",
+        );
+        std::env::set_var("KOMPRESS_TEST_ROOT", &root);
+        std::env::set_var("HF_HUB_CACHE", "${KOMPRESS_TEST_ROOT}/hub");
+        assert_eq!(lookup(), Some(want));
+
+        cached_file(
+            &t.path()
+                .join("home")
+                .join(".cache")
+                .join("huggingface")
+                .join("hub"),
+            DEFAULT_TOKENIZER_REPO,
+            &pin,
+            "tokenizer.json",
+        );
+        std::env::set_var("HF_HUB_CACHE", t.path().join("empty"));
+        assert_eq!(lookup(), None);
+    }
 
     /// `from_pretrained` must refuse before `Api::new()` when the operator
     /// air-gapped the box.

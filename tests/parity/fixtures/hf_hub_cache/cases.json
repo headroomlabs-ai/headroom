@@ -1,5 +1,5 @@
 {
-  "description": "Cases both languages are checked against so Rust's hf_hub_cache_dir() names the directory huggingface_hub would. tests/test_fastembed_pinned_snapshot.py checks them against Python's posixpath/ntpath and huggingface_hub.constants; crates/headroom-core/src/relevance/embedding.rs checks its port against the same file.",
+  "description": "Cases both languages are checked against so Rust's hf_hub_cache_dir() names the directory huggingface_hub would. tests/test_fastembed_pinned_snapshot.py checks them against Python's posixpath/ntpath and huggingface_hub.constants; crates/headroom-core/src/hf_cache.rs checks its port against the same file.",
   "expandvars": {
     "comment": "posix = posixpath.expandvars, nt = ntpath.expandvars, with env set and unset absent (identical on CPython 3.10, 3.11, 3.13).",
     "env": {

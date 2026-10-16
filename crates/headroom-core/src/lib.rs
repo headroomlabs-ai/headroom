@@ -8,6 +8,8 @@ pub mod auth_mode;
 pub mod cache_control;
 pub mod ccr;
 pub mod compression_policy;
+#[cfg(feature = "ml")]
+mod hf_cache;
 pub mod offline;
 #[cfg(feature = "ml")]
 mod onnx_cpu;

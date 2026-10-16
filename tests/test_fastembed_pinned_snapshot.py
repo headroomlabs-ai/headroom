@@ -228,11 +228,11 @@ def test_python_matches_parity_fixture():
 
 # ── the shared HuggingFace cache directory ──────────────────────────────────
 #
-# Rust's ``hf_hub_cache_dir`` re-implements how ``huggingface_hub`` picks the
+# Rust's ``hf_cache::hub_cache_dir`` re-implements how ``huggingface_hub`` picks the
 # hub cache, so both languages look up and download into one directory. These
 # check the shared fixture against Python itself; the Rust tests
 # ``expand_vars_matches_python_posixpath_and_ntpath`` and
-# ``hf_hub_cache_dir_matches_the_shared_fixture`` check the port against the
+# ``hub_cache_dir_matches_the_shared_fixture`` (``crates/headroom-core/src/hf_cache.rs``) check the port against the
 # same file.
 
 _CACHE_VARS = ("HF_HUB_CACHE", "HUGGINGFACE_HUB_CACHE", "HF_HOME", "XDG_CACHE_HOME")
