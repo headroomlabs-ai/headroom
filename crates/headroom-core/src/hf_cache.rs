@@ -1,17 +1,22 @@
 //! The HuggingFace hub cache, located and read the way Python's
-//! `huggingface_hub` does, so the Rust loaders (the relevance embedder and
-//! Kompress) find the files the Python side downloaded and pinned.
+//! `huggingface_hub` does, so the Rust loaders (the relevance embedder,
+//! Kompress and the HuggingFace tokenizer) find the files the Python side
+//! downloaded and pinned, and authenticate with the same token.
 //!
-//! Two halves, both network-free: [`hub_cache_dir`] picks the one cache
-//! directory Python would use, and [`snapshot_path`] resolves a repo at a
-//! revision inside it. The pinned revisions themselves live next to each
-//! loader and are kept equal to `_PINNED_REVISIONS` in
+//! All network-free: [`hub_cache_dir`] picks the one cache directory Python
+//! would use, [`snapshot_path`] resolves a repo at a revision inside it, and
+//! [`hf_token`] finds the access token. The pinned revisions themselves live
+//! next to each loader and are kept equal to `_PINNED_REVISIONS` in
 //! `headroom/onnx_runtime.py` by tests on the Python side.
+//!
+//! Not behind the `ml` feature: the tokenizer, which is not either, uses the
+//! cache and token lookups.
 
 use std::path::{Path, PathBuf};
 
 /// True when `HEADROOM_HF_PIN` turns revision pinning off, so pinned repos
 /// float on `main` (same values as Python's `onnx_runtime._resolve_revision`).
+#[cfg_attr(not(feature = "ml"), allow(dead_code))] // the pinned loaders are `ml`-only
 pub(crate) fn pin_disabled() -> bool {
     let pin = std::env::var("HEADROOM_HF_PIN").unwrap_or_default();
     matches!(
@@ -22,6 +27,7 @@ pub(crate) fn pin_disabled() -> bool {
 
 /// The revision to load for a repo pinned at `pinned`: the pin, or `main`
 /// when `HEADROOM_HF_PIN` turns pinning off.
+#[cfg_attr(not(feature = "ml"), allow(dead_code))]
 pub(crate) fn pinned_or_main(pinned: &str) -> &str {
     if pin_disabled() {
         "main"
@@ -37,6 +43,7 @@ pub(crate) fn pinned_or_main(pinned: &str) -> &str {
 /// SHA is used as the directory name directly. `hf_hub::Cache` resolves every
 /// revision through `refs/`, which Python's `huggingface_hub` does not write
 /// for a commit SHA, so a snapshot Python downloaded at a pin would be missed.
+#[cfg_attr(not(feature = "ml"), allow(dead_code))]
 pub(crate) fn snapshot_path(cache: &Path, repo: &str, revision: &str) -> PathBuf {
     let repo_dir = cache.join(format!("models--{}", repo.replace('/', "--")));
     let commit = std::fs::read_to_string(repo_dir.join("refs").join(revision))
@@ -66,26 +73,65 @@ pub(crate) fn snapshot_path(cache: &Path, repo: &str, revision: &str) -> PathBuf
 /// relative to the working directory. `tests/parity/fixtures/hf_hub_cache/`
 /// holds the cases both languages are checked against.
 pub(crate) fn hub_cache_dir() -> Option<PathBuf> {
-    let var = |name: &str| {
-        std::env::var_os(name)
-            .filter(|v| !v.is_empty())
-            .map(PathBuf::from)
-    };
-    let home = std::env::home_dir();
-    let expand = |path: PathBuf| expand_vars(&expand_user(path, home.as_deref()));
-    let hub = match var("HF_HUB_CACHE").or_else(|| var("HUGGINGFACE_HUB_CACHE")) {
+    let hub = match env_path("HF_HUB_CACHE").or_else(|| env_path("HUGGINGFACE_HUB_CACHE")) {
         Some(dir) => dir,
-        None => {
-            let hf_home = match var("HF_HOME") {
-                Some(dir) => dir,
-                None => var("XDG_CACHE_HOME")
-                    .or_else(|| home.as_ref().map(|home| home.join(".cache")))?
-                    .join("huggingface"),
-            };
-            expand(hf_home).join("hub")
-        }
+        None => hf_home_dir()?.join("hub"),
     };
     Some(expand(hub))
+}
+
+/// `huggingface_hub.constants.HF_HOME`: `HF_HOME`, else
+/// `XDG_CACHE_HOME/huggingface`, else `~/.cache/huggingface`, expanded as
+/// Python does. The hub cache defaults to its `hub` folder and the login
+/// token to its `token` file.
+fn hf_home_dir() -> Option<PathBuf> {
+    let dir = match env_path("HF_HOME") {
+        Some(dir) => dir,
+        None => env_path("XDG_CACHE_HOME")
+            .or_else(|| std::env::home_dir().map(|home| home.join(".cache")))?
+            .join("huggingface"),
+    };
+    Some(expand(dir))
+}
+
+/// The HuggingFace access token, found the way `huggingface_hub.get_token()`
+/// finds it: `HF_TOKEN`, then its legacy name `HUGGING_FACE_HUB_TOKEN`, then
+/// the file at `HF_TOKEN_PATH` (default `HF_HOME/token`, where
+/// `hf auth login` writes it). Each value is cleaned like Python's
+/// `_clean_token`: line breaks removed, outer whitespace trimmed, and an
+/// empty result counts as no token.
+///
+/// `hf-hub`'s own lookup reads only a `token` file beside the hub cache, so
+/// `HF_TOKEN`, an explicit `HF_TOKEN_PATH`, or a hub cache moved away from
+/// `HF_HOME` would leave a gated download unauthenticated.
+pub(crate) fn hf_token() -> Option<String> {
+    let clean = |token: String| {
+        let token = token.replace(['\r', '\n'], "");
+        let token = token.trim();
+        (!token.is_empty()).then(|| token.to_string())
+    };
+    ["HF_TOKEN", "HUGGING_FACE_HUB_TOKEN"]
+        .into_iter()
+        .find_map(|name| std::env::var(name).ok().and_then(clean))
+        .or_else(|| {
+            let path = match env_path("HF_TOKEN_PATH") {
+                Some(path) => expand(path),
+                None => hf_home_dir()?.join("token"),
+            };
+            std::fs::read_to_string(path).ok().and_then(clean)
+        })
+}
+
+/// A path-valued variable; an empty one counts as unset.
+fn env_path(name: &str) -> Option<PathBuf> {
+    std::env::var_os(name)
+        .filter(|v| !v.is_empty())
+        .map(PathBuf::from)
+}
+
+/// `expandvars(expanduser(path))`, the order `huggingface_hub.constants` uses.
+fn expand(path: PathBuf) -> PathBuf {
+    expand_vars(&expand_user(path, std::env::home_dir().as_deref()))
 }
 
 /// Python's `os.path.expanduser` for a leading bare `~` component. `~user`
@@ -423,6 +469,48 @@ pub(crate) mod tests {
             "{}",
             dir.display()
         );
+    }
+
+    /// The fixture's `token` cases, which the Python half checks against
+    /// `huggingface_hub.get_token()`.
+    #[test]
+    fn hf_token_matches_the_shared_fixture() {
+        let fixture: serde_json::Value = serde_json::from_str(HF_CACHE_FIXTURE).unwrap();
+        let probe_vars: Vec<String> =
+            serde_json::from_value(fixture["cache_dir"]["probe_vars"].clone()).unwrap();
+        let _guard = crate::test_support::env_lock();
+        let _env = CacheEnv::cleared_with(probe_vars.clone());
+        for case in fixture["token"]["cases"].as_array().unwrap() {
+            let t = tempfile::tempdir().unwrap();
+            let (root, home) = (t.path().join("root"), t.path().join("home"));
+            let fill = |text: &str| {
+                text.replace("{root}", root.to_str().unwrap())
+                    .replace("{home}", home.to_str().unwrap())
+            };
+            for name in CACHE_ENV
+                .iter()
+                .copied()
+                .chain(probe_vars.iter().map(String::as_str))
+            {
+                std::env::remove_var(name);
+            }
+            std::env::set_var("HOME", &home);
+            std::env::set_var("USERPROFILE", &home);
+            for (name, value) in case["env"].as_object().unwrap() {
+                std::env::set_var(name, fill(value.as_str().unwrap()));
+            }
+            for (path, content) in case["files"].as_object().unwrap() {
+                let path = PathBuf::from(fill(path));
+                std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+                std::fs::write(path, content.as_str().unwrap()).unwrap();
+            }
+            assert_eq!(
+                hf_token().as_deref(),
+                case["expected"].as_str(),
+                "{}",
+                case["name"]
+            );
+        }
     }
 
     /// A commit SHA names the snapshot directly; a branch goes through its

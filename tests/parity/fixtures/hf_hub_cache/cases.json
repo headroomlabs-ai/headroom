@@ -130,7 +130,10 @@
     "comment": "{root} and {home} are temporary directories; HOME and USERPROFILE are set to {home}, every other cache variable is cleared first. expected may be {posix, nt}.",
     "probe_vars": [
       "HEADROOM_HF_PROBE_ROOT",
-      "HEADROOM_HF_PROBE_UNSET"
+      "HEADROOM_HF_PROBE_UNSET",
+      "HF_TOKEN",
+      "HF_TOKEN_PATH",
+      "HUGGING_FACE_HUB_TOKEN"
     ],
     "cases": [
       {
@@ -234,6 +237,92 @@
         "name": "nothing set: the default under the home directory",
         "env": {},
         "expected": "{home}/.cache/huggingface/hub"
+      }
+    ]
+  },
+  "token": {
+    "comment": "huggingface_hub.get_token(): env, files written first ({root}/{home} as in cache_dir), expected token or null. HF_TOKEN, HUGGING_FACE_HUB_TOKEN and HF_TOKEN_PATH are cleared with the cache variables.",
+    "cases": [
+      {
+        "name": "HF_TOKEN wins over the login file",
+        "env": {
+          "HF_TOKEN": "hf_env"
+        },
+        "files": {
+          "{home}/.cache/huggingface/token": "hf_file"
+        },
+        "expected": "hf_env"
+      },
+      {
+        "name": "the legacy HUGGING_FACE_HUB_TOKEN",
+        "env": {
+          "HUGGING_FACE_HUB_TOKEN": "hf_legacy"
+        },
+        "files": {},
+        "expected": "hf_legacy"
+      },
+      {
+        "name": "an empty HF_TOKEN falls through to the legacy name",
+        "env": {
+          "HF_TOKEN": "",
+          "HUGGING_FACE_HUB_TOKEN": "hf_legacy"
+        },
+        "files": {},
+        "expected": "hf_legacy"
+      },
+      {
+        "name": "the login file under the default HF_HOME, cleaned",
+        "env": {},
+        "files": {
+          "{home}/.cache/huggingface/token": "  hf_file\r\n"
+        },
+        "expected": "hf_file"
+      },
+      {
+        "name": "the login file under HF_HOME",
+        "env": {
+          "HF_HOME": "{root}/hf"
+        },
+        "files": {
+          "{root}/hf/token": "hf_home"
+        },
+        "expected": "hf_home"
+      },
+      {
+        "name": "HF_TOKEN_PATH through ${VAR}",
+        "env": {
+          "HEADROOM_HF_PROBE_ROOT": "{root}",
+          "HF_TOKEN_PATH": "${HEADROOM_HF_PROBE_ROOT}/tok"
+        },
+        "files": {
+          "{root}/tok": "hf_path"
+        },
+        "expected": "hf_path"
+      },
+      {
+        "name": "moving the hub cache does not move the token",
+        "env": {
+          "HF_HUB_CACHE": "{root}/elsewhere/hub"
+        },
+        "files": {
+          "{home}/.cache/huggingface/token": "hf_file",
+          "{root}/elsewhere/token": "hf_wrong"
+        },
+        "expected": "hf_file"
+      },
+      {
+        "name": "a blank login file is no token",
+        "env": {},
+        "files": {
+          "{home}/.cache/huggingface/token": " \n"
+        },
+        "expected": null
+      },
+      {
+        "name": "nothing set",
+        "env": {},
+        "files": {},
+        "expected": null
       }
     ]
   }
