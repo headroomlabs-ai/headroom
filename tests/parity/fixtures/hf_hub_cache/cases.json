@@ -1,0 +1,240 @@
+{
+  "description": "Cases both languages are checked against so Rust's hf_hub_cache_dir() names the directory huggingface_hub would. tests/test_fastembed_pinned_snapshot.py checks them against Python's posixpath/ntpath and huggingface_hub.constants; crates/headroom-core/src/relevance/embedding.rs checks its port against the same file.",
+  "expandvars": {
+    "comment": "posix = posixpath.expandvars, nt = ntpath.expandvars, with env set and unset absent (identical on CPython 3.10, 3.11, 3.13).",
+    "env": {
+      "HEADROOM_EV_A": "x",
+      "HEADROOM_EV_B_C": "y$HEADROOM_EV_A",
+      "HEADROOM_EV_D-E": "z"
+    },
+    "unset": "HEADROOM_EV_UNSET",
+    "cases": [
+      {
+        "input": "plain/path",
+        "posix": "plain/path",
+        "nt": "plain/path"
+      },
+      {
+        "input": "$HEADROOM_EV_A",
+        "posix": "x",
+        "nt": "x"
+      },
+      {
+        "input": "${HEADROOM_EV_A}",
+        "posix": "x",
+        "nt": "x"
+      },
+      {
+        "input": "$HEADROOM_EV_A/$HEADROOM_EV_B_C",
+        "posix": "x/y$HEADROOM_EV_A",
+        "nt": "x/y$HEADROOM_EV_A"
+      },
+      {
+        "input": "$$HEADROOM_EV_A",
+        "posix": "$x",
+        "nt": "$HEADROOM_EV_A"
+      },
+      {
+        "input": "$",
+        "posix": "$",
+        "nt": "$"
+      },
+      {
+        "input": "a$",
+        "posix": "a$",
+        "nt": "a$"
+      },
+      {
+        "input": "$/x",
+        "posix": "$/x",
+        "nt": "$/x"
+      },
+      {
+        "input": "${HEADROOM_EV_A",
+        "posix": "${HEADROOM_EV_A",
+        "nt": "${HEADROOM_EV_A"
+      },
+      {
+        "input": "${}",
+        "posix": "${}",
+        "nt": "${}"
+      },
+      {
+        "input": "$HEADROOM_EV_UNSET/x",
+        "posix": "$HEADROOM_EV_UNSET/x",
+        "nt": "$HEADROOM_EV_UNSET/x"
+      },
+      {
+        "input": "${HEADROOM_EV_UNSET}/x",
+        "posix": "${HEADROOM_EV_UNSET}/x",
+        "nt": "${HEADROOM_EV_UNSET}/x"
+      },
+      {
+        "input": "%HEADROOM_EV_A%/x",
+        "posix": "%HEADROOM_EV_A%/x",
+        "nt": "x/x"
+      },
+      {
+        "input": "%%HEADROOM_EV_A%%",
+        "posix": "%%HEADROOM_EV_A%%",
+        "nt": "%HEADROOM_EV_A%"
+      },
+      {
+        "input": "%HEADROOM_EV_A",
+        "posix": "%HEADROOM_EV_A",
+        "nt": "%HEADROOM_EV_A"
+      },
+      {
+        "input": "%HEADROOM_EV_UNSET%/x",
+        "posix": "%HEADROOM_EV_UNSET%/x",
+        "nt": "%HEADROOM_EV_UNSET%/x"
+      },
+      {
+        "input": "'$HEADROOM_EV_A'/$HEADROOM_EV_A",
+        "posix": "'x'/x",
+        "nt": "'$HEADROOM_EV_A'/x"
+      },
+      {
+        "input": "'$HEADROOM_EV_A",
+        "posix": "'x",
+        "nt": "'$HEADROOM_EV_A"
+      },
+      {
+        "input": "$HEADROOM_EV_D-E",
+        "posix": "$HEADROOM_EV_D-E",
+        "nt": "z"
+      },
+      {
+        "input": "${HEADROOM_EV_D-E}",
+        "posix": "z",
+        "nt": "z"
+      },
+      {
+        "input": "$HEADROOM_EV_A-x",
+        "posix": "x-x",
+        "nt": "$HEADROOM_EV_A-x"
+      },
+      {
+        "input": "~$HEADROOM_EV_A",
+        "posix": "~x",
+        "nt": "~x"
+      },
+      {
+        "input": "é/$HEADROOM_EV_A/é",
+        "posix": "é/x/é",
+        "nt": "é/x/é"
+      }
+    ]
+  },
+  "cache_dir": {
+    "comment": "{root} and {home} are temporary directories; HOME and USERPROFILE are set to {home}, every other cache variable is cleared first. expected may be {posix, nt}.",
+    "probe_vars": [
+      "HEADROOM_HF_PROBE_ROOT",
+      "HEADROOM_HF_PROBE_UNSET"
+    ],
+    "cases": [
+      {
+        "name": "HF_HUB_CACHE through ${VAR} (the #4190 review case)",
+        "env": {
+          "HEADROOM_HF_PROBE_ROOT": "{root}",
+          "HF_HUB_CACHE": "${HEADROOM_HF_PROBE_ROOT}/hub"
+        },
+        "expected": "{root}/hub"
+      },
+      {
+        "name": "HF_HUB_CACHE through $VAR",
+        "env": {
+          "HEADROOM_HF_PROBE_ROOT": "{root}",
+          "HF_HUB_CACHE": "$HEADROOM_HF_PROBE_ROOT/hub"
+        },
+        "expected": "{root}/hub"
+      },
+      {
+        "name": "legacy HUGGINGFACE_HUB_CACHE through ${VAR}",
+        "env": {
+          "HEADROOM_HF_PROBE_ROOT": "{root}",
+          "HUGGINGFACE_HUB_CACHE": "${HEADROOM_HF_PROBE_ROOT}/legacy"
+        },
+        "expected": "{root}/legacy"
+      },
+      {
+        "name": "HF_HOME through ${VAR}",
+        "env": {
+          "HEADROOM_HF_PROBE_ROOT": "{root}",
+          "HF_HOME": "${HEADROOM_HF_PROBE_ROOT}/hf-home"
+        },
+        "expected": "{root}/hf-home/hub"
+      },
+      {
+        "name": "XDG_CACHE_HOME through ${VAR}",
+        "env": {
+          "HEADROOM_HF_PROBE_ROOT": "{root}",
+          "XDG_CACHE_HOME": "${HEADROOM_HF_PROBE_ROOT}/xdg"
+        },
+        "expected": "{root}/xdg/huggingface/hub"
+      },
+      {
+        "name": "HF_HUB_CACHE still wins over an expanded HF_HOME",
+        "env": {
+          "HEADROOM_HF_PROBE_ROOT": "{root}",
+          "HF_HOME": "${HEADROOM_HF_PROBE_ROOT}/hf-home",
+          "HF_HUB_CACHE": "{root}/explicit"
+        },
+        "expected": "{root}/explicit"
+      },
+      {
+        "name": "an unset variable stays literal",
+        "env": {
+          "HF_HUB_CACHE": "{root}/${HEADROOM_HF_PROBE_UNSET}/hub"
+        },
+        "expected": "{root}/${HEADROOM_HF_PROBE_UNSET}/hub"
+      },
+      {
+        "name": "leading ~ in HF_HUB_CACHE",
+        "env": {
+          "HF_HUB_CACHE": "~/models"
+        },
+        "expected": "{home}/models"
+      },
+      {
+        "name": "leading ~ in HF_HOME",
+        "env": {
+          "HF_HOME": "~/hf"
+        },
+        "expected": "{home}/hf/hub"
+      },
+      {
+        "name": "a ~ that a variable produces in HF_HUB_CACHE stays literal (expanduser runs first)",
+        "env": {
+          "HEADROOM_HF_PROBE_ROOT": "~/r",
+          "HF_HUB_CACHE": "${HEADROOM_HF_PROBE_ROOT}/hub"
+        },
+        "expected": "~/r/hub"
+      },
+      {
+        "name": "a ~ that a variable produces in HF_HOME expands on the second pass",
+        "env": {
+          "HEADROOM_HF_PROBE_ROOT": "~/r",
+          "HF_HOME": "${HEADROOM_HF_PROBE_ROOT}/hf"
+        },
+        "expected": "{home}/r/hf/hub"
+      },
+      {
+        "name": "%VAR% is a variable on Windows only",
+        "env": {
+          "HEADROOM_HF_PROBE_ROOT": "{root}",
+          "HF_HUB_CACHE": "%HEADROOM_HF_PROBE_ROOT%/hub"
+        },
+        "expected": {
+          "posix": "%HEADROOM_HF_PROBE_ROOT%/hub",
+          "nt": "{root}/hub"
+        }
+      },
+      {
+        "name": "nothing set: the default under the home directory",
+        "env": {},
+        "expected": "{home}/.cache/huggingface/hub"
+      }
+    ]
+  }
+}
