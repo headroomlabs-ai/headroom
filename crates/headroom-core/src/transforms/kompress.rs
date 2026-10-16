@@ -352,9 +352,10 @@ impl Kompress {
                 tokenizer_repo = %config.tokenizer_repo,
                 revision = %cache_revision(&config.tokenizer_repo),
                 hub_cache = ?crate::hf_cache::hub_cache_dir(),
-                "Kompress deferred: tokenizer.json not found in HF cache \
-                 (not downloaded, or present but unreadable — e.g. HF symlinks \
-                 over \\\\wsl$ which native Windows cannot follow)"
+                "Kompress deferred: tokenizer.json not found in the HF cache at the \
+                 pinned revision (not downloaded yet — the Python side fetches the \
+                 pin on its next Kompress load — or present but unreadable, e.g. HF \
+                 symlinks over \\\\wsl$ which native Windows cannot follow)"
             );
             return Ok(None);
         };
@@ -610,6 +611,19 @@ fn load_tokenizer(path: &Path, repo: &str) -> Result<Tokenizer, KompressError> {
 fn build_session(path: &Path) -> Result<Session, Box<dyn std::error::Error + Send + Sync>> {
     let session = Session::builder()?.commit_from_file(path)?;
     Ok(session)
+}
+
+/// The tokenizer and the ONNX artifact `onnx` (e.g.
+/// `"onnx/kompress-int8-wo.onnx"`) that the cache-only loader reads for
+/// `config`: the pinned snapshots in Python's hub cache, as
+/// [`Kompress::from_cache`] finds them. `None` when either is missing. For
+/// parity harnesses that load one specific artifact through
+/// [`Kompress::from_files`], so they test the files production would load.
+pub fn cached_artifacts(config: &KompressConfig, onnx: &str) -> Option<(PathBuf, PathBuf)> {
+    let tokenizer = hf_cache_file(&config.tokenizer_repo, &["tokenizer.json"])?;
+    let rel: Vec<&str> = onnx.split('/').collect();
+    let model = hf_cache_file(&config.model_id, &rel)?;
+    Some((tokenizer, model))
 }
 
 /// The revision of `repo` to load from the cache: its pin when it is one of

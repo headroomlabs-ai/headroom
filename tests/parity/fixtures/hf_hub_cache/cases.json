@@ -271,6 +271,17 @@
         "expected": "hf_legacy"
       },
       {
+        "name": "a whitespace-only HF_TOKEN is still the one picked, so the legacy name is skipped",
+        "env": {
+          "HF_TOKEN": "  ",
+          "HUGGING_FACE_HUB_TOKEN": "hf_legacy"
+        },
+        "files": {
+          "{home}/.cache/huggingface/token": "hf_file"
+        },
+        "expected": "hf_file"
+      },
+      {
         "name": "the login file under the default HF_HOME, cleaned",
         "env": {},
         "files": {

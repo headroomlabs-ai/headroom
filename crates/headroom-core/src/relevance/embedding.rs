@@ -114,7 +114,7 @@ fn cached_snapshot(cache: &Path, revision: &str) -> Option<PathBuf> {
 }
 
 /// The Hub handle for [`DEFAULT_MODEL_REPO`] at `revision`, caching under
-/// `cache_root`. Honors `HF_ENDPOINT` like the Python side does.
+/// `cache_root`, with Python's endpoint and token ([`crate::hf_cache::hub_api`]).
 #[cfg(feature = "ml")]
 fn default_model_repo(
     cache_root: &Path,
@@ -131,14 +131,7 @@ fn default_model_repo(
     // tell the causes apart in the log.
     crate::offline::guard_egress("fastembed embedding model download", DEFAULT_MODEL_REPO)
         .map_err(|e| format!("EmbeddingScorer model load refused: {e}"))?;
-    let mut builder =
-        hf_hub::api::sync::ApiBuilder::from_cache(hf_hub::Cache::new(cache_root.to_path_buf()))
-            .with_progress(false);
-    if let Ok(endpoint) = std::env::var("HF_ENDPOINT") {
-        builder = builder.with_endpoint(endpoint);
-    }
-    let api = builder
-        .build()
+    let api = crate::hf_cache::hub_api(cache_root)
         .map_err(|e| format!("EmbeddingScorer: HuggingFace client init failed: {e}"))?;
     Ok(api.repo(hf_hub::Repo::with_revision(
         DEFAULT_MODEL_REPO.to_string(),

@@ -175,17 +175,11 @@ impl HfTokenizer {
 }
 
 /// The Hub client for [`HfTokenizer::from_pretrained`]: caching in Python's
-/// hub cache directory, with Python's token and `HF_ENDPOINT`.
+/// hub cache directory, with Python's token and endpoint.
 fn hub_api() -> Result<hf_hub::api::sync::Api, Box<dyn std::error::Error + Send + Sync>> {
     let cache = crate::hf_cache::hub_cache_dir()
         .ok_or("no HuggingFace cache directory (set HF_HUB_CACHE or HF_HOME)")?;
-    let mut builder = hf_hub::api::sync::ApiBuilder::from_cache(hf_hub::Cache::new(cache))
-        .with_progress(false)
-        .with_token(crate::hf_cache::hf_token());
-    if let Ok(endpoint) = std::env::var("HF_ENDPOINT") {
-        builder = builder.with_endpoint(endpoint);
-    }
-    Ok(builder.build()?)
+    Ok(crate::hf_cache::hub_api(&cache)?)
 }
 
 impl Tokenizer for HfTokenizer {
@@ -460,7 +454,9 @@ mod tests {
         std::env::set_var("HOME", t.path().join("home"));
         std::env::set_var("USERPROFILE", t.path().join("home"));
         std::env::set_var("HF_HUB_CACHE", t.path().join("hub"));
-        std::env::set_var("HF_ENDPOINT", format!("http://127.0.0.1:{port}"));
+        // Trailing slash on purpose: Python strips it, and a kept one
+        // would request `//acme/...`.
+        std::env::set_var("HF_ENDPOINT", format!("http://127.0.0.1:{port}/"));
         std::env::set_var("HF_TOKEN", "hf_test_token");
 
         let result = HfTokenizer::from_pretrained("acme/gated");
@@ -470,7 +466,7 @@ mod tests {
             "{result:?}"
         );
         assert!(
-            request.contains("/acme/gated/resolve/main/tokenizer.json"),
+            request.contains(" /acme/gated/resolve/main/tokenizer.json "),
             "{request}"
         );
         assert!(

@@ -4,8 +4,11 @@
 //! downloaded and pinned, and authenticate with the same token.
 //!
 //! All network-free: [`hub_cache_dir`] picks the one cache directory Python
-//! would use, [`snapshot_path`] resolves a repo at a revision inside it, and
-//! [`hf_token`] finds the access token. The pinned revisions themselves live
+//! would use, [`snapshot_path`] resolves a repo at a revision inside it,
+//! [`hf_token`] finds the access token and [`hub_api`] builds a client from
+//! them. One known divergence: an empty variable counts as unset here, where
+//! Python would take it as a path relative to the working directory (see
+//! [`hub_cache_dir`]). The pinned revisions themselves live
 //! next to each loader and are kept equal to `_PINNED_REVISIONS` in
 //! `headroom/onnx_runtime.py` by tests on the Python side.
 //!
@@ -110,9 +113,13 @@ pub(crate) fn hf_token() -> Option<String> {
         let token = token.trim();
         (!token.is_empty()).then(|| token.to_string())
     };
+    // `HF_TOKEN or HUGGING_FACE_HUB_TOKEN`, then clean: a whitespace-only
+    // `HF_TOKEN` is still the one picked, and cleans to no token, so the
+    // legacy name is not consulted (the login file is).
     ["HF_TOKEN", "HUGGING_FACE_HUB_TOKEN"]
         .into_iter()
-        .find_map(|name| std::env::var(name).ok().and_then(clean))
+        .find_map(|name| std::env::var(name).ok().filter(|v| !v.is_empty()))
+        .and_then(clean)
         .or_else(|| {
             let path = match env_path("HF_TOKEN_PATH") {
                 Some(path) => expand(path),
@@ -120,6 +127,68 @@ pub(crate) fn hf_token() -> Option<String> {
             };
             std::fs::read_to_string(path).ok().and_then(clean)
         })
+}
+
+/// The Hub endpoint: `HF_ENDPOINT` without trailing slashes (Python's
+/// `constants.ENDPOINT` strips them, and `hf-hub` appends `/{repo}/…`, so a
+/// kept slash would request `//repo`), else `https://huggingface.co`.
+pub(crate) fn hf_endpoint() -> String {
+    match std::env::var("HF_ENDPOINT") {
+        Ok(endpoint) => endpoint.trim_end_matches('/').to_string(),
+        Err(_) => "https://huggingface.co".to_string(),
+    }
+}
+
+/// An `hf-hub` client that caches in `cache` and talks to [`hf_endpoint`]
+/// with [`hf_token`], as Python's `huggingface_hub` would. Building it opens
+/// no connection; callers put their `guard_egress` in front of it.
+///
+/// The token is not sent over plain `http://` to a host other than loopback:
+/// it would cross the network in clear text on every request, so the client
+/// goes without it and says why. Python would send it; a gated repo behind
+/// such a mirror then answers 401 rather than leak the credential.
+pub(crate) fn hub_api(cache: &Path) -> Result<hf_hub::api::sync::Api, hf_hub::api::sync::ApiError> {
+    let endpoint = hf_endpoint();
+    let token = hf_token().filter(|_| {
+        let exposed = sends_in_clear_text(&endpoint);
+        if exposed {
+            tracing::warn!(
+                event = "hf_token_withheld",
+                endpoint = %endpoint,
+                "HF_ENDPOINT is plain http to a non-loopback host; not sending the \
+                 HuggingFace token to it. Use an https endpoint for gated repos."
+            );
+        }
+        !exposed
+    });
+    hf_hub::api::sync::ApiBuilder::from_cache(hf_hub::Cache::new(cache.to_path_buf()))
+        .with_progress(false)
+        .with_endpoint(endpoint)
+        .with_token(token)
+        .build()
+}
+
+/// Whether a request to `endpoint` would carry its headers unencrypted off
+/// this machine: `http://` to anything but a loopback host.
+fn sends_in_clear_text(endpoint: &str) -> bool {
+    let Some(rest) = endpoint
+        .get(..7)
+        .filter(|scheme| scheme.eq_ignore_ascii_case("http://"))
+        .map(|_| &endpoint[7..])
+    else {
+        return false;
+    };
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
+    let host_port = authority.rsplit('@').next().unwrap_or("");
+    let host = match host_port.strip_prefix('[') {
+        Some(v6) => v6.split(']').next().unwrap_or(""),
+        None => host_port.split(':').next().unwrap_or(""),
+    };
+    let loopback = host.eq_ignore_ascii_case("localhost")
+        || host
+            .parse::<std::net::IpAddr>()
+            .is_ok_and(|ip| ip.is_loopback());
+    !loopback
 }
 
 /// A path-valued variable; an empty one counts as unset.
@@ -510,6 +579,44 @@ pub(crate) mod tests {
                 "{}",
                 case["name"]
             );
+        }
+    }
+
+    #[test]
+    fn hf_endpoint_drops_trailing_slashes_like_python() {
+        let _guard = crate::test_support::env_lock();
+        let saved = std::env::var_os("HF_ENDPOINT");
+        std::env::remove_var("HF_ENDPOINT");
+        assert_eq!(hf_endpoint(), "https://huggingface.co");
+        std::env::set_var("HF_ENDPOINT", "https://mirror.example.com//");
+        assert_eq!(hf_endpoint(), "https://mirror.example.com");
+        match saved {
+            Some(v) => std::env::set_var("HF_ENDPOINT", v),
+            None => std::env::remove_var("HF_ENDPOINT"),
+        }
+    }
+
+    /// The token is withheld only where it would cross the network unencrypted.
+    #[test]
+    fn plain_http_off_loopback_is_the_only_clear_text_endpoint() {
+        for endpoint in [
+            "http://mirror.example.com",
+            "HTTP://mirror.example.com:8080/hub",
+            "http://10.0.0.5",
+            "http://user@hub.internal",
+            "http://localhost.example.com",
+        ] {
+            assert!(sends_in_clear_text(endpoint), "{endpoint}");
+        }
+        for endpoint in [
+            "https://huggingface.co",
+            "https://mirror.example.com",
+            "http://localhost:8000",
+            "http://127.0.0.1:9",
+            "http://127.8.0.1",
+            "http://[::1]:8080/",
+        ] {
+            assert!(!sends_in_clear_text(endpoint), "{endpoint}");
         }
     }
 
