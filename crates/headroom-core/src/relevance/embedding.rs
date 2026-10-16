@@ -112,11 +112,16 @@ fn default_model_revision() -> &'static str {
 /// used when a higher one is configured, which is also what Python does: with
 /// `HF_HUB_CACHE` set, a model under `~/.cache` is neither found nor reused.
 ///
-/// A leading `~` is expanded like Python's `expanduser`; `$VAR` references
-/// (Python's `expandvars`) are not. The home directory comes from
-/// `std::env::home_dir`, which falls back to the user database when `HOME`
-/// is unset, as `expanduser` does. An empty variable counts as unset; Python
-/// would treat it as a path relative to the working directory.
+/// Both expansions happen as in `huggingface_hub.constants`:
+/// `expandvars(expanduser(...))`, first on `HF_HOME` (or its
+/// `XDG_CACHE_HOME` default) and then on the hub path itself. So
+/// `HF_HUB_CACHE=${ROOT}/hub` names the same directory in both languages, and
+/// a `~` that only appears once a variable is expanded stays literal, as it
+/// does in Python. The home directory comes from `std::env::home_dir`, which
+/// falls back to the user database when `HOME` is unset, as `expanduser`
+/// does. An empty variable counts as unset; Python would treat it as a path
+/// relative to the working directory. `tests/parity/fixtures/hf_hub_cache/`
+/// holds the cases both languages are checked against.
 #[cfg(feature = "ml")]
 fn hf_hub_cache_dir() -> Option<PathBuf> {
     let var = |name: &str| {
@@ -125,20 +130,180 @@ fn hf_hub_cache_dir() -> Option<PathBuf> {
             .map(PathBuf::from)
     };
     let home = std::env::home_dir();
-    let dir = var("HF_HUB_CACHE")
-        .or_else(|| var("HUGGINGFACE_HUB_CACHE"))
-        .or_else(|| var("HF_HOME").map(|dir| dir.join("hub")))
-        .or_else(|| var("XDG_CACHE_HOME").map(|dir| dir.join("huggingface").join("hub")))
-        .or_else(|| {
-            home.as_ref()
-                .map(|home| home.join(".cache").join("huggingface").join("hub"))
-        })?;
-    // Only a bare `~` component expands; `~user` stays as written, which is
-    // also what `expanduser` does when it cannot resolve the user.
-    Some(match (dir.strip_prefix("~"), &home) {
+    let expand = |path: PathBuf| expand_vars(&expand_user(path, home.as_deref()));
+    let hub = match var("HF_HUB_CACHE").or_else(|| var("HUGGINGFACE_HUB_CACHE")) {
+        Some(dir) => dir,
+        None => {
+            let hf_home = match var("HF_HOME") {
+                Some(dir) => dir,
+                None => var("XDG_CACHE_HOME")
+                    .or_else(|| home.as_ref().map(|home| home.join(".cache")))?
+                    .join("huggingface"),
+            };
+            expand(hf_home).join("hub")
+        }
+    };
+    Some(expand(hub))
+}
+
+/// Python's `os.path.expanduser` for a leading bare `~` component. `~user`
+/// stays as written, which is also what `expanduser` does when it cannot
+/// resolve the user.
+#[cfg(feature = "ml")]
+fn expand_user(path: PathBuf, home: Option<&Path>) -> PathBuf {
+    match (path.strip_prefix("~"), home) {
         (Ok(rest), Some(home)) => home.join(rest),
-        _ => dir,
-    })
+        _ => path,
+    }
+}
+
+/// Python's `os.path.expandvars`: `posixpath` rules off Windows, `ntpath`
+/// rules on it. A path that is not valid Unicode is returned unchanged.
+#[cfg(feature = "ml")]
+fn expand_vars(path: &Path) -> PathBuf {
+    let Some(text) = path.to_str() else {
+        return path.to_path_buf();
+    };
+    #[cfg(windows)]
+    let expanded = expand_vars_nt(text, env_lookup);
+    #[cfg(not(windows))]
+    let expanded = expand_vars_posix(text, env_lookup);
+    PathBuf::from(expanded)
+}
+
+/// An environment value for `expand_vars`. Names the OS cannot hold (empty,
+/// or containing `=` or NUL) are unset, which is how Python's `os.environ`
+/// lookup fails for them too.
+#[cfg(feature = "ml")]
+fn env_lookup(name: &str) -> Option<std::ffi::OsString> {
+    if name.is_empty() || name.contains(['=', '\0']) {
+        return None;
+    }
+    std::env::var_os(name)
+}
+
+/// `posixpath.expandvars`: `$name` (ASCII letters, digits, `_`) or
+/// `${anything but a brace}`. An unset name, and a `$` that starts neither
+/// form, stay as written. Expanded values are not scanned again.
+#[cfg(feature = "ml")]
+#[cfg_attr(windows, allow(dead_code))] // tests run both rule sets everywhere
+fn expand_vars_posix(
+    text: &str,
+    lookup: impl Fn(&str) -> Option<std::ffi::OsString>,
+) -> std::ffi::OsString {
+    let mut out = std::ffi::OsString::new();
+    let mut rest = text;
+    while let Some(at) = rest.find('$') {
+        out.push(&rest[..at]);
+        let after = &rest[at + 1..];
+        let word = after
+            .find(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+            .unwrap_or(after.len());
+        // (name, length of the reference after the `$`)
+        let reference = if word > 0 {
+            Some((&after[..word], word))
+        } else {
+            after
+                .strip_prefix('{')
+                .and_then(|braced| braced.find('}').map(|end| (&braced[..end], end + 2)))
+        };
+        match reference {
+            Some((name, len)) => {
+                match lookup(name) {
+                    Some(value) => out.push(value),
+                    None => out.push(&rest[at..at + 1 + len]),
+                }
+                rest = &after[len..];
+            }
+            None => {
+                out.push("$");
+                rest = after;
+            }
+        }
+    }
+    out.push(rest);
+    out
+}
+
+/// `ntpath.expandvars`: `%name%`, `${name}` and `$name` (ASCII letters,
+/// digits, `_`, `-`); `%%` and `$$` are a literal `%` and `$`; nothing inside
+/// single quotes expands. An unset or unterminated reference stays as
+/// written.
+#[cfg(feature = "ml")]
+#[cfg_attr(not(windows), allow(dead_code))] // tests run both rule sets everywhere
+fn expand_vars_nt(
+    text: &str,
+    lookup: impl Fn(&str) -> Option<std::ffi::OsString>,
+) -> std::ffi::OsString {
+    let mut out = std::ffi::OsString::new();
+    let mut rest = text;
+    while let Some(c) = rest.chars().next() {
+        let after = &rest[c.len_utf8()..];
+        match c {
+            '\'' => match after.find('\'') {
+                Some(end) => {
+                    out.push(&rest[..end + 2]);
+                    rest = &after[end + 1..];
+                }
+                None => {
+                    out.push(rest);
+                    rest = "";
+                }
+            },
+            '%' if after.starts_with('%') => {
+                out.push("%");
+                rest = &after[1..];
+            }
+            '%' => match after.find('%') {
+                Some(end) => {
+                    let name = &after[..end];
+                    match lookup(name) {
+                        Some(value) => out.push(value),
+                        None => out.push(&rest[..end + 2]),
+                    }
+                    rest = &after[end + 1..];
+                }
+                None => {
+                    out.push(rest);
+                    rest = "";
+                }
+            },
+            '$' if after.starts_with('$') => {
+                out.push("$");
+                rest = &after[1..];
+            }
+            '$' if after.starts_with('{') => match after[1..].find('}') {
+                Some(end) => {
+                    let name = &after[1..1 + end];
+                    match lookup(name) {
+                        Some(value) => out.push(value),
+                        None => out.push(&rest[..end + 3]),
+                    }
+                    rest = &after[end + 2..];
+                }
+                None => {
+                    out.push(rest);
+                    rest = "";
+                }
+            },
+            '$' => {
+                let end = after
+                    .find(|c: char| !(c.is_ascii_alphanumeric() || c == '_' || c == '-'))
+                    .unwrap_or(after.len());
+                let name = &after[..end];
+                match lookup(name) {
+                    Some(value) => out.push(value),
+                    None => out.push(&rest[..end + 1]),
+                }
+                rest = &after[end..];
+            }
+            _ => {
+                out.push(&rest[..c.len_utf8()]);
+                rest = after;
+            }
+        }
+    }
+    out
 }
 
 /// Find a snapshot of [`DEFAULT_MODEL_REPO`] at `revision` in the hub cache
@@ -695,18 +860,30 @@ mod tests {
     /// assertion cannot leak a fake cache into later tests. Take
     /// `env_lock()` first.
     #[cfg(feature = "ml")]
-    struct CacheEnv(Vec<(&'static str, Option<std::ffi::OsString>)>);
+    struct CacheEnv(Vec<(String, Option<std::ffi::OsString>)>);
 
     #[cfg(feature = "ml")]
     impl CacheEnv {
         fn cleared() -> Self {
-            let saved = CACHE_ENV
+            Self::cleared_with(std::iter::empty())
+        }
+
+        /// [`Self::cleared`], plus `extra` variables (the ones a test's
+        /// paths reference).
+        fn cleared_with(extra: impl IntoIterator<Item = String>) -> Self {
+            let names: Vec<String> = CACHE_ENV
                 .iter()
-                .map(|&name| (name, std::env::var_os(name)))
+                .map(|name| name.to_string())
+                .chain(extra)
                 .collect();
-            for name in CACHE_ENV {
-                std::env::remove_var(name);
-            }
+            let saved = names
+                .into_iter()
+                .map(|name| {
+                    let value = std::env::var_os(&name);
+                    std::env::remove_var(&name);
+                    (name, value)
+                })
+                .collect();
             CacheEnv(saved)
         }
     }
@@ -762,6 +939,82 @@ mod tests {
             hf_hub_cache_dir(),
             Some(p("home").join("models").join("hub"))
         );
+    }
+
+    /// Cases checked against Python itself (`posixpath`, `ntpath` and
+    /// `huggingface_hub.constants`) by `tests/test_fastembed_pinned_snapshot.py`.
+    #[cfg(feature = "ml")]
+    const HF_CACHE_FIXTURE: &str = include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../tests/parity/fixtures/hf_hub_cache/cases.json"
+    ));
+
+    /// Both rule sets on every platform, so the Windows port is exercised by
+    /// the macOS and Linux runs too.
+    #[cfg(feature = "ml")]
+    #[test]
+    fn expand_vars_matches_python_posixpath_and_ntpath() {
+        let fixture: serde_json::Value = serde_json::from_str(HF_CACHE_FIXTURE).unwrap();
+        let section = &fixture["expandvars"];
+        let env: std::collections::HashMap<String, String> =
+            serde_json::from_value(section["env"].clone()).unwrap();
+        let lookup = |name: &str| env.get(name).map(std::ffi::OsString::from);
+        for case in section["cases"].as_array().unwrap() {
+            let input = case["input"].as_str().unwrap();
+            let want = |key: &str| std::ffi::OsString::from(case[key].as_str().unwrap());
+            assert_eq!(
+                expand_vars_posix(input, lookup),
+                want("posix"),
+                "posix {input:?}"
+            );
+            assert_eq!(expand_vars_nt(input, lookup), want("nt"), "nt {input:?}");
+        }
+    }
+
+    /// The review case among them: `HF_HUB_CACHE=${ROOT}/hub` is
+    /// `<ROOT>/hub` in Python, so Rust must not look up or download into a
+    /// literal `${ROOT}` directory instead.
+    #[cfg(feature = "ml")]
+    #[test]
+    fn hf_hub_cache_dir_matches_the_shared_fixture() {
+        let fixture: serde_json::Value = serde_json::from_str(HF_CACHE_FIXTURE).unwrap();
+        let section = &fixture["cache_dir"];
+        let probe_vars: Vec<String> =
+            serde_json::from_value(section["probe_vars"].clone()).unwrap();
+        let _guard = crate::test_support::env_lock();
+        let _env = CacheEnv::cleared_with(probe_vars.clone());
+        let t = tempfile::tempdir().unwrap();
+        let (root, home) = (t.path().join("root"), t.path().join("home"));
+        let fill = |text: &str| {
+            text.replace("{root}", root.to_str().unwrap())
+                .replace("{home}", home.to_str().unwrap())
+        };
+        for case in section["cases"].as_array().unwrap() {
+            for name in CACHE_ENV
+                .iter()
+                .copied()
+                .chain(probe_vars.iter().map(String::as_str))
+            {
+                std::env::remove_var(name);
+            }
+            std::env::set_var("HOME", &home);
+            std::env::set_var("USERPROFILE", &home);
+            for (name, value) in case["env"].as_object().unwrap() {
+                std::env::set_var(name, fill(value.as_str().unwrap()));
+            }
+            let expected = match &case["expected"] {
+                serde_json::Value::Object(by_os) => {
+                    &by_os[if cfg!(windows) { "nt" } else { "posix" }]
+                }
+                expected => expected,
+            };
+            assert_eq!(
+                hf_hub_cache_dir(),
+                Some(PathBuf::from(fill(expected.as_str().unwrap()))),
+                "{}",
+                case["name"]
+            );
+        }
     }
 
     /// With no `HOME` (a service started with a bare environment) the home

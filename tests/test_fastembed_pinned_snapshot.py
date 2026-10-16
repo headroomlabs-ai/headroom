@@ -31,6 +31,9 @@ from headroom.relevance.embedding import (
 REPO_ROOT = Path(__file__).resolve().parents[1]
 RUST_EMBEDDING = REPO_ROOT / "crates/headroom-core/src/relevance/embedding.rs"
 PARITY_FIXTURE = REPO_ROOT / "tests/parity/fixtures/embedding/bge_small_en_v15_pinned.json"
+HF_CACHE_FIXTURE = json.loads(
+    (REPO_ROOT / "tests/parity/fixtures/hf_hub_cache/cases.json").read_text(encoding="utf-8")
+)
 PIN = _PINNED_REVISIONS[DEFAULT_MODEL_REPO]
 
 
@@ -221,3 +224,67 @@ def test_python_matches_parity_fixture():
     for text, row, expected in zip(fixture["texts"], got, fixture["embeddings"]):
         worst = float(np.abs(np.asarray(row, dtype=np.float64) - np.asarray(expected)).max())
         assert worst <= fixture["max_abs_diff"], f"{text!r}: max |python - fixture| = {worst:e}"
+
+
+# ── the shared HuggingFace cache directory ──────────────────────────────────
+#
+# Rust's ``hf_hub_cache_dir`` re-implements how ``huggingface_hub`` picks the
+# hub cache, so both languages look up and download into one directory. These
+# check the shared fixture against Python itself; the Rust tests
+# ``expand_vars_matches_python_posixpath_and_ntpath`` and
+# ``hf_hub_cache_dir_matches_the_shared_fixture`` check the port against the
+# same file.
+
+_CACHE_VARS = ("HF_HUB_CACHE", "HUGGINGFACE_HUB_CACHE", "HF_HOME", "XDG_CACHE_HOME")
+
+
+@pytest.mark.parametrize(
+    "case", HF_CACHE_FIXTURE["expandvars"]["cases"], ids=lambda case: case["input"]
+)
+def test_expandvars_fixture_matches_posixpath_and_ntpath(
+    case: dict[str, str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import ntpath
+    import posixpath
+
+    for name, value in HF_CACHE_FIXTURE["expandvars"]["env"].items():
+        monkeypatch.setenv(name, value)
+    monkeypatch.delenv(HF_CACHE_FIXTURE["expandvars"]["unset"], raising=False)
+    assert posixpath.expandvars(case["input"]) == case["posix"]
+    assert ntpath.expandvars(case["input"]) == case["nt"]
+
+
+@pytest.mark.parametrize(
+    "case", HF_CACHE_FIXTURE["cache_dir"]["cases"], ids=lambda case: case["name"]
+)
+def test_cache_dir_fixture_matches_huggingface_hub(case: dict, tmp_path: Path) -> None:
+    """``huggingface_hub`` reads these variables once, at import, so each case
+    runs in a fresh interpreter."""
+    import subprocess
+
+    pytest.importorskip("huggingface_hub")
+    root, home = tmp_path / "root", tmp_path / "home"
+
+    def fill(text: str) -> str:
+        return text.replace("{root}", str(root)).replace("{home}", str(home))
+
+    probe_vars = HF_CACHE_FIXTURE["cache_dir"]["probe_vars"]
+    env = {k: v for k, v in os.environ.items() if k not in (*_CACHE_VARS, *probe_vars)}
+    env["HOME"] = env["USERPROFILE"] = str(home)
+    env.update({name: fill(value) for name, value in case["env"].items()})
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            "import sys, huggingface_hub.constants as c; sys.stdout.write(c.HF_HUB_CACHE)",
+        ],
+        capture_output=True,
+        text=True,
+        env=env,
+        timeout=60,
+        check=True,
+    )
+    expected = case["expected"]
+    if isinstance(expected, dict):
+        expected = expected["nt" if os.name == "nt" else "posix"]
+    assert Path(result.stdout) == Path(fill(expected))
