@@ -213,6 +213,7 @@ Compression is lossless via CCR (Compress-Cache-Retrieve): originals are stored 
 | `routeCodexViaProxy` | `true` | Rewrite OpenClaw's built-in `openai-codex` provider to use the active Headroom proxy in memory so upstream Codex requests pass through Headroom. |
 | `gatewayProviderIds` | `[]` | Optional explicit list of OpenClaw provider ids to route through the active Headroom proxy in memory. Friendly aliases `codex`, `claude`, `copilot`, and `gemini` are also accepted. When set, this overrides the default `openai-codex` routing list. |
 | `announceCompression` | `true` | Adds a static, cache-stable notice to the system prompt the first time a session compresses more than 100 tokens, then keeps it unchanged for the rest of the session. Set to `false` to guarantee Headroom never modifies the system prompt. |
+| `commitLogPath` | `$HEADROOM_WORKSPACE_DIR/openclaw/commit-log.json`, else `~/.headroom/openclaw/commit-log.json` | Where the plugin records each turn OpenClaw has accepted (one small marker file per turn, in a sibling `commit-log.d/` directory), so a retried commit is answered as a duplicate even after a restart. Must be on a writable filesystem: on a read-only root (common in Kubernetes), point this or `HEADROOM_WORKSPACE_DIR` at a writable volume. While commits fail, OpenClaw 2026.9.9+ runs each later turn of the session on its legacy context path. |
 
 ## Comparison with lossless-claw
 

@@ -38,7 +38,9 @@ export interface HeadroomEngineConfig extends ProxyManagerConfig {
   circuitBreakerThreshold?: number;
   circuitBreakerCooldownMs?: number;
   /** Where to durably record committed turn-advancement keys (see
-   * `DurableAdvancementKeyStore`). Defaults to `defaultCommitLogPath()`. */
+   * `DurableAdvancementKeyStore`; the markers live beside it in
+   * `markerDirFor(commitLogPath)`). Must be on a writable filesystem.
+   * Defaults to `defaultCommitLogPath()`. */
   commitLogPath?: string;
   announceCompression?: boolean;
 }
@@ -236,17 +238,18 @@ export class HeadroomContextEngine {
   /**
    * Durable turn-advancement commit — required by OpenClaw's transcriptSemantics
    * contract. Called only for the accepted, successful turn; failed or aborted
-   * turns never reach here. Must be an atomic, idempotent write of the
-   * accepted `messages` keyed by `advancementKey` so a host retry with the
-   * same key reports "duplicate" instead of re-applying the advancement —
-   * including a retry that arrives after this process restarted, which is
-   * why the record lives on disk (see `DurableAdvancementKeyStore`) rather
-   * than in memory, and includes the messages rather than just the key.
+   * turns never reach here. Must be one atomic, idempotent write keyed by
+   * `advancementKey`, so a host retry with the same key reports "duplicate"
+   * instead of re-applying the advancement — including a retry that arrives
+   * after this process restarted, which is why the record lives on disk (see
+   * `DurableAdvancementKeyStore`) rather than in memory. This engine keeps no
+   * turn state of its own (OpenClaw's transcript holds the accepted
+   * `messages`), so recording the key is the whole advancement.
    */
   async commitTurn(params: { advancementKey: string; messages: any[] }): Promise<{
     status: "committed" | "duplicate";
   }> {
-    const status = await this.advancementKeyStore.tryCommit(params.advancementKey, params.messages);
+    const status = await this.advancementKeyStore.tryCommit(params.advancementKey);
     return { status };
   }
 

@@ -45,6 +45,10 @@
     "announceCompression": {
       "label": "Announce Compression In System Prompt",
       "help": "When enabled, a static, cache-stable notice is added to the system prompt the first time a session compresses more than 100 tokens. Disable to guarantee the plugin never modifies the system prompt."
+    },
+    "commitLogPath": {
+      "label": "Turn Commit Log Path",
+      "help": "Where to record committed turn advancements (the markers go in a sibling directory). Must be writable. Defaults to $HEADROOM_WORKSPACE_DIR/openclaw/commit-log.json, else ~/.headroom/openclaw/commit-log.json."
     }
   },
   "configSchema": {
@@ -114,6 +118,10 @@
       "announceCompression": {
         "type": "boolean",
         "default": true
+      },
+      "commitLogPath": {
+        "type": "string",
+        "minLength": 1
       }
     }
   },
