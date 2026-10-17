@@ -108,6 +108,10 @@ def _register_provider_passthrough_route(
     spec: ProviderPassthroughRoute,
 ) -> None:
     async def provider_passthrough(request: Request):
+        # A reachability probe the token gate let through without a credential
+        # (/api/hello): answer it here, never relay it upstream anonymously.
+        if getattr(request.state, "headroom_local_hello_probe", False):
+            return Response(status_code=200)
         return await proxy.handle_passthrough(
             request,
             _api_target(proxy, spec.provider_name),
