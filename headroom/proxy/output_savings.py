@@ -406,6 +406,9 @@ class SavingsLedger:
     baseline: BaselineModel = field(default_factory=BaselineModel)
     treatment: dict[str, _Accum] = field(default_factory=dict)
     control: dict[str, _Accum] = field(default_factory=dict)
+    # Set by ``from_dict`` when it dropped pre-rule arms, so the owner can
+    # persist the drop instead of re-dropping (and re-warning) on every load.
+    dropped_legacy_arms: bool = field(default=False, compare=False, repr=False)
 
     # ---- recording -------------------------------------------------------
 
@@ -616,7 +619,7 @@ class SavingsLedger:
         }
 
     @classmethod
-    def from_dict(cls, d: dict[str, Any]) -> SavingsLedger:
+    def from_dict(cls, d: dict[str, Any], *, warn_legacy: bool = True) -> SavingsLedger:
         ledger = cls(baseline=BaselineModel.from_dict(d.get("baseline") or {}))
         if not d.get("shaped_only"):
             # Pre-rule arms cannot be told apart from shaped ones entry by
@@ -625,6 +628,8 @@ class SavingsLedger:
             # baseline is kept: it is learned from pre-shaper history, costs a
             # `learn --verbosity` run to rebuild, and was never the poisoned part.
             if d.get("treatment") or d.get("control"):
+                ledger.dropped_legacy_arms = True
+            if ledger.dropped_legacy_arms and warn_legacy:
                 logger.warning(
                     "output-savings ledger predates shaped-only recording; "
                     "dropping %d treatment and %d control strata and "
@@ -651,14 +656,14 @@ class SavingsLedger:
         fsutil.write_text(p, json.dumps(self.to_dict(), separators=(",", ":")))
 
     @classmethod
-    def load(cls, path: Any) -> SavingsLedger:
+    def load(cls, path: Any, *, warn_legacy: bool = True) -> SavingsLedger:
         from pathlib import Path
 
         p = Path(path)
         if not p.exists():
             return cls()
         try:
-            return cls.from_dict(json.loads(p.read_text()))
+            return cls.from_dict(json.loads(p.read_text()), warn_legacy=warn_legacy)
         except (json.JSONDecodeError, ValueError, OSError) as exc:
             # Fail open (empty ledger), but surface the loss — silently
             # swallowing a corrupt file made lost history indistinguishable
@@ -692,6 +697,11 @@ class SavingsRecorder:
         self._ledger = SavingsLedger.load(self._path)
         self._flush_every = flush_every
         self._since_flush = 0
+        if self._ledger.dropped_legacy_arms:
+            # Persist the drop now. With the shaper off nothing ever records,
+            # so waiting for a periodic flush would leave the legacy file on
+            # disk indefinitely.
+            self._save_unless_stateless()
 
     def record_from_labels(self, labels: Any, output_tokens: int) -> bool:
         """Record one outcome given its transforms_applied labels. Returns True
@@ -779,13 +789,26 @@ class SavingsRecorder:
         same number of samples still takes effect, and the empty-disk guard keeps
         a truncated file from wiping a baseline we already hold."""
         try:
-            disk = SavingsLedger.load(self._path)
+            # Only the baseline is read here, and the constructor already
+            # reported any legacy arms. Warning again would repeat on every
+            # /stats poll whenever the file can't be rewritten (stateless).
+            disk = SavingsLedger.load(self._path, warn_legacy=False)
         except OSError:
             return
         if disk.baseline.total_samples == 0:
             return
         if disk.baseline.to_dict() != self._ledger.baseline.to_dict():
             self._ledger.baseline = disk.baseline
+
+    def _save_unless_stateless(self) -> None:
+        from ..paths import process_is_stateless
+
+        if process_is_stateless():
+            return
+        try:
+            self._ledger.save(self._path)
+        except OSError:
+            pass
 
     def _flush_locked(self) -> None:
         from ..paths import process_is_stateless

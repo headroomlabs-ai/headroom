@@ -685,6 +685,63 @@ class TestLedgerPersistence:
         ledger = SavingsLedger.load(p)
         assert ledger.baseline.total_samples == 0
 
+    @staticmethod
+    def _pre_rule_ledger(path):
+        """A ledger written before shaped-only recording: arms, no marker."""
+        baseline = BaselineModel()
+        baseline.observe("opus|a|s|tools", 1000)
+        legacy = {
+            "baseline": baseline.to_dict(),
+            "treatment": {"opus|a|s|tools": {"n": 3, "sum": 2400.0, "sumsq": 1920000.0}},
+            "control": {},
+        }
+        path.write_text(json.dumps(legacy))
+        return legacy
+
+    @staticmethod
+    def _legacy_warnings(caplog):
+        return [r for r in caplog.records if "predates shaped-only" in r.getMessage()]
+
+    def test_pre_rule_ledger_warns_once_and_is_rewritten(self, tmp_path, caplog):
+        """/stats reloads the ledger on every poll. With the shaper disabled
+        nothing ever flushes, so the legacy file used to survive and warn on
+        every poll forever."""
+        import logging
+
+        path = tmp_path / "output_savings.json"
+        legacy = self._pre_rule_ledger(path)
+
+        with caplog.at_level(logging.WARNING):
+            recorder = SavingsRecorder(str(path))
+            for _ in range(3):
+                recorder.estimate()
+
+        assert len(self._legacy_warnings(caplog)) == 1
+        on_disk = json.loads(path.read_text())
+        assert on_disk["shaped_only"] is True
+        assert on_disk["treatment"] == {}
+        assert on_disk["baseline"] == legacy["baseline"]
+
+    def test_stateless_pre_rule_ledger_warns_once_and_is_left_alone(self, tmp_path, caplog):
+        import logging
+
+        from headroom import paths
+
+        path = tmp_path / "output_savings.json"
+        legacy = self._pre_rule_ledger(path)
+
+        paths.set_process_stateless(True)
+        try:
+            with caplog.at_level(logging.WARNING):
+                recorder = SavingsRecorder(str(path))
+                for _ in range(3):
+                    recorder.estimate()
+        finally:
+            paths.set_process_stateless(False)
+
+        assert len(self._legacy_warnings(caplog)) == 1
+        assert json.loads(path.read_text()) == legacy
+
 
 # ---------------------------------------------------------------------------
 # echo ratio (direct waste signal)
