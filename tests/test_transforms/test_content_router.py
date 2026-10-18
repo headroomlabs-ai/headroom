@@ -1589,40 +1589,6 @@ class TestSmartCrusherFallback:
             f"{strategy_chain}"
         )
 
-    def test_code_aware_fallback_also_uses_unified_block(self, router, monkeypatch):
-        """CodeAware strategy also uses the unified fallback block.
-        Verify it doesn't double-invoke Kompress either."""
-        import headroom.transforms.content_router as crm
-
-        monkeypatch.setattr(
-            crm.ContentRouter,
-            "_try_ml_compressor",
-            lambda self, content, context="", question=None: (
-                content,
-                len(content.split()),
-            ),
-        )
-
-        plain = "This is just plain text. " * 200
-
-        compressed, compressed_tokens, strategy_chain, _reversible = (
-            router._apply_strategy_to_content(
-                plain,
-                CompressionStrategy.CODE_AWARE,
-                context="",
-            )
-        )
-
-        # CodeAware should be in the chain
-        assert "code_aware" in strategy_chain
-
-        # No duplicate fallback entries
-        kompress_count = strategy_chain.count("kompress")
-        assert kompress_count <= 1, (
-            f"Kompress appeared {kompress_count} times; "
-            f"duplicate fallback in CodeAware path: {strategy_chain}"
-        )
-
 
 # =============================================================================
 # TestCompressBlockContent — PR #704 shared-path regression

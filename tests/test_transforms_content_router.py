@@ -2829,14 +2829,6 @@ def test_json_in_html_preserves_records_and_markup() -> None:
     assert not result.unrecoverable_sections
 
 
-# A Claude Code Read of Rust: line-numbered code that code_aware hands back
-# unchanged (it cannot parse the number column) while reporting compressed=True.
-# Code runs ~2 tokens per whitespace word, so a word count badly undercounts it.
-_NUMBERED_RUST = "\n".join(
-    f"{i}\tlet value_{i} = compute(&items[{i}..], Some(opts.clone()))?;" for i in range(1, 121)
-)
-
-
 def _noop_code_aware_router(monkeypatch: pytest.MonkeyPatch, kompress_out: str) -> ContentRouter:
     monkeypatch.delenv("HEADROOM_LOSSLESS_THEN_LOSSY", raising=False)
     router = ContentRouter(ContentRouterConfig(enable_code_aware=True))
@@ -2858,95 +2850,35 @@ def _noop_code_aware_router(monkeypatch: pytest.MonkeyPatch, kompress_out: str) 
     return router
 
 
-def test_code_aware_noop_keeps_a_smaller_kompress_fallback(
-    monkeypatch: pytest.MonkeyPatch,
+@pytest.mark.parametrize(
+    ("enabled", "preferred", "layer_lossy"),
+    [(False, True, False), (True, True, False), (True, False, False), (True, True, True)],
+    ids=["unavailable", "declined", "passthrough", "lossless-then-lossy"],
+)
+def test_fenced_code_keeps_keywords_when_code_compression_declines(
+    monkeypatch: pytest.MonkeyPatch, enabled: bool, preferred: bool, layer_lossy: bool
 ) -> None:
-    """The fallback is judged in tokens, the unit of the code_aware result.
+    code = "\n\n".join(
+        f"def select_{i}(items):\n"
+        "    result = []\n"
+        "    for item in items:\n"
+        "        if item is not None:\n"
+        "            result.append(item)\n"
+        "    return result"
+        for i in range(6)
+    )
+    router = _noop_code_aware_router(monkeypatch, code.replace("for ", "").replace("if ", ""))
+    router.config.enable_code_aware = enabled
+    router.config.prefer_code_aware_for_code = preferred
+    router._lossless_then_lossy = layer_lossy
+    prose = "\n\n".join(f"Section {i} describes the generated implementation." for i in range(6))
+    mixed = f"{prose}\n\n```python\n{code}\n```\n\nExecution finished."
 
-    With code_aware's result counted in words, a Kompress result at ~60% of the
-    tokens still "lost" to the unchanged block, so the inference always ran and
-    was always thrown away.
-    """
-    kompressed = "\n".join(f"{i}\tvalue_{i} compute(&items[{i}..])" for i in range(1, 121))
-    assert _estimate_tokens(kompressed) < _estimate_tokens(_NUMBERED_RUST)
-    assert _estimate_tokens(kompressed) > len(_NUMBERED_RUST.split())
-    router = _noop_code_aware_router(monkeypatch, kompressed)
-
-    compressed, compressed_tokens, strategy_chain, _reversible = router._apply_strategy_to_content(
-        _NUMBERED_RUST, CompressionStrategy.CODE_AWARE, context=""
+    result = router.compress(
+        mixed, precomputed_detection=DetectionResult(ContentType.PLAIN_TEXT, 1.0, {})
     )
 
-    assert compressed == kompressed
-    assert compressed_tokens == _estimate_tokens(kompressed)
-    assert strategy_chain == ["code_aware", "kompress"]
-
-
-def test_code_aware_noop_reports_tokens_when_kompress_passes_through(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """An unchanged block is reported at its own token count, never its word count."""
-    router = _noop_code_aware_router(monkeypatch, _NUMBERED_RUST)
-
-    compressed, compressed_tokens, _chain, _reversible = router._apply_strategy_to_content(
-        _NUMBERED_RUST, CompressionStrategy.CODE_AWARE, context=""
-    )
-
-    assert compressed == _NUMBERED_RUST
-    assert compressed_tokens == _estimate_tokens(_NUMBERED_RUST)
-
-
-def test_code_aware_noop_runs_kompress_once_when_it_passes_through(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Lossless-then-lossy tries Kompress inline; a passthrough must not be retried."""
-    router = _noop_code_aware_router(monkeypatch, _NUMBERED_RUST)
-    router._lossless_then_lossy = True
-    calls: list[str] = []
-    kompress = router._try_ml_compressor
-
-    def counting(content: str, *args: object, **kwargs: object) -> tuple[str, int]:
-        calls.append(content)
-        return kompress(content, *args, **kwargs)
-
-    monkeypatch.setattr(router, "_try_ml_compressor", counting)
-
-    compressed, compressed_tokens, _chain, _reversible = router._apply_strategy_to_content(
-        _NUMBERED_RUST, CompressionStrategy.CODE_AWARE, context=""
-    )
-
-    assert compressed == _NUMBERED_RUST
-    assert compressed_tokens == _estimate_tokens(_NUMBERED_RUST)
-    assert len(calls) == 1
-
-
-def test_code_aware_noop_keeps_a_smaller_inline_kompress(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Lossless-then-lossy's inline attempt keeps a Kompress result that wins.
-
-    Measured in tokens, a code_aware no-op no longer looks like a shrink, so the
-    inline attempt fires and its smaller result is kept without a second call.
-    """
-    kompressed = "\n".join(f"{i}\tvalue_{i} compute(&items[{i}..])" for i in range(1, 121))
-    router = _noop_code_aware_router(monkeypatch, kompressed)
-    router._lossless_then_lossy = True
-    calls: list[str] = []
-    kompress = router._try_ml_compressor
-
-    def counting(content: str, *args: object, **kwargs: object) -> tuple[str, int]:
-        calls.append(content)
-        return kompress(content, *args, **kwargs)
-
-    monkeypatch.setattr(router, "_try_ml_compressor", counting)
-
-    compressed, compressed_tokens, strategy_chain, _reversible = router._apply_strategy_to_content(
-        _NUMBERED_RUST, CompressionStrategy.CODE_AWARE, context=""
-    )
-
-    assert compressed == kompressed
-    assert compressed_tokens == _estimate_tokens(kompressed)
-    assert strategy_chain == ["code_aware", "kompress"]
-    assert len(calls) == 1
+    assert f"```python\n{code}\n```" in result.compressed
 
 
 @pytest.mark.parametrize("as_block", [False, True], ids=["string-tool", "tool-result-block"])

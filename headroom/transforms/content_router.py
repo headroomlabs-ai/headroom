@@ -4538,12 +4538,17 @@ class ContentRouter(Transform):
         # compressor on the byte-folded remainder and keep it IFF it removes a
         # further meaningful chunk (Kompress must save >= _lossy_min_extra_savings
         # beyond the fold). Keeps the fold AND reclaims the semantic word-drop
-        # tail, never doing worse than the fold. DIFF folds are returned verbatim
-        # — Kompressing hunks corrupts `git apply`.
+        # tail, never doing worse than the fold. Code and explicit passthrough
+        # remain lossless; Kompress would also corrupt diff hunks.
         if _ll_label is not None:
             _lossy_after_fold = (
                 self._lossless_then_lossy
-                and strategy != CompressionStrategy.DIFF
+                and strategy
+                not in {
+                    CompressionStrategy.DIFF,
+                    CompressionStrategy.CODE_AWARE,
+                    CompressionStrategy.PASSTHROUGH,
+                }
                 and _ll_label != "lossless_diff"
                 and not self._looks_like_diff(content)
             )
@@ -4591,14 +4596,9 @@ class ContentRouter(Transform):
                     compressor = self._get_code_compressor()
                     if compressor:
                         compressor_name = type(compressor).__name__
-                        # Registry-resolved dispatch: the built-in "code_aware"
-                        # adapter delegates to this same getter+method with the
-                        # language passed through ``config``, so on a real
-                        # compression the content is byte-identical to the
-                        # historical direct call. If the adapter did NOT compress
-                        # (``compressed=False``), leave the local ``compressed``
-                        # None so the EXISTING Kompress fallback below runs
-                        # exactly as today.
+                        # The registry adapter passes the language through to
+                        # the code-aware compressor. If it declines the block,
+                        # preserve the original code rather than trying ML.
                         output = self._registry_compress(
                             "code_aware",
                             strategy,
@@ -4615,39 +4615,6 @@ class ContentRouter(Transform):
                             # 55% compression and no fallback could beat it.
                             compressed_tokens = _estimate_tokens(output.content)
                             decision_reason = "code_aware"
-                if compressed is None:
-                    # Fallback to Kompress
-                    compressed, compressed_tokens = self._try_ml_compressor(
-                        content, context, question
-                    )
-                    strategy = CompressionStrategy.KOMPRESS  # Update for TOIN
-                    actual_strategy = strategy
-                    compressor_name = "KompressCompressor"
-                    decision_reason = "code_aware_unavailable_fallback_kompress"
-                    strategy_chain.append(CompressionStrategy.KOMPRESS.value)
-                elif (
-                    self._lossless_then_lossy
-                    and compressed_tokens is not None
-                    and compressed_tokens >= original_tokens
-                ):
-                    # #3 — lossless-then-lossy: code-aware produced NO net shrink
-                    # and the lossless fold found nothing either, so this code
-                    # block would otherwise pass through uncompressed. Give the
-                    # lossy ML compressor (Kompress) a shot so lossy runs even when
-                    # lossless has no savings. Reads are protected upstream, so
-                    # only NON-read code reaches here. Keep Kompress ONLY if it
-                    # actually shrinks (never inflate).
-                    # Recorded as tried even if it loses, so the no-savings
-                    # fallback below does not run the same inference again.
-                    strategy_chain.append(CompressionStrategy.KOMPRESS.value)
-                    _k, _ = self._try_ml_compressor(content, context, question)
-                    _kt = _estimate_tokens(_k)
-                    if _kt < original_tokens and len(_k) < len(content):
-                        compressed, compressed_tokens = _k, _kt
-                        strategy = CompressionStrategy.KOMPRESS
-                        actual_strategy = strategy
-                        compressor_name = "KompressCompressor"
-                        decision_reason = "code_aware_no_shrink_fallback_kompress"
 
             elif strategy == CompressionStrategy.SMART_CRUSHER:
                 # SmartCrusher handles its own TOIN recording
@@ -4872,15 +4839,11 @@ class ContentRouter(Transform):
             # some rows and not others with nothing marking which (#3652).
             fallback_eligible_strategy = strategy in {
                 CompressionStrategy.SMART_CRUSHER,
-                CompressionStrategy.CODE_AWARE,
                 CompressionStrategy.CONFIG,
             }
             fallback_no_savings = compressed == content or compressed_tokens >= original_tokens
             if fallback_eligible_strategy and fallback_no_savings:
-                # Skip if Kompress was already tried by an inline fallback
-                # (e.g. CODE_AWARE's code-compressor-unavailable path at
-                # line 1249).  Prevents a duplicate strategy_chain entry
-                # and a wasted second _try_ml_compressor call.
+                # Do not run Kompress twice if an inline fallback already tried it.
                 already_tried_kompress = CompressionStrategy.KOMPRESS.value in strategy_chain
                 if not already_tried_kompress:
                     strategy_chain.append(CompressionStrategy.KOMPRESS.value)
@@ -4952,10 +4915,9 @@ class ContentRouter(Transform):
             # produced and KEEP it only if it removes a further meaningful chunk
             # (>= _lossy_min_extra_savings beyond the strategy result) and is
             # actually shorter — never inflating, never doing worse than the
-            # strategy output. DIFF is excluded (Kompress corrupts ``git
-            # apply``); TEXT/KOMPRESS already ran Kompress; CODE_AWARE has its
-            # own inline no-shrink fallback; SMART_CRUSHER uses the
-            # zero-savings fallback above; TABULAR never goes to Kompress.
+            # strategy output. Code, diffs, and tables stay out of lossy ML;
+            # TEXT/KOMPRESS already ran it, and SMART_CRUSHER uses the
+            # zero-savings fallback above.
             if (
                 self._lossless_then_lossy
                 and compressed is not None
@@ -5468,6 +5430,8 @@ class ContentRouter(Transform):
 
     def _strategy_from_detection_type(self, content_type: ContentType) -> CompressionStrategy:
         """Get strategy from ContentType enum."""
+        if content_type == ContentType.SOURCE_CODE and not self.config.prefer_code_aware_for_code:
+            return CompressionStrategy.PASSTHROUGH
         mapping = {
             ContentType.SOURCE_CODE: CompressionStrategy.CODE_AWARE,
             ContentType.JSON_ARRAY: CompressionStrategy.SMART_CRUSHER,
