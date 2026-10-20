@@ -415,19 +415,22 @@ impl DiffCompressor {
                 }
             }
 
-            // Trim context inside each kept hunk.
-            let mut compressed_hunks: Vec<DiffHunk> = Vec::with_capacity(selected.len());
+            // Trim context inside each kept hunk. Trimming can split a hunk
+            // in two, so the kept/removed counts stay per original hunk.
+            let selected_count = selected.len();
+            let mut compressed_hunks: Vec<DiffHunk> = Vec::with_capacity(selected_count);
             for hunk in selected {
-                let trimmed = reduce_context(&hunk, self.config.max_context_lines);
-                if trimmed.lines.len() > largest_kept {
-                    largest_kept = trimmed.lines.len();
+                for trimmed in reduce_context(&hunk, self.config.max_context_lines) {
+                    if trimmed.lines.len() > largest_kept {
+                        largest_kept = trimmed.lines.len();
+                    }
+                    context_kept_total += trimmed.context_lines;
+                    compressed_hunks.push(trimmed);
                 }
-                context_kept_total += trimmed.context_lines;
-                compressed_hunks.push(trimmed);
             }
 
-            hunks_kept_total += compressed_hunks.len();
-            hunks_removed_total += original_hunk_count - compressed_hunks.len();
+            hunks_kept_total += selected_count;
+            hunks_removed_total += original_hunk_count - selected_count;
 
             compressed_files.push(DiffFile {
                 hunks: compressed_hunks,
@@ -1028,7 +1031,14 @@ fn extract_line_number(header: &str) -> usize {
 
 // ─── Context trimming ──────────────────────────────────────────────────────
 
-fn reduce_context(hunk: &DiffHunk, max_context: usize) -> DiffHunk {
+/// Trim each hunk's context to `max_context` lines around its changes.
+///
+/// Dropping context moves where a hunk starts and can leave a gap between
+/// two changes, so every contiguous run of kept lines becomes its own hunk
+/// with a header recomputed from the original line numbers (the same hunks
+/// `git diff -U<max_context>` prints). A hunk that loses no lines keeps its
+/// header byte-for-byte.
+fn reduce_context(hunk: &DiffHunk, max_context: usize) -> Vec<DiffHunk> {
     let parents = hunk_parents(&hunk.header);
     let change_kind = |l: &str| -> (bool, bool) {
         if parents > 1 {
@@ -1038,6 +1048,15 @@ fn reduce_context(hunk: &DiffHunk, max_context: usize) -> DiffHunk {
         }
     };
 
+    // Lines past the extent the header declares (the empty string left by a
+    // trailing newline, a format-patch signature) are not part of the hunk:
+    // they never count as a change, ride along with the last run, and are
+    // not numbered.
+    let ranges = parse_hunk_ranges(&hunk.header, parents);
+    let body_len = ranges
+        .as_ref()
+        .map_or(hunk.lines.len(), |r| hunk_body_len(&hunk.lines, parents, r));
+
     // Indices of `+`/`-` lines.
     let change_positions: Vec<usize> = hunk
         .lines
@@ -1045,7 +1064,7 @@ fn reduce_context(hunk: &DiffHunk, max_context: usize) -> DiffHunk {
         .enumerate()
         .filter_map(|(i, l)| {
             let (added, deleted) = change_kind(l);
-            if added || deleted {
+            if i < body_len && (added || deleted) {
                 Some(i)
             } else {
                 None
@@ -1053,53 +1072,108 @@ fn reduce_context(hunk: &DiffHunk, max_context: usize) -> DiffHunk {
         })
         .collect();
 
+    let mut keep = std::collections::BTreeSet::new();
     if change_positions.is_empty() {
         // No-changes hunk → keep up to `max_context` leading lines, like Python.
-        let take = max_context.min(hunk.lines.len());
-        let lines: Vec<String> = hunk.lines.iter().take(take).cloned().collect();
-        return DiffHunk {
-            header: hunk.header.clone(),
-            lines,
-            additions: 0,
-            deletions: 0,
-            context_lines: take,
-            score: hunk.score,
-        };
-    }
-
-    // Indices to keep: each change + `max_context` lines either side.
-    let mut keep = std::collections::BTreeSet::new();
-    for &pos in &change_positions {
-        keep.insert(pos);
-        let lo = pos.saturating_sub(max_context);
-        for i in lo..pos {
-            keep.insert(i);
+        keep.extend(0..max_context.min(hunk.lines.len()));
+    } else {
+        // Indices to keep: each change + `max_context` lines either side.
+        for &pos in &change_positions {
+            keep.insert(pos);
+            let lo = pos.saturating_sub(max_context);
+            for i in lo..pos {
+                keep.insert(i);
+            }
+            let hi = (pos + max_context + 1).min(hunk.lines.len());
+            for i in (pos + 1)..hi {
+                keep.insert(i);
+            }
         }
-        let hi = (pos + max_context + 1).min(hunk.lines.len());
-        for i in (pos + 1)..hi {
-            keep.insert(i);
-        }
-    }
 
-    // Bug-fix: ALWAYS keep `\ No newline at end of file` markers (and any
-    // other backslash-prefixed metadata) regardless of distance from a
-    // change. These are structural patch markers, not context — losing
-    // them breaks round-trippable patches and changes the semantic
-    // meaning of the trailing line in the file. Mirrors the same fix in
-    // the Python source.
-    for (i, line) in hunk.lines.iter().enumerate() {
-        if line.starts_with('\\') {
-            keep.insert(i);
+        // Bug-fix: ALWAYS keep `\ No newline at end of file` markers (and any
+        // other backslash-prefixed metadata) regardless of distance from a
+        // change. These are structural patch markers, not context — losing
+        // them breaks round-trippable patches and changes the semantic
+        // meaning of the trailing line in the file. Mirrors the same fix in
+        // the Python source.
+        for (i, line) in hunk.lines.iter().enumerate() {
+            if line.starts_with('\\') {
+                keep.insert(i);
+            }
         }
     }
 
-    let mut new_lines: Vec<String> = Vec::with_capacity(keep.len());
+    let untouched = keep.is_empty() || keep.len() == hunk.lines.len();
+    let Some(ranges) = ranges.filter(|_| !untouched) else {
+        // Nothing trimmed, or a header we can't renumber: one hunk under
+        // the original header.
+        return vec![build_hunk(
+            hunk.header.clone(),
+            keep.iter().map(|&i| hunk.lines[i].clone()).collect(),
+            &change_kind,
+            hunk.score,
+        )];
+    };
+
+    // Split the kept lines into contiguous runs.
+    let mut runs: Vec<Vec<usize>> = Vec::new();
+    for &i in &keep {
+        match runs.last_mut() {
+            Some(run) if i >= body_len || run.last() == Some(&(i - 1)) => run.push(i),
+            _ => runs.push(vec![i]),
+        }
+    }
+
+    let marker = "@".repeat(parents + 1);
+    let (mut old_next, mut new_next) = (ranges.old_next, ranges.new_next);
+    let mut out = Vec::with_capacity(runs.len());
+    let mut pos = 0usize;
+    for run in runs {
+        // Advance the line numbers over everything before this run.
+        while pos < run[0] {
+            advance(&hunk.lines[pos], parents, &mut old_next, &mut new_next);
+            pos += 1;
+        }
+        let (old_start, new_start) = (old_next.clone(), new_next);
+        for &i in run.iter().filter(|&&i| i < body_len) {
+            advance(&hunk.lines[i], parents, &mut old_next, &mut new_next);
+        }
+        pos = run[run.len() - 1] + 1;
+
+        let mut header = marker.clone();
+        for (start, next) in old_start.iter().zip(&old_next) {
+            header.push_str(&format_range('-', *start, next - start, parents > 1));
+        }
+        header.push_str(&format_range(
+            '+',
+            new_start,
+            new_next - new_start,
+            parents > 1,
+        ));
+        header.push(' ');
+        header.push_str(&marker);
+        header.push_str(&ranges.heading);
+
+        out.push(build_hunk(
+            header,
+            run.iter().map(|&i| hunk.lines[i].clone()).collect(),
+            &change_kind,
+            hunk.score,
+        ));
+    }
+    out
+}
+
+fn build_hunk(
+    header: String,
+    lines: Vec<String>,
+    change_kind: &dyn Fn(&str) -> (bool, bool),
+    score: f64,
+) -> DiffHunk {
     let mut additions = 0usize;
     let mut deletions = 0usize;
     let mut context_lines = 0usize;
-    for &i in &keep {
-        let line = &hunk.lines[i];
-        new_lines.push(line.clone());
+    for line in &lines {
         let (added, deleted) = change_kind(line);
         if deleted {
             deletions += 1;
@@ -1109,14 +1183,129 @@ fn reduce_context(hunk: &DiffHunk, max_context: usize) -> DiffHunk {
             context_lines += 1;
         }
     }
-
     DiffHunk {
-        header: hunk.header.clone(),
-        lines: new_lines,
+        header,
+        lines,
         additions,
         deletions,
         context_lines,
-        score: hunk.score,
+        score,
+    }
+}
+
+/// Line numbers parsed from a hunk header: where each old side (one per
+/// parent) and the new side start, how many lines each spans, and the
+/// trailing section heading (` def foo():`).
+struct HunkRanges {
+    old_next: Vec<usize>,
+    old_len: Vec<usize>,
+    new_next: usize,
+    new_len: usize,
+    heading: String,
+}
+
+/// `None` if the header doesn't have the `@@ -a,b +c,d @@` shape (with one
+/// `-` range per parent).
+fn parse_hunk_ranges(header: &str, parents: usize) -> Option<HunkRanges> {
+    let marker = "@".repeat(parents + 1);
+    let rest = header.strip_prefix(&marker)?;
+    let end = rest.find(&format!(" {marker}"))?;
+    let heading = rest[end + 1 + marker.len()..].to_string();
+    let ranges: Vec<&str> = rest[..end].split_whitespace().collect();
+    if ranges.len() != parents + 1 {
+        return None;
+    }
+    // Returns (next line number, line count). A zero-length range names the
+    // line *before* the hunk.
+    let parse = |range: &str, sign: char| -> Option<(usize, usize)> {
+        let body = range.strip_prefix(sign)?;
+        let (start, count) = match body.split_once(',') {
+            Some((s, c)) => (s.parse::<usize>().ok()?, c.parse::<usize>().ok()?),
+            None => (body.parse::<usize>().ok()?, 1),
+        };
+        Some((
+            if count == 0 {
+                start.checked_add(1)?
+            } else {
+                start
+            },
+            count,
+        ))
+    };
+    let old = ranges[..parents]
+        .iter()
+        .map(|r| parse(r, '-'))
+        .collect::<Option<Vec<_>>>()?;
+    let (new_next, new_len) = parse(ranges[parents], '+')?;
+    Some(HunkRanges {
+        old_next: old.iter().map(|&(n, _)| n).collect(),
+        old_len: old.iter().map(|&(_, c)| c).collect(),
+        new_next,
+        new_len,
+        heading,
+    })
+}
+
+/// Number of leading lines that make up the hunk its header describes.
+fn hunk_body_len(lines: &[String], parents: usize, ranges: &HunkRanges) -> usize {
+    let (mut old, mut new) = (ranges.old_next.clone(), ranges.new_next);
+    let done = |old: &[usize], new: usize| {
+        new - ranges.new_next >= ranges.new_len
+            && old
+                .iter()
+                .zip(&ranges.old_next)
+                .zip(&ranges.old_len)
+                .all(|((o, start), len)| o - start >= *len)
+    };
+    let mut n = 0;
+    while n < lines.len() && !done(&old, new) {
+        advance(&lines[n], parents, &mut old, &mut new);
+        n += 1;
+    }
+    n
+}
+
+/// Step the per-side line numbers over one hunk line.
+fn advance(line: &str, parents: usize, old_next: &mut [usize], new_next: &mut usize) {
+    if line.starts_with('\\') {
+        return;
+    }
+    let cols = line.as_bytes();
+    let col = |j: usize| cols.get(j).copied().unwrap_or(b' ');
+    let deleted = (0..parents).any(|j| col(j) == b'-');
+    // A deleted line exists only in the parents marked `-`; any other line
+    // is in the result and in every parent not marked `+`.
+    for (j, next) in old_next.iter_mut().enumerate() {
+        let in_parent = if deleted {
+            col(j) == b'-'
+        } else {
+            col(j) != b'+'
+        };
+        if in_parent {
+            *next = next.saturating_add(1);
+        }
+    }
+    if !deleted {
+        *new_next = new_next.saturating_add(1);
+    }
+}
+
+/// One side of a hunk header, as git writes it: ` -12,3`, ` -12` for a
+/// single line, and the line before the hunk for an empty range. Combined
+/// headers always carry the count and name the next line for an empty range.
+fn format_range(sign: char, next_line: usize, count: usize, combined: bool) -> String {
+    if combined {
+        return format!(" {sign}{next_line},{count}");
+    }
+    let start = if count == 0 {
+        next_line.saturating_sub(1)
+    } else {
+        next_line
+    };
+    if count == 1 {
+        format!(" {sign}{start}")
+    } else {
+        format!(" {sign}{start},{count}")
     }
 }
 
@@ -1818,6 +2007,121 @@ mod tests {
             );
         }
         assert_eq!((r.additions, r.deletions), (3, 4));
+    }
+
+    /// Trimmed hunks get headers that match their lines. Expected ranges
+    /// are what `git diff -U2` / `-U0` print for the same change.
+    #[test]
+    fn trimmed_hunks_are_renumbered_like_git() {
+        let mut lines = vec![
+            "diff --git a/f b/f".to_string(),
+            "--- a/f".to_string(),
+            "+++ b/f".to_string(),
+            "@@ -7,14 +7,14 @@ l6".to_string(),
+        ];
+        for i in 7..=20 {
+            match i {
+                10 | 17 => {
+                    lines.push(format!("-l{i}"));
+                    lines.push(format!("+l{i} x"));
+                }
+                _ => lines.push(format!(" l{i}")),
+            }
+        }
+        lines.push("@@ -23,6 +23,7 @@ l22".to_string());
+        for i in 23..=28 {
+            lines.push(format!(" l{i}"));
+            if i == 25 {
+                lines.push("+new after 25".to_string());
+            }
+        }
+        let input = lines.join("\n") + "\n";
+        let headers = |max_context_lines: usize| -> Vec<String> {
+            let cfg = DiffCompressorConfig {
+                min_lines_for_ccr: 5,
+                max_context_lines,
+                ..Default::default()
+            };
+            let r = DiffCompressor::new(cfg).compress(&input, "");
+            r.compressed
+                .lines()
+                .filter(|l| l.starts_with("@@"))
+                .map(str::to_string)
+                .collect()
+        };
+        assert_eq!(
+            headers(2),
+            [
+                "@@ -8,5 +8,5 @@ l6",
+                "@@ -15,5 +15,5 @@ l6",
+                "@@ -24,4 +24,5 @@ l22"
+            ]
+        );
+        assert_eq!(
+            headers(0),
+            [
+                "@@ -10 +10 @@ l6",
+                "@@ -17 +17 @@ l6",
+                "@@ -25,0 +26 @@ l22"
+            ]
+        );
+        // Nothing to trim: the header is left alone.
+        assert!(headers(3).contains(&"@@ -7,14 +7,14 @@ l6".to_string()));
+    }
+
+    /// Line numbers near `usize::MAX` must not overflow while renumbering.
+    #[test]
+    fn renumbering_huge_line_numbers_does_not_panic() {
+        let mut lines = vec![
+            "diff --git a/f b/f".to_string(),
+            "--- a/f".to_string(),
+            "+++ b/f".to_string(),
+            format!("@@ -{0},0 +{0},5 @@", usize::MAX),
+        ];
+        lines.extend((0..5).map(|i| format!("+added_{i}")));
+        lines.push(format!("@@ -{0},6 +{0},6 @@", usize::MAX - 2));
+        lines.extend((0..5).map(|i| format!(" ctx_{i}")));
+        lines.push("-old".to_string());
+        let cfg = DiffCompressorConfig {
+            min_lines_for_ccr: 5,
+            ..Default::default()
+        };
+        let r = DiffCompressor::new(cfg).compress(&lines.join("\n"), "");
+        assert!(r.compressed.contains("-old"));
+    }
+
+    /// Combined-diff hunks are renumbered per parent.
+    #[test]
+    fn trimmed_combined_hunk_is_renumbered_per_parent() {
+        let input = [
+            "diff --combined f",
+            "--- a/f",
+            "+++ b/f",
+            "@@@ -1,8 -1,8 +1,8 @@@",
+            "  c1",
+            "  c2",
+            "  c3",
+            "- p1_old",
+            " -p2_old",
+            "++merged",
+            "  c4",
+            "  c5",
+            "  c6",
+            "  c7",
+            "",
+        ]
+        .join("\n");
+        let cfg = DiffCompressorConfig {
+            min_lines_for_ccr: 5,
+            ..Default::default()
+        };
+        let r = DiffCompressor::new(cfg).compress(&input, "");
+        assert!(
+            r.compressed
+                .contains("@@@ -2,5 -2,5 +2,5 @@@\n  c2\n  c3\n- p1_old\n"),
+            "{}",
+            r.compressed
+        );
     }
 
     /// Bug-fix test: pre-diff content (commit headers, email-style
