@@ -2247,6 +2247,28 @@ def _setup_headroom_mcp(
         click.echo(line)
 
 
+def _serena_inline_comment(rest: str) -> str:
+    """Return the inline comment to keep when rewriting a Serena setting.
+
+    ``rest`` is everything after the colon. The first ``#`` starts the comment,
+    including when it sits flush against the colon or the old value: this
+    setting is always rewritten to ``false``, so a ``#`` that strict YAML would
+    treat as part of the scalar is kept as a comment instead. Whitespace that
+    already separates the ``#`` is preserved; a glued ``#`` gets one inserted
+    space. Every other token, such as a YAML type tag, is discarded with the
+    old value.
+    """
+    hash_at = rest.find("#")
+    if hash_at < 0:
+        return ""
+    prefix, body = rest[:hash_at], rest[hash_at:]
+    if prefix.strip(" \t") == "":
+        return prefix + body if prefix else " " + body
+    if prefix[-1] in " \t":
+        return prefix[len(prefix.rstrip(" \t")) :] + body
+    return " " + body
+
+
 def _ensure_serena_dashboard_disabled(*, verbose: bool = False) -> None:
     """Disable Serena's browser dashboard auto-open in ``~/.serena/serena_config.yml``.
 
@@ -2287,6 +2309,12 @@ def _ensure_serena_dashboard_disabled(*, verbose: bool = False) -> None:
     "key absent" appended a second copy of the key, and Serena loads this file
     with ruamel in duplicate-key-strict mode, so every later startup died with
     ``DuplicateKeyError`` before the MCP handshake ("Connection closed").
+
+    The edit only ever touches a *top-level* (column-0) occurrence of the key.
+    An indented one belongs to a different mapping (e.g. a nested
+    ``extension:`` block that happens to reuse the name) and is left alone —
+    both when rewriting the value and when dropping duplicates, so it can
+    never be mistaken for, or merged with, Serena's real setting.
     """
     import re
 
@@ -2311,24 +2339,30 @@ def _ensure_serena_dashboard_disabled(*, verbose: bool = False) -> None:
     # append a second copy of it in that case. Rewrite the value in place
     # (keeping any inline comment) and drop redundant copies, so configs an
     # older Headroom already broke are repaired rather than re-broken.
-    # ``(?!#)\S*`` treats an empty value and a comment-only value the same;
-    # ``(.*)`` keeps the comment text intact, including any colons in it.
-    dashboard = re.compile(rf"^([ \t]*){re.escape(key)}:[ \t]*((?!#)\S*)(.*)$")
+    #
+    # Anchored with no leading whitespace: only a column-0 occurrence of the
+    # key is this top-level setting. An indented one belongs to a different
+    # mapping and must not be rewritten or deduplicated against.
+    #
+    # The pattern only recognizes the key line. ``_serena_inline_comment``
+    # decides what to keep from the remainder, so a ``#`` flush against the
+    # colon still matches and is preserved instead of leaving the line in
+    # place and appending a second copy of the key.
+    dashboard = re.compile(rf"^{re.escape(key)}:[ \t]*(.*)$")
     lines: list[str] = []
     rewritten = False
     for line in text.splitlines(keepends=True):
-        match = dashboard.match(line)
+        body = line.rstrip("\r\n")
+        match = dashboard.match(body)
         if match is None:
             lines.append(line)
             continue
         if rewritten:
             continue
         rewritten = True
-        indent, comment = match.group(1), match.group(3)
-        if comment and not comment[0].isspace():
-            comment = " " + comment
-        ending = "\n" if line.endswith("\n") else ""
-        lines.append(f"{indent}{key}: false{comment}{ending}")
+        comment = _serena_inline_comment(match.group(1))
+        ending = "\n" if line.endswith(("\n", "\r")) else ""
+        lines.append(f"{key}: false{comment}{ending}")
     if rewritten:
         new = "".join(lines)
     else:

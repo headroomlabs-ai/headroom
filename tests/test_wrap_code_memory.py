@@ -144,6 +144,36 @@ def test_serena_dashboard_disabled_keeps_comment_on_unset_value(tmp_path, monkey
     assert cfg.read_text() == first
 
 
+def test_serena_dashboard_disabled_keeps_comment_glued_to_colon(tmp_path, monkeypatch) -> None:
+    """A ``#`` with no space after the colon is still the comment.
+
+    ``web_dashboard_open_on_launch:# note`` does not match a pattern that
+    requires the value token to be non-comment text, so the line used to be
+    left in place and a second copy of the key was appended.
+    """
+    import yaml
+
+    monkeypatch.setenv("HOME", str(tmp_path))
+    cfg = tmp_path / ".serena" / "serena_config.yml"
+    cfg.parent.mkdir(parents=True)
+    cfg.write_text(
+        "projects: []\n"
+        "web_dashboard_open_on_launch:# note: leave unset for now\n"
+        "gui_log_window: false\n"
+    )
+
+    wrap._ensure_serena_dashboard_disabled()
+
+    text = cfg.read_text()
+    assert text.count("web_dashboard_open_on_launch") == 1
+    assert "web_dashboard_open_on_launch: false # note: leave unset for now" in text
+    assert yaml.safe_load(text)["web_dashboard_open_on_launch"] is False
+
+    first = text
+    wrap._ensure_serena_dashboard_disabled()
+    assert cfg.read_text() == first
+
+
 def test_serena_dashboard_disabled_repairs_duplicate_keys(tmp_path, monkeypatch) -> None:
     """Configs already broken by an older Headroom must come back valid.
 
@@ -177,6 +207,62 @@ def test_serena_dashboard_disabled_repairs_duplicate_keys(tmp_path, monkeypatch)
     first = text
     wrap._ensure_serena_dashboard_disabled()
     assert cfg.read_text() == first
+
+
+def test_serena_dashboard_disabled_ignores_nested_key(tmp_path, monkeypatch) -> None:
+    """Only the column-0 key is Serena's setting; an indented one is not.
+
+    A line edit that matches the key name regardless of indentation can
+    rewrite an unrelated nested mapping's key, and can mistake it for a
+    duplicate of the real top-level setting and delete the real one.
+    """
+    import yaml
+
+    monkeypatch.setenv("HOME", str(tmp_path))
+    cfg = tmp_path / ".serena" / "serena_config.yml"
+    cfg.parent.mkdir(parents=True)
+    cfg.write_text(
+        "extension:\n"
+        "  web_dashboard_open_on_launch: true\n"
+        "web_dashboard_open_on_launch: true\n"
+        "projects: []\n"
+    )
+
+    wrap._ensure_serena_dashboard_disabled()
+
+    text = cfg.read_text()
+    assert "  web_dashboard_open_on_launch: true\n" in text, "nested key must be left untouched"
+    parsed = yaml.safe_load(text)
+    assert parsed["web_dashboard_open_on_launch"] is False
+    assert parsed["extension"]["web_dashboard_open_on_launch"] is True
+
+    first = text
+    wrap._ensure_serena_dashboard_disabled()
+    assert cfg.read_text() == first
+
+
+def test_serena_dashboard_disabled_drops_non_comment_trailing_content(
+    tmp_path, monkeypatch
+) -> None:
+    """Trailing content that is not a comment must not survive the rewrite.
+
+    E.g. an explicit YAML type tag (``!!bool true``) has a value token plus a
+    second, space-separated token. Preserving that second token as if it were
+    a comment turns the rewritten line into ``false true``, which YAML parses
+    as the string ``"false true"`` instead of the boolean ``False``.
+    """
+    import yaml
+
+    monkeypatch.setenv("HOME", str(tmp_path))
+    cfg = tmp_path / ".serena" / "serena_config.yml"
+    cfg.parent.mkdir(parents=True)
+    cfg.write_text("projects: []\nweb_dashboard_open_on_launch: !!bool true\n")
+
+    wrap._ensure_serena_dashboard_disabled()
+
+    text = cfg.read_text()
+    assert "web_dashboard_open_on_launch: false\n" in text
+    assert yaml.safe_load(text)["web_dashboard_open_on_launch"] is False
 
 
 def test_serena_config_is_never_created_by_headroom(tmp_path, monkeypatch) -> None:
