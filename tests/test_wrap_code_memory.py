@@ -115,6 +115,70 @@ def test_serena_dashboard_disabled_keeps_inline_comment(tmp_path, monkeypatch) -
     assert text.count("web_dashboard_open_on_launch") == 1
 
 
+def test_serena_dashboard_disabled_keeps_comment_on_unset_value(tmp_path, monkeypatch) -> None:
+    """A comment right after the colon must stay a comment, not become the value.
+
+    ``web_dashboard_open_on_launch: # note`` used to turn into
+    ``...: false note``, which YAML reads as the string ``"false note"`` rather
+    than the boolean ``False``.
+    """
+    import yaml
+
+    monkeypatch.setenv("HOME", str(tmp_path))
+    cfg = tmp_path / ".serena" / "serena_config.yml"
+    cfg.parent.mkdir(parents=True)
+    cfg.write_text(
+        "projects: []\n"
+        "web_dashboard_open_on_launch: # note: leave unset for now\n"
+        "gui_log_window: false\n"
+    )
+
+    wrap._ensure_serena_dashboard_disabled()
+
+    text = cfg.read_text()
+    assert "web_dashboard_open_on_launch: false # note: leave unset for now" in text
+    assert yaml.safe_load(text)["web_dashboard_open_on_launch"] is False
+
+    first = text
+    wrap._ensure_serena_dashboard_disabled()
+    assert cfg.read_text() == first
+
+
+def test_serena_dashboard_disabled_repairs_duplicate_keys(tmp_path, monkeypatch) -> None:
+    """Configs already broken by an older Headroom must come back valid.
+
+    A duplicate top-level key makes Serena's ruamel loader raise, so rewriting
+    both copies in place would leave the MCP server unable to start.
+    """
+    import yaml
+
+    monkeypatch.setenv("HOME", str(tmp_path))
+    cfg = tmp_path / ".serena" / "serena_config.yml"
+    cfg.parent.mkdir(parents=True)
+    cfg.write_text(
+        "web_dashboard: true\n"
+        "web_dashboard_open_on_launch:\n"
+        "\n"
+        "# other settings\n"
+        "gui_log_window: false\n"
+        "projects:\n- /home/me/work/api\n"
+        "web_dashboard_open_on_launch: false\n"
+    )
+
+    wrap._ensure_serena_dashboard_disabled()
+
+    text = cfg.read_text()
+    assert text.count("web_dashboard_open_on_launch") == 1, "duplicate key breaks Serena"
+    parsed = yaml.safe_load(text)
+    assert parsed["web_dashboard_open_on_launch"] is False
+    assert parsed["projects"] == ["/home/me/work/api"]
+    assert parsed["web_dashboard"] is True
+
+    first = text
+    wrap._ensure_serena_dashboard_disabled()
+    assert cfg.read_text() == first
+
+
 def test_serena_config_is_never_created_by_headroom(tmp_path, monkeypatch) -> None:
     """Headroom must NOT pre-empt Serena's own config bootstrap (#2674).
 

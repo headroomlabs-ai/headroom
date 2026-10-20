@@ -2307,13 +2307,30 @@ def _ensure_serena_dashboard_disabled(*, verbose: bool = False) -> None:
     new = text
     appended: list[str] = []
 
-    # Match the key whether its value is empty, a boolean, or followed by an
-    # inline comment. ``\S*`` matches an empty value and stops at the first
-    # space, so anything written after the value (comments, spacing) is left
-    # untouched, and nothing can swallow the newline after the key.
-    dashboard = re.compile(rf"^([ \t]*){re.escape(key)}:[ \t]*\S*", re.MULTILINE)
-    if dashboard.search(new):
-        new = dashboard.sub(rf"\g<1>{key}: false", new)
+    # Serena's template writes this key with no value, and Headroom used to
+    # append a second copy of it in that case. Rewrite the value in place
+    # (keeping any inline comment) and drop redundant copies, so configs an
+    # older Headroom already broke are repaired rather than re-broken.
+    # ``(?!#)\S*`` treats an empty value and a comment-only value the same;
+    # ``(.*)`` keeps the comment text intact, including any colons in it.
+    dashboard = re.compile(rf"^([ \t]*){re.escape(key)}:[ \t]*((?!#)\S*)(.*)$")
+    lines: list[str] = []
+    rewritten = False
+    for line in text.splitlines(keepends=True):
+        match = dashboard.match(line)
+        if match is None:
+            lines.append(line)
+            continue
+        if rewritten:
+            continue
+        rewritten = True
+        indent, comment = match.group(1), match.group(3)
+        if comment and not comment[0].isspace():
+            comment = " " + comment
+        ending = "\n" if line.endswith("\n") else ""
+        lines.append(f"{indent}{key}: false{comment}{ending}")
+    if rewritten:
+        new = "".join(lines)
     else:
         appended.append(f"{key}: false")
 
