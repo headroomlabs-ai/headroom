@@ -2280,6 +2280,13 @@ def _ensure_serena_dashboard_disabled(*, verbose: bool = False) -> None:
 
     ``projects: []`` is still backfilled into an *existing* file, to repair
     configs an affected Headroom version already wrote.
+
+    Serena's own template writes this key with *no* value
+    (``web_dashboard_open_on_launch:``), which is valid YAML meaning "unset".
+    The line edit therefore has to match an empty value too: treating it as
+    "key absent" appended a second copy of the key, and Serena loads this file
+    with ruamel in duplicate-key-strict mode, so every later startup died with
+    ``DuplicateKeyError`` before the MCP handshake ("Connection closed").
     """
     import re
 
@@ -2300,7 +2307,11 @@ def _ensure_serena_dashboard_disabled(*, verbose: bool = False) -> None:
     new = text
     appended: list[str] = []
 
-    dashboard = re.compile(rf"^(\s*){re.escape(key)}:\s*\S+\s*$", re.MULTILINE)
+    # Match the key whether its value is empty, a boolean, or followed by an
+    # inline comment. ``\S*`` matches an empty value and stops at the first
+    # space, so anything written after the value (comments, spacing) is left
+    # untouched, and nothing can swallow the newline after the key.
+    dashboard = re.compile(rf"^([ \t]*){re.escape(key)}:[ \t]*\S*", re.MULTILINE)
     if dashboard.search(new):
         new = dashboard.sub(rf"\g<1>{key}: false", new)
     else:

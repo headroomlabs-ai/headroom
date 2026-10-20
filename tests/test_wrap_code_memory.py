@@ -65,6 +65,56 @@ def test_serena_dashboard_disabled_flips_existing_config(tmp_path, monkeypatch) 
     assert "web_dashboard: true" in text  # other keys preserved
 
 
+def test_serena_dashboard_disabled_handles_unset_value(tmp_path, monkeypatch) -> None:
+    """Serena's template ships ``web_dashboard_open_on_launch:`` with no value.
+
+    Requiring a value in the regex treated the key as absent and appended a
+    second copy of it. Serena loads this file with ruamel in duplicate-key-strict
+    mode, so the duplicate made every later startup die with ``DuplicateKeyError``
+    before the MCP handshake ("Connection closed").
+    """
+    import yaml
+
+    monkeypatch.setenv("HOME", str(tmp_path))
+    cfg = tmp_path / ".serena" / "serena_config.yml"
+    cfg.parent.mkdir(parents=True)
+    cfg.write_text(
+        "web_dashboard: true\n"
+        "web_dashboard_open_on_launch:\n"
+        "\n"
+        "gui_log_window: false\n"
+        "projects:\n- /home/me/work/api\n"
+    )
+
+    wrap._ensure_serena_dashboard_disabled()
+
+    text = cfg.read_text()
+    assert text.count("web_dashboard_open_on_launch") == 1, "duplicate key breaks Serena"
+    assert "web_dashboard_open_on_launch: false" in text
+    assert "\n\ngui_log_window: false\n" in text, "blank line after the key must survive"
+    parsed = yaml.safe_load(text)
+    assert parsed["web_dashboard_open_on_launch"] is False
+    assert parsed["web_dashboard"] is True
+    assert parsed["projects"] == ["/home/me/work/api"]
+
+    first = text
+    wrap._ensure_serena_dashboard_disabled()
+    assert cfg.read_text() == first
+
+
+def test_serena_dashboard_disabled_keeps_inline_comment(tmp_path, monkeypatch) -> None:
+    monkeypatch.setenv("HOME", str(tmp_path))
+    cfg = tmp_path / ".serena" / "serena_config.yml"
+    cfg.parent.mkdir(parents=True)
+    cfg.write_text("projects: []\nweb_dashboard_open_on_launch: true  # keep this\n")
+
+    wrap._ensure_serena_dashboard_disabled()
+
+    text = cfg.read_text()
+    assert "web_dashboard_open_on_launch: false  # keep this" in text
+    assert text.count("web_dashboard_open_on_launch") == 1
+
+
 def test_serena_config_is_never_created_by_headroom(tmp_path, monkeypatch) -> None:
     """Headroom must NOT pre-empt Serena's own config bootstrap (#2674).
 
