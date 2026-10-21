@@ -195,25 +195,37 @@ class TestMustKeepCompression:
 
 
 class _TruncatingTok:
-    """Tokenizer that covers only the first ``max_words`` words of a chunk.
+    """Tokenizer that models ``truncation=True, max_length=512``.
 
-    Mimics ``truncation=True, max_length=512`` for a chunk whose words are
-    token-heavy: words past the budget get no ``word_id`` at all, exactly as
-    the real tokenizer reports them.
+    Every word costs ``tokens_per_word`` tokens, which is how a chunk of
+    token-heavy words (logs, IDs, paths, numbers) runs past the token limit
+    before its word budget is used up. Words past the limit get no
+    ``word_id`` at all, exactly as the real tokenizer reports them. The cut
+    can also land inside a word: that word keeps the tokens that fit and
+    the rest of it never reaches the tokenizer.
     """
 
-    def __init__(self, max_words: int):
-        self.max_words = max_words
+    def __init__(self, tokens_per_word: int = 1, max_length: int = 512):
+        self.tokens_per_word = tokens_per_word
+        self.max_length = max_length
 
     def __call__(self, chunk_words, **kw):
         batch_words = chunk_words if (chunk_words and isinstance(chunk_words[0], list)) else [chunk_words]
         word_ids = []
         for words in batch_words:
-            covered = min(len(words), self.max_words)
-            word_ids.append(list(range(covered)))
+            ids: list[int] = []
+            used = 0
+            for idx in range(len(words)):
+                room = self.max_length - used
+                if room <= 0:
+                    break
+                take = min(self.tokens_per_word, room)
+                ids.extend([idx] * take)
+                used += take
+            word_ids.append(ids)
         return _Enc(
-            input_ids=[[0] * len(wids) for wids in word_ids],
-            attention_mask=[[1] * len(wids) for wids in word_ids],
+            input_ids=[[0] * len(ids) for ids in word_ids],
+            attention_mask=[[1] * len(ids) for ids in word_ids],
             _word_ids=word_ids,
         )
 
@@ -222,49 +234,82 @@ class TestTruncatedWordsCompression:
     """Words past the tokenizer's 512-token cut are kept, not dropped (#4309).
 
     Chunks are cut by words (``chunk_words``) but tokenized with
-    ``truncation=True, max_length=512``. A chunk of token-heavy words (logs,
-    IDs, paths, numbers) hits the token limit well before its word budget, so
-    the tail of the chunk had no score and was dropped silently from the
-    default proxy path (``target_ratio=None``).
+    ``truncation=True, max_length=512``. A chunk of token-heavy words hits
+    the token limit well before its word budget, so the tail of the chunk had
+    no score and was dropped silently from the default proxy path
+    (``target_ratio=None``).
     """
 
-    # 13 words clears the compressor's 10-word input gate.
-    WORDS = "alpha beta gamma delta epsilon zeta eta theta iota kappa lambda mu nu"
-    # The fake model keeps only the first word of what it was shown.
-    KEPT_BY_MODEL = ["alpha"]
+    # One chunk is `chunk_words` words long, so 350 words is exactly one.
+    CHUNK_WORDS = 350
 
-    def _compress(self, monkeypatch, max_words):
-        monkeypatch.setattr(kc, "_load_kompress", lambda *a, **k: (_Model(), _TruncatingTok(max_words), "onnx"))
+    def _words(self, count: int) -> list[str]:
+        return [f"word{i}" for i in range(count)]
+
+    def _install(self, monkeypatch, tokens_per_word):
+        monkeypatch.setattr(
+            kc,
+            "_load_kompress",
+            lambda *a, **k: (_Model(), _TruncatingTok(tokens_per_word), "onnx"),
+        )
         monkeypatch.setattr(kc, "_model_device_type", lambda *a, **k: "cpu")
         monkeypatch.delenv(_KOMPRESS_MUST_KEEP_ENV, raising=False)
+
+    def _compress(self, monkeypatch, tokens_per_word):
+        self._install(monkeypatch, tokens_per_word)
+        words = self._words(self.CHUNK_WORDS)
         compressor = KompressCompressor(KompressConfig(enable_ccr=False, min_input_words=10))
         monkeypatch.setattr(compressor, "_should_batch_single_content", lambda *a, **k: False)
-        return compressor.compress(self.WORDS).compressed.split()
+        kept = compressor.compress(" ".join(words)).compressed.split()
+        return kept, words
 
     def test_words_past_the_truncation_point_survive(self, monkeypatch):
-        # The tokenizer covers only the first two words, so every word from
-        # the third on was truncated: the model never saw them and they used
-        # to vanish from the output entirely.
-        kept = self._compress(monkeypatch, max_words=2)
-        words = self.WORDS.split()
-        # The first word the model saw is kept; the second it dropped; the
-        # truncated tail is kept verbatim rather than dropped.
-        assert kept == [words[0]] + words[2:]
+        # Two tokens per word: the 350-word chunk needs 700 tokens, so the
+        # tokenizer cuts it at 512. The 256 words it covered were scored, the
+        # other 94 were never seen and used to vanish from the output.
+        kept, words = self._compress(monkeypatch, tokens_per_word=2)
+        # 256 words were covered; the cut landed at a word boundary here, but
+        # the last covered word is kept too, because the cut may have fallen
+        # inside it.
+        assert kept == [words[0]] + words[255:]
+
+    def test_the_word_the_cut_landed_in_is_kept(self, monkeypatch):
+        # Three tokens per word: the cut at 512 falls inside word 170, whose
+        # last token never reached the tokenizer. The model only saw part of
+        # that word, so dropping it would take its unseen suffix with it.
+        kept, words = self._compress(monkeypatch, tokens_per_word=3)
+        assert kept == [words[0]] + words[170:]
 
     def test_fully_covered_chunk_is_unchanged(self, monkeypatch):
-        # Nothing is truncated, so the model's own choice stands: it kept the
-        # first word and dropped the rest.
-        kept = self._compress(monkeypatch, max_words=99)
-        assert kept == self.KEPT_BY_MODEL
+        # One token per word: the chunk fits in 512 tokens, so nothing was
+        # truncated and the model's own choice stands. It kept the first word
+        # and dropped the rest.
+        kept, words = self._compress(monkeypatch, tokens_per_word=1)
+        assert kept == [words[0]]
 
     def test_batch_path_keeps_truncated_words_too(self, monkeypatch):
-        monkeypatch.setattr(kc, "_load_kompress", lambda *a, **k: (_Model(), _TruncatingTok(2), "onnx"))
-        monkeypatch.setattr(kc, "_model_device_type", lambda *a, **k: "cpu")
-        monkeypatch.delenv(_KOMPRESS_MUST_KEEP_ENV, raising=False)
+        self._install(monkeypatch, 2)
+        words = self._words(self.CHUNK_WORDS)
         compressor = KompressCompressor(KompressConfig(enable_ccr=False, min_input_words=10))
         monkeypatch.setattr(compressor, "_should_use_sequential_fallback", lambda: False)
 
-        [result] = compressor.compress_batch([self.WORDS], batch_size=8)
+        [result] = compressor.compress_batch([" ".join(words)], batch_size=8)
 
-        words = self.WORDS.split()
-        assert result.compressed.split() == [words[0]] + words[2:]
+        assert result.compressed.split() == [words[0]] + words[255:]
+
+    def test_a_forced_ratio_still_gets_its_budget(self, monkeypatch):
+        # A forced ratio is a hard budget the caller asked for, so the
+        # unscored tail is not added back on that path.
+        self._install(monkeypatch, 2)
+        words = self._words(self.CHUNK_WORDS)
+        compressor = KompressCompressor(KompressConfig(enable_ccr=False, min_input_words=10))
+        monkeypatch.setattr(compressor, "_should_batch_single_content", lambda *a, **k: False)
+
+        kept = compressor.compress(" ".join(words), target_ratio=0.5).compressed.split()
+
+        # The ratio applied to the 256 scored words: the first word (the only
+        # one the model scored) plus the next 127. The unscored tail is not
+        # added back, so the budget the caller asked for still holds.
+        assert len(kept) == 128
+        assert kept[0] == words[0]
+        assert words[255] not in kept
