@@ -87,6 +87,8 @@ _KOMPRESS_MUST_KEEP_RE = re.compile(
     r"|(?i:\b(?:and|or|nor|xor)\b)"
 )
 _KOMPRESS_MUST_KEEP_ENV = "HEADROOM_KOMPRESS_MUST_KEEP"
+#: Tokenizer budget per chunk. Words past it are never scored (#4309).
+_KOMPRESS_MAX_TOKENS = 512
 KOMPRESS_BACKEND_ENV = "HEADROOM_KOMPRESS_BACKEND"
 KOMPRESS_ONNX_FILENAME_ENV = "HEADROOM_KOMPRESS_ONNX_FILENAME"
 
@@ -102,6 +104,39 @@ def _add_kompress_must_keep_words(
     for word_idx, word in enumerate(chunk_words):
         if _KOMPRESS_MUST_KEEP_RE.search(word):
             kept_ids.add(word_idx + chunk_start)
+
+
+def _add_truncated_words(
+    kept_ids: set[int],
+    word_ids: list[int | None],
+    chunk_words: list[str],
+    chunk_start: int,
+    token_count: int,
+) -> None:
+    """Keep the words the tokenizer's token cut took away.
+
+    Chunks are cut by words (``chunk_words``) but tokenized with
+    ``truncation=True, max_length=512``. Words past token 512 get no
+    ``word_id``, so they are never scored and never make ``kept_ids`` -- they
+    are dropped silently, regardless of importance, and the loss is
+    positional: whatever sits at the end of the chunk disappears (#4309).
+
+    The cut can also land inside a word. Its visible prefix counts as
+    covered, so the model scores part of a word and may drop the whole of
+    it, taking the unseen suffix with it. The last covered word is kept as
+    well whenever the chunk reached the token limit.
+    """
+    covered = max((wid for wid in word_ids if wid is not None), default=-1) + 1
+    first_dropped = covered
+    if token_count >= _KOMPRESS_MAX_TOKENS and covered > 0:
+        first_dropped = covered - 1
+    for local_idx in range(first_dropped, len(chunk_words)):
+        kept_ids.add(local_idx + chunk_start)
+
+
+def _real_token_count(attention_row) -> int:
+    """Number of real (non-padding) tokens in an attention-mask row."""
+    return sum(1 for mask in attention_row if mask)
 
 
 _TABULAR_ROW_SPLIT_RE = re.compile(r"\s{2,}")
@@ -1992,7 +2027,7 @@ class KompressCompressor(Transform):
                     chunk_words,
                     is_split_into_words=True,
                     truncation=True,
-                    max_length=512,
+                    max_length=_KOMPRESS_MAX_TOKENS,
                     padding=True,
                     return_tensors=return_tensors,
                 )
@@ -2000,6 +2035,7 @@ class KompressCompressor(Transform):
                 input_ids = encoding["input_ids"]
                 attention_mask = encoding["attention_mask"]
                 word_ids = encoding.word_ids(batch_index=0)
+                token_count = _real_token_count(attention_mask[0])
 
                 if not is_onnx:
                     device = next(model.parameters()).device
@@ -2088,6 +2124,13 @@ class KompressCompressor(Transform):
                             continue
                         if bool(mask_list[idx]):
                             kept_ids.add(wid + chunk_start)
+                    # The words past the tokenizer's token cut were never
+                    # scored, so the model cannot have kept them. A forced
+                    # ratio is a hard budget the caller asked for, so only the
+                    # model-decides path takes them back (#4309).
+                    _add_truncated_words(
+                        kept_ids, word_ids, chunk_words, chunk_start, token_count
+                    )
 
                 # Hard override: always keep must-keep tokens regardless of model score.
                 # Numbers, error names, paths, and flags carry meaning agents cannot
@@ -2426,7 +2469,7 @@ class KompressCompressor(Transform):
                     batch_word_lists,
                     is_split_into_words=True,
                     truncation=True,
-                    max_length=512,
+                    max_length=_KOMPRESS_MAX_TOKENS,
                     padding=True,
                     return_tensors=return_tensors,
                 )
@@ -2508,6 +2551,17 @@ class KompressCompressor(Transform):
                         for wid, score in word_scores.items():
                             if score > self.config.score_threshold:
                                 kept_ids_per_text[text_idx].add(wid + chunk_start)
+                        # The words past the tokenizer's token cut were never
+                        # scored, so the model cannot have kept them. A forced
+                        # ratio is a hard budget the caller asked for, so only
+                        # the model-decides path takes them back (#4309).
+                        _add_truncated_words(
+                            kept_ids_per_text[text_idx],
+                            word_ids,
+                            chunk_words,
+                            chunk_start,
+                            _real_token_count(attention_mask[batch_idx]),
+                        )
 
                     _add_kompress_must_keep_words(
                         kept_ids_per_text[text_idx], chunk_words, chunk_start
