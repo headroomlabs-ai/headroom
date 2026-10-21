@@ -3,7 +3,8 @@
 This module provides backend adapters for the memory system:
 - LocalBackend: Fully local using SQLite + HNSW + InMemoryGraph (default)
 - Mem0Backend: Graph + vector memory via Mem0 (Neo4j + Qdrant)
-- Mem0SystemAdapter: Adapter to use Mem0Backend with MemorySystem tools
+- Mem0SystemAdapter: Adapter to use Mem0Backend with MemorySystem tools (deprecated;
+  use DirectMem0Adapter for local mode; cloud mode has no replacement)
 - DirectMem0Adapter: Optimized adapter that bypasses Mem0's LLM extraction
 - CogneeBackend: Knowledge-graph memory via cognee
 

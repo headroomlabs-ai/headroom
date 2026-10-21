@@ -26,6 +26,7 @@ from headroom.learn.fixtures import (
 )
 from headroom.learn.loops import (
     _IDENTITY_FIELDS,
+    LoopPattern,
     _canonical_signature,
     _identity_input,
     _signature_tokens,
@@ -37,6 +38,7 @@ from headroom.learn.models import (
     Recommendation,
     RecommendationTarget,
     SessionData,
+    SessionEvent,
     ToolCall,
 )
 
@@ -149,6 +151,119 @@ class TestDigestSurfacesLoops:
     def test_digest_without_loops_has_no_loop_section(self):
         digest = _build_digest(_project(), [one_off_error_session()])
         assert "Detected Loops" not in digest
+
+    @pytest.mark.parametrize("max_tokens", [80_000, 10_000])
+    @pytest.mark.parametrize(
+        ("tool", "sample"),
+        [
+            ("Bash", "x" * 120),
+            ("Grep", "x" * 2000),  # a long search pattern
+            ("Glob", "src/" * 500 + "*.py"),  # a long path
+        ],
+        ids=["bash", "long-grep-pattern", "long-glob-path"],
+    )
+    def test_loop_section_stays_inside_the_digest_budget(self, tool, sample, max_tokens):
+        # Rendered whole, thousands of loops with hundreds of indices each made
+        # a 1.79M-char prompt, over Codex's 1,048,576-char input cap.
+        loops = [
+            LoopPattern(tool, "s", sample, 300, False, 1_000_000 - i, list(range(300)))
+            for i in range(2000)
+        ]
+        digest = _build_digest(_project(), [], loops=loops, max_tokens=max_tokens)
+        section = digest[digest.index("=== Detected Loops") :]
+        assert len(section) <= max_tokens  # a quarter of the budget's chars
+        # The costliest loops are the ones kept, and the caller's list is intact.
+        assert "~1,000,000 tokens wasted" in section
+        assert "~999,000 tokens wasted" not in section
+        assert loops[0].sample_input == sample
+        assert len(loops[0].msg_indices) == 300
+
+    @pytest.mark.parametrize("max_tokens", [80_000, 10_000])
+    def test_loops_fit_beside_a_large_prior_patterns_section(self, tmp_path, max_tokens):
+        # The event stream cannot trim sections placed ahead of it, so the
+        # loops give way to the prior patterns, which are never cut.
+        bullets = "".join(f"- rule {i:06d} {'y' * 80}\n" for i in range(max_tokens * 4 // 100))
+        claude_md = tmp_path / "CLAUDE.md"
+        claude_md.write_text(
+            f"<!-- headroom:learn:start -->\n{bullets}<!-- headroom:learn:end -->\n"
+        )
+        project = ProjectInfo(
+            name="proj",
+            project_path=tmp_path,
+            data_path=tmp_path / "data",
+            context_file=claude_md,
+        )
+        loops = [
+            LoopPattern("Grep", "s", "x" * 2000, 300, False, 1_000_000 - i, list(range(300)))
+            for i in range(25)
+        ]
+        digest = _build_digest(project, [], loops=loops, max_tokens=max_tokens)
+        assert bullets.splitlines()[-1] in digest
+        assert "~1,000,000 tokens wasted" in digest
+        assert len(digest) <= max_tokens * 4
+
+    @pytest.mark.parametrize("with_loops", [False, True], ids=["no-loops", "loops"])
+    @pytest.mark.parametrize("with_events", [False, True], ids=["tool-calls", "events"])
+    @pytest.mark.parametrize("max_tokens", [80_000, 10_000])
+    def test_whole_digest_stays_inside_the_budget(self, max_tokens, with_events, with_loops):
+        # Far more session text than the budget: every line and its newline
+        # counts, and none goes in that would leave no room for the markers.
+        sessions = []
+        for s in range(5):
+            calls = [
+                ToolCall(
+                    name="Bash",
+                    tool_call_id=f"{s}-{i}",
+                    input_data={"command": f"run {i}"},
+                    output="e" * 300,
+                    is_error=True,
+                    msg_index=i,
+                )
+                for i in range(3000)
+            ]
+            events = (
+                [SessionEvent(type="tool_call", msg_index=c.msg_index, tool_call=c) for c in calls]
+                if with_events
+                else []
+            )
+            sessions.append(SessionData(session_id=f"s{s}", tool_calls=calls, events=events))
+        loops = (
+            [
+                LoopPattern("Grep", "s", "x" * 2000, 300, False, 1_000_000 - i, list(range(300)))
+                for i in range(2000)
+            ]
+            if with_loops
+            else []
+        )
+        digest = _build_digest(_project(), sessions, loops=loops, max_tokens=max_tokens)
+        assert len(digest) <= max_tokens * 4
+        assert "remaining" in digest and "sessions truncated" in digest
+
+    @pytest.mark.parametrize("with_events", [False, True], ids=["tool-calls", "events"])
+    @pytest.mark.parametrize("max_tokens", [80_000, 10_000])
+    def test_many_tiny_sessions_stay_inside_the_budget(self, max_tokens, with_events):
+        # Thousands of kept sessions, each closed by a blank line whose newline
+        # counts too; the marker reserve alone would absorb only ~100 of them.
+        sessions = []
+        for s in range(20_000):
+            call = ToolCall(
+                name="Bash",
+                tool_call_id=str(s),
+                input_data={"command": "ls"},
+                output="ok",
+                is_error=False,
+                msg_index=0,
+            )
+            events = [SessionEvent(type="tool_call", msg_index=0, tool_call=call)]
+            sessions.append(
+                SessionData(
+                    session_id=f"s{s}", tool_calls=[call], events=events if with_events else []
+                )
+            )
+        digest = _build_digest(_project(), sessions, loops=[], max_tokens=max_tokens)
+        assert len(digest) <= max_tokens * 4
+        assert digest.count("=== Session ") > 500
+        assert "sessions truncated" in digest
 
 
 # =============================================================================

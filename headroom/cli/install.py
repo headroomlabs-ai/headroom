@@ -604,7 +604,8 @@ def _build_deployment_manifest(
         region=region,
         proxy_mode=proxy_mode,
         memory_enabled=memory,
-        telemetry_enabled=telemetry and not no_telemetry,
+        # --no-telemetry wins when both are given; neither leaves it unset.
+        telemetry_enabled=False if no_telemetry else (True if telemetry else None),
         no_rate_limit=no_rate_limit,
         image=image,
         no_http2=no_http2,
@@ -875,7 +876,7 @@ def _echo_installed(manifest: DeploymentManifest, *, prefix: str = "Installed pe
 @click.option(
     "--no-telemetry",
     is_flag=True,
-    help="Force anonymous telemetry off in the runtime (already the default).",
+    help="Turn off local stats and the anonymous upload beacon in the runtime.",
 )
 @click.option(
     "--no-rate-limit",
@@ -1092,7 +1093,7 @@ def install_apply(
 @click.option(
     "--no-telemetry",
     is_flag=True,
-    help="Force anonymous telemetry off in the runtime (already the default).",
+    help="Turn off local stats and the anonymous upload beacon in the runtime.",
 )
 @click.option(
     "--image",

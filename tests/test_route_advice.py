@@ -7,6 +7,7 @@ with nothing published, every path is exactly what it was before.
 from __future__ import annotations
 
 import asyncio
+import json
 from types import SimpleNamespace
 
 import pytest
@@ -24,6 +25,17 @@ class _Req:
 
 
 DEFAULT = object()  # stands in for the configured backend
+
+
+def _sse_contains_error_event(payload: bytes) -> bool:
+    """True when any complete SSE event in ``payload`` is a failure event."""
+    from headroom.proxy.handlers.streaming import _sse_event_outcome
+    from headroom.proxy.helpers import parse_sse_events_from_byte_buffer
+
+    return any(
+        _sse_event_outcome(event_name, data, "chat")[0]
+        for event_name, data in parse_sse_events_from_byte_buffer(bytearray(payload))
+    )
 
 
 # --- reading what an extension published ------------------------------------
@@ -336,22 +348,16 @@ def test_stream_outcome_status_preserves_success_and_reclassifies_failure():
 
 
 def test_sse_error_detection_handles_native_and_split_events():
-    from headroom.proxy.handlers.streaming import _sse_contains_error_event
-
     assert _sse_contains_error_event(b'event: error\ndata: {"type":"error"}\n\n')
     assert _sse_contains_error_event(b'data: {"type":"er' + b'ror"}\n\n')
     assert not _sse_contains_error_event(b'data: {"type":"message"}\n\n')
 
 
 def test_sse_error_text_in_response_content_is_not_an_error():
-    from headroom.proxy.handlers.streaming import _sse_contains_error_event
-
     assert not _sse_contains_error_event(b'data: {"text":"event: error"}\n\n')
 
 
 def test_responses_failed_envelope_is_an_error():
-    from headroom.proxy.handlers.streaming import _sse_contains_error_event
-
     assert _sse_contains_error_event(
         b'data: {"type":"response.failed","response":{"status":"failed",'
         b'"error":{"code":"server_error"}}}\n\n'
@@ -397,6 +403,70 @@ def test_backend_clean_eof_requires_protocol_completion(provider, complete):
     asyncio.run(drive(handler, handler.anthropic_backend))
     assert len(outcomes) == 1
     assert outcomes[0].status_code == (200 if complete else 502)
+
+
+@pytest.mark.parametrize("provider", ["anthropic", "openai"])
+def test_backend_client_hangup_after_terminal_event_is_completed(provider):
+    """A client may close on the terminal event, before the backend's EOF."""
+    from types import MethodType
+
+    from headroom.proxy.handlers.streaming import StreamingMixin
+
+    class Backend(_Backend):
+        async def stream_message(self, body, headers):
+            yield SimpleNamespace(
+                event_type="message_stop",
+                raw_sse='event: message_stop\ndata: {"type":"message_stop"}\n\n',
+                data={"type": "message_stop"},
+            )
+            await asyncio.Event().wait()
+
+        async def stream_openai_message(self, body, headers):
+            yield "data: [DONE]\n\n"
+            await asyncio.Event().wait()
+
+    outcomes = []
+
+    async def record(outcome):
+        outcomes.append(outcome)
+
+    handler = _handler(Backend(provider))
+    handler._record_request_outcome = record
+    handler._extract_anthropic_cache_ttl_metrics = lambda usage: (0, 0)
+    handler._parse_sse_usage_from_buffer = MethodType(
+        StreamingMixin._parse_sse_usage_from_buffer, handler
+    )
+
+    async def drive():
+        arguments = {
+            "body": {"messages": []},
+            "headers": {},
+            "model": "m",
+            "request_id": "rid",
+            "original_tokens": 0,
+            "optimized_tokens": 0,
+            "tokens_saved": 0,
+            "transforms_applied": [],
+            "tags": {},
+            "optimization_latency": 0.0,
+            "backend": handler.anthropic_backend,
+        }
+        if provider == "anthropic":
+            response = await StreamingMixin._stream_response_bedrock(
+                handler, provider=provider, **arguments
+            )
+        else:
+            response = await StreamingMixin._stream_openai_via_backend(
+                handler, start_time=0.0, **arguments
+            )
+        body = response.body_iterator
+        while b"message_stop" not in (chunk := await body.__anext__()) and b"[DONE]" not in chunk:
+            pass
+        await body.aclose()
+
+    asyncio.run(drive())
+    assert len(outcomes) == 1
+    assert outcomes[0].status_code == 200
 
 
 @pytest.mark.parametrize("provider", ["anthropic", "openai"])
@@ -476,8 +546,6 @@ def test_responses_terminal_semantics(event, data, expected_failed, expected_ter
 
 @pytest.mark.parametrize("event_type", ['["error"]', '{"unexpected":true}', "7", "true"])
 def test_malformed_event_type_is_not_interpreted_as_a_protocol_marker(event_type):
-    from headroom.proxy.handlers.streaming import _sse_contains_error_event
-
     payload = ('data: {"type":' + event_type + "}\n\ndata: [DONE]\n\n").encode()
     assert not _sse_contains_error_event(payload)
 
@@ -623,3 +691,38 @@ def test_the_resolver_follows_a_reassigned_default():
     assert first.default is None
     h.anthropic_backend = DEFAULT
     assert BR(h.anthropic_backend).default is DEFAULT
+
+
+@pytest.mark.parametrize(("written", "inferred"), [(0, False), (20, False), (None, True)])
+def test_backend_openai_stream_reads_reported_cache_writes(written, inferred):
+    """A reported write, zero included, is the provider's word; only an absent
+    field falls back to inferring writes from the uncached slice."""
+    from types import MethodType
+
+    from headroom.proxy.handlers.streaming import StreamingMixin
+
+    details = {"cached_tokens": 75}
+    if written is not None:
+        details["cache_write_tokens"] = written
+    usage = {"input_tokens": 100, "output_tokens": 5, "input_tokens_details": details}
+
+    class Backend(_Backend):
+        async def stream_openai_message(self, body, headers):
+            yield f"data: {json.dumps({'type': 'response.completed', 'response': {'usage': usage}})}\n\n"
+            yield "data: [DONE]\n\n"
+
+    outcomes = []
+
+    async def record(outcome):
+        outcomes.append(outcome)
+
+    handler = _handler(Backend("openai"))
+    handler._record_request_outcome = record
+    handler._parse_sse_usage_from_buffer = MethodType(
+        StreamingMixin._parse_sse_usage_from_buffer, handler
+    )
+    asyncio.run(_drive_openai_with_outcome(handler, handler.anthropic_backend))
+
+    o = outcomes[0]
+    assert o.cache_inferred is inferred
+    assert o.cache_write_tokens == (25 if written is None else written)

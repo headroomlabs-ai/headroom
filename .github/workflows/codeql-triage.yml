@@ -1,0 +1,52 @@
+name: CodeQL Weekly Triage
+
+# Gives code scanning alerts an owner and a cadence. Alert #63 was found by
+# CodeQL the day it was introduced and then sat open for five months because
+# nobody was assigned to look (INC-2026-001). Every Monday this opens one issue,
+# assigned to the security owner, listing the open critical/high alerts; the
+# owner fixes or dismisses each with a reason and closes the issue. The issue
+# history is the record that triage happened.
+
+on:
+  schedule:
+    # Mondays, US morning.
+    - cron: '23 15 * * 1'
+  workflow_dispatch:
+
+permissions:
+  contents: read  # checkout, for scripts/codeql_triage.sh
+  issues: write
+  security-events: read
+
+concurrency:
+  group: codeql-triage
+  cancel-in-progress: false
+
+env:
+  # Security owner: Tejas Chopra (tejas@headroomlabs.ai).
+  TRIAGE_ASSIGNEE: chopratejas
+
+jobs:
+  triage:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Ensure security label exists
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh label create "security" \
+            --repo "${{ github.repository }}" \
+            --color "b60205" \
+            --description "Security-relevant; exempt from stale triage" \
+            --force
+
+      - uses: actions/checkout@v7
+
+      # One issue per ISO week: re-runs and later dispatches reuse it (see the
+      # script header). Tested by tests/test_codeql_triage_script.py.
+      - name: Open or update this week's triage issue
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+        run: scripts/codeql_triage.sh

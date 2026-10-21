@@ -321,6 +321,68 @@ def test_responses_bills_the_original_plus_the_redrive(monkeypatch, _no_hooks) -
 
 
 @respx.mock
+def test_responses_reported_cache_writes_include_the_redrive(monkeypatch, _no_hooks) -> None:
+    """Responses reports billed writes itself; both calls' writes are writes,
+    not an uncached remainder priced at list."""
+    register_turn_hook(_RedriveOnce())
+    app, outcomes = _app_and_outcomes(monkeypatch)
+
+    def body(rid: str, total: int, cached: int, written: int) -> dict:
+        return {
+            "id": rid,
+            "output": [{"type": "message", "role": "assistant", "content": []}],
+            "usage": {
+                "input_tokens": total,
+                "output_tokens": 10,
+                "input_tokens_details": {"cached_tokens": cached, "cache_write_tokens": written},
+            },
+        }
+
+    sent = iter([body("a", 400, 300, 80), body("b", 500, 400, 60)])
+    respx.post("https://api.openai.com/v1/responses").mock(
+        side_effect=lambda request: httpx.Response(200, json=next(sent))
+    )
+
+    with TestClient(app) as client:
+        r = client.post(
+            "/v1/responses",
+            json={
+                "model": "gpt-4o",
+                "input": [{"type": "message", "role": "user", "content": []}],
+                "stream": False,
+            },
+            headers={"authorization": "Bearer sk-test"},
+        )
+    assert r.status_code == 200
+    o = outcomes[-1]
+    assert (o.provider_input_tokens, o.cache_read_tokens, o.cache_write_tokens) == (900, 700, 140)
+    assert o.uncached_input_tokens == 60
+    assert o.cache_inferred is False
+
+
+def test_redrive_writes_survive_a_final_response_without_the_field() -> None:
+    """Treating the final call's own write as 0 prices the same as inferring
+    it (inferred writes are dropped), so the re-drives' real writes stay."""
+    from headroom.proxy.handlers.openai import _hook_reported_write
+
+    u = TurnHookUsage()
+    a = {
+        "usage": {
+            "input_tokens": 100,
+            "output_tokens": 1,
+            "input_tokens_details": {"cached_tokens": 60, "cache_write_tokens": 30},
+        }
+    }
+    b = {"usage": {"input_tokens": 100, "output_tokens": 1}}
+    u.record(a, **RESPONSES_USAGE_KEYS)
+    u.record(b, **RESPONSES_USAGE_KEYS)
+    u.settle(b)
+    assert _hook_reported_write(None, u) == 30
+    assert _hook_reported_write(5, u) == 35
+    assert _hook_reported_write(None, TurnHookUsage()) is None
+
+
+@respx.mock
 def test_no_hook_registered_bills_exactly_the_one_call(monkeypatch, _no_hooks) -> None:
     """The regression guard in the other direction: with no hook, accounting must
     be untouched — this whole mechanism has to be inert on a stock proxy."""

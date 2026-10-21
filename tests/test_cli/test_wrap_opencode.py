@@ -73,7 +73,7 @@ def _subscription_resolution() -> CopilotSubscriptionTokenResolution:
 # ---------------------------------------------------------------------------
 
 
-def test_wrap_opencode_copilot_subscription_normalizes_enterprise_host_and_handoffs_seed_after_actual_port(
+def test_wrap_opencode_copilot_subscription_honours_advertised_enterprise_host_and_handoffs_seed_after_actual_port(
     runner: CliRunner,
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -144,7 +144,7 @@ def test_wrap_opencode_copilot_subscription_normalizes_enterprise_host_and_hando
 
     assert result.exit_code == 0, result.output
     ensure = captured["ensure"]
-    assert ensure["openai_api_url"] == "https://api.githubcopilot.com"
+    assert ensure["openai_api_url"] == "https://api.enterprise.githubcopilot.com"
     assert ensure["copilot_api_token"] == "copilot-api-secret"
     assert ensure["copilot_refresh_oauth_token"] == "gho-oauth"
     assert ensure["copilot_api_token_expires_at"] == 123.5

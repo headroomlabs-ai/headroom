@@ -15,7 +15,6 @@ from headroom.install.runtime import (
     _deployment_env,
     _mount_source,
     _process_identity,
-    _process_matches_runtime,
     _read_pid,
     _runtime_env,
     _write_pid,
@@ -847,7 +846,7 @@ def test_process_identity_must_match_headroom_command(monkeypatch) -> None:
             }
 
     monkeypatch.setitem(sys.modules, "psutil", types.SimpleNamespace(Process=FakeProcess))
-    assert not _process_matches_runtime(4321, _python_service_manifest())
+    assert _process_identity(4321, _python_service_manifest()) is False
 
     class MatchingProcess(FakeProcess):
         def cmdline(self) -> list[str]:
@@ -860,7 +859,7 @@ def test_process_identity_must_match_headroom_command(monkeypatch) -> None:
             }
 
     monkeypatch.setitem(sys.modules, "psutil", types.SimpleNamespace(Process=MatchingProcess))
-    assert _process_matches_runtime(4321, _python_service_manifest())
+    assert _process_identity(4321, _python_service_manifest()) is True
 
 
 def test_process_identity_falls_back_without_psutil(monkeypatch) -> None:
@@ -876,7 +875,7 @@ def test_process_identity_falls_back_without_psutil(monkeypatch) -> None:
         ),
     )
     monkeypatch.setitem(sys.modules, "psutil", None)
-    assert _process_matches_runtime(4321, manifest)
+    assert _process_identity(4321, manifest) is True
 
 
 def test_process_identity_uses_macos_ps_fallback_without_psutil(monkeypatch) -> None:
@@ -893,7 +892,7 @@ def test_process_identity_uses_macos_ps_fallback_without_psutil(monkeypatch) -> 
         )
 
     monkeypatch.setattr("headroom.install.runtime.run", lambda *a, **k: Result())
-    assert _process_matches_runtime(4321, manifest)
+    assert _process_identity(4321, manifest) is True
 
 
 def test_process_identity_uses_windows_wmi_command_line_without_psutil(monkeypatch) -> None:
@@ -914,7 +913,7 @@ def test_process_identity_uses_windows_wmi_command_line_without_psutil(monkeypat
         lambda command, **kwargs: calls.append(command) or Result(),
     )
 
-    assert _process_matches_runtime(4321, manifest)
+    assert _process_identity(4321, manifest) is True
     assert calls[0][:3] == ["powershell.exe", "-NoProfile", "-NonInteractive"]
 
 
@@ -1010,7 +1009,7 @@ def test_runtime_status_does_not_use_ready_probe_for_failed_identity(
 
 def test_process_identity_rejects_current_pid(monkeypatch) -> None:
     monkeypatch.setattr("headroom.install.runtime.os.getpid", lambda: 4321)
-    assert not _process_matches_runtime(4321, _python_service_manifest())
+    assert _process_identity(4321, _python_service_manifest()) is False
 
 
 def test_darwin_task_preserves_popen_path(monkeypatch, tmp_path: Path) -> None:

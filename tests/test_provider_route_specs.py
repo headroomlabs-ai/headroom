@@ -1,8 +1,13 @@
 from __future__ import annotations
 
+from collections import Counter
+from types import SimpleNamespace
+
+from fastapi import FastAPI
+
+from headroom.providers.proxy_routes import register_provider_routes
 from headroom.providers.route_specs import (
     ANTHROPIC_BATCH_ROUTES,
-    ANTHROPIC_HANDLER_ROUTES,
     ANTHROPIC_PASSTHROUGH_ROUTES,
     CLOUDCODE_HANDLER_ROUTES,
     GEMINI_BATCH_ROUTES,
@@ -28,6 +33,21 @@ def test_provider_handler_route_specs_are_unique() -> None:
     route_keys = {(spec.method, spec.path) for spec in PROVIDER_HANDLER_ROUTES}
 
     assert len(route_keys) == len(PROVIDER_HANDLER_ROUTES)
+
+
+def test_registered_provider_routes_are_unique() -> None:
+    """A second route for the same method and path is shadowed by the first and never runs."""
+    app = FastAPI()
+    proxy = SimpleNamespace(config=SimpleNamespace(bedrock_api_url="https://bedrock.example.test"))
+    register_provider_routes(app, proxy)
+
+    seen: Counter[tuple[str, str]] = Counter()
+    for route in app.router.routes:
+        for method in getattr(route, "methods", None) or {"WEBSOCKET"}:
+            seen[(method, route.path)] += 1
+
+    assert seen[("POST", "/v1/messages")] == 1
+    assert [key for key, count in seen.items() if count > 1] == []
 
 
 def test_openai_passthrough_routes_model_endpoint_intent() -> None:
@@ -79,9 +99,6 @@ def test_gemini_passthrough_routes_model_endpoint_intent() -> None:
 
 
 def test_direct_handler_routes_model_endpoint_intent() -> None:
-    assert ANTHROPIC_HANDLER_ROUTES == (
-        ProviderHandlerRoute("POST", "/v1/messages", "handle_anthropic_messages"),
-    )
     assert OPENAI_HANDLER_ROUTES == (
         ProviderHandlerRoute("POST", "/v1/chat/completions", "handle_openai_chat"),
         ProviderHandlerRoute("POST", "/chat/completions", "handle_openai_chat"),

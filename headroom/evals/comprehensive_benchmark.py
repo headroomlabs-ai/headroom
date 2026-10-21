@@ -46,29 +46,6 @@ DEFAULT_TASKS = [
     "gsm8k",  # Math reasoning - generation-based, works with chat APIs
 ]
 
-# Tier 1 standard benchmarks for the suite runner
-TIER1_TASKS = [
-    "gsm8k",  # Math reasoning
-    "truthfulqa_gen",  # Factual accuracy
-    "mmlu",  # General knowledge (57 subjects)
-    "arc_challenge",  # Science reasoning
-]
-
-# Code tasks (need --confirm_run_unsafe_code)
-TIER1_CODE_TASKS = [
-    "humaneval",  # Code generation (pass@1)
-]
-
-EXTENDED_TASKS = [
-    "mmlu",  # 57 subjects - comprehensive but slow
-    "gsm8k",  # Math - requires multi-step reasoning
-    "arc_challenge",  # Harder science reasoning
-]
-
-TIER3_TASKS = [
-    "hellaswag",  # Commonsense reasoning
-]
-
 
 @dataclass
 class BenchmarkResult:

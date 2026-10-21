@@ -22,6 +22,7 @@ from headroom.agent_savings import proxy_pipeline_kwargs
 from headroom.copilot_auth import build_copilot_upstream_url
 from headroom.proxy.auth_mode import classify_client
 from headroom.proxy.compression_decision import CompressionDecision
+from headroom.proxy.handlers._failure_logging import log_request_failure
 from headroom.proxy.helpers import (
     COMPRESSION_TIMEOUT_SECONDS,
     extract_tags,
@@ -61,11 +62,6 @@ class GeminiHandlerMixin:
         from headroom.proxy.token_counting import count_tokens_offloaded
 
         return await count_tokens_offloaded(self, model, messages)
-
-    async def _count_texts_offloaded(self, model, texts):  # noqa: ANN001, ANN201
-        from headroom.proxy.token_counting import count_texts_offloaded
-
-        return await count_texts_offloaded(self, model, texts)
 
     def _gemini_replay_forwarded_prefix(
         self,
@@ -565,6 +561,8 @@ class GeminiHandlerMixin:
                         status_code=response.status_code,
                         original_tokens=total_input_tokens,
                         optimized_tokens=total_input_tokens,
+                        # Gemini's own promptTokenCount (inclusive of cached content).
+                        provider_input_tokens=total_input_tokens,
                         output_tokens=output_tokens,
                         tokens_saved=0,
                         attempted_input_tokens=total_input_tokens,
@@ -872,6 +870,9 @@ class GeminiHandlerMixin:
                 total_latency = (time.time() - start_time) * 1000
 
                 total_input_tokens = optimized_tokens  # fallback
+                # Gemini's own promptTokenCount, only when it reported one; the
+                # fallback above is Headroom's estimate and must not pass as billed.
+                provider_prompt_tokens = 0
                 output_tokens = 0
                 cache_read_tokens = 0
                 resp_json = None
@@ -890,6 +891,8 @@ class GeminiHandlerMixin:
                         if usage.get("promptTokenCount") is None
                         else usage["promptTokenCount"]
                     )
+                    if usage.get("promptTokenCount") is not None:
+                        provider_prompt_tokens = total_input_tokens
                     output_tokens = gemini_output_tokens(
                         usage
                     )  # includes thinking tokens (2.5-family)
@@ -988,6 +991,8 @@ class GeminiHandlerMixin:
                     total_input_tokens = _usage_int(
                         usage.get("promptTokenCount"), total_input_tokens
                     )
+                    if usage.get("promptTokenCount") is not None:
+                        provider_prompt_tokens = total_input_tokens
                     output_tokens = _usage_int(usage.get("candidatesTokenCount"), output_tokens)
                     cache_read_tokens = _usage_int(
                         usage.get("cachedContentTokenCount"), cache_read_tokens
@@ -1048,6 +1053,8 @@ class GeminiHandlerMixin:
                     status_code=response.status_code,
                     original_tokens=effective_original_tokens,
                     optimized_tokens=total_input_tokens,
+                    # Gemini's own promptTokenCount (inclusive of cached content).
+                    provider_input_tokens=provider_prompt_tokens,
                     output_tokens=output_tokens,
                     tokens_saved=tokens_saved,
                     attempted_input_tokens=total_input_tokens + tokens_saved,
@@ -1105,7 +1112,9 @@ class GeminiHandlerMixin:
             return Response(content=e.content, status_code=e.status_code, headers=response_headers)
         except Exception as e:
             await self.metrics.record_failed(provider=provider_name)
-            logger.error(f"[{request_id}] Gemini request failed: {type(e).__name__}: {e}")
+            log_request_failure(
+                request_id, "Gemini request", e, provider=provider_name, model=model
+            )
             return JSONResponse(
                 status_code=502,
                 content={
@@ -1575,7 +1584,9 @@ class GeminiHandlerMixin:
             )
         except Exception as e:
             await self.metrics.record_failed(provider=provider_name)
-            logger.error(f"[{request_id}] Gemini countTokens failed: {type(e).__name__}: {e}")
+            log_request_failure(
+                request_id, "Gemini countTokens", e, provider=provider_name, model=model
+            )
             return JSONResponse(
                 status_code=502,
                 content={

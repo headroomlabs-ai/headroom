@@ -6,7 +6,6 @@ These are real tests that:
 - Test MCP server initialization (when MCP SDK is available)
 """
 
-import json
 import sys
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -14,11 +13,6 @@ import pytest
 from click.testing import CliRunner
 
 from headroom.cli.main import main
-from headroom.cli.mcp import (
-    get_headroom_command,
-    load_mcp_config,
-    save_mcp_config,
-)
 from headroom.mcp_registry.base import ServerSpec
 
 # Check if MCP SDK is available
@@ -28,23 +22,6 @@ try:
     MCP_AVAILABLE = True
 except ImportError:
     MCP_AVAILABLE = False
-
-
-@pytest.fixture
-def temp_claude_dir(tmp_path):
-    """Create a temporary .claude directory for testing."""
-    claude_dir = tmp_path / ".claude"
-    claude_dir.mkdir()
-    return claude_dir
-
-
-@pytest.fixture
-def mock_claude_config_path(temp_claude_dir):
-    """Patch the MCP config path to use temp directory."""
-    config_path = temp_claude_dir / "mcp.json"
-    with patch("headroom.cli.mcp.MCP_CONFIG_PATH", config_path):
-        with patch("headroom.cli.mcp.CLAUDE_CONFIG_DIR", temp_claude_dir):
-            yield config_path
 
 
 @pytest.fixture
@@ -79,70 +56,10 @@ class FakeRegistrar:
         return False
 
 
-class TestMCPConfigFunctions:
-    """Test config file handling functions."""
-
-    def test_get_headroom_command_returns_list(self):
-        """Command should be a list suitable for subprocess."""
-        cmd = get_headroom_command()
-        assert isinstance(cmd, list)
-        assert len(cmd) >= 1
-        # Should end with mcp serve args
-        assert "mcp" in cmd or "-m" in cmd
-
-    def test_load_mcp_config_empty_when_no_file(self, mock_claude_config_path):
-        """Loading non-existent config returns empty structure."""
-        config = load_mcp_config()
-        assert config == {"mcpServers": {}}
-
-    def test_save_and_load_config(self, mock_claude_config_path):
-        """Config can be saved and loaded back."""
-        test_config = {
-            "mcpServers": {
-                "headroom": {
-                    "command": "headroom",
-                    "args": ["mcp", "serve"],
-                }
-            }
-        }
-        save_mcp_config(test_config)
-
-        # File should exist
-        assert mock_claude_config_path.exists()
-
-        # Load it back
-        loaded = load_mcp_config()
-        assert loaded == test_config
-
-    def test_save_config_creates_directory(self, tmp_path):
-        """save_mcp_config creates parent directory if needed."""
-        claude_dir = tmp_path / "new_dir" / ".claude"
-        config_path = claude_dir / "mcp.json"
-
-        with patch("headroom.cli.mcp.MCP_CONFIG_PATH", config_path):
-            with patch("headroom.cli.mcp.CLAUDE_CONFIG_DIR", claude_dir):
-                save_mcp_config({"mcpServers": {}})
-
-        assert config_path.exists()
-
-    def test_load_config_preserves_other_servers(self, mock_claude_config_path):
-        """Loading preserves other MCP servers in config."""
-        # Write config with another server
-        existing_config = {
-            "mcpServers": {
-                "other-server": {"command": "other", "args": []},
-            }
-        }
-        mock_claude_config_path.write_text(json.dumps(existing_config))
-
-        loaded = load_mcp_config()
-        assert "other-server" in loaded["mcpServers"]
-
-
 #
 # Note: Tests for the 'mcp install' command's writes/idempotency/CLI-vs-file
 # fallback used to live here, but they were tightly coupled to private
-# globals (MCP_CONFIG_PATH, shutil.which) and exercised the same surface
+# module globals (config paths, shutil.which) and exercised the same surface
 # already covered by:
 #   - tests/test_mcp_registry/test_claude_registrar.py (file/CLI behavior
 #     with proper constructor injection — no patches)
@@ -179,7 +96,7 @@ class TestMCPUninstallCommand:
         assert result.exit_code == 0
         assert registrar.removed == ["headroom"]
 
-    def test_uninstall_no_config_file(self, mock_claude_config_path):
+    def test_uninstall_no_config_file(self):
         """Uninstall with no config file exits cleanly."""
         runner = CliRunner()
         with patch("headroom.mcp_registry.get_all_registrars", return_value=[]):
@@ -188,7 +105,7 @@ class TestMCPUninstallCommand:
         assert result.exit_code == 0
         assert "nothing to uninstall" in result.output.lower()
 
-    def test_uninstall_not_configured(self, mock_claude_config_path):
+    def test_uninstall_not_configured(self):
         """Uninstall when headroom not in config exits cleanly."""
         registrar = FakeRegistrar(configured=False)
 
@@ -230,7 +147,7 @@ class TestMCPUninstallCommand:
 class TestMCPStatusCommand:
     """Test 'headroom mcp status' command."""
 
-    def test_status_not_configured(self, mock_claude_config_path):
+    def test_status_not_configured(self):
         """Status shows not configured when no config."""
         runner = CliRunner()
         registrar = FakeRegistrar(configured=False)
@@ -246,7 +163,7 @@ class TestMCPStatusCommand:
             or "No config" in result.output
         )
 
-    def test_status_configured(self, mock_claude_config_path, mock_mcp_available):
+    def test_status_configured(self, mock_mcp_available):
         """Status reports configured when a registrar has headroom."""
         registrar = FakeRegistrar(configured=True)
 

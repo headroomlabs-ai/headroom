@@ -633,38 +633,6 @@ class FieldSemantics:
         self.inferred_type = inferred
         self.confidence = confidence
 
-    def is_value_important(self, value_hash: str) -> bool:
-        """Check if a specific value is considered important.
-
-        A value is important if:
-        1. It's in the important_value_hashes list (has been retrieved)
-        2. It's NOT the default value (for error_indicator type)
-
-        Args:
-            value_hash: SHA256[:8] hash of the value to check.
-
-        Returns:
-            True if this value should be preserved during compression.
-        """
-        # If we don't have enough data, be conservative
-        if self.confidence < 0.3:
-            return False
-
-        # For error_indicator: non-default values are important
-        if self.inferred_type == "error_indicator":
-            if self.default_value_hash and value_hash != self.default_value_hash:
-                return True
-
-        # For any type: values that have been retrieved are important
-        if value_hash in self.important_value_hashes:
-            return True
-
-        # For status: check if this value has been retrieved
-        if self.inferred_type == "status":
-            return value_hash in self.value_retrieval_frequency
-
-        return False
-
 
 @dataclass
 class CompressionEvent:

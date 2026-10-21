@@ -248,32 +248,6 @@ def _parse_judge_response(text: str) -> tuple[float, str]:
     return score, reasoning
 
 
-def create_batch_judge(
-    judge_fn: Callable[[str, str, str], tuple[float, str]],
-    max_concurrent: int = 5,
-) -> Callable[[list[tuple[str, str, str]]], list[tuple[float, str]]]:
-    """Create a batch judge function for parallel evaluation.
-
-    Args:
-        judge_fn: Single-item judge function.
-        max_concurrent: Maximum concurrent API calls.
-
-    Returns:
-        A function that takes a list of (question, ground_truth, prediction)
-        and returns a list of (score, reasoning).
-    """
-    from concurrent.futures import ThreadPoolExecutor
-
-    def batch_judge(
-        items: list[tuple[str, str, str]],
-    ) -> list[tuple[float, str]]:
-        with ThreadPoolExecutor(max_workers=max_concurrent) as executor:
-            futures = [executor.submit(judge_fn, q, gt, pred) for q, gt, pred in items]
-            return [f.result() for f in futures]
-
-    return batch_judge
-
-
 # Convenience function for simple scoring without LLM
 def simple_judge(
     question: str,

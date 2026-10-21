@@ -16,6 +16,7 @@ from datetime import datetime, timedelta
 from typing import TYPE_CHECKING, Any, NamedTuple
 
 from headroom.cache_economics import CACHE_ECONOMICS as _CACHE_ECONOMICS
+from headroom.log_safety import WarnOnce, describe_exception, safe_id
 from headroom.proxy.budget_basis_policy import (
     BUDGET_BASIS_BLOCK,
     BUDGET_BASIS_IGNORE,
@@ -57,17 +58,26 @@ logger = logging.getLogger("headroom.proxy")
 # Pricing-lookup warnings are emitted on the per-request cost path, so an
 # unresolvable model (a custom / OpenAI-compatible name LiteLLM can't price,
 # e.g. glm-5.2) floods proxy.log with an identical WARNING every single request
-# (#2504). Track which models have already been warned so each fires once per
-# process; the set is tiny and bounded by the number of distinct models seen.
-_warned_pricing_models: set[str] = set()
+# (#2504). Each (lookup, model) pair warns once; model names come from clients,
+# so WarnOnce also caps how many distinct models can warn.
+_pricing_warnings = WarnOnce(1024, "unpriceable models")
 
 
-def _warn_pricing_once(model: str, message: str) -> None:
-    """Emit ``message`` at WARNING only the first time ``model`` fails pricing."""
-    if model in _warned_pricing_models:
+def _warn_pricing_once(
+    lookup: str, what: str, model: str, exc: BaseException | None = None
+) -> None:
+    """Warn once per ``(lookup, model)`` that pricing failed, payload-safe.
+
+    A pricing backend's exception can quote provider responses or credentials,
+    so only :func:`describe_exception` (types and code locations) is logged, at
+    every level.
+    """
+    if not _pricing_warnings.first((lookup, model), logger):
         return
-    _warned_pricing_models.add(model)
-    logger.warning(message)
+    if exc is None:
+        logger.warning("%s for model %s", what, safe_id(model))
+    else:
+        logger.warning("%s for model %s: %s", what, safe_id(model), describe_exception(exc))
 
 
 # A route whose responses never carry a usage breakdown hits the estimated-basis
@@ -275,7 +285,10 @@ def build_prefix_cache_stats(
                             from headroom.pricing.counterfactual import resolve_rates
 
                             cache_prices = resolve_rates(model_name)
-                        except Exception:
+                        except Exception as e:
+                            _warn_pricing_once(
+                                "cache_rates", "Failed to resolve cache rates", model_name, e
+                            )
                             cache_prices = None
                         best_tokens = tokens_sent
 
@@ -900,6 +913,12 @@ class CostTracker:
         self._tool_saved_write_1h_by_model: dict[str, float] = {}
         self._tool_saved_list_by_model: dict[str, float] = {}
         self._tokens_sent_by_model: dict[str, int] = {}
+        # Of _tokens_sent_by_model: the part that is the provider's own billed
+        # count (the rest is Headroom's tokenizer estimate), and how many
+        # requests it came from. The licence usage report sends both so the
+        # cloud side can tell a billed figure from an estimate.
+        self._provider_tokens_sent_by_model: dict[str, int] = {}
+        self._provider_requests_by_model: dict[str, int] = {}
         # Completion tokens keyed by ``(model, long_context)`` — same reason as
         # the savings buckets: the >200k completion rate is a different number.
         self._output_tokens_by_tier: dict[tuple[str, bool], int] = {}
@@ -930,6 +949,8 @@ class CostTracker:
         self._tool_saved_write_1h_by_model.clear()
         self._tool_saved_list_by_model.clear()
         self._tokens_sent_by_model.clear()
+        self._provider_tokens_sent_by_model.clear()
+        self._provider_requests_by_model.clear()
         self._output_tokens_by_tier.clear()
         self._requests_by_model.clear()
         self._api_cache_read_by_model.clear()
@@ -964,8 +985,7 @@ class CostTracker:
         litellm = _get_litellm_module()
         if litellm is None:
             _warn_pricing_once(
-                f"__litellm_unavailable__:{model}",
-                f"LiteLLM not available - cannot calculate costs for model {model}",
+                "litellm_unavailable", "LiteLLM not available - cannot calculate costs", model
             )
             return None
 
@@ -988,7 +1008,7 @@ class CostTracker:
             return float(total_cost) if total_cost > 0 else None
 
         except Exception as e:
-            _warn_pricing_once(model, f"Failed to get pricing for model {model}: {e}")
+            _warn_pricing_once("estimate", "Failed to get pricing", model, e)
             return None
 
     def _prune_old_costs(self):
@@ -1023,13 +1043,15 @@ class CostTracker:
         output_tokens: int = 0,
         cache_inferred: bool = False,
         tool_schema_saved: int = 0,
+        provider_reported: bool = False,
     ):
         """Record token counts per model and accumulate request cost for budget enforcement.
 
         Args:
             model: Model name.
             tokens_saved: Tokens removed by compression (Headroom's count).
-            tokens_sent: Compressed message tokens sent (Headroom's count).
+            tokens_sent: Input tokens sent: the provider's billed count when
+                ``provider_reported``, else Headroom's local estimate.
             cache_read_tokens: Cache read tokens from API response usage.
             cache_write_tokens: Cache write tokens from API response usage.
             uncached_tokens: Non-cached input tokens from API response usage.
@@ -1047,6 +1069,8 @@ class CostTracker:
                 attributed. The dashboard's per-model "Tokens Saved" column
                 therefore showed compression only, while the headline above it
                 counted both.
+            provider_reported: True when ``tokens_sent`` is the provider's own
+                billed input (uncached + cache read + cache write).
         """
         # Post-guard invariant (all providers): Headroom never forwards a request
         # larger than the original (handlers revert any inflation before sending),
@@ -1134,6 +1158,13 @@ class CostTracker:
                 self._tool_saved_list_by_model.get(model, 0.0) + list_part
             )
         self._tokens_sent_by_model[model] = self._tokens_sent_by_model.get(model, 0) + tokens_sent
+        if provider_reported:
+            self._provider_tokens_sent_by_model[model] = (
+                self._provider_tokens_sent_by_model.get(model, 0) + tokens_sent
+            )
+            self._provider_requests_by_model[model] = (
+                self._provider_requests_by_model.get(model, 0) + 1
+            )
         okey = (model, long_context)
         self._output_tokens_by_tier[okey] = self._output_tokens_by_tier.get(okey, 0) + max(
             0, output_tokens
@@ -1350,7 +1381,8 @@ class CostTracker:
             info = litellm.model_cost.get(resolved, {})
             cost_per_token = info.get("input_cost_per_token")
             return cost_per_token * 1_000_000 if cost_per_token else None
-        except Exception:
+        except Exception as e:
+            _warn_pricing_once("list_price", "Failed to get list price", model, e)
             return None
 
     def _get_output_price(self, model: str, *, long_context: bool = False) -> float | None:
@@ -1371,7 +1403,8 @@ class CostTracker:
             if long_context:
                 return info.get("output_cost_per_token_above_200k_tokens") or base or None
             return base or None
-        except Exception:
+        except Exception as e:
+            _warn_pricing_once("output_price", "Failed to get output price", model, e)
             return None
 
     def _write_cost_usd(self, model: str, w5m_price: float, w1h_price: float) -> float:
@@ -1425,7 +1458,8 @@ class CostTracker:
             from headroom.pricing.counterfactual import resolve_rates
 
             rates = resolve_rates(model, long_context=long_context, for_billing=for_billing)
-        except Exception:
+        except Exception as e:
+            _warn_pricing_once("cache_rates", "Failed to resolve cache rates", model, e)
             return None
         if rates is None or not rates.uncached:
             return None

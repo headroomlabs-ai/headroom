@@ -22,6 +22,7 @@ if TYPE_CHECKING:
 
 from headroom import savings_ledger
 from headroom.observability import get_otel_metrics
+from headroom.proxy.savings_attribution import event_count
 from headroom.proxy.savings_tracker import SavingsTracker, estimate_request_savings_usd
 
 logger = logging.getLogger("headroom.proxy")
@@ -165,6 +166,14 @@ class PrometheusMetrics:
         self.inbound_responses_by_status: dict[str, int] = defaultdict(int)
 
         self.tokens_input_total = 0
+        # Of tokens_input_total: how much is the provider's own billed count
+        # versus Headroom's local tokenizer estimate (provider reported no
+        # usage, or the path never parsed it). Reported beside every input
+        # total so nobody reads an estimate as the bill.
+        self.tokens_input_provider_reported_total = 0
+        self.tokens_input_estimated_total = 0
+        self.requests_input_provider_reported = 0
+        self.requests_input_estimated = 0
         self.tokens_output_total = 0
         self.tokens_saved_total = 0
         # Tool-schema savings (deferral + turn-hook tool shrink), aggregated from
@@ -427,6 +436,10 @@ class PrometheusMetrics:
             self.inbound_responses_by_status.clear()
 
             self.tokens_input_total = 0
+            self.tokens_input_provider_reported_total = 0
+            self.tokens_input_estimated_total = 0
+            self.requests_input_provider_reported = 0
+            self.requests_input_estimated = 0
             self.tokens_output_total = 0
             self.tokens_saved_total = 0
             self.tool_search_saved_total = 0
@@ -642,6 +655,24 @@ class PrometheusMetrics:
         if saved > 0:
             self.extension_savings[key] += saved
 
+    def extension_savings_by_source(self) -> dict[str, int]:
+        """Measured savings per source, as ``/stats`` reports ``extension_savings``.
+
+        Realized savings attribution rows (``ctx.record_savings`` from a turn
+        hook, ``record_scope_savings``) plus ``record_extension_savings`` totals.
+        A source reported through both APIs (``headroom-hdr`` does, per request)
+        shows the larger of the two totals rather than their sum: nothing ties an
+        attribution row to a ``record_extension_savings`` call, so summing would
+        double-count it. Estimated rows (``realized=False``) stay in
+        ``savings.by_source`` only.
+        """
+        out = dict(self.extension_savings)
+        for row in list(self.savings_by_source.values()):
+            source, tokens = str(row["source"]), int(row["tokens"])
+            if row["realized"] and tokens > out.get(source, 0):
+                out[source] = tokens
+        return out
+
     def record_compression_failed(self, reason: str) -> None:
         """Record one fail-open compression failure, bucketed by ``reason``.
 
@@ -854,6 +885,10 @@ class PrometheusMetrics:
         # ``CacheMix.normalized``. Defaults False, preserving behaviour for the
         # providers that report disjoint buckets.
         cache_inferred: bool = False,
+        # True when ``input_tokens`` is the provider's own billed count, False
+        # when it is Headroom's local estimate. None (callers predating the
+        # split) records nothing in either bucket.
+        input_provider_reported: bool | None = None,
     ):
         """Record metrics for a request.
 
@@ -868,6 +903,10 @@ class PrometheusMetrics:
         from headroom.telemetry.context import MAX_DISTINCT_MODELS
 
         ledger_input_tokens = input_tokens if local_input_tokens is None else local_input_tokens
+        # An inferred write is the uncached slice under another name (see
+        # ``cache_inferred``), so it adds neither new input nor a billed write.
+        billed_write_tokens = 0 if cache_inferred else cache_write_tokens
+        new_input_tokens = int(uncached_input_tokens) + int(billed_write_tokens)
         # Post-guard invariant (all providers): Headroom never forwards a request
         # larger than the original — handlers revert any inflation before sending
         # (verified clean on the wire). So compression savings are >= 0; a negative
@@ -931,6 +970,12 @@ class PrometheusMetrics:
                 self.requests_cached += 1
 
             self.tokens_input_total += input_tokens
+            if input_provider_reported is True:
+                self.tokens_input_provider_reported_total += input_tokens
+                self.requests_input_provider_reported += 1
+            elif input_provider_reported is False and input_tokens > 0:
+                self.tokens_input_estimated_total += input_tokens
+                self.requests_input_estimated += 1
             self.tokens_output_total += output_tokens
             self.tokens_saved_total += tokens_saved
             self.tool_search_saved_total += max(0, int(tool_search_saved))
@@ -948,7 +993,7 @@ class PrometheusMetrics:
                         "usd": 0.0,
                     },
                 )
-                row["events"] = int(row["events"]) + 1
+                row["events"] = int(row["events"]) + event_count(item)
                 row["tokens"] = int(row["tokens"]) + max(0, int(item.get("tokens", 0) or 0))
                 row["usd"] = round(
                     float(row["usd"]) + float(item.get("usd", 0.0) or 0.0),
@@ -960,14 +1005,14 @@ class PrometheusMetrics:
 
             # New-input cohort, on the same predicate the ledger uses below.
             if uncached_input_tokens > 0 or cache_write_tokens > 0:
-                self.new_input_tokens_total += uncached_input_tokens + cache_write_tokens
+                self.new_input_tokens_total += new_input_tokens
                 self.new_input_saved_tokens_total += max(0, int(tokens_saved))
 
             # Track provider-specific prefix cache metrics
             if cache_read_tokens > 0 or cache_write_tokens > 0:
                 pc = self.cache_by_provider[provider]
                 pc["cache_read_tokens"] += cache_read_tokens
-                pc["cache_write_tokens"] += cache_write_tokens
+                pc["cache_write_tokens"] += billed_write_tokens
                 pc["cache_write_5m_tokens"] += cache_write_5m_tokens
                 pc["cache_write_1h_tokens"] += cache_write_1h_tokens
                 if cache_write_5m_tokens > 0:
@@ -1158,9 +1203,7 @@ class PrometheusMetrics:
                 # show the same new-input rate the dashboard headline does.
                 # Omitted when there is no cache breakdown (e.g. Bedrock), so
                 # the ledger never divides savings by themselves.
-                new_input_tokens=(
-                    int(uncached_input_tokens) + int(cache_write_tokens) if has_new_input else None
-                ),
+                new_input_tokens=new_input_tokens if has_new_input else None,
                 deferred_tokens=deferral_saved,
             )
 

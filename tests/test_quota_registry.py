@@ -158,8 +158,17 @@ def test_stop_all_calls_stop_on_all_registered():
     unavailable = _UnavailableTracker()
     registry.register(t)
     registry.register(unavailable)
+
+    stopped = []
+
+    async def _stop() -> None:
+        stopped.append(True)
+
+    unavailable.stop = _stop  # type: ignore[method-assign]
     asyncio.run(registry.stop_all())
     assert t.stopped is True
+    # stop() runs regardless of availability
+    assert stopped == [True]
 
 
 def test_stop_all_continues_on_exception():
@@ -175,18 +184,25 @@ def test_stop_all_continues_on_exception():
         def get_stats(self) -> dict | None:
             return None
 
+    after = _AlwaysOnTracker()
     registry.register(_BrokenTracker())
-    # Should not raise
+    registry.register(after)
+    # Should not raise, and trackers after the failing one are still stopped
     asyncio.run(registry.stop_all())
+    assert after.stopped is True
 
 
 def test_passive_tracker_start_stop_are_noops():
     registry = QuotaTrackerRegistry()
     t = _PassiveTracker()
     registry.register(t)
+    assert t.is_available() is True
+    assert asyncio.run(t.start()) is None
     asyncio.run(registry.start_all())
+    assert registry.get_all_stats() == {"passive": {"passive": True}}
+    assert asyncio.run(t.stop()) is None
     asyncio.run(registry.stop_all())
-    # No assertions needed — we verify no exception is raised
+    assert registry.get_stats("passive") == {"passive": True}
 
 
 # ---------------------------------------------------------------------------

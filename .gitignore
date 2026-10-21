@@ -20,6 +20,7 @@ scripts/*
 !scripts/verify-ruff-version.py
 !scripts/pr-governance.py
 !scripts/bootstrap-windows-dev.ps1
+!scripts/codeql_triage.sh
 !scripts/build_npm_release_assets.mjs
 !scripts/build_python_release_smoke.py
 !scripts/release_smoke_all.py

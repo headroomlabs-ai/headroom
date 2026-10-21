@@ -342,7 +342,9 @@ def normalize_usage(usage: dict[str, Any]) -> NormalizedUsage:
     # ``input_tokens`` too, so the key name cannot be the discriminator. Keying
     # off Anthropic's cache fields can misread only a relay that mixes the two
     # vocabularies, and then it errs towards not inflating the prompt.
-    input_includes_cache = not (
+    # Responses' ``input_tokens_details`` marks an inclusive total even when a
+    # relay also flattened a top-level read beside it.
+    input_includes_cache = "input_tokens_details" in usage or not (
         "cache_read_input_tokens" in usage or "cache_creation_input_tokens" in usage
     )
     output_tokens = _usage_int(usage, "output_tokens")
@@ -351,10 +353,16 @@ def normalize_usage(usage: dict[str, Any]) -> NormalizedUsage:
 
     cache_read = _usage_int(usage, "cache_read_input_tokens")
     cache_write = _usage_int(usage, "cache_creation_input_tokens")
+    if cache_write is None:
+        # Responses reports billed writes as input_tokens_details.cache_write_tokens;
+        # chat reports none. Read whether or not a top-level read was relayed.
+        details = usage.get("input_tokens_details")
+        if isinstance(details, dict):
+            cache_write = _usage_int(details, "cache_write_tokens")
     if cache_read is None:
-        # OpenAI reports reads only (no write counter exists), nested under
-        # prompt_tokens_details (chat), input_tokens_details (Responses) or —
-        # in Kong's flattened log shape — at the top level.
+        # OpenAI nests reads under prompt_tokens_details (chat),
+        # input_tokens_details (Responses) or — in Kong's flattened log shape —
+        # puts them at the top level.
         for details_key in ("prompt_tokens_details", "input_tokens_details"):
             details = usage.get(details_key)
             if isinstance(details, dict):
@@ -839,6 +847,14 @@ class RequestTransformer:
         self.tags = tags
         self.caps = caps
         self.result: RequestTransformResult | None = None
+        # Tool-definition tokens the request hooks ADDED (e.g. a search tool).
+        # The compress handler adds it to ``tokens_after``: it is sent too.
+        self.tool_growth_tokens = 0
+        # Message tokens the request hooks ADDED (only counted by the handler
+        # when it did not recount the messages), and tool tokens they removed
+        # (booked on turn_hook_tools_saved_tokens), for signed netting.
+        self.message_growth_tokens = 0
+        self.hook_tool_saved_tokens = 0
         self._tokenizer: Any = None
 
     def _get_tokenizer(self) -> Any:
@@ -909,12 +925,16 @@ class RequestTransformer:
                     f"{int(self.tags.get('tool_search_deferred_tokens', 0) or 0)}tok"
                 )
             msg_after = _safe_count(count_messages, messages)
+            if msg_before is not None and msg_after is not None:
+                self.message_growth_tokens = max(0, msg_after - msg_before)
             if msg_before is not None and msg_after is not None and msg_after < msg_before:
                 transforms.append("turn_hook")
                 messages_rewritten = True
             tools_after = _safe_count(count_tools, without_deferral_flags(tools))
             if tools_before is not None and tools_after is not None:
+                self.tool_growth_tokens = max(0, tools_after - tools_before)
                 saved = max(0, tools_before - tools_after)
+                self.hook_tool_saved_tokens = saved
                 if saved > 0:
                     self.tags["turn_hook_tools_saved_tokens"] = (
                         int(self.tags.get("turn_hook_tools_saved_tokens", 0) or 0) + saved
@@ -1178,7 +1198,6 @@ def shape_gateway_body(
     and the block is re-appended deterministically. Never raises.
     """
     try:
-        from headroom.proxy import runtime_env
         from headroom.proxy.output_savings import (
             assign_arm,
             conversation_key_from_body,
@@ -1188,6 +1207,7 @@ def shape_gateway_body(
         from headroom.proxy.output_shaper import (
             OutputShaperSettings,
             classify_turn,
+            output_holdout_fraction,
             resolve_verbosity_level,
             shape_openai_chat_request,
             shape_request,
@@ -1201,11 +1221,7 @@ def shape_gateway_body(
         )
         if not settings.enabled:
             return False
-        try:
-            holdout = float(runtime_env.getenv("HEADROOM_OUTPUT_HOLDOUT", "0") or "0")
-        except ValueError:
-            holdout = 0.0
-        arm = assign_arm(conversation_key_from_body(provider_body), holdout)
+        arm = assign_arm(conversation_key_from_body(provider_body), output_holdout_fraction())
         messages = provider_body.get("messages")
         turn_kind = classify_turn(messages if isinstance(messages, list) else []).value
         stratum = stratum_key(
@@ -1498,14 +1514,12 @@ async def handle_compress_response(proxy: Any, request: Any) -> Any:
     """``POST /v1/compress/response`` — finish or re-drive a pending turn."""
     from fastapi.responses import JSONResponse
 
-    from headroom.proxy.helpers import _read_request_json
+    from headroom.proxy.helpers import _read_request_json, invalid_request_body_message
 
     try:
         body = await _read_request_json(request)
-    except Exception:
-        return _error(400, "invalid_request", "Invalid JSON in request body.")
-    if not isinstance(body, dict):
-        return _error(400, "invalid_request", "Request body must be a JSON object.")
+    except Exception as exc:
+        return _error(400, "invalid_request", invalid_request_body_message(exc))
 
     turn_id = body.get("turn_id")
     if not isinstance(turn_id, str) or not turn_id.strip() or len(turn_id) > 128:

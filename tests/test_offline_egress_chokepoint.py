@@ -1698,7 +1698,7 @@ class TestDoctorNetworkOffline:
 
 
 class TestInstallDownloadsOffline:
-    """`headroom install`'s two release downloads.
+    """`headroom install`'s release download.
 
     `binaries.py` already had `HEADROOM_BINARIES_OFFLINE`, which is exactly the
     kind of second, differently-named flag an operator should not have to
@@ -1717,13 +1717,6 @@ class TestInstallDownloadsOffline:
                 progress=False,
             )
         assert _refused_hostname(excinfo.value) == "github.com"
-
-    def test_cbm_download_opens_no_socket(self, offline: None, no_sockets: None) -> None:
-        from headroom.graph import installer
-
-        with pytest.raises(OfflineEgressBlocked) as excinfo:
-            installer.download_cbm()
-        assert "HEADROOM_OFFLINE" in str(excinfo.value)
 
     def test_the_binaries_specific_switch_still_wins_first(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
@@ -2358,13 +2351,17 @@ _EGRESS_ALLOWLIST: dict[str, tuple[int, str]] = {
         "calls guard_egress first.",
     ),
     "relevance/embedding.py": (
-        1,
+        2,
         "cache-only: the first of the two fastembed loads in "
         "_load_text_embedding runs with HF_HUB_OFFLINE forced to 1, so "
         "huggingface_hub resolves from the local cache or raises without "
         "opening a socket. The network retry directly below it calls "
         "guard_egress, which is why a pre-seeded air-gapped host still loads "
-        "the model and a cold one refuses instead of dialling.",
+        "the model and a cold one refuses instead of dialling. The load in "
+        "_load_default_model runs under the same forced HF_HUB_OFFLINE and "
+        "passes specific_model_path, which fastembed loads without any Hub "
+        "lookup; its files come through hf_hub_download_local_first, guarded "
+        "on the miss.",
     ),
 }
 

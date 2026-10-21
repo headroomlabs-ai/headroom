@@ -24,6 +24,10 @@ dependencies may impose their own Python/platform limits. Platforms outside
 that matrix fall back to the source distribution and need a Rust/native
 toolchain.
 
+Use the distribution name `headroom-ai` for every install, including extras such as
+`"headroom-ai[langchain]"`. The Python import and CLI command remain `headroom`;
+the PyPI distribution named `headroom` is a different project.
+
 On Intel macOS, ONNX Runtime wheels are available through Python 3.13, using
 the pre-1.24 runtime. Python 3.14 and newer omit optional ONNX backends from
 `proxy`, `voice`, `relevance`, and `image` extras because compatible wheels are

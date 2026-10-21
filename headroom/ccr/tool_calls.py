@@ -109,6 +109,25 @@ def is_ccr_tool_call(tool_call: dict[str, Any]) -> bool:
     )
 
 
+def has_ccr_retrieve_tool(tools: Any) -> bool:
+    """Return true when a tool list defines the CCR retrieval tool.
+
+    Accepts flat definitions (Anthropic, OpenAI Responses: ``{"name": ...}``) and
+    chat-completions definitions nested under ``"function"``.
+    """
+    if not isinstance(tools, list):
+        return False
+    for tool in tools:
+        if not isinstance(tool, dict):
+            continue
+        if tool.get("name") == CCR_TOOL_NAME:
+            return True
+        function = tool.get("function")
+        if isinstance(function, dict) and function.get("name") == CCR_TOOL_NAME:
+            return True
+    return False
+
+
 def has_ccr_tool_calls(response: dict[str, Any], provider: str) -> bool:
     """Return true when ``response`` contains at least one CCR tool call."""
     return any(is_ccr_tool_call(tool_call) for tool_call in extract_tool_calls(response, provider))
