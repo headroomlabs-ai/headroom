@@ -156,6 +156,42 @@ def test_count_messages_fails_open_to_estimation(monkeypatch: pytest.MonkeyPatch
     assert tokens > 0  # estimation fallback, no exception, no hang
 
 
+def _chat_template_tokenizer() -> Any:
+    """A real ``PreTrainedTokenizerFast`` with a chat template, built in memory."""
+    from tokenizers import Tokenizer
+    from tokenizers.models import WordLevel
+    from tokenizers.pre_tokenizers import Whitespace
+    from transformers import PreTrainedTokenizerFast
+
+    engine = Tokenizer(
+        WordLevel({"[UNK]": 0, "<eos>": 1, "<assistant>": 2, "hello": 3}, unk_token="[UNK]")
+    )
+    engine.pre_tokenizer = Whitespace()
+    tokenizer = PreTrainedTokenizerFast(
+        tokenizer_object=engine,
+        unk_token="[UNK]",
+        eos_token="<eos>",
+        additional_special_tokens=["<assistant>"],
+    )
+    tokenizer.chat_template = (
+        "{% for message in messages %}{{ message['content'] }}<eos>{% endfor %}"
+        "{% if add_generation_prompt %}<assistant>{% endif %}"
+    )
+    return tokenizer
+
+
+def test_count_message_is_non_negative_for_empty_message_with_chat_template() -> None:
+    """GH #4274: the base reply-overhead subtraction must not apply to a template's count."""
+    counter = HuggingFaceTokenizer("llama-3")
+    counter._tokenizer = _chat_template_tokenizer()
+    message = {"role": "user", "content": ""}
+
+    # The template emits just the EOS token for this message; no generation prompt.
+    assert counter.count_message(message) == 1
+    # The whole-list path still appends the generation prompt, so it is unchanged.
+    assert counter.count_messages([message]) == 2
+
+
 def test_deepseek_model_aliases_resolve_to_expected_tokenizers() -> None:
     assert get_tokenizer_name("deepseek-v3.2") == "deepseek-ai/DeepSeek-V3.2"
     assert get_tokenizer_name("deepseek-v4-pro") == "deepseek-ai/DeepSeek-V4-Pro"

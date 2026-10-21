@@ -465,6 +465,33 @@ class HuggingFaceTokenizer(BaseTokenizer):
 
         return super().count_messages(messages)
 
+    def count_message(self, message: dict[str, Any]) -> int:
+        """Count tokens in a single message using the model's chat template.
+
+        The base implementation subtracts a fixed reply overhead from a count that
+        includes the generation prompt, which can go negative for templates that
+        define their own overhead (GH #4274). Here the template renders the message
+        alone without a generation prompt, so the result is never negative.
+
+        Args:
+            message: A message dict with 'role' and 'content'.
+
+        Returns:
+            Token count for this message.
+        """
+        if self._use_fallback() or not hasattr(self.tokenizer, "apply_chat_template"):
+            return super().count_message(message)
+        try:
+            formatted = self.tokenizer.apply_chat_template(
+                [message],
+                tokenize=True,
+                add_generation_prompt=False,
+                return_dict=False,
+            )
+        except Exception:
+            return super().count_message(message)
+        return len(formatted)
+
     def encode(self, text: str) -> list[int]:
         """Encode text to token IDs.
 
