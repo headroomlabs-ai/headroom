@@ -1440,10 +1440,20 @@ def test_model_metadata_routes_honor_the_custom_base_url(monkeypatch) -> None:
             "/v1/models/gpt-5",
             headers={"x-headroom-base-url": "https://custom.example/"},
         )
+        # An Anthropic-compatible gateway names its upstream the same way.
+        anthropic = client.get(
+            "/v1/models",
+            headers={
+                "x-api-key": "gateway-key",
+                "x-headroom-base-url": "https://custom.example",
+            },
+        )
 
     assert listed.json()["base_url"] == "https://custom.example"
     assert fetched.json()["base_url"] == "https://custom.example"
     assert calls[0][2] == "openai"
+    assert anthropic.json()["base_url"] == "https://custom.example"
+    assert calls[-1][2] == "anthropic"
 
 
 def test_model_metadata_routes_reject_an_unsafe_custom_base_url(monkeypatch) -> None:
