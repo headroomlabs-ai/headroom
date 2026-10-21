@@ -3821,6 +3821,12 @@ class OpenAIHandlerMixin:
 
                 if is_token_mode(self.config.mode):
                     comp_cache = self._get_compression_cache(openai_session_id)
+                    from headroom.cache.prefix_tracker import seed_restored_compression_cache
+
+                    # Seeds the empty cache after a restart
+                    # (HEADROOM_PREFIX_STATE_FILE); without it the freeze below
+                    # freezes nothing.
+                    seed_restored_compression_cache(openai_prefix_tracker, comp_cache)
 
                     if not is_cache_mode(self.config.mode):
                         # Token mode: shared engine, REPLAYABLE policy — its
@@ -10695,6 +10701,9 @@ class OpenAIHandlerMixin:
                 session_tracker = self.session_tracker_store.get_or_create(
                     _session_key, _tracker_provider
                 )
+                from headroom.cache.prefix_tracker import seed_restored_compression_cache
+
+                seed_restored_compression_cache(session_tracker, comp_cache)
 
             # A claimed turn prepares its executor-side work here (tokenizer,
             # hooks, scope binding) — CPU-bound parts run inside the closures
