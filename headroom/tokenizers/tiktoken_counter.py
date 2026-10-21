@@ -304,7 +304,9 @@ class TiktokenCounter(BaseTokenizer):
                         for part in value:
                             if isinstance(part, dict):
                                 if part.get("type") == "text":
-                                    total += self.count_text(part.get("text", ""))
+                                    total += self.count_text(
+                                        coerce_countable_text(part.get("text", ""))
+                                    )
                                 elif part.get("type") == "image_url":
                                     # Image tokens vary by detail level
                                     detail = part.get("image_url", {}).get("detail", "auto")

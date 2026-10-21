@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import copy
+import json
+
 import pytest
 
 from headroom.tokenizers import (
@@ -771,3 +774,60 @@ class TestThinkingBlockCounting:
             - count_content_blocks(unsigned, counter.count_text)
             == 750
         )
+
+
+_STRUCTURED_PAYLOAD = {"message": "non-string provider text", "kind": "note"}
+_TEXTUAL_PAYLOAD = json.dumps(_STRUCTURED_PAYLOAD, ensure_ascii=False)
+
+
+@pytest.mark.parametrize(
+    "structured, textual",
+    [
+        (
+            {"role": "user", "content": [{"type": "text", "text": _STRUCTURED_PAYLOAD}]},
+            {"role": "user", "content": [{"type": "text", "text": _TEXTUAL_PAYLOAD}]},
+        ),
+        (
+            {"role": _STRUCTURED_PAYLOAD, "content": "hi"},
+            {"role": _TEXTUAL_PAYLOAD, "content": "hi"},
+        ),
+        (
+            {"role": "user", "name": _STRUCTURED_PAYLOAD, "content": "hi"},
+            {"role": "user", "name": _TEXTUAL_PAYLOAD, "content": "hi"},
+        ),
+        (
+            {
+                "role": "assistant",
+                "content": [{"reasoningContent": {"reasoningText": {"text": _STRUCTURED_PAYLOAD}}}],
+            },
+            {
+                "role": "assistant",
+                "content": [{"reasoningContent": {"reasoningText": {"text": _TEXTUAL_PAYLOAD}}}],
+            },
+        ),
+        (
+            {"role": "user", "content": [{"text": _STRUCTURED_PAYLOAD}]},
+            {"role": "user", "content": [{"text": _TEXTUAL_PAYLOAD}]},
+        ),
+        (
+            {
+                "role": "assistant",
+                "content": [{"type": "thinking", "thinking": _STRUCTURED_PAYLOAD}],
+            },
+            {"role": "assistant", "content": [{"type": "thinking", "thinking": _TEXTUAL_PAYLOAD}]},
+        ),
+    ],
+    ids=["text-part", "role", "name", "reasoning-text", "strands-text", "thinking"],
+)
+@pytest.mark.parametrize(
+    "counter",
+    [TiktokenCounter("gpt-4o"), CharacterCounter()],
+    ids=["tiktoken", "base-walker"],
+)
+def test_structured_text_counts_like_its_textual_form(
+    counter, structured: dict, textual: dict
+) -> None:
+    """Structured text must not crash the counter and must not mutate the input."""
+    before = copy.deepcopy(structured)
+    assert counter.count_messages([structured]) == counter.count_messages([textual])
+    assert structured == before
