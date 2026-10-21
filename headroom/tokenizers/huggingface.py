@@ -479,18 +479,19 @@ class HuggingFaceTokenizer(BaseTokenizer):
         Returns:
             Token count for this message.
         """
-        if self._use_fallback() or not hasattr(self.tokenizer, "apply_chat_template"):
-            return super().count_message(message)
-        try:
-            formatted = self.tokenizer.apply_chat_template(
-                [message],
-                tokenize=True,
-                add_generation_prompt=False,
-                return_dict=False,
-            )
-        except Exception:
-            return super().count_message(message)
-        return len(formatted)
+        if not self._use_fallback() and hasattr(self.tokenizer, "apply_chat_template"):
+            try:
+                formatted = self.tokenizer.apply_chat_template(
+                    [message],
+                    tokenize=True,
+                    add_generation_prompt=False,
+                    return_dict=False,
+                )
+                return len(formatted)
+            except Exception:
+                pass
+        # The base subtracts a reply overhead, which can drive a short message below zero.
+        return max(0, super().count_message(message))
 
     def encode(self, text: str) -> list[int]:
         """Encode text to token IDs.

@@ -156,7 +156,18 @@ def test_count_messages_fails_open_to_estimation(monkeypatch: pytest.MonkeyPatch
     assert tokens > 0  # estimation fallback, no exception, no hang
 
 
-def _chat_template_tokenizer() -> Any:
+_EOS_THEN_GENERATION_PROMPT = (
+    "{% for message in messages %}{{ message['content'] }}<eos>{% endfor %}"
+    "{% if add_generation_prompt %}<assistant>{% endif %}"
+)
+_REQUIRES_GENERATION_PROMPT = (
+    "{% if not add_generation_prompt %}"
+    "{{ raise_exception('generation prompt required') }}"
+    "{% endif %}" + _EOS_THEN_GENERATION_PROMPT
+)
+
+
+def _chat_template_tokenizer(chat_template: str = _EOS_THEN_GENERATION_PROMPT) -> Any:
     """A real ``PreTrainedTokenizerFast`` with a chat template, built in memory."""
     from tokenizers import Tokenizer
     from tokenizers.models import WordLevel
@@ -173,10 +184,7 @@ def _chat_template_tokenizer() -> Any:
         eos_token="<eos>",
         additional_special_tokens=["<assistant>"],
     )
-    tokenizer.chat_template = (
-        "{% for message in messages %}{{ message['content'] }}<eos>{% endfor %}"
-        "{% if add_generation_prompt %}<assistant>{% endif %}"
-    )
+    tokenizer.chat_template = chat_template
     return tokenizer
 
 
@@ -190,6 +198,17 @@ def test_count_message_is_non_negative_for_empty_message_with_chat_template() ->
     assert counter.count_message(message) == 1
     # The whole-list path still appends the generation prompt, so it is unchanged.
     assert counter.count_messages([message]) == 2
+
+
+def test_count_message_is_non_negative_when_template_rejects_no_generation_prompt() -> None:
+    """GH #4274: the fallback after a rejected render must not return a negative count."""
+    counter = HuggingFaceTokenizer("llama-3")
+    counter._tokenizer = _chat_template_tokenizer(_REQUIRES_GENERATION_PROMPT)
+    message = {"role": "user", "content": ""}
+
+    # Rendering without the generation prompt raises, so the base count-minus-3 applies
+    # to the two-token generation-prompt render (-1 before clamping).
+    assert counter.count_message(message) == 0
 
 
 def test_deepseek_model_aliases_resolve_to_expected_tokenizers() -> None:
