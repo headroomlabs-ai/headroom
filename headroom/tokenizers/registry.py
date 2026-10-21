@@ -26,6 +26,7 @@ MODEL_PATTERNS: list[tuple[str, str]] = [
     # OpenAI models -> tiktoken
     (r"^gpt-5", "tiktoken"),
     (r"^gpt-4o", "tiktoken"),
+    (r"^chatgpt-4o-", "tiktoken"),
     (r"^gpt-4", "tiktoken"),
     (r"^gpt-3\.5", "tiktoken"),
     (r"^o1", "tiktoken"),
