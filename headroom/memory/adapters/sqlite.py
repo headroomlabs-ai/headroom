@@ -841,18 +841,19 @@ class SQLiteMemoryStore:
         conditions = ["user_id = ?"]
         params: list[Any] = [user_id]
 
-        if turn_id is not None:
-            # Clear only specific turn
-            conditions.append("turn_id = ?")
-            params.append(turn_id)
-        elif agent_id is not None:
-            # Clear agent and its turns
-            conditions.append("agent_id = ?")
-            params.append(agent_id)
-        elif session_id is not None:
-            # Clear session and its agents/turns
+        # Each level narrows the one above it, so a narrower scope must keep its
+        # parent predicates: turn_id only within its agent/session, agent_id only
+        # within its session. Applying just the deepest id deleted every row that
+        # shared it across sessions.
+        if session_id is not None:
             conditions.append("session_id = ?")
             params.append(session_id)
+        if agent_id is not None:
+            conditions.append("agent_id = ?")
+            params.append(agent_id)
+        if turn_id is not None:
+            conditions.append("turn_id = ?")
+            params.append(turn_id)
         # If only user_id, clear all user's memories
 
         where_clause = " AND ".join(conditions)

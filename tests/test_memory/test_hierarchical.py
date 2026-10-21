@@ -378,6 +378,21 @@ class TestSQLiteMemoryStore:
         remaining = await store.query(MemoryFilter(user_id="alice"))
         assert len(remaining) == 2
 
+    @pytest.mark.asyncio
+    async def test_clear_scope_narrows_with_parent_scopes(self, store):
+        """A narrower scope must not delete rows outside its parents (#4303)."""
+        await store.save_batch(
+            [
+                Memory(content="s1 planner", user_id="alice", session_id="s1", agent_id="planner"),
+                Memory(content="s2 planner", user_id="alice", session_id="s2", agent_id="planner"),
+            ]
+        )
+
+        deleted = await store.clear_scope("alice", session_id="s1", agent_id="planner")
+
+        assert deleted == 1
+        assert len(await store.query(MemoryFilter(user_id="alice", session_id="s2"))) == 1
+
 
 # =============================================================================
 # LRU Cache Tests
