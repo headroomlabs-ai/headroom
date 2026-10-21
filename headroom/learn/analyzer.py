@@ -336,8 +336,9 @@ def _is_prompt_too_long(exc: Exception) -> bool:
 
     Matches the known phrasings across backends: claude CLI ("Prompt is too
     long"), Anthropic via LiteLLM ("prompt is too long: N tokens > M maximum"),
-    OpenAI ("context_length_exceeded" / "maximum context length"), and Gemini
-    ("input token count exceeds the maximum").
+    OpenAI ("context_length_exceeded" / "maximum context length"), Gemini
+    ("input token count exceeds the maximum"), and the codex CLI ("Input exceeds
+    the maximum length of 1048576 characters").
     """
     msg = str(exc).lower()
     return any(
@@ -348,6 +349,7 @@ def _is_prompt_too_long(exc: Exception) -> bool:
             "maximum context length",
             "context window",
             "token count exceeds",
+            "input exceeds the maximum length",
         )
     )
 
@@ -392,30 +394,42 @@ def _build_digest(
         lines.append(f"Tokens used: {total_tokens_in:,} in / {total_tokens_out:,} out")
     lines.append("")
 
-    # Detected loops first — the most expensive waste pattern, so the LLM sees
-    # it before the (budget-truncatable) per-session event stream.
-    loop_section = format_loops_for_digest(loops)
-    if loop_section:
-        lines.append(loop_section)
-
-    # Prior learned patterns (if any) — gives the LLM the current baseline so
-    # it can produce complete updated sections instead of condensed deltas.
-    prior_section = _build_prior_patterns_section(project)
-    if prior_section:
-        lines.append(prior_section)
-
     # Budget tracking — stop adding events when we approach the limit
     # Rough estimate: 4 chars per token
     char_budget = max_tokens * 4
-    chars_used = sum(len(ln) for ln in lines)
+    # Every line costs its length plus the newline joining it, and goes in only
+    # if it leaves this room for the truncation markers that can follow it (an
+    # events line, a blank, a sessions line), so the digest stays inside
+    # char_budget. Only a prior-patterns section that leaves no such room on
+    # its own (never cut, see below) can push it past.
+    room = char_budget - 100
+
+    # Prior learned patterns (if any) — gives the LLM the current baseline so
+    # it can produce complete updated sections instead of condensed deltas.
+    # Never cut: a re-emitted section replaces its prior one wholesale, so a
+    # partial baseline would drop the missing bullets from the written file.
+    prior_section = _build_prior_patterns_section(project)
+
+    # Detected loops first — the most expensive waste pattern, so the LLM sees
+    # it before the (budget-truncatable) per-session event stream. The event
+    # stream cannot trim a section placed ahead of it, so the loops get their
+    # own cap: a quarter of the budget, less whatever the header and prior
+    # patterns leave short. Rendered whole, every loop with every index, the
+    # section alone outgrew the digest on a machine with years of Codex
+    # sessions, which learn scans as one project.
+    pre_event_chars = sum(len(ln) + 1 for ln in lines) + len(prior_section) + 2
+    loop_section = format_loops_for_digest(
+        loops, max_chars=min(char_budget // 4, room - pre_event_chars)
+    )
+    if loop_section:
+        lines.append(loop_section)
+    if prior_section:
+        lines.append(prior_section)
+
+    chars_used = sum(len(ln) + 1 for ln in lines)
+    full = False
 
     for session in sessions:
-        if chars_used > char_budget:
-            lines.append(
-                f"... (remaining {len(sessions) - sessions.index(session)} sessions truncated)"
-            )
-            break
-
         session_header = (
             f"=== Session {session.session_id[:12]} "
             f"({len(session.tool_calls)} calls, {session.failure_count} failures"
@@ -423,29 +437,38 @@ def _build_digest(
         if session.total_input_tokens:
             session_header += f", {session.total_input_tokens:,} input tokens"
         session_header += ") ==="
+        if full or chars_used + len(session_header) + 1 > room:
+            lines.append(
+                f"... (remaining {len(sessions) - sessions.index(session)} sessions truncated)"
+            )
+            break
         lines.append(session_header)
-        chars_used += len(session_header)
+        chars_used += len(session_header) + 1
 
         # Use events if available (richer context), fall back to tool_calls
         if session.events:
             for event in session.events:
-                if chars_used > char_budget:
-                    lines.append("  ... (remaining events truncated)")
-                    break
                 event_line = _format_event(event)
-                if event_line:
-                    lines.append(event_line)
-                    chars_used += len(event_line)
+                if not event_line:
+                    continue
+                if chars_used + len(event_line) + 1 > room:
+                    lines.append("  ... (remaining events truncated)")
+                    full = True
+                    break
+                lines.append(event_line)
+                chars_used += len(event_line) + 1
         else:
             for tc in session.tool_calls:
-                if chars_used > char_budget:
-                    lines.append("  ... (remaining calls truncated)")
-                    break
                 tc_line = _format_tool_call(tc)
+                if chars_used + len(tc_line) + 1 > room:
+                    lines.append("  ... (remaining calls truncated)")
+                    full = True
+                    break
                 lines.append(tc_line)
-                chars_used += len(tc_line)
+                chars_used += len(tc_line) + 1
 
         lines.append("")
+        chars_used += 1
 
     return "\n".join(lines)
 
