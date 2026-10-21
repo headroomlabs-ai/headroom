@@ -192,3 +192,79 @@ class TestMustKeepCompression:
         )
 
         assert result.compressed.split() == ["alpha", "0x7fff2038"]
+
+
+class _TruncatingTok:
+    """Tokenizer that covers only the first ``max_words`` words of a chunk.
+
+    Mimics ``truncation=True, max_length=512`` for a chunk whose words are
+    token-heavy: words past the budget get no ``word_id`` at all, exactly as
+    the real tokenizer reports them.
+    """
+
+    def __init__(self, max_words: int):
+        self.max_words = max_words
+
+    def __call__(self, chunk_words, **kw):
+        batch_words = chunk_words if (chunk_words and isinstance(chunk_words[0], list)) else [chunk_words]
+        word_ids = []
+        for words in batch_words:
+            covered = min(len(words), self.max_words)
+            word_ids.append(list(range(covered)))
+        return _Enc(
+            input_ids=[[0] * len(wids) for wids in word_ids],
+            attention_mask=[[1] * len(wids) for wids in word_ids],
+            _word_ids=word_ids,
+        )
+
+
+class TestTruncatedWordsCompression:
+    """Words past the tokenizer's 512-token cut are kept, not dropped (#4309).
+
+    Chunks are cut by words (``chunk_words``) but tokenized with
+    ``truncation=True, max_length=512``. A chunk of token-heavy words (logs,
+    IDs, paths, numbers) hits the token limit well before its word budget, so
+    the tail of the chunk had no score and was dropped silently from the
+    default proxy path (``target_ratio=None``).
+    """
+
+    # 13 words clears the compressor's 10-word input gate.
+    WORDS = "alpha beta gamma delta epsilon zeta eta theta iota kappa lambda mu nu"
+    # The fake model keeps only the first word of what it was shown.
+    KEPT_BY_MODEL = ["alpha"]
+
+    def _compress(self, monkeypatch, max_words):
+        monkeypatch.setattr(kc, "_load_kompress", lambda *a, **k: (_Model(), _TruncatingTok(max_words), "onnx"))
+        monkeypatch.setattr(kc, "_model_device_type", lambda *a, **k: "cpu")
+        monkeypatch.delenv(_KOMPRESS_MUST_KEEP_ENV, raising=False)
+        compressor = KompressCompressor(KompressConfig(enable_ccr=False, min_input_words=10))
+        monkeypatch.setattr(compressor, "_should_batch_single_content", lambda *a, **k: False)
+        return compressor.compress(self.WORDS).compressed.split()
+
+    def test_words_past_the_truncation_point_survive(self, monkeypatch):
+        # The tokenizer covers only the first two words, so every word from
+        # the third on was truncated: the model never saw them and they used
+        # to vanish from the output entirely.
+        kept = self._compress(monkeypatch, max_words=2)
+        words = self.WORDS.split()
+        # The first word the model saw is kept; the second it dropped; the
+        # truncated tail is kept verbatim rather than dropped.
+        assert kept == [words[0]] + words[2:]
+
+    def test_fully_covered_chunk_is_unchanged(self, monkeypatch):
+        # Nothing is truncated, so the model's own choice stands: it kept the
+        # first word and dropped the rest.
+        kept = self._compress(monkeypatch, max_words=99)
+        assert kept == self.KEPT_BY_MODEL
+
+    def test_batch_path_keeps_truncated_words_too(self, monkeypatch):
+        monkeypatch.setattr(kc, "_load_kompress", lambda *a, **k: (_Model(), _TruncatingTok(2), "onnx"))
+        monkeypatch.setattr(kc, "_model_device_type", lambda *a, **k: "cpu")
+        monkeypatch.delenv(_KOMPRESS_MUST_KEEP_ENV, raising=False)
+        compressor = KompressCompressor(KompressConfig(enable_ccr=False, min_input_words=10))
+        monkeypatch.setattr(compressor, "_should_use_sequential_fallback", lambda: False)
+
+        [result] = compressor.compress_batch([self.WORDS], batch_size=8)
+
+        words = self.WORDS.split()
+        assert result.compressed.split() == [words[0]] + words[2:]

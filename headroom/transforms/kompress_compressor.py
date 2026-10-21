@@ -104,6 +104,27 @@ def _add_kompress_must_keep_words(
             kept_ids.add(word_idx + chunk_start)
 
 
+def _add_truncated_words(
+    kept_ids: set[int],
+    word_ids: list[int | None],
+    chunk_words: list[str],
+    chunk_start: int,
+) -> None:
+    """Keep words past the tokenizer's truncation point verbatim.
+
+    Chunks are cut by words (``chunk_words``) but tokenized with
+    ``truncation=True, max_length=512``. Words past token 512 get no
+    ``word_id``, so they are never scored and never make ``kept_ids`` — they
+    are dropped silently, regardless of importance, and the loss is
+    positional: whatever sits at the end of the chunk disappears. Logs, IDs,
+    hashes, paths and numbers run at 2.5-3+ tokens/word, so a 350-word chunk
+    of them exceeds 512 tokens routinely (#4309).
+    """
+    covered = max((wid for wid in word_ids if wid is not None), default=-1) + 1
+    for local_idx in range(covered, len(chunk_words)):
+        kept_ids.add(local_idx + chunk_start)
+
+
 _TABULAR_ROW_SPLIT_RE = re.compile(r"\s{2,}")
 
 
@@ -2093,6 +2114,7 @@ class KompressCompressor(Transform):
                 # Numbers, error names, paths, and flags carry meaning agents cannot
                 # reconstruct from context. Disable via HEADROOM_KOMPRESS_MUST_KEEP=0.
                 _add_kompress_must_keep_words(kept_ids, chunk_words, chunk_start)
+                _add_truncated_words(kept_ids, word_ids, chunk_words, chunk_start)
 
             for i, line_id in enumerate(line_ids):
                 if line_id in protected_line_ids:
@@ -2511,6 +2533,9 @@ class KompressCompressor(Transform):
 
                     _add_kompress_must_keep_words(
                         kept_ids_per_text[text_idx], chunk_words, chunk_start
+                    )
+                    _add_truncated_words(
+                        kept_ids_per_text[text_idx], word_ids, chunk_words, chunk_start
                     )
 
             except Exception as e:
