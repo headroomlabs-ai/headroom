@@ -410,8 +410,9 @@ constraint-dependencies = [
     "transformers>=5.5.0",
     # PYSEC-2026-3447 — transitive dependency; fix at 83.0.0
     "setuptools>=83.0.0",
-    # PYSEC-2026-3545/3546/3547 — transitive HTTP/WebSocket parser fixes
-    "aiohttp>=3.14.3",
+    # PYSEC-2026-3545/3546/3547, CVE-2026-111063/111064, GHSA-2g87-pp6c-29x5 —
+    # transitive HTTP/WebSocket parser, cookie and keepalive fixes; fix at 3.14.4
+    "aiohttp>=3.14.4",
     # PYSEC-2026-3552/3553/3554 — PKCS#7 and certificate verification fixes
     "cryptography>=50.0.0",
 ]
