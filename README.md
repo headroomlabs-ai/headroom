@@ -624,8 +624,8 @@ prompts, completions, code or file paths. It exists so we can see when a release
 regresses a compression ratio across real workloads rather than only our own test
 corpus.
 
-Turn it off with `HEADROOM_BEACON=off`, the `DO_NOT_TRACK=1` convention, or
-`HEADROOM_OFFLINE=1`. The full field list is in
+Turn it off with `HEADROOM_BEACON=off`, `HEADROOM_TELEMETRY=off`, the
+`DO_NOT_TRACK=1` convention, or `HEADROOM_OFFLINE=1`. The full field list is in
 [the proxy docs](https://docs.headroomlabs.ai/docs/proxy).
 
 ## Headroom for teams

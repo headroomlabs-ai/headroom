@@ -124,8 +124,9 @@ class TestLiteLLMLogSuppression:
         # initially absent so teardown restores or removes the temporary module.
         monkeypatch.setattr(providers, "litellm", None, raising=False)
         monkeypatch.delenv("LITELLM_SUPPRESS_DEBUG_INFO", raising=False)
-        # Restore the original modules at teardown: pricing submodules retain
-        # references to that LiteLLM instance and must not see a second catalog.
+        # delitem, not pop: teardown puts the real modules back. A bare pop made
+        # every later `import litellm` load a second copy, so a test pinning a
+        # rate on it missed modules still holding the first (CostTracker).
         monkeypatch.delitem(sys.modules, "headroom.providers.litellm", raising=False)
         monkeypatch.delitem(sys.modules, "litellm", raising=False)
 

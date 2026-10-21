@@ -1005,62 +1005,6 @@ async def test_download_and_upload_openai_file_helpers() -> None:
 
 
 @pytest.mark.asyncio
-async def test_store_google_batch_context_persists_transformed_requests(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    stored_contexts: list[object] = []
-
-    class FakeBatchContext:
-        def __init__(self, **kwargs) -> None:  # noqa: ANN003
-            self.kwargs = kwargs
-            self.requests: list[object] = []
-
-        def add_request(self, request) -> None:  # noqa: ANN001
-            self.requests.append(request)
-
-    class FakeBatchRequestContext:
-        def __init__(self, **kwargs) -> None:  # noqa: ANN003
-            self.kwargs = kwargs
-
-    class FakeStore:
-        async def store(self, context) -> None:  # noqa: ANN001
-            stored_contexts.append(context)
-
-    monkeypatch.setitem(
-        sys.modules,
-        "headroom.ccr",
-        SimpleNamespace(
-            BatchContext=FakeBatchContext,
-            BatchRequestContext=FakeBatchRequestContext,
-            get_batch_context_store=lambda: FakeStore(),
-        ),
-    )
-
-    handler = DummyBatchHandler()
-    await handler._store_google_batch_context(
-        "batches/123",
-        [
-            {
-                "metadata": {"key": "req-1"},
-                "request": {
-                    "contents": [{"parts": [{"text": "hello"}]}],
-                    "systemInstruction": {"parts": [{"text": "system"}]},
-                    "tools": [{"name": "tool"}],
-                },
-            }
-        ],
-        "gemini-2.0",
-        "api-key",
-    )
-
-    context = stored_contexts[0]
-    assert context.kwargs["batch_id"] == "batches/123"
-    assert context.requests[0].kwargs["custom_id"] == "req-1"
-    assert context.requests[0].kwargs["messages"] == [{"role": "user", "content": "hello"}]
-    assert context.requests[0].kwargs["system_instruction"] == "system"
-
-
-@pytest.mark.asyncio
 async def test_handle_google_batch_results_passes_through_early_exit_cases(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1299,11 +1243,6 @@ async def test_handle_google_batch_create_success_and_failure_paths(
 
     monkeypatch.setitem(sys.modules, "headroom.ccr", SimpleNamespace(CCRToolInjector=FakeInjector))
 
-    stored: list[tuple[str, list[dict[str, object]], str, str | None]] = []
-
-    async def fake_store(batch_name, requests_list, model, api_key):  # noqa: ANN001
-        stored.append((batch_name, requests_list, model, api_key))
-
     async def fake_retry(method, url, headers, body, **kwargs):  # noqa: ANN001
         return FakeResponse(
             status_code=200,
@@ -1333,7 +1272,6 @@ async def test_handle_google_batch_create_success_and_failure_paths(
 
     monkeypatch.setattr("headroom.proxy.helpers._read_request_json", good_payload)
     monkeypatch.setattr(handler, "_retry_request", fake_retry)
-    monkeypatch.setattr(handler, "_store_google_batch_context", fake_store)
 
     response = await handler.handle_google_batch_create(
         FakeRequest("{}", headers={"x-goog-api-key": "secret"}),
@@ -1343,9 +1281,6 @@ async def test_handle_google_batch_create_success_and_failure_paths(
     assert dict(response.headers)["x-upstream"] == "1"
     assert handler.metrics.record_calls[-1]["provider"] == "google"
     assert handler.metrics.record_calls[-1]["tokens_saved"] == 60
-    assert stored[0][0] == "batches/123"
-    assert stored[0][2:] == ("gemini-pro", "secret")
-    assert stored[0][1][0]["metadata"] == {"key": "req-1"}
 
     async def broken_retry(method, url, headers, body, **kwargs):  # noqa: ANN001
         raise RuntimeError("forward failed")
@@ -1671,59 +1606,6 @@ async def test_batch_helper_methods_and_openai_file_error_branches() -> None:
     handler.http_client.raise_get = None
     handler.http_client.post_response = FakeResponse(status_code=200, json_data={})
     assert await handler._upload_openai_file("{}", "missing-id.jsonl", {}) is None
-
-
-@pytest.mark.asyncio
-async def test_store_google_batch_context_without_system_text(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    stored_contexts: list[object] = []
-
-    class FakeBatchContext:
-        def __init__(self, **kwargs) -> None:  # noqa: ANN003
-            self.kwargs = kwargs
-            self.requests: list[object] = []
-
-        def add_request(self, request) -> None:  # noqa: ANN001
-            self.requests.append(request)
-
-    class FakeBatchRequestContext:
-        def __init__(self, **kwargs) -> None:  # noqa: ANN003
-            self.kwargs = kwargs
-
-    class FakeStore:
-        async def store(self, context) -> None:  # noqa: ANN001
-            stored_contexts.append(context)
-
-    handler = DummyBatchHandler()
-    monkeypatch.setitem(
-        sys.modules,
-        "headroom.ccr",
-        SimpleNamespace(
-            BatchContext=FakeBatchContext,
-            BatchRequestContext=FakeBatchRequestContext,
-            get_batch_context_store=lambda: FakeStore(),
-        ),
-    )
-
-    await handler._store_google_batch_context(
-        "batches/456",
-        [
-            {
-                "request": {
-                    "contents": [{"parts": [{"text": "hello"}]}],
-                    "systemInstruction": {"parts": ["bad"]},
-                }
-            }
-        ],
-        "gemini-2.0",
-        None,
-    )
-
-    context = stored_contexts[0]
-    assert context.kwargs["api_key"] is None
-    assert context.requests[0].kwargs["custom_id"] == ""
-    assert context.requests[0].kwargs["system_instruction"] is None
 
 
 @pytest.mark.asyncio

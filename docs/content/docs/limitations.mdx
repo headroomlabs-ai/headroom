@@ -174,10 +174,12 @@ this page's "nothing leaves the machine" framing as universal:
   compression ratios, skip reasons, provider and model ids, failure counts, plus
   OS and architecture. Never prompts, completions, code, or file paths -- the
   collector allowlists fields server-side and drops the rest. Disable it with
-  `HEADROOM_BEACON=off`, the cross-tool `DO_NOT_TRACK=1` convention, or by
+  `HEADROOM_BEACON=off`, `HEADROOM_TELEMETRY=off`, the cross-tool `DO_NOT_TRACK=1` convention, or by
   running offline. `is_beacon_enabled()` is fail-open: an unrecognized value
   uploads rather than staying silent. See [Proxy](/docs/proxy) for the full
   field list.
 
 These are deliberately separate so that enabling local `/stats` does not
-silently start an upload on the next release.
+silently start an upload on the next release. The one crossing only ever turns
+the upload off: an explicit `HEADROOM_TELEMETRY=off` also stops the beacon
+(unless `HEADROOM_BEACON=on`).

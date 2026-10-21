@@ -1687,6 +1687,38 @@ class TestHydrateEdgeCases:
         assert learner._persisted_ids == {}
 
     @pytest.mark.asyncio
+    async def test_unreadable_db_warns_on_hydration(self, tmp_path):
+        """A memory.db that cannot be read must say so; a missing one stays quiet."""
+        import logging
+
+        records: list[logging.LogRecord] = []
+
+        class _Collect(logging.Handler):
+            def emit(self, record: logging.LogRecord) -> None:
+                records.append(record)
+
+        handler = _Collect(level=logging.DEBUG)
+        logger = logging.getLogger("headroom.memory.traffic_learner")
+        logger.addHandler(handler)
+        try:
+            await TrafficLearner(
+                backend=_FakeBackend(tmp_path / "not-there.db"), min_evidence=1
+            )._hydrate_persisted_state()
+            assert [r for r in records if r.levelno >= logging.WARNING] == []
+
+            bad = tmp_path / "memory.db"
+            bad.write_bytes(b"this is not a sqlite database" * 100)
+            learner = TrafficLearner(backend=_FakeBackend(bad), min_evidence=1)
+            await learner._hydrate_persisted_state()
+            warnings = [r for r in records if r.levelno == logging.WARNING]
+            assert len(warnings) == 1
+            assert "hydrate" in warnings[0].getMessage()
+            assert str(bad) in warnings[0].getMessage()
+            assert learner._saved_hashes == set()
+        finally:
+            logger.removeHandler(handler)
+
+    @pytest.mark.asyncio
     async def test_hydration_is_bounded_to_dedup_window(self, tmp_path):
         """A persisted history larger than dedup_window must not start the
         in-memory dedup maps oversized. Hydration keeps at most dedup_window

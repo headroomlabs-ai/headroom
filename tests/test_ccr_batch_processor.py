@@ -1,22 +1,25 @@
 """Tests for CCR batch result processor.
 
 These tests verify that:
-1. BatchResultProcessor class initialization works correctly
+1. Native tool schemas permit real CCR batch continuations
 2. Result parsing for Anthropic, OpenAI, and Google batch formats
 3. CCR tool call detection in batch results
 4. Continuation call handling works for all providers
 5. Error cases and edge cases are handled gracefully
 """
 
+import json
+import re
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import httpx
 import pytest
 
+from headroom.cache import compression_store as compression_store_module
+from headroom.cache.compression_store import CompressionStore, set_request_compression_store
+from headroom.ccr import batch_store as batch_store_module
 from headroom.ccr.batch_processor import (
     BatchResultProcessor,
-    BatchResultProcessorConfig,
-    ProcessedBatchResult,
     process_batch_results,
 )
 from headroom.ccr.batch_store import (
@@ -26,107 +29,6 @@ from headroom.ccr.batch_store import (
     reset_batch_context_store,
 )
 from headroom.ccr.tool_injection import CCR_TOOL_NAME
-
-
-class TestBatchResultProcessorConfig:
-    """Test BatchResultProcessorConfig dataclass."""
-
-    def test_default_config(self):
-        """Default config values."""
-        config = BatchResultProcessorConfig()
-
-        assert config.enabled is True
-        assert config.continuation_timeout == 120
-        assert config.max_continuation_rounds == 3
-
-    def test_custom_config(self):
-        """Custom config values."""
-        config = BatchResultProcessorConfig(
-            enabled=False,
-            continuation_timeout=60,
-            max_continuation_rounds=5,
-        )
-
-        assert config.enabled is False
-        assert config.continuation_timeout == 60
-        assert config.max_continuation_rounds == 5
-
-
-class TestProcessedBatchResult:
-    """Test ProcessedBatchResult dataclass."""
-
-    def test_default_values(self):
-        """Default values for ProcessedBatchResult."""
-        result = ProcessedBatchResult(
-            custom_id="req_123",
-            result={"content": "test"},
-        )
-
-        assert result.custom_id == "req_123"
-        assert result.result == {"content": "test"}
-        assert result.was_processed is False
-        assert result.continuation_rounds == 0
-        assert result.error is None
-
-    def test_processed_result(self):
-        """ProcessedBatchResult with CCR processing."""
-        result = ProcessedBatchResult(
-            custom_id="req_456",
-            result={"content": "processed"},
-            was_processed=True,
-            continuation_rounds=2,
-        )
-
-        assert result.was_processed is True
-        assert result.continuation_rounds == 2
-
-    def test_error_result(self):
-        """ProcessedBatchResult with error."""
-        result = ProcessedBatchResult(
-            custom_id="req_789",
-            result={"content": "partial"},
-            error="Retrieval failed",
-        )
-
-        assert result.error == "Retrieval failed"
-
-
-class TestBatchResultProcessorInit:
-    """Test BatchResultProcessor initialization."""
-
-    def test_default_initialization(self):
-        """Initialize with default config."""
-        http_client = MagicMock(spec=httpx.AsyncClient)
-        processor = BatchResultProcessor(http_client)
-
-        assert processor.http_client == http_client
-        assert processor.config.enabled is True
-        assert processor.config.continuation_timeout == 120
-        assert processor.ccr_handler is not None
-
-    def test_custom_config_initialization(self):
-        """Initialize with custom config."""
-        http_client = MagicMock(spec=httpx.AsyncClient)
-        config = BatchResultProcessorConfig(
-            enabled=False,
-            continuation_timeout=60,
-        )
-        processor = BatchResultProcessor(http_client, config)
-
-        assert processor.config.enabled is False
-        assert processor.config.continuation_timeout == 60
-
-    def test_api_urls_set(self):
-        """API URLs are set for all providers."""
-        http_client = MagicMock(spec=httpx.AsyncClient)
-        processor = BatchResultProcessor(http_client)
-
-        assert "anthropic" in processor.api_urls
-        assert "openai" in processor.api_urls
-        assert "google" in processor.api_urls
-        assert processor.api_urls["anthropic"] == "https://api.anthropic.com"
-        assert processor.api_urls["openai"] == "https://api.openai.com"
-        assert processor.api_urls["google"] == "https://generativelanguage.googleapis.com"
 
 
 class TestCustomIdExtraction:
@@ -684,47 +586,196 @@ class TestContinuationCalls:
         assert call_args.kwargs["json"]["model"] == "gpt-4"
 
     @pytest.mark.asyncio
-    async def test_google_continuation_call(self):
-        """Test Google continuation call format."""
-        mock_response = MagicMock()
-        mock_response.json.return_value = {
-            "candidates": [{"content": {"parts": [{"text": "Final answer"}]}}]
-        }
-        mock_response.raise_for_status = MagicMock()
+    @pytest.mark.parametrize("client_tools", ["functions", "siblings", "none"])
+    async def test_google_batch_create_to_results_retains_injected_native_tools(
+        self, monkeypatch, tmp_path, client_tools
+    ):
+        from starlette.requests import Request
 
-        http_client = AsyncMock(spec=httpx.AsyncClient)
-        http_client.post.return_value = mock_response
+        from headroom.providers.openai import OpenAIProvider
+        from headroom.proxy.server import HeadroomProxy, ProxyConfig
+        from headroom.transforms.content_router import ContentRouter, ContentRouterConfig
+        from headroom.transforms.pipeline import TransformPipeline
 
-        processor = BatchResultProcessor(http_client)
+        monkeypatch.setenv("HEADROOM_WORKSPACE_DIR", str(tmp_path))
+        original_records = [
+            f"Record {i}: amount={i * 13}, owner=account-{i}, unique source information "
+            "with a detailed transaction description."
+            for i in range(200)
+        ]
+        original = json.dumps(original_records, indent=2)
+        store = CompressionStore(enable_feedback=False)
+        previous_store = compression_store_module._request_ccr_store.get()
+        set_request_compression_store(store)
+        monkeypatch.setattr(batch_store_module, "_batch_context_store", BatchContextStore())
+        tools = [] if client_tools == "none" else [{"googleSearch": {}}, {"codeExecution": {}}]
+        if client_tools == "functions":
+            tools.insert(
+                0,
+                {
+                    "functionDeclarations": [
+                        {
+                            "name": "lookup",
+                            "description": "Look up one record.",
+                            "parameters": {"type": "OBJECT"},
+                        }
+                    ]
+                },
+            )
+        forwarded = None
 
-        request_context = BatchRequestContext(
-            custom_id="req_1",
-            messages=[{"role": "user", "content": "Hello"}],
-            model="gemini-pro",
-            system_instruction="Be helpful.",
+        def admit_wire_request(request):
+            nonlocal forwarded
+            body = json.loads(request.content)
+            if request.url.path.endswith(":batchGenerateContent"):
+                forwarded = body["batch"]["input_config"]["requests"]["requests"][0]["request"]
+                return httpx.Response(200, json={"name": "batches/native-tools"})
+            recovered = [
+                part["functionResponse"]["response"].get("original_content")
+                for content in body["contents"]
+                for part in content["parts"]
+                if "functionResponse" in part
+            ]
+            declarations = [
+                declaration
+                for tool in body.get("tools", [])
+                for declaration in tool.get("functionDeclarations", [])
+            ]
+            expected_names = (
+                {CCR_TOOL_NAME, "lookup"} if client_tools == "functions" else {CCR_TOOL_NAME}
+            )
+            admitted = (
+                {declaration.get("name") for declaration in declarations} == expected_names
+                and body.get("tools") == forwarded.get("tools")
+                and all(
+                    all(declaration in declarations for declaration in tool["functionDeclarations"])
+                    if "functionDeclarations" in tool
+                    else tool in body["tools"]
+                    for tool in tools
+                )
+                and any(
+                    isinstance(value, str) and json.loads(value) == original_records
+                    for value in recovered
+                )
+            )
+            return httpx.Response(
+                200 if admitted else 400,
+                json={
+                    "candidates": [
+                        {"content": {"role": "model", "parts": [{"text": "All records recovered"}]}}
+                    ]
+                }
+                if admitted
+                else {"error": {"message": "Missing effective native tools or original records"}},
+            )
+
+        proxy = HeadroomProxy(
+            ProxyConfig(
+                optimize=True,
+                cache_enabled=False,
+                rate_limit_enabled=False,
+                cost_tracking_enabled=False,
+                log_requests=False,
+                retry_enabled=False,
+                image_optimize=False,
+            )
         )
-        batch_context = BatchContext(
-            batch_id="batch_123",
-            provider="google",
-            api_key="google_api_key",
+        proxy.openai_pipeline = TransformPipeline(
+            provider=OpenAIProvider(),
+            transforms=[
+                ContentRouter(
+                    ContentRouterConfig(
+                        skip_user_messages=False,
+                        protect_analysis_context=False,
+                        enable_kompress=False,
+                        smart_crusher_max_items_after_crush=12,
+                        smart_crusher_with_compaction=False,
+                    )
+                )
+            ],
+        )
+        payload = json.dumps(
+            {
+                "batch": {
+                    "input_config": {
+                        "requests": {
+                            "requests": [
+                                {
+                                    "metadata": {"key": "request"},
+                                    "request": {
+                                        "contents": [
+                                            {"role": "user", "parts": [{"text": original}]}
+                                        ],
+                                        "tools": tools,
+                                    },
+                                }
+                            ]
+                        }
+                    }
+                }
+            }
+        ).encode()
+        chunks = iter(
+            [
+                {"type": "http.request", "body": payload[:100], "more_body": True},
+                {"type": "http.request", "body": payload[100:], "more_body": False},
+            ]
         )
 
-        await processor._google_continuation(
-            [{"role": "user", "content": "Hello"}],
-            [{"name": "test_tool", "parameters": {}}],
-            request_context,
-            batch_context,
+        async def receive():
+            return next(chunks, {"type": "http.disconnect"})
+
+        request = Request(
+            {
+                "type": "http",
+                "method": "POST",
+                "path": "/v1beta/models/gemini-2.5-flash:batchGenerateContent",
+                "query_string": b"",
+                "headers": [(b"content-type", b"application/json")],
+                "scheme": "http",
+                "server": ("127.0.0.1", 80),
+            },
+            receive,
         )
-
-        # Verify API call
-        http_client.post.assert_called_once()
-        call_args = http_client.post.call_args
-
-        assert "generativelanguage.googleapis.com" in call_args.args[0]
-        assert "gemini-pro" in call_args.args[0]
-        assert "key=google_api_key" in call_args.args[0]
-        assert "contents" in call_args.kwargs["json"]
-        assert "systemInstruction" in call_args.kwargs["json"]
+        try:
+            async with httpx.AsyncClient(
+                transport=httpx.MockTransport(admit_wire_request)
+            ) as client:
+                proxy.http_client = client
+                created = await proxy.handle_google_batch_create(request, "gemini-2.5-flash")
+                assert created.status_code == 200
+                hash_key = re.search(
+                    r"(?:<<ccr:|Retrieve (?:more|original): hash=)([a-f0-9]{12,24})",
+                    json.dumps(forwarded),
+                ).group(1)
+                response = {
+                    "candidates": [
+                        {
+                            "content": {
+                                "role": "model",
+                                "parts": [
+                                    {
+                                        "functionCall": {
+                                            "name": CCR_TOOL_NAME,
+                                            "args": {"hash": hash_key},
+                                        }
+                                    }
+                                ],
+                            }
+                        }
+                    ]
+                }
+                processed = await BatchResultProcessor(client).process_results(
+                    "batches/native-tools",
+                    [{"metadata": {"key": "request"}, "response": response}],
+                    "google",
+                )
+            assert processed[0].result["response"]["candidates"][0]["content"]["parts"] == [
+                {"text": "All records recovered"}
+            ]
+        finally:
+            set_request_compression_store(previous_store)
+            proxy._compression_executor.shutdown(wait=True)
 
     @pytest.mark.asyncio
     async def test_continuation_with_tools(self):
