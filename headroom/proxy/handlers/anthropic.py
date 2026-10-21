@@ -20,6 +20,7 @@ from typing import TYPE_CHECKING, Any
 from urllib.parse import urlsplit
 
 from headroom.proxy.session_affinity import session_affinity_headers
+from headroom.proxy.sse_byte_buffer_policy import strip_leading_bom
 from headroom.proxy.stage_timer import StageTimer, emit_stage_timings_log
 from headroom.proxy.tool_schema_savings_policy import (
     net_hook_tool_saving,
@@ -289,7 +290,7 @@ def _looks_like_sse_response(response: httpx.Response) -> bool:
     content_type = (response.headers.get("content-type") or "").lower()
     if "text/event-stream" in content_type:
         return True
-    head = response.content[:64].lstrip()
+    head = strip_leading_bom(response.content[:64]).lstrip()
     return head.startswith(b"event:") or head.startswith(b"data:")
 
 

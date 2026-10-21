@@ -316,3 +316,18 @@ def test_event_stream_under_a_vague_content_type_is_still_adapted() -> None:
     assert resp.status_code == 200
     assert "application/json" in resp.headers["content-type"]
     assert resp.json()["content"] == [{"type": "text", "text": "hello"}]
+
+
+def test_bom_prefixed_event_stream_under_a_vague_content_type_is_still_adapted() -> None:
+    """A BOM ahead of the first field must not hide the stream from the sniff (#4255)."""
+    resp, _ = _drive(
+        upstream=httpx.Response(
+            200,
+            content=b"\xef\xbb\xbf" + COMPLETE_SSE.encode(),
+            headers={"content-type": "application/octet-stream"},
+        )
+    )
+
+    assert resp.status_code == 200
+    assert "application/json" in resp.headers["content-type"]
+    assert resp.json()["content"] == [{"type": "text", "text": "hello"}]
