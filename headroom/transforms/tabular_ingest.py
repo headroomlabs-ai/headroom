@@ -157,6 +157,15 @@ def parse_tabular(
     width = len(headers)
     if any(len(row) != width for row in rows):
         return None
+    # Two columns with the same name cannot be zipped into records without one
+    # overwriting the other: the earlier column's values would be lost and the
+    # remaining ones relabelled as if they were the dropped ones (#4277).
+    # Repeated names are common in tool output (SQL join results repeat `id`,
+    # `name` and `created_at`; a markdown table with two blank header cells
+    # collapses them to one `""` key). Treat such a table as non-tabular and
+    # pass it through verbatim, as a ragged table already does.
+    if len(set(headers)) != len(headers):
+        return None
     # The detector finds fixed-width columns by single-space gutters, but the
     # parser splits on 2+ spaces, so a table like GNU `ls -l` can come back as
     # one cell per line. That is not a table; leave it verbatim.
