@@ -118,6 +118,37 @@ class TestSanitizeForwardedResponseHeaders:
         assert "transfer-encoding" not in cleaned
         assert cleaned["request-id"] == "req_abc"
 
+    def test_drops_headers_named_by_connection(self):
+        cleaned = sanitize_forwarded_response_headers(
+            {
+                "connection": "X-Upstream-Hop, Upgrade",
+                "X-Upstream-Hop": "1",
+                "upgrade": "h2c",
+                "request-id": "req_abc",
+            }
+        )
+        assert cleaned == {"request-id": "req_abc"}
+
+    def test_drops_headers_named_by_every_connection_field(self):
+        headers = httpx.Headers(
+            [
+                ("connection", "X-Upstream-Hop, Upgrade"),
+                ("Connection", "x-second-hop"),
+                ("x-upstream-hop", "1"),
+                ("x-second-hop", "2"),
+                ("upgrade", "h2c"),
+                ("request-id", "req_abc"),
+            ]
+        )
+        cleaned = sanitize_forwarded_response_headers(headers)
+        assert cleaned == {"request-id": "req_abc"}
+        assert headers["x-second-hop"] == "2"
+
+    @pytest.mark.parametrize("name", ["te", "trailer", "upgrade"])
+    def test_drops_hop_by_hop_headers_without_connection(self, name):
+        cleaned = sanitize_forwarded_response_headers({name: "trailers", "request-id": "req_abc"})
+        assert cleaned == {"request-id": "req_abc"}
+
 
 # --------------------------------------------------------------------------
 # 2. Replaying a poisoned cache entry

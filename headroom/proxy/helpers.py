@@ -336,6 +336,9 @@ FRAMING_RESPONSE_HEADERS: tuple[str, ...] = (
     "connection",
     "keep-alive",
     "server",
+    "te",
+    "trailer",
+    "upgrade",
 )
 
 
@@ -348,11 +351,22 @@ def sanitize_forwarded_response_headers(
     Pass any additional header names to strip as ``extra_names`` (for
     example ``"content-type"`` when the caller sets its own media type).
 
+    Headers named by any ``Connection`` value are dropped too (RFC 9110
+    §7.6.1), since the upstream declared them hop-by-hop.
+
     Matching is case-insensitive, but the casing of the headers that
     survive is left untouched.
     """
+    items = dict(headers).items()
+    connection_named = {
+        token.strip().lower()
+        for key, value in items
+        if key.lower() == "connection"
+        for token in value.split(",")
+    }
     drop = {name.lower() for name in (*FRAMING_RESPONSE_HEADERS, *extra_names)}
-    return {key: value for key, value in dict(headers).items() if key.lower() not in drop}
+    drop |= connection_named
+    return {key: value for key, value in items if key.lower() not in drop}
 
 
 def _path_for_log(path: str) -> str:
