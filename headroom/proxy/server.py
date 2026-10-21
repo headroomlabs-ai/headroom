@@ -6281,13 +6281,19 @@ def _json_ready(value: Any) -> Any:
 
 
 def _proxy_config_payload(config: ProxyConfig) -> dict[str, Any]:
+    from headroom import settings_store
+
     payload: dict[str, Any] = {}
     for field in fields(config):
         if field.name == "rollout":
             assert config.rollout is not None
             payload["_rollout_snapshot"] = config.rollout.to_internal_dict()
             continue
-        value = _json_ready(getattr(config, field.name))
+        value = getattr(config, field.name)
+        if field.name == "profile_seeded_env_keys":
+            # Spawned workers inherit the generated env, but not module globals.
+            value = value | settings_store.seeded_env_keys()
+        value = _json_ready(value)
         try:
             json.dumps(value)
         except TypeError:
