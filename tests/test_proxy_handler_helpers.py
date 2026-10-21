@@ -1192,6 +1192,89 @@ def test_append_context_skips_trailing_system_message() -> None:
     assert inject(messages, "memory", frozen_message_count=0) is messages
 
 
+def test_proactive_expansion_appends_after_cached_prefix_without_mutating_it() -> None:
+    """CCR expansion must not rewrite a message the provider has already cached (#4287)."""
+    from headroom.ccr.context_tracker import (
+        PROACTIVE_EXPANSION_CLOSE_TAG,
+        PROACTIVE_EXPANSION_OPEN_TAG,
+    )
+
+    env_block = {"type": "text", "text": "# Environment", "cache_control": {"type": "ephemeral"}}
+    trailing_system = {"role": "system", "content": [env_block]}
+    first_user = {
+        "role": "user",
+        "content": [{"type": "text", "text": "hello from turn 0"}],
+    }
+    messages = [first_user, trailing_system]
+    expansion = f"{PROACTIVE_EXPANSION_OPEN_TAG}\nexpanded\n{PROACTIVE_EXPANSION_CLOSE_TAG}"
+
+    forwarded = AnthropicHandlerMixin._append_proactive_expansion_after_cached_prefix(
+        messages, expansion
+    )
+
+    assert forwarded[0] == first_user
+    assert forwarded[1]["role"] == "system"
+    assert forwarded[1]["content"][0] == env_block
+    assert forwarded[1]["content"][1] == {"type": "text", "text": expansion}
+    assert "cache_control" not in forwarded[1]["content"][1]
+    assert AnthropicHandlerMixin._without_proactive_expansion_messages(forwarded) == messages
+    assert messages[0]["content"][0]["text"] == "hello from turn 0"
+    assert messages[1]["content"] == [env_block]
+
+
+def test_proactive_expansion_without_cache_control_stays_on_the_live_user_turn() -> None:
+    from headroom.ccr.context_tracker import (
+        PROACTIVE_EXPANSION_CLOSE_TAG,
+        PROACTIVE_EXPANSION_OPEN_TAG,
+    )
+
+    messages = [{"role": "user", "content": "hello"}]
+    expansion = f"{PROACTIVE_EXPANSION_OPEN_TAG}\nexpanded\n{PROACTIVE_EXPANSION_CLOSE_TAG}"
+    forwarded = AnthropicHandlerMixin._append_proactive_expansion_after_cached_prefix(
+        messages, expansion
+    )
+    assert forwarded[0]["content"][0] == {"type": "text", "text": "hello"}
+    assert forwarded[0]["content"][1] == {"type": "text", "text": expansion}
+    assert AnthropicHandlerMixin._without_proactive_expansion_messages(forwarded) == [
+        {"role": "user", "content": [{"type": "text", "text": "hello"}]}
+    ]
+    assert messages[0]["content"] == "hello"
+
+
+def test_proactive_expansion_keeps_tool_results_together_and_client_text() -> None:
+    from headroom.ccr.context_tracker import (
+        PROACTIVE_EXPANSION_CLOSE_TAG,
+        PROACTIVE_EXPANSION_OPEN_TAG,
+    )
+
+    expansion = f"{PROACTIVE_EXPANSION_OPEN_TAG}\nexample\n{PROACTIVE_EXPANSION_CLOSE_TAG}"
+    tool_a = {
+        "type": "tool_result",
+        "tool_use_id": "A",
+        "content": "a",
+        "cache_control": {"type": "ephemeral"},
+    }
+    tool_b = {"type": "tool_result", "tool_use_id": "B", "content": "b"}
+    messages = [{"role": "user", "content": [tool_a, tool_b]}]
+    forwarded = AnthropicHandlerMixin._append_proactive_expansion_after_cached_prefix(
+        messages, expansion
+    )
+    content = forwarded[0]["content"]
+    assert [block.get("type") for block in content] == ["tool_result", "tool_result", "text"]
+    assert content[0] is tool_a and content[1] is tool_b and "cache_control" not in content[2]
+    assert AnthropicHandlerMixin._without_proactive_expansion_messages(forwarded) == messages
+    client = [
+        {
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "Explain this:"},
+                {"type": "text", "text": expansion},
+            ],
+        }
+    ]
+    assert AnthropicHandlerMixin._without_proactive_expansion_messages(client) == client
+
+
 def test_anthropic_image_compression_helper_only_rewrites_latest_eligible_turn() -> None:
     image_message = {
         "role": "user",
