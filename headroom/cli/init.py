@@ -144,7 +144,9 @@ def _local_profile(cwd: Path | None = None) -> str:
     slug = "".join(
         ch if (ch.isascii() and ch.isalnum()) or ch in "-._" else "-" for ch in root.name.lower()
     ).strip("-")
-    digest = sha1(str(root).encode("utf-8")).hexdigest()[:8]
+    # surrogateescape restores raw POSIX filename bytes (e.g. 0xff) that pathlib
+    # decoded lossily; valid UTF-8 names hash exactly as before.
+    digest = sha1(str(root).encode("utf-8", "surrogateescape")).hexdigest()[:8]
     return validate_profile_name(f"init-{slug or 'repo'}-{digest}")
 
 

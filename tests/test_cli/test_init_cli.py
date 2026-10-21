@@ -1723,6 +1723,31 @@ def test_local_profile_distinguishes_identical_non_ascii_names(monkeypatch, tmp_
     assert init_cli._local_profile(first) != init_cli._local_profile(second)
 
 
+@pytest.mark.skipif(os.name == "nt", reason="raw byte filenames are POSIX-only")
+def test_local_profile_handles_non_utf8_posix_directory_names(monkeypatch, tmp_path) -> None:
+    """A valid POSIX directory whose name is not UTF-8 must not crash ``hook ensure``.
+
+    ``pathlib`` surrogate-escapes the raw byte 0xff, and encoding that path
+    with ``str.encode("utf-8")`` raised UnicodeEncodeError. Distinct raw names
+    must still yield distinct profiles.
+    """
+    init_cli, _ = _load_init_module(monkeypatch)
+    first = tmp_path / os.fsdecode(b"proj-\xff-a")
+    second = tmp_path / os.fsdecode(b"proj-\xff-b")
+    try:
+        first.mkdir()
+        second.mkdir()
+    except OSError:
+        pytest.skip("filesystem does not allow non-UTF-8 directory names")
+
+    first_profile = init_cli._local_profile(first)
+    second_profile = init_cli._local_profile(second)
+
+    assert PROFILE_RE.fullmatch(first_profile), first_profile
+    assert PROFILE_RE.fullmatch(second_profile), second_profile
+    assert first_profile != second_profile
+
+
 def test_write_json_keeps_the_existing_file_when_the_write_fails(monkeypatch, tmp_path) -> None:
     """``init`` rewrites user-owned files such as ~/.claude/settings.json.
 
