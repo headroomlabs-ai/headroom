@@ -214,6 +214,27 @@ class TestEffectiveValues:
         assert lossless["runtime_override"] is False
         assert lossless["env_override"] is True
 
+    def test_schema_does_not_call_a_seeded_stored_value_an_env_override(
+        self, workspace, monkeypatch
+    ):
+        # Issue #4320: apply_to_environ seeds the stored value into os.environ at
+        # startup, which made the GUI's own saved setting look like an operator
+        # export and locked it. It is only an override when the value differs.
+        _clear_env(monkeypatch)
+        settings_store.save({"mode": "token"})
+
+        settings_store.apply_to_environ(settings_store.load())
+        field = next(
+            f for f in settings_store.to_schema()["fields"] if f["key"] == "mode"
+        )
+        assert field["env_override"] is False
+
+        monkeypatch.setenv("HEADROOM_MODE", "cache")
+        field = next(
+            f for f in settings_store.to_schema()["fields"] if f["key"] == "mode"
+        )
+        assert field["env_override"] is True
+
 
 class TestSecretMasking:
     def test_schema_and_stored_mask_secret(self, workspace, monkeypatch):

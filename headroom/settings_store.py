@@ -1079,6 +1079,12 @@ def to_schema(
     effective = {**environment_effective, **runtime}
     fields: list[dict[str, Any]] = []
     for field in SETTINGS:
+        # ``apply_to_environ`` seeds each stored value into its env var, so an
+        # env var that merely matches the stored value is the GUI's own value,
+        # not an operator export. Only a differing value is an override.
+        env_raw = os.environ.get(field.env)
+        seeded = stored.get(field.key)
+        seeded_env = _serialize(field, seeded) if seeded is not None else None
         fields.append(
             {
                 "key": field.key,
@@ -1094,7 +1100,8 @@ def to_schema(
                 "minimum": field.minimum,
                 "maximum": field.maximum,
                 "tier": field.tier,
-                "env_override": bool(os.environ.get(field.env))
+                "env_override": bool(env_raw)
+                and env_raw != seeded_env
                 and field.env not in env_override_exclusions,
                 "runtime_override": field.key in runtime
                 and runtime[field.key] != environment_effective[field.key],
