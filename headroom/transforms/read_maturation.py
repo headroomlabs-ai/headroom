@@ -153,6 +153,31 @@ class ReadMaturationManager:
         # once per session (content and marker are stable per tool call).
         self._replay_token_deltas: dict[str, int] = {}
 
+    def export_state(self) -> dict[str, Any]:
+        """Session state as JSON, for ``SessionTrackerStore.save_state``."""
+        return {
+            "matured": {k: [m.marker, m.ccr_hash] for k, m in self._matured.items()},
+            "booked": sorted(self._booked),
+            "deltas": self._replay_token_deltas,
+        }
+
+    @staticmethod
+    def validate_state(state: Any) -> dict[str, Any]:
+        """Normalize :meth:`export_state` output read from disk. Raises on a bad
+        shape, so a bad file is rejected at load and never inside a request."""
+        return {
+            "matured": {str(k): [str(m), str(h)] for k, (m, h) in state["matured"].items()},
+            "booked": [str(k) for k in state["booked"]],
+            "deltas": {str(k): int(v) for k, v in state["deltas"].items()},
+        }
+
+    def restore_state(self, state: dict[str, Any]) -> None:
+        """Adopt :meth:`validate_state` output from the previous process, so a
+        matured Read's removal is not booked again after a restart."""
+        self._matured = {k: MaturedRead(m, h) for k, (m, h) in state["matured"].items()}
+        self._booked = set(state["booked"])
+        self._replay_token_deltas = dict(state["deltas"])
+
     # ─── Per-request entry point ────────────────────────────────────────
 
     def apply(

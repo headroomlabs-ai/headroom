@@ -2351,13 +2351,17 @@ _EGRESS_ALLOWLIST: dict[str, tuple[int, str]] = {
         "calls guard_egress first.",
     ),
     "relevance/embedding.py": (
-        1,
+        2,
         "cache-only: the first of the two fastembed loads in "
         "_load_text_embedding runs with HF_HUB_OFFLINE forced to 1, so "
         "huggingface_hub resolves from the local cache or raises without "
         "opening a socket. The network retry directly below it calls "
         "guard_egress, which is why a pre-seeded air-gapped host still loads "
-        "the model and a cold one refuses instead of dialling.",
+        "the model and a cold one refuses instead of dialling. The load in "
+        "_load_default_model runs under the same forced HF_HUB_OFFLINE and "
+        "passes specific_model_path, which fastembed loads without any Hub "
+        "lookup; its files come through hf_hub_download_local_first, guarded "
+        "on the miss.",
     ),
 }
 
