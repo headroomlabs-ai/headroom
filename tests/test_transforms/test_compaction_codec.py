@@ -15,6 +15,8 @@ from __future__ import annotations
 
 import json
 
+import pytest
+
 from headroom.transforms.compaction_codec import (
     contains_removal_marker,
     expand_compacted,
@@ -201,3 +203,26 @@ def test_single_column_null_survives_value_factoring() -> None:
     factored = factor_values(block)
     assert expand_compacted(factored) == expand_compacted(block)
     assert expand_compacted(factored) == [{"k": "x"}, {"k": "y"}, {"k": None}]
+
+
+@pytest.mark.parametrize(
+    "legend",
+    [
+        '["first","last"]',  # negative index would wrap to Python's last element
+        '"abc"',  # string legend would be indexed by character
+        "42",  # scalar legend cannot be indexed
+        '{"a":"x"}',  # object legend cannot be indexed by integer
+    ],
+)
+def test_dictionary_reference_rejects_negative_index_and_non_array_legend(legend: str) -> None:
+    index = "-1" if legend.startswith("[") else "0"
+    assert expand_compacted(f"[1]{{tag:string}} __dict:1\n@tag={legend}\n{index}\n") is None
+
+
+def test_quoted_negative_number_and_valid_dictionary_bounds_still_decode() -> None:
+    legend = '@tag=["first","last"]'
+    assert expand_compacted(f"[2]{{tag:string}} __dict:1\n{legend}\n0\n1\n") == [
+        {"tag": "first"},
+        {"tag": "last"},
+    ]
+    assert expand_compacted(f'[1]{{tag:string}} __dict:1\n{legend}\n"-1"\n') == [{"tag": "-1"}]
