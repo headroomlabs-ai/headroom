@@ -11,6 +11,7 @@ import asyncio
 import contextlib
 import json
 import logging
+import math
 import sys
 from pathlib import Path
 from types import SimpleNamespace
@@ -2372,3 +2373,197 @@ async def test_ws_session_metrics_track_model_per_response_create():
         "model-a",
         "model-b",
     ]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("usage", "expected"),
+    [({"input_tokens": 10, "output_tokens": 1}, [("ws_fold", True)]), (None, [])],
+    ids=["billed", "usage_less"],
+)
+async def test_ws_turn_hook_savings_reach_the_turn_outcome(usage, expected):
+    """A turn hook's savings on a Codex WS turn must reach that turn's outcome.
+
+    The WS path compressed without ``savings_tags``, so ``ctx.record_savings``
+    wrote into a throwaway dict and ``/stats`` never saw the attribution. A turn
+    with no input usage books nothing, the same gate as its headline savings.
+    """
+    from headroom.proxy.savings_attribution import from_tags
+    from headroom.proxy.turn_hooks import clear_turn_hooks, register_turn_hook
+
+    class _DropOldInput:
+        name = "drop_old_input"
+        savings_source = "ws_fold"
+        stream_safe = True
+
+        def on_request(self, ctx: SimpleNamespace) -> None:
+            del ctx.messages[:-1]
+
+    first = json.dumps(
+        {
+            "type": "response.create",
+            "response": {
+                "model": "gpt-5.4",
+                "input": [
+                    {"type": "message", "role": "user", "content": "old " * 50},
+                    {"type": "message", "role": "user", "content": "new"},
+                ],
+            },
+        }
+    )
+    upstream = _FakeUpstream(
+        [
+            json.dumps({"type": "response.created", "response": {"id": "r_1"}}),
+            json.dumps(
+                {
+                    "type": "response.completed",
+                    "response": {"id": "r_1", **({"usage": usage} if usage else {})},
+                }
+            ),
+        ]
+    )
+    client_ws = _FakeWebSocket(frames=[first])
+    handler = _DummyOpenAIHandler()
+    handler.config.optimize = True
+    outcomes = []
+
+    async def _record_request_outcome(outcome):
+        outcomes.append(outcome)
+
+    handler._record_request_outcome = _record_request_outcome
+
+    clear_turn_hooks()
+    register_turn_hook(_DropOldInput())
+    try:
+        with patch.dict(sys.modules, {"websockets": _make_fake_websockets_module(upstream)}):
+            await handler.handle_openai_responses_ws(client_ws)
+    finally:
+        clear_turn_hooks()
+
+    sent = json.loads(upstream.sent[0])["response"]["input"]
+    assert [item["content"] for item in sent] == ["new"]  # the hook really ran
+    rows = [row for outcome in outcomes for row in from_tags(outcome.tags)]
+    assert [(row["source"], row["realized"]) for row in rows] == expected
+    assert all(row["tokens"] > 0 for row in rows)
+
+
+class _UpstreamAfterSends(_FakeUpstream):
+    """Streams its events only once ``sends`` frames reached it, so every frame's
+    savings are pending before the one usage-carrying outcome claims them."""
+
+    def __init__(self, events: list[str], *, sends: int) -> None:
+        super().__init__(events)
+        self._sends = sends
+
+    async def _iter(self):
+        while len(self.sent) < self._sends:
+            await asyncio.sleep(0)
+        for ev in self._events:
+            yield ev
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("sources_per_frame", "frames_n", "expected_rows", "overflowed"),
+    [
+        (lambda i: "tool_search", 33, 2, False),
+        (lambda i: f"src{i}", 33, 34, False),
+        # ws_fold + 255 named sources fill MAX_NAMED_ROWS; the other 45 share one row.
+        (lambda i: f"src{i}", 300, 257, True),
+    ],
+    ids=["repeated_source", "distinct_sources", "distinct_sources_past_the_bound"],
+)
+async def test_ws_pending_savings_beyond_32_rows_are_all_booked(
+    sources_per_frame, frames_n, expected_rows, overflowed
+):
+    """Pending frames hand every token and every event to the billed turn.
+
+    Rows coalesce to one per (source, realized, estimated) key; distinct
+    sources past ``MAX_NAMED_ROWS`` fold into ``other`` rather than growing
+    the session's pending list without bound.
+    """
+    from headroom.proxy.prometheus_metrics import PrometheusMetrics
+    from headroom.proxy.savings_attribution import SAVINGS_ATTRIBUTION_TAG, from_tags
+    from headroom.proxy.turn_hooks import clear_turn_hooks, register_turn_hook
+
+    seen = {"frame": 0}
+
+    class _DeferTools:
+        name = "defer_tools"
+        savings_source = "ws_fold"
+        stream_safe = True
+
+        def on_request(self, ctx: SimpleNamespace) -> None:
+            del ctx.messages[:-1]
+            ctx.record_savings(sources_per_frame(seen["frame"]), tokens=100, usd=0.01)
+            seen["frame"] += 1
+
+    def _frame(i: int) -> str:
+        return json.dumps(
+            {
+                "type": "response.create",
+                "response": {
+                    "model": "gpt-5.4",
+                    "input": [
+                        {"type": "message", "role": "user", "content": f"old {i} " * 50},
+                        {"type": "message", "role": "user", "content": f"new {i}"},
+                    ],
+                },
+            }
+        )
+
+    upstream = _UpstreamAfterSends(
+        [
+            json.dumps({"type": "response.created", "response": {"id": "r_1"}}),
+            json.dumps(
+                {
+                    "type": "response.completed",
+                    "response": {
+                        "id": "r_1",
+                        "usage": {"input_tokens": 10, "output_tokens": 1},
+                    },
+                }
+            ),
+        ],
+        sends=frames_n,
+    )
+    client_ws = _FakeWebSocket(frames=[_frame(i) for i in range(frames_n)])
+    handler = _DummyOpenAIHandler()
+    handler.config.optimize = True
+    outcomes = []
+
+    async def _record_request_outcome(outcome):
+        outcomes.append(outcome)
+
+    handler._record_request_outcome = _record_request_outcome
+
+    clear_turn_hooks()
+    register_turn_hook(_DeferTools())
+    try:
+        with patch.dict(sys.modules, {"websockets": _make_fake_websockets_module(upstream)}):
+            await handler.handle_openai_responses_ws(client_ws)
+    finally:
+        clear_turn_hooks()
+
+    assert len(upstream.sent) == frames_n
+    assert seen["frame"] == frames_n
+    metrics = PrometheusMetrics()
+    stored = []
+    for outcome in outcomes:
+        rows = from_tags(outcome.tags)
+        stored.append(len(outcome.tags.get(SAVINGS_ATTRIBUTION_TAG, [])))
+        await metrics.record_request(
+            provider="openai",
+            model="gpt-5.4",
+            input_tokens=10,
+            output_tokens=1,
+            tokens_saved=0,
+            latency_ms=1.0,
+            savings_attribution=rows,
+        )
+    hook_rows = [row for row in metrics.savings_by_source.values() if row["source"] != "ws_fold"]
+    assert sum(int(row["tokens"]) for row in hook_rows) == 100 * frames_n
+    assert sum(int(row["events"]) for row in hook_rows) == frames_n
+    assert math.isclose(sum(float(row["usd"]) for row in hook_rows), 0.01 * frames_n)
+    assert ("other" in {row["source"] for row in hook_rows}) is overflowed
+    assert stored == [expected_rows]

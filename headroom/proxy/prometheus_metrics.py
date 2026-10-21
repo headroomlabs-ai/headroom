@@ -22,6 +22,7 @@ if TYPE_CHECKING:
 
 from headroom import savings_ledger
 from headroom.observability import get_otel_metrics
+from headroom.proxy.savings_attribution import event_count
 from headroom.proxy.savings_tracker import SavingsTracker, estimate_request_savings_usd
 
 logger = logging.getLogger("headroom.proxy")
@@ -654,6 +655,24 @@ class PrometheusMetrics:
         if saved > 0:
             self.extension_savings[key] += saved
 
+    def extension_savings_by_source(self) -> dict[str, int]:
+        """Measured savings per source, as ``/stats`` reports ``extension_savings``.
+
+        Realized savings attribution rows (``ctx.record_savings`` from a turn
+        hook, ``record_scope_savings``) plus ``record_extension_savings`` totals.
+        A source reported through both APIs (``headroom-hdr`` does, per request)
+        shows the larger of the two totals rather than their sum: nothing ties an
+        attribution row to a ``record_extension_savings`` call, so summing would
+        double-count it. Estimated rows (``realized=False``) stay in
+        ``savings.by_source`` only.
+        """
+        out = dict(self.extension_savings)
+        for row in list(self.savings_by_source.values()):
+            source, tokens = str(row["source"]), int(row["tokens"])
+            if row["realized"] and tokens > out.get(source, 0):
+                out[source] = tokens
+        return out
+
     def record_compression_failed(self, reason: str) -> None:
         """Record one fail-open compression failure, bucketed by ``reason``.
 
@@ -970,7 +989,7 @@ class PrometheusMetrics:
                         "usd": 0.0,
                     },
                 )
-                row["events"] = int(row["events"]) + 1
+                row["events"] = int(row["events"]) + event_count(item)
                 row["tokens"] = int(row["tokens"]) + max(0, int(item.get("tokens", 0) or 0))
                 row["usd"] = round(
                     float(row["usd"]) + float(item.get("usd", 0.0) or 0.0),
