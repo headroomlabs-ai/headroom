@@ -117,7 +117,7 @@ def test_nothing_to_do_returns_the_same_list() -> None:
     assert mirror_client_message_cache_control(messages, client) is messages
 
 
-def test_block_level_markers_are_left_to_the_block_normalizer() -> None:
+def test_block_markers_already_where_the_client_put_them_are_left_alone() -> None:
     block = {"type": "text", "text": "x", "cache_control": CC}
     client = [{"role": "user", "content": [dict(block)]}]
     messages = [{"role": "user", "content": [dict(block)]}]

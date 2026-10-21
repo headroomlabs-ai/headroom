@@ -4169,11 +4169,10 @@ class OpenAIHandlerMixin:
 
         # Both replays above forward earlier turns' messages byte-identical,
         # including the cache_control each carried back then. Chat Completions
-        # clients mark the message dict and an assistant's tool_calls, which the
-        # block-level normalizer does not see, so without this the markers
-        # accumulate turn over turn and an Anthropic-backed gateway rejects the
-        # request (more than four breakpoints). Content is untouched: only the
-        # markers move.
+        # clients mark the message dict, an assistant's tool_calls and content
+        # blocks, so without this the markers accumulate turn over turn and an
+        # Anthropic-backed gateway rejects the request (more than four
+        # breakpoints). Only the markers move; every other byte stays replayed.
         from headroom.cache.prefix_tracker import mirror_client_message_cache_control
 
         optimized_messages = mirror_client_message_cache_control(
