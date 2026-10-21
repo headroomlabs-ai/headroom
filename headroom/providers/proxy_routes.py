@@ -498,15 +498,35 @@ def register_provider_routes(app: FastAPI, proxy: Any) -> None:
             VERTEX_STREAM_RAW_PREDICT.name,
         )
 
-    @app.get("/v1/models")
-    async def list_models(request: Request):
-        headers = dict(request.headers)
-        provider_name = proxy.provider_runtime.model_metadata_provider(headers)
+    async def _model_metadata_base_url(headers: dict[str, str], provider_name: str) -> str:
+        """Resolve the upstream for a model-metadata route.
+
+        An OpenAI-compatible client can name its own upstream with
+        ``x-headroom-base-url``, the same way the chat and responses
+        handlers do. Without it the discovery call went to the proxy's
+        default OpenAI upstream, so a custom provider's models were never
+        listed and the client saw a 401 instead of its model list
+        (#4302).
+        """
         base_url = (
             _openai_compatible_base_url(proxy, headers)
             if provider_name == "openai"
             else _api_target(proxy, provider_name)
         )
+        if provider_name == "openai":
+            custom_base = headers.get("x-headroom-base-url", "").strip()
+            if custom_base:
+                if not await is_safe_upstream_url_async(custom_base):
+                    logger.warning("rejecting unsafe x-headroom-base-url: %r", custom_base)
+                else:
+                    base_url = custom_base.rstrip("/")
+        return base_url
+
+    @app.get("/v1/models")
+    async def list_models(request: Request):
+        headers = dict(request.headers)
+        provider_name = proxy.provider_runtime.model_metadata_provider(headers)
+        base_url = await _model_metadata_base_url(headers, provider_name)
         return await handle_model_metadata_endpoint(
             proxy,
             request,
@@ -519,11 +539,7 @@ def register_provider_routes(app: FastAPI, proxy: Any) -> None:
     async def get_model(request: Request, model_id: str):
         headers = dict(request.headers)
         provider_name = proxy.provider_runtime.model_metadata_provider(headers)
-        base_url = (
-            _openai_compatible_base_url(proxy, headers)
-            if provider_name == "openai"
-            else _api_target(proxy, provider_name)
-        )
+        base_url = await _model_metadata_base_url(headers, provider_name)
         return await handle_model_metadata_endpoint(
             proxy,
             request,

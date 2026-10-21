@@ -1409,3 +1409,66 @@ def test_anthropic_messages_strips_ansi_model_id_before_upstream() -> None:
 
     assert response.status_code == 200
     assert fake_http_client.bodies[0]["model"] == "claude-opus-4-8"
+
+
+def test_model_metadata_routes_honor_the_custom_base_url(monkeypatch) -> None:
+    # A client that names its own upstream must get its model list from that
+    # upstream, not from the proxy's default OpenAI one: the chat and
+    # responses handlers already honor the header (#4302).
+    monkeypatch.setenv("HEADROOM_ALLOWED_BASE_URLS", "custom.example")
+    calls: list[tuple[str, str, str]] = []
+
+    async def fake_passthrough(self, request, base_url, sub_path="", provider_name=""):  # type: ignore[no-untyped-def]
+        calls.append((request.url.path, base_url, provider_name))
+        return JSONResponse(
+            {
+                "path": request.url.path,
+                "base_url": base_url,
+                "sub_path": sub_path,
+                "provider": provider_name,
+            }
+        )
+
+    monkeypatch.setattr(HeadroomProxy, "handle_passthrough", fake_passthrough)
+
+    with TestClient(_app()) as client:
+        listed = client.get(
+            "/v1/models",
+            headers={"x-headroom-base-url": "https://custom.example"},
+        )
+        fetched = client.get(
+            "/v1/models/gpt-5",
+            headers={"x-headroom-base-url": "https://custom.example/"},
+        )
+
+    assert listed.json()["base_url"] == "https://custom.example"
+    assert fetched.json()["base_url"] == "https://custom.example"
+    assert calls[0][2] == "openai"
+
+
+def test_model_metadata_routes_reject_an_unsafe_custom_base_url(monkeypatch) -> None:
+    # A client-named upstream goes through the same SSRF guard as the other
+    # routes: an unsafe one is ignored and the configured upstream is used.
+    monkeypatch.setenv("HEADROOM_ALLOWED_BASE_URLS", "custom.example")
+    calls: list[tuple[str, str, str]] = []
+
+    async def fake_passthrough(self, request, base_url, sub_path="", provider_name=""):  # type: ignore[no-untyped-def]
+        calls.append((request.url.path, base_url, provider_name))
+        return JSONResponse(
+            {
+                "path": request.url.path,
+                "base_url": base_url,
+                "sub_path": sub_path,
+                "provider": provider_name,
+            }
+        )
+
+    monkeypatch.setattr(HeadroomProxy, "handle_passthrough", fake_passthrough)
+
+    with TestClient(_app()) as client:
+        unsafe = client.get(
+            "/v1/models",
+            headers={"x-headroom-base-url": "http://169.254.169.254"},
+        )
+
+    assert unsafe.json()["base_url"] == "https://api.openai.test"
