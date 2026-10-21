@@ -91,9 +91,10 @@ Use 'auto' (default) to scan all detected agents."""
     "--target",
     type=str,
     default=None,
-    help="Override the context file learnings are written to (Claude Code only). "
-    "Path is relative to the project root, or absolute. Defaults to CLAUDE.local.md "
-    "(personal, gitignored). Pass CLAUDE.md to write to the team-shared file instead.",
+    help="Override the context file learnings are written to (Claude Code and Gemini/"
+    "Antigravity). Path is relative to the project root, or absolute. Defaults to "
+    "CLAUDE.local.md (personal, gitignored) for Claude Code and GEMINI.md for Gemini. "
+    "Pass CLAUDE.md to write to the team-shared file instead.",
 )
 @click.option(
     "--agent",
