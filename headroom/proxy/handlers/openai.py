@@ -3538,6 +3538,7 @@ class OpenAIHandlerMixin:
             "reasoning_effort": body.get("reasoning_effort"),
             "verbosity": body.get("verbosity"),
             "modalities": body.get("modalities"),
+            "audio": body.get("audio"),
         }
         # Snapshot the lookup messages too. `messages` is the primary cache
         # key component, but the pre_compress hook below reassigns it, so

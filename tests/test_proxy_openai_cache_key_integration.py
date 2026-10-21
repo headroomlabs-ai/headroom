@@ -64,6 +64,24 @@ def _content(response: httpx.Response) -> str:
         ("tool_choice", "auto", "none"),
         ("seed", 1, 2),
         ("reasoning_effort", "low", "high"),
+        pytest.param(
+            "audio",
+            {"voice": "alloy", "format": "wav"},
+            {"voice": "echo", "format": "mp3"},
+            id="audio-voice-and-format",
+        ),
+        pytest.param(
+            "audio",
+            {"voice": "alloy", "format": "wav"},
+            {"voice": "echo", "format": "wav"},
+            id="audio-voice-only",
+        ),
+        pytest.param(
+            "audio",
+            {"voice": "alloy", "format": "wav"},
+            {"voice": "alloy", "format": "mp3"},
+            id="audio-format-only",
+        ),
     ],
 )
 def test_openai_differing_field_not_served_from_cache(field, a, b) -> None:
