@@ -2269,6 +2269,24 @@ def _serena_inline_comment(rest: str) -> str:
     return " " + body
 
 
+def _serena_root_indent(text: str) -> str:
+    """Return the indentation of the root mapping.
+
+    YAML allows every root key to share an indent, so column 0 is not the
+    test. The root indent is the shortest leading whitespace on a non-empty,
+    non-comment line. A deeper line belongs to a nested block.
+    """
+    root: str | None = None
+    for line in text.splitlines():
+        stripped = line.lstrip(" \t")
+        if not stripped or stripped.startswith("#"):
+            continue
+        indent = line[: len(line) - len(stripped)]
+        if root is None or len(indent) < len(root):
+            root = indent
+    return root or ""
+
+
 def _ensure_serena_dashboard_disabled(*, verbose: bool = False) -> None:
     """Disable Serena's browser dashboard auto-open in ``~/.serena/serena_config.yml``.
 
@@ -2310,11 +2328,13 @@ def _ensure_serena_dashboard_disabled(*, verbose: bool = False) -> None:
     with ruamel in duplicate-key-strict mode, so every later startup died with
     ``DuplicateKeyError`` before the MCP handshake ("Connection closed").
 
-    The edit only ever touches a *top-level* (column-0) occurrence of the key.
-    An indented one belongs to a different mapping (e.g. a nested
-    ``extension:`` block that happens to reuse the name) and is left alone —
-    both when rewriting the value and when dropping duplicates, so it can
-    never be mistaken for, or merged with, Serena's real setting.
+    The edit only touches the key at the root mapping's indent. YAML allows
+    that mapping to be indented as a whole, so column 0 is not the test: the
+    root indent is the shortest indent of a non-comment line. A deeper
+    occurrence belongs to a nested mapping (e.g. an ``extension:`` block that
+    reuses the name) and is left alone — both when rewriting the value and
+    when dropping duplicates, so it can never be mistaken for, or merged
+    with, Serena's real setting.
     """
     import re
 
@@ -2340,15 +2360,17 @@ def _ensure_serena_dashboard_disabled(*, verbose: bool = False) -> None:
     # (keeping any inline comment) and drop redundant copies, so configs an
     # older Headroom already broke are repaired rather than re-broken.
     #
-    # Anchored with no leading whitespace: only a column-0 occurrence of the
-    # key is this top-level setting. An indented one belongs to a different
-    # mapping and must not be rewritten or deduplicated against.
+    # Match the key only at the root mapping's indent, and keep that indent
+    # when rewriting or appending. A root mapping indented as a whole is still
+    # the top-level mapping; appending a column-0 key beside it makes the file
+    # unparsable. A deeper occurrence is a different mapping.
     #
     # The pattern only recognizes the key line. ``_serena_inline_comment``
     # decides what to keep from the remainder, so a ``#`` flush against the
     # colon still matches and is preserved instead of leaving the line in
     # place and appending a second copy of the key.
-    dashboard = re.compile(rf"^{re.escape(key)}:[ \t]*(.*)$")
+    indent = _serena_root_indent(text)
+    dashboard = re.compile(rf"^{re.escape(indent)}{re.escape(key)}:[ \t]*(.*)$")
     lines: list[str] = []
     rewritten = False
     for line in text.splitlines(keepends=True):
@@ -2362,15 +2384,15 @@ def _ensure_serena_dashboard_disabled(*, verbose: bool = False) -> None:
         rewritten = True
         comment = _serena_inline_comment(match.group(1))
         ending = "\n" if line.endswith(("\n", "\r")) else ""
-        lines.append(f"{key}: false{comment}{ending}")
+        lines.append(f"{indent}{key}: false{comment}{ending}")
     if rewritten:
         new = "".join(lines)
     else:
-        appended.append(f"{key}: false")
+        appended.append(f"{indent}{key}: false")
 
     # Repair a config left by an affected Headroom version (see #2674 above).
     if not re.search(r"^\s*projects\s*:", new, re.MULTILINE):
-        appended.append("projects: []")
+        appended.append(f"{indent}projects: []")
 
     if appended:
         body = new.rstrip("\n")

@@ -209,12 +209,39 @@ def test_serena_dashboard_disabled_repairs_duplicate_keys(tmp_path, monkeypatch)
     assert cfg.read_text() == first
 
 
-def test_serena_dashboard_disabled_ignores_nested_key(tmp_path, monkeypatch) -> None:
-    """Only the column-0 key is Serena's setting; an indented one is not.
+def test_serena_dashboard_disabled_keeps_indented_root_mapping(tmp_path, monkeypatch) -> None:
+    """A root mapping indented as a whole is still the top-level mapping.
 
-    A line edit that matches the key name regardless of indentation can
-    rewrite an unrelated nested mapping's key, and can mistake it for a
-    duplicate of the real top-level setting and delete the real one.
+    Rewriting only a column-0 key misses this setting and appends another
+    at column 0. YAML then rejects the file: expected a document start, but
+    found a block mapping start.
+    """
+    import yaml
+
+    monkeypatch.setenv("HOME", str(tmp_path))
+    cfg = tmp_path / ".serena" / "serena_config.yml"
+    cfg.parent.mkdir(parents=True)
+    cfg.write_text("  projects: []\n  web_dashboard_open_on_launch: true\n")
+
+    wrap._ensure_serena_dashboard_disabled()
+
+    text = cfg.read_text()
+    assert "  web_dashboard_open_on_launch: false\n" in text
+    assert "\nweb_dashboard_open_on_launch:" not in text
+    parsed = yaml.safe_load(text)
+    assert parsed["web_dashboard_open_on_launch"] is False
+    assert parsed["projects"] == []
+
+    first = text
+    wrap._ensure_serena_dashboard_disabled()
+    assert cfg.read_text() == first
+
+
+def test_serena_dashboard_disabled_ignores_nested_key(tmp_path, monkeypatch) -> None:
+    """A key nested under another mapping is not Serena's setting.
+
+    The root key in this file is at column 0. The indented copy belongs to
+    ``extension`` and must not be rewritten or dropped as a duplicate.
     """
     import yaml
 
@@ -232,6 +259,36 @@ def test_serena_dashboard_disabled_ignores_nested_key(tmp_path, monkeypatch) -> 
 
     text = cfg.read_text()
     assert "  web_dashboard_open_on_launch: true\n" in text, "nested key must be left untouched"
+    parsed = yaml.safe_load(text)
+    assert parsed["web_dashboard_open_on_launch"] is False
+    assert parsed["extension"]["web_dashboard_open_on_launch"] is True
+
+    first = text
+    wrap._ensure_serena_dashboard_disabled()
+    assert cfg.read_text() == first
+
+
+def test_serena_dashboard_disabled_ignores_nested_key_under_indented_root(
+    tmp_path, monkeypatch
+) -> None:
+    """A deeper key stays nested when the root mapping itself is indented."""
+    import yaml
+
+    monkeypatch.setenv("HOME", str(tmp_path))
+    cfg = tmp_path / ".serena" / "serena_config.yml"
+    cfg.parent.mkdir(parents=True)
+    cfg.write_text(
+        "  extension:\n"
+        "    web_dashboard_open_on_launch: true\n"
+        "  web_dashboard_open_on_launch: true\n"
+        "  projects: []\n"
+    )
+
+    wrap._ensure_serena_dashboard_disabled()
+
+    text = cfg.read_text()
+    assert "    web_dashboard_open_on_launch: true\n" in text
+    assert "  web_dashboard_open_on_launch: false\n" in text
     parsed = yaml.safe_load(text)
     assert parsed["web_dashboard_open_on_launch"] is False
     assert parsed["extension"]["web_dashboard_open_on_launch"] is True
