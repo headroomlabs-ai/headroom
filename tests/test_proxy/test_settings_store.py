@@ -29,6 +29,17 @@ def _clear_env(monkeypatch):
 
 
 class TestRoundTrip:
+    def test_save_creates_parent_for_settings_path_override(self, workspace, monkeypatch):
+        target = workspace / "separate config" / "nested" / "settings.json"
+        monkeypatch.setenv(paths.HEADROOM_SETTINGS_PATH_ENV, str(target))
+        assert not target.parent.exists()
+
+        settings_store.save({"mode": "token"})
+
+        assert json.loads(target.read_text(encoding="utf-8")) == {"mode": "token"}
+        assert settings_store.load() == {"mode": "token"}
+        assert not list(target.parent.glob("*.tmp"))
+
     def test_save_then_load_coerces_types(self, workspace, monkeypatch):
         _clear_env(monkeypatch)
         settings_store.save(
