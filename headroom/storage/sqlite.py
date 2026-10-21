@@ -35,50 +35,61 @@ class SQLiteStorage(Storage):
 
         conn = sqlite3.connect(self.db_path)
         try:
-            cursor = conn.cursor()
-            cursor.execute("""
-                CREATE TABLE IF NOT EXISTS requests (
-                    id TEXT PRIMARY KEY,
-                    timestamp TEXT NOT NULL,
-                    model TEXT NOT NULL,
-                    stream INTEGER NOT NULL,
-                    mode TEXT NOT NULL,
-                    tokens_input_before INTEGER NOT NULL,
-                    tokens_input_after INTEGER NOT NULL,
-                    tokens_output INTEGER,
-                    block_breakdown TEXT NOT NULL,
-                    waste_signals TEXT NOT NULL,
-                    stable_prefix_hash TEXT,
-                    cache_alignment_score REAL,
-                    cached_tokens INTEGER,
-                    transforms_applied TEXT NOT NULL,
-                    tool_units_dropped INTEGER DEFAULT 0,
-                    turns_dropped INTEGER DEFAULT 0,
-                    messages_hash TEXT,
-                    error TEXT
-                )
-            """)
-
-            # Create indices
-            cursor.execute("""
-                CREATE INDEX IF NOT EXISTS idx_timestamp ON requests(timestamp)
-            """)
-            cursor.execute("""
-                CREATE INDEX IF NOT EXISTS idx_model ON requests(model)
-            """)
-            cursor.execute("""
-                CREATE INDEX IF NOT EXISTS idx_mode ON requests(mode)
-            """)
-
-            conn.commit()
+            self._create_schema(conn)
         finally:
             conn.close()
+
+    @staticmethod
+    def _create_schema(conn: sqlite3.Connection) -> None:
+        """Create the requests table and its indices on ``conn`` if missing.
+
+        Must run on every connection that serves requests: a ``:memory:`` or
+        temporary database exists only for the connection that created it.
+        """
+        cursor = conn.cursor()
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS requests (
+                id TEXT PRIMARY KEY,
+                timestamp TEXT NOT NULL,
+                model TEXT NOT NULL,
+                stream INTEGER NOT NULL,
+                mode TEXT NOT NULL,
+                tokens_input_before INTEGER NOT NULL,
+                tokens_input_after INTEGER NOT NULL,
+                tokens_output INTEGER,
+                block_breakdown TEXT NOT NULL,
+                waste_signals TEXT NOT NULL,
+                stable_prefix_hash TEXT,
+                cache_alignment_score REAL,
+                cached_tokens INTEGER,
+                transforms_applied TEXT NOT NULL,
+                tool_units_dropped INTEGER DEFAULT 0,
+                turns_dropped INTEGER DEFAULT 0,
+                messages_hash TEXT,
+                error TEXT
+            )
+        """)
+
+        # Create indices
+        cursor.execute("""
+            CREATE INDEX IF NOT EXISTS idx_timestamp ON requests(timestamp)
+        """)
+        cursor.execute("""
+            CREATE INDEX IF NOT EXISTS idx_model ON requests(model)
+        """)
+        cursor.execute("""
+            CREATE INDEX IF NOT EXISTS idx_mode ON requests(mode)
+        """)
+
+        conn.commit()
 
     def _get_conn(self) -> sqlite3.Connection:
         """Get or create connection."""
         if self._conn is None:
-            self._conn = sqlite3.connect(self.db_path)
-            self._conn.row_factory = sqlite3.Row
+            conn = sqlite3.connect(self.db_path)
+            self._create_schema(conn)
+            conn.row_factory = sqlite3.Row
+            self._conn = conn
         return self._conn
 
     def save(self, metrics: RequestMetrics) -> None:

@@ -96,6 +96,28 @@ class TestSQLiteStorageInit:
             assert db_path.exists()
             storage.close()
 
+    @pytest.mark.parametrize("db_path", [":memory:", ""], ids=["memory", "temporary"])
+    def test_volatile_store_has_schema_before_first_save(self, db_path, sample_request_metrics):
+        """Volatile databases must be usable from the first call, not only after the constructor."""
+        storage = SQLiteStorage(db_path)
+        try:
+            storage.save(sample_request_metrics)
+            assert storage.get(sample_request_metrics.request_id) == sample_request_metrics
+            assert storage.count() == 1
+        finally:
+            storage.close()
+
+    def test_volatile_store_reinitializes_schema_after_close(self, sample_request_metrics):
+        """Closing a volatile store discards its rows, but the reopened store still has a schema."""
+        storage = SQLiteStorage(":memory:")
+        storage.save(sample_request_metrics)
+        storage.close()
+
+        assert storage.get(sample_request_metrics.request_id) is None
+        storage.save(sample_request_metrics)
+        assert storage.get(sample_request_metrics.request_id) == sample_request_metrics
+        storage.close()
+
 
 class TestSave:
     """Tests for SQLiteStorage.save method."""
