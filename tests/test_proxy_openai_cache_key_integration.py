@@ -64,29 +64,46 @@ def _content(response: httpx.Response) -> str:
         ("tool_choice", "auto", "none"),
         ("seed", 1, 2),
         ("reasoning_effort", "low", "high"),
+    ],
+)
+def test_openai_differing_field_not_served_from_cache(field, a, b) -> None:
+    """A and B share messages and differ only in ``field``; B must not be served
+    A's cached response, and a repeat of A must hit the cache."""
+    _assert_not_served_from_cache({field: a}, {field: b})
+
+
+_AUDIO_MODALITIES = {"modalities": ["text", "audio"]}
+
+
+@pytest.mark.parametrize(
+    "a,b",
+    [
         pytest.param(
-            "audio",
             {"voice": "alloy", "format": "wav"},
             {"voice": "echo", "format": "mp3"},
             id="audio-voice-and-format",
         ),
         pytest.param(
-            "audio",
             {"voice": "alloy", "format": "wav"},
             {"voice": "echo", "format": "wav"},
             id="audio-voice-only",
         ),
         pytest.param(
-            "audio",
             {"voice": "alloy", "format": "wav"},
             {"voice": "alloy", "format": "mp3"},
             id="audio-format-only",
         ),
     ],
 )
-def test_openai_differing_field_not_served_from_cache(field, a, b) -> None:
-    """A and B share messages and differ only in ``field``; B must not be served
-    A's cached response, and a repeat of A must hit the cache."""
+def test_openai_audio_config_not_served_from_cache(a, b) -> None:
+    """Audio requests (``modalities`` includes ``audio``) that differ only in
+    voice and/or format must not share a cached audio response."""
+    _assert_not_served_from_cache(
+        {**_AUDIO_MODALITIES, "audio": a}, {**_AUDIO_MODALITIES, "audio": b}
+    )
+
+
+def _assert_not_served_from_cache(extra_a: dict, extra_b: dict) -> None:
     calls = {"n": 0}
 
     with _make_cached_proxy_client() as client:
@@ -113,22 +130,22 @@ def test_openai_differing_field_not_served_from_cache(field, a, b) -> None:
         proxy._retry_request = _fake_retry
         headers = {"authorization": "Bearer test-key"}
 
-        # A: field=a -> upstream call 1, cached under A's key.
-        ra = client.post("/v1/chat/completions", headers=headers, json=_body(**{field: a}))
+        # A: extra_a -> upstream call 1, cached under A's key.
+        ra = client.post("/v1/chat/completions", headers=headers, json=_body(**extra_a))
         assert ra.status_code == 200
         assert _content(ra) == "resp-1"
         assert calls["n"] == 1
 
-        # B: field=b, SAME messages -> must reach the upstream again, not be
+        # B: extra_b, SAME messages -> must reach the upstream again, not be
         # served A's cached response. With the field missing from the key, B
         # collided with A and calls stayed 1 (the bug this guards).
-        rb = client.post("/v1/chat/completions", headers=headers, json=_body(**{field: b}))
+        rb = client.post("/v1/chat/completions", headers=headers, json=_body(**extra_b))
         assert rb.status_code == 200
         assert _content(rb) == "resp-2"
         assert calls["n"] == 2
 
         # A again -> served from cache, upstream NOT called.
-        ra2 = client.post("/v1/chat/completions", headers=headers, json=_body(**{field: a}))
+        ra2 = client.post("/v1/chat/completions", headers=headers, json=_body(**extra_a))
         assert ra2.status_code == 200
         assert _content(ra2) == "resp-1"
         assert calls["n"] == 2
