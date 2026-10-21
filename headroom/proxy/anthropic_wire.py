@@ -23,6 +23,7 @@ from dataclasses import dataclass, field, replace
 from typing import Any
 
 from headroom.copilot_auth import build_copilot_upstream_url
+from headroom.proxy.sse_byte_buffer_policy import UTF8_BOM
 
 _DANGEROUS_TOOL_USE_RE = re.compile(r"(?:^|,)\s*dangerous-tool-use-[^,\s]+", re.IGNORECASE)
 # Members of each known event (and delta type) that reconstruction interprets.
@@ -169,6 +170,19 @@ def _split_frames(raw: bytes) -> list[bytes]:
     if raw[start:].strip():
         frames.append(raw[start:])
     return frames
+
+
+def _stream_frames(raw_sse_bytes: bytes) -> list[_SSEFrame]:
+    """Frame a closed stream, decoding past a leading UTF-8 BOM on the first frame.
+
+    The BOM stays on the first frame's raw bytes so opaque replay is byte-identical.
+    """
+
+    has_bom = raw_sse_bytes.startswith(UTF8_BOM)
+    return [
+        _SSEFrame(raw, *_json_payload(raw[len(UTF8_BOM) :] if has_bom and index == 0 else raw))
+        for index, raw in enumerate(_split_frames(raw_sse_bytes))
+    ]
 
 
 def _frame_parts(raw: bytes) -> tuple[str, str | None]:
@@ -486,7 +500,7 @@ class AnthropicSSEEnvelope:
             every original frame needed for loss-minimizing replay.
         """
 
-        frames = [_SSEFrame(raw, *_json_payload(raw)) for raw in _split_frames(raw_sse_bytes)]
+        frames = _stream_frames(raw_sse_bytes)
         reconstruction = _response_from_events(frames)
 
         # Anything the reconstruction did not consume is replayed verbatim.
@@ -720,10 +734,9 @@ def fold_anthropic_stream(raw_sse_bytes: bytes) -> dict[str, Any] | None:
 
     envelope = AnthropicSSEEnvelope.parse(raw_sse_bytes)
     if envelope.saw_error:
-        for raw in _split_frames(raw_sse_bytes):
-            event_type, payload = _json_payload(raw)
-            if event_type == "error" and payload is not None:
-                return payload
+        for frame in _stream_frames(raw_sse_bytes):
+            if frame.event_type == "error" and frame.payload is not None:
+                return frame.payload
     if not envelope.is_complete():
         return None
     if envelope.saw_unreconstructable_frame:

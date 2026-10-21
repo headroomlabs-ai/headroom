@@ -13,6 +13,7 @@ from headroom.ccr.response_handler import (
     StreamingCCRHandler,
 )
 from headroom.ccr.tool_injection import CCR_TOOL_NAME
+from headroom.proxy.anthropic_wire import AnthropicSSEEnvelope, fold_anthropic_stream
 
 
 class FakeStore:
@@ -885,3 +886,108 @@ async def test_response_to_sse_emits_openai_chunk_frames() -> None:
     assert deltas[2]["tool_calls"][0]["index"] == 0
     assert deltas[2]["tool_calls"][0]["function"] == {"name": "do_thing", "arguments": '{"a":1}'}
     assert frames[-1]["choices"][0]["finish_reason"] == "tool_calls"
+
+
+UTF8_BOM = "\ufeff"
+
+
+def _data_only_stream(events: list[dict[str, Any]]) -> str:
+    return "".join(f"data: {json.dumps(event)}\n\n" for event in events)
+
+
+def test_openai_closed_stream_with_bom_keeps_first_delta() -> None:
+    handler = StreamingCCRHandler(CCRResponseHandler(), provider="openai")
+    stream = (
+        _data_only_stream(
+            [
+                {
+                    "id": "chatcmpl_bom",
+                    "model": "gpt-4o",
+                    "choices": [{"index": 0, "delta": {"role": "assistant", "content": "Hel"}}],
+                },
+                {
+                    "id": "chatcmpl_bom",
+                    "model": "gpt-4o",
+                    "choices": [{"index": 0, "delta": {"content": "lo"}, "finish_reason": "stop"}],
+                },
+            ]
+        )
+        + "data: [DONE]\n\n"
+    )
+
+    with_bom = handler._parse_sse_stream((UTF8_BOM + stream).encode())
+
+    assert with_bom == handler._parse_sse_stream(stream.encode())
+    assert with_bom["choices"][0]["message"]["content"] == "Hello"
+
+
+def test_anthropic_closed_stream_with_bom_keeps_message_start() -> None:
+    handler = StreamingCCRHandler(CCRResponseHandler(), provider="anthropic")
+    stream = _data_only_stream(
+        [
+            {
+                "type": "message_start",
+                "message": {
+                    "id": "msg_bom",
+                    "type": "message",
+                    "role": "assistant",
+                    "model": "claude-sonnet-4-6",
+                    "content": [],
+                    "usage": {"input_tokens": 7, "output_tokens": 1},
+                },
+            },
+            {
+                "type": "content_block_start",
+                "index": 0,
+                "content_block": {"type": "text", "text": ""},
+            },
+            {
+                "type": "content_block_delta",
+                "index": 0,
+                "delta": {"type": "text_delta", "text": "Hi"},
+            },
+            {"type": "content_block_stop", "index": 0},
+            {
+                "type": "message_delta",
+                "delta": {"stop_reason": "end_turn", "stop_sequence": None},
+                "usage": {"output_tokens": 2},
+            },
+            {"type": "message_stop"},
+        ]
+    )
+
+    with_bom = handler._parse_sse_stream((UTF8_BOM + stream).encode())
+
+    assert with_bom == handler._parse_sse_stream(stream.encode())
+    assert with_bom["id"] == "msg_bom"
+    assert with_bom["usage"]["input_tokens"] == 7
+    assert with_bom["content"] == [{"type": "text", "text": "Hi"}]
+
+
+def test_anthropic_error_event_after_bom_is_reported() -> None:
+    error = {"type": "error", "error": {"type": "overloaded_error", "message": "Overloaded"}}
+    raw = (UTF8_BOM + _data_only_stream([error])).encode()
+
+    assert fold_anthropic_stream(raw) == error
+
+
+def test_bom_inside_text_delta_is_not_stripped() -> None:
+    handler = StreamingCCRHandler(CCRResponseHandler(), provider="openai")
+    stream = _data_only_stream(
+        [{"id": "c", "choices": [{"index": 0, "delta": {"content": UTF8_BOM + "Hi"}}]}]
+    )
+
+    parsed = handler._parse_sse_stream(stream.encode())
+
+    assert parsed["choices"][0]["message"]["content"] == UTF8_BOM + "Hi"
+
+
+def test_bom_prefixed_opaque_frame_is_replayed_verbatim() -> None:
+    ping = (UTF8_BOM + 'event: ping\ndata: {"type":"ping"}\n\n').encode()
+    message_start = _data_only_stream(
+        [{"type": "message_start", "message": {"id": "msg_replay", "usage": {}}}]
+    ).encode()
+
+    envelope = AnthropicSSEEnvelope.parse(ping + message_start)
+
+    assert ping in b"".join(envelope.render())

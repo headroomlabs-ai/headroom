@@ -8,6 +8,12 @@ from __future__ import annotations
 SSE_EVENT_TERMINATORS = (b"\n\n", b"\r\n\r\n")
 SSE_EVENT_LINE_PREFIX = "event:"
 SSE_DATA_LINE_PREFIX = "data:"
+UTF8_BOM = b"\xef\xbb\xbf"
+
+
+def strip_leading_bom(data: bytes) -> bytes:
+    """Drop the one UTF-8 byte-order mark that may open a closed SSE payload."""
+    return data.removeprefix(UTF8_BOM)
 
 
 def find_sse_event_terminator(buf: bytearray) -> tuple[int, int] | None:

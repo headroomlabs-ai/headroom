@@ -20,6 +20,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from headroom.proxy.anthropic_wire import AnthropicSSEEnvelope
+from headroom.proxy.sse_byte_buffer_policy import strip_leading_bom
 
 from ..cache.compression_store import format_retrieval_miss_detail, get_compression_store
 from .tool_calls import (
@@ -815,7 +816,7 @@ class StreamingCCRHandler:
         # tail bytes left in ``buf`` indicate the upstream truncated
         # mid-event — log and ignore (already handled at the streaming
         # layer above).
-        buf = bytearray(data)
+        buf = bytearray(strip_leading_bom(data))
         events: list[dict[str, Any]] = []
         for _event_name, data_str in parse_sse_events_from_byte_buffer(buf):
             stripped = data_str.strip()
