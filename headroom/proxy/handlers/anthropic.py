@@ -35,11 +35,7 @@ if TYPE_CHECKING:
 import httpx
 
 from headroom.agent_savings import proxy_pipeline_kwargs
-from headroom.ccr.context_tracker import (
-    PROACTIVE_EXPANSION_CLOSE_TAG,
-    PROACTIVE_EXPANSION_OPEN_TAG,
-    looks_like_claude_code_compact_summary,
-)
+from headroom.ccr.context_tracker import looks_like_claude_code_compact_summary
 from headroom.ccr.marker_resolution import resolve_markers_in_response
 from headroom.ccr.tool_calls import has_ccr_retrieve_tool
 from headroom.copilot_auth import apply_copilot_api_auth, is_copilot_upstream_url
@@ -152,6 +148,10 @@ def _is_googleapis_endpoint(value: object) -> bool:
     except ValueError:
         return False
     return hostname == "googleapis.com" or hostname.endswith(".googleapis.com")
+
+
+class _ProxyExpansionBlock(dict):
+    pass
 
 
 class _AnthropicTurnHookUsage:
@@ -824,6 +824,7 @@ class AnthropicHandlerMixin:
                     # next turn, so any injection here busts the prefix
                     # cache at this message from then on.
                     and "cache_control" not in block
+                    and not isinstance(block, _ProxyExpansionBlock)
                 ):
                     existing = block.get("text", "")
                     new_content.append({**block, "text": existing + "\n\n" + context_text})
@@ -838,23 +839,8 @@ class AnthropicHandlerMixin:
         return messages
 
     @staticmethod
-    def _is_proactive_expansion_text(text: Any) -> bool:
-        """True when ``text`` is a proxy-injected CCR expansion wrapper."""
-        if not isinstance(text, str):
-            return False
-        stripped = text.strip()
-        return stripped.startswith(PROACTIVE_EXPANSION_OPEN_TAG) and stripped.endswith(
-            PROACTIVE_EXPANSION_CLOSE_TAG
-        )
-
-    @classmethod
-    def _is_proactive_expansion_block(cls, block: Any) -> bool:
-        """True when a content block is a proxy-injected CCR expansion."""
-        if isinstance(block, str):
-            return cls._is_proactive_expansion_text(block)
-        if not isinstance(block, dict):
-            return False
-        return cls._is_proactive_expansion_text(block.get("text"))
+    def _is_proactive_expansion_block(block: Any) -> bool:
+        return isinstance(block, _ProxyExpansionBlock)
 
     @classmethod
     def _append_proactive_expansion_after_cached_prefix(
@@ -889,7 +875,7 @@ class AnthropicHandlerMixin:
                 if isinstance(content, list) and content:
                     last_block_index = len(content) - 1
 
-        expansion_block = {"type": "text", "text": context_text}
+        expansion_block = _ProxyExpansionBlock({"type": "text", "text": context_text})
         target_index = last_message_index
         if target_index is None:
             target_index = len(messages) - 1
@@ -908,6 +894,12 @@ class AnthropicHandlerMixin:
         if isinstance(content, list):
             new_content = list(content)
             insert_at = last_block_index + 1 if last_block_index is not None else len(new_content)
+            while (
+                insert_at < len(new_content)
+                and isinstance(new_content[insert_at], dict)
+                and new_content[insert_at].get("type") == "tool_result"
+            ):
+                insert_at += 1
             new_content.insert(insert_at, expansion_block)
             updated[target_index] = {**message, "content": new_content}
             return updated
@@ -936,12 +928,6 @@ class AnthropicHandlerMixin:
                 stripped.append(message)
                 continue
             content = message.get("content")
-            if isinstance(content, str):
-                if cls._is_proactive_expansion_text(content):
-                    changed = True
-                    continue
-                stripped.append(message)
-                continue
             if not isinstance(content, list):
                 stripped.append(message)
                 continue
