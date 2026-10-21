@@ -82,7 +82,7 @@ class TokenCountCache:
         if text in self._counts:
             self._counts[text] = count
             return
-        if len(text) < self._min_chars:
+        if len(text) < self._min_chars or len(text) > self._max_chars:
             return
         if len(self._counts) >= self._max_entries or self._chars >= self._max_chars:
             self._counts.clear()

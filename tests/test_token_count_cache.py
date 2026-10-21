@@ -69,6 +69,22 @@ def test_cache_respects_the_character_budget() -> None:
     assert cache._chars <= 1000 + 200  # one entry may straddle the cap
 
 
+def test_single_input_larger_than_char_budget_is_not_retained() -> None:
+    """An oversized request body must not outlive the call that counted it."""
+    cache = TokenCountCache(min_chars=1, max_entries=100, max_chars=1000)
+    cache.put("warm", 1)
+    cache.put("x" * 5000, 2)
+    assert cache.get("x" * 5000) is None
+    assert cache._counts == {"warm": 1}
+    assert cache._chars == len("warm")
+
+
+def test_input_at_exact_char_budget_is_retained() -> None:
+    cache = TokenCountCache(min_chars=1, max_entries=100, max_chars=1000)
+    cache.put("y" * 1000, 7)
+    assert cache.get("y" * 1000) == 7
+
+
 def test_small_strings_are_not_cached() -> None:
     """They encode in microseconds; caching them would evict the entries that matter."""
     cache = TokenCountCache(min_chars=256)
