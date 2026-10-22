@@ -1458,7 +1458,10 @@ def test_model_metadata_routes_honor_the_custom_base_url(monkeypatch) -> None:
 
 def test_model_metadata_routes_reject_an_unsafe_custom_base_url(monkeypatch) -> None:
     # A client-named upstream goes through the same SSRF guard as the other
-    # routes: an unsafe one is ignored and the configured upstream is used.
+    # routes: an unsafe one is refused, and the request never reaches an
+    # upstream. Falling back to the configured upstream would have sent the
+    # authenticated request, and its credentials, to a host the client did
+    # not name.
     monkeypatch.setenv("HEADROOM_ALLOWED_BASE_URLS", "custom.example")
     calls: list[tuple[str, str, str]] = []
 
@@ -1475,10 +1478,20 @@ def test_model_metadata_routes_reject_an_unsafe_custom_base_url(monkeypatch) -> 
 
     monkeypatch.setattr(HeadroomProxy, "handle_passthrough", fake_passthrough)
 
+    credential = {"authorization": "Bearer synthetic-private-gateway-key"}
     with TestClient(_app()) as client:
-        unsafe = client.get(
+        listed = client.get(
             "/v1/models",
-            headers={"x-headroom-base-url": "http://169.254.169.254"},
+            headers={**credential, "x-headroom-base-url": "http://169.254.169.254"},
+        )
+        fetched = client.get(
+            "/v1/models/gpt-5",
+            headers={**credential, "x-headroom-base-url": "http://169.254.169.254"},
         )
 
-    assert unsafe.json()["base_url"] == "https://api.openai.test"
+    assert listed.status_code == 400
+    assert listed.json()["detail"] == "Rejected unsafe upstream base URL"
+    assert fetched.status_code == 400
+    # No upstream call at all: the rejected request must not be redirected to
+    # the configured upstream, which would disclose the credential.
+    assert calls == []
