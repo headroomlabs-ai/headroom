@@ -379,6 +379,27 @@ class TestSQLiteMemoryStore:
         assert len(remaining) == 2
 
     @pytest.mark.asyncio
+    async def test_clear_scope_narrows_to_the_turn_without_a_session(self, store):
+        """agent_id + turn_id without a session must scope to that turn (#4303)."""
+        await store.save_batch(
+            [
+                Memory(content="planner t1", user_id="alice", agent_id="planner", turn_id="t1"),
+                Memory(content="planner t2", user_id="alice", agent_id="planner", turn_id="t2"),
+            ]
+        )
+
+        deleted = await store.clear_scope("alice", agent_id="planner", turn_id="t1")
+
+        assert deleted == 1
+        remaining = await store.query(MemoryFilter(user_id="alice", agent_id="planner"))
+        assert [m.content for m in remaining] == ["planner t2"]
+        # The query has to describe the same scope the delete used.
+        assert (
+            len(await store.query(MemoryFilter(user_id="alice", agent_id="planner", turn_id="t1")))
+            == 0
+        )
+
+    @pytest.mark.asyncio
     async def test_clear_scope_narrows_with_parent_scopes(self, store):
         """A narrower scope must not delete rows outside its parents (#4303)."""
         await store.save_batch(

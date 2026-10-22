@@ -460,6 +460,15 @@ class SQLiteMemoryStore:
                 # Agent without session - unusual but supported
                 conditions.append("agent_id = ?")
                 params.append(filter.agent_id)
+                # turn_id narrows the agent scope exactly as it narrows a
+                # session scope. Leaving it out here made this query describe a
+                # wider scope than clear_scope() deletes, so the pre-delete
+                # query that collects the ids to unindex returned rows the
+                # delete kept - and the index lost a turn that was still
+                # stored (#4303).
+                if filter.turn_id is not None:
+                    conditions.append("turn_id = ?")
+                    params.append(filter.turn_id)
             elif filter.turn_id is not None:
                 # Turn without session/agent - unusual but supported
                 conditions.append("turn_id = ?")
