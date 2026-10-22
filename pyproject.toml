@@ -195,7 +195,11 @@ relevance = [
 # `headroom/image/compressor.py` adapts both API shapes at runtime via
 # a try/except cascade. See issue #372 for context.
 image = [
-    "pillow>=12.3.0",         # PYSEC-2026-2253/2254/2255/2256/2257 fixes (decompression-bomb + cmd-injection)
+    # PYSEC-2026-2253/2254/2255/2256/2257 fixes (decompression-bomb + cmd-injection);
+    # 13.0.0 also fixes CVE-2026-112895/112400/112896 et al. Pillow 13 has no
+    # Python 3.10 wheels, so 3.10 stays on 12.3.0, which is still advisory-exposed.
+    "pillow>=13.0.0; python_version >= '3.11'",
+    "pillow>=12.3.0; python_version < '3.11'",
     "sentencepiece>=0.1.99",  # Required by SigLIP tokenizer (SiglipTokenizer)
     # Python 3.6–3.12: keep the proven ORT-bundled package directly.
     # ~15 MB ONNX models auto-downloaded on first use.
@@ -415,6 +419,14 @@ constraint-dependencies = [
     "aiohttp>=3.14.4",
     # PYSEC-2026-3552/3553/3554 — PKCS#7 and certificate verification fixes
     "cryptography>=50.0.0",
+]
+# Lift fastembed's `pillow<13` cap (declared by every fastembed release up to
+# 0.9.0). Headroom only imports fastembed.TextEmbedding; fastembed's PIL use is
+# in its image/multimodal modules, which headroom never imports. Without this
+# override the `all` extra cannot resolve alongside pillow 13.0.0.
+override-dependencies = [
+    "pillow>=13.0.0; python_version >= '3.11'",
+    "pillow>=12.3.0; python_version < '3.11'",
 ]
 
 # Pin the project's package index to public PyPI. Without this, `uv lock`
