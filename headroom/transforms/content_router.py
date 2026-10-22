@@ -6399,6 +6399,21 @@ class ContentRouter(Transform):
                         _diag[i] = "protected:shell_small_result"
                     continue
 
+            # Legacy OpenAI `role:"function"` carries the tool name on the
+            # message itself, not in a tool_call_id. Resolve it directly so the
+            # small-shell floor also covers this wire shape (#3590 review).
+            if role == "function":
+                function_name = message.get("name", "")
+                if _is_small_shell_result(function_name, content, self.config.bash_tool_names):
+                    result_slots[i] = message
+                    transforms_applied.append("router:shell_small_result_verbatim")
+                    route_counts["shell_small_result"] = (
+                        route_counts.get("shell_small_result", 0) + 1
+                    )
+                    if collect_diagnostics:
+                        _diag[i] = "protected:shell_small_result"
+                    continue
+
             # Read protection (ROLE / SHAPE-AGNOSTIC). An observation produced by
             # a file read command (cat/sed/head/…) is passed VERBATIM so the agent
             # keeps exact bytes to patch — regardless of how THIS harness labels
@@ -7672,6 +7687,26 @@ class ContentRouter(Transform):
                         transforms_applied.append("router:excluded:ccr_retrieve")
                         if route_counts is not None:
                             route_counts["ccr_retrieve"] = route_counts.get("ccr_retrieve", 0) + 1
+                        continue
+
+                    # A normalized tool/function message can carry its output
+                    # as top-level text blocks rather than a tool_result
+                    # wrapper. Apply the same small-shell floor here (#3590
+                    # review).
+                    _shell_name = (
+                        (tool_name_map or {}).get(_msg_tool_id, "")
+                        if role == "tool"
+                        else message.get("name", "")
+                    )
+                    if _is_small_shell_result(
+                        _shell_name, block.get("text", ""), self.config.bash_tool_names
+                    ):
+                        new_blocks.append(block)
+                        transforms_applied.append("router:shell_small_result_verbatim")
+                        if route_counts is not None:
+                            route_counts["shell_small_result"] = (
+                                route_counts.get("shell_small_result", 0) + 1
+                            )
                         continue
                 text_content = block.get("text", "")
                 if isinstance(text_content, str) and (

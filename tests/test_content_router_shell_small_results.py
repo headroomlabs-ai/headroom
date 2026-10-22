@@ -130,6 +130,75 @@ def _route_openai(tool_name: str, tool_output: str) -> TransformResult:
     )
 
 
+def _tail(messages: list[dict[str, object]]) -> list[dict[str, object]]:
+    for i in range(10):
+        messages.append({"role": "assistant", "content": f"step {i}"})
+        messages.append({"role": "user", "content": f"continue {i}"})
+    return messages
+
+
+def _function_conversation(tool_name: str, tool_output: str) -> list[dict[str, object]]:
+    """Legacy OpenAI shape: role:function with the tool name on the message."""
+    messages: list[dict[str, object]] = [
+        {"role": "system", "content": "You are a coding agent."},
+        {"role": "user", "content": "run the command"},
+        {
+            "role": "assistant",
+            "content": None,
+            "tool_calls": [
+                {
+                    "id": "call_1",
+                    "type": "function",
+                    "function": {"name": tool_name, "arguments": "{}"},
+                }
+            ],
+        },
+        {"role": "function", "name": tool_name, "content": tool_output},
+    ]
+    return _tail(messages)
+
+
+def _route_function(tool_name: str, tool_output: str) -> TransformResult:
+    router = ContentRouter(ContentRouterConfig())
+    router.compress = _fake_compress  # type: ignore[assignment]
+    return router.apply(
+        _function_conversation(tool_name, tool_output), _tokenizer(), target_ratio=0.4
+    )
+
+
+def _text_block_conversation(tool_name: str, tool_output: str) -> list[dict[str, object]]:
+    """OpenAI shape: a tool message whose content is a list of text blocks."""
+    messages: list[dict[str, object]] = [
+        {"role": "system", "content": "You are a coding agent."},
+        {"role": "user", "content": "run the command"},
+        {
+            "role": "assistant",
+            "content": None,
+            "tool_calls": [
+                {
+                    "id": "call_1",
+                    "type": "function",
+                    "function": {"name": tool_name, "arguments": "{}"},
+                }
+            ],
+        },
+        {
+            "role": "tool",
+            "tool_call_id": "call_1",
+            "content": [{"type": "text", "text": tool_output}],
+        },
+    ]
+    return _tail(messages)
+
+
+def _route_text_block(tool_name: str, tool_output: str) -> TransformResult:
+    router = ContentRouter(ContentRouterConfig())
+    router.compress = _fake_compress  # type: ignore[assignment]
+    return router.apply(
+        _text_block_conversation(tool_name, tool_output), _tokenizer(), target_ratio=0.4
+    )
+
+
 def _ls_output(rows: int = 18) -> str:
     files = "\n".join(
         f"-rw-r--r--  1 user  staff  {1000 + i:>6} Oct 22 09:{i:02d} report_{i:02d}_final_v2.md"
@@ -260,4 +329,24 @@ def test_small_list_form_tool_result_stays_verbatim() -> None:
     result = _route("Bash", output, list_form=True)
 
     assert result.messages[3]["content"][0]["content"] == [{"type": "text", "text": output}]
+    assert "router:shell_small_result_verbatim" in result.transforms_applied
+
+
+def test_small_legacy_function_result_stays_verbatim() -> None:
+    """Legacy role:function resolves the shell name from message["name"]."""
+    output = _ls_output()
+
+    result = _route_function("Bash", output)
+
+    assert result.messages[3]["content"] == output
+    assert "router:shell_small_result_verbatim" in result.transforms_applied
+
+
+def test_small_top_level_text_block_stays_verbatim() -> None:
+    """A tool message normalized to top-level text blocks gets the guard."""
+    output = _ls_output()
+
+    result = _route_text_block("Bash", output)
+
+    assert result.messages[3]["content"] == [{"type": "text", "text": output}]
     assert "router:shell_small_result_verbatim" in result.transforms_applied
