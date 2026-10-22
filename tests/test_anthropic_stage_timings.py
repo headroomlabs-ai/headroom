@@ -266,7 +266,7 @@ def test_subscription_contribution_receives_request_savings_usd(monkeypatch):
     handler = _DummyAnthropicHandler()
     captured: dict[str, object] = {}
     tracker = SimpleNamespace(
-        notify_active=lambda token: None,
+        notify_active=lambda token, **kwargs: None,
         update_contribution=lambda **kwargs: captured.update(kwargs),
     )
 
