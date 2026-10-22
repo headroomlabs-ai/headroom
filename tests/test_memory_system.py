@@ -1028,6 +1028,105 @@ class TestMemorySystem:
         assert "memory_id" in result
 
     @pytest.mark.asyncio
+    async def test_handle_memory_save_background_keeps_pre_extracted_payload(self):
+        """background=True must not strip facts on backends lacking the kwarg (#4359)."""
+
+        class LocalLikeBackend:
+            """Accepts pre-extraction fields but not `background` (like LocalBackend)."""
+
+            def __init__(self):
+                self.received: dict[str, Any] | None = None
+
+            async def save_memory(
+                self,
+                content: str,
+                user_id: str,
+                importance: float = 0.5,
+                entities: list[str] | None = None,
+                relationships: list[dict[str, str]] | None = None,
+                session_id: str | None = None,
+                metadata: dict[str, Any] | None = None,
+                facts: list[str] | None = None,
+                extracted_entities: list[dict[str, str]] | None = None,
+                extracted_relationships: list[dict[str, str]] | None = None,
+            ) -> Memory:
+                self.received = {"facts": facts, "extracted_entities": extracted_entities}
+                return Memory(content=content, user_id=user_id, importance=importance)
+
+            async def search_memories(self, *args: Any, **kwargs: Any) -> list[Memory]:
+                return []
+
+            async def update_memory(self, *args: Any, **kwargs: Any) -> Memory | None:
+                return None
+
+            async def delete_memory(self, *args: Any, **kwargs: Any) -> bool:
+                return False
+
+            async def get_memory(self, memory_id: str) -> Memory | None:
+                return None
+
+        backend = LocalLikeBackend()
+        system = MemorySystem(backend, user_id="alice")  # type: ignore[arg-type]
+        result = await system.handle_memory_save(
+            content="Summary",
+            importance=0.5,
+            facts=["A", "B"],
+            extracted_entities=[{"entity": "A", "entity_type": "concept"}],
+            background=True,
+        )
+
+        assert result["success"] is True
+        assert backend.received is not None
+        assert backend.received["facts"] == ["A", "B"]
+        assert backend.received["extracted_entities"] == [{"entity": "A", "entity_type": "concept"}]
+        assert result["optimized"] is True
+        assert result["fact_count"] == 2
+
+    @pytest.mark.asyncio
+    async def test_handle_memory_save_fallback_reports_dropped_facts(self):
+        """A fallback that drops the payload must not report the facts as stored."""
+
+        class BasicBackend:
+            """Accepts neither pre-extraction fields nor `background`."""
+
+            async def save_memory(
+                self,
+                content: str,
+                user_id: str,
+                importance: float = 0.5,
+                entities: list[str] | None = None,
+                relationships: list[dict[str, str]] | None = None,
+                session_id: str | None = None,
+                metadata: dict[str, Any] | None = None,
+            ) -> Memory:
+                return Memory(content=content, user_id=user_id, importance=importance)
+
+            async def search_memories(self, *args: Any, **kwargs: Any) -> list[Memory]:
+                return []
+
+            async def update_memory(self, *args: Any, **kwargs: Any) -> Memory | None:
+                return None
+
+            async def delete_memory(self, *args: Any, **kwargs: Any) -> bool:
+                return False
+
+            async def get_memory(self, memory_id: str) -> Memory | None:
+                return None
+
+        system = MemorySystem(BasicBackend(), user_id="alice")  # type: ignore[arg-type]
+        result = await system.handle_memory_save(
+            content="Summary",
+            importance=0.5,
+            facts=["A", "B"],
+            background=True,
+        )
+
+        assert result["success"] is True
+        assert result["optimized"] is False
+        assert result["facts_stored"] is False
+        assert result["fact_count"] == 0
+
+    @pytest.mark.asyncio
     async def test_handle_memory_save_invalid_importance_high(self, memory_system):
         """Test saving a memory with importance > 1.0."""
         result = await memory_system.handle_memory_save(

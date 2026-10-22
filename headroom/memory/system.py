@@ -8,6 +8,7 @@ function-calling LLMs.
 
 from __future__ import annotations
 
+import inspect
 import logging
 from typing import Any, Protocol, runtime_checkable
 
@@ -16,6 +17,18 @@ from headroom.memory.ports import MemorySearchResult
 from headroom.memory.tools import MEMORY_TOOLS, MEMORY_TOOLS_OPTIMIZED
 
 logger = logging.getLogger(__name__)
+
+
+def _accepts_kwarg(func: Any, name: str) -> bool:
+    """Return True if `func` accepts `name` as a keyword argument."""
+    try:
+        params = inspect.signature(func).parameters
+    except (TypeError, ValueError):
+        # Uninspectable callable: let the call itself decide.
+        return True
+    if any(p.kind is inspect.Parameter.VAR_KEYWORD for p in params.values()):
+        return True
+    return name in params
 
 
 # =============================================================================
@@ -347,7 +360,10 @@ class MemorySystem:
             save_kwargs["extracted_entities"] = extracted_entities
         if extracted_relationships is not None:
             save_kwargs["extracted_relationships"] = extracted_relationships
-        if background is not None:
+        # Only pass `background` to backends that accept it. Sending it to a
+        # backend without the parameter raises TypeError and would trigger the
+        # fallback below, which re-saves without the pre-extracted payload.
+        if background is not None and _accepts_kwarg(self._backend.save_memory, "background"):
             save_kwargs["background"] = background
 
         # Log optimization usage
@@ -356,11 +372,13 @@ class MemorySystem:
             logger.info("Using pre-extracted data for optimized storage")
 
         # Save the memory
+        pre_extraction_persisted = True
         try:
             memory = await self._backend.save_memory(**save_kwargs)
         except TypeError:
             # Backend doesn't support pre-extraction fields, use basic call
             logger.debug("Backend doesn't support pre-extraction, falling back to basic save")
+            pre_extraction_persisted = False
             memory = await self._backend.save_memory(
                 content=content,
                 user_id=self._user_id,
@@ -383,9 +401,16 @@ class MemorySystem:
 
         # Include optimization info if pre-extraction was used
         if has_pre_extraction:
-            result["optimized"] = True
-            if facts:
-                result["fact_count"] = len(facts)
+            if pre_extraction_persisted:
+                result["optimized"] = True
+                if facts:
+                    result["fact_count"] = len(facts)
+            else:
+                # The fallback dropped the pre-extracted payload; report what
+                # was actually stored instead of the facts we were handed.
+                result["optimized"] = False
+                result["facts_stored"] = False
+                result["fact_count"] = 0
 
         # Include async/background info if save was async
         if memory.metadata and memory.metadata.get("_async"):
