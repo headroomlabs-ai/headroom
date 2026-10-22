@@ -26,6 +26,9 @@ def workspace(tmp_path, monkeypatch):
 def _clear_env(monkeypatch):
     for field in settings_store.SETTINGS:
         monkeypatch.delenv(field.env, raising=False)
+    # The startup seed is process state, so it has to be reset with the
+    # environment it describes.
+    monkeypatch.setattr(settings_store, "_SEEDED_ENV", {})
 
 
 class TestRoundTrip:
@@ -213,6 +216,55 @@ class TestEffectiveValues:
         assert lossless["value"] is True
         assert lossless["runtime_override"] is False
         assert lossless["env_override"] is True
+
+    def test_schema_does_not_call_a_seeded_stored_value_an_env_override(
+        self, workspace, monkeypatch
+    ):
+        # Issue #4320: apply_to_environ seeds the stored value into os.environ at
+        # startup, which made the GUI's own saved setting look like an operator
+        # export and locked it. It is only an override when Headroom did not
+        # insert the value.
+        _clear_env(monkeypatch)
+        settings_store.save({"mode": "token"})
+
+        settings_store.apply_to_environ(settings_store.load())
+        field = next(f for f in settings_store.to_schema()["fields"] if f["key"] == "mode")
+        assert field["env_override"] is False
+
+        monkeypatch.setenv("HEADROOM_MODE", "cache")
+        field = next(f for f in settings_store.to_schema()["fields"] if f["key"] == "mode")
+        assert field["env_override"] is True
+
+    def test_schema_keeps_a_seed_an_override_out_after_a_later_save(self, workspace, monkeypatch):
+        # The seed stays Headroom's own value when the file changes under it.
+        # Comparing the env value with the stored value would report the
+        # stale seed as an operator export and lock the setting until restart.
+        _clear_env(monkeypatch)
+        settings_store.save({"mode": "token"})
+        settings_store.apply_to_environ(settings_store.load())
+
+        settings_store.save({"mode": "cache"})
+
+        field = next(f for f in settings_store.to_schema()["fields"] if f["key"] == "mode")
+        assert field["env_override"] is False
+        # The startup seed is still the effective value until a restart.
+        assert field["value"] == "token"
+
+    def test_schema_reports_an_equal_valued_external_export_as_an_override(
+        self, workspace, monkeypatch
+    ):
+        # An operator export that carries the same text as the settings file
+        # still wins at startup, so the dashboard has to keep the setting
+        # locked rather than offer an edit that cannot take effect.
+        _clear_env(monkeypatch)
+        settings_store.save({"mode": "token"})
+        monkeypatch.setenv("HEADROOM_MODE", "token")
+
+        settings_store.apply_to_environ(settings_store.load())
+
+        field = next(f for f in settings_store.to_schema()["fields"] if f["key"] == "mode")
+        assert field["env_override"] is True
+        assert settings_store.seeded_environment().get("HEADROOM_MODE") is None
 
 
 class TestSecretMasking:
