@@ -185,11 +185,15 @@ def extract_relationships_from_section(
             relationships.append({"source": key, "relationship": "is", "destination": value})
 
     # Pattern: "X uses Y", "X with Y", "X via Y"
+    # Word runs are bounded ({1,64}) so a single long token (base64 blob,
+    # minified line, hash) cannot trigger quadratic backtracking: without a
+    # bound, each scan position retries a growing \w+ prefix and costs
+    # O(n^2) in the token length (#4370).
     verb_patterns = [
-        (r"(\w+(?:\s+\w+)?)\s+uses\s+(\w+(?:\s+\w+)?)", "uses"),
-        (r"(\w+(?:\s+\w+)?)\s+requires\s+(\w+(?:\s+\w+)?)", "requires"),
-        (r"(\w+(?:\s+\w+)?)\s+integrates\s+with\s+(\w+(?:\s+\w+)?)", "integrates_with"),
-        (r"(\w+(?:\s+\w+)?)\s+depends\s+on\s+(\w+(?:\s+\w+)?)", "depends_on"),
+        (r"(\w{1,64}(?:\s+\w{1,64})?)\s+uses\s+(\w{1,64}(?:\s+\w{1,64})?)", "uses"),
+        (r"(\w{1,64}(?:\s+\w{1,64})?)\s+requires\s+(\w{1,64}(?:\s+\w{1,64})?)", "requires"),
+        (r"(\w{1,64}(?:\s+\w{1,64})?)\s+integrates\s+with\s+(\w{1,64}(?:\s+\w{1,64})?)", "integrates_with"),
+        (r"(\w{1,64}(?:\s+\w{1,64})?)\s+depends\s+on\s+(\w{1,64}(?:\s+\w{1,64})?)", "depends_on"),
     ]
     for pattern, rel_type in verb_patterns:
         for match in re.finditer(pattern, section.content, re.IGNORECASE):
