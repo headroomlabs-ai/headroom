@@ -798,23 +798,28 @@ class SQLiteMemoryStore:
             return []
 
         history: list[Memory] = [current]
+        # Imported or reused IDs can form cycles. Visit each stored record
+        # only once across both directions instead of blocking indefinitely.
+        visited = {current.id}
 
         # Follow chain backwards (supersedes)
         back_id = current.supersedes
-        while back_id is not None:
+        while back_id is not None and back_id not in visited:
             prev = await self.get(back_id)
             if prev is None:
                 break
+            visited.add(prev.id)
             history.insert(0, prev)  # Add to beginning
             back_id = prev.supersedes
 
         # Follow chain forwards (superseded_by) if requested
         if include_future:
             forward_id = current.superseded_by
-            while forward_id is not None:
+            while forward_id is not None and forward_id not in visited:
                 next_mem = await self.get(forward_id)
                 if next_mem is None:
                     break
+                visited.add(next_mem.id)
                 history.append(next_mem)
                 forward_id = next_mem.superseded_by
 
