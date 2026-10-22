@@ -4299,6 +4299,10 @@ class AnthropicHandlerMixin:
                         mutation_reasons=body_mutation_tracker.reasons,
                         memory_request_ctx=memory_request_ctx,
                         outcome_provider=provider_name,
+                        subscription_tracking=(
+                            _auth_header.startswith("Bearer ")
+                            and not _auth_header.startswith("Bearer sk-ant-api")
+                        ),
                         session_key=session_key,
                         server_memory_tool_names=server_memory_tool_names,
                         client_beta=client_anthropic_beta or "",
@@ -5163,16 +5167,32 @@ class AnthropicHandlerMixin:
                         if _auth_header.startswith("Bearer ") and not _auth_header.startswith(
                             "Bearer sk-ant-api"
                         ):
+                            from headroom.proxy.savings_tracker import (
+                                estimate_request_savings_usd,
+                            )
                             from headroom.subscription.tracker import (
                                 get_subscription_tracker as _get_sub_tracker,
                             )
 
                             _sub_tracker = _get_sub_tracker()
                             if _sub_tracker is not None:
+                                _savings_usd = estimate_request_savings_usd(
+                                    model,
+                                    compression_tokens_saved=tokens_saved,
+                                    cache_read_tokens=cr_tokens,
+                                    cache_write_tokens=cw_tokens,
+                                    cache_write_5m_tokens=cw_5m_tokens,
+                                    cache_write_1h_tokens=cw_1h_tokens,
+                                    uncached_input_tokens=uncached_input_tokens,
+                                    local_input_tokens=optimized_tokens,
+                                    provider=provider_name,
+                                )
                                 _sub_tracker.update_contribution(
                                     tokens_submitted=optimized_tokens,
                                     tokens_saved_compression=tokens_saved,
                                     tokens_saved_cache_reads=cr_tokens,
+                                    compression_savings_usd=_savings_usd["compression"],
+                                    cache_savings_usd=_savings_usd["provider_cache"],
                                 )
 
                         # The pre-refactor PERF emit (above) read raw usage
