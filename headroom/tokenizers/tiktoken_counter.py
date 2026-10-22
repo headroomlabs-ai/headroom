@@ -16,7 +16,7 @@ import threading
 from functools import lru_cache
 from typing import Any
 
-from .base import BaseTokenizer, TokenCountCache, coerce_countable_text
+from .base import BaseTokenizer, TokenCountCache, coerce_countable_text, coerce_message_text
 
 logger = logging.getLogger(__name__)
 
@@ -305,7 +305,7 @@ class TiktokenCounter(BaseTokenizer):
                             if isinstance(part, dict):
                                 if part.get("type") == "text":
                                     total += self.count_text(
-                                        coerce_countable_text(part.get("text", ""))
+                                        coerce_message_text(part.get("text", ""))
                                     )
                                 elif part.get("type") == "image_url":
                                     # Image tokens vary by detail level
@@ -327,9 +327,9 @@ class TiktokenCounter(BaseTokenizer):
                             elif isinstance(part, str):
                                 total += self.count_text(part)
                 elif key == "role":
-                    total += self.count_text(coerce_countable_text(value))
+                    total += self.count_text(coerce_message_text(value))
                 elif key == "name":
-                    total += self.count_text(coerce_countable_text(value))
+                    total += self.count_text(coerce_message_text(value))
                     total += 1  # Name adds 1 token
                 elif key == "tool_calls":
                     for tool_call in value or []:

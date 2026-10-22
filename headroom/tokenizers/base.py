@@ -107,20 +107,35 @@ def coerce_countable_text(value: Any) -> str:
 
     ``None`` counts as nothing; dicts/lists are JSON-serialized so an object
     ``arguments`` is priced roughly like the JSON string it should have been;
-    anything else falls back to ``str()``.
+    anything else falls back to ``str()``. The result is capped at
+    ``_MAX_COERCED_FIELD_CHARS``; message content uses :func:`coerce_message_text`
+    instead, which is uncapped.
     """
+    text = _coerce_to_text(value)
+    return text[:_MAX_COERCED_FIELD_CHARS]
+
+
+def coerce_message_text(value: Any) -> str:
+    """Return message content as text, with the full serialized form kept.
+
+    Same conversion as :func:`coerce_countable_text`, without the cap. A
+    structured text block must price exactly like its textual form; truncating
+    it would drop the tail of the content from the count.
+    """
+    return _coerce_to_text(value)
+
+
+def _coerce_to_text(value: Any) -> str:
     if isinstance(value, str):
         return value
     if value is None:
         return ""
     if isinstance(value, dict | list | tuple):
         try:
-            text = json.dumps(value, ensure_ascii=False, default=str)
+            return json.dumps(value, ensure_ascii=False, default=str)
         except (TypeError, ValueError):
-            text = str(value)
-    else:
-        text = str(value)
-    return text[:_MAX_COERCED_FIELD_CHARS]
+            return str(value)
+    return str(value)
 
 
 @runtime_checkable
@@ -211,7 +226,7 @@ class BaseTokenizer(ABC):
 
             # Count role
             role = message.get("role", "")
-            total += self.count_text(coerce_countable_text(role))
+            total += self.count_text(coerce_message_text(role))
 
             # Count content
             content = message.get("content")
@@ -235,7 +250,7 @@ class BaseTokenizer(ABC):
             # Count name field
             name = message.get("name")
             if name:
-                total += self.count_text(coerce_countable_text(name))
+                total += self.count_text(coerce_message_text(name))
                 total += 1  # Name field overhead
 
         # Reply start overhead
@@ -255,7 +270,7 @@ class BaseTokenizer(ABC):
                 part_type = part.get("type", "")
 
                 if part_type == "text":
-                    total += self.count_text(coerce_countable_text(part.get("text", "")))
+                    total += self.count_text(coerce_message_text(part.get("text", "")))
                 elif part_type in ("image_url", "image", "input_image"):
                     # Images are NOT tokenized as text — they have a pixel-based cost.
                     # Anthropic: tokens = (width * height) / 750, max ~1600 after resize.
@@ -281,15 +296,15 @@ class BaseTokenizer(ABC):
                     else:
                         total += self._count_serialized(content)
                 elif part_type == "tool_use":
-                    total += self.count_text(coerce_countable_text(part.get("name", "")))
+                    total += self.count_text(coerce_message_text(part.get("name", "")))
                     total += self._count_serialized(part.get("input", {}))
                 elif not part_type and "text" in part:
                     # Strands SDK format: {"text": "..."} without "type" field
-                    total += self.count_text(coerce_countable_text(part["text"]))
+                    total += self.count_text(coerce_message_text(part["text"]))
                 elif not part_type and "toolUse" in part:
                     # Strands SDK tool_use: {"toolUse": {"name": ..., "input": ...}}
                     tool_use = part["toolUse"]
-                    total += self.count_text(coerce_countable_text(tool_use.get("name", "")))
+                    total += self.count_text(coerce_message_text(tool_use.get("name", "")))
                     total += self._count_serialized(tool_use.get("input", {}))
                 elif not part_type and "toolResult" in part:
                     # Strands SDK tool_result: {"toolResult": {"content": [...]}}
@@ -309,7 +324,7 @@ class BaseTokenizer(ABC):
                     reasoning_text = reasoning.get("reasoningText", {})
                     if isinstance(reasoning_text, dict):
                         total += self.count_text(
-                            coerce_countable_text(reasoning_text.get("text", ""))
+                            coerce_message_text(reasoning_text.get("text", ""))
                         )
                     elif isinstance(reasoning_text, str):
                         total += self.count_text(reasoning_text)
@@ -360,7 +375,7 @@ class BaseTokenizer(ABC):
                     # ~4 bytes/token (len * 3/4 / 4), which lands that session
                     # near the provider figure and never prices an omitted
                     # block at zero.
-                    total += self.count_text(coerce_countable_text(part.get("thinking", "")))
+                    total += self.count_text(coerce_message_text(part.get("thinking", "")))
                     total += len(part.get("signature") or "") * 3 // 16
                 else:
                     # Unknown type - estimate from JSON

@@ -831,3 +831,48 @@ def test_structured_text_counts_like_its_textual_form(
     before = copy.deepcopy(structured)
     assert counter.count_messages([structured]) == counter.count_messages([textual])
     assert structured == before
+
+
+# Serializes to ~300k chars, above the 200k cap on tool-call fields. The structured
+# block must still price exactly like its textual form: the omitted tail is content.
+_OVER_LIMIT_PAYLOAD = {"message": "hello " * 50_000}
+_OVER_LIMIT_TEXT = json.dumps(_OVER_LIMIT_PAYLOAD, ensure_ascii=False)
+
+
+@pytest.mark.parametrize(
+    "structured, textual",
+    [
+        (
+            {"role": "user", "content": [{"type": "text", "text": _OVER_LIMIT_PAYLOAD}]},
+            {"role": "user", "content": [{"type": "text", "text": _OVER_LIMIT_TEXT}]},
+        ),
+        (
+            {"role": "user", "content": [{"text": _OVER_LIMIT_PAYLOAD}]},
+            {"role": "user", "content": [{"text": _OVER_LIMIT_TEXT}]},
+        ),
+        (
+            {
+                "role": "assistant",
+                "content": [{"type": "thinking", "thinking": _OVER_LIMIT_PAYLOAD}],
+            },
+            {"role": "assistant", "content": [{"type": "thinking", "thinking": _OVER_LIMIT_TEXT}]},
+        ),
+        (
+            {"role": _OVER_LIMIT_PAYLOAD, "content": "hi"},
+            {"role": _OVER_LIMIT_TEXT, "content": "hi"},
+        ),
+    ],
+    ids=["text-part", "strands-text", "thinking", "role"],
+)
+@pytest.mark.parametrize(
+    "counter",
+    [TiktokenCounter("gpt-4o"), CharacterCounter()],
+    ids=["tiktoken", "base-walker"],
+)
+def test_structured_text_above_coercion_limit_counts_full_content(
+    counter, structured: dict, textual: dict
+) -> None:
+    """Content past the tool-field coercion cap is counted, not silently dropped."""
+    before = copy.deepcopy(structured)
+    assert counter.count_messages([structured]) == counter.count_messages([textual])
+    assert structured == before
