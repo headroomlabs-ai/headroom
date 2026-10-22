@@ -770,11 +770,8 @@ class TestLedgerPersistence:
         assert on_disk["baseline"] == learned.to_dict()
         assert recorder._ledger.baseline.to_dict() == learned.to_dict()
 
-    @pytest.mark.skipif(
-        __import__("importlib").util.find_spec("fcntl") is None, reason="flock is Unix-only"
-    )
     def test_migration_holds_the_ledger_lock_while_writing(self, tmp_path, monkeypatch):
-        import fcntl
+        import threading
 
         path = tmp_path / "output_savings.json"
         self._pre_rule_ledger(path)
@@ -782,24 +779,67 @@ class TestLedgerPersistence:
         contended = []
 
         def probing_save(self, p):
-            with open(str(p) + ".lock", "a") as other:
-                try:
-                    fcntl.flock(other, fcntl.LOCK_EX | fcntl.LOCK_NB)
-                    fcntl.flock(other, fcntl.LOCK_UN)
-                    contended.append(False)
-                except BlockingIOError:
-                    contended.append(True)
-            real_save(self, p)
+            acquired = threading.Event()
 
+            def other_writer():
+                with ledger_lock(p):
+                    acquired.set()
+
+            probe = threading.Thread(target=other_writer)
+            probe.start()
+            contended.append(not acquired.wait(timeout=0.3))
+            real_save(self, p)
+            probe_threads.append(probe)
+
+        probe_threads: list[threading.Thread] = []
         monkeypatch.setattr(SavingsLedger, "save", probing_save)
         SavingsRecorder(str(path))
+        for probe in probe_threads:
+            probe.join(timeout=5)
 
         assert contended == [True]
         assert json.loads(path.read_text())["shaped_only"] is True
 
-    @pytest.mark.skipif(
-        __import__("importlib").util.find_spec("fcntl") is None, reason="flock is Unix-only"
-    )
+    def test_migration_keeps_a_baseline_learned_during_the_locked_reload(
+        self, tmp_path, monkeypatch
+    ):
+        """learn writes while the migration holds its re-read snapshot; it
+        must wait for the lock rather than be overwritten by that snapshot."""
+        import threading
+
+        path = tmp_path / "output_savings.json"
+        legacy = self._pre_rule_ledger(path)
+        learned = BaselineModel()
+        for output_tokens in (400, 420, 380):
+            learned.observe("opus|b|s|tools", output_tokens)
+
+        real_load = SavingsLedger.load.__func__
+        loads = []
+        writers: list[threading.Thread] = []
+
+        def learn_during_second_load(cls, p, **kwargs):
+            ledger = real_load(cls, p, **kwargs)
+            loads.append(p)
+            if len(loads) == 2:
+                writer = threading.Thread(target=SavingsLedger.store_baseline, args=(path, learned))
+                writer.start()
+                writer.join(timeout=0.3)
+                writers.append(writer)
+            return ledger
+
+        monkeypatch.setattr(SavingsLedger, "load", classmethod(learn_during_second_load))
+        recorder = SavingsRecorder(str(path))
+        assert len(writers) == 1
+        writers[0].join(timeout=5)
+        assert not writers[0].is_alive()
+
+        on_disk = json.loads(path.read_text())
+        assert on_disk["shaped_only"] is True
+        assert on_disk["baseline"] == learned.to_dict()
+        assert on_disk["baseline"] != legacy["baseline"]
+        recorder.estimate()
+        assert recorder._ledger.baseline.to_dict() == learned.to_dict()
+
     def test_store_baseline_waits_for_the_ledger_lock(self, tmp_path):
         """learn must not replace the file while another writer holds the lock
         between its re-read and its save."""

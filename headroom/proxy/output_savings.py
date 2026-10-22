@@ -399,23 +399,45 @@ def ledger_lock(path: Any) -> Iterator[None]:
     """Serialize read-modify-write of the ledger file across processes.
 
     The lock lives in a sidecar file because ``save`` replaces the ledger's
-    inode. Unix-only, like the other flock users; elsewhere it is a no-op.
+    inode. Same platform split as ``cli.wrap._locked_file``.
     """
+    import sys
     from pathlib import Path
 
-    try:
-        import fcntl
-    except ImportError:
-        yield
-        return
     lock_path = Path(str(path) + ".lock")
     lock_path.parent.mkdir(parents=True, exist_ok=True)
-    with open(lock_path, "a") as handle:
-        fcntl.flock(handle, fcntl.LOCK_EX)
-        try:
-            yield
-        finally:
-            fcntl.flock(handle, fcntl.LOCK_UN)
+    with open(lock_path, "a+b") as handle:
+        if sys.platform == "win32":
+            import msvcrt
+            import os
+            import time
+
+            # msvcrt.locking locks bytes from the current position, so lock a
+            # real byte at offset 0. LK_LOCK raises after ~10 one-second
+            # retries, so loop on the non-blocking form instead.
+            if os.fstat(handle.fileno()).st_size == 0:
+                handle.write(b"0")
+                handle.flush()
+            handle.seek(0)
+            while True:
+                try:
+                    msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+                    break
+                except OSError:
+                    time.sleep(0.05)
+            try:
+                yield
+            finally:
+                handle.seek(0)
+                msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+        else:
+            import fcntl
+
+            fcntl.flock(handle, fcntl.LOCK_EX)
+            try:
+                yield
+            finally:
+                fcntl.flock(handle, fcntl.LOCK_UN)
 
 
 @dataclass
