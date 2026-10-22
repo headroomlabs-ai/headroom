@@ -156,8 +156,13 @@ class _PromptCache:
         return read, write, hit
 
 
-def _drive(requests: list[list[dict[str, Any]]]) -> list[tuple[list[dict[str, Any]], int]]:
-    """Send each history through the real handler; return (forwarded, read_hit)."""
+def _drive(
+    requests: list[list[dict[str, Any]]], cache: _PromptCache | None = None, **config: Any
+) -> list[tuple[list[dict[str, Any]], int]]:
+    """Send each history through the real handler; return (forwarded, read_hit).
+
+    One app per call: a second call with the same ``cache`` is a proxy restart
+    in front of a provider whose prompt cache stayed warm."""
     app = create_app(
         ProxyConfig(
             optimize=True,
@@ -168,9 +173,10 @@ def _drive(requests: list[list[dict[str, Any]]]) -> list[tuple[list[dict[str, An
             rate_limit_enabled=False,
             cost_tracking_enabled=False,
             log_requests=False,
+            **config,
         )
     )
-    cache = _PromptCache()
+    cache = cache or _PromptCache()
     seen: list[tuple[list[dict[str, Any]], int]] = []
     with TestClient(app) as client:
         proxy = client.app.state.proxy

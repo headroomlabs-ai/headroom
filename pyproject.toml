@@ -172,13 +172,13 @@ pytorch-mps = [
 ]
 # Semantic relevance scoring with embeddings.
 # Uses `fastembed` (BAAI/bge-small-en-v1.5 by default — 33M params,
-# 384 dims, ~30 MB int8-quantized ONNX). Same library + model used by
-# the Rust SmartCrusher (`fastembed` crate), giving byte-equal embeddings
-# across the language boundary. Replaced sentence-transformers in
+# 384 dims, ~67 MB quantized ONNX), loaded from a pinned
+# Qdrant/bge-small-en-v1.5-onnx-Q snapshot. Replaced sentence-transformers in
 # Stage 3c.1 — fastembed is faster (~2-3x), smaller (no torch
 # dependency), and outranks all-MiniLM-L6-v2 on MTEB by ~6 points.
+# >=0.6.0 for `specific_model_path`, which the pinned-snapshot load needs.
 relevance = [
-    "fastembed>=0.4.0; python_version<'3.14' or sys_platform != 'darwin' or platform_machine != 'x86_64'",
+    "fastembed>=0.6.0; python_version<'3.14' or sys_platform != 'darwin' or platform_machine != 'x86_64'",
     "numpy>=1.24.0",
 ]
 # Image compression (ML-based routing + OCR)
@@ -410,8 +410,9 @@ constraint-dependencies = [
     "transformers>=5.5.0",
     # PYSEC-2026-3447 — transitive dependency; fix at 83.0.0
     "setuptools>=83.0.0",
-    # PYSEC-2026-3545/3546/3547 — transitive HTTP/WebSocket parser fixes
-    "aiohttp>=3.14.3",
+    # PYSEC-2026-3545/3546/3547 — transitive HTTP/WebSocket parser fixes;
+    # CVE-2026-111063/111064, GHSA-2g87-pp6c-29x5; fix at 3.14.4
+    "aiohttp>=3.14.4",
     # PYSEC-2026-3552/3553/3554 — PKCS#7 and certificate verification fixes
     "cryptography>=50.0.0",
 ]
