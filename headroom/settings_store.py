@@ -999,13 +999,32 @@ def save(values: dict[str, Any]) -> None:
     _atomic_write_text(paths.settings_path(), payload)
 
 
+# The env vars Headroom itself inserted at startup, mapped to the value it
+# inserted. This is provenance, not value equality: an operator export that
+# happens to carry the same text as the settings file is still an operator
+# export, and Headroom's own seed stays Headroom's own even after the file
+# changes underneath it.
+_SEEDED_ENV: dict[str, str] = {}
+
+
+def seeded_environment() -> dict[str, str]:
+    """Return the env vars Headroom inserted at startup, with their values."""
+    return dict(_SEEDED_ENV)
+
+
 def apply_to_environ(values: dict[str, Any]) -> None:
     """``setdefault`` each stored value into ``os.environ`` (explicit export wins)."""
     for key, value in values.items():
         field = _BY_KEY.get(key)
         if field is None or value is None:
             continue
-        os.environ.setdefault(field.env, _serialize(field, value))
+        if field.env in os.environ:
+            # An explicit export is already there and keeps precedence, so
+            # Headroom did not insert this one.
+            continue
+        serialized = _serialize(field, value)
+        os.environ[field.env] = serialized
+        _SEEDED_ENV[field.env] = serialized
 
 
 def _coerce_runtime_values(runtime_values: dict[str, Any] | None) -> dict[str, Any]:
@@ -1079,12 +1098,13 @@ def to_schema(
     effective = {**environment_effective, **runtime}
     fields: list[dict[str, Any]] = []
     for field in SETTINGS:
-        # ``apply_to_environ`` seeds each stored value into its env var, so an
-        # env var that merely matches the stored value is the GUI's own value,
-        # not an operator export. Only a differing value is an override.
+        # An env var is an operator export only when Headroom did not put it
+        # there. The startup seed is recorded when it happens, so the answer
+        # does not depend on how the value compares with the settings file:
+        # a value saved after the seed is still Headroom's own seed, and an
+        # operator export that matches the stored text is still an export.
         env_raw = os.environ.get(field.env)
-        seeded = stored.get(field.key)
-        seeded_env = _serialize(field, seeded) if seeded is not None else None
+        seeded_env = _SEEDED_ENV.get(field.env)
         fields.append(
             {
                 "key": field.key,
