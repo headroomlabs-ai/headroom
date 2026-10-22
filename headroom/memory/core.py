@@ -18,6 +18,8 @@ from headroom.memory.models import Memory, ScopeLevel
 from headroom.memory.ports import MemoryFilter, TextFilter, VectorFilter
 
 if TYPE_CHECKING:
+    from collections.abc import Awaitable, Callable
+
     from headroom.memory.ports import (
         Embedder,
         MemoryCache,
@@ -438,7 +440,13 @@ class HierarchicalMemory:
             limit=limit,
         )
 
-        return await self._text_index.search(text_filter)
+        # FTS5 retains a synchronous search(str) API for legacy callers; its
+        # async filter-based entry point is search_memories. External adapters
+        # implementing the TextIndex protocol keep using search(TextFilter).
+        search: Callable[[TextFilter], Awaitable[list[TextSearchResult]]] = getattr(
+            self._text_index, "search_memories", self._text_index.search
+        )
+        return await search(text_filter)
 
     # =========================================================================
     # Memory Updates
