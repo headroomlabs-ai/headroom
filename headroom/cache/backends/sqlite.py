@@ -14,6 +14,11 @@ cannot provide, both load-bearing for the no-accuracy-loss guarantee:
 Set ``HEADROOM_CCR_BACKEND=memory`` to opt back into the in-memory
 backend, or ``HEADROOM_CCR_SQLITE_PATH`` to relocate the database file
 (default ``workspace_dir()/ccr_store.db``).
+
+Corruption raises ``StorageError`` without replacing the database. Recovery
+must happen offline, after stopping every worker sharing the database: preserve
+or restore the database and its WAL/SHM sidecars together. An online unlink can
+strand sibling workers on the old inode and lose their stored originals.
 """
 
 from __future__ import annotations
@@ -28,6 +33,7 @@ from dataclasses import asdict, fields
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
+from ...exceptions import StorageError
 from ...fileperms import ensure_private_file
 from ...log_safety import WarnOnce, safe_id
 
@@ -140,7 +146,7 @@ class SQLiteBackend:
 
     @staticmethod
     def _is_corruption(error: Exception) -> bool:
-        """Only genuine file corruption justifies recreating the database.
+        """Distinguish corruption from errors that can safely remain cache misses.
 
         ``sqlite3.OperationalError`` (a DatabaseError subclass) also covers
         transient conditions like ``database is locked`` under multi-worker
@@ -152,30 +158,25 @@ class SQLiteBackend:
         return "malformed" in msg or "not a database" in msg
 
     def _handle_db_error(self, error: sqlite3.DatabaseError, op: str) -> None:
-        """Corruption → recreate (loud). Anything else (busy/locked/io) →
-        log and treat the operation as a miss; never destroy data over a
-        transient error."""
+        """Fail closed on corruption; leave transient errors as cache misses.
+
+        This backend cannot know whether another worker still holds the file.
+        Never unlink it or close our connection as part of online recovery:
+        that can split the workers across two databases, or strand this worker
+        on a closed connection if reopening fails. A failed write must not look
+        successful to CompressionStore, which would return an unretrievable key.
+        """
         if not self._is_corruption(error):
             logger.warning(
                 "CCR SQLite %s failed on %s (transient, no reset): %s", op, self._path, error
             )
             return
-        logger.warning(
-            "CCR SQLite store at %s is corrupt (%s); recreating. "
-            "Previously stored originals are lost — affected retrieval "
-            "markers will miss until their content is re-compressed.",
-            self._path,
-            error,
-        )
-        try:
-            self._conn.close()
-        except Exception:  # noqa: BLE001 - best-effort close on corrupt handle
-            pass
-        self._path.unlink(missing_ok=True)
-        self._unreadable_warned = WarnOnce(
-            _MAX_REPORTED_UNREADABLE, "unreadable CCR SQLite entries"
-        )
-        self._conn = self._open()
+        raise StorageError(
+            "CCR SQLite store is corrupt; the database was left intact. "
+            "Stop all workers using this store before recovering the database "
+            "and its WAL/SHM sidecars.",
+            details={"path": str(self._path), "operation": op, "error": str(error)},
+        ) from error
 
     def _report_unreadable(self, hash_key: str, reason: object) -> None:
         first = self._unreadable_warned.first(hash_key, logger)
