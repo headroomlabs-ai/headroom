@@ -31,6 +31,18 @@ def _accepts_kwarg(func: Any, name: str) -> bool:
     return name in params
 
 
+def _is_unexpected_kwarg(exc: TypeError) -> bool:
+    """True for a call-signature mismatch, not a TypeError raised mid-save.
+
+    The pre-extraction fallback below re-saves without the optimized payload,
+    so it may only fire when the backend rejected a keyword argument. A
+    ``TypeError`` raised *after* the backend wrote the record would otherwise
+    save the memory twice while reporting the first payload as dropped (review
+    finding on the PR).
+    """
+    return "unexpected keyword argument" in str(exc)
+
+
 # =============================================================================
 # Memory Backend Protocol
 # =============================================================================
@@ -375,7 +387,11 @@ class MemorySystem:
         pre_extraction_persisted = True
         try:
             memory = await self._backend.save_memory(**save_kwargs)
-        except TypeError:
+        except TypeError as exc:
+            if not _is_unexpected_kwarg(exc):
+                # Not a signature mismatch: the backend may already have written
+                # the record, so a retry would duplicate it. Let it propagate.
+                raise
             # Backend doesn't support pre-extraction fields, use basic call
             logger.debug("Backend doesn't support pre-extraction, falling back to basic save")
             pre_extraction_persisted = False

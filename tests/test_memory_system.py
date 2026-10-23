@@ -1127,6 +1127,47 @@ class TestMemorySystem:
         assert result["fact_count"] == 0
 
     @pytest.mark.asyncio
+    async def test_handle_memory_save_type_error_after_write_is_not_retried(self):
+        """A TypeError raised after the write propagates instead of saving twice.
+
+        The fallback only handles a signature mismatch; a backend that already
+        wrote the record and then raised TypeError would otherwise be called
+        again while the first payload is reported dropped (review finding)."""
+
+        class WritingBackend:
+            """Accepts the pre-extraction fields, writes, then raises TypeError."""
+
+            def __init__(self):
+                self.calls = 0
+
+            async def save_memory(self, *args: Any, **kwargs: Any) -> Memory:
+                self.calls += 1
+                raise TypeError("sqlite3.OperationalError wrapped as TypeError")
+
+            async def search_memories(self, *args: Any, **kwargs: Any) -> list[Memory]:
+                return []
+
+            async def update_memory(self, *args: Any, **kwargs: Any) -> Memory | None:
+                return None
+
+            async def delete_memory(self, *args: Any, **kwargs: Any) -> bool:
+                return False
+
+            async def get_memory(self, memory_id: str) -> Memory | None:
+                return None
+
+        backend = WritingBackend()
+        system = MemorySystem(backend, user_id="alice")  # type: ignore[arg-type]
+        with pytest.raises(TypeError):
+            await system.handle_memory_save(
+                content="Summary",
+                importance=0.5,
+                facts=["A"],
+                background=True,
+            )
+        assert backend.calls == 1
+
+    @pytest.mark.asyncio
     async def test_handle_memory_save_invalid_importance_high(self, memory_system):
         """Test saving a memory with importance > 1.0."""
         result = await memory_system.handle_memory_save(
