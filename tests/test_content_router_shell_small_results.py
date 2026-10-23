@@ -10,6 +10,8 @@ cost. Large build/test logs must keep going through the lossy path.
 
 from __future__ import annotations
 
+from collections.abc import Callable
+
 import pytest
 
 from headroom.config import TransformResult
@@ -349,4 +351,47 @@ def test_small_top_level_text_block_stays_verbatim() -> None:
     result = _route_text_block("Bash", output)
 
     assert result.messages[3]["content"] == [{"type": "text", "text": output}]
+    assert "router:shell_small_result_verbatim" in result.transforms_applied
+
+
+@pytest.mark.parametrize("role", ["tool", "function"])
+@pytest.mark.parametrize("length", [1999, 2000, 2400])
+def test_split_shell_result_uses_total_text_length(role: str, length: int) -> None:
+    """The floor applies to the whole result, not each provider text fragment."""
+    messages = _text_block_conversation("Bash", "")
+    if role == "function":
+        messages[3] = {"role": "function", "name": "Bash"}
+    blocks = [
+        {"type": "text", "text": _padded_output(length // 2)},
+        {"type": "text", "text": _padded_output(length - length // 2)},
+    ]
+    messages[3]["content"] = blocks
+    router = ContentRouter(ContentRouterConfig())
+    router.compress = _fake_compress  # type: ignore[assignment]
+
+    result = router.apply(messages, _tokenizer(), target_ratio=0.4)
+
+    assert (result.messages[3]["content"] == blocks) is (length < 2000)
+    assert ("router:shell_small_result_verbatim" in result.transforms_applied) is (length < 2000)
+
+
+@pytest.mark.parametrize("route", [_route_openai, _route_function, _route_text_block])
+def test_shell_floor_override_applies_to_wire_shapes(
+    monkeypatch: pytest.MonkeyPatch, route: Callable[[str, str], TransformResult]
+) -> None:
+    """A positive override protects below the floor and compresses at it."""
+    monkeypatch.setenv("HEADROOM_SHELL_RESULT_MIN_CHARS", "1000")
+    below = route("Bash", _padded_output(999))
+    at = route("Bash", _padded_output(1000))
+    assert "router:shell_small_result_verbatim" in below.transforms_applied
+    assert "router:shell_small_result_verbatim" not in at.transforms_applied
+
+
+def test_custom_shell_names_are_normalized_and_protected() -> None:
+    """An operator's custom mixed-case shell name gets the same floor."""
+    router = ContentRouter(ContentRouterConfig(bash_tool_names=frozenset({"MyShell"})))
+    router.compress = _fake_compress  # type: ignore[assignment]
+    output = _ls_output()
+    result = router.apply(_openai_conversation("mYsHeLl", output), _tokenizer(), target_ratio=0.4)
+    assert result.messages[3]["content"] == output
     assert "router:shell_small_result_verbatim" in result.transforms_applied

@@ -7383,6 +7383,21 @@ class ContentRouter(Transform):
         any_compressed = False
         role = message.get("role", "")
 
+        # Top-level text blocks are fragments of one tool result. Measure the
+        # whole result so splitting a large log cannot activate the small-result
+        # floor for every fragment. Sum lengths without copying the payload.
+        shell_result_chars = (
+            sum(
+                len(block["text"])
+                for block in content_blocks
+                if isinstance(block, dict)
+                and block.get("type") == "text"
+                and isinstance(block.get("text"), str)
+            )
+            if role in ("tool", "function")
+            else 0
+        )
+
         # Role-based gate for `text` blocks. Tool/function roles are tool
         # outputs and compress freely; assistant defaults to skip (cache
         # safety) with explicit opt-in; unknown roles default to skip.
@@ -7698,8 +7713,11 @@ class ContentRouter(Transform):
                         if role == "tool"
                         else message.get("name", "")
                     )
-                    if _is_small_shell_result(
-                        _shell_name, block.get("text", ""), self.config.bash_tool_names
+                    if (
+                        _is_small_shell_result(
+                            _shell_name, block.get("text", ""), self.config.bash_tool_names
+                        )
+                        and shell_result_chars < _shell_result_min_chars()
                     ):
                         new_blocks.append(block)
                         transforms_applied.append("router:shell_small_result_verbatim")
