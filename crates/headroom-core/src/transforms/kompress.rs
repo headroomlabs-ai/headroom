@@ -267,8 +267,8 @@ impl Kompress {
     /// downloading on miss). Blocking — call off the hot path. Tries the
     /// [`ONNX_CANDIDATES`] in order.
     pub fn from_pretrained(config: KompressConfig) -> Result<Self, KompressError> {
-        // Air-gap chokepoint — the same one `hf_impl.rs` uses for the
-        // tokenizer, for the same reason. `HF_HUB_OFFLINE` only shortcuts the
+        // Air-gap chokepoint — the same guard `hf_cache::hub_api` runs for
+        // the tokenizer and embedder, for the same reason. `HF_HUB_OFFLINE` only shortcuts the
         // cache *lookup*; on a cache miss `hf-hub` still dials huggingface.co,
         // so the Kompress model download is a live egress path under
         // `HEADROOM_OFFLINE=1` and was not covered.

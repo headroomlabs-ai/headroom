@@ -17,6 +17,8 @@
 
 use std::path::{Path, PathBuf};
 
+use thiserror::Error;
+
 /// True when `HEADROOM_HF_PIN` turns revision pinning off, so pinned repos
 /// float on `main` (same values as Python's `onnx_runtime._resolve_revision`).
 #[cfg_attr(not(feature = "ml"), allow(dead_code))] // the pinned loaders are `ml`-only
@@ -140,7 +142,7 @@ pub(crate) fn hf_endpoint() -> String {
 }
 
 /// Why [`hub_api`] returned no client.
-#[derive(Debug, thiserror::Error)]
+#[derive(Debug, Error)]
 pub(crate) enum HubApiError {
     /// `HEADROOM_OFFLINE` is set; refused before the client existed.
     #[error(transparent)]
@@ -154,11 +156,14 @@ pub(crate) enum HubApiError {
 /// with [`hf_token`], as Python's `huggingface_hub` would, for fetching
 /// `destination` (a repo id) for `purpose`.
 ///
-/// This is the air-gap chokepoint for every Rust Hub download: under
-/// `HEADROOM_OFFLINE` it returns [`HubApiError::Offline`] before building the
-/// client, because building it resolves the endpoint and the `ureq` agent,
-/// and `hf-hub` downloads on a cache miss even with `HF_HUB_OFFLINE` set.
-/// Guarding here rather than in each caller means no caller can skip it.
+/// This is the air-gap chokepoint for the tokenizer and embedder downloads:
+/// under `HEADROOM_OFFLINE` it returns [`HubApiError::Offline`] before
+/// building the client, because building it resolves the endpoint and the
+/// `ureq` agent, and `hf-hub` downloads on a cache miss even with
+/// `HF_HUB_OFFLINE` set. Guarding here rather than in each caller means no
+/// caller of this function can skip it. (`Kompress::from_pretrained` still
+/// builds its own `Api::new()` client behind its own guard; production loads
+/// Kompress cache-only through `Kompress::from_cache`.)
 ///
 /// The token is not sent over plain `http://` to a host other than loopback:
 /// it would cross the network in clear text on every request, so the client

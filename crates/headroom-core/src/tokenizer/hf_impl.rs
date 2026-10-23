@@ -175,15 +175,21 @@ impl HfTokenizer {
 /// Refuses with [`HfTokenizerError::Offline`] under `HEADROOM_OFFLINE`.
 fn hub_api(repo: &str) -> Result<hf_hub::api::sync::Api, HfTokenizerError> {
     use crate::hf_cache::HubApiError;
+    const PURPOSE: &str = "HuggingFace tokenizer download";
 
     let hub_error = |source: Box<dyn std::error::Error + Send + Sync>| HfTokenizerError::Hub {
         repo: repo.to_string(),
         source,
     };
-    let cache = crate::hf_cache::hub_cache_dir().ok_or_else(|| {
-        hub_error("no HuggingFace cache directory (set HF_HUB_CACHE or HF_HOME)".into())
-    })?;
-    crate::hf_cache::hub_api(&cache, "HuggingFace tokenizer download", repo).map_err(|e| match e {
+    let Some(cache) = crate::hf_cache::hub_cache_dir() else {
+        // Offline still wins: the caller treats `Offline` as final, and a
+        // missing cache directory is no reason to report a Hub failure.
+        crate::offline::guard_egress(PURPOSE, repo)?;
+        return Err(hub_error(
+            "no HuggingFace cache directory (set HF_HUB_CACHE or HF_HOME)".into(),
+        ));
+    };
+    crate::hf_cache::hub_api(&cache, PURPOSE, repo).map_err(|e| match e {
         HubApiError::Offline(blocked) => HfTokenizerError::Offline(blocked),
         HubApiError::Build(source) => hub_error(Box::new(source)),
     })
@@ -317,7 +323,7 @@ mod tests {
     /// this a real assertion rather than a tautology: without the guard the call
     /// reaches `hf-hub`, dials `huggingface.co`, gets a 401/404 and returns
     /// `HfTokenizerError::Hub`. Only the guard can produce `Offline`, and only
-    /// by returning before `Api::new` — so `Offline` *is* the "no socket was
+    /// by returning before `hf_cache::hub_api` builds the client — so `Offline` *is* the "no socket was
     /// opened" assertion for this path. (A packet-level assertion is not
     /// available to a `cargo test` unit test the way `socket.socket` patching is
     /// in Python; this typed-error distinction is the equivalent signal.)

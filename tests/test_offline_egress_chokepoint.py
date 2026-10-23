@@ -977,9 +977,12 @@ class TestRustOfflineParity:
 
     def test_hf_fetch_guards_before_it_builds_a_client(self) -> None:
         source = _RUST_HF.read_text(encoding="utf-8")
-        assert "guard_egress(" in source, "hf_cache.rs does not consult the offline guard"
-        guard_at = source.index("guard_egress(")
-        api_at = source.index("hf_hub::api::sync::ApiBuilder::from_cache(")
+        # Within hub_api itself: a guard elsewhere in the file does not count.
+        fn_at = source.index("pub(crate) fn hub_api(")
+        body = source[fn_at : source.index("\n}\n", fn_at)]
+        assert "guard_egress(" in body, "hf_cache::hub_api does not consult the offline guard"
+        guard_at = body.index("guard_egress(")
+        api_at = body.index("hf_hub::api::sync::ApiBuilder::from_cache(")
         assert guard_at < api_at, (
             "the offline guard runs after ApiBuilder::build(), which already resolves the "
             "Hub endpoint and builds the ureq agent — guard before the client "
