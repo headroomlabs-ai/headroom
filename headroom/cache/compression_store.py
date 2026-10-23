@@ -40,7 +40,7 @@ import threading
 import time
 from collections import deque
 from contextvars import ContextVar
-from dataclasses import dataclass, field, replace
+from dataclasses import asdict, dataclass, field, replace
 from typing import TYPE_CHECKING, Any
 
 from ..log_safety import describe_exception, safe_id
@@ -736,6 +736,48 @@ class CompressionStore:
             events_copy = [e for e in events_copy if e.tool_name == tool_name]
 
         return list(reversed(events_copy[-limit:]))
+
+    def export_entries(self, hashes: list[str]) -> list[dict[str, Any]]:
+        """The live entries for ``hashes`` as JSON-safe dicts, without counting
+        a retrieval. ``SessionTrackerStore.save_state`` carries them across a
+        restart so the markers it replays still resolve (:meth:`import_entries`)."""
+        with self._lock:
+            found = [self._backend.get(hash_key) for hash_key in hashes]
+        return [asdict(e) for e in found if e is not None and not e.is_expired()]
+
+    def import_entries(self, entries: list[CompressionEntry]) -> int:
+        """Re-store :meth:`export_entries` output, each with its original expiry.
+
+        An entry the backend still holds (a persistent backend kept it) is left
+        as it is. Raises on a malformed entry. Returns the entries stored.
+        """
+        now = time.time()
+        stored = 0
+        for e in entries:
+            if not all(
+                isinstance(v, str) for v in (e.hash, e.original_content, e.compressed_content)
+            ):
+                raise ValueError(f"malformed CCR entry {e.hash!r}")
+            ttl = int(e.created_at + e.ttl - now)
+            if ttl <= 0 or self.exists(e.hash):
+                continue
+            self.store(
+                e.original_content,
+                e.compressed_content,
+                original_tokens=e.original_tokens,
+                compressed_tokens=e.compressed_tokens,
+                original_item_count=e.original_item_count,
+                compressed_item_count=e.compressed_item_count,
+                tool_name=e.tool_name,
+                tool_call_id=e.tool_call_id,
+                query_context=e.query_context,
+                tool_signature_hash=e.tool_signature_hash,
+                compression_strategy=e.compression_strategy,
+                ttl=ttl,
+                explicit_hash=e.hash,
+            )
+            stored += 1
+        return stored
 
     def clear(self) -> None:
         """Clear all entries. Mainly for testing."""
