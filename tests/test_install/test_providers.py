@@ -1139,12 +1139,18 @@ def test_unix_env_failure_restores_earlier_targets_when_existing_target_rejects_
 
 
 def test_unix_env_block_round_trips_shell_special_values(monkeypatch, tmp_path: Path) -> None:
+    import shlex
     import shutil
     import subprocess
+    import sys
 
     from headroom.install import providers
 
-    if shutil.which("bash") is None:
+    # System32 bash.exe is the WSL launcher and cannot open a Windows fixture path.
+    if sys.platform == "win32":
+        pytest.skip("Unix shell rc round-trip is not supported on Windows")
+    shell = shutil.which("bash")
+    if shell is None:
         pytest.skip("bash not available")
     manifest = _manifest(tmp_path)
     manifest.scope = "user"
@@ -1153,7 +1159,8 @@ def test_unix_env_block_round_trips_shell_special_values(monkeypatch, tmp_path: 
         "HEADROOM_JSON": '{"a": "b"}',
         "HEADROOM_TICK": "`id`",
     }
-    bashrc = tmp_path / ".bashrc"
+    bashrc = tmp_path / "dir with spaces" / ".bashrc"
+    bashrc.parent.mkdir()
     monkeypatch.setattr(providers, "unix_user_env_targets", lambda: [bashrc])
 
     providers._apply_unix_env_scope(manifest)
@@ -1161,8 +1168,19 @@ def test_unix_env_block_round_trips_shell_special_values(monkeypatch, tmp_path: 
     manifest.base_env["HEADROOM_WORKSPACE_DIR"] = r"C:\new\dir \d+"
     providers._apply_unix_env_scope(manifest)
 
+    quoted = shlex.quote(str(bashrc))
+    readable = subprocess.run(
+        [shell, "-c", f"test -r {quoted}"],
+        capture_output=True,
+        text=True,
+    )
+    if readable.returncode != 0:
+        pytest.skip("selected shell cannot read the fixture path")
+
     names = list(manifest.base_env)
-    script = f"source {bashrc}; " + "; ".join(f'printf "%s\\0" "${name}"' for name in names)
-    result = subprocess.run(["bash", "-c", script], capture_output=True, text=True, check=True)
+    prints = " && ".join(f'printf "%s\\0" "${name}"' for name in names)
+    # A failed source must fail the script; a following printf must not mask it.
+    script = f"source {quoted} && {prints}"
+    result = subprocess.run([shell, "-c", script], capture_output=True, text=True, check=True)
     assert result.stdout.split("\0")[:-1] == list(manifest.base_env.values())
     assert bashrc.read_text(encoding="utf-8").count("# >>> headroom persistent env >>>") == 1
