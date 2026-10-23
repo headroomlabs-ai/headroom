@@ -134,11 +134,11 @@ impl HfTokenizer {
         // HEADROOM_OFFLINE=1 gets the same refusal whichever runtime reaches
         // for the Hub.
         //
-        // It has to sit here rather than around the `get` below: `Api::new`
-        // builds the `ureq` agent and resolves the endpoint, and hf-hub's own
+        // `crate::hf_cache::hub_api` runs the guard before it builds the
+        // client, rather than around the `get` below: building it creates the
+        // `ureq` agent and resolves the endpoint, and hf-hub's own
         // HF_HUB_OFFLINE handling only covers the cache lookup — a cache miss
-        // still dials out. Guarding first means the air-gapped case never
-        // constructs a client at all.
+        // still dials out. So the air-gapped case never constructs a client.
         //
         // The refusal is hard on purpose. Silently returning a cached or
         // estimating tokenizer would leave token counts subtly wrong with no
@@ -150,11 +150,7 @@ impl HfTokenizer {
         // client exists" and "serve from the cache" cannot both hold here. An
         // air-gapped deployment with pre-seeded artifacts should point at them
         // with `from_file`, which is network-free by construction.
-        crate::offline::guard_egress("HuggingFace tokenizer download", repo)?;
-        let api = hub_api().map_err(|source| HfTokenizerError::Hub {
-            repo: repo.to_string(),
-            source,
-        })?;
+        let api = hub_api(repo)?;
         let path = api
             .model(repo.to_string())
             .get("tokenizer.json")
@@ -174,12 +170,23 @@ impl HfTokenizer {
     }
 }
 
-/// The Hub client for [`HfTokenizer::from_pretrained`]: caching in Python's
-/// hub cache directory, with Python's token and endpoint.
-fn hub_api() -> Result<hf_hub::api::sync::Api, Box<dyn std::error::Error + Send + Sync>> {
-    let cache = crate::hf_cache::hub_cache_dir()
-        .ok_or("no HuggingFace cache directory (set HF_HUB_CACHE or HF_HOME)")?;
-    Ok(crate::hf_cache::hub_api(&cache)?)
+/// The Hub client for [`HfTokenizer::from_pretrained`] fetching `repo`:
+/// caching in Python's hub cache directory, with Python's token and endpoint.
+/// Refuses with [`HfTokenizerError::Offline`] under `HEADROOM_OFFLINE`.
+fn hub_api(repo: &str) -> Result<hf_hub::api::sync::Api, HfTokenizerError> {
+    use crate::hf_cache::HubApiError;
+
+    let hub_error = |source: Box<dyn std::error::Error + Send + Sync>| HfTokenizerError::Hub {
+        repo: repo.to_string(),
+        source,
+    };
+    let cache = crate::hf_cache::hub_cache_dir().ok_or_else(|| {
+        hub_error("no HuggingFace cache directory (set HF_HUB_CACHE or HF_HOME)".into())
+    })?;
+    crate::hf_cache::hub_api(&cache, "HuggingFace tokenizer download", repo).map_err(|e| match e {
+        HubApiError::Offline(blocked) => HfTokenizerError::Offline(blocked),
+        HubApiError::Build(source) => hub_error(Box::new(source)),
+    })
 }
 
 impl Tokenizer for HfTokenizer {

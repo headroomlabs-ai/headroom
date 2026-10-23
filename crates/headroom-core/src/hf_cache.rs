@@ -139,15 +139,37 @@ pub(crate) fn hf_endpoint() -> String {
     }
 }
 
+/// Why [`hub_api`] returned no client.
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum HubApiError {
+    /// `HEADROOM_OFFLINE` is set; refused before the client existed.
+    #[error(transparent)]
+    Offline(#[from] crate::offline::OfflineEgressBlocked),
+    /// `hf-hub` could not build the client.
+    #[error(transparent)]
+    Build(#[from] hf_hub::api::sync::ApiError),
+}
+
 /// An `hf-hub` client that caches in `cache` and talks to [`hf_endpoint`]
-/// with [`hf_token`], as Python's `huggingface_hub` would. Building it opens
-/// no connection; callers put their `guard_egress` in front of it.
+/// with [`hf_token`], as Python's `huggingface_hub` would, for fetching
+/// `destination` (a repo id) for `purpose`.
+///
+/// This is the air-gap chokepoint for every Rust Hub download: under
+/// `HEADROOM_OFFLINE` it returns [`HubApiError::Offline`] before building the
+/// client, because building it resolves the endpoint and the `ureq` agent,
+/// and `hf-hub` downloads on a cache miss even with `HF_HUB_OFFLINE` set.
+/// Guarding here rather than in each caller means no caller can skip it.
 ///
 /// The token is not sent over plain `http://` to a host other than loopback:
 /// it would cross the network in clear text on every request, so the client
 /// goes without it and says why. Python would send it; a gated repo behind
 /// such a mirror then answers 401 rather than leak the credential.
-pub(crate) fn hub_api(cache: &Path) -> Result<hf_hub::api::sync::Api, hf_hub::api::sync::ApiError> {
+pub(crate) fn hub_api(
+    cache: &Path,
+    purpose: &str,
+    destination: &str,
+) -> Result<hf_hub::api::sync::Api, HubApiError> {
+    crate::offline::guard_egress(purpose, destination)?;
     let endpoint = hf_endpoint();
     let token = hf_token().filter(|_| {
         let exposed = sends_in_clear_text(&endpoint);
@@ -166,6 +188,7 @@ pub(crate) fn hub_api(cache: &Path) -> Result<hf_hub::api::sync::Api, hf_hub::ap
         .with_endpoint(endpoint)
         .with_token(token)
         .build()
+        .map_err(HubApiError::Build)
 }
 
 /// Whether a request to `endpoint` would carry its headers unencrypted off

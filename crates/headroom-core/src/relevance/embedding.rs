@@ -120,19 +120,24 @@ fn default_model_repo(
     cache_root: &Path,
     revision: &str,
 ) -> Result<hf_hub::api::sync::ApiRepo, String> {
-    // Air-gap chokepoint, ahead of the client: building it resolves the Hub
-    // endpoint and the `ureq` agent, and `hf-hub` downloads on a cache miss
-    // even with `HF_HUB_OFFLINE` set. Callers reach this only on a cache
+    // `hub_api` is the air-gap chokepoint: under `HEADROOM_OFFLINE` it
+    // refuses before building the client. Callers reach this only on a cache
     // miss, so a pre-seeded air-gapped host still loads.
     //
     // The refusal is soft by design: every caller degrades to the BM25
     // scorer on `Err`, so an air-gapped box loses embedding relevance instead
     // of failing a request. The message names the switch so the operator can
     // tell the causes apart in the log.
-    crate::offline::guard_egress("fastembed embedding model download", DEFAULT_MODEL_REPO)
-        .map_err(|e| format!("EmbeddingScorer model load refused: {e}"))?;
-    let api = crate::hf_cache::hub_api(cache_root)
-        .map_err(|e| format!("EmbeddingScorer: HuggingFace client init failed: {e}"))?;
+    use crate::hf_cache::HubApiError;
+    let api = crate::hf_cache::hub_api(
+        cache_root,
+        "fastembed embedding model download",
+        DEFAULT_MODEL_REPO,
+    )
+    .map_err(|e| match e {
+        HubApiError::Offline(e) => format!("EmbeddingScorer model load refused: {e}"),
+        HubApiError::Build(e) => format!("EmbeddingScorer: HuggingFace client init failed: {e}"),
+    })?;
     Ok(api.repo(hf_hub::Repo::with_revision(
         DEFAULT_MODEL_REPO.to_string(),
         hf_hub::RepoType::Model,
