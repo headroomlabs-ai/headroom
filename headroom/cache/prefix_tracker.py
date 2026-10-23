@@ -16,16 +16,19 @@ pipeline skips them entirely.
 
 from __future__ import annotations
 
+import contextlib
 import copy
 import hashlib
 import itertools
 import json
 import logging
 import os
+import re
 import time
 from collections import OrderedDict, deque
 from contextvars import ContextVar
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 
 logger = logging.getLogger(__name__)
@@ -70,6 +73,23 @@ _CACHE_TTL_CLEANUP_MARGIN_SECONDS = 60
 # request that resumes an older snapshot keeps it next-newest, so any number
 # of forks off one turn leaves that turn resumable.
 _LINEAGE_HISTORY = 3
+
+# Opt-in file for SessionTrackerStore state across a graceful restart. It holds
+# conversation content, so nothing is written unless an operator sets it.
+PREFIX_STATE_FILE_ENV = "HEADROOM_PREFIX_STATE_FILE"
+_PREFIX_STATE_VERSION = 1
+# Newest trackers first; whatever does not fit starts cold, as all did before.
+_PREFIX_STATE_MAX_TRACKERS = 256
+_PREFIX_STATE_MAX_BYTES = 64 * 1024 * 1024
+# Any CCR reference in saved messages: ``hash=<hex>`` markers (Retrieve
+# more/original, compressed-item counts) and SmartCrusher's ``<<ccr:<hex>``.
+_CCR_HASH_RE = re.compile(r"(?:hash=|<<ccr:)([0-9a-f]{12,24})")
+
+
+def prefix_state_file() -> str | None:
+    """The configured tracker state file, or None when persistence is off."""
+    return os.environ.get(PREFIX_STATE_FILE_ENV, "").strip() or None
+
 
 # (tracker, turn, resumed state) the current request resolved to. Each proxied
 # request runs in its own asyncio task, so it reads the state it resumed and
@@ -1180,6 +1200,12 @@ class PrefixCacheTracker:
         # lazily by the handler when read maturation is enabled. Rides
         # here so it shares the session's affinity and TTL cleanup.
         self.read_maturation_manager: Any = None
+        # Set by SessionTrackerStore.load_state: this process has no
+        # CompressionCache entries behind the restored prefix yet, and the
+        # handler adopts the saved maturation state (validated at load) when it
+        # builds the manager.
+        self.restored_from_disk = False
+        self.restored_maturation_state: dict[str, Any] | None = None
 
         # Stats
         self._busts_avoided: int = 0
@@ -1609,6 +1635,42 @@ def _lineage_snapshot(obj: Any) -> Any:
     return obj
 
 
+def _deref(table: list[Any], refs: list[int]) -> list[Any]:
+    """Rebuild a saved message list. Restored lists share message objects,
+    which is safe: tracker and lineage lists are never mutated in place."""
+    if not all(type(i) is int and 0 <= i < len(table) for i in refs):
+        raise ValueError("message reference out of range")
+    return [table[i] for i in refs]
+
+
+def _decode_turn_state(table: list[Any], state: list[Any]) -> tuple[Any, ...]:
+    turn, cached_tokens, cached_messages, original, forwarded = state
+    return (
+        int(turn),
+        int(cached_tokens),
+        int(cached_messages),
+        _deref(table, original),
+        _deref(table, forwarded),
+    )
+
+
+def seed_restored_compression_cache(tracker: Any, comp_cache: Any) -> None:
+    """Seed a token-mode CompressionCache on a tracker's first request after
+    :meth:`SessionTrackerStore.load_state`.
+
+    The new process has no cache entries behind the restored prefix, so the
+    freeze computed from that cache freezes nothing: the pipeline recompresses
+    (and read maturation rewrites) messages the provider cached, and beyond the
+    provider-confirmed floor the overlay declines a larger replay. Seeding with
+    what was forwarded gives the freeze the pre-restart count.
+    """
+    if getattr(tracker, "restored_from_disk", False):
+        tracker.restored_from_disk = False
+        comp_cache.update_from_result(
+            tracker.get_last_original_messages(), tracker.get_last_forwarded_messages()
+        )
+
+
 class SessionTrackerStore:
     """Manages PrefixCacheTracker instances across sessions.
 
@@ -2007,3 +2069,218 @@ class SessionTrackerStore:
     def active_sessions(self) -> int:
         """Number of active session trackers (one per conversation lineage)."""
         return len(self._trackers)
+
+    def save_state(self, path: str) -> int:
+        """Write the live trackers to ``path`` for the next process to resume.
+
+        Called on graceful shutdown when ``HEADROOM_PREFIX_STATE_FILE`` is set.
+        Without it, a restart leaves every warm conversation with no tracker:
+        its next request recompresses the whole history into bytes that differ
+        from the prefix the provider cached, and the cache is re-written from
+        the first changed message. Newest trackers first, capped at
+        ``_PREFIX_STATE_MAX_TRACKERS`` and ``_PREFIX_STATE_MAX_BYTES``; a
+        tracker whose messages are not JSON is skipped. Each tracker carries
+        the CCR entries its messages reference, so its replayed markers still
+        resolve when the CCR backend does not survive the restart (memory).
+        Never raises; returns the number of trackers written.
+        """
+        from headroom.cache.compression_store import get_compression_store
+        from headroom.fsutil import write_text
+        from headroom.paths import persistence_allowed
+
+        if not persistence_allowed("prefix-cache tracker state"):
+            return 0
+        sessions = {key: sid for sid, family in self._lineages.items() for key in family}
+        live = sorted(
+            (item for item in self._trackers.items() if not item[1].is_expired),
+            key=lambda item: item[1]._last_activity,
+            reverse=True,
+        )
+        entries: list[str] = []
+        ccr: dict[str, str] = {}
+        size = 0
+        for key, tracker in live[:_PREFIX_STATE_MAX_TRACKERS]:
+            try:
+                entry = self._encode_tracker(key, tracker, sessions.get(key))
+                refs = [h for h in dict.fromkeys(_CCR_HASH_RE.findall(entry)) if h not in ccr]
+                records = get_compression_store().export_entries(refs) if refs else []
+                payloads = {r["hash"]: json.dumps(r) for r in records}
+            except Exception:  # an unsaveable tracker starts cold, as all did before
+                continue
+            grow = len(entry) + sum(len(p) + 1 for p in payloads.values())
+            if size + grow > _PREFIX_STATE_MAX_BYTES:
+                continue
+            size += grow + 1
+            entries.append(entry)
+            ccr.update(payloads)
+        try:
+            target = Path(path)
+            target.parent.mkdir(parents=True, exist_ok=True)
+            # write_text keeps the target's mode, so tighten it in place rather
+            # than unlinking: a failed write must leave the last snapshot.
+            with contextlib.suppress(FileNotFoundError):
+                target.chmod(0o600)
+            write_text(
+                target,
+                f'{{"version":{_PREFIX_STATE_VERSION},"trackers":[{",".join(entries)}],'
+                f'"ccr":[{",".join(ccr.values())}]}}',
+            )
+        except OSError as exc:
+            logger.warning("SessionTrackerStore: prefix state not saved to %s: %s", path, exc)
+            return 0
+        logger.info(
+            "SessionTrackerStore: saved %d of %d prefix trackers (%d bytes) to %s",
+            len(entries),
+            len(self._trackers),
+            size,
+            path,
+        )
+        return len(entries)
+
+    def _encode_tracker(self, key: str, tracker: PrefixCacheTracker, session_id: str | None) -> str:
+        """One tracker as JSON, each distinct message stored once.
+
+        Successive turns, the lineage snapshots and the original/forwarded
+        pairs mostly repeat the same messages, so this keeps the file near one
+        copy of each conversation instead of up to eleven.
+        """
+        index: dict[str, int] = {}
+        memo: dict[int, list[int]] = {}
+
+        def ref(messages: list[Any]) -> list[int]:
+            if id(messages) not in memo:
+                refs = []
+                for message in messages:
+                    blob = json.dumps(message)
+                    refs.append(index.setdefault(blob, len(index)))
+                memo[id(messages)] = refs
+            return memo[id(messages)]
+
+        def state(s: tuple[Any, ...]) -> list[Any]:
+            return [s[0], s[1], s[2], ref(s[3]), ref(s[4])]
+
+        maturation = tracker.read_maturation_manager
+        meta = {
+            "key": key,
+            "session": session_id,
+            "affinity": self._lineage_affinities.get(key),
+            "provider": tracker.provider,
+            "last_activity": tracker._last_activity,
+            "cache_ttl": tracker._cache_ttl_seconds,
+            "state": state(tracker._turn_state()),
+            "turns": [[t, state(s)] for t, s in tracker._turn_states.items() if s is not None],
+            "history": [[ref(snap), t] for snap, t in self._lineage_history.get(key, ())],
+            "maturation": None if maturation is None else maturation.export_state(),
+        }
+        return f'{{"meta":{json.dumps(meta)},"messages":[{",".join(index)}]}}'
+
+    def load_state(self, path: str) -> int:
+        """Resume the trackers :meth:`save_state` wrote, before serving.
+
+        Trackers past their retention are dropped. The file is removed once
+        loaded, so a later crash cannot bring back state older than what it
+        lost. A missing file is normal; an unreadable or invalid one is logged
+        and leaves the store empty. Never raises; returns trackers restored.
+        """
+        from headroom.paths import persistence_allowed
+
+        # Loading deletes the file, so stateless mode leaves it for a later run.
+        if not persistence_allowed("prefix-cache tracker state"):
+            return 0
+        try:
+            with open(path, encoding="utf-8") as f:
+                data = json.load(f)
+            restored = self._decode_state(data)
+        except FileNotFoundError:
+            return 0
+        except Exception as exc:  # any bad file must leave boot unaffected
+            logger.warning(
+                "SessionTrackerStore: ignoring prefix state %s (%s: %s)",
+                path,
+                type(exc).__name__,
+                exc,
+            )
+            return 0
+        try:
+            os.remove(path)
+        except OSError as exc:
+            logger.warning("SessionTrackerStore: could not remove %s: %s", path, exc)
+        logger.info(
+            "SessionTrackerStore: restored %d of %d prefix trackers from %s",
+            restored,
+            len(data["trackers"]),
+            path,
+        )
+        return restored
+
+    def _decode_state(self, data: Any) -> int:
+        """Validate the whole file first, then install it; a bad file installs nothing."""
+        from headroom.cache.compression_store import CompressionEntry, get_compression_store
+
+        if data.get("version") != _PREFIX_STATE_VERSION:
+            raise ValueError(f"unsupported version {data.get('version')!r}")
+        ccr = [CompressionEntry(**record) for record in data["ccr"]]
+        trackers: dict[str, PrefixCacheTracker] = {}
+        families: dict[str, OrderedDict[str, list[Any]]] = {}
+        affinities: dict[str, str | None] = {}
+        histories: dict[str, deque[tuple[list[Any], int]]] = {}
+        now = time.time()
+        # Oldest first, so each family keeps its lineages in creation order.
+        for entry in reversed(data["trackers"]):
+            meta, table = entry["meta"], entry["messages"]
+            tracker = PrefixCacheTracker(str(meta["provider"]), self._default_config)
+            tracker._last_activity = float(meta["last_activity"])
+            tracker.observe_cache_ttl(meta["cache_ttl"])
+            # NaN or a future stamp would never expire.
+            if tracker.is_expired or not tracker._last_activity <= now:
+                continue
+            (
+                tracker._turn_number,
+                tracker._cached_token_count,
+                tracker._cached_message_count,
+                tracker._last_original_messages,
+                tracker._last_forwarded_messages,
+            ) = _decode_turn_state(table, meta["state"])
+            tracker._turn_states = {int(t): _decode_turn_state(table, s) for t, s in meta["turns"]}
+            tracker.restored_from_disk = True
+            if meta["maturation"] is not None:
+                from headroom.transforms.read_maturation import ReadMaturationManager
+
+                tracker.restored_maturation_state = ReadMaturationManager.validate_state(
+                    meta["maturation"]
+                )
+            key = str(meta["key"])
+            trackers[key] = tracker
+            history = deque(
+                ((_deref(table, snap), int(t)) for snap, t in meta["history"]),
+                maxlen=_LINEAGE_HISTORY,
+            )
+            if not history:
+                continue
+            histories[key] = history
+            if meta["session"] is not None:
+                families.setdefault(str(meta["session"]), OrderedDict())[key] = history[0][0]
+                affinity = meta["affinity"]
+                affinities[key] = None if affinity is None else str(affinity)
+
+        if ccr and trackers:
+            # First, so a marker a restored tracker replays resolves from its
+            # first request; a failure here still installs no tracker.
+            get_compression_store().import_entries(ccr)
+
+        # New turns and lineages must not reuse a restored id.
+        turns = [t for h in histories.values() for _, t in h]
+        turns += [t for tracker in trackers.values() for t in tracker._turn_states]
+        lineage_ns = [
+            int(n)
+            for _, sep, n in (key.rpartition("\x00") for key in trackers)
+            if sep and n.isdecimal()
+        ]
+        self._turn_counter = itertools.count(max([next(self._turn_counter), *turns]) + 1)
+        self._lineage_counter = itertools.count(max([next(self._lineage_counter), *lineage_ns]) + 1)
+        self._trackers.update(trackers)
+        self._lineage_history.update(histories)
+        self._lineage_affinities.update(affinities)
+        for session_id, family in families.items():
+            self._lineages.setdefault(session_id, OrderedDict()).update(family)
+        return len(trackers)

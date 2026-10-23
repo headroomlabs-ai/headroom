@@ -528,16 +528,21 @@ headroom wrap antigravity          # Start proxy + print Antigravity setup instr
 headroom mcp install --agent antigravity   # Register the Headroom MCP server in Antigravity
 ```
 
-`wrap antigravity` prints a custom OpenAI-compatible model-provider base URL
-to add in Antigravity's model-provider settings; Antigravity fetches the model
-list from `GET /v1/models` on its own. Native Cloud Code Assist traffic
-(`google-antigravity` clients) is accepted on
-[`POST /v1internal:streamGenerateContent`](#post-v1internalstreamgeneratecontent)
-and routed upstream like any other Cloud Code request.
+The Antigravity IDE does not support third-party model providers — its
+agent models are Google-managed, so there is no settings panel to point
+at the proxy. What the proxy does offer Antigravity users:
 
-MCP registration writes to Antigravity's global `mcp_config.json` under
-`~/.gemini/` (preferring the install's current location when one already
-exists) and refuses to overwrite a config file that does not parse as JSON.
+- MCP tools: `mcp install` writes the Headroom server into Antigravity's
+  global `mcp_config.json` under `~/.gemini/` (preferring the install's
+  current location when one already exists) and refuses to overwrite a
+  config file that does not parse as JSON.
+- Native traffic: `google-antigravity` clients are accepted on
+  [`POST /v1internal:streamGenerateContent`](#post-v1internalstreamgeneratecontent)
+  and routed upstream like any other Cloud Code request.
+
+The Antigravity CLI (`agy`), unlike the IDE, accepts a custom endpoint
+via its `GOOGLE_GEMINI_BASE_URL` setting — the one Antigravity surface
+where a custom model endpoint is supported.
 
 ### `POST /v1/compress`
 
