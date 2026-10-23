@@ -7905,21 +7905,19 @@ def antigravity(
     verbose: bool,
     prepare_only: bool,
 ) -> None:
-    """Start Headroom proxy for use with Antigravity IDE.
+    """Start Headroom proxy for use with the Antigravity IDE.
 
     \b
-    Antigravity reads its model endpoints from its model-provider settings,
-    not from environment variables. This command starts the proxy and prints
-    the settings to add as a custom OpenAI-compatible model provider.
-
-    \b
-    After running this command, open Antigravity and add a custom model
-    provider with the printed base URL. Antigravity fetches the model list
-    from GET /v1/models automatically.
+    The Antigravity IDE does not support third-party model providers —
+    its agent models are Google-managed. This command starts the proxy
+    and prints what the integration actually covers: MCP server
+    registration (`headroom mcp install --agent antigravity`) and the
+    native `POST /v1internal:streamGenerateContent` endpoint for
+    `google-antigravity` clients.
 
     \b
     Example:
-        headroom wrap antigravity                # Start proxy + Antigravity settings
+        headroom wrap antigravity                # Start proxy + Antigravity setup
         headroom wrap antigravity --port 9999    # Custom proxy port
     """
     if prepare_only:
