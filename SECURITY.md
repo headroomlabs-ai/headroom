@@ -105,7 +105,9 @@ host, and what the local admin surface does and does not allow. The summary:
   loopback client address *and* a loopback `Host:` header, plus a same-origin check on
   the mutating ones. This is a local-trust model: any process on the same host is
   trusted. Setting `HEADROOM_PROXY_TRUSTED_DASHBOARD_CLIENT_CIDRS` deliberately widens
-  the settings and stats surface beyond loopback.
+  the settings and stats surface beyond loopback. Setting `HEADROOM_PROXY_TOKEN` also
+  shows every token holder the per-request `/stats` metadata of all callers, but opens
+  none of these routes.
 
 Thank you for helping keep Headroom and its users safe!
 
