@@ -600,9 +600,10 @@ class SmartCrusher(Transform):
         Used both for protected-pattern matching and for identity
         comparison across the crush boundary — kept rows are
         re-serialized by Rust, so rows are matched by content, not by
-        Python object identity.
+        Python object identity. ``ensure_ascii=False`` so a pattern such
+        as ``Kraków`` sees the characters, not ``\\u00f3`` escapes.
         """
-        return json.dumps(item, sort_keys=True, default=str)
+        return json.dumps(item, sort_keys=True, default=str, ensure_ascii=False)
 
     def _row_matches_protected(self, item: Any) -> bool:
         text = self._canon(item)
