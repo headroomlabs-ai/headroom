@@ -1751,11 +1751,31 @@ class AnthropicHandlerMixin:
             # parallel sub-calls commonly share model+system+history while
             # carrying different tool sets.  Sharing one tracker across those
             # requests pins cache reads at the early tools segment (#2671).
-            from headroom.cache.prefix_tracker import segment_fingerprint
+            # Deferred tools are not in that key, so a ToolSearch load that
+            # appends one keeps the conversation's lineage, but only where they
+            # reach the provider still deferred. A third-party upstream gets
+            # them eagerly (the tool-search downgrade below uses this same
+            # predicate) and so does a translating backend; there a load does
+            # change the provider's key, and the key here counts them.
+            from headroom.cache.prefix_tracker import cache_key_tools, segment_fingerprint
+            from headroom.proxy.helpers import anthropic_first_party_tool_search_supported
 
+            _anthropic_target_base_url = upstream_base_url or self.ANTHROPIC_API_URL
+            _third_party_anthropic_upstream = provider_name == "anthropic" and (
+                not anthropic_first_party_tool_search_supported(_anthropic_target_base_url)
+            )
             affinity_tools = self._tools_for_forwarding(
                 body.get("tools"), preserve_order=preserve_tool_order
             )
+            from headroom.proxy import runtime_env
+
+            if (
+                not _third_party_anthropic_upstream
+                and getattr(self, "anthropic_backend", None) is None
+                and runtime_env.getenv("HEADROOM_DEFERRED_TOOL_AFFINITY", "1").strip().lower()
+                not in ("0", "false", "no", "off")
+            ):
+                affinity_tools = cache_key_tools(affinity_tools)
             cache_affinity = segment_fingerprint(
                 {
                     "model": model,
@@ -3324,14 +3344,10 @@ class AnthropicHandlerMixin:
                 tokens_saved = max(0, original_tokens - optimized_tokens)
 
             from headroom.proxy.helpers import (
-                anthropic_first_party_tool_search_supported,
                 strip_first_party_tool_search_tools_for_third_party_upstream,
             )
 
-            _anthropic_target_base_url = upstream_base_url or self.ANTHROPIC_API_URL
-            _third_party_anthropic_upstream = provider_name == "anthropic" and (
-                not anthropic_first_party_tool_search_supported(_anthropic_target_base_url)
-            )
+            # _third_party_anthropic_upstream is decided before the lineage key.
             if _third_party_anthropic_upstream:
                 _tools_before_strip = body.get("tools")
                 _tools_after_strip = strip_first_party_tool_search_tools_for_third_party_upstream(
