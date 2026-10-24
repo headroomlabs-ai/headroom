@@ -596,6 +596,24 @@ def _external_compressor_matches(descriptor: CompressorDescriptor, content_mime:
     return any(d in ("*", "*/*") or d == type_wildcard for d in declared)
 
 
+def _malformed_tool_call_ids(messages: list[dict[str, Any]]) -> set[str]:
+    """Ids of OpenAI tool calls whose ``function`` is not an object.
+
+    Such a call has no readable tool name, so its result cannot be classified;
+    it is passed through like a verbatim-excluded tool rather than compressed.
+    """
+    ids: set[str] = set()
+    for msg in messages:
+        if msg.get("role") != "assistant":
+            continue
+        for tc in msg.get("tool_calls") or []:
+            if isinstance(tc, dict) and not isinstance(tc.get("function"), dict):
+                tc_id = tc.get("id")
+                if isinstance(tc_id, str) and tc_id:
+                    ids.add(tc_id)
+    return ids
+
+
 def _tool_call_args_text(raw: Any) -> str:
     """Compact, query-usable text from a tool call's args.
 
@@ -5788,7 +5806,9 @@ class ContentRouter(Transform):
             for tc in msg.get("tool_calls") or []:
                 if isinstance(tc, dict):
                     tc_id = tc.get("id", "")
-                    fn = tc.get("function", {})
+                    fn = tc.get("function")
+                    if not isinstance(fn, dict):  # "function": null / non-object
+                        continue
                     name = fn.get("name", "")
                     call_args = fn.get("arguments")
                     if name:
@@ -6140,6 +6160,9 @@ class ContentRouter(Transform):
             for tool_id, name in tool_name_map.items()
             if is_tool_excluded(name, exclude_tools)
         }
+        # A call with no readable name keeps its result untouched, as it was
+        # before such calls stopped raising out of apply().
+        excluded_tool_ids |= _malformed_tool_call_ids(messages)
 
         # CCR-retrieve tool IDs, precomputed once (mirrors excluded_tool_ids
         # above, rather than calling is_tool_excluded() per message/block). A
@@ -6534,7 +6557,7 @@ class ContentRouter(Transform):
             if role == "tool":
                 if tool_call_id in excluded_tool_ids:
                     tool_name = tool_name_map.get(tool_call_id, "")
-                    if tool_name and is_tool_excluded(tool_name, DEFAULT_VERBATIM_EXCLUDE_TOOLS):
+                    if not tool_name or is_tool_excluded(tool_name, DEFAULT_VERBATIM_EXCLUDE_TOOLS):
                         result_slots[i] = message
                         transforms_applied.append("router:excluded:tool")
                         route_counts["excluded_tool"] += 1
@@ -7663,7 +7686,7 @@ class ContentRouter(Transform):
                     continue
                 if tool_use_id in excluded_tool_ids:
                     tool_name = tool_name_map.get(tool_use_id, "") if tool_name_map else ""
-                    if tool_name and is_tool_excluded(tool_name, DEFAULT_VERBATIM_EXCLUDE_TOOLS):
+                    if not tool_name or is_tool_excluded(tool_name, DEFAULT_VERBATIM_EXCLUDE_TOOLS):
                         new_blocks.append(block)
                         transforms_applied.append("router:excluded:tool")
                         if route_counts is not None:

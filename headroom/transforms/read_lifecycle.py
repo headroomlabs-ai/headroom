@@ -181,7 +181,9 @@ class ReadLifecycleManager:
                 if not isinstance(tc, dict):
                     continue
                 tc_id = tc.get("id", "")
-                func = tc.get("function", {})
+                func = tc.get("function")
+                if not isinstance(func, dict):  # "function": null / non-object
+                    continue
                 name = func.get("name", "")
                 if not tc_id or not name:
                     continue
@@ -191,11 +193,15 @@ class ReadLifecycleManager:
                 limit = None
                 try:
                     args = json.loads(func.get("arguments", "{}"))
+                except (json.JSONDecodeError, TypeError):
+                    args = None
+                if isinstance(args, dict):  # arguments may decode to a list/str/number
                     file_path = args.get("file_path") or args.get("path")
                     offset = args.get("offset")
                     limit = args.get("limit")
-                except (json.JSONDecodeError, TypeError):
-                    pass
+                # file_path is a dict key downstream; an unhashable value must not reach it.
+                if not isinstance(file_path, str):
+                    file_path = None
                 metadata[tc_id] = (name, file_path, offset, limit)
 
             # Anthropic format: content blocks with type=tool_use
@@ -218,6 +224,8 @@ class ReadLifecycleManager:
                     file_path = inp.get("file_path") or inp.get("path")
                     offset = inp.get("offset")
                     limit = inp.get("limit")
+                if not isinstance(file_path, str):
+                    file_path = None
                 metadata[tc_id] = (name, file_path, offset, limit)
 
         return metadata
