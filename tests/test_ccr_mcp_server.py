@@ -542,6 +542,215 @@ def test_run_stdio_reaps_process_on_parent_death(monkeypatch) -> None:
     assert cleaned["done"] is True
 
 
+# --- Kompress warm-up -------------------------------------------------------
+# `headroom mcp serve` never loaded the Kompress model, so headroom_compress
+# stayed router:noop. The server now warms the compressor the compress()
+# pipeline serves requests with, the same way the proxy does.
+
+_WARM_MODEL_ID = "test/mcp-warmup-model"
+
+
+class _WarmKompress:
+    def __init__(self) -> None:
+        self.config = type("Cfg", (), {"model_id": _WARM_MODEL_ID})()
+        self.calls: list[bool] = []
+        self.preloaded = threading.Event()
+        self._degraded_reason: str | None = None
+
+    def preload(self, *, allow_download: bool = True) -> str:
+        self.calls.append(allow_download)
+        self._degraded_reason = "canary too slow"
+        self.preloaded.set()
+        return "onnx"
+
+
+@pytest.fixture
+def warm_env(monkeypatch):
+    import importlib
+
+    from headroom.transforms import kompress_compressor as kc
+
+    compress_module = importlib.import_module("headroom.compress")
+
+    monkeypatch.setenv("HEADROOM_KOMPRESS_WARMUP_DELAY_SECONDS", "0")
+    monkeypatch.delenv("HEADROOM_KOMPRESS_WARMUP", raising=False)
+    monkeypatch.setattr("platform.libc_ver", lambda: ("glibc", "2.35"))
+
+    def install(compressor):
+        # pytest re-sets this per phase, so clear it in the test body.
+        monkeypatch.delenv("PYTEST_CURRENT_TEST", raising=False)
+        router = type("Router", (), {"_get_kompress": lambda self: compressor})()
+        pipeline = type("Pipeline", (), {"transforms": [router]})()
+        monkeypatch.setattr(compress_module, "_get_pipeline", lambda: pipeline)
+
+    yield install
+    with kc._download_threads_lock:
+        thread = kc._download_threads.pop(_WARM_MODEL_ID, None)
+        kc._download_failures.pop(_WARM_MODEL_ID, None)
+    if thread is not None:
+        thread.join(timeout=5)
+
+
+def test_mcp_warmup_preloads_router_compressor_cache_first(warm_env) -> None:
+    kompress = _WarmKompress()
+    warm_env(kompress)
+    server = mcp_server.HeadroomMCPServer(check_proxy=False)
+    assert server._start_kompress_warmup() is True
+    assert kompress.preloaded.wait(5)
+    assert kompress.calls == [False]
+    # The degraded verdict set during warm-up is on the serving instance.
+    assert kompress._degraded_reason == "canary too slow"
+
+
+def test_mcp_warmup_falls_back_to_download_when_not_cached(warm_env) -> None:
+    from headroom.transforms.kompress_compressor import KompressModelNotCached
+
+    class _NotCached(_WarmKompress):
+        def preload(self, *, allow_download: bool = True) -> str:
+            if not allow_download:
+                self.calls.append(False)
+                raise KompressModelNotCached("nope")
+            return super().preload(allow_download=allow_download)
+
+    kompress = _NotCached()
+    warm_env(kompress)
+    assert mcp_server.HeadroomMCPServer(check_proxy=False)._start_kompress_warmup() is True
+    assert kompress.preloaded.wait(5)
+    assert kompress.calls == [False, True]
+
+
+def test_mcp_warmup_old_glibc_skips_unless_forced(warm_env, monkeypatch) -> None:
+    monkeypatch.setattr("platform.libc_ver", lambda: ("glibc", "2.17"))
+    kompress = _WarmKompress()
+    warm_env(kompress)
+    server = mcp_server.HeadroomMCPServer(check_proxy=False)
+    assert server._start_kompress_warmup() is False
+    assert not kompress.preloaded.wait(0.2)
+
+    monkeypatch.setenv("HEADROOM_KOMPRESS_WARMUP", "1")
+    assert server._start_kompress_warmup() is True
+    assert kompress.preloaded.wait(5)
+
+
+def test_mcp_warmup_disabled_by_env(warm_env, monkeypatch) -> None:
+    monkeypatch.setenv("HEADROOM_KOMPRESS_WARMUP", "0")
+    kompress = _WarmKompress()
+    warm_env(kompress)
+    assert mcp_server.HeadroomMCPServer(check_proxy=False)._start_kompress_warmup() is False
+    assert not kompress.preloaded.wait(0.2)
+
+
+def test_mcp_warmup_skips_remote_endpoint(warm_env) -> None:
+    class _Remote:  # remote compressor: no preload
+        pass
+
+    warm_env(_Remote())
+    assert mcp_server.HeadroomMCPServer(check_proxy=False)._start_kompress_warmup() is False
+
+
+def test_mcp_warmup_failure_does_not_crash(warm_env, caplog) -> None:
+    class _Boom(_WarmKompress):
+        def preload(self, *, allow_download: bool = True) -> str:
+            self.preloaded.set()
+            raise OSError("no network")
+
+    kompress = _Boom()
+    warm_env(kompress)
+    assert mcp_server.HeadroomMCPServer(check_proxy=False)._start_kompress_warmup() is True
+    assert kompress.preloaded.wait(5)
+
+
+def test_mcp_warmup_not_started_when_pipeline_fails(warm_env, monkeypatch) -> None:
+    import importlib
+
+    warm_env(_WarmKompress())
+
+    def broken_pipeline():
+        raise RuntimeError("pipeline unavailable")
+
+    monkeypatch.setattr(
+        importlib.import_module("headroom.compress"), "_get_pipeline", broken_pipeline
+    )
+    assert mcp_server.HeadroomMCPServer(check_proxy=False)._start_kompress_warmup() is False
+
+
+def test_mcp_warmup_runs_without_glibc(warm_env, monkeypatch) -> None:
+    monkeypatch.setattr("platform.libc_ver", lambda: ("", ""))  # musl, macOS
+    kompress = _WarmKompress()
+    warm_env(kompress)
+    assert mcp_server.HeadroomMCPServer(check_proxy=False)._start_kompress_warmup() is True
+    assert kompress.preloaded.wait(5)
+
+
+def test_mcp_warmup_unreadable_glibc_version_counts_as_old(warm_env, monkeypatch) -> None:
+    monkeypatch.setattr("platform.libc_ver", lambda: ("glibc", "unknown"))
+    kompress = _WarmKompress()
+    warm_env(kompress)
+    assert mcp_server.HeadroomMCPServer(check_proxy=False)._start_kompress_warmup() is False
+    assert not kompress.preloaded.wait(0.2)
+
+
+def test_mcp_warmup_skips_transforms_without_a_usable_compressor(warm_env, monkeypatch) -> None:
+    import importlib
+
+    kompress = _WarmKompress()
+    warm_env(kompress)
+
+    def broken_getter(self):
+        raise RuntimeError("cannot build compressor")
+
+    no_kompress = object()
+    failing = type("FailingRouter", (), {"_get_kompress": broken_getter})()
+    router = type("Router", (), {"_get_kompress": lambda self: kompress})()
+    pipeline = type("Pipeline", (), {"transforms": [no_kompress, failing, router]})()
+    monkeypatch.setattr(
+        importlib.import_module("headroom.compress"), "_get_pipeline", lambda: pipeline
+    )
+
+    assert mcp_server.HeadroomMCPServer(check_proxy=False)._start_kompress_warmup() is True
+    assert kompress.preloaded.wait(5)
+
+
+def test_mcp_warmup_bad_delay_uses_default(warm_env, monkeypatch) -> None:
+    monkeypatch.setenv("HEADROOM_KOMPRESS_WARMUP_DELAY_SECONDS", "soon")
+    kompress = _WarmKompress()
+    warm_env(kompress)
+    assert mcp_server.HeadroomMCPServer(check_proxy=False)._start_kompress_warmup() is True
+    assert kompress.preloaded.wait(5)  # default delay is 2 s
+
+
+def test_run_stdio_and_http_each_start_warmup_once(monkeypatch) -> None:
+    server = mcp_server.HeadroomMCPServer(check_proxy=False)
+    started: list[str] = []
+    monkeypatch.setattr(server, "_launch_kompress_warmup", lambda: started.append("w"))
+
+    @contextlib.asynccontextmanager
+    async def fake_stdio_server():
+        yield (object(), object())
+
+    monkeypatch.setattr(mcp_server, "stdio_server", fake_stdio_server)
+
+    async def returns(*_a, **_k) -> None:
+        return None
+
+    monkeypatch.setattr(server.server, "run", returns, raising=False)
+    asyncio.run(server.run_stdio(parent_death_poll_interval=0.001))
+    assert started == ["w"]
+
+    import sys
+    import types
+
+    async def fake_serve(*_a, **_k) -> None:
+        return None
+
+    # The real module needs the MCP SDK; stub it so only the call order is tested.
+    fake_http = types.ModuleType("headroom.ccr.mcp_http")
+    fake_http.serve_streamable_http = fake_serve  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "headroom.ccr.mcp_http", fake_http)
+    asyncio.run(server.run_streamable_http("127.0.0.1", 0, "/mcp"))
+    assert started == ["w", "w"]
+
+
 class _RecordList(logging.Handler):
     def __init__(self) -> None:
         super().__init__(level=logging.DEBUG)
@@ -605,3 +814,47 @@ def test_proxy_stats_failure_keeps_url_credentials_out_of_logs(level) -> None:
     if level == logging.DEBUG:
         # The failure is still diagnosable: the redacted URL and the exception type.
         assert any(f"127.0.0.1:{port}" in line and "JSONDecodeError" in line for line in formatted)
+
+
+def test_launch_warmup_builds_pipeline_off_the_calling_thread(warm_env, monkeypatch) -> None:
+    import importlib
+
+    kompress = _WarmKompress()
+    warm_env(kompress)
+    compress_module = importlib.import_module("headroom.compress")
+    inner = compress_module._get_pipeline
+    threads: list[int] = []
+
+    def spy():
+        threads.append(threading.get_ident())
+        return inner()
+
+    monkeypatch.setattr(compress_module, "_get_pipeline", spy)
+    server = mcp_server.HeadroomMCPServer(check_proxy=False)
+    server._launch_kompress_warmup().join(5)
+    assert kompress.preloaded.wait(5)
+    assert threads and threading.get_ident() not in threads
+
+
+def test_cached_onnx_alone_satisfies_cache_only_preload(monkeypatch) -> None:
+    """Only the ONNX artifact cached (issue scenario): cache-only preload succeeds
+    without touching PyTorch or the network."""
+    from headroom.transforms import kompress_compressor as kc
+
+    monkeypatch.setattr(kc, "_kompress_cache", {})
+    monkeypatch.delenv(kc.KOMPRESS_BACKEND_ENV, raising=False)
+    monkeypatch.setattr(kc, "_is_onnx_available", lambda: True)
+    monkeypatch.setattr(kc, "_canary_threshold_seconds", lambda: None)
+    seen: list[bool] = []
+
+    def fake_onnx(model_id, use_coreml=False, allow_download=True):
+        seen.append(allow_download)
+        return object(), object(), "onnx"
+
+    def no_torch(*_a, **_k):
+        raise AssertionError("PyTorch must not be consulted")
+
+    monkeypatch.setattr(kc, "_load_kompress_onnx", fake_onnx)
+    monkeypatch.setattr(kc, "_load_kompress_pytorch", no_torch)
+    assert kc.KompressCompressor().preload(allow_download=False) == "onnx"
+    assert seen == [False]
