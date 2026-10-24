@@ -50,6 +50,13 @@ def test_codex_provider_section_emits_requires_openai_auth_when_flagged() -> Non
     assert "requires_openai_auth = true" in section
 
 
+def test_codex_provider_section_bypasses_headroom_for_realtime_voice() -> None:
+    section = build_provider_section(port=8787, name="OpenAI via Headroom proxy")
+
+    assert 'experimental_realtime_ws_base_url = "https://api.openai.com/v1"' in section
+    assert 'experimental_realtime_webrtc_call_base_url = "https://api.openai.com/v1"' in section
+
+
 def test_codex_uses_chatgpt_auth_true_for_chatgpt_mode(tmp_path: Path) -> None:
     auth = tmp_path / "auth.json"
     auth.write_text('{"auth_mode": "chatgpt"}', encoding="utf-8")
