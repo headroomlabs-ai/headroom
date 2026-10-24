@@ -47,6 +47,7 @@ from headroom.evals.metrics import (
     compute_semantic_similarity,
 )
 from headroom.offline import guard_egress
+from headroom.providers.evals import call_eval_llm, create_eval_client, default_eval_model
 from headroom.transforms.content_router import ContentRouter, ContentRouterConfig
 
 logger = logging.getLogger(__name__)
@@ -1023,55 +1024,23 @@ class BatchCompressionEvaluator:
 
     def _get_default_model(self, provider: str) -> str:
         """Get default model for provider."""
-        return {
-            "anthropic": "claude-sonnet-4-20250514",
-            "openai": "gpt-4o",
-        }.get(provider, "claude-sonnet-4-20250514")
+        return default_eval_model(provider)
 
     def _init_llm_client(self) -> Any:
         """Initialize LLM client."""
         guard_egress(f"{self.provider} API for the batch compression benchmark")
-        if self.provider == "anthropic":
-            try:
-                import anthropic
-
-                return anthropic.Anthropic()
-            except ImportError as e:
-                raise ImportError(
-                    "anthropic package required. Install with: pip install anthropic"
-                ) from e
-        elif self.provider == "openai":
-            try:
-                import openai
-
-                return openai.OpenAI()
-            except ImportError as e:
-                raise ImportError(
-                    "openai package required. Install with: pip install openai"
-                ) from e
-        else:
-            raise ValueError(f"Unknown provider: {self.provider}")
+        return create_eval_client(self.provider)
 
     def _call_llm(self, messages: list[dict[str, Any]]) -> str:
         """Call LLM and return response text."""
-        if self.provider == "anthropic":
-            response = self._llm_client.messages.create(
-                model=self.model,
-                max_tokens=1024,
-                temperature=0.0,
-                messages=messages,
-            )
-            return str(response.content[0].text)
-        elif self.provider == "openai":
-            response = self._llm_client.chat.completions.create(
-                model=self.model,
-                max_tokens=1024,
-                temperature=0.0,
-                messages=messages,
-            )
-            content = response.choices[0].message.content
-            return str(content) if content else ""
-        return ""
+        return call_eval_llm(
+            self.provider,
+            self._llm_client,
+            self.model,
+            messages,
+            max_tokens=1024,
+            temperature=0.0,
+        )
 
     def _compress_messages(
         self, messages: list[dict[str, Any]]

@@ -15,8 +15,9 @@ from collections import deque
 from datetime import datetime, timedelta
 from typing import TYPE_CHECKING, Any, NamedTuple
 
-from headroom.cache_economics import CACHE_ECONOMICS as _CACHE_ECONOMICS
 from headroom.log_safety import WarnOnce, describe_exception, safe_id
+from headroom.providers.cache_economics import cache_economics_for_provider
+from headroom.providers.registry import model_matches_provider
 from headroom.proxy.budget_basis_policy import (
     BUDGET_BASIS_BLOCK,
     BUDGET_BASIS_IGNORE,
@@ -248,9 +249,9 @@ def build_prefix_cache_stats(
         if pc["requests"] == 0:
             continue
 
-        econ = _CACHE_ECONOMICS.get(provider, _CACHE_ECONOMICS["anthropic"])
-        read_mult: float = econ["read_multiplier"]  # type: ignore[assignment]
-        write_mult: float = econ["write_multiplier"]  # type: ignore[assignment]
+        econ = cache_economics_for_provider(provider)
+        read_mult = econ.read_multiplier
+        write_mult = econ.write_multiplier
 
         # Get the base input price per token for the most-used model on this
         # provider. Pick the provider-matching, priced model with the highest
@@ -268,16 +269,7 @@ def build_prefix_cache_stats(
         if cost_tracker:
             best_tokens = -1
             for model_name, tokens_sent in cost_tracker._tokens_sent_by_model.items():
-                # Match model to provider
-                _openai_prefixes = ("gpt", "o1", "o3", "o4")
-                is_match = (
-                    (provider in ("anthropic", "vertex:anthropic") and "claude" in model_name)
-                    or (provider == "openai" and any(p in model_name for p in _openai_prefixes))
-                    or (provider == "gemini" and "gemini" in model_name)
-                    or (provider == "xai" and "grok" in model_name)
-                    or (provider == "bedrock" and "claude" in model_name)
-                )
-                if is_match and tokens_sent > best_tokens:
+                if model_matches_provider(provider, model_name) and tokens_sent > best_tokens:
                     price_per_1m = cost_tracker._get_list_price(model_name)
                     if price_per_1m:
                         input_price_per_token = price_per_1m / 1_000_000
@@ -292,7 +284,7 @@ def build_prefix_cache_stats(
                             cache_prices = None
                         best_tokens = tokens_sent
 
-        # Catalog rates win; the provider ratio table is the fallback for a model
+        # Catalog rates win; provider-owned defaults are the fallback for a model
         # that publishes no cache pricing.
         pricing_source = "provider_default"
         if cache_prices and input_price_per_token:
@@ -367,7 +359,7 @@ def build_prefix_cache_stats(
             "write_premium_usd": round(write_premium_usd, 4),
             "net_savings_usd": round(savings_usd - write_premium_usd, 4),
             "cache_pricing_source": pricing_source,
-            "label": str(econ["label"]),
+            "label": econ.label,
             "observed_ttl_buckets": {
                 "5m": {
                     "tokens": write_5m_tokens,
