@@ -30,19 +30,23 @@ def test_strip_cache_control_recurses_through_dicts_and_lists() -> None:
 
 def test_compute_semantic_cache_key_is_stable_for_identical_inputs() -> None:
     kwargs = {"system": "sys", "tools": [{"name": "read"}], "temperature": 0.2}
-    assert compute_semantic_cache_key(MESSAGES, MODEL, **kwargs) == compute_semantic_cache_key(
+    assert compute_semantic_cache_key(
+        MESSAGES, MODEL, partition="p_test", **kwargs
+    ) == compute_semantic_cache_key(
         MESSAGES,
         MODEL,
+        partition="p_test",
         **kwargs,
     )
 
 
 def test_compute_semantic_cache_key_distinguishes_response_shaping_fields() -> None:
     assert compute_semantic_cache_key(
-        MESSAGES, MODEL, temperature=0.0
+        MESSAGES, MODEL, partition="p_test", temperature=0.0
     ) != compute_semantic_cache_key(
         MESSAGES,
         MODEL,
+        partition="p_test",
         temperature=1.0,
     )
 
@@ -53,10 +57,12 @@ def test_compute_semantic_cache_key_ignores_moved_cache_control_breakpoints() ->
     assert compute_semantic_cache_key(
         MESSAGES,
         MODEL,
+        partition="p_test",
         system=with_breakpoint,
     ) == compute_semantic_cache_key(
         MESSAGES,
         MODEL,
+        partition="p_test",
         system=without_breakpoint,
     )
 
@@ -64,8 +70,11 @@ def test_compute_semantic_cache_key_ignores_moved_cache_control_breakpoints() ->
 def test_semantic_cache_private_key_wrapper_delegates_to_policy() -> None:
     cache = SemanticCache()
     kwargs = {"system": "sys", "tools": [{"name": "read"}], "temperature": 0.2}
-    assert cache._compute_key(MESSAGES, MODEL, **kwargs) == compute_semantic_cache_key(
+    assert cache._compute_key(
+        MESSAGES, MODEL, partition="p_test", **kwargs
+    ) == compute_semantic_cache_key(
         MESSAGES,
         MODEL,
+        partition="p_test",
         **kwargs,
     )

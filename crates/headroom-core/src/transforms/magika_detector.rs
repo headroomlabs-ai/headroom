@@ -382,7 +382,11 @@ fn session() -> &'static Mutex<Result<Session, String>> {
         let spawned = std::thread::Builder::new()
             .name("magika-init".into())
             .spawn(move || {
-                let _ = tx.send(Session::new().map_err(|e| e.to_string()));
+                // One intra-op thread means ORT builds no pool: pool threads
+                // spin-wait between inferences, burning ~2 cores under light
+                // load (#4187), and magika's builder has no allow_spinning knob.
+                let built = Session::builder().with_intra_threads(1).build();
+                let _ = tx.send(built.map_err(|e| e.to_string()));
             });
         if let Err(e) = spawned {
             tracing::warn!("magika init thread spawn failed: {e}");

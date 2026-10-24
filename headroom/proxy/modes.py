@@ -36,3 +36,17 @@ def is_token_mode(mode: str | None) -> bool:
 def is_cache_mode(mode: str | None) -> bool:
     """Return True when mode resolves to cache mode."""
     return normalize_proxy_mode(mode) == PROXY_MODE_CACHE
+
+
+def read_maturation_inert_reason(
+    mode: str | None, *, quiesce_turns: int, max_hold_turns: int
+) -> str | None:
+    """Why read maturation can never fire under ``mode``, else None.
+
+    Cache mode freezes every turn but the latest, and maturation skips frozen
+    messages. A Read in the latest turn has had no quiet turns yet, so it is
+    held unless a threshold is 0; by the time it could quiesce it is frozen.
+    """
+    if is_cache_mode(mode) and quiesce_turns > 0 and max_hold_turns > 0:
+        return "cache mode freezes a Read before it can quiesce"
+    return None

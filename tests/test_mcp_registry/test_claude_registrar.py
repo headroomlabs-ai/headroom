@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import json
+import os
+import stat
 import subprocess
 from pathlib import Path
 from unittest.mock import patch
@@ -490,6 +492,55 @@ def test_register_via_file_preserves_malformed_config(tmp_path: Path, contents: 
     assert "not valid JSON" in result.detail
     # The original bytes are untouched — nothing was overwritten.
     assert cfg.read_text(encoding="utf-8") == contents
+
+
+def test_non_utf8_config_fails_cleanly_and_is_left_untouched(tmp_path: Path) -> None:
+    """A ~/.claude.json saved in a non-UTF-8 locale encoding (GBK here) must not
+    crash register/unregister/validate with a raw UnicodeDecodeError; it is
+    treated as malformed and never rewritten."""
+    from headroom.mcp_registry.claude import ClaudeConfigMutationError
+
+    cfg = tmp_path / ".claude.json"
+    original = '{"projects": {"/项目": {}}}'.encode("gbk")
+    cfg.write_bytes(original)
+    reg = _make_registrar(tmp_path, cli=None)
+
+    result = reg.register_server(_spec())
+    assert result.status == RegisterStatus.FAILED
+    assert "not valid JSON" in result.detail
+    assert reg.unregister_server("headroom") is False
+    with pytest.raises(ClaudeConfigMutationError, match="not valid UTF-8"):
+        reg.validate_configs_for_mutation()
+    assert cfg.read_bytes() == original
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX file modes")
+def test_failed_write_leaves_claude_json_intact(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """~/.claude.json holds OAuth state; a write that fails mid-way (ENOSPC at
+    fsync here) must leave the original bytes and mode, and no temp file."""
+    cfg = tmp_path / ".claude.json"
+    original = json.dumps({"oauthAccount": {"emailAddress": "a@b.c"}, "mcpServers": {}})
+    cfg.write_text(original, encoding="utf-8")
+    cfg.chmod(0o600)
+    reg = _make_registrar(tmp_path, cli=None)
+
+    def no_space(fd: int) -> None:
+        raise OSError(28, "No space left on device")
+
+    monkeypatch.setattr("headroom.fsutil.os.fsync", no_space)
+    result = reg.register_server(_spec())
+    assert result.status == RegisterStatus.FAILED
+    assert "No space left" in result.detail
+
+    assert cfg.read_text(encoding="utf-8") == original
+    assert sorted(p.name for p in tmp_path.iterdir()) == [".claude.json"]
+
+    monkeypatch.undo()
+    assert reg.register_server(_spec()).status == RegisterStatus.REGISTERED
+    assert stat.S_IMODE(cfg.stat().st_mode) == 0o600
+    assert json.loads(cfg.read_text(encoding="utf-8"))["oauthAccount"]
 
 
 def test_register_via_file_merges_into_existing_valid_config(tmp_path: Path) -> None:

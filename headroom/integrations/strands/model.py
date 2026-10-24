@@ -10,7 +10,6 @@ import asyncio
 import logging
 import threading
 from collections.abc import AsyncGenerator, AsyncIterable
-from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, TypeVar
 from uuid import uuid4
@@ -36,6 +35,7 @@ except ImportError:
 T = TypeVar("T")
 
 from headroom import HeadroomConfig  # noqa: E402
+from headroom.integrations._metrics import OptimizationMetrics  # noqa: E402
 from headroom.providers import OpenAIProvider  # noqa: E402
 from headroom.transforms import TransformPipeline  # noqa: E402
 
@@ -55,20 +55,6 @@ def _check_strands_available() -> None:
 def strands_available() -> bool:
     """Check if Strands SDK is installed."""
     return STRANDS_AVAILABLE
-
-
-@dataclass
-class OptimizationMetrics:
-    """Metrics from a single optimization pass."""
-
-    request_id: str
-    timestamp: datetime
-    tokens_before: int
-    tokens_after: int
-    tokens_saved: int
-    savings_percent: float
-    transforms_applied: list[str]
-    model: str
 
 
 class HeadroomStrandsModel(Model):  # type: ignore[misc]

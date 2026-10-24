@@ -27,7 +27,7 @@
 //! - **Telemetry**: no-op.
 //! - **`_compress_text_within_items`**: pass-through (returns input
 //!   unchanged) since text compression has its own port pipeline.
-//! - **`summarize_dropped_items`**: empty string.
+//! - **Dropped-item summary**: empty string.
 //!
 //! Parity fixtures will be recorded with all four disabled on the
 //! Python side, locking byte-equal output. The TOIN/CCR/feedback

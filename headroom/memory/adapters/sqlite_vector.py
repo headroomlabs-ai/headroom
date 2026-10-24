@@ -29,6 +29,7 @@ from typing import TYPE_CHECKING, Any, cast
 
 import numpy as np
 
+from ...fileperms import connect_private_sqlite
 from ..models import Memory, ScopeLevel, normalize_entity_refs
 from ..ports import VectorFilter, VectorSearchResult
 
@@ -235,8 +236,8 @@ class SQLiteVectorIndex:
         self._init_db()
 
     def _create_conn(self) -> sqlite3.Connection:
-        """Create a SQLite connection with sqlite-vec loaded."""
-        conn = sqlite3.connect(str(self._db_path))
+        """Create a SQLite connection with sqlite-vec loaded (file owner-only)."""
+        conn = connect_private_sqlite(self._db_path, what="memory vector index")
         conn.row_factory = sqlite3.Row
 
         # Load sqlite-vec extension

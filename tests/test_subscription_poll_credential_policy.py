@@ -103,9 +103,11 @@ def test_foreign_bearer_never_reaches_the_usage_poll(tmp_path, monkeypatch) -> N
 
     tracker._client.fetch = fetch  # type: ignore[method-assign]
     asyncio.run(tracker._maybe_poll())
-    # The poll ran (the caller marked activity) but with no adopted token, so
-    # the client falls back to the operator's own credential.
-    assert polled == [None]
+    # Activity was marked, but with no adopted local-operator token and no
+    # operator-configured credential there is nothing to poll — and specifically
+    # the foreign bearer must never be spent. Skip the unnecessary fetch(None).
+    assert polled == []
+    assert "tenant-b-oauth-token" not in {t for t in polled if t}
 
 
 # ---------------------------------------------------------------------------
