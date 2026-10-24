@@ -1,7 +1,9 @@
-"""Claude wrap Vertex upstream handoff tests."""
+"""Claude wrap cloud-provider (Vertex, Foundry, Bedrock) handoff tests."""
 
 from __future__ import annotations
 
+import json
+import os
 from pathlib import Path
 from typing import Any
 
@@ -91,6 +93,7 @@ def _invoke_wrap_claude(
     def fake_ensure_proxy(*args: object, **kwargs: object) -> tuple[None, int]:
         captured["ensure_args"] = args
         captured["ensure_kwargs"] = kwargs
+        captured["proxy_environ"] = dict(os.environ)
         return None, args[0] if args else 8787
 
     def fake_run(cmd: list[str], *, env: dict[str, str]) -> _Completed:
@@ -695,3 +698,178 @@ def test_ensure_proxy_restarts_idle_proxy_to_clear_vertex_api_url(
     assert calls[1][0] == "start"
     assert calls[1][2]["vertex_api_url"] is None
     assert calls[1][2]["clear_vertex_api_url"] is True
+
+
+def _bedrock_settings(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    *,
+    user_env: dict[str, str] | None = None,
+    managed: str | None = None,
+) -> None:
+    """Point the user and managed settings at temp files, and undo AWS env lifts."""
+    user = tmp_path / "user-settings.json"
+    user.write_text(json.dumps({"env": user_env or {}}), encoding="utf-8")
+    managed_path = tmp_path / "managed-settings.json"
+    if managed is not None:
+        managed_path.write_text(managed, encoding="utf-8")
+    monkeypatch.setattr(wrap_mod, "claude_user_settings_path", lambda: user)
+    monkeypatch.setattr(wrap_mod, "_claude_managed_settings_path", lambda: managed_path)
+    for key in (*wrap_mod._CLAUDE_BEDROCK_AWS_KEYS, "HEADROOM_REGION", "HEADROOM_BACKEND"):
+        monkeypatch.setenv(key, "unset")  # record the original so the lift is undone
+        monkeypatch.delenv(key)
+
+
+_BEDROCK_OVERRIDE = ["--settings", json.dumps({"env": {"CLAUDE_CODE_USE_BEDROCK": "0"}})]
+
+
+def test_wrap_claude_bedrock_from_shell_routes_through_the_bedrock_backend(
+    runner: CliRunner, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    _bedrock_settings(monkeypatch, tmp_path)
+    captured, output = _invoke_wrap_claude(
+        runner, monkeypatch, env={"CLAUDE_CODE_USE_BEDROCK": "1", "AWS_REGION": "us-west-2"}
+    )
+
+    assert captured["ensure_kwargs"]["backend"] == "bedrock"
+    assert captured["ensure_kwargs"]["region"] == "us-west-2"
+    child = captured["child_env"]
+    assert child["CLAUDE_CODE_USE_BEDROCK"] == "0"
+    assert child["ANTHROPIC_BASE_URL"].startswith("http://127.0.0.1:")
+    assert child["ANTHROPIC_AUTH_TOKEN"]
+    assert captured["child_cmd"] == ["/usr/bin/claude", *_BEDROCK_OVERRIDE]
+    assert "Bedrock mode" in output
+
+
+def test_wrap_claude_bedrock_set_in_user_settings_is_overridden_for_the_session(
+    runner: CliRunner, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    # The flag and AWS settings live only in ~/.claude/settings.json, which
+    # Claude Code obeys over the shell.
+    _bedrock_settings(
+        monkeypatch,
+        tmp_path,
+        user_env={
+            "CLAUDE_CODE_USE_BEDROCK": "true",
+            "AWS_PROFILE": "bedrock-sso",
+            "AWS_REGION": "us-west-2",
+            "ANTHROPIC_API_KEY": "sk-ant-dummy",
+        },
+    )
+    captured, output = _invoke_wrap_claude(runner, monkeypatch, env={})
+
+    assert captured["ensure_kwargs"]["backend"] == "bedrock"
+    assert captured["ensure_kwargs"]["region"] == "us-west-2"
+    assert captured["proxy_environ"]["AWS_PROFILE"] == "bedrock-sso"
+    assert captured["child_cmd"][1:3] == _BEDROCK_OVERRIDE
+    # A credential is already configured; adding another would conflict.
+    assert "ANTHROPIC_AUTH_TOKEN" not in captured["child_env"]
+    assert "CLAUDE_CODE_USE_BEDROCK=true from" in output
+
+
+def test_wrap_claude_bedrock_aws_key_cleared_in_settings_is_cleared_for_the_proxy(
+    runner: CliRunner, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    _bedrock_settings(
+        monkeypatch, tmp_path, user_env={"CLAUDE_CODE_USE_BEDROCK": "1", "AWS_PROFILE": ""}
+    )
+    captured, _output = _invoke_wrap_claude(
+        runner, monkeypatch, env={"AWS_PROFILE": "shell-profile"}
+    )
+
+    assert "AWS_PROFILE" not in captured["proxy_environ"]
+
+
+def test_wrap_claude_bedrock_region_flag_beats_aws_region(
+    runner: CliRunner, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    _bedrock_settings(monkeypatch, tmp_path)
+    captured, _output = _invoke_wrap_claude(
+        runner,
+        monkeypatch,
+        env={"CLAUDE_CODE_USE_BEDROCK": "1", "AWS_REGION": "us-west-2"},
+        extra_args=("--region", "eu-west-1"),
+    )
+
+    assert captured["ensure_kwargs"]["region"] == "eu-west-1"
+
+
+def test_wrap_claude_bedrock_wins_over_vertex_like_claude_code(
+    runner: CliRunner, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    _bedrock_settings(monkeypatch, tmp_path, user_env={"CLAUDE_CODE_USE_BEDROCK": "1"})
+    captured, output = _invoke_wrap_claude(runner, monkeypatch, env={"CLAUDE_CODE_USE_VERTEX": "1"})
+
+    assert captured["ensure_kwargs"]["backend"] == "bedrock"
+    assert "ANTHROPIC_VERTEX_BASE_URL" not in captured["child_env"]
+    assert "Bedrock mode" in output
+
+
+@pytest.mark.parametrize(
+    ("env", "extra_args", "managed", "reason"),
+    [
+        ({}, (), '{"env":{"CLAUDE_CODE_USE_BEDROCK":"1"}}', "ask your admin"),
+        ({"ANTHROPIC_BEDROCK_BASE_URL": "https://gw.example"}, (), None, "gateway"),
+        ({"CLAUDE_CODE_SKIP_BEDROCK_AUTH": "1"}, (), None, "gateway"),
+        ({}, ("--no-proxy",), None, "--no-proxy"),
+        ({}, ("--backend", "anthropic"), None, "'anthropic'"),
+        ({"HEADROOM_BACKEND": "anyllm"}, (), None, "'anyllm'"),
+        ({}, ("--", "--settings", "mine.json"), None, "your own --settings"),
+    ],
+)
+def test_wrap_claude_bedrock_it_cannot_route_is_left_alone_with_a_warning(
+    runner: CliRunner,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    env: dict[str, str],
+    extra_args: tuple[str, ...],
+    managed: str | None,
+    reason: str,
+) -> None:
+    _bedrock_settings(
+        monkeypatch,
+        tmp_path,
+        user_env={} if managed else {"CLAUDE_CODE_USE_BEDROCK": "1"},
+        managed=managed,
+    )
+    captured, output = _invoke_wrap_claude(runner, monkeypatch, env=env, extra_args=extra_args)
+
+    assert _BEDROCK_OVERRIDE[1] not in captured["child_cmd"]
+    assert "CLAUDE_CODE_USE_BEDROCK" not in captured["child_env"]
+    assert "Headroom will see none of its traffic" in output
+    assert reason in output
+
+
+def test_wrap_claude_unreadable_managed_settings_warns_instead_of_failing(
+    runner: CliRunner, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    _bedrock_settings(monkeypatch, tmp_path, managed="{not json")
+    captured, output = _invoke_wrap_claude(runner, monkeypatch, env={})
+
+    assert captured["child_cmd"] == ["/usr/bin/claude"]
+    assert "could not read" in output
+
+
+def test_wrap_claude_bedrock_skips_project_settings(
+    runner: CliRunner, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    _bedrock_settings(monkeypatch, tmp_path, user_env={"CLAUDE_CODE_USE_BEDROCK": "1"})
+    captured, output = _invoke_wrap_claude(
+        runner, monkeypatch, env={}, extra_args=("--project-settings",)
+    )
+
+    assert "write_base_url_args" not in captured
+    assert "Skipping project-local Claude settings in Bedrock mode" in output
+
+
+def test_wrap_claude_bedrock_flag_cleared_by_settings_is_not_bedrock(
+    runner: CliRunner, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    _bedrock_settings(monkeypatch, tmp_path, user_env={"CLAUDE_CODE_USE_BEDROCK": "0"})
+    captured, output = _invoke_wrap_claude(
+        runner, monkeypatch, env={"CLAUDE_CODE_USE_BEDROCK": "1"}
+    )
+
+    assert captured["ensure_kwargs"]["backend"] is None
+    assert captured["child_cmd"] == ["/usr/bin/claude"]
+    assert "Bedrock" not in output

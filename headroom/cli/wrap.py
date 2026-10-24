@@ -87,6 +87,7 @@ from headroom.providers.antigravity import (
     render_setup_lines as _render_antigravity_setup_lines,
 )
 from headroom.providers.claude import (
+    CLAUDE_AUTH_KEYS,
     DEFAULT_1M_MODEL,
     HEADROOM_1M_MODEL_ENV,
     REMOTE_CONTROL_BASE_URL_ENV,
@@ -94,6 +95,7 @@ from headroom.providers.claude import (
     TOOL_SEARCH_ENV,
     claude_auth_conflict_message,
     claude_auth_conflict_sources,
+    claude_effective_env,
     claude_user_settings_path,
     configure_vscode_claude_settings,
     detect_claude_code_version,
@@ -305,22 +307,104 @@ def _claude_settings_env(path: Path) -> dict[str, object]:
     return dict(env) if isinstance(env, dict) else {}
 
 
-def _raise_on_claude_auth_conflict(
-    *,
-    user_settings_path: Path,
-    project_settings_path: Path,
+def _claude_managed_settings_path() -> Path:
+    """Where Claude Code reads its admin-managed settings file.
+
+    Managed policy delivered another way (a macOS MDM profile, the Windows
+    registry) is not read here.
+    """
+    if sys.platform == "darwin":
+        return Path("/Library/Application Support/ClaudeCode/managed-settings.json")
+    if sys.platform == "win32":
+        return Path(r"C:\Program Files\ClaudeCode\managed-settings.json")
+    return Path("/etc/claude-code/managed-settings.json")
+
+
+def _claude_managed_settings_env(path: Path) -> dict[str, object]:
+    """The env block of the managed settings; ``{}`` if absent or unreadable.
+
+    The file belongs to an admin and wrap never writes it, so a broken one is
+    reported and skipped rather than stopping the launch.
+    """
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return {}
+    except (OSError, json.JSONDecodeError) as exc:
+        click.echo(f"  Warning: could not read {path} ({exc}); ignoring it.")
+        return {}
+    env = payload.get("env") if isinstance(payload, dict) else None
+    return dict(env) if isinstance(env, dict) else {}
+
+
+def _claude_env_layers(
     project_local_settings_path: Path,
-    environ: dict[str, str],
-) -> None:
-    """Refuse an auth state Claude Code rejects before mutating wrap state."""
-    conflict = claude_auth_conflict_sources(
-        (str(user_settings_path), _claude_settings_env(user_settings_path)),
-        (str(project_settings_path), _claude_settings_env(project_settings_path)),
+) -> list[tuple[str, Mapping[str, object]]]:
+    """Claude Code's env sources, lowest precedence first.
+
+    Its settings files outrank the shell, and managed settings outrank
+    everything, ``--settings`` included.
+    """
+    user = claude_user_settings_path()
+    project = Path.cwd() / ".claude" / "settings.json"
+    managed = _claude_managed_settings_path()
+    return [
+        ("shell environment", os.environ),
+        (str(user), _claude_settings_env(user)),
+        (str(project), _claude_settings_env(project)),
         (str(project_local_settings_path), _claude_settings_env(project_local_settings_path)),
-        ("shell environment", environ),
-    )
+        (str(managed), _claude_managed_settings_env(managed)),
+    ]
+
+
+def _raise_on_claude_auth_conflict(layers: list[tuple[str, Mapping[str, object]]]) -> None:
+    """Refuse an auth state Claude Code rejects before mutating wrap state."""
+    conflict = claude_auth_conflict_sources(*layers)
     if conflict is not None:
         raise click.ClickException(claude_auth_conflict_message(conflict))
+
+
+_CLAUDE_BEDROCK_ENV = "CLAUDE_CODE_USE_BEDROCK"
+# AWS settings a Bedrock user may keep only in a Claude settings env block. The
+# proxy calls Bedrock itself, so it needs them in its own environment.
+_CLAUDE_BEDROCK_AWS_KEYS = (
+    "AWS_PROFILE",
+    "AWS_REGION",
+    "AWS_DEFAULT_REGION",
+    "AWS_ACCESS_KEY_ID",
+    "AWS_SECRET_ACCESS_KEY",
+    "AWS_SESSION_TOKEN",
+    "AWS_BEARER_TOKEN_BEDROCK",
+)
+
+
+def _is_env_truthy(value: str) -> bool:
+    """Claude Code's reading of a flag env var such as CLAUDE_CODE_USE_BEDROCK."""
+    return value.strip().lower() in ("1", "true", "yes", "on")
+
+
+def _claude_bedrock_bypass_reason(
+    claude_env: Mapping[str, tuple[str, str]],
+    *,
+    managed_source: str,
+    backend: str | None,
+    no_proxy: bool,
+    claude_args: tuple[str, ...],
+) -> str | None:
+    """Why wrap cannot route this Bedrock-mode session through Headroom, or None."""
+    if claude_env[_CLAUDE_BEDROCK_ENV][1] == managed_source:
+        return f"it is set in {managed_source}, which outranks wrap; ask your admin to remove it"
+    if "ANTHROPIC_BEDROCK_BASE_URL" in claude_env or _is_env_truthy(
+        claude_env.get("CLAUDE_CODE_SKIP_BEDROCK_AUTH", ("", ""))[0]
+    ):
+        return "it goes through your own Bedrock gateway, which the proxy would skip"
+    if no_proxy:
+        return "--no-proxy reuses a proxy whose backend wrap does not set"
+    if backend not in (None, "bedrock"):
+        return f"the proxy backend is '{backend}', not 'bedrock'"
+    if any(arg == "--settings" or arg.startswith("--settings=") for arg in claude_args):
+        return "your own --settings would replace the override wrap passes to Claude Code"
+    return None
 
 
 def _append_text(path: Path, content: str) -> None:
@@ -6158,12 +6242,13 @@ def claude(
     # early proxy-start failure would make the finally raise UnboundLocalError,
     # masking the real error and skipping cleanup(). Mirrors the holders above.
     _wrap_settings_path = Path.cwd() / ".claude" / "settings.local.json"
-    _raise_on_claude_auth_conflict(
-        user_settings_path=claude_user_settings_path(),
-        project_settings_path=Path.cwd() / ".claude" / "settings.json",
-        project_local_settings_path=_wrap_settings_path,
-        environ=dict(os.environ),
-    )
+    _claude_env_sources = _claude_env_layers(_wrap_settings_path)
+    _raise_on_claude_auth_conflict(_claude_env_sources)
+    # What Claude Code will see, with the source of each value.
+    _claude_env = claude_effective_env(*_claude_env_sources)
+    _bedrock_value, _bedrock_source = _claude_env.get(_CLAUDE_BEDROCK_ENV, ("", ""))
+    # Claude Code picks Bedrock over Vertex and Foundry when the flags overlap.
+    bedrock_on = _is_env_truthy(_bedrock_value)
     cleanup = _make_cleanup(proxy_holder, port_holder)
     signal.signal(signal.SIGINT, _ignore_child_sigint)
     signal.signal(signal.SIGTERM, _exit_on_signal)
@@ -6225,7 +6310,7 @@ def claude(
         # than the full ANTHROPIC_FOUNDRY_BASE_URL.  When the URL is absent we derive
         # it from the resource name so the proxy has an upstream to forward to.
         foundry_upstream = None
-        if os.environ.get("CLAUDE_CODE_USE_FOUNDRY"):
+        if os.environ.get("CLAUDE_CODE_USE_FOUNDRY") and not bedrock_on:
             foundry_upstream = os.environ.get("ANTHROPIC_FOUNDRY_BASE_URL")
             if not foundry_upstream:
                 resource = os.environ.get("ANTHROPIC_FOUNDRY_RESOURCE", "").strip()
@@ -6240,9 +6325,46 @@ def claude(
         # real regional Vertex host (derived per-request from the path's
         # location) using Claude Code's own ADC token — no API key, no creds held
         # by Headroom. This is the turnkey Vertex compression path.
-        use_vertex = bool(os.environ.get("CLAUDE_CODE_USE_VERTEX"))
+        use_vertex = bool(os.environ.get("CLAUDE_CODE_USE_VERTEX")) and not bedrock_on
         proxy_url = _claude_proxy_base_url(port)
         vertex_upstream = _vertex_target_api_url_from_claude_env(proxy_url) if use_vertex else None
+
+        # Bedrock mode: with CLAUDE_CODE_USE_BEDROCK=1, Claude Code ignores
+        # ANTHROPIC_BASE_URL and calls AWS itself, so Headroom saw nothing. Run
+        # it in Anthropic mode against a proxy on the Bedrock backend instead;
+        # the proxy calls Bedrock with the user's AWS credentials. The flag
+        # often lives in a settings file, which outranks the shell, so it is
+        # overridden with --settings below.
+        # When that cannot be done safely, say Headroom is bypassed instead.
+        bedrock_bypass = (
+            _claude_bedrock_bypass_reason(
+                _claude_env,
+                managed_source=str(_claude_managed_settings_path()),
+                backend=backend or os.environ.get("HEADROOM_BACKEND"),
+                no_proxy=no_proxy,
+                claude_args=claude_args,
+            )
+            if bedrock_on
+            else None
+        )
+        use_bedrock = bedrock_on and bedrock_bypass is None
+        if use_bedrock:
+            # The proxy runs on the shell environment; give it the AWS settings
+            # Claude Code would have used, including ones a settings file cleared.
+            for key in _CLAUDE_BEDROCK_AWS_KEYS:
+                if key in _claude_env:
+                    os.environ[key] = _claude_env[key][0]
+                else:
+                    os.environ.pop(key, None)
+            backend = backend or os.environ.get("HEADROOM_BACKEND") or "bedrock"
+            # _start_proxy falls back to HEADROOM_REGION itself; it is repeated
+            # here so AWS_REGION only applies when neither is set.
+            region = (
+                region
+                or os.environ.get("HEADROOM_REGION")
+                or os.environ.get("AWS_REGION")
+                or os.environ.get("AWS_DEFAULT_REGION")
+            )
 
         # Issue #1353: when none of the explicit override channels (Foundry,
         # Vertex, ANTHROPIC_TARGET_API_URL) apply, inherit a pre-existing
@@ -6252,6 +6374,7 @@ def claude(
         if (
             not foundry_upstream
             and not use_vertex
+            and not use_bedrock
             and not os.environ.get("ANTHROPIC_TARGET_API_URL")
         ):
             custom_upstream = _detect_inbound_anthropic_upstream(port)
@@ -6317,6 +6440,15 @@ def claude(
             click.echo(
                 f"  Foundry mode: ANTHROPIC_FOUNDRY_BASE_URL={_foundry_proxy_url(proxy_url)} → upstream {foundry_upstream}"
             )
+        elif use_bedrock:
+            click.echo(
+                f"  Bedrock mode: ANTHROPIC_BASE_URL={proxy_url} → Bedrock "
+                f"[{region or 'proxy default region'}] with your AWS credentials"
+            )
+            click.echo(
+                f"  ({_CLAUDE_BEDROCK_ENV}={_bedrock_value} from {_bedrock_source}; "
+                "set to 0 for this session so requests go through Headroom)"
+            )
         elif custom_upstream:
             click.echo(f"  ANTHROPIC_BASE_URL={proxy_url} → upstream {custom_upstream}")
         else:
@@ -6359,6 +6491,12 @@ def claude(
                         context_1m_enabled=context_1m,
                     )
                 )
+        if bedrock_bypass:
+            click.echo(
+                f"  Warning: Claude Code is in Bedrock mode ({_CLAUDE_BEDROCK_ENV} from "
+                f"{_bedrock_source}) and will call Bedrock directly, so Headroom will see "
+                f"none of its traffic: {bedrock_bypass}."
+            )
         if claude_args:
             click.echo(f"  Extra args: {' '.join(claude_args)}")
         _print_telemetry_notice()
@@ -6377,6 +6515,17 @@ def claude(
             env["ANTHROPIC_FOUNDRY_BASE_URL"] = _foundry_proxy_url(proxy_url)
         else:
             env["ANTHROPIC_BASE_URL"] = proxy_url
+        if use_bedrock:
+            env[_CLAUDE_BEDROCK_ENV] = "0"
+            claude_args = (
+                "--settings",
+                json.dumps({"env": {_CLAUDE_BEDROCK_ENV: "0"}}),
+                *claude_args,
+            )
+            # Anthropic mode needs a credential to start; the proxy ignores it
+            # and signs its Bedrock calls with the AWS credentials.
+            if not any(key in _claude_env for key in CLAUDE_AUTH_KEYS):
+                env["ANTHROPIC_AUTH_TOKEN"] = "headroom-bedrock"
 
         # Recover an older crashed wrap even when new project settings writes
         # are disabled. The marker records the prior value to restore; without
@@ -6389,7 +6538,14 @@ def claude(
                 foundry_mode=_settings_foundry[0], vertex_mode=_settings_vertex[0]
             ),
         )
-        if _claude_project_settings_enabled(project_settings):
+        if use_bedrock and _claude_project_settings_enabled(project_settings):
+            # Workers started outside this launch read only the settings files,
+            # where Bedrock mode stays on, so a persisted base URL would do nothing.
+            click.echo(
+                "  Skipping project-local Claude settings in Bedrock mode; "
+                "daemon-spawned workers will call Bedrock directly."
+            )
+        elif _claude_project_settings_enabled(project_settings):
             _saved_base_url[0] = _write_claude_wrap_base_url(
                 (
                     _foundry_proxy_url(proxy_url)
