@@ -134,6 +134,8 @@ def test_provider_bound_bytes_and_outcomes_match(monkeypatch) -> None:
     """Per turn: provider-bound ``messages`` and ``tools`` are identical on both
     paths, and the outcomes agree on provider-reported tokens and (within
     tolerance) on ``tokens_saved``."""
+    # Compare the schema-compacting paths with the HTTP opt-in enabled too.
+    monkeypatch.setenv("HEADROOM_TOOL_SCHEMA_COMPACTION", "1")
     proxy_provider, gateway_provider = FakeProvider(), FakeProvider()
     respx.post(OPENAI_UPSTREAM).mock(side_effect=_bridge(proxy_provider))
 
