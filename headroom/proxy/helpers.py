@@ -3758,29 +3758,37 @@ _CLIENT_SIDE_SEARCH_FLOOR = frozenset({"toolsearch"})
 # more) most frequent tools resident.
 _TOOL_SEARCH_CORE_TOOLS = frozenset(
     {
+        "agent",
+        "apply_patch",
+        "askuserquestion",
         "bash",
         "bash_background",
+        "bash_background_kill",
         "bash_background_output",
         "bash_background_wait",
-        "bash_background_kill",
-        "read",
-        "write",
         "edit",
-        "multiedit",
-        "apply_patch",
+        "exitplanmode",
         "glob",
         "grep",
-        "task",
-        "todowrite",
-        "todoread",
-        "webfetch",
+        "multiedit",
         "question",
+        "read",
+        "sendmessage",
         "skill",
+        "task",
+        "taskstop",
+        "todoread",
+        "todowrite",
         # A client's own tool-search/schema-fetch tool (Claude Code's ``ToolSearch``).
         # It resolves tools the client keeps in its local registry and never puts in
         # the request body (TaskCreate, WebFetch, …), so deferring it hides the only
         # tool that can load them and they become permanently unreachable.
         "toolsearch",
+        "webfetch",
+        # Claude Code dynamic workflows; client-side ToolSearch does not index it,
+        # so deferring Workflow leaves it unreachable (#4313).
+        "workflow",
+        "write",
     }
 )
 

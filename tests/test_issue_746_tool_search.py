@@ -343,6 +343,48 @@ def test_client_tool_search_tool_is_never_deferred() -> None:
     assert by_name["ToolSearch"].get("defer_loading") is None
 
 
+def test_claude_code_orchestration_and_interactive_tools_not_deferred() -> None:
+    # Claude Code sends built-in orchestration and interactive tools (Agent,
+    # Workflow, AskUserQuestion, SendMessage, TaskStop, ExitPlanMode) inline in
+    # the request tools. Deferring Workflow breaks dynamic workflows because
+    # ToolSearch cannot resolve it (#4313), and deferring interactive tools
+    # degrades direct prompt/skill execution.
+    tools = [
+        {"name": n, "description": n, "input_schema": {}}
+        for n in [
+            "Agent",
+            "Workflow",
+            "AskUserQuestion",
+            "SendMessage",
+            "TaskStop",
+            "ExitPlanMode",
+            "Bash",
+            "Read",
+            "Write",
+            "Edit",
+            "ToolSearch",
+            "mcp__slack__post",
+            "mcp__linear__create",
+        ]
+    ]
+    out = inject_tool_search_deferral(tools)
+    by_name = {t.get("name"): t for t in out if "name" in t}
+    for core_tool in (
+        "Agent",
+        "Workflow",
+        "AskUserQuestion",
+        "SendMessage",
+        "TaskStop",
+        "ExitPlanMode",
+    ):
+        assert by_name[core_tool].get("defer_loading") is None, (
+            f"{core_tool} was deferred but must remain resident (#4313)"
+        )
+    # External MCP tools must still be deferred
+    assert by_name["mcp__slack__post"].get("defer_loading") is True
+    assert by_name["mcp__linear__create"].get("defer_loading") is True
+
+
 def test_resident_real_tool_survives_pascal_case_surface() -> None:
     # The injected search tool is typed and does not satisfy the invariant on its
     # own; Anthropic 400s when every real tool is deferred.
