@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import threading
 from importlib.metadata import entry_points
+from inspect import iscoroutinefunction
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -366,14 +367,18 @@ def _adapt_text_search(
 
     FTS5 keeps its synchronous string API; external backends use the TextIndex
     search contract even when they have an unrelated ``search_memories`` helper.
+    An FTS5 subclass with an async search override also uses that contract.
     Look up the method when called so construction does not require search for
     callers that only use indexing, and method replacements remain visible.
     """
     from headroom.memory.adapters.fts5 import FTS5TextIndex
 
-    if isinstance(text_index, FTS5TextIndex):
-        return lambda filter: text_index.search_memories(filter)
-    return lambda filter: text_index.search(filter)
+    def search(filter: TextFilter) -> Awaitable[list[TextSearchResult]]:
+        if isinstance(text_index, FTS5TextIndex) and not iscoroutinefunction(text_index.search):
+            return text_index.search_memories(filter)
+        return text_index.search(filter)
+
+    return search
 
 
 def _create_cache(config: MemoryConfig) -> MemoryCache:
