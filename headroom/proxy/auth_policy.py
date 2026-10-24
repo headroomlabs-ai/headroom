@@ -32,6 +32,11 @@ CLIENT_UA_MAP: tuple[tuple[str, str], ...] = (
     ("claude-vscode/", "claude-vscode"),
     ("anthropic-cli/", "anthropic-cli"),
     ("codex-cli/", "codex"),
+    ("codex-tui/", "codex"),
+    ("codex_cli_rs/", "codex"),
+    ("codex-browser-use/", "codex"),
+    ("codex-computer-use/", "codex"),
+    ("codex desktop/", "codex"),
     ("cursor/", "cursor"),
     # Current Grok Build releases send "grok-shell/<version>" (verified against
     # grok 0.2.112); older builds sent "grok/". Deliberately NOT added to
