@@ -333,7 +333,17 @@ def test_relocate_system_messages_noop_without_system_entry() -> None:
     assert system == "A"
 
 
-def test_relocate_system_messages_preserves_valid_mid_conversation_section() -> None:
+@pytest.mark.parametrize(
+    "model",
+    [
+        "claude-opus-5",
+        # Claude Haiku 5.5 supports mid-conversation system messages too; it was
+        # missing here, so Claude Code's Haiku subagent traffic had every valid
+        # section hoisted into the top-level system prompt.
+        "claude-haiku-5-5",
+    ],
+)
+def test_relocate_system_messages_preserves_valid_mid_conversation_section(model: str) -> None:
     messages = [
         {"role": "user", "content": "Run the tests."},
         {
@@ -343,9 +353,7 @@ def test_relocate_system_messages_preserves_valid_mid_conversation_section() -> 
         {"role": "assistant", "content": "I will do both."},
     ]
 
-    clean, system, changed = relocate_system_messages_to_top_level(
-        messages, "base", "claude-opus-5"
-    )
+    clean, system, changed = relocate_system_messages_to_top_level(messages, "base", model)
 
     assert changed is False
     assert clean is messages
@@ -392,15 +400,14 @@ def test_relocate_system_messages_still_moves_invalid_mid_conversation_placement
     assert system == [{"type": "text", "text": messages[1]["content"]}]
 
 
-def test_relocate_system_messages_moves_valid_shape_for_unsupported_model() -> None:
+@pytest.mark.parametrize("model", ["claude-sonnet-4-6", "claude-haiku-4-5"])
+def test_relocate_system_messages_moves_valid_shape_for_unsupported_model(model: str) -> None:
     messages = [
         {"role": "user", "content": "question"},
         {"role": "system", "content": "mid-turn instruction"},
     ]
 
-    clean, system, changed = relocate_system_messages_to_top_level(
-        messages, None, "claude-sonnet-4-6"
-    )
+    clean, system, changed = relocate_system_messages_to_top_level(messages, None, model)
 
     assert changed is True
     assert clean == [{"role": "user", "content": "question"}]
@@ -490,6 +497,123 @@ def test_relocate_system_messages_image_only_sections_pass_through_unchanged() -
     assert changed is False
     assert clean == messages
     assert new_system == system
+
+
+def test_relocate_system_messages_drops_non_text_from_leading_section(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    image_block = {
+        "type": "image",
+        "source": {"type": "base64", "media_type": "image/png", "data": "aGk="},
+    }
+    cached_text = {
+        "type": "text",
+        "text": "leading instruction",
+        "cache_control": {"type": "ephemeral"},
+    }
+    messages: list[dict] = [
+        {"role": "system", "content": [cached_text, image_block]},
+        {"role": "user", "content": "hi"},
+    ]
+
+    caplog.set_level("WARNING", logger="headroom.proxy")
+    clean, new_system, changed = relocate_system_messages_to_top_level(
+        messages, [{"type": "text", "text": "base"}], "claude-opus-5"
+    )
+
+    assert changed is True
+    assert clean == [{"role": "user", "content": "hi"}]
+    assert new_system == [
+        {"type": "text", "text": "base"},
+        cached_text,
+    ]
+    assert "event=system_relocation_block_dropped" in caplog.text
+    assert "block_type=image" in caplog.text
+
+
+def test_relocate_system_messages_drops_all_non_text_leading_section() -> None:
+    image_block = {
+        "type": "image",
+        "source": {"type": "base64", "media_type": "image/png", "data": "aGk="},
+    }
+    messages: list[dict] = [
+        {"role": "system", "content": [image_block]},
+        {"role": "user", "content": "hi"},
+    ]
+
+    clean, new_system, changed = relocate_system_messages_to_top_level(
+        messages, [{"type": "text", "text": "base"}], "claude-opus-5"
+    )
+
+    assert changed is True
+    assert clean == [{"role": "user", "content": "hi"}]
+    assert new_system == [{"type": "text", "text": "base"}]
+
+
+@pytest.mark.parametrize("block_type", ["text", "image", "tool_use", "tool_result", None])
+def test_leading_system_text_uses_only_anthropic_text_block_fields(block_type) -> None:
+    from copy import deepcopy
+
+    cache_control = {"type": "ephemeral", "ttl": "1h"}
+    citations = [
+        {
+            "type": "char_location",
+            "cited_text": "instruction",
+            "document_index": 0,
+            "document_title": "source",
+            "start_char_index": 0,
+            "end_char_index": 11,
+        }
+    ]
+    block = {
+        "type": block_type,
+        "text": "instruction",
+        "cache_control": cache_control,
+        "citations": citations,
+        "source": {"type": "url", "url": "https://example.invalid/image.png"},
+        "id": "tool1",
+        "name": "read",
+        "input": {"path": "file.txt"},
+        "tool_use_id": "tool1",
+        "is_error": False,
+    }
+    messages = [
+        {"role": "system", "content": [block]},
+        {"role": "user", "content": "hi"},
+    ]
+    original = deepcopy(messages)
+    clean, system, changed = relocate_system_messages_to_top_level(messages, None, None)
+    assert changed
+    assert clean == [{"role": "user", "content": "hi"}]
+    assert system == [
+        {
+            "type": "text",
+            "text": "instruction",
+            "cache_control": cache_control,
+            "citations": citations,
+        }
+    ]
+    assert messages == original
+
+
+def test_all_contiguous_leading_system_sections_are_normalized() -> None:
+    image = {"type": "image", "source": {"type": "url", "url": "https://example.invalid/a"}}
+    clean, system, changed = relocate_system_messages_to_top_level(
+        [
+            {"role": "system", "content": "first instruction"},
+            {"role": "system", "content": [image]},
+            {"role": "system", "content": [{"type": "text", "text": "second instruction"}]},
+            {"role": "user", "content": "hi"},
+        ],
+        None,
+        None,
+    )
+    assert changed
+    assert clean == [{"role": "user", "content": "hi"}]
+    assert system == [
+        {"type": "text", "text": "first instruction"},
+        {"type": "text", "text": "second instruction"},
+    ]
 
 
 def test_headroom_bypass_helper_is_transport_neutral() -> None:

@@ -112,7 +112,9 @@ def test_toin_pattern_detail_whitelists_learned_payload(monkeypatch: pytest.Monk
             }
 
     monkeypatch.setattr("headroom.proxy.server.get_toin", lambda: FakeTOIN())
-    response = _loopback_client().get("/v1/toin/pattern/unknown")
+    client = _loopback_client()
+    identifier = client.get("/v1/toin/patterns").json()[0]["hash"]
+    response = client.get(f"/v1/toin/pattern/{identifier}")
 
     assert response.status_code == 200
     assert response.json() == {
@@ -123,6 +125,63 @@ def test_toin_pattern_detail_whitelists_learned_payload(monkeypatch: pytest.Monk
         "skip_recommended": False,
         "optimal_max_items": 20,
     }
+
+
+@pytest.fixture
+def scoped_toin(monkeypatch: pytest.MonkeyPatch, tmp_path):
+    from headroom.telemetry.toin import TOINConfig, ToolIntelligenceNetwork
+
+    toin = ToolIntelligenceNetwork(TOINConfig(storage_path=str(tmp_path / "toin.json")))
+    patterns = {
+        "global|unknown|unknown|abc123": 8,
+        "global|unknown|unknown|abc456": 16,
+        "global|payg|claude|abc123": 24,
+        "other-tenant|unknown|unknown|abc123": 32,
+        "tenant/alpha?scope=one#fragment|unknown|unknown|abc123": 40,
+    }
+    toin.import_patterns(
+        {
+            "instance_id": "scoped-pattern-regression",
+            "patterns": {
+                key: {
+                    "tool_signature_hash": key.rsplit("|", 1)[-1],
+                    "sample_size": count,
+                    "total_compressions": count,
+                    "total_retrievals": 0,
+                }
+                for key, count in patterns.items()
+            },
+        }
+    )
+    monkeypatch.setattr("headroom.proxy.server.get_toin", lambda: toin)
+    return patterns
+
+
+def test_listed_toin_identifiers_address_their_own_scoped_pattern(scoped_toin) -> None:
+    from urllib.parse import quote
+
+    client = _loopback_client()
+    listed = client.get("/v1/toin/patterns").json()
+    assert {item["hash"] for item in listed} == set(scoped_toin)
+    for item in listed:
+        response = client.get(f"/v1/toin/pattern/{quote(item['hash'], safe='')}")
+        assert response.status_code == 200
+        assert response.json()["compressions"] == item["compressions"]
+
+
+@pytest.mark.parametrize(
+    ("prefix", "status", "count"),
+    [
+        ("global|unknown|unknown|abc", 409, None),
+        ("global|unknown|unknown|abc1", 200, 8),
+        ("missing-pattern", 404, None),
+    ],
+)
+def test_toin_prefix_lookup_is_unambiguous(scoped_toin, prefix, status, count) -> None:
+    response = _loopback_client().get(f"/v1/toin/pattern/{prefix}")
+    assert response.status_code == status
+    if count is not None:
+        assert response.json()["compressions"] == count
 
 
 # Mutating routes reachable from loopback. `require_loopback` cannot stop a
@@ -480,6 +539,47 @@ def test_health_config_block_is_loopback_only(monkeypatch: pytest.MonkeyPatch) -
     local = _client(loopback=True).get("/health")
     assert local.status_code == 200
     assert "config" in local.json()
+
+
+@pytest.mark.parametrize(
+    ("exclude_tools", "requested"),
+    [(None, "Bash"), ({"WebSearch"}, "Bash,WebSearch")],
+)
+def test_protected_tool_reuse_does_not_warn_about_missing_exclusions(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    exclude_tools: set[str] | None,
+    requested: str,
+) -> None:
+    from headroom.cli.wrap import _warn_proxy_mode_mismatch
+
+    monkeypatch.setenv("HEADROOM_SKIP_UPSTREAM_CHECK", "1")
+    monkeypatch.delenv("HEADROOM_MODE", raising=False)
+    monkeypatch.delenv("HEADROOM_MIN_TOKENS", raising=False)
+    monkeypatch.setenv("HEADROOM_EXCLUDE_TOOLS", requested)
+    app = create_app(
+        ProxyConfig(
+            optimize=False,
+            cache_enabled=False,
+            rate_limit_enabled=False,
+            cost_tracking_enabled=False,
+            log_requests=False,
+            ccr_inject_tool=False,
+            ccr_handle_responses=False,
+            ccr_context_tracking=False,
+            image_optimize=False,
+            disable_kompress=True,
+            exclude_tools=exclude_tools,
+            protect_tool_results={"Bash"},
+        )
+    )
+    client = TestClient(app, base_url="http://127.0.0.1", client=("127.0.0.1", 12345))
+    response = client.get("/health")
+    assert response.status_code == 200
+
+    capsys.readouterr()
+    _warn_proxy_mode_mismatch(response.json()["config"])
+    assert capsys.readouterr().out == ""
 
 
 def test_stats_per_request_metadata_is_loopback_only() -> None:

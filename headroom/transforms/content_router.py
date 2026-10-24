@@ -63,6 +63,7 @@ from ..config import (
     is_tool_excluded,
     unwrap_tool_call,
 )
+from ..log_safety import content_logging_enabled
 from ..offline import OfflineEgressBlocked
 from ..parser import CCR_RETRIEVAL_MARKER_RE
 from ..tokenizer import Tokenizer
@@ -80,6 +81,7 @@ from .compressor_registry import (
 from .content_detector import (
     ContentType,
     DetectionResult,
+    _try_detect_git_status,
     _try_detect_log,
     _try_detect_search,
     _try_detect_structured_config,
@@ -236,6 +238,13 @@ def _compression_deadline_seconds() -> float:
         )
     except ValueError:
         return 20.0
+
+
+def _compress_workers() -> int:
+    try:
+        return int(os.environ.get("HEADROOM_COMPRESS_WORKERS", "4"))
+    except ValueError:
+        return 4
 
 
 def _router_debug_dumps(value: Any) -> str:
@@ -945,8 +954,14 @@ def _bash_command_is_search(command: str, search_commands: frozenset[str]) -> bo
     return prog in search_commands
 
 
+def _router_debug_enabled() -> bool:
+    """Router debug events carry the tool output being routed, so DEBUG alone is
+    not enough: they also need the explicit content opt-in."""
+    return logger.isEnabledFor(logging.DEBUG) and content_logging_enabled()
+
+
 def _log_router_debug(event: str, **payload: Any) -> None:
-    if not logger.isEnabledFor(logging.DEBUG):
+    if not _router_debug_enabled():
         return
     payload = {"event": event, **payload}
     logger.debug("event=%s %s", event, _router_debug_dumps(payload))
@@ -1202,6 +1217,12 @@ def _detect_content(content: str) -> DetectionResult:
     # Detect on the unwrapped payload so a tool-output envelope's tags don't get
     # the whole result misclassified as HTML/XML (#route-converter corruption).
     content = _strip_detection_envelope(content)
+
+    # Status paths/state are structural ground truth even if Magika assigns
+    # another content type; retain the format metadata on both backends.
+    git_status = _try_detect_git_status(content)
+    if git_status is not None:
+        return git_status
 
     backend = _resolve_detect_backend()
     if backend == "python":
@@ -1832,6 +1853,37 @@ class RouterCompressionResult:
             )
 
 
+def _mcp_result_min_chars() -> int:
+    """Below this many characters an MCP tool result is never compressed."""
+    try:
+        return max(0, int(os.environ.get("HEADROOM_MCP_RESULT_MIN_CHARS", "4000")))
+    except ValueError:
+        return 4000
+
+
+#: MCP tool-name prefixes seen on the wire: ``mcp__server__tool`` (Claude Code,
+#: Codex, Droid), ``mcp_server_tool`` (Gemini, VS Code Copilot), ``mcp--server--tool``
+#: (Roo). Harnesses that send bare MCP names cannot be told apart from built-ins.
+_MCP_NAME_PREFIXES = ("mcp_", "mcp--")
+
+
+def _is_small_mcp_result(tool_name: Any, text: Any) -> bool:
+    """True when ``text`` is an MCP tool's output short enough to keep verbatim.
+
+    A Jira ticket or a Slack thread is a few hundred tokens of high-value fields.
+    Compressing it saves tens of tokens, and when the model misses a field it
+    re-calls the tool or headroom_retrieve: a whole extra turn that re-reads the
+    entire cached conversation (measured: +2 turns, +15% cost on
+    benchmarks/tool_search_vs_native). ``HEADROOM_MCP_RESULT_MIN_CHARS=0``
+    restores the old behaviour.
+    """
+    return (
+        isinstance(text, str)
+        and str(tool_name or "").lower().startswith(_MCP_NAME_PREFIXES)
+        and len(text) < _mcp_result_min_chars()
+    )
+
+
 @dataclass
 class ContentRouterConfig:
     """Configuration for intelligent content routing.
@@ -2444,7 +2496,6 @@ class ContentRouter(Transform):
         # skip — i.e. revert it to original text and bust the provider prefix
         # cache. Counting pins isolates the freeze's attributable payoff.
         self._freeze_pin_hits = 0
-        self._freeze_pin_chars = 0
 
     # ── #3486: per-request runtime state accessors ──────────────────────
     #
@@ -2579,7 +2630,6 @@ class ContentRouter(Transform):
         preserved = max(0, int(len(content) * (1.0 - cached_ratio)))
         with self._frozen_lock:
             self._freeze_pin_hits += 1
-            self._freeze_pin_chars += preserved
             hits = self._freeze_pin_hits
         logger.info(
             f"FREEZE-PIN: pins={hits} cached_ratio={cached_ratio:.3f} "
@@ -2698,6 +2748,21 @@ class ContentRouter(Transform):
             return bool(compressor.is_ready())
         except Exception:
             return True
+
+    @staticmethod
+    def _kompress_load_in_progress(compressor: Any) -> bool:
+        """Whether a background thread is still fetching or loading ``compressor``'s model.
+
+        Compressors without ``is_loading`` (the remote one is always ready,
+        test doubles) count as not loading.
+        """
+        is_loading = getattr(compressor, "is_loading", None)
+        if is_loading is None:
+            return False
+        try:
+            return bool(is_loading())
+        except Exception:
+            return False
 
     def _record_to_toin(
         self,
@@ -2828,7 +2893,7 @@ class ContentRouter(Transform):
             RouterCompressionResult with compressed content and routing metadata.
         """
         context = context or ""
-        debug_enabled = logger.isEnabledFor(logging.DEBUG)
+        debug_enabled = _router_debug_enabled()
         request_debug = (
             {
                 "chars": len(content),
@@ -3018,6 +3083,9 @@ class ContentRouter(Transform):
         if detection is None:
             detection = _detect_content(content)
 
+        if detection.metadata.get("format") == "git_status":
+            return CompressionStrategy.TABULAR
+
         # 1. Check for mixed content
         if mixed:
             # 2. Verify with the native detector: ``is_mixed_content`` uses
@@ -3123,7 +3191,7 @@ class ContentRouter(Transform):
             sections_source,
             isolate=tuple(placeholder for placeholder, _ in protected),
         )
-        if logger.isEnabledFor(logging.DEBUG):
+        if _router_debug_enabled():
             _log_router_debug(
                 "content_router_mixed_sections",
                 section_count=len(sections),
@@ -3798,6 +3866,11 @@ class ContentRouter(Transform):
             log]``). Log readers use this to see *how* we got to the
             final compressor without parsing decision_reason strings.
         """
+        # Git status is path/state ground truth, not a rectangular CSV table.
+        # Preserve it before embedded-JSON, lossy-after-fold and external stages.
+        if _try_detect_git_status(_strip_detection_envelope(content)) is not None:
+            return content, _estimate_tokens(content), [CompressionStrategy.TABULAR.value]
+
         # ── STRUCTURAL (embedded) JSON routing ───────────────────────────────
         # Before anything else: if this block is not a single JSON value but
         # CONTAINS balanced JSON span(s), route each span through this very
@@ -4340,7 +4413,7 @@ class ContentRouter(Transform):
                     compressed, compressed_tokens = dense
                     strategy_chain.append("dense_elide")
                     decision_reason = f"{decision_reason}_dense_elide"
-            if logger.isEnabledFor(logging.DEBUG):
+            if _router_debug_enabled():
                 _log_router_debug(
                     "content_router_strategy_result",
                     requested_strategy=requested_strategy.value,
@@ -4400,7 +4473,7 @@ class ContentRouter(Transform):
                 )
                 return elided, elided_tokens, strategy_chain
         strategy_chain.append(CompressionStrategy.PASSTHROUGH.value)
-        if logger.isEnabledFor(logging.DEBUG):
+        if _router_debug_enabled():
             _log_router_debug(
                 "content_router_strategy_result",
                 requested_strategy=requested_strategy.value,
@@ -4674,10 +4747,22 @@ class ContentRouter(Transform):
             if compressor:
                 if not compressor.is_ready():
                     compressor.ensure_background_load()
-                    # Surface: warn once per ContentRouter instance so operators
-                    # know compression is degraded — model not cached, or
-                    # HuggingFace unreachable (corporate firewall, SSL, etc.).
-                    if not getattr(self, "_kompress_warned", False):
+                    # Surface once per ContentRouter instance that requests pass
+                    # through uncompressed. While a thread is still fetching or
+                    # loading the model (the post-startup warm-up, or the
+                    # download just started above) that is expected, so say it
+                    # at INFO. With no loader running, e.g. a failed download
+                    # in its retry backoff, compression is degraded: warn and
+                    # name the usual causes (_background_download has already
+                    # logged the actual error).
+                    if self._kompress_load_in_progress(compressor):
+                        if not getattr(self, "_kompress_loading_noted", False):
+                            logger.info(
+                                "Kompress model still loading in the background; "
+                                "requests pass through uncompressed until it is ready."
+                            )
+                            self._kompress_loading_noted = True
+                    elif not getattr(self, "_kompress_warned", False) and not compressor.is_ready():
                         logger.warning(
                             "Kompress model not ready; requests will not be "
                             "compressed. Check HuggingFace connectivity or "
@@ -5113,7 +5198,12 @@ class ContentRouter(Transform):
         if self.config.enable_kompress:
             compressor = self._get_kompress()
             if compressor:
-                if not hasattr(compressor, "preload"):
+                if compressor is self._get_remote_kompress():
+                    # HEADROOM_KOMPRESS_ENDPOINT runs the model; there is no
+                    # local model to download or warm.
+                    status["kompress"] = "enabled"
+                    status["kompress_backend"] = "remote"
+                elif not hasattr(compressor, "preload"):
                     status["kompress"] = "enabled"
                     status["kompress_backend"] = "unknown"
                 else:
@@ -6225,6 +6315,16 @@ class ContentRouter(Transform):
                 tool_name = tool_name_map.get(tool_call_id, "")
                 bias = self._get_tool_bias(tool_name) if tool_name else 1.0
 
+                # Small MCP results stay verbatim: twin of the Anthropic
+                # tool_result branch in _process_content_blocks.
+                if _is_small_mcp_result(tool_name, content):
+                    result_slots[i] = message
+                    transforms_applied.append("router:mcp_small_result_verbatim")
+                    route_counts["mcp_small_result"] = route_counts.get("mcp_small_result", 0) + 1
+                    if collect_diagnostics:
+                        _diag[i] = "protected:mcp_small_result"
+                    continue
+
                 # Bash-search lossless pre-empt: a read-only search (grep/rg/git
                 # grep) run via a shell tool yields byte-losslessly foldable
                 # output. Fold it instead of the lossy strategy path.
@@ -6487,9 +6587,7 @@ class ContentRouter(Transform):
 
         # --- Pass 2: Parallel compression of all cache-miss messages ---
         if pending_tasks:
-            max_workers = min(
-                len(pending_tasks), int(os.environ.get("HEADROOM_COMPRESS_WORKERS", "4"))
-            )
+            max_workers = min(len(pending_tasks), _compress_workers())
             t_parallel_start = time.perf_counter()
 
             if max_workers <= 1 or len(pending_tasks) == 1:
@@ -7375,6 +7473,16 @@ class ContentRouter(Transform):
                     else tool_content
                 )
 
+                # Small MCP results stay verbatim (see _is_small_mcp_result).
+                if _is_small_mcp_result(tool_name, tool_text):
+                    new_blocks.append(block)
+                    transforms_applied.append("router:mcp_small_result_verbatim")
+                    if route_counts is not None:
+                        route_counts["mcp_small_result"] = (
+                            route_counts.get("mcp_small_result", 0) + 1
+                        )
+                    continue
+
                 # Bash-search lossless pre-empt (twin of the string-form path):
                 # fold read-only search output (grep/rg/git grep) byte-losslessly
                 # instead of taking the lossy strategy path.
@@ -7814,24 +7922,3 @@ class ContentRouter(Transform):
         Always returns True - the router handles all content types.
         """
         return True
-
-
-def route_and_compress(
-    content: str,
-    context: str = "",
-) -> str:
-    """Convenience function for one-off routing and compression.
-
-    Args:
-        content: Content to compress.
-        context: Optional context for relevance-aware compression.
-
-    Returns:
-        Compressed content.
-
-    Example:
-        >>> compressed = route_and_compress(mixed_content)
-    """
-    router = ContentRouter()
-    result = router.compress(content, context=context)
-    return result.compressed

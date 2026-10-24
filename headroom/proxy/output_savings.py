@@ -354,6 +354,44 @@ class SavingsEstimate:
 _SHAPED_LABEL_PREFIX = "output_shaper:verbosity:"
 
 
+# :data:`MEASURED_MIN_CLUSTERS` decides whether a stratum is a real sample at
+# all. The gates below decide something stricter: whether the measurement has
+# earned the headline slot away from the synthetic control.
+
+# Conversations per arm a stratum needs before it may count toward the
+# headline. The 95% band is computed per REQUEST, so it reads one long
+# conversation as many independent draws: five control conversations of 200
+# requests each report about +/-4pp where the honest band is tens of points.
+# Only capped per-stratum cluster ids are stored, so a cluster-robust band
+# cannot be computed; this floor is the clustering guard instead. It must stay
+# at or below ``_CLUSTER_CAP``, which ``n_clusters`` saturates at.
+MEASURED_SUPERSEDE_MIN_CLUSTERS = 30
+
+# Share of the conversation-labelled treatment requests the measured strata
+# must cover. Below it the holdout describes a corner of the traffic, not the
+# traffic. Labelled requests only: the measurement can only ever be built from
+# those, so unlabelled legacy volume must neither help nor block it.
+MEASURED_MIN_COVERAGE = 0.5
+
+# ...and the 95% band must be at least this tight, in percentage points of
+# reduction. A stratum can clear every cluster floor and still be too noisy to
+# say anything.
+MEASURED_MAX_CI_HALF_WIDTH_PCT = 10.0
+
+
+def _measured_covers(measured: SavingsEstimate, labelled_requests: int) -> bool:
+    """Whether the measured strata describe the traffic, not a corner of it."""
+    return measured.n_requests >= MEASURED_MIN_COVERAGE * labelled_requests
+
+
+def _measured_supersedes(measured: SavingsEstimate, labelled_requests: int) -> bool:
+    """Whether the A/B measurement has outgrown the synthetic-control estimate."""
+    half_width = (measured.ci_high_pct - measured.ci_low_pct) / 2.0
+    if half_width > MEASURED_MAX_CI_HALF_WIDTH_PCT:
+        return False
+    return _measured_covers(measured, labelled_requests)
+
+
 @dataclass
 class SavingsLedger:
     """Accumulates shaped (treatment) and unshaped (control) observations and
@@ -407,7 +445,9 @@ class SavingsLedger:
                 var += (n * n) * (mu_var / m)
         return self._finalize(total_saved, total_baseline, var, n_requests, "estimated")
 
-    def estimate_from_holdout(self) -> SavingsEstimate | None:
+    def estimate_from_holdout(
+        self, min_clusters: int = MEASURED_MIN_CLUSTERS
+    ) -> SavingsEstimate | None:
         """A/B measurement: per-stratum control mean minus treatment mean.
 
         Only strata with conversation-labelled data in BOTH arms contribute,
@@ -439,7 +479,7 @@ class SavingsLedger:
             c = self.control.get(key)
             if c is None or c.qn == 0 or t.qn == 0:
                 continue
-            if c.n_clusters < MEASURED_MIN_CLUSTERS or t.n_clusters < MEASURED_MIN_CLUSTERS:
+            if c.n_clusters < min_clusters or t.n_clusters < min_clusters:
                 continue
             contributing += 1
             # Everything below reads the qualified subset only. The clusters
@@ -529,17 +569,33 @@ class SavingsLedger:
         )
 
     def best_estimate(self, level: int | None = None) -> SavingsEstimate:
-        """Strongest available tier: measured > estimated > modelled.
+        """Strongest believable tier: measured > estimated > modelled.
 
         ``level`` enables the modelled fallback; without it the behaviour is
         unchanged from before, which keeps every existing caller honest.
+
+        The measured tier is preferred only once it is worth believing. With
+        conversation-stable keys five conversations per arm fill quickly, so on
+        the bare cluster gate a corner of the traffic, or a few long
+        conversations, would decide the headline. The measured number displaces
+        the synthetic control only when every stratum it is built from holds
+        :data:`MEASURED_SUPERSEDE_MIN_CLUSTERS` conversations per arm, those
+        strata cover :data:`MEASURED_MIN_COVERAGE` of the labelled treatment
+        requests, and its band is tight enough to mean something. With no
+        baseline to fall back on, the bare cluster gate's measurement is still
+        reported, since it displaces nothing, but only while it covers the
+        traffic: a corner of it is not a headline either way.
         """
-        measured = self.estimate_from_holdout()
-        if measured is not None:
+        measured = self.estimate_from_holdout(min_clusters=MEASURED_SUPERSEDE_MIN_CLUSTERS)
+        labelled = sum(t.qn for t in self.treatment.values())
+        if measured is not None and _measured_supersedes(measured, labelled):
             return measured
         estimated = self.estimate_from_baseline()
         if estimated.n_requests > 0:
             return estimated
+        measured = self.estimate_from_holdout()
+        if measured is not None and _measured_covers(measured, labelled):
+            return measured
         if level is not None:
             modelled = self.estimate_from_model(level)
             if modelled is not None:

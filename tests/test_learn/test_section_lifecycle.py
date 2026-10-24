@@ -15,7 +15,7 @@ because it asserts on writer behaviour; it drives the real, unmodified
 import pytest
 
 from headroom.learn.models import Recommendation, RecommendationTarget
-from headroom.learn.writer import _merge_into_file
+from headroom.learn.writer import _merge_into_file, _merge_markdown_items, _prune_carried_section
 from headroom.memory.traffic_learner import (
     ExtractedPattern,
     PatternCategory,
@@ -262,3 +262,37 @@ class TestTrafficLearnerCategoryLifecycle:
         assert "User prefers terse output" in final
         assert "### Learned: architecture" not in final
         assert "Handlers live under headroom/proxy/handlers" not in final
+
+
+class TestSanitizedPatternIdHandling:
+    """The persisted form of a pattern-id comment is HTML-sanitized."""
+
+    def test_prune_decodes_sanitized_pattern_ids(self):
+        """A carried bullet whose id comment is sanitized still expires.
+
+        On disk the comment reads ``&lt;!-- ... --&gt;``; the prune path must
+        treat it as a tracked item, not as untagged content to keep forever.
+        """
+        sanitized = (
+            "- Handlers live under headroom/proxy/handlers"
+            " &lt;!-- headroom:pattern-id:abc123 --&gt;"
+        )
+
+        assert _prune_carried_section(sanitized, frozenset()) == ""
+        assert _prune_carried_section(sanitized, frozenset({"abc123"})) == sanitized
+
+    def test_merge_keeps_entity_and_literal_ampersand_bullets_distinct(self):
+        """Two live bullets differing only in ``&amp;`` vs ``&`` both survive.
+
+        The visible-text dedup key must stay on the bullet text as written:
+        decoding it before comparing would collapse suggestions that render
+        the same but are literally different advice.
+        """
+        new_content = "- Prefer `a &amp; b` in configs <!-- headroom:pattern-id:hash2 -->"
+        prior_content = "- Prefer `a & b` in configs <!-- headroom:pattern-id:hash1 -->"
+
+        merged = _merge_markdown_items(new_content, prior_content, frozenset({"hash1", "hash2"}))
+
+        assert merged is not None
+        assert "`a &amp; b`" in merged
+        assert "`a & b`" in merged

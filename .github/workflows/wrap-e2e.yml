@@ -30,6 +30,9 @@ concurrency:
   group: wrap-e2e-${{ github.ref }}
   cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
 
+permissions:
+  contents: read
+
 jobs:
   docker-wrap-e2e:
     runs-on: ubuntu-latest

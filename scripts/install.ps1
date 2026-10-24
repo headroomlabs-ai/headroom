@@ -402,7 +402,13 @@ function Add-DashboardGatewayEnv {
     # 127.0.0.1. Trust only that exact gateway by default so the dashboard's
     # metadata gate works for the first-party persistent Docker preset while
     # preserving an explicitly configured allowlist.
-    if (Test-Path Env:HEADROOM_PROXY_TRUSTED_DASHBOARD_CLIENT_CIDRS) {
+    #
+    # An explicitly empty allowlist counts as configured. Look it up the way
+    # Get-PassthroughEnvArgs does: once Env: has been enumerated, Windows
+    # PowerShell 5.1 reports an empty variable as unset through Test-Path and
+    # [Environment]::GetEnvironmentVariable, which would add the gateway on top
+    # of the forwarded empty value.
+    if (Get-ChildItem Env: | Where-Object { $_.Name -eq 'HEADROOM_PROXY_TRUSTED_DASHBOARD_CLIENT_CIDRS' }) {
         return
     }
 

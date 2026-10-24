@@ -1,10 +1,14 @@
 """Proxy server CLI commands."""
 
+import errno
+import ipaddress
 import logging
 import os
+import platform
+import socket
 import sys
 import warnings
-from importlib import import_module
+from importlib.util import find_spec
 from pathlib import Path
 from typing import Any, Literal, cast
 
@@ -21,6 +25,15 @@ from headroom.proxy.modes import PROXY_MODE_CACHE, normalize_proxy_mode
 from .main import main
 
 
+def _proxy_requires_onnx_backends() -> bool:
+    """Match extras that omit unavailable Intel macOS Python 3.14+ wheels."""
+    return not (
+        sys.platform == "darwin"
+        and platform.machine() == "x86_64"
+        and sys.version_info[:2] >= (3, 14)
+    )
+
+
 def ensure_proxy_dependencies() -> None:
     """Verify optional proxy extras are installed before starting or wrapping."""
     required_modules: list[str] = [
@@ -29,18 +42,19 @@ def ensure_proxy_dependencies() -> None:
         "httpx",
         "openai",
         "mcp",
-        "magika",
         "zstandard",
         "websockets",
-        "onnxruntime",
         "transformers",
     ]
+    if _proxy_requires_onnx_backends():
+        required_modules.extend(["magika", "onnxruntime"])
     if sys.implementation.name != "pypy":
         required_modules.append("orjson")
 
     try:
-        for module in required_modules:
-            import_module(module)
+        missing = next((module for module in required_modules if find_spec(module) is None), None)
+        if missing is not None:
+            raise ImportError(f"No module named '{missing}'")
     except ImportError as e:
         click.secho(
             "Error: Proxy dependencies not installed. Run: pip install headroom-ai[proxy]",
@@ -184,14 +198,97 @@ def _get_env_int(name: str, default: int) -> int:
     return default if value is None else value
 
 
-def _get_env_float_optional(name: str) -> float | None:
-    val = os.environ.get(name)
-    if val is None or val == "":
+def _tcp_port_in_use(host: str, port: int, *, workers: int) -> tuple[OSError, Any] | None:
+    """Return ``(EADDRINUSE error, busy address)`` uvicorn would hit binding ``host:port``.
+
+    Returns None when the bind would succeed.
+
+    Mirrors uvicorn's own bind so the probe never refuses a bind uvicorn would
+    accept: ``SO_REUSEADDR`` (both uvicorn paths set it on POSIX, so a port in
+    TIME_WAIT after a restart is not "in use"); a single process binds every
+    address ``host`` resolves to (asyncio ``create_server``), while
+    ``--workers > 1`` binds one AF_INET/AF_INET6 socket in the parent.
+    Windows ``SO_REUSEADDR`` semantics differ, so Windows is left to uvicorn,
+    as is any error other than EADDRINUSE (unresolvable host, address not on
+    this machine); uvicorn reports those as before.
+    """
+    if sys.platform == "win32":
+        return None
+    if workers > 1:
+        family = socket.AF_INET6 if ":" in host else socket.AF_INET
+        targets: list[tuple[Any, Any]] = [(family, (host, port))]
+    else:
+        try:
+            infos = socket.getaddrinfo(
+                host or None, port, type=socket.SOCK_STREAM, flags=socket.AI_PASSIVE
+            )
+        except (OSError, UnicodeError):
+            return None
+        targets = [(info[0], info[4]) for info in infos]
+    for family, address in targets:
+        try:
+            with socket.socket(family, socket.SOCK_STREAM) as probe:
+                probe.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                if family == socket.AF_INET6 and workers <= 1:
+                    # asyncio binds v4 and v6 separately; match it.
+                    probe.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 1)
+                probe.bind(address)
+        except OSError as exc:
+            if exc.errno == errno.EADDRINUSE:
+                return exc, address
+    return None
+
+
+_WILDCARD_PROBE_HOSTS = {"": "127.0.0.1", "0.0.0.0": "127.0.0.1", "::": "::1"}
+
+
+def _probe_host_for(address: Any) -> str | None:
+    """The numeric address to ask "is this Headroom?", or None when it can't be targeted.
+
+    A wildcard bind is reached through loopback of the same family. A
+    hostname (the ``--workers > 1`` path binds it unresolved) is resolved for
+    IPv4. A scoped IPv6 address cannot go in a probe URL.
+    """
+    host = str(address[0])
+    if host in _WILDCARD_PROBE_HOSTS:
+        return _WILDCARD_PROBE_HOSTS[host]
+    if "%" in host:
         return None
     try:
-        return float(val)
+        ipaddress.ip_address(host)
     except ValueError:
-        raise click.ClickException(f"{name} must be a number, got {val!r}") from None
+        try:
+            infos = socket.getaddrinfo(host, None, socket.AF_INET, socket.SOCK_STREAM)
+        except (OSError, UnicodeError):
+            return None
+        return str(infos[0][4][0]) if infos else None
+    return host
+
+
+def _refuse_busy_port(host: str, port: int, *, workers: int) -> None:
+    """Fail before the banner when ``host:port`` is already taken.
+
+    Without this the banner prints "Press Ctrl+C to stop", then uvicorn's bind
+    error is buried among startup and shutdown log lines.
+    """
+    busy = _tcp_port_in_use(host, port, workers=workers)
+    if busy is None:
+        return
+    error, address = busy
+    from headroom.cli.port_discovery import probe_headroom_proxy
+
+    reason = error.strerror or str(error)
+    probe_host = _probe_host_for(address)
+    if probe_host is None:
+        holder = f"({reason})"
+    elif probe_headroom_proxy(port, host=probe_host):
+        holder = "by a running Headroom proxy (reuse it, or stop it first)"
+    else:
+        holder = f"by another process ({reason})"
+    raise click.ClickException(
+        f"Port {port} on {host} is already in use {holder}. "
+        "Start this proxy on another port with --port N (env: HEADROOM_PORT)."
+    )
 
 
 @main.command()
@@ -770,9 +867,9 @@ def dashboard(port: int, no_open: bool) -> None:
     envvar="HEADROOM_READ_MATURATION",
     help=(
         "EXPERIMENTAL: activity-based read maturation — hold fresh Reads "
-        "out of the provider prefix cache and compress them once their "
-        "file quiesces. Requires HEADROOM_ROLLOUT_CHANNEL=beta (or dev); "
-        "env: HEADROOM_READ_MATURATION=1."
+        "verbatim and compress them once their file quiesces, unless the "
+        "provider cache already holds them. Requires "
+        "HEADROOM_ROLLOUT_CHANNEL=beta (or dev); env: HEADROOM_READ_MATURATION=1."
     ),
 )
 @click.option(
@@ -1015,7 +1112,7 @@ def dashboard(port: int, no_open: bool) -> None:
 @click.option(
     "--no-telemetry",
     is_flag=True,
-    help="Force anonymous usage telemetry off (already the default; env: HEADROOM_TELEMETRY=off)",
+    help="Turn off local stats and the anonymous upload beacon (env: HEADROOM_TELEMETRY=off)",
 )
 @click.option(
     "--stateless",
@@ -1684,6 +1781,8 @@ Memory (Multi-Provider):
     _bind = evaluate_bind_policy(config.host, config.proxy_token)
     if _bind.refused:
         raise click.ClickException(_bind.message())
+    if not config.uds:
+        _refuse_busy_port(config.host, config.port, workers=workers)
     _auth_on = _bind.token_configured
     _open_bind_note = (
         f" · WARNING open bind, /v1/* UNAUTHENTICATED (acknowledged via {OPEN_BIND_ACK_ENV}=1)"

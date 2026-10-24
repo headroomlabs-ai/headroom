@@ -57,6 +57,27 @@ PACKAGE_ROOT = REPO_ROOT / "headroom"
 # ──────────────────────────── socket booby trap ────────────────────────────
 
 
+class TestUpdateCheckOffline:
+    def test_explicit_update_check_never_constructs_request(self, monkeypatch, offline, no_sockets):
+        from click.testing import CliRunner
+
+        from headroom import update_check
+        from headroom.cli import main
+
+        attempts = []
+
+        def refuse_request(*args, **kwargs):
+            attempts.append((args, kwargs))
+            raise SocketOpened("update check constructed a request while offline")
+
+        monkeypatch.setenv("HEADROOM_UPDATE_CHECK", "on")
+        monkeypatch.setattr(update_check.urllib.request, "Request", refuse_request)
+        result = CliRunner().invoke(main, ["update", "--check"])
+
+        assert attempts == []
+        assert result.exit_code == 1
+
+
 class SocketOpened(AssertionError):
     """Raised from the patched socket entry points.
 
@@ -1677,7 +1698,7 @@ class TestDoctorNetworkOffline:
 
 
 class TestInstallDownloadsOffline:
-    """`headroom install`'s two release downloads.
+    """`headroom install`'s release download.
 
     `binaries.py` already had `HEADROOM_BINARIES_OFFLINE`, which is exactly the
     kind of second, differently-named flag an operator should not have to
@@ -1696,13 +1717,6 @@ class TestInstallDownloadsOffline:
                 progress=False,
             )
         assert _refused_hostname(excinfo.value) == "github.com"
-
-    def test_cbm_download_opens_no_socket(self, offline: None, no_sockets: None) -> None:
-        from headroom.graph import installer
-
-        with pytest.raises(OfflineEgressBlocked) as excinfo:
-            installer.download_cbm()
-        assert "HEADROOM_OFFLINE" in str(excinfo.value)
 
     def test_the_binaries_specific_switch_still_wins_first(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
@@ -2271,11 +2285,6 @@ _EGRESS_ALLOWLIST: dict[str, tuple[int, str]] = {
         "deployment that points Headroom at an on-prem model endpoint, which "
         "is the main reason such a deployment exists.",
     ),
-    "update_check.py": (
-        1,
-        "gated: is_update_check_enabled() returns False when is_offline(), so "
-        "the request is never built. See headroom/update_check.py.",
-    ),
     "telemetry/session.py": (
         1,
         "gated: the beacon upload is reached only via is_telemetry_enabled(), "
@@ -2298,8 +2307,9 @@ _EGRESS_ALLOWLIST: dict[str, tuple[int, str]] = {
         "the locally running proxy (/health and /admin/runtime-env).",
     ),
     "cli/learn.py": (
-        1,
-        "loopback: hard-coded http://127.0.0.1:<port>/admin/runtime-env on the local proxy.",
+        2,
+        "loopback: both sites are hard-coded http://127.0.0.1:<port> calls to "
+        "the locally running proxy (/health and /admin/runtime-env).",
     ),
     "cli/mcp.py": (
         1,
@@ -2341,13 +2351,17 @@ _EGRESS_ALLOWLIST: dict[str, tuple[int, str]] = {
         "calls guard_egress first.",
     ),
     "relevance/embedding.py": (
-        1,
+        2,
         "cache-only: the first of the two fastembed loads in "
         "_load_text_embedding runs with HF_HUB_OFFLINE forced to 1, so "
         "huggingface_hub resolves from the local cache or raises without "
         "opening a socket. The network retry directly below it calls "
         "guard_egress, which is why a pre-seeded air-gapped host still loads "
-        "the model and a cold one refuses instead of dialling.",
+        "the model and a cold one refuses instead of dialling. The load in "
+        "_load_default_model runs under the same forced HF_HUB_OFFLINE and "
+        "passes specific_model_path, which fastembed loads without any Hub "
+        "lookup; its files come through hf_hub_download_local_first, guarded "
+        "on the miss.",
     ),
 }
 

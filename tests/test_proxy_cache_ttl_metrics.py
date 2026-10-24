@@ -313,7 +313,7 @@ def test_streaming_parser_extracts_anthropic_ttl_bucket_usage() -> None:
         b'"cache_read_input_tokens":3,"cache_creation_input_tokens":9,'
         b'"cache_creation":{"ephemeral_5m_input_tokens":4,"ephemeral_1h_input_tokens":5}}}}\n\n'
     )
-    usage = proxy._parse_sse_usage(chunk, "anthropic")
+    usage = proxy._parse_sse_usage_from_buffer({"sse_buffer": bytearray(chunk)}, "anthropic")
 
     assert usage is not None
     assert usage["cache_creation_ephemeral_5m_input_tokens"] == 4
@@ -498,3 +498,86 @@ def test_reset_runtime_clears_miss_attribution() -> None:
     asyncio.run(metrics.record_cache_miss_attribution("anthropic", "ttl_expiry"))
     asyncio.run(metrics.reset_runtime())
     assert dict(metrics.cache_miss_attribution_by_provider) == {}
+
+
+def test_prefix_cache_stats_prices_xai_cache_reads_with_grok_models(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Grok traffic books under ``xai``; its cache reads must be priced with a
+    Grok model, not dropped to $0 because no model matched the provider."""
+    metrics = PrometheusMetrics()
+    metrics.cache_by_provider["xai"].update(
+        {"requests": 1, "hit_requests": 1, "cache_read_tokens": 1_000_000}
+    )
+    tracker = CostTracker()
+    tracker._tokens_sent_by_model.update({"grok-4": 1})
+    monkeypatch.setattr(CostTracker, "_get_list_price", lambda _self, _model: 3.0)
+    monkeypatch.setattr(CostTracker, "_get_cache_prices", lambda _self, _model: None)
+
+    stats = build_prefix_cache_stats(metrics, tracker)
+
+    # No catalog cache rates: xAI's own fallback ratio, not Anthropic's 0.1.
+    assert stats["by_provider"]["xai"]["savings_usd"] == round(1_000_000 * 3e-6 * (1 - 0.16), 4)
+
+
+def test_streaming_parser_reads_cache_usage_sent_only_in_message_delta() -> None:
+    # Fireworks' Anthropic endpoint sends zeros in message_start and the real
+    # input and cache counts in message_delta. The prefix tracker freezes history
+    # by cache_read, so dropping them makes it treat a warm cache as cold.
+    from headroom.proxy.server import HeadroomProxy, ProxyConfig
+
+    proxy = HeadroomProxy(
+        ProxyConfig(
+            optimize=False,
+            cache_enabled=False,
+            rate_limit_enabled=False,
+            cost_tracking_enabled=False,
+            log_requests=False,
+            ccr_inject_tool=False,
+            ccr_handle_responses=False,
+            ccr_context_tracking=False,
+        )
+    )
+    chunk = (
+        b'data: {"type":"message_start","message":{"usage":{"input_tokens":0,'
+        b'"output_tokens":0,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}}}\n\n'
+        b'data: {"type":"message_delta","delta":{"stop_reason":"tool_use"},"usage":'
+        b'{"input_tokens":1,"output_tokens":5,"cache_read_input_tokens":2802,'
+        b'"cache_creation_input_tokens":0}}\n\n'
+    )
+    usage = proxy._parse_sse_usage_from_buffer({"sse_buffer": bytearray(chunk)}, "anthropic")
+
+    assert usage["cache_read_input_tokens"] == 2802
+    assert usage["input_tokens"] == 1
+    assert usage["output_tokens"] == 5
+
+
+def test_streaming_parser_reads_ttl_buckets_sent_only_in_message_delta() -> None:
+    # One-hour cache writes reported only in message_delta must stay one-hour,
+    # or the cost tracker prices them as five-minute writes.
+    from headroom.proxy.server import HeadroomProxy, ProxyConfig
+
+    proxy = HeadroomProxy(
+        ProxyConfig(
+            optimize=False,
+            cache_enabled=False,
+            rate_limit_enabled=False,
+            cost_tracking_enabled=False,
+            log_requests=False,
+            ccr_inject_tool=False,
+            ccr_handle_responses=False,
+            ccr_context_tracking=False,
+        )
+    )
+    chunk = (
+        b'data: {"type":"message_start","message":{"usage":{"input_tokens":0,'
+        b'"cache_creation_input_tokens":0}}}\n\n'
+        b'data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":'
+        b'{"input_tokens":5,"output_tokens":2,"cache_creation_input_tokens":1000,'
+        b'"cache_creation":{"ephemeral_5m_input_tokens":0,"ephemeral_1h_input_tokens":1000}}}\n\n'
+    )
+    usage = proxy._parse_sse_usage_from_buffer({"sse_buffer": bytearray(chunk)}, "anthropic")
+
+    assert usage["cache_creation_input_tokens"] == 1000
+    assert usage["cache_creation_ephemeral_1h_input_tokens"] == 1000
+    assert usage["cache_creation_ephemeral_5m_input_tokens"] == 0
