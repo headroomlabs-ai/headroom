@@ -1,0 +1,6 @@
+node_modules/
+.dados-dev/
+.dados-demo/
+.vercel/
+.env*
+*.db

@@ -1,0 +1,16 @@
+{
+  "name": "financeiro-interno",
+  "version": "0.2.0",
+  "private": true,
+  "type": "module",
+  "description": "Financeiro interno do escritório de arquitetura e gestão de obras",
+  "engines": { "node": "22.x" },
+  "scripts": {
+    "dev": "node dev-server.js",
+    "demo": "DEMO=1 node dev-server.js",
+    "test": "node --test \"test/**/*.test.js\""
+  },
+  "dependencies": {
+    "@vercel/blob": "^2.8.0"
+  }
+}
