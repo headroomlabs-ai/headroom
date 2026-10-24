@@ -3549,7 +3549,7 @@ class OpenAIHandlerMixin:
         # `messages`, but it runs before this snapshot, so its output is already
         # captured — keep this snapshot after image compression, or a reorder
         # silently reintroduces the drift.
-        cache_lookup_messages = messages
+        cache_lookup_messages = copy.deepcopy(messages) if self.cache and not stream else messages
         # Response-cache partition: a cached response is only ever replayed to a
         # caller presenting the same provider credentials and principal (01-F15).
         # Snapshotted with the key fields so lookup and store agree. None means

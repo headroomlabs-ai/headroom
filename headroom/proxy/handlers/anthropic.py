@@ -1544,7 +1544,9 @@ class AnthropicHandlerMixin:
             # it was looked up by — the cache would never hit and would fill with
             # unreachable entries. Reuse this raw snapshot verbatim at cache.set
             # (the same reason cache_key_fields is snapshotted here, #327).
-            cache_lookup_messages = messages
+            cache_lookup_messages = (
+                copy.deepcopy(messages) if self.cache and not stream else messages
+            )
             # Response-cache partition: a cached response is only ever replayed to a
             # caller presenting the same provider credentials and principal (01-F15).
             # Snapshotted with the key fields so lookup and store agree. None means
