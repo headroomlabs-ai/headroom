@@ -1,0 +1,15 @@
+{
+  "expires": "2026-11-15",
+  "reason": "E2E harness only, never shipped in the wheel or SDK. npm 12.2.1 bundles undici 6.29.0 and ip-address 10.7.2; bundled copies ignore overrides and no newer npm release is available. OpenClaw is updated to 2026.10.6 and uses fixed Undici 8.12.3, so no OpenClaw path is excepted. Recheck npm upstream and remove these exact-path exceptions by the existing expiry.",
+  "advisories": {
+    "GHSA-4qv8-2p9j-2685": {
+      "node_modules/npm/node_modules/undici": "6.29.0"
+    },
+    "GHSA-xjj6-f33q-929c": {
+      "node_modules/npm/node_modules/undici": "6.29.0"
+    },
+    "GHSA-rxp7-6hxx-x8q5": {
+      "node_modules/npm/node_modules/ip-address": "10.7.2"
+    }
+  }
+}
