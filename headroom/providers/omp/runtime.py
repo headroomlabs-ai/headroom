@@ -1,19 +1,19 @@
 """Runtime helpers for Oh My Pi (omp) integrations.
 
-omp resolves its Anthropic chat endpoint from the model registry
-(``providers.anthropic.baseUrl`` in ``~/.omp/agent/models.yml``), not from
+omp resolves its Anthropic and OpenAI provider endpoints from the model registry
+(``providers.<id>.baseUrl`` in ``~/.omp/agent/models.yml``), not from
 ``ANTHROPIC_BASE_URL`` — that env var only feeds omp's web-search helper.
 Verified empirically: with ``ANTHROPIC_BASE_URL`` pointed at a local probe
 server, omp's chat traffic still went to the real Anthropic endpoint; with a
 ``models.yml`` same-ID override, every ``/v1/messages`` request arrived at the
-probe.  A same-ID override keeps omp's bundled Anthropic model catalog and
-stored credentials (both keyed by provider id ``anthropic``), so only the
-endpoint moves.
+probe. Same-ID overrides keep omp's bundled model catalog and stored
+credentials, so only the endpoints move.
 
-The wrap therefore injects a marker-fenced ``providers.anthropic.baseUrl``
-override into ``models.yml``, snapshotting the pre-wrap file byte-for-byte
-first — the same durable-wrap + backup + ``headroom unwrap`` contract the
-Codex wrap uses for ``config.toml``.
+The wrap injects marker-fenced ``providers.anthropic.baseUrl``,
+``providers.openai.baseUrl``, and ``providers.openai-codex.baseUrl`` overrides
+into ``models.yml``, snapshotting the pre-wrap file byte-for-byte first. OMP's
+Codex provider appends ``/codex/responses``; Headroom already aliases that
+path. Gemini and other providers remain untouched.
 """
 
 from __future__ import annotations
@@ -23,6 +23,7 @@ from collections.abc import Mapping
 from pathlib import Path
 
 from headroom.providers.claude import proxy_base_url as claude_proxy_base_url
+from headroom.providers.codex import proxy_base_url as codex_proxy_base_url
 from headroom.proxy.project_context import with_project_prefix
 
 MANAGED_MARKER = "# managed by `headroom wrap omp`"
@@ -62,6 +63,11 @@ def proxy_anthropic_base_url(port: int, project: str | None = None) -> str:
     return with_project_prefix(claude_proxy_base_url(port), project)
 
 
+def proxy_openai_base_url(port: int, project: str | None = None) -> str:
+    """Proxy base URL omp's OpenAI and Codex providers are pointed at."""
+    return with_project_prefix(codex_proxy_base_url(port), project)
+
+
 def is_managed(models_file: Path) -> bool:
     """Whether ``models_file`` is currently a wrap-managed override."""
     if not models_file.exists():
@@ -74,25 +80,26 @@ def is_managed(models_file: Path) -> bool:
 
 
 def inject_models_override(port: int, project: str | None = None) -> tuple[Path, str]:
-    """Point ``providers.anthropic.baseUrl`` at the local proxy.
+    """Point omp's Anthropic, OpenAI, and Codex provider endpoints at Headroom.
 
-    Returns ``(models_file, base_url)``.
+    Returns ``(models_file, anthropic_base_url)`` for backward compatibility.
 
     * First injection snapshots the user's pre-wrap file byte-for-byte to
-      ``models.yml.headroom-backup`` so unwrap can restore it exactly.  A file
+      ``models.yml.headroom-backup`` so unwrap can restore it exactly. A file
       that is already wrap-managed is never re-snapshotted (that would clobber
       the pristine backup — same guard as the Codex config snapshot).
     * The managed file is regenerated from the backup (or from scratch when
       the user had no ``models.yml``) on every call, so re-running with a
-      different ``--port`` updates the override idempotently.
+      different ``--port`` updates the overrides idempotently.
     * Any user-defined providers/models from the pre-wrap file are preserved:
-      the override only deep-sets ``providers.anthropic.baseUrl``.
+      the override only deep-sets each supported provider's ``baseUrl``.
     """
     import yaml  # type: ignore[import-untyped]  # PyYAML ships no stubs; lint env installs no deps
 
     models_file = models_yml_path()
     backup = backup_path(models_file)
     base_url = proxy_anthropic_base_url(port, project)
+    openai_base_url = proxy_openai_base_url(port, project)
 
     original_bytes: bytes | None = None
     if backup.exists():
@@ -119,11 +126,16 @@ def inject_models_override(port: int, project: str | None = None) -> tuple[Path,
     if not isinstance(providers, dict):  # malformed user value: keep it in backup only
         providers = {}
         data["providers"] = providers
-    anthropic = providers.setdefault("anthropic", {})
-    if not isinstance(anthropic, dict):
-        anthropic = {}
-        providers["anthropic"] = anthropic
-    anthropic["baseUrl"] = base_url
+    for provider_name, provider_base_url in (
+        ("anthropic", base_url),
+        ("openai", openai_base_url),
+        ("openai-codex", openai_base_url),
+    ):
+        provider = providers.setdefault(provider_name, {})
+        if not isinstance(provider, dict):
+            provider = {}
+            providers[provider_name] = provider
+        provider["baseUrl"] = provider_base_url
 
     models_file.parent.mkdir(parents=True, exist_ok=True)
     rendered = yaml.safe_dump(data, sort_keys=False, default_flow_style=False)
@@ -157,10 +169,15 @@ def build_launch_env(
 ) -> tuple[dict[str, str], list[str]]:
     """Build the launch environment and display lines for the omp wrap.
 
-    The endpoint redirect itself lives in ``models.yml`` (see module
+    The endpoint redirects themselves live in ``models.yml`` (see module
     docstring), so the environment passes through unchanged; the display
-    lines surface where the override went.
+    lines surface where the overrides went.
     """
     env = dict(environ or os.environ)
     base_url = proxy_anthropic_base_url(port, project)
-    return env, [f"models.yml: providers.anthropic.baseUrl={base_url}"]
+    openai_base_url = proxy_openai_base_url(port, project)
+    return env, [
+        f"models.yml: providers.anthropic.baseUrl={base_url}",
+        f"models.yml: providers.openai.baseUrl={openai_base_url}",
+        f"models.yml: providers.openai-codex.baseUrl={openai_base_url}",
+    ]
