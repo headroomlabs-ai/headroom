@@ -24,6 +24,7 @@ from headroom.transforms.content_router import (
     ContentType,
     RouterCompressionResult,
     RoutingDecision,
+    _is_small_shell_result,
     _shell_result_min_chars,
 )
 
@@ -287,6 +288,20 @@ def test_zero_shell_result_min_chars_is_legitimate(monkeypatch: pytest.MonkeyPat
     assert _shell_result_min_chars() == 0
 
 
+def test_negative_shell_result_min_chars_disables_the_guard(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("HEADROOM_SHELL_RESULT_MIN_CHARS", "-1")
+    assert _shell_result_min_chars() == 0
+    result = _route("Bash", _ls_output())
+    assert "router:shell_small_result_verbatim" not in result.transforms_applied
+
+
+@pytest.mark.parametrize("text", [None, 123, ""])
+def test_empty_or_non_string_values_are_not_small_shell_results(text: object) -> None:
+    assert not _is_small_shell_result("Bash", text, frozenset({"bash"}))
+
+
 def test_shell_result_floor_boundary_is_exclusive() -> None:
     """The floor is "shorter than", so exactly 2000 chars stays compressible."""
     at_floor = _padded_output(2000)
@@ -395,3 +410,40 @@ def test_custom_shell_names_are_normalized_and_protected() -> None:
     result = router.apply(_openai_conversation("mYsHeLl", output), _tokenizer(), target_ratio=0.4)
     assert result.messages[3]["content"] == output
     assert "router:shell_small_result_verbatim" in result.transforms_applied
+
+
+@pytest.mark.parametrize("route", [_route_openai, _route_function, _route_text_block])
+def test_non_shell_results_remain_compressible_in_all_wire_shapes(
+    route: Callable[[str, str], TransformResult],
+) -> None:
+    output = _ls_output()
+    result = route("SomeOtherTool", output)
+    assert "router:shell_small_result_verbatim" not in result.transforms_applied
+    assert result.messages[3]["content"] not in (output, [{"type": "text", "text": output}])
+
+
+@pytest.mark.parametrize("route", [_route_openai, _route_function, _route_text_block])
+def test_shell_floor_can_be_disabled_in_all_wire_shapes(
+    monkeypatch: pytest.MonkeyPatch, route: Callable[[str, str], TransformResult]
+) -> None:
+    monkeypatch.setenv("HEADROOM_SHELL_RESULT_MIN_CHARS", "0")
+    output = _ls_output()
+    result = route("Bash", output)
+    assert "router:shell_small_result_verbatim" not in result.transforms_applied
+    assert result.messages[3]["content"] not in (output, [{"type": "text", "text": output}])
+
+
+@pytest.mark.parametrize("conversation", [_openai_conversation, _function_conversation])
+def test_small_shell_result_diagnostics_explain_why_it_was_preserved(
+    conversation: Callable[[str, str], list[dict[str, object]]],
+) -> None:
+    output = _ls_output()
+    router = ContentRouter(ContentRouterConfig())
+    router.compress = _fake_compress  # type: ignore[assignment]
+    result = router.apply(
+        conversation("Bash", output), _tokenizer(), target_ratio=0.4, collect_diagnostics=True
+    )
+    decision = next(item for item in result.message_decisions if item.message_index == 3)
+    assert decision.action == "protected:shell_small_result"
+    assert decision.tokens_before == decision.tokens_after
+    assert result.messages[3]["content"] == output
