@@ -13,24 +13,33 @@
 # import-order violations because the ruff pre-commit hook in
 # .pre-commit-config.yaml was never installed for contributors.
 #
-# Idempotent. Re-running is safe. Skips installation if `.git/hooks/` is
-# missing (e.g. running outside a git checkout).
+# Idempotent. Re-running is safe. Exits with an error when run outside a git
+# checkout. Works from linked worktrees too: there `.git` is a file, so the
+# hooks directory is resolved through git rather than assumed to be
+# `.git/hooks/`.
 
 set -euo pipefail
 
 cd "$(dirname "$0")/.."
 
-if [[ ! -d .git/hooks ]]; then
-    echo "error: .git/hooks/ not found — run from a git checkout root" >&2
+# Install only into the checkout this script belongs to. A source copy nested
+# inside another repository would otherwise resolve that repository's hooks.
+if [[ "$(git rev-parse --show-toplevel 2>/dev/null)" != "$(pwd -P)" ]]; then
+    echo "error: $(pwd -P) is not the root of a git checkout — run from a Headroom git checkout" >&2
     exit 1
 fi
+
+# Ask git for the effective hooks directory. In a linked worktree `.git` is a
+# file and hooks live in the shared common dir, so `.git/hooks` doesn't exist.
+HOOKS_DIR="$(git rev-parse --git-path hooks)"
+mkdir -p "$HOOKS_DIR"
 
 if ! command -v npx &>/dev/null; then
     echo "error: npx not found — install Node 18+ before installing Headroom's git hooks." >&2
     exit 1
 fi
 
-HOOK_PATH=".git/hooks/pre-push"
+HOOK_PATH="$HOOKS_DIR/pre-push"
 
 cat > "$HOOK_PATH" <<'HOOK_EOF'
 #!/usr/bin/env bash
@@ -96,8 +105,8 @@ fi
 if [[ -n "$PRE_COMMIT_BIN" ]]; then
     "$PRE_COMMIT_BIN" install
     "$PRE_COMMIT_BIN" install --hook-type commit-msg
-    echo "✅ installed: .git/hooks/pre-commit (repo pre-commit checks via pre-commit)"
-    echo "✅ installed: .git/hooks/commit-msg (conventional commit enforcement via commitlint)"
+    echo "✅ installed: $HOOKS_DIR/pre-commit (repo pre-commit checks via pre-commit)"
+    echo "✅ installed: $HOOKS_DIR/commit-msg (conventional commit enforcement via commitlint)"
 else
     echo "error: pre-commit not found — run 'pip install -e .[dev]' first, then re-run this script." >&2
     exit 1
