@@ -122,6 +122,12 @@ append_common_container_args() {
   ensure_host_dirs
   ref+=(-w /workspace)
   ref+=(--env "HOME=${HEADROOM_CONTAINER_HOME}")
+  # Docker creates ${HEADROOM_CONTAINER_HOME} as root:root when the image has
+  # no such directory, so $HOME is not writable by the --user <host-uid>
+  # process (issue #4207). Keep the HuggingFace/XDG caches on the
+  # bind-mounted workspace, which the host user owns.
+  ref+=(--env "HF_HOME=${HEADROOM_CONTAINER_HOME}/.headroom/cache/huggingface")
+  ref+=(--env "XDG_CACHE_HOME=${HEADROOM_CONTAINER_HOME}/.headroom/cache")
   ref+=(--env "PYTHONUNBUFFERED=1")
   # Canonical Headroom filesystem contract (issue #175) — forward into the
   # container so the proxy resolves state/config to the bind-mounted path.

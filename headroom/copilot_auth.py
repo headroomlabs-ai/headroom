@@ -1069,6 +1069,14 @@ def _set_header_default(headers: dict[str, str], name: str, value: str) -> None:
     headers[name] = value
 
 
+def _remove_headers(headers: dict[str, str], *names: str) -> None:
+    """Remove every case variant of the named headers in place."""
+    names_lower = {name.lower() for name in names}
+    for key in list(headers):
+        if key.lower() in names_lower:
+            del headers[key]
+
+
 def _copilot_token_exchange_headers(
     oauth_token: str, *, integration_id: str | None = None
 ) -> dict[str, str]:
@@ -1695,7 +1703,7 @@ def _is_forwardable_copilot_bearer_token(token: str) -> bool:
 def _token_kind(token: str) -> str:
     """Return a non-sensitive label for the token type, safe to log."""
     t = token.strip()
-    for prefix in ("tid_", "gho_", "ghs_", "ghp_", "github_pat_"):
+    for prefix in ("tid_", "ghu_", "gho_", "ghs_", "ghp_", "github_pat_"):
         if t.startswith(prefix):
             return prefix + "***"
     return "unknown" if t else "empty"
@@ -1725,6 +1733,36 @@ async def apply_copilot_api_auth(headers: dict[str, str], *, url: str) -> dict[s
     if not is_copilot_upstream_url(url):
         return resolved
 
+    incoming_auth = next((v for k, v in resolved.items() if k.lower() == "authorization"), None)
+    scheme, _, raw_token = incoming_auth.partition(" ") if incoming_auth else ("", "", "")
+    # Inline completions accept the editor's own OAuth credential. Keep its
+    # account and integration metadata rather than substituting the operator's
+    # seat or adding chat-specific defaults (#3352).
+    if (
+        scheme.lower() == "bearer"
+        and raw_token.startswith("ghu_")
+        and is_copilot_completions_host(url)
+        and not _is_managed_copilot_seeded_bearer(raw_token)
+    ):
+        upstream = urlparse(url)
+        base = urlparse(copilot_completions_base_url())
+        path = upstream.path
+        prefix = base.path.rstrip("/")
+        if (
+            prefix
+            and upstream.scheme == base.scheme
+            and upstream.netloc.lower() == base.netloc.lower()
+            and path.startswith(prefix + "/")
+        ):
+            path = path[len(prefix) :]
+        if is_copilot_completions_path(path):
+            logger.info(
+                "apply_copilot_api_auth: passing through inline editor token kind=%s",
+                _token_kind(raw_token),
+            )
+            _remove_headers(resolved, "x-api-key")
+            return resolved
+
     # Read the CLIENT's integration ID before any default is applied, so the
     # credential we mint below can be bound to the surface that actually made
     # the call rather than to whatever this proxy happens to default to.
@@ -1734,9 +1772,7 @@ async def apply_copilot_api_auth(headers: dict[str, str], *, url: str) -> dict[s
     for name, value in _copilot_chat_header_defaults(integration_id).items():
         _set_header_default(resolved, name, value)
 
-    incoming_auth = next((v for k, v in resolved.items() if k.lower() == "authorization"), None)
     if incoming_auth:
-        scheme, _, raw_token = incoming_auth.partition(" ")
         if (
             scheme.lower() == "bearer"
             and raw_token
@@ -1752,9 +1788,7 @@ async def apply_copilot_api_auth(headers: dict[str, str], *, url: str) -> dict[s
                     "apply_copilot_api_auth: passing through client token kind=%s",
                     _token_kind(raw_token),
                 )
-                for key in list(resolved):
-                    if key.lower() == "x-api-key":
-                        resolved.pop(key)
+                _remove_headers(resolved, "x-api-key")
                 return resolved
         logger.info(
             "apply_copilot_api_auth: incoming token not suitable (kind=%s), will replace",
@@ -1762,9 +1796,7 @@ async def apply_copilot_api_auth(headers: dict[str, str], *, url: str) -> dict[s
         )
 
     token = await get_copilot_token_provider().get_api_token(integration_id=integration_id)
-    for key in list(resolved):
-        if key.lower() in {"authorization", "x-api-key"}:
-            resolved.pop(key)
+    _remove_headers(resolved, "authorization", "x-api-key")
     resolved["Authorization"] = f"Bearer {token.token}"
     # The credential and the integration ID must leave together. Until now the
     # ID was applied with set-default semantics BEFORE this branch was chosen,

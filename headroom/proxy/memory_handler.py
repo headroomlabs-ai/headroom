@@ -759,9 +759,12 @@ class MemoryHandler:
         if not self.config.inject_context:
             return None
 
+        from headroom.proxy.helpers import get_memory_injection_mode
+
         # PR-B6: Tool mode disables auto-injection. The model calls
-        # ``memory_search`` to retrieve when it wants to.
-        if self.config.mode == MemoryMode.TOOL:
+        # ``memory_search`` to retrieve when it wants to. Selected by the
+        # handler config or by HEADROOM_MEMORY_INJECTION_MODE=tool.
+        if self.config.mode == MemoryMode.TOOL or get_memory_injection_mode() == "tool":
             logger.info(
                 "event=memory_mode_skip mode=tool user_id=%s reason=tool_mode_no_auto_injection",
                 user_id,
@@ -797,18 +800,6 @@ class MemoryHandler:
             )
             return None
 
-        # Build the embedding query. When the handler provides a
-        # MemoryQuery, use its multi-source untruncated input; otherwise
-        # fall back to extracting from messages (kept for legacy callers
-        # / tests). Full fidelity in both paths.
-        if query is not None:
-            query_text = query.to_embedding_input()
-        else:
-            query_text = self._extract_user_query(messages)
-        if not query_text:
-            logger.debug("Memory: No query text for context search")
-            return None
-
         # Compose the budget: explicit per-call wins; otherwise derive
         # from self.config so existing top_k/min_similarity callers see
         # no behaviour change.
@@ -822,6 +813,22 @@ class MemoryHandler:
         )
 
         try:
+            if query is not None:
+                from headroom.proxy.memory_query_policy import bounded_embedding_parts
+
+                parts = bounded_embedding_parts(
+                    user_text=query.user_text,
+                    recent_tool_outputs=query.recent_tool_outputs,
+                    recent_assistant_turns=query.recent_assistant_turns,
+                )
+                prepare = getattr(backend, "prepare_search_query", None)
+                query_text = await prepare(*parts) if prepare is not None else "".join(parts)
+            else:
+                query_text = self._extract_user_query(messages)[-4096:]
+            if not query_text:
+                logger.debug("Memory: No query text for context search")
+                return None
+
             # Search memories on the per-request resolved backend.
             results = await backend.search_memories(
                 query=query_text,
@@ -868,7 +875,7 @@ class MemoryHandler:
                     memory_lines.append(f"   (Related: {entities_str})")
 
         except Exception as e:
-            logger.warning(f"Memory: Search failed for user {effective_user_id}: {e}")
+            logger.warning(f"Memory: Search failed for user {effective_user_id}: {e!r}")
             return None
 
         if not memory_lines:
@@ -901,10 +908,8 @@ pass that ID directly to memory_update or memory_delete — you do not need \
 to call memory_search first to discover IDs. Use this context to inform \
 your responses, not to drive new actions."""
 
-        # Apply the token-budget cap on the formatted block. Pre-this-
-        # PR there was no cap — up to ~4000 tokens could be injected
-        # per request. The budget bounds the output without touching
-        # the input query (which stays full-fidelity per MemoryQuery).
+        # The formatted output budget is separate from the embedding-input
+        # budget above; the original MemoryQuery remains full-fidelity.
         context = effective_budget.apply_to_text(context)
 
         # Track only memories that survived ranking, entry limits, and the

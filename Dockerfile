@@ -51,11 +51,16 @@ COPY headroom/ headroom/
 # `headroom proxy --backend`, including Bedrock temporary/SSO credentials.
 # Those credentials require botocore (GH #1551), supplied by [bedrock].
 ARG HEADROOM_EXTRAS=proxy,code,bedrock
+# `uv pip install` ignores [tool.uv] override-dependencies (uv.lock only), so
+# pass them explicitly: the image gets the security overrides the lock has
+# (pillow 13 over fastembed's <13 cap). Python 3.10 has no tomllib: pip's
+# vendored tomli reads the file there.
 RUN --mount=type=cache,target=/root/.cache/uv \
     --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/usr/local/cargo/git \
     --mount=type=cache,target=/build/target \
-    uv pip install --system ".[${HEADROOM_EXTRAS}]"
+    python -c "exec('try: import tomllib\\nexcept ImportError: from pip._vendor import tomli as tomllib'); print('\\n'.join(tomllib.load(open('pyproject.toml', 'rb'))['tool']['uv']['override-dependencies']))" > /tmp/overrides.txt && \
+    uv pip install --system --overrides /tmp/overrides.txt ".[${HEADROOM_EXTRAS}]"
 
 RUN --mount=type=bind,source=.,target=/context,readonly \
     HEADROOM_BUILD_VERSION="${HEADROOM_BUILD_VERSION}" PYTHON_SITE_PACKAGES="${PYTHON_SITE_PACKAGES}" python - <<'PY'

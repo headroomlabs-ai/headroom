@@ -26,7 +26,10 @@ tracing-subscriber = { version = "0.3", features = ["json", "env-filter", "fmt"]
 # roots (Zscaler, Netskope, ...) are installed in the OS store, never in
 # Mozilla's list, so webpki alone rejects every re-signed upstream certificate.
 reqwest = { version = "0.12", default-features = false, features = ["stream", "rustls-tls", "rustls-tls-native-roots", "http2"] }
-tokio-tungstenite = { version = "0.30", default-features = false, features = ["connect", "rustls-tls-webpki-roots", "rustls-tls-native-roots"] }
+# websocket.rs always supplies tls::websocket_tls_config(), which loads our
+# direct webpki-roots 1.x dependency plus native/additive roots. Do not enable
+# tungstenite's unused default webpki store: it pulls the obsolete 0.26 shim.
+tokio-tungstenite = { version = "0.30", default-features = false, features = ["connect", "rustls-tls-native-roots"] }
 clap = { workspace = true, features = ["derive", "env"] }
 serde = { workspace = true }
 serde_json = { workspace = true }
@@ -122,7 +125,7 @@ tokio-rustls = { version = "0.26", default-features = false, features = ["ring",
 # is the generator rustls' own test-suite uses; dev-only, never shipped.
 rcgen = { version = "0.14", default-features = false, features = ["ring", "pem"] }
 reqwest = { version = "0.12", default-features = false, features = ["stream", "rustls-tls", "http2", "json"] }
-tokio-tungstenite = { version = "0.30", default-features = false, features = ["connect", "rustls-tls-webpki-roots"] }
+tokio-tungstenite = { version = "0.30", default-features = false, features = ["connect", "rustls-tls-native-roots"] }
 futures-util = "0.3"
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "signal", "net", "io-util", "time", "test-util", "process"] }
 hyper = { version = "1", features = ["server", "http1", "http2"] }
