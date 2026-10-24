@@ -12,6 +12,8 @@ import functools
 import json
 import os
 import uuid
+from datetime import datetime, timedelta, timezone
+from unittest.mock import patch
 
 import pytest
 
@@ -508,6 +510,121 @@ class TestMemoryBridgeSync:
         # Sync again - nothing should be exported (all memories have source tag)
         stats = await bridge.sync(user_id="test_user")
         assert stats.memories_exported == 0
+
+    @pytest.mark.asyncio
+    async def test_sync_exports_organic_memory_when_markdown_changes(
+        self, bridge, tmp_dir, backend
+    ):
+        """Importing edits must not replace the export's previous watermark."""
+        md_path = tmp_dir / "MEMORY.md"
+        md_path.write_text("## Facts\n- User likes Python\n", encoding="utf-8", newline="\n")
+        bridge._config.md_paths = [md_path]
+        initial = await bridge.sync(user_id="test_user")
+        skip_if_offline_bridge_import_failed(initial.import_stats)
+
+        organic = await backend.save_memory(
+            content="Release label is cobalt-47", user_id="test_user", metadata={}
+        )
+        created_at = organic.created_at.replace(tzinfo=timezone.utc)
+        bridge._sync_state["last_sync"] = (created_at - timedelta(minutes=1)).isoformat()
+        bridge._save_sync_state()
+        md_path.write_text(
+            "## Facts\n- User likes Python\n\n## Updates\n- Project uses SQLite\n",
+            encoding="utf-8",
+            newline="\n",
+        )
+
+        with patch("headroom.memory.bridge.datetime", wraps=datetime) as clock:
+            clock.now.return_value = created_at + timedelta(minutes=1)
+            stats = await bridge.sync(user_id="test_user")
+
+        assert stats.import_stats.sections_imported > 0
+        assert stats.memories_exported == 1
+        content = md_path.read_text(encoding="utf-8")
+        assert content.count("Release label is cobalt-47") == 1
+        assert content.count("Project uses SQLite") == 1
+
+    @pytest.mark.asyncio
+    async def test_first_sync_exports_existing_organic_memory(self, bridge, tmp_dir, backend):
+        """An initial import must not hide memories saved before the first sync."""
+        organic = await backend.save_memory(
+            content="Guitar lessons are scheduled for Thursday", user_id="test_user", metadata={}
+        )
+        md_path = tmp_dir / "MEMORY.md"
+        md_path.write_text("## Facts\n- User likes Python\n", encoding="utf-8", newline="\n")
+        bridge._config.md_paths = [md_path]
+        assert bridge._sync_state.get("last_sync") is None
+
+        with patch("headroom.memory.bridge.datetime", wraps=datetime) as clock:
+            clock.now.return_value = organic.created_at.replace(tzinfo=timezone.utc) + timedelta(
+                minutes=1
+            )
+            stats = await bridge.sync(user_id="test_user")
+
+        assert stats.import_stats.sections_imported > 0
+        assert stats.memories_exported == 1
+        content = md_path.read_text(encoding="utf-8")
+        assert content.count("Guitar lessons are scheduled for Thursday") == 1
+        assert content.count("User likes Python") == 1
+
+    @pytest.mark.asyncio
+    async def test_sync_still_excludes_organic_memory_before_watermark(
+        self, bridge, tmp_dir, backend
+    ):
+        organic = await backend.save_memory(
+            content="Deployment region is eu-west-2", user_id="test_user", metadata={}
+        )
+        created_at = organic.created_at.replace(tzinfo=timezone.utc)
+        bridge._sync_state["last_sync"] = (created_at + timedelta(minutes=1)).isoformat()
+        md_path = tmp_dir / "MEMORY.md"
+        md_path.write_text("## Facts\n- User likes Python\n", encoding="utf-8", newline="\n")
+        bridge._config.md_paths = [md_path]
+
+        with patch("headroom.memory.bridge.datetime", wraps=datetime) as clock:
+            clock.now.return_value = created_at + timedelta(minutes=2)
+            stats = await bridge.sync(user_id="test_user")
+
+        assert stats.import_stats.sections_imported > 0
+        assert stats.memories_exported == 0
+        assert "Deployment region" not in md_path.read_text(encoding="utf-8")
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("watermark", [None, "not-a-timestamp"])
+    async def test_sync_keeps_watermark_fallback_for_unchanged_file(
+        self, bridge, tmp_dir, backend, watermark
+    ):
+        md_path = tmp_dir / "MEMORY.md"
+        md_path.write_text("## Facts\n- User likes Python\n", encoding="utf-8", newline="\n")
+        bridge._config.md_paths = [md_path]
+        initial = await bridge.sync(user_id="test_user")
+        skip_if_offline_bridge_import_failed(initial.import_stats)
+        await backend.save_memory(
+            content="Release label is cobalt-47", user_id="test_user", metadata={}
+        )
+        bridge._sync_state["last_sync"] = watermark
+
+        stats = await bridge.sync(user_id="test_user")
+
+        assert stats.import_stats.files_skipped_unchanged == 1
+        assert stats.memories_exported == 1
+        assert md_path.read_text(encoding="utf-8").count("Release label is cobalt-47") == 1
+
+    @pytest.mark.asyncio
+    async def test_first_sync_without_import_exports_existing_memory(
+        self, bridge, tmp_dir, backend
+    ):
+        await backend.save_memory(
+            content="Release label is cobalt-47", user_id="test_user", metadata={}
+        )
+        md_path = tmp_dir / "MEMORY.md"
+        bridge._config.md_paths = [md_path]
+        assert not md_path.exists()
+
+        stats = await bridge.sync(user_id="test_user")
+
+        assert stats.import_stats.sections_imported == 0
+        assert stats.memories_exported == 1
+        assert "Release label is cobalt-47" in md_path.read_text(encoding="utf-8")
 
 
 @decorate_async_test_methods
