@@ -111,6 +111,10 @@ Turn 5: User asks "What about the auth middleware?"
 
 CCR works automatically on the Anthropic and OpenAI proxy paths, but you can also retrieve cached data programmatically:
 
+For newly stored Kompress entries, `/v1/retrieve` reports a `cl100k_base` token
+estimate of the stored original in `original_tokens`, not a word count; provider
+tokenizers can differ, and previously persisted entries are not rewritten.
+
 <Tabs groupId="lang" items={['TypeScript', 'Python']}>
 <Tab value="TypeScript">
 ```ts twoslash

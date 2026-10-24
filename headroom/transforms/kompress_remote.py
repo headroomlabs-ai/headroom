@@ -321,13 +321,7 @@ class RemoteKompressCompressor:
             # the real block — the exact loss ``ccr_original`` exists to prevent.
             # Same resolution order as KompressCompressor.compress.
             ccr_source = ccr_original if ccr_original is not None else content
-            # The endpoint's ``original_tokens`` describes ``content``, so it does
-            # not describe a different ``ccr_source``; count that one locally.
-            # Unchanged on the common path where no override was passed.
-            ccr_source_tokens = (
-                len(ccr_source.split()) if ccr_original is not None else result.original_tokens
-            )
-            cache_key = store_kompress_in_ccr(ccr_source, compressed, ccr_source_tokens)
+            cache_key = store_kompress_in_ccr(ccr_source, compressed)
             if cache_key:
                 # Report the source line span so a reader can tell content was
                 # compressed away rather than absent (#2586).
