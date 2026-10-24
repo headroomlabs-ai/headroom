@@ -80,7 +80,7 @@ def _skip_proxy_port_preflight_unless_exercised(
 
 
 @pytest.fixture(autouse=True)
-def _scrub_developer_headroom_env(monkeypatch, tmp_path):
+def _scrub_developer_headroom_env(monkeypatch, tmp_path, tmp_path_factory):
     for key in list(os.environ):
         if key.startswith("HEADROOM_"):
             monkeypatch.delenv(key, raising=False)
@@ -89,6 +89,11 @@ def _scrub_developer_headroom_env(monkeypatch, tmp_path):
     # test its own store so proxy/CLI startup cannot load developer settings and
     # saves cannot rewrite them. Tests of path precedence can override this.
     monkeypatch.setenv("HEADROOM_SETTINGS_PATH", str(tmp_path / "headroom-settings.json"))
+    # The proxy's compression cache keeps results on disk; never in the
+    # developer's ~/.headroom, never shared between tests, and not in tmp_path,
+    # which tests assert stays empty when nothing is persisted.
+    cache_dir = tmp_path_factory.mktemp("compression-cache")
+    monkeypatch.setenv("HEADROOM_COMPRESSION_CACHE_PATH", str(cache_dir / "compression_cache.db"))
     # The scrub also deletes the HEADROOM_HARD_WATCHDOG_SECS=0 opt-out CI sets
     # (#3845), so every test that enters the proxy lifespan armed the 90s
     # production watchdog inside pytest; it hard-exits the process with code 1
