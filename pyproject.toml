@@ -78,6 +78,13 @@ dependencies = [
     # and pip upgrades an older copy. Same platform marker as huggingface-hub's
     # own hf-xet requirement, so it never installs where hf-xet would not.
     "hf-xet>=1.6.0; platform_machine == 'AMD64' or platform_machine == 'aarch64' or platform_machine == 'amd64' or platform_machine == 'arm64' or platform_machine == 'x86_64'",
+    # Not imported directly: litellm, huggingface-hub and torch use it.
+    # CVE-2026-112907/112913/112940 are fixed in 4.2.1, but litellm 1.106 caps
+    # filelock <4, so without this floor pip picks that litellm and 3.32.7;
+    # with it pip takes litellm 1.103.7 (uv.lock has 1.101.0). Declared here so
+    # the floor reaches pip installs. 4.2 needs Python 3.11, so pip on 3.10
+    # still gets an affected filelock.
+    "filelock>=4.2.1; python_version >= '3.11'",
 ]
 
 [project.optional-dependencies]
@@ -195,7 +202,7 @@ relevance = [
 # `headroom/image/compressor.py` adapts both API shapes at runtime via
 # a try/except cascade. See issue #372 for context.
 image = [
-    "pillow>=12.3.0",         # PYSEC-2026-2253/2254/2255/2256/2257 fixes (decompression-bomb + cmd-injection)
+    "pillow>=12.3.0",         # PYSEC-2026-2253..2257; uv.lock takes 13.0.0 (see override-dependencies)
     "sentencepiece>=0.1.99",  # Required by SigLIP tokenizer (SiglipTokenizer)
     # Python 3.6–3.12: keep the proven ORT-bundled package directly.
     # ~15 MB ONNX models auto-downloaded on first use.
@@ -293,6 +300,11 @@ bedrock = [
     "boto3>=1.41.0",
     "botocore[crt]>=1.41.0",
 ]
+# State shared across replicas: CCR store (HEADROOM_CCR_BACKEND=redis) and
+# session-aware /v1/compress (HEADROOM_COMPRESS_SESSION_STORE=redis://...).
+redis = [
+    "redis>=5.0.0",
+]
 # HTML content extraction
 html = [
     "trafilatura>=1.6.0",
@@ -325,6 +337,7 @@ dev = [
     "sentence-transformers>=2.2.0,<7.0",
     "numpy>=1.24.0",
     "openpyxl>=3.1.0",  # exercises spreadsheet_ingest (.xlsx) in the test suite
+    "fakeredis[lua]>=2.20.0",  # Redis-backed shared state, without a Redis server
     "xlrd>=2.0.1",      # exercises spreadsheet_ingest (.xls) in the test suite
     "xlwt>=1.3.0",      # writes the legacy .xls fixtures for spreadsheet_ingest tests
     # test_upstream_guard builds a self-signed cert to prove the pinned connection
@@ -424,6 +437,21 @@ constraint-dependencies = [
 # then breaks CI on every public runner that can't reach the mirror.
 # Declaring the index in pyproject.toml makes the project authoritative
 # regardless of who runs `uv lock`.
+# fastembed (0.9.0, latest) caps pillow <13, but Pillow 13.0.0 is the only fix
+# for ten decoder CVEs on untrusted images (CVE-2026-112395, -112895 and
+# others), which headroom.image opens. fastembed imports PIL only for its image models;
+# Headroom uses its text models. Checked: fastembed text embedding and
+# Headroom's image tests pass on Pillow 13. This applies to uv.lock (CI,
+# release images, uv installs); the package metadata keeps pillow>=12.3.0 so
+# `pip install headroom-ai[all]` still resolves against fastembed's cap; on
+# that Pillow, headroom/image/decoder_guard.py forwards images undecoded.
+# Drop this override once fastembed allows Pillow 13.
+# Pillow 13 needs Python 3.11; on 3.10 no fixed release exists.
+override-dependencies = [
+    "pillow>=13.0.0; python_version >= '3.11'",
+    "pillow>=12.3.0,<13; python_version < '3.11'",
+]
+
 [[tool.uv.index]]
 name = "pypi"
 url = "https://pypi.org/simple/"
