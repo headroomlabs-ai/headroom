@@ -430,6 +430,46 @@ def test_settings_trusted_gateway_dashboard_client_allowed(
     assert resp.status_code == 200, resp.text
 
 
+def test_settings_trusted_dashboard_hostname_allowed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv(
+        "HEADROOM_PROXY_TRUSTED_DASHBOARD_HOSTS",
+        "headroom.nealbresler.com",
+    )
+    monkeypatch.setenv(
+        "HEADROOM_PROXY_TRUSTED_DASHBOARD_CLIENT_CIDRS",
+        "100.90.0.5/32",
+    )
+    client = TestClient(
+        _make_app(),
+        base_url="https://headroom.nealbresler.com",
+        client=("100.90.0.5", 12345),
+    )
+    response = client.get("/dashboard/settings")
+    assert response.status_code == 200, response.text
+
+
+def test_settings_untrusted_dashboard_hostname_still_rejected(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv(
+        "HEADROOM_PROXY_TRUSTED_DASHBOARD_HOSTS",
+        "headroom.nealbresler.com",
+    )
+    monkeypatch.setenv(
+        "HEADROOM_PROXY_TRUSTED_DASHBOARD_CLIENT_CIDRS",
+        "100.90.0.5/32",
+    )
+    client = TestClient(
+        _make_app(),
+        base_url="http://attacker.example",
+        client=("100.90.0.5", 12345),
+    )
+    response = client.get("/dashboard/settings")
+    assert response.status_code == 404, response.text
+
+
 def test_settings_trusted_gateway_cidr_mismatch_still_404s(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

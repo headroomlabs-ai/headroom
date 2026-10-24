@@ -2873,9 +2873,22 @@ def _request_can_view_dashboard_metadata(
         host_header = request.headers.get("host")
     except AttributeError:
         return False
-    if not is_ip_literal_host_header(host_header):
+    if not host_header:
         return False
-    # is_ip_literal_host_header() rejects a missing Host, so host_header is a str here.
+
+    if not is_ip_literal_host_header(host_header):
+        # Reverse proxies commonly expose the dashboard through a DNS name.
+        # Allow only explicitly configured authorities here; retain the
+        # same-origin and trusted-client checks below.
+        trusted_hosts = {
+            value.strip().lower()
+            for value in os.getenv("HEADROOM_PROXY_TRUSTED_DASHBOARD_HOSTS", "").split(",")
+            if value.strip()
+        }
+        if host_header.strip().lower() not in trusted_hosts:
+            return False
+
+    # The Host header is present and either an IP literal or explicitly trusted.
     assert host_header is not None
 
     # CIDR authorization makes this endpoint usable by a remote dashboard, but
