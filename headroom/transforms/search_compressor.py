@@ -171,12 +171,21 @@ class SearchCompressor:
     ) -> SearchCompressionResult:
         rust_result = self._rust.compress(content, context, bias)
         cache_key: str | None = rust_result.cache_key
-        if cache_key is not None:
-            # Mirror the original Python: persist to the production CCR
-            # store. The Rust crate already wrote to its in-memory test
-            # store; promote that to the long-lived Python store so the
-            # marker remains retrievable beyond the request lifecycle.
-            persist_rust_ccr_entry(content, rust_result.compressed, cache_key, source="search")
+        # Mirror the original Python: persist to the production CCR
+        # store. The Rust crate already wrote to its in-memory test
+        # store; promote that to the long-lived Python store so the
+        # marker remains retrievable beyond the request lifecycle.
+        if cache_key is not None and not persist_rust_ccr_entry(
+            content, rust_result.compressed, cache_key, source="search"
+        ):
+            return SearchCompressionResult(  # unstored original: no marker
+                compressed=content,
+                original=content,
+                original_match_count=rust_result.original_match_count,
+                compressed_match_count=rust_result.original_match_count,
+                files_affected=rust_result.files_affected,
+                compression_ratio=1.0,
+            )
 
         summaries = dict(cast("dict[str, str]", rust_result.summaries))
         return SearchCompressionResult(

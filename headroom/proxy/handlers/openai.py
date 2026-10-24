@@ -10701,9 +10701,6 @@ class OpenAIHandlerMixin:
                 session_tracker = self.session_tracker_store.get_or_create(
                     _session_key, _tracker_provider
                 )
-                from headroom.cache.prefix_tracker import seed_restored_compression_cache
-
-                seed_restored_compression_cache(session_tracker, comp_cache)
 
             # A claimed turn prepares its executor-side work here (tokenizer,
             # hooks, scope binding) — CPU-bound parts run inside the closures
@@ -10764,6 +10761,21 @@ class OpenAIHandlerMixin:
                         "(a previous turn for this session is still running)"
                     )
                 try:
+                    nonlocal session_tracker
+                    from headroom.cache.prefix_tracker import seed_restored_compression_cache
+
+                    shared = self.shared_compress_sessions
+                    if shared is not None:
+                        # Another replica may have served this session's last
+                        # turn: take its tracker when it is newer than ours.
+                        newer = shared.fetch(
+                            self.session_tracker_store, _session_key, session_tracker
+                        )
+                        if newer is not None:
+                            # The key is present (get_or_create above).
+                            self.session_tracker_store.install(_session_key, newer)
+                            session_tracker = newer
+                    seed_restored_compression_cache(session_tracker, comp_cache)
                     prev_original = session_tracker.get_last_original_messages()
                     prev_returned = session_tracker.get_last_forwarded_messages()
                     prep = prepare_turn(
@@ -10838,6 +10850,8 @@ class OpenAIHandlerMixin:
                     # return time because whatever we hand back IS what the
                     # caller sends upstream.
                     session_tracker.record_returned(messages, final)
+                    if shared is not None:
+                        shared.publish(self.session_tracker_store, _session_key, session_tracker)
                     info = {
                         "id": session_id,
                         "frozen_message_count": session_frozen,
@@ -11149,6 +11163,40 @@ class OpenAIHandlerMixin:
         # from here.
         _session_key = f"compress\x00{session_id}"
         tracker = self.session_tracker_store.peek(_session_key)
+        shared = self.shared_compress_sessions
+        if shared is not None:
+            # The session's last turn may have run on another replica. Fetched
+            # under the turn lock (a local turn in flight must finish first),
+            # installed here on the loop: the key may be new to this store.
+            _local = tracker
+            _lock_cache = self._peek_compression_cache(_session_key)
+
+            def _fetch():
+                lock = _lock_cache.session_turn_lock if _lock_cache is not None else None
+                if lock is not None and not lock.acquire(
+                    timeout=_SESSION_TURN_LOCK_TIMEOUT_SECONDS
+                ):
+                    return None
+                try:
+                    return shared.fetch(self.session_tracker_store, _session_key, _local)
+                finally:
+                    if lock is not None:
+                        lock.release()
+
+            try:
+                newer = await self._run_compression_in_executor(
+                    _fetch, timeout=COMPRESSION_TIMEOUT_SECONDS
+                )
+            except TimeoutError:
+                newer = None  # answer from this replica's state, as without the store
+            if newer is not None:
+                current = self.session_tracker_store.peek(_session_key)
+                if current is _local:
+                    self.session_tracker_store.install(_session_key, newer)
+                    tracker = newer
+                else:
+                    # A local turn installed a tracker meanwhile: it is newer.
+                    tracker = current
         if tracker is None:
             return self._compress_usage_unknown_session(session_id)
         # No create, no LRU bump: the cache is only needed for its turn lock.
@@ -11195,6 +11243,8 @@ class OpenAIHandlerMixin:
                     messages=last_returned,
                     original_messages=tracker.get_last_original_messages(),
                 )
+                if shared is not None:
+                    shared.publish(self.session_tracker_store, _session_key, tracker)
                 return tracker.get_frozen_message_count()
             finally:
                 if lock is not None:
