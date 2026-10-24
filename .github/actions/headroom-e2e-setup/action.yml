@@ -43,7 +43,9 @@ runs:
     # extension. Toolchain has to be set up before the editable install path.
     - name: Install Rust toolchain
       if: ${{ inputs.install-mode == 'editable-proxy' }}
-      uses: dtolnay/rust-toolchain@1.95.0
+      uses: dtolnay/rust-toolchain@stable
+      with:
+        toolchain: 1.98.1
 
     - name: Cache cargo registry + build
       if: ${{ inputs.install-mode == 'editable-proxy' }}
