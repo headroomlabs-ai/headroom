@@ -88,6 +88,7 @@ def test_proxy_shutdown_unloads_image_models() -> None:
     assert unload_prefix.call_args_list == [
         call("technique_router:"),
         call("siglip:"),
+        call("onnx_technique_router:"),
     ]
     quota_registry.stop_all.assert_awaited_once()
 
