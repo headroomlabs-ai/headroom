@@ -505,6 +505,114 @@ def test_the_buffered_turn_and_its_ccr_continuation_stream_upstream() -> None:
     }
 
 
+class _FailingContinuationClient:
+    """A CCR continuation that dies on the wire or comes back non-2xx."""
+
+    def __init__(self, reply: httpx.Response | None) -> None:
+        self.reply = reply
+
+    async def post(self, url, *, content=None, headers=None, timeout=None):  # noqa: ANN001
+        if self.reply is None:
+            raise httpx.ConnectError("peer said CONTENT_CANARY")
+        return self.reply
+
+    async def aclose(self) -> None:
+        return None
+
+
+@pytest.mark.parametrize("failure", ["transport", "status"])
+def test_a_failed_ccr_continuation_logs_only_safe_metadata(monkeypatch, failure) -> None:
+    import logging
+
+    monkeypatch.delenv("HEADROOM_DEBUG_DUMP", raising=False)
+    marker = get_compression_store().store(
+        original=json.dumps({"secret": "retrieved answer"}), compressed="{}", original_item_count=1
+    )
+    retrieve_turn = [
+        _message_start(),
+        {
+            "type": "content_block_start",
+            "index": 0,
+            "content_block": {
+                "type": "tool_use",
+                "id": "t1",
+                "name": "headroom_retrieve",
+                "input": {},
+            },
+        },
+        {
+            "type": "content_block_delta",
+            "index": 0,
+            "delta": {"type": "input_json_delta", "partial_json": json.dumps({"hash": marker})},
+        },
+        {"type": "content_block_stop", "index": 0},
+        {
+            "type": "message_delta",
+            "delta": {"stop_reason": "tool_use", "stop_sequence": None},
+            "usage": {"output_tokens": 9},
+        },
+        {"type": "message_stop"},
+    ]
+    reply = (
+        None
+        if failure == "transport"
+        else httpx.Response(
+            503,
+            content=b"CONTENT_CANARY",
+            headers={"request-id": "req_upstream_1", "x-private": "HEADER_CANARY"},
+        )
+    )
+    records: list[logging.LogRecord] = []
+
+    class _Collect(logging.Handler):
+        def emit(self, record: logging.LogRecord) -> None:
+            records.append(record)
+
+    app = create_app(_config())
+    with TestClient(app) as client:
+        # Attached after startup: startup reconfigures headroom.* logging.
+        logger = logging.getLogger("headroom.proxy")
+        handler = _Collect(level=logging.DEBUG)
+        logger.addHandler(handler)
+        proxy = client.app.state.proxy
+
+        async def _fake_retry(method, url, headers, body, stream=False, **kwargs):  # noqa: ANN001
+            return _stream_reply(*retrieve_turn)
+
+        proxy._retry_request = _fake_retry  # type: ignore[assignment]
+        proxy.http_client = _FailingContinuationClient(reply)
+        try:
+            client.post(
+                "/v1/messages",
+                headers={"x-api-key": "k", "anthropic-version": "2023-06-01"},
+                json={
+                    "model": "claude-opus-5",
+                    "max_tokens": 64,
+                    "stream": True,
+                    "tools": [create_ccr_tool_definition("anthropic")],
+                    "messages": [{"role": "user", "content": f"use <<ccr:{marker}>>"}],
+                },
+            )
+        finally:
+            logger.removeHandler(handler)
+
+    [failure_log] = [
+        logging.Formatter().format(r)
+        for r in records
+        if "CCR continuation failed" in r.getMessage()
+    ]
+    if failure == "transport":
+        assert "ConnectError" in failure_log
+        assert "status=None" in failure_log
+    else:
+        assert "status=503" in failure_log
+        assert "upstream_request_id='req_upstream_1'" in failure_log
+    for record in records:
+        rendered = logging.Formatter().format(record)
+        assert "CONTENT_CANARY" not in rendered
+        assert "HEADER_CANARY" not in rendered
+
+
 def test_a_client_stream_false_request_is_left_alone() -> None:
     marker = get_compression_store().store(
         original=json.dumps({"earlier": "tool output"}),

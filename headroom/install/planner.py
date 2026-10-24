@@ -150,7 +150,7 @@ def build_manifest(
     region: str | None,
     proxy_mode: str,
     memory_enabled: bool,
-    telemetry_enabled: bool,
+    telemetry_enabled: bool | None,
     image: str,
     no_rate_limit: bool = False,
     no_http2: bool = False,
@@ -201,9 +201,12 @@ def build_manifest(
         base_env["HEADROOM_ANYLLM_PROVIDER"] = anyllm_provider
     if region:
         base_env["HEADROOM_REGION"] = region
-    # Telemetry is opt-in (off by default). Write the value explicitly so the
-    # generated manifest is unambiguous and doesn't depend on the runtime default.
-    base_env["HEADROOM_TELEMETRY"] = "on" if telemetry_enabled else "off"
+    # Write the operator's explicit choice only. ``off`` also stops the upload
+    # beacon (telemetry/beacon.py), so writing it by default would turn the
+    # beacon off for every install nobody asked to opt out. Local stats stay
+    # off without it: they are opt-in.
+    if telemetry_enabled is not None:
+        base_env["HEADROOM_TELEMETRY"] = "on" if telemetry_enabled else "off"
     if memory_enabled:
         base_env["HEADROOM_MEMORY_ENABLED"] = "1"
     # Grok / Grok Build need proxy upstream = xAI. Only auto-set when no other
@@ -262,7 +265,8 @@ def build_manifest(
         "--backend",
         backend,
     ]
-    proxy_args.append("--telemetry" if telemetry_enabled else "--no-telemetry")
+    if telemetry_enabled is not None:
+        proxy_args.append("--telemetry" if telemetry_enabled else "--no-telemetry")
     # Agentic CLI targets (Claude Code, Codex) burst well above 60 req/min.
     # Persist the flag so reinstalls don't silently reintroduce throttling.
     # (see: https://github.com/headroomlabs-ai/headroom/issues/1350)

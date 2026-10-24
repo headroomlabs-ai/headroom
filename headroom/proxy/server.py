@@ -202,7 +202,7 @@ from headroom.subscription.tracker import (
     get_subscription_tracker,
 )
 from headroom.telemetry import get_telemetry_collector
-from headroom.telemetry.beacon import is_beacon_enabled, is_telemetry_enabled
+from headroom.telemetry.beacon import beacon_off_reason, is_beacon_enabled, is_telemetry_enabled
 from headroom.telemetry.toin import get_toin
 from headroom.transforms import (
     CacheAligner,
@@ -1040,6 +1040,10 @@ class HeadroomProxy(
         # Runs BEFORE the disable_kompress override below so that flag stays
         # authoritative for turning Kompress off.
         _apply_compressor_selection(router_config, config.compressors)
+        # The proxy is long-lived: keep compression results it has no memory
+        # budget for in a SQLite file instead of compressing them again
+        # (headroom.cache.result_store; off in stateless mode).
+        router_config.result_cache_disk = True
         # External (non-built-in) `headroom.compressor` selections are ignored by
         # `_apply_compressor_selection` (they have no enable_* flag). Thread them
         # to the router here so it can route matching blocks through them; None
@@ -1203,6 +1207,13 @@ class HeadroomProxy(
                 session_ttl_seconds=config.prefix_freeze_session_ttl,
             )
         )
+        # Session-aware /v1/compress state in Redis, so any replica serves any
+        # turn (HEADROOM_COMPRESS_SESSION_STORE); None keeps it in memory.
+        from headroom.cache.shared_sessions import open_shared_sessions
+
+        self.shared_compress_sessions = open_shared_sessions()
+        # Set by startup() when HEADROOM_PREFIX_STATE_FILE opts in.
+        self._prefix_state_file: str | None = None
 
         # Compression cache store for token mode (session-scoped). The dict
         # itself is mutated under `_compression_caches_lock`; the per-session
@@ -2048,6 +2059,17 @@ class HeadroomProxy(
     async def startup(self):
         """Initialize async resources."""
         self._get_shutdown_event().clear()
+        # Opt-in: resume the prefix trackers the previous process saved on its
+        # graceful shutdown, so warm conversations replay their cached prefix.
+        from headroom.cache.prefix_tracker import PREFIX_STATE_FILE_ENV, prefix_state_file
+
+        self._prefix_state_file = prefix_state_file()
+        if self._prefix_state_file and _MULTI_WORKER_CONFIG_ENV in os.environ:
+            # Each worker holds its own trackers; one file cannot hold them all.
+            logger.warning("%s ignored: not supported with multiple workers", PREFIX_STATE_FILE_ENV)
+            self._prefix_state_file = None
+        if self._prefix_state_file:
+            self.session_tracker_store.load_state(self._prefix_state_file)
         self.pipeline_extensions.emit(
             PipelineStage.PRE_START,
             operation="proxy.startup",
@@ -2229,7 +2251,10 @@ class HeadroomProxy(
 
         # Log component status
         if self._kompress_status == "enabled":
-            logger.info("Kompress: ENABLED (ModernBERT token compressor)")
+            if eager_status.get("kompress_backend") == "remote":
+                logger.info("Kompress: ENABLED (remote endpoint; no local model)")
+            else:
+                logger.info("Kompress: ENABLED (ModernBERT token compressor)")
         elif self._kompress_status == "deferred":
             if self._start_kompress_background_warmup():
                 logger.info("Kompress: DEFERRED (warming in the background after startup)")
@@ -2373,10 +2398,11 @@ class HeadroomProxy(
         if is_beacon_enabled():
             logger.info(
                 "Anonymous upload beacon: ENABLED (default — session summaries are sent to "
-                "Headroom Labs). Opt out: HEADROOM_BEACON=off or DO_NOT_TRACK=1"
+                "Headroom Labs). Opt out: HEADROOM_BEACON=off, HEADROOM_TELEMETRY=off or "
+                "DO_NOT_TRACK=1"
             )
         else:
-            logger.info("Anonymous upload beacon: DISABLED")
+            logger.info("Anonymous upload beacon: DISABLED (%s)", beacon_off_reason())
 
         self.pipeline_extensions.emit(
             PipelineStage.POST_START,
@@ -2391,6 +2417,9 @@ class HeadroomProxy(
     async def shutdown(self):
         """Cleanup async resources."""
         self._get_shutdown_event().set()
+        # First, before any await can hit the shutdown step timeout.
+        if self._prefix_state_file:
+            self.session_tracker_store.save_state(self._prefix_state_file)
         if self.http_client_h1 and self.http_client_h1 is not self.http_client:
             await self.http_client_h1.aclose()
         self.http_client_h1 = None
@@ -5272,7 +5301,7 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
             else {},
             "compressions_by_strategy": dict(m.compressions_by_strategy),
             "tokens_saved_by_strategy": dict(m.tokens_saved_by_strategy),
-            "extension_savings": dict(m.extension_savings),
+            "extension_savings": m.extension_savings_by_source(),
             "codex_ws": {
                 "units_total": m.codex_ws_units_total,
                 "units_modified_total": m.codex_ws_units_modified_total,
@@ -5358,6 +5387,9 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
                 "original_tokens_cached": compression_stats.get("total_original_tokens", 0),
                 "compressed_tokens_cached": compression_stats.get("total_compressed_tokens", 0),
                 "ccr_retrievals": compression_stats.get("total_retrievals", 0),
+                # "this_replica" with a shared store: the token and retrieval
+                # counts are this process's since it started, not the store's.
+                "totals_scope": compression_stats.get("totals_scope", "store"),
             },
             "compression_cache": compression_cache_stats,
             # Per-language AST compression pauses. Empty on a healthy install;
@@ -6488,7 +6520,7 @@ def run_server(
         sys.exit(1)
 
     # Seed the request-time coding-profile toggles (tool-search, dedupe, read
-    # protection, lossless→lossy, effort-router, block-char floor) into the
+    # protection, lossless→lossy, block-char floor) into the
     # process env before serving, so downstream per-request readers pick them up.
     # Done here (not in the CLI command) so unit tests that mock run_server never
     # mutate os.environ. setdefault → explicit env still wins. MODE / profile are
