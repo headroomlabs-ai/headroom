@@ -362,8 +362,9 @@ def expand_compacted(text: str) -> list[dict[str, Any]] | None:
     """Reconstruct the original array of objects from densified ``text``.
 
     Returns the list of dicts, or ``None`` if ``text`` is not a parseable
-    densified block or carries an irreversible removal marker (CCR / dropped
-    rows) — callers treat ``None`` as "cannot losslessly reverse".
+    densified block, its row count differs from the header, or it carries an
+    irreversible removal marker (CCR / dropped rows). Callers treat ``None``
+    as "cannot losslessly reverse".
     """
     if not is_compacted(text) or contains_removal_marker(text):
         return None
@@ -387,8 +388,12 @@ def expand_compacted(text: str) -> list[dict[str, Any]] | None:
         except (ValueError, TypeError):
             return None
 
+    rows = _split_data_rows(rest, declared)
+    if len(rows) != declared:
+        return None
+
     out: list[dict[str, Any]] = []
-    for cells in _split_data_rows(rest, declared):
+    for cells in rows:
         if not cells:
             continue
         record: dict[str, Any] = {}

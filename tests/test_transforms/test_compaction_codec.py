@@ -15,6 +15,8 @@ from __future__ import annotations
 
 import json
 
+import pytest
+
 from headroom.transforms.compaction_codec import (
     contains_removal_marker,
     expand_compacted,
@@ -171,6 +173,34 @@ def test_trailing_newline_beyond_declared_count_is_trimmed() -> None:
     # A blank line BEYOND the declared row count is the trailing-newline
     # artifact and must be dropped (not decoded as a spurious extra null row).
     assert expand_compacted("[2]{k:string?}\na\nb\n\n") == [{"k": "a"}, {"k": "b"}]
+
+
+@pytest.mark.parametrize("wrapped", [False, True])
+@pytest.mark.parametrize(
+    "block",
+    [
+        "[3]{id:int,name:string}\n1,Alice\n2,Bob\n",
+        "[1]{id:int,name:string}\n1,Alice\n2,Bob\n",
+        "[1]{id:int}\n",
+        '[3]{name:string} __dict:1\n@name=["Alice","Bob"]\n0\n1\n',
+    ],
+    ids=["missing-row", "extra-row", "empty-body", "factored-missing-row"],
+)
+def test_row_count_mismatch_is_not_decoded(block: str, wrapped: bool) -> None:
+    # A truncated or extended block must not masquerade as the original array.
+    assert expand_compacted(json.dumps(block) if wrapped else block) is None
+
+
+def test_multiline_cells_count_as_one_row() -> None:
+    block = '[2]{id:int,note:string}\n1,"first\nsecond"\n2,last\n'
+    assert expand_compacted(block) == [
+        {"id": 1, "note": "first\nsecond"},
+        {"id": 2, "note": "last"},
+    ]
+
+
+def test_empty_array_decodes() -> None:
+    assert expand_compacted("[0]{id:int}\n") == []
 
 
 def test_json_column_string_literals_stay_strings_and_values_keep_their_type() -> None:
