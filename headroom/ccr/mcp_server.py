@@ -36,6 +36,7 @@ from typing import TYPE_CHECKING, Any
 from headroom import paths as _paths
 from headroom import savings_ledger
 from headroom.cache.compression_store import format_retrieval_miss_detail
+from headroom.exceptions import StorageError
 from headroom.log_safety import describe_exception, redact_url, safe_id
 from headroom.telemetry import session as telemetry_session
 
@@ -460,16 +461,31 @@ class HeadroomMCPServer:
 
         # Store original in local store for later retrieval
         store = self._get_local_store()
-        hash_key = store.store(
-            original=content,
-            compressed=compressed_content
-            if isinstance(compressed_content, str)
-            else json.dumps(compressed_content),
-            original_tokens=input_tokens,
-            compressed_tokens=output_tokens,
-            compression_strategy="mcp_compress",
-            ttl=MCP_SESSION_TTL,
-        )
+        try:
+            hash_key = store.store(
+                original=content,
+                compressed=compressed_content
+                if isinstance(compressed_content, str)
+                else json.dumps(compressed_content),
+                original_tokens=input_tokens,
+                compressed_tokens=output_tokens,
+                compression_strategy="mcp_compress",
+                ttl=MCP_SESSION_TTL,
+            )
+        except StorageError as e:
+            # No stored original: hand back the content itself, which also
+            # keeps out any marker the pipeline put in the compressed text.
+            logger.warning("headroom_compress: returning the original, CCR store refused it: %s", e)
+            return {
+                "compressed": content,
+                "hash": None,
+                "original_tokens": input_tokens,
+                "compressed_tokens": input_tokens,
+                "tokens_saved": 0,
+                "savings_percent": 0,
+                "transforms": [],
+                "note": "Not compressed: the CCR store could not keep the original.",
+            }
 
         # Track stats
         strategy = (
@@ -1085,16 +1101,21 @@ class HeadroomMCPServer:
         # Fresh read: store in CCR and cache the hash
         store = self._get_local_store()
         token_estimate = self._estimate_tokens(content)
-        ccr_hash = store.store(
-            original=content,
-            compressed=f"[File: {path.name}, {line_count} lines]",
-            original_tokens=token_estimate,
-            compressed_tokens=5,
-            tool_name="headroom_read",
-            ttl=MCP_SESSION_TTL,
-        )
-
-        self._file_cache[str_path] = (content_hash, ccr_hash, line_count, token_estimate)
+        try:
+            ccr_hash = store.store(
+                original=content,
+                compressed=f"[File: {path.name}, {line_count} lines]",
+                original_tokens=token_estimate,
+                compressed_tokens=5,
+                tool_name="headroom_read",
+                ttl=MCP_SESSION_TTL,
+            )
+        except StorageError as e:
+            # The full content is returned below either way; without a stored
+            # original, a re-read must not answer with a hash.
+            logger.warning("headroom_read: not cached, the CCR store refused it: %s", e)
+        else:
+            self._file_cache[str_path] = (content_hash, ccr_hash, line_count, token_estimate)
 
         # Return full content with line numbers (like Claude Code's Read tool)
         numbered_lines = []
