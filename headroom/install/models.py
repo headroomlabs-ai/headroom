@@ -115,6 +115,12 @@ class DeploymentManifest:
     health_url: str = "http://127.0.0.1:8787/readyz"
     base_env: dict[str, str] = field(default_factory=dict)
     tool_envs: dict[str, dict[str, str]] = field(default_factory=dict)
+    # User-owned provider settings, keyed by target ("opencode"): an apiKey
+    # the user configured for a third-party upstream. The tool config file is
+    # restored from the pre-install backup on every deactivate, so a
+    # credential written there by hand would not survive the cycle; the
+    # deployment state keeps it.
+    provider_options: dict[str, dict[str, Any]] = field(default_factory=dict)
     proxy_args: list[str] = field(default_factory=list)
     mutations: list[ManagedMutation] = field(default_factory=list)
     artifacts: list[ArtifactRecord] = field(default_factory=list)
