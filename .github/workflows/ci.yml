@@ -489,9 +489,11 @@ jobs:
       - name: Run relevance tests
         # Offline so fastembed reads the cache the prefetch step just warmed,
         # without an unauthenticated cache-validation HEAD that could 429.
+        # RUN_FASTEMBED_TESTS runs the Python half of the embedding parity check.
         env:
           HF_HUB_OFFLINE: "1"
           TRANSFORMERS_OFFLINE: "1"
+          RUN_FASTEMBED_TESTS: "1"
         run: pytest tests/test_relevance.py tests/test_fastembed_pinned_snapshot.py -v
 
       - name: Run HTML extraction and tool reversibility tests

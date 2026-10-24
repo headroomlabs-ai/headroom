@@ -2,8 +2,12 @@
 
 This module provides semantic relevance scoring using `fastembed`
 (BAAI/bge-small-en-v1.5 by default — 33M params, 384 dims, ~67 MB
-quantized ONNX), loaded from a pinned Qdrant/bge-small-en-v1.5-onnx-Q
-snapshot in the HuggingFace hub cache.
+quantized ONNX). The Rust scorer (fastembed-rs crate) loads the same
+pinned Qdrant/bge-small-en-v1.5-onnx-Q snapshot, so both languages run
+the same ONNX file and tokenizer. On the same ONNX Runtime build the two
+agree within 1e-6 per component; across ORT versions they drift by up to
+~4e-4, so they are close, not byte-equal. The gated parity fixture in
+tests/parity/fixtures/embedding/ bounds that drift.
 
 Key features:
 - Semantic understanding ("errors" matches "failed", "issues")
@@ -16,8 +20,8 @@ Install with: pip install "headroom-ai[relevance]"
 
 History: this module previously wrapped `sentence-transformers`
 (PyTorch). Switched to fastembed in Stage 3c.1 of the Rust port to:
-1. Match the Rust embedding scorer byte-for-byte (both call into
-   ONNX Runtime over the identical ONNX file).
+1. Run the same ONNX model as the Rust embedding scorer (both call
+   into ONNX Runtime over the identical pinned ONNX file).
 2. Remove the torch dependency from the relevance/ path
    (Phase 6: "drop torch from Python").
 3. Get a better default model (bge-small-en-v1.5 vs MiniLM-L6-v2).
@@ -124,12 +128,14 @@ def _load_text_embedding(kwargs: dict[str, Any]) -> TextEmbedding:
     return TextEmbedding(**kwargs)
 
 
-# Default model name. Same string used by the Rust embedding scorer.
+# Default model name. Same model the Rust embedding scorer loads.
 DEFAULT_MODEL_NAME = "BAAI/bge-small-en-v1.5"
 
 # The HF repo fastembed resolves DEFAULT_MODEL_NAME to, and every file a
 # fastembed load of it reads. Its revision is pinned in
-# ``onnx_runtime._PINNED_REVISIONS`` (HEADROOM_HF_PIN=off floats it).
+# ``onnx_runtime._PINNED_REVISIONS`` (HEADROOM_HF_PIN=off floats it). The Rust
+# scorer loads the same snapshot: keep both equal to DEFAULT_MODEL_REPO and
+# DEFAULT_MODEL_FILES in crates/headroom-core/src/relevance/embedding.rs.
 DEFAULT_MODEL_REPO = "Qdrant/bge-small-en-v1.5-onnx-Q"
 DEFAULT_MODEL_FILES = (
     "model_optimized.onnx",
@@ -149,9 +155,9 @@ def _resolve_default_model_snapshot() -> str:
     here through ``hf_hub_download_local_first`` instead, which applies the
     pinned SHA, tries the cache first and guards the network fallback.
 
-    The files land in the standard HuggingFace hub cache rather than
-    fastembed's default under the system temp dir, which macOS purges after a
-    few idle days.
+    The files land in the standard HuggingFace hub cache, which the Rust
+    scorer searches too, rather than fastembed's default under the system temp
+    dir, which macOS purges after a few idle days.
 
     Raises:
         OfflineEgressBlocked: ``HEADROOM_OFFLINE`` is set and a file is not cached.
