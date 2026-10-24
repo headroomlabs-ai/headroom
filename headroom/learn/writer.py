@@ -6,6 +6,7 @@ injection mechanism for each agent system (CLAUDE.md, .cursorrules, etc.).
 
 from __future__ import annotations
 
+import html
 import re
 import subprocess
 from abc import ABC, abstractmethod
@@ -116,7 +117,24 @@ def _build_section(recommendations: list[Recommendation]) -> str:
 
 # Matches the "*~N tokens/session saved*" annotation emitted by _build_section.
 _TOKENS_ANNOTATION_PATTERN = re.compile(r"\*~([\d,]+) tokens/session saved\*\n?")
-_PATTERN_ID_PATTERN = re.compile(r"<!--\s*headroom:pattern-id:([^\s>]+)\s*-->\s*$")
+# New recommendations contain raw annotations; saved blocks contain the
+# escaped delimiters emitted by sanitize_block_text. Recognize both without
+# unescaping transcript-derived content or weakening managed-block boundaries.
+_PATTERN_ID_PATTERN = re.compile(
+    r"(?:<!--|&lt;!--)\s*headroom:pattern-id:([^\s>]+)\s*(?:-->|--&gt;)\s*$"
+)
+
+
+def _tagged_pattern_id(line: str) -> str | None:
+    """Return the id inside a bullet's pattern-id comment, if any.
+
+    ``_build_section`` sanitizes block content, so on disk the comment reads
+    ``&lt;!-- ... --&gt;``; match against the decoded line so carried-forward
+    sections are still recognized as lifecycle-tracked. Callers keep the
+    original (still-sanitized) line when the bullet survives.
+    """
+    match = _PATTERN_ID_PATTERN.search(html.unescape(line))
+    return match.group(1) if match else None
 
 
 def _merge_markdown_items(
@@ -147,8 +165,7 @@ def _merge_markdown_items(
             return None
         items: list[tuple[str | None, str, str]] = []
         for line in lines:
-            id_match = _PATTERN_ID_PATTERN.search(line)
-            pattern_id = id_match.group(1) if id_match else None
+            pattern_id = _tagged_pattern_id(line)
             visible = _PATTERN_ID_PATTERN.sub("", line).strip().casefold()
             items.append((pattern_id, visible, line))
         return items
@@ -222,12 +239,12 @@ def _prune_carried_section(
     kept: list[str] = []
     saw_tracked_item = False
     for line in lines:
-        id_match = _PATTERN_ID_PATTERN.search(line)
-        if id_match is None:
+        pattern_id = _tagged_pattern_id(line)
+        if pattern_id is None:
             kept.append(line)
             continue
         saw_tracked_item = True
-        if id_match.group(1) in active_item_ids:
+        if pattern_id in active_item_ids:
             kept.append(line)
     if not saw_tracked_item:
         return None

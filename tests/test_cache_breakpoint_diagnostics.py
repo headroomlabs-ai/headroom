@@ -403,6 +403,63 @@ def test_runtime_log_refuses_a_symlinked_path(tmp_path, monkeypatch) -> None:
     assert stat.S_IMODE(elsewhere.stat().st_mode) == 0o666, "the symlink target was chmodded"
 
 
+class _ListHandler(logging.Handler):
+    def __init__(self) -> None:
+        super().__init__(logging.DEBUG)
+        self.records: list[logging.LogRecord] = []
+
+    def emit(self, record: logging.LogRecord) -> None:
+        self.records.append(record)
+
+
+def _runtime_log_warnings(port: int) -> list[str]:
+    """Run ``_setup_file_logging`` and return the 'runtime log disabled' warnings.
+
+    The handler sits on ``headroom.proxy`` directly: caplog does not see
+    ``headroom.*`` records once a proxy app has configured logging.
+    """
+    from headroom.proxy.helpers import _setup_file_logging
+
+    proxy_logger = logging.getLogger("headroom.proxy")
+    headroom_logger = logging.getLogger("headroom")
+    before = list(headroom_logger.handlers)
+    capture = _ListHandler()
+    proxy_logger.addHandler(capture)
+    try:
+        _setup_file_logging(port)
+    finally:
+        proxy_logger.removeHandler(capture)
+        for handler in list(headroom_logger.handlers):
+            if handler not in before:
+                headroom_logger.removeHandler(handler)
+                handler.close()
+    return [
+        r.getMessage()
+        for r in capture.records
+        if r.levelno == logging.WARNING and "runtime log disabled" in r.getMessage()
+    ]
+
+
+def test_runtime_log_says_why_it_is_missing(tmp_path, monkeypatch) -> None:
+    """An unwritable log directory used to disable proxy.log without a word."""
+    monkeypatch.setenv("HEADROOM_WORKSPACE_DIR", str(tmp_path))
+    # A regular file where the logs directory belongs: mkdir raises OSError.
+    _paths.log_dir().write_text("", encoding="utf-8")
+
+    warnings = _runtime_log_warnings(18808)
+
+    assert len(warnings) == 1
+    assert str(_paths.log_dir()) in warnings[0]
+    assert "HEADROOM_WORKSPACE_DIR" in warnings[0]
+
+
+def test_runtime_log_stays_quiet_when_writable(tmp_path, monkeypatch) -> None:
+    monkeypatch.setenv("HEADROOM_WORKSPACE_DIR", str(tmp_path))
+
+    assert _runtime_log_warnings(18809) == []
+    assert _paths.proxy_log_path(18809).exists()
+
+
 @pytest.mark.skipif(
     os.name != "posix",
     reason="creating a symlink needs elevation on Windows, and O_NOFOLLOW does not exist there",

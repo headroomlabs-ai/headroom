@@ -538,7 +538,8 @@ class TestBatchExtraction:
             ),
         ]
 
-        results = extractor.extract_batch(pages)
+        with pytest.warns(DeprecationWarning, match="extract_batch is deprecated"):
+            results = extractor.extract_batch(pages)
 
         assert len(results) == 3
         assert all(isinstance(r, HTMLExtractionResult) for r in results)

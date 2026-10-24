@@ -129,6 +129,20 @@ class TestHeadroomChatMessageHistoryMessages:
         assert len(messages) == len(sample_langchain_messages)
         assert history._compression_count == 0
 
+    def test_messages_below_threshold_with_default_provider(self):
+        """With no provider passed, the default provider counts tokens and
+        short histories pass through."""
+        from headroom.integrations.langchain.memory import HeadroomChatMessageHistory
+
+        base = MagicMock()
+        base.messages = [HumanMessage(content="Hello"), AIMessage(content="Hi there!")]
+
+        history = HeadroomChatMessageHistory(base, compress_threshold_tokens=10000)
+        messages = history.messages
+
+        assert [m.content for m in messages] == ["Hello", "Hi there!"]
+        assert history._compression_count == 0
+
     def test_messages_compresses_when_over_threshold(self, mock_base_history, mock_provider):
         """messages applies compression when over token threshold."""
         from headroom.integrations.langchain.memory import HeadroomChatMessageHistory

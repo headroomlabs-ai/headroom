@@ -23,9 +23,20 @@ import headroom.proxy.server as server_mod
 from headroom.proxy.server import ProxyConfig, create_app
 
 
-def _make_proxy(*, optimize: bool):
+def _make_proxy(
+    *,
+    optimize: bool,
+    disable_kompress: bool = False,
+    disable_kompress_anthropic: bool | None = None,
+    disable_kompress_openai: bool | None = None,
+    compressors: set[str] | None = None,
+):
     config = ProxyConfig(
         optimize=optimize,
+        disable_kompress=disable_kompress,
+        disable_kompress_anthropic=disable_kompress_anthropic,
+        disable_kompress_openai=disable_kompress_openai,
+        compressors=compressors,
         cache_enabled=False,
         rate_limit_enabled=False,
         cost_tracking_enabled=False,
@@ -153,5 +164,122 @@ async def test_startup_reports_deferred_kompress(caplog):
         assert proxy._kompress_status == "deferred"
         assert "Kompress: DEFERRED (model loads on first request)" in caplog.messages
         assert not any("Kompress: not installed" in message for message in caplog.messages)
+    finally:
+        await proxy.shutdown()
+
+
+@pytest.mark.parametrize("optimize", [True, False])
+async def test_startup_reports_disabled_kompress(caplog, monkeypatch, optimize):
+    proxy = _make_proxy(optimize=optimize, disable_kompress=True)
+    monkeypatch.setattr(proxy, "_eager_preload_transforms", lambda: ({}, []))
+
+    try:
+        server_mod.logger.addHandler(caplog.handler)
+        try:
+            with caplog.at_level(logging.INFO, logger=server_mod.logger.name):
+                await proxy.startup()
+        finally:
+            server_mod.logger.removeHandler(caplog.handler)
+
+        assert "Kompress: DISABLED" in caplog.messages
+        assert (
+            "Kompress: not installed (pip install headroom-ai[ml] for ML compression)"
+            not in caplog.messages
+        )
+    finally:
+        await proxy.shutdown()
+
+
+async def test_startup_keeps_not_installed_message_when_kompress_is_missing(caplog, monkeypatch):
+    proxy = _make_proxy(optimize=True)
+    monkeypatch.setattr(proxy, "_eager_preload_transforms", lambda: ({}, []))
+
+    try:
+        server_mod.logger.addHandler(caplog.handler)
+        try:
+            with caplog.at_level(logging.INFO, logger=server_mod.logger.name):
+                await proxy.startup()
+        finally:
+            server_mod.logger.removeHandler(caplog.handler)
+
+        assert (
+            "Kompress: not installed (pip install headroom-ai[ml] for ML compression)"
+            in caplog.messages
+        )
+    finally:
+        await proxy.shutdown()
+
+
+async def test_startup_keeps_missing_message_when_provider_override_enables_kompress(
+    caplog, monkeypatch
+):
+    proxy = _make_proxy(
+        optimize=True,
+        disable_kompress=True,
+        disable_kompress_anthropic=False,
+    )
+    monkeypatch.setattr(proxy, "_eager_preload_transforms", lambda: ({}, []))
+
+    try:
+        server_mod.logger.addHandler(caplog.handler)
+        try:
+            with caplog.at_level(logging.INFO, logger=server_mod.logger.name):
+                await proxy.startup()
+        finally:
+            server_mod.logger.removeHandler(caplog.handler)
+
+        assert "Kompress: DISABLED" not in caplog.messages
+        assert (
+            "Kompress: not installed (pip install headroom-ai[ml] for ML compression)"
+            in caplog.messages
+        )
+    finally:
+        await proxy.shutdown()
+
+
+async def test_startup_reports_disabled_when_both_providers_disable_kompress(caplog, monkeypatch):
+    proxy = _make_proxy(
+        optimize=True,
+        disable_kompress_anthropic=True,
+        disable_kompress_openai=True,
+    )
+    monkeypatch.setattr(proxy, "_eager_preload_transforms", lambda: ({}, []))
+
+    try:
+        server_mod.logger.addHandler(caplog.handler)
+        try:
+            with caplog.at_level(logging.INFO, logger=server_mod.logger.name):
+                await proxy.startup()
+        finally:
+            server_mod.logger.removeHandler(caplog.handler)
+
+        assert "Kompress: DISABLED" in caplog.messages
+        assert (
+            "Kompress: not installed (pip install headroom-ai[ml] for ML compression)"
+            not in caplog.messages
+        )
+    finally:
+        await proxy.shutdown()
+
+
+async def test_startup_reports_disabled_when_compressor_selection_omits_kompress(
+    caplog, monkeypatch
+):
+    proxy = _make_proxy(optimize=True, compressors={"smart_crusher"})
+    monkeypatch.setattr(proxy, "_eager_preload_transforms", lambda: ({}, []))
+
+    try:
+        server_mod.logger.addHandler(caplog.handler)
+        try:
+            with caplog.at_level(logging.INFO, logger=server_mod.logger.name):
+                await proxy.startup()
+        finally:
+            server_mod.logger.removeHandler(caplog.handler)
+
+        assert "Kompress: DISABLED" in caplog.messages
+        assert (
+            "Kompress: not installed (pip install headroom-ai[ml] for ML compression)"
+            not in caplog.messages
+        )
     finally:
         await proxy.shutdown()

@@ -1,17 +1,14 @@
-"""Live validation of Mechanism B's no-bust invariant against the real API.
+"""Live validation of Mechanism B's cache behaviour against the real API.
 
-The design's central claim, tested empirically:
+Tested empirically:
 
-1. Request A holds a fresh Read out of the cache (breakpoint relocated
-   to just before it) → the provider's cache_creation must NOT include
-   the read content.
-2. Request B (one turn later, read matured into a marker, breakpoint
-   back at the tail) → the provider must report a cache READ covering
-   request A's cached prefix — proving the prefix survived the read's
-   replacement, i.e. nothing was busted.
-
-If assertion 2 fails, breakpoint relocation breaks prefix matching and
-the mechanism needs redesign before it is enabled anywhere.
+1. Request A holds a fresh Read verbatim and forwards the client's tail
+   breakpoint on it → the provider's cache_creation includes the read
+   content (the held Read is cached with its turn).
+2. Request B (one turn later, file quiet, but the Read is now inside the
+   provider-confirmed prefix) → the Read is NOT matured, and the provider
+   reports a cache READ covering request A's cached prefix — nothing was
+   busted.
 
 Skipped without ANTHROPIC_API_KEY. Costs ~15K haiku tokens per run.
 """
@@ -24,10 +21,7 @@ import httpx
 import pytest
 
 from headroom.config import ReadMaturationConfig
-from headroom.transforms.read_maturation import (
-    ReadMaturationManager,
-    relocate_cache_breakpoint,
-)
+from headroom.transforms.read_maturation import ReadMaturationManager
 
 pytestmark = pytest.mark.skipif(
     not os.environ.get("ANTHROPIC_API_KEY"),
@@ -113,29 +107,25 @@ def conv_base() -> list[dict]:
 
 
 class TestNoBustInvariantLive:
-    def test_hold_then_mature_preserves_cache(self):
+    def test_held_read_is_cached_and_not_rewritten(self):
         mgr = ReadMaturationManager(ReadMaturationConfig(enabled=True, quiesce_turns=1))
 
-        # ── Request A: fresh read → held, breakpoint relocated before it.
+        # ── Request A: fresh read → held verbatim, client breakpoint kept.
         msgs_a = conv_base()
         res_a = mgr.apply(msgs_a)
         assert res_a.holding_msg_indices == [2], "fixture must trigger holding"
-        fwd_a = relocate_cache_breakpoint(res_a.messages, res_a.holding_msg_indices)
-        assert "cache_control" not in fwd_a[2]["content"][0]
+        fwd_a = res_a.messages
+        assert "cache_control" in fwd_a[2]["content"][0]
 
         usage_a = call(fwd_a)
         created_a = usage_a.get("cache_creation_input_tokens", 0)
         input_a = usage_a.get("input_tokens", 0)
-        # The held read (~4K tokens of input) must NOT be in the cache
-        # write. created_a covers system pad + first two messages only.
-        assert created_a > 0, f"prefix did not cache at all: {usage_a}"
-        assert input_a > 3000, f"read content missing from input: {usage_a}"
-        total_a = created_a + input_a + usage_a.get("cache_read_input_tokens", 0)
-        assert created_a < total_a * 0.7, (
-            f"cache write covered the held read — hold failed: {usage_a}"
-        )
+        # The held read (~4K tokens) is in the cache write, not the
+        # uncached input: the client's tail breakpoint sits on it.
+        assert created_a > 3000, f"held read was not cache-written: {usage_a}"
+        assert input_a < 1000, f"held read was sent uncached: {usage_a}"
 
-        # ── Request B: one assistant turn later, file quiet → matured.
+        # ── Request B: one assistant turn later, file quiet, Read cached.
         msgs_b = [
             *conv_base(),
             {"role": "assistant", "content": [{"type": "text", "text": "Read it."}]},
@@ -154,26 +144,23 @@ class TestNoBustInvariantLive:
         # no longer carries one.
         del msgs_b[2]["content"][0]["cache_control"]
 
-        res_b = mgr.apply(msgs_b)
-        assert res_b.newly_matured == 1, "read must mature after quiesce"
-        fwd_b = relocate_cache_breakpoint(res_b.messages, res_b.holding_msg_indices)
-        marker = fwd_b[2]["content"][0]["content"]
-        assert "Retrieve original: hash=" in marker
+        # Request A cached messages 0-2, so the provider-confirmed prefix
+        # now covers the Read: it stays verbatim instead of maturing.
+        res_b = mgr.apply(msgs_b, frozen_message_count=3)
+        assert res_b.newly_matured == 0, "a cached read must not mature"
+        fwd_b = res_b.messages
+        assert fwd_b[2]["content"][0]["content"] == FILE_CONTENT
 
         usage_b = call(fwd_b)
         read_b = usage_b.get("cache_read_input_tokens", 0)
 
-        # THE invariant: request A's cached prefix must still be valid —
-        # the matured read sat outside it, so replacing it busts nothing.
+        # Request A's cached prefix, Read included, must still be valid.
         assert read_b >= created_a * 0.9, (
-            f"NO-BUST INVARIANT FAILED: request B read {read_b} cached tokens "
-            f"but request A created {created_a} — breakpoint relocation broke "
-            f"prefix matching. A={usage_a} B={usage_b}"
+            f"request B read {read_b} cached tokens but request A created "
+            f"{created_a}: the cached prefix was busted. A={usage_a} B={usage_b}"
         )
-        # And the matured form is small: B's uncached input should be far
-        # below the read size (marker + two short turns, not 4K tokens).
         assert usage_b.get("input_tokens", 0) < 2500, (
-            f"matured request still carried heavy uncached input: {usage_b}"
+            f"request B carried heavy uncached input: {usage_b}"
         )
 
 

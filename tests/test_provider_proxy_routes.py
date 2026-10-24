@@ -118,6 +118,9 @@ def test_provider_passthrough_routes_forward_expected_targets(monkeypatch) -> No
         assert client.post("/v1/messages/count_tokens").json()["base_url"] == (
             "https://api.anthropic.test"
         )
+        assert client.get("/api/hello").json()["base_url"] == ("https://api.anthropic.test")
+        assert client.head("/api/hello").status_code == 200
+        assert calls[-1] == ("HEAD", "/api/hello", "https://api.anthropic.test", "anthropic")
         assert client.get("/v1/models", headers={"x-goog-api-key": "test"}).json()["base_url"] == (
             "https://api.openai.test"
         )

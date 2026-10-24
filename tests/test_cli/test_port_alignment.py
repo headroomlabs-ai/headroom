@@ -331,6 +331,26 @@ class TestCodexProviderPortWarning:
         assert "port 9200" in capsys.readouterr().err
         assert 'base_url = "http://127.0.0.1:8787/v1"' in config.read_text(encoding="utf-8")
 
+    def test_init_provider_preserves_user_options_on_repoint(self, tmp_path, monkeypatch):
+        import tomllib
+
+        monkeypatch.setattr(init_mod, "retag_to_headroom", lambda _path: None)
+        config = tmp_path / "config.toml"
+        config.write_text(
+            "[model_providers.headroom]\n"
+            'base_url = "http://127.0.0.1:9200/v1"\n'
+            "request_max_retries = 7\n"
+            '[profiles.work]\nmodel_provider = "custom"\n',
+            encoding="utf-8",
+        )
+        for port in (8787, 9500):
+            init_mod._ensure_codex_provider(config, port)
+            parsed = tomllib.loads(config.read_text(encoding="utf-8"))
+            provider = parsed["model_providers"]["headroom"]
+            assert provider["base_url"] == f"http://127.0.0.1:{port}/v1"
+            assert provider["request_max_retries"] == 7
+            assert parsed["profiles"]["work"]["model_provider"] == "custom"
+
 
 class TestInitPortResolution:
     def _ctx(self, args: list[str]) -> click.Context:
@@ -565,7 +585,7 @@ class TestDoctorAdditions:
         monkeypatch.setattr(doctor_mod, "check_deployments", lambda manifests: None)
         monkeypatch.setattr(doctor_mod, "claude_settings_path", lambda: home / "settings.json")
         monkeypatch.setattr(doctor_mod, "savings_path", lambda: home / "savings.json")
-        result = CliRunner().invoke(main, ["doctor", "--json"])
+        result = CliRunner().invoke(main, ["doctor", "--json", "--port", "8787"])
         payload = json.loads(result.output)
         assert payload["exit_code"] == 2  # still a failure at the probed port
         proxy = next(c for c in payload["checks"] if c["name"] == "proxy")
@@ -589,3 +609,49 @@ class TestSelfhealWarning:
         monkeypatch.setattr(pd, "find_live_proxy_elsewhere", lambda requested, **k: None)
         wrap_mod._warn_live_proxy_after_selfheal({"port": 8787})
         assert capsys.readouterr().err == ""
+
+
+def test_init_adopted_provider_survives_unwrap(tmp_path, monkeypatch):
+    import tomllib
+
+    monkeypatch.setattr(init_mod, "retag_to_headroom", lambda _path: None)
+    config = tmp_path / "config.toml"
+    original = '[model_providers.headroom]\nbase_url = "http://127.0.0.1:9200/v1"\nrequest_max_retries = 7\n'
+    config.write_text(original, encoding="utf-8")
+    for port in (8787, 9500):
+        init_mod._ensure_codex_provider(config, port)
+    restored = init_mod._strip_codex_init_block(config.read_text(encoding="utf-8"))
+    assert tomllib.loads(restored) == tomllib.loads(original)
+
+
+def test_init_replaces_auth_when_credentials_change(tmp_path, monkeypatch):
+    import json
+
+    import tomllib
+
+    monkeypatch.setattr(init_mod, "retag_to_headroom", lambda _path: None)
+    monkeypatch.setattr(init_mod, "codex_home_dir", lambda: tmp_path)
+    auth = tmp_path / "auth.json"
+    config = tmp_path / "config.toml"
+    for payload, oauth in (
+        (
+            {
+                "auth_mode": "chatgpt",
+                "tokens": {"access_token": "test-oauth", "account_id": "test-account"},
+            },
+            True,
+        ),
+        ({"OPENAI_API_KEY": "test-key"}, False),
+        (
+            {
+                "auth_mode": "chatgpt",
+                "tokens": {"access_token": "test-oauth", "account_id": "test-account"},
+            },
+            True,
+        ),
+    ):
+        auth.write_text(json.dumps(payload), encoding="utf-8")
+        init_mod._ensure_codex_provider(config, 8787)
+        provider = tomllib.loads(config.read_text(encoding="utf-8"))["model_providers"]["headroom"]
+        assert provider.get("requires_openai_auth", False) is oauth
+        assert ("auth" in provider) is not oauth

@@ -84,7 +84,9 @@ def _make_config() -> ProxyConfig:
 def _install_prefix_tracker(proxy) -> None:
     tracker = _FakePrefixTracker()
     proxy.session_tracker_store.compute_session_id = lambda request, model, messages: "s1"
-    proxy.session_tracker_store.get_or_create = lambda session_id, provider: tracker
+    proxy.session_tracker_store.get_or_create = (
+        lambda session_id, provider, cache_ttl_seconds=None: tracker
+    )
 
 
 def _anthropic_message_response() -> dict[str, object]:

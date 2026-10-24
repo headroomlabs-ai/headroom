@@ -340,6 +340,52 @@ async def test_send_message_converts_anthropic_tools_and_tool_choice(
     assert sent["tool_choice"] == "required"
 
 
+@pytest.mark.parametrize(
+    ("anthropic_choice", "openai_choice"),
+    [
+        ({"type": "auto"}, "auto"),
+        ({"type": "any"}, "required"),
+        ({"type": "none"}, "none"),
+        ({"type": "tool", "name": "t"}, {"type": "function", "function": {"name": "t"}}),
+    ],
+)
+def test_convert_tool_choice_covers_every_anthropic_type(
+    anthropic_choice: dict[str, object], openai_choice: object
+) -> None:
+    """Every Anthropic tool_choice type maps to its OpenAI equivalent.
+
+    ``{"type": "none"}`` ("do not use any tool this turn") previously fell
+    through to the ``"auto"`` default, inverting the instruction into "you may
+    use tools" so the model could call a tool the client explicitly forbade.
+    """
+    assert anyllm._convert_tool_choice(anthropic_choice) == openai_choice
+
+
+@pytest.mark.asyncio
+async def test_send_message_forwards_tool_choice_none(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A request forbidding tools must reach any-llm as OpenAI ``"none"``.
+
+    Regression: ``{"type": "none"}`` was converted to ``"auto"``, letting the
+    model call a tool the client disabled for the turn.
+    """
+    backend, instance = make_backend(monkeypatch)
+    instance.response = make_response(make_choice("ok", "stop"))
+
+    await backend.send_message(
+        {
+            "model": "claude",
+            "messages": [{"role": "user", "content": "hi"}],
+            "tools": [{"name": "t", "input_schema": {"type": "object"}}],
+            "tool_choice": {"type": "none"},
+        },
+        {},
+    )
+
+    assert instance.calls[0]["tool_choice"] == "none"
+
+
 @pytest.mark.asyncio
 async def test_stream_message_converts_anthropic_tools_and_tool_choice(
     monkeypatch: pytest.MonkeyPatch,

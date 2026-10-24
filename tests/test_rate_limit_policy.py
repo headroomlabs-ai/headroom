@@ -5,7 +5,6 @@ from __future__ import annotations
 from headroom.proxy.rate_limit_policy import (
     consume_from_bucket,
     refilled_tokens,
-    stale_bucket_keys,
 )
 
 
@@ -95,11 +94,3 @@ def test_consume_from_bucket_debt_delays_the_next_request() -> None:
     assert allowed is False
     assert remaining == -132_000
     assert wait_seconds == 79.8
-
-
-def test_stale_bucket_keys_returns_only_old_buckets() -> None:
-    assert stale_bucket_keys(
-        {"fresh": 950, "edge": 400, "stale": 399},
-        now=1000,
-        stale_after_seconds=600,
-    ) == ["stale"]

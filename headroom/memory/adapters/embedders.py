@@ -21,6 +21,7 @@ from typing import TYPE_CHECKING, Any, cast
 import numpy as np
 
 from headroom.models.config import ML_MODEL_DEFAULTS
+from headroom.offline import OFFLINE_ENV, OfflineEgressBlocked, guard_egress
 from headroom.onnx_runtime import create_cpu_session_options, hf_hub_download_local_first
 
 if TYPE_CHECKING:
@@ -450,8 +451,20 @@ class OnnxLocalEmbedder:
         logger.info("Loading ONNX embedding model (all-MiniLM-L6-v2, ~86MB)...")
 
         # Prefer local cache to avoid a redundant network HEAD on warm starts.
-        model_path = hf_hub_download_local_first(self.ONNX_REPO, "model.onnx")
-        tok_path = hf_hub_download_local_first(self.ONNX_REPO, "tokenizer.json")
+        # OfflineEgressBlocked is a BaseException so it cannot be swallowed by
+        # accident; here the degradation is deliberate and written down. A model
+        # download is not data leaving the box, and an air-gapped deployment
+        # without a cached embedder should get "the local embedder is
+        # unavailable" — the caller's existing failure mode — rather than a
+        # BaseException escaping into the memory pipeline.
+        try:
+            model_path = hf_hub_download_local_first(self.ONNX_REPO, "model.onnx")
+            tok_path = hf_hub_download_local_first(self.ONNX_REPO, "tokenizer.json")
+        except OfflineEgressBlocked as blocked:
+            raise RuntimeError(
+                f"local ONNX embedder {self.ONNX_REPO} is not cached and "
+                f"{OFFLINE_ENV} forbids fetching it: {blocked}"
+            ) from blocked
 
         # Keep a small thread pool for Docker compatibility and disable ORT's
         # CPU memory arena/pattern caches so long-running proxy workers do not
@@ -655,6 +668,7 @@ class OpenAIEmbedder:
     @cached_property
     def _async_client(self) -> Any:
         """Lazy initialization of async OpenAI client."""
+        guard_egress("OpenAI embedding API", "api.openai.com")
         from openai import AsyncOpenAI
 
         return AsyncOpenAI(api_key=self._api_key)

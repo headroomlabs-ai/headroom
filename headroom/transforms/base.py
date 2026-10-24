@@ -2,29 +2,54 @@
 
 from __future__ import annotations
 
+import logging
 from abc import ABC, abstractmethod
 from typing import Any
 
 from ..config import TransformResult
+from ..log_safety import describe_exception, safe_id
 from ..tokenizer import Tokenizer
 
+logger = logging.getLogger(__name__)
 
-def split_frozen(
-    messages: list[dict[str, Any]],
-    frozen_message_count: int,
-) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
-    """Split messages into frozen (cached prefix) and mutable portions.
 
-    Args:
-        messages: All messages.
-        frozen_message_count: Number of leading messages to freeze.
+def persist_rust_ccr_entry(original: str, compressed: str, cache_key: str, *, source: str) -> None:
+    """Store a Rust-emitted CCR entry in the production ``CompressionStore``.
 
-    Returns:
-        (frozen, mutable) — frozen messages must not be modified.
+    The Rust search/diff/log compressors emit a retrieval marker but keep the
+    original only in their in-memory test store. This writes it through to the
+    long-lived Python store so the marker resolves. Failures are logged at
+    warning level with ``source`` (the compressor name): a store hiccup must not
+    break the response, just degrade retrieval.
     """
-    if frozen_message_count <= 0 or frozen_message_count >= len(messages):
-        return [], messages
-    return messages[:frozen_message_count], messages[frozen_message_count:]
+    try:
+        from ..cache.compression_store import get_compression_store
+    except ImportError as e:
+        logger.warning(
+            "CCR store import failed (%s); cache_key %s won't persist: %s",
+            source,
+            cache_key,
+            safe_id(e),
+        )
+        logger.debug("CCR store import failure detail: %s", describe_exception(e))
+        return
+    try:
+        store: Any = get_compression_store()
+        # The Rust-emitted marker embeds MD5(original)[:24], but store() has
+        # defaulted to SHA-256(original)[:24] since PR #395. Pass the marker's
+        # key explicitly so retrieving the marker hash finds the entry (#816).
+        store.store(original, compressed, explicit_hash=cache_key)
+    except Exception as e:
+        # Store backends can echo the payload in errors. The WARNING names only
+        # the exception type; the DEBUG record has types and code locations, or
+        # the full traceback (payload included) once HEADROOM_DEBUG_DUMP=full.
+        logger.warning(
+            "CCR store write failed (%s, %s); cache_key %s remains in-marker only",
+            source,
+            safe_id(e),
+            cache_key,
+        )
+        logger.debug("CCR store write failure detail: %s", describe_exception(e))
 
 
 class Transform(ABC):

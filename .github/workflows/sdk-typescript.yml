@@ -1,0 +1,43 @@
+name: SDK (TypeScript)
+
+# The TypeScript SDK (sdk/typescript, published to npm as `headroom-ai`) has a
+# vitest suite, a typecheck and a build, yet nothing in CI ever ran them. Two
+# individually green PRs could leave `npm test` red on main (#3424 + #3370,
+# repaired in #3796), and a dependabot bump of `ai` could break three adapter
+# tests without anyone noticing (#3910). This gate runs the SDK's own
+# test + typecheck + build whenever it (or this workflow) changes, mirroring
+# the OpenCode plugin gate in opencode-plugin.yml.
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - "sdk/typescript/**"
+      - ".github/workflows/sdk-typescript.yml"
+  push:
+    branches: [main]
+    paths:
+      - "sdk/typescript/**"
+      - ".github/workflows/sdk-typescript.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: test + typecheck + build
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    defaults:
+      run:
+        working-directory: sdk/typescript
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: ">=24.16.0 <25"
+          cache: npm
+          cache-dependency-path: sdk/typescript/package-lock.json
+      - run: npm ci
+      - run: npm test
+      - run: npm run typecheck
+      - run: npm run build

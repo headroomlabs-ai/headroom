@@ -79,7 +79,7 @@ def _install_session_tracker(proxy: object, frozen_count: int) -> None:
         lambda request, model, messages: "stable-session"
     )
     proxy.session_tracker_store.get_or_create = (  # type: ignore[attr-defined]
-        lambda session_id, provider: fake_tracker
+        lambda session_id, provider, cache_ttl_seconds=None: fake_tracker
     )
 
 
