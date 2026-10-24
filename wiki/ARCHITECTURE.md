@@ -669,7 +669,7 @@ if self.config.use_feedback_hints and tool_name:
         return items, f"skip:feedback({hints.reason})", None
 
     if hints.suggested_items is not None:
-        self.config.max_items_after_crush = hints.suggested_items
+        self.config.min_tokens_to_crush = hints.suggested_min_tokens
 ```
 
 **Feedback Endpoints:**

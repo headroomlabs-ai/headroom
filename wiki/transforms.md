@@ -23,7 +23,6 @@ from headroom import SmartCrusherConfig
 
 config = SmartCrusherConfig(
     min_tokens_to_crush=200,  # Only compress if > 200 tokens
-    max_items_after_crush=50,  # Keep at most 50 items
     keep_first=3,  # Always keep first 3 items
     keep_last=2,  # Always keep last 2 items
     relevance_threshold=0.3,  # Keep items with relevance > 0.3

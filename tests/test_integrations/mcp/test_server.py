@@ -187,13 +187,11 @@ class TestMCPToolProfiles:
         """Slack tools should match slack profile."""
         profile = mcp_compressor.get_profile("mcp__slack__search")
         assert "slack" in profile.tool_name_pattern
-        assert profile.max_items == 25
 
     def test_database_profile_match(self, mcp_compressor):
         """Database tools should match database profile."""
         profile = mcp_compressor.get_profile("mcp__database__query")
         assert "database" in profile.tool_name_pattern or "sql" in profile.tool_name_pattern
-        assert profile.max_items == 30
 
     def test_github_profile_match(self, mcp_compressor):
         """GitHub tools should match github profile."""
@@ -201,15 +199,15 @@ class TestMCPToolProfiles:
         assert "github" in profile.tool_name_pattern
 
     def test_log_profile_match(self, mcp_compressor):
-        """Log tools should match log profile with higher max_items."""
+        """Log tools should match the log profile."""
         profile = mcp_compressor.get_profile("search_logs")
         assert "log" in profile.tool_name_pattern
-        assert profile.max_items == 40  # Logs get more items
+        assert "fatal" in profile.preserve_error_keywords
 
     def test_fallback_profile(self, mcp_compressor):
         """Unknown tools should get fallback profile."""
         profile = mcp_compressor.get_profile("some_random_tool")
-        assert profile.max_items == 20  # Default
+        assert profile.tool_name_pattern == r".*"
 
 
 class TestMCPCompressionBasics:
@@ -593,14 +591,13 @@ class TestMCPCustomProfiles:
         custom_profiles = [
             MCPToolProfile(
                 tool_name_pattern=r".*custom.*",
-                max_items=10,
                 min_tokens_to_compress=100,
             ),
         ]
         compressor = HeadroomMCPCompressor(profiles=custom_profiles)
 
         profile = compressor.get_profile("custom_tool")
-        assert profile.max_items == 10
+        assert profile.min_tokens_to_compress == 100
 
     def test_profile_disabled(self):
         """Disabled profiles should not compress."""

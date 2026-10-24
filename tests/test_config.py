@@ -121,7 +121,6 @@ class TestSmartCrusherConfig:
         assert config.variance_threshold == 2.0
         assert config.uniqueness_threshold == 0.1
         assert config.similarity_threshold == 0.8
-        assert config.max_items_after_crush == 15
         assert config.preserve_change_points is True
         assert config.factor_out_constants is False
         assert config.include_summaries is False
