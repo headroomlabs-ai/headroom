@@ -2,6 +2,11 @@
 
 Covers env -> ProxyConfig, ProxyConfig -> live proxy, and the presence of the
 routing block in the Anthropic request handler.
+
+The env -> ProxyConfig half is checked once per entrypoint that builds its own
+ProxyConfig, not just via ``_proxy_config_from_env``: that helper only runs on
+the factory/multi-worker path, so testing it alone let #2764 through — the
+router was unreachable from ``headroom proxy``, the documented way to run it.
 """
 
 from __future__ import annotations
@@ -9,15 +14,24 @@ from __future__ import annotations
 import inspect
 import json
 import logging
-from unittest.mock import AsyncMock, MagicMock
+from collections.abc import Iterator
+from contextlib import contextmanager
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import httpx
 import pytest
+from click.testing import CliRunner
 from fastapi.testclient import TestClient
 
+from headroom.cli.main import main
 from headroom.proxy.handlers.anthropic import AnthropicHandlerMixin
 from headroom.proxy.model_router import ModelRoute, ModelRouter, ModelRouterConfig
 from headroom.proxy.server import ProxyConfig, _proxy_config_from_env, create_app
+
+ROUTES_JSON = (
+    '[{"name":"small","max_input_tokens":4000,"require_no_tools":true,'
+    '"to_model":"claude-haiku-4-5"}]'
+)
 
 MESSAGES = "/v1/messages"
 
@@ -89,6 +103,46 @@ def test_proxy_config_from_env_router_disabled_by_default(monkeypatch) -> None:
     assert not config.model_router.enabled
 
 
+def _cli_config(env: dict[str, str]) -> ProxyConfig:
+    """Build the ProxyConfig `headroom proxy` would run with, without serving."""
+    captured: dict = {}
+
+    def mock_run_server(config, **kwargs):
+        captured["config"] = config
+
+    with patch("headroom.proxy.server.run_server", mock_run_server):
+        result = CliRunner().invoke(main, ["proxy"], env=env, catch_exceptions=False)
+    assert result.exit_code == 0, result.output
+    return captured["config"]
+
+
+def test_cli_proxy_reads_router_from_env() -> None:
+    # Regression for #2764: the click CLI built its own ProxyConfig and never
+    # passed model_router, so both env vars were silently ignored on the
+    # single-worker path -- with no log line, the only symptom was the bill.
+    config = _cli_config(
+        {"HEADROOM_MODEL_ROUTER_ENABLED": "1", "HEADROOM_MODEL_ROUTES": ROUTES_JSON}
+    )
+    assert config.model_router is not None
+    assert config.model_router.enabled
+    assert config.model_router.routes[0].to_model == "claude-haiku-4-5"
+
+
+def test_cli_proxy_router_disabled_by_default() -> None:
+    config = _cli_config({})
+    assert config.model_router is not None
+    assert not config.model_router.enabled
+
+
+def test_cli_proxy_router_disabled_on_malformed_routes() -> None:
+    # from_env fails open to disabled; the CLI must not turn that into a crash.
+    config = _cli_config(
+        {"HEADROOM_MODEL_ROUTER_ENABLED": "1", "HEADROOM_MODEL_ROUTES": "{not json"}
+    )
+    assert config.model_router is not None
+    assert not config.model_router.enabled
+
+
 def test_create_app_wires_model_router() -> None:
     config = ProxyConfig(
         optimize=False,
@@ -116,6 +170,55 @@ def test_create_app_router_disabled_when_unset() -> None:
     app = create_app(ProxyConfig(optimize=False, cost_tracking_enabled=False))
     with TestClient(app) as client:
         assert not client.app.state.proxy.model_router.enabled
+
+
+@contextmanager
+def _captured_proxy_logs() -> Iterator[list[str]]:
+    """Collect ``headroom.proxy`` records.
+
+    Not ``caplog``: ``create_app`` reconfigures logging while it runs, which
+    drops pytest's root handler mid-call, so a record emitted during app
+    construction never reaches it. A handler attached to the logger itself
+    survives that.
+    """
+    messages: list[str] = []
+
+    class _Collector(logging.Handler):
+        def emit(self, record: logging.LogRecord) -> None:
+            messages.append(record.getMessage())
+
+    logger = logging.getLogger("headroom.proxy")
+    handler = _Collector()
+    previous_level = logger.level
+    logger.addHandler(handler)
+    logger.setLevel(logging.INFO)
+    try:
+        yield messages
+    finally:
+        logger.removeHandler(handler)
+        logger.setLevel(previous_level)
+
+
+def test_router_state_is_logged_at_startup() -> None:
+    # Routing emits nothing when off, so without this line an unwired entrypoint
+    # (#2764) or a rule set that failed to parse looks identical to "no traffic
+    # matched a rule".
+    with _captured_proxy_logs() as messages:
+        create_app(
+            ProxyConfig(
+                optimize=False,
+                cost_tracking_enabled=False,
+                model_router=ModelRouterConfig(
+                    enabled=True,
+                    routes=(ModelRoute(to_model="cheap", max_input_tokens=10_000, name="small"),),
+                ),
+            )
+        )
+    assert "model router: enabled, 1 rule(s)" in messages
+
+    with _captured_proxy_logs() as messages:
+        create_app(ProxyConfig(optimize=False, cost_tracking_enabled=False))
+    assert "model router: disabled" in messages
 
 
 def test_handler_delegates_to_maybe_route_model() -> None:
