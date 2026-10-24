@@ -30,6 +30,7 @@ from typing import TYPE_CHECKING, Any
 
 from ...fileperms import ensure_private_file
 from ...log_safety import WarnOnce, safe_id
+from .base import StoreWriteError
 
 if TYPE_CHECKING:
     from ..compression_store import CompressionEntry
@@ -158,8 +159,8 @@ class SQLiteBackend:
         """Return the live connection, reopening it if a retry is due.
 
         Caller holds ``_lock``. Raises :class:`StoreUnavailableError` while the
-        store is down, so callers treat the operation as a miss (reads) or a
-        discarded write (writes) and the warning makes that visible.
+        store is down, so reads degrade to a miss and ``set()`` raises
+        :class:`StoreWriteError` to the producer.
         """
         if self._conn is not None:
             return self._conn
@@ -336,6 +337,12 @@ class SQLiteBackend:
         return self._entry_from_json(row[0], hash_key)
 
     def set(self, hash_key: str, entry: CompressionEntry) -> None:
+        """Persist ``entry``; raise :class:`StoreWriteError` if it was not.
+
+        Unlike reads, a failed write must not look like success: the caller
+        is about to hand out ``hash_key`` in place of the original, so it has
+        to learn that the original is not retrievable and keep it instead.
+        """
         payload = json.dumps(asdict(entry), ensure_ascii=False)
         with self._lock:
             try:
@@ -346,9 +353,20 @@ class SQLiteBackend:
                     (hash_key, payload, entry.created_at, entry.ttl),
                 )
                 conn.commit()
-                self._maybe_purge()
             except sqlite3.DatabaseError as e:
                 self._handle_db_error(e, f"set {safe_id(hash_key)}")
+                raise StoreWriteError(
+                    f"CCR SQLite write of {safe_id(hash_key)} was not persisted"
+                ) from e
+            try:
+                self._maybe_purge()
+            except sqlite3.DatabaseError as e:
+                self._handle_db_error(e, "purge")
+                if self._is_corruption(e):
+                    # Recovery recreated the file, so the row committed above is gone.
+                    raise StoreWriteError(
+                        f"CCR SQLite write of {safe_id(hash_key)} was lost to corruption recovery"
+                    ) from e
 
     def delete(self, hash_key: str) -> bool:
         with self._lock:

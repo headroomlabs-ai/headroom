@@ -26,7 +26,7 @@ Usage:
     store = CompressionStore(backend=MyBackend())
 """
 
-from .base import CompressionStoreBackend
+from .base import CompressionStoreBackend, StoreWriteError
 from .memory import InMemoryBackend
 from .sqlite import SQLiteBackend
 
@@ -34,4 +34,5 @@ __all__ = [
     "CompressionStoreBackend",
     "InMemoryBackend",
     "SQLiteBackend",
+    "StoreWriteError",
 ]

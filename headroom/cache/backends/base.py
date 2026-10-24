@@ -13,6 +13,16 @@ if TYPE_CHECKING:
     from ..compression_store import CompressionEntry
 
 
+class StoreWriteError(RuntimeError):
+    """A backend could not persist an entry passed to ``set()``.
+
+    Raised instead of returning normally so the failure reaches the producer:
+    ``CompressionStore.store()`` lets it propagate, and a producer that gets
+    it must keep the original content rather than emit a retrieval marker
+    whose hash would never resolve.
+    """
+
+
 @runtime_checkable
 class CompressionStoreBackend(Protocol):
     """Protocol for CompressionStore storage backends.
@@ -55,6 +65,10 @@ class CompressionStoreBackend(Protocol):
         Args:
             hash_key: The unique hash identifying the entry.
             entry: The CompressionEntry to store.
+
+        Raises:
+            StoreWriteError: The entry was not persisted. Returning normally
+                means a later ``get(hash_key)`` can find it.
 
         Note:
             Overwrites any existing entry with the same key.

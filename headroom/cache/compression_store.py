@@ -44,6 +44,7 @@ from dataclasses import asdict, dataclass, field, replace
 from typing import TYPE_CHECKING, Any
 
 from ..log_safety import describe_exception, safe_id
+from .backends.base import StoreWriteError
 
 if TYPE_CHECKING:
     from ..memory.tracker import ComponentStats
@@ -329,6 +330,11 @@ class CompressionStore:
 
         Returns:
             Hash key for retrieving this content.
+
+        Raises:
+            StoreWriteError: The backend did not persist the entry. The hash
+                would not resolve, so the caller must keep the original
+                instead of emitting a retrieval marker for it.
         """
         # Generate hash from original content. Default: SHA-256[:24] of the
         # original. When the caller provides `explicit_hash`, use it
@@ -485,8 +491,13 @@ class CompressionStore:
 
             # Track access for feedback
             entry.record_access(query)
-            # Update the backend with the modified entry
-            self._backend.set(hash_key, entry)
+            # Update the backend with the modified entry. Best effort: the
+            # access counters are bookkeeping, so a write failure here must
+            # not turn a successful read into an error.
+            try:
+                self._backend.set(hash_key, entry)
+            except StoreWriteError as e:
+                logger.debug("CCR access-count update for %s not persisted: %s", hash_key, e)
 
             # Log retrieval event
             if self._enable_feedback:

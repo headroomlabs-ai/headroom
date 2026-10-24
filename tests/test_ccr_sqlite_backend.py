@@ -14,6 +14,7 @@ import time
 
 import pytest
 
+from headroom.cache.backends.base import StoreWriteError
 from headroom.cache.backends.sqlite import SQLiteBackend
 from headroom.cache.compression_store import CompressionEntry, CompressionStore
 
@@ -475,9 +476,10 @@ class TestMultiWorkerSafety:
             b._handle_db_error(sqlite3.DatabaseError("database disk image is malformed"), "get")
             assert "failed to reopen" in caplog.text
             # Down and the retry is not due yet: a miss, and the discarded
-            # write is reported rather than silently accepted.
+            # write raises rather than returning as if it had persisted.
             assert b.get("h1") is None
-            b.set("h2", make_entry("h2"))
+            with pytest.raises(StoreWriteError):
+                b.set("h2", make_entry("h2"))
             assert "nothing was read or persisted" in caplog.text
 
         # The filesystem problem clears and the backoff elapses.
@@ -541,6 +543,32 @@ class TestMultiWorkerSafety:
         clock[0] += sqlite_mod._REOPEN_BACKOFF_MAX
         b.set("h2", make_entry("h2"))
         assert b.exists("h2")
+
+    def test_transient_write_failure_raises_store_write_error(self, db_path):
+        """A write lost to a transient error (busy/locked) is still lost:
+        set() must report it, and must not reset the database."""
+        b = SQLiteBackend(db_path)
+        b.set("h1", make_entry())
+
+        class LockedInsertConn:
+            def __init__(self, real):
+                self._real = real
+
+            def execute(self, *args, **kwargs):
+                if args and "INSERT" in args[0]:
+                    raise sqlite3.OperationalError("database is locked")
+                return self._real.execute(*args, **kwargs)
+
+            def __getattr__(self, name):
+                return getattr(self._real, name)
+
+        real = b._conn
+        b._conn = LockedInsertConn(real)  # type: ignore[assignment]
+        with pytest.raises(StoreWriteError):
+            b.set("h2", make_entry("h2"))
+        b._conn = real
+        assert b.get("h1") is not None
+        assert b.get("h2") is None
 
     def test_busy_timeout_configured(self, db_path):
         b = SQLiteBackend(db_path)
@@ -644,6 +672,96 @@ class TestDefaults:
 
         assert "re-read" in CCR_MISS_MESSAGE
         assert "re-run" in CCR_MISS_MESSAGE
+
+
+COMMENTED_TOML = (
+    "".join(f"# note {i}: keep this setting in sync with the deploy runbook\n" for i in range(30))
+    + '[package]\nname = "demo"\nversion = "0.1.0"\n\n[dependencies]\nserde = "1.0"\n'
+)
+
+
+class TestProducerDuringOutage:
+    """The producer-facing contract while the backend is down after a failed
+    corruption-recovery reopen: writes fail loudly so producers keep the
+    original, reads stay fail-open, and both work again after recovery."""
+
+    @pytest.fixture
+    def outage(self, db_path, monkeypatch):
+        import headroom.cache.backends.sqlite as sqlite_mod
+
+        backend = SQLiteBackend(db_path)
+        real_open = backend._open
+        clock = [1000.0]
+        monkeypatch.setattr(sqlite_mod.time, "monotonic", lambda: clock[0])
+
+        def broken_open():
+            raise sqlite3.OperationalError("unable to open database file")
+
+        monkeypatch.setattr(backend, "_open", broken_open)
+        backend._handle_db_error(sqlite3.DatabaseError("database disk image is malformed"), "get")
+
+        def recover():
+            monkeypatch.setattr(backend, "_open", real_open)
+            clock[0] += sqlite_mod._REOPEN_BACKOFF_MAX
+
+        return backend, recover
+
+    def test_compression_store_raises_and_recovers(self, outage):
+        backend, recover = outage
+        store = CompressionStore(backend=backend, enable_feedback=False)
+
+        with pytest.raises(StoreWriteError):
+            store.store("original " * 100, "compressed")
+        # Reads stay fail-open: a miss, not an exception.
+        assert store.retrieve("0" * 24) is None
+
+        recover()
+        hash_key = store.store("original " * 100, "compressed")
+        entry = store.retrieve(hash_key)
+        assert entry is not None
+        assert entry.original_content == "original " * 100
+
+    def test_retrieve_survives_failed_access_count_write(self, db_path):
+        backend = SQLiteBackend(db_path)
+        store = CompressionStore(backend=backend, enable_feedback=False)
+        hash_key = store.store("original " * 100, "compressed")
+
+        def failing_set(hash_key, entry):
+            raise StoreWriteError("write not persisted")
+
+        backend.set = failing_set  # type: ignore[method-assign]
+        entry = store.retrieve(hash_key)
+        assert entry is not None
+        assert entry.original_content == "original " * 100
+
+    def test_config_compressor_keeps_original_during_outage(self, outage, monkeypatch):
+        from headroom.parser import CCR_RETRIEVAL_MARKER_RE
+        from headroom.transforms.config_compressor import (
+            ConfigCompressor,
+            ConfigCompressorConfig,
+        )
+
+        backend, recover = outage
+        store = CompressionStore(backend=backend, enable_feedback=False)
+        monkeypatch.setattr("headroom.cache.compression_store.get_compression_store", lambda: store)
+        comp = ConfigCompressor(ConfigCompressorConfig(enable_ccr=True))
+
+        result = comp.compress(COMMENTED_TOML)
+        # No hash was issued for an original that was never stored, so all
+        # 30 comments stay in the output.
+        assert result.ccr_hash is None
+        assert result.lines_elided == 0
+        assert not CCR_RETRIEVAL_MARKER_RE.search(result.compressed)
+        for i in range(30):
+            assert f"# note {i}:" in result.compressed
+
+        recover()
+        result = comp.compress(COMMENTED_TOML)
+        assert result.ccr_hash is not None
+        assert "# note 0:" not in result.compressed
+        entry = store.retrieve(result.ccr_hash)
+        assert entry is not None
+        assert entry.original_content == COMMENTED_TOML
 
 
 if __name__ == "__main__":
