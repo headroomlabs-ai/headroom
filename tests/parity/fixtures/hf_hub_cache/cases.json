@@ -231,6 +231,45 @@
         }
       },
       {
+        "name": "an empty HF_HUB_CACHE is the working directory, not HF_HOME (the #4438 review case)",
+        "env": {
+          "HF_HUB_CACHE": "",
+          "HF_HOME": "{root}/fallback-home"
+        },
+        "expected": ""
+      },
+      {
+        "name": "an empty legacy HUGGINGFACE_HUB_CACHE is the working directory",
+        "env": {
+          "HUGGINGFACE_HUB_CACHE": "",
+          "HF_HOME": "{root}/fallback-home"
+        },
+        "expected": ""
+      },
+      {
+        "name": "an empty HF_HUB_CACHE still wins over a set legacy HUGGINGFACE_HUB_CACHE",
+        "env": {
+          "HF_HUB_CACHE": "",
+          "HUGGINGFACE_HUB_CACHE": "{root}/legacy"
+        },
+        "expected": ""
+      },
+      {
+        "name": "an empty HF_HOME is hub under the working directory, not XDG_CACHE_HOME",
+        "env": {
+          "HF_HOME": "",
+          "XDG_CACHE_HOME": "{root}/xdg"
+        },
+        "expected": "hub"
+      },
+      {
+        "name": "an empty XDG_CACHE_HOME is huggingface/hub under the working directory, not the home default",
+        "env": {
+          "XDG_CACHE_HOME": ""
+        },
+        "expected": "huggingface/hub"
+      },
+      {
         "name": "nothing set: the default under the home directory",
         "env": {},
         "expected": "{home}/.cache/huggingface/hub"

@@ -119,16 +119,14 @@ fn default_model_revision() -> &'static str {
 /// a `~` that only appears once a variable is expanded stays literal, as it
 /// does in Python. The home directory comes from `std::env::home_dir`, which
 /// falls back to the user database when `HOME` is unset, as `expanduser`
-/// does. An empty variable counts as unset; Python would treat it as a path
-/// relative to the working directory. `tests/parity/fixtures/hf_hub_cache/`
+/// does. A variable that is set but empty still counts, as with `os.getenv`:
+/// `HF_HUB_CACHE=''` is the working directory itself, `HF_HOME=''` is `hub`
+/// and `XDG_CACHE_HOME=''` is `huggingface/hub` under it, and none of them
+/// falls through to a lower-priority cache. `tests/parity/fixtures/hf_hub_cache/`
 /// holds the cases both languages are checked against.
 #[cfg(feature = "ml")]
 fn hf_hub_cache_dir() -> Option<PathBuf> {
-    let var = |name: &str| {
-        std::env::var_os(name)
-            .filter(|v| !v.is_empty())
-            .map(PathBuf::from)
-    };
+    let var = |name: &str| std::env::var_os(name).map(PathBuf::from);
     let home = std::env::home_dir();
     let expand = |path: PathBuf| expand_vars(&expand_user(path, home.as_deref()));
     let hub = match var("HF_HUB_CACHE").or_else(|| var("HUGGINGFACE_HUB_CACHE")) {
@@ -932,13 +930,21 @@ mod tests {
             Some(p("home").join(".cache").join("huggingface").join("hub"))
         );
 
-        // An empty variable counts as unset, and a leading `~` expands.
-        std::env::set_var("HF_HUB_CACHE", "");
+        // A leading `~` expands.
         std::env::set_var("HF_HOME", "~/models");
         assert_eq!(
             hf_hub_cache_dir(),
             Some(p("home").join("models").join("hub"))
         );
+
+        // A set but empty variable is the working directory, as in Python,
+        // and still wins over every variable after it.
+        std::env::set_var("HF_HUB_CACHE", "");
+        assert_eq!(hf_hub_cache_dir(), Some(PathBuf::new()));
+        std::env::remove_var("HF_HUB_CACHE");
+        std::env::set_var("HF_HOME", "");
+        std::env::set_var("XDG_CACHE_HOME", p("xdg"));
+        assert_eq!(hf_hub_cache_dir(), Some(PathBuf::from("hub")));
     }
 
     /// Cases checked against Python itself (`posixpath`, `ntpath` and
