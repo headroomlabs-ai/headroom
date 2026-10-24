@@ -114,6 +114,11 @@
       "announceCompression": {
         "type": "boolean",
         "default": true
+      },
+      "skipCompressionWhenCacheWarmMs": {
+        "type": "number",
+        "minimum": 0,
+        "description": "Skip applying a compression while the provider prompt cache is warm (newest assistant message younger than this, in ms). 0 disables. While warm, a session keeps receiving the compressed messages its last compressing assembly returned. Compression still applies when the history must shrink to fit the token budget."
       }
     }
   },

@@ -213,6 +213,7 @@ Compression is lossless via CCR (Compress-Cache-Retrieve): originals are stored 
 | `routeCodexViaProxy` | `true` | Rewrite OpenClaw's built-in `openai-codex` provider to use the active Headroom proxy in memory so upstream Codex requests pass through Headroom. |
 | `gatewayProviderIds` | `[]` | Optional explicit list of OpenClaw provider ids to route through the active Headroom proxy in memory. Friendly aliases `codex`, `claude`, `copilot`, and `gemini` are also accepted. When set, this overrides the default `openai-codex` routing list. |
 | `announceCompression` | `true` | Adds a static, cache-stable notice to the system prompt the first time a session compresses more than 100 tokens, then keeps it unchanged for the rest of the session. Set to `false` to guarantee Headroom never modifies the system prompt. |
+| `skipCompressionWhenCacheWarmMs` | `0` | While the newest assistant message in the history (the provider's last response) is younger than this many ms, do not apply a compression. On a provider with prompt caching, compressing history it has already cached makes it re-write that history at the cache-write rate to save tokens billed at the cache-read rate. Warm turns that provably fit the token budget skip the proxy call, and a turn after a compressing cold turn re-sends the same compressed messages. History is still compressed when it must shrink to fit the token budget. Set it to the provider's cache TTL (Anthropic/Bedrock: `300000`). `0` disables. |
 
 ## Comparison with lossless-claw
 

@@ -7,6 +7,7 @@
 
 /* eslint-disable @typescript-eslint/no-explicit-any */
 
+import { createHash } from "node:crypto";
 import { compress } from "headroom-ai";
 import { ProxyManager, defaultLogger, type ProxyManagerConfig, type ProxyManagerLogger } from "./proxy-manager.js";
 import { agentToOpenAIIndexed, normalizeAgentMessages, restoreAgentMessages } from "./convert.js";
@@ -41,6 +42,61 @@ export interface HeadroomEngineConfig extends ProxyManagerConfig {
    * `DurableAdvancementKeyStore`). Defaults to `defaultCommitLogPath()`. */
   commitLogPath?: string;
   announceCompression?: boolean;
+  /**
+   * Skip applying a compression while the provider's prompt cache for this session is still warm, i.e. the
+   * newest assistant message in the history is younger than this many ms (0 = never skip). Compressing history the
+   * provider already cached makes it re-write that history at the cache-write rate, to save tokens that
+   * would have been billed at the cache-read rate, so on a warm cache it almost never pays. A cold cache
+   * is re-written anyway, so compressing then is free and shrinks the write. The history is still
+   * compressed when it has to shrink to fit `tokenBudget`. Set it to the provider's cache TTL
+   * (Anthropic/Bedrock default: 300000).
+   *
+   * While the cache is warm, a session keeps receiving the compressed messages its last compressing
+   * assembly returned (the provider cached those, not the originals), with any newer messages after them
+   * as they came in. Only a cold assembly compresses the newer messages too.
+   */
+  skipCompressionWhenCacheWarmMs?: number;
+}
+
+/**
+ * UTF-8 size of `messages` as JSON: an upper bound on the proxy's token count for them. Its tokenizers spend at
+ * least one byte of text per token, and the JSON also carries each message's framing. (An image is counted at a
+ * fixed estimate, which its base64 data exceeds unless the image is tiny.)
+ */
+function jsonBytes(messages: any[]): number {
+  return Buffer.byteLength(JSON.stringify(messages), "utf8");
+}
+
+/** The proxy's token count for a session's history, so a warm turn can bound it without asking again. */
+interface TokenCount {
+  /** Fingerprints of the messages counted, in order. */
+  keys: string[];
+  /** The model counted for: the proxy picks its tokenizer by model. */
+  model: string;
+  tokens: number;
+  usedAt: number;
+}
+
+/** What a compressing assembly returned, so later assemblies can send the same bytes while the cache is warm. */
+interface CompressedView {
+  /** Fingerprints of the original messages the view replaces, in order. */
+  sourceKeys: string[];
+  /** Fingerprints of the view's own messages, for a caller that passes the view back in place of the originals. */
+  viewKeys: string[];
+  messages: any[];
+  usedAt: number;
+}
+
+/** Content fingerprint of one message. */
+function messageKey(message: unknown): string {
+  return createHash("sha1")
+    .update(JSON.stringify(message) ?? "")
+    .digest("base64");
+}
+
+/** True when `messages` starts with messages whose fingerprints are `keys`. */
+function startsWithKeys(messages: any[], keys: string[]): boolean {
+  return messages.length >= keys.length && keys.every((key, i) => key === messageKey(messages[i]));
 }
 
 export class HeadroomContextEngine {
@@ -78,6 +134,10 @@ export class HeadroomContextEngine {
   // eviction — no session lifecycle callback exists here to bound it otherwise.
   private announcedSessions = new Set<string>();
   private static readonly MAX_ANNOUNCED_SESSIONS = 1000;
+  /** Per session: the compressed view the provider's prompt cache holds (see `unchanged`). */
+  private compressedViews = new Map<string, CompressedView>();
+  /** Per session: the proxy's last token count for the history (see `fitsBudget`). */
+  private tokenCounts = new Map<string, TokenCount>();
 
   constructor(config: HeadroomEngineConfig = {}, logger?: ProxyManagerLogger) {
     this.config = config;
@@ -138,11 +198,15 @@ export class HeadroomContextEngine {
     estimatedTokens: number;
     systemPromptAddition?: string;
   }> {
+    this.evictIdle(params.sessionId);
+    const warm = this.isCacheWarm(params.messages);
+    const model = params.model ?? "claude-sonnet-4-5";
+
     if (!this.proxyUrl || this.config.enabled === false) {
       this.ensureProxyStarted();
       // Fallback: return messages unchanged
       return {
-        messages: normalizeAgentMessages(params.messages),
+        messages: this.unchanged(params, warm),
         estimatedTokens: 0,
         systemPromptAddition: this.sessionCompressionNotice(params.sessionId),
       };
@@ -151,7 +215,17 @@ export class HeadroomContextEngine {
     if (this.isCircuitOpen()) {
       this.logger.warn("[headroom] Circuit open — using uncompressed messages");
       return {
-        messages: normalizeAgentMessages(params.messages),
+        messages: this.unchanged(params, warm),
+        estimatedTokens: 0,
+        systemPromptAddition: this.sessionCompressionNotice(params.sessionId),
+      };
+    }
+
+    // Warm cache and provably within budget: skip without calling the proxy, so it neither counts savings that
+    // are never applied nor adds its latency. Otherwise ask the proxy and decide on its token count below.
+    if (warm && this.fitsBudget(params, model)) {
+      return {
+        messages: this.unchanged(params, warm),
         estimatedTokens: 0,
         systemPromptAddition: this.sessionCompressionNotice(params.sessionId),
       };
@@ -164,14 +238,35 @@ export class HeadroomContextEngine {
       // Compress via proxy — pass tokenBudget so RollingWindow enforces it
       const result = await withTimeout(
         compress(openaiMessages, {
-          model: params.model ?? "claude-sonnet-4-5",
+          model,
           baseUrl: this.proxyUrl,
           fallback: true,
           tokenBudget: params.tokenBudget,
         } as any),
         this.config.requestTimeoutMs ?? 30_000,
       );
+      this.rememberTokenCount(params, model, result.tokensBefore);
 
+      if (!result.compressed || result.tokensSaved === 0) {
+        this.resetCircuit();
+        return {
+          messages: this.unchanged(params, warm),
+          estimatedTokens: result.tokensBefore,
+          systemPromptAddition: this.sessionCompressionNotice(params.sessionId),
+        };
+      }
+
+      if (warm && !(params.tokenBudget && result.tokensBefore > params.tokenBudget)) {
+        this.resetCircuit();
+        this.logger.debug(`Skipped compression on a warm prompt cache (would have saved ${result.tokensSaved})`);
+        return {
+          messages: this.unchanged(params, warm),
+          estimatedTokens: result.tokensBefore,
+          systemPromptAddition: this.sessionCompressionNotice(params.sessionId),
+        };
+      }
+
+      // Only a compression that is applied earns the notice, so this comes after the warm skip.
       const shouldAnnounceCompression =
         (this.hasAnnouncedCompression(params.sessionId) || result.tokensSaved > 100) &&
         this.config.announceCompression !== false;
@@ -179,18 +274,10 @@ export class HeadroomContextEngine {
         this.markCompressionAnnounced(params.sessionId);
       }
 
-      if (!result.compressed || result.tokensSaved === 0) {
-        this.resetCircuit();
-        return {
-          messages: normalizeAgentMessages(params.messages),
-          estimatedTokens: result.tokensBefore,
-          systemPromptAddition: this.sessionCompressionNotice(params.sessionId),
-        };
-      }
-
       // Convert back to AgentMessage format
       const compressedAgentMessages = restoreAgentMessages(params.messages, openaiMessages, result.messages);
       this.resetCircuit();
+      this.remember(params, compressedAgentMessages);
 
       // Track stats
       this.stats.totalCompressions++;
@@ -211,11 +298,115 @@ export class HeadroomContextEngine {
       this.tripCircuit(error);
       // Graceful fallback: return original messages
       return {
-        messages: normalizeAgentMessages(params.messages),
+        messages: this.unchanged(params, warm),
         estimatedTokens: 0,
         systemPromptAddition: this.sessionCompressionNotice(params.sessionId),
       };
     }
+  }
+
+  /**
+   * The history to send when this assembly applies no new compression.
+   *
+   * While the cache is warm it has to be what the provider already holds. That is the compressed view the
+   * session's last compressing assembly returned, for the messages it covered, followed by the newer messages
+   * as they came in. Sending the originals instead would undo that compression and make the provider re-write
+   * everything after the first message it touched. On a cold cache everything is written anyway, so the
+   * originals go out and the view is dropped.
+   */
+  private unchanged(params: { sessionId: string; messages: any[] }, warm: boolean): any[] {
+    const view = this.compressedViews.get(params.sessionId);
+    if (view && warm) {
+      const covered = startsWithKeys(params.messages, view.sourceKeys)
+        ? view.sourceKeys.length
+        : startsWithKeys(params.messages, view.viewKeys)
+          ? view.viewKeys.length
+          : -1;
+      if (covered >= 0) {
+        view.usedAt = Date.now();
+        this.logger.debug(`Kept the compressed view of ${covered} messages (prompt cache warm)`);
+        // A copy: OpenClaw keeps the returned list as the turn's working state and appends to it.
+        return [...structuredClone(view.messages), ...normalizeAgentMessages(params.messages.slice(covered))];
+      }
+    }
+    // No view, a cold cache, or a history that changed under the view (e.g. a compaction rewrote it), so the
+    // provider cannot be holding the view any more.
+    this.compressedViews.delete(params.sessionId);
+    return normalizeAgentMessages(params.messages);
+  }
+
+  /** Record what a compressing assembly returned in place of `params.messages`, for `unchanged`. */
+  private remember(params: { sessionId: string; messages: any[] }, assembled: any[]): void {
+    if (!(this.cacheWindowMs() > 0)) return;
+    try {
+      this.compressedViews.set(params.sessionId, {
+        sourceKeys: params.messages.map(messageKey),
+        viewKeys: assembled.map(messageKey),
+        messages: structuredClone(assembled),
+        usedAt: Date.now(),
+      });
+    } catch (error) {
+      // Not fatal: without a view the next warm assembly sends the originals, which costs one cache re-write.
+      this.compressedViews.delete(params.sessionId);
+      this.logger.warn(`[headroom] Could not keep the compressed view: ${error}`);
+    }
+  }
+
+  /**
+   * True when the history can be shown to fit `tokenBudget` (or there is none) without asking the proxy. The
+   * bound is the proxy's own count for `model` from the last time it saw this history plus the size of any
+   * messages appended since, or failing that the size of the whole history (see `jsonBytes`).
+   */
+  private fitsBudget(params: { sessionId: string; messages: any[]; tokenBudget?: number }, model: string): boolean {
+    if (!params.tokenBudget) return true;
+    const count = this.tokenCounts.get(params.sessionId);
+    if (count && count.model === model && startsWithKeys(params.messages, count.keys)) {
+      count.usedAt = Date.now();
+      return count.tokens + jsonBytes(params.messages.slice(count.keys.length)) <= params.tokenBudget;
+    }
+    return jsonBytes(params.messages) <= params.tokenBudget;
+  }
+
+  /** Record the proxy's token count for `params.messages` under `model`, for `fitsBudget`. */
+  private rememberTokenCount(params: { sessionId: string; messages: any[] }, model: string, tokens: number): void {
+    // The SDK's fallback result (proxy unreachable) reports 0 tokens, which is not a count.
+    if (!(this.cacheWindowMs() > 0) || !(tokens > 0)) return;
+    this.tokenCounts.set(params.sessionId, { keys: params.messages.map(messageKey), model, tokens, usedAt: Date.now() });
+  }
+
+  /**
+   * Drop the views and counts of other sessions that have gone unused for longer than the window: their next
+   * assembly is cold and cannot use them. The current session's are settled by the assembly in progress.
+   */
+  private evictIdle(sessionId: string): void {
+    const windowMs = this.cacheWindowMs();
+    if (!(windowMs > 0)) return;
+    const now = Date.now();
+    for (const entries of [this.compressedViews, this.tokenCounts] as Map<string, { usedAt: number }>[]) {
+      for (const [id, entry] of entries) {
+        if (id !== sessionId && now - entry.usedAt > windowMs) entries.delete(id);
+      }
+    }
+  }
+
+  private cacheWindowMs(): number {
+    return this.config.skipCompressionWhenCacheWarmMs ?? 0;
+  }
+
+  /**
+   * True while the newest assistant message in the history is younger than `skipCompressionWhenCacheWarmMs`. An
+   * assistant message is stamped when the provider is asked for it, which is the last time the provider read this
+   * prefix. Messages after it, such as the result of a tool that ran for a long time, do not keep the cache warm.
+   */
+  private isCacheWarm(messages: any[]): boolean {
+    const windowMs = this.cacheWindowMs();
+    if (!(windowMs > 0)) return false;
+    let newest = 0;
+    for (const message of messages) {
+      const ts = message?.timestamp;
+      if (message?.role === "assistant" && typeof ts === "number" && ts > newest) newest = ts;
+    }
+    return newest > 0 && Date.now() - newest < windowMs;
   }
 
   /** Delegate persistent compaction to OpenClaw's built-in runtime. */
