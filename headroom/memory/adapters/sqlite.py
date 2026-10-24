@@ -431,49 +431,18 @@ class SQLiteMemoryStore:
         conditions: list[str] = []
         params: list[Any] = []
 
-        # Hierarchical scope filtering
+        # Every supplied scope narrows the match. IDs can be reused under
+        # different parents, so no child scope can replace a parent predicate.
         if filter.user_id is not None:
             conditions.append("user_id = ?")
             params.append(filter.user_id)
-
-            # Hierarchical filtering: when filtering by user_id only,
-            # return USER-level and below (all that user's memories)
-            # This is implicit - we just filter by user_id
-
-            if filter.session_id is not None:
-                conditions.append("session_id = ?")
-                params.append(filter.session_id)
-
-                # agent_id and turn_id are independent narrowing constraints:
-                # turn_id must be applied even when agent_id is absent. Nesting
-                # the turn_id check inside the agent_id block dropped the turn
-                # filter for a (session_id + turn_id, no agent_id) query, so it
-                # returned the whole session instead of the one turn.
-                if filter.agent_id is not None:
-                    conditions.append("agent_id = ?")
-                    params.append(filter.agent_id)
-
-                if filter.turn_id is not None:
-                    conditions.append("turn_id = ?")
-                    params.append(filter.turn_id)
-            elif filter.agent_id is not None:
-                # Agent without session - unusual but supported
-                conditions.append("agent_id = ?")
-                params.append(filter.agent_id)
-            elif filter.turn_id is not None:
-                # Turn without session/agent - unusual but supported
-                conditions.append("turn_id = ?")
-                params.append(filter.turn_id)
-        elif filter.session_id is not None:
-            # Session without user - filter by session only
+        if filter.session_id is not None:
             conditions.append("session_id = ?")
             params.append(filter.session_id)
-        elif filter.agent_id is not None:
-            # Agent without user/session
+        if filter.agent_id is not None:
             conditions.append("agent_id = ?")
             params.append(filter.agent_id)
-        elif filter.turn_id is not None:
-            # Turn only
+        if filter.turn_id is not None:
             conditions.append("turn_id = ?")
             params.append(filter.turn_id)
 
@@ -838,22 +807,17 @@ class SQLiteMemoryStore:
         Returns:
             Number of memories deleted.
         """
-        conditions = ["user_id = ?"]
-        params: list[Any] = [user_id]
-
-        if turn_id is not None:
-            # Clear only specific turn
-            conditions.append("turn_id = ?")
-            params.append(turn_id)
-        elif agent_id is not None:
-            # Clear agent and its turns
-            conditions.append("agent_id = ?")
-            params.append(agent_id)
-        elif session_id is not None:
-            # Clear session and its agents/turns
-            conditions.append("session_id = ?")
-            params.append(session_id)
-        # If only user_id, clear all user's memories
+        # Use the same scope as the query that selects IDs for index cleanup.
+        # Clearing includes historical versions as well as active memories.
+        conditions, params = self._build_query_conditions(
+            MemoryFilter(
+                user_id=user_id,
+                session_id=session_id,
+                agent_id=agent_id,
+                turn_id=turn_id,
+                include_superseded=True,
+            )
+        )
 
         where_clause = " AND ".join(conditions)
 
