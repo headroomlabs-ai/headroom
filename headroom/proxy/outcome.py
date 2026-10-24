@@ -791,6 +791,7 @@ async def emit_request_outcome(handler: Any, outcome: RequestOutcome) -> None:
                 cache_read_tokens=outcome.cache_read_tokens,
                 cache_write_tokens=outcome.cache_write_tokens,
                 uncached_input_tokens=outcome.uncached_input_tokens,
+                provider_input_tokens=outcome.provider_input_tokens,
                 transforms_applied=list(outcome.transforms_applied),
                 savings_breakdown=savings_breakdown,
                 waste_signals=outcome.waste_signals,
