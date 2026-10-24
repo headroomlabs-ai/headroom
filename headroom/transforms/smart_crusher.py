@@ -515,6 +515,7 @@ class SmartCrusher(Transform):
         # (``{...} {...} {...}``) rather than a real array. The Rust crusher
         # only compresses JSON arrays, so normalize that shape first —
         # otherwise it passes through at 0% compression (#1741).
+        given = content
         normalized = normalize_concatenated_json(content)
         if normalized is not None:
             content = normalized
@@ -524,6 +525,17 @@ class SmartCrusher(Transform):
             else self._build_rust(bool(lossless_only))
         )
         r = rust.crush(content, query, bias)
+        # Bridge any CCR markers emitted by the Rust crusher into the
+        # Python compression_store so /v1/retrieve resolves them; a marker
+        # the store did not take points nowhere, so keep the input instead.
+        # See `_mirror_ccr_to_python_store` for full rationale.
+        if not self._mirror_ccr_to_python_store(
+            rendered=r.compressed,
+            strategy=r.strategy,
+            query_context=query,
+            tool_name=None,
+        ):
+            return CrushResult(compressed=given, original=given, was_modified=False)
         # Re-attach the TOIN learning loop. The retired Python class
         # recorded compressions into TOIN inline; the Rust port doesn't
         # know about TOIN, and `ContentRouter._record_to_toin` skips
@@ -544,15 +556,6 @@ class SmartCrusher(Transform):
                 query_context=query,
                 tool_name=None,
             )
-        # Bridge any CCR markers emitted by the Rust crusher into the
-        # Python compression_store so /v1/retrieve resolves them.
-        # See `_mirror_ccr_to_python_store` for full rationale.
-        self._mirror_ccr_to_python_store(
-            rendered=r.compressed,
-            strategy=r.strategy,
-            query_context=query,
-            tool_name=None,
-        )
         return CrushResult(
             compressed=r.compressed,
             original=r.original,
@@ -794,9 +797,10 @@ class SmartCrusher(Transform):
         # already stashed the canonical in its own store. Mirror that
         # entry into the Python compression_store keyed by the same
         # 12-char SHA-256 hash so /v1/retrieve resolves it.
+        mirrored = True
         ccr_hash = result.get("ccr_hash")
         if ccr_hash:
-            self._mirror_single_hash_to_python_store(
+            mirrored = self._mirror_single_hash_to_python_store(
                 ccr_hash,
                 strategy=str(result.get("strategy_info") or "smart_crusher_row_drop"),
                 query_context=query,
@@ -804,22 +808,20 @@ class SmartCrusher(Transform):
             )
         # Opaque-blob substitutions inside the kept items also produce
         # markers. Walk the rendered shape to bridge those too.
-        kept_json = result.get("items")
-        if isinstance(kept_json, str) and "<<ccr:" in kept_json:
-            self._mirror_ccr_markers_in_text(
-                kept_json,
-                strategy=str(result.get("strategy_info") or "smart_crusher"),
-                query_context=query,
-                tool_name=None,
-            )
-        compacted = result.get("compacted")
-        if isinstance(compacted, str) and "<<ccr:" in compacted:
-            self._mirror_ccr_markers_in_text(
-                compacted,
-                strategy=str(result.get("strategy_info") or "smart_crusher"),
-                query_context=query,
-                tool_name=None,
-            )
+        strategy = str(result.get("strategy_info") or "smart_crusher")
+        for rendered in (result.get("items"), result.get("compacted")):
+            if mirrored and isinstance(rendered, str):
+                mirrored = self._mirror_ccr_to_python_store(rendered, strategy, query, None)
+        if not mirrored:
+            # A marker the store did not take points nowhere: keep the input.
+            return {
+                "items": items_json,
+                "ccr_hash": None,
+                "dropped_summary": "",
+                "strategy_info": "passthrough",
+                "compacted": None,
+                "compaction_kind": None,
+            }
         return result
 
     def compact_document_json(self, doc_json: str) -> str:
@@ -836,13 +838,8 @@ class SmartCrusher(Transform):
         result: str = self._rust.compact_document_json(doc_json)
         # Mirror any opaque-blob markers the walker emitted into the
         # Python store so /v1/retrieve resolves them.
-        if "<<ccr:" in result:
-            self._mirror_ccr_markers_in_text(
-                result,
-                strategy="smart_crusher_compact_document",
-                query_context="",
-                tool_name=None,
-            )
+        if not self._mirror_ccr_to_python_store(result, "smart_crusher_compact_document", "", None):
+            return doc_json  # a marker the store did not take points nowhere
         return result
 
     def ccr_get(self, hash_key: str) -> str | None:
@@ -890,6 +887,17 @@ class SmartCrusher(Transform):
             crushed, was_modified, info = self._apply_audit_safe_protection_to_content(
                 protected, content, crushed, was_modified, info
             )
+        # Bridge any CCR markers (row-drop sentinels or opaque-blob
+        # substitutions) emitted by the Rust crusher into the Python
+        # compression_store so /v1/retrieve resolves them; a marker the
+        # store did not take points nowhere, so keep the input instead.
+        if not self._mirror_ccr_to_python_store(
+            rendered=crushed,
+            strategy=info or "smart_crusher",
+            query_context=query_context,
+            tool_name=tool_name,
+        ):
+            return content, False, "passthrough"
         # Same passthrough filter as `crush()` — re-canonicalization of
         # JSON whitespace can flip `was_modified=True` even when the
         # `info` field reports `passthrough` and no compression happened.
@@ -901,15 +909,6 @@ class SmartCrusher(Transform):
                 query_context=query_context,
                 tool_name=tool_name,
             )
-        # Bridge any CCR markers (row-drop sentinels or opaque-blob
-        # substitutions) emitted by the Rust crusher into the Python
-        # compression_store so /v1/retrieve resolves them.
-        self._mirror_ccr_to_python_store(
-            rendered=crushed,
-            strategy=info or "smart_crusher",
-            query_context=query_context,
-            tool_name=tool_name,
-        )
         return crushed, was_modified, info
 
     def _record_to_toin(
@@ -1026,10 +1025,11 @@ class SmartCrusher(Transform):
     # `compression_store.store(..., explicit_hash=hash)` so the Python
     # store is keyed by the exact hash that's in the prompt marker.
     #
-    # Best-effort by design: a missing compression_store import (e.g.
-    # in a stripped CLI build) or a transient store error must NOT
-    # break compression itself. Compression has already succeeded; the
-    # bridge just makes /v1/retrieve work. Errors log at debug.
+    # A missing compression_store import (a stripped CLI build) or a
+    # marker whose hash the Rust store does not hold is not a failure. A
+    # store error is: the mirror returns False and the caller keeps the
+    # input uncompressed, since a marker nobody stored never resolves on
+    # another replica. Store errors log at warning; nothing raises.
 
     def _mirror_ccr_to_python_store(
         self,
@@ -1037,9 +1037,10 @@ class SmartCrusher(Transform):
         strategy: str,
         query_context: str,
         tool_name: str | None,
-    ) -> None:
+    ) -> bool:
         """Walk `rendered` for any `<<ccr:HASH ...>>` markers and mirror
-        each into the Python `compression_store`.
+        each into the Python `compression_store`. Returns whether every
+        marker's original was stored (True when there is none).
 
         `rendered` may be a JSON string (the standard SmartCrusher
         output format) or arbitrary text. We try the structured walk
@@ -1047,8 +1048,8 @@ class SmartCrusher(Transform):
         """
         # Cheap pre-filter — most outputs have no marker at all.
         if "<<ccr:" not in rendered:
-            return
-        self._mirror_ccr_markers_in_text(
+            return True
+        return self._mirror_ccr_markers_in_text(
             rendered,
             strategy=strategy,
             query_context=query_context,
@@ -1061,9 +1062,9 @@ class SmartCrusher(Transform):
         strategy: str,
         query_context: str,
         tool_name: str | None,
-    ) -> None:
+    ) -> bool:
         """Find every distinct `<<ccr:HASH...>>` hash in `rendered` and
-        mirror Rust→Python store for each.
+        mirror Rust→Python store for each; whether all were stored.
 
         Tries JSON-tree walk first (structured, handles nested shapes);
         falls back to a token scan if `rendered` isn't valid JSON.
@@ -1080,15 +1081,15 @@ class SmartCrusher(Transform):
             # always re-serializes via `python_safe_json_dumps`). Fall
             # through to a string-token scan so we still bridge.
             self._collect_ccr_hashes_from_string(rendered, hashes)
-        if not hashes:
-            return
-        for h in hashes:
+        return all(
             self._mirror_single_hash_to_python_store(
                 h,
                 strategy=strategy,
                 query_context=query_context,
                 tool_name=tool_name,
             )
+            for h in hashes
+        )
 
     @staticmethod
     def _collect_ccr_hashes(value: Any, sink: set[str]) -> None:
@@ -1147,9 +1148,10 @@ class SmartCrusher(Transform):
         strategy: str,
         query_context: str,
         tool_name: str | None,
-    ) -> None:
+    ) -> bool:
         """Mirror a single Rust-stored CCR entry into the Python
-        compression_store, keyed by `ccr_hash`. Best-effort.
+        compression_store, keyed by `ccr_hash`. False when the store did
+        not take it; True when stored or there is nothing to mirror.
         """
         canonical = self._rust.ccr_get(ccr_hash)
         if canonical is None:
@@ -1161,19 +1163,19 @@ class SmartCrusher(Transform):
                 "CCR mirror: hash %s not in Rust store (skipped)",
                 ccr_hash,
             )
-            return
+            return True
         try:
             from ..cache.compression_store import get_compression_store
         except ImportError:
             # Stripped build without the compression_store module.
             # Mirror is a no-op; Rust side still serves the data.
             logger.debug("CCR mirror: compression_store module unavailable")
-            return
+            return True
         try:
             store = get_compression_store()
         except Exception as e:  # pragma: no cover - defensive
-            logger.debug("CCR mirror: cannot get compression_store (%s)", e)
-            return
+            logger.warning("CCR mirror: cannot get compression_store (%s)", safe_id(e))
+            return False
         # The TTL on the Python store defaults to 30 minutes — same as
         # the Rust store's `DEFAULT_TTL` (see crates/headroom-core/src/
         # ccr/mod.rs). No need to override.
@@ -1191,6 +1193,7 @@ class SmartCrusher(Transform):
                 compression_strategy=strategy,
                 explicit_hash=ccr_hash,
             )
+            return True
         except ValueError:
             # explicit_hash validation failed — the marker had a
             # malformed hash (shouldn't happen in practice).
@@ -1198,12 +1201,14 @@ class SmartCrusher(Transform):
                 "CCR mirror: invalid hash %r from rendered marker",
                 ccr_hash,
             )
+            return False
         except Exception as e:
             # Store backends can echo the payload in errors, so no level logs it;
             # describe_exception keeps only types and code locations.
             logger.warning("CCR mirror: store write failed (%s) for hash %s", safe_id(e), ccr_hash)
             if logger.isEnabledFor(logging.DEBUG):
                 logger.debug("CCR mirror store failure detail: %s", describe_exception(e))
+            return False
 
     def _extract_context_from_messages(self, messages: list[dict[str, Any]]) -> str:
         """Build a query string from the last 5 user messages + recent
