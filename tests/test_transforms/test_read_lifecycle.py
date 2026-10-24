@@ -612,6 +612,90 @@ class TestNoFilePathHandling:
         assert result.messages[1]["content"] == LARGE_CONTENT
 
 
+class TestCompressIgnorePolicy:
+    """Central `ignore.compress` enforcement (issue #1150).
+
+    A path ignored for "compress" is never marked stale/superseded by
+    ReadLifecycleManager, so its content is never replaced — this is the
+    real, production compression file/content intake path (not just an
+    IgnorePolicy unit test).
+    """
+
+    def test_stale_read_of_ignored_path_is_not_replaced(self, tmp_path):
+        from headroom.config import IgnoreConfig
+        from headroom.ignore import IgnorePolicy
+
+        policy = IgnorePolicy.load(tmp_path, IgnoreConfig(compress=["CLAUDE.md"]))
+        config = ReadLifecycleConfig(enabled=True)
+        mgr = ReadLifecycleManager(config, ignore_policy=policy)
+
+        messages = [
+            make_openai_read("r1", "CLAUDE.md"),
+            make_openai_tool_result("r1", LARGE_CONTENT),
+            make_openai_edit("e1", "CLAUDE.md"),
+            make_openai_tool_result("e1", "edit success"),
+        ]
+
+        result = mgr.apply(messages)
+        assert result.reads_stale == 0
+        assert result.reads_fresh == 1
+        assert result.messages[1]["content"] == LARGE_CONTENT
+
+    def test_stale_read_of_non_ignored_path_is_still_replaced(self, tmp_path):
+        """Sanity check: the ignore policy only exempts matching paths."""
+        from headroom.config import IgnoreConfig
+        from headroom.ignore import IgnorePolicy
+
+        policy = IgnorePolicy.load(tmp_path, IgnoreConfig(compress=["CLAUDE.md"]))
+        config = ReadLifecycleConfig(enabled=True)
+        mgr = ReadLifecycleManager(config, ignore_policy=policy)
+
+        messages = [
+            make_openai_read("r1", "/src/app.py"),
+            make_openai_tool_result("r1", LARGE_CONTENT),
+            make_openai_edit("e1", "/src/app.py"),
+            make_openai_tool_result("e1", "edit success"),
+        ]
+
+        result = mgr.apply(messages)
+        assert result.reads_stale == 1
+        assert "stale" in result.messages[1]["content"].lower()
+
+    def test_superseded_read_of_ignored_path_is_not_replaced(self, tmp_path):
+        from headroom.config import IgnoreConfig
+        from headroom.ignore import IgnorePolicy
+
+        policy = IgnorePolicy.load(tmp_path, IgnoreConfig(compress=["CLAUDE.md"]))
+        config = ReadLifecycleConfig(enabled=True, compress_superseded=True)
+        mgr = ReadLifecycleManager(config, ignore_policy=policy)
+
+        messages = [
+            make_openai_read("r1", "CLAUDE.md"),
+            make_openai_tool_result("r1", LARGE_CONTENT),
+            make_openai_read("r2", "CLAUDE.md"),
+            make_openai_tool_result("r2", LARGE_CONTENT),
+        ]
+
+        result = mgr.apply(messages)
+        assert result.reads_superseded == 0
+        assert result.messages[1]["content"] == LARGE_CONTENT
+
+    def test_no_ignore_policy_preserves_prior_behavior(self):
+        """Backward compatibility: omitting ignore_policy changes nothing."""
+        config = ReadLifecycleConfig(enabled=True)
+        mgr = ReadLifecycleManager(config)  # no ignore_policy passed
+
+        messages = [
+            make_openai_read("r1", "CLAUDE.md"),
+            make_openai_tool_result("r1", LARGE_CONTENT),
+            make_openai_edit("e1", "CLAUDE.md"),
+            make_openai_tool_result("e1", "edit success"),
+        ]
+
+        result = mgr.apply(messages)
+        assert result.reads_stale == 1
+
+
 class TestContentRouterIntegration:
     """Regression: ContentRouter.transform must wire a real CCR store into
     ReadLifecycleManager so STALE Read markers resolve via headroom_retrieve."""
