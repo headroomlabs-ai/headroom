@@ -498,8 +498,15 @@ def register_provider_routes(app: FastAPI, proxy: Any) -> None:
             VERTEX_STREAM_RAW_PREDICT.name,
         )
 
-    @app.get("/v1/models")
-    async def list_models(request: Request):
+    async def _model_metadata_route(request: Request) -> tuple[str, str]:
+        # A caller-named upstream wins, as in the catch-all and the chat
+        # handlers: model discovery must reach the same gateway as inference.
+        custom_base = request.headers.get("x-headroom-base-url", "").strip()
+        if custom_base:
+            if not await is_safe_upstream_url_async(custom_base):
+                logger.warning("rejecting unsafe x-headroom-base-url: %r", custom_base)
+                raise HTTPException(status_code=400, detail="Rejected unsafe upstream base URL")
+            return "openai", custom_base.rstrip("/")
         headers = dict(request.headers)
         provider_name = proxy.provider_runtime.model_metadata_provider(headers)
         base_url = (
@@ -507,6 +514,11 @@ def register_provider_routes(app: FastAPI, proxy: Any) -> None:
             if provider_name == "openai"
             else _api_target(proxy, provider_name)
         )
+        return provider_name, base_url
+
+    @app.get("/v1/models")
+    async def list_models(request: Request):
+        provider_name, base_url = await _model_metadata_route(request)
         return await handle_model_metadata_endpoint(
             proxy,
             request,
@@ -517,13 +529,7 @@ def register_provider_routes(app: FastAPI, proxy: Any) -> None:
 
     @app.get("/v1/models/{model_id}")
     async def get_model(request: Request, model_id: str):
-        headers = dict(request.headers)
-        provider_name = proxy.provider_runtime.model_metadata_provider(headers)
-        base_url = (
-            _openai_compatible_base_url(proxy, headers)
-            if provider_name == "openai"
-            else _api_target(proxy, provider_name)
-        )
+        provider_name, base_url = await _model_metadata_route(request)
         return await handle_model_metadata_endpoint(
             proxy,
             request,
