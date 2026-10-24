@@ -63,6 +63,7 @@ from typing import Any
 
 from headroom.cache_economics import CACHE_ECONOMICS
 from headroom.log_safety import describe_exception, safe_id
+from headroom.offline import pin_litellm_cost_map_local
 from headroom.pricing.cache_ttl import CACHE_WRITE_MULTIPLIERS
 
 logger = logging.getLogger(__name__)
@@ -338,6 +339,7 @@ def _litellm() -> Any | None:
     deployments often run without it. Callers degrade to list pricing.
     """
     try:
+        pin_litellm_cost_map_local()
         import litellm
     except Exception:  # pragma: no cover - environment-dependent
         return None

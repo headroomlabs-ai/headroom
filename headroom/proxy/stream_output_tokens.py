@@ -40,9 +40,12 @@ TEXT_CHARS_PER_TOKEN = 4
 def _iter_sse_payloads(sse: str) -> Iterator[Any]:
     """Yield each ``data:`` payload in an SSE stream as a parsed object.
 
-    Tolerates the two things real streams do that a naive split does not:
-    an event whose ``data:`` is spread over multiple lines, and ``[DONE]``.
+    Tolerates the things real streams do that a naive split does not: an
+    event whose ``data:`` is spread over multiple lines, ``[DONE]``, and CRLF
+    or bare-CR line endings (both valid SSE; JSON payloads escape their own
+    CRs, so normalising them cannot touch the data).
     """
+    sse = sse.replace("\r\n", "\n").replace("\r", "\n")
     for block in sse.split("\n\n"):
         lines = [ln for ln in block.split("\n") if ln.startswith("data:")]
         if not lines:
