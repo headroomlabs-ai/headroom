@@ -193,12 +193,6 @@ def _cache_put(key: str, compacted: dict[str, Any], before: int, after: int) -> 
         _compaction_cache[key] = (compacted, before, after)
 
 
-def invalidate_cache() -> None:
-    """Clear the compaction cache (e.g. on config change)."""
-    with _cache_lock:
-        _compaction_cache.clear()
-
-
 # ---------------------------------------------------------------------------
 # Layer 1: annotation-key compaction
 # ---------------------------------------------------------------------------

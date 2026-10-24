@@ -718,7 +718,6 @@ class MemoryHandler:
         messages: list[dict[str, Any]],
         request_context: RequestContext | None = None,
         *,
-        ranker: Any | None = None,
         query: Any | None = None,
         budget: Any | None = None,
     ) -> str | None:
@@ -736,14 +735,6 @@ class MemoryHandler:
                 omitted, behaves as before this fix — single-bucket search
                 against the legacy backend. Production handlers always
                 pass it; tests / mocks can keep the simpler call shape.
-            ranker: Optional :class:`~headroom.proxy.memory_ranker.MemoryRanker`
-                — re-ranks the backend's cosine-only candidates by an
-                additional signal (recency, source, access count, …).
-                When ``None`` (default), behaviour is pure cosine +
-                ``budget.min_similarity`` floor. When provided, candidates
-                are adapted to :class:`MemoryCandidate`, re-ranked, then
-                re-filtered by ``budget.min_similarity`` on the boosted
-                score.
             query: Optional :class:`MemoryQuery` — multi-source, full-
                 fidelity retrieval query. When provided, takes precedence
                 over the ``messages``-derived query. Constructed at the
@@ -754,8 +745,7 @@ class MemoryHandler:
                 returned formatted block by tokens / entries / min
                 similarity. When ``None``, defaults are taken from
                 ``self.config`` so the existing top_k / min_similarity
-                contract is preserved. Both the no-ranker and the with-
-                ranker paths honour the same budget.
+                contract is preserved.
 
         Returns:
             Formatted context string, or None if no relevant memories.
@@ -848,71 +838,34 @@ class MemoryHandler:
                 )
                 return None
 
-            # Optional re-rank: when a MemoryRanker is provided, adapt
-            # results to MemoryCandidate, re-rank, then filter by
-            # ``budget.min_similarity`` on the BOOSTED score. The re-rank
-            # can promote a fresh weak-cosine memory above a stale
-            # strong-cosine one (RecencyBoostRanker default behaviour).
-            # Cap by ``budget.max_entries`` after filtering so the budget
-            # contract is honoured on both branches.
+            # Pure cosine + budget min_similarity floor.
             # Each rendered row carries the memory ID in [brackets] so
             # the model can address it directly via memory_update /
             # memory_delete without round-tripping through memory_search.
-            # Both branches below render the same `i. [id] content` shape
-            # so the format is stable regardless of whether a ranker is
-            # in play.
             selected_memory_ids: list[str] = []
-            if ranker is not None:
-                from headroom.proxy.memory_ranker import MemoryCandidate
+            filtered_results = [r for r in results if r.score >= effective_budget.min_similarity]
 
-                candidates = [MemoryCandidate.from_backend_result(r) for r in results]
-                ranked = ranker.rank(candidates)
-                # Filter on the post-rank score (the ranker may have
-                # boosted or attenuated original cosine values).
-                ranked = [c for c in ranked if c.score >= effective_budget.min_similarity]
-                if not ranked:
-                    logger.debug(
-                        f"Memory: {len(results)} memories found but none above threshold "
-                        f"{effective_budget.min_similarity} after re-rank"
-                    )
-                    return None
-                ranked = ranked[: effective_budget.max_entries]
-                memory_lines = []
-                for i, candidate in enumerate(ranked, 1):
-                    memory_id = candidate.id or "?"
-                    if candidate.id:
-                        selected_memory_ids.append(candidate.id)
-                    memory_lines.append(f"{i}. [{memory_id}] {candidate.content}")
-                    if candidate.related_entities:
-                        entities_str = ", ".join(candidate.related_entities[:3])
-                        memory_lines.append(f"   (Related: {entities_str})")
-            else:
-                # No ranker: pure cosine + budget min_similarity floor.
-                filtered_results = [
-                    r for r in results if r.score >= effective_budget.min_similarity
-                ]
+            if not filtered_results:
+                logger.debug(
+                    f"Memory: {len(results)} memories found but none above threshold "
+                    f"{effective_budget.min_similarity}"
+                )
+                return None
 
-                if not filtered_results:
-                    logger.debug(
-                        f"Memory: {len(results)} memories found but none above threshold "
-                        f"{effective_budget.min_similarity}"
-                    )
-                    return None
+            # Cap entry count via the budget (defence-in-depth —
+            # backend already gets top_k=max_entries but this enforces
+            # it on post-filter results too).
+            filtered_results = filtered_results[: effective_budget.max_entries]
 
-                # Cap entry count via the budget (defence-in-depth —
-                # backend already gets top_k=max_entries but this enforces
-                # it on post-filter results too).
-                filtered_results = filtered_results[: effective_budget.max_entries]
-
-                memory_lines = []
-                for i, result in enumerate(filtered_results, 1):
-                    memory_id = getattr(result.memory, "id", None) or "?"
-                    if memory_id != "?":
-                        selected_memory_ids.append(memory_id)
-                    memory_lines.append(f"{i}. [{memory_id}] {result.memory.content}")
-                    if hasattr(result, "related_entities") and result.related_entities:
-                        entities_str = ", ".join(result.related_entities[:3])
-                        memory_lines.append(f"   (Related: {entities_str})")
+            memory_lines = []
+            for i, result in enumerate(filtered_results, 1):
+                memory_id = getattr(result.memory, "id", None) or "?"
+                if memory_id != "?":
+                    selected_memory_ids.append(memory_id)
+                memory_lines.append(f"{i}. [{memory_id}] {result.memory.content}")
+                if hasattr(result, "related_entities") and result.related_entities:
+                    entities_str = ", ".join(result.related_entities[:3])
+                    memory_lines.append(f"   (Related: {entities_str})")
 
         except Exception as e:
             logger.warning(f"Memory: Search failed for user {effective_user_id}: {e}")
@@ -1616,269 +1569,6 @@ your responses, not to drive new actions."""
         except Exception as e:
             logger.error(f"Memory: Native tool error: {e}")
             return f"Error: {e}"
-
-    def _resolve_native_path(self, path: str, user_id: str) -> Path:
-        """Resolve path within user's memory directory safely.
-
-        Prevents path traversal attacks by ensuring path stays within
-        the user's memory directory.
-        """
-        assert self._native_memory_dir is not None
-
-        # User-scoped memory directory
-        user_dir = self._native_memory_dir / user_id
-        user_dir.mkdir(parents=True, exist_ok=True)
-
-        # Normalize path (remove /memories prefix if present)
-        if path.startswith("/memories"):
-            path = path[len("/memories") :]
-        if path.startswith("/"):
-            path = path[1:]
-
-        # Resolve and validate
-        resolved = (user_dir / path).resolve()
-
-        # Security: ensure path is within user directory
-        try:
-            resolved.relative_to(user_dir.resolve())
-        except ValueError:
-            raise ValueError(f"Path traversal detected: {path}") from None
-
-        return resolved
-
-    def _native_view(self, input_data: dict[str, Any], user_id: str) -> str:
-        """View directory contents or file contents."""
-        path = input_data.get("path", "/memories")
-        view_range = input_data.get("view_range")
-
-        resolved = self._resolve_native_path(path, user_id)
-
-        if not resolved.exists():
-            return f"The path {path} does not exist. Please provide a valid path."
-
-        if resolved.is_dir():
-            # List directory contents
-            lines = [
-                f"Here're the files and directories up to 2 levels deep in {path}, "
-                "excluding hidden items and node_modules:"
-            ]
-
-            def get_size(p: Path) -> str:
-                if p.is_file():
-                    size = p.stat().st_size
-                    if size < 1024:
-                        return f"{size}B"
-                    elif size < 1024 * 1024:
-                        return f"{size / 1024:.1f}K"
-                    else:
-                        return f"{size / (1024 * 1024):.1f}M"
-                return "4.0K"  # Default for directories
-
-            def list_recursive(p: Path, rel_path: str, depth: int) -> None:
-                if depth > 2:
-                    return
-                if p.name.startswith(".") or p.name == "node_modules":
-                    return
-
-                lines.append(f"{get_size(p)}\t{rel_path}")
-
-                if p.is_dir() and depth < 2:
-                    try:
-                        for child in sorted(p.iterdir()):
-                            child_rel = (
-                                f"{rel_path}/{child.name}"
-                                if rel_path != path
-                                else f"{path}/{child.name}"
-                            )
-                            list_recursive(child, child_rel, depth + 1)
-                    except PermissionError:
-                        pass
-
-            list_recursive(resolved, path, 0)
-            return "\n".join(lines)
-
-        else:
-            # Read file contents with line numbers
-            try:
-                content = resolved.read_text(encoding="utf-8")
-            except UnicodeDecodeError:
-                content = resolved.read_text(encoding="latin-1")
-
-            lines_content = content.split("\n")
-
-            if len(lines_content) > 999999:
-                return f"File {path} exceeds maximum line limit of 999,999 lines."
-
-            # Apply view_range if specified
-            start_line = 1
-            end_line = len(lines_content)
-            if view_range and len(view_range) >= 2:
-                start_line = max(1, view_range[0])
-                end_line = min(len(lines_content), view_range[1])
-
-            result_lines = [f"Here's the content of {path} with line numbers:"]
-            for i, line in enumerate(lines_content[start_line - 1 : end_line], start=start_line):
-                result_lines.append(f"{i:6d}\t{line}")
-
-            return "\n".join(result_lines)
-
-    def _native_create(self, input_data: dict[str, Any], user_id: str) -> str:
-        """Create a new file."""
-        path = input_data.get("path", "")
-        file_text = input_data.get("file_text", "")
-
-        if not path:
-            return "Error: path is required"
-
-        resolved = self._resolve_native_path(path, user_id)
-
-        if resolved.exists():
-            return f"Error: File {path} already exists"
-
-        # Create parent directories if needed
-        resolved.parent.mkdir(parents=True, exist_ok=True)
-
-        resolved.write_text(file_text, encoding="utf-8")
-        logger.info(f"Memory: Native create: {path} for user {user_id}")
-
-        return f"File created successfully at: {path}"
-
-    def _native_str_replace(self, input_data: dict[str, Any], user_id: str) -> str:
-        """Replace text in a file."""
-        path = input_data.get("path", "")
-        old_str = input_data.get("old_str", "")
-        new_str = input_data.get("new_str", "")
-
-        if not path:
-            return "Error: path is required"
-        if not old_str:
-            return "Error: old_str is required"
-
-        resolved = self._resolve_native_path(path, user_id)
-
-        if not resolved.exists():
-            return f"Error: The path {path} does not exist. Please provide a valid path."
-
-        if resolved.is_dir():
-            return f"Error: The path {path} does not exist. Please provide a valid path."
-
-        content = resolved.read_text(encoding="utf-8")
-
-        # Check for occurrences
-        occurrences = content.count(old_str)
-        if occurrences == 0:
-            return f"No replacement was performed, old_str `{old_str}` did not appear verbatim in {path}."
-        if occurrences > 1:
-            # Find line numbers
-            lines = content.split("\n")
-            found_lines = []
-            for i, line in enumerate(lines, 1):
-                if old_str in line:
-                    found_lines.append(str(i))
-            return (
-                f"No replacement was performed. Multiple occurrences of old_str `{old_str}` "
-                f"in lines: {', '.join(found_lines)}. Please ensure it is unique"
-            )
-
-        # Perform replacement
-        new_content = content.replace(old_str, new_str, 1)
-        resolved.write_text(new_content, encoding="utf-8")
-
-        # Show snippet around the change
-        lines = new_content.split("\n")
-        for i, line in enumerate(lines):
-            if new_str in line:
-                start = max(0, i - 2)
-                end = min(len(lines), i + 3)
-                snippet_lines = ["The memory file has been edited."]
-                for j in range(start, end):
-                    snippet_lines.append(f"{j + 1:6d}\t{lines[j]}")
-                return "\n".join(snippet_lines)
-
-        return "The memory file has been edited."
-
-    def _native_insert(self, input_data: dict[str, Any], user_id: str) -> str:
-        """Insert text at a specific line."""
-        path = input_data.get("path", "")
-        insert_line = input_data.get("insert_line", 0)
-        insert_text = input_data.get("insert_text", "")
-
-        if not path:
-            return "Error: path is required"
-
-        resolved = self._resolve_native_path(path, user_id)
-
-        if not resolved.exists():
-            return f"Error: The path {path} does not exist"
-
-        if resolved.is_dir():
-            return f"Error: The path {path} does not exist"
-
-        content = resolved.read_text(encoding="utf-8")
-        lines = content.split("\n")
-        n_lines = len(lines)
-
-        if insert_line < 0 or insert_line > n_lines:
-            return (
-                f"Error: Invalid `insert_line` parameter: {insert_line}. "
-                f"It should be within the range of lines of the file: [0, {n_lines}]"
-            )
-
-        # Insert at specified line
-        lines.insert(insert_line, insert_text.rstrip("\n"))
-
-        resolved.write_text("\n".join(lines), encoding="utf-8")
-
-        return f"The file {path} has been edited."
-
-    def _native_delete_file(self, input_data: dict[str, Any], user_id: str) -> str:
-        """Delete a file or directory."""
-        path = input_data.get("path", "")
-
-        if not path:
-            return "Error: path is required"
-
-        resolved = self._resolve_native_path(path, user_id)
-
-        if not resolved.exists():
-            return f"Error: The path {path} does not exist"
-
-        import shutil
-
-        if resolved.is_dir():
-            shutil.rmtree(resolved)
-        else:
-            resolved.unlink()
-
-        logger.info(f"Memory: Native delete: {path} for user {user_id}")
-        return f"Successfully deleted {path}"
-
-    def _native_rename(self, input_data: dict[str, Any], user_id: str) -> str:
-        """Rename or move a file/directory."""
-        old_path = input_data.get("old_path", "")
-        new_path = input_data.get("new_path", "")
-
-        if not old_path:
-            return "Error: old_path is required"
-        if not new_path:
-            return "Error: new_path is required"
-
-        resolved_old = self._resolve_native_path(old_path, user_id)
-        resolved_new = self._resolve_native_path(new_path, user_id)
-
-        if not resolved_old.exists():
-            return f"Error: The path {old_path} does not exist"
-
-        if resolved_new.exists():
-            return f"Error: The destination {new_path} already exists"
-
-        # Create parent directory if needed
-        resolved_new.parent.mkdir(parents=True, exist_ok=True)
-
-        resolved_old.rename(resolved_new)
-
-        logger.info(f"Memory: Native rename: {old_path} -> {new_path} for user {user_id}")
-        return f"Successfully renamed {old_path} to {new_path}"
 
     # =========================================================================
     # Semantic Translation Methods (Native Tool → Vector Store)

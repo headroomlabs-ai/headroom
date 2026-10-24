@@ -337,3 +337,29 @@ def test_server_side_state_means_incremental_input() -> None:
         savings_conversation_key(_responses_body("more", conversation={"id": "conv_abc"})) is None
     )
     assert savings_conversation_key({"model": "gpt-6-astra", "messages": []}) is None
+
+
+@pytest.mark.asyncio
+async def test_pipeline_extensions_read_both_figures_from_the_snapshot() -> None:
+    """An extension sees the wire figure and the novel share the totals book,
+    so it never has to parse PERF lines to tell re-sent history from new."""
+    from headroom.pipeline import PipelineExtensionManager, PipelineStage
+
+    seen: list[Any] = []
+
+    class _Recorder:
+        def on_pipeline_event(self, event: Any) -> None:
+            if event.stage is PipelineStage.OUTCOME_OBSERVED:
+                seen.append(event.outcome)
+
+    handler = _Handler()
+    handler.pipeline_extensions = PipelineExtensionManager(extensions=[_Recorder()], discover=False)
+    await emit_request_outcome(
+        handler, _responses_outcome(tokens_saved=62_806, conversation_tokens_saved=62_806)
+    )
+    await emit_request_outcome(handler, _responses_outcome())
+
+    assert [(s.tokens_saved, s.novel_tokens_saved) for s in seen] == [
+        (62_806, 62_806),
+        (76_020, 13_214),
+    ]

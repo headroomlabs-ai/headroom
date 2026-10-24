@@ -527,44 +527,34 @@ def install_supervisor(manifest: DeploymentManifest, *, start: bool = True) -> l
         records.append(ArtifactRecord(kind="plist", path=str(plist_path)))
         return records
 
-    if _is_windows() and manifest.supervisor_kind == SupervisorKind.SERVICE.value:
-        # sc.exe's binPath= value embeds its own quotes (cmd.exe /c "<path>").
-        # Passing this as an argv list lets subprocess.list2cmdline re-quote the
-        # token and sc.exe mis-tokenizes it (issue #1654), so build the exact
-        # command line ourselves and hand subprocess a string.
-        run_cmd = windows_run_cmd_path(manifest.profile)
-        create_cmd = (
-            f"sc.exe create {manifest.service_name} "
-            f'binPath= "cmd.exe /c \\"{run_cmd}\\"" start= auto'
-        )
-        subprocess.run(create_cmd, check=True)
-        subprocess.run(
-            ["sc.exe", "failure", manifest.service_name, "reset= 0", "actions= restart/5000"],
-            check=True,
-        )
-        records.append(ArtifactRecord(kind="windows-service", path=manifest.service_name))
-        return records
-
-    if _is_windows() and manifest.supervisor_kind == SupervisorKind.TASK.value:
+    if _is_windows() and manifest.supervisor_kind in (
+        SupervisorKind.SERVICE.value,
+        SupervisorKind.TASK.value,
+    ):
         startup_name = f"{manifest.service_name}-startup"
         health_name = f"{manifest.service_name}-health"
-        startup_cmd = str(windows_ensure_cmd_path(manifest.profile))
+        startup_cmd = str(
+            windows_run_cmd_path(manifest.profile)
+            if manifest.supervisor_kind == SupervisorKind.SERVICE.value
+            else windows_ensure_cmd_path(manifest.profile)
+        )
+        health_cmd = str(windows_ensure_cmd_path(manifest.profile))
         # Register from task XML (not schtasks flags) so the principal is S4U /
         # hidden — flag-created tasks use an interactive token and flash a
         # focus-stealing console on every run (issue #2453).
         preferred_logon_type = "ServiceAccount" if manifest.scope == "system" else "S4U"
         preferred_tasks = [
-            (startup_name, _windows_boot_trigger()),
-            (health_name, _windows_health_trigger()),
+            (startup_name, startup_cmd, _windows_boot_trigger()),
+            (health_name, health_cmd, _windows_health_trigger()),
         ]
         registered_preferred_tasks: list[str] = []
 
         try:
-            for name, trigger_xml in preferred_tasks:
+            for name, task_cmd, trigger_xml in preferred_tasks:
                 _register_windows_task(
                     name,
                     _windows_task_xml(
-                        startup_cmd,
+                        task_cmd,
                         trigger_xml=trigger_xml,
                         scope=manifest.scope,
                         logon_type=preferred_logon_type,
@@ -579,12 +569,13 @@ def install_supervisor(manifest: DeploymentManifest, *, start: bool = True) -> l
             if exc.task_created:
                 must_delete.add(name)
             _cleanup_windows_tasks_for_fallback(
-                [name for name, _trigger_xml in preferred_tasks], must_delete=must_delete
+                [name for name, _task_cmd, _trigger_xml in preferred_tasks],
+                must_delete=must_delete,
             )
             _register_windows_task(
                 health_name,
                 _windows_task_xml(
-                    startup_cmd,
+                    health_cmd,
                     trigger_xml=_windows_health_trigger(),
                     scope=manifest.scope,
                     logon_type="InteractiveToken",
@@ -652,8 +643,12 @@ def start_supervisor(manifest: DeploymentManifest) -> None:
         plist_path = plist_dir / f"{label}.plist"
         _bootstrap_with_retry(domain, plist_path, action="start")
         return
-    if _is_windows() and manifest.supervisor_kind == SupervisorKind.SERVICE.value:
-        subprocess.run(["sc.exe", "start", manifest.service_name], check=True)
+    if _is_windows():
+        subprocess.run(
+            ["schtasks", "/Change", "/TN", f"{manifest.service_name}-health", "/ENABLE"],
+            check=True,
+        )
+        subprocess.run(["schtasks", "/Run", "/TN", f"{manifest.service_name}-startup"], check=True)
 
 
 def stop_supervisor(manifest: DeploymentManifest) -> None:
@@ -691,8 +686,11 @@ def stop_supervisor(manifest: DeploymentManifest) -> None:
                 f"launchctl bootout failed for {domain}/{label}: {detail or 'unknown error'}"
             )
         return
-    if _is_windows() and manifest.supervisor_kind == SupervisorKind.SERVICE.value:
-        subprocess.run(["sc.exe", "stop", manifest.service_name], check=True)
+    if _is_windows():
+        health = f"{manifest.service_name}-health"
+        subprocess.run(["schtasks", "/Change", "/TN", health, "/DISABLE"], check=True)
+        subprocess.run(["schtasks", "/End", "/TN", health], check=False)
+        subprocess.run(["schtasks", "/End", "/TN", f"{manifest.service_name}-startup"], check=True)
 
 
 def remove_supervisor(manifest: DeploymentManifest) -> None:
@@ -772,32 +770,23 @@ def remove_supervisor(manifest: DeploymentManifest) -> None:
         return
 
     if _is_windows():
-        if manifest.supervisor_kind == SupervisorKind.SERVICE.value:
+        # Both presets are task-backed. Remove any legacy SCM service too,
+        # but do not hide a permission failure behind best-effort cleanup.
+        result = run(["sc.exe", "stop", manifest.service_name], capture_output=True, text=True)
+        _require_removal_success(result, "sc.exe stop", absent_codes={1060, 1062})
+        result = run(["sc.exe", "delete", manifest.service_name], capture_output=True, text=True)
+        _require_removal_success(result, "sc.exe delete", absent_codes={1060})
+        for suffix in ("startup", "health"):
             result = run(
-                ["sc.exe", "stop", manifest.service_name],
+                ["schtasks", "/Delete", "/TN", f"{manifest.service_name}-{suffix}", "/F"],
                 capture_output=True,
                 text=True,
             )
-            _require_removal_success(result, "sc.exe stop", absent_text="does not exist")
-            result = run(
-                ["sc.exe", "delete", manifest.service_name],
-                capture_output=True,
-                text=True,
+            _require_removal_success(
+                result,
+                f"schtasks {suffix} delete",
+                absent_text="cannot find the file specified",
             )
-            _require_removal_success(result, "sc.exe delete", absent_text="does not exist")
-            return
-        result = run(
-            ["schtasks", "/Delete", "/TN", f"{manifest.service_name}-startup", "/F"],
-            capture_output=True,
-            text=True,
-        )
-        _require_removal_success(result, "schtasks startup delete", absent_text="does not exist")
-        result = run(
-            ["schtasks", "/Delete", "/TN", f"{manifest.service_name}-health", "/F"],
-            capture_output=True,
-            text=True,
-        )
-        _require_removal_success(result, "schtasks health delete", absent_text="does not exist")
 
 
 def _result_text(result: object) -> str:

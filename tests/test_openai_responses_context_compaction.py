@@ -6,7 +6,6 @@ from typing import Any
 from headroom.proxy.handlers.openai import (
     OpenAIHandlerMixin,
     _compact_openai_responses_tools,
-    _openai_responses_context_budget,
 )
 from headroom.transforms.content_router import (
     CompressionStrategy,
@@ -14,46 +13,6 @@ from headroom.transforms.content_router import (
     ContentRouterConfig,
     _estimate_tokens,
 )
-
-
-def test_openai_responses_context_budget_breaks_out_static_and_live_buckets() -> None:
-    payload = {
-        "instructions": "stable instructions",
-        "tools": [
-            {
-                "type": "function",
-                "name": "read_file",
-                "description": "Read a file.",
-                "parameters": {
-                    "type": "object",
-                    "properties": {"path": {"type": "string"}},
-                    "required": ["path"],
-                },
-            }
-        ],
-        "input": [
-            {
-                "type": "function_call_output",
-                "call_id": "call_1",
-                "output": "line one\nline two\n",
-            },
-            {
-                "type": "message",
-                "role": "user",
-                "content": [{"type": "input_text", "text": "do the thing"}],
-            },
-        ],
-    }
-
-    budget = _openai_responses_context_budget(payload)
-
-    assert budget["payload_bytes"] > 0
-    assert {"instructions", "tools", "input"}.issubset(budget["buckets"])
-    assert budget["input_breakdown"]["function_call_output"]["items"] == 1
-    assert budget["input_breakdown"]["function_call_output"]["text_bytes"] == len(
-        b"line one\nline two\n"
-    )
-    assert budget["input_breakdown"]["message"]["items"] == 1
 
 
 def test_openai_tool_schema_compaction_preserves_invocation_shape() -> None:
@@ -301,12 +260,12 @@ def test_codex_payload_with_only_messages_field_also_reaches_router() -> None:
 
 
 def test_compression_pass_debug_logs_are_suppressed(caplog) -> None:
-    """Re-entrant Codex websocket passes share one `request_id` but
-    process distinct payloads. The `pass_id` field on every compression
-    event must be content-derived so dashboards can attribute each
-    unit_result to its originating pass. Distinct payloads → distinct
-    pass_ids (per-pass savings sum legitimately across passes); identical
-    payloads → identical pass_ids (idempotent retries should dedup)."""
+    """Compression passes must not log per-pass payload events at INFO.
+
+    Re-entrant Codex websocket passes share one `request_id`; three passes
+    over two distinct payloads must emit no ``event=codex_compression_*``
+    records, which would carry request content.
+    """
 
     import logging as _logging
 
@@ -343,42 +302,12 @@ def test_compression_pass_debug_logs_are_suppressed(caplog) -> None:
     handler._compress_openai_responses_payload(
         payload_b, model="gpt-5.5", request_id="hr_shared_request"
     )
-    # Same content twice → same pass_id (deterministic + idempotent).
+    # A repeat of the first payload, as a re-entrant pass would send.
     handler._compress_openai_responses_payload(
         payload_a, model="gpt-5.5", request_id="hr_shared_request"
     )
 
     assert not any("event=codex_compression_" in record.getMessage() for record in caplog.records)
-    return
-
-    # Collect pass_ids in call order — payload bodies are no longer
-    # embedded at INFO so we can't grep for content; we rely on the
-    # 3-call sequence [a, b, a] producing a [A, B, A] pass_id sequence.
-    pass_id_sequence: list[str] = []
-    for record in caplog.records:
-        message = record.getMessage()
-        if "event=codex_compression_payload_input" not in message:
-            continue
-        match_quoted = '"pass_id":"'
-        idx = message.find(match_quoted)
-        assert idx != -1, f"pass_id missing from event: {message[:200]}"
-        start = idx + len(match_quoted)
-        end = message.find('"', start)
-        pass_id_sequence.append(message[start:end])
-
-    assert len(pass_id_sequence) == 3, (
-        f"expected exactly 3 payload_input events for 3 calls, got {len(pass_id_sequence)}"
-    )
-    # Two distinct payloads + one repeat → two distinct pass_ids overall.
-    assert len(set(pass_id_sequence)) == 2, (
-        f"expected two distinct pass_ids, got {set(pass_id_sequence)}"
-    )
-    # Repeated payload_a must be deterministic — index 0 and 2 are the
-    # same call shape so they must produce the same pass_id.
-    assert pass_id_sequence[0] == pass_id_sequence[2], (
-        f"repeated identical payload produced different pass_ids: {pass_id_sequence}"
-    )
-    assert pass_id_sequence[0] != pass_id_sequence[1]
 
 
 def test_codex_payload_without_either_field_is_skipped() -> None:

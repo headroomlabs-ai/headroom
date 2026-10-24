@@ -136,6 +136,32 @@ class TestLongContextPricing:
         )
         assert cost == pytest.approx(expected, rel=1e-4)
 
+    def test_premium_survives_litellm_dropping_the_long_context_rate(self, provider, monkeypatch):
+        """A LiteLLM entry without the above-200K rate must not bill a long prompt at the base tier."""
+        litellm = pytest.importorskip("litellm")
+        import headroom.providers.anthropic as anthropic_module
+
+        # One map for both readers: the guard and litellm's own cost_per_token.
+        monkeypatch.setitem(
+            litellm.model_cost,
+            "claude-sonnet-4-5",
+            {
+                "litellm_provider": "anthropic",
+                "mode": "chat",
+                "input_cost_per_token": 3e-06,
+                "output_cost_per_token": 1.5e-05,
+                "cache_read_input_token_cost": 3e-07,
+            },
+        )
+
+        assert provider.estimate_cost(300_000, 5_000, "claude-sonnet-4-5", 0) == pytest.approx(
+            1.9125, rel=1e-4
+        )
+        # Below the threshold the LiteLLM path still prices it.
+        assert (
+            anthropic_module._litellm_lacks_long_context_rate("claude-sonnet-4-5", 100_000) is False
+        )
+
     def test_untiered_model_is_not_charged_a_premium(self, manual_provider):
         # Opus is flat-rated across its whole window: 300K*$5 + 5K*$25 = $1.625.
         cost = manual_provider.estimate_cost(300_000, 5_000, "claude-opus-4-5-20251101", 0)

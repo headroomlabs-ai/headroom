@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 import json
+import logging
+import os
+import stat
 from pathlib import Path
 
 import pytest
@@ -90,7 +93,7 @@ def test_recovery_manifest_preserves_mutations_and_artifacts(monkeypatch, tmp_pa
     assert not recovery.exists()
 
 
-def test_list_manifests_ignores_invalid_payloads(monkeypatch, tmp_path: Path) -> None:
+def test_list_manifests_ignores_invalid_payloads(monkeypatch, tmp_path: Path, caplog) -> None:
     monkeypatch.setattr(Path, "home", lambda: tmp_path)
     valid = _manifest()
     save_manifest(valid)
@@ -99,9 +102,67 @@ def test_list_manifests_ignores_invalid_payloads(monkeypatch, tmp_path: Path) ->
     broken_dir.mkdir(parents=True)
     (broken_dir / "manifest.json").write_text("{not json", encoding="utf-8")
 
-    manifests = list_manifests()
+    with caplog.at_level(logging.WARNING, logger="headroom.install.state"):
+        manifests = list_manifests()
 
     assert [manifest.profile for manifest in manifests] == ["default"]
+    warnings = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
+    assert any(str(broken_dir / "manifest.json") in message for message in warnings)
+    assert not any(str(tmp_path / ".headroom" / "deploy" / "default") in m for m in warnings)
+
+
+def _broken_profile(tmp_path: Path, name: str) -> Path:
+    path = tmp_path / ".headroom" / "deploy" / name / "manifest.json"
+    path.parent.mkdir(parents=True)
+    return path
+
+
+def test_unreadable_and_malformed_manifests_get_distinct_messages(
+    monkeypatch, tmp_path: Path, caplog
+) -> None:
+    """A read failure must not be reported as corruption: the fix differs."""
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    malformed = _broken_profile(tmp_path, "malformed")
+    malformed.write_text("{not json", encoding="utf-8")
+    unreadable = _broken_profile(tmp_path, "unreadable")
+    unreadable.write_text(json.dumps({"profile": "unreadable"}), encoding="utf-8")
+
+    real_read_text = Path.read_text
+
+    def read_text(self: Path, *args, **kwargs) -> str:
+        if self == unreadable:
+            raise PermissionError(13, "Permission denied", str(self))
+        return real_read_text(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "read_text", read_text)
+
+    with caplog.at_level(logging.WARNING, logger="headroom.install.state"):
+        assert list_manifests() == []
+    messages = [r.getMessage() for r in caplog.records if r.name == "headroom.install.state"]
+    assert len(messages) == 2
+    corrupt = next(m for m in messages if str(malformed) in m)
+    unread = next(m for m in messages if str(unreadable) in m)
+    assert corrupt.startswith("Skipping corrupt deployment manifest")
+    assert unread.startswith("Skipping unreadable deployment manifest")
+    assert "Permission denied" in unread and "permissions" in unread
+
+    with pytest.raises(ManifestError, match="is corrupt"):
+        load_manifest("malformed")
+    with pytest.raises(ManifestError, match="could not be read .*Permission denied"):
+        load_manifest("unreadable")
+
+
+@pytest.mark.skipif(os.name != "posix", reason="mode bits decide access only on POSIX")
+def test_save_manifest_keeps_manifest_owner_only(monkeypatch, tmp_path: Path) -> None:
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    save_manifest(_manifest())
+    path = tmp_path / ".headroom" / "deploy" / "default" / "manifest.json"
+    assert stat.S_IMODE(path.stat().st_mode) == 0o600
+
+    # A manifest left group/world-readable is tightened on the next save.
+    path.chmod(0o644)
+    save_manifest(_manifest())
+    assert stat.S_IMODE(path.stat().st_mode) == 0o600
 
 
 def _write_manifest_with_image(profile_dir: Path, image: str) -> None:

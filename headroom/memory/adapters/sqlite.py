@@ -13,6 +13,7 @@ import contextlib
 import json
 import re
 import sqlite3
+import warnings
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -878,9 +879,19 @@ class SQLiteMemoryStore:
     def count_sync(self) -> int:
         """Synchronous count of all memories (for diagnostics).
 
+        .. deprecated::
+            Nothing in Headroom calls this. Use the async
+            ``count(MemoryFilter(include_superseded=True))`` instead.
+
         Returns:
             Total number of memories in the store.
         """
+        warnings.warn(
+            "SQLiteMemoryStore.count_sync is deprecated and will be removed in a future "
+            "release; use the async count(MemoryFilter(include_superseded=True)) instead.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
         with self._get_conn() as conn:
             cursor = conn.execute("SELECT COUNT(*) FROM memories")
             result = cursor.fetchone()[0]

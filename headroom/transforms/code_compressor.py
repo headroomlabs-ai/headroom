@@ -774,56 +774,63 @@ class CodeCompressionResult:
 # Lightweight pre-filter patterns for language detection.
 # These are ONLY used as a quick check to avoid parsing with every language.
 # Actual detection is done by tree-sitter (fewest parse errors wins).
+#
+# Leading indentation is ``[^\S\n]*`` (whitespace except newline), not
+# ``\s*``. With MULTILINE, ``^\s*`` lets every line start scan through all
+# the blank lines that follow it, so a run of n blank lines costs O(n^2)
+# and holds the GIL for seconds. Stopping at the newline keeps each attempt
+# on its own line; the match count is unchanged because the same keyword is
+# still matched from the start of its own line.
 _LANGUAGE_PREFILTER: dict[CodeLanguage, list[re.Pattern[str]]] = {
     CodeLanguage.PYTHON: [
-        re.compile(r"^\s*(def|class|import|from|async def)\s+\w+", re.MULTILINE),
-        re.compile(r"^\s*@\w+", re.MULTILINE),
-        re.compile(r'^\s*"""', re.MULTILINE),
-        re.compile(r"^\s*if __name__\s*==", re.MULTILINE),
+        re.compile(r"^[^\S\n]*(def|class|import|from|async def)\s+\w+", re.MULTILINE),
+        re.compile(r"^[^\S\n]*@\w+", re.MULTILINE),
+        re.compile(r'^[^\S\n]*"""', re.MULTILINE),
+        re.compile(r"^[^\S\n]*if __name__\s*==", re.MULTILINE),
     ],
     CodeLanguage.JAVASCRIPT: [
-        re.compile(r"^\s*(function|const|let|var|class|export)\s+\w+", re.MULTILINE),
-        re.compile(r"^\s*async\s+(function|=>)", re.MULTILINE),
-        re.compile(r"^\s*module\.exports", re.MULTILINE),
-        re.compile(r"^\s*(import|export)\s+.*\s+from\s+['\"]", re.MULTILINE),
+        re.compile(r"^[^\S\n]*(function|const|let|var|class|export)\s+\w+", re.MULTILINE),
+        re.compile(r"^[^\S\n]*async\s+(function|=>)", re.MULTILINE),
+        re.compile(r"^[^\S\n]*module\.exports", re.MULTILINE),
+        re.compile(r"^[^\S\n]*(import|export)\s+.*\s+from\s+['\"]", re.MULTILINE),
     ],
     CodeLanguage.TYPESCRIPT: [
-        re.compile(r"^\s*(interface|type|enum|namespace)\s+\w+", re.MULTILINE),
+        re.compile(r"^[^\S\n]*(interface|type|enum|namespace)\s+\w+", re.MULTILINE),
         re.compile(r":\s*(string|number|boolean|any|void|Promise)\b", re.MULTILINE),
     ],
     CodeLanguage.GO: [
-        re.compile(r"^\s*(func|type|package|import)\s+", re.MULTILINE),
-        re.compile(r"^\s*func\s+\([^)]+\)\s+\w+", re.MULTILINE),
+        re.compile(r"^[^\S\n]*(func|type|package|import)\s+", re.MULTILINE),
+        re.compile(r"^[^\S\n]*func\s+\([^)]+\)\s+\w+", re.MULTILINE),
         re.compile(r"\bstruct\s*\{", re.MULTILINE),
     ],
     CodeLanguage.RUST: [
-        re.compile(r"^\s*(fn|struct|enum|impl|mod|use|pub)\s+", re.MULTILINE),
-        re.compile(r"^\s*#\[", re.MULTILINE),
+        re.compile(r"^[^\S\n]*(fn|struct|enum|impl|mod|use|pub)\s+", re.MULTILINE),
+        re.compile(r"^[^\S\n]*#\[", re.MULTILINE),
     ],
     CodeLanguage.JAVA: [
-        re.compile(r"^\s*(public|private|protected)\s+(class|interface|enum)", re.MULTILINE),
-        re.compile(r"^\s*package\s+[\w.]+;", re.MULTILINE),
+        re.compile(r"^[^\S\n]*(public|private|protected)\s+(class|interface|enum)", re.MULTILINE),
+        re.compile(r"^[^\S\n]*package\s+[\w.]+;", re.MULTILINE),
     ],
     CodeLanguage.C: [
-        re.compile(r"^\s*#include\s*[<\"]", re.MULTILINE),
-        re.compile(r"^\s*(int|void|char|float|double)\s+\w+\s*\(", re.MULTILINE),
-        re.compile(r"^\s*typedef\s+", re.MULTILINE),
+        re.compile(r"^[^\S\n]*#include\s*[<\"]", re.MULTILINE),
+        re.compile(r"^[^\S\n]*(int|void|char|float|double)\s+\w+\s*\(", re.MULTILINE),
+        re.compile(r"^[^\S\n]*typedef\s+", re.MULTILINE),
     ],
     CodeLanguage.CPP: [
-        re.compile(r"^\s*#include\s*[<\"]", re.MULTILINE),
+        re.compile(r"^[^\S\n]*#include\s*[<\"]", re.MULTILINE),
         re.compile(r"\bnamespace\s+\w+", re.MULTILINE),
         re.compile(r"::\w+", re.MULTILINE),
     ],
     CodeLanguage.PERL: [
-        re.compile(r"^\s*(sub|package|use|require)\s+[\w:]+", re.MULTILINE),
-        re.compile(r"^\s*(my|our|local)\s+[\$@%]", re.MULTILINE),
+        re.compile(r"^[^\S\n]*(sub|package|use|require)\s+[\w:]+", re.MULTILINE),
+        re.compile(r"^[^\S\n]*(my|our|local)\s+[\$@%]", re.MULTILINE),
         re.compile(r"[\$@%]\w+", re.MULTILINE),
     ],
     CodeLanguage.CSHARP: [
-        re.compile(r"^\s*using\s+[\w.]+\s*;", re.MULTILINE),
-        re.compile(r"^\s*namespace\s+[\w.]+", re.MULTILINE),
+        re.compile(r"^[^\S\n]*using\s+[\w.]+\s*;", re.MULTILINE),
+        re.compile(r"^[^\S\n]*namespace\s+[\w.]+", re.MULTILINE),
         re.compile(
-            r"^\s*(public|private|protected|internal|sealed|static|abstract|partial)\s+"
+            r"^[^\S\n]*(public|private|protected|internal|sealed|static|abstract|partial)\s+"
             r"(class|struct|record|interface|enum)\b",
             re.MULTILINE,
         ),
@@ -831,22 +838,26 @@ _LANGUAGE_PREFILTER: dict[CodeLanguage, list[re.Pattern[str]]] = {
     ],
     CodeLanguage.PHP: [
         re.compile(r"<\?php\b"),
-        re.compile(r"^\s*namespace\s+[\w\\]+\s*;", re.MULTILINE),
-        re.compile(r"^\s*use\s+[\w\\]+(\s+as\s+\w+)?\s*;", re.MULTILINE),
+        re.compile(r"^[^\S\n]*namespace\s+[\w\\]+\s*;", re.MULTILINE),
+        re.compile(r"^[^\S\n]*use\s+[\w\\]+(\s+as\s+\w+)?\s*;", re.MULTILINE),
+        # The modifier carries its own trailing gap. As ``^\s*(mod)?\s*``,
+        # two adjacent gaps could split the same run of whitespace every
+        # possible way: cubic on blank runs, quadratic on one long indent.
         re.compile(
-            r"^\s*(public|private|protected|static|abstract|final)?\s*function\s+\w+\s*\(",
+            r"^[^\S\n]*(?:(public|private|protected|static|abstract|final)[^\S\n]*)?"
+            r"function\s+\w+\s*\(",
             re.MULTILINE,
         ),
         re.compile(r"\$this->|->\w+\s*\(", re.MULTILINE),
     ],
     CodeLanguage.BASH: [
-        re.compile(r"^\s*#!.*\b(?:bash|sh|zsh)\b", re.MULTILINE),
+        re.compile(r"^[^\S\n]*#!.*\b(?:bash|sh|zsh)\b", re.MULTILINE),
         re.compile(
-            r"^\s*(?:if|then|elif|else|fi|for|while|until|do|done|case|esac|select)\b",
+            r"^[^\S\n]*(?:if|then|elif|else|fi|for|while|until|do|done|case|esac|select)\b",
             re.MULTILINE,
         ),
         re.compile(
-            r"^\s*(?:export|source|shopt|declare|local|alias|set|readonly|typeset)\b",
+            r"^[^\S\n]*(?:export|source|shopt|declare|local|alias|set|readonly|typeset)\b",
             re.MULTILINE,
         ),
         re.compile(r"\[\[.*\]\]|\$\{[^}]+\}|\$\([^)]+\)", re.MULTILINE),
@@ -2686,33 +2697,3 @@ def _has_syntax_issues(node: Any) -> bool:
         if _has_syntax_issues(child):
             return True
     return False
-
-
-def compress_code(
-    code: str,
-    language: str | None = None,
-    target_rate: float = 0.2,
-    context: str = "",
-) -> str:
-    """Convenience function for one-off code compression.
-
-    Args:
-        code: Source code to compress.
-        language: Language hint (auto-detected if None).
-        target_rate: Target compression rate (0.2 = keep 20%).
-        context: Optional context for relevance.
-
-    Returns:
-        Compressed code string.
-
-    Example:
-        >>> compressed = compress_code(large_python_file)
-        >>> print(compressed)  # Valid Python code
-    """
-    config = CodeCompressorConfig(
-        target_compression_rate=target_rate,
-        language_hint=language,
-    )
-    compressor = CodeAwareCompressor(config)
-    result = compressor.compress(code, language=language, context=context)
-    return result.compressed
