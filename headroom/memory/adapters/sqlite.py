@@ -67,6 +67,12 @@ class SQLiteMemoryStore:
     Schema:
         The memories table stores all Memory fields with appropriate indexes
         for efficient querying by scope, category, importance, and time.
+
+    Metadata filters:
+        Numbers and booleans use native SQLite equality. String filters match only
+        JSON text values. None matches an explicit JSON null,
+        not a missing key. Arrays and objects compare as compact JSON text with
+        matching JSON types; array order and object member order are significant.
     """
 
     def __init__(self, db_path: str | Path = "headroom_memory.db") -> None:
@@ -571,13 +577,22 @@ class SQLiteMemoryStore:
                 # equates ``5 = '5'`` — so an int/float/bool metadata filter matched
                 # nothing. ``bool`` is a subclass of ``int``, so it is covered here
                 # (a JSON ``true`` extracts to 1, and Python ``True`` binds to 1).
-                # A non-scalar value (dict/list) is not a bindable SQLite type, so it
-                # keeps the JSON-text comparison rather than raising.
-                conditions.append(f"json_extract(metadata, '$.{key}') = ?")
-                if isinstance(value, (str, int, float)):
+                if value is None:
+                    # json_extract returns SQL NULL for both null and missing keys.
+                    conditions.append(f"json_type(metadata, '$.{key}') = 'null'")
+                elif isinstance(value, (str, int, float)):
+                    if isinstance(value, str):
+                        # Extracted JSON arrays/objects are also SQL text.
+                        conditions.append(f"json_type(metadata, '$.{key}') = 'text'")
+                    conditions.append(f"json_extract(metadata, '$.{key}') = ?")
                     params.append(value)
                 else:
-                    params.append(json.dumps(value))
+                    # Normalize whitespace like json_extract does for arrays/objects,
+                    # and do not match a string containing the same JSON text.
+                    encoded = json.dumps(value)
+                    conditions.append(f"json_type(metadata, '$.{key}') = json_type(?)")
+                    conditions.append(f"json_extract(metadata, '$.{key}') = json(?)")
+                    params.extend([encoded, encoded])
 
         return conditions, params
 
