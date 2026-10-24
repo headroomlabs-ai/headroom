@@ -6,9 +6,8 @@
 //! All network-free: [`hub_cache_dir`] picks the one cache directory Python
 //! would use, [`snapshot_path`] resolves a repo at a revision inside it,
 //! [`hf_token`] finds the access token and [`hub_api`] builds a client from
-//! them. One known divergence: an empty variable counts as unset here, where
-//! Python would take it as a path relative to the working directory (see
-//! [`hub_cache_dir`]). The pinned revisions themselves live
+//! them. A path variable that is set but empty counts as set, as in Python
+//! (see [`hub_cache_dir`]). The pinned revisions themselves live
 //! next to each loader and are kept equal to `_PINNED_REVISIONS` in
 //! `headroom/onnx_runtime.py` by tests on the Python side.
 //!
@@ -74,8 +73,10 @@ pub(crate) fn snapshot_path(cache: &Path, repo: &str, revision: &str) -> PathBuf
 /// a `~` that only appears once a variable is expanded stays literal, as it
 /// does in Python. The home directory comes from `std::env::home_dir`, which
 /// falls back to the user database when `HOME` is unset, as `expanduser`
-/// does. An empty variable counts as unset; Python would treat it as a path
-/// relative to the working directory. `tests/parity/fixtures/hf_hub_cache/`
+/// does. A variable that is set but empty still counts, as with `os.getenv`:
+/// `HF_HUB_CACHE=''` is the working directory itself, `HF_HOME=''` is `hub`
+/// and `XDG_CACHE_HOME=''` is `huggingface/hub` under it, and none of them
+/// falls through to a lower-priority cache. `tests/parity/fixtures/hf_hub_cache/`
 /// holds the cases both languages are checked against.
 pub(crate) fn hub_cache_dir() -> Option<PathBuf> {
     let hub = match env_path("HF_HUB_CACHE").or_else(|| env_path("HUGGINGFACE_HUB_CACHE")) {
@@ -219,11 +220,10 @@ fn sends_in_clear_text(endpoint: &str) -> bool {
     !loopback
 }
 
-/// A path-valued variable; an empty one counts as unset.
+/// A path-valued variable. An empty one is still set, as `os.getenv` reads
+/// it, so it never falls through to the next variable.
 fn env_path(name: &str) -> Option<PathBuf> {
-    std::env::var_os(name)
-        .filter(|v| !v.is_empty())
-        .map(PathBuf::from)
+    std::env::var_os(name).map(PathBuf::from)
 }
 
 /// `expandvars(expanduser(path))`, the order `huggingface_hub.constants` uses.
@@ -472,10 +472,38 @@ pub(crate) mod tests {
             Some(p("home").join(".cache").join("huggingface").join("hub"))
         );
 
-        // An empty variable counts as unset, and a leading `~` expands.
-        std::env::set_var("HF_HUB_CACHE", "");
+        // A leading `~` expands.
         std::env::set_var("HF_HOME", "~/models");
         assert_eq!(hub_cache_dir(), Some(p("home").join("models").join("hub")));
+
+        // A set but empty variable is the working directory, as in Python,
+        // and still wins over every variable after it.
+        std::env::set_var("HF_HUB_CACHE", "");
+        assert_eq!(hub_cache_dir(), Some(PathBuf::new()));
+        std::env::remove_var("HF_HUB_CACHE");
+        std::env::set_var("HF_HOME", "");
+        std::env::set_var("XDG_CACHE_HOME", p("xdg"));
+        assert_eq!(hub_cache_dir(), Some(PathBuf::from("hub")));
+    }
+
+    /// An empty `HF_TOKEN_PATH` names no readable file, so there is no token;
+    /// it must not fall back to `HF_HOME/token`. Python's `get_token()` raises
+    /// `IsADirectoryError` here (it reads `.`), so this case is Rust-only
+    /// rather than in the shared fixture.
+    #[test]
+    fn an_empty_hf_token_path_does_not_fall_back_to_hf_home() {
+        let _guard = crate::test_support::env_lock();
+        let _env = CacheEnv::cleared_with(
+            ["HF_TOKEN", "HUGGING_FACE_HUB_TOKEN", "HF_TOKEN_PATH"].map(String::from),
+        );
+        let hf_home = tempfile::tempdir().unwrap();
+        std::fs::write(hf_home.path().join("token"), "hf_from_home\n").unwrap();
+        std::env::set_var("HF_HOME", hf_home.path());
+
+        std::env::remove_var("HF_TOKEN_PATH");
+        assert_eq!(hf_token().as_deref(), Some("hf_from_home"));
+        std::env::set_var("HF_TOKEN_PATH", "");
+        assert_eq!(hf_token(), None);
     }
 
     /// Cases checked against Python itself (`posixpath`, `ntpath` and
