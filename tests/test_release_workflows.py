@@ -156,6 +156,31 @@ def test_every_published_docker_variant_includes_bedrock_auth_dependencies() -> 
     assert {"boto3", "botocore"} <= bedrock_names
 
 
+def test_root_docker_bake_targets_pass_runtime_home_root() -> None:
+    """Root image variants must declare the volume/workdir under ``/root`` (#4443).
+
+    ``RUNTIME_HOME`` defaults to ``/home/nonroot`` in the Dockerfile, so a bake
+    target with ``RUNTIME_USER = "root"`` that omits it ships an image whose
+    VOLUME and WORKDIR are ``/home/nonroot`` while the process runs with
+    ``HOME=/root``; ``~/.headroom`` then lands in the container layer.
+    """
+    bake = (ROOT / "docker-bake.hcl").read_text(encoding="utf-8")
+    blocks = re.findall(r'^target "([^"]+)" \{\n(.*?)^\}', bake, flags=re.S | re.M)
+    root_targets = {
+        name: body for name, body in blocks if re.search(r'RUNTIME_USER\s*=\s*"root"', body)
+    }
+    assert set(root_targets) == {"runtime", "runtime-code", "runtime-slim", "runtime-code-slim"}
+    missing = [
+        name
+        for name, body in root_targets.items()
+        if not re.search(r'RUNTIME_HOME\s*=\s*"/root"', body)
+    ]
+    assert not missing, f"root bake targets without RUNTIME_HOME=/root: {missing}"
+    for name, body in blocks:
+        if re.search(r'RUNTIME_USER\s*=\s*"nonroot"', body):
+            assert "RUNTIME_HOME" not in body or "/home/nonroot" in body, name
+
+
 def test_public_docker_instructions_use_the_current_organization_package() -> None:
     """Do not send users back to the personal GHCR package frozen at 0.27.0."""
     public_docs = (
