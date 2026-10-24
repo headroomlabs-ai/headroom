@@ -1987,7 +1987,7 @@ requires-dist = [
     { name = "strands-agents", marker = "extra == 'strands'", specifier = ">=0.1.0" },
     { name = "tiktoken", specifier = ">=0.5.0" },
     { name = "tomli", marker = "python_full_version < '3.11'", specifier = ">=2.0.0" },
-    { name = "tomlkit", specifier = ">=0.13.0,<1.0" },
+    { name = "tomlkit", specifier = ">=0.15.0,<1.0" },
     { name = "torch", marker = "sys_platform == 'darwin' and extra == 'pytorch-mps'", specifier = ">=2.12.1" },
     { name = "torch", marker = "(platform_machine != 'x86_64' and extra == 'ml') or (sys_platform != 'darwin' and extra == 'ml')", specifier = ">=2.12.1" },
     { name = "torch", marker = "(platform_machine != 'x86_64' and extra == 'voice') or (sys_platform != 'darwin' and extra == 'voice')", specifier = ">=2.12.1" },
