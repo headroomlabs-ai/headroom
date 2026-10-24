@@ -320,6 +320,7 @@ Fine-grained control over what gets compressed and how hard. Most users pick a [
 | `--mode` / `HEADROOM_MODE` | `cache` | `cache` compresses only the newest delta (prefix-cache safe); `token` maximizes removal. |
 | `--target-ratio` / `HEADROOM_TARGET_RATIO` | unset | Keep-ratio for ML text compression; lower = more aggressive (e.g. `0.10`). |
 | `HEADROOM_MIN_TOKENS` | `500` | Minimum block size before a tool output is compressed. |
+| `HEADROOM_SHELL_RESULT_MIN_CHARS` | `2000` | Shell tool results shorter than this many characters bypass lossy compression. For top-level text blocks, the threshold uses their combined text length. Byte-lossless folds such as search grouping may still apply. Applies to `bash`, `shell`, `local_shell`, and aliases such as `run_shell_command`/`execute_command`; set `0` to restore lossy compression. |
 | `HEADROOM_COMPRESS_USER_MESSAGES` | profile | Compress text inside user-role messages. The `coding` profile turns this on; set `0` to keep user text verbatim under it. Anthropic `tool_result` blocks compress either way. No `--compress-user-messages` flag on `headroom proxy`; the direct module entry point (`python -m headroom.proxy.server`) does accept one. |
 | `HEADROOM_COMPRESS_SYSTEM_MESSAGES` | unset | Compress system prompts. Off by default to keep the hottest cache prefix stable. |
 | `HEADROOM_PROTECT_RECENT` | profile | Never compress the N most recent turns. |

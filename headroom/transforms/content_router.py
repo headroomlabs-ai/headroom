@@ -2113,6 +2113,30 @@ def _is_small_mcp_result(tool_name: Any, text: Any) -> bool:
     )
 
 
+def _shell_result_min_chars() -> int:
+    """Below this many characters a shell tool result is never lossily compressed."""
+    try:
+        return max(0, int(os.environ.get("HEADROOM_SHELL_RESULT_MIN_CHARS", "2000")))
+    except ValueError:
+        return 2000
+
+
+def _is_small_shell_result(tool_name: Any, text: Any, bash_tool_names: frozenset[str]) -> bool:
+    """True when ``text`` is a short shell result that must not be lossily compressed.
+
+    A 200-token ``ls -la``, ``git status``, or JSON dump is cheap to keep and
+    expensive to get wrong: lossy compression can leave a numbers-only blob
+    that still looks structured, so the model treats it as data instead of
+    retrying the command (issue #3590). Large build/test logs still take the
+    lossy path. ``HEADROOM_SHELL_RESULT_MIN_CHARS=0`` restores the old
+    behaviour.
+    """
+    if not isinstance(text, str) or not text:
+        return False
+    name = str(tool_name or "").lower()
+    return name in bash_tool_names and len(text) < _shell_result_min_chars()
+
+
 @dataclass
 class ContentRouterConfig:
     """Configuration for intelligent content routing.
@@ -2317,8 +2341,22 @@ class ContentRouterConfig:
     # BUT a read-only *search* run through them (grep/rg/git grep) yields byte-
     # losslessly foldable output — folded instead of lossy-compressed. See
     # ``_bash_search_fold``. Config so new harness tool names / search programs
-    # can be added without code changes.
-    bash_tool_names: frozenset[str] = frozenset({"bash", "shell", "local_shell"})
+    # can be added without code changes. The aliases mirror
+    # ``headroom.learn._shared._TOOL_NAME_MAP`` so the same harnesses are
+    # covered here.
+    bash_tool_names: frozenset[str] = frozenset(
+        {
+            "bash",
+            "shell",
+            "local_shell",
+            "run_shell_command",
+            "execute_command",
+            "exec_command",
+            "terminal",
+            "run_command",
+            "run_terminal_command",
+        }
+    )
     bash_search_commands: frozenset[str] = frozenset(
         {"grep", "egrep", "fgrep", "rg", "ripgrep", "ag", "ack"}
     )
@@ -2348,6 +2386,12 @@ class ContentRouterConfig:
     # Group search-compressor output by file (`rg --heading` style).
     # Default False; the proxy enables it in token mode.
     search_group_by_file: bool = False
+
+    def __post_init__(self) -> None:
+        # Normalize once so the per-message shell check stays a set lookup.
+        self.bash_tool_names = frozenset(
+            name.lower() for name in self.bash_tool_names if isinstance(name, str)
+        )
 
 
 @dataclass
@@ -6311,6 +6355,7 @@ class ContentRouter(Transform):
             "ccr_retrieve": 0,
             "user_msg": 0,
             "small": 0,
+            "shell_small_result": 0,
             "recent_code": 0,
             "analysis_ctx": 0,
             "ratio_too_high": 0,
@@ -6598,6 +6643,36 @@ class ContentRouter(Transform):
                     )
                     if collect_diagnostics:
                         _diag[i] = "compressed:bash_lossless_search"
+                    continue
+
+                # Small shell results stay verbatim (#3590). A short `ls`,
+                # `git status`, or JSON dump is cheap to keep; lossy
+                # compression can leave a numbers-only blob that still looks
+                # structured, so the model treats it as data instead of
+                # retrying. Large build/test logs still take the lossy path.
+                if _is_small_shell_result(tool_name, content, self.config.bash_tool_names):
+                    result_slots[i] = message
+                    transforms_applied.append("router:shell_small_result_verbatim")
+                    route_counts["shell_small_result"] = (
+                        route_counts.get("shell_small_result", 0) + 1
+                    )
+                    if collect_diagnostics:
+                        _diag[i] = "protected:shell_small_result"
+                    continue
+
+            # Legacy OpenAI `role:"function"` carries the tool name on the
+            # message itself, not in a tool_call_id. Resolve it directly so the
+            # small-shell floor also covers this wire shape (#3590 review).
+            if role == "function":
+                function_name = message.get("name", "")
+                if _is_small_shell_result(function_name, content, self.config.bash_tool_names):
+                    result_slots[i] = message
+                    transforms_applied.append("router:shell_small_result_verbatim")
+                    route_counts["shell_small_result"] = (
+                        route_counts.get("shell_small_result", 0) + 1
+                    )
+                    if collect_diagnostics:
+                        _diag[i] = "protected:shell_small_result"
                     continue
 
             # Read protection (ROLE / SHAPE-AGNOSTIC). An observation produced by
@@ -7569,6 +7644,21 @@ class ContentRouter(Transform):
         any_compressed = False
         role = message.get("role", "")
 
+        # Top-level text blocks are fragments of one tool result. Measure the
+        # whole result so splitting a large log cannot activate the small-result
+        # floor for every fragment. Sum lengths without copying the payload.
+        shell_result_chars = (
+            sum(
+                len(block["text"])
+                for block in content_blocks
+                if isinstance(block, dict)
+                and block.get("type") == "text"
+                and isinstance(block.get("text"), str)
+            )
+            if role in ("tool", "function")
+            else 0
+        )
+
         # Role-based gate for `text` blocks. Tool/function roles are tool
         # outputs and compress freely; assistant defaults to skip (cache
         # safety) with explicit opt-in; unknown roles default to skip.
@@ -7767,6 +7857,18 @@ class ContentRouter(Transform):
                     any_compressed = True
                     continue
 
+                # Small shell results stay verbatim (#3590), same contract as
+                # the string-form path above. Build/test logs above the floor
+                # still go through lossy compression.
+                if _is_small_shell_result(tool_name, tool_text, self.config.bash_tool_names):
+                    new_blocks.append(block)
+                    transforms_applied.append("router:shell_small_result_verbatim")
+                    if route_counts is not None:
+                        route_counts["shell_small_result"] = (
+                            route_counts.get("shell_small_result", 0) + 1
+                        )
+                    continue
+
                 # Protection: failed tool calls / error outputs stay verbatim
                 # (issue #847). `is_error` is Anthropic's explicit failure
                 # flag and suffices alone; the indicator scan catches error
@@ -7863,6 +7965,29 @@ class ContentRouter(Transform):
                         transforms_applied.append("router:excluded:ccr_retrieve")
                         if route_counts is not None:
                             route_counts["ccr_retrieve"] = route_counts.get("ccr_retrieve", 0) + 1
+                        continue
+
+                    # A normalized tool/function message can carry its output
+                    # as top-level text blocks rather than a tool_result
+                    # wrapper. Apply the same small-shell floor here (#3590
+                    # review).
+                    _shell_name = (
+                        (tool_name_map or {}).get(_msg_tool_id, "")
+                        if role == "tool"
+                        else message.get("name", "")
+                    )
+                    if (
+                        _is_small_shell_result(
+                            _shell_name, block.get("text", ""), self.config.bash_tool_names
+                        )
+                        and shell_result_chars < _shell_result_min_chars()
+                    ):
+                        new_blocks.append(block)
+                        transforms_applied.append("router:shell_small_result_verbatim")
+                        if route_counts is not None:
+                            route_counts["shell_small_result"] = (
+                                route_counts.get("shell_small_result", 0) + 1
+                            )
                         continue
                 text_content = block.get("text", "")
                 if isinstance(text_content, str) and (

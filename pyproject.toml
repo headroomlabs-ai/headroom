@@ -55,7 +55,7 @@ dependencies = [
     "litellm>=1.96.2,<2.0",
     "click>=8.3.3",               # CLI framework; PYSEC-2026-2132 fix (command injection in click.edit())
     "rich>=13.0.0",               # Rich terminal output
-    "opentelemetry-api>=1.24.0",  # Safe no-op OTEL API for instrumentation
+    "opentelemetry-api>=1.45.1",  # CVE-2026-114603: bounded, linear-time tracestate parsing
     # AST-aware code slicing (CodeCompressor); binary wheel. 0.44.1 is excluded:
     # that PyPI release was a compromised supply-chain build shipping an
     # info-stealer `sg.exe` (Trojan:Win64/Lazy!MTB) alongside the real binary
@@ -406,6 +406,8 @@ Changelog = "https://github.com/headroomlabs-ai/headroom/blob/main/CHANGELOG.md"
 # transitively; the floor pins below ensure uv resolves to patched versions.
 [tool.uv]
 constraint-dependencies = [
+    # PYSEC-2026-4320 — remove distrusted root certificates from the CA bundle.
+    "certifi>=2026.10.19",
     # GHSA-5239-wwwm-4pmq (Low) — transitive via rich; fix at 2.20.0
     "pygments>=2.20.0",
     # GHSA-4xgf-cpjx-pc3j (Medium) — transitive via mcp; fix at 2.14.2
@@ -421,8 +423,11 @@ constraint-dependencies = [
     "lxml-html-clean>=0.4.5",
     # CVE-2026-5241 (High) — direct optional dep for proxy/ml/voice; fix at 5.5.0
     "transformers>=5.5.0",
-    # PYSEC-2026-3447 — transitive dependency; fix at 83.0.0
-    "setuptools>=83.0.0",
+    # GHSA-xmj3-9gf7-h52w — Windows wheel namespace path traversal.
+    "setuptools>=84.1.0",
+    # CVE-2026-112940/112913/112907. The patched series requires Python 3.11;
+    # Python 3.10 retains the legacy locked version; it is not remediated by this marker.
+    "filelock>=4.2.1; python_version >= '3.11'",
     # PYSEC-2026-3545/3546/3547 — transitive HTTP/WebSocket parser fixes;
     # CVE-2026-111063/111064, GHSA-2g87-pp6c-29x5; fix at 3.14.4
     "aiohttp>=3.14.4",
