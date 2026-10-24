@@ -23,7 +23,7 @@
 		"fumadocs-typescript": "^5.5.1",
 		"fumadocs-ui": "16.17.1",
 		"lucide-react": "^1.48.0",
-		"next": "^16.4.0",
+		"next": "^16.4.3",
 		"react": "^19.3.0",
 		"react-dom": "^19.3.0",
 		"recharts": "^3.10.1",
