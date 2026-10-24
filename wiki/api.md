@@ -322,13 +322,13 @@ tokens = tokenizer.count_messages(messages)
 Generate an HTML report from stored metrics.
 
 ```python
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from headroom import generate_report
 
 path = generate_report(
     store_url="sqlite:////absolute/path/to/headroom.db",
     output_path="report.html",
-    start_time=datetime.now() - timedelta(days=1),
+    start_time=datetime.now(timezone.utc) - timedelta(days=1),
 )  # returns the path to the generated HTML file
 ```
 
