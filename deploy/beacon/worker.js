@@ -125,10 +125,8 @@ const ALLOWED_RESOURCE = [
 // retried, so the event would simply be lost.
 //
 // Restored to ~3x the worst legitimate payload. This is not the abuse control
-// and never was: the endpoint is unauthenticated by design and the WAF rate
-// limit (60 req/min/IP, see wrangler.toml) is what bounds a bad actor. At 60
-// requests a minute the difference between these two ceilings is 3.8 MB/min
-// and 15 MB/min, neither of which is interesting to Cloudflare.
+// and never was: the endpoint is unauthenticated by design and the RATE_LIMIT
+// binding (see fetch() and wrangler.toml) is what bounds a bad actor.
 const MAX_BODY_BYTES = 256 * 1024;
 
 // Cap on what an arriving body EXPANDS to. `raw.byteLength` cannot see this:
@@ -406,6 +404,31 @@ export default {
     const url = new URL(request.url);
     if (url.pathname !== '/v1/logs') {
       return new Response('not found', { status: 404 });
+    }
+
+    // Abuse bound, checked before the body is read so a flood costs neither
+    // the inflate nor an R2 write. Keyed on one constant rather than the
+    // sender: a per-IP limit would mean reading cf-connecting-ip, which this
+    // Worker never does (see the header). The price is that a flood also
+    // sheds real events until the window rolls over -- acceptable for
+    // fire-and-forget telemetry, and the cap sits ~10x above normal traffic.
+    //
+    // 429 is safe for old clients: only 400/415 make them drop gzip
+    // (_GZIP_REFUSED_STATUSES in headroom/telemetry/session.py).
+    //
+    // Fails open: with no binding (local tests, an old wrangler.toml) or when
+    // the rate-limit service itself errors, the upload proceeds. A limiter
+    // outage must not drop every legitimate beacon; the cost is that a flood
+    // during that outage is unbounded until the service recovers.
+    if (env.RATE_LIMIT) {
+      let limited = false;
+      try {
+        const { success } = await env.RATE_LIMIT.limit({ key: 'all' });
+        limited = !success;
+      } catch (err) {
+        console.error('beacon: rate limiter unavailable, failing open:', String(err));
+      }
+      if (limited) return new Response('rate limited', { status: 429 });
     }
 
     const raw = await request.arrayBuffer();

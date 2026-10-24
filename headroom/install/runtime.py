@@ -118,7 +118,14 @@ def _runtime_env(manifest: DeploymentManifest) -> dict[str, str]:
 
 
 def _ensure_host_dirs() -> None:
-    for subdir in (".headroom", ".claude", ".codex", ".gemini", ".config/opencode"):
+    for subdir in (
+        ".headroom",
+        ".claude",
+        ".codex",
+        ".gemini",
+        ".config/opencode",
+        ".config/litellm",
+    ):
         (Path.home() / subdir).mkdir(parents=True, exist_ok=True)
 
 
@@ -170,6 +177,8 @@ def build_runtime_command(manifest: DeploymentManifest) -> list[str]:
         f"{_mount_source(home, '.gemini')}:{container_home}/.gemini",
         "--volume",
         f"{_mount_source(home, '.config/opencode')}:{container_home}/.config/opencode",
+        "--volume",
+        f"{_mount_source(home, '.config/litellm')}:{container_home}/.config/litellm",
     ]
     docker_gpus = manifest.base_env.get("HEADROOM_DOCKER_GPUS", "").strip()
     if docker_gpus:
@@ -358,11 +367,6 @@ def _proxy_deployment_markers_match(cmdline: list[str], manifest: DeploymentMani
         ):
             return False
     return True
-
-
-def _process_matches_runtime(pid: int, manifest: DeploymentManifest) -> bool:
-    """Verify the PID's deployment identity before lifecycle operations."""
-    return _process_identity(pid, manifest) is True
 
 
 def _process_identity(pid: int, manifest: DeploymentManifest) -> bool | None:

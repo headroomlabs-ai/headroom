@@ -120,16 +120,19 @@ def candidate_ports(
     return seen[:_MAX_CANDIDATES]
 
 
-def probe_headroom_proxy(port: int, timeout: float = _PROBE_TIMEOUT_SECONDS) -> bool:
-    """True when a Headroom proxy answers ``/livez`` on loopback ``port``.
+def probe_headroom_proxy(
+    port: int, timeout: float = _PROBE_TIMEOUT_SECONDS, *, host: str = "127.0.0.1"
+) -> bool:
+    """True when a Headroom proxy answers ``/livez`` on ``host:port`` (loopback by default).
 
     Requires the ``service: headroom-proxy`` identity (or the legacy
     ``alive``+``version`` shape) so an unrelated local server on the port is
-    never mistaken for Headroom.
+    never mistaken for Headroom. ``host`` is a numeric IPv4 or IPv6 address.
     """
     from headroom.install.health import probe_json
 
-    return is_headroom_livez(probe_json(f"http://127.0.0.1:{port}/livez", timeout=timeout))
+    netloc = f"[{host}]" if ":" in host else host
+    return is_headroom_livez(probe_json(f"http://{netloc}:{port}/livez", timeout=timeout))
 
 
 def is_headroom_livez(payload: Mapping[str, Any] | None) -> bool:

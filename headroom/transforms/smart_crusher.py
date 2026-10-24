@@ -52,7 +52,8 @@ from dataclasses import dataclass
 from typing import Any
 
 from ..ccr.tool_injection import CCR_TOOL_NAME
-from ..config import CCRConfig, TransformResult, is_tool_excluded
+from ..config import CCRConfig, TransformResult, is_tool_excluded, unwrap_tool_call_name
+from ..log_safety import describe_exception, safe_id
 from ..tokenizer import Tokenizer
 from ..utils import compute_short_hash, create_tool_digest_marker, deep_copy_messages
 from .base import Transform
@@ -129,7 +130,7 @@ def strip_ccr_sentinels(items: Any) -> Any:
 
 
 def _build_tool_name_index(messages: list[dict[str, Any]]) -> dict[str, str]:
-    """Map tool_call_id/tool_use_id → tool name across OpenAI + Anthropic formats.
+    """Map tool_call_id/tool_use_id → effective tool name in both wire formats.
 
     Skips entries where id or name is missing; those calls still crush, but
     won't contribute a tool-name to the ``smart_crush`` tag.
@@ -140,9 +141,10 @@ def _build_tool_name_index(messages: list[dict[str, Any]]) -> dict[str, str]:
             continue
         for tc in msg.get("tool_calls") or []:
             tc_id = tc.get("id")
-            name = (tc.get("function") or {}).get("name")
-            if tc_id and name:
-                index[tc_id] = name
+            function = tc.get("function") or {}
+            name = function.get("name")
+            if tc_id and isinstance(name, str) and name:
+                index[tc_id] = unwrap_tool_call_name(name, function.get("arguments"))
         content = msg.get("content")
         if isinstance(content, list):
             for block in content:
@@ -150,8 +152,8 @@ def _build_tool_name_index(messages: list[dict[str, Any]]) -> dict[str, str]:
                     continue
                 bid = block.get("id")
                 name = block.get("name")
-                if bid and name:
-                    index[bid] = name
+                if bid and isinstance(name, str) and name:
+                    index[bid] = unwrap_tool_call_name(name, block.get("input"))
     return index
 
 
@@ -1196,8 +1198,12 @@ class SmartCrusher(Transform):
                 "CCR mirror: invalid hash %r from rendered marker",
                 ccr_hash,
             )
-        except Exception as e:  # pragma: no cover - defensive
-            logger.debug("CCR mirror: store.store() raised (%s)", e)
+        except Exception as e:
+            # Store backends can echo the payload in errors, so no level logs it;
+            # describe_exception keeps only types and code locations.
+            logger.warning("CCR mirror: store write failed (%s) for hash %s", safe_id(e), ccr_hash)
+            if logger.isEnabledFor(logging.DEBUG):
+                logger.debug("CCR mirror store failure detail: %s", describe_exception(e))
 
     def _extract_context_from_messages(self, messages: list[dict[str, Any]]) -> str:
         """Build a query string from the last 5 user messages + recent

@@ -13,6 +13,7 @@ import {
   EXCLUDE_HOSTS_ENV,
   ORIGINAL_PATH_HEADER,
   PROJECT_HEADER,
+  SESSION_TOKEN_HEADER,
   installHeadroomTransport,
   modelBaseRoutesThroughProxy,
   normalizeExcludeHosts,
@@ -24,6 +25,7 @@ export interface HeadroomOpenCodePluginOptions {
   excludeHosts?: string[];
   backend?: string;
   debug?: boolean;
+  sessionToken?: string;
 }
 
 export const HEADROOM_PLUGIN_ID = "headroom";
@@ -40,6 +42,13 @@ function resolveProxyUrl(options?: HeadroomOpenCodePluginOptions): string {
       getDefaultProxyUrl(),
   );
 }
+
+// Read by workspace_registry.resolve_registered_cwd() on the proxy side --
+// mirrors wrap.py's _apply_session_token_header_env for claude.
+function resolveSessionToken(options?: HeadroomOpenCodePluginOptions): string | undefined {
+  return options?.sessionToken ?? process.env.HEADROOM_OPENCODE_SESSION_TOKEN;
+}
+
 
 // The exclusion list governs both the transport patch and the 2.x model
 // rewrite, so resolve it once: option over environment variable, normalized
@@ -86,6 +95,7 @@ function routeModelsThroughProxy(
   proxyUrl: string,
   project: string,
   excludeHosts: string[],
+  sessionToken?: string,
 ): void {
   for (const model of models.list()) {
     // DeepMutable turns the branded ID strings into object types.
@@ -104,6 +114,7 @@ function routeModelsThroughProxy(
         [BASE_URL_HEADER]: upstream.origin,
         [ORIGINAL_PATH_HEADER]: `${trimTrailingSlashes(upstream.pathname)}${suffix}`,
         [PROJECT_HEADER]: project,
+        ...(sessionToken ? { [SESSION_TOKEN_HEADER]: sessionToken } : {}),
       };
     });
   }
@@ -123,6 +134,7 @@ export const HeadroomPlugin: Plugin = async (input, options = {}) => {
     project,
     excludeHosts: pluginOptions.excludeHosts,
     debug: pluginOptions.debug,
+    sessionToken: resolveSessionToken(pluginOptions),
   });
 
   return {
@@ -158,16 +170,18 @@ export const headroomSetup: PluginV2.Plugin["setup"] = async (ctx) => {
     pluginOptions.project ?? ctx.location.project.id ?? ctx.location.directory;
   const retrieveTool = createHeadroomRetrieveTool({ proxyBaseUrl: proxyUrl });
   const excludeHosts = resolveExcludeHosts(pluginOptions);
+  const sessionToken = resolveSessionToken(pluginOptions);
   const uninstallTransport = installHeadroomTransport({
     proxyUrl,
     project,
     excludeHosts,
     debug: pluginOptions.debug,
+    sessionToken,
   });
 
   try {
     await ctx.model.transform((models) => {
-      routeModelsThroughProxy(models, proxyUrl, project, excludeHosts);
+      routeModelsThroughProxy(models, proxyUrl, project, excludeHosts, sessionToken);
     });
     await ctx.tool.transform((editor) => {
       editor.add({

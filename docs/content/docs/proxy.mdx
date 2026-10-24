@@ -24,7 +24,7 @@ headroom proxy \
   --budget 100.0
 ```
 
-Two independent telemetry switches exist. `HEADROOM_TELEMETRY=on` (or `--telemetry`) turns on **local-only** in-process usage stats that power your own `/stats`, `/metrics`, and dashboard — off by default, and nothing under this switch leaves the machine.
+Two telemetry switches exist. `HEADROOM_TELEMETRY=on` (or `--telemetry`) turns on **local-only** in-process usage stats that power your own `/stats`, `/metrics`, and dashboard — off by default, and nothing under this switch leaves the machine.
 
 Separately, an **anonymous usage beacon is on by default** (opt-out). Once a session goes idle it POSTs a small summary of how compression behaved to a Headroom Labs collector.
 
@@ -36,7 +36,7 @@ Separately, an **anonymous usage beacon is on by default** (opt-out). Once a ses
 
 The install id is a random UUID generated on first run and stored in your config directory. It is deliberately not derived from hostname, MAC address, or any hardware property — delete the file and you get a new one.
 
-Disable it with `HEADROOM_BEACON=off`, the `DO_NOT_TRACK=1` convention, or `HEADROOM_OFFLINE=1` (which also disables update checks and license reporting).
+Disable it with `HEADROOM_BEACON=off`, `HEADROOM_TELEMETRY=off` (or `--no-telemetry`), the `DO_NOT_TRACK=1` convention, or `HEADROOM_OFFLINE=1` (which also disables update checks and license reporting). `HEADROOM_BEACON=on` keeps the beacon on even with local stats off. `headroom telemetry` names the setting that turned it off.
 
 ## CLI options
 
@@ -528,16 +528,21 @@ headroom wrap antigravity          # Start proxy + print Antigravity setup instr
 headroom mcp install --agent antigravity   # Register the Headroom MCP server in Antigravity
 ```
 
-`wrap antigravity` prints a custom OpenAI-compatible model-provider base URL
-to add in Antigravity's model-provider settings; Antigravity fetches the model
-list from `GET /v1/models` on its own. Native Cloud Code Assist traffic
-(`google-antigravity` clients) is accepted on
-[`POST /v1internal:streamGenerateContent`](#post-v1internalstreamgeneratecontent)
-and routed upstream like any other Cloud Code request.
+The Antigravity IDE does not support third-party model providers — its
+agent models are Google-managed, so there is no settings panel to point
+at the proxy. What the proxy does offer Antigravity users:
 
-MCP registration writes to Antigravity's global `mcp_config.json` under
-`~/.gemini/` (preferring the install's current location when one already
-exists) and refuses to overwrite a config file that does not parse as JSON.
+- MCP tools: `mcp install` writes the Headroom server into Antigravity's
+  global `mcp_config.json` under `~/.gemini/` (preferring the install's
+  current location when one already exists) and refuses to overwrite a
+  config file that does not parse as JSON.
+- Native traffic: `google-antigravity` clients are accepted on
+  [`POST /v1internal:streamGenerateContent`](#post-v1internalstreamgeneratecontent)
+  and routed upstream like any other Cloud Code request.
+
+The Antigravity CLI (`agy`), unlike the IDE, accepts a custom endpoint
+via its `GOOGLE_GEMINI_BASE_URL` setting — the one Antigravity surface
+where a custom model endpoint is supported.
 
 ### `POST /v1/compress`
 

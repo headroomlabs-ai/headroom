@@ -11,7 +11,6 @@ from headroom.providers.opencode.config import (
     HEADROOM_OPENCODE_PLUGIN,
     _inject_key_into_json,
     _parse_json_loose,
-    append_headroom_plugin,
     inject_opencode_provider_config,
     opencode_config_paths,
     snapshot_opencode_config_if_unwrapped,
@@ -477,24 +476,6 @@ def test_inject_provider_config_preserves_unrelated_top_level_keys(
     assert "headroom" in config.get("provider", {})
 
 
-def test_append_headroom_plugin_adds_plugin_once() -> None:
-    config: dict[str, object] = {"plugin": ["some-plugin"]}
-
-    assert append_headroom_plugin(config) is True
-    assert append_headroom_plugin(config) is False
-
-    assert config["plugin"] == ["some-plugin", HEADROOM_OPENCODE_PLUGIN]
-
-
-def test_append_headroom_plugin_preserves_configured_tuple_entry() -> None:
-    config: dict[str, object] = {
-        "plugin": [[HEADROOM_OPENCODE_PLUGIN, {"proxyUrl": "http://127.0.0.1:8787"}]]
-    }
-
-    assert append_headroom_plugin(config) is False
-    assert config["plugin"] == [[HEADROOM_OPENCODE_PLUGIN, {"proxyUrl": "http://127.0.0.1:8787"}]]
-
-
 def test_inject_provider_config_no_crash_on_unwriteable_dir(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -594,6 +575,42 @@ def test_build_launch_env_with_project(monkeypatch: pytest.MonkeyPatch, tmp_path
     assert f"plugin={HEADROOM_OPENCODE_PLUGIN}" in display
     assert "OPENAI_BASE_URL" not in env
     assert "ANTHROPIC_BASE_URL" not in env
+
+
+def test_build_launch_env_forwards_session_token_when_plugin_present(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Token reaches OpenCode only via the transport plugin -- the only
+    header-capable layer (native baseURL is header-blind, like Cursor)."""
+    from headroom.providers.opencode.runtime import build_launch_env
+
+    plugin = tmp_path / "entry.opencode.js"
+    plugin.write_text("export default () => {}", encoding="utf-8")
+    monkeypatch.setenv("HEADROOM_OPENCODE_PLUGIN_PATH", str(plugin))
+
+    env, _display = build_launch_env(
+        port=8787,
+        include_mcp=False,
+        session_token="tok-abc",
+    )
+    assert env["HEADROOM_OPENCODE_SESSION_TOKEN"] == "tok-abc"
+
+
+def test_build_launch_env_omits_session_token_when_plugin_absent(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """No plugin -> no header surface -> token must not be forwarded,
+    same as Cursor's UNKNOWN."""
+    from headroom.providers.opencode.runtime import build_launch_env
+
+    monkeypatch.setenv("HEADROOM_OPENCODE_PLUGIN_PATH", str(tmp_path / "missing.js"))
+
+    env, _display = build_launch_env(
+        port=8787,
+        include_mcp=False,
+        session_token="tok-abc",
+    )
+    assert "HEADROOM_OPENCODE_SESSION_TOKEN" not in env
 
 
 def test_build_launch_env_with_custom_environ() -> None:

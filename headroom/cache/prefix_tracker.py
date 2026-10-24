@@ -16,15 +16,19 @@ pipeline skips them entirely.
 
 from __future__ import annotations
 
+import contextlib
 import copy
 import hashlib
 import itertools
 import json
 import logging
 import os
+import re
 import time
-from collections import OrderedDict
+from collections import OrderedDict, deque
+from contextvars import ContextVar
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 
 logger = logging.getLogger(__name__)
@@ -62,6 +66,39 @@ _PROVIDER_CACHE_TTL_SECONDS = {
 # Keep tracker state through the same post-TTL confidence margin used by
 # cold-prefix detection, but never below the configured session cleanup floor.
 _CACHE_TTL_CLEANUP_MARGIN_SECONDS = 60
+
+# Recent request snapshots kept per lineage. A Claude Code fork (the subagent
+# progress summary, the parent's side query) re-sends the history plus one
+# prompt, so the next real turn extends the snapshot BEFORE the fork. A
+# request that resumes an older snapshot keeps it next-newest, so any number
+# of forks off one turn leaves that turn resumable.
+_LINEAGE_HISTORY = 3
+
+# Opt-in file for SessionTrackerStore state across a graceful restart. It holds
+# conversation content, so nothing is written unless an operator sets it.
+PREFIX_STATE_FILE_ENV = "HEADROOM_PREFIX_STATE_FILE"
+_PREFIX_STATE_VERSION = 1
+# Newest trackers first; whatever does not fit starts cold, as all did before.
+_PREFIX_STATE_MAX_TRACKERS = 256
+_PREFIX_STATE_MAX_BYTES = 64 * 1024 * 1024
+# Any CCR reference in saved messages: ``hash=<hex>`` markers (Retrieve
+# more/original, compressed-item counts) and SmartCrusher's ``<<ccr:<hex>``.
+_CCR_HASH_RE = re.compile(r"(?:hash=|<<ccr:)([0-9a-f]{12,24})")
+
+
+def prefix_state_file() -> str | None:
+    """The configured tracker state file, or None when persistence is off."""
+    return os.environ.get(PREFIX_STATE_FILE_ENV, "").strip() or None
+
+
+# (tracker, turn, resumed state) the current request resolved to. Each proxied
+# request runs in its own asyncio task, so it reads the state it resumed and
+# ``update_from_response`` records its response against its own turn, even
+# while a fork of the same conversation is in flight on the same tracker. Same
+# pattern as the request-scoped tenant key and CCR store.
+_resolved_turn: ContextVar[tuple[Any, int, tuple[Any, ...] | None] | None] = ContextVar(
+    "headroom_resolved_lineage_turn", default=None
+)
 
 
 @dataclass
@@ -587,6 +624,36 @@ def extract_cache_stable_delta(
         copy.deepcopy(previous_forwarded_messages),
         copy.deepcopy(current_messages[prefix_len:]),
     )
+
+
+def restore_frozen_prefix(
+    original_messages: list[dict[str, Any]],
+    candidate_messages: list[dict[str, Any]],
+    *,
+    frozen_message_count: int,
+) -> tuple[list[dict[str, Any]], int]:
+    """Force the frozen prefix of ``candidate_messages`` to match the original bytes.
+
+    Returns ``(restored_messages, restored_count)``. Messages a transform dropped
+    from the prefix are put back; any frozen message it changed is replaced by
+    the original. ``restored_count`` is how many prefix messages were restored.
+    """
+    if frozen_message_count <= 0 or not original_messages:
+        return candidate_messages, 0
+
+    frozen = min(frozen_message_count, len(original_messages))
+    restored = list(candidate_messages)
+
+    # Defensive: if a transform dropped prefix messages, restore them.
+    if len(restored) < frozen:
+        return list(original_messages[:frozen]) + restored, frozen
+
+    changed = 0
+    for idx in range(frozen):
+        if restored[idx] != original_messages[idx]:
+            restored[idx] = original_messages[idx]
+            changed += 1
+    return restored, changed
 
 
 def overlay_cached_prefix(
@@ -1123,11 +1190,22 @@ class PrefixCacheTracker:
         # net-cost/TTL P_alive gate could never see idle time. The handler reads
         # this and forwards it to the pipeline as `idle_seconds`.
         self._idle_seconds_at_fetch: float = 0.0
+        # Turn state after each recent request's response (None while it is in
+        # flight), keyed by the turn SessionTrackerStore issued it. A request
+        # resumes the state of the turn it extends, so a fork's response never
+        # becomes the main line's frozen prefix or replay source.
+        self._turn_states: dict[int, tuple[Any, ...] | None] = {}
 
         # Session-scoped ReadMaturationManager (Mechanism B), created
         # lazily by the handler when read maturation is enabled. Rides
         # here so it shares the session's affinity and TTL cleanup.
         self.read_maturation_manager: Any = None
+        # Set by SessionTrackerStore.load_state: this process has no
+        # CompressionCache entries behind the restored prefix yet, and the
+        # handler adopts the saved maturation state (validated at load) when it
+        # builds the manager.
+        self.restored_from_disk = False
+        self.restored_maturation_state: dict[str, Any] | None = None
 
         # Stats
         self._busts_avoided: int = 0
@@ -1139,13 +1217,14 @@ class PrefixCacheTracker:
 
         Returns 0 on turn 0 (cold start) or if caching is disabled/below threshold.
         """
+        turn_number, cached_tokens, cached_messages, _, _ = self._request_turn_state()
         if not self.config.enabled:
             return 0
-        if self._turn_number == 0:
+        if turn_number == 0:
             return 0
-        if self._cached_token_count < self.config.min_cached_tokens:
+        if cached_tokens < self.config.min_cached_tokens:
             return 0
-        return self._cached_message_count
+        return int(cached_messages)
 
     def update_from_response(
         self,
@@ -1178,6 +1257,7 @@ class PrefixCacheTracker:
         if total_cached == 0:
             self._cached_token_count = 0
             self._cached_message_count = 0
+            self._record_turn_state()
             return
 
         # Estimate per-message token counts if not provided
@@ -1197,6 +1277,7 @@ class PrefixCacheTracker:
 
         self._cached_token_count = total_cached
         self._cached_message_count = frozen_count
+        self._record_turn_state()
 
         logger.debug(
             "PrefixCacheTracker[%s]: turn=%d, cached=%d tokens, "
@@ -1211,10 +1292,56 @@ class PrefixCacheTracker:
         )
 
     def get_last_original_messages(self) -> list[dict[str, Any]]:
-        return copy.deepcopy(self._last_original_messages)
+        return copy.deepcopy(self._request_turn_state()[3])
 
     def get_last_forwarded_messages(self) -> list[dict[str, Any]]:
-        return copy.deepcopy(self._last_forwarded_messages)
+        return copy.deepcopy(self._request_turn_state()[4])
+
+    def _turn_state(self) -> tuple[Any, ...]:
+        return (
+            self._turn_number,
+            self._cached_token_count,
+            self._cached_message_count,
+            self._last_original_messages,
+            self._last_forwarded_messages,
+        )
+
+    def _request_turn_state(self) -> tuple[Any, ...]:
+        """The state this request resumed at resolve time, else the current one.
+
+        A handler may read after an ``await`` (OpenAI's overlay runs after
+        compression), by which time a sibling request on this lineage may have
+        resumed a different turn.
+        """
+        resolved = _resolved_turn.get()
+        if resolved is not None and resolved[0] is self and resolved[2] is not None:
+            return resolved[2]
+        return self._turn_state()
+
+    def _record_turn_state(self) -> None:
+        """Remember this response's state under the turn that sent it."""
+        resolved = _resolved_turn.get()
+        if resolved is not None and resolved[0] is self:
+            if resolved[1] in self._turn_states:
+                self._turn_states[resolved[1]] = self._turn_state()
+            # The request has its response; later reads see the current state.
+            _resolved_turn.set((self, resolved[1], None))
+
+    def _resume_turn(self, turn: int | None) -> None:
+        """Continue from ``turn``'s response, not whichever response came last.
+
+        A turn still in flight (or one recorded before turn tracking) has no
+        state yet; the current state stands, as it did before.
+        """
+        state = self._turn_states.get(turn) if turn is not None else None
+        if state is not None:
+            (
+                self._turn_number,
+                self._cached_token_count,
+                self._cached_message_count,
+                self._last_original_messages,
+                self._last_forwarded_messages,
+            ) = state
 
     def record_returned(
         self,
@@ -1281,7 +1408,8 @@ class PrefixCacheTracker:
         if idle_seconds is None:
             idle_seconds = self.seconds_since_activity()
         ttl = self.resolved_cache_ttl_seconds()
-        expected = self._cached_token_count
+        # The turn this request resumed, not whichever sibling answered last.
+        expected = self._request_turn_state()[1]
 
         # Nothing was cached last turn → cold start, not a miss.
         if expected <= 0:
@@ -1336,7 +1464,7 @@ class PrefixCacheTracker:
         content. Anything else (a frozen message rewritten, the prefix
         reordered, the list now shorter) counts as a prefix change.
         """
-        prev = self._last_forwarded_messages
+        prev: list[dict[str, Any]] = self._request_turn_state()[4]
         if not prev:
             # No recorded prefix to compare — can't claim it changed.
             return True
@@ -1507,6 +1635,42 @@ def _lineage_snapshot(obj: Any) -> Any:
     return obj
 
 
+def _deref(table: list[Any], refs: list[int]) -> list[Any]:
+    """Rebuild a saved message list. Restored lists share message objects,
+    which is safe: tracker and lineage lists are never mutated in place."""
+    if not all(type(i) is int and 0 <= i < len(table) for i in refs):
+        raise ValueError("message reference out of range")
+    return [table[i] for i in refs]
+
+
+def _decode_turn_state(table: list[Any], state: list[Any]) -> tuple[Any, ...]:
+    turn, cached_tokens, cached_messages, original, forwarded = state
+    return (
+        int(turn),
+        int(cached_tokens),
+        int(cached_messages),
+        _deref(table, original),
+        _deref(table, forwarded),
+    )
+
+
+def seed_restored_compression_cache(tracker: Any, comp_cache: Any) -> None:
+    """Seed a token-mode CompressionCache on a tracker's first request after
+    :meth:`SessionTrackerStore.load_state`.
+
+    The new process has no cache entries behind the restored prefix, so the
+    freeze computed from that cache freezes nothing: the pipeline recompresses
+    (and read maturation rewrites) messages the provider cached, and beyond the
+    provider-confirmed floor the overlay declines a larger replay. Seeding with
+    what was forwarded gives the freeze the pre-restart count.
+    """
+    if getattr(tracker, "restored_from_disk", False):
+        tracker.restored_from_disk = False
+        comp_cache.update_from_result(
+            tracker.get_last_original_messages(), tracker.get_last_forwarded_messages()
+        )
+
+
 class SessionTrackerStore:
     """Manages PrefixCacheTracker instances across sessions.
 
@@ -1535,6 +1699,10 @@ class SessionTrackerStore:
         # but different tool profiles must never share frozen-prefix state.
         self._lineage_affinities: dict[str, str | None] = {}
         self._lineage_counter = itertools.count(1)
+        # Recent (snapshot, turn) per tracker key, newest first; the newest
+        # snapshot is the one in ``_lineages``.
+        self._lineage_history: dict[str, deque[tuple[list[Any], int]]] = {}
+        self._turn_counter = itertools.count(1)
 
     def peek(self, session_id: str) -> PrefixCacheTracker | None:
         """Return the live tracker for ``session_id``, else None.
@@ -1584,6 +1752,7 @@ class SessionTrackerStore:
     def _discard_tracker(self, tracker_key: str) -> None:
         """Remove a tracker and any lineage indexes that point to it."""
         self._trackers.pop(tracker_key, None)
+        self._lineage_history.pop(tracker_key, None)
         for session_id, family in list(self._lineages.items()):
             family.pop(tracker_key, None)
             self._lineage_affinities.pop(tracker_key, None)
@@ -1677,22 +1846,48 @@ class SessionTrackerStore:
         for key in expired_keys:
             family.pop(key, None)
             self._lineage_affinities.pop(key, None)
+            self._lineage_history.pop(key, None)
             self._trackers.pop(key, None)
         by_length = sorted(family.items(), key=lambda item: len(item[1]), reverse=True)
-        best_key: str | None = None
-        for accepted in (
-            (RELATION_EXACT, RELATION_MESSAGE_APPEND),
-            (RELATION_BLOCK_APPEND,),
-        ):
-            for key, chain in by_length:
-                if self._lineage_affinities.get(key) != cache_affinity:
-                    continue
-                relation = _classify_history_canonical(snap, chain)
-                if relation.kind in accepted:
-                    best_key = key
-                    break
-            if best_key is not None:
-                break
+
+        def continuation(
+            candidates: list[tuple[str, list[Any], int | None]],
+        ) -> tuple[str | None, int | None]:
+            for accepted in (
+                (RELATION_EXACT, RELATION_MESSAGE_APPEND),
+                (RELATION_BLOCK_APPEND,),
+            ):
+                for key, chain, turn in candidates:
+                    if self._lineage_affinities.get(key) != cache_affinity:
+                        continue
+                    if _classify_history_canonical(snap, chain).kind in accepted:
+                        return key, turn
+            return None, None
+
+        def latest_turn(key: str) -> int | None:
+            history = self._lineage_history.get(key)
+            return history[0][1] if history else None
+
+        best_key, best_turn = continuation(
+            [(key, chain, latest_turn(key)) for key, chain in by_length]
+        )
+        if best_key is None:
+            # A fork (Claude Code's subagent summary or side query: the
+            # history plus one prompt) became a lineage's latest snapshot, so
+            # this turn extends the snapshot before it. Resume that turn
+            # instead of starting a cold lineage that recompresses history the
+            # provider already cached.
+            best_key, best_turn = continuation(
+                sorted(
+                    (
+                        (key, chain, turn)
+                        for key in family
+                        for chain, turn in list(self._lineage_history.get(key, ()))[1:]
+                    ),
+                    key=lambda item: len(item[1]),
+                    reverse=True,
+                )
+            )
 
         if best_key is None:
             rewrite_candidates: list[tuple[tuple[int, int, int], str]] = []
@@ -1778,6 +1973,22 @@ class SessionTrackerStore:
         family = self._lineages.setdefault(session_id, family)
         family[best_key] = snap
         self._lineage_affinities[best_key] = cache_affinity
+        if isinstance(tracker, PrefixCacheTracker):  # test stubs keep no turns
+            tracker._resume_turn(best_turn if best_turn is not None else latest_turn(best_key))
+            turn = next(self._turn_counter)
+            history = self._lineage_history.setdefault(best_key, deque(maxlen=_LINEAGE_HISTORY))
+            branch = next((entry for entry in history if entry[1] == best_turn), None)
+            if branch is not None and branch is not history[0]:
+                # A fork off an older turn: that turn stays the branch point the
+                # next main turn extends, so keep it behind this request rather
+                # than let successive forks push it out.
+                history.remove(branch)
+                history.appendleft(branch)
+            history.appendleft((snap, turn))
+            live = {t for _, t in history}
+            tracker._turn_states = {t: s for t, s in tracker._turn_states.items() if t in live}
+            tracker._turn_states[turn] = None
+            _resolved_turn.set((tracker, turn, tracker._turn_state()))
         return tracker
 
     def compute_session_id(
@@ -1847,6 +2058,7 @@ class SessionTrackerStore:
                 for key in [k for k in family if k not in self._trackers]:
                     del family[key]
                     self._lineage_affinities.pop(key, None)
+                    self._lineage_history.pop(key, None)
                 if not family:
                     del self._lineages[base]
             logger.debug("SessionTrackerStore: cleaned up %d expired sessions", len(expired))
@@ -1857,3 +2069,218 @@ class SessionTrackerStore:
     def active_sessions(self) -> int:
         """Number of active session trackers (one per conversation lineage)."""
         return len(self._trackers)
+
+    def save_state(self, path: str) -> int:
+        """Write the live trackers to ``path`` for the next process to resume.
+
+        Called on graceful shutdown when ``HEADROOM_PREFIX_STATE_FILE`` is set.
+        Without it, a restart leaves every warm conversation with no tracker:
+        its next request recompresses the whole history into bytes that differ
+        from the prefix the provider cached, and the cache is re-written from
+        the first changed message. Newest trackers first, capped at
+        ``_PREFIX_STATE_MAX_TRACKERS`` and ``_PREFIX_STATE_MAX_BYTES``; a
+        tracker whose messages are not JSON is skipped. Each tracker carries
+        the CCR entries its messages reference, so its replayed markers still
+        resolve when the CCR backend does not survive the restart (memory).
+        Never raises; returns the number of trackers written.
+        """
+        from headroom.cache.compression_store import get_compression_store
+        from headroom.fsutil import write_text
+        from headroom.paths import persistence_allowed
+
+        if not persistence_allowed("prefix-cache tracker state"):
+            return 0
+        sessions = {key: sid for sid, family in self._lineages.items() for key in family}
+        live = sorted(
+            (item for item in self._trackers.items() if not item[1].is_expired),
+            key=lambda item: item[1]._last_activity,
+            reverse=True,
+        )
+        entries: list[str] = []
+        ccr: dict[str, str] = {}
+        size = 0
+        for key, tracker in live[:_PREFIX_STATE_MAX_TRACKERS]:
+            try:
+                entry = self._encode_tracker(key, tracker, sessions.get(key))
+                refs = [h for h in dict.fromkeys(_CCR_HASH_RE.findall(entry)) if h not in ccr]
+                records = get_compression_store().export_entries(refs) if refs else []
+                payloads = {r["hash"]: json.dumps(r) for r in records}
+            except Exception:  # an unsaveable tracker starts cold, as all did before
+                continue
+            grow = len(entry) + sum(len(p) + 1 for p in payloads.values())
+            if size + grow > _PREFIX_STATE_MAX_BYTES:
+                continue
+            size += grow + 1
+            entries.append(entry)
+            ccr.update(payloads)
+        try:
+            target = Path(path)
+            target.parent.mkdir(parents=True, exist_ok=True)
+            # write_text keeps the target's mode, so tighten it in place rather
+            # than unlinking: a failed write must leave the last snapshot.
+            with contextlib.suppress(FileNotFoundError):
+                target.chmod(0o600)
+            write_text(
+                target,
+                f'{{"version":{_PREFIX_STATE_VERSION},"trackers":[{",".join(entries)}],'
+                f'"ccr":[{",".join(ccr.values())}]}}',
+            )
+        except OSError as exc:
+            logger.warning("SessionTrackerStore: prefix state not saved to %s: %s", path, exc)
+            return 0
+        logger.info(
+            "SessionTrackerStore: saved %d of %d prefix trackers (%d bytes) to %s",
+            len(entries),
+            len(self._trackers),
+            size,
+            path,
+        )
+        return len(entries)
+
+    def _encode_tracker(self, key: str, tracker: PrefixCacheTracker, session_id: str | None) -> str:
+        """One tracker as JSON, each distinct message stored once.
+
+        Successive turns, the lineage snapshots and the original/forwarded
+        pairs mostly repeat the same messages, so this keeps the file near one
+        copy of each conversation instead of up to eleven.
+        """
+        index: dict[str, int] = {}
+        memo: dict[int, list[int]] = {}
+
+        def ref(messages: list[Any]) -> list[int]:
+            if id(messages) not in memo:
+                refs = []
+                for message in messages:
+                    blob = json.dumps(message)
+                    refs.append(index.setdefault(blob, len(index)))
+                memo[id(messages)] = refs
+            return memo[id(messages)]
+
+        def state(s: tuple[Any, ...]) -> list[Any]:
+            return [s[0], s[1], s[2], ref(s[3]), ref(s[4])]
+
+        maturation = tracker.read_maturation_manager
+        meta = {
+            "key": key,
+            "session": session_id,
+            "affinity": self._lineage_affinities.get(key),
+            "provider": tracker.provider,
+            "last_activity": tracker._last_activity,
+            "cache_ttl": tracker._cache_ttl_seconds,
+            "state": state(tracker._turn_state()),
+            "turns": [[t, state(s)] for t, s in tracker._turn_states.items() if s is not None],
+            "history": [[ref(snap), t] for snap, t in self._lineage_history.get(key, ())],
+            "maturation": None if maturation is None else maturation.export_state(),
+        }
+        return f'{{"meta":{json.dumps(meta)},"messages":[{",".join(index)}]}}'
+
+    def load_state(self, path: str) -> int:
+        """Resume the trackers :meth:`save_state` wrote, before serving.
+
+        Trackers past their retention are dropped. The file is removed once
+        loaded, so a later crash cannot bring back state older than what it
+        lost. A missing file is normal; an unreadable or invalid one is logged
+        and leaves the store empty. Never raises; returns trackers restored.
+        """
+        from headroom.paths import persistence_allowed
+
+        # Loading deletes the file, so stateless mode leaves it for a later run.
+        if not persistence_allowed("prefix-cache tracker state"):
+            return 0
+        try:
+            with open(path, encoding="utf-8") as f:
+                data = json.load(f)
+            restored = self._decode_state(data)
+        except FileNotFoundError:
+            return 0
+        except Exception as exc:  # any bad file must leave boot unaffected
+            logger.warning(
+                "SessionTrackerStore: ignoring prefix state %s (%s: %s)",
+                path,
+                type(exc).__name__,
+                exc,
+            )
+            return 0
+        try:
+            os.remove(path)
+        except OSError as exc:
+            logger.warning("SessionTrackerStore: could not remove %s: %s", path, exc)
+        logger.info(
+            "SessionTrackerStore: restored %d of %d prefix trackers from %s",
+            restored,
+            len(data["trackers"]),
+            path,
+        )
+        return restored
+
+    def _decode_state(self, data: Any) -> int:
+        """Validate the whole file first, then install it; a bad file installs nothing."""
+        from headroom.cache.compression_store import CompressionEntry, get_compression_store
+
+        if data.get("version") != _PREFIX_STATE_VERSION:
+            raise ValueError(f"unsupported version {data.get('version')!r}")
+        ccr = [CompressionEntry(**record) for record in data["ccr"]]
+        trackers: dict[str, PrefixCacheTracker] = {}
+        families: dict[str, OrderedDict[str, list[Any]]] = {}
+        affinities: dict[str, str | None] = {}
+        histories: dict[str, deque[tuple[list[Any], int]]] = {}
+        now = time.time()
+        # Oldest first, so each family keeps its lineages in creation order.
+        for entry in reversed(data["trackers"]):
+            meta, table = entry["meta"], entry["messages"]
+            tracker = PrefixCacheTracker(str(meta["provider"]), self._default_config)
+            tracker._last_activity = float(meta["last_activity"])
+            tracker.observe_cache_ttl(meta["cache_ttl"])
+            # NaN or a future stamp would never expire.
+            if tracker.is_expired or not tracker._last_activity <= now:
+                continue
+            (
+                tracker._turn_number,
+                tracker._cached_token_count,
+                tracker._cached_message_count,
+                tracker._last_original_messages,
+                tracker._last_forwarded_messages,
+            ) = _decode_turn_state(table, meta["state"])
+            tracker._turn_states = {int(t): _decode_turn_state(table, s) for t, s in meta["turns"]}
+            tracker.restored_from_disk = True
+            if meta["maturation"] is not None:
+                from headroom.transforms.read_maturation import ReadMaturationManager
+
+                tracker.restored_maturation_state = ReadMaturationManager.validate_state(
+                    meta["maturation"]
+                )
+            key = str(meta["key"])
+            trackers[key] = tracker
+            history = deque(
+                ((_deref(table, snap), int(t)) for snap, t in meta["history"]),
+                maxlen=_LINEAGE_HISTORY,
+            )
+            if not history:
+                continue
+            histories[key] = history
+            if meta["session"] is not None:
+                families.setdefault(str(meta["session"]), OrderedDict())[key] = history[0][0]
+                affinity = meta["affinity"]
+                affinities[key] = None if affinity is None else str(affinity)
+
+        if ccr and trackers:
+            # First, so a marker a restored tracker replays resolves from its
+            # first request; a failure here still installs no tracker.
+            get_compression_store().import_entries(ccr)
+
+        # New turns and lineages must not reuse a restored id.
+        turns = [t for h in histories.values() for _, t in h]
+        turns += [t for tracker in trackers.values() for t in tracker._turn_states]
+        lineage_ns = [
+            int(n)
+            for _, sep, n in (key.rpartition("\x00") for key in trackers)
+            if sep and n.isdecimal()
+        ]
+        self._turn_counter = itertools.count(max([next(self._turn_counter), *turns]) + 1)
+        self._lineage_counter = itertools.count(max([next(self._lineage_counter), *lineage_ns]) + 1)
+        self._trackers.update(trackers)
+        self._lineage_history.update(histories)
+        self._lineage_affinities.update(affinities)
+        for session_id, family in families.items():
+            self._lineages.setdefault(session_id, OrderedDict()).update(family)
+        return len(trackers)

@@ -10,6 +10,7 @@ const fs = nodeRequire("node:fs") as typeof import("node:fs");
 export const BASE_URL_HEADER = "x-headroom-base-url";
 export const ORIGINAL_PATH_HEADER = "x-headroom-original-path";
 export const PROJECT_HEADER = "x-headroom-project";
+export const SESSION_TOKEN_HEADER = "x-headroom-session-token";
 const PROXY_ENV = "HEADROOM_OPENCODE_TRANSPORT_PROXY_URL";
 export const EXCLUDE_HOSTS_ENV = "HEADROOM_OPENCODE_EXCLUDE_HOSTS";
 const STATE_KEY = Symbol.for("headroom.opencode.transport");
@@ -30,6 +31,7 @@ interface InstallOptions {
   project?: string;
   excludeHosts?: string[];
   debug?: boolean;
+  sessionToken?: string;
 }
 
 interface TransportState {
@@ -38,6 +40,7 @@ interface TransportState {
   project: string | undefined;
   excludeHosts: string[];
   debug: boolean;
+  sessionToken: string | undefined;
   originalFetch: typeof fetch;
   originalHttpRequest: HttpRequest;
   originalHttpGet: HttpGet;
@@ -325,6 +328,7 @@ function mergeFetchHeaders(
   upstream: URL | undefined,
   originalPath: string | undefined = undefined,
   project: string | undefined = undefined,
+  sessionToken: string | undefined = undefined,
 ): Headers {
   const headers = new Headers(input instanceof Request ? input.headers : undefined);
   if (init?.headers) {
@@ -340,6 +344,9 @@ function mergeFetchHeaders(
   if (project) {
     headers.set(PROJECT_HEADER, project);
   }
+  if (sessionToken) {
+    headers.set(SESSION_TOKEN_HEADER, sessionToken);
+  }
   return headers;
 }
 
@@ -349,6 +356,7 @@ function withRoutedFetchInput(
   proxy: URL,
   project: string | undefined,
   excludeHosts: string[],
+  sessionToken: string | undefined,
 ): FetchArgs {
   const upstream = requestUrl(input);
   if (!shouldRoute(upstream, proxy, excludeHosts)) {
@@ -358,7 +366,7 @@ function withRoutedFetchInput(
   const { url: nextUrl, originalPath } = routedUrlForOpenCode(upstream, proxy);
   const nextInit = {
     ...init,
-    headers: mergeFetchHeaders(input, init, upstream, originalPath, project),
+    headers: mergeFetchHeaders(input, init, upstream, originalPath, project, sessionToken),
   };
 
   if (input instanceof Request) {
@@ -416,6 +424,7 @@ function headersForNodeRequest(
   upstream: URL,
   originalPath: string | undefined,
   project: string | undefined,
+  sessionToken: string | undefined,
 ): Record<string, string> {
   const headers = new Headers(options.headers as HeadersInit | undefined);
   headers.set(BASE_URL_HEADER, upstream.origin);
@@ -424,6 +433,9 @@ function headersForNodeRequest(
   }
   if (project) {
     headers.set(PROJECT_HEADER, project);
+  }
+  if (sessionToken) {
+    headers.set(SESSION_TOKEN_HEADER, sessionToken);
   }
   headers.delete("host");
 
@@ -439,6 +451,7 @@ function routedNodeOptions(
   proxy: URL,
   project: string | undefined,
   excludeHosts: string[],
+  sessionToken: string | undefined,
 ): Record<string, unknown> | undefined {
   if (!parts.url || !shouldRoute(parts.url, proxy, excludeHosts)) {
     return undefined;
@@ -472,7 +485,7 @@ function routedNodeOptions(
     hostname: nextUrl.hostname,
     port: nextUrl.port || undefined,
     path: `${nextUrl.pathname}${nextUrl.search}`,
-    headers: headersForNodeRequest(parts.options, parts.url, originalPath, project),
+    headers: headersForNodeRequest(parts.options, parts.url, originalPath, project, sessionToken),
   };
 }
 
@@ -489,7 +502,7 @@ function wrapRequest(
 
     const proxy = normalizeProxyUrl(state.proxyUrl);
     const parts = splitNodeArgs(args);
-    const nextOptions = routedNodeOptions(parts, proxy, state.project, state.excludeHosts);
+    const nextOptions = routedNodeOptions(parts, proxy, state.project, state.excludeHosts, state.sessionToken);
     if (!nextOptions) {
       return Reflect.apply(originalRequest, this, args);
     }
@@ -527,6 +540,7 @@ export function installHeadroomTransport(options: InstallOptions): () => void {
     existing.project = options.project;
     existing.excludeHosts = excludeHosts;
     existing.debug = Boolean(options.debug);
+    existing.sessionToken = options.sessionToken;
     installProcessEnv(options.proxyUrl, excludeHosts);
     return () => uninstallHeadroomTransport();
   }
@@ -537,6 +551,7 @@ export function installHeadroomTransport(options: InstallOptions): () => void {
     project: options.project,
     excludeHosts,
     debug: Boolean(options.debug),
+    sessionToken: options.sessionToken,
     originalFetch: globalThis.fetch,
     originalHttpRequest: http.request,
     originalHttpGet: http.get,
@@ -557,7 +572,7 @@ export function installHeadroomTransport(options: InstallOptions): () => void {
       return state.originalFetch(...args);
     }
     const proxy = normalizeProxyUrl(current.proxyUrl);
-    const [nextInput, nextInit] = withRoutedFetchInput(args[0], args[1], proxy, current.project, current.excludeHosts);
+    const [nextInput, nextInit] = withRoutedFetchInput(args[0], args[1], proxy, current.project, current.excludeHosts, current.sessionToken);
     return state.originalFetch(nextInput, nextInit);
   };
 

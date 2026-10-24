@@ -5,6 +5,9 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+import pytest
+
+from headroom import fsutil
 from headroom.mcp_registry.antigravity import AntigravityRegistrar
 from headroom.mcp_registry.base import RegisterStatus, ServerSpec
 from headroom.mcp_registry.install import get_all_registrars, install_everywhere
@@ -225,6 +228,31 @@ def test_unregister_removes_entry_from_all_locations(tmp_path: Path) -> None:
         assert "headroom" not in payload["mcpServers"]
         # Unrelated entries are preserved in both files.
         assert payload["mcpServers"]["other"] == {"command": "other-server"}
+
+
+def test_unregister_reports_failure_when_a_write_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    registrar = _make_registrar(tmp_path)
+    current, legacy = _config_path(tmp_path), _legacy_config_path(tmp_path)
+    for path in (current, legacy):
+        path.parent.mkdir(parents=True)
+        path.write_text(json.dumps({"mcpServers": {"headroom": {"command": "headroom"}}}))
+
+    real_write = fsutil.write_text
+
+    def fail_current(path: Path, content: str) -> None:
+        if path == current:
+            raise OSError("read-only filesystem")
+        return real_write(path, content)
+
+    monkeypatch.setattr(fsutil, "write_text", fail_current)
+
+    # The legacy config was cleaned up, but the failed one still registers the
+    # server — so this must not report success.
+    assert registrar.unregister_server("headroom") is False
+    assert "headroom" in json.loads(current.read_text())["mcpServers"]
+    assert "headroom" not in json.loads(legacy.read_text())["mcpServers"]
 
 
 def test_registrar_name_and_display_name() -> None:

@@ -489,3 +489,25 @@ describe("default export", () => {
     });
   });
 });
+
+
+describe("OpenCode 2.x workspace session identity", () => {
+  it.each([undefined, "explicit-session"])("carries the resolved session token through both routes (%s)", async (sessionToken) => {
+    vi.stubEnv("HEADROOM_OPENCODE_SESSION_TOKEN", "environment-session");
+    const models: FakeModel[] = [{
+      id: "custom", providerID: "gateway",
+      package: "@opencode/ai/providers/openai-compatible",
+      settings: { baseURL: "https://gateway.example/v1" },
+    }];
+    const { context } = pluginContextV2({ sessionToken }, { models });
+    const cleanup = await headroomSetup(context);
+    try {
+      const expected = sessionToken ?? "environment-session";
+      expect(models[0].headers?.["x-headroom-session-token"]).toBe(expected);
+      expect((globalThis as Record<symbol, { sessionToken?: string }>)[TRANSPORT_STATE]?.sessionToken).toBe(expected);
+    } finally {
+      await cleanup?.();
+      vi.unstubAllEnvs();
+    }
+  });
+});

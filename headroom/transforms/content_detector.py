@@ -1009,20 +1009,3 @@ def _try_detect_code(content: str) -> DetectionResult | None:
         confidence,
         {"language": best_lang, "pattern_matches": best_score},
     )
-
-
-def is_json_array_of_dicts(content: str) -> bool:
-    """Quick check if content is a JSON array of dictionaries.
-
-    This is the format SmartCrusher can handle natively.
-
-    Args:
-        content: The content to check.
-
-    Returns:
-        True if content is a JSON array where all items are dicts.
-    """
-    result = detect_content_type(content)
-    return result.content_type == ContentType.JSON_ARRAY and result.metadata.get(
-        "is_dict_array", False
-    )

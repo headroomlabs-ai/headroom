@@ -221,7 +221,7 @@ async def test_count_texts_offloaded_runs_on_worker_thread(monkeypatch) -> None:
 
     monkeypatch.setattr("headroom.tokenizers.get_tokenizer", lambda *a, **k: _SpyTokenizer())
 
-    _, tokens = await proxy._count_texts_offloaded("gemini-pro", ["hello", "world"])
+    _, tokens = await count_texts_offloaded(proxy, "gemini-pro", ["hello", "world"])
 
     assert tokens > 0
     assert seen["thread"].startswith("headroom-compress")
@@ -238,7 +238,7 @@ async def test_count_texts_offloaded_fails_open(monkeypatch) -> None:  # noqa: A
 
     monkeypatch.setattr("headroom.tokenizers.get_tokenizer", _boom)
 
-    tokenizer, tokens = await proxy._count_texts_offloaded("deepseek-chat", ["hello", "world"])
+    tokenizer, tokens = await count_texts_offloaded(proxy, "deepseek-chat", ["hello", "world"])
 
     assert isinstance(tokenizer, EstimatingTokenCounter)
     assert tokens > 0
@@ -274,7 +274,7 @@ async def test_count_texts_offloaded_sums_fragments(monkeypatch) -> None:  # noq
     )
     fragments = ["hello", "world", "foo"]
 
-    _, total = await proxy._count_texts_offloaded("gemini-pro", fragments)
+    _, total = await count_texts_offloaded(proxy, "gemini-pro", fragments)
 
     est = EstimatingTokenCounter()
     assert total == sum(est.count_text(f) for f in fragments)

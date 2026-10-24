@@ -211,8 +211,13 @@ picks the level:
 
 ```bash
 headroom learn --verbosity            # dry run — preview what it found
-headroom learn --verbosity --apply    # save it; the proxy picks it up
+headroom learn --verbosity --apply    # save it and apply it to the running proxy
 ```
+
+A proxy in cache mode (the default) never re-reads the learned level, because a
+level that changes mid-conversation would bust the prompt cache. There `--apply`
+pins it with `HEADROOM_VERBOSITY_LEVEL`; set that variable yourself to keep it
+after a restart.
 
 **Measuring it.** Output savings are counterfactual — we never see what the model
 *would* have written — so Headroom reports an estimate with a confidence range
@@ -619,8 +624,8 @@ prompts, completions, code or file paths. It exists so we can see when a release
 regresses a compression ratio across real workloads rather than only our own test
 corpus.
 
-Turn it off with `HEADROOM_BEACON=off`, the `DO_NOT_TRACK=1` convention, or
-`HEADROOM_OFFLINE=1`. The full field list is in
+Turn it off with `HEADROOM_BEACON=off`, `HEADROOM_TELEMETRY=off`, the
+`DO_NOT_TRACK=1` convention, or `HEADROOM_OFFLINE=1`. The full field list is in
 [the proxy docs](https://docs.headroomlabs.ai/docs/proxy).
 
 ## Headroom for teams

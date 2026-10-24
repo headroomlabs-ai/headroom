@@ -7,6 +7,7 @@ Tests cover:
 4. Edge cases
 """
 
+from headroom._core import detect_log_format
 from headroom.transforms.log_compressor import (
     LogCompressionResult,
     LogCompressor,
@@ -15,6 +16,21 @@ from headroom.transforms.log_compressor import (
     LogLevel,
     LogLine,
 )
+
+
+def _detect(lines: list[str]) -> LogFormat:
+    """The Rust format detector that compress() uses."""
+    return LogFormat(detect_log_format(list(lines)))
+
+
+_FILLER = [f"step {i} ok" for i in range(100)]
+
+
+def _compress_amid_filler(lines: list[str], **config) -> LogCompressionResult:
+    """Compress ``lines`` between 100 filler lines on each side, so selection
+    actually has to choose."""
+    content = "\n".join([*_FILLER, *lines, *_FILLER])
+    return LogCompressor(LogCompressorConfig(enable_ccr=False, **config)).compress(content)
 
 
 class TestLogFormatDetection:
@@ -36,9 +52,8 @@ tests/test_foo.py::test_edge - AssertionError
 FAILED tests/test_foo.py::test_edge
 ========================= 1 failed, 14 passed =========================
 """
-        compressor = LogCompressor()
         lines = content.split("\n")
-        detected = compressor._detect_format(lines)
+        detected = _detect(lines)
         assert detected == LogFormat.PYTEST
 
     def test_detect_npm_format(self):
@@ -50,9 +65,8 @@ npm ERR! ERESOLVE unable to resolve dependency tree
 npm info using npm@9.0.0
 > added 150 packages in 5s
 """
-        compressor = LogCompressor()
         lines = content.split("\n")
-        detected = compressor._detect_format(lines)
+        detected = _detect(lines)
         assert detected == LogFormat.NPM
 
     def test_detect_cargo_format(self):
@@ -70,9 +84,8 @@ error[E0382]: borrow of moved value: `s`
     Finished dev [unoptimized + debuginfo] target(s) in 0.50s
      Running `target/debug/myproject`
 """
-        compressor = LogCompressor()
         lines = content.split("\n")
-        detected = compressor._detect_format(lines)
+        detected = _detect(lines)
         assert detected == LogFormat.CARGO
 
     def test_detect_make_format(self):
@@ -84,9 +97,8 @@ make[1]: *** [Makefile:10: utils.o] Error 1
 make: *** [Makefile:5: all] Error 2
 g++ -Wall -o program main.cpp utils.cpp
 """
-        compressor = LogCompressor()
         lines = content.split("\n")
-        detected = compressor._detect_format(lines)
+        detected = _detect(lines)
         assert detected == LogFormat.MAKE
 
     def test_detect_jest_format(self):
@@ -96,9 +108,8 @@ FAIL src/utils/helpers.test.ts
   Test Suites: 1 failed, 1 passed, 2 total
   Tests:       2 failed, 10 passed, 12 total
 """
-        compressor = LogCompressor()
         lines = content.split("\n")
-        detected = compressor._detect_format(lines)
+        detected = _detect(lines)
         assert detected == LogFormat.JEST
 
     def test_detect_generic_format(self):
@@ -109,238 +120,70 @@ WARNING Low memory
 ERROR Connection timeout
 CRITICAL System failure
 """
-        compressor = LogCompressor()
         lines = content.split("\n")
-        detected = compressor._detect_format(lines)
+        detected = _detect(lines)
         assert detected == LogFormat.GENERIC
 
     def test_detect_empty_returns_generic(self):
         """Empty or minimal input returns GENERIC."""
-        compressor = LogCompressor()
-        assert compressor._detect_format([]) == LogFormat.GENERIC
-        assert compressor._detect_format(["random line"]) == LogFormat.GENERIC
+        assert _detect([]) == LogFormat.GENERIC
+        assert _detect(["random line"]) == LogFormat.GENERIC
 
 
 class TestLogLevelDetection:
-    """Tests for log level detection in lines."""
+    """Level counts reported by compress(). DEBUG/TRACE/UNKNOWN and the full
+    keyword table are unit-tested in Rust (level_classifier_covers_every_level)."""
 
-    def test_detect_error_levels(self):
-        """ERROR, FATAL, CRITICAL are detected."""
-        compressor = LogCompressor()
-
-        error_lines = [
+    def test_level_counts(self):
+        lines = [
             "ERROR: something went wrong",
             "error: file not found",
             "Error: Invalid input",
             "FATAL: system crash",
             "fatal error occurred",
             "CRITICAL: database down",
-        ]
-
-        for line in error_lines:
-            log_lines = compressor._parse_lines([line])
-            assert log_lines[0].level == LogLevel.ERROR, f"Failed for: {line}"
-
-    def test_detect_fail_levels(self):
-        """FAIL, FAILED are detected."""
-        compressor = LogCompressor()
-
-        fail_lines = [
             "FAIL tests/test_foo.py",
             "FAILED to connect",
             "Test failed",
-        ]
-
-        for line in fail_lines:
-            log_lines = compressor._parse_lines([line])
-            assert log_lines[0].level == LogLevel.FAIL, f"Failed for: {line}"
-
-    def test_detect_warn_levels(self):
-        """WARN, WARNING are detected."""
-        compressor = LogCompressor()
-
-        warn_lines = [
             "WARN: deprecated function",
             "WARNING: low disk space",
             "warning: unused variable",
+            "INFO: starting process",
+            "info starting",
+            "DEBUG: variable x = 5",
+            "TRACE: entering function",
         ]
-
-        for line in warn_lines:
-            log_lines = compressor._parse_lines([line])
-            assert log_lines[0].level == LogLevel.WARN, f"Failed for: {line}"
-
-    def test_detect_info_debug_trace(self):
-        """INFO, DEBUG, TRACE are detected."""
-        compressor = LogCompressor()
-
-        test_cases = [
-            ("INFO: starting process", LogLevel.INFO),
-            ("info starting", LogLevel.INFO),
-            ("DEBUG: variable x = 5", LogLevel.DEBUG),
-            ("debug mode enabled", LogLevel.DEBUG),
-            ("TRACE: entering function", LogLevel.TRACE),
-        ]
-
-        for line, expected_level in test_cases:
-            log_lines = compressor._parse_lines([line])
-            assert log_lines[0].level == expected_level, f"Failed for: {line}"
-
-    def test_unknown_level_default(self):
-        """Lines without level markers default to UNKNOWN."""
-        compressor = LogCompressor()
-        log_lines = compressor._parse_lines(["Just some regular text"])
-        assert log_lines[0].level == LogLevel.UNKNOWN
+        stats = _compress_amid_filler(lines).stats
+        assert stats["errors"] == 6
+        assert stats["fails"] == 3
+        assert stats["warnings"] == 3
+        assert stats["info"] == 2
 
 
 class TestStackTraceDetection:
-    """Tests for stack trace detection."""
+    """Stack-trace lines survive compression. Python, Go, Rust-panic, .NET and
+    Java traces are unit-tested in Rust; these pin the JS and rustc shapes."""
 
-    def test_detect_python_traceback(self):
-        """Python traceback is detected."""
-        content = """Traceback (most recent call last):
-  File "main.py", line 42, in process
-    result = compute(data)
-  File "utils.py", line 15, in compute
-    return data / 0
-ZeroDivisionError: division by zero
-"""
-        compressor = LogCompressor()
-        log_lines = compressor._parse_lines(content.split("\n"))
-
-        # First several lines should be marked as stack trace
-        stack_trace_count = sum(1 for line in log_lines if line.is_stack_trace)
-        assert stack_trace_count > 0
-
-    def test_detect_javascript_stack_trace(self):
-        """JavaScript stack trace is detected."""
-        content = """Error: Connection failed
-    at Connection.connect (src/db.js:42:15)
-    at async main (src/index.js:10:5)
-"""
-        compressor = LogCompressor()
-        log_lines = compressor._parse_lines(content.split("\n"))
-
-        stack_trace_count = sum(1 for line in log_lines if line.is_stack_trace)
-        assert stack_trace_count > 0
-
-    def test_detect_rust_error_location(self):
-        """Rust error location is detected."""
-        content = """error[E0382]: borrow of moved value: `s`
- --> src/main.rs:5:13
-  |
-3 |     let s = String::from("hello");
-  |         - move occurs
-"""
-        compressor = LogCompressor()
-        log_lines = compressor._parse_lines(content.split("\n"))
-
-        stack_trace_count = sum(1 for line in log_lines if line.is_stack_trace)
-        assert stack_trace_count > 0
-
-
-class TestLineDeduplication:
-    """Tests for warning/line deduplication."""
-
-    def test_dedupe_identical_warnings(self):
-        """Identical warnings are deduplicated."""
-        compressor = LogCompressor()
-
-        lines = [
-            LogLine(line_number=1, content="WARNING: unused variable 'x'", level=LogLevel.WARN),
-            LogLine(line_number=2, content="WARNING: unused variable 'x'", level=LogLevel.WARN),
-            LogLine(line_number=3, content="WARNING: unused variable 'x'", level=LogLevel.WARN),
+    def test_javascript_stack_trace_kept(self):
+        trace = [
+            "Error: Connection failed",
+            "    at Connection.connect (src/db.js:42:15)",
+            "    at async main (src/index.js:10:5)",
         ]
+        # No context lines, so only stack-trace detection can keep the frames.
+        compressed = _compress_amid_filler(trace, error_context_lines=0).compressed
+        for line in trace:
+            assert line in compressed
 
-        deduped = compressor._dedupe_similar(lines)
-        assert len(deduped) == 1
-
-    def test_dedupe_similar_with_numbers(self):
-        """Similar warnings with different numbers are deduplicated."""
-        compressor = LogCompressor()
-
-        lines = [
-            LogLine(line_number=1, content="WARNING: error at line 10", level=LogLevel.WARN),
-            LogLine(line_number=2, content="WARNING: error at line 20", level=LogLevel.WARN),
-            LogLine(line_number=3, content="WARNING: error at line 30", level=LogLevel.WARN),
+    def test_rust_error_location_kept(self):
+        trace = [
+            "error[E0382]: borrow of moved value: `s`",
+            " --> src/main.rs:5:13",
         ]
-
-        deduped = compressor._dedupe_similar(lines)
-        # Numbers normalized to "N", so all three are treated as identical pattern
-        assert len(deduped) == 1
-
-    def test_dedupe_similar_with_paths(self):
-        """Similar warnings with different paths are deduplicated.
-
-        Note: The path regex /[\\w/]+/ requires paths to end with '/'.
-        Paths like '/path/to/' will be normalized, but '/path/to/file' won't
-        be fully normalized because 'file' doesn't end with '/'.
-        """
-        compressor = LogCompressor()
-
-        # Paths ending with / are normalized
-        lines = [
-            LogLine(line_number=1, content="WARNING: in /path/to/ error", level=LogLevel.WARN),
-            LogLine(line_number=2, content="WARNING: in /other/dir/ error", level=LogLevel.WARN),
-            LogLine(line_number=3, content="WARNING: in /another/path/ error", level=LogLevel.WARN),
-        ]
-
-        deduped = compressor._dedupe_similar(lines)
-        # Paths normalized to /PATH/, so all three are treated as identical pattern
-        assert len(deduped) == 1
-
-    def test_keeps_different_warnings(self):
-        """Different warnings are preserved."""
-        compressor = LogCompressor()
-
-        lines = [
-            LogLine(line_number=1, content="WARNING: unused variable", level=LogLevel.WARN),
-            LogLine(line_number=2, content="WARNING: deprecated function", level=LogLevel.WARN),
-            LogLine(line_number=3, content="WARNING: missing docstring", level=LogLevel.WARN),
-        ]
-
-        deduped = compressor._dedupe_similar(lines)
-        assert len(deduped) == 3
-
-
-class TestLineScoring:
-    """Tests for line importance scoring."""
-
-    def test_error_lines_score_highest(self):
-        """ERROR and FAIL lines get highest scores."""
-        compressor = LogCompressor()
-
-        error_line = LogLine(line_number=1, content="ERROR: critical", level=LogLevel.ERROR)
-        fail_line = LogLine(line_number=2, content="FAILED test", level=LogLevel.FAIL)
-        info_line = LogLine(line_number=3, content="INFO: normal", level=LogLevel.INFO)
-
-        error_score = compressor._score_line(error_line)
-        fail_score = compressor._score_line(fail_line)
-        info_score = compressor._score_line(info_line)
-
-        assert error_score > info_score
-        assert fail_score > info_score
-
-    def test_stack_trace_boost(self):
-        """Stack trace lines get boosted score."""
-        compressor = LogCompressor()
-
-        regular = LogLine(line_number=1, content="some line", level=LogLevel.UNKNOWN)
-        stack_trace = LogLine(
-            line_number=2, content="  File 'x.py'", level=LogLevel.UNKNOWN, is_stack_trace=True
-        )
-
-        assert compressor._score_line(stack_trace) > compressor._score_line(regular)
-
-    def test_summary_line_boost(self):
-        """Summary lines get boosted score."""
-        compressor = LogCompressor()
-
-        regular = LogLine(line_number=1, content="some line", level=LogLevel.UNKNOWN)
-        summary = LogLine(
-            line_number=2, content="10 passed, 2 failed", level=LogLevel.UNKNOWN, is_summary=True
-        )
-
-        assert compressor._score_line(summary) > compressor._score_line(regular)
+        # No context lines, so only stack-trace detection can keep the frames.
+        compressed = _compress_amid_filler(trace, error_context_lines=0).compressed
+        for line in trace:
+            assert line in compressed
 
 
 class TestCompressionBehavior:

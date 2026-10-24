@@ -11,14 +11,9 @@ from pathlib import Path
 
 from headroom._subprocess import run
 from headroom.mcp_registry.install import DEFAULT_PROXY_URL
+from headroom.providers.codex import proxy_base_url
 
 from .config import HEADROOM_OPENCODE_PLUGIN, headroom_provider_entry
-
-
-def proxy_base_url(port: int) -> str:
-    """Return the local proxy base URL used by OpenCode integrations."""
-    return f"http://127.0.0.1:{port}/v1"
-
 
 # OpenCode 2.x subcommands. Of these only the interactive ones (the root TUI,
 # ``run`` and ``mini``) get ``--standalone``; the rest are management commands.
@@ -217,6 +212,7 @@ def build_launch_env(
     *,
     include_mcp: bool = True,
     include_plugin: bool = True,
+    session_token: str | None = None,
 ) -> tuple[dict[str, str], list[str]]:
     """Build environment variables for launching OpenCode through Headroom.
 
@@ -224,6 +220,11 @@ def build_launch_env(
     Existing provider/base URL environment variables are preserved. When the
     transport plugin is loaded, ``HEADROOM_PROXY_URL`` tells it which proxy to
     route to.
+
+    ``session_token`` reaches the plugin (as
+    ``HEADROOM_OPENCODE_SESSION_TOKEN``) only when it's loaded -- the only
+    layer able to send a header. Without it, disk-verify stays ``UNKNOWN``,
+    same as Cursor.
     """
     env = dict(environ or os.environ)
 
@@ -237,6 +238,8 @@ def build_launch_env(
     display = ["OPENCODE_CONFIG_CONTENT={provider: headroom}"]
     if "plugin" in config_content:
         env["HEADROOM_PROXY_URL"] = f"http://127.0.0.1:{port}"
+        if session_token:
+            env["HEADROOM_OPENCODE_SESSION_TOKEN"] = session_token
         display.append(f"plugin={HEADROOM_OPENCODE_PLUGIN}")
 
     if project and "HEADROOM_PROJECT" not in env:

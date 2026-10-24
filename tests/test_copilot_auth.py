@@ -541,7 +541,7 @@ def test_subscription_enterprise_host_repro(
     assert resolution.token == "copilot-api"
     assert resolution.source == "headroom-copilot-auth:/tmp/copilot_auth.json:token-exchange"
     assert resolution.confidence == "copilot-token-exchange"
-    assert resolution.api_url == copilot_auth.DEFAULT_API_URL
+    assert resolution.api_url == "https://api.enterprise.githubcopilot.com"
     assert resolution.token_fingerprint == copilot_auth.token_fingerprint("copilot-api")
     assert resolution.refresh_oauth_token == "gho-oauth"
     assert isinstance(resolution.api_token_expires_at, float)
@@ -589,7 +589,7 @@ def test_resolve_subscription_exchange_uses_cloud_enterprise_advertised_api(
     resolution = copilot_auth.resolve_subscription_bearer_token_details()
 
     assert resolution is not None
-    assert resolution.api_url == copilot_auth.DEFAULT_API_URL
+    assert resolution.api_url == "https://api.enterprise.githubcopilot.com"
     assert copilot_auth._token_exchange_url() == "https://api.github.com/copilot_internal/v2/token"
 
 
@@ -610,7 +610,8 @@ def test_api_url_from_exchange_payload_rejects_non_copilot_host(
         oauth_token="gho-oauth",
     )
 
-    assert resolved == copilot_auth.DEFAULT_API_URL
+    # The foreign host is ignored; the user-info lookup's Business host is used.
+    assert resolved == "https://api.business.githubcopilot.com"
 
 
 def _resolve_subscription_producer_path(
@@ -718,16 +719,66 @@ def test_subscription_unknown_host_passthrough(monkeypatch: pytest.MonkeyPatch) 
     [
         "https://api.githubcopilot.com",
         "https://api.individual.githubcopilot.com",
-        "https://api.business.githubcopilot.com",
-        "https://api.enterprise.githubcopilot.com",
     ],
 )
-def test_subscription_known_hosts_normalize_to_default(payload_host: str) -> None:
+def test_subscription_individual_host_normalizes_to_default(
+    monkeypatch: pytest.MonkeyPatch, payload_host: str
+) -> None:
+    """#610: the individual host lags on newer models, so it is never routed to."""
+    monkeypatch.delenv("GITHUB_COPILOT_API_URL", raising=False)
+    monkeypatch.delenv("GITHUB_COPILOT_USE_ADVERTISED_HOST", raising=False)
     assert (
         copilot_auth._subscription_api_url_from_user_info_payload(
             {"endpoints": {"api": payload_host}}
         )
         == copilot_auth.DEFAULT_API_URL
+    )
+
+
+@pytest.mark.parametrize(
+    "payload_host",
+    [
+        "https://api.business.githubcopilot.com",
+        "https://api.enterprise.githubcopilot.com",
+    ],
+)
+def test_subscription_business_and_enterprise_hosts_are_honoured(
+    monkeypatch: pytest.MonkeyPatch, payload_host: str
+) -> None:
+    """A firewall on GitHub's subscription-based routing allows only the plan host."""
+    monkeypatch.delenv("GITHUB_COPILOT_API_URL", raising=False)
+    monkeypatch.delenv("GITHUB_COPILOT_USE_ADVERTISED_HOST", raising=False)
+    assert (
+        copilot_auth._subscription_api_url_from_user_info_payload(
+            {"endpoints": {"api": payload_host + "/"}}
+        )
+        == payload_host
+    )
+
+
+@pytest.mark.parametrize("opt_out", ["0", "false", "no", "off", " OFF "])
+def test_subscription_advertised_host_opt_out_restores_generic_fold(
+    monkeypatch: pytest.MonkeyPatch, opt_out: str
+) -> None:
+    """#2455: seats whose plan host lags on models can fold back to the generic host."""
+    monkeypatch.delenv("GITHUB_COPILOT_API_URL", raising=False)
+    monkeypatch.setenv("GITHUB_COPILOT_USE_ADVERTISED_HOST", opt_out)
+    assert (
+        copilot_auth._subscription_api_url_from_user_info_payload(
+            {"endpoints": {"api": "https://api.enterprise.githubcopilot.com"}}
+        )
+        == copilot_auth.DEFAULT_API_URL
+    )
+
+
+def test_subscription_advertised_host_explicit_pin_wins(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("GITHUB_COPILOT_USE_ADVERTISED_HOST", raising=False)
+    monkeypatch.setenv("GITHUB_COPILOT_API_URL", "https://api.githubcopilot.com")
+    assert (
+        copilot_auth._subscription_api_url_from_user_info_payload(
+            {"endpoints": {"api": "https://api.enterprise.githubcopilot.com"}}
+        )
+        == "https://api.githubcopilot.com"
     )
 
 
