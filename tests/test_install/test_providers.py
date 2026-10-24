@@ -432,6 +432,65 @@ def test_apply_mutations_runs_openclaw_for_user_scope(monkeypatch, tmp_path: Pat
     assert [mutation.kind for mutation in mutations] == ["openclaw-wrap"]
 
 
+def test_provider_mutation_failure_reverts_prior_returned_record(
+    monkeypatch, tmp_path: Path
+) -> None:
+    import headroom.providers.install_registry as registry
+
+    manifest = _manifest(tmp_path)
+    manifest.targets = ["first", "second"]
+    first = ManagedMutation(target="first", kind="first")
+    reverted: list[ManagedMutation] = []
+
+    def apply_first(current):
+        return first
+
+    def fail_second(current):
+        raise RuntimeError("second mutation failed")
+
+    def revert(mutation, current):
+        reverted.append(mutation)
+
+    monkeypatch.setattr(
+        registry,
+        "_PROVIDER_SCOPE_HANDLERS",
+        {"first": (apply_first, revert), "second": (fail_second, revert)},
+    )
+
+    with pytest.raises(RuntimeError, match="second mutation failed"):
+        registry.apply_provider_scope_mutations(manifest)
+    assert reverted == [first]
+
+
+def test_provider_rollback_failure_preserves_unreverted_records(
+    monkeypatch, tmp_path: Path
+) -> None:
+    import headroom.providers.install_registry as registry
+
+    manifest = _manifest(tmp_path)
+    manifest.targets = ["first", "second"]
+    first = ManagedMutation(target="first", kind="first")
+
+    def apply_first(current):
+        return first
+
+    def fail_second(current):
+        raise RuntimeError("second mutation failed")
+
+    def fail_revert(mutation, current):
+        raise RuntimeError("rollback unavailable")
+
+    monkeypatch.setattr(
+        registry,
+        "_PROVIDER_SCOPE_HANDLERS",
+        {"first": (apply_first, fail_revert), "second": (fail_second, fail_revert)},
+    )
+
+    with pytest.raises(RuntimeError, match="rollback unavailable"):
+        registry.apply_provider_scope_mutations(manifest)
+    assert manifest.mutations == [first]
+
+
 def test_claude_build_install_env_returns_proxy_base_url() -> None:
     # Arrange / Act
     env = build_claude_install_env(port=5566, backend="ignored")
@@ -682,6 +741,10 @@ def test_inject_codex_provider_config_writes_openai_base_url(
     home = tmp_path
     monkeypatch.setenv("HOME", str(home))
     monkeypatch.setenv("USERPROFILE", str(home))
+    (home / ".codex").mkdir()
+    (home / ".codex" / "auth.json").write_text(
+        '{"OPENAI_API_KEY": "sk-test-only"}', encoding="utf-8"
+    )
 
     wrap_mod._inject_codex_provider_config(8787)
 
@@ -704,6 +767,8 @@ def test_inject_codex_provider_config_writes_openai_base_url(
     assert "requires_openai_auth" not in content, (
         f"requires_openai_auth must be absent from the injected provider block; got:\n{content}"
     )
+    assert "auth = { command =" in content
+    assert "sk-test-only" not in content
     # openai_base_url must be in the top-level block, NOT inside [model_providers.*]
     lines = content.splitlines()
     in_provider_section = False
@@ -891,6 +956,67 @@ def test_planner_provider_scope_unsupported_error_excludes_opencode() -> None:
 
 
 # ---------------------------------------------------------------------------
+# Planner-level antigravity smoke tests
+# ---------------------------------------------------------------------------
+
+
+def test_planner_resolves_antigravity_as_install_target() -> None:
+    from headroom.install.planner import resolve_targets
+
+    targets = resolve_targets("manual", ["antigravity"])
+    assert "antigravity" in targets
+
+
+def test_planner_antigravity_in_supported_targets_enum() -> None:
+    from headroom.install.models import ToolTarget
+    from headroom.install.planner import PROVIDER_SCOPE_TARGETS, SUPPORTED_TARGETS
+
+    assert ToolTarget.ANTIGRAVITY in SUPPORTED_TARGETS
+    assert ToolTarget.ANTIGRAVITY not in PROVIDER_SCOPE_TARGETS
+
+
+def test_planner_antigravity_rejected_in_provider_scope() -> None:
+    import click
+    import pytest
+
+    from headroom.install.planner import resolve_targets
+
+    with pytest.raises(click.ClickException, match="unsupported targets"):
+        resolve_targets("manual", ["antigravity"], scope="provider")
+
+
+def test_planner_build_tool_envs_includes_antigravity() -> None:
+    from headroom.install.planner import build_tool_envs
+
+    envs = build_tool_envs(port=8787, backend="anthropic", targets=["antigravity"])
+    assert "antigravity" in envs
+    assert envs["antigravity"]["OPENAI_BASE_URL"] == "http://127.0.0.1:8787/v1"
+    assert envs["antigravity"]["ANTHROPIC_BASE_URL"] == "http://127.0.0.1:8787"
+
+
+def test_planner_resolve_all_includes_antigravity() -> None:
+    from headroom.install.planner import resolve_targets
+
+    targets = resolve_targets("all", [])
+    assert "antigravity" in targets
+
+
+def test_planner_detect_targets_ignores_bare_gemini_dir(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from pathlib import Path as StdPath
+
+    from headroom.install.planner import detect_targets
+
+    # Gemini CLI keeps its own session data under ~/.gemini/, so the shared
+    # home directory alone must not count as an Antigravity install.
+    (tmp_path / ".gemini").mkdir()
+    monkeypatch.setattr(StdPath, "home", classmethod(lambda cls: tmp_path))
+
+    assert "antigravity" not in detect_targets()
+
+
+# ---------------------------------------------------------------------------
 # Opencode revert OSError fallback
 # ---------------------------------------------------------------------------
 
@@ -937,3 +1063,76 @@ def test_revert_opencode_provider_scope_fallback_on_oserror(monkeypatch, tmp_pat
 
     assert backup_path.exists()  # backup preserved when copy fails
     assert not config_path.exists() or "headroom" not in config_path.read_text()
+
+
+def test_apply_mutations_records_each_provider_mutation_once(monkeypatch, tmp_path: Path) -> None:
+    import headroom.providers.install_registry as registry
+    from headroom.install.providers import apply_mutations
+
+    manifest = _manifest(tmp_path)
+    manifest.targets = ["first"]
+    first = ManagedMutation(target="first", kind="first")
+    monkeypatch.setattr(
+        registry,
+        "_PROVIDER_SCOPE_HANDLERS",
+        {"first": (lambda current: first, lambda mutation, current: None)},
+    )
+
+    assert apply_mutations(manifest) == [first]
+    assert manifest.mutations == [first]
+
+
+def test_unix_env_failure_restores_previous_shell_contents(monkeypatch, tmp_path: Path) -> None:
+    from headroom import fsutil
+    from headroom.install import providers
+
+    manifest = _manifest(tmp_path)
+    manifest.scope = "user"
+    bashrc = tmp_path / ".bashrc"
+    zshrc = tmp_path / ".zshrc"
+    previous = (
+        '# >>> headroom persistent env >>>\nexport OLD="1"\n# <<< headroom persistent env <<<\n'
+    )
+    bashrc.write_text(previous, encoding="utf-8")
+    monkeypatch.setattr(providers, "unix_user_env_targets", lambda: [bashrc, zshrc])
+    real_write = fsutil.write_text
+
+    def write_text(path, content):
+        if Path(path) == zshrc:
+            raise OSError("disk full")
+        real_write(path, content)
+
+    monkeypatch.setattr(fsutil, "write_text", write_text)
+
+    with pytest.raises(OSError, match="disk full"):
+        providers._apply_unix_env_scope(manifest)
+    assert bashrc.read_text(encoding="utf-8") == previous
+    assert not zshrc.exists()
+
+
+def test_unix_env_failure_restores_earlier_targets_when_existing_target_rejects_writes(
+    monkeypatch, tmp_path: Path
+) -> None:
+    from headroom import fsutil
+    from headroom.install import providers
+
+    manifest = _manifest(tmp_path)
+    manifest.scope = "user"
+    bashrc = tmp_path / ".bashrc"
+    zshrc = tmp_path / ".zshrc"
+    bashrc.write_text("# bash\n", encoding="utf-8")
+    zshrc.write_text("# zsh\n", encoding="utf-8")
+    monkeypatch.setattr(providers, "unix_user_env_targets", lambda: [bashrc, zshrc])
+    real_write = fsutil.write_text
+
+    def write_text(path, content):
+        if Path(path) == zshrc:
+            raise OSError("read-only")
+        real_write(path, content)
+
+    monkeypatch.setattr(fsutil, "write_text", write_text)
+
+    with pytest.raises(OSError, match="read-only"):
+        providers._apply_unix_env_scope(manifest)
+    assert bashrc.read_text(encoding="utf-8") == "# bash\n"
+    assert zshrc.read_text(encoding="utf-8") == "# zsh\n"

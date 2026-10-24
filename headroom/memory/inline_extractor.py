@@ -61,6 +61,22 @@ class ParsedResponse:
     raw: str | None  # Original full response
 
 
+def _append_instruction(content: Any, instruction: str) -> Any:
+    """Append the memory instruction to a system prompt's content.
+
+    ``content`` may be a plain string or a list of content-part dicts (OpenAI
+    allows ``content`` as a list; Anthropic system prompts are commonly a list of
+    ``{"type": "text", ...}`` blocks). Concatenating a str onto a list raises
+    ``TypeError``, so a list gets the instruction appended as a trailing text
+    part instead. Any other shape falls back to a string join.
+    """
+    if isinstance(content, list):
+        return [*content, {"type": "text", "text": instruction}]
+    if isinstance(content, str):
+        return content + instruction
+    return f"{content}{instruction}" if content else instruction
+
+
 def inject_memory_instruction(
     messages: list[dict[str, Any]],
     short: bool = True,
@@ -83,7 +99,7 @@ def inject_memory_instruction(
         if msg.get("role") == "system":
             messages[i] = {
                 **msg,
-                "content": msg.get("content", "") + instruction,
+                "content": _append_instruction(msg.get("content", ""), instruction),
             }
             has_system = True
             break
@@ -157,95 +173,3 @@ def parse_response_with_memory(response_text: str | None) -> ParsedResponse:
         memories=memories,
         raw=response_text,
     )
-
-
-class InlineMemoryWrapper:
-    """Wrapper that extracts memories from LLM responses inline.
-
-    This is the zero-latency approach - memories are extracted
-    as part of the response, not in a separate call.
-
-    Usage:
-        wrapper = InlineMemoryWrapper(openai_client)
-        response, memories = wrapper.chat(
-            messages=[{"role": "user", "content": "I prefer Python"}],
-            model="gpt-4o-mini"
-        )
-        # response = "Great choice! Python is excellent..."
-        # memories = [{"content": "User prefers Python"}]
-    """
-
-    def __init__(self, client: Any):
-        """Initialize wrapper.
-
-        Args:
-            client: OpenAI-compatible client
-        """
-        self.client = client
-
-    def chat(
-        self,
-        messages: list[dict[str, Any]],
-        model: str = "gpt-4o-mini",
-        short_instruction: bool = True,
-        **kwargs: Any,
-    ) -> tuple[str | None, list[dict[str, Any]]]:
-        """Send chat request and extract memories inline.
-
-        Args:
-            messages: Chat messages
-            model: Model to use
-            short_instruction: Use shorter memory instruction
-            **kwargs: Additional args for chat completion
-
-        Returns:
-            Tuple of (response_content, extracted_memories)
-        """
-        # Inject memory instruction
-        modified_messages = inject_memory_instruction(messages, short=short_instruction)
-
-        # Call LLM
-        response = self.client.chat.completions.create(
-            model=model,
-            messages=modified_messages,
-            **kwargs,
-        )
-
-        raw_content = response.choices[0].message.content
-
-        # Parse response and extract memories
-        parsed = parse_response_with_memory(raw_content)
-
-        return parsed.content, parsed.memories
-
-    def chat_with_response(
-        self,
-        messages: list[dict[str, Any]],
-        model: str = "gpt-4o-mini",
-        **kwargs: Any,
-    ) -> tuple[Any, str | None, list[dict[str, Any]]]:
-        """Send chat request and return full response object.
-
-        Args:
-            messages: Chat messages
-            model: Model to use
-            **kwargs: Additional args for chat completion
-
-        Returns:
-            Tuple of (response_object, content, memories)
-        """
-        modified_messages = inject_memory_instruction(messages)
-
-        response = self.client.chat.completions.create(
-            model=model,
-            messages=modified_messages,
-            **kwargs,
-        )
-
-        raw_content = response.choices[0].message.content
-        parsed = parse_response_with_memory(raw_content)
-
-        # Modify response to have clean content
-        response.choices[0].message.content = parsed.content
-
-        return response, parsed.content, parsed.memories

@@ -175,12 +175,6 @@ def test_detects_fixed_width_command_output(content: str) -> None:
             id="c_defines",
         ),
         pytest.param(
-            'On branch main\nChanges not staged for commit:\n  (use "git add <file>..." to update what will be committed)\n'
-            + "\n".join(f"\tmodified:   src/m_{i}.py" for i in range(10)),
-            ContentType.PLAIN_TEXT,
-            id="git_status",
-        ),
-        pytest.param(
             "3aa5012 perf(memory/budget): precompute word sets once\nc81378c fix(grok): preserve xAI model context metadata\nb0c19a2 fix(security): reject unauthenticated public proxy binds\n871bbde fix(proxy): reject Anthropic batch operations on Copilot\na29162b fix(dashboard): separate rolling cache economics by owner",
             ContentType.PLAIN_TEXT,
             id="git_log",
@@ -194,6 +188,20 @@ def test_detects_fixed_width_command_output(content: str) -> None:
 )
 def test_fixed_width_does_not_claim_non_tables(content: str, expected: ContentType) -> None:
     assert detect_content_type(content).content_type is expected
+
+
+def test_git_status_is_not_a_rectangular_table() -> None:
+    status = (
+        "On branch main\nChanges not staged for commit:\n"
+        '  (use "git add <file>..." to update what will be committed)\n'
+        + "\n".join(f"\tmodified:   src/m_{i}.py" for i in range(10))
+    )
+
+    detected = detect_content_type(status)
+
+    assert detected.content_type is ContentType.TABULAR
+    assert detected.metadata["format"] == "git_status"
+    assert parse_tabular(status) is None
 
 
 # Detection — edge branches --------------------------------------------------

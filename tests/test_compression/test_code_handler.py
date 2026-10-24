@@ -353,3 +353,40 @@ class TestTreeSitterContainers:
             f"class code preserved {result.preservation_ratio:.0%} — "
             "container bodies are leaking into the structural mask"
         )
+
+
+class TestByteSpanToCharSpan:
+    """_byte_spans_to_char_spans must map tree-sitter byte offsets to character
+    offsets. The ASCII fast path returns spans unchanged (byte == char) without
+    allocating a UTF-8 copy; the non-ASCII path derives each character's width
+    from its code point instead of re-encoding it."""
+
+    def test_ascii_returns_spans_unchanged(self):
+        from headroom.compression.handlers.code_handler import CodeSpan
+
+        spans = [
+            CodeSpan(start=0, end=5, role="sig", is_structural=True),
+            CodeSpan(start=6, end=11, role="body", is_structural=False),
+        ]
+        out = CodeStructureHandler._byte_spans_to_char_spans(spans, "def f():\n    pass\n")
+        assert [(s.start, s.end) for s in out] == [(0, 5), (6, 11)]
+
+    def test_non_ascii_remaps_byte_offsets_to_char_offsets(self):
+        from headroom.compression.handlers.code_handler import CodeSpan
+
+        # café (é = 2 bytes), 🚀 (4 bytes), 语言 (3 bytes each).
+        content = "x = 'café 🚀 语言'\n"
+        enc = content.encode("utf-8")
+        # A structural span covering the whole line, plus one covering 'return'-like
+        # region: give byte offsets and expect character offsets back.
+        whole = CodeSpan(start=0, end=len(enc), role="body", is_structural=True)
+        # byte offset of the closing quote vs its character offset
+        quote_byte = enc.rindex(b"'")
+        quote_char = content.rindex("'")
+        marker = CodeSpan(start=quote_byte, end=len(enc), role="sig", is_structural=True)
+
+        out = CodeStructureHandler._byte_spans_to_char_spans([whole, marker], content)
+        assert out[0].start == 0
+        assert out[0].end == len(content)  # exclusive end maps to char length
+        assert out[1].start == quote_char  # byte offset correctly remapped
+        assert out[1].end == len(content)

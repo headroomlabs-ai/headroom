@@ -16,6 +16,7 @@ import type {
   ProxyCompressResponse,
   ProxyErrorResponse,
 } from "../src/types.js";
+import type { CompressRequestConfig } from "../src/types/config.js";
 import {
   HeadroomError,
   HeadroomConnectionError,
@@ -176,7 +177,10 @@ describe("HeadroomClientInterface", () => {
 
   it("compress accepts messages and optional options", () => {
     expectTypeOf<HeadroomClientInterface["compress"]>().parameters.toEqualTypeOf<
-      [OpenAIMessage[], ({ model?: string; tokenBudget?: number } | undefined)?]
+      [
+        OpenAIMessage[],
+        ({ model?: string; tokenBudget?: number; config?: CompressRequestConfig } | undefined)?,
+      ]
     >();
   });
 });

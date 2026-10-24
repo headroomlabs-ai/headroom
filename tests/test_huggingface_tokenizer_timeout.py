@@ -29,7 +29,10 @@ from headroom.tokenizers.huggingface import (
 
 
 @pytest.fixture(autouse=True)
-def _fresh_cache():
+def _fresh_cache(monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.delenv("HEADROOM_OFFLINE", raising=False)
+    monkeypatch.delenv("HF_HUB_OFFLINE", raising=False)
+    monkeypatch.delenv("TRANSFORMERS_OFFLINE", raising=False)
     _load_tokenizer.cache_clear()
     yield
     _load_tokenizer.cache_clear()
@@ -104,6 +107,41 @@ def test_timeout_zero_disables_network_loading(monkeypatch: pytest.MonkeyPatch) 
     monkeypatch.setenv("HEADROOM_HF_TOKENIZER_LOAD_TIMEOUT_SECS", "0")
 
     assert _load_tokenizer("google/gemma-7b") is None
+
+
+def test_offline_mode_prevents_network_loading(monkeypatch: pytest.MonkeyPatch) -> None:
+    calls: list[dict[str, Any]] = []
+
+    def fake_from_pretrained(name: str, **kwargs: Any):
+        calls.append(kwargs)
+        if kwargs.get("local_files_only"):
+            raise OSError("not in cache")
+        raise AssertionError("network load attempted in offline mode")
+
+    _install_fake_transformers(monkeypatch, fake_from_pretrained)
+    monkeypatch.setenv("HEADROOM_OFFLINE", "1")
+    monkeypatch.setenv("HF_HUB_OFFLINE", "0")
+    monkeypatch.setenv("TRANSFORMERS_OFFLINE", "0")
+    monkeypatch.setenv("HEADROOM_HF_TOKENIZER_LOAD_TIMEOUT_SECS", "5")
+
+    assert _load_tokenizer("Qwen/Qwen2.5-7B") is None
+    assert len(calls) == 1
+    assert calls[0].get("local_files_only") is True
+
+
+def test_offline_mode_allows_cached_tokenizer(monkeypatch: pytest.MonkeyPatch) -> None:
+    calls: list[dict[str, Any]] = []
+
+    def fake_from_pretrained(name: str, **kwargs: Any):
+        calls.append(kwargs)
+        return "cached-tokenizer"
+
+    _install_fake_transformers(monkeypatch, fake_from_pretrained)
+    monkeypatch.setenv("HEADROOM_OFFLINE", "1")
+
+    assert _load_tokenizer("Qwen/Qwen2.5-7B") == "cached-tokenizer"
+    assert len(calls) == 1
+    assert calls[0].get("local_files_only") is True
 
 
 def test_count_messages_fails_open_to_estimation(monkeypatch: pytest.MonkeyPatch) -> None:

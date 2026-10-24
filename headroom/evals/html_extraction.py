@@ -15,6 +15,8 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
+from headroom.offline import guard_egress
+
 if TYPE_CHECKING:
     from headroom.transforms.html_extractor import HTMLExtractor
 
@@ -255,6 +257,7 @@ class HTMLExtractionEvaluator:
 
     def _create_judge(self) -> Callable[[str, str, str], tuple[float, str]]:
         """Create the LLM judge function."""
+        guard_egress(f"{self.provider} API for the HTML-extraction eval judge")
         if self.provider == "openai":
             try:
                 from openai import OpenAI
@@ -355,6 +358,7 @@ class HTMLExtractionEvaluator:
 
     def _get_answer(self, content: str, question: str) -> str:
         """Get LLM answer for a question given content."""
+        guard_egress(f"{self.provider} API for the HTML-extraction eval answers")
         prompt = f"""Based on the following content, answer the question.
 
 Content:

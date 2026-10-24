@@ -12,7 +12,7 @@ from headroom.providers.codex import (
 )
 from headroom.providers.codex.model_metadata import (
     codex_model_registry_entry,
-    fetch_chatgpt_codex_model_ids,
+    fetch_chatgpt_codex_model_entries,
     normalize_codex_registry_headers,
     synthetic_model_get_response,
     synthetic_models_list_response,
@@ -113,13 +113,14 @@ async def test_codex_model_registry_fetch_returns_slugs() -> None:
 
     client = FakeClient()
 
-    model_ids = await fetch_chatgpt_codex_model_ids(
+    entries = await fetch_chatgpt_codex_model_entries(
         client,
         {"authorization": "Bearer token", "chatgpt-account-id": "acct"},
         "0.135.0",
     )
 
-    assert model_ids == ("gpt-5.5", "gpt-5.4")
+    assert entries is not None
+    assert [entry["slug"] for entry in entries] == ["gpt-5.5", "gpt-5.4"]
     assert client.calls == [
         (
             "https://chatgpt.com/backend-api/codex/models?client_version=0.135.0",

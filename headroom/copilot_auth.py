@@ -15,7 +15,7 @@ from collections.abc import Mapping
 from contextvars import ContextVar
 from ctypes import wintypes
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 from urllib import error as urllib_error
@@ -26,6 +26,7 @@ from headroom import paths
 from headroom._subprocess import run
 from headroom.copilot_linux_secret import read_copilot_oauth_token as read_linux_secret_token
 from headroom.copilot_macos_keychain import read_copilot_oauth_token as read_macos_keychain_token
+from headroom.offline import guard_egress
 from headroom.proxy import ssl_context as proxy_ssl_context
 
 logger = logging.getLogger(__name__)
@@ -79,8 +80,20 @@ _EXPIRY_KEYS = ("expires_at", "expiresAt", "expiry", "expires")
 
 
 def _urlopen(request: urllib_request.Request, *, timeout: float) -> Any:
-    """Open a GitHub request with Headroom's configured corporate trust roots."""
+    """Open a GitHub request with Headroom's configured corporate trust roots.
 
+    Every GitHub call in this module bottoms out here, so this is also the
+    backstop for the air-gap switch. The four call sites guard individually
+    too — they can name the specific step ("device-flow authorisation",
+    "token exchange") in the refusal, which this frame cannot — but a fifth
+    call site added later inherits the refusal from here whether its author
+    thought about ``HEADROOM_OFFLINE`` or not.
+    """
+
+    guard_egress(
+        "GitHub Copilot authentication",
+        urlparse(request.full_url).hostname or request.full_url,
+    )
     context = proxy_ssl_context.build_urlopen_context()
     if context is not None:
         return urllib_request.urlopen(request, timeout=timeout, context=context)
@@ -268,17 +281,6 @@ def _configured_api_url() -> str:
     return DEFAULT_API_URL
 
 
-def copilot_api_url() -> str:
-    """Return the configured Copilot API base URL without any network calls.
-
-    Resolves ``GITHUB_COPILOT_API_URL``, then the configured enterprise domain,
-    then ``api.githubcopilot.com``. Unlike :func:`resolve_copilot_api_url` this
-    performs no token exchange, so it is safe to call while routing a request.
-    """
-
-    return _configured_api_url()
-
-
 # GitHub's token exchange advertises the host that serves inline completions
 # under ``endpoints.proxy``, alongside the ``endpoints.api`` chat host. It is
 # recorded here when observed so completions routing uses GitHub's own answer
@@ -342,6 +344,28 @@ def is_copilot_completions_host(url: str | None) -> bool:
     # Per-SKU hosts GitHub hands out via `endpoints.proxy`, e.g.
     # proxy.individual.githubcopilot.com / proxy.business… / proxy.enterprise….
     return host.startswith("proxy.") and host.endswith(".githubcopilot.com")
+
+
+def copilot_nes_base_url(model: Any, upstream_base_url: str) -> str | None:
+    """Return the completions host for a next-edit request aimed at public CAPI.
+
+    Copilot Chat serves ghost text and next edits by posting ``copilot-nes-*``
+    models to ``{overrideProxyUrl}/chat/completions``. ``headroom wrap vscode``
+    points that override at the same proxy as CAPI, but only the completions
+    host serves these models; CAPI answers ``400 model_not_supported``.
+
+    Returns ``None`` (keep the upstream) for any other model, for an upstream
+    that already is a completions host, and for a GHE or custom deployment,
+    whose traffic must not leave it (see :func:`copilot_completions_base_url`).
+    """
+
+    if not (isinstance(model, str) and model.startswith("copilot-nes-")):
+        return None
+    if not _is_public_copilot_api_host(_url_host(upstream_base_url)):
+        return None
+    if is_copilot_completions_host(upstream_base_url):
+        return None
+    return copilot_completions_base_url()
 
 
 def copilot_completions_base_url() -> str:
@@ -591,9 +615,19 @@ def _parse_expiry(value: Any) -> float | None:
             pass
         try:
             normalized = raw.replace("Z", "+00:00")
-            return datetime.fromisoformat(normalized).timestamp()
+            parsed = datetime.fromisoformat(normalized)
         except ValueError:
             return None
+        # A timezone-naive ISO string (no `Z`, no offset) must be read as UTC,
+        # not the host's local zone. `datetime.timestamp()` assumes local time
+        # for naive datetimes, so on a non-UTC box the same expiry resolves to a
+        # different epoch — hours early or late — silently expiring a live token
+        # or trusting a dead one. Every other ISO parser in the codebase treats
+        # naive as UTC (see telemetry/traffic_learner, proxy/memory_rank_policy);
+        # match that here.
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        return parsed.timestamp()
 
     return None
 
@@ -689,6 +723,7 @@ def start_copilot_device_authorization(
     """Start the GitHub Copilot OAuth device-code flow."""
 
     urls = _github_oauth_urls(domain)
+    guard_egress("GitHub Copilot device-flow authorisation", domain)
     body = urlencode({"client_id": COPILOT_CHAT_OAUTH_CLIENT_ID, "scope": "read:user"}).encode(
         "utf-8"
     )
@@ -720,6 +755,7 @@ def poll_copilot_device_authorization(
     """Poll GitHub until the device-code OAuth flow returns an access token."""
 
     urls = _github_oauth_urls(domain)
+    guard_egress("GitHub Copilot device-flow authorisation", domain)
     deadline = time.time() + max(1, expires_in)
     poll_interval = max(1, interval)
     while time.time() < deadline:
@@ -808,7 +844,9 @@ def read_cached_oauth_token() -> str | None:
     return None
 
 
-def iter_oauth_token_candidates() -> list[CopilotTokenCandidate]:
+def iter_oauth_token_candidates(
+    *, include_platform_secret_stores: bool = True
+) -> list[CopilotTokenCandidate]:
     """Return reusable token candidates in safest-first discovery order."""
 
     candidates: list[CopilotTokenCandidate] = []
@@ -834,6 +872,38 @@ def iter_oauth_token_candidates() -> list[CopilotTokenCandidate]:
                 )
             )
 
+    if include_platform_secret_stores:
+        candidates.extend(_platform_secret_store_oauth_token_candidates())
+
+    candidates.extend(_read_file_oauth_token_candidates())
+
+    for env_var in _GENERIC_GITHUB_TOKEN_ENV_VARS:
+        token = os.environ.get(env_var, "").strip()
+        if token:
+            candidates.append(
+                CopilotTokenCandidate(
+                    token=token,
+                    source=f"env:{env_var}",
+                    confidence="generic-github",
+                )
+            )
+
+    gh_token = _read_gh_cli_oauth_token()
+    if gh_token:
+        candidates.append(
+            CopilotTokenCandidate(
+                token=gh_token,
+                source="gh-cli",
+                confidence="generic-github",
+            )
+        )
+
+    return _dedupe_token_candidates(candidates)
+
+
+def _platform_secret_store_oauth_token_candidates() -> list[CopilotTokenCandidate]:
+    """Return OAuth candidates from platform credential stores."""
+    candidates: list[CopilotTokenCandidate] = []
     windows_copilot_token = _read_windows_copilot_cli_oauth_token()
     if windows_copilot_token:
         candidates.append(
@@ -863,31 +933,7 @@ def iter_oauth_token_candidates() -> list[CopilotTokenCandidate]:
                 confidence="high",
             )
         )
-
-    candidates.extend(_read_file_oauth_token_candidates())
-
-    for env_var in _GENERIC_GITHUB_TOKEN_ENV_VARS:
-        token = os.environ.get(env_var, "").strip()
-        if token:
-            candidates.append(
-                CopilotTokenCandidate(
-                    token=token,
-                    source=f"env:{env_var}",
-                    confidence="generic-github",
-                )
-            )
-
-    gh_token = _read_gh_cli_oauth_token()
-    if gh_token:
-        candidates.append(
-            CopilotTokenCandidate(
-                token=gh_token,
-                source="gh-cli",
-                confidence="generic-github",
-            )
-        )
-
-    return _dedupe_token_candidates(candidates)
+    return candidates
 
 
 def _read_file_oauth_token_candidates() -> list[CopilotTokenCandidate]:
@@ -1041,6 +1087,28 @@ def _api_url_from_payload(payload: dict[str, Any] | None) -> str | None:
     return None
 
 
+#: Opt-out: ``0``/``false``/``no``/``off`` folds the Business and Enterprise
+#: hosts below back into the generic host, for seats where the segmented host
+#: still lags on model availability (#2455 folded them after a Business seat
+#: got "model not supported" for Claude models on its plan host).
+_USE_ADVERTISED_HOST_ENV = "GITHUB_COPILOT_USE_ADVERTISED_HOST"
+
+#: Per-plan chat hosts GitHub advertises in ``endpoints.api`` for Business and
+#: Enterprise seats. Honoured by default: they are the hosts GitHub's own
+#: clients route with, and an enterprise on GitHub's subscription-based network
+#: routing allows only its own plan host, so the generic host is unreachable
+#: there and the failure looks like a random connection error. The individual
+#: host is still folded (#610: it did not serve newer models on the Responses
+#: API). An explicit ``GITHUB_COPILOT_API_URL`` or enterprise domain wins over
+#: both.
+_ADVERTISED_PLAN_HOSTS: frozenset[str] = frozenset(
+    {
+        "api.business.githubcopilot.com",
+        "api.enterprise.githubcopilot.com",
+    }
+)
+
+
 def _subscription_api_url_from_user_info_payload(payload: dict[str, Any] | None) -> str:
     configured = _configured_api_url_override()
     if configured:
@@ -1051,12 +1119,21 @@ def _subscription_api_url_from_user_info_payload(payload: dict[str, Any] | None)
         return DEFAULT_API_URL
 
     host = urlparse(api_url).netloc.lower()
-    if host in {
-        "api.githubcopilot.com",
-        "api.individual.githubcopilot.com",
-        "api.business.githubcopilot.com",
-        "api.enterprise.githubcopilot.com",
-    }:
+    if host in _ADVERTISED_PLAN_HOSTS:
+        opt_out = os.environ.get(_USE_ADVERTISED_HOST_ENV, "").strip().lower()
+        if opt_out in {"0", "false", "no", "off"}:
+            return DEFAULT_API_URL
+        # Named in the log so a "model not supported" 400 from the plan host
+        # sits next to the escape hatch instead of looking like a proxy fault.
+        logger.info(
+            "Routing Copilot subscription traffic to the advertised plan host %s "
+            "(set %s=0 to use %s instead)",
+            api_url,
+            _USE_ADVERTISED_HOST_ENV,
+            DEFAULT_API_URL,
+        )
+        return api_url
+    if host in {"api.githubcopilot.com", "api.individual.githubcopilot.com"}:
         return DEFAULT_API_URL
     if host.endswith(".githubcopilot.com"):
         return api_url
@@ -1153,9 +1230,34 @@ def resolve_subscription_bearer_token_details() -> CopilotSubscriptionTokenResol
                 api_url=_subscription_api_url_from_user_info_payload(payload),
             )
 
-    for candidate in iter_oauth_token_candidates():
+    attempted_tokens: set[str] = set()
+    resolution = _resolve_subscription_oauth_token_candidates(
+        iter_oauth_token_candidates(include_platform_secret_stores=False),
+        attempted_tokens=attempted_tokens,
+    )
+    if resolution is not None:
+        return resolution
+
+    return _resolve_subscription_oauth_token_candidates(
+        [
+            candidate
+            for candidate in _platform_secret_store_oauth_token_candidates()
+            if candidate.token not in attempted_tokens
+        ]
+    )
+
+
+def _resolve_subscription_oauth_token_candidates(
+    candidates: list[CopilotTokenCandidate],
+    *,
+    attempted_tokens: set[str] | None = None,
+) -> CopilotSubscriptionTokenResolution | None:
+    """Return the first candidate GitHub accepts for subscription APIs."""
+    for candidate in candidates:
         if not candidate.validate_for_subscription:
             continue
+        if attempted_tokens is not None:
+            attempted_tokens.add(candidate.token)
         if _is_copilot_api_token(candidate.token):
             payload = _fetch_copilot_user_info(candidate.token)
             if payload is not None:
@@ -1357,14 +1459,14 @@ def resolve_copilot_api_url(oauth_token: str | None = None) -> str:
        (corporate proxy, enterprise / data-residency host, tests).
     2. The generic public host ``https://api.githubcopilot.com``.
 
-    The account-specific ``endpoints.api`` advertised by ``/copilot_internal/user``
-    is intentionally NOT used to route. It returns a segmented host (e.g.
-    ``api.individual.githubcopilot.com``) that does not serve newer models on the
-    responses API — wrapping such a request regressed after 0.22.4 (#610) — and it
-    is not the host the official Copilot client routes with (that comes from the
-    token-exchange endpoint, not user info). Accounts that genuinely require a
-    dedicated host set ``GITHUB_COPILOT_API_URL`` explicitly. ``oauth_token`` is
-    accepted for call-site compatibility but no longer triggers a network lookup.
+    This path performs no network lookup, so it cannot see the per-plan host a
+    token exchange advertises. The subscription lanes (``wrap vscode``,
+    ``wrap copilot --subscription``, OpenCode) resolve that host through
+    :func:`resolve_subscription_bearer_token_details` and pin it into the proxy
+    as ``GITHUB_COPILOT_API_URL``, which step 1 then honours. The
+    ``api.individual.githubcopilot.com`` host is never routed to (#610: it did
+    not serve newer models on the Responses API). ``oauth_token`` is accepted
+    for call-site compatibility but no longer triggers a network lookup.
     """
 
     del oauth_token  # reserved; routing no longer depends on a user-info lookup
@@ -1378,6 +1480,7 @@ def _fetch_copilot_user_info(token: str) -> dict[str, Any] | None:
     if not token:
         return None
 
+    guard_egress("GitHub Copilot account lookup", urlparse(_user_info_url()).hostname)
     headers = _copilot_token_exchange_headers(token)
     request = urllib_request.Request(_user_info_url(), headers=headers, method="GET")
     try:
@@ -1495,6 +1598,10 @@ class CopilotTokenProvider:
 
     @staticmethod
     def _exchange_token_sync(headers: dict[str, str]) -> dict[str, Any]:
+        guard_egress(
+            "GitHub Copilot API token exchange",
+            urlparse(_token_exchange_url()).hostname,
+        )
         request = urllib_request.Request(_token_exchange_url(), headers=headers, method="GET")
         try:
             with _urlopen(request, timeout=10.0) as response:

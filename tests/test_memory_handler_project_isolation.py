@@ -259,8 +259,9 @@ def test_user_mode_partitions_by_user_id(tmp_path: Path) -> None:
 #
 # When `mode=PROJECT` and `unresolved_project_fallback="empty"` (the new
 # default), an inbound request with no project-resolution signal
-# (x-headroom-project-id / x-headroom-cwd / system-prompt cwd:) must
-# return None from search_and_format_context — NOT silently pool the
+# (x-headroom-project-id / x-headroom-cwd / x-headroom-project /
+# system-prompt cwd:) must return None from search_and_format_context —
+# NOT silently pool the
 # request's memory into the GLOBAL bucket. The old GLOBAL fallback was
 # what surfaced a memory from a prior unrelated TAM-550 session into
 # a live PR-review thread, where the agent misread it as a new command.

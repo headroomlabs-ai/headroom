@@ -1,5 +1,12 @@
 import { describe, it, expect } from "vitest";
-import { vercelToOpenAI, openAIToVercel, anthropicToOpenAI, openAIToAnthropic } from "../../src/utils/format.js";
+import {
+  vercelToOpenAI,
+  openAIToVercel,
+  anthropicToOpenAI,
+  openAIToAnthropic,
+  geminiToOpenAI,
+  openAIToGemini,
+} from "../../src/utils/format.js";
 import type { OpenAIMessage } from "../../src/types.js";
 
 describe("vercelToOpenAI", () => {
@@ -367,6 +374,27 @@ describe("anthropicToOpenAI", () => {
     ]);
     expect(result).toEqual([]);
   });
+
+  it("flattens array-content tool_result blocks to newline-joined text", () => {
+    const result = anthropicToOpenAI([
+      {
+        role: "user",
+        content: [
+          {
+            type: "tool_result",
+            tool_use_id: "tu_1",
+            content: [
+              { type: "text", text: "row 1" },
+              { type: "text", text: "row 2" },
+            ],
+          },
+        ],
+      },
+    ]);
+    expect(result).toEqual([
+      { role: "tool", content: "row 1\nrow 2", tool_call_id: "tu_1" },
+    ]);
+  });
 });
 
 describe("openAIToAnthropic", () => {
@@ -617,3 +645,196 @@ describe("round-trip conversion", () => {
     });
   });
 });
+
+describe("geminiToOpenAI", () => {
+  it("converts an inlineData part to an image_url data URI and keeps the text", () => {
+    const result = geminiToOpenAI([
+      {
+        role: "user",
+        parts: [
+          { text: "what is this?" },
+          { inlineData: { mimeType: "image/png", data: "AAAA" } },
+        ],
+      },
+    ]);
+    expect(result).toEqual([
+      {
+        role: "user",
+        content: [
+          { type: "text", text: "what is this?" },
+          { type: "image_url", image_url: { url: "data:image/png;base64,AAAA" } },
+        ],
+      },
+    ]);
+  });
+
+  it("keeps an image-only user turn instead of dropping it", () => {
+    const result = geminiToOpenAI([
+      { role: "user", parts: [{ inlineData: { mimeType: "image/jpeg", data: "BBBB" } }] },
+    ]);
+    expect(result).toEqual([
+      {
+        role: "user",
+        content: [{ type: "image_url", image_url: { url: "data:image/jpeg;base64,BBBB" } }],
+      },
+    ]);
+  });
+
+  it("converts a fileData part to an image_url carrying its fileUri", () => {
+    const result = geminiToOpenAI([
+      {
+        role: "user",
+        parts: [
+          { text: "summarise" },
+          { fileData: { mimeType: "application/pdf", fileUri: "https://generativelanguage.googleapis.com/v1beta/files/abc" } },
+        ],
+      },
+    ]);
+    expect(result).toEqual([
+      {
+        role: "user",
+        content: [
+          { type: "text", text: "summarise" },
+          {
+            type: "image_url",
+            image_url: { url: "https://generativelanguage.googleapis.com/v1beta/files/abc", mime_type: "application/pdf" },
+          },
+        ],
+      },
+    ]);
+  });
+
+  it("leaves text-only user turns as a newline-joined string (backward compat)", () => {
+    const result = geminiToOpenAI([
+      { role: "user", parts: [{ text: "a" }, { text: "b" }] },
+    ]);
+    expect(result).toEqual([{ role: "user", content: "a\nb" }]);
+  });
+});
+
+describe("openAIToGemini", () => {
+  it("restores an image_url data URI as an inlineData part", () => {
+    const msgs: OpenAIMessage[] = [
+      {
+        role: "user",
+        content: [
+          { type: "text", text: "hi" },
+          { type: "image_url", image_url: { url: "data:image/png;base64,AAAA" } },
+        ],
+      },
+    ];
+    expect(openAIToGemini(msgs)).toEqual([
+      { role: "user", parts: [{ text: "hi" }, { inlineData: { mimeType: "image/png", data: "AAAA" } }] },
+    ]);
+  });
+
+  it("restores a non-data image_url with a carried MIME type as a complete fileData part", () => {
+    const msgs = [
+      {
+        role: "user",
+        content: [
+          {
+            type: "image_url",
+            image_url: { url: "https://generativelanguage.googleapis.com/v1beta/files/abc", mime_type: "application/pdf" },
+          },
+        ],
+      },
+    ] as OpenAIMessage[];
+    expect(openAIToGemini(msgs)).toEqual([
+      {
+        role: "user",
+        parts: [{ fileData: { mimeType: "application/pdf", fileUri: "https://generativelanguage.googleapis.com/v1beta/files/abc" } }],
+      },
+    ]);
+  });
+
+  it("infers the MIME type from a common file extension when the image_url carries none", () => {
+    const msgs: OpenAIMessage[] = [
+      { role: "user", content: [{ type: "image_url", image_url: { url: "https://example.com/cat.png?size=large" } }] },
+    ];
+    expect(openAIToGemini(msgs)).toEqual([
+      { role: "user", parts: [{ fileData: { mimeType: "image/png", fileUri: "https://example.com/cat.png?size=large" } }] },
+    ]);
+  });
+
+  it("keeps only fileUri when no MIME type is known (documented fallback)", () => {
+    const msgs: OpenAIMessage[] = [
+      { role: "user", content: [{ type: "image_url", image_url: { url: "https://example.com/blob" } }] },
+    ];
+    expect(openAIToGemini(msgs)).toEqual([
+      { role: "user", parts: [{ fileData: { fileUri: "https://example.com/blob" } }] },
+    ]);
+  });
+
+  it("keeps text-only array content as a single text part (backward compat)", () => {
+    const msgs: OpenAIMessage[] = [
+      { role: "user", content: [{ type: "text", text: "a" }, { type: "text", text: "b" }] },
+    ];
+    expect(openAIToGemini(msgs)).toEqual([{ role: "user", parts: [{ text: "a\nb" }] }]);
+  });
+});
+
+describe("round-trip: geminiToOpenAI then openAIToGemini", () => {
+  it("reproduces a text+inlineData turn exactly", () => {
+    const original = [
+      {
+        role: "user",
+        parts: [{ text: "what is this?" }, { inlineData: { mimeType: "image/png", data: "AAAA" } }],
+      },
+    ];
+    expect(openAIToGemini(geminiToOpenAI(original))).toEqual(original);
+  });
+
+  it("reproduces a text+fileData (application/pdf) turn exactly", () => {
+    const original = [
+      {
+        role: "user",
+        parts: [
+          { text: "summarise" },
+          { fileData: { mimeType: "application/pdf", fileUri: "https://generativelanguage.googleapis.com/v1beta/files/abc" } },
+        ],
+      },
+    ];
+    expect(openAIToGemini(geminiToOpenAI(original))).toEqual(original);
+  });
+});
+describe("openAIToVercel tool names", () => {
+  it("carries the tool name from the matching tool-call onto the tool-result part", () => {
+    const msgs: OpenAIMessage[] = [
+      {
+        role: "assistant",
+        content: null,
+        tool_calls: [
+          { id: "tc_1", type: "function", function: { name: "getWeather", arguments: '{"city":"Paris"}' } },
+        ],
+      },
+      { role: "tool", content: '{"tempC":21}', tool_call_id: "tc_1" },
+    ];
+    const result = openAIToVercel(msgs);
+    expect(result[1].content[0]).toEqual({
+      type: "tool-result",
+      toolCallId: "tc_1",
+      toolName: "getWeather",
+      output: { type: "json", value: { tempC: 21 } },
+    });
+  });
+
+  it("preserves tool names through a Vercel -> OpenAI -> Vercel round trip", () => {
+    const original = [
+      { role: "user", content: [{ type: "text", text: "weather in Paris?" }] },
+      {
+        role: "assistant",
+        content: [{ type: "tool-call", toolCallId: "call_1", toolName: "getWeather", input: { city: "Paris" } }],
+      },
+      {
+        role: "tool",
+        content: [
+          { type: "tool-result", toolCallId: "call_1", toolName: "getWeather", output: { type: "json", value: { tempC: 21 } } },
+        ],
+      },
+    ];
+    const back = openAIToVercel(vercelToOpenAI(original));
+    expect(back[2].content[0].toolName).toBe("getWeather");
+  });
+});
+

@@ -8,18 +8,27 @@
 
 from __future__ import annotations
 
+import contextlib
 import logging
 
+import httpx
 import pytest
 
 pytest.importorskip("fastapi")
 
+from fastapi.responses import JSONResponse
 from fastapi.testclient import TestClient
 
 from headroom.cache.compression_store import reset_compression_store
 from headroom.offline import apply_offline_env, is_offline
 from headroom.proxy.audit import is_auditable_path
-from headroom.proxy.server import ProxyConfig, WebSocketAuthMiddleware, create_app
+from headroom.proxy.handlers.openai import OpenAIHandlerMixin
+from headroom.proxy.server import (
+    ProxyConfig,
+    WebSocketAuthMiddleware,
+    create_app,
+    scrub_proxy_token_headers,
+)
 
 NONLOOPBACK = ("203.0.113.5", 44444)  # TEST-NET-3, never loopback
 LOOPBACK = ("127.0.0.1", 12345)
@@ -37,7 +46,13 @@ def _make_app(**overrides):
     return create_app(config)
 
 
-def test_create_app_accepts_test_net_host_without_transport_validation() -> None:
+def test_create_app_accepts_test_net_host_without_transport_validation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # No transport-level validation of the host string — but a non-loopback
+    # bind with no token is an *acknowledged* open bind, never a silent one
+    # (see test_proxy_bind_policy.py for the refusal path).
+    monkeypatch.setenv("HEADROOM_ALLOW_UNAUTHENTICATED_BIND", "1")
     app = _make_app(host="203.0.113.5", proxy_token=None)
     assert app is not None
 
@@ -95,12 +110,54 @@ class TestInboundAuthToken:
         with TestClient(app, base_url="http://127.0.0.1", client=LOOPBACK) as c:
             assert c.get("/stats").status_code != 401
 
+    def test_missing_peer_address_is_not_loopback(self):
+        """No ``scope["client"]`` (UDS, adapters) must fail closed, not open.
+
+        ``is_loopback_host(None)`` used to return True, which silently switched
+        the token gate off for any transport that leaves the peer unset.
+        """
+        app = _make_app(proxy_token="s3cr3t-token")
+        with TestClient(app, base_url="http://127.0.0.1", client=None) as c:  # type: ignore[arg-type]
+            assert c.get("/stats").status_code == 401
+            ok = c.get("/stats", headers={"Authorization": "Bearer s3cr3t-token"})
+            assert ok.status_code != 401
+
     def test_health_endpoints_exempt_even_nonloopback(self):
         """Orchestrator health probes must work without the token."""
         app = _make_app(proxy_token="s3cr3t-token")
         with TestClient(app, base_url="http://testserver", client=NONLOOPBACK) as c:
             assert c.get("/livez").status_code == 200
             assert c.get("/readyz").status_code in (200, 503)  # ready/not-ready, never 401
+
+    @pytest.mark.parametrize(
+        ("method", "path"),
+        [
+            ("GET", "/healthz"),  # no Python route: lands on the catch-all
+            ("POST", "/health"),
+            ("PUT", "/livez"),
+            ("DELETE", "/readyz"),
+            ("HEAD", "/livez"),  # @app.get does not register HEAD
+        ],
+    )
+    def test_health_exemption_does_not_reach_passthrough(self, monkeypatch, method, path):
+        """Only GET probes are exempt from the token.
+
+        Any other request on a health path is not served by the health handler
+        but by the catch-all passthrough, which relays it upstream. Exempting
+        those turned the proxy into an unauthenticated relay.
+        """
+        relayed: list[tuple[str, str]] = []
+
+        async def _spy_passthrough(self, request, base_url, *args, **kwargs):
+            relayed.append((request.method, request.url.path))
+            return JSONResponse({"relayed_to": base_url})
+
+        monkeypatch.setattr(OpenAIHandlerMixin, "handle_passthrough", _spy_passthrough)
+        app = _make_app(proxy_token="s3cr3t-token")
+        with TestClient(app, base_url="http://testserver", client=NONLOOPBACK) as c:
+            resp = c.request(method, path)
+        assert resp.status_code == 401
+        assert relayed == []
 
 
 # ──────────────────── 2.1b inbound auth token over WebSocket ──────────────
@@ -211,24 +268,63 @@ class TestWebSocketAuthMiddleware:
         assert not _closed_with_policy_violation(sent)
 
     async def test_loopback_is_exempt(self):
-        """Same trust boundary the HTTP gate already grants loopback."""
+        """Same trust boundary the HTTP gate already grants loopback.
+
+        Both gates the HTTP admin guards apply: loopback peer *and* loopback
+        ``Host`` header (a real handshake always carries one).
+        """
         downstream = _SpyApp()
         mw = WebSocketAuthMiddleware(downstream, proxy_token="s3cr3t-token")
 
-        sent = await _drive(mw, _ws_scope(client=LOOPBACK))
+        sent = await _drive(mw, _ws_scope(client=LOOPBACK, headers=[("host", "127.0.0.1:8787")]))
 
         assert downstream.called is True
         assert not _closed_with_policy_violation(sent)
 
-    async def test_unknown_client_is_treated_as_loopback(self):
-        """Mirrors is_loopback_host(None) -> True, as the HTTP gate does."""
+    async def test_loopback_peer_with_foreign_host_header_is_not_exempt(self):
+        """DNS rebinding: a local browser reaching 127.0.0.1 still says Host: attacker.
+
+        The HTTP admin routes have checked Host since the loopback guard was
+        written; the WebSocket gate checked the peer only. Same rule now.
+        """
         downstream = _SpyApp()
         mw = WebSocketAuthMiddleware(downstream, proxy_token="s3cr3t-token")
 
-        sent = await _drive(mw, _ws_scope(client=None))
+        sent = await _drive(
+            mw, _ws_scope(client=LOOPBACK, headers=[("host", "attacker.example:8787")])
+        )
+
+        assert downstream.called is False
+        assert _closed_with_policy_violation(sent)
+
+    async def test_loopback_peer_with_foreign_host_but_valid_token_passes(self):
+        """The Host check only decides the *exemption*; the token still works."""
+        downstream = _SpyApp()
+        mw = WebSocketAuthMiddleware(downstream, proxy_token="s3cr3t-token")
+
+        sent = await _drive(
+            mw,
+            _ws_scope(
+                client=LOOPBACK,
+                headers=[
+                    ("host", "attacker.example:8787"),
+                    ("authorization", "Bearer s3cr3t-token"),
+                ],
+            ),
+        )
 
         assert downstream.called is True
         assert not _closed_with_policy_violation(sent)
+
+    async def test_unknown_client_is_not_loopback(self):
+        """Mirrors is_loopback_host(None) -> False: fail closed, like the HTTP gate."""
+        downstream = _SpyApp()
+        mw = WebSocketAuthMiddleware(downstream, proxy_token="s3cr3t-token")
+
+        sent = await _drive(mw, _ws_scope(client=None, headers=[("host", "127.0.0.1")]))
+
+        assert downstream.called is False
+        assert _closed_with_policy_violation(sent)
 
     async def test_repeated_header_resolves_like_the_http_gate(self):
         """A duplicated Authorization must mean the same thing on both transports.
@@ -332,6 +428,302 @@ def _record_ws_handler_reached(app, monkeypatch):
     return lambda: bool(seen)
 
 
+# ─────────────── 2.1c the proxy token never reaches an upstream ───────────
+
+
+TOKEN = "s3cr3t-token"
+
+
+class _CapturingTransport(httpx.AsyncBaseTransport):
+    """Upstream stand-in that records every request the proxy sends it."""
+
+    def __init__(self) -> None:
+        self.requests: list[httpx.Request] = []
+
+    async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
+        self.requests.append(request)
+        if "chat/completions" in str(request.url):
+            body = {
+                "id": "chatcmpl-mock",
+                "object": "chat.completion",
+                "created": 1,
+                "model": "gpt-4o",
+                "choices": [
+                    {
+                        "index": 0,
+                        "message": {"role": "assistant", "content": "hi"},
+                        "finish_reason": "stop",
+                    }
+                ],
+                "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
+            }
+        elif "/v1/messages" in str(request.url):
+            body = {
+                "id": "msg_mock",
+                "type": "message",
+                "role": "assistant",
+                "content": [{"type": "text", "text": "hi"}],
+                "usage": {"input_tokens": 1, "output_tokens": 1},
+            }
+        else:
+            body = {"object": "list", "data": []}
+        return httpx.Response(200, headers={"content-type": "application/json"}, json=body)
+
+
+@contextlib.contextmanager
+def _upstream_capturing_client(*, client=NONLOOPBACK, base_url="http://testserver"):
+    reset_compression_store()
+    config = ProxyConfig(
+        optimize=False,
+        cache_enabled=False,
+        rate_limit_enabled=False,
+        cost_tracking_enabled=False,
+        log_requests=False,
+        ccr_inject_tool=False,
+        ccr_handle_responses=False,
+        ccr_context_tracking=False,
+        image_optimize=False,
+        anthropic_api_url="https://api.anthropic.test",
+        openai_api_url="https://api.openai.test",
+        proxy_token=TOKEN,
+    )
+    app = create_app(config)
+    transport = _CapturingTransport()
+    with TestClient(app, base_url=base_url, client=client) as c:
+        # Startup builds the real upstream client, so swap it only after
+        # entering the lifespan or requests would leave the test process.
+        app.state.proxy.http_client = httpx.AsyncClient(transport=transport)
+        yield c, transport
+
+
+def _anthropic_request(c, headers):
+    return c.post(
+        "/v1/messages",
+        headers={"anthropic-version": "2023-06-01", **headers},
+        json={
+            "model": "claude-3-5-sonnet-20241022",
+            "messages": [{"role": "user", "content": "Hello"}],
+            "max_tokens": 16,
+        },
+    )
+
+
+def _only_upstream_request(transport) -> httpx.Request:
+    assert len(transport.requests) == 1, transport.requests
+    return transport.requests[0]
+
+
+class TestProxyTokenIsNotForwardedUpstream:
+    """The proxy credential authenticates to Headroom only.
+
+    Handlers build upstream headers from the inbound request and strip only
+    ``x-headroom-*``, so a token sent as ``Authorization: Bearer`` used to be
+    relayed to the provider verbatim. These tests capture what actually leaves
+    the proxy.
+    """
+
+    def test_bearer_token_is_dropped_and_provider_key_kept(self):
+        with _upstream_capturing_client() as (c, transport):
+            resp = _anthropic_request(
+                c, {"x-api-key": "sk-ant-test", "Authorization": f"Bearer {TOKEN}"}
+            )
+        assert resp.status_code == 200, resp.text
+
+        upstream = _only_upstream_request(transport)
+        assert "authorization" not in upstream.headers
+        assert upstream.headers["x-api-key"] == "sk-ant-test"
+        assert TOKEN not in str(upstream.headers.raw)
+
+    def test_lowercase_scheme_is_dropped_too(self):
+        """The gate accepts ``bearer`` in any case, so the scrub must as well."""
+        with _upstream_capturing_client() as (c, transport):
+            resp = _anthropic_request(
+                c, {"x-api-key": "sk-ant-test", "Authorization": f"bearer {TOKEN}"}
+            )
+        assert resp.status_code == 200, resp.text
+        assert "authorization" not in _only_upstream_request(transport).headers
+
+    def test_custom_header_is_dropped_and_provider_bearer_kept(self):
+        with _upstream_capturing_client() as (c, transport):
+            resp = c.post(
+                "/v1/chat/completions",
+                headers={"X-Headroom-Proxy-Token": TOKEN, "Authorization": "Bearer sk-test"},
+                json={"model": "gpt-4o", "messages": [{"role": "user", "content": "Hello"}]},
+            )
+        assert resp.status_code == 200, resp.text
+
+        upstream = _only_upstream_request(transport)
+        assert upstream.headers["authorization"] == "Bearer sk-test"
+        assert "x-headroom-proxy-token" not in upstream.headers
+
+    def test_custom_header_is_dropped_even_with_internal_strip_disabled(self, monkeypatch):
+        """``HEADROOM_STRIP_INTERNAL_HEADERS=disabled`` must not leak the credential."""
+        monkeypatch.setenv("HEADROOM_STRIP_INTERNAL_HEADERS", "disabled")
+        with _upstream_capturing_client() as (c, transport):
+            resp = _anthropic_request(
+                c, {"x-api-key": "sk-ant-test", "X-Headroom-Proxy-Token": TOKEN}
+            )
+        assert resp.status_code == 200, resp.text
+        assert "x-headroom-proxy-token" not in _only_upstream_request(transport).headers
+
+    def test_loopback_caller_token_is_dropped(self):
+        """Loopback skips the check, but its token is still not the provider's."""
+        with _upstream_capturing_client(client=LOOPBACK, base_url="http://127.0.0.1") as (
+            c,
+            transport,
+        ):
+            resp = _anthropic_request(
+                c, {"x-api-key": "sk-ant-test", "Authorization": f"Bearer {TOKEN}"}
+            )
+        assert resp.status_code == 200, resp.text
+        assert "authorization" not in _only_upstream_request(transport).headers
+
+    def test_catch_all_passthrough_drops_bearer_token(self):
+        with _upstream_capturing_client() as (c, transport):
+            resp = c.get(
+                "/v1/models",
+                headers={"x-api-key": "sk-ant-test", "Authorization": f"Bearer {TOKEN}"},
+            )
+        assert resp.status_code == 200, resp.text
+        upstream = _only_upstream_request(transport)
+        assert "authorization" not in upstream.headers
+        assert upstream.headers["x-api-key"] == "sk-ant-test"
+
+
+class TestScrubProxyTokenHeaders:
+    """The scope-level scrub both gates share."""
+
+    @staticmethod
+    def _scope(*headers):
+        return {"headers": [(k.encode("latin-1"), v.encode("latin-1")) for k, v in headers]}
+
+    def test_drops_matching_bearer_keeps_other_headers(self):
+        scope = self._scope(("authorization", f"Bearer {TOKEN}"), ("x-api-key", "sk-ant"))
+        scrub_proxy_token_headers(scope, TOKEN.encode())
+        assert scope["headers"] == [(b"x-api-key", b"sk-ant")]
+
+    def test_keeps_non_matching_bearer(self):
+        scope = self._scope(("authorization", "Bearer sk-provider"))
+        scrub_proxy_token_headers(scope, TOKEN.encode())
+        assert scope["headers"] == [(b"authorization", b"Bearer sk-provider")]
+
+    def test_keeps_non_bearer_authorization(self):
+        scope = self._scope(("authorization", f"Basic {TOKEN}"))
+        scrub_proxy_token_headers(scope, TOKEN.encode())
+        assert scope["headers"] == [(b"authorization", f"Basic {TOKEN}".encode())]
+
+    def test_duplicate_authorization_drops_only_the_token(self):
+        scope = self._scope(
+            ("authorization", f"Bearer {TOKEN}"),
+            ("authorization", "Bearer sk-provider"),
+        )
+        scrub_proxy_token_headers(scope, TOKEN.encode())
+        assert scope["headers"] == [(b"authorization", b"Bearer sk-provider")]
+
+    def test_custom_header_dropped_even_without_configured_token(self):
+        scope = self._scope(("x-headroom-proxy-token", "anything"), ("x-api-key", "sk-ant"))
+        scrub_proxy_token_headers(scope, b"")
+        assert scope["headers"] == [(b"x-api-key", b"sk-ant")]
+
+    def test_no_configured_token_leaves_authorization_alone(self):
+        scope = self._scope(("authorization", f"Bearer {TOKEN}"))
+        scrub_proxy_token_headers(scope, b"")
+        assert scope["headers"] == [(b"authorization", f"Bearer {TOKEN}".encode())]
+
+    def test_non_ascii_header_value_does_not_raise(self):
+        scope = {"headers": [(b"authorization", "Bearer café".encode("latin-1"))]}
+        scrub_proxy_token_headers(scope, TOKEN.encode())
+        assert len(scope["headers"]) == 1
+
+
+class _HeaderSpyApp:
+    """Downstream ASGI app that records the headers it was handed."""
+
+    def __init__(self) -> None:
+        self.headers: list[tuple[bytes, bytes]] | None = None
+
+    async def __call__(self, scope, receive, send) -> None:
+        self.headers = list(scope["headers"])
+
+
+class TestWebSocketScrubsProxyToken:
+    @pytest.mark.parametrize("client", [NONLOOPBACK, LOOPBACK])
+    async def test_bearer_token_removed_before_the_app(self, client):
+        downstream = _HeaderSpyApp()
+        mw = WebSocketAuthMiddleware(downstream, proxy_token=TOKEN)
+
+        await _drive(
+            mw,
+            _ws_scope(
+                client=client,
+                headers=[("authorization", f"Bearer {TOKEN}"), ("x-api-key", "sk-ant")],
+            ),
+        )
+
+        assert downstream.headers == [(b"x-api-key", b"sk-ant")]
+
+    @pytest.mark.parametrize("token_header", ["authorization", "x-headroom-proxy-token"])
+    async def test_loopback_exempt_handshake_is_still_scrubbed(self, token_header):
+        # Loopback peer *and* loopback Host takes the token exemption; the
+        # exemption must not skip the scrub, or a local client that sends the
+        # token anyway has it forwarded upstream.
+        downstream = _HeaderSpyApp()
+        mw = WebSocketAuthMiddleware(downstream, proxy_token=TOKEN)
+        value = f"Bearer {TOKEN}" if token_header == "authorization" else TOKEN
+
+        await _drive(
+            mw,
+            _ws_scope(
+                client=LOOPBACK,
+                headers=[
+                    ("host", "127.0.0.1:8787"),
+                    (token_header, value),
+                    ("x-api-key", "sk-ant"),
+                ],
+            ),
+        )
+
+        assert downstream.headers == [(b"host", b"127.0.0.1:8787"), (b"x-api-key", b"sk-ant")]
+
+    async def test_custom_header_removed_provider_bearer_kept(self):
+        downstream = _HeaderSpyApp()
+        mw = WebSocketAuthMiddleware(downstream, proxy_token=TOKEN)
+
+        await _drive(
+            mw,
+            _ws_scope(
+                headers=[
+                    ("authorization", "Bearer sk-provider"),
+                    ("x-headroom-proxy-token", TOKEN),
+                ]
+            ),
+        )
+
+        assert downstream.headers == [(b"authorization", b"Bearer sk-provider")]
+
+    def test_responses_route_handler_never_sees_the_token(self, monkeypatch):
+        app = _make_app(proxy_token=TOKEN)
+        seen: list[dict[str, str]] = []
+
+        async def _responses_spy(websocket):
+            seen.append(dict(websocket.headers))
+            await websocket.close(code=1000)
+
+        monkeypatch.setattr(app.state.proxy, "handle_openai_responses_ws", _responses_spy)
+
+        with TestClient(app, base_url="http://testserver", client=NONLOOPBACK) as c:
+            try:
+                with c.websocket_connect(
+                    "/v1/responses", headers={"Authorization": f"Bearer {TOKEN}"}
+                ):
+                    pass
+            except Exception:  # noqa: BLE001 - spy closes the socket immediately
+                pass
+
+        assert len(seen) == 1
+        assert "authorization" not in seen[0]
+
+
 # ───────────────────────────── 3.1 security headers ───────────────────────
 
 
@@ -427,3 +819,37 @@ class TestOfflineSwitch:
 
         assert os.environ.get("HF_HUB_OFFLINE") == "1"
         assert os.environ.get("TRANSFORMERS_OFFLINE") == "1"
+
+
+# ─────────────────── missing peer address fails closed everywhere ───────────
+
+
+def test_is_loopback_host_none_is_not_loopback() -> None:
+    from headroom.proxy.loopback_guard import is_loopback_host
+
+    assert is_loopback_host(None) is False
+    # Sanity: the genuine loopback literals are unaffected.
+    assert is_loopback_host("127.0.0.1") is True
+    assert is_loopback_host("::1") is True
+    assert is_loopback_host("localhost") is True
+
+
+def test_require_loopback_404s_a_request_with_no_peer() -> None:
+    """Admin/debug guards must not open up when ``request.client`` is None."""
+    from fastapi import HTTPException
+
+    from headroom.proxy.loopback_guard import require_loopback
+
+    class _NoPeerRequest:
+        client = None
+        headers = {"host": "127.0.0.1:8787"}
+
+    with pytest.raises(HTTPException) as exc_info:
+        require_loopback(_NoPeerRequest())  # type: ignore[arg-type]
+    assert exc_info.value.status_code == 404
+
+
+def test_debug_route_404s_for_request_with_no_peer() -> None:
+    app = _make_app()
+    with TestClient(app, base_url="http://127.0.0.1", client=None) as c:  # type: ignore[arg-type]
+        assert c.get("/debug/tasks").status_code == 404

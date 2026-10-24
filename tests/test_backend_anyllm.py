@@ -340,6 +340,52 @@ async def test_send_message_converts_anthropic_tools_and_tool_choice(
     assert sent["tool_choice"] == "required"
 
 
+@pytest.mark.parametrize(
+    ("anthropic_choice", "openai_choice"),
+    [
+        ({"type": "auto"}, "auto"),
+        ({"type": "any"}, "required"),
+        ({"type": "none"}, "none"),
+        ({"type": "tool", "name": "t"}, {"type": "function", "function": {"name": "t"}}),
+    ],
+)
+def test_convert_tool_choice_covers_every_anthropic_type(
+    anthropic_choice: dict[str, object], openai_choice: object
+) -> None:
+    """Every Anthropic tool_choice type maps to its OpenAI equivalent.
+
+    ``{"type": "none"}`` ("do not use any tool this turn") previously fell
+    through to the ``"auto"`` default, inverting the instruction into "you may
+    use tools" so the model could call a tool the client explicitly forbade.
+    """
+    assert anyllm._convert_tool_choice(anthropic_choice) == openai_choice
+
+
+@pytest.mark.asyncio
+async def test_send_message_forwards_tool_choice_none(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A request forbidding tools must reach any-llm as OpenAI ``"none"``.
+
+    Regression: ``{"type": "none"}`` was converted to ``"auto"``, letting the
+    model call a tool the client disabled for the turn.
+    """
+    backend, instance = make_backend(monkeypatch)
+    instance.response = make_response(make_choice("ok", "stop"))
+
+    await backend.send_message(
+        {
+            "model": "claude",
+            "messages": [{"role": "user", "content": "hi"}],
+            "tools": [{"name": "t", "input_schema": {"type": "object"}}],
+            "tool_choice": {"type": "none"},
+        },
+        {},
+    )
+
+    assert instance.calls[0]["tool_choice"] == "none"
+
+
 @pytest.mark.asyncio
 async def test_stream_message_converts_anthropic_tools_and_tool_choice(
     monkeypatch: pytest.MonkeyPatch,
@@ -377,7 +423,8 @@ async def test_send_message_returns_error_response(monkeypatch: pytest.MonkeyPat
 
     assert result.status_code == 401
     assert result.body["error"]["type"] == "authentication_error"
-    assert result.error == "authentication api_key missing"
+    # Unclassified exception text stays in the server log, never the client.
+    assert result.error == "The proxy could not complete the request."
 
 
 @pytest.mark.asyncio
@@ -416,7 +463,7 @@ async def test_stream_message_yields_events_and_error(monkeypatch: pytest.Monkey
     instance_error.raise_error = RuntimeError("stream broke")
     error_events = [event async for event in backend_error.stream_message({"messages": []}, {})]
     assert error_events[-1].event_type == "error"
-    assert error_events[-1].data["error"]["message"] == "stream broke"
+    assert error_events[-1].data["error"]["message"] == "The proxy could not complete the request."
 
 
 def _tool_call_delta(*, index, tc_id=None, name=None, arguments=None):  # noqa: ANN001, ANN202

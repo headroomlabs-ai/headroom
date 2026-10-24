@@ -83,7 +83,13 @@ from ._version import __version__  # noqa: F401
 # ~microseconds. See `headroom/_ort.py` for the full story.
 ensure_ort_dylib_pinned()
 
-from .compress import CompressConfig, CompressResult, compress, compress_spreadsheet  # noqa: E402
+from .compress import (  # noqa: E402
+    CompressConfig,
+    CompressResult,
+    compress,
+    compress_spreadsheet,
+    densify,
+)
 
 # Keep a real callable bound for the one-function compression API so
 # `from headroom import compress` is never shadowed by the submodule object.
@@ -119,6 +125,7 @@ __all__ = [
     "DiffArtifact",
     "RequestMetrics",
     "SimulationResult",
+    "MessageDecision",
     "TransformDiff",
     "TransformResult",
     "WasteSignals",
@@ -174,9 +181,13 @@ __all__ = [
     "EmbedderBackend",
     # One-function compression API
     "compress",
+    "densify",
     "compress_spreadsheet",
     "CompressConfig",
     "CompressResult",
+    # Reverse densified tool output (for consumers of mode="agent" output)
+    "expand_compacted",
+    "is_compacted",
     # Hooks
     "CompressionHooks",
     "CompressContext",
@@ -223,6 +234,7 @@ _LAZY_EXPORTS: dict[str, tuple[str, str]] = {
     "DiffArtifact": ("headroom.config", "DiffArtifact"),
     "RequestMetrics": ("headroom.config", "RequestMetrics"),
     "SimulationResult": ("headroom.config", "SimulationResult"),
+    "MessageDecision": ("headroom.config", "MessageDecision"),
     "TransformDiff": ("headroom.config", "TransformDiff"),
     "TransformResult": ("headroom.config", "TransformResult"),
     "WasteSignals": ("headroom.config", "WasteSignals"),
@@ -271,7 +283,10 @@ _LAZY_EXPORTS: dict[str, tuple[str, str]] = {
     "reset_otel_metrics": ("headroom.observability", "reset_otel_metrics"),
     # One-function API
     "compress": ("headroom.compress", "compress"),
+    "densify": ("headroom.compress", "densify"),
     "compress_spreadsheet": ("headroom.compress", "compress_spreadsheet"),
+    "expand_compacted": ("headroom.transforms.compaction_codec", "expand_compacted"),
+    "is_compacted": ("headroom.transforms.compaction_codec", "is_compacted"),
     # Hooks
     "CompressionHooks": ("headroom.hooks", "CompressionHooks"),
     "CompressContext": ("headroom.hooks", "CompressContext"),

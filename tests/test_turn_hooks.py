@@ -133,6 +133,7 @@ def test_request_runner_attributes_savings_with_handler_counters():
             "tokens": 15,
             "usd": 0.0,
             "details": {"message_tokens_saved": 14, "tool_tokens_saved": 1},
+            "events": 1,
         }
     ]
 

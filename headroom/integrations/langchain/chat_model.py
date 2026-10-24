@@ -32,8 +32,7 @@ import copy
 import json
 import logging
 from collections.abc import AsyncIterator, Iterator, Sequence
-from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any
 from uuid import UUID, uuid4
 
@@ -63,6 +62,7 @@ except ImportError:
     RunnableBinding = ()  # type: ignore[misc,assignment]
 
 from headroom import HeadroomConfig, HeadroomMode
+from headroom.integrations._metrics import OptimizationMetrics
 from headroom.providers import OpenAIProvider
 from headroom.transforms import TransformPipeline
 
@@ -76,7 +76,7 @@ def _check_langchain_available() -> None:
     if not LANGCHAIN_AVAILABLE:
         raise ImportError(
             "LangChain is required for this integration. "
-            "Install with: pip install headroom[langchain] "
+            'Install with: pip install "headroom-ai[langchain]" '
             "or: pip install langchain-core langchain-openai"
         )
 
@@ -100,20 +100,6 @@ def _tool_call_args_to_json(tc: dict[str, Any] | Any) -> str:
 def langchain_available() -> bool:
     """Check if LangChain is installed."""
     return LANGCHAIN_AVAILABLE
-
-
-@dataclass
-class OptimizationMetrics:
-    """Metrics from a single optimization pass."""
-
-    request_id: str
-    timestamp: datetime
-    tokens_before: int
-    tokens_after: int
-    tokens_saved: int
-    savings_percent: float
-    transforms_applied: list[str]
-    model: str
 
 
 class HeadroomChatModel(BaseChatModel):
@@ -350,7 +336,7 @@ class HeadroomChatModel(BaseChatModel):
         # Create metrics
         metrics = OptimizationMetrics(
             request_id=request_id,
-            timestamp=datetime.now(),
+            timestamp=datetime.now(timezone.utc),
             tokens_before=result.tokens_before,
             tokens_after=result.tokens_after,
             tokens_saved=result.tokens_before - result.tokens_after,
@@ -920,7 +906,7 @@ class HeadroomRunnable:
         # Track metrics
         metrics = OptimizationMetrics(
             request_id=str(uuid4()),
-            timestamp=datetime.now(),
+            timestamp=datetime.now(timezone.utc),
             tokens_before=result.tokens_before,
             tokens_after=result.tokens_after,
             tokens_saved=result.tokens_before - result.tokens_after,

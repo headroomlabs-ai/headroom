@@ -190,6 +190,52 @@ describe("withHeadroom (Anthropic)", () => {
     expect(createArgs.messages.length).toBeGreaterThan(0);
   });
 
+  it("flattens array-content tool_result blocks to text for the compression request", async () => {
+    mockFetch.mockResolvedValueOnce(mockCompressSuccess());
+
+    const mockCreate = vi.fn().mockResolvedValue({});
+    const fakeClient = { messages: { create: mockCreate } };
+
+    const wrapped = withHeadroom(fakeClient as any, {
+      baseUrl: "http://localhost:8787",
+    });
+
+    await wrapped.messages.create({
+      model: "claude-sonnet-4-5-20250929",
+      messages: [
+        { role: "user", content: "run the query" },
+        {
+          role: "assistant",
+          content: [
+            { type: "tool_use", id: "tu_1", name: "query", input: { sql: "select 1" } },
+          ],
+        },
+        {
+          role: "user",
+          content: [
+            {
+              type: "tool_result",
+              tool_use_id: "tu_1",
+              content: [
+                { type: "text", text: "row 1" },
+                { type: "text", text: "row 2" },
+              ],
+            },
+          ],
+        },
+      ],
+      max_tokens: 1024,
+    });
+
+    // The proxy must receive the tool output as text, not a JSON-encoded block array.
+    const body = JSON.parse(mockFetch.mock.calls[0][1].body);
+    expect(body.messages[2]).toEqual({
+      role: "tool",
+      content: "row 1\nrow 2",
+      tool_call_id: "tu_1",
+    });
+  });
+
   it("preserves image blocks instead of dropping them during compression", async () => {
     mockFetch.mockResolvedValueOnce(mockCompressSuccess());
 

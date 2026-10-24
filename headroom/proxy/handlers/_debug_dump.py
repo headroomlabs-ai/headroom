@@ -14,7 +14,8 @@ import os
 from datetime import datetime
 from pathlib import Path
 from typing import Any
-from urllib.parse import urlsplit, urlunsplit
+
+from headroom.log_safety import content_logging_enabled, redact_url
 
 logger = logging.getLogger(__name__)
 
@@ -29,9 +30,9 @@ def _debug_dump_mode(config: Any) -> str:
     """
     if getattr(config, "stateless", False):
         return "off"
-    raw = os.environ.get("HEADROOM_DEBUG_DUMP", "").strip().lower()
-    if raw in ("full", "all", "content"):
+    if content_logging_enabled():
         return "full"
+    raw = os.environ.get("HEADROOM_DEBUG_DUMP", "").strip().lower()
     if raw in ("1", "true", "yes", "on", "redacted"):
         return "redacted"
     return "off"
@@ -52,23 +53,6 @@ def _redact_debug_value(value: Any, _max_len: int = 80) -> Any:
     if isinstance(value, list):
         return [_redact_debug_value(v, _max_len) for v in value]
     return value
-
-
-def _redact_url(url: str) -> str:
-    """Drop the query string and fragment from ``url``.
-
-    Some upstreams carry credentials in the query (Gemini's ``?key=``), and the
-    query is never needed to debug a rejected request, so it is elided in every
-    mode — ``full`` opts in to prompt content, not to credentials.
-    """
-    try:
-        parts = urlsplit(url)
-    except ValueError:
-        return "<unparseable url>"
-    if not parts.query and not parts.fragment:
-        return url
-    redacted = urlunsplit((parts.scheme, parts.netloc, parts.path, "", ""))
-    return f"{redacted}?<redacted>" if parts.query else redacted
 
 
 def _decode_sent_body(body: Any) -> Any:
@@ -119,7 +103,7 @@ def write_upstream_error_dump(
         payload = json.dumps(
             {
                 "request_id": request_id,
-                "url": _redact_url(url),
+                "url": redact_url(url),
                 "status": status,
                 "provider": provider,
                 "model": model,

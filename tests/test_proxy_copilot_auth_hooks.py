@@ -13,7 +13,6 @@ ROOT = Path(__file__).resolve().parents[1]
 _ISOLATED_MODULE_NAMES = (
     "headroom.proxy",
     "headroom.proxy.handlers",
-    "httpx",
     "fastapi.responses",
     "tests.headroom_proxy_handlers_openai",
     "tests.headroom_proxy_handlers_streaming",
@@ -42,12 +41,10 @@ def _load_handler_module(monkeypatch: pytest.MonkeyPatch, module_name: str, rela
     handlers_pkg.__path__ = [str(ROOT / "headroom" / "proxy" / "handlers")]
     monkeypatch.setitem(sys.modules, "headroom.proxy.handlers", handlers_pkg)
 
-    httpx_mod = types.ModuleType("httpx")
-    httpx_mod.ConnectError = type("ConnectError", (Exception,), {})
-    httpx_mod.ConnectTimeout = type("ConnectTimeout", (Exception,), {})
-    httpx_mod.PoolTimeout = type("PoolTimeout", (Exception,), {})
-    httpx_mod.ReadTimeout = type("ReadTimeout", (Exception,), {})
-    monkeypatch.setitem(sys.modules, "httpx", httpx_mod)
+    # The real httpx, not a stub: it is a core dependency, and a partial stub
+    # breaks whatever else imports httpx during a cold import (the CCR/MCP SSE
+    # client needs httpx.Response). It also keeps the exception hierarchy the
+    # proxy catches (TransportError and its subclasses) exactly as in production.
 
     responses_mod = types.ModuleType("fastapi.responses")
 

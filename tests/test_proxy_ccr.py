@@ -529,9 +529,10 @@ class TestEndToEndTOINIntegration:
         store = get_compression_store()
         store.process_pending_feedback()
 
-        # PR-B5: pattern key is now `(auth_mode, model_family, sig_hash)`.
-        # Callers that don't supply auth/model land on the
-        # `("unknown", "unknown", sig_hash)` slot.
+        # PR-B5 + PR-F3: pattern key is now `(tenant_key, auth_mode,
+        # model_family, sig_hash)`. Callers that don't supply
+        # tenant/auth/model land on the
+        # `("global", "unknown", "unknown", sig_hash)` slot.
         from headroom.telemetry.toin import _make_pattern_key
 
         pattern = fresh_toin._patterns.get(_make_pattern_key(None, None, signature.structure_hash))
@@ -607,9 +608,10 @@ class TestEndToEndTOINIntegration:
         store.process_pending_feedback()
 
         # Step 3: Verify TOIN learned
-        # PR-B5: pattern key is now `(auth_mode, model_family, sig_hash)`.
-        # Callers that don't supply auth/model land on the
-        # `("unknown", "unknown", sig_hash)` slot.
+        # PR-B5 + PR-F3: pattern key is now `(tenant_key, auth_mode,
+        # model_family, sig_hash)`. Callers that don't supply
+        # tenant/auth/model land on the
+        # `("global", "unknown", "unknown", sig_hash)` slot.
         from headroom.telemetry.toin import _make_pattern_key
 
         pattern = fresh_toin._patterns.get(_make_pattern_key(None, None, signature.structure_hash))

@@ -16,6 +16,7 @@ don't need a real provider:
 
 from __future__ import annotations
 
+import logging
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -359,10 +360,22 @@ def test_backend_ccr_intercept_exception_is_reraised_not_swallowed():
         "usage": {"prompt_tokens": 50, "completion_tokens": 5, "total_tokens": 55},
     }
 
+    records: list[logging.LogRecord] = []
+
+    class _Collect(logging.Handler):
+        def emit(self, record: logging.LogRecord) -> None:
+            records.append(record)
+
+    handler = _Collect(level=logging.DEBUG)
+    proxy_logger = logging.getLogger("headroom.proxy")
+
     mock_backend = _make_mock_backend(tool_call_response)
     with patch("headroom.proxy.server.AnyLLMBackend", return_value=mock_backend):
         app = create_app(config)
         with TestClient(app) as client:
+            # Attach after startup: proxy logging setup would otherwise
+            # detach a handler added earlier (caplog has the same problem).
+            proxy_logger.addHandler(handler)
             _install_tracker_stub(client)
             proxy = client.app.state.proxy
             failing_handler = MagicMock()
@@ -381,6 +394,7 @@ def test_backend_ccr_intercept_exception_is_reraised_not_swallowed():
                 },
                 headers={"Authorization": "Bearer test-key"},
             )
+            proxy_logger.removeHandler(handler)
 
     # The outer `try/except Exception` on the backend block converts the
     # re-raise into a 500 response. The critical assertion is that the
@@ -397,7 +411,14 @@ def test_backend_ccr_intercept_exception_is_reraised_not_swallowed():
         or body.get("choices", [{}])[0].get("message", {}).get("tool_calls") is None
     )
     assert "error" in body
-    assert "ccr-store-blew-up" in body["error"]["message"]
+    # The client gets the fixed vocabulary and a correlation id, not the
+    # exception text; the operator log keeps the detail under that id.
+    assert body["error"]["code"] == "internal_error"
+    request_id = body["error"]["request_id"]
+    assert request_id and f"request_id={request_id}" in body["error"]["message"]
+    assert "ccr-store-blew-up" not in resp.text
+    logged = [r.getMessage() for r in records]
+    assert any(f"[{request_id}]" in m and "ccr-store-blew-up" in m for m in logged), logged
 
 
 def test_backend_streaming_passes_prefix_tracker_through():

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import heapq
 import json
 from collections.abc import Iterator
 from datetime import datetime
@@ -101,35 +102,51 @@ class JSONLStorage(Storage):
         limit: int = 100,
         offset: int = 0,
     ) -> list[RequestMetrics]:
-        """Query metrics with filters."""
-        results: list[RequestMetrics] = []
-        skipped = 0
+        """Query metrics with filters.
 
-        for metrics in self.iter_all():
-            # Apply filters
+        Matches are ordered by timestamp descending, then request_id
+        descending (the order SQLiteStorage.query() applies), before the
+        ``[offset : offset + limit]`` page is returned. Selection is bounded
+        to that window instead of materializing the full match set.
+
+        Args:
+            start_time: Filter by timestamp >= start_time.
+            end_time: Filter by timestamp <= end_time.
+            model: Filter by model name.
+            mode: Filter by mode (audit/optimize).
+            limit: Maximum results to return; must be non-negative.
+            offset: Number of results to skip; must be non-negative.
+
+        Returns:
+            List of matching RequestMetrics for the requested page.
+
+        Raises:
+            ValueError: If limit or offset is negative.
+        """
+        if limit < 0:
+            raise ValueError(f"limit must be non-negative, got {limit}")
+        if offset < 0:
+            raise ValueError(f"offset must be non-negative, got {offset}")
+        if limit == 0:
+            return []
+
+        def _matches(metrics: RequestMetrics) -> bool:
             if start_time is not None and metrics.timestamp < start_time:
-                continue
+                return False
             if end_time is not None and metrics.timestamp > end_time:
-                continue
+                return False
             if model is not None and metrics.model != model:
-                continue
+                return False
             if mode is not None and metrics.mode != mode:
-                continue
+                return False
+            return True
 
-            # Handle offset
-            if skipped < offset:
-                skipped += 1
-                continue
+        filtered = (metrics for metrics in self.iter_all() if _matches(metrics))
 
-            results.append(metrics)
-
-            # Handle limit
-            if len(results) >= limit:
-                break
-
-        # Sort by timestamp descending
-        results.sort(key=lambda m: m.timestamp, reverse=True)
-        return results
+        # Keep only the top offset + limit matches under the shared
+        # timestamp DESC, request_id DESC order, then drop the offset prefix.
+        top = heapq.nlargest(offset + limit, filtered, key=lambda m: (m.timestamp, m.request_id))
+        return top[offset : offset + limit]
 
     def count(
         self,

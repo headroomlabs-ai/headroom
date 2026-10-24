@@ -440,3 +440,107 @@ def test_register_preserves_non_ascii_values(tmp_path: Path) -> None:
     data = tomllib.loads(cfg.read_text(encoding="utf-8"))
     assert data["project"] == "比赛/机器人"
     assert "headroom" in data.get("mcp_servers", {})
+
+
+# ----------------------------------------------------------------------
+# Tables another app appended inside our marker span
+# ----------------------------------------------------------------------
+
+# The ChatGPT app's TOML writer appends its tables before the document's
+# trailing comment, which is our end marker when our span is last.
+_APP_TABLES = (
+    "\n[mcp_servers.node_repl]\n"
+    'command = "/Applications/ChatGPT.app/Contents/Resources/node_repl"\n'
+    "\n[mcp_servers.node_repl.env]\n"
+    'NODE_REPL_MODE = "browser"\n'
+)
+
+
+def _app_appends_inside_span(cfg: Path, tables: str = _APP_TABLES.lstrip("\n")) -> None:
+    end = "# --- end Headroom MCP server ---"
+    cfg.write_text(cfg.read_text().replace(end, tables + end))
+
+
+# A foreign multi-line string holding a line that reads as our header: the
+# line-level move splits the table wrongly, so the rewrite must be refused.
+_UNSPLITTABLE = '[notes]\ntext = """\n[mcp_servers.headroom.env]\n"""\n'
+
+
+def test_unregister_keeps_app_table_inside_span(tmp_path: Path) -> None:
+    reg = _make_registrar(tmp_path)
+    cfg = _config_path(tmp_path)
+    cfg.parent.mkdir()
+    cfg.write_text('model = "gpt-5"\n')
+    reg.register_server(_spec())
+    _app_appends_inside_span(cfg)
+
+    assert reg.unregister_server("headroom") is True
+
+    data = tomllib.loads(cfg.read_text())
+    assert "headroom" not in data["mcp_servers"]
+    assert data["mcp_servers"]["node_repl"]["env"] == {"NODE_REPL_MODE": "browser"}
+    assert data["model"] == "gpt-5"
+
+
+def test_register_force_keeps_app_table_inside_span(tmp_path: Path) -> None:
+    reg = _make_registrar(tmp_path)
+    cfg = _config_path(tmp_path)
+    reg.register_server(_spec(env={"HEADROOM_PROXY_URL": "http://127.0.0.1:9999"}))
+    _app_appends_inside_span(cfg)
+
+    assert reg.register_server(_spec(), force=True).status == RegisterStatus.REGISTERED
+
+    data = tomllib.loads(cfg.read_text())
+    assert data["mcp_servers"]["headroom"].get("env") is None
+    assert data["mcp_servers"]["node_repl"]["env"] == {"NODE_REPL_MODE": "browser"}
+    # The app's table now sits outside our span, so the next unregister keeps it too.
+    assert reg.unregister_server("headroom") is True
+    assert "node_repl" in tomllib.loads(cfg.read_text())["mcp_servers"]
+
+
+def test_unregister_keeps_quoted_key_table_inside_span(tmp_path: Path) -> None:
+    # The `#` in a quoted key is not a comment.
+    reg = _make_registrar(tmp_path)
+    cfg = _config_path(tmp_path)
+    reg.register_server(_spec())
+    _app_appends_inside_span(cfg, '[mcp_servers."foo#bar"]\ncommand = "foreign"\n')
+    assert set(tomllib.loads(cfg.read_text())["mcp_servers"]) == {"headroom", "foo#bar"}
+
+    assert reg.unregister_server("headroom") is True
+
+    assert tomllib.loads(cfg.read_text())["mcp_servers"] == {"foo#bar": {"command": "foreign"}}
+
+
+@pytest.mark.parametrize("inside_span", [_UNSPLITTABLE, "broken =\n"])
+def test_refuses_span_rewrite_that_would_change_other_entries(
+    tmp_path: Path, inside_span: str
+) -> None:
+    reg = _make_registrar(tmp_path)
+    cfg = _config_path(tmp_path)
+    reg.register_server(_spec(env={"HEADROOM_PROXY_URL": "http://127.0.0.1:9999"}))
+    _app_appends_inside_span(cfg, inside_span)
+    before = cfg.read_text()
+
+    assert reg.unregister_server("headroom") is False
+    assert reg.register_server(_spec(), force=True).status == RegisterStatus.FAILED
+    assert cfg.read_text() == before
+
+
+def test_register_escapes_control_chars_in_env_value(tmp_path: Path) -> None:
+    """A newline in an env value must be escaped so the block stays valid TOML.
+
+    TOML basic strings forbid literal control characters other than tab, so a
+    multi-line value (e.g. a PEM key in an env var) rendered with only ``\\``
+    and ``"`` escaping produced unparseable TOML. The write guard then rejected
+    the whole registration with a misleading "file does not parse" error.
+    """
+    reg = _make_registrar(tmp_path)
+    pem = "-----BEGIN KEY-----\nabc\n-----END KEY-----"
+
+    result = reg.register_server(_spec(env={"PEM": pem}), force=True)
+
+    assert result.status == RegisterStatus.REGISTERED
+    # The rendered config parses and round-trips the value verbatim.
+    parsed = tomllib.loads(_config_path(tmp_path).read_text())
+    assert parsed["mcp_servers"]["headroom"]["env"]["PEM"] == pem
+    assert reg.get_server("headroom").env["PEM"] == pem

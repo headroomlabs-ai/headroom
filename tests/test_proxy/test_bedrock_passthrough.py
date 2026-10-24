@@ -328,6 +328,105 @@ def test_upstream_connect_error_returns_502():
     assert resp.status_code == 502
 
 
+def test_oversized_body_returns_413_and_never_forwards(monkeypatch):
+    """A body over MAX_REQUEST_BODY_SIZE gets a 413 fail-closed response, and
+    _forward_bedrock is never reached: a partially-read oversized body must
+    not go out to the gateway.
+    """
+    import headroom.proxy.helpers as helpers_mod
+
+    small_cap = 1024
+    monkeypatch.setattr(helpers_mod, "MAX_REQUEST_BODY_SIZE", small_cap)
+
+    app = create_app(_make_config())
+    with TestClient(app) as client:
+        proxy = client.app.state.proxy
+        http = _install_fake_client(proxy, _FakeUpstream())
+        proxy.anthropic_pipeline.apply = MagicMock(side_effect=AssertionError("should not run"))
+        body = {"messages": [{"role": "user", "content": "x" * (small_cap * 4)}], "max_tokens": 8}
+        resp = client.post(INVOKE, json=body)
+
+    assert resp.status_code == 413
+    assert resp.json()["error"]["type"] == "request_too_large"
+    http.build_request.assert_not_called()
+    http.send.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    "route", [INVOKE, INVOKE_STREAM], ids=["invoke", "invoke-with-response-stream"]
+)
+def test_body_ceiling_413_uses_bedrock_handler_dialect(monkeypatch, route):
+    """The body ceiling is enforced outside the handler, but its 413 must keep
+    the route's own wire dialect: exactly the payload ``handle_bedrock_invoke``
+    returns for ``RequestBodyTooLarge`` —
+    ``{"error": {"type": "request_too_large", "message": ...}}`` — with the
+    request refused before any upstream call.
+    """
+    import headroom.proxy.helpers as helpers_mod
+
+    small_cap = 1024
+    monkeypatch.setattr(helpers_mod, "MAX_REQUEST_BODY_SIZE", small_cap)
+
+    app = create_app(_make_config())
+    with TestClient(app) as client:
+        proxy = client.app.state.proxy
+        http = _install_fake_client(proxy, _FakeUpstream())
+        proxy.anthropic_pipeline.apply = MagicMock(side_effect=AssertionError("should not run"))
+        body = {"messages": [{"role": "user", "content": "x" * (small_cap * 4)}], "max_tokens": 8}
+        resp = client.post(route, json=body)
+
+    assert resp.status_code == 413
+    assert resp.json() == {
+        "error": {
+            "type": "request_too_large",
+            "message": f"Request body too large. Maximum size is {small_cap // (1024 * 1024)}MB",
+        }
+    }
+    http.build_request.assert_not_called()
+    http.send.assert_not_called()
+
+
+def test_body_ceiling_413_leaves_other_dialects_unchanged(monkeypatch):
+    """The dialect fix is scoped to the Bedrock InvokeModel routes: ``/v1/messages``
+    keeps the Anthropic envelope and OpenAI chat keeps
+    ``{"error": {"type": "invalid_request_error", "code": "request_too_large"}}``.
+    """
+    import headroom.proxy.helpers as helpers_mod
+
+    small_cap = 1024
+    monkeypatch.setattr(helpers_mod, "MAX_REQUEST_BODY_SIZE", small_cap)
+
+    app = create_app(_make_config())
+    with TestClient(app) as client:
+        proxy = client.app.state.proxy
+        http = _install_fake_client(proxy, _FakeUpstream())
+        proxy.anthropic_pipeline.apply = MagicMock(side_effect=AssertionError("should not run"))
+        oversized = b"x" * (small_cap * 4)
+        messages = client.post(
+            "/v1/messages",
+            content=oversized,
+            headers={"content-type": "application/json"},
+        )
+        chat = client.post(
+            "/v1/chat/completions",
+            content=oversized,
+            headers={"content-type": "application/json"},
+        )
+
+    message = f"Request body too large. Maximum size is {small_cap // (1024 * 1024)}MB"
+    assert messages.status_code == 413
+    assert messages.json() == {
+        "type": "error",
+        "error": {"type": "request_too_large", "message": message},
+    }
+    assert chat.status_code == 413
+    assert chat.json() == {
+        "error": {"message": message, "type": "invalid_request_error", "code": "request_too_large"}
+    }
+    http.build_request.assert_not_called()
+    http.send.assert_not_called()
+
+
 # ── metrics ───────────────────────────────────────────────────────────
 
 
@@ -349,6 +448,34 @@ def test_outcome_recorded_with_bedrock_provider():
     outcome = proxy._record_request_outcome.await_args.args[0]
     assert outcome.provider == "bedrock"
     assert outcome.tokens_saved == 750
+
+
+@pytest.mark.parametrize("upstream_status", [400, 403, 429, 500, 503])
+def test_outcome_carries_real_upstream_status_on_error(upstream_status):
+    """Regression: handle_bedrock_invoke built RequestOutcome without a
+    status_code kwarg, so an upstream throttle/auth/model error recorded as
+    the dataclass default of 200 — the failed turn then fed the success
+    funnel (savings/cost/request-log) in emit_request_outcome instead of
+    being short-circuited by its `status_code >= 400` guard."""
+    app = create_app(_make_config())
+    with TestClient(app) as client:
+        proxy = client.app.state.proxy
+        _install_fake_client(
+            proxy, _FakeUpstream(status_code=upstream_status, chunks=(b'{"error":true}',))
+        )
+        proxy._record_request_outcome = AsyncMock()
+        proxy.anthropic_pipeline.apply = MagicMock(
+            return_value=_FakeResult([{"role": "user", "content": "c"}], 1000, 250)
+        )
+        resp = client.post(
+            INVOKE,
+            json={"messages": [{"role": "user", "content": "q" * 3000}], "max_tokens": 8},
+        )
+
+    assert resp.status_code == upstream_status
+    assert proxy._record_request_outcome.await_count == 1
+    outcome = proxy._record_request_outcome.await_args.args[0]
+    assert outcome.status_code == upstream_status
 
 
 # ── env config path ───────────────────────────────────────────────────
