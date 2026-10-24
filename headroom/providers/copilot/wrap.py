@@ -11,6 +11,7 @@ from typing import Any
 
 import click
 
+from headroom.offline import OfflineEgressBlocked, guard_egress
 from headroom.proxy.project_context import with_project_prefix
 
 
@@ -131,6 +132,31 @@ def model_prefers_responses_api(model: str | None) -> bool:
     return value.startswith(("gpt-5", "o1", "o3"))
 
 
+#: Copilot model families served on ``/chat/completions`` only. In the captured
+#: ``/models`` catalog (``tests/fixtures/copilot_models/models_list.json``) no
+#: model of theirs that publishes endpoints lists ``/responses``; ``gpt-4*`` and
+#: ``gpt-3.5*`` publish none and are kept from the pre-catalog heuristic.
+_CHAT_COMPLETIONS_ONLY_PREFIXES = ("claude", "gemini", "gpt-4", "gpt-3.5", "kimi")
+
+#: Single chat-only models outside those families, matched by exact name so a
+#: future ``trajectory-*`` model is not swept in.
+_CHAT_COMPLETIONS_ONLY_MODELS = frozenset({"trajectory-compaction"})
+
+
+def model_requires_chat_completions(model: str | None) -> bool:
+    """Return True for models GitHub Copilot serves only on /chat/completions.
+
+    Not the inverse of :func:`model_prefers_responses_api`. A name in neither
+    family (``mai-code-1-flash-picker`` is served only on ``/responses``) must
+    stay on the wire the client chose, since bridging it would turn a working
+    request into a 400.
+    """
+    value = _normalized_model_name(model)
+    return value in _CHAT_COMPLETIONS_ONLY_MODELS or value.startswith(
+        _CHAT_COMPLETIONS_ONLY_PREFIXES
+    )
+
+
 def copilot_model_from_args(
     copilot_args: tuple[str, ...],
     env: Mapping[str, str] | None = None,
@@ -147,80 +173,187 @@ def copilot_model_from_args(
 
 
 def default_wire_api_for_model(model: str | None) -> str:
-    """Choose the Copilot OpenAI-compatible wire API for a model."""
+    """Choose the Copilot OpenAI-compatible wire API for a model, by name."""
     return "responses" if model_prefers_responses_api(model) else "completions"
+
+
+def resolve_wire_api_for_model(
+    model: str | None,
+    *,
+    api_url: str | None = None,
+    token: str | None = None,
+    timeout: float = 4.0,
+) -> str:
+    """Pick the wire API from the model's published endpoints when possible.
+
+    The launcher pins ``COPILOT_PROVIDER_WIRE_API`` for the whole session, so
+    guessing it from the model name can make a perfectly valid main model
+    unusable. ``mai-code-1-flash-picker`` is served **only** on ``/responses``
+    but does not match ``gpt-5*/o1*/o3*``, so the name heuristic pins the
+    session to ``completions`` and every turn fails with
+    ``400 model "mai-code-1-flash-picker" is not accessible via the
+    /chat/completions endpoint`` -- reproduced end-to-end through the real
+    Copilot CLI.
+
+    Asking the upstream which endpoints serve the model removes the guess. This
+    runs once at launch, is bounded by ``timeout``, and falls back to
+    :func:`default_wire_api_for_model` on any failure, so a slow or unreachable
+    ``/models`` only costs a few seconds and never blocks a launch. Under
+    ``HEADROOM_OFFLINE`` it uses that fallback without opening a connection.
+    """
+    fallback = default_wire_api_for_model(model)
+    if not model or not api_url or not token:
+        return fallback
+
+    try:
+        import httpx
+
+        from headroom.copilot_auth import _copilot_chat_header_defaults
+        from headroom.models.copilot_catalog import catalog_enabled, parse_models_payload
+
+        if not catalog_enabled():
+            return fallback
+
+        url = f"{api_url.rstrip('/')}/models"
+        guard_egress("Copilot model catalog for the launch wire API", url)
+        headers = {"Authorization": f"Bearer {token}", **_copilot_chat_header_defaults()}
+        response = httpx.get(url, headers=headers, timeout=timeout)
+        if response.status_code != 200:
+            return fallback
+        card = parse_models_payload(response.json()).get(model)
+    except OfflineEgressBlocked:
+        return fallback
+    except Exception:  # noqa: BLE001 — launch must never fail on discovery
+        return fallback
+
+    if card is None or not card.constrains_endpoints():
+        return fallback
+    # Prefer the model's native wire so the main model never rides the buffered
+    # bridge for every turn; only fall back when it publishes neither.
+    if "/responses" in card.endpoints and "/chat/completions" not in card.endpoints:
+        return "responses"
+    if "/chat/completions" in card.endpoints and "/responses" not in card.endpoints:
+        return "completions"
+    if "/responses" in card.endpoints or "/chat/completions" in card.endpoints:
+        return fallback if fallback in ("responses", "completions") else "completions"
+    return fallback
+
+
+#: The env var that redirects the Copilot CLI's **native** (GitHub-authenticated)
+#: Copilot-API surface at a different host. Undocumented -- it is absent from
+#: ``copilot help environment`` -- but structurally embedded in the shipped CLI:
+#: every native call resolves its base URL through a helper that checks it first,
+#: and the CLI logs "Using COPILOT_API_URL from environment" when it fires.
+#:
+#: This is the interposition point that BYOK is not. BYOK *replaces* Copilot's
+#: model routing and accepts exactly one model, so the picker collapses to that
+#: model and the main agent cannot be switched in-session. Redirecting the native
+#: surface instead leaves Copilot's own routing intact -- the CLI still fetches
+#: ``GET /models``, so the picker stays populated and ``/model`` keeps working --
+#: while every request still travels through Headroom.
+COPILOT_NATIVE_API_URL_ENV = "COPILOT_API_URL"
+
+#: Prefix on every model id the VS Code chat-model config registers.
+#:
+#: VS Code's chat model picker keys a model on its **bare id**, ignoring which
+#: provider contributed it. A BYOK entry that reuses Copilot's own id is
+#: therefore treated as the same model as Copilot's native one, and the picker
+#: renders that identity exactly once -- as the native entry. Every model the
+#: user has recently used or GitHub has featured is already shown that way, so
+#: precisely those models lost their Headroom twin: the compressed route was
+#: invisible for the models people reach for most.
+#:
+#: Registering ``headroom--claude-opus-5`` keeps the two identities distinct in
+#: the picker. The prefix is stripped again in the proxy
+#: (``resolve_copilot_model_id``) so the id that reaches Copilot is the real one,
+#: and savings are still attributed to the real model.
+VSCODE_MODEL_ID_PREFIX = "headroom--"
+
+#: Paths the native CLI drives that are *not* inference and must pass through
+#: untouched. Recorded here for documentation; the proxy's catch-all already
+#: forwards them.
+COPILOT_NATIVE_PASSTHROUGH_PATHS: tuple[str, ...] = (
+    "/models",
+    "/models/session",
+    "/models/session/intent",
+    "/mcp/readonly",
+    "/agents",
+)
+
+
+def native_api_url_supported(
+    *, environ: Mapping[str, str] | None = None, home: str | None = None
+) -> bool | None:
+    """Best-effort check that the installed CLI honours ``COPILOT_API_URL``.
+
+    Returns ``True`` when the shipped application bundle references the variable,
+    ``False`` when a bundle was found and does not, and ``None`` when no bundle
+    could be located (unknown -- caller should proceed with a note rather than
+    refuse).
+
+    Worth checking because the variable is undocumented: if a future CLI drops
+    it, the failure is *silent* in the worst way -- the CLI would talk straight to
+    GitHub, everything would appear to work, and Headroom would simply never see
+    the traffic. A cheap pre-launch signal beats discovering that from a savings
+    report that reads zero.
+    """
+    env = environ if environ is not None else os.environ
+    resolved_home = home if home is not None else os.path.expanduser("~")
+    local = env.get("LOCALAPPDATA") or env.get("HOME") or resolved_home
+    roots = [
+        os.path.join(local, "copilot", "pkg"),
+        os.path.join(resolved_home, ".local", "share", "copilot", "pkg"),
+    ]
+
+    # Answer from the NEWEST bundle only. ORing over every installed version is
+    # unsafe in the direction that matters: an old bundle that still has the
+    # variable would vouch for a new one that dropped it, which is precisely the
+    # silent-bypass case this probe exists to catch.
+    bundles: list[tuple[tuple[int, ...], str]] = []
+    for root in roots:
+        if not os.path.isdir(root):
+            continue
+        for dirpath, _dirnames, filenames in os.walk(root):
+            if "app.js" in filenames:
+                bundles.append((_version_key(dirpath), os.path.join(dirpath, "app.js")))
+    if not bundles:
+        return None  # nothing to inspect: unknown, not unsupported
+
+    bundles.sort()
+    _key, path = bundles[-1]
+    try:
+        with open(path, encoding="utf-8", errors="replace") as fh:
+            # Overlap successive reads so the needle cannot be missed by
+            # landing across a chunk boundary (it silently returned False for
+            # a supported CLI, which then hard-refused the launch).
+            carry = ""
+            overlap = len(COPILOT_NATIVE_API_URL_ENV) - 1
+            while chunk := fh.read(1 << 20):
+                if COPILOT_NATIVE_API_URL_ENV in carry + chunk:
+                    return True
+                carry = chunk[-overlap:] if overlap else ""
+    except OSError:
+        # The newest bundle could not be opened, or failed mid-read (deleted or
+        # locked concurrently). That is unknown, not unsupported -- and an older
+        # bundle must not vote in its place, for the reason given above.
+        return None
+    # The newest bundle is authoritative.
+    return False
+
+
+def _version_key(path: str) -> tuple[int, ...]:
+    """Sortable version tuple from a bundle directory name (``.../1.0.77``)."""
+    name = os.path.basename(path.rstrip(os.sep))
+    parts: list[int] = []
+    for piece in name.split("."):
+        digits = "".join(ch for ch in piece if ch.isdigit())
+        parts.append(int(digits) if digits else 0)
+    return tuple(parts) or (0,)
 
 
 def provider_key_source(provider_type: str) -> str:
     """Return the preferred provider key variable for the selected provider type."""
     return "ANTHROPIC_API_KEY" if provider_type == "anthropic" else "OPENAI_API_KEY"
-
-
-COPILOT_NATIVE_API_URL_ENV = "COPILOT_API_URL"
-
-# Any survivor keeps Copilot in its single-model BYOK lane, defeating native
-# model routing while making the launch look superficially successful.
-COPILOT_BYOK_ENV_VARS: tuple[str, ...] = (
-    "COPILOT_PROVIDER_BASE_URL",
-    "COPILOT_PROVIDER_TYPE",
-    "COPILOT_PROVIDER_API_KEY",
-    "COPILOT_PROVIDER_BEARER_TOKEN",
-    "COPILOT_PROVIDER_WIRE_API",
-    "COPILOT_PROVIDER_TRANSPORT",
-    "COPILOT_PROVIDER_AZURE_API_VERSION",
-    "COPILOT_PROVIDER_MODEL_ID",
-    "COPILOT_PROVIDER_WIRE_MODEL",
-    "COPILOT_PROVIDER_MODEL_LIMITS_ID",
-    "COPILOT_PROVIDER_MAX_PROMPT_TOKENS",
-    "COPILOT_PROVIDER_MAX_OUTPUT_TOKENS",
-    "COPILOT_PROVIDER_HEADERS",
-)
-
-
-def build_native_launch_env(
-    *,
-    port: int,
-    environ: Mapping[str, str] | None = None,
-    project: str | None = None,
-) -> tuple[dict[str, str], list[str]]:
-    """Redirect Copilot's native API surface through Headroom, not BYOK."""
-    env = dict(environ if environ is not None else os.environ)
-    base_url = with_project_prefix(f"http://127.0.0.1:{port}", project)
-    env[COPILOT_NATIVE_API_URL_ENV] = base_url
-    for variable in COPILOT_BYOK_ENV_VARS:
-        env.pop(variable, None)
-    return env, [
-        f"{COPILOT_NATIVE_API_URL_ENV}={base_url}",
-        "COPILOT_AUTH_MODE=github-native",
-    ]
-
-
-def native_api_url_supported(*, environ: Mapping[str, str] | None = None) -> bool | None:
-    """Best-effort tri-state probe for the CLI's native API URL override."""
-    env = environ if environ is not None else os.environ
-    local = env.get("LOCALAPPDATA") or env.get("HOME") or os.path.expanduser("~")
-    roots = (
-        os.path.join(local, "copilot", "pkg"),
-        os.path.join(os.path.expanduser("~"), ".local", "share", "copilot", "pkg"),
-    )
-    found_bundle = False
-    for root in roots:
-        if not os.path.isdir(root):
-            continue
-        for dirpath, _dirnames, filenames in os.walk(root):
-            if "app.js" not in filenames:
-                continue
-            found_bundle = True
-            try:
-                with open(
-                    os.path.join(dirpath, "app.js"), encoding="utf-8", errors="replace"
-                ) as bundle:
-                    while chunk := bundle.read(1 << 20):
-                        if COPILOT_NATIVE_API_URL_ENV in chunk:
-                            return True
-            except OSError:
-                continue
-    return False if found_bundle else None
 
 
 def build_launch_env(
@@ -266,6 +399,57 @@ def build_launch_env(
         "COPILOT_PROVIDER_TYPE=openai",
         f"COPILOT_PROVIDER_BASE_URL={base_url}",
         f"COPILOT_PROVIDER_WIRE_API={effective_wire_api}",
+    ]
+
+
+#: BYOK provider variables that must be absent in native mode. Leaving any one of
+#: them set keeps the CLI in BYOK, which is exactly the single-model behaviour
+#: native mode exists to escape -- and the failure would look like "native mode
+#: silently did nothing".
+COPILOT_BYOK_ENV_VARS: tuple[str, ...] = (
+    "COPILOT_PROVIDER_BASE_URL",
+    "COPILOT_PROVIDER_TYPE",
+    "COPILOT_PROVIDER_API_KEY",
+    "COPILOT_PROVIDER_BEARER_TOKEN",
+    "COPILOT_PROVIDER_WIRE_API",
+    "COPILOT_PROVIDER_TRANSPORT",
+    "COPILOT_PROVIDER_AZURE_API_VERSION",
+    "COPILOT_PROVIDER_MODEL_ID",
+    "COPILOT_PROVIDER_WIRE_MODEL",
+    "COPILOT_PROVIDER_MODEL_LIMITS_ID",
+    "COPILOT_PROVIDER_MAX_PROMPT_TOKENS",
+    "COPILOT_PROVIDER_MAX_OUTPUT_TOKENS",
+    "COPILOT_PROVIDER_HEADERS",
+)
+
+
+def build_native_launch_env(
+    *,
+    port: int,
+    environ: Mapping[str, str] | None = None,
+    project: str | None = None,
+) -> tuple[dict[str, str], list[str]]:
+    """Build the launch environment for native (non-BYOK) Copilot routing.
+
+    Sets :data:`COPILOT_NATIVE_API_URL_ENV` to the local proxy and **clears every
+    BYOK variable**, so the CLI keeps its own GitHub auth and its own model
+    routing. The consequences are the point of the whole mode: the model picker
+    stays fully populated, ``/model`` switches the main agent mid-session,
+    ``--model auto`` works again, and a custom agent's ``model:`` frontmatter is
+    honoured -- none of which BYOK can offer.
+
+    The ``/p/<project>`` prefix is preserved because the Copilot CLI cannot send
+    custom headers; per-project savings attribution rides in the base URL, and
+    the native surface keeps the prefix on every request.
+    """
+    env = dict(environ if environ is not None else os.environ)
+    base_url = with_project_prefix(f"http://127.0.0.1:{port}", project)
+    env[COPILOT_NATIVE_API_URL_ENV] = base_url
+    for var in COPILOT_BYOK_ENV_VARS:
+        env.pop(var, None)
+    return env, [
+        f"{COPILOT_NATIVE_API_URL_ENV}={base_url}",
+        "COPILOT_AUTH_MODE=github-native",
     ]
 
 

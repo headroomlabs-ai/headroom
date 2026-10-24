@@ -23,8 +23,16 @@ def test_openai_responses_route_aliases_are_explicit() -> None:
         "/v1/codex/responses",
         "/backend-api/responses",
         "/backend-api/codex/responses",
+        # Unprefixed form driven by the Copilot CLI's native API surface
+        # (`wrap copilot --native`). Before it was registered, those requests fell
+        # through to the generic passthrough route, which forwards unchanged and
+        # does not compress by default — so OpenAI-family models in a native
+        # session were silently uncompressed.
         "/responses",
     )
+    # Deliberately NOT an alias any more. The websocket relay is the Codex
+    # /responses transport; Copilot's native WS frames are a different shape and
+    # unverified against it, so `/responses` must not silently acquire a WS route.
     assert OPENAI_RESPONSES_WEBSOCKET_PATHS == (
         "/v1/responses",
         "/v1/codex/responses",

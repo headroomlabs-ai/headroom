@@ -3,6 +3,7 @@ from __future__ import annotations
 import io
 import json
 import urllib.error
+from pathlib import Path
 from unittest.mock import patch
 
 import click
@@ -16,6 +17,7 @@ from headroom.providers.copilot.wrap import (
     is_auto_model,
     model_configured,
     model_prefers_responses_api,
+    model_requires_chat_completions,
     provider_key_source,
     query_proxy_config,
     resolve_provider_type,
@@ -108,6 +110,53 @@ def test_model_prefers_responses_api_for_reasoning_models(
 ) -> None:
     assert model_prefers_responses_api(model) is expected
     assert default_wire_api_for_model(model) == ("responses" if expected else "completions")
+
+
+@pytest.mark.parametrize(
+    ("model", "expected"),
+    [
+        ("claude-sonnet-4.6", True),
+        ("copilot/Claude-Opus-4.8", True),
+        ("gemini-3.5-flash", True),
+        ("gpt-4.1", True),
+        ("gpt-4o-mini", True),
+        ("gpt-3.5-turbo", True),
+        ("kimi-k2.7-code", True),
+        ("trajectory-compaction", True),
+        ("copilot/trajectory-compaction", True),
+        ("trajectory-compaction-next", False),
+        ("gpt-5.4", False),
+        ("o3-mini", False),
+        ("mai-code-1-flash-picker", False),
+        ("gpt-model-swap-a", False),
+        ("", False),
+        (None, False),
+    ],
+)
+def test_model_requires_chat_completions_only_for_known_chat_only_families(
+    model: str | None,
+    expected: bool,
+) -> None:
+    """A name in no known family is not presumed chat-only (it may be served only on /responses)."""
+    assert model_requires_chat_completions(model) is expected
+
+
+def _catalog_models_with_endpoints() -> list[tuple[str, list[str]]]:
+    path = Path(__file__).parent / "fixtures" / "copilot_models" / "models_list.json"
+    rows = json.loads(path.read_text(encoding="utf-8"))["data"]
+    return [
+        (row["id"], row["supported_endpoints"]) for row in rows if row.get("supported_endpoints")
+    ]
+
+
+@pytest.mark.parametrize(("model", "endpoints"), _catalog_models_with_endpoints())
+def test_model_requires_chat_completions_agrees_with_the_captured_catalog(
+    model: str,
+    endpoints: list[str],
+) -> None:
+    """The name fallback bridges exactly the models the catalog serves only on /chat/completions."""
+    chat_only = "/chat/completions" in endpoints and "/responses" not in endpoints
+    assert model_requires_chat_completions(model) is chat_only
 
 
 def test_copilot_model_from_args_prefers_cli_over_environment() -> None:
