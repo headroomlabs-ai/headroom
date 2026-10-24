@@ -232,7 +232,7 @@ class TestCompressionEntry:
             created_at=time.time(),
         )
         assert entry.hash == "abc123"
-        assert entry.ttl == 1800  # Default TTL (session-scale)
+        assert entry.ttl == 3600  # Default idle TTL (session-scale)
         assert entry.retrieval_count == 0
         assert entry.search_queries == []
         assert entry.last_accessed is None
@@ -404,7 +404,7 @@ class TestCompressionStoreInit:
         store = CompressionStore()
 
         assert store._max_entries == 1000
-        assert store._default_ttl == 1800
+        assert store._default_ttl == 3600
         assert store._enable_feedback is True
         assert store._backend is not None
 
@@ -517,7 +517,7 @@ class TestCompressionStoreOperations:
         entry = store.retrieve(hash_key)
 
         assert entry is not None
-        assert entry.ttl == 1800  # Default TTL (session-scale)
+        assert entry.ttl == 3600  # Default idle TTL (session-scale)
 
     def test_store_accepts_custom_ttl(self, store: CompressionStore):
         """store() accepts custom TTL override."""
@@ -733,7 +733,7 @@ class TestCompressionStoreEviction:
         assert not backend.exists(old_hash)
         assert len(store._eviction_heap) - store._stale_heap_entries == backend.count() == 1
         assert len(store._expiration_heap) - store._stale_expiration_heap_entries == backend.count()
-        assert (entry.created_at, oversized_hash) in store._eviction_heap
+        assert (entry.created_at, entry.created_at, oversized_hash) in store._eviction_heap
         assert (float("inf"), entry.created_at, oversized_hash) in store._expiration_heap
 
     @pytest.mark.parametrize("mode", ["count", "revision", "revision_error", "stale_revision"])
@@ -979,6 +979,86 @@ class TestCompressionStoreEviction:
         assert not backend.exists(first_live)
         assert backend.exists(second_live)
         assert backend.exists(new_hash)
+
+    def test_recent_access_defers_expiration_heap_cleanup(self):
+        """A retrieve moves the idle deadline; the creation-time heap tuple
+        must be rescheduled, not trusted, and the entry still expires at the
+        new deadline (#2604)."""
+        backend = InMemoryBackend()
+        store = CompressionStore(enable_feedback=False, backend=backend)
+
+        with patch("headroom.cache.compression_store.time.time") as now:
+            now.return_value = 1000
+            # Long-lived neighbors keep the stale ratio low, so no heap rebuild
+            # papers over a tuple that was never rescheduled.
+            for i in range(4):
+                store.store(original=f"filler_{i}", compressed="filler", ttl=600)
+            hash_key = store.store(original="hot", compressed="hot", ttl=60)
+            now.return_value = 1050
+            assert store.retrieve(hash_key) is not None
+            now.return_value = 1061
+            store.store(original="other_1", compressed="other_1", ttl=600)
+            assert backend.exists(hash_key)
+            now.return_value = 1111
+            store.store(original="other_2", compressed="other_2", ttl=600)
+            assert not backend.exists(hash_key)
+            status = store.get_entry_status(hash_key)
+
+        assert status["status"] == "expired_and_purged"
+        assert status["expiry_reason"] == "idle"
+
+    def test_recent_access_cannot_outlive_max_lifetime(self):
+        """Repeated access keeps an entry alive only up to its lifetime ceiling."""
+        backend = InMemoryBackend()
+        store = CompressionStore(enable_feedback=False, backend=backend)
+
+        with patch("headroom.cache.compression_store.time.time") as now:
+            now.return_value = 1000
+            for i in range(4):
+                store.store(original=f"filler_{i}", compressed="filler", ttl=600)
+            hash_key = store.store(original="hot", compressed="hot", ttl=60, max_lifetime=100)
+            for t in (1050, 1095):
+                now.return_value = t
+                assert store.retrieve(hash_key) is not None
+            now.return_value = 1099
+            store.store(original="other_1", compressed="other_1", ttl=600)
+            assert backend.exists(hash_key)
+            now.return_value = 1101
+            store.store(original="other_2", compressed="other_2", ttl=600)
+            assert not backend.exists(hash_key)
+            status = store.get_entry_status(hash_key)
+
+        assert status["expiry_reason"] == "max_lifetime"
+
+    def test_repeated_retrievals_do_not_grow_heaps(self):
+        """Access re-keys lazily, so a read-heavy session adds no heap tuples."""
+        store = CompressionStore(enable_feedback=False)
+        hash_key = store.store(original="hot", compressed="hot")
+
+        for _ in range(1000):
+            assert store.retrieve(hash_key) is not None
+
+        assert len(store._eviction_heap) == 1
+        assert len(store._expiration_heap) == 1
+
+    def test_sibling_worker_access_defers_expiration(self, tmp_path):
+        """An access committed by another worker on a shared SQLite file also
+        keeps the entry alive, since the heap re-checks the stored row."""
+        db_path = tmp_path / "ccr.db"
+        store = CompressionStore(enable_feedback=False, backend=SQLiteBackend(db_path))
+        sibling = CompressionStore(enable_feedback=False, backend=SQLiteBackend(db_path))
+
+        with patch("headroom.cache.compression_store.time.time") as now:
+            now.return_value = 1000
+            hash_key = store.store(original="hot", compressed="hot", ttl=60)
+            now.return_value = 1050
+            assert sibling.retrieve(hash_key) is not None
+            now.return_value = 1061
+            store.store(original="other_1", compressed="other_1", ttl=600)
+            assert store.exists(hash_key)
+            now.return_value = 1111
+            store.store(original="other_2", compressed="other_2", ttl=600)
+            assert not store.exists(hash_key)
 
     def test_heap_rebuild_on_stale_threshold(self):
         """Heap is rebuilt when stale entry ratio exceeds threshold."""
