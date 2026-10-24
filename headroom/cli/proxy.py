@@ -1,6 +1,7 @@
 """Proxy server CLI commands."""
 
 import errno
+import importlib.util
 import ipaddress
 import logging
 import os
@@ -113,6 +114,8 @@ warnings.filterwarnings("ignore", category=UserWarning, module="huggingface_hub"
 
 # ---------------------------------------------------------------------------
 
+_MEMORY_STACK_MODULES = ("mem0", "qdrant_client", "neo4j")
+
 
 def _get_env_bool(name: str, default: bool) -> bool:
     val = os.environ.get(name)
@@ -196,6 +199,22 @@ def _get_env_int(name: str, default: int) -> int:
     """
     value = _get_env_int_optional(name)
     return default if value is None else value
+
+
+def _validate_memory_backend_dependencies(memory_backend: str) -> None:
+    """Fail fast when an explicitly selected memory backend cannot start."""
+    if memory_backend != "qdrant-neo4j":
+        return
+
+    missing = [
+        module for module in _MEMORY_STACK_MODULES if importlib.util.find_spec(module) is None
+    ]
+    if missing:
+        raise click.ClickException(
+            "The qdrant-neo4j memory backend requires the memory-stack dependencies "
+            f"(missing: {', '.join(missing)}). Install them with: "
+            "pip install 'headroom-ai[memory-stack]'"
+        )
 
 
 def _tcp_port_in_use(host: str, port: int, *, workers: int) -> tuple[OSError, Any] | None:
@@ -970,6 +989,18 @@ def dashboard(port: int, no_open: bool) -> None:
     ),
 )
 @click.option(
+    "--memory-backend",
+    type=click.Choice(["local", "qdrant-neo4j"]),
+    default="local",
+    envvar="HEADROOM_MEMORY_BACKEND",
+    help=(
+        "Memory storage backend. local — per-machine SQLite (default). "
+        "qdrant-neo4j — shared Qdrant + Neo4j, so several machines can read and write "
+        "one memory store; configure it with --memory-qdrant-* and requires "
+        "pip install 'headroom-ai[memory-stack]'. Env: HEADROOM_MEMORY_BACKEND."
+    ),
+)
+@click.option(
     "--memory-qdrant-url",
     default=None,
     help=(
@@ -1219,6 +1250,7 @@ def proxy(
     no_memory_tools: bool,
     no_memory_context: bool,
     memory_top_k: int,
+    memory_backend: str,
     memory_qdrant_url: str | None,
     memory_qdrant_host: str | None,
     memory_qdrant_port: int | None,
@@ -1448,6 +1480,8 @@ def proxy(
     license_key = resolve_license_token()
     usage_reporting = usage_reporting_enabled()
 
+    _validate_memory_backend_dependencies(memory_backend)
+
     # Qdrant connection for the qdrant-neo4j backend. CLI flags default
     # to None; when omitted we let ProxyConfig's default_factory resolve
     # HEADROOM_QDRANT_* env vars. Explicit CLI values win over env.
@@ -1605,6 +1639,7 @@ def proxy(
         memory_inject_tools=not no_memory_tools,
         memory_inject_context=not no_memory_context,
         memory_top_k=memory_top_k,
+        memory_backend=cast(Literal["local", "qdrant-neo4j"], memory_backend),
         **qdrant_overrides,
         # Traffic Learning: only with --learn, never with --no-learn
         # Stateless mode disables learning (requires filesystem)
@@ -1701,6 +1736,7 @@ Memory (Multi-Provider):
   - Anthropic: Uses native memory tool (memory_20250818) - subscription safe
   - OpenAI/Gemini/Others: Uses function calling format
   - All providers share the same semantic vector store backend
+  - Backend: {config.memory_backend}
   - Storage mode: {config.memory_storage_mode} (per-project DB by default — set x-headroom-project-id / x-headroom-cwd to override)
   - Tools: {"ENABLED" if config.memory_inject_tools else "DISABLED"}
   - Context injection: {"ENABLED" if config.memory_inject_context else "DISABLED"}

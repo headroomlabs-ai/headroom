@@ -296,6 +296,85 @@ class TestMemoryTopKValidation:
         assert result.exit_code != 0
 
 
+class TestMemoryBackend:
+    """The CLI must expose the existing memory backend without changing defaults."""
+
+    def test_default_is_local(self, runner: CliRunner, mock_run_server: dict) -> None:
+        result = runner.invoke(main, ["proxy"], catch_exceptions=False)
+
+        assert result.exit_code == 0, result.output
+        assert mock_run_server["config"].memory_backend == "local"
+
+    def test_qdrant_neo4j_flag_reaches_config_and_banner(
+        self, runner: CliRunner, mock_run_server: dict
+    ) -> None:
+        with patch("headroom.cli.proxy._validate_memory_backend_dependencies"):
+            result = runner.invoke(
+                main,
+                ["proxy", "--memory", "--memory-backend", "qdrant-neo4j"],
+                catch_exceptions=False,
+            )
+
+        assert result.exit_code == 0, result.output
+        assert mock_run_server["config"].memory_backend == "qdrant-neo4j"
+        assert "- Backend: qdrant-neo4j" in result.output
+
+    def test_qdrant_neo4j_env_reaches_config(
+        self, runner: CliRunner, mock_run_server: dict
+    ) -> None:
+        with patch("headroom.cli.proxy._validate_memory_backend_dependencies"):
+            result = runner.invoke(
+                main,
+                ["proxy"],
+                env={"HEADROOM_MEMORY_BACKEND": "qdrant-neo4j"},
+                catch_exceptions=False,
+            )
+
+        assert result.exit_code == 0, result.output
+        assert mock_run_server["config"].memory_backend == "qdrant-neo4j"
+
+    def test_flag_wins_over_conflicting_env(self, runner: CliRunner, mock_run_server: dict) -> None:
+        result = runner.invoke(
+            main,
+            ["proxy", "--memory-backend", "local"],
+            env={"HEADROOM_MEMORY_BACKEND": "qdrant-neo4j"},
+            catch_exceptions=False,
+        )
+
+        assert result.exit_code == 0, result.output
+        assert mock_run_server["config"].memory_backend == "local"
+
+    def test_invalid_value_is_rejected(self, runner: CliRunner) -> None:
+        result = runner.invoke(main, ["proxy", "--memory-backend", "invalid"])
+
+        assert result.exit_code != 0
+        assert "Invalid value for '--memory-backend'" in result.output
+
+    def test_qdrant_neo4j_fails_fast_without_memory_stack(
+        self, runner: CliRunner, mock_run_server: dict
+    ) -> None:
+        with patch("headroom.cli.proxy.importlib.util.find_spec", return_value=None):
+            result = runner.invoke(main, ["proxy", "--memory-backend", "qdrant-neo4j"])
+
+        assert result.exit_code != 0
+        assert "qdrant-neo4j memory backend requires" in result.output
+        assert "pip install 'headroom-ai[memory-stack]'" in result.output
+        assert "config" not in mock_run_server
+
+    def test_qdrant_neo4j_starts_when_memory_stack_is_installed(
+        self, runner: CliRunner, mock_run_server: dict
+    ) -> None:
+        with patch("headroom.cli.proxy.importlib.util.find_spec", return_value=object()):
+            result = runner.invoke(
+                main,
+                ["proxy", "--memory-backend", "qdrant-neo4j"],
+                catch_exceptions=False,
+            )
+
+        assert result.exit_code == 0, result.output
+        assert mock_run_server["config"].memory_backend == "qdrant-neo4j"
+
+
 class TestMissingProxyDepsError:
     """When proxy dependencies are absent the CLI should print an actionable error and exit 1."""
 
