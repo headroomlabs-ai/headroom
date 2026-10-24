@@ -183,6 +183,17 @@ def _write_fixture(
     }
 
     target = out_dir / f"{digest[:16]}.json"
+    if target.exists():
+        try:
+            existing = json.loads(target.read_text())
+            comparable = {key: value for key, value in fixture.items() if key != "recorded_at"}
+            existing_comparable = {
+                key: value for key, value in existing.items() if key != "recorded_at"
+            }
+            if existing_comparable == comparable:
+                return
+        except (OSError, json.JSONDecodeError):
+            pass
     target.write_text(json.dumps(fixture, indent=2, sort_keys=True) + "\n")
 
 
@@ -309,6 +320,17 @@ def record_all(root: Path | None = None) -> dict[str, str]:
         statuses["code_aware_compressor"] = f"blocked:{e.__class__.__name__}:{e}"
 
     return statuses
+
+
+def record_code_aware(root: Path | None = None) -> str:
+    """Patch only the code-aware compressor for its scoped fixture recorder."""
+    try:
+        from headroom.transforms.code_compressor import CodeAwareCompressor
+
+        _wrap_method(CodeAwareCompressor, "compress", "code_aware_compressor", root=root)
+    except Exception as e:
+        return f"blocked:{e.__class__.__name__}:{e}"
+    return "patched"
 
 
 def _wrap_method(
@@ -886,7 +908,7 @@ def run_default_workload(root: Path | None = None) -> dict[str, int]:
     except Exception as e:
         LOG.warning("kompress workload failed: %s", e)
 
-    # code_aware_compressor — AST code compression over all 8 languages.
+    # code_aware_compressor — AST code compression over all 9 languages.
     # Installs the individual-grammar parser patch first (see
     # install_individual_grammar_parsers); enable_ccr=False +
     # fallback_to_kompress=False keep output deterministic. Soft-fails when
@@ -929,6 +951,7 @@ def install_individual_grammar_parsers() -> None:
     import tree_sitter_java
     import tree_sitter_javascript
     import tree_sitter_python
+    import tree_sitter_ruby
     import tree_sitter_rust
     import tree_sitter_typescript
     from tree_sitter import Language, Parser
@@ -944,11 +967,14 @@ def install_individual_grammar_parsers() -> None:
         "java": Language(tree_sitter_java.language()),
         "c": Language(tree_sitter_c.language()),
         "cpp": Language(tree_sitter_cpp.language()),
+        "ruby": Language(tree_sitter_ruby.language()),
     }
     cache: dict[str, Any] = {}
 
     def _get_parser(language: str) -> Any:
         if language not in cache:
+            if language not in langs:
+                raise KeyError(f"No pinned parity parser is mapped for {language!r}")
             try:
                 cache[language] = Parser(langs[language])
             except TypeError:  # older binding: assign .language
@@ -958,11 +984,19 @@ def install_individual_grammar_parsers() -> None:
         return cache[language]
 
     cc._get_parser = _get_parser  # type: ignore[assignment]  # noqa: SLF001
+    # Keep the parity corpus scoped to the grammars this recorder pins. An
+    # unmapped production candidate must not be silently substituted by a
+    # different grammar, while direct requests still fail loudly above.
+    cc._LANGUAGE_PREFILTER = {
+        language: patterns
+        for language, patterns in cc._LANGUAGE_PREFILTER.items()
+        if language.value in langs
+    }
     cc._check_tree_sitter_available = lambda: True  # type: ignore[assignment]  # noqa: SLF001
 
 
 def _varied_code_inputs() -> list[str]:
-    """≥20 varied source-code inputs spanning all 8 supported languages.
+    """≥20 varied source-code inputs spanning all 9 supported languages.
 
     Exercises: imports, long-bodied functions (body truncation), classes with
     multiple methods, decorators, type definitions, top-level code, Python
@@ -970,6 +1004,70 @@ def _varied_code_inputs() -> list[str]:
     an UNKNOWN input (plain prose → passthrough with fallback disabled). All
     inputs are ASCII (the non-ASCII byte/char slice ambiguity is out of parity
     scope; see code_compressor.rs module docs)."""
+    ruby_basic = (
+        "require 'json'\n"
+        "require_relative 'processor'\n"
+        "load 'extensions'\n"
+        "autoload :Helper, 'helper'\n"
+        "class Processor\n"
+        "  include Enumerable\n"
+        "  attr_reader :name\n"
+        "  CONST = 'stable'\n"
+        "  def process(items)\n"
+        "    first = items.map(&:strip)\n"
+        "    second = first.map(&:upcase)\n"
+        "    third = second.reverse\n"
+        "    fourth = third.join(',')\n"
+        "    fifth = fourth.strip\n"
+        "    sixth = fifth.reverse\n"
+        "    seventh = sixth.upcase\n"
+        "    eighth = seventh\n"
+        "    ninth = eighth\n"
+        "    tenth = ninth\n"
+        "    tenth\n"
+        "  end\n"
+        "  def reset\n"
+        "    @name = nil\n"
+        "    @name = 'reset'\n"
+        "    @name\n"
+        "  end\n"
+        "end\n"
+    )
+    ruby_same_line = (
+        "class Compact; def value; a=1; b=2; c=3; d=4; e=5; f=6; g=7; h=8; "
+        "i=9; j=10; k=11; l=12; m=13; n=14; o=15; p=16; q=17; r=18; "
+        "s=19; t=20; t; end; end\n"
+        "# " + "padding " * 80
+    )
+    ruby_heredoc = (
+        "class Query\n"
+        "  def run\n"
+        "    first = 1\n"
+        "    query = <<~SQL\n"
+        "      SELECT 1\n"
+        "    SQL\n"
+        "    second = 2\n"
+        "    third = 3\n"
+        "    fourth = 4\n"
+        "    fifth = fourth + 1\n"
+        "    sixth = fifth + 1\n"
+        "    seventh = sixth + 1\n"
+        "    eighth = seventh + 1\n"
+        "    ninth = eighth + 1\n"
+        "    tenth = ninth + 1\n"
+        "    eleventh = tenth + 1\n"
+        "    twelfth = eleventh + 1\n"
+        "    thirteenth = twelfth + 1\n"
+        "    fourteenth = thirteenth + 1\n"
+        "    fifteenth = fourteenth + 1\n"
+        "    sixteenth = fifteenth + 1\n"
+        "    seventeenth = sixteenth + 1\n"
+        "    eighteenth = seventeenth + 1\n"
+        "    nineteenth = eighteenth + 1\n"
+        "    twentieth = nineteenth + 1\n"
+        "  end\n"
+        "end\n"
+    )
     python_basic = (
         "import os\n"
         "import sys\n"
@@ -1284,6 +1382,9 @@ def _varied_code_inputs() -> list[str]:
 
     return [
         python_basic,
+        ruby_basic,
+        ruby_same_line,
+        ruby_heredoc,
         python_nodoc,
         python_multiline_ds,
         python_orchestrator,
@@ -1309,6 +1410,7 @@ def _varied_code_inputs() -> list[str]:
         f"{cpp_basic}\n// variant 1",
         f"{typescript_basic}\n// variant 1",
         f"{python_orchestrator}\n# variant 1",
+        f"{ruby_basic}\n# variant 1",
     ]
 
 
