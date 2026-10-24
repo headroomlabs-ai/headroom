@@ -403,7 +403,9 @@ class BaseTokenizer(ABC):
         source = image_data.get("source", {})
         img_bytes = source.get("bytes", b"")
 
-        if isinstance(img_bytes, bytes | bytearray) and len(img_bytes) > 0:
+        from headroom.image.decoder_guard import pillow_is_safe
+
+        if isinstance(img_bytes, bytes | bytearray) and len(img_bytes) > 0 and pillow_is_safe():
             try:
                 import io
 
