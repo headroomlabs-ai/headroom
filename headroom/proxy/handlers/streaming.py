@@ -1613,7 +1613,11 @@ class StreamingMixin:
         # message id + request id. ``x-litellm-key-*`` carries the per-key
         # spend/budget envelope a LiteLLM virtual key reports per request;
         # downstream status widgets read it from the streaming response the
-        # same way they already do from the buffered path. The buffered
+        # same way they already do from the buffered path. GitHub Copilot keys
+        # its AI-credit accounting off ``x-github-*`` / ``*copilot*`` headers;
+        # without them the Copilot CLI marks streamed usage records
+        # ``aiCreditsStatus: unavailable`` and silently under-reports credits.
+        # The buffered
         # (non-streaming) path already forwards every upstream header, so
         # this keeps the two paths symmetric.
         forwarded_headers = {
@@ -1622,6 +1626,8 @@ class StreamingMixin:
             if "ratelimit" in k.lower()
             or k.lower().startswith("x-codex")
             or k.lower().startswith("x-litellm-key-")
+            or k.lower().startswith("x-github")
+            or "copilot" in k.lower()
             or k.lower() in ("request-id", "anthropic-request-id", "x-request-id")
         }
         # Headroom's own compression metrics, as the buffered path stamps them.
