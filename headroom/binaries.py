@@ -58,6 +58,19 @@ from headroom.offline import guard_egress
 
 logger = logging.getLogger(__name__)
 
+# Affirmative values for the sha256-verification bypass. This is a security
+# control (supply-chain integrity), so it must fail CLOSED: only an explicit
+# affirmative disables verification. A bare presence check treated
+# `HEADROOM_BINARIES_ALLOW_UNVERIFIED=0` / `=false` — the natural way to say
+# "keep verifying" — as truthy and silently skipped verification.
+_TRUTHY = frozenset({"1", "true", "yes", "on"})
+
+
+def _allow_unverified_binaries() -> bool:
+    """Whether sha256 verification of fetched binaries is bypassed."""
+    return os.environ.get("HEADROOM_BINARIES_ALLOW_UNVERIFIED", "").strip().lower() in _TRUTHY
+
+
 __all__ = [
     "BinaryError",
     "BinaryFetchError",
@@ -385,7 +398,7 @@ def _allow_unverified(name: str) -> bool:
     when ``lastResort`` will not fire, and when the log may be going somewhere
     an operator is not watching, such as a file.
     """
-    if not os.environ.get("HEADROOM_BINARIES_ALLOW_UNVERIFIED"):
+    if not _allow_unverified_binaries():
         return False
     message = (
         f"headroom: WARNING: accepting {name} WITHOUT sha256 verification "
@@ -399,6 +412,7 @@ def _allow_unverified(name: str) -> bool:
 
 
 def _verify_sha256(path: Path, expected: str | None) -> None:
+
     if _allow_unverified(path.name):
         return
     if not expected:
@@ -439,6 +453,7 @@ def verify_download_bytes(data: bytes, *, url: str, name: str) -> None:
     Sha256Mismatch if the bytes do not match it. Setting
     HEADROOM_BINARIES_ALLOW_UNVERIFIED=1 skips both checks.
     """
+
     if _allow_unverified(name):
         return
     expected = sha256_for_url(url)
