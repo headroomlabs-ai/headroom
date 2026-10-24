@@ -3453,6 +3453,7 @@ class ContentRouter(Transform):
         # Any section carrying a placeholder is passed through verbatim
         # instead of ever entering a compressor.
         placeholders = [placeholder for placeholder, _ in protected]
+        source_lines = sections_source.split("\n")
 
         compressed_sections: list[str] = []
         routing_log: list[RoutingDecision] = []
@@ -3460,7 +3461,13 @@ class ContentRouter(Transform):
         for i, section in enumerate(sections):
             if placeholders and any(ph in section.content for ph in placeholders):
                 section_tokens = _estimate_tokens(section.content)
-                compressed_sections.append(section.content)
+                passthrough = section.content
+                # A fenced section's content is only the body. Emit its source
+                # lines instead, so the fence lines come back exactly as they
+                # were (and a fence left open stays open).
+                if section.is_code_fence:
+                    passthrough = "\n".join(source_lines[section.start_line : section.end_line + 1])
+                compressed_sections.append(passthrough)
                 routing_log.append(
                     RoutingDecision(
                         content_type=section.content_type,
