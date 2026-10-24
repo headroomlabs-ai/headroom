@@ -768,11 +768,19 @@ class MemoryHandler:
             )
             return None
 
-        await self._ensure_initialized()
-        if not self._backend:
-            return None
+        try:
+            await self._ensure_initialized()
+            if not self._backend:
+                return None
 
-        backend, scope, effective_user_id = self._resolve_for_request(user_id, request_context)
+            backend, scope, effective_user_id = self._resolve_for_request(user_id, request_context)
+        except Exception as e:
+            logger.warning(
+                "Memory: Failed to initialize or resolve backend for user %s: %s",
+                user_id,
+                e,
+            )
+            return None
 
         # Fail-closed when the router was unable to resolve a project in
         # PROJECT mode and `unresolved_project_fallback="empty"` (the
