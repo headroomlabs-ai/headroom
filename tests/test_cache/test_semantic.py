@@ -51,6 +51,43 @@ class TestSemanticCache:
         entry = cache.get("Unknown query", messages_hash="unknown")
         assert entry is None
 
+    @pytest.mark.parametrize("max_entries", [0, -1])
+    def test_put_rejects_nonpositive_capacity(self, max_entries, monkeypatch):
+        cache = SemanticCache(SemanticCacheConfig(max_entries=max_entries))
+        # Fail promptly instead of hanging if the unguarded eviction loop returns.
+        monkeypatch.setattr(
+            cache, "_evict_oldest", lambda: pytest.fail("Invalid capacity must not evict entries")
+        )
+
+        with pytest.raises(ValueError, match="max_entries must be positive"):
+            cache.put("query", "response", messages_hash="request")
+
+        assert cache.get_stats()["entries"] == 0
+
+    @pytest.mark.parametrize("max_entries", [0, -1])
+    @pytest.mark.parametrize("messages_hash", ["existing", "new"])
+    def test_invalid_capacity_change_preserves_entries(
+        self, max_entries, messages_hash, monkeypatch
+    ):
+        cache = SemanticCache(SemanticCacheConfig(max_entries=1))
+        cache.put("query", "original", messages_hash="existing")
+        cache.config.max_entries = max_entries
+        stats = cache.get_stats()
+        monkeypatch.setattr(
+            cache, "_evict_oldest", lambda: pytest.fail("Invalid capacity must not evict entries")
+        )
+
+        with pytest.raises(ValueError, match="max_entries must be positive"):
+            cache.put("query", "replacement", messages_hash=messages_hash)
+
+        assert cache.get_stats() == stats
+        assert cache.get("query", messages_hash="existing").response == "original"
+        assert cache.get("query", messages_hash="new") is None
+
+        cache.config.max_entries = 1
+        cache.put("query", "updated", messages_hash="existing")
+        assert cache.get("query", messages_hash="existing").response == "updated"
+
     def test_same_query_different_context_does_not_collide(self, cache):
         """Two requests that share a trailing user message but differ in earlier
         context (distinct messages_hash) must not overwrite each other. Before the

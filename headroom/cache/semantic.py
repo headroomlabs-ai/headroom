@@ -82,7 +82,7 @@ class SemanticCacheConfig:
     # Similarity threshold for cache hit (0.0 - 1.0)
     similarity_threshold: float = 0.95
 
-    # Maximum entries in cache
+    # Maximum entries in cache (must be positive)
     max_entries: int = 1000
 
     # TTL in seconds (0 = no expiry)
@@ -199,7 +199,13 @@ class SemanticCache:
 
         Returns:
             Cache key for the entry
+
+        Raises:
+            ValueError: If max_entries is not positive.
         """
+        if self.config.max_entries <= 0:
+            raise ValueError("max_entries must be positive")
+
         self._cleanup_expired()
 
         # Create cache key. Prefer the full-context hash: two requests that share
