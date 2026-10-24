@@ -8,11 +8,15 @@ from pathlib import Path
 import pytest
 
 from headroom.providers.opencode.config import (
+    HEADROOM_OPENCODE_EXTRA_MODELS_ENV,
     HEADROOM_OPENCODE_PLUGIN,
     _inject_key_into_json,
     _parse_json_loose,
+    extra_models_from_env,
+    headroom_provider_entry,
     inject_opencode_provider_config,
     opencode_config_paths,
+    parse_extra_model_spec,
     snapshot_opencode_config_if_unwrapped,
     strip_opencode_headroom_blocks,
 )
@@ -293,6 +297,121 @@ def test_inject_provider_config_drops_user_entries_without_an_explicit_upstream(
     headroom = _parse_json_loose(config_file.read_text())["provider"]["headroom"]
     assert "apiKey" not in headroom["options"]
     assert set(headroom["models"]) == {"gpt-4o", "gpt-4.1"}
+
+
+# ---------------------------------------------------------------------------
+# Extra models
+# ---------------------------------------------------------------------------
+
+
+def test_parse_extra_model_spec_full() -> None:
+    """Full id=name=context=output spec parses into a provider models entry."""
+    model_id, entry = parse_extra_model_spec("deepseek-v4-pro=DeepSeek V4=1000000=384000")
+    assert model_id == "deepseek-v4-pro"
+    assert entry == {"name": "DeepSeek V4", "limit": {"context": 1000000, "output": 384000}}
+
+
+def test_parse_extra_model_spec_defaults() -> None:
+    """Name defaults to the id, context to 200000, output to min(16384, context)."""
+    model_id, entry = parse_extra_model_spec("deepseek-chat")
+    assert model_id == "deepseek-chat"
+    assert entry == {"name": "deepseek-chat", "limit": {"context": 200000, "output": 16384}}
+
+    _, named = parse_extra_model_spec("deepseek-chat=DeepSeek Chat=65536")
+    assert named == {"name": "DeepSeek Chat", "limit": {"context": 65536, "output": 16384}}
+
+    # A context window below the default output caps the output, and an empty
+    # name field still falls back to the id.
+    _, small = parse_extra_model_spec("small-model==8192")
+    assert small == {"name": "small-model", "limit": {"context": 8192, "output": 8192}}
+
+
+@pytest.mark.parametrize(
+    ("spec", "expected_id", "expected_name"),
+    [
+        ("qwen2.5-coder:7b", "qwen2.5-coder:7b", "qwen2.5-coder:7b"),
+        (
+            "deepseek/deepseek-chat:free=DeepSeek Free",
+            "deepseek/deepseek-chat:free",
+            "DeepSeek Free",
+        ),
+        ("deepseek-r1:14b=DeepSeek R1: 14B=65536", "deepseek-r1:14b", "DeepSeek R1: 14B"),
+    ],
+)
+def test_parse_extra_model_spec_keeps_colons_in_ids(
+    spec: str, expected_id: str, expected_name: str
+) -> None:
+    """Ollama (`name:tag`) and OpenRouter (`:free`) ids keep their colons."""
+    model_id, entry = parse_extra_model_spec(spec)
+    assert model_id == expected_id
+    assert entry["name"] == expected_name
+
+
+@pytest.mark.parametrize(
+    "spec",
+    [
+        "",
+        "=name=1000",
+        "id=name=abc",
+        "id=name=0",
+        "id=name=1000=abc",
+        "id=name=1000=-1",
+        "id=n=1=2=3",
+    ],
+)
+def test_parse_extra_model_spec_invalid(spec: str) -> None:
+    """Empty id or a bad context window / output limit raises ValueError."""
+    with pytest.raises(ValueError):
+        parse_extra_model_spec(spec)
+
+
+def test_extra_models_from_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    """HEADROOM_OPENCODE_EXTRA_MODELS parses comma-separated specs."""
+    monkeypatch.setenv(
+        HEADROOM_OPENCODE_EXTRA_MODELS_ENV,
+        "deepseek-chat=DeepSeek Chat=65536, qwen2.5-coder:7b",
+    )
+    models = extra_models_from_env()
+    assert models["deepseek-chat"]["limit"]["context"] == 65536
+    assert models["qwen2.5-coder:7b"]["name"] == "qwen2.5-coder:7b"
+
+    monkeypatch.delenv(HEADROOM_OPENCODE_EXTRA_MODELS_ENV)
+    assert extra_models_from_env() == {}
+
+
+def test_headroom_provider_entry_merges_extra_models() -> None:
+    """Extra models are merged alongside the built-in model list."""
+    _, entry = parse_extra_model_spec("deepseek-chat=DeepSeek Chat=65536")
+    provider = headroom_provider_entry(8787, {"deepseek-chat": entry})
+    assert "gpt-4o" in provider["models"]
+    assert provider["models"]["deepseek-chat"]["name"] == "DeepSeek Chat"
+
+
+def test_inject_provider_config_with_extra_models(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """inject_opencode_provider_config writes extra models into the config."""
+    _set_test_home(monkeypatch, tmp_path)
+    _, entry = parse_extra_model_spec("deepseek-chat=DeepSeek Chat=65536")
+    inject_opencode_provider_config(port=8787, extra_models={"deepseek-chat": entry})
+    config_file = tmp_path / ".config" / "opencode" / "opencode.json"
+    config = _parse_json_loose(config_file.read_text())
+    models = config["provider"]["headroom"]["models"]
+    assert models["deepseek-chat"]["limit"]["context"] == 65536
+    assert "gpt-4o" in models
+
+
+def test_build_opencode_config_content_with_extra_models() -> None:
+    """build_opencode_config_content threads extra models into the headroom provider."""
+    from headroom.providers.opencode.runtime import build_opencode_config_content
+
+    _, entry = parse_extra_model_spec("deepseek-chat=DeepSeek Chat=65536")
+    config = build_opencode_config_content(
+        port=8787, include_mcp=False, include_plugin=False, extra_models={"deepseek-chat": entry}
+    )
+    models = config["provider"]["headroom"]["models"]
+    assert models["deepseek-chat"]["name"] == "DeepSeek Chat"
+    assert "gpt-4o" in models
 
 
 # ---------------------------------------------------------------------------
@@ -654,6 +773,45 @@ def test_inject_provider_config_strips_existing_markers(
     assert second.count("headroom") == first.count("headroom")
 
 
+@pytest.mark.parametrize("keep_user_entries", [False, True])
+def test_extra_models_override_persisted_collision_with_upstream_gate(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, keep_user_entries: bool
+) -> None:
+    _set_test_home(monkeypatch, tmp_path)
+    config_file = tmp_path / ".config" / "opencode" / "opencode.json"
+    config_file.parent.mkdir(parents=True)
+    config_file.write_text(
+        json.dumps(
+            {
+                "provider": {
+                    "headroom": {
+                        "options": {
+                            "apiKey": "third-party-secret",
+                            "baseURL": "https://old.invalid",
+                        },
+                        "models": {
+                            "deepseek-chat": {"name": "Old model"},
+                            "private-model": {"name": "Private"},
+                        },
+                    }
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    _, entry = parse_extra_model_spec("deepseek-chat=DeepSeek Chat=65536")
+    inject_opencode_provider_config(
+        port=8787, extra_models={"deepseek-chat": entry}, keep_user_entries=keep_user_entries
+    )
+    provider = json.loads(config_file.read_text(encoding="utf-8"))["provider"]["headroom"]
+    assert provider["models"]["deepseek-chat"] == entry
+    assert provider["options"]["baseURL"] == "http://127.0.0.1:8787/v1"
+    assert ("private-model" in provider["models"]) is keep_user_entries
+    assert ("apiKey" in provider["options"]) is keep_user_entries
+    if keep_user_entries:
+        assert provider["options"]["apiKey"] == "third-party-secret"
+
+
 # ---------------------------------------------------------------------------
 # OpenCode 2.x --standalone launch flag
 # ---------------------------------------------------------------------------
@@ -748,3 +906,204 @@ def test_jsonc_migration_treats_dangling_conflict_as_ambiguous(
     migrate_legacy_opencode_jsonc_backup(config, canonical)
     assert not canonical.exists()
     assert legacy.read_bytes() == original
+
+
+# ---------------------------------------------------------------------------
+# Managed state (what Headroom owns in the config file)
+# ---------------------------------------------------------------------------
+
+
+def _managed_state_path(config_file: Path) -> Path:
+    return config_file.with_name(config_file.name + ".headroom-managed.json")
+
+
+def test_inject_provider_config_records_managed_state(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The sidecar records the model ids and baseURL Headroom injected."""
+    _set_test_home(monkeypatch, tmp_path)
+    config_file = tmp_path / ".config" / "opencode" / "opencode.json"
+
+    inject_opencode_provider_config(port=8787, extra_models={"my-model": {"name": "My Model"}})
+
+    state = json.loads(_managed_state_path(config_file).read_text(encoding="utf-8"))
+    assert state["created_file"] is True
+    assert state["managed_base_url"] == "http://127.0.0.1:8787/v1"
+    assert set(state["managed_models"]) == {"gpt-4o", "gpt-4.1", "my-model"}
+
+
+def test_inject_provider_config_keeps_existing_file_out_of_created_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A config the user already had is not marked as Headroom-created."""
+    _set_test_home(monkeypatch, tmp_path)
+    config_file = tmp_path / ".config" / "opencode" / "opencode.json"
+    config_file.parent.mkdir(parents=True)
+    config_file.write_text('{"theme": "dark"}', encoding="utf-8")
+
+    inject_opencode_provider_config(port=8787)
+
+    state = json.loads(_managed_state_path(config_file).read_text(encoding="utf-8"))
+    assert state["created_file"] is False
+
+
+def test_snapshot_skips_a_config_headroom_wrote(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A re-wrap must not snapshot Headroom's own config as pre-wrap content."""
+    _set_test_home(monkeypatch, tmp_path)
+    config_file = tmp_path / ".config" / "opencode" / "opencode.json"
+
+    inject_opencode_provider_config(port=8787)
+    backup_file = config_file.with_name(config_file.name + ".headroom-backup")
+    assert not backup_file.exists()
+
+    inject_opencode_provider_config(port=8787)
+    assert not backup_file.exists()
+
+
+def test_snapshot_does_not_back_up_a_config_headroom_created(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A config Headroom created holds no pre-wrap content to restore."""
+    _set_test_home(monkeypatch, tmp_path)
+    config_file = tmp_path / ".config" / "opencode" / "opencode.json"
+
+    inject_opencode_provider_config(port=8787)
+    config_file.write_text('{"theme": "dark"}', encoding="utf-8")
+
+    inject_opencode_provider_config(port=8787)
+    backup_file = config_file.with_name(config_file.name + ".headroom-backup")
+    assert not backup_file.exists()
+
+
+def test_reinject_prunes_a_dropped_extra_model(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A model Headroom injected but no longer advertises is dropped."""
+    _set_test_home(monkeypatch, tmp_path)
+    config_file = tmp_path / ".config" / "opencode" / "opencode.json"
+    extra = {"name": "My Model", "limit": {"context": 200000, "output": 16384}}
+
+    inject_opencode_provider_config(port=8787, extra_models={"my-model": extra})
+    inject_opencode_provider_config(port=8787, keep_user_entries=True)
+
+    models = _parse_json_loose(config_file.read_text(encoding="utf-8"))["provider"]["headroom"][
+        "models"
+    ]
+    assert "my-model" not in models
+    assert set(models) == {"gpt-4o", "gpt-4.1"}
+
+
+def test_reinject_keeps_a_user_model_and_a_edited_extra(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Models the user added or edited survive a re-wrap."""
+    _set_test_home(monkeypatch, tmp_path)
+    config_file = tmp_path / ".config" / "opencode" / "opencode.json"
+    extra = {"name": "My Model", "limit": {"context": 200000, "output": 16384}}
+
+    inject_opencode_provider_config(port=8787, extra_models={"my-model": extra})
+    data = _parse_json_loose(config_file.read_text(encoding="utf-8"))
+    data["provider"]["headroom"]["models"]["user-model"] = {"name": "User Model"}
+    data["provider"]["headroom"]["models"]["my-model"] = {"name": "Renamed by the user"}
+    config_file.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
+
+    inject_opencode_provider_config(port=8787, keep_user_entries=True)
+
+    models = _parse_json_loose(config_file.read_text(encoding="utf-8"))["provider"]["headroom"][
+        "models"
+    ]
+    assert models["user-model"] == {"name": "User Model"}
+    assert models["my-model"] == {"name": "Renamed by the user"}
+
+
+def test_remove_managed_opencode_provider_keeps_user_entries() -> None:
+    """Only the entries Headroom injected are removed."""
+    from headroom.providers.opencode.config import (
+        OpencodeManagedState,
+        remove_managed_opencode_provider,
+    )
+
+    state = OpencodeManagedState(
+        created_file=True,
+        managed_base_url="http://127.0.0.1:8787/v1",
+        managed_models={"gpt-4o": {"name": "GPT-4o"}},
+    )
+    data = {
+        "provider": {
+            "headroom": {
+                "npm": "@ai-sdk/openai-compatible",
+                "name": "Headroom Proxy",
+                "options": {"baseURL": "http://127.0.0.1:8787/v1", "apiKey": "secret"},
+                "models": {"gpt-4o": {"name": "GPT-4o"}, "user-model": {"name": "User"}},
+            },
+            "anthropic": {"options": {"timeout": 5}},
+        },
+        "theme": "dark",
+    }
+
+    assert remove_managed_opencode_provider(data, state) is True
+    headroom = data["provider"]["headroom"]
+    assert headroom["models"] == {"user-model": {"name": "User"}}
+    assert headroom["options"] == {"apiKey": "secret"}
+    assert data["provider"]["anthropic"] == {"options": {"timeout": 5}}
+    assert data["theme"] == "dark"
+
+
+def test_remove_managed_opencode_provider_drops_the_empty_provider() -> None:
+    """A provider block that only held Headroom's entries is removed."""
+    from headroom.providers.opencode.config import (
+        OpencodeManagedState,
+        remove_managed_opencode_provider,
+    )
+
+    state = OpencodeManagedState(
+        created_file=True,
+        managed_base_url="http://127.0.0.1:8787/v1",
+        managed_models={"gpt-4o": {"name": "GPT-4o"}},
+    )
+    data = {
+        "provider": {
+            "headroom": {
+                "npm": "@ai-sdk/openai-compatible",
+                "name": "Headroom Proxy",
+                "options": {"baseURL": "http://127.0.0.1:8787/v1"},
+                "models": {"gpt-4o": {"name": "GPT-4o"}},
+            }
+        }
+    }
+
+    assert remove_managed_opencode_provider(data, state) is True
+    assert data == {}
+
+
+def test_opencode_config_is_empty_only_for_empty_configs(tmp_path: Path) -> None:
+    """A config with content (or with unreadable content) is never empty."""
+    from headroom.providers.opencode.config import opencode_config_is_empty
+
+    config_file = tmp_path / "opencode.json"
+    config_file.write_text("{}", encoding="utf-8")
+    assert opencode_config_is_empty(config_file) is True
+
+    config_file.write_text('{"provider": {}}', encoding="utf-8")
+    assert opencode_config_is_empty(config_file) is True
+
+    config_file.write_text('{"provider": {"headroom": {}}}', encoding="utf-8")
+    assert opencode_config_is_empty(config_file) is True
+
+    config_file.write_text('{"theme": "dark"}', encoding="utf-8")
+    assert opencode_config_is_empty(config_file) is False
+
+    # A falsy user setting is content, not an empty section.
+    config_file.write_text('{"autoupdate": false}', encoding="utf-8")
+    assert opencode_config_is_empty(config_file) is False
+
+    config_file.write_text('{"retries": 0}', encoding="utf-8")
+    assert opencode_config_is_empty(config_file) is False
+
+    config_file.write_text('{"model": ""}', encoding="utf-8")
+    assert opencode_config_is_empty(config_file) is False
+
+    config_file.write_text("not json", encoding="utf-8")
+    assert opencode_config_is_empty(config_file) is False
