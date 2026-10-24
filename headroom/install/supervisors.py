@@ -342,12 +342,39 @@ def _parse_windows_task_xml(raw: bytes | str) -> ElementTree.Element:
     if isinstance(raw, bytes):
         try:
             return ElementTree.fromstring(raw)
-        except ElementTree.ParseError:
-            raw = raw.decode(errors="replace")
+        except (ElementTree.ParseError, ValueError, LookupError):
+            pass
+
+        raw_bytes = raw
+        raw_str = None
+        if b"\x00" in raw_bytes:
+            try:
+                raw_str = raw_bytes.decode("utf-16")
+            except UnicodeDecodeError:
+                raw_str = raw_bytes.decode(errors="replace")
+        else:
+            declared_enc = None
+            match = re.search(rb'<\?xml\s+[^>]*encoding=["\']([^"\']+)["\']', raw_bytes)
+            if match:
+                enc_name = match.group(1).decode("ascii", errors="ignore").lower()
+                if "utf-16" not in enc_name and "utf-32" not in enc_name:
+                    declared_enc = enc_name
+            if declared_enc:
+                try:
+                    raw_str = raw_bytes.decode(declared_enc)
+                except (LookupError, UnicodeDecodeError):
+                    pass
+            if raw_str is None:
+                try:
+                    raw_str = raw_bytes.decode("utf-8-sig")
+                except UnicodeDecodeError:
+                    raw_str = raw_bytes.decode(errors="replace")
+    else:
+        raw_str = raw
     normalized = re.sub(
-        r'<\?xml\s+version="1\.0"\s+encoding="[^"]+"\?>',
-        '<?xml version="1.0"?>',
-        raw,
+        r'<\?xml\s+version="1\.0"\s+encoding="[^"]+"\?>\s*',
+        "",
+        raw_str,
         count=1,
     )
     return ElementTree.fromstring(normalized)
@@ -381,7 +408,7 @@ def _register_windows_task(name: str, xml: str, *, expected_logon_type: str) -> 
 
         try:
             task = _parse_windows_task_xml(query.stdout or b"")
-        except ElementTree.ParseError as exc:
+        except (ElementTree.ParseError, ValueError, LookupError) as exc:
             raise _WindowsTaskRegistrationError(
                 f"Could not parse registered Windows task {name!r}", task_created=True
             ) from exc

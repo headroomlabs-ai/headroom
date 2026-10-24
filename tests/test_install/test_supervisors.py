@@ -119,6 +119,112 @@ def test_parse_windows_task_xml_accepts_valid_bytes() -> None:
     assert task.find("LogonType").text == "S4U"
 
 
+def test_parse_windows_task_xml_accepts_utf16_encoded_bytes() -> None:
+    xml = (
+        '<?xml version="1.0" encoding="UTF-16"?>\n'
+        '<Task xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">'
+        "<Principals><Principal><LogonType>S4U</LogonType></Principal></Principals>"
+        "</Task>"
+    )
+    task = _parse_windows_task_xml(xml.encode("utf-16"))
+    assert task is not None
+    assert task.find(".//{*}LogonType").text == "S4U"
+
+
+def test_parse_windows_task_xml_accepts_utf16be_without_bom() -> None:
+    xml = (
+        '<?xml version="1.0" encoding="UTF-16"?>\n'
+        '<Task xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">'
+        "<Principals><Principal><LogonType>S4U</LogonType></Principal></Principals>"
+        "</Task>"
+    )
+    task = _parse_windows_task_xml(xml.encode("utf-16-be"))
+    assert task is not None
+    assert task.find(".//{*}LogonType").text == "S4U"
+
+
+def test_parse_windows_task_xml_preserves_declared_windows_codepage() -> None:
+    xml = (
+        '<?xml version="1.0" encoding="windows-1252"?>\n'
+        '<Task xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">'
+        "<Name>Caf\xe9</Name>"
+        "<Principals><Principal><LogonType>S4U</LogonType></Principal></Principals>"
+        "</Task>"
+    )
+    task = _parse_windows_task_xml(xml.encode("windows-1252"))
+    assert task is not None
+    assert task.find(".//{*}Name").text == "Caf\xe9"
+    assert task.find(".//{*}LogonType").text == "S4U"
+
+
+def test_parse_windows_task_xml_accepts_declared_multibyte_encoding() -> None:
+    xml = (
+        '<?xml version="1.0" encoding="shift_jis"?>\n'
+        '<Task xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">'
+        "<Name>\u30c6\u30b9\u30c8</Name>"
+        "<Principals><Principal><LogonType>S4U</LogonType></Principal></Principals>"
+        "</Task>"
+    )
+    task = _parse_windows_task_xml(xml.encode("shift_jis"))
+    assert task is not None
+    assert task.find(".//{*}Name").text == "\u30c6\u30b9\u30c8"
+    assert task.find(".//{*}LogonType").text == "S4U"
+
+
+def test_parse_windows_task_xml_accepts_ansi_with_invalid_utf8() -> None:
+    xml = (
+        b'<Task xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">'
+        b"<Name>Caf\xe9</Name>"
+        b"<Principals><Principal><LogonType>S4U</LogonType></Principal></Principals>"
+        b"</Task>"
+    )
+    task = _parse_windows_task_xml(xml)
+    assert task is not None
+    assert task.find(".//{*}LogonType").text == "S4U"
+
+
+def test_register_windows_task_cleans_up_on_unparseable_xml(monkeypatch) -> None:
+    def fake_run(command: list[str], **kwargs):
+        if command[1] == "/Query":
+            return _LaunchctlResult(stdout=b"<<<not-xml>>>")
+        return _LaunchctlResult()
+
+    monkeypatch.setattr("headroom.install.supervisors.subprocess.run", fake_run)
+
+    with pytest.raises(_WindowsTaskRegistrationError) as exc_info:
+        _register_windows_task("headroom-test-task", "<Task />", expected_logon_type="S4U")
+
+    assert exc_info.value.task_created is True
+
+
+def test_register_windows_task_cleans_up_on_unsupported_multibyte_error(monkeypatch) -> None:
+    def fake_run(command: list[str], **kwargs):
+        if command[1] == "/Query":
+            return _LaunchctlResult(
+                stdout=b'<?xml version="1.0" encoding="unsupported-codec"?><Task>'
+            )
+        return _LaunchctlResult()
+
+    monkeypatch.setattr("headroom.install.supervisors.subprocess.run", fake_run)
+
+    with pytest.raises(_WindowsTaskRegistrationError) as exc_info:
+        _register_windows_task("headroom-test-task", "<Task />", expected_logon_type="S4U")
+
+    assert exc_info.value.task_created is True
+
+
+def test_parse_windows_task_xml_accepts_utf8_bom_bytes() -> None:
+    xml = (
+        '<?xml version="1.0" encoding="UTF-16"?>\n'
+        '<Task xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">'
+        "<Principals><Principal><LogonType>S4U</LogonType></Principal></Principals>"
+        "</Task>"
+    )
+    task = _parse_windows_task_xml(xml.encode("utf-8-sig"))
+    assert task is not None
+    assert task.find(".//{*}LogonType").text == "S4U"
+
+
 def test_parse_windows_task_xml_accepts_text() -> None:
     task = _parse_windows_task_xml("<Task><LogonType>InteractiveToken</LogonType></Task>")
 
