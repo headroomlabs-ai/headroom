@@ -20,14 +20,13 @@
 
 mod common;
 
-use aws_credential_types::Credentials;
 use axum::body::Body;
 use axum::extract::{Extension, State};
 use axum::http::StatusCode;
 use axum::routing::post;
 use axum::Router;
 use bytes::Bytes;
-use common::start_proxy_with_state;
+use common::{start_proxy_with_state, test_credentials};
 use headroom_core::auth_mode::AuthMode;
 use headroom_proxy::AppState;
 use serde_json::{json, Value};
@@ -40,16 +39,6 @@ use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 const TEST_MODEL: &str = "anthropic.claude-3-haiku-20240307-v1:0";
-
-fn test_credentials() -> Credentials {
-    Credentials::new(
-        "AKIAEXAMPLEAKIDFORTEST",
-        "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",
-        None,
-        None,
-        "test",
-    )
-}
 
 #[derive(Default, Clone, Debug)]
 struct CapturedRequest {

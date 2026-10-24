@@ -41,6 +41,7 @@ from headroom.proxy.body_forwarding import (
     thinking_blocks_survived_mutation,
 )
 from headroom.proxy.helpers import (
+    _path_for_log,
     _reset_session_beta_tracker_for_test,
     append_text_to_latest_user_chat_message,
     get_session_beta_tracker,
@@ -509,6 +510,67 @@ def test_log_outbound_request_emits_structured_fields() -> None:
     assert "x-api-key" not in msg.lower()
 
 
+def test_log_outbound_request_strips_query_string_api_key() -> None:
+    """Google forwarders put the API key in ``?key=``; it must not reach the log."""
+    import logging
+
+    proxy_logger = logging.getLogger("headroom.proxy")
+    records: list[logging.LogRecord] = []
+
+    class _ListHandler(logging.Handler):
+        def emit(self, record: logging.LogRecord) -> None:
+            records.append(record)
+
+    handler = _ListHandler(level=logging.INFO)
+    prev_level = proxy_logger.level
+    proxy_logger.addHandler(handler)
+    proxy_logger.setLevel(logging.INFO)
+    try:
+        log_outbound_request(
+            forwarder="google_batch_passthrough",
+            method="POST",
+            path=(
+                "https://user:pw@generativelanguage.googleapis.com/v1beta/"
+                "models/gemini-2.5-pro:batchGenerateContent?key=AIzaSECRET#frag"
+            ),
+            body_bytes_count=1,
+            body_mutated=False,
+            mutation_reasons=[],
+            request_id=None,
+            source="passthrough",
+        )
+    finally:
+        proxy_logger.removeHandler(handler)
+        proxy_logger.setLevel(prev_level)
+
+    msg = next(r.getMessage() for r in records if "outbound_request" in r.getMessage())
+    assert (
+        "path=https://generativelanguage.googleapis.com/v1beta/"
+        "models/gemini-2.5-pro:batchGenerateContent " in msg
+    )
+    assert "AIzaSECRET" not in msg
+    assert "key=" not in msg
+    assert "user:pw" not in msg
+
+
+@pytest.mark.parametrize(
+    ("path", "expected"),
+    [
+        # IPv6 upstreams keep their brackets so the log stays a valid URL.
+        ("https://[::1]:8787/v1/messages?key=SECRET", "https://[::1]:8787/v1/messages"),
+        ("http://[2001:db8::1]/v1/chat", "http://[2001:db8::1]/v1/chat"),
+        ("https://api.example.com:8443/v1?x=1#f", "https://api.example.com:8443/v1"),
+        # Relative paths pass through without a query.
+        ("/v1/messages?key=SECRET", "/v1/messages"),
+        # An invalid port makes urlsplit raise; never fall back to the raw URL.
+        ("https://host:notaport/v1?key=SECRET", "<unparseable>"),
+        ("https://[::1/v1?key=SECRET", "<unparseable>"),
+    ],
+)
+def test_path_for_log(path: str, expected: str) -> None:
+    assert _path_for_log(path) == expected
+
+
 # ---------------------------------------------------------------------------
 # httpx-mock end-to-end byte-faithful checks
 # ---------------------------------------------------------------------------
@@ -598,7 +660,9 @@ def _make_anthropic_app(*, optimize: bool) -> tuple[TestClient, _CapturingTransp
     # turn 0 on every run.
     fake_tracker = _FakePrefixTracker(frozen_count=0)
     proxy.session_tracker_store.compute_session_id = lambda request, model, messages: "s1"
-    proxy.session_tracker_store.get_or_create = lambda session_id, provider: fake_tracker
+    proxy.session_tracker_store.get_or_create = (
+        lambda session_id, provider, cache_ttl_seconds=None: fake_tracker
+    )
 
     return TestClient(app), transport
 
@@ -636,7 +700,9 @@ def test_signed_thinking_discarded_mutation_uses_wire_truth_for_all_accounting(
 
     tracker = _FakePrefixTracker(frozen_count=0)
     proxy.session_tracker_store.compute_session_id = lambda request, model, messages: "signed"
-    proxy.session_tracker_store.get_or_create = lambda session_id, provider: tracker
+    proxy.session_tracker_store.get_or_create = (
+        lambda session_id, provider, cache_ttl_seconds=None: tracker
+    )
 
     inbound = {
         "model": "claude-opus-5",
@@ -729,7 +795,9 @@ def test_untouched_thinking_lets_tool_compaction_reach_the_wire(
 
     tracker = _FakePrefixTracker(frozen_count=0)
     proxy.session_tracker_store.compute_session_id = lambda request, model, messages: "signed"
-    proxy.session_tracker_store.get_or_create = lambda session_id, provider: tracker
+    proxy.session_tracker_store.get_or_create = (
+        lambda session_id, provider, cache_ttl_seconds=None: tracker
+    )
 
     signed_block = {"type": "thinking", "thinking": "private", "signature": "sig123"}
     inbound = {
@@ -1407,7 +1475,9 @@ def test_streaming_forwarder_byte_faithful() -> None:
     # Pin session tracker so the cache-stable delta path is a no-op.
     fake_tracker = _FakePrefixTracker(frozen_count=0)
     proxy.session_tracker_store.compute_session_id = lambda request, model, messages: "s_stream"
-    proxy.session_tracker_store.get_or_create = lambda session_id, provider: fake_tracker
+    proxy.session_tracker_store.get_or_create = (
+        lambda session_id, provider, cache_ttl_seconds=None: fake_tracker
+    )
 
     transport = _StreamingCapturingTransport()
     proxy.http_client = httpx.AsyncClient(transport=transport)
@@ -1504,7 +1574,9 @@ def test_messages_custom_upstream_stream_preserves_client_beta_header() -> None:
         proxy.session_tracker_store.compute_session_id = lambda request, model, messages: (
             "custom-stream-beta-1"
         )
-        proxy.session_tracker_store.get_or_create = lambda session_id, provider: fake_tracker
+        proxy.session_tracker_store.get_or_create = (
+            lambda session_id, provider, cache_ttl_seconds=None: fake_tracker
+        )
 
         transport = _StreamingCapturingTransport()
         proxy.http_client = httpx.AsyncClient(transport=transport)

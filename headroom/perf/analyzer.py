@@ -67,12 +67,11 @@ _STAGE_TIMINGS_RE = re.compile(
 
 
 # ---------------------------------------------------------------------------
-# Cache-aware pricing via LiteLLM
+# List pricing via LiteLLM
 # ---------------------------------------------------------------------------
 
-# LiteLLM already knows per-token costs for 100+ models including
-# cache_read and cache_creation pricing.  We call it directly instead
-# of maintaining our own pricing tables.
+# LiteLLM already knows per-token costs for 100+ models.  We read it
+# directly instead of maintaining our own pricing tables.
 
 try:
     import litellm as _litellm
@@ -80,32 +79,6 @@ try:
     _LITELLM_AVAILABLE = True
 except ImportError:
     _LITELLM_AVAILABLE = False
-
-
-def _litellm_cost(
-    model: str,
-    prompt_tokens: int,
-    cache_read_tokens: int = 0,
-    cache_write_tokens: int = 0,
-) -> float | None:
-    """Compute input cost via litellm.cost_per_token (cache-aware).
-
-    Returns total input cost in USD, or None if model not found.
-    """
-    if not _LITELLM_AVAILABLE:
-        return None
-    resolved = resolve_litellm_model(model)
-    try:
-        input_cost, _ = _litellm.cost_per_token(
-            model=resolved,
-            prompt_tokens=prompt_tokens,
-            completion_tokens=0,
-            cache_read_input_tokens=cache_read_tokens,
-            cache_creation_input_tokens=cache_write_tokens,
-        )
-        return float(input_cost)
-    except Exception:
-        return None
 
 
 def _get_list_price(model: str) -> float | None:
@@ -840,13 +813,15 @@ def format_report(report: PerfReport) -> str:
     # exactly zero tokens; every token-savings channel in the proxy would record
     # it as nothing. Showing `$` beside a `0 tokens` row is the honest rendering
     # of that, and collapsing them into one number would be an invented saving.
+    from headroom.proxy.savings_attribution import event_count
+
     by_source: dict[tuple[str, bool], dict[str, float]] = {}
     for record in report.perf_records:
         for item in getattr(record, "savings_breakdown", ()) or ():
             source = str(item.get("source") or "other")
             realized = bool(item.get("realized", True))
             row = by_source.setdefault((source, realized), {"events": 0, "tokens": 0, "usd": 0.0})
-            row["events"] += 1
+            row["events"] += event_count(item)
             row["tokens"] += max(0, _as_number(item.get("tokens"), int))
             row["usd"] += _as_number(item.get("usd"), float)
     if by_source:
@@ -1383,6 +1358,8 @@ def build_perf_summary(report: PerfReport) -> dict:
             }
         )
 
+    from headroom.proxy.savings_attribution import event_count
+
     by_source_groups: dict[tuple[str, bool], dict[str, int | float | str | bool]] = {}
     for record in records:
         for item in record.savings_breakdown:
@@ -1399,7 +1376,7 @@ def build_perf_summary(report: PerfReport) -> dict:
                     "usd": 0.0,
                 },
             )
-            row["events"] = int(row["events"]) + 1
+            row["events"] = int(row["events"]) + event_count(item)
             raw_tokens = item.get("tokens", 0)
             raw_usd = item.get("usd", 0.0)
             tokens = int(raw_tokens) if isinstance(raw_tokens, (str, int, float)) else 0

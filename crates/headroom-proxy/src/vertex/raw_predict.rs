@@ -36,6 +36,8 @@ use std::net::SocketAddr;
 
 use crate::compression;
 use crate::headers::{build_forward_request_headers, filter_response_headers};
+use crate::observability::capture::TEE_QUEUE_DEPTH as VERTEX_SSE_QUEUE_DEPTH;
+use crate::observability::{capture, ledger};
 use crate::proxy::AppState;
 use crate::vertex::{adc::TokenSourceError, envelope, VertexVerb};
 
@@ -76,6 +78,13 @@ pub(crate) async fn forward_vertex_request(
 ) -> Response {
     let path_for_log = uri.path().to_string();
 
+    // Constructed at handler ENTRY so every exit — including
+    // proxy-side rejections (oversized body, envelope mismatch, ADC
+    // failure) — records exactly once. An ADC outage must show in
+    // /stats as a failure spike, not zero traffic.
+    let mut pending_stats =
+        capture::start_pending(&state, ledger::provider::VERTEX, &ctx.model_id, &request_id);
+
     // ─── 1. BUFFER BODY ────────────────────────────────────────────────
     let max = state.config.compression_max_body_bytes as usize;
     let buffered = match to_bytes(body, max).await {
@@ -89,6 +98,7 @@ pub(crate) async fn forward_vertex_request(
                 error = %e,
                 "vertex request body exceeds compression buffer limit; failing loudly"
             );
+            capture::finalize_rejected(pending_stats.take());
             return error_response(
                 StatusCode::PAYLOAD_TOO_LARGE,
                 "request body exceeds buffer limit",
@@ -122,6 +132,7 @@ pub(crate) async fn forward_vertex_request(
                 error = %e,
                 "vertex envelope did not match expected shape; rejecting with 400"
             );
+            capture::finalize_rejected(pending_stats.take());
             return error_response(StatusCode::BAD_REQUEST, "vertex envelope invalid");
         }
     }
@@ -133,6 +144,7 @@ pub(crate) async fn forward_vertex_request(
     // The dispatcher uses RawValue-based surgery so `anthropic_version`
     // (and any other non-`messages` top-level field) round-trips
     // byte-equal. Compression off → buffered bytes used unchanged.
+    let mut stats_compression: (u64, u64, Vec<String>) = (0, 0, Vec::new());
     let body_to_send = if state.config.compression {
         // PR-E3: Vertex uses GCP ADC bearer-token auth downstream, not
         // Anthropic credentials, so the PAYG/OAuth/subscription
@@ -177,6 +189,11 @@ pub(crate) async fn forward_vertex_request(
                     markers = markers_inserted.len(),
                     "vertex live-zone compression applied"
                 );
+                stats_compression = (
+                    tokens_before as u64,
+                    tokens_after as u64,
+                    strategies_applied.iter().map(|s| s.to_string()).collect(),
+                );
                 body
             }
             compression::Outcome::Passthrough { reason } => {
@@ -201,6 +218,11 @@ pub(crate) async fn forward_vertex_request(
         buffered
     };
 
+    if let Some(p) = pending_stats.as_mut() {
+        let (before, after, transforms) = stats_compression;
+        p.set_compression(before, after, transforms);
+    }
+
     // ─── 4. RESOLVE BEARER TOKEN ───────────────────────────────────────
     let bearer = match state.vertex_token_source.bearer().await {
         Ok(t) => t,
@@ -221,6 +243,7 @@ pub(crate) async fn forward_vertex_request(
                 TokenSourceError::ProviderInit(_) => StatusCode::BAD_GATEWAY,
                 TokenSourceError::Fetch(_) => StatusCode::BAD_GATEWAY,
             };
+            capture::finalize_rejected(pending_stats.take());
             return error_response(status, "vertex ADC token fetch failed");
         }
     };
@@ -248,6 +271,7 @@ pub(crate) async fn forward_vertex_request(
                 error = %e,
                 "could not construct vertex upstream URL"
             );
+            capture::finalize_rejected(pending_stats.take());
             return error_response(StatusCode::BAD_GATEWAY, "vertex upstream URL build failed");
         }
     };
@@ -293,6 +317,7 @@ pub(crate) async fn forward_vertex_request(
                 error = %e,
                 "ADC bearer token contained invalid header bytes; refusing to forward"
             );
+            capture::finalize_rejected(pending_stats.take());
             return error_response(StatusCode::BAD_GATEWAY, "vertex auth header build failed");
         }
     }
@@ -308,9 +333,11 @@ pub(crate) async fn forward_vertex_request(
                 error = %e,
                 "could not convert axum method to reqwest method"
             );
+            capture::finalize_rejected(pending_stats.take());
             return error_response(StatusCode::BAD_REQUEST, "vertex method invalid");
         }
     };
+
     let upstream_resp = match state
         .client
         .request(reqwest_method, upstream_url.clone())
@@ -321,6 +348,9 @@ pub(crate) async fn forward_vertex_request(
     {
         Ok(r) => r,
         Err(e) => {
+            if let Some(p) = pending_stats.take() {
+                p.finalize_failed();
+            }
             tracing::warn!(
                 event = "vertex_upstream_error",
                 request_id = %request_id,
@@ -335,6 +365,11 @@ pub(crate) async fn forward_vertex_request(
     // ─── 8. STREAM RESPONSE ────────────────────────────────────────────
     let upstream_status = upstream_resp.status();
     let status = StatusCode::from_u16(upstream_status.as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
+    if !upstream_status.is_success() {
+        if let Some(p) = pending_stats.as_mut() {
+            p.mark_failed();
+        }
+    }
     let resp_headers = filter_response_headers(upstream_resp.headers());
 
     // PR-C1 reuse: when `attach_sse_tee` is set AND the upstream
@@ -355,7 +390,11 @@ pub(crate) async fn forward_vertex_request(
     let parser_tx = if attach_sse_tee && is_sse {
         let (tx, rx) = tokio::sync::mpsc::channel::<bytes::Bytes>(VERTEX_SSE_QUEUE_DEPTH);
         let rid = request_id.clone();
-        tokio::spawn(run_anthropic_sse_state_machine(rx, rid));
+        tokio::spawn(run_anthropic_sse_state_machine(
+            rx,
+            rid,
+            pending_stats.take(),
+        ));
         tracing::info!(
             event = "vertex_sse_tee_engaged",
             request_id = %request_id,
@@ -363,7 +402,12 @@ pub(crate) async fn forward_vertex_request(
         );
         Some(tx)
     } else {
-        None
+        // Non-SSE (rawPredict, or a JSON error on the streaming
+        // verb): tee the body into a bounded buffer and parse the
+        // Anthropic-shape usage block when it completes.
+        pending_stats
+            .take()
+            .map(|p| capture::spawn_json_usage_capture(capture::ResponseShape::Anthropic, p))
     };
 
     use futures_util::StreamExt as _;
@@ -434,13 +478,6 @@ fn error_response(status: StatusCode, msg: &'static str) -> Response {
         .expect("static error response")
 }
 
-/// Bound on the in-flight queue between the byte-passthrough and the
-/// SSE state-machine task. Mirrors the
-/// `crate::proxy::SSE_PARSER_QUEUE_DEPTH` rationale (256 events ≈ 5
-/// seconds of typical Anthropic streaming under the per-100ms event
-/// rate; keeps memory bounded even if the parser stalls).
-const VERTEX_SSE_QUEUE_DEPTH: usize = 256;
-
 /// Drive the Anthropic SSE state machine over a stream of byte
 /// chunks. Lives in its own spawned task; the byte path is fed via a
 /// best-effort tee from [`forward_vertex_request`] and never blocks
@@ -448,6 +485,7 @@ const VERTEX_SSE_QUEUE_DEPTH: usize = 256;
 async fn run_anthropic_sse_state_machine(
     mut rx: tokio::sync::mpsc::Receiver<bytes::Bytes>,
     request_id: String,
+    pending_stats: Option<capture::PendingRecord>,
 ) {
     use crate::sse::framing::SseFramer;
     let mut framer = SseFramer::new();
@@ -487,4 +525,12 @@ async fn run_anthropic_sse_state_machine(
         blocks = state.blocks.len(),
         "vertex sse stream closed"
     );
+    if let Some(mut p) = pending_stats {
+        // In-band `{"type":"error"}` on a 200 OK stream is not a
+        // billable success (same rule as the direct Anthropic lane).
+        if matches!(state.status, crate::sse::anthropic::StreamStatus::Errored) {
+            p.mark_failed();
+        }
+        p.finalize(capture::usage_from_anthropic_state(&state));
+    }
 }

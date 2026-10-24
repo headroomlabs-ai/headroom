@@ -82,6 +82,10 @@ The client never sees CCR tool calls on the Anthropic and OpenAI proxy paths; He
   also return `finish_reason=MALFORMED_FUNCTION_CALL` on large function-response
   continuations after CCR retrieval; that separate limitation remains tracked in
   [issue #2041](https://github.com/headroomlabs-ai/headroom/issues/2041).
+  Native Google batch contexts retain the effective forwarded Tool objects,
+  including injected retrieval declarations and sibling Google Search or code
+  execution tools. Continuations use those declarations alongside the original
+  conversation rather than rebuilding a function-declaration wrapper.
 </Callout>
 
 ## Phase 4: Context Tracker

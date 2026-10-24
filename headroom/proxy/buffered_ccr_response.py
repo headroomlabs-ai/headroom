@@ -76,18 +76,21 @@ class BufferedCCRErrorFormat:
     heartbeat: bytes
 
 
+# The wire types Anthropic documents; clients switch their retry behaviour
+# on these, so a 429 must not arrive labelled `api_error`.
+ANTHROPIC_ERROR_TYPES: dict[int, str] = {
+    400: "invalid_request_error",
+    401: "authentication_error",
+    403: "permission_error",
+    404: "not_found_error",
+    413: "request_too_large",
+    429: "rate_limit_error",
+    529: "overloaded_error",
+}
+
+
 def _anthropic_error_type(status: int) -> str:
-    # The wire types Anthropic documents; clients switch their retry behaviour
-    # on these, so a 429 must not arrive labelled `api_error`.
-    return {
-        400: "invalid_request_error",
-        401: "authentication_error",
-        403: "permission_error",
-        404: "not_found_error",
-        413: "request_too_large",
-        429: "rate_limit_error",
-        529: "overloaded_error",
-    }.get(status, "api_error")
+    return ANTHROPIC_ERROR_TYPES.get(status, "api_error")
 
 
 def _openai_error_type(status: int) -> str:

@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import hashlib
 import io
+import ssl
 import sys
 import tarfile
 import zipfile
@@ -101,7 +102,7 @@ def fake_urlopen(monkeypatch):
     """Install a fake urllib.request.urlopen that serves registered URLs."""
     served: dict[str, bytes] = {}
 
-    def fake(req, timeout=None):  # noqa: ARG001
+    def fake(req, timeout=None, context=None):  # noqa: ARG001
         url = req.full_url if hasattr(req, "full_url") else req
         if url not in served:
             raise AssertionError(f"unexpected fetch for {url}")
@@ -218,6 +219,20 @@ def test_mirror_substitution(monkeypatch):
     assert binaries._mirror_url("https://example.com/x") == "https://example.com/x"
 
 
+def test_download_wraps_tls_context_error_and_preserves_cause(monkeypatch, tmp_path):
+    error = ssl.SSLError("invalid configured certificate bundle")
+    monkeypatch.setattr(
+        binaries,
+        "_ssl_context",
+        lambda: (_ for _ in ()).throw(error),
+    )
+
+    with pytest.raises(binaries.BinaryFetchError, match="failed to configure TLS trust") as exc:
+        binaries._download("https://example.invalid/tool.tar.gz", tmp_path / "tool.tar.gz")
+
+    assert exc.value.__cause__ is error
+
+
 def test_mirror_url_with_query_params_strips_them_from_download_filename(
     monkeypatch, fake_urlopen, allow_unverified
 ):
@@ -284,7 +299,7 @@ def test_download_retries_transient_network_failure(monkeypatch, tmp_path):
     attempts = 0
     sleeps: list[float] = []
 
-    def flaky_urlopen(req, timeout=None):  # noqa: ARG001
+    def flaky_urlopen(req, timeout=None, context=None):  # noqa: ARG001
         nonlocal attempts
         attempts += 1
         if attempts < 3:
@@ -465,7 +480,7 @@ def test_ensure_tools_partial_failure_proxy_still_starts(monkeypatch, allow_unve
     scc_asset = binaries._registry()["tools"]["scc"]["assets"]["darwin-aarch64"]
     scc_tar = _make_tar_gz({"scc": b"ok"})
 
-    def selective_urlopen(req, timeout=None):  # noqa: ARG001
+    def selective_urlopen(req, timeout=None, context=None):  # noqa: ARG001
         url = req.full_url if hasattr(req, "full_url") else req
         if url == scc_asset["url"]:
             return _FakeResponse(scc_tar)

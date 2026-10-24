@@ -106,3 +106,54 @@ def test_concurrent_counting_is_consistent() -> None:
     with ThreadPoolExecutor(max_workers=8) as pool:
         got = list(pool.map(counter.count_text, bodies))
     assert got == [expected[b] for b in bodies]
+
+
+# ---------------------------------------------------------------------------
+# O2 (2026-09-27 perf audit): a re-count of an entry already in the cache is a
+# hit, not an admission — it must update the stored value without running the
+# eviction check. Before this change the admission path ran for every put(),
+# so re-counting one cached message while the cache sat at capacity cleared
+# the WHOLE cache and forced a full re-encode of every cached message on the
+# next miss (the storm the cache exists to prevent).
+# ---------------------------------------------------------------------------
+
+
+def test_recput_of_existing_key_updates_value_without_evicting() -> None:
+    """Re-counting a cached key at capacity must not clear the cache."""
+    cache = TokenCountCache(min_chars=1, max_entries=2, max_chars=1000)
+    cache.put("alpha", 10)
+    cache.put("beta", 20)  # cache now at max_entries
+    cache.put("alpha", 99)  # hit: update in place, skip admission
+    assert cache.get("alpha") == 99
+    assert cache.get("beta") == 20  # not evicted
+    assert len(cache._counts) == 2
+
+
+def test_recput_of_existing_key_at_char_budget_does_not_evict() -> None:
+    """The char-budget branch of admission must be skipped on a hit too."""
+    cache = TokenCountCache(min_chars=1, max_entries=100, max_chars=40)
+    cache.put("a" * 20, 10)
+    cache.put("b" * 20, 20)  # _chars == 40 == max_chars
+    cache.put("a" * 20, 99)  # hit: no admission, no clear
+    assert cache.get("a" * 20) == 99
+    assert cache.get("b" * 20) == 20
+    assert len(cache._counts) == 2
+
+
+def test_new_key_at_capacity_still_admits_via_clear() -> None:
+    """The hit-path early return must not change admission for NEW keys."""
+    cache = TokenCountCache(min_chars=1, max_entries=2, max_chars=1000)
+    cache.put("alpha", 10)
+    cache.put("beta", 20)
+    cache.put("gamma", 30)  # new key at capacity: documented clear + admit
+    assert cache._counts == {"gamma": 30}
+
+
+def test_recput_of_below_min_key_never_admits_and_never_evicts() -> None:
+    """Keys below min_chars are rejected by admission; re-puts must not evict."""
+    cache = TokenCountCache(min_chars=10, max_entries=2, max_chars=1000)
+    cache.put("aaaaaaaaaa-1", 10)
+    cache.put("x", 1)  # below min_chars: rejected
+    assert cache._counts == {"aaaaaaaaaa-1": 10}
+    cache.put("x", 5)  # re-put: still no admission, no eviction
+    assert cache._counts == {"aaaaaaaaaa-1": 10}

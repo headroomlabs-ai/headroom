@@ -14,9 +14,17 @@ import shutil
 from pathlib import Path
 from typing import Any
 
+from headroom import fsutil
 from headroom.install.paths import opencode_config_path
 
-from .base import MCPRegistrar, RegisterResult, RegisterStatus, ServerSpec
+from .base import (
+    MCPRegistrar,
+    RegisterResult,
+    RegisterStatus,
+    ServerSpec,
+    _diff_specs,
+    _specs_equivalent,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -57,7 +65,7 @@ def _read_json(path: Path) -> dict[str, Any]:
         return {}
     try:
         raw = path.read_text(encoding="utf-8")
-    except OSError:
+    except (OSError, UnicodeDecodeError):
         return {}
     return _parse_json_loose(raw) or {}
 
@@ -84,7 +92,10 @@ def _read_json_for_write(path: Path) -> dict[str, Any]:
     """
     if not path.exists():
         return {}
-    raw = path.read_text(encoding="utf-8")  # OSError propagates to the caller
+    try:
+        raw = path.read_text(encoding="utf-8")  # OSError propagates to the caller
+    except UnicodeDecodeError as exc:
+        raise _MalformedConfigError(f"not valid UTF-8: {exc}") from exc
     if not raw.strip():
         return {}
     data = _parse_json_loose(raw)
@@ -95,9 +106,7 @@ def _read_json_for_write(path: Path) -> dict[str, Any]:
 
 def _write_json(path: Path, data: dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump(data, f, indent=2)
-        f.write("\n")
+    fsutil.write_text(path, json.dumps(data, indent=2) + "\n")
 
 
 def _entry_to_spec(name: str, entry: dict[str, Any]) -> ServerSpec:
@@ -124,28 +133,6 @@ def _spec_to_entry(spec: ServerSpec) -> dict[str, Any]:
     if spec.env:
         entry["environment"] = dict(spec.env)
     return entry
-
-
-def _specs_equivalent(a: ServerSpec, b: ServerSpec) -> bool:
-    return (
-        a.name == b.name
-        and a.command == b.command
-        and tuple(a.args) == tuple(b.args)
-        and dict(a.env) == dict(b.env)
-    )
-
-
-def _diff_specs(existing: ServerSpec, requested: ServerSpec) -> str:
-    parts: list[str] = []
-    if existing.command != requested.command:
-        parts.append(f"command {existing.command!r} -> {requested.command!r}")
-    if tuple(existing.args) != tuple(requested.args):
-        parts.append(f"args {list(existing.args)} -> {list(requested.args)}")
-    if dict(existing.env) != dict(requested.env):
-        parts.append(f"env {dict(existing.env)} -> {dict(requested.env)}")
-    if not parts:
-        return "spec differs in unidentified field(s)"
-    return "; ".join(parts)
 
 
 class OpencodeRegistrar(MCPRegistrar):

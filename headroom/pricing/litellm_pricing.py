@@ -44,6 +44,10 @@ try:
         del _os.environ[_leaked_key]
     del _env_snapshot, _os
 
+    # Probing an unknown model makes litellm print() its "Provider List"
+    # banner to stdout, which corrupts `headroom perf --format json`.
+    litellm.suppress_debug_info = True
+
     LITELLM_AVAILABLE = True
 except ImportError:
     litellm = None  # type: ignore[assignment]
