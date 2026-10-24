@@ -7,6 +7,7 @@ and proper wiring between components.
 
 from __future__ import annotations
 
+import os
 import threading
 from importlib.metadata import entry_points
 from pathlib import Path
@@ -160,6 +161,19 @@ def _create_embedder(config: MemoryConfig) -> Embedder:
         ValueError: If the embedder backend is not supported.
     """
 
+    sidecar_socket = os.environ.get("HEADROOM_EMBEDDING_SERVER_SOCKET", "").strip()
+    if sidecar_socket:
+        key = ("remote", sidecar_socket, "")
+        with _EMBEDDER_CACHE_LOCK:
+            cached = _EMBEDDER_CACHE.get(key)
+            if cached is not None:
+                return cached
+            from headroom.memory.adapters.remote import RemoteEmbedder
+
+            embedder: Embedder = RemoteEmbedder(sidecar_socket)
+            _EMBEDDER_CACHE[key] = embedder
+            return embedder
+
     # Validate inputs ahead of the cache. The cache key is
     # ``(backend, model)`` and intentionally does NOT include the API
     # key — but that means a cached OpenAI embedder would shadow the
@@ -191,7 +205,7 @@ def _create_embedder(config: MemoryConfig) -> Embedder:
         if config.embedder_backend == EmbedderBackend.LOCAL:
             from headroom.memory.adapters.embedders import LocalEmbedder
 
-            embedder: Embedder = LocalEmbedder(model_name=config.embedder_model)
+            embedder = LocalEmbedder(model_name=config.embedder_model)
 
         elif config.embedder_backend == EmbedderBackend.ONNX:
             from headroom.memory.adapters.embedders import OnnxLocalEmbedder
@@ -239,6 +253,12 @@ def _create_vector_index(config: MemoryConfig) -> VectorIndex:
     Raises:
         ValueError: If the vector backend is not supported or unavailable.
     """
+    sidecar_socket = os.environ.get("HEADROOM_EMBEDDING_SERVER_SOCKET", "").strip()
+    if sidecar_socket:
+        from headroom.memory.adapters.remote import RemoteVectorIndex
+
+        return RemoteVectorIndex(sidecar_socket)
+
     backend = config.vector_backend
 
     if backend == VectorBackend.EXTERNAL:
