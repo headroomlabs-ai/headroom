@@ -1127,6 +1127,97 @@ class TestMemorySystem:
         assert result["fact_count"] == 0
 
     @pytest.mark.asyncio
+    async def test_handle_memory_save_unsupported_fields_filtered_before_single_call(self):
+        """An older backend gets one call with only the fields it accepts."""
+
+        class BasicBackend:
+            """Accepts neither pre-extraction fields nor `background`."""
+
+            def __init__(self) -> None:
+                self.calls: list[dict[str, Any]] = []
+
+            async def save_memory(
+                self,
+                content: str,
+                user_id: str,
+                importance: float = 0.5,
+                entities: list[str] | None = None,
+                relationships: list[dict[str, str]] | None = None,
+                session_id: str | None = None,
+                metadata: dict[str, Any] | None = None,
+            ) -> Memory:
+                self.calls.append({"content": content, "metadata": metadata})
+                return Memory(content=content, user_id=user_id, importance=importance)
+
+            async def search_memories(self, *args: Any, **kwargs: Any) -> list[Memory]:
+                return []
+
+            async def update_memory(self, *args: Any, **kwargs: Any) -> Memory | None:
+                return None
+
+            async def delete_memory(self, *args: Any, **kwargs: Any) -> bool:
+                return False
+
+            async def get_memory(self, memory_id: str) -> Memory | None:
+                return None
+
+        backend = BasicBackend()
+        system = MemorySystem(backend, user_id="alice")  # type: ignore[arg-type]
+        result = await system.handle_memory_save(
+            content="Summary",
+            importance=0.5,
+            facts=["A", "B"],
+            background=True,
+        )
+
+        assert result["success"] is True
+        assert len(backend.calls) == 1, "field support must be decided before the call, not by retrying"
+
+    @pytest.mark.asyncio
+    async def test_handle_memory_save_internal_type_error_is_not_replayed(self):
+        """A TypeError raised inside the backend after it wrote must not re-save.
+
+        A backend that accepts ``**kwargs`` can persist the record and then
+        raise a plain ``TypeError`` from an internal hook with exactly the
+        'unexpected keyword argument' text. The save must not be replayed: that
+        would produce a duplicate record.
+        """
+
+        class PostWriteHookBackend:
+            """Writes first, then fails in an internal post-write hook."""
+
+            def __init__(self) -> None:
+                self.writes: list[str] = []
+
+            async def save_memory(self, content: str, user_id: str, **kwargs: Any) -> Memory:
+                self.writes.append(content)
+                if kwargs.get("facts") is not None:
+                    raise TypeError("post_write_hook() got an unexpected keyword argument 'record'")
+                return Memory(content=content, user_id=user_id)
+
+            async def search_memories(self, *args: Any, **kwargs: Any) -> list[Memory]:
+                return []
+
+            async def update_memory(self, *args: Any, **kwargs: Any) -> Memory | None:
+                return None
+
+            async def delete_memory(self, *args: Any, **kwargs: Any) -> bool:
+                return False
+
+            async def get_memory(self, memory_id: str) -> Memory | None:
+                return None
+
+        backend = PostWriteHookBackend()
+        system = MemorySystem(backend, user_id="alice")  # type: ignore[arg-type]
+        with pytest.raises(TypeError):
+            await system.handle_memory_save(
+                content="Summary",
+                importance=0.5,
+                facts=["A", "B"],
+            )
+        assert backend.writes == ["Summary"], "the save must never be replayed after a write"
+
+    @pytest.mark.asyncio
     async def test_handle_memory_save_invalid_importance_high(self, memory_system):
         """Test saving a memory with importance > 1.0."""
         result = await memory_system.handle_memory_save(
