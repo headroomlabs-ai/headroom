@@ -11532,6 +11532,8 @@ class OpenAIHandlerMixin:
         base_url: str,
         endpoint_name: str | None = None,
         provider: str | None = None,
+        *,
+        verbatim: bool = False,
     ) -> Response:
         """Pass through request unchanged.
 
@@ -11540,6 +11542,8 @@ class OpenAIHandlerMixin:
             base_url: The upstream API base URL
             endpoint_name: Optional name for stats tracking (e.g., "models", "embeddings")
             provider: Optional provider name for stats (e.g., "openai", "anthropic", "gemini")
+            verbatim: Skip the opt-in ``compress_passthrough`` Responses
+                compressor, so the body reaches the upstream unchanged.
         """
         from fastapi.responses import Response
 
@@ -11623,7 +11627,8 @@ class OpenAIHandlerMixin:
         # the exact same ContentRouter/Kompress path the native handler runs.
         _pt_config = getattr(self, "config", None)
         if (
-            getattr(_pt_config, "compress_passthrough", False)
+            not verbatim
+            and getattr(_pt_config, "compress_passthrough", False)
             and getattr(_pt_config, "optimize", False)
             and request.method == "POST"
             and path.rstrip("/").endswith("/responses")
