@@ -3313,6 +3313,10 @@ class OpenAIHandlerMixin:
     async def handle_openai_chat(
         self,
         request: Request,
+        *,
+        trusted_upstream_base_url: str | None = None,
+        trusted_original_path: str | None = None,
+        trusted_provider_name: str | None = None,
     ) -> Response | StreamingResponse:
         """Handle OpenAI /v1/chat/completions endpoint."""
         if not hasattr(self, "pipeline_extensions"):
@@ -3394,8 +3398,10 @@ class OpenAIHandlerMixin:
         original_client_messages = snapshot_original_messages(
             messages, hooks=self.config.hooks, extensions=self.pipeline_extensions
         )
-        custom_upstream_base_url = _resolve_openai_upstream_base(request.headers)
-        upstream_base_url = self._resolve_openai_upstream(request)
+        custom_upstream_base_url = trusted_upstream_base_url or _resolve_openai_upstream_base(
+            request.headers
+        )
+        upstream_base_url = trusted_upstream_base_url or self._resolve_openai_upstream(request)
         # Ghost text and next edits: CAPI does not serve these models. A
         # caller-chosen x-headroom-base-url is left alone, as in
         # select_passthrough_base_url.
@@ -3410,16 +3416,20 @@ class OpenAIHandlerMixin:
             upstream_base_url,
             model,
         )
-        handler_path = (
-            _resolve_openai_handler_path(request.headers, handler_path=handler_path_suffix)
-            if custom_upstream_base_url is not None
-            else f"/v1{handler_path_suffix}"
-        )
+        if trusted_original_path is not None:
+            handler_path = trusted_original_path
+        elif custom_upstream_base_url is not None:
+            handler_path = _resolve_openai_handler_path(
+                request.headers,
+                handler_path=handler_path_suffix,
+            )
+        else:
+            handler_path = f"/v1{handler_path_suffix}"
         input_event = self.pipeline_extensions.emit(
             PipelineStage.INPUT_RECEIVED,
             operation="proxy.request",
             request_id=request_id,
-            provider="openai",
+            provider=trusted_provider_name or "openai",
             model=model,
             messages=messages,
             tools=body.get("tools"),
@@ -3553,24 +3563,23 @@ class OpenAIHandlerMixin:
             stripped_count=_pre_strip_count_chat,
             request_id=request_id,
         )
-        custom_upstream_base_url = _resolve_openai_upstream_base(request.headers)
-        handler_path = (
-            _resolve_openai_handler_path(
+        if trusted_original_path is not None:
+            handler_path = trusted_original_path
+        elif custom_upstream_base_url is not None:
+            handler_path = _resolve_openai_handler_path(
                 request.headers,
                 handler_path=_OPENAI_CHAT_COMPLETIONS_PATH,
             )
-            if custom_upstream_base_url is not None
-            else "/v1/chat/completions"
-        )
-        _, custom_chat_provider = _custom_base_passthrough_telemetry(
-            request.method,
-            handler_path,
-            custom_upstream_base_url or "",
-        )
-        # Fixed taxonomy from the shared helper (zen, zai, meta, openai, xai);
-        # any other custom base is the shared "custom" bucket. Never derive the
-        # label from the request-controlled hostname — see the review on #3759.
-        # Grok CLI routed to xAI without a base-url header is still xai.
+        else:
+            handler_path = "/v1/chat/completions"
+        if trusted_provider_name is not None:
+            custom_chat_provider = trusted_provider_name
+        else:
+            _, custom_chat_provider = _custom_base_passthrough_telemetry(
+                request.method,
+                handler_path,
+                upstream_base_url or "",
+            )
         openai_chat_outcome_provider = custom_chat_provider or (
             CUSTOM_BASE_PROVIDER
             if custom_upstream_base_url
@@ -5768,6 +5777,10 @@ class OpenAIHandlerMixin:
     async def handle_openai_responses(
         self,
         request: Request,
+        *,
+        trusted_upstream_base_url: str | None = None,
+        trusted_original_path: str | None = None,
+        trusted_provider_name: str | None = None,
     ) -> Response | StreamingResponse:
         """Handle OpenAI /v1/responses endpoint (new Responses API).
 
@@ -5790,6 +5803,7 @@ class OpenAIHandlerMixin:
 
         start_time = time.time()
         request_id = await self._next_request_id()
+        responses_outcome_provider = trusted_provider_name or "openai"
 
         # Phase F PR-F1: classify auth mode at request entry. The result
         # is stored on `request.state` so downstream handlers (cache
@@ -5938,11 +5952,15 @@ class OpenAIHandlerMixin:
         # below sends the request to chatgpt.com.
         custom_upstream_base_url = _resolve_openai_upstream_base(request.headers)
         upstream_base_url = custom_upstream_base_url
-        openai_upstream_base_url = self._resolve_openai_upstream(request)
+        openai_upstream_base_url = trusted_upstream_base_url or self._resolve_openai_upstream(
+            request
+        )
         headers = merge_extra_headers(
             headers,
-            self._openai_extra_headers_for_upstream(openai_upstream_base_url),
-            upstream_url=custom_upstream_base_url,
+            self._openai_extra_headers_for_upstream(
+                trusted_upstream_base_url or openai_upstream_base_url
+            ),
+            upstream_url=trusted_upstream_base_url or custom_upstream_base_url,
             config=self.config,
         )
         # Mirror the WS handler: never forward Codex's client-only lite header
@@ -6094,7 +6112,9 @@ class OpenAIHandlerMixin:
             rate_key = rate_limit_identity(request, headers)
             allowed, wait_seconds = await self.rate_limiter.check_request(rate_key)
             if not allowed:
-                await self.metrics.record_rate_limited(provider="openai", source="headroom")
+                await self.metrics.record_rate_limited(
+                    provider=responses_outcome_provider, source="headroom"
+                )
                 raise HTTPException(
                     status_code=429,
                     detail=f"Rate limited. Retry after {wait_seconds:.1f}s",
@@ -6328,17 +6348,23 @@ class OpenAIHandlerMixin:
 
         # Route to correct endpoint based on auth mode.
         # ChatGPT session auth (codex login) uses chatgpt.com, not api.openai.com.
-        if is_chatgpt_auth:
+        if is_chatgpt_auth and trusted_upstream_base_url is None:
             url = codex_responses_http_url()
         else:
-            handler_path = (
-                _resolve_openai_handler_path(request.headers, handler_path=_OPENAI_RESPONSES_PATH)
-                if custom_upstream_base_url is not None
-                else "/v1/responses"
+            upstream_base_url = trusted_upstream_base_url or _resolve_openai_upstream_base(
+                request.headers
             )
-            # Reuse the OpenAI-compatible candidate resolved at request entry.
-            # In this non-ChatGPT branch it is also the actual upstream, keeping
-            # direct routing and header selection aligned.
+            if trusted_upstream_base_url is not None:
+                handler_path = trusted_original_path or request.url.path
+            else:
+                handler_path = (
+                    _resolve_openai_handler_path(
+                        request.headers,
+                        handler_path=_OPENAI_RESPONSES_PATH,
+                    )
+                    if upstream_base_url is not None
+                    else "/v1/responses"
+                )
             url = build_copilot_upstream_url(
                 openai_upstream_base_url,
                 handler_path,
@@ -6618,7 +6644,7 @@ class OpenAIHandlerMixin:
                     url,
                     headers,
                     body,
-                    "openai",
+                    responses_outcome_provider,
                     model,
                     request_id,
                     original_tokens,
@@ -7081,7 +7107,7 @@ class OpenAIHandlerMixin:
                     await self._record_request_outcome(
                         RequestOutcome(
                             request_id=request_id,
-                            provider="openai",
+                            provider=responses_outcome_provider,
                             model=model,
                             status_code=response.status_code,
                             original_tokens=effective_original_tokens,
@@ -7218,6 +7244,9 @@ class OpenAIHandlerMixin:
 
                 # Same wrapper as the Anthropic twin; only the error wire format
                 # differs. See headroom/proxy/buffered_ccr_response.py (#3079).
+                async def _record_buffered_responses_failure(**_kwargs: Any) -> None:
+                    await self.metrics.record_failed(provider=responses_outcome_provider)
+
                 _buffered_call = buffered_ccr_asgi_call(
                     operation=operation,
                     fmt=OPENAI_ERROR_FORMAT,
@@ -7226,7 +7255,7 @@ class OpenAIHandlerMixin:
                         "buffered_ccr_grace_seconds",
                         DEFAULT_BUFFERED_CCR_GRACE_SECONDS,
                     ),
-                    record_failed=self.metrics.record_failed,
+                    record_failed=_record_buffered_responses_failure,
                     request_id=request_id,
                 )
 
@@ -7237,7 +7266,7 @@ class OpenAIHandlerMixin:
                 return _BufferedCCRResponse(media_type="text/event-stream")
             return await _buffered_ccr_operation()
         except Exception as e:
-            await self.metrics.record_failed(provider="openai")
+            await self.metrics.record_failed(provider=responses_outcome_provider)
             log_request_failure(request_id, "OpenAI responses request", e, model=model)
             return JSONResponse(
                 status_code=502,
