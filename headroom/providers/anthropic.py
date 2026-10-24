@@ -25,6 +25,7 @@ from datetime import datetime
 from typing import Any, cast
 
 from headroom import paths as _paths
+from headroom.offline import pin_litellm_cost_map_local
 from headroom.pricing.deepseek_tiers import (
     LEGACY_MODEL_IDS,
     OFF_PEAK_RATES_PER_1M,
@@ -49,6 +50,7 @@ def _get_litellm_clients() -> tuple[Any | None, Any | None]:
         return None, None
 
     try:
+        pin_litellm_cost_map_local()
         import litellm
 
         litellm.suppress_debug_info = True

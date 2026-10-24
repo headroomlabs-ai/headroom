@@ -257,6 +257,15 @@ class NormalizedUsage:
             return True
         return self.cache_read is not None and self.cache_write is not None
 
+    def _merged_includes_cache(self, other: NormalizedUsage) -> bool:
+        """Accounting dialect across rounds. A usage block without cache fields
+        carries no dialect (``normalize_usage`` defaults it to inclusive, which
+        is wrong for a cacheless Anthropic round), so the round that reported
+        cache fields decides; the latest such round wins."""
+        if other.has_cache_signal or not self.has_cache_signal:
+            return other.input_includes_cache
+        return self.input_includes_cache
+
     def merged_with(self, other: NormalizedUsage) -> NormalizedUsage:
         """Sum the billed counters across re-drive rounds; cache fields come
         from the latest round that carried them (the last provider call is the
@@ -272,6 +281,7 @@ class NormalizedUsage:
             output_tokens=_sum(self.output_tokens, other.output_tokens),
             cache_read=other.cache_read if other.has_cache_signal else self.cache_read,
             cache_write=other.cache_write if other.has_cache_signal else self.cache_write,
+            input_includes_cache=self._merged_includes_cache(other),
         )
 
     def summed_with(self, other: NormalizedUsage) -> NormalizedUsage:
@@ -290,6 +300,7 @@ class NormalizedUsage:
             output_tokens=_sum(self.output_tokens, other.output_tokens),
             cache_read=_sum(self.cache_read, other.cache_read),
             cache_write=_sum(self.cache_write, other.cache_write),
+            input_includes_cache=self._merged_includes_cache(other),
         )
 
     def as_anthropic(self) -> dict[str, int]:
