@@ -1704,6 +1704,7 @@ class CompressionStrategy(Enum):
 
     CODE_AWARE = "code_aware"
     SMART_CRUSHER = "smart_crusher"
+    JSON_MINIFIER = "json_minifier"
     SEARCH = "search"
     LOG = "log"
     KOMPRESS = "kompress"
@@ -1790,6 +1791,8 @@ class RouterCompressionResult:
             LOG fallback chain it's three. Lets log readers see *how*
             we got to the final compressor without parsing the
             decision_reason string.
+        unrecoverable_sections: A changed lossy mixed section or adopted embedded
+            JSON span lacks its own recovery, independently of sibling markers.
         cache_hit: True when this result was reused from a cache
             instead of a fresh compression run. compress() itself
             never sets this (only apply() has the router-internal
@@ -1805,6 +1808,7 @@ class RouterCompressionResult:
     sections_processed: int = 1
     strategy_chain: list[str] = field(default_factory=list)
     cache_hit: bool = False
+    unrecoverable_sections: bool = False
 
     @property
     def total_original_tokens(self) -> int:
@@ -2789,8 +2793,8 @@ class ContentRouter(Transform):
             language: Optional language hint for code.
             context: Query context for pattern learning.
         """
-        # Skip SmartCrusher - it handles its own TOIN recording
-        if strategy == CompressionStrategy.SMART_CRUSHER:
+        # SmartCrusher records its own decisions; reformatting does not train TOIN.
+        if strategy in {CompressionStrategy.SMART_CRUSHER, CompressionStrategy.JSON_MINIFIER}:
             return
 
         # Skip if no actual compression happened
@@ -3216,6 +3220,7 @@ class ContentRouter(Transform):
 
         compressed_sections: list[str] = []
         routing_log: list[RoutingDecision] = []
+        unrecoverable_sections = False
 
         for i, section in enumerate(sections):
             if placeholders and any(ph in section.content for ph in placeholders):
@@ -3237,15 +3242,27 @@ class ContentRouter(Transform):
 
             # Compress section
             original_tokens = _estimate_tokens(section.content)
-            compressed_content, compressed_tokens, _section_chain = self._apply_strategy_to_content(
-                section.content,
-                strategy,
-                context,
-                section.language,
-                question,
-                bias=bias,
+            compressed_content, compressed_tokens, _section_chain, reversible = (
+                self._apply_strategy_to_content(
+                    section.content,
+                    strategy,
+                    context,
+                    section.language,
+                    question,
+                    bias=bias,
+                )
             )
+            if _section_chain == [CompressionStrategy.JSON_MINIFIER.value]:
+                strategy = CompressionStrategy.JSON_MINIFIER
 
+            if (
+                compressed_content != section.content
+                and not reversible
+                and (
+                    strategy in self.LOSSY_UNMARKED_STRATEGIES or "embedded_json" in _section_chain
+                )
+            ):
+                unrecoverable_sections = True
             # Preserve code fence markers
             if section.is_code_fence and section.language:
                 compressed_content = f"```{section.language}\n{compressed_content}\n```"
@@ -3282,13 +3299,19 @@ class ContentRouter(Transform):
         compressed = "\n\n".join(compressed_sections)
         if protected:
             compressed = restore_tags(compressed, protected)
+        routed_strategies = {decision.strategy for decision in routing_log}
 
         return RouterCompressionResult(
             compressed=compressed,
             original=content,
-            strategy_used=CompressionStrategy.MIXED,
+            strategy_used=(
+                next(iter(routed_strategies))
+                if len(routed_strategies) == 1
+                else CompressionStrategy.MIXED
+            ),
             routing_log=routing_log,
             sections_processed=len(sections),
+            unrecoverable_sections=unrecoverable_sections,
         )
 
     def _compress_pure(
@@ -3313,15 +3336,18 @@ class ContentRouter(Transform):
         """
         original_tokens = _estimate_tokens(content)
 
-        compressed, compressed_tokens, strategy_chain = self._apply_strategy_to_content(
+        compressed, compressed_tokens, strategy_chain, reversible = self._apply_strategy_to_content(
             content, strategy, context, question=question, bias=bias
         )
+        if strategy_chain == [CompressionStrategy.JSON_MINIFIER.value]:
+            strategy = CompressionStrategy.JSON_MINIFIER
 
         return RouterCompressionResult(
             compressed=compressed,
             original=content,
             strategy_used=strategy,
             strategy_chain=strategy_chain,
+            unrecoverable_sections=not reversible and "embedded_json" in strategy_chain,
             routing_log=[
                 RoutingDecision(
                     content_type=self._content_type_from_strategy(strategy),
@@ -3846,7 +3872,7 @@ class ContentRouter(Transform):
         question: str | None = None,
         bias: float = 1.0,
         _allow_embedded: bool = True,
-    ) -> tuple[str, int, list[str]]:
+    ) -> tuple[str, int, list[str], bool]:
         """Apply a compression strategy to content.
 
         Args:
@@ -3859,8 +3885,11 @@ class ContentRouter(Transform):
 
         Returns:
             Tuple of (compressed_content, compressed_token_count,
-            strategy_chain). The chain lists every strategy attempted
-            in order — first the requested one, then any fallbacks.
+            strategy_chain, reversible). Reversible means unchanged, known
+            lossless, or covered by this result's own retrieval marker(s).
+            Embedded routing aggregates only adopted spans; a marker in one
+            span cannot cover another span's unmarked loss.
+            The chain lists every strategy attempted in order.
             Single-entry chain means a direct hit; multi-entry means
             the fallback chain fired (e.g. ``[smart_crusher, kompress,
             log]``). Log readers use this to see *how* we got to the
@@ -3869,7 +3898,7 @@ class ContentRouter(Transform):
         # Git status is path/state ground truth, not a rectangular CSV table.
         # Preserve it before embedded-JSON, lossy-after-fold and external stages.
         if _try_detect_git_status(_strip_detection_envelope(content)) is not None:
-            return content, _estimate_tokens(content), [CompressionStrategy.TABULAR.value]
+            return content, _estimate_tokens(content), [CompressionStrategy.TABULAR.value], True
 
         # ── STRUCTURAL (embedded) JSON routing ───────────────────────────────
         # Before anything else: if this block is not a single JSON value but
@@ -3898,7 +3927,8 @@ class ContentRouter(Transform):
         if _allow_embedded and not _defer_embedded_for_html:
             routed = self._embedded_json_route(content, context, question, bias)
             if routed is not None:
-                return routed, _estimate_tokens(routed), ["embedded_json"]
+                text, reversible = routed
+                return text, _estimate_tokens(text), ["embedded_json"], reversible
 
         # Track original tokens for TOIN recording
         original_tokens = _estimate_tokens(content)
@@ -3930,8 +3960,8 @@ class ContentRouter(Transform):
         # never a marker-free lossy drop that could not be recovered.
         if self.config.lossless:
             if _ll_label is not None:
-                return _ll_content, _estimate_tokens(_ll_content), [_ll_label]
-            return content, original_tokens, [CompressionStrategy.PASSTHROUGH.value]
+                return _ll_content, _estimate_tokens(_ll_content), [_ll_label], True
+            return content, original_tokens, [CompressionStrategy.PASSTHROUGH.value], True
 
         # ── LOSSY / CCR mode: layer relevance-split + lossy ON TOP of the fold ─
         # The operator has opted into lossy compression, so we reclaim more than
@@ -3954,7 +3984,12 @@ class ContentRouter(Transform):
             kind = "log" if strategy is CompressionStrategy.LOG else "search"
             split = self._relevance_split_compress(content, kind, context)
             if split is not None:
-                return split, _estimate_tokens(split), [kind, "relevance_split"]
+                return (
+                    split,
+                    _estimate_tokens(split),
+                    [kind, "relevance_split"],
+                    bool(CCR_RETRIEVAL_MARKER_RE.search(split)),
+                )
 
         # No relevance split adopted → return the STAGE 0 lossless fold as the
         # floor. Lossless-then-lossy: before returning, run the aggressive lossy
@@ -3987,8 +4022,9 @@ class ContentRouter(Transform):
                         _komp,
                         _komp_tokens,
                         [_ll_label, CompressionStrategy.KOMPRESS.value],
+                        bool(CCR_RETRIEVAL_MARKER_RE.search(_komp)),
                     )
-            return _ll_content, _estimate_tokens(_ll_content), [_ll_label]
+            return _ll_content, _estimate_tokens(_ll_content), [_ll_label], True
 
         # CCR/lossy mode, nothing foldable (code/json/text/mixed) and no relevance
         # split → fall through to the lossy compressors below (kompress /
@@ -4005,7 +4041,7 @@ class ContentRouter(Transform):
         # through to the EXISTING built-in dispatch UNCHANGED.
         external = self._try_external_compressor(content, strategy, context, question)
         if external is not None:
-            return external
+            return (*external, bool(CCR_RETRIEVAL_MARKER_RE.search(external[0])))
 
         try:
             if strategy == CompressionStrategy.CODE_AWARE:
@@ -4097,6 +4133,18 @@ class ContentRouter(Transform):
                             compressed = output.content
                             compressed_tokens = _estimate_tokens(output.content)
                             decision_reason = "smart_crusher"
+                            if compressed == content:
+                                from headroom._core import minify_json
+
+                                minified = minify_json(content)
+                                if minified is not None:
+                                    compressed = minified
+                                    compressed_tokens = _estimate_tokens(minified)
+                                    strategy = CompressionStrategy.JSON_MINIFIER
+                                    actual_strategy = strategy
+                                    strategy_chain = [strategy.value]
+                                    compressor_name = "JsonMinifier"
+                                    decision_reason = "json_minifier"
                         # Fallback to Kompress (and possibly Log) is
                         # handled by the unified post-strategy block below
                         # — no inline fallback here to avoid duplicate
@@ -4444,7 +4492,12 @@ class ContentRouter(Transform):
                 language=language,
                 context=context,
             )
-            return compressed, compressed_tokens, strategy_chain
+            reversible = (
+                compressed == content
+                or strategy_chain == [CompressionStrategy.JSON_MINIFIER.value]
+                or bool(CCR_RETRIEVAL_MARKER_RE.search(compressed))
+            )
+            return compressed, compressed_tokens, strategy_chain, reversible
 
         # #3609: deferred embedded-JSON splice. The HTML strategy ran above and
         # extracted nothing (``compressed`` is still None), so the local JSON
@@ -4454,7 +4507,8 @@ class ContentRouter(Transform):
             routed = self._embedded_json_route(content, context, question, bias)
             if routed is not None:
                 strategy_chain.append("embedded_json")
-                return routed, _estimate_tokens(routed), strategy_chain
+                text, reversible = routed
+                return text, _estimate_tokens(text), strategy_chain, reversible
 
         # Fallback: return unchanged
         if self.config.enable_dense_line_elision:
@@ -4471,7 +4525,12 @@ class ContentRouter(Transform):
                     language=language,
                     context=context,
                 )
-                return elided, elided_tokens, strategy_chain
+                return (
+                    elided,
+                    elided_tokens,
+                    strategy_chain,
+                    bool(CCR_RETRIEVAL_MARKER_RE.search(elided)),
+                )
         strategy_chain.append(CompressionStrategy.PASSTHROUGH.value)
         if _router_debug_enabled():
             _log_router_debug(
@@ -4493,7 +4552,7 @@ class ContentRouter(Transform):
                 output=content,
                 error=error,
             )
-        return content, original_tokens, strategy_chain
+        return content, original_tokens, strategy_chain, True
 
     def _elide_dense(self, text: str, context: str) -> tuple[str, int] | None:
         """Dense-line elision with a CCR retrieval marker; None when no line is dense.
@@ -4553,19 +4612,19 @@ class ContentRouter(Transform):
 
     def _embedded_json_route(
         self, content: str, context: str, question: str | None, bias: float
-    ) -> str | None:
+    ) -> tuple[str, bool] | None:
         """Route embedded JSON spans inside ``content`` through the JSON compressors.
 
         Extracted from the ``_apply_strategy_to_content`` pre-pass so the HTML
         strategy can defer the splice (#3609) and retry it in the passthrough
-        fallback. Returns the spliced block, or ``None`` when nothing
-        safe/smaller applied.
+        fallback. Returns the spliced block and its per-span reversibility,
+        or None when nothing smaller applied.
         """
         from headroom.transforms.recursive_json import route_embedded_json
 
-        def _dispatch_span(span: str) -> str | None:
+        def _dispatch_span(span: str) -> tuple[str, bool] | None:
             strat = self._strategy_from_detection_type(_detect_content(span).content_type)
-            text, _t, _c = self._apply_strategy_to_content(
+            text, _t, _c, reversible = self._apply_strategy_to_content(
                 span,
                 strat,
                 context,
@@ -4573,7 +4632,7 @@ class ContentRouter(Transform):
                 bias=bias,
                 _allow_embedded=False,
             )
-            return text if text != span else None
+            return (text, reversible) if text != span else None
 
         return route_embedded_json(content, _dispatch_span, tok=_estimate_tokens)
 
@@ -4880,6 +4939,7 @@ class ContentRouter(Transform):
         mapping = {
             CompressionStrategy.CODE_AWARE: ContentType.SOURCE_CODE,
             CompressionStrategy.SMART_CRUSHER: ContentType.JSON_ARRAY,
+            CompressionStrategy.JSON_MINIFIER: ContentType.JSON_ARRAY,
             CompressionStrategy.SEARCH: ContentType.SEARCH_RESULTS,
             CompressionStrategy.LOG: ContentType.BUILD_OUTPUT,
             CompressionStrategy.DIFF: ContentType.GIT_DIFF,
@@ -6728,8 +6788,13 @@ class ContentRouter(Transform):
                     if (
                         enforce_rev
                         and self.config.ccr_inject_marker
-                        and result.strategy_used in self.LOSSY_UNMARKED_STRATEGIES
-                        and not CCR_RETRIEVAL_MARKER_RE.search(result.compressed)
+                        and (
+                            getattr(result, "unrecoverable_sections", False)
+                            or (
+                                result.strategy_used in self.LOSSY_UNMARKED_STRATEGIES
+                                and not CCR_RETRIEVAL_MARKER_RE.search(result.compressed)
+                            )
+                        )
                     ):
                         self._cache.mark_skip(content_key)
                         result_slots[slot_idx] = message
@@ -7819,8 +7884,13 @@ class ContentRouter(Transform):
             if (
                 enforce_reversibility
                 and self.config.ccr_inject_marker
-                and result.strategy_used in self.LOSSY_UNMARKED_STRATEGIES
-                and not CCR_RETRIEVAL_MARKER_RE.search(result.compressed)
+                and (
+                    getattr(result, "unrecoverable_sections", False)
+                    or (
+                        result.strategy_used in self.LOSSY_UNMARKED_STRATEGIES
+                        and not CCR_RETRIEVAL_MARKER_RE.search(result.compressed)
+                    )
+                )
             ):
                 self._cache.mark_skip(content_key)
                 if route_counts is not None:

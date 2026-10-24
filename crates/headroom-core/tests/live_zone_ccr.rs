@@ -117,3 +117,31 @@ fn store_only_populated_after_token_gate_admits() {
     .expect("dispatcher");
     assert_eq!(store.len(), 0, "no compression → no CCR put");
 }
+
+#[test]
+fn lossless_json_minification_stays_valid_without_a_retrieval_obligation() {
+    let fields: serde_json::Map<String, Value> =
+        (0..500).map(|i| (format!("field_{i}"), json!(i))).collect();
+    let value = json!([fields]);
+    let payload = serde_json::to_string_pretty(&value).unwrap();
+    let body = body_with_payload(&payload);
+    let store = InMemoryCcrStore::new();
+    let outcome = compress_anthropic_live_zone_with_ccr(
+        &body,
+        0,
+        AuthMode::Payg,
+        DEFAULT_MODEL,
+        Some(&store),
+    )
+    .unwrap();
+    let LiveZoneOutcome::Modified { new_body, .. } = outcome else {
+        panic!("pretty JSON must save tokens through the lossless minifier");
+    };
+    let forwarded: Value = serde_json::from_str(new_body.get()).unwrap();
+    let content = forwarded["messages"][0]["content"][0]["content"]
+        .as_str()
+        .unwrap();
+    assert_eq!(serde_json::from_str::<Value>(content).unwrap(), value);
+    assert_eq!(content, serde_json::to_string(&value).unwrap());
+    assert!(store.get(&compute_key(payload.as_bytes())).is_none());
+}

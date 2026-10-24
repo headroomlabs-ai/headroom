@@ -1,6 +1,4 @@
-"""Unit tests for headroom.transforms.recursive_json — the structural (embedded)
-JSON routing step. Uses a fake dispatch so the mechanism is tested in isolation
-from the real compressors."""
+"""Embedded JSON routing: preserved surroundings and per-adopted-span recovery."""
 
 from __future__ import annotations
 
@@ -13,62 +11,76 @@ from headroom.transforms.recursive_json import (
 )
 
 
-def _upper_dispatch(span: str) -> str | None:
-    """Fake compressor: returns a shorter deterministic stand-in for any span."""
-    try:
-        v = json.loads(span)
-    except ValueError:
-        return None
-    return f"<TABLE n={len(v)}>" if isinstance(v, list) else "<OBJ>"
+def _minify_dispatch(span: str) -> tuple[str, bool]:
+    return json.dumps(json.loads(span), separators=(",", ":")), True
 
 
 def test_embedded_json_routed_and_surroundings_exact() -> None:
-    payload = json.dumps([{"id": i, "ok": True} for i in range(6)], separators=(",", ":"))
+    rows = [{"id": i, "ok": True} for i in range(6)]
+    payload = json.dumps(rows, indent=2)
     content = f"Fetched rows from API:\n{payload}\nDone (200 OK)."
-    out = route_embedded_json(content, _upper_dispatch)
-    assert out is not None
-    assert out.startswith("Fetched rows from API:\n")
-    assert out.endswith("\nDone (200 OK).")
-    assert "<TABLE n=6>" in out
+    assert route_embedded_json(content, _minify_dispatch) == (
+        f"Fetched rows from API:\n{json.dumps(rows, separators=(',', ':'))}\nDone (200 OK).",
+        True,
+    )
 
 
 def test_ccr_marker_span_passed_through() -> None:
-    # A span already carrying a CCR marker must never be re-routed (R1).
     content = 'prefix [{"a":1,"b":2},{"a":3,"b":"<<ccr:deadbeef,json,900>>"}] suffix'
-    out = route_embedded_json(content, _upper_dispatch)
-    assert out is None  # only span contains a marker → skipped → nothing to do
+    assert route_embedded_json(content, _minify_dispatch) is None
 
 
 def test_no_json_is_noop() -> None:
-    assert route_embedded_json("just prose, nothing structured here", _upper_dispatch) is None
+    assert route_embedded_json("just prose, nothing structured here", _minify_dispatch) is None
 
 
 def test_whole_block_json_is_callers_job() -> None:
-    # A block that IS a single JSON value is skipped (routed by the caller).
     content = json.dumps([{"a": i} for i in range(5)], separators=(",", ":"))
-    assert route_embedded_json(content, _upper_dispatch) is None
+    assert route_embedded_json(content, _minify_dispatch) is None
 
 
 def test_benefit_gate_declines_when_not_smaller() -> None:
-    payload = json.dumps([{"a": i} for i in range(5)], separators=(",", ":"))
-    content = f"x {payload} y"
-    # Dispatch that returns something LARGER → must be declined (outcome gate).
-    assert route_embedded_json(content, lambda s: s + " " * 999) is None
+    payload = json.dumps([{"a": i} for i in range(5)])
+    assert route_embedded_json(f"x {payload} y", lambda s: (s + " " * 999, True)) is None
 
 
-def test_deterministic() -> None:
-    payload = json.dumps([{"k": i} for i in range(8)], separators=(",", ":"))
-    content = f"a {payload} b {payload} c"
-    r1 = route_embedded_json(content, _upper_dispatch)
-    r2 = route_embedded_json(content, _upper_dispatch)
-    assert r1 == r2 and r1 is not None
-    assert r1.count("<TABLE n=8>") == 2  # both embedded spans routed
+def test_unmarked_loss_cannot_borrow_another_spans_marker() -> None:
+    first = json.dumps([{"id": i} for i in range(10)], indent=2)
+    second = json.dumps([{"value": i} for i in range(10)], indent=2)
+
+    def dispatch(span: str) -> tuple[str, bool]:
+        rows = json.loads(span)
+        if "id" in rows[0]:
+            return "<<ccr:deadbeef,json,100>>", True
+        return json.dumps(rows[:1]), False
+
+    for left, right in ((first, second), (second, first)):
+        result = route_embedded_json(f"first: {left}\nsecond: {right}", dispatch, tok=len)
+        assert result is not None
+        text, reversible = result
+        assert "<<ccr:deadbeef,json,100>>" in text
+        assert '{"value": 0}' in text and '{"value": 9}' not in text
+        assert reversible is False
+
+
+def test_rejected_lossy_candidate_does_not_taint_adopted_minification() -> None:
+    first = json.dumps([{"id": i} for i in range(10)], indent=2)
+    second = json.dumps([{"value": i} for i in range(10)], indent=2)
+
+    def dispatch(span: str) -> tuple[str, bool]:
+        rows = json.loads(span)
+        if "id" in rows[0]:
+            return json.dumps(rows[:1]) + " " * len(span), False
+        return _minify_dispatch(span)
+
+    assert route_embedded_json(f"first: {first}\nsecond: {second}", dispatch, tok=len) == (
+        f"first: {first}\nsecond: {json.dumps(json.loads(second), separators=(',', ':'))}",
+        True,
+    )
 
 
 def test_scalar_array_not_routed() -> None:
-    # array of scalars is not a "routable" JSON shape (no dict rows)
-    content = "nums: [1,2,3,4,5,6,7,8] done"
-    assert route_embedded_json(content, _upper_dispatch) is None
+    assert route_embedded_json("nums: [1,2,3,4,5,6,7,8] done", _minify_dispatch) is None
 
 
 def test_json_document_spans_finds_containers_anywhere() -> None:
