@@ -41,6 +41,16 @@ This plugin closes the loop by calling the proxy's `POST /v1/retrieve` HTTP endp
 
 3. Restart the Hermes gateway / TUI (plugin discovery is cached per process).
 
+## Supported Hermes providers
+
+`headroom wrap hermes` sets `ANTHROPIC_BASE_URL` and `OPENAI_BASE_URL`. Hermes uses these only for the `anthropic` and `openai` providers. Its default provider (`openrouter`) and others such as `nous` call their own endpoints and skip Headroom. Pick a routed provider, for example:
+
+```bash
+headroom wrap hermes -- --provider anthropic
+```
+
+The wrapper prints a note when `--provider` is missing or is not a routed provider.
+
 ## Recommended proxy configuration
 
 Hermes tool names don't match headroom's built-in `DEFAULT_EXCLUDE_TOOLS` (which protects Claude Code's `Read`/`Grep`/`Edit`/...), so two exclusions are strongly recommended on the proxy side:
