@@ -81,7 +81,8 @@ class TestMidTurnSteering:
         proxy._config.retry_max_delay_ms = 0
         proxy.config = proxy._config
         proxy.memory_handler = None
-        proxy._parse_sse_usage_from_buffer = MagicMock(return_value=None)
+        # Exercise real event parsing: successful completion requires the
+        # message_stop marker before pending messages can be drained.
         proxy._finalize_stream_response = AsyncMock(return_value=None)
         return proxy
 

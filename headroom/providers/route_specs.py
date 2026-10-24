@@ -23,10 +23,13 @@ class ProviderHandlerRoute:
     path: str
     handler_name: str
     path_param: str | None = None
+    supports_custom_base_url: bool = False
 
 
 ANTHROPIC_PASSTHROUGH_ROUTES: tuple[ProviderPassthroughRoute, ...] = (
     ProviderPassthroughRoute("POST", "/v1/messages/count_tokens", "anthropic", "count_tokens"),
+    ProviderPassthroughRoute("GET", "/api/hello", "anthropic", "api/hello"),
+    ProviderPassthroughRoute("HEAD", "/api/hello", "anthropic", "api/hello"),
 )
 
 
@@ -71,11 +74,6 @@ PROVIDER_PASSTHROUGH_ROUTES: tuple[ProviderPassthroughRoute, ...] = (
     *ANTHROPIC_PASSTHROUGH_ROUTES,
     *OPENAI_PASSTHROUGH_ROUTES,
     *GEMINI_PASSTHROUGH_ROUTES,
-)
-
-
-ANTHROPIC_HANDLER_ROUTES: tuple[ProviderHandlerRoute, ...] = (
-    ProviderHandlerRoute("POST", "/v1/messages", "handle_anthropic_messages"),
 )
 
 
@@ -141,18 +139,21 @@ GEMINI_HANDLER_ROUTES: tuple[ProviderHandlerRoute, ...] = (
         "/v1beta/models/{model}:generateContent",
         "handle_gemini_generate_content",
         "model",
+        True,
     ),
     ProviderHandlerRoute(
         "POST",
         "/v1beta/models/{model}:streamGenerateContent",
         "handle_gemini_stream_generate_content",
         "model",
+        True,
     ),
     ProviderHandlerRoute(
         "POST",
         "/v1beta/models/{model}:countTokens",
         "handle_gemini_count_tokens",
         "model",
+        True,
     ),
 )
 
@@ -200,7 +201,6 @@ CLOUDCODE_HANDLER_ROUTES: tuple[ProviderHandlerRoute, ...] = (
 
 
 PROVIDER_HANDLER_ROUTES: tuple[ProviderHandlerRoute, ...] = (
-    *ANTHROPIC_HANDLER_ROUTES,
     *ANTHROPIC_BATCH_ROUTES,
     *OPENAI_HANDLER_ROUTES,
     *OPENAI_BATCH_ROUTES,

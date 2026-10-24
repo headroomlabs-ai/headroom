@@ -226,7 +226,7 @@ def _load_tokenizer(tokenizer_name: str):
     # vetted, not a variant the caller chose.
     tokenizer_name = repo
 
-    from headroom.offline import apply_offline_env, is_offline
+    from headroom.offline import apply_offline_env, guard_egress, is_offline
 
     offline = is_offline()
     if offline:
@@ -268,6 +268,10 @@ def _load_tokenizer(tokenizer_name: str):
 
     def _download() -> None:
         try:
+            # Defence in depth behind the is_offline() return above: the switch
+            # could flip between that check and this thread, and the guard is
+            # what the egress meta-test recognises as dominating the fetch.
+            guard_egress(f"HuggingFace tokenizer download ({tokenizer_name})", "huggingface.co")
             result.append(
                 AutoTokenizer.from_pretrained(
                     tokenizer_name,

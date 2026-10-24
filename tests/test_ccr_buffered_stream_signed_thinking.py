@@ -27,6 +27,7 @@ httpx = pytest.importorskip("httpx")
 from fastapi.testclient import TestClient  # noqa: E402
 
 from headroom.proxy.models import CacheEntry  # noqa: E402
+from headroom.proxy.semantic_cache_key_policy import compute_cache_partition  # noqa: E402
 from headroom.proxy.server import ProxyConfig, create_app  # noqa: E402
 
 RETRIEVE_TOOL = {
@@ -174,7 +175,8 @@ def test_signed_thinking_history_skips_the_buffered_ccr_path(
         assert calls["stream_body"]["stream"] is True
     else:
         assert "buffered_body" in calls, "expected the buffered CCR path"
-        assert calls["buffered_body"]["stream"] is False
+        # The buffered request itself streams; the proxy folds the reply.
+        assert calls["buffered_body"]["stream"] is True
 
 
 @pytest.mark.parametrize("upstream_delay", [0.0, 1.2], ids=["prompt", "past-keepalive"])
@@ -277,7 +279,8 @@ def test_buffering_is_gated_on_a_redeemable_marker(
     assert resp.status_code == 200, resp.text
     if expect_buffered:
         assert "buffered_body" in calls, "a redeemable marker must still buffer"
-        assert calls["buffered_body"]["stream"] is False
+        # The buffered request itself streams; the proxy folds the reply.
+        assert calls["buffered_body"]["stream"] is True
     else:
         assert "stream_body" in calls, "nothing to retrieve — the client must keep streaming"
         assert "buffered_body" not in calls
@@ -314,6 +317,8 @@ def test_cache_hit_never_replays_a_foreign_content_type() -> None:
         key = proxy.cache._compute_key(
             body["messages"],
             body["model"],
+            # Same partition the handler derives for this caller (01-F15).
+            partition=compute_cache_partition(_headers()),
             upstream_base_url=None,
             system=None,
             tools=None,

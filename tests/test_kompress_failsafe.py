@@ -369,21 +369,6 @@ def test_carried_deadline_reaches_sequential_fallback(monkeypatch):
     assert model.calls == 1
 
 
-def test_acquire_bounded_unbounded_when_both_disabled():
-    semaphore = kc._execution_semaphore("onnx", "onnx")
-    assert kc._acquire_bounded(semaphore, None, None) is True
-    semaphore.release()
-
-
-def test_acquire_bounded_negative_remaining_does_not_raise():
-    semaphore = kc._execution_semaphore("onnx", "onnx")
-    assert semaphore.acquire(timeout=0)
-    try:
-        assert kc._acquire_bounded(semaphore, 5.0, -1.0) is False
-    finally:
-        semaphore.release()
-
-
 # ── Wall-clock budget: give up before the proxy's stage timeout ───────
 
 
@@ -622,6 +607,71 @@ def test_all_artifacts_failing_at_run_raises_rather_than_returning_a_dead_sessio
 
     with pytest.raises(FileNotFoundError, match="No loadable ONNX artifact"):
         kc._create_onnx_session("org/model", ["CPUExecutionProvider"])
+
+
+# ── Load-stage timings: say where a slow warm-up spent its time ────────────────
+
+
+def _install_ticking_clock(monkeypatch):
+    """Each clock reading is 1s after the last, so every timed stage costs 1000ms."""
+
+    def ticking_clock():
+        now = [0.0]
+
+        def tick() -> float:
+            now[0] += 1.0
+            return now[0]
+
+        return staticmethod(tick)
+
+    clock = type("_Clock", (), {"perf_counter": ticking_clock(), "thread_time": ticking_clock()})
+    monkeypatch.setattr(kc, "time", clock)
+
+
+def test_stage_timings_count_every_candidate_attempt(monkeypatch):
+    """A candidate rejected at smoke-run still costs time, so it shows in the totals."""
+    _install_fake_ort(monkeypatch, run_fails_for={"int8-wo"})
+    _install_ticking_clock(monkeypatch)
+    stage_ms: kc.StageTimings = {}
+
+    kc._create_onnx_session("org/model", ["CPUExecutionProvider"], stage_ms=stage_ms)
+
+    # int8-wo resolved, built and smoke-run (rejected); fp32 the same (accepted).
+    # onnxruntime is imported once, on the first resolved candidate.
+    assert stage_ms == {
+        "artifact_resolve": (2000.0, 2000.0),
+        "onnxruntime_import": (1000.0, 1000.0),
+        "session_build": (2000.0, 2000.0),
+        "smoke_run": (2000.0, 2000.0),
+    }
+
+
+def test_onnx_load_logs_every_stage(monkeypatch, caplog):
+    import sys
+    from types import SimpleNamespace
+
+    _install_fake_ort(monkeypatch, run_fails_for=set())
+    monkeypatch.setitem(sys.modules, "transformers", SimpleNamespace(AutoTokenizer=object()))
+    monkeypatch.setattr(kc, "_kompress_cache", {})
+    monkeypatch.setattr(
+        kc, "_load_modernbert_tokenizer", lambda _auto, *, allow_download: "tokenizer"
+    )
+
+    with caplog.at_level("INFO", logger=kc.logger.name):
+        kc._load_kompress_onnx("org/model")
+
+    loaded = [r.getMessage() for r in caplog.records if "Kompress ONNX loaded" in r.getMessage()]
+    assert len(loaded) == 1
+    for stage in (
+        "artifact_resolve=",
+        "onnxruntime_import=",
+        "session_build=",
+        "smoke_run=",
+        "transformers_import=",
+        "tokenizer_load=",
+    ):
+        assert stage in loaded[0]
+    assert "Downloading" not in caplog.text
 
 
 # ── Failure latch: a broken model stops costing us every request ───────────────

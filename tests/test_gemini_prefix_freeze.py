@@ -112,7 +112,7 @@ def _gemini_provider(sent: list[dict[str, Any]]):
         if ":streamGenerateContent" in str(request.url):
             chunks = (
                 'data: {"candidates": [{"content": {"role": "model", '
-                '"parts": [{"text": "ack"}]}}]}\n\n'
+                '"parts": [{"text": "ack"}]}, "finishReason": "STOP"}]}\n\n'
                 + f"data: {json.dumps({'usageMetadata': usage})}\n\n"
             )
             return httpx.Response(

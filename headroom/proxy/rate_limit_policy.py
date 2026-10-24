@@ -36,14 +36,3 @@ def consume_from_bucket(
 
     wait_seconds = (required - available_tokens) * (60.0 / rate_per_minute)
     return False, available_tokens, wait_seconds
-
-
-def stale_bucket_keys(
-    last_updates: dict[str, float],
-    *,
-    now: float,
-    stale_after_seconds: float,
-) -> list[str]:
-    """Return bucket keys whose last update is older than the stale threshold."""
-    stale_before = now - stale_after_seconds
-    return [key for key, last_update in last_updates.items() if last_update < stale_before]
