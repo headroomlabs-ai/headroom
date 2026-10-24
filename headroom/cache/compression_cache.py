@@ -76,12 +76,42 @@ def _extract_tool_result_content(msg: dict) -> str | None:
     return None
 
 
+def _can_swap_tool_result_content(msg: dict) -> bool:
+    """Whether replacing extracted text preserves the OpenAI content shape.
+
+    A joined replacement cannot be mapped back to multiple blocks without
+    losing boundaries, metadata or media. All rewrite callers must check this
+    before extraction, transformation or savings accounting. Anthropic's
+    existing tool-result rewrite contract is unchanged.
+    """
+    if msg.get("role") != "tool":
+        return True
+    content = msg.get("content")
+    if isinstance(content, str):
+        return True
+    return (
+        isinstance(content, list)
+        and len(content) == 1
+        and isinstance(content[0], dict)
+        and content[0].get("type") == "text"
+        and isinstance(content[0].get("text"), str)
+    )
+
+
 def _swap_tool_result_content(msg: dict, new_content: str) -> dict:
-    """Deep copy msg and replace tool result content with new_content."""
+    """Deep copy and rewrite supported content; preserve unsupported layouts."""
     new_msg = copy.deepcopy(msg)
+    if not _can_swap_tool_result_content(msg):
+        return new_msg
     # OpenAI format
     if new_msg.get("role") == "tool":
-        new_msg["content"] = new_content
+        content = new_msg.get("content")
+        if isinstance(content, list):
+            # The shared guard permits only an unambiguous single text block.
+            # Keep its shape and metadata, including gateway cache breakpoints.
+            content[0]["text"] = new_content
+        else:
+            new_msg["content"] = new_content
         return new_msg
     # Anthropic format
     content = new_msg.get("content")
@@ -341,6 +371,9 @@ class CompressionCache:
         with self._lock:
             result: list[dict] = []
             for msg in messages:
+                if not _can_swap_tool_result_content(msg):
+                    result.append(msg)
+                    continue
                 if _is_tool_result_message(msg):
                     content = _extract_tool_result_content(msg)
                     if content is not None:
