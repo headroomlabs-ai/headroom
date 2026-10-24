@@ -385,6 +385,9 @@ def _make_llm_judge(model: str) -> Any:
     best-effort: any failure (no key, parse error) returns None so the caller
     falls back to the heuristic.
     """
+    from headroom.offline import guard_egress
+
+    guard_egress(f"{model} API for the headroom learn --llm-judge verbosity judge")
 
     def judge(signals: dict) -> tuple[int, str] | None:
         try:

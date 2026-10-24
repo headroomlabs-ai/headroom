@@ -321,6 +321,9 @@ OUTPUT FORMAT (JSON only):
 
 IMPORTANT: Every event MUST have a specific date. If you cannot determine the date, state it as "around {session_datetime}"."""
 
+        from headroom.offline import guard_egress
+
+        guard_egress(f"{self.config.extraction_model} API for memory eval extraction")
         try:
             response = litellm.completion(
                 model=self.config.extraction_model,

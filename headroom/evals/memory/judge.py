@@ -175,6 +175,8 @@ def create_litellm_judge(
             "LiteLLM package required for LLM judge. Install with: pip install litellm"
         ) from e
 
+    guard_egress(f"{model} API for the memory eval LLM judge")
+
     def judge(question: str, ground_truth: str, prediction: str) -> tuple[float, str]:
         prompt = JUDGE_PROMPT.format(
             question=question,

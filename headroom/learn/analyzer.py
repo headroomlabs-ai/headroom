@@ -1092,7 +1092,12 @@ def _call_llm(
     the provider: "claude-*" → Anthropic, "gpt-*" → OpenAI, "gemini/*" → Google, etc.
     For CLI-based models (ending in "-cli"), delegates to ``_call_cli_llm``.
     """
+    from headroom.offline import guard_egress
+
     if model in _CLI_MODEL_IDS:
+        # The provider CLI sends the digest to its own API, so refuse before
+        # spawning it rather than letting the subprocess reach the network.
+        guard_egress(f"{model} provider CLI for headroom learn session analysis")
         return _call_cli_llm(digest, model, on_progress=on_progress)
 
     import litellm
@@ -1106,6 +1111,7 @@ def _call_llm(
     if model.startswith("claude"):
         api_base = "https://api.anthropic.com"
 
+    guard_egress(f"{model} API for headroom learn session analysis", api_base)
     response = litellm.completion(
         model=model,
         messages=[

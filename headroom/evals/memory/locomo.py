@@ -29,6 +29,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from headroom.offline import guard_egress
+
 logger = logging.getLogger(__name__)
 
 # LoCoMo dataset URL
@@ -231,6 +233,7 @@ def download_locomo(cache_dir: Path | None = None) -> Path:
         logger.info(f"Using cached LoCoMo dataset: {cache_path}")
         return cache_path
 
+    guard_egress("LoCoMo eval-dataset download", LOCOMO_URL)
     logger.info(f"Downloading LoCoMo dataset from {LOCOMO_URL}...")
     urllib.request.urlretrieve(LOCOMO_URL, cache_path)  # nosec B310
     logger.info(f"Downloaded to {cache_path}")

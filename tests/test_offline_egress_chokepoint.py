@@ -1764,6 +1764,167 @@ class TestEvalRunnerLocalProvider:
             runner._init_llm_client()
 
 
+class TestLearnAndMemoryEvalOffline:
+    """`headroom learn` and the memory evals reach their LLM through litellm,
+    and the LoCoMo loader downloads with urlretrieve. None of them consulted
+    the switch (#4338). litellm is replaced by a recorder so a refused path
+    is seen to stop before the request, not just to raise somewhere."""
+
+    @pytest.fixture
+    def litellm_calls(self, monkeypatch: pytest.MonkeyPatch) -> list[dict]:
+        import sys
+
+        calls: list[dict] = []
+        fake = SimpleNamespace(
+            completion=lambda **kwargs: calls.append(kwargs),
+            suppress_debug_info=False,
+        )
+        monkeypatch.setitem(sys.modules, "litellm", fake)
+        return calls
+
+    def test_learn_analysis_is_refused(
+        self, offline: None, no_sockets: None, litellm_calls: list[dict]
+    ) -> None:
+        from headroom.learn import analyzer
+
+        with pytest.raises(OfflineEgressBlocked) as excinfo:
+            analyzer._call_llm("digest", "claude-sonnet-4-6")
+        assert _refused_hostname(excinfo.value) == "api.anthropic.com"
+        assert litellm_calls == []
+
+    @pytest.fixture
+    def cli_calls(self, monkeypatch: pytest.MonkeyPatch) -> list[str]:
+        """Record the provider-CLI delegate and fail on any spawned process."""
+        from headroom.learn import analyzer
+
+        calls: list[str] = []
+
+        def no_process(*args: object, **kwargs: object) -> None:
+            raise AssertionError(f"learn spawned a provider CLI: {args!r}")
+
+        def fake_cli(digest: str, model: str, on_progress: object = None) -> dict:
+            calls.append(model)
+            return {"context_file_rules": []}
+
+        monkeypatch.setattr(analyzer, "_call_cli_llm", fake_cli)
+        monkeypatch.setattr(analyzer, "Popen", no_process)
+        monkeypatch.setattr(analyzer, "run", no_process)
+        monkeypatch.setattr(analyzer.subprocess, "Popen", no_process)
+        monkeypatch.setattr(analyzer.subprocess, "run", no_process)
+        return calls
+
+    @pytest.mark.parametrize("model", ["claude-cli", "gemini-cli", "codex-cli", "agy-cli"])
+    def test_learn_cli_analysis_is_refused_before_the_cli_runs(
+        self, offline: None, no_sockets: None, cli_calls: list[str], model: str
+    ) -> None:
+        from headroom.learn import analyzer
+
+        assert model in analyzer._CLI_MODEL_IDS
+        with pytest.raises(OfflineEgressBlocked, match=model):
+            analyzer._call_llm("digest", model)
+        assert cli_calls == []
+
+    def test_learn_cli_analysis_still_runs_online(
+        self, monkeypatch: pytest.MonkeyPatch, cli_calls: list[str]
+    ) -> None:
+        from headroom.learn import analyzer
+
+        monkeypatch.delenv("HEADROOM_OFFLINE", raising=False)
+        assert analyzer._call_llm("digest", "claude-cli") == {"context_file_rules": []}
+        assert cli_calls == ["claude-cli"]
+
+    def test_learn_verbosity_llm_judge_is_refused(
+        self, offline: None, no_sockets: None, litellm_calls: list[dict]
+    ) -> None:
+        from headroom.cli import learn
+
+        with pytest.raises(OfflineEgressBlocked):
+            learn._make_llm_judge("gpt-4o")
+        assert litellm_calls == []
+
+    def test_memory_eval_answer_model_is_refused(
+        self, offline: None, no_sockets: None, litellm_calls: list[dict]
+    ) -> None:
+        from headroom.cli import evals
+
+        with pytest.raises(OfflineEgressBlocked):
+            evals._run_memory_eval(
+                n_conversations=1,
+                categories=None,
+                include_adversarial=False,
+                top_k=10,
+                f1_threshold=0.5,
+                answer_model="gpt-4o",
+                llm_judge=False,
+                judge_provider="simple",
+                judge_model="gpt-4o",
+                output=None,
+                no_extract=True,
+                extraction_model="gpt-4o-mini",
+                pass_all=False,
+                parallel=1,
+                debug=False,
+            )
+        assert litellm_calls == []
+
+    def test_memory_eval_litellm_judge_is_refused(
+        self, offline: None, no_sockets: None, litellm_calls: list[dict]
+    ) -> None:
+        from headroom.evals.memory.judge import create_litellm_judge
+
+        with pytest.raises(OfflineEgressBlocked):
+            create_litellm_judge(model="gpt-4o")
+        assert litellm_calls == []
+
+    def test_memory_eval_extraction_is_refused(
+        self, offline: None, no_sockets: None, litellm_calls: list[dict]
+    ) -> None:
+        from headroom.evals.memory.runner import LoCoMoEvaluator
+
+        evaluator = LoCoMoEvaluator()
+        with pytest.raises(OfflineEgressBlocked):
+            evaluator._extract_memories_from_session("A: hi", "1 May 2023", "A", "B")
+        assert litellm_calls == []
+
+    def test_memory_eval_v2_save_and_answer_are_refused(
+        self, offline: None, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        import asyncio
+
+        from headroom.evals.memory import runner_v2
+
+        calls: list[dict] = []
+        monkeypatch.setattr(
+            runner_v2, "litellm", SimpleNamespace(completion=lambda **kw: calls.append(kw))
+        )
+        evaluator = runner_v2.LoCoMoEvaluatorV2()
+        conversation = SimpleNamespace(speaker_a="A", speaker_b="B", sessions=[])
+        with pytest.raises(OfflineEgressBlocked):
+            asyncio.run(evaluator._replay_conversation(conversation))
+        with pytest.raises(OfflineEgressBlocked):
+            asyncio.run(evaluator._answer_question(SimpleNamespace(question="Who?"), conversation))
+        assert calls == []
+
+    def test_locomo_download_opens_no_socket(
+        self, offline: None, no_sockets: None, tmp_path: Path
+    ) -> None:
+        from headroom.evals.memory.locomo import download_locomo
+
+        with pytest.raises(OfflineEgressBlocked) as excinfo:
+            download_locomo(cache_dir=tmp_path)
+        assert _refused_hostname(excinfo.value) == "raw.githubusercontent.com"
+        assert not (tmp_path / "locomo10.json").exists()
+
+    def test_a_cached_locomo_dataset_still_loads_offline(
+        self, offline: None, no_sockets: None, tmp_path: Path
+    ) -> None:
+        from headroom.evals.memory.locomo import download_locomo
+
+        cached = tmp_path / "locomo10.json"
+        cached.write_text("[]", encoding="utf-8")
+        assert download_locomo(cache_dir=tmp_path) == cached
+
+
 class TestHeadroomCloudCompressionOffline:
     """Both Headroom Cloud integrations.
 
@@ -2024,6 +2185,7 @@ _EGRESS_CALLEES = re.compile(
       | httpx\.(?:get|post|put|patch|delete|head|request|stream)  # module-level verbs
       | requests\.(?:get|post|put|patch|delete|head|request|Session)
       | (?:urllib\.request\.)?urlopen | _urlopen       # urllib, bare or wrapped
+      | (?:urllib\.request\.)?urlretrieve              # urllib file download
       | aiohttp\.ClientSession
       | urllib3\.PoolManager
       | (?:huggingface_hub\.)?hf_hub_download          # the Python half of the HF fetch
@@ -2035,6 +2197,8 @@ _EGRESS_CALLEES = re.compile(
       | OTLP(?:Metric|Span|Log)Exporter                # OTEL export, incl. its background timer
       | (?:openai\.)?(?:Async)?(?:OpenAI|AzureOpenAI)  # provider SDKs build their own
       | (?:anthropic\.)?(?:Async)?Anthropic(?:Bedrock|Vertex)?
+      | litellm\.a?completion                          # litellm-routed provider calls
+      | _call_cli_llm                                  # learn's provider CLIs call their APIs
     )$""",
     re.VERBOSE,
 )
@@ -2284,6 +2448,13 @@ _EGRESS_ALLOWLIST: dict[str, tuple[int, str]] = {
         "upstream they configured. Blocking this would break every air-gapped "
         "deployment that points Headroom at an on-prem model endpoint, which "
         "is the main reason such a deployment exists.",
+    ),
+    "backends/litellm.py": (
+        4,
+        "user-traffic: LiteLLMBackend's send/stream paths (Anthropic and "
+        "OpenAI shaped) forward the caller's request to the provider the "
+        "operator configured as the proxy backend (Bedrock, Vertex, "
+        "OpenRouter, ...). Same role as the proxy's own forwarding above.",
     ),
     "telemetry/session.py": (
         1,
