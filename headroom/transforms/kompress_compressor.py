@@ -23,11 +23,13 @@ import os
 import re
 import threading
 import time
+from collections.abc import Callable, Iterator
 from dataclasses import dataclass
 from functools import lru_cache
 from typing import Any, Literal
 
 from ..config import TransformResult
+from ..log_safety import describe_exception, safe_id
 from ..offline import OFFLINE_ENV, OfflineEgressBlocked
 from ..onnx_runtime import (
     ONNX_CPU_ARENA_ENV,
@@ -797,8 +799,46 @@ def _smoke_run(session: Any) -> None:
     )
 
 
+#: Per-stage load cost: stage name -> (wall-clock ms, loading-thread CPU ms).
+StageTimings = dict[str, tuple[float, float]]
+
+
+@contextlib.contextmanager
+def _timed_stage(stage_ms: StageTimings | None, stage: str) -> Iterator[None]:
+    """Add the block's wall-clock and thread-CPU milliseconds to ``stage_ms[stage]``.
+
+    Accumulates rather than overwrites, so a stage that runs once per ONNX
+    candidate reports the cost of every attempt, failed ones included. Records
+    on exceptions too. A no-op when ``stage_ms`` is ``None``.
+
+    CPU is this thread's only (``time.thread_time``): work on onnxruntime's own
+    worker threads is not counted, and wall far above CPU means the thread was
+    waiting (disk, the GIL, a lock) rather than working.
+    """
+    if stage_ms is None:
+        yield
+        return
+    wall_started = time.perf_counter()
+    cpu_started = time.thread_time()
+    try:
+        yield
+    finally:
+        wall_ms = (time.perf_counter() - wall_started) * 1000.0
+        cpu_ms = (time.thread_time() - cpu_started) * 1000.0
+        prev_wall, prev_cpu = stage_ms.get(stage, (0.0, 0.0))
+        stage_ms[stage] = (prev_wall + wall_ms, prev_cpu + cpu_ms)
+
+
+def _format_stage_ms(stage_ms: StageTimings) -> str:
+    return " ".join(f"{stage}={wall:.0f}/{cpu:.0f}" for stage, (wall, cpu) in stage_ms.items())
+
+
 def _create_onnx_session(
-    model_id: str, providers: list[Any], *, allow_download: bool = True
+    model_id: str,
+    providers: list[Any],
+    *,
+    allow_download: bool = True,
+    stage_ms: StageTimings | None = None,
 ) -> Any:
     """Resolve and load the model's ONNX artifact, trying candidates in order.
 
@@ -812,6 +852,10 @@ def _create_onnx_session(
     cache only; if none is cached, :class:`KompressModelNotCached` is raised
     instead of hitting the network. ``onnxruntime`` is imported only after a
     candidate resolves, so a cache-only miss never requires it.
+
+    ``stage_ms``, when given, accumulates the cost of ``artifact_resolve``,
+    ``onnxruntime_import``, ``session_build`` and ``smoke_run`` across every
+    candidate tried. See :func:`_timed_stage`.
     """
     last_err: Exception | None = None
     cache_miss = False
@@ -819,9 +863,10 @@ def _create_onnx_session(
     ort: Any = None
     for filename in _onnx_filename_candidates():
         try:
-            onnx_path = _hf_artifact(
-                model_id, filename, allow_network=allow_download and refused is None
-            )
+            with _timed_stage(stage_ms, "artifact_resolve"):
+                onnx_path = _hf_artifact(
+                    model_id, filename, allow_network=allow_download and refused is None
+                )
         except KompressModelNotCached as exc:
             # Only _hf_artifact's air-gap translation raises this here. It says
             # THIS candidate is not cached; a later one may be. Keep looking,
@@ -834,16 +879,19 @@ def _create_onnx_session(
             logger.debug("ONNX artifact %r unavailable for %s: %s", filename, model_id, exc)
             continue
         if ort is None:
-            import onnxruntime
+            with _timed_stage(stage_ms, "onnxruntime_import"):
+                import onnxruntime
 
             ort = onnxruntime
         try:
-            session = ort.InferenceSession(
-                onnx_path,
-                _onnx_session_options(ort),
-                providers=providers,
-            )
-            _smoke_run(session)
+            with _timed_stage(stage_ms, "session_build"):
+                session = ort.InferenceSession(
+                    onnx_path,
+                    _onnx_session_options(ort),
+                    providers=providers,
+                )
+            with _timed_stage(stage_ms, "smoke_run"):
+                _smoke_run(session)
             return session
         except Exception as exc:
             last_err = exc
@@ -878,7 +926,12 @@ def _load_kompress_onnx(
         if model_id in _kompress_cache:
             return _kompress_cache[model_id]
 
-        logger.info("Downloading Kompress ONNX model from %s ...", model_id)
+        # Logged before any cache lookup: the artifacts usually come from disk
+        # (startup prefetch), and _hf_artifact goes to the Hub only on a miss.
+        logger.info("Loading Kompress ONNX model from %s ...", model_id)
+        load_started = time.perf_counter()
+        load_cpu_started = time.thread_time()
+        stage_ms: StageTimings = {}
 
         backend = "onnx_coreml" if use_coreml else "onnx"
         providers: list[Any]
@@ -907,15 +960,26 @@ def _load_kompress_onnx(
         else:
             providers = ["CPUExecutionProvider"]
 
-        session = _create_onnx_session(model_id, providers, allow_download=allow_download)
+        session = _create_onnx_session(
+            model_id, providers, allow_download=allow_download, stage_ms=stage_ms
+        )
         model = _OnnxModel(session)
 
-        from transformers import AutoTokenizer
+        with _timed_stage(stage_ms, "transformers_import"):
+            from transformers import AutoTokenizer
 
-        tokenizer = _load_modernbert_tokenizer(AutoTokenizer, allow_download=allow_download)
+        with _timed_stage(stage_ms, "tokenizer_load"):
+            tokenizer = _load_modernbert_tokenizer(AutoTokenizer, allow_download=allow_download)
 
         _kompress_cache[model_id] = (model, tokenizer, backend)
-        logger.info("Kompress ONNX loaded: %s backend=%s", model_id, backend)
+        logger.info(
+            "Kompress ONNX loaded: %s backend=%s total_ms=%.0f/%.0f stages_ms(wall/cpu): %s",
+            model_id,
+            backend,
+            (time.perf_counter() - load_started) * 1000.0,
+            (time.thread_time() - load_cpu_started) * 1000.0,
+            _format_stage_ms(stage_ms),
+        )
         return model, tokenizer, backend
 
 
@@ -1341,6 +1405,48 @@ def ensure_background_download(model_id: str = HF_MODEL_ID, device: str = "auto"
         thread.start()
 
 
+def is_kompress_load_in_progress(model_id: str = HF_MODEL_ID) -> bool:
+    """True while a registered thread (prefetch, download or warm-up) is working on ``model_id``."""
+    with _download_threads_lock:
+        thread = _download_threads.get(model_id)
+    return thread is not None and thread.is_alive()
+
+
+def start_kompress_warmup_thread(model_id: str, warm: Callable[[], None]) -> threading.Thread:
+    """Run ``warm`` on a daemon ``kompress-warmup`` thread registered as ``model_id``'s loader.
+
+    The proxy's post-startup warm-up loads the model on its own thread. Unless
+    that thread is in the per-model registry, a request arriving mid-warm-up
+    finds the model not ready, sees no live loader, and has
+    :func:`ensure_background_download` start a second thread that only queues
+    on ``_kompress_lock`` and then returns the warm-up's cache entry. Registered
+    before it starts, so the warm-up's initial delay is covered too.
+
+    If a prefetch or download thread is already registered, the warm-up takes
+    its place in the registry and waits for it to finish before running
+    ``warm``. Without the wait, a warm-up that failed while a startup prefetch
+    was still downloading would leave the registry pointing at a dead thread,
+    and the next request would start another download next to the hidden
+    prefetch. Waiting also keeps the warm-up from fetching the same files at
+    the same time. Once the warm-up finishes, a failed one included, the next
+    :func:`ensure_background_download` call replaces the dead entry as usual.
+    """
+    with _download_threads_lock:
+        previous = _download_threads.get(model_id)
+
+        def _run() -> None:
+            # Registry entries are always started threads, so join() is safe;
+            # it returns at once for one that has already finished.
+            if previous is not None:
+                previous.join()
+            warm()
+
+        thread = threading.Thread(target=_run, name="kompress-warmup", daemon=True)
+        _download_threads[model_id] = thread
+        thread.start()
+    return thread
+
+
 def prefetch_kompress_artifacts(model_id: str = HF_MODEL_ID) -> bool:
     """Download the model's ONNX artifact to the local cache. No native init.
 
@@ -1597,7 +1703,14 @@ def store_kompress_in_ccr(original: str, compressed: str, original_tokens: int) 
                 strategy="kompress",
             )
         return cache_key
-    except Exception:
+    except Exception as e:
+        # Store backends can echo the payload in errors, so no level logs it;
+        # describe_exception keeps only types and code locations.
+        logger.warning(
+            "Kompress CCR store write failed (%s); output is not retrievable", safe_id(e)
+        )
+        if logger.isEnabledFor(logging.DEBUG):
+            logger.debug("Kompress CCR store failure detail: %s", describe_exception(e))
         return None
 
 
@@ -1750,6 +1863,10 @@ class KompressCompressor(Transform):
         No-op when the model is already cached or a download is already running.
         """
         ensure_background_download(self.config.model_id, self.config.device)
+
+    def is_loading(self) -> bool:
+        """True while a background thread is fetching or loading this model."""
+        return is_kompress_load_in_progress(self.config.model_id)
 
     def compress(
         self,

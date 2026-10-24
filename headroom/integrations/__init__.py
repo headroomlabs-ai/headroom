@@ -2,7 +2,7 @@
 
 Available integrations:
 
-LangChain (pip install headroom[langchain]):
+LangChain (pip install "headroom-ai[langchain]"):
     - HeadroomChatModel: Drop-in wrapper for any LangChain chat model
     - HeadroomChatMessageHistory: Automatic conversation compression
     - HeadroomDocumentCompressor: Relevance-based document filtering
@@ -19,7 +19,7 @@ CrewAI (pip install headroom-ai crewai):
     - HeadroomToolWrapper: Tool output compression for CrewAI agents
     - wrap_tools_with_headroom: Batch wrapper for CrewAI tools
 
-AutoGen (pip install headroom[autogen]):
+AutoGen (pip install "headroom-ai[autogen]"):
     - HeadroomToolWrapper: Tool output compression for AutoGen agents
     - wrap_tools_with_headroom: Batch wrapper for AutoGen tools
 

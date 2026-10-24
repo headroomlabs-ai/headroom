@@ -33,6 +33,7 @@ from typing import Any
 
 from headroom.log_safety import describe_exception
 from headroom.proxy.conversation_savings import get_conversation_savings
+from headroom.proxy.savings import ItemMeasure, get_item_ledger
 from headroom.proxy.tool_schema_savings_policy import (
     headline_tokens_saved,
     tool_schema_saved_from_tags,
@@ -204,6 +205,11 @@ class RequestOutcome:
     #     path, where the outcome carries a per-turn delta.
     conversation_key: str | None = None
     conversation_tokens_saved: int | None = None
+    # savings_measure: the request's per-item original/sent counts against the
+    #     conversation's previous request (``headroom.proxy.savings``), from
+    #     which the per-request savings record is priced. None on paths that
+    #     do not measure items yet.
+    savings_measure: ItemMeasure | None = None
     transforms_applied: tuple[str, ...] = ()
     waste_signals: dict[str, int] | None = None
     num_messages: int = 0
@@ -339,6 +345,7 @@ class RequestOutcome:
         conversation_key: str | None = None,
         conversation_tokens_saved: int | None = None,
         provider_input_tokens: int = 0,
+        savings_measure: ItemMeasure | None = None,
     ) -> RequestOutcome:
         """Construct an outcome from the locals available at streaming
         finalize. Three streaming finalizers
@@ -414,6 +421,7 @@ class RequestOutcome:
             tokens_saved=tokens_saved,
             conversation_key=conversation_key,
             conversation_tokens_saved=conversation_tokens_saved,
+            savings_measure=savings_measure,
             attempted_input_tokens=optimized_tokens + tokens_saved,
             status_code=status_code,
             cache_read_tokens=cache_read_tokens,
@@ -539,6 +547,10 @@ async def emit_request_outcome(handler: Any, outcome: RequestOutcome) -> None:
     #    beacon must never add latency to, or take down, the request path.
     record_outcome(outcome)
 
+    if outcome.savings_measure is not None:
+        # Only a request the provider served becomes the next one's baseline.
+        get_item_ledger().settle(outcome.savings_measure, succeeded=outcome.status_code < 400)
+
     # A rejected turn must not feed the savings/cost/log success stats; that
     # would let a request the provider never billed inflate the save-rate.
     # Record it under the counter that names what happened, and stop.
@@ -570,44 +582,6 @@ async def emit_request_outcome(handler: Any, outcome: RequestOutcome) -> None:
         else:
             await handler.metrics.record_failed(provider=outcome.provider)
         return
-
-    # Outcome stage: hand the meter's reading to any pipeline extension that
-    # adapts to it — a ceiling that was hit, an effort setting that did or did
-    # not pay off. The snapshot is frozen, so an extension can learn from the
-    # measurement without being able to rewrite it: extensions declare what
-    # they did, the core records what happened, and attribution is the core's
-    # arithmetic over both.
-    #
-    # Best-effort and last in line: a handler without a pipeline manager, or an
-    # extension that raises, must not affect the response or the stats below.
-    _pipeline = getattr(handler, "pipeline_extensions", None)
-    if _pipeline is not None and getattr(_pipeline, "enabled", False):
-        try:
-            from headroom.pipeline import OutcomeSnapshot, PipelineStage
-
-            _pipeline.emit(
-                PipelineStage.OUTCOME_OBSERVED,
-                operation="proxy.outcome",
-                request_id=outcome.request_id,
-                provider=outcome.provider,
-                model=outcome.model,
-                outcome=OutcomeSnapshot(
-                    request_id=outcome.request_id,
-                    provider=outcome.provider,
-                    model=outcome.model,
-                    output_tokens=outcome.output_tokens,
-                    thinking_tokens=outcome.thinking_tokens,
-                    thinking_inferred=outcome.thinking_inferred,
-                    stop_reason=outcome.stop_reason,
-                    input_tokens=outcome.provider_input_tokens or outcome.optimized_tokens,
-                    cache_read_tokens=outcome.cache_read_tokens,
-                    cache_write_tokens=outcome.cache_write_tokens,
-                    turn_index=outcome.turn_index,
-                    transforms_applied=tuple(str(t) for t in (outcome.transforms_applied or ())),
-                ),
-            )
-        except Exception:  # noqa: BLE001 - telemetry must never break a response
-            logger.debug("OUTCOME_OBSERVED emit failed", exc_info=True)
 
     # Output-shaping savings ledger (counterfactual estimator). The shaper
     # tags each request's (arm, stratum) onto ``transforms_applied``; feed the
@@ -652,6 +626,49 @@ async def emit_request_outcome(handler: Any, outcome: RequestOutcome) -> None:
     )
     if novel_tokens_saved is None:
         novel_tokens_saved = outcome.tokens_saved
+
+    # Outcome stage: hand the meter's reading to any pipeline extension that
+    # adapts to it — a ceiling that was hit, an effort setting that did or did
+    # not pay off. The snapshot is frozen, so an extension can learn from the
+    # measurement without being able to rewrite it: extensions declare what
+    # they did, the core records what happened, and attribution is the core's
+    # arithmetic over both.
+    #
+    # Emitted after the novel share is known, so an extension reads the same
+    # per-request savings the running totals book instead of parsing PERF lines.
+    #
+    # Best-effort: a handler without a pipeline manager, or an extension that
+    # raises, must not affect the response or the stats below.
+    _pipeline = getattr(handler, "pipeline_extensions", None)
+    if _pipeline is not None and getattr(_pipeline, "enabled", False):
+        try:
+            from headroom.pipeline import OutcomeSnapshot, PipelineStage
+
+            _pipeline.emit(
+                PipelineStage.OUTCOME_OBSERVED,
+                operation="proxy.outcome",
+                request_id=outcome.request_id,
+                provider=outcome.provider,
+                model=outcome.model,
+                outcome=OutcomeSnapshot(
+                    request_id=outcome.request_id,
+                    provider=outcome.provider,
+                    model=outcome.model,
+                    output_tokens=outcome.output_tokens,
+                    thinking_tokens=outcome.thinking_tokens,
+                    thinking_inferred=outcome.thinking_inferred,
+                    stop_reason=outcome.stop_reason,
+                    input_tokens=outcome.provider_input_tokens or outcome.optimized_tokens,
+                    cache_read_tokens=outcome.cache_read_tokens,
+                    cache_write_tokens=outcome.cache_write_tokens,
+                    turn_index=outcome.turn_index,
+                    transforms_applied=tuple(str(t) for t in (outcome.transforms_applied or ())),
+                    tokens_saved=outcome.tokens_saved,
+                    novel_tokens_saved=novel_tokens_saved,
+                ),
+            )
+        except Exception:  # noqa: BLE001 - telemetry must never break a response
+            logger.debug("OUTCOME_OBSERVED emit failed", exc_info=True)
 
     # Tool-schema savings (deferral + turn-hook tool shrink) live in per-request
     # tags and never move tok_before/after; aggregate them into Metrics so the

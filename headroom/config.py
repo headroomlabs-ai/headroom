@@ -118,7 +118,7 @@ class RelevanceScorerConfig:
     DEFAULT: "hybrid" - combines exact matching (UUIDs, IDs) with semantic
     understanding. Falls back to BM25 if sentence-transformers not installed.
 
-    For full hybrid support, install: pip install headroom[relevance]
+    For full hybrid support, install: pip install "headroom-ai[relevance]"
 
     WHY HYBRID IS DEFAULT:
     - Missing important items during compression is catastrophic

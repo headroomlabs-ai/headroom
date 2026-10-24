@@ -1175,3 +1175,33 @@ def test_missing_binary_error_goes_to_stderr_only(
     assert result.exit_code == 1
     assert result.stdout == ""
     assert result.stderr.startswith(expected)
+
+
+def test_start_proxy_passes_carried_extensions_as_a_flag(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    captured: dict[str, object] = {}
+    proc = _FakeProxyProc()
+
+    def fake_popen(command: list[str], **kwargs: object) -> _FakeProxyProc:
+        captured["command"] = command
+        return proc
+
+    monkeypatch.setattr(wrap_mod.subprocess, "Popen", fake_popen)
+    monkeypatch.setattr(wrap_mod, "_check_proxy", lambda port: True)
+    monkeypatch.setattr(wrap_mod, "_get_log_path", lambda port=None: tmp_path / "proxy.log")
+    monkeypatch.setattr(
+        wrap_mod,
+        "_get_proxy_stdio_log_path",
+        lambda port=None: tmp_path / "proxy-stdio.log",
+    )
+    monkeypatch.setattr(wrap_mod.time, "sleep", lambda seconds: None)
+
+    wrap_mod._start_proxy(8788, proxy_extensions=["observability", "routemegood"])
+    command = captured["command"]
+    assert isinstance(command, list)
+    assert command[command.index("--proxy-extension") + 1] == "observability,routemegood"
+
+    wrap_mod._start_proxy(8788)
+    assert "--proxy-extension" not in captured["command"]

@@ -284,6 +284,7 @@ accept arbitrary environment variables — writes are restricted to a hardcoded 
 | `HEADROOM_INTERCEPT_READ_MIN_CHARS` | ast-grep read-interception threshold |
 | `HEADROOM_VERIFY_TRUNCATION_ON_DISK` | Verify ast-grep Read truncation against disk when no client banner is found. Always returns `UNKNOWN` on Windows, where `dir_fd` / `O_NOFOLLOW` support is unavailable. |
 | `HEADROOM_VERIFY_TRUNCATION_MAX_BYTES` | Max on-disk file size (bytes) the disk-verify fallback will read |
+| `HEADROOM_BUFFERED_UPSTREAM_STREAM` | Send buffered CCR requests (and their continuations) upstream as `stream: true` and fold the reply (default on; `0` sends `stream: false`) |
 
 Keys outside this list are ignored, and `/admin/upstream` is read-only — there is no
 write route on the admin surface, specifically so a caller cannot redirect
@@ -342,7 +343,7 @@ Beyond your configured LLM providers, Headroom may contact:
 
 | Destination | Purpose | Default | Disable / pre-provision |
 |---|---|---|---|
-| `headroom-beacon.headroom-beacon.workers.dev` | Anonymous session summaries to Headroom Labs | **On** — see [The beacon](#the-beacon-is-on-by-default) | `HEADROOM_BEACON=off`, `DO_NOT_TRACK=1`, or `HEADROOM_OFFLINE` |
+| `headroom-beacon.headroom-beacon.workers.dev` | Anonymous session summaries to Headroom Labs | **On** — see [The beacon](#the-beacon-is-on-by-default) | `HEADROOM_BEACON=off`, `HEADROOM_TELEMETRY=off`, `DO_NOT_TRACK=1`, or `HEADROOM_OFFLINE` |
 | `pypi.org` | Daily version check for update notices | On | `HEADROOM_UPDATE_CHECK=off`; also skipped in `--stateless`, in CI, and from source checkouts |
 | `huggingface.co` | Downloads models for the optional ML compression paths | On first use of those features | Pre-provision the model cache, or leave the features disabled |
 | `app.headroomlabs.ai` | License validation and usage reporting | Only with a license key configured | Omit the license key |
@@ -378,13 +379,16 @@ Prompts, completions, file contents, tool results, and file paths are **not** in
 payload. The install id is a random UUID rather than a machine fingerprint, and resets
 if you delete `<config dir>/install_id`.
 
-Three controls switch it off, checked in this order:
+Four controls switch it off, checked in this order:
 
 ```bash
-HEADROOM_OFFLINE=1     # offline mode — disables all egress, not just the beacon
-DO_NOT_TRACK=1         # the cross-tool convention, honoured
-HEADROOM_BEACON=off    # also false / 0 / no / disable / disabled
+HEADROOM_OFFLINE=1      # offline mode — disables all egress, not just the beacon
+DO_NOT_TRACK=1          # the cross-tool convention, honoured
+HEADROOM_BEACON=off     # also false / 0 / no / disable / disabled; =on keeps it on
+HEADROOM_TELEMETRY=off  # same off-values; also what --no-telemetry sets
 ```
+
+`headroom telemetry` names the setting that turned it off.
 
 The destination can also be redirected with `HEADROOM_TELEMETRY_ENDPOINT`, which is
 useful if you would rather terminate the reports at a receiver you control than block
@@ -400,8 +404,8 @@ assuming a typo fails safe.
 
 `HEADROOM_TELEMETRY` is a **different switch**, off by default and opt-in. It aggregates
 stats locally for the in-process collector and the `/stats` and `/v1/telemetry`
-endpoints, and sends nothing off-host. Enabling it does not authorise beacon upload, and
-disabling it does not suppress the beacon — the two are deliberately independent.
+endpoints, and sends nothing off-host. Enabling it does not authorise beacon upload; an
+explicit `HEADROOM_TELEMETRY=off` does suppress the beacon, unless `HEADROOM_BEACON=on`.
 
 Operational metrics are separate again: OpenTelemetry export
 (`HEADROOM_OTEL_METRICS_*`) is opt-in and targets a collector you specify.
