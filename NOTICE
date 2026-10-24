@@ -51,3 +51,12 @@ https://github.com/tailwindlabs/tailwindcss
 Alpine.js 3.13.3 — MIT License
 Copyright (c) 2019-2025 Caleb Porzio and contributors
 https://github.com/alpinejs/alpine
+
+CodeBurn (invoked via `headroom xray`)
+--------------------------------------
+Copyright (c) 2026 AgentSeal
+Licensed under the MIT License
+https://github.com/getagentseal/codeburn
+
+Headroom does not redistribute CodeBurn binaries. `headroom xray` invokes
+the pinned npm package through npx, which fetches and caches it at runtime.
