@@ -17,7 +17,7 @@ from __future__ import annotations
 import logging
 from collections.abc import Callable
 
-from headroom.offline import guard_egress
+from headroom.offline import guard_egress, pin_litellm_cost_map_local
 
 logger = logging.getLogger(__name__)
 
@@ -169,6 +169,7 @@ def create_litellm_judge(
         score, reasoning = judge_fn(question, ground_truth, prediction)
     """
     try:
+        pin_litellm_cost_map_local()
         import litellm
     except ImportError as e:
         raise ImportError(

@@ -7,6 +7,11 @@ services:
     tty: true
     environment:
       HOME: /tmp/headroom-home
+      # Docker creates /tmp/headroom-home as root:root, so $HOME is not
+      # writable by the --user the container runs as (issue #4207). Keep the
+      # HuggingFace/XDG caches on the bind-mounted workspace instead.
+      HF_HOME: /tmp/headroom-home/.headroom/cache/huggingface
+      XDG_CACHE_HOME: /tmp/headroom-home/.headroom/cache
       # Canonical Headroom filesystem contract (issue #175). Forwarded into
       # the container so the proxy resolves state/config to the bind-mounted
       # /tmp/headroom-home/.headroom path. HEADROOM_WORKSPACE (above) remains
@@ -28,6 +33,9 @@ services:
     restart: unless-stopped
     environment:
       HOME: /tmp/headroom-home
+      # See the `cli` service above (issue #4207).
+      HF_HOME: /tmp/headroom-home/.headroom/cache/huggingface
+      XDG_CACHE_HOME: /tmp/headroom-home/.headroom/cache
       HEADROOM_HOST: 0.0.0.0
       HEADROOM_PROXY_TOKEN: ${HEADROOM_PROXY_TOKEN:-}
       # The container binds 0.0.0.0 so the loopback publication below can reach

@@ -49,12 +49,17 @@ class CompressionStoreBackend(Protocol):
         """
         ...
 
-    def set(self, hash_key: str, entry: CompressionEntry) -> None:
+    def set(self, hash_key: str, entry: CompressionEntry) -> bool | None:
         """Store an entry with the given hash key.
 
         Args:
             hash_key: The unique hash identifying the entry.
             entry: The CompressionEntry to store.
+
+        Returns:
+            ``False`` when a backend that absorbs its errors did not store it
+            (``CompressionStore.store`` then raises ``StorageError``);
+            ``None`` (or ``True``) otherwise.
 
         Note:
             Overwrites any existing entry with the same key.

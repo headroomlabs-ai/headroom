@@ -28,21 +28,41 @@ Scope of the guarantee — read this before citing it in a threat model:
   the wrong inode by a path that changed underneath us. ``O_NOFOLLOW`` means a
   symlink planted at the path fails the open outright rather than redirecting
   the write.
-* **Windows**: *not* enforced, and deliberately not claimed. Who may read an
-  NTFS file is decided by its ACL. ``os.chmod`` on Windows only toggles the
-  read-only attribute and leaves the ACL untouched, so ``chmod(0o600)`` returns
-  successfully while ``stat.S_IMODE`` still reports ``0666`` and the file stays
-  readable per the inherited ACL. Python ships no ACL API, so Headroom does not
-  pretend to set one: on Windows the log inherits the ACL of its parent
-  directory and :data:`OWNER_ONLY_SUPPORTED` is ``False``. Callers that create
-  sensitive files say so once in the log (see
-  ``headroom.proxy.helpers._setup_file_logging``), and operators should treat
-  the log directory itself as the access-control boundary — keep it under the
-  user profile, and do not put it on a share.
+* **Windows**: mode bits do not control read access there — who may read an
+  NTFS file is decided by its ACL, and ``os.chmod`` only toggles the
+  read-only attribute and leaves the ACL untouched, so ``chmod(0o600)``
+  returns successfully while ``stat.S_IMODE`` still reports ``0666``. That is
+  why :data:`OWNER_ONLY_SUPPORTED` — "mode bits enforce this" — is ``False``
+  on Windows and stays that way regardless of the rest of this paragraph.
+  :func:`restrict_fd_to_owner` and :func:`restrict_path_to_owner` nonetheless
+  restrict the log, its rotated backups, and the JSONL request log there too,
+  through :mod:`headroom._fileperms_windows`: a DACL with exactly one entry
+  (the calling user, full control), built fresh rather than merged with the
+  inherited entries that made the file readable in the first place, and
+  applied with ``PROTECTED_DACL_SECURITY_INFORMATION`` so those inherited
+  entries are dropped rather than left alongside it. Unlike the POSIX path
+  this can fail per-call (a non-NTFS volume, a missing privilege), so callers
+  that need to know whether it actually took effect call
+  :func:`verify_owner_only` rather than trusting the static flag — see
+  ``headroom.proxy.helpers._warn_once_if_not_protected``, which warns only
+  when verification fails rather than unconditionally on Windows. Not
+  extended (yet) to the sqlite-backed memory/CCR stores
+  (:func:`ensure_private_file`/:func:`connect_private_sqlite`) or
+  :func:`private_dir` — those remain unenforced on Windows, same as before.
 
-``O_NOFOLLOW`` does not exist on Windows either, so the symlink protection
-there is the explicit :func:`is_symlink` check callers make before opening, not
-a kernel-enforced one.
+``O_NOFOLLOW`` does not exist on Windows, so the CRT ``os.open`` underneath
+Python's own ``open()`` has no way to refuse a symlink/junction there — it
+silently follows one to whatever it points at. :func:`open_owner_only` does
+not route through that on Windows for this reason: it opens via
+``headroom._fileperms_windows.open_no_follow``, which uses
+``FILE_FLAG_OPEN_REPARSE_POINT`` to open the reparse point itself regardless
+of create-or-open disposition, and refuses it outright if the resulting
+handle's own attributes show it is one — closing the same gap ``O_NOFOLLOW``
+closes on POSIX, checked on the handle rather than the path so there is
+nothing for a race to redirect. :func:`restrict_path_to_owner` uses the same
+flag for the same reason when narrowing a file it did not open itself
+(rotated backups): because that path only ever touches the reparse point's
+own DACL, never a target's, it is safe even without the attribute check.
 """
 
 from __future__ import annotations
@@ -62,8 +82,13 @@ OWNER_ONLY_MODE = 0o600
 OWNER_ONLY_DIR_MODE = 0o700
 
 #: ``True`` only where the mode bits above actually decide who can read the
-#: file. See the module docstring for why Windows is excluded.
+#: file. See the module docstring for why Windows is excluded -- it has its
+#: own, separately-verified mechanism instead, not reflected in this flag.
 OWNER_ONLY_SUPPORTED = os.name == "posix"
+
+_win: Any = None
+if os.name == "nt":
+    from . import _fileperms_windows as _win
 
 
 def _open_flags(*, truncate: bool = False) -> int:
@@ -83,14 +108,17 @@ def restrict_fd_to_owner(fd: int) -> bool:
 
     Acts on the descriptor, not the path, so there is no window in which the
     mode could land on a different file, and no way for a symlink to move it.
-    Returns ``False`` on platforms where the mode bits do not carry the
-    guarantee rather than reporting a protection that was not established.
+    On Windows this goes through :mod:`headroom._fileperms_windows` instead
+    of mode bits (see the module docstring); returns ``False`` if that fails
+    too, rather than reporting a protection that was not established.
     """
-    if not OWNER_ONLY_SUPPORTED:
-        return False
-    if stat.S_IMODE(os.fstat(fd).st_mode) != OWNER_ONLY_MODE:
-        os.fchmod(fd, OWNER_ONLY_MODE)
-    return True
+    if OWNER_ONLY_SUPPORTED:
+        if stat.S_IMODE(os.fstat(fd).st_mode) != OWNER_ONLY_MODE:
+            os.fchmod(fd, OWNER_ONLY_MODE)
+        return True
+    if _win is not None:
+        return bool(_win.restrict_handle(fd))
+    return False
 
 
 def restrict_path_to_owner(path: str | os.PathLike[str]) -> bool:
@@ -98,18 +126,43 @@ def restrict_path_to_owner(path: str | os.PathLike[str]) -> bool:
 
     For files Headroom did not open itself — rotated log backups, and backups
     left behind by an older unhardened run. A path that is a symlink is left
-    alone: the target is not ours to re-permission.
+    alone on every platform: the target is not ours to re-permission. On
+    Windows the ACL path (see the module docstring) adds
+    ``FILE_FLAG_OPEN_REPARSE_POINT`` underneath that check as a second guard.
     """
-    if not OWNER_ONLY_SUPPORTED:
-        return False
     try:
         if os.path.islink(path) or not os.path.exists(path):
             return False
-        if stat.S_IMODE(os.stat(path).st_mode) != OWNER_ONLY_MODE:
-            os.chmod(path, OWNER_ONLY_MODE)
+        if OWNER_ONLY_SUPPORTED:
+            if stat.S_IMODE(os.stat(path).st_mode) != OWNER_ONLY_MODE:
+                os.chmod(path, OWNER_ONLY_MODE)
+            return True
     except OSError:
         return False
-    return True
+    if _win is not None:
+        return bool(_win.restrict_path(os.fspath(path)))
+    return False
+
+
+def verify_owner_only(path: str | os.PathLike[str]) -> bool:
+    """Confirm *path* is restricted to its current owner right now.
+
+    Unlike :data:`OWNER_ONLY_SUPPORTED` (a static per-platform flag) or the
+    return value of :func:`restrict_fd_to_owner`/:func:`restrict_path_to_owner`
+    (whether the API calls *reported* success), this re-reads the file's
+    actual permissions. On Windows the ACL call can fail for reasons that
+    have nothing to do with Headroom's code -- a non-NTFS volume, a missing
+    privilege -- so a caller deciding whether to warn an operator should ask
+    what happened to *this* file, not assume from the platform.
+    """
+    if OWNER_ONLY_SUPPORTED:
+        try:
+            return stat.S_IMODE(os.stat(path).st_mode) == OWNER_ONLY_MODE
+        except OSError:
+            return False
+    if _win is not None:
+        return bool(_win.verify_path(os.fspath(path)))
+    return False
 
 
 def open_owner_only(
@@ -124,22 +177,43 @@ def open_owner_only(
 
     Raises ``OSError`` — which every caller already treats as "logging is
     unavailable, carry on" — if the path cannot be opened, including when it is
-    a symlink on a platform with ``O_NOFOLLOW``. Failing closed is deliberate:
-    a redirected sensitive log is worse than no log.
+    a symlink or junction. Failing closed is deliberate: a redirected sensitive
+    log is worse than no log.
+
+    On POSIX, ``O_NOFOLLOW`` makes the ``os.open`` below refuse a symlink at
+    the kernel level. Windows has no such flag -- plain ``os.open`` there
+    silently follows a planted symlink/junction to whatever it points at, so
+    a DACL applied afterward lands on the target, not the intended file; this
+    goes through :func:`headroom._fileperms_windows.open_no_follow` instead,
+    which opens the reparse point itself and verifies that before touching
+    anything, closing the one path/open gap ``O_NOFOLLOW`` closes on POSIX.
     """
     if mode[:1] not in ("a", "w"):
         raise ValueError(f"open_owner_only: mode must start with 'a' or 'w', got {mode!r}")
-    fd = os.open(path, _open_flags(truncate=mode.startswith("w")), OWNER_ONLY_MODE)
-    try:
-        restrict_fd_to_owner(fd)
-        return open(fd, mode, encoding=encoding, errors=errors, newline=newline, closefd=True)
-    except BaseException:
+    truncate = mode.startswith("w")
+    if OWNER_ONLY_SUPPORTED:
+        fd = os.open(path, _open_flags(truncate=truncate), OWNER_ONLY_MODE)
         try:
-            os.close(fd)
-        except OSError:
-            # open() can have taken and closed the descriptor on its way out.
-            pass
-        raise
+            restrict_fd_to_owner(fd)
+            return open(fd, mode, encoding=encoding, errors=errors, newline=newline, closefd=True)
+        except BaseException:
+            try:
+                os.close(fd)
+            except OSError:
+                # open() can have taken and closed the descriptor on its way out.
+                pass
+            raise
+    if _win is not None:
+        fd = _win.open_no_follow(os.fspath(path), truncate=truncate)
+        try:
+            return open(fd, mode, encoding=encoding, errors=errors, newline=newline, closefd=True)
+        except BaseException:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+            raise
+    return open(path, mode, encoding=encoding, errors=errors, newline=newline)
 
 
 def ensure_private_file(path: str | os.PathLike[str], *, what: str = "file") -> None:
