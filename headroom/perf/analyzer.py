@@ -11,10 +11,13 @@ Anthropic), not the full input price.  This prevents overstating dollar savings.
 
 from __future__ import annotations
 
+import io
 import logging
 import math
 import os
 import re
+from collections.abc import Iterable, Iterator
+from contextlib import contextmanager
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -244,7 +247,56 @@ def _parse_log_ts(ts: str | None) -> datetime | None:
         return None
 
 
-def parse_log_files(last_n_hours: float = 168.0) -> PerfReport:
+@contextmanager
+def _open_log_tail(log_file: Path, max_tail_bytes: int | None) -> Iterator[Iterable[str]]:
+    """Yield log lines, optionally only those inside the last N bytes.
+
+    Without a cap this is a plain full-file text read.
+
+    With a cap, one bounded window is read, ending at the size observed on
+    entry. Reading the window up front rather than seeking and then streaming
+    to EOF is what keeps the promise the cap makes: a single log line can be
+    arbitrarily long (the proxy log carries untruncated wire previews), so a
+    seek followed by an unbounded ``readline`` can pull in far more than the
+    cap, and streaming to EOF would also keep following a file that is being
+    appended to while the report is built.
+
+    Seeking happens on the raw binary stream because a byte offset is not a
+    valid ``TextIOWrapper.seek`` cookie. One byte before the window is read
+    too, so an offset that already sits on a line start is distinguishable
+    from one that landed inside a line; only the latter discards a partial
+    record. Without that extra byte an aligned offset silently drops the
+    first complete record in the window.
+    """
+    if not max_tail_bytes or max_tail_bytes <= 0:
+        with open(log_file, encoding="utf-8", errors="replace") as text:
+            yield text
+        return
+
+    with open(log_file, "rb") as raw:
+        size = log_file.stat().st_size
+        if size <= max_tail_bytes:
+            yield io.TextIOWrapper(raw, encoding="utf-8", errors="replace")
+            return
+        raw.seek(size - max_tail_bytes - 1)
+        window = raw.read(max_tail_bytes + 1)
+
+    if window[:1] == b"\n":
+        window = window[1:]
+    else:
+        _, newline, window = window.partition(b"\n")
+        if not newline:
+            # The window is one unterminated line, so it holds no complete
+            # record. Parsing its tail would invent a truncated one.
+            window = b""
+    yield io.StringIO(window.decode("utf-8", errors="replace"))
+
+
+def parse_log_files(
+    last_n_hours: float = 168.0,
+    *,
+    max_tail_bytes_per_file: int | None = None,
+) -> PerfReport:
     """Parse all proxy log files and return structured records.
 
     Args:
@@ -253,6 +305,12 @@ def parse_log_files(last_n_hours: float = 168.0) -> PerfReport:
             window in the report header reflects the actual timestamps that
             survived the filter, so the user can see whether the log went
             back far enough.
+        max_tail_bytes_per_file: Optional per-file cap on how many trailing
+            bytes are read. ``None`` (the default, used by the CLI reports)
+            reads every file in full. Callers that need a bounded latency
+            more than a complete history — the live dashboard /stats
+            throughput probe — pass a cap so one multi-hundred-megabyte
+            proxy log cannot stall the request.
 
     Returns:
         PerfReport with all parsed records.
@@ -334,7 +392,7 @@ def parse_log_files(last_n_hours: float = 168.0) -> PerfReport:
     for log_file in log_files:
         report.log_files_read += 1
         try:
-            with open(log_file, encoding="utf-8", errors="replace") as f:
+            with _open_log_tail(log_file, max_tail_bytes_per_file) as f:
                 for line in f:
                     report.total_lines_parsed += 1
                     line = line.rstrip()
