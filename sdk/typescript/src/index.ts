@@ -28,6 +28,7 @@ export type {
   OpenAIMessage,
   CompressOptions,
   CompressResult,
+  ClientCompressOptions,
   HeadroomClientOptions,
   HeadroomClientInterface,
 } from "./types.js";
