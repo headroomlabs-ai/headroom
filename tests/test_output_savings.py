@@ -17,6 +17,7 @@ from headroom.proxy.output_savings import (
     conversation_label,
     echo_ratio,
     input_bucket,
+    ledger_lock,
     model_family,
     stratum_key,
     stratum_label,
@@ -685,6 +686,181 @@ class TestLedgerPersistence:
         ledger = SavingsLedger.load(p)
         assert ledger.baseline.total_samples == 0
 
+    @staticmethod
+    def _pre_rule_ledger(path):
+        """A ledger written before shaped-only recording: arms, no marker."""
+        baseline = BaselineModel()
+        baseline.observe("opus|a|s|tools", 1000)
+        legacy = {
+            "baseline": baseline.to_dict(),
+            "treatment": {"opus|a|s|tools": {"n": 3, "sum": 2400.0, "sumsq": 1920000.0}},
+            "control": {},
+        }
+        path.write_text(json.dumps(legacy))
+        return legacy
+
+    @staticmethod
+    def _legacy_warnings(caplog):
+        return [r for r in caplog.records if "predates shaped-only" in r.getMessage()]
+
+    def test_pre_rule_ledger_warns_once_and_is_rewritten(self, tmp_path, caplog):
+        """/stats reloads the ledger on every poll. With the shaper disabled
+        nothing ever flushes, so the legacy file used to survive and warn on
+        every poll forever."""
+        import logging
+
+        path = tmp_path / "output_savings.json"
+        legacy = self._pre_rule_ledger(path)
+
+        with caplog.at_level(logging.WARNING):
+            recorder = SavingsRecorder(str(path))
+            for _ in range(3):
+                recorder.estimate()
+
+        assert len(self._legacy_warnings(caplog)) == 1
+        on_disk = json.loads(path.read_text())
+        assert on_disk["shaped_only"] is True
+        assert on_disk["treatment"] == {}
+        assert on_disk["baseline"] == legacy["baseline"]
+
+    def test_stateless_pre_rule_ledger_warns_once_and_is_left_alone(self, tmp_path, caplog):
+        import logging
+
+        from headroom import paths
+
+        path = tmp_path / "output_savings.json"
+        legacy = self._pre_rule_ledger(path)
+
+        paths.set_process_stateless(True)
+        try:
+            with caplog.at_level(logging.WARNING):
+                recorder = SavingsRecorder(str(path))
+                for _ in range(3):
+                    recorder.estimate()
+        finally:
+            paths.set_process_stateless(False)
+
+        assert len(self._legacy_warnings(caplog)) == 1
+        assert json.loads(path.read_text()) == legacy
+        assert not (tmp_path / "output_savings.json.lock").exists()
+
+    def test_migration_keeps_a_baseline_learned_after_the_first_load(self, tmp_path, monkeypatch):
+        """learn replaced the file between the recorder's first load and its
+        migration write; the stale legacy baseline must not overwrite it."""
+        path = tmp_path / "output_savings.json"
+        self._pre_rule_ledger(path)
+        learned = BaselineModel()
+        for output_tokens in (400, 420, 380):
+            learned.observe("opus|b|s|tools", output_tokens)
+
+        real_load = SavingsLedger.load.__func__
+        loads = []
+
+        def load_then_learn(cls, p, **kwargs):
+            ledger = real_load(cls, p, **kwargs)
+            loads.append(p)
+            if len(loads) == 1:
+                SavingsLedger.store_baseline(path, learned)
+            return ledger
+
+        monkeypatch.setattr(SavingsLedger, "load", classmethod(load_then_learn))
+        recorder = SavingsRecorder(str(path))
+
+        on_disk = json.loads(path.read_text())
+        assert on_disk["baseline"] == learned.to_dict()
+        assert recorder._ledger.baseline.to_dict() == learned.to_dict()
+
+    def test_migration_holds_the_ledger_lock_while_writing(self, tmp_path, monkeypatch):
+        import threading
+
+        path = tmp_path / "output_savings.json"
+        self._pre_rule_ledger(path)
+        real_save = SavingsLedger.save
+        contended = []
+
+        def probing_save(self, p):
+            acquired = threading.Event()
+
+            def other_writer():
+                with ledger_lock(p):
+                    acquired.set()
+
+            probe = threading.Thread(target=other_writer)
+            probe.start()
+            contended.append(not acquired.wait(timeout=0.3))
+            real_save(self, p)
+            probe_threads.append(probe)
+
+        probe_threads: list[threading.Thread] = []
+        monkeypatch.setattr(SavingsLedger, "save", probing_save)
+        SavingsRecorder(str(path))
+        for probe in probe_threads:
+            probe.join(timeout=5)
+
+        assert contended == [True]
+        assert json.loads(path.read_text())["shaped_only"] is True
+
+    def test_migration_keeps_a_baseline_learned_during_the_locked_reload(
+        self, tmp_path, monkeypatch
+    ):
+        """learn writes while the migration holds its re-read snapshot; it
+        must wait for the lock rather than be overwritten by that snapshot."""
+        import threading
+
+        path = tmp_path / "output_savings.json"
+        legacy = self._pre_rule_ledger(path)
+        learned = BaselineModel()
+        for output_tokens in (400, 420, 380):
+            learned.observe("opus|b|s|tools", output_tokens)
+
+        real_load = SavingsLedger.load.__func__
+        loads = []
+        writers: list[threading.Thread] = []
+
+        def learn_during_second_load(cls, p, **kwargs):
+            ledger = real_load(cls, p, **kwargs)
+            loads.append(p)
+            if len(loads) == 2:
+                writer = threading.Thread(target=SavingsLedger.store_baseline, args=(path, learned))
+                writer.start()
+                writer.join(timeout=0.3)
+                writers.append(writer)
+            return ledger
+
+        monkeypatch.setattr(SavingsLedger, "load", classmethod(learn_during_second_load))
+        recorder = SavingsRecorder(str(path))
+        assert len(writers) == 1
+        writers[0].join(timeout=5)
+        assert not writers[0].is_alive()
+
+        on_disk = json.loads(path.read_text())
+        assert on_disk["shaped_only"] is True
+        assert on_disk["baseline"] == learned.to_dict()
+        assert on_disk["baseline"] != legacy["baseline"]
+        recorder.estimate()
+        assert recorder._ledger.baseline.to_dict() == learned.to_dict()
+
+    def test_store_baseline_waits_for_the_ledger_lock(self, tmp_path):
+        """learn must not replace the file while another writer holds the lock
+        between its re-read and its save."""
+        import threading
+
+        path = tmp_path / "output_savings.json"
+        legacy = self._pre_rule_ledger(path)
+        learned = BaselineModel()
+        learned.observe("opus|b|s|tools", 400)
+
+        writer = threading.Thread(target=SavingsLedger.store_baseline, args=(path, learned))
+        with ledger_lock(path):
+            writer.start()
+            writer.join(timeout=0.3)
+            assert writer.is_alive()
+            assert json.loads(path.read_text()) == legacy
+        writer.join(timeout=5)
+
+        assert not writer.is_alive()
+        assert json.loads(path.read_text())["baseline"] == learned.to_dict()
+
 
 # ---------------------------------------------------------------------------
 # echo ratio (direct waste signal)
@@ -768,6 +944,21 @@ class TestRecorderBaselineReload:
         # The flush must keep the learned baseline rather than writing the empty
         # in-memory one over it.
         assert SavingsLedger.load(path).baseline.total_samples == 4
+
+    def test_store_baseline_keeps_live_arms(self, tmp_path):
+        path = str(tmp_path / "output_savings.json")
+        key = self._key()
+
+        recorder = SavingsRecorder(path, flush_every=1)
+        recorder.record_from_labels([stratum_label("treatment", key), SHAPED], 200)
+
+        learned = BaselineModel()
+        learned.observe(key, 400)
+        SavingsLedger.store_baseline(path, learned)
+
+        on_disk = SavingsLedger.load(path)
+        assert on_disk.baseline.to_dict() == learned.to_dict()
+        assert on_disk.treatment[key].n == 1
 
     def test_does_not_downgrade_to_empty_disk_baseline(self, tmp_path):
         path = str(tmp_path / "output_savings.json")
