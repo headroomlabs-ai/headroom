@@ -1171,7 +1171,9 @@ class TestMemorySystem:
         )
 
         assert result["success"] is True
-        assert len(backend.calls) == 1, "field support must be decided before the call, not by retrying"
+        assert len(backend.calls) == 1, (
+            "field support must be decided before the call, not by retrying"
+        )
 
     @pytest.mark.asyncio
     async def test_handle_memory_save_internal_unexpected_kwarg_is_not_replayed(self):

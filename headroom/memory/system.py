@@ -397,7 +397,11 @@ class MemorySystem:
         # inside the backend may come after it already wrote the record, and
         # the two cannot be told apart afterwards. A failed save is therefore
         # never replayed — an internal TypeError propagates to the caller.
-        pre_keys = [k for k in ("facts", "extracted_entities", "extracted_relationships") if k in save_kwargs]
+        pre_keys = [
+            k
+            for k in ("facts", "extracted_entities", "extracted_relationships")
+            if k in save_kwargs
+        ]
         save_kwargs = _filter_supported_kwargs(self._backend.save_memory, save_kwargs)
         pre_extraction_persisted = bool(pre_keys) and all(k in save_kwargs for k in pre_keys)
         if pre_keys and not pre_extraction_persisted:
