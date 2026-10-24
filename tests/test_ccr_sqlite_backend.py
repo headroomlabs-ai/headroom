@@ -425,12 +425,19 @@ class TestMultiWorkerSafety:
         reader = SQLiteBackend(db_path)
         writer.set("h1", make_entry())
         before = db_path.stat()
-        error = sqlite3.DatabaseError(message)
+        sensitive_marker = "private-diagnostic-sentinel"
+        error = sqlite3.DatabaseError(f"{message}: {sensitive_marker}")
 
         with pytest.raises(StorageError, match="Stop all workers") as raised:
             writer._handle_db_error(error, "get")
 
         assert raised.value.__cause__ is error
+        # MCP returns str(error) to clients, including any StorageError details.
+        assert sensitive_marker not in str(raised.value)
+        assert str(db_path) not in str(raised.value)
+        assert raised.value.details == {"operation": "get"}
+        assert "database was left intact" in str(raised.value)
+        assert "WAL/SHM sidecars" in str(raised.value)
         assert db_path.stat().st_ino == before.st_ino
         assert writer.get("h1") is not None
         assert reader.get("h1") is not None
