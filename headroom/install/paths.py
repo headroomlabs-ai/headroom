@@ -116,6 +116,12 @@ def claude_settings_path() -> Path:
     return Path.home() / ".claude" / "settings.json"
 
 
+def codebuddy_settings_path() -> Path:
+    """Return the CodeBuddy user settings path."""
+
+    return Path.home() / ".codebuddy" / "settings.json"
+
+
 def codex_home_dir() -> Path:
     """Return Codex's user config directory, honoring ``CODEX_HOME``.
 
