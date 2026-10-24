@@ -302,6 +302,7 @@ def test_unwrap_claude_restores_all_base_url_modes(runner: CliRunner) -> None:
             "previous": None,
             "foundry_mode": False,
             "vertex_mode": False,
+            "bedrock_mode": False,
             "settings_path": settings_path,
             # unwrap is the user asking for their settings back, so it drops
             # every wrap session's ownership claim instead of deferring to a
@@ -312,6 +313,7 @@ def test_unwrap_claude_restores_all_base_url_modes(runner: CliRunner) -> None:
             "previous": None,
             "foundry_mode": True,
             "vertex_mode": False,
+            "bedrock_mode": False,
             "settings_path": settings_path,
             "force": True,
         },
@@ -319,6 +321,15 @@ def test_unwrap_claude_restores_all_base_url_modes(runner: CliRunner) -> None:
             "previous": None,
             "foundry_mode": False,
             "vertex_mode": True,
+            "bedrock_mode": False,
+            "settings_path": settings_path,
+            "force": True,
+        },
+        {
+            "previous": None,
+            "foundry_mode": False,
+            "vertex_mode": False,
+            "bedrock_mode": True,
             "settings_path": settings_path,
             "force": True,
         },
