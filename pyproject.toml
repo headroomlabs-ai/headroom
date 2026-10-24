@@ -410,8 +410,11 @@ constraint-dependencies = [
     "lxml-html-clean>=0.4.5",
     # CVE-2026-5241 (High) — direct optional dep for proxy/ml/voice; fix at 5.5.0
     "transformers>=5.5.0",
-    # PYSEC-2026-3447 — transitive dependency; fix at 83.0.0
-    "setuptools>=83.0.0",
+    # GHSA-xmj3-9gf7-h52w — Windows wheel namespace path traversal.
+    "setuptools>=84.1.0",
+    # CVE-2026-112940/112913/112907. The patched series requires Python 3.11;
+    # Python 3.10 retains the legacy locked version; it is not remediated by this marker.
+    "filelock>=4.2.1; python_version >= '3.11'",
     # PYSEC-2026-3545/3546/3547 — transitive HTTP/WebSocket parser fixes;
     # CVE-2026-111063/111064, GHSA-2g87-pp6c-29x5; fix at 3.14.4
     "aiohttp>=3.14.4",
