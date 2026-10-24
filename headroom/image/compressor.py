@@ -36,6 +36,7 @@ if TYPE_CHECKING:
 # Import the enum from the dependency-free module so importing the compressor
 # does not eagerly import trained_router (and thus torch/transformers) — that
 # eager import crashed on Python 3.13+ (#2513).
+from .decoder_guard import pillow_is_safe
 from .image_types import ImageMemo, Technique
 
 logger = logging.getLogger(__name__)
@@ -702,7 +703,7 @@ class ImageCompressor:
         Returns:
             Messages with compressed images
         """
-        if not self.has_images(messages):
+        if not self.has_images(messages) or not pillow_is_safe():
             return messages
 
         # Step 1: Tile-boundary optimization (always safe, pure math)
