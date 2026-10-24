@@ -8,7 +8,8 @@ use std::net::SocketAddr;
 
 use axum::body::Body;
 use axum::extract::ws::{CloseFrame, Message as AxMsg, WebSocket, WebSocketUpgrade};
-use axum::http::{HeaderName, HeaderValue, Request, Response, StatusCode};
+use axum::http::{HeaderName, HeaderValue, Request, Response};
+use axum::response::IntoResponse;
 use futures_util::{SinkExt, StreamExt};
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::protocol::CloseFrame as TgCloseFrame;
@@ -32,11 +33,13 @@ pub async fn ws_handler(
         .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
 
     // Build the upstream WS URL.
+    // A rejected path (dot segments, backslash) is the client's fault and
+    // maps to 400; a bad upstream scheme is the operator's and maps to 502.
     let upstream_url = match build_upstream_ws_url(&state.config.upstream, req.uri()) {
         Ok(u) => u,
         Err(e) => {
             tracing::warn!(error = %e, "failed to build upstream ws url");
-            return (StatusCode::BAD_GATEWAY, e).into_response_body();
+            return e.into_response();
         }
     };
 
@@ -84,30 +87,25 @@ pub async fn ws_handler(
     })
 }
 
-trait IntoResponseBody {
-    fn into_response_body(self) -> Response<Body>;
-}
-impl IntoResponseBody for (StatusCode, String) {
-    fn into_response_body(self) -> Response<Body> {
-        Response::builder()
-            .status(self.0)
-            .body(Body::from(self.1))
-            .unwrap()
-    }
-}
-
-fn build_upstream_ws_url(base: &url::Url, req_uri: &http::Uri) -> Result<url::Url, String> {
+fn build_upstream_ws_url(
+    base: &url::Url,
+    req_uri: &http::Uri,
+) -> Result<url::Url, crate::ProxyError> {
     let mut joined = base.clone();
     let new_scheme = match joined.scheme() {
         "http" => "ws",
         "https" => "wss",
         "ws" | "wss" => "ws", // already WS; set_scheme is a no-op but keeps it uniform
-        other => return Err(format!("unsupported upstream scheme: {other}")),
+        other => {
+            return Err(crate::ProxyError::InvalidUpstream(format!(
+                "unsupported upstream scheme: {other}"
+            )))
+        }
     };
     joined
         .set_scheme(new_scheme)
-        .map_err(|()| "failed to set ws scheme".to_string())?;
-    Ok(join_upstream_path(&joined, req_uri.path(), req_uri.query()))
+        .map_err(|()| crate::ProxyError::InvalidUpstream("failed to set ws scheme".to_string()))?;
+    join_upstream_path(&joined, req_uri.path(), req_uri.query())
 }
 
 async fn run_ws_pump(

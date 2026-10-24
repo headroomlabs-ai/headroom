@@ -175,6 +175,45 @@ class TestEffectiveValues:
         monkeypatch.setenv("HEADROOM_SAVINGS_PROFILE", "general")
         assert settings_store.effective_values()["savings_profile"] == "general"
 
+    def test_runtime_values_override_environment(self, workspace, monkeypatch):
+        _clear_env(monkeypatch)
+        monkeypatch.setenv("HEADROOM_LOSSLESS", "0")
+
+        values = settings_store.effective_values(runtime_values={"lossless": True})
+
+        assert values["lossless"] is True
+
+    def test_schema_marks_runtime_difference_without_mislabeling_seeded_env(
+        self, workspace, monkeypatch
+    ):
+        _clear_env(monkeypatch)
+        monkeypatch.setenv("HEADROOM_MODE", "cache")
+        monkeypatch.setenv("HEADROOM_LOSSLESS", "0")
+
+        schema = settings_store.to_schema(
+            runtime_values={"mode": "token", "lossless": True},
+            env_override_exclusions={"HEADROOM_MODE", "HEADROOM_LOSSLESS"},
+        )
+        by_key = {field["key"]: field for field in schema["fields"]}
+
+        assert by_key["mode"]["value"] == "token"
+        assert by_key["mode"]["runtime_override"] is True
+        assert by_key["mode"]["env_override"] is False
+        assert by_key["lossless"]["value"] is True
+        assert by_key["lossless"]["runtime_override"] is True
+        assert by_key["lossless"]["env_override"] is False
+
+    def test_schema_keeps_explicit_environment_override(self, workspace, monkeypatch):
+        _clear_env(monkeypatch)
+        monkeypatch.setenv("HEADROOM_LOSSLESS", "1")
+
+        schema = settings_store.to_schema(runtime_values={"lossless": True})
+        lossless = next(field for field in schema["fields"] if field["key"] == "lossless")
+
+        assert lossless["value"] is True
+        assert lossless["runtime_override"] is False
+        assert lossless["env_override"] is True
+
 
 class TestSecretMasking:
     def test_schema_and_stored_mask_secret(self, workspace, monkeypatch):

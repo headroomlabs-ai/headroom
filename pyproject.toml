@@ -4,7 +4,7 @@ build-backend = "maturin"
 
 [project]
 name = "headroom-ai"
-version = "0.39.1"
+version = "0.41.0"
 description = "The Context Optimization Layer for LLM Applications - Cut costs by 50-90%"
 readme = "README.md"
 license = "Apache-2.0"
@@ -69,6 +69,15 @@ dependencies = [
     # cert store), where IT installs corporate TLS-inspection roots (Zscaler,
     # Netskope). Pure Python, no deps; the same library pip uses by default.
     "truststore>=0.10.0",
+    # Not imported directly: huggingface-hub (via litellm -> tokenizers, so in
+    # every install) uses it for Hub downloads. Before 1.6.0 its worker threads
+    # could re-initialize or re-enter Python while the interpreter shut down
+    # after a download, crashing the process at exit (SIGSEGV in
+    # Py_InitializeEx, or a fatal TstateNULL error). Declared here rather than
+    # as a uv constraint so the floor reaches the published wheel's metadata
+    # and pip upgrades an older copy. Same platform marker as huggingface-hub's
+    # own hf-xet requirement, so it never installs where hf-xet would not.
+    "hf-xet>=1.6.0; platform_machine == 'AMD64' or platform_machine == 'aarch64' or platform_machine == 'amd64' or platform_machine == 'arm64' or platform_machine == 'x86_64'",
 ]
 
 [project.optional-dependencies]
@@ -83,15 +92,17 @@ proxy = [
     "openai>=2.14.0",             # OpenAI API format support
     # The server still uses the v1 low-level Server decorator API. Keep this
     # cap until the SDK 2.x port lands (GH #2658 / regression GH #2977).
-    "mcp>=1.28.1,<2.0.0",         # MCP server (headroom_compress, retrieve, stats)
-    "magika>=0.6.0",              # ML content detection for ContentRouter
+    "mcp>=1.30.0,<2.0.0",         # MCP server (headroom_compress, retrieve, stats)
+    "magika>=0.6.0; python_version<'3.14' or sys_platform != 'darwin' or platform_machine != 'x86_64'", # ML detection needs ORT wheels
     "zstandard>=0.20.0",          # Decompress zstd request bodies (Codex, etc.)
     "websockets>=13.0",           # WebSocket proxy for /v1/responses (Codex gpt-5.4+)
-    # Rust fastembed enables ORT C API 24. ORT <1.24 deadlocks instead of
-    # returning an initialization error; 1.24+ no longer ships Python 3.10
-    # wheels, so 3.10 keeps Python-only ORT and bypasses native detection.
-    "onnxruntime>=1.24.0; python_version>='3.11'",
-    "onnxruntime>=1.16.0,<1.24.0; python_version<'3.11'",
+    # ORT <1.24 deadlocks in Rust fastembed instead of returning an init error.
+    # Python 3.10 keeps Python-only ORT and bypasses native detection. Intel
+    # macOS also needs older ORT because newer releases have no x86_64 wheels.
+    # No ORT wheel exists for Intel macOS Python 3.14+; optional ML detection
+    # falls back to heuristics there. Transitive ORT backends use the same gate.
+    "onnxruntime>=1.24.0; python_version>='3.11' and (sys_platform != 'darwin' or platform_machine != 'x86_64')",
+    "onnxruntime>=1.16.0,<1.24.0; python_version<'3.11' or (python_version<'3.14' and sys_platform == 'darwin' and platform_machine == 'x86_64')",
     "transformers>=5.5.0,<6.0",   # Tokenizer only (for Kompress)
     # File watcher for live code graph reindexing (--code-graph). watchdog 6.0.0
     # publishes no macOS wheel for Python 3.14, so installing it there needs a C
@@ -125,11 +136,11 @@ ml = [
     # makes `headroom-ai[all]` unsatisfiable on Intel Macs (#1931).
     "torch>=2.12.1; sys_platform != 'darwin' or platform_machine != 'x86_64'",
     "transformers>=5.5.0,<6.0",
-    # transformers >= 5.x requires huggingface-hub >= 1.5.0,<2.0; pinning
+    # transformers >= 5.x requires huggingface-hub >= 1.5.0,< 3.0; pinning
     # the floor here prevents Kompress from silently falling back to
     # "unavailable" when a sibling install (e.g. `pip install
     # strands-agents`) drags huggingface-hub backwards.
-    "huggingface-hub>=1.5.0,<2.0",
+    "huggingface-hub>=1.5.0,<3.0",
 ]
 # Memory system (hierarchical memory with vector search).
 # Uses the pure-Python sqlite-vec backend by default (VectorBackend.AUTO ->
@@ -161,13 +172,13 @@ pytorch-mps = [
 ]
 # Semantic relevance scoring with embeddings.
 # Uses `fastembed` (BAAI/bge-small-en-v1.5 by default — 33M params,
-# 384 dims, ~30 MB int8-quantized ONNX). Same library + model used by
-# the Rust SmartCrusher (`fastembed` crate), giving byte-equal embeddings
-# across the language boundary. Replaced sentence-transformers in
+# 384 dims, ~67 MB quantized ONNX), loaded from a pinned
+# Qdrant/bge-small-en-v1.5-onnx-Q snapshot. Replaced sentence-transformers in
 # Stage 3c.1 — fastembed is faster (~2-3x), smaller (no torch
 # dependency), and outranks all-MiniLM-L6-v2 on MTEB by ~6 points.
+# >=0.6.0 for `specific_model_path`, which the pinned-snapshot load needs.
 relevance = [
-    "fastembed>=0.4.0",
+    "fastembed>=0.6.0; python_version<'3.14' or sys_platform != 'darwin' or platform_machine != 'x86_64'",
     "numpy>=1.24.0",
 ]
 # Image compression (ML-based routing + OCR)
@@ -193,8 +204,8 @@ image = [
     # declare requires-python<3.13). Use the successor `rapidocr` 3.x
     # core + `onnxruntime` engine; same ORT backend, just split into
     # two packages. Total install size and inference speed unchanged.
-    "rapidocr>=3.0,<4; python_version>='3.13'",
-    "onnxruntime>=1.7,<2; python_version>='3.13'",
+    "rapidocr>=3.0,<4; python_version>='3.13' and (python_version<'3.14' or sys_platform != 'darwin' or platform_machine != 'x86_64')",
+    "onnxruntime>=1.7,<2; python_version>='3.13' and (python_version<'3.14' or sys_platform != 'darwin' or platform_machine != 'x86_64')",
 ]
 # Report generation
 reports = [
@@ -235,25 +246,25 @@ agno = [
 strands = [
     "strands-agents>=0.1.0",
 ]
-# CrewAI agent framework integration
-crewai = [
-    "crewai>=1.15.21",
-]
+# CrewAI: no extra on purpose. The integration only wraps CrewAI tools, so it
+# uses whatever CrewAI the user already has (`pip install headroom-ai crewai`).
+# An extra here would put CrewAI's own dependency tree (including chromadb,
+# which has unpatched server-side CVEs) into our lockfile and security alerts.
 # AutoGen agent framework integration
 autogen = [
     "autogen-agentchat>=0.7",
 ]
 # MCP server for Claude Code integration
 mcp = [
-    "mcp>=1.28.1,<2.0.0",
+    "mcp>=1.30.0,<2.0.0",
     "httpx>=0.24.0",
     "starlette>=0.27.0",
     "uvicorn>=0.23.0,<1.0",
 ]
 # Voice filler detection
 voice = [
-    "onnxruntime>=1.24.0; python_version>='3.11'",
-    "onnxruntime>=1.16.0,<1.24.0; python_version<'3.11'",
+    "onnxruntime>=1.24.0; python_version>='3.11' and (sys_platform != 'darwin' or platform_machine != 'x86_64')",
+    "onnxruntime>=1.16.0,<1.24.0; python_version<'3.11' or (python_version<'3.14' and sys_platform == 'darwin' and platform_machine == 'x86_64')",
     "transformers>=5.5.0,<6.0",
     "torch>=2.12.1; sys_platform != 'darwin' or platform_machine != 'x86_64'",
 ]
@@ -292,7 +303,7 @@ dev = [
     "pytest-cov>=4.0.0",
     "pytest-asyncio>=0.21.0",
     "jsonschema>=4.23.0,<5.0",  # Validate versioned release evidence contracts
-    "ruff==0.16.8",
+    "ruff==0.17.0",
     "mypy>=1.0.0",
     "pre-commit>=3.0.0",
     "openai>=1.0.0",
@@ -400,8 +411,9 @@ constraint-dependencies = [
     "transformers>=5.5.0",
     # PYSEC-2026-3447 — transitive dependency; fix at 83.0.0
     "setuptools>=83.0.0",
-    # PYSEC-2026-3545/3546/3547 — transitive HTTP/WebSocket parser fixes
-    "aiohttp>=3.14.3",
+    # PYSEC-2026-3545/3546/3547 — transitive HTTP/WebSocket parser fixes;
+    # CVE-2026-111063/111064, GHSA-2g87-pp6c-29x5; fix at 3.14.4
+    "aiohttp>=3.14.4",
     # PYSEC-2026-3552/3553/3554 — PKCS#7 and certificate verification fixes
     "cryptography>=50.0.0",
 ]
@@ -533,13 +545,14 @@ markers = [
     "real_llm: tests that hit real LLM APIs; skipped unless explicitly enabled",
     "live: opt-in multi-turn tests that hit real upstream APIs; require provider keys",
     "proxy_dependency_gate: exercises ensure_proxy_dependencies() without mocking",
+    "proxy_port_preflight: exercises the proxy busy-port check against real sockets",
+    "windows_newline: newline-contract tests (#3698); also run on windows-latest in CI",
 ]
 
 [tool.coverage.run]
 source = ["headroom"]
 branch = true
 omit = [
-    "headroom/cli.py",
     "*/tests/*",
 ]
 

@@ -40,8 +40,10 @@ import threading
 import time
 from collections import deque
 from contextvars import ContextVar
-from dataclasses import dataclass, field, replace
+from dataclasses import asdict, dataclass, field, replace
 from typing import TYPE_CHECKING, Any
+
+from ..log_safety import describe_exception, safe_id
 
 if TYPE_CHECKING:
     from ..memory.tracker import ComponentStats
@@ -735,6 +737,48 @@ class CompressionStore:
 
         return list(reversed(events_copy[-limit:]))
 
+    def export_entries(self, hashes: list[str]) -> list[dict[str, Any]]:
+        """The live entries for ``hashes`` as JSON-safe dicts, without counting
+        a retrieval. ``SessionTrackerStore.save_state`` carries them across a
+        restart so the markers it replays still resolve (:meth:`import_entries`)."""
+        with self._lock:
+            found = [self._backend.get(hash_key) for hash_key in hashes]
+        return [asdict(e) for e in found if e is not None and not e.is_expired()]
+
+    def import_entries(self, entries: list[CompressionEntry]) -> int:
+        """Re-store :meth:`export_entries` output, each with its original expiry.
+
+        An entry the backend still holds (a persistent backend kept it) is left
+        as it is. Raises on a malformed entry. Returns the entries stored.
+        """
+        now = time.time()
+        stored = 0
+        for e in entries:
+            if not all(
+                isinstance(v, str) for v in (e.hash, e.original_content, e.compressed_content)
+            ):
+                raise ValueError(f"malformed CCR entry {e.hash!r}")
+            ttl = int(e.created_at + e.ttl - now)
+            if ttl <= 0 or self.exists(e.hash):
+                continue
+            self.store(
+                e.original_content,
+                e.compressed_content,
+                original_tokens=e.original_tokens,
+                compressed_tokens=e.compressed_tokens,
+                original_item_count=e.original_item_count,
+                compressed_item_count=e.compressed_item_count,
+                tool_name=e.tool_name,
+                tool_call_id=e.tool_call_id,
+                query_context=e.query_context,
+                tool_signature_hash=e.tool_signature_hash,
+                compression_strategy=e.compression_strategy,
+                ttl=ttl,
+                explicit_hash=e.hash,
+            )
+            stored += 1
+        return stored
+
     def clear(self) -> None:
         """Clear all entries. Mainly for testing."""
         with self._lock:
@@ -1114,11 +1158,24 @@ def _create_default_ccr_backend() -> CompressionStoreBackend | None:
     "memory" opts back into the in-process dict. Other values load
     adapters via setuptools entry point 'headroom.ccr_backend'.
     Returns None to use InMemoryBackend.
+
+    Stateless mode (``--stateless`` / ``HEADROOM_STATELESS``) never opens the
+    SQLite file: the entries it would hold are the verbatim tool outputs that
+    stateless deployments run stateless to keep off disk. The default and an
+    explicit ``sqlite`` both fall back to the in-process store (retrieval then
+    does not survive a restart or cross workers, which is the documented
+    stateless trade-off). A named entry-point backend is still honoured — the
+    operator chose it explicitly, and it is how a stateless multi-worker
+    deployment gets a non-file (e.g. redis) store.
     """
+    from ..paths import persistence_allowed
+
     backend_type = (os.environ.get("HEADROOM_CCR_BACKEND") or "").strip().lower()
     if backend_type == "memory":
         return None
     if not backend_type or backend_type == "sqlite":
+        if not persistence_allowed("CCR retrieval store (ccr_store.db)"):
+            return None
         try:
             from .backends.sqlite import SQLiteBackend
 
@@ -1151,7 +1208,16 @@ def _create_default_ccr_backend() -> CompressionStoreBackend | None:
         backend: CompressionStoreBackend = fn(**kwargs)
         return backend
     except Exception as e:
-        logger.warning("Failed to load CCR backend %s: %s", backend_type, e)
+        # The backend's exception can echo HEADROOM_REDIS_URL (credentials included),
+        # so no level logs its message; DEBUG gets describe_exception (types and frames).
+        logger.warning(
+            "Failed to load CCR backend %s (%s); falling back to the in-process store. "
+            "Retrieval will not survive proxy restarts or cross worker processes.",
+            backend_type,
+            safe_id(e),
+        )
+        if logger.isEnabledFor(logging.DEBUG):
+            logger.debug("CCR backend %s load failure: %s", backend_type, describe_exception(e))
         return None
 
 
@@ -1195,6 +1261,22 @@ def get_compression_store(
                     backend=backend,
                 )
     return _compression_store
+
+
+def detach_compression_store() -> None:
+    """Drop the global compression store without clearing it.
+
+    The next :func:`get_compression_store` builds a fresh store from the
+    current settings. Unlike :func:`reset_compression_store`, the old store's
+    entries are left as they are: nothing is deleted from its backend, so a
+    SQLite file is neither written nor emptied. Used when the proxy switches to
+    stateless mode at runtime. The old backend is not closed, because code
+    that already holds the old store may still be using it.
+    """
+    global _compression_store
+
+    with _store_lock:
+        _compression_store = None
 
 
 def reset_compression_store() -> None:

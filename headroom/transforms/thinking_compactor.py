@@ -59,7 +59,12 @@ def bills_prior_thinking(model: str) -> bool:
     """
     nums: list[int] = []
     for part in model.lower().split("-"):
-        if part.isdigit():
+        # Version components are one or two digits (major, optional minor). Longer
+        # runs are the release-date suffix (``YYYYMMDD``) — treating it as the
+        # minor version made a major-only id like ``claude-sonnet-4-20250514``
+        # read as ``(4, 20250514) >= (4, 6)`` -> True, inverting the gate for
+        # Claude 4.0 (which strips prior thinking server-side).
+        if part.isdigit() and len(part) <= 2:
             nums.append(int(part))
         elif nums:
             break  # version digits are contiguous; stop at the family/date boundary

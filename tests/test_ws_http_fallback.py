@@ -410,7 +410,8 @@ class TestWsHttpFallback:
         body = {"model": "gpt-5.4", "input": "big context"}
         usage = asyncio.run(handler._ws_http_fallback(ws, body, json.dumps(body), {}, "req_usage"))
 
-        input_tokens, output_tokens, cache_read, _cache_write, uncached = usage
+        input_tokens, output_tokens, cache_read, _cache_write, uncached, inferred = usage
+        assert inferred is True  # no cache_write_tokens on this frame
         assert input_tokens == 31055
         assert output_tokens == 246
         assert cache_read == 20000
@@ -427,7 +428,30 @@ class TestWsHttpFallback:
                 ws, {"model": "gpt-5.4", "input": "hi"}, json.dumps({"input": "hi"}), {}, "req_none"
             )
         )
-        assert usage == (0, 0, 0, 0, 0)
+        assert usage == (0, 0, 0, 0, 0, True)
+
+    def test_fallback_returns_reported_cache_writes_as_real(self):
+        """A reported write must not come back flagged inferred: pricing drops
+        inferred writes, so the written tokens would be billed at nothing."""
+        handler = _make_handler()
+        completed = {
+            "type": "response.completed",
+            "response": {
+                "usage": {
+                    "input_tokens": 100,
+                    "output_tokens": 5,
+                    "input_tokens_details": {"cached_tokens": 75, "cache_write_tokens": 20},
+                }
+            },
+        }
+        handler.http_client = FakeHttpClient(
+            FakeStreamResponse(200, [f"data: {json.dumps(completed)}\n\n", "data: [DONE]\n\n"])
+        )
+        body = {"model": "gpt-5.4", "input": "hi"}
+        usage = asyncio.run(
+            handler._ws_http_fallback(FakeWebSocket(), body, json.dumps(body), {}, "req_w")
+        )
+        assert usage == (100, 5, 75, 20, 5, False)
 
     def test_fallback_refreshes_codex_rate_limit_state(self, monkeypatch):
         """A successful fallback refreshes Codex /stats from response headers.

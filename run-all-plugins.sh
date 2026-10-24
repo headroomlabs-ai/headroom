@@ -69,9 +69,9 @@ set -a; # shellcheck disable=SC1090
 source "$ENV_TXT"; set +a
 
 # ── 4. plugin license (Ed25519, offline, wildcard) ────────────────────────────
-# HEADROOM_LICENSE + HEADROOM_LICENSE_PUBKEY. This is SEPARATE from the OSS cloud
-# key (HEADROOM_LICENSE_KEY) — the banner will still say "OSS (no license key)",
-# but each plugin prints "license accepted". Fallback: skip verification entirely.
+# HEADROOM_LICENSE + HEADROOM_LICENSE_PUBKEY. Core and every plugin read the same
+# HEADROOM_LICENSE; the banner says "LICENSED (usage reporting off)" unless
+# HEADROOM_USAGE_REPORTING=1 is also set. Fallback: skip verification entirely.
 if [ -f "$PLUGINS_ENV" ]; then
   set -a; # shellcheck disable=SC1090
   source "$PLUGINS_ENV"; set +a

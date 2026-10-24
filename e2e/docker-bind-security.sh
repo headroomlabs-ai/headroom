@@ -116,9 +116,18 @@ docker run -d --rm --name "$base_container" --network "$network" -p "0.0.0.0:187
   -e "OPENAI_TARGET_API_URL=http://${mock_container}:8080" -e OPENAI_API_KEY=upstream-secret \
   "$base_image" >/dev/null
 docker run -d --rm --name "$head_container" --network "$network" -p "0.0.0.0:18784:8787" "$head_image" >/dev/null
+# Loopback-published container that binds 0.0.0.0 inside: the proxy cannot see
+# the host publication, so the operator acknowledges the token-less open bind.
 docker run -d --rm --name "$local_container" --network "$network" -p "127.0.0.1:18786:8787" \
+  -e HEADROOM_ALLOW_UNAUTHENTICATED_BIND=1 \
   -e "OPENAI_TARGET_API_URL=http://${mock_container}:8080" -e OPENAI_API_KEY=upstream-secret \
   "$head_image" --host 0.0.0.0 --port 8787 >/dev/null
+# Without the acknowledgement or a token, the same launch must refuse to start
+# and name both ways out.
+refused_output="$(docker run --rm --network "$network" "$head_image" --host 0.0.0.0 --port 8787 2>&1)" \
+  && { echo "token-less 0.0.0.0 bind started without acknowledgement" >&2; exit 1; }
+grep -Fq HEADROOM_PROXY_TOKEN <<<"$refused_output"
+grep -Fq HEADROOM_ALLOW_UNAUTHENTICATED_BIND <<<"$refused_output"
 docker image inspect --format '{{range .Config.Env}}{{println .}}{{end}}' "$slim_image" \
   | grep -Fxq 'HEADROOM_HOST=127.0.0.1'
 docker run --rm --entrypoint python3 "$slim_image" -c 'import headroom._core; print("rust_core=loaded")'
@@ -182,4 +191,4 @@ ws_key="$(printf '%s' 'the sample nonce' | base64 | tr -d '\n')"
 ws_status="$(docker run --rm --name "$attacker_container" --network "$network" curlimages/curl:8.12.1 --silent --output /dev/null --write-out '%{http_code}' --http1.1 -H 'Connection: Upgrade' -H 'Upgrade: websocket' -H 'Sec-WebSocket-Version: 13' -H "Sec-WebSocket-Key: ${ws_key}" "http://${host_ip}:18785/v1/live")"
 test "$ws_status" = "$ws_status_expected"
 printf 'base_ref=%s base_digest=%s head_digest=%s slim_digest=%s runtime_slim_config=loopback rust_core=loaded local_completion=200 attacker_loopback=000 ws_status=%s\n' "$base_ref" "$(docker image inspect --format='{{.Id}}' "$base_image")" "$(docker image inspect --format='{{.Id}}' "$head_image")" "$(docker image inspect --format='{{.Id}}' "$slim_image")" "$ws_status"
-echo "docker bind security: fixture forwarding, loopback isolation, built-image health, slim-image loopback config, and token controls passed"
+echo "docker bind security: fixture forwarding, loopback isolation, open-bind refusal, built-image health, slim-image loopback config, and token controls passed"

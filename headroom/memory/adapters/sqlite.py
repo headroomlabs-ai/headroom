@@ -9,17 +9,22 @@ Provides persistent storage for Memory objects with full support for:
 
 from __future__ import annotations
 
+import contextlib
 import json
 import re
 import sqlite3
+import warnings
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
+from ...fileperms import connect_private_sqlite
 from ..models import Memory, ScopeLevel, normalize_entity_refs
 from ..ports import MemoryFilter
 
 if TYPE_CHECKING:
+    from collections.abc import Iterator
+
     import numpy as np
 
 # Regex pattern for safe metadata keys: alphanumeric, underscores, hyphens only
@@ -73,15 +78,22 @@ class SQLiteMemoryStore:
         self.db_path = Path(db_path)
         self._init_db()
 
-    def _get_conn(self) -> sqlite3.Connection:
+    @contextlib.contextmanager
+    def _get_conn(self) -> Iterator[sqlite3.Connection]:
         """Get a new database connection (thread-safe pattern).
 
-        Returns:
-            A new SQLite connection with row factory configured.
+        Commits on clean exit, rolls back on exception, and always closes
+        the connection -- callers use ``with self._get_conn() as conn:``.
+        The file is created, or narrowed, owner-only before sqlite opens it:
+        it holds memory content and the user ids it belongs to.
         """
-        conn = sqlite3.connect(str(self.db_path))
+        conn = connect_private_sqlite(self.db_path, what="memory store")
         conn.row_factory = sqlite3.Row
-        return conn
+        try:
+            with conn:
+                yield conn
+        finally:
+            conn.close()
 
     def _init_db(self) -> None:
         """Initialize the database schema with indexes."""
@@ -867,9 +879,19 @@ class SQLiteMemoryStore:
     def count_sync(self) -> int:
         """Synchronous count of all memories (for diagnostics).
 
+        .. deprecated::
+            Nothing in Headroom calls this. Use the async
+            ``count(MemoryFilter(include_superseded=True))`` instead.
+
         Returns:
             Total number of memories in the store.
         """
+        warnings.warn(
+            "SQLiteMemoryStore.count_sync is deprecated and will be removed in a future "
+            "release; use the async count(MemoryFilter(include_superseded=True)) instead.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
         with self._get_conn() as conn:
             cursor = conn.execute("SELECT COUNT(*) FROM memories")
             result = cursor.fetchone()[0]

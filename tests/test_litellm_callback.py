@@ -17,23 +17,6 @@ from headroom.integrations.litellm_callback import HeadroomCallback  # noqa: E40
 
 
 class TestHeadroomCallbackCustomLoggerInheritance:
-    def test_instantiates_without_error(self) -> None:
-        cb = HeadroomCallback()
-        assert cb is not None
-
-    def test_has_async_post_call_success_hook(self) -> None:
-        """Regression: AttributeError: 'HeadroomCallback' has no attr 'async_post_call_success_hook'."""
-        cb = HeadroomCallback()
-        assert hasattr(cb, "async_post_call_success_hook"), (
-            "async_post_call_success_hook must exist (added in litellm 1.89.x)"
-        )
-
-    def test_async_post_call_success_hook_is_callable(self) -> None:
-        """LiteLLM must be able to await the hook without exception."""
-        cb = HeadroomCallback()
-        hook = cb.async_post_call_success_hook
-        assert callable(hook)
-
     def test_async_post_call_success_hook_does_not_raise(self) -> None:
         """Calling the hook (no-op from CustomLogger) must not raise."""
         cb = HeadroomCallback()
@@ -58,12 +41,6 @@ class TestHeadroomCallbackCustomLoggerInheritance:
             if name.startswith("async_") and not hasattr(cb, name)
         ]
         assert not missing, f"Missing CustomLogger hooks: {missing}"
-
-    def test_async_pre_call_hook_still_works(self) -> None:
-        """Inheritance must not break the existing compression hook."""
-        cb = HeadroomCallback()
-        assert hasattr(cb, "async_pre_call_hook")
-        assert callable(cb.async_pre_call_hook)
 
     def test_total_tokens_saved_property(self) -> None:
         cb = HeadroomCallback()

@@ -106,6 +106,40 @@ async def test_chat_template_kwargs_forwarded_streaming() -> None:
 
 
 @pytest.mark.asyncio
+async def test_streaming_chunks_report_requested_model_not_mapped_slug() -> None:
+    """Streamed chunks must carry the client's requested model, not the
+    LiteLLM-mapped provider slug (matches the non-streaming path)."""
+    import json
+
+    backend = make_backend()  # provider="openrouter"
+
+    # LiteLLM tags each chunk with the mapped model it was called with
+    # ("openrouter/qwen3"); the client asked for "qwen3".
+    stream = FakeAsyncStream(
+        [
+            SimpleNamespace(
+                model_dump=lambda **kwargs: {
+                    "id": "chunk1",
+                    "model": "openrouter/qwen3",
+                    "choices": [{"index": 0, "delta": {"content": "hi"}}],
+                }
+            ),
+        ]
+    )
+
+    with patch("headroom.backends.litellm.acompletion", new_callable=AsyncMock) as mock_acomp:
+        mock_acomp.return_value = stream
+
+        chunks = [
+            chunk async for chunk in backend.stream_openai_message(request_body(model="qwen3"), {})
+        ]
+
+    data_chunks = [c for c in chunks if c.startswith("data: ") and "[DONE]" not in c]
+    payload = json.loads(data_chunks[0][len("data: ") :])
+    assert payload["model"] == "qwen3"
+
+
+@pytest.mark.asyncio
 async def test_standard_only_body_has_no_extra_body() -> None:
     backend = make_backend()
 
@@ -225,3 +259,24 @@ async def test_reasoning_params_forwarded_top_level_streaming() -> None:
     kwargs = mock_acomp.await_args.kwargs
     assert kwargs["reasoning_effort"] == "high"
     assert "reasoning_effort" not in kwargs.get("extra_body", {})
+
+
+@pytest.mark.asyncio
+async def test_lowercase_bearer_caller_key_is_forwarded() -> None:
+    """A lowercase `authorization: bearer <key>` must still forward the key.
+
+    RFC 7235 §2.1 makes the auth-scheme token case-insensitive. A case-sensitive
+    `startswith("Bearer ")` dropped the caller credential for a lowercase scheme,
+    so litellm fell back to a (possibly absent) env key and the upstream 401'd.
+    """
+    backend = make_backend()  # provider=openrouter, not env-auth
+
+    with patch("headroom.backends.litellm.acompletion", new_callable=AsyncMock) as mock_acomp:
+        mock_acomp.return_value = make_response()
+
+        await backend.send_openai_message(
+            request_body(),
+            {"authorization": "bearer sk-caller-123"},
+        )
+
+    assert mock_acomp.await_args.kwargs.get("api_key") == "sk-caller-123"

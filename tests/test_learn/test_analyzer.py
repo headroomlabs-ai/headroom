@@ -21,7 +21,6 @@ from headroom.learn.analyzer import (
     _strip_fenced_json,
 )
 from headroom.learn.models import (
-    AnalysisResult,
     ErrorCategory,
     ProjectInfo,
     RecommendationTarget,
@@ -476,11 +475,22 @@ class TestSessionAnalyzer:
         assert result.recommendations == []
         assert result.analysis_error == "API key not set"
 
+    @pytest.mark.parametrize(
+        "error",
+        [
+            "`claude -p` failed (exit 1):\nPrompt is too long",
+            # What codex exec printed on a real learn run: it refuses a prompt over 2**20 chars.
+            "`codex exec` failed (exit 1):\nError: turn/start: turn/start failed: Input exceeds "
+            "the maximum length of 1048576 characters. (code -32602), data: "
+            '{"input_error_code":"input_too_large","max_chars":1048576,"actual_chars":1786526}',
+        ],
+        ids=["claude", "codex"],
+    )
     @patch("headroom.learn.analyzer._call_llm")
-    def test_retries_smaller_digest_on_prompt_too_long(self, mock_call_llm: MagicMock):
+    def test_retries_smaller_digest_on_prompt_too_long(self, mock_call_llm: MagicMock, error):
         """A context-overflow error rebuilds the digest at half the budget and retries."""
         mock_call_llm.side_effect = [
-            RuntimeError("`claude -p` failed (exit 1):\nPrompt is too long"),
+            RuntimeError(error),
             {"context_file_rules": [], "memory_file_rules": []},
         ]
 
@@ -626,6 +636,29 @@ class TestDetectDefaultModel:
         )
         assert _detect_default_model() == "codex-cli"
 
+    def test_cli_fallback_never_auto_detects_agy(self, monkeypatch):
+        monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+        monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+        monkeypatch.delenv("GEMINI_API_KEY", raising=False)
+        monkeypatch.delenv("HEADROOM_LEARN_CLI", raising=False)
+        monkeypatch.setenv("HEADROOM_LEARN_ALLOW_UNSAFE_AGY", "1")
+        monkeypatch.setattr(
+            "headroom.learn.analyzer.shutil.which",
+            lambda name: f"/usr/bin/{name}" if name == "agy" else None,
+        )
+        with pytest.raises(RuntimeError, match="No LLM API key found"):
+            _detect_default_model()
+
+    def test_cli_fallback_prefers_existing_clis_over_agy(self, monkeypatch):
+        monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+        monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+        monkeypatch.delenv("GEMINI_API_KEY", raising=False)
+        monkeypatch.setattr(
+            "headroom.learn.analyzer.shutil.which",
+            lambda name: f"/usr/bin/{name}" if name in ("codex", "agy") else None,
+        )
+        assert _detect_default_model() == "codex-cli"
+
     def test_api_key_preferred_over_cli(self, monkeypatch):
         monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-test")
         monkeypatch.setattr(
@@ -647,6 +680,23 @@ class TestDetectDefaultModel:
         monkeypatch.delenv("GEMINI_API_KEY", raising=False)
         monkeypatch.setenv("HEADROOM_LEARN_CLI", "codex")
         assert _detect_default_model() == "codex-cli"
+
+    def test_env_var_selects_agy_with_unsafe_opt_in(self, monkeypatch):
+        monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+        monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+        monkeypatch.delenv("GEMINI_API_KEY", raising=False)
+        monkeypatch.setenv("HEADROOM_LEARN_CLI", "agy")
+        monkeypatch.setenv("HEADROOM_LEARN_ALLOW_UNSAFE_AGY", "1")
+        assert _detect_default_model() == "agy-cli"
+
+    def test_env_var_agy_without_unsafe_opt_in_raises(self, monkeypatch):
+        monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+        monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+        monkeypatch.delenv("GEMINI_API_KEY", raising=False)
+        monkeypatch.delenv("HEADROOM_LEARN_ALLOW_UNSAFE_AGY", raising=False)
+        monkeypatch.setenv("HEADROOM_LEARN_CLI", "agy")
+        with pytest.raises(ValueError, match="HEADROOM_LEARN_ALLOW_UNSAFE_AGY=1"):
+            _detect_default_model()
 
     def test_env_var_invalid_raises(self, monkeypatch):
         monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
@@ -792,6 +842,11 @@ class TestCallCliLlm:
             "stream-json",
             "--verbose",
             "--include-partial-messages",
+            "--tools",
+            "",
+            "--strict-mcp-config",
+            "--settings",
+            '{"disableAllHooks":true}',
         ]
 
     def test_claude_cli_progress_callback_is_throttled(self):
@@ -1027,6 +1082,64 @@ class TestCallCliLlm:
         assert cmd == ["gemini", "-p"]
 
     @patch("headroom.learn.analyzer.subprocess.run")
+    def test_agy_cli_sends_stream_json_and_parses_result_event(
+        self, mock_run: MagicMock, monkeypatch
+    ):
+        monkeypatch.setenv("HEADROOM_LEARN_ALLOW_UNSAFE_AGY", "1")
+        response = '```json\n{"context_file_rules": [], "memory_file_rules": []}\n```\n'
+        mock_run.return_value = MagicMock(
+            returncode=0,
+            stdout="\n".join(
+                [
+                    '{"event": "init", "init": {"permission_mode": "default"}}',
+                    '{"event": "step_update", "step_update": {"text_delta": "{"}}',
+                    json.dumps({"event": "result", "result": {"response": response}}),
+                ]
+            ),
+            stderr="",
+        )
+        result = _call_cli_llm("test digest", "agy-cli")
+        assert result == {"context_file_rules": [], "memory_file_rules": []}
+        cmd = mock_run.call_args[0][0]
+        assert cmd == ["agy", "--input-format", "stream-json", "--output-format", "stream-json"]
+        sent = json.loads(mock_run.call_args.kwargs["input"])
+        assert sent["event"] == "user"
+        assert sent["message"]["content"].endswith("test digest")
+
+    @patch("headroom.learn.analyzer.subprocess.run")
+    def test_agy_cli_result_with_unicode_line_separator(self, mock_run: MagicMock, monkeypatch):
+        monkeypatch.setenv("HEADROOM_LEARN_ALLOW_UNSAFE_AGY", "1")
+        response = '{"context_file_rules": [], "memory_file_rules": [], "note": "a b"}'
+        mock_run.return_value = MagicMock(
+            returncode=0,
+            stdout=json.dumps(
+                {"event": "result", "result": {"response": response}}, ensure_ascii=False
+            )
+            + "\n",
+            stderr="",
+        )
+        result = _call_cli_llm("test digest", "agy-cli")
+        assert result["note"] == "a b"
+
+    @patch("headroom.learn.analyzer.subprocess.run")
+    def test_agy_cli_without_unsafe_opt_in_does_not_run(self, mock_run: MagicMock, monkeypatch):
+        monkeypatch.delenv("HEADROOM_LEARN_ALLOW_UNSAFE_AGY", raising=False)
+        with pytest.raises(ValueError, match="HEADROOM_LEARN_ALLOW_UNSAFE_AGY=1"):
+            _call_cli_llm("test digest", "agy-cli")
+        mock_run.assert_not_called()
+
+    @patch("headroom.learn.analyzer.subprocess.run")
+    def test_agy_cli_missing_result_event_raises(self, mock_run: MagicMock, monkeypatch):
+        monkeypatch.setenv("HEADROOM_LEARN_ALLOW_UNSAFE_AGY", "1")
+        mock_run.return_value = MagicMock(
+            returncode=0,
+            stdout='{"event": "init", "init": {}}\n',
+            stderr="",
+        )
+        with pytest.raises(RuntimeError, match="unparseable output"):
+            _call_cli_llm("test digest", "agy-cli")
+
+    @patch("headroom.learn.analyzer.subprocess.run")
     def test_codex_nonzero_exit_raises(self, mock_run: MagicMock):
         mock_run.return_value = MagicMock(
             returncode=1,
@@ -1058,6 +1171,50 @@ class TestCallCliLlm:
         with pytest.raises(RuntimeError) as exc_info:
             _call_cli_llm("test digest", "codex-cli")
         assert long_stderr not in str(exc_info.value)
+
+    @patch("headroom.learn.analyzer.subprocess.run")
+    def test_codex_failure_drops_prompt_echo_and_keeps_reason(self, mock_run: MagicMock):
+        # `codex exec` echoes the whole stdin prompt to stderr ahead of its own
+        # error, so a head-of-stderr excerpt is the banner plus our system prompt
+        # and never the reason. Shape captured from codex-cli 0.156.1.
+        def _codex(cmd, *, input, **kwargs):
+            stderr = (
+                "Reading prompt from stdin...\nOpenAI Codex v0.156.1\n--------\n"
+                "model: gpt-5\n--------\nuser\n" + input + "\n\n"
+            )
+            stderr += "ERROR: Reconnecting... 1/5\n" * 100
+            stderr += "ERROR: unexpected status 401 Unauthorized: Missing bearer\n"
+            return MagicMock(returncode=1, stdout="", stderr=stderr)
+
+        mock_run.side_effect = _codex
+        with pytest.raises(RuntimeError) as exc_info:
+            _call_cli_llm("SECRET-SESSION-DIGEST", "codex-cli")
+        message = str(exc_info.value)
+        assert message.endswith("ERROR: unexpected status 401 Unauthorized: Missing bearer")
+        assert "[prompt omitted]" in message
+        assert "SECRET-SESSION-DIGEST" not in message
+        assert "OpenAI Codex v0.156.1" in message
+        # Whole lines only, still inside the snippet cap.
+        assert "\nERROR: Reconnecting... 1/5\n" in message
+        assert len(message) < 2200
+
+    @patch("headroom.learn.analyzer.subprocess.run")
+    def test_codex_failure_keeps_reason_behind_a_long_banner(self, mock_run: MagicMock):
+        # Diagnostics ahead of the echo longer than the whole snippet cap must
+        # not push the CLI's final error out of the message.
+        def _codex(cmd, *, input, **kwargs):
+            stderr = "WARN startup diagnostic line\n" * 100 + input + "\n"
+            stderr += "ERROR: unknown model gpt-x\n"
+            return MagicMock(returncode=1, stdout="", stderr=stderr)
+
+        mock_run.side_effect = _codex
+        with pytest.raises(RuntimeError) as exc_info:
+            _call_cli_llm("SECRET-SESSION-DIGEST", "codex-cli")
+        message = str(exc_info.value)
+        assert message.endswith("[prompt omitted]\nERROR: unknown model gpt-x")
+        assert message.startswith("`codex exec")
+        assert "SECRET-SESSION-DIGEST" not in message
+        assert len(message) < 2200
 
     def test_unknown_cli_model_raises(self):
         with pytest.raises(ValueError, match="Unknown CLI model"):
@@ -1298,20 +1455,3 @@ class TestCallLlmRouting:
         mock_cli.return_value = {}
         _call_llm("digest", "codex-cli")
         mock_cli.assert_called_once_with("digest", "codex-cli", on_progress=None)
-
-
-# =============================================================================
-# Legacy Compatibility
-# =============================================================================
-
-
-class TestFailureAnalyzerCompat:
-    @patch("headroom.learn.analyzer._call_llm")
-    def test_legacy_alias_works(self, mock_call_llm: MagicMock):
-        from headroom.learn.analyzer import FailureAnalyzer
-
-        mock_call_llm.return_value = {"context_file_rules": [], "memory_file_rules": []}
-
-        analyzer = FailureAnalyzer()
-        result = analyzer.analyze(_project(), [])
-        assert isinstance(result, AnalysisResult)

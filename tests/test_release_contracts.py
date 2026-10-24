@@ -55,6 +55,20 @@ def test_all_schemas_are_valid_draft_2020_12(
         Draft202012Validator.check_schema(schema)
 
 
+@pytest.mark.parametrize("check", list(_example("integration-result")["checks"]))
+@pytest.mark.parametrize("status", ["fail", "inconclusive"])
+def test_passing_integration_requires_every_required_check_to_pass(
+    check: str,
+    status: str,
+    schemas: dict[str, dict[str, Any]],
+    registry: Registry,
+) -> None:
+    document = _example("integration-result")
+    document["checks"][check] = status
+    with pytest.raises(ValidationError):
+        _validator("integration-result.schema.json", schemas, registry).validate(document)
+
+
 @pytest.mark.parametrize(
     "name",
     [

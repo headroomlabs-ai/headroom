@@ -42,7 +42,14 @@ def is_dense_line(line: str) -> bool:
     if n < MIN_LINE_CHARS or "\t" in line or (line.count(" ") / n) >= MAX_SPACE_RATIO:
         return False
     stripped = line.strip()
-    return not (stripped[:1] in "{[" and stripped[-1:] in "}]")
+    if stripped[:1] in "{[" and stripped[-1:] in "}]":
+        return False
+    # A label can precede compact JSON. Eliding that line would silently
+    # rewrite its values even when the JSON record guard skipped Kompress.
+    from .recursive_json import scan_json_documents
+
+    spans, complete = scan_json_documents(line)
+    return complete and not spans
 
 
 def elide_dense_lines(text: str) -> tuple[str, int]:

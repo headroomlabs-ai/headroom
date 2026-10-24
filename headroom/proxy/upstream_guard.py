@@ -205,8 +205,11 @@ def clear_validated_addresses() -> None:
     _PIN_SCOPE.set(None)
 
 
-def _allowlisted_destinations() -> tuple[set[str], set[tuple[str, str, int]]] | None:
-    raw = os.environ.get(ALLOWED_BASE_URLS_ENV)
+def allowlisted_destinations(
+    env: str = ALLOWED_BASE_URLS_ENV,
+) -> tuple[set[str], set[tuple[str, str, int]]] | None:
+    """Parse a comma-separated host/URL list from ``env``; ``None`` when unset."""
+    raw = os.environ.get(env)
     if not raw or not raw.strip():
         return None
     hosts: set[str] = set()
@@ -233,19 +236,41 @@ def _allowlisted_destinations() -> tuple[set[str], set[tuple[str, str, int]]] | 
     return hosts, origins
 
 
-# RFC 6052 / RFC 8215: these IPv6 prefixes embed an IPv4 address in their low
-# 32 bits, and `ipaddress` reports the well-known one as globally routable. On a
-# NAT64 network `64:ff9b::7f00:1` reaches 127.0.0.1, so the embedded address is
-# what has to be judged. 6to4, Teredo and IPv4-mapped forms are already caught
-# by the `is_global` test below.
-_NAT64_PREFIXES = (
-    ipaddress.IPv6Network("64:ff9b::/96"),
-    ipaddress.IPv6Network("64:ff9b:1::/48"),
-)
+def destination_listed(
+    allow: tuple[set[str], set[tuple[str, str, int]]],
+    scheme: str,
+    host: str,
+    port: int | None,
+) -> bool:
+    """Whether a destination matches a parsed host/origin list.
+
+    A bare host admits every port for that host; a URL admits only its exact
+    origin, with the scheme's default port filled in when ``port`` is ``None``.
+    """
+    hosts, origins = allow
+    if host.lower() in hosts:
+        return True
+    scheme = scheme.lower()
+    if port is None:
+        port = 443 if scheme in {"https", "wss"} else 80
+    return (scheme, host.lower(), port) in origins
+
+
+# RFC 6052 well-known prefix. A DNS64 resolver answers a host that has only an
+# A record with `64:ff9b::<its IPv4>`, and the NAT64 translator delivers that to
+# the IPv4 address in the low 32 bits, so the embedded address is what has to
+# be judged: `64:ff9b::7f00:1` reaches 127.0.0.1. It has to be judged *before*
+# the category checks, because `ipaddress` calls the whole prefix reserved (it
+# sits in ::/8) -- judging the IPv6 form rejected every IPv4-only upstream on a
+# DNS64 network. The local-use prefix (RFC 8215, 64:ff9b:1::/48) is not
+# unwrapped: where its IPv4 bits sit depends on the operator's prefix length,
+# so it stays rejected as non-global. 6to4, Teredo and IPv4-mapped forms are
+# already caught by the `is_global` test below.
+_NAT64_WELL_KNOWN_PREFIX = ipaddress.IPv6Network("64:ff9b::/96")
 
 
 def _nat64_embedded_ipv4(addr: ipaddress.IPv6Address) -> ipaddress.IPv4Address | None:
-    if not any(addr in prefix for prefix in _NAT64_PREFIXES):
+    if addr not in _NAT64_WELL_KNOWN_PREFIX:
         return None
     try:
         return ipaddress.IPv4Address(int(addr) & 0xFFFFFFFF)
@@ -258,6 +283,10 @@ def _is_internal_address(ip: str) -> bool:
         addr = ipaddress.ip_address(ip)
     except ValueError:
         return True  # unparseable (e.g. scoped link-local) -> treat as unsafe
+    if isinstance(addr, ipaddress.IPv6Address):
+        embedded = _nat64_embedded_ipv4(addr)
+        if embedded is not None:
+            return _is_internal_address(str(embedded))
     if (
         addr.is_private
         or addr.is_loopback
@@ -275,10 +304,6 @@ def _is_internal_address(ip: str) -> bool:
     # learns about.
     if not addr.is_global:
         return True
-    if isinstance(addr, ipaddress.IPv6Address):
-        embedded = _nat64_embedded_ipv4(addr)
-        if embedded is not None and _is_internal_address(str(embedded)):
-            return True
     return False
 
 
@@ -307,18 +332,13 @@ def is_safe_upstream_url(url: str, *, scope: dict[str, UpstreamPin] | None = Non
     if not host:
         return False
 
-    allow = _allowlisted_destinations()
+    allow = allowlisted_destinations()
     if allow is not None:
-        hosts, origins = allow
-        if host.lower() in hosts:
-            return True
         try:
             port = parsed.port
         except ValueError:
-            return False
-        if port is None:
-            port = 443 if parsed.scheme.lower() in {"https", "wss"} else 80
-        return (parsed.scheme.lower(), host.lower(), port) in origins
+            port = -1  # matches no origin; a listed bare host still passes, as before
+        return destination_listed(allow, parsed.scheme, host, port)
 
     try:
         infos = _RESOLVER_POOL.submit(

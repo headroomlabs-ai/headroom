@@ -59,9 +59,8 @@ class _CapturingHandler(logging.Handler):
 def proxy_log_capture():
     """Capture ``headroom.proxy`` records.
 
-    ``_setup_file_logging`` sets ``propagate = False`` on this logger, so
-    ``caplog`` (which hangs off the root) never sees them — the same reason
-    ``tests/test_anthropic_stage_timings.py`` attaches its own handler.
+    A direct handler keeps this fixture isolated from unrelated propagation
+    mutations elsewhere in the suite.
     """
     target = logging.getLogger("headroom.proxy")
     handler = _CapturingHandler()
@@ -296,7 +295,8 @@ def test_buffered_ccr_turn_does_not_write_the_response_cache():
 
     assert resp.status_code == 200, resp.text
     # The conversion really happened — otherwise this test proves nothing.
-    assert forwarded_bodies and forwarded_bodies[0]["stream"] is False
+    # Buffered: the request streams upstream and the proxy folds the reply.
+    assert forwarded_bodies and forwarded_bodies[0]["stream"] is True
     # ...and nothing was written to the response cache.
     proxy.cache.set.assert_not_awaited()
     reset_compression_store()

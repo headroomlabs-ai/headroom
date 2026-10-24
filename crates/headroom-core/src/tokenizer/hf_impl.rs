@@ -49,6 +49,13 @@ pub enum HfTokenizerError {
         #[source]
         source: Box<dyn std::error::Error + Send + Sync>,
     },
+    /// `HEADROOM_OFFLINE` is set, so the Hub fetch was refused before any
+    /// socket was opened. Deliberately a separate variant from [`Self::Hub`]:
+    /// a caller that retries or falls back on a transient download failure
+    /// must not do either here — the operator asked for no egress, and
+    /// retrying an air-gap refusal is just a slower refusal.
+    #[error(transparent)]
+    Offline(#[from] crate::offline::OfflineEgressBlocked),
 }
 
 /// Token counter backed by a HuggingFace `tokenizer.json`.
@@ -110,11 +117,35 @@ impl HfTokenizer {
     /// processes hit the on-disk cache.
     ///
     /// Errors:
+    /// - [`HfTokenizerError::Offline`] when `HEADROOM_OFFLINE` is set. Refused
+    ///   before any socket is opened; see below.
     /// - [`HfTokenizerError::Hub`] for download failures (no network, 404,
     ///   401 on a gated model without `HF_TOKEN`).
     /// - [`HfTokenizerError::Load`] if the downloaded bytes don't parse as
     ///   a valid `tokenizer.json`. Should not happen for healthy HF repos.
     pub fn from_pretrained(repo: &str) -> Result<Self, HfTokenizerError> {
+        // Air-gap chokepoint, matching `headroom/offline.py`'s `guard_egress`.
+        // This is the Rust half of the same switch, so an operator who sets
+        // HEADROOM_OFFLINE=1 gets the same refusal whichever runtime reaches
+        // for the Hub.
+        //
+        // It has to sit here rather than around the `get` below: `Api::new`
+        // builds the `ureq` agent and resolves the endpoint, and hf-hub's own
+        // HF_HUB_OFFLINE handling only covers the cache lookup — a cache miss
+        // still dials out. Guarding first means the air-gapped case never
+        // constructs a client at all.
+        //
+        // The refusal is hard on purpose. Silently returning a cached or
+        // estimating tokenizer would leave token counts subtly wrong with no
+        // signal; the caller (`tokenizer::registry::try_register_hf`) already
+        // propagates the error so the operator sees which repo was wanted.
+        //
+        // Note it refuses even on a warm cache: `hf-hub` 0.5 exposes no
+        // cache-hit/cache-miss split at this layer, so "guard before the
+        // client exists" and "serve from the cache" cannot both hold here. An
+        // air-gapped deployment with pre-seeded artifacts should point at them
+        // with `from_file`, which is network-free by construction.
+        crate::offline::guard_egress("HuggingFace tokenizer download", repo)?;
         let api = hf_hub::api::sync::Api::new().map_err(|e| HfTokenizerError::Hub {
             repo: repo.to_string(),
             source: Box::new(e),
@@ -259,6 +290,41 @@ mod tests {
         let b = a.clone();
         assert!(Arc::ptr_eq(&a.inner, &b.inner));
     }
+
+    /// A-2: `HEADROOM_OFFLINE=1` must stop the Hub fetch before a socket exists.
+    ///
+    /// The repo name is deliberately one that cannot exist, which is what makes
+    /// this a real assertion rather than a tautology: without the guard the call
+    /// reaches `hf-hub`, dials `huggingface.co`, gets a 401/404 and returns
+    /// `HfTokenizerError::Hub`. Only the guard can produce `Offline`, and only
+    /// by returning before `Api::new` — so `Offline` *is* the "no socket was
+    /// opened" assertion for this path. (A packet-level assertion is not
+    /// available to a `cargo test` unit test the way `socket.socket` patching is
+    /// in Python; this typed-error distinction is the equivalent signal.)
+    #[test]
+    fn from_pretrained_refuses_while_offline() {
+        let _guard = crate::test_support::env_lock();
+        std::env::set_var(crate::offline::OFFLINE_ENV, "1");
+        let result = HfTokenizer::from_pretrained("headroomlabs-ai/this-repo-does-not-exist-a2");
+        std::env::remove_var(crate::offline::OFFLINE_ENV);
+
+        match result {
+            Err(HfTokenizerError::Offline(blocked)) => {
+                assert_eq!(blocked.purpose, "HuggingFace tokenizer download");
+                assert_eq!(
+                    blocked.destination,
+                    "headroomlabs-ai/this-repo-does-not-exist-a2"
+                );
+            }
+            Err(other) => panic!("expected an offline refusal, got a network error: {other}"),
+            Ok(_) => panic!("expected an offline refusal, got a tokenizer"),
+        }
+    }
+
+    // The "switch off ⇒ guard is a no-op" half is covered in `crate::offline`'s
+    // own tests rather than here: asserting it through `from_pretrained` would
+    // mean actually dialling huggingface.co, which is exactly the thing a unit
+    // test must not do.
 
     #[test]
     fn from_file_loads_a_real_file() {

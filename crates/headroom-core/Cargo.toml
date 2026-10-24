@@ -204,6 +204,10 @@ name = "tokenizer"
 harness = false
 
 [[bench]]
+name = "live_zone_dispatch"
+harness = false
+
+[[bench]]
 name = "ccr_store"
 harness = false
 

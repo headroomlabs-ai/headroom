@@ -157,6 +157,99 @@ def test_proxy_starts_in_degraded_mode_when_opt_out_set(
 
 
 # ──────────────────────────────────────────────────────────────────────────
+# 3b. Degraded mode must actually be reachable, and must mean passthrough.
+# ──────────────────────────────────────────────────────────────────────────
+def test_proxy_server_module_imports_without_rust_core() -> None:
+    """`import headroom.proxy.server` must survive an unloadable `_core`.
+
+    Regression for issue #2918. `headroom.transforms.error_detection` used
+    to do a top-level `from headroom._core import ...`, and
+    `content_router` imports it at module level, so a Windows box where
+    Smart App Control blocked the unsigned `_core.pyd` couldn't even
+    import the server — the `HEADROOM_REQUIRE_RUST_CORE=false` opt-out the
+    other tests in this file exercise was unreachable in exactly the
+    situation it exists for, and users got `ConnectionRefused` instead of
+    a degraded proxy.
+
+    This has to run in a child interpreter: the tests above deliberately
+    import the server module first and only then poison `sys.modules`, so
+    an in-process check would pass on the cached module regardless.
+    """
+    import subprocess
+    import sys
+    from pathlib import Path
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            "import sys\n"
+            "sys.modules['headroom._core'] = None\n"
+            "import headroom.proxy.server\n"
+            "print('OK')\n",
+        ],
+        capture_output=True,
+        text=True,
+        cwd=Path(__file__).resolve().parents[1],
+        timeout=300,
+    )
+    assert result.returncode == 0, (
+        "importing headroom.proxy.server without a loadable Rust core failed — "
+        "some module on the proxy import path took a hard top-level "
+        f"`from headroom._core import ...` dependency again:\n{result.stderr}"
+    )
+    assert "OK" in result.stdout
+
+
+def test_degraded_mode_forces_passthrough(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Degraded mode must turn optimization off, not just label itself.
+
+    Every compressor reaches `headroom._core` sooner or later, so a proxy
+    that starts with `rust_core: "disabled"` while `optimize` is still
+    true would answer each request with an ImportError. The point of the
+    opt-out is that the client keeps working, so the lifespan drops to the
+    same passthrough path `--no-optimize` uses.
+    """
+    from fastapi.testclient import TestClient
+
+    from headroom.proxy.server import ProxyConfig, create_app
+
+    monkeypatch.setenv("HEADROOM_REQUIRE_RUST_CORE", "false")
+
+    import sys
+
+    sys.modules.pop("headroom._core", None)
+    sys.modules["headroom._core"] = None  # type: ignore[assignment]
+
+    config = ProxyConfig(
+        optimize=True,  # the point of the test: this must be flipped off
+        image_optimize=False,
+        cache_enabled=False,
+        rate_limit_enabled=False,
+        cost_tracking_enabled=False,
+        log_requests=False,
+        ccr_inject_tool=False,
+        ccr_handle_responses=False,
+        ccr_context_tracking=False,
+    )
+    app = create_app(config)
+
+    try:
+        with TestClient(app) as client:
+            response = client.get("/health")
+            assert response.status_code == 200
+            assert response.json()["rust_core"] == "disabled"
+            assert config.optimize is False, (
+                "lifespan left optimize=True while the Rust core is unavailable — "
+                "every compressed request would raise ImportError"
+            )
+    finally:
+        sys.modules.pop("headroom._core", None)
+
+
+# ──────────────────────────────────────────────────────────────────────────
 # 4. Happy path through the helper: real extension present → status=loaded.
 # ──────────────────────────────────────────────────────────────────────────
 def test_check_rust_core_returns_loaded_when_extension_present(

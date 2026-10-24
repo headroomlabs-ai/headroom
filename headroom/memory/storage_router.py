@@ -33,6 +33,7 @@ from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
 from typing import Any
+from urllib.parse import unquote
 
 from headroom.memory.backends.local import LocalBackend, LocalBackendConfig
 
@@ -141,9 +142,8 @@ class ProjectResolver:
     """Resolve a request to a (key, display_name) project identity.
 
     Looks at request signals in priority order and returns ``None`` when
-    no signal yields a project. The router uses that ``None`` to apply
-    the configured fallback (today: ``GLOBAL`` per the user's choice in
-    the bug-fix design discussion).
+    no trusted signal yields a project. The router uses that ``None`` to
+    apply the configured fallback (fail-closed ``empty`` by default).
     """
 
     def resolve(self, ctx: RequestContext) -> tuple[str, str] | None:
@@ -173,7 +173,7 @@ class ProjectResolver:
         # Tier 2: client-provided explicit cwd (any client).
         explicit_cwd = self._first_nonempty_header(ctx.headers, "x-headroom-cwd")
         if explicit_cwd:
-            ident = self._identity_from_cwd(explicit_cwd)
+            ident = self._identity_from_cwd(explicit_cwd, percent_encoded=True)
             if ident is not None:
                 return ident
 
@@ -223,8 +223,18 @@ class ProjectResolver:
         return None
 
     @classmethod
-    def _identity_from_cwd(cls, raw_cwd: str) -> tuple[str, str] | None:
-        cwd = raw_cwd.strip()
+    def _identity_from_cwd(
+        cls, raw_cwd: str, *, percent_encoded: bool = False
+    ) -> tuple[str, str] | None:
+        # ``percent_encoded`` is set only for the ``x-headroom-cwd`` header,
+        # which the wrapper percent-encodes so non-ASCII paths stay valid HTTP
+        # values; there ``unquote`` restores the canonical path before
+        # realpath/hash computation. Every other tier (CLI override, system
+        # prompt) carries a literal filesystem path that was never encoded, so
+        # decoding it would fold genuinely distinct directories together: a
+        # real ``/work/acme%2Fapi`` would collapse onto ``/work/acme/api`` and
+        # share its store. Decode at the boundary that encodes, nowhere else.
+        cwd = unquote(raw_cwd.strip()) if percent_encoded else raw_cwd.strip()
         if not cwd:
             return None
         # Normalise so symlinked / trailing-slash variants collapse to
@@ -333,7 +343,8 @@ class BackendRouter:
                 # command).
                 logger.warning(
                     "event=memory_project_unresolved behavior=empty user_id=%s "
-                    "hint='set x-headroom-project-id or x-headroom-cwd header, "
+                    "hint='set x-headroom-project-id, x-headroom-cwd, or "
+                    "provide a cwd in the system prompt, "
                     "or set memory.unresolved_project_fallback=global to opt-in "
                     "to legacy cross-project GLOBAL pooling (cross-project leak risk).'",
                     ctx.base_user_id,

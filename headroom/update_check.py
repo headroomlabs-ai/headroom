@@ -26,7 +26,10 @@ import threading
 import time
 import urllib.request
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    import ssl
 
 logger = logging.getLogger(__name__)
 
@@ -38,17 +41,11 @@ _CACHE_FILE = "update_check.json"
 _CHECK_TTL_SECONDS = 86_400
 
 _OFF_VALUES = frozenset(("off", "false", "0", "no", "disable", "disabled"))
-_TRUE_VALUES = frozenset(("on", "true", "1", "yes", "enable", "enabled"))
 
 
 def _env_off(name: str, default: str = "on") -> bool:
     """Return True when env var ``name`` is set to a falsey/off value."""
     return os.environ.get(name, default).strip().lower() in _OFF_VALUES
-
-
-def _env_on(name: str) -> bool:
-    """Return True when env var ``name`` is set to a truthy/on value."""
-    return os.environ.get(name, "").strip().lower() in _TRUE_VALUES
 
 
 def is_update_check_enabled() -> bool:
@@ -65,7 +62,9 @@ def is_update_check_enabled() -> bool:
         return False
     if _env_off("HEADROOM_UPDATE_CHECK"):
         return False
-    if _env_on("HEADROOM_STATELESS"):
+    from headroom.paths import process_is_stateless
+
+    if process_is_stateless():
         return False
     if os.environ.get("CI", "").strip():
         return False
@@ -133,8 +132,10 @@ def read_cache() -> dict[str, Any] | None:
 def write_cache(latest_version: str, *, now: float | None = None) -> None:
     """Persist the latest-known version + check timestamp. Never raises."""
     try:
-        from headroom.paths import ensure_workspace_dir
+        from headroom.paths import ensure_workspace_dir, persistence_allowed
 
+        if not persistence_allowed("update-check cache"):
+            return
         ensure_workspace_dir()
         payload = {
             "last_check": now if now is not None else time.time(),
@@ -189,17 +190,46 @@ def _select_latest(data: dict[str, Any], *, allow_pre: bool) -> str | None:
     return None
 
 
+def _urlopen_ssl_context() -> ssl.SSLContext | None:
+    """Return an SSL context for urllib.request.urlopen that honors Headroom's
+    trust policy (OS store + certifi, HEADROOM_CA_BUNDLE, etc).
+
+    Imported lazily so this module's dependency footprint stays at stdlib +
+    packaging when the trust helpers aren't yet importable (e.g. during early
+    startup or in minimal test environments). Falls back to ``None`` (urlopen's
+    default) when the helper cannot be loaded.
+    """
+    try:
+        from headroom.proxy.ssl_context import build_urlopen_context
+    except ImportError:
+        return None
+
+    return build_urlopen_context()
+
+
 def fetch_latest_version(*, allow_pre: bool = False, timeout: float = 4.0) -> str | None:
     """Query the PyPI JSON API for the latest release. Returns None on any error.
 
     Uses ``urllib`` (stdlib) so the base CLI install needs no HTTP dependency.
+    Passes Headroom's configured SSL context so corporate TLS-inspection roots
+    (Zscaler, Netskope, ...) installed in the OS trust store — or referenced via
+    ``HEADROOM_CA_BUNDLE`` / ``SSL_CERT_FILE`` — are trusted the same way the
+    proxy trusts them.
     """
     try:
+        from headroom.offline import guard_egress
+
+        guard_egress("Headroom update check", _PYPI_JSON_URL)
         req = urllib.request.Request(
             _PYPI_JSON_URL,
             headers={"Accept": "application/json", "User-Agent": "headroom-update-check"},
         )
-        with urllib.request.urlopen(req, timeout=timeout) as resp:  # noqa: S310 — fixed https URL
+        ctx = _urlopen_ssl_context()
+        if ctx is not None:
+            resp = urllib.request.urlopen(req, timeout=timeout, context=ctx)  # noqa: S310 — fixed https URL
+        else:
+            resp = urllib.request.urlopen(req, timeout=timeout)  # noqa: S310 — fixed https URL
+        with resp:
             data = json.loads(resp.read().decode("utf-8"))
         return _select_latest(data, allow_pre=allow_pre)
     except Exception:

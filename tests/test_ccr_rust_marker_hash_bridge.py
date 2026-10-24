@@ -4,18 +4,20 @@ The Rust side embeds ``MD5(original)[:24]`` in the emitted
 ``Retrieve more: hash=...`` marker, but since PR #395
 ``CompressionStore.store()`` defaults to ``SHA-256(original)[:24]``.
 PR #395 fixed the SmartCrusher path by passing ``explicit_hash``
-(see ``test_ccr_row_drop_store_bridge.py``); the three
-``_persist_to_python_ccr`` shims on the Rust-accelerated transforms
-were never migrated, so every marker they emitted dangled —
-retrieval returned "Entry not found or expired" inside any TTL.
+(see ``test_ccr_row_drop_store_bridge.py``); the CCR write-through
+used by the Rust-accelerated transforms was never migrated, so every
+marker they emitted dangled — retrieval returned "Entry not found or
+expired" inside any TTL.
 
-These tests pin the cross-language contract at the shim layer: the
-store entry must be keyed by the exact hash the marker embeds.
+These tests pin the cross-language contract at the shared
+``persist_rust_ccr_entry`` helper: the store entry must be keyed by the
+exact hash the marker embeds.
 """
 
 from __future__ import annotations
 
 import hashlib
+import logging
 
 import pytest
 
@@ -23,11 +25,7 @@ from headroom.cache.compression_store import (
     get_compression_store,
     reset_compression_store,
 )
-from headroom.transforms.diff_compressor import DiffCompressor
-from headroom.transforms.log_compressor import LogCompressor
-from headroom.transforms.search_compressor import SearchCompressor
-
-pytest.importorskip("headroom._core", reason="Rust extension required")
+from headroom.transforms.base import persist_rust_ccr_entry
 
 
 @pytest.fixture(autouse=True)
@@ -35,6 +33,30 @@ def _fresh_store():
     reset_compression_store()
     yield
     reset_compression_store()
+
+
+@pytest.mark.parametrize("level", [logging.INFO, logging.DEBUG])
+def test_persist_warning_rejects_malformed_exception_names(monkeypatch, caplog, level) -> None:
+    from headroom.cache import compression_store
+    from headroom.transforms import base
+
+    canary = "PRIVATE_CREDENTIAL_CANARY\nFORGED_LOG_ENTRY"
+    error_type = type(canary, (RuntimeError,), {})
+
+    class BrokenStore:
+        def store(self, original, compressed, **kwargs):
+            raise error_type("untrusted backend text")
+
+    monkeypatch.delenv("HEADROOM_DEBUG_DUMP", raising=False)
+    monkeypatch.setattr(compression_store, "get_compression_store", lambda: BrokenStore())
+    with caplog.at_level(level, logger=base.logger.name):
+        assert persist_rust_ccr_entry("original", "compressed", "a" * 24, source="diff") is None
+    assert len([record for record in caplog.records if record.levelno == logging.WARNING]) == 1
+    for record in caplog.records:
+        rendered = logging.Formatter().format(record)
+        assert "PRIVATE_CREDENTIAL_CANARY" not in rendered
+        assert "FORGED_LOG_ENTRY" not in rendered
+        assert "\n" not in rendered
 
 
 def _rust_marker_key(original: str) -> str:
@@ -61,25 +83,105 @@ def _assert_round_trip(original: str) -> None:
     )
 
 
-def test_search_compressor_shim_stores_under_marker_key() -> None:
-    original = "src/app.py:12: def handle_request(payload):\n" * 40
-    SearchCompressor()._persist_to_python_ccr(
-        original, "compressed search output", _rust_marker_key(original)
+@pytest.mark.parametrize(
+    ("source", "original"),
+    [
+        ("search", "src/app.py:12: def handle_request(payload):\n" * 40),
+        ("diff", "+added line of code\n-removed line of code\n" * 40),
+        ("log", "2026-06-11T09:00:00Z INFO worker heartbeat ok seq=1\n" * 40),
+    ],
+)
+def test_persist_stores_under_marker_key(source: str, original: str) -> None:
+    persist_rust_ccr_entry(
+        original, f"compressed {source} output", _rust_marker_key(original), source=source
     )
     _assert_round_trip(original)
 
 
-def test_diff_compressor_shim_stores_under_marker_key() -> None:
-    original = "+added line of code\n-removed line of code\n" * 40
-    DiffCompressor()._persist_to_python_ccr(
-        original, "compressed diff output", _rust_marker_key(original)
-    )
-    _assert_round_trip(original)
+def test_persist_failure_logs_no_exception_text_at_any_level(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import logging
+
+    import headroom.cache.compression_store as compression_store
+    import headroom.transforms.base as base
+
+    content = "def private_source_canary_4c1e(): pass"
+    credential = "sk-test-credential-canary-91bd"
+
+    class _Store:
+        def store(self, original: str, *_args: object, **_kwargs: object) -> str:
+            try:
+                raise ValueError(f"backend rejected key {credential}")
+            except ValueError as cause:
+                raise RuntimeError(f"cannot store {original}") from cause
+
+    monkeypatch.delenv("HEADROOM_DEBUG_DUMP", raising=False)
+    monkeypatch.setattr(compression_store, "get_compression_store", lambda: _Store())
+    records: list[logging.LogRecord] = []
+
+    class _Capture(logging.Handler):
+        def emit(self, record: logging.LogRecord) -> None:
+            records.append(record)
+
+    handler = _Capture(level=logging.DEBUG)
+    base.logger.addHandler(handler)
+    monkeypatch.setattr(base.logger, "level", logging.DEBUG)
+    try:
+        persist_rust_ccr_entry(content, "comp", "a" * 24, source="diff")
+    finally:
+        base.logger.removeHandler(handler)
+
+    formatter = logging.Formatter()
+    for record in records:
+        rendered = formatter.format(record)
+        assert content not in rendered
+        assert credential not in rendered
+
+    warnings = [r for r in records if r.levelno == logging.WARNING]
+    assert len(warnings) == 1
+    assert "(diff, <RuntimeError>)" in warnings[0].getMessage()
+    assert "a" * 24 in warnings[0].getMessage()
+    details = [r for r in records if r.levelno == logging.DEBUG]
+    assert len(details) == 1
+    assert "RuntimeError" in details[0].getMessage()
+    assert "caused by ValueError" in details[0].getMessage()
 
 
-def test_log_compressor_shim_stores_under_marker_key() -> None:
-    original = "2026-06-11T09:00:00Z INFO worker heartbeat ok seq=1\n" * 40
-    LogCompressor()._persist_to_python_ccr(
-        original, "compressed log output", _rust_marker_key(original)
-    )
-    _assert_round_trip(original)
+def test_persist_warning_stays_one_line_when_full_dump_is_on(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """HEADROOM_DEBUG_DUMP=full puts the traceback in DEBUG only, never the WARNING."""
+    import headroom.cache.compression_store as compression_store
+    import headroom.transforms.base as base
+
+    class _Store:
+        def store(self, *_args: object, **_kwargs: object) -> str:
+            raise RuntimeError("cannot store original")
+
+    monkeypatch.setenv("HEADROOM_DEBUG_DUMP", "full")
+    monkeypatch.setattr(compression_store, "get_compression_store", lambda: _Store())
+    records: list[logging.LogRecord] = []
+
+    class _Capture(logging.Handler):
+        def emit(self, record: logging.LogRecord) -> None:
+            records.append(record)
+
+    handler = _Capture(level=logging.DEBUG)
+    base.logger.addHandler(handler)
+    monkeypatch.setattr(base.logger, "level", logging.DEBUG)
+    try:
+        persist_rust_ccr_entry("original", "comp", "a" * 24, source="log")
+    finally:
+        base.logger.removeHandler(handler)
+
+    warnings = [r.getMessage() for r in records if r.levelno == logging.WARNING]
+    assert len(warnings) == 1
+    assert "(log, <RuntimeError>)" in warnings[0]
+    assert "\n" not in warnings[0]
+    assert "Traceback" not in warnings[0]
+    assert "cannot store original" not in warnings[0]
+    details = [r.getMessage() for r in records if r.levelno == logging.DEBUG]
+    assert len(details) == 1
+    assert "Traceback" in details[0]
+    assert "cannot store original" in details[0]

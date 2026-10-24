@@ -35,6 +35,28 @@ pub fn extra_root_certificates() -> Vec<reqwest::Certificate> {
         .collect()
 }
 
+/// Install ring as the process-wide rustls [`CryptoProvider`].
+///
+/// This binary links two providers — ring (reqwest, tokio-tungstenite) and
+/// aws-lc-rs (the AWS SDK behind `aws-config`). rustls refuses to guess
+/// between them: `ClientConfig::builder()` panics unless a default has been
+/// installed, and reqwest reaches for that default when it builds its TLS
+/// client. Installing ring explicitly makes the choice deliberate and keeps
+/// every TLS client in the process on one provider — the same one
+/// [`websocket_tls_config`] names. Idempotent: a second call (tests, embedded
+/// use) is a no-op.
+///
+/// ring rather than aws-lc-rs because it is the provider reqwest already
+/// defaults to, needs no C toolchain or cmake at build time, and the AWS SDK
+/// carries its own explicit configuration either way.
+///
+/// [`CryptoProvider`]: rustls::crypto::CryptoProvider
+pub fn install_process_crypto_provider() {
+    // `Err` means a provider is already installed, which is exactly the
+    // state we want.
+    let _ = rustls::crypto::ring::default_provider().install_default();
+}
+
 /// rustls client config for `wss://` upstreams: webpki + OS + additive roots,
 /// on an explicit crypto provider. Built once per process.
 pub fn websocket_tls_config() -> Arc<rustls::ClientConfig> {

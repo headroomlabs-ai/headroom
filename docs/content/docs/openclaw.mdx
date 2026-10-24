@@ -1,0 +1,80 @@
+---
+title: OpenClaw
+description: Context compression plugin for OpenClaw with 70-90% token savings and optional local proxy auto-start.
+---
+
+The bundled [`plugins/openclaw`](https://github.com/headroomlabs-ai/headroom/tree/main/plugins/openclaw) plugin (`@headroom-ai/openclaw`) brings Headroom compression to [OpenClaw](https://github.com/openclaw/openclaw): tool outputs, code, logs, and structured data — 70-90% token savings with zero LLM calls.
+
+## Install
+
+Recommended one-command setup:
+
+```bash
+headroom wrap openclaw
+```
+
+Manual install:
+
+```bash
+pip install "headroom-ai[proxy]"
+openclaw plugins install --dangerously-force-unsafe-install headroom-ai/openclaw
+```
+
+> The plugin can auto-start a local `headroom proxy` when needed. Auto-start is opt-in via `autoStart` (default `false` — see [Configure](#configure)). OpenClaw treats process-launching plugins as unsafe by default, so `--dangerously-force-unsafe-install` is required even if you plan to use a remote proxy — the capability is declared at install time.
+
+## Configure
+
+Install automatically selects the `contextEngine` slot for `headroom` on current OpenClaw releases. To switch back manually, set `plugins.slots.contextEngine` to `"legacy"` or another engine id.
+
+Key options (exposed as plugin UI hints):
+
+| Option | Default | Meaning |
+|--------|---------|---------|
+| `proxyUrl` | auto-detected | Optional proxy URL (e.g. `http://127.0.0.1:8787` or remote). Probe-gated before provider routing. Remote URLs are connect-only: probed at startup, no subprocess spawned. |
+| `proxyPort` | `8787` | Default port for auto-detect/auto-start when `proxyUrl` is unset. |
+| `pythonPath` | auto-detected | Optional explicit python executable for the python fallback launcher. |
+| `autoStart` | `false` | Opt-in auto-start of a local `headroom proxy` if none is detected (local URLs only; ignored for remote proxies). Keep `false` when systemd or another supervisor owns the proxy. |
+| `startupTimeoutMs` | `20000` | Time to wait for an auto-started proxy to become healthy. |
+| `retryMaxAttempts` | unset | Max upstream retry attempts (connection/read/5xx) with an auto-started local proxy. |
+| `connectTimeoutSeconds` | unset | Upstream connection timeout for the auto-started proxy. |
+| `requestTimeoutMs` | `30000` | Max wait for one compression request; on timeout the call is cancelled and the original uncompressed messages are used as a fallback. |
+| `circuitBreakerThreshold` | `3` | Consecutive `assemble()` errors before the circuit breaker opens and all requests bypass the proxy. |
+| `circuitBreakerCooldownMs` | `60000` | How long the circuit breaker stays open; after the cooldown it resets and the next request re-probes the proxy via `/health`. |
+| `routeCodexViaProxy` | `true` | Rewrite OpenClaw's built-in `openai-codex` provider base URL to the active proxy in memory (see below). |
+| `gatewayProviderIds` | `[]` | Explicit list of OpenClaw provider ids to route through the proxy. Aliases `codex`, `claude`, `copilot`, `gemini` are accepted; when set, it overrides the default `openai-codex` routing list. |
+
+### Upstream gateway routing
+
+By default (`routeCodexViaProxy: true`) the plugin rewrites the built-in `openai-codex` provider base URL to a verified active proxy at runtime, in memory — so Codex provider traffic flows through Headroom and `/stats` can observe real upstream request and cache activity instead of only local context compression. This does not replace the proxy's own Codex routing rules (it still decides between `api.openai.com` and `chatgpt.com/backend-api/codex/responses` based on ChatGPT auth); the plugin only points the provider config at the active proxy and preserves the rest.
+
+To route additional providers through the same proxy, set `gatewayProviderIds`:
+
+```json
+{
+  "plugins": {
+    "entries": {
+      "headroom": {
+        "enabled": true,
+        "config": {
+          "gatewayProviderIds": ["openai-codex", "anthropic", "github-copilot", "google", "openrouter"]
+        }
+      }
+    }
+  }
+}
+```
+
+The rewrite is intentionally lightweight and reversible: provider `baseUrl` changes are never persisted back to `openclaw.json`, and disabling the plugin, clearing `gatewayProviderIds`, or restarting without Headroom restores normal provider resolution. Set `routeCodexViaProxy: false` to disable the default Codex routing; for durable provider rewrites use `headroom wrap openclaw` instead of relying on plugin install side effects.
+
+## Local development install
+
+When testing from the repo, build from the plugin directory so launcher detection aligns with runtime paths:
+
+```bash
+cd plugins/openclaw
+npm install
+npm run build
+openclaw plugins install --dangerously-force-unsafe-install --link .
+```
+
+The plugin checks launchers in this order: **PATH → local npm bin → global npm → python**, where "local npm bin" means `plugins/openclaw/node_modules/.bin/headroom` relative to the source checkout. `plugins/openclaw` also carries a no-op hook shim so OpenClaw's hook-pack fallback treats the path as valid instead of emitting a misleading `package.json missing openclaw.hooks` warning.

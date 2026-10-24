@@ -1,9 +1,8 @@
 """Tests for Tool Output Intelligence Network (TOIN).
 
-PR-B5 retired the request-time hint API. Tests that exercised the old
-`get_recommendation()` / `CompressionHint` shape are skipped at module
-level — the new observation-only contract is covered by
-`tests/test_toin_observation_only.py` and `tests/test_toin_publish.py`.
+PR-B5 retired the request-time hint API. The observation-only contract
+is covered by `tests/test_toin_observation_only.py` and
+`tests/test_toin_publish.py`.
 """
 
 import os
@@ -331,47 +330,6 @@ class TestToolIntelligenceNetwork:
         # Field should be in commonly_retrieved_fields after 3+ retrievals
         assert len(pattern.commonly_retrieved_fields) > 0
 
-    # PR-B5: the following tests exercised the request-time hint API
-    # that's now retired. They're skipped wholesale; the new contract
-    # ("get_recommendation always returns None and emits a deprecation
-    # warning") is covered by tests/test_toin_observation_only.py.
-
-    @pytest.mark.skip(
-        reason="PR-B5: get_recommendation retired — see test_toin_observation_only.py"
-    )
-    def test_get_recommendation_no_data(self):
-        pass
-
-    @pytest.mark.skip(
-        reason="PR-B5: get_recommendation retired — see test_toin_observation_only.py"
-    )
-    def test_get_recommendation_insufficient_samples(self):
-        pass
-
-    @pytest.mark.skip(
-        reason="PR-B5: get_recommendation retired — see test_toin_observation_only.py"
-    )
-    def test_get_recommendation_aggressive_compression(self):
-        pass
-
-    @pytest.mark.skip(
-        reason="PR-B5: get_recommendation retired — see test_toin_observation_only.py"
-    )
-    def test_get_recommendation_conservative_compression(self):
-        pass
-
-    @pytest.mark.skip(
-        reason="PR-B5: get_recommendation retired — see test_toin_observation_only.py"
-    )
-    def test_get_recommendation_skip_compression(self):
-        pass
-
-    @pytest.mark.skip(
-        reason="PR-B5: get_recommendation retired — see test_toin_observation_only.py"
-    )
-    def test_get_recommendation_disabled(self):
-        pass
-
     def test_get_stats(self):
         """get_stats returns overall statistics."""
         toin = ToolIntelligenceNetwork()
@@ -457,7 +415,8 @@ class TestTOINExportImport:
         assert len(export["patterns"]) == 1
         # PR-B5: keys are now serialized "auth|model|hash" tuples; default
         # auth/model produce the "unknown|unknown|<hash>" string.
-        assert f"unknown|unknown|{sig.structure_hash}" in export["patterns"]
+        # PR-F3: prepended with the tenant_key slot — default is "global".
+        assert f"global|unknown|unknown|{sig.structure_hash}" in export["patterns"]
 
     def test_import_patterns_new_pattern(self):
         """import_patterns adds new patterns."""
