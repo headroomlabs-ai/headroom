@@ -296,7 +296,9 @@ class TestRelationshipExtraction:
         elapsed = time.monotonic() - start
         assert elapsed < 2.0, f"extraction took {elapsed:.1f}s on one long token"
         uses_rels = [r for r in rels if r["relationship"] == "uses"]
-        assert any("Headroom" in r["source"] and r["destination"].split()[0] == "SQLite" for r in uses_rels)
+        assert any(
+            "Headroom" in r["source"] and r["destination"].split()[0] == "SQLite" for r in uses_rels
+        )
 
     def test_long_names_bind_whole(self):
         """A name longer than 64 characters binds whole, not as a 64-char slice."""
