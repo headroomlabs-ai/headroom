@@ -2,24 +2,37 @@
 
 from __future__ import annotations
 
-# SSE byte-buffer helper supports LF and CRLF event separators. Per the SSE
-# spec the default event name is "message"; we return ``None`` so callers can
-# decide whether to apply that default.
+import re
+
+# SSE byte-buffer helper supports LF, CRLF and CR line endings, mixed freely
+# (see ``find_sse_event_terminator``). Per the SSE spec the default event name
+# is "message"; we return ``None`` so callers can decide whether to apply that
+# default. ``SSE_EVENT_TERMINATORS`` lists the two common separators.
 SSE_EVENT_TERMINATORS = (b"\n\n", b"\r\n\r\n")
 SSE_EVENT_LINE_PREFIX = "event:"
 SSE_DATA_LINE_PREFIX = "data:"
 
+# An event ends at a blank line: a line ending directly followed by another.
+# The spec lets every line end in CRLF, LF or CR independently, so any pair of
+# the three is a terminator (``\n\r``, ``\r\n\r``, ``\r\r\n`` ... as well as
+# the common ``\n\n`` and ``\r\n\r\n``). A CR directly followed by LF is one
+# CRLF ending, never a CR ending plus a blank LF line.
+_SSE_BLANK_LINE_RE = re.compile(rb"(?:\r\n|\n|\r(?!\n))(?:\r\n|\n|\r)")
+
 
 def find_sse_event_terminator(buf: bytearray) -> tuple[int, int] | None:
-    """Return the earliest complete SSE event terminator in ``buf``."""
-    matches = [
-        (idx, len(terminator))
-        for terminator in SSE_EVENT_TERMINATORS
-        if (idx := buf.find(terminator)) != -1
-    ]
-    if not matches:
+    """Return ``(index, length)`` of the earliest complete event terminator.
+
+    Returns ``None`` when ``buf`` holds no blank line yet, or when the
+    earliest one ends in a CR that is the last byte of ``buf``: the next byte
+    may be the LF of a CRLF, which belongs to the same terminator.
+    """
+    match = _SSE_BLANK_LINE_RE.search(buf)
+    if match is None:
         return None
-    return min(matches, key=lambda match: match[0])
+    if match.end() == len(buf) and buf[-1:] == b"\r":
+        return None
+    return match.start(), match.end() - match.start()
 
 
 def parse_sse_events_from_byte_buffer(

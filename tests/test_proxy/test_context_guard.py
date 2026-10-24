@@ -293,6 +293,30 @@ class TestStreamUsageGuard:
         assert b"\n" not in out.replace(b"\r\n", b"")
         assert _parse_usage(out)["input_tokens"] == int(1_000_000 * REPORT_FRACTION)
 
+    def test_cr_framed_events_are_released_and_rewritten(self):
+        guard = StreamUsageGuard(believed_limit=1_000_000, effective_limit=200_000)
+        event = _message_start_event(190_000).replace(b"\n", b"\r")
+        out = guard.feed(event + b"event: ping\r")
+        # The rewritten frame keeps its CR line endings and blank line.
+        assert out.endswith(b"\r\r")
+        assert b"\n" not in out
+        assert _parse_usage(out.replace(b"\r", b"\n"))["input_tokens"] == int(
+            1_000_000 * REPORT_FRACTION
+        )
+
+    def test_armed_guard_rewrites_a_cr_framed_message_delta(self):
+        guard = StreamUsageGuard(believed_limit=200_000, effective_limit=200_000)
+        guard.feed(_message_start_event(180_000).replace(b"\n", b"\r") + b":\r")
+        delta = _message_delta_event(180_000).replace(b"\n", b"\r")
+        out = guard.feed(delta + b":\r")
+        # The rewritten frame keeps its CR blank line; the guard is then inert
+        # and releases the held ":\r" verbatim.
+        assert b"\n" not in out
+        frame, rest = out.rsplit(b"\r\r", 1)
+        assert rest == b":\r"
+        usage = json.loads(frame.split(b"data: ")[1])["usage"]
+        assert usage["input_tokens"] == int(200_000 * REPORT_FRACTION)
+
     def test_a_chunk_over_the_buffer_cap_still_gets_its_message_start_read(self):
         guard = StreamUsageGuard(believed_limit=1_000_000, effective_limit=200_000)
         filler = b"event: content_block_delta\ndata: " + b"x" * (300 * 1024) + b"\n\n"
