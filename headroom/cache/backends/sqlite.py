@@ -175,7 +175,8 @@ class SQLiteBackend:
             "CCR SQLite store is corrupt; the database was left intact. "
             "Stop all workers using this store before recovering the database "
             "and its WAL/SHM sidecars.",
-            details={"path": str(self._path), "operation": op, "error": str(error)},
+            # Details are included in str(error), which MCP returns to clients.
+            details={"operation": op},
         ) from error
 
     def _report_unreadable(self, hash_key: str, reason: object) -> None:
