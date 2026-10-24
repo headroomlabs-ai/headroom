@@ -69,7 +69,7 @@ ENV DEBIAN_FRONTEND=noninteractive \
     PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1
 
-# OpenClaw 2026.9.3 requires Node >=24.16.0 (or >=26.1.0). Install the
+# OpenClaw 2026.10.6 requires Node >=24.22.1 <25 (or >=26.12.1). Install the
 # Node 24 LTS line alongside Python 3.11. Also install git for packages
 # that clone at install time.
 RUN apt-get update && \
