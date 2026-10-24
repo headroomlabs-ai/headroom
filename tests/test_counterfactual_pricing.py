@@ -172,12 +172,13 @@ def test_untagged_writes_default_to_the_five_minute_ttl():
 
 def test_long_context_derives_the_one_hour_rate_and_says_so():
     """No catalog publishes a combined 1h + above-200k rate, so it derives."""
-    rates = resolve_rates(SONNET, long_context=True)
+    model = anthropic_pricing_model("input_cost_per_token_above_200k_tokens")
+    rates = resolve_rates(model, long_context=True)
 
     assert rates.basis == BASIS_CATALOG_TTL_RATIO
     assert rates.write_1h / rates.uncached == pytest.approx(2.00, abs=1e-6)
     # And it is the EXPENSIVE tier, not the base one.
-    assert rates.uncached > resolve_rates(SONNET).uncached
+    assert rates.uncached > resolve_rates(model).uncached
 
 
 # ── Provider agnosticism: every harness, every backend ────────────────────

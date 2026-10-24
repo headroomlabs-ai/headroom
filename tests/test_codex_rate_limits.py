@@ -368,6 +368,28 @@ class TestUsagePollGating:
         assert headers["User-Agent"] == "codex_exec/0.139.0"
         assert headers["originator"] == "codex_exec"
 
+    def test_build_headers_accepts_lowercase_bearer_scheme(self):
+        """RFC 7235 2.1: the auth scheme is case-insensitive.
+
+        A client sending `authorization: bearer <token>` must still trigger the
+        usage poll; a case-sensitive check previously returned None, so the
+        Codex rate-limit window was never refreshed for such requests.
+        """
+        headers = _build_usage_headers(
+            {
+                "authorization": "bearer abc.def.ghi",
+                "chatgpt-account-id": "acct-1",
+            }
+        )
+        assert headers is not None
+        assert headers["Authorization"] == "bearer abc.def.ghi"
+        assert headers["ChatGPT-Account-Id"] == "acct-1"
+
+    def test_build_headers_still_rejects_a_bare_scheme_or_non_bearer(self):
+        assert _build_usage_headers({"authorization": "Bearer", "chatgpt-account-id": "a"}) is None
+        assert _build_usage_headers({"authorization": "bearer ", "chatgpt-account-id": "a"}) is None
+        assert _build_usage_headers({"authorization": "sk-live", "chatgpt-account-id": "a"}) is None
+
     def test_try_begin_poll_throttles(self):
         state = CodexRateLimitState()
         assert state._try_begin_poll(60.0) is True

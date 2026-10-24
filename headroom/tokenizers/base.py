@@ -41,9 +41,14 @@ class TokenCountCache:
     characters are capped.
 
     No lock: ``dict`` get/set/clear are atomic under the GIL, and the pipeline
-    runs on a thread pool. An LRU would need ``move_to_end``, which is not
-    atomic — hence clear-on-full rather than eviction. A cleared cache costs one
-    re-encode, never a wrong answer.
+    runs on a thread pool. A true LRU would need ``move_to_end`` on every hit,
+    which is not atomic — hence no per-key eviction. A full cache still clears,
+    but only on the one put that admits a new key past the cap: repeated
+    re-counts of *known* texts (an agent loop re-counting a stable prefix on
+    every request) are pure dict hits and never trip the eviction, so the
+    classic storm — one fresh tool_result per request evicting the whole
+    cache and forcing a full-prefix re-encode — cannot happen. A cleared
+    cache costs one re-encode, never a wrong answer.
     """
 
     __slots__ = ("_chars", "_counts", "_max_chars", "_max_entries", "_min_chars")
@@ -66,7 +71,17 @@ class TokenCountCache:
         return self._counts.get(text)
 
     def put(self, text: str, count: int) -> None:
-        """Store *count* for *text* if it is worth caching."""
+        """Store *count* for *text* if it is worth caching.
+
+        A re-count of an entry already in the cache is a hit, not an
+        admission: updating the stored value cannot grow the cache, so it
+        must not run the eviction check (a dict hit would clear the whole
+        cache and force a full re-encode of every cached message on the
+        next miss — the storm this exists to prevent).
+        """
+        if text in self._counts:
+            self._counts[text] = count
+            return
         if len(text) < self._min_chars:
             return
         if len(self._counts) >= self._max_entries or self._chars >= self._max_chars:

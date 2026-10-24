@@ -48,9 +48,13 @@ import urllib.request
 import zipfile
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    import ssl
 
 from headroom._subprocess import run
+from headroom.offline import guard_egress
 
 logger = logging.getLogger(__name__)
 
@@ -263,9 +267,33 @@ def _mirror_url(url: str) -> str:
 # ---------- Download + verify --------------------------------------------- #
 
 
+def _ssl_context() -> ssl.SSLContext | None:
+    """Return Headroom's configured SSL context for urllib.request.urlopen, or
+    ``None`` (urlopen's default) when the trust helper cannot be loaded.
+
+    This ensures binary downloads from GitHub releases (and any configured
+    mirror) trust the same roots as the proxy — including corporate
+    TLS-inspection roots installed in the OS store and bundles referenced via
+    ``HEADROOM_CA_BUNDLE`` / ``SSL_CERT_FILE``. Without this, ``uv tool``
+    installs (where certifi may not yet be wired to the stdlib path) raise
+    ``CERTIFICATE_VERIFY_FAILED`` even though certifi is already a dependency.
+    """
+    try:
+        from headroom.proxy.ssl_context import build_urlopen_context
+    except ImportError:
+        return None
+
+    return build_urlopen_context()
+
+
 def _download(url: str, dest: Path, *, progress: bool = True) -> None:
     if os.environ.get("HEADROOM_BINARIES_OFFLINE"):
         raise OfflineError(f"offline mode (HEADROOM_BINARIES_OFFLINE=1) but fetch required: {url}")
+    # HEADROOM_BINARIES_OFFLINE above is the narrow, binaries-only switch; this
+    # is the deployment-wide one. An operator who set the air-gap switch should
+    # not have to also discover a second, differently-named flag to stop
+    # Headroom fetching release assets from GitHub at install time.
+    guard_egress("release binary download", url)
     if not _has_writable_existing_parent(dest.parent):
         raise OSError(f"binary cache directory parent is not writable: {dest.parent}")
     dest.parent.mkdir(parents=True, exist_ok=True)
@@ -275,10 +303,18 @@ def _download(url: str, dest: Path, *, progress: bool = True) -> None:
     if not final_url.startswith("https://"):
         raise BinaryFetchError(f"refusing non-https download URL: {final_url!r}")
     req = urllib.request.Request(final_url, headers={"User-Agent": "headroom-binaries/1"})
+    try:
+        ctx = _ssl_context()
+    except Exception as e:
+        raise BinaryFetchError(f"failed to configure TLS trust for binary download: {e}") from e
     attempts = 3
     for attempt in range(1, attempts + 1):
         try:
-            with urllib.request.urlopen(req, timeout=60) as resp:  # noqa: S310 (https)
+            if ctx is not None:
+                resp = urllib.request.urlopen(req, timeout=60, context=ctx)  # noqa: S310 (https)
+            else:
+                resp = urllib.request.urlopen(req, timeout=60)  # noqa: S310 (https)
+            with resp:
                 total = int(resp.headers.get("Content-Length") or 0)
                 _stream_to(resp, dest, total, label=dest.name, show_progress=progress)
             return

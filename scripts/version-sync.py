@@ -107,6 +107,9 @@ def update_plugin_versions(root: Path, version: str) -> None:
         root / "plugins" / "headroom-agent-hooks" / ".github" / "plugin" / "plugin.json",
         version,
     )
+    update_plugin_manifest(
+        root / "plugins" / "headroom-snip" / ".claude-plugin" / "plugin.json", version
+    )
 
 
 def update_openclaw_package_json(file_path: Path, version: str) -> None:
@@ -170,6 +173,29 @@ def write_release_metadata(root: Path, version: str) -> None:
         f.write("\n")
 
 
+def update_uv_lock_version(root: Path, version: str) -> None:
+    """Sync only the editable project's version without resolving dependencies."""
+    lock_path = root / "uv.lock"
+    if not lock_path.exists():
+        return
+    content = lock_path.read_text(encoding="utf-8")
+    packages = tomllib.loads(content).get("package", [])
+    editable = [p for p in packages if p.get("source", {}).get("editable") == "."]
+    if len(editable) != 1:
+        raise ValueError("uv.lock must contain exactly one editable root package")
+    package = editable[0]
+    if package["version"] == version:
+        return
+    pattern = (
+        rf'(?m)(^name = {re.escape(json.dumps(package["name"]))}\nversion = )"[^"\n]+"'
+        r'(?=\nsource = \{ editable = "\." \})'
+    )
+    updated, count = re.subn(pattern, lambda match: match[1] + json.dumps(version), content)
+    if count != 1:
+        raise ValueError("Cannot locate canonical editable root version in uv.lock")
+    lock_path.write_text(updated, encoding="utf-8", newline="\n")
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Synchronize version across headroom packages")
     parser.add_argument(
@@ -207,6 +233,7 @@ def main() -> None:
 
     # Update all versioned files
     update_pyproject_version(args.root, version)
+    update_uv_lock_version(args.root, version)
     update_openclaw_package_json(args.root / "plugins" / "openclaw" / "package.json", version)
     update_opencode_package_json(args.root / "plugins" / "opencode" / "package.json", version)
     update_package_json(args.root / "sdk" / "typescript" / "package.json", version)

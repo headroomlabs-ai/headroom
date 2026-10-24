@@ -24,6 +24,7 @@ from pathlib import Path
 from typing import Any
 
 from headroom import paths as _paths
+from headroom.log_safety import WarnOnce, describe_exception, safe_id
 from headroom.proxy import project_name_policy
 from headroom.proxy.persistent_metrics import PersistentMetricsState
 
@@ -265,6 +266,23 @@ def _normalize_provider(value: Any) -> str:
     return cleaned or PROVIDER_UNKNOWN
 
 
+AGENT_UNKNOWN = "unknown"
+
+
+def _normalize_agent(value: Any) -> str:
+    """Normalize a client/agent label, falling back to a stable sentinel.
+
+    The agent is the harness classified from User-Agent / X-Client
+    (claude-code, codex, opencode, grok_build, ...). Checkpoints persisted
+    before per-agent attribution existed have no agent field and collapse
+    into ``AGENT_UNKNOWN``.
+    """
+    if not isinstance(value, str):
+        return AGENT_UNKNOWN
+    cleaned = value.strip()
+    return cleaned or AGENT_UNKNOWN
+
+
 MODEL_UNKNOWN = "unknown"
 
 
@@ -338,14 +356,23 @@ def _resolve_litellm_model(model: str) -> str:
         info = litellm.model_cost.get(resolved)
         if info and info.get("input_cost_per_token") is not None:
             return resolved
-    except Exception:
-        pass
+    except Exception as exc:
+        logger.debug(
+            "Shared litellm model resolution failed for model=%s: %s",
+            safe_id(model),
+            describe_exception(exc),
+        )
 
+    # litellm raises a bare Exception for a model it has not mapped, so this is
+    # the narrowest catch that works. A miss means "not this spelling, try the
+    # provider prefixes next". Runs once per model (lru_cache above).
     try:
         litellm.cost_per_token(model=model, prompt_tokens=1, completion_tokens=0)
         return model
-    except Exception:
-        pass
+    except Exception as exc:
+        logger.debug(
+            "litellm cannot price model=%s as given: %s", safe_id(model), describe_exception(exc)
+        )
 
     prefixes = {
         "claude-": "anthropic/",
@@ -371,6 +398,25 @@ def _resolve_litellm_model(model: str) -> str:
     return model
 
 
+# An unpriced model (a local model, a gateway alias, a model newer than the
+# bundled litellm) is an expected case, and the estimators below run on every
+# request, so each model is logged once. Debug, not warning: proxy/cost.py
+# already warns once per unpriceable model on the live path. Model names come
+# from clients, so the guard is bounded like _resolve_litellm_model's cache.
+_unpriced_models_logged = WarnOnce(_MODEL_RESOLUTION_CACHE_MAXSIZE, "unpriced models")
+
+
+def _log_unpriced_model_once(model: str, field: str) -> None:
+    if not logger.isEnabledFor(logging.DEBUG):
+        return
+    if _unpriced_models_logged.first(model, logger):
+        logger.debug(
+            "No litellm %s for model=%s; savings and cost use the fallback rate",
+            field,
+            safe_id(model),
+        )
+
+
 def _estimate_compression_savings_usd(model: str, tokens_saved: int) -> float:
     """Estimate compression savings in USD from saved input tokens."""
     litellm = _get_litellm_module()
@@ -388,9 +434,15 @@ def _estimate_compression_savings_usd(model: str, tokens_saved: int) -> float:
         # a real 0.0 as unavailable and billed the $3/M fallback — phantom savings
         # for a model that costs nothing.
         if input_cost_per_token is None:
-            raise RuntimeError("input cost unavailable")
+            _log_unpriced_model_once(model, "input_cost_per_token")
+            return float(tokens_saved) * float(DEFAULT_FALLBACK_INPUT_COST_PER_TOKEN)
         return float(tokens_saved) * float(input_cost_per_token)
-    except Exception:
+    except Exception as exc:
+        logger.debug(
+            "Compression savings priced at the fallback rate for model=%s: %s",
+            safe_id(model),
+            describe_exception(exc),
+        )
         return float(tokens_saved) * float(DEFAULT_FALLBACK_INPUT_COST_PER_TOKEN)
 
 
@@ -415,9 +467,15 @@ def _estimate_output_savings_usd(model: str, tokens_saved: int) -> float:
         # rate -> phantom output savings for a model that costs nothing. Mirrors
         # the fix already applied to `_estimate_compression_savings_usd`.
         if output_cost_per_token is None:
-            raise RuntimeError("output cost unavailable")
+            _log_unpriced_model_once(model, "output_cost_per_token")
+            return float(tokens_saved) * float(DEFAULT_FALLBACK_OUTPUT_COST_PER_TOKEN)
         return float(tokens_saved) * float(output_cost_per_token)
-    except Exception:
+    except Exception as exc:
+        logger.debug(
+            "Output savings priced at the fallback rate for model=%s: %s",
+            safe_id(model),
+            describe_exception(exc),
+        )
         return float(tokens_saved) * float(DEFAULT_FALLBACK_OUTPUT_COST_PER_TOKEN)
 
 
@@ -464,7 +522,12 @@ def _estimate_cache_savings_usd(model: str, cache_read_tokens: int) -> float:
         if discount <= 0:
             return 0.0
         return float(cache_read_tokens) * discount
-    except Exception:
+    except Exception as exc:
+        logger.debug(
+            "Cache savings pricing failed for model=%s; booking 0: %s",
+            safe_id(model),
+            describe_exception(exc),
+        )
         return 0.0
 
 
@@ -611,7 +674,8 @@ def _estimate_input_cost_usd(
         # A missing key means the model is unknown → fall back to a blended rate.
         # A present 0.0 means the model is free and must cost $0, not the fallback.
         if input_cost_per_token is None:
-            raise RuntimeError("input cost unavailable")
+            _log_unpriced_model_once(model, "input_cost_per_token")
+            return float(chargeable_tokens) * float(DEFAULT_FALLBACK_INPUT_COST_PER_TOKEN)
 
         if use_breakdown:
             cache_read_cost = info.get(
@@ -629,7 +693,12 @@ def _estimate_input_cost_usd(
             )
 
         return float(total_input_tokens) * float(input_cost_per_token)
-    except Exception:
+    except Exception as exc:
+        logger.debug(
+            "Input cost priced at the fallback rate for model=%s: %s",
+            safe_id(model),
+            describe_exception(exc),
+        )
         return float(chargeable_tokens) * float(DEFAULT_FALLBACK_INPUT_COST_PER_TOKEN)
 
 
@@ -649,6 +718,7 @@ def _normalize_history_entry(entry: Any) -> dict[str, Any] | None:
     total_output_cost_usd = 0.0
     provider = PROVIDER_UNKNOWN
     model = MODEL_UNKNOWN
+    agent = AGENT_UNKNOWN
 
     if isinstance(entry, dict):
         timestamp = _parse_timestamp(entry.get("timestamp"))
@@ -668,6 +738,7 @@ def _normalize_history_entry(entry: Any) -> dict[str, Any] | None:
         total_output_cost_usd = _coerce_float(entry.get("total_output_cost_usd"))
         provider = _normalize_provider(entry.get("provider"))
         model = _normalize_model(entry.get("model"))
+        agent = _normalize_agent(entry.get("agent"))
     elif isinstance(entry, list | tuple) and len(entry) >= 2:
         timestamp = _parse_timestamp(entry[0])
         total_tokens_saved = _coerce_int(entry[1])
@@ -687,6 +758,7 @@ def _normalize_history_entry(entry: Any) -> dict[str, Any] | None:
         "timestamp": _to_utc_iso(timestamp),
         "provider": provider,
         "model": model,
+        "agent": agent,
         "total_tokens_saved": total_tokens_saved,
         "compression_savings_usd": round(compression_savings_usd, 6),
         "cache_read_tokens": cache_read_tokens,
@@ -971,6 +1043,7 @@ class SavingsTracker:
         model: str,
         tokens_saved: int,
         provider: str | None = None,
+        agent: str | None = None,
         total_input_tokens: int | None = None,
         total_input_cost_usd: float | None = None,
         timestamp: datetime | str | None = None,
@@ -1023,6 +1096,7 @@ class SavingsTracker:
                 {
                     "timestamp": _to_utc_iso(timestamp_dt),
                     "provider": _normalize_provider(provider),
+                    "agent": _normalize_agent(agent),
                     "model": _normalize_model(model),
                     "total_tokens_saved": lifetime["tokens_saved"],
                     "compression_savings_usd": lifetime["compression_savings_usd"],
@@ -1052,6 +1126,7 @@ class SavingsTracker:
         # into ``lifetime["total_output_cost_usd"]``; see the delta below.
         output_tokens: int = 0,
         provider: str | None = None,
+        agent: str | None = None,
         project: str | None = None,
         cache_read_tokens: int = 0,
         cache_write_tokens: int = 0,
@@ -1325,6 +1400,7 @@ class SavingsTracker:
                     {
                         "timestamp": _to_utc_iso(timestamp_dt),
                         "provider": _normalize_provider(provider),
+                        "agent": _normalize_agent(agent),
                         "model": _normalize_model(model),
                         "total_tokens_saved": lifetime["tokens_saved"],
                         "compression_savings_usd": lifetime["compression_savings_usd"],
@@ -2294,6 +2370,7 @@ class SavingsTracker:
                     "total_output_cost_usd": total_output_cost_usd,
                     **_empty_cache_delta(),
                     "by_provider": {},
+                    "by_agent": {},
                     "by_model": {},
                 },
             )
@@ -2368,6 +2445,39 @@ class SavingsTracker:
                 prov["total_input_tokens_delta"] += delta_input_tokens
                 prov["total_input_cost_usd_delta"] = round(
                     prov["total_input_cost_usd_delta"] + delta_input_cost_usd,
+                    6,
+                )
+
+                # Same single-owner attribution by agent. Providers cannot
+                # separate clients that share an upstream (Claude Code vs
+                # OpenCode both hit anthropic; Codex vs OpenCode both hit
+                # openai), so dashboards need this dimension for honest
+                # per-connector rows.
+                agent = _normalize_agent(point.get("agent"))
+                agent_entry = entry["by_agent"].setdefault(
+                    agent,
+                    {
+                        "tokens_saved": 0,
+                        "compression_savings_usd_delta": 0.0,
+                        "total_input_tokens_delta": 0,
+                        "total_input_cost_usd_delta": 0.0,
+                        **_empty_cache_delta(),
+                    },
+                )
+                _add_cache(
+                    agent_entry,
+                    delta_cache_read_tokens,
+                    delta_cache_savings_usd,
+                    delta_cache_read_cost_usd,
+                )
+                agent_entry["tokens_saved"] += delta_tokens
+                agent_entry["compression_savings_usd_delta"] = round(
+                    agent_entry["compression_savings_usd_delta"] + delta_usd,
+                    6,
+                )
+                agent_entry["total_input_tokens_delta"] += delta_input_tokens
+                agent_entry["total_input_cost_usd_delta"] = round(
+                    agent_entry["total_input_cost_usd_delta"] + delta_input_cost_usd,
                     6,
                 )
 

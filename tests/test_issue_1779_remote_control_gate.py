@@ -27,6 +27,7 @@ from headroom.providers.claude.runtime import (
     remote_control_applies_to_auth,
     remote_control_gate_active,
     remote_control_gate_message,
+    remote_control_gate_short_message,
     remote_control_sibling_gate_note,
 )
 
@@ -293,3 +294,22 @@ def test_sibling_note_does_not_advise_1m_already_passed() -> None:
 )
 def test_is_custom_anthropic_base_url_host_edges(value, expected) -> None:
     assert is_custom_anthropic_base_url(value) is expected
+
+
+# ---------------------------------------------------------------------------
+# Compact banner line (#3426) keeps the #1779 accuracy rule
+# ---------------------------------------------------------------------------
+
+
+def test_short_message_known_gated_version_states_fact() -> None:
+    msg = remote_control_gate_short_message(version=_GATED)
+    assert msg == (
+        "Remote Control (/rc) is disabled while routed through Headroom — run `claude` "
+        "directly (no wrap) for sessions that need it."
+    )
+
+
+def test_short_message_unknown_version_states_threshold() -> None:
+    msg = remote_control_gate_short_message(version=None)
+    assert "is disabled on Claude Code 2.1.196+ while routed through Headroom" in msg
+    assert "may" not in msg

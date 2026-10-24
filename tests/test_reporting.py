@@ -49,8 +49,9 @@ def test_reporting_public_export() -> None:
 
 def test_get_jinja2_template_success_with_stub(monkeypatch) -> None:
     class FakeTemplate:
-        def __init__(self, template_str: str) -> None:
+        def __init__(self, template_str: str, **options) -> None:
             self.template_str = template_str
+            self.options = options
 
         def render(self, **kwargs) -> str:
             return f"{self.template_str}:{kwargs['name']}"
@@ -58,6 +59,15 @@ def test_get_jinja2_template_success_with_stub(monkeypatch) -> None:
     monkeypatch.setitem(sys.modules, "jinja2", SimpleNamespace(Template=FakeTemplate))
     template = generator._get_jinja2_template("hello")
     assert template.render(name="world") == "hello:world"
+    assert template.options == {"autoescape": True}
+
+
+def test_report_template_escapes_client_supplied_fields() -> None:
+    pytest.importorskip("jinja2")
+    template = generator._get_jinja2_template("<td>{{ model }}</td>")
+    html = template.render(model="<script>alert(1)</script>")
+    assert "<script>" not in html
+    assert "&lt;script&gt;" in html
 
 
 def test_get_jinja2_template_raises_helpful_error(monkeypatch) -> None:

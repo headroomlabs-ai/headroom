@@ -4,6 +4,6 @@
     "rootDir": ".",
     "noEmit": true
   },
-  "include": ["src", "test/**/*.test-d.ts"],
+  "include": ["src", "test/**/*.test-d.ts", "test/adapters/vercel-ai.test.ts"],
   "exclude": ["node_modules", "dist"]
 }

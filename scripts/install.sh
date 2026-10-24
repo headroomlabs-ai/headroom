@@ -104,6 +104,18 @@ append_passthrough_envs() {
   done
 }
 
+# Publish the proxy on host loopback only. The container itself must bind
+# 0.0.0.0 for Docker port forwarding to reach it, and the proxy refuses a
+# token-less non-loopback bind unless the operator states that the runtime
+# already confines the port. This helper is the only place that statement is
+# made, and it is made together with the 127.0.0.1 publication it relies on,
+# so the acknowledgement can never be added without the loopback restriction.
+append_loopback_publish_args() {
+  local -n _target="$1"
+  local port="$2"
+  _target+=(-p "127.0.0.1:${port}:${port}" --env "HEADROOM_ALLOW_UNAUTHENTICATED_BIND=1")
+}
+
 append_common_container_args() {
   local -n ref=$1
 
@@ -186,7 +198,8 @@ start_proxy_container() {
 
   local container_name="headroom-proxy-${port}-$$"
   local args=()
-  args=(docker run -d --rm --name "${container_name}" -p "127.0.0.1:${port}:${port}")
+  args=(docker run -d --rm --name "${container_name}")
+  append_loopback_publish_args args "${port}"
   append_common_container_args args
   args+=("${HEADROOM_IMAGE}" --host 0.0.0.0 --port "${port}" "$@")
   "${args[@]}" >/dev/null
@@ -491,7 +504,8 @@ start_persistent_docker_install() {
 
   docker rm -f "${container_name}" >/dev/null 2>&1 || true
 
-  args=(docker run -d --restart unless-stopped --name "${container_name}" -p "127.0.0.1:${port}:${port}")
+  args=(docker run -d --restart unless-stopped --name "${container_name}")
+  append_loopback_publish_args args "${port}"
   append_persistent_container_args args
   append_dashboard_gateway_env args
   args+=(
@@ -1571,7 +1585,7 @@ EOF
       run_args=(docker run --rm)
       append_tty_args run_args
       append_common_container_args run_args
-      run_args+=(-p "127.0.0.1:${port}:${port}")
+      append_loopback_publish_args run_args "${port}"
       run_args+=(--entrypoint headroom "${HEADROOM_IMAGE}" proxy --host 0.0.0.0 --port "${port}" "${args[@]:1}")
       "${run_args[@]}"
       ;;

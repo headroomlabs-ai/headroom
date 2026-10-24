@@ -22,9 +22,8 @@
 
 mod common;
 
-use aws_credential_types::Credentials;
 use bytes::{Bytes, BytesMut};
-use common::start_proxy_with_state;
+use common::{start_proxy_with_state, test_credentials};
 use headroom_proxy::bedrock::{
     parse_eventstream, CrcValidation, EventStreamParser, HeaderValue, MessageBuilder, ParseError,
 };
@@ -35,16 +34,6 @@ use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 const TEST_MODEL: &str = "anthropic.claude-3-haiku-20240307-v1:0";
-
-fn test_credentials() -> Credentials {
-    Credentials::new(
-        "AKIAEXAMPLEAKIDFORTEST",
-        "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",
-        None,
-        None,
-        "test",
-    )
-}
 
 /// Synthesise a minimal Bedrock-shape Anthropic stream as binary
 /// EventStream bytes. The exact JSON payload mirrors what real
@@ -576,4 +565,78 @@ proptest! {
             }
         }
     }
+}
+
+/// Regression (caught in review of the first stats PR, #1057; the fix
+/// never landed with it): in SSE-translation mode, an unknown
+/// `:event-type` (`TranslateOutcome::Skip`) arriving in the same
+/// upstream chunk as known messages must not strand the known
+/// messages in the parser buffer. The pre-fix drain shape pulled a
+/// FRESH upstream chunk after a Skip, so when the Skip'd frame sat in
+/// the final chunk, every complete message buffered behind it was
+/// dropped and the client's stream ended early.
+#[tokio::test]
+async fn skip_in_final_chunk_does_not_strand_buffered_frames() {
+    // One chunk, three messages: known → unknown → known.
+    let mut buf = bytes::BytesMut::new();
+    let frame = |event_type: &str, payload: serde_json::Value| {
+        MessageBuilder::new()
+            .header_string(":event-type", event_type)
+            .header_string(":content-type", "application/json")
+            .header_string(":message-type", "event")
+            .payload(Bytes::from(serde_json::to_string(&payload).unwrap()))
+            .build()
+    };
+    buf.extend_from_slice(&frame(
+        "chunk",
+        serde_json::json!({"type": "message_start",
+            "message": {"id": "m1", "usage": {"input_tokens": 3}}}),
+    ));
+    buf.extend_from_slice(&frame(
+        "somethingNewFromAws",
+        serde_json::json!({"novel": true}),
+    ));
+    buf.extend_from_slice(&frame("chunk", serde_json::json!({"type": "message_stop"})));
+    let body = buf.freeze();
+
+    let upstream = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path(
+            "/model/anthropic.claude-3-haiku-20240307-v1:0/invoke-with-response-stream",
+        ))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "application/vnd.amazon.eventstream")
+                .set_body_raw(body.to_vec(), "application/vnd.amazon.eventstream"),
+        )
+        .mount(&upstream)
+        .await;
+    let proxy = bedrock_proxy(&upstream, |_| {}).await;
+
+    let resp = reqwest::Client::new()
+        .post(format!(
+            "{}/model/anthropic.claude-3-haiku-20240307-v1:0/invoke-with-response-stream",
+            proxy.url()
+        ))
+        .header("content-type", "application/json")
+        .header("accept", "text/event-stream")
+        .json(&serde_json::json!({
+            "anthropic_version": "bedrock-2023-05-31",
+            "max_tokens": 8,
+            "messages": [{"role": "user", "content": "hi"}]
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let text = resp.text().await.unwrap();
+    assert!(
+        text.contains("message_start"),
+        "frame before the Skip must arrive: {text}"
+    );
+    assert!(
+        text.contains("message_stop"),
+        "frame buffered BEHIND the Skip'd message must still arrive \
+         (pre-fix behaviour dropped it): {text}"
+    );
 }

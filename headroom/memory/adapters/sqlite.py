@@ -13,10 +13,12 @@ import contextlib
 import json
 import re
 import sqlite3
+import warnings
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
+from ...fileperms import connect_private_sqlite
 from ..models import Memory, ScopeLevel, normalize_entity_refs
 from ..ports import MemoryFilter
 
@@ -82,8 +84,10 @@ class SQLiteMemoryStore:
 
         Commits on clean exit, rolls back on exception, and always closes
         the connection -- callers use ``with self._get_conn() as conn:``.
+        The file is created, or narrowed, owner-only before sqlite opens it:
+        it holds memory content and the user ids it belongs to.
         """
-        conn = sqlite3.connect(str(self.db_path))
+        conn = connect_private_sqlite(self.db_path, what="memory store")
         conn.row_factory = sqlite3.Row
         try:
             with conn:
@@ -875,9 +879,19 @@ class SQLiteMemoryStore:
     def count_sync(self) -> int:
         """Synchronous count of all memories (for diagnostics).
 
+        .. deprecated::
+            Nothing in Headroom calls this. Use the async
+            ``count(MemoryFilter(include_superseded=True))`` instead.
+
         Returns:
             Total number of memories in the store.
         """
+        warnings.warn(
+            "SQLiteMemoryStore.count_sync is deprecated and will be removed in a future "
+            "release; use the async count(MemoryFilter(include_superseded=True)) instead.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
         with self._get_conn() as conn:
             cursor = conn.execute("SELECT COUNT(*) FROM memories")
             result = cursor.fetchone()[0]

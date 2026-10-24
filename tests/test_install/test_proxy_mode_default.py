@@ -65,12 +65,12 @@ def test_token_mode_is_still_reachable() -> None:
     from headroom.cli.install import deploy, install_apply
     from headroom.proxy.proxy_mode_policy import (
         PROXY_MODE_TOKEN,
-        normalize_proxy_mode_value,
+        normalize_proxy_mode_decision,
     )
 
     for command in (install_apply, deploy):
         param = next(p for p in command.params if p.name == "proxy_mode")
         assert param.type.name == "text", f"{command.name} --mode became restrictive"
 
-    assert normalize_proxy_mode_value("token") == PROXY_MODE_TOKEN
-    assert normalize_proxy_mode_value("token_headroom") == PROXY_MODE_TOKEN
+    assert normalize_proxy_mode_decision("token").normalized == PROXY_MODE_TOKEN
+    assert normalize_proxy_mode_decision("token_headroom").normalized == PROXY_MODE_TOKEN

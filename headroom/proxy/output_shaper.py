@@ -135,6 +135,18 @@ class OutputShaperSettings:
         )
 
 
+def output_holdout_fraction() -> float:
+    """Fraction of conversations held out of shaping (``HEADROOM_OUTPUT_HOLDOUT``).
+
+    Read live, like the other shaper knobs. Unset or unparseable means 0.0 (no
+    holdout); :func:`~headroom.proxy.output_savings.assign_arm` clamps the range.
+    """
+    try:
+        return float(runtime_env.getenv("HEADROOM_OUTPUT_HOLDOUT", "0") or "0")
+    except ValueError:
+        return 0.0
+
+
 def shaper_enabled_for(config: Any) -> bool | None:
     """Resolve the output-shaper gate for a proxy config.
 

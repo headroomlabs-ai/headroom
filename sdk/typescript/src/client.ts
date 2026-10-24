@@ -75,6 +75,16 @@ export interface HeadroomParams {
   headroomToolProfiles?: Record<string, Record<string, any>>;
 }
 
+/**
+ * Strip trailing "/" characters. A loop rather than a `+$` regex, which
+ * backtracks quadratically on inputs with long runs of slashes.
+ */
+function trimTrailingSlashes(value: string): string {
+  let end = value.length;
+  while (end > 0 && value.charCodeAt(end - 1) === 47) end--;
+  return value.slice(0, end);
+}
+
 // --- Sub-clients ---
 
 class ChatCompletions {
@@ -211,11 +221,9 @@ export class HeadroomClient implements HeadroomClientInterface {
   readonly messages: Messages;
 
   constructor(options: ExtendedClientOptions = {}) {
-    this.baseUrl = (
-      options.baseUrl ??
-      getEnv("HEADROOM_BASE_URL") ??
-      DEFAULT_BASE_URL
-    ).replace(/\/+$/, "");
+    this.baseUrl = trimTrailingSlashes(
+      options.baseUrl ?? getEnv("HEADROOM_BASE_URL") ?? DEFAULT_BASE_URL,
+    );
     this.apiKey = options.apiKey ?? getEnv("HEADROOM_API_KEY");
     this.timeout = options.timeout ?? DEFAULT_TIMEOUT;
     this.fallback = options.fallback ?? true;

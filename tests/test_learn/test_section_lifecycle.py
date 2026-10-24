@@ -12,8 +12,10 @@ because it asserts on writer behaviour; it drives the real, unmodified
 ``_patterns_to_recommendations`` to get there.
 """
 
+import pytest
+
 from headroom.learn.models import Recommendation, RecommendationTarget
-from headroom.learn.writer import _merge_into_file
+from headroom.learn.writer import _merge_into_file, _merge_markdown_items, _prune_carried_section
 from headroom.memory.traffic_learner import (
     ExtractedPattern,
     PatternCategory,
@@ -177,6 +179,50 @@ class TestCarriedSectionLifecycle:
 class TestTrafficLearnerCategoryLifecycle:
     """End-to-end through the real learner rendering."""
 
+    @pytest.mark.windows_newline
+    @pytest.mark.parametrize("newline", ["\n", "\r\n"], ids=["lf", "crlf"])
+    def test_saved_ids_keep_unbatched_items_and_remove_expired_items(self, tmp_path, newline):
+        context_file = tmp_path / "AGENTS.md"
+        prior = _rec(
+            "Learned: preference",
+            "- Old queue <!-- headroom:pattern-id:queue -->\n"
+            "- Prefer ripgrep <!-- headroom:pattern-id:ripgrep -->\n"
+            "- Use vendored SDK <!-- headroom:pattern-id:vendored -->",
+        )
+        prior.preserve_prior_items = True
+        context_file.write_text(
+            _merge_into_file(context_file, [prior]), encoding="utf-8", newline=newline
+        )
+
+        current = _rec("Learned: preference", "- New queue <!-- headroom:pattern-id:queue -->")
+        current.preserve_prior_items = True
+        current.active_item_ids = frozenset({"queue", "ripgrep"})
+        final = _merge_into_file(context_file, [current])
+
+        assert "New queue" in final
+        assert "Old queue" not in final
+        assert "Prefer ripgrep" in final
+        assert "Use vendored SDK" not in final
+        assert final.count("<!--") == 2  # Only the managed block delimiters stay literal.
+
+    @pytest.mark.windows_newline
+    @pytest.mark.parametrize("newline", ["\n", "\r\n"], ids=["lf", "crlf"])
+    def test_saved_ids_replace_prior_text_without_a_lifecycle_signal(self, tmp_path, newline):
+        context_file = tmp_path / "AGENTS.md"
+        prior = _rec("Learned: preference", "- Old queue <!-- headroom:pattern-id:queue -->")
+        prior.preserve_prior_items = True
+        context_file.write_text(
+            _merge_into_file(context_file, [prior]), encoding="utf-8", newline=newline
+        )
+
+        current = _rec("Learned: preference", "- New queue <!-- headroom:pattern-id:queue -->")
+        current.preserve_prior_items = True
+        final = _merge_into_file(context_file, [current])
+
+        assert "New queue" in final
+        assert "Old queue" not in final
+        assert final.count("headroom:pattern-id:queue") == 1
+
     def test_category_losing_its_last_pattern_drops_its_heading(self, tmp_path):
         """An emptied category leaves the file entirely.
 
@@ -216,3 +262,37 @@ class TestTrafficLearnerCategoryLifecycle:
         assert "User prefers terse output" in final
         assert "### Learned: architecture" not in final
         assert "Handlers live under headroom/proxy/handlers" not in final
+
+
+class TestSanitizedPatternIdHandling:
+    """The persisted form of a pattern-id comment is HTML-sanitized."""
+
+    def test_prune_decodes_sanitized_pattern_ids(self):
+        """A carried bullet whose id comment is sanitized still expires.
+
+        On disk the comment reads ``&lt;!-- ... --&gt;``; the prune path must
+        treat it as a tracked item, not as untagged content to keep forever.
+        """
+        sanitized = (
+            "- Handlers live under headroom/proxy/handlers"
+            " &lt;!-- headroom:pattern-id:abc123 --&gt;"
+        )
+
+        assert _prune_carried_section(sanitized, frozenset()) == ""
+        assert _prune_carried_section(sanitized, frozenset({"abc123"})) == sanitized
+
+    def test_merge_keeps_entity_and_literal_ampersand_bullets_distinct(self):
+        """Two live bullets differing only in ``&amp;`` vs ``&`` both survive.
+
+        The visible-text dedup key must stay on the bullet text as written:
+        decoding it before comparing would collapse suggestions that render
+        the same but are literally different advice.
+        """
+        new_content = "- Prefer `a &amp; b` in configs <!-- headroom:pattern-id:hash2 -->"
+        prior_content = "- Prefer `a & b` in configs <!-- headroom:pattern-id:hash1 -->"
+
+        merged = _merge_markdown_items(new_content, prior_content, frozenset({"hash1", "hash2"}))
+
+        assert merged is not None
+        assert "`a &amp; b`" in merged
+        assert "`a & b`" in merged
