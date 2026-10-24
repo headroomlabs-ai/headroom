@@ -1206,6 +1206,11 @@ class PrefixCacheTracker:
         # builds the manager.
         self.restored_from_disk = False
         self.restored_maturation_state: dict[str, Any] | None = None
+        # Shared-store state (headroom.cache.shared_sessions): the write token
+        # this tracker matches ("" when never shared) and the digests of the
+        # messages known to be stored with it.
+        self.shared_token = ""
+        self.shared_digests: frozenset[str] = frozenset()
 
         # Stats
         self._busts_avoided: int = 0
@@ -1509,16 +1514,20 @@ class PrefixCacheTracker:
 
     def is_expired_for_cache_ttl(self, cache_ttl_seconds: int | None) -> bool:
         """Check expiry including the longest configured or observed cache lifetime."""
+        return (time.time() - self._last_activity) > self.retention_seconds(cache_ttl_seconds)
+
+    def retention_seconds(self, cache_ttl_seconds: int | None = None) -> float:
+        """How long this tracker is kept after its last activity: the session
+        TTL, or the longest configured or observed cache lifetime plus a margin."""
         observed_ttl = max(
             self._cache_ttl_seconds or 0,
             self.config.cache_ttl_seconds or 0,
             cache_ttl_seconds or 0,
         )
-        retention = max(
+        return max(
             self.config.session_ttl_seconds,
             observed_ttl + _CACHE_TTL_CLEANUP_MARGIN_SECONDS if observed_ttl else 0,
         )
-        return (time.time() - self._last_activity) > retention
 
     def observe_cache_ttl(self, cache_ttl_seconds: int | None) -> None:
         """Remember the longest provider cache lifetime observed for this lineage."""
@@ -2144,6 +2153,14 @@ class SessionTrackerStore:
         pairs mostly repeat the same messages, so this keeps the file near one
         copy of each conversation instead of up to eleven.
         """
+        meta, table = self._tracker_parts(key, tracker, session_id)
+        return f'{{"meta":{json.dumps(meta)},"messages":[{",".join(table)}]}}'
+
+    def _tracker_parts(
+        self, key: str, tracker: PrefixCacheTracker, session_id: str | None
+    ) -> tuple[dict[str, Any], list[str]]:
+        """A tracker as its metadata, whose message lists are indexes into the
+        table, and the table: each distinct message once, as JSON."""
         index: dict[str, int] = {}
         memo: dict[int, list[int]] = {}
 
@@ -2172,7 +2189,7 @@ class SessionTrackerStore:
             "history": [[ref(snap), t] for snap, t in self._lineage_history.get(key, ())],
             "maturation": None if maturation is None else maturation.export_state(),
         }
-        return f'{{"meta":{json.dumps(meta)},"messages":[{",".join(index)}]}}'
+        return meta, list(index)
 
     def load_state(self, path: str) -> int:
         """Resume the trackers :meth:`save_state` wrote, before serving.
@@ -2213,6 +2230,58 @@ class SessionTrackerStore:
         )
         return restored
 
+    def _decode_tracker(self, entry: Any, now: float) -> PrefixCacheTracker | None:
+        """One :meth:`_encode_tracker` entry as a tracker marked restored, or
+        ``None`` when it has expired. Raises on a malformed entry."""
+        meta, table = entry["meta"], entry["messages"]
+        tracker = PrefixCacheTracker(str(meta["provider"]), self._default_config)
+        tracker._last_activity = float(meta["last_activity"])
+        tracker.observe_cache_ttl(meta["cache_ttl"])
+        # NaN or a future stamp would never expire.
+        if tracker.is_expired or not tracker._last_activity <= now:
+            return None
+        (
+            tracker._turn_number,
+            tracker._cached_token_count,
+            tracker._cached_message_count,
+            tracker._last_original_messages,
+            tracker._last_forwarded_messages,
+        ) = _decode_turn_state(table, meta["state"])
+        tracker._turn_states = {int(t): _decode_turn_state(table, s) for t, s in meta["turns"]}
+        tracker.restored_from_disk = True
+        if meta["maturation"] is not None:
+            from headroom.transforms.read_maturation import ReadMaturationManager
+
+            tracker.restored_maturation_state = ReadMaturationManager.validate_state(
+                meta["maturation"]
+            )
+        return tracker
+
+    def encode_shared(
+        self, key: str, tracker: PrefixCacheTracker
+    ) -> tuple[dict[str, Any], list[str]]:
+        """``tracker`` for another process (headroom.cache.shared_sessions): its
+        metadata and its message table, each distinct message once, as JSON.
+        Raises when its messages are not JSON."""
+        return self._tracker_parts(key, tracker, None)
+
+    def decode_shared(self, meta: Any, messages: list[Any]) -> PrefixCacheTracker | None:
+        """The tracker :meth:`encode_shared` described, marked restored so its
+        next turn seeds the compression cache from it; ``None`` when it has
+        expired. Raises on malformed input. Does not install it."""
+        if not isinstance(meta, dict):
+            raise ValueError("tracker metadata is not an object")
+        now = time.time()
+        # Written on another host: a clock ahead of ours is not a future stamp.
+        meta = {**meta, "last_activity": min(float(meta["last_activity"]), now)}
+        return self._decode_tracker({"meta": meta, "messages": messages}, now)
+
+    def install(self, key: str, tracker: PrefixCacheTracker) -> None:
+        """Make ``tracker`` the one under ``key``. Call on the event loop, or
+        from a worker thread only for a key already present (replacing a value
+        does not resize the dict the loop may be iterating)."""
+        self._trackers[key] = tracker
+
     def _decode_state(self, data: Any) -> int:
         """Validate the whole file first, then install it; a bad file installs nothing."""
         from headroom.cache.compression_store import CompressionEntry, get_compression_store
@@ -2228,27 +2297,9 @@ class SessionTrackerStore:
         # Oldest first, so each family keeps its lineages in creation order.
         for entry in reversed(data["trackers"]):
             meta, table = entry["meta"], entry["messages"]
-            tracker = PrefixCacheTracker(str(meta["provider"]), self._default_config)
-            tracker._last_activity = float(meta["last_activity"])
-            tracker.observe_cache_ttl(meta["cache_ttl"])
-            # NaN or a future stamp would never expire.
-            if tracker.is_expired or not tracker._last_activity <= now:
+            tracker = self._decode_tracker(entry, now)
+            if tracker is None:
                 continue
-            (
-                tracker._turn_number,
-                tracker._cached_token_count,
-                tracker._cached_message_count,
-                tracker._last_original_messages,
-                tracker._last_forwarded_messages,
-            ) = _decode_turn_state(table, meta["state"])
-            tracker._turn_states = {int(t): _decode_turn_state(table, s) for t, s in meta["turns"]}
-            tracker.restored_from_disk = True
-            if meta["maturation"] is not None:
-                from headroom.transforms.read_maturation import ReadMaturationManager
-
-                tracker.restored_maturation_state = ReadMaturationManager.validate_state(
-                    meta["maturation"]
-                )
             key = str(meta["key"])
             trackers[key] = tracker
             history = deque(
