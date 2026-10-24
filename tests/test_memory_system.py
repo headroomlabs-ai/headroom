@@ -1174,13 +1174,14 @@ class TestMemorySystem:
         assert len(backend.calls) == 1, "field support must be decided before the call, not by retrying"
 
     @pytest.mark.asyncio
-    async def test_handle_memory_save_internal_type_error_is_not_replayed(self):
-        """A TypeError raised inside the backend after it wrote must not re-save.
+    async def test_handle_memory_save_internal_unexpected_kwarg_is_not_replayed(self):
+        """An internal 'unexpected keyword argument' TypeError after the write must not re-save.
 
-        A backend that accepts ``**kwargs`` can persist the record and then
-        raise a plain ``TypeError`` from an internal hook with exactly the
-        'unexpected keyword argument' text. The save must not be replayed: that
-        would produce a duplicate record.
+        A backend that accepts ``**kwargs`` can persist the record and then call
+        a zero-argument post-write hook with a keyword — Python raises exactly
+        ``TypeError: ... unexpected keyword argument ...``, the same text a
+        binding failure produces. The save must not be replayed: that would
+        produce a duplicate record (review finding on the PR).
         """
 
         class PostWriteHookBackend:
@@ -1192,7 +1193,12 @@ class TestMemorySystem:
             async def save_memory(self, content: str, user_id: str, **kwargs: Any) -> Memory:
                 self.writes.append(content)
                 if kwargs.get("facts") is not None:
-                    raise TypeError("post_write_hook() got an unexpected keyword argument 'record'")
+                    # Zero-argument hook called with a keyword: the normal
+                    # Python-generated binding TypeError, raised after the write.
+                    def post_write_hook() -> None:  # pragma: no cover - never runs
+                        ...
+
+                    post_write_hook(unexpected=True)  # type: ignore[call-arg]
                 return Memory(content=content, user_id=user_id)
 
             async def search_memories(self, *args: Any, **kwargs: Any) -> list[Memory]:
@@ -1209,7 +1215,7 @@ class TestMemorySystem:
 
         backend = PostWriteHookBackend()
         system = MemorySystem(backend, user_id="alice")  # type: ignore[arg-type]
-        with pytest.raises(TypeError):
+        with pytest.raises(TypeError, match="unexpected keyword argument"):
             await system.handle_memory_save(
                 content="Summary",
                 importance=0.5,
