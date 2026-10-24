@@ -415,17 +415,28 @@ describe("HeadroomContextEngine transcriptSemantics contract", () => {
     20_000,
   );
 
-  it("persists the accepted messages together with the advancement key", async () => {
+  it("records only the advancement key, so the store doesn't grow with the turn's size", async () => {
+    // Regression: every accepted turn's messages used to be kept forever in one
+    // file that was rewritten on each commit. OpenClaw's transcript already holds
+    // them, and this engine never reads them back.
     const engine = new HeadroomContextEngine({ commitLogPath });
-    const messages = [{ role: "user", content: "hello" }];
+    const toolOutput = "x".repeat(1_000_000);
 
     await expect(
-      engine.commitTurn({ advancementKey: "turn-1", messages }),
+      engine.commitTurn({
+        advancementKey: "turn-1",
+        messages: [{ role: "toolResult", content: [{ type: "text", text: toolOutput }] }],
+      }),
     ).resolves.toEqual({ status: "committed" });
 
-    const raw = await fs.readFile(commitLogPath, "utf8");
-    const entries = JSON.parse(raw) as Record<string, { messages: unknown }>;
-    expect(entries["turn-1"].messages).toEqual(messages);
+    let storedBytes = 0;
+    for (const entry of await fs.readdir(commitLogDir, { recursive: true, withFileTypes: true })) {
+      if (entry.isFile()) {
+        storedBytes += (await fs.stat(path.join(entry.parentPath, entry.name))).size;
+      }
+    }
+    expect(storedBytes).toBeGreaterThan(0);
+    expect(storedBytes).toBeLessThan(1_000);
   });
 });
 
