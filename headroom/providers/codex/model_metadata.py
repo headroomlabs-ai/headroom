@@ -270,29 +270,6 @@ async def fetch_chatgpt_codex_model_entries(
         return None
 
 
-async def fetch_chatgpt_codex_model_ids(
-    http_client: CodexModelRegistryHttpClient,
-    headers: Mapping[str, str],
-    requested_client_version: str | None,
-    options: CodexModelRegistryOptions = CodexModelRegistryOptions(),
-) -> tuple[str, ...] | None:
-    """Fetch Codex model slugs from ChatGPT, returning None when fallback should apply."""
-    model_entries = await fetch_chatgpt_codex_model_entries(
-        http_client,
-        headers,
-        requested_client_version,
-        options,
-    )
-    if model_entries is None:
-        return None
-    return tuple(
-        slug
-        for entry in model_entries
-        for slug in (entry.get("slug"),)
-        if isinstance(slug, str) and slug
-    )
-
-
 async def fetch_chatgpt_codex_models_response(
     http_client: CodexModelRegistryHttpClient,
     headers: Mapping[str, str],

@@ -401,6 +401,7 @@ headroom proxy --learn --min-evidence 3
 | `HEADROOM_THINKING_COMPACT` | Compact plain-text reasoning that models re-send every turn (Kimi/GLM/DeepSeek `reasoning_content` / inline `<think>`): Kompress it on warm turns, drop it on cold turns. No-op for Claude/Codex/OpenAI (encrypted reasoning). See [Cold-prefix hook](#cold-prefix-hook--reasoning-compaction). | `off` |
 | `HEADROOM_THINKING_COMPACT_KEEP_LAST` | Most-recent assistant turns whose reasoning is left intact (the active reasoning the model still uses). Only applies with `HEADROOM_THINKING_COMPACT`. | `1` |
 | `HEADROOM_COLD_RECOMPACT` | On a confirmed-cold turn (idle past the real cache TTL), recompact the whole prefix — cross-turn dedupe + superseded-read drop + lossless folds — instead of forwarding a byte-identical prefix to a dead cache. Warm turns unchanged. Pair with `HEADROOM_DEDUPE`. See [Cold-prefix hook](#cold-prefix-hook--reasoning-compaction). | `off` |
+| `HEADROOM_PREFIX_STATE_FILE` | Path where the proxy saves its prefix-cache trackers on a graceful shutdown and restores them on the next start (then deletes the file), so warm conversations replay the exact prefix the provider cached instead of re-writing it. The file holds conversation content: it is written `0600`, capped at the 256 newest conversations and 64 MB, and only trackers still inside their cache lifetime are restored, with the retrieval (CCR) entries their markers point at, so those markers resolve even with `HEADROOM_CCR_BACKEND=memory`. Not supported with multiple workers; ignored in stateless mode (neither read nor written). | -- |
 | `HEADROOM_DEDUPE` | Whole-conversation verbatim cross-turn dedup in the router (cache-safe, information-preserving via retrieval markers). Superseded-read drop + lossless folds run without it; this adds verbatim dedup. | `off` |
 | `HEADROOM_CACHE_TTL_LEARN` | Append per-turn cache-outcome observations (provider, model, idle, hit/miss) to `cache_ttl_observations.jsonl` for the offline `headroom-cache-ttl` learner. Observation-only (no request-behavior change); respects `HEADROOM_STATELESS`; the log is size-bounded. | `off` |
 | `HEADROOM_KOMPRESS_ENDPOINT` / `HEADROOM_KOMPRESS_ENDPOINT_TOKEN` | Offload ML compression (Kompress) to a remote endpoint instead of the local ONNX model — used by reasoning compaction and the router when set. | -- |
@@ -480,6 +481,7 @@ Enable it with `HEADROOM_MODEL_ROUTER_ENABLED=1` and declare ordered rules in `H
 | `to_model` | string (required) | Model to route to when the rule matches. |
 | `max_input_tokens` | integer | Match only when the estimated input size is at or below this. |
 | `min_input_tokens` | integer | Match only when the estimated input size is at or above this. |
+| `max_output_tokens` | integer | Match only when the request's own `max_tokens` is at or below this. A request without `max_tokens` does not match. |
 | `require_no_tools` | boolean | Match only when the request declares no tools (a proxy for low-risk work). |
 | `from_models` | list of strings | Restrict the rule to these source models. Omit for any source model. |
 | `name` | string | Label surfaced in the decision log. |
@@ -494,6 +496,7 @@ export HEADROOM_MODEL_ROUTES='[
 
 Notes:
 
+- Combine `max_input_tokens` with `max_output_tokens` to downshift only turns that are cheap on both sides: a tiny prompt that asks for a long answer (a large `max_tokens`) stays on the original model.
 - Input size is a fast, tokenizer-free estimate over the messages, tools, and top-level `system` prompt, meant for tier selection rather than exact accounting.
 - A malformed rule fails open: it is skipped (never silently widened), and the rest of the rules still apply.
 - Routing is skipped for byte-faithful passthrough requests (`x-headroom-bypass: true` or `x-headroom-mode: passthrough`), so those are never model-rewritten.

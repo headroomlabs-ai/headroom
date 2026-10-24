@@ -29,7 +29,9 @@ class ContentSection:
 
 
 _CODE_FENCE_PATTERN = re.compile(r"^```(\w*)\s*$", re.MULTILINE)
-_JSON_BLOCK_START = re.compile(r"^\s*[\[{]", re.MULTILINE)
+# ``[^\S\n]*``, not ``\s*``: under MULTILINE, ``^\s*`` rescans every
+# following blank line from each line start (quadratic in a blank run).
+_JSON_BLOCK_START = re.compile(r"^[^\S\n]*[\[{]", re.MULTILINE)
 _SEARCH_RESULT_PATTERN = re.compile(r"^\S+:\d+:", re.MULTILINE)
 _PROSE_PATTERN = re.compile(r"[A-Z][a-z]+\s+\w+\s+\w+")
 

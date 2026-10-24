@@ -5,7 +5,7 @@ from __future__ import annotations
 import logging
 import os
 from collections.abc import MutableMapping
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 from typing import Protocol
 
 logger = logging.getLogger(__name__)
@@ -336,8 +336,9 @@ def proxy_pipeline_kwargs(config: object) -> dict[str, object]:
         if profile.min_chars_for_block is not None:
             kwargs["min_chars_for_block_compression"] = profile.min_chars_for_block
 
-    if getattr(config, "compress_user_messages", False):
-        kwargs["compress_user_messages"] = True
+    compress_user_messages = getattr(config, "compress_user_messages", None)
+    if compress_user_messages is not None:
+        kwargs["compress_user_messages"] = bool(compress_user_messages)
 
     compress_system_messages = getattr(config, "compress_system_messages", None)
     if compress_system_messages is not None:
@@ -407,18 +408,3 @@ def seed_proxy_env_defaults(
     # already in the env and otherwise falls back to DEFAULT_PROFILE (coding).
     apply_agent_savings_env_defaults(target)
     return frozenset(key for key in target if key not in before)
-
-
-def with_target_savings(
-    profile: AgentSavingsProfile,
-    target_savings: float,
-) -> AgentSavingsProfile:
-    """Return a copy of ``profile`` adjusted to a specific savings target."""
-
-    if not 0 < target_savings < 1:
-        raise ValueError("target_savings must be between 0 and 1")
-    return replace(
-        profile,
-        target_savings=target_savings,
-        target_ratio=round(1 - target_savings, 4),
-    )

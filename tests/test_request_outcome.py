@@ -307,6 +307,9 @@ async def test_funnel_passes_canonical_record_tokens_shape() -> None:
         # it here is what lets the dashboard's per-model table count the layer
         # its own headline counts. Zero for this outcome (no deferral tags).
         "tool_schema_saved": 0,
+        # Whether the positional tokens_sent is the provider's billed count.
+        # This outcome carries no provider_input_tokens, so it is an estimate.
+        "provider_reported": False,
     }
 
 

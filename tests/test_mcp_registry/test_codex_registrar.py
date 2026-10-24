@@ -524,3 +524,23 @@ def test_refuses_span_rewrite_that_would_change_other_entries(
     assert reg.unregister_server("headroom") is False
     assert reg.register_server(_spec(), force=True).status == RegisterStatus.FAILED
     assert cfg.read_text() == before
+
+
+def test_register_escapes_control_chars_in_env_value(tmp_path: Path) -> None:
+    """A newline in an env value must be escaped so the block stays valid TOML.
+
+    TOML basic strings forbid literal control characters other than tab, so a
+    multi-line value (e.g. a PEM key in an env var) rendered with only ``\\``
+    and ``"`` escaping produced unparseable TOML. The write guard then rejected
+    the whole registration with a misleading "file does not parse" error.
+    """
+    reg = _make_registrar(tmp_path)
+    pem = "-----BEGIN KEY-----\nabc\n-----END KEY-----"
+
+    result = reg.register_server(_spec(env={"PEM": pem}), force=True)
+
+    assert result.status == RegisterStatus.REGISTERED
+    # The rendered config parses and round-trips the value verbatim.
+    parsed = tomllib.loads(_config_path(tmp_path).read_text())
+    assert parsed["mcp_servers"]["headroom"]["env"]["PEM"] == pem
+    assert reg.get_server("headroom").env["PEM"] == pem

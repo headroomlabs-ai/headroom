@@ -268,6 +268,37 @@ class TestDetectWasteSignals:
         assert signals.base64_tokens == 0
         assert signals.json_bloat_tokens == 0
 
+    def test_html_comment_counted_once(self, mock_tokenizer):
+        """A comment matches both HTML_TAG_PATTERN and HTML_COMMENT_PATTERN;
+        it must contribute its token count once, not twice."""
+        comment = "<!--" + "x" * 600 + "-->"
+        text = "before " + comment + " after"
+        signals = detect_waste_signals(text, mock_tokenizer)
+        assert signals.html_noise_tokens == (len(comment) // 4 + 1)
+
+    def test_tags_inside_comments_not_counted(self, mock_tokenizer):
+        """Tags inside a comment are part of the comment, not extra noise."""
+        comment = '<!-- <img src="diagram.png" alt="chart"> -->'
+        text = "text " + comment + " end"
+        signals = detect_waste_signals(text, mock_tokenizer)
+        assert signals.html_noise_tokens == (len(comment) // 4 + 1)
+
+    def test_mixed_tags_and_comments_counted_once_each(self, mock_tokenizer):
+        """Plain tags and comments each contribute exactly once."""
+        tag_open = '<div class="a">'
+        tag_close = "</div>"
+        comment = "<!-- note -->"
+        text = tag_open + "content" + tag_close + comment + tag_open + "more" + tag_close
+        signals = detect_waste_signals(text, mock_tokenizer)
+        expected = 2 * len(tag_open) + 2 * len(tag_close) + len(comment)
+        assert signals.html_noise_tokens == (expected // 4 + 1)
+
+    def test_plain_tags_unchanged(self, mock_tokenizer):
+        """Regular tags keep their existing count when no comments are present."""
+        text = "<div>Hello</div>"
+        signals = detect_waste_signals(text, mock_tokenizer)
+        assert signals.html_noise_tokens == (len("<div>") + len("</div>")) // 4 + 1
+
 
 # --- TestIsRagContent ---
 
@@ -458,6 +489,7 @@ class TestStreamingToolCallObjects:
         assert tool_call_blocks[0].flags.get("function_name") == "dummy_tool"
         assert "dummy_tool" in tool_call_blocks[0].text
 
+    @pytest.mark.filterwarnings("ignore:find_tool_units is deprecated:DeprecationWarning")
     def test_find_tool_units_with_sdk_tool_call(self):
         """The second `.get()` site: find_tool_units must still pair an
         SDK-object tool_call with its tool response message."""
@@ -644,6 +676,7 @@ class TestRereadDetection:
 # --- TestFindToolUnits ---
 
 
+@pytest.mark.filterwarnings("ignore:find_tool_units is deprecated:DeprecationWarning")
 class TestFindToolUnits:
     """Tests for find_tool_units function."""
 
@@ -833,6 +866,7 @@ class TestFindToolUnits:
 # --- TestGetMessageContentText ---
 
 
+@pytest.mark.filterwarnings("ignore:get_message_content_text is deprecated:DeprecationWarning")
 class TestGetMessageContentText:
     """Tests for get_message_content_text function."""
 
@@ -898,6 +932,16 @@ class TestGetMessageContentText:
         msg = {"role": "user", "content": []}
         text = get_message_content_text(msg)
         assert text == ""
+
+
+def test_find_tool_units_is_deprecated() -> None:
+    with pytest.warns(DeprecationWarning, match="find_tool_units is deprecated"):
+        assert find_tool_units([]) == []
+
+
+def test_get_message_content_text_is_deprecated() -> None:
+    with pytest.warns(DeprecationWarning, match="get_message_content_text is deprecated"):
+        assert get_message_content_text({"content": "hi"}) == "hi"
 
 
 # --- Additional fixtures for complex tests ---
