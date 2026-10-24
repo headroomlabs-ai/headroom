@@ -74,6 +74,7 @@ if TYPE_CHECKING:
 import httpx
 
 from headroom.agent_savings import proxy_pipeline_kwargs
+from headroom.ccr.marker import CCR_HEX_ID_INNER
 from headroom.ccr.marker_resolution import resolve_markers_in_response
 from headroom.ccr.tool_calls import has_ccr_retrieve_tool
 from headroom.config import is_tool_excluded, unwrap_tool_call_name
@@ -148,9 +149,11 @@ _CODEX_WS_COMPRESSION_TIMEOUT_SECONDS = 5.0
 # are not this path's business and come from ProxyConfig.
 _WS_HTTP_FALLBACK_READ_TIMEOUT_SECONDS = 120.0
 _CCR_HASH_RE = re.compile(
-    r"(?:Retrieve (?:more|original): hash=|<<ccr:)([a-fA-F0-9]{12,24})(?=[^a-fA-F0-9]|$)"
+    rf"(?:Retrieve (?:more|original): hash=|<<ccr:)({CCR_HEX_ID_INNER})(?=[^a-f0-9]|$)"
+    rf"|\[ccr:({CCR_HEX_ID_INNER})\]",
+    re.IGNORECASE,
 )
-_BARE_CCR_HASH_RE = re.compile(r"[a-fA-F0-9]{12,24}")
+_BARE_CCR_HASH_RE = re.compile(CCR_HEX_ID_INNER, re.IGNORECASE)
 
 
 def _response_ccr_hashes(messages: list[dict[str, Any]], markers: list[str]) -> list[str]:
@@ -167,7 +170,9 @@ def _response_ccr_hashes(messages: list[dict[str, Any]], markers: list[str]) -> 
     def collect(value: Any, *, allow_bare_hash: bool = False) -> None:
         if isinstance(value, str):
             candidates = [value] if allow_bare_hash and _BARE_CCR_HASH_RE.fullmatch(value) else []
-            candidates.extend(match.group(1) for match in _CCR_HASH_RE.finditer(value))
+            candidates.extend(
+                match.group(1) or match.group(2) for match in _CCR_HASH_RE.finditer(value)
+            )
             for candidate in candidates:
                 normalized = candidate.lower()
                 if normalized not in seen:

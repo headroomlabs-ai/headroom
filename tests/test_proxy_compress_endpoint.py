@@ -173,6 +173,26 @@ class TestCompressEndpointBasic:
             "feedface00112233",
         ]
 
+    def test_response_ccr_hashes_accepts_short_labels_and_terse_markers(self):
+        from headroom.proxy.handlers.openai import _response_ccr_hashes
+
+        assert _response_ccr_hashes(
+            [{"role": "tool", "content": "[ccr:AB] Retrieve original: hash=cd. <<ccr:ef 1_rows>>"}],
+            ["12", "not-a-hash", "stable_prefix_hash:ab"],
+        ) == ["12", "ab", "cd", "ef"]
+        assert (
+            _response_ccr_hashes(
+                [
+                    {
+                        "role": "tool",
+                        "content": "[ccr:a] [ccr:zz] [ccr:ab cd] [ccr:" + "a" * 25 + "]",
+                    }
+                ],
+                ["a", "a" * 25],
+            )
+            == []
+        )
+
     def test_bypass_header_returns_uncompressed(self, client):
         """X-Headroom-Bypass header should skip compression."""
         messages = [

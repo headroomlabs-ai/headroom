@@ -19729,6 +19729,7 @@ tool.schema = external_exports;
 
 // src/retrieve.ts
 var _proxyUrlCache = null;
+var CCR_ID_PATTERN = /^[a-f0-9]{2,24}$/i;
 function getDefaultProxyUrl() {
   return _proxyUrlCache ?? process.env.HEADROOM_BASE_URL ?? "http://localhost:8787";
 }
@@ -19741,22 +19742,22 @@ function createHeadroomRetrieveTool(config2) {
   const origin = trimTrailingSlashes(config2.proxyBaseUrl);
   return {
     name: "headroom_retrieve",
-    description: "Retrieve original uncompressed content from Headroom's compression store. Use when compressed context mentions a hash and you need the full details. Pass the hash from the compression marker (24 hex characters). Retrieval is by hash and always returns the full original content.",
+    description: "Retrieve original uncompressed content from Headroom's compression store. Use when compressed context mentions a hash and you need the full details. Pass the identifier from the compression marker (2\u201324 hex characters). Retrieval is by hash and always returns the full original content.",
     parameters: {
       type: "object",
       properties: {
         hash: {
           type: "string",
-          description: "The 24-character hex hash from the compression marker"
+          description: "The 2\u201324-character hex identifier from the compression marker"
         }
       },
       required: ["hash"]
     },
     execute: async (args) => {
       const { hash: hash2 } = args;
-      if (!/^[a-f0-9]{24}$/i.test(hash2)) {
+      if (!CCR_ID_PATTERN.test(hash2)) {
         return JSON.stringify({
-          error: "Invalid hash format. Expected 24 hex characters."
+          error: "Invalid hash format. Expected 2\u201324 hex characters."
         });
       }
       try {
@@ -20308,7 +20309,7 @@ var HeadroomPlugin = async (input2, options = {}) => {
       headroom_retrieve: tool({
         description: retrieveTool.description,
         args: {
-          hash: external_exports.string().regex(/^[a-f0-9]{24}$/i, "Expected 24-character hex hash")
+          hash: external_exports.string().regex(CCR_ID_PATTERN, "Expected 2\u201324-character hex identifier")
         },
         async execute(args) {
           return retrieveTool.execute(args);
