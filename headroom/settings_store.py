@@ -126,7 +126,7 @@ SETTINGS: tuple[SettingField, ...] = (
         "Code-aware compression",
         "Compression",
         "bool",
-        default=True,
+        default=False,
         help="AST-based code compression (requires the [code] extra).",
         tier="basic",
     ),
