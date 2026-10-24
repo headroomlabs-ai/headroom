@@ -151,7 +151,7 @@ class TestHeadroomConfig:
     def test_default_values(self):
         """Default values are correctly set."""
         config = HeadroomConfig()
-        assert config.store_url == "sqlite:///headroom.db"
+        assert config.store_url is None
         assert config.default_mode == HeadroomMode.AUDIT
         assert config.generate_diff_artifact is False
         # Nested configs exist
