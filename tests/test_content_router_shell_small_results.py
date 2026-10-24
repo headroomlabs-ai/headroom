@@ -447,3 +447,37 @@ def test_small_shell_result_diagnostics_explain_why_it_was_preserved(
     assert decision.action == "protected:shell_small_result"
     assert decision.tokens_before == decision.tokens_after
     assert result.messages[3]["content"] == output
+
+
+@pytest.mark.parametrize("shape", ["anthropic", "tool", "function"])
+def test_small_shell_blocks_without_optional_route_counters(shape: str) -> None:
+    """Direct block callers can omit counters without losing the shell guard."""
+    output = _ls_output()
+    if shape == "anthropic":
+        message = _conversation("Bash", output)[3]
+    elif shape == "function":
+        message = {
+            "role": "function",
+            "name": "Bash",
+            "content": [{"type": "text", "text": output}],
+        }
+    else:
+        message = _text_block_conversation("Bash", output)[3]
+    transforms: list[str] = []
+    router = ContentRouter(ContentRouterConfig())
+    router.compress = _fake_compress  # type: ignore[assignment]
+
+    result = router._process_content_blocks(
+        message=message,
+        content_blocks=message["content"],
+        context="",
+        transforms_applied=transforms,
+        excluded_tool_ids=set(),
+        ccr_retrieve_tool_ids=set(),
+        tool_name_map={"tool_1": "Bash", "call_1": "Bash"},
+        route_counts=None,
+        messages_from_end=20,
+    )
+
+    assert result is message
+    assert transforms == ["router:shell_small_result_verbatim"]
