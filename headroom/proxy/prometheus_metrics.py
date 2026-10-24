@@ -40,6 +40,15 @@ _OTHER_MODEL = "other"
 MAX_DISTINCT_PATHS = 256
 _OTHER_PATH = "other"
 
+# Same idea for savings attribution rows (see record_request). Source names come
+# from extensions and turn hooks, so one that mints a name per request would grow
+# savings_by_source, and its three exported series, without bound. Past this many
+# rows, new sources are summed into ``_OTHER_SOURCE``: only the name is lost,
+# never a token or a dollar. Unlike the per-request ledger's bound, ``tool_search``
+# may fold here: nothing reads this table by source name, every reader sums it.
+MAX_DISTINCT_SAVINGS_ROWS = 256
+_OTHER_SOURCE = "other"
+
 # Closed label set for headroom_requests_rate_limited_total{source}. Two 429s
 # mean opposite things to an operator: "headroom" is OUR limiter refusing the
 # request (raise the cap), "upstream" is the provider refusing it (back off or
@@ -209,6 +218,7 @@ class PrometheusMetrics:
         self.extension_savings: dict[str, int] = defaultdict(int)
         # Named savings attribution; realized and projected rows stay separate.
         self.savings_by_source: dict[str, dict[str, str | int | float | bool]] = {}
+        self._savings_source_cardinality_warned = False
 
         # Fail-open compression failures, keyed by reason ("timeout",
         # "error"). The proxy fails open on any optimization error so the
@@ -449,6 +459,7 @@ class PrometheusMetrics:
             self.tokens_saved_by_strategy.clear()
             self.extension_savings.clear()
             self.savings_by_source.clear()
+            self._savings_source_cardinality_warned = False
             with self._obs_counter_lock:
                 self.compression_failed_by_reason.clear()
                 self.upstream_connection_errors_by_provider.clear()
@@ -983,6 +994,18 @@ class PrometheusMetrics:
                 source = str(item.get("source") or "other")[:64]
                 realized = bool(item.get("realized", True))
                 key = f"{source}:{int(realized)}"
+                if (
+                    key not in self.savings_by_source
+                    and len(self.savings_by_source) >= MAX_DISTINCT_SAVINGS_ROWS
+                ):
+                    source, key = _OTHER_SOURCE, f"{_OTHER_SOURCE}:{int(realized)}"
+                    if not self._savings_source_cardinality_warned:
+                        self._savings_source_cardinality_warned = True
+                        logger.warning(
+                            "metrics.record: savings source cardinality cap (%d) reached; "
+                            'summing further sources into "other"',
+                            MAX_DISTINCT_SAVINGS_ROWS,
+                        )
                 row = self.savings_by_source.setdefault(
                     key,
                     {

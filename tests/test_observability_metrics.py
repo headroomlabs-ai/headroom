@@ -18,7 +18,11 @@ from headroom.observability import (
     set_otel_metrics,
     unregister_otel_metric_attribute_provider,
 )
-from headroom.proxy.prometheus_metrics import MAX_DISTINCT_PATHS, PrometheusMetrics
+from headroom.proxy.prometheus_metrics import (
+    MAX_DISTINCT_PATHS,
+    MAX_DISTINCT_SAVINGS_ROWS,
+    PrometheusMetrics,
+)
 from headroom.telemetry.context import MAX_DISTINCT_MODELS
 from headroom.transforms.pipeline import TransformPipeline
 
@@ -622,6 +626,48 @@ async def test_prometheus_metrics_reset_rearms_path_cardinality_warning() -> Non
 
     assert metrics._path_cardinality_warned is False
     assert len(metrics.inbound_requests_by_path) == 0
+
+
+@pytest.mark.asyncio
+async def test_prometheus_metrics_caps_savings_source_cardinality() -> None:
+    """An extension that names a new savings source per request cannot grow
+    savings_by_source, or its exported series, past MAX_DISTINCT_SAVINGS_ROWS plus
+    one "other" row per realized flag, and every token and dollar is still booked."""
+    metrics = PrometheusMetrics(stateless=True)
+    sources = MAX_DISTINCT_SAVINGS_ROWS + 50
+    for i in range(sources):
+        await metrics.record_request(
+            provider="openai",
+            model="gpt-4o",
+            input_tokens=10,
+            output_tokens=1,
+            tokens_saved=0,
+            latency_ms=1.0,
+            savings_attribution=[
+                {"source": f"plugin_{i}", "realized": True, "tokens": 100, "usd": 0.01},
+                {"source": "tool_search", "realized": False, "tokens": 10},
+            ],
+        )
+
+    rows = metrics.savings_by_source
+    assert len(rows) == MAX_DISTINCT_SAVINGS_ROWS + 1
+    assert rows["tool_search:0"]["tokens"] == 10 * sources
+    assert sum(int(r["tokens"]) for r in rows.values()) == 110 * sources
+    assert sum(float(r["usd"]) for r in rows.values()) == pytest.approx(0.01 * sources)
+    assert sum(int(r["events"]) for r in rows.values()) == 2 * sources
+    exported = await metrics.export()
+    series = [
+        line
+        for line in exported.splitlines()
+        if line.startswith("headroom_savings_attributed_tokens_total{")
+    ]
+    assert len(series) == MAX_DISTINCT_SAVINGS_ROWS + 1
+    assert metrics._savings_source_cardinality_warned is True
+
+    await metrics.reset_runtime()
+
+    assert metrics._savings_source_cardinality_warned is False
+    assert metrics.savings_by_source == {}
 
 
 @pytest.mark.asyncio
