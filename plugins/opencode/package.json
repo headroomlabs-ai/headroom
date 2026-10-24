@@ -46,7 +46,9 @@
     "vitest": "^5.0.0"
   },
   "overrides": {
-    "esbuild": "^0.28.1"
+    "esbuild": "^0.28.1",
+    "zod": "^4.6.6",
+    "toml": "^5.0.1"
   },
   "license": "Apache-2.0"
 }

@@ -30,6 +30,7 @@ from headroom.evals.memory.locomo import (
 )
 from headroom.evals.metrics import compute_exact_match, compute_f1
 from headroom.memory import HierarchicalMemory, MemoryConfig
+from headroom.offline import pin_litellm_cost_map_local
 
 logger = logging.getLogger(__name__)
 
@@ -277,6 +278,7 @@ class LoCoMoEvaluator:
             List of extracted memory dicts with 'content' and 'category'.
         """
         try:
+            pin_litellm_cost_map_local()
             import litellm
         except ImportError:
             logger.warning("litellm not available, falling back to raw dialogue storage")
