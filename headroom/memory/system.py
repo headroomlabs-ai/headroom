@@ -381,8 +381,8 @@ class MemorySystem:
         if extracted_relationships is not None:
             save_kwargs["extracted_relationships"] = extracted_relationships
         # Only pass `background` to backends that accept it. Sending it to a
-        # backend without the parameter raises TypeError and would trigger the
-        # fallback below, which re-saves without the pre-extracted payload.
+        # backend without the parameter would raise TypeError before the save
+        # runs, losing the pre-extracted payload with it.
         if background is not None and _accepts_kwarg(self._backend.save_memory, "background"):
             save_kwargs["background"] = background
 
