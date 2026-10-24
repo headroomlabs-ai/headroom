@@ -109,11 +109,23 @@ def _migrate_deprecated_image(image: Any) -> Any:
 
 
 def _manifest_from_payload(payload: dict[str, Any]) -> DeploymentManifest:
-    """Build a manifest from its decoded JSON, migrating the retired image repo."""
+    """Build a manifest from decoded JSON, applying legacy image and mode migrations."""
     payload["mutations"] = [ManagedMutation(**item) for item in payload.get("mutations", [])]
     payload["artifacts"] = [ArtifactRecord(**item) for item in payload.get("artifacts", [])]
     if "image" in payload:
         payload["image"] = _migrate_deprecated_image(payload["image"])
+    # Mode is represented by the proxy argument generated from ``proxy_mode``.
+    # Older manifests also exported it through the supervisor environment,
+    # creating two competing runtime inputs. Remove only the matching derived
+    # copy; a different or mode-less environment value remains an explicit input.
+    base_env = payload.get("base_env")
+    proxy_mode = payload.get("proxy_mode")
+    if (
+        isinstance(base_env, dict)
+        and proxy_mode is not None
+        and base_env.get("HEADROOM_MODE") == proxy_mode
+    ):
+        base_env.pop("HEADROOM_MODE", None)
     return DeploymentManifest(**payload)
 
 

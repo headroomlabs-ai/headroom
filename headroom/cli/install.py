@@ -576,8 +576,12 @@ def _build_deployment_manifest(
     backend: str,
     anyllm_provider: str | None,
     region: str | None,
-    proxy_mode: str,
+    proxy_mode: str | None,
     memory: bool,
+    learn_enabled: bool | None,
+    memory_storage_mode: str,
+    traffic_learning_min_evidence: int,
+    memory_project_root: str,
     telemetry: bool,
     no_telemetry: bool,
     image: str,
@@ -603,11 +607,15 @@ def _build_deployment_manifest(
         anyllm_provider=anyllm_provider,
         region=region,
         proxy_mode=proxy_mode,
-        memory_enabled=memory,
+        memory_enabled=memory or learn_enabled is True,
         # --no-telemetry wins when both are given; neither leaves it unset.
         telemetry_enabled=False if no_telemetry else (True if telemetry else None),
         no_rate_limit=no_rate_limit,
         image=image,
+        learn_enabled=learn_enabled,
+        memory_storage_mode=memory_storage_mode,
+        traffic_learning_min_evidence=traffic_learning_min_evidence,
+        memory_project_root=memory_project_root,
         no_http2=no_http2,
         code_aware=code_aware,
         intercept_tool_results=intercept_tool_results,
@@ -863,11 +871,38 @@ def _echo_installed(manifest: DeploymentManifest, *, prefix: str = "Installed pe
 @click.option(
     "--mode",
     "proxy_mode",
-    default="cache",
-    show_default=True,
-    help="Proxy optimization mode. cache = delta-only compression at ~0 prefix-cache busts.",
+    default=None,
+    help="Proxy optimization mode. Omit to use runtime/settings defaults.",
 )
 @click.option("--memory", is_flag=True, help="Enable persistent memory in the proxy runtime.")
+@click.option(
+    "--learn/--no-learn",
+    "learn_enabled",
+    default=None,
+    help="Explicitly enable or disable traffic learning.",
+)
+@click.option(
+    "--memory-storage",
+    "memory_storage_mode",
+    type=click.Choice(["project", "user", "global"], case_sensitive=False),
+    default="project",
+    show_default=True,
+    help="Persistent memory storage scope.",
+)
+@click.option(
+    "--min-evidence",
+    "traffic_learning_min_evidence",
+    type=click.IntRange(min=1),
+    default=5,
+    show_default=True,
+    help="Evidence count required before learning persists a pattern.",
+)
+@click.option(
+    "--memory-project-root",
+    type=click.Path(path_type=str),
+    default="",
+    help="Override the project root used by project memory storage.",
+)
 @click.option(
     "--telemetry",
     is_flag=True,
@@ -957,8 +992,12 @@ def install_apply(
     backend: str,
     anyllm_provider: str | None,
     region: str | None,
-    proxy_mode: str,
+    proxy_mode: str | None,
     memory: bool,
+    learn_enabled: bool | None,
+    memory_storage_mode: str,
+    traffic_learning_min_evidence: int,
+    memory_project_root: str,
     telemetry: bool,
     no_telemetry: bool,
     no_rate_limit: bool,
@@ -1006,6 +1045,10 @@ def install_apply(
         region=region,
         proxy_mode=proxy_mode,
         memory=memory,
+        learn_enabled=learn_enabled,
+        memory_storage_mode=memory_storage_mode,
+        traffic_learning_min_evidence=traffic_learning_min_evidence,
+        memory_project_root=memory_project_root,
         telemetry=telemetry,
         no_telemetry=no_telemetry,
         no_rate_limit=no_rate_limit,
@@ -1058,9 +1101,8 @@ def install_apply(
 @click.option(
     "--mode",
     "proxy_mode",
-    default="cache",
-    show_default=True,
-    help="Proxy optimization mode. cache = delta-only compression at ~0 prefix-cache busts.",
+    default=None,
+    help="Proxy optimization mode. Omit to use runtime/settings defaults.",
 )
 @click.option(
     "--scope",
@@ -1085,6 +1127,34 @@ def install_apply(
     help="Tool target to configure when --providers manual is used.",
 )
 @click.option("--memory", is_flag=True, help="Enable persistent memory in the proxy runtime.")
+@click.option(
+    "--learn/--no-learn",
+    "learn_enabled",
+    default=None,
+    help="Explicitly enable or disable traffic learning.",
+)
+@click.option(
+    "--memory-storage",
+    "memory_storage_mode",
+    type=click.Choice(["project", "user", "global"], case_sensitive=False),
+    default="project",
+    show_default=True,
+    help="Persistent memory storage scope.",
+)
+@click.option(
+    "--min-evidence",
+    "traffic_learning_min_evidence",
+    type=click.IntRange(min=1),
+    default=5,
+    show_default=True,
+    help="Evidence count required before learning persists a pattern.",
+)
+@click.option(
+    "--memory-project-root",
+    type=click.Path(path_type=str),
+    default="",
+    help="Override the project root used by project memory storage.",
+)
 @click.option(
     "--telemetry",
     is_flag=True,
@@ -1117,11 +1187,15 @@ def deploy(
     backend: str,
     anyllm_provider: str | None,
     region: str | None,
-    proxy_mode: str,
+    proxy_mode: str | None,
     scope: str,
     provider_mode: str,
     targets: tuple[str, ...],
     memory: bool,
+    learn_enabled: bool | None,
+    memory_storage_mode: str,
+    traffic_learning_min_evidence: int,
+    memory_project_root: str,
     telemetry: bool,
     no_telemetry: bool,
     image: str,
@@ -1145,6 +1219,10 @@ def deploy(
         region=region,
         proxy_mode=proxy_mode,
         memory=memory,
+        learn_enabled=learn_enabled,
+        memory_storage_mode=memory_storage_mode,
+        traffic_learning_min_evidence=traffic_learning_min_evidence,
+        memory_project_root=memory_project_root,
         telemetry=telemetry,
         no_telemetry=no_telemetry,
         image=image,
@@ -1168,6 +1246,21 @@ def install_status(profile: str) -> None:
     click.echo(f"Runtime:    {manifest.runtime_kind}")
     click.echo(f"Supervisor: {manifest.supervisor_kind}")
     click.echo(f"Scope:      {manifest.scope}")
+    click.echo(f"Mode:       {getattr(manifest, 'proxy_mode', None) or 'runtime default'}")
+    click.echo(
+        f"Memory:     {'enabled' if getattr(manifest, 'memory_enabled', False) else 'disabled'}"
+    )
+    learn_enabled = getattr(manifest, "learn_enabled", None)
+    learning = (
+        "runtime default" if learn_enabled is None else ("enabled" if learn_enabled else "disabled")
+    )
+    click.echo(f"Learning:   {learning}")
+    click.echo(f"Storage:    {getattr(manifest, 'memory_storage_mode', 'project')}")
+    min_evidence = getattr(manifest, "base_env", {}).get("HEADROOM_MIN_EVIDENCE") or getattr(
+        manifest, "traffic_learning_min_evidence", 5
+    )
+    click.echo(f"Min evidence: {min_evidence}")
+    click.echo(f"Project root: {getattr(manifest, 'memory_project_root', '') or 'runtime default'}")
     click.echo(f"Port:       {manifest.port}")
     click.echo(f"Status:     {runtime_status(manifest)}")
     click.echo(f"Healthy:    {'yes' if probe_ready(manifest.health_url) else 'no'}")
