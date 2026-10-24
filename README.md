@@ -437,14 +437,18 @@ orchestration stays focused on lifecycle, sequencing and policy:
 
 ```bash
 uv tool install --python 3.13 "headroom-ai[all]"  # CLI, isolated app env
-pip install "headroom-ai[all]"                    # Python, everything — includes the CLI
+pip install "headroom-ai[all]"                    # CLI/proxy feature set
 npm install headroom-ai                           # TypeScript SDK (library only)
 docker pull ghcr.io/headroomlabs-ai/headroom:latest
 ```
 
+`[all]` includes the CLI/proxy feature set, including image support, without PyTorch-backed dependencies.
+Add `[ml]`, `[memory]`, `[evals]`, or `[voice]` separately for those features;
+their PyTorch dependency can install CUDA runtime packages on Linux.
+
 Granular extras: `[proxy]`, `[mcp]`, `[ml]` (Kompress-v2-base), `[code]`,
-`[memory]`, `[vector]` (optional HNSW backend — needs a C++ toolchain, not in
-`[all]`), `[relevance]`, `[image]`, `[agno]`, `[langchain]`, `[evals]`,
+`[memory]`, `[vector]` (optional HNSW backend — needs a C++ toolchain),
+`[relevance]`, `[image]`, `[sandbox]` (lean, torch-free proxy), `[agno]`, `[langchain]`, `[evals]`, `[voice]`, and
 `[pytorch-mps]` (Apple-GPU memory-embedder offload — set
 `HEADROOM_EMBEDDER_RUNTIME=pytorch_mps`). Requires **Python 3.10+**.
 
