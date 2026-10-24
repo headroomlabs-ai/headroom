@@ -35,11 +35,25 @@ impl ReformatTransform for JsonMinifier {
             return Err(TransformError::skipped(NAME, "empty input"));
         }
 
+        // Validate first: malformed input must be rejected identically in
+        // both feature configurations.
         let value: serde_json::Value = serde_json::from_str(trimmed)
             .map_err(|e| TransformError::invalid_input(NAME, e.to_string()))?;
 
+        // With `arbitrary-precision` the `Value` round-trip preserves the
+        // source numeric token (and normalises escapes). Without it,
+        // `Value` stores out-of-range integers as `f64`, so serialising the
+        // round-trip would round them. In that configuration strip
+        // insignificant whitespace from the source text instead, which keeps
+        // every number byte-for-byte.
+        #[cfg(feature = "arbitrary-precision")]
         let minified = serde_json::to_string(&value)
             .map_err(|e| TransformError::internal(NAME, e.to_string()))?;
+        #[cfg(not(feature = "arbitrary-precision"))]
+        let minified = {
+            let _ = &value;
+            minify_lossless(trimmed)
+        };
 
         // Defensive: if minification grew the byte count (e.g. caller
         // already passed compact JSON, or escaping rules added bytes),
@@ -53,6 +67,36 @@ impl ReformatTransform for JsonMinifier {
 
         Ok(ReformatOutput::from_lengths(content.len(), minified))
     }
+}
+
+/// Strip insignificant JSON whitespace without parsing through `Value`.
+///
+/// Only whitespace outside string literals is removed, so numeric tokens,
+/// escapes, key order, and duplicate keys survive the pass byte-for-byte.
+/// The caller has already validated the input with `serde_json`.
+#[cfg(not(feature = "arbitrary-precision"))]
+fn minify_lossless(input: &str) -> String {
+    let mut out = String::with_capacity(input.len());
+    let mut in_string = false;
+    let mut escaped = false;
+    for ch in input.chars() {
+        if in_string {
+            out.push(ch);
+            if escaped {
+                escaped = false;
+            } else if ch == '\\' {
+                escaped = true;
+            } else if ch == '"' {
+                in_string = false;
+            }
+        } else if ch == '"' {
+            in_string = true;
+            out.push(ch);
+        } else if !ch.is_ascii_whitespace() {
+            out.push(ch);
+        }
+    }
+    out
 }
 
 #[cfg(test)]
@@ -171,5 +215,22 @@ mod tests {
         let r = JsonMinifier.apply(pretty).expect("parses");
         let v: serde_json::Value = serde_json::from_str(&r.output).unwrap();
         assert_eq!(v["msg"], "héllo 🌍 wörld");
+    }
+    #[test]
+    fn whitespace_inside_strings_is_preserved() {
+        let pretty = "{\n  \"msg\": \"hello  world\\n\",\n  \"n\": 1\n}";
+        let r = JsonMinifier.apply(pretty).expect("parses");
+        assert_eq!(r.output, "{\"msg\":\"hello  world\\n\",\"n\":1}");
+    }
+
+    /// Without `arbitrary-precision`, a `Value` round-trip would turn
+    /// `18446744073709551617` into an `f64` and round it. The lossless
+    /// lexical pass must keep the literal token.
+    #[cfg(not(feature = "arbitrary-precision"))]
+    #[test]
+    fn numeric_tokens_survive_without_arbitrary_precision() {
+        let pretty = "{ \"id\": 18446744073709551617, \"f\": 1.0, \"e\": 1e2 }";
+        let r = JsonMinifier.apply(pretty).expect("parses");
+        assert_eq!(r.output, r#"{"id":18446744073709551617,"f":1.0,"e":1e2}"#);
     }
 }

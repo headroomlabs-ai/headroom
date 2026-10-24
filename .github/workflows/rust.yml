@@ -145,6 +145,41 @@ jobs:
       - name: cargo test
         run: cargo test --workspace
 
+  feature-matrix:
+    name: feature matrix (headroom-core)
+    needs: rust-changes
+    if: needs.rust-changes.outputs.rust == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        features:
+          - ''
+          - sqlite
+          - arbitrary-precision
+          - ml
+          - redis
+          - 'sqlite,arbitrary-precision'
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install stable toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.95.0
+      - name: Cache cargo registry + build
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: feature-matrix-${{ matrix.features }}
+      - name: cargo check (no default features + integration tests)
+        run: |
+          if [ -z "${{ matrix.features }}" ]; then
+            cargo check -p headroom-core --no-default-features --tests
+          else
+            cargo check -p headroom-core --no-default-features --tests \
+              --features "${{ matrix.features }}"
+          fi
+
   simulator-e2e:
     name: simulator e2e (${{ matrix.os }})
     needs: rust-changes

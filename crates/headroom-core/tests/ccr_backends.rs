@@ -5,11 +5,12 @@
 
 use std::time::Duration;
 
-use headroom_core::ccr::backends::{
-    from_config, CcrBackendConfig, InMemoryCcrStore, SqliteCcrStore,
-};
+#[cfg(feature = "sqlite")]
+use headroom_core::ccr::backends::SqliteCcrStore;
+use headroom_core::ccr::backends::{from_config, CcrBackendConfig, InMemoryCcrStore};
 use headroom_core::ccr::{compute_key, CcrStore};
 
+#[cfg(feature = "sqlite")]
 #[test]
 fn sqlite_round_trip() {
     let dir = tempfile::tempdir().expect("tempdir");
@@ -25,6 +26,7 @@ fn sqlite_round_trip() {
     assert_eq!(store.get("missing-hash-key"), None);
 }
 
+#[cfg(feature = "sqlite")]
 #[test]
 fn sqlite_ttl_purge() {
     let dir = tempfile::tempdir().expect("tempdir");
@@ -40,6 +42,7 @@ fn sqlite_ttl_purge() {
     assert_eq!(store.len(), 0, "expired entry must be physically deleted");
 }
 
+#[cfg(feature = "sqlite")]
 #[test]
 fn sqlite_persists_across_proxy_restart() {
     // Acceptance criterion #4 from the plan: write via SqliteCcrStore,
@@ -66,6 +69,7 @@ fn sqlite_persists_across_proxy_restart() {
     );
 }
 
+#[cfg(feature = "sqlite")]
 #[test]
 fn from_config_sqlite_roundtrip() {
     let dir = tempfile::tempdir().expect("tempdir");
@@ -78,6 +82,24 @@ fn from_config_sqlite_roundtrip() {
     let hash = compute_key(b"hello");
     store.put(&hash, "hello");
     assert_eq!(store.get(&hash).as_deref(), Some("hello"));
+}
+
+#[cfg(not(feature = "sqlite"))]
+#[test]
+fn from_config_sqlite_unsupported_when_feature_off() {
+    use headroom_core::ccr::backends::CcrBackendInitError;
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let cfg = CcrBackendConfig::Sqlite {
+        path: dir.path().join("ccr.sqlite"),
+        ttl_seconds: 300,
+    };
+    let Err(CcrBackendInitError::UnsupportedBackend { backend, feature }) = from_config(&cfg)
+    else {
+        panic!("sqlite must report UnsupportedBackend when the feature is off");
+    };
+    assert_eq!(backend, "sqlite");
+    assert_eq!(feature, "sqlite");
 }
 
 #[test]
@@ -99,16 +121,15 @@ fn from_config_redis_unsupported_when_feature_off() {
         ttl_seconds: 300,
         key_prefix: None,
     };
-    match from_config(&cfg) {
-        Err(CcrBackendInitError::UnsupportedBackend { backend, feature }) => {
-            assert_eq!(backend, "redis");
-            assert_eq!(feature, "redis");
-        }
-        Err(other) => panic!("expected UnsupportedBackend, got {other:?}"),
-        Ok(_) => panic!("redis must error when feature is off"),
-    }
+    let Err(CcrBackendInitError::UnsupportedBackend { backend, feature }) = from_config(&cfg)
+    else {
+        panic!("redis must report UnsupportedBackend when the feature is off");
+    };
+    assert_eq!(backend, "redis");
+    assert_eq!(feature, "redis");
 }
 
+#[cfg(feature = "sqlite")]
 #[test]
 fn backend_swap_byte_equal_keys() {
     // Stage data through one backend, swap to another with the same
@@ -207,6 +228,7 @@ fn in_memory_max_lifetime_caps_sliding_window() {
     );
 }
 
+#[cfg(feature = "sqlite")]
 #[test]
 fn sqlite_get_refreshes_idle_ttl() {
     let dir = tempfile::tempdir().expect("tempdir");
@@ -239,6 +261,7 @@ fn sqlite_get_refreshes_idle_ttl() {
     );
 }
 
+#[cfg(feature = "sqlite")]
 #[test]
 fn sqlite_max_lifetime_caps_sliding_window() {
     // Timing note: the backend stores unix-SECONDS (`as_secs()` truncates)
@@ -281,6 +304,7 @@ fn sqlite_max_lifetime_caps_sliding_window() {
     );
 }
 
+#[cfg(feature = "sqlite")]
 #[test]
 fn sqlite_migrates_legacy_schema_without_last_accessed() {
     // A DB created by a pre-sliding-TTL build has no `last_accessed`
