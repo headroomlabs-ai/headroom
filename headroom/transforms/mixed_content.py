@@ -28,12 +28,23 @@ class ContentSection:
     atomic: bool = False
 
 
-_CODE_FENCE_PATTERN = re.compile(r"^```(\w*)\s*$", re.MULTILINE)
+# Group 1 is the whole info string: any text without a backtick, so
+# ``c++``, ``c#``, ``objective-c``, ``js {1,3}`` and `` c++`` (space first) all
+# open a fence. ``\w*`` missed such openers and then took the closing fence
+# for one. A single quantifier keeps a long line linear; the language is the
+# info string's first word (see ``_fence_language``).
+_CODE_FENCE_PATTERN = re.compile(r"^```([^\n`]*)$", re.MULTILINE)
 # ``[^\S\n]*``, not ``\s*``: under MULTILINE, ``^\s*`` rescans every
 # following blank line from each line start (quadratic in a blank run).
 _JSON_BLOCK_START = re.compile(r"^[^\S\n]*[\[{]", re.MULTILINE)
 _SEARCH_RESULT_PATTERN = re.compile(r"^\S+:\d+:", re.MULTILINE)
 _PROSE_PATTERN = re.compile(r"[A-Z][a-z]+\s+\w+\s+\w+")
+
+
+def _fence_language(info_string: str) -> str:
+    """First word of a fence info string, or ``"unknown"`` for a bare fence."""
+    words = info_string.split()
+    return words[0] if words else "unknown"
 
 
 def _is_search_line(line: str) -> bool:
@@ -143,7 +154,7 @@ def split_into_sections(content: str, *, isolate: tuple[str, ...] = ()) -> list[
             continue
 
         if match := _CODE_FENCE_PATTERN.match(line):
-            language = match.group(1) or "unknown"
+            language = _fence_language(match.group(1))
             code_lines = []
             start_line = i
             i += 1
