@@ -1,0 +1,8 @@
+__pycache__/
+*.py[cod]
+.pytest_cache/
+*.egg-info/
+companion/build/
+dist/
+docs/test-results/
+plugins/headroom-sidebar/.claude-plugin/types/

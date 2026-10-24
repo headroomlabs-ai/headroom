@@ -32,6 +32,9 @@ available during an outage. Do not delete the lockfile or add fallback installs
 to make a build pass.
 
 These are existing test tools, not new product dependencies. Codex is maintained
-by OpenAI; OpenClaw and its transitive dependencies retain their upstream
-maintainers. Their install surface includes registry downloads, native optional
+by OpenAI. The MCP SDK override pins 1.31.0 to fix GHSA-6qxp-vccf-f47h while
+OpenClaw 2026.9.6 still pins the affected 1.30.0; remove the override once the
+upstream CLI dependency is fixed. OpenClaw and its transitive dependencies retain
+their upstream maintainers.
+Their install surface includes registry downloads, native optional
 packages and lifecycle scripts, as before. Top-level CLI versions are unchanged.
