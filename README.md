@@ -128,8 +128,10 @@ starts a local proxy, installs **[Serena](https://github.com/oraios/serena)** fo
 semantic code navigation, and launches the agent configured to route through
 Headroom. For Claude Code, Serena is registered for the wrapped project only
 (as a `local`-scope MCP server in `~/.claude.json`). Use
-`--code-memory-scope user` to make it available in every project, or
-`--code-memory none` to skip it. `headroom unwrap` removes either registration.
+`--code-memory-scope user` to make it available in every project,
+`--code-memory ix` to register the [Ix](https://github.com/ix-infrastructure/Ix)
+code-graph MCP instead, or `--code-memory none` to skip it. `headroom unwrap`
+removes any of these registrations that Headroom made.
 
 The `headroom` CLI ships only in the PyPI package. The npm `headroom-ai` package
 is the TypeScript SDK — a library you import
