@@ -1486,6 +1486,32 @@ def _fresh_cc_router(monkeypatch: pytest.MonkeyPatch) -> tuple[ContentRouter, li
     return router, calls
 
 
+def test_cache_controlled_prompt_reports_protection_reason(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    router, calls = _fresh_cc_router(monkeypatch)
+    prompt = "{" + '"record": "value", ' * 100 + '"end": true}'
+    messages = [
+        {
+            "role": "user",
+            "content": [{"type": "text", "text": prompt, "cache_control": {"type": "ephemeral"}}],
+        }
+    ]
+
+    result = router.apply(
+        messages,
+        _ChurnTokenizer(),
+        model_limit=100_000,
+        prefix_replay_guaranteed=True,
+        compress_user_messages=True,
+        min_tokens_to_compress=1,
+    )
+
+    assert result.messages == messages
+    assert "router:protected:cache_control" in result.transforms_applied
+    assert prompt not in calls
+
+
 def _fresh_cc_turn1() -> list[dict]:
     return [
         {"role": "user", "content": "run the tests"},
