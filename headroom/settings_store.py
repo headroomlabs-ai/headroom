@@ -951,6 +951,7 @@ def _atomic_write_text(path: Path, data: str) -> None:
     startup apply hook) crash-loop a supervised proxy. ``load()`` is also
     fail-open as a second line of defence.
     """
+    path.parent.mkdir(parents=True, exist_ok=True)
     fd, tmp_name = tempfile.mkstemp(dir=path.parent, prefix=f".{path.name}.", suffix=".tmp")
     tmp_path = Path(tmp_name)
     try:
