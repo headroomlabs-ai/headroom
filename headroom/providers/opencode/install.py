@@ -13,6 +13,7 @@ from headroom.install.paths import opencode_config_path
 from .config import (
     _inject_key_into_json,
     _parse_json_loose,
+    load_user_opencode_config,
     migrate_legacy_opencode_jsonc_backup,
     snapshot_opencode_config_if_unwrapped,
     strip_opencode_headroom_blocks,
@@ -40,7 +41,7 @@ def apply_provider_scope(manifest: DeploymentManifest) -> ManagedMutation | None
 
     if config_file.exists():
         content = fsutil.read_text(config_file)
-        data = _parse_json_loose(content)
+        data = load_user_opencode_config(content, config_file)
     else:
         data = {}
 

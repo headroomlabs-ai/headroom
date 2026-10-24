@@ -20,6 +20,7 @@ from datetime import datetime, timedelta
 from pathlib import Path
 
 from headroom import paths as _paths
+from headroom.offline import pin_litellm_cost_map_local
 from headroom.pricing.litellm_pricing import resolve_litellm_model
 
 log = logging.getLogger(__name__)
@@ -74,6 +75,7 @@ _STAGE_TIMINGS_RE = re.compile(
 # directly instead of maintaining our own pricing tables.
 
 try:
+    pin_litellm_cost_map_local()
     import litellm as _litellm
 
     _LITELLM_AVAILABLE = True

@@ -7,6 +7,8 @@ from pathlib import Path
 
 import click
 
+from headroom.offline import pin_litellm_cost_map_local
+
 from .main import main
 
 
@@ -480,6 +482,7 @@ def _run_memory_eval(
     answer_fn = None
     if answer_model:
         try:
+            pin_litellm_cost_map_local()
             import litellm
 
             def answer_fn(question: str, memories: list[str]) -> str:

@@ -502,6 +502,30 @@ class TestTelemetryCollector:
         assert len(collector._events) <= 5
 
 
+class TestEmptyItemsSignature:
+    """Empty-item compressions must not create a new tool signature each time."""
+
+    def test_empty_signature_is_stable(self):
+        assert (
+            ToolSignature.from_items([]).structure_hash
+            == ToolSignature.from_items([]).structure_hash
+        )
+
+    def test_repeated_empty_compressions_share_one_tool_stat(self):
+        collector = TelemetryCollector()
+        for _ in range(50):
+            collector.record_compression(
+                items=[],
+                original_count=0,
+                compressed_count=0,
+                original_tokens=10,
+                compressed_tokens=10,
+                strategy="none",
+            )
+
+        assert len(collector.get_all_tool_stats()) == 1
+
+
 class TestTelemetryPersistence:
     """Test telemetry persistence to disk."""
 

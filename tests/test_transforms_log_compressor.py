@@ -1,9 +1,10 @@
 from __future__ import annotations
 
+import re
+
 import pytest
 
 from headroom.transforms.log_compressor import (
-    LogCompressionResult,
     LogCompressor,
     LogCompressorConfig,
     LogFormat,
@@ -185,18 +186,37 @@ def test_real_compress_ignores_malformed_short_summary_diagnostic() -> None:
         "FAILED outside.py::test_9\n"
         "ERROR outside.py::test_10\n"
         "ERROR outside.py::test_19\n"
-        "[67 lines omitted: 10 ERROR, 10 FAIL, 51 INFO]"
+        "[67 lines omitted: 8 ERROR, 8 FAIL, 51 INFO]"
     )
 
 
-def test_result_properties() -> None:
-    result = LogCompressionResult(
-        compressed="small",
-        original="this is a substantially longer log body",
-        original_line_count=20,
-        compressed_line_count=5,
-        format_detected=LogFormat.GENERIC,
-        compression_ratio=0.25,
-    )
-    assert result.tokens_saved_estimate > 0
-    assert result.lines_omitted == 15
+def test_omitted_marker_counts_only_dropped_lines_on_native_path() -> None:
+    lines = [f"INFO worker processed item {i}" for i in range(400)]
+    error = "ERROR worker failed: connection reset"
+    lines.insert(200, error)
+    result = LogCompressor(LogCompressorConfig(enable_ccr=False)).compress("\n".join(lines))
+    marker = next(line for line in result.compressed.splitlines() if "lines omitted:" in line)
+    counts = {
+        level: int(count) for count, level in re.findall(r"(\d+) (ERROR|FAIL|WARN|INFO)", marker)
+    }
+
+    assert error in result.compressed.splitlines()
+    assert counts == {"INFO": result.lines_omitted}
+    assert marker == f"[{result.lines_omitted} lines omitted: {result.lines_omitted} INFO]"
+    assert result.stats["errors"] == 1
+    assert result.stats["info"] == 400
+
+
+@pytest.mark.parametrize("prefix", ["DEBUG ", "TRACE ", ""])
+def test_non_severity_omissions_keep_count_notice_on_native_path(prefix: str) -> None:
+    error = "ERROR retained failure"
+    original = "\n".join([f"{prefix}progress step {i}" for i in range(100)] + [error])
+    result = LogCompressor(LogCompressorConfig(enable_ccr=False)).compress(original)
+    marker = re.search(r"(?m)^\[(\d+) lines omitted[^\]]*\]$", result.compressed)
+    assert marker is not None
+    assert int(marker[1]) == result.lines_omitted
+    assert not re.search(r"\d+ (ERROR|FAIL|WARN|INFO)\b", marker[0])
+    assert marker[0] == f"[{result.lines_omitted} lines omitted]"
+    assert error in result.compressed.splitlines()
+    assert result.stats["errors"] == 1
+    assert result.stats["total"] == 101

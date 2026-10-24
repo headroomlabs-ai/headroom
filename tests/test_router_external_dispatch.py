@@ -281,15 +281,17 @@ def test_recoverable_map_is_retrievable(_memory_ccr):
     assert entry.compression_strategy == "external:ext_json"
 
 
-def test_non_hex_recoverable_hash_is_skipped_without_breaking(_memory_ccr):
-    # A malformed (non-hex) recovery hash must not break the request; the block
-    # is still compressed, only that entry is not retrievable.
+def test_non_hex_recoverable_hash_falls_back_to_builtin(_memory_ccr):
+    # A malformed (non-hex) recovery hash must not break the request; the store
+    # cannot keep that entry, so the external output (whose marker would point
+    # nowhere) is discarded and the built-in path runs.
     comp = _RecordingExternal(name="ext_json", content_types=("application/json",), bad_hash=True)
     router = _router_with_external(comp, ["ext_json"])
 
     result = router.compress(_JSON_ARRAY)
 
-    assert "external:ext_json" in result.strategy_chain
+    assert "external:ext_json" not in result.strategy_chain
+    assert "external-compressed" not in result.compressed
     assert get_compression_store().retrieve("zznothex") is None
 
 
