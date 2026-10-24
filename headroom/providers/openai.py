@@ -17,6 +17,7 @@ from typing import Any, cast
 
 from headroom import paths as _paths
 from headroom.log_safety import describe_exception, safe_id
+from headroom.offline import pin_litellm_cost_map_local
 from headroom.pricing.litellm_pricing import estimate_cost_from_tokens
 from headroom.tokenizers.base import (
     TokenCountCache,
@@ -49,6 +50,7 @@ def _get_litellm_module() -> Any | None:
         return None
 
     try:
+        pin_litellm_cost_map_local()
         import litellm
     except ImportError:
         return None
