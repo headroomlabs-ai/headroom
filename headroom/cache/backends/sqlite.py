@@ -57,6 +57,20 @@ _PURGE_INTERVAL = 60.0
 # hour; further ones log at debug only. A row that stays broken warns again
 # about once an hour, which keeps it visible without flooding.
 _MAX_REPORTED_UNREADABLE = 1000
+# After a failed reopen, retry on the next operation once this many seconds
+# have passed, doubling per consecutive failure up to the cap. Bounded so a
+# store whose filesystem problem has cleared comes back on its own, without
+# hammering a still-broken path on every call.
+_REOPEN_BACKOFF_INITIAL = 1.0
+_REOPEN_BACKOFF_MAX = 60.0
+
+
+class StoreUnavailableError(sqlite3.OperationalError):
+    """The connection is down after a failed reopen and the retry is not due.
+
+    Subclasses ``sqlite3.OperationalError`` so every existing
+    ``except sqlite3.DatabaseError`` path degrades it to a miss.
+    """
 
 
 def default_db_path() -> Path:
@@ -92,7 +106,9 @@ class SQLiteBackend:
         self._unreadable_warned = WarnOnce(
             _MAX_REPORTED_UNREADABLE, "unreadable CCR SQLite entries"
         )
-        self._conn = self._open()
+        self._conn: sqlite3.Connection | None = self._open()
+        self._reopen_backoff = _REOPEN_BACKOFF_INITIAL
+        self._next_reopen_at = 0.0
 
     @staticmethod
     def _ensure_private(path: Path) -> None:
@@ -138,6 +154,32 @@ class SQLiteBackend:
                     pass
         return conn
 
+    def _connection(self) -> sqlite3.Connection:
+        """Return the live connection, reopening it if a retry is due.
+
+        Caller holds ``_lock``. Raises :class:`StoreUnavailableError` while the
+        store is down, so callers treat the operation as a miss (reads) or a
+        discarded write (writes) and the warning makes that visible.
+        """
+        if self._conn is not None:
+            return self._conn
+        now = time.monotonic()
+        if now < self._next_reopen_at:
+            raise StoreUnavailableError(f"CCR SQLite store {self._path} is unavailable")
+        try:
+            self._conn = self._open()
+        except Exception as e:  # noqa: BLE001 - any open failure keeps the store down
+            self._schedule_reopen(now)
+            raise StoreUnavailableError(f"CCR SQLite store {self._path} reopen failed: {e}") from e
+        self._reopen_backoff = _REOPEN_BACKOFF_INITIAL
+        self._next_reopen_at = 0.0
+        logger.warning("CCR SQLite store %s reopened; storage is available again.", self._path)
+        return self._conn
+
+    def _schedule_reopen(self, now: float) -> None:
+        self._next_reopen_at = now + self._reopen_backoff
+        self._reopen_backoff = min(self._reopen_backoff * 2, _REOPEN_BACKOFF_MAX)
+
     @staticmethod
     def _is_corruption(error: Exception) -> bool:
         """Only genuine file corruption justifies recreating the database.
@@ -155,6 +197,14 @@ class SQLiteBackend:
         """Corruption → recreate (loud). Anything else (busy/locked/io) →
         log and treat the operation as a miss; never destroy data over a
         transient error."""
+        if isinstance(error, StoreUnavailableError):
+            logger.warning(
+                "CCR SQLite %s skipped: %s (nothing was read or persisted; "
+                "will retry the connection)",
+                op,
+                error,
+            )
+            return
         if not self._is_corruption(error):
             logger.warning(
                 "CCR SQLite %s failed on %s (transient, no reset): %s", op, self._path, error
@@ -168,14 +218,47 @@ class SQLiteBackend:
             error,
         )
         try:
-            self._conn.close()
+            if self._conn is not None:
+                self._conn.close()
         except Exception:  # noqa: BLE001 - best-effort close on corrupt handle
             pass
-        self._path.unlink(missing_ok=True)
+        self._conn = None
+        # Remove the corrupt database's -wal / -shm sidecars while the main
+        # file still exists, so no sibling worker can have created a fresh
+        # database (and fresh sidecars) at this path yet.
+        for suffix in ("-wal", "-shm"):
+            try:
+                Path(f"{self._path}{suffix}").unlink(missing_ok=True)
+            except OSError:  # noqa: PERF203 - best-effort sidecar cleanup
+                pass
+        try:
+            self._path.unlink(missing_ok=True)
+        except PermissionError:
+            # On Windows another process may still hold the file open. Leave
+            # it in place and reattach to it instead of keeping a closed
+            # handle, so later operations are not silently dead.
+            logger.warning(
+                "CCR SQLite could not remove corrupt store %s (PermissionError); "
+                "reattaching to the existing file.",
+                self._path,
+            )
         self._unreadable_warned = WarnOnce(
             _MAX_REPORTED_UNREADABLE, "unreadable CCR SQLite entries"
         )
-        self._conn = self._open()
+        try:
+            self._conn = self._open()
+        except Exception:  # noqa: BLE001 - recovery must not escape get()/set()
+            # Keep no handle and schedule a bounded retry: later operations
+            # reopen once it is due instead of failing for the process lifetime.
+            self._schedule_reopen(time.monotonic())
+            logger.exception(
+                "CCR SQLite failed to reopen %s after corruption recovery; "
+                "operations miss until a later reopen succeeds.",
+                self._path,
+            )
+        else:
+            self._reopen_backoff = _REOPEN_BACKOFF_INITIAL
+            self._next_reopen_at = 0.0
 
     def _report_unreadable(self, hash_key: str, reason: object) -> None:
         first = self._unreadable_warned.first(hash_key, logger)
@@ -212,11 +295,12 @@ class SQLiteBackend:
 
     def _purge_expired(self, now: float) -> int:
         """Delete expired rows using metadata; caller holds ``_lock``."""
-        cursor = self._conn.execute(
+        conn = self._connection()
+        cursor = conn.execute(
             "DELETE FROM ccr_entries WHERE created_at + ttl < ?",
             (now,),
         )
-        self._conn.commit()
+        conn.commit()
         self._last_purge = now
         return cursor.rowcount
 
@@ -239,7 +323,8 @@ class SQLiteBackend:
     def get(self, hash_key: str) -> CompressionEntry | None:
         with self._lock:
             try:
-                row = self._conn.execute(
+                conn = self._connection()
+                row = conn.execute(
                     "SELECT entry_json FROM ccr_entries WHERE hash = ?",
                     (hash_key,),
                 ).fetchone()
@@ -254,12 +339,13 @@ class SQLiteBackend:
         payload = json.dumps(asdict(entry), ensure_ascii=False)
         with self._lock:
             try:
-                self._conn.execute(
+                conn = self._connection()
+                conn.execute(
                     "INSERT OR REPLACE INTO ccr_entries "
                     "(hash, entry_json, created_at, ttl) VALUES (?, ?, ?, ?)",
                     (hash_key, payload, entry.created_at, entry.ttl),
                 )
-                self._conn.commit()
+                conn.commit()
                 self._maybe_purge()
             except sqlite3.DatabaseError as e:
                 self._handle_db_error(e, f"set {safe_id(hash_key)}")
@@ -267,11 +353,12 @@ class SQLiteBackend:
     def delete(self, hash_key: str) -> bool:
         with self._lock:
             try:
-                cur = self._conn.execute(
+                conn = self._connection()
+                cur = conn.execute(
                     "DELETE FROM ccr_entries WHERE hash = ?",
                     (hash_key,),
                 )
-                self._conn.commit()
+                conn.commit()
                 return cur.rowcount > 0
             except sqlite3.DatabaseError as e:
                 self._handle_db_error(e, f"delete {safe_id(hash_key)}")
@@ -280,7 +367,8 @@ class SQLiteBackend:
     def exists(self, hash_key: str) -> bool:
         with self._lock:
             try:
-                row = self._conn.execute(
+                conn = self._connection()
+                row = conn.execute(
                     "SELECT 1 FROM ccr_entries WHERE hash = ?",
                     (hash_key,),
                 ).fetchone()
@@ -292,15 +380,17 @@ class SQLiteBackend:
     def clear(self) -> None:
         with self._lock:
             try:
-                self._conn.execute("DELETE FROM ccr_entries")
-                self._conn.commit()
+                conn = self._connection()
+                conn.execute("DELETE FROM ccr_entries")
+                conn.commit()
             except sqlite3.DatabaseError as e:
                 self._handle_db_error(e, "clear")
 
     def count(self) -> int:
         with self._lock:
             try:
-                row = self._conn.execute("SELECT COUNT(*) FROM ccr_entries").fetchone()
+                conn = self._connection()
+                row = conn.execute("SELECT COUNT(*) FROM ccr_entries").fetchone()
             except sqlite3.DatabaseError as e:
                 self._handle_db_error(e, "count")
                 return 0
@@ -310,7 +400,8 @@ class SQLiteBackend:
         """Return a token that changes when another connection commits."""
         with self._lock:
             try:
-                row = self._conn.execute("PRAGMA data_version").fetchone()
+                conn = self._connection()
+                row = conn.execute("PRAGMA data_version").fetchone()
             except sqlite3.DatabaseError as e:
                 self._handle_db_error(e, "revision")
                 return None
@@ -319,7 +410,8 @@ class SQLiteBackend:
     def keys(self) -> list[str]:
         with self._lock:
             try:
-                rows = self._conn.execute("SELECT hash FROM ccr_entries").fetchall()
+                conn = self._connection()
+                rows = conn.execute("SELECT hash FROM ccr_entries").fetchall()
             except sqlite3.DatabaseError as e:
                 self._handle_db_error(e, "keys")
                 return []
@@ -328,7 +420,8 @@ class SQLiteBackend:
     def items(self) -> list[tuple[str, CompressionEntry]]:
         with self._lock:
             try:
-                rows = self._conn.execute("SELECT hash, entry_json FROM ccr_entries").fetchall()
+                conn = self._connection()
+                rows = conn.execute("SELECT hash, entry_json FROM ccr_entries").fetchall()
             except sqlite3.DatabaseError as e:
                 self._handle_db_error(e, "items")
                 return []
@@ -342,7 +435,8 @@ class SQLiteBackend:
     def get_stats(self) -> dict[str, Any]:
         with self._lock:
             try:
-                count_row = self._conn.execute("SELECT COUNT(*) FROM ccr_entries").fetchone()
+                conn = self._connection()
+                count_row = conn.execute("SELECT COUNT(*) FROM ccr_entries").fetchone()
             except sqlite3.DatabaseError as e:
                 self._handle_db_error(e, "stats")
                 count_row = (0,)

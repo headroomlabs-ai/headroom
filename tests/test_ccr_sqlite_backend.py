@@ -425,6 +425,123 @@ class TestMultiWorkerSafety:
         b.set("h2", make_entry("h2"))
         assert b.exists("h2")
 
+    def test_corruption_reset_removes_stale_sidecars(self, db_path):
+        b = SQLiteBackend(db_path)
+        b.set("h1", make_entry())
+        b._conn.close()
+        for suffix in ("-wal", "-shm"):
+            (db_path.parent / f"{db_path.name}{suffix}").write_bytes(b"stale")
+        b._handle_db_error(sqlite3.DatabaseError("file is not a database"), "get")
+        assert b.count() == 0
+        for suffix in ("-wal", "-shm"):
+            sidecar = db_path.parent / f"{db_path.name}{suffix}"
+            assert not sidecar.exists() or sidecar.read_bytes() != b"stale"
+
+    def test_corruption_reset_reattaches_when_unlink_is_denied(self, db_path, monkeypatch):
+        """Windows refuses to unlink a file another process holds open; the
+        handler must not raise and must not leave a closed connection."""
+        b = SQLiteBackend(db_path)
+        b.set("h1", make_entry())
+        real_unlink = type(db_path).unlink
+
+        def deny_main(self, *args, **kwargs):
+            if self == db_path:
+                raise PermissionError("[WinError 32] file in use")
+            return real_unlink(self, *args, **kwargs)
+
+        monkeypatch.setattr(type(db_path), "unlink", deny_main)
+        b._handle_db_error(sqlite3.DatabaseError("database disk image is malformed"), "get")
+        assert db_path.exists()
+        b.set("h2", make_entry("h2"))
+        assert b.exists("h2")
+
+    def test_failed_reopen_after_reset_recovers_later(self, db_path, monkeypatch, caplog):
+        """A reopen that fails during corruption recovery must not leave the
+        store dead for the process lifetime: once the retry is due and the
+        open succeeds, writes persist and reads hit again."""
+        import headroom.cache.backends.sqlite as sqlite_mod
+
+        b = SQLiteBackend(db_path)
+        b.set("h1", make_entry())
+        real_open = b._open
+        clock = [1000.0]
+        monkeypatch.setattr(sqlite_mod.time, "monotonic", lambda: clock[0])
+
+        def broken_open():
+            raise sqlite3.OperationalError("unable to open database file")
+
+        monkeypatch.setattr(b, "_open", broken_open)
+        with caplog.at_level(logging.WARNING):
+            b._handle_db_error(sqlite3.DatabaseError("database disk image is malformed"), "get")
+            assert "failed to reopen" in caplog.text
+            # Down and the retry is not due yet: a miss, and the discarded
+            # write is reported rather than silently accepted.
+            assert b.get("h1") is None
+            b.set("h2", make_entry("h2"))
+            assert "nothing was read or persisted" in caplog.text
+
+        # The filesystem problem clears and the backoff elapses.
+        monkeypatch.setattr(b, "_open", real_open)
+        clock[0] += sqlite_mod._REOPEN_BACKOFF_MAX
+        b.set("h3", make_entry("h3"))
+        got = b.get("h3")
+        assert got is not None
+        assert got.hash == "h3"
+
+    def test_reopen_retry_backs_off_while_open_keeps_failing(self, db_path, monkeypatch):
+        import headroom.cache.backends.sqlite as sqlite_mod
+
+        b = SQLiteBackend(db_path)
+        clock = [1000.0]
+        monkeypatch.setattr(sqlite_mod.time, "monotonic", lambda: clock[0])
+        attempts = []
+
+        def broken_open():
+            attempts.append(clock[0])
+            raise sqlite3.OperationalError("unable to open database file")
+
+        monkeypatch.setattr(b, "_open", broken_open)
+        b._handle_db_error(sqlite3.DatabaseError("file is not a database"), "get")
+        assert len(attempts) == 1
+        for _ in range(5):
+            assert b.get("h1") is None  # not due: no extra open attempts
+        assert len(attempts) == 1
+        clock[0] += sqlite_mod._REOPEN_BACKOFF_INITIAL
+        assert b.get("h1") is None
+        assert len(attempts) == 2
+        # The wait doubled, so the old interval is no longer enough.
+        clock[0] += sqlite_mod._REOPEN_BACKOFF_INITIAL
+        assert b.get("h1") is None
+        assert len(attempts) == 2
+
+    def test_reopen_after_denied_unlink_failure_recovers(self, db_path, monkeypatch):
+        import headroom.cache.backends.sqlite as sqlite_mod
+
+        b = SQLiteBackend(db_path)
+        b.set("h1", make_entry())
+        real_unlink = type(db_path).unlink
+        real_open = b._open
+        clock = [1000.0]
+        monkeypatch.setattr(sqlite_mod.time, "monotonic", lambda: clock[0])
+
+        def deny_main(self, *args, **kwargs):
+            if self == db_path:
+                raise PermissionError("[WinError 32] file in use")
+            return real_unlink(self, *args, **kwargs)
+
+        def broken_open():
+            raise sqlite3.OperationalError("unable to open database file")
+
+        monkeypatch.setattr(type(db_path), "unlink", deny_main)
+        monkeypatch.setattr(b, "_open", broken_open)
+        b._handle_db_error(sqlite3.DatabaseError("database disk image is malformed"), "get")
+        assert b.get("h1") is None
+
+        monkeypatch.setattr(b, "_open", real_open)
+        clock[0] += sqlite_mod._REOPEN_BACKOFF_MAX
+        b.set("h2", make_entry("h2"))
+        assert b.exists("h2")
+
     def test_busy_timeout_configured(self, db_path):
         b = SQLiteBackend(db_path)
         timeout = b._conn.execute("PRAGMA busy_timeout").fetchone()[0]
