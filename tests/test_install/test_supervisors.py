@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import subprocess
+import sys
 from pathlib import Path
 
 import click
@@ -18,6 +19,7 @@ from headroom.install.supervisors import (
     _render_windows_runner,
     _windows_boot_trigger,
     _windows_health_trigger,
+    _windows_hidden_launcher,
     _windows_task_xml,
     _WindowsTaskRegistrationError,
     install_supervisor,
@@ -42,7 +44,11 @@ def test_windows_task_xml_user_scope_is_hidden_s4u() -> None:
     assert "<Command>C:\\tmp\\default\\ensure-headroom.cmd</Command>" in xml
 
 
-def test_windows_task_xml_user_scope_supports_interactive_token() -> None:
+def test_windows_task_xml_user_scope_supports_interactive_token(monkeypatch) -> None:
+    monkeypatch.setattr(
+        "headroom.install.supervisors._windows_hidden_launcher",
+        lambda script: ("C:\\py\\pythonw.exe", f'-c "launch" "{script}"'),
+    )
     xml = _windows_task_xml(
         "C:\\tmp\\default\\ensure-headroom.cmd",
         trigger_xml=_windows_health_trigger(),
@@ -54,6 +60,76 @@ def test_windows_task_xml_user_scope_supports_interactive_token() -> None:
     assert "<LogonType>InteractiveToken</LogonType>" in xml
     assert "<RunLevel>LeastPrivilege</RunLevel>" in xml
     assert "<Interval>PT5M</Interval>" in xml
+    # Interactive-token runs must not open a visible console window.
+    assert "<Command>C:\\py\\pythonw.exe</Command>" in xml
+    assert '<Arguments>-c "launch" "C:\\tmp\\default\\ensure-headroom.cmd"</Arguments>' in xml
+
+
+def test_windows_task_xml_interactive_token_without_pythonw(monkeypatch) -> None:
+    # No pythonw: keep the bare script so recovery still runs.
+    monkeypatch.setattr(
+        "headroom.install.supervisors._windows_hidden_launcher", lambda script: None
+    )
+    xml = _windows_task_xml(
+        "C:\\tmp\\default\\ensure-headroom.cmd",
+        trigger_xml=_windows_health_trigger(),
+        scope="user",
+        logon_type="InteractiveToken",
+    )
+
+    assert "<Command>C:\\tmp\\default\\ensure-headroom.cmd</Command>" in xml
+    assert "<Arguments>" not in xml
+
+
+def test_windows_task_xml_s4u_keeps_bare_script(monkeypatch) -> None:
+    monkeypatch.setattr(
+        "headroom.install.supervisors._windows_hidden_launcher",
+        lambda script: ("C:\\py\\pythonw.exe", "-c x"),
+    )
+    xml = _windows_task_xml(
+        "C:\\tmp\\default\\ensure-headroom.cmd",
+        trigger_xml=_windows_health_trigger(),
+        scope="user",
+    )
+
+    assert "<Command>C:\\tmp\\default\\ensure-headroom.cmd</Command>" in xml
+    assert "pythonw" not in xml
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="runs a real .cmd via pythonw")
+def test_windows_hidden_launcher_propagates_failure_status(tmp_path) -> None:
+    # A failing health script must fail the task action (conhost --headless
+    # reported 0 here), with the script still actually run.
+    marker = tmp_path / "ran.txt"
+    script = tmp_path / "dir with space" / "ensure-headroom.cmd"
+    script.parent.mkdir()
+    script.write_text(f'@echo off\r\necho ran> "{marker}"\r\nexit /b 13\r\n')
+
+    launcher = _windows_hidden_launcher(str(script))
+    if launcher is None:
+        pytest.skip("pythonw.exe not available next to sys.executable")
+    command, arguments = launcher
+    result = subprocess.run(f'"{command}" {arguments}', timeout=60)
+
+    assert result.returncode == 13
+    assert marker.read_text().strip() == "ran"
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="runs the generated cmd/ps1 chain")
+def test_windows_hidden_launcher_runs_generated_runner_chain(tmp_path) -> None:
+    # The health action is the generated .cmd shim -> powershell -> .ps1;
+    # the exit status has to survive the whole chain.
+    ps1 = tmp_path / "dir with space" / "ensure-headroom.ps1"
+    cmd = ps1.with_suffix(".cmd")
+    _render_windows_runner(ps1, cmd, ["cmd", "/c", "exit 13"])
+
+    launcher = _windows_hidden_launcher(str(cmd))
+    if launcher is None:
+        pytest.skip("pythonw.exe not available next to sys.executable")
+    command, arguments = launcher
+    result = subprocess.run(f'"{command}" {arguments}', timeout=60)
+
+    assert result.returncode == 13
 
 
 def test_windows_task_xml_system_scope_uses_localsystem() -> None:
