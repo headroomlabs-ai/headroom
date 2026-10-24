@@ -55,7 +55,7 @@ dependencies = [
     "litellm>=1.96.2,<2.0",
     "click>=8.3.3",               # CLI framework; PYSEC-2026-2132 fix (command injection in click.edit())
     "rich>=13.0.0",               # Rich terminal output
-    "opentelemetry-api>=1.24.0",  # Safe no-op OTEL API for instrumentation
+    "opentelemetry-api>=1.45.1",  # CVE-2026-114603: bounded, linear-time tracestate parsing
     # AST-aware code slicing (CodeCompressor); binary wheel. 0.44.1 is excluded:
     # that PyPI release was a compromised supply-chain build shipping an
     # info-stealer `sg.exe` (Trojan:Win64/Lazy!MTB) alongside the real binary
@@ -393,6 +393,8 @@ Changelog = "https://github.com/headroomlabs-ai/headroom/blob/main/CHANGELOG.md"
 # transitively; the floor pins below ensure uv resolves to patched versions.
 [tool.uv]
 constraint-dependencies = [
+    # PYSEC-2026-4320 — remove distrusted root certificates from the CA bundle.
+    "certifi>=2026.10.19",
     # GHSA-5239-wwwm-4pmq (Low) — transitive via rich; fix at 2.20.0
     "pygments>=2.20.0",
     # GHSA-4xgf-cpjx-pc3j (Medium) — transitive via mcp; fix at 2.14.2
