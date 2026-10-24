@@ -843,6 +843,28 @@ def run_network_probes(extra_urls: Sequence[str]) -> tuple[list[Any], set[str]]:
     return reports, required
 
 
+def network_checks(extra_urls: Sequence[str]) -> list[CheckResult]:
+    """The ``--network`` rows, or one skipped row when ``HEADROOM_OFFLINE`` is set.
+
+    Every probe here dials an internet host, so under the air-gap switch none
+    of them runs; saying so beats a page of "unreachable" failures.
+    """
+    from headroom.offline import OFFLINE_ENV, OfflineEgressBlocked
+
+    try:
+        reports, required = run_network_probes(extra_urls)
+    except OfflineEgressBlocked as blocked:
+        return [
+            CheckResult(
+                name="network",
+                status=SKIP,
+                summary=f"skipped: {OFFLINE_ENV} is set, no endpoint was contacted",
+                hint=str(blocked),
+            )
+        ]
+    return check_network_endpoints(reports, required)
+
+
 def check_shell_env(environ: Mapping[str, str], port: int) -> CheckResult:
     """Is the *current shell* pointed at the proxy for ad-hoc runs?"""
     name = "shell env"
@@ -1233,8 +1255,7 @@ def doctor(
     if proxy_env_check is not None:
         checks.append(proxy_env_check)
     if network or network_urls:
-        reports, required = run_network_probes(network_urls)
-        checks.extend(check_network_endpoints(reports, required))
+        checks.extend(network_checks(network_urls))
     auth_conflict_check = check_claude_auth_conflict(
         claude_settings_path(),
         project_claude_settings,

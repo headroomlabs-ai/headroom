@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import contextlib
+import importlib
+import logging
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -108,6 +110,94 @@ class TestExternalPlugin:
             reg = get_registry()
             assert "cursor" in reg
             assert reg["cursor"].name == "cursor"
+
+
+class TestBuiltinLoadFailure:
+    def test_broken_builtin_plugin_is_logged_as_a_warning(self):
+        records: list[logging.LogRecord] = []
+
+        class _Collect(logging.Handler):
+            def emit(self, record: logging.LogRecord) -> None:
+                records.append(record)
+
+        handler = _Collect(level=logging.DEBUG)
+        logger = logging.getLogger("headroom.learn.registry")
+        logger.addHandler(handler)
+        real_import = importlib.import_module
+
+        def _import(name: str, *args, **kwargs):  # noqa: ANN002, ANN003, ANN202
+            if name == "headroom.learn.plugins.grok":
+                raise ImportError("simulated breakage")
+            return real_import(name, *args, **kwargs)
+
+        try:
+            get_registry()
+            assert [r for r in records if r.levelno >= logging.WARNING] == []
+
+            reset_registry()
+            with patch("headroom.learn.registry.importlib.import_module", _import):
+                reg = get_registry()
+            assert "grok" not in reg
+            assert "claude" in reg
+            warnings = [r for r in records if r.levelno == logging.WARNING]
+            assert len(warnings) == 1
+            assert "grok" in warnings[0].getMessage()
+        finally:
+            logger.removeHandler(handler)
+
+
+_MALFORMED_ERROR = type("PRIVATE_CREDENTIAL_CANARY\nFORGED_LOG_ENTRY", (RuntimeError,), {})
+
+
+@pytest.mark.parametrize("level", [logging.INFO, logging.DEBUG])
+@pytest.mark.parametrize("source", ["builtin", "external"])
+def test_plugin_load_failure_logs_no_exception_text(monkeypatch, level, source) -> None:
+    """A failing plugin's exception message and class name stay out of every record."""
+    records: list[logging.LogRecord] = []
+
+    class _Collect(logging.Handler):
+        def emit(self, record: logging.LogRecord) -> None:
+            records.append(record)
+
+    error = _MALFORMED_ERROR("cannot open postgres://user:CRED_CANARY@db/learn")
+    monkeypatch.delenv("HEADROOM_DEBUG_DUMP", raising=False)
+    if source == "builtin":
+        real_import = importlib.import_module
+
+        def _import(name: str, *args, **kwargs):  # noqa: ANN002, ANN003, ANN202
+            if name == "headroom.learn.plugins.grok":
+                raise error
+            return real_import(name, *args, **kwargs)
+
+        monkeypatch.setattr("headroom.learn.registry.importlib.import_module", _import)
+    else:
+        broken_ep = MagicMock()
+        broken_ep.name = "broken"
+        broken_ep.load.side_effect = error
+        monkeypatch.setattr("importlib.metadata.entry_points", lambda group: [broken_ep])
+
+    logger = logging.getLogger("headroom.learn.registry")
+    handler = _Collect(level=logging.DEBUG)
+    previous = logger.level
+    logger.addHandler(handler)
+    logger.setLevel(level)
+    try:
+        reset_registry()
+        assert "claude" in get_registry()
+    finally:
+        logger.removeHandler(handler)
+        logger.setLevel(previous)
+        reset_registry()
+
+    warnings = [r for r in records if r.levelno == logging.WARNING]
+    assert len(warnings) == 1
+    assert ("grok" if source == "builtin" else "broken") in warnings[0].getMessage()
+    for record in records:
+        rendered = logging.Formatter().format(record)
+        assert "CRED_CANARY" not in rendered
+        assert "PRIVATE_CREDENTIAL_CANARY" not in rendered
+        assert "FORGED_LOG_ENTRY" not in rendered
+        assert "\n" not in rendered
 
 
 class TestResetRegistry:

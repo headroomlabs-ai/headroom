@@ -11,6 +11,8 @@ from typing import Any
 
 from opentelemetry import trace
 
+from headroom.offline import guard_egress
+
 from .metrics import _headroom_version, _parse_bool, _parse_key_value_pairs
 
 logger = logging.getLogger(__name__)
@@ -158,6 +160,17 @@ def configure_langfuse_tracing(
         )
         return get_headroom_tracer()
 
+    # Air-gap chokepoint, the exact counterpart of the one in metrics.py.
+    # Langfuse OTLP tracing ships every span off the box on a background
+    # BatchSpanProcessor timer — and unlike the metrics exporter, the endpoint
+    # here is Langfuse Cloud unless the operator overrode it. It was missed
+    # when the metric exporter was guarded; the two are the same egress shape
+    # and now refuse the same way. Guarded before OTLPSpanExporter is
+    # constructed, because the exporter opens its session eagerly.
+    guard_egress(
+        "Langfuse OTLP trace export",
+        resolved.endpoint or "the OTEL SDK's default OTLP endpoint",
+    )
     resource = Resource.create(
         {
             SERVICE_NAME: resolved.service_name,

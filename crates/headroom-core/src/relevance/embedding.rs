@@ -98,6 +98,22 @@ impl EmbeddingScorer {
     /// quality/speed tradeoff for compression-relevance scoring on
     /// short snippets.
     pub fn try_new_with_model(model_kind: EmbeddingModel) -> Result<Self, String> {
+        let name = format!("{:?}", model_kind);
+        // Air-gap chokepoint, FIRST thing in the function. `TextEmbedding::
+        // try_new` resolves the model's ONNX weights through `hf-hub`, which
+        // downloads from huggingface.co on a cache miss even with
+        // `HF_HUB_OFFLINE` set — the same hole the tokenizer and Kompress model
+        // fetches had. It sits ahead of the AVX2 and ort-loader probes below so
+        // that an air-gapped box reports the policy refusal rather than
+        // whichever local prerequisite happened to be missing as well.
+        //
+        // The refusal is soft here by design: this function already returns
+        // `Err(String)` for "ONNX runtime unavailable" and every caller degrades
+        // to the BM25 scorer, so an air-gapped box loses embedding relevance
+        // instead of failing a request. The message names the switch so the
+        // operator can tell the two causes apart in the log.
+        crate::offline::guard_egress("fastembed embedding model download", &name)
+            .map_err(|e| format!("EmbeddingScorer model load refused: {e}"))?;
         // fastembed links the precompiled ONNX Runtime binary, which contains
         // AVX2 instructions on x86. Loading/running it on a non-AVX2 CPU traps
         // with SIGILL (issue #1723) — an uncatchable native fault. Bail early so
@@ -113,7 +129,6 @@ impl EmbeddingScorer {
         // `dynamic_ort_loader_ready`).
         crate::transforms::magika_detector::dynamic_ort_loader_ready()
             .map_err(|e| format!("EmbeddingScorer: ONNX Runtime unavailable: {e}"))?;
-        let name = format!("{:?}", model_kind);
         let model = TextEmbedding::try_new(InitOptions::new(model_kind))
             .map_err(|e| format!("EmbeddingScorer model load failed: {}", e))?;
         Ok(EmbeddingScorer {
@@ -306,6 +321,28 @@ mod tests {
     #[cfg(feature = "ml")]
     fn fastembed_enabled() -> bool {
         std::env::var("RUN_FASTEMBED_TESTS").is_ok()
+    }
+
+    /// `try_new_with_model` must refuse before fastembed resolves the model,
+    /// and must say so in the returned message rather than looking like an
+    /// ordinary load failure — the caller only ever sees the `String`.
+    ///
+    /// Not gated on `RUN_FASTEMBED_TESTS`: the whole point is that no network
+    /// call happens, so this is safe to run in CI. If the guard were removed
+    /// this test would either download ~30 MB or fail with a load error, and
+    /// neither says "refused".
+    #[cfg(feature = "ml")]
+    #[test]
+    fn try_new_refuses_while_offline() {
+        let _guard = crate::test_support::env_lock();
+        std::env::set_var(crate::offline::OFFLINE_ENV, "1");
+        let result = EmbeddingScorer::try_new();
+        std::env::remove_var(crate::offline::OFFLINE_ENV);
+
+        let err = result.err().expect("guard must refuse while offline");
+        assert!(err.contains("refused"), "{err}");
+        assert!(err.contains(crate::offline::OFFLINE_ENV), "{err}");
+        assert!(err.contains("fastembed embedding model download"), "{err}");
     }
 
     /// Construct a stub scorer with `model = None` for offline-safe

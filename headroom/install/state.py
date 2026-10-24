@@ -108,6 +108,15 @@ def _migrate_deprecated_image(image: Any) -> Any:
     return image
 
 
+def _manifest_from_payload(payload: dict[str, Any]) -> DeploymentManifest:
+    """Build a manifest from its decoded JSON, migrating the retired image repo."""
+    payload["mutations"] = [ManagedMutation(**item) for item in payload.get("mutations", [])]
+    payload["artifacts"] = [ArtifactRecord(**item) for item in payload.get("artifacts", [])]
+    if "image" in payload:
+        payload["image"] = _migrate_deprecated_image(payload["image"])
+    return DeploymentManifest(**payload)
+
+
 def load_manifest(profile: str = "default") -> DeploymentManifest | None:
     """Load a deployment manifest when present."""
 
@@ -119,13 +128,15 @@ def load_manifest(profile: str = "default") -> DeploymentManifest | None:
     # command and the auto-run `init hook ensure` route through here. Raise a
     # typed error so callers can report cleanly or degrade gracefully.
     try:
-        payload = json.loads(path.read_text(encoding="utf-8"))
-        payload["mutations"] = [ManagedMutation(**item) for item in payload.get("mutations", [])]
-        payload["artifacts"] = [ArtifactRecord(**item) for item in payload.get("artifacts", [])]
-        if "image" in payload:
-            payload["image"] = _migrate_deprecated_image(payload["image"])
-        return DeploymentManifest(**payload)
-    except (json.JSONDecodeError, ValueError, TypeError, OSError) as e:
+        text = path.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError) as e:
+        raise ManifestError(
+            f"deployment profile '{profile}' could not be read ({path}): {e}. "
+            "Check the file's permissions and that it is UTF-8."
+        ) from e
+    try:
+        return _manifest_from_payload(json.loads(text))
+    except (ValueError, TypeError) as e:
         raise ManifestError(f"deployment profile '{profile}' is corrupt ({path}): {e}") from e
 
 
@@ -139,16 +150,24 @@ def list_manifests() -> list[DeploymentManifest]:
     manifests: list[DeploymentManifest] = []
     for candidate in sorted(root.glob("*/manifest.json")):
         try:
-            payload = json.loads(candidate.read_text(encoding="utf-8"))
-            payload["mutations"] = [
-                ManagedMutation(**item) for item in payload.get("mutations", [])
-            ]
-            payload["artifacts"] = [ArtifactRecord(**item) for item in payload.get("artifacts", [])]
-            if "image" in payload:
-                payload["image"] = _migrate_deprecated_image(payload["image"])
-            manifests.append(DeploymentManifest(**payload))
-        except (OSError, ValueError, TypeError):
+            text = candidate.read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError) as e:
+            logger.warning(
+                "Skipping unreadable deployment manifest %s: %s. Check the file's "
+                "permissions and that it is UTF-8.",
+                candidate,
+                e,
+            )
             continue
+        try:
+            manifests.append(_manifest_from_payload(json.loads(text)))
+        except (ValueError, TypeError) as e:
+            logger.warning(
+                "Skipping corrupt deployment manifest %s: %s. Fix or delete the file to "
+                "restore that profile.",
+                candidate,
+                e,
+            )
     return manifests
 
 

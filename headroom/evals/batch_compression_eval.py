@@ -46,6 +46,7 @@ from headroom.evals.metrics import (
     compute_rouge_l,
     compute_semantic_similarity,
 )
+from headroom.offline import guard_egress
 from headroom.transforms.content_router import ContentRouter, ContentRouterConfig
 
 logger = logging.getLogger(__name__)
@@ -1029,6 +1030,7 @@ class BatchCompressionEvaluator:
 
     def _init_llm_client(self) -> Any:
         """Initialize LLM client."""
+        guard_egress(f"{self.provider} API for the batch compression benchmark")
         if self.provider == "anthropic":
             try:
                 import anthropic

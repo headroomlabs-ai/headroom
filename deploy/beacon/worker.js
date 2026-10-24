@@ -6,7 +6,8 @@
  * client sends AND exactly what happens to it on arrival. "Trust us" is not a
  * privacy policy.
  *
- * Deployed at otlp.headroomlabs.ai. Three jobs:
+ * Deployed at headroom-beacon.headroom-beacon.workers.dev (otlp.headroomlabs.ai
+ * is planned but not yet routed; see wrangler.toml). Three jobs:
  *
  *   1. Allowlist. Drop every field not on ALLOWED_KEYS before anything is
  *      written. This is the only privacy control that works retroactively —
@@ -25,7 +26,9 @@
  *
  * What this deliberately does NOT do: log, store, or forward the source IP.
  * Cloudflare offers it as cf-connecting-ip; it is the one field that would
- * deanonymise install_id, so it is never read.
+ * deanonymise install_id, so it is never read. Cloudflare's own per-request
+ * invocation logs would record it regardless of this code, which is why
+ * wrangler.toml turns them off (observability.logs.invocation_logs = false).
  */
 
 // Mostly mirrors the payload built by _Session.payload(); an extension may
@@ -122,10 +125,8 @@ const ALLOWED_RESOURCE = [
 // retried, so the event would simply be lost.
 //
 // Restored to ~3x the worst legitimate payload. This is not the abuse control
-// and never was: the endpoint is unauthenticated by design and the WAF rate
-// limit (60 req/min/IP, see wrangler.toml) is what bounds a bad actor. At 60
-// requests a minute the difference between these two ceilings is 3.8 MB/min
-// and 15 MB/min, neither of which is interesting to Cloudflare.
+// and never was: the endpoint is unauthenticated by design and the RATE_LIMIT
+// binding (see fetch() and wrangler.toml) is what bounds a bad actor.
 const MAX_BODY_BYTES = 256 * 1024;
 
 // Cap on what an arriving body EXPANDS to. `raw.byteLength` cannot see this:
@@ -403,6 +404,31 @@ export default {
     const url = new URL(request.url);
     if (url.pathname !== '/v1/logs') {
       return new Response('not found', { status: 404 });
+    }
+
+    // Abuse bound, checked before the body is read so a flood costs neither
+    // the inflate nor an R2 write. Keyed on one constant rather than the
+    // sender: a per-IP limit would mean reading cf-connecting-ip, which this
+    // Worker never does (see the header). The price is that a flood also
+    // sheds real events until the window rolls over -- acceptable for
+    // fire-and-forget telemetry, and the cap sits ~10x above normal traffic.
+    //
+    // 429 is safe for old clients: only 400/415 make them drop gzip
+    // (_GZIP_REFUSED_STATUSES in headroom/telemetry/session.py).
+    //
+    // Fails open: with no binding (local tests, an old wrangler.toml) or when
+    // the rate-limit service itself errors, the upload proceeds. A limiter
+    // outage must not drop every legitimate beacon; the cost is that a flood
+    // during that outage is unbounded until the service recovers.
+    if (env.RATE_LIMIT) {
+      let limited = false;
+      try {
+        const { success } = await env.RATE_LIMIT.limit({ key: 'all' });
+        limited = !success;
+      } catch (err) {
+        console.error('beacon: rate limiter unavailable, failing open:', String(err));
+      }
+      if (limited) return new Response('rate limited', { status: 429 });
     }
 
     const raw = await request.arrayBuffer();

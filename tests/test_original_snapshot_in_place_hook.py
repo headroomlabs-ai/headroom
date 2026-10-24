@@ -4,8 +4,10 @@ O1 aliases ``original_client_messages`` to the live ``messages`` list to skip a
 deepcopy per request. That is only safe while nothing mutates the list before
 the pipeline's own copy; ``config.hooks.pre_compress`` receives the live list,
 so a hook that edits it in place (and returns the same list) used to rewrite the
-recorded original too. With hooks or extensions configured the snapshot is an
-independently owned copy; with neither, the alias stays (no env switch).
+recorded original too. Registered turn hooks (skill search) fold message text
+in place the same way. With hooks, extensions or turn hooks configured the
+snapshot is an independently owned copy; with none, the alias stays (no env
+switch).
 
 Observed at the handlers' own consumers: ``compute_session_id`` derives the
 session from the ORIGINAL client messages after the hook has run, and the
@@ -27,8 +29,18 @@ from fastapi.testclient import TestClient  # noqa: E402
 from headroom.hooks import CompressionHooks  # noqa: E402
 from headroom.proxy.helpers import snapshot_original_messages  # noqa: E402
 from headroom.proxy.server import ProxyConfig, create_app  # noqa: E402
+from headroom.proxy.turn_hooks import clear_turn_hooks, register_turn_hook  # noqa: E402
 
 ORIGINAL = "the original user text"
+
+
+@pytest.fixture(autouse=True)
+def _clean_turn_hooks():
+    clear_turn_hooks()
+    yield
+    clear_turn_hooks()
+
+
 HOOKED = "HOOKED IN PLACE"
 
 
@@ -175,3 +187,66 @@ def test_the_snapshot_aliases_only_when_nothing_can_mutate() -> None:
     for kw in ({"hooks": _InPlaceHooks()}, {"extensions": _Ext()}):
         snap = snapshot_original_messages(msgs, **kw)
         assert snap == msgs and snap is not msgs and snap[0] is not msgs[0]
+
+
+def test_the_snapshot_is_a_copy_while_a_turn_hook_is_registered() -> None:
+    msgs = [{"role": "user", "content": ORIGINAL}]
+    register_turn_hook(_InPlaceTurnHook())
+    snap = snapshot_original_messages(msgs)
+    assert snap == msgs and snap is not msgs and snap[0] is not msgs[0]
+
+
+class _InPlaceTurnHook:
+    """Shaped like skill search: rewrites a message's text in place, adds a tool."""
+
+    name = "in_place_fold"
+    stream_safe = False
+
+    def on_request(self, ctx) -> None:
+        for m in ctx.messages:
+            if m.get("role") == "user":
+                m["content"] = "short"
+        ctx.tools = [
+            *(ctx.tools or []),
+            {"name": "search", "description": "find", "input_schema": {"type": "object"}},
+        ]
+
+
+def test_anthropic_headline_counts_a_turn_hook_fold_made_in_place() -> None:
+    register_turn_hook(_InPlaceTurnHook())
+    with TestClient(create_app(_config(hooks=None))) as client:
+        proxy = client.app.state.proxy
+
+        async def _fake_retry(method, url, headers, body, stream=False, **kwargs):  # noqa: ANN001
+            return httpx.Response(
+                200,
+                content=json.dumps(
+                    {
+                        "id": "msg_1",
+                        "type": "message",
+                        "role": "assistant",
+                        "model": "claude-sonnet-4-5",
+                        "content": [{"type": "text", "text": "ok"}],
+                        "stop_reason": "end_turn",
+                        "usage": {"input_tokens": 5, "output_tokens": 1},
+                    }
+                ).encode(),
+                headers={"content-type": "application/json"},
+            )
+
+        proxy._retry_request = _fake_retry
+        r = client.post(
+            "/v1/messages",
+            headers={"x-api-key": "sk-ant-test", "anthropic-version": "2023-06-01"},
+            json={
+                "model": "claude-sonnet-4-5",
+                "max_tokens": 16,
+                "messages": [{"role": "user", "content": ORIGINAL + " word" * 400}],
+            },
+        )
+        assert r.status_code == 200, r.text
+
+    before = int(r.headers["x-headroom-tokens-before"])
+    after = int(r.headers["x-headroom-tokens-after"])
+    assert before > after
+    assert int(r.headers["x-headroom-tokens-saved"]) == before - after > 0

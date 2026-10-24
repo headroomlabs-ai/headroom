@@ -63,6 +63,8 @@ from ..config import (
     is_tool_excluded,
     unwrap_tool_call,
 )
+from ..log_safety import content_logging_enabled
+from ..offline import OfflineEgressBlocked
 from ..parser import CCR_RETRIEVAL_MARKER_RE
 from ..tokenizer import Tokenizer
 from ..tokenizers.base import count_content_blocks
@@ -79,6 +81,7 @@ from .compressor_registry import (
 from .content_detector import (
     ContentType,
     DetectionResult,
+    _try_detect_git_status,
     _try_detect_log,
     _try_detect_search,
     _try_detect_structured_config,
@@ -165,6 +168,68 @@ def _estimate_tokens(text: str) -> int:
     return max(1, _TOKEN_ESTIMATOR.count_text(text))
 
 
+#: Share of the outer compression timeout the ML stage may consume. The
+#: remainder has to cover this request's non-ML work AND the overrun of the one
+#: ML call that can still be running when the ceiling is reached -- the worker
+#: is not preemptible, so the ceiling can only stop the NEXT call.
+_ML_STAGE_BUDGET_FRACTION = 0.5
+
+
+def _ml_stage_deadline_seconds() -> float:
+    """Wall-clock ceiling for ALL ML (Kompress) work inside one request.
+
+    ``_kompress_max_tokens`` bounds a single block. It cannot bound a request:
+    the mixed-content path splits a payload into sections and calls
+    ``_try_ml_compressor`` once per section (see ``_compress_mixed``), so every
+    section can sit under the per-block ceiling while their sum runs for
+    minutes. #3711 reported ~70s on a 1.4MB tool_result of prose blocks
+    separated by small JSON objects -- with the size gate recording only
+    ``within`` -- which blew the 30s compression budget and then quarantined
+    compression for every following request.
+
+    So the guard has to match the budget's granularity: once this much time
+    has gone into ML for this request, remaining blocks pass through unchanged.
+    Raw rather than a cheaper lossy fallback: the router caches that verdict,
+    so the block keeps the same bytes on later turns and the prompt cache
+    holds.
+
+    The point of the ceiling is to degrade to a partial compression *before*
+    the executor abandons a non-preemptible worker, so it is worthless unless
+    it sits below the deadline that does the abandoning. A bare default could
+    not promise that: an operator who lowers
+    ``HEADROOM_COMPRESSION_TIMEOUT_SECONDS`` below 15s got a guard that could
+    never fire first -- exactly the failure this exists to prevent. The budget
+    is therefore clamped to :data:`_ML_STAGE_BUDGET_FRACTION` of the effective
+    outer timeout, leaving the remainder for the non-ML work in the same
+    request (lossless transforms, assembly) plus the overrun of the one ML call
+    already in flight when the ceiling is reached.
+
+    The outer budget read here is ``HEADROOM_COMPRESSION_TIMEOUT_SECONDS``, the
+    executor timeout that quarantines the stage -- NOT
+    ``HEADROOM_COMPRESSION_DEADLINE_MS``, which bounds a different, softer
+    in-router deadline (see ``_compression_deadline_seconds``).
+
+    ``0`` disables the ceiling (previous behavior), and an explicit request
+    below the clamp is honoured -- the clamp only ever lowers.
+    """
+    try:
+        configured = max(
+            0.0,
+            float(os.environ.get("HEADROOM_ML_STAGE_DEADLINE_SECONDS", "15")),
+        )
+    except ValueError:
+        configured = 15.0
+    if configured <= 0.0:
+        return 0.0
+    try:
+        outer = float(os.environ.get("HEADROOM_COMPRESSION_TIMEOUT_SECONDS", "30"))
+    except ValueError:
+        outer = 30.0
+    if outer <= 0.0:
+        return configured
+    return min(configured, outer * _ML_STAGE_BUDGET_FRACTION)
+
+
 def _compression_deadline_seconds() -> float:
     try:
         return max(
@@ -173,6 +238,13 @@ def _compression_deadline_seconds() -> float:
         )
     except ValueError:
         return 20.0
+
+
+def _compress_workers() -> int:
+    try:
+        return int(os.environ.get("HEADROOM_COMPRESS_WORKERS", "4"))
+    except ValueError:
+        return 4
 
 
 def _router_debug_dumps(value: Any) -> str:
@@ -882,8 +954,14 @@ def _bash_command_is_search(command: str, search_commands: frozenset[str]) -> bo
     return prog in search_commands
 
 
+def _router_debug_enabled() -> bool:
+    """Router debug events carry the tool output being routed, so DEBUG alone is
+    not enough: they also need the explicit content opt-in."""
+    return logger.isEnabledFor(logging.DEBUG) and content_logging_enabled()
+
+
 def _log_router_debug(event: str, **payload: Any) -> None:
-    if not logger.isEnabledFor(logging.DEBUG):
+    if not _router_debug_enabled():
         return
     payload = {"event": event, **payload}
     logger.debug("event=%s %s", event, _router_debug_dumps(payload))
@@ -1140,6 +1218,12 @@ def _detect_content(content: str) -> DetectionResult:
     # the whole result misclassified as HTML/XML (#route-converter corruption).
     content = _strip_detection_envelope(content)
 
+    # Status paths/state are structural ground truth even if Magika assigns
+    # another content type; retain the format metadata on both backends.
+    git_status = _try_detect_git_status(content)
+    if git_status is not None:
+        return git_status
+
     backend = _resolve_detect_backend()
     if backend == "python":
         if not _detect_backend_warned:
@@ -1185,7 +1269,7 @@ def _detect_content(content: str) -> DetectionResult:
         # "json_array"); translate to the Python `ContentType` enum so
         # downstream mapping keys match.
         content_type = ContentType(rust_result.content_type)
-    except (KeyboardInterrupt, SystemExit, GeneratorExit):
+    except (KeyboardInterrupt, SystemExit, GeneratorExit, OfflineEgressBlocked):
         raise
     except BaseException as exc:  # noqa: BLE001
         # A native Rust panic surfaces as pyo3_runtime.PanicException, which
@@ -1194,7 +1278,9 @@ def _detect_content(content: str) -> DetectionResult:
         # (panic, or an unrecognized content-type tag) degrades to the
         # pure-Python detector instead of aborting the request. See #1123.
         # Guard: don't swallow cancellation/control-flow BaseExceptions such
-        # as asyncio.CancelledError — keep them propagating.
+        # as asyncio.CancelledError — keep them propagating. OfflineEgressBlocked
+        # is in that list for the same reason: it is a policy refusal, not a
+        # detector failure, and degrading it here would hide the air-gap switch.
         if isinstance(exc, asyncio.CancelledError):
             raise
         if isinstance(exc, TimeoutError):
@@ -1767,6 +1853,37 @@ class RouterCompressionResult:
             )
 
 
+def _mcp_result_min_chars() -> int:
+    """Below this many characters an MCP tool result is never compressed."""
+    try:
+        return max(0, int(os.environ.get("HEADROOM_MCP_RESULT_MIN_CHARS", "4000")))
+    except ValueError:
+        return 4000
+
+
+#: MCP tool-name prefixes seen on the wire: ``mcp__server__tool`` (Claude Code,
+#: Codex, Droid), ``mcp_server_tool`` (Gemini, VS Code Copilot), ``mcp--server--tool``
+#: (Roo). Harnesses that send bare MCP names cannot be told apart from built-ins.
+_MCP_NAME_PREFIXES = ("mcp_", "mcp--")
+
+
+def _is_small_mcp_result(tool_name: Any, text: Any) -> bool:
+    """True when ``text`` is an MCP tool's output short enough to keep verbatim.
+
+    A Jira ticket or a Slack thread is a few hundred tokens of high-value fields.
+    Compressing it saves tens of tokens, and when the model misses a field it
+    re-calls the tool or headroom_retrieve: a whole extra turn that re-reads the
+    entire cached conversation (measured: +2 turns, +15% cost on
+    benchmarks/tool_search_vs_native). ``HEADROOM_MCP_RESULT_MIN_CHARS=0``
+    restores the old behaviour.
+    """
+    return (
+        isinstance(text, str)
+        and str(tool_name or "").lower().startswith(_MCP_NAME_PREFIXES)
+        and len(text) < _mcp_result_min_chars()
+    )
+
+
 @dataclass
 class ContentRouterConfig:
     """Configuration for intelligent content routing.
@@ -2044,6 +2161,22 @@ class _PerRequestRuntimeState:
 
     compression_policy: Any = None
     target_ratio: float | None = None
+    # Whether an `apply()` call owns this state and the ML budget therefore
+    # applies. False on the INSTANCE-SCOPED DEFAULT that direct `compress()`
+    # callers read (see `ContentRouter.__init__`): that object is shared by
+    # every such call for the life of the router, so charging it would
+    # accumulate across unrelated calls until ML switched itself off forever.
+    # Direct callers keep the old unbounded behaviour.
+    ml_budget_active: bool = False
+    # Seconds this request has spent INSIDE the ML compressor (#3711).
+    # Cumulative rather than a wall-clock deadline stamped at `apply()` entry:
+    # the budget is a statement about ML work, so time spent on lifecycle,
+    # classification and lossless transforms must not draw it down.
+    ml_elapsed: float = 0.0
+    # Longest single ML call observed in THIS request, seconds per estimated
+    # token. Used to project whether the next block can finish inside what is
+    # left; see `_try_ml_compressor`.
+    ml_seconds_per_token: float = 0.0
     force_kompress: bool = False
     skip_kompress: bool = False
     kompress_model: str | None = None
@@ -2363,7 +2496,6 @@ class ContentRouter(Transform):
         # skip — i.e. revert it to original text and bust the provider prefix
         # cache. Counting pins isolates the freeze's attributable payoff.
         self._freeze_pin_hits = 0
-        self._freeze_pin_chars = 0
 
     # ── #3486: per-request runtime state accessors ──────────────────────
     #
@@ -2498,7 +2630,6 @@ class ContentRouter(Transform):
         preserved = max(0, int(len(content) * (1.0 - cached_ratio)))
         with self._frozen_lock:
             self._freeze_pin_hits += 1
-            self._freeze_pin_chars += preserved
             hits = self._freeze_pin_hits
         logger.info(
             f"FREEZE-PIN: pins={hits} cached_ratio={cached_ratio:.3f} "
@@ -2617,6 +2748,21 @@ class ContentRouter(Transform):
             return bool(compressor.is_ready())
         except Exception:
             return True
+
+    @staticmethod
+    def _kompress_load_in_progress(compressor: Any) -> bool:
+        """Whether a background thread is still fetching or loading ``compressor``'s model.
+
+        Compressors without ``is_loading`` (the remote one is always ready,
+        test doubles) count as not loading.
+        """
+        is_loading = getattr(compressor, "is_loading", None)
+        if is_loading is None:
+            return False
+        try:
+            return bool(is_loading())
+        except Exception:
+            return False
 
     def _record_to_toin(
         self,
@@ -2747,7 +2893,7 @@ class ContentRouter(Transform):
             RouterCompressionResult with compressed content and routing metadata.
         """
         context = context or ""
-        debug_enabled = logger.isEnabledFor(logging.DEBUG)
+        debug_enabled = _router_debug_enabled()
         request_debug = (
             {
                 "chars": len(content),
@@ -2937,6 +3083,9 @@ class ContentRouter(Transform):
         if detection is None:
             detection = _detect_content(content)
 
+        if detection.metadata.get("format") == "git_status":
+            return CompressionStrategy.TABULAR
+
         # 1. Check for mixed content
         if mixed:
             # 2. Verify with the native detector: ``is_mixed_content`` uses
@@ -3042,7 +3191,7 @@ class ContentRouter(Transform):
             sections_source,
             isolate=tuple(placeholder for placeholder, _ in protected),
         )
-        if logger.isEnabledFor(logging.DEBUG):
+        if _router_debug_enabled():
             _log_router_debug(
                 "content_router_mixed_sections",
                 section_count=len(sections),
@@ -3717,6 +3866,11 @@ class ContentRouter(Transform):
             log]``). Log readers use this to see *how* we got to the
             final compressor without parsing decision_reason strings.
         """
+        # Git status is path/state ground truth, not a rectangular CSV table.
+        # Preserve it before embedded-JSON, lossy-after-fold and external stages.
+        if _try_detect_git_status(_strip_detection_envelope(content)) is not None:
+            return content, _estimate_tokens(content), [CompressionStrategy.TABULAR.value]
+
         # ── STRUCTURAL (embedded) JSON routing ───────────────────────────────
         # Before anything else: if this block is not a single JSON value but
         # CONTAINS balanced JSON span(s), route each span through this very
@@ -4259,7 +4413,7 @@ class ContentRouter(Transform):
                     compressed, compressed_tokens = dense
                     strategy_chain.append("dense_elide")
                     decision_reason = f"{decision_reason}_dense_elide"
-            if logger.isEnabledFor(logging.DEBUG):
+            if _router_debug_enabled():
                 _log_router_debug(
                     "content_router_strategy_result",
                     requested_strategy=requested_strategy.value,
@@ -4319,7 +4473,7 @@ class ContentRouter(Transform):
                 )
                 return elided, elided_tokens, strategy_chain
         strategy_chain.append(CompressionStrategy.PASSTHROUGH.value)
-        if logger.isEnabledFor(logging.DEBUG):
+        if _router_debug_enabled():
             _log_router_debug(
                 "content_router_strategy_result",
                 requested_strategy=requested_strategy.value,
@@ -4374,6 +4528,28 @@ class ContentRouter(Transform):
                 logger.debug("dense-line elision: CCR store unavailable (%s); skipping", exc)
                 return None
         return elided, _estimate_tokens(elided)
+
+    def _charge_ml_time(self, elapsed: float, text: str) -> None:
+        """Bill *elapsed* seconds of ML work to this request's budget.
+
+        Also records the worst seconds-per-token seen so far, which is what the
+        admission check in :meth:`_try_ml_compressor` projects the NEXT block
+        with. Worst case rather than an average: the ceiling exists to stop a
+        single long call from overrunning the outer timeout, and an average
+        would let one slow block hide behind several fast ones.
+
+        Best-effort -- accounting must never break a compression that worked.
+        """
+        try:
+            state = self._runtime_state_var.get()
+            if not state.ml_budget_active:
+                return
+            state.ml_elapsed += max(0.0, elapsed)
+            tokens = _estimate_tokens(text)
+            if tokens > 0 and elapsed > 0.0:
+                state.ml_seconds_per_token = max(state.ml_seconds_per_token, elapsed / tokens)
+        except Exception:  # pragma: no cover - defensive
+            logger.debug("ML budget accounting failed", exc_info=True)
 
     def _embedded_json_route(
         self, content: str, context: str, question: str | None, bias: float
@@ -4465,6 +4641,60 @@ class ContentRouter(Transform):
         # (under the 50,000 cap, gate silent) but 55,557 estimator tokens, 11%
         # over. That is exactly the >30s non-preemptible ONNX inference this gate
         # exists to prevent (#1171).
+        # Request-scoped ML ceiling (#3711). The size check below bounds ONE
+        # block; this bounds the request. Without it a payload split into many
+        # individually-small sections calls this function once per section, each
+        # passing the size gate, until the sum blows the compression budget and
+        # quarantines the stage for every later request. Checked before the size
+        # gate so an over-budget request stops paying the estimator too.
+        # An admission check that only asks "is the budget gone yet?" lets a
+        # call start at 14.9s of a 15s budget and run for another minute: the
+        # ONNX worker is not preemptible, so nothing stops it once it begins,
+        # and it can overrun the outer executor timeout the ceiling exists to
+        # protect. So project this block's cost and refuse it unless it can
+        # plausibly FINISH inside what is left.
+        #
+        # The projection uses the worst seconds-per-token this request has
+        # actually measured. The first block of a request has no measurement,
+        # so it cannot be refused on one -- instead the call itself is capped:
+        # what is left of the budget goes to Kompress as its per-call time
+        # budget (below), and Kompress stops at the next chunk boundary when
+        # it runs out, returning the block unchanged. That holds for every
+        # call, so a projection that guessed low cannot overrun either.
+        _ml_state = self._runtime_state_var.get()
+        _ml_budget = _ml_stage_deadline_seconds() if _ml_state.ml_budget_active else 0.0
+        _remaining = (_ml_budget - _ml_state.ml_elapsed) if _ml_budget > 0 else None
+        # Exhausted is decided before any estimator work, so an over-budget
+        # request stops paying for tokenization too.
+        _over_budget = _remaining is not None and _remaining <= 0.0
+        _block_tokens = -1
+        _projected = 0.0
+        if _remaining is not None and not _over_budget:
+            _rate = _ml_state.ml_seconds_per_token
+            if _rate > 0.0:
+                _block_tokens = _estimate_tokens(text_to_compress)
+                _projected = _block_tokens * _rate
+                _over_budget = _projected > _remaining
+        if _over_budget:
+            self._observe_kompress_size_gate("deadline")
+            if _block_tokens < 0:
+                _block_tokens = _estimate_tokens(text_to_compress)
+            logger.info(
+                "ML stage budget spent (%.1fs of %.1fs used, ~%.1fs projected for a "
+                "~%d tok block, %.1fs left); passing remaining blocks through "
+                "unchanged. Partial compression beats a blown budget.",
+                _ml_state.ml_elapsed,
+                _ml_budget,
+                _projected,
+                _block_tokens,
+                max(0.0, _remaining or 0.0),
+            )
+            # Unchanged, not the size gate's lossy fallback below: this
+            # verdict depends on the request, not the content, and the router
+            # caches it, so the bytes must be ones it can keep sending on
+            # later turns without busting the prompt cache.
+            return content, _estimate_tokens(content)
+
         if (
             self._kompress_max_tokens > 0
             and _estimate_tokens(text_to_compress) > self._kompress_max_tokens
@@ -4517,10 +4747,22 @@ class ContentRouter(Transform):
             if compressor:
                 if not compressor.is_ready():
                     compressor.ensure_background_load()
-                    # Surface: warn once per ContentRouter instance so operators
-                    # know compression is degraded — model not cached, or
-                    # HuggingFace unreachable (corporate firewall, SSL, etc.).
-                    if not getattr(self, "_kompress_warned", False):
+                    # Surface once per ContentRouter instance that requests pass
+                    # through uncompressed. While a thread is still fetching or
+                    # loading the model (the post-startup warm-up, or the
+                    # download just started above) that is expected, so say it
+                    # at INFO. With no loader running, e.g. a failed download
+                    # in its retry backoff, compression is degraded: warn and
+                    # name the usual causes (_background_download has already
+                    # logged the actual error).
+                    if self._kompress_load_in_progress(compressor):
+                        if not getattr(self, "_kompress_loading_noted", False):
+                            logger.info(
+                                "Kompress model still loading in the background; "
+                                "requests pass through uncompressed until it is ready."
+                            )
+                            self._kompress_loading_noted = True
+                    elif not getattr(self, "_kompress_warned", False) and not compressor.is_ready():
                         logger.warning(
                             "Kompress model not ready; requests will not be "
                             "compressed. Check HuggingFace connectivity or "
@@ -4561,7 +4803,28 @@ class ContentRouter(Transform):
                             compressor, "shares_request_deadline", False
                         ):
                             compress_kwargs["_deadline_started_at"] = deadline_origin
-                        result = compressor.compress(text_to_compress, **compress_kwargs)
+                        # The ML budget's remainder caps THIS call, so the
+                        # first one of a request -- admitted without a measured
+                        # cost -- cannot run past the budget either. Remote
+                        # Kompress takes the cap too (it bounds the whole HTTP
+                        # request, and declines the call when too little is
+                        # left) but not the shared deadline origin, hence the
+                        # separate flag.
+                        if _remaining is not None and (
+                            getattr(compressor, "shares_request_deadline", False)
+                            or getattr(compressor, "accepts_time_budget_cap", False)
+                        ):
+                            compress_kwargs["_time_budget_cap_seconds"] = _remaining
+                        _ml_started = time.monotonic()
+                        try:
+                            result = compressor.compress(text_to_compress, **compress_kwargs)
+                        finally:
+                            # In a `finally` so a call that RAISES still draws
+                            # down the budget: a failing compressor burns the
+                            # same non-preemptible wall clock as a passing one,
+                            # and not charging for it let a request retry its
+                            # way past the ceiling.
+                            self._charge_ml_time(time.monotonic() - _ml_started, text_to_compress)
                         compressed = result.compressed
                         compressed_tokens = result.compressed_tokens
                     except Exception as e:
@@ -4935,7 +5198,12 @@ class ContentRouter(Transform):
         if self.config.enable_kompress:
             compressor = self._get_kompress()
             if compressor:
-                if not hasattr(compressor, "preload"):
+                if compressor is self._get_remote_kompress():
+                    # HEADROOM_KOMPRESS_ENDPOINT runs the model; there is no
+                    # local model to download or warm.
+                    status["kompress"] = "enabled"
+                    status["kompress_backend"] = "remote"
+                elif not hasattr(compressor, "preload"):
                     status["kompress"] = "enabled"
                     status["kompress_backend"] = "unknown"
                 else:
@@ -5482,8 +5750,18 @@ class ContentRouter(Transform):
         # The kompress deadline origin is stamped HERE, with the rest of the
         # per-request state, so every block this call compresses draws down one
         # shared budget instead of restarting it.
+        #
+        # The ML ceiling (#3711) is deliberately NOT armed here. It used to be,
+        # which meant lifecycle work, message classification, lossless
+        # transforms and task preparation all ran down a budget whose log line
+        # claimed to measure time "in ML". `_try_ml_compressor` accumulates the
+        # time it actually spends inside the compressor instead, so the number
+        # means what it says.
         self._runtime_state_var.set(
-            _PerRequestRuntimeState(kompress_deadline_started_at=time.perf_counter())
+            _PerRequestRuntimeState(
+                kompress_deadline_started_at=time.perf_counter(),
+                ml_budget_active=True,
+            )
         )
 
         # Pre-process: Read lifecycle management (stale/superseded detection)
@@ -6037,6 +6315,16 @@ class ContentRouter(Transform):
                 tool_name = tool_name_map.get(tool_call_id, "")
                 bias = self._get_tool_bias(tool_name) if tool_name else 1.0
 
+                # Small MCP results stay verbatim: twin of the Anthropic
+                # tool_result branch in _process_content_blocks.
+                if _is_small_mcp_result(tool_name, content):
+                    result_slots[i] = message
+                    transforms_applied.append("router:mcp_small_result_verbatim")
+                    route_counts["mcp_small_result"] = route_counts.get("mcp_small_result", 0) + 1
+                    if collect_diagnostics:
+                        _diag[i] = "protected:mcp_small_result"
+                    continue
+
                 # Bash-search lossless pre-empt: a read-only search (grep/rg/git
                 # grep) run via a shell tool yields byte-losslessly foldable
                 # output. Fold it instead of the lossy strategy path.
@@ -6299,9 +6587,7 @@ class ContentRouter(Transform):
 
         # --- Pass 2: Parallel compression of all cache-miss messages ---
         if pending_tasks:
-            max_workers = min(
-                len(pending_tasks), int(os.environ.get("HEADROOM_COMPRESS_WORKERS", "4"))
-            )
+            max_workers = min(len(pending_tasks), _compress_workers())
             t_parallel_start = time.perf_counter()
 
             if max_workers <= 1 or len(pending_tasks) == 1:
@@ -7187,6 +7473,16 @@ class ContentRouter(Transform):
                     else tool_content
                 )
 
+                # Small MCP results stay verbatim (see _is_small_mcp_result).
+                if _is_small_mcp_result(tool_name, tool_text):
+                    new_blocks.append(block)
+                    transforms_applied.append("router:mcp_small_result_verbatim")
+                    if route_counts is not None:
+                        route_counts["mcp_small_result"] = (
+                            route_counts.get("mcp_small_result", 0) + 1
+                        )
+                    continue
+
                 # Bash-search lossless pre-empt (twin of the string-form path):
                 # fold read-only search output (grep/rg/git grep) byte-losslessly
                 # instead of taking the lossy strategy path.
@@ -7626,24 +7922,3 @@ class ContentRouter(Transform):
         Always returns True - the router handles all content types.
         """
         return True
-
-
-def route_and_compress(
-    content: str,
-    context: str = "",
-) -> str:
-    """Convenience function for one-off routing and compression.
-
-    Args:
-        content: Content to compress.
-        context: Optional context for relevance-aware compression.
-
-    Returns:
-        Compressed content.
-
-    Example:
-        >>> compressed = route_and_compress(mixed_content)
-    """
-    router = ContentRouter()
-    result = router.compress(content, context=context)
-    return result.compressed

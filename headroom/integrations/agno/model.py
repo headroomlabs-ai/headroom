@@ -30,6 +30,7 @@ except ImportError:
     ModelResponse = dict  # type: ignore[misc,assignment]
 
 from headroom import HeadroomConfig, HeadroomMode
+from headroom.integrations._metrics import OptimizationMetrics
 from headroom.parser import _coerce_tool_call_to_dict
 from headroom.providers import OpenAIProvider
 from headroom.transforms import TransformPipeline
@@ -48,20 +49,6 @@ def _check_agno_available() -> None:
 def agno_available() -> bool:
     """Check if Agno is installed."""
     return AGNO_AVAILABLE
-
-
-@dataclass
-class OptimizationMetrics:
-    """Metrics from a single optimization pass."""
-
-    request_id: str
-    timestamp: datetime
-    tokens_before: int
-    tokens_after: int
-    tokens_saved: int
-    savings_percent: float
-    transforms_applied: list[str]
-    model: str
 
 
 @dataclass
