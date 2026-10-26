@@ -866,6 +866,11 @@ class RequestTransformer:
         # (booked on turn_hook_tools_saved_tokens), for signed netting.
         self.message_growth_tokens = 0
         self.hook_tool_saved_tokens = 0
+        # Tool-definition tokens before and after schema compaction, both 0 when
+        # it changed nothing or could not be counted. The compress handler folds
+        # them into ``tokens_before``/``tokens_after``, as the chat handlers do.
+        self.compaction_tokens_before = 0
+        self.compaction_tokens_after = 0
         self._tokenizer: Any = None
 
     def _get_tokenizer(self) -> Any:
@@ -906,6 +911,15 @@ class RequestTransformer:
             count_tools = _count_tools_with(tokenizer)
         except Exception:
             logger.debug("gateway turn: tokenizer unavailable; hook savings uncounted")
+        if tool_transforms:
+            # Counted before any hook runs: a hook may edit the compacted list.
+            # Tools the client already deferred are not billed, so their
+            # compaction saves nothing.
+            compacted_before = _safe_count(count_tools, _billed_tools(self.tools))
+            compacted_after = _safe_count(count_tools, _billed_tools(tools))
+            if compacted_before is not None and compacted_after is not None:
+                self.compaction_tokens_before = compacted_before
+                self.compaction_tokens_after = compacted_after
 
         # Built even with no hook registered: the response half drives CCR
         # retrieval through the same context (messages + live tools).
@@ -979,6 +993,13 @@ class RequestTransformer:
             messages_rewritten=messages_rewritten,
         )
         return messages
+
+
+def _billed_tools(tools: Any) -> Any:
+    """The tools that enter the billed context: all but those flagged ``defer_loading``."""
+    if not isinstance(tools, list):
+        return tools
+    return [t for t in tools if not (isinstance(t, dict) and t.get("defer_loading"))]
 
 
 def _safe_count(counter: Callable[[Any], int] | None, value: Any) -> int | None:
