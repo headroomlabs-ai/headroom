@@ -824,6 +824,13 @@ The response keeps every field above and adds six:
 
 Fail-open answers (bypass header, empty `messages`, stateless timeout) carry the same six keys with your original body, `obligations: []` and `headers: {}`.
 
+**Savings on a gateway answer.** The token counts follow the proxy path, so a gateway can report the same figure `/stats` does. When compaction shortened `tools`, `tokens_before` and `tokens_after` also count the tool definitions before and after it, so `tokens_saved` includes the compaction saving. Two more fields carry the tool definitions kept out of the context, which no message count sees; both are absent on fail-open answers:
+
+| Field | Description |
+| --- | --- |
+| `tool_tokens_saved` | Tool-search deferral plus tools a turn hook removed, net (`tool_search_deferred_tokens` after reconciliation + `turn_hook_tools_saved_tokens` after netting against message growth). `tokens_saved + tool_tokens_saved` is the `/stats` headline for the turn. |
+| `tool_tokens_deferred` | The deferral share of `tool_tokens_saved`. `/stats` books it as `estimated`: a deferred tool the model loads later is billed after all. Subtract it for a figure of measured savings only. |
+
 When `relay_usage` is owed, the turn's `/stats` record is deferred until the response half arrives with billed input and output, cache counts, provider status and latency; a turn that never comes back is recorded as-is when it expires. Pending turns live `HEADROOM_GATEWAY_TURN_TTL_SECONDS` (default `120`, refreshed on every `redrive`), at most `HEADROOM_GATEWAY_MAX_PENDING_TURNS` at a time (default `10000`, oldest evicted first), and a turn may re-drive at most `HEADROOM_GATEWAY_MAX_REDRIVES` times (default `8`).
 
 **`config.mode: "ccr"` on this contract.** When markers were inserted and re-driving is allowed, Headroom injects the `headroom_retrieve` tool into `body.tools` (`ccr_tool_injected` in `transforms_applied`), adds the `redrive` obligation, and the response half answers the model's retrieval calls itself — the gateway just keeps re-driving. Without `can_redrive`, `ccr` mode behaves as it does today: the markers are yours to resolve.
