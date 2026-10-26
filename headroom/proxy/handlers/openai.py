@@ -54,6 +54,7 @@ from headroom.proxy.semantic_cache_key_policy import compute_request_cache_parti
 from headroom.proxy.stage_timer import StageTimer, emit_stage_timings_log
 from headroom.proxy.tool_schema_savings_policy import (
     net_hook_tool_saving,
+    tool_schema_saved_from_tags,
     without_deferral_flags,
 )
 from headroom.proxy.turn_hooks import run_responses_create_hooks
@@ -11055,6 +11056,13 @@ class OpenAIHandlerMixin:
             # the saving, and offset tools the hook removed (signed, clamped once).
             _hook_tool_saved = 0
             if _turn is not None:
+                # Tool-schema compaction, folded into both endpoints as the chat
+                # handlers do: the message counts never see tool bytes.
+                _compacted_before = int(getattr(_turn, "compaction_tokens_before", 0) or 0)
+                _compacted_after = int(getattr(_turn, "compaction_tokens_after", 0) or 0)
+                if 0 < _compacted_after < _compacted_before:
+                    tokens_before += _compacted_before
+                    tokens_after += _compacted_after
                 tokens_after += max(0, int(getattr(_turn, "tool_growth_tokens", 0) or 0))
                 # Only a count of pre-hook messages lacks the text a hook added;
                 # a recount of the final messages (stateless fold, session) has it.
@@ -11134,6 +11142,19 @@ class OpenAIHandlerMixin:
             }
             if session_info is not None:
                 _payload["session"] = session_info
+            if _turn is not None:
+                # Tool definitions kept out of the context (deferral, a hook's
+                # tool shrink), which the message counts never see. The headline
+                # /stats reports is tokens_saved + tool_tokens_saved. The
+                # deferral share is an estimate (booked ``estimated``), so it is
+                # also reported on its own for a caller that bills on measured
+                # savings only.
+                _payload["tool_tokens_saved"] = tool_schema_saved_from_tags(tags)
+                try:
+                    _deferred = int(tags.get("tool_search_deferred_tokens", 0) or 0)
+                except (TypeError, ValueError):
+                    _deferred = 0
+                _payload["tool_tokens_deferred"] = max(0, _deferred)
             if _finished is not None and _finished.fields:
                 _payload.update(_finished.fields)
             return JSONResponse(_payload)
