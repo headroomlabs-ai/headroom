@@ -388,18 +388,31 @@ def test_batch_allows_permitted_user_and_assistant_units():
             )
         )
 
-    # They have different roles so build_compression_batches won't group them together,
-    # but each with a duplicate should form a batch
+    # Test permitted user units
     user_entries = [entries[0], entries[0]]
-    batches, skipped = build_compression_batches(user_entries, min_batch_bytes=512)
-    assert len(batches) == 1
-    assert skipped == []
+    user_batches, user_skipped = build_compression_batches(user_entries, min_batch_bytes=512)
+    assert len(user_batches) == 1
+    assert user_skipped == []
 
     router = _ShorteningRouter()
-    results = compress_batch_with_router(
-        batches[0],
+    user_results = compress_batch_with_router(
+        user_batches[0],
         router=router,
         tokenizer=_CharacterCounter(),
     )
     assert router.calls == 1
-    assert all(res.modified for _, res in results)
+    assert all(res.modified for _, res in user_results)
+
+    # Test permitted assistant units
+    assistant_entries = [entries[1], entries[1]]
+    asst_batches, asst_skipped = build_compression_batches(assistant_entries, min_batch_bytes=512)
+    assert len(asst_batches) == 1
+    assert asst_skipped == []
+
+    asst_results = compress_batch_with_router(
+        asst_batches[0],
+        router=router,
+        tokenizer=_CharacterCounter(),
+    )
+    assert router.calls == 2
+    assert all(res.modified for _, res in asst_results)
