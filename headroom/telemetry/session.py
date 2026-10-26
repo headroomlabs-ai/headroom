@@ -118,6 +118,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from headroom.offline import pin_litellm_cost_map_local
+
 logger = logging.getLogger(__name__)
 
 # Where session events go. The receiver is open source: deploy/beacon/worker.js.
@@ -532,6 +534,7 @@ def _public_model(model: str) -> str | None:
 
     resolved: str | None = None
     try:
+        pin_litellm_cost_map_local()
         import litellm
 
         registry = litellm.model_cost

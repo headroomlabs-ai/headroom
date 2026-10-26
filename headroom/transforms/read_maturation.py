@@ -412,7 +412,10 @@ class ReadMaturationManager:
                     compression_strategy="read_maturation",
                 )
             except Exception as e:  # noqa: BLE001 - storage failure must not break the request
+                # Keep it verbatim (a marker would point at nothing); a later
+                # request matures it once the store takes it.
                 logger.warning("read_maturation: CCR store failed for %s: %s", tc_id, e)
+                return None, False
 
         file_display = file_path or "unknown"
         # NOTE: "Retrieve original: hash=" is load-bearing (marker-

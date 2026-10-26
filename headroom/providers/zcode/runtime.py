@@ -6,6 +6,7 @@ import json
 import logging
 from dataclasses import dataclass
 from pathlib import Path
+from urllib.parse import urlsplit
 
 from headroom.install.paths import zcode_config_dir
 from headroom.providers.claude import proxy_base_url as _claude_proxy_base_url
@@ -40,11 +41,30 @@ def build_proxy_targets(port: int) -> ZCodeProxyTargets:
     )
 
 
-def detect_upstream(config_path: Path | None = None) -> ZCodeUpstream:
+def _points_at_proxy(base_url: str, proxy_port: int | None) -> bool:
+    """True when *base_url* names the Headroom proxy: its advertised host and port.
+
+    Policy: the proxy is advertised on ``127.0.0.1`` (see ``build_proxy_targets``)
+    and ``localhost`` is treated as that same host. ``[::1]`` is a different
+    socket, so an IPv6 provider on the same port is a real upstream, not the proxy.
+    """
+    if proxy_port is None:
+        return False
+    try:
+        parts = urlsplit(base_url)
+        return parts.hostname in ("127.0.0.1", "localhost") and parts.port == proxy_port
+    except ValueError:
+        return False
+
+
+def detect_upstream(
+    config_path: Path | None = None, proxy_port: int | None = None
+) -> ZCodeUpstream:
     """Read ZCode config.json and find the enabled provider's upstream URL.
 
     Resolution order:
-    1. First provider with ``enabled=True`` and a non-empty ``baseURL``.
+    1. First provider with ``enabled=True`` and a non-empty ``baseURL`` that
+       does not point at the Headroom proxy itself (``proxy_port``).
     2. Fallback: Z.ai Anthropic endpoint.
 
     Parameters
@@ -52,6 +72,10 @@ def detect_upstream(config_path: Path | None = None) -> ZCodeUpstream:
     config_path:
         Override for the config file path.  When *None* the default
         ``~/.zcode/v2/config.json`` is used.
+    proxy_port:
+        Port of the local Headroom proxy.  A provider whose ``baseURL`` is a
+        loopback URL on this port is skipped, because ZCode users are told to
+        point a provider at the proxy and using it as the upstream would loop.
     """
     if config_path is None:
         config_path = zcode_config_dir() / "v2" / "config.json"
@@ -83,8 +107,11 @@ def detect_upstream(config_path: Path | None = None) -> ZCodeUpstream:
         opts = provider.get("options", {})
         if not isinstance(opts, dict):
             continue
-        base_url = opts.get("baseURL", "").strip()
-        if not base_url:
+        base_url = opts.get("baseURL")
+        if not isinstance(base_url, str):
+            continue
+        base_url = base_url.strip()
+        if not base_url or _points_at_proxy(base_url, proxy_port):
             continue
         kind = provider.get("kind", "anthropic")
         name = provider.get("name", "ZCode provider")
