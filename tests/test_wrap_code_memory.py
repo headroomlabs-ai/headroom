@@ -237,6 +237,88 @@ def test_serena_dashboard_disabled_keeps_indented_root_mapping(tmp_path, monkeyp
     assert cfg.read_text() == first
 
 
+def test_serena_dashboard_disabled_keeps_indented_root_after_document_marker(
+    tmp_path, monkeypatch
+) -> None:
+    """A ``---`` document marker is not a mapping line.
+
+    Counting it as column 0 makes the root indent empty, so the indented
+    setting is left in place and a column-0 key is appended. YAML then
+    rejects the file.
+    """
+    import yaml
+
+    monkeypatch.setenv("HOME", str(tmp_path))
+    cfg = tmp_path / ".serena" / "serena_config.yml"
+    cfg.parent.mkdir(parents=True)
+    cfg.write_text("---\n  projects: []\n  web_dashboard_open_on_launch: true\n")
+
+    wrap._ensure_serena_dashboard_disabled()
+
+    text = cfg.read_text()
+    assert text.startswith("---\n")
+    assert "  web_dashboard_open_on_launch: false\n" in text
+    assert "\nweb_dashboard_open_on_launch:" not in text
+    parsed = yaml.safe_load(text)
+    assert parsed["web_dashboard_open_on_launch"] is False
+    assert parsed["projects"] == []
+
+    first = text
+    wrap._ensure_serena_dashboard_disabled()
+    assert cfg.read_text() == first
+
+
+def test_serena_dashboard_disabled_skips_yaml_directive(tmp_path, monkeypatch) -> None:
+    """A ``%YAML`` directive is outside the mapping and must not set the indent."""
+    import yaml
+
+    monkeypatch.setenv("HOME", str(tmp_path))
+    cfg = tmp_path / ".serena" / "serena_config.yml"
+    cfg.parent.mkdir(parents=True)
+    cfg.write_text("%YAML 1.2\n---\n  projects: []\n  web_dashboard_open_on_launch: true\n")
+
+    wrap._ensure_serena_dashboard_disabled()
+
+    text = cfg.read_text()
+    assert text.startswith("%YAML 1.2\n---\n")
+    assert "  web_dashboard_open_on_launch: false\n" in text
+    assert "\nweb_dashboard_open_on_launch:" not in text
+    parsed = yaml.safe_load(text)
+    assert parsed["web_dashboard_open_on_launch"] is False
+    assert parsed["projects"] == []
+
+    first = text
+    wrap._ensure_serena_dashboard_disabled()
+    assert cfg.read_text() == first
+
+
+def test_serena_dashboard_disabled_appends_inside_document_end_marker(
+    tmp_path, monkeypatch
+) -> None:
+    """A missing key is inserted before a trailing ``...``, not after it.
+
+    A key written after the document end marker starts a second document.
+    """
+    import yaml
+
+    monkeypatch.setenv("HOME", str(tmp_path))
+    cfg = tmp_path / ".serena" / "serena_config.yml"
+    cfg.parent.mkdir(parents=True)
+    cfg.write_text("---\n  projects: []\n...\n")
+
+    wrap._ensure_serena_dashboard_disabled()
+
+    text = cfg.read_text()
+    assert text.index("  web_dashboard_open_on_launch: false\n") < text.index("...\n")
+    parsed = yaml.safe_load(text)
+    assert parsed["web_dashboard_open_on_launch"] is False
+    assert parsed["projects"] == []
+
+    first = text
+    wrap._ensure_serena_dashboard_disabled()
+    assert cfg.read_text() == first
+
+
 def test_serena_dashboard_disabled_ignores_nested_key(tmp_path, monkeypatch) -> None:
     """A key nested under another mapping is not Serena's setting.
 

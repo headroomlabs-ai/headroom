@@ -2269,15 +2269,26 @@ def _serena_inline_comment(rest: str) -> str:
     return " " + body
 
 
+# A document marker or directive is YAML syntax outside the mapping. It is
+# only a marker when it starts at column 0; an indented ``---`` inside a
+# block scalar is content.
+_YAML_STRUCTURE_LINE = re.compile(r"^(?:---|\.\.\.)(?:[ \t]|$)|^%")
+
+
 def _serena_root_indent(text: str) -> str:
     """Return the indentation of the root mapping.
 
     YAML allows every root key to share an indent, so column 0 is not the
     test. The root indent is the shortest leading whitespace on a non-empty,
-    non-comment line. A deeper line belongs to a nested block.
+    non-comment line. Document markers (``---``, ``...``) and ``%`` directives
+    are skipped: they are YAML syntax outside the mapping, and counting them
+    would treat an indented root as column 0. A deeper line belongs to a
+    nested block.
     """
     root: str | None = None
     for line in text.splitlines():
+        if _YAML_STRUCTURE_LINE.match(line):
+            continue
         stripped = line.lstrip(" \t")
         if not stripped or stripped.startswith("#"):
             continue
@@ -2330,11 +2341,11 @@ def _ensure_serena_dashboard_disabled(*, verbose: bool = False) -> None:
 
     The edit only touches the key at the root mapping's indent. YAML allows
     that mapping to be indented as a whole, so column 0 is not the test: the
-    root indent is the shortest indent of a non-comment line. A deeper
-    occurrence belongs to a nested mapping (e.g. an ``extension:`` block that
-    reuses the name) and is left alone — both when rewriting the value and
-    when dropping duplicates, so it can never be mistaken for, or merged
-    with, Serena's real setting.
+    root indent is the shortest indent of a non-comment line, ignoring
+    document markers and directives. A deeper occurrence belongs to a nested
+    mapping (e.g. an ``extension:`` block that reuses the name) and is left
+    alone — both when rewriting the value and when dropping duplicates, so
+    it can never be mistaken for, or merged with, Serena's real setting.
     """
     import re
 
@@ -2395,8 +2406,25 @@ def _ensure_serena_dashboard_disabled(*, verbose: bool = False) -> None:
         appended.append(f"{indent}projects: []")
 
     if appended:
-        body = new.rstrip("\n")
-        new = (f"{body}\n" if body.strip() else "") + "\n".join(appended) + "\n"
+        addition = "\n".join(appended) + "\n"
+        lines = new.splitlines(keepends=True)
+        end_at: int | None = None
+        for index in range(len(lines) - 1, -1, -1):
+            if not lines[index].strip(" \t\r\n"):
+                continue
+            if lines[index].rstrip("\r\n") == "...":
+                end_at = index
+            break
+        if end_at is None:
+            body = new.rstrip("\n")
+            new = (f"{body}\n" if body.strip() else "") + addition
+        else:
+            # A key after ``...`` starts a second document. Keep the addition
+            # inside the one Serena loads.
+            prefix = "".join(lines[:end_at])
+            if prefix and not prefix.endswith("\n"):
+                prefix += "\n"
+            new = prefix + addition + "".join(lines[end_at:])
 
     if new == text:
         return
