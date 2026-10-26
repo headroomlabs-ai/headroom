@@ -24,8 +24,6 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-import litellm
-
 from headroom.evals.memory.locomo import (
     LOCOMO_CATEGORIES,
     LoCoMoCase,
@@ -37,6 +35,12 @@ from headroom.memory.backends.local import LocalBackend, LocalBackendConfig
 from headroom.memory.models import Memory
 from headroom.memory.system import MemoryBackend
 from headroom.memory.tools import MEMORY_TOOLS
+from headroom.offline import pin_litellm_cost_map_local
+
+# Before the import: litellm fetches its pricing table at import time unless
+# told not to, and HEADROOM_OFFLINE forbids that fetch.
+pin_litellm_cost_map_local()
+import litellm  # noqa: E402
 
 logger = logging.getLogger(__name__)
 

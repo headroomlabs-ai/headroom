@@ -465,3 +465,42 @@ def test_anthropic_bills_original_plus_hook_redrive(monkeypatch, _no_hooks) -> N
     assert outcome.cache_read_tokens == 120
     assert outcome.cache_write_tokens == 55
     assert outcome.uncached_input_tokens == 250
+
+
+@respx.mock
+def test_anthropic_hook_redrive_error_is_not_rebuilt_as_200(monkeypatch, _no_hooks) -> None:
+    """An upstream error on the re-drive must not replace the good first response."""
+    register_turn_hook(_RedriveOnce())
+    app, _outcomes = _app_and_outcomes(monkeypatch)
+
+    first = {
+        "id": "a",
+        "type": "message",
+        "role": "assistant",
+        "model": "claude-sonnet-4-5",
+        "content": [{"type": "text", "text": "a"}],
+        "stop_reason": "end_turn",
+        "usage": {"input_tokens": 100, "output_tokens": 10},
+    }
+    error = {"type": "error", "error": {"type": "api_error", "message": "Internal server error"}}
+    # The first call succeeds; every later call (the re-drive, plus its retries) fails.
+    route = respx.post("https://api.anthropic.com/v1/messages").mock(
+        side_effect=[httpx.Response(200, json=first), httpx.Response(500, json=error)]
+        + [httpx.Response(500, json=error)] * 5
+    )
+
+    with TestClient(app) as client:
+        result = client.post(
+            "/v1/messages",
+            json={
+                "model": "claude-sonnet-4-5",
+                "max_tokens": 64,
+                "messages": [{"role": "user", "content": "hi"}],
+            },
+            headers={"x-api-key": "sk-ant-test", "anthropic-version": "2023-06-01"},
+        )
+
+    assert route.call_count >= 2
+    assert result.status_code == 200
+    assert result.json()["id"] == "a"
+    assert result.json().get("type") != "error"
