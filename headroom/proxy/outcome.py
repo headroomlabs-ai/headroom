@@ -124,7 +124,7 @@ class RequestOutcome:
 
     # ── Output composition ────────────────────────────────────────────
     # ``output_tokens`` pools two quantities that different levers move in
-    # opposite directions: reasoning-effort routing cuts thinking, verbosity
+    # opposite directions: thinking-budget levers cut thinking, verbosity
     # steering cuts visible text. Summed, neither can be attributed — a turn
     # whose thinking dropped 4,000 tokens while its prose grew 200 is
     # indistinguishable from one where nothing happened.
@@ -250,7 +250,7 @@ class RequestOutcome:
         The quantity verbosity steering actually targets. Callers must handle
         ``None`` rather than defaulting it to ``output_tokens``: on a provider
         that reports no thinking count, treating the whole output as visible
-        would credit steering with reductions that reasoning-effort routing
+        would credit steering with reductions that a lower thinking budget
         produced.
 
         Clamped at zero because an inferred count comes from Headroom's
