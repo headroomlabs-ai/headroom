@@ -306,29 +306,36 @@ class CompressionEvaluator:
 
         compression_ratio = 1 - (compressed_tokens / original_tokens) if original_tokens > 0 else 0
 
+        errors: list[str] = []
+
         # Run LLM with original context
         start = time.time()
         try:
             response_original = self.llm_fn(case.context, case.query)
         except Exception as e:
             response_original = f"ERROR: {e}"
+            errors.append(f"original: {type(e).__name__}: {e}")
         latency_original = (time.time() - start) * 1000
 
+        compressed_failed = False
         # Run LLM with compressed context
         start = time.time()
         try:
             response_compressed = self.llm_fn(compressed_context, case.query)
         except Exception as e:
             response_compressed = f"ERROR: {e}"
+            errors.append(f"compressed: {type(e).__name__}: {e}")
+            compressed_failed = True
         latency_compressed = (time.time() - start) * 1000
 
         # Compute metrics
-        exact_match = compute_exact_match(response_original, response_compressed)
-        f1_score = compute_f1(response_original, response_compressed)
+        # Diagnostic exception strings are not answers, even if they match.
+        exact_match = not errors and compute_exact_match(response_original, response_compressed)
+        f1_score = compute_f1(response_original, response_compressed) if not errors else 0.0
 
         # Semantic similarity if available
         semantic_sim = None
-        if self.semantic_similarity_fn:
+        if self.semantic_similarity_fn and not errors:
             try:
                 semantic_sim = self.semantic_similarity_fn(response_original, response_compressed)
             except Exception:
@@ -338,14 +345,14 @@ class CompressionEvaluator:
         contains_ground_truth = None
         if case.ground_truth:
             gt_lower = case.ground_truth.lower()
-            contains_ground_truth = (
+            contains_ground_truth = not compressed_failed and (
                 gt_lower in response_compressed.lower()
                 or compute_f1(response_compressed, case.ground_truth) > 0.5
             )
 
         # Determine if accuracy is preserved
         # Criteria: F1 > 0.8 OR semantic similarity > 0.9 OR contains ground truth
-        accuracy_preserved = (
+        accuracy_preserved = not errors and (
             f1_score > 0.8
             or (semantic_sim is not None and semantic_sim > 0.9)
             or (contains_ground_truth is True)
@@ -366,6 +373,7 @@ class CompressionEvaluator:
             latency_original_ms=latency_original,
             latency_compressed_ms=latency_compressed,
             accuracy_preserved=accuracy_preserved,
+            error="; ".join(errors) if errors else None,
         )
 
     def evaluate_suite(
