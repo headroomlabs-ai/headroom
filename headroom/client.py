@@ -338,7 +338,7 @@ class HeadroomClient:
         self._cache_optimizer: BaseCacheOptimizer | None = None
         self._semantic_cache_layer: SemanticCacheLayer | None = None
 
-        if enable_cache_optimizer:
+        if self._config.cache_optimizer.enabled:
             if cache_optimizer is not None:
                 self._cache_optimizer = cache_optimizer
             else:
@@ -372,7 +372,7 @@ class HeadroomClient:
             provider=self._provider.name.lower(),
             metadata={
                 "default_mode": self._default_mode.value,
-                "cache_optimizer_enabled": enable_cache_optimizer,
+                "cache_optimizer_enabled": self._config.cache_optimizer.enabled,
                 "semantic_cache_enabled": enable_semantic_cache,
             },
         )
