@@ -530,6 +530,23 @@ class TestContextTargetOverride:
         assert abs_target.exists()
         assert "Use uv" in abs_target.read_text()
 
+    def test_missing_project_dir_is_not_created(self, tmp_path):
+        # A deleted worktree's session folder decodes to a guessed path such as
+        # ~/claude/claude/worktrees/teacher/new/lab; learn must not create it.
+        proj = _project(tmp_path)
+        proj.project_path = tmp_path / "gone" / "worktree"
+        writer = ClaudeCodeWriter()
+        recs = [
+            _rec(RecommendationTarget.CONTEXT_FILE, "Commands", "- Run make"),
+            _rec(RecommendationTarget.MEMORY_FILE, "Notes", "- Keep this"),
+        ]
+        result = writer.write(recs, proj, dry_run=False)
+
+        assert not (tmp_path / "gone").exists()
+        assert any("does not exist" in w for w in result.warnings)
+        # Memory lives in the session folder, which does exist, so it is still written.
+        assert "Keep this" in (proj.data_path / "memory" / "MEMORY.md").read_text()
+
 
 class TestLegacyClaudeMdMigration:
     """A stale headroom block in the shared CLAUDE.md migrates to CLAUDE.local.md."""

@@ -537,6 +537,17 @@ class ClaudeCodeWriter(ContextWriter):
 
         if context_recs:
             target_path = self._resolve_context_path(project)
+            # A deleted project (e.g. a removed git worktree) leaves only its
+            # escaped session-folder name, whose dash-to-slash decode is a guess.
+            # Never create that guessed directory tree just to hold learnings.
+            if not project.project_path.is_dir() and target_path.is_relative_to(
+                project.project_path
+            ):
+                result.warnings.append(
+                    f"Skipped {target_path}: project directory {project.project_path} does not exist."
+                )
+                context_recs = []
+        if context_recs:
             # Only ever auto-ignore a file whose name marks it personal: an
             # explicit --target CLAUDE.md is a deliberate opt-in to the shared
             # file, and ~/.claude/CLAUDE.md may sit in a dotfiles repo.
