@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import pytest
 
-from headroom.evals.core import CompressionEvaluator, EvalCase, EvalSuite
+from headroom.evals.core import CompressionEvaluator, EvalCase, EvalMode, EvalSuite
 
 
 @pytest.fixture(autouse=True)
@@ -129,6 +129,20 @@ def batch_endpoint(monkeypatch, tmp_path):
                     "usage": {"input_tokens": 1, "output_tokens": 1},
                 }
             )
+            if not failed and "chat/completions" in self.path:
+                body = {
+                    "id": "chat_fixture",
+                    "object": "chat.completion",
+                    "created": 0,
+                    "model": "fixture",
+                    "choices": [
+                        {
+                            "index": 0,
+                            "message": {"role": "assistant", "content": outcome},
+                            "finish_reason": "stop",
+                        }
+                    ],
+                }
             payload = json.dumps(body).encode()
             self.send_response(403 if failed else 200)
             self.send_header("Content-Type", "application/json")
@@ -147,6 +161,8 @@ def batch_endpoint(monkeypatch, tmp_path):
     monkeypatch.setenv("ANTHROPIC_API_KEY", "synthetic-fixture")
     monkeypatch.setenv("ANTHROPIC_BASE_URL", f"http://127.0.0.1:{server.server_port}")
     monkeypatch.delenv("ANTHROPIC_AUTH_TOKEN", raising=False)
+    monkeypatch.setenv("OPENAI_API_KEY", "synthetic-fixture")
+    monkeypatch.setenv("OPENAI_BASE_URL", f"http://127.0.0.1:{server.server_port}/v1")
     monkeypatch.setenv("HEADROOM_WORKSPACE_DIR", str(tmp_path / "workspace"))
     monkeypatch.setenv("HEADROOM_CONFIG_DIR", str(tmp_path / "config"))
     try:
@@ -234,3 +250,119 @@ def test_batch_literal_error_answer_and_aggregate_are_preserved(batch_endpoint):
     assert result.avg_f1_score == 0.5
     assert result.results[0].error is None
     assert result.results[0].f1_score == 1.0
+
+
+def _runner_case():
+    return EvalCase(
+        id="runner-fixture",
+        context=_batch_case().request.messages[0]["content"],
+        query="What is the answer?",
+        ground_truth="42",
+    )
+
+
+def _runner(proxy=False):
+    import os
+
+    from headroom.evals.runners.before_after import BeforeAfterRunner, LLMConfig
+    from headroom.transforms.content_router import ContentRouterConfig
+
+    return BeforeAfterRunner(
+        llm_config=LLMConfig(
+            provider="anthropic",
+            model="claude-fixture",
+            headroom_proxy_url=os.environ["ANTHROPIC_BASE_URL"] if proxy else None,
+        ),
+        router_config=ContentRouterConfig(enable_kompress=False),
+        use_semantic_similarity=False,
+    )
+
+
+def _close_runner(runner):
+    runner._llm_client.close()
+    if runner._proxy_client is not None:
+        runner._proxy_client.close()
+
+
+@pytest.mark.parametrize("proxy", [False, True])
+@pytest.mark.parametrize(
+    "outcomes,compressed_failed",
+    [
+        ([TimeoutError("42"), TimeoutError("42")], True),
+        ([TimeoutError("42"), "42"], False),
+        (["42", TimeoutError("42")], True),
+    ],
+)
+def test_cli_runner_failures_are_not_answers(batch_endpoint, proxy, outcomes, compressed_failed):
+    responses, requests = batch_endpoint
+    responses.extend(outcomes)
+    runner = _runner(proxy)
+    try:
+        result = runner.evaluate_case(_runner_case())
+    finally:
+        _close_runner(runner)
+    assert len(requests) == 2
+    assert result.compressed_tokens < result.original_tokens
+    assert not result.accuracy_preserved
+    assert result.exact_match is False
+    assert result.f1_score == 0.0
+    assert result.semantic_similarity is None
+    assert result.contains_ground_truth is (not compressed_failed)
+    assert result.error is not None
+
+
+@pytest.mark.parametrize("proxy", [False, True])
+def test_cli_runner_literal_error_success_is_preserved(batch_endpoint, proxy):
+    responses, requests = batch_endpoint
+    responses.extend(["ERROR: 42", "ERROR: 42"])
+    runner = _runner(proxy)
+    try:
+        result = runner.run(EvalSuite("literal", [_runner_case()]))
+    finally:
+        _close_runner(runner)
+    assert len(requests) == 2
+    assert result.passed_cases == 1
+    assert result.accuracy_preservation_rate == 1.0
+    assert result.results[0].error is None
+
+
+def test_cli_ground_truth_failure_skips_judge_and_bfcl_matching(batch_endpoint):
+    responses, requests = batch_endpoint
+    # The spare high-scoring judge reply must not be consumed after provider failure.
+    responses.extend([TimeoutError("42"), "Reasoning: fixture\nScore: 5"])
+    runner = _runner()
+    case = _runner_case()
+    case.ground_truth = '[{"answer": {"value": [42]}}]'
+    case.metadata["source"] = "BFCL"
+    try:
+        result = runner.evaluate_case(case, mode=EvalMode.GROUND_TRUTH)
+    finally:
+        _close_runner(runner)
+    assert len(requests) == 1
+    assert runner._judge_fn is None
+    assert not result.accuracy_preserved
+    assert result.contains_ground_truth is False
+    assert result.f1_score == 0.0
+    assert result.error.startswith("compressed: ")
+
+
+@pytest.mark.parametrize("judge_fails,bfcl", [(False, False), (True, False), (True, True)])
+def test_cli_ground_truth_success_and_judge_fallback_unchanged(batch_endpoint, judge_fails, bfcl):
+    responses, requests = batch_endpoint
+    responses.extend(
+        ["42", TimeoutError("judge unavailable") if judge_fails else "Reasoning: fixture\nScore: 5"]
+    )
+    runner = _runner()
+    case = _runner_case()
+    if bfcl:
+        case.ground_truth = '[{"answer": {"value": [42]}}]'
+        case.metadata["source"] = "BFCL"
+    try:
+        result = runner.evaluate_case(case, mode=EvalMode.GROUND_TRUTH)
+    finally:
+        _close_runner(runner)
+    assert len(requests) == 2
+    assert result.accuracy_preserved
+    assert result.contains_ground_truth is True
+    assert result.f1_score == (0.0 if judge_fails else 1.0)
+    assert result.error is None
