@@ -13,7 +13,14 @@ def main():
     with tempfile.TemporaryDirectory(prefix="headroom-cache-config-") as scratch:
         for key in ["HEADROOM_WORKSPACE_DIR", "HEADROOM_CONFIG_DIR", "XDG_CACHE_HOME"]:
             os.environ[key] = str(Path(scratch) / key.lower())
-        os.environ.update(HEADROOM_OFFLINE="1", HEADROOM_BEACON="off", DO_NOT_TRACK="1")
+        # This isolated proof needs no persistent, process-global CCR database.
+        # Keep the store in memory so Windows can remove the scratch directory.
+        os.environ.update(
+            HEADROOM_OFFLINE="1",
+            HEADROOM_BEACON="off",
+            DO_NOT_TRACK="1",
+            HEADROOM_CCR_BACKEND="memory",
+        )
         from openai import OpenAI
 
         from headroom import HeadroomClient, OpenAIProvider
