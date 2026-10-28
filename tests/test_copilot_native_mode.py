@@ -203,6 +203,25 @@ def test_byok_and_native_are_mutually_exclusive_shapes() -> None:
     assert "COPILOT_PROVIDER_BASE_URL" not in native
 
 
+def test_native_support_probe_scans_cli_main_loader_layout(tmp_path) -> None:
+    local = tmp_path / "local"
+    version = local / "copilot" / "pkg" / "platform" / "1.0.102"
+    version.mkdir(parents=True)
+    (version / "app.js").write_text("loader only", encoding="utf-8")
+    (version / "cli-main.js").write_text("no override here", encoding="utf-8")
+    assert native_api_url_supported(environ={"LOCALAPPDATA": str(local)}) is False
+
+    (version / "cli-main.js").write_text("process.env.COPILOT_API_URL", encoding="utf-8")
+    assert native_api_url_supported(environ={"LOCALAPPDATA": str(local)}) is True
+
+
+def test_native_support_probe_skips_unreadable_bundle(monkeypatch, tmp_path) -> None:
+    local = tmp_path / "local"
+    bundle = local / "copilot" / "pkg" / "platform" / "1.0" / "app.js"
+    bundle.parent.mkdir(parents=True)
+    bundle.write_text("process.env.COPILOT_API_URL", encoding="utf-8")
+
+
 # ---------------------------------------------------------------------------
 # CLI wiring: flag validation and launch plumbing
 # ---------------------------------------------------------------------------

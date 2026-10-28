@@ -307,11 +307,11 @@ class HeadroomClient:
         # Use provided config or build from individual parameters
         if config is not None:
             self._config = config
-            # Override store_url and mode if explicitly provided in config
+            # Override store_url and mode if explicitly provided in config.
+            # The resolved URL is not written back: the caller may share this
+            # config with other clients, which would then read it as explicit.
             if config.store_url:
                 self._store_url = config.store_url
-            else:
-                self._config.store_url = store_url
             self._default_mode = config.default_mode
         else:
             # Build config from individual parameters
@@ -325,7 +325,7 @@ class HeadroomClient:
             self._config.model_context_limits.update(model_context_limits)
 
         # Initialize storage
-        self._storage = create_storage(store_url)
+        self._storage = create_storage(self._store_url)
 
         # Initialize transform pipeline
         self._pipeline = TransformPipeline(self._config, provider=self._provider)

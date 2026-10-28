@@ -321,24 +321,25 @@ def native_api_url_supported(
 
     bundles.sort()
     _key, path = bundles[-1]
-    try:
-        with open(path, encoding="utf-8", errors="replace") as fh:
-            # Overlap successive reads so the needle cannot be missed by
-            # landing across a chunk boundary (it silently returned False for
-            # a supported CLI, which then hard-refused the launch).
-            carry = ""
-            overlap = len(COPILOT_NATIVE_API_URL_ENV) - 1
-            while chunk := fh.read(1 << 20):
-                if COPILOT_NATIVE_API_URL_ENV in carry + chunk:
-                    return True
-                carry = chunk[-overlap:] if overlap else ""
-    except OSError:
-        # The newest bundle could not be opened, or failed mid-read (deleted or
-        # locked concurrently). That is unknown, not unsupported -- and an older
-        # bundle must not vote in its place, for the reason given above.
-        return None
-    # The newest bundle is authoritative.
-    return False
+    # Modern CLI bundles move the env read from app.js into cli-main.js.
+    # Inspect both files from the newest version; older versions cannot vouch.
+    candidates = [path]
+    cli_main = os.path.join(os.path.dirname(path), "cli-main.js")
+    if os.path.isfile(cli_main):
+        candidates.append(cli_main)
+    unreadable = False
+    for candidate in candidates:
+        try:
+            with open(candidate, encoding="utf-8", errors="replace") as fh:
+                carry = ""
+                overlap = len(COPILOT_NATIVE_API_URL_ENV) - 1
+                while chunk := fh.read(1 << 20):
+                    if COPILOT_NATIVE_API_URL_ENV in carry + chunk:
+                        return True
+                    carry = chunk[-overlap:] if overlap else ""
+        except OSError:
+            unreadable = True
+    return None if unreadable else False
 
 
 def _version_key(path: str) -> tuple[int, ...]:

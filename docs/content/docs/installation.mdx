@@ -116,11 +116,12 @@ pip install "headroom-ai[all]"
 | `autogen` | AutoGen AgentChat integration; **not in `[all]`** | `pip install "headroom-ai[autogen]"` |
 | `anyllm` | any-llm multi-provider backend (Python 3.11+); **not in `[all]`** | `pip install "headroom-ai[anyllm]"` |
 | `bedrock` | Native AWS Bedrock credentials/backend support; **not in `[all]`** | `pip install "headroom-ai[bedrock]"` |
+| `redis` | Redis client for state shared across replicas (`HEADROOM_CCR_BACKEND=redis`, `HEADROOM_COMPRESS_SESSION_STORE`); **not in `[all]`**, included in every Docker image | `pip install "headroom-ai[redis]"` |
 | `evals` | Evaluation framework (GSM8K, SQuAD, BFCL benchmarks) | `pip install "headroom-ai[evals]"` |
 | `pytorch-mps` | Apple-GPU (MPS) memory-embedder offload — **macOS only**, not in `[all]` (torch + sentence-transformers); opt in with `HEADROOM_EMBEDDER_RUNTIME=pytorch_mps` | `pip install "headroom-ai[pytorch-mps]"` |
 | `html` | HTML main-content extraction with trafilatura | `pip install "headroom-ai[html]"` |
 | `spreadsheet` | `.xlsx` / `.xls` ingestion with openpyxl and xlrd | `pip install "headroom-ai[spreadsheet]"` |
-| `sandbox` | Torch-free proxy bundle for constrained environments | `pip install "headroom-ai[sandbox]"` |
+| `lean` | Torch-free proxy bundle for constrained environments (a dependency profile; it provides no isolation). `sandbox` is a deprecated alias | `pip install "headroom-ai[lean]"` |
 | `all` | Runtime bundle: `proxy,code,ml,memory,relevance,image,reports,otel,evals,voice,html,mcp,spreadsheet` | `pip install "headroom-ai[all]"` |
 
 `[all]` is the full built-in runtime bundle, not every integration or optional
@@ -255,15 +256,15 @@ If you want a host `headroom` CLI that keeps Headroom itself inside a container 
 
 | Tag | Extras | Base image | Description |
 |---|---|---|---|
-| `latest` | `proxy,bedrock` | Debian slim | Default image, runs as non-root |
-| `<version>` | `proxy,bedrock` | Debian slim | Pinned release, same default variant |
-| `nonroot` | `proxy,bedrock` | Debian slim | Explicit non-root variant |
-| `code` | `proxy,code,bedrock` | Debian slim | Includes tree-sitter for code compression |
-| `code-nonroot` | `proxy,code,bedrock` | Debian slim | Code compression, non-root |
-| `slim` | `proxy,bedrock` | Distroless | Minimal image, no shell |
-| `slim-nonroot` | `proxy,bedrock` | Distroless | Minimal, non-root |
-| `code-slim` | `proxy,code,bedrock` | Distroless | Code compression, minimal |
-| `code-slim-nonroot` | `proxy,code,bedrock` | Distroless | Code compression, minimal, non-root |
+| `latest` | `proxy,bedrock,redis` | Debian slim | Default image, runs as non-root |
+| `<version>` | `proxy,bedrock,redis` | Debian slim | Pinned release, same default variant |
+| `nonroot` | `proxy,bedrock,redis` | Debian slim | Explicit non-root variant |
+| `code` | `proxy,code,bedrock,redis` | Debian slim | Includes tree-sitter for code compression |
+| `code-nonroot` | `proxy,code,bedrock,redis` | Debian slim | Code compression, non-root |
+| `slim` | `proxy,bedrock,redis` | Distroless | Minimal image, no shell |
+| `slim-nonroot` | `proxy,bedrock,redis` | Distroless | Minimal, non-root |
+| `code-slim` | `proxy,code,bedrock,redis` | Distroless | Code compression, minimal |
+| `code-slim-nonroot` | `proxy,code,bedrock,redis` | Distroless | Code compression, minimal, non-root |
 
 ### Build from source
 

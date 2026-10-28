@@ -250,6 +250,9 @@ def capture_codex_wire_debug(
 #     prefix) is never mutated.
 #   - "disabled": Memory context lookup is skipped entirely; the request
 #     forwards untouched.
+#   - "tool": Auto-injection of context is off, but the memory tools are still
+#     registered; the agent calls them explicitly (``search_and_format_context``
+#     returns None in this mode).
 #
 # Configurable via HEADROOM_MEMORY_INJECTION_MODE env var. There is no
 # "system_prompt" option — that path is permanently retired by I2 (cache hot
@@ -1862,22 +1865,26 @@ class _OwnerOnlyRotatingFileHandler(RotatingFileHandler):
 _owner_only_warning_emitted = False
 
 
-def _warn_once_if_owner_only_unsupported(log_path: Path) -> None:
-    """Say plainly, once per process, when the file cannot be made owner-only.
+def _warn_once_if_not_protected(log_path: Path) -> None:
+    """Say plainly, once per process, when the file is not actually owner-only.
 
-    A security control that quietly does nothing on a supported platform is
-    worse than no control, so Windows gets told rather than left to assume the
-    0600 in the docs applies to it.
+    Checks the file itself (:func:`headroom.fileperms.verify_owner_only`)
+    rather than assuming from the platform: on Windows the ACL restriction
+    (:mod:`headroom._fileperms_windows`) usually succeeds, in which case this
+    stays silent, but it can fail for reasons that have nothing to do with
+    Headroom's own code — a non-NTFS volume, a missing privilege — and a
+    control that quietly does nothing is worse than no control.
     """
     global _owner_only_warning_emitted
-    if _fileperms.OWNER_ONLY_SUPPORTED or _owner_only_warning_emitted:
+    if _owner_only_warning_emitted or _fileperms.verify_owner_only(log_path):
         return
     _owner_only_warning_emitted = True
     logger.warning(
-        "Headroom cannot create %s owner-only on this platform: file modes do not "
-        "control read access here, and Headroom does not set an ACL. The runtime log "
-        "can contain request and response content (--log-messages, wire debug, "
-        "HEADROOM_LOG_PAYLOAD_PREVIEW) — protect the log directory itself.",
+        "Headroom could not restrict %s to the current user — other accounts "
+        "on this machine may be able to read it. The runtime log can contain "
+        "request and response content (--log-messages, wire debug, "
+        "HEADROOM_LOG_PAYLOAD_PREVIEW); move HEADROOM_WORKSPACE_DIR somewhere "
+        "only you can access, or restrict the containing directory yourself.",
         log_path,
     )
 
@@ -1971,7 +1978,6 @@ def _setup_file_logging(
                 log_path,
             )
             return
-        _warn_once_if_owner_only_unsupported(log_path)
         # Attach to the headroom root logger so all sub-loggers are captured.
         # Keep root propagation enabled for container stdout/stderr while
         # this handler writes the separate port/worker-specific proxy log.
@@ -2011,6 +2017,11 @@ def _setup_file_logging(
             headroom_logger.removeHandler(stale)
             stale.close()
         headroom_logger.addHandler(handler)
+        # After, not before: the handler's _open() is what actually attempts
+        # the protection (mode bits on POSIX, the ACL call on Windows), so
+        # only now is there something real to verify rather than a platform
+        # guess.
+        _warn_once_if_not_protected(log_path)
         if level == logging.DEBUG:
             logger.warning(
                 "Headroom debug logging is on (HEADROOM_LOG_LEVEL). %s now records "
@@ -2022,11 +2033,13 @@ def _setup_file_logging(
             )
     except OSError as exc:
         # Non-fatal: can't write logs (read-only fs, permissions, etc.). Say so,
-        # or the missing proxy.log is the only clue. The OSError names the path.
+        # or the missing proxy.log is the only clue. str(exc) embeds repr(filename),
+        # which doubles backslashes on Windows -- exc.filename is the raw path.
         logger.warning(
-            "Headroom runtime log disabled: cannot write the log file: %s. "
+            "Headroom runtime log disabled: cannot write the log file: %s: %s. "
             "Point HEADROOM_WORKSPACE_DIR at a writable directory to restore proxy.log.",
-            exc,
+            exc.filename or log_dir,
+            exc.strerror or exc,
         )
 
 
@@ -2896,27 +2909,20 @@ def apply_session_sticky_ccr_tool(
       * Otherwise, inject only when this turn produced compressed content.
         The first injection records the golden bytes for future turns.
 
-    Tools whose name already equals ``CCR_TOOL_NAME`` (e.g. the client
-    pre-registered it via MCP) are not re-appended; the client's bytes
-    win.
+    Tools registered under ``CCR_TOOL_NAME`` or a supported client/MCP alias
+    are not re-appended; the client's executable name and definition win.
 
     Returns ``(updated_tools, was_injected)``. ``updated_tools`` is a
     fresh list (caller-safe).
     """
-    from headroom.ccr.tool_injection import CCR_TOOL_NAME
+    from headroom.ccr.tool_calls import client_retrieval_tool_name
 
     if provider not in ("anthropic", "openai", "google"):
         raise ValueError(f"unsupported provider: {provider!r}")
 
     tools_out: list[dict[str, Any]] = list(existing_tools) if existing_tools else []
-    existing_names: set[str] = set()
-    for t in tools_out:
-        n = _extract_tool_name(t)
-        if n:
-            existing_names.add(n)
-
-    # Client (or MCP) already provided a tool by this name — don't double up.
-    if CCR_TOOL_NAME in existing_names:
+    # Only default Headroom aliases claim ownership, not arbitrary MCP servers.
+    if client_retrieval_tool_name(tools_out):
         log_tool_injection_decision(
             provider=provider,
             session_id=session_id,
@@ -4097,9 +4103,21 @@ def _warn_deferred_without_search_tool(tools: Any) -> None:
     )
 
 
+#: Non-Anthropic upstreams that accept the first-party deferred tool shape.
+#: These bill deferred schemas compactly, so downgrading deferral for them
+#: inlines the whole catalog and multiplies billed prompt tokens.
+_DEFERRAL_CAPABLE_HOSTS: frozenset[str] = frozenset({"api.githubcopilot.com"})
+
+
 def anthropic_first_party_tool_search_supported(api_base_url: str | None) -> bool:
     """Return whether Anthropic server-side tool search is valid for this upstream."""
-    from headroom.providers.claude.runtime import is_custom_anthropic_base_url
+    from headroom.providers.claude.runtime import (
+        _gate_view_host,
+        is_custom_anthropic_base_url,
+    )
+
+    if _gate_view_host((api_base_url or "").strip()) in _DEFERRAL_CAPABLE_HOSTS:
+        return True
 
     return not is_custom_anthropic_base_url(api_base_url)
 

@@ -51,9 +51,105 @@ jobs:
           wc -l requirements-prod.txt
 
       - name: Audit dependencies (pip-audit)
-        uses: pypa/gh-action-pip-audit@v1.1.0
+        # The export is uv.lock's fully pinned set, overrides applied: audit it
+        # as is. pip must not re-resolve it (fastembed's pillow<13 cap would
+        # fail; see [tool.uv] override-dependencies), and the pip-audit action
+        # has no --disable-pip input, so pip-audit runs directly.
+        run: uvx pip-audit==2.10.1 -r requirements-prod.txt --no-deps --disable-pip
+
+  # ---- SCA: what `pip install headroom-ai[all]` gets ---------------------
+  # The job above audits uv.lock, which the release image also installs
+  # (overrides applied). pip ignores [tool.uv] and resolves the package
+  # metadata, where fastembed caps pillow <13: audit that set too. Its Pillow
+  # advisories fixed in 13 are accepted only because headroom/image/
+  # decoder_guard.py never decodes an image on Pillow <13, which the guard step
+  # proves on that same Pillow first. Any other finding fails the job.
+  # `uv pip compile` stands in for pip's resolver on Linux/Python 3.12, so it
+  # approximates, not reproduces, every user's install; on Python 3.10 pip
+  # also gets Pillow 12 (guarded) and filelock <4.2.1 (no fixed release there).
+  # It resolves live from PyPI, so a new upstream advisory would fail PRs that
+  # did not cause it: on pull requests it runs only when pyproject.toml changes;
+  # pushes to main and the weekly schedule always run it.
+  published-install-audit:
+    name: Dependency audit (pip install from package metadata)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
         with:
-          inputs: requirements-prod.txt
+          fetch-depth: 0
+
+      - name: Run on this event?
+        id: gate
+        run: |
+          if [ "${{ github.event_name }}" != "pull_request" ] || \
+             git diff --name-only "${{ github.event.pull_request.base.sha }}" HEAD | grep -qx pyproject.toml; then
+            echo "run=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "pyproject.toml unchanged in this PR; main and the weekly run cover it."
+          fi
+
+      - name: Set up Python
+        if: steps.gate.outputs.run == 'true'
+        uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+
+      - name: Install uv
+        if: steps.gate.outputs.run == 'true'
+        uses: astral-sh/setup-uv@v10.3.0
+
+      - name: Resolve what pip installs from the package metadata
+        if: steps.gate.outputs.run == 'true'
+        run: |
+          uv --no-config pip compile pyproject.toml --extra all --python-version 3.12 \
+            --no-header --no-annotate -o published.txt
+          uv --no-config pip compile pyproject.toml --python-version 3.12 \
+            --no-header --no-annotate -o core.txt
+          grep -iE '^(pillow|fastembed)==' published.txt
+
+      - name: The decoder guard holds on that Pillow
+        if: steps.gate.outputs.run == 'true'
+        run: |
+          uv venv -p 3.12 .published
+          uv --no-config pip install -p .published -r core.txt \
+            "$(grep -i '^pillow==' published.txt)" pytest pytest-asyncio
+          .published/bin/python -m pytest -p no:cacheprovider tests/test_image_decoder_guard.py
+          PINNED="$(grep -i '^pillow==' published.txt | cut -d= -f3)" .published/bin/python - <<'PY'
+          import os
+
+          import PIL
+          from headroom.image.decoder_guard import FIXED_PILLOW_MAJOR, pillow_is_safe
+
+          # The guard reads the Pillow that is imported; it must be pip's pick.
+          assert PIL.__version__ == os.environ["PINNED"], (PIL.__version__, os.environ["PINNED"])
+          fixed = int(PIL.__version__.split(".")[0]) >= FIXED_PILLOW_MAJOR
+          assert pillow_is_safe() is fixed, (PIL.__version__, pillow_is_safe())
+          print("Pillow", PIL.__version__, "decodes images:", fixed)
+          PY
+
+      - name: Audit it (pip-audit)
+        if: steps.gate.outputs.run == 'true'
+        run: |
+          uvx pip-audit==2.10.1 -r published.txt --no-deps --disable-pip \
+            --format json -o audit.json || true
+          python - <<'PY'
+          import json
+
+          deps = json.load(open("audit.json"))["dependencies"]
+          findings = [(d["name"], d["version"], v) for d in deps for v in d.get("vulns", [])]
+          guarded = [
+              f for f in findings
+              # The guard turns off all decoding below Pillow 13, whatever the fix.
+              if f[0].lower() == "pillow" and int(f[1].split(".")[0]) < 13
+          ]
+          for name, ver, v in findings:
+              note = "  (guarded: decoder_guard)" if (name, ver, v) in guarded else ""
+              print(f"{name} {ver} {v['id']} fix {v['fix_versions']}{note}")
+          assert len(deps) > 50, "pip-audit produced no dependency list"
+          if len(findings) > len(guarded):
+              raise SystemExit("Unguarded advisories in the pip-installed set; see above.")
+          PY
 
   # ---- SCA: Rust dependency advisories -----------------------------------
   # `cargo audit` reads Cargo.lock only (no build, about a minute), so it runs
@@ -104,9 +200,58 @@ jobs:
       - uses: actions/setup-node@v7
         with:
           node-version: ">=24.16.0 <25"
+      # A directory may hold npm-audit-exceptions.json for advisories in copies
+      # bundled inside a package, which overrides cannot replace. A listed
+      # advisory is accepted only at its listed path, only while the lock has
+      # that exact version there as a bundled copy, and only until `expires`.
+      # Any other finding fails, and so does an entry that no longer matches.
       - name: Audit locked dependencies at every severity
         working-directory: ${{ matrix.directory }}
-        run: npm audit --package-lock-only --audit-level=low
+        run: |
+          if [ ! -f npm-audit-exceptions.json ]; then
+            npm audit --package-lock-only --audit-level=low
+            exit
+          fi
+          npm audit --package-lock-only --audit-level=low || true
+          npm audit --package-lock-only --json > "$RUNNER_TEMP/audit.json" || true
+          python3 - "$RUNNER_TEMP/audit.json" <<'PY'
+          import datetime
+          import json
+          import sys
+
+          exceptions = json.load(open("npm-audit-exceptions.json"))
+          if datetime.date.today().isoformat() > exceptions["expires"]:
+              sys.exit(f"npm-audit-exceptions.json expired on {exceptions['expires']}: recheck upstream.")
+          allowed = exceptions["advisories"]  # {advisory: {lock path: bundled version}}
+          locked = json.load(open("package-lock.json"))["packages"]
+          vulns = json.load(open(sys.argv[1])).get("vulnerabilities", {})
+          seen, unexpected = set(), []
+          for name, vuln in vulns.items():
+              for via in vuln["via"]:
+                  if isinstance(via, str):
+                      # Inherited: its advisories are checked on that package's
+                      # own entry, which therefore has to be in the report.
+                      if via not in vulns:
+                          unexpected.append(f"{name} via {via} (no entry for {via})")
+                      continue
+                  advisory = via["url"].rsplit("/", 1)[-1]
+                  for node in vuln["nodes"]:
+                      entry = locked.get(node, {})
+                      pinned = allowed.get(advisory, {}).get(node)
+                      if pinned and entry.get("version") == pinned and entry.get("inBundle"):
+                          seen.add((advisory, node))
+                      else:
+                          found = f"{entry.get('version')}{' bundled' if entry.get('inBundle') else ''}"
+                          unexpected.append(f"{advisory} {node} {found} ({via['severity']})")
+          stale = [f"{a} {n}" for a, nodes in allowed.items() for n in nodes if (a, n) not in seen]
+          for line in unexpected:
+              print("NOT EXCEPTED:", line)
+          for line in stale:
+              print("STALE EXCEPTION (fixed? remove it):", line)
+          if unexpected or stale:
+              sys.exit(1)
+          print(f"Only excepted bundled advisories remain ({len(seen)}), until {exceptions['expires']}.")
+          PY
 
   # ---- SAST: CodeQL static analysis ------------------------------------
   codeql:
