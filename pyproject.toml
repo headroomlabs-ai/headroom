@@ -8,7 +8,7 @@ version = "0.42.0"
 description = "The Context Optimization Layer for LLM Applications - Cut costs by 50-90%"
 readme = "README.md"
 license = "Apache-2.0"
-requires-python = ">=3.10"
+requires-python = ">=3.11"
 authors = [
     { name = "Headroom Contributors" }
 ]
@@ -35,7 +35,6 @@ classifiers = [
     "Intended Audience :: Developers",
     "Operating System :: OS Independent",
     "Programming Language :: Python :: 3",
-    "Programming Language :: Python :: 3.10",
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
     "Programming Language :: Python :: 3.13",
@@ -50,7 +49,7 @@ dependencies = [
     "pydantic>=2.0.0",            # Config and data models
     # Model registry, pricing and non-core providers; all lazily imported and
     # ImportError-guarded. 1.96.2 is the first litellm with prebuilt wheels for
-    # Python 3.10-3.14 on Linux, macOS and Windows: older releases either reject
+    # Python 3.11-3.14 on Linux, macOS and Windows: older releases either reject
     # Python 3.14 (GH #956) or fall back to a Rust source build.
     "litellm>=1.96.2,<2.0",
     "click>=8.3.3",               # CLI framework; PYSEC-2026-2132 fix (command injection in click.edit())
@@ -63,7 +62,6 @@ dependencies = [
     # future patched one.
     "ast-grep-cli>=0.30.0,!=0.44.1",
     "pyyaml>=6.0",                # omp wrap: parse/merge omp's models.yml registry
-    "tomli>=2.0.0; python_version < '3.11'",  # tomllib backport for helper scripts
     "tomlkit>=0.13.0,<1.0",       # Loss-minimizing Codex config recovery
     # Verify upstream TLS through the OS trust store (macOS Keychain, Windows
     # cert store), where IT installs corporate TLS-inspection roots (Zscaler,
@@ -82,9 +80,8 @@ dependencies = [
     # CVE-2026-112907/112913/112940 are fixed in 4.2.1, but litellm 1.106 caps
     # filelock <4, so without this floor pip picks that litellm and 3.32.7;
     # with it pip takes litellm 1.103.7 (uv.lock has 1.101.0). Declared here so
-    # the floor reaches pip installs. 4.2 needs Python 3.11, so pip on 3.10
-    # still gets an affected filelock.
-    "filelock>=4.2.1; python_version >= '3.11'",
+    # the floor reaches pip installs.
+    "filelock>=4.2.1",
 ]
 
 [project.optional-dependencies]
@@ -446,10 +443,8 @@ constraint-dependencies = [
 # `pip install headroom-ai[all]` still resolves against fastembed's cap; on
 # that Pillow, headroom/image/decoder_guard.py forwards images undecoded.
 # Drop this override once fastembed allows Pillow 13.
-# Pillow 13 needs Python 3.11; on 3.10 no fixed release exists.
 override-dependencies = [
-    "pillow>=13.0.0; python_version >= '3.11'",
-    "pillow>=12.3.0,<13; python_version < '3.11'",
+    "pillow>=13.0.0",
 ]
 
 [[tool.uv.index]]
@@ -484,6 +479,8 @@ features = ["extension-module"]
 bindings = "pyo3"
 
 [tool.ruff]
+# Kept at py310 until the py311 idiom migration lands (UP017/UP036/UP041/UP042
+# touch ~200 sites); requires-python is 3.11.
 target-version = "py310"
 line-length = 100
 
@@ -511,7 +508,7 @@ quote-style = "double"
 indent-style = "space"
 
 [tool.mypy]
-python_version = "3.10"
+python_version = "3.11"
 warn_return_any = true
 warn_unused_configs = true
 disallow_untyped_defs = true
