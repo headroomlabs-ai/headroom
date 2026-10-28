@@ -1,8 +1,8 @@
 /**
- * HeadroomContextEngine — ContextEngine implementation for OpenClaw.
+ * HeadroomContextEngine â€” ContextEngine implementation for OpenClaw.
  *
  * Compresses tool outputs and conversation context using the Headroom proxy.
- * Zero LLM calls — all compression is algorithmic (SmartCrusher, ContentRouter, etc.)
+ * Zero LLM calls â€” all compression is algorithmic (SmartCrusher, ContentRouter, etc.)
  */
 
 /* eslint-disable @typescript-eslint/no-explicit-any */
@@ -18,24 +18,14 @@ import {
   type OpenClawCompactResult,
 } from "./openclaw-compaction.js";
 
-/** Race a promise against a timeout and always release the timer. */
-function withTimeout<T>(promise: Promise<T>, ms: number): Promise<T> {
-  let timerId: ReturnType<typeof setTimeout> | undefined;
-  const timer = new Promise<never>((_, reject) => {
-    timerId = setTimeout(() => reject(new Error(`headroom compress() timed out after ${ms}ms`)), ms);
-  });
-  return Promise.race([promise, timer]).finally(() => {
-    if (timerId !== undefined) clearTimeout(timerId);
-  });
-}
-
-// Must stay static — OpenClaw prepends it to the cached system prompt.
+// Must stay static â€” OpenClaw prepends it to the cached system prompt.
 const HEADROOM_COMPRESSION_NOTICE =
   "[Headroom is compressing tool outputs in this session. Use headroom_retrieve if you need the original, uncompressed content.]";
 
 export interface HeadroomEngineConfig extends ProxyManagerConfig {
   enabled?: boolean;
   requestTimeoutMs?: number;
+  minContextChars?: number;
   circuitBreakerThreshold?: number;
   circuitBreakerCooldownMs?: number;
   /** Where to durably record committed turn-advancement keys (see
@@ -131,7 +121,7 @@ export class HeadroomContextEngine {
   };
   private circuit = { errors: 0, openUntilMs: 0 };
   // Sessions shown the compression notice. Bounded via insertion-order
-  // eviction — no session lifecycle callback exists here to bound it otherwise.
+  // eviction â€” no session lifecycle callback exists here to bound it otherwise.
   private announcedSessions = new Set<string>();
   private static readonly MAX_ANNOUNCED_SESSIONS = 1000;
   /** Per session: the compressed view the provider's prompt cache holds (see `unchanged`). */
@@ -181,9 +171,9 @@ export class HeadroomContextEngine {
   }
 
   /**
-   * Assemble context for the model — THE CORE HOOK.
+   * Assemble context for the model â€” THE CORE HOOK.
    *
-   * Converts AgentMessage[] → OpenAI format → compress() → AgentMessage[]. Only messages the proxy
+   * Converts AgentMessage[] â†’ OpenAI format â†’ compress() â†’ AgentMessage[]. Only messages the proxy
    * actually changed are rebuilt; the rest are returned exactly as OpenClaw passed them, so the
    * provider prompt cache survives up to the first compressed message (see restoreAgentMessages).
    */
@@ -213,7 +203,7 @@ export class HeadroomContextEngine {
     }
 
     if (this.isCircuitOpen()) {
-      this.logger.warn("[headroom] Circuit open — using uncompressed messages");
+      this.logger.warn("[headroom] Circuit open â€” using uncompressed messages");
       return {
         messages: this.unchanged(params, warm),
         estimatedTokens: 0,
@@ -232,19 +222,28 @@ export class HeadroomContextEngine {
     }
 
     try {
-      // Convert AgentMessage → OpenAI format
+      // Convert AgentMessage â†’ OpenAI format
       const openaiMessages = agentToOpenAIIndexed(params.messages);
+      const minContextChars = this.config.minContextChars ?? 800;
+      if (minContextChars > 0 && countContextChars(openaiMessages) < minContextChars) {
+        this.logger.debug("[headroom] Context below compression threshold â€” using original messages");
+        return {
+          messages: normalizeAgentMessages(params.messages),
+          estimatedTokens: 0,
+          systemPromptAddition: this.sessionCompressionNotice(params.sessionId),
+        };
+      }
 
-      // Compress via proxy — pass tokenBudget so RollingWindow enforces it
-      const result = await withTimeout(
-        compress(openaiMessages, {
-          model,
-          baseUrl: this.proxyUrl,
-          fallback: true,
-          tokenBudget: params.tokenBudget,
-        } as any),
-        this.config.requestTimeoutMs ?? 30_000,
-      );
+      // Compress via proxy â€” pass tokenBudget so RollingWindow enforces it
+      const result = await compress(openaiMessages, {
+        model,
+        baseUrl: this.proxyUrl,
+        fallback: true,
+        tokenBudget: params.tokenBudget,
+        // The SDK applies this to AbortSignal.timeout(), so a timed-out call is
+        // cancelled instead of continuing in the background after fail-open.
+        timeout: this.config.requestTimeoutMs ?? 2_000,
+      } as any);
       this.rememberTokenCount(params, model, result.tokensBefore);
 
       if (!result.compressed || result.tokensSaved === 0) {
@@ -285,7 +284,7 @@ export class HeadroomContextEngine {
       this.stats.totalTokensBefore += result.tokensBefore;
 
       this.logger.debug(
-        `Assembled: ${result.tokensBefore} → ${result.tokensAfter} tokens (saved ${result.tokensSaved})`,
+        `Assembled: ${result.tokensBefore} â†’ ${result.tokensAfter} tokens (saved ${result.tokensSaved})`,
       );
 
       return {
@@ -425,11 +424,11 @@ export class HeadroomContextEngine {
   }
 
   /**
-   * Durable turn-advancement commit — required by OpenClaw's transcriptSemantics
+   * Durable turn-advancement commit â€” required by OpenClaw's transcriptSemantics
    * contract. Called only for the accepted, successful turn; failed or aborted
    * turns never reach here. Must be an atomic, idempotent write of the
    * accepted `messages` keyed by `advancementKey` so a host retry with the
-   * same key reports "duplicate" instead of re-applying the advancement —
+   * same key reports "duplicate" instead of re-applying the advancement â€”
    * including a retry that arrives after this process restarted, which is
    * why the record lives on disk (see `DurableAdvancementKeyStore`) rather
    * than in memory, and includes the messages rather than just the key.
@@ -590,4 +589,15 @@ export class HeadroomContextEngine {
       }
     }
   }
+}
+
+function countContextChars(messages: ReturnType<typeof agentToOpenAIIndexed>): number {
+  let total = 0;
+  for (const message of messages) {
+    total += message.content?.length ?? 0;
+    for (const toolCall of message.tool_calls ?? []) {
+      total += toolCall.function?.arguments?.length ?? 0;
+    }
+  }
+  return total;
 }

@@ -4,11 +4,11 @@ build-backend = "maturin"
 
 [project]
 name = "headroom-ai"
-version = "0.41.0"
+version = "0.42.0"
 description = "The Context Optimization Layer for LLM Applications - Cut costs by 50-90%"
 readme = "README.md"
 license = "Apache-2.0"
-requires-python = ">=3.10"
+requires-python = ">=3.11"
 authors = [
     { name = "Headroom Contributors" }
 ]
@@ -35,7 +35,6 @@ classifiers = [
     "Intended Audience :: Developers",
     "Operating System :: OS Independent",
     "Programming Language :: Python :: 3",
-    "Programming Language :: Python :: 3.10",
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
     "Programming Language :: Python :: 3.13",
@@ -50,7 +49,7 @@ dependencies = [
     "pydantic>=2.0.0",            # Config and data models
     # Model registry, pricing and non-core providers; all lazily imported and
     # ImportError-guarded. 1.96.2 is the first litellm with prebuilt wheels for
-    # Python 3.10-3.14 on Linux, macOS and Windows: older releases either reject
+    # Python 3.11-3.14 on Linux, macOS and Windows: older releases either reject
     # Python 3.14 (GH #956) or fall back to a Rust source build.
     "litellm>=1.96.2,<2.0",
     "click>=8.3.3",               # CLI framework; PYSEC-2026-2132 fix (command injection in click.edit())
@@ -63,12 +62,26 @@ dependencies = [
     # future patched one.
     "ast-grep-cli>=0.30.0,!=0.44.1",
     "pyyaml>=6.0",                # omp wrap: parse/merge omp's models.yml registry
-    "tomli>=2.0.0; python_version < '3.11'",  # tomllib backport for helper scripts
     "tomlkit>=0.13.0,<1.0",       # Loss-minimizing Codex config recovery
     # Verify upstream TLS through the OS trust store (macOS Keychain, Windows
     # cert store), where IT installs corporate TLS-inspection roots (Zscaler,
     # Netskope). Pure Python, no deps; the same library pip uses by default.
     "truststore>=0.10.0",
+    # Not imported directly: huggingface-hub (via litellm -> tokenizers, so in
+    # every install) uses it for Hub downloads. Before 1.6.0 its worker threads
+    # could re-initialize or re-enter Python while the interpreter shut down
+    # after a download, crashing the process at exit (SIGSEGV in
+    # Py_InitializeEx, or a fatal TstateNULL error). Declared here rather than
+    # as a uv constraint so the floor reaches the published wheel's metadata
+    # and pip upgrades an older copy. Same platform marker as huggingface-hub's
+    # own hf-xet requirement, so it never installs where hf-xet would not.
+    "hf-xet>=1.6.0; platform_machine == 'AMD64' or platform_machine == 'aarch64' or platform_machine == 'amd64' or platform_machine == 'arm64' or platform_machine == 'x86_64'",
+    # Not imported directly: litellm, huggingface-hub and torch use it.
+    # CVE-2026-112907/112913/112940 are fixed in 4.2.1, but litellm 1.106 caps
+    # filelock <4, so without this floor pip picks that litellm and 3.32.7;
+    # with it pip takes litellm 1.103.7 (uv.lock has 1.101.0). Declared here so
+    # the floor reaches pip installs.
+    "filelock>=4.2.1",
 ]
 
 [project.optional-dependencies]
@@ -83,10 +96,11 @@ proxy = [
     "openai>=2.14.0",             # OpenAI API format support
     # The server still uses the v1 low-level Server decorator API. Keep this
     # cap until the SDK 2.x port lands (GH #2658 / regression GH #2977).
-    "mcp>=1.28.1,<2.0.0",         # MCP server (headroom_compress, retrieve, stats)
+    "mcp>=1.30.0,<2.0.0",         # MCP server (headroom_compress, retrieve, stats)
     "magika>=0.6.0; python_version<'3.14' or sys_platform != 'darwin' or platform_machine != 'x86_64'", # ML detection needs ORT wheels
     "zstandard>=0.20.0",          # Decompress zstd request bodies (Codex, etc.)
     "websockets>=13.0",           # WebSocket proxy for /v1/responses (Codex gpt-5.4+)
+    "python-socks[asyncio]>=2.7.1",  # SOCKS support when websockets discovers a system proxy
     # ORT <1.24 deadlocks in Rust fastembed instead of returning an init error.
     # Python 3.10 keeps Python-only ORT and bypasses native detection. Intel
     # macOS also needs older ORT because newer releases have no x86_64 wheels.
@@ -127,11 +141,11 @@ ml = [
     # makes `headroom-ai[all]` unsatisfiable on Intel Macs (#1931).
     "torch>=2.12.1; sys_platform != 'darwin' or platform_machine != 'x86_64'",
     "transformers>=5.5.0,<6.0",
-    # transformers >= 5.x requires huggingface-hub >= 1.5.0,<2.0; pinning
+    # transformers >= 5.x requires huggingface-hub >= 1.5.0,< 3.0; pinning
     # the floor here prevents Kompress from silently falling back to
     # "unavailable" when a sibling install (e.g. `pip install
     # strands-agents`) drags huggingface-hub backwards.
-    "huggingface-hub>=1.5.0,<2.0",
+    "huggingface-hub>=1.5.0,<3.0",
 ]
 # Memory system (hierarchical memory with vector search).
 # Uses the pure-Python sqlite-vec backend by default (VectorBackend.AUTO ->
@@ -163,13 +177,13 @@ pytorch-mps = [
 ]
 # Semantic relevance scoring with embeddings.
 # Uses `fastembed` (BAAI/bge-small-en-v1.5 by default — 33M params,
-# 384 dims, ~30 MB int8-quantized ONNX). Same library + model used by
-# the Rust SmartCrusher (`fastembed` crate), giving byte-equal embeddings
-# across the language boundary. Replaced sentence-transformers in
+# 384 dims, ~67 MB quantized ONNX), loaded from a pinned
+# Qdrant/bge-small-en-v1.5-onnx-Q snapshot. Replaced sentence-transformers in
 # Stage 3c.1 — fastembed is faster (~2-3x), smaller (no torch
 # dependency), and outranks all-MiniLM-L6-v2 on MTEB by ~6 points.
+# >=0.6.0 for `specific_model_path`, which the pinned-snapshot load needs.
 relevance = [
-    "fastembed>=0.4.0; python_version<'3.14' or sys_platform != 'darwin' or platform_machine != 'x86_64'",
+    "fastembed>=0.6.0; python_version<'3.14' or sys_platform != 'darwin' or platform_machine != 'x86_64'",
     "numpy>=1.24.0",
 ]
 # Image compression (ML-based routing + OCR)
@@ -186,7 +200,7 @@ relevance = [
 # `headroom/image/compressor.py` adapts both API shapes at runtime via
 # a try/except cascade. See issue #372 for context.
 image = [
-    "pillow>=12.3.0",         # PYSEC-2026-2253/2254/2255/2256/2257 fixes (decompression-bomb + cmd-injection)
+    "pillow>=12.3.0",         # PYSEC-2026-2253..2257; uv.lock takes 13.0.0 (see override-dependencies)
     "sentencepiece>=0.1.99",  # Required by SigLIP tokenizer (SiglipTokenizer)
     # Python 3.6–3.12: keep the proven ORT-bundled package directly.
     # ~15 MB ONNX models auto-downloaded on first use.
@@ -247,7 +261,7 @@ autogen = [
 ]
 # MCP server for Claude Code integration
 mcp = [
-    "mcp>=1.28.1,<2.0.0",
+    "mcp>=1.30.0,<2.0.0",
     "httpx>=0.24.0",
     "starlette>=0.27.0",
     "uvicorn>=0.23.0,<1.0",
@@ -284,6 +298,11 @@ bedrock = [
     "boto3>=1.41.0",
     "botocore[crt]>=1.41.0",
 ]
+# State shared across replicas: CCR store (HEADROOM_CCR_BACKEND=redis) and
+# session-aware /v1/compress (HEADROOM_COMPRESS_SESSION_STORE=redis://...).
+redis = [
+    "redis>=5.0.0",
+]
 # HTML content extraction
 html = [
     "trafilatura>=1.6.0",
@@ -293,7 +312,7 @@ dev = [
     "pytest>=7.0.0",
     "pytest-cov>=4.0.0",
     "pytest-asyncio>=0.21.0",
-    "ruff==0.16.8",
+    "ruff==0.17.0",
     "mypy>=1.0.0",
     "pre-commit>=3.0.0",
     "openai>=1.0.0",
@@ -316,6 +335,7 @@ dev = [
     "sentence-transformers>=2.2.0,<7.0",
     "numpy>=1.24.0",
     "openpyxl>=3.1.0",  # exercises spreadsheet_ingest (.xlsx) in the test suite
+    "fakeredis[lua]>=2.20.0",  # Redis-backed shared state, without a Redis server
     "xlrd>=2.0.1",      # exercises spreadsheet_ingest (.xls) in the test suite
     "xlwt>=1.3.0",      # writes the legacy .xls fixtures for spreadsheet_ingest tests
     # test_upstream_guard builds a self-signed cert to prove the pinned connection
@@ -337,8 +357,13 @@ dev = [
 all = [
     "headroom-ai[proxy,code,ml,memory,relevance,image,reports,otel,evals,voice,html,mcp,spreadsheet]",
 ]
-# Sandbox: a lean proxy with ALL torch-free capability — for running Headroom in
-# a locked-down/low-resource sandbox and offloading heavy ML elsewhere.
+# Lean: a proxy with ALL torch-free capability — for running Headroom in a
+# constrained or low-resource environment and offloading heavy ML elsewhere.
+#
+# This is a DEPENDENCY PROFILE. It provides no isolation, no confinement and
+# no privilege reduction of any kind. It was previously named `sandbox`, which
+# invited exactly that assumption; `sandbox` is retained below as a
+# deprecated alias for one release so existing installs keep resolving.
 #
 # = [all] MINUS:
 #   - image  (SigLIP/OCR — excluded by request)
@@ -349,12 +374,17 @@ all = [
 #   - memory + evals  (both pull sentence-transformers -> torch, i.e. the very
 #             ML weight a sandbox avoids; evals is a dev/test harness, not a
 #             runtime feature). Opt back in explicitly if you accept torch:
-#             pip install headroom-ai[sandbox,memory]
+#             pip install headroom-ai[lean,memory]
 #
 # Everything kept here is torch-free: code-aware compression (tree-sitter),
 # embedding relevance (fastembed), HTML/spreadsheet ingestion, reports, OTel.
-sandbox = [
+lean = [
     "headroom-ai[proxy,code,relevance,reports,otel,html,mcp,spreadsheet]",
+]
+# Deprecated alias for `lean`, kept for one release. The name implied an
+# isolation guarantee the extra never provided. Remove after 0.39.x.
+sandbox = [
+    "headroom-ai[lean]",
 ]
 
 [project.scripts]
@@ -401,8 +431,9 @@ constraint-dependencies = [
     "transformers>=5.5.0",
     # PYSEC-2026-3447 — transitive dependency; fix at 83.0.0
     "setuptools>=83.0.0",
-    # PYSEC-2026-3545/3546/3547 — transitive HTTP/WebSocket parser fixes
-    "aiohttp>=3.14.3",
+    # PYSEC-2026-3545/3546/3547 — transitive HTTP/WebSocket parser fixes;
+    # CVE-2026-111063/111064, GHSA-2g87-pp6c-29x5; fix at 3.14.4
+    "aiohttp>=3.14.4",
     # PYSEC-2026-3552/3553/3554 — PKCS#7 and certificate verification fixes
     "cryptography>=50.0.0",
 ]
@@ -414,6 +445,19 @@ constraint-dependencies = [
 # then breaks CI on every public runner that can't reach the mirror.
 # Declaring the index in pyproject.toml makes the project authoritative
 # regardless of who runs `uv lock`.
+# fastembed (0.9.0, latest) caps pillow <13, but Pillow 13.0.0 is the only fix
+# for ten decoder CVEs on untrusted images (CVE-2026-112395, -112895 and
+# others), which headroom.image opens. fastembed imports PIL only for its image models;
+# Headroom uses its text models. Checked: fastembed text embedding and
+# Headroom's image tests pass on Pillow 13. This applies to uv.lock (CI,
+# release images, uv installs); the package metadata keeps pillow>=12.3.0 so
+# `pip install headroom-ai[all]` still resolves against fastembed's cap; on
+# that Pillow, headroom/image/decoder_guard.py forwards images undecoded.
+# Drop this override once fastembed allows Pillow 13.
+override-dependencies = [
+    "pillow>=13.0.0",
+]
+
 [[tool.uv.index]]
 name = "pypi"
 url = "https://pypi.org/simple/"
@@ -446,6 +490,8 @@ features = ["extension-module"]
 bindings = "pyo3"
 
 [tool.ruff]
+# Kept at py310 until the py311 idiom migration lands (UP017/UP036/UP041/UP042
+# touch ~200 sites); requires-python is 3.11.
 target-version = "py310"
 line-length = 100
 
@@ -473,7 +519,7 @@ quote-style = "double"
 indent-style = "space"
 
 [tool.mypy]
-python_version = "3.10"
+python_version = "3.11"
 warn_return_any = true
 warn_unused_configs = true
 disallow_untyped_defs = true

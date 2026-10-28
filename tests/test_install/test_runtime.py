@@ -118,6 +118,47 @@ def test_build_runtime_command_for_docker_includes_deployment_env(
     )
 
 
+def test_build_runtime_command_keeps_hf_cache_on_the_writable_mount(
+    monkeypatch, tmp_path: Path
+) -> None:
+    """Issue #4207: ``$HOME`` is created root-owned by Docker but the container
+    runs as the host uid, so the HuggingFace cache must live on a bind mount the
+    host user owns. Otherwise the Kompress model download dies with
+    ``Permission denied``.
+    """
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    manifest = DeploymentManifest(
+        profile="default",
+        preset="persistent-docker",
+        runtime_kind="docker",
+        supervisor_kind="none",
+        scope="user",
+        provider_mode="manual",
+        targets=["claude"],
+        port=8787,
+        host="127.0.0.1",
+        backend="anthropic",
+        image="ghcr.io/headroomlabs-ai/headroom:latest",
+        base_env={"HEADROOM_PORT": "8787"},
+        proxy_args=["--host", "127.0.0.1", "--port", "8787"],
+    )
+
+    command = build_runtime_command(manifest)
+
+    # The cache path sits under the ``~/.headroom`` bind mount, which the host
+    # user (and therefore the --user the container runs as) can write.
+    hf_home = "HF_HOME=/tmp/headroom-home/.headroom/cache/huggingface"
+    xdg_cache = "XDG_CACHE_HOME=/tmp/headroom-home/.headroom/cache"
+    assert hf_home in command
+    assert xdg_cache in command
+    # Both are real --env flags, not stray argv tokens.
+    assert command[command.index(hf_home) - 1] == "--env"
+    assert command[command.index(xdg_cache) - 1] == "--env"
+    # The cache lives under the .headroom mount, so it must not be mounted
+    # anywhere Docker would create as root.
+    assert f"{_mount_source(str(tmp_path), '.headroom')}:/tmp/headroom-home/.headroom" in command
+
+
 def test_build_runtime_command_lets_the_host_dashboard_read_its_data(
     monkeypatch, tmp_path: Path
 ) -> None:

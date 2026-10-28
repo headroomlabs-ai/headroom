@@ -257,6 +257,15 @@ class NormalizedUsage:
             return True
         return self.cache_read is not None and self.cache_write is not None
 
+    def _merged_includes_cache(self, other: NormalizedUsage) -> bool:
+        """Accounting dialect across rounds. A usage block without cache fields
+        carries no dialect (``normalize_usage`` defaults it to inclusive, which
+        is wrong for a cacheless Anthropic round), so the round that reported
+        cache fields decides; the latest such round wins."""
+        if other.has_cache_signal or not self.has_cache_signal:
+            return other.input_includes_cache
+        return self.input_includes_cache
+
     def merged_with(self, other: NormalizedUsage) -> NormalizedUsage:
         """Sum the billed counters across re-drive rounds; cache fields come
         from the latest round that carried them (the last provider call is the
@@ -272,6 +281,7 @@ class NormalizedUsage:
             output_tokens=_sum(self.output_tokens, other.output_tokens),
             cache_read=other.cache_read if other.has_cache_signal else self.cache_read,
             cache_write=other.cache_write if other.has_cache_signal else self.cache_write,
+            input_includes_cache=self._merged_includes_cache(other),
         )
 
     def summed_with(self, other: NormalizedUsage) -> NormalizedUsage:
@@ -290,6 +300,7 @@ class NormalizedUsage:
             output_tokens=_sum(self.output_tokens, other.output_tokens),
             cache_read=_sum(self.cache_read, other.cache_read),
             cache_write=_sum(self.cache_write, other.cache_write),
+            input_includes_cache=self._merged_includes_cache(other),
         )
 
     def as_anthropic(self) -> dict[str, int]:
@@ -342,7 +353,9 @@ def normalize_usage(usage: dict[str, Any]) -> NormalizedUsage:
     # ``input_tokens`` too, so the key name cannot be the discriminator. Keying
     # off Anthropic's cache fields can misread only a relay that mixes the two
     # vocabularies, and then it errs towards not inflating the prompt.
-    input_includes_cache = not (
+    # Responses' ``input_tokens_details`` marks an inclusive total even when a
+    # relay also flattened a top-level read beside it.
+    input_includes_cache = "input_tokens_details" in usage or not (
         "cache_read_input_tokens" in usage or "cache_creation_input_tokens" in usage
     )
     output_tokens = _usage_int(usage, "output_tokens")
@@ -351,10 +364,16 @@ def normalize_usage(usage: dict[str, Any]) -> NormalizedUsage:
 
     cache_read = _usage_int(usage, "cache_read_input_tokens")
     cache_write = _usage_int(usage, "cache_creation_input_tokens")
+    if cache_write is None:
+        # Responses reports billed writes as input_tokens_details.cache_write_tokens;
+        # chat reports none. Read whether or not a top-level read was relayed.
+        details = usage.get("input_tokens_details")
+        if isinstance(details, dict):
+            cache_write = _usage_int(details, "cache_write_tokens")
     if cache_read is None:
-        # OpenAI reports reads only (no write counter exists), nested under
-        # prompt_tokens_details (chat), input_tokens_details (Responses) or —
-        # in Kong's flattened log shape — at the top level.
+        # OpenAI nests reads under prompt_tokens_details (chat),
+        # input_tokens_details (Responses) or — in Kong's flattened log shape —
+        # puts them at the top level.
         for details_key in ("prompt_tokens_details", "input_tokens_details"):
             details = usage.get(details_key)
             if isinstance(details, dict):
@@ -839,6 +858,19 @@ class RequestTransformer:
         self.tags = tags
         self.caps = caps
         self.result: RequestTransformResult | None = None
+        # Tool-definition tokens the request hooks ADDED (e.g. a search tool).
+        # The compress handler adds it to ``tokens_after``: it is sent too.
+        self.tool_growth_tokens = 0
+        # Message tokens the request hooks ADDED (only counted by the handler
+        # when it did not recount the messages), and tool tokens they removed
+        # (booked on turn_hook_tools_saved_tokens), for signed netting.
+        self.message_growth_tokens = 0
+        self.hook_tool_saved_tokens = 0
+        # Tool-definition tokens before and after schema compaction, both 0 when
+        # it changed nothing or could not be counted. The compress handler folds
+        # them into ``tokens_before``/``tokens_after``, as the chat handlers do.
+        self.compaction_tokens_before = 0
+        self.compaction_tokens_after = 0
         self._tokenizer: Any = None
 
     def _get_tokenizer(self) -> Any:
@@ -879,6 +911,15 @@ class RequestTransformer:
             count_tools = _count_tools_with(tokenizer)
         except Exception:
             logger.debug("gateway turn: tokenizer unavailable; hook savings uncounted")
+        if tool_transforms:
+            # Counted before any hook runs: a hook may edit the compacted list.
+            # Tools the client already deferred are not billed, so their
+            # compaction saves nothing.
+            compacted_before = _safe_count(count_tools, _billed_tools(self.tools))
+            compacted_after = _safe_count(count_tools, _billed_tools(tools))
+            if compacted_before is not None and compacted_after is not None:
+                self.compaction_tokens_before = compacted_before
+                self.compaction_tokens_after = compacted_after
 
         # Built even with no hook registered: the response half drives CCR
         # retrieval through the same context (messages + live tools).
@@ -909,12 +950,16 @@ class RequestTransformer:
                     f"{int(self.tags.get('tool_search_deferred_tokens', 0) or 0)}tok"
                 )
             msg_after = _safe_count(count_messages, messages)
+            if msg_before is not None and msg_after is not None:
+                self.message_growth_tokens = max(0, msg_after - msg_before)
             if msg_before is not None and msg_after is not None and msg_after < msg_before:
                 transforms.append("turn_hook")
                 messages_rewritten = True
             tools_after = _safe_count(count_tools, without_deferral_flags(tools))
             if tools_before is not None and tools_after is not None:
+                self.tool_growth_tokens = max(0, tools_after - tools_before)
                 saved = max(0, tools_before - tools_after)
+                self.hook_tool_saved_tokens = saved
                 if saved > 0:
                     self.tags["turn_hook_tools_saved_tokens"] = (
                         int(self.tags.get("turn_hook_tools_saved_tokens", 0) or 0) + saved
@@ -948,6 +993,13 @@ class RequestTransformer:
             messages_rewritten=messages_rewritten,
         )
         return messages
+
+
+def _billed_tools(tools: Any) -> Any:
+    """The tools that enter the billed context: all but those flagged ``defer_loading``."""
+    if not isinstance(tools, list):
+        return tools
+    return [t for t in tools if not (isinstance(t, dict) and t.get("defer_loading"))]
 
 
 def _safe_count(counter: Callable[[Any], int] | None, value: Any) -> int | None:

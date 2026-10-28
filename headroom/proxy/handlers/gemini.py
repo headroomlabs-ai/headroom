@@ -22,6 +22,7 @@ from headroom.agent_savings import proxy_pipeline_kwargs
 from headroom.copilot_auth import build_copilot_upstream_url
 from headroom.proxy.auth_mode import classify_client
 from headroom.proxy.compression_decision import CompressionDecision
+from headroom.proxy.handlers._failure_logging import log_request_failure
 from headroom.proxy.helpers import (
     COMPRESSION_TIMEOUT_SECONDS,
     extract_tags,
@@ -155,6 +156,10 @@ class GeminiHandlerMixin:
         - thought / thoughtSignature: thinking parts, which must round-trip intact
         - non-string text, which the text round trip cannot rebuild
 
+        The REST API accepts both the camelCase JSON names and the snake_case
+        proto field names (``inline_data``, ``function_call``, ...), so both
+        spellings are checked.
+
         Args:
             content: A single Gemini content entry with 'parts' list.
 
@@ -173,6 +178,13 @@ class GeminiHandlerMixin:
                     "codeExecutionResult",
                     "thought",
                     "thoughtSignature",
+                    "inline_data",
+                    "file_data",
+                    "function_call",
+                    "function_response",
+                    "executable_code",
+                    "code_execution_result",
+                    "thought_signature",
                 )
             ):
                 return True
@@ -268,9 +280,10 @@ class GeminiHandlerMixin:
 
             if include_function_responses:
                 for part in parts:
-                    if "functionResponse" not in part:
+                    function_response = part.get("functionResponse", part.get("function_response"))
+                    if function_response is None:
                         continue
-                    payload = self._function_response_text(part["functionResponse"])
+                    payload = self._function_response_text(function_response)
                     if payload:
                         messages.append({"role": "tool", "content": payload})
 
@@ -1111,7 +1124,9 @@ class GeminiHandlerMixin:
             return Response(content=e.content, status_code=e.status_code, headers=response_headers)
         except Exception as e:
             await self.metrics.record_failed(provider=provider_name)
-            logger.error(f"[{request_id}] Gemini request failed: {type(e).__name__}: {e}")
+            log_request_failure(
+                request_id, "Gemini request", e, provider=provider_name, model=model
+            )
             return JSONResponse(
                 status_code=502,
                 content={
@@ -1581,7 +1596,9 @@ class GeminiHandlerMixin:
             )
         except Exception as e:
             await self.metrics.record_failed(provider=provider_name)
-            logger.error(f"[{request_id}] Gemini countTokens failed: {type(e).__name__}: {e}")
+            log_request_failure(
+                request_id, "Gemini countTokens", e, provider=provider_name, model=model
+            )
             return JSONResponse(
                 status_code=502,
                 content={

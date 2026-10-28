@@ -50,7 +50,8 @@ def test_decide_memory_injection_reports_mode_reasons() -> None:
     )
 
     assert disabled.skip_reason == "mode_disabled"
-    assert tool.skip_reason == "mode_tool"
+    assert tool.inject is True
+    assert tool.skip_reason is None
 
 
 def test_apply_memory_skip_reason_stamps_only_when_skipping() -> None:
