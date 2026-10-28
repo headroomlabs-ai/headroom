@@ -6761,7 +6761,9 @@ class OpenAIHandlerMixin:
                 and not _bypass
             ):
                 body_mutation_tracker.mark_mutated("responses_store_false")
-        responses_memory_tools_allowed = _allow_responses_memory_tools(is_chatgpt_auth)
+        responses_memory_tools_allowed = _allow_responses_memory_tools(is_chatgpt_auth) and (
+            not stream
+        )
 
         # PR-A6 (P5-50, preps P0-6): session-sticky `OpenAI-Beta` merge
         # for /v1/responses. Compute a session_id off the same store the
