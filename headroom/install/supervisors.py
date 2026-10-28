@@ -21,6 +21,10 @@ from headroom._subprocess import run
 
 from .models import ArtifactRecord, DeploymentManifest, SupervisorKind
 from .paths import (
+    OWNER_ONLY_FILE_MODE,
+    OWNER_ONLY_SCRIPT_MODE,
+    POSIX_MODES_ENFORCED,
+    chmod_owner_only,
     unix_ensure_script_path,
     unix_run_script_path,
     windows_ensure_cmd_path,
@@ -45,6 +49,32 @@ _ENV_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 
 def _is_windows() -> bool:
     return sys.platform.startswith("win")
+
+
+def _write_private_text(path: Path, data: str, mode: int) -> None:
+    """Atomically replace a secret-bearing runner with a private new inode.
+
+    Creating the temporary file exclusively avoids following a replacement
+    hard link. Restrict it before publishing; a failed write, restriction or
+    replacement leaves the previous runner and unrelated files untouched.
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, name = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=path.parent)
+    temporary = Path(name)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            if hasattr(os, "fchmod"):
+                os.fchmod(handle.fileno(), mode)
+            handle.write(data)
+        if not chmod_owner_only(temporary, mode) and POSIX_MODES_ENFORCED:
+            raise click.ClickException(
+                f"Refusing to write {path}: permissions could not be restricted "
+                f"to {oct(mode)}, and the file carries any API key passed via "
+                f"`headroom install --env`. Fix directory permissions and re-run."
+            )
+        os.replace(temporary, path)
+    finally:
+        temporary.unlink(missing_ok=True)
 
 
 def _validated_env_items(env: dict[str, str] | None) -> list[tuple[str, str]]:
@@ -101,14 +131,19 @@ def _render_unix_runner(
     export_lines = "".join(
         f"export {name}={shlex.quote(value)}\n" for name, value in _validated_env_items(env)
     )
-    path.write_text(
+    # 0700, not 0755: `export_lines` can contain a provider API key in
+    # cleartext (see `_write_private_text`). The supervisor runs this script as
+    # the installing user for a user-scope install and as root for a
+    # system-scope one, so dropping group/other loses nothing.
+    _write_private_text(
+        path,
         "#!/usr/bin/env bash\nset -euo pipefail\n"
         + export_lines
         + "exec "
         + " ".join(shlex.quote(x) for x in command)
-        + "\n"
+        + "\n",
+        OWNER_ONLY_SCRIPT_MODE,
     )
-    path.chmod(0o755)
     return ArtifactRecord(kind="script", path=str(path))
 
 
@@ -124,9 +159,17 @@ def _render_windows_runner(
     env_lines = "".join(
         f"$env:{name} = {_powershell_literal(value)}\n" for name, value in _validated_env_items(env)
     )
-    ps1_path.write_text(
-        f"$ErrorActionPreference = 'Stop'\n{env_lines}& {escaped}\nexit $LASTEXITCODE\n"
+    # The .ps1 carries `$env:` assignments that can include a provider API key,
+    # so it is owner-only like its POSIX counterpart. Windows resolves access
+    # by ACL rather than by these bits, but the mode still matters when the
+    # profile directory is read from WSL, a backup, or a synced home.
+    _write_private_text(
+        ps1_path,
+        f"$ErrorActionPreference = 'Stop'\n{env_lines}& {escaped}\nexit $LASTEXITCODE\n",
+        OWNER_ONLY_FILE_MODE,
     )
+    # The .cmd shim holds no secrets — it only invokes the .ps1 — so it keeps a
+    # conventional mode.
     cmd_path.write_text(
         '@echo off\r\npowershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0'
         + ps1_path.name

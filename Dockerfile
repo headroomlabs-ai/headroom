@@ -50,11 +50,12 @@ COPY headroom/ headroom/
 # The standalone Dockerfile must support every backend advertised by
 # `headroom proxy --backend`, including Bedrock temporary/SSO credentials.
 # Those credentials require botocore (GH #1551), supplied by [bedrock].
-ARG HEADROOM_EXTRAS=proxy,code,bedrock
+# [redis] backs the replica-shared stores: without it HEADROOM_COMPRESS_SESSION_STORE
+# stops startup and HEADROOM_CCR_BACKEND=redis falls back to a per-process store.
+ARG HEADROOM_EXTRAS=proxy,code,bedrock,redis
 # `uv pip install` ignores [tool.uv] override-dependencies (uv.lock only), so
 # pass them explicitly: the image gets the security overrides the lock has
-# (pillow 13 over fastembed's <13 cap). Python 3.10 has no tomllib: pip's
-# vendored tomli reads the file there.
+# (pillow 13 over fastembed's <13 cap).
 RUN --mount=type=cache,target=/root/.cache/uv \
     --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/usr/local/cargo/git \
