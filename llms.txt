@@ -64,10 +64,10 @@ The canonical, always-current documentation index lives at the docs site below. 
 
 ## Headroom for Teams
 
-For teams and companies that want Headroom across every developer rather than one laptop: Headroom Enterprise adds more savings (tool search for every model, harness tuning, extra compressors), automatic model routing (open source has opt-in, rule-based routing), prompt-injection and risky-tool-call removal, SSO, managed or VPC deployment, an org-wide savings dashboard, and support. Companies that sign a 12-month Enterprise plan get the first 3 months free.
+Headroom OSS is a framework built to show what's possible on one developer's laptop, so it saves less than Headroom Enterprise. Enterprise adds more cost savings, tokens secured, on premise deployment, deep attribution and many more features. Teams and enterprises: contact hello@headroomlabs.ai or visit https://headroomlabs.ai.
 
-- [Headroom for Teams](https://docs.headroomlabs.ai/docs/teams): Open source vs Enterprise, and the 3-months-free offer.
-- [Claim 3 months free](https://headroom-perks.vercel.app/?source=github&utm_source=llms-txt): Perk sign-up form. One perk per company.
+- [Headroom for Teams](https://docs.headroomlabs.ai/docs/teams): Open source vs Enterprise, and how to reach us.
+- [headroomlabs.ai](https://headroomlabs.ai): Company site. Email hello@headroomlabs.ai.
 
 ## Licensing
 
