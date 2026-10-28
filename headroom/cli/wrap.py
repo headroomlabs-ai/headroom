@@ -41,10 +41,7 @@ from functools import wraps
 from pathlib import Path
 from typing import Any, NamedTuple, cast
 
-try:
-    import tomllib
-except ModuleNotFoundError:  # pragma: no cover - Python < 3.11
-    import tomli as tomllib
+import tomllib
 
 from headroom._subprocess import identity_mismatch as _shared_identity_mismatch
 from headroom._subprocess import pid_alive, proc_identity, run

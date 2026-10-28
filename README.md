@@ -443,7 +443,7 @@ Granular extras: `[proxy]`, `[mcp]`, `[ml]` (Kompress-v2-base), `[code]`,
 `[memory]`, `[vector]` (optional HNSW backend — needs a C++ toolchain, not in
 `[all]`), `[relevance]`, `[image]`, `[agno]`, `[langchain]`, `[evals]`,
 `[pytorch-mps]` (Apple-GPU memory-embedder offload — set
-`HEADROOM_EMBEDDER_RUNTIME=pytorch_mps`). Requires **Python 3.10+**.
+`HEADROOM_EMBEDDER_RUNTIME=pytorch_mps`). Requires **Python 3.11+**.
 
 > `[all]` covers the core stack but not the framework adapters. Install those
 > separately: `pip install "headroom-ai[langchain]"`, and likewise `[agno]`,
