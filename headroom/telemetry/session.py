@@ -118,6 +118,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from headroom.offline import pin_litellm_cost_map_local
+
 logger = logging.getLogger(__name__)
 
 # Where session events go. The receiver is open source: deploy/beacon/worker.js.
@@ -532,6 +534,7 @@ def _public_model(model: str) -> str | None:
 
     resolved: str | None = None
     try:
+        pin_litellm_cost_map_local()
         import litellm
 
         registry = litellm.model_cost
@@ -1768,7 +1771,13 @@ def post_session_event(payload: dict[str, Any]) -> None:
     ponytail: unbounded thread spawn is safe only because the close rate is
     bounded by the idle timeout. Revisit if anything else starts emitting here.
     """
+    from headroom.telemetry.beacon import is_beacon_enabled
+
     try:
+        # Re-checked at send time: a session buffered before an opt-out must
+        # not upload after it (heartbeats and idle closes send through here).
+        if not is_beacon_enabled():
+            return
         threading.Thread(
             target=_post_blocking,
             args=(payload,),
@@ -1812,8 +1821,16 @@ def _flush_at_exit() -> None:
     Still does not cover SIGKILL or a closed laptop. Heartbeats bound the loss
     there to one flush interval.
     """
+    from headroom.telemetry.beacon import is_beacon_enabled
+
     aggregator = _aggregator
     if aggregator is None:
+        return
+    try:
+        if not is_beacon_enabled():  # opted out since the session was buffered
+            return
+    except Exception:
+        logger.debug("telemetry: beacon gate failed at exit", exc_info=True)
         return
     aggregator.flush_all(emit=lambda payload: _post_blocking(payload, timeout=_EXIT_POST_TIMEOUT_S))
 

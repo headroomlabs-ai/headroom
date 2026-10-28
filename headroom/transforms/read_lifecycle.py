@@ -475,7 +475,8 @@ class ReadLifecycleManager:
             return False, content, None
 
         # Best-effort CCR persistence (mirrors read_maturation.py): a store
-        # failure must not break compress().
+        # failure must not break compress(), and keeps the Read verbatim — a
+        # marker would point at an original nobody stored.
         ccr_hash = hashlib.sha256(content.encode()).hexdigest()[:24]
         if self.store is not None:
             try:
@@ -493,6 +494,7 @@ class ReadLifecycleManager:
                     classification.tool_call_id,
                     e,
                 )
+                return False, content, None
 
         file_display = classification.file_path or "unknown"
 

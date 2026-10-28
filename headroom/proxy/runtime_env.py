@@ -84,6 +84,18 @@ RUNTIME_ENV_KNOBS: tuple[Knob, ...] = (
         "int",
         "Max on-disk file size (bytes) the disk-verify fallback will read.",
     ),
+    Knob(
+        "HEADROOM_WEB_SEARCH_HISTORY",
+        "bool",
+        "Drop web_search_call history from a Responses request that declares no "
+        "web_search tool (default on; 0 disables).",
+    ),
+    Knob(
+        "HEADROOM_BUFFERED_UPSTREAM_STREAM",
+        "bool",
+        "Send buffered CCR requests upstream as stream:true and fold the reply "
+        "(default on; 0 sends stream:false).",
+    ),
 )
 
 _KNOBS_BY_ENV: dict[str, Knob] = {k.env: k for k in RUNTIME_ENV_KNOBS}

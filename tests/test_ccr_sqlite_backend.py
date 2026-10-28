@@ -7,6 +7,7 @@ worker processes — neither holds for the in-memory dict.
 
 from __future__ import annotations
 
+import logging
 import os
 import sqlite3
 import time
@@ -221,7 +222,7 @@ class TestSQLiteBackend:
         monkeypatch.setattr(
             backend,
             "_entry_from_json",
-            lambda _raw: pytest.fail("new insertion decoded existing CCR payloads"),
+            lambda *_args: pytest.fail("new insertion decoded existing CCR payloads"),
         )
 
         new_hash = store.store("new original", "new compact", ttl=60)
@@ -282,6 +283,83 @@ class TestSQLiteBackend:
         store = CompressionStore(backend=b, max_entries=1000)
         store.store(original="fresh original", compressed="c", original_item_count=1)
         assert b.get("good") is not None
+
+    def test_unreadable_row_is_logged_once_and_healthy_rows_are_not(self, db_path):
+        """An unreadable row must say so in the log (once per hash), so an
+        operator can tell corruption from a genuine retrieval miss."""
+        records: list[logging.LogRecord] = []
+
+        class _Collect(logging.Handler):
+            def emit(self, record: logging.LogRecord) -> None:
+                records.append(record)
+
+        handler = _Collect(level=logging.DEBUG)
+        logger = logging.getLogger("headroom.cache.backends.sqlite")
+        logger.addHandler(handler)
+        try:
+            b = SQLiteBackend(db_path)
+            b.set("good", make_entry("good"))
+            assert b.get("good") is not None
+            assert [r for r in records if "unreadable" in r.getMessage()] == []
+
+            with b._lock:
+                b._conn.execute(
+                    "INSERT OR REPLACE INTO ccr_entries "
+                    "(hash, entry_json, created_at, ttl) VALUES (?, ?, ?, ?)",
+                    ("broken", "{not json", time.time(), 1800),
+                )
+                b._conn.commit()
+
+            assert b.get("broken") is None
+            b.items()
+            b.items()
+            unreadable = [r for r in records if "unreadable" in r.getMessage()]
+            assert len(unreadable) == 1
+            assert unreadable[0].levelno == logging.WARNING
+            assert "broken" in unreadable[0].getMessage()
+            assert "good" not in unreadable[0].getMessage()
+        finally:
+            logger.removeHandler(handler)
+
+    def test_repeated_scans_over_the_cap_stay_bounded(self, db_path, monkeypatch):
+        """More bad rows than the cap, scanned twice: at most cap row warnings plus
+        one overflow warning in total, and the rows stay in place and still miss."""
+        import headroom.cache.backends.sqlite as sqlite_mod
+
+        monkeypatch.setattr(sqlite_mod, "_MAX_REPORTED_UNREADABLE", 2)
+        records: list[logging.LogRecord] = []
+
+        class _Collect(logging.Handler):
+            def emit(self, record: logging.LogRecord) -> None:
+                records.append(record)
+
+        handler = _Collect(level=logging.DEBUG)
+        logger = logging.getLogger("headroom.cache.backends.sqlite")
+        logger.addHandler(handler)
+        keys = [f"bad{i}" for i in range(5)]
+        try:
+            b = SQLiteBackend(db_path)
+            with b._lock:
+                for key in keys:
+                    b._conn.execute(
+                        "INSERT OR REPLACE INTO ccr_entries "
+                        "(hash, entry_json, created_at, ttl) VALUES (?, ?, ?, ?)",
+                        (key, "{not json", time.time(), 1800),
+                    )
+                b._conn.commit()
+            assert b.items() == []
+            assert b.items() == []
+            assert b.get("bad4") is None
+            assert b.count() == len(keys)
+        finally:
+            logger.removeHandler(handler)
+
+        warnings = [r.getMessage() for r in records if r.levelno == logging.WARNING]
+        row_warnings = [m for m in warnings if "is unreadable" in m]
+        assert len(row_warnings) == 2
+        assert all("JSONDecodeError" in m for m in row_warnings)
+        assert len([m for m in warnings if "More than 2 warnings about" in m]) == 1
+        assert len(warnings) == 3
 
     def test_store_ttl_enforcement_via_compression_store(self, db_path):
         """TTL checks stay in CompressionStore; expired entries miss."""

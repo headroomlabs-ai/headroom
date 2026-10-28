@@ -1112,7 +1112,7 @@ def dashboard(port: int, no_open: bool) -> None:
 @click.option(
     "--no-telemetry",
     is_flag=True,
-    help="Force anonymous usage telemetry off (already the default; env: HEADROOM_TELEMETRY=off)",
+    help="Turn off local stats and the anonymous upload beacon (env: HEADROOM_TELEMETRY=off)",
 )
 @click.option(
     "--stateless",

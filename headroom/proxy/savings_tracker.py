@@ -25,8 +25,13 @@ from typing import Any
 
 from headroom import paths as _paths
 from headroom.log_safety import WarnOnce, describe_exception, safe_id
+from headroom.offline import pin_litellm_cost_map_local
 from headroom.proxy import project_name_policy
-from headroom.proxy.persistent_metrics import PersistentMetricsState
+from headroom.proxy.persistent_metrics import (
+    MAX_LABEL_LENGTH,
+    PersistentMetricsState,
+    bounded_model_key,
+)
 
 PROJECT_NAME_MAX_LENGTH = project_name_policy.PROJECT_NAME_MAX_LENGTH
 sanitize_project_name = project_name_policy.sanitize_project_name
@@ -152,6 +157,7 @@ def _get_litellm_module() -> Any | None:
         return litellm
 
     try:
+        pin_litellm_cost_map_local()
         import litellm as imported_litellm
     except ImportError:
         return None
@@ -723,7 +729,7 @@ def _normalize_history_entry(entry: Any) -> dict[str, Any] | None:
     if isinstance(entry, dict):
         timestamp = _parse_timestamp(entry.get("timestamp"))
         total_tokens_saved = _coerce_int(entry.get("total_tokens_saved"))
-        compression_savings_usd = _coerce_float(entry.get("compression_savings_usd"))
+        compression_savings_usd = _coerce_signed_float(entry.get("compression_savings_usd"))
         # Older history points predate cache-savings tracking and omit these
         # keys entirely; default to 0/0.0 rather than raising or dropping the
         # entry, matching how every other field here handles legacy shapes.
@@ -743,7 +749,7 @@ def _normalize_history_entry(entry: Any) -> dict[str, Any] | None:
         timestamp = _parse_timestamp(entry[0])
         total_tokens_saved = _coerce_int(entry[1])
         if len(entry) >= 3:
-            compression_savings_usd = _coerce_float(entry[2])
+            compression_savings_usd = _coerce_signed_float(entry[2])
         if len(entry) >= 4:
             total_input_tokens = _coerce_int(entry[3])
         if len(entry) >= 5:
@@ -1097,7 +1103,7 @@ class SavingsTracker:
                     "timestamp": _to_utc_iso(timestamp_dt),
                     "provider": _normalize_provider(provider),
                     "agent": _normalize_agent(agent),
-                    "model": _normalize_model(model),
+                    "model": _normalize_model(model)[:MAX_LABEL_LENGTH],
                     "total_tokens_saved": lifetime["tokens_saved"],
                     "compression_savings_usd": lifetime["compression_savings_usd"],
                     "total_input_tokens": lifetime["total_input_tokens"],
@@ -1401,7 +1407,7 @@ class SavingsTracker:
                         "timestamp": _to_utc_iso(timestamp_dt),
                         "provider": _normalize_provider(provider),
                         "agent": _normalize_agent(agent),
-                        "model": _normalize_model(model),
+                        "model": _normalize_model(model)[:MAX_LABEL_LENGTH],
                         "total_tokens_saved": lifetime["tokens_saved"],
                         "compression_savings_usd": lifetime["compression_savings_usd"],
                         "cache_read_tokens": lifetime["cache_read_tokens"],
@@ -1578,7 +1584,7 @@ class SavingsTracker:
         without migration.
         """
         by_model: dict[str, dict[str, Any]] = self._state.setdefault("by_model", {})
-        key = _normalize_model(model)
+        key = bounded_model_key(_normalize_model(model), by_model)
         entry = by_model.setdefault(key, _empty_by_model_entry())
         entry["requests"] += max(requests_delta, 0)
         entry["tokens_saved"] += max(tokens_saved_delta, 0)
@@ -1877,7 +1883,7 @@ class SavingsTracker:
         if isinstance(lifetime_raw, dict):
             lifetime_requests = _coerce_int(lifetime_raw.get("requests"))
             lifetime_tokens_saved = _coerce_int(lifetime_raw.get("tokens_saved"))
-            lifetime_savings_usd = _coerce_float(lifetime_raw.get("compression_savings_usd"))
+            lifetime_savings_usd = _coerce_signed_float(lifetime_raw.get("compression_savings_usd"))
             lifetime_tool_tokens_saved = _coerce_int(lifetime_raw.get("tool_tokens_saved"))
             lifetime_tool_savings_usd = _coerce_float(lifetime_raw.get("tool_schema_savings_usd"))
             lifetime_cache_read_tokens = _coerce_int(lifetime_raw.get("cache_read_tokens"))
@@ -1887,7 +1893,7 @@ class SavingsTracker:
             migrated_at = lifetime_raw.get("savings_basis_migrated_at")
             is_v6_lifetime = "compression_savings_list_usd" in lifetime_raw
             if is_v6_lifetime:
-                lifetime_savings_list_usd = _coerce_float(
+                lifetime_savings_list_usd = _coerce_signed_float(
                     lifetime_raw.get("compression_savings_list_usd")
                 )
                 lifetime_basis = str(lifetime_raw.get("savings_basis") or BASIS_UNKNOWN)
@@ -1897,14 +1903,27 @@ class SavingsTracker:
 
         if normalized_history:
             last = normalized_history[-1]
+            # A losing request that saves no tokens and reads no cache appends
+            # no checkpoint, so the saved total can legitimately sit BELOW the
+            # last checkpoint. Only trust the checkpoint for dollars when the
+            # saved counters show the lifetime block is behind it.
+            history_ahead = (
+                lifetime_tokens_saved < last["total_tokens_saved"]
+                or lifetime_cache_read_tokens < _coerce_int(last.get("cache_read_tokens"))
+                or lifetime_output_tokens_saved < _coerce_int(last.get("output_tokens_saved"))
+                or lifetime_tool_tokens_saved < _coerce_int(last.get("tool_tokens_saved"))
+                or not (
+                    isinstance(lifetime_raw, dict) and "compression_savings_usd" in lifetime_raw
+                )
+            )
             lifetime_tokens_saved = max(
                 lifetime_tokens_saved,
                 last["total_tokens_saved"],
             )
-            lifetime_savings_usd = max(
-                lifetime_savings_usd,
-                _coerce_float(last["compression_savings_usd"]),
-            )
+            if history_ahead:
+                # The checkpoint is the newer source here; a numeric max() would
+                # discard a newer negative total in favour of an older higher one.
+                lifetime_savings_usd = _coerce_signed_float(last["compression_savings_usd"])
             lifetime_tool_tokens_saved = max(
                 lifetime_tool_tokens_saved,
                 _coerce_int(last.get("tool_tokens_saved")),
@@ -2221,7 +2240,7 @@ class SavingsTracker:
             2,
         )
         session["compression_savings_usd"] = round(
-            _coerce_float(session.get("compression_savings_usd")),
+            _coerce_signed_float(session.get("compression_savings_usd")),
             6,
         )
         session["total_input_cost_usd"] = round(

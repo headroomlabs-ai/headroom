@@ -5,13 +5,20 @@ from __future__ import annotations
 import heapq
 import json
 from collections.abc import Iterator
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
 from ..config import RequestMetrics
 from ..utils import format_timestamp, parse_timestamp
 from .base import Storage
+
+
+def _utc_bound(dt: datetime | None) -> datetime | None:
+    """Normalize a filter bound to the naive UTC used by stored timestamps."""
+    if dt is not None and dt.tzinfo is not None:
+        return dt.astimezone(timezone.utc).replace(tzinfo=None)
+    return dt
 
 
 class JSONLStorage(Storage):
@@ -130,6 +137,10 @@ class JSONLStorage(Storage):
         if limit == 0:
             return []
 
+        # Stored timestamps are naive UTC; apply the same normalization to filters.
+        start_time = _utc_bound(start_time)
+        end_time = _utc_bound(end_time)
+
         def _matches(metrics: RequestMetrics) -> bool:
             if start_time is not None and metrics.timestamp < start_time:
                 return False
@@ -156,6 +167,9 @@ class JSONLStorage(Storage):
         mode: str | None = None,
     ) -> int:
         """Count metrics matching filters."""
+        start_time = _utc_bound(start_time)
+        end_time = _utc_bound(end_time)
+
         count = 0
 
         for metrics in self.iter_all():
@@ -194,6 +208,9 @@ class JSONLStorage(Storage):
         end_time: datetime | None = None,
     ) -> dict[str, Any]:
         """Get summary statistics."""
+        start_time = _utc_bound(start_time)
+        end_time = _utc_bound(end_time)
+
         total_requests = 0
         total_tokens_before = 0
         total_tokens_after = 0
