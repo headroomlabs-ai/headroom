@@ -1,6 +1,7 @@
 """Tests for JSONL storage query paging (shared newest-first contract)."""
 
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
 
 import pytest
 
@@ -62,6 +63,31 @@ def _expected_page(
 
 def _ids(metrics: list[RequestMetrics]) -> list[str]:
     return [m.request_id for m in metrics]
+
+
+@pytest.mark.parametrize("method", ["query", "count", "get_summary_stats"])
+def test_jsonl_aware_time_bounds_are_inclusive(method: str, tmp_path: Path) -> None:
+    """Aware bounds preserve their UTC instant and include the exact boundary."""
+    boundary = datetime(2026, 4, 23, 23, 59, 59, 500000, tzinfo=timezone.utc)
+    local_boundary = boundary.astimezone(timezone(timedelta(hours=5, minutes=30)))
+    with JSONLStorage(str(tmp_path / "metrics.jsonl")) as storage:
+        for request_id, delta in [("before", -1), ("boundary", 0), ("after", 1)]:
+            storage.save(_metrics(request_id, boundary + timedelta(microseconds=delta)))
+        scenarios = [
+            ({"start_time": local_boundary}, ["after", "boundary"]),
+            ({"end_time": local_boundary}, ["boundary", "before"]),
+            ({"start_time": local_boundary, "end_time": local_boundary}, ["boundary"]),
+        ]
+        for filters, expected_ids in scenarios:
+            result = getattr(storage, method)(**filters)
+            if method == "query":
+                assert _ids(result) == expected_ids, filters
+            elif method == "count":
+                assert result == len(expected_ids), filters
+            else:
+                assert result["total_requests"] == len(expected_ids), filters
+                assert result["total_tokens_before"] == 1000 * len(expected_ids), filters
+                assert result["total_tokens_after"] == 800 * len(expected_ids), filters
 
 
 def _assert_timestamp_desc(metrics: list[RequestMetrics]) -> None:
