@@ -113,10 +113,10 @@ class TestAnthropicModelFallback:
         """Test pattern-based inference for haiku models."""
         provider = AnthropicProvider()
 
-        limit = provider.get_context_limit("claude-haiku-5-20260101")
+        limit = provider.get_context_limit("claude-haiku-6-20270101")
         assert limit == 200000
 
-        pricing = provider._get_pricing("claude-haiku-5-20260101")
+        pricing = provider._get_pricing("claude-haiku-6-20270101")
         assert pricing["input"] == 0.80
         assert pricing["output"] == 4.00
 

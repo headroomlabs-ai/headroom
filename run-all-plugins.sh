@@ -5,7 +5,7 @@
 # to the Kompress-v2 Modal endpoint. Then confirm everything loaded.
 #
 #   Plugins : lossless_guard, skill_search, observability, tier_router, tool_search
-#   Extra   : headroom-ai[sandbox]  (torch-free proxy; ML offloaded to Modal)
+#   Extra   : headroom-ai[lean]  (torch-free proxy; ML offloaded to Modal)
 #   Profile : coding  (HEADROOM_SAVINGS_PROFILE) + cache mode (prefix-cache safe)
 #
 # Secrets are SOURCED from ~/env.txt and ~/.headroom/plugins.env — never inlined.
@@ -29,7 +29,7 @@ source "$VENV/bin/activate"
 PY="$VENV/bin/python"
 
 # ── 2. install (guarded) ──────────────────────────────────────────────────────
-# headroom-ai[sandbox] pulls proxy,code,relevance,reports,otel,html,mcp,spreadsheet
+# headroom-ai[lean] pulls proxy,code,relevance,reports,otel,html,mcp,spreadsheet
 # (all torch-free — heavy ML is offloaded to the Modal Kompress endpoint below).
 # The 5 plugins install --no-deps so pip won't drag PyPI's headroom-ai over the
 # local editable one; headroom-license is their shared Ed25519 verifier.
@@ -44,14 +44,14 @@ if [ "$need_install" = "1" ]; then
   if [ -n "$avail" ] && [ "$avail" -lt 2 ]; then
     echo "!! <2Gi free — aborting before heavy install (free space, then re-run)"; exit 1
   fi
-  echo "▶ installing pip+maturin, then headroom-ai[sandbox] + license + 5 plugins (editable)…"
+  echo "▶ installing pip+maturin, then headroom-ai[lean] + license + 5 plugins (editable)…"
   "$PY" -m pip install -U pip maturin
   # litellm >=1.92 ships an sdist-only Rust bridge whose AWS-SDK crates need rustc>=1.94.1;
   # the default rustup toolchain here is older (pip builds litellm in a temp dir that misses
   # the repo's 1.95 pin), so pin to the last pure-Python wheel line (1.91.4). Satisfies
   # headroom's litellm>=1.86.2,<2.0 and skips the Rust build entirely.
   "$PY" -m pip install "litellm<1.92"
-  "$PY" -m pip install -e "${HR}[sandbox]" "litellm<1.92"
+  "$PY" -m pip install -e "${HR}[lean]" "litellm<1.92"
   "$PY" -m pip install -e /Users/tcms/demo/headroom-license
   for p in lossless-guard skill-search observability tier-router tool-search; do
     "$PY" -m pip install -e "/Users/tcms/demo/headroom-${p}" --no-deps

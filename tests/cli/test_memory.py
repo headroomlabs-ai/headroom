@@ -165,6 +165,79 @@ class TestMemoryShow:
         assert result.exit_code == 0
         assert "TypeScript" in result.output
 
+    def test_show_by_partial_id_beyond_default_query_limit(
+        self, runner: CliRunner, temp_db: str
+    ) -> None:
+        """Show a unique partial ID when the match is older than 1,000 rows."""
+        store = SQLiteMemoryStore(temp_db)
+        filler_start = datetime(2024, 1, 1)
+        memories = [
+            Memory(
+                id=f"filler-{index:04d}",
+                content=f"Filler memory {index}",
+                user_id="test-user",
+                created_at=filler_start + timedelta(days=index),
+                valid_from=filler_start + timedelta(days=index),
+            )
+            for index in range(1000)
+        ]
+        memories.append(
+            Memory(
+                id="legacy-target-memory",
+                content="Legacy target outside the first page",
+                user_id="test-user",
+                created_at=datetime(2020, 1, 1),
+                valid_from=datetime(2020, 1, 1),
+            )
+        )
+        asyncio.run(store.save_batch(memories))
+
+        result = runner.invoke(main, ["memory", "show", "--db-path", temp_db, "legacy-target-"])
+
+        assert result.exit_code == 0
+        assert "Legacy target outside the first page" in result.output
+
+    def test_show_by_partial_id_reports_ambiguity_beyond_default_query_limit(
+        self, runner: CliRunner, temp_db: str
+    ) -> None:
+        """Report ambiguity when matching IDs span beyond the first 1,000 rows."""
+        store = SQLiteMemoryStore(temp_db)
+        filler_start = datetime(2024, 1, 1)
+        memories = [
+            Memory(
+                id=f"filler-{index:04d}",
+                content=f"Filler memory {index}",
+                user_id="test-user",
+                created_at=filler_start + timedelta(days=index),
+                valid_from=filler_start + timedelta(days=index),
+            )
+            for index in range(1000)
+        ]
+        memories.extend(
+            [
+                Memory(
+                    id="shared-prefix-old",
+                    content="Older matching memory",
+                    user_id="test-user",
+                    created_at=datetime(2020, 1, 1),
+                    valid_from=datetime(2020, 1, 1),
+                ),
+                Memory(
+                    id="shared-prefix-new",
+                    content="Newer matching memory",
+                    user_id="test-user",
+                    created_at=datetime(2026, 1, 1),
+                    valid_from=datetime(2026, 1, 1),
+                ),
+            ]
+        )
+        asyncio.run(store.save_batch(memories))
+
+        result = runner.invoke(main, ["memory", "show", "--db-path", temp_db, "shared-prefix-"])
+
+        assert result.exit_code != 0
+        assert "Ambiguous ID 'shared-prefix-'" in result.output
+
     def test_show_json_output(self, runner: CliRunner, populated_db: str) -> None:
         """Show memory as JSON."""
         result = runner.invoke(

@@ -26,6 +26,7 @@ from datetime import date
 from typing import Any
 
 from headroom.models.registry import ModelRegistry
+from headroom.offline import pin_litellm_cost_map_local
 from headroom.pricing.litellm_pricing import estimate_cost_from_tokens
 from headroom.tokenizers import EstimatingTokenCounter
 
@@ -33,6 +34,7 @@ from .base import Provider, TokenCounter
 
 # Check if litellm is available for pricing/context limit lookups
 try:
+    pin_litellm_cost_map_local()
     import litellm
 
     LITELLM_AVAILABLE = True

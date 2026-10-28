@@ -43,7 +43,7 @@ logger = logging.getLogger(__name__)
 # Known prefixes that mark a working-directory line inside a client's
 # ``<env>`` / ``<environment>`` system-prompt block. Ordered so that the
 # most specific / most recent client format is tried first. Matched with
-# literal ``str.find`` — no regex.
+# literal line-start checks after trimming — no regex.
 _CWD_PREFIXES: tuple[str, ...] = (
     "Primary working directory:",  # Claude Code (current)
     "Working directory:",  # Claude Code (older) / Codex
@@ -91,7 +91,7 @@ class ResolvedScope:
     """
 
     mode: MemoryStorageMode
-    db_path: Path
+    db_path: Path | None
     display_name: str  # human-readable label, e.g. project basename
     project_key: str | None  # stable hash, None for USER/GLOBAL
 
@@ -211,15 +211,15 @@ class ProjectResolver:
         if not system_prompt:
             return None
         for prefix in _CWD_PREFIXES:
-            idx = system_prompt.find(prefix)
-            if idx < 0:
-                continue
-            start = idx + len(prefix)
-            end = system_prompt.find("\n", start)
-            chunk = system_prompt[start:] if end < 0 else system_prompt[start:end]
-            chunk = chunk.strip()
-            if chunk:
-                return chunk
+            for raw_line in system_prompt.split("\n"):
+                line = raw_line.strip()
+                if line.startswith("-"):
+                    line = line[1:].lstrip()
+                if not line.startswith(prefix):
+                    continue
+                chunk = line[len(prefix) :].strip()
+                if chunk:
+                    return chunk
         return None
 
     @classmethod
@@ -248,9 +248,21 @@ class ProjectResolver:
         except (OSError, ValueError):
             normalised = cwd
         normalised = normalised.rstrip(os.sep) or os.sep
+        # A path with no UTF-8 form cannot be hashed without a lossy encoding
+        # that could merge distinct directories onto one store. It reaches
+        # here either from the input (an unpaired surrogate, e.g. a
+        # JSON-decoded ``\ud800`` escape) or from ``realpath`` following a
+        # symlink to a non-UTF-8 filename, which POSIX returns as
+        # ``\udcXX`` surrogate escapes. Check after normalising so both are
+        # covered, and treat the cwd as unusable: resolution falls through to
+        # the next tier, or fails closed, instead of raising (#4162).
+        try:
+            encoded = normalised.encode("utf-8")
+        except UnicodeEncodeError:
+            return None
         basename = os.path.basename(normalised) or "root"
         safe_basename = cls._sanitize_basename(basename) or "project"
-        digest = hashlib.sha256(normalised.encode("utf-8")).hexdigest()[:16]
+        digest = hashlib.sha256(encoded).hexdigest()[:16]
         key = f"{safe_basename}-{digest}"
         return key, basename
 
@@ -292,12 +304,19 @@ class BackendRouter:
         self._backends: OrderedDict[Path, LocalBackend] = OrderedDict()
         self._lock = threading.Lock()
 
-    def backend_for(self, ctx: RequestContext) -> tuple[LocalBackend, ResolvedScope]:
+    def backend_for(self, ctx: RequestContext) -> tuple[LocalBackend | None, ResolvedScope]:
         """Return the backend + scope metadata to use for this request."""
 
         scope = self._resolve_scope(ctx)
+        if scope.db_path is None:
+            return None, scope
         backend = self._get_or_create_backend(scope.db_path)
         return backend, scope
+
+    def scope_for(self, ctx: RequestContext) -> ResolvedScope:
+        """Resolve request scope without acquiring or creating a backend."""
+
+        return self._resolve_scope(ctx)
 
     def _resolve_scope(self, ctx: RequestContext) -> ResolvedScope:
         mode = self._config.mode
@@ -351,7 +370,7 @@ class BackendRouter:
                 )
                 return ResolvedScope(
                     mode=MemoryStorageMode.PROJECT,
-                    db_path=self._config.global_db_path,  # Unused — caller checks project_key.
+                    db_path=None,
                     display_name="unresolved (no memory)",
                     project_key=None,
                 )
@@ -481,7 +500,7 @@ def _first_user_text_with_cwd(messages: list[Any]) -> str:
             continue
         content = msg.get("content")
         user_text = content if isinstance(content, str) else _text_from_blocks(content)
-        if user_text and any(prefix in user_text for prefix in _CWD_PREFIXES):
+        if user_text and ProjectResolver._extract_cwd_from_system_prompt(user_text) is not None:
             return user_text
     return ""
 
@@ -520,7 +539,7 @@ def extract_system_prompt(body: Mapping[str, Any]) -> str:
         # redirect this request at another project's memory store by pasting
         # its own ``cwd:`` line.
         trusted = "\n".join(parts)
-        if not any(prefix in trusted for prefix in _CWD_PREFIXES):
+        if ProjectResolver._extract_cwd_from_system_prompt(trusted) is None:
             cwd_text = _first_user_text_with_cwd(messages)
             if cwd_text:
                 parts.append(cwd_text)

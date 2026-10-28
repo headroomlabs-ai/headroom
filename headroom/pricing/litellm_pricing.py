@@ -15,6 +15,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from typing import Any
 
+from headroom.offline import pin_litellm_cost_map_local
 from headroom.pricing.deepseek_tiers import (
     LEGACY_MODEL_IDS,
     OFF_PEAK_RATES_PER_1M,
@@ -34,6 +35,11 @@ from headroom.pricing.litellm_model_resolution import (
 # litellm added. The module itself is fully imported and cached in
 # `sys.modules`; subsequent `import litellm` calls hit the cache and
 # don't re-run the dotenv side effect.
+#
+# Under HEADROOM_OFFLINE, litellm must also stay on its bundled pricing table
+# rather than fetch one from GitHub during that import.
+pin_litellm_cost_map_local()
+
 try:
     import os as _os
 

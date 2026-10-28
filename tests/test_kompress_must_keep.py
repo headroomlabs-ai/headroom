@@ -210,7 +210,9 @@ class _TruncatingTok:
         self.max_length = max_length
 
     def __call__(self, chunk_words, **kw):
-        batch_words = chunk_words if (chunk_words and isinstance(chunk_words[0], list)) else [chunk_words]
+        batch_words = (
+            chunk_words if (chunk_words and isinstance(chunk_words[0], list)) else [chunk_words]
+        )
         word_ids = []
         for words in batch_words:
             ids: list[int] = []
@@ -298,8 +300,7 @@ class TestTruncatedWordsCompression:
         assert result.compressed.split() == [words[0]] + words[255:]
 
     def test_a_forced_ratio_still_gets_its_budget(self, monkeypatch):
-        # A forced ratio is a hard budget the caller asked for, so the
-        # unscored tail is not added back on that path.
+        # A forced ratio selects scored words within each token window.
         self._install(monkeypatch, 2)
         words = self._words(self.CHUNK_WORDS)
         compressor = KompressCompressor(KompressConfig(enable_ccr=False, min_input_words=10))
@@ -307,9 +308,7 @@ class TestTruncatedWordsCompression:
 
         kept = compressor.compress(" ".join(words), target_ratio=0.5).compressed.split()
 
-        # The ratio applied to the 256 scored words: the first word (the only
-        # one the model scored) plus the next 127. The unscored tail is not
-        # added back, so the budget the caller asked for still holds.
-        assert len(kept) == 128
-        assert kept[0] == words[0]
-        assert words[255] not in kept
+        # Main now scores the formerly unseen tail in another window.
+        # Windows score 255 and 95 complete words, each applying the
+        # requested ratio independently with rounding down (127 + 47).
+        assert kept == words[:127] + words[255:302]
