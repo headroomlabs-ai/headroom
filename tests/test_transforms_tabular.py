@@ -1,6 +1,6 @@
 """Tests for tabular-text + spreadsheet compression.
 
-Covers detection (content_detector), the CSV→SmartCrusher bridge
+Covers detection (content_detector), the CSVâ†’SmartCrusher bridge
 (tabular_ingest), router wiring (content_router), and binary spreadsheet
 ingestion (spreadsheet_ingest / compress_spreadsheet).
 """
@@ -204,7 +204,7 @@ def test_git_status_is_not_a_rectangular_table() -> None:
     assert parse_tabular(status) is None
 
 
-# Detection — edge branches --------------------------------------------------
+# Detection â€” edge branches --------------------------------------------------
 
 
 def test_is_md_separator_needs_two_columns() -> None:
@@ -267,7 +267,7 @@ def test_parse_markdown_table_drops_separator() -> None:
 
 def test_parse_tabular_rejects_ragged_fixed_width(monkeypatch) -> None:
     # Rows with differing cell counts can't be zipped under the headers
-    # without misattributing columns (#1652) — must pass through.
+    # without misattributing columns (#1652) â€” must pass through.
     import headroom.transforms.tabular_ingest as ti
 
     monkeypatch.setattr(
@@ -278,7 +278,7 @@ def test_parse_tabular_rejects_ragged_fixed_width(monkeypatch) -> None:
     ragged = (
         "tool  installed  latest  status\n"
         "rtk  0.42.4  0.43.0  update available\n"
-        "rtk  ✓  0.42.4  0.42.4  -  up-to-date"
+        "rtk  âœ“  0.42.4  0.42.4  -  up-to-date"
     )
     assert ti.parse_tabular(ragged) is None
 
@@ -306,7 +306,7 @@ def test_compress_passes_through_ragged_table(monkeypatch) -> None:
     ragged = (
         "tool  installed  latest  status\n"
         "rtk  0.42.4  0.43.0  update available\n"
-        "rtk  ✓  0.42.4  0.42.4  -  up-to-date"
+        "rtk  âœ“  0.42.4  0.42.4  -  up-to-date"
     )
     result = TabularCompressor().compress(ragged)
     assert not result.was_modified
@@ -318,9 +318,7 @@ def test_compress_passes_through_ragged_table(monkeypatch) -> None:
 
 def _duplicate_header_csv() -> str:
     # A SQL join result: the same column name appears twice (#4277).
-    return "id,name,id,name\n" + "".join(
-        f"{i},user_{i},{100 + i},org_{i % 3}\n" for i in range(40)
-    )
+    return "id,name,id,name\n" + "".join(f"{i},user_{i},{100 + i},org_{i % 3}\n" for i in range(40))
 
 
 def test_parse_tabular_rejects_duplicate_headers() -> None:
@@ -347,6 +345,29 @@ def test_compress_passes_through_a_table_with_duplicate_headers() -> None:
 
     result = TabularCompressor().compress(content)
 
+    assert not result.was_modified
+    assert result.compressed == content
+
+
+_JOIN_CSV = "id,name,id,name\n1,alice,10,acme\n2,bob,20,globex\n3,carol,30,initech\n"
+_BLANK_HEADER_MARKDOWN = (
+    "| id | | |\n| --- | --- | --- |\n| 1 | alice | x |\n| 2 | bob | y |\n| 3 | carol | z |"
+)
+
+
+@pytest.mark.parametrize("content", [_JOIN_CSV, _BLANK_HEADER_MARKDOWN])
+def test_parse_tabular_rejects_duplicate_headers_upstream(content: str) -> None:
+    # Records are keyed by header, so a repeated name keeps only its last
+    # column: `alice` and `bob` would vanish from the compressed table.
+    assert parse_tabular(content) is None
+
+
+def test_compress_passes_through_duplicate_headers_upstream() -> None:
+    # Large enough that SmartCrusher would otherwise save bytes on it.
+    content = "id,name,id,name\n" + "".join(
+        f"{i},user_{i},{100 + i},org_{i % 3}\n" for i in range(40)
+    )
+    result = TabularCompressor().compress(content)
     assert not result.was_modified
     assert result.compressed == content
 
@@ -566,7 +587,7 @@ def test_rows_to_csv_drops_trailing_empty_rows_and_has_no_dangling_cr() -> None:
     openpyxl's used-range routinely extends past the last data row, so a sheet
     commonly ends in ``(None, None, ...)`` tuples. Those were emitted as blank
     ``,`` rows, and ``csv.writer``'s default ``\\r\\n`` terminator combined with
-    ``.strip("\\n")`` left a dangling ``\\r`` — noise fed straight to the LLM.
+    ``.strip("\\n")`` left a dangling ``\\r`` â€” noise fed straight to the LLM.
     """
     from headroom.transforms.spreadsheet_ingest import _rows_to_csv
 

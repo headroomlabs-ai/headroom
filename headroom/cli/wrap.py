@@ -41,10 +41,7 @@ from functools import wraps
 from pathlib import Path
 from typing import Any, NamedTuple, cast
 
-try:
-    import tomllib
-except ModuleNotFoundError:  # pragma: no cover - Python < 3.11
-    import tomli as tomllib
+import tomllib
 
 from headroom._subprocess import identity_mismatch as _shared_identity_mismatch
 from headroom._subprocess import pid_alive, proc_identity, run
@@ -8110,7 +8107,15 @@ def zcode(
     if prepare_only:
         return
 
-    upstream = _detect_zcode_upstream()
+    # _ensure_proxy moves to another port when the requested one is held by a
+    # non-Headroom service. Resolve that port first so the upstream is chosen
+    # against the port the proxy will actually bind.
+    if not no_proxy and not (_check_proxy(port) and not _foreign_listener(port)):
+        try:
+            port = _find_available_port(port)
+        except (OSError, RuntimeError):
+            pass  # _ensure_proxy reports the same error
+    upstream = _detect_zcode_upstream(proxy_port=port)
     anthropic_url, openai_url = _zcode_upstream_to_urls(upstream)
 
     def _print_zcode_setup(actual_port: int = port) -> None:
