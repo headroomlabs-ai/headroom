@@ -23,11 +23,13 @@ import os
 import re
 import threading
 import time
+from collections.abc import Callable, Iterator
 from dataclasses import dataclass
 from functools import lru_cache
 from typing import Any, Literal
 
 from ..config import TransformResult
+from ..log_safety import describe_exception, safe_id
 from ..offline import OFFLINE_ENV, OfflineEgressBlocked
 from ..onnx_runtime import (
     ONNX_CPU_ARENA_ENV,
@@ -87,6 +89,44 @@ _KOMPRESS_MUST_KEEP_RE = re.compile(
 _KOMPRESS_MUST_KEEP_ENV = "HEADROOM_KOMPRESS_MUST_KEEP"
 KOMPRESS_BACKEND_ENV = "HEADROOM_KOMPRESS_BACKEND"
 KOMPRESS_ONNX_FILENAME_ENV = "HEADROOM_KOMPRESS_ONNX_FILENAME"
+
+
+# Tokens the model reads per chunk; the tokenizer truncates each chunk here.
+_KOMPRESS_MAX_TOKENS = 512
+
+
+def _row_token_counts(word_id_rows: list[list[int | None]]) -> list[int]:
+    """Real tokens per row of a padded batch, from the word ids alone.
+
+    Padding and special tokens both map to no word, so a row's trailing run
+    of ``None`` is its padding plus the special tokens every row ends with.
+    The longest row has no padding, so its run is the shortest. Read from
+    the word ids rather than ``attention_mask`` so the count does not depend
+    on the tensor type (numpy for ONNX, torch for CUDA and MPS).
+    """
+    trailing = []
+    for row in word_id_rows:
+        n = 0
+        while n < len(row) and row[-1 - n] is None:
+            n += 1
+        trailing.append(n)
+    specials = min(trailing, default=0)
+    return [len(row) - (n - specials) for row, n in zip(word_id_rows, trailing)]
+
+
+def _words_seen_whole(word_ids: list[int | None], n_tokens: int, n_words: int) -> int:
+    """Count the leading words of a chunk the model saw in full.
+
+    ``word_ids`` maps each token to its word. Truncation can stop inside a
+    word, so once the chunk was cut (words are missing, or the token cap was
+    hit) the last word present may be a prefix and is not counted.
+    """
+    seen = [wid for wid in word_ids if wid is not None]
+    if not seen:
+        return 0
+    last = max(seen)
+    cut = last + 1 < n_words or n_tokens >= _KOMPRESS_MAX_TOKENS
+    return last if cut else last + 1
 
 
 def _add_kompress_must_keep_words(
@@ -797,8 +837,46 @@ def _smoke_run(session: Any) -> None:
     )
 
 
+#: Per-stage load cost: stage name -> (wall-clock ms, loading-thread CPU ms).
+StageTimings = dict[str, tuple[float, float]]
+
+
+@contextlib.contextmanager
+def _timed_stage(stage_ms: StageTimings | None, stage: str) -> Iterator[None]:
+    """Add the block's wall-clock and thread-CPU milliseconds to ``stage_ms[stage]``.
+
+    Accumulates rather than overwrites, so a stage that runs once per ONNX
+    candidate reports the cost of every attempt, failed ones included. Records
+    on exceptions too. A no-op when ``stage_ms`` is ``None``.
+
+    CPU is this thread's only (``time.thread_time``): work on onnxruntime's own
+    worker threads is not counted, and wall far above CPU means the thread was
+    waiting (disk, the GIL, a lock) rather than working.
+    """
+    if stage_ms is None:
+        yield
+        return
+    wall_started = time.perf_counter()
+    cpu_started = time.thread_time()
+    try:
+        yield
+    finally:
+        wall_ms = (time.perf_counter() - wall_started) * 1000.0
+        cpu_ms = (time.thread_time() - cpu_started) * 1000.0
+        prev_wall, prev_cpu = stage_ms.get(stage, (0.0, 0.0))
+        stage_ms[stage] = (prev_wall + wall_ms, prev_cpu + cpu_ms)
+
+
+def _format_stage_ms(stage_ms: StageTimings) -> str:
+    return " ".join(f"{stage}={wall:.0f}/{cpu:.0f}" for stage, (wall, cpu) in stage_ms.items())
+
+
 def _create_onnx_session(
-    model_id: str, providers: list[Any], *, allow_download: bool = True
+    model_id: str,
+    providers: list[Any],
+    *,
+    allow_download: bool = True,
+    stage_ms: StageTimings | None = None,
 ) -> Any:
     """Resolve and load the model's ONNX artifact, trying candidates in order.
 
@@ -812,6 +890,10 @@ def _create_onnx_session(
     cache only; if none is cached, :class:`KompressModelNotCached` is raised
     instead of hitting the network. ``onnxruntime`` is imported only after a
     candidate resolves, so a cache-only miss never requires it.
+
+    ``stage_ms``, when given, accumulates the cost of ``artifact_resolve``,
+    ``onnxruntime_import``, ``session_build`` and ``smoke_run`` across every
+    candidate tried. See :func:`_timed_stage`.
     """
     last_err: Exception | None = None
     cache_miss = False
@@ -819,9 +901,10 @@ def _create_onnx_session(
     ort: Any = None
     for filename in _onnx_filename_candidates():
         try:
-            onnx_path = _hf_artifact(
-                model_id, filename, allow_network=allow_download and refused is None
-            )
+            with _timed_stage(stage_ms, "artifact_resolve"):
+                onnx_path = _hf_artifact(
+                    model_id, filename, allow_network=allow_download and refused is None
+                )
         except KompressModelNotCached as exc:
             # Only _hf_artifact's air-gap translation raises this here. It says
             # THIS candidate is not cached; a later one may be. Keep looking,
@@ -834,16 +917,19 @@ def _create_onnx_session(
             logger.debug("ONNX artifact %r unavailable for %s: %s", filename, model_id, exc)
             continue
         if ort is None:
-            import onnxruntime
+            with _timed_stage(stage_ms, "onnxruntime_import"):
+                import onnxruntime
 
             ort = onnxruntime
         try:
-            session = ort.InferenceSession(
-                onnx_path,
-                _onnx_session_options(ort),
-                providers=providers,
-            )
-            _smoke_run(session)
+            with _timed_stage(stage_ms, "session_build"):
+                session = ort.InferenceSession(
+                    onnx_path,
+                    _onnx_session_options(ort),
+                    providers=providers,
+                )
+            with _timed_stage(stage_ms, "smoke_run"):
+                _smoke_run(session)
             return session
         except Exception as exc:
             last_err = exc
@@ -857,8 +943,9 @@ def _create_onnx_session(
         raise refused
     if not allow_download and cache_miss:
         raise KompressModelNotCached(model_id) from last_err
+    detail = f": {last_err}" if last_err is not None else ""
     raise FileNotFoundError(
-        f"No loadable ONNX artifact in {model_id}; tried {_onnx_filename_candidates()}"
+        f"No loadable ONNX artifact in {model_id}; tried {_onnx_filename_candidates()}{detail}"
     ) from last_err
 
 
@@ -878,7 +965,12 @@ def _load_kompress_onnx(
         if model_id in _kompress_cache:
             return _kompress_cache[model_id]
 
-        logger.info("Downloading Kompress ONNX model from %s ...", model_id)
+        # Logged before any cache lookup: the artifacts usually come from disk
+        # (startup prefetch), and _hf_artifact goes to the Hub only on a miss.
+        logger.info("Loading Kompress ONNX model from %s ...", model_id)
+        load_started = time.perf_counter()
+        load_cpu_started = time.thread_time()
+        stage_ms: StageTimings = {}
 
         backend = "onnx_coreml" if use_coreml else "onnx"
         providers: list[Any]
@@ -907,15 +999,26 @@ def _load_kompress_onnx(
         else:
             providers = ["CPUExecutionProvider"]
 
-        session = _create_onnx_session(model_id, providers, allow_download=allow_download)
+        session = _create_onnx_session(
+            model_id, providers, allow_download=allow_download, stage_ms=stage_ms
+        )
         model = _OnnxModel(session)
 
-        from transformers import AutoTokenizer
+        with _timed_stage(stage_ms, "transformers_import"):
+            from transformers import AutoTokenizer
 
-        tokenizer = _load_modernbert_tokenizer(AutoTokenizer, allow_download=allow_download)
+        with _timed_stage(stage_ms, "tokenizer_load"):
+            tokenizer = _load_modernbert_tokenizer(AutoTokenizer, allow_download=allow_download)
 
         _kompress_cache[model_id] = (model, tokenizer, backend)
-        logger.info("Kompress ONNX loaded: %s backend=%s", model_id, backend)
+        logger.info(
+            "Kompress ONNX loaded: %s backend=%s total_ms=%.0f/%.0f stages_ms(wall/cpu): %s",
+            model_id,
+            backend,
+            (time.perf_counter() - load_started) * 1000.0,
+            (time.thread_time() - load_cpu_started) * 1000.0,
+            _format_stage_ms(stage_ms),
+        )
         return model, tokenizer, backend
 
 
@@ -1177,6 +1280,7 @@ def _load_kompress(
     # Auto mode: preserve stable default behavior. This avoids changing
     # compression quality/perf characteristics for existing installs while
     # allowing opt-in MPS/CoreML experiments via HEADROOM_KOMPRESS_BACKEND.
+    onnx_error: Exception | None = None
     if _is_onnx_available():
         try:
             return _load_kompress_onnx(model_id, use_coreml=False, allow_download=allow_download)
@@ -1186,10 +1290,23 @@ def _load_kompress(
             if not allow_download:
                 raise
         except Exception as e:
+            onnx_error = e
             logger.warning("ONNX load failed for %s, trying PyTorch: %s", model_id, e)
 
     if _is_pytorch_available():
         return _load_kompress_pytorch(model_id, device, allow_download=allow_download)
+
+    if onnx_error is not None:
+        # onnxruntime IS installed and was tried, but loading failed. The
+        # "requires onnxruntime or torch" message would be a lie that sends the
+        # operator to reinstall extras that are already present (issue #4207:
+        # an unwritable $HOME fails the HuggingFace download, which surfaces as
+        # "No loadable ONNX artifact" and was then reported as a missing
+        # dependency). Re-raise the real error instead, chained so the original
+        # traceback is preserved.
+        raise RuntimeError(
+            f"Kompress ONNX backend failed for {model_id}: {onnx_error}"
+        ) from onnx_error
 
     raise ImportError(
         "Kompress requires onnxruntime or torch. Install with: pip install headroom-ai[proxy]"
@@ -1339,6 +1456,48 @@ def ensure_background_download(model_id: str = HF_MODEL_ID, device: str = "auto"
         )
         _download_threads[model_id] = thread
         thread.start()
+
+
+def is_kompress_load_in_progress(model_id: str = HF_MODEL_ID) -> bool:
+    """True while a registered thread (prefetch, download or warm-up) is working on ``model_id``."""
+    with _download_threads_lock:
+        thread = _download_threads.get(model_id)
+    return thread is not None and thread.is_alive()
+
+
+def start_kompress_warmup_thread(model_id: str, warm: Callable[[], None]) -> threading.Thread:
+    """Run ``warm`` on a daemon ``kompress-warmup`` thread registered as ``model_id``'s loader.
+
+    The proxy's post-startup warm-up loads the model on its own thread. Unless
+    that thread is in the per-model registry, a request arriving mid-warm-up
+    finds the model not ready, sees no live loader, and has
+    :func:`ensure_background_download` start a second thread that only queues
+    on ``_kompress_lock`` and then returns the warm-up's cache entry. Registered
+    before it starts, so the warm-up's initial delay is covered too.
+
+    If a prefetch or download thread is already registered, the warm-up takes
+    its place in the registry and waits for it to finish before running
+    ``warm``. Without the wait, a warm-up that failed while a startup prefetch
+    was still downloading would leave the registry pointing at a dead thread,
+    and the next request would start another download next to the hidden
+    prefetch. Waiting also keeps the warm-up from fetching the same files at
+    the same time. Once the warm-up finishes, a failed one included, the next
+    :func:`ensure_background_download` call replaces the dead entry as usual.
+    """
+    with _download_threads_lock:
+        previous = _download_threads.get(model_id)
+
+        def _run() -> None:
+            # Registry entries are always started threads, so join() is safe;
+            # it returns at once for one that has already finished.
+            if previous is not None:
+                previous.join()
+            warm()
+
+        thread = threading.Thread(target=_run, name="kompress-warmup", daemon=True)
+        _download_threads[model_id] = thread
+        thread.start()
+    return thread
 
 
 def prefetch_kompress_artifacts(model_id: str = HF_MODEL_ID) -> bool:
@@ -1597,7 +1756,14 @@ def store_kompress_in_ccr(original: str, compressed: str, original_tokens: int) 
                 strategy="kompress",
             )
         return cache_key
-    except Exception:
+    except Exception as e:
+        # Store backends can echo the payload in errors, so no level logs it;
+        # describe_exception keeps only types and code locations.
+        logger.warning(
+            "Kompress CCR store write failed (%s); output is not retrievable", safe_id(e)
+        )
+        if logger.isEnabledFor(logging.DEBUG):
+            logger.debug("Kompress CCR store failure detail: %s", describe_exception(e))
         return None
 
 
@@ -1751,6 +1917,10 @@ class KompressCompressor(Transform):
         """
         ensure_background_download(self.config.model_id, self.config.device)
 
+    def is_loading(self) -> bool:
+        """True while a background thread is fetching or loading this model."""
+        return is_kompress_load_in_progress(self.config.model_id)
+
     def compress(
         self,
         content: str,
@@ -1839,7 +2009,13 @@ class KompressCompressor(Transform):
             budget = _capped_time_budget(_time_budget_cap_seconds)
             deadline = time.monotonic() + budget if budget is not None else None
 
-            for chunk_start in range(0, n_words, max_chunk_words):
+            # The model sees at most 512 tokens per chunk. A 350-word chunk of
+            # URLs, code or citation markers tokenizes past that, and a word
+            # beyond the cut gets no keep decision at all. Advance by the words
+            # the tokenizer kept whole, so the rest start the next chunk and
+            # every word is scored or kept.
+            chunk_start = 0
+            while chunk_start < n_words:
                 remaining: float | None = None
                 if deadline is not None:
                     remaining = deadline - time.monotonic()
@@ -1875,7 +2051,7 @@ class KompressCompressor(Transform):
                     chunk_words,
                     is_split_into_words=True,
                     truncation=True,
-                    max_length=512,
+                    max_length=_KOMPRESS_MAX_TOKENS,
                     padding=True,
                     return_tensors=return_tensors,
                 )
@@ -1883,6 +2059,14 @@ class KompressCompressor(Transform):
                 input_ids = encoding["input_ids"]
                 attention_mask = encoding["attention_mask"]
                 word_ids = encoding.word_ids(batch_index=0)
+                # One row, so no padding: every token in it is real.
+                scored = _words_seen_whole(word_ids, len(word_ids), len(chunk_words))
+                if scored == 0:
+                    # One word fills the window by itself (a long URL or a
+                    # minified line). The model cannot see it whole: keep it.
+                    kept_ids.add(chunk_start)
+                    chunk_start += 1
+                    continue
 
                 if not is_onnx:
                     device = next(model.parameters()).device
@@ -1950,10 +2134,12 @@ class KompressCompressor(Transform):
                             mask_list = keep_mask[0].cpu()
                     inference_ms += (time.perf_counter() - inference_started) * 1000
 
+                # A word past `scored` is a prefix the cut left behind: it is
+                # rescored with the next chunk and must not take a slot here.
                 if target_ratio is not None:
                     word_scores: dict[int, float] = {}
                     for idx, wid in enumerate(word_ids):
-                        if wid is None:
+                        if wid is None or wid >= scored:
                             continue
                         s = float(score_list[idx])
                         if wid not in word_scores or s > word_scores[wid]:
@@ -1967,7 +2153,7 @@ class KompressCompressor(Transform):
                             kept_ids.add(wid + chunk_start)
                 else:
                     for idx, wid in enumerate(word_ids):
-                        if wid is None:
+                        if wid is None or wid >= scored:
                             continue
                         if bool(mask_list[idx]):
                             kept_ids.add(wid + chunk_start)
@@ -1975,7 +2161,8 @@ class KompressCompressor(Transform):
                 # Hard override: always keep must-keep tokens regardless of model score.
                 # Numbers, error names, paths, and flags carry meaning agents cannot
                 # reconstruct from context. Disable via HEADROOM_KOMPRESS_MUST_KEEP=0.
-                _add_kompress_must_keep_words(kept_ids, chunk_words, chunk_start)
+                _add_kompress_must_keep_words(kept_ids, chunk_words[:scored], chunk_start)
+                chunk_start += scored
 
             for i, line_id in enumerate(line_ids):
                 if line_id in protected_line_ids:
@@ -2309,13 +2496,15 @@ class KompressCompressor(Transform):
                     batch_word_lists,
                     is_split_into_words=True,
                     truncation=True,
-                    max_length=512,
+                    max_length=_KOMPRESS_MAX_TOKENS,
                     padding=True,
                     return_tensors=return_tensors,
                 )
 
                 input_ids = encoding["input_ids"]
                 attention_mask = encoding["attention_mask"]
+                word_id_rows = [encoding.word_ids(batch_index=i) for i in range(len(batch))]
+                row_tokens = _row_token_counts(word_id_rows)
 
                 if not is_onnx:
                     device = next(model.parameters()).device
@@ -2363,13 +2552,24 @@ class KompressCompressor(Transform):
                     inference_ms += (time.perf_counter() - inference_started) * 1000
 
                 for batch_idx, (text_idx, chunk_start, chunk_words, ratio) in enumerate(batch):
-                    word_ids = encoding.word_ids(batch_index=batch_idx)
+                    word_ids = word_id_rows[batch_idx]
                     score_list = scores[batch_idx] if is_onnx else scores[batch_idx].cpu()
 
-                    # Token -> word reduction (max score per word).
+                    # Words past the 512-token cut, and the word the cut may
+                    # have split, were never scored whole. The batch is built
+                    # before tokenizing, so instead of re-chunking (the single
+                    # path does) keep them: an unscored word is not a word the
+                    # model chose to drop.
+                    scored = _words_seen_whole(word_ids, row_tokens[batch_idx], len(chunk_words))
+                    kept_ids_per_text[text_idx].update(
+                        range(chunk_start + scored, chunk_start + len(chunk_words))
+                    )
+
+                    # Token -> word reduction (max score per word). Words from
+                    # `scored` on are kept above and must not take a slot here.
                     word_scores: dict[int, float] = {}
                     for idx, wid in enumerate(word_ids):
-                        if wid is None:
+                        if wid is None or wid >= scored:
                             continue
                         s = float(score_list[idx])
                         if wid not in word_scores or s > word_scores[wid]:

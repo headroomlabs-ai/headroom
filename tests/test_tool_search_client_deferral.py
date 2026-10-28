@@ -38,6 +38,7 @@ import pytest
 
 from headroom.proxy.helpers import (
     _TOOL_SEARCH_MIN_TOOLS,
+    anthropic_first_party_tool_search_supported,
     claude_code_tool_search_inactive,
     inject_tool_search_deferral,
     inject_tool_search_deferral_openai,
@@ -408,6 +409,29 @@ def test_nothing_to_strip_returns_the_same_list() -> None:
     out = strip_first_party_tool_search_tools_for_third_party_upstream(tools, THIRD_PARTY_URL)
 
     assert out is tools
+
+
+def test_github_copilot_upstream_keeps_deferral() -> None:
+    """Copilot accepts the deferred shape and bills deferred schemas compactly."""
+    tools = [ANTHROPIC_SEARCH_REGEX, {"name": "mcp__srv__a", "defer_loading": True}]
+
+    out = strip_first_party_tool_search_tools_for_third_party_upstream(
+        tools, "https://api.githubcopilot.com"
+    )
+
+    assert out is tools
+    assert anthropic_first_party_tool_search_supported("https://api.githubcopilot.com")
+
+
+def test_copilot_host_match_is_exact() -> None:
+    """A lookalike host must not inherit the exemption."""
+    assert not anthropic_first_party_tool_search_supported("https://api.githubcopilot.com.evil.com")
+
+
+def test_other_third_party_upstreams_still_downgrade() -> None:
+    """The exemption is host-scoped: Bedrock/Vertex/gateways are unchanged."""
+    for url in (THIRD_PARTY_URL, "https://bedrock-runtime.us-east-1.amazonaws.com"):
+        assert not anthropic_first_party_tool_search_supported(url)
 
 
 # --------------------------------------------------------------------------

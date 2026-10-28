@@ -121,6 +121,25 @@ def test_multi_line_data_fields_concatenate() -> None:
     assert extract_stream_text(sse) == "joined"
 
 
+@pytest.mark.parametrize("newline", ["\r\n", "\r"], ids=["crlf", "cr"])
+def test_crlf_and_cr_framed_streams_are_parsed(newline: str) -> None:
+    """SSE allows CRLF and bare CR line endings; the proxy forwards both (#649)."""
+    lf = _sse(
+        _chat_delta("Hello world, " * 20),
+        {"choices": [{"index": 0, "delta": {}, "finish_reason": "length"}]},
+    )
+    sse = lf.replace("\n", newline)
+
+    assert extract_stream_text(sse) == extract_stream_text(lf) == "Hello world, " * 20
+    assert estimate_output_tokens(
+        sse_text=sse, total_bytes=len(sse.encode()), body={"max_tokens": 64}
+    ) == (64, "exact_ceiling")
+    assert estimate_output_tokens(sse_text=sse, total_bytes=len(sse.encode())) == (
+        len("Hello world, " * 20) // TEXT_CHARS_PER_TOKEN,
+        "estimated_text",
+    )
+
+
 # --------------------------------------------------------------------------- #
 # The estimate itself
 # --------------------------------------------------------------------------- #

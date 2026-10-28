@@ -25,11 +25,14 @@ from typing import Any
 
 from headroom import paths as _paths
 from headroom.log_safety import WarnOnce, describe_exception, safe_id
+from headroom.offline import pin_litellm_cost_map_local
 from headroom.proxy import project_name_policy
 from headroom.proxy.persistent_metrics import (
+    MAX_LABEL_LENGTH,
     PRICING_BASIS,
     PersistentMetricsState,
     _coerce_signed_float,
+    bounded_model_key,
     normalize_compression_prices,
 )
 
@@ -143,6 +146,7 @@ def _get_litellm_module() -> Any | None:
         return litellm
 
     try:
+        pin_litellm_cost_map_local()
         import litellm as imported_litellm
     except ImportError:
         return None
@@ -222,6 +226,8 @@ def _coerce_float(value: Any, default: float = 0.0) -> float:
 def _recover_component(lifetime_raw: Any, last: dict[str, Any], key: str) -> float:
     """Prefer authoritative lifetime prices; otherwise recover the checkpoint."""
     raw = lifetime_raw if isinstance(lifetime_raw, dict) else {}
+    if _coerce_int(last.get("total_tokens_saved")) > _coerce_int(raw.get("tokens_saved")):
+        return _coerce_signed_float(last.get(key))
     current = raw.get("pricing_basis") == PRICING_BASIS
     if key.startswith("legacy_"):
         base_key = key.removeprefix("legacy_")
@@ -522,6 +528,7 @@ def estimate_request_savings_usd(
     compression_tokens_saved: int = 0,
     tool_schema_tokens_saved: int = 0,
     output_tokens_saved: int = 0,
+    output_tokens: int = 0,
     cache_read_tokens: int = 0,
     cache_write_tokens: int = 0,
     cache_write_5m_tokens: int = 0,
@@ -567,6 +574,8 @@ def estimate_request_savings_usd(
         CacheMix,
         PricedSavings,
         Region,
+        long_context_premium_avoided_usd,
+        long_context_threshold,
         price_savings,
         weakest_basis,
     )
@@ -579,26 +588,45 @@ def estimate_request_savings_usd(
         uncached_input_tokens=uncached_input_tokens,
         cache_inferred=cache_inferred,
     )
-    long_context = mix.is_long_context(local_tokens=local_input_tokens)
+    threshold = long_context_threshold(model)
+    long_context = mix.is_long_context(local_tokens=local_input_tokens, threshold=threshold)
+    # Compression that kept the prompt under the threshold avoided the long
+    # card on the whole request: the removed tokens are priced at that card,
+    # and the forwarded input and generated output premiums are added on top.
+    forwarded = max(mix.billed, max(_coerce_int(local_input_tokens), 0))
+    crossed = (
+        not long_context and forwarded + max(_coerce_int(compression_tokens_saved), 0) > threshold
+    )
 
-    def _price(tokens: Any, region: Region) -> PricedSavings:
+    def _price(tokens: Any, region: Region, *, long_tier: bool) -> PricedSavings:
         return price_savings(
             max(_coerce_int(tokens), 0),
             model=model,
             mix=mix,
             region=region,
-            long_context=long_context,
+            long_context=long_tier,
             provider=provider,
             # Matches the blended rate the flat estimators fall back to, so an
             # unpriceable model reports the same dollars it always has.
             fallback_rate_per_token=DEFAULT_FALLBACK_INPUT_COST_PER_TOKEN,
         )
 
-    compression = _price(compression_tokens_saved, Region.LIVE_ZONE)
-    tool_schema = _price(tool_schema_tokens_saved, Region.PREFIX)
+    compression = _price(
+        compression_tokens_saved, Region.LIVE_ZONE, long_tier=long_context or crossed
+    )
+    tool_schema = _price(tool_schema_tokens_saved, Region.PREFIX, long_tier=long_context)
+    compression_usd = compression.usd
+    if crossed:
+        compression_usd += long_context_premium_avoided_usd(
+            model,
+            mix,
+            local_tokens=local_input_tokens,
+            output_tokens=output_tokens,
+            provider=provider,
+        )
 
     return {
-        "compression": compression.usd,
+        "compression": compression_usd,
         "compression_list": compression.usd_list,
         "tool_schema": tool_schema.usd,
         "tool_schema_list": tool_schema.usd_list,
@@ -725,7 +753,7 @@ def _normalize_history_entry(entry: Any) -> dict[str, Any] | None:
         timestamp = _parse_timestamp(entry[0])
         total_tokens_saved = _coerce_int(entry[1])
         if len(entry) >= 3:
-            compression_savings_usd = _coerce_float(entry[2])
+            compression_savings_usd = _coerce_signed_float(entry[2])
         if len(entry) >= 4:
             total_input_tokens = _coerce_int(entry[3])
         if len(entry) >= 5:
@@ -1080,7 +1108,7 @@ class SavingsTracker:
                     "timestamp": _to_utc_iso(timestamp_dt),
                     "provider": _normalize_provider(provider),
                     "agent": _normalize_agent(agent),
-                    "model": _normalize_model(model),
+                    "model": _normalize_model(model)[:MAX_LABEL_LENGTH],
                     "total_tokens_saved": lifetime["tokens_saved"],
                     "compression_savings_usd": lifetime["compression_savings_usd"],
                     "pricing_basis": PRICING_BASIS,
@@ -1387,7 +1415,7 @@ class SavingsTracker:
                         "timestamp": _to_utc_iso(timestamp_dt),
                         "provider": _normalize_provider(provider),
                         "agent": _normalize_agent(agent),
-                        "model": _normalize_model(model),
+                        "model": _normalize_model(model)[:MAX_LABEL_LENGTH],
                         "total_tokens_saved": lifetime["tokens_saved"],
                         "compression_savings_usd": lifetime["compression_savings_usd"],
                         "pricing_basis": PRICING_BASIS,
@@ -1448,6 +1476,7 @@ class SavingsTracker:
             priced = estimate_request_savings_usd(
                 model,
                 compression_tokens_saved=_coerce_int(metrics.get("tokens_saved")),
+                output_tokens=_coerce_int(metrics.get("output_tokens")),
                 cache_read_tokens=cache_read_tokens,
                 cache_write_tokens=cache_write_tokens,
                 cache_write_5m_tokens=_coerce_int(metrics.get("cache_write_5m_tokens")),
@@ -1571,7 +1600,7 @@ class SavingsTracker:
         without migration.
         """
         by_model: dict[str, dict[str, Any]] = self._state.setdefault("by_model", {})
-        key = _normalize_model(model)
+        key = bounded_model_key(_normalize_model(model), by_model)
         entry = by_model.setdefault(key, _empty_by_model_entry())
         entry["requests"] += max(requests_delta, 0)
         entry["tokens_saved"] += max(tokens_saved_delta, 0)
@@ -1894,7 +1923,7 @@ class SavingsTracker:
             migrated_at = lifetime_raw.get("savings_basis_migrated_at")
             is_v6_lifetime = "compression_savings_list_usd" in lifetime_raw
             if is_v6_lifetime:
-                lifetime_savings_list_usd = _coerce_float(
+                lifetime_savings_list_usd = _coerce_signed_float(
                     lifetime_raw.get("compression_savings_list_usd")
                 )
                 if lifetime_raw.get("pricing_basis") == PRICING_BASIS:
@@ -1905,6 +1934,10 @@ class SavingsTracker:
 
         if normalized_history:
             last = normalized_history[-1]
+            # A losing request that saves no tokens and reads no cache appends
+            # no checkpoint, so the saved total can legitimately sit BELOW the
+            # last checkpoint. Only trust the checkpoint for dollars when the
+            # saved counters show the lifetime block is behind it.
             lifetime_tokens_saved = max(
                 lifetime_tokens_saved,
                 last["total_tokens_saved"],
@@ -2224,7 +2257,7 @@ class SavingsTracker:
             2,
         )
         session["compression_savings_usd"] = round(
-            _coerce_float(session.get("compression_savings_usd")),
+            _coerce_signed_float(session.get("compression_savings_usd")),
             6,
         )
         session["total_input_cost_usd"] = round(

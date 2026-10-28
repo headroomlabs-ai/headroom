@@ -15,6 +15,26 @@ MAX_STACK_VALUES = 64
 MAX_TRACKED_MODELS = 200
 MAX_EXPOSED_MODELS = 100
 MAX_LABEL_LENGTH = 128
+OTHER_MODEL = "other"
+# ``CostTracker.stats()`` skips keys with this prefix; an overflowing
+# passthrough name must keep it or it would enter the processed-traffic totals.
+PASSTHROUGH_PREFIX = "passthrough:"
+OTHER_PASSTHROUGH_MODEL = PASSTHROUGH_PREFIX + OTHER_MODEL
+
+
+def bounded_model_key(model: str, tracked: Any) -> str:
+    """Key under which a client-supplied model name may enter a per-model map.
+
+    ``model`` comes from the request body, so it is clipped to
+    ``MAX_LABEL_LENGTH`` and a new name past ``MAX_TRACKED_MODELS`` distinct
+    keys collapses into ``OTHER_MODEL`` (``OTHER_PASSTHROUGH_MODEL`` for a
+    ``passthrough:`` name). ``tracked`` is the map being written.
+    """
+    key = model[:MAX_LABEL_LENGTH]
+    if key in tracked or len(tracked) < MAX_TRACKED_MODELS:
+        return key
+    return OTHER_PASSTHROUGH_MODEL if key.startswith(PASSTHROUGH_PREFIX) else OTHER_MODEL
+
 
 KNOWN_MISS_REASONS = frozenset({"ttl_expiry", "prefix_change", "unknown"})
 # Mirrors RATE_LIMIT_SOURCES in prometheus_metrics: "headroom" is our own
@@ -65,6 +85,7 @@ def _coerce_float(value: Any) -> float:
 
 
 def _coerce_signed_float(value: Any) -> float:
+    """_coerce_float without the zero floor, for compression savings that can lose."""
     try:
         result = float(value)
     except (TypeError, ValueError, OverflowError):
@@ -272,7 +293,12 @@ class PersistentMetricsState:
             "compression_savings_list_usd",
             "cache_savings_usd",
         ):
-            result["cost"][key] = round(_coerce_float(raw_cost.get(key)), 6)
+            result["cost"][key] = round(
+                (_coerce_signed_float if key.startswith("compression_savings") else _coerce_float)(
+                    raw_cost.get(key)
+                ),
+                6,
+            )
         if "compression_savings_list_usd" not in raw_cost:
             result["cost"]["compression_savings_list_usd"] = round(
                 _coerce_signed_float(raw_cost.get("compression_savings_usd")), 6
@@ -472,7 +498,7 @@ class PersistentMetricsState:
         cost = self._state["cost"]
         cost["input_usd"] = round(cost["input_usd"] + _coerce_float(input_usd), 6)
         cost["compression_savings_usd"] = round(
-            cost["compression_savings_usd"] + _coerce_float(compression_savings_usd), 6
+            cost["compression_savings_usd"] + _coerce_signed_float(compression_savings_usd), 6
         )
         # Defaults to the cache-aware figure when a caller supplies no ceiling,
         # which is the truthful reading of "these are the same number" for a
@@ -483,7 +509,9 @@ class PersistentMetricsState:
             else compression_savings_list_usd
         )
         cost["compression_savings_list_usd"] = round(
-            _coerce_float(cost.get("compression_savings_list_usd")) + _coerce_float(list_delta), 6
+            _coerce_signed_float(cost.get("compression_savings_list_usd"))
+            + _coerce_signed_float(list_delta),
+            6,
         )
         if savings_basis:
             cost["savings_basis"] = _blend_savings_basis(cost.get("savings_basis"), savings_basis)
