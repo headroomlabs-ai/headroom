@@ -807,12 +807,16 @@ class DirectMem0Adapter:
         """
         await self._ensure_initialized()
 
-        # Use Mem0's search (no LLM calls, just embeddings)
+        # Use Mem0's search (no LLM calls, just embeddings). mem0ai 2.x is
+        # keyword-only and rejects top-level entity params via
+        # ``_reject_top_level_entity_params`` (raising for ``user_id``) while
+        # silently swallowing ``limit`` from ``**kwargs``. Scope with
+        # ``filters`` and bound the result count with ``top_k``.
         results = await asyncio.to_thread(
             self._mem0_client.search,
             query=query,
-            user_id=user_id,
-            limit=top_k,
+            filters={"user_id": user_id},
+            top_k=top_k,
         )
 
         search_results: list[MemorySearchResult] = []

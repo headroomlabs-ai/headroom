@@ -301,6 +301,43 @@ async def test_huge_model_supplied_id_is_capped_in_the_warning() -> None:
     assert "'short-id'" in short and "…" not in short
 
 
+class _Mem0V2SearchClient:
+    """Minimal stand-in for the mem0ai 2.x ``Memory.search`` contract.
+
+    Keyword-only signature with ``top_k``/``filters`` and no top-level entity
+    parameters; any ``user_id``/``agent_id``/``run_id`` in ``**kwargs`` raises,
+    and an unknown ``limit`` would be silently swallowed by ``**kwargs``.
+    """
+
+    def __init__(self) -> None:
+        self.calls: list[dict[str, object]] = []
+
+    def search(self, query, *, top_k=20, filters=None, **kwargs):
+        for name in ("user_id", "agent_id", "run_id"):
+            if name in kwargs:
+                raise ValueError(
+                    f"Top-level entity parameters {{{name!r}}} are not supported in "
+                    f"search(). Use filters={{{name!r}: '...'}} instead."
+                )
+        self.calls.append({"query": query, "top_k": top_k, "filters": filters, **kwargs})
+        return [{"id": "m1", "memory": "Works at Netflix", "score": 0.9}]
+
+
+@pytest.mark.asyncio
+async def test_search_memories_uses_mem0_v2_filters_and_top_k() -> None:
+    """search_memories must call mem0 2.x search with filters + top_k, not the
+    removed top-level user_id/limit kwargs (issue #4246)."""
+    adapter = _adapter()
+    adapter._ensure_initialized = AsyncMock()  # type: ignore[method-assign]
+    client = _Mem0V2SearchClient()
+    adapter._mem0_client = client
+
+    results = await adapter.search_memories("anything", user_id="u1", top_k=3)
+
+    assert client.calls == [{"query": "anything", "top_k": 3, "filters": {"user_id": "u1"}}]
+    assert [r.memory.content for r in results] == ["Works at Netflix"]
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize("level", [logging.INFO, logging.DEBUG])
 async def test_get_memory_survives_an_out_of_range_errno(level: int) -> None:
