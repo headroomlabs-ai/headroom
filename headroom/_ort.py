@@ -119,7 +119,10 @@ def _resolve_and_pin() -> str | None:
 
         installed = _installed_ort_version()
         if installed is not None and installed < _MIN_RUST_ORT_API_VERSION:
-            logger.warning(
+            # By design on Intel macOS, where the proxy extra pins onnxruntime
+            # <1.24 (no newer x86_64 wheels): Python detection is the supported
+            # path there, so this is information, not a warning.
+            logger.info(
                 "onnxruntime %d.%d exposes an older C API than Rust detection "
                 "requires (1.24+); leaving %s unset and using Python detection",
                 *installed,

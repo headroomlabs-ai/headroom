@@ -10,6 +10,7 @@ monkeypatched so every branch runs on any CI OS.
 
 from __future__ import annotations
 
+import logging
 import sys
 from types import SimpleNamespace
 
@@ -82,10 +83,14 @@ def test_incompatible_package_is_not_pinned(monkeypatch, tmp_path, caplog):
     capi.mkdir(parents=True)
     (capi / "libonnxruntime.so.1.23.2").write_bytes(b"old")
     _fake_spec_for(monkeypatch, pkg)
+    caplog.set_level(logging.INFO, logger=_ort.logger.name)
 
     assert _ort.ensure_ort_dylib_pinned() is None
     assert not _ort.rust_ort_runtime_compatible()
-    assert "older C API" in caplog.text
+    older = [r for r in caplog.records if "older C API" in r.getMessage()]
+    assert len(older) == 1
+    # Supported configuration (Intel macOS pins onnxruntime <1.24): not a warning.
+    assert older[0].levelno == logging.INFO
 
 
 def test_content_router_bypasses_native_detector_for_incompatible_ort(monkeypatch, caplog):
@@ -94,12 +99,21 @@ def test_content_router_bypasses_native_detector_for_incompatible_ort(monkeypatc
     monkeypatch.setenv("HEADROOM_DETECT_BACKEND", "rust")
     monkeypatch.setattr(_ort, "rust_ort_runtime_compatible", lambda: False)
     monkeypatch.setattr(router, "_detect_native_unhealthy", False)
+    caplog.set_level(logging.INFO, logger=router.logger.name)
 
     result = router._detect_content('{"safe": true}')
 
     assert result.content_type.value.startswith("json")
     assert router._detect_native_unhealthy is True
-    assert "requires ONNX Runtime 1.24+" in caplog.text
+    fallback = [r for r in caplog.records if "requires ONNX Runtime 1.24+" in r.getMessage()]
+    assert len(fallback) == 1
+    # A base install has no ONNX Runtime by design; the fallback is the
+    # supported path there, so it must not surface as a warning on first import.
+    assert fallback[0].levelno == logging.INFO
+
+    caplog.clear()
+    router._detect_content('{"safe": true}')
+    assert "requires ONNX Runtime 1.24+" not in caplog.text
 
 
 def test_pins_to_package_capi_dll(monkeypatch, tmp_path):
