@@ -14,10 +14,7 @@ from functools import lru_cache
 from pathlib import Path
 from typing import Any, Literal, cast
 
-try:
-    import tomllib
-except ModuleNotFoundError:  # pragma: no cover - Python 3.10
-    import tomli as tomllib
+import tomllib
 
 from headroom.memory.storage_router import ProjectResolver, RequestContext
 from headroom.providers.codex.threads import _codex_state_db_paths
