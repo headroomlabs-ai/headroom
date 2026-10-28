@@ -894,7 +894,7 @@ def test_deferral_is_skipped_when_any_name_cannot_be_a_namespace() -> None:
     assert any(t.get("defer_loading") for t in out if isinstance(t, dict))
 
 
-def test_tool_search_deferral_is_scoped_to_a_real_anthropic_upstream() -> None:
+def test_tool_search_deferral_is_scoped_to_supported_upstreams() -> None:
     """Deferring tools against Copilot silently disarms the client's whole toolset.
 
     Anthropic's tool-search protocol is first-party only. Both `wrap copilot
@@ -913,7 +913,8 @@ def test_tool_search_deferral_is_scoped_to_a_real_anthropic_upstream() -> None:
     assert anthropic_first_party_tool_search_supported("https://api.anthropic.com") is True
     assert anthropic_first_party_tool_search_supported(None) is True
     # The configurations this bug was reported from:
-    assert anthropic_first_party_tool_search_supported("https://api.githubcopilot.com") is False
+    # Copilot accepts deferred schemas; enterprise hosts remain opt-out below.
+    assert anthropic_first_party_tool_search_supported("https://api.githubcopilot.com") is True
     assert (
         anthropic_first_party_tool_search_supported("https://copilot-api.enterprise.ghe.com")
         is False
