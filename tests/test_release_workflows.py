@@ -1750,6 +1750,8 @@ def test_version_sync_covers_every_file_the_verifier_gates() -> None:
         "sdk/typescript/package.json",
         "plugins/headroom-agent-hooks/.claude-plugin/plugin.json",
         "plugins/headroom-agent-hooks/.github/plugin/plugin.json",
+        "plugins/headroom-skill/.claude-plugin/plugin.json",
+        "plugins/headroom-skill/.github/plugin/plugin.json",
         "marketplace.json",
     ]
     for path in gated:
@@ -1760,6 +1762,7 @@ def test_version_sync_covers_every_file_the_verifier_gates() -> None:
         "openclaw",
         "typescript",
         "headroom-agent-hooks",
+        "headroom-skill",
         "marketplace.json",
         "server.json",
     ]:
