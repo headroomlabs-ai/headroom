@@ -901,6 +901,7 @@ def _sed_is_quiet_read(rest: list[str]) -> bool:
         return False
     # GNU -l takes a line length; BSD -l is a line-buffering flag. Recognize
     # either dialect so existing BSD reads do not lose their protection.
+    is_quiet = False
     for short_options in ("anErsuzbiIe:f:l:", "anErsuzbliIe:f:"):
         try:
             options, _ = getopt.gnu_getopt(
@@ -926,11 +927,12 @@ def _sed_is_quiet_read(rest: list[str]) -> bool:
             )
         except getopt.GetoptError:
             continue
-        # -i/-I can accompany -n, but edit the input instead of reading it.
-        return any(opt in {"-n", "--quiet", "--silent"} for opt, _ in options) and not any(
-            opt in {"-i", "-I", "--in-place"} for opt, _ in options
-        )
-    return False
+        # Check both dialects: GNU -l may consume a BSD -n or in-place flag.
+        # Any in-place interpretation takes precedence over quiet mode.
+        if any(opt in {"-i", "-I", "--in-place"} for opt, _ in options):
+            return False
+        is_quiet |= any(opt in {"-n", "--quiet", "--silent"} for opt, _ in options)
+    return is_quiet
 
 
 # Shell wrappers that prefix the real program — peeled to find it. Shell

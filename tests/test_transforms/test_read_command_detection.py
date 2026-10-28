@@ -35,6 +35,10 @@ from headroom.transforms.content_router import (
         "sed -n --follow-symlinks '1,60p' foo.py",
         "sed -a -n '1,60p' foo.py",  # BSD sed.
         "sed -n -e '1,60p' foo.py -l",  # BSD line buffering (no argument).
+        "sed -l -n '1,60p' foo.py",
+        "sed -ln '1,60p' foo.py",
+        "sed -l 80 -n '1,60p' foo.py",  # GNU line length takes an argument.
+        "sed -nl80 '1,60p' foo.py",
         "cd /repo && cat foo.py",
         "sudo cat foo.py",
         "rtk cat foo.py",
@@ -96,6 +100,8 @@ def test_chained_reads_are_detected(command: str) -> None:
         "sed -n -i '1,60p' foo.py",
         "sed -n -I .bak '1,60p' foo.py",  # BSD in-place editing.
         "sed -n -I '' '1,60p' foo.py",
+        "sed -n -l -i '' '1,60p' foo.py",  # BSD -l must not hide in-place flags.
+        "sed -n -l -I .bak '1,60p' foo.py",
         "sed -in '1,60p' foo.py",
         "sed --quiet --in-place '1,60p' foo.py",
         "sed --quiet --in-place=.bak '1,60p' foo.py",
