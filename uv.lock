@@ -1779,6 +1779,33 @@ langgraph = [
     { name = "langchain-openai" },
     { name = "langgraph" },
 ]
+lean = [
+    { name = "fastapi" },
+    { name = "fastembed", marker = "python_full_version < '3.14' or platform_machine != 'x86_64' or sys_platform != 'darwin'" },
+    { name = "httpx", extra = ["http2"] },
+    { name = "jinja2" },
+    { name = "magika", marker = "python_full_version < '3.14' or platform_machine != 'x86_64' or sys_platform != 'darwin'" },
+    { name = "mcp" },
+    { name = "numpy" },
+    { name = "onnxruntime", version = "1.23.2", source = { registry = "https://pypi.org/simple/" }, marker = "python_full_version < '3.14' and platform_machine == 'x86_64' and sys_platform == 'darwin'" },
+    { name = "onnxruntime", version = "1.26.0", source = { registry = "https://pypi.org/simple/" }, marker = "platform_machine != 'x86_64' or sys_platform != 'darwin'" },
+    { name = "openai" },
+    { name = "openpyxl" },
+    { name = "opentelemetry-exporter-otlp-proto-http" },
+    { name = "opentelemetry-sdk" },
+    { name = "orjson", marker = "platform_python_implementation != 'PyPy'" },
+    { name = "sqlite-vec" },
+    { name = "starlette" },
+    { name = "trafilatura" },
+    { name = "transformers" },
+    { name = "tree-sitter" },
+    { name = "tree-sitter-language-pack" },
+    { name = "uvicorn" },
+    { name = "watchdog", marker = "python_full_version < '3.14' or sys_platform != 'darwin'" },
+    { name = "websockets" },
+    { name = "xlrd" },
+    { name = "zstandard" },
+]
 mcp = [
     { name = "httpx" },
     { name = "mcp" },
@@ -1927,9 +1954,10 @@ requires-dist = [
     { name = "filelock", specifier = ">=4.2.1" },
     { name = "google-cloud-aiplatform", marker = "extra == 'vertex'", specifier = ">=1.38" },
     { name = "gunicorn", marker = "sys_platform != 'win32' and extra == 'proxy-prod'", specifier = ">=21.0.0" },
+    { name = "headroom-ai", extras = ["lean"], marker = "extra == 'sandbox'" },
     { name = "headroom-ai", extras = ["proxy"], marker = "extra == 'proxy-prod'" },
     { name = "headroom-ai", extras = ["proxy", "code", "ml", "memory", "relevance", "image", "reports", "otel", "evals", "voice", "html", "mcp", "spreadsheet"], marker = "extra == 'all'" },
-    { name = "headroom-ai", extras = ["proxy", "code", "relevance", "reports", "otel", "html", "mcp", "spreadsheet"], marker = "extra == 'sandbox'" },
+    { name = "headroom-ai", extras = ["proxy", "code", "relevance", "reports", "otel", "html", "mcp", "spreadsheet"], marker = "extra == 'lean'" },
     { name = "headroom-ai", extras = ["voice"], marker = "extra == 'voice-train'" },
     { name = "hf-xet", marker = "platform_machine == 'AMD64' or platform_machine == 'aarch64' or platform_machine == 'amd64' or platform_machine == 'arm64' or platform_machine == 'x86_64'", specifier = ">=1.6.0" },
     { name = "hnswlib", marker = "extra == 'dev'", specifier = ">=0.8.0" },
@@ -2021,7 +2049,7 @@ requires-dist = [
     { name = "xlwt", marker = "extra == 'dev'", specifier = ">=1.3.0" },
     { name = "zstandard", marker = "extra == 'proxy'", specifier = ">=0.20.0" },
 ]
-provides-extras = ["proxy", "proxy-prod", "vertex", "code", "ml", "memory", "vector", "memory-stack", "pytorch-mps", "relevance", "image", "reports", "spreadsheet", "otel", "anyllm", "langchain", "langgraph", "agno", "strands", "autogen", "mcp", "voice", "voice-train", "evals", "bedrock", "redis", "html", "dev", "all", "sandbox"]
+provides-extras = ["proxy", "proxy-prod", "vertex", "code", "ml", "memory", "vector", "memory-stack", "pytorch-mps", "relevance", "image", "reports", "spreadsheet", "otel", "anyllm", "langchain", "langgraph", "agno", "strands", "autogen", "mcp", "voice", "voice-train", "evals", "bedrock", "redis", "html", "dev", "all", "lean", "sandbox"]
 
 [[package]]
 name = "hf-xet"
