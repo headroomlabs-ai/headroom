@@ -1,18 +1,21 @@
 //! Embedding-based relevance scorer using `fastembed-rs`.
 //!
-//! Uses BAAI/bge-small-en-v1.5 (33M params, 384 dims) by default —
-//! same model the Python side runs via the `fastembed` package, giving
-//! byte-equal embeddings on identical inputs. fastembed wraps ONNX
-//! Runtime under the hood, with the runtime binary auto-downloaded
-//! once at build time and the model weights auto-downloaded from
-//! Hugging Face Hub on first use (~30 MB int8-quantized ONNX).
+//! Uses BAAI/bge-small-en-v1.5 (33M params, 384 dims) by default, loaded
+//! from the same pinned `Qdrant/bge-small-en-v1.5-onnx-Q` snapshot the
+//! Python side's `fastembed` package runs (~67 MB quantized ONNX). fastembed
+//! wraps ONNX Runtime under the hood, with the runtime library loaded
+//! dynamically and the model files downloaded from Hugging Face Hub on
+//! first use.
 //!
 //! # Caching
 //!
 //! Loading a sentence-transformer model takes ~1-2 seconds (HF Hub
 //! call + ONNX session init). Construct the scorer once per process
 //! and reuse — `try_new` returns a `Result` because the first
-//! construction may need network access to fetch the model.
+//! construction may need network access to fetch the model. The files
+//! live in the HuggingFace hub cache directory Python's `huggingface_hub`
+//! would pick (`HF_HUB_CACHE`, `HF_HOME/hub`, `~/.cache/huggingface/hub`,
+//! …; see `crate::hf_cache::hub_cache_dir`), shared with Python.
 //!
 //! When constructed, `is_available()` returns `true` and `HybridScorer`
 //! switches off the BM25-fallback path automatically. If construction
@@ -21,18 +24,186 @@
 //!
 //! # Output stability vs Python
 //!
-//! Both languages call into the same ONNX file via ONNX Runtime (`ort`
-//! crate in Rust, `onnxruntime` package in Python's fastembed). Same
-//! kernels, same weights — embeddings agree to floating-point
-//! representation. Cosine similarity agrees to ~1e-6.
+//! Both languages run the same ONNX file and tokenizer through ONNX
+//! Runtime (`ort` crate in Rust, `onnxruntime` package in Python's
+//! fastembed), with the same CLS pooling and normalization. On the same
+//! ONNX Runtime build they agree within 1e-6 per component; across ORT
+//! versions they drift by up to ~4e-4, so they are close, not byte-equal.
+//! The gated parity fixture in `tests/parity/fixtures/embedding/` bounds
+//! that drift on both sides (see `tests/parity/record_embedding.py`).
 
+#[cfg(feature = "ml")]
+use std::path::{Path, PathBuf};
 #[cfg(feature = "ml")]
 use std::sync::Mutex;
 
 #[cfg(feature = "ml")]
-use fastembed::{EmbeddingModel, InitOptions, TextEmbedding};
+use fastembed::{
+    EmbeddingModel, InitOptions, InitOptionsUserDefined, Pooling, QuantizationMode, TextEmbedding,
+    TokenizerFiles, UserDefinedEmbeddingModel,
+};
 
 use super::base::{RelevanceScore, RelevanceScorer};
+
+/// Name the default model reports, the same string Python uses.
+#[cfg(feature = "ml")]
+const DEFAULT_MODEL_NAME: &str = "BAAI/bge-small-en-v1.5";
+
+/// HF repo the default model loads from: the one Python's fastembed
+/// resolves `BAAI/bge-small-en-v1.5` to. fastembed-rs maps its own
+/// `BGESmallENV15` to `Xenova/bge-small-en-v1.5`, a different (fp32) export,
+/// and always on `main`, so the default is loaded as a user-defined model
+/// from this repo instead. Keep equal to `DEFAULT_MODEL_REPO` in
+/// `headroom/relevance/embedding.py`.
+#[cfg(feature = "ml")]
+const DEFAULT_MODEL_REPO: &str = "Qdrant/bge-small-en-v1.5-onnx-Q";
+
+/// Pinned commit of [`DEFAULT_MODEL_REPO`]. Keep equal to its entry in
+/// `_PINNED_REVISIONS` (`headroom/onnx_runtime.py`);
+/// `tests/test_fastembed_pinned_snapshot.py` enforces both equalities.
+#[cfg(feature = "ml")]
+const DEFAULT_MODEL_REVISION: &str = "52398278842ec682c6f32300af41344b1c0b0bb2";
+
+#[cfg(feature = "ml")]
+const DEFAULT_MODEL_FILE: &str = "model_optimized.onnx";
+
+/// Every file the load reads: the ONNX graph, then what `TokenizerFiles`
+/// needs. Same list as Python's `DEFAULT_MODEL_FILES`.
+#[cfg(feature = "ml")]
+const DEFAULT_MODEL_FILES: [&str; 5] = [
+    DEFAULT_MODEL_FILE,
+    "tokenizer.json",
+    "tokenizer_config.json",
+    "special_tokens_map.json",
+    "config.json",
+];
+
+/// The revision to load: the pin, or `main` when `HEADROOM_HF_PIN` turns
+/// pinning off (same values as Python's `onnx_runtime._resolve_revision`).
+#[cfg(feature = "ml")]
+fn default_model_revision() -> &'static str {
+    crate::hf_cache::pinned_or_main(DEFAULT_MODEL_REVISION)
+}
+
+/// Find a snapshot of [`DEFAULT_MODEL_REPO`] at `revision` in the hub cache
+/// `cache` that holds every file in [`DEFAULT_MODEL_FILES`]. Never touches the
+/// network; see [`crate::hf_cache::snapshot_path`] for how `revision`
+/// resolves.
+#[cfg(feature = "ml")]
+fn cached_snapshot(cache: &Path, revision: &str) -> Option<PathBuf> {
+    let snapshot = crate::hf_cache::snapshot_path(cache, DEFAULT_MODEL_REPO, revision);
+    // `is_file` follows the snapshot's symlinks, so blobs deleted from under
+    // it count as a miss rather than a load failure.
+    DEFAULT_MODEL_FILES
+        .iter()
+        .all(|name| snapshot.join(name).is_file())
+        .then_some(snapshot)
+}
+
+/// The Hub handle for [`DEFAULT_MODEL_REPO`] at `revision`, caching under
+/// `cache_root`, with Python's endpoint and token ([`crate::hf_cache::hub_api`]).
+#[cfg(feature = "ml")]
+fn default_model_repo(
+    cache_root: &Path,
+    revision: &str,
+) -> Result<hf_hub::api::sync::ApiRepo, String> {
+    // `hub_api` is the air-gap chokepoint: under `HEADROOM_OFFLINE` it
+    // refuses before building the client. Callers reach this only on a cache
+    // miss, so a pre-seeded air-gapped host still loads.
+    //
+    // The refusal is soft by design: every caller degrades to the BM25
+    // scorer on `Err`, so an air-gapped box loses embedding relevance instead
+    // of failing a request. The message names the switch so the operator can
+    // tell the causes apart in the log.
+    use crate::hf_cache::HubApiError;
+    let api = crate::hf_cache::hub_api(
+        cache_root,
+        "fastembed embedding model download",
+        DEFAULT_MODEL_REPO,
+    )
+    .map_err(|e| match e {
+        HubApiError::Offline(e) => format!("EmbeddingScorer model load refused: {e}"),
+        HubApiError::Build(e) => format!("EmbeddingScorer: HuggingFace client init failed: {e}"),
+    })?;
+    Ok(api.repo(hf_hub::Repo::with_revision(
+        DEFAULT_MODEL_REPO.to_string(),
+        hf_hub::RepoType::Model,
+        revision.to_string(),
+    )))
+}
+
+/// Download every file of the snapshot at `revision` through `repo` (from
+/// [`default_model_repo`]) and return the snapshot directory.
+#[cfg(feature = "ml")]
+fn download_snapshot(repo: &hf_hub::api::sync::ApiRepo, revision: &str) -> Result<PathBuf, String> {
+    let mut snapshot: Option<PathBuf> = None;
+    for name in DEFAULT_MODEL_FILES {
+        let path = repo.get(name).map_err(|e| {
+            format!(
+                "EmbeddingScorer: downloading {DEFAULT_MODEL_REPO}/{name}@{revision} failed: {e}"
+            )
+        })?;
+        let dir = path
+            .parent()
+            .map(Path::to_path_buf)
+            .ok_or_else(|| format!("EmbeddingScorer: {} has no parent", path.display()))?;
+        match &snapshot {
+            None => snapshot = Some(dir),
+            Some(first) if *first == dir => {}
+            Some(first) => {
+                return Err(format!(
+                    "EmbeddingScorer: {DEFAULT_MODEL_REPO} files resolved to more than one \
+                     snapshot: {} and {}",
+                    first.display(),
+                    dir.display()
+                ))
+            }
+        }
+    }
+    snapshot.ok_or_else(|| "EmbeddingScorer: no model files configured".to_string())
+}
+
+/// Load the snapshot in `dir` with the settings fastembed uses for this
+/// model (`BGESmallENV15Q` in fastembed-rs, the Python default): CLS
+/// pooling, static quantization, 512-token truncation.
+#[cfg(feature = "ml")]
+fn load_snapshot(dir: &Path) -> Result<TextEmbedding, String> {
+    let read = |name: &str| {
+        std::fs::read(dir.join(name))
+            .map_err(|e| format!("EmbeddingScorer: reading {}: {e}", dir.join(name).display()))
+    };
+    let tokenizer_files = TokenizerFiles {
+        tokenizer_file: read("tokenizer.json")?,
+        config_file: read("config.json")?,
+        special_tokens_map_file: read("special_tokens_map.json")?,
+        tokenizer_config_file: read("tokenizer_config.json")?,
+    };
+    let model = UserDefinedEmbeddingModel::new(read(DEFAULT_MODEL_FILE)?, tokenizer_files)
+        .with_pooling(Pooling::Cls)
+        .with_quantization(QuantizationMode::Static);
+    TextEmbedding::try_new_from_user_defined(model, InitOptionsUserDefined::new())
+        .map_err(|e| format!("EmbeddingScorer model load failed: {e}"))
+}
+
+/// Refuse before ONNX Runtime is touched on a host that cannot run it.
+#[cfg(feature = "ml")]
+fn onnx_runtime_ready() -> Result<(), String> {
+    // fastembed links the precompiled ONNX Runtime binary, which contains
+    // AVX2 instructions on x86. Loading/running it on a non-AVX2 CPU traps
+    // with SIGILL (issue #1723) — an uncatchable native fault. Bail early so
+    // callers fall back to the BM25/stub path instead of killing the process.
+    if !crate::onnx_cpu::onnx_runtime_supported_by_cpu() {
+        return Err("EmbeddingScorer: ONNX Runtime backend requires AVX2 on \
+             this x86 CPU; embedding relevance disabled (falling back to BM25)"
+            .to_string());
+    }
+    // The crate loads ONNX Runtime dynamically (`ort-load-dynamic`);
+    // resolve and commit the dylib before fastembed touches ort — a
+    // failed in-ort load deadlocks instead of erroring (see
+    // `dynamic_ort_loader_ready`).
+    crate::transforms::magika_detector::dynamic_ort_loader_ready()
+        .map_err(|e| format!("EmbeddingScorer: ONNX Runtime unavailable: {e}"))
+}
 
 /// fastembed-backed semantic relevance scorer.
 ///
@@ -82,53 +253,62 @@ impl Default for EmbeddingScorer {
 #[cfg(feature = "ml")]
 impl EmbeddingScorer {
     /// Construct the scorer with the default model
-    /// (BAAI/bge-small-en-v1.5). May trigger a one-time HF Hub
-    /// download if the model isn't cached locally; subsequent calls
-    /// are fast.
+    /// (BAAI/bge-small-en-v1.5) from its pinned snapshot. May trigger a
+    /// one-time HF Hub download if the snapshot isn't cached locally;
+    /// subsequent calls are fast.
     ///
-    /// Returns an error from fastembed if model initialization fails
-    /// (network failure during download, missing ONNX runtime
+    /// Returns an error if model initialization fails (refused while
+    /// offline, network failure during download, missing ONNX runtime
     /// binaries, etc.).
     pub fn try_new() -> Result<Self, String> {
-        Self::try_new_with_model(EmbeddingModel::BGESmallENV15)
+        let cache = crate::hf_cache::hub_cache_dir().ok_or_else(|| {
+            "EmbeddingScorer: no HuggingFace cache directory (set HF_HUB_CACHE or HF_HOME)"
+                .to_string()
+        })?;
+        Self::try_new_pinned(&cache)
     }
 
-    /// Construct with an explicit model. See `fastembed::EmbeddingModel`
-    /// for the catalog. The default `BGESmallENV15` is the best
-    /// quality/speed tradeoff for compression-relevance scoring on
-    /// short snippets.
+    /// [`Self::try_new`] against an explicit hub cache directory, used for
+    /// both the lookup and any download. Split out so tests can point it at a
+    /// temporary cache.
+    fn try_new_pinned(cache: &Path) -> Result<Self, String> {
+        let revision = default_model_revision();
+        let snapshot = match cached_snapshot(cache, revision) {
+            Some(dir) => {
+                onnx_runtime_ready()?;
+                dir
+            }
+            None => {
+                // Built (and so guarded) ahead of the AVX2 and ort-loader
+                // probes, so an air-gapped box reports the policy refusal
+                // rather than whichever local prerequisite was missing too.
+                let repo = default_model_repo(cache, revision)?;
+                onnx_runtime_ready()?;
+                download_snapshot(&repo, revision)?
+            }
+        };
+        let model = load_snapshot(&snapshot)?;
+        Ok(EmbeddingScorer {
+            model_name: DEFAULT_MODEL_NAME.to_string(),
+            model: Some(Mutex::new(model)),
+        })
+    }
+
+    /// Construct with an explicit model from fastembed-rs's catalog (see
+    /// `fastembed::EmbeddingModel`). Unlike [`Self::try_new`], these are not
+    /// pinned: fastembed resolves them on the repo's `main`. Note that
+    /// `BGESmallENV15` here is the `Xenova` fp32 export, not the snapshot
+    /// Python runs; use `try_new` for the default model.
     pub fn try_new_with_model(model_kind: EmbeddingModel) -> Result<Self, String> {
         let name = format!("{:?}", model_kind);
         // Air-gap chokepoint, FIRST thing in the function. `TextEmbedding::
         // try_new` resolves the model's ONNX weights through `hf-hub`, which
         // downloads from huggingface.co on a cache miss even with
-        // `HF_HUB_OFFLINE` set — the same hole the tokenizer and Kompress model
-        // fetches had. It sits ahead of the AVX2 and ort-loader probes below so
-        // that an air-gapped box reports the policy refusal rather than
-        // whichever local prerequisite happened to be missing as well.
-        //
-        // The refusal is soft here by design: this function already returns
-        // `Err(String)` for "ONNX runtime unavailable" and every caller degrades
-        // to the BM25 scorer, so an air-gapped box loses embedding relevance
-        // instead of failing a request. The message names the switch so the
-        // operator can tell the two causes apart in the log.
+        // `HF_HUB_OFFLINE` set, and offers no cache-only attempt to put the
+        // guard behind, so this refuses even a cached model.
         crate::offline::guard_egress("fastembed embedding model download", &name)
             .map_err(|e| format!("EmbeddingScorer model load refused: {e}"))?;
-        // fastembed links the precompiled ONNX Runtime binary, which contains
-        // AVX2 instructions on x86. Loading/running it on a non-AVX2 CPU traps
-        // with SIGILL (issue #1723) — an uncatchable native fault. Bail early so
-        // callers fall back to the BM25/stub path instead of killing the process.
-        if !crate::onnx_cpu::onnx_runtime_supported_by_cpu() {
-            return Err("EmbeddingScorer: ONNX Runtime backend requires AVX2 on \
-                 this x86 CPU; embedding relevance disabled (falling back to BM25)"
-                .to_string());
-        }
-        // The crate loads ONNX Runtime dynamically (`ort-load-dynamic`);
-        // resolve and commit the dylib before fastembed touches ort — a
-        // failed in-ort load deadlocks instead of erroring (see
-        // `dynamic_ort_loader_ready`).
-        crate::transforms::magika_detector::dynamic_ort_loader_ready()
-            .map_err(|e| format!("EmbeddingScorer: ONNX Runtime unavailable: {e}"))?;
+        onnx_runtime_ready()?;
         let model = TextEmbedding::try_new(InitOptions::new(model_kind))
             .map_err(|e| format!("EmbeddingScorer model load failed: {}", e))?;
         Ok(EmbeddingScorer {
@@ -312,9 +492,11 @@ fn cosine_similarity(a: &[f32], b: &[f32]) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(feature = "ml")]
+    use crate::hf_cache::tests::CacheEnv;
 
     // The real-model tests are gated behind RUN_FASTEMBED_TESTS=1
-    // since they require network access on first run (~30 MB model
+    // since they require network access on first run (~67 MB model
     // download). Without the env var, only the offline-safe stub
     // path is exercised.
 
@@ -323,26 +505,185 @@ mod tests {
         std::env::var("RUN_FASTEMBED_TESTS").is_ok()
     }
 
-    /// `try_new_with_model` must refuse before fastembed resolves the model,
-    /// and must say so in the returned message rather than looking like an
-    /// ordinary load failure — the caller only ever sees the `String`.
+    /// Lay out a fake HF cache snapshot of the default repo at `commit`,
+    /// holding `files` (dummy bytes), and return the snapshot directory.
+    #[cfg(feature = "ml")]
+    fn fake_snapshot(root: &Path, commit: &str, files: &[&str]) -> PathBuf {
+        let snapshot = root
+            .join(format!("models--{}", DEFAULT_MODEL_REPO.replace('/', "--")))
+            .join("snapshots")
+            .join(commit);
+        std::fs::create_dir_all(&snapshot).unwrap();
+        for name in files {
+            std::fs::write(snapshot.join(name), b"not a model").unwrap();
+        }
+        snapshot
+    }
+
+    /// A cold cache must refuse before anything resolves the model, and say
+    /// so in the returned message rather than looking like an ordinary load
+    /// failure — the caller only ever sees the `String`.
     ///
     /// Not gated on `RUN_FASTEMBED_TESTS`: the whole point is that no network
     /// call happens, so this is safe to run in CI. If the guard were removed
-    /// this test would either download ~30 MB or fail with a load error, and
+    /// this test would either download ~67 MB or fail with a load error, and
     /// neither says "refused".
     #[cfg(feature = "ml")]
     #[test]
     fn try_new_refuses_while_offline() {
+        let cache = tempfile::tempdir().unwrap();
         let _guard = crate::test_support::env_lock();
         std::env::set_var(crate::offline::OFFLINE_ENV, "1");
-        let result = EmbeddingScorer::try_new();
+        let result = EmbeddingScorer::try_new_pinned(cache.path());
         std::env::remove_var(crate::offline::OFFLINE_ENV);
 
         let err = result.err().expect("guard must refuse while offline");
         assert!(err.contains("refused"), "{err}");
         assert!(err.contains(crate::offline::OFFLINE_ENV), "{err}");
         assert!(err.contains("fastembed embedding model download"), "{err}");
+    }
+
+    /// A pre-seeded snapshot is the air-gapped setup: the guard sits on the
+    /// cache miss only, so a cached snapshot gets past it. The dummy ONNX
+    /// bytes then fail to load (or ORT is missing), which is fine; what
+    /// matters is that the failure is not the refusal.
+    #[cfg(feature = "ml")]
+    #[test]
+    fn a_cached_snapshot_is_not_refused_offline() {
+        let cache = tempfile::tempdir().unwrap();
+        fake_snapshot(cache.path(), DEFAULT_MODEL_REVISION, &DEFAULT_MODEL_FILES);
+        let _guard = crate::test_support::env_lock();
+        let pin = std::env::var_os("HEADROOM_HF_PIN");
+        std::env::remove_var("HEADROOM_HF_PIN");
+        std::env::set_var(crate::offline::OFFLINE_ENV, "1");
+        let result = EmbeddingScorer::try_new_pinned(cache.path());
+        std::env::remove_var(crate::offline::OFFLINE_ENV);
+        if let Some(pin) = pin {
+            std::env::set_var("HEADROOM_HF_PIN", pin);
+        }
+
+        let err = result
+            .err()
+            .expect("dummy model bytes can never load into a session");
+        assert!(!err.contains("refused"), "{err}");
+    }
+
+    #[cfg(feature = "ml")]
+    #[test]
+    fn cached_snapshot_finds_the_pinned_commit() {
+        let cache = tempfile::tempdir().unwrap();
+        let snapshot = fake_snapshot(cache.path(), DEFAULT_MODEL_REVISION, &DEFAULT_MODEL_FILES);
+        assert_eq!(
+            cached_snapshot(cache.path(), DEFAULT_MODEL_REVISION),
+            Some(snapshot)
+        );
+    }
+
+    /// The regression this pin exists for: a snapshot of whatever `main`
+    /// pointed to must not satisfy the pinned lookup.
+    #[cfg(feature = "ml")]
+    #[test]
+    fn cached_snapshot_ignores_other_commits() {
+        let cache = tempfile::tempdir().unwrap();
+        let main_commit = "aa8f8b060edb00e03bfdd08813a2949946c8ba55";
+        let snapshot = fake_snapshot(cache.path(), main_commit, &DEFAULT_MODEL_FILES);
+        let refs = snapshot.parent().unwrap().parent().unwrap().join("refs");
+        std::fs::create_dir_all(&refs).unwrap();
+        std::fs::write(refs.join("main"), main_commit).unwrap();
+
+        assert_eq!(cached_snapshot(cache.path(), DEFAULT_MODEL_REVISION), None);
+        // `main` still resolves through its ref, for HEADROOM_HF_PIN=off.
+        assert_eq!(cached_snapshot(cache.path(), "main"), Some(snapshot));
+    }
+
+    #[cfg(feature = "ml")]
+    #[test]
+    fn cached_snapshot_needs_every_file() {
+        let cache = tempfile::tempdir().unwrap();
+        fake_snapshot(
+            cache.path(),
+            DEFAULT_MODEL_REVISION,
+            &DEFAULT_MODEL_FILES[..DEFAULT_MODEL_FILES.len() - 1],
+        );
+        assert_eq!(cached_snapshot(cache.path(), DEFAULT_MODEL_REVISION), None);
+    }
+
+    /// The case from review: an explicit, empty `HF_HUB_CACHE` next to a
+    /// complete snapshot in the default cache under `HOME`. Python looks only
+    /// in the explicit cache and downloads there, so Rust must not find the
+    /// `HOME` copy, for the pinned revision or for floating `main`
+    /// (`HEADROOM_HF_PIN=off`). `try_new` is `try_new_pinned` on
+    /// `hub_cache_dir()`, which looks up and downloads only in the
+    /// directory it is given (see the two offline tests above), so checking
+    /// the resolver and the lookup here covers it without flipping
+    /// `HEADROOM_OFFLINE` for a long stretch of the parallel run.
+    #[cfg(feature = "ml")]
+    #[test]
+    fn an_empty_explicit_cache_ignores_a_lower_priority_snapshot() {
+        let _guard = crate::test_support::env_lock();
+        let _env = CacheEnv::cleared();
+        let explicit = tempfile::tempdir().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        let default_cache = home.path().join(".cache").join("huggingface").join("hub");
+        // A complete pinned snapshot, plus an older `main` behind refs/main.
+        let pinned = fake_snapshot(&default_cache, DEFAULT_MODEL_REVISION, &DEFAULT_MODEL_FILES);
+        let main_commit = "aa8f8b060edb00e03bfdd08813a2949946c8ba55";
+        let main = fake_snapshot(&default_cache, main_commit, &DEFAULT_MODEL_FILES);
+        let refs = main.parent().unwrap().parent().unwrap().join("refs");
+        std::fs::create_dir_all(&refs).unwrap();
+        std::fs::write(refs.join("main"), main_commit).unwrap();
+        std::env::set_var("HOME", home.path());
+        std::env::set_var("USERPROFILE", home.path());
+
+        std::env::set_var("HF_HUB_CACHE", explicit.path());
+        let cache = crate::hf_cache::hub_cache_dir().expect("cache directory");
+        assert_eq!(cache, explicit.path());
+        assert_eq!(cached_snapshot(&cache, DEFAULT_MODEL_REVISION), None);
+        assert_eq!(cached_snapshot(&cache, "main"), None);
+
+        // Without the explicit cache, the same HOME snapshots are the cache.
+        std::env::remove_var("HF_HUB_CACHE");
+        let cache = crate::hf_cache::hub_cache_dir().expect("cache directory");
+        assert_eq!(cache, default_cache);
+        assert_eq!(
+            cached_snapshot(&cache, DEFAULT_MODEL_REVISION),
+            Some(pinned)
+        );
+        assert_eq!(cached_snapshot(&cache, "main"), Some(main));
+    }
+
+    /// The download asks the Hub for the pinned commit. This is what Python's
+    /// fastembed silently dropped; building the URL makes no network call.
+    #[cfg(feature = "ml")]
+    #[test]
+    fn download_requests_the_pinned_revision() {
+        let cache = tempfile::tempdir().unwrap();
+        let _guard = crate::test_support::env_lock();
+        std::env::remove_var(crate::offline::OFFLINE_ENV);
+        let repo = default_model_repo(cache.path(), DEFAULT_MODEL_REVISION).unwrap();
+        let url = repo.url(DEFAULT_MODEL_FILE);
+        assert!(
+            url.ends_with(&format!(
+                "/{DEFAULT_MODEL_REPO}/resolve/{DEFAULT_MODEL_REVISION}/{DEFAULT_MODEL_FILE}"
+            )),
+            "{url}"
+        );
+    }
+
+    #[cfg(feature = "ml")]
+    #[test]
+    fn pin_can_be_disabled() {
+        let _guard = crate::test_support::env_lock();
+        let pin = std::env::var_os("HEADROOM_HF_PIN");
+        std::env::set_var("HEADROOM_HF_PIN", " OFF ");
+        let disabled = default_model_revision();
+        std::env::remove_var("HEADROOM_HF_PIN");
+        let pinned = default_model_revision();
+        if let Some(pin) = pin {
+            std::env::set_var("HEADROOM_HF_PIN", pin);
+        }
+        assert_eq!(disabled, "main");
+        assert_eq!(pinned, DEFAULT_MODEL_REVISION);
     }
 
     /// Construct a stub scorer with `model = None` for offline-safe
@@ -472,7 +813,69 @@ mod tests {
         }
         let s = EmbeddingScorer::try_new().expect("model loads");
         assert!(s.is_available());
-        assert_eq!(s.model_name, "BGESmallENV15");
+        assert_eq!(s.model_name, "BAAI/bge-small-en-v1.5");
+    }
+
+    /// Rust half of the cross-language parity check: the pinned model must
+    /// reproduce the embeddings Python recorded (tests/parity/record_embedding.py)
+    /// within the fixture's tolerance. The Python half is
+    /// tests/test_fastembed_pinned_snapshot.py; both comparing against one
+    /// fixture bounds the drift between the two languages.
+    #[cfg(feature = "ml")]
+    #[test]
+    fn fastembed_matches_parity_fixture() {
+        if !fastembed_enabled() {
+            return;
+        }
+        let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tests/parity/fixtures/embedding/bge_small_en_v15_pinned.json");
+        let fixture: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).expect("fixture readable"))
+                .expect("fixture is JSON");
+        assert_eq!(fixture["repo"], DEFAULT_MODEL_REPO);
+        assert_eq!(fixture["revision"], DEFAULT_MODEL_REVISION);
+        let max_abs_diff = fixture["max_abs_diff"].as_f64().expect("max_abs_diff");
+        let texts: Vec<String> = fixture["texts"]
+            .as_array()
+            .expect("texts")
+            .iter()
+            .map(|t| t.as_str().expect("text").to_string())
+            .collect();
+        let expected: Vec<Vec<f64>> = fixture["embeddings"]
+            .as_array()
+            .expect("embeddings")
+            .iter()
+            .map(|row| {
+                row.as_array()
+                    .expect("row")
+                    .iter()
+                    .map(|v| v.as_f64().expect("float"))
+                    .collect()
+            })
+            .collect();
+
+        let s = EmbeddingScorer::try_new().expect("model loads");
+        let got = s
+            .model
+            .as_ref()
+            .unwrap()
+            .lock()
+            .unwrap()
+            .embed(texts.clone(), None)
+            .expect("embed");
+        assert_eq!(got.len(), expected.len());
+        for ((text, got), expected) in texts.iter().zip(&got).zip(&expected) {
+            assert_eq!(got.len(), expected.len(), "{text}");
+            let worst = got
+                .iter()
+                .zip(expected)
+                .map(|(g, e)| (*g as f64 - e).abs())
+                .fold(0.0_f64, f64::max);
+            assert!(
+                worst <= max_abs_diff,
+                "{text:?}: max |rust - fixture| = {worst:e} > {max_abs_diff:e}"
+            );
+        }
     }
 
     #[cfg(feature = "ml")]
