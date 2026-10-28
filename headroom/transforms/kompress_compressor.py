@@ -172,7 +172,7 @@ def _add_truncated_words(
         kept_ids.add(local_idx + chunk_start)
 
 
-def _real_token_count(attention_row) -> int:
+def _real_token_count(attention_row: Any) -> int:
     """Number of real (non-padding) tokens in an attention-mask row."""
     return sum(1 for mask in attention_row if mask)
 
