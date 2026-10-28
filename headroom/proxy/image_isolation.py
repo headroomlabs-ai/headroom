@@ -20,6 +20,12 @@ logger = logging.getLogger("headroom.proxy")
 _IMAGE_POOL_LOCK = threading.Lock()
 _IMAGE_POOL: ProcessPoolExecutor | None = None
 
+# Number of calls currently awaiting a result from ``_IMAGE_POOL``. A
+# timeout-driven reset tears down the whole single-worker pool (#4418), so it
+# must only run when the failing call is the *only* one using it. When other
+# requests are mid-flight their queued or running jobs must be left alone.
+_IMAGE_POOL_INFLIGHT = 0
+
 # Per-worker-process cached compressor. The image pool is a persistent
 # single-worker ProcessPoolExecutor, so building a fresh ImageCompressor (and,
 # inside it, a fresh ONNX router loading native ort.InferenceSession models) on
@@ -126,6 +132,23 @@ def _image_pool() -> ProcessPoolExecutor:
         return _IMAGE_POOL
 
 
+def _acquire_image_pool() -> ProcessPoolExecutor:
+    """Return the shared pool and record one more call waiting on it."""
+    global _IMAGE_POOL_INFLIGHT
+    pool = _image_pool()
+    with _IMAGE_POOL_LOCK:
+        _IMAGE_POOL_INFLIGHT += 1
+        return pool
+
+
+def _release_image_pool() -> None:
+    """Record that a call waiting on the shared pool has finished."""
+    global _IMAGE_POOL_INFLIGHT
+    with _IMAGE_POOL_LOCK:
+        if _IMAGE_POOL_INFLIGHT > 0:
+            _IMAGE_POOL_INFLIGHT -= 1
+
+
 def _reset_image_pool(pool: ProcessPoolExecutor | None = None) -> None:
     """Drop ``pool`` (default: the current one) and kill its worker.
 
@@ -134,11 +157,19 @@ def _reset_image_pool(pool: ProcessPoolExecutor | None = None) -> None:
     discarded, while the next request cold-loaded the models in a fresh worker
     beside it. Only the current pool is unpublished, so a call that fails
     after another request already rebuilt the pool leaves the rebuilt one alone.
+
+    The reset kills the single shared worker, so it also cancels or kills every
+    other call's queued or running job (#4418). Refuse the destructive teardown
+    while any other call is still using the pool: those requests fail open on
+    their own and keep their compression instead of losing it to this one's
+    timeout.
     """
     global _IMAGE_POOL
     with _IMAGE_POOL_LOCK:
         if pool is None:
             pool = _IMAGE_POOL
+        if _IMAGE_POOL_INFLIGHT > 1 and _IMAGE_POOL is pool:
+            return
         if _IMAGE_POOL is pool:
             _IMAGE_POOL = None
     if pool is None:
@@ -158,11 +189,25 @@ async def run_image_compression_isolated(
 ) -> tuple[list[dict[str, Any]], dict[str, Any] | None]:
     loop = asyncio.get_running_loop()
     pool: ProcessPoolExecutor | None = None
+    acquired = False
     try:
         deadline = time.time() + timeout * _OCR_BUDGET_FRACTION
-        pool = _image_pool()
+        pool = _acquire_image_pool()
+        acquired = True
         future = loop.run_in_executor(pool, _IMAGE_WORKER, messages, provider, deadline)
         return await asyncio.wait_for(future, timeout=timeout)
+    except asyncio.CancelledError:
+        # A cancelled queued job (pool reset) or a real task cancellation both
+        # surface here. ``asyncio.CancelledError`` is a ``BaseException`` since
+        # 3.8, so the ``except Exception`` clauses below (and at the call sites)
+        # never saw it and it escaped the request handler instead of failing
+        # open. Re-raise only when *this* task is genuinely being cancelled;
+        # otherwise forward the original payload (#4418).
+        if asyncio.current_task() is not None and asyncio.current_task().cancelling():
+            raise
+        logger.warning("Image compression worker cancelled; forwarding original image payload")
+        _reset_image_pool(pool)
+        return messages, None
     except BrokenProcessPool:
         logger.warning("Image compression worker crashed; forwarding original image payload")
         _reset_image_pool(pool)
@@ -178,3 +223,6 @@ async def run_image_compression_isolated(
         )
         _reset_image_pool(pool)
         return messages, None
+    finally:
+        if acquired:
+            _release_image_pool()

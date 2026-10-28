@@ -21,10 +21,12 @@ from headroom.proxy.handlers.openai import OpenAIHandlerMixin
 @pytest.fixture(autouse=True)
 def _reset_image_pool() -> None:
     image_isolation._reset_image_pool()
+    image_isolation._IMAGE_POOL_INFLIGHT = 0
     try:
         yield
     finally:
         image_isolation._reset_image_pool()
+        image_isolation._IMAGE_POOL_INFLIGHT = 0
         image_isolation._IMAGE_WORKER = image_isolation._compress_messages_worker
 
 
