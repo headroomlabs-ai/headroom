@@ -1295,6 +1295,69 @@ class TestSaveRecovery:
         assert rows[0][2]["evidence_count"] == 6
 
     @pytest.mark.asyncio
+    async def test_repeated_index_repair_failures_remain_pending(self, tmp_path):
+        db = tmp_path / "memory.db"
+        _init_db(db)
+        backend = _ObservedBackend(db)
+        backend.fail_after_commit = True
+        refresh = backend.refresh_memory_indexes
+        refresh_attempted = asyncio.Event()
+        failures_left = 2
+
+        async def failing_refresh(memory_id):
+            nonlocal failures_left
+            try:
+                if failures_left:
+                    failures_left -= 1
+                    raise RuntimeError("index unavailable")
+                await refresh(memory_id)
+            finally:
+                refresh_attempted.set()
+
+        backend.refresh_memory_indexes = failing_refresh
+        learner = TrafficLearner(backend=backend, min_evidence=3)
+        content = "Use uv for Python packages."
+        await learner.start()
+        try:
+            await self._feed(learner, content, 3)
+            await asyncio.wait_for(backend.attempted.wait(), 2)
+            committed = _read_traffic_rows(db)
+            assert len(committed) == 1
+            memory_id, _, metadata = committed[0]
+            h = metadata["content_hash"]
+            save_token = metadata["learner_save_token"]
+            assert h not in learner._saved_hashes
+            assert learner._pattern_counts[h][1] == 3
+            assert learner._save_tokens[h] == save_token
+
+            for extra, expected in ((2, 5), (1, 6)):
+                refresh_attempted.clear()
+                await self._feed(learner, content, extra)
+                await asyncio.wait_for(refresh_attempted.wait(), 2)
+                rows = _read_traffic_rows(db)
+                assert len(rows) == 1
+                assert rows[0][0] == memory_id
+                assert rows[0][2]["evidence_count"] == expected
+                assert rows[0][2]["learner_saved_evidence"] == expected
+                assert h not in learner._saved_hashes
+                assert learner._pattern_counts[h][1] == expected
+                assert learner._save_tokens[h] == save_token
+
+            refresh_attempted.clear()
+            await self._feed(learner, content, 1)
+            await asyncio.wait_for(refresh_attempted.wait(), 2)
+            rows = _read_traffic_rows(db)
+            assert len(rows) == 1
+            assert rows[0][0] == memory_id
+            assert rows[0][2]["evidence_count"] == 7
+            assert rows[0][2]["learner_saved_evidence"] == 7
+            assert h in learner._saved_hashes
+            assert h not in learner._pattern_counts
+            assert h not in learner._save_tokens
+        finally:
+            await learner.stop()
+
+    @pytest.mark.asyncio
     async def test_late_reconciliation_preserves_other_and_already_counted_sightings(
         self, tmp_path
     ):

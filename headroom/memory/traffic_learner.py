@@ -1667,6 +1667,8 @@ class TrafficLearner:
                     memory_id,
                     e,
                 )
+                if save_attempt is not None:
+                    raise
         return updated
 
     # =========================================================================
