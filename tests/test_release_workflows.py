@@ -156,6 +156,29 @@ def test_every_published_docker_variant_includes_bedrock_auth_dependencies() -> 
     assert {"boto3", "botocore"} <= bedrock_names
 
 
+def test_every_docker_variant_includes_the_redis_extra() -> None:
+    """Without the client, HEADROOM_COMPRESS_SESSION_STORE=redis:// stops
+    startup and HEADROOM_CCR_BACKEND=redis falls back to a per-process store,
+    so the 0.42 image could use neither. Keep the Dockerfile default and every
+    bake target on [redis]."""
+    dockerfile = (ROOT / "Dockerfile").read_text(encoding="utf-8")
+    defaults = re.findall(r"^ARG HEADROOM_EXTRAS=(\S+)$", dockerfile, re.MULTILINE)
+    assert len(defaults) == 1, defaults
+    assert "redis" in defaults[0].split(",")
+
+    bake = (ROOT / "docker-bake.hcl").read_text(encoding="utf-8")
+    targets = re.findall(r'^\s*HEADROOM_EXTRAS = "([^"]*)"$', bake, re.MULTILINE)
+    assert len(targets) == 9
+    assert all("redis" in extras.split(",") for extras in targets), targets
+
+    project = tomllib.loads((ROOT / "pyproject.toml").read_text(encoding="utf-8"))
+    redis_names = {
+        Requirement(requirement).name
+        for requirement in project["project"]["optional-dependencies"]["redis"]
+    }
+    assert "redis" in redis_names
+
+
 def test_public_docker_instructions_use_the_current_organization_package() -> None:
     """Do not send users back to the personal GHCR package frozen at 0.27.0."""
     public_docs = (
