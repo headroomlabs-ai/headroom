@@ -1358,6 +1358,137 @@ class TestSaveRecovery:
             await learner.stop()
 
     @pytest.mark.asyncio
+    async def test_shutdown_keeps_failed_evidence_and_drains_other_queued_saves(self, tmp_path):
+        import sqlite3
+
+        db = tmp_path / "memory.db"
+        _init_db(db)
+        failed = "Use uv for Python packages."
+        saved = "Keep pull request descriptions short."
+        with sqlite3.connect(db) as conn:
+            conn.execute(
+                "CREATE TRIGGER reject_one_save BEFORE INSERT ON memories "
+                "WHEN NEW.content = 'Use uv for Python packages.' "
+                "BEGIN SELECT RAISE(ABORT, 'backend unavailable'); END"
+            )
+        backend = _FakeBackend(db)
+        learner = TrafficLearner(backend=backend, min_evidence=3)
+        await self._feed(learner, failed, 3)
+        await self._feed(learner, saved, 3)
+        await learner.stop()
+        assert {content: meta["evidence_count"] for _, content, meta in _read_traffic_rows(db)} == {
+            saved: 3
+        }
+
+        with sqlite3.connect(db) as conn:
+            conn.execute("DROP TRIGGER reject_one_save")
+        restored = TrafficLearner(backend=backend, min_evidence=3)
+        await restored.start()
+        try:
+            await self._feed(restored, failed, 1)
+            await _wait_for_evidence(db, failed, 4)
+        finally:
+            await restored.stop()
+        assert {content: meta["evidence_count"] for _, content, meta in _read_traffic_rows(db)} == {
+            failed: 4,
+            saved: 3,
+        }
+
+    @pytest.mark.asyncio
+    async def test_reconciliation_retries_a_failed_sql_update_without_losing_evidence(
+        self, tmp_path
+    ):
+        import sqlite3
+
+        db = tmp_path / "memory.db"
+        _init_db(db)
+        backend = _ObservedBackend(db)
+        backend.fail_after_commit = True
+        learner = TrafficLearner(backend=backend, min_evidence=3)
+        reconciled = asyncio.Event()
+        bump = learner._bump_persisted_evidence
+
+        async def observed_bump(*args, **kwargs):
+            try:
+                return await bump(*args, **kwargs)
+            finally:
+                reconciled.set()
+
+        learner._bump_persisted_evidence = observed_bump
+        content = "Use uv for Python packages."
+        await learner.start()
+        try:
+            await self._feed(learner, content, 3)
+            await asyncio.wait_for(backend.attempted.wait(), 2)
+            committed = _read_traffic_rows(db)
+            assert len(committed) == 1
+            memory_id, _, metadata = committed[0]
+            h = metadata["content_hash"]
+            token = metadata["learner_save_token"]
+            with sqlite3.connect(db) as conn:
+                conn.execute(
+                    "CREATE TRIGGER reject_update BEFORE UPDATE ON memories "
+                    "BEGIN SELECT RAISE(ABORT, 'backend unavailable'); END"
+                )
+            await self._feed(learner, content, 2)
+            await asyncio.wait_for(reconciled.wait(), 2)
+            rows = _read_traffic_rows(db)
+            assert len(rows) == 1
+            assert rows[0][0] == memory_id
+            assert rows[0][2]["evidence_count"] == 3
+            assert rows[0][2]["learner_saved_evidence"] == 3
+            assert learner._pattern_counts[h][1] == 5
+            assert learner._save_tokens[h] == token
+            assert h not in learner._saved_hashes
+
+            with sqlite3.connect(db) as conn:
+                conn.execute("DROP TRIGGER reject_update")
+            reconciled.clear()
+            await self._feed(learner, content, 1)
+            await asyncio.wait_for(reconciled.wait(), 2)
+            rows = _read_traffic_rows(db)
+            assert len(rows) == 1
+            assert rows[0][0] == memory_id
+            assert rows[0][2]["evidence_count"] == 6
+            assert rows[0][2]["learner_saved_evidence"] == 6
+            assert h in learner._saved_hashes
+            assert h not in learner._pattern_counts
+            assert h not in learner._save_tokens
+        finally:
+            await learner.stop()
+
+    @pytest.mark.asyncio
+    async def test_confirmed_evidence_survives_best_effort_index_refresh_failure(self, tmp_path):
+        db = tmp_path / "memory.db"
+        _init_db(db)
+        backend = _FakeBackend(db)
+        learner = TrafficLearner(backend=backend, min_evidence=3)
+        content = "Use uv for Python packages."
+        await learner.start()
+        try:
+            await self._feed(learner, content, 3)
+            await _wait_for_saved(learner, 1, db)
+            committed = _read_traffic_rows(db)
+            assert len(committed) == 1
+            memory_id, _, metadata = committed[0]
+            h = metadata["content_hash"]
+
+            async def failing_refresh(memory_id):
+                raise RuntimeError("index unavailable")
+
+            backend.refresh_memory_indexes = failing_refresh
+            await self._feed(learner, content, 2)
+            rows = _read_traffic_rows(db)
+            assert len(rows) == 1
+            assert rows[0][0] == memory_id
+            assert rows[0][2]["evidence_count"] == 5
+            assert h in learner._saved_hashes
+            assert h not in learner._pattern_counts
+            assert h not in learner._save_tokens
+        finally:
+            await learner.stop()
+
+    @pytest.mark.asyncio
     async def test_late_reconciliation_preserves_other_and_already_counted_sightings(
         self, tmp_path
     ):
