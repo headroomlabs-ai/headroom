@@ -391,6 +391,53 @@ print(f"CCR Key: {result.ccr_key}")  # For retrieval
 
 ---
 
+---
+
+## Boolean Compression
+
+Headroom includes a deterministic boolean algebra compressor that reduces truth tables and boolean expressions to their minimal sum-of-products (SOP) form using the Quine-McCluskey algorithm via [boolean-algebra-engine](https://github.com/Shrivastava-Aditya/bool-LLM-ngn). For structured inputs, the output is logically equivalent to the parsed function. The optional natural-language path first uses an LLM to infer a function and is therefore probabilistic, not lossless.
+
+### Content types handled
+
+| Input | Example | Savings |
+|-------|---------|---------|
+| Markdown truth table | 8-row `\| A \| B \| C \| Out \|` table | ~91% |
+| English-operator expression | `A AND B OR NOT C` | ~71% |
+| Natural-language logic (NL path) | "alarm on when door open and motion detected" | ~87% |
+
+### Installation
+
+```bash
+# Algorithmic path only (no API key needed)
+pip install "headroom-ai[boolean]"
+
+# With natural-language extraction (Anthropic)
+pip install "headroom-ai[boolean,nl-anthropic]"
+export ANTHROPIC_API_KEY=sk-...
+
+# With natural-language extraction (OpenAI)
+pip install "headroom-ai[boolean,nl-openai]"
+export OPENAI_API_KEY=sk-...
+```
+
+If `boolean-algebra-engine` is not installed, both compressors are silently unavailable and headroom falls back to Kompress. No import error is raised at startup.
+
+### How detection works
+
+The router detects boolean content before routing:
+
+- **Truth tables**: A header row of variable names followed by rows of `0`/`1` values (markdown `|` pipes supported).
+- **Symbolic expressions**: Single uppercase-letter variables (`A`, `B`, `C`) combined with `AND`/`OR`/`NOT`, `&&`/`||`/`!`, `.`/`+`/`~`, or Unicode `¬`.
+- **Natural-language logic** (NL path, optional): Short prose describing a logic function using signal phrases like *"output is high when … and …"* or *"alarm turns on if … but not …"*.
+
+Source code and general prose that happen to use `and`/`or` are **not** detected — the detector requires single-letter uppercase variables or an explicit truth table structure to avoid false positives.
+
+### Telemetry
+
+The Headroom integration does not send usage events to the boolean-algebra-engine PostHog project or create a second analytics channel. Installing or using this optional compressor does not change Headroom's telemetry policy.
+
+---
+
 ## See Also
 
 - [Transforms Reference](transforms.md) - Other compression transforms
