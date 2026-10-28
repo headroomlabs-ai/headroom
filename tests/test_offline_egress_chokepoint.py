@@ -3205,8 +3205,8 @@ class TestDocsMatchTheGuarantee:
 
 _RUST_EGRESS_PATTERNS = re.compile(
     r"""
-      hf_hub::api::(?:sync|tokio)::Api(?:Builder)?::new\(
-    | (?<![\w:])Api(?:Builder)?::new\(
+      hf_hub::api::(?:sync|tokio)::Api(?:Builder)?::(?:new|from_env|from_cache)\(
+    | (?<![\w:])Api(?:Builder)?::(?:new|from_env|from_cache)\(
     | (?<![\w:])TextEmbedding::try_new\w*\(
     | (?<![\w:])reqwest::(?:Client::(?:new|builder)|get|post)\(
     | (?<![\w:])ureq::(?:agent|builder|get|post|put|delete|request)\(
@@ -3220,6 +3220,14 @@ _RUST_FN = re.compile(
 )
 
 _RUST_ALLOWLIST: dict[str, tuple[int, str]] = {
+    "headroom-core/src/relevance/embedding.rs": (
+        1,
+        "cache-only: TextEmbedding::try_new_from_user_defined in load_snapshot "
+        "builds the ONNX session from bytes already read off disk and has no "
+        "Hub client at all. The files reach the disk through "
+        "default_model_repo, whose ApiBuilder is guarded, and only on a cache "
+        "miss, so a pre-seeded air-gapped host still loads.",
+    ),
     "headroom-proxy/src/proxy.rs": (
         1,
         "user-traffic: the reqwest client the Rust proxy forwards the caller's "
@@ -3326,7 +3334,13 @@ class TestRustEgressChokepointCoverage:
             "headroom-core/src/relevance/embedding.rs",
         ):
             assert relpath in sites, f"{relpath} has no detected egress site at all"
-            assert all(site.guarded for site in sites[relpath]), (
+            # Every site is guarded, except the cache-only loads the allowlist
+            # counts for the file (embedding.rs: the user-defined model load).
+            unguarded = [site for site in sites[relpath] if not site.guarded]
+            assert len(unguarded) < len(sites[relpath]), (
+                f"{relpath} has no egress site the Rust sweep sees as guarded"
+            )
+            assert len(unguarded) == _RUST_ALLOWLIST.get(relpath, (0, ""))[0], (
                 f"{relpath} has an egress site the Rust sweep does not see as guarded"
             )
 

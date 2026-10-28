@@ -176,8 +176,10 @@ pytorch-mps = [
 ]
 # Semantic relevance scoring with embeddings.
 # Uses `fastembed` (BAAI/bge-small-en-v1.5 by default — 33M params,
-# 384 dims, ~67 MB quantized ONNX), loaded from a pinned
-# Qdrant/bge-small-en-v1.5-onnx-Q snapshot. Replaced sentence-transformers in
+# 384 dims, ~67 MB quantized ONNX). The Rust scorer (`fastembed` crate)
+# loads the same pinned Qdrant/bge-small-en-v1.5-onnx-Q snapshot, so both
+# languages run the same ONNX file; tests/parity/fixtures/embedding/
+# bounds the remaining ONNX Runtime drift. Replaced sentence-transformers in
 # Stage 3c.1 — fastembed is faster (~2-3x), smaller (no torch
 # dependency), and outranks all-MiniLM-L6-v2 on MTEB by ~6 points.
 # >=0.6.0 for `specific_model_path`, which the pinned-snapshot load needs.
