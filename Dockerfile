@@ -53,8 +53,7 @@ COPY headroom/ headroom/
 ARG HEADROOM_EXTRAS=proxy,code,bedrock
 # `uv pip install` ignores [tool.uv] override-dependencies (uv.lock only), so
 # pass them explicitly: the image gets the security overrides the lock has
-# (pillow 13 over fastembed's <13 cap). Python 3.10 has no tomllib: pip's
-# vendored tomli reads the file there.
+# (pillow 13 over fastembed's <13 cap).
 RUN --mount=type=cache,target=/root/.cache/uv \
     --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/usr/local/cargo/git \
