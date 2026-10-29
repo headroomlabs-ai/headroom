@@ -131,7 +131,8 @@ def test_heredoc_body_is_not_split_into_a_bogus_read() -> None:
 
 
 @pytest.mark.parametrize("flag", ["-n", "-ne", "-En", "--quiet", "--silent"])
-def test_quiet_sed_output_reaches_read_protection(flag: str, monkeypatch) -> None:
+@pytest.mark.parametrize("comment", ["", " # avoid -i here", " # --unknown", " # author's note"])
+def test_quiet_sed_output_reaches_read_protection(flag: str, comment: str, monkeypatch) -> None:
     monkeypatch.setenv("HEADROOM_PROTECT_READS", "1")
     content = "def compute(value):\n    return value * 2\n" * 20
     messages = [
@@ -145,7 +146,7 @@ def test_quiet_sed_output_reaches_read_protection(flag: str, monkeypatch) -> Non
                     "type": "function",
                     "function": {
                         "name": "Bash",
-                        "arguments": json.dumps({"command": f"sed {flag} '1,60p' foo.py"}),
+                        "arguments": json.dumps({"command": f"sed {flag} '1,60p' foo.py{comment}"}),
                     },
                 }
             ],
@@ -163,3 +164,29 @@ def test_quiet_sed_output_reaches_read_protection(flag: str, monkeypatch) -> Non
     result = router.apply(messages, EstimatingTokenCounter(), protect_recent=0)
     assert "router:read_protected" in result.transforms_applied
     assert result.messages[2]["content"] == content
+
+
+@pytest.mark.parametrize(
+    ("command", "expected"),
+    [
+        ("sed -n '1,60p' foo.py # avoid -i here", True),
+        ("sed -n '1,60p' foo.py # --unknown", True),
+        ("sed -n '1,60p' foo.py # author's note", True),
+        ("sed -n '1,60p' foo.py # unclosed \"quote", True),
+        ("sed -n '1,60p' 'foo#bar.py'", True),
+        ('sed -n "1,60p" "foo#bar.py"', True),
+        ("sed -n '1,60p' foo#bar.py", True),
+        (r"sed -n '1,60p' foo\#bar.py", True),
+        ("sed -n '/# marker/p' foo.py", True),
+        # Literal hashes must not hide real in-place options that follow them.
+        ("sed -n '1,60p' foo#bar.py -i", False),
+        ("sed -n '1,60p' 'foo#bar.py' -i", False),
+        (r"sed -n '1,60p' foo\#bar.py -i", False),
+        (r"sed -n '1,60p' foo\ #bar.py -i", False),
+        ("sed -n '/# marker/p' foo.py -i", False),
+        ("sed -n '1,60p' foo.py -i # --quiet", False),
+        ("sed -n 'unterminated # quote", False),
+    ],
+)
+def test_sed_shell_comments_and_literal_hashes(command: str, expected: bool) -> None:
+    assert _is_read_command(command) is expected

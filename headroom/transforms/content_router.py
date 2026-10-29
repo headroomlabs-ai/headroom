@@ -891,12 +891,37 @@ def _segment_is_read(c: str) -> bool:
     return not _LOCKFILE_RE.search(c)
 
 
+def _strip_shell_comment(command: str) -> str:
+    """Strip a comment at an unquoted word boundary, retaining literal hashes."""
+    quote = ""
+    escaped = False
+    word_start = True
+    for i, char in enumerate(command):
+        if escaped:
+            escaped = False
+            continue
+        if char == "\\" and quote != "'":
+            escaped = True
+            word_start = False
+        elif quote:
+            if char == quote:
+                quote = ""
+        elif char in {"'", '"'}:
+            quote = char
+            word_start = False
+        elif char == "#" and word_start:
+            return command[:i]
+        else:
+            word_start = char.isspace()
+    return command
+
+
 def _sed_is_quiet_read(rest: list[str]) -> bool:
     """Recognize quiet sed options without treating script arguments as flags."""
     try:
         # _bash_program retains shell quotes in its whitespace-split arguments.
         # Reconstruct them before parsing options, including grouped flags (-ne).
-        args = shlex.split(" ".join(rest))
+        args = shlex.split(_strip_shell_comment(" ".join(rest)))
     except ValueError:
         return False
     # GNU -l takes a line length; BSD -l is a line-buffering flag. Recognize
