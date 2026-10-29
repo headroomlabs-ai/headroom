@@ -23,13 +23,15 @@ resolution-markers = [
 [manifest]
 constraints = [
     { name = "aiohttp", specifier = ">=3.14.4" },
+    { name = "certifi", specifier = ">=2026.10.19" },
     { name = "cryptography", specifier = ">=50.0.0" },
+    { name = "filelock", marker = "python_full_version >= '3.11'", specifier = ">=4.2.1" },
     { name = "gitpython", specifier = ">=3.1.58" },
     { name = "langsmith", specifier = ">=0.9.0" },
     { name = "lxml-html-clean", specifier = ">=0.4.5" },
     { name = "pydantic-settings", specifier = ">=2.14.2" },
     { name = "pygments", specifier = ">=2.20.0" },
-    { name = "setuptools", specifier = ">=83.0.0" },
+    { name = "setuptools", specifier = ">=84.1.0" },
     { name = "transformers", specifier = ">=5.5.0" },
 ]
 overrides = [{ name = "pillow", specifier = ">=13.0.0" }]
@@ -1765,7 +1767,7 @@ requires-dist = [
     { name = "openai", marker = "extra == 'proxy'", specifier = ">=2.14.0" },
     { name = "openpyxl", marker = "extra == 'dev'", specifier = ">=3.1.0" },
     { name = "openpyxl", marker = "extra == 'spreadsheet'", specifier = ">=3.1.0" },
-    { name = "opentelemetry-api", specifier = ">=1.24.0" },
+    { name = "opentelemetry-api", specifier = ">=1.45.1" },
     { name = "opentelemetry-exporter-otlp-proto-http", marker = "extra == 'dev'", specifier = ">=1.24.0" },
     { name = "opentelemetry-exporter-otlp-proto-http", marker = "extra == 'otel'", specifier = ">=1.24.0" },
     { name = "opentelemetry-sdk", marker = "extra == 'dev'", specifier = ">=1.24.0" },
@@ -1798,7 +1800,7 @@ requires-dist = [
     { name = "starlette", marker = "extra == 'mcp'", specifier = ">=0.27.0" },
     { name = "strands-agents", marker = "extra == 'strands'", specifier = ">=0.1.0" },
     { name = "tiktoken", specifier = ">=0.5.0" },
-    { name = "tomlkit", specifier = ">=0.13.0,<1.0" },
+    { name = "tomlkit", specifier = ">=0.15.0,<1.0" },
     { name = "torch", marker = "sys_platform == 'darwin' and extra == 'pytorch-mps'", specifier = ">=2.12.1" },
     { name = "torch", marker = "(platform_machine != 'x86_64' and extra == 'ml') or (sys_platform != 'darwin' and extra == 'ml')", specifier = ">=2.12.1" },
     { name = "torch", marker = "(platform_machine != 'x86_64' and extra == 'voice') or (sys_platform != 'darwin' and extra == 'voice')", specifier = ">=2.12.1" },
