@@ -14,7 +14,7 @@ import time
 import uuid
 from collections.abc import Awaitable, Callable
 from datetime import datetime
-from functools import lru_cache, partial
+from functools import lru_cache
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 from urllib.parse import urlsplit
@@ -525,7 +525,6 @@ class AnthropicHandlerMixin:
         *,
         fail_open: bool = True,  # noqa: ANN001
     ):
->>>>>>> 685151f4 (fix(proxy): preserve budget and timeout guarantees)
         from headroom.proxy.token_counting import count_tokens_offloaded
 
         return await count_tokens_offloaded(self, model, messages, fail_open=fail_open)
@@ -4017,6 +4016,7 @@ class AnthropicHandlerMixin:
                 )
 
             pending_budget_error: Response | None = None
+            budget_refusal_recorded = False
 
             async def _guard_outbound(final_body, continuation_headers):
                 nonlocal pending_budget_error
@@ -4065,6 +4065,72 @@ class AnthropicHandlerMixin:
                 if refusal is not None:
                     pending_budget_error = refusal
                 return refusal
+
+            async def _return_pending_budget_error(response=None) -> Response:
+                nonlocal budget_refusal_recorded
+                assert pending_budget_error is not None
+                await _finalize_pre_upstream()
+                if not budget_refusal_recorded:
+                    usage: dict[str, Any] = {}
+                    if response is not None:
+                        try:
+                            response_body = response.json()
+                            if isinstance(response_body, dict) and isinstance(
+                                response_body.get("usage"), dict
+                            ):
+                                usage = response_body["usage"]
+                        except (ValueError, TypeError):
+                            pass
+
+                    def _usage_count(key: str) -> int:
+                        value = usage.get(key)
+                        return (
+                            value if isinstance(value, int) and not isinstance(value, bool) else 0
+                        )
+
+                    input_tokens = _usage_count("input_tokens")
+                    cache_read_tokens = _usage_count("cache_read_input_tokens")
+                    cache_write_tokens = _usage_count("cache_creation_input_tokens")
+                    uncached_input_tokens = max(
+                        0, input_tokens - cache_read_tokens - cache_write_tokens
+                    )
+                    await self._record_request_outcome(
+                        RequestOutcome(
+                            request_id=request_id,
+                            provider=provider_name,
+                            model=model,
+                            status_code=pending_budget_error.status_code,
+                            original_tokens=original_tokens,
+                            optimized_tokens=optimized_tokens,
+                            provider_input_tokens=(
+                                uncached_input_tokens + cache_read_tokens + cache_write_tokens
+                            ),
+                            output_tokens=_usage_count("output_tokens"),
+                            tokens_saved=tokens_saved,
+                            attempted_input_tokens=optimized_tokens + tokens_saved,
+                            cache_read_tokens=cache_read_tokens,
+                            cache_write_tokens=cache_write_tokens,
+                            uncached_input_tokens=uncached_input_tokens,
+                            total_latency_ms=(time.time() - start_time) * 1000,
+                            overhead_ms=optimization_latency,
+                            pipeline_timing=pipeline_timing,
+                            transforms_applied=tuple(transforms_applied),
+                            num_messages=len(body.get("messages", [])),
+                            tags=tags,
+                            client=client,
+                            turn_id=compute_turn_id(
+                                model, body.get("system"), body.get("messages")
+                            ),
+                            request_messages=original_client_messages
+                            if self.config.log_full_messages
+                            else None,
+                            compressed_messages=body.get("messages")
+                            if self.config.log_full_messages
+                            else None,
+                        )
+                    )
+                    budget_refusal_recorded = True
+                return pending_budget_error
 
             async def _prepare_budget_backend(backend):
                 if _bypass or not getattr(self.anthropic_provider, "_operator_context_limits", {}):
@@ -4689,14 +4755,13 @@ class AnthropicHandlerMixin:
 
                     async def _buffered_ccr_operation():
                         async with stage_timer.measure("upstream_connect"):
+
                             async def send_upstream(send_headers, send_body):
                                 is_original_body = send_body is body
                                 selected = selected_outbound if is_original_body else None
                                 if not is_original_body:
                                     try:
-                                        selected = await _guard_outbound(
-                                            send_body, send_headers
-                                        )
+                                        selected = await _guard_outbound(send_body, send_headers)
                                     except RuntimeError:
                                         if pending_budget_error is None:
                                             raise
@@ -4740,8 +4805,7 @@ class AnthropicHandlerMixin:
                             else:
                                 response = await send_upstream(headers, body)
                         if pending_budget_error is not None:
-                            await _finalize_pre_upstream()
-                            return pending_budget_error
+                            return await _return_pending_budget_error(response)
                         self.pipeline_extensions.emit(
                             PipelineStage.POST_SEND,
                             operation="proxy.request",
@@ -5124,8 +5188,7 @@ class AnthropicHandlerMixin:
                                     provider="anthropic",
                                 )
                                 if pending_budget_error is not None:
-                                    await _finalize_pre_upstream()
-                                    return pending_budget_error
+                                    return await _return_pending_budget_error(response)
                                 if final_resp_json is resp_json:
                                     # The handler intentionally returns the same
                                     # object for both a failed continuation and
@@ -5205,8 +5268,7 @@ class AnthropicHandlerMixin:
                                         )
                             except Exception as e:
                                 if pending_budget_error is not None:
-                                    await _finalize_pre_upstream()
-                                    return pending_budget_error
+                                    return await _return_pending_budget_error(response)
                                 import traceback
 
                                 logger.error(
@@ -5330,8 +5392,7 @@ class AnthropicHandlerMixin:
                                 # Continue with original response
 
                         if pending_budget_error is not None:
-                            await _finalize_pre_upstream()
-                            return pending_budget_error
+                            return await _return_pending_budget_error(response)
 
                         # Buffered response hooks run for every successful turn,
                         # not only the CCR branch. Reuse the request context so
@@ -5369,12 +5430,10 @@ class AnthropicHandlerMixin:
                                 )
                             except Exception:
                                 if pending_budget_error is not None:
-                                    await _finalize_pre_upstream()
-                                    return pending_budget_error
+                                    return await _return_pending_budget_error(response)
                                 raise
                             if pending_budget_error is not None:
-                                await _finalize_pre_upstream()
-                                return pending_budget_error
+                                return await _return_pending_budget_error(response)
                             _hook_usage.settle(hooked_json)
                             if hooked_json is not resp_json:
                                 resp_json = hooked_json
@@ -5900,8 +5959,7 @@ class AnthropicHandlerMixin:
                         raise
                     except Exception:
                         if pending_budget_error is not None:
-                            await _finalize_pre_upstream()
-                            return pending_budget_error
+                            return await _return_pending_budget_error()
                         salvaged = _salvageable_upstream.get("resp_json")
                         if salvaged is None or not self._can_salvage_buffered_upstream(salvaged):
                             raise

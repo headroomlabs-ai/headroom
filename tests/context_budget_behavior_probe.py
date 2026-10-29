@@ -14,7 +14,7 @@ import sys
 import threading
 import time
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
 import httpx
 import uvicorn
@@ -306,6 +306,8 @@ def run_continuation(
                 )
             )
             proxy = app.state.proxy
+            outcome_recorder = AsyncMock(wraps=proxy._record_request_outcome)
+            proxy._record_request_outcome = outcome_recorder
             if owner == "hook":
                 register_turn_hook(Hook())
                 register_turn_hook(Hook())
@@ -366,6 +368,7 @@ def run_continuation(
             "initial_calls": min(1, len(calls)),
             "refused_continuation_calls": max(0, len(calls) - 1),
             "hook_attempts": len(hooks_attempts),
+            "outcome_records": outcome_recorder.await_count,
             "ordinary_answer": "ordinary answer" in content,
         }
         print("continuation " + json.dumps(evidence))
@@ -395,6 +398,7 @@ def main():
                     "api_error" if unavailable else "invalid_request_error"
                 ), row
                 assert row["initial_calls"] == 1 and row["refused_continuation_calls"] == 0, row
+                assert row["outcome_records"] == 1, row
                 assert row["EOF"] and row["ping"] == late
     row = run_continuation("hook", unavailable=True, grace_disabled=True)
     assert row["status"] == 500 and not row["ping"]

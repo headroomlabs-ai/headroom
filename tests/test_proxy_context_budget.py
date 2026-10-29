@@ -1686,6 +1686,7 @@ def _assert_continuation(owner, *, late, unavailable=False, grace_disabled=False
     if late:
         assert row["content_type"] == "text/event-stream"
     assert row["initial_calls"] == 1 and row["refused_continuation_calls"] == 0
+    assert row["outcome_records"] == 1
     if owner == "hook":
         assert row["hook_attempts"] == 2
 
