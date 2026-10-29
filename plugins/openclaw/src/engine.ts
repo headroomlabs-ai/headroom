@@ -1,8 +1,8 @@
 /**
- * HeadroomContextEngine â€” ContextEngine implementation for OpenClaw.
+ * HeadroomContextEngine — ContextEngine implementation for OpenClaw.
  *
  * Compresses tool outputs and conversation context using the Headroom proxy.
- * Zero LLM calls â€” all compression is algorithmic (SmartCrusher, ContentRouter, etc.)
+ * Zero LLM calls — all compression is algorithmic (SmartCrusher, ContentRouter, etc.)
  */
 
 /* eslint-disable @typescript-eslint/no-explicit-any */
@@ -18,7 +18,7 @@ import {
   type OpenClawCompactResult,
 } from "./openclaw-compaction.js";
 
-// Must stay static â€” OpenClaw prepends it to the cached system prompt.
+// Must stay static — OpenClaw prepends it to the cached system prompt.
 const HEADROOM_COMPRESSION_NOTICE =
   "[Headroom is compressing tool outputs in this session. Use headroom_retrieve if you need the original, uncompressed content.]";
 
@@ -121,7 +121,7 @@ export class HeadroomContextEngine {
   };
   private circuit = { errors: 0, openUntilMs: 0 };
   // Sessions shown the compression notice. Bounded via insertion-order
-  // eviction â€” no session lifecycle callback exists here to bound it otherwise.
+  // eviction — no session lifecycle callback exists here to bound it otherwise.
   private announcedSessions = new Set<string>();
   private static readonly MAX_ANNOUNCED_SESSIONS = 1000;
   /** Per session: the compressed view the provider's prompt cache holds (see `unchanged`). */
@@ -171,9 +171,9 @@ export class HeadroomContextEngine {
   }
 
   /**
-   * Assemble context for the model â€” THE CORE HOOK.
+   * Assemble context for the model — THE CORE HOOK.
    *
-   * Converts AgentMessage[] â†’ OpenAI format â†’ compress() â†’ AgentMessage[]. Only messages the proxy
+   * Converts AgentMessage[] → OpenAI format → compress() → AgentMessage[]. Only messages the proxy
    * actually changed are rebuilt; the rest are returned exactly as OpenClaw passed them, so the
    * provider prompt cache survives up to the first compressed message (see restoreAgentMessages).
    */
@@ -203,7 +203,7 @@ export class HeadroomContextEngine {
     }
 
     if (this.isCircuitOpen()) {
-      this.logger.warn("[headroom] Circuit open â€” using uncompressed messages");
+      this.logger.warn("[headroom] Circuit open — using uncompressed messages");
       return {
         messages: this.unchanged(params, warm),
         estimatedTokens: 0,
@@ -222,11 +222,11 @@ export class HeadroomContextEngine {
     }
 
     try {
-      // Convert AgentMessage â†’ OpenAI format
+      // Convert AgentMessage → OpenAI format
       const openaiMessages = agentToOpenAIIndexed(params.messages);
       const minContextChars = this.config.minContextChars ?? 800;
       if (minContextChars > 0 && countContextChars(openaiMessages) < minContextChars) {
-        this.logger.debug("[headroom] Context below compression threshold â€” using original messages");
+        this.logger.debug("[headroom] Context below compression threshold — using original messages");
         return {
           messages: normalizeAgentMessages(params.messages),
           estimatedTokens: 0,
@@ -234,7 +234,7 @@ export class HeadroomContextEngine {
         };
       }
 
-      // Compress via proxy â€” pass tokenBudget so RollingWindow enforces it
+      // Compress via proxy — pass tokenBudget so RollingWindow enforces it
       const result = await compress(openaiMessages, {
         model,
         baseUrl: this.proxyUrl,
@@ -284,7 +284,7 @@ export class HeadroomContextEngine {
       this.stats.totalTokensBefore += result.tokensBefore;
 
       this.logger.debug(
-        `Assembled: ${result.tokensBefore} â†’ ${result.tokensAfter} tokens (saved ${result.tokensSaved})`,
+        `Assembled: ${result.tokensBefore} → ${result.tokensAfter} tokens (saved ${result.tokensSaved})`,
       );
 
       return {
@@ -424,11 +424,11 @@ export class HeadroomContextEngine {
   }
 
   /**
-   * Durable turn-advancement commit â€” required by OpenClaw's transcriptSemantics
+   * Durable turn-advancement commit — required by OpenClaw's transcriptSemantics
    * contract. Called only for the accepted, successful turn; failed or aborted
    * turns never reach here. Must be an atomic, idempotent write of the
    * accepted `messages` keyed by `advancementKey` so a host retry with the
-   * same key reports "duplicate" instead of re-applying the advancement â€”
+   * same key reports "duplicate" instead of re-applying the advancement —
    * including a retry that arrives after this process restarted, which is
    * why the record lives on disk (see `DurableAdvancementKeyStore`) rather
    * than in memory, and includes the messages rather than just the key.
