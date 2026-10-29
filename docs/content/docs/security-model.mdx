@@ -284,6 +284,7 @@ accept arbitrary environment variables — writes are restricted to a hardcoded 
 | `HEADROOM_INTERCEPT_READ_MIN_CHARS` | ast-grep read-interception threshold |
 | `HEADROOM_VERIFY_TRUNCATION_ON_DISK` | Verify ast-grep Read truncation against disk when no client banner is found. Always returns `UNKNOWN` on Windows, where `dir_fd` / `O_NOFOLLOW` support is unavailable. |
 | `HEADROOM_VERIFY_TRUNCATION_MAX_BYTES` | Max on-disk file size (bytes) the disk-verify fallback will read |
+| `HEADROOM_DEFERRED_TOOL_AFFINITY` | Keep `defer_loading` tools out of the Anthropic prefix-tracker lineage key (default on; `0` counts them again) |
 | `HEADROOM_WEB_SEARCH_HISTORY` | Drop `web_search_call` history from a Responses request that declares no web_search tool (default on; `0` disables) |
 | `HEADROOM_BUFFERED_UPSTREAM_STREAM` | Send buffered CCR requests (and their continuations) upstream as `stream: true` and fold the reply (default on; `0` sends `stream: false`) |
 

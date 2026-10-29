@@ -1965,6 +1965,7 @@ class OpenAIHandlerMixin:
         body: dict[str, Any],
         *,
         request_id: str,
+        request_context: Any = None,
     ) -> None:
         """Feed one Responses HTTP request into the live traffic learner."""
         traffic_learner = getattr(self, "traffic_learner", None)
@@ -1972,6 +1973,8 @@ class OpenAIHandlerMixin:
             return
         try:
             memory_handler = getattr(self, "memory_handler", None)
+            if memory_handler and memory_handler.is_project_unresolved(request_context):
+                return
             if (
                 traffic_learner._backend is None
                 and memory_handler
@@ -2001,6 +2004,7 @@ class OpenAIHandlerMixin:
         messages: list[dict[str, Any]],
         *,
         request_id: str,
+        request_context: Any = None,
     ) -> None:
         """Feed one chat/completions request into the live traffic learner.
 
@@ -2017,6 +2021,8 @@ class OpenAIHandlerMixin:
             return
         try:
             memory_handler = getattr(self, "memory_handler", None)
+            if memory_handler and memory_handler.is_project_unresolved(request_context):
+                return
             if (
                 traffic_learner._backend is None
                 and memory_handler
@@ -2044,6 +2050,7 @@ class OpenAIHandlerMixin:
         seen_call_ids: set[str],
         baseline: bool,
         request_id: str,
+        request_context: Any = None,
     ) -> None:
         """Feed one Codex WS ``response.create`` turn into the traffic learner.
 
@@ -2067,6 +2074,8 @@ class OpenAIHandlerMixin:
             return
         try:
             memory_handler = getattr(self, "memory_handler", None)
+            if memory_handler and memory_handler.is_project_unresolved(request_context):
+                return
             if (
                 traffic_learner._backend is None
                 and memory_handler
@@ -3454,8 +3463,6 @@ class OpenAIHandlerMixin:
         # compression mutates it, mirroring the Responses and Anthropic
         # ingestion paths. Without this, chat/completions traffic (Copilot CLI,
         # opencode, OpenAI SDKs) fed nothing to the learner (part of #2060).
-        await self._observe_openai_chat_traffic(original_client_messages, request_id=request_id)
-
         # Bypass: skip ALL compression for explicit opt-out
         _bypass = self._headroom_bypass_enabled(request.headers)
         if _bypass:
@@ -3605,6 +3612,12 @@ class OpenAIHandlerMixin:
                 ),
             )
 
+        await self._observe_openai_chat_traffic(
+            original_client_messages,
+            request_id=request_id,
+            request_context=memory_request_ctx,
+        )
+
         # Canonical memory-injection gate (parallels Anthropic). Pre-
         # PR-this the inline conjunction at the memory site silently
         # ignored `x-headroom-bypass: true`, mutating request bytes
@@ -3688,7 +3701,7 @@ class OpenAIHandlerMixin:
         # `messages`, but it runs before this snapshot, so its output is already
         # captured — keep this snapshot after image compression, or a reorder
         # silently reintroduces the drift.
-        cache_lookup_messages = messages
+        cache_lookup_messages = copy.deepcopy(messages) if self.cache and not stream else messages
         # Response-cache partition: a cached response is only ever replayed to a
         # caller presenting the same provider credentials and principal (01-F15).
         # Snapshotted with the key fields so lookup and store agree. None means
@@ -4320,6 +4333,24 @@ class OpenAIHandlerMixin:
         optimized_messages = mirror_client_message_cache_control(
             optimized_messages, original_client_messages
         )
+
+        from headroom.proxy.helpers import enforce_cache_breakpoint_budget
+
+        # Bypass (x-headroom-bypass: true, _bypass computed at ~L3458) opts out
+        # of ALL compression: never mutate those requests here.
+        # client_messages=None: passing the client list runs
+        # normalize_message_cache_control, whose block-level legacy fallback can
+        # add a marker to a list-content user message on chat requests and then
+        # cost a real system marker. Without it only the oldest-first drop runs
+        # — stale replayed markers are oldest, so they go first.
+        if not _bypass:
+            _, optimized_messages, tools, _ = enforce_cache_breakpoint_budget(
+                None,
+                optimized_messages,
+                tools,
+                client_messages=None,
+                request_id=request_id,
+            )
 
         # Memory: inject context and tools for OpenAI requests.
         #
@@ -6010,12 +6041,6 @@ class OpenAIHandlerMixin:
         resolved_project_root_override = codex_project_root_override or (
             str(codex_project.cwd) if codex_project and codex_project.cwd else None
         )
-        # The shared learner cannot isolate project state. Scoped Codex turns
-        # skip learning until a project-scoped learner is available.
-        if not codex_project_scope_required and (
-            codex_project is None or codex_project.reason == "metadata_missing"
-        ):
-            await self._observe_openai_responses_traffic(body, request_id=request_id)
         memory_client = (
             "codex"
             if is_chatgpt_auth
@@ -6088,6 +6113,17 @@ class OpenAIHandlerMixin:
                 system_prompt=_extract_sys_prompt(body),
                 base_user_id=memory_user_id,
                 project_root_override=resolved_project_root_override,
+            )
+
+        # The shared learner cannot isolate project state. Scoped Codex turns
+        # skip learning until a project-scoped learner is available.
+        if not codex_project_scope_required and (
+            codex_project is None or codex_project.reason == "metadata_missing"
+        ):
+            await self._observe_openai_responses_traffic(
+                body,
+                request_id=request_id,
+                request_context=memory_request_ctx,
             )
 
         # Rate limiting
@@ -6998,13 +7034,13 @@ class OpenAIHandlerMixin:
                                 except (json.JSONDecodeError, TypeError):
                                     args = {}
 
-                                await self.memory_handler._ensure_initialized()
-                                if self.memory_handler._backend:
-                                    result = await self.memory_handler._execute_memory_tool(
-                                        name, args, memory_user_id, "openai"
-                                    )
-                                else:
-                                    result = json.dumps({"error": "Memory backend not initialized"})
+                                result = await self.memory_handler._execute_memory_tool(
+                                    name,
+                                    args,
+                                    memory_user_id,
+                                    "openai",
+                                    request_context=memory_request_ctx,
+                                )
 
                                 tool_outputs.append(
                                     {
@@ -8131,21 +8167,37 @@ class OpenAIHandlerMixin:
                         resolved_project.project_key if ws_turn_project_features_allowed else None
                     )
 
-                if first_project_resolution and ws_turn_learning_allowed:
-                    inner_payload = frame_body.get("response", frame_body)
-                    if isinstance(inner_payload, dict):
-                        await self._observe_openai_ws_response_create(
-                            inner_payload,
-                            seen_call_ids=ws_learner_seen_call_ids,
-                            baseline=True,
-                            request_id=request_id,
-                        )
-
                 memory_user_id_candidate = (
                     resolve_memory_identity(websocket)
                     if self.memory_handler and ws_turn_project_features_allowed
                     else None
                 )
+                ws_response_body = frame_body.get("response", frame_body)
+                if memory_user_id_candidate is not None and isinstance(ws_response_body, dict):
+                    from headroom.memory.storage_router import (
+                        RequestContext as _MemRequestContext,
+                    )
+
+                    memory_request_ctx = _MemRequestContext(
+                        headers=dict(ws_headers),
+                        system_prompt=str(ws_response_body.get("instructions") or ""),
+                        base_user_id=memory_user_id_candidate,
+                        project_root_override=resolved_project_root_override,
+                    )
+
+                if (
+                    first_project_resolution
+                    and ws_turn_learning_allowed
+                    and isinstance(ws_response_body, dict)
+                ):
+                    await self._observe_openai_ws_response_create(
+                        ws_response_body,
+                        seen_call_ids=ws_learner_seen_call_ids,
+                        baseline=True,
+                        request_id=request_id,
+                        request_context=memory_request_ctx,
+                    )
+
                 memory_decision = MemoryDecision.decide(
                     headers=ws_headers,
                     memory_handler=(
@@ -8162,24 +8214,8 @@ class OpenAIHandlerMixin:
 
                 memory_user_id = memory_user_id_candidate
                 try:
-                    # Unwrap response.create envelope to access the response body
-                    ws_response_body = frame_body.get("response", frame_body)
                     if not isinstance(ws_response_body, dict):
                         return frame_raw
-                    # Per-project memory routing (GH #462). For WS,
-                    # ``ws_response_body`` carries ``instructions`` —
-                    # that's the system-prompt-equivalent we feed to the
-                    # resolver.
-                    from headroom.memory.storage_router import (
-                        RequestContext as _MemRequestContext,
-                    )
-
-                    memory_request_ctx = _MemRequestContext(
-                        headers=dict(ws_headers),
-                        system_prompt=str(ws_response_body.get("instructions") or ""),
-                        base_user_id=memory_user_id,
-                        project_root_override=resolved_project_root_override,
-                    )
 
                     # Debug: log what Codex sends so we can see the full tool list
                     existing_tool_names = [
@@ -8761,6 +8797,7 @@ class OpenAIHandlerMixin:
                                 seen_call_ids=ws_learner_seen_call_ids,
                                 baseline=False,
                                 request_id=request_id,
+                                request_context=memory_request_ctx,
                             )
                         store_forced = _ensure_chatgpt_responses_store_false(
                             inner_payload,
@@ -9627,19 +9664,19 @@ class OpenAIHandlerMixin:
                                     except (json.JSONDecodeError, TypeError):
                                         fc_args = {}
 
-                                    await self.memory_handler._ensure_initialized()
+                                    if not self.memory_handler.is_project_unresolved(
+                                        response_memory_request_ctx
+                                    ):
+                                        await self.memory_handler._ensure_initialized()
                                     if response_memory_generation != ws_memory_generation:
                                         break
-                                    if self.memory_handler._backend:
-                                        result = await self.memory_handler._execute_memory_tool(
-                                            fc_name,
-                                            fc_args,
-                                            response_memory_user_id,
-                                            "openai",
-                                            request_context=response_memory_request_ctx,
-                                        )
-                                    else:
-                                        result = json.dumps({"error": "backend not ready"})
+                                    result = await self.memory_handler._execute_memory_tool(
+                                        fc_name,
+                                        fc_args,
+                                        response_memory_user_id,
+                                        "openai",
+                                        request_context=response_memory_request_ctx,
+                                    )
 
                                     tool_outputs.append(
                                         {

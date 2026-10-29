@@ -297,6 +297,9 @@ class TiktokenCounter(BaseTokenizer):
                     continue
 
                 if key == "content":
+                    if isinstance(value, dict):
+                        # Unwrapped single block: price it like the list form (#4273).
+                        value = [value]
                     if isinstance(value, str):
                         total += self.count_text(value)
                     elif isinstance(value, list):
@@ -304,7 +307,9 @@ class TiktokenCounter(BaseTokenizer):
                         for part in value:
                             if isinstance(part, dict):
                                 if part.get("type") == "text":
-                                    total += self.count_text(part.get("text", ""))
+                                    total += self.count_text(
+                                        coerce_countable_text(part.get("text", ""))
+                                    )
                                 elif part.get("type") == "image_url":
                                     # Image tokens vary by detail level
                                     detail = part.get("image_url", {}).get("detail", "auto")
@@ -324,6 +329,8 @@ class TiktokenCounter(BaseTokenizer):
                                     total += self._count_content_parts([part])
                             elif isinstance(part, str):
                                 total += self.count_text(part)
+                    else:
+                        total += self.count_text(coerce_countable_text(value))
                 elif key == "role":
                     total += self.count_text(coerce_countable_text(value))
                 elif key == "name":
