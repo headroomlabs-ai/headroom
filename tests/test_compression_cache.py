@@ -310,6 +310,60 @@ class TestCompressionCacheFrozenCount:
         # count = 3, then capped at len-1 = 2 (live-zone reservation).
         assert cache.compute_frozen_count(messages) == 2
 
+    @pytest.mark.parametrize(
+        "blocks",
+        [
+            [{"type": "tool_reference", "tool_name": "mcp__notes__search"}],
+            [
+                {
+                    "type": "image",
+                    "source": {"type": "base64", "media_type": "image/png", "data": "iVBO"},
+                }
+            ],
+            [],
+        ],
+        ids=["tool-reference", "image", "empty"],
+    )
+    def test_tool_result_without_text_does_not_stop_frozen(
+        self, cache: CompressionCache, blocks: list
+    ) -> None:
+        """Claude Code's ToolSearch answers with tool_reference blocks only. The
+        cache has nothing to replay for such a result; as a miss it stopped the
+        count at that message for the rest of the session."""
+        messages = [
+            {"role": "user", "content": "hello"},
+            {
+                "role": "user",
+                "content": [{"type": "tool_result", "tool_use_id": "t1", "content": blocks}],
+            },
+            {"role": "assistant", "content": "found it"},
+            {"role": "user", "content": "follow up"},
+        ]
+        assert cache.compute_frozen_count(messages) == 3
+
+    def test_text_beside_a_textless_tool_result_still_stops_frozen(
+        self, cache: CompressionCache
+    ) -> None:
+        """Parallel calls put several tool_results in one message, and the cache
+        keys it by the first. Text after a textless first result was never
+        stored, so it cannot be replayed."""
+        messages = [
+            {"role": "user", "content": "hello"},
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "tool_result",
+                        "tool_use_id": "t1",
+                        "content": [{"type": "tool_reference", "tool_name": "mcp__notes__search"}],
+                    },
+                    {"type": "tool_result", "tool_use_id": "t2", "content": "uncached output"},
+                ],
+            },
+            {"role": "user", "content": "follow up"},
+        ]
+        assert cache.compute_frozen_count(messages) == 1
+
     def test_update_from_result_identical_content_marks_stable(
         self, cache: CompressionCache
     ) -> None:
