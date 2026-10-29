@@ -1027,9 +1027,7 @@ def apply_to_environ(values: dict[str, Any]) -> None:
 
 def seeded_env_keys() -> frozenset[str]:
     """Settings-generated env keys whose values have not since been overridden."""
-    return frozenset(
-        key for key, value in _SEEDED_ENV.items() if os.environ.get(key) == value
-    )
+    return frozenset(key for key, value in _SEEDED_ENV.items() if os.environ.get(key) == value)
 
 
 def _coerce_runtime_values(runtime_values: dict[str, Any] | None) -> dict[str, Any]:
