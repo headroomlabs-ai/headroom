@@ -53,6 +53,7 @@ from headroom.proxy.savings_attribution import from_tags as savings_from_tags
 from headroom.proxy.semantic_cache_key_policy import compute_request_cache_partition
 from headroom.proxy.stage_timer import StageTimer, emit_stage_timings_log
 from headroom.proxy.tool_schema_savings_policy import (
+    TURN_HOOK_SYSTEM_SAVED_TAG,
     net_hook_tool_saving,
     tool_schema_saved_from_tags,
     without_deferral_flags,
@@ -11100,6 +11101,17 @@ class OpenAIHandlerMixin:
                 if 0 < _compacted_after < _compacted_before:
                     tokens_before += _compacted_before
                     tokens_after += _compacted_after
+                # A hook's system-prompt rewrite (Anthropic): a cut is a
+                # prefix-priced tag, what it added reduces the saving.
+                _system_cut = int(getattr(_turn, "system_tokens_before", 0) or 0) - int(
+                    getattr(_turn, "system_tokens_after", 0) or 0
+                )
+                if _system_cut > 0:
+                    tags[TURN_HOOK_SYSTEM_SAVED_TAG] = (
+                        int(tags.get(TURN_HOOK_SYSTEM_SAVED_TAG, 0) or 0) + _system_cut
+                    )
+                else:
+                    tokens_after -= _system_cut
                 tokens_after += max(0, int(getattr(_turn, "tool_growth_tokens", 0) or 0))
                 # Only a count of pre-hook messages lacks the text a hook added;
                 # a recount of the final messages (stateless fold, session) has it.

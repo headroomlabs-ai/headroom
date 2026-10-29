@@ -72,6 +72,15 @@ class TurnContext:
     # A translating backend drops ``defer_loading`` and bills every tool, so the
     # history does not say which are billed.
     deferred_tools_billed: bool = False
+    # The request's top-level system prompt (Anthropic ``/v1/messages`` only:
+    # a string or a list of blocks; ``None`` elsewhere). A hook may rewrite it
+    # in place or replace it; the handler forwards the result, and the hook
+    # runner books its token delta with the message and tool deltas. Response
+    # hooks see it as the request hooks left it, which may or may not include
+    # the output shaper's later steering block. ``system`` comes before the
+    # messages in Anthropic's cache key: a rewrite that differs between turns of a
+    # conversation busts the whole message prefix, so it must be deterministic.
+    system: Any = None
 
     def record_savings(
         self,
@@ -246,6 +255,26 @@ def _tool_loading_history(ctx: TurnContext) -> object:
     return loading_history(ctx.provider, ctx.messages)
 
 
+def count_system_tokens(
+    count_messages: Callable[[list[dict[str, Any]]], int] | None, system: Any
+) -> int | None:
+    """Tokens of an Anthropic top-level ``system`` (string or blocks), 0 when absent.
+
+    Counted as one message with the same counter as the messages, so a hook's
+    system delta is on the scale of its message delta. ``None`` when there is
+    no counter or it fails: accounting never fails a request.
+    """
+    if count_messages is None:
+        return None
+    if not system:
+        return 0
+    try:
+        return int(count_messages([{"role": "system", "content": system}]))
+    except Exception:
+        log.debug("system prompt token count failed; its delta is not booked", exc_info=True)
+        return None
+
+
 def run_request_hooks(ctx: TurnContext, *, stream_safe_only: bool = False) -> None:
     """Run each hook's ``on_request``. Inert when none registered; never raises.
 
@@ -267,6 +296,7 @@ def run_request_hooks(ctx: TurnContext, *, stream_safe_only: bool = False) -> No
     # more than the whole sequence actually removed.
     gains: list[tuple[str, int, dict[str, int]]] = []
     sequence_net = 0
+    count_messages = ctx.count_messages
     for hook in registered_turn_hooks():
         if stream_safe_only and not getattr(hook, "stream_safe", False):
             continue
@@ -274,10 +304,11 @@ def run_request_hooks(ctx: TurnContext, *, stream_safe_only: bool = False) -> No
         if fn is None:
             continue
         booked_tag = ctx.tags.get("tool_search_deferred_tokens")
-        before_messages = before_tools = None
+        before_messages = before_system = before_tools = None
         try:
-            if ctx.count_messages is not None:
-                before_messages = ctx.count_messages(ctx.messages)
+            if count_messages is not None:
+                before_messages = count_messages(ctx.messages)
+                before_system = count_system_tokens(count_messages, ctx.system)
             if ctx.count_tools is not None:
                 before_tools = tools_before_hook(
                     ctx.tools, _tool_loading_history(ctx), ctx.count_tools
@@ -286,11 +317,12 @@ def run_request_hooks(ctx: TurnContext, *, stream_safe_only: bool = False) -> No
             # Signed deltas, netted: a hook that folds messages but ADDS a tool
             # (skill search's ``search_skills``) saved the difference, not the
             # fold alone. Booked only when the net is a saving.
-            message_saved = (
-                before_messages - ctx.count_messages(ctx.messages)
-                if before_messages is not None and ctx.count_messages is not None
-                else 0
-            )
+            message_saved = system_saved = 0
+            if count_messages is not None and before_messages is not None:
+                message_saved = before_messages - count_messages(ctx.messages)
+            after_system = count_system_tokens(count_messages, ctx.system)
+            if before_system is not None and after_system is not None:
+                system_saved = before_system - after_system
             tool_saved = 0
             if before_tools is not None and ctx.count_tools is not None:
                 tools_was, tools_now = hook_tool_counts(
@@ -300,14 +332,17 @@ def run_request_hooks(ctx: TurnContext, *, stream_safe_only: bool = False) -> No
                     ctx.count_tools,
                 )
                 tool_saved = tools_was - tools_now
-            net_saved = message_saved + tool_saved
+            net_saved = message_saved + system_saved + tool_saved
             sequence_net += net_saved
             if net_saved > 0:
+                details = {"message_tokens_saved": message_saved, "tool_tokens_saved": tool_saved}
+                if system_saved:
+                    details["system_tokens_saved"] = system_saved
                 gains.append(
                     (
                         getattr(hook, "savings_source", getattr(hook, "name", type(hook).__name__)),
                         net_saved,
-                        {"message_tokens_saved": message_saved, "tool_tokens_saved": tool_saved},
+                        details,
                     )
                 )
         except Exception:  # a hook must never break the proxy
@@ -328,15 +363,14 @@ def run_request_hooks(ctx: TurnContext, *, stream_safe_only: bool = False) -> No
         budget -= tokens
         if tokens < net_saved:
             # Later hooks' cost comes off this credit; share it across the
-            # message and tool parts so the breakdown still sums to ``tokens``.
-            # The uncapped deltas stay for diagnosis.
-            message_part = round(details["message_tokens_saved"] * tokens / net_saved)
-            details = {
-                "message_tokens_saved": message_part,
-                "tool_tokens_saved": tokens - message_part,
-                "uncapped_message_tokens_saved": details["message_tokens_saved"],
-                "uncapped_tool_tokens_saved": details["tool_tokens_saved"],
-            }
+            # message, system and tool parts so the breakdown still sums to
+            # ``tokens`` (the tool part takes the rounding). The uncapped
+            # deltas stay for diagnosis.
+            capped = {key: round(value * tokens / net_saved) for key, value in details.items()}
+            capped["tool_tokens_saved"] = tokens - sum(
+                value for key, value in capped.items() if key != "tool_tokens_saved"
+            )
+            details = {**capped, **{f"uncapped_{key}": value for key, value in details.items()}}
         try:
             ctx.record_savings(source, tokens=tokens, details=details)
         except Exception:

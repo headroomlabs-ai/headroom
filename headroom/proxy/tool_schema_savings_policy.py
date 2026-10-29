@@ -316,14 +316,19 @@ def reconcile_deferred_tokens(
         return
 
 
+# System-prompt text a turn hook removed: like a tool schema it sits in the
+# cached prefix, so it is priced as these tags are, not as live-zone content.
+TURN_HOOK_SYSTEM_SAVED_TAG = "turn_hook_system_saved_tokens"
 TOOL_SCHEMA_SAVINGS_TAGS: tuple[str, ...] = (
     "tool_search_deferred_tokens",
     "turn_hook_tools_saved_tokens",
+    TURN_HOOK_SYSTEM_SAVED_TAG,
 )
 
 
 def tool_schema_saved_from_tags(tags: object) -> int:
-    """Return tool-definition tokens Headroom kept out of context for one request.
+    """Return prefix tokens (tool definitions, a hook's system-prompt cut) Headroom
+    kept out of context for one request.
 
     The summed tags are set only on paths where Headroom performed the deferral,
     so clients that already had tool search enabled contribute zero here.
@@ -350,7 +355,8 @@ def net_hook_tool_saving(raw_saved: int, tags: object, hook_tool_saved: int) -> 
     message text while removing tools leaves ``raw_saved`` negative, and the
     clamp alone would drop the growth while the tag kept the full removal. The
     deficit is debited from the tag first (at most what the hooks booked on
-    this request), so headline == messages + tools, signed, clamped once.
+    this request), then from the system-prompt cut they booked, so headline ==
+    messages + tools + system, signed, clamped once.
     """
     raw = int(raw_saved)
     booked = max(0, int(hook_tool_saved or 0))
@@ -359,6 +365,12 @@ def net_hook_tool_saving(raw_saved: int, tags: object, hook_tool_saved: int) -> 
         current = int(tags.get("turn_hook_tools_saved_tokens", 0) or 0)
         tags["turn_hook_tools_saved_tokens"] = max(0, current - offset)
         raw += offset
+    if raw < 0 and isinstance(tags, dict):
+        system_cut = max(0, int(tags.get(TURN_HOOK_SYSTEM_SAVED_TAG, 0) or 0))
+        offset = min(-raw, system_cut)
+        if offset:
+            tags[TURN_HOOK_SYSTEM_SAVED_TAG] = system_cut - offset
+            raw += offset
     return max(0, raw)
 
 
