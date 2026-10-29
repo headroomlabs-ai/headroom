@@ -184,21 +184,54 @@ describe("compress() keeps Anthropic text documents through the public path", ()
     mockFetch.mockReset();
   });
 
-  it("sends a document-only turn as a media part and restores the document block", async () => {
+  it("posts a document-only turn as the native document block and returns it unchanged", async () => {
     const doc = {
       type: "document",
       source: { type: "text", media_type: "text/plain", data: "Critical contract: do not delete account 123" },
       title: "Contract",
       citations: { enabled: true },
     };
-    // The proxy passes non-text parts through unchanged; echo the request's messages back.
+    // The proxy passes non-text blocks through unchanged; echo the request's messages back.
     mockFetch.mockImplementationOnce(async (_url: string, init: any) => okResponse({ messages: JSON.parse(init.body).messages }));
 
     const result = await compress([{ role: "user", content: [doc] }], { baseUrl: "http://localhost:8787" });
 
+    // Anthropic input is not converted: the document block itself reaches the proxy.
     const body = JSON.parse(mockFetch.mock.calls[0][1].body);
-    expect(body.messages).toHaveLength(1);
-    expect(body.messages[0].content[0].type).toBe("image_url");
+    expect(body.messages).toEqual([{ role: "user", content: [doc] }]);
     expect(result.messages).toEqual([{ role: "user", content: [doc] }]);
+  });
+});
+
+describe("compress() sends Anthropic-format input to the proxy natively", () => {
+  beforeEach(() => {
+    mockFetch.mockReset();
+  });
+
+  const anthropicTurn = [
+    { role: "user", content: "search for X" },
+    {
+      role: "assistant",
+      content: [
+        { type: "thinking", thinking: "Search first.", signature: "SIG-1" },
+        { type: "tool_use", id: "toolu_1", name: "search", input: { q: "X" } },
+      ],
+    },
+    {
+      role: "user",
+      content: [{ type: "tool_result", tool_use_id: "toolu_1", content: "a\nb\nc" }],
+    },
+  ];
+
+  it("posts the Anthropic blocks as-is and returns the proxy's messages unconverted", async () => {
+    const returned = structuredClone(anthropicTurn);
+    (returned[2].content as any[])[0].content = "[3 lines]";
+    mockFetch.mockResolvedValueOnce(okResponse({ messages: returned }));
+
+    const result = await compress(anthropicTurn, { baseUrl: "http://localhost:8787" });
+
+    const body = JSON.parse(mockFetch.mock.calls[0][1].body);
+    expect(body.messages).toEqual(anthropicTurn);
+    expect(result.messages).toEqual(returned);
   });
 });
