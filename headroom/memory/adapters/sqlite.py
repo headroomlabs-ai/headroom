@@ -67,6 +67,12 @@ class SQLiteMemoryStore:
     Schema:
         The memories table stores all Memory fields with appropriate indexes
         for efficient querying by scope, category, importance, and time.
+
+    Metadata filters:
+        Numbers and booleans use native SQLite equality. String filters match only
+        JSON text values. None matches an explicit JSON null,
+        not a missing key. Arrays and objects compare as compact JSON text with
+        matching JSON types; array order and object member order are significant.
     """
 
     def __init__(self, db_path: str | Path = "headroom_memory.db") -> None:
@@ -571,13 +577,22 @@ class SQLiteMemoryStore:
                 # equates ``5 = '5'`` — so an int/float/bool metadata filter matched
                 # nothing. ``bool`` is a subclass of ``int``, so it is covered here
                 # (a JSON ``true`` extracts to 1, and Python ``True`` binds to 1).
-                # A non-scalar value (dict/list) is not a bindable SQLite type, so it
-                # keeps the JSON-text comparison rather than raising.
-                conditions.append(f"json_extract(metadata, '$.{key}') = ?")
-                if isinstance(value, (str, int, float)):
+                if value is None:
+                    # json_extract returns SQL NULL for both null and missing keys.
+                    conditions.append(f"json_type(metadata, '$.{key}') = 'null'")
+                elif isinstance(value, (str, int, float)):
+                    if isinstance(value, str):
+                        # Extracted JSON arrays/objects are also SQL text.
+                        conditions.append(f"json_type(metadata, '$.{key}') = 'text'")
+                    conditions.append(f"json_extract(metadata, '$.{key}') = ?")
                     params.append(value)
                 else:
-                    params.append(json.dumps(value))
+                    # Normalize whitespace like json_extract does for arrays/objects,
+                    # and do not match a string containing the same JSON text.
+                    encoded = json.dumps(value)
+                    conditions.append(f"json_type(metadata, '$.{key}') = json_type(?)")
+                    conditions.append(f"json_extract(metadata, '$.{key}') = json(?)")
+                    params.extend([encoded, encoded])
 
         return conditions, params
 
@@ -798,23 +813,28 @@ class SQLiteMemoryStore:
             return []
 
         history: list[Memory] = [current]
+        # Imported or reused IDs can form cycles. Visit each stored record
+        # only once across both directions instead of blocking indefinitely.
+        visited = {current.id}
 
         # Follow chain backwards (supersedes)
         back_id = current.supersedes
-        while back_id is not None:
+        while back_id is not None and back_id not in visited:
             prev = await self.get(back_id)
             if prev is None:
                 break
+            visited.add(prev.id)
             history.insert(0, prev)  # Add to beginning
             back_id = prev.supersedes
 
         # Follow chain forwards (superseded_by) if requested
         if include_future:
             forward_id = current.superseded_by
-            while forward_id is not None:
+            while forward_id is not None and forward_id not in visited:
                 next_mem = await self.get(forward_id)
                 if next_mem is None:
                     break
+                visited.add(next_mem.id)
                 history.append(next_mem)
                 forward_id = next_mem.superseded_by
 
