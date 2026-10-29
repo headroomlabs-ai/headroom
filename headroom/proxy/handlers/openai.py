@@ -134,6 +134,7 @@ from headroom.proxy.token_counting import gemini_output_tokens
 logger = logging.getLogger("headroom.proxy")
 
 _OPENAI_RESPONSES_UNIT_CACHE_MAX_ENTRIES = 10_000
+_OPENAI_RESPONSES_TOOL_CONTEXT_LIMIT = 512
 _OPENAI_RESPONSES_UNIT_CACHE_VERSION = "openai_responses_unit_v1"
 _OPENAI_RESPONSES_UNIT_PARALLELISM_ENV = "HEADROOM_TOOL_OUTPUT_COMPRESSION_PARALLELISM"
 _OPENAI_RESPONSES_UNIT_PARALLELISM_DEFAULT = 4
@@ -2222,6 +2223,7 @@ class OpenAIHandlerMixin:
         request_id: str,
         timing: dict[str, float] | None = None,
         deadline_started_at: float | None = None,
+        tool_names_by_call_id: dict[str, str] | None = None,
     ) -> tuple[dict[str, Any], bool, int, list[str], dict[str, int], list[str], int]:
         """Run ContentRouter on OpenAI Responses text units.
 
@@ -2344,7 +2346,6 @@ class OpenAIHandlerMixin:
                         return True
             return False
 
-        headroom_retrieve_call_ids: set[str] = set()
         # Map each Responses tool call to its name so that outputs belonging to
         # excluded tools (HEADROOM_EXCLUDE_TOOLS) can be protected from
         # compression. The chat/Anthropic paths get this via
@@ -2352,7 +2353,7 @@ class OpenAIHandlerMixin:
         # name on the `function_call` (or Codex `custom_tool_call`) item and
         # the originating call_id on the matching output, so we correlate
         # them here.
-        function_name_by_call_id: dict[str, str] = {}
+        function_name_by_call_id = dict(tool_names_by_call_id or {})
         for item in items:
             if not isinstance(item, dict):
                 continue
@@ -2366,12 +2367,13 @@ class OpenAIHandlerMixin:
                 name = unwrap_tool_call_name(name, item.get("arguments") or item.get("input"))
             if isinstance(name, str) and isinstance(call_id, str) and call_id:
                 function_name_by_call_id[call_id] = name
-            # Same matcher ContentRouter uses for its ccr_retrieve guard, so the
-            # MCP alias forms (mcp__srv__x, Hermes' mcp_srv_x, OpenCode's
-            # headroom_headroom_retrieve) are recognized here too.
-            if isinstance(name, str) and is_tool_excluded(name, ("headroom_retrieve",)):
-                if isinstance(call_id, str) and call_id:
-                    headroom_retrieve_call_ids.add(call_id)
+        # Continuations may contain outputs only; observed WS names retain the
+        # same unconditional retrieval guard as calls present in this payload.
+        headroom_retrieve_call_ids = {
+            call_id
+            for call_id, name in function_name_by_call_id.items()
+            if is_tool_excluded(name, ("headroom_retrieve",))
+        }
 
         # Resolve the effective exclude set once (None -> built-in defaults),
         # mirroring ContentRouter's policy. exclude_tools already contains both
@@ -2896,6 +2898,7 @@ class OpenAIHandlerMixin:
         client: str | None = None,
         savings_tags: dict[str, Any] | None = None,
         deadline_started_at: float | None = None,
+        tool_names_by_call_id: dict[str, str] | None = None,
     ) -> tuple[dict[str, Any], bool, int, list[str], str | None, int, int, int]:
         """Compress an OpenAI Responses payload through the shared router.
 
@@ -3129,6 +3132,7 @@ class OpenAIHandlerMixin:
             request_id=request_id,
             timing=timing_sink,
             deadline_started_at=deadline_started_at,
+            tool_names_by_call_id=tool_names_by_call_id,
         )
         _add_timing("compression_live_units_total", live_units_started)
         if router_modified:
@@ -3196,6 +3200,7 @@ class OpenAIHandlerMixin:
         timeout: float = COMPRESSION_TIMEOUT_SECONDS,
         client: str | None = None,
         savings_tags: dict[str, Any] | None = None,
+        tool_names_by_call_id: dict[str, str] | None = None,
     ) -> tuple[dict[str, Any], bool, int, list[str], str | None, int, int, int, dict[str, float]]:
         timing: dict[str, float] = {}
 
@@ -3245,6 +3250,8 @@ class OpenAIHandlerMixin:
             }
             if savings_tags is not None:
                 compression_kwargs["savings_tags"] = savings_tags
+            if tool_names_by_call_id:
+                compression_kwargs["tool_names_by_call_id"] = tool_names_by_call_id
             while True:
                 try:
                     result = self._compress_openai_responses_payload(
@@ -7884,6 +7891,43 @@ class OpenAIHandlerMixin:
             body: dict[str, Any] = {}
             current_response_input: list[dict[str, Any]] = []
             current_response_template: dict[str, Any] = {}
+            # Codex sends only tool outputs on previous_response_id continuations.
+            # Retain resolved retrieval identities, never tool arguments or results,
+            # for this connection (including rejected/repeated continuations).
+            ws_tool_names_by_call_id: dict[str, str] = {}
+            ws_tool_context_exhausted = False
+
+            def _remember_ws_tool_call(item: Any) -> None:
+                nonlocal ws_tool_context_exhausted
+                if ws_tool_context_exhausted or not isinstance(item, dict):
+                    return
+                if item.get("type") not in {"function_call", "custom_tool_call"}:
+                    return
+                call_id = item.get("call_id")
+                name = item.get("name")
+                if not isinstance(call_id, str) or not call_id or not isinstance(name, str):
+                    return
+                from headroom.config import is_tool_excluded, unwrap_tool_call_name
+
+                name = unwrap_tool_call_name(name, item.get("arguments") or item.get("input"))
+                if not is_tool_excluded(name, ("headroom_retrieve",)):
+                    ws_tool_names_by_call_id.pop(call_id, None)
+                    return
+                if (
+                    call_id not in ws_tool_names_by_call_id
+                    and len(ws_tool_names_by_call_id) >= _OPENAI_RESPONSES_TOOL_CONTEXT_LIMIT
+                ):
+                    # Evicting an unconsumed identity would silently re-compress
+                    # its original. Bound metadata and fail safe for this connection.
+                    ws_tool_context_exhausted = True
+                    logger.warning(
+                        "[%s] WS retrieval context limit reached; "
+                        "preserving tool outputs without compression for this connection",
+                        request_id,
+                    )
+                    return
+                ws_tool_names_by_call_id[call_id] = name
+
             tokens_saved = 0
             # Session-scoped accumulator for tokens we *attempted* to
             # compress (extracted units + schema). Drives the active-
@@ -8824,9 +8868,14 @@ class OpenAIHandlerMixin:
                                 store_forced,
                                 "chatgpt_store_false" if store_forced else "bypass_header",
                             )
-                        if not self.config.optimize:
+                        if ws_tool_context_exhausted or not self.config.optimize:
+                            passthrough_reason = (
+                                "tool_context_limit"
+                                if ws_tool_context_exhausted
+                                else "optimize_disabled"
+                            )
                             _log_ws_passthrough(
-                                "optimize_disabled",
+                                passthrough_reason,
                                 frame_index=frame_index,
                                 raw_bytes=len(raw_after_store.encode("utf-8", errors="replace")),
                                 frame_type="response.create",
@@ -8835,7 +8884,7 @@ class OpenAIHandlerMixin:
                             return (
                                 raw_after_store,
                                 store_forced,
-                                "chatgpt_store_false" if store_forced else "optimize_disabled",
+                                "chatgpt_store_false" if store_forced else passthrough_reason,
                             )
                         frame_compression_elapsed_ms = 0.0
                         try:
@@ -8869,6 +8918,7 @@ class OpenAIHandlerMixin:
                                     else COMPRESSION_TIMEOUT_SECONDS,
                                     client=client,
                                     savings_tags=frame_savings,
+                                    tool_names_by_call_id=dict(ws_tool_names_by_call_id),
                                 )
                                 for _timing_name, _timing_ms in frame_compression_timing.items():
                                     _record_ws_compression_timing(_timing_name, _timing_ms)
@@ -9526,6 +9576,8 @@ class OpenAIHandlerMixin:
                                     upstream_frame_index,
                                     ws_last_upstream_frame_type,
                                 )
+                                if event_type == "response.output_item.done":
+                                    _remember_ws_tool_call(event.get("item"))
                                 response = event.get("response")
                                 completed_response_model = (
                                     str(response.get("model") or "unknown")
