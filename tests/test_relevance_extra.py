@@ -124,6 +124,22 @@ def test_embedding_score_and_batch_with_fake_model(monkeypatch) -> None:
     assert [item.reason for item in batch] == ["Embedding: 0.75", "Embedding: 0.25"]
 
 
+def test_embedding_encode_caps_the_onnx_batch(monkeypatch) -> None:
+    # The default fastembed batch (256) sizes ORT's never-shrinking arena to the
+    # largest relevance split ever scored; every encode must pass the cap.
+    calls = []
+
+    class FakeModel:
+        def embed(self, texts, **kwargs):
+            calls.append(kwargs)
+            return [[1.0, 0.0] for _ in texts]
+
+    scorer = EmbeddingScorer()
+    monkeypatch.setattr(scorer, "_get_model", lambda: FakeModel())
+    assert len(scorer._encode([f"record {i}" for i in range(300)])) == 300
+    assert calls == [{"batch_size": embedding.EMBED_BATCH_SIZE}]
+
+
 def test_hybrid_constructor_alpha_variants_and_single_score_paths(monkeypatch) -> None:
     bm25_result = RelevanceScore(score=0.1, reason="bm25", matched_terms=["term"])
     emb_result = RelevanceScore(score=0.9, reason="emb", matched_terms=[])

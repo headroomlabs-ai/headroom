@@ -23,13 +23,15 @@ resolution-markers = [
 [manifest]
 constraints = [
     { name = "aiohttp", specifier = ">=3.14.4" },
+    { name = "certifi", specifier = ">=2026.10.19" },
     { name = "cryptography", specifier = ">=50.0.0" },
+    { name = "filelock", marker = "python_full_version >= '3.11'", specifier = ">=4.2.1" },
     { name = "gitpython", specifier = ">=3.1.58" },
     { name = "langsmith", specifier = ">=0.9.0" },
     { name = "lxml-html-clean", specifier = ">=0.4.5" },
     { name = "pydantic-settings", specifier = ">=2.14.2" },
     { name = "pygments", specifier = ">=2.20.0" },
-    { name = "setuptools", specifier = ">=83.0.0" },
+    { name = "setuptools", specifier = ">=84.1.0" },
     { name = "transformers", specifier = ">=5.5.0" },
 ]
 overrides = [{ name = "pillow", specifier = ">=13.0.0" }]
@@ -1690,6 +1692,7 @@ all = [
     { name = "opentelemetry-sdk" },
     { name = "orjson", marker = "platform_python_implementation != 'PyPy'" },
     { name = "pillow" },
+    { name = "python-socks" },
     { name = "rapidocr", marker = "(python_full_version >= '3.13' and platform_machine != 'x86_64') or (python_full_version == '3.13.*' and platform_machine == 'x86_64' and sys_platform == 'darwin') or (python_full_version >= '3.13' and sys_platform != 'darwin')" },
     { name = "rapidocr-onnxruntime", marker = "python_full_version < '3.13'" },
     { name = "scikit-learn" },
@@ -1839,6 +1842,7 @@ proxy = [
     { name = "onnxruntime", version = "1.26.0", source = { registry = "https://pypi.org/simple/" }, marker = "platform_machine != 'x86_64' or sys_platform != 'darwin'" },
     { name = "openai" },
     { name = "orjson", marker = "platform_python_implementation != 'PyPy'" },
+    { name = "python-socks" },
     { name = "sqlite-vec" },
     { name = "transformers" },
     { name = "uvicorn" },
@@ -1856,6 +1860,7 @@ proxy-prod = [
     { name = "onnxruntime", version = "1.26.0", source = { registry = "https://pypi.org/simple/" }, marker = "platform_machine != 'x86_64' or sys_platform != 'darwin'" },
     { name = "openai" },
     { name = "orjson", marker = "platform_python_implementation != 'PyPy'" },
+    { name = "python-socks" },
     { name = "sqlite-vec" },
     { name = "transformers" },
     { name = "uvicorn" },
@@ -1892,6 +1897,7 @@ sandbox = [
     { name = "opentelemetry-exporter-otlp-proto-http" },
     { name = "opentelemetry-sdk" },
     { name = "orjson", marker = "platform_python_implementation != 'PyPy'" },
+    { name = "python-socks" },
     { name = "sqlite-vec" },
     { name = "starlette" },
     { name = "trafilatura" },
@@ -1995,7 +2001,7 @@ requires-dist = [
     { name = "openai", marker = "extra == 'proxy'", specifier = ">=2.14.0" },
     { name = "openpyxl", marker = "extra == 'dev'", specifier = ">=3.1.0" },
     { name = "openpyxl", marker = "extra == 'spreadsheet'", specifier = ">=3.1.0" },
-    { name = "opentelemetry-api", specifier = ">=1.24.0" },
+    { name = "opentelemetry-api", specifier = ">=1.45.1" },
     { name = "opentelemetry-exporter-otlp-proto-http", marker = "extra == 'dev'", specifier = ">=1.24.0" },
     { name = "opentelemetry-exporter-otlp-proto-http", marker = "extra == 'otel'", specifier = ">=1.24.0" },
     { name = "opentelemetry-sdk", marker = "extra == 'dev'", specifier = ">=1.24.0" },
@@ -2007,6 +2013,7 @@ requires-dist = [
     { name = "pytest", marker = "extra == 'dev'", specifier = ">=7.0.0" },
     { name = "pytest-asyncio", marker = "extra == 'dev'", specifier = ">=0.21.0" },
     { name = "pytest-cov", marker = "extra == 'dev'", specifier = ">=4.0.0" },
+    { name = "python-socks", extras = ["asyncio"], marker = "extra == 'proxy'", specifier = ">=2.7.1" },
     { name = "pyyaml", specifier = ">=6.0" },
     { name = "qdrant-client", marker = "extra == 'memory-stack'", specifier = ">=1.9.0,<2.0" },
     { name = "rapidocr", marker = "(python_full_version == '3.13.*' and platform_machine == 'x86_64' and sys_platform == 'darwin' and extra == 'image') or (python_full_version >= '3.13' and platform_machine != 'x86_64' and extra == 'image') or (python_full_version >= '3.13' and sys_platform != 'darwin' and extra == 'image')", specifier = ">=3.0,<4" },
@@ -2027,7 +2034,7 @@ requires-dist = [
     { name = "starlette", marker = "extra == 'mcp'", specifier = ">=0.27.0" },
     { name = "strands-agents", marker = "extra == 'strands'", specifier = ">=0.1.0" },
     { name = "tiktoken", specifier = ">=0.5.0" },
-    { name = "tomlkit", specifier = ">=0.13.0,<1.0" },
+    { name = "tomlkit", specifier = ">=0.15.0,<1.0" },
     { name = "torch", marker = "sys_platform == 'darwin' and extra == 'pytorch-mps'", specifier = ">=2.12.1" },
     { name = "torch", marker = "(platform_machine != 'x86_64' and extra == 'ml') or (sys_platform != 'darwin' and extra == 'ml')", specifier = ">=2.12.1" },
     { name = "torch", marker = "(platform_machine != 'x86_64' and extra == 'voice') or (sys_platform != 'darwin' and extra == 'voice')", specifier = ">=2.12.1" },
@@ -4783,6 +4790,15 @@ source = { registry = "https://pypi.org/simple/" }
 sdist = { url = "https://files.pythonhosted.org/packages/64/7e/9b35ad8f3d9ca680f7c87a88f19612fdd8da9796c4d3b46e560ac79dcc4a/python_multipart-0.0.31.tar.gz", hash = "sha256:fc631183bb13e56db3158a4909908dfb2e23565286744e798241e63750e5d680", size = 46689, upload-time = "2026-06-04T08:27:49.014Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/5e/1e/7f7f299527a5a8ad90acd5f2f78dfa6c8495c6301a3205106ea68a84de96/python_multipart-0.0.31-py3-none-any.whl", hash = "sha256:8408153d68a9773291fc1da39a8b85a50044bddbabd2dd72e9229776b7b15e28", size = 29996, upload-time = "2026-06-04T08:27:47.804Z" },
+]
+
+[[package]]
+name = "python-socks"
+version = "3.2.0"
+source = { registry = "https://pypi.org/simple/" }
+sdist = { url = "https://files.pythonhosted.org/packages/5c/c8/1309971a28d94df88d90e308b2eaef09e209402606446dd9d88d75cc2158/python_socks-3.2.0.tar.gz", hash = "sha256:b1a0e372f33182f657d935c3171fa03623b6a65734323746d0de9f296bc537ea", size = 38773, upload-time = "2026-10-27T14:57:11.953Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/b6/6e/c42bb2ed04ddb141dcba433662d21a92323ba25c2662f8b99f0a0de4a30a/python_socks-3.2.0-py3-none-any.whl", hash = "sha256:4cb349f43043eeeb12d10919cb992a7ce8671c2c5a836a47cb0c29d8def11d24", size = 49571, upload-time = "2026-10-27T14:57:10.422Z" },
 ]
 
 [[package]]
