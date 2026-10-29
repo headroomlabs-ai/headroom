@@ -12,6 +12,67 @@ from headroom.telemetry.models import ToolSignature
 from headroom.telemetry.toin import TOINConfig, ToolIntelligenceNetwork
 
 
+def test_filesystem_save_reports_parent_directory_failure(tmp_path) -> None:
+    blocked = tmp_path / "blocked"
+    blocked.write_text("not a directory", encoding="utf-8", newline="\n")
+    backend = FileSystemTOINBackend(str(blocked / "toin.json"))
+
+    with pytest.raises(OSError):
+        backend.save({"patterns": {}})
+
+
+def test_failed_replace_preserves_store_and_cleans_temporary_file(tmp_path, monkeypatch) -> None:
+    from pathlib import Path
+
+    path = tmp_path / "toin.json"
+    backend = FileSystemTOINBackend(str(path))
+    backend.save({"patterns": {"original": {}}})
+    original = path.read_bytes()
+
+    def fail_replace(self, target):
+        raise OSError("replace unavailable")
+
+    monkeypatch.setattr(Path, "replace", fail_replace)
+    with pytest.raises(OSError, match="replace unavailable"):
+        backend.save({"patterns": {"new": {}}})
+
+    assert path.read_bytes() == original
+    assert not list(tmp_path.glob(".toin_*.tmp"))
+
+
+def test_filesystem_failure_keeps_toin_dirty_for_automatic_retry(tmp_path, caplog) -> None:
+    parent = tmp_path / "state"
+    path = parent / "toin.json"
+    toin = ToolIntelligenceNetwork(TOINConfig(storage_path=str(path), auto_save_interval=3600))
+    toin.record_compression(
+        tool_signature=_signature(123),
+        original_count=10,
+        compressed_count=5,
+        original_tokens=100,
+        compressed_tokens=50,
+        strategy="test",
+    )
+    toin._last_save_time = 0
+    parent.write_text("temporarily blocked", encoding="utf-8", newline="\n")
+
+    with caplog.at_level(logging.WARNING):
+        toin.save()
+
+    assert toin._dirty is True
+    assert toin._last_save_time == 0
+    assert any(getattr(record, "event", None) == "toin_save_failed" for record in caplog.records)
+
+    parent.unlink()
+    toin._maybe_auto_save()
+
+    assert toin._dirty is False
+    assert toin._last_save_time > 0
+    restored = ToolIntelligenceNetwork(TOINConfig(storage_path=str(path)))
+    pattern = restored.get_pattern(_signature(123).structure_hash)
+    assert pattern is not None
+    assert pattern.total_compressions == 1
+
+
 def _signature(index: int) -> ToolSignature:
     return ToolSignature.from_items([{f"field_{index}": "x"}])
 
