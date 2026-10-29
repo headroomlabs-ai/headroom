@@ -10,6 +10,7 @@ import sys
 import textwrap
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from urllib.parse import parse_qs, urlsplit
 
 import pytest
 
@@ -85,7 +86,8 @@ def admitted_proxy(monkeypatch, request):
 
         def do_POST(self):
             body = json.loads(self.rfile.read(int(self.headers["content-length"])))
-            path = self.path.split("?", 1)[0]
+            url = urlsplit(self.path)
+            path = url.path
             if path.endswith("/responses"):
                 if "input" not in body or body.get("store") is not False:
                     self.send_error(400, "Unsupported Responses wire request")
@@ -123,7 +125,43 @@ def admitted_proxy(monkeypatch, request):
                             "finish_reason": "stop",
                         }
                     ]
-                    response = ("data: " + json.dumps(payload) + "\n\ndata: [DONE]\n\n").encode()
+                    usage = payload.pop("usage")
+                    usage_chunk = {**payload, "choices": [], "usage": usage}
+                    response = (
+                        "".join(
+                            "data: " + json.dumps(chunk) + "\n\n"
+                            for chunk in (payload, usage_chunk)
+                        )
+                        + "data: [DONE]\n\n"
+                    ).encode()
+                    content_type = "text/event-stream"
+                else:
+                    response = json.dumps(payload).encode()
+                    content_type = "application/json"
+            elif path.endswith((":generateContent", ":streamGenerateContent")):
+                query = parse_qs(url.query)
+                if query.get("key") != ["synthetic-only"]:
+                    self.send_error(401, "Gemini API key required")
+                    return
+                streaming = path.endswith(":streamGenerateContent")
+                if streaming and query.get("alt") != ["sse"]:
+                    self.send_error(400, "Streaming endpoint requires one alt=sse")
+                    return
+                payload = {
+                    "candidates": [
+                        {
+                            "content": {"role": "model", "parts": [{"text": "ok"}]},
+                            "finishReason": "STOP",
+                        }
+                    ],
+                    "usageMetadata": {
+                        "promptTokenCount": 101,
+                        "candidatesTokenCount": 1,
+                        "totalTokenCount": 102,
+                    },
+                }
+                if streaming:
+                    response = ("data: " + json.dumps(payload) + "\n\n").encode()
                     content_type = "text/event-stream"
                 else:
                     response = json.dumps(payload).encode()
@@ -305,3 +343,76 @@ def test_large_vertex_backend_retains_route_forced_streaming(admitted_proxy):
         if line.startswith("data: ") and line != "data: [DONE]"
     ]
     assert events[-1]["type"] == "message_stop"
+
+
+@pytest.mark.parametrize("streaming", [False, True])
+def test_large_gemini_history_preserves_auth_and_streaming_contract(admitted_proxy, streaming):
+    endpoint = "streamGenerateContent" if streaming else "generateContent"
+    response = admitted_proxy.post(
+        f"/v1beta/models/gemini-2.5-flash:{endpoint}?key=synthetic-only&alt=json",
+        json={"contents": [{"role": "user", "parts": [{"text": "history " * 3000}]}]},
+    )
+    assert response.status_code == 200
+    if streaming:
+        assert response.headers["content-type"].startswith("text/event-stream")
+        events = [
+            json.loads(line.removeprefix("data: "))
+            for line in response.text.splitlines()
+            if line.startswith("data: ")
+        ]
+        assert (
+            "".join(
+                part["text"]
+                for event in events
+                for candidate in event.get("candidates", [])
+                for part in candidate["content"]["parts"]
+            )
+            == "ok"
+        )
+        assert events[-1]["candidates"][0]["finishReason"] == "STOP"
+    else:
+        assert response.json()["candidates"][0]["content"]["parts"][0]["text"] == "ok"
+    stats = admitted_proxy.get("/stats").json()
+    assert stats["tokens"]["input_provider_reported"] == 101
+    assert stats["tokens"]["output"] == 1
+    assert stats["tokens"]["proxy_attempted_tokens"] == 0
+    assert stats["tokens"]["saved"] == 0
+    assert stats["requests"]["failed"] == 0
+
+
+@pytest.mark.parametrize("admitted_proxy", ["litellm-openai"], indirect=True)
+@pytest.mark.parametrize("streaming", [False, True])
+def test_large_openai_backend_reports_usage_without_compression(admitted_proxy, streaming):
+    body = {
+        "model": "gpt-4o",
+        "messages": [{"role": "user", "content": "history " * 3000}],
+        "stream": streaming,
+    }
+    if streaming:
+        body["stream_options"] = {"include_usage": True}
+    response = admitted_proxy.post("/v1/chat/completions", json=body)
+    assert response.status_code == 200
+    if streaming:
+        assert response.headers["content-type"].startswith("text/event-stream")
+        events = [
+            json.loads(line.removeprefix("data: "))
+            for line in response.text.splitlines()
+            if line.startswith("data: ") and line != "data: [DONE]"
+        ]
+        assert (
+            "".join(
+                choice["delta"].get("content", "")
+                for event in events
+                for choice in event.get("choices", [])
+            )
+            == "ok"
+        )
+        assert response.text.endswith("data: [DONE]\n\n")
+    else:
+        assert response.json()["choices"][0]["message"]["content"] == "ok"
+    stats = admitted_proxy.get("/stats").json()
+    assert stats["tokens"]["input_provider_reported"] == 101
+    assert stats["tokens"]["output"] == 1
+    assert stats["tokens"]["proxy_attempted_tokens"] == 0
+    assert stats["tokens"]["saved"] == 0
+    assert stats["requests"]["failed"] == 0
