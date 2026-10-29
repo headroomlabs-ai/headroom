@@ -167,10 +167,8 @@ fn discover_onnxruntime_libraries() -> Vec<PathBuf> {
         }
     }
 
-    if let Ok(cwd) = std::env::current_dir() {
-        roots.push(cwd.join(".venv"));
-        roots.push(cwd.join("venv"));
-    }
+    // The cwd may be an untrusted agent workspace. Only discover an environment
+    // there when the operator explicitly selects it with VIRTUAL_ENV/CONDA_PREFIX.
 
     if let Some(user_profile) = env_path("USERPROFILE") {
         roots.extend(versioned_children(
@@ -504,6 +502,81 @@ pub fn map_magika_label(label: &str) -> ContentType {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn check_discovery_root(directory: &str, active_env: Option<&str>) {
+        let root = tempfile::tempdir().unwrap();
+        let environment = root.path().join(directory);
+        #[cfg(target_os = "windows")]
+        let library = environment.join("Lib/site-packages/onnxruntime/capi/onnxruntime.dll");
+        #[cfg(target_os = "macos")]
+        let library =
+            environment.join("lib/python3.11/site-packages/onnxruntime/capi/libonnxruntime.dylib");
+        #[cfg(all(not(target_os = "windows"), not(target_os = "macos")))]
+        let library =
+            environment.join("lib/python3.11/site-packages/onnxruntime/capi/libonnxruntime.so");
+        std::fs::create_dir_all(library.parent().unwrap()).unwrap();
+        std::fs::write(&library, b"not a native library").unwrap();
+
+        // Isolate process cwd and environment from parallel unit tests. The
+        // child enumerates candidates only; it never loads the stub library.
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap());
+        child
+            .arg("--exact")
+            .arg("transforms::magika_detector::tests::discovery_root_child")
+            .arg("--nocapture")
+            .current_dir(root.path())
+            .env_remove("VIRTUAL_ENV")
+            .env_remove("CONDA_PREFIX")
+            .env("HEADROOM_TEST_ORT_LIBRARY", &library)
+            .env(
+                "HEADROOM_TEST_ORT_EXPECTED",
+                if active_env.is_some() { "yes" } else { "no" },
+            );
+        if let Some(variable) = active_env {
+            child.env(variable, &environment);
+        }
+        let output = child.output().unwrap();
+        assert!(
+            output.status.success(),
+            "{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[test]
+    fn discovery_root_child() {
+        let Some(library) = env_path("HEADROOM_TEST_ORT_LIBRARY") else {
+            return;
+        };
+        let expected = std::env::var("HEADROOM_TEST_ORT_EXPECTED").unwrap() == "yes";
+        let candidates = discover_onnxruntime_libraries();
+        assert_eq!(
+            candidates.contains(&library),
+            expected,
+            "candidates: {candidates:?}"
+        );
+    }
+
+    #[test]
+    fn discovery_ignores_cwd_dot_venv() {
+        check_discovery_root(".venv", None);
+    }
+
+    #[test]
+    fn discovery_ignores_cwd_venv() {
+        check_discovery_root("venv", None);
+    }
+
+    #[test]
+    fn discovery_keeps_explicit_virtual_env() {
+        check_discovery_root(".venv", Some("VIRTUAL_ENV"));
+    }
+
+    #[test]
+    fn discovery_keeps_explicit_conda_prefix() {
+        check_discovery_root("venv", Some("CONDA_PREFIX"));
+    }
 
     fn assert_detect(content: &str, expected: ContentType, hint: &str) {
         if let Err(init_reason) = magika_runtime_available_for_session_init() {
