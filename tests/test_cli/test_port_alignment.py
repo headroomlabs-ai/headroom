@@ -434,6 +434,21 @@ class TestHookAlignment:
         message = init_mod.alignment_warning("codex", "init-user", probe=lambda p: False)
         assert message is not None and "--port 8787 codex" in message
 
+    def test_codex_root_openai_base_url_beats_an_inactive_headroom_table(
+        self, home: Path, tmp_path: Path, monkeypatch
+    ) -> None:
+        custom = tmp_path / "custom-codex"
+        custom.mkdir()
+        (custom / "config.toml").write_text(
+            'openai_base_url = "http://127.0.0.1:9200/v1"\n[model_providers.headroom]\n'
+            'base_url = "http://127.0.0.1:8787/v1"\n',
+            encoding="utf-8",
+        )
+        monkeypatch.setenv("CODEX_HOME", str(custom))
+        monkeypatch.setattr(init_mod, "load_manifest", lambda profile: _manifest(profile, 8787))
+        message = init_mod.alignment_warning("codex", "init-user", probe=lambda p: False)
+        assert message is not None and "127.0.0.1:9200" in message
+
     def test_session_start_emits_hook_json(self, claude_settings: Path) -> None:
         self._route_claude(claude_settings, 9200)
         result = CliRunner().invoke(
