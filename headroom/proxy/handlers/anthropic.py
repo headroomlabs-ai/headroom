@@ -1574,7 +1574,9 @@ class AnthropicHandlerMixin:
             # it was looked up by — the cache would never hit and would fill with
             # unreachable entries. Reuse this raw snapshot verbatim at cache.set
             # (the same reason cache_key_fields is snapshotted here, #327).
-            cache_lookup_messages = messages
+            cache_lookup_messages = (
+                copy.deepcopy(messages) if self.cache and not stream else messages
+            )
             # Response-cache partition: a cached response is only ever replayed to a
             # caller presenting the same provider credentials and principal (01-F15).
             # Snapshotted with the key fields so lookup and store agree. None means
@@ -2673,9 +2675,14 @@ class AnthropicHandlerMixin:
                             prefix_tracker.restored_maturation_state = None
                             maturation_mgr.restore_state(state)
                     _maturation_mgr = maturation_mgr
+                    # Never below the floor finalize_turn just replayed: the
+                    # pipeline's freeze is clamped to what the local compression
+                    # cache can byte-replay, which stops at the first tool_result
+                    # it never stored, so on its own it lets a cached Read mature
+                    # and re-write the provider cache from that Read onward.
                     maturation = maturation_mgr.apply(
                         optimized_messages,
-                        frozen_message_count=frozen_message_count,
+                        frozen_message_count=max(frozen_message_count, _confirmed_frozen),
                     )
                     if maturation.replacements_applied or maturation.holding_msg_indices:
                         optimized_messages = maturation.messages
