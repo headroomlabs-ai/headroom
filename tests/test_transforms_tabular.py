@@ -1,6 +1,6 @@
 """Tests for tabular-text + spreadsheet compression.
 
-Covers detection (content_detector), the CSVâ†’SmartCrusher bridge
+Covers detection (content_detector), the CSV→SmartCrusher bridge
 (tabular_ingest), router wiring (content_router), and binary spreadsheet
 ingestion (spreadsheet_ingest / compress_spreadsheet).
 """
@@ -204,7 +204,7 @@ def test_git_status_is_not_a_rectangular_table() -> None:
     assert parse_tabular(status) is None
 
 
-# Detection â€” edge branches --------------------------------------------------
+# Detection — edge branches --------------------------------------------------
 
 
 def test_is_md_separator_needs_two_columns() -> None:
@@ -267,7 +267,7 @@ def test_parse_markdown_table_drops_separator() -> None:
 
 def test_parse_tabular_rejects_ragged_fixed_width(monkeypatch) -> None:
     # Rows with differing cell counts can't be zipped under the headers
-    # without misattributing columns (#1652) â€” must pass through.
+    # without misattributing columns (#1652) — must pass through.
     import headroom.transforms.tabular_ingest as ti
 
     monkeypatch.setattr(
@@ -278,7 +278,7 @@ def test_parse_tabular_rejects_ragged_fixed_width(monkeypatch) -> None:
     ragged = (
         "tool  installed  latest  status\n"
         "rtk  0.42.4  0.43.0  update available\n"
-        "rtk  âœ“  0.42.4  0.42.4  -  up-to-date"
+        "rtk  ✓  0.42.4  0.42.4  -  up-to-date"
     )
     assert ti.parse_tabular(ragged) is None
 
@@ -306,7 +306,7 @@ def test_compress_passes_through_ragged_table(monkeypatch) -> None:
     ragged = (
         "tool  installed  latest  status\n"
         "rtk  0.42.4  0.43.0  update available\n"
-        "rtk  âœ“  0.42.4  0.42.4  -  up-to-date"
+        "rtk  ✓  0.42.4  0.42.4  -  up-to-date"
     )
     result = TabularCompressor().compress(ragged)
     assert not result.was_modified
@@ -587,7 +587,7 @@ def test_rows_to_csv_drops_trailing_empty_rows_and_has_no_dangling_cr() -> None:
     openpyxl's used-range routinely extends past the last data row, so a sheet
     commonly ends in ``(None, None, ...)`` tuples. Those were emitted as blank
     ``,`` rows, and ``csv.writer``'s default ``\\r\\n`` terminator combined with
-    ``.strip("\\n")`` left a dangling ``\\r`` â€” noise fed straight to the LLM.
+    ``.strip("\\n")`` left a dangling ``\\r`` — noise fed straight to the LLM.
     """
     from headroom.transforms.spreadsheet_ingest import _rows_to_csv
 

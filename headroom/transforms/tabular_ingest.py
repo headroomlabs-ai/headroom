@@ -1,14 +1,14 @@
 """Tabular-text compressor: bridges CSV/TSV/markdown tables to SmartCrusher.
 
 Raw tabular *text* (CSV/TSV files, markdown tables, fixed-width tables) has no
-native compressor â€” it would otherwise fall through to plain-text Kompress,
+native compressor — it would otherwise fall through to plain-text Kompress,
 ignoring its row/column structure. This module parses tabular text into a JSON
 array of records and routes it through the existing, battle-tested
 `SmartCrusher`, which already does lossless ``csv-schema`` compaction first and
 lossy row-drop with reversible ``<<ccr:HASH>>`` markers as a fallback.
 
-No new compression algorithm and no new CCR plumbing live here â€” only the
-textâ†’records bridge.
+No new compression algorithm and no new CCR plumbing live here — only the
+text→records bridge.
 """
 
 from __future__ import annotations
@@ -25,7 +25,7 @@ from .content_detector import ContentType, detect_content_type
 _MD_SEP_CELL = re.compile(r"^:?-{2,}:?$")
 
 
-# â”€â”€â”€ Public dataclasses (mirror SearchCompressor / LogCompressor surface) â”€â”€â”€â”€
+# ─── Public dataclasses (mirror SearchCompressor / LogCompressor surface) ────
 
 
 @dataclass
@@ -58,7 +58,7 @@ class TabularCompressionResult:
         return len(self.compressed) / len(self.original)
 
 
-# â”€â”€â”€ Parsers (text â†’ headers + rows) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+# ─── Parsers (text → headers + rows) ─────────────────────────────────────────
 
 
 def parse_csv(content: str, delimiter: str = ",") -> tuple[list[str], list[list[str]]]:
@@ -102,7 +102,7 @@ def parse_markdown_table(content: str) -> tuple[list[str], list[list[str]]]:
 
 
 def parse_fixed_width(content: str) -> tuple[list[str], list[list[str]]]:
-    """Parse whitespace-aligned columns (best-effort, â‰¥ 2 spaces as a gap)."""
+    """Parse whitespace-aligned columns (best-effort, ≥ 2 spaces as a gap)."""
     lines = [ln for ln in content.split("\n") if ln.strip()]
     if len(lines) < 2:
         return [], []
@@ -152,7 +152,7 @@ def parse_tabular(
         return None
     # Ragged tables (rows whose cell count differs from the header count)
     # can't be zipped into records without shifting values under the wrong
-    # column â€” a compressed table must never state facts the original
+    # column — a compressed table must never state facts the original
     # didn't (#1652). Treat them as non-tabular and pass through verbatim.
     width = len(headers)
     if any(len(row) != width for row in rows):
@@ -170,7 +170,7 @@ def parse_tabular(
     return headers, rows, fmt
 
 
-# â”€â”€â”€ Compressor (text â†’ records â†’ SmartCrusher) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+# ─── Compressor (text → records → SmartCrusher) ──────────────────────────────
 
 
 class TabularCompressor:
