@@ -186,6 +186,20 @@ class TestEmbeddingScorer:
         # "failed"/"error" semantically relates to "errors"
         assert scores[0].score > scores[1].score
 
+    def test_batches_past_the_cap_keep_each_score_with_its_item(self, scorer):
+        """Three EMBED_BATCH_SIZE batches of mixed lengths, the related item in
+        the last: a misaligned batch boundary would hand its score away."""
+        items = [
+            f"inventory row {i}: " + "pallets of garden furniture " * (i % 5 + 1) for i in range(40)
+        ]
+        items[37] = "authentication failed for user admin: invalid password"
+
+        scores = [s.score for s in scorer.score_batch(items, "login error")]
+        assert len(scores) == 40
+        assert max(range(40), key=scores.__getitem__) == 37
+        for item, batched in zip(items, scores):
+            assert batched == pytest.approx(scorer.score(item, "login error").score, abs=1e-3)
+
     def test_paraphrase_match(self, scorer):
         """Embeddings match paraphrases."""
         items = [
