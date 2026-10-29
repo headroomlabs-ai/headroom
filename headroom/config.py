@@ -430,9 +430,11 @@ _CCR_RETRIEVE_TOOL_NAME = "headroom_retrieve"
 # wrapper is never exempted as a whole (an `execute` call running anything else
 # stays compressible), and the match keys on the model-authored call arguments
 # -- never on the result content (an `original_content` property is data the
-# model may echo, not recovery proof). Tradeoff, same family as the
-# mcp__<server>__ alias matching above: a wrapper payload that merely mentions
-# `headroom_retrieve(` inside a string (e.g. a shell command being exec'd)
+# model may echo, not recovery proof). A mention inside a comment or a plain
+# '...' / "..." string literal (e.g. a shell command being exec'd) is not a
+# call and does not count. Template literals stay in scope because their
+# `${...}` substitutions run code. Tradeoff, same family as the
+# mcp__<server>__ alias matching above: any other mention that parses as a call
 # over-protects that one output; losing compression is cheap, losing retrieved
 # bytes is not.
 #
@@ -456,6 +458,41 @@ _JS_BRACKET_KEY_RE = re.compile(
     r"""\[\s*\\?(?:"([^"\n\\]{1,200})\\?"|'([^'\n\\]{1,200})\\?')\s*\]"""
     r"""\s*(?:\?\.)?\s*\("""
 )
+# Spans that are never executed: line/block comments and plain string literals.
+# Template literals are consumed as one token (so quotes inside them do not
+# open a bogus string) but are not reported as inert -- see above.
+_JS_INERT_RE = re.compile(
+    r"""//[^\n]*|/\*.*?\*/|"(?:[^"\\\n]|\\.)*"|'(?:[^'\\\n]|\\.)*'|`(?:[^`\\]|\\.)*`""",
+    re.S,
+)
+_JS_LEXICALLY_AMBIGUOUS = frozenset("/\"'`\\")
+
+
+def _js_inert_spans(text: str) -> list[tuple[int, int]]:
+    """Comment and plain-string spans of ``text``, or ``[]`` when unsure.
+
+    This is a token scan, not a JS parser: a regex literal (``/"/``), a
+    division, an escaped-quote payload or an unterminated literal can start a
+    bogus string that swallows a real call. Any such character left outside
+    the recognized tokens means the scan may be out of sync, so nothing is
+    masked and the caller falls back to matching the whole text (fail safe:
+    over-protecting costs compression, hiding a retrieve loses bytes).
+    """
+    spans: list[tuple[int, int]] = []
+    last = 0
+    for match in _JS_INERT_RE.finditer(text):
+        if not _JS_LEXICALLY_AMBIGUOUS.isdisjoint(text[last : match.start()]):
+            return []
+        if not match.group().startswith("`"):
+            spans.append(match.span())
+        last = match.end()
+    if not _JS_LEXICALLY_AMBIGUOUS.isdisjoint(text[last:]):
+        return []
+    return spans
+
+
+def _in_spans(pos: int, spans: list[tuple[int, int]]) -> bool:
+    return any(start <= pos < end for start, end in spans)
 
 
 def _decoded_strings(value: Any) -> list[str]:
@@ -511,12 +548,13 @@ def _orchestrator_invokes_retrieve(name: str, arguments: Any) -> bool:
     for text in texts:
         if _CCR_RETRIEVE_TOOL_NAME not in text:
             continue
+        inert = _js_inert_spans(text)
         for match in _JS_CALL_CHAIN_RE.finditer(text):
-            if _names_retrieve(match.group(1)):
+            if not _in_spans(match.start(1), inert) and _names_retrieve(match.group(1)):
                 return True
         for match in _JS_BRACKET_KEY_RE.finditer(text):
             key = next(group for group in match.groups() if group)
-            if _names_retrieve(key):
+            if not _in_spans(match.start(), inert) and _names_retrieve(key):
                 return True
     return False
 

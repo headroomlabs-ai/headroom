@@ -827,6 +827,59 @@ def test_openai_responses_adapter_preserves_headroom_retrieve_outputs(name, argu
     assert strategy_chain == []
 
 
+@pytest.mark.parametrize(
+    ("script", "protected"),
+    [
+        ('text(await tools.mcp__headroom__headroom_retrieve({hash:"4b83e2e09593"}));', True),
+        # Mixed script: the retrieved bytes share the one exec output.
+        (
+            'text(await tools.exec_command({cmd:"ls"}));\n'
+            'text(await tools.mcp__headroom__headroom_retrieve({hash:"abc"}));',
+            True,
+        ),
+        ('text(await tools.exec_command({cmd:"pytest -q"}));', False),
+        (
+            "// tools.mcp__headroom__headroom_retrieve({hash}) if a marker appears\n"
+            'text(await tools.exec_command({cmd:"pytest -q"}));',
+            False,
+        ),
+        ("text(await tools.exec_command({cmd:\"grep -rn 'headroom_retrieve(' src\"}));", False),
+    ],
+)
+def test_openai_responses_adapter_codex_code_mode_exec_retrieve(script, protected):
+    """Codex code mode calls MCP tools from JavaScript in one ``exec`` custom
+    tool call; only an exec that actually calls headroom_retrieve stays raw."""
+    router = ContentRouter()
+
+    def compress(self, content: str, **_kwargs):
+        return RouterCompressionResult(
+            compressed="compressed exec output",
+            original=content,
+            strategy_used=CompressionStrategy.KOMPRESS,
+        )
+
+    router.compress = MethodType(compress, router)
+    handler = _handler_with_router(router)
+    payload = {
+        "model": "gpt-5",
+        "input": [
+            {"type": "custom_tool_call", "call_id": "call_exec", "name": "exec", "input": script},
+            {
+                "type": "custom_tool_call_output",
+                "call_id": "call_exec",
+                "output": " ".join(f"retrieved{i}" for i in range(180)),
+            },
+        ],
+    }
+
+    new_payload, modified, *_rest = handler._compress_openai_responses_live_text_units_with_router(
+        payload, model="gpt-5", request_id="req_test"
+    )
+
+    assert modified is not protected
+    assert (new_payload == payload) is protected
+
+
 def test_openai_responses_adapter_preserves_excluded_tool_outputs():
     """Regression for #940: outputs for HEADROOM_EXCLUDE_TOOLS tools stay raw.
 

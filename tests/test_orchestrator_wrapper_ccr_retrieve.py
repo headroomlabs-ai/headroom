@@ -177,6 +177,46 @@ class TestOrchestratorUnwrap:
         code = 'const r = await tools?.bash.bash?.({command: "ls"});'
         assert unwrap_tool_call("execute", json.dumps({"code": code}))[0] == "execute"
 
+    def test_retrieve_call_inside_comment_keeps_name(self):
+        """A commented-out call never runs, so its output is not retrieved bytes."""
+        for code in (
+            '// tools.headroom_retrieve({hash: "abc"})\nrun(1);',
+            '/* await tools["headroom_retrieve"]({hash: "abc"}); */\nrun(1);',
+        ):
+            assert unwrap_tool_call("exec", code)[0] == "exec", code
+
+    def test_retrieve_call_inside_string_literal_keeps_name(self):
+        """A shell command that merely mentions the call stays compressible."""
+        for code in (
+            "await tools.exec_command({cmd: \"grep -rn 'headroom_retrieve(' src\"});",
+            "await tools.exec_command({cmd: 'echo tools.headroom_retrieve(1)'});",
+        ):
+            assert unwrap_tool_call("exec", code)[0] == "exec", code
+
+    def test_retrieve_call_after_strings_and_comments_resolves(self):
+        """Masking must not swallow the real call that follows them."""
+        code = (
+            "// it's a retrieve\n"
+            'const note = "a // b";\n'
+            "const r = await tools.headroom_retrieve({hash: 'abc'});"
+        )
+        assert unwrap_tool_call("exec", code)[0] == "headroom_retrieve"
+
+    def test_retrieve_call_inside_template_substitution_resolves(self):
+        """Template literals are not masked: `${...}` substitutions run code."""
+        code = "text(`${await tools.headroom_retrieve({hash: 'abc'})}`);"
+        assert unwrap_tool_call("exec", code)[0] == "headroom_retrieve"
+
+    def test_retrieve_call_after_ambiguous_slash_resolves(self):
+        """A regex literal or division can desync a token scan into a bogus
+        string that swallows the real call; the matcher must stay fail-safe."""
+        for code in (
+            'const q = /"/; await tools.headroom_retrieve({hash:"abc"});',
+            "const q = /'/; await tools.headroom_retrieve({hash:'abc'});",
+            'const n = a / 2; await tools.headroom_retrieve({hash:"abc"}); // "x',
+        ):
+            assert unwrap_tool_call("exec", code)[0] == "headroom_retrieve", code
+
     def test_hermes_bridge_over_orchestrator_retrieve_resolves(self):
         """`tool_call` wrapping an `execute` that runs the retrieval tool: the
         name must resolve through the nested orchestrator, not stop at
