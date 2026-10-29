@@ -234,9 +234,9 @@ class TestGeminiCountTokensCompression:
         assert stats_response.status_code == 200
         stats = stats_response.json()
 
-        # Verify Gemini requests are tracked
-        assert stats["requests"]["total"] >= 1
-        assert "gemini" in stats["requests"]["by_provider"]
+        # countTokens is a sizing call, not a billed request: it is not booked
+        assert stats["requests"]["total"] == 0
+        assert "gemini" not in stats["requests"]["by_provider"]
 
 
 class TestGeminiCountTokensLargeContent:
@@ -413,28 +413,16 @@ class TestGeminiCountTokensErrors:
 class TestGeminiCountTokensStats:
     """Test proxy stats tracking for countTokens requests."""
 
-    def test_stats_track_gemini_provider(self, gemini_client_optimized, api_key):
-        """Stats correctly track Gemini provider."""
-        # Clear stats by getting a fresh client
+    def test_stats_do_not_book_count_tokens(self, gemini_client_optimized, api_key):
+        """countTokens is a sizing call and is not booked as a request."""
         gemini_client_optimized.post(
             f"/v1beta/models/gemini-2.0-flash:countTokens?key={api_key}",
             json={"contents": create_simple_content()},
         )
 
         stats = gemini_client_optimized.get("/stats").json()
-        assert "gemini" in stats["requests"]["by_provider"]
-        assert stats["requests"]["by_provider"]["gemini"] >= 1
-
-    def test_stats_track_model(self, gemini_client_optimized, api_key):
-        """Stats correctly track model used."""
-        gemini_client_optimized.post(
-            f"/v1beta/models/gemini-2.0-flash:countTokens?key={api_key}",
-            json={"contents": create_simple_content()},
-        )
-
-        stats = gemini_client_optimized.get("/stats").json()
-        # Model should be tracked in by_model
-        assert len(stats["requests"]["by_model"]) >= 1
+        assert "gemini" not in stats["requests"]["by_provider"]
+        assert stats["requests"]["total"] == 0
 
     def test_stats_track_tokens_saved(self, gemini_client_optimized, api_key):
         """Stats track tokens saved from compression."""
@@ -476,16 +464,16 @@ class TestGeminiCountTokensIntegration:
         token_count = response.json()["totalTokens"]
         assert token_count > 0
 
-        # Step 3: Verify stats updated
+        # Step 3: countTokens is not booked as a request
         updated_stats = gemini_client_optimized.get("/stats").json()
-        assert updated_stats["requests"]["total"] > initial_stats["requests"]["total"]
+        assert updated_stats["requests"]["total"] == initial_stats["requests"]["total"]
 
         # Step 4: Verify tokens saved is tracked (may be negative for small overhead)
         # Allow for some compression overhead
         assert updated_stats["tokens"]["saved"] >= initial_tokens_saved - 100
 
-    def test_multiple_requests_accumulate_stats(self, gemini_client_optimized, api_key):
-        """Multiple requests correctly accumulate stats."""
+    def test_multiple_requests_are_not_booked(self, gemini_client_optimized, api_key):
+        """Repeated countTokens calls leave the request counter unchanged."""
         initial_stats = gemini_client_optimized.get("/stats").json()
         initial_total = initial_stats["requests"]["total"]
 
@@ -497,4 +485,4 @@ class TestGeminiCountTokensIntegration:
             )
 
         updated_stats = gemini_client_optimized.get("/stats").json()
-        assert updated_stats["requests"]["total"] >= initial_total + 3
+        assert updated_stats["requests"]["total"] == initial_total

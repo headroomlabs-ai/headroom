@@ -383,9 +383,12 @@ def expand_compacted(text: str) -> list[dict[str, Any]] | None:
         if not eq or not name.startswith("@"):
             return None
         try:
-            legends[name[1:]] = json.loads(payload)
+            result = json.loads(payload)
         except (ValueError, TypeError):
             return None
+        if not isinstance(result, list):
+            return None
+        legends[name[1:]] = result
 
     out: list[dict[str, Any]] = []
     for cells in _split_data_rows(rest, declared):
@@ -404,7 +407,10 @@ def expand_compacted(text: str) -> list[dict[str, Any]] | None:
                     _assign(record, col.path, None)
                     continue
                 try:
-                    _assign(record, col.path, legends[col.name][int(value)])
+                    idx_val = int(value)
+                    if idx_val < 0:
+                        return None
+                    _assign(record, col.path, legends[col.name][idx_val])
                 except (ValueError, IndexError):
                     return None
                 continue

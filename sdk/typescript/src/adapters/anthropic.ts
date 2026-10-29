@@ -1,6 +1,5 @@
 import { compress } from "../compress.js";
 import type { CompressOptions } from "../types.js";
-import { anthropicToOpenAI, openAIToAnthropic } from "../utils/format.js";
 
 /* eslint-disable @typescript-eslint/no-explicit-any */
 
@@ -15,6 +14,10 @@ interface AnthropicLike {
  * Wrap an Anthropic client to auto-compress messages before each request.
  *
  * Intercepts `client.messages.create()` only. All other methods pass through.
+ * Messages reach `/v1/compress` in Anthropic shape and come back in Anthropic
+ * shape: the proxy compresses Anthropic content blocks natively, so thinking
+ * blocks, cache_control markers and tool_result blocks are forwarded exactly
+ * as the caller built them.
  *
  * @example
  * ```typescript
@@ -40,20 +43,15 @@ export function withHeadroom<T extends AnthropicLike>(
     const model =
       options.model ?? params.model ?? "claude-sonnet-4-5-20250929";
 
-    const openaiMessages = anthropicToOpenAI(messages);
-    const result = await compress(openaiMessages, {
+    const result = await compress(messages, {
       stack: "adapter_ts_anthropic",
       ...options,
       model,
     });
 
-    const anthropicMessages = result.compressed
-      ? openAIToAnthropic(result.messages)
-      : messages;
-
     return originalCreate({
       ...params,
-      messages: anthropicMessages,
+      messages: result.compressed ? result.messages : messages,
     });
   };
 

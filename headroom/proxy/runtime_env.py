@@ -85,6 +85,12 @@ RUNTIME_ENV_KNOBS: tuple[Knob, ...] = (
         "Max on-disk file size (bytes) the disk-verify fallback will read.",
     ),
     Knob(
+        "HEADROOM_DEFERRED_TOOL_AFFINITY",
+        "bool",
+        "Keep defer_loading tools out of the Anthropic prefix-tracker lineage key "
+        "(default on; 0 counts them again).",
+    ),
+    Knob(
         "HEADROOM_WEB_SEARCH_HISTORY",
         "bool",
         "Drop web_search_call history from a Responses request that declares no "
