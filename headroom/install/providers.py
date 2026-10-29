@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 import re
+import shlex
 import subprocess
 from pathlib import Path
 
@@ -32,7 +33,8 @@ def _merge_marker_block(file_path: Path, block: str, pattern: re.Pattern[str], m
     if file_path.exists():
         existing = fsutil.read_text(file_path)
         if marker in existing:
-            return pattern.sub(block, existing)
+            # A callable replacement: the block is literal text, not a template.
+            return pattern.sub(lambda _match: block, existing)
         return existing.rstrip() + "\n\n" + block + "\n"
     return block + "\n"
 
@@ -40,7 +42,8 @@ def _merge_marker_block(file_path: Path, block: str, pattern: re.Pattern[str], m
 def _env_block(values: dict[str, str]) -> str:
     lines = [_ENV_MARKER_START]
     for name, value in values.items():
-        lines.append(f'export {name}="{value}"')
+        # shlex.quote so `$`, `"` and backticks reach the shell verbatim.
+        lines.append(f"export {name}={shlex.quote(value)}")
     lines.append(_ENV_MARKER_END)
     return "\n".join(lines)
 
