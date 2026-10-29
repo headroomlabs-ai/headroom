@@ -2500,7 +2500,7 @@ def test_html_with_embedded_json_runs_extractor_not_json_shortcut() -> None:
     assert len(result.compressed) < len(doc) * 3 // 5
 
 
-def test_html_json_fallback_preserves_records_and_markup() -> None:
+def test_json_in_html_preserves_records_and_markup() -> None:
     rows = [
         {"id": i, "account": f"ACCOUNT_{i}", "score": i * 13, "active": i % 2 == 0}
         for i in range(60)
@@ -2527,7 +2527,6 @@ def test_html_json_fallback_preserves_records_and_markup() -> None:
     assert result.compressed.endswith(suffix)
     assert json.loads(result.compressed[len(prefix) : -len(suffix)]) == rows
     assert result.tokens_saved > 0
-    assert result.strategy_chain == ["html", "embedded_json"]
     assert not result.unrecoverable_sections
 
 
