@@ -661,6 +661,54 @@ def test_ensure_codex_provider_preserves_profile_overrides(monkeypatch, tmp_path
     assert parsed["profiles"]["work"]["openai_base_url"] == "https://azure.example/v1"
 
 
+def test_ensure_codex_provider_preserves_multiline_inline_profile_overrides(
+    monkeypatch, tmp_path: Path
+) -> None:
+    """A profile in a multi-line inline table (TOML 1.1) keeps its provider."""
+    from headroom.providers.codex.config_toml import loads_codex_config
+
+    init_cli, _ = _load_init_module(monkeypatch)
+    path = tmp_path / "config.toml"
+    path.write_text(
+        'model_provider = "openai"\n'
+        "profiles = {\n"
+        "  work = {\n"
+        '    model_provider = "company",\n'
+        '    openai_base_url = "https://company.example/v1",\n'
+        "  },\n"
+        "}\n",
+        encoding="utf-8",
+    )
+
+    init_cli._ensure_codex_provider(path, 8787)
+
+    parsed = loads_codex_config(path.read_text(encoding="utf-8"))
+    assert parsed["model_provider"] == "headroom"
+    assert parsed["profiles"]["work"] == {
+        "model_provider": "company",
+        "openai_base_url": "https://company.example/v1",
+    }
+
+
+@pytest.mark.parametrize("sep", [" ", "\x85"])
+def test_ensure_codex_provider_keeps_single_line_string_with_unicode_separator(
+    monkeypatch, tmp_path: Path, sep: str
+) -> None:
+    """Provider-looking text after U+2028/U+0085 in a string stays in the value."""
+    from headroom.providers.codex.config_toml import loads_codex_config
+
+    init_cli, _ = _load_init_module(monkeypatch)
+    path = tmp_path / "config.toml"
+    notes = f'hello{sep}model_provider = "company"{sep}world'
+    path.write_text(f"notes = '{notes}'\n\n[features]\nhooks = true\n", encoding="utf-8")
+
+    init_cli._ensure_codex_provider(path, 8787)
+
+    parsed = loads_codex_config(path.read_text(encoding="utf-8"))
+    assert parsed["notes"] == notes
+    assert parsed["model_provider"] == "headroom"
+
+
 def test_ensure_codex_provider_emits_requires_openai_auth_for_chatgpt(
     monkeypatch, tmp_path: Path
 ) -> None:
@@ -705,6 +753,23 @@ def test_ensure_codex_feature_flag_replaces_existing_marker(monkeypatch, tmp_pat
     assert content.count(init_cli._CODEX_FEATURE_MARKER_START) == 1
     assert "hooks = true" in content
     assert "codex_hooks" not in content
+
+
+@pytest.mark.parametrize("sep", [" ", "\x85"])
+def test_ensure_codex_feature_flag_keeps_single_line_string_with_unicode_separator(
+    monkeypatch, tmp_path: Path, sep: str
+) -> None:
+    from headroom.providers.codex.config_toml import loads_codex_config
+
+    init_cli, _ = _load_init_module(monkeypatch)
+    path = tmp_path / "config.toml"
+    notes = f"hello{sep}codex_hooks = true{sep}world"
+    path.write_text(f"[features]\nnotes = '{notes}'\n", encoding="utf-8")
+
+    init_cli._ensure_codex_feature_flag(path)
+
+    parsed = loads_codex_config(path.read_text(encoding="utf-8"))
+    assert parsed["features"] == {"notes": notes, "hooks": True}
 
 
 @pytest.mark.parametrize("custom_home", [False, True])

@@ -66,6 +66,66 @@ def test_no_rewrite_loop(tmp_path):
     assert r.tick() is False
 
 
+@pytest.mark.parametrize(
+    "url",
+    [
+        "http://127.0.0.1:8787",
+        "http://127.0.0.1:8787/",
+        "http://127.0.0.1:8787/v1",
+        "http://localhost:8787",
+        "http://LOCALHOST:8787/v1/",
+    ],
+)
+def test_proxy_own_url_spellings_are_not_captured(tmp_path, url):
+    r, sf, captured = _make(tmp_path)
+    _write(sf, {"env": {"ANTHROPIC_BASE_URL": url}})
+    assert r.tick() is False
+    assert captured == []
+    assert r.current_upstream is None
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "http://127.0.0.1:8788",
+        "http://localhost:9999/v1",
+        "https://127.0.0.1:8787",
+        "http://[::1]:8787",
+        "https://api.deepseek.com/anthropic",
+    ],
+)
+def test_other_ports_and_hosts_are_still_captured(tmp_path, url):
+    r, sf, captured = _make(tmp_path)
+    _write(sf, {"env": {"ANTHROPIC_BASE_URL": url}})
+    assert r.tick() is True
+    assert captured == [url]
+
+
+@pytest.mark.parametrize("url", ["http://127.0.0.1:99999", "http://[::1"])
+def test_unparseable_base_url_is_not_treated_as_the_proxy(tmp_path, url):
+    # urlsplit raises ValueError for these; such a URL is not this proxy.
+    r, sf, captured = _make(tmp_path)
+    _write(sf, {"env": {"ANTHROPIC_BASE_URL": url}})
+    assert r.tick() is True
+    assert captured == [url]
+
+
+def test_ipv6_proxy_address_is_self_only_for_ipv6_bind(tmp_path):
+    sf = tmp_path / "settings.json"
+    captured: list[str] = []
+    r = CCSwitchReconciler(
+        proxy_url="http://[::1]:8787",
+        default_upstream=DEFAULT,
+        set_upstream=captured.append,
+        path=sf,
+    )
+    _write(sf, {"env": {"ANTHROPIC_BASE_URL": "http://[::1]:8787"}})
+    assert r.tick() is False
+    _write(sf, {"env": {"ANTHROPIC_BASE_URL": "http://127.0.0.1:8787"}})
+    assert r.tick() is True
+    assert captured == ["http://127.0.0.1:8787"]
+
+
 def test_switching_provider_recaptures(tmp_path):
     r, sf, captured = _make(tmp_path)
     _write(

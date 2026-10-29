@@ -156,6 +156,10 @@ class GeminiHandlerMixin:
         - thought / thoughtSignature: thinking parts, which must round-trip intact
         - non-string text, which the text round trip cannot rebuild
 
+        The REST API accepts both the camelCase JSON names and the snake_case
+        proto field names (``inline_data``, ``function_call``, ...), so both
+        spellings are checked.
+
         Args:
             content: A single Gemini content entry with 'parts' list.
 
@@ -174,6 +178,13 @@ class GeminiHandlerMixin:
                     "codeExecutionResult",
                     "thought",
                     "thoughtSignature",
+                    "inline_data",
+                    "file_data",
+                    "function_call",
+                    "function_response",
+                    "executable_code",
+                    "code_execution_result",
+                    "thought_signature",
                 )
             ):
                 return True
@@ -269,9 +280,10 @@ class GeminiHandlerMixin:
 
             if include_function_responses:
                 for part in parts:
-                    if "functionResponse" not in part:
+                    function_response = part.get("functionResponse", part.get("function_response"))
+                    if function_response is None:
                         continue
-                    payload = self._function_response_text(part["functionResponse"])
+                    payload = self._function_response_text(function_response)
                     if payload:
                         messages.append({"role": "tool", "content": payload})
 
@@ -1539,28 +1551,29 @@ class GeminiHandlerMixin:
                 max(0, original_tokens - compressed_tokens) if compressed_tokens > 0 else 0
             )
 
-            # Fallback denominator (see comment on the main gemini
-            # record_request site) — pre-comp request size.
-            # countTokens is a sizing helper; it never generates output
-            # tokens and never touches cache. The funnel handles the
-            # "nothing to report" shape with all-zero cache defaults.
-            await self._record_request_outcome(
-                RequestOutcome(
-                    request_id=request_id,
-                    provider=provider_name,
-                    model=model,
-                    status_code=response.status_code,
-                    original_tokens=original_tokens,
-                    optimized_tokens=compressed_tokens,
-                    output_tokens=0,
-                    tokens_saved=tokens_saved,
-                    attempted_input_tokens=compressed_tokens + tokens_saved,
-                    total_latency_ms=total_latency,
-                    transforms_applied=tuple(transforms_applied),
-                    tags=tags,
-                    client=client,
+            # countTokens is a sizing helper: the provider generates and bills
+            # nothing for it, so a successful call is logged below but never
+            # booked as a request or as savings. An upstream rejection (429,
+            # 5xx) still goes through the funnel, which records it under the
+            # rate-limit / failure counters and stops before any success stats.
+            if response.status_code >= 400:
+                await self._record_request_outcome(
+                    RequestOutcome(
+                        request_id=request_id,
+                        provider=provider_name,
+                        model=model,
+                        status_code=response.status_code,
+                        original_tokens=original_tokens,
+                        optimized_tokens=compressed_tokens,
+                        output_tokens=0,
+                        tokens_saved=tokens_saved,
+                        attempted_input_tokens=compressed_tokens + tokens_saved,
+                        total_latency_ms=total_latency,
+                        transforms_applied=tuple(transforms_applied),
+                        tags=tags,
+                        client=client,
+                    )
                 )
-            )
 
             if tokens_saved > 0:
                 logger.info(

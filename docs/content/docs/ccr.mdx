@@ -62,6 +62,19 @@ Headroom injects a `headroom_retrieve` tool into the LLM's available tools:
 
 The LLM sees this tool alongside your application's tools and can call it whenever the compressed data is insufficient.
 
+If your client already registers retrieval through MCP, Headroom keeps that
+client-owned tool instead of adding a second bare `headroom_retrieve`.
+Supported spellings include OpenCode's `headroom_headroom_retrieve` and MCP
+wrappers such as `mcp__headroom__headroom_retrieve` and
+`mcp_Headroom_headroom_retrieve`. The same rule applies to session-aware
+injection and the per-request fallback, so Headroom does not advertise an
+unavailable bare retrieval tool alongside the client's executable alias.
+
+These ownership aliases are limited to the default `headroom` MCP server
+name. An unrelated server such as `mcp__other__headroom_retrieve` does not
+replace the proxy's retrieval tool. Optional CCR system instructions use
+the executable name selected from the available tool definitions.
+
 ## Phase 3: Response Handler
 
 When the LLM calls `headroom_retrieve`:
@@ -71,7 +84,9 @@ When the LLM calls `headroom_retrieve`:
 3. The result is added to the conversation
 4. The API call continues automatically
 
-The client never sees CCR tool calls on the Anthropic and OpenAI proxy paths; Headroom resolves them transparently there.
+On the Anthropic and OpenAI proxy paths, only retrieval-only responses naming
+the proxy's bare `headroom_retrieve` are resolved server-side. Mixed responses
+and all MCP-registered retrieval aliases are forwarded for the client to execute.
 
 <Callout type="warning" title="Gemini CCR boundary">
   Buffered native Gemini requests resolve `headroom_retrieve` server-side and
