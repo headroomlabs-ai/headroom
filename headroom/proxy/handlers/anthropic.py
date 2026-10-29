@@ -3850,9 +3850,11 @@ class AnthropicHandlerMixin:
                 outgoing_model: str | None = None,
                 *,
                 outbound_beta: str = "",
+                operator_context_provider: Any | None = None,
             ) -> Response | None:
                 """Reject only after routing and byte-faithful restoration are final."""
-                if _bypass or not getattr(self.anthropic_provider, "_operator_context_limits", {}):
+                _cbp_provider = operator_context_provider or self.anthropic_provider
+                if _bypass or not getattr(_cbp_provider, "_operator_context_limits", {}):
                     return None
                 _cbp_mode = "observe"
                 try:
@@ -3870,15 +3872,16 @@ class AnthropicHandlerMixin:
                     if not isinstance(_cbp_model, str):
                         return None
                     if (
-                        isinstance(raw_model, str)
+                        _cbp_provider is self.anthropic_provider
+                        and isinstance(raw_model, str)
                         and "context-1m" in outbound_beta.lower()
                         and has_context_1m_suffix(raw_model)
-                        and sanitize_anthropic_model_id(_cbp_model)
+                        and sanitize_anthropic_model_id(_cbp_model.removeprefix("anthropic/"))
                         == sanitize_anthropic_model_id(raw_model)
                     ):
                         _cbp_model = raw_model
 
-                    _cbp_declared = self.anthropic_provider.get_operator_context_limit(_cbp_model)
+                    _cbp_declared = _cbp_provider.get_operator_context_limit(_cbp_model)
                     if _cbp_declared is None:
                         return None
 
@@ -3893,8 +3896,10 @@ class AnthropicHandlerMixin:
                         return None
                     _cbp_outbound_beta = outbound_beta
                     _cbp_has_context1m = "context-1m" in _cbp_outbound_beta.lower()
-                    if _cbp_has_context1m and not (
-                        self.anthropic_provider.has_raw_operator_context_limit(_cbp_model)
+                    if (
+                        _cbp_provider is self.anthropic_provider
+                        and _cbp_has_context1m
+                        and not self.anthropic_provider.has_raw_operator_context_limit(_cbp_model)
                     ):
                         _cbp_mode = "observe"
                         logger.warning(
@@ -4132,14 +4137,44 @@ class AnthropicHandlerMixin:
                     budget_refusal_recorded = True
                 return pending_budget_error
 
+            def _prepared_anthropic_beta(prepared: dict[str, Any]) -> str:
+                for field in ("extra_headers", "headers"):
+                    outbound_headers = prepared.get(field)
+                    if isinstance(outbound_headers, dict):
+                        for key, value in outbound_headers.items():
+                            if key.lower() == "anthropic-beta" and isinstance(value, str):
+                                return value
+                for key in ("anthropic-beta", "anthropic_beta"):
+                    value = prepared.get(key)
+                    if isinstance(value, str):
+                        return value
+                return ""
+
             async def _prepare_budget_backend(backend):
-                if _bypass or not getattr(self.anthropic_provider, "_operator_context_limits", {}):
+                _backend_provider = (
+                    self.openai_provider
+                    if getattr(backend, "provider", "") == "openai"
+                    else self.anthropic_provider
+                )
+                _operator_limits = getattr(_backend_provider, "_operator_context_limits", {})
+                if _bypass or not _operator_limits:
                     return None, None
                 try:
                     candidate = backend.map_model_id(body.get("model") or model)
                 except Exception:
                     return None, None
-                if self.anthropic_provider.get_operator_context_limit(candidate) is None:
+                _has_candidate_limit = (
+                    _backend_provider.get_operator_context_limit(candidate) is not None
+                )
+                _raw_context1m_candidate = (
+                    _backend_provider is self.anthropic_provider
+                    and isinstance(raw_model, str)
+                    and has_context_1m_suffix(raw_model)
+                    and self.anthropic_provider.has_raw_operator_context_limit(raw_model)
+                    and sanitize_anthropic_model_id(candidate.removeprefix("anthropic/"))
+                    == sanitize_anthropic_model_id(raw_model)
+                )
+                if not _has_candidate_limit and not _raw_context1m_candidate:
                     return None, None
                 try:
                     prepared = backend.prepare_message(body, headers, stream=stream)
@@ -4153,7 +4188,12 @@ class AnthropicHandlerMixin:
                     if rejecting:
                         return None, await _budget_evaluation_unavailable()
                     return None, None
-                refusal = await _context_budget_rejection(prepared, prepared.get("model"))
+                refusal = await _context_budget_rejection(
+                    prepared,
+                    prepared.get("model"),
+                    outbound_beta=_prepared_anthropic_beta(prepared),
+                    operator_context_provider=_backend_provider,
+                )
                 return prepared, refusal
 
             # Forward request - use Bedrock backend if configured, otherwise direct API

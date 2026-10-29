@@ -1003,6 +1003,105 @@ def test_destination_identity_uses_backend_resolver_model_and_tokenizer(monkeypa
     assert target_model in tokenized_models
 
 
+def test_openai_backend_uses_its_namespaced_operator_limit(monkeypatch):
+    import headroom.tokenizers as _tk
+    from headroom.backends.base import BackendResponse
+    from headroom.providers.openai import OpenAIProvider
+
+    monkeypatch.setenv("HEADROOM_CONTEXT_LIMIT_MODE", "reject")
+    monkeypatch.setenv("HEADROOM_CONTEXT_LIMIT_SAFETY_MARGIN", "0")
+    monkeypatch.setenv(
+        "HEADROOM_MODEL_LIMITS",
+        json.dumps({"openai": {"context_limits": {"gpt-4o": 1_000}}}),
+    )
+    monkeypatch.setattr(_tk, "get_tokenizer", lambda model: _DummyTokenizer(2_000))
+    handler = _make_handler_subclass()(operator_limit=None)
+    handler.openai_provider = OpenAIProvider()
+
+    class OpenAIBackend:
+        provider = "openai"
+        name = "litellm-openai"
+        sends = 0
+
+        def map_model_id(self, model):
+            return f"openai/{model}"
+
+        def prepare_message(self, body, headers, *, stream=False):
+            return {**body, "model": self.map_model_id(body["model"])}
+
+        async def send_message(self, *args, **kwargs):
+            self.sends += 1
+            return BackendResponse(body={})
+
+    backend = OpenAIBackend()
+    handler.anthropic_backend = backend
+    response = anyio.run(
+        handler.handle_anthropic_messages,
+        _build_request(
+            {
+                "model": "gpt-4o",
+                "messages": [{"role": "user", "content": "hi"}],
+                "max_tokens": 100,
+            }
+        ),
+    )
+
+    assert response.status_code == 400
+    assert "openai/gpt-4o" in json.loads(response.body)["error"]["message"]
+    assert backend.sends == 0
+
+
+@pytest.mark.parametrize("prepared_beta", ["context-1m", ""])
+def test_backend_one_million_limit_requires_prepared_beta(monkeypatch, prepared_beta):
+    import headroom.tokenizers as _tk
+    from headroom.backends.base import BackendResponse
+
+    monkeypatch.setenv("HEADROOM_CONTEXT_LIMIT_MODE", "reject")
+    monkeypatch.setenv("HEADROOM_CONTEXT_LIMIT_SAFETY_MARGIN", "0")
+    monkeypatch.setattr(_tk, "get_tokenizer", lambda model: _DummyTokenizer(2_000))
+    handler = _make_handler_subclass()(operator_limit=None)
+    handler.anthropic_provider._operator_context_limits["claude-sonnet-4[1m]"] = 1_000
+
+    class AnthropicBackend:
+        provider = "anthropic"
+        name = "litellm-anthropic"
+        sends: list[dict] = []
+
+        def map_model_id(self, model):
+            return f"anthropic/{model}"
+
+        def prepare_message(self, body, headers, *, stream=False):
+            prepared = {**body, "model": self.map_model_id(body["model"])}
+            if prepared_beta:
+                prepared["extra_headers"] = {"anthropic-beta": prepared_beta}
+            return prepared
+
+        async def send_message(self, body, headers, *, prepared=None):
+            self.sends.append(prepared)
+            return BackendResponse(body={}, status_code=418, error="synthetic")
+
+    backend = AnthropicBackend()
+    handler.anthropic_backend = backend
+    response = anyio.run(
+        handler.handle_anthropic_messages,
+        _build_request(
+            {
+                "model": "claude-sonnet-4[1m]",
+                "messages": [{"role": "user", "content": "hi"}],
+                "max_tokens": 10,
+            },
+            headers={"anthropic-beta": "context-1m"},
+        ),
+    )
+
+    if prepared_beta:
+        assert response.status_code == 400
+        assert backend.sends == []
+    else:
+        assert response.status_code == 418
+        assert len(backend.sends) == 1
+
+
 def test_destination_identity_uses_url_model_override_limit_and_tokenizer(monkeypatch):
     """A path-selected model owns the limit even when the body keeps its model."""
     monkeypatch.setenv("HEADROOM_CONTEXT_LIMIT_MODE", "reject")

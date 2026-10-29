@@ -77,6 +77,21 @@ class TestOpenAITokenCounting:
         assert count >= 4
 
 
+def test_openai_operator_limit_tracks_only_configured_declarations(monkeypatch):
+    import json
+
+    from headroom.providers.openai import OpenAIProvider
+
+    monkeypatch.setenv(
+        "HEADROOM_MODEL_LIMITS",
+        json.dumps({"openai": {"context_limits": {"gpt-4o": 1_000}}}),
+    )
+    provider = OpenAIProvider()
+
+    assert provider.get_operator_context_limit("openai/gpt-4o") == 1_000
+    assert provider.get_operator_context_limit("gpt-4o-mini") is None
+
+
 class TestOpenAIModelLimits:
     def test_get_context_limit_gpt4o(self, openai_provider):
         assert openai_provider.get_context_limit("gpt-4o") == 128000

@@ -1310,12 +1310,7 @@ class LiteLLMBackend(Backend):
         # Forwarding x-api-key (e.g. sk-ant-dummy) would override their credentials.
         _env_auth_providers = ("bedrock", "vertex_ai", "vertex_ai_beta", "sagemaker")
         if self.provider not in _env_auth_providers:
-            auth_header = headers.get("authorization", headers.get("Authorization", ""))
-            _caller_key = (
-                auth_header[7:]
-                if auth_header.startswith("Bearer ")
-                else headers.get("x-api-key", "")
-            )
+            _caller_key = _caller_key_from_headers(headers)
             # Only forward it if it can actually authenticate the TARGET.
             if _caller_key and _caller_key_travels_to(litellm_model, _caller_key):
                 kwargs["api_key"] = _caller_key

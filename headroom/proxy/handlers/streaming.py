@@ -649,6 +649,7 @@ class StreamingMixin:
                     continuation_body, headers, continuation_outbound
                 )
                 if refusal is not None:
+                    stream_state["stream_failed"] = True
                     yield _upstream_error_frame(refusal.body, request_id)
                     return
             continuation_bytes = continuation_outbound.content

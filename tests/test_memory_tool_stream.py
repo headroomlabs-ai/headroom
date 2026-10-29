@@ -240,6 +240,7 @@ class TestStreamingMemoryContinuation:
 
         proxy = _proxy([_sse([TEXT, SAVE], "tool_use")], SAVE_RESULT)
         proxy._record_request_outcome = AsyncMock()
+        prefix_tracker = MagicMock()
         measure = ItemMeasure(
             sent_tokens=10,
             removed_old=2,
@@ -268,6 +269,7 @@ class TestStreamingMemoryContinuation:
             server_memory_tool_names=MEMORY_TOOLS,
             context_budget_guard=guard,
             savings_measure=measure,
+            prefix_tracker=prefix_tracker,
         )
 
         errors = [event for event in events if event["type"] == "error"]
@@ -296,6 +298,8 @@ class TestStreamingMemoryContinuation:
         proxy._record_request_outcome.assert_awaited_once()
         outcome = proxy._record_request_outcome.await_args.args[0]
         assert outcome.savings_measure == measure
+        assert outcome.status_code == 502
+        prefix_tracker.update_from_response.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_memory_call_runs_server_side_and_answer_streams_on(self) -> None:
