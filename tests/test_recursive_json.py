@@ -25,6 +25,19 @@ def test_embedded_json_routed_and_surroundings_exact() -> None:
     )
 
 
+def test_noop_json_span_does_not_block_later_compaction() -> None:
+    compact = json.dumps([{"id": i, "ok": True} for i in range(6)], separators=(",", ":"))
+    rows = [{"id": i, "message": f"entry-{i}"} for i in range(20, 26)]
+    padded = json.dumps(rows, indent=2)
+    leading, between, trailing = "Début 🚀\r\nfirst: ", "\r\nsecond: ", "\r\nFin."
+    content = leading + compact + between + padded + trailing
+
+    assert route_embedded_json(content, _minify_dispatch) == (
+        leading + compact + between + json.dumps(rows, separators=(",", ":")) + trailing,
+        True,
+    )
+
+
 def test_ccr_marker_span_passed_through() -> None:
     content = 'prefix [{"a":1,"b":2},{"a":3,"b":"<<ccr:deadbeef,json,900>>"}] suffix'
     assert route_embedded_json(content, _minify_dispatch) is None

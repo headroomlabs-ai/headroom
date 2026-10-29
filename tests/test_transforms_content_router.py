@@ -2500,41 +2500,35 @@ def test_html_with_embedded_json_runs_extractor_not_json_shortcut() -> None:
     assert len(result.compressed) < len(doc) * 3 // 5
 
 
-def test_html_extraction_miss_still_gets_deferred_json_splice() -> None:
-    """Deferring must not LOSE the embedded-JSON win when extraction finds nothing.
-
-    A shell-only HTML document makes the extractor come back empty; the
-    deferred splice then still compresses the embedded array. Before the fix
-    this shape short-circuited at the top (chain ``["embedded_json"]``); now
-    the block first proves the HTML strategy is a miss (chain
-    ``["html", "embedded_json"]``) with the same spliced output.
-    """
-    pytest.importorskip("trafilatura")
-    embedded = json.dumps(
-        [
-            {"id": i, "name": f"item-{i}", "tags": ["alpha", "beta"], "score": i * 3}
-            for i in range(40)
-        ]
+def test_html_json_fallback_preserves_records_and_markup() -> None:
+    rows = [
+        {"id": i, "account": f"ACCOUNT_{i}", "score": i * 13, "active": i % 2 == 0}
+        for i in range(60)
+    ]
+    prefix = (
+        "<!DOCTYPE html>\n<html><head><title>data</title></head>\n<body>\n"
+        '<script type="application/json">'
     )
-    shell = (
-        "<!DOCTYPE html>\n<html><head><title>t</title></head>\n<body>\n"
-        '<script type="application/json">' + embedded + "</script>\n"
-        "</body></html>\n"
-    )
-    router = ContentRouter()
-    # sanity: extraction finds nothing on this shell (empty or None)
-    extractor = router._get_html_extractor()
-    assert extractor is not None
-    assert not (extractor.extract(shell).extracted or "").strip()
-
-    text, _tokens, chain, _reversible = router._apply_strategy_to_content(
-        shell, CompressionStrategy.HTML, "", None, 1.0
+    suffix = "</script>\n</body></html>\n"
+    shell = prefix + json.dumps(rows) + suffix
+    router = ContentRouter(
+        ContentRouterConfig(
+            lossless=False,
+            enable_html_extractor=True,
+            smart_crusher_lossless_only=True,
+            smart_crusher_with_compaction=False,
+            enable_kompress=False,
+        )
     )
 
-    assert chain == ["html", "embedded_json"]
-    assert len(text) < len(shell)
-    json_marker = '"id":'
-    assert json_marker not in text  # the array was compressed away
+    result = router.compress(shell)
+
+    assert result.compressed.startswith(prefix)
+    assert result.compressed.endswith(suffix)
+    assert json.loads(result.compressed[len(prefix) : -len(suffix)]) == rows
+    assert result.tokens_saved > 0
+    assert result.strategy_chain == ["html", "embedded_json"]
+    assert not result.unrecoverable_sections
 
 
 # A Claude Code Read of Rust: line-numbered code that code_aware hands back
