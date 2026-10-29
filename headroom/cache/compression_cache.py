@@ -76,6 +76,22 @@ def _extract_tool_result_content(msg: dict) -> str | None:
     return None
 
 
+def _carries_tool_result_text(msg: dict) -> bool:
+    """Whether any tool result in ``msg`` holds text (both formats)."""
+    if msg.get("role") == "tool":
+        results = [msg.get("content")]
+    else:
+        results = [
+            b.get("content")
+            for b in msg.get("content") or []
+            if isinstance(b, dict) and b.get("type") == "tool_result"
+        ]
+    return any(
+        isinstance(c, str) or (isinstance(c, list) and _extract_text_from_blocks(c) is not None)
+        for c in results
+    )
+
+
 def _swap_tool_result_content(msg: dict, new_content: str) -> dict:
     """Deep copy msg and replace tool result content with new_content."""
     new_msg = copy.deepcopy(msg)
@@ -294,9 +310,10 @@ class CompressionCache:
         """Count consecutive stable messages from the start.
 
         A message is stable if it is a plain user/assistant/system message,
-        an assistant message with tool_use blocks, or a tool_result whose
-        content hash is already in the cache. The first unstable tool_result
-        (cache miss) stops the count.
+        an assistant message with tool_use blocks, a tool_result whose
+        content hash is already in the cache, or a tool_result with no text
+        (nothing to replay). The first unstable tool_result (cache miss)
+        stops the count.
 
         The trailing message is *always* excluded from the frozen prefix
         (cap of ``len(messages) - 1``). The trailing message represents
@@ -319,9 +336,15 @@ class CompressionCache:
                         h = self.content_hash(content)
                         if h not in self._cache and h not in self._stable_hashes:
                             break
-                    else:
-                        # tool_result with non-string content; treat as unstable
+                    elif _carries_tool_result_text(msg):
+                        # Text after a textless first tool_result: the cache
+                        # keys a message by its first one, so this text was
+                        # never stored and cannot be byte-replayed.
                         break
+                    # A tool_result with no text at all (a ToolSearch
+                    # tool_reference list, an image) gives the cache nothing
+                    # to replay, so it is stable. As a miss it stopped the
+                    # count for the rest of the session.
                 # Regular user/assistant/system messages and assistant+tool_use
                 # are always stable — fall through.
                 count += 1
