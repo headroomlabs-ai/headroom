@@ -21,12 +21,27 @@ Batch API Support:
 - Works with all providers: Anthropic, OpenAI, Google
 """
 
-from .batch_processor import (
-    BatchResultProcessor,
-    BatchResultProcessorConfig,
-    ProcessedBatchResult,
-    process_batch_results,
-)
+# Batch processing is optional: it imports httpx to make continuation API
+# calls, but httpx is only declared under the [proxy]/[mcp]/[dev] extras, not
+# the base install. SmartCrusher (core compression) reaches CCR_TOOL_NAME
+# below through this package's __init__, so a hard import here breaks core
+# compression for anyone who installed plain `headroom-ai`.
+try:
+    from .batch_processor import (
+        BatchResultProcessor,
+        BatchResultProcessorConfig,
+        ProcessedBatchResult,
+        process_batch_results,
+    )
+
+    BATCH_PROCESSING_AVAILABLE = True
+except ImportError:
+    BatchResultProcessor = None  # type: ignore
+    BatchResultProcessorConfig = None  # type: ignore
+    ProcessedBatchResult = None  # type: ignore
+    process_batch_results = None  # type: ignore
+    BATCH_PROCESSING_AVAILABLE = False
+
 from .batch_store import (
     BatchContext,
     BatchContextStore,
@@ -109,6 +124,7 @@ __all__ = [
     "get_batch_context_store",
     "process_batch_results",
     "reset_batch_context_store",
+    "BATCH_PROCESSING_AVAILABLE",
     # MCP server
     "HeadroomMCPServer",
     "create_ccr_mcp_server",
