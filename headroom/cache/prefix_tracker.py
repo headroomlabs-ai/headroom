@@ -563,12 +563,30 @@ def classify_history_relation(
     return _classify_history_canonical(current, previous)
 
 
+def cache_key_tools(tools: Any) -> Any:
+    """The Anthropic ``tools`` that count toward the prompt-cache key.
+
+    A ``defer_loading`` tool is kept out of the prompt until the model loads
+    it, so adding one to ``tools`` leaves the cached prefix readable. Claude
+    Code appends every tool its ToolSearch loads to ``tools``, still marked
+    deferred; counting those would start a new lineage at frozen=0 after each
+    load and re-run the whole history. Every other tool, and a tool whose
+    ``defer_loading`` is cleared, still counts. The Anthropic handler decides
+    when to apply this (first-party upstream, ``HEADROOM_DEFERRED_TOOL_AFFINITY``).
+    """
+    if not isinstance(tools, list):
+        return tools
+    return [t for t in tools if not (isinstance(t, dict) and t.get("defer_loading"))]
+
+
 def segment_fingerprint(value: Any) -> str:
     """Stable hash for non-message provider cache-key segments.
 
     Cache-control placement and transport annotations are deliberately ignored;
-    semantic tool/model/thinking changes remain visible.  The hash is affinity
-    metadata only and is never used to reconstruct or forward request content.
+    semantic tool/model/thinking changes remain visible.  It hashes what it is
+    given, so callers pass only what the provider keys its cache on (for
+    Anthropic tools, :func:`cache_key_tools`).  The hash is affinity metadata
+    only and is never used to reconstruct or forward request content.
     """
     canonical = _lineage_snapshot(_canonicalize_for_prefix_compare(value))
     encoded = json.dumps(

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import subprocess
+import sys
 from pathlib import Path
 
 import click
@@ -947,6 +948,63 @@ def test_start_and_stop_supervisor_darwin_windows_and_none(monkeypatch) -> None:
     ]
 
 
+@pytest.mark.parametrize(
+    "stderr",
+    [
+        "ERROR: The system cannot find the file specified.",
+        'ERROR: The specified task name "headroom-default-health" does not exist in the system.',
+    ],
+)
+def test_windows_stop_tolerates_absent_tasks(monkeypatch: pytest.MonkeyPatch, stderr: str) -> None:
+    # Session-scoped fallback installs never create the `-startup` task, and
+    # the health task can be missing too, so stop must not raise when
+    # schtasks reports the task as missing.
+    monkeypatch.setattr("headroom.install.supervisors.sys.platform", "win32")
+    calls: list[list[str]] = []
+    monkeypatch.setattr(
+        "headroom.install.supervisors.subprocess.run",
+        lambda command, **kwargs: _LaunchctlResult(0),
+    )
+
+    def fake_run(command: list[str], **kwargs: object) -> object:
+        calls.append(command)
+        return type(
+            "Result",
+            (),
+            {
+                "returncode": 1,
+                "stdout": "",
+                "stderr": stderr,
+            },
+        )()
+
+    monkeypatch.setattr("headroom.install.supervisors.run", fake_run)
+    stop_supervisor(_manifest(supervisor=SupervisorKind.SERVICE.value))
+    assert calls == [
+        ["schtasks", "/Change", "/TN", "headroom-default-health", "/DISABLE"],
+        ["schtasks", "/End", "/TN", "headroom-default-startup"],
+    ]
+
+
+def test_windows_stop_surfaces_access_denied(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr("headroom.install.supervisors.sys.platform", "win32")
+
+    def fake_run(command: list[str], **kwargs: object) -> object:
+        return type(
+            "Result",
+            (),
+            {
+                "returncode": 1,
+                "stdout": "",
+                "stderr": "ERROR: Access is denied.",
+            },
+        )()
+
+    monkeypatch.setattr("headroom.install.supervisors.run", fake_run)
+    with pytest.raises(click.ClickException, match="Access is denied"):
+        stop_supervisor(_manifest(supervisor=SupervisorKind.SERVICE.value))
+
+
 def test_macos_start_bootstraps_when_job_not_registered(monkeypatch, tmp_path: Path) -> None:
     # Post-`stop`/`restart` state: the job was booted out, so `kickstart` fails
     # (launchctl 113) and start must bootstrap the plist instead.
@@ -1182,6 +1240,57 @@ def test_remove_supervisor_darwin_and_windows(monkeypatch, tmp_path: Path) -> No
         ["schtasks", "/Delete", "/TN", "headroom-default-health", "/F"],
     ]
     assert calls == windows_cleanup + windows_cleanup
+
+
+@pytest.mark.skipif(
+    sys.platform.startswith("win"),
+    reason="POSIX mode bits are advisory on Windows, where access is governed by ACLs",
+)
+def test_render_runner_scripts_are_owner_only_because_they_export_secrets(
+    monkeypatch, tmp_path: Path
+) -> None:
+    """0700, not 0755: the export lines can carry a provider API key.
+
+    `headroom install --env ANTHROPIC_API_KEY=...` lands in `base_env`, and
+    these scripts `export` every entry in cleartext because launchd/systemd
+    hand the process a bare environment. At 0755 that put a live key in a
+    world-readable file. The supervisor runs the script as the installing user
+    (user scope) or as root (system scope), so neither needs the other bits.
+    """
+    monkeypatch.setattr("headroom.install.supervisors.sys.platform", "linux")
+    monkeypatch.setattr(
+        "headroom.install.supervisors.resolve_headroom_command", lambda: ["headroom"]
+    )
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    manifest = _manifest(base_env={"ANTHROPIC_API_KEY": "sk-ant-api03-not-a-real-key"})
+
+    records = render_runner_scripts(manifest)
+
+    assert records
+    for record in records:
+        path = Path(record.path)
+        content = path.read_text(encoding="utf-8")
+        assert "export ANTHROPIC_API_KEY=sk-ant-api03-not-a-real-key" in content
+        mode = path.stat().st_mode & 0o777
+        assert mode == 0o700, f"{path.name} is {mode:04o}, exposing an API key"
+
+
+@pytest.mark.skipif(
+    sys.platform.startswith("win"),
+    reason="POSIX mode bits are advisory on Windows, where access is governed by ACLs",
+)
+def test_render_unix_runner_narrows_a_script_written_by_an_earlier_version(
+    monkeypatch, tmp_path: Path
+) -> None:
+    """Re-running `install apply` must fix an existing 0755 runner script."""
+    monkeypatch.setattr("headroom.install.supervisors.sys.platform", "linux")
+    path = tmp_path / "run-headroom.sh"
+    path.write_text("#!/usr/bin/env bash\n")
+    path.chmod(0o755)
+
+    _render_unix_runner(path, ["headroom", "proxy"], {"ANTHROPIC_API_KEY": "sk-ant-x"})
+
+    assert path.stat().st_mode & 0o777 == 0o700
 
 
 @pytest.mark.parametrize(

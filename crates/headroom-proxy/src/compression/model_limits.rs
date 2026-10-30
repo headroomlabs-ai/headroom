@@ -187,8 +187,11 @@ mod tests {
             "claude-opus-5-5",
             "claude-opus-5",
             "claude-fable-5-1",
+            "claude-haiku-5-5",
             "global.anthropic.claude-sonnet-5-5",
             "vertex_ai/claude-sonnet-5-5",
+            "us.anthropic.claude-haiku-5-5",
+            "vertex_ai/claude-haiku-5-5",
         ] {
             assert_eq!(context_window_for(model), 1_000_000, "{model}");
         }

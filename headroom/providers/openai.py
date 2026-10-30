@@ -646,7 +646,7 @@ class OpenAIProvider(Provider):
         if model not in _UNKNOWN_MODEL_WARNINGS:
             _UNKNOWN_MODEL_WARNINGS.add(model)
             logger.warning(
-                f"Unknown OpenAI model '{model}': {reason} ({limit:,} tokens). "
+                f"Unknown OpenAI model {safe_id(model)}: {reason} ({limit:,} tokens). "
                 f"To configure explicitly, set HEADROOM_MODEL_LIMITS env var or "
                 f"add to ~/.headroom/models.json"
             )
