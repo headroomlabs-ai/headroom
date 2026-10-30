@@ -60,6 +60,23 @@ from .base import (
 logger = logging.getLogger(__name__)
 
 
+def _now_matching(reference: datetime) -> datetime:
+    """Return the current time with tzinfo matching ``reference``.
+
+    A ``CachedContentInfo`` timestamp may be naive (the local-time default this
+    module's own examples produce with ``datetime.now() + timedelta(...)``) or
+    timezone-aware (Google's ``genai.caching.CachedContent.expire_time`` is an
+    aware RFC3339 value, and the documented integration registers it directly).
+    Comparing or subtracting a naive ``datetime.now()`` against an aware
+    ``expires_at`` raises ``TypeError``, which crashed ``register_cache`` and
+    every ``is_expired`` consumer. Anchoring "now" to the same awareness as the
+    value it is measured against is correct for both: ``datetime.now(None)`` is
+    the naive local time used before, and ``datetime.now(tz)`` is the aware
+    instant for a tz-aware timestamp.
+    """
+    return datetime.now(reference.tzinfo)
+
+
 # Google-specific constants
 GOOGLE_MIN_CACHE_TOKENS = 32_768  # 32K tokens minimum
 GOOGLE_CACHE_DISCOUNT = 0.75  # 75% discount on cached tokens
@@ -100,18 +117,18 @@ class CachedContentInfo:
     @property
     def is_expired(self) -> bool:
         """Check if cache has expired."""
-        return datetime.now() >= self.expires_at
+        return _now_matching(self.expires_at) >= self.expires_at
 
     @property
     def ttl_remaining_seconds(self) -> int:
         """Seconds remaining until expiry."""
-        remaining = (self.expires_at - datetime.now()).total_seconds()
+        remaining = (self.expires_at - _now_matching(self.expires_at)).total_seconds()
         return max(0, int(remaining))
 
     @property
     def age_seconds(self) -> int:
         """Age of the cache in seconds."""
-        return int((datetime.now() - self.created_at).total_seconds())
+        return int((_now_matching(self.created_at) - self.created_at).total_seconds())
 
     def to_dict(self) -> dict[str, Any]:
         """Serialize to dictionary."""

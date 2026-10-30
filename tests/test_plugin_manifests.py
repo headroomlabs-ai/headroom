@@ -10,10 +10,32 @@ def _load_json(relative_path: str) -> object:
     return json.loads((REPO_ROOT / relative_path).read_text(encoding="utf-8"))
 
 
+# Plugins built on Claude Code's function hooks, which Copilot CLI cannot load.
+CLAUDE_CODE_ONLY = {"headroom-snip"}
+
+
 def test_marketplace_manifests_match() -> None:
-    assert _load_json(".claude-plugin/marketplace.json") == _load_json(
-        ".github/plugin/marketplace.json"
-    )
+    claude = _load_json(".claude-plugin/marketplace.json")
+    assert isinstance(claude, dict)
+    shared = {
+        **claude,
+        "plugins": [p for p in claude["plugins"] if p["name"] not in CLAUDE_CODE_ONLY],
+    }
+    assert shared == _load_json(".github/plugin/marketplace.json")
+
+
+def test_claude_code_only_plugins_are_listed_and_versioned() -> None:
+    marketplace = _load_json(".claude-plugin/marketplace.json")
+    assert isinstance(marketplace, dict)
+    for entry in marketplace["plugins"]:
+        if entry["name"] not in CLAUDE_CODE_ONLY:
+            continue
+        plugin_root = (REPO_ROOT / entry["source"]).resolve()
+        manifest = _load_json(f"{entry['source']}/.claude-plugin/plugin.json")
+        assert isinstance(manifest, dict)
+        assert manifest["name"] == entry["name"]
+        assert manifest["version"] == entry["version"] == marketplace["metadata"]["version"]
+        assert (plugin_root / "hooks" / "hooks.json").is_file()
 
 
 def test_plugin_manifests_share_core_metadata() -> None:
@@ -25,6 +47,20 @@ def test_plugin_manifests_share_core_metadata() -> None:
         assert claude[key] == copilot[key]
     assert "hooks" not in claude
     assert copilot["hooks"] == "./hooks"
+
+
+def test_plugin_hooks_timeout_exceeds_cold_start_wait() -> None:
+    """The plugin's `ensure` hooks are killed by the host (Claude Code, etc.)
+    at their declared `timeout`, independent of anything inside the process.
+    Headroom's own cold-start path can take up to wait_ready's 45s ceiling
+    (headroom/cli/init.py), so a shorter external timeout makes the hook
+    unwinnable by construction on every session start (#3417)."""
+    hooks = _load_json("plugins/headroom-agent-hooks/hooks/hooks.json")
+    assert isinstance(hooks, dict)
+    for event in ("SessionStart", "PreToolUse"):
+        for entry in hooks["hooks"][event]:
+            for hook in entry["hooks"]:
+                assert hook["timeout"] > 45
 
 
 def test_marketplace_entry_points_to_plugin_root() -> None:
@@ -53,3 +89,26 @@ def test_plugin_metadata_points_to_upstream_repo() -> None:
     assert claude["author"]["url"] == expected_repo
     assert claude["homepage"] == expected_repo
     assert claude["repository"] == expected_repo
+
+
+def test_plugin_hooks_share_anchored_launcher_and_rootless_tail() -> None:
+    hooks = _load_json("plugins/headroom-agent-hooks/hooks/hooks.json")
+    assert isinstance(hooks, dict)
+    commands = [
+        entry["hooks"][0]["command"] for entries in hooks["hooks"].values() for entry in entries
+    ]
+    expected = (
+        'sh -c \'[ -n "${CLAUDE_PLUGIN_ROOT:-}" ] && launcher="${CLAUDE_PLUGIN_ROOT}/bin/headroom-hook.sh" && '
+        '[ -r "$launcher" ] && exec sh "$launcher"; '
+        "exec headroom init hook ensure'"
+    )
+    assert commands == [expected, expected]
+    powershell = [
+        entry["hooks"][0]["powershell"] for entries in hooks["hooks"].values() for entry in entries
+    ]
+    assert powershell == ["headroom init hook ensure", "headroom init hook ensure"]
+    assert hooks["hooks"]["SessionStart"][0]["matcher"] == "startup|resume"
+    assert hooks["hooks"]["PreToolUse"][0]["matcher"] == "Bash|PowerShell"
+    launcher = REPO_ROOT / "plugins/headroom-agent-hooks/bin/headroom-hook.sh"
+    assert launcher.is_file()
+    assert b"\r" not in launcher.read_bytes()

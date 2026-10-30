@@ -53,6 +53,7 @@ TerminationCause = Literal[
     "client_cancel",
     "response_completed",
     "client_timeout",
+    "budget_exceeded",
     "unknown",
 ]
 

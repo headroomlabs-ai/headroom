@@ -167,3 +167,62 @@ def test_different_thinking_not_served_from_cache() -> None:
         assert a2.status_code == 200
         assert _text(a2) == "resp-1"
         assert calls["n"] == 2
+
+
+def test_different_custom_upstream_not_served_from_cache(monkeypatch) -> None:
+    """The response producer is part of cache identity (#3346)."""
+    calls: list[str] = []
+
+    async def allow_example_upstream(_url: str) -> bool:
+        return True
+
+    monkeypatch.setattr(
+        "headroom.providers.proxy_routes.is_safe_upstream_url_async",
+        allow_example_upstream,
+    )
+
+    with _make_cached_proxy_client() as client:
+        proxy = client.app.state.proxy
+
+        async def _fake_retry(method, url, headers, body, stream=False, **kwargs):  # noqa: ANN001
+            calls.append(str(url))
+            text = "gateway-A" if "gateway-a" in str(url) else "gateway-B"
+            return httpx.Response(
+                200,
+                json={
+                    "id": f"msg_{len(calls)}",
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [{"type": "text", "text": text}],
+                    "usage": {
+                        "input_tokens": 10,
+                        "output_tokens": 3,
+                        "cache_read_input_tokens": 0,
+                        "cache_creation_input_tokens": 0,
+                    },
+                },
+            )
+
+        proxy._retry_request = _fake_retry
+        headers = {"x-api-key": "test-key", "anthropic-version": "2023-06-01"}
+        body = _body("Answer with the gateway identity.")
+
+        first = client.post(
+            "/v1/messages",
+            headers={**headers, "x-headroom-base-url": "https://gateway-a.example"},
+            json=body,
+        )
+        second = client.post(
+            "/v1/messages",
+            headers={**headers, "x-headroom-base-url": "https://gateway-b.example"},
+            json=body,
+        )
+
+    assert first.status_code == 200
+    assert second.status_code == 200
+    assert _text(first) == "gateway-A"
+    assert _text(second) == "gateway-B"
+    assert calls == [
+        "https://gateway-a.example/v1/messages",
+        "https://gateway-b.example/v1/messages",
+    ]

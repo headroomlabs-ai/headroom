@@ -57,15 +57,42 @@ async def test_record_savings_event_uses_original_input_as_before(
         client="claude-code",
     )
 
-    assert calls == [
-        {
-            "tokens_before": 1000,
-            "tokens_after": 600,
-            "model": "claude-opus-4-6",
-            "client": "claude-code",
-            "source": "proxy",
-        }
-    ]
+    # Assert on the fields this test is ABOUT (the before/after reconstruction
+    # and attribution) rather than the whole kwargs dict. The ledger call also
+    # carries the savings split and the request's cache mix, which every future
+    # field addition would otherwise break this test on without saying anything
+    # about what it guards.
+    assert len(calls) == 1
+    call = calls[0]
+    assert call["tokens_before"] == 1000
+    assert call["tokens_after"] == 600
+    assert call["model"] == "claude-opus-4-6"
+    assert call["client"] == "claude-code"
+    assert call["source"] == "proxy"
+    # No deferral on this request, so the whole saving is message compression.
+    assert call["saved_compression"] == 400
+    assert call["saved_tool_schema"] == 0
+
+    # With a provider cache breakdown the ledger also gets the /stats
+    # new-input denominator (uncached + cache write) and the deferral share of
+    # the saving, so `headroom savings` can pair compression-only with new input.
+    calls.clear()
+    await metrics.record_request(
+        provider="anthropic",
+        model="claude-opus-4-6",
+        input_tokens=600,
+        output_tokens=25,
+        tokens_saved=400,
+        latency_ms=10.0,
+        client="claude-code",
+        cache_read_tokens=5000,
+        cache_write_tokens=700,
+        uncached_input_tokens=200,
+        tool_search_saved=150,
+    )
+    assert calls[0]["tokens_before"] == 1000 + 150
+    assert calls[0]["new_input_tokens"] == 900
+    assert calls[0]["deferred_tokens"] == 150
 
 
 @pytest.mark.asyncio
@@ -155,3 +182,46 @@ async def test_record_savings_event_written_for_deferral_only_turn(
     assert len(calls) == 1
     assert calls[0]["tokens_before"] == 50000 + 13182
     assert calls[0]["tokens_after"] == 50000
+
+
+@pytest.mark.asyncio
+async def test_zero_saving_request_with_cache_breakdown_reaches_the_ledger(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A request that saved nothing but newly billed input is a denominator
+    observation for the new-input basis, so it must reach the ledger. One
+    without any breakdown is skipped as before."""
+    calls: list[dict[str, Any]] = []
+    monkeypatch.setattr(
+        prometheus_metrics.savings_ledger,
+        "record_savings_event",
+        lambda **kwargs: calls.append(kwargs),
+    )
+    metrics = prometheus_metrics.PrometheusMetrics(
+        savings_tracker=_FakeSavingsTracker(),
+        otel_metrics=_FakeOtelMetrics(),
+    )
+    await metrics.record_request(
+        provider="anthropic",
+        model="claude-opus-4-6",
+        input_tokens=10_000,
+        output_tokens=25,
+        tokens_saved=0,
+        latency_ms=10.0,
+        client="claude-code",
+        cache_read_tokens=5_000,
+        uncached_input_tokens=10_000,
+    )
+    assert len(calls) == 1
+    assert calls[0]["tokens_before"] == calls[0]["tokens_after"]
+    assert calls[0]["new_input_tokens"] == 10_000
+    await metrics.record_request(
+        provider="bedrock",
+        model="claude-opus-4-6",
+        input_tokens=10_000,
+        output_tokens=25,
+        tokens_saved=0,
+        latency_ms=10.0,
+        client="claude-code",
+    )
+    assert len(calls) == 1

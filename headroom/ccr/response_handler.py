@@ -19,11 +19,15 @@ from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from typing import Any
 
+from headroom.proxy.anthropic_wire import AnthropicSSEEnvelope
+
 from ..cache.compression_store import format_retrieval_miss_detail, get_compression_store
 from .tool_calls import (
     CCRToolCall,
+    drop_tool_calls,
     extract_tool_calls,
     has_ccr_tool_calls,
+    is_ccr_tool_call,
     parse_ccr_tool_calls,
 )
 from .tool_injection import CCR_TOOL_NAME
@@ -474,18 +478,41 @@ class CCRResponseHandler:
                 # No CCR tool calls, we're done
                 break
 
-            # If the model called CCR alongside non-CCR tools, we cannot build
-            # a valid continuation — every tool_use in the assistant message
-            # requires a matching tool_result, but we only have CCR results.
-            # Skip CCR handling and let the client resolve all tool calls.
+            # The model called CCR alongside client tools. The client has no
+            # headroom_retrieve (Claude Code answers "No such tool available:
+            # headroom_retrieve", so the model never gets the content), and a
+            # continuation needs a tool_result for every tool_use. The client
+            # calls have not run yet, so drop them and serve the retrieval now;
+            # the model decides again, content in hand, in the continuation.
+            # That continuation replaces this turn whatever it does: re-issue
+            # the calls, change them or drop them. Only a failed continuation
+            # hands this turn back (below), since the model made no newer
+            # decision. A CCR-named call without a valid hash, or a provider
+            # where dropping a sibling is not safe (see drop_tool_calls), keeps
+            # the turn as it is for the client to resolve.
+            mixed_turn: dict[str, Any] | None = None
             if other_calls:
-                logger.warning(
-                    "CCR: Skipping CCR handling — model called %d non-CCR tool(s) "
-                    "alongside headroom_retrieve. Cannot create a valid continuation "
-                    "without results for the other tools. Client must handle all tool calls.",
+                trimmed = (
+                    current_response
+                    if any(is_ccr_tool_call(c) for c in other_calls)
+                    else drop_tool_calls(current_response, provider, other_calls)
+                )
+                if trimmed is current_response:
+                    logger.warning(
+                        "CCR: Skipping CCR handling — model called %d non-CCR tool(s) "
+                        "alongside headroom_retrieve. Cannot create a valid continuation "
+                        "without results for the other tools. Client must handle all tool calls.",
+                        len(other_calls),
+                    )
+                    break
+                logger.info(
+                    "CCR: model called headroom_retrieve alongside %d client tool(s); "
+                    "serving the retrieval and dropping the unrun client call(s) "
+                    "for the model to re-issue",
                     len(other_calls),
                 )
-                break
+                mixed_turn = current_response
+                current_response = trimmed
 
             rounds += 1
             with self._retrieval_count_lock:
@@ -538,7 +565,11 @@ class CCRResponseHandler:
                 # entirely (#3129).
                 logger.error("CCR: Continuation API call failed: %s: %r", type(e).__name__, e)
                 # Return the response we had (with unhandled CCR calls)
-                # The client will see the tool_use and might handle it differently
+                # The client will see the tool_use and might handle it differently.
+                # For a mixed turn that is the model's own turn, client calls
+                # included (#839), never the trimmed one that lost them.
+                if mixed_turn is not None:
+                    current_response = mixed_turn
                 break
 
         if rounds >= self.config.max_retrieval_rounds:
@@ -725,8 +756,19 @@ class StreamingCCRHandler:
 
             # Parse the complete response
             try:
-                # For SSE streams, we need to parse the accumulated data
-                complete_data = self._parse_sse_stream(self.buffer.get_accumulated())
+                # The envelope is request-local. It carries opaque Anthropic
+                # frames over a CCR continuation without coupling concurrent
+                # streams through this long-lived handler instance.
+                stream_bytes = self.buffer.get_accumulated()
+                complete_data = self._parse_sse_stream(stream_bytes)
+                envelope = None
+                if self.provider == "anthropic":
+                    candidate = self._parse_anthropic_sse_envelope(stream_bytes)
+                    # Keep the long-standing parser seam usable by callers and
+                    # tests that replace it. Only attach the wire envelope when
+                    # that parser returned the corresponding native message.
+                    if complete_data == candidate.message:
+                        envelope = candidate
 
                 # Handle CCR
                 final_response = await self.response_handler.handle_response(
@@ -739,7 +781,11 @@ class StreamingCCRHandler:
 
                 # Re-stream the final response
                 # Convert back to SSE format
-                async for chunk in self._response_to_sse(final_response):
+                if envelope is None:
+                    response_stream = self._response_to_sse(final_response)
+                else:
+                    response_stream = self._response_to_sse(final_response, envelope=envelope)
+                async for chunk in response_stream:
                     yield chunk
 
             except Exception as e:
@@ -759,6 +805,9 @@ class StreamingCCRHandler:
         event is an upstream protocol bug — surfaced loudly, not
         silently corrupted.
         """
+        if self.provider == "anthropic":
+            return self._parse_anthropic_sse_envelope(data).message
+
         from headroom.proxy.helpers import parse_sse_events_from_byte_buffer
 
         # Accumulate all event data via the canonical bytes-buffer
@@ -785,132 +834,20 @@ class StreamingCCRHandler:
                 len(buf),
             )
 
-        # Reconstruct response from events
-        # This is provider-specific
-        if self.provider == "anthropic":
-            return self._reconstruct_anthropic_response(events)
-        else:
-            return self._reconstruct_openai_response(events)
+        return self._reconstruct_openai_response(events)
 
     def _reconstruct_anthropic_response(
         self,
         events: list[dict[str, Any]],
     ) -> dict[str, Any]:
         """Reconstruct Anthropic response from stream events."""
-        response: dict[str, Any] = {
-            "content": [],
-            "stop_reason": None,
-            "usage": {},
-        }
+        return AnthropicSSEEnvelope.from_events(events).message
 
-        blocks_by_index: dict[int, dict[str, Any]] = {}
-        current_block: dict[str, Any] | None = None
+    @staticmethod
+    def _parse_anthropic_sse_envelope(data: bytes) -> AnthropicSSEEnvelope:
+        """Parse a complete Anthropic stream into its request-local envelope."""
 
-        for event in events:
-            event_type = event.get("type", "")
-
-            if event_type == "content_block_start":
-                block = event.get("content_block", {})
-                block_index = event.get("index", len(blocks_by_index))
-                btype = block.get("type")
-                current_block = {"type": btype}
-                if btype == "text":
-                    current_block["text"] = block.get("text", "")
-                elif btype == "tool_use":
-                    current_block.update(
-                        {
-                            "id": block.get("id", ""),
-                            "name": block.get("name", ""),
-                            "input": {},
-                        }
-                    )
-                elif btype == "thinking":
-                    current_block["thinking_buffer"] = block.get("thinking", "")
-                    if "signature" in block:
-                        current_block["signature"] = block["signature"]
-                elif btype == "redacted_thinking":
-                    if "data" in block:
-                        current_block["data"] = block["data"]
-                elif btype:
-                    current_block = dict(block)
-                blocks_by_index[block_index] = current_block
-
-            elif event_type == "content_block_delta":
-                idx = event.get("index")
-                target = (blocks_by_index.get(idx) if idx is not None else None) or current_block
-                if target is None:
-                    continue
-                delta = event.get("delta", {})
-                dtype = delta.get("type")
-                if dtype == "text_delta":
-                    target["text"] = target.get("text", "") + delta.get("text", "")
-                elif dtype == "input_json_delta":
-                    # Accumulate for any block streaming input (tool_use AND
-                    # server_tool_use); the stop handler parses it into `input`
-                    # (#2438).
-                    partial = delta.get("partial_json", "")
-                    target["_partial_json"] = target.get("_partial_json", "") + partial
-                elif dtype == "thinking_delta":
-                    target["thinking_buffer"] = target.get("thinking_buffer", "") + delta.get(
-                        "thinking", ""
-                    )
-                elif dtype == "signature_delta":
-                    if "signature" in delta:
-                        target["signature"] = delta["signature"]
-                elif dtype == "citations_delta":
-                    citation = delta.get("citation")
-                    if citation is not None:
-                        target.setdefault("citations", []).append(citation)
-
-            elif event_type == "content_block_stop":
-                idx = event.get("index")
-                target = (blocks_by_index.get(idx) if idx is not None else None) or current_block
-                if target is not None:
-                    # Parse streamed `_partial_json` into `input` for any block
-                    # that carried input_json_delta — tool_use AND
-                    # server_tool_use — not just tool_use. The narrow type gate
-                    # left server_tool_use.input malformed and leaked the scratch
-                    # key into replayed history (#2438). Always strip the key.
-                    if "_partial_json" in target:
-                        partial = target.pop("_partial_json")
-                        try:
-                            target["input"] = json.loads(partial) if partial else {}
-                        except json.JSONDecodeError:
-                            target["input"] = {}
-                    if target.get("type") == "thinking" and "thinking_buffer" in target:
-                        target["thinking"] = target.pop("thinking_buffer")
-                    if target not in response["content"]:
-                        response["content"].append(target)
-                    current_block = None
-
-            elif event_type == "message_start":
-                msg = event.get("message", {})
-                if "id" in msg:
-                    response["id"] = msg["id"]
-                if "model" in msg:
-                    response["model"] = msg["model"]
-                if "role" in msg:
-                    response["role"] = msg["role"]
-                if "stop_reason" in msg:
-                    response["stop_reason"] = msg["stop_reason"]
-                if "stop_details" in msg:
-                    response["stop_details"] = msg["stop_details"]
-                if msg.get("usage"):
-                    response["usage"].update(msg["usage"])
-
-            elif event_type == "message_delta":
-                delta = event.get("delta", {})
-                if "stop_reason" in delta:
-                    response["stop_reason"] = delta["stop_reason"]
-                if "stop_details" in delta:
-                    response["stop_details"] = delta["stop_details"]
-                if event.get("usage"):
-                    response["usage"].update(event["usage"])
-
-            elif event_type == "message_stop":
-                pass
-
-        return response
+        return AnthropicSSEEnvelope.parse(data)
 
     def _reconstruct_openai_response(
         self,
@@ -1082,6 +1019,8 @@ class StreamingCCRHandler:
     async def _response_to_sse(
         self,
         response: dict[str, Any],
+        *,
+        envelope: Any | None = None,
     ) -> Any:  # AsyncGenerator[bytes, None]
         """Convert a response back to SSE format for streaming.
 
@@ -1089,10 +1028,14 @@ class StreamingCCRHandler:
         to chunk the response more granularly.
         """
         if self.provider == "anthropic":
-            from headroom.proxy.handlers.streaming import StreamingMixin
+            if envelope is not None:
+                for chunk in envelope.render(response):
+                    yield chunk
+            else:
+                from headroom.proxy.handlers.streaming import StreamingMixin
 
-            for chunk in StreamingMixin()._response_to_sse(response, "anthropic"):
-                yield chunk
+                for chunk in StreamingMixin()._response_to_sse(response, "anthropic"):
+                    yield chunk
         else:
             # OpenAI SSE format: `chat.completion.chunk` frames, then [DONE].
             for chunk in self._openai_response_to_chunks(response):

@@ -9,7 +9,9 @@ from types import SimpleNamespace
 import pytest
 
 import headroom.reporting as reporting
+from headroom.models.registry import ModelRegistry
 from headroom.reporting import generator
+from headroom.utils import format_cost
 
 
 @dataclass
@@ -47,8 +49,9 @@ def test_reporting_public_export() -> None:
 
 def test_get_jinja2_template_success_with_stub(monkeypatch) -> None:
     class FakeTemplate:
-        def __init__(self, template_str: str) -> None:
+        def __init__(self, template_str: str, **options) -> None:
             self.template_str = template_str
+            self.options = options
 
         def render(self, **kwargs) -> str:
             return f"{self.template_str}:{kwargs['name']}"
@@ -56,6 +59,15 @@ def test_get_jinja2_template_success_with_stub(monkeypatch) -> None:
     monkeypatch.setitem(sys.modules, "jinja2", SimpleNamespace(Template=FakeTemplate))
     template = generator._get_jinja2_template("hello")
     assert template.render(name="world") == "hello:world"
+    assert template.options == {"autoescape": True}
+
+
+def test_report_template_escapes_client_supplied_fields() -> None:
+    pytest.importorskip("jinja2")
+    template = generator._get_jinja2_template("<td>{{ model }}</td>")
+    html = template.render(model="<script>alert(1)</script>")
+    assert "<script>" not in html
+    assert "&lt;script&gt;" in html
 
 
 def test_get_jinja2_template_raises_helpful_error(monkeypatch) -> None:
@@ -255,12 +267,6 @@ def test_generate_report_writes_output_and_closes_storage(
         generator, "_generate_recommendations", lambda *args: [{"title": "Keep going"}]
     )
     monkeypatch.setattr(generator, "_get_jinja2_template", lambda template_str: FakeTemplate())
-    monkeypatch.setattr(
-        generator,
-        "estimate_cost",
-        lambda tokens, output_tokens, model: {100: 2.0, 0: None}[tokens],
-    )
-    monkeypatch.setattr(generator, "format_cost", lambda cost: f"${cost:.2f}")
 
     output_path = tmp_path / "report.html"
     result = generator.generate_report(
@@ -274,8 +280,66 @@ def test_generate_report_writes_output_and_closes_storage(
     assert output_path.read_text() == "<html>report</html>"
     assert render_calls[0]["period"] == expected_period
     assert render_calls[0]["stats"]["tpm_multiplier"] == 100.0
-    assert render_calls[0]["stats"]["estimated_savings"] == "$2.00"
     assert storage.closed is True
+
+
+def _capture_stats(monkeypatch, tmp_path, stats: dict) -> dict:
+    """Run generate_report() over *stats* and hand back the rendered stats dict.
+
+    Only the storage and template seams are patched: pricing stays the product's
+    own, so a report that cannot price itself shows up here as a wrong number.
+    """
+    render_calls: list[dict] = []
+
+    class FakeTemplate:
+        def render(self, **kwargs) -> str:
+            render_calls.append(kwargs)
+            return "<html>report</html>"
+
+    monkeypatch.setattr(generator, "create_storage", lambda store_url: FakeStorage(stats, []))
+    monkeypatch.setattr(generator, "_build_waste_histogram", lambda *args: [])
+    monkeypatch.setattr(generator, "_get_top_waste_requests", lambda *args, **kwargs: [])
+    monkeypatch.setattr(generator, "_generate_recommendations", lambda *args: [])
+    monkeypatch.setattr(generator, "_get_jinja2_template", lambda template_str: FakeTemplate())
+
+    generator.generate_report("sqlite:///demo.db", output_path=str(tmp_path / "report.html"))
+    return render_calls[0]["stats"]
+
+
+SAVINGS_STATS = {
+    "total_requests": 2,
+    "total_tokens_saved": 245_000,
+    "avg_tokens_saved": 122_500,
+    "total_tokens_before": 350_000,
+    "total_tokens_after": 105_000,
+    "avg_cache_alignment": 80,
+    "audit_count": 0,
+    "optimize_count": 2,
+}
+
+
+def test_generate_report_prices_the_savings_tile(monkeypatch, tmp_path) -> None:
+    """245k tokens saved must cost something, not read as a $0.0000 claim."""
+    stats = _capture_stats(monkeypatch, tmp_path, dict(SAVINGS_STATS))
+
+    before = ModelRegistry.estimate_cost("gpt-4o", 350_000, 0)
+    after = ModelRegistry.estimate_cost("gpt-4o", 105_000, 0)
+    assert before is not None and after is not None, "gpt-4o left the bundled rate card"
+    assert stats["estimated_savings"] == format_cost(before - after)
+    assert stats["estimated_savings"] != "$0.00"
+
+
+def test_generate_report_says_unavailable_when_it_cannot_price(monkeypatch, tmp_path) -> None:
+    """An unknown price is a missing number, not zero saved."""
+    monkeypatch.setattr(
+        ModelRegistry,
+        "estimate_cost",
+        classmethod(lambda cls, model, *args, **kwargs: None),
+    )
+
+    stats = _capture_stats(monkeypatch, tmp_path, dict(SAVINGS_STATS))
+
+    assert stats["estimated_savings"] == "unavailable"
 
 
 def test_generate_report_closes_storage_when_render_fails(monkeypatch, tmp_path) -> None:
@@ -302,8 +366,6 @@ def test_generate_report_closes_storage_when_render_fails(monkeypatch, tmp_path)
     monkeypatch.setattr(generator, "_get_top_waste_requests", lambda *args, **kwargs: [])
     monkeypatch.setattr(generator, "_generate_recommendations", lambda *args: [])
     monkeypatch.setattr(generator, "_get_jinja2_template", lambda template_str: FakeTemplate())
-    monkeypatch.setattr(generator, "estimate_cost", lambda *args: 0.0)
-    monkeypatch.setattr(generator, "format_cost", lambda cost: "$0.00")
 
     with pytest.raises(RuntimeError, match="boom"):
         generator.generate_report("sqlite:///demo.db", output_path=str(tmp_path / "report.html"))

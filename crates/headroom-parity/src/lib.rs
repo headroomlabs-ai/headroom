@@ -6,6 +6,8 @@
 //! stubs and report `Skipped` — see the `stub_comparator!` block below for what
 //! each is waiting on.
 
+#![forbid(unsafe_code)]
+
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use std::fs;

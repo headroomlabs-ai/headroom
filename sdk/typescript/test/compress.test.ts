@@ -1,5 +1,6 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
 import { compress } from "../src/compress.js";
+import { HeadroomClient } from "../src/client.js";
 import type { OpenAIMessage } from "../src/types.js";
 
 const mockFetch = vi.fn();
@@ -114,5 +115,123 @@ describe("compress()", () => {
     // Verify all messages were sent to proxy
     const body = JSON.parse(mockFetch.mock.calls[0][1].body);
     expect(body.messages).toHaveLength(5);
+  });
+
+  it("forwards a per-call config, overriding a provided client's config", async () => {
+    mockFetch.mockResolvedValueOnce(okResponse());
+    const client = new HeadroomClient({
+      baseUrl: "http://localhost:8787",
+      config: { mode: "lossy_inline" },
+    });
+
+    await compress([{ role: "user", content: "hello" }], {
+      client,
+      config: { mode: "ccr", targetRatio: 0.25 },
+    });
+
+    const [, opts] = mockFetch.mock.calls[0];
+    const body = JSON.parse(opts.body);
+    expect(body.config.mode).toBe("ccr");
+    expect(body.config.target_ratio).toBe(0.25);
+  });
+});
+
+describe("compress() autodetects Vercel media-only conversations", () => {
+  beforeEach(() => {
+    mockFetch.mockReset();
+  });
+
+  it("sends binary file parts as image_url data URIs and restores Vercel file parts", async () => {
+    mockFetch.mockResolvedValueOnce(
+      okResponse({
+        messages: [
+          {
+            role: "user",
+            content: [
+              { type: "text", text: "compressed" },
+              { type: "image_url", image_url: { url: "data:image/png;base64,iVBORw==", part: "file" } },
+            ],
+          },
+        ],
+      }),
+    );
+
+    const result = await compress(
+      [
+        {
+          role: "user",
+          content: [
+            { type: "text", text: "what is this?" },
+            { type: "file", mediaType: "image/png", data: new Uint8Array([137, 80, 78, 71]) },
+          ],
+        },
+      ],
+      { baseUrl: "http://localhost:8787" },
+    );
+
+    const body = JSON.parse(mockFetch.mock.calls[0][1].body);
+    expect(body.messages[0].content[1]).toEqual({
+      type: "image_url",
+      image_url: { url: "data:image/png;base64,iVBORw==", part: "file" },
+    });
+    expect(JSON.stringify(body)).not.toContain('"0":137');
+    expect(result.messages[0].content[1]).toEqual({ type: "file", mediaType: "image/png", data: "iVBORw==" });
+  });
+});
+
+describe("compress() keeps Anthropic text documents through the public path", () => {
+  beforeEach(() => {
+    mockFetch.mockReset();
+  });
+
+  it("posts a document-only turn as the native document block and returns it unchanged", async () => {
+    const doc = {
+      type: "document",
+      source: { type: "text", media_type: "text/plain", data: "Critical contract: do not delete account 123" },
+      title: "Contract",
+      citations: { enabled: true },
+    };
+    // The proxy passes non-text blocks through unchanged; echo the request's messages back.
+    mockFetch.mockImplementationOnce(async (_url: string, init: any) => okResponse({ messages: JSON.parse(init.body).messages }));
+
+    const result = await compress([{ role: "user", content: [doc] }], { baseUrl: "http://localhost:8787" });
+
+    // Anthropic input is not converted: the document block itself reaches the proxy.
+    const body = JSON.parse(mockFetch.mock.calls[0][1].body);
+    expect(body.messages).toEqual([{ role: "user", content: [doc] }]);
+    expect(result.messages).toEqual([{ role: "user", content: [doc] }]);
+  });
+});
+
+describe("compress() sends Anthropic-format input to the proxy natively", () => {
+  beforeEach(() => {
+    mockFetch.mockReset();
+  });
+
+  const anthropicTurn = [
+    { role: "user", content: "search for X" },
+    {
+      role: "assistant",
+      content: [
+        { type: "thinking", thinking: "Search first.", signature: "SIG-1" },
+        { type: "tool_use", id: "toolu_1", name: "search", input: { q: "X" } },
+      ],
+    },
+    {
+      role: "user",
+      content: [{ type: "tool_result", tool_use_id: "toolu_1", content: "a\nb\nc" }],
+    },
+  ];
+
+  it("posts the Anthropic blocks as-is and returns the proxy's messages unconverted", async () => {
+    const returned = structuredClone(anthropicTurn);
+    (returned[2].content as any[])[0].content = "[3 lines]";
+    mockFetch.mockResolvedValueOnce(okResponse({ messages: returned }));
+
+    const result = await compress(anthropicTurn, { baseUrl: "http://localhost:8787" });
+
+    const body = JSON.parse(mockFetch.mock.calls[0][1].body);
+    expect(body.messages).toEqual(anthropicTurn);
+    expect(result.messages).toEqual(returned);
   });
 });

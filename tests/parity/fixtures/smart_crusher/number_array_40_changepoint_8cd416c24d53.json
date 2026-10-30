@@ -24,7 +24,7 @@
   "input_sha256": "8cd416c24d53a5c61ebf4ad2e06963169de552cf163331df276773459af00275",
   "label": "number_array_40_changepoint",
   "output": {
-    "compressed": "[10,11,12,10,10,10,10,10,10,51,54,57,60,68,69]",
+    "compressed": "[10,11,12,10,10,10,10,10,10,51,54,57,60,68,69,\"\u2026 25 more items <<ccr:905235220a7b 25_items_offloaded>>\"]",
     "original": "[10, 11, 12, 10, 11, 12, 10, 11, 12, 10, 11, 12, 10, 11, 12, 10, 11, 12, 10, 11, 50, 51, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62, 63, 64, 65, 66, 67, 68, 69]",
     "strategy": "number:adaptive(40->15,min=10,max=69,mean=35.23,median=31,stddev=24.94,p25=11,p75=59.25)(40->15)",
     "was_modified": true

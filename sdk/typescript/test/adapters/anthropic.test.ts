@@ -21,6 +21,39 @@ function mockCompressSuccess(
   );
 }
 
+// A thinking-enabled tool-use turn. Anthropic requires the thinking blocks
+// back "complete and unmodified" with the tool result, or the request is a 400.
+const thinkingToolTurn = [
+  {
+    role: "user",
+    content: [
+      { type: "text", text: "Read the gateway log.", cache_control: { type: "ephemeral" } },
+    ],
+  },
+  {
+    role: "assistant",
+    content: [
+      { type: "thinking", thinking: "I should read the log first.", signature: "SIG-abc123" },
+      { type: "redacted_thinking", data: "REDACTED-xyz" },
+      { type: "text", text: "Reading the log now." },
+      { type: "tool_use", id: "toolu_01", name: "fetch_gateway_metrics", input: { path: "/var/log/gateway.json" } },
+    ],
+  },
+  {
+    role: "user",
+    content: [
+      {
+        type: "tool_result",
+        tool_use_id: "toolu_01",
+        content: [
+          { type: "text", text: "row 1\nrow 2\nrow 3" },
+          { type: "image", source: { type: "base64", media_type: "image/png", data: "AAAA" } },
+        ],
+      },
+    ],
+  },
+];
+
 describe("withHeadroom (Anthropic)", () => {
   beforeEach(() => {
     mockFetch.mockReset();
@@ -102,7 +135,7 @@ describe("withHeadroom (Anthropic)", () => {
     expect(result).toEqual(expectedResponse);
   });
 
-  it("converts Anthropic content blocks to OpenAI format for compression", async () => {
+  it("posts Anthropic content blocks to /v1/compress unchanged", async () => {
     mockFetch.mockResolvedValueOnce(mockCompressSuccess());
 
     const mockCreate = vi.fn().mockResolvedValue({});
@@ -112,46 +145,47 @@ describe("withHeadroom (Anthropic)", () => {
       baseUrl: "http://localhost:8787",
     });
 
+    const messages = [
+      { role: "user", content: [{ type: "text", text: "analyze this data" }] },
+    ];
     await wrapped.messages.create({
       model: "claude-sonnet-4-5-20250929",
-      messages: [
-        {
-          role: "user",
-          content: [{ type: "text", text: "analyze this data" }],
-        },
-      ],
+      messages,
       max_tokens: 1024,
     });
 
-    // Verify the compress call used OpenAI format
+    // The proxy compresses Anthropic blocks natively; nothing is converted.
     const body = JSON.parse(mockFetch.mock.calls[0][1].body);
-    expect(body.messages[0].role).toBe("user");
-    expect(body.messages[0].content).toBe("analyze this data");
+    expect(body.messages).toEqual(messages);
+    expect(body.model).toBe("claude-sonnet-4-5-20250929");
   });
 
-  it("handles Anthropic tool_use and tool_result blocks", async () => {
-    // Proxy returns compressed messages
-    mockFetch.mockResolvedValueOnce(
-      mockCompressSuccess([
-        { role: "user", content: "search for X" },
-        {
-          role: "assistant",
-          content: null,
-          tool_calls: [
-            {
-              id: "tu_1",
-              type: "function",
-              function: { name: "search", arguments: '{"q":"X"}' },
-            },
-          ],
-        },
-        {
-          role: "tool",
-          content: '{"results":["a","b"]}',
-          tool_call_id: "tu_1",
-        },
-      ]),
-    );
+  it("posts tool_use and array-content tool_result blocks as-is and forwards the proxy's result", async () => {
+    const turn = [
+      { role: "user", content: "run the query" },
+      {
+        role: "assistant",
+        content: [
+          { type: "tool_use", id: "tu_1", name: "query", input: { sql: "select 1" } },
+        ],
+      },
+      {
+        role: "user",
+        content: [
+          {
+            type: "tool_result",
+            tool_use_id: "tu_1",
+            content: [
+              { type: "text", text: "row 1" },
+              { type: "text", text: "row 2" },
+            ],
+          },
+        ],
+      },
+    ];
+    const compressed = structuredClone(turn);
+    (compressed[2].content as any[])[0].content = [{ type: "text", text: "[2 rows]" }];
+    mockFetch.mockResolvedValueOnce(mockCompressSuccess(compressed));
 
     const mockCreate = vi.fn().mockResolvedValue({});
     const fakeClient = { messages: { create: mockCreate } };
@@ -162,32 +196,92 @@ describe("withHeadroom (Anthropic)", () => {
 
     await wrapped.messages.create({
       model: "claude-sonnet-4-5-20250929",
-      messages: [
-        { role: "user", content: "search for X" },
-        {
-          role: "assistant",
-          content: [
-            { type: "tool_use", id: "tu_1", name: "search", input: { q: "X" } },
-          ],
-        },
-        {
-          role: "user",
-          content: [
-            {
-              type: "tool_result",
-              tool_use_id: "tu_1",
-              content: '{"results":["a","b"]}',
-            },
-          ],
-        },
-      ],
+      messages: turn,
       max_tokens: 1024,
     });
 
+    // The proxy reads Anthropic tool_result blocks natively, list content included.
+    const body = JSON.parse(mockFetch.mock.calls[0][1].body);
+    expect(body.messages).toEqual(turn);
+
     expect(mockCreate).toHaveBeenCalledOnce();
-    // Messages should be converted back to Anthropic format
     const createArgs = mockCreate.mock.calls[0][0];
-    expect(createArgs.messages.length).toBeGreaterThan(0);
+    expect(createArgs.messages).toEqual(compressed);
+  });
+
+  it("keeps image blocks native in the compression request and in the forwarded messages", async () => {
+    const turn = [
+      {
+        role: "user",
+        content: [
+          { type: "text", text: "what is this?" },
+          {
+            type: "image",
+            source: { type: "base64", media_type: "image/png", data: "AAAA" },
+          },
+        ],
+      },
+    ];
+    mockFetch.mockResolvedValueOnce(mockCompressSuccess(turn));
+
+    const mockCreate = vi.fn().mockResolvedValue({});
+    const fakeClient = { messages: { create: mockCreate } };
+
+    const wrapped = withHeadroom(fakeClient as any, {
+      baseUrl: "http://localhost:8787",
+    });
+
+    await wrapped.messages.create({
+      model: "claude-sonnet-4-5-20250929",
+      messages: turn,
+      max_tokens: 1024,
+    });
+
+    const body = JSON.parse(mockFetch.mock.calls[0][1].body);
+    expect(body.messages).toEqual(turn);
+
+    expect(mockCreate).toHaveBeenCalledOnce();
+    const createArgs = mockCreate.mock.calls[0][0];
+    expect(createArgs.messages).toEqual(turn);
+  });
+
+  it("posts a thinking-enabled tool-use turn unchanged, thinking blocks and tool_result blocks included", async () => {
+    mockFetch.mockResolvedValueOnce(mockCompressSuccess(thinkingToolTurn));
+    const mockCreate = vi.fn().mockResolvedValue({});
+    const wrapped = withHeadroom({ messages: { create: mockCreate } } as any, {
+      baseUrl: "http://localhost:8787",
+    });
+
+    await wrapped.messages.create({
+      model: "claude-sonnet-4-5-20250929",
+      messages: thinkingToolTurn,
+      max_tokens: 1024,
+    });
+
+    const body = JSON.parse(mockFetch.mock.calls[0][1].body);
+    expect(body.messages).toEqual(thinkingToolTurn);
+    expect(body.model).toBe("claude-sonnet-4-5-20250929");
+  });
+
+  it("forwards the proxy's returned Anthropic messages to messages.create as-is", async () => {
+    const compressed = structuredClone(thinkingToolTurn);
+    (compressed[2].content[0] as any).content[0].text = "[3 rows]";
+    mockFetch.mockResolvedValueOnce(mockCompressSuccess(compressed));
+    const mockCreate = vi.fn().mockResolvedValue({});
+    const wrapped = withHeadroom({ messages: { create: mockCreate } } as any, {
+      baseUrl: "http://localhost:8787",
+    });
+
+    await wrapped.messages.create({
+      model: "claude-sonnet-4-5-20250929",
+      messages: thinkingToolTurn,
+      max_tokens: 1024,
+    });
+
+    const createArgs = mockCreate.mock.calls[0][0];
+    expect(createArgs.messages).toEqual(compressed);
+    // The thinking blocks reach the provider exactly as the model produced them.
+    expect(createArgs.messages[1].content.slice(0, 2)).toEqual(thinkingToolTurn[1].content.slice(0, 2));
   });
 
   it("returns original messages on compression fallback", async () => {

@@ -56,6 +56,8 @@ class CompressionUnit:
 #                      Responses handler's unit-result cache) and is surfaced
 #                      via RouterCompressionResult.cache_hit, not as a reason
 #                      here — no code path produces this category today
+# - deadline:          the request's compression deadline had passed before
+#                      this unit started, so it was left unchanged
 UNIT_REASON_CATEGORIES = {
     None: "applied",
     "protected_user_message": "protected_role",
@@ -66,6 +68,7 @@ UNIT_REASON_CATEGORIES = {
     "router_no_change": "compressor_noop",
     "already_compressed": "already_compressed",
     "rejected_not_smaller": "rejected_not_smaller",
+    "deadline_exceeded": "deadline",
 }
 
 
@@ -116,6 +119,7 @@ _LOSSY_UNMARKED_STRATEGIES = {
     CompressionStrategy.KOMPRESS.value,
     CompressionStrategy.TEXT.value,
     CompressionStrategy.CODE_AWARE.value,
+    CompressionStrategy.HTML.value,
 }
 
 
@@ -214,17 +218,38 @@ def _compress_marker_free_text(
     )
 
 
+def check_unit_protection(unit: CompressionUnit) -> str | None:
+    """Return the early refusal reason if a unit is protected, else None."""
+    if not unit.mutable:
+        return "immutable"
+    if unit.role == "user" and unit.metadata.get("compress_user") != "true":
+        return "protected_user_message"
+    if unit.role in {"system", "developer"}:
+        return "protected_system_message"
+    if unit.role == "assistant" and unit.metadata.get("compress_assistant") != "true":
+        return "protected_assistant_message"
+    if unit.cache_zone != "live":
+        return f"cache_zone_{unit.cache_zone}"
+    return None
+
+
 def compress_unit_with_router(
     unit: CompressionUnit,
     *,
     router: ContentRouter,
     tokenizer: TokenCounterLike,
     target_ratio: float | None = None,
+    deadline_started_at: float | None = None,
 ) -> UnitCompressionResult:
     """Compress one safe text unit through ContentRouter.
 
     The final accept/reject gate uses the provider/model tokenizer, not the
     router's internal word-count estimates.
+
+    ``deadline_started_at`` is the deadline origin of the request this unit
+    belongs to (see ``ContentRouter.share_request_deadline``). Once that
+    deadline has passed the unit is returned unchanged without entering the
+    router.
     """
 
     tokens_before = tokenizer.count_text(unit.text)
@@ -253,18 +278,13 @@ def compress_unit_with_router(
             kw["reason_category"] = _categorize_reason(reason_val)
         return replace(base, **kw)  # type: ignore[arg-type]
 
-    if not unit.mutable:
-        return _with_reason(reason="immutable")
-    if unit.role == "user":
-        return _with_reason(reason="protected_user_message")
-    if unit.role in {"system", "developer"}:
-        return _with_reason(reason="protected_system_message")
-    if unit.role == "assistant" and unit.metadata.get("compress_assistant") != "true":
-        return _with_reason(reason="protected_assistant_message")
-    if unit.cache_zone != "live":
-        return _with_reason(reason=f"cache_zone_{unit.cache_zone}")
+    protection_reason = check_unit_protection(unit)
+    if protection_reason is not None:
+        return _with_reason(reason=protection_reason)
     if text_bytes < unit.min_bytes:
         return _with_reason(reason="below_unit_floor")
+    if deadline_started_at is not None and not router.share_request_deadline(deadline_started_at):
+        return _with_reason(reason="deadline_exceeded")
 
     prior_target_ratio = getattr(router, "_runtime_target_ratio", None)
     if target_ratio is not None:

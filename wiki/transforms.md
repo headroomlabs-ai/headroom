@@ -155,7 +155,7 @@ AST-based compression for source code using tree-sitter.
 
 - **Syntax validity guaranteed** — Output always parses correctly
 - **Preserves critical structure** — Imports, signatures, types, error handlers
-- **Multi-language support** — Python, JavaScript, TypeScript, Go, Rust, Java, C, C++
+- **Multi-language support** — Python, JavaScript, TypeScript, Go, Rust, Java, C, C++, C#, PHP
 - **Lightweight** — ~50MB vs ~1GB for the ML compressor
 
 ### Installation
@@ -228,7 +228,7 @@ print(f"Syntax valid: {result.syntax_valid}")  # True
 | Tier | Languages | Support Level |
 |------|-----------|---------------|
 | 1 | Python, JavaScript, TypeScript | Full AST analysis |
-| 2 | Go, Rust, Java, C, C++ | Function body compression |
+| 2 | Go, Rust, Java, C, C++, C#, PHP | Function body compression |
 
 ### Memory Management
 

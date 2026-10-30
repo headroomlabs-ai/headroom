@@ -1,7 +1,9 @@
 """Pricing registry for LLM model cost estimation."""
 
 from dataclasses import dataclass, field
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta
+
+from .deepseek_tiers import rates_for as _deepseek_rates_for
 
 
 @dataclass(frozen=True)
@@ -99,6 +101,7 @@ class PricingRegistry:
         cached_input_tokens: int = 0,
         batch_input_tokens: int = 0,
         batch_output_tokens: int = 0,
+        now: datetime | None = None,
     ) -> CostEstimate:
         """Estimate the cost for a given token usage.
 
@@ -109,18 +112,40 @@ class PricingRegistry:
             cached_input_tokens: Number of cached input tokens.
             batch_input_tokens: Number of batch API input tokens.
             batch_output_tokens: Number of batch API output tokens.
+            now: Request instant used to select a peak/off-peak tier. ``None``
+                reads the wall clock.
 
         Returns:
             CostEstimate with calculated cost and breakdown.
 
         Raises:
             ValueError: If model is not found in registry.
+
+        Note:
+            DeepSeek flash/pro ids are priced from the peak/off-peak tier table
+            even when absent from ``self.prices``, and a flat row for such an id
+            is deliberately ignored in favour of the tier.
         """
-        pricing = self.get_price(model)
+        tier = _deepseek_rates_for(model, now)
+        # The synthesized row deliberately leaves the batch rates ``None``, so
+        # the flat body's own guards raise the same messages DeepSeek's flat
+        # rows would. Tier and flat pricing share one arithmetic body, so the
+        # two cannot drift.
+        pricing = (
+            self.get_price(model)
+            if tier is None
+            else ModelPricing(
+                model=model,
+                provider="deepseek",
+                input_per_1m=tier.input_per_1m,
+                output_per_1m=tier.output_per_1m,
+                cached_input_per_1m=tier.cache_hit_per_1m,
+            )
+        )
         if pricing is None:
             raise ValueError(f"Model '{model}' not found in registry")
 
-        breakdown = {}
+        breakdown: dict = {"tier": tier.tier} if tier is not None else {}
         total_cost = 0.0
 
         # Regular input tokens

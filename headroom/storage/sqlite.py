@@ -142,7 +142,31 @@ class SQLiteStorage(Storage):
         limit: int = 100,
         offset: int = 0,
     ) -> list[RequestMetrics]:
-        """Query metrics with filters."""
+        """Query metrics with filters.
+
+        Matches are ordered by timestamp descending, then request_id
+        descending (the order JSONLStorage.query() applies), before the
+        ``LIMIT/OFFSET`` page is returned.
+
+        Args:
+            start_time: Filter by timestamp >= start_time.
+            end_time: Filter by timestamp <= end_time.
+            model: Filter by model name.
+            mode: Filter by mode (audit/optimize).
+            limit: Maximum results to return; must be non-negative.
+            offset: Number of results to skip; must be non-negative.
+
+        Returns:
+            List of matching RequestMetrics for the requested page.
+
+        Raises:
+            ValueError: If limit or offset is negative.
+        """
+        if limit < 0:
+            raise ValueError(f"limit must be non-negative, got {limit}")
+        if offset < 0:
+            raise ValueError(f"offset must be non-negative, got {offset}")
+
         conn = self._get_conn()
         cursor = conn.cursor()
 
@@ -162,7 +186,9 @@ class SQLiteStorage(Storage):
             query += " AND mode = ?"
             params.append(mode)
 
-        query += " ORDER BY timestamp DESC LIMIT ? OFFSET ?"
+        # Timestamp DESC, id DESC: the same fully-defined order
+        # JSONLStorage.query() applies, so tied timestamps page identically.
+        query += " ORDER BY timestamp DESC, id DESC LIMIT ? OFFSET ?"
         params.extend([limit, offset])
 
         cursor.execute(query, params)

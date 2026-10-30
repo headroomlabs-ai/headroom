@@ -29,6 +29,16 @@ from .deepseek_prices import (
 from .deepseek_prices import (
     LAST_UPDATED as DEEPSEEK_LAST_UPDATED,
 )
+from .deepseek_tiers import (
+    OFF_PEAK_RATES_PER_1M,
+    PEAK_MULTIPLIER,
+    WEEKEND_OFF_PEAK_FROM,
+    DeepSeekRates,
+    bare_model,
+    is_peak,
+    off_peak_rates,
+    rates_for,
+)
 from .litellm_pricing import (
     LiteLLMModelPricing,
     estimate_cost,
@@ -76,4 +86,13 @@ __all__ = [
     "DEEPSEEK_LAST_UPDATED",
     "DEEPSEEK_PRICES",
     "get_deepseek_registry",
+    # DeepSeek peak/off-peak structure (Beijing windows; peak = 2x off-peak)
+    "OFF_PEAK_RATES_PER_1M",
+    "PEAK_MULTIPLIER",
+    "WEEKEND_OFF_PEAK_FROM",
+    "DeepSeekRates",
+    "bare_model",
+    "is_peak",
+    "off_peak_rates",
+    "rates_for",
 ]

@@ -86,8 +86,13 @@ class TestCompactSystemPromptContentBlocks:
         assert modified is False
         assert result["system"][0]["text"] == "Short instruction."
 
-    def test_preserves_cache_control(self) -> None:
-        """cache_control must survive compaction."""
+    def test_marked_block_is_left_byte_identical(self) -> None:
+        """A cached block must not be rewritten, marker or not.
+
+        Preserving the ``cache_control`` field does not preserve the cache
+        entry: the provider keys on the content. Rewriting a block it has
+        already hashed re-bills the whole prefix at the write rate.
+        """
         payload = {
             "system": [
                 {
@@ -103,9 +108,33 @@ class TestCompactSystemPromptContentBlocks:
             model="m",
             request_id="test3",
         )
-        assert modified is True
+        assert modified is False
         block = result["system"][0]
+        assert block["text"] == "A" * 1000
         assert block["cache_control"] == {"type": "ephemeral"}
+
+    def test_compacts_after_the_breakpoint_and_keeps_the_marker(self) -> None:
+        """Blocks past the last marker are still fair game."""
+        payload = {
+            "system": [
+                {
+                    "type": "text",
+                    "text": "A" * 1000,
+                    "cache_control": {"type": "ephemeral"},
+                },
+                {"type": "text", "text": "B" * 1000},
+            ],
+        }
+        result, modified, _, _ = compact_system_prompt(
+            payload,
+            router=_MockRouter(),
+            model="m",
+            request_id="test3b",
+        )
+        assert modified is True
+        assert result["system"][0]["text"] == "A" * 1000
+        assert result["system"][0]["cache_control"] == {"type": "ephemeral"}
+        assert result["system"][1]["text"] != "B" * 1000
 
     def test_preserves_non_text_blocks(self) -> None:
         payload = {

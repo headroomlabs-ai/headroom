@@ -145,5 +145,5 @@ class OAuth2ClientCredentials:
         except (TypeError, ValueError):
             ttl = 300
         ttl = max(1, ttl)  # 0/negative would cause a stale token or per-request minting
-        log.info("oauth2: minted token (ttl=%ss, scopes=%s)", ttl, self.scopes or "-")
+        log.info("oauth2: minted token (ttl=%ss, scopes=%d)", ttl, len(self.scopes))
         return token, ttl

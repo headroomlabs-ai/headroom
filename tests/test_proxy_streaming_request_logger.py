@@ -274,14 +274,8 @@ async def test_finalize_openai_responses_stream_uses_provider_usage_for_dashboar
 
 
 @pytest.mark.asyncio
-async def test_finalize_stream_response_recovers_usage_from_truncated_buffer() -> None:
-    """When upstream truncates mid-event (no trailing \\n\\n), the per-chunk
-    parser leaves the message_start usage event sitting in sse_buffer and
-    PERF logs cache_read=cache_write=0 — which then poisons the freeze
-    heuristic on the next request. The finalizer must flush the residual
-    buffer so the real cache_read / cache_creation tokens still land in
-    the log even on aborted streams.
-    """
+async def test_finalize_stream_response_discards_truncated_utf8_tail() -> None:
+    """An interrupted SSE event must not be made complete by finalization."""
     proxy = _build_proxy_with_real_logger(log_full_messages=False)
 
     partial_message_start = (
@@ -291,6 +285,7 @@ async def test_finalize_stream_response_recovers_usage_from_truncated_buffer() -
         b'"content":[],"stop_reason":null,"usage":{'
         b'"input_tokens":1234,"cache_read_input_tokens":50000,'
         b'"cache_creation_input_tokens":2500,"output_tokens":1}}}'
+        b"\xe5"
     )
 
     state = {
@@ -319,9 +314,10 @@ async def test_finalize_stream_response_recovers_usage_from_truncated_buffer() -
         start_time=0.0,
     )
 
-    assert state["input_tokens"] == 1234
-    assert state["cache_read_input_tokens"] == 50000
-    assert state["cache_creation_input_tokens"] == 2500
+    assert state["input_tokens"] is None
+    assert state["cache_read_input_tokens"] == 0
+    assert state["cache_creation_input_tokens"] == 0
+    assert state["sse_buffer"] == bytearray()
 
 
 @pytest.mark.asyncio

@@ -97,7 +97,7 @@ def _tok(text: str) -> int:
 def test_payload_tokens_is_cl100k_or_one_per_character(monkeypatch):
     marker = ccr_retrieval_marker(100, 59, SINGLE_TOKEN_SOURCE, _real_key(SINGLE_TOKEN_SOURCE))
     assert _real_key(SINGLE_TOKEN_SOURCE) == "7dbb8f8de9f3e1d7c6f3a6e1"
-    assert payload_tokens(marker) == _tok(marker) == 43
+    assert payload_tokens(marker) == _tok(marker) == 47
     assert payload_tokens(SINGLE_TOKEN_SOURCE) == _tok(SINGLE_TOKEN_SOURCE) == 100
     monkeypatch.setattr(kc, "_payload_encoder", False)
     assert payload_tokens(marker) == len(marker)

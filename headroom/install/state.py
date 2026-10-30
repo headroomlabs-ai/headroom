@@ -12,7 +12,16 @@ from pathlib import Path
 from typing import Any
 
 from .models import ArtifactRecord, DeploymentManifest, ManagedMutation, iso_utc_now
-from .paths import deploy_root, manifest_path, profile_root
+from .paths import (
+    OWNER_ONLY_DIR_MODE,
+    OWNER_ONLY_FILE_MODE,
+    POSIX_MODES_ENFORCED,
+    chmod_owner_only,
+    deploy_root,
+    manifest_path,
+    profile_root,
+    recovery_manifest_path,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -29,19 +38,75 @@ def _atomic_write_text(path: Path, data: str) -> None:
     both POSIX and Windows). A crash between truncate and full write therefore
     leaves either the previous file or the complete new one on disk, never a
     truncated manifest.
+
+    The file is owner-only. ``manifest.base_env`` holds whatever
+    ``headroom install --env KEY=VALUE`` was given, and that is the supported
+    way to hand a provider API key to a supervised proxy (supervisors start
+    from a bare environment), so the manifest must be assumed to contain
+    secrets. :func:`tempfile.mkstemp` already creates the temporary file 0600
+    and :func:`os.replace` carries that mode across, but the chmod is explicit
+    so the guarantee survives a future rewrite of this function and is pinned
+    by a test rather than inherited by accident.
     """
     directory = path.parent
     fd, tmp_name = tempfile.mkstemp(dir=directory, prefix=f".{path.name}.", suffix=".tmp")
     tmp_path = Path(tmp_name)
     try:
-        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+        with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as handle:
             handle.write(data)
             handle.flush()
             os.fsync(handle.fileno())
+        chmod_owner_only(tmp_path, OWNER_ONLY_FILE_MODE)
         os.replace(tmp_path, path)
     except BaseException:
         tmp_path.unlink(missing_ok=True)
         raise
+
+
+def _manifest_json(manifest: DeploymentManifest) -> str:
+    return json.dumps(asdict(manifest), indent=2) + "\n"
+
+
+def _narrow_profile_root(root: Path) -> None:
+    """Make a deployment profile directory owner-only.
+
+    ``exist_ok=True`` leaves a pre-existing directory's mode alone, and a
+    profile created before owner-only modes is 0755, so narrow it on every save
+    rather than only at creation.
+
+    Not fatal, unlike the runner script: the manifest itself is created through
+    ``mkstemp``, which is 0600 from birth, so a directory that could not be
+    narrowed weakens the outer layer without exposing the file. Warn rather
+    than abandon a deployment over it.
+    """
+    if not chmod_owner_only(root, OWNER_ONLY_DIR_MODE) and POSIX_MODES_ENFORCED:
+        logger.warning(
+            "Deployment profile directory %s is not owner-only; the "
+            "manifest inside it is still 0o%o, but other local users can "
+            "list the directory.",
+            root,
+            OWNER_ONLY_FILE_MODE,
+        )
+
+
+def _save_manifest_at(
+    path: Path,
+    manifest: DeploymentManifest,
+    *,
+    strict: bool,
+    owner_only_dir: bool = False,
+) -> None:
+    root = path.parent
+    root.mkdir(parents=True, exist_ok=True)
+    if owner_only_dir:
+        _narrow_profile_root(root)
+    manifest.updated_at = iso_utc_now()
+    try:
+        _atomic_write_text(path, _manifest_json(manifest))
+    except OSError:
+        if strict:
+            raise
+        logger.warning("Cannot save deployment manifest: %s — continuing without persistence", path)
 
 
 def save_manifest(manifest: DeploymentManifest) -> None:
@@ -50,15 +115,36 @@ def save_manifest(manifest: DeploymentManifest) -> None:
     The write is atomic so an interrupted save (SIGKILL, system restart, OOM)
     cannot leave a truncated ``manifest.json`` behind. Gracefully handles
     read-only filesystems by logging a warning instead of crashing.
+
+    The profile directory and the manifest are owner-only: ``base_env`` carries
+    whatever ``headroom install --env`` was given, which is the supported way to
+    hand a provider API key to a supervised proxy. See
+    :data:`headroom.install.paths.OWNER_ONLY_DIR_MODE`.
     """
     try:
-        root = profile_root(manifest.profile)
-        root.mkdir(parents=True, exist_ok=True)
-        manifest.updated_at = iso_utc_now()
-        path = manifest_path(manifest.profile)
-        _atomic_write_text(path, json.dumps(asdict(manifest), indent=2) + "\n")
+        _save_manifest_at(
+            manifest_path(manifest.profile), manifest, strict=False, owner_only_dir=True
+        )
     except OSError as e:
         logger.warning("Cannot save deployment manifest: %s — continuing without persistence", e)
+
+
+def save_manifest_strict(manifest: DeploymentManifest) -> None:
+    """Persist a manifest and propagate errors when recovery depends on it."""
+
+    _save_manifest_at(manifest_path(manifest.profile), manifest, strict=True, owner_only_dir=True)
+
+
+def save_recovery_manifest(manifest: DeploymentManifest) -> None:
+    """Persist an inactive, complete snapshot for failed deployment recovery."""
+
+    _save_manifest_at(recovery_manifest_path(manifest.profile), manifest, strict=True)
+
+
+def delete_recovery_manifest(profile: str = "default") -> None:
+    """Delete an inactive recovery snapshot when its transaction is complete."""
+
+    recovery_manifest_path(profile).unlink(missing_ok=True)
 
 
 # The Docker image org moved from a personal repo to the project org. The old
@@ -78,6 +164,15 @@ def _migrate_deprecated_image(image: Any) -> Any:
     return image
 
 
+def _manifest_from_payload(payload: dict[str, Any]) -> DeploymentManifest:
+    """Build a manifest from its decoded JSON, migrating the retired image repo."""
+    payload["mutations"] = [ManagedMutation(**item) for item in payload.get("mutations", [])]
+    payload["artifacts"] = [ArtifactRecord(**item) for item in payload.get("artifacts", [])]
+    if "image" in payload:
+        payload["image"] = _migrate_deprecated_image(payload["image"])
+    return DeploymentManifest(**payload)
+
+
 def load_manifest(profile: str = "default") -> DeploymentManifest | None:
     """Load a deployment manifest when present."""
 
@@ -89,13 +184,15 @@ def load_manifest(profile: str = "default") -> DeploymentManifest | None:
     # command and the auto-run `init hook ensure` route through here. Raise a
     # typed error so callers can report cleanly or degrade gracefully.
     try:
-        payload = json.loads(path.read_text(encoding="utf-8"))
-        payload["mutations"] = [ManagedMutation(**item) for item in payload.get("mutations", [])]
-        payload["artifacts"] = [ArtifactRecord(**item) for item in payload.get("artifacts", [])]
-        if "image" in payload:
-            payload["image"] = _migrate_deprecated_image(payload["image"])
-        return DeploymentManifest(**payload)
-    except (json.JSONDecodeError, ValueError, TypeError, OSError) as e:
+        text = path.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError) as e:
+        raise ManifestError(
+            f"deployment profile '{profile}' could not be read ({path}): {e}. "
+            "Check the file's permissions and that it is UTF-8."
+        ) from e
+    try:
+        return _manifest_from_payload(json.loads(text))
+    except (ValueError, TypeError) as e:
         raise ManifestError(f"deployment profile '{profile}' is corrupt ({path}): {e}") from e
 
 
@@ -109,16 +206,24 @@ def list_manifests() -> list[DeploymentManifest]:
     manifests: list[DeploymentManifest] = []
     for candidate in sorted(root.glob("*/manifest.json")):
         try:
-            payload = json.loads(candidate.read_text(encoding="utf-8"))
-            payload["mutations"] = [
-                ManagedMutation(**item) for item in payload.get("mutations", [])
-            ]
-            payload["artifacts"] = [ArtifactRecord(**item) for item in payload.get("artifacts", [])]
-            if "image" in payload:
-                payload["image"] = _migrate_deprecated_image(payload["image"])
-            manifests.append(DeploymentManifest(**payload))
-        except (OSError, ValueError, TypeError):
+            text = candidate.read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError) as e:
+            logger.warning(
+                "Skipping unreadable deployment manifest %s: %s. Check the file's "
+                "permissions and that it is UTF-8.",
+                candidate,
+                e,
+            )
             continue
+        try:
+            manifests.append(_manifest_from_payload(json.loads(text)))
+        except (ValueError, TypeError) as e:
+            logger.warning(
+                "Skipping corrupt deployment manifest %s: %s. Fix or delete the file to "
+                "restore that profile.",
+                candidate,
+                e,
+            )
     return manifests
 
 
@@ -127,4 +232,4 @@ def delete_manifest(profile: str = "default") -> None:
 
     root = profile_root(profile)
     if root.exists():
-        shutil.rmtree(root, ignore_errors=True)
+        shutil.rmtree(root)

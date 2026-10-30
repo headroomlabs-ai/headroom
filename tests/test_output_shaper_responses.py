@@ -15,6 +15,7 @@ from typing import Any
 from headroom.proxy.handlers.openai import _shape_openai_responses_payload
 from headroom.proxy.output_savings import conversation_key_from_responses_body
 from headroom.proxy.output_shaper import (
+    DEFAULT_VERBOSITY_LEVEL,
     OutputShaperSettings,
     TurnKind,
     apply_responses_verbosity_steering,
@@ -202,7 +203,7 @@ class TestShapeResponsesRequest:
         body = _mechanical_body()
         result = shape_responses_request(body, OutputShaperSettings(enabled=True))
         assert result.changed is True
-        assert "output_shaper:verbosity:L3" in (result.labels or [])
+        assert f"output_shaper:verbosity:L{DEFAULT_VERBOSITY_LEVEL}" in (result.labels or [])
         assert body["reasoning"]["effort"] == "high", "reasoning.effort is left alone now"
         assert body["instructions"].startswith("You are Codex.")
 
@@ -217,7 +218,7 @@ class TestShapeResponsesRequest:
         result = shape_responses_request(body, OutputShaperSettings(enabled=True))
         assert result.changed is True
         assert body["reasoning"]["effort"] == "high"
-        assert result.labels == ["output_shaper:verbosity:L3"]
+        assert result.labels == [f"output_shaper:verbosity:L{DEFAULT_VERBOSITY_LEVEL}"]
 
 
 # ---------------------------------------------------------------------------

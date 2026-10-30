@@ -1,41 +1,66 @@
 """OpenCode MCP registrar.
 
-OpenCode stores MCP server configuration in ``~/.config/opencode/opencode.json``
-under the top-level ``mcp`` key. This registrar edits that JSON file directly.
+OpenCode stores MCP server configuration under ``~/.config/opencode/opencode.json``
+(or ``opencode.jsonc``, if present) under the top-level ``mcp`` key. This registrar
+edits that JSON file directly.
 """
 
 from __future__ import annotations
 
 import json
 import logging
-import os
 import shutil
 from pathlib import Path
 from typing import Any
 
-from .base import MCPRegistrar, RegisterResult, RegisterStatus, ServerSpec
+from headroom import fsutil
+from headroom.install.paths import opencode_config_path
+
+from .base import (
+    MCPRegistrar,
+    RegisterResult,
+    RegisterStatus,
+    ServerSpec,
+    _diff_specs,
+    _specs_equivalent,
+)
 
 logger = logging.getLogger(__name__)
 
 
-def _opencode_home_dir() -> Path:
-    """Return the OpenCode home/config directory."""
-    env_path = os.environ.get("OPENCODE_HOME", "").strip()
-    if env_path:
-        return Path(env_path).expanduser()
-    return Path.home() / ".config" / "opencode"
+def _parse_json_loose(raw: str) -> dict[str, Any] | None:
+    """Parse JSON or JSONC text, returning ``None`` if it can't be parsed as an object.
 
+    Standard JSON is tried first so URLs containing ``//`` are never touched.
+    The JSONC fallback reuses the OpenCode provider's string-aware stripping
+    of ``//`` and ``/* */`` comments and trailing commas, so this accepts the
+    same files ``headroom wrap``/``install`` already edit.
+    """
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError:
+        # Imported here: headroom.providers.opencode imports this package.
+        from headroom.providers.opencode.config import (
+            _strip_jsonc_comments,
+            _strip_jsonc_trailing_commas,
+        )
 
-def _opencode_config_path() -> Path:
-    """Return the active OpenCode config path."""
-    env_path = os.environ.get("OPENCODE_CONFIG", "").strip()
-    if env_path:
-        return Path(env_path).expanduser()
-    return _opencode_home_dir() / "opencode.json"
+        # The stripper treats an unterminated ``/*`` as running to EOF. That is
+        # malformed input, and accepting what precedes it would let the write
+        # path drop the rest of the file. A ``*/`` appended after a newline
+        # survives stripping unless it closes such a comment.
+        if not _strip_jsonc_comments(raw + "\n*/").endswith("*/"):
+            return None
+        cleaned = _strip_jsonc_trailing_commas(_strip_jsonc_comments(raw))
+        try:
+            data = json.loads(cleaned)
+        except json.JSONDecodeError:
+            return None
+    return data if isinstance(data, dict) else None
 
 
 def _read_json(path: Path) -> dict[str, Any]:
-    """Read a JSON file, returning empty dict if absent or unparseable.
+    """Read a JSON/JSONC file, returning empty dict if absent or unparseable.
 
     Safe for READ-ONLY callers only. Do NOT use before a full-file rewrite:
     an unparseable existing file returns ``{}`` here, and writing that back
@@ -45,13 +70,10 @@ def _read_json(path: Path) -> dict[str, Any]:
     if not path.exists():
         return {}
     try:
-        with open(path, encoding="utf-8") as f:
-            data = json.load(f)
-    except (OSError, json.JSONDecodeError):
+        raw = path.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError):
         return {}
-    if not isinstance(data, dict):
-        return {}
-    return data
+    return _parse_json_loose(raw) or {}
 
 
 class _MalformedConfigError(Exception):
@@ -63,33 +85,34 @@ class _MalformedConfigError(Exception):
 
 
 def _read_json_for_write(path: Path) -> dict[str, Any]:
-    """Read a JSON object for a subsequent full-file rewrite.
+    """Read a JSON/JSONC object for a subsequent full-file rewrite.
 
     Returns ``{}`` only when the file is absent or empty (safe to start fresh).
-    If the file exists with content but does not parse as a JSON object, raise
-    :class:`_MalformedConfigError` so the caller aborts instead of overwriting
-    unrelated user config — ``opencode.json`` holds ``theme``/``model``/
-    ``provider``/other MCP servers alongside the ``mcp`` block.
+    JSONC comments and trailing commas are stripped before parsing, matching
+    the loose JSONC handling used by the OpenCode provider-block writer — note the rewritten
+    file loses any comments it had. If the file exists with content but still
+    does not parse as a JSON object, raise :class:`_MalformedConfigError` so
+    the caller aborts instead of overwriting unrelated user config — the
+    OpenCode config file holds ``theme``/``model``/``provider``/other MCP
+    servers alongside the ``mcp`` block.
     """
     if not path.exists():
         return {}
-    raw = path.read_text(encoding="utf-8")  # OSError propagates to the caller
+    try:
+        raw = path.read_text(encoding="utf-8")  # OSError propagates to the caller
+    except UnicodeDecodeError as exc:
+        raise _MalformedConfigError(f"not valid UTF-8: {exc}") from exc
     if not raw.strip():
         return {}
-    try:
-        data = json.loads(raw)
-    except json.JSONDecodeError as exc:
-        raise _MalformedConfigError(str(exc)) from exc
-    if not isinstance(data, dict):
-        raise _MalformedConfigError("top-level JSON is not an object")
+    data = _parse_json_loose(raw)
+    if data is None:
+        raise _MalformedConfigError("not valid JSON/JSONC")
     return data
 
 
 def _write_json(path: Path, data: dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump(data, f, indent=2)
-        f.write("\n")
+    fsutil.write_text(path, json.dumps(data, indent=2) + "\n")
 
 
 def _entry_to_spec(name: str, entry: dict[str, Any]) -> ServerSpec:
@@ -118,28 +141,6 @@ def _spec_to_entry(spec: ServerSpec) -> dict[str, Any]:
     return entry
 
 
-def _specs_equivalent(a: ServerSpec, b: ServerSpec) -> bool:
-    return (
-        a.name == b.name
-        and a.command == b.command
-        and tuple(a.args) == tuple(b.args)
-        and dict(a.env) == dict(b.env)
-    )
-
-
-def _diff_specs(existing: ServerSpec, requested: ServerSpec) -> str:
-    parts: list[str] = []
-    if existing.command != requested.command:
-        parts.append(f"command {existing.command!r} -> {requested.command!r}")
-    if tuple(existing.args) != tuple(requested.args):
-        parts.append(f"args {list(existing.args)} -> {list(requested.args)}")
-    if dict(existing.env) != dict(requested.env):
-        parts.append(f"env {dict(existing.env)} -> {dict(requested.env)}")
-    if not parts:
-        return "spec differs in unidentified field(s)"
-    return "; ".join(parts)
-
-
 class OpencodeRegistrar(MCPRegistrar):
     """Register MCP servers with OpenCode."""
 
@@ -147,7 +148,7 @@ class OpencodeRegistrar(MCPRegistrar):
     display_name = "OpenCode"
 
     def __init__(self, *, config_path: Path | None = None) -> None:
-        self._config_path = config_path or _opencode_config_path()
+        self._config_path = config_path or opencode_config_path()
 
     def detect(self) -> bool:
         if shutil.which("opencode"):
@@ -209,8 +210,8 @@ class OpencodeRegistrar(MCPRegistrar):
             mcp[spec.name] = _spec_to_entry(spec)
             _write_json(self._config_path, data)
         except _MalformedConfigError as exc:
-            # Refuse to overwrite: opencode.json holds theme/model/provider and
-            # other MCP servers that a blind rewrite would wipe.
+            # Refuse to overwrite: the config file holds theme/model/provider
+            # and other MCP servers that a blind rewrite would wipe.
             return RegisterResult(
                 RegisterStatus.FAILED,
                 f"{self._config_path} exists but is not valid JSON ({exc}); "

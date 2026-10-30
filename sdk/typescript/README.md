@@ -1,6 +1,16 @@
-# headroom-ai
+# Headroom (`headroom-ai`) for TypeScript
 
-Compress LLM context. Save tokens. Fit more into every request.
+Compress tool outputs, logs, JSON and chat history before each LLM call. Fewer
+input tokens, same answers.
+
+**Requires the Headroom proxy.** Compression runs in the Python proxy; this
+package sends messages to it over HTTP (default `http://localhost:8787`). Start
+it first:
+
+```bash
+pip install "headroom-ai[proxy]"   # or: uv tool install --python 3.13 "headroom-ai[proxy]"
+headroom proxy --port 8787
+```
 
 ## Install
 
@@ -23,7 +33,7 @@ const response = await openai.chat.completions.create({
 });
 ```
 
-Requires a running Headroom proxy (`headroom proxy`).
+Pass `baseUrl` if the proxy is not on `http://localhost:8787`.
 
 ## Framework Adapters
 
@@ -279,7 +289,15 @@ const hints = await client.feedback.getHints('list_servers');
 // TOIN (Tool Output Intelligence Network)
 const toinStats = await client.toin.getStats();
 const patterns = await client.toin.getPatterns(20);
+const pattern = patterns[0] && await client.toin.getPattern(patterns[0].hash);
 ```
+
+Each `hash` is the complete scoped aggregation key, including tenant, auth mode,
+model family, and tool signature. Pass it back unchanged for an exact lookup;
+the client URL-encodes it. Shorter aggregation-key prefixes are accepted only
+when they identify one pattern; ambiguous prefixes return HTTP 409 rather than
+an arbitrary pattern.
+
 
 ## Configuration Types
 

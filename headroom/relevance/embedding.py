@@ -1,10 +1,9 @@
 """Embedding-based relevance scorer for Headroom SDK.
 
 This module provides semantic relevance scoring using `fastembed`
-(BAAI/bge-small-en-v1.5 by default — 33M params, 384 dims, ~30 MB
-int8-quantized ONNX). Same library + same model used by the Rust
-SmartCrusher (fastembed-rs crate) so embeddings agree byte-for-byte
-across the language boundary.
+(BAAI/bge-small-en-v1.5 by default — 33M params, 384 dims, ~67 MB
+quantized ONNX), loaded from a pinned Qdrant/bge-small-en-v1.5-onnx-Q
+snapshot in the HuggingFace hub cache.
 
 Key features:
 - Semantic understanding ("errors" matches "failed", "issues")
@@ -13,7 +12,7 @@ Key features:
 - ~2-3x faster than sentence-transformers' all-MiniLM-L6-v2
 - Outranks all-MiniLM-L6-v2 by ~6 MTEB points
 
-Install with: pip install headroom[relevance]
+Install with: pip install "headroom-ai[relevance]"
 
 History: this module previously wrapped `sentence-transformers`
 (PyTorch). Switched to fastembed in Stage 3c.1 of the Rust port to:
@@ -28,9 +27,21 @@ from __future__ import annotations
 
 import logging
 import os
-from typing import TYPE_CHECKING
+from collections.abc import Iterator
+from contextlib import contextmanager
+from pathlib import Path
+from typing import TYPE_CHECKING, Any
+
+from headroom.offline import OfflineEgressBlocked, guard_egress
+from headroom.onnx_runtime import _resolve_revision, hf_hub_download_local_first
 
 from .base import RelevanceScore, RelevanceScorer
+
+# Texts per ONNX Runtime run. fastembed pads each batch to its longest text, and
+# its default batch of 256 grows ORT's CPU arena (which never shrinks) to fit
+# the biggest batch a proxy ever scores: 2.5 GB retained in a long-lived macOS
+# proxy. 16 holds ~10x less and runs faster, with less padding per batch.
+EMBED_BATCH_SIZE = 16
 
 # numpy is an optional dependency - import lazily
 _numpy = None
@@ -47,7 +58,7 @@ def _get_numpy():
         except ImportError as e:
             raise ImportError(
                 "numpy is required for EmbeddingScorer. "
-                "Install with: pip install headroom[relevance]"
+                'Install with: pip install "headroom-ai[relevance]"'
             ) from e
     return _numpy
 
@@ -57,28 +68,142 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+
+@contextmanager
+def _hf_hub_forced_offline() -> Iterator[None]:
+    """Force the HuggingFace stack offline for the duration of the block.
+
+    huggingface_hub reads HF_HUB_OFFLINE once, at import, into
+    ``constants.HF_HUB_OFFLINE``; if it was imported before this call the env
+    var alone changes nothing. Force both, and restore both on exit.
+    """
+    from huggingface_hub import constants as hf_constants
+
+    previous = os.environ.get("HF_HUB_OFFLINE")
+    previous_constant = hf_constants.HF_HUB_OFFLINE
+    os.environ["HF_HUB_OFFLINE"] = "1"
+    hf_constants.HF_HUB_OFFLINE = True
+    try:
+        yield
+    finally:
+        hf_constants.HF_HUB_OFFLINE = previous_constant
+        if previous is None:
+            os.environ.pop("HF_HUB_OFFLINE", None)
+        else:
+            os.environ["HF_HUB_OFFLINE"] = previous
+
+
+def _load_text_embedding(kwargs: dict[str, Any]) -> TextEmbedding:
+    """Build a fastembed ``TextEmbedding``, cache first and network second.
+
+    ``onnx_runtime.hf_hub_download_local_first`` can hang the air-gap guard on
+    an explicit ``local_files_only=True`` attempt because ``hf_hub_download``
+    takes that flag. fastembed's constructor does not, so the same cache-hit /
+    network-fallback split has to be made here: try the load with the whole
+    HuggingFace stack forced offline, and only reach for the guard when that
+    fails, which is exactly the case where a socket would have been opened.
+
+    This keeps the behaviour an air-gapped deployment actually wants — a
+    pre-seeded cache still loads under ``HEADROOM_OFFLINE`` — while making a
+    cold cache refuse instead of quietly dialling huggingface.co. A plain
+    unconditional guard would have broken the pre-seeded case, which is the
+    reason this path was left unguarded before.
+
+    The ``HF_HUB_OFFLINE`` flip is process-global for the duration of the
+    call. That is acceptable here because loading is one-shot and memoised by
+    the caller, and because the value it forces is *stricter* than whatever it
+    replaces, so a concurrent HuggingFace call can only be refused locally,
+    never sent somewhere it would not otherwise go.
+    """
+    from fastembed import TextEmbedding
+
+    try:
+        with _hf_hub_forced_offline():
+            return TextEmbedding(**kwargs)
+    except Exception as cache_miss:  # noqa: BLE001 - any local-lookup failure
+        logger.debug("fastembed cache lookup failed, falling back to network: %s", cache_miss)
+
+    guard_egress(
+        f"fastembed weight download for {kwargs['model_name']}",
+        "huggingface.co",
+    )
+    return TextEmbedding(**kwargs)
+
+
 # Default model name. Same string used by the Rust embedding scorer.
 DEFAULT_MODEL_NAME = "BAAI/bge-small-en-v1.5"
 
-# Pinned revision of fastembed's underlying HF repo for the default model
-# (fastembed resolves "BAAI/bge-small-en-v1.5" -> "qdrant/bge-small-en-v1.5-onnx-q").
-# fastembed's TextEmbedding signature omits ``revision`` but forwards **kwargs to
-# huggingface_hub.snapshot_download, so passing it pins the download for
-# supply-chain integrity. Only the default model is pinned; custom models float.
-# Set HEADROOM_HF_PIN=off to bypass (mirrors headroom.onnx_runtime pinning).
-_DEFAULT_MODEL_PINNED_REVISION = "52398278842ec682c6f32300af41344b1c0b0bb2"
+# The HF repo fastembed resolves DEFAULT_MODEL_NAME to, and every file a
+# fastembed load of it reads. Its revision is pinned in
+# ``onnx_runtime._PINNED_REVISIONS`` (HEADROOM_HF_PIN=off floats it).
+DEFAULT_MODEL_REPO = "Qdrant/bge-small-en-v1.5-onnx-Q"
+DEFAULT_MODEL_FILES = (
+    "model_optimized.onnx",
+    "tokenizer.json",
+    "tokenizer_config.json",
+    "special_tokens_map.json",
+    "config.json",
+)
 
 
-def _pinned_revision(model_name: str) -> str | None:
-    """Return the pinned HF revision for ``model_name`` (default model only).
+def _resolve_default_model_snapshot() -> str:
+    """Return the local directory holding the pinned default-model snapshot.
 
-    Returns ``None`` for custom models or when ``HEADROOM_HF_PIN=off``.
+    fastembed cannot pin this itself: ``TextEmbedding`` accepts ``revision``
+    but drops it before ``snapshot_download`` (fastembed 0.9.0), so passing it
+    left the download floating on the repo's ``main``. Each file is resolved
+    here through ``hf_hub_download_local_first`` instead, which applies the
+    pinned SHA, tries the cache first and guards the network fallback.
+
+    The files land in the standard HuggingFace hub cache rather than
+    fastembed's default under the system temp dir, which macOS purges after a
+    few idle days.
+
+    Raises:
+        OfflineEgressBlocked: ``HEADROOM_OFFLINE`` is set and a file is not cached.
+        RuntimeError: the files resolved to more than one snapshot, which only
+            happens when ``main`` moved mid-download with pinning turned off.
     """
-    if os.environ.get("HEADROOM_HF_PIN", "").strip().lower() in ("off", "0", "false", "no"):
-        return None
-    if model_name == DEFAULT_MODEL_NAME:
-        return _DEFAULT_MODEL_PINNED_REVISION
-    return None
+    paths = [
+        Path(hf_hub_download_local_first(DEFAULT_MODEL_REPO, name)) for name in DEFAULT_MODEL_FILES
+    ]
+    snapshot_dirs = {path.parent for path in paths}
+    if len(snapshot_dirs) != 1:
+        raise RuntimeError(
+            f"{DEFAULT_MODEL_REPO} files resolved to more than one snapshot: "
+            f"{sorted(str(d) for d in snapshot_dirs)}"
+        )
+    return str(snapshot_dirs.pop())
+
+
+def _default_model_seed_hint() -> str:
+    """How to pre-seed DEFAULT_MODEL_NAME on a host that cannot download it.
+
+    Names the exact snapshot the load looks up, because a fastembed cache
+    seeded for an older Headroom no longer satisfies it.
+    """
+    revision = _resolve_revision(DEFAULT_MODEL_REPO, None) or "main"
+    return (
+        f"Pre-seed the HuggingFace hub cache with {DEFAULT_MODEL_REPO}@{revision} "
+        f"(`hf download {DEFAULT_MODEL_REPO} {' '.join(DEFAULT_MODEL_FILES)} "
+        f"--revision {revision}`), or use the BM25-only scorer. A fastembed cache "
+        "seeded for an older Headroom is not read for this model."
+    )
+
+
+def _load_default_model() -> TextEmbedding:
+    """Load DEFAULT_MODEL_NAME from its pinned snapshot, with no fastembed lookup.
+
+    Given ``specific_model_path`` fastembed loads that directory without
+    touching the Hub; the construction still runs with the Hub forced offline
+    so that a fastembed that stopped honouring it fails here instead of
+    downloading an unpinned copy.
+    """
+    from fastembed import TextEmbedding
+
+    snapshot = _resolve_default_model_snapshot()
+    with _hf_hub_forced_offline():
+        return TextEmbedding(model_name=DEFAULT_MODEL_NAME, specific_model_path=snapshot)
 
 
 def _cosine_similarity(a, b) -> float:
@@ -107,8 +232,8 @@ class EmbeddingScorer(RelevanceScorer):
     """Semantic relevance scorer using fastembed (ONNX-backed).
 
     Default model: BAAI/bge-small-en-v1.5 (33M params, 384 dims).
-    Auto-downloads from HuggingFace Hub on first use (~30 MB
-    int8-quantized ONNX).
+    Auto-downloads its pinned snapshot from HuggingFace Hub on first
+    use (~67 MB quantized ONNX).
 
     Example:
         scorer = EmbeddingScorer()
@@ -119,7 +244,7 @@ class EmbeddingScorer(RelevanceScorer):
         # score.score > 0.5 (semantic match between "failed"/"error" and "errors")
 
     Note:
-        Requires fastembed: pip install headroom[relevance]
+        Requires fastembed: pip install "headroom-ai[relevance]"
     """
 
     def __init__(
@@ -165,18 +290,34 @@ class EmbeddingScorer(RelevanceScorer):
         """
         if not self.is_available():
             raise RuntimeError(
-                "EmbeddingScorer requires fastembed. Install with: pip install headroom[relevance]"
+                "EmbeddingScorer requires fastembed. "
+                'Install with: pip install "headroom-ai[relevance]"'
             )
 
         if self._model is None:
-            from fastembed import TextEmbedding
-
-            revision = _pinned_revision(self.model_name)
-            if revision is not None:
-                # fastembed forwards **kwargs to snapshot_download(revision=...).
-                self._model = TextEmbedding(model_name=self.model_name, revision=revision)
-            else:
-                self._model = TextEmbedding(model_name=self.model_name)
+            try:
+                if self.model_name == DEFAULT_MODEL_NAME:
+                    self._model = _load_default_model()
+                else:
+                    # Other catalog models are not pinned: fastembed resolves
+                    # them on the repo's main, cache first.
+                    self._model = _load_text_embedding({"model_name": self.model_name})
+            except OfflineEgressBlocked as blocked:
+                # Translate at the boundary that owns the degradation, the way
+                # the Kompress and ONNX loaders do. Public model weights are
+                # not data leaving the box, so what the caller needs to hear
+                # is "this model is not available here and why", not an
+                # air-gap type it has never seen.
+                if self.model_name == DEFAULT_MODEL_NAME:
+                    seed_hint = _default_model_seed_hint()
+                else:
+                    seed_hint = (
+                        "Pre-seed the fastembed cache on this host, or use the BM25-only scorer."
+                    )
+                raise RuntimeError(
+                    f"Embedding model {self.model_name!r} is unavailable: "
+                    f"{str(blocked).rstrip('.')}. {seed_hint}"
+                ) from None
         return self._model
 
     def _encode(self, texts: list[str]):
@@ -194,7 +335,7 @@ class EmbeddingScorer(RelevanceScorer):
         """
         np = _get_numpy()
         model = self._get_model()
-        embeddings = list(model.embed(texts))
+        embeddings = list(model.embed(texts, batch_size=EMBED_BATCH_SIZE))
         return np.array(embeddings)
 
     def score(self, item: str, context: str) -> RelevanceScore:

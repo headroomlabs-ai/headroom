@@ -30,9 +30,22 @@
 use std::sync::Mutex;
 
 #[cfg(feature = "ml")]
-use fastembed::{EmbeddingModel, InitOptions, TextEmbedding};
+use fastembed::{EmbeddingModel, InitOptions, QuantizationMode, TextEmbedding};
 
 use super::base::{RelevanceScore, RelevanceScorer};
+
+/// Texts per ONNX Runtime run, matching Python's `EMBED_BATCH_SIZE`: fastembed's
+/// default of 256 grows ORT's never-shrinking CPU arena to the biggest batch scored.
+#[cfg(feature = "ml")]
+const EMBED_BATCH_SIZE: usize = 16;
+
+/// fastembed refuses to split a dynamic-quantized model's input across runs (each
+/// run calibrates its own int8 range, so the embeddings would not compare): one batch.
+#[cfg(feature = "ml")]
+fn embed_batch_size(model_kind: &EmbeddingModel) -> Option<usize> {
+    (TextEmbedding::get_quantization_mode(model_kind) != QuantizationMode::Dynamic)
+        .then_some(EMBED_BATCH_SIZE)
+}
 
 /// fastembed-backed semantic relevance scorer.
 ///
@@ -56,6 +69,8 @@ pub struct EmbeddingScorer {
     /// dominant cost so contention is bounded by inference latency,
     /// not lock latency.
     model: Option<Mutex<TextEmbedding>>,
+    /// `embed` batch size for this model, from `embed_batch_size`.
+    batch_size: Option<usize>,
 }
 
 #[cfg(feature = "ml")]
@@ -75,6 +90,7 @@ impl Default for EmbeddingScorer {
         EmbeddingScorer {
             model_name: "BAAI/bge-small-en-v1.5".to_string(),
             model: None,
+            batch_size: Some(EMBED_BATCH_SIZE),
         }
     }
 }
@@ -98,6 +114,22 @@ impl EmbeddingScorer {
     /// quality/speed tradeoff for compression-relevance scoring on
     /// short snippets.
     pub fn try_new_with_model(model_kind: EmbeddingModel) -> Result<Self, String> {
+        let name = format!("{:?}", model_kind);
+        // Air-gap chokepoint, FIRST thing in the function. `TextEmbedding::
+        // try_new` resolves the model's ONNX weights through `hf-hub`, which
+        // downloads from huggingface.co on a cache miss even with
+        // `HF_HUB_OFFLINE` set — the same hole the tokenizer and Kompress model
+        // fetches had. It sits ahead of the AVX2 and ort-loader probes below so
+        // that an air-gapped box reports the policy refusal rather than
+        // whichever local prerequisite happened to be missing as well.
+        //
+        // The refusal is soft here by design: this function already returns
+        // `Err(String)` for "ONNX runtime unavailable" and every caller degrades
+        // to the BM25 scorer, so an air-gapped box loses embedding relevance
+        // instead of failing a request. The message names the switch so the
+        // operator can tell the two causes apart in the log.
+        crate::offline::guard_egress("fastembed embedding model download", &name)
+            .map_err(|e| format!("EmbeddingScorer model load refused: {e}"))?;
         // fastembed links the precompiled ONNX Runtime binary, which contains
         // AVX2 instructions on x86. Loading/running it on a non-AVX2 CPU traps
         // with SIGILL (issue #1723) — an uncatchable native fault. Bail early so
@@ -113,12 +145,13 @@ impl EmbeddingScorer {
         // `dynamic_ort_loader_ready`).
         crate::transforms::magika_detector::dynamic_ort_loader_ready()
             .map_err(|e| format!("EmbeddingScorer: ONNX Runtime unavailable: {e}"))?;
-        let name = format!("{:?}", model_kind);
+        let batch_size = embed_batch_size(&model_kind);
         let model = TextEmbedding::try_new(InitOptions::new(model_kind))
             .map_err(|e| format!("EmbeddingScorer model load failed: {}", e))?;
         Ok(EmbeddingScorer {
             model_name: name,
             model: Some(Mutex::new(model)),
+            batch_size,
         })
     }
 }
@@ -177,11 +210,11 @@ impl RelevanceScorer for EmbeddingScorer {
             }
         };
 
-        // Encode items + context in one batch — saves model dispatch
-        // overhead. Mirrors Python fastembed batch encoding.
+        // Encode items + context in one `embed` call, which runs them in
+        // `self.batch_size` chunks. Mirrors Python fastembed batch encoding.
         let mut all_texts: Vec<String> = items.iter().map(|s| s.to_string()).collect();
         all_texts.push(context.to_string());
-        let embeddings = match guard.embed(all_texts, None) {
+        let embeddings = match guard.embed(all_texts, self.batch_size) {
             Ok(e) => e,
             Err(e) => {
                 return items
@@ -308,6 +341,28 @@ mod tests {
         std::env::var("RUN_FASTEMBED_TESTS").is_ok()
     }
 
+    /// `try_new_with_model` must refuse before fastembed resolves the model,
+    /// and must say so in the returned message rather than looking like an
+    /// ordinary load failure — the caller only ever sees the `String`.
+    ///
+    /// Not gated on `RUN_FASTEMBED_TESTS`: the whole point is that no network
+    /// call happens, so this is safe to run in CI. If the guard were removed
+    /// this test would either download ~30 MB or fail with a load error, and
+    /// neither says "refused".
+    #[cfg(feature = "ml")]
+    #[test]
+    fn try_new_refuses_while_offline() {
+        let _guard = crate::test_support::env_lock();
+        std::env::set_var(crate::offline::OFFLINE_ENV, "1");
+        let result = EmbeddingScorer::try_new();
+        std::env::remove_var(crate::offline::OFFLINE_ENV);
+
+        let err = result.err().expect("guard must refuse while offline");
+        assert!(err.contains("refused"), "{err}");
+        assert!(err.contains(crate::offline::OFFLINE_ENV), "{err}");
+        assert!(err.contains("fastembed embedding model download"), "{err}");
+    }
+
     /// Construct a stub scorer with `model = None` for offline-safe
     /// tests of the unavailable-path behavior.
     #[cfg(feature = "ml")]
@@ -315,6 +370,7 @@ mod tests {
         EmbeddingScorer {
             model_name: "test".to_string(),
             model: None,
+            batch_size: Some(EMBED_BATCH_SIZE),
         }
     }
 
@@ -425,6 +481,15 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "ml")]
+    #[test]
+    fn dynamic_quantized_models_embed_in_one_batch() {
+        let capped = Some(EMBED_BATCH_SIZE);
+        assert_eq!(embed_batch_size(&EmbeddingModel::BGESmallENV15), capped);
+        assert_eq!(embed_batch_size(&EmbeddingModel::BGESmallENV15Q), capped);
+        assert_eq!(embed_batch_size(&EmbeddingModel::AllMiniLML6V2Q), None);
+    }
+
     // ---------- model-backed tests (gated on RUN_FASTEMBED_TESTS) ----------
 
     #[cfg(feature = "ml")]
@@ -467,6 +532,73 @@ mod tests {
         assert_eq!(scores.len(), 3);
         for sc in scores {
             assert!((0.0..=1.0).contains(&sc.score));
+        }
+    }
+
+    #[cfg(feature = "ml")]
+    #[test]
+    fn fastembed_batches_past_the_cap_keep_each_score_with_its_item() {
+        if !fastembed_enabled() {
+            return;
+        }
+        // Three EMBED_BATCH_SIZE batches of mixed lengths, the one related item
+        // in the last: a misaligned batch boundary would hand its score away.
+        let s = EmbeddingScorer::try_new().expect("model loads");
+        let mut items: Vec<String> = (0..40)
+            .map(|i| {
+                format!(
+                    "inventory row {i}: {}",
+                    "pallets of garden furniture ".repeat(i % 5 + 1)
+                )
+            })
+            .collect();
+        items[37] = "authentication failed for user admin: invalid password".to_string();
+        let refs: Vec<&str> = items.iter().map(String::as_str).collect();
+        let batch = s.score_batch(&refs, "login error");
+        assert_eq!(batch.len(), 40);
+        let top = (0..40)
+            .max_by(|&a, &b| batch[a].score.total_cmp(&batch[b].score))
+            .unwrap();
+        assert_eq!(top, 37);
+        for (item, sc) in refs.iter().zip(&batch) {
+            let single = s.score(item, "login error").score;
+            assert!(
+                (sc.score - single).abs() < 1e-3,
+                "{item}: batched {} vs single {single}",
+                sc.score
+            );
+        }
+    }
+
+    #[cfg(feature = "ml")]
+    #[test]
+    fn fastembed_dynamic_quantized_model_scores_on_both_sides_of_the_cap() {
+        if !fastembed_enabled() {
+            return;
+        }
+        // 15 items plus the context fill exactly one EMBED_BATCH_SIZE run; 16
+        // and 40 go past it, where fastembed refuses to split this model.
+        let s = EmbeddingScorer::try_new_with_model(EmbeddingModel::AllMiniLML6V2Q)
+            .expect("model loads");
+        for n in [15, 16, 40] {
+            let mut items: Vec<String> = (0..n)
+                .map(|i| format!("inventory row {i}: pallets of garden furniture"))
+                .collect();
+            items[n - 3] = "authentication failed for user admin: invalid password".to_string();
+            let refs: Vec<&str> = items.iter().map(String::as_str).collect();
+            let batch = s.score_batch(&refs, "login error");
+            assert_eq!(batch.len(), n);
+            for sc in &batch {
+                assert!(
+                    !sc.reason.contains("inference failed"),
+                    "{n} items: {}",
+                    sc.reason
+                );
+            }
+            let top = (0..n)
+                .max_by(|&a, &b| batch[a].score.total_cmp(&batch[b].score))
+                .unwrap();
+            assert_eq!(top, n - 3, "{n} items");
         }
     }
 }

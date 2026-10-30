@@ -112,6 +112,12 @@ Or via `~/.claude/settings.json`:
 Claude Code now talks plain Anthropic `/v1/messages` to Headroom; Headroom compresses
 and forwards to Bedrock via LiteLLM, then translates the answer back.
 
+This translating route is not currently compatible with Claude Code's server-side
+auto-mode classifier protocol. Ordinary model traffic remains fail-open, but
+classifier-bearing turns may use Claude Code's billable client-side fallback.
+Use native Anthropic transport for server-side auto mode, or set
+`CLAUDE_CODE_AUTO_MODE_SERVER=0` when the fallback is intentional.
+
 ## Application inference profiles (account-specific ARNs)
 
 If your IAM policy only permits **application inference profiles** (account-specific

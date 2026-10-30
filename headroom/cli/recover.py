@@ -2,12 +2,12 @@
 
 from __future__ import annotations
 
-import os
 from pathlib import Path
 
 import click
 
 from headroom.cli.main import main
+from headroom.install.paths import codex_home_dir
 from headroom.providers.codex.recovery import (
     audit_codex_history,
     discover_dangling_homes,
@@ -38,7 +38,7 @@ def recover() -> None:
 @click.option("--yes", is_flag=True, help="Apply the recovery without prompting.")
 def recover_codex(sources: tuple[Path, ...], target: Path | None, yes: bool) -> None:
     """Merge sessions and configuration from dangling Codex homes."""
-    target = target or Path(os.environ.get("CODEX_HOME", Path.home() / ".codex"))
+    target = target or codex_home_dir()
     selected_sources = list(sources) or [
         *discover_dangling_homes(),
         *discover_retained_sources(target),

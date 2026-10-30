@@ -25,7 +25,8 @@ import json
 import logging
 import sys
 from collections import deque
-from dataclasses import asdict
+from copy import deepcopy
+from dataclasses import asdict, fields
 from pathlib import Path
 from threading import Lock
 from typing import TYPE_CHECKING, Any
@@ -33,6 +34,7 @@ from typing import TYPE_CHECKING, Any
 if TYPE_CHECKING:
     from ..memory.tracker import ComponentStats
 
+from headroom import fileperms
 from headroom.proxy import request_log_redaction_policy
 from headroom.proxy.models import RequestLog
 
@@ -82,6 +84,10 @@ def redact_image_base64(payload: Any) -> Any:
     return result.value
 
 
+# Payload fields `get_recent` never returns and therefore must never walk.
+_HEAVY_FIELDS = frozenset({"request_messages", "compressed_messages", "response_content"})
+
+
 class RequestLogger:
     """Log requests to JSONL file.
 
@@ -91,6 +97,14 @@ class RequestLogger:
     """
 
     MAX_LOG_ENTRIES = 10_000
+    # How many of the newest entries keep their message payloads
+    # (``request_messages`` / ``compressed_messages`` / ``response_content``).
+    # ``/transformations/feed`` serves at most this many, and nothing else
+    # reads the payloads back, so keeping them on all MAX_LOG_ENTRIES retained
+    # two parsed copies of every conversation for the life of the process:
+    # a long agentic session grew one proxy to 100 GB RSS. Light fields stay
+    # on every entry for ``get_recent`` / ``/stats``.
+    MESSAGE_WINDOW = 100
 
     def __init__(self, log_file: str | None = None, log_full_messages: bool = False):
         self.log_file = Path(log_file) if log_file else None
@@ -130,10 +144,23 @@ class RequestLogger:
             entry.response_content = redact_image_base64(entry.response_content)
 
         self._logs.append(entry)
+        # Drop the payloads of the entry that just left the message window.
+        # One entry per append keeps the newest MESSAGE_WINDOW populated and
+        # every older one light without a scan.
+        if len(self._logs) > self.MESSAGE_WINDOW:
+            aged = self._logs[-self.MESSAGE_WINDOW - 1]
+            aged.request_messages = None
+            aged.compressed_messages = None
+            aged.response_content = None
 
         if self.log_file:
             try:
-                with open(self.log_file, "a") as f:
+                # Owner-only: with ``log_full_messages`` this file holds whole
+                # request and response bodies, and it is the caller's chosen
+                # path rather than one under ~/.headroom, so it must not be
+                # created at the umask. Symlinked paths fail the open and land
+                # in the graceful-degradation branch below.
+                with fileperms.open_owner_only(self.log_file, "a") as f:
                     log_dict = asdict(entry)
                     if not self.log_full_messages:
                         log_dict.pop("request_messages", None)
@@ -147,19 +174,36 @@ class RequestLogger:
         """Get recent log entries (without request/compressed messages and response_content)."""
         # Convert deque to list for slicing (deque doesn't support slicing)
         entries = list(self._logs)[-n:]
+        # Not asdict(): that deep-copies every field BEFORE the heavy ones are
+        # dropped, so each entry cost a full walk of its request_messages and
+        # compressed_messages (~3.4 ms for a 400 KB Claude Code transcript).
+        # /stats calls this with n=10_000 synchronously on the event loop, so
+        # a full deque made every /stats build take ~30 s and a dashboard
+        # polling it starved /v1/messages. The retained fields are still
+        # deep-copied, so callers cannot reach nested containers (tags,
+        # savings_breakdown) that the in-memory log owns.
         return [
-            {
-                k: v
-                for k, v in asdict(e).items()
-                if k not in ("request_messages", "compressed_messages", "response_content")
-            }
+            {f.name: deepcopy(getattr(e, f.name)) for f in fields(e) if f.name not in _HEAVY_FIELDS}
             for e in entries
         ]
 
-    def get_recent_with_messages(self, n: int = 20) -> list[dict]:
-        """Get recent log entries including full request/response messages."""
+    def get_recent_with_messages(self, n: int = 20, include_messages: bool = True) -> list[dict]:
+        """Get recent log entries including full request/response messages.
+
+        ``include_messages=False`` returns the same entries without
+        ``request_messages`` / ``compressed_messages`` / ``response_content``,
+        and without walking them: ``asdict`` deep-copies every field, so a
+        caller that only reads the per-request numbers otherwise pays for a
+        full copy of each transcript (~160 KB per Claude Code turn, ~44 MB per
+        ``limit=100`` feed pull) on the event loop.
+        """
         entries = list(self._logs)[-n:]
-        return [asdict(e) for e in entries]
+        if include_messages:
+            return [asdict(e) for e in entries]
+        return [
+            {f.name: deepcopy(getattr(e, f.name)) for f in fields(e) if f.name not in _HEAVY_FIELDS}
+            for e in entries
+        ]
 
     def stats(self) -> dict:
         """Get logging statistics."""

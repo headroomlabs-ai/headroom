@@ -52,10 +52,16 @@ def _make_anthropic_payload_with_tools() -> dict:
 def _make_anthropic_payload_with_long_system() -> dict:
     """Payload with a long system prompt that qualifies for L3 compaction."""
     long_text = "x" * 5000  # well above default min_chars
+    # Two blocks, mirroring how agentic clients actually shape the system array:
+    # a stable block the client has pinned with cache_control (CLAUDE.md, rules)
+    # followed by dynamic content. Only the block AFTER the last breakpoint is
+    # eligible -- rewriting the pinned one would bust the provider's entry, so
+    # compaction must leave it byte-identical.
     return {
         "model": "claude-sonnet-4-6",
         "system": [
             {"type": "text", "text": long_text, "cache_control": {"type": "ephemeral"}},
+            {"type": "text", "text": "y" * 5000},
         ],
         "messages": [{"role": "user", "content": "hello"}],
         "tools": [],
@@ -383,7 +389,11 @@ def test_handler_auxiliary_compaction_respects_optimization_decision(
     if should_compact:
         assert "title" not in forwarded["tools"][0]["input_schema"]
         assert len(forwarded["tools"][0]["description"]) < len(payload["tools"][0]["description"])
-        assert forwarded["system"][0]["text"] == "short system"
+        # Block 0 is pinned by cache_control: byte-identical, marker intact.
+        assert forwarded["system"][0]["text"] == payload["system"][0]["text"]
+        assert forwarded["system"][0]["cache_control"] == {"type": "ephemeral"}
+        # Block 1 sits after the breakpoint and is compacted.
+        assert forwarded["system"][1]["text"] == "short system"
         assert all(label in transforms for label in labels)
         router.compress.assert_called_once()
         assert summary["compression"]["total_tokens_removed"] > 0

@@ -132,3 +132,98 @@ def test_compress_allows_non_loopback_with_flag(monkeypatch):
     client = TestClient(_fast_app())
     resp = client.post("/v1/compress", json=_BODY)
     assert resp.status_code == 200, resp.text
+
+
+def test_compress_allows_container_gateway_with_loopback_host(monkeypatch):
+    monkeypatch.delenv("HEADROOM_COMPRESS_ALLOW_REMOTE", raising=False)
+    monkeypatch.setenv("HEADROOM_CONTAINER_HOST_GATEWAY", "172.17.0.1")
+    client = TestClient(
+        _fast_app(),
+        base_url="http://127.0.0.1:8787",
+        client=("172.17.0.1", 12345),
+    )
+    resp = client.post("/v1/compress", json=_BODY)
+    assert resp.status_code == 200, resp.text
+
+
+def test_compress_blocks_peer_container_on_bridge_network(monkeypatch):
+    monkeypatch.delenv("HEADROOM_COMPRESS_ALLOW_REMOTE", raising=False)
+    monkeypatch.setenv("HEADROOM_CONTAINER_HOST_GATEWAY", "172.17.0.1")
+    # Peer container connecting directly with its own container IP
+    client = TestClient(
+        _fast_app(),
+        base_url="http://172.17.0.2:8787",
+        client=("172.17.0.5", 12345),
+    )
+    assert client.post("/v1/compress", json=_BODY).status_code == 404
+
+    # Peer container trying to spoof a loopback Host header
+    client_spoofed_host = TestClient(
+        _fast_app(),
+        base_url="http://127.0.0.1:8787",
+        client=("172.17.0.5", 12345),
+    )
+    assert client_spoofed_host.post("/v1/compress", json=_BODY).status_code == 404
+
+
+def test_compress_blocks_non_loopback_host_header_from_gateway(monkeypatch):
+    monkeypatch.delenv("HEADROOM_COMPRESS_ALLOW_REMOTE", raising=False)
+    monkeypatch.setenv("HEADROOM_CONTAINER_HOST_GATEWAY", "172.17.0.1")
+    # Gateway IP caller but with external domain Host header (e.g. DNS rebinding)
+    client = TestClient(
+        _fast_app(),
+        base_url="http://attacker.com",
+        client=("172.17.0.1", 12345),
+    )
+    assert client.post("/v1/compress", json=_BODY).status_code == 404
+
+
+def test_loopback_guard_container_gateway_helpers(monkeypatch, tmp_path):
+    from headroom.proxy.loopback_guard import (
+        get_container_host_gateway,
+        is_container_environment,
+        is_container_host_gateway,
+    )
+
+    # Clean state - non-container environment
+    monkeypatch.delenv("HEADROOM_CONTAINER_HOST_GATEWAY", raising=False)
+    monkeypatch.delenv("HEADROOM_DEPLOYMENT_RUNTIME", raising=False)
+    monkeypatch.delenv("HEADROOM_DEPLOYMENT_PRESET", raising=False)
+    monkeypatch.setattr("os.path.exists", lambda path: False)
+    assert not is_container_environment()
+    assert get_container_host_gateway() is None
+    assert not is_container_host_gateway("172.17.0.1")
+
+    # Explicit override
+    monkeypatch.setenv("HEADROOM_CONTAINER_HOST_GATEWAY", "172.17.0.1")
+    assert is_container_environment()
+    assert get_container_host_gateway() == "172.17.0.1"
+    assert is_container_host_gateway("172.17.0.1")
+    assert is_container_host_gateway("::ffff:172.17.0.1")
+    assert not is_container_host_gateway("172.17.0.5")
+
+    # Linux route file parsing
+    monkeypatch.delenv("HEADROOM_CONTAINER_HOST_GATEWAY", raising=False)
+    monkeypatch.setenv("HEADROOM_DEPLOYMENT_RUNTIME", "docker")
+    assert is_container_environment()
+
+    route_content = (
+        "Iface\tDestination\tGateway \tFlags\tRefCnt\tUse\tMetric\tMask\t\tMTU\tWindow\tIRTT\n"
+        "eth0\t00000000\t0111A8C0\t0003\t0\t0\t0\t00000000\t0\t0\t0\n"
+    )
+    route_file = tmp_path / "route"
+    route_file.write_text(route_content, encoding="ascii")
+
+    import builtins
+
+    real_open = builtins.open
+
+    def fake_open(file, *args, **kwargs):
+        if file == "/proc/net/route":
+            return real_open(route_file, *args, **kwargs)
+        return real_open(file, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "open", fake_open)
+    assert get_container_host_gateway() == "192.168.17.1"
+    assert is_container_host_gateway("192.168.17.1")
+    assert not is_container_host_gateway("192.168.17.2")

@@ -287,3 +287,55 @@ def test_content_router_payg_records_to_toin(fresh_toin):
     assert post >= pre, (
         "PAYG must not be blocked by the F2.2 gate — write should happen or fall through naturally"
     )
+
+
+# ─── ContentRouter → SmartCrusher.crush() (#4474) ───────────────────────
+
+
+@_skip_no_core
+@pytest.mark.parametrize(
+    ("mode", "expect_write"),
+    [(AuthMode.SUBSCRIPTION, False), (AuthMode.PAYG, True)],
+)
+def test_content_router_smart_crusher_path_honours_toin_read_only(fresh_toin, mode, expect_write):
+    """The router compresses JSON arrays via the shared crusher's
+    ``crush()`` and never calls ``crusher.apply()``, so the crusher's
+    own ``_runtime_compression_policy`` stays None. The router must
+    forward the request's ``toin_read_only`` gate to that call.
+    """
+    from headroom.transforms.content_router import ContentRouter
+
+    router = ContentRouter()
+    messages = _wrap_in_tool_message(_bigger_array(60))
+    pre = sum(p.total_compressions for p in fresh_toin._patterns.values())
+
+    result = router.apply(messages, _tokenizer(), compression_policy=policy_for_mode(mode))
+
+    assert any("smart_crusher" in t for t in result.transforms_applied), (
+        "payload must route through SmartCrusher for this test to mean anything"
+    )
+    # The shared crusher's own field is untouched — the gate travels per call.
+    assert router._get_smart_crusher()._runtime_compression_policy is None
+    post = sum(p.total_compressions for p in fresh_toin._patterns.values())
+    if expect_write:
+        assert post > pre, "write-enabled policy must still feed TOIN via the router"
+    else:
+        assert post == pre, "Subscription MUST NOT write to TOIN via router → crush()"
+
+
+@_skip_no_core
+def test_smart_crusher_crush_record_toin_false_skips_write(fresh_toin):
+    """``crush(record_toin=False)`` compresses as usual but skips TOIN;
+    the default keeps the legacy write-enabled behaviour."""
+    from headroom.transforms.smart_crusher import SmartCrusher, SmartCrusherConfig
+
+    crusher = SmartCrusher(SmartCrusherConfig())
+    payload = _bigger_array(60)
+
+    gated = crusher.crush(payload, record_toin=False)
+    if not gated.was_modified or gated.strategy == "passthrough":
+        pytest.skip("payload didn't trigger compression — bump the size")
+    assert sum(p.total_compressions for p in fresh_toin._patterns.values()) == 0
+
+    crusher.crush(payload)
+    assert sum(p.total_compressions for p in fresh_toin._patterns.values()) > 0

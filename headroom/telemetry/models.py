@@ -214,13 +214,11 @@ class ToolSignature:
     def from_items(cls, items: list[dict[str, Any]]) -> ToolSignature:
         """Create signature from sample items."""
         if not items:
-            # HIGH FIX: Generate unique hash for empty outputs to prevent
-            # different tools' empty responses from colliding into one pattern.
-            # Use a random component to ensure uniqueness across tool types.
-            import uuid
-
-            # MEDIUM FIX #15: Use 24 chars (96 bits) instead of 16 (64 bits) to reduce collision risk
-            empty_hash = hashlib.sha256(f"empty:{uuid.uuid4()}".encode()).hexdigest()[:24]
+            # Fixed hash (not random): a per-call uuid made every empty result a new
+            # signature, so collector._tool_stats grew without bound. Empty outputs carry
+            # no structure to distinguish, so they share one bucket. Not the literal
+            # "empty", to stay distinct from any caller-supplied string key.
+            empty_hash = hashlib.sha256(b"empty").hexdigest()[:24]
             return cls(
                 structure_hash=empty_hash,
                 field_count=0,
@@ -632,38 +630,6 @@ class FieldSemantics:
 
         self.inferred_type = inferred
         self.confidence = confidence
-
-    def is_value_important(self, value_hash: str) -> bool:
-        """Check if a specific value is considered important.
-
-        A value is important if:
-        1. It's in the important_value_hashes list (has been retrieved)
-        2. It's NOT the default value (for error_indicator type)
-
-        Args:
-            value_hash: SHA256[:8] hash of the value to check.
-
-        Returns:
-            True if this value should be preserved during compression.
-        """
-        # If we don't have enough data, be conservative
-        if self.confidence < 0.3:
-            return False
-
-        # For error_indicator: non-default values are important
-        if self.inferred_type == "error_indicator":
-            if self.default_value_hash and value_hash != self.default_value_hash:
-                return True
-
-        # For any type: values that have been retrieved are important
-        if value_hash in self.important_value_hashes:
-            return True
-
-        # For status: check if this value has been retrieved
-        if self.inferred_type == "status":
-            return value_hash in self.value_retrieval_frequency
-
-        return False
 
 
 @dataclass

@@ -244,8 +244,8 @@ def test_code_aware_router_dispatch_matches_direct(monkeypatch: pytest.MonkeyPat
         content, CompressionStrategy.CODE_AWARE, "q", language="python", bias=1.0
     )
     assert out == shrunk
-    # CODE_AWARE's historical token metric is len(compressed.split()), NOT _estimate_tokens.
-    assert tokens == len(shrunk.split())
+    # Measured in the router's token estimate, the unit of original_tokens.
+    assert tokens == _estimate_tokens(shrunk)
     assert chain == [CompressionStrategy.CODE_AWARE.value]
     # The flip forwarded content, language, and context through the registry adapter.
     assert seen == {"content": content, "language": "python", "context": "q"}

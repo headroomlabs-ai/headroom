@@ -16,8 +16,14 @@ from functools import lru_cache
 from typing import Any, cast
 
 from headroom import paths as _paths
+from headroom.log_safety import describe_exception, safe_id
+from headroom.offline import pin_litellm_cost_map_local
 from headroom.pricing.litellm_pricing import estimate_cost_from_tokens
-from headroom.tokenizers.base import coerce_countable_text, count_content_blocks
+from headroom.tokenizers.base import (
+    TokenCountCache,
+    coerce_countable_text,
+    count_content_blocks,
+)
 
 from .base import Provider, TokenCounter
 
@@ -44,6 +50,7 @@ def _get_litellm_module() -> Any | None:
         return None
 
     try:
+        pin_litellm_cost_map_local()
         import litellm
     except ImportError:
         return None
@@ -81,8 +88,7 @@ _CONTEXT_LIMITS: dict[str, int] = {
     "gpt-4o-2024-08-06": 128000,
     "gpt-4o-2024-05-13": 128000,
     # GPT-4.1 series (~1M input). LiteLLM is still consulted first in
-    # get_context_limit; these are the manual fallback for installs without it
-    # (the litellm dep is gated python_version < '3.14').
+    # get_context_limit; these are the manual fallback for installs without it.
     "gpt-4.1": 1_047_576,
     "gpt-4.1-mini": 1_047_576,
     "gpt-4.1-nano": 1_047_576,
@@ -110,9 +116,11 @@ _CONTEXT_LIMITS: dict[str, int] = {
     "o3-mini": 200000,
     "o4-mini": 200000,
     # DeepSeek (often accessed via OpenAI-compatible API). Values verified
-    # against api-docs.deepseek.com (V4) and LiteLLM model_cost (deprecated
-    # aliases). LiteLLM lookup is still attempted first in get_context_limit;
-    # these are the manual fallback when LiteLLM doesn't know the model.
+    # against api-docs.deepseek.com (V4.1-Flash / V4-Pro-0813) and LiteLLM
+    # model_cost (deprecated aliases). LiteLLM lookup is still attempted first in
+    # get_context_limit; these are the manual fallback when LiteLLM doesn't know
+    # the model.
+    "deepseek-flash": 1_000_000,
     "deepseek-v4-flash": 1_000_000,
     "deepseek-v4-pro": 1_000_000,
     "deepseek-v3.2": 128_000,
@@ -365,11 +373,26 @@ class OpenAITokenCounter:
         self.model = model
         encoding_name = _get_encoding_name_for_model(model, custom_encodings)
         self._encoding = _get_encoding(encoding_name)
+        # count_text is a pure function of its text, and this counter is a
+        # per-model singleton reused across requests (OpenAIProvider caches it),
+        # so a stable prefix/system prompt or a repeated tool result is otherwise
+        # re-encoded on every turn. Cache the count like AnthropicTokenCounter
+        # already does (the cache only admits large strings, so tiny/rare ones
+        # pay nothing).
+        self._count_cache = TokenCountCache()
 
     def count_text(self, text: str) -> int:
         """Count tokens in text."""
         if not text:
             return 0
+        cached = self._count_cache.get(text)
+        if cached is not None:
+            return cached
+        count = self._count_text_uncached(text)
+        self._count_cache.put(text, count)
+        return count
+
+    def _count_text_uncached(self, text: str) -> int:
         try:
             return len(self._encoding.encode(text))
         except ValueError:
@@ -583,8 +606,10 @@ class OpenAIProvider(Provider):
                     max_tokens = info["max_input_tokens"]
                     if max_tokens is not None:
                         return int(max_tokens)
-            except Exception:
-                pass
+            except Exception as e:
+                logger.debug(
+                    f"LiteLLM get_model_info failed for {safe_id(model)}: {describe_exception(e)}"
+                )
 
         # Fall back to hardcoded
         return self._get_context_limit_manual(model)
@@ -621,7 +646,7 @@ class OpenAIProvider(Provider):
         if model not in _UNKNOWN_MODEL_WARNINGS:
             _UNKNOWN_MODEL_WARNINGS.add(model)
             logger.warning(
-                f"Unknown OpenAI model '{model}': {reason} ({limit:,} tokens). "
+                f"Unknown OpenAI model {safe_id(model)}: {reason} ({limit:,} tokens). "
                 f"To configure explicitly, set HEADROOM_MODEL_LIMITS env var or "
                 f"add to ~/.headroom/models.json"
             )
@@ -705,8 +730,7 @@ class OpenAIProvider(Provider):
 
         The table used to be authoritative, which is how it went ~18 months stale
         and priced gpt-4.1-nano 300x over (see the entries below). Demoting it to
-        a fallback means that drift only reaches installs with no LiteLLM — the
-        dependency is gated ``python_version < '3.14'``.
+        a fallback means that drift only reaches installs with no LiteLLM.
         """
         # 1. Explicit configuration wins.
         override = self._pricing_overrides.get(model)

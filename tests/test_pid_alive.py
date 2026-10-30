@@ -37,6 +37,20 @@ def test_pid_alive_systemerror_is_not_alive(monkeypatch) -> None:
     assert pid_alive(4321) is False
 
 
+def test_pid_alive_overflow_is_not_alive(monkeypatch) -> None:
+    monkeypatch.setitem(
+        sys.modules,
+        "psutil",
+        types.SimpleNamespace(pid_exists=lambda pid: (_ for _ in ()).throw(RuntimeError())),
+    )
+    monkeypatch.setattr(
+        "headroom._subprocess.os.kill",
+        lambda pid, sig: (_ for _ in ()).throw(OverflowError()),
+    )
+
+    assert pid_alive(int("9" * 100)) is False
+
+
 def test_pid_alive_only_uses_signal_zero(monkeypatch) -> None:
     """The liveness probe must never send a real (terminating) signal."""
     monkeypatch.setitem(

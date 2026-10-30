@@ -53,7 +53,12 @@ _COMMENT_RES = {
 # Content where whole-line elision is unsafe: a '#' line inside a YAML block
 # scalar or a TOML multi-line string is data, not a comment. Detection is
 # deliberately over-broad — when in doubt, Tier 2 stays off.
-_YAML_BLOCK_SCALAR_RE = re.compile(r":\s*[|>][+-]?\d*\s*$", re.MULTILINE)
+# Block scalars can be sequence items as well as mapping values; indentation
+# and chomping indicators may appear in either order, and a header can carry
+# a trailing comment. Conservatively skip elision for every such header.
+_YAML_BLOCK_SCALAR_RE = re.compile(
+    r"(?:^|[ \t:])[|>][1-9+-]*[ \t]*(?:#[^\r\n]*)?\r?$", re.MULTILINE
+)
 _TOML_MULTILINE_RE = re.compile(r'"""|\'\'\'')
 
 

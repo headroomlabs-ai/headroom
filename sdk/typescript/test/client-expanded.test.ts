@@ -2,8 +2,9 @@
  * Tests for expanded HeadroomClient — chat.completions, messages, metrics, CCR, etc.
  * Uses mocked proxy (no real server needed).
  */
-import { describe, it, expect, vi, beforeEach } from "vitest";
+import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import { HeadroomClient } from "../src/client.js";
+import { HeadroomConnectionError } from "../src/types.js";
 
 const mockFetch = vi.fn();
 vi.stubGlobal("fetch", mockFetch);
@@ -16,6 +17,46 @@ function jsonResponse(data: any, ok = true) {
     text: async () => JSON.stringify(data),
   };
 }
+
+describe("provider requests authenticate to the proxy separately", () => {
+  beforeEach(() => {
+    mockFetch.mockReset();
+    mockFetch.mockResolvedValue(jsonResponse({}));
+    for (const name of ["HEADROOM_API_KEY", "OPENAI_API_KEY", "ANTHROPIC_API_KEY"]) {
+      vi.stubEnv(name, "");
+    }
+  });
+  afterEach(() => vi.unstubAllEnvs());
+
+  it.each([
+    ["openai", "explicit"], ["anthropic", "explicit"],
+    ["openai", "environment"], ["anthropic", "environment"],
+    ["openai", "proxy-only"], ["anthropic", "proxy-only"],
+    ["openai", "provider-only"], ["anthropic", "provider-only"],
+  ])("sends the correct credentials for %s (%s)", async (provider, source) => {
+    const hasProxy = source !== "provider-only";
+    const hasProvider = source !== "proxy-only";
+    const fromEnv = source === "environment";
+    if (fromEnv) {
+      vi.stubEnv("HEADROOM_API_KEY", "proxy-token");
+      vi.stubEnv(provider === "openai" ? "OPENAI_API_KEY" : "ANTHROPIC_API_KEY", "provider-key");
+    }
+    const client = new HeadroomClient({
+      baseUrl: "http://proxy:8787",
+      apiKey: hasProxy && !fromEnv ? "proxy-token" : undefined,
+      providerApiKey: hasProvider && !fromEnv ? "provider-key" : undefined,
+    });
+    const params = { model: "test-model", messages: [{ role: "user" as const, content: "hello" }] };
+    await (provider === "openai" ? client.chat.completions.create(params) : client.messages.create(params));
+
+    const headers = new Headers(mockFetch.mock.calls[0][1].headers);
+    expect(headers.get("X-Headroom-Proxy-Token")).toBe(hasProxy ? "proxy-token" : null);
+    expect(headers.get("Authorization")).toBe(
+      hasProvider ? (provider === "openai" ? "Bearer provider-key" : null) : "Bearer proxy-token",
+    );
+    expect(headers.get("x-api-key")).toBe(hasProvider && provider === "anthropic" ? "provider-key" : null);
+  });
+});
 
 describe("HeadroomClient constructor", () => {
   it("accepts extended options", () => {
@@ -329,5 +370,81 @@ describe("HeadroomClient config passthrough", () => {
     expect(body.config).toBeDefined();
     expect(body.config.smart_crusher.enabled).toBe(true);
     expect(body.config.smart_crusher.min_tokens_to_crush).toBe(100);
+  });
+});
+
+describe("shared HTTP transport", () => {
+  beforeEach(() => {
+    mockFetch.mockReset();
+  });
+
+  it("serializes structured bodies once and sends serialized bodies verbatim", async () => {
+    mockFetch.mockResolvedValue(jsonResponse({ ok: true }));
+    const client = new HeadroomClient({ baseUrl: "http://test:8787" });
+
+    // Structured body (rawFetch) — serialized exactly once.
+    await client.chat.completions.create({ model: "gpt-4o", messages: [{ role: "user", content: "hi" }] });
+    expect(JSON.parse(mockFetch.mock.calls[0][1].body).messages[0].content).toBe("hi");
+
+    // Already-serialized body (_fetch) — passed through, not re-stringified.
+    await client.compressRaw({ messages: [{ role: "user", content: "hi" }] } as any);
+    expect(JSON.parse(mockFetch.mock.calls[1][1].body).messages[0].content).toBe("hi");
+
+    // No body — nothing sent.
+    await client.telemetry.getStats();
+    expect(mockFetch.mock.calls[2][1].body).toBeUndefined();
+  });
+
+  it("keeps proxy headers on requests without provider auth", async () => {
+    mockFetch.mockResolvedValue(jsonResponse({ ok: true }));
+    const client = new HeadroomClient({ baseUrl: "http://test:8787", apiKey: "hr_proxykey", stack: "cli" });
+    await client.telemetry.getStats();
+    const headers = mockFetch.mock.calls[0][1].headers;
+    expect(headers["Content-Type"]).toBe("application/json");
+    expect(headers["Authorization"]).toBe("Bearer hr_proxykey");
+    expect(headers["X-Headroom-Stack"]).toBe("cli");
+  });
+
+  it("does not overwrite provider auth headers with the proxy apiKey", async () => {
+    mockFetch.mockResolvedValue(jsonResponse({ choices: [] }));
+    const client = new HeadroomClient({
+      baseUrl: "http://test:8787",
+      apiKey: "hr_proxykey",
+      providerApiKey: "sk-provider",
+    });
+    await client.chat.completions.create({ model: "gpt-4o", messages: [] });
+    expect(mockFetch.mock.calls[0][1].headers["Authorization"]).toBe("Bearer sk-provider");
+
+    await client.messages.create({ model: "claude-3", messages: [] } as any);
+    const anthropicHeaders = mockFetch.mock.calls[1][1].headers;
+    expect(anthropicHeaders["x-api-key"]).toBe("sk-provider");
+    expect(anthropicHeaders["Authorization"]).toBeUndefined();
+  });
+
+  it("does not overwrite an environment provider key either", async () => {
+    mockFetch.mockResolvedValue(jsonResponse({ choices: [] }));
+    vi.stubEnv("OPENAI_API_KEY", "sk-env-provider");
+    const client = new HeadroomClient({ baseUrl: "http://test:8787", apiKey: "hr_proxykey" });
+    await client.chat.completions.create({ model: "gpt-4o", messages: [] });
+    expect(mockFetch.mock.calls[0][1].headers["Authorization"]).toBe("Bearer sk-env-provider");
+    vi.unstubAllEnvs();
+  });
+
+  it("maps non-ok responses with non-JSON bodies", async () => {
+    mockFetch.mockResolvedValue({
+      ok: false,
+      status: 502,
+      json: async () => {
+        throw new Error("not json");
+      },
+    });
+    const client = new HeadroomClient({ baseUrl: "http://test:8787" });
+    await expect(client.telemetry.getStats()).rejects.toThrow("HTTP 502");
+  });
+
+  it("wraps connection failures", async () => {
+    mockFetch.mockRejectedValue(new TypeError("fetch failed"));
+    const client = new HeadroomClient({ baseUrl: "http://test:8787" });
+    await expect(client.telemetry.getStats()).rejects.toThrow(HeadroomConnectionError);
   });
 });

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import re
 from collections.abc import Mapping
 from urllib.parse import urlparse
@@ -19,6 +20,27 @@ TOOL_SEARCH_FOUNDRY_DEFAULT = "false"
 REMOTE_CONTROL_BASE_URL_ENV = "ANTHROPIC_BASE_URL"
 REMOTE_CONTROL_FEATURE = "Remote Control"
 CLAUDE_AUTH_KEYS = ("ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN")
+
+# Claude Code requests the 1M context tier when its client-owned model setting
+# carries this suffix. Keep the selector in the Claude provider runtime so the
+# standalone wrapper and the VS Code settings path use identical fallback and
+# idempotence rules.
+CONTEXT_1M_SUFFIX = "[1m]"
+HEADROOM_1M_MODEL_ENV = "HEADROOM_1M_MODEL"
+DEFAULT_1M_MODEL = "claude-opus-5"
+
+
+def resolve_1m_model(current: str | None) -> str:
+    """Return the selected model with exactly one Claude 1M suffix.
+
+    An explicit model wins over the configurable fallback. Blank values use
+    ``HEADROOM_1M_MODEL`` and then the built-in default. Existing suffixes are
+    preserved so repeated setup is idempotent.
+    """
+    fallback = (os.environ.get(HEADROOM_1M_MODEL_ENV) or "").strip() or DEFAULT_1M_MODEL
+    base = (current or "").strip() or fallback
+    return base if base.endswith(CONTEXT_1M_SUFFIX) else f"{base}{CONTEXT_1M_SUFFIX}"
+
 
 # GH #1779: Claude Code v2.1.196 added a client-side eligibility check that
 # DISABLES first-party Remote Control (`/remote-control` / `/rc`, which mirrors a
@@ -134,6 +156,24 @@ def remote_control_gate_message(source: str, *, version: tuple[int, int, int] | 
         f"{REMOTE_CONTROL_FEATURE}: {lead} "
         "Headroom cannot override this client-side gate — run Claude without "
         "Headroom for sessions that need Remote Control."
+    )
+
+
+def remote_control_gate_short_message(*, version: tuple[int, int, int] | None = None) -> str:
+    """One-line Remote Control notice for the default ``wrap claude`` banner (#3426).
+
+    Same accuracy rule as :func:`remote_control_gate_message` (issue #1779):
+    with a known gated version state the disable as fact; with an unknown
+    version name the threshold rather than assert the user's build.
+    """
+    scope = (
+        ""
+        if version is not None and version >= REMOTE_CONTROL_GATED_MIN_VERSION
+        else f" on Claude Code {_version_str(REMOTE_CONTROL_GATED_MIN_VERSION)}+"
+    )
+    return (
+        f"{REMOTE_CONTROL_FEATURE} (/rc) is disabled{scope} while routed through "
+        "Headroom — run `claude` directly (no wrap) for sessions that need it."
     )
 
 

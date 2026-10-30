@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import http.server
 import json
 import logging
 import os
@@ -13,6 +14,7 @@ from types import SimpleNamespace
 from typing import Any
 from unittest.mock import patch
 
+import httpx
 import pytest
 import uvicorn
 import websockets
@@ -26,6 +28,7 @@ from headroom.providers.codex.live import (
     _forward_headers,
     codex_live_websocket_url,
     codex_live_ws_path,
+    handle_codex_live_http,
     handle_codex_live_websocket,
 )
 from headroom.providers.codex.runtime import resolve_codex_routing
@@ -105,6 +108,135 @@ def test_live_auth_modes_and_derived_paths(monkeypatch) -> None:
         )
         == "wss://chatgpt.com/backend-api/codex/custom/live?mode=live"
     )
+
+
+@pytest.mark.asyncio
+async def test_live_http_call_creation_forwards_json_and_location() -> None:
+    token = _jwt(
+        {
+            "https://api.openai.com/auth": {"chatgpt_account_id": "acct-live"},
+        }
+    )
+
+    class FakeRequest:
+        headers = {
+            "authorization": f"Bearer {token}",
+            "host": "proxy.test",
+            "content-length": "123",
+            "content-type": "multipart/form-data; boundary=test",
+        }
+
+        async def form(self):  # type: ignore[no-untyped-def]
+            return {"sdp": "v=0", "session": '{"type":"realtime"}'}
+
+    class FakeHttpClient:
+        def __init__(self) -> None:
+            self.call: tuple[str, str, dict[str, str], dict[str, object]] | None = None
+
+        async def request(self, method, url, **kwargs):  # type: ignore[no-untyped-def]
+            self.call = (method, url, dict(kwargs["headers"]), kwargs["json"])
+            return SimpleNamespace(
+                content=b'{"ok":true}',
+                status_code=201,
+                headers={"Location": "/backend-api/codex/realtime/calls/1"},
+            )
+
+    client = FakeHttpClient()
+    response = await handle_codex_live_http(
+        FakeRequest(),
+        client,
+        "https://api.openai.test",
+        "/v1/live",
+    )
+
+    assert client.call == (
+        "POST",
+        "https://chatgpt.com/backend-api/codex/realtime/calls?intent=quicksilver&architecture=avas",
+        {
+            "authorization": f"Bearer {token}",
+            "ChatGPT-Account-ID": "acct-live",
+        },
+        {"sdp": "v=0", "session": {"type": "realtime"}},
+    )
+    assert response is not None
+    assert response.status_code == 201
+    assert response.headers["Location"] == "/backend-api/codex/realtime/calls/1"
+    assert response.body == b'{"ok":true}'
+
+
+@pytest.mark.asyncio
+async def test_live_http_call_creation_strips_internal_headers_and_stale_compression_headers() -> (
+    None
+):
+    """Regression for PR #3464 review: internal x-headroom-* headers must
+    never reach the upstream call, and a compressed upstream response must
+    not have its content-encoding/content-length replayed onto the
+    already-decoded body httpx hands back (that makes the downstream client
+    try to decompress plain bytes a second time). `Location` must survive.
+    """
+    token = _jwt(
+        {
+            "https://api.openai.com/auth": {"chatgpt_account_id": "acct-live"},
+        }
+    )
+
+    class FakeRequest:
+        headers = {
+            "authorization": f"Bearer {token}",
+            "host": "proxy.test",
+            "content-type": "multipart/form-data; boundary=test",
+            "x-headroom-proxy-token": "internal-secret",
+            "x-headroom-bypass": "true",
+        }
+
+        async def form(self):  # type: ignore[no-untyped-def]
+            return {"sdp": "v=0", "session": '{"type":"realtime"}'}
+
+    class FakeHttpClient:
+        def __init__(self) -> None:
+            self.call: tuple[str, str, dict[str, str], dict[str, object]] | None = None
+
+        async def request(self, method, url, **kwargs):  # type: ignore[no-untyped-def]
+            self.call = (method, url, dict(kwargs["headers"]), kwargs["json"])
+            # httpx already decoded the (gzip) body; the upstream response
+            # object still carries the wire-framing headers describing the
+            # *compressed* bytes, which is what a real httpx.Response looks
+            # like after transparent decompression.
+            return SimpleNamespace(
+                content=b'{"ok":true}',
+                status_code=201,
+                headers={
+                    "Location": "/backend-api/codex/realtime/calls/1",
+                    "Content-Encoding": "gzip",
+                    "Content-Length": "9999",
+                    "Transfer-Encoding": "chunked",
+                },
+            )
+
+    client = FakeHttpClient()
+    response = await handle_codex_live_http(
+        FakeRequest(),
+        client,
+        "https://api.openai.test",
+        "/v1/live",
+    )
+
+    assert response is not None
+    assert client.call is not None
+    sent_headers = client.call[2]
+    lowered_sent = {key.lower() for key in sent_headers}
+    assert "x-headroom-proxy-token" not in lowered_sent
+    assert "x-headroom-bypass" not in lowered_sent
+    assert sent_headers["authorization"] == f"Bearer {token}"
+    assert sent_headers["ChatGPT-Account-ID"] == "acct-live"
+
+    lowered_response = {key.lower(): value for key, value in response.headers.items()}
+    assert "content-encoding" not in lowered_response
+    assert "transfer-encoding" not in lowered_response
+    assert lowered_response["location"] == "/backend-api/codex/realtime/calls/1"
+    assert response.body == b'{"ok":true}'
+    # Starlette computes content-length from the actual (decoded) body.
+    assert lowered_response["content-length"] == str(len(b'{"ok":true}'))
 
 
 def test_live_headers_strip_internal_and_handshake_headers_without_beta_injection() -> None:
@@ -575,6 +707,115 @@ async def test_live_rg4_real_uvicorn_and_websockets_binary_round_trip() -> None:
     finally:
         proxy.stop()
         await upstream.stop()
+        if previous is None:
+            os.environ.pop("HEADROOM_REQUIRE_RUST_CORE", None)
+        else:
+            os.environ["HEADROOM_REQUIRE_RUST_CORE"] = previous
+
+
+class _LoopbackHttpUpstream:
+    """Minimal HTTP upstream that echoes the request it received.
+
+    Used to prove, through the *actual registered* `/v1/live` route and its
+    passthrough fallback, that a non-ChatGPT-authenticated request reaches
+    the upstream with its body intact -- not consumed and errored out by
+    `handle_codex_live_http` before falling through.
+    """
+
+    def __init__(self) -> None:
+        self.port = _free_port()
+        self.requests: list[dict[str, Any]] = []
+        outer = self
+
+        class _Handler(http.server.BaseHTTPRequestHandler):
+            def do_POST(self) -> None:  # noqa: N802
+                length = int(self.headers.get("Content-Length", 0))
+                body = self.rfile.read(length)
+                outer.requests.append(
+                    {"path": self.path, "headers": dict(self.headers), "body": body}
+                )
+                payload = b'{"echoed":true}'
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(payload)))
+                self.end_headers()
+                self.wfile.write(payload)
+
+            def log_message(self, *args: Any) -> None:  # noqa: ANN401
+                del args
+
+        self.server = http.server.ThreadingHTTPServer(("127.0.0.1", self.port), _Handler)
+        self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
+
+    def start(self) -> None:
+        self.thread.start()
+
+    def stop(self) -> None:
+        self.server.shutdown()
+        self.thread.join(timeout=5.0)
+
+
+@pytest.mark.asyncio
+async def test_live_http_non_chatgpt_multipart_falls_through_with_body_intact() -> None:
+    """Regression for PR #3464 review: a real multipart request without
+    ChatGPT auth must fall through to the passthrough fallback with its
+    body still readable -- not a 500 from `RuntimeError: Stream consumed`.
+    """
+    previous = os.environ.get("HEADROOM_REQUIRE_RUST_CORE")
+    os.environ["HEADROOM_REQUIRE_RUST_CORE"] = "false"
+    upstream = _LoopbackHttpUpstream()
+    upstream.start()
+    proxy = _ProxyThread(_free_port(), upstream.port)
+    proxy.start()
+    try:
+        async with httpx.AsyncClient() as client:
+            response = await client.post(
+                f"http://127.0.0.1:{proxy.server.config.port}/v1/live",
+                files={
+                    "sdp": (None, "v=0"),
+                    "session": (None, '{"type":"realtime"}'),
+                },
+                # No Authorization / ChatGPT-Account-ID header: not ChatGPT auth.
+            )
+        assert response.status_code == 200
+        assert response.json() == {"echoed": True}
+        assert len(upstream.requests) == 1
+        assert b"v=0" in upstream.requests[0]["body"]
+    finally:
+        proxy.stop()
+        upstream.stop()
+        if previous is None:
+            os.environ.pop("HEADROOM_REQUIRE_RUST_CORE", None)
+        else:
+            os.environ["HEADROOM_REQUIRE_RUST_CORE"] = previous
+
+
+@pytest.mark.asyncio
+async def test_live_http_non_chatgpt_json_body_falls_through_instead_of_400() -> None:
+    """Regression for PR #3464 review: a JSON (non-multipart) request must
+    fall through to the passthrough fallback, not receive the handler's own
+    "Missing sdp or session form field" 400.
+    """
+    previous = os.environ.get("HEADROOM_REQUIRE_RUST_CORE")
+    os.environ["HEADROOM_REQUIRE_RUST_CORE"] = "false"
+    upstream = _LoopbackHttpUpstream()
+    upstream.start()
+    proxy = _ProxyThread(_free_port(), upstream.port)
+    proxy.start()
+    try:
+        async with httpx.AsyncClient() as client:
+            response = await client.post(
+                f"http://127.0.0.1:{proxy.server.config.port}/v1/live",
+                json={"unrelated": "payload"},
+                # No Authorization / ChatGPT-Account-ID header: not ChatGPT auth.
+            )
+        assert response.status_code == 200
+        assert response.json() == {"echoed": True}
+        assert len(upstream.requests) == 1
+        assert json.loads(upstream.requests[0]["body"]) == {"unrelated": "payload"}
+    finally:
+        proxy.stop()
+        upstream.stop()
         if previous is None:
             os.environ.pop("HEADROOM_REQUIRE_RUST_CORE", None)
         else:

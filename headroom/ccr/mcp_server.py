@@ -31,12 +31,17 @@ import os
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from headroom import paths as _paths
 from headroom import savings_ledger
 from headroom.cache.compression_store import format_retrieval_miss_detail
+from headroom.exceptions import StorageError
+from headroom.log_safety import describe_exception, redact_url, safe_id
 from headroom.telemetry import session as telemetry_session
+
+if TYPE_CHECKING:
+    from headroom.tokenizers.estimator import EstimatingTokenCounter
 
 # fcntl is Unix-only; on Windows we skip file locking (stats are best-effort).
 # Keep the module typed as Any so Windows mypy runs don't try to resolve Unix-only attrs.
@@ -206,7 +211,13 @@ SESSION_WINDOW_SECONDS = 7200  # 2 hours — events older than this are pruned
 
 
 def _append_shared_event(event: dict[str, Any]) -> None:
-    """Append an event to the shared stats file (cross-process, file-locked)."""
+    """Append an event to the shared stats file (cross-process, file-locked).
+
+    No-op in stateless mode (``HEADROOM_STATELESS``): the aggregate then covers
+    only this process, which is the documented stateless trade-off.
+    """
+    if not _paths.persistence_allowed("MCP session stats"):
+        return
     try:
         SHARED_STATS_DIR.mkdir(parents=True, exist_ok=True)
         event["pid"] = os.getpid()
@@ -217,8 +228,13 @@ def _append_shared_event(event: dict[str, Any]) -> None:
             f.write(line)
             if _HAS_FCNTL:
                 fcntl.flock(f, fcntl.LOCK_UN)
-    except Exception:
-        pass  # Never break compression because of stats
+    except Exception as exc:
+        # Never break compression because of stats
+        logger.debug(
+            "MCP session stats: append to %s failed: %s",
+            SHARED_STATS_FILE,
+            describe_exception(exc),
+        )
 
 
 def _read_shared_events(window_seconds: int = SESSION_WINDOW_SECONDS) -> list[dict[str, Any]]:
@@ -246,8 +262,9 @@ def _read_shared_events(window_seconds: int = SESSION_WINDOW_SECONDS) -> list[di
                     keep_lines.append(line + "\n")
             except json.JSONDecodeError:
                 continue
-        # Prune old entries (only if we dropped some)
-        if len(keep_lines) < len(lines):
+        # Prune old entries (only if we dropped some). Never rewrite the file in
+        # stateless mode — reading is fine, writing is not.
+        if len(keep_lines) < len(lines) and _paths.persistence_allowed("MCP session stats"):
             try:
                 with open(SHARED_STATS_FILE, "w") as f:
                     if _HAS_FCNTL:
@@ -255,10 +272,18 @@ def _read_shared_events(window_seconds: int = SESSION_WINDOW_SECONDS) -> list[di
                     f.writelines(keep_lines)
                     if _HAS_FCNTL:
                         fcntl.flock(f, fcntl.LOCK_UN)
-            except Exception:
-                pass
-    except Exception:
-        pass
+            except Exception as exc:
+                logger.debug(
+                    "MCP session stats: pruning %s failed: %s",
+                    SHARED_STATS_FILE,
+                    describe_exception(exc),
+                )
+    except Exception as exc:
+        logger.debug(
+            "MCP session stats: reading %s failed: %s",
+            SHARED_STATS_FILE,
+            describe_exception(exc),
+        )
     return events
 
 
@@ -377,7 +402,7 @@ class HeadroomMCPServer:
         self._http_client: httpx.AsyncClient | None = None  # type: ignore[assignment]
         self._stats = SessionStats()
         self._local_store: Any = None  # Lazy-initialized CompressionStore
-        self._compressor_initialized = False
+        self._token_estimator: EstimatingTokenCounter | None = None
         # File read cache: path → (content_hash, ccr_hash, line_count, token_count)
         self._file_cache: dict[str, tuple[str, str, int, int]] = {}
 
@@ -401,6 +426,23 @@ class HeadroomMCPServer:
             self._local_store = get_compression_store()
         return self._local_store
 
+    def _estimate_tokens(self, text: str) -> int:
+        """Price file content in tokens, the way the rest of the pipeline does.
+
+        Whitespace splitting is a word count, not a token count. Measured on
+        real files it under-reports by 1.43x on prose, 1.30x on source, and
+        691x for the 2.2 KB single-line JSON array in the regression test -- a
+        compact document has no spaces, so the whole file is one "word". That
+        figure is stored as ``original_tokens`` (which the savings totals sum
+        over) and echoed back to the agent as ``~N tokens`` in the
+        already-in-context note it uses to decide whether to re-read the file.
+        """
+        if self._token_estimator is None:
+            from headroom.tokenizers.estimator import EstimatingTokenCounter
+
+            self._token_estimator = EstimatingTokenCounter()
+        return max(1, self._token_estimator.count_text(text))
+
     def _compress_content(self, content: str) -> dict[str, Any]:
         """Compress content using Headroom's pipeline.
 
@@ -419,16 +461,31 @@ class HeadroomMCPServer:
 
         # Store original in local store for later retrieval
         store = self._get_local_store()
-        hash_key = store.store(
-            original=content,
-            compressed=compressed_content
-            if isinstance(compressed_content, str)
-            else json.dumps(compressed_content),
-            original_tokens=input_tokens,
-            compressed_tokens=output_tokens,
-            compression_strategy="mcp_compress",
-            ttl=MCP_SESSION_TTL,
-        )
+        try:
+            hash_key = store.store(
+                original=content,
+                compressed=compressed_content
+                if isinstance(compressed_content, str)
+                else json.dumps(compressed_content),
+                original_tokens=input_tokens,
+                compressed_tokens=output_tokens,
+                compression_strategy="mcp_compress",
+                ttl=MCP_SESSION_TTL,
+            )
+        except StorageError as e:
+            # No stored original: hand back the content itself, which also
+            # keeps out any marker the pipeline put in the compressed text.
+            logger.warning("headroom_compress: returning the original, CCR store refused it: %s", e)
+            return {
+                "compressed": content,
+                "hash": None,
+                "original_tokens": input_tokens,
+                "compressed_tokens": input_tokens,
+                "tokens_saved": 0,
+                "savings_percent": 0,
+                "transforms": [],
+                "note": "Not compressed: the CCR store could not keep the original.",
+            }
 
         # Track stats
         strategy = (
@@ -502,8 +559,14 @@ class HeadroomMCPServer:
                     result["source"] = "proxy"
                     self._stats.record_retrieval(hash_key)
                     return result
-            except Exception:
-                pass  # Proxy unavailable, that's fine
+            except Exception as exc:
+                # Proxy unavailable is expected; log so a bug here is not silent.
+                logger.debug(
+                    "MCP retrieve: proxy fallback failed for hash=%s via %s: %s",
+                    safe_id(hash_key),
+                    redact_url(self.proxy_url),
+                    describe_exception(exc),
+                )
 
         if expired_entry_status:
             ttl_seconds = expired_entry_status.get(
@@ -768,8 +831,8 @@ class HeadroomMCPServer:
         # restarts. Best-effort: never let savings bookkeeping break the tool.
         try:
             self._record_savings(result)
-        except Exception:
-            logger.debug("durable savings recording failed", exc_info=True)
+        except Exception as exc:
+            logger.debug("durable savings recording failed: %s", describe_exception(exc))
 
         proxy_status = await self._probe_proxy_unreachable()
         if proxy_status:
@@ -818,8 +881,11 @@ class HeadroomMCPServer:
             name = getattr(info, "name", None)
             if name:
                 return str(name)
-        except Exception:
-            pass
+        except (LookupError, AttributeError) as exc:
+            # Outside a request there is no request context; fall back to "unknown".
+            logger.debug(
+                "MCP client name unavailable; reporting 'unknown': %s", describe_exception(exc)
+            )
         return "unknown"
 
     async def _handle_retrieve(self, arguments: dict[str, Any]) -> list[TextContent]:
@@ -918,7 +984,12 @@ class HeadroomMCPServer:
                 return None
             result: dict[str, Any] = response.json()
             return result
-        except Exception:
+        except Exception as exc:
+            logger.debug(
+                "MCP stats: proxy /stats fetch failed via %s: %s",
+                redact_url(self.proxy_url),
+                describe_exception(exc),
+            )
             return None
 
     @staticmethod
@@ -1029,17 +1100,22 @@ class HeadroomMCPServer:
 
         # Fresh read: store in CCR and cache the hash
         store = self._get_local_store()
-        ccr_hash = store.store(
-            original=content,
-            compressed=f"[File: {path.name}, {line_count} lines]",
-            original_tokens=len(content.split()),
-            compressed_tokens=5,
-            tool_name="headroom_read",
-            ttl=MCP_SESSION_TTL,
-        )
-
-        token_estimate = len(content.split())
-        self._file_cache[str_path] = (content_hash, ccr_hash, line_count, token_estimate)
+        token_estimate = self._estimate_tokens(content)
+        try:
+            ccr_hash = store.store(
+                original=content,
+                compressed=f"[File: {path.name}, {line_count} lines]",
+                original_tokens=token_estimate,
+                compressed_tokens=5,
+                tool_name="headroom_read",
+                ttl=MCP_SESSION_TTL,
+            )
+        except StorageError as e:
+            # The full content is returned below either way; without a stored
+            # original, a re-read must not answer with a hash.
+            logger.warning("headroom_read: not cached, the CCR store refused it: %s", e)
+        else:
+            self._file_cache[str_path] = (content_hash, ccr_hash, line_count, token_estimate)
 
         # Return full content with line numbers (like Claude Code's Read tool)
         numbered_lines = []
@@ -1086,7 +1162,7 @@ class HeadroomMCPServer:
         watchdog forces shutdown once we are reparented.
         """
         async with stdio_server() as (read_stream, write_stream):
-            logger.info(f"Headroom MCP Server starting (proxy: {self.proxy_url})")
+            logger.info("Headroom MCP Server starting (proxy: %s)", redact_url(self.proxy_url))
             serve_task = asyncio.create_task(
                 self.server.run(
                     read_stream,

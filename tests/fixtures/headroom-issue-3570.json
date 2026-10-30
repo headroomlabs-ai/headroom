@@ -1,0 +1,41 @@
+{
+  "issue": 3570,
+  "url": "https://github.com/headroomlabs-ai/headroom/issues/3570",
+  "captured_from": "claude plugin install serena@claude-plugins-official (Claude Code 2.1.238)",
+  "plugin_id": "serena@claude-plugins-official",
+  "plugin_mcp_json": {
+    "serena": {
+      "command": "uvx",
+      "args": ["--from", "git+https://github.com/oraios/serena", "serena", "start-mcp-server"]
+    }
+  },
+  "installed_plugins_json": {
+    "version": 2,
+    "plugins": {
+      "serena@claude-plugins-official": [
+        {
+          "scope": "user",
+          "installPath": "<installPath>",
+          "version": "022b3c274938",
+          "installedAt": "2026-09-13T23:38:36.229Z",
+          "lastUpdated": "2026-09-13T23:38:36.229Z",
+          "gitCommitSha": "022b3c274938ddfb9fd928fc582eb9b9ed0f537f"
+        }
+      ]
+    }
+  },
+  "settings_json": {
+    "enabledPlugins": {
+      "serena@claude-plugins-official": true
+    }
+  },
+  "project_scoped_record": {
+    "scope": "project",
+    "installPath": "<installPath>",
+    "version": "da823e86c8fe",
+    "installedAt": "2026-09-14T19:41:37.899Z",
+    "lastUpdated": "2026-09-14T19:41:37.899Z",
+    "gitCommitSha": "da823e86c8feef13b73b6712af11eadd38c992f6",
+    "projectPath": "<projectPath>"
+  }
+}

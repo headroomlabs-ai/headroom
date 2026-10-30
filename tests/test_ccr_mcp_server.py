@@ -2,7 +2,10 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import http.server
 import json
+import logging
+import threading
 
 import pytest
 
@@ -11,6 +14,7 @@ from headroom.cache.compression_store import (
     get_compression_store,
     reset_compression_store,
 )
+from headroom.tokenizers.estimator import EstimatingTokenCounter
 from tests._mcp_stub import import_module_with_mcp_stub
 
 mcp_server = import_module_with_mcp_stub("headroom.ccr.mcp_server")
@@ -91,6 +95,50 @@ def test_compress_savings_percent_tracks_token_counts(fresh_store) -> None:
         assert result["savings_percent"] == 0.0  # not inverted to 100
     else:
         assert result["savings_percent"] > 0.0
+
+
+def _compact_json(tmp_path):
+    """A single-line JSON file: one whitespace-separated word, thousands of tokens."""
+    path = tmp_path / "payload.json"
+    path.write_text(
+        json.dumps(
+            [{"id": i, "status": "ok", "kind": "run"} for i in range(60)],
+            separators=(",", ":"),
+        ),
+        encoding="utf-8",
+    )
+    return path
+
+
+def test_read_tool_prices_files_in_tokens_not_words(fresh_store, tmp_path) -> None:
+    """``headroom_read`` caches a token estimate and stores it as the entry's
+    ``original_tokens``. It used to be ``len(content.split())`` — a word count
+    in a token field, which is 1 for a single-line JSON document that is
+    thousands of tokens long."""
+    path = _compact_json(tmp_path)
+    content = path.read_text(encoding="utf-8")
+    server = mcp_server.HeadroomMCPServer(check_proxy=False)
+
+    asyncio.run(server._handle_read({"file_path": str(path), "fresh": True}))
+
+    estimated = next(iter(server._file_cache.values()))[3]
+    assert estimated == EstimatingTokenCounter().count_text(content)
+    assert estimated > len(content.split())
+
+
+def test_read_tool_cache_note_reports_tokens(fresh_store, tmp_path) -> None:
+    """The 'already in your context' note is read by the agent to decide whether
+    to re-read the file, so its ``~N tokens`` figure has to be a token count."""
+    path = _compact_json(tmp_path)
+    content = path.read_text(encoding="utf-8")
+    server = mcp_server.HeadroomMCPServer(check_proxy=False)
+
+    asyncio.run(server._handle_read({"file_path": str(path)}))
+    response = asyncio.run(server._handle_read({"file_path": str(path)}))
+    payload = json.loads(response[0].kwargs["text"])
+
+    assert payload["status"] == "cached"
+    assert f"~{EstimatingTokenCounter().count_text(content)} tokens" in payload["note"]
 
 
 def test_mcp_compress_surfaces_unreachable_proxy(fresh_store) -> None:
@@ -492,3 +540,68 @@ def test_run_stdio_reaps_process_on_parent_death(monkeypatch) -> None:
 
     assert excinfo.value.args[0] == 0
     assert cleaned["done"] is True
+
+
+class _RecordList(logging.Handler):
+    def __init__(self) -> None:
+        super().__init__(level=logging.DEBUG)
+        self.records: list[logging.LogRecord] = []
+
+    def emit(self, record: logging.LogRecord) -> None:
+        self.records.append(record)
+
+
+@pytest.mark.parametrize("level", [logging.DEBUG, logging.WARNING])
+def test_proxy_stats_failure_keeps_url_credentials_out_of_logs(level) -> None:
+    canary = "pw-canary-7c1e"
+    # A path segment can carry a token too, plain or %-encoded (%50 is "P").
+    path_canaries = ("PLAIN_PATH_CANARY", "%50RIVATE_PATH_CANARY", "PRIVATE_PATH_CANARY")
+
+    class _MalformedJson(http.server.BaseHTTPRequestHandler):
+        def do_GET(self) -> None:  # noqa: N802 - stdlib handler name
+            body = b"{not json"
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, *_args: object) -> None:
+            pass
+
+    httpd = http.server.ThreadingHTTPServer(("127.0.0.1", 0), _MalformedJson)
+    thread = threading.Thread(target=httpd.serve_forever, daemon=True)
+    thread.start()
+    # Attach directly: caplog misses `headroom.*` loggers once logging is configured.
+    logger = logging.getLogger("headroom.ccr.mcp")
+    handler = _RecordList()
+    previous = logger.level
+    logger.addHandler(handler)
+    logger.setLevel(level)
+    try:
+        port = httpd.server_address[1]
+        server = mcp_server.HeadroomMCPServer(
+            proxy_url=f"http://user:{canary}@127.0.0.1:{port}/bot{path_canaries[0]}/{path_canaries[1]}",
+            check_proxy=True,
+        )
+
+        async def fetch() -> object:
+            try:
+                return await server._fetch_full_proxy_stats()
+            finally:
+                if server._http_client is not None:
+                    await server._http_client.aclose()
+
+        assert asyncio.run(fetch()) is None
+    finally:
+        logger.removeHandler(handler)
+        logger.setLevel(previous)
+        httpd.shutdown()
+        httpd.server_close()
+
+    formatted = [logging.Formatter().format(record) for record in handler.records]
+    for secret in (canary, *path_canaries):
+        assert all(secret not in line for line in formatted)
+    if level == logging.DEBUG:
+        # The failure is still diagnosable: the redacted URL and the exception type.
+        assert any(f"127.0.0.1:{port}" in line and "JSONDecodeError" in line for line in formatted)

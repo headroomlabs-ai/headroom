@@ -71,6 +71,7 @@ from .toin import (
     DEFAULT_AUTH_MODE,
     DEFAULT_MIN_OBSERVATIONS_TO_PUBLISH,
     DEFAULT_MODEL_FAMILY,
+    DEFAULT_TENANT_KEY,
     TOINConfig,
     ToolIntelligenceNetwork,
     ToolPattern,
@@ -94,10 +95,11 @@ __all__ = [
     "FieldDistribution",
     "RetrievalStats",
     "ToolSignature",
-    # TOIN (observation-only since PR-B5)
+    # TOIN (observation-only since PR-B5; per-tenant since PR-F3)
     "DEFAULT_AUTH_MODE",
     "DEFAULT_MIN_OBSERVATIONS_TO_PUBLISH",
     "DEFAULT_MODEL_FAMILY",
+    "DEFAULT_TENANT_KEY",
     "TOINConfig",
     "ToolIntelligenceNetwork",
     "ToolPattern",

@@ -2,13 +2,19 @@
 
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass
-from typing import Any, cast
+from typing import Any, NoReturn, cast
 
 from fastapi import Request
 from fastapi.responses import Response
 
 from headroom.providers.codex.model_metadata import handle_chatgpt_model_metadata
+from headroom.providers.grok.model_metadata import (
+    is_xai_model_list_target,
+    normalize_xai_model_metadata,
+)
+from headroom.proxy.helpers import sanitize_forwarded_response_headers
 
 
 @dataclass(frozen=True, slots=True)
@@ -21,6 +27,10 @@ class ModelMetadataEndpoint:
 
 
 MODEL_METADATA_LIST_ENDPOINT = ModelMetadataEndpoint("/v1/models", "/backend-api/models")
+
+
+def _reject_non_standard_json_constant(value: str) -> NoReturn:
+    raise ValueError(f"non-standard JSON constant: {value}")
 
 
 def model_metadata_get_endpoint(model_id: str) -> ModelMetadataEndpoint:
@@ -49,7 +59,7 @@ async def handle_model_metadata_endpoint(
     if chatgpt_response is not None:
         return chatgpt_response
 
-    return cast(
+    response = cast(
         Response,
         await proxy.handle_passthrough(
             request,
@@ -58,3 +68,37 @@ async def handle_model_metadata_endpoint(
             provider_name,
         ),
     )
+    if (
+        endpoint == MODEL_METADATA_LIST_ENDPOINT
+        and 200 <= response.status_code < 300
+        and is_xai_model_list_target(provider_api_base_url)
+    ):
+        normalized_content: bytes | None = None
+        try:
+            payload = json.loads(
+                response.body,
+                parse_constant=_reject_non_standard_json_constant,
+            )
+            normalized_payload = normalize_xai_model_metadata(payload)
+            if normalized_payload is not None:
+                normalized_content = json.dumps(
+                    normalized_payload,
+                    separators=(",", ":"),
+                    ensure_ascii=False,
+                ).encode("utf-8")
+        except (TypeError, UnicodeError, ValueError):
+            normalized_payload = None
+        if normalized_payload is not None and normalized_content is not None:
+            headers = sanitize_forwarded_response_headers(
+                response.headers,
+                "etag",
+                "last-modified",
+                "cache-control",
+            )
+            headers["content-type"] = "application/json"
+            return Response(
+                content=normalized_content,
+                status_code=response.status_code,
+                headers=headers,
+            )
+    return response

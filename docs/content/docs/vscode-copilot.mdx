@@ -117,8 +117,20 @@ snapshot in response metadata (for example, a request for `gpt-5.5` returned
 Copilot plan and organization policy.
 
 The proxy supports the native Copilot OpenAI-compatible request paths used by
-GPT and Claude models. Headroom's upstream auth hook replaces local client auth
-with the current Copilot API token on every Copilot-bound request.
+GPT and Claude models. Inline completions retain the editor's own `ghu_` OAuth
+bearer and native integration metadata on the completions host, including an
+operator-configured gateway with a base-path prefix. Headroom does not replace
+that editor identity with the proxy operator's Copilot seat or add chat-specific
+headers. Chat and Responses retain their existing managed Copilot API-token
+policy; a raw OAuth bearer on those routes does not gain the inline exception.
+
+A configured base path is removed only for the same scheme and authority, at a
+complete path-segment boundary. Other recognized completions endpoints keep
+their native `/v1` paths.
+
+The inline auth branch logs only the credential kind (`ghu_***`), not the
+editor's OAuth token. Case variants of unrelated provider API-key headers are
+removed before any Copilot auth branch forwards the request.
 
 ## Stop and undo
 
@@ -144,10 +156,19 @@ remote, and profile-specific settings should use `--settings-file` explicitly.
 
 ## Enterprise
 
-GitHub.com Enterprise Cloud normally requires no override; Headroom uses the API
-URL advertised during token exchange. For GitHub Enterprise Server/custom domains,
-set `GITHUB_COPILOT_ENTERPRISE_URL` or `GITHUB_COPILOT_ENTERPRISE_DOMAIN` before
-both `copilot-auth login` and `wrap vscode`.
+GitHub.com Enterprise Cloud normally requires no override. Copilot Business and
+Enterprise seats are routed to the host GitHub advertises during token exchange
+(`api.business.githubcopilot.com` or `api.enterprise.githubcopilot.com`), which is
+the host GitHub's own clients use. This matters on networks that follow GitHub's
+[subscription-based network routing](https://docs.github.com/en/copilot/how-tos/administer-copilot/manage-for-enterprise/manage-access/manage-network-access):
+their firewall allows only the plan host, and the generic `api.githubcopilot.com`
+is blocked. If the plan host rejects a model the generic host serves, set
+`GITHUB_COPILOT_USE_ADVERTISED_HOST=0` to route through the generic host again.
+An explicit `GITHUB_COPILOT_API_URL` still wins over both.
+
+For GitHub Enterprise Server/custom domains, set `GITHUB_COPILOT_ENTERPRISE_URL`
+or `GITHUB_COPILOT_ENTERPRISE_DOMAIN` before both `copilot-auth login` and
+`wrap vscode`.
 
 ## Verification and troubleshooting
 
@@ -159,6 +180,9 @@ both `copilot-auth login` and `wrap vscode`.
   does not add or rename models.
 - If connection is refused, keep the wrapper running and check loopback/remote
   port reachability.
+- If Headroom records no requests while Copilot keeps working, the window is
+  probably using a VS Code profile with its own settings. `wrap vscode` warns
+  about each such profile and prints the `--settings-file` path to configure it.
 - Use `--port 8788` when the default port is occupied; settings update safely.
 - If Headroom refuses settings, repair the reported JSONC/marker conflict or use
   `--no-configure` and apply the printed settings manually.

@@ -38,6 +38,7 @@ def _clear_claude_mode_env(monkeypatch: pytest.MonkeyPatch) -> None:
         "ANTHROPIC_VERTEX_BASE_URL",
         "ANTHROPIC_FOUNDRY_BASE_URL",
         "ANTHROPIC_FOUNDRY_RESOURCE",
+        "HEADROOM_CLAUDE_PROJECT_SETTINGS",
         "CLAUDE_CODE_USE_VERTEX",
         "CLAUDE_CODE_USE_FOUNDRY",
         "VERTEX_TARGET_API_URL",
@@ -66,7 +67,7 @@ def _invoke_wrap_claude(
 
     _clear_claude_mode_env(monkeypatch)
     monkeypatch.setattr(wrap_mod.shutil, "which", lambda _name: "/usr/bin/claude")
-    monkeypatch.setattr(wrap_mod, "_register_proxy_client", lambda _port: None)
+    monkeypatch.setattr(wrap_mod, "_register_proxy_client", lambda _port, session_token=None: None)
     monkeypatch.setattr(wrap_mod, "_make_cleanup", lambda _holder, _port: lambda: None)
     monkeypatch.setattr(wrap_mod.signal, "signal", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(wrap_mod, "_push_runtime_env", lambda *_args, **_kwargs: None)
@@ -104,18 +105,23 @@ def _invoke_wrap_claude(
     monkeypatch.setattr(wrap_mod, "detect_claude_code_version", lambda *_a, **_k: (2, 1, 196))
     monkeypatch.setattr(wrap_mod.subprocess, "run", fake_run)
 
-    result = runner.invoke(
-        main,
-        [
-            "wrap",
-            "claude",
-            "--no-mcp",
-            "--no-tokensave",
-            "--no-serena",
-            *extra_args,
-        ],
-        env=env,
-    )
+    # Isolate cwd: the wrap flow writes .claude/settings.local.json (selfheal
+    # hook, stale-marker check) relative to cwd, and with shutil.which patched
+    # above a run from the repo root would poison the real repo settings with a
+    # "/usr/bin/claude wrap selfheal" hook.
+    with runner.isolated_filesystem():
+        result = runner.invoke(
+            main,
+            [
+                "wrap",
+                "claude",
+                "--no-mcp",
+                "--no-tokensave",
+                "--no-serena",
+                *extra_args,
+            ],
+            env=env,
+        )
 
     assert result.exit_code == 0, result.output
     return captured, result.output
@@ -124,7 +130,8 @@ def _invoke_wrap_claude(
 def test_wrap_claude_plain_mode_warns_about_remote_control_gate(
     runner: CliRunner, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    captured, output = _invoke_wrap_claude(runner, monkeypatch, env={})
+    # -v restores the full #1779 explanation (#3426 made it opt-in).
+    captured, output = _invoke_wrap_claude(runner, monkeypatch, env={}, extra_args=("-v",))
 
     assert captured["child_cmd"] == ["/usr/bin/claude"]
     assert "Remote Control" in output
@@ -157,7 +164,11 @@ def test_wrap_claude_rejects_conflicting_auth_before_proxy_mutation(
     monkeypatch.setattr(wrap_mod, "claude_user_settings_path", lambda: user_settings)
     monkeypatch.setattr(wrap_mod.shutil, "which", lambda _name: "/usr/bin/claude")
     proxy_calls: list[int] = []
-    monkeypatch.setattr(wrap_mod, "_register_proxy_client", lambda port: proxy_calls.append(port))
+    monkeypatch.setattr(
+        wrap_mod,
+        "_register_proxy_client",
+        lambda port, session_token=None: proxy_calls.append(port),
+    )
 
     result = runner.invoke(
         main,
@@ -209,7 +220,7 @@ def test_wrap_claude_sibling_note_accurate_under_1m_and_tool_search_optouts(
         runner,
         monkeypatch,
         env={},
-        extra_args=("--1m", "--tool-search", "false"),
+        extra_args=("-v", "--1m", "--tool-search", "false"),
     )
     assert "already restored via --1m" in output
     assert "restore with `headroom wrap claude --1m`" not in output
@@ -262,15 +273,15 @@ def test_wrap_claude_tool_search_banner_line_still_accurate_when_active(
     runner: CliRunner, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     # Default session: deferral is on, and both the #746 banner line and the
-    # RC sibling note say so.
-    _captured, output = _invoke_wrap_claude(runner, monkeypatch, env={})
+    # RC sibling note say so (full wording under -v, #3426).
+    _captured, output = _invoke_wrap_claude(runner, monkeypatch, env={}, extra_args=("-v",))
     assert "on-demand tool loading kept on" in output
     assert "keeps it on for this session" in output
     assert "DISABLED per your setting" not in output
-    assert _captured["write_tool_search_value"] == "true"
+    assert "write_tool_search_value" not in _captured
 
 
-def test_wrap_claude_foundry_persists_disabled_tool_search_for_workers(
+def test_wrap_claude_foundry_keeps_disabled_tool_search_process_local_by_default(
     runner: CliRunner, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     captured, output = _invoke_wrap_claude(
@@ -283,8 +294,71 @@ def test_wrap_claude_foundry_persists_disabled_tool_search_for_workers(
     )
 
     assert captured["child_env"]["ENABLE_TOOL_SEARCH"] == "false"
+    assert "write_tool_search_value" not in captured
+    # Foundry's default turns deferral off without a --tool-search flag, so the
+    # compact line must not blame the user's setting (#3426).
+    assert "On-demand tool loading: off (this session)" in output
+    assert "kept on" not in output
+
+
+def test_wrap_claude_default_banner_is_compact(
+    runner: CliRunner, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Issue #3426: without -v the RC notice and the #746 line are one line each,
+    # and the long explanation / sibling note / env-var trailer are omitted.
+    _captured, output = _invoke_wrap_claude(runner, monkeypatch, env={})
+    assert (
+        "Remote Control (/rc) is disabled while routed through Headroom — run `claude` "
+        "directly (no wrap) for sessions that need it."
+    ) in output
+    assert "On-demand tool loading: kept on (this session)" in output
+    assert "Same base-URL gate" not in output
+    assert "ENABLE_TOOL_SEARCH=" not in output
+    assert "issue #746" not in output
+
+
+def test_wrap_claude_compact_tool_search_off_line(
+    runner: CliRunner, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _captured, output = _invoke_wrap_claude(
+        runner, monkeypatch, env={}, extra_args=("--tool-search", "false")
+    )
+    assert "On-demand tool loading: off (this session)" in output
+    assert "kept on" not in output
+
+
+def test_proxy_status_line_keeps_own_signature_and_names_port_once() -> None:
+    # The status helper must not inherit _ensure_proxy_unlocked's metadata via
+    # a stray @wraps; _ensure_proxy is the function that should carry it.
+    import inspect
+
+    assert wrap_mod._proxy_status_line.__name__ == "_proxy_status_line"
+    assert list(inspect.signature(wrap_mod._proxy_status_line).parameters) == [
+        "status",
+        "port",
+    ]
+    assert wrap_mod._ensure_proxy.__wrapped__ is wrap_mod._ensure_proxy_unlocked
+    assert "learn" in inspect.signature(wrap_mod._ensure_proxy).parameters
+
+    line = wrap_mod._proxy_status_line("Proxy ready", 8787)
+    assert line == "  Proxy ready — dashboard: http://127.0.0.1:8787/dashboard"
+    assert line.count("127.0.0.1:8787") == 1
+
+
+def test_wrap_claude_foundry_project_settings_opt_in_persists_disabled_tool_search(
+    runner: CliRunner, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    captured, _output = _invoke_wrap_claude(
+        runner,
+        monkeypatch,
+        env={
+            "CLAUDE_CODE_USE_FOUNDRY": "1",
+            "ANTHROPIC_FOUNDRY_BASE_URL": "https://tenant.services.ai.azure.com/anthropic",
+        },
+        extra_args=("--project-settings",),
+    )
+
     assert captured["write_tool_search_value"] == "false"
-    assert "on-demand tool loading DISABLED" in output
 
 
 def test_wrap_claude_vertex_passes_custom_base_url_to_proxy_before_child_redirect(
@@ -307,13 +381,11 @@ def test_wrap_claude_vertex_passes_custom_base_url_to_proxy_before_child_redirec
 
     ensure_kwargs = captured["ensure_kwargs"]
     child_env = captured["child_env"]
-    write_kwargs = captured["write_base_url_kwargs"]
     assert ensure_kwargs["vertex_api_url"] == custom_vertex_url
     assert ensure_kwargs["clear_vertex_api_url"] is False
     assert ensure_kwargs["anthropic_api_url"] is None
     assert child_env["ANTHROPIC_VERTEX_BASE_URL"] == "http://127.0.0.1:8787"
-    assert write_kwargs["vertex_mode"] is True
-    assert write_kwargs["foundry_mode"] is False
+    assert "write_base_url_kwargs" not in captured
 
 
 def test_wrap_claude_vertex_target_env_beats_anthropic_vertex_base_url(
@@ -366,7 +438,7 @@ def test_wrap_claude_vertex_default_or_absent_base_url_does_not_force_vertex_tar
     assert child_env["ANTHROPIC_VERTEX_BASE_URL"] == "http://127.0.0.1:8787"
 
 
-def test_wrap_claude_foundry_proxy_env_behavior_is_unchanged(
+def test_wrap_claude_foundry_proxy_env_uses_process_environment_only_by_default(
     runner: CliRunner, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     foundry_url = "https://my-resource.services.ai.azure.com/anthropic"
@@ -389,8 +461,7 @@ def test_wrap_claude_foundry_proxy_env_behavior_is_unchanged(
     assert ensure_kwargs["anthropic_api_url"] == foundry_url
     assert ensure_kwargs["vertex_api_url"] is None
     assert child_env["ANTHROPIC_FOUNDRY_BASE_URL"] == "http://127.0.0.1:8787/anthropic"
-    assert captured["write_base_url_kwargs"]["foundry_mode"] is True
-    assert captured["write_base_url_kwargs"]["vertex_mode"] is False
+    assert "write_base_url_kwargs" not in captured
 
 
 def test_write_vertex_mode_sets_vertex_key(tmp_path: Path) -> None:
@@ -458,6 +529,29 @@ def test_start_proxy_sets_vertex_target_env_for_proxy_subprocess(
     ]
     proxy_env = captured["kwargs"]["env"]
     assert proxy_env["VERTEX_TARGET_API_URL"] == "https://vertex-gateway.internal/custom"
+
+
+def test_start_proxy_marks_subprocess_as_wrap_owned(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Wrap-spawned proxies carry HEADROOM_WRAP_OWNED=1 for the orphan watchdog."""
+    fake_proc = _FakeProxyProcess()
+    captured: dict[str, Any] = {}
+
+    monkeypatch.setattr(wrap_mod, "_get_log_path", lambda port=None: tmp_path / "proxy.log")
+    monkeypatch.setattr(wrap_mod, "_check_proxy", lambda _port: True)
+    monkeypatch.setattr(wrap_mod.time, "sleep", lambda _seconds: None)
+
+    def fake_popen(cmd: list[str], **kwargs: object) -> _FakeProxyProcess:
+        captured["kwargs"] = kwargs
+        return fake_proc
+
+    monkeypatch.setattr(wrap_mod.subprocess, "Popen", fake_popen)
+
+    proc = wrap_mod._start_proxy(8787, agent_type="codex")
+
+    assert proc is fake_proc
+    assert captured["kwargs"]["env"]["HEADROOM_WRAP_OWNED"] == "1"
 
 
 def test_start_proxy_clears_inherited_vertex_target_env(

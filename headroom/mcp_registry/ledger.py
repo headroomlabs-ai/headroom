@@ -14,7 +14,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from headroom import paths
+from headroom import fsutil, paths
 
 from .base import ServerSpec
 
@@ -42,7 +42,13 @@ def spec_fingerprint(spec: ServerSpec) -> str:
     return hashlib.sha256(raw).hexdigest()
 
 
-def record_install(agent: str, spec: ServerSpec, *, path: Path | None = None) -> None:
+def record_install(
+    agent: str,
+    spec: ServerSpec,
+    *,
+    path: Path | None = None,
+    ownership_key: str | None = None,
+) -> None:
     """Record that Headroom installed ``spec`` for ``agent``."""
     ledger_file = path or ledger_path()
     # Automatic installs must recover from a stale or damaged ledger. The
@@ -56,14 +62,20 @@ def record_install(agent: str, spec: ServerSpec, *, path: Path | None = None) ->
     if not isinstance(agent_entry, dict):
         agent_entry = {}
         agents[agent] = agent_entry
-    agent_entry[spec.name] = {
+    agent_entry[ownership_key or spec.name] = {
         "fingerprint": spec_fingerprint(spec),
         "installed_at": datetime.now(timezone.utc).isoformat(),
     }
     _write_ledger(ledger_file, data)
 
 
-def clear_install(agent: str, server_name: str, *, path: Path | None = None) -> None:
+def clear_install(
+    agent: str,
+    server_name: str,
+    *,
+    path: Path | None = None,
+    ownership_key: str | None = None,
+) -> None:
     """Remove one ledger entry if present."""
     ledger_file = path or ledger_path()
     data = _read_ledger(ledger_file)
@@ -71,9 +83,10 @@ def clear_install(agent: str, server_name: str, *, path: Path | None = None) -> 
     if not isinstance(agents, dict):
         return
     agent_entry = agents.get(agent)
-    if not isinstance(agent_entry, dict) or server_name not in agent_entry:
+    key = ownership_key or server_name
+    if not isinstance(agent_entry, dict) or key not in agent_entry:
         return
-    del agent_entry[server_name]
+    del agent_entry[key]
     if not agent_entry:
         del agents[agent]
     if not agents:
@@ -86,6 +99,7 @@ def headroom_installed_matching(
     current_spec: ServerSpec | None,
     *,
     path: Path | None = None,
+    ownership_key: str | None = None,
 ) -> bool:
     """Return True when the ledger says Headroom installed ``current_spec``."""
     if current_spec is None:
@@ -93,7 +107,7 @@ def headroom_installed_matching(
     ledger_file = path or ledger_path()
     data = _read_ledger(ledger_file)
     try:
-        entry = data["agents"][agent][current_spec.name]
+        entry = data["agents"][agent][ownership_key or current_spec.name]
     except (KeyError, TypeError):
         return False
     if not isinstance(entry, dict):
@@ -115,6 +129,10 @@ def _read_ledger(path: Path, *, for_mutation: bool = False) -> dict[str, Any]:
         if for_mutation:
             raise LedgerMutationError(f"MCP install ledger is unreadable: {path}") from exc
         return {}
+    except UnicodeDecodeError as exc:
+        if for_mutation:
+            raise LedgerMutationError(f"MCP install ledger is not valid UTF-8: {path}") from exc
+        return {}
     try:
         data = json.loads(raw)
     except json.JSONDecodeError as exc:
@@ -123,10 +141,20 @@ def _read_ledger(path: Path, *, for_mutation: bool = False) -> dict[str, Any]:
         return {}
     if not isinstance(data, dict):
         if for_mutation:
-            raise LedgerMutationError("MCP install ledger must contain a JSON object")
+            raise LedgerMutationError(f"MCP install ledger must contain a JSON object: {path}")
         return {}
     if for_mutation:
         for section in ("agents",):
+            # An *absent* section is a valid empty ledger, not a malformed one.
+            # ``clear_install`` pops ``agents`` once its last entry is removed, so
+            # a fully-unwrapped ledger is exactly ``{}`` — and ``record_install``
+            # likewise treats a missing ``agents`` as empty. Rejecting it here made
+            # the very next mutation (e.g. ``headroom mcp adopt``) fail with a
+            # bogus "malformed" error after an ordinary unwrap. A section that is
+            # *present* but not a dict (e.g. ``{"agents": null}``) is still
+            # malformed — so key-absence, not a ``None`` value, is what is skipped.
+            if section not in data:
+                continue
             section_data = data.get(section)
             if not isinstance(section_data, dict) or any(
                 not isinstance(agent_entry, dict)
@@ -144,4 +172,4 @@ def _read_ledger(path: Path, *, for_mutation: bool = False) -> dict[str, Any]:
 
 def _write_ledger(path: Path, data: dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(data, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    fsutil.write_text(path, json.dumps(data, indent=2, sort_keys=True) + "\n")

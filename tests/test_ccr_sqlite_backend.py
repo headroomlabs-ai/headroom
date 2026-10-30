@@ -7,6 +7,7 @@ worker processes — neither holds for the in-memory dict.
 
 from __future__ import annotations
 
+import logging
 import os
 import sqlite3
 import time
@@ -57,6 +58,79 @@ class TestSQLiteBackend:
         assert b.delete("h1")
         assert not b.exists("h1")
         assert not b.delete("h1")
+
+    @pytest.mark.skipif(os.name == "nt", reason="POSIX permission bits only")
+    def test_db_file_is_private_under_permissive_umask(self, db_path):
+        """The CCR db (sensitive tool output) must be 0o600 under any umask.
+
+        ``_ensure_private`` creates the db with an explicit ``0o600`` mode
+        (``O_CREAT | O_EXCL``) before ``sqlite3.connect`` opens it, so it is
+        private from birth. Forcing ``umask(0o022)`` — which would make sqlite
+        create it 0o644 — confirms the mode is umask-independent.
+        """
+        old_umask = os.umask(0o022)
+        try:
+            SQLiteBackend(db_path)  # fresh open, private from birth
+        finally:
+            os.umask(old_umask)
+
+        assert db_path.exists()
+        assert (db_path.stat().st_mode & 0o777) == 0o600
+
+    @pytest.mark.skipif(os.name == "nt", reason="POSIX chmod semantics")
+    def test_open_fails_closed_when_db_cannot_be_made_private(self, db_path, monkeypatch):
+        """If an existing db cannot be narrowed, opening must abort (fail closed).
+
+        A store of raw tool output must not be opened world-readable, so
+        ``_ensure_private`` raises rather than silently proceeding to
+        ``sqlite3.connect`` on a db it could not make private.
+        """
+        import headroom.cache.backends.sqlite as sqlite_mod
+
+        db_path.write_text("")  # pre-existing regular db file
+
+        def boom(fd, mode):
+            raise PermissionError("cannot fchmod")
+
+        # The existing-file path narrows through the descriptor (fchmod), so a
+        # narrowing failure there must still abort the open.
+        monkeypatch.setattr(sqlite_mod.os, "fchmod", boom)
+        with pytest.raises(PermissionError):
+            SQLiteBackend(db_path)
+
+    @pytest.mark.skipif(os.name == "nt", reason="POSIX symlink semantics")
+    def test_open_fails_closed_on_symlinked_db_path(self, tmp_path):
+        """A symlinked db path must be refused without following it.
+
+        If the db path is a symlink an attacker planted, ``_ensure_private``
+        must fail closed (O_NOFOLLOW) rather than chmod-ing and handing the
+        attacker-chosen target to ``sqlite3.connect``. The target must be left
+        untouched: neither narrowed nor opened/rewritten.
+        """
+        target = tmp_path / "attacker_target"
+        # Create the target with a deliberately wider mode via umask (not an
+        # explicit permissive chmod) so a chmod-follow regression would show up
+        # as a mode change, without the test itself performing a world-readable
+        # chmod that the security scanner flags as overly permissive.
+        old_umask = os.umask(0o022)
+        try:
+            target.write_text("SECRET-ORIGINAL")  # lands 0o644 under this umask
+        finally:
+            os.umask(old_umask)
+        before_mode = target.stat().st_mode & 0o777
+        assert before_mode != 0o600  # precondition: a narrow would be visible
+
+        link = tmp_path / "ccr_store.db"
+        link.symlink_to(target)
+
+        with pytest.raises(PermissionError):
+            SQLiteBackend(link)
+
+        # Target was neither narrowed (mode unchanged) nor opened/rewritten by
+        # sqlite (contents intact, no WAL/journal siblings created).
+        assert (target.stat().st_mode & 0o777) == before_mode
+        assert target.read_text() == "SECRET-ORIGINAL"
+        assert link.is_symlink()
 
     def test_survives_reopen(self, db_path):
         """The restart-survival property the default flip exists for."""
@@ -140,11 +214,15 @@ class TestSQLiteBackend:
         assert expired is not None
         expired.created_at = time.time() - 11
         backend.set(expired_hash, expired)
+        # The setup stores above intentionally exercised the periodic purge and
+        # advanced its 60-second throttle. Make the insertion under test eligible
+        # to purge the row we only just backdated.
+        backend._last_purge = 0.0
 
         monkeypatch.setattr(
             backend,
             "_entry_from_json",
-            lambda _raw: pytest.fail("new insertion decoded existing CCR payloads"),
+            lambda *_args: pytest.fail("new insertion decoded existing CCR payloads"),
         )
 
         new_hash = store.store("new original", "new compact", ttl=60)
@@ -174,6 +252,114 @@ class TestSQLiteBackend:
         got = b.get("h1")
         assert got is not None
         assert got.original_content == "x" * 600
+
+    def test_missing_required_field_degrades_to_miss(self, db_path):
+        """A row that parses as JSON but is missing a required CompressionEntry
+        field (schema drift across an upgrade, a partially written row) must
+        degrade to a miss, not raise. Otherwise it crashes get() and — via
+        items(), which _clean_expired runs on every store's eviction — breaks
+        all reads, evictions, and stores for one poison row."""
+        b = SQLiteBackend(db_path)
+        b.set("good", make_entry("good"))
+        # Insert a valid-JSON blob missing required fields, plus a non-dict blob.
+        with b._lock:
+            for hash_key, blob in (
+                ("poison", '{"hash": "poison", "original_content": "x"}'),
+                ("nulljson", "null"),
+            ):
+                b._conn.execute(
+                    "INSERT OR REPLACE INTO ccr_entries "
+                    "(hash, entry_json, created_at, ttl) VALUES (?, ?, ?, ?)",
+                    (hash_key, blob, time.time(), 1800),
+                )
+            b._conn.commit()
+
+        assert b.get("poison") is None  # no TypeError
+        assert b.get("nulljson") is None
+        # items() skips the bad rows instead of raising; the good row survives.
+        items = dict(b.items())
+        assert set(items) == {"good"}
+        # A store cycle (which evicts via items()) still works with poison present.
+        store = CompressionStore(backend=b, max_entries=1000)
+        store.store(original="fresh original", compressed="c", original_item_count=1)
+        assert b.get("good") is not None
+
+    def test_unreadable_row_is_logged_once_and_healthy_rows_are_not(self, db_path):
+        """An unreadable row must say so in the log (once per hash), so an
+        operator can tell corruption from a genuine retrieval miss."""
+        records: list[logging.LogRecord] = []
+
+        class _Collect(logging.Handler):
+            def emit(self, record: logging.LogRecord) -> None:
+                records.append(record)
+
+        handler = _Collect(level=logging.DEBUG)
+        logger = logging.getLogger("headroom.cache.backends.sqlite")
+        logger.addHandler(handler)
+        try:
+            b = SQLiteBackend(db_path)
+            b.set("good", make_entry("good"))
+            assert b.get("good") is not None
+            assert [r for r in records if "unreadable" in r.getMessage()] == []
+
+            with b._lock:
+                b._conn.execute(
+                    "INSERT OR REPLACE INTO ccr_entries "
+                    "(hash, entry_json, created_at, ttl) VALUES (?, ?, ?, ?)",
+                    ("broken", "{not json", time.time(), 1800),
+                )
+                b._conn.commit()
+
+            assert b.get("broken") is None
+            b.items()
+            b.items()
+            unreadable = [r for r in records if "unreadable" in r.getMessage()]
+            assert len(unreadable) == 1
+            assert unreadable[0].levelno == logging.WARNING
+            assert "broken" in unreadable[0].getMessage()
+            assert "good" not in unreadable[0].getMessage()
+        finally:
+            logger.removeHandler(handler)
+
+    def test_repeated_scans_over_the_cap_stay_bounded(self, db_path, monkeypatch):
+        """More bad rows than the cap, scanned twice: at most cap row warnings plus
+        one overflow warning in total, and the rows stay in place and still miss."""
+        import headroom.cache.backends.sqlite as sqlite_mod
+
+        monkeypatch.setattr(sqlite_mod, "_MAX_REPORTED_UNREADABLE", 2)
+        records: list[logging.LogRecord] = []
+
+        class _Collect(logging.Handler):
+            def emit(self, record: logging.LogRecord) -> None:
+                records.append(record)
+
+        handler = _Collect(level=logging.DEBUG)
+        logger = logging.getLogger("headroom.cache.backends.sqlite")
+        logger.addHandler(handler)
+        keys = [f"bad{i}" for i in range(5)]
+        try:
+            b = SQLiteBackend(db_path)
+            with b._lock:
+                for key in keys:
+                    b._conn.execute(
+                        "INSERT OR REPLACE INTO ccr_entries "
+                        "(hash, entry_json, created_at, ttl) VALUES (?, ?, ?, ?)",
+                        (key, "{not json", time.time(), 1800),
+                    )
+                b._conn.commit()
+            assert b.items() == []
+            assert b.items() == []
+            assert b.get("bad4") is None
+            assert b.count() == len(keys)
+        finally:
+            logger.removeHandler(handler)
+
+        warnings = [r.getMessage() for r in records if r.levelno == logging.WARNING]
+        row_warnings = [m for m in warnings if "is unreadable" in m]
+        assert len(row_warnings) == 2
+        assert all("JSONDecodeError" in m for m in row_warnings)
+        assert len([m for m in warnings if "More than 2 warnings about" in m]) == 1
+        assert len(warnings) == 3
 
     def test_store_ttl_enforcement_via_compression_store(self, db_path):
         """TTL checks stay in CompressionStore; expired entries miss."""

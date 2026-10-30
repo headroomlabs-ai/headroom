@@ -218,10 +218,22 @@ def test_stats_gates_a_controller_verbosity_zero(tmp_path, monkeypatch):
     assert payload["method"] == "inactive"
 
 
-def test_stats_gates_cache_mode_even_with_a_level_set(tmp_path, monkeypatch):
-    """``mode="cache"`` forces the resolved level to 0 in the handlers. /stats
-    omitted ``steering_allowed_for``, so it kept publishing the ledger."""
+def test_stats_publishes_in_cache_mode_when_the_level_is_pinned(tmp_path, monkeypatch):
+    """A pinned level runs in cache mode, so /stats must report it as live.
+
+    /stats builds the SAME settings the handlers do; when they steer, it
+    publishes. The inverse -- publishing a ledger no live steering produced --
+    is what the sibling tests below guard."""
     monkeypatch.setenv("HEADROOM_VERBOSITY_LEVEL", "3")
     payload = _stats_output_reduction(tmp_path, monkeypatch, mode="cache")
-    assert payload["active"] is False
-    assert payload["method"] == "inactive"
+    assert payload["active"] is True
+    assert payload["method"] == "measured"
+
+
+def test_stats_publishes_in_cache_mode_with_the_shaper_alone(tmp_path, monkeypatch):
+    """An enabled shaper steers at the default level in cache mode, so /stats
+    must report it live -- with no HEADROOM_VERBOSITY_LEVEL set at all."""
+    monkeypatch.delenv("HEADROOM_VERBOSITY_LEVEL", raising=False)
+    payload = _stats_output_reduction(tmp_path, monkeypatch, mode="cache")
+    assert payload["active"] is True
+    assert payload["method"] == "measured"

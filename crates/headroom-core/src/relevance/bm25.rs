@@ -13,7 +13,7 @@
 //! high-signal matches). Final score is clamped to `[0, 1]` via
 //! `RelevanceScore::new`.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::LazyLock;
 
 use regex::Regex;
@@ -87,7 +87,7 @@ impl BM25Scorer {
     fn bm25_score(
         &self,
         doc_tokens: &[String],
-        query_freq: &HashMap<String, usize>,
+        query_freq: &BTreeMap<String, usize>,
         avg_doc_len: f64,
     ) -> (f64, Vec<String>) {
         if doc_tokens.is_empty() || query_freq.is_empty() {
@@ -113,16 +113,13 @@ impl BM25Scorer {
         let mut matched: Vec<String> = Vec::new();
         let idf = 2.0_f64.ln();
 
-        // Iterate query_freq in HashMap order — Python iterates dict
-        // order (insertion order in 3.7+). For matched_terms we only
-        // care about MEMBERSHIP not ordering downstream, but we sort
-        // tokens alphabetically here for deterministic test output
-        // when multiple terms match.
-        let mut keys: Vec<&String> = query_freq.keys().collect();
-        keys.sort();
-
-        for term in keys {
-            let qf = query_freq[term];
+        // Python iterates dict order (insertion order in 3.7+). For
+        // matched_terms we only care about MEMBERSHIP not ordering
+        // downstream, but terms are visited alphabetically here for
+        // deterministic test output when multiple terms match. A
+        // `BTreeMap` already iterates in key order, so batch scoring no
+        // longer re-sorts the same query keys once per document.
+        for (term, qf) in query_freq {
             let Some(&f) = doc_freq.get(term.as_str()) else {
                 continue;
             };
@@ -132,7 +129,7 @@ impl BM25Scorer {
             let numerator = f * (self.k1 + 1.0);
             let denominator = f + self.k1 * (1.0 - self.b + self.b * doc_len / avgdl);
             let term_score = idf * numerator / denominator;
-            score += term_score * qf as f64;
+            score += term_score * *qf as f64;
         }
 
         (score, matched)
@@ -158,7 +155,7 @@ impl RelevanceScorer for BM25Scorer {
         let context_tokens = self.tokenize(context);
 
         // Build query frequency map from context.
-        let mut query_freq: HashMap<String, usize> = HashMap::new();
+        let mut query_freq: BTreeMap<String, usize> = BTreeMap::new();
         for t in &context_tokens {
             *query_freq.entry(t.clone()).or_insert(0) += 1;
         }
@@ -197,7 +194,7 @@ impl RelevanceScorer for BM25Scorer {
                 .collect();
         }
 
-        let mut query_freq: HashMap<String, usize> = HashMap::new();
+        let mut query_freq: BTreeMap<String, usize> = BTreeMap::new();
         for t in &context_tokens {
             *query_freq.entry(t.clone()).or_insert(0) += 1;
         }
@@ -349,6 +346,27 @@ mod tests {
         let refs: Vec<&str> = items.iter().map(|s| s.as_str()).collect();
         let scores = scorer().score_batch(&refs, "user42");
         assert_eq!(scores.len(), 50);
+    }
+
+    #[test]
+    fn matched_terms_are_lexicographic_regardless_of_context_order() {
+        // Query preparation is what makes matched_terms deterministic. The
+        // context here is deliberately in reverse lexicographic order, so a
+        // map that iterates in insertion or hash order would fail this.
+        let doc = "zulu yankee mike delta alpha";
+        let context = "zulu yankee mike delta alpha";
+        let expected = ["alpha", "delta", "mike", "yankee", "zulu"];
+
+        let single = scorer().score(doc, context);
+        assert_eq!(single.matched_terms, expected);
+
+        // Every document in a batch must get the same ordering, not just
+        // the first one: preparation is shared across the whole batch.
+        let items = vec![doc; 4];
+        for score in scorer().score_batch(&items, context) {
+            // The batch path caps matched_terms at 5.
+            assert_eq!(score.matched_terms, expected);
+        }
     }
 
     // ---------- BM25 formula ----------
