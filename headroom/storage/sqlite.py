@@ -13,6 +13,18 @@ from ..config import RequestMetrics
 from ..utils import format_timestamp, parse_timestamp
 from .base import Storage
 
+# Cache optimizer metric columns, shared by the CREATE TABLE schema, the
+# legacy-database migration, save() and _row_to_metrics().
+_CACHE_OPTIMIZER_COLUMNS: tuple[tuple[str, str], ...] = (
+    ("cache_optimizer_used", "TEXT"),
+    ("cache_optimizer_strategy", "TEXT"),
+    ("cacheable_tokens", "INTEGER DEFAULT 0"),
+    ("breakpoints_inserted", "INTEGER DEFAULT 0"),
+    ("estimated_cache_hit", "INTEGER DEFAULT 0"),
+    ("estimated_savings_percent", "REAL DEFAULT 0.0"),
+    ("semantic_cache_hit", "INTEGER DEFAULT 0"),
+)
+
 
 class SQLiteStorage(Storage):
     """SQLite-based metrics storage."""
@@ -33,44 +45,76 @@ class SQLiteStorage(Storage):
         path = Path(self.db_path)
         path.parent.mkdir(parents=True, exist_ok=True)
 
-        conn = sqlite3.connect(self.db_path)
+        # isolation_level=None so we can take an explicit reserved lock with
+        # BEGIN IMMEDIATE rather than a deferred transaction that still lets
+        # another constructor read the old schema.
+        conn = sqlite3.connect(self.db_path, isolation_level=None, timeout=30.0)
         try:
             cursor = conn.cursor()
-            cursor.execute("""
-                CREATE TABLE IF NOT EXISTS requests (
-                    id TEXT PRIMARY KEY,
-                    timestamp TEXT NOT NULL,
-                    model TEXT NOT NULL,
-                    stream INTEGER NOT NULL,
-                    mode TEXT NOT NULL,
-                    tokens_input_before INTEGER NOT NULL,
-                    tokens_input_after INTEGER NOT NULL,
-                    tokens_output INTEGER,
-                    block_breakdown TEXT NOT NULL,
-                    waste_signals TEXT NOT NULL,
-                    stable_prefix_hash TEXT,
-                    cache_alignment_score REAL,
-                    cached_tokens INTEGER,
-                    transforms_applied TEXT NOT NULL,
-                    tool_units_dropped INTEGER DEFAULT 0,
-                    turns_dropped INTEGER DEFAULT 0,
-                    messages_hash TEXT,
-                    error TEXT
-                )
-            """)
+            cursor.execute("BEGIN IMMEDIATE")
+            try:
+                cursor.execute("""
+                    CREATE TABLE IF NOT EXISTS requests (
+                        id TEXT PRIMARY KEY,
+                        timestamp TEXT NOT NULL,
+                        model TEXT NOT NULL,
+                        stream INTEGER NOT NULL,
+                        mode TEXT NOT NULL,
+                        tokens_input_before INTEGER NOT NULL,
+                        tokens_input_after INTEGER NOT NULL,
+                        tokens_output INTEGER,
+                        block_breakdown TEXT NOT NULL,
+                        waste_signals TEXT NOT NULL,
+                        stable_prefix_hash TEXT,
+                        cache_alignment_score REAL,
+                        cached_tokens INTEGER,
+                        cache_optimizer_used TEXT,
+                        cache_optimizer_strategy TEXT,
+                        cacheable_tokens INTEGER DEFAULT 0,
+                        breakpoints_inserted INTEGER DEFAULT 0,
+                        estimated_cache_hit INTEGER DEFAULT 0,
+                        estimated_savings_percent REAL DEFAULT 0.0,
+                        semantic_cache_hit INTEGER DEFAULT 0,
+                        transforms_applied TEXT NOT NULL,
+                        tool_units_dropped INTEGER DEFAULT 0,
+                        turns_dropped INTEGER DEFAULT 0,
+                        messages_hash TEXT,
+                        error TEXT
+                    )
+                """)
 
-            # Create indices
-            cursor.execute("""
-                CREATE INDEX IF NOT EXISTS idx_timestamp ON requests(timestamp)
-            """)
-            cursor.execute("""
-                CREATE INDEX IF NOT EXISTS idx_model ON requests(model)
-            """)
-            cursor.execute("""
-                CREATE INDEX IF NOT EXISTS idx_mode ON requests(mode)
-            """)
+                # Upgrade databases created before the cache optimizer columns
+                # existed, preserving existing rows. The reserved lock above
+                # serializes this check-and-alter against concurrent constructors.
+                cursor.execute("PRAGMA table_info(requests)")
+                existing_columns = {row[1] for row in cursor.fetchall()}
+                for column, ddl in _CACHE_OPTIMIZER_COLUMNS:
+                    if column not in existing_columns:
+                        try:
+                            cursor.execute(  # nosec B608
+                                f"ALTER TABLE requests ADD COLUMN {column} {ddl}"
+                            )
+                        except sqlite3.OperationalError as exc:
+                            # Another connection may have added the column
+                            # between our schema read and this ALTER.
+                            if "duplicate column name" not in str(exc).lower():
+                                raise
 
-            conn.commit()
+                # Create indices
+                cursor.execute("""
+                    CREATE INDEX IF NOT EXISTS idx_timestamp ON requests(timestamp)
+                """)
+                cursor.execute("""
+                    CREATE INDEX IF NOT EXISTS idx_model ON requests(model)
+                """)
+                cursor.execute("""
+                    CREATE INDEX IF NOT EXISTS idx_mode ON requests(mode)
+                """)
+
+                conn.commit()
+            except Exception:
+                conn.rollback()
+                raise
         finally:
             conn.close()
 
@@ -93,9 +137,12 @@ class SQLiteStorage(Storage):
                 tokens_input_before, tokens_input_after, tokens_output,
                 block_breakdown, waste_signals,
                 stable_prefix_hash, cache_alignment_score, cached_tokens,
+                cache_optimizer_used, cache_optimizer_strategy, cacheable_tokens,
+                breakpoints_inserted, estimated_cache_hit, estimated_savings_percent,
+                semantic_cache_hit,
                 transforms_applied, tool_units_dropped, turns_dropped,
                 messages_hash, error
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 metrics.request_id,
@@ -111,6 +158,13 @@ class SQLiteStorage(Storage):
                 metrics.stable_prefix_hash,
                 metrics.cache_alignment_score,
                 metrics.cached_tokens,
+                metrics.cache_optimizer_used,
+                metrics.cache_optimizer_strategy,
+                metrics.cacheable_tokens,
+                metrics.breakpoints_inserted,
+                1 if metrics.estimated_cache_hit else 0,
+                metrics.estimated_savings_percent,
+                1 if metrics.semantic_cache_hit else 0,
                 json.dumps(metrics.transforms_applied),
                 metrics.tool_units_dropped,
                 metrics.turns_dropped,
@@ -301,6 +355,13 @@ class SQLiteStorage(Storage):
             stable_prefix_hash=row["stable_prefix_hash"] or "",
             cache_alignment_score=row["cache_alignment_score"] or 0.0,
             cached_tokens=row["cached_tokens"],
+            cache_optimizer_used=row["cache_optimizer_used"],
+            cache_optimizer_strategy=row["cache_optimizer_strategy"],
+            cacheable_tokens=row["cacheable_tokens"] or 0,
+            breakpoints_inserted=row["breakpoints_inserted"] or 0,
+            estimated_cache_hit=bool(row["estimated_cache_hit"]),
+            estimated_savings_percent=row["estimated_savings_percent"] or 0.0,
+            semantic_cache_hit=bool(row["semantic_cache_hit"]),
             transforms_applied=json.loads(row["transforms_applied"]),
             tool_units_dropped=row["tool_units_dropped"] or 0,
             turns_dropped=row["turns_dropped"] or 0,
