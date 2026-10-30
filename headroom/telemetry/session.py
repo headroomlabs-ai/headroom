@@ -119,6 +119,7 @@ from pathlib import Path
 from typing import Any
 
 from headroom.offline import pin_litellm_cost_map_local
+from headroom.utils import remember_bounded
 
 logger = logging.getLogger(__name__)
 
@@ -510,7 +511,11 @@ def _config_snapshot() -> dict[str, str]:
     return out
 
 
+# Least-recently-used first. ``model`` comes from the request body, so the
+# entry count is capped (#4479); a model that falls out is simply looked up
+# again the next time it is seen.
 _model_cache: dict[str, str | None] = {}
+_MODEL_CACHE_MAXSIZE = 256
 
 
 def _public_model(model: str) -> str | None:
@@ -529,8 +534,13 @@ def _public_model(model: str) -> str | None:
     """
     if not model:
         return None
-    if model in _model_cache:
-        return _model_cache[model]
+    try:
+        cached = _model_cache[model]
+    except KeyError:
+        pass
+    else:
+        remember_bounded(_model_cache, model, cached, _MODEL_CACHE_MAXSIZE)
+        return cached
 
     resolved: str | None = None
     try:
@@ -545,9 +555,7 @@ def _public_model(model: str) -> str | None:
     except Exception:
         resolved = None
 
-    # ponytail: unbounded dict, but it is keyed by distinct model ids seen in
-    # one process — a handful. Cap it if a router ever fans out over hundreds.
-    _model_cache[model] = resolved
+    remember_bounded(_model_cache, model, resolved, _MODEL_CACHE_MAXSIZE)
     return resolved
 
 

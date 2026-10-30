@@ -9,7 +9,10 @@ import re
 import uuid
 import warnings
 from datetime import datetime, timezone
-from typing import Any
+from typing import Any, TypeVar
+
+_K = TypeVar("_K")
+_V = TypeVar("_V")
 
 # Marker format for Headroom modifications
 MARKER_PREFIX = "<headroom:"
@@ -37,6 +40,41 @@ def compute_hash(data: str | bytes) -> str:
 def compute_short_hash(data: str | bytes, length: int = 16) -> str:
     """Compute truncated SHA256 hash."""
     return compute_hash(data)[:length]
+
+
+def remember_bounded(cache: dict[_K, _V], key: _K, value: _V, maxsize: int) -> None:
+    """Store ``key`` as the newest entry of ``cache``, keeping at most ``maxsize``.
+
+    ``cache`` is a plain dict used as a least-recently-used cache: insertion
+    order is recency order, so the first key is the stalest and is evicted
+    first. Call this again on a cache hit to mark the key recently used.
+
+    Meant for caches keyed by client-controlled strings, such as a proxied
+    request's ``model`` field: the entry count stays bounded however many
+    distinct keys arrive, and an evicted key is recomputed on its next use
+    rather than answered wrongly.
+
+    Safe to call from several threads without a lock: a race can evict a key
+    early or leave the cache briefly one entry over ``maxsize``, never raise.
+
+    Args:
+        cache: The dict to update in place.
+        key: Cache key.
+        value: Value to store.
+        maxsize: Maximum number of entries. ``<= 0`` stores nothing.
+    """
+    if maxsize <= 0:
+        cache.clear()
+        return
+    cache.pop(key, None)
+    while len(cache) >= maxsize:
+        try:
+            oldest = next(iter(cache))
+        except (StopIteration, RuntimeError):
+            # Emptied, or resized by another thread mid-iteration.
+            break
+        cache.pop(oldest, None)
+    cache[key] = value
 
 
 def fast_hash(data: str | bytes, length: int = 16) -> str:
