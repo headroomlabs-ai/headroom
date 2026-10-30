@@ -93,6 +93,9 @@ _learned_limits: dict[tuple[str, bool, str], tuple[int, float]] = {}
 # Give up scanning for message_start beyond this many buffered bytes.
 _MAX_GUARD_BUFFER = 256 * 1024
 
+# SSE lines may end in CRLF, LF or CR, mixed within one frame.
+_SSE_LINE_ENDING_RE = re.compile(rb"(\r\n|\n|\r)")
+
 
 def context_guard_enabled() -> bool:
     """True unless explicitly disabled via HEADROOM_CONTEXT_GUARD=0."""
@@ -239,10 +242,18 @@ def reset_learned_limits() -> None:
     _learned_limits.clear()
 
 
-def _data_line(payload: dict[str, Any], original: bytes) -> bytes:
-    """A rewritten ``data:`` line keeping the original's CRLF ending."""
-    eol = b"\r" if original.endswith(b"\r") else b""
-    return b"data: " + json.dumps(payload, separators=(",", ":")).encode() + eol
+def _split_sse_lines(event: bytes) -> list[bytes]:
+    """Split a frame into ``[line, ending, line, ending, ..., tail]``.
+
+    Lines sit at even indices without their endings, so a rewritten line can
+    be put back and ``b"".join`` restores every original line ending.
+    """
+    return _SSE_LINE_ENDING_RE.split(event)
+
+
+def _data_line(payload: dict[str, Any]) -> bytes:
+    """A rewritten ``data:`` line, without its ending (kept by the caller)."""
+    return b"data: " + json.dumps(payload, separators=(",", ":")).encode()
 
 
 def _sse_event_type(event: bytes) -> bytes | None:
@@ -258,8 +269,9 @@ def _sse_event_type(event: bytes) -> bytes | None:
     injects. Those pass through without arming or disarming anything; treating
     one as an unknown event disabled the guard for the whole stream.
     """
+    lines = _split_sse_lines(event)[::2]
     saw_data = False
-    for line in event.split(b"\n"):
+    for line in lines:
         if line.startswith(b"event:"):
             return line[len(b"event:") :].strip()
         if line.startswith(b"data:"):
@@ -267,7 +279,7 @@ def _sse_event_type(event: bytes) -> bytes | None:
     if not saw_data:
         return None
     # A data frame with no event: line defaults to the type inside the payload.
-    for line in event.split(b"\n"):
+    for line in lines:
         if not line.startswith(b"data:"):
             continue
         try:
@@ -449,9 +461,9 @@ class StreamUsageGuard:
             return event
 
     def _rewrite_message_start(self, event: bytes) -> bytes:
-        lines = event.split(b"\n")
+        lines = _split_sse_lines(event)
         for i, line in enumerate(lines):
-            if not line.startswith(b"data:"):
+            if i % 2 or not line.startswith(b"data:"):
                 continue
             payload = json.loads(line[len(b"data:") :].strip())
             if payload.get("type") != "message_start":
@@ -484,15 +496,15 @@ class StreamUsageGuard:
                 target_total,
                 self._believed_limit,
             )
-            lines[i] = _data_line(payload, line)
-            return b"\n".join(lines)
+            lines[i] = _data_line(payload)
+            return b"".join(lines)
         return event
 
     def _rewrite_message_delta(self, event: bytes) -> bytes:
         assert self._target_total is not None
-        lines = event.split(b"\n")
+        lines = _split_sse_lines(event)
         for i, line in enumerate(lines):
-            if not line.startswith(b"data:"):
+            if i % 2 or not line.startswith(b"data:"):
                 continue
             payload = json.loads(line[len(b"data:") :].strip())
             if payload.get("type") != "message_delta":
@@ -511,6 +523,6 @@ class StreamUsageGuard:
                 # Never deflate.
                 return event
             usage["input_tokens"] = new_input
-            lines[i] = _data_line(payload, line)
-            return b"\n".join(lines)
+            lines[i] = _data_line(payload)
+            return b"".join(lines)
         return event
