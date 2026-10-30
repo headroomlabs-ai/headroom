@@ -3,6 +3,8 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+import pytest
+
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
 
@@ -38,15 +40,19 @@ def test_claude_code_only_plugins_are_listed_and_versioned() -> None:
         assert (plugin_root / "hooks" / "hooks.json").is_file()
 
 
-def test_plugin_manifests_share_core_metadata() -> None:
-    claude = _load_json("plugins/headroom-agent-hooks/.claude-plugin/plugin.json")
-    copilot = _load_json("plugins/headroom-agent-hooks/.github/plugin/plugin.json")
+@pytest.mark.parametrize("plugin", ["headroom-agent-hooks", "headroom-skill"])
+def test_plugin_manifests_share_core_metadata(plugin: str) -> None:
+    claude = _load_json(f"plugins/{plugin}/.claude-plugin/plugin.json")
+    copilot = _load_json(f"plugins/{plugin}/.github/plugin/plugin.json")
     assert isinstance(claude, dict)
     assert isinstance(copilot, dict)
     for key in ("name", "version", "description", "author", "homepage", "repository", "keywords"):
         assert claude[key] == copilot[key]
     assert "hooks" not in claude
-    assert copilot["hooks"] == "./hooks"
+    if plugin == "headroom-agent-hooks":
+        assert copilot["hooks"] == "./hooks"
+    else:
+        assert "hooks" not in copilot
 
 
 def test_plugin_hooks_timeout_exceeds_cold_start_wait() -> None:
@@ -112,3 +118,28 @@ def test_plugin_hooks_share_anchored_launcher_and_rootless_tail() -> None:
     launcher = REPO_ROOT / "plugins/headroom-agent-hooks/bin/headroom-hook.sh"
     assert launcher.is_file()
     assert b"\r" not in launcher.read_bytes()
+
+
+def test_skill_plugin_ships_the_repo_root_skill() -> None:
+    """The skill is published twice: at `skills/headroom` for skills.sh / Codex /
+    Cursor, which read the repo root, and inside the plugin for the Claude Code
+    and Copilot marketplaces, which read the plugin root. No symlinks (Windows
+    checkouts), so this test is what keeps the two copies identical."""
+    root_skill = REPO_ROOT / "skills" / "headroom" / "SKILL.md"
+    plugin_skill = REPO_ROOT / "plugins" / "headroom-skill" / "skills" / "headroom" / "SKILL.md"
+    assert root_skill.read_bytes() == plugin_skill.read_bytes()
+    head = root_skill.read_text(encoding="utf-8").split("---")[1]
+    assert "name: headroom\n" in head
+    assert "description: " in head
+
+
+def test_skill_plugin_manifests_match_marketplace() -> None:
+    marketplace = _load_json(".claude-plugin/marketplace.json")
+    assert isinstance(marketplace, dict)
+    entry = next(p for p in marketplace["plugins"] if p["name"] == "headroom-skill")
+    claude = _load_json("plugins/headroom-skill/.claude-plugin/plugin.json")
+    assert isinstance(claude, dict)
+    for key in ("name", "version", "description", "author", "homepage", "repository", "keywords"):
+        assert claude[key] == entry[key]
+    assert entry["version"] == marketplace["metadata"]["version"]
+    assert (REPO_ROOT / entry["source"] / "skills" / "headroom" / "SKILL.md").is_file()

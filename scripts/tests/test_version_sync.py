@@ -30,6 +30,10 @@ def temp_project(tmp_path: Path) -> dict[str, Path]:
     agent_hooks_github.mkdir(parents=True)
     snip_claude = plugins / "headroom-snip" / ".claude-plugin"
     snip_claude.mkdir(parents=True)
+    skill_claude = plugins / "headroom-skill" / ".claude-plugin"
+    skill_claude.mkdir(parents=True)
+    skill_github = plugins / "headroom-skill" / ".github" / "plugin"
+    skill_github.mkdir(parents=True)
     sdk = root / "sdk"
     typescript = sdk / "typescript"
     typescript.mkdir(parents=True)
@@ -94,6 +98,10 @@ def temp_project(tmp_path: Path) -> dict[str, Path]:
     snip_plugin = snip_claude / "plugin.json"
     snip_plugin.write_text(json.dumps({"name": "headroom-snip", "version": "0.1.0"}))
 
+    skill_plugins = [skill_claude / "plugin.json", skill_github / "plugin.json"]
+    for manifest in skill_plugins:
+        manifest.write_text(json.dumps({"name": "headroom-skill", "version": "0.1.0"}))
+
     # sdk/typescript/package.json
     typescript_pkg = typescript / "package.json"
     typescript_pkg.write_text(json.dumps({"name": "test", "version": "0.5.25"}))
@@ -122,6 +130,7 @@ def temp_project(tmp_path: Path) -> dict[str, Path]:
         "repo_github_marketplace": repo_github_marketplace,
         "claude_plugin": claude_plugin,
         "snip_plugin": snip_plugin,
+        "skill_plugins": skill_plugins,
         "github_plugin": github_plugin,
         "typescript_pkg": typescript_pkg,
         "server_json": server_json,
@@ -351,6 +360,8 @@ def test_plugin_manifests_only_leaves_package_versions_unchanged(
     assert json.loads(temp_project["typescript_pkg"].read_text())["version"] == "0.5.25"
     assert json.loads(temp_project["claude_plugin"].read_text())["version"] == "0.8.0"
     assert json.loads(temp_project["snip_plugin"].read_text())["version"] == "0.8.0"
+    for manifest in temp_project["skill_plugins"]:
+        assert json.loads(manifest.read_text())["version"] == "0.8.0"
     assert (
         json.loads(temp_project["repo_github_marketplace"].read_text())["metadata"]["version"]
         == "0.8.0"
