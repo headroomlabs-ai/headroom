@@ -5705,7 +5705,7 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
         )
 
     # Debug endpoints
-    @app.get("/debug/memory", dependencies=[Depends(_require_loopback)])
+    @app.get("/debug/memory", dependencies=[Depends(_require_loopback_or_container_gateway)])
     async def debug_memory():
         """Get detailed memory usage statistics.
 
