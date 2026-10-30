@@ -171,3 +171,14 @@ func main() {
 def test_get_parser_refuses_quarantined_perl():
     with pytest.raises(ValueError, match="quarantined"):
         cc._get_parser("perl")
+
+
+@pytest.mark.parametrize(
+    "code",
+    [
+        "@value = <<~TXT\nend\nTXT\n@value\n",
+        "@value = 1\n__DATA__\nend\n",
+    ],
+)
+def test_perl_negative_space_ignores_ruby_end_in_data_regions(code):
+    assert cc.detect_language(code)[0] != CodeLanguage.RUBY
