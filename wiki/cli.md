@@ -47,7 +47,10 @@ This page is the authoritative reference for the **Python Headroom CLI** exposed
 | `headroom wrap aider` | Start proxy and launch Aider | **host-bridged** |
 | `headroom wrap cursor` | Start proxy and print Cursor config guidance | **host-bridged** |
 | `headroom wrap openclaw` | Install and configure the OpenClaw plugin | **host-bridged** |
+| `headroom unwrap claude` | Undo durable setup from `headroom wrap claude` | **host-bridged** |
+| `headroom unwrap codex` | Undo `headroom wrap codex` config edits | **host-bridged** |
 | `headroom unwrap openclaw` | Disable the Headroom OpenClaw plugin | **host-bridged** |
+| `headroom uninstall` | Reverse a full Headroom install in one step | **host-bridged** |
 
 ## Captured `--help` output
 
@@ -97,6 +100,7 @@ Commands:
   savings         Show durable compression savings over time.
   sg              Run ast-grep (AST-aware structural search/replace).
   tools           Manage bundled CLI tool binaries (ast-grep, difft, scc).
+  uninstall      Reverse the Headroom install in one step.
   unwrap          Undo durable Headroom wrapping for supported tools.
   update          Update Headroom to the latest release.
   wrap            Wrap CLI tools to run through Headroom.
@@ -258,8 +262,13 @@ Usage: headroom unwrap [OPTIONS] COMMAND [ARGS]...
   Undo durable Headroom wrapping for supported tools.
 
 Commands:
+  claude    Undo durable setup from `headroom wrap claude`.
+  codex     Undo `headroom wrap codex` edits to ~/.codex/config.toml.
   openclaw  Disable the Headroom OpenClaw plugin and restore the legacy engine slot.
 ```
+
+To reverse an install in one step instead of unwrapping each tool, use
+[`headroom uninstall`](#headroom-uninstall).
 
 </details>
 
@@ -906,6 +915,51 @@ headroom unwrap openclaw --no-restart
 | `--verbose`, `-v` | off | Verbose output |
 
 This disables the Headroom OpenClaw plugin and restores the legacy context engine slot.
+
+### `headroom unwrap claude`
+
+```bash
+headroom unwrap claude
+```
+
+| Option | Default | Meaning |
+|---|---|---|
+| `--port`, `-p` | `8787` | Proxy port to stop |
+| `--no-stop-proxy` | off | Do not stop the local Headroom proxy |
+| `--keep-mcp` | off | Keep Headroom MCP registrations |
+| `--keep-rtk` | off | Keep rtk Claude hooks |
+
+### `headroom unwrap codex`
+
+```bash
+headroom unwrap codex
+```
+
+| Option | Default | Meaning |
+|---|---|---|
+| `--port`, `-p` | `8787` | Proxy port to stop |
+| `--no-stop-proxy` | off | Do not stop the local Headroom proxy |
+
+Restores `~/.codex/config.toml` from the pre-wrap backup, or strips the Headroom-managed blocks if no backup exists.
+
+## `headroom uninstall`
+
+Reverse a full Headroom install in one step. Detects what is present and undoes all of it: unwraps each wrapped tool (Codex, Claude, OpenClaw), removes MCP registrations, tears down any persistent supervisor deployment, and stops the local proxy.
+
+```bash
+headroom uninstall
+headroom uninstall --dry-run        # preview without changing anything
+headroom uninstall --purge-state    # also delete the ~/.headroom workspace
+```
+
+| Option | Default | Meaning |
+|---|---|---|
+| `--port`, `-p` | `8787` | Local proxy port to stop |
+| `--keep-proxy` | off | Leave the local Headroom proxy running |
+| `--purge-state` | off | Also delete `~/.headroom` (savings history, caches, telemetry) |
+| `--dry-run` | off | Report what would be removed without changing anything |
+
+The Python/Node package itself is left to your package manager; the final `pip uninstall headroom-ai` / `npm uninstall -g headroom-ai` step is printed at the end.
 
 ## Docker-native parity matrix
 
