@@ -379,7 +379,13 @@ def _tool_search_convo(nquiet: int) -> list[dict]:
                     "id": "toolu_ts",
                     "name": "ToolSearch",
                     "input": {"query": "notes"},
-                }
+                },
+                {
+                    "type": "tool_use",
+                    "id": "toolu_pwd",
+                    "name": "Bash",
+                    "input": {"command": "pwd"},
+                },
             ],
         },
         {
@@ -389,7 +395,8 @@ def _tool_search_convo(nquiet: int) -> list[dict]:
                     "type": "tool_result",
                     "tool_use_id": "toolu_ts",
                     "content": [{"type": "tool_reference", "tool_name": DEFERRED_TOOL["name"]}],
-                }
+                },
+                {"type": "tool_result", "tool_use_id": "toolu_pwd", "content": "/x"},
             ],
         },
     ]
