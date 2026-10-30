@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import logging
 import threading
-from unittest.mock import AsyncMock, MagicMock
+from typing import Any
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -301,6 +303,103 @@ async def test_huge_model_supplied_id_is_capped_in_the_warning() -> None:
     assert "'short-id'" in short and "…" not in short
 
 
+class _Mem0V2SearchClient:
+    """Minimal stand-in for the mem0ai 2.x ``Memory.search`` contract.
+
+    Keyword-only signature with ``top_k``/``filters`` and no top-level entity
+    parameters; any ``user_id``/``agent_id``/``run_id`` in ``**kwargs`` raises,
+    and an unknown ``limit`` would be silently swallowed by ``**kwargs``.
+    """
+
+    def __init__(self) -> None:
+        self.calls: list[dict[str, object]] = []
+        self._hits: object = [{"id": "m1", "memory": "Works at Netflix", "score": 0.9}]
+
+    def search(self, query, *, top_k=20, filters=None, **kwargs):
+        for name in ("user_id", "agent_id", "run_id"):
+            if name in kwargs:
+                raise ValueError(
+                    f"Top-level entity parameters {{{name!r}}} are not supported in "
+                    f"search(). Use filters={{{name!r}: '...'}} instead."
+                )
+        self.calls.append({"query": query, "top_k": top_k, "filters": filters, **kwargs})
+        return self._hits
+
+
+class _Mem0NullableMetadataClient(_Mem0V2SearchClient):
+    """Real mem0ai 2.x hit shape: MemoryItem.model_dump() emits metadata=None."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self._hits = {
+            "results": [
+                {
+                    "id": "m1",
+                    "memory": "Works at Netflix",
+                    "hash": None,
+                    "metadata": None,
+                    "score": 0.9,
+                    "created_at": None,
+                    "updated_at": None,
+                    "user_id": "u1",
+                }
+            ]
+        }
+
+
+@pytest.mark.asyncio
+async def test_search_memories_uses_mem0_v2_filters_and_top_k() -> None:
+    """search_memories must call mem0 2.x search with filters + top_k, not the
+    removed top-level user_id/limit kwargs (issue #4246)."""
+    adapter = _adapter()
+    adapter._ensure_initialized = AsyncMock()  # type: ignore[method-assign]
+    client = _Mem0V2SearchClient()
+    adapter._mem0_client = client
+
+    results = await adapter.search_memories("anything", user_id="u1", top_k=3)
+
+    assert client.calls == [{"query": "anything", "top_k": 3, "filters": {"user_id": "u1"}}]
+    assert [r.memory.content for r in results] == ["Works at Netflix"]
+
+
+@pytest.mark.asyncio
+async def test_search_memories_accepts_nullable_mem0_metadata() -> None:
+    """Mem0 2.x dumps metadata=None when a hit has no extra payload keys.
+
+    ``result.get("metadata", {})`` still returns None, which used to crash
+    entity/session filtering and user_id construction (issue #4246 follow-up).
+    """
+    adapter = _adapter()
+    adapter._ensure_initialized = AsyncMock()  # type: ignore[method-assign]
+    adapter._mem0_client = _Mem0NullableMetadataClient()
+
+    results = await adapter.search_memories("anything", user_id="u1", entities=["Netflix"], top_k=3)
+
+    assert [r.memory.content for r in results] == ["Works at Netflix"]
+    assert results[0].memory.user_id == "u1"
+    assert results[0].memory.metadata == {}
+
+    missed = await adapter.search_memories("anything", user_id="u1", session_id="s1")
+    assert missed == []
+
+
+def test_direct_qdrant_payload_includes_data_for_mem0_search() -> None:
+    """Direct Qdrant writes must store text under ``data`` so mem0 2.x search
+    does not skip the point (``if not payload.get("data"): continue``)."""
+    from headroom.memory.backends.direct_mem0 import _direct_qdrant_payload
+
+    payload = _direct_qdrant_payload("direct adapter fact", "tenant-a", 0.5)
+    assert payload["data"] == "direct adapter fact"
+    assert payload["memory"] == "direct adapter fact"
+    assert payload["user_id"] == "tenant-a"
+    # Caller metadata cannot strip the field mem0 search requires.
+    overwritten = _direct_qdrant_payload(
+        "fact", "u1", 0.1, metadata={"data": "nope", "memory": "nope"}
+    )
+    assert overwritten["data"] == "fact"
+    assert overwritten["memory"] == "fact"
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize("level", [logging.INFO, logging.DEBUG])
 async def test_get_memory_survives_an_out_of_range_errno(level: int) -> None:
@@ -332,3 +431,128 @@ async def test_get_memory_survives_an_out_of_range_errno(level: int) -> None:
     assert any(r.levelno == logging.DEBUG for r in records) is (level == logging.DEBUG)
     for record in records:
         logging.Formatter().format(record)
+
+
+def _vec3(text: str) -> list[float]:
+    """Deterministic 3-d unit vector so identical strings cosine-match at 1.0."""
+    digest = hashlib.sha256(text.encode()).digest()
+    raw = [((digest[i] / 255.0) * 2 - 1) for i in range(3)]
+    norm = sum(x * x for x in raw) ** 0.5 or 1.0
+    return [x / norm for x in raw]
+
+
+class _Deterministic3DEmbedder:
+    """Stand-in for a Mem0 embedder: ``embed`` / ``embed_batch``, 3 dimensions."""
+
+    def embed(self, text: str, memory_action: str | None = None) -> list[float]:
+        return _vec3(text)
+
+    def embed_batch(self, texts: list[str], memory_action: str | None = None) -> list[list[float]]:
+        return [_vec3(text) for text in texts]
+
+
+def _inmemory_mem0(tmp_path: Any, collection_name: str = "headroom_memories"):
+    """Real mem0ai Memory + in-memory Qdrant, no OpenAI/graph/network.
+
+    Mirrors the maintainer reproduction: Memory.search against the real Qdrant
+    store, deterministic 3-d embeddings, collection created by Mem0 itself.
+    """
+    pytest.importorskip("mem0")
+    qdrant_client_mod = pytest.importorskip("qdrant_client")
+
+    from mem0.memory import main as mem0_main
+
+    client = qdrant_client_mod.QdrantClient(":memory:")
+    embedder = _Deterministic3DEmbedder()
+
+    def _embedder_factory(*_args: object, **_kwargs: object) -> _Deterministic3DEmbedder:
+        return embedder
+
+    def _llm_factory(*_args: object, **_kwargs: object) -> MagicMock:
+        return MagicMock()
+
+    with (
+        patch.object(mem0_main, "MEM0_TELEMETRY", False),
+        patch.object(mem0_main.EmbedderFactory, "create", side_effect=_embedder_factory),
+        patch.object(mem0_main.LlmFactory, "create", side_effect=_llm_factory),
+        patch.object(mem0_main, "capture_event", lambda *a, **k: None),
+    ):
+        memory = mem0_main.Memory.from_config(
+            {
+                "vector_store": {
+                    "provider": "qdrant",
+                    "config": {
+                        "collection_name": collection_name,
+                        "embedding_model_dims": 3,
+                        "client": client,
+                    },
+                },
+                "history_db_path": str(tmp_path / "mem0-history.db"),
+            }
+        )
+    memory.embedding_model = embedder
+    # Keep this test on dense cosine search. The BM25 sparse slot would load
+    # fastembed's Qdrant/bm25 model, which is out of scope here.
+    if hasattr(memory.vector_store, "_has_bm25_slot"):
+        memory.vector_store._has_bm25_slot = False
+    return memory, client
+
+
+@pytest.mark.asyncio
+async def test_direct_write_then_mem0_search_round_trip(tmp_path) -> None:
+    """Write through the adapter, then retrieve through real mem0ai 2.x search.
+
+    Covers the payload contract (``data`` vs ``memory``), nullable metadata on
+    a Mem0-native hit, and the adapter's search decoding of both.
+    """
+    mem0_memory, qdrant = _inmemory_mem0(tmp_path)
+    from qdrant_client.models import PointStruct
+
+    adapter = DirectMem0Adapter(Mem0Config(enable_graph=False, collection_name="headroom_memories"))
+    adapter._ensure_initialized = AsyncMock()  # type: ignore[method-assign]
+    adapter._initialized = True
+    adapter._qdrant_client = qdrant
+    adapter._mem0_client = mem0_memory
+    adapter._embed = lambda text: _vec3(text)  # type: ignore[method-assign]
+
+    fact = "direct adapter fact"
+    user_id = "tenant-a"
+    await adapter._write_facts_to_qdrant(facts=[fact], user_id=user_id, importance=0.5)
+
+    found = await adapter.search_memories(fact, user_id=user_id, top_k=5)
+    assert [r.memory.content for r in found] == [fact]
+    assert found[0].memory.user_id == user_id
+
+    # Legacy payload shape: text under ``memory`` only. Mem0 2.x search skips it.
+    qdrant.upsert(
+        collection_name="headroom_memories",
+        points=[
+            PointStruct(
+                id="aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
+                vector=_vec3("legacy memory only"),
+                payload={
+                    "memory": "legacy memory only",
+                    "user_id": user_id,
+                    "importance": 0.5,
+                },
+            )
+        ],
+    )
+    legacy = await adapter.search_memories("legacy memory only", user_id=user_id, top_k=5)
+    assert "legacy memory only" not in [r.memory.content for r in legacy]
+
+    # Mem0-native payload (data + user_id, no extra keys) dumps metadata=None.
+    qdrant.upsert(
+        collection_name="headroom_memories",
+        points=[
+            PointStruct(
+                id="11111111-2222-3333-4444-555555555555",
+                vector=_vec3("native mem0 fact"),
+                payload={"data": "native mem0 fact", "user_id": user_id},
+            )
+        ],
+    )
+    native = await adapter.search_memories("native mem0 fact", user_id=user_id, top_k=5)
+    native_hit = next(r for r in native if r.memory.content == "native mem0 fact")
+    assert native_hit.memory.metadata == {}
+    assert native_hit.memory.user_id == user_id
