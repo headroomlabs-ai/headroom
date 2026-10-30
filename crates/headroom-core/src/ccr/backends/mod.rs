@@ -9,6 +9,7 @@
 pub mod in_memory;
 #[cfg(feature = "redis")]
 pub mod redis;
+#[cfg(feature = "sqlite")]
 pub mod sqlite;
 
 use std::path::PathBuf;
@@ -20,6 +21,7 @@ use crate::ccr::CcrStore;
 #[cfg(feature = "redis")]
 pub use self::redis::RedisCcrStore;
 pub use in_memory::InMemoryCcrStore;
+#[cfg(feature = "sqlite")]
 pub use sqlite::SqliteCcrStore;
 
 /// Operator-visible configuration for the CCR backend. Mirrors the
@@ -30,6 +32,8 @@ pub enum CcrBackendConfig {
     /// In-memory (test default). Bounded LRU; lost on restart.
     InMemory { capacity: usize, ttl_seconds: u64 },
     /// SQLite-backed (prod default). DB file at `path`; persistent.
+    /// Requires the `sqlite` feature (default-on); without it,
+    /// [`from_config`] returns [`CcrBackendInitError::UnsupportedBackend`].
     Sqlite { path: PathBuf, ttl_seconds: u64 },
     /// Redis-backed (multi-worker opt-in). Cfg-gated; surfaces an
     /// `UnsupportedBackend` error if the feature is not compiled in.
@@ -65,6 +69,7 @@ impl CcrBackendConfig {
 #[derive(Debug, Error)]
 pub enum CcrBackendInitError {
     /// SQLite open / schema-create failed.
+    #[cfg(feature = "sqlite")]
     #[error("ccr sqlite backend init failed: {0}")]
     Sqlite(#[from] rusqlite::Error),
     /// Redis open / PING failed (the smoke-test in `RedisCcrStore::open`).
@@ -113,6 +118,7 @@ pub fn from_config(config: &CcrBackendConfig) -> Result<Box<dyn CcrStore>, CcrBa
             );
             Ok(Box::new(store))
         }
+        #[cfg(feature = "sqlite")]
         CcrBackendConfig::Sqlite { path, ttl_seconds } => {
             let store = SqliteCcrStore::open(path, *ttl_seconds)?;
             tracing::info!(
@@ -124,6 +130,11 @@ pub fn from_config(config: &CcrBackendConfig) -> Result<Box<dyn CcrStore>, CcrBa
             );
             Ok(Box::new(store))
         }
+        #[cfg(not(feature = "sqlite"))]
+        CcrBackendConfig::Sqlite { .. } => Err(CcrBackendInitError::UnsupportedBackend {
+            backend: "sqlite",
+            feature: "sqlite",
+        }),
         #[cfg(feature = "redis")]
         CcrBackendConfig::Redis {
             url,

@@ -132,12 +132,27 @@ fn walk_array(items: Vec<Value>, ctx: &DocumentCompactor) -> Value {
 fn walk_string(s: String, ctx: &DocumentCompactor) -> Value {
     // Stringified-JSON: parse, recurse, replace.
     if let Some(parsed) = try_parse_json_container(&s) {
+        // Without `arbitrary-precision`, a `Value` round-trip cannot
+        // represent numbers outside serde_json's native `i64`/`u64`/`f64`
+        // range, so re-serializing an unchanged inner document would round
+        // them (and rewrite escapes/whitespace for no benefit). Keep the
+        // cell's original bytes whenever the walk found nothing to
+        // compact. See `smart_crusher` module docs for the opt-out
+        // semantics.
+        #[cfg(not(feature = "arbitrary-precision"))]
+        let unchanged_probe = parsed.clone();
         let recursed = walk(parsed, ctx);
         return match recursed {
             // Sub-table won — already a rendered string.
             Value::String(rendered) => Value::String(rendered),
-            // Sub-recursion didn't compact anything; emit compact JSON.
-            other => Value::String(serde_json::to_string(&other).unwrap_or(s)),
+            other => {
+                #[cfg(not(feature = "arbitrary-precision"))]
+                if other == unchanged_probe {
+                    return Value::String(s);
+                }
+                // Sub-recursion didn't compact anything; emit compact JSON.
+                Value::String(serde_json::to_string(&other).unwrap_or(s))
+            }
         };
     }
 
@@ -397,5 +412,36 @@ mod tests {
         let doc = json!({"payload": "{not valid json"});
         let out = dc().compact(doc.clone());
         assert_eq!(out, doc);
+    }
+
+    /// Without `arbitrary-precision`, a `Value` round-trip would round
+    /// `18446744073709551617` (outside `i64`/`u64`/`f64` native range).
+    /// When the walk finds nothing to compact inside a stringified-JSON
+    /// cell, the cell must keep its original bytes instead of being
+    /// re-serialized.
+    #[cfg(not(feature = "arbitrary-precision"))]
+    #[test]
+    fn unchanged_stringified_json_keeps_numeric_tokens() {
+        let cell = r#"{"id": 18446744073709551617, "f": 1.0}"#;
+        let out = dc().compact(json!({"payload": cell}));
+        assert_eq!(
+            out.pointer("/payload").and_then(|v| v.as_str()),
+            Some(cell),
+            "unchanged stringified JSON must keep its exact bytes"
+        );
+    }
+
+    /// Compactable stringified JSON must still be walked/compacted; the
+    /// byte-preserving branch only applies when recursion changed nothing.
+    #[cfg(not(feature = "arbitrary-precision"))]
+    #[test]
+    fn compactable_stringified_json_still_compacts() {
+        let cell = r#"[{"x":1},{"x":2},{"x":3}]"#;
+        let out = dc().compact(json!({"payload": cell}));
+        let rendered = out
+            .pointer("/payload")
+            .and_then(|v| v.as_str())
+            .expect("payload compacted");
+        assert!(rendered.starts_with("[3]{"), "got: {rendered}");
     }
 }

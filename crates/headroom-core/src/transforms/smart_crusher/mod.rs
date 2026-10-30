@@ -31,6 +31,34 @@
 //!
 //! Each fix has a fixture entry in the parity harness and a corresponding
 //! test in `tests/test_transforms/test_smart_crusher_bugs.py`.
+//!
+//! # Numeric precision and the `arbitrary-precision` Cargo feature
+//!
+//! `SmartCrusher` (like the rest of the structural transforms) reads JSON
+//! through `serde_json::Value`. `Value::Number` is backed by `i64`/`u64`/`f64`
+//! unless `serde_json`'s `arbitrary_precision` feature is enabled, so a JSON
+//! number outside those native ranges (a large integer, or a float with more
+//! precision than `f64` holds) **cannot be represented** in a feature-off
+//! build: `serde_json::from_str` already rounds it before `SmartCrusher` sees
+//! it. This is an inherent `serde_json` property, not something a `Value`-based
+//! transform can recover from.
+//!
+//! `headroom-core` re-exposes that feature as its default-on
+//! `arbitrary-precision` feature (`default-features = false` turns it off).
+//! In a feature-off build:
+//!
+//! * Documents the crusher leaves **unchanged** keep their original bytes:
+//!   whitespace is stripped lexically and numeric tokens are never
+//!   re-serialized (mirrors [`JsonMinifier`](crate::transforms::pipeline::reformats::json_minifier)).
+//! * Documents it **modifies** are re-serialized from `Value`, so
+//!   out-of-range numbers are not preserved. The same applies to rendered
+//!   table/CSV compaction and to CCR-store payloads, which are serialized
+//!   from the parsed tree (retrieval therefore returns the rounded value).
+//! * Byte-for-byte parity with the Python implementation is only guaranteed
+//!   with the feature enabled.
+//!
+//! Consumers that pass JSON containing large/precise numbers should keep the
+//! default `arbitrary-precision` feature on.
 
 mod analyzer;
 mod anchors;

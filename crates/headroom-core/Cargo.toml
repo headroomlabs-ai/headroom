@@ -119,13 +119,15 @@ toml = "1.1"
 # hex via `headroom/ccr/tool_injection.py` regex. Pure-Rust by default,
 # no system dep, no SIMD-feature-gated flag (the crate auto-detects).
 blake3 = "1"
-# `rusqlite` for the SQLite-backed CCR store (the production default).
-# `bundled` builds SQLite from source so deploys do not need a system
-# libsqlite3 — matters for Lambda / container builds where the host
-# image may lag behind. Sub-1 MB binary cost. WAL is enabled at
-# connection-open time (see `ccr/backends/sqlite.rs`); no extra feature
-# flags required.
-rusqlite = { version = "0.40", features = ["bundled"] }
+# `rusqlite` for the SQLite-backed CCR store (the production default),
+# behind the default-on `sqlite` feature. It is optional because `bundled`
+# links a second `sqlite3` via `libsqlite3-sys`; a consumer that already
+# links one (e.g. through sqlx) cannot take it and can select the in-memory
+# store instead. `bundled` builds SQLite from source so deploys do not need
+# a system libsqlite3 — matters for Lambda / container builds where the
+# host image may lag behind. WAL is enabled at connection-open time (see
+# `ccr/backends/sqlite.rs`).
+rusqlite = { version = "0.40", features = ["bundled"], optional = true }
 # `redis` for the optional multi-worker CCR backend. Cfg-gated behind
 # the `redis` feature so deploys that don't need it pay no compile
 # cost. Default features include the sync `Connection` API used in
@@ -137,7 +139,10 @@ redis = { version = "1.6", optional = true, default-features = false }
 # classifier live with the other Phase B/F policy primitives without
 # cycling through the proxy crate. Tiny crate (no I/O, just types).
 http = "1"
-# tree-sitter + per-language grammars for the CodeCompressor AST port.
+# tree-sitter + per-language grammars for the CodeCompressor AST port,
+# behind the default-on `code` feature. They are optional because
+# `tree-sitter` declares `links = "tree-sitter"`; a consumer that already
+# links a different tree-sitter version cannot take it.
 # Versions are pinned to EXACTLY match the Python reference grammars
 # (`tree-sitter-<lang>` PyPI wheels) so the Rust and Python parsers emit
 # node-for-node identical ASTs — the precondition for byte-parity. Same
@@ -146,15 +151,15 @@ http = "1"
 # samples × 8 languages) confirmed 100% identical node-type + line-span
 # trees at these exact pins. Bumping any pin requires re-running the
 # canary and re-recording the code_aware_compressor fixtures.
-tree-sitter = "=0.27.0"
-tree-sitter-python = "=0.25.0"
-tree-sitter-javascript = "=0.25.0"
-tree-sitter-typescript = "=0.23.2"
-tree-sitter-go = "=0.25.0"
-tree-sitter-rust = "=0.24.2"
-tree-sitter-java = "=0.23.5"
-tree-sitter-c = "=0.24.2"
-tree-sitter-cpp = "=0.23.4"
+tree-sitter = { version = "=0.27.0", optional = true }
+tree-sitter-python = { version = "=0.25.0", optional = true }
+tree-sitter-javascript = { version = "=0.25.0", optional = true }
+tree-sitter-typescript = { version = "=0.23.2", optional = true }
+tree-sitter-go = { version = "=0.25.0", optional = true }
+tree-sitter-rust = { version = "=0.24.2", optional = true }
+tree-sitter-java = { version = "=0.23.5", optional = true }
+tree-sitter-c = { version = "=0.24.2", optional = true }
+tree-sitter-cpp = { version = "=0.23.4", optional = true }
 
 # Load ONNX Runtime dynamically on every platform. The alternative,
 # `ort-download-binaries-*`, statically links Microsoft's prebuilt ORT:
@@ -177,27 +182,66 @@ fastembed = { version = "5", default-features = false, optional = true, features
 ort = { version = "=2.0.0-rc.12", default-features = false, optional = true, features = ["load-dynamic"] }
 
 [features]
-# `ml` is ON by default, so a stock build is byte-for-byte what it was before:
-# the ONNX-backed transforms (fastembed embeddings, magika detection, the
-# smart-crusher ML path) are all compiled in. Turning it OFF
-# (`default-features = false`) drops `ort`/`fastembed`/`magika` from the tree
-# entirely, so a consumer that only uses the lexical path (`TextCrusher` /
-# BM25 relevance) builds with no ONNX Runtime at all — which is what lets that
-# consumer ship a fully-static musl binary. See the source `#[cfg(feature =
-# "ml")]` gates (TODO: the module + dispatch gating is the collaborative half
-# of this change — flagged in the PR).
-default = ["ml"]
+# All capability features are ON by default, so a stock build is byte-for-byte
+# what it was before (the ONNX-backed transforms, the SQLite CCR backend, the
+# tree-sitter code compressor, and serde_json's arbitrary-precision numbers are
+# all compiled in). Consumers that need a narrower graph can set
+# `default-features = false` and opt back into only what they use:
+#
+# - `ml`: fastembed embeddings, magika detection, the smart-crusher ML path,
+#   and Kompress (pulls ONNX Runtime via `ort`).
+# - `sqlite`: the persistent SQLite CCR backend (pulls bundled `libsqlite3`,
+#   which declares `links = "sqlite3"`). Without it, `from_config` returns
+#   `UnsupportedBackend` for `CcrBackendConfig::Sqlite`; the in-memory store
+#   is always available.
+# - `code`: the tree-sitter AST code compressor (pulls `tree-sitter`, which
+#   declares `links = "tree-sitter"`). Without it, source-code blocks fall
+#   through to the Kompress/no-op arm.
+# - `arbitrary-precision`: serde_json's `arbitrary_precision`, required by
+#   the byte-parity paths but global to the graph (serde-rs/serde#2748).
+default = ["ml", "sqlite", "code", "arbitrary-precision"]
 ml = ["dep:ort", "dep:fastembed", "dep:magika"]
+sqlite = ["dep:rusqlite"]
+code = [
+    "dep:tree-sitter",
+    "dep:tree-sitter-python",
+    "dep:tree-sitter-javascript",
+    "dep:tree-sitter-typescript",
+    "dep:tree-sitter-go",
+    "dep:tree-sitter-rust",
+    "dep:tree-sitter-java",
+    "dep:tree-sitter-c",
+    "dep:tree-sitter-cpp",
+]
+arbitrary-precision = ["serde_json/arbitrary_precision"]
 # Compile in the Redis CCR backend. Enable for multi-worker deployments
 # that want a shared CCR store with no sticky-session at the LB. The
-# SQLite backend (always compiled) is the production default for
-# single-worker / single-instance setups.
+# SQLite backend (`sqlite` feature, on by default) is the production
+# default for single-worker / single-instance setups.
 redis = ["dep:redis"]
 
 [dev-dependencies]
 proptest = "1"
 criterion = { version = "0.8", features = ["html_reports"] }
 tempfile = "3"
+
+# The Kompress parity fixtures import `transforms::kompress`, which only exists
+# with the `ml` feature. Gate the target so `--no-default-features --tests`
+# builds the remaining integration tests without it.
+[[test]]
+name = "kompress_parity"
+path = "tests/kompress_parity.rs"
+required-features = ["ml"]
+
+# The code-compressor parity fixtures import `transforms::code_compressor`,
+# which only exists when the `code` feature is enabled (it pulls in the
+# tree-sitter grammar crates). Gate the target the same way so
+# `--no-default-features --tests` builds the remaining integration tests
+# without it.
+[[test]]
+name = "code_compressor_parity"
+path = "tests/code_compressor_parity.rs"
+required-features = ["code"]
 
 [[bench]]
 name = "tokenizer"

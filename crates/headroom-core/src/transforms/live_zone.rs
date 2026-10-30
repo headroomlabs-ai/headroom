@@ -109,6 +109,7 @@ use serde_json::value::RawValue;
 use serde_json::Value;
 use thiserror::Error;
 
+#[cfg(feature = "code")]
 use super::code_compressor::{CodeAwareCompressor, CodeCompressorConfig};
 use super::content_detector::{detect_content_type, ContentType};
 use super::diff_compressor::{DiffCompressor, DiffCompressorConfig};
@@ -131,6 +132,7 @@ const STRATEGY_SEARCH_COMPRESSOR: &str = "search_compressor";
 /// Strategy tag emitted when DiffCompressor rewrote a unified-diff block.
 const STRATEGY_DIFF_COMPRESSOR: &str = "diff_compressor";
 /// Strategy tag emitted when CodeAwareCompressor rewrote a source-code block.
+#[cfg(feature = "code")]
 const STRATEGY_CODE_COMPRESSOR: &str = "code_compressor";
 /// Strategy tag emitted when Kompress rewrote a plain-text block (also
 /// used by the SourceCode arm's passthrough fallback — see
@@ -583,6 +585,7 @@ fn diff_compressor() -> &'static DiffCompressor {
     INSTANCE.get_or_init(|| DiffCompressor::new(DiffCompressorConfig::default()))
 }
 
+#[cfg(feature = "code")]
 fn code_compressor() -> &'static CodeAwareCompressor {
     static INSTANCE: OnceLock<CodeAwareCompressor> = OnceLock::new();
     INSTANCE.get_or_init(|| CodeAwareCompressor::new(CodeCompressorConfig::default()))
@@ -746,6 +749,7 @@ pub fn warm_live_zone_compressors() -> bool {
     let _ = log_compressor();
     let _ = search_compressor();
     let _ = diff_compressor();
+    #[cfg(feature = "code")]
     let _ = code_compressor();
     warm_kompress_blocking()
 }
@@ -1704,16 +1708,17 @@ fn dispatch_compressor(text: &str, content_type: ContentType) -> DispatchResult 
                 compressed: result.compressed,
             }
         }
-        // Routes to the tree-sitter-backed CodeAwareCompressor (PR-B4).
-        // The compressor fails open internally (re-parse-and-revert on
-        // syntax errors, a min-token floor, and a compression-ratio
-        // guard), so this arm only has to compare its output against
-        // the input; the tokenizer-rejection gate in
-        // `compress_one_block` applies on top of that. When the code
-        // compressor doesn't shrink the block (e.g. it's already
-        // dense, or tree-sitter reverted on a parse error), fall back
-        // to Kompress rather than giving up — mirrors the Python
-        // router's no-shrink → Kompress fallback.
+        // Routes to the tree-sitter-backed CodeAwareCompressor (PR-B4) when
+        // the `code` feature is compiled in. The compressor fails open
+        // internally (re-parse-and-revert on syntax errors, a min-token
+        // floor, and a compression-ratio guard), so this arm only has to
+        // compare its output against the input; the tokenizer-rejection
+        // gate in `compress_one_block` applies on top of that. When the
+        // code compressor doesn't shrink the block (e.g. it's already
+        // dense, or tree-sitter reverted on a parse error), fall back to
+        // Kompress rather than giving up — mirrors the Python router's
+        // no-shrink → Kompress fallback.
+        #[cfg(feature = "code")]
         ContentType::SourceCode => {
             let result = code_compressor().compress(text);
             if result.compressed == text {
@@ -1730,6 +1735,10 @@ fn dispatch_compressor(text: &str, content_type: ContentType) -> DispatchResult 
                 compressed: result.compressed,
             }
         }
+        // Without the `code` feature there is no AST compressor; use the
+        // same Kompress/no-op fallback as the passthrough path above.
+        #[cfg(not(feature = "code"))]
+        ContentType::SourceCode => kompress_or_noop(text, content_type),
         // Cache-only EXTRACTIVE prose compressor (PR-B4): Kompress drops
         // low-salience words and rejoins on single spaces — lossy by
         // design. `kompress_or_noop` degrades to a deterministic no-op
