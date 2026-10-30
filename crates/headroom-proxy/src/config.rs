@@ -893,9 +893,9 @@ fn default_stats_path() -> Option<std::path::PathBuf> {
             // `workspace_dir()` semantics (its tests pin
             // `HEADROOM_WORKSPACE_DIR=~/custom` → `$HOME/custom`).
             let expanded = if let Some(rest) = dir.strip_prefix("~/") {
-                match home_dir() {
-                    Some(home) => home.join(rest),
-                    None => return None,
+                {
+                    let home = home_dir()?;
+                    home.join(rest)
                 }
             } else {
                 std::path::PathBuf::from(dir)
