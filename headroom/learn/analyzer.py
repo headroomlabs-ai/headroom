@@ -1099,14 +1099,14 @@ def _call_llm(
     pin_litellm_cost_map_local()
     import litellm
 
+    from headroom.providers.litellm import completion_api_base_for_model
+
     # Suppress LiteLLM's verbose logging
     litellm.suppress_debug_info = True
 
     # For Anthropic models, bypass ANTHROPIC_BASE_URL which may point to
     # the user's local headroom proxy
-    api_base = None
-    if model.startswith("claude"):
-        api_base = "https://api.anthropic.com"
+    api_base = completion_api_base_for_model(model)
 
     response = litellm.completion(
         model=model,
@@ -1181,7 +1181,7 @@ def _safe_int(val: object) -> int:
     """Safely convert a value to int."""
     if isinstance(val, int):
         return val
-    if isinstance(val, (float, str)):
+    if isinstance(val, float | str):
         try:
             return int(val)
         except (ValueError, TypeError):
