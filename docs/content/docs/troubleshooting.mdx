@@ -224,7 +224,34 @@ See [issue #746](https://github.com/headroomlabs-ai/headroom/issues/746) for the
 
 Note that Remote Control does **not** honor `_CLAUDE_CODE_ASSUME_FIRST_PARTY_BASE_URL`, the flag that re-enables the 1M window and on-demand tool loading — it reads the base URL directly. Headroom cannot re-enable Remote Control from the server side the way `--1m` restores the `context-1m` beta header, because the eligibility decision and the bridge connection both happen in the client.
 
-**Fix**: Launch Claude directly, without `ANTHROPIC_BASE_URL`, for sessions that need Remote Control, and use Headroom for the rest.
+**Fix**: Either launch Claude directly, without `ANTHROPIC_BASE_URL`, for sessions that need Remote Control and use Headroom for the rest, or keep both with the [HTTPS proxy route](#keep-remote-control-with-the-https-proxy-route) below.
+
+### Keep Remote Control with the HTTPS proxy route
+
+Leave `ANTHROPIC_BASE_URL` unset, so the host check passes, and reach Headroom through `HTTPS_PROXY` instead — the [enterprise proxy path](https://code.claude.com/docs/en/network-config) Claude Code supports. A local [mitmproxy](https://mitmproxy.org/) decrypts `api.anthropic.com` only, with its CA trusted through `NODE_EXTRA_CA_CERTS`, and an addon hands the `/v1/messages*` calls to Headroom. Every other host, including `claude.ai` where the Remote Control bridge lives, stays a raw tunnel, and subscription auth is untouched.
+
+```bash
+mitmdump --listen-host 127.0.0.1 --listen-port 8790 \
+  --allow-hosts '^api\.anthropic\.com(:443)?$' \
+  -s examples/claude_code_remote_control/route_to_headroom.py
+```
+
+```json
+{
+  "env": {
+    "HTTPS_PROXY": "http://127.0.0.1:8790",
+    "NO_PROXY": "localhost,127.0.0.1,::1",
+    "NODE_EXTRA_CA_CERTS": "/Users/you/.mitmproxy/mitmproxy-ca-cert.pem"
+  },
+  "remoteControlAtStartup": true
+}
+```
+
+<Callout type="warning" title="Start Headroom without the proxy variables">
+  Headroom's upstream client honours `HTTPS_PROXY`. When the Headroom proxy is started by a Claude Code hook (`headroom init hook ensure`), it inherits Claude Code's environment, so its own upstream calls would come back through mitmproxy. Prefix those hook commands with `env -u HTTPS_PROXY -u HTTP_PROXY -u NODE_EXTRA_CA_CERTS`. The addon also marks the requests it redirects, so a second pass goes straight to Anthropic instead of looping.
+</Callout>
+
+Full setup, verification steps, caveats and rollback: [`examples/claude_code_remote_control`](https://github.com/headroomlabs-ai/headroom/tree/main/examples/claude_code_remote_control).
 
 ### Why the Unix socket route does not help
 
@@ -254,7 +281,7 @@ authToken, credentials, config, or profile to be set.
 
 No proxy-side change can repair this: the eligibility decision happens in the client before any request is made.
 
-**What remains**: a transport that leaves `ANTHROPIC_BASE_URL` unset and does not set `ANTHROPIC_UNIX_SOCKET` — an `HTTPS_PROXY` CONNECT/MITM front end with a locally-generated CA trusted through `NODE_EXTRA_CA_CERTS`. That keeps the host genuinely `api.anthropic.com` and leaves subscription auth untouched. It is tracked on [issue #1779](https://github.com/headroomlabs-ai/headroom/issues/1779); `headroom proxy --uds` is still useful as a transport, just not for this.
+**What remains**: a transport that leaves `ANTHROPIC_BASE_URL` unset and does not set `ANTHROPIC_UNIX_SOCKET` — an `HTTPS_PROXY` CONNECT/MITM front end with a locally-generated CA trusted through `NODE_EXTRA_CA_CERTS`. That keeps the host genuinely `api.anthropic.com` and leaves subscription auth untouched: see [Keep Remote Control with the HTTPS proxy route](#keep-remote-control-with-the-https-proxy-route) ([issue #1779](https://github.com/headroomlabs-ai/headroom/issues/1779)). `headroom proxy --uds` is still useful as a transport, just not for this.
 
 The upstream request to allow loopback proxies is tracked at [anthropics/claude-code#76653](https://github.com/anthropics/claude-code/issues/76653).
 

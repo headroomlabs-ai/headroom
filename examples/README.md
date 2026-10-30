@@ -88,6 +88,19 @@ PYTHONPATH=. python -m examples.langchain_demo.run_comparison
 
 See [langchain_demo/README.md](langchain_demo/README.md) for details.
 
+### claude_code_remote_control/
+
+Keep Claude Code's Remote Control while routing through Headroom: `ANTHROPIC_BASE_URL`
+stays unset and a local mitmproxy addon hands `/v1/messages` to Headroom via `HTTPS_PROXY`:
+
+```bash
+mitmdump --listen-host 127.0.0.1 --listen-port 8790 \
+  --allow-hosts '^api\.anthropic\.com(:443)?$' \
+  -s examples/claude_code_remote_control/route_to_headroom.py
+```
+
+See [claude_code_remote_control/README.md](claude_code_remote_control/README.md) for the Claude Code settings.
+
 ### mcp_demo/
 
 MCP (Model Context Protocol) integration demo:
