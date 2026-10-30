@@ -93,6 +93,10 @@ RUN npm install -g --no-fund --no-audit npm@11.16.0
 COPY e2e/wrap/tools/package.json e2e/wrap/tools/package-lock.json /opt/wrap-tools/
 RUN npm ci --prefix /opt/wrap-tools --no-fund --no-audit
 
+# Exercise the installed dependency fixes in both existing wrap-E2E CI callers.
+COPY e2e/wrap/tools/dependency-regression.test.cjs /opt/wrap-tools/
+RUN npm test --prefix /opt/wrap-tools
+
 WORKDIR /workspace
 
 # Bring in the prebuilt manylinux wheel from stage 1.

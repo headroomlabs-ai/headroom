@@ -2004,7 +2004,12 @@ class HeadroomProxy(
         if raw not in ("1", "true", "yes", "on"):
             import platform
 
-            libc, version = platform.libc_ver()
+            try:
+                libc, version = platform.libc_ver()
+            except OSError:
+                # libc_ver() reads sys.executable; Microsoft Store Python's
+                # python.exe is an app-execution alias that can't be opened.
+                libc, version = "", ""
             if libc == "glibc":
                 try:
                     major, minor = (int(part) for part in version.split(".")[:2])
