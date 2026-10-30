@@ -256,22 +256,24 @@
           "tests": [
             "tests/test_toin.py",
             "tests/test_proxy_ccr.py",
-            "tests/test_compression_policy_toin_gate.py"
+            "tests/test_compression_policy_toin_gate.py",
+            "crates/headroom-core/tests/live_zone_recommendations.rs"
           ]
         },
         "macos": {
-          "status": "partial",
+          "status": "covered",
           "tests": [
             "tests/test_toin.py",
-            "tests/test_compression_policy_toin_gate.py"
-          ],
-          "gap": "Native end-to-end verification of served recommendations is still needed."
+            "tests/test_compression_policy_toin_gate.py",
+            "crates/headroom-core/tests/live_zone_recommendations.rs"
+          ]
         },
         "windows": {
           "status": "partial",
           "tests": [
             "tests/test_toin.py",
-            "tests/test_compression_policy_toin_gate.py"
+            "tests/test_compression_policy_toin_gate.py",
+            "crates/headroom-core/tests/live_zone_recommendations.rs"
           ],
           "gap": "Native end-to-end verification is blocked by Windows wheel availability."
         }

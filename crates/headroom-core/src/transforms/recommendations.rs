@@ -15,11 +15,10 @@
 //! 3. At startup, [`RecommendationStore::load_default`] reads the file
 //!    once and exposes the recommendations via a process-wide
 //!    [`OnceLock`].
-//! 4. [`get`] / [`RecommendationStore::lookup`] return the row matching
-//!    `(auth_mode, model_family, structure_hash)`, or `None` when no
-//!    advice was published. The dispatcher (PR-B3's
-//!    `dispatch_compressor`) does **not** consume this surface yet —
-//!    PR-F3 is responsible for wiring it.
+//! 4. Native live-zone dispatch computes the same structural signature,
+//!    resolves the request's tenant/model slice (with legacy `unknown`
+//!    fallback), and preserves the original block when published retrieval
+//!    evidence recommends skipping compression.
 //!
 //! # File schema
 //!
@@ -47,6 +46,10 @@ use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
 use serde::Deserialize;
+use serde_json::Value;
+use sha2::{Digest, Sha256};
+
+use super::content_detector::ContentType;
 
 /// Environment variable that overrides the default `recommendations.toml`
 /// path. The Rust proxy reads it once at startup; runtime changes do
@@ -139,6 +142,33 @@ impl RecommendationStore {
         self.by_key.get(&key)
     }
 
+    /// Look up advice for a live request, falling back to the legacy
+    /// `unknown` slices populated by observation call sites that predate
+    /// auth/model plumbing. Specific tenant rows always win.
+    pub fn lookup_for_request(
+        &self,
+        auth_mode: AuthMode,
+        model: &str,
+        structure_hash: &str,
+    ) -> Option<&Recommendation> {
+        let mut model_candidates = vec![model.to_ascii_lowercase()];
+        if let Some(family) = model_family(model) {
+            if !model_candidates.iter().any(|candidate| candidate == family) {
+                model_candidates.push(family.to_string());
+            }
+        }
+        model_candidates.push("unknown".to_string());
+
+        for mode in [auth_mode, AuthMode::Unknown] {
+            for candidate in &model_candidates {
+                if let Some(row) = self.lookup(mode, candidate, structure_hash) {
+                    return Some(row);
+                }
+            }
+        }
+        None
+    }
+
     /// Parse a TOML string into a [`RecommendationStore`].
     pub fn from_toml_str(s: &str) -> Result<Self, RecommendationsError> {
         let parsed: RecommendationFile = toml::from_str(s).map_err(RecommendationsError::Parse)?;
@@ -211,6 +241,137 @@ impl RecommendationStore {
     }
 }
 
+/// Reproduce Python `ToolSignature` hashes for content entering native dispatch.
+/// These hashes are the cross-language join key in `recommendations.toml`.
+pub fn structure_hash(content_type: ContentType, text: &str) -> Option<String> {
+    if content_type == ContentType::JsonArray {
+        return json_array_structure_hash(text);
+    }
+
+    let strategy = match content_type {
+        ContentType::BuildOutput => "log",
+        ContentType::SearchResults => "search",
+        ContentType::GitDiff => "diff",
+        ContentType::SourceCode => "code_aware",
+        ContentType::PlainText => "text",
+        ContentType::Html => "html",
+        ContentType::JsonArray => unreachable!(),
+    };
+    let sample: String = text.chars().take(100).collect();
+    let hint = sha256_prefix(sample.as_bytes(), 8);
+    Some(sha256_prefix(
+        format!("content:{strategy}:{hint}").as_bytes(),
+        24,
+    ))
+}
+
+fn json_array_structure_hash(text: &str) -> Option<String> {
+    let Value::Array(items) = serde_json::from_str(text).ok()? else {
+        return None;
+    };
+    let mut fields: std::collections::BTreeMap<String, std::collections::HashSet<&'static str>> =
+        std::collections::BTreeMap::new();
+    for item in items.iter().take(5) {
+        let Value::Object(object) = item else {
+            continue;
+        };
+        for (key, value) in object {
+            let value_type = match value {
+                Value::String(_) => "string",
+                Value::Bool(_) => "boolean",
+                Value::Number(_) => "numeric",
+                Value::Array(_) => "array",
+                Value::Object(_) => "object",
+                Value::Null => "null",
+            };
+            fields.entry(key.clone()).or_default().insert(value_type);
+        }
+    }
+    if fields.is_empty() {
+        return None;
+    }
+
+    let mut canonical = String::from("[");
+    for (index, (key, types)) in fields.iter().enumerate() {
+        if index > 0 {
+            canonical.push_str(", ");
+        }
+        let non_null: Vec<_> = types
+            .iter()
+            .copied()
+            .filter(|kind| *kind != "null")
+            .collect();
+        let selected = if non_null.len() == 1 {
+            non_null[0]
+        } else if non_null.len() > 1 {
+            ["object", "array", "string", "numeric", "boolean"]
+                .into_iter()
+                .find(|kind| types.contains(kind))
+                .unwrap_or("mixed")
+        } else {
+            "null"
+        };
+        canonical.push('[');
+        canonical.push_str(&python_json_string(key));
+        canonical.push_str(", ");
+        canonical.push_str(&python_json_string(selected));
+        canonical.push(']');
+    }
+    canonical.push(']');
+    Some(sha256_prefix(canonical.as_bytes(), 24))
+}
+
+fn python_json_string(value: &str) -> String {
+    let mut out = String::from("\"");
+    for ch in value.chars() {
+        match ch {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\u{08}' => out.push_str("\\b"),
+            '\u{0c}' => out.push_str("\\f"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            ch if ch.is_ascii() && !ch.is_control() => out.push(ch),
+            ch if (ch as u32) <= 0xffff => out.push_str(&format!("\\u{:04x}", ch as u32)),
+            ch => {
+                let code = ch as u32 - 0x1_0000;
+                let high = 0xd800 + (code >> 10);
+                let low = 0xdc00 + (code & 0x3ff);
+                out.push_str(&format!("\\u{high:04x}\\u{low:04x}"));
+            }
+        }
+    }
+    out.push('"');
+    out
+}
+
+fn sha256_prefix(bytes: &[u8], chars: usize) -> String {
+    let digest = Sha256::digest(bytes);
+    let mut hex = String::with_capacity(digest.len() * 2);
+    for byte in digest {
+        use std::fmt::Write as _;
+        let _ = write!(&mut hex, "{byte:02x}");
+    }
+    hex[..chars].to_string()
+}
+
+fn model_family(model: &str) -> Option<&'static str> {
+    let model = model.to_ascii_lowercase();
+    [
+        "claude-3-5",
+        "claude-3-7",
+        "gpt-4o",
+        "gpt-4-turbo",
+        "gpt-4",
+        "gpt-3.5",
+        "o1",
+        "o3",
+    ]
+    .into_iter()
+    .find(|family| model.contains(family))
+}
+
 /// Process-wide store populated at first call to [`load_default`].
 static GLOBAL: OnceLock<RecommendationStore> = OnceLock::new();
 
@@ -232,9 +393,9 @@ pub fn load_default() -> &'static RecommendationStore {
     GLOBAL.get_or_init(|| RecommendationStore::load_or_empty(default_path()))
 }
 
-/// Module-level convenience: look up a recommendation in the global
-/// store. PR-F3 will wire this into `dispatch_compressor`. PR-B5 only
-/// exposes the API surface.
+/// Module-level convenience: look up an exact recommendation in the global
+/// store. Live dispatch uses [`RecommendationStore::lookup_for_request`] to
+/// include model-family and legacy-slice fallbacks.
 pub fn get(
     auth_mode: AuthMode,
     model: &str,
@@ -324,6 +485,54 @@ observations = 60
         let store = RecommendationStore::empty();
         assert!(store.is_empty());
         assert!(store.lookup(AuthMode::Payg, "claude-3-5", "any").is_none());
+    }
+
+    #[test]
+    fn structure_hash_matches_python_for_mixed_unicode_json_fields() {
+        let text = r#"[
+            {"name":"alpha","score":1,"active":true,"meta":{"x":1},"tags":["a"],"note":null},
+            {"name":"beta","score":"mixed","active":false,"meta":null,"tags":[],"emoji😀":"ok"}
+        ]"#;
+        assert_eq!(
+            structure_hash(ContentType::JsonArray, text).as_deref(),
+            Some("a42541935d69f0fc3f21ca9d")
+        );
+    }
+
+    #[test]
+    fn request_lookup_prefers_specific_slice_then_legacy_unknown() {
+        let store = RecommendationStore::from_toml_str(
+            r#"
+[[recommendation]]
+auth_mode = "unknown"
+model_family = "unknown"
+structure_hash = "shape"
+skip_compression_recommended = true
+strategy_hint = "skip_compression"
+confidence = 0.8
+observations = 80
+
+[[recommendation]]
+auth_mode = "payg"
+model_family = "claude-3-5"
+structure_hash = "shape"
+skip_compression_recommended = false
+strategy_hint = "smart_crusher"
+confidence = 0.9
+observations = 90
+"#,
+        )
+        .expect("recommendations parse");
+
+        let specific = store
+            .lookup_for_request(AuthMode::Payg, "claude-3-5-sonnet-20241022", "shape")
+            .expect("family-specific row");
+        assert!(!specific.skip_compression_recommended);
+
+        let legacy = store
+            .lookup_for_request(AuthMode::OAuth, "claude-opus-4-1", "shape")
+            .expect("legacy fallback row");
+        assert!(legacy.skip_compression_recommended);
     }
 
     #[test]
