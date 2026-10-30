@@ -231,23 +231,7 @@ def test_astgrep_flags_truncated_read(tokenizer):
         "showing lines 1-42 of 90 total (26031 tokens, cap 25000). "
         "Call Read with offset=43 to see more.]\n"
     )
-    messages = [
-        {
-            "role": "assistant",
-            "content": [
-                {
-                    "type": "tool_use",
-                    "id": "abc",
-                    "name": "Read",
-                    "input": {"file_path": "/repo/payments.py"},
-                }
-            ],
-        },
-        {
-            "role": "user",
-            "content": [{"type": "tool_result", "tool_use_id": "abc", "content": truncated_source}],
-        },
-    ]
+    messages = _read_result_messages(truncated_source)
     result = apply_to_messages(messages, tokenizer)
     assert len(result.spans) == 1
     new_content = result.messages[1]["content"][0]["content"]
@@ -350,6 +334,38 @@ def test_astgrep_accepts_truncation_at_start_equals_end(tokenizer):
     result = apply_to_messages(messages, tokenizer)
     new_content = result.messages[1]["content"][0]["content"]
     assert "truncated upstream" in new_content
+    assert "showing through line 42 of 90 total" in new_content
+
+
+def test_astgrep_flags_truncated_read_offset_window(tokenizer):
+    """A legitimate offset read (not starting at line 1) must still be
+    recognized -- window length, not the absolute end index, is what's
+    checked against the visible payload."""
+    truncated_source = (
+        _PY_FIXTURE + "\n\n[Truncated: PARTIAL view — /repo/payments.py: "
+        "showing lines 100-148 of 300 total (26031 tokens, cap 25000). "
+        "Call Read with offset=149 to see more.]\n"
+    )
+    messages = _read_result_messages(truncated_source)
+    result = apply_to_messages(messages, tokenizer)
+    new_content = result.messages[1]["content"][0]["content"]
+    assert "truncated upstream" in new_content
+    assert "showing through line 148 of 300 total" in new_content
+
+
+def test_astgrep_ignores_offset_window_exceeding_visible_payload(tokenizer):
+    """An offset window is still checked for plausibility -- a claimed
+    window far longer than what's actually visible must not trigger."""
+    truncated_source = (
+        _PY_FIXTURE + "\n\n[Truncated: PARTIAL view — /repo/payments.py: "
+        "showing lines 100-5148 of 9999 total (26031 tokens, cap 25000). "
+        "Call Read with offset=5149 to see more.]\n"
+    )
+    messages = _read_result_messages(truncated_source)
+    result = apply_to_messages(messages, tokenizer)
+    new_content = result.messages[1]["content"][0]["content"]
+    assert "outlined by ast-grep" in new_content
+    assert "truncated upstream" not in new_content
 
 
 # -------- Disk verification: client-independent truncation fallback ----- #

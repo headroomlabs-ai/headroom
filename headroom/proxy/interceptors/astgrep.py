@@ -115,7 +115,8 @@ def _is_plausible_truncation_range(
     # end_line == total_lines means the whole file was shown, not truncated.
     if start_line < 1 or end_line < start_line or end_line >= total_lines:
         return False
-    return end_line <= source_line_count
+    window_length = end_line - start_line + 1
+    return window_length <= source_line_count
 
 
 def _detect_truncation(source: str) -> tuple[int, int] | None:
