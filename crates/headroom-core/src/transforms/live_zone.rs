@@ -644,11 +644,18 @@ pub fn kompress_init_runs() -> usize {
 #[cfg(feature = "ml")]
 fn run_kompress_init() {
     KOMPRESS_INIT_RUNS.fetch_add(1, Ordering::Relaxed);
-    let slot = match Kompress::from_cache(KompressConfig::default()) {
-        Ok(k) => k, // None => HF cache cold: deterministic NoOp downstream
-        Err(e) => {
-            tracing::warn!(event = "kompress_init_failed", error = %e);
-            None
+    // Before any `ort` call: unsupported CPU => SIGILL, unpinned loader =>
+    // deadlock. Same guards magika and the embedding scorer run first.
+    let slot = if let Err((reason, error)) = super::kompress::ort_session_preconditions() {
+        tracing::warn!(event = "kompress_init_skipped", reason, error = %error);
+        None
+    } else {
+        match Kompress::from_cache(KompressConfig::default()) {
+            Ok(k) => k, // None => HF cache cold: deterministic NoOp downstream
+            Err(e) => {
+                tracing::warn!(event = "kompress_init_failed", error = %e);
+                None
+            }
         }
     };
     let ready = slot.is_some();

@@ -1,10 +1,10 @@
 //! Shared CPU-capability guard for the precompiled ONNX Runtime binary.
 //!
-//! Both ONNX entry points in this crate — Magika content detection
-//! ([`crate::transforms::magika_detector`]) and the embedding relevance
-//! scorer ([`crate::relevance::EmbeddingScorer`]) — link the same
-//! precompiled ONNX Runtime shipped by `ort-sys` (pulled in via
-//! fastembed's `ort-download-binaries*` feature).
+//! All ONNX entry points in this crate — Magika content detection
+//! ([`crate::transforms::magika_detector`]), the embedding relevance
+//! scorer ([`crate::relevance::EmbeddingScorer`]) and the Kompress
+//! compressor ([`crate::transforms::kompress`]) — load the same
+//! precompiled ONNX Runtime binary at run time (`ort-load-dynamic`).
 //!
 //! On x86/x86_64 that binary contains AVX2-family instructions. Executing
 //! it on a CPU without AVX2 (common inside Docker / QEMU / older cloud VMs)
