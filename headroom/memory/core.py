@@ -13,7 +13,7 @@ from datetime import datetime
 from typing import TYPE_CHECKING, Any
 
 from headroom.memory.config import MemoryConfig
-from headroom.memory.factory import create_memory_system
+from headroom.memory.factory import _adapt_text_search, create_memory_system
 from headroom.memory.models import Memory, ScopeLevel
 from headroom.memory.ports import MemoryFilter, TextFilter, VectorFilter
 
@@ -95,6 +95,7 @@ class HierarchicalMemory:
         self._store = store
         self._vector_index = vector_index
         self._text_index = text_index
+        self._search_text = _adapt_text_search(text_index)
         self._embedder = embedder
         self._cache = cache
         self._config = config or MemoryConfig()
@@ -438,7 +439,7 @@ class HierarchicalMemory:
             limit=limit,
         )
 
-        return await self._text_index.search(text_filter)
+        return await self._search_text(text_filter)
 
     # =========================================================================
     # Memory Updates
