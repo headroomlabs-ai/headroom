@@ -62,6 +62,10 @@ def is_cold_prefix(
             if ttl_fn is None:
                 return False
             ttl = float(ttl_fn())
+        # A request can carry a shorter TTL than the turns that wrote the cache
+        # (Claude Code's idle-compaction request uses the 5m default on a 1h
+        # conversation); the cached prefix lives as long as its longest write.
+        ttl = max(ttl, float(getattr(prefix_tracker, "_cache_ttl_seconds", None) or 0))
     except Exception:
         return False
     return idle > ttl + margin_seconds
