@@ -57,14 +57,19 @@ export async function compress(
   const proxyMessages = native ? processedMessages : toOpenAI(processedMessages);
 
   // 4. Compute biases
-  let biases: Record<number, number> = {};
+  let biases: Record<number, number> | undefined;
   if (hooks) {
     biases = await hooks.computeBiases(proxyMessages, ctx);
   }
 
   // 5. Compress via proxy
   const client = providedClient ?? new HeadroomClient(clientOptions);
-  const result = await client.compress(proxyMessages, { model, tokenBudget, config });
+  const result = await client.compress(proxyMessages, {
+    model,
+    tokenBudget,
+    ...(biases !== undefined ? { biases } : {}),
+    config,
+  });
 
   // 6. Convert compressed messages back to original format
   const outputMessages = native ? result.messages : fromOpenAI(result.messages, inputFormat);

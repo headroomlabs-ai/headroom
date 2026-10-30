@@ -11,12 +11,12 @@ import type {
   OpenAIMessage,
   CompressOptions,
   CompressResult,
+  ClientCompressOptions,
   HeadroomClientOptions,
   HeadroomClientInterface,
   ProxyCompressResponse,
   ProxyErrorResponse,
 } from "../src/types.js";
-import type { CompressRequestConfig } from "../src/types/config.js";
 import {
   HeadroomError,
   HeadroomConnectionError,
@@ -179,7 +179,7 @@ describe("HeadroomClientInterface", () => {
     expectTypeOf<HeadroomClientInterface["compress"]>().parameters.toEqualTypeOf<
       [
         OpenAIMessage[],
-        ({ model?: string; tokenBudget?: number; config?: CompressRequestConfig } | undefined)?,
+        (ClientCompressOptions | undefined)?,
       ]
     >();
   });
