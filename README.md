@@ -124,12 +124,12 @@ print(f"Saved {result.tokens_saved} tokens ({result.compression_ratio:.0%})")
 ```
 
 Launch a wrapped agent session each time, so the setup runs. `headroom wrap`
-starts a local proxy, installs **[Serena](https://github.com/oraios/serena)** for
-semantic code navigation, and launches the agent configured to route through
-Headroom. For Claude Code, Serena is registered for the wrapped project only
-(as a `local`-scope MCP server in `~/.claude.json`). Use
-`--code-memory-scope user` to make it available in every project, or
-`--code-memory none` to skip it. `headroom unwrap` removes either registration.
+starts a local proxy and launches the agent configured to route through
+Headroom. Add `--code-memory serena` to also install
+**[Serena](https://github.com/oraios/serena)** for semantic code navigation (off
+by default). For Claude Code, Serena is registered for the wrapped project only
+(as a `local`-scope MCP server in `~/.claude.json`); use `--code-memory-scope user`
+to make it available in every project. `headroom unwrap` removes either registration.
 
 The `headroom` CLI ships only in the PyPI package. The npm `headroom-ai` package
 is the TypeScript SDK — a library you import
@@ -668,7 +668,7 @@ framework, and is reversible.
 Headroom is the proxy, and it compresses everything flowing through it whatever
 sits upstream. Our recommended companion is
 **[Serena](https://github.com/oraios/serena)** for semantic code navigation,
-installed by default when you wrap an agent, plus **Ponytail** if you want leaner
+installed with `headroom wrap --code-memory serena`, plus **Ponytail** if you want leaner
 model output. Everything else is your call — attach a code-memory MCP, Graphify,
 Caveman, or any other MCP server, and Headroom compresses downstream of all of it.
 

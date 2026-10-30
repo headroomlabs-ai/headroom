@@ -1114,7 +1114,7 @@ _serena_instructions_option = click.option(
 
 
 # --- Code-memory MCP selection ------------------------------------------------
-# The code-memory MCP is Serena by default; turn it off with --code-memory none.
+# No code-memory MCP is registered by default; opt into Serena with --code-memory serena.
 # Selection flows through HEADROOM_CODE_MEMORY (set by the eager --code-memory
 # callback) so it works the same on every agent without threading a param
 # through each subcommand — the same approach as _serena_instructions_option above.
@@ -1129,10 +1129,10 @@ def _resolve_code_memory(kwargs: dict[str, Any]) -> str:
 
     Precedence: the explicit selector (``--code-memory`` / ``HEADROOM_CODE_MEMORY``)
     wins; otherwise the deprecated ``--serena`` / ``--no-serena`` flags map into
-    it; otherwise the default is ``serena`` — mature, offline, symbol-level code
-    navigation. The retired ``tokensave`` option is accepted gracefully: an
-    explicit ``tokensave`` selector (or the deprecated ``--no-tokensave`` flag)
-    now resolves to Serena.
+    it; otherwise the default is ``none``. Serena adds ~6K tokens of tool
+    definitions to every request where tools are not deferred, plus launch-time
+    indexing, so it is opt-in. The retired ``tokensave`` option is accepted
+    gracefully: an explicit ``tokensave`` selector resolves to Serena.
     """
     env = os.environ.get(_CODE_MEMORY_ENV, "").strip().lower()
     if env == "tokensave":
@@ -1144,9 +1144,9 @@ def _resolve_code_memory(kwargs: dict[str, Any]) -> str:
                 f"{_CODE_MEMORY_ENV} must be one of: {', '.join(sorted(_VALID_CODE_MEMORY))}"
             )
         return env
-    if kwargs.get("no_serena"):
-        return _CODE_MEMORY_NONE
-    return _CODE_MEMORY_SERENA
+    if kwargs.get("serena") and not kwargs.get("no_serena"):
+        return _CODE_MEMORY_SERENA
+    return _CODE_MEMORY_NONE
 
 
 def _code_memory_flag_callback(ctx: Any, param: Any, value: str | None) -> str | None:
@@ -1158,7 +1158,7 @@ def _code_memory_flag_callback(ctx: Any, param: Any, value: str | None) -> str |
     return value
 
 
-# Shared selector applied to code-memory-capable subcommands (claude/codex/grok).
+# Shared selector applied to code-memory-capable subcommands (claude/codex/grok/opencode).
 # ``expose_value=False`` so no subcommand signature changes; it flows purely
 # through HEADROOM_CODE_MEMORY.
 _code_memory_option = click.option(
@@ -1169,7 +1169,7 @@ _code_memory_option = click.option(
     is_eager=True,
     callback=_code_memory_flag_callback,
     help=(
-        "Code-memory MCP to register: 'serena' (default) or 'none'. "
+        "Code-memory MCP to register: 'none' (default) or 'serena'. "
         "Also set by HEADROOM_CODE_MEMORY. Replaces --serena/--no-serena."
     ),
 )
@@ -1252,7 +1252,7 @@ def _legacy_code_memory_options(command: Any) -> Any:
             "--no-tokensave",
             is_flag=True,
             hidden=True,
-            help="Deprecated and ignored: tokensave was retired; Serena is the default code memory.",
+            help="Deprecated and ignored: tokensave was retired.",
         ),
     ):
         command = decorator(command)
@@ -2862,19 +2862,22 @@ def _remove_headroom_installed_serena_mcp(registrar: Any) -> str:
     return "failed"
 
 
-def _disable_serena_mcp(
-    registrar: Any, *, verbose: bool = False, reason: str = "--no-serena"
-) -> None:
+def _disable_serena_mcp(registrar: Any, *, verbose: bool = False, explicit: bool = True) -> None:
     """Actively disable a Headroom-installed Serena entry, not merely skip it.
 
     Serena used to be registered by default, so a prior ``headroom wrap``
     persists a ``serena`` entry into the agent's MCP config; the agent then
     keeps launching Serena on startup. Just *skipping* registration on a later
     run leaves that stale entry in place — so this removes the entry Headroom
-    installed. A user-managed Serena (absent from our ledger) is reported but
-    left untouched. ``reason`` is surfaced in the message (e.g. ``--no-serena``
-    or ``--code-memory none`` when the user opted out).
+    installed. A user-managed Serena (absent from our ledger) is left
+    untouched, and only reported when the user opted out (``explicit``) or
+    asked for ``verbose`` output — otherwise every default wrap would say so.
     """
+    reason = (
+        "--code-memory none / HEADROOM_CODE_MEMORY=none"
+        if explicit
+        else "Serena is now off by default; pass --code-memory serena to keep it"
+    )
     if not registrar.detect():
         if verbose:
             click.echo(f"  Serena MCP: {registrar.display_name} not detected — skipping")
@@ -2890,10 +2893,11 @@ def _disable_serena_mcp(
         click.echo(f"  Removed previously-installed Serena MCP ({reason})")
         click.echo(f"    restart {registrar.display_name} if it was already running")
     elif status == "not_headroom_owned":
-        click.echo(
-            "  Serena MCP is present but user-managed — leaving it in place "
-            "(--no-serena only removes entries Headroom installed)"
-        )
+        if explicit or verbose:
+            click.echo(
+                "  Serena MCP is present but user-managed — leaving it in place "
+                "(Headroom only removes entries it installed)"
+            )
     else:  # "failed"
         click.echo(
             "  Serena MCP: removal failed — remove the 'serena' entry from your MCP config manually"
@@ -2966,13 +2970,18 @@ def _disable_tokensave_mcp(registrar: Any, *, verbose: bool = False) -> None:
         )
 
 
+def _code_memory_opted_out(kwargs: dict[str, Any]) -> bool:
+    """Whether 'none' was chosen explicitly rather than reached by default."""
+    return bool(os.environ.get(_CODE_MEMORY_ENV, "").strip() or kwargs.get("no_serena"))
+
+
 def _setup_coding_compressor(registrar: Any, *, serena_context: str, **kwargs: Any) -> None:
-    """Set up the code-memory MCP, selected via ``--code-memory`` (default serena).
+    """Set up the code-memory MCP, selected via ``--code-memory`` (default none).
 
     Selection (see :func:`_resolve_code_memory`):
 
-    * ``serena`` (default) — register Serena (mature, offline, symbol-level).
-    * ``none`` — register nothing.
+    * ``none`` (default) — register nothing; remove a Serena entry Headroom installed.
+    * ``serena`` — register Serena (offline, symbol-level).
 
     Either way, any Headroom-installed ``tokensave`` entry from a prior release
     is removed (tokensave was retired in favour of Serena). The deprecated
@@ -2987,7 +2996,7 @@ def _setup_coding_compressor(registrar: Any, *, serena_context: str, **kwargs: A
     _disable_tokensave_mcp(registrar, verbose=verbose)
 
     if selection == _CODE_MEMORY_NONE:
-        _disable_serena_mcp(registrar, verbose=verbose, reason="--code-memory none")
+        _disable_serena_mcp(registrar, verbose=verbose, explicit=_code_memory_opted_out(kwargs))
         return
 
     _setup_serena_mcp(registrar, context=serena_context, verbose=verbose, force=force)
@@ -6135,13 +6144,13 @@ def claude(
 
     \b
     Examples:
-        headroom wrap claude                    # Start everything (Serena code memory)
+        headroom wrap claude                    # Start proxy + claude
         headroom wrap claude --memory           # With persistent memory
         headroom wrap claude --resume <id>      # Resume a session
         headroom wrap claude -- -p              # Claude in print mode
         headroom wrap claude --no-mcp           # Skip MCP retrieve tool registration
         headroom wrap claude --project-settings # Persist proxy routing in .claude/settings.local.json
-        headroom wrap claude --code-memory none # No code-memory MCP
+        headroom wrap claude --code-memory serena  # Also register the Serena code-memory MCP
         headroom wrap claude --code-memory-scope user  # Serena in every session, not just here
         headroom wrap claude --1m               # Preserve the 1M context window
     """
@@ -7472,7 +7481,7 @@ def codex(
         headroom wrap codex                         # Start proxy + mcp + codex
         headroom wrap codex -- "fix the bug"        # Pass prompt to codex
         headroom wrap codex --no-mcp                # Skip MCP retrieve tool registration
-        headroom wrap codex --code-memory none      # No code-memory MCP
+        headroom wrap codex --code-memory serena    # Also register the Serena code-memory MCP
         headroom wrap codex --port 9999             # Custom proxy port
         headroom wrap codex --backend anyllm --anyllm-provider groq
     """
@@ -7787,6 +7796,7 @@ def grok(
         headroom wrap grok                         # Start proxy + grok
         headroom wrap grok -- -p "fix the bug"     # Pass prompt to grok
         headroom wrap grok --no-mcp                # Skip MCP retrieve tool registration
+        headroom wrap grok --code-memory serena    # Also register the Serena code-memory MCP
         headroom wrap grok --port 9999             # Custom proxy port
     """
     if not no_mcp:
@@ -8502,7 +8512,13 @@ def openclaw(
 @_serena_instructions_option
 @proxy_port_option()
 @click.option("--no-mcp", is_flag=True, help="Skip headroom MCP server registration")
-@click.option("--no-serena", is_flag=True, help="Skip Serena MCP server registration")
+@_code_memory_option
+@click.option(
+    "--no-serena",
+    is_flag=True,
+    hidden=True,
+    help="Deprecated: Serena is off by default. Register no code-memory MCP.",
+)
 @click.option(
     "--code-graph",
     is_flag=True,
@@ -8565,7 +8581,7 @@ def opencode(
         headroom wrap opencode                         # Start proxy + opencode
         headroom wrap opencode -- "fix the bug"        # Pass prompt to opencode
         headroom wrap opencode --no-mcp                # Skip MCP retrieve tool registration
-        headroom wrap opencode --no-serena             # Skip Serena MCP registration
+        headroom wrap opencode --code-memory serena    # Also register the Serena MCP
         headroom wrap opencode --port 9999             # Custom proxy port
         headroom wrap opencode --backend anyllm --anyllm-provider groq
         headroom wrap opencode --copilot-subscription # Use a GitHub Copilot subscription
@@ -8638,17 +8654,18 @@ def opencode(
     elif verbose:
         click.echo("  Skipping MCP retrieve tool (--no-mcp)")
 
-    if not no_serena:
-        from headroom.mcp_registry import OpencodeRegistrar
+    from headroom.mcp_registry import OpencodeRegistrar
 
-        # Serena ships no "opencode" context (only agent/codex/claude-code/ide/…);
-        # passing --context opencode crashes Serena on launch (#1549/#1572). Use
-        # the generic "agent" context, which OpenCode is.
-        _setup_serena_mcp(OpencodeRegistrar(), context="agent", verbose=verbose, force=True)
-    else:
-        from headroom.mcp_registry import OpencodeRegistrar
-
-        _disable_serena_mcp(OpencodeRegistrar(), verbose=verbose)
+    # Serena ships no "opencode" context (only agent/codex/claude-code/ide/…);
+    # passing --context opencode crashes Serena on launch (#1549/#1572). Use
+    # the generic "agent" context, which OpenCode is.
+    _setup_coding_compressor(
+        OpencodeRegistrar(),
+        serena_context="agent",
+        no_serena=no_serena,
+        verbose=verbose,
+        force=True,
+    )
 
     # Setup memory MCP server for OpenCode (native tool integration)
     if memory:

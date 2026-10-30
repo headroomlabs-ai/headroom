@@ -1,10 +1,10 @@
 """`--no-serena` must actively disable Serena, not merely skip adding it.
 
-Serena is installed by default, so a prior `headroom wrap` persists a
-`serena` MCP entry and the agent keeps launching it (dashboard popup and
-all). These tests pin that a later `--no-serena` removes the entry Headroom
-installed, leaves a user-managed entry alone, and that Codex unwrap also
-removes Serena.
+Earlier releases installed Serena by default, so a prior `headroom wrap`
+persisted a `serena` MCP entry and the agent keeps launching it (dashboard
+popup and all). These tests pin that a later `--no-serena` or a default wrap
+removes the entry Headroom installed, leaves a user-managed entry alone, and
+that Codex unwrap also removes Serena.
 """
 
 from __future__ import annotations
@@ -86,7 +86,7 @@ def test_disable_noop_when_serena_absent(
     wrap_cli._disable_serena_mcp(registrar, verbose=True)
 
     assert registrar.unregistered == []
-    assert "Skipping Serena MCP (--no-serena)" in capsys.readouterr().out
+    assert "Skipping Serena MCP (--code-memory none" in capsys.readouterr().out
 
 
 def test_disable_noop_when_agent_not_detected(
@@ -123,3 +123,34 @@ def test_unwrap_codex_removes_headroom_installed_serena(
     assert result.exit_code == 0, result.output
     assert registrar.unregistered == ["serena"]
     assert "Removed Headroom-installed Serena MCP server from Codex" in result.output
+
+
+def test_default_wrap_removes_headroom_installed_serena_and_says_how_to_keep_it(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # Serena is off by default now: an upgrading user's Headroom-installed entry
+    # is removed on the next wrap, with the way to opt back in.
+    monkeypatch.setenv("HEADROOM_WORKSPACE_DIR", str(tmp_path / ".headroom"))
+    monkeypatch.delenv("HEADROOM_CODE_MEMORY", raising=False)
+    spec = build_serena_spec("claude-code")
+    record_install("claude", spec)
+    registrar = _FakeRegistrar("claude", server=spec)
+
+    wrap_cli._setup_coding_compressor(registrar, serena_context="claude-code")
+
+    assert registrar.unregistered == ["serena"]
+    assert "pass --code-memory serena to keep it" in capsys.readouterr().out
+
+
+def test_default_wrap_leaves_user_managed_serena_silently(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # A Serena the user registered is theirs: kept, and no notice on every wrap.
+    monkeypatch.setenv("HEADROOM_WORKSPACE_DIR", str(tmp_path / ".headroom"))
+    monkeypatch.delenv("HEADROOM_CODE_MEMORY", raising=False)
+    registrar = _FakeRegistrar("claude", server=ServerSpec(name="serena", command="serena"))
+
+    wrap_cli._setup_coding_compressor(registrar, serena_context="claude-code")
+
+    assert registrar.unregistered == []
+    assert "Serena" not in capsys.readouterr().out

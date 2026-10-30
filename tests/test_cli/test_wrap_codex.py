@@ -2040,6 +2040,7 @@ def test_wrap_codex_prepare_only_registers_serena_when_uvx_exists(
     runner: CliRunner, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     _set_test_home(monkeypatch, tmp_path)
+    monkeypatch.setenv("HEADROOM_CODE_MEMORY", "serena")
     config_file = tmp_path / ".codex" / "config.toml"
     config_file.parent.mkdir(parents=True)
 
@@ -2049,7 +2050,7 @@ def test_wrap_codex_prepare_only_registers_serena_when_uvx_exists(
         return None
 
     with patch("headroom.cli.wrap.shutil.which", side_effect=fake_which):
-        # Serena is the code-memory MCP; assert it lands in the codex config.
+        # Serena is opted in; assert it lands in the codex config.
         result = runner.invoke(main, ["wrap", "codex", "--prepare-only"])
 
     assert result.exit_code == 0, result.output

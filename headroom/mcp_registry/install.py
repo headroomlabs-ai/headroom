@@ -54,9 +54,9 @@ def build_serena_spec(context: str) -> ServerSpec:
     """Construct the canonical Serena MCP server spec for an agent context.
 
     ``--open-web-dashboard False`` suppresses Serena's browser popup on
-    startup. Headroom installs Serena by default, so without this flag every
-    wrapped session opens the Serena dashboard tab even for users who never
-    opted into Serena or created a ``~/.serena/serena_config.yml``. The flag
+    startup. Without this flag every session Headroom wraps with Serena
+    opens the Serena dashboard tab, even for users who never created a
+    ``~/.serena/serena_config.yml``. The flag
     overrides Serena's own config at startup (it sets
     ``web_dashboard_open_on_launch=False``), so it works regardless of the
     user's local config. The dashboard backend still runs and remains
