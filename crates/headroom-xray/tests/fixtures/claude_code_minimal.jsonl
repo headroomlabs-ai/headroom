@@ -1,0 +1,5 @@
+{"type":"user","message":{"role":"user","content":[{"type":"text","text":"Please look at the codebase structure and run the tests."}]}}
+{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"toolu_aaa111","name":"Bash","input":{"command":"ls -la /path/to/<redacted>/src/","description":"List source directory"}}]}}
+{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_aaa111","content":"total 64\ndrwxr-xr-x  8 <redacted>  staff   256 Jan  1 00:00 .\ndrwxr-xr-x 12 <redacted>  staff   384 Jan  1 00:00 ..\n-rw-r--r--  1 <redacted>  staff  4096 Jan  1 00:00 lib.rs\n-rw-r--r--  1 <redacted>  staff  2048 Jan  1 00:00 main.rs\ndrwxr-xr-x  3 <redacted>  staff    96 Jan  1 00:00 transforms\n"}]}}
+{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"toolu_bbb222","name":"Read","input":{"file_path":"/path/to/<redacted>/src/lib.rs","limit":50}}]}}
+{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_bbb222","content":"1\t//! Library root.\n2\tpub mod transforms;\n3\tpub mod config;\n4\tpub mod error;\n"}]}}
