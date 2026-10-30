@@ -30,16 +30,18 @@ from __future__ import annotations
 
 import hashlib
 import logging
+import weakref
 from collections import OrderedDict
 from typing import Any
 
 log = logging.getLogger(__name__)
 
-# original-thinking-hash -> compacted text. Deterministic memo so the same
+# (compressor identity, original-thinking-hash) -> (weak reference, compacted text).
+# Deterministic memo so the same
 # thinking always yields the same bytes (cache stability), even if Kompress is
 # nondeterministic. Bounded; ONNX Kompress is deterministic so eviction+recompute
 # is byte-identical anyway. ponytail: crude LRU cap, fine given determinism.
-_COMPACT_CACHE: OrderedDict[str, str] = OrderedDict()
+_COMPACT_CACHE: OrderedDict[tuple[int, str], tuple[weakref.ReferenceType[Any], str]] = OrderedDict()
 _CACHE_CAP = 8192
 
 # Prefix on the emitted text block so the compaction is legible to the model
@@ -77,11 +79,12 @@ def bills_prior_thinking(model: str) -> bool:
 
 def _memo_compact(text: str, kompress: Any) -> str | None:
     """Deterministically compact ``text`` via Kompress; None if no gain/failure."""
-    key = hashlib.sha1(text.encode("utf-8", "replace")).hexdigest()
+    key = (id(kompress), hashlib.sha1(text.encode("utf-8", "replace")).hexdigest())
     cached = _COMPACT_CACHE.get(key)
-    if cached is not None:
+    # Verify identity as well as id: a collected compressor's id may be reused.
+    if cached is not None and cached[0]() is kompress:
         _COMPACT_CACHE.move_to_end(key)
-        return cached
+        return cached[1]
     try:
         # allow_download=False: never block the request thread on a cold model
         # (mirrors the proxy convention in ContentRouter._get_kompress callers).
@@ -92,7 +95,13 @@ def _memo_compact(text: str, kompress: Any) -> str | None:
         return None
     if not isinstance(compacted, str) or not compacted:
         return None
-    _COMPACT_CACHE[key] = compacted
+    try:
+        compressor_ref = weakref.ref(kompress)
+    except TypeError:
+        # Duck-typed compressors need not support weak references. Do not keep
+        # model instances alive just to memoize their output.
+        return compacted
+    _COMPACT_CACHE[key] = (compressor_ref, compacted)
     _COMPACT_CACHE.move_to_end(key)
     while len(_COMPACT_CACHE) > _CACHE_CAP:
         _COMPACT_CACHE.popitem(last=False)
