@@ -129,6 +129,18 @@ def extract_tool_calls_from_messages(
         if not isinstance(msg, Mapping):
             continue
         role = msg.get("role")
+        if role == "user":
+            content = msg.get("content")
+            # Anthropic tool results use the user role but continue the tool loop.
+            if isinstance(content, str) or (
+                isinstance(content, list)
+                and any(
+                    isinstance(block, Mapping) and block.get("type") != "tool_result"
+                    for block in content
+                )
+            ):
+                calls.clear()
+            continue
         if role != "assistant":
             continue
 
@@ -201,10 +213,8 @@ class ToolLoopCircuitBreaker:
         extracted = extract_tool_calls_from_messages(messages)
         with self._lock:
             q = self._get_or_create_queue(session_id)
-            if extracted:
-                # Replace with the latest window from messages
-                q.clear()
-                q.extend(extracted[-self.max_history :])
+            q.clear()
+            q.extend(extracted[-self.max_history :])
             if not q:
                 return None
             return detect_repetition_cycle(q, self.min_repetitions, self.max_period)

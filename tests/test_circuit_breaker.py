@@ -237,6 +237,76 @@ def test_circuit_breaker_check_messages() -> None:
     assert det.count == 3
 
 
+@pytest.mark.parametrize("message_format", ["openai", "anthropic"])
+@pytest.mark.parametrize("keep_history", [False, True])
+def test_circuit_breaker_resets_on_user_intervention(
+    message_format: str, keep_history: bool
+) -> None:
+    cb = ToolLoopCircuitBreaker()
+    messages = [{"role": "user", "content": "inspect the project"}]
+    for index in range(3):
+        if message_format == "anthropic":
+            messages.extend(
+                [
+                    {
+                        "role": "assistant",
+                        "content": [
+                            {
+                                "type": "tool_use",
+                                "id": f"call_{index}",
+                                "name": "view",
+                                "input": {"path": "src/main.py"},
+                            }
+                        ],
+                    },
+                    {
+                        "role": "user",
+                        "content": [
+                            {
+                                "type": "tool_result",
+                                "tool_use_id": f"call_{index}",
+                                "content": "contents",
+                            }
+                        ],
+                    },
+                ]
+            )
+        else:
+            messages.extend(
+                [
+                    {
+                        "role": "assistant",
+                        "tool_calls": [
+                            {
+                                "id": f"call_{index}",
+                                "type": "function",
+                                "function": {
+                                    "name": "view",
+                                    "arguments": '{"path": "src/main.py"}',
+                                },
+                            }
+                        ],
+                    },
+                    {"role": "tool", "tool_call_id": f"call_{index}", "content": "contents"},
+                ]
+            )
+
+    assert cb.check_messages("session", messages) is not None
+    redirect = {
+        "role": "user",
+        "content": (
+            [{"type": "text", "text": "Stop tools and summarize now."}]
+            if message_format == "anthropic"
+            else "Stop tools and summarize now."
+        ),
+    }
+    recovery = [*messages, redirect] if keep_history else [redirect]
+    assert cb.check_messages("session", recovery) is None
+    assert cb.check_session("session") is None
+    assert cb.check_messages("session", [*recovery, *messages[-2:]]) is None
+    assert cb.check_messages("session", messages) is not None
+
+
 def test_proxy_config_circuit_breaker() -> None:
     """Tests ProxyConfig defaults and validation for circuit_breaker mode."""
     from headroom.proxy.models import ProxyConfig
@@ -668,7 +738,8 @@ def test_circuit_breaker_session_eviction_and_unserializable_dict() -> None:
     assert len(h) == 16
 
 
-def test_openai_chat_handler_allows_recovery_after_detected_loop() -> None:
+@pytest.mark.parametrize("recovery_mode", ["different_tool", "user_redirect", "fresh_user"])
+def test_openai_chat_handler_allows_recovery_after_detected_loop(recovery_mode: str) -> None:
     """A client can recover after the circuit breaker rejects a repeated loop."""
     import httpx
     from fastapi.testclient import TestClient
@@ -715,6 +786,7 @@ def test_openai_chat_handler_allows_recovery_after_detected_loop() -> None:
         )
     ) as client:
         client.app.state.proxy._retry_request = _mock_retry
+        client.headers["x-headroom-session-id"] = "recovery-session"
 
         blocked = client.post(
             "/v1/chat/completions",
@@ -728,22 +800,29 @@ def test_openai_chat_handler_allows_recovery_after_detected_loop() -> None:
             headers={"authorization": "******"},
             json={
                 "model": "gpt-4o",
-                "messages": [
-                    *loop_messages,
-                    {
-                        "role": "assistant",
-                        "tool_calls": [
-                            {
-                                "id": "call_4",
-                                "type": "function",
-                                "function": {
-                                    "name": "view",
-                                    "arguments": '{"path": "src/other.py"}',
-                                },
-                            }
-                        ],
-                    },
-                ],
+                "messages": (
+                    [
+                        *loop_messages,
+                        {
+                            "role": "assistant",
+                            "tool_calls": [
+                                {
+                                    "id": "call_4",
+                                    "type": "function",
+                                    "function": {
+                                        "name": "view",
+                                        "arguments": '{"path": "src/other.py"}',
+                                    },
+                                }
+                            ],
+                        },
+                    ]
+                    if recovery_mode == "different_tool"
+                    else [
+                        *(loop_messages if recovery_mode == "user_redirect" else []),
+                        {"role": "user", "content": "Stop tools and summarize now."},
+                    ]
+                ),
             },
         )
         assert recovered.status_code == 200
