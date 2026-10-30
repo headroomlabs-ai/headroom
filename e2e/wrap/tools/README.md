@@ -17,10 +17,17 @@ OpenClaw version no longer supports Node 22):
 cd e2e/wrap/tools
 npm install --package-lock-only --no-fund --no-audit
 npm ci --no-fund --no-audit
+npm test
 cd ../../..
 docker build -f e2e/wrap/Dockerfile -t headroom-wrap-e2e .
 docker run --rm headroom-wrap-e2e
 ```
+
+`npm test` runs the Ajv URI and Express body-parser regression checks against
+the installed locked dependencies. The Dockerfile runs the same command from
+`/opt/wrap-tools` after `npm ci`, so failures stop the image build in both the
+existing Wrap E2E workflow and CI's Docker-native wrap E2E job. Their path
+filters include `e2e/**`, covering dependency and regression-test updates.
 
 To intentionally refresh transitive versions without changing the pinned CLI
 versions, use `npm update --package-lock-only --no-fund --no-audit` in this

@@ -67,6 +67,19 @@ def test_skipped_on_the_glibc_family_that_crashes(monkeypatch: pytest.MonkeyPatc
     assert not kompress.preloaded.wait(0.2)
 
 
+def test_unreadable_interpreter_does_not_fail_startup(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Microsoft Store Python's python.exe can't be opened, so libc_ver() raises."""
+
+    def _raise() -> tuple[str, str]:
+        raise OSError(22, "Invalid argument")
+
+    monkeypatch.setattr("platform.libc_ver", _raise)
+    monkeypatch.delenv("PYTEST_CURRENT_TEST", raising=False)
+    kompress = _Kompress()
+    assert HeadroomProxy._start_kompress_background_warmup(_proxy_with(kompress)) is True
+    assert kompress.preloaded.wait(5)
+
+
 def test_env_switch_wins_both_ways(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr("platform.libc_ver", lambda: ("glibc", "2.17"))
     monkeypatch.setenv("HEADROOM_KOMPRESS_WARMUP", "1")
