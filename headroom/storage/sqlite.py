@@ -13,7 +13,6 @@ from ..config import RequestMetrics
 from ..utils import format_timestamp, parse_timestamp
 from .base import Storage
 
-
 # Cache optimizer metric columns, shared by the CREATE TABLE schema, the
 # legacy-database migration, save() and _row_to_metrics().
 _CACHE_OPTIMIZER_COLUMNS: tuple[tuple[str, str], ...] = (
@@ -46,59 +45,76 @@ class SQLiteStorage(Storage):
         path = Path(self.db_path)
         path.parent.mkdir(parents=True, exist_ok=True)
 
-        conn = sqlite3.connect(self.db_path)
+        # isolation_level=None so we can take an explicit reserved lock with
+        # BEGIN IMMEDIATE rather than a deferred transaction that still lets
+        # another constructor read the old schema.
+        conn = sqlite3.connect(self.db_path, isolation_level=None, timeout=30.0)
         try:
             cursor = conn.cursor()
-            cursor.execute("""
-                CREATE TABLE IF NOT EXISTS requests (
-                    id TEXT PRIMARY KEY,
-                    timestamp TEXT NOT NULL,
-                    model TEXT NOT NULL,
-                    stream INTEGER NOT NULL,
-                    mode TEXT NOT NULL,
-                    tokens_input_before INTEGER NOT NULL,
-                    tokens_input_after INTEGER NOT NULL,
-                    tokens_output INTEGER,
-                    block_breakdown TEXT NOT NULL,
-                    waste_signals TEXT NOT NULL,
-                    stable_prefix_hash TEXT,
-                    cache_alignment_score REAL,
-                    cached_tokens INTEGER,
-                    cache_optimizer_used TEXT,
-                    cache_optimizer_strategy TEXT,
-                    cacheable_tokens INTEGER DEFAULT 0,
-                    breakpoints_inserted INTEGER DEFAULT 0,
-                    estimated_cache_hit INTEGER DEFAULT 0,
-                    estimated_savings_percent REAL DEFAULT 0.0,
-                    semantic_cache_hit INTEGER DEFAULT 0,
-                    transforms_applied TEXT NOT NULL,
-                    tool_units_dropped INTEGER DEFAULT 0,
-                    turns_dropped INTEGER DEFAULT 0,
-                    messages_hash TEXT,
-                    error TEXT
-                )
-            """)
+            cursor.execute("BEGIN IMMEDIATE")
+            try:
+                cursor.execute("""
+                    CREATE TABLE IF NOT EXISTS requests (
+                        id TEXT PRIMARY KEY,
+                        timestamp TEXT NOT NULL,
+                        model TEXT NOT NULL,
+                        stream INTEGER NOT NULL,
+                        mode TEXT NOT NULL,
+                        tokens_input_before INTEGER NOT NULL,
+                        tokens_input_after INTEGER NOT NULL,
+                        tokens_output INTEGER,
+                        block_breakdown TEXT NOT NULL,
+                        waste_signals TEXT NOT NULL,
+                        stable_prefix_hash TEXT,
+                        cache_alignment_score REAL,
+                        cached_tokens INTEGER,
+                        cache_optimizer_used TEXT,
+                        cache_optimizer_strategy TEXT,
+                        cacheable_tokens INTEGER DEFAULT 0,
+                        breakpoints_inserted INTEGER DEFAULT 0,
+                        estimated_cache_hit INTEGER DEFAULT 0,
+                        estimated_savings_percent REAL DEFAULT 0.0,
+                        semantic_cache_hit INTEGER DEFAULT 0,
+                        transforms_applied TEXT NOT NULL,
+                        tool_units_dropped INTEGER DEFAULT 0,
+                        turns_dropped INTEGER DEFAULT 0,
+                        messages_hash TEXT,
+                        error TEXT
+                    )
+                """)
 
-            # Upgrade databases created before the cache optimizer columns
-            # existed, preserving existing rows.
-            cursor.execute("PRAGMA table_info(requests)")
-            existing_columns = {row[1] for row in cursor.fetchall()}
-            for column, ddl in _CACHE_OPTIMIZER_COLUMNS:
-                if column not in existing_columns:
-                    cursor.execute(f"ALTER TABLE requests ADD COLUMN {column} {ddl}")  # nosec B608
+                # Upgrade databases created before the cache optimizer columns
+                # existed, preserving existing rows. The reserved lock above
+                # serializes this check-and-alter against concurrent constructors.
+                cursor.execute("PRAGMA table_info(requests)")
+                existing_columns = {row[1] for row in cursor.fetchall()}
+                for column, ddl in _CACHE_OPTIMIZER_COLUMNS:
+                    if column not in existing_columns:
+                        try:
+                            cursor.execute(  # nosec B608
+                                f"ALTER TABLE requests ADD COLUMN {column} {ddl}"
+                            )
+                        except sqlite3.OperationalError as exc:
+                            # Another connection may have added the column
+                            # between our schema read and this ALTER.
+                            if "duplicate column name" not in str(exc).lower():
+                                raise
 
-            # Create indices
-            cursor.execute("""
-                CREATE INDEX IF NOT EXISTS idx_timestamp ON requests(timestamp)
-            """)
-            cursor.execute("""
-                CREATE INDEX IF NOT EXISTS idx_model ON requests(model)
-            """)
-            cursor.execute("""
-                CREATE INDEX IF NOT EXISTS idx_mode ON requests(mode)
-            """)
+                # Create indices
+                cursor.execute("""
+                    CREATE INDEX IF NOT EXISTS idx_timestamp ON requests(timestamp)
+                """)
+                cursor.execute("""
+                    CREATE INDEX IF NOT EXISTS idx_model ON requests(model)
+                """)
+                cursor.execute("""
+                    CREATE INDEX IF NOT EXISTS idx_mode ON requests(mode)
+                """)
 
-            conn.commit()
+                conn.commit()
+            except Exception:
+                conn.rollback()
+                raise
         finally:
             conn.close()
 
