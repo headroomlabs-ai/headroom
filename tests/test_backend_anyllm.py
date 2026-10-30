@@ -761,3 +761,37 @@ async def test_close_is_noop(monkeypatch: pytest.MonkeyPatch) -> None:
     backend, _instance = make_backend(monkeypatch)
     assert await backend.close() is None
     assert isinstance(StreamEvent(event_type="message_start", data={}), StreamEvent)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("wire_format", ["anthropic", "openai"])
+@pytest.mark.parametrize("streaming", [False, True])
+async def test_send_message_forwards_service_tier(
+    monkeypatch: pytest.MonkeyPatch, wire_format: str, streaming: bool
+) -> None:
+    """service_tier is a standard provider param — forward it, don't drop it."""
+    backend, instance = make_backend(monkeypatch)
+    instance.response = (
+        FakeAsyncStream([])
+        if streaming
+        else make_response(
+            make_choice("done", "stop"),
+            usage=SimpleNamespace(prompt_tokens=1, completion_tokens=1, total_tokens=2),
+        )
+    )
+    body = {
+        "model": "claude-3-7-sonnet",
+        "messages": [{"role": "user", "content": [{"type": "text", "text": "hi"}]}],
+        "max_tokens": 16,
+        "service_tier": "standard_only",
+    }
+    if streaming:
+        method = (
+            backend.stream_message if wire_format == "anthropic" else backend.stream_openai_message
+        )
+        events = [event async for event in method(body, {})]
+        assert events
+    else:
+        method = backend.send_message if wire_format == "anthropic" else backend.send_openai_message
+        assert (await method(body, {})).status_code == 200
+    assert instance.calls[0]["service_tier"] == "standard_only"
