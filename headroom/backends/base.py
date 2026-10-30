@@ -59,11 +59,19 @@ class Backend(ABC):
         """Backend name (e.g., 'anthropic', 'bedrock')."""
         ...
 
+    def prepare_message(
+        self, body: dict[str, Any], headers: dict[str, str], *, stream: bool = False
+    ) -> dict[str, Any]:
+        """Prepare SDK arguments without sending a request."""
+        raise NotImplementedError
+
     @abstractmethod
     async def send_message(
         self,
         body: dict[str, Any],
         headers: dict[str, str],
+        *,
+        prepared: dict[str, Any] | None = None,
     ) -> BackendResponse:
         """Send a non-streaming message request.
 
@@ -81,6 +89,8 @@ class Backend(ABC):
         self,
         body: dict[str, Any],
         headers: dict[str, str],
+        *,
+        prepared: dict[str, Any] | None = None,
     ) -> AsyncIterator[StreamEvent]:
         """Stream a message request.
 

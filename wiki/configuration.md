@@ -233,6 +233,8 @@ Some settings can be configured via environment variables:
 | Variable | Description | Default |
 |----------|-------------|---------|
 | `HEADROOM_MODEL_LIMITS` | Custom model config (JSON string or file path) | - |
+| `HEADROOM_CONTEXT_LIMIT_MODE` | Context budget guard mode. `observe` (default) logs over-limit finalized requests and forwards them; `reject` returns a local 400 before any upstream attempt. Effective only when a model limit is declared in `HEADROOM_MODEL_LIMITS` or `models.json`. | `observe` |
+| `HEADROOM_CONTEXT_LIMIT_SAFETY_MARGIN` | Token reserve subtracted from the declared model context limit before comparing against the finalized request token count. The reserve is the larger of this value and `max_tokens`. A non-negative integer. | `0` |
 | `HEADROOM_CONFIG_DIR` | Canonical config (read-mostly) root. Derives `models.json` and per-plugin config paths when set. | `~/.headroom/config` |
 | `HEADROOM_WORKSPACE_DIR` | Canonical workspace (read-write state) root. Derives savings ledger, memory DB, logs, TOIN, subscription state, and more when set. | `~/.headroom` |
 | `HEADROOM_SAVINGS_PATH` | Full path to the proxy savings JSON ledger. Always wins when set. | derived from `${HEADROOM_WORKSPACE_DIR}` |
@@ -393,6 +395,25 @@ export HEADROOM_MODEL_LIMITS='{"anthropic":{"context_limits":{"claude-new":20000
 
 # File path
 export HEADROOM_MODEL_LIMITS=/path/to/models.json
+```
+
+### Context budget guard
+
+The proxy checks each finalized Anthropic `/v1/messages` forward against an operator-declared destination limit from `HEADROOM_MODEL_LIMITS` or `models.json`. Inferred model limits never authorize rejection. The threshold is `declared_limit - max(HEADROOM_CONTEXT_LIMIT_SAFETY_MARGIN, max_tokens)`.
+
+Direct requests count the selected outbound JSON bytes. LiteLLM and AnyLLM requests count their prepared destination, messages, tools, and output reserve. Converted system content counts once. LiteLLM's retained thinking blocks count through a temporary content view that leaves SDK arguments unchanged; thinking discarded during cross-vendor conversion contributes zero. Token counts are local estimates and may differ from provider accounting.
+
+The default `observe` mode logs overage and forwards. Unknown modes warn and preserve forwarding. With `HEADROOM_CONTEXT_LIMIT_MODE=reject`, measured excess returns HTTP 400 `invalid_request_error` before that upstream attempt. If evaluation is unavailable for a configured reject request, the proxy returns HTTP 500 `api_error` without inventing a token count. A non-positive threshold also rejects. Bypass and passthrough requests preserve forwarding.
+
+Every handler-owned CCR, memory, and response-hook continuation receives a fresh check. Before response commitment, continuation refusals retain their HTTP 400 or 500 status. If a buffered SSE response has already committed HTTP 200 and heartbeats, the proxy emits a terminating `invalid_request_error` or `api_error` SSE event with the same overage or unavailable-evaluation message. The refused continuation makes zero upstream calls. Client retry behavior depends on the client.
+
+A forwarded `context-1m` capability requires an exact raw model declaration to authorize rejection; otherwise it observes. Backend mapping uses the actual destination declaration, including when conversion discards an inbound beta capability.
+
+```bash
+export HEADROOM_MODEL_LIMITS='{"context_limits":{"step-router-v1":262144}}'
+export HEADROOM_CONTEXT_LIMIT_MODE=reject
+export HEADROOM_CONTEXT_LIMIT_SAFETY_MARGIN=12000
+headroom proxy
 ```
 
 ### Pattern-Based Inference

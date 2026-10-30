@@ -233,6 +233,75 @@ SAVE_RESULT = [{"type": "tool_result", "tool_use_id": "toolu_mem", "content": '{
 
 class TestStreamingMemoryContinuation:
     @pytest.mark.asyncio
+    async def test_over_budget_continuation_emits_error_without_forwarding(self) -> None:
+        from fastapi.responses import JSONResponse
+
+        from headroom.proxy.savings import ItemMeasure
+
+        proxy = _proxy([_sse([TEXT, SAVE], "tool_use")], SAVE_RESULT)
+        proxy._record_request_outcome = AsyncMock()
+        prefix_tracker = MagicMock()
+        measure = ItemMeasure(
+            sent_tokens=10,
+            removed_old=2,
+            removed_new=3,
+            sent_shared_prefix=4,
+            bust=0,
+        )
+        checked: list[dict[str, Any]] = []
+
+        async def guard(body: dict[str, Any], headers: dict[str, str], outbound: Any):
+            checked.append(json.loads(outbound.content))
+            assert headers["x-api-key"] == "sk-test"
+            return JSONResponse(
+                status_code=400,
+                content={
+                    "type": "error",
+                    "error": {
+                        "type": "invalid_request_error",
+                        "message": "Context budget exceeded by 123 tokens.",
+                    },
+                },
+            )
+
+        events = await _client_view(
+            proxy,
+            server_memory_tool_names=MEMORY_TOOLS,
+            context_budget_guard=guard,
+            savings_measure=measure,
+            prefix_tracker=prefix_tracker,
+        )
+
+        errors = [event for event in events if event["type"] == "error"]
+        assert checked == [
+            {
+                "model": "claude-test",
+                "max_tokens": 100,
+                "stream": True,
+                "messages": [
+                    {"role": "user", "content": "remember the deploy region"},
+                    {"role": "assistant", "content": [TEXT, SAVE]},
+                    {"role": "user", "content": SAVE_RESULT},
+                ],
+            }
+        ]
+        assert errors == [
+            {
+                "type": "error",
+                "error": {
+                    "type": "invalid_request_error",
+                    "message": "Context budget exceeded by 123 tokens.",
+                },
+            }
+        ]
+        assert proxy.http_client.send.await_count == 1
+        proxy._record_request_outcome.assert_awaited_once()
+        outcome = proxy._record_request_outcome.await_args.args[0]
+        assert outcome.savings_measure == measure
+        assert outcome.status_code == 502
+        prefix_tracker.update_from_response.assert_not_called()
+
+    @pytest.mark.asyncio
     async def test_memory_call_runs_server_side_and_answer_streams_on(self) -> None:
         proxy = _proxy(
             [

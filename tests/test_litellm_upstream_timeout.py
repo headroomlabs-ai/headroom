@@ -8,47 +8,60 @@ caller simply stops, forever, and that is indistinguishable from slow work.
 
 from __future__ import annotations
 
-import ast
-from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 import pytest
 
 from headroom.backends.litellm import (
     DEFAULT_UPSTREAM_TIMEOUT,
     UPSTREAM_TIMEOUT_ENV,
+    LiteLLMBackend,
     _upstream_timeout,
 )
 
-_SRC = Path(__file__).resolve().parents[1] / "headroom" / "backends" / "litellm.py"
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "method", ["send_message", "stream_message", "send_openai_message", "stream_openai_message"]
+)
+@pytest.mark.parametrize("env_value", ["42.5", "", "0", "-1", "nonsense", "None"])
+async def test_every_acompletion_call_is_bounded(monkeypatch, method, env_value):
+    """Every send path supplies its timeout at the SDK boundary."""
+    monkeypatch.setenv(UPSTREAM_TIMEOUT_ENV, env_value)
+    backend = LiteLLMBackend(provider="openrouter")
+    body = {"model": "qwen3", "messages": [{"role": "user", "content": "hello"}]}
 
-def test_every_acompletion_call_is_bounded():
-    """A new dispatch path added without a timeout reintroduces the hang.
+    async def empty_stream():
+        for chunk in ():
+            yield chunk
 
-    Checked structurally rather than by mocking, because the failure mode is a
-    call site someone ADDS later -- which no mock of the existing paths sees.
-    """
-    tree = ast.parse(_SRC.read_text())
-    calls, guards = 0, 0
-    for node in ast.walk(tree):
-        if not isinstance(node, ast.Call):
-            continue
-        fn = node.func
-        if isinstance(fn, ast.Name) and fn.id == "acompletion":
-            calls += 1
-        if (
-            isinstance(fn, ast.Attribute)
-            and fn.attr == "setdefault"
-            and node.args
-            and isinstance(node.args[0], ast.Constant)
-            and node.args[0].value == "timeout"
-        ):
-            guards += 1
-    assert calls > 0, "no acompletion call sites found -- test is stale"
-    assert guards >= calls, (
-        f"{calls} acompletion call site(s) but only {guards} timeout guard(s); "
-        "an unbounded upstream call blocks its caller forever"
+    response = SimpleNamespace(
+        id="resp_timeout",
+        created=123456,
+        choices=[
+            SimpleNamespace(
+                index=0,
+                finish_reason="stop",
+                message=SimpleNamespace(role="assistant", content="ok", tool_calls=None),
+            )
+        ],
+        usage=SimpleNamespace(prompt_tokens=2, completion_tokens=3, total_tokens=5),
     )
+    streaming = method.startswith("stream")
+    completion = AsyncMock(return_value=empty_stream() if streaming else response)
+    monkeypatch.setattr("headroom.backends.litellm.acompletion", completion)
+
+    result = getattr(backend, method)(body, {})
+    if streaming:
+        chunks = [chunk async for chunk in result]
+        assert chunks
+    else:
+        assert (await result).status_code == 200
+
+    completion.assert_awaited_once()
+    expected = 42.5 if env_value == "42.5" else DEFAULT_UPSTREAM_TIMEOUT
+    assert completion.await_args.kwargs["timeout"] == pytest.approx(expected)
 
 
 def test_a_junk_env_value_cannot_disable_the_timeout(monkeypatch):
