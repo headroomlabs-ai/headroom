@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import time
 from typing import Any
+from unittest.mock import AsyncMock, Mock
 
 import pytest
 
@@ -13,6 +14,7 @@ from fastapi.testclient import TestClient
 
 from headroom.config import TransformResult
 from headroom.proxy.server import ProxyConfig, create_app
+from headroom.tokenizer import Tokenizer
 
 
 def _proxy_config(**overrides: Any) -> ProxyConfig:
@@ -92,29 +94,34 @@ def test_v1_compress_success_reports_actual_metrics(monkeypatch) -> None:
     assert body["ccr_hashes"] == [ccr_hash]
 
 
-def test_v1_compress_timeout_fails_open_quickly(monkeypatch) -> None:
+def test_v1_compress_timeout_fails_open_without_retry_or_recount(monkeypatch) -> None:
     monkeypatch.setenv("HEADROOM_SKIP_UPSTREAM_CHECK", "1")
     app = create_app(_proxy_config())
     proxy = app.state.proxy
     request_messages = [{"role": "user", "content": "do not mutate me"}]
 
-    async def timeout_executor(fn, *, timeout):  # noqa: ANN001
-        raise TimeoutError("compression deadline exceeded")
-
+    timeout_executor = AsyncMock(side_effect=TimeoutError("compression deadline exceeded"))
+    pipeline_apply = Mock(side_effect=AssertionError("compression must not retry inline"))
+    count_messages = Mock(side_effect=AssertionError("timeout must not recount tokens"))
     monkeypatch.setattr(proxy, "_run_compression_in_executor", timeout_executor)
+    monkeypatch.setattr(proxy._compress_pipeline_cache["no_ccr"], "apply", pipeline_apply)
 
     with TestClient(app, base_url="http://127.0.0.1", client=("127.0.0.1", 12345)) as client:
-        started = time.perf_counter()
+        # Check the fail-open contract, not host speed: outcome bookkeeping
+        # after the timeout can include pricing and durable savings writes.
+        monkeypatch.setattr(Tokenizer, "count_messages", count_messages)
         response = client.post(
             "/v1/compress",
             json={"model": "gpt-4o", "messages": request_messages},
         )
-        elapsed = time.perf_counter() - started
 
     body = response.json()
     assert response.status_code == 200
-    assert elapsed < 0.5
+    timeout_executor.assert_awaited_once()
+    pipeline_apply.assert_not_called()
+    count_messages.assert_not_called()
     assert body["messages"] == request_messages
+    assert body["tokens_before"] == body["tokens_after"] == 0
     assert body["tokens_saved"] == 0
     assert body["compression_ratio"] == 1.0
     assert body["transforms_applied"] == []
