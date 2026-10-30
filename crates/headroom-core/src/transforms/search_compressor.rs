@@ -296,6 +296,21 @@ impl SearchCompressor {
         bias: f64,
         store: Option<&dyn CcrStore>,
     ) -> (SearchCompressionResult, SearchCompressorStats) {
+        self.compress_with_ccr_source(content, context, bias, store, content)
+    }
+
+    /// Like [`Self::compress_with_store`], but the CCR entry and its
+    /// hash come from `ccr_source` rather than `content`. Use when
+    /// `content` is a derived form of the original (e.g. after a
+    /// reformat) and retrieval must return the original.
+    pub fn compress_with_ccr_source(
+        &self,
+        content: &str,
+        context: &str,
+        bias: f64,
+        store: Option<&dyn CcrStore>,
+        ccr_source: &str,
+    ) -> (SearchCompressionResult, SearchCompressorStats) {
         let mut stats = SearchCompressorStats::default();
         let parsed = self.parse_search_results(content, &mut stats);
 
@@ -334,8 +349,8 @@ impl SearchCompressor {
             } else if ratio >= self.config.min_compression_ratio_for_ccr {
                 stats.ccr_skip_reason = Some("compression ratio too high");
             } else if let Some(store) = store {
-                let key = md5_hex_24(content);
-                store.put(&key, content);
+                let key = md5_hex_24(ccr_source);
+                store.put(&key, ccr_source);
                 let marker = format!(
                     "\n[{} matches compressed to {}. Retrieve more: hash={}]",
                     original_count, compressed_count, key

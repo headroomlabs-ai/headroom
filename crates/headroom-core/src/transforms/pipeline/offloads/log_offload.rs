@@ -145,10 +145,11 @@ impl OffloadTransform for LogOffload {
         content: &str,
         _ctx: &CompressionContext,
         store: &dyn CcrStore,
+        ccr_source: &str,
     ) -> Result<OffloadOutput, TransformError> {
-        let (result, stats) = self
-            .compressor
-            .compress_with_store(content, self.bias, Some(store));
+        let (result, stats) =
+            self.compressor
+                .compress_with_ccr_source(content, self.bias, Some(store), ccr_source);
 
         // The trait contract says `cache_key` is required. If the
         // underlying compressor decided post-hoc that the offload
@@ -258,7 +259,7 @@ mod tests {
         let log: String = line.repeat(200);
         let store = InMemoryCcrStore::new();
         let r = offload()
-            .apply(&log, &CompressionContext::default(), &store)
+            .apply(&log, &CompressionContext::default(), &store, &log)
             .expect("offload should produce a key on bloaty input");
         assert!(!r.cache_key.is_empty());
         assert_eq!(store.get(&r.cache_key).as_deref(), Some(log.as_str()));
@@ -273,7 +274,7 @@ mod tests {
         let log = "INFO: a\nINFO: b\nINFO: c\nINFO: d\nINFO: e";
         let store = InMemoryCcrStore::new();
         let err = offload()
-            .apply(log, &CompressionContext::default(), &store)
+            .apply(log, &CompressionContext::default(), &store, log)
             .expect_err("must skip");
         match err {
             TransformError::Skipped { transform, .. } => assert_eq!(transform, "log_offload"),

@@ -132,15 +132,14 @@ impl OffloadTransform for DiffOffload {
         content: &str,
         ctx: &CompressionContext,
         store: &dyn CcrStore,
+        ccr_source: &str,
     ) -> Result<OffloadOutput, TransformError> {
-        // `compress_with_store` (added in the audit-cleanup PR) writes
-        // the original to `store` under the same `cache_key` it embeds
-        // in the marker. Earlier versions of this offload had to
-        // double-store post-hoc because the compressor lacked a store
-        // parameter — that hack is gone.
-        let (result, _) = self
-            .compressor
-            .compress_with_store(content, &ctx.query, Some(store));
+        // The compressor writes `ccr_source` to `store` under the same
+        // `cache_key` it embeds in the marker, so retrieval returns the
+        // pipeline input rather than the reformatted `content`.
+        let (result, _) =
+            self.compressor
+                .compress_with_ccr_source(content, &ctx.query, Some(store), ccr_source);
 
         let Some(key) = result.cache_key else {
             return Err(TransformError::skipped(
@@ -254,7 +253,7 @@ mod tests {
         let diff = build_diff(1, 200, 5);
         let store = InMemoryCcrStore::new();
         let r = offload()
-            .apply(&diff, &CompressionContext::default(), &store)
+            .apply(&diff, &CompressionContext::default(), &store, &diff)
             .expect("should compress");
         assert!(!r.cache_key.is_empty());
         // Bug-fix verification: DiffCompressor itself wouldn't have
@@ -268,7 +267,7 @@ mod tests {
         let diff = build_diff(1, 5, 2);
         let store = InMemoryCcrStore::new();
         let err = offload()
-            .apply(&diff, &CompressionContext::default(), &store)
+            .apply(&diff, &CompressionContext::default(), &store, &diff)
             .expect_err("must skip");
         match err {
             TransformError::Skipped { transform, .. } => assert_eq!(transform, "diff_offload"),

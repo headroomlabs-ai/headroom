@@ -52,8 +52,10 @@
 //! Reformats:
 //! - [`reformats::JsonMinifier`] — JSON whitespace stripping.
 //! - [`reformats::LogTemplate`] — Drain-style template miner for
-//!   build/log output. Lossless — emits `[Template Tn: ...] (Nx)` +
-//!   variant table, every original line reconstructible.
+//!   build/log output. Tokens preserved, whitespace normalized —
+//!   emits `[Template Tn: ...] (Nx)` + variant table; the exact
+//!   original is recoverable only through CCR when an offload runs
+//!   after the reformat.
 //!
 //! Offloads:
 //! - [`offloads::JsonOffload`] — wraps `SmartCrusher` for JSON arrays
