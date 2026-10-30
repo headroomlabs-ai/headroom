@@ -324,6 +324,55 @@ def test_proxy_config_circuit_breaker() -> None:
         ProxyConfig(circuit_breaker="bogus")
 
 
+@pytest.mark.parametrize("message_format", ["openai", "anthropic"])
+def test_parallel_calls_require_repeated_assistant_turns(message_format: str) -> None:
+    if message_format == "openai":
+        assistant = {
+            "role": "assistant",
+            "tool_calls": [
+                {"function": {"name": "read", "arguments": '{"path":"file.py"}'}} for _ in range(3)
+            ],
+        }
+    else:
+        assistant = {
+            "role": "assistant",
+            "content": [
+                {"type": "tool_use", "name": "read", "input": {"path": "file.py"}} for _ in range(3)
+            ],
+        }
+    breaker = ToolLoopCircuitBreaker()
+    assert breaker.check_messages("parallel", [assistant]) is None
+    assert breaker.check_messages("parallel", [assistant, assistant]) is None
+    assert breaker.check_messages("parallel", [assistant, assistant, assistant]) is not None
+
+
+@pytest.mark.parametrize("mode", ["warn", "enforce", "off"])
+def test_circuit_breaker_env_matches_click_factory(monkeypatch, mode: str) -> None:
+    from unittest.mock import patch
+
+    from click.testing import CliRunner
+
+    from headroom.cli.main import main
+    from headroom.proxy.server import _proxy_config_from_env
+
+    monkeypatch.delenv("HEADROOM_PROXY_CONFIG_JSON", raising=False)
+    monkeypatch.setenv("HEADROOM_CIRCUIT_BREAKER", mode)
+    with patch("headroom.proxy.server.run_server") as run_server:
+        result = CliRunner().invoke(main, ["proxy", "--no-optimize"])
+    assert result.exit_code == 0, result.output
+    assert run_server.call_args.args[0].circuit_breaker == mode
+    assert _proxy_config_from_env().circuit_breaker == mode
+
+
+def test_circuit_breaker_factory_rejects_invalid_env_mode(monkeypatch) -> None:
+    from headroom.proxy.server import _proxy_config_from_env
+
+    monkeypatch.delenv("HEADROOM_PROXY_CONFIG_JSON", raising=False)
+    monkeypatch.setenv("HEADROOM_CIRCUIT_BREAKER", "bogus")
+    with pytest.raises(ValueError, match="Invalid circuit breaker mode"):
+        _proxy_config_from_env()
+
+
 @pytest.mark.asyncio
 async def test_metrics_record_tool_loop_detected() -> None:
     """Tests Prometheus and OTel metrics record tool loop detections."""
@@ -739,7 +788,10 @@ def test_circuit_breaker_session_eviction_and_unserializable_dict() -> None:
 
 
 @pytest.mark.parametrize("recovery_mode", ["different_tool", "user_redirect", "fresh_user"])
-def test_openai_chat_handler_allows_recovery_after_detected_loop(recovery_mode: str) -> None:
+@pytest.mark.parametrize("explicit_session", [True, False])
+def test_openai_chat_handler_allows_recovery_after_detected_loop(
+    recovery_mode: str, explicit_session: bool
+) -> None:
     """A client can recover after the circuit breaker rejects a repeated loop."""
     import httpx
     from fastapi.testclient import TestClient
@@ -750,17 +802,21 @@ def test_openai_chat_handler_allows_recovery_after_detected_loop(recovery_mode: 
     loop_messages = [
         {"role": "user", "content": "inspect the project"},
         *[
-            {
-                "role": "assistant",
-                "tool_calls": [
-                    {
-                        "id": f"call_{index}",
-                        "type": "function",
-                        "function": {"name": "view", "arguments": '{"path": "src/main.py"}'},
-                    }
-                ],
-            }
+            message
             for index in range(1, 4)
+            for message in (
+                {
+                    "role": "assistant",
+                    "tool_calls": [
+                        {
+                            "id": f"call_{index}",
+                            "type": "function",
+                            "function": {"name": "view", "arguments": '{"path": "src/main.py"}'},
+                        }
+                    ],
+                },
+                {"role": "tool", "tool_call_id": f"call_{index}", "content": "file contents"},
+            )
         ],
     ]
 
@@ -786,7 +842,8 @@ def test_openai_chat_handler_allows_recovery_after_detected_loop(recovery_mode: 
         )
     ) as client:
         client.app.state.proxy._retry_request = _mock_retry
-        client.headers["x-headroom-session-id"] = "recovery-session"
+        if explicit_session:
+            client.headers["x-headroom-session-id"] = "recovery-session"
 
         blocked = client.post(
             "/v1/chat/completions",
@@ -820,7 +877,14 @@ def test_openai_chat_handler_allows_recovery_after_detected_loop(recovery_mode: 
                     if recovery_mode == "different_tool"
                     else [
                         *(loop_messages if recovery_mode == "user_redirect" else []),
-                        {"role": "user", "content": "Stop tools and summarize now."},
+                        {
+                            "role": "user",
+                            "content": (
+                                "What is two plus two?"
+                                if recovery_mode == "fresh_user"
+                                else "Stop tools and summarize now."
+                            ),
+                        },
                     ]
                 ),
             },
@@ -829,35 +893,83 @@ def test_openai_chat_handler_allows_recovery_after_detected_loop(recovery_mode: 
         assert recovered.json()["choices"][0]["message"]["content"] == "recovered"
 
 
-def test_openai_responses_handler_detects_native_function_calls() -> None:
-    """The circuit breaker detects native Responses function_call items."""
+@pytest.mark.parametrize(
+    ("call_type", "call_fields", "changed_fields", "tool_name"),
+    [
+        (
+            "function_call",
+            {"name": "view", "arguments": '{"path":"src/main.py"}'},
+            {"arguments": '{"path":"src/other.py"}'},
+            "view",
+        ),
+        (
+            "custom_tool_call",
+            {"name": "exec", "input": "read_file('src/main.py')"},
+            {"input": "read_file('src/other.py')"},
+            "exec",
+        ),
+        (
+            "local_shell_call",
+            {"action": {"type": "exec", "command": ["cat", "src/main.py"], "env": {}}},
+            {"action": {"type": "exec", "command": ["cat", "src/other.py"], "env": {}}},
+            "local_shell_call",
+        ),
+        (
+            "apply_patch_call",
+            {"operation": {"type": "update_file", "path": "src/main.py", "diff": "@@\n-old\n+new"}},
+            {
+                "operation": {
+                    "type": "update_file",
+                    "path": "src/other.py",
+                    "diff": "@@\n-old\n+new",
+                }
+            },
+            "apply_patch_call",
+        ),
+    ],
+)
+@pytest.mark.parametrize("history_kind", ["loop", "parallel", "varying"])
+def test_openai_responses_handler_detects_native_tool_calls(
+    call_type: str,
+    call_fields: dict[str, object],
+    changed_fields: dict[str, object],
+    tool_name: str,
+    history_kind: str,
+) -> None:
+    """Native calls retain argument identity, batch boundaries, and user recovery."""
     import httpx
     from fastapi.testclient import TestClient
 
     from headroom.proxy.models import ProxyConfig
     from headroom.proxy.server import create_app
 
-    input_items = [
-        *[
-            {
-                "type": "function_call",
-                "call_id": f"call_{index}",
-                "name": "view",
-                "arguments": '{"path": "src/main.py"}',
-            }
-            for index in range(1, 4)
-        ],
-        *[
-            {
-                "type": "function_call_output",
-                "call_id": f"call_{index}",
-                "output": "file contents",
-            }
-            for index in range(1, 4)
-        ],
+    calls = [
+        {"type": call_type, "call_id": f"call_{index}", **call_fields} for index in range(1, 4)
     ]
+    outputs = [
+        {"type": f"{call_type}_output", "call_id": f"call_{index}", "output": "file contents"}
+        for index in range(1, 4)
+    ]
+    if history_kind == "varying":
+        calls[-1].update(changed_fields)
+    if history_kind == "parallel":
+        input_items = [
+            calls[0],
+            {"type": "reasoning", "id": "rs_1", "summary": []},
+            {
+                "type": "message",
+                "role": "assistant",
+                "content": [{"type": "output_text", "text": "Reading the files."}],
+            },
+            *calls[1:],
+            *outputs,
+        ]
+    else:
+        input_items = [item for pair in zip(calls, outputs, strict=True) for item in pair]
+    forwarded = []
 
     async def _mock_retry(method, url, headers, body, stream=False, **kwargs):  # noqa: ANN001, ANN002, ANN003, ANN202
+        forwarded.append(body["input"])
         return httpx.Response(
             200,
             json={"id": "resp_1", "object": "response", "output": [], "usage": {}},
@@ -875,12 +987,37 @@ def test_openai_responses_handler_detects_native_function_calls() -> None:
         )
     ) as client:
         client.app.state.proxy._retry_request = _mock_retry
+        client.headers["x-headroom-session-id"] = "responses-recovery"
         response = client.post(
             "/v1/responses",
             headers={"authorization": "******"},
             json={"model": "gpt-4o", "instructions": "Inspect the project", "input": input_items},
         )
 
-    assert response.status_code == 429
-    assert "Tool call loop detected" in response.json()["detail"]
-    assert "view" in response.json()["detail"]
+        if history_kind == "loop":
+            assert response.status_code == 429
+            assert "Tool call loop detected" in response.json()["detail"]
+            assert tool_name in response.json()["detail"]
+            assert forwarded == []
+            recovered = client.post(
+                "/v1/responses",
+                headers={"authorization": "******"},
+                json={
+                    "model": "gpt-4o",
+                    "instructions": "Inspect the project",
+                    "input": [
+                        *input_items,
+                        {"role": "user", "content": "Stop tools and summarize now."},
+                    ],
+                },
+            )
+            assert recovered.status_code == 200
+        else:
+            assert response.status_code == 200
+            assert client.app.state.proxy.metrics.tool_loops_detected == 0
+        assert len(forwarded) == 1
+        assert [
+            item for item in forwarded[0] if item.get("type") in (call_type, f"{call_type}_output")
+        ] == [
+            item for item in input_items if item.get("type") in (call_type, f"{call_type}_output")
+        ]

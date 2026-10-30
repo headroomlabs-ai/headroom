@@ -6081,16 +6081,16 @@ class OpenAIHandlerMixin:
         # Circuit breaker check for runaway tool repetition loops
         _cb = getattr(self, "tool_loop_circuit_breaker", None)
         if _cb is not None and getattr(self.config, "circuit_breaker", "warn") != "off":
-            from headroom.proxy.circuit_breaker import execute_circuit_breaker_policy
+            from headroom.proxy.circuit_breaker import (
+                execute_circuit_breaker_policy,
+                responses_input_to_circuit_breaker_messages,
+            )
 
             await execute_circuit_breaker_policy(
                 circuit_breaker=_cb,
                 mode=self.config.circuit_breaker,
                 session_id=_responses_session_id,
-                messages=_responses_input_to_learner_messages(
-                    body.get("instructions"),
-                    input_data,
-                ),
+                messages=responses_input_to_circuit_breaker_messages(input_data),
                 request_id=request_id,
                 metrics=getattr(self, "metrics", None),
             )

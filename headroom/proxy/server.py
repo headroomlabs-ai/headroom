@@ -6438,6 +6438,7 @@ def _proxy_config_from_env() -> ProxyConfig:
         malloc_trim_interval_seconds=_get_env_int("HEADROOM_MALLOC_TRIM_INTERVAL_SECONDS", 60),
         proxy_token=os.environ.get("HEADROOM_PROXY_TOKEN") or None,
         offline=_get_env_bool("HEADROOM_OFFLINE", False),
+        circuit_breaker=_get_env_str("HEADROOM_CIRCUIT_BREAKER", "warn"),
         # Default mode is CACHE (Headroom's coding posture): delta-only compression
         # at ~0 prefix-cache busts. HEADROOM_MODE overrides.
         mode=normalize_proxy_mode(_get_env_str("HEADROOM_MODE", PROXY_MODE_CACHE)),

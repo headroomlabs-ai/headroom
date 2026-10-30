@@ -120,7 +120,7 @@ def detect_repetition_cycle(
 def extract_tool_calls_from_messages(
     messages: Sequence[Mapping[str, Any]] | None,
 ) -> list[tuple[str, str]]:
-    """Extract tool calls from OpenAI or Anthropic shaped message arrays."""
+    """Extract tool signatures, counting identical parallel calls only once per turn."""
     calls: list[tuple[str, str]] = []
     if not messages:
         return calls
@@ -144,6 +144,7 @@ def extract_tool_calls_from_messages(
         if role != "assistant":
             continue
 
+        batch: list[tuple[str, str]] = []
         # OpenAI tool_calls: [{"function": {"name": "...", "arguments": "..."}}]
         tool_calls = msg.get("tool_calls")
         if isinstance(tool_calls, list):
@@ -151,21 +152,63 @@ def extract_tool_calls_from_messages(
                 if isinstance(tc, dict):
                     fn = tc.get("function")
                     if isinstance(fn, dict) and "name" in fn:
-                        calls.append(hash_tool_call(str(fn["name"]), fn.get("arguments")))
+                        batch.append(hash_tool_call(str(fn["name"]), fn.get("arguments")))
 
         # OpenAI legacy function_call: {"name": "...", "arguments": "..."}
         func_call = msg.get("function_call")
         if isinstance(func_call, dict) and "name" in func_call:
-            calls.append(hash_tool_call(str(func_call["name"]), func_call.get("arguments")))
+            batch.append(hash_tool_call(str(func_call["name"]), func_call.get("arguments")))
 
         # Anthropic tool_use content blocks: [{"type": "tool_use", "name": "...", "input": {...}}]
         content = msg.get("content")
         if isinstance(content, list):
             for block in content:
                 if isinstance(block, dict) and block.get("type") == "tool_use" and "name" in block:
-                    calls.append(hash_tool_call(str(block["name"]), block.get("input")))
+                    batch.append(hash_tool_call(str(block["name"]), block.get("input")))
+
+        calls.extend(dict.fromkeys(batch))
 
     return calls
+
+
+def responses_input_to_circuit_breaker_messages(input_data: Any) -> list[dict[str, Any]]:
+    """Normalize native tool batches for detection without changing wire input."""
+    if isinstance(input_data, str):
+        return [{"role": "user", "content": input_data}]
+    if not isinstance(input_data, list):
+        return []
+
+    fields = {
+        "function_call": "arguments",
+        "custom_tool_call": "input",
+        "local_shell_call": "action",
+        "apply_patch_call": "operation",
+    }
+    messages: list[dict[str, Any]] = []
+    pending: list[dict[str, Any]] = []
+    for item in input_data:
+        if not isinstance(item, dict):
+            continue
+        item_type = item.get("type")
+        field = fields.get(item_type) if isinstance(item_type, str) else None
+        if field is not None:
+            if not pending:
+                messages.append({"role": "assistant", "tool_calls": pending})
+            pending.append(
+                {"function": {"name": item.get("name") or item_type, "arguments": item.get(field)}}
+            )
+            continue
+        role = item.get("role")
+        if (isinstance(item_type, str) and item_type.endswith("_call_output")) or role in (
+            "user",
+            "tool",
+        ):
+            pending = []
+        if role in ("system", "developer", "user", "assistant", "tool"):
+            if role == "assistant" and ("tool_calls" in item or "function_call" in item):
+                pending = []
+            messages.append(item)
+    return messages
 
 
 class ToolLoopCircuitBreaker:
