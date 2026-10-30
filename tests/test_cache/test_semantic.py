@@ -123,6 +123,52 @@ class TestSemanticCache:
         got2 = cache.get("query2", messages_hash="h2")
         assert got2 is not None and got2.response == "response2b"
 
+    def test_put_failure_after_eviction_keeps_live_entry(self):
+        """A failed embedding must not silently drop an already-evicted entry.
+
+        The eviction loop used to run before the embedding call, so if the
+        embedding function raised, an old live entry was already evicted while
+        the new entry was never stored — a permanent data loss on a transient
+        error. The exception must still propagate.
+        """
+        config = SemanticCacheConfig(max_entries=1, similarity_threshold=0.9)
+        cache = SemanticCache(config)
+
+        call_count = {"n": 0}
+
+        def flaky_embedding(text: str) -> list[float]:
+            call_count["n"] += 1
+            if call_count["n"] == 1:
+                return [1.0, 0.0]
+            raise RuntimeError("embedding backend unavailable")
+
+        cache._embedding_fn = flaky_embedding
+
+        # First put succeeds and fills the cache to capacity.
+        cache.put("a", "response-a", messages_hash="ha")
+        assert cache.get("a", messages_hash="ha") is not None
+        assert len(cache._cache) == 1
+
+        # Second put raises, but the live entry must survive untouched.
+        with pytest.raises(RuntimeError, match="embedding backend unavailable"):
+            cache.put("b", "response-b", messages_hash="hb")
+
+        assert cache.get("a", messages_hash="ha") is not None
+        assert len(cache._cache) == 1
+
+        # With the embedding working again, a new put evicts "a" normally.
+        def stable_embedding(text: str) -> list[float]:
+            # Distinct vectors per query so "a" and "c" never false-hit.
+            if text == "a":
+                return [1.0, 0.0]
+            return [0.0, 1.0]
+
+        cache._embedding_fn = stable_embedding
+        cache.put("c", "response-c", messages_hash="hc")
+        assert cache.get("a", messages_hash="ha") is None
+        assert cache.get("c", messages_hash="hc") is not None
+        assert len(cache._cache) == 1
+
     def test_ttl_expiration(self):
         """Test TTL expiration."""
         config = SemanticCacheConfig(ttl_seconds=1)
