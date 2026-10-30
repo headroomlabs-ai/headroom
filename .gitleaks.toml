@@ -12,6 +12,7 @@ paths = [
   '''.*\.lock$''',
   '''.*package-lock\.json$''',
   '''pnpm-lock\.yaml$''',
+  '''(^|/)sdk/generated-pilot/manifest\.json$''',
   # Test / benchmark / parity trees use synthetic JWTs and API keys by design.
   '''(^|/)tests/''',
   '''(^|/)benchmarks/''',

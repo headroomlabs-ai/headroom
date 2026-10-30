@@ -1,0 +1,178 @@
+{
+  "components": {
+    "schemas": {
+      "RetrievalError": {
+        "additionalProperties": true,
+        "properties": {
+          "detail": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "detail"
+        ],
+        "type": "object"
+      },
+      "RetrieveRequest": {
+        "additionalProperties": true,
+        "properties": {
+          "hash": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "hash"
+        ],
+        "type": "object"
+      },
+      "RetrieveResponse": {
+        "additionalProperties": true,
+        "properties": {
+          "compressed_item_count": {
+            "type": "integer"
+          },
+          "hash": {
+            "type": "string"
+          },
+          "original_content": {
+            "type": "string"
+          },
+          "original_item_count": {
+            "type": "integer"
+          },
+          "original_tokens": {
+            "type": "integer"
+          },
+          "retrieval_count": {
+            "type": "integer"
+          },
+          "tool_name": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        },
+        "required": [
+          "compressed_item_count",
+          "hash",
+          "original_content",
+          "original_item_count",
+          "original_tokens",
+          "retrieval_count",
+          "tool_name"
+        ],
+        "type": "object"
+      }
+    }
+  },
+  "info": {
+    "title": "Headroom HTTP contract pilot",
+    "version": "0.1.0"
+  },
+  "openapi": "3.1.1",
+  "paths": {
+    "/v1/retrieve": {
+      "post": {
+        "operationId": "retrieve",
+        "parameters": [],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/RetrieveRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RetrieveResponse"
+                }
+              }
+            },
+            "description": "Successful JSON response"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RetrievalError"
+                }
+              }
+            },
+            "description": "Declared HTTP error"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RetrievalError"
+                }
+              }
+            },
+            "description": "Declared HTTP error"
+          },
+          "default": {
+            "description": "Undeclared HTTP error; preserve status, headers, and raw body"
+          }
+        },
+        "security": [],
+        "x-headroom-access": "loopback-same-origin",
+        "x-headroom-retry": "never-by-default"
+      }
+    },
+    "/v1/retrieve/{hash_key}": {
+      "get": {
+        "operationId": "retrieve_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "hash_key",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RetrieveResponse"
+                }
+              }
+            },
+            "description": "Successful JSON response"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RetrievalError"
+                }
+              }
+            },
+            "description": "Declared HTTP error"
+          },
+          "default": {
+            "description": "Undeclared HTTP error; preserve status, headers, and raw body"
+          }
+        },
+        "security": [],
+        "x-headroom-access": "loopback",
+        "x-headroom-retry": "never-by-default"
+      }
+    }
+  },
+  "x-headroom-profile": "json-http-v1-pilot"
+}
