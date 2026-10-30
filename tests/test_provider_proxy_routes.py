@@ -1409,3 +1409,89 @@ def test_anthropic_messages_strips_ansi_model_id_before_upstream() -> None:
 
     assert response.status_code == 200
     assert fake_http_client.bodies[0]["model"] == "claude-opus-4-8"
+
+
+def test_model_metadata_routes_honor_the_custom_base_url(monkeypatch) -> None:
+    # A client that names its own upstream must get its model list from that
+    # upstream, not from the proxy's default OpenAI one: the chat and
+    # responses handlers already honor the header (#4302).
+    monkeypatch.setenv("HEADROOM_ALLOWED_BASE_URLS", "custom.example")
+    calls: list[tuple[str, str, str]] = []
+
+    async def fake_passthrough(self, request, base_url, sub_path="", provider_name=""):  # type: ignore[no-untyped-def]
+        calls.append((request.url.path, base_url, provider_name))
+        return JSONResponse(
+            {
+                "path": request.url.path,
+                "base_url": base_url,
+                "sub_path": sub_path,
+                "provider": provider_name,
+            }
+        )
+
+    monkeypatch.setattr(HeadroomProxy, "handle_passthrough", fake_passthrough)
+
+    with TestClient(_app()) as client:
+        listed = client.get(
+            "/v1/models",
+            headers={"x-headroom-base-url": "https://custom.example"},
+        )
+        fetched = client.get(
+            "/v1/models/gpt-5",
+            headers={"x-headroom-base-url": "https://custom.example/"},
+        )
+        # An Anthropic-compatible gateway names its upstream the same way.
+        anthropic = client.get(
+            "/v1/models",
+            headers={
+                "x-api-key": "gateway-key",
+                "x-headroom-base-url": "https://custom.example",
+            },
+        )
+
+    assert listed.json()["base_url"] == "https://custom.example"
+    assert fetched.json()["base_url"] == "https://custom.example"
+    assert calls[0][2] == "openai"
+    assert anthropic.json()["base_url"] == "https://custom.example"
+    assert calls[-1][2] == "anthropic"
+
+
+def test_model_metadata_routes_reject_an_unsafe_custom_base_url(monkeypatch) -> None:
+    # A client-named upstream goes through the same SSRF guard as the other
+    # routes: an unsafe one is refused, and the request never reaches an
+    # upstream. Falling back to the configured upstream would have sent the
+    # authenticated request, and its credentials, to a host the client did
+    # not name.
+    monkeypatch.setenv("HEADROOM_ALLOWED_BASE_URLS", "custom.example")
+    calls: list[tuple[str, str, str]] = []
+
+    async def fake_passthrough(self, request, base_url, sub_path="", provider_name=""):  # type: ignore[no-untyped-def]
+        calls.append((request.url.path, base_url, provider_name))
+        return JSONResponse(
+            {
+                "path": request.url.path,
+                "base_url": base_url,
+                "sub_path": sub_path,
+                "provider": provider_name,
+            }
+        )
+
+    monkeypatch.setattr(HeadroomProxy, "handle_passthrough", fake_passthrough)
+
+    credential = {"authorization": "Bearer synthetic-private-gateway-key"}
+    with TestClient(_app()) as client:
+        listed = client.get(
+            "/v1/models",
+            headers={**credential, "x-headroom-base-url": "http://169.254.169.254"},
+        )
+        fetched = client.get(
+            "/v1/models/gpt-5",
+            headers={**credential, "x-headroom-base-url": "http://169.254.169.254"},
+        )
+
+    assert listed.status_code == 400
+    assert listed.json()["detail"] == "Rejected unsafe upstream base URL"
+    assert fetched.status_code == 400
+    # No upstream call at all: the rejected request must not be redirected to
+    # the configured upstream, which would disclose the credential.
+    assert calls == []
