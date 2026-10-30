@@ -6,6 +6,7 @@ prevents future token waste.
 
 Plugin architecture:
     plugins/claude.py  ─┐
+    plugins/codebuddy.py─┤
     plugins/codex.py   ─┤→  Analyzer (LLM)  →  Writer (adapter)
     plugins/gemini.py  ─┤
     plugins/grok.py    ─┘
