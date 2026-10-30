@@ -251,27 +251,27 @@ def test_code_aware_router_dispatch_matches_direct(monkeypatch: pytest.MonkeyPat
     assert seen == {"content": content, "language": "python", "context": "q"}
 
 
-def test_code_aware_unavailable_falls_back_to_kompress(monkeypatch: pytest.MonkeyPatch) -> None:
-    # CODE_AWARE-RETURNS-NONE: with the code compressor UNAVAILABLE (tree-sitter
-    # missing) the branch's local `compressed` stays None, so the EXISTING inline
-    # Kompress fallback runs — the flip touches none of that logic. Mock
-    # _try_ml_compressor so NO real ML runs, and assert the SAME strategy_chain
-    # ([code_aware, kompress]) the historical direct dispatch produced.
+def test_code_aware_unavailable_passes_code_through(monkeypatch: pytest.MonkeyPatch) -> None:
+    # With the code compressor unavailable (tree-sitter missing) the code goes
+    # through unchanged; Kompress, which drops keywords and indentation, never
+    # sees it.
     router = _fallback_router()
     _isolate_branch(monkeypatch, router)
     monkeypatch.setattr(router, "_get_code_compressor", lambda: None)
+
+    kompressed: list[str] = []
     monkeypatch.setattr(
         router,
         "_try_ml_compressor",
-        lambda content, ctx, q: ("KOMPRESSED::" + content, 3),
+        lambda content, *_a, **_k: (kompressed.append(content), ("x", 1))[1],
     )
     content = "def foo():\n    return 1\n"
-    out, tokens, chain = router._apply_strategy_to_content(
+    out, _tokens, chain = router._apply_strategy_to_content(
         content, CompressionStrategy.CODE_AWARE, "ctx", language=None, bias=1.0
     )
-    assert out == "KOMPRESSED::" + content
-    assert tokens == 3
-    assert chain == [CompressionStrategy.CODE_AWARE.value, CompressionStrategy.KOMPRESS.value]
+    assert out == content
+    assert kompressed == []
+    assert CompressionStrategy.KOMPRESS.value not in chain
 
 
 def test_html_router_dispatch_matches_direct(monkeypatch: pytest.MonkeyPatch) -> None:

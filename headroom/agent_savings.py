@@ -172,14 +172,17 @@ _PROFILES: dict[str, AgentSavingsProfile] = {
         accuracy_guard="strict",
         # Coding posture: defer non-core tool schemas, dedupe re-reads, extend
         # lossy coverage when lossless found nothing, and NEVER lossy-compress a
-        # file read (the agent patches exact bytes). CCR stays ON (unset) so any
+        # file read (the agent patches exact bytes). Code is never compressed:
+        # protect_reads misses code the agent fetches (curl, an MCP tool) and
+        # reads Codex sends without their command, and code_aware cuts the
+        # function bodies the agent came to read. CCR stays ON (unset) so any
         # lossy loss is recoverable. Low block floor so modest
         # deltas are eligible.
         tool_search=True,
         cross_turn_dedup=True,
         lossless_then_lossy=True,
         protect_reads=True,
-        code_aware=True,
+        code_aware=False,
         lossless=False,
         min_chars_for_block=25,
     ),
@@ -241,6 +244,19 @@ def get_agent_savings_profile(name: str | None = None) -> AgentSavingsProfile:
         DEFAULT_PROFILE,
     )
     return _PROFILES[fallback_name]
+
+
+def code_aware_default() -> bool:
+    """Whether code-aware compression is on when no CLI flag names it.
+
+    ``HEADROOM_CODE_AWARE_ENABLED`` when set, else the savings profile's
+    setting. Proxy entry points build their config before the profile's env is
+    seeded, so they ask here rather than reading the env alone.
+    """
+    env = os.environ.get("HEADROOM_CODE_AWARE_ENABLED")
+    if env is not None:
+        return env.strip().lower() in ("true", "1", "yes", "on")
+    return get_agent_savings_profile(os.environ.get("HEADROOM_SAVINGS_PROFILE")).code_aware
 
 
 def apply_agent_savings_env_defaults(
