@@ -1279,8 +1279,12 @@ def _detect_content(content: str) -> DetectionResult:
     from headroom._ort import rust_ort_runtime_compatible
 
     if not rust_ort_runtime_compatible():
+        # Expected on every install without the proxy extra's ONNX Runtime
+        # (plain ``pip install headroom-ai``): the pure-Python detector is the
+        # supported path there, so this is information, not a warning. The
+        # circuit breaker above makes it fire once per process.
         _detect_native_unhealthy = True
-        logger.warning(
+        logger.info(
             "Native content detection requires ONNX Runtime 1.24+; "
             "using pure-Python detection for this process."
         )
