@@ -5,6 +5,7 @@ import { z } from "zod";
 
 import {
   createHeadroomRetrieveTool,
+  CCR_ID_PATTERN,
   getDefaultProxyUrl,
   trimTrailingSlashes,
 } from "./retrieve.js";
@@ -147,7 +148,7 @@ export const HeadroomPlugin: Plugin = async (input, options = {}) => {
         args: {
           hash: z
             .string()
-            .regex(/^[a-f0-9]{24}$/i, "Expected 24-character hex hash"),
+            .regex(CCR_ID_PATTERN, "Expected 2–24-character hex identifier"),
         },
         async execute(args) {
           return retrieveTool.execute(args);

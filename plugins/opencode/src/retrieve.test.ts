@@ -1,6 +1,29 @@
-import { describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 
-import { trimTrailingSlashes } from "./retrieve.js";
+import { createHeadroomRetrieveTool, trimTrailingSlashes } from "./retrieve.js";
+
+afterEach(() => vi.unstubAllGlobals());
+
+describe("retrieve supported CCR identifiers", () => {
+  it.each(["ab", "ABC", "0123456789abcdef01234567"])("retrieves %s", async (hash) => {
+    const fetchMock = vi.fn(async () => new Response(JSON.stringify("original content")));
+    vi.stubGlobal("fetch", fetchMock);
+    const tool = createHeadroomRetrieveTool({ proxyBaseUrl: "http://127.0.0.1:8787" });
+    expect(await tool.execute({ hash })).toBe("original content");
+    expect(fetchMock).toHaveBeenCalledWith(
+      `http://127.0.0.1:8787/v1/retrieve/${hash}`,
+      expect.any(Object),
+    );
+  });
+
+  it.each(["a", "a".repeat(25), "zz", "ab cd", "ab?key=x"])("rejects %s", async (hash) => {
+    const fetchMock = vi.fn();
+    vi.stubGlobal("fetch", fetchMock);
+    const tool = createHeadroomRetrieveTool({ proxyBaseUrl: "http://127.0.0.1:8787" });
+    expect(JSON.parse(await tool.execute({ hash })).error).toContain("Invalid hash format");
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+});
 
 describe("trimTrailingSlashes", () => {
   it.each([

@@ -2,6 +2,7 @@ import type { CompressResult } from "headroom-ai";
 import { compress } from "headroom-ai";
 
 let _proxyUrlCache: string | null = null;
+export const CCR_ID_PATTERN = /^[a-f0-9]{2,24}$/i;
 
 export function setDefaultProxyUrl(url: string): void {
   _proxyUrlCache = url;
@@ -33,14 +34,14 @@ export function createHeadroomRetrieveTool(config: RetrieveToolConfig) {
     description:
       "Retrieve original uncompressed content from Headroom's compression store. " +
       "Use when compressed context mentions a hash and you need the full details. " +
-      "Pass the hash from the compression marker (24 hex characters). " +
+      "Pass the identifier from the compression marker (2–24 hex characters). " +
       "Retrieval is by hash and always returns the full original content.",
     parameters: {
       type: "object" as const,
       properties: {
         hash: {
           type: "string",
-          description: "The 24-character hex hash from the compression marker",
+          description: "The 2–24-character hex identifier from the compression marker",
         },
       },
       required: ["hash"],
@@ -48,9 +49,9 @@ export function createHeadroomRetrieveTool(config: RetrieveToolConfig) {
     execute: async (args: { hash: string }): Promise<string> => {
       const { hash } = args;
 
-      if (!/^[a-f0-9]{24}$/i.test(hash)) {
+      if (!CCR_ID_PATTERN.test(hash)) {
         return JSON.stringify({
-          error: "Invalid hash format. Expected 24 hex characters.",
+          error: "Invalid hash format. Expected 2–24 hex characters.",
         });
       }
 
