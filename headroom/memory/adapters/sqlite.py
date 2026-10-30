@@ -49,6 +49,20 @@ def _validate_metadata_key(key: str) -> bool:
     return _SAFE_METADATA_KEY_PATTERN.match(key) is not None
 
 
+def _utc_timestamp(value: str | None) -> str | None:
+    """Comparable UTC text without rewriting stored offsets or rounding fractions.
+
+    Naive timestamps follow Memory's UTC defaults. SQLite date functions round
+    fractional seconds, so keep Python's full microsecond precision here.
+    """
+    if value is None:
+        return None
+    timestamp = datetime.fromisoformat(value)
+    if timestamp.tzinfo is not None:
+        timestamp = timestamp.astimezone(timezone.utc).replace(tzinfo=None)
+    return timestamp.isoformat(timespec="microseconds")
+
+
 class SQLiteMemoryStore:
     """SQLite-based memory store implementing the MemoryStore protocol.
 
@@ -95,6 +109,7 @@ class SQLiteMemoryStore:
         """
         conn = connect_private_sqlite(self.db_path, what="memory store")
         conn.row_factory = sqlite3.Row
+        conn.create_function("headroom_utc_timestamp", 1, _utc_timestamp, deterministic=True)
         try:
             with conn:
                 yield conn
@@ -507,21 +522,23 @@ class SQLiteMemoryStore:
             if scope_conditions:
                 conditions.append(f"({' OR '.join(scope_conditions)})")
 
+        # Normalize both sides: persisted rows may retain explicit UTC offsets.
+        # This favors correct instant comparisons over the raw TEXT time index.
         # Temporal filtering
         if filter.created_after is not None:
-            conditions.append("created_at >= ?")
-            params.append(filter.created_after.isoformat())
+            conditions.append("headroom_utc_timestamp(created_at) >= ?")
+            params.append(_utc_timestamp(filter.created_after.isoformat()))
 
         if filter.created_before is not None:
-            conditions.append("created_at <= ?")
-            params.append(filter.created_before.isoformat())
+            conditions.append("headroom_utc_timestamp(created_at) <= ?")
+            params.append(_utc_timestamp(filter.created_before.isoformat()))
 
         # Point-in-time query
         if filter.valid_at is not None:
-            valid_at_str = filter.valid_at.isoformat()
-            conditions.append("valid_from <= ?")
+            valid_at_str = _utc_timestamp(filter.valid_at.isoformat())
+            conditions.append("headroom_utc_timestamp(valid_from) <= ?")
             params.append(valid_at_str)
-            conditions.append("(valid_until IS NULL OR valid_until > ?)")
+            conditions.append("(valid_until IS NULL OR headroom_utc_timestamp(valid_until) > ?)")
             params.append(valid_at_str)
 
         # Superseded filtering
@@ -619,6 +636,9 @@ class SQLiteMemoryStore:
             "last_accessed",
         ):
             order_column = "created_at"
+
+        if order_column in ("created_at", "last_accessed"):
+            order_column = f"headroom_utc_timestamp({order_column})"
 
         order_direction = "DESC" if filter.order_desc else "ASC"
 

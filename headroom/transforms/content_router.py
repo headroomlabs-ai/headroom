@@ -360,9 +360,18 @@ def _invoke_smart_crusher(router: ContentRouter, inp: CompressInput) -> str | No
     crusher = router._get_smart_crusher()
     if crusher is None:
         return None
+    # F2.2: the router never calls ``crusher.apply()``, so the crusher's own
+    # policy field stays None. Forward the request's TOIN read-only gate per
+    # call instead (the crusher is shared across concurrent requests). The
+    # kwarg is only sent when gating, so crushers exposing the plain
+    # ``crush(content, query, bias)`` signature keep working.
+    policy = router._runtime_compression_policy
+    gate: dict[str, bool] = {}
+    if policy is not None and policy.toin_read_only:
+        gate["record_toin"] = False
     # ``_get_*`` getters are typed ``Any``; pin the result to the contract type.
     compressed: str = crusher.crush(
-        inp.content, query=inp.query, bias=_adapter_bias(inp)
+        inp.content, query=inp.query, bias=_adapter_bias(inp), **gate
     ).compressed
     return compressed
 
