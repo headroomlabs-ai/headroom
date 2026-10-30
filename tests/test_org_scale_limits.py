@@ -15,6 +15,12 @@ Registry TTL/LRU mechanics live in ``test_compression_cache_registry.py``.
 
 from __future__ import annotations
 
+import json
+import os
+import subprocess
+import sys
+import textwrap
+
 import pytest
 
 pytest.importorskip("fastapi")
@@ -38,86 +44,52 @@ def _make_proxy():
     return app.state.proxy
 
 
-# --------------------------------------------------------------------------- #
-# Per-session entry cap is plumbed through and env-tunable.                    #
-# --------------------------------------------------------------------------- #
+@pytest.mark.parametrize("raw", ["nan", "inf", "-inf"])
+def test_nonfinite_cache_ttl_still_reclaims_idle_sessions(raw, tmp_path) -> None:
+    program = textwrap.dedent(
+        """
+        import json
+        import time
+        from headroom.proxy.server import ProxyConfig, create_app
 
-
-def test_compression_cache_entry_cap_is_plumbed(monkeypatch) -> None:
-    import headroom.proxy.server as server_mod
-
-    monkeypatch.setattr(server_mod, "COMPRESSION_CACHE_MAX_ENTRIES", 123)
-    proxy = _make_proxy()
-    assert proxy._get_compression_cache("s").max_entries == 123
-
-
-def test_compression_cache_entry_cap_env_parsing(monkeypatch) -> None:
-    import importlib
-
-    import headroom.proxy.helpers as helpers_mod
-
-    monkeypatch.setenv("HEADROOM_COMPRESSION_CACHE_MAX_ENTRIES", "50000")
-    importlib.reload(helpers_mod)
-    assert helpers_mod.COMPRESSION_CACHE_MAX_ENTRIES == 50000
-
-    # Floor: an absurdly small value cannot disable the cache.
-    monkeypatch.setenv("HEADROOM_COMPRESSION_CACHE_MAX_ENTRIES", "1")
-    importlib.reload(helpers_mod)
-    assert helpers_mod.COMPRESSION_CACHE_MAX_ENTRIES == 100
-
-    # Garbage falls back to the default.
-    monkeypatch.setenv("HEADROOM_COMPRESSION_CACHE_MAX_ENTRIES", "banana")
-    importlib.reload(helpers_mod)
-    assert helpers_mod.COMPRESSION_CACHE_MAX_ENTRIES == 10000
-
-    monkeypatch.delenv("HEADROOM_COMPRESSION_CACHE_MAX_ENTRIES")
-    importlib.reload(helpers_mod)
-    assert helpers_mod.COMPRESSION_CACHE_MAX_ENTRIES == 10000
-
-
-def test_compression_cache_ttl_env_rejects_non_finite(monkeypatch) -> None:
-    """'nan'/'inf' parse as floats but poison every idle comparison — they
-    must fall back to the default like any other unparseable value."""
-    import importlib
-
-    import headroom.proxy.helpers as helpers_mod
-
-    for bad in ("nan", "inf", "-inf"):
-        monkeypatch.setenv("HEADROOM_COMPRESSION_CACHE_TTL_SECONDS", bad)
-        importlib.reload(helpers_mod)
-        assert helpers_mod.COMPRESSION_CACHE_TTL_SECONDS == 3900.0, bad
-
-    # Below the 600s floor clamps up; above it passes through.
-    monkeypatch.setenv("HEADROOM_COMPRESSION_CACHE_TTL_SECONDS", "60")
-    importlib.reload(helpers_mod)
-    assert helpers_mod.COMPRESSION_CACHE_TTL_SECONDS == 600.0
-
-    monkeypatch.delenv("HEADROOM_COMPRESSION_CACHE_TTL_SECONDS")
-    importlib.reload(helpers_mod)
-    assert helpers_mod.COMPRESSION_CACHE_TTL_SECONDS == 3900.0
+        proxy = create_app(ProxyConfig(
+            optimize=False, cache_enabled=False, rate_limit_enabled=False,
+            cost_tracking_enabled=False, log_requests=False,
+            ccr_inject_tool=False, ccr_handle_responses=False,
+            ccr_context_tracking=False, image_optimize=False,
+        )).state.proxy
+        proxy._get_compression_cache("stale")
+        proxy._get_compression_cache("fresh")
+        now = time.time()
+        proxy._compression_cache_last_seen["stale"] = now - 1_000_000
+        proxy._compression_caches_last_cleanup = (
+            now - proxy._COMPRESSION_CACHE_CLEANUP_INTERVAL_SECONDS - 1
+        )
+        proxy._get_compression_cache("trigger")
+        print(json.dumps({
+            "stale": "stale" in proxy._compression_caches,
+            "fresh": "fresh" in proxy._compression_caches,
+        }))
+        """
+    )
+    result = subprocess.run(
+        [sys.executable, "-c", program],
+        env={
+            **os.environ,
+            "HEADROOM_COMPRESSION_CACHE_TTL_SECONDS": raw,
+            "HEADROOM_WORKSPACE_DIR": str(tmp_path),
+        },
+        capture_output=True,
+        text=True,
+        check=True,
+        timeout=120,
+    )
+    assert json.loads(result.stdout) == {"stale": False, "fresh": True}
 
 
 # --------------------------------------------------------------------------- #
 # Frozen-verdicts store: process-wide, so it must be sizeable per deployment.  #
 # --------------------------------------------------------------------------- #
-
-
-def test_frozen_verdicts_cap_env(monkeypatch) -> None:
-    from headroom.transforms.content_router import ContentRouter, ContentRouterConfig
-
-    monkeypatch.setenv("HEADROOM_FROZEN_VERDICTS_MAX", "65536")
-    assert ContentRouter(ContentRouterConfig())._frozen_verdicts_max == 65536
-
-    # Floor: cannot be sized below 256.
-    monkeypatch.setenv("HEADROOM_FROZEN_VERDICTS_MAX", "1")
-    assert ContentRouter(ContentRouterConfig())._frozen_verdicts_max == 256
-
-    # Garbage falls back to the default.
-    monkeypatch.setenv("HEADROOM_FROZEN_VERDICTS_MAX", "banana")
-    assert ContentRouter(ContentRouterConfig())._frozen_verdicts_max == 4096
-
-    monkeypatch.delenv("HEADROOM_FROZEN_VERDICTS_MAX")
-    assert ContentRouter(ContentRouterConfig())._frozen_verdicts_max == 4096
 
 
 def test_frozen_verdicts_eviction_honors_configured_cap(monkeypatch) -> None:

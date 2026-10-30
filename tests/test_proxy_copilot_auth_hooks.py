@@ -6,11 +6,11 @@ from starlette.requests import Request
 from starlette.responses import StreamingResponse
 
 from headroom import paths
+from headroom.proxy.handlers import openai as openai_mod
 from headroom.proxy.server import HeadroomProxy, ProxyConfig
 
 
 def test_openai_chat_routes_copilot_requests_per_model() -> None:
-    from headroom.proxy.handlers import openai as openai_mod
 
     copilot_base = "https://api.githubcopilot.com"
     gpt54_mini_url = openai_mod.build_copilot_upstream_url(

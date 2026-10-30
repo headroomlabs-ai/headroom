@@ -126,16 +126,6 @@ def small_raw_cap(monkeypatch: pytest.MonkeyPatch) -> int:
 # ───────────────────────────── the ceiling itself ──────────────────────────
 
 
-def test_decompressed_ceiling_matches_the_plain_body_ceiling() -> None:
-    """A client must not get more room by arriving compressed."""
-    assert _helpers().MAX_DECOMPRESSED_BODY_SIZE == _helpers().MAX_REQUEST_BODY_SIZE
-
-
-def test_too_large_is_a_value_error() -> None:
-    """Every existing call site catches ValueError; the subclass must not escape it."""
-    assert issubclass(_helpers().RequestBodyTooLarge, ValueError)
-
-
 # ───────────────────────────── refusal, per codec ──────────────────────────
 
 

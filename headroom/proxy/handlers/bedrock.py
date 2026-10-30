@@ -84,6 +84,7 @@ class BedrockHandlerMixin:
             read_request_json_with_bytes,
         )
         from headroom.proxy.modes import is_cache_mode
+        from headroom.proxy.request_limit_policy import COMPRESSION_BODY_MAX_BYTES
         from headroom.utils import extract_user_query
 
         start_time = time.time()
@@ -176,12 +177,22 @@ class BedrockHandlerMixin:
         messages = body.get("messages")
         bypass = (
             _headroom_bypass_enabled(request.headers)
+            or len(raw) > COMPRESSION_BODY_MAX_BYTES
             or not getattr(self.config, "optimize", True)  # type: ignore[attr-defined]
             or is_cache_mode(getattr(self.config, "mode", "token"))  # type: ignore[attr-defined]
             or not isinstance(messages, list)
             or not messages
             or len(messages) > MAX_MESSAGE_ARRAY_LENGTH
         )
+        if len(raw) > COMPRESSION_BODY_MAX_BYTES:
+            tags["passthrough_reason"] = "request_body_soft_limit"
+            logger.info(
+                "[%s] event=compression_passthrough reason=request_body_soft_limit "
+                "bytes=%d threshold=%d",
+                request_id,
+                len(raw),
+                COMPRESSION_BODY_MAX_BYTES,
+            )
 
         outbound = raw
         original_tokens = 0

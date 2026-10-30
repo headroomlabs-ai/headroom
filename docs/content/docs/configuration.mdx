@@ -21,6 +21,53 @@ See [Runtime Rollouts](/docs/runtime-rollouts) for policy, provenance, and
 contributor rules.
 If Codex history disappeared after using an older wrapper, see [Recover Codex State](/docs/codex-recovery) before wrapping Codex again.
 
+## Proxy request-body admission
+
+| Variable | Default | Purpose |
+|----------|---------|---------|
+| `HEADROOM_REQUEST_BODY_MAX_BYTES` | `104857600` (100 MiB) | Hard whole-request ceiling, resolved at process startup. Must be a positive integer. |
+
+The ceiling applies to the complete history, not each message or text chunk.
+Declared oversized HTTP bodies are rejected before reading them; chunked bodies
+are metered as they arrive. Oversized wire bodies return HTTP 413 by default,
+before JSON parsing, image classification, tokenization, or compression.
+Decompressed gzip, deflate, Brotli, and Zstandard bodies obey the same ceiling;
+`/v1/compress` returns the same size refusal for oversized decoded bodies,
+including requests with `x-headroom-bypass: true`.
+
+The previous 100 MiB admission default is retained. Anthropic Messages,
+OpenAI Chat/Responses, Gemini generateContent, and Bedrock InvokeModel HTTP
+routes have a separate **16 MiB compression threshold**, measured on the decoded body.
+Larger admitted histories skip body normalization, image processing, memory
+injection, tokenization, and compression. Native upstreams receive the original
+decoded JSON bytes; obsolete compression headers are removed. Streaming and
+non-streaming responses retain their normal protocol.
+
+Required auth-specific wire settings still apply: ChatGPT Responses receives
+`store: false` even when the client omitted it or set it to true. This
+reserializes the body only when that setting needs rewriting; an already-valid
+body remains byte-faithful. Vertex route-forced streaming is retained even
+without a `stream` body field.
+
+Envelope/model routing currently requires one JSON parse. Configured or
+per-request translating backends still perform the necessary wire conversion,
+but do not run request-side compression. Passthrough outcomes report zero
+compression savings and use provider-reported usage when available; missing
+usage is not presented as a local token measurement.
+
+The soft threshold applies to HTTP forwarding, not explicit `/v1/compress`
+calls or WebSocket messages. Auth, routing, rate and budget gates remain in
+force. Operators can choose a different hard ceiling and restart the proxy:
+
+```bash
+HEADROOM_REQUEST_BODY_MAX_BYTES=33554432 headroom proxy
+```
+
+Neither threshold is a process-memory limit or a mechanism for cancelling
+workers already running. JSON decoding, transport buffers, protocol translation,
+and third-party ASGI middleware still require memory; bound concurrency
+separately on small hosts.
+
 ## SDK Modes (`default_mode` / `headroom_mode`)
 
 These modes apply to SDK usage via `HeadroomClient(default_mode=...)` or per-request `headroom_mode=...`. They are **not** the same as the proxy `--mode` flag.

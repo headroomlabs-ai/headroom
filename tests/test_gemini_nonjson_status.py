@@ -10,14 +10,6 @@ import pytest
 from headroom.proxy.handlers.gemini import GeminiHandlerMixin
 
 
-class _FakeRequest:
-    def __init__(self) -> None:
-        self.headers: dict[str, str] = {}
-        self.query_params: dict[str, str] = {}
-        self.url = SimpleNamespace(path="/v1beta/models/gemini-pro:generateContent", query="")
-        self.scope: dict = {"type": "http", "method": "POST"}
-
-
 class _NonJsonResponse:
     status_code = 503
     content = b"<html>temporarily unavailable</html>"
@@ -73,20 +65,17 @@ class _Handler(GeminiHandlerMixin):
 
 @pytest.mark.asyncio
 async def test_generate_content_forwards_non_json_upstream_status(
-    monkeypatch: pytest.MonkeyPatch,
+    monkeypatch: pytest.MonkeyPatch, gemini_request
 ) -> None:
-    async def payload(request):  # noqa: ANN001, ANN201
-        return {"contents": [{"role": "user", "parts": [{"text": "hello"}]}]}
 
     class _Tokenizer:
         def count_messages(self, messages):  # noqa: ANN001, ANN201
             return 7
 
-    monkeypatch.setattr("headroom.proxy.helpers._read_request_json", payload)
     monkeypatch.setattr("headroom.tokenizers.get_tokenizer", lambda model: _Tokenizer())
 
     handler = _Handler()
-    response = await handler.handle_gemini_generate_content(_FakeRequest(), "gemini-pro")
+    response = await handler.handle_gemini_generate_content(gemini_request, "gemini-pro")
 
     assert response.status_code == 503
     assert response.body == _NonJsonResponse.content

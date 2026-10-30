@@ -343,7 +343,12 @@ class GeminiHandlerMixin:
         from fastapi import HTTPException
         from fastapi.responses import JSONResponse, Response
 
-        from headroom.proxy.helpers import MAX_REQUEST_BODY_SIZE, _read_request_json
+        from headroom.proxy.helpers import (
+            MAX_REQUEST_BODY_SIZE,
+            RequestBodyTooLarge,
+            read_request_json_with_bytes,
+        )
+        from headroom.proxy.request_limit_policy import COMPRESSION_BODY_MAX_BYTES
         from headroom.utils import extract_user_query
 
         def _stream_url(base_url: str) -> str:
@@ -373,7 +378,9 @@ class GeminiHandlerMixin:
 
         # Parse request
         try:
-            body = await _read_request_json(request)
+            body, original_body_bytes = await read_request_json_with_bytes(request)
+        except RequestBodyTooLarge:
+            raise
         except (json.JSONDecodeError, ValueError) as e:
             return JSONResponse(
                 status_code=400,
@@ -414,6 +421,64 @@ class GeminiHandlerMixin:
             stripped_count=_pre_strip_count_gem,
             request_id=request_id,
         )
+        # Rate limiting: one identity rule for every provider
+        # (headroom/proxy/rate_limit_identity.py).
+        if self.rate_limiter:
+            rate_key = rate_limit_identity(request, headers)
+            allowed, wait_seconds = await self.rate_limiter.check_request(rate_key)
+            if not allowed:
+                await self.metrics.record_rate_limited(provider=provider_name, source="headroom")
+                raise HTTPException(
+                    status_code=429,
+                    detail=f"Rate limited. Retry after {wait_seconds:.1f}s",
+                )
+
+        # Budget check
+        cost_tracker = self.cost_tracker
+        if cost_tracker:
+            allowed, remaining = cost_tracker.check_budget()
+            if not allowed:
+                raise HTTPException(
+                    status_code=429,
+                    detail=cost_tracker.budget_denial_detail(),
+                )
+        if len(original_body_bytes) > COMPRESSION_BODY_MAX_BYTES:
+            is_streaming = request.query_params.get("alt") == "sse" or request.url.path.endswith(
+                ":streamGenerateContent"
+            )
+            passthrough_path = request.url.path
+            if is_streaming:
+                passthrough_path = passthrough_path.replace(
+                    ":generateContent", ":streamGenerateContent"
+                )
+            passthrough_base = upstream_base_url or self.GEMINI_API_URL
+            passthrough_url = build_copilot_upstream_url(passthrough_base, passthrough_path)
+            if is_streaming:
+                passthrough_url = _stream_url(passthrough_url)
+            elif request.url.query:
+                passthrough_url = f"{passthrough_url}?{request.url.query}"
+            headers.pop("content-encoding", None)
+            headers.pop("transfer-encoding", None)
+            assert self.http_client is not None, "http_client must be initialized"
+            upstream_request = self.http_client.build_request(
+                request.method, passthrough_url, headers=headers, content=original_body_bytes
+            )
+            logger.info(
+                "[%s] event=compression_passthrough reason=request_body_soft_limit "
+                "bytes=%d threshold=%d",
+                request_id,
+                len(original_body_bytes),
+                COMPRESSION_BODY_MAX_BYTES,
+            )
+            return await self.handle_passthrough(
+                request,
+                passthrough_base,
+                endpoint_name="streamGenerateContent" if is_streaming else "generateContent",
+                provider=provider_name,
+                _upstream_request=upstream_request,
+                _model=model,
+                _start_time=start_time,
+            )
 
         # Memory: Get user ID when memory is enabled. Reads `request.headers`
         # directly because `headers` was stripped of `x-headroom-*` (PR-A5).
@@ -470,28 +535,6 @@ class GeminiHandlerMixin:
             mode_name=get_memory_injection_mode(),
         )
         memory_decision.apply_to_tags(tags)
-
-        # Rate limiting: one identity rule for every provider
-        # (headroom/proxy/rate_limit_identity.py).
-        if self.rate_limiter:
-            rate_key = rate_limit_identity(request, headers)
-            allowed, wait_seconds = await self.rate_limiter.check_request(rate_key)
-            if not allowed:
-                await self.metrics.record_rate_limited(provider=provider_name, source="headroom")
-                raise HTTPException(
-                    status_code=429,
-                    detail=f"Rate limited. Retry after {wait_seconds:.1f}s",
-                )
-
-        # Budget check
-        cost_tracker = self.cost_tracker
-        if cost_tracker:
-            allowed, remaining = cost_tracker.check_budget()
-            if not allowed:
-                raise HTTPException(
-                    status_code=429,
-                    detail=cost_tracker.budget_denial_detail(),
-                )
 
         # Convert Gemini format to messages for optimization
         system_instruction = body.get("systemInstruction")

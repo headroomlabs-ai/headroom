@@ -102,6 +102,13 @@ Headroom uses a `pyproject.toml`/`maturin` build backend. Older `pip`
 versions may fail editable installs by looking for `setup.py`; upgrade `pip`
 first or use `uv sync --extra dev`.
 
+Handler tests that read request bodies should use a real Starlette `Request`
+with ASGI receive messages, including streamed chunks, rather than patching the
+body reader. Size-limit regressions must configure an explicit test ceiling;
+the production ceiling is independent of the compression admission threshold.
+Avoid replacing imported proxy packages in `sys.modules`: it can split live
+helper and exception identities across full-suite test orderings.
+
 ### Dev Containers
 
 Two configs ship for VS Code / Codespaces:

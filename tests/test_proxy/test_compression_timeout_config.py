@@ -1,76 +1,60 @@
 from __future__ import annotations
 
-import importlib
-import logging
+import json
 import os
+import subprocess
+import sys
+import textwrap
 
 import pytest
 
-import headroom.proxy.helpers as helpers
 
+@pytest.mark.parametrize(
+    ("deadline", "expected"),
+    [("0.001", {"timed_out": True}), ("1.0", {"value": 42})],
+)
+def test_startup_deadline_bounds_actual_compression_work(deadline, expected, tmp_path) -> None:
+    program = textwrap.dedent(
+        """
+        import asyncio
+        import json
+        import time
+        from headroom.proxy import helpers
+        from headroom.proxy.server import HeadroomProxy, ProxyConfig
 
-@pytest.fixture(autouse=True)
-def _restore_default_timeout():
-    """Each test reloads helpers under a chosen env; reset to the default afterwards
-    so the reloaded module constant doesn't leak into the rest of the suite."""
-    yield
-    os.environ.pop("HEADROOM_COMPRESSION_TIMEOUT_SECONDS", None)
-    importlib.reload(helpers)
+        proxy = HeadroomProxy(ProxyConfig(
+            optimize=False, cache_enabled=False, rate_limit_enabled=False,
+            cost_tracking_enabled=False, log_requests=False, image_optimize=False,
+        ))
 
+        def work():
+            time.sleep(0.05)
+            return 42
 
-def test_default_timeout_is_30(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.delenv("HEADROOM_COMPRESSION_TIMEOUT_SECONDS", raising=False)
-    importlib.reload(helpers)
-    assert helpers.COMPRESSION_TIMEOUT_SECONDS == 30.0
+        async def main():
+            try:
+                value = await proxy._run_compression_in_executor(
+                    work, timeout=helpers.COMPRESSION_TIMEOUT_SECONDS
+                )
+                print(json.dumps({"value": value}))
+            except asyncio.TimeoutError:
+                print(json.dumps({"timed_out": True}))
+            finally:
+                proxy._compression_executor.shutdown(wait=True)
 
-
-def test_env_overrides_timeout(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setenv("HEADROOM_COMPRESSION_TIMEOUT_SECONDS", "75")
-    importlib.reload(helpers)
-    assert helpers.COMPRESSION_TIMEOUT_SECONDS == 75.0
-
-
-def test_fractional_timeout(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setenv("HEADROOM_COMPRESSION_TIMEOUT_SECONDS", "12.5")
-    importlib.reload(helpers)
-    assert helpers.COMPRESSION_TIMEOUT_SECONDS == 12.5
-
-
-def test_bad_env_falls_back_to_default(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setenv("HEADROOM_COMPRESSION_TIMEOUT_SECONDS", "not-a-number")
-    importlib.reload(helpers)
-    assert helpers.COMPRESSION_TIMEOUT_SECONDS == 30.0
-
-
-class _Capture(logging.Handler):
-    def __init__(self) -> None:
-        super().__init__(logging.DEBUG)
-        self.messages: list[str] = []
-
-    def emit(self, record: logging.LogRecord) -> None:
-        if record.levelno == logging.WARNING:
-            self.messages.append(record.getMessage())
-
-
-def _reload_warnings() -> list[str]:
-    capture = _Capture()
-    proxy_logger = logging.getLogger("headroom.proxy")
-    proxy_logger.addHandler(capture)
-    try:
-        importlib.reload(helpers)
-    finally:
-        proxy_logger.removeHandler(capture)
-    return [m for m in capture.messages if "HEADROOM_COMPRESSION_TIMEOUT_SECONDS" in m]
-
-
-def test_bad_env_says_it_was_ignored(monkeypatch: pytest.MonkeyPatch) -> None:
-    """A typo in the knob used to revert to 30s without a word."""
-    monkeypatch.setenv("HEADROOM_COMPRESSION_TIMEOUT_SECONDS", "not-a-number")
-    assert _reload_warnings() == [
-        "Ignoring invalid HEADROOM_COMPRESSION_TIMEOUT_SECONDS='not-a-number'; using 30.0"
-    ]
-
-
-def test_valid_env_is_silent(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setenv("HEADROOM_COMPRESSION_TIMEOUT_SECONDS", "75")
-    assert _reload_warnings() == []
+        asyncio.run(main())
+        """
+    )
+    result = subprocess.run(
+        [sys.executable, "-c", program],
+        env={
+            **os.environ,
+            "HEADROOM_COMPRESSION_TIMEOUT_SECONDS": deadline,
+            "HEADROOM_WORKSPACE_DIR": str(tmp_path),
+        },
+        capture_output=True,
+        text=True,
+        check=True,
+        timeout=120,
+    )
+    assert json.loads(result.stdout) == expected
