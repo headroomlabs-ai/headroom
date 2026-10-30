@@ -15,6 +15,11 @@ from unittest.mock import patch
 import pytest
 
 import headroom.transforms.code_compressor as cc
+from headroom.cache.compression_store import (
+    CompressionStore,
+    clear_request_compression_store,
+    set_request_compression_store,
+)
 from headroom.transforms.code_compressor import (
     CodeAwareCompressor,
     CodeCompressionResult,
@@ -208,6 +213,46 @@ def generate_go_code(n_functions: int = 3) -> str:
         )
 
     return "\n".join(lines)
+
+
+@pytest.mark.skipif(not TREE_SITTER_INSTALLED, reason="tree-sitter not installed")
+@pytest.mark.parametrize(
+    ("language", "code", "comment_prefix"),
+    [
+        pytest.param("python", generate_python_code(), "#", id="python"),
+        pytest.param("javascript", generate_javascript_code(), "//", id="javascript"),
+        pytest.param("typescript", generate_javascript_code(), "//", id="typescript"),
+        pytest.param("go", generate_go_code(), "//", id="go"),
+    ],
+)
+def test_ccr_marker_preserves_code_syntax(language, code, comment_prefix):
+    """CCR metadata must be a comment in the final output, not just before storage."""
+    store = CompressionStore()
+    set_request_compression_store(store)
+    try:
+        compressor = CodeAwareCompressor(
+            CodeCompressorConfig(
+                min_tokens_for_compression=10,
+                enable_ccr=True,
+                fallback_to_kompress=False,
+            )
+        )
+        result = compressor.compress(code, language=language)
+
+        assert result.cache_key is not None
+        assert result.syntax_valid
+        # Parse the returned source, including the marker appended after the
+        # compressor's internal syntax check (#4478, item 4).
+        assert compressor._verify_syntax(result.compressed, CodeLanguage(language))
+        marker = result.compressed.splitlines()[-1]
+        assert marker.startswith(f"{comment_prefix} [")
+        assert f"Retrieve more: hash={result.cache_key}." in marker
+        assert "Expires in 5m.]" in marker
+        entry = store.retrieve(result.cache_key)
+        assert entry is not None
+        assert entry.original_content == code
+    finally:
+        clear_request_compression_store()
 
 
 # =============================================================================

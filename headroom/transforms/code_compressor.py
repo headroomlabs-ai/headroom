@@ -1510,8 +1510,9 @@ class CodeAwareCompressor(Transform):
 
                     # Use the actual config attribute (not the wrong name)
                     ttl_min = max(1, self.config.ccr_ttl // 60)
+                    comment_prefix = _LANG_CONFIGS[detected_lang].comment_prefix
                     compressed += (
-                        f"\n# [{original_tokens - compressed_tokens} tokens compressed."
+                        f"\n{comment_prefix} [{original_tokens - compressed_tokens} tokens compressed."
                         f"{summary_str}"
                         f" Retrieve more: hash={cache_key}."
                         f" Expires in {ttl_min}m.]"
