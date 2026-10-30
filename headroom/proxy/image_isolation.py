@@ -20,10 +20,13 @@ logger = logging.getLogger("headroom.proxy")
 _IMAGE_POOL_LOCK = threading.Lock()
 _IMAGE_POOL: ProcessPoolExecutor | None = None
 
-# Number of calls currently awaiting a result from ``_IMAGE_POOL``. A
-# timeout-driven reset tears down the whole single-worker pool (#4418), so it
-# must only run when the failing call is the *only* one using it. When other
-# requests are mid-flight their queued or running jobs must be left alone.
+# Number of calls currently awaiting a result from the *published*
+# ``_IMAGE_POOL``. A timeout-driven reset tears down the whole single-worker
+# pool (#4418), so it must only run when the failing call is the *only* one
+# using that pool. The counter is paired with the published pool under
+# ``_IMAGE_POOL_LOCK``: acquire creates/returns the pool and increments in one
+# critical section, and unpublishing zeros the counter so a release of an
+# already-reset pool cannot underflow a replacement.
 _IMAGE_POOL_INFLIGHT = 0
 
 # Per-worker-process cached compressor. The image pool is a persistent
@@ -121,31 +124,57 @@ _IMAGE_WORKER: Callable[
 ] = _compress_messages_worker
 
 
-def _image_pool() -> ProcessPoolExecutor:
+class _PoolJobCancelled(Exception):
+    """The process-pool job was cancelled (typically by a pool reset).
+
+    ``ProcessPoolExecutor.shutdown(cancel_futures=True)`` cancels the wrapped
+    concurrent.futures job, which asyncio surfaces as ``CancelledError``. That
+    is not a request to cancel *this* task, and ``Task.cancelling()`` (the
+    discriminator) only exists on Python 3.11+. Mapping pool-job cancellation
+    onto a regular exception lets genuine caller cancellation propagate from
+    ``wait_for`` on 3.10 as well as 3.11+.
+    """
+
+
+def _ensure_image_pool_locked() -> ProcessPoolExecutor:
+    """Return the published pool, creating it if needed. Caller holds the lock."""
     global _IMAGE_POOL
+    if _IMAGE_POOL is None:
+        _IMAGE_POOL = ProcessPoolExecutor(
+            max_workers=1,
+            mp_context=multiprocessing.get_context("spawn"),
+        )
+    return _IMAGE_POOL
+
+
+def _image_pool() -> ProcessPoolExecutor:
     with _IMAGE_POOL_LOCK:
-        if _IMAGE_POOL is None:
-            _IMAGE_POOL = ProcessPoolExecutor(
-                max_workers=1,
-                mp_context=multiprocessing.get_context("spawn"),
-            )
-        return _IMAGE_POOL
+        return _ensure_image_pool_locked()
 
 
 def _acquire_image_pool() -> ProcessPoolExecutor:
-    """Return the shared pool and record one more call waiting on it."""
+    """Return the shared pool and record one more call waiting on it.
+
+    Pool lookup/creation and the inflight increment share one lock so a
+    concurrent reset cannot unpublished the pool after we observed it and
+    before we counted this call.
+    """
     global _IMAGE_POOL_INFLIGHT
-    pool = _image_pool()
     with _IMAGE_POOL_LOCK:
+        pool = _ensure_image_pool_locked()
         _IMAGE_POOL_INFLIGHT += 1
         return pool
 
 
-def _release_image_pool() -> None:
-    """Record that a call waiting on the shared pool has finished."""
+def _release_image_pool(pool: ProcessPoolExecutor) -> None:
+    """Record that a call waiting on ``pool`` has finished.
+
+    Inflight counts the currently published pool. A release for a pool that
+    was already unpublished is a no-op so it cannot underflow a replacement.
+    """
     global _IMAGE_POOL_INFLIGHT
     with _IMAGE_POOL_LOCK:
-        if _IMAGE_POOL_INFLIGHT > 0:
+        if _IMAGE_POOL is pool and _IMAGE_POOL_INFLIGHT > 0:
             _IMAGE_POOL_INFLIGHT -= 1
 
 
@@ -162,9 +191,9 @@ def _reset_image_pool(pool: ProcessPoolExecutor | None = None) -> None:
     other call's queued or running job (#4418). Refuse the destructive teardown
     while any other call is still using the pool: those requests fail open on
     their own and keep their compression instead of losing it to this one's
-    timeout.
+    timeout. Usage is checked under the same lock as acquire.
     """
-    global _IMAGE_POOL
+    global _IMAGE_POOL, _IMAGE_POOL_INFLIGHT
     with _IMAGE_POOL_LOCK:
         if pool is None:
             pool = _IMAGE_POOL
@@ -172,6 +201,7 @@ def _reset_image_pool(pool: ProcessPoolExecutor | None = None) -> None:
             return
         if _IMAGE_POOL is pool:
             _IMAGE_POOL = None
+            _IMAGE_POOL_INFLIGHT = 0
     if pool is None:
         return
     # shutdown() sets _processes to None, so take the workers first.
@@ -179,6 +209,41 @@ def _reset_image_pool(pool: ProcessPoolExecutor | None = None) -> None:
     pool.shutdown(wait=False, cancel_futures=True)
     for worker in workers:
         worker.kill()
+
+
+async def _await_pool_job(
+    future: asyncio.Future[Any],
+    timeout: float,
+) -> tuple[list[dict[str, Any]], dict[str, Any] | None]:
+    """Await ``future`` without treating its cancellation as task cancellation.
+
+    A cancelled executor future and a cancelled caller both used to surface as
+    ``asyncio.CancelledError``. On Python 3.10 there is no ``Task.cancelling()``
+    to tell them apart, so the previous handler either leaked ``AttributeError``
+    or could not propagate genuine cancellation. Complete a private waiter
+    instead: executor cancellation becomes ``_PoolJobCancelled``, while
+    ``wait_for`` only raises ``CancelledError`` when *this* task is cancelled.
+    """
+    loop = asyncio.get_running_loop()
+    waiter: asyncio.Future[Any] = loop.create_future()
+
+    def _propagate(done: asyncio.Future[Any]) -> None:
+        if waiter.done():
+            return
+        try:
+            if done.cancelled():
+                waiter.set_exception(_PoolJobCancelled())
+                return
+            exc = done.exception()
+            if exc is not None:
+                waiter.set_exception(exc)
+                return
+            waiter.set_result(done.result())
+        except asyncio.InvalidStateError:
+            return
+
+    future.add_done_callback(_propagate)
+    return await asyncio.wait_for(waiter, timeout=timeout)
 
 
 async def run_image_compression_isolated(
@@ -195,16 +260,8 @@ async def run_image_compression_isolated(
         pool = _acquire_image_pool()
         acquired = True
         future = loop.run_in_executor(pool, _IMAGE_WORKER, messages, provider, deadline)
-        return await asyncio.wait_for(future, timeout=timeout)
-    except asyncio.CancelledError:
-        # A cancelled queued job (pool reset) or a real task cancellation both
-        # surface here. ``asyncio.CancelledError`` is a ``BaseException`` since
-        # 3.8, so the ``except Exception`` clauses below (and at the call sites)
-        # never saw it and it escaped the request handler instead of failing
-        # open. Re-raise only when *this* task is genuinely being cancelled;
-        # otherwise forward the original payload (#4418).
-        if asyncio.current_task() is not None and asyncio.current_task().cancelling():
-            raise
+        return await _await_pool_job(future, timeout)
+    except _PoolJobCancelled:
         logger.warning("Image compression worker cancelled; forwarding original image payload")
         _reset_image_pool(pool)
         return messages, None
@@ -224,5 +281,5 @@ async def run_image_compression_isolated(
         _reset_image_pool(pool)
         return messages, None
     finally:
-        if acquired:
-            _release_image_pool()
+        if acquired and pool is not None:
+            _release_image_pool(pool)
