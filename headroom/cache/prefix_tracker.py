@@ -1235,6 +1235,28 @@ class PrefixCacheTracker:
         self._tokens_preserved: int = 0
         self._compression_foregone_tokens: int = 0
 
+    def seed_replay_prefix(self, donor: PrefixCacheTracker, shared: int) -> None:
+        """Start from the first ``shared`` messages ``donor`` forwarded last turn.
+
+        Those bytes are what the provider cached for the prefix this new lineage
+        shares with ``donor``, so replaying them keeps that prefix a cache hit.
+        """
+        self._last_original_messages = donor._last_original_messages[:shared]
+        self._last_forwarded_messages = donor._last_forwarded_messages[:shared]
+        self._turn_number = donor._turn_number
+        self._cached_message_count = min(donor._cached_message_count, shared)
+        if shared >= donor._cached_message_count:
+            self._cached_token_count = donor._cached_token_count
+        else:
+            self._cached_token_count = sum(
+                self._estimate_message_tokens(
+                    self._last_forwarded_messages[: self._cached_message_count]
+                )
+            )
+        if donor is not self:
+            self._idle_seconds_at_fetch = max(0.0, time.time() - donor._last_activity)
+            self.observe_cache_ttl(donor._cache_ttl_seconds)
+
     def get_frozen_message_count(self) -> int:
         """How many leading messages to skip compression on the next turn.
 
@@ -1642,6 +1664,35 @@ class PrefixCacheTracker:
         return counts
 
 
+# A new lineage is seeded from an existing one only when they share at least
+# this many leading messages; shorter overlaps are mostly a shared preamble.
+_MIN_SEED_PREFIX_MESSAGES = 8
+
+
+def _shared_message_prefix(current: list[Any], previous: list[Any]) -> int:
+    """Number of leading messages of ``previous`` that ``current`` repeats.
+
+    Lineage lookup sees ``[synthetic system message, *messages]`` while a turn
+    records its history without it, so leading system entries ``previous``
+    doesn't have are skipped before comparing.
+    """
+    lead = 0
+    while (
+        lead < len(current)
+        and isinstance(current[lead], dict)
+        and current[lead].get("role") == "system"
+        and not (previous and isinstance(previous[0], dict) and previous[0].get("role") == "system")
+    ):
+        lead += 1
+    current = current[lead:]
+    shared = 0
+    for cur, prev in zip(current, previous):
+        if _canonicalize_for_prefix_compare(cur) != _canonicalize_for_prefix_compare(prev):
+            break
+        shared += 1
+    return shared
+
+
 def _lineage_snapshot(obj: Any) -> Any:
     """Structural copy of a canonical projection for lineage-chain storage.
 
@@ -1785,6 +1836,35 @@ class SessionTrackerStore:
             self._lineage_affinities.pop(tracker_key, None)
             if not family:
                 del self._lineages[session_id]
+
+    def _divergence_seed(
+        self,
+        family: dict[str, Any],
+        messages: list[dict[str, Any]],
+        cache_affinity: str | None,
+    ) -> tuple[PrefixCacheTracker, int] | None:
+        """Lineage whose last forwarded turn shares the longest prefix with ``messages``.
+
+        A turn that diverges mid-history (rewind, compaction request) matches no
+        lineage, yet its shared prefix is cached as that lineage's forwarded
+        bytes. Ties go to the most recently active lineage.
+        """
+        if os.environ.get("HEADROOM_DIVERGENCE_SEED") == "0":
+            return None
+        best: tuple[int, float, PrefixCacheTracker] | None = None
+        for key in family:
+            donor = self._trackers.get(key)
+            if donor is None or self._lineage_affinities.get(key) != cache_affinity:
+                continue
+            orig, fwd = donor._last_original_messages, donor._last_forwarded_messages
+            if not orig or len(orig) != len(fwd):
+                continue
+            shared = _shared_message_prefix(messages, orig)
+            if shared >= _MIN_SEED_PREFIX_MESSAGES and (
+                best is None or (shared, donor._last_activity) > best[:2]
+            ):
+                best = (shared, donor._last_activity, donor)
+        return None if best is None else (best[2], best[0])
 
     def resolve_tracker(
         self,
@@ -1961,6 +2041,7 @@ class SessionTrackerStore:
                 ):
                     best_key = tail_candidates[0][1]
 
+        seed = self._divergence_seed(family, messages, cache_affinity) if best_key is None else None
         if best_key is None:
             cap = self._default_config.max_lineages_per_session
             if len(family) >= cap:
@@ -1998,10 +2079,21 @@ class SessionTrackerStore:
         # Lookup can evict an expired bare tracker and detach an empty family.
         # Stamp the replacement into the live index, not that detached mapping.
         family = self._lineages.setdefault(session_id, family)
+        if seed is not None:
+            tracker.seed_replay_prefix(*seed)
         family[best_key] = snap
         self._lineage_affinities[best_key] = cache_affinity
         if isinstance(tracker, PrefixCacheTracker):  # test stubs keep no turns
             tracker._resume_turn(best_turn if best_turn is not None else latest_turn(best_key))
+            # A matched turn can still end before the recorded history does
+            # (Claude Code's compaction request drops the last reply), and the
+            # overlay only replays a history the request extends. Keep the part
+            # it shares, so that prefix is replayed instead of nothing.
+            orig = tracker._last_original_messages
+            if seed is None and len(orig) == len(tracker._last_forwarded_messages):
+                shared = _shared_message_prefix(messages, orig)
+                if _MIN_SEED_PREFIX_MESSAGES <= shared < len(orig):
+                    tracker.seed_replay_prefix(tracker, shared)
             turn = next(self._turn_counter)
             history = self._lineage_history.setdefault(best_key, deque(maxlen=_LINEAGE_HISTORY))
             branch = next((entry for entry in history if entry[1] == best_turn), None)
