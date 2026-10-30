@@ -235,3 +235,22 @@ describe("compress() sends Anthropic-format input to the proxy natively", () => 
     expect(result.messages).toEqual(returned);
   });
 });
+
+describe("compress() honors a declared input format", () => {
+  beforeEach(() => {
+    mockFetch.mockReset();
+  });
+
+  it("converts a text-only Vercel prompt both ways when format is declared, instead of autodetecting OpenAI", async () => {
+    // Nothing in this prompt distinguishes it from OpenAI, so autodetection would hand it
+    // to the proxy unconverted and return OpenAI shape (a string) to an AI SDK caller.
+    const prompt = [{ role: "user", content: [{ type: "text", text: "hi" }] }];
+    mockFetch.mockResolvedValueOnce(okResponse({ messages: [{ role: "user", content: "compressed" }] }));
+
+    const result = await compress(prompt, { baseUrl: "http://localhost:8787", format: "vercel" });
+
+    const body = JSON.parse(mockFetch.mock.calls[0][1].body);
+    expect(body.messages).toEqual([{ role: "user", content: "hi" }]);
+    expect(result.messages).toEqual([{ role: "user", content: [{ type: "text", text: "compressed" }] }]);
+  });
+});

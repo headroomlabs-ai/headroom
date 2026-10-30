@@ -136,4 +136,4 @@ const { output } = await generateText({
 3. Compressed messages are converted back to Vercel format
 4. The original model receives the smaller prompt
 
-All other model behavior (tool calling, structured output, streaming) is unchanged.
+All other model behavior (tool calling, structured output, streaming) is unchanged. Provider state the AI SDK attaches to the prompt travels through untouched: `reasoning` parts (with the Anthropic `signature` or `redactedData`, OpenAI `itemId`, Google `thoughtSignature` they carry) stay in place, and `providerOptions` on messages, text and file parts, tool calls and tool results come back exactly as sent. Only large tool results change.

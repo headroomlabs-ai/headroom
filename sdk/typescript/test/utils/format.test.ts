@@ -223,17 +223,25 @@ describe("vercelToOpenAI", () => {
     });
   });
 
-  it("skips reasoning parts in assistant messages", () => {
+  it("carries reasoning parts in assistant messages ahead of the text, verbatim", () => {
     const result = vercelToOpenAI([
       {
         role: "assistant",
         content: [
-          { type: "reasoning", text: "thinking..." },
+          { type: "reasoning", text: "thinking...", providerOptions: { anthropic: { signature: "SIG" } } },
           { type: "text", text: "answer" },
         ],
       },
     ]);
-    expect(result).toEqual([{ role: "assistant", content: "answer" }]);
+    expect(result).toEqual([
+      {
+        role: "assistant",
+        content: [
+          { type: "reasoning", text: "thinking...", providerOptions: { anthropic: { signature: "SIG" } } },
+          { type: "text", text: "answer" },
+        ],
+      },
+    ]);
   });
 
   it("handles full multi-turn conversation", () => {
@@ -1457,5 +1465,139 @@ describe("Anthropic document sources (text, content, file) and document fields",
       },
     ];
     expect(fromOpenAI(toOpenAI(input), "anthropic")).toEqual(input);
+  });
+});
+
+describe("Vercel converters carry provider reasoning state through the OpenAI round trip", () => {
+  // A LanguageModelV3 prompt as the AI SDK builds it on the second step of a
+  // thinking-enabled tool loop: reasoning parts carry the Anthropic signature /
+  // redacted data, text and tool-call parts carry Google thought signatures,
+  // messages and parts carry Anthropic cache breakpoints.
+  const prompt = [
+    { role: "system", content: "Be brief.", providerOptions: { anthropic: { cacheControl: { type: "ephemeral" } } } },
+    {
+      role: "user",
+      content: [{ type: "text", text: "Read the gateway log.", providerOptions: { anthropic: { cacheControl: { type: "ephemeral" } } } }],
+      providerOptions: { openai: { tag: "u1" } },
+    },
+    {
+      role: "assistant",
+      content: [
+        { type: "reasoning", text: "I should read the log first.", providerOptions: { anthropic: { signature: "SIG-abc123" } } },
+        { type: "reasoning", text: "", providerOptions: { anthropic: { redactedData: "REDACTED-xyz" } } },
+        { type: "text", text: "Reading the log now.", providerOptions: { google: { thoughtSignature: "TS-text" } } },
+        {
+          type: "tool-call",
+          toolCallId: "call_01",
+          toolName: "fetch_gateway_metrics",
+          input: { path: "/var/log/gateway.json" },
+          providerOptions: { google: { thoughtSignature: "TS-999" }, openai: { itemId: "fc_1" } },
+        },
+      ],
+      providerOptions: { anthropic: { cacheControl: { type: "ephemeral" } } },
+    },
+    {
+      role: "tool",
+      content: [
+        {
+          type: "tool-result",
+          toolCallId: "call_01",
+          toolName: "fetch_gateway_metrics",
+          output: { type: "text", value: "row 1\nrow 2" },
+          providerOptions: { anthropic: { cacheControl: { type: "ephemeral" } } },
+        },
+      ],
+      providerOptions: { openai: { tag: "t1" } },
+    },
+  ];
+
+  it("round-trips the whole prompt exactly", () => {
+    expect(openAIToVercel(vercelToOpenAI(prompt))).toEqual(prompt);
+  });
+
+  it("keeps reasoning parts verbatim and in order inside the OpenAI content array", () => {
+    const [assistant] = vercelToOpenAI([prompt[2]]);
+    expect(assistant.content).toEqual([
+      { type: "reasoning", text: "I should read the log first.", providerOptions: { anthropic: { signature: "SIG-abc123" } } },
+      { type: "reasoning", text: "", providerOptions: { anthropic: { redactedData: "REDACTED-xyz" } } },
+      { type: "text", text: "Reading the log now.", providerOptions: { google: { thoughtSignature: "TS-text" } } },
+    ]);
+  });
+
+  it("carries providerOptions and providerExecuted on tool calls", () => {
+    const [assistant] = vercelToOpenAI([
+      {
+        role: "assistant",
+        content: [
+          { type: "tool-call", toolCallId: "ws_1", toolName: "web_search", input: { q: "x" }, providerExecuted: true, providerOptions: { openai: { itemId: "ws_1" } } },
+        ],
+      },
+    ]);
+    expect(assistant.tool_calls).toEqual([
+      {
+        id: "ws_1",
+        type: "function",
+        function: { name: "web_search", arguments: '{"q":"x"}' },
+        providerExecuted: true,
+        providerOptions: { openai: { itemId: "ws_1" } },
+      },
+    ]);
+    const [back] = openAIToVercel([assistant]);
+    expect(back.content).toEqual([
+      { type: "tool-call", toolCallId: "ws_1", toolName: "web_search", input: { q: "x" }, providerExecuted: true, providerOptions: { openai: { itemId: "ws_1" } } },
+    ]);
+  });
+
+  it("carries a provider-executed tool-result part in assistant content verbatim", () => {
+    const part = {
+      type: "tool-result",
+      toolCallId: "ws_1",
+      toolName: "web_search",
+      output: { type: "json", value: { hits: 3 } },
+      providerExecuted: true,
+    };
+    const message = { role: "assistant", content: [{ type: "text", text: "Searching." }, part] };
+    const [converted] = vercelToOpenAI([message]);
+    expect(converted.content).toEqual([{ type: "text", text: "Searching." }, part]);
+    expect(openAIToVercel([converted])).toEqual([message]);
+  });
+
+  it("carries a tool-approval-response part verbatim", () => {
+    const approval = { type: "tool-approval-response", approvalId: "ap_1", approved: true, providerExecuted: true };
+    const converted = vercelToOpenAI([
+      { role: "assistant", content: [{ type: "tool-call", toolCallId: "call_1", toolName: "deploy", input: {} }] },
+      { role: "tool", content: [{ type: "tool-result", toolCallId: "call_1", toolName: "deploy", output: { type: "text", value: "done" } }, approval] },
+    ]);
+    const back = openAIToVercel(converted);
+    expect(back.flatMap((m: any) => m.content)).toContainEqual(approval);
+    expect(back.flatMap((m: any) => m.content)).toContainEqual({ type: "tool-result", toolCallId: "call_1", toolName: "deploy", output: { type: "text", value: "done" } });
+  });
+
+  it("keeps a user text part with providerOptions as a part, and a plain one as a string", () => {
+    const [withOptions] = vercelToOpenAI([prompt[1]]);
+    expect(withOptions.content).toEqual([{ type: "text", text: "Read the gateway log.", providerOptions: { anthropic: { cacheControl: { type: "ephemeral" } } } }]);
+    const [plain] = vercelToOpenAI([{ role: "user", content: [{ type: "text", text: "hi" }] }]);
+    expect(plain.content).toBe("hi");
+  });
+
+  it("still collapses a text-only assistant turn without providerOptions to a string", () => {
+    expect(vercelToOpenAI([{ role: "assistant", content: [{ type: "text", text: "a" }, { type: "text", text: "b" }] }])).toEqual([
+      { role: "assistant", content: "ab" },
+    ]);
+  });
+});
+
+describe("Vercel media parts carry providerOptions through the image_url carrier", () => {
+  it("round-trips providerOptions on a file part", () => {
+    const message = {
+      role: "user",
+      content: [
+        { type: "text", text: "see attached" },
+        { type: "file", mediaType: "application/pdf", data: "JVBERi0=", providerOptions: { anthropic: { citations: { enabled: true } } } },
+      ],
+    };
+    const [converted] = vercelToOpenAI([message]);
+    expect((converted.content as any[])[1].image_url.providerOptions).toEqual({ anthropic: { citations: { enabled: true } } });
+    expect(openAIToVercel([converted])).toEqual([message]);
   });
 });

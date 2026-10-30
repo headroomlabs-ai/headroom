@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
-import type { LanguageModelV3, LanguageModelV4FilePart, LanguageModelV4Prompt } from "@ai-sdk/provider";
+import type { LanguageModelV3, LanguageModelV3Prompt, LanguageModelV4FilePart, LanguageModelV4Prompt } from "@ai-sdk/provider";
 import {
   headroomMiddleware,
   compressVercelMessages,
@@ -510,5 +510,59 @@ describe("withHeadroom", () => {
     } as any);
 
     expect(fakeModel.doGenerate).toHaveBeenCalled();
+  });
+});
+
+describe("headroomMiddleware carries provider reasoning state", () => {
+  beforeEach(() => {
+    mockFetch.mockReset();
+  });
+
+  it("restores reasoning parts and providerOptions after a compressed round trip", async () => {
+    // Step two of a thinking-enabled tool loop, as the AI SDK hands it to transformParams.
+    const prompt: LanguageModelV3Prompt = [
+      { role: "system", content: "Be brief.", providerOptions: { anthropic: { cacheControl: { type: "ephemeral" } } } },
+      { role: "user", content: [{ type: "text", text: "Read the gateway log." }] },
+      {
+        role: "assistant",
+        content: [
+          { type: "reasoning", text: "I should read the log first.", providerOptions: { anthropic: { signature: "SIG-abc123" } } },
+          { type: "text", text: "Reading the log now.", providerOptions: { google: { thoughtSignature: "TS-text" } } },
+          {
+            type: "tool-call",
+            toolCallId: "call_01",
+            toolName: "fetch_gateway_metrics",
+            input: { path: "/var/log/gateway.json" },
+            providerOptions: { google: { thoughtSignature: "TS-999" } },
+          },
+        ],
+        providerOptions: { anthropic: { cacheControl: { type: "ephemeral" } } },
+      },
+      {
+        role: "tool",
+        content: [
+          {
+            type: "tool-result",
+            toolCallId: "call_01",
+            toolName: "fetch_gateway_metrics",
+            output: { type: "text", value: "row 1\nrow 2\nrow 3\nrow 4" },
+            providerOptions: { anthropic: { cacheControl: { type: "ephemeral" } } },
+          },
+        ],
+      },
+    ];
+    // The proxy rewrites only the tool message's content and passes everything else through.
+    mockFetch.mockImplementationOnce(async (_url: string, init: any) => {
+      const messages = JSON.parse(init.body).messages;
+      messages[3] = { ...messages[3], content: "[4 rows]" };
+      return mockCompressResponse(messages);
+    });
+
+    const middleware = headroomMiddleware({ baseUrl: "http://localhost:8787" });
+    const out = await middleware.transformParams({ params: { prompt }, model: { specificationVersion: "v3" }, type: "generate" });
+
+    const expected = structuredClone(prompt) as any[];
+    expected[3].content[0].output = { type: "text", value: "[4 rows]" };
+    expect(out.prompt).toEqual(expected);
   });
 });

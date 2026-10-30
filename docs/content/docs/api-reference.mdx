@@ -152,6 +152,7 @@ Top-level function to compress messages via the Headroom proxy.
   client: { type: 'HeadroomClientInterface', description: 'Pre-configured client instance to use' },
   tokenBudget: { type: 'number', description: 'Token budget — compress to fit within this limit' },
   hooks: { type: 'CompressionHooks', description: 'Compression hooks for pre/post processing' },
+  format: { type: "'openai' | 'anthropic' | 'vercel' | 'gemini'", description: 'Format of `messages`, when known. Skips autodetection, which cannot tell a text-only Vercel AI SDK prompt from OpenAI messages' },
 }} />
 
 ```ts twoslash

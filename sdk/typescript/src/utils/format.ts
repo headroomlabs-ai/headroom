@@ -16,6 +16,7 @@ import type {
   AssistantMessage,
   ContentPart,
   ToolCall,
+  ToolMessage,
 } from "../types.js";
 
 /* eslint-disable @typescript-eslint/no-explicit-any */
@@ -45,11 +46,21 @@ export function detectFormat(messages: any[]): MessageFormat {
     // OpenAI: tool role with tool_call_id
     if (msg.role === "tool" && "tool_call_id" in msg && typeof msg.content === "string") return "openai";
 
+    // Vercel: provider options on a message (no other format has them)
+    if (msg && typeof msg === "object" && "providerOptions" in msg) return "vercel";
+
     // Check content blocks/parts for format-specific markers
     if (Array.isArray(msg.content)) {
       for (const part of msg.content) {
-        // Vercel: hyphenated types
+        // Vercel: hyphenated types, reasoning parts (Anthropic spells its block `thinking`)
         if (part.type === "tool-call" || part.type === "tool-result") return "vercel";
+        if (
+          part.type === "reasoning" ||
+          part.type === "reasoning-file" ||
+          part.type === "custom" ||
+          part.type === "tool-approval-request" ||
+          part.type === "tool-approval-response"
+        ) return "vercel";
         // Anthropic: underscored types
         if (part.type === "tool_use" || part.type === "tool_result") return "anthropic";
         // Anthropic: image / document with source.type
@@ -362,6 +373,7 @@ type VercelMediaImageUrl = {
   data_tag?: "data" | "url" | "text" | "reference";
   // A provider-managed file reference, carried verbatim (it has no bytes or url to convert).
   reference?: Record<string, string>;
+  providerOptions?: Record<string, unknown>;
 };
 
 function base64ToText(b64: string): string {
@@ -399,6 +411,7 @@ function vercelMediaImageUrl(p: any): VercelMediaImageUrl | null {
   const out: VercelMediaImageUrl = { url: "" };
   if (p.type === "file") out.part = "file";
   if (typeof p.filename === "string") out.filename = p.filename;
+  if (p.providerOptions && typeof p.providerOptions === "object") out.providerOptions = p.providerOptions;
 
   if (data && typeof data === "object" && typeof data.type === "string") {
     if (data.type === "data") {
@@ -468,14 +481,25 @@ function vercelMediaPart(imageUrl: any): any {
     if (tag === "url") data = { type: "url", url: parsed ?? url };
   }
   const isFile = imageUrl.part === "file" || (mediaType !== undefined && !mediaType.startsWith("image/"));
+  let part: any;
   if (isFile) {
-    const part: any = { type: "file", mediaType: mediaType ?? "application/octet-stream", data };
+    part = { type: "file", mediaType: mediaType ?? "application/octet-stream", data };
     if (typeof imageUrl.filename === "string") part.filename = imageUrl.filename;
-    return part;
+  } else {
+    part = { type: "image", image: data };
+    if (mediaType) part.mediaType = mediaType;
   }
-  const part: any = { type: "image", image: data };
-  if (mediaType) part.mediaType = mediaType;
-  return part;
+  return withProviderOptions(part, imageUrl);
+}
+
+// Copy the AI SDK's `providerOptions` from a message or part onto its OpenAI counterpart. The
+// key has no OpenAI meaning; the proxy copies messages with their extra keys and passes unknown
+// content parts through, so the reverse conversion hands it back exactly as it arrived.
+function withProviderOptions<T extends object>(target: T, source: any): T {
+  if (source && typeof source === "object" && source.providerOptions && typeof source.providerOptions === "object") {
+    (target as any).providerOptions = source.providerOptions;
+  }
+  return target;
 }
 
 // Assistant content parts for the Anthropic / Gemini reverse converters. A text-only array
@@ -501,68 +525,85 @@ export function vercelToOpenAI(messages: any[]): OpenAIMessage[] {
 
   for (const msg of messages) {
     if (msg.role === "system") {
-      result.push({ role: "system", content: typeof msg.content === "string" ? msg.content : String(msg.content) });
+      result.push(withProviderOptions(
+        { role: "system", content: typeof msg.content === "string" ? msg.content : String(msg.content) },
+        msg,
+      ));
       continue;
     }
 
     if (msg.role === "user") {
       if (typeof msg.content === "string") {
-        result.push({ role: "user", content: msg.content });
+        result.push(withProviderOptions({ role: "user", content: msg.content }, msg));
         continue;
       }
       const parts = Array.isArray(msg.content) ? msg.content : [];
       const textParts = parts.filter((p: any) => p.type === "text");
       const mediaParts = parts.filter((p: any) => p.type === "image" || p.type === "file");
+      // Text-only turns collapse to a string unless a text part carries providerOptions.
+      const plainText = mediaParts.length === 0 && textParts.length > 0 && textParts.every((p: any) => !p.providerOptions);
 
-      if (mediaParts.length === 0 && textParts.length > 0) {
-        result.push({ role: "user", content: textParts.map((p: any) => p.text).join("") });
+      if (plainText) {
+        result.push(withProviderOptions({ role: "user", content: textParts.map((p: any) => p.text).join("") }, msg));
       } else {
         const openaiParts = parts
           .filter((p: any) => p.type === "text" || p.type === "image" || p.type === "file")
           .map((p: any) => {
-            if (p.type === "text") return { type: "text" as const, text: p.text };
+            if (p.type === "text") return withProviderOptions({ type: "text" as const, text: p.text }, p);
             const imageUrl = vercelMediaImageUrl(p);
             return imageUrl ? { type: "image_url" as const, image_url: imageUrl } : null;
           })
           .filter((p: any): p is NonNullable<typeof p> => p !== null);
-        result.push({ role: "user", content: openaiParts });
+        result.push(withProviderOptions({ role: "user", content: openaiParts }, msg));
       }
       continue;
     }
 
     if (msg.role === "assistant") {
       if (typeof msg.content === "string") {
-        result.push({ role: "assistant", content: msg.content });
+        result.push(withProviderOptions({ role: "assistant", content: msg.content }, msg));
         continue;
       }
       const parts = Array.isArray(msg.content) ? msg.content : [];
       const textParts = parts.filter((p: any) => p.type === "text");
       const toolCallParts = parts.filter((p: any) => p.type === "tool-call");
-      const hasFiles = parts.some((p: any) => p.type === "file");
+      // Anything other than text and tool calls keeps its place in the content array: files
+      // as image_url carriers; reasoning, reasoning-file, custom and provider-executed
+      // tool-result parts verbatim. Text-only content still collapses to a string unless a
+      // text part carries providerOptions.
+      const keepParts =
+        parts.some((p: any) => p.type !== "text" && p.type !== "tool-call") ||
+        textParts.some((p: any) => p.providerOptions);
 
       let content: AssistantMessage["content"];
-      if (hasFiles) {
-        // AI SDK assistant content may carry generated files; keep them as ordered parts.
+      if (keepParts) {
         content = parts
-          .filter((p: any) => p.type === "text" || p.type === "file")
+          .filter((p: any) => p.type !== "tool-call")
           .map((p: any) => {
-            if (p.type === "text") return { type: "text" as const, text: p.text };
-            const imageUrl = vercelMediaImageUrl(p);
-            return imageUrl ? { type: "image_url" as const, image_url: imageUrl } : null;
+            if (p.type === "text") return withProviderOptions({ type: "text" as const, text: p.text }, p);
+            if (p.type === "file") {
+              const imageUrl = vercelMediaImageUrl(p);
+              return imageUrl ? { type: "image_url" as const, image_url: imageUrl } : null;
+            }
+            return p;
           })
           .filter((p: any): p is NonNullable<typeof p> => p !== null);
       } else {
         content = textParts.length > 0 ? textParts.map((p: any) => p.text).join("") : null;
       }
-      const openaiMsg: AssistantMessage = { role: "assistant", content };
+      const openaiMsg: AssistantMessage = withProviderOptions({ role: "assistant", content }, msg);
 
       if (toolCallParts.length > 0) {
-        openaiMsg.tool_calls = toolCallParts.map((p: any): ToolCall => ({
-          id: p.toolCallId,
-          type: "function",
-          // AI SDK v6 uses `input`, earlier versions used `args`
-          function: { name: p.toolName, arguments: JSON.stringify(p.input ?? p.args) },
-        }));
+        openaiMsg.tool_calls = toolCallParts.map((p: any): ToolCall => {
+          const tc: ToolCall = {
+            id: p.toolCallId,
+            type: "function",
+            // AI SDK v6 uses `input`, earlier versions used `args`
+            function: { name: p.toolName, arguments: JSON.stringify(p.input ?? p.args) },
+          };
+          if (p.providerExecuted !== undefined) tc.providerExecuted = p.providerExecuted;
+          return withProviderOptions(tc, p);
+        });
       }
       result.push(openaiMsg);
       continue;
@@ -571,6 +612,7 @@ export function vercelToOpenAI(messages: any[]): OpenAIMessage[] {
     if (msg.role === "tool") {
       const parts = Array.isArray(msg.content) ? msg.content : [];
       for (const part of parts) {
+        let toolMsg: ToolMessage;
         if (part.type === "tool-result") {
           // AI SDK v6 uses `output: { type, value }`, earlier versions used `result`
           let contentStr: string;
@@ -584,12 +626,19 @@ export function vercelToOpenAI(messages: any[]): OpenAIMessage[] {
           } else {
             contentStr = "";
           }
-          result.push({
-            role: "tool",
-            content: contentStr,
-            tool_call_id: part.toolCallId,
-          });
+          toolMsg = withProviderOptions({ role: "tool", content: contentStr, tool_call_id: part.toolCallId }, part);
+        } else {
+          // tool-approval-response (or any other AI SDK tool part): no OpenAI equivalent,
+          // carried verbatim on `part` and restored as-is.
+          toolMsg = { role: "tool", content: "", tool_call_id: part.toolCallId ?? part.approvalId ?? "" };
+          (toolMsg as any).part = part;
         }
+        // One OpenAI tool message is one tool-result part, so the part's providerOptions
+        // take the `providerOptions` key and the message's go under `messageProviderOptions`.
+        if (msg.providerOptions && typeof msg.providerOptions === "object") {
+          (toolMsg as any).messageProviderOptions = msg.providerOptions;
+        }
+        result.push(toolMsg);
       }
       continue;
     }
@@ -605,20 +654,20 @@ export function openAIToVercel(messages: OpenAIMessage[]): any[] {
 
   for (const msg of messages) {
     if (msg.role === "system") {
-      result.push({ role: "system", content: msg.content });
+      result.push(withProviderOptions({ role: "system", content: msg.content }, msg));
       continue;
     }
 
     if (msg.role === "user") {
       if (typeof msg.content === "string") {
-        result.push({ role: "user", content: [{ type: "text", text: msg.content }] });
+        result.push(withProviderOptions({ role: "user", content: [{ type: "text", text: msg.content }] }, msg));
       } else if (Array.isArray(msg.content)) {
         const parts = msg.content.map((p) => {
-          if (p.type === "text") return { type: "text", text: p.text };
+          if (p.type === "text") return withProviderOptions({ type: "text", text: p.text }, p);
           if (p.type === "image_url") return vercelMediaPart(p.image_url);
-          return { type: "text", text: "" };
+          return p;
         });
-        result.push({ role: "user", content: parts });
+        result.push(withProviderOptions({ role: "user", content: parts }, msg));
       }
       continue;
     }
@@ -629,8 +678,9 @@ export function openAIToVercel(messages: OpenAIMessage[]): any[] {
         if (msg.content) parts.push({ type: "text", text: msg.content });
       } else if (Array.isArray(msg.content)) {
         for (const p of msg.content) {
-          if (p.type === "text") parts.push({ type: "text", text: p.text });
+          if (p.type === "text") parts.push(withProviderOptions({ type: "text", text: p.text }, p));
           else if (p.type === "image_url") parts.push(vercelMediaPart(p.image_url));
+          else parts.push(p); // reasoning and other AI SDK parts, carried verbatim
         }
       }
       if (msg.tool_calls) {
@@ -638,34 +688,43 @@ export function openAIToVercel(messages: OpenAIMessage[]): any[] {
           toolNames.set(tc.id, tc.function.name);
           let input: any;
           try { input = JSON.parse(tc.function.arguments); } catch { input = tc.function.arguments ?? {}; }
-          parts.push({
+          const part: any = {
             type: "tool-call",
             toolCallId: tc.id,
             toolName: tc.function.name,
             input, // AI SDK v6 uses `input`, not `args`
-          });
+          };
+          if (tc.providerExecuted !== undefined) part.providerExecuted = tc.providerExecuted;
+          parts.push(withProviderOptions(part, tc));
         }
       }
-      result.push({ role: "assistant", content: parts });
+      result.push(withProviderOptions({ role: "assistant", content: parts }, msg));
       continue;
     }
 
     if (msg.role === "tool") {
-      let parsed: any;
-      try { parsed = JSON.parse(msg.content); } catch { parsed = msg.content; }
-      // AI SDK v6 requires output: { type: 'json' | 'text', value }
-      const output = typeof parsed === "string"
-        ? { type: "text" as const, value: parsed }
-        : { type: "json" as const, value: parsed };
-      result.push({
-        role: "tool",
-        content: [{
+      const carried = (msg as any).part;
+      let part: any;
+      if (carried && typeof carried === "object") {
+        part = carried;
+      } else {
+        let parsed: any;
+        try { parsed = JSON.parse(msg.content); } catch { parsed = msg.content; }
+        // AI SDK v6 requires output: { type: 'json' | 'text', value }
+        const output = typeof parsed === "string"
+          ? { type: "text" as const, value: parsed }
+          : { type: "json" as const, value: parsed };
+        part = withProviderOptions({
           type: "tool-result",
           toolCallId: msg.tool_call_id,
           toolName: toolNames.get(msg.tool_call_id) ?? "unknown",
           output,
-        }],
-      });
+        }, msg);
+      }
+      const toolMsg: any = { role: "tool", content: [part] };
+      const messageOptions = (msg as any).messageProviderOptions;
+      if (messageOptions && typeof messageOptions === "object") toolMsg.providerOptions = messageOptions;
+      result.push(toolMsg);
       continue;
     }
   }
@@ -863,8 +922,7 @@ export function openAIToGemini(messages: OpenAIMessage[]): any[] {
 // Universal: any format → OpenAI, and OpenAI → original format
 // ============================================================
 
-export function toOpenAI(messages: any[]): OpenAIMessage[] {
-  const format = detectFormat(messages);
+export function toOpenAI(messages: any[], format: MessageFormat = detectFormat(messages)): OpenAIMessage[] {
   switch (format) {
     case "openai": return messages as OpenAIMessage[];
     case "anthropic": return anthropicToOpenAI(messages);

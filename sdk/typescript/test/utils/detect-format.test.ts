@@ -208,3 +208,18 @@ describe("detectFormat: Anthropic thinking blocks", () => {
     expect(detectFormat(messages)).toBe("anthropic");
   });
 });
+
+describe("detectFormat: Vercel reasoning parts and providerOptions", () => {
+  it("detects a turn whose only Vercel marker is a reasoning part", () => {
+    const messages = [
+      { role: "user", content: "hi" },
+      { role: "assistant", content: [{ type: "reasoning", text: "..." }, { type: "text", text: "hello" }] },
+    ];
+    expect(detectFormat(messages)).toBe("vercel");
+  });
+
+  it("detects a message-level providerOptions key as Vercel", () => {
+    const messages = [{ role: "user", content: "hi", providerOptions: { anthropic: { cacheControl: { type: "ephemeral" } } } }];
+    expect(detectFormat(messages)).toBe("vercel");
+  });
+});

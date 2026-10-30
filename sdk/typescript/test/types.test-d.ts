@@ -15,6 +15,9 @@ import type {
   HeadroomClientInterface,
   ProxyCompressResponse,
   ProxyErrorResponse,
+  ProviderOptions,
+  ReasoningContentPart,
+  PassthroughContentPart,
 } from "../src/types.js";
 import type { CompressRequestConfig } from "../src/types/config.js";
 import {
@@ -247,5 +250,38 @@ describe("Proxy response types (internal)", () => {
       type: string;
       message: string;
     }>();
+  });
+});
+
+describe("Provider carriers (Vercel reasoning state)", () => {
+  it("ProviderOptions is a two-level record", () => {
+    expectTypeOf<ProviderOptions>().toEqualTypeOf<Record<string, Record<string, unknown>>>();
+  });
+
+  it("TextContentPart carries optional providerOptions", () => {
+    expectTypeOf<TextContentPart["providerOptions"]>().toEqualTypeOf<ProviderOptions | undefined>();
+  });
+
+  it("ReasoningContentPart is a ContentPart", () => {
+    expectTypeOf<ReasoningContentPart["type"]>().toEqualTypeOf<"reasoning">();
+    expectTypeOf<ReasoningContentPart["text"]>().toBeString();
+    expectTypeOf<ReasoningContentPart>().toMatchTypeOf<ContentPart>();
+  });
+
+  it("PassthroughContentPart is a ContentPart with literal types", () => {
+    expectTypeOf<PassthroughContentPart["type"]>().toEqualTypeOf<"reasoning-file" | "custom" | "tool-result" | "tool-approval-request">();
+    expectTypeOf<PassthroughContentPart>().toMatchTypeOf<ContentPart>();
+  });
+
+  it("ToolCall carries optional providerOptions and providerExecuted", () => {
+    expectTypeOf<ToolCall["providerOptions"]>().toEqualTypeOf<ProviderOptions | undefined>();
+    expectTypeOf<ToolCall["providerExecuted"]>().toEqualTypeOf<boolean | undefined>();
+  });
+
+  it("every message type carries optional providerOptions", () => {
+    expectTypeOf<SystemMessage["providerOptions"]>().toEqualTypeOf<ProviderOptions | undefined>();
+    expectTypeOf<UserMessage["providerOptions"]>().toEqualTypeOf<ProviderOptions | undefined>();
+    expectTypeOf<AssistantMessage["providerOptions"]>().toEqualTypeOf<ProviderOptions | undefined>();
+    expectTypeOf<ToolMessage["providerOptions"]>().toEqualTypeOf<ProviderOptions | undefined>();
   });
 });
