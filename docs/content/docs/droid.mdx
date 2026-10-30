@@ -1,0 +1,73 @@
+---
+title: Factory Droid
+description: Route Factory Droid through Headroom so Anthropic-model turns are compressed on your existing Factory subscription.
+---
+
+Use `headroom wrap droid` to run [Factory Droid](https://docs.factory.ai) through the local Headroom proxy. Droid keeps talking to Factory with its own login; Headroom sits in between and compresses the Anthropic-shaped inference requests.
+
+## Quick Start
+
+```bash
+headroom wrap droid
+```
+
+Pass Droid arguments after `--`:
+
+```bash
+headroom wrap droid -- exec "fix the failing test"
+```
+
+There is nothing to undo. The wrapper writes no Droid config and no `customModels`; it only sets an environment variable on the `droid` process it launches.
+
+## What `wrap droid` Does
+
+| Step | What happens |
+|---|---|
+| Upstream | Resolves the real Factory upstream (see [Upstream precedence](#upstream-precedence)) |
+| Proxy | Starts or reuses a Headroom proxy started with `--factory-api-url <upstream>` |
+| Launch | Runs `droid` with `FACTORY_API_BASE_URL=http://127.0.0.1:<port>` |
+
+If the requested port is busy, or a proxy with different routing is running there, the wrapper picks a free port and points `FACTORY_API_BASE_URL` at it. You do not need to pass `--port` yourself.
+
+## What Is Compressed
+
+| Path | Behaviour |
+|---|---|
+| `POST /api/llm/a/v1/messages` | Compressed with the same pipeline as `/v1/messages`, then forwarded to `<upstream>/api/llm/a/v1/messages` |
+| Any other `/api/*` path | Forwarded verbatim to the upstream (method, query string, headers and body unchanged) |
+| Anything outside `/api/` | Never sent to Factory; keeps the proxy's normal routing |
+
+OpenAI-shaped traffic under `/api/llm/o/` is **not compressed yet**. It still reaches Factory, but is forwarded verbatim and buffered rather than streamed incrementally. Models Droid serves over that route see no savings.
+
+A few `/api/*` requests keep the proxy's normal behaviour instead of going to Factory: requests that set `x-headroom-base-url`, and Hermes Studio's `/api/codex-proxy/` and `/api/claude-code-proxy/` paths.
+
+On the compressed route, Headroom ignores a client-sent `x-headroom-base-url` and strips every `x-headroom-*` header before forwarding. Your Factory `Authorization` header is forwarded unchanged. Operator-configured Anthropic extra headers (`ANTHROPIC_TARGET_API_HEADERS`) are **not** sent to Factory.
+
+## Upstream Precedence
+
+1. `--factory-api-url <url>`
+2. An existing `FACTORY_API_BASE_URL` in your shell (for example an enterprise or regional gateway)
+3. `https://api.factory.ai`
+
+The upstream must be an `http(s)` URL with no credentials, query string or fragment. Loopback hosts (`localhost`, `127.x`, `[::1]`) are rejected, which stops a leftover `FACTORY_API_BASE_URL` from an earlier wrapped session from pointing the proxy at itself. If you see that error, unset `FACTORY_API_BASE_URL` and run the command again.
+
+## Using an Existing Proxy
+
+With `--no-proxy`, the wrapper does not start a proxy. It refuses to launch Droid unless the port answers `/health` as a Headroom proxy that serves the same Factory upstream:
+
+```bash
+headroom proxy --port 8787 --factory-api-url https://api.factory.ai
+headroom wrap droid --no-proxy --port 8787
+```
+
+A non-Headroom listener, a proxy without Factory routing, or a proxy for a different Factory upstream is an error, so Droid's credentials never go to a listener that was not set up for them.
+
+## Options
+
+| Option | Description |
+|---|---|
+| `--port`, `-p` | Proxy port (default: `$HEADROOM_PORT`, else 8787) |
+| `--factory-api-url` | Real Factory upstream (default: `$FACTORY_API_BASE_URL`, else `https://api.factory.ai`) |
+| `--no-proxy` | Use an existing Factory-mode proxy instead of starting one |
+| `--learn` | Enable live traffic learning |
+| `--memory` | Enable persistent cross-session memory |

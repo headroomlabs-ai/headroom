@@ -182,6 +182,12 @@ class ProxyConfig:
     # SigV4 signature. Leave unset (default) to keep `--backend bedrock`'s
     # direct-to-AWS, re-signing behavior unchanged.
     bedrock_api_url: str | None = None
+    # Factory Droid upstream (`--factory-api-url` / FACTORY_TARGET_API_URL).
+    # When set, `/api/llm/a/v1/messages` is compressed and forwarded here and
+    # every other `/api/*` path is passed through verbatim; it serves `/api/*`
+    # only and never becomes the catch-all upstream. Leave unset (default) to
+    # keep `/api/*` on the normal catch-all.
+    factory_api_url: str | None = None
     anyllm_provider: str = "openai"
 
     # Optimization mode: "token" (rewrite for max compression) or

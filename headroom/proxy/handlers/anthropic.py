@@ -1038,8 +1038,15 @@ class AnthropicHandlerMixin:
         provider_name: str = "anthropic",
         model_override: str | None = None,
         force_stream: bool = False,
+        force_direct: bool = False,
     ) -> Response | StreamingResponse:
-        """Handle Anthropic /v1/messages endpoint."""
+        """Handle Anthropic /v1/messages endpoint.
+
+        ``force_direct`` forwards over HTTP to ``upstream_base_url`` without
+        consulting the backend resolver: neither ``self.anthropic_backend``
+        nor route advice can take the request (or rewrite ``body["model"]``).
+        Used by routes whose upstream is fixed, such as Factory.
+        """
         if not hasattr(self, "pipeline_extensions"):
             from headroom.pipeline import PipelineExtensionManager
 
@@ -3760,7 +3767,10 @@ class AnthropicHandlerMixin:
                         str(model)
                         if (
                             not upstream_base_url
-                            or getattr(self, "anthropic_backend", None) is not None
+                            or (
+                                getattr(self, "anthropic_backend", None) is not None
+                                and not force_direct
+                            )
                             or _is_googleapis_endpoint(upstream_base_url)
                         )
                         else None
@@ -3829,10 +3839,13 @@ class AnthropicHandlerMixin:
             # it names a provider we do not already speak, serve this ONE
             # request from a translating backend for it. Absent, unresolvable,
             # or same-protocol -> `self.anthropic_backend`, i.e. exactly the
-            # behaviour this line had before.
+            # behaviour this line had before. `force_direct` skips the
+            # resolver entirely: the caller's upstream is the only target.
             from headroom.proxy.route_advice import resolver_for
 
-            request_backend = resolver_for(self).for_request(request, body=body)
+            request_backend = (
+                None if force_direct else resolver_for(self).for_request(request, body=body)
+            )
             if request_backend is not None:
                 # Route through Bedrock backend
                 try:
