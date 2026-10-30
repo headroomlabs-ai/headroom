@@ -158,11 +158,9 @@ def _select_latest(data: dict[str, Any], *, allow_pre: bool) -> str | None:
     candidates: list[Version] = []
     if isinstance(releases, dict):
         for ver_str, files in releases.items():
-            # Skip releases whose every artifact is yanked.
-            if (
-                isinstance(files, list)
-                and files
-                and all(isinstance(f, dict) and f.get("yanked") for f in files)
+            # Skip releases with no artifacts, or whose every artifact is yanked.
+            if isinstance(files, list) and (
+                not files or all(isinstance(f, dict) and f.get("yanked") for f in files)
             ):
                 continue
             try:
@@ -174,6 +172,10 @@ def _select_latest(data: dict[str, Any], *, allow_pre: bool) -> str | None:
             candidates.append(ver)
     if candidates:
         return str(max(candidates))
+    if isinstance(releases, dict) and releases:
+        # Releases are listed but none is installable (all yanked or file-less):
+        # do not fall back to info.version, which names one of them.
+        return None
 
     # Fallback to info.version when releases is absent/empty.
     info = data.get("info")
