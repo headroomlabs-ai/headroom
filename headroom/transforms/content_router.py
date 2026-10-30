@@ -7941,11 +7941,14 @@ class ContentRouter(Transform):
                             route_counts["already_compressed"] += 1
                         continue
 
-                    # Two-tier compression cache → shared helper
+                    # Two-tier compression cache → shared helper. Tool output is
+                    # gated (#1307), so it keys into the gated namespace like the
+                    # string path: an ungated entry for the same bytes must not
+                    # answer this lookup before the gate runs (#4477).
                     compressed_content, was_compressed = self._compress_block_content(
                         content=tool_text,
                         content_key=content_cache_key(
-                            tool_text, getattr(self, "_runtime_target_ratio", None)
+                            tool_text, getattr(self, "_runtime_target_ratio", None), gated=True
                         ),
                         context=block_context,
                         bias=bias,
@@ -8036,11 +8039,17 @@ class ContentRouter(Transform):
                             route_counts["already_compressed"] += 1
                         continue
 
-                    # Two-tier compression cache → shared helper
+                    # Two-tier compression cache → shared helper. A role:"tool" /
+                    # "function" message in block-list form is tool output, the
+                    # same ground truth as its string form, so it gets the same
+                    # #1307 gate and the gated cache namespace (#4477).
+                    enforce_reversibility = role in ("tool", "function")
                     compressed_content, _was_compressed = self._compress_block_content(
                         content=text_content,
                         content_key=content_cache_key(
-                            text_content, getattr(self, "_runtime_target_ratio", None)
+                            text_content,
+                            getattr(self, "_runtime_target_ratio", None),
+                            gated=enforce_reversibility,
                         ),
                         context=context,
                         bias=1.0,
@@ -8051,6 +8060,7 @@ class ContentRouter(Transform):
                         compressed_details=compressed_details,
                         strategy_label="text_block",
                         details_prefix="text",
+                        enforce_reversibility=enforce_reversibility,
                     )
                     if compressed_content is not None:
                         new_blocks.append({**block, "text": compressed_content})
@@ -8230,8 +8240,9 @@ class ContentRouter(Transform):
             # (kompress/text/code/html) that emitted no CCR retrieve marker is
             # unrecoverable, so the agent would act on a fabricated summary
             # (#1307). The string/`role=="tool"` path guards this; mirror it
-            # here for tool_result blocks (never cached, so the Tier-2 path
-            # above can't serve a poisoned entry).
+            # here for tool output in block form. Callers that enforce the gate
+            # key with ``gated=True``, so the Tier-2 path above never serves
+            # them an ungated entry for the same bytes.
             #
             # EXCEPTION: no-CCR mode (config.ccr_inject_marker=False). Here the
             # operator has *deliberately* disabled retrieval markers — recovery

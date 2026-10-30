@@ -1636,8 +1636,18 @@ def test_system_text_blocks_skipped_when_skip_system_true(
 def test_tool_role_text_blocks_compressed_by_default(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    router = _make_router_with_mock_compress(monkeypatch)
+    router = ContentRouter(ContentRouterConfig())
     long_text = "T" * 1000
+    recoverable = "T" * 100 + " [compressed] <<ccr:9f3a21>>"
+    monkeypatch.setattr(
+        router,
+        "compress",
+        lambda *a, **k: SimpleNamespace(
+            compressed=recoverable,
+            compression_ratio=0.5,
+            strategy_used=CompressionStrategy.TEXT,
+        ),
+    )
     msg = {"role": "tool", "content": [{"type": "text", "text": long_text}]}
     result = router._process_content_blocks(
         msg,
@@ -1647,8 +1657,9 @@ def test_tool_role_text_blocks_compressed_by_default(
         set(),
         set(),
     )
-    # tool role ≈ tool output — compress freely
-    assert "[compressed]" in result["content"][0]["text"]
+    # tool role ≈ tool output — not protected like user/system text; a
+    # recoverable result is accepted (an unmarked lossy one is gated, #1307).
+    assert result["content"][0]["text"] == recoverable
 
 
 def test_unknown_role_text_blocks_skipped_for_safety(

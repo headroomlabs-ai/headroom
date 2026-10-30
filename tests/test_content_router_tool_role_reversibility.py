@@ -140,3 +140,102 @@ def test_tool_role_structured_strategies_accepted(monkeypatch, strategy) -> None
     """Structured strategies are lossless/self-marking -> not gated, compressed kept."""
     result = _run(monkeypatch, _tool_msg(GREP_OUTPUT), strategy, LOSSY_SUMMARY)
     assert result.messages[0]["content"] == LOSSY_SUMMARY
+
+
+# --- Block-form tool output (#4477) -----------------------------------------
+#
+# Tool output also arrives as content blocks: an Anthropic ``tool_result`` block,
+# or a role="tool"/"function" message whose content is a list of text blocks.
+# Both shapes must get the same #1307 gate as the string path, and must read and
+# write the gated cache namespace so an ungated entry for byte-identical text
+# (an assistant message, a user text block) is never served as tool output.
+
+
+def _text_blocks_msg(role: str, content: str) -> dict:
+    msg: dict = {"role": role, "content": [{"type": "text", "text": content}]}
+    if role == "tool":
+        msg["tool_call_id"] = "call_bash_1"
+    else:
+        msg["name"] = "bash"
+    return msg
+
+
+def _tool_result_msg(content: str) -> dict:
+    return {
+        "role": "user",
+        "content": [{"type": "tool_result", "tool_use_id": "toolu_bash_1", "content": content}],
+    }
+
+
+def _apply(router: ContentRouter, message: dict, **kwargs):
+    return router.apply(
+        [message], _WordTokenizer(), protect_recent=0, protect_analysis_context=False, **kwargs
+    )
+
+
+@pytest.mark.parametrize("role", ["tool", "function"])
+def test_tool_role_text_blocks_lossy_unmarked_kept_verbatim(monkeypatch, role) -> None:
+    """List-of-text tool output gets the gate the string form already has."""
+    result = _run(
+        monkeypatch,
+        _text_blocks_msg(role, GREP_OUTPUT),
+        CompressionStrategy.KOMPRESS,
+        LOSSY_SUMMARY,
+    )
+    assert result.messages[0]["content"] == [{"type": "text", "text": GREP_OUTPUT}]
+
+
+@pytest.mark.parametrize("role", ["tool", "function"])
+def test_tool_role_text_blocks_lossy_with_ccr_marker_accepted(monkeypatch, role) -> None:
+    """A recoverable (marked) result still compresses list-of-text tool output."""
+    result = _run(
+        monkeypatch,
+        _text_blocks_msg(role, GREP_OUTPUT),
+        CompressionStrategy.KOMPRESS,
+        CCR_MARKER_SUMMARY,
+    )
+    assert result.messages[0]["content"] == [{"type": "text", "text": CCR_MARKER_SUMMARY}]
+
+
+def test_tool_result_block_not_served_an_ungated_cache_entry(monkeypatch) -> None:
+    """An unmarked lossy result cached for ungated text must not reach a tool_result.
+
+    The assistant text-block path is not gated (assistant prose is not tool ground
+    truth), so it caches the lossy summary. A later tool_result carrying the same
+    bytes must miss that entry and be gated, not take the cache hit.
+    """
+    router = ContentRouter()
+    monkeypatch.setattr(
+        router,
+        "compress",
+        lambda *a, **k: _force_result(CompressionStrategy.KOMPRESS, LOSSY_SUMMARY),
+    )
+    first = _apply(
+        router,
+        {"role": "assistant", "content": [{"type": "text", "text": GREP_OUTPUT}]},
+        compress_assistant_text_blocks=True,
+    )
+    assert first.messages[0]["content"][0]["text"] == LOSSY_SUMMARY  # ungated: compressed
+
+    second = _apply(router, _tool_result_msg(GREP_OUTPUT))
+    assert second.messages[0]["content"][0]["content"] == GREP_OUTPUT
+
+
+def test_gated_tool_result_skip_does_not_suppress_ungated_text(monkeypatch) -> None:
+    """The reverse direction: a gate skip recorded for tool output stays in the
+    gated namespace, so ungated text with the same bytes still compresses."""
+    router = ContentRouter()
+    monkeypatch.setattr(
+        router,
+        "compress",
+        lambda *a, **k: _force_result(CompressionStrategy.KOMPRESS, LOSSY_SUMMARY),
+    )
+    first = _apply(router, _tool_result_msg(GREP_OUTPUT))
+    assert first.messages[0]["content"][0]["content"] == GREP_OUTPUT  # gated: kept
+
+    second = _apply(
+        router,
+        {"role": "assistant", "content": [{"type": "text", "text": GREP_OUTPUT}]},
+        compress_assistant_text_blocks=True,
+    )
+    assert second.messages[0]["content"][0]["text"] == LOSSY_SUMMARY
