@@ -16,6 +16,7 @@ import pytest
 
 from headroom.cache.backends.sqlite import SQLiteBackend
 from headroom.cache.compression_store import CompressionEntry, CompressionStore
+from headroom.exceptions import StorageError
 
 
 def make_entry(hash_key: str = "h1", content: str = "x" * 600, ttl: int = 1800) -> CompressionEntry:
@@ -416,14 +417,58 @@ class TestMultiWorkerSafety:
         assert db_path.exists()
         assert b.get("h1") is not None
 
-    def test_corruption_message_triggers_reset(self, db_path):
-        b = SQLiteBackend(db_path)
-        b.set("h1", make_entry())
-        b._handle_db_error(sqlite3.DatabaseError("database disk image is malformed"), "get")
-        # Database recreated: empty but functional.
-        assert b.count() == 0
-        b.set("h2", make_entry("h2"))
-        assert b.exists("h2")
+    @pytest.mark.parametrize(
+        "message", ["database disk image is malformed", "file is not a database"]
+    )
+    def test_corruption_does_not_unlink_a_shared_database(self, db_path, message):
+        writer = SQLiteBackend(db_path)
+        reader = SQLiteBackend(db_path)
+        writer.set("h1", make_entry())
+        before = db_path.stat()
+        sensitive_marker = "private-diagnostic-sentinel"
+        error = sqlite3.DatabaseError(f"{message}: {sensitive_marker}")
+
+        with pytest.raises(StorageError, match="Stop all workers") as raised:
+            writer._handle_db_error(error, "get")
+
+        assert raised.value.__cause__ is error
+        # MCP returns str(error) to clients, including any StorageError details.
+        assert sensitive_marker not in str(raised.value)
+        assert str(db_path) not in str(raised.value)
+        assert raised.value.details == {"operation": "get"}
+        assert "database was left intact" in str(raised.value)
+        assert "WAL/SHM sidecars" in str(raised.value)
+        assert db_path.stat().st_ino == before.st_ino
+        assert writer.get("h1") is not None
+        assert reader.get("h1") is not None
+        writer.set("h2", make_entry("h2"))
+        assert reader.get("h2") is not None
+
+    @pytest.mark.parametrize("operation", ["get", "set", "items", "count", "purge_expired"])
+    def test_real_corruption_raises_storage_error_without_closing_connection(
+        self, db_path, operation
+    ):
+        backend = SQLiteBackend(db_path)
+        backend.set("h1", make_entry())
+        # Corrupt only this temporary database's schema, using the real SQLite
+        # engine so the operation below raises without a mocked connection.
+        backend._conn.execute("PRAGMA writable_schema=ON")
+        backend._conn.execute("UPDATE sqlite_master SET sql='not sql' WHERE name='ccr_entries'")
+        backend._conn.execute("PRAGMA writable_schema=OFF")
+        version = backend._conn.execute("PRAGMA schema_version").fetchone()[0]
+        backend._conn.execute(f"PRAGMA schema_version={version + 1}")
+        backend._conn.commit()
+        before = db_path.stat()
+        args = {"get": ("h1",), "set": ("h2", make_entry("h2"))}.get(operation, ())
+
+        for _ in range(2):
+            with pytest.raises(StorageError, match="corrupt") as raised:
+                getattr(backend, operation)(*args)
+            assert isinstance(raised.value.__cause__, sqlite3.DatabaseError)
+            assert "malformed" in str(raised.value.__cause__)
+            assert db_path.stat().st_ino == before.st_ino
+        # A failed recovery must not strand the backend on a closed handle.
+        assert backend._conn.execute("PRAGMA schema_version").fetchone()[0] == version + 1
 
     def test_busy_timeout_configured(self, db_path):
         b = SQLiteBackend(db_path)
