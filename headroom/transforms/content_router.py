@@ -5042,6 +5042,13 @@ class ContentRouter(Transform):
                 self._kompress_max_tokens,
                 self._kompress_gate_fires,
             )
+            if protected:
+                # The fallback compressors take no ``ccr_original`` and would
+                # store the ``{{HEADROOM_TAG_N}}`` placeholder text in CCR; any
+                # placeholder line they drop is also discarded by
+                # ``restore_tags``, losing the tagged block outright. Pass the
+                # original through unchanged instead (as the budget branch above).
+                return content, _estimate_tokens(content)
             out = text_to_compress
             crusher = self._get_text_crusher()
             if crusher is not None:
@@ -5062,8 +5069,6 @@ class ContentRouter(Transform):
                             "Kompress size-gate -> LogCompressor failed (%s); passing through", e
                         )
                         out = text_to_compress
-            if protected:
-                out = restore_tags(out, protected)
             return out, _estimate_tokens(out)
 
         # Reached only when the gate is enabled and this eligible block is

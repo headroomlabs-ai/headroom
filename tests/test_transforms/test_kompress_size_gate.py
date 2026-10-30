@@ -74,3 +74,28 @@ def test_gate_fires_through_strategy_dispatch(monkeypatch, strategy):
     router._apply_strategy_to_content(big, strategy, "")
 
     assert router._kompress_gate_fires == 1
+
+
+def test_gate_keeps_tagged_blocks_out_of_lossy_fallback(monkeypatch):
+    # Over the gate, with custom tags protected: the TextCrusher/LogCompressor
+    # fallback must not see the {{HEADROOM_TAG_N}} placeholder text. It would
+    # store the placeholders in CCR and ``restore_tags`` discards any wrap whose
+    # placeholder line it dropped, so the tagged content would vanish from both
+    # the output and the retrieval path.
+    router = ContentRouter()
+    router._kompress_max_tokens = 50  # tiny ceiling (x4 = 200 chars)
+
+    def _boom():
+        raise AssertionError("kompress must not be invoked for oversized (gated) input")
+
+    monkeypatch.setattr(router, "_get_kompress", _boom)
+
+    lines = [f"<item>row {i} value</item> note text here for item number {i}" for i in range(200)]
+    text = "Results from the fetch tool:\n\n" + "\n".join(lines)
+
+    out, _ = router._try_ml_compressor(text, "")
+
+    assert router._kompress_gate_fires == 1
+    assert out == text
+    assert out.count("<item>") == 200
+    assert "{{HEADROOM_TAG" not in out
