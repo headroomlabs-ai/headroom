@@ -28,6 +28,7 @@ import contextlib
 import json
 import logging
 import os
+import threading
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -1150,6 +1151,36 @@ class HeadroomMCPServer:
             os.getppid(),
         )
 
+    def _start_kompress_warmup(self) -> bool:
+        """Warm the Kompress model that ``headroom.compress.compress()`` will use.
+
+        Without this the router never finds the model ready (its own background
+        load needs the network), so ``headroom_compress`` stays ``router:noop``.
+        Cache-first; the model load runs on a daemon thread and the servers call this
+        via :meth:`_launch_kompress_warmup` so pipeline construction is off the
+        event loop too. Never writes to stdout.
+        """
+        try:
+            from headroom.compress import _get_pipeline
+            from headroom.transforms.kompress_compressor import start_kompress_background_warmup
+
+            return start_kompress_background_warmup((_get_pipeline(),), cache_first=True)
+        except Exception as exc:
+            logger.warning("Kompress warm-up not started: %s", describe_exception(exc))
+            return False
+
+    def _launch_kompress_warmup(self) -> threading.Thread:
+        """Run :meth:`_start_kompress_warmup` off the calling thread.
+
+        Building the compression pipeline imports every transform, which would
+        delay the MCP handshake if done on the event loop.
+        """
+        thread = threading.Thread(
+            target=self._start_kompress_warmup, name="kompress-warmup-init", daemon=True
+        )
+        thread.start()
+        return thread
+
     async def run_stdio(
         self,
         parent_death_poll_interval: float = PARENT_DEATH_POLL_INTERVAL,
@@ -1163,6 +1194,7 @@ class HeadroomMCPServer:
         """
         async with stdio_server() as (read_stream, write_stream):
             logger.info("Headroom MCP Server starting (proxy: %s)", redact_url(self.proxy_url))
+            self._launch_kompress_warmup()
             serve_task = asyncio.create_task(
                 self.server.run(
                     read_stream,
@@ -1205,6 +1237,7 @@ class HeadroomMCPServer:
         """Run the server with Streamable HTTP transport."""
         from .mcp_http import serve_streamable_http
 
+        self._launch_kompress_warmup()
         await serve_streamable_http(
             self,
             host=host,

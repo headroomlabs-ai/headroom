@@ -1995,71 +1995,9 @@ class HeadroomProxy(
         affected host family) and when ``HEADROOM_KOMPRESS_WARMUP`` is ``0``;
         ``1`` forces it. Returns ``True`` when a warm-up thread was started.
         """
-        raw = os.environ.get("HEADROOM_KOMPRESS_WARMUP", "").strip().lower()
-        if raw in ("0", "false", "no", "off"):
-            return False
-        if not raw and os.environ.get("PYTEST_CURRENT_TEST"):
-            # Test apps boot by the hundred; none of them should load a model.
-            return False
-        if raw not in ("1", "true", "yes", "on"):
-            import platform
+        from headroom.transforms.kompress_compressor import start_kompress_background_warmup
 
-            try:
-                libc, version = platform.libc_ver()
-            except OSError:
-                # libc_ver() reads sys.executable; Microsoft Store Python's
-                # python.exe is an app-execution alias that can't be opened.
-                libc, version = "", ""
-            if libc == "glibc":
-                try:
-                    major, minor = (int(part) for part in version.split(".")[:2])
-                except ValueError:
-                    major, minor = 0, 0
-                if (major, minor) < (2, 28):
-                    return False
-        compressor = None
-        for pipeline in (self.anthropic_pipeline, self.openai_pipeline):
-            for transform in getattr(pipeline, "transforms", []):
-                getter = getattr(transform, "_get_kompress", None)
-                if getter is None:
-                    continue
-                try:
-                    compressor = getter()
-                except Exception:
-                    compressor = None
-                if compressor is not None and hasattr(compressor, "preload"):
-                    break
-                compressor = None
-            if compressor is not None:
-                break
-        if compressor is None:
-            return False
-
-        try:
-            delay = float(os.environ.get("HEADROOM_KOMPRESS_WARMUP_DELAY_SECONDS", "2") or 2)
-        except ValueError:
-            delay = 2.0
-
-        def _warm() -> None:
-            time.sleep(max(0.0, delay))
-            started = time.monotonic()
-            try:
-                backend = compressor.preload(allow_download=True)
-            except Exception as exc:  # the lazy request path still loads on first use
-                logger.warning("Kompress background warm-up failed: %s", exc)
-                return
-            logger.info(
-                "Kompress: warmed in the background in %.0f ms (backend %s)",
-                (time.monotonic() - started) * 1000,
-                backend,
-            )
-
-        from headroom.transforms.kompress_compressor import start_kompress_warmup_thread
-
-        # Registered as the model's loader, so a request during the warm-up
-        # doesn't start a second load thread.
-        start_kompress_warmup_thread(compressor.config.model_id, _warm)
-        return True
+        return start_kompress_background_warmup((self.anthropic_pipeline, self.openai_pipeline))
 
     async def startup(self):
         """Initialize async resources."""
