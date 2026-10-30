@@ -5,8 +5,10 @@ build-backend = "maturin"
 [project]
 name = "headroom-ai"
 version = "0.42.0"
-description = "The Context Optimization Layer for LLM Applications - Cut costs by 50-90%"
-readme = "README.md"
+description = "Compress tool outputs, logs, JSON and chat history before each LLM call. Fewer input tokens, same answers; in-process, no API key. Library, proxy and MCP server."
+# PyPI renders this file; GitHub renders README.md. Keep the two in step on the
+# install commands and the savings claim (README.md "Proof" is the source).
+readme = "README-pypi.md"
 license = "Apache-2.0"
 requires-python = ">=3.11"
 authors = [
@@ -21,14 +23,26 @@ keywords = [
     "anthropic",
     "claude",
     "gpt",
-    "context",
-    "token",
-    "optimization",
-    "compression",
-    "caching",
+    "gemini",
+    "token-cost",
+    "reduce-tokens",
+    "input-tokens",
+    "context-window",
+    "token-budget",
+    "tool-output",
+    "tool-results",
+    "chat-history",
+    "trim-messages",
+    "context-compression",
+    "prompt-compression",
+    "context-engineering",
+    "agents",
+    "coding-agents",
+    "mcp",
     "proxy",
-    "ai",
-    "machine-learning",
+    "fastapi",
+    "langchain",
+    "litellm",
 ]
 classifiers = [
     "Development Status :: 4 - Beta",

@@ -17,7 +17,7 @@ RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
 
 WORKDIR /build
 
-COPY pyproject.toml uv.lock README.md ./
+COPY pyproject.toml uv.lock README.md README-pypi.md ./
 COPY Cargo.toml Cargo.lock rust-toolchain.toml ./
 COPY crates/ crates/
 COPY headroom/ headroom/
