@@ -1249,6 +1249,241 @@ def test_source_code_code_aware_enabled_uses_code_aware(
     assert strategy is CompressionStrategy.CODE_AWARE
 
 
+# ---------------------------------------------------------------------------
+# MIXED false-positive on a complete HTML document: embedded JSON or ordinary
+# body prose triggers ``has_json_blocks``/``has_prose`` in ``is_mixed_content``,
+# misclassifying a page with a clear DOCTYPE/``<html>`` root as MIXED.  The
+# detector says HTML.  ``_determine_strategy`` must trust it over the regex
+# heuristics, same as the SOURCE_CODE case above. See #3608, #3609.
+# ---------------------------------------------------------------------------
+
+# Product page with inline JSON-LD: the shape from #3608. The ``ld+json`` block
+# trips ``has_json_blocks``, the article copy trips ``has_prose``, so
+# ``is_mixed_content`` says True even though the document is unmistakably HTML.
+# trafilatura keeps the prose and drops the ``<script>`` payload, which is why
+# the tool-role guard below has to treat HTML as lossy-unmarked.
+MIXED_HTML_PRODUCT_PAGE = """<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Field Jacket | Example Outfitters</title>
+<script type="application/ld+json">
+{
+  "@context": "https://schema.org",
+  "@type": "Product",
+  "name": "Field Jacket",
+  "sku": "SKU-48213",
+  "offers": {"@type": "Offer", "price": "189.00", "priceCurrency": "USD"},
+  "aggregateRating": {"@type": "AggregateRating", "ratingValue": "4.7", "reviewCount": "132"}
+}
+</script>
+</head>
+<body>
+<header><nav><a href="/">Home</a> <a href="/jackets">Jackets</a></nav></header>
+<article>
+<h1>Field Jacket</h1>
+<p>The Field Jacket is cut from a waxed cotton shell that sheds light rain without feeling stiff.</p>
+<p>Two chest pockets and two hand pockets close with brass snaps and the collar stands up on its own.</p>
+<p>We recommend sizing down if you plan to layer it over a sweater during colder months.</p>
+<p>Every jacket is finished by hand in our workshop and ships within two business days.</p>
+<p>Returns are accepted for thirty days as long as the tags are still attached to the garment.</p>
+<p>Care instructions are printed on the inner label so sponge clean only and never machine wash.</p>
+</article>
+<footer><p>Example Outfitters, 42 Market Street</p></footer>
+</body>
+</html>"""
+
+# What an HTML extractor keeps from that page: prose only, no JSON-LD facts.
+HTML_PROSE_ONLY = "\n\n".join(
+    [
+        "Field Jacket",
+        "The Field Jacket is cut from a waxed cotton shell that sheds light rain without "
+        "feeling stiff.",
+        "Two chest pockets and two hand pockets close with brass snaps and the collar stands "
+        "up on its own.",
+        "We recommend sizing down if you plan to layer it over a sweater during colder months.",
+        "Every jacket is finished by hand in our workshop and ships within two business days.",
+        "Returns are accepted for thirty days as long as the tags are still attached to the "
+        "garment.",
+        "Care instructions are printed on the inner label so sponge clean only and never "
+        "machine wash.",
+        "Example Outfitters, 42 Market Street",
+    ]
+)
+
+
+# A prose answer that embeds a fenced complete HTML example. Seven sentences
+# trip ``has_prose`` and the fence trips ``has_code_fences``, so
+# ``is_mixed_content`` says True; the tags inside the fence also make the
+# detector report HTML. The override must not treat the whole answer as a page.
+FENCED_HTML_EXAMPLE = """Here is how the page should look. Keep the header and the footer.
+The layout uses a centered container and a sticky header.
+Colours come from the theme variables defined at the top of the stylesheet.
+Do not rename the ids, the script queries them directly.
+The footer should stay at the bottom on short pages.
+Test it in both light and dark mode before shipping it.
+If the cards wrap badly, reduce the gap between them.
+
+```html
+<!DOCTYPE html>
+<html lang="en">
+<head><meta charset="utf-8"><title>Demo</title></head>
+<body>
+<div id="header">Header</div>
+<div id="nav">Nav</div>
+<div id="main">
+  <div class="card">Card one</div>
+  <div class="card">Card two</div>
+</div>
+<div id="footer">Footer</div>
+</body>
+</html>
+```
+
+Save that as index.html and open it in a browser.
+The `div` ids are what the JavaScript expects, so do not rename them.
+"""
+
+
+def _stub_html_extractor(extracted: str) -> tuple[SimpleNamespace, list[str]]:
+    """Deterministic stand-in for HTMLExtractor (no trafilatura needed)."""
+    seen: list[str] = []
+
+    def _extract(html: str) -> SimpleNamespace:
+        seen.append(html)
+        return SimpleNamespace(extracted=extracted)
+
+    return SimpleNamespace(extract=_extract), seen
+
+
+def test_mixed_html_product_page_routes_to_html() -> None:
+    """A complete HTML page with inline JSON-LD must reach the HTML strategy.
+
+    Both signals come from the real code: ``is_mixed_content`` and the
+    pure-Python detector (the same one ``_detect_content`` falls back to on
+    Windows). No monkeypatching, so the heuristic shapes that caused #3608 are
+    the ones under test.
+    """
+    from headroom.transforms.content_detector import detect_content_type
+
+    router = ContentRouter(ContentRouterConfig())
+
+    assert is_mixed_content(MIXED_HTML_PRODUCT_PAGE) is True
+    detection = detect_content_type(MIXED_HTML_PRODUCT_PAGE)
+    assert detection.content_type is ContentType.HTML
+
+    strategy = router._determine_strategy(MIXED_HTML_PRODUCT_PAGE, mixed=True, detection=detection)
+    assert strategy is CompressionStrategy.HTML
+
+
+def test_html_override_has_no_second_confidence_gate() -> None:
+    """The router trusts the detector's HTML type without re-checking confidence.
+
+    ``detect_content_type`` only returns HTML when its own score clears 0.7, and
+    the native backend hardcodes confidence 1.0, so a threshold here would never
+    filter anything — it only read as a real guard. This pins the single gate so
+    it isn't re-added as dead code.
+    """
+    router = ContentRouter(ContentRouterConfig())
+
+    strategy = router._determine_strategy(
+        MIXED_HTML_PRODUCT_PAGE,
+        mixed=True,
+        detection=DetectionResult(ContentType.HTML, 0.5, {}),
+    )
+    assert strategy is CompressionStrategy.HTML
+
+
+def test_fenced_html_example_stays_mixed() -> None:
+    """A fenced HTML example inside prose must not be extracted as a page.
+
+    The detector reads the tags inside the fence and reports HTML, and the
+    answer is mixed, so without the top-level check the whole response goes to
+    the HTML extractor and the surrounding instructions and fence lines are
+    lost. Both signals come from the real detector and the real heuristic.
+    """
+    from headroom.transforms.content_detector import detect_content_type
+
+    router = ContentRouter(ContentRouterConfig())
+
+    assert is_mixed_content(FENCED_HTML_EXAMPLE) is True
+    detection = detect_content_type(FENCED_HTML_EXAMPLE)
+    assert detection.content_type is ContentType.HTML
+
+    strategy = router._determine_strategy(FENCED_HTML_EXAMPLE, mixed=True, detection=detection)
+    assert strategy is CompressionStrategy.MIXED
+
+
+def test_tool_html_with_inline_jsonld_kept_verbatim(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """apply() must not replace tool HTML with prose that lost its JSON-LD (#3627).
+
+    Routing now sends this page to the HTML extractor, which keeps the article
+    and drops SKU, price and rating without storing the original or emitting a
+    CCR marker. The tool-ground-truth guard has to keep the page verbatim.
+    """
+    router = ContentRouter(ContentRouterConfig())
+    monkeypatch.setattr(
+        content_router_module,
+        "_detect_content",
+        lambda content: DetectionResult(ContentType.HTML, 1.0, {}),
+    )
+    extractor, seen = _stub_html_extractor(HTML_PROSE_ONLY)
+    monkeypatch.setattr(router, "_get_html_extractor", lambda: extractor)
+
+    result = router.apply(
+        [{"role": "tool", "tool_call_id": "call_bash_1", "content": MIXED_HTML_PRODUCT_PAGE}],
+        _ChurnTokenizer(),
+        protect_recent=0,
+        protect_analysis_context=False,
+    )
+
+    assert seen, "extractor never ran: routing did not reach the HTML strategy"
+    out = result.messages[0]["content"]
+    assert out == MIXED_HTML_PRODUCT_PAGE
+    for fact in ("SKU-48213", "189.00", "4.7"):
+        assert fact in out
+
+
+def test_assistant_html_still_compressed(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The HTML guard is scoped to tool ground truth, like the other lossy paths."""
+    router = ContentRouter(ContentRouterConfig())
+    monkeypatch.setattr(
+        content_router_module,
+        "_detect_content",
+        lambda content: DetectionResult(ContentType.HTML, 1.0, {}),
+    )
+    extractor, seen = _stub_html_extractor(HTML_PROSE_ONLY)
+    monkeypatch.setattr(router, "_get_html_extractor", lambda: extractor)
+
+    result = router.apply(
+        [{"role": "assistant", "content": MIXED_HTML_PRODUCT_PAGE}],
+        _ChurnTokenizer(),
+        protect_recent=0,
+        protect_analysis_context=False,
+    )
+
+    assert seen, "extractor never ran: routing did not reach the HTML strategy"
+    assert result.messages[0]["content"] == HTML_PROSE_ONLY
+
+
+def test_html_strategy_without_extractor_passes_through(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Without the ``[html]`` extra (no trafilatura) HTML stays untouched."""
+    router = ContentRouter(ContentRouterConfig())
+    monkeypatch.setattr(
+        content_router_module,
+        "_detect_content",
+        lambda content: DetectionResult(ContentType.HTML, 1.0, {}),
+    )
+    monkeypatch.setattr(router, "_get_html_extractor", lambda: None)
+
+    result = router.compress(MIXED_HTML_PRODUCT_PAGE)
+    assert result.compressed == MIXED_HTML_PRODUCT_PAGE
+
+
 def test_source_code_passthrough_does_not_invoke_kompress(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
