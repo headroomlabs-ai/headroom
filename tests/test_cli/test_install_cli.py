@@ -2055,6 +2055,36 @@ def test_install_start_still_skips_when_nothing_is_pending(monkeypatch) -> None:
     assert applied == []
 
 
+def test_install_apply_rejects_bad_opencode_extra_model_spec(monkeypatch) -> None:
+    """A malformed spec fails before anything is deployed (#3970).
+
+    It would otherwise surface only when provider config is applied, after the
+    new runtime has started.
+    """
+    applied: list[object] = []
+    monkeypatch.setattr("headroom.cli.install._apply_manifest", applied.append)
+
+    result = CliRunner().invoke(
+        main,
+        [
+            "install",
+            "apply",
+            "--scope",
+            "provider",
+            "--providers",
+            "manual",
+            "--target",
+            "opencode",
+            "--env",
+            "HEADROOM_OPENCODE_EXTRA_MODELS=deepseek-chat=DeepSeek=lots",
+        ],
+    )
+
+    assert result.exit_code != 0
+    assert "non-integer context window" in result.output
+    assert applied == []
+
+
 @pytest.mark.parametrize("lifecycle", ["apply", "restart", "ensure"])
 def test_opencode_reactivation_preserves_edits(
     lifecycle: str, monkeypatch: pytest.MonkeyPatch, tmp_path: Path

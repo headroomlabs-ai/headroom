@@ -55,7 +55,13 @@ from headroom.install.supervisors import (
     start_supervisor,
     stop_supervisor,
 )
-from headroom.providers.opencode.install import restore_opencode_backup
+from headroom.providers.opencode.config import extra_models_from_env
+from headroom.providers.opencode.install import (
+    _binding_matches,
+    _upstream_identity,
+    _upstream_url,
+    restore_opencode_backup,
+)
 
 from .main import main
 
@@ -683,6 +689,30 @@ def _apply_manifest(manifest: DeploymentManifest) -> None:
             _save_recovery_snapshot(existing, profile)
             recovery_saved = True
             _remove_deployment(existing)
+            # A provider credential is deployment state, not command-line state:
+            # the deactivate above rewrote the tool config without it, and the
+            # new manifest is built from the flags. Carry it over -- but only
+            # when the upstream identity matches, so credentials stay bound to
+            # their destination. Legacy untagged state is treated as bound to
+            # the existing manifest's upstream.
+            existing_upstream = _upstream_identity(existing)
+            new_upstream = _upstream_identity(manifest)
+            for target, options in (existing.provider_options or {}).items():
+                if target == "opencode":
+                    # Older state is first bound to the existing deployment's own
+                    # destination: a v1 binding was lowercased, so it is trusted
+                    # only when the existing URL lost nothing to that. Only a
+                    # binding re-established as v2 is compared with the new one.
+                    if options.get("_upstream_v") != 2:
+                        if not _binding_matches(
+                            options, existing_upstream, _upstream_url(existing)
+                        ):
+                            continue
+                        options = {**options, "_upstream": existing_upstream, "_upstream_v": 2}
+                    if _binding_matches(options, new_upstream):
+                        manifest.provider_options.setdefault(target, options)
+                else:
+                    manifest.provider_options.setdefault(target, options)
 
     except Exception as exc:
         recovery_detail = (
@@ -995,6 +1025,12 @@ def install_apply(
     # supervised runner forwards to the same gateway the interactive proxy would
     # (#2240). Explicit --env wins, so merge the captured vars underneath.
     combined_env = {**_capture_passthrough_env(os.environ), **parsed_env}
+    # Extra OpenCode model specs are parsed when provider config is applied,
+    # which runs after the new runtime starts, so reject a bad one up front.
+    try:
+        extra_models_from_env(combined_env)
+    except ValueError as exc:
+        raise click.BadParameter(str(exc), param_hint="--env") from exc
 
     manifest = _build_deployment_manifest(
         profile=profile,
