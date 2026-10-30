@@ -120,12 +120,12 @@
     }
   },
   "devDependencies": {
-    "@ai-sdk/anthropic": "^4.0.53",
-    "@ai-sdk/openai": "^4.0.60",
-    "@ai-sdk/provider": "^4.0.14",
+    "@ai-sdk/anthropic": "^4.0.88",
+    "@ai-sdk/openai": "^4.0.102",
+    "@ai-sdk/provider": "^4.0.34",
     "@anthropic-ai/sdk": "^0.133.0",
     "@types/node": "^26.5.0",
-    "ai": "^7.0.59",
+    "ai": "^7.0.153",
     "dotenv": "^18.0.1",
     "openai": "^7.10.0",
     "tsup": "^8.0.0",
