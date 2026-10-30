@@ -671,6 +671,39 @@ class TestClearScope:
         assert remaining == 1
 
     @pytest.mark.asyncio
+    async def test_clear_scope_keeps_a_surviving_turn_in_the_indexes(self, memory_system):
+        """Clearing one turn must not unindex the turn that survives (#4303).
+
+        The orchestrator collects the ids to remove from the indexes with a
+        query, then deletes the rows. If the query describes a wider scope
+        than the delete, a turn that is still stored loses its index entry and
+        stops being findable.
+        """
+        await memory_system.add_batch(
+            [
+                {
+                    "content": "planner t1",
+                    "user_id": "alice",
+                    "agent_id": "planner",
+                    "turn_id": "t1",
+                },
+                {
+                    "content": "planner t2",
+                    "user_id": "alice",
+                    "agent_id": "planner",
+                    "turn_id": "t2",
+                },
+            ]
+        )
+
+        count = await memory_system.clear_scope(user_id="alice", agent_id="planner", turn_id="t1")
+
+        assert count == 1
+        # t2's row survived, so it must still be findable through the indexes.
+        found = await memory_system.text_search("planner t2", user_id="alice")
+        assert [r.memory.content for r in found] == ["planner t2"]
+
+    @pytest.mark.asyncio
     async def test_clear_scope_empty(self, memory_system):
         """Test clearing scope with no matching memories."""
         count = await memory_system.clear_scope(user_id="nonexistent-user")
