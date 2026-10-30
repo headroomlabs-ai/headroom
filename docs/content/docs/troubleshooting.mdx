@@ -107,7 +107,7 @@ print(f"SmartCrusher: {stats['transforms']['smart_crusher_enabled']}")
 
 **Solutions**:
 
-<Tabs groupId="lang" items={['TypeScript', 'Python']}>
+<Tabs groupId="lang" items={['TypeScript', 'Python', 'Go']}>
 <Tab value="TypeScript">
 ```ts twoslash
 import { compress } from 'headroom-ai';
@@ -138,6 +138,23 @@ response = client.chat.completions.create(
 # 3. Lower the compression threshold
 config = HeadroomConfig()
 config.smart_crusher.min_tokens_to_crush = 100  # Default is 200
+```
+</Tab>
+<Tab value="Go">
+```go
+import "github.com/headroomlabs-ai/headroom/sdk/golang"
+
+// Lower the compression threshold via Config:
+cfg := &headroom.Config{
+    SmartCrusher: &headroom.SmartCrusherConfig{
+        Enabled:          headroom.Bool(true),
+        MinTokensToCrush: headroom.Int(100),
+    },
+}
+client := headroom.NewClient(headroom.WithConfig(cfg))
+
+result, _ := client.Compress(ctx, msgs, headroom.CompressOptions{Model: "gpt-4o"})
+fmt.Printf("Saved: %d tokens, compressed=%v\n", result.TokensSaved, result.Compressed)
 ```
 </Tab>
 </Tabs>
