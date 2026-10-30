@@ -214,14 +214,23 @@ ENTRYPOINT ["headroom", "proxy"]
 # Keep host and port defaults in the CLI so HEADROOM_HOST and HEADROOM_PORT
 # remain authoritative for the published image.
 
+# Distroless has no shell, so the ~/.headroom state directory cannot be made
+# with RUN there. Build it here and COPY it in with the right owner (#4443).
+FROM python:${PYTHON_VERSION}-slim AS runtime-slim-state
+RUN mkdir -p /state/.headroom
+
 FROM ${DISTROLESS_IMAGE} AS runtime-slim
 
 ARG RUNTIME_USER=nonroot
+ARG RUNTIME_HOME=/home/nonroot
 ARG PYTHON_SITE_PACKAGES
 
 COPY --from=builder ${PYTHON_SITE_PACKAGES} ${PYTHON_SITE_PACKAGES}
 # Native Rust reverse proxy binary (issue #976).
 COPY --from=builder /usr/local/bin/headroom-proxy /usr/local/bin/headroom-proxy
+# Owned by the runtime user so the volume below is writable (user and group
+# are both named after RUNTIME_USER in the distroless image).
+COPY --from=runtime-slim-state --chown=${RUNTIME_USER}:${RUNTIME_USER} /state/ ${RUNTIME_HOME}/
 
 USER ${RUNTIME_USER}
 WORKDIR /app
@@ -230,6 +239,10 @@ ENV HEADROOM_HOST=127.0.0.1 \
     PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
     PYTHONPATH=${PYTHON_SITE_PACKAGES}
+
+# Same persistent-state volume as the python-slim stage; pass
+# --build-arg RUNTIME_HOME=/root when building with RUNTIME_USER=root.
+VOLUME ${RUNTIME_HOME}/.headroom
 
 EXPOSE 8787
 

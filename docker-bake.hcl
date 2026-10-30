@@ -21,6 +21,7 @@ target "runtime" {
   args = {
     HEADROOM_EXTRAS = "proxy,bedrock,redis"
     RUNTIME_USER    = "root"
+    RUNTIME_HOME    = "/root"
   }
 }
 
@@ -39,6 +40,7 @@ target "runtime-code" {
   args = {
     HEADROOM_EXTRAS = "proxy,code,bedrock,redis"
     RUNTIME_USER    = "root"
+    RUNTIME_HOME    = "/root"
   }
 }
 
@@ -57,6 +59,7 @@ target "runtime-slim" {
   args = {
     HEADROOM_EXTRAS = "proxy,bedrock,redis"
     RUNTIME_USER    = "root"
+    RUNTIME_HOME    = "/root"
   }
 }
 
@@ -75,6 +78,7 @@ target "runtime-code-slim" {
   args = {
     HEADROOM_EXTRAS = "proxy,code,bedrock,redis"
     RUNTIME_USER    = "root"
+    RUNTIME_HOME    = "/root"
   }
 }
 

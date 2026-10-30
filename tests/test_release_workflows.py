@@ -156,6 +156,69 @@ def test_every_published_docker_variant_includes_bedrock_auth_dependencies() -> 
     assert {"boto3", "botocore"} <= bedrock_names
 
 
+def _dockerfile_stages() -> dict[str, list[str]]:
+    """Map each Dockerfile stage to its instruction lines, parent stages first.
+
+    A stage that is ``FROM <earlier stage>`` inherits that stage's filesystem
+    and metadata (VOLUME, WORKDIR, ARG-derived values), so the parent's lines
+    are part of what the child ships.
+    """
+    own: dict[str, list[str]] = {}
+    parent: dict[str, str] = {}
+    current: list[str] | None = None
+    for raw in (ROOT / "Dockerfile").read_text(encoding="utf-8").splitlines():
+        line = raw.strip()
+        from_match = re.match(r"FROM\s+(\S+)\s+AS\s+(\S+)$", line, re.IGNORECASE)
+        if from_match:
+            base, name = from_match.groups()
+            current = own.setdefault(name, [])
+            if base in own:
+                parent[name] = base
+        elif current is not None and line and not line.startswith("#"):
+            current.append(line)
+    stages: dict[str, list[str]] = {}
+    for name in own:
+        chain, node = [], name
+        while node:
+            chain.insert(0, node)
+            node = parent.get(node, "")
+        stages[name] = [line for stage in chain for line in own[stage]]
+    return stages
+
+
+def test_docker_bake_runtime_args_are_declared_by_the_selected_stage() -> None:
+    """Each bake target's runtime args must reach the stage it builds (#4443).
+
+    Build args are scoped to one Dockerfile stage, so passing ``RUNTIME_HOME``
+    to a target whose ``target =`` stage has no ``ARG RUNTIME_HOME`` is a
+    silent no-op. The distroless ``runtime-slim`` stage once ignored it, so the
+    slim root variants shipped without the state volume.
+    """
+    stages = _dockerfile_stages()
+    bake = (ROOT / "docker-bake.hcl").read_text(encoding="utf-8")
+    blocks = re.findall(r'^target "([^"]+)" \{\n(.*?)^\}', bake, flags=re.S | re.M)
+    checked = {}
+    for name, body in blocks:
+        stage_match = re.search(r'^\s*target\s*=\s*"([^"]+)"', body, re.M)
+        if not stage_match:
+            continue
+        stage = stage_match.group(1)
+        assert stage in stages, f"{name} selects unknown Dockerfile stage {stage}"
+        declared = {m.group(1) for line in stages[stage] if (m := re.match(r"ARG\s+(\w+)", line))}
+        passed = set(re.findall(r"^\s*(RUNTIME_\w+)\s*=", body, re.M))
+        assert passed <= declared, f"{name}: stage {stage} does not declare {passed - declared}"
+        home = re.search(r'RUNTIME_HOME\s*=\s*"([^"]+)"', body)
+        user = re.search(r'RUNTIME_USER\s*=\s*"([^"]+)"', body)
+        if user and user.group(1) == "root":
+            assert home and home.group(1) == "/root", f"{name}: root target needs /root"
+        if home:
+            # The stage must put its state volume under the home it was given.
+            assert "VOLUME ${RUNTIME_HOME}/.headroom" in stages[stage], f"{name}: {stage}"
+        checked[name] = stage
+    assert {"runtime", "runtime-code", "runtime-slim", "runtime-code-slim"} <= set(checked)
+    assert {checked[n] for n in ("runtime-slim", "runtime-code-slim")} == {"runtime-slim"}
+
+
 def test_every_docker_variant_includes_the_redis_extra() -> None:
     """Without the client, HEADROOM_COMPRESS_SESSION_STORE=redis:// stops
     startup and HEADROOM_CCR_BACKEND=redis falls back to a per-process store,
