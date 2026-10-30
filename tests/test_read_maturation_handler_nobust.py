@@ -367,9 +367,8 @@ DEFERRED_TOOL = {
 
 def _tool_search_convo(nquiet: int) -> list[dict]:
     """``_busy_convo`` after a ToolSearch whose result holds only tool_reference
-    blocks, as Claude Code loads deferred tools. The compression cache reads no
-    text from that result, so its count never passes it, however much of the
-    later tool output compresses."""
+    blocks, as Claude Code loads deferred tools. Such textless results are
+    stable; tests must not rely on them stopping the local replay window."""
     msgs = _busy_convo(nquiet)
     search = [
         {
@@ -434,23 +433,46 @@ def _record_pipeline_freeze(monkeypatch) -> list[int]:
 @pytest.mark.parametrize(
     ("convo", "tools", "pipeline_stop"),
     [
-        # Nothing compresses, so the compression cache never stores the Read.
+        # Both input shapes exercise the same explicitly bounded local cache.
         (_convo, [READ_TOOL], 2),
-        # Tool output compresses, but the count stops at the ToolSearch result.
         (_tool_search_convo, [READ_TOOL, DEFERRED_TOOL], 2),
     ],
     ids=["quiet", "tool-reference"],
 )
-def test_read_inside_the_cached_prefix_stays_verbatim(monkeypatch, convo, tools, pipeline_stop):
+@pytest.mark.parametrize("cache_hits", [True, False], ids=["provider-cached", "provider-uncached"])
+def test_read_inside_the_cached_prefix_stays_verbatim(
+    monkeypatch, convo, tools, pipeline_stop, cache_hits
+):
     """By the time the Read's file quiesces the provider has cached it, so
     maturing it would re-write the cache from the Read onward. The pipeline's
     own freeze stops below the Read here; maturation must follow the
-    provider-confirmed floor that finalize_turn replays instead."""
+    provider-confirmed floor that finalize_turn replays instead. The uncached
+    control must still mature, so retaining the Read cannot pass vacuously."""
+    from headroom.cache.compression_cache import CompressionCache
     from headroom.cache.compression_store import reset_compression_store
+    from headroom.transforms.read_maturation import ReadMaturationManager
 
     monkeypatch.setenv("HEADROOM_CCR_BACKEND", "memory")
     reset_compression_store()
+    # Explicitly model a local replay window shorter than the provider's
+    # confirmed prefix (e.g. after local cache eviction). Keep real preparation
+    # and tracking; do not depend on any particular tool-result shape being a
+    # cache miss. Textless ToolSearch results are legitimately stable now.
+    compute_frozen = CompressionCache.compute_frozen_count
+
+    def _bounded_local_replay(self, messages):
+        return min(compute_frozen(self, messages), pipeline_stop)
+
+    monkeypatch.setattr(CompressionCache, "compute_frozen_count", _bounded_local_replay)
     pipeline_freeze = _record_pipeline_freeze(monkeypatch)
+    maturation_freeze: list[int] = []
+    apply = ReadMaturationManager.apply
+
+    def _recording_apply(self, messages, frozen_message_count=0):
+        maturation_freeze.append(frozen_message_count)
+        return apply(self, messages, frozen_message_count=frozen_message_count)
+
+    monkeypatch.setattr(ReadMaturationManager, "apply", _recording_apply)
     config = ProxyConfig(
         optimize=True,
         read_maturation=True,
@@ -462,11 +484,29 @@ def test_read_inside_the_cached_prefix_stays_verbatim(monkeypatch, convo, tools,
     )
 
     forwarded = _drive_session(
-        config, n_turns=8, session_id="cached-read-2", convo=convo, tools=tools
+        config,
+        n_turns=8,
+        session_id="cached-read-2",
+        convo=convo,
+        tools=tools,
+        cache_hits=cache_hits,
     )
 
     assert pipeline_freeze and max(pipeline_freeze) <= pipeline_stop, (
         f"fixture must keep the pipeline freeze below the Read: {pipeline_freeze}"
+    )
+    assert len(forwarded) == 8, "every turn must reach the upstream"
+    read_at = next(i for i, msg in enumerate(convo(0)) if _read_result_content(msg) is not None)
+    assert pipeline_stop <= read_at, "the local replay window must exclude the held Read"
+    if not cache_hits:
+        assert maturation_freeze and not any(maturation_freeze)
+        assert _first_matured_turn(forwarded) is not None, "uncached control never matured"
+        return
+    assert len(maturation_freeze) == 8 and all(f > read_at for f in maturation_freeze[1:]), (
+        f"provider-confirmed maturation floor must protect the Read: {maturation_freeze}"
+    )
+    assert all(_read_result_content(msgs[read_at]) == BIG for msgs in forwarded), (
+        "the held Read must remain present and verbatim on every turn"
     )
     assert _first_matured_turn(forwarded) is None, "a cached Read was matured"
     assert not _prefix_rewrites(forwarded), "the forwarded cached prefix changed"
