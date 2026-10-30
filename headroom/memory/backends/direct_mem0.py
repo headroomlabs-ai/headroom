@@ -71,6 +71,60 @@ def _utcnow() -> datetime:
     return datetime.now(timezone.utc)
 
 
+def _mem0_search_metadata(result: dict[str, Any]) -> dict[str, Any]:
+    """Return extra payload fields from a Mem0 2.x search hit.
+
+    ``MemoryItem.metadata`` defaults to ``None``. When a hit has no extra
+    payload keys, ``MemoryItem.model_dump()`` therefore emits
+    ``metadata: None``. ``dict.get("metadata", {})`` still returns ``None``
+    in that case (the key is present), so callers must not treat the default
+    as a guaranteed mapping.
+    """
+    metadata = result.get("metadata")
+    return metadata if isinstance(metadata, dict) else {}
+
+
+def _mem0_search_content(result: dict[str, Any], metadata: dict[str, Any]) -> str:
+    """Resolve memory text from a Mem0 2.x search hit.
+
+    Mem0 maps the Qdrant payload's ``data`` field onto the result's
+    ``memory`` key. Direct-adapter writes also keep a ``memory`` alias for
+    older payload readers, which can surface under ``metadata`` when Mem0
+    treats it as extra payload.
+    """
+    content = result.get("memory") or result.get("data")
+    if not content:
+        content = metadata.get("memory") or metadata.get("data") or result.get("content")
+    return content or ""
+
+
+def _direct_qdrant_payload(
+    fact: str,
+    user_id: str,
+    importance: float,
+    metadata: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Build a Qdrant payload that Mem0 2.x search can round-trip.
+
+    Mem0's ``_search_vector_store`` skips hits whose payload has no ``data``
+    field. Headroom historically stored the fact under ``memory`` only, so
+    saved records were invisible to ``Memory.search``. New writes store the
+    text under both ``data`` (required) and ``memory`` (legacy alias).
+    """
+    return {
+        "user_id": user_id,
+        "importance": importance,
+        "created_at": _utcnow().isoformat(),
+        "hash": hashlib.md5(fact.encode()).hexdigest(),  # nosec B324
+        **(metadata or {}),
+        # ``data`` must win over caller metadata: Mem0 2.x search skips
+        # payloads that lack it. ``memory`` is a compatibility alias for
+        # records and readers that predate the mem0 2.x payload contract.
+        "data": fact,
+        "memory": fact,
+    }
+
+
 @dataclass
 class Mem0Config:
     """Configuration for Direct Mem0 adapter.
@@ -292,6 +346,11 @@ class DirectMem0Adapter:
     ) -> list[str]:
         """Write pre-extracted facts directly to Qdrant.
 
+        Each point's payload stores the fact under ``data`` (required by
+        mem0ai 2.x ``Memory.search``) and ``memory`` (legacy alias). Records
+        written before this contract only have ``memory`` and will not be
+        returned by search until they are migrated; see wiki/memory.md.
+
         Args:
             facts: List of fact strings to store.
             user_id: User identifier.
@@ -313,15 +372,12 @@ class DirectMem0Adapter:
             # Generate embedding
             embedding = await asyncio.to_thread(self._embed, fact)
 
-            # Build metadata payload
-            payload = {
-                "memory": fact,
-                "user_id": user_id,
-                "importance": importance,
-                "created_at": _utcnow().isoformat(),
-                "hash": hashlib.md5(fact.encode()).hexdigest(),  # nosec B324
-                **(metadata or {}),
-            }
+            payload = _direct_qdrant_payload(
+                fact=fact,
+                user_id=user_id,
+                importance=importance,
+                metadata=metadata,
+            )
 
             points.append(
                 PointStruct(
@@ -823,17 +879,17 @@ class DirectMem0Adapter:
         result_list = results if isinstance(results, list) else results.get("results", [])
 
         for result in result_list:
-            # Mem0 returns memory in metadata.memory when using direct Qdrant writes
-            result_metadata = result.get("metadata", {})
-            memory_content = result.get("memory") or result_metadata.get(
-                "memory", result.get("content", "")
-            )
+            # Mem0 2.x may omit extra payload keys and then dump
+            # ``metadata: None`` (not a missing key). Entity/session filters
+            # and user_id construction all call ``.get`` on this mapping.
+            result_metadata = _mem0_search_metadata(result)
+            memory_content = _mem0_search_content(result, result_metadata)
             memory_id = result.get("id", str(uuid.uuid4()))
             similarity = result.get("score", result.get("similarity", 0.0))
+            memory_entities = result_metadata.get("entity_refs") or []
 
             # Filter by entities if provided
             if entities:
-                memory_entities = result_metadata.get("entity_refs", [])
                 content_lower = memory_content.lower()
                 if not any(e in memory_entities for e in entities):
                     if not any(e.lower() in content_lower for e in entities):
@@ -846,10 +902,10 @@ class DirectMem0Adapter:
             memory = Memory(
                 id=memory_id,
                 content=memory_content,
-                user_id=result_metadata.get("user_id", user_id),
+                user_id=result.get("user_id") or result_metadata.get("user_id") or user_id,
                 session_id=result_metadata.get("session_id"),
                 importance=result_metadata.get("importance", 0.5),
-                entity_refs=result_metadata.get("entity_refs", []),
+                entity_refs=memory_entities,
                 metadata=result_metadata,
                 created_at=_utcnow(),
                 valid_from=_utcnow(),
@@ -859,7 +915,7 @@ class DirectMem0Adapter:
                 MemorySearchResult(
                     memory=memory,
                     score=float(similarity),
-                    related_entities=result_metadata.get("entity_refs", []),
+                    related_entities=memory_entities,
                     related_memories=[],
                 )
             )

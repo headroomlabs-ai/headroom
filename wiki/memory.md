@@ -728,6 +728,40 @@ for m in client.memory.get_all():
 3. Try a more specific search query
 4. Check similarity threshold
 
+### DirectMem0 / qdrant-neo4j search returns nothing after a mem0 2.x upgrade
+
+mem0ai 2.x `Memory.search` only returns Qdrant points whose payload includes a `data` field. `DirectMem0Adapter` historically wrote the fact under `memory` only, so those records stay in Qdrant but are invisible to search.
+
+New writes store both `data` (required) and `memory` (legacy alias). To migrate existing points, copy `memory` onto `data` once:
+
+```python
+from qdrant_client import QdrantClient
+
+client = QdrantClient(...)  # same URL/host as Headroom
+collection = "headroom_memories"  # Mem0Config.collection_name
+offset = None
+while True:
+    points, offset = client.scroll(
+        collection_name=collection,
+        with_payload=True,
+        limit=100,
+        offset=offset,
+    )
+    for point in points:
+        payload = point.payload or {}
+        if payload.get("data") or not payload.get("memory"):
+            continue
+        client.set_payload(
+            collection_name=collection,
+            payload={"data": payload["memory"]},
+            points=[point.id],
+        )
+    if offset is None:
+        break
+```
+
+Also confirm search is called with mem0 2.x `filters={"user_id": ...}` and `top_k`, not the removed top-level `user_id` / `limit` kwargs.
+
 ### High latency
 
 1. Use local embeddings: `embedder_backend=EmbedderBackend.LOCAL`
