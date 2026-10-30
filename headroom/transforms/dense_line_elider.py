@@ -21,6 +21,11 @@ from __future__ import annotations
 
 MIN_LINE_CHARS = 300
 MAX_SPACE_RATIO = 0.06
+# Chinese, Japanese and Thai prose puts no spaces between words, so a long
+# paragraph passes the space test. Minified assets, base64 and RSC payloads are
+# almost entirely ASCII, so a line with more non-ASCII than this is text, even
+# when HTML markup or long URLs around the prose make up most of the line.
+MAX_NON_ASCII_RATIO = 0.1
 # A single dense line (a JWT, a signed URL, a PATH, an RSA modulus) is a value
 # the agent asked for, not a dump: a block is only elided when its dense lines
 # add up to at least this many chars. Real bundle dumps are tens of KB.
@@ -40,6 +45,8 @@ def is_dense_line(line: str) -> bool:
     # Tabs: TSV / ``psql -A`` rows pass the space ratio but are data the agent
     # asked for; minified assets and encoded blobs never carry tabs.
     if n < MIN_LINE_CHARS or "\t" in line or (line.count(" ") / n) >= MAX_SPACE_RATIO:
+        return False
+    if not line.isascii() and n - len(line.encode("ascii", "ignore")) > n * MAX_NON_ASCII_RATIO:
         return False
     stripped = line.strip()
     if stripped[:1] in "{[" and stripped[-1:] in "}]":
