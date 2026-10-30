@@ -4809,6 +4809,215 @@ def inject_tool_search_deferral_openai(
     return out
 
 
+# ── LeanContext (pure-Python, in-process) ────────────────────────────
+
+_leanctx_python_stats: dict[str, Any] = {
+    "tool": "leanctx-py",
+    "label": "LeanContext (Python)",
+    "scope": "project",
+    "tokens_saved": 0,
+    "attempted_tokens": 0,
+    "lines_dropped": 0,
+    "calls": 0,
+    "proxy_tokens_saved": 0,
+    "proxy_attempted_tokens": 0,
+    "proxy_lines_dropped": 0,
+    "proxy_calls": 0,
+}
+
+
+def apply_leanctx_python(
+    text: str,
+    window_radius: int = 50,
+    *,
+    record_proxy_stats: bool = False,
+) -> str:
+    """Apply in-process LeanContext filtering to tool output text.
+
+    Returns filtered text and updates internal stats. Standalone helper calls
+    default to ``record_proxy_stats=False`` so ad-hoc utility invocations do
+    not inflate proxy request savings in ``/stats``.
+    """
+    from headroom.transforms.lean_context import get_lean_context
+
+    lc = get_lean_context(window_radius)
+    result = lc.truncate(text)
+
+    saved_tokens = result.dropped_lines * 20  # ~20 tokens/line avg
+    attempted_tokens = max(saved_tokens, result.original_lines * 20)
+
+    _leanctx_python_stats["lines_dropped"] += result.dropped_lines
+    _leanctx_python_stats["calls"] += 1
+    _leanctx_python_stats["tokens_saved"] += saved_tokens
+    _leanctx_python_stats["attempted_tokens"] += attempted_tokens
+
+    if record_proxy_stats:
+        _leanctx_python_stats["proxy_lines_dropped"] += result.dropped_lines
+        _leanctx_python_stats["proxy_calls"] += 1
+        _leanctx_python_stats["proxy_tokens_saved"] += saved_tokens
+        _leanctx_python_stats["proxy_attempted_tokens"] += attempted_tokens
+
+    return result.text
+
+
+def get_leanctx_python_stats() -> dict[str, Any]:
+    """Get LeanContext Python in-process stats."""
+    return dict(_leanctx_python_stats)
+
+
+def reset_leanctx_python_stats() -> None:
+    """Reset LeanContext Python in-process stats."""
+    for key in (
+        "tokens_saved",
+        "attempted_tokens",
+        "lines_dropped",
+        "calls",
+        "proxy_tokens_saved",
+        "proxy_attempted_tokens",
+        "proxy_lines_dropped",
+        "proxy_calls",
+    ):
+        _leanctx_python_stats[key] = 0
+
+
+def leanctx_enabled(headers: Any = None) -> bool:
+    """Check whether LeanContext tool-output truncation is enabled for a request."""
+    if headers is not None and hasattr(headers, "get"):
+        raw_hdr = str(
+            headers.get("x-headroom-lean-context") or headers.get("X-Headroom-Lean-Context") or ""
+        ).strip()
+        if raw_hdr.lower() in ("1", "true", "yes", "on"):
+            return True
+        if raw_hdr.lower() in ("0", "false", "no", "off"):
+            return False
+    env_val = os.environ.get("HEADROOM_LEAN_CONTEXT", "").strip().lower()
+    return env_val in ("1", "true", "yes", "on")
+
+
+def apply_leanctx_to_messages(
+    messages: list[dict[str, Any]],
+    *,
+    window_radius: int = 50,
+    record_proxy_stats: bool = True,
+) -> tuple[list[dict[str, Any]], int]:
+    """Apply LeanContext window truncation to tool-output messages in a request.
+
+    Supports both OpenAI ``role="tool"`` messages (string or block content) and
+    Anthropic ``role="user"`` messages containing ``type="tool_result"`` blocks.
+    Returns ``(updated_messages, lines_dropped)``. When no lines are dropped,
+    the original ``messages`` list is returned unchanged.
+    """
+    if not messages:
+        return messages, 0
+
+    before_dropped = int(
+        _leanctx_python_stats["proxy_lines_dropped" if record_proxy_stats else "lines_dropped"]
+    )
+    updated_messages: list[dict[str, Any]] = []
+    any_modified = False
+
+    for msg in messages:
+        if not isinstance(msg, dict):
+            updated_messages.append(msg)
+            continue
+
+        role = msg.get("role")
+        content = msg.get("content")
+
+        if role == "tool" and isinstance(content, str):
+            truncated = apply_leanctx_python(
+                content,
+                window_radius=window_radius,
+                record_proxy_stats=record_proxy_stats,
+            )
+            if truncated != content:
+                any_modified = True
+                updated_messages.append({**msg, "content": truncated})
+            else:
+                updated_messages.append(msg)
+        elif role in ("user", "tool") and isinstance(content, list):
+            new_blocks: list[Any] = []
+            msg_modified = False
+            for block in content:
+                if not isinstance(block, dict):
+                    new_blocks.append(block)
+                    continue
+                btype = block.get("type")
+                if btype == "tool_result":
+                    bcontent = block.get("content")
+                    if isinstance(bcontent, str):
+                        truncated = apply_leanctx_python(
+                            bcontent,
+                            window_radius=window_radius,
+                            record_proxy_stats=record_proxy_stats,
+                        )
+                        if truncated != bcontent:
+                            msg_modified = True
+                            new_blocks.append({**block, "content": truncated})
+                        else:
+                            new_blocks.append(block)
+                    elif isinstance(bcontent, list):
+                        inner_blocks: list[Any] = []
+                        inner_modified = False
+                        for sub in bcontent:
+                            if (
+                                isinstance(sub, dict)
+                                and sub.get("type") == "text"
+                                and isinstance(sub.get("text"), str)
+                            ):
+                                truncated = apply_leanctx_python(
+                                    sub["text"],
+                                    window_radius=window_radius,
+                                    record_proxy_stats=record_proxy_stats,
+                                )
+                                if truncated != sub["text"]:
+                                    inner_modified = True
+                                    inner_blocks.append({**sub, "text": truncated})
+                                else:
+                                    inner_blocks.append(sub)
+                            else:
+                                inner_blocks.append(sub)
+                        if inner_modified:
+                            msg_modified = True
+                            new_blocks.append({**block, "content": inner_blocks})
+                        else:
+                            new_blocks.append(block)
+                    else:
+                        new_blocks.append(block)
+                elif (
+                    role == "tool"
+                    and btype in ("text", "input_text", "output_text")
+                    and isinstance(block.get("text"), str)
+                ):
+                    truncated = apply_leanctx_python(
+                        block["text"],
+                        window_radius=window_radius,
+                        record_proxy_stats=record_proxy_stats,
+                    )
+                    if truncated != block["text"]:
+                        msg_modified = True
+                        new_blocks.append({**block, "text": truncated})
+                    else:
+                        new_blocks.append(block)
+                else:
+                    new_blocks.append(block)
+            if msg_modified:
+                any_modified = True
+                updated_messages.append({**msg, "content": new_blocks})
+            else:
+                updated_messages.append(msg)
+        else:
+            updated_messages.append(msg)
+
+    after_dropped = int(
+        _leanctx_python_stats["proxy_lines_dropped" if record_proxy_stats else "lines_dropped"]
+    )
+    lines_dropped = max(0, after_dropped - before_dropped)
+    if not any_modified:
+        return messages, 0
+    return updated_messages, lines_dropped
+
+
 _KEEP_LAST_TURNS_INSTRUCTION_ROLES = frozenset({"system", "developer"})
 
 

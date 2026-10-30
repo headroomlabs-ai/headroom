@@ -1,0 +1,53 @@
+name: leanctx-ci
+on:
+  push:
+    paths:
+      - '.github/workflows/leanctx-ci.yml'
+      - 'headroom/transforms/lean_context.py'
+      - 'headroom/proxy/coalescer.py'
+      - 'headroom/proxy/helpers.py'
+      - 'headroom/proxy/server.py'
+      - 'headroom/proxy/prometheus_metrics.py'
+      - 'headroom/proxy/handlers/anthropic.py'
+      - 'headroom/proxy/handlers/openai.py'
+      - 'tests/test_transforms/test_lean_context*.py'
+      - 'tests/test_proxy/test_coalescer*.py'
+      - 'pyproject.toml'
+      - 'uv.lock'
+  pull_request:
+    paths:
+      - '.github/workflows/leanctx-ci.yml'
+      - 'headroom/transforms/lean_context.py'
+      - 'headroom/proxy/coalescer.py'
+      - 'headroom/proxy/helpers.py'
+      - 'headroom/proxy/server.py'
+      - 'headroom/proxy/prometheus_metrics.py'
+      - 'headroom/proxy/handlers/anthropic.py'
+      - 'headroom/proxy/handlers/openai.py'
+      - 'tests/test_transforms/test_lean_context*.py'
+      - 'tests/test_proxy/test_coalescer*.py'
+      - 'pyproject.toml'
+      - 'uv.lock'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.12'
+      - run: python -m pip install --upgrade pip uv
+      - run: uv sync --frozen --extra dev
+      - run: >-
+          uv run pytest
+          tests/test_transforms/test_lean_context.py
+          tests/test_transforms/test_lean_context_bench.py
+          tests/test_transforms/test_lean_context_fuzz.py
+          tests/test_proxy/test_coalescer.py
+          tests/test_proxy/test_coalescer_fuzz.py
+          -v

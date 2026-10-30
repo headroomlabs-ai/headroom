@@ -351,6 +351,23 @@ def _dump_prefix_mismatch(request_id: str, current: list, previous: list) -> Non
         )
 
 
+def _clone_buffered_response(response: Any) -> Any:
+    """Hand each caller its own copy of a shared buffered upstream response."""
+    try:
+        content = response.content
+    except Exception:
+        return response
+    try:
+        return httpx.Response(
+            status_code=response.status_code,
+            headers=dict(response.headers),
+            content=content,
+            request=response.request,
+        )
+    except Exception:
+        return response
+
+
 class AnthropicHandlerMixin:
     """Mixin providing Anthropic API handler methods for HeadroomProxy."""
 
@@ -1387,6 +1404,8 @@ class AnthropicHandlerMixin:
             from headroom.proxy.helpers import (
                 _strip_internal_headers,
                 apply_keep_last_turns,
+                apply_leanctx_to_messages,
+                leanctx_enabled,
                 log_outbound_headers,
                 merge_extra_headers,
             )
@@ -1717,8 +1736,27 @@ class AnthropicHandlerMixin:
                 except ValueError:
                     pass  # malformed value — never break the request
 
+            # LeanContext window truncation for tool outputs (opt-in via
+            # HEADROOM_LEAN_CONTEXT=1 or x-headroom-lean-context: 1).
+            _leanctx_dropped_lines = 0
+            if not _bypass and leanctx_enabled(request.headers):
+                messages, _leanctx_dropped_lines = apply_leanctx_to_messages(
+                    messages,
+                    record_proxy_stats=True,
+                )
+                if _leanctx_dropped_lines > 0:
+                    body["messages"] = messages
+                    body_mutation_tracker.mark_mutated("lean_context")
+                    logger.info(
+                        "[%s] lean_context: dropped %d lines from tool outputs",
+                        request_id,
+                        _leanctx_dropped_lines,
+                    )
+
             # Apply optimization
             transforms_applied = []
+            if _leanctx_dropped_lines > 0:
+                transforms_applied.append(f"lean_context:{_leanctx_dropped_lines}_lines_dropped")
             pipeline_timing: dict[str, float] = {}
             waste_signals_dict: dict[str, int] | None = None
             optimized_messages = messages
@@ -4400,7 +4438,43 @@ class AnthropicHandlerMixin:
                                     send_upstream, headers, body, url=url, request_id=request_id
                                 )
                             else:
-                                response = await send_upstream(headers, body)
+                                from headroom.proxy.coalescer import (
+                                    coalescing_enabled,
+                                    get_coalescer,
+                                )
+
+                                if coalescing_enabled(request.headers):
+                                    import hashlib
+
+                                    _auth_fp = hashlib.sha256(
+                                        (
+                                            f"{url}|"
+                                            f"{headers.get('authorization', '')}|"
+                                            f"{headers.get('x-api-key', '')}"
+                                        ).encode()
+                                    ).hexdigest()[:16]
+                                    _coalesce_res = await get_coalescer().submit(
+                                        body,
+                                        scope=_auth_fp,
+                                        dispatch_fn=lambda outbound_body: send_upstream(
+                                            headers, outbound_body
+                                        ),
+                                    )
+                                    response = _coalesce_res["response"]
+                                    tags["coalesced"] = bool(_coalesce_res.get("coalesced", False))
+                                    if tags["coalesced"]:
+                                        # A coalesced batch is only formed from
+                                        # identical inputs, so the answer is the
+                                        # same — but each caller still owns its
+                                        # response. Sharing one object lets one
+                                        # caller's later mutation (or stream read)
+                                        # leak into its peers.
+                                        response = _clone_buffered_response(response)
+                                    tags["coalesced_batch_size"] = int(
+                                        _coalesce_res.get("batch_size", 1)
+                                    )
+                                else:
+                                    response = await send_upstream(headers, body)
                         self.pipeline_extensions.emit(
                             PipelineStage.POST_SEND,
                             operation="proxy.request",

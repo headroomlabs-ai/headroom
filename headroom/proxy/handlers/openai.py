@@ -3537,6 +3537,8 @@ class OpenAIHandlerMixin:
         from headroom.proxy.helpers import (
             _strip_internal_headers,
             apply_keep_last_turns,
+            apply_leanctx_to_messages,
+            leanctx_enabled,
             log_outbound_headers,
             merge_extra_headers,
         )
@@ -3829,8 +3831,26 @@ class OpenAIHandlerMixin:
             except ValueError:
                 pass  # malformed value — never break the request
 
+        # LeanContext window truncation for tool outputs (opt-in via
+        # HEADROOM_LEAN_CONTEXT=1 or x-headroom-lean-context: 1).
+        _leanctx_dropped_lines = 0
+        if not _bypass and leanctx_enabled(request.headers):
+            messages, _leanctx_dropped_lines = apply_leanctx_to_messages(
+                messages,
+                record_proxy_stats=True,
+            )
+            if _leanctx_dropped_lines > 0:
+                body["messages"] = messages
+                logger.info(
+                    "[%s] lean_context: dropped %d lines from tool outputs",
+                    request_id,
+                    _leanctx_dropped_lines,
+                )
+
         # Optimization
         transforms_applied = []
+        if _leanctx_dropped_lines > 0:
+            transforms_applied.append(f"lean_context:{_leanctx_dropped_lines}_lines_dropped")
         pipeline_timing: dict[str, float] = {}
         waste_signals_dict: dict[str, int] | None = None
         optimized_messages = messages

@@ -444,6 +444,14 @@ class PrometheusMetrics:
             self.tokens_saved_total = 0
             self.tool_search_saved_total = 0
             self.attempted_input_tokens_total = 0
+            try:
+                from headroom.proxy.coalescer import reset_coalescer
+                from headroom.proxy.helpers import reset_leanctx_python_stats
+
+                reset_leanctx_python_stats()
+                reset_coalescer()
+            except Exception:
+                pass
 
             self.compressions_by_strategy.clear()
             self.tokens_saved_by_strategy.clear()
