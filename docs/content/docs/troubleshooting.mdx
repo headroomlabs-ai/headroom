@@ -364,6 +364,28 @@ pipx install --python python3.13 "headroom-ai[all]==0.21.4"
 If you already have Headroom installed under `pipx`, uninstall it first or
 reinstall it with the supported interpreter.
 
+### Docker image frozen at an old version
+
+**Symptom**: `headroom --version` inside the running container reports an old
+release (e.g. `0.27.0`) no matter how recently you pulled the image.
+
+**Cause**: the project moved from the `chopratejas` personal account to the
+`headroomlabs-ai` org, and GHCR does not redirect packages across that move.
+`ghcr.io/chopratejas/headroom` still exists but stopped receiving pushes at
+that point, so it is permanently frozen at the last version built under the
+old namespace. A `HEADROOM_DOCKER_IMAGE` override, an install script, or a
+tutorial saved from before the move can still point there.
+
+Pull the current image instead:
+
+```bash
+docker pull ghcr.io/headroomlabs-ai/headroom:latest
+```
+
+If you set `HEADROOM_DOCKER_IMAGE` yourself, check it does not still read
+`ghcr.io/chopratejas/headroom`. See [Docker install](/docs/docker-install)
+for the current default and the available tags.
+
 ### pip install fails with C++ compilation error
 
 **Symptom**: `RuntimeError: Unsupported compiler -- at least C++11 support is needed!`

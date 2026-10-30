@@ -3,12 +3,19 @@
   "version": "1.0.0",
   "private": true,
   "description": "Locked CLI dependencies for the Docker wrap E2E harness",
+  "scripts": {
+    "test": "node --test --test-concurrency=1 --test-reporter=tap dependency-regression.test.cjs"
+  },
   "dependencies": {
-    "@openai/codex": "0.162.1",
-    "openclaw": "2026.10.2"
+    "@openai/codex": "0.163.0",
+    "openclaw": "2026.10.6"
   },
   "overrides": {
     "@modelcontextprotocol/sdk": "1.32.1",
-    "npm": "12.2.1"
+    "npm": "12.2.1",
+    "zod": "4.6.6",
+    "openclaw": {
+      "undici": "8.12.3"
+    }
   }
 }

@@ -39,9 +39,9 @@ from ..log_safety import describe_exception, safe_id
 logger = logging.getLogger(__name__)
 
 # A run must be at least this many lines AND this many chars to be worth a
-# pointer. Small dups are left alone (fragmenting context is not worth it) —
-# and a larger floor keeps the pointer comfortably shorter than the span it
-# replaces, so a fold is always a net byte win.
+# pointer. Small dups are left alone (fragmenting context is not worth it).
+# The floor alone does not make a fold a net byte win (the pointer can still be
+# as long as a short span); dedup_blocks checks the UTF-8 sizes before folding.
 DEFAULT_MIN_LINES = 3
 DEFAULT_MIN_CHARS = 40
 # Cap anchor candidates examined per line so a hot line (e.g. ``    return``)
@@ -54,7 +54,7 @@ MAX_ANCHOR_CANDIDATES = 16
 # line must start with the digit, so ``number + delta`` re-numbers byte-exactly
 # without touching alignment padding, keeping renumbered folds strictly lossless.
 #
-# ``[1-9]\d*`` (not ``\d+``) is load-bearing: a LEADING-ZERO run (``08:00:01`` in
+# The leading ``[1-9]`` (not ``\d``) is load-bearing: a LEADING-ZERO run (``08:00:01`` in
 # a timestamped log, ``007:...``) is not an unpadded grep/sed line number, and
 # recovery is ``str(int(number) + delta)``, which drops the zero pad — ``int("08")
 # + 1`` renders ``"9"``, not ``"09"``. Matching those would fold them under a
@@ -63,7 +63,11 @@ MAX_ANCHOR_CANDIDATES = 16
 # fold only on an EXACT match (delta 0) — the "prefer false negatives" posture.
 # Real grep -n / sed -n / rg -n numbers never carry a leading zero, so the
 # intended renumber-fold feature is unaffected.
-_LINENO_RE = re.compile(r"^([1-9]\d*)(:|\t)(.*)$", re.DOTALL)
+#
+# ``\d{0,17}`` bounds the run at 18 digits: Python refuses ``int()`` on a run of
+# 4,301+ digits (ValueError), which would abort dedup for the whole request. A
+# longer run is not a real line number, so the line stays non-numbered.
+_LINENO_RE = re.compile(r"^([1-9]\d{0,17})(:|\t)(.*)$", re.DOTALL)
 
 
 def _num_and_key(line: str) -> tuple[int | None, str, str]:
@@ -264,9 +268,12 @@ def dedup_blocks(
                 if m is not None and m[0] >= min_lines:
                     span = lines[i : i + m[0]]
                     span_text = "\n".join(span)
-                    if len(span_text) >= min_chars:
-                        ref_turn = blocks[m[1]].turn
-                        ptr = _pointer(span, ref_turn, m[3])
+                    ptr = _pointer(span, blocks[m[1]].turn, m[3])
+                    # Never fold when the pointer is not shorter than the span, in
+                    # UTF-8 bytes ("↑" is 3 bytes, so character counts mislead).
+                    if len(span_text) >= min_chars and len(ptr.encode("utf-8")) < len(
+                        span_text.encode("utf-8")
+                    ):
                         out.append(ptr)
                         # Folded span is NOT verbatim in this block's output:
                         # mark None so it can't seed a later contiguous match,
