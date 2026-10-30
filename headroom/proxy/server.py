@@ -1215,6 +1215,11 @@ class HeadroomProxy(
         # Set by startup() when HEADROOM_PREFIX_STATE_FILE opts in.
         self._prefix_state_file: str | None = None
 
+        # Circuit breaker for runaway tool repetition loops
+        from headroom.proxy.circuit_breaker import ToolLoopCircuitBreaker
+
+        self.tool_loop_circuit_breaker = ToolLoopCircuitBreaker()
+
         # Compression cache store for token mode (session-scoped). The dict
         # itself is mutated under `_compression_caches_lock`; the per-session
         # `CompressionCache` instances have their own internal lock guarding
@@ -6433,6 +6438,7 @@ def _proxy_config_from_env() -> ProxyConfig:
         malloc_trim_interval_seconds=_get_env_int("HEADROOM_MALLOC_TRIM_INTERVAL_SECONDS", 60),
         proxy_token=os.environ.get("HEADROOM_PROXY_TOKEN") or None,
         offline=_get_env_bool("HEADROOM_OFFLINE", False),
+        circuit_breaker=_get_env_str("HEADROOM_CIRCUIT_BREAKER", "warn"),
         # Default mode is CACHE (Headroom's coding posture): delta-only compression
         # at ~0 prefix-cache busts. HEADROOM_MODE overrides.
         mode=normalize_proxy_mode(_get_env_str("HEADROOM_MODE", PROXY_MODE_CACHE)),
