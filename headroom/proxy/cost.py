@@ -12,6 +12,7 @@ import importlib.util
 import logging
 import math
 from collections import deque
+from collections.abc import Mapping
 from datetime import datetime, timedelta
 from typing import TYPE_CHECKING, Any, NamedTuple
 
@@ -544,6 +545,42 @@ def build_prefix_cache_stats(
     }
 
 
+def request_cost_usd(cost_tracker: CostTracker | None, log: Mapping[str, Any]) -> float | None:
+    """Best-effort actual-cost estimate (USD) for one logged request (issue #1079).
+
+    Prices the same input count the cost tracker bills — the provider-reported
+    ``provider_input_tokens`` when the provider reported one, else the local
+    post-compression ``input_tokens_optimized`` — plus ``output_tokens``, via the
+    existing ``CostTracker.estimate_cost`` (LiteLLM list price). Best-effort: it
+    does NOT apply cache-read/cache-write discounts. The log keeps cache read and
+    write counts, but not the inferred-write flag or the 5m/1h write split that
+    cache-aware pricing needs (pricing an inferred OpenAI write as a write would
+    overcharge), so treat the value as a list-price estimate, not an exact bill.
+
+    Returns ``None`` — never a fabricated number — when cost tracking is
+    disabled, the entry lacks a model, input tokens or output tokens, or pricing
+    is unavailable, so downstream tooling can distinguish "unknown" from "$0". A
+    missing output count is unknown, not zero: pricing it as zero would publish
+    an input-only figure that looks complete. Exception-isolated so a single bad
+    entry never breaks the ``/stats`` payload.
+    """
+    if cost_tracker is None:
+        return None
+    model = log.get("model")
+    input_tokens = log.get("provider_input_tokens") or log.get("input_tokens_optimized")
+    output_tokens = log.get("output_tokens")
+    if not model or input_tokens is None or output_tokens is None:
+        return None
+    try:
+        return cost_tracker.estimate_cost(
+            model=model,
+            input_tokens=int(input_tokens),
+            output_tokens=int(output_tokens),
+        )
+    except Exception:  # noqa: BLE001 — never break /stats on a pricing error
+        return None
+
+
 def merge_cost_stats(
     cost_stats: dict | None,
     cache_stats: dict,
@@ -649,7 +686,7 @@ def build_session_summary(
     def _entry_has_number(entry: Any, attr: str) -> bool:
         value = getattr(entry, attr, None)
         return (
-            isinstance(value, (int, float))
+            isinstance(value, int | float)
             and not isinstance(value, bool)
             and math.isfinite(float(value))
         )
