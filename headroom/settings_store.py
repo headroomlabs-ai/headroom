@@ -774,6 +774,7 @@ SETTINGS: tuple[SettingField, ...] = (
 
 _BY_KEY: dict[str, SettingField] = {f.key: f for f in SETTINGS}
 _BY_ENV: dict[str, SettingField] = {f.env: f for f in SETTINGS}
+# Values inserted by this process, distinct from operator-provided exports.
 
 
 class SettingsValidationError(Exception):
@@ -1018,13 +1019,15 @@ def apply_to_environ(values: dict[str, Any]) -> None:
         field = _BY_KEY.get(key)
         if field is None or value is None:
             continue
-        if field.env in os.environ:
-            # An explicit export is already there and keeps precedence, so
-            # Headroom did not insert this one.
-            continue
-        serialized = _serialize(field, value)
-        os.environ[field.env] = serialized
-        _SEEDED_ENV[field.env] = serialized
+        if field.env not in os.environ:
+            serialized = _serialize(field, value)
+            os.environ.setdefault(field.env, serialized)
+            _SEEDED_ENV[field.env] = serialized
+
+
+def seeded_env_keys() -> frozenset[str]:
+    """Settings-generated env keys whose values have not since been overridden."""
+    return frozenset(key for key, value in _SEEDED_ENV.items() if os.environ.get(key) == value)
 
 
 def _coerce_runtime_values(runtime_values: dict[str, Any] | None) -> dict[str, Any]:
@@ -1093,6 +1096,7 @@ def to_schema(
     explicit operator exports.
     """
     stored = load()
+    generated_env_keys = seeded_env_keys() | env_override_exclusions
     environment_effective = effective_values(stored)
     runtime = _coerce_runtime_values(runtime_values)
     effective = {**environment_effective, **runtime}
@@ -1122,7 +1126,7 @@ def to_schema(
                 "tier": field.tier,
                 "env_override": bool(env_raw)
                 and env_raw != seeded_env
-                and field.env not in env_override_exclusions,
+                and field.env not in generated_env_keys,
                 "runtime_override": field.key in runtime
                 and runtime[field.key] != environment_effective[field.key],
                 "value": _mask(field, effective.get(field.key)),
