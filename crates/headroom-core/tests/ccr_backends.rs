@@ -162,14 +162,15 @@ fn backend_swap_byte_equal_keys() {
 
 #[test]
 fn in_memory_get_refreshes_idle_ttl() {
-    let store = InMemoryCcrStore::with_capacity_and_ttl(10, Duration::from_millis(120));
+    // Wide margins: `sleep` overshoots by tens of ms on loaded macOS runners.
+    let store = InMemoryCcrStore::with_capacity_and_ttl(10, Duration::from_millis(1_000));
     let hash = compute_key(b"hot entry");
     store.put(&hash, "hot entry");
-    // Touch the entry every 60ms for ~4 idle windows' worth of wall
-    // clock. Wall-clock expiry would kill it at 120ms; a sliding idle
-    // window keeps it alive because every hit restarts the clock.
-    for _ in 0..8 {
-        std::thread::sleep(Duration::from_millis(60));
+    // Touch the entry every 250ms for 1.5s. Wall-clock expiry would kill
+    // it at 1s; a sliding idle window keeps it alive because every hit
+    // restarts the clock.
+    for _ in 0..6 {
+        std::thread::sleep(Duration::from_millis(250));
         assert_eq!(
             store.get(&hash).as_deref(),
             Some("hot entry"),
@@ -177,7 +178,7 @@ fn in_memory_get_refreshes_idle_ttl() {
         );
     }
     // Now go idle past the window: the entry must expire.
-    std::thread::sleep(Duration::from_millis(200));
+    std::thread::sleep(Duration::from_millis(1_500));
     assert_eq!(
         store.get(&hash),
         None,
