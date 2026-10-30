@@ -21,6 +21,7 @@ the same deprecation policy.
 
 from __future__ import annotations
 
+import hashlib
 import inspect
 import logging
 from collections.abc import Awaitable, Callable, Mapping
@@ -40,6 +41,15 @@ log = logging.getLogger(__name__)
 # The exact message/response shapes are provider-native (Anthropic / OpenAI /
 # Google), matching whatever the surrounding handler already works with.
 CallModel = Callable[[list[dict[str, Any]]], Awaitable[dict[str, Any]]]
+
+
+def conversation_from(namespace: str, client_id: object) -> str | None:
+    """``TurnContext.conversation`` for a client-supplied id: a sha256 of
+    ``namespace`` and the id, so hooks get a stable opaque key and two sources
+    can never alias; ``None`` when there is no id."""
+    if not isinstance(client_id, str) or not client_id:
+        return None
+    return hashlib.sha256(f"{namespace}\0{client_id}".encode("utf-8", "ignore")).hexdigest()
 
 
 @dataclass
@@ -67,6 +77,14 @@ class TurnContext:
     # a token set behind the client's own value rather than overwritten. On the
     # gateway contract the merged map is the response's ``headers`` object.
     provider_headers: dict[str, str] = field(default_factory=dict)
+    # An opaque key, stable for one client conversation (every turn and retry
+    # of it), or None when the client names none. A digest, never the client's
+    # raw id: from Claude Code's session header, Codex's thread or session id,
+    # ``x-headroom-session-id``, or the gateway session. A hook that pins per
+    # conversation (e.g. wording it must not change mid-cache) keys on it.
+    # Keys compare within one endpoint: the same session header gives a
+    # different key on /v1/messages and /v1/responses.
+    conversation: str | None = None
 
     def record_savings(
         self,

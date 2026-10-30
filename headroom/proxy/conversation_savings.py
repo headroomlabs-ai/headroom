@@ -49,6 +49,7 @@ __all__ = [
     "get_conversation_savings",
     "reset_conversation_savings",
     "savings_conversation_key",
+    "turn_conversation_key",
 ]
 
 _ID_KEYS = ("id", "conversation_id", "session_id", "thread_id")
@@ -103,9 +104,24 @@ def savings_conversation_key(body: Any, *, session_id: str | None = None) -> str
         return None
     if body.get("previous_response_id") or body.get("conversation"):
         return None
+    return turn_conversation_key(body, session_id=session_id)
 
+
+def turn_conversation_key(body: Any, *, session_id: str | None = None) -> str | None:
+    """The conversation a Responses request names, or ``None`` when it names none.
+
+    Premise 1 of :func:`savings_conversation_key` only, with the same ids and
+    the same digest: an incremental body (``previous_response_id``) still
+    belongs to its conversation, so this is the key turn hooks see as
+    ``TurnContext.conversation`` on every turn. So does a body that names a
+    server-side ``conversation`` (an id, or an object with one), which
+    :func:`savings_conversation_key` excludes before calling this.
+    """
+    if not isinstance(body, dict):
+        return None
+    body = _unwrap_response_create_body(body)
     identity = ""
-    for key in ("conversation_id", "thread_id", "session_id"):
+    for key in ("conversation_id", "thread_id", "session_id", "conversation"):
         value = _explicit_id(body.get(key))
         if value:
             identity = f"{key}:{value}"

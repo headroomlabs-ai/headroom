@@ -92,6 +92,9 @@ class GatewayTurn:
         self._obligations: list[str] = []
         self._turn_id: str | None = None
         self._ccr_armed = False
+        # Set by the compress handler from the session id (see CompressTurn);
+        # hooks see it as ``TurnContext.conversation``.
+        self.conversation: str | None = None
 
     # -- fail-open ---------------------------------------------------------
     def fail_open_fields(self, messages: list[dict[str, Any]]) -> dict[str, Any]:
@@ -124,6 +127,7 @@ class GatewayTurn:
             config=config,
             tags=tags,
             caps=self.caps,
+            conversation=self.conversation,
         )
 
     # -- executor side -----------------------------------------------------

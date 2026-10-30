@@ -364,8 +364,9 @@ def _responses_body() -> dict[str, object]:
 @pytest.mark.parametrize(
     ("user_agent", "expected"),
     [
-        ("opencode/0.4.2", {"client": "opencode"}),
-        ("codex-cli/1.2.3", {"client": "codex"}),
+        # No conversation id in the body or headers: hooks get no conversation.
+        ("opencode/0.4.2", {"client": "opencode", "conversation": None}),
+        ("codex-cli/1.2.3", {"client": "codex", "conversation": None}),
     ],
 )
 def test_native_responses_route_carries_the_client_decision(
