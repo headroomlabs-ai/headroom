@@ -458,6 +458,42 @@ def test_compress_passes_through_ragged_table(monkeypatch) -> None:
     assert result.compressed == ragged
 
 
+# Duplicate header names ------------------------------------------------------
+
+
+def _duplicate_header_csv() -> str:
+    # A SQL join result: the same column name appears twice (#4277).
+    return "id,name,id,name\n" + "".join(f"{i},user_{i},{100 + i},org_{i % 3}\n" for i in range(40))
+
+
+def test_parse_tabular_rejects_duplicate_headers() -> None:
+    # Two columns with the same name cannot be zipped into records without one
+    # overwriting the other, so the earlier column's values would be lost.
+    assert parse_tabular(_duplicate_header_csv()) is None
+
+
+def test_parse_tabular_rejects_duplicate_blank_markdown_headers(monkeypatch) -> None:
+    import headroom.transforms.tabular_ingest as ti
+
+    monkeypatch.setattr(
+        ti,
+        "detect_content_type",
+        lambda _c: DetectionResult(ContentType.TABULAR, 0.9, {"format": "markdown"}),
+    )
+    # Two blank header cells collapse to the same "" key.
+    blank = "|  |  |\n| --- | --- |\n| 1 | 2 |\n| 3 | 4 |"
+    assert ti.parse_tabular(blank) is None
+
+
+def test_compress_passes_through_a_table_with_duplicate_headers() -> None:
+    content = _duplicate_header_csv()
+
+    result = TabularCompressor().compress(content)
+
+    assert not result.was_modified
+    assert result.compressed == content
+
+
 _JOIN_CSV = "id,name,id,name\n1,alice,10,acme\n2,bob,20,globex\n3,carol,30,initech\n"
 _BLANK_HEADER_MARKDOWN = (
     "| id | | |\n| --- | --- | --- |\n| 1 | alice | x |\n| 2 | bob | y |\n| 3 | carol | z |"
@@ -465,13 +501,13 @@ _BLANK_HEADER_MARKDOWN = (
 
 
 @pytest.mark.parametrize("content", [_JOIN_CSV, _BLANK_HEADER_MARKDOWN])
-def test_parse_tabular_rejects_duplicate_headers(content: str) -> None:
+def test_parse_tabular_rejects_duplicate_headers_upstream(content: str) -> None:
     # Records are keyed by header, so a repeated name keeps only its last
     # column: `alice` and `bob` would vanish from the compressed table.
     assert parse_tabular(content) is None
 
 
-def test_compress_passes_through_duplicate_headers() -> None:
+def test_compress_passes_through_duplicate_headers_upstream() -> None:
     # Large enough that SmartCrusher would otherwise save bytes on it.
     content = "id,name,id,name\n" + "".join(
         f"{i},user_{i},{100 + i},org_{i % 3}\n" for i in range(40)
@@ -479,6 +515,17 @@ def test_compress_passes_through_duplicate_headers() -> None:
     result = TabularCompressor().compress(content)
     assert not result.was_modified
     assert result.compressed == content
+
+
+def test_router_keeps_every_column_of_a_table_with_duplicate_headers() -> None:
+    content = _duplicate_header_csv()
+
+    result = ContentRouter().compress(content)
+
+    # No column may be dropped, and the remaining values must not be
+    # relabelled as if they came from the dropped columns.
+    for value in ("user_7", "org_1", "100", "107"):
+        assert value in result.compressed
 
 
 def _csv_with_an_oversized_cell() -> str:
