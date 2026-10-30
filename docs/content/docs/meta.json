@@ -28,6 +28,7 @@
     "corporate-networks",
     "local-llm-prefill",
     "---Integrations---",
+    "fastapi",
     "vercel-ai-sdk",
     "openai-sdk",
     "anthropic-sdk",
