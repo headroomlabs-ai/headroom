@@ -1,0 +1,73 @@
+<!doctype html>
+<html lang="pt-BR" data-theme="dark">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="theme-color" content="#0B0D14">
+  <meta name="color-scheme" content="dark light">
+  <title>Financeiro Interno · Cariati</title>
+  <link rel="icon" type="image/png" href="logo-cariati.png">
+  <link rel="apple-touch-icon" href="icon-192.png">
+  <link rel="manifest" href="manifest.webmanifest">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;500;600;700&family=Space+Grotesk:wght@500;600;700&display=swap">
+  <link rel="stylesheet" href="styles.css">
+  <script src="theme.js"></script>
+</head>
+<body>
+  <!-- gradientes compartilhados pelos medidores e gráficos -->
+  <svg width="0" height="0" style="position:absolute" aria-hidden="true" focusable="false">
+    <defs>
+      <linearGradient id="gAmber" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#FFC56B"/><stop offset=".45" stop-color="#FF9F1C"/><stop offset="1" stop-color="#FF6B35"/></linearGradient>
+      <linearGradient id="gViolet" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#C084FC"/><stop offset="1" stop-color="#8B5CF6"/></linearGradient>
+      <linearGradient id="gCyan" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#67E8F9"/><stop offset="1" stop-color="#22D3EE"/></linearGradient>
+      <linearGradient id="gRed" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#FCA5A5"/><stop offset="1" stop-color="#F87171"/></linearGradient>
+      <linearGradient id="gBarPago" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#6EE7B7"/><stop offset="1" stop-color="#34D399" stop-opacity=".55"/></linearGradient>
+      <linearGradient id="gBarAtraso" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#FCA5A5"/><stop offset="1" stop-color="#F87171" stop-opacity=".6"/></linearGradient>
+      <linearGradient id="gBarPrev" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#FFC56B"/><stop offset="1" stop-color="#FF6B35" stop-opacity=".6"/></linearGradient>
+      <linearGradient id="gBarAzul" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#67E8F9"/><stop offset="1" stop-color="#8B5CF6" stop-opacity=".7"/></linearGradient>
+    </defs>
+  </svg>
+
+  <!-- atmosfera: luzes desfocadas de entardecer, silhueta de cidade e trilhas de circuito -->
+  <div class="atmosfera" aria-hidden="true">
+    <i class="bokeh b1"></i><i class="bokeh b2"></i><i class="bokeh b3"></i><i class="bokeh b4"></i><i class="bokeh b5"></i>
+    <svg class="cidade" viewBox="0 0 1200 220" preserveAspectRatio="none"><path d="M0 220V150h40v-30h30v50h35V90h45v70h30v-40h40v60h50V80h38v90h40v-50h35v60h45V100h30v70h55v-45h40v55h38V70h42v110h38v-60h35v50h45V110h32v60h50v-35h40v50h45V95h36v85h40v-55h38v60h48V120h30v50h42v-30h38v80z"/></svg>
+    <svg class="circuito" width="100%" height="100%"><defs><pattern id="grade" width="48" height="48" patternUnits="userSpaceOnUse"><path d="M48 0H0V48" fill="none" stroke="currentColor" stroke-width=".5"/></pattern>
+      <pattern id="trilha" width="240" height="240" patternUnits="userSpaceOnUse"><path d="M0 60h70l24 24h66M240 150h-60l-20-20h-80M120 0v54l26 26M60 240v-70l30-30" fill="none" stroke="currentColor" stroke-width=".8"/><circle cx="94" cy="84" r="2.2" fill="currentColor"/><circle cx="160" cy="84" r="2.2" fill="currentColor"/><circle cx="80" cy="130" r="2.2" fill="currentColor"/></pattern></defs>
+      <rect width="100%" height="100%" fill="url(#grade)"/><rect width="100%" height="100%" fill="url(#trilha)"/></svg>
+  </div>
+
+  <a class="pular" href="#conteudo">Pular para o conteúdo</a>
+  <div class="app" id="app">
+    <aside class="side glass" id="side" aria-label="Menu principal">
+      <div class="side-topo">
+        <div class="brand"><img class="brand-logo" src="logo-cariati.png" alt="Cariati Arquitetura &amp; Gestão"><small class="brand-sub">Financeiro interno</small></div>
+        <button class="icon-btn side-colapsar" id="colapsar" aria-label="Recolher menu" title="Recolher menu"></button>
+      </div>
+      <button class="btn btn-primary side-novo" id="side-novo"><span data-ic="plus"></span><span class="rot">Novo lançamento</span></button>
+      <nav id="nav" class="nav"></nav>
+      <div class="side-rodape">
+        <button class="nav-link" id="sair" hidden><span data-ic="logout"></span><span class="rot">Sair</span></button>
+      </div>
+    </aside>
+    <div class="scrim" id="scrim" hidden></div>
+
+    <div class="main">
+      <header class="topbar">
+        <button class="icon-btn menu-btn" id="menu-btn" aria-label="Abrir menu" aria-expanded="false"></button>
+        <button class="busca-pilula" id="busca-abrir" aria-label="Buscar (Ctrl+K)"><span data-ic="search"></span><span class="busca-txt">Buscar lançamentos, telas e ações…</span><kbd>Ctrl K</kbd></button>
+        <span class="espaco"></span>
+        <button class="icon-btn" id="tema" aria-label="Alternar tema claro/escuro" title="Alternar tema"></button>
+      </header>
+      <main id="conteudo" class="page" tabindex="-1"></main>
+    </div>
+  </div>
+
+  <button class="btn btn-primary cta" id="cta" hidden></button>
+  <nav class="bottomnav glass" id="bottomnav" aria-label="Navegação rápida"></nav>
+  <div id="toasts" aria-live="polite" role="status"></div>
+  <script type="module" src="app.js"></script>
+</body>
+</html>
