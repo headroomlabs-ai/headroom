@@ -20,6 +20,7 @@ from headroom.providers import (
     create_litellm_provider,
     create_lmstudio_provider,
     create_ollama_provider,
+    create_runcrate_provider,
     create_together_provider,
     create_vllm_provider,
     is_litellm_available,
@@ -363,6 +364,15 @@ class TestProviderFactoryFunctions:
         provider = create_together_provider()
         assert provider.name == "together"
         assert "together.xyz" in provider.base_url
+
+    def test_create_runcrate_provider(self):
+        """Test creating Runcrate provider."""
+        provider = create_runcrate_provider()
+        assert provider.name == "runcrate"
+        assert "api.runcrate.ai" in provider.base_url
+        cost = provider.estimate_cost(1000, 2000, "deepseek-ai/DeepSeek-V4.1-Flash")
+        assert cost == pytest.approx(1000 / 1_000_000 * 0.147 + 2000 / 1_000_000 * 0.441)
+        assert provider.estimate_cost(100, 100, "Qwen/unknown") is None
 
     def test_create_groq_provider(self):
         """Test creating Groq provider."""
