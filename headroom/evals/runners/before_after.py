@@ -318,14 +318,18 @@ Answer:"""
 
         # --- BEFORE_AFTER mode (default) ---
 
+        errors: list[str] = []
+
         # Run LLM with ORIGINAL context (direct to API, no Headroom)
         start = time.time()
         try:
             response_original = self._call_llm(case.context, case.query)
         except Exception as e:
             response_original = f"ERROR: {e}"
+            errors.append(f"original: {type(e).__name__}: {e}")
         latency_original = (time.time() - start) * 1000
 
+        compressed_failed = False
         # Run LLM with Headroom context
         # If proxy is configured: send ORIGINAL context through proxy (full stack:
         # compression + CCR + cache alignment — the real production path)
@@ -338,15 +342,18 @@ Answer:"""
                 response_compressed = self._call_llm(compressed_context, case.query)
         except Exception as e:
             response_compressed = f"ERROR: {e}"
+            errors.append(f"compressed: {type(e).__name__}: {e}")
+            compressed_failed = True
         latency_compressed = (time.time() - start) * 1000
 
         # Compute metrics
-        exact_match = compute_exact_match(response_original, response_compressed)
-        f1_score = compute_f1(response_original, response_compressed)
+        # Exception diagnostics are not answers, including failures through a proxy.
+        exact_match = not errors and compute_exact_match(response_original, response_compressed)
+        f1_score = compute_f1(response_original, response_compressed) if not errors else 0.0
 
         # Semantic similarity
         semantic_sim = None
-        if self.use_semantic_similarity:
+        if self.use_semantic_similarity and not errors:
             try:
                 semantic_sim = compute_semantic_similarity(response_original, response_compressed)
             except (ImportError, Exception):
@@ -356,13 +363,13 @@ Answer:"""
         contains_ground_truth = None
         if case.ground_truth:
             gt_lower = case.ground_truth.lower()
-            contains_ground_truth = (
+            contains_ground_truth = not compressed_failed and (
                 gt_lower in response_compressed.lower()
                 or compute_f1(response_compressed, case.ground_truth) > 0.5
             )
 
         # Determine accuracy preservation
-        accuracy_preserved = (
+        accuracy_preserved = not errors and (
             f1_score > 0.7
             or (semantic_sim is not None and semantic_sim > 0.85)
             or contains_ground_truth is True
@@ -383,6 +390,7 @@ Answer:"""
             latency_original_ms=latency_original,
             latency_compressed_ms=latency_compressed,
             accuracy_preserved=accuracy_preserved,
+            error="; ".join(errors) if errors else None,
         )
 
     def _evaluate_ground_truth(
@@ -403,17 +411,19 @@ Answer:"""
         from headroom.evals.metrics import compute_f1
 
         # Only call LLM with compressed context (half the cost)
+        error = None
         start = time.time()
         try:
             response_compressed = self._call_llm(compressed_context, case.query)
         except Exception as e:
             response_compressed = f"ERROR: {e}"
+            error = f"compressed: {type(e).__name__}: {e}"
         latency_compressed = (time.time() - start) * 1000
 
         # Use LLM-as-judge for semantic ground truth comparison
-        contains_gt = None
+        contains_gt = False if error is not None else None
         judge_score = 0.0
-        if case.ground_truth:
+        if case.ground_truth and error is None:
             try:
                 if self._judge_fn is None:
                     from headroom.evals.memory.judge import create_openai_judge
@@ -450,6 +460,7 @@ Answer:"""
             latency_original_ms=0.0,
             latency_compressed_ms=latency_compressed,
             accuracy_preserved=accuracy_preserved,
+            error=error,
         )
 
     def run(
