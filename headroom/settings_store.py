@@ -917,7 +917,7 @@ def load() -> dict[str, Any]:
         raw = path.read_text(encoding="utf-8")
     except FileNotFoundError:
         return {}
-    except OSError as exc:
+    except (OSError, UnicodeDecodeError) as exc:
         logger.warning("settings_store: cannot read %s: %s", path, exc)
         return {}
     try:

@@ -131,6 +131,16 @@ class TestValidation:
 
 
 class TestFailOpen:
+    @pytest.mark.parametrize("payload", [b"\xff", b'{"log_file":"caf\xe9"}', b'{"mode":"\xc3'])
+    def test_invalid_utf8_returns_empty_without_rewriting(self, workspace, payload, caplog):
+        path = paths.settings_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(payload)
+
+        assert settings_store.load() == {}
+        assert path.read_bytes() == payload
+        assert "settings_store:" in caplog.text
+
     def test_corrupt_json_returns_empty(self, workspace):
         path = paths.settings_path()
         path.parent.mkdir(parents=True, exist_ok=True)
