@@ -223,6 +223,7 @@ def create_proxy_backend(
     openai_api_url: str | None = None,
     anyllm_backend_cls: Any | None = None,
     litellm_backend_cls: Any | None = None,
+    bedrock_client_factory: Callable[[str | None], Any] | None = None,
 ) -> Backend | None:
     """Create the optional translated backend for Anthropic proxy requests."""
     if backend == "anthropic":
@@ -256,17 +257,42 @@ def create_proxy_backend(
     # (`vertex/…` instead of `vertex_ai/…`), region dropped, auth mishandled.
     if provider in ("vertex", "google-vertex", "googlevertex"):
         provider = "vertex_ai"
+    # ``bedrock_client_factory`` only makes sense for the Bedrock
+    # provider; passing it for any other litellm-* provider is a
+    # no-op at runtime, but it widens the public call signature of
+    # the backend ``__init__``. Restrict the kwarg to bedrock to
+    # keep the API surface honest.
+    litellm_kwargs: dict[str, Any] = {}
+    if provider == "bedrock":
+        if bedrock_profile is not None:
+            litellm_kwargs["profile_name"] = bedrock_profile
+        if bedrock_client_factory is not None:
+            litellm_kwargs["bedrock_client_factory"] = bedrock_client_factory
     try:
         backend_cls = litellm_backend_cls or _load_litellm_backend()
         instance = cast(
             "Backend",
-            backend_cls(provider=provider, region=bedrock_region, profile_name=bedrock_profile),
+            backend_cls(
+                provider=provider,
+                region=bedrock_region,
+                **litellm_kwargs,
+            ),
         )
         logger.info("LiteLLM backend enabled (provider=%s, region=%s)", provider, bedrock_region)
         return instance
     except ImportError as exc:
         logger.warning("LiteLLM backend not available: %s", exc)
         return None
+    except TypeError as exc:
+        # A ``TypeError`` here is the contract signal from
+        # ``_build_bedrock_client``: the user-supplied factory either
+        # raised or returned something that does not look like a
+        # boto3 ``bedrock-runtime`` client. This is a configuration
+        # error on the operator's side and must not be silently
+        # swallowed — surface it with the full traceback so the
+        # operator can fix their hook.
+        logger.exception("Invalid bedrock_client_factory: %s", exc)
+        raise
     except Exception as exc:  # pragma: no cover - defensive logging
         _log_backend_init_failure(
             logger,
