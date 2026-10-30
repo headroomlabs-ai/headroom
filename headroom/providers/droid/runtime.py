@@ -2,8 +2,8 @@
 
 ``headroom wrap droid`` routes Droid through Headroom by pointing Droid's
 Factory gateway at the local proxy via the ``FACTORY_API_BASE_URL`` environment
-variable. The proxy compresses the Anthropic-shaped ``/api/llm/a/v1/messages``
-inference route and forwards every other Factory REST path verbatim to the real
+variable. The proxy compresses Factory's Messages, Chat Completions, Responses,
+and Gemini inference routes and forwards other Factory REST paths to the real
 upstream resolved here, so all Droid models (including Droid Core) are
 compressed on the user's Factory subscription with no ``customModels`` edits.
 """

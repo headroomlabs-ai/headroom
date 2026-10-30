@@ -6,6 +6,7 @@ from typing import Any
 from unittest.mock import patch
 
 import httpx
+import pytest
 from fastapi.responses import JSONResponse
 from fastapi.testclient import TestClient
 
@@ -1730,3 +1731,92 @@ def test_factory_openai_responses_route_absent_without_factory_upstream(
         ).json()
 
     assert payload == {"handler": "handle_passthrough"}
+
+
+@pytest.mark.parametrize("stream", [False, True])
+@pytest.mark.parametrize("nontext", [False, True])
+def test_factory_gemini_uses_inference_pipeline_and_preserves_gateway(
+    stream: bool, nontext: bool
+) -> None:
+    calls: list[httpx.Request] = []
+    upstream = {
+        "candidates": [{"content": {"role": "model", "parts": [{"text": "ok"}]}}],
+        "usageMetadata": {"promptTokenCount": 1, "candidatesTokenCount": 1},
+    }
+
+    def handle(request: httpx.Request) -> httpx.Response:
+        calls.append(request)
+        if stream:
+            return httpx.Response(
+                200,
+                headers={"content-type": "text/event-stream"},
+                text=f"data: {json.dumps(upstream)}\n\n",
+            )
+        return httpx.Response(200, json=upstream)
+
+    part = (
+        {"inlineData": {"mimeType": "image/png", "data": "AAAA"}} if nontext else {"text": "hello"}
+    )
+    body = {
+        "model": "gemini-factory-test",
+        "stream": stream,
+        "contents": [{"role": "user", "parts": [part]}],
+    }
+    with TestClient(_factory_app("http://127.0.0.1:9999/private")) as client:
+        transport = httpx.MockTransport(handle)
+        client.app.state.proxy.http_client = httpx.AsyncClient(transport=transport)
+        client.app.state.proxy.http_client_h1 = httpx.AsyncClient(transport=transport)
+        response = client.post(
+            "/api/llm/g/v1/generate?trace=test",
+            headers={
+                "authorization": "Bearer factory-test",
+                "x-headroom-base-url": "https://evil.example",
+                "x-headroom-original-path": "/wrong",
+            },
+            json=body,
+        )
+
+    assert response.status_code == 200, response.text
+    assert response.headers["x-headroom-model"] == "gemini-factory-test"
+    assert "ok" in response.text
+    assert len(calls) == 1
+    assert str(calls[0].url) == ("http://127.0.0.1:9999/private/api/llm/g/v1/generate?trace=test")
+    assert calls[0].headers["authorization"] == "Bearer factory-test"
+    assert not any(name.startswith("x-headroom-") for name in calls[0].headers)
+    assert json.loads(calls[0].content) == body
+    assert response.headers["content-type"].startswith(
+        "text/event-stream" if stream else "application/json"
+    )
+
+
+@pytest.mark.parametrize("model,stream", [(None, False), ("", False), (42, False), (None, True)])
+def test_factory_gemini_without_model_preserves_provider_response(
+    model: object, stream: bool, caplog: pytest.LogCaptureFixture
+) -> None:
+    calls: list[httpx.Request] = []
+
+    def handle(request: httpx.Request) -> httpx.Response:
+        calls.append(request)
+        return httpx.Response(422, json={"error": "provider model validation"})
+
+    body = {"model": model, "stream": stream, "contents": [{"parts": [{"text": "hello"}]}]}
+    with TestClient(_factory_app("http://127.0.0.1:9999/private")) as client:
+        transport = httpx.MockTransport(handle)
+        client.app.state.proxy.http_client = httpx.AsyncClient(transport=transport)
+        client.app.state.proxy.http_client_h1 = httpx.AsyncClient(transport=transport)
+        response = client.post(
+            "/api/llm/g/v1/generate",
+            headers={
+                "authorization": "Bearer factory-test",
+                "x-headroom-base-url": "https://evil.example",
+            },
+            json=body,
+        )
+
+    assert response.status_code == 422
+    assert response.json() == {"error": "provider model validation"}
+    assert len(calls) == 1
+    assert str(calls[0].url) == "http://127.0.0.1:9999/private/api/llm/g/v1/generate"
+    assert calls[0].headers["authorization"] == "Bearer factory-test"
+    assert json.loads(calls[0].content) == body
+    assert "forwarding without compression" in caplog.text

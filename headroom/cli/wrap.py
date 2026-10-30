@@ -9254,9 +9254,8 @@ def droid(
     Droid talks to Factory's gateway and honors ``FACTORY_API_BASE_URL`` to
     redirect that traffic. This command starts the proxy in Factory mode and
     launches ``droid`` with ``FACTORY_API_BASE_URL`` pointed at the local proxy.
-    The proxy compresses the Anthropic-shaped ``/api/llm/a/v1/messages`` and the
-    OpenAI-shaped ``/api/llm/o/v1/chat/completions`` inference routes and
-    forwards every other Factory REST path verbatim to the real upstream,
+    The proxy compresses Factory's Messages, Chat Completions, Responses, and
+    Gemini inference routes and forwards other Factory REST paths to the upstream,
     passing the Factory session credential through untouched. Use Droid
     normally: any model, including Droid Core, is compressed on your Factory
     subscription. No ``customModels`` edits and no API keys.
