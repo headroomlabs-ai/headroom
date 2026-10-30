@@ -331,7 +331,14 @@ def test_snapshot_query_helpers() -> None:
     )
 
     assert snapshot.is_available("tool-result-interceptors") is True
-    assert snapshot.enabled == frozenset({"tool_result_interceptors"})
+    # The explicit request plus whatever the registry turns on by default on
+    # canary, minus the explicit disable.
+    canary_defaults = {
+        name for name, spec in FEATURES.items() if spec.default_enabled(RolloutChannel.CANARY)
+    }
+    assert snapshot.enabled == frozenset(
+        ({"tool_result_interceptors"} | canary_defaults) - {"read_maturation"}
+    )
     assert snapshot.disabled == frozenset({"read_maturation"})
     assert resolve_rollout(
         {"HEADROOM_ROLLOUT_CHANNEL": "canary"},

@@ -14,6 +14,24 @@ from headroom import copilot_auth
 from headroom.proxy import ssl_context
 
 
+def test_token_fingerprint_is_a_short_stable_kdf_digest() -> None:
+    import hashlib
+    import re
+
+    first = copilot_auth.token_fingerprint("gho_example-token")
+    assert re.fullmatch(r"pbkdf2:[0-9a-f]{12}", first)
+    assert copilot_auth.token_fingerprint("gho_example-token") == first
+    assert copilot_auth.token_fingerprint("gho_other-token") != first
+    kdf = hashlib.pbkdf2_hmac(
+        "sha256", b"gho_example-token", b"headroom/token-fingerprint/v2", 1_000
+    )
+    assert first == "pbkdf2:" + kdf.hex()[:12]
+    # A fingerprint an older Headroom published can never match, so a compare
+    # against one keeps the isolating behaviour.
+    legacy = "sha256:" + hashlib.sha256(b"gho_example-token").hexdigest()[:12]
+    assert first != legacy
+
+
 def test_device_authorization_uses_form_encoded_request(monkeypatch: pytest.MonkeyPatch) -> None:
     import io
 

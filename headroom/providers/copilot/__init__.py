@@ -9,6 +9,7 @@ from .vscode import (
     vscode_user_dir,
 )
 from .wrap import (
+    VSCODE_MODEL_ID_PREFIX,
     build_launch_env,
     copilot_model_from_args,
     default_wire_api_for_model,
@@ -16,6 +17,7 @@ from .wrap import (
     is_auto_model,
     model_configured,
     model_prefers_responses_api,
+    model_requires_chat_completions,
     provider_key_source,
     query_proxy_config,
     resolve_provider_type,
@@ -24,12 +26,14 @@ from .wrap import (
 )
 
 __all__ = [
+    "VSCODE_MODEL_ID_PREFIX",
     "build_launch_env",
     "copilot_model_from_args",
     "default_wire_api_for_model",
     "detect_running_proxy_backend",
     "is_auto_model",
     "model_prefers_responses_api",
+    "model_requires_chat_completions",
     "model_configured",
     "provider_key_source",
     "query_proxy_config",
