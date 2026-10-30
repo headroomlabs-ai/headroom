@@ -8,7 +8,7 @@ from unittest.mock import patch
 
 import click
 import pytest
-from click.testing import CliRunner
+from click.testing import CliRunner, Result
 
 from headroom.cli import wrap as wrap_mod
 from headroom.cli.main import main
@@ -557,6 +557,199 @@ def test_wrap_opencode_prepare_only_injects_config(
     assert config_file.exists()
     config = json.loads(config_file.read_text(encoding="utf-8"))
     assert config["provider"]["headroom"]["options"]["baseURL"] == "http://127.0.0.1:9000/v1"
+
+
+def test_wrap_opencode_extra_model_flag_injects_config(
+    runner: CliRunner,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """`--extra-model` specs are merged into the injected provider models."""
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.delenv("HEADROOM_CONTEXT_TOOL", raising=False)
+    monkeypatch.delenv("HEADROOM_OPENCODE_EXTRA_MODELS", raising=False)
+    _set_test_home(monkeypatch, tmp_path)
+
+    with patch.object(wrap_mod.shutil, "which", return_value="opencode"):
+        result = runner.invoke(
+            main,
+            [
+                "wrap",
+                "opencode",
+                "--prepare-only",
+                "--extra-model",
+                "deepseek-chat=DeepSeek Chat=65536",
+                "--extra-model",
+                "qwen2.5-coder:7b",
+            ],
+        )
+
+    assert result.exit_code == 0, result.output
+    config_file = tmp_path / ".config" / "opencode" / "opencode.json"
+    config = json.loads(config_file.read_text(encoding="utf-8"))
+    models = config["provider"]["headroom"]["models"]
+    assert models["deepseek-chat"]["name"] == "DeepSeek Chat"
+    assert models["deepseek-chat"]["limit"]["context"] == 65536
+    assert models["qwen2.5-coder:7b"]["name"] == "qwen2.5-coder:7b"
+    assert "gpt-4o" in models
+
+
+def test_wrap_opencode_extra_models_env_var(
+    runner: CliRunner,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """HEADROOM_OPENCODE_EXTRA_MODELS persists extra models across wraps."""
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.delenv("HEADROOM_CONTEXT_TOOL", raising=False)
+    monkeypatch.setenv("HEADROOM_OPENCODE_EXTRA_MODELS", "deepseek-chat=DeepSeek Chat=65536")
+    _set_test_home(monkeypatch, tmp_path)
+
+    with patch.object(wrap_mod.shutil, "which", return_value="opencode"):
+        result = runner.invoke(main, ["wrap", "opencode", "--prepare-only"])
+
+    assert result.exit_code == 0, result.output
+    config_file = tmp_path / ".config" / "opencode" / "opencode.json"
+    config = json.loads(config_file.read_text(encoding="utf-8"))
+    assert config["provider"]["headroom"]["models"]["deepseek-chat"]["limit"]["context"] == 65536
+
+
+def test_wrap_opencode_extra_model_flag_in_launch_env(
+    runner: CliRunner,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Extra models reach OPENCODE_CONFIG_CONTENT on the normal launch path."""
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.delenv("HEADROOM_CONTEXT_TOOL", raising=False)
+    monkeypatch.delenv("HEADROOM_OPENCODE_EXTRA_MODELS", raising=False)
+    _set_test_home(monkeypatch, tmp_path)
+
+    captured: dict[str, object] = {}
+
+    def fake_launch_tool(**kwargs):  # noqa: ANN003
+        captured.update(kwargs)
+
+    with patch.object(wrap_mod.shutil, "which", return_value="opencode"):
+        with patch.object(wrap_mod, "_launch_tool", side_effect=fake_launch_tool):
+            result = runner.invoke(
+                main,
+                [
+                    "wrap",
+                    "opencode",
+                    "--port",
+                    "9000",
+                    "--no-mcp",
+                    "--extra-model",
+                    "deepseek-chat=DeepSeek Chat=65536",
+                ],
+            )
+
+    assert result.exit_code == 0, result.output
+    env = captured["env"]
+    assert isinstance(env, dict)
+    config = json.loads(env["OPENCODE_CONFIG_CONTENT"])
+    models = config["provider"]["headroom"]["models"]
+    assert models["deepseek-chat"]["name"] == "DeepSeek Chat"
+    assert models["deepseek-chat"]["limit"]["context"] == 65536
+    assert "gpt-4o" in models
+
+
+def test_wrap_opencode_extra_models_env_var_in_launch_env(
+    runner: CliRunner,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Env-sourced extra models reach OPENCODE_CONFIG_CONTENT on launch."""
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.delenv("HEADROOM_CONTEXT_TOOL", raising=False)
+    monkeypatch.setenv("HEADROOM_OPENCODE_EXTRA_MODELS", "kimi-k2=Kimi K2")
+    _set_test_home(monkeypatch, tmp_path)
+
+    captured: dict[str, object] = {}
+
+    def fake_launch_tool(**kwargs):  # noqa: ANN003
+        captured.update(kwargs)
+
+    with patch.object(wrap_mod.shutil, "which", return_value="opencode"):
+        with patch.object(wrap_mod, "_launch_tool", side_effect=fake_launch_tool):
+            result = runner.invoke(main, ["wrap", "opencode", "--port", "9000", "--no-mcp"])
+
+    assert result.exit_code == 0, result.output
+    env = captured["env"]
+    assert isinstance(env, dict)
+    config = json.loads(env["OPENCODE_CONFIG_CONTENT"])
+    assert config["provider"]["headroom"]["models"]["kimi-k2"]["name"] == "Kimi K2"
+
+
+def test_wrap_opencode_extra_model_overrides_kept_user_entry(
+    runner: CliRunner,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """With --openai-api-url the user's headroom models are kept, but an
+    --extra-model for the same id replaces the kept entry."""
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.delenv("HEADROOM_CONTEXT_TOOL", raising=False)
+    monkeypatch.delenv("HEADROOM_OPENCODE_EXTRA_MODELS", raising=False)
+    _set_test_home(monkeypatch, tmp_path)
+    config_file = tmp_path / ".config" / "opencode" / "opencode.json"
+    config_file.parent.mkdir(parents=True)
+    config_file.write_text(
+        json.dumps(
+            {
+                "provider": {
+                    "headroom": {
+                        "models": {
+                            "deepseek-chat": {"name": "Stale"},
+                            "deepseek-reasoner": {"name": "DeepSeek Reasoner"},
+                        }
+                    }
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    with patch.object(wrap_mod.shutil, "which", return_value="opencode"):
+        result = runner.invoke(
+            main,
+            [
+                "wrap",
+                "opencode",
+                "--prepare-only",
+                "--openai-api-url",
+                "https://api.deepseek.com/v1",
+                "--extra-model",
+                "deepseek-chat=DeepSeek Chat=65536",
+            ],
+        )
+
+    assert result.exit_code == 0, result.output
+    models = json.loads(config_file.read_text(encoding="utf-8"))["provider"]["headroom"]["models"]
+    assert models["deepseek-chat"]["name"] == "DeepSeek Chat"
+    assert models["deepseek-chat"]["limit"]["context"] == 65536
+    assert models["deepseek-reasoner"] == {"name": "DeepSeek Reasoner"}
+
+
+def test_wrap_opencode_extra_model_invalid_spec_errors(
+    runner: CliRunner,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A malformed --extra-model spec fails with a usage error, not a traceback."""
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.delenv("HEADROOM_CONTEXT_TOOL", raising=False)
+    _set_test_home(monkeypatch, tmp_path)
+
+    with patch.object(wrap_mod.shutil, "which", return_value="opencode"):
+        result = runner.invoke(
+            main,
+            ["wrap", "opencode", "--prepare-only", "--extra-model", "bad=name=abc"],
+        )
+
+    assert result.exit_code != 0
+    assert "non-integer context window" in result.output
 
 
 def test_wrap_opencode_prepare_only_registers_serena_with_agent_context(
@@ -1753,3 +1946,187 @@ def test_wrap_opencode_session_token_matches_registration(
     # Assumes the plugin resolves (packaged bundle ships in this checkout);
     # see test_build_launch_env_omits_session_token_when_plugin_absent.
     assert env.get("HEADROOM_OPENCODE_SESSION_TOKEN") == registered_token
+
+
+# ---------------------------------------------------------------------------
+# Fresh wrap -> unwrap lifecycle (no pre-wrap config, no backup)
+# ---------------------------------------------------------------------------
+
+
+def _managed_state_path(config_file: Path) -> Path:
+    return config_file.with_name(config_file.name + ".headroom-managed.json")
+
+
+def _prepare_only_wrap(runner: CliRunner, extra_args: list[str] | None = None) -> Result:
+    return runner.invoke(
+        main,
+        ["wrap", "opencode", "--prepare-only", "--no-mcp", "--no-serena", *(extra_args or [])],
+    )
+
+
+def test_unwrap_opencode_removes_a_freshly_wrapped_config(
+    runner: CliRunner,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A config Headroom created is removed again, backup or not."""
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.delenv("HEADROOM_CONTEXT_TOOL", raising=False)
+    monkeypatch.delenv("HEADROOM_OPENCODE_EXTRA_MODELS", raising=False)
+    _set_test_home(monkeypatch, tmp_path)
+
+    config_file = tmp_path / ".config" / "opencode" / "opencode.json"
+
+    with patch.object(wrap_mod.shutil, "which", return_value="opencode"):
+        wrapped = _prepare_only_wrap(runner, ["--extra-model", "my-model=My Model"])
+    assert wrapped.exit_code == 0, wrapped.output
+    assert config_file.exists()
+    assert not (tmp_path / ".config" / "opencode" / "opencode.json.headroom-backup").exists()
+
+    with patch.object(wrap_mod, "_stop_local_proxy_for_unwrap", return_value="stopped"):
+        result = runner.invoke(main, ["unwrap", "opencode"])
+
+    assert result.exit_code == 0, result.output
+    assert not config_file.exists(), "the config Headroom created must be removed again"
+    assert not _managed_state_path(config_file).exists()
+
+
+def test_unwrap_opencode_removes_a_freshly_wrapped_config_with_mcp(
+    runner: CliRunner,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The MCP entry Headroom registered goes away with the config it created."""
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.delenv("HEADROOM_CONTEXT_TOOL", raising=False)
+    monkeypatch.delenv("HEADROOM_OPENCODE_EXTRA_MODELS", raising=False)
+    _set_test_home(monkeypatch, tmp_path)
+
+    config_file = tmp_path / ".config" / "opencode" / "opencode.json"
+
+    with patch.object(wrap_mod.shutil, "which", return_value="opencode"):
+        wrapped = runner.invoke(main, ["wrap", "opencode", "--prepare-only", "--no-serena"])
+    assert wrapped.exit_code == 0, wrapped.output
+    assert "headroom" in json.loads(config_file.read_text(encoding="utf-8"))["mcp"]
+
+    with patch.object(wrap_mod, "_stop_local_proxy_for_unwrap", return_value="stopped"):
+        result = runner.invoke(main, ["unwrap", "opencode"])
+
+    assert result.exit_code == 0, result.output
+    assert not config_file.exists()
+    assert not _managed_state_path(config_file).exists()
+
+
+def test_unwrap_opencode_removes_a_directly_injected_config(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Injecting the provider directly and then unwrapping leaves no config."""
+    from headroom.providers.opencode.config import inject_opencode_provider_config
+
+    monkeypatch.chdir(tmp_path)
+    _set_test_home(monkeypatch, tmp_path)
+
+    config_file = tmp_path / ".config" / "opencode" / "opencode.json"
+    inject_opencode_provider_config(
+        port=8787, extra_models={"my-model": {"name": "My Model", "limit": {}}}
+    )
+    assert "my-model" in config_file.read_text(encoding="utf-8")
+
+    with patch.object(wrap_mod, "_stop_local_proxy_for_unwrap", return_value="stopped"):
+        wrap_mod.unwrap_opencode.callback(port=8787, no_stop_proxy=True)
+
+    assert not config_file.exists()
+    assert not _managed_state_path(config_file).exists()
+
+
+def test_unwrap_opencode_keeps_a_falsy_user_setting(
+    runner: CliRunner,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A user setting that is false is content, not an empty section."""
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.delenv("HEADROOM_CONTEXT_TOOL", raising=False)
+    monkeypatch.delenv("HEADROOM_OPENCODE_EXTRA_MODELS", raising=False)
+    _set_test_home(monkeypatch, tmp_path)
+
+    config_file = tmp_path / ".config" / "opencode" / "opencode.json"
+
+    with patch.object(wrap_mod.shutil, "which", return_value="opencode"):
+        wrapped = _prepare_only_wrap(runner)
+    assert wrapped.exit_code == 0, wrapped.output
+
+    data = json.loads(config_file.read_text(encoding="utf-8"))
+    data["autoupdate"] = False
+    config_file.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
+
+    with patch.object(wrap_mod, "_stop_local_proxy_for_unwrap", return_value="stopped"):
+        result = runner.invoke(main, ["unwrap", "opencode"])
+
+    assert result.exit_code == 0, result.output
+    assert config_file.exists(), "the user setting must not cost the user the file"
+    assert json.loads(config_file.read_text(encoding="utf-8"))["autoupdate"] is False
+
+
+def test_unwrap_opencode_keeps_user_content_added_after_a_fresh_wrap(
+    runner: CliRunner,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Undoing Headroom's config keeps what the user added to it."""
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.delenv("HEADROOM_CONTEXT_TOOL", raising=False)
+    monkeypatch.delenv("HEADROOM_OPENCODE_EXTRA_MODELS", raising=False)
+    _set_test_home(monkeypatch, tmp_path)
+
+    config_file = tmp_path / ".config" / "opencode" / "opencode.json"
+
+    with patch.object(wrap_mod.shutil, "which", return_value="opencode"):
+        wrapped = _prepare_only_wrap(runner, ["--extra-model", "my-model=My Model"])
+    assert wrapped.exit_code == 0, wrapped.output
+
+    data = json.loads(config_file.read_text(encoding="utf-8"))
+    data["theme"] = "dark"
+    data["provider"]["headroom"]["models"]["user-model"] = {"name": "User Model"}
+    data["provider"]["headroom"]["options"]["apiKey"] = "{env:MY_KEY}"
+    config_file.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
+
+    with patch.object(wrap_mod, "_stop_local_proxy_for_unwrap", return_value="stopped"):
+        result = runner.invoke(main, ["unwrap", "opencode"])
+
+    assert result.exit_code == 0, result.output
+    remaining = json.loads(config_file.read_text(encoding="utf-8"))
+    assert remaining["theme"] == "dark"
+    headroom = remaining["provider"]["headroom"]
+    assert headroom["models"] == {"user-model": {"name": "User Model"}}
+    assert headroom["options"] == {"apiKey": "{env:MY_KEY}"}
+    assert "baseURL" not in headroom["options"]
+
+
+def test_rewrap_without_the_extra_model_drops_the_stale_extra(
+    runner: CliRunner,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A model Headroom injected but no longer requested does not linger."""
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.delenv("HEADROOM_CONTEXT_TOOL", raising=False)
+    monkeypatch.delenv("HEADROOM_OPENCODE_EXTRA_MODELS", raising=False)
+    _set_test_home(monkeypatch, tmp_path)
+
+    config_file = tmp_path / ".config" / "opencode" / "opencode.json"
+    upstream = ["--openai-api-url", "https://api.deepseek.com/v1"]
+
+    with patch.object(wrap_mod.shutil, "which", return_value="opencode"):
+        wrapped = _prepare_only_wrap(runner, [*upstream, "--extra-model", "my-model=My Model"])
+    assert wrapped.exit_code == 0, wrapped.output
+    models = json.loads(config_file.read_text(encoding="utf-8"))["provider"]["headroom"]["models"]
+    assert "my-model" in models
+
+    with patch.object(wrap_mod.shutil, "which", return_value="opencode"):
+        rewrapped = _prepare_only_wrap(runner, upstream)
+    assert rewrapped.exit_code == 0, rewrapped.output
+    models = json.loads(config_file.read_text(encoding="utf-8"))["provider"]["headroom"]["models"]
+    assert "my-model" not in models
+    assert set(models) == {"gpt-4o", "gpt-4.1"}
