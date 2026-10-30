@@ -224,6 +224,76 @@ class GeminiHandlerMixin:
                 # else: dropped by compression — omit
         return result
 
+    @staticmethod
+    def _carry_tail_append_into_preserved(
+        original_contents: list[dict],
+        preserved_indices: set[int],
+        preserved_contents: dict[int, dict],
+        before_messages: list[dict],
+        after_messages: list[dict],
+    ) -> bool:
+        """Carry a memory tail append onto a preserved contents[] entry.
+
+        ``_rebuild_gemini_contents`` forwards preserved (non-text) entries
+        verbatim and discards their converted message, so text appended to
+        that message never reaches the upstream body (#4419). Find the one
+        message the tail append changed, map it to its contents[] index the
+        same way the rebuild does (the k-th non-system message pairs with the
+        k-th entry that has a text part), and, when that entry is preserved
+        and is the latest user entry, append the same suffix to a copy of its
+        last text part.
+
+        Returns False when the append would be dropped: the target is a
+        preserved entry older than the latest user entry. Writing memory into
+        that older turn would change an already-cached prefix, so the caller
+        skips the injection instead of logging one that never reaches the wire.
+        """
+        if len(before_messages) != len(after_messages):
+            return True
+        changed = [i for i, (b, a) in enumerate(zip(before_messages, after_messages)) if b is not a]
+        if len(changed) != 1:
+            return True
+        msg_idx = changed[0]
+        before = before_messages[msg_idx].get("content")
+        after = after_messages[msg_idx].get("content")
+        if not (isinstance(before, str) and isinstance(after, str)):
+            return True
+        if not after.startswith(before) or len(after) == len(before):
+            return True
+        suffix = after[len(before) :]
+
+        ordinal = sum(1 for m in before_messages[:msg_idx] if m.get("role") != "system")
+        text_entry_indices = [
+            idx
+            for idx, content in enumerate(original_contents)
+            if any(isinstance(p.get("text"), str) for p in GeminiHandlerMixin._dict_parts(content))
+        ]
+        if ordinal >= len(text_entry_indices):
+            return True
+        content_idx = text_entry_indices[ordinal]
+        if content_idx not in preserved_indices:
+            return True
+        latest_user_idx = max(
+            (
+                idx
+                for idx, content in enumerate(original_contents)
+                if (content.get("role", "user") if isinstance(content, dict) else "user") == "user"
+            ),
+            default=None,
+        )
+        if content_idx != latest_user_idx:
+            return False
+
+        entry = preserved_contents[content_idx]
+        # Copy the raw list so every part (including non-dict ones) is kept as-is.
+        parts = list(entry["parts"])
+        last_text = max(
+            i for i, p in enumerate(parts) if isinstance(p, dict) and isinstance(p.get("text"), str)
+        )
+        parts[last_text] = {**parts[last_text], "text": parts[last_text]["text"] + suffix}
+        preserved_contents[content_idx] = {**entry, "parts": parts}
+        return True
+
     def _gemini_contents_to_messages(
         self,
         contents: list[dict],
@@ -736,6 +806,17 @@ class GeminiHandlerMixin:
                                 provider="openai",
                             )
                         )
+                        # Entries with non-text parts are restored verbatim by
+                        # _rebuild_gemini_contents; carry the append onto them so
+                        # it is not dropped after being logged, or skip it.
+                        if bytes_appended > 0 and not self._carry_tail_append_into_preserved(
+                            contents,
+                            preserved_indices,
+                            preserved_contents,
+                            optimized_messages,
+                            new_messages,
+                        ):
+                            bytes_appended = 0
                         if bytes_appended > 0:
                             optimized_messages = new_messages
                             logger.info(
