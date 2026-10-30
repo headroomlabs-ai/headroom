@@ -2249,6 +2249,57 @@ def _setup_headroom_mcp(
         click.echo(line)
 
 
+def _serena_inline_comment(rest: str) -> str:
+    """Return the inline comment to keep when rewriting a Serena setting.
+
+    ``rest`` is everything after the colon. The first ``#`` starts the comment,
+    including when it sits flush against the colon or the old value: this
+    setting is always rewritten to ``false``, so a ``#`` that strict YAML would
+    treat as part of the scalar is kept as a comment instead. Whitespace that
+    already separates the ``#`` is preserved; a glued ``#`` gets one inserted
+    space. Every other token, such as a YAML type tag, is discarded with the
+    old value.
+    """
+    hash_at = rest.find("#")
+    if hash_at < 0:
+        return ""
+    prefix, body = rest[:hash_at], rest[hash_at:]
+    if prefix.strip(" \t") == "":
+        return prefix + body if prefix else " " + body
+    if prefix[-1] in " \t":
+        return prefix[len(prefix.rstrip(" \t")) :] + body
+    return " " + body
+
+
+# A document marker or directive is YAML syntax outside the mapping. It is
+# only a marker when it starts at column 0; an indented ``---`` inside a
+# block scalar is content.
+_YAML_STRUCTURE_LINE = re.compile(r"^(?:---|\.\.\.)(?:[ \t]|$)|^%")
+
+
+def _serena_root_indent(text: str) -> str:
+    """Return the indentation of the root mapping.
+
+    YAML allows every root key to share an indent, so column 0 is not the
+    test. The root indent is the shortest leading whitespace on a non-empty,
+    non-comment line. Document markers (``---``, ``...``) and ``%`` directives
+    are skipped: they are YAML syntax outside the mapping, and counting them
+    would treat an indented root as column 0. A deeper line belongs to a
+    nested block.
+    """
+    root: str | None = None
+    for line in text.splitlines():
+        if _YAML_STRUCTURE_LINE.match(line):
+            continue
+        stripped = line.lstrip(" \t")
+        if not stripped or stripped.startswith("#"):
+            continue
+        indent = line[: len(line) - len(stripped)]
+        if root is None or len(indent) < len(root):
+            root = indent
+    return root or ""
+
+
 def _ensure_serena_dashboard_disabled(*, verbose: bool = False) -> None:
     """Disable Serena's browser dashboard auto-open in ``~/.serena/serena_config.yml``.
 
@@ -2282,6 +2333,21 @@ def _ensure_serena_dashboard_disabled(*, verbose: bool = False) -> None:
 
     ``projects: []`` is still backfilled into an *existing* file, to repair
     configs an affected Headroom version already wrote.
+
+    Serena's own template writes this key with *no* value
+    (``web_dashboard_open_on_launch:``), which is valid YAML meaning "unset".
+    The line edit therefore has to match an empty value too: treating it as
+    "key absent" appended a second copy of the key, and Serena loads this file
+    with ruamel in duplicate-key-strict mode, so every later startup died with
+    ``DuplicateKeyError`` before the MCP handshake ("Connection closed").
+
+    The edit only touches the key at the root mapping's indent. YAML allows
+    that mapping to be indented as a whole, so column 0 is not the test: the
+    root indent is the shortest indent of a non-comment line, ignoring
+    document markers and directives. A deeper occurrence belongs to a nested
+    mapping (e.g. an ``extension:`` block that reuses the name) and is left
+    alone — both when rewriting the value and when dropping duplicates, so
+    it can never be mistaken for, or merged with, Serena's real setting.
     """
     import re
 
@@ -2302,19 +2368,65 @@ def _ensure_serena_dashboard_disabled(*, verbose: bool = False) -> None:
     new = text
     appended: list[str] = []
 
-    dashboard = re.compile(rf"^(\s*){re.escape(key)}:\s*\S+\s*$", re.MULTILINE)
-    if dashboard.search(new):
-        new = dashboard.sub(rf"\g<1>{key}: false", new)
+    # Serena's template writes this key with no value, and Headroom used to
+    # append a second copy of it in that case. Rewrite the value in place
+    # (keeping any inline comment) and drop redundant copies, so configs an
+    # older Headroom already broke are repaired rather than re-broken.
+    #
+    # Match the key only at the root mapping's indent, and keep that indent
+    # when rewriting or appending. A root mapping indented as a whole is still
+    # the top-level mapping; appending a column-0 key beside it makes the file
+    # unparsable. A deeper occurrence is a different mapping.
+    #
+    # The pattern only recognizes the key line. ``_serena_inline_comment``
+    # decides what to keep from the remainder, so a ``#`` flush against the
+    # colon still matches and is preserved instead of leaving the line in
+    # place and appending a second copy of the key.
+    indent = _serena_root_indent(text)
+    dashboard = re.compile(rf"^{re.escape(indent)}{re.escape(key)}:[ \t]*(.*)$")
+    lines: list[str] = []
+    rewritten = False
+    for line in text.splitlines(keepends=True):
+        body = line.rstrip("\r\n")
+        match = dashboard.match(body)
+        if match is None:
+            lines.append(line)
+            continue
+        if rewritten:
+            continue
+        rewritten = True
+        comment = _serena_inline_comment(match.group(1))
+        ending = "\n" if line.endswith(("\n", "\r")) else ""
+        lines.append(f"{indent}{key}: false{comment}{ending}")
+    if rewritten:
+        new = "".join(lines)
     else:
-        appended.append(f"{key}: false")
+        appended.append(f"{indent}{key}: false")
 
     # Repair a config left by an affected Headroom version (see #2674 above).
     if not re.search(r"^\s*projects\s*:", new, re.MULTILINE):
-        appended.append("projects: []")
+        appended.append(f"{indent}projects: []")
 
     if appended:
-        body = new.rstrip("\n")
-        new = (f"{body}\n" if body.strip() else "") + "\n".join(appended) + "\n"
+        addition = "\n".join(appended) + "\n"
+        lines = new.splitlines(keepends=True)
+        end_at: int | None = None
+        for index in range(len(lines) - 1, -1, -1):
+            if not lines[index].strip(" \t\r\n"):
+                continue
+            if lines[index].rstrip("\r\n") == "...":
+                end_at = index
+            break
+        if end_at is None:
+            body = new.rstrip("\n")
+            new = (f"{body}\n" if body.strip() else "") + addition
+        else:
+            # A key after ``...`` starts a second document. Keep the addition
+            # inside the one Serena loads.
+            prefix = "".join(lines[:end_at])
+            if prefix and not prefix.endswith("\n"):
+                prefix += "\n"
+            new = prefix + addition + "".join(lines[end_at:])
 
     if new == text:
         return
