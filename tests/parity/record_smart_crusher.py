@@ -33,11 +33,13 @@ from __future__ import annotations
 
 import datetime as _dt
 import hashlib
+import inspect
 import json
 from dataclasses import asdict
 from pathlib import Path
 from typing import Any
 
+from headroom._core import SmartCrusherConfig as NativeSmartCrusherConfig
 from headroom.transforms.smart_crusher import SmartCrusher, SmartCrusherConfig
 
 _REPO_ROOT = Path(__file__).resolve().parent.parent.parent
@@ -57,11 +59,14 @@ def _record(
     config: SmartCrusherConfig | None = None,
 ) -> Path:
     cfg = config or SmartCrusherConfig()
-    crusher = SmartCrusher(config=cfg)
+    # Match both parity comparators' legacy keep/drop mode.
+    crusher = SmartCrusher(config=cfg, with_compaction=False)
     result = crusher.crush(content, query=query, bias=bias)
 
     payload_input = {"content": content, "query": query, "bias": bias}
-    payload_config = asdict(cfg)
+    # Fixtures are replayed through PyO3, not the wrapper-only guard options.
+    native_parameters = inspect.signature(NativeSmartCrusherConfig).parameters
+    payload_config = {key: value for key, value in asdict(cfg).items() if key in native_parameters}
     payload_output = {
         "compressed": result.compressed,
         "original": result.original,
@@ -89,7 +94,7 @@ def _record(
 
     _FIXTURES_DIR.mkdir(parents=True, exist_ok=True)
     target = _FIXTURES_DIR / f"{label}_{digest[:12]}.json"
-    target.write_text(json.dumps(fixture, indent=2, sort_keys=True) + "\n")
+    target.write_text(json.dumps(fixture, indent=2, sort_keys=True) + "\n", newline="\n")
     return target
 
 
@@ -103,25 +108,11 @@ def _scenarios() -> list[tuple[str, str, str, float]]:
     # unchanged; trivially byte-equal.
     out.append(("non_json_passthrough", "this is not json at all", "", 1.0))
 
-    # 2. JSON object with no array fields long enough to crush.
-    out.append(
-        (
-            "small_object_passthrough",
-            json.dumps({"a": 1, "b": 2, "c": "hello"}),
-            "",
-            1.0,
-        )
-    )
+    # 2. An object without crushable arrays retains its whitespace.
+    out.append(("small_object_passthrough", json.dumps({"a": 1, "b": 2, "c": "hello"}), "", 1.0))
 
-    # 3. Short array (below min_items_to_analyze=5) → passthrough.
-    out.append(
-        (
-            "short_array_passthrough",
-            json.dumps([1, 2, 3]),
-            "",
-            1.0,
-        )
-    )
+    # 3. An array below the analysis threshold is byte-identical.
+    out.append(("short_array_passthrough", json.dumps([1, 2, 3]), "", 1.0))
 
     # 4. Dict array with 30 items, varied integer status field.
     # Exercises crush_array's adaptive_k → smart_sample / top_n path.
@@ -142,7 +133,8 @@ def _scenarios() -> list[tuple[str, str, str, float]]:
     mixed_arr = ["start"] + list(range(20)) + ["middle"] + ["end"] * 5
     out.append(("mixed_array", json.dumps(mixed_arr), "", 1.0))
 
-    # 8. Nested: top-level dict whose `events` field is a long dict array.
+    # Nested arrays whose analysis keeps every item must preserve their
+    # enclosing object's original bytes rather than reserialize it.
     nested = {
         "request_id": "req-1",
         "events": [{"step": i, "kind": "trace", "msg": f"e{i}"} for i in range(20)],
@@ -155,9 +147,7 @@ def _scenarios() -> list[tuple[str, str, str, float]]:
     # 10. Bias < 1 (keep fewer) on the 30-dict case.
     out.append(("dict_array_30_bias_low", json.dumps(items_30_dict), "", 0.7))
 
-    # 11. Unicode payload — exercises the `ensure_ascii=False` path in
-    # Python's safe_json_dumps. Rust's python_safe_json_dumps must emit
-    # raw UTF-8 bytes here, not `\uXXXX` escapes.
+    # Preserve escaped Unicode in unchanged input, including whitespace.
     unicode_items = [{"id": i, "msg": f"hello 中文 русский {i}", "tag": "тест"} for i in range(20)]
     out.append(("unicode_dict_array", json.dumps(unicode_items), "", 1.0))
 
@@ -169,7 +159,8 @@ def _scenarios() -> list[tuple[str, str, str, float]]:
     ]
     out.append(("dict_array_100_sequential", json.dumps(big_seq), "", 1.0))
 
-    # 13. Time-series-like payload: monotonic timestamp + float metric.
+    # Time-series analysis may keep every point; its float spellings and
+    # original JSON formatting must then survive the Python/native bridge.
     ts = [{"ts": 1000 + i, "metric": float(i * 1.5), "host": f"host-{i % 3}"} for i in range(50)]
     out.append(("time_series_50", json.dumps(ts), "", 1.0))
 
@@ -180,18 +171,12 @@ def _scenarios() -> list[tuple[str, str, str, float]]:
     # 15. Empty array — boundary case, must round-trip cleanly.
     out.append(("empty_array", json.dumps([]), "", 1.0))
 
-    # 16. Array of nulls and bools — non-crushable mixed type.
+    # 16. Non-crushable null/bool mixtures retain their original separators.
     out.append(
-        (
-            "nulls_and_bools",
-            json.dumps([None, True, False, None, True, False, None]),
-            "",
-            1.0,
-        )
+        ("nulls_and_bools", json.dumps([None, True, False, None, True, False, None]), "", 1.0)
     )
 
-    # 17. Deeply nested structure: 3-level depth with arrays at each
-    # level. Exercises process_value's recursion.
+    # Recursive no-op analysis must preserve bytes through every object level.
     deep = {"a": {"b": {"events": [{"i": i, "kind": "deep", "v": f"x{i}"} for i in range(15)]}}}
     out.append(("nested_3deep_with_array", json.dumps(deep), "", 1.0))
 

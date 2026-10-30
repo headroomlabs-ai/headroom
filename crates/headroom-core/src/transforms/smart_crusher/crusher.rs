@@ -372,14 +372,13 @@ impl SmartCrusher {
     ///
     /// Parses `content` as JSON, recursively processes it (compressing
     /// arrays at every depth via the appropriate per-type crusher),
-    /// then re-serializes with Python-compatible formatting (`, ` and
-    /// `: ` separators, ASCII-escaped non-ASCII).
+    /// then returns original bytes for unchanged values. Transformed
+    /// values use compact JSON, unescaped Unicode, and insertion order.
     ///
     /// Returns a `CrushResult` with:
-    /// - `compressed`: the re-serialized JSON.
+    /// - `compressed`: transformed JSON, or original bytes on passthrough.
     /// - `original`: the input string (unmodified).
-    /// - `was_modified`: whether `compressed` differs from `content`'s
-    ///   trimmed form.
+    /// - `was_modified`: whether processing changed the parsed JSON value.
     /// - `strategy`: combined strategy info from all crushed arrays
     ///   (or `"passthrough"`).
     pub fn crush(&self, content: &str, query: &str, bias: f64) -> CrushResult {
@@ -418,9 +417,9 @@ impl SmartCrusher {
         }
     }
 
-    /// `SmartCrusher._smart_crush_content` (Python line 2243-2301).
-    /// JSON-parse, recursively process, re-serialize. CCR marker
-    /// injection is stubbed (CCR is disabled in this stage).
+    /// Apply recursive JSON transforms without rewriting unchanged values.
+    /// Actual transformations use compact JSON; unchanged values retain
+    /// the original bytes, including whitespace and escapes.
     ///
     /// Returns `(crushed_content, was_modified, info)`.
     pub fn smart_crush_content(
@@ -446,19 +445,12 @@ impl SmartCrusher {
         let (crushed, info) =
             self.process_value_with_hook(&parsed, 0, query_context, bias, prose_hook);
 
-        // When an object and its descendants were left unchanged, keep
-        // the original bytes. Re-serializing would rewrite Unicode
-        // escapes and numeric lexical forms, then advertise a false
-        // compression. Nested skip/compaction still serializes below
-        // because those paths populate `info`. Spaced JSON without a
-        // nested strategy is compact-serialized for historical crush()
-        // / parity fixtures.
-        if crushed == parsed
-            && info.is_empty()
-            && matches!(parsed, Value::Object(_))
-            && !has_json_insignificant_whitespace(content)
-        {
-            return (content.to_string(), false, String::new());
+        // An unchanged value is passthrough, regardless of container type
+        // or whitespace. Preserve its bytes, escapes, and numeric forms
+        // instead of advertising re-serialization as compression. Keep
+        // diagnostic strategy information for decisions that made no edit.
+        if crushed == parsed {
+            return (content.to_string(), false, info);
         }
 
         // Re-serialize with Python `safe_json_dumps` formatting:
@@ -1295,36 +1287,6 @@ fn hash_canonical(canonical: &str) -> String {
 // here because `process_string`'s `string_ccr:<kind>` strategy-info
 // label is local to this module's debug-string convention.
 
-/// True when `s` has JSON whitespace outside of string literals
-/// (spaces after `:` / `,`, pretty-print newlines, etc.). Used to
-/// keep compact unchanged objects on the original-bytes path while
-/// still compact-serializing spaced inputs for historical crush()
-/// output.
-fn has_json_insignificant_whitespace(s: &str) -> bool {
-    let mut in_string = false;
-    let mut escape = false;
-    for ch in s.trim().chars() {
-        if in_string {
-            if escape {
-                escape = false;
-            } else if ch == '\\' {
-                escape = true;
-            } else if ch == '"' {
-                in_string = false;
-            }
-            continue;
-        }
-        if ch == '"' {
-            in_string = true;
-            continue;
-        }
-        if ch.is_whitespace() {
-            return true;
-        }
-    }
-    false
-}
-
 fn opaque_kind_label(kind: &super::compaction::OpaqueKind) -> &str {
     use super::compaction::OpaqueKind;
     match kind {
@@ -2004,36 +1966,45 @@ mod tests {
     }
 
     #[test]
-    fn crush_unchanged_object_keeps_original_bytes() {
+    fn crush_unchanged_values_preserve_original_bytes() {
         let c = crusher();
-        // Compact input: escaped Unicode and numeric lexical forms must
-        // survive the passthrough branch rather than being reserialized
-        // (`\u00e9` → `é`, `1.0` → `1`).
-        let compact = r#"{"cafe":"caf\u00e9","n":1.0,"ok":true}"#;
-        let result = c.crush(compact, "", 1.0);
-        assert_eq!(result.compressed, compact);
-        assert!(!result.was_modified);
-        assert_eq!(result.strategy, "passthrough");
-        assert!(
-            !result.compressed.contains("<<ccr:"),
-            "unchanged object must not invent a CCR marker"
-        );
+        let cases = [
+            r#"{"cafe":"caf\u00e9","n":1.0,"ok":true}"#,
+            r#"{ "cafe": "caf\u00e9", "n": 1.0, "ok": true }"#,
+            " \n{\n \"cafe\": \"caf\\u00e9\", \"n\": 1.0\n}\n\t",
+            r#"[ "\u0061", 1.0, { "ok": true } ]"#,
+            " \t\"caf\\u00e9\"\r\n ",
+            " \n1.0e+03\t ",
+            " \tnull\r\n ",
+        ];
+        for input in cases {
+            let result = c.crush(input, "", 1.0);
+            assert_eq!(
+                result.compressed, input,
+                "passthrough must preserve the original representation"
+            );
+            assert!(!result.was_modified);
+            assert_eq!(result.strategy, "passthrough");
+            assert!(
+                !result.compressed.contains("<<ccr:"),
+                "unchanged values must not invent CCR retrieval markers"
+            );
+        }
+    }
 
-        // Spaced / pretty-printed unchanged objects still compact-serialize
-        // (historical crush() output, required by parity fixtures) but
-        // must not advertise a key-drop strategy or invent a CCR hash.
-        let spaced = "{ \"cafe\": \"caf\\u00e9\", \"n\": 1.0, \"ok\": true }";
-        let spaced_result = c.crush(spaced, "", 1.0);
-        assert_eq!(spaced_result.strategy, "passthrough");
-        assert!(
-            !spaced_result.strategy.contains("adaptive"),
-            "must not report a key-drop strategy: {}",
-            spaced_result.strategy
-        );
-        assert!(!spaced_result.compressed.contains("<<ccr:"));
-        let parsed: Value = serde_json::from_str(&spaced_result.compressed).unwrap();
-        assert_eq!(parsed["cafe"], "café");
-        assert_eq!(parsed["ok"], true);
+    #[test]
+    fn crush_unchanged_analyzed_values_do_not_report_compression() {
+        let c = SmartCrusher::without_compaction(SmartCrusherConfig::default());
+        let rows: Vec<Value> = (0..15)
+            .map(|i| json!({"i": i, "kind": "deep", "v": format!("x{i}")}))
+            .collect();
+        let nested = serde_json::to_string_pretty(&json!({"a": {"b": {"events": rows}}}))
+            .expect("valid nested JSON");
+        for input in ["[null, true, false, null, true, false, null]", &nested] {
+            let result = c.crush(input, "", 1.0);
+            assert_eq!(result.compressed, input);
+            assert!(!result.was_modified);
+        }
     }
 
     #[test]
