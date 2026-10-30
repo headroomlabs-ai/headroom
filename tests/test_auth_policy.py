@@ -90,6 +90,16 @@ def test_bearer_case_insensitive_preserves_oauth_and_jwt_shapes() -> None:
     assert classify_auth_signals(AuthSignals(authorization=f"bearer {jwt}")) is AuthMode.OAUTH
 
 
+def test_extra_spaces_between_scheme_and_token_are_ignored() -> None:
+    # Same answer as the Rust classifier (headroom_core::auth_mode::classify).
+    assert classify_auth_signals(AuthSignals(authorization="Bearer  sk-ant-oat01-abc")) is (
+        AuthMode.OAUTH
+    )
+    assert classify_auth_signals(AuthSignals(authorization="bearer   sk-ant-api03-abc")) is (
+        AuthMode.PAYG
+    )
+
+
 def test_credential_case_is_not_folded() -> None:
     # Only the scheme is case-folded; the token keeps its case, so a PAYG
     # `sk-...` prefix still matches exactly (it is lowercase by construction).
