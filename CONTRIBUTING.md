@@ -73,7 +73,7 @@ A human maintainer reviews every dep change. PRs that add or bump a package must
 ## PR workflow
 
 1. Fork, branch from `main`.
-2. Install **Node 18+** and run `uv sync --extra dev` then `make install-git-hooks` — installs repo pre-commit checks on every commit, commitlint on every commit message, and ci-precheck on every push.
+2. Install **Node 18+** and run `uv sync --extra dev` then `make install-git-hooks` — installs repo pre-commit checks on every commit, commitlint on every commit message, and ci-precheck on every push. Add `--extra vector` when you need the optional HNSW backend/tests.
 3. One logical change per PR.
 4. Add tests.
 5. `uv run pytest` · `uv run ruff check .` · `uv run ruff format .`
@@ -95,6 +95,9 @@ python -m venv .venv && source .venv/bin/activate
 node --version  # Node 18+ required for commitlint hooks
 python -m pip install --upgrade pip
 python -m pip install -e ".[dev,relevance,proxy]"
+# Add `,vector` if you need the optional HNSW backend/tests. On distro Python
+# installs, `hnswlib` also needs Python development headers (for example
+# `python3-dev` on Debian/Ubuntu).
 python -m pytest
 ```
 

@@ -16,14 +16,21 @@ Usage:
 
 from __future__ import annotations
 
+import fnmatch
 import json
 import logging
+import os
+import shutil
 import subprocess
+import tempfile
 import threading
 import time
+from collections.abc import Iterator
+from contextlib import contextmanager
 from pathlib import Path
 
 from headroom._subprocess import run
+from headroom.ignore import IGNORE_FILE_NAME, IgnorePolicy
 
 logger = logging.getLogger(__name__)
 
@@ -104,6 +111,10 @@ class CodeGraphWatcher:
         project_dir: Root directory to watch.
         debounce_seconds: Wait this long after last change before reindexing.
         cbm_binary: Path to codebase-memory-mcp binary. Auto-detected if None.
+        ignore_config: Optional ``headroom.config.IgnoreConfig`` (or
+            equivalent object exposing ``paths``/``memory``/... list-of-str
+            attributes) merged with any ``.headroomignore`` file at
+            ``project_dir`` for ``ignore.memory`` enforcement (issue #1150).
     """
 
     def __init__(
@@ -111,10 +122,16 @@ class CodeGraphWatcher:
         project_dir: str | Path,
         debounce_seconds: float = 2.0,
         cbm_binary: str | None = None,
+        ignore_config: object | None = None,
     ) -> None:
         self.project_dir = str(project_dir)
         self.debounce_seconds = debounce_seconds
         self.cbm_binary: str | None = None
+        self._ignore_config = ignore_config
+        self._ignore_policy = IgnorePolicy.load(project_dir, ignore_config)
+        self._has_memory_ignores = any(
+            rule.applies_to("memory") for rule in self._ignore_policy.active_rules()
+        )
         if cbm_binary:
             self.cbm_binary = cbm_binary
         else:
@@ -124,6 +141,7 @@ class CodeGraphWatcher:
             self.cbm_binary = str(path) if path else None
         self._observer: object | None = None
         self._debounce_timer: threading.Timer | None = None
+        self._debounce_generation = 0
         self._lock = threading.Lock()
         self._running = False
         self._reindex_count = 0
@@ -147,12 +165,19 @@ class CodeGraphWatcher:
                 self._watcher = watcher
 
             def on_any_event(self, event: object) -> None:
-                # watchdog event has src_path attribute
                 src_path = getattr(event, "src_path", "")
-                if not src_path:
+                dest_path = getattr(event, "dest_path", "")
+                event_paths = [Path(value) for value in (src_path, dest_path) if value]
+                if not event_paths:
                     return
 
-                path = Path(src_path)
+                ignore_path = (Path(self._watcher.project_dir) / IGNORE_FILE_NAME).resolve()
+                if any(path.resolve() == ignore_path for path in event_paths):
+                    self._watcher._reload_ignore_policy()
+                    self._watcher._schedule_reindex()
+                    return
+
+                path = Path(src_path) if src_path else event_paths[0]
 
                 # Skip ignored directories
                 for part in path.parts:
@@ -165,6 +190,12 @@ class CodeGraphWatcher:
 
                 # Skip temporary/swap files
                 if path.name.startswith(".") or path.name.endswith("~"):
+                    return
+
+                # Skip paths ignored for indexing/memory (.headroomignore /
+                # ignore.memory config — e.g. generated agent-harness files
+                # projected from a canonical source; issue #1150).
+                if self._watcher._ignore_policy.is_ignored(path, "memory"):
                     return
 
                 self._watcher._schedule_reindex()
@@ -187,6 +218,7 @@ class CodeGraphWatcher:
         """Stop watching and clean up."""
         self._running = False
         with self._lock:
+            self._debounce_generation += 1
             if self._debounce_timer:
                 self._debounce_timer.cancel()
                 self._debounce_timer = None
@@ -208,9 +240,32 @@ class CodeGraphWatcher:
         with self._lock:
             if self._debounce_timer:
                 self._debounce_timer.cancel()
-            self._debounce_timer = threading.Timer(self.debounce_seconds, self._do_reindex)
-            self._debounce_timer.daemon = True
-            self._debounce_timer.start()
+            self._debounce_generation += 1
+            generation = self._debounce_generation
+            timer = threading.Timer(
+                self.debounce_seconds,
+                self._do_reindex_if_current,
+                args=(generation,),
+            )
+            timer.daemon = True
+            self._debounce_timer = timer
+        timer.start()
+
+    def _do_reindex_if_current(self, generation: int) -> None:
+        """Ignore callbacks from timers superseded by a later filesystem event."""
+        with self._lock:
+            if generation != self._debounce_generation:
+                return
+            self._debounce_timer = None
+        self._do_reindex()
+
+    def _reload_ignore_policy(self) -> None:
+        """Reload policies after the root ignore file changes."""
+        policy = IgnorePolicy.load(self.project_dir, self._ignore_config)
+        has_memory_ignores = any(rule.applies_to("memory") for rule in policy.active_rules())
+        with self._lock:
+            self._ignore_policy = policy
+            self._has_memory_ignores = has_memory_ignores
 
     def _do_reindex(self) -> None:
         """Trigger incremental reindex via codebase-memory-mcp."""
@@ -219,17 +274,21 @@ class CodeGraphWatcher:
 
         try:
             start = time.monotonic()
-            result = run(
-                [
-                    self.cbm_binary,
-                    "cli",
-                    "index_repository",
-                    json.dumps({"repo_path": self.project_dir, "mode": "fast"}),
-                ],
-                capture_output=True,
-                text=True,
-                timeout=30,
-            )
+            with self._indexable_repo_path() as repo_path:
+                payload = {"repo_path": str(repo_path), "mode": "fast"}
+                if repo_path.resolve() != Path(self.project_dir).resolve():
+                    payload["name"] = Path(self.project_dir).resolve().name
+                result = run(
+                    [
+                        self.cbm_binary,
+                        "cli",
+                        "index_repository",
+                        json.dumps(payload),
+                    ],
+                    capture_output=True,
+                    text=True,
+                    timeout=30,
+                )
 
             elapsed = time.monotonic() - start
             self._reindex_count += 1
@@ -263,6 +322,61 @@ class CodeGraphWatcher:
             logger.warning("Code graph: reindex timed out after 30s")
         except Exception as e:
             logger.debug("Code graph: reindex error: %s", e)
+
+    @contextmanager
+    def _indexable_repo_path(self) -> Iterator[Path]:
+        """Yield a repo tree containing only files allowed for memory indexing."""
+        project_path = Path(self.project_dir)
+        project_root = project_path.resolve()
+        with self._lock:
+            ignore_policy = self._ignore_policy
+            has_memory_ignores = self._has_memory_ignores
+        if not has_memory_ignores:
+            yield project_path
+            return
+
+        with tempfile.TemporaryDirectory(prefix="headroom-cbm-index-") as tmp:
+            staged_root = Path(tmp) / project_root.name
+            self._stage_indexable_tree(project_root, staged_root, ignore_policy)
+            yield staged_root
+
+    def _stage_indexable_tree(
+        self, source_root: Path, staged_root: Path, ignore_policy: IgnorePolicy
+    ) -> None:
+        """Hard-link or copy non-ignored files into ``staged_root`` for indexing."""
+        staged_root.mkdir(parents=True, exist_ok=True)
+        for dirpath, dirnames, filenames in os.walk(source_root):
+            current = Path(dirpath)
+            dirnames[:] = [
+                dirname
+                for dirname in dirnames
+                if not self._skip_index_dir(source_root, current / dirname, ignore_policy)
+            ]
+
+            for filename in filenames:
+                source = current / filename
+                if source.is_symlink() or ignore_policy.is_ignored(source, "memory"):
+                    continue
+                relative = source.relative_to(source_root)
+                destination = staged_root / relative
+                destination.parent.mkdir(parents=True, exist_ok=True)
+                try:
+                    os.link(source, destination)
+                except OSError:
+                    shutil.copy2(source, destination)
+
+    def _skip_index_dir(self, source_root: Path, path: Path, ignore_policy: IgnorePolicy) -> bool:
+        if ignore_policy.is_ignored(path, "memory"):
+            return True
+        try:
+            parts = path.relative_to(source_root).parts
+        except ValueError:
+            parts = path.parts
+        return any(
+            ignore == part or fnmatch.fnmatchcase(part, ignore)
+            for part in parts
+            for ignore in _IGNORE_DIRS
+        )
 
     @property
     def stats(self) -> dict:

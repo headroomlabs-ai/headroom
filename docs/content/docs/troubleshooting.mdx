@@ -388,23 +388,23 @@ for the current default and the available tags.
 
 ### pip install fails with C++ compilation error
 
-**Symptom**: `RuntimeError: Unsupported compiler -- at least C++11 support is needed!`
+**Symptoms**: `RuntimeError: Unsupported compiler -- at least C++11 support is needed!` or `fatal error: Python.h: No such file or directory`
 
 ```bash
 # Linux / Debian-based (including Docker)
-apt-get install -y build-essential && pip install headroom-ai
+apt-get install -y build-essential python3-dev && pip install "headroom-ai[vector]"
 
 # macOS (Xcode command line tools)
-xcode-select --install && pip install headroom-ai
+xcode-select --install && pip install "headroom-ai[vector]"
 ```
 
 For Docker, install and remove build tools in one layer:
 
 ```dockerfile
 FROM python:3.11-slim
-RUN apt-get update && apt-get install -y --no-install-recommends build-essential \
-    && pip install "headroom-ai[proxy]" \
-    && apt-get purge -y build-essential && apt-get autoremove -y \
+RUN apt-get update && apt-get install -y --no-install-recommends build-essential python3-dev \
+    && pip install "headroom-ai[vector]" \
+    && apt-get purge -y build-essential python3-dev && apt-get autoremove -y \
     && rm -rf /var/lib/apt/lists/*
 ```
 
