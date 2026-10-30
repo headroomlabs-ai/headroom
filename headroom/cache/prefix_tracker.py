@@ -1105,33 +1105,37 @@ def mirror_client_message_cache_control(
     messages: list[dict[str, Any]],
     client_messages: list[dict[str, Any]] | None,
 ) -> list[dict[str, Any]]:
-    """Keep ``cache_control`` outside content blocks exactly where the client put it.
+    """Keep Chat Completions ``cache_control`` exactly where the client put it.
 
     OpenAI-compatible clients that talk to Anthropic models through a gateway
-    (OpenCode via ``@ai-sdk/openai-compatible``, then LiteLLM) do not mark
-    content blocks. They mark the MESSAGE dict — ``{"role": "tool", "content":
-    "...", "cache_control": {...}}`` — and, on an assistant turn, the entries of
-    its ``tool_calls`` list, which the gateway turns into ``tool_use`` blocks.
-    ``normalize_message_cache_control`` only sees block markers
-    (``_client_marker_positions`` reads list content), so after
-    ``overlay_cached_prefix`` / ``finalize_turn`` replay an earlier turn's
-    forwarded messages, these markers ride along untouched. A client that marks
-    three places per request (system, the newest tool call, the newest tool
-    result) ends up forwarding four, then five and more, and the gateway's
-    translation to Anthropic blocks crosses the limit of four (``A maximum of 4
-    blocks with cache_control may be provided. Found 6``).
+    (OpenCode via ``@ai-sdk/openai-compatible``, then LiteLLM) mark three kinds
+    of holder: the MESSAGE dict — ``{"role": "tool", "content": "...",
+    "cache_control": {...}}`` —, the entries of an assistant's ``tool_calls``
+    list, which the gateway turns into ``tool_use`` blocks, and the content
+    blocks of list-form content (OpenCode V2 sends system, user and tool
+    content as text blocks). After ``overlay_cached_prefix`` /
+    ``finalize_turn`` replay an earlier turn's forwarded messages, last turn's
+    markers ride along with the replayed bytes. A client that moves its
+    breakpoint forward each step then forwards one marker more per step, and
+    the gateway's translation to Anthropic blocks crosses the limit of four
+    (``A maximum of 4 blocks with cache_control may be provided. Found 5``).
 
-    The client's current request is the authority for these markers, the same
-    rule the block-level normalizer applies: on each message and on each of its
-    ``tool_calls``, drop the marker unless the client put one there in this
-    request, in which case copy the client's own value. Content — and any
-    block-level marker in it — is left alone, so the replayed bytes the provider
-    cached stay byte-identical.
+    The client's current request is the authority for these markers: on each
+    message, each of its ``tool_calls`` and each of its content blocks, drop the
+    marker unless the client put one there in this request, in which case copy
+    the client's own value (an explicit ``ttl`` survives per position). Only the
+    ``cache_control`` keys move; every other byte of the replayed content stays
+    what the provider cached.
 
-    Index alignment is the invariant (the pipeline preserves message count and
-    each message's tool calls); where it does not hold, that message or list is
-    returned unchanged rather than guessing, and the breakpoint budget guard
-    still bounds the total.
+    Unlike ``normalize_message_cache_control`` this never creates a marker and
+    never moves one to a different block: in Chat the system prompt is part of
+    ``messages``, so a consolidating fallback would also strip the client's
+    system breakpoints. Index alignment is the invariant (the pipeline preserves
+    message count and each message's tool calls); where it does not hold, that
+    message or list is left unchanged rather than guessing. A replay may also
+    bring back an earlier turn's block-form content where the client now sends
+    a string (OpenCode does this for older user turns): the client marks no
+    block there, so the replayed block markers are dropped.
     """
     if not isinstance(client_messages, list) or len(client_messages) != len(messages):
         return messages
@@ -1153,9 +1157,39 @@ def mirror_client_message_cache_control(
             if any(c for _, c in mirrored):
                 new_msg = {**new_msg, "tool_calls": [c for c, _ in mirrored]}
                 msg_changed = True
+        blocks = new_msg.get("content")
+        client_blocks = client.get("content") if isinstance(client, dict) else None
+        if isinstance(blocks, list):
+            mirrored = _mirror_block_markers(blocks, client_blocks)
+            if mirrored is not blocks:
+                new_msg = {**new_msg, "content": mirrored}
+                msg_changed = True
         out.append(new_msg)
         changed = changed or msg_changed
     return out if changed else messages
+
+
+def _mirror_block_markers(blocks: list[Any], client_content: Any) -> list[Any]:
+    """Give each forwarded content block the client's block marker (or none).
+
+    A client message that marks no block (string content, which a replay may
+    bring back in an earlier turn's block form, or unmarked blocks) leaves no
+    block marker to keep, so every one is dropped. When the client does mark
+    blocks, positions map 1:1 only if the block counts match; otherwise the
+    blocks are returned unchanged rather than guessing.
+    """
+    client_blocks = client_content if isinstance(client_content, list) else []
+    client_marks = any(
+        isinstance(b, dict) and isinstance(b.get("cache_control"), dict) for b in client_blocks
+    )
+    if not client_marks:
+        client_blocks = [None] * len(blocks)
+    elif len(client_blocks) != len(blocks):
+        return blocks
+    mirrored = [_mirror_marker(b, cb) for b, cb in zip(blocks, client_blocks)]
+    if not any(c for _, c in mirrored):
+        return blocks
+    return [b for b, _ in mirrored]
 
 
 def _mirror_marker(holder: Any, client_holder: Any) -> tuple[Any, bool]:
