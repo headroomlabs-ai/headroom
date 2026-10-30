@@ -1,16 +1,22 @@
 """Request coalescer — merge rapid compatible prompts into batched requests.
 
-When an agent sends multiple compatible non-streaming requests within a
+When an agent sends multiple *identical* non-streaming requests within a
 configurable window (default 5s), buffer them by compatibility key
-(model, system, tools, generation parameters, and auth scope), share only
-their verified common conversation prefix, and dispatch through the
-configured upstream sender.
+(the complete request: model, system, tools, generation parameters,
+messages, and auth scope) and dispatch once through the configured
+upstream sender.
+
+Only requests whose complete inputs are equivalent may share a dispatch.
+Two requests under one credential are still two independent sessions: a
+shared model/settings/auth scope does not make their answers
+interchangeable, and one upstream response cannot be demultiplexed into
+per-caller answers. Deduplication therefore requires an identical payload.
 
 Benefits:
-- Reduces API call overhead (N compatible calls -> 1 call)
-- Shared conversation/system prefix is sent once instead of N times
-- Preserves intra-request repeated turns, per-request settings, and
-  caller cancellation isolation
+- Reduces API call overhead for duplicate prompts (retry storms, fan-out
+  of the same question)
+- Never substitutes one caller's answer for another's
+- Dispatch lifetime is independent of any single waiter
 """
 
 from __future__ import annotations
@@ -41,16 +47,15 @@ def _canonical_json(value: Any) -> str:
 
 
 def _compatibility_key(payload: dict[str, Any], scope: str | None = None) -> str:
-    """Compute a compatibility key from all non-message request fields + scope.
+    """Compute a compatibility key from the complete request inputs + scope.
 
-    Requests only batch together when their model, system prompt, tools,
-    generation settings, and auth/endpoint scope match exactly.
+    Requests only batch together when *every* field matches, messages
+    included. Matching settings and auth scope do not make two prompts
+    interchangeable, so the conversation is part of the identity.
     """
-    non_message_fields = {
-        k: v for k, v in payload.items() if k != "messages" and k not in _INTERNAL_KEYS
-    }
+    fields = {k: v for k, v in payload.items() if k not in _INTERNAL_KEYS}
     effective_scope = scope if scope is not None else str(payload.get("_coalesce_scope", ""))
-    return _canonical_json({"scope": effective_scope, "fields": non_message_fields})
+    return _canonical_json({"scope": effective_scope, "fields": fields})
 
 
 def _strip_internal_keys(payload: dict[str, Any]) -> dict[str, Any]:
@@ -74,11 +79,12 @@ class CoalescedRequest:
 
 
 class RequestCoalescer:
-    """Buffer rapid compatible requests and merge them into batches.
+    """Buffer rapid identical requests and merge them into batches.
 
-    When compatible requests arrive within ``window_sec`` of each other,
-    they are grouped by non-message settings + scope and merged into a
-    single batch preserving all intra-request turns.
+    Requests are grouped by their complete inputs (settings *and* messages)
+    plus auth scope, so a batch only ever contains the same question asked
+    more than once. Dispatch runs in its own task: it is never owned by —
+    or cancellable through — any single waiting caller.
     """
 
     def __init__(
@@ -92,7 +98,8 @@ class RequestCoalescer:
         self.dispatch_fn = dispatch_fn
         self._pending: list[CoalescedRequest] = []
         self._lock = asyncio.Lock()
-        self._flush_task: asyncio.Task[None] | None = None
+        self._timer_task: asyncio.Task[None] | None = None
+        self._flushing: set[asyncio.Task[None]] = set()
         self._stats: dict[str, int] = {
             "requests_submitted": 0,
             "requests_coalesced": 0,
@@ -101,6 +108,14 @@ class RequestCoalescer:
             "cancelled_requests": 0,
             "dispatch_errors": 0,
         }
+
+    @property
+    def _flush_task(self) -> asyncio.Task[None] | None:
+        """Most recent in-flight flush task, if any (observability/compat)."""
+        for task in self._flushing:
+            if not task.done():
+                return task
+        return None
 
     async def __aenter__(self) -> RequestCoalescer:
         return self
@@ -124,7 +139,7 @@ class RequestCoalescer:
         scope: str | None = None,
         dispatch_fn: DispatchFn | None = None,
     ) -> dict[str, Any]:
-        """Submit a request. May be batched with other compatible rapid requests."""
+        """Submit a request. May be batched with identical rapid requests."""
         req = CoalescedRequest(payload=payload, scope=scope, dispatch_fn=dispatch_fn)
 
         async with self._lock:
@@ -133,11 +148,12 @@ class RequestCoalescer:
             active_count = sum(1 for r in self._pending if not r.future.done())
 
             if active_count >= self.max_batch:
-                # Batch is full — flush immediately
-                await self._flush()
-            elif self._flush_task is None or self._flush_task.done():
-                # Start the flush timer
-                self._flush_task = asyncio.create_task(self._delayed_flush())
+                # Batch is full — flush in a task of its own. Never await the
+                # dispatch here: the caller's task must not own, or be able
+                # to cancel, a batch its peers are waiting on.
+                self._start_flush_locked()
+            elif self._timer_task is None or self._timer_task.done():
+                self._timer_task = asyncio.create_task(self._delayed_flush())
 
         try:
             return await req.future
@@ -148,10 +164,19 @@ class RequestCoalescer:
                     self._stats["cancelled_requests"] += 1
                 if not any(not r.future.done() for r in self._pending):
                     self._pending.clear()
-                    if self._flush_task and not self._flush_task.done():
-                        self._flush_task.cancel()
-                        self._flush_task = None
+                    if self._timer_task is not None and not self._timer_task.done():
+                        self._timer_task.cancel()
+                    self._timer_task = None
             raise
+
+    def _start_flush_locked(self) -> None:
+        """Schedule a flush as an independent task. Caller must hold the lock."""
+        task = asyncio.create_task(self._flush_worker())
+        self._flushing.add(task)
+        task.add_done_callback(self._flushing.discard)
+        if self._timer_task is not None and not self._timer_task.done():
+            self._timer_task.cancel()
+            self._timer_task = None
 
     async def _delayed_flush(self) -> None:
         """Wait for window_sec, then flush pending requests."""
@@ -159,61 +184,70 @@ class RequestCoalescer:
             await asyncio.sleep(self.window_sec)
         except asyncio.CancelledError:
             return
-        async with self._lock:
-            await self._flush()
+        await self._flush_worker()
 
-    async def _flush(self) -> None:
-        """Group pending requests by compatibility, dispatch, and resolve futures."""
-        if self._flush_task and self._flush_task is not asyncio.current_task():
-            self._flush_task.cancel()
-        self._flush_task = None
+    async def _flush_worker(self) -> None:
+        """Snapshot pending under the lock, then dispatch outside it.
 
-        if not self._pending:
-            return
+        Holds the lock only long enough to take ownership of the queue, so a
+        slow upstream never blocks new submits, and a cancelled waiter never
+        cancels the shared dispatch.
+        """
+        try:
+            async with self._lock:
+                snapshot = self._take_pending_locked()
+            if not snapshot:
+                return
 
+            groups: OrderedDict[str, list[CoalescedRequest]] = OrderedDict()
+            for req in snapshot:
+                groups.setdefault(_compatibility_key(req.payload, req.scope), []).append(req)
+
+            for group in groups.values():
+                await self._flush_compatible_group(group)
+        except asyncio.CancelledError:
+            raise
+        except Exception:  # pragma: no cover - defensive
+            logger.exception("coalescer flush failed")
+
+    def _take_pending_locked(self) -> list[CoalescedRequest]:
+        """Swap out the pending queue, dropping callers that already left."""
         raw_pending = self._pending
         self._pending = []
-
-        # Drop requests whose callers cancelled before flush
-        active_pending: list[CoalescedRequest] = []
+        active: list[CoalescedRequest] = []
         for req in raw_pending:
             if req.future.done():
                 self._stats["cancelled_requests"] += 1
             else:
-                active_pending.append(req)
+                active.append(req)
+        return active
 
-        if not active_pending:
-            return
-
-        # Partition by compatibility key so requests with different model,
-        # system, tools, generation settings, or auth scope never mix.
-        groups: OrderedDict[str, list[CoalescedRequest]] = OrderedDict()
-        for req in active_pending:
-            key = _compatibility_key(req.payload, req.scope)
-            groups.setdefault(key, []).append(req)
-
-        for group in groups.values():
-            await self._flush_compatible_group(group)
+    async def _flush(self) -> None:
+        """Drain pending now (serialized close path)."""
+        await self._flush_worker()
 
     async def _flush_compatible_group(self, group: list[CoalescedRequest]) -> None:
-        """Dispatch a single compatible group (solo or merged) and resolve waiters."""
+        """Dispatch a single compatible group and resolve its waiters.
+
+        The group is keyed on complete-input identity, so every member asked
+        the same question: the one upstream answer is the correct answer for
+        each of them. No merging of distinct conversations happens here.
+        """
         live_group = [r for r in group if not r.future.done()]
         if not live_group:
             return
 
         self._stats["batches_flushed"] += 1
         is_coalesced = len(live_group) > 1
+        outbound_payload = _strip_internal_keys(live_group[0].payload)
         if is_coalesced:
-            outbound_payload = self._merge_requests([r.payload for r in live_group])
             self._stats["requests_coalesced"] += len(live_group)
             self._stats["api_calls_saved"] += len(live_group) - 1
             logger.info(
-                "coalesced %d compatible requests into 1 batch (saved %d API calls)",
+                "coalesced %d identical requests into 1 batch (saved %d API calls)",
                 len(live_group),
                 len(live_group) - 1,
             )
-        else:
-            outbound_payload = _strip_internal_keys(live_group[0].payload)
 
         effective_dispatch = live_group[0].dispatch_fn or self.dispatch_fn
         upstream_response: Any = None
@@ -242,59 +276,16 @@ class RequestCoalescer:
                 result_envelope["response"] = upstream_response
             req.future.set_result(result_envelope)
 
-    def _merge_requests(self, payloads: list[dict[str, Any]]) -> dict[str, Any]:
-        """Merge compatible payloads while preserving every intra-request turn.
-
-        Identifies only the verified longest common message prefix across all
-        payloads in the batch, emits that shared prefix once, and appends each
-        request's full suffix in order so repeated turns within a single
-        conversation (e.g., ``user: retry`` after ``assistant: done``) and
-        tool-call/tool-result pairs are never dropped.
-        """
-        if not payloads:
-            return {}
-
-        merged = _strip_internal_keys(payloads[0])
-        message_lists: list[list[Any]] = [list(p.get("messages", [])) for p in payloads]
-
-        if not message_lists:
-            merged["messages"] = []
-            merged["_coalesced_from"] = len(payloads)
-            merged["_coalesced_slices"] = []
-            return merged
-
-        # Find the longest common message prefix across all requests in the batch
-        min_len = min(len(msgs) for msgs in message_lists)
-        prefix_len = 0
-        for idx in range(min_len):
-            first_key = _canonical_json(message_lists[0][idx])
-            if all(_canonical_json(msgs[idx]) == first_key for msgs in message_lists[1:]):
-                prefix_len = idx + 1
-            else:
-                break
-
-        all_messages: list[Any] = list(message_lists[0][:prefix_len])
-        slices: list[dict[str, int]] = []
-        for msgs in message_lists:
-            suffix = msgs[prefix_len:]
-            start = len(all_messages)
-            all_messages.extend(suffix)
-            end = len(all_messages)
-            slices.append({"prefix_len": prefix_len, "start": start, "end": end})
-
-        merged["messages"] = all_messages
-        merged["_coalesced_from"] = len(payloads)
-        merged["_coalesced_slices"] = slices
-
-        return merged
-
     async def close(self) -> None:
         """Flush any remaining requests and shut down."""
         async with self._lock:
-            if self._flush_task:
-                self._flush_task.cancel()
-                self._flush_task = None
-            await self._flush()
+            if self._timer_task is not None:
+                self._timer_task.cancel()
+                self._timer_task = None
+        await self._flush_worker()
+        in_flight = [t for t in self._flushing if not t.done()]
+        if in_flight:
+            await asyncio.gather(*in_flight, return_exceptions=True)
 
 
 # ── Singleton & Proxy Integration Helpers ────────────────────────────

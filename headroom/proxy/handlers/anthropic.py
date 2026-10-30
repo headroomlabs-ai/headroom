@@ -351,6 +351,23 @@ def _dump_prefix_mismatch(request_id: str, current: list, previous: list) -> Non
         )
 
 
+def _clone_buffered_response(response: Any) -> Any:
+    """Hand each caller its own copy of a shared buffered upstream response."""
+    try:
+        content = response.content
+    except Exception:
+        return response
+    try:
+        return httpx.Response(
+            status_code=response.status_code,
+            headers=dict(response.headers),
+            content=content,
+            request=response.request,
+        )
+    except Exception:
+        return response
+
+
 class AnthropicHandlerMixin:
     """Mixin providing Anthropic API handler methods for HeadroomProxy."""
 
@@ -4445,6 +4462,14 @@ class AnthropicHandlerMixin:
                                     )
                                     response = _coalesce_res["response"]
                                     tags["coalesced"] = bool(_coalesce_res.get("coalesced", False))
+                                    if tags["coalesced"]:
+                                        # A coalesced batch is only formed from
+                                        # identical inputs, so the answer is the
+                                        # same — but each caller still owns its
+                                        # response. Sharing one object lets one
+                                        # caller's later mutation (or stream read)
+                                        # leak into its peers.
+                                        response = _clone_buffered_response(response)
                                     tags["coalesced_batch_size"] = int(
                                         _coalesce_res.get("batch_size", 1)
                                     )
