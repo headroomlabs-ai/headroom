@@ -600,7 +600,9 @@ def _activate_output_shaper(
     import urllib.error
     import urllib.request
 
-    resolved_port = _local_proxy_port(port)
+    from headroom.cli.port_discovery import resolve_read_port
+
+    resolved_port, _origin = resolve_read_port(port)
     overrides = {"HEADROOM_OUTPUT_SHAPER": "1"}
     if verbosity_level is not None:
         overrides["HEADROOM_VERBOSITY_LEVEL"] = verbosity_level
