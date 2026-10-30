@@ -8,6 +8,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## Unreleased
 
+### Fixed
+
+- **Codex: `CLIENT_UA_MAP` matched a User-Agent no shipped Codex build sends.**
+  The only OpenAI needle was `codex-cli/`; measured across two `proxy.log`
+  rotations the Codex User-Agents actually on the wire were `codex-tui/` (3,167
+  requests), `codex-browser-use/` (1,338), `Codex Desktop/` (368),
+  `codex_cli_rs/` (13) and `codex-computer-use/` (1) — 4,887 requests, zero
+  matches. Every Codex request therefore classified as `None`, so the Codex
+  fail-open in `decide_compression_failure_action()`, which keys on
+  `client == "codex"`, never fired and a compression timeout returned 413.
+
 ### Features
 - **proxy:** opt-in cost-aware model routing ([#1706](https://github.com/headroomlabs-ai/headroom/issues/1706)). Set `HEADROOM_MODEL_ROUTER_ENABLED=1` and `HEADROOM_MODEL_ROUTES` (a JSON array of ordered rules) to rewrite the upstream model based on estimated input size and tool presence, complementary to content compression, e.g. send small, tool-free requests to a cheaper model. First matching rule wins, and each decision is logged with a reason so routing stays observable. Malformed rules fail open (the rule is skipped, never silently widened). Disabled by default so behavior is unchanged, skipped under `x-headroom-bypass`/passthrough, and currently applied on the Anthropic `/v1/messages` path.
 - **install:** `headroom install apply` now accepts `--code-aware/--no-code-aware`, `--intercept-tool-results`, `--protect-tool-results`, and `--bedrock-profile`, mirroring the equivalent flags already on `headroom proxy`. Previously the only way to run a persistent deployment with these settings was to hand-edit `manifest.json` after the fact, which silently reverts on the next `install apply`.
