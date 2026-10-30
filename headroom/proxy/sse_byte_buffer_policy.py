@@ -42,10 +42,10 @@ def parse_sse_events_from_byte_buffer(
         event_bytes = bytes(buf[:idx])
         del buf[: idx + terminator_len]
 
-        event_text = event_bytes.decode("utf-8")
         event_name: str | None = None
         data_lines: list[str] = []
-        for line in event_text.splitlines():
+        for raw_line in event_bytes.splitlines():
+            line = raw_line.decode("utf-8")
             if not line:
                 continue
             if line.startswith(":"):
