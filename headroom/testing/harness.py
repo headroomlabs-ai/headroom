@@ -750,7 +750,6 @@ class Headroom:
         lossless: bool | None = None,
         compressors: set[str] | Sequence[str] | Literal["*"] | None = None,
         min_tokens: int | None = None,
-        max_items: int | None = None,
         savings_profile: str | None = None,
     ) -> Headroom:
         """Configure proxy and SDK compression posture with real config fields."""
@@ -772,9 +771,6 @@ class Headroom:
         if min_tokens is not None:
             self._proxy_config.min_tokens_to_crush = min_tokens
             self._headroom_config.smart_crusher.min_tokens_to_crush = min_tokens
-        if max_items is not None:
-            self._proxy_config.max_items_after_crush = max_items
-            self._headroom_config.smart_crusher.max_items_after_crush = max_items
         if savings_profile is not None:
             self._proxy_config.savings_profile = savings_profile
         return self

@@ -275,7 +275,7 @@ from headroom import HeadroomClient, OpenAIProvider, HeadroomConfig
 config = HeadroomConfig()
 
 # Keep more items after compression (default: 15)
-config.smart_crusher.max_items_after_crush = 30
+config.smart_crusher.min_tokens_to_crush = 500
 
 # Only compress if tool output has > 500 tokens (default: 200)
 config.smart_crusher.min_tokens_to_crush = 500
@@ -367,7 +367,7 @@ config.smart_crusher.relevance.tier = "bm25"
 
 ```python
 # Keep more items
-config.smart_crusher.max_items_after_crush = 50
+config.smart_crusher.min_tokens_to_crush = 2000
 ```
 
 See [Troubleshooting Guide](troubleshooting.md) for more solutions.

@@ -128,7 +128,6 @@ def test_v1_compress_real_json_tool_payload_reduces_tokens(monkeypatch) -> None:
         _proxy_config(
             ccr_inject_marker=False,
             min_tokens_to_crush=20,
-            max_items_after_crush=10,
         )
     )
     items = [

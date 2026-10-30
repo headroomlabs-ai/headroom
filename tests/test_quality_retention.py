@@ -54,7 +54,7 @@ class TestErrorRetention:
         """CRITICAL: Every item with error keywords MUST be retained."""
         items, error_indices = large_dataset
 
-        config = SmartCrusherConfig(max_items_after_crush=20)
+        config = SmartCrusherConfig()
         content = json.dumps(items)
         compressed_str, _, _ = smart_crush_tool_output(content, config, with_compaction=False)
         compressed = json.loads(compressed_str)
@@ -74,7 +74,7 @@ class TestErrorRetention:
         items = [{"id": f"item_{i}", "msg": f"Normal {i}"} for i in range(100)]
         items[50]["msg"] = f"This contains {keyword} keyword"
 
-        config = SmartCrusherConfig(max_items_after_crush=15)
+        config = SmartCrusherConfig()
         compressed_str, _, _ = smart_crush_tool_output(
             json.dumps(items), config, with_compaction=False
         )
@@ -89,7 +89,7 @@ class TestErrorRetention:
         items[50]["data"]["status"] = "failed"
         items[50]["data"]["error"] = "Nested error"
 
-        config = SmartCrusherConfig(max_items_after_crush=15)
+        config = SmartCrusherConfig()
         compressed_str, _, _ = smart_crush_tool_output(
             json.dumps(items), config, with_compaction=False
         )
@@ -113,7 +113,7 @@ class TestErrorRetention:
         assert error_count_before == 34  # 0,3,6,...,99 = 34 items
 
         # Compress with max 20 items
-        config = SmartCrusherConfig(max_items_after_crush=20)
+        config = SmartCrusherConfig()
         compressed_str, _, _ = smart_crush_tool_output(
             json.dumps(items), config, with_compaction=False
         )
@@ -153,7 +153,7 @@ class TestAnomalyRetention:
             items[idx]["is_anomaly"] = True  # Mark for verification
             anomaly_indices.append(idx)
 
-        config = SmartCrusherConfig(max_items_after_crush=20)
+        config = SmartCrusherConfig()
         compressed_str, _, _ = smart_crush_tool_output(
             json.dumps(items), config, with_compaction=False
         )
@@ -172,7 +172,7 @@ class TestAnomalyRetention:
         items[50]["value"] = -999  # Negative anomaly
         items[50]["is_anomaly"] = True
 
-        config = SmartCrusherConfig(max_items_after_crush=15)
+        config = SmartCrusherConfig()
         compressed_str, _, _ = smart_crush_tool_output(
             json.dumps(items), config, with_compaction=False
         )
@@ -195,7 +195,7 @@ class TestRelevanceRetention:
         items[50]["is_target"] = True
 
         # Use SmartCrusher with query context (via message-based API)
-        config = SmartCrusherConfig(max_items_after_crush=15)
+        config = SmartCrusherConfig()
         crusher = SmartCrusher(config, with_compaction=False)
 
         # Create tokenizer with proper counter
@@ -224,7 +224,7 @@ class TestFirstLastRetention:
         """First 3 items must always be retained."""
         items = [{"id": i, "value": i} for i in range(100)]
 
-        config = SmartCrusherConfig(max_items_after_crush=15)
+        config = SmartCrusherConfig()
         compressed_str, _, _ = smart_crush_tool_output(
             json.dumps(items), config, with_compaction=False
         )
@@ -239,7 +239,7 @@ class TestFirstLastRetention:
         """Last 2 items must always be retained."""
         items = [{"id": i, "value": i} for i in range(100)]
 
-        config = SmartCrusherConfig(max_items_after_crush=15)
+        config = SmartCrusherConfig()
         compressed_str, _, _ = smart_crush_tool_output(
             json.dumps(items), config, with_compaction=False
         )
@@ -262,7 +262,7 @@ class TestCombinedRetention:
         items[50]["error"] = "Critical failure"
         items[50]["is_both"] = True
 
-        config = SmartCrusherConfig(max_items_after_crush=10)
+        config = SmartCrusherConfig()
         compressed_str, _, _ = smart_crush_tool_output(
             json.dumps(items), config, with_compaction=False
         )
@@ -292,7 +292,7 @@ class TestCombinedRetention:
 
             items.append(item)
 
-        config = SmartCrusherConfig(max_items_after_crush=30)
+        config = SmartCrusherConfig()
         compressed_str, _, _ = smart_crush_tool_output(
             json.dumps(items), config, with_compaction=False
         )
@@ -333,7 +333,7 @@ class TestCompressionRatio:
 
         original_size = len(json.dumps(items))
 
-        config = SmartCrusherConfig(max_items_after_crush=50)
+        config = SmartCrusherConfig()
         compressed_str, _, _ = smart_crush_tool_output(
             json.dumps(items), config, with_compaction=False
         )
@@ -372,7 +372,7 @@ class TestEdgeCases:
         """When all items are errors, all should be retained."""
         items = [{"id": i, "error": f"Error {i}"} for i in range(50)]
 
-        config = SmartCrusherConfig(max_items_after_crush=20)
+        config = SmartCrusherConfig()
         compressed_str, _, _ = smart_crush_tool_output(
             json.dumps(items), config, with_compaction=False
         )
@@ -388,7 +388,7 @@ class TestEdgeCases:
         items = [{"id": i, "content": f"内容 {i}"} for i in range(100)]
         items[50]["error"] = "错误: Unicode error message"
 
-        config = SmartCrusherConfig(max_items_after_crush=15)
+        config = SmartCrusherConfig()
         compressed_str, _, _ = smart_crush_tool_output(
             json.dumps(items), config, with_compaction=False
         )

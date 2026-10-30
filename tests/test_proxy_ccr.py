@@ -414,7 +414,6 @@ class TestEndToEndTOINIntegration:
                     SmartCrusherConfig(
                         enabled=True,
                         min_tokens_to_crush=100,
-                        max_items_after_crush=15,
                     ),
                     ccr_config=CCRConfig(
                         enabled=True,

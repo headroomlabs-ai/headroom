@@ -113,7 +113,7 @@ response = client.chat.completions.create(
   `headroom_tool_profiles` is accepted but not currently wired through
   `TransformPipeline.apply()`, so passing it changes nothing. To keep
   specific tool outputs from being compressed as aggressively, use
-  `config.smart_crusher.max_items_after_crush` or
+  a higher `config.smart_crusher.min_tokens_to_crush`, or
   `config.smart_crusher.enabled = False` instead — see
   [Compression Too Aggressive](/docs/troubleshooting#compression-too-aggressive).
 </Callout>
@@ -247,7 +247,6 @@ if not result["valid"]:
 <TypeTable type={{
   min_tokens_to_crush: { type: 'int', description: 'Minimum tokens before applying compression', default: '200' },
   min_items_to_analyze: { type: 'int', description: 'Minimum items before analyzing for compression', default: '5' },
-  max_items_after_crush: { type: 'int', description: 'Maximum items to keep after compression', default: '15' },
   variance_threshold: { type: 'float', description: 'Variance threshold for analysis', default: '2.0' },
   uniqueness_threshold: { type: 'float', description: 'Uniqueness threshold for deduplication', default: '0.1' },
   similarity_threshold: { type: 'float', description: 'Similarity threshold for grouping', default: '0.8' },
@@ -263,7 +262,6 @@ from headroom import SmartCrusherConfig
 
 config = SmartCrusherConfig(
     min_tokens_to_crush=200,
-    max_items_after_crush=15,
     variance_threshold=2.0,
     preserve_change_points=True,
 )
