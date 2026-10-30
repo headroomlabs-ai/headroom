@@ -55,6 +55,13 @@ class TestSQLiteStorageInit:
             "stable_prefix_hash",
             "cache_alignment_score",
             "cached_tokens",
+            "cache_optimizer_used",
+            "cache_optimizer_strategy",
+            "cacheable_tokens",
+            "breakpoints_inserted",
+            "estimated_cache_hit",
+            "estimated_savings_percent",
+            "semantic_cache_hit",
             "transforms_applied",
             "tool_units_dropped",
             "turns_dropped",
@@ -793,3 +800,123 @@ class TestConcurrency:
         count = storage.count()
         assert count == 50  # 5 threads * 10 records each
         storage.close()
+
+
+class TestCacheOptimizerMetrics:
+    """Cache-optimizer fields must survive a durable SQLite round trip (#4261)."""
+
+    def test_save_close_reopen_preserves_cache_optimizer_fields(self, temp_sqlite_db):
+        metrics = RequestMetrics(
+            request_id="cache-repro",
+            timestamp=datetime(2025, 1, 6, 12, 0, 0),
+            model="claude-3-opus",
+            stream=False,
+            mode="optimize",
+            tokens_input_before=1000,
+            tokens_input_after=800,
+            cache_optimizer_used="anthropic-cache-optimizer",
+            cache_optimizer_strategy="explicit_breakpoints",
+            cacheable_tokens=789,
+            breakpoints_inserted=2,
+            estimated_cache_hit=True,
+            estimated_savings_percent=42.5,
+            semantic_cache_hit=True,
+        )
+
+        storage = SQLiteStorage(temp_sqlite_db)
+        storage.save(metrics)
+        storage.close()
+
+        reopened = SQLiteStorage(temp_sqlite_db)
+        restored = reopened.get("cache-repro")
+        reopened.close()
+
+        assert restored is not None
+        assert restored.cache_optimizer_used == "anthropic-cache-optimizer"
+        assert restored.cache_optimizer_strategy == "explicit_breakpoints"
+        assert restored.cacheable_tokens == 789
+        assert restored.breakpoints_inserted == 2
+        assert restored.estimated_cache_hit is True
+        assert restored.estimated_savings_percent == 42.5
+        assert restored.semantic_cache_hit is True
+
+    def test_cache_optimizer_defaults_round_trip(self, temp_sqlite_db):
+        metrics = RequestMetrics(
+            request_id="cache-defaults",
+            timestamp=datetime(2025, 1, 6, 12, 0, 0),
+            model="gpt-4o",
+            stream=False,
+            mode="audit",
+            tokens_input_before=1000,
+            tokens_input_after=800,
+        )
+
+        storage = SQLiteStorage(temp_sqlite_db)
+        storage.save(metrics)
+        storage.close()
+
+        reopened = SQLiteStorage(temp_sqlite_db)
+        restored = reopened.get("cache-defaults")
+        reopened.close()
+
+        assert restored is not None
+        assert restored.cache_optimizer_used is None
+        assert restored.cache_optimizer_strategy is None
+        assert restored.cacheable_tokens == 0
+        assert restored.breakpoints_inserted == 0
+        assert restored.estimated_cache_hit is False
+        assert restored.estimated_savings_percent == 0.0
+        assert restored.semantic_cache_hit is False
+
+    def test_opening_legacy_database_migrates_without_dropping_rows(self, temp_sqlite_db):
+        legacy_schema = """
+            CREATE TABLE requests (
+                id TEXT PRIMARY KEY,
+                timestamp TEXT NOT NULL,
+                model TEXT NOT NULL,
+                stream INTEGER NOT NULL,
+                mode TEXT NOT NULL,
+                tokens_input_before INTEGER NOT NULL,
+                tokens_input_after INTEGER NOT NULL,
+                tokens_output INTEGER,
+                block_breakdown TEXT NOT NULL,
+                waste_signals TEXT NOT NULL,
+                stable_prefix_hash TEXT,
+                cache_alignment_score REAL,
+                cached_tokens INTEGER,
+                transforms_applied TEXT NOT NULL,
+                tool_units_dropped INTEGER DEFAULT 0,
+                turns_dropped INTEGER DEFAULT 0,
+                messages_hash TEXT,
+                error TEXT
+            )
+        """
+        conn = sqlite3.connect(temp_sqlite_db)
+        cursor = conn.cursor()
+        cursor.execute(legacy_schema)
+        cursor.execute(
+            """
+            INSERT INTO requests (
+                id, timestamp, model, stream, mode,
+                tokens_input_before, tokens_input_after, tokens_output,
+                block_breakdown, waste_signals, transforms_applied,
+                tool_units_dropped, turns_dropped
+            ) VALUES (
+                'legacy-1', '2025-01-06T12:00:00Z', 'gpt-4o', 0, 'audit',
+                1000, 800, 200, '{}', '{}', '[]', 0, 0
+            )
+            """
+        )
+        conn.commit()
+        conn.close()
+
+        storage = SQLiteStorage(temp_sqlite_db)
+        restored = storage.get("legacy-1")
+        storage.close()
+
+        assert restored is not None
+        assert restored.model == "gpt-4o"
+        assert restored.tokens_input_before == 1000
+        assert restored.cache_optimizer_used is None
+        assert restored.cacheable_tokens == 0
+        assert restored.semantic_cache_hit is False
