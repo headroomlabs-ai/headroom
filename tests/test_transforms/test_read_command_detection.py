@@ -134,7 +134,14 @@ def test_heredoc_body_is_not_split_into_a_bogus_read() -> None:
 @pytest.mark.parametrize("comment", ["", " # avoid -i here", " # --unknown", " # author's note"])
 def test_quiet_sed_output_reaches_read_protection(flag: str, comment: str, monkeypatch) -> None:
     monkeypatch.setenv("HEADROOM_PROTECT_READS", "1")
-    content = "def compute(value):\n    return value * 2\n" * 20
+    monkeypatch.setenv("HEADROOM_SHELL_RESULT_MIN_CHARS", "2000")
+    # Sixty source lines exceed the small-shell shortcut and reach read protection.
+    content = "".join(
+        f"def compute_{i}(value):\n"
+        "    return value * 2  # Preserve this source exactly for a later patch.\n"
+        for i in range(30)
+    )
+    assert len(content) >= 2000
     messages = [
         {"role": "user", "content": "Read the module."},
         {
@@ -162,6 +169,7 @@ def test_quiet_sed_output_reaches_read_protection(flag: str, comment: str, monke
         )
     )
     result = router.apply(messages, EstimatingTokenCounter(), protect_recent=0)
+    assert "router:shell_small_result_verbatim" not in result.transforms_applied
     assert "router:read_protected" in result.transforms_applied
     assert result.messages[2]["content"] == content
 
