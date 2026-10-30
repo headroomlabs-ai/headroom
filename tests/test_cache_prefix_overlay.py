@@ -94,6 +94,27 @@ def test_overlay_never_inflates_forwarded_payload():
     assert overlay_cached_prefix(optimized, current, previous, inflated_forwarded) == optimized
 
 
+def test_overlay_declines_an_expansion_baked_into_message_zero_when_floor_is_zero():
+    """A first-turn CCR expansion in the cached prefix is larger than the client replay.
+
+    With ``confirmed_frozen_count=0`` overlay refuses the inflated replay, so
+    the next turn forwards the unexpanded client bytes and rewrites the cache
+    from message 0. Recording the pre-injection snapshot avoids this (#4287).
+    """
+    original = [M("user", "hello")]
+    expanded = [M("user", "hello\n\n<headroom_proactive_expansion>\n" + "x" * 400)]
+    current = original + [M("user", "next")]
+    optimized = current
+    declined = overlay_cached_prefix(
+        optimized, current, original, expanded, confirmed_frozen_count=0
+    )
+    assert declined == optimized
+    replayed = overlay_cached_prefix(
+        optimized, current, original, original, confirmed_frozen_count=0
+    )
+    assert replayed[:1] == original
+
+
 def test_overlay_returns_optimized_when_json_sizing_fails(monkeypatch):
     optimized = [M("user", "stable"), M("user", "tail")]
     current = [M("user", "stable"), M("user", "tail")]
