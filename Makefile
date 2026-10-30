@@ -138,7 +138,7 @@ ci-precheck-commitlint:
 		exit 1; \
 	fi
 	npx --yes --package=@commitlint/cli --package=@commitlint/config-conventional -- \
-		commitlint --from origin/main --to HEAD --config .commitlintrc.json
+		python scripts/lint_commits.py --from origin/main --to HEAD --config .commitlintrc.json
 
 install-git-hooks:
 	@scripts/install-git-hooks.sh
