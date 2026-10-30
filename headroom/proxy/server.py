@@ -2897,6 +2897,29 @@ def _request_can_view_dashboard_metadata(
     )
 
 
+def _request_can_view_stats_metadata(
+    request: Request,
+    trusted_dashboard_client_cidrs: tuple[ipaddress.IPv4Network | ipaddress.IPv6Network, ...],
+) -> bool:
+    """Authorize per-request ``/stats`` metadata (ids, providers, models, errors).
+
+    Everything :func:`_request_can_view_dashboard_metadata` allows, plus callers
+    that proved they hold ``HEADROOM_PROXY_TOKEN``: the security gate sets
+    ``request.state.proxy_authenticated`` only after a constant-time token match.
+    That is what a dashboard fronted by an authenticating reverse proxy sends
+    (the proxy adds the token after its own sign-in). Such a caller reaches
+    ``/stats`` with a domain ``Host`` and a peer outside any trusted CIDR, so
+    the Host/CIDR rule above can never admit it, and the dashboard's
+    "Recent Requests" table stays empty. This widens what the token grants:
+    every holder sees the request metadata of every caller on this proxy
+    (docs/content/docs/security-model.mdx, "What the proxy token unlocks").
+    The settings routes and the loopback-only routes keep their own guards.
+    """
+    if getattr(request.state, "proxy_authenticated", False) is True:
+        return True
+    return _request_can_view_dashboard_metadata(request, trusted_dashboard_client_cidrs)
+
+
 def _request_has_same_origin_or_no_provenance(request: Request, host_header: str) -> bool:
     """Accept no browser provenance, otherwise require same-origin headers."""
 
@@ -5537,10 +5560,12 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
 
         ``recent_requests`` / ``request_logs`` (per-request ids, providers,
         models, errors) and ``config`` (backend + savings profile) are embedded
-        only for loopback callers — the local dashboard. Network callers still
+        only for callers :func:`_request_can_view_stats_metadata` admits:
+        loopback (the local dashboard), a trusted dashboard CIDR peer, or a
+        caller that passed the proxy token check. Other network callers still
         get the aggregate counters but never the per-request metadata.
         """
-        include_sensitive = _request_can_view_dashboard_metadata(
+        include_sensitive = _request_can_view_stats_metadata(
             request,
             trusted_dashboard_client_cidrs,
         )
@@ -5564,7 +5589,7 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
     async def stats_lifetime(request: Request):
         """Return persisted lifetime aggregates with sensitive fields gated."""
         payload = dict(proxy.metrics.savings_tracker.lifetime_response())
-        include_sensitive = _request_can_view_dashboard_metadata(
+        include_sensitive = _request_can_view_stats_metadata(
             request,
             trusted_dashboard_client_cidrs,
         )

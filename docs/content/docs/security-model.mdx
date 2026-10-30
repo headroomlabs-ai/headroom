@@ -261,13 +261,40 @@ the boundary and should say so in their own threat model.
 
 | Variable | Effect |
 |---|---|
-| `HEADROOM_PROXY_TRUSTED_DASHBOARD_CLIENT_CIDRS` | Peers in these CIDRs reach `/settings`, `/settings/schema`, `/dashboard/settings`, and the settings *writes* **without being on loopback** — and additionally see the fields `/stats` and `/stats-lifetime` otherwise withhold from network callers (per-request ids, providers, models, errors, project names, backend config). Added so the settings UI works behind a reverse proxy. |
+| `HEADROOM_PROXY_TRUSTED_DASHBOARD_CLIENT_CIDRS` | Peers in these CIDRs reach `/settings`, `/settings/schema`, `/dashboard/settings`, and the settings *writes* **without being on loopback** — and additionally see the fields `/stats` and `/stats-lifetime` otherwise withhold from network callers (per-request ids, providers, models, errors, project names, backend config). Added so the settings UI works behind a reverse proxy. A caller holding `HEADROOM_PROXY_TOKEN` sees those `/stats` fields too, but none of the settings routes; see [What the proxy token unlocks](#what-the-proxy-token-unlocks). |
 | `HEADROOM_PROXY_TRUSTED_GATEWAY_CIDRS` | Peers in these CIDRs are trusted to supply `X-Forwarded-*` headers, which is what makes the client IP the *forwarded* one rather than the gateway's. |
 
 Both parse strictly: a malformed CIDR raises at startup rather than silently emptying the
 allowlist. Note the interaction — trusting a gateway for `X-Forwarded-For` means the
 dashboard CIDR check is applied to a client-supplied header, so the two must be configured
 together and pointed at infrastructure you control.
+
+### What the proxy token unlocks
+
+With `HEADROOM_PROXY_TOKEN` set, a non-loopback caller that presents the token
+(`X-Headroom-Proxy-Token` or `Authorization: Bearer`) can use the provider routes and the
+read-only operator routes (`/stats-history`, `/quota`, `/subscription-window`, `/metrics`).
+It also sees the per-request metadata that `/stats` and `/stats-lifetime` withhold from other
+network callers, the same fields a dashboard CIDR peer sees:
+
+| Endpoint | Fields a token holder also sees |
+|---|---|
+| `/stats` (and `/stats?cached=1`) | `recent_requests` and `request_logs`: request ids, timestamps, providers, models, token counts, transforms applied, tags, error text. Never prompt or response content. Plus `config`: backend and savings profile. |
+| `/stats-lifetime` | `projects` (per-project savings) and `persistence.error` |
+
+That is what a dashboard behind an authenticating reverse proxy needs. The reverse proxy
+adds the token after its own sign-in, then reaches `/stats` with a domain `Host:` from a
+peer outside any dashboard CIDR, which the CIDR rule never admits.
+
+The token opens nothing else in this section. `/settings`, `/settings/schema`,
+`/dashboard/settings` and the settings writes still need loopback or a dashboard CIDR peer.
+The `require_loopback` routes (`/admin/*`, `/debug/*`, `/cache/clear`, `/stats/reset`,
+`/transformations/feed`, `/v1/retrieve*` and the rest listed above) still need loopback.
+
+The token is one shared secret, not a per-caller identity. Every holder sees the request
+metadata of every caller on that proxy: which models they use, their error text, their
+project names. If you hand the token to several clients that should not see each other's
+traffic metadata, run one proxy per client.
 
 ### What `POST /admin/runtime-env` can change
 

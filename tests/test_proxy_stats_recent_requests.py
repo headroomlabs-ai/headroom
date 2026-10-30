@@ -324,3 +324,49 @@ def test_read_maturation_reports_whether_it_can_fire(
     assert (payload["inert_reason"] is None) is effective
     banner = [r for r in caplog.records if r.getMessage().startswith("Read maturation:")]
     assert [r.levelname for r in banner] == [startup_level]
+
+
+@pytest.mark.parametrize("path", ["/stats?cached=1", "/stats"])
+def test_recent_requests_served_to_token_holder_behind_auth_proxy(
+    monkeypatch: pytest.MonkeyPatch, path: str
+) -> None:
+    """A dashboard fronted by an authenticating reverse proxy reaches /stats with
+    a domain Host from a non-loopback peer, carrying HEADROOM_PROXY_TOKEN. The
+    Host/CIDR rule can never admit it; the verified token must."""
+    monkeypatch.setenv("HEADROOM_PROXY_TOKEN", "s3cret-token")
+    monkeypatch.setenv("HEADROOM_HOST", "0.0.0.0")
+    app = create_app(
+        ProxyConfig(
+            optimize=False,
+            cache_enabled=False,
+            rate_limit_enabled=False,
+            cost_tracking_enabled=False,
+            log_requests=False,
+            ccr_inject_tool=False,
+            ccr_handle_responses=False,
+            ccr_context_tracking=False,
+            http2=False,
+        )
+    )
+    logger = FakeRequestLogger()
+    app.state.proxy.logger = logger
+    logger.logs = [
+        FakeLogEntry(
+            {
+                "request_id": "req-1",
+                "timestamp": "2026-10-12T10:00:00Z",
+                "provider": "anthropic",
+                "model": "claude-sonnet",
+            }
+        )
+    ]
+    token = {"x-headroom-proxy-token": "s3cret-token"}
+
+    with TestClient(app, base_url="http://headroom", client=("10.0.4.7", 5000)) as client:
+        payload = client.get(path, headers=token).json()
+        assert [r["request_id"] for r in payload["recent_requests"]] == ["req-1"]
+        assert payload["request_logs"]
+
+        # The gate still refuses callers without (or with a wrong) token.
+        assert client.get(path).status_code == 401
+        assert client.get(path, headers={"x-headroom-proxy-token": "nope"}).status_code == 401
