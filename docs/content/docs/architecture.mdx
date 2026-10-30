@@ -109,7 +109,7 @@ CCR is **on by default**. Disable the markers and the injected retrieval tool wi
 
 TOIN learns which fields matter for a given tool over repeated calls — which items get retrieved, which fields carry signal — and feeds that back into SmartCrusher's importance scoring so compression gets sharper for the tools you actually use.
 
-TOIN is **local and observation-only**: it aggregates statistics on your own machine (or your own proxy instance). Nothing about your tools or traffic is shared across users or sent off the box. For a brand-new tool type it falls back to statistical heuristics and improves as it observes more calls.
+TOIN is **local and observation-only**: it aggregates statistics on your own machine (or your own proxy instance). The learned patterns stay on your machine and are not shared across users. When the anonymous session beacon is on (the default; see [Security model](/docs/security-model#the-beacon-is-on-by-default)), a content-free structural descriptor of each tool output (bucketed field count, nesting depth, shape flags) and token counts are included in it; the same switches turn that off. For a brand-new tool type it falls back to statistical heuristics and improves as it observes more calls.
 
 ## What Headroom does not rewrite
 

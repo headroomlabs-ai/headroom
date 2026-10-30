@@ -97,7 +97,7 @@ and both the memory store and the Copilot token can be relocated independently. 
 | License cache | `<workspace>/license_cache.json` | Cached license envelope | Per envelope | No | Inherits umask |
 | Settings store | `<workspace>/settings.json`, or `$HEADROOM_SETTINGS_PATH` | Dashboard-managed knob values — **including two header maps that carry credentials**, see [The settings store](#the-settings-store) | Until deleted | No | `0600`, inherited from `mkstemp` |
 | Proxy log | `<workspace>/logs/proxy.log` + 5 rotations | INFO-level operational log, always on; carries the admin audit stream | 10 MB × 5 backups, then rotated out | No | Inherits umask |
-| Request log | Opt-in, `--log-file` / `$HEADROOM_LOG_FILE` | JSONL per-request records; **full request and response content** when `--log-messages` is on | Until deleted | No | Inherits umask |
+| Request log | Opt-in, `--log-file` / `$HEADROOM_LOG_FILE` | JSONL per-request records; **full request and response content** when `--log-messages` is on | Until deleted | No | `0600`, owner-only |
 
 The config directory is `$HEADROOM_CONFIG_DIR`, else `$HEADROOM_WORKSPACE_DIR/config`,
 else `~/.headroom/config`.
@@ -107,7 +107,7 @@ rests on filesystem permissions and on the security of the account the proxy run
 
 ### The settings store
 
-The dashboard settings GUI persists a curated set of 59 knobs to
+The dashboard settings GUI persists a curated set of 63 knobs to
 `<workspace>/settings.json`. Two of them are marked secret, and both are credential-shaped:
 `ANTHROPIC_TARGET_API_HEADERS` and `OPENAI_TARGET_API_HEADERS` are free-form JSON header
 maps merged into forwarded requests — the field's own help text gives
@@ -296,7 +296,7 @@ credential-bearing traffic through it.
 
 The settings routes are the wider surface, and they should be read as part of the same
 threat model as `/admin/*` rather than as a separate UI concern. `POST /settings`
-validates against the 59-field registry described under
+validates against the 63-field registry described under
 [The settings store](#the-settings-store) and writes the result to disk;
 `POST /settings/apply` does the same and then **restarts the proxy** so the values take
 effect (self-restarting on service deployments, returning the host command under Docker).
@@ -330,7 +330,7 @@ logger, not a file of its own, so in a default install it lands in
 
 The loopback and same-origin gates are an effective boundary against remote and
 browser-based attackers. They are not a boundary against local ones. Any process that can
-bind a loopback socket as your user can flip the seven runtime knobs, write the 59
+bind a loopback socket as your user can flip the ten runtime knobs, write the 63
 settings and restart the proxy to apply them, read `/v1/retrieve*`, and reach the debug
 routes. There is no token, no mTLS, and no per-caller authorization — the guards
 distinguish *where a request came from*, not *who sent it*.
@@ -349,11 +349,13 @@ Beyond your configured LLM providers, Headroom may contact:
 | `pypi.org` | Daily version check for update notices | On | `HEADROOM_UPDATE_CHECK=off`; also skipped in `--stateless`, in CI, and from source checkouts |
 | `huggingface.co` | Downloads models for the optional ML compression paths | On first use of those features | Pre-provision the model cache, or leave the features disabled |
 | `app.headroomlabs.ai` | License validation and usage reporting | Only with a license key configured | Omit the license key |
+| `api.anthropic.com` | Subscription usage poll (`/api/oauth/usage`) for the quota panel; sends your Claude OAuth token as a bearer credential | On, but it only polls when a token is found (`CLAUDE_CODE_OAUTH_TOKEN` or the Claude credentials file); every 300 s | `HEADROOM_NO_SUBSCRIPTION_TRACKING=1` or `HEADROOM_OFFLINE` |
+| `api.github.com` | GitHub Copilot quota poll (`/copilot_internal/user`); sends a GitHub token as a bearer credential | On, but it only polls when one of `GITHUB_COPILOT_GITHUB_TOKEN`, `GITHUB_TOKEN`, `COPILOT_GITHUB_TOKEN` or `GITHUB_COPILOT_API_TOKEN` is set; every 60 s | No dedicated switch found. Unset those variables, or use `HEADROOM_OFFLINE` |
 
 ### The beacon is on by default
 
-This is the one egress path that is enabled without any action from you, so it warrants
-its own treatment. It is governed by `HEADROOM_BEACON` and is **opt-out**
+This is the one egress path that is enabled by default whatever credentials you have, so it
+warrants its own treatment. It is governed by `HEADROOM_BEACON` and is **opt-out**
 (`BEACON_DEFAULT_ON = True`). Session summaries are POSTed to
 `https://headroom-beacon.headroom-beacon.workers.dev/v1/logs`, currently a Cloudflare
 `workers.dev` address.
@@ -371,6 +373,16 @@ snapshot — not a delta — carrying:
   latency/overhead in milliseconds, passthrough turns, and response-cache hits.
 - **Context**: request sources (`proxy` / `mcp`), the sorted provider and model names seen,
   a failure count, and those failures split by HTTP status code.
+- **Schema v2 additions** (`schema_version: 2`, additive over v1): `quality` (tokens re-read
+  because compression removed them), `hist` (fixed-bucket distributions), `shapes` (content
+  type and strategy counts, plus a bucketed structural descriptor per tool output: field
+  count rounded down to a power of two, nesting depth and shape-flag letters, never field
+  names or TOIN's structure hash), `cache` (prompt-cache hit rate by gap since the previous
+  turn), `trajectory`, `clients` (harness name and turn count), `errors` (4xx counts by
+  status), `strata` (output-shaper A/B arm and request features), and `config` (the values
+  of 15 allow-listed `HEADROOM_*` variables, each reduced to a short slug; the list is
+  `_CONFIG_ENV_KEYS` in `headroom/telemetry/session.py`). `headroom telemetry --show` prints
+  the exact payload.
 
 Alongside each report go resource attributes: a random per-install UUID, Headroom version,
 OS type, CPU architecture, and — when known — install mode and detected stack.
