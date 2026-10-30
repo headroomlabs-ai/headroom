@@ -538,6 +538,18 @@ def dashboard(port: int, no_open: bool) -> None:
     ),
 )
 @click.option(
+    "--no-ccr-response-handling",
+    is_flag=True,
+    envvar="HEADROOM_NO_CCR_RESPONSE_HANDLING",
+    help=(
+        "Disable server-side buffering of streaming responses for CCR response "
+        "handling, independent of --no-ccr. A client that offers the "
+        "headroom_retrieve tool itself (e.g. the bundled OpenCode plugin) "
+        "otherwise always takes the buffered-stream path with no opt-out "
+        "(issue #3082). Env: HEADROOM_NO_CCR_RESPONSE_HANDLING."
+    ),
+)
+@click.option(
     "--proxy-extension",
     "proxy_extension",
     multiple=True,
@@ -1178,6 +1190,7 @@ def proxy(
     lossless: bool,
     ccr_inline_resolve: bool,
     no_ccr_proactive_expansion: bool,
+    no_ccr_response_handling: bool,
     proxy_extension: tuple[str, ...],
     compressor: tuple[str, ...],
     no_subscription_tracking: bool,
@@ -1515,7 +1528,7 @@ def proxy(
         # for exactly the clients told to use it (#3082).
         ccr_inject_tool=not no_ccr,
         ccr_inject_marker=not no_ccr,
-        ccr_handle_responses=not no_ccr,
+        ccr_handle_responses=not (no_ccr or no_ccr_response_handling),
         ccr_resolve_markers_inline=ccr_inline_resolve,
         lossless=lossless,
         ccr_proactive_expansion=not no_ccr_proactive_expansion,
