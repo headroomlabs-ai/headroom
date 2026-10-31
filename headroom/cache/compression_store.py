@@ -845,6 +845,21 @@ class CompressionStore:
             self._stale_heap_entries = 0  # CRITICAL FIX: Reset stale counter
             self._stale_expiration_heap_entries = 0
 
+    def close(self) -> None:
+        """Close the storage backend and release its resources.
+
+        A shared backend (Redis) registers its guard in the module-level
+        registry; closing the store unregisters it so availability reports
+        reflect the live store lifecycle instead of a detached one.
+        """
+        with self._lock:
+            backend = getattr(self, "_backend", None)
+            if backend is not None and hasattr(backend, "close"):
+                try:
+                    backend.close()
+                except Exception:
+                    pass
+
     def _evict_if_needed(self) -> None:
         """Evict expired, then oldest live entries until below capacity.
 
@@ -1352,11 +1367,15 @@ def detach_compression_store() -> None:
     entries are left as they are: nothing is deleted from its backend, so a
     SQLite file is neither written nor emptied. Used when the proxy switches to
     stateless mode at runtime. The old backend is not closed, because code
-    that already holds the old store may still be using it.
+    that already holds the old store may still be using it; only its Redis
+    guard is unregistered, so /health and /metrics stop reporting it.
     """
     global _compression_store
 
     with _store_lock:
+        guard = getattr(getattr(_compression_store, "_backend", None), "_guard", None)
+        if guard is not None:
+            guard.close()
         _compression_store = None
 
 
@@ -1367,4 +1386,9 @@ def reset_compression_store() -> None:
     with _store_lock:
         if _compression_store is not None:
             _compression_store.clear()
+            if hasattr(_compression_store, "close"):
+                try:
+                    _compression_store.close()
+                except Exception:
+                    pass
         _compression_store = None
