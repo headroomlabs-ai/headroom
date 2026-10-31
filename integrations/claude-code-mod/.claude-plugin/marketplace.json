@@ -1,0 +1,14 @@
+{
+  "name": "headroom-mods",
+  "owner": {
+    "name": "Headroom Labs"
+  },
+  "plugins": [
+    {
+      "name": "headroom-sidebar",
+      "source": "./plugins/headroom-sidebar",
+      "description": "Live conversation compression and read-only message inspection",
+      "version": "0.1.3"
+    }
+  ]
+}

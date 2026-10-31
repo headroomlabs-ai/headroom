@@ -29,6 +29,27 @@ def _read_marketplace_versions(path: Path) -> dict[str, str]:
     if isinstance(plugins, list):
         for index, plugin in enumerate(plugins):
             if isinstance(plugin, dict):
+                if plugin.get("name") not in {"headroom", "headroom-agent-hooks"}:
+                    # Independently released local plugins follow their own
+                    # manifest, rather than the Headroom package version.
+                    source = plugin.get("source")
+                    if not isinstance(source, str):
+                        raise ValueError(
+                            f"{path}: plugin {plugin.get('name')} needs a local source"
+                        )
+                    plugin_root = (ROOT / source).resolve()
+                    if not plugin_root.is_relative_to(ROOT.resolve()):
+                        raise ValueError(f"{path}: plugin source is outside the repository")
+                    manifest = plugin_root / ".claude-plugin" / "plugin.json"
+                    with open(manifest, encoding="utf-8") as f:
+                        local = json.load(f)
+                    if local.get("name") != plugin.get("name") or local.get(
+                        "version"
+                    ) != plugin.get("version"):
+                        raise ValueError(
+                            f"{path}: plugin {plugin.get('name')} does not match {manifest}"
+                        )
+                    continue
                 versions[f"{path}:plugins[{index}]"] = str(plugin.get("version"))
     return versions
 

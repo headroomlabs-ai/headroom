@@ -68,12 +68,18 @@ def test_marketplace_entry_points_to_plugin_root() -> None:
     assert isinstance(marketplace, dict)
     plugins = marketplace["plugins"]
     assert isinstance(plugins, list)
-    plugin = plugins[0]
-    assert plugin["name"] == "headroom"
-    plugin_root = (REPO_ROOT / plugin["source"]).resolve()
-    assert plugin_root.is_dir()
-    assert (plugin_root / ".claude-plugin" / "plugin.json").is_file()
-    assert (plugin_root / "hooks" / "hooks.json").is_file()
+    assert plugins[0]["name"] == "headroom"
+    assert len({plugin["name"] for plugin in plugins}) == len(plugins)
+    for plugin in plugins:
+        plugin_root = (REPO_ROOT / plugin["source"]).resolve()
+        assert plugin_root.is_relative_to(REPO_ROOT)
+        assert plugin_root.is_dir()
+        manifest = plugin_root / ".claude-plugin" / "plugin.json"
+        assert manifest.is_file()
+        metadata = json.loads(manifest.read_text(encoding="utf-8"))
+        assert metadata["name"] == plugin["name"]
+        assert metadata["version"] == plugin["version"]
+        assert (plugin_root / "hooks" / "hooks.json").is_file()
 
 
 def test_plugin_metadata_points_to_upstream_repo() -> None:
