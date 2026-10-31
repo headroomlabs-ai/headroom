@@ -1037,7 +1037,10 @@ class LiteLLMBackend(Backend):
                     block_type = block.get("type", "")
                     if block_type == "text":
                         text_parts.append(block.get("text", ""))
-                        parts.append({"type": "text", "text": block.get("text", "")})
+                        text_part: dict[str, Any] = {"type": "text", "text": block.get("text", "")}
+                        if "cache_control" in block:
+                            text_part["cache_control"] = block["cache_control"]
+                        parts.append(text_part)
                     elif block_type == "image":
                         image_part = _anthropic_image_to_openai(block)
                         if image_part:
@@ -1131,6 +1134,11 @@ class LiteLLMBackend(Backend):
                 # assistant-turn image, which this code has always dropped.
                 if has_image and role == "user":
                     simple_msg["content"] = parts
+                elif any("cache_control" in p for p in parts):
+                    # A joined string can't carry the breakpoint: litellm's Bedrock
+                    # Converse transform only emits a cachePoint for a marked content
+                    # part, as with the tool_result and system paths.
+                    simple_msg["content"] = [p for p in parts if p["type"] == "text"]
                 if preserve_thinking and thinking_blocks and role == "assistant":
                     simple_msg["thinking_blocks"] = thinking_blocks
                 converted.append(simple_msg)
