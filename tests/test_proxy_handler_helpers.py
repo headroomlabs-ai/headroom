@@ -419,14 +419,14 @@ def test_relocate_system_messages_moves_valid_shape_for_unsupported_model(model:
 @pytest.mark.parametrize(
     ("model", "third_party_upstream", "expected"),
     [
-        ("qwen3.8-flash-next-uncensored", True, True),
+        ("qwen3.8-flash-next", True, True),
         ("glm-5.3", True, True),
         # Claude-named models behind a gateway keep the conservative hoist.
         ("claude-opus-5", True, False),
         ("anthropic/claude-sonnet-4-6", True, False),
         ("global.anthropic.claude-sonnet-5-v1:0", True, False),
         # Anthropic itself (or Vertex / a backend) keeps the model allow-list.
-        ("qwen3.8-flash-next-uncensored", False, False),
+        ("qwen3.8-flash-next", False, False),
     ],
 )
 def test_is_third_party_model(model: str, third_party_upstream: bool, expected: bool) -> None:
@@ -447,7 +447,7 @@ def test_relocate_system_messages_keeps_valid_sections_for_third_party_model() -
     ]
 
     clean, system, changed = relocate_system_messages_to_top_level(
-        messages, "base", "qwen3.8-flash-next-uncensored", third_party_model=True
+        messages, "base", "qwen3.8-flash-next", third_party_model=True
     )
 
     assert changed is False
@@ -473,7 +473,7 @@ def test_relocate_system_messages_still_moves_invalid_placement_for_third_party_
     messages: list[dict],
 ) -> None:
     clean, system, changed = relocate_system_messages_to_top_level(
-        messages, None, "qwen3.8-flash-next-uncensored", third_party_model=True
+        messages, None, "qwen3.8-flash-next", third_party_model=True
     )
 
     assert changed is True
