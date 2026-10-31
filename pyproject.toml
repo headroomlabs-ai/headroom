@@ -525,6 +525,9 @@ indent-style = "space"
 
 [tool.mypy]
 python_version = "3.11"
+# Type-check as the CI lint job does (ubuntu-latest), so the pre-commit hook
+# gives the same answer on Windows; POSIX-only os calls are guarded at runtime.
+platform = "linux"
 warn_return_any = true
 warn_unused_configs = true
 disallow_untyped_defs = true
