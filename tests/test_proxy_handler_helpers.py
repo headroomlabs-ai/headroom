@@ -20,6 +20,7 @@ from headroom.proxy.handlers.openai import (
 )
 from headroom.proxy.helpers import (
     _headroom_bypass_enabled,
+    is_third_party_model,
     relocate_system_messages_to_top_level,
 )
 from headroom.proxy.outcome import emit_request_outcome
@@ -413,6 +414,71 @@ def test_relocate_system_messages_moves_valid_shape_for_unsupported_model(model:
     assert changed is True
     assert clean == [{"role": "user", "content": "question"}]
     assert system == [{"type": "text", "text": "mid-turn instruction"}]
+
+
+@pytest.mark.parametrize(
+    ("model", "third_party_upstream", "expected"),
+    [
+        ("qwen3.8-flash-next", True, True),
+        ("glm-5.3", True, True),
+        # Claude-named models behind a gateway keep the conservative hoist.
+        ("claude-opus-5", True, False),
+        ("anthropic/claude-sonnet-4-6", True, False),
+        ("global.anthropic.claude-sonnet-5-v1:0", True, False),
+        # Anthropic itself (or Vertex / a backend) keeps the model allow-list.
+        ("qwen3.8-flash-next", False, False),
+    ],
+)
+def test_is_third_party_model(model: str, third_party_upstream: bool, expected: bool) -> None:
+    assert is_third_party_model(model, third_party_upstream=third_party_upstream) is expected
+
+
+def test_relocate_system_messages_keeps_valid_sections_for_third_party_model() -> None:
+    # #3552 kept non-text blocks in place for third-party upstreams, but text
+    # sections were still hoisted for every model there. A client that appends a
+    # section most turns changed the top-level system prompt on each request, and
+    # the upstream's prefix cache missed the whole conversation every turn.
+    messages = [
+        {"role": "user", "content": "Run the tests."},
+        {"role": "system", "content": "The user added: update the changelog too."},
+        {"role": "assistant", "content": "I will do both."},
+        {"role": "user", "content": [{"type": "tool_result", "content": "ok"}]},
+        {"role": "system", "content": "<system-reminder>todo list changed</system-reminder>"},
+    ]
+
+    clean, system, changed = relocate_system_messages_to_top_level(
+        messages, "base", "qwen3.8-flash-next", third_party_model=True
+    )
+
+    assert changed is False
+    assert clean is messages
+    assert system == "base"
+
+
+@pytest.mark.parametrize(
+    "messages",
+    [
+        # The #765 case: a system block left at messages[0] is invalid anywhere.
+        [
+            {"role": "system", "content": "You are a harness."},
+            {"role": "user", "content": "hi"},
+        ],
+        [
+            {"role": "assistant", "content": "answer"},
+            {"role": "system", "content": "You are a harness."},
+        ],
+    ],
+)
+def test_relocate_system_messages_still_moves_invalid_placement_for_third_party_model(
+    messages: list[dict],
+) -> None:
+    clean, system, changed = relocate_system_messages_to_top_level(
+        messages, None, "qwen3.8-flash-next", third_party_model=True
+    )
+
+    assert changed is True
+    assert all(message.get("role") != "system" for message in clean)
+    assert system == [{"type": "text", "text": "You are a harness."}]
 
 
 def test_relocate_system_messages_keeps_image_blocks_out_of_top_level_system() -> None:
