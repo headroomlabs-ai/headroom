@@ -10,16 +10,24 @@ PATH. `npm ci` does not support global installs, so diagnostics must also use
 `npm list --prefix /opt/wrap-tools`.
 
 After editing a CLI version in `package.json`, regenerate the lockfile using
-Node 22 and npm 11.16.0 on Linux:
+Node 24.22.1+ within the Node 24 line and npm 11.16.0 on Linux (the pinned
+OpenClaw version no longer supports Node 22):
 
 ```sh
 cd e2e/wrap/tools
 npm install --package-lock-only --no-fund --no-audit
 npm ci --no-fund --no-audit
+npm test
 cd ../../..
 docker build -f e2e/wrap/Dockerfile -t headroom-wrap-e2e .
 docker run --rm headroom-wrap-e2e
 ```
+
+`npm test` runs the Ajv URI and Express body-parser regression checks against
+the installed locked dependencies. The Dockerfile runs the same command from
+`/opt/wrap-tools` after `npm ci`, so failures stop the image build in both the
+existing Wrap E2E workflow and CI's Docker-native wrap E2E job. Their path
+filters include `e2e/**`, covering dependency and regression-test updates.
 
 To intentionally refresh transitive versions without changing the pinned CLI
 versions, use `npm update --package-lock-only --no-fund --no-audit` in this
@@ -34,4 +42,11 @@ to make a build pass.
 These are existing test tools, not new product dependencies. Codex is maintained
 by OpenAI; OpenClaw and its transitive dependencies retain their upstream
 maintainers. Their install surface includes registry downloads, native optional
-packages and lifecycle scripts, as before. Top-level CLI versions are unchanged.
+packages and lifecycle scripts, as before. OpenClaw 2026.10.6 and its fixed
+Undici override follow the upstream #4453 security repair.
+
+The raw audit still reports npm 12.2.1's bundled ip-address and Undici copies.
+`npm-audit-exceptions.json` records the upstream-approved E2E-only risk
+acceptance, restricted to exact advisory/path/version combinations and expiring
+on 2026-11-15. Security CI rejects other findings and expired or stale entries;
+these exceptions are not a claim that the contained packages are patched.

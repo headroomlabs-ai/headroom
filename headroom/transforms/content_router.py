@@ -360,9 +360,18 @@ def _invoke_smart_crusher(router: ContentRouter, inp: CompressInput) -> str | No
     crusher = router._get_smart_crusher()
     if crusher is None:
         return None
+    # F2.2: the router never calls ``crusher.apply()``, so the crusher's own
+    # policy field stays None. Forward the request's TOIN read-only gate per
+    # call instead (the crusher is shared across concurrent requests). The
+    # kwarg is only sent when gating, so crushers exposing the plain
+    # ``crush(content, query, bias)`` signature keep working.
+    policy = router._runtime_compression_policy
+    gate: dict[str, bool] = {}
+    if policy is not None and policy.toin_read_only:
+        gate["record_toin"] = False
     # ``_get_*`` getters are typed ``Any``; pin the result to the contract type.
     compressed: str = crusher.crush(
-        inp.content, query=inp.query, bias=_adapter_bias(inp)
+        inp.content, query=inp.query, bias=_adapter_bias(inp), **gate
     ).compressed
     return compressed
 
@@ -594,6 +603,24 @@ def _external_compressor_matches(descriptor: CompressorDescriptor, content_mime:
     top = content_mime.split("/", 1)[0]
     type_wildcard = f"{top}/*"
     return any(d in ("*", "*/*") or d == type_wildcard for d in declared)
+
+
+def _malformed_tool_call_ids(messages: list[dict[str, Any]]) -> set[str]:
+    """Ids of OpenAI tool calls whose ``function`` is not an object.
+
+    Such a call has no readable tool name, so its result cannot be classified;
+    it is passed through like a verbatim-excluded tool rather than compressed.
+    """
+    ids: set[str] = set()
+    for msg in messages:
+        if msg.get("role") != "assistant":
+            continue
+        for tc in msg.get("tool_calls") or []:
+            if isinstance(tc, dict) and not isinstance(tc.get("function"), dict):
+                tc_id = tc.get("id")
+                if isinstance(tc_id, str) and tc_id:
+                    ids.add(tc_id)
+    return ids
 
 
 def _tool_call_args_text(raw: Any) -> str:
@@ -2113,6 +2140,30 @@ def _is_small_mcp_result(tool_name: Any, text: Any) -> bool:
     )
 
 
+def _shell_result_min_chars() -> int:
+    """Below this many characters a shell tool result is never lossily compressed."""
+    try:
+        return max(0, int(os.environ.get("HEADROOM_SHELL_RESULT_MIN_CHARS", "2000")))
+    except ValueError:
+        return 2000
+
+
+def _is_small_shell_result(tool_name: Any, text: Any, bash_tool_names: frozenset[str]) -> bool:
+    """True when ``text`` is a short shell result that must not be lossily compressed.
+
+    A 200-token ``ls -la``, ``git status``, or JSON dump is cheap to keep and
+    expensive to get wrong: lossy compression can leave a numbers-only blob
+    that still looks structured, so the model treats it as data instead of
+    retrying the command (issue #3590). Large build/test logs still take the
+    lossy path. ``HEADROOM_SHELL_RESULT_MIN_CHARS=0`` restores the old
+    behaviour.
+    """
+    if not isinstance(text, str) or not text:
+        return False
+    name = str(tool_name or "").lower()
+    return name in bash_tool_names and len(text) < _shell_result_min_chars()
+
+
 @dataclass
 class ContentRouterConfig:
     """Configuration for intelligent content routing.
@@ -2317,8 +2368,22 @@ class ContentRouterConfig:
     # BUT a read-only *search* run through them (grep/rg/git grep) yields byte-
     # losslessly foldable output — folded instead of lossy-compressed. See
     # ``_bash_search_fold``. Config so new harness tool names / search programs
-    # can be added without code changes.
-    bash_tool_names: frozenset[str] = frozenset({"bash", "shell", "local_shell"})
+    # can be added without code changes. The aliases mirror
+    # ``headroom.learn._shared._TOOL_NAME_MAP`` so the same harnesses are
+    # covered here.
+    bash_tool_names: frozenset[str] = frozenset(
+        {
+            "bash",
+            "shell",
+            "local_shell",
+            "run_shell_command",
+            "execute_command",
+            "exec_command",
+            "terminal",
+            "run_command",
+            "run_terminal_command",
+        }
+    )
     bash_search_commands: frozenset[str] = frozenset(
         {"grep", "egrep", "fgrep", "rg", "ripgrep", "ag", "ack"}
     )
@@ -2348,6 +2413,12 @@ class ContentRouterConfig:
     # Group search-compressor output by file (`rg --heading` style).
     # Default False; the proxy enables it in token mode.
     search_group_by_file: bool = False
+
+    def __post_init__(self) -> None:
+        # Normalize once so the per-message shell check stays a set lookup.
+        self.bash_tool_names = frozenset(
+            name.lower() for name in self.bash_tool_names if isinstance(name, str)
+        )
 
 
 @dataclass
@@ -3716,6 +3787,31 @@ class ContentRouter(Transform):
 
         return cand, f"lossless_{kind}"
 
+    @staticmethod
+    def _validate_provider_output(supplied: Any) -> tuple[str, str] | None:
+        """Contract check shared by the general and excluded-tool provider paths.
+
+        Returns ``(candidate, safe_kind)`` or ``None`` ("ignore"). Never raises.
+        """
+        if supplied is None:
+            return None
+        if not isinstance(supplied, tuple | list) or len(supplied) != 2:
+            logger.debug("lossless provider returned a malformed result; ignoring")
+            return None
+        if not isinstance(supplied[0], str) or not isinstance(supplied[1], str):
+            logger.debug("lossless provider returned non-str members; ignoring")
+            return None
+        # An empty / whitespace-only "fold" wins every length comparison and
+        # would silently delete the block's content. That is not lossless.
+        if not supplied[0].strip():
+            logger.debug("lossless provider returned an empty result; ignoring")
+            return None
+        # fullmatch, not match: Python's `$` also matches just BEFORE a
+        # trailing newline, so `re.match` would let "log\n" through and
+        # put a newline into a metric label.
+        kind = supplied[1] if _PROVIDER_KIND_RE.fullmatch(supplied[1]) else _PROVIDER_KIND_FALLBACK
+        return (supplied[0], kind)
+
     def _lossless_provider_result(self, content: str) -> tuple[str, str] | None:
         """Validated + memoized ``(candidate, safe_kind)`` from the provider.
 
@@ -3746,29 +3842,7 @@ class ContentRouter(Transform):
 
         result: tuple[str, str] | None = None
         try:
-            supplied = provider(content)
-            if supplied is None:
-                result = None
-            # Validate defensively *inside* the try: unpacking a 3-tuple / a bare
-            # string / a non-sequence raises, and that exception used to escape
-            # all the way out of the request.
-            elif not isinstance(supplied, tuple | list) or len(supplied) != 2:
-                logger.debug("lossless provider returned a malformed result; ignoring")
-            elif not isinstance(supplied[0], str) or not isinstance(supplied[1], str):
-                logger.debug("lossless provider returned non-str members; ignoring")
-            # An empty / whitespace-only "fold" wins every length comparison and
-            # would silently delete the block's content. That is not lossless.
-            elif not supplied[0].strip():
-                logger.debug("lossless provider returned an empty result; ignoring")
-            else:
-                raw_kind = supplied[1]
-                # fullmatch, not match: Python's `$` also matches just BEFORE a
-                # trailing newline, so `re.match` would let "log\n" through and
-                # put a newline into a metric label.
-                kind = (
-                    raw_kind if _PROVIDER_KIND_RE.fullmatch(raw_kind) else _PROVIDER_KIND_FALLBACK
-                )
-                result = (supplied[0], kind)
+            result = self._validate_provider_output(provider(content))
         except Exception:  # noqa: BLE001 - a broken provider must not break routing
             logger.debug("lossless provider failed in _lossless_first", exc_info=True)
             result = None
@@ -5788,7 +5862,9 @@ class ContentRouter(Transform):
             for tc in msg.get("tool_calls") or []:
                 if isinstance(tc, dict):
                     tc_id = tc.get("id", "")
-                    fn = tc.get("function", {})
+                    fn = tc.get("function")
+                    if not isinstance(fn, dict):  # "function": null / non-object
+                        continue
                     name = fn.get("name", "")
                     call_args = fn.get("arguments")
                     if name:
@@ -6140,6 +6216,9 @@ class ContentRouter(Transform):
             for tool_id, name in tool_name_map.items()
             if is_tool_excluded(name, exclude_tools)
         }
+        # A call with no readable name keeps its result untouched, as it was
+        # before such calls stopped raising out of apply().
+        excluded_tool_ids |= _malformed_tool_call_ids(messages)
 
         # CCR-retrieve tool IDs, precomputed once (mirrors excluded_tool_ids
         # above, rather than calling is_tool_excluded() per message/block). A
@@ -6311,6 +6390,7 @@ class ContentRouter(Transform):
             "ccr_retrieve": 0,
             "user_msg": 0,
             "small": 0,
+            "shell_small_result": 0,
             "recent_code": 0,
             "analysis_ctx": 0,
             "ratio_too_high": 0,
@@ -6534,7 +6614,7 @@ class ContentRouter(Transform):
             if role == "tool":
                 if tool_call_id in excluded_tool_ids:
                     tool_name = tool_name_map.get(tool_call_id, "")
-                    if tool_name and is_tool_excluded(tool_name, DEFAULT_VERBATIM_EXCLUDE_TOOLS):
+                    if not tool_name or is_tool_excluded(tool_name, DEFAULT_VERBATIM_EXCLUDE_TOOLS):
                         result_slots[i] = message
                         transforms_applied.append("router:excluded:tool")
                         route_counts["excluded_tool"] += 1
@@ -6598,6 +6678,36 @@ class ContentRouter(Transform):
                     )
                     if collect_diagnostics:
                         _diag[i] = "compressed:bash_lossless_search"
+                    continue
+
+                # Small shell results stay verbatim (#3590). A short `ls`,
+                # `git status`, or JSON dump is cheap to keep; lossy
+                # compression can leave a numbers-only blob that still looks
+                # structured, so the model treats it as data instead of
+                # retrying. Large build/test logs still take the lossy path.
+                if _is_small_shell_result(tool_name, content, self.config.bash_tool_names):
+                    result_slots[i] = message
+                    transforms_applied.append("router:shell_small_result_verbatim")
+                    route_counts["shell_small_result"] = (
+                        route_counts.get("shell_small_result", 0) + 1
+                    )
+                    if collect_diagnostics:
+                        _diag[i] = "protected:shell_small_result"
+                    continue
+
+            # Legacy OpenAI `role:"function"` carries the tool name on the
+            # message itself, not in a tool_call_id. Resolve it directly so the
+            # small-shell floor also covers this wire shape (#3590 review).
+            if role == "function":
+                function_name = message.get("name", "")
+                if _is_small_shell_result(function_name, content, self.config.bash_tool_names):
+                    result_slots[i] = message
+                    transforms_applied.append("router:shell_small_result_verbatim")
+                    route_counts["shell_small_result"] = (
+                        route_counts.get("shell_small_result", 0) + 1
+                    )
+                    if collect_diagnostics:
+                        _diag[i] = "protected:shell_small_result"
                     continue
 
             # Read protection (ROLE / SHAPE-AGNOSTIC). An observation produced by
@@ -7239,7 +7349,7 @@ class ContentRouter(Transform):
             try:
                 # A registered provider is authoritative for excluded-tool
                 # compaction; fall back to the built-in folds only if it raises.
-                return provider(content)
+                return self._validate_provider_output(provider(content))
             except Exception:  # noqa: BLE001
                 logger.debug(
                     "lossless provider failed; using built-in compaction",
@@ -7569,6 +7679,21 @@ class ContentRouter(Transform):
         any_compressed = False
         role = message.get("role", "")
 
+        # Top-level text blocks are fragments of one tool result. Measure the
+        # whole result so splitting a large log cannot activate the small-result
+        # floor for every fragment. Sum lengths without copying the payload.
+        shell_result_chars = (
+            sum(
+                len(block["text"])
+                for block in content_blocks
+                if isinstance(block, dict)
+                and block.get("type") == "text"
+                and isinstance(block.get("text"), str)
+            )
+            if role in ("tool", "function")
+            else 0
+        )
+
         # Role-based gate for `text` blocks. Tool/function roles are tool
         # outputs and compress freely; assistant defaults to skip (cache
         # safety) with explicit opt-in; unknown roles default to skip.
@@ -7663,7 +7788,7 @@ class ContentRouter(Transform):
                     continue
                 if tool_use_id in excluded_tool_ids:
                     tool_name = tool_name_map.get(tool_use_id, "") if tool_name_map else ""
-                    if tool_name and is_tool_excluded(tool_name, DEFAULT_VERBATIM_EXCLUDE_TOOLS):
+                    if not tool_name or is_tool_excluded(tool_name, DEFAULT_VERBATIM_EXCLUDE_TOOLS):
                         new_blocks.append(block)
                         transforms_applied.append("router:excluded:tool")
                         if route_counts is not None:
@@ -7767,6 +7892,18 @@ class ContentRouter(Transform):
                     any_compressed = True
                     continue
 
+                # Small shell results stay verbatim (#3590), same contract as
+                # the string-form path above. Build/test logs above the floor
+                # still go through lossy compression.
+                if _is_small_shell_result(tool_name, tool_text, self.config.bash_tool_names):
+                    new_blocks.append(block)
+                    transforms_applied.append("router:shell_small_result_verbatim")
+                    if route_counts is not None:
+                        route_counts["shell_small_result"] = (
+                            route_counts.get("shell_small_result", 0) + 1
+                        )
+                    continue
+
                 # Protection: failed tool calls / error outputs stay verbatim
                 # (issue #847). `is_error` is Anthropic's explicit failure
                 # flag and suffices alone; the indicator scan catches error
@@ -7863,6 +8000,29 @@ class ContentRouter(Transform):
                         transforms_applied.append("router:excluded:ccr_retrieve")
                         if route_counts is not None:
                             route_counts["ccr_retrieve"] = route_counts.get("ccr_retrieve", 0) + 1
+                        continue
+
+                    # A normalized tool/function message can carry its output
+                    # as top-level text blocks rather than a tool_result
+                    # wrapper. Apply the same small-shell floor here (#3590
+                    # review).
+                    _shell_name = (
+                        (tool_name_map or {}).get(_msg_tool_id, "")
+                        if role == "tool"
+                        else message.get("name", "")
+                    )
+                    if (
+                        _is_small_shell_result(
+                            _shell_name, block.get("text", ""), self.config.bash_tool_names
+                        )
+                        and shell_result_chars < _shell_result_min_chars()
+                    ):
+                        new_blocks.append(block)
+                        transforms_applied.append("router:shell_small_result_verbatim")
+                        if route_counts is not None:
+                            route_counts["shell_small_result"] = (
+                                route_counts.get("shell_small_result", 0) + 1
+                            )
                         continue
                 text_content = block.get("text", "")
                 if isinstance(text_content, str) and (

@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import pytest
+
 from headroom.config import DEFAULT_EXCLUDE_TOOLS
 from headroom.proxy.server import HeadroomProxy, ProxyConfig
 from headroom.transforms.content_detector import ContentType
@@ -159,7 +161,11 @@ def test_web_tool_results_skip_cross_turn_dedup() -> None:
     assert second["content"] == payload  # type: ignore[index]
 
 
-def test_bash_remains_compressible() -> None:
+@pytest.mark.parametrize("repetitions, expected_calls", [(100, 0), (200, 1)])
+def test_bash_compression_respects_small_result_floor(
+    monkeypatch: pytest.MonkeyPatch, repetitions: int, expected_calls: int
+) -> None:
+    monkeypatch.setenv("HEADROOM_SHELL_RESULT_MIN_CHARS", "2000")
     router = _router()
     calls = 0
 
@@ -177,8 +183,11 @@ def test_bash_remains_compressible() -> None:
         )
 
     router.compress = fake_compress  # type: ignore[method-assign]
-    payload = "bash output " * 100
+    payload = "bash output " * repetitions
     result = router.apply(_messages("Bash", payload), _Tokenizer())
 
-    assert calls == 1
+    assert calls == expected_calls
     assert "router:excluded:tool" not in result.transforms_applied
+    assert ("router:shell_small_result_verbatim" in result.transforms_applied) is (
+        expected_calls == 0
+    )

@@ -373,6 +373,34 @@ def _call_openai_transport(
     return response
 
 
+def _call_anthropic_create_transport(
+    client: Any,
+    *,
+    model: str,
+    messages: list[dict[str, Any]],
+    stream: bool,
+    metrics: Any,
+    **kwargs: Any,
+) -> Any:
+    if stream:
+        response = client._original.messages.create(
+            model=model,
+            messages=messages,
+            stream=True,
+            **kwargs,
+        )
+        return client._wrap_stream(response, metrics)
+
+    return _call_anthropic_transport(
+        client,
+        model=model,
+        messages=messages,
+        stream=False,
+        metrics=metrics,
+        **kwargs,
+    )
+
+
 def _call_anthropic_transport(
     client: Any,
     *,
@@ -409,6 +437,7 @@ def _call_anthropic_transport(
 _ClientTransport = Callable[..., Any]
 _CLIENT_TRANSPORTS: dict[str, _ClientTransport] = {
     "anthropic": _call_anthropic_transport,
+    "anthropic_create": _call_anthropic_create_transport,
     "openai": _call_openai_transport,
 }
 
