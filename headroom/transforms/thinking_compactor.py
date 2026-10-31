@@ -238,6 +238,7 @@ def compact_reasoning_openai_chat(
     keep_last_turns: int = 1,
     min_words: int = 40,
     drop: bool = False,
+    drop_first_turns: int = 0,
 ) -> tuple[list[dict[str, Any]], dict[str, int]]:
     """Compact plain-text reasoning in OpenAI-chat messages (Kimi / GLM / DeepSeek-R1).
 
@@ -252,27 +253,46 @@ def compact_reasoning_openai_chat(
     ``drop=False`` (warm): Kompress the reasoning (deterministic → cache-stable).
     ``drop=True`` (cold-prefix hook): remove the reasoning outright — the full
     block, not just ~15% — safe because the cold turn re-caches from scratch.
+
+    ``drop_first_turns`` (sticky drop): the first ``drop_first_turns`` assistant
+    turns (0-based ordinal, excluding the kept last turns) use the DROP path even
+    on a warm turn, so a turn that was dropped on a prior cold turn is dropped
+    again rather than re-Kompressed — keeping the forwarded prefix byte-identical
+    to the cached cold-turn prefix (#4548). ``dropped_upto`` in the returned stats
+    is (highest dropped ordinal + 1), or 0 when nothing was dropped.
+
     Shape-driven — no model gate; no-ops when no plain-text reasoning is present
     (OpenAI's encrypted models, Kimi k2.6). Keeps the last ``keep_last_turns``
     assistant turns intact (the active reasoning the model uses). Never raises.
     """
-    stats = {"turns_compacted": 0, "blocks": 0, "words_before": 0, "words_after": 0}
-    if kompress is None and not drop:  # drop needs no compressor
+    stats = {
+        "turns_compacted": 0,
+        "blocks": 0,
+        "words_before": 0,
+        "words_after": 0,
+        "dropped_upto": 0,
+    }
+    if kompress is None and not drop and drop_first_turns == 0:
         return messages, stats
     asst_indices = [i for i, m in enumerate(messages) if m.get("role") == "assistant"]
     keep = set(asst_indices[-keep_last_turns:]) if keep_last_turns > 0 else set()
+    ordinal_of = {idx: o for o, idx in enumerate(asst_indices)}
 
     out: list[dict[str, Any]] = []
     for i, m in enumerate(messages):
         if m.get("role") != "assistant" or i in keep:
             out.append(m)
             continue
+        ordinal = ordinal_of[i]
+        # Sticky drop: turns dropped on a prior cold turn are dropped again on
+        # the next warm turn so the prefix stays byte-identical to the cache.
+        use_drop = drop or (ordinal < drop_first_turns)
         changed = False
         nm = dict(m)
         # (1) Kimi: reasoning_content field (plain text, no signature → editable)
         rc = m.get("reasoning_content")
         if isinstance(rc, str) and len(rc.split()) >= min_words:
-            if drop:  # cold hook: drop the whole reasoning block
+            if use_drop:  # cold hook: drop the whole reasoning block
                 nm["reasoning_content"] = ""
                 changed = True
                 stats["blocks"] += 1
@@ -288,7 +308,7 @@ def compact_reasoning_openai_chat(
         # (2) GLM / DeepSeek-R1: inline <think>…</think> in string content
         c = m.get("content")
         if isinstance(c, str) and "<think>" in c:
-            new_c, b, wb, wa = _compact_think_spans(c, kompress, min_words, drop=drop)
+            new_c, b, wb, wa = _compact_think_spans(c, kompress, min_words, drop=use_drop)
             if b:
                 nm["content"] = new_c
                 changed = True
@@ -297,6 +317,8 @@ def compact_reasoning_openai_chat(
                 stats["words_after"] += wa
         if changed:
             stats["turns_compacted"] += 1
+            if use_drop:
+                stats["dropped_upto"] = max(stats["dropped_upto"], ordinal + 1)
             out.append(nm)
         else:
             out.append(m)

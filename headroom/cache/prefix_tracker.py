@@ -1235,12 +1235,21 @@ class PrefixCacheTracker:
         self._tokens_preserved: int = 0
         self._compression_foregone_tokens: int = 0
 
+        # Sticky reasoning-drop floor (#4548): on a cold turn the OpenAI reasoning
+        # compactor drops non-kept prior turns outright (safe — the cold turn
+        # re-caches from scratch). The next warm turn must DROP those same turns
+        # again instead of re-Kompressing them, or the forwarded prefix no longer
+        # matches the cached cold-turn prefix and the cache misses. This is the
+        # highest assistant ordinal dropped + 1, i.e. the count of leading
+        # non-kept turns to keep dropped on subsequent warm turns.
+        self.reasoning_drop_upto: int = 0
+
     def get_frozen_message_count(self) -> int:
         """How many leading messages to skip compression on the next turn.
 
         Returns 0 on turn 0 (cold start) or if caching is disabled/below threshold.
         """
-        turn_number, cached_tokens, cached_messages, _, _ = self._request_turn_state()
+        turn_number, cached_tokens, cached_messages, *_ = self._request_turn_state()
         if not self.config.enabled:
             return 0
         if turn_number == 0:
@@ -1327,6 +1336,7 @@ class PrefixCacheTracker:
             self._cached_message_count,
             self._last_original_messages,
             self._last_forwarded_messages,
+            self.reasoning_drop_upto,
         )
 
     def _request_turn_state(self) -> tuple[Any, ...]:
@@ -1364,6 +1374,7 @@ class PrefixCacheTracker:
                 self._cached_message_count,
                 self._last_original_messages,
                 self._last_forwarded_messages,
+                self.reasoning_drop_upto,
             ) = state
 
     def record_returned(
@@ -1671,13 +1682,18 @@ def _deref(table: list[Any], refs: list[int]) -> list[Any]:
 
 
 def _decode_turn_state(table: list[Any], state: list[Any]) -> tuple[Any, ...]:
-    turn, cached_tokens, cached_messages, original, forwarded = state
+    if len(state) >= 6:
+        turn, cached_tokens, cached_messages, original, forwarded, drop_upto = state
+    else:
+        turn, cached_tokens, cached_messages, original, forwarded = state
+        drop_upto = 0
     return (
         int(turn),
         int(cached_tokens),
         int(cached_messages),
         _deref(table, original),
         _deref(table, forwarded),
+        int(drop_upto),
     )
 
 
@@ -2192,7 +2208,7 @@ class SessionTrackerStore:
             return memo[id(messages)]
 
         def state(s: tuple[Any, ...]) -> list[Any]:
-            return [s[0], s[1], s[2], ref(s[3]), ref(s[4])]
+            return [s[0], s[1], s[2], ref(s[3]), ref(s[4]), s[5]]
 
         maturation = tracker.read_maturation_manager
         meta = {
@@ -2264,6 +2280,7 @@ class SessionTrackerStore:
             tracker._cached_message_count,
             tracker._last_original_messages,
             tracker._last_forwarded_messages,
+            tracker.reasoning_drop_upto,
         ) = _decode_turn_state(table, meta["state"])
         tracker._turn_states = {int(t): _decode_turn_state(table, s) for t, s in meta["turns"]}
         tracker.restored_from_disk = True
