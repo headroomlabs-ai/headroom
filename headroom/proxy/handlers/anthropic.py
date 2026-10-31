@@ -66,6 +66,7 @@ from headroom.proxy.handlers._failure_logging import log_hook_failure, log_reque
 from headroom.proxy.helpers import (
     extract_tags,
     invalid_request_body_message,
+    is_third_party_model,
     relocate_system_messages_to_top_level,
     sanitize_forwarded_response_headers,
 )
@@ -3752,6 +3753,8 @@ class AnthropicHandlerMixin:
             # compression). Anthropic rejects that with a 400 ("messages.0: use
             # the top-level 'system' parameter ..."), so relocate it back to the
             # top-level ``system`` parameter as the last step before forwarding.
+            # A non-Claude model on a third-party upstream (configured target or
+            # per-request base URL) keeps the client's valid sections in place.
             relocated_messages, relocated_system, system_relocated = (
                 relocate_system_messages_to_top_level(
                     body["messages"],
@@ -3764,6 +3767,12 @@ class AnthropicHandlerMixin:
                             or _is_googleapis_endpoint(upstream_base_url)
                         )
                         else None
+                    ),
+                    third_party_model=is_third_party_model(
+                        model,
+                        third_party_upstream=bool(
+                            upstream_base_url or _third_party_anthropic_upstream
+                        ),
                     ),
                 )
             )
