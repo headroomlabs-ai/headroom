@@ -1620,13 +1620,30 @@ def _compression_cache_budget_bytes() -> int:
     return max(1, int(mb * 1024 * 1024))
 
 
-def content_cache_key(content: str, target_ratio: float | None, gated: bool = False) -> str:
-    """The compression cache's key for ``content``: a digest, the same in every
-    process, so the disk tier (and replicas sharing it) can use it. The runtime
-    target ratio is part of it (a different ratio is a different result), and so
-    is the reversibility gate tool output passes (#1307)."""
+def content_cache_key(
+    content: str,
+    target_ratio: float | None,
+    gated: bool = False,
+    *,
+    kompress_model: str | None = None,
+    force_kompress: bool = False,
+    skip_kompress: bool = False,
+    bias: float = 1.0,
+    context: str = "",
+) -> str:
+    """A process-stable digest of content and the policy used to compress it.
+
+    Results, skips and frozen verdicts must not cross request-policy boundaries.
+    JSON frames the policy fields unambiguously, including arbitrary context and
+    model strings, before the content bytes (also used by the shared disk tier).
+    """
     h = hashlib.blake2b(digest_size=16)
-    h.update(f"{target_ratio!r}|{int(gated)}|".encode())
+    h.update(
+        json.dumps(
+            [target_ratio, gated, kompress_model, force_kompress, skip_kompress, bias, context],
+            separators=(",", ":"),
+        ).encode("utf-8")
+    )
     h.update(content.encode("utf-8", "surrogatepass"))
     return h.hexdigest()
 
@@ -6845,14 +6862,14 @@ class ContentRouter(Transform):
             # Two-tier compression cache.
             # Tier 1 (skip): known won't-compress → instant skip.
             # Tier 2 (result): known compresses → reuse compressed text.
-            # Key on the runtime target_ratio too: the same content compressed at
-            # a different ratio is a different result, so it must not alias.
+            # Key on the request policy and effective compressor inputs too:
+            # identical content can produce different results under each.
             # Tool ground truth is gated against lossy-unrecoverable results below
             # (#1307). Partition its cache namespace so a gated tool entry is never
             # served from — or poisons — an ungated entry for byte-identical content.
             enforce_reversibility = role == "tool"
-            content_key = content_cache_key(
-                content, getattr(self, "_runtime_target_ratio", None), gated=enforce_reversibility
+            content_key = self._content_cache_key(
+                content, gated=enforce_reversibility, bias=msg_bias, context=context
             )
 
             # Tier 1: skip set — instant rejection
@@ -7417,6 +7434,21 @@ class ContentRouter(Transform):
             return None
         return folded if len(folded) < len(content) else None
 
+    def _content_cache_key(
+        self, content: str, *, gated: bool = False, bias: float = 1.0, context: str = ""
+    ) -> str:
+        """Scope all message shapes to this request's compression policy."""
+        return content_cache_key(
+            content,
+            self._runtime_target_ratio,
+            gated=gated,
+            kompress_model=self._runtime_kompress_model,
+            force_kompress=self._runtime_force_kompress,
+            skip_kompress=self._runtime_skip_kompress,
+            bias=bias,
+            context=context,
+        )
+
     def _get_tool_bias(self, tool_name: str) -> float:
         """Look up compression bias for a tool name.
 
@@ -7944,8 +7976,8 @@ class ContentRouter(Transform):
                     # Two-tier compression cache → shared helper
                     compressed_content, was_compressed = self._compress_block_content(
                         content=tool_text,
-                        content_key=content_cache_key(
-                            tool_text, getattr(self, "_runtime_target_ratio", None)
+                        content_key=self._content_cache_key(
+                            tool_text, bias=bias, context=block_context
                         ),
                         context=block_context,
                         bias=bias,
@@ -8039,8 +8071,8 @@ class ContentRouter(Transform):
                     # Two-tier compression cache → shared helper
                     compressed_content, _was_compressed = self._compress_block_content(
                         content=text_content,
-                        content_key=content_cache_key(
-                            text_content, getattr(self, "_runtime_target_ratio", None)
+                        content_key=self._content_cache_key(
+                            text_content, bias=1.0, context=context
                         ),
                         context=context,
                         bias=1.0,
