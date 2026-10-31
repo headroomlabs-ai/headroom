@@ -4,6 +4,7 @@ import asyncio
 import inspect
 import threading
 import time
+from pathlib import Path
 
 import pytest
 
@@ -122,6 +123,134 @@ def _interference_worker(
     return [{"role": "user", "content": "compressed:" + str(messages[-1]["content"])}], {
         "technique": "preserve"
     }
+
+
+def _queued_abandon_worker(
+    messages: list[dict[str, object]],
+    provider: str,
+    deadline: float | None = None,
+) -> tuple[list[dict[str, object]], dict[str, object] | None]:
+    payload = messages[-1]["content"]
+    if not isinstance(payload, dict):
+        raise TypeError(f"expected coordination payload, got {type(payload)!r}")
+    kind = payload["kind"]
+    if kind == "peer":
+        Path(str(payload["started"])).write_text("1", encoding="utf-8", newline="\n")
+        release = Path(str(payload["release"]))
+        give_up = time.time() + 15
+        while not release.exists() and time.time() < give_up:
+            time.sleep(0.01)
+        Path(str(payload["done"])).write_text("1", encoding="utf-8", newline="\n")
+        return [{"role": "user", "content": "compressed:peer"}], {"technique": "preserve"}
+    if kind == "filler":
+        return [{"role": "user", "content": "compressed:filler"}], {"technique": "preserve"}
+    if kind == "target":
+        Path(str(payload["ran"])).write_text("1", encoding="utf-8", newline="\n")
+        return [{"role": "user", "content": "compressed:target"}], {"technique": "preserve"}
+    raise RuntimeError(f"unknown kind:{kind}")
+
+
+@pytest.mark.parametrize("abandon", ["timeout", "cancel"])
+async def test_abandoned_queued_job_never_runs_while_peer_completes(
+    monkeypatch, tmp_path, abandon: str
+) -> None:
+    # A timeout or caller cancel used to complete only the private waiter, so
+    # the still-queued executor job could run after the request already failed
+    # open. Isolation correctly refuses to tear down the pool while a peer is
+    # inflight; this call's pending future must still be cancelled so the
+    # abandoned job never runs and the unrelated peer still finishes.
+    monkeypatch.setattr(image_isolation, "_IMAGE_WORKER", _queued_abandon_worker)
+
+    started = tmp_path / "peer-started"
+    release = tmp_path / "peer-release"
+    done = tmp_path / "peer-done"
+    ran = tmp_path / "target-ran"
+    peer_msgs = [
+        {
+            "role": "user",
+            "content": {
+                "kind": "peer",
+                "started": str(started),
+                "release": str(release),
+                "done": str(done),
+            },
+        }
+    ]
+    target_msgs = [{"role": "user", "content": {"kind": "target", "ran": str(ran)}}]
+    # ProcessPoolExecutor prefetches max_workers + 1 items onto its call
+    # queue and marks those futures running, which makes cancel() a no-op.
+    # Queue fillers so the abandoned target stays pending behind that prefetch.
+    filler_count = 3
+
+    loop = asyncio.get_running_loop()
+    real_run_in_executor = loop.run_in_executor
+    executor_futures: list[asyncio.Future[object]] = []
+
+    def _track_run_in_executor(*args: object, **kwargs: object):
+        future = real_run_in_executor(*args, **kwargs)
+        executor_futures.append(future)
+        return future
+
+    monkeypatch.setattr(loop, "run_in_executor", _track_run_in_executor)
+
+    peer_task = asyncio.create_task(
+        image_isolation.run_image_compression_isolated(peer_msgs, provider="openai", timeout=15.0)
+    )
+    deadline = time.time() + 5
+    while not started.exists() and time.time() < deadline:
+        await asyncio.sleep(0.01)
+    assert started.exists(), "peer never occupied the shared worker"
+
+    filler_tasks = [
+        asyncio.create_task(
+            image_isolation.run_image_compression_isolated(
+                [{"role": "user", "content": {"kind": "filler", "n": n}}],
+                provider="openai",
+                timeout=15.0,
+            )
+        )
+        for n in range(filler_count)
+    ]
+    target_task = asyncio.create_task(
+        image_isolation.run_image_compression_isolated(
+            target_msgs,
+            provider="openai",
+            timeout=0.05 if abandon == "timeout" else 15.0,
+        )
+    )
+    expected_jobs = 1 + filler_count + 1
+    submitted = time.time() + 5
+    while len(executor_futures) < expected_jobs and time.time() < submitted:
+        await asyncio.sleep(0.01)
+    assert len(executor_futures) >= expected_jobs
+    target_future = executor_futures[-1]
+    assert not target_future.done()
+
+    if abandon == "timeout":
+        target_returned, target_result = await target_task
+        assert target_returned is target_msgs
+        assert target_result is None
+    else:
+        target_task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await target_task
+
+    assert target_future.cancelled()
+    assert not ran.exists()
+
+    release.write_text("1", encoding="utf-8", newline="\n")
+    peer_returned, peer_result = await peer_task
+    assert peer_returned[-1]["content"] == "compressed:peer"
+    assert peer_result == {"technique": "preserve"}
+    assert not executor_futures[0].cancelled()
+
+    for filler_returned, filler_result in await asyncio.gather(*filler_tasks):
+        assert filler_returned[-1]["content"] == "compressed:filler"
+        assert filler_result == {"technique": "preserve"}
+
+    await asyncio.sleep(0.2)
+    assert not ran.exists()
+    assert done.read_text(encoding="utf-8") == "1"
 
 
 async def test_one_timeout_does_not_destroy_a_concurrent_request(monkeypatch) -> None:

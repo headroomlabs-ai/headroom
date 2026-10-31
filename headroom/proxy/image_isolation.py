@@ -223,6 +223,12 @@ async def _await_pool_job(
     or could not propagate genuine cancellation. Complete a private waiter
     instead: executor cancellation becomes ``_PoolJobCancelled``, while
     ``wait_for`` only raises ``CancelledError`` when *this* task is cancelled.
+
+    Timeout and caller cancellation complete only that private waiter, so they
+    would otherwise leave the ``run_in_executor`` future queued. Cancel it
+    best-effort: a still-pending job must not run after this call already
+    failed open. A job that is already running cannot be cancelled; isolation
+    still refuses to kill the worker while another call is using the pool.
     """
     loop = asyncio.get_running_loop()
     waiter: asyncio.Future[Any] = loop.create_future()
@@ -243,7 +249,11 @@ async def _await_pool_job(
             return
 
     future.add_done_callback(_propagate)
-    return await asyncio.wait_for(waiter, timeout=timeout)
+    try:
+        return await asyncio.wait_for(waiter, timeout=timeout)
+    finally:
+        if not future.done():
+            future.cancel()
 
 
 async def run_image_compression_isolated(
