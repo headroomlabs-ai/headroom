@@ -230,8 +230,8 @@ def ensure_private_file(path: str | os.PathLike[str], *, what: str = "file") -> 
     opened world-readable, so a failure to create or narrow the file privately
     raises :class:`PermissionError` rather than proceeding to open a wide
     file. The existing-file path is symlink-race resistant — ``O_EXCL`` on the
-    create refuses to reuse a planted file or symlink; an existing file is
-    re-opened with ``O_NOFOLLOW`` and narrowed through that descriptor
+    create refuses to reuse a planted file or symlink; an existing file not
+    already 0600 is opened with ``O_NOFOLLOW`` and narrowed through it
     (``fstat`` to confirm a regular file, ``fchmod`` to set the mode) rather
     than by re-resolving the path, which closes the check-then-chmod TOCTOU a
     ``chmod(path)`` would leave open. On Windows POSIX mode bits and
@@ -249,15 +249,36 @@ def ensure_private_file(path: str | os.PathLike[str], *, what: str = "file") -> 
     except FileExistsError:
         pass
 
+    _narrow_existing(path, what=what, missing_ok=False)
+
+
+def _narrow_existing(path: str | os.PathLike[str], *, what: str, missing_ok: bool) -> None:
+    """Narrow an existing file to 0600 through an ``O_NOFOLLOW`` descriptor.
+
+    A regular file already 0600 and owned by the caller (any owner as root) is
+    only ``lstat``-ed: closing any descriptor on a sqlite file drops the
+    process's ``fcntl`` locks on it (sqlite.org/howtocorrupt.html, 2.2).
+    Non-regular files are refused; with *missing_ok*, a missing file is skipped.
+    """
     if not (hasattr(os, "O_NOFOLLOW") and hasattr(os, "fchmod")):
         return
 
+    fd = -1
     try:
-        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+        st = os.lstat(path)
+        if stat.S_ISREG(st.st_mode):
+            euid = os.geteuid()  # type: ignore[attr-defined]
+            if stat.S_IMODE(st.st_mode) == OWNER_ONLY_MODE and (st.st_uid == euid or euid == 0):
+                return
+            fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
     except OSError as exc:
+        if missing_ok and isinstance(exc, FileNotFoundError):
+            return
         raise PermissionError(
             f"refusing to open {what} at {path}: not a regular file (symlink or open error: {exc})"
         ) from exc
+    if fd < 0:
+        raise PermissionError(f"refusing to open {what} at {path}: not a regular file")
     try:
         if not stat.S_ISREG(os.fstat(fd).st_mode):
             raise PermissionError(f"refusing to open {what} at {path}: not a regular file")
@@ -346,9 +367,7 @@ def connect_private_sqlite(
         # them. Missing ones are left alone: sqlite creates them with the
         # main file's mode, which is now 0600.
         for suffix in _SQLITE_SIDECAR_SUFFIXES:
-            sidecar = file_path + suffix
-            if os.path.lexists(sidecar):
-                ensure_private_file(sidecar, what=f"{what} {suffix[1:]} file")
+            _narrow_existing(file_path + suffix, what=f"{what} {suffix[1:]} file", missing_ok=True)
     # ``**connect_kwargs: Any`` makes mypy type the call as ``Any``; the
     # annotation pins it back to the real return type.
     conn: sqlite3.Connection = sqlite3.connect(os.fspath(path), **connect_kwargs)

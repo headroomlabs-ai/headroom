@@ -1307,3 +1307,100 @@ def test_proxy_pipeline_excludes_interceptor_when_env_not_set(monkeypatch):
     for pipeline in (proxy.anthropic_pipeline, proxy.openai_pipeline):
         transforms = pipeline.transforms
         assert not any(isinstance(t, ToolResultInterceptorTransform) for t in transforms)
+
+
+@pytest.mark.parametrize(
+    "content",
+    [
+        [
+            {"type": "text", "text": "first long block " * 20},
+            {"type": "text", "text": "second long block " * 20},
+        ],
+        [
+            {"type": "image_url", "image_url": {"url": "data:image/png;base64,AA=="}},
+            {"type": "text", "text": "long text " * 40},
+        ],
+        [],
+        ["not a block"],
+        [{"type": "text"}],
+        [{"type": "text", "text": 42}],
+    ],
+)
+def test_unsupported_openai_blocks_skip_interceptors_and_savings(content, tokenizer, monkeypatch):
+    from copy import deepcopy
+
+    class Shortener:
+        name = "shape-regression"
+        calls = 0
+
+        def progressive_disclosure_key(self, *_):
+            self.calls += 1
+            return "same-key"
+
+        def matches(self, *_):
+            self.calls += 1
+            return True
+
+        def transform(self, *_):
+            self.calls += 1
+            return "short"
+
+    interceptor = Shortener()
+    monkeypatch.setattr("headroom.proxy.interceptors.base.INTERCEPTORS", [interceptor])
+    unsupported = {"role": "tool", "tool_call_id": "1", "content": content}
+    snapshot = deepcopy(unsupported)
+    result = apply_to_messages([unsupported], tokenizer)
+    assert result.messages == [snapshot]
+    assert result.messages[0] is unsupported
+    assert result.spans == []
+    assert interceptor.calls == 0
+    assert unsupported == snapshot
+    pipeline_result = ToolResultInterceptorTransform().apply([unsupported], tokenizer)
+    assert pipeline_result.messages == [snapshot]
+    assert pipeline_result.transforms_applied == []
+    assert pipeline_result.tokens_before == pipeline_result.tokens_after
+    assert interceptor.calls == 0
+
+    # A skipped layout must not consume progressive-disclosure state.
+    valid = {"role": "tool", "tool_call_id": "2", "content": "long output " * 40}
+    result = apply_to_messages([unsupported, valid], tokenizer)
+    assert result.messages[0] == snapshot
+    assert result.messages[1]["content"] == "short"
+    assert len(result.spans) == 1
+    assert interceptor.calls == 3
+
+
+def test_single_openai_text_block_interceptor_preserves_metadata(tokenizer, monkeypatch):
+    from copy import deepcopy
+
+    class Shortener:
+        name = "metadata-regression"
+
+        def matches(self, *_):
+            return True
+
+        def transform(self, *_):
+            return "short"
+
+    monkeypatch.setattr("headroom.proxy.interceptors.base.INTERCEPTORS", [Shortener()])
+    message = {
+        "role": "tool",
+        "tool_call_id": "1",
+        "content": [
+            {
+                "type": "text",
+                "text": "long output " * 40,
+                "cache_control": {"type": "ephemeral", "ttl": "1h"},
+                "metadata": {"nested": [1, 2]},
+            }
+        ],
+    }
+    original = deepcopy(message)
+    result = apply_to_messages([message], tokenizer)
+    expected = deepcopy(message)
+    expected["content"][0]["text"] = "short"
+    assert result.messages == [expected]
+    assert len(result.spans) == 1
+    assert result.spans[0].tokens_saved > 0
+    result.messages[0]["content"][0]["metadata"]["nested"].append(3)
+    assert message == original
