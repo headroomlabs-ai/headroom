@@ -343,6 +343,82 @@ def test_client_tool_search_tool_is_never_deferred() -> None:
     assert by_name["ToolSearch"].get("defer_loading") is None
 
 
+def test_claude_code_orchestration_and_interactive_tools_not_deferred() -> None:
+    # Claude Code sends built-in orchestration and interactive tools (Agent,
+    # Workflow, AskUserQuestion, SendMessage, TaskStop, ExitPlanMode) inline in
+    # the request tools. Deferring Workflow breaks dynamic workflows because
+    # ToolSearch cannot resolve it (#4313), and deferring interactive tools
+    # degrades direct prompt/skill execution.
+    tools = [
+        {"name": n, "description": n, "input_schema": {}}
+        for n in [
+            "Agent",
+            "Workflow",
+            "AskUserQuestion",
+            "SendMessage",
+            "TaskStop",
+            "ExitPlanMode",
+            "Bash",
+            "Read",
+            "Write",
+            "Edit",
+            "ToolSearch",
+            "mcp__slack__post",
+            "mcp__linear__create",
+        ]
+    ]
+    out = inject_tool_search_deferral(tools)
+    by_name = {t.get("name"): t for t in out if "name" in t}
+    for core_tool in (
+        "Agent",
+        "Workflow",
+        "AskUserQuestion",
+        "SendMessage",
+        "TaskStop",
+        "ExitPlanMode",
+    ):
+        assert by_name[core_tool].get("defer_loading") is None, (
+            f"{core_tool} was deferred but must remain resident (#4313)"
+        )
+    # External MCP tools must still be deferred
+    assert by_name["mcp__slack__post"].get("defer_loading") is True
+    assert by_name["mcp__linear__create"].get("defer_loading") is True
+
+
+def test_workflow_remains_resident_when_override_omits_it(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Explicit core-tool override (e.g. bash, read) omits Workflow, but Workflow
+    # must remain in the unconditional resident floor because client-side
+    # ToolSearch cannot recover it once deferred (#4313). Ordinary tools like
+    # Grep must still be deferred according to the override.
+    monkeypatch.setenv("HEADROOM_TOOL_SEARCH_CORE_TOOLS", "bash,read")
+    tools = [
+        {"name": "Bash", "description": "bash", "input_schema": {}},
+        {"name": "Read", "description": "read", "input_schema": {}},
+        {"name": "Workflow", "description": "workflow", "input_schema": {}},
+        {"name": "ToolSearch", "description": "search", "input_schema": {}},
+        {"name": "Grep", "description": "grep", "input_schema": {}},
+        *[
+            {"name": f"mcp__slack__t{i}", "description": "mcp", "input_schema": {}}
+            for i in range(10)
+        ],
+    ]
+    out = inject_tool_search_deferral(tools)
+    by_name = {t.get("name"): t for t in out if isinstance(t, dict) and "name" in t}
+
+    assert by_name["Workflow"].get("defer_loading") is None, (
+        "Workflow was deferred under override but must remain resident (#4313)"
+    )
+    assert by_name["ToolSearch"].get("defer_loading") is None, "ToolSearch must survive overrides"
+    # Configured core tools remain resident
+    assert by_name["Bash"].get("defer_loading") is None
+    assert by_name["Read"].get("defer_loading") is None
+    # Unconfigured ordinary tool is deferred according to override
+    assert by_name["Grep"].get("defer_loading") is True
+    assert by_name["mcp__slack__t0"].get("defer_loading") is True
+
+
 def test_resident_real_tool_survives_pascal_case_surface() -> None:
     # The injected search tool is typed and does not satisfy the invariant on its
     # own; Anthropic 400s when every real tool is deferred.

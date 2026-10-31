@@ -299,7 +299,7 @@ def test_resident_set_is_overridable(monkeypatch: pytest.MonkeyPatch) -> None:
     """So deferring built-ins can be measured instead of guessed."""
     monkeypatch.setenv("HEADROOM_TOOL_SEARCH_CORE_TOOLS", "bash,read")
 
-    assert resolved_core_tools() == frozenset({"bash", "read", "toolsearch"})
+    assert resolved_core_tools() == frozenset({"bash", "read", "toolsearch", "workflow"})
 
     tools = [
         {"name": "bash", "input_schema": {}},
@@ -603,14 +603,14 @@ def test_legacy_env_var_is_honoured(monkeypatch: pytest.MonkeyPatch) -> None:
     """
     monkeypatch.setenv("HEADROOM_TOOL_SEARCH_CORE", "bash,read")
 
-    assert resolved_core_tools() == frozenset({"bash", "read", "toolsearch"})
+    assert resolved_core_tools() == frozenset({"bash", "read", "toolsearch", "workflow"})
 
 
 def test_canonical_env_var_wins_over_legacy(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("HEADROOM_TOOL_SEARCH_CORE", "bash,read")
     monkeypatch.setenv("HEADROOM_TOOL_SEARCH_CORE_TOOLS", "grep")
 
-    assert resolved_core_tools() == frozenset({"grep", "toolsearch"})
+    assert resolved_core_tools() == frozenset({"grep", "toolsearch", "workflow"})
 
 
 def test_neither_set_keeps_the_default(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -625,7 +625,7 @@ def test_empty_override_defers_everything_non_typed(monkeypatch: pytest.MonkeyPa
     """An explicit empty set is a real instruction, not an unset variable."""
     monkeypatch.setenv("HEADROOM_TOOL_SEARCH_CORE_TOOLS", "")
 
-    assert resolved_core_tools() == frozenset({"toolsearch"})
+    assert resolved_core_tools() == frozenset({"toolsearch", "workflow"})
 
 
 def test_the_override_tolerates_spaces_after_commas(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -637,7 +637,9 @@ def test_the_override_tolerates_spaces_after_commas(monkeypatch: pytest.MonkeyPa
     """
     monkeypatch.setenv("HEADROOM_TOOL_SEARCH_CORE_TOOLS", "bash, read , terminal")
 
-    assert resolved_core_tools() == frozenset({"bash", "read", "terminal", "toolsearch"})
+    assert resolved_core_tools() == frozenset(
+        {"bash", "read", "terminal", "toolsearch", "workflow"}
+    )
 
 
 def test_an_override_cannot_defer_the_clients_search_tool(
@@ -655,6 +657,25 @@ def test_an_override_cannot_defer_the_clients_search_tool(
     by_name = {t.get("name"): t for t in inject_tool_search_deferral(tools) if isinstance(t, dict)}
 
     assert by_name["ToolSearch"].get("defer_loading") is None
+    assert by_name["mcp__srv0__do"].get("defer_loading") is True
+
+
+def test_an_override_cannot_defer_workflow(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Dynamic workflows must remain resident under any override (#4313)."""
+    monkeypatch.setenv("HEADROOM_TOOL_SEARCH_CORE_TOOLS", "Bash,Read")
+    tools = [
+        CLAUDE_CODE_TOOL_SEARCH,
+        {"name": "Workflow", "input_schema": {}},
+        {"name": "Bash", "input_schema": {}},
+        *_mcp(14),
+    ]
+    by_name = {t.get("name"): t for t in inject_tool_search_deferral(tools) if isinstance(t, dict)}
+
+    assert by_name["Workflow"].get("defer_loading") is None
+    assert by_name["ToolSearch"].get("defer_loading") is None
+    assert by_name["Bash"].get("defer_loading") is None
     assert by_name["mcp__srv0__do"].get("defer_loading") is True
 
 

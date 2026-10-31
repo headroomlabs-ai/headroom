@@ -3760,13 +3760,15 @@ def reset_tool_search_hint_state() -> None:
 # stays callable. Deterministic output → the tools prefix still prompt-caches.
 # ---------------------------------------------------------------------------
 
-# Resident no matter what the operator's override says. The client's own
-# tool-search tool is the one thing that must never be deferred: it is what
-# loads the tools it resolves, and Claude Code uses it to reach tools held in a
-# local registry (TaskCreate, WebFetch, ...) that nothing else can reach. An
-# override says which ORDINARY tools stay inline, so letting it drop this would
-# silently orphan a whole category rather than defer it.
-_CLIENT_SIDE_SEARCH_FLOOR = frozenset({"toolsearch"})
+# Resident no matter what the operator's override says:
+# - The client's own tool-search tool (Claude Code's ``ToolSearch``) loads the
+#   tools it resolves, and Claude Code uses it to reach tools held in a local
+#   registry (TaskCreate, WebFetch, ...) that nothing else can reach.
+# - Dynamic workflows (Claude Code's ``Workflow``) must remain resident because
+#   client-side ToolSearch does not index or recover it once deferred (#4313).
+# An override says which ORDINARY tools stay inline, so letting it drop these
+# would silently orphan a whole category rather than defer it.
+_CLIENT_SIDE_SEARCH_FLOOR = frozenset({"toolsearch", "workflow"})
 
 # Core coding tools kept non-deferred so routine edit/read/run loops never pay a
 # search round-trip. Everything else (Slack/Linear/Sentry/Notion/Snowflake/…) is
@@ -3774,29 +3776,37 @@ _CLIENT_SIDE_SEARCH_FLOOR = frozenset({"toolsearch"})
 # more) most frequent tools resident.
 _TOOL_SEARCH_CORE_TOOLS = frozenset(
     {
+        "agent",
+        "apply_patch",
+        "askuserquestion",
         "bash",
         "bash_background",
+        "bash_background_kill",
         "bash_background_output",
         "bash_background_wait",
-        "bash_background_kill",
-        "read",
-        "write",
         "edit",
-        "multiedit",
-        "apply_patch",
+        "exitplanmode",
         "glob",
         "grep",
-        "task",
-        "todowrite",
-        "todoread",
-        "webfetch",
+        "multiedit",
         "question",
+        "read",
+        "sendmessage",
         "skill",
+        "task",
+        "taskstop",
+        "todoread",
+        "todowrite",
         # A client's own tool-search/schema-fetch tool (Claude Code's ``ToolSearch``).
         # It resolves tools the client keeps in its local registry and never puts in
         # the request body (TaskCreate, WebFetch, …), so deferring it hides the only
         # tool that can load them and they become permanently unreachable.
         "toolsearch",
+        "webfetch",
+        # Claude Code dynamic workflows; client-side ToolSearch does not index it,
+        # so deferring Workflow leaves it unreachable (#4313).
+        "workflow",
+        "write",
     }
 )
 
@@ -3874,10 +3884,11 @@ def resolved_core_tools(extra: frozenset[str] = frozenset()) -> frozenset[str]:
     # natural spelling "bash, read, terminal" used to resolve to {" read",
     # " terminal", "bash"} and defer the two tools the operator asked to pin.
     named = {_tool_search_resident_key(part.strip()) for part in raw.split(",") if part.strip()}
-    # The client's own tool-search tool survives every override. Deferring it
-    # hides the only thing that can load the tools it resolves -- including
-    # tools the client keeps in a local registry, which nothing else can reach
-    # -- so an override that omits it would silently orphan them.
+    # The client's own tool-search tool and dynamic workflow tool survive
+    # every override. Deferring ToolSearch hides the only thing that can load
+    # the tools it resolves (including local-registry tools); deferring Workflow
+    # leaves dynamic workflows permanently unreachable because client-side
+    # ToolSearch does not index or recover it (#4313).
     return frozenset(named | _CLIENT_SIDE_SEARCH_FLOOR)
 
 
