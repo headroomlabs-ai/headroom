@@ -238,6 +238,24 @@ def test_filesystem_backend_writes_compact_json(tmp_path) -> None:
     assert "  " not in path.read_text(encoding="utf-8")
 
 
+@pytest.mark.windows_newline
+def test_filesystem_backend_writes_pin_lf(monkeypatch, tmp_path) -> None:
+    import headroom.telemetry.backends.filesystem as filesystem
+
+    calls: list[dict] = []
+    real_open = open
+
+    def recording_open(fd, *args, **kwargs):
+        calls.append(kwargs)
+        return real_open(fd, *args, **kwargs)
+
+    monkeypatch.setattr(filesystem, "open", recording_open, raising=False)
+    FileSystemTOINBackend(str(tmp_path / "toin.json")).save({"patterns": {}})
+
+    # Artifact bytes alone cannot detect a missing newline pin on POSIX.
+    assert [call.get("newline") for call in calls] == ["\n"]
+
+
 def test_filesystem_backend_skips_oversized_store(tmp_path) -> None:
     path = tmp_path / "toin.json"
     path.write_text("x" * 100, encoding="utf-8")
@@ -245,3 +263,99 @@ def test_filesystem_backend_skips_oversized_store(tmp_path) -> None:
     backend = FileSystemTOINBackend(str(path), max_load_bytes=10)
     assert backend.load() == {}
     assert path.exists()
+
+
+def test_filesystem_backend_preserves_oversized_store_on_save(tmp_path) -> None:
+    path = tmp_path / "toin.json"
+    original = b'{"patterns":{"existing":{"value":1}}}'
+    path.write_bytes(original)
+    backend = FileSystemTOINBackend(str(path), max_load_bytes=len(original) - 1)
+
+    assert backend.load() == {}
+    with pytest.raises(ValueError, match="limit"):
+        backend.save({})
+
+    assert path.read_bytes() == original
+    assert list(tmp_path.glob(".toin_*.tmp")) == []
+
+
+@pytest.mark.parametrize("existing", [False, True], ids=["new_store", "existing_store"])
+def test_filesystem_backend_rejects_oversized_output(tmp_path, existing) -> None:
+    path = tmp_path / "toin.json"
+    original = b"{}"
+    if existing:
+        path.write_bytes(original)
+    data = {"value": "x" * 100}
+    limit = len(json.dumps(data, separators=(",", ":")).encode("utf-8")) - 1
+    backend = FileSystemTOINBackend(str(path), max_load_bytes=limit)
+
+    with pytest.raises(ValueError, match="limit"):
+        backend.save(data)
+
+    if existing:
+        assert path.read_bytes() == original
+    else:
+        assert not path.exists()
+    assert list(tmp_path.glob(".toin_*.tmp")) == []
+
+
+def test_filesystem_backend_accepts_exact_byte_limit(tmp_path) -> None:
+    path = tmp_path / "toin.json"
+    data = {"value": "雪"}
+    serialized = json.dumps(data, separators=(",", ":")).encode("utf-8")
+    backend = FileSystemTOINBackend(str(path), max_load_bytes=len(serialized))
+
+    backend.save(data)
+    assert path.read_bytes() == serialized
+    assert backend.load() == data
+    # An existing file at the boundary can still be replaced.
+    backend.save({})
+    assert backend.load() == {}
+
+
+def test_filesystem_backend_zero_byte_limit_rejects_output(tmp_path) -> None:
+    path = tmp_path / "toin.json"
+    backend = FileSystemTOINBackend(str(path), max_load_bytes=0)
+
+    with pytest.raises(ValueError, match="limit"):
+        backend.save({})
+
+    assert not path.exists()
+    assert list(tmp_path.glob(".toin_*.tmp")) == []
+
+
+def test_filesystem_backend_without_byte_limit_allows_growth(tmp_path) -> None:
+    path = tmp_path / "toin.json"
+    backend = FileSystemTOINBackend(str(path), max_load_bytes=None)
+    backend.save({"value": "x" * 100})
+    data = {"value": "x" * 200}
+
+    backend.save(data)
+
+    assert backend.load() == data
+
+
+@pytest.mark.parametrize("oversized_on_load", [True, False], ids=["load_rejected", "store_grows"])
+def test_toin_size_rejection_preserves_store_and_dirty_state(
+    tmp_path, caplog, oversized_on_load
+) -> None:
+    path = tmp_path / "toin.json"
+    _saved_store(path, 3 if oversized_on_load else 1)
+    original = path.read_bytes()
+    limit = len(original) - 1 if oversized_on_load else len(original) + 128
+    toin = ToolIntelligenceNetwork(
+        TOINConfig(storage_path=str(path), max_storage_bytes=limit, auto_save_interval=0)
+    )
+    assert len(toin._patterns) == (0 if oversized_on_load else 1)
+    _record(toin, 99)
+    last_save_time = toin._last_save_time
+
+    with caplog.at_level(logging.WARNING, logger="headroom.telemetry.toin"):
+        toin.save()
+
+    assert path.read_bytes() == original
+    assert toin._dirty
+    assert toin._last_save_time == last_save_time
+    assert list(tmp_path.glob(".toin_*.tmp")) == []
+    [warning] = [r for r in caplog.records if getattr(r, "event", None) == "toin_save_failed"]
+    assert warning.error_type == "ValueError"
