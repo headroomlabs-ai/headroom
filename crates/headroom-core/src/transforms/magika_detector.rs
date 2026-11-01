@@ -154,7 +154,11 @@ fn init_ort_from_path(path: &Path) -> Result<(), String> {
             path.display()
         )
     })?;
-    let _committed = builder.commit();
+    // `ort` enables ONNX Runtime's usage telemetry by default, and ORT 1.31+
+    // uploads it to Microsoft on Linux and macOS too. Importing `headroom`
+    // sets ORT_DISABLE_TELEMETRY, which stops the uploader before it starts;
+    // this only stops later events, for Rust-only callers that skip Python.
+    let _committed = builder.with_telemetry(false).commit();
     Ok(())
 }
 
