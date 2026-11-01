@@ -25,6 +25,7 @@ from headroom.proxy.tool_schema_savings_policy import (
     billed_tools,
     hook_tool_counts,
     net_hook_tool_saving,
+    proxy_added_tools,
     tools_before_hook,
 )
 
@@ -37,6 +38,7 @@ if TYPE_CHECKING:
 import httpx
 
 from headroom.agent_savings import proxy_pipeline_kwargs
+from headroom.ccr import CCR_TOOL_NAME
 from headroom.ccr.context_tracker import looks_like_claude_code_compact_summary
 from headroom.ccr.marker_resolution import resolve_markers_in_response
 from headroom.ccr.tool_calls import has_ccr_retrieve_tool
@@ -3231,11 +3233,23 @@ class AnthropicHandlerMixin:
 
             _deferred_billed_eagerly = resolver_for(self).for_request(request) is not None
 
-            def _compaction_counted(value: object) -> object:
-                """The tools whose compaction is a saving: the billed ones."""
+            def _billed_view(value: object) -> object:
                 if _deferred_billed_eagerly:
                     return value
                 return billed_tools(value, optimized_messages)
+
+            def _compaction_counted(value: object) -> object:
+                """The tools whose compaction is a saving: billed ones the client
+                sent. The proxy's own retrieve tool is booked as a cost below, so
+                compacting it earns nothing."""
+                billed = _billed_view(value)
+                if not proxy_added_tools(billed, _original_tools, CCR_TOOL_NAME):
+                    return billed
+                return [
+                    t
+                    for t in billed
+                    if not (isinstance(t, dict) and t.get("name") == CCR_TOOL_NAME)
+                ]
 
             _tools_compaction_started = time.time()
             try:
@@ -3664,6 +3678,14 @@ class AnthropicHandlerMixin:
                     optimized_tokens += _tool_tokens_after
                 # A tool a turn hook added is sent too: it reduces the saving.
                 optimized_tokens += _th_tool_growth
+                # So is the CCR retrieve tool the proxy declared (the client
+                # never sent it), unless deferred and unloaded: its cost comes
+                # off this turn's saving.
+                optimized_tokens += _count_tool_tokens(
+                    proxy_added_tools(
+                        _billed_view(body.get("tools")), _original_tools, CCR_TOOL_NAME
+                    )
+                )
                 # First-appearance accounting for matured Reads. The client
                 # re-sends the raw conversation every turn, so this diff would
                 # otherwise re-book a matured Read's removal on every request
@@ -3716,6 +3738,7 @@ class AnthropicHandlerMixin:
                     resolve_verbosity_level,
                     shape_request,
                 )
+                from headroom.proxy.output_verbosity_policy import steering_text
 
                 _shaper_settings = OutputShaperSettings.from_env(
                     enabled=(shaper_enabled_for(getattr(self, "config", None))),
@@ -3749,6 +3772,24 @@ class AnthropicHandlerMixin:
                         _level, _src = resolve_verbosity_level(_shaper_settings)
                         shape_result = shape_request(body, _shaper_settings, level_override=_level)
                         if shape_result.changed:
+                            # The steering block is sent on every treatment turn:
+                            # book it as a cost against this turn's input saving,
+                            # debiting hook tool credit when the saving runs out.
+                            try:
+                                _steer_tokens = tokenizer.count_text(steering_text(_level) or "")
+                            except Exception:
+                                logger.debug(
+                                    "[%s] steering token count failed; cost not booked",
+                                    request_id,
+                                )
+                                _steer_tokens = 0
+                            if _steer_tokens:
+                                optimized_tokens += _steer_tokens
+                                tokens_saved = net_hook_tool_saving(
+                                    tokens_saved - _steer_tokens,
+                                    tags,
+                                    int(tags.get("turn_hook_tools_saved_tokens", 0) or 0),
+                                )
                             body_mutation_tracker.mark_mutated("output_shaper")
                             transforms_applied.extend(shape_result.labels or [])
                             logger.info(

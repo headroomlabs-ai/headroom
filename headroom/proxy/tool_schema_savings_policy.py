@@ -209,6 +209,18 @@ def loading_history(provider: str, messages: object) -> object:
     return messages if provider == "anthropic" else None
 
 
+def proxy_added_tools(tools: object, client_tools: object, name: str) -> list[Any]:
+    """The tool named ``name`` in the outbound ``tools`` when the client did not
+    declare it: a definition the proxy added and the request pays for."""
+    if name in _tool_names(client_tools):
+        return []
+    return [
+        t
+        for t in (tools if isinstance(tools, list) else [])
+        if isinstance(t, dict) and t.get("name") == name
+    ]
+
+
 DeferredBooking = tuple[int, dict[str, Any], "dict[str, Any] | None", frozenset[str]]
 
 

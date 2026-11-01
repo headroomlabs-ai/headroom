@@ -1,5 +1,11 @@
-"""A deferred tool no ``tool_reference`` has loaded is not billed, so a hook
-condensing one saves nothing on the bill (measured on Copilot's Claude API)."""
+"""What the proxy itself adds to a request is a cost against its savings.
+
+Measured on Copilot's Claude API: the ``headroom_retrieve`` tool the proxy
+declares and the output shaper's steering block are billed on every turn they
+are sent, yet neither was ever subtracted from the booked total. And a deferred
+tool no ``tool_reference`` has loaded is not billed, so a hook condensing one
+saves nothing on the bill.
+"""
 
 from __future__ import annotations
 
@@ -198,3 +204,104 @@ def test_a_translating_backend_bills_a_deferred_tool_so_condensing_it_saves(monk
         backend=SimpleNamespace(name="litellm", send_message=_send_message),
     )
     assert tags["turn_hook_tools_saved_tokens"] > 0
+
+
+def test_the_retrieve_tool_the_proxy_declares_is_netted_out(monkeypatch) -> None:
+    from headroom.ccr import CCR_TOOL_NAME
+
+    register_turn_hook(_DropResident())
+    # A headroom_retrieve call in the history makes the proxy declare the tool.
+    tags, upstream = _send(
+        monkeypatch,
+        {
+            "messages": [
+                {"role": "user", "content": "hi"},
+                {
+                    "role": "assistant",
+                    "content": [
+                        {
+                            "type": "tool_use",
+                            "id": "r1",
+                            "name": CCR_TOOL_NAME,
+                            "input": {"hash": "x"},
+                        }
+                    ],
+                },
+                {
+                    "role": "user",
+                    "content": [{"type": "tool_result", "tool_use_id": "r1", "content": "data"}],
+                },
+            ],
+            "tools": [_tool("keep"), _tool("victim")],
+        },
+        optimize=True,
+    )
+    (retrieve,) = [t for t in upstream["tools"] if t.get("name") == CCR_TOOL_NAME]
+    assert tags["turn_hook_tools_saved_tokens"] == _resident_saving() - _count_tools([retrieve])
+
+
+def test_the_output_shaper_steering_block_is_netted_out(monkeypatch) -> None:
+    from headroom.proxy.output_verbosity_policy import STEERING_SENTINEL
+    from headroom.tokenizers import get_tokenizer
+
+    monkeypatch.setenv("HEADROOM_OUTPUT_SHAPER", "1")
+    monkeypatch.setenv("HEADROOM_OUTPUT_HOLDOUT", "0")
+    register_turn_hook(_DropResident())
+    tags, upstream = _send(
+        monkeypatch,
+        {
+            "system": "You are terse.",
+            "messages": [{"role": "user", "content": "hi"}],
+            "tools": [_tool("keep"), _tool("victim")],
+        },
+    )
+    (steering,) = [
+        b["text"] for b in upstream["system"] if b.get("text", "").startswith(STEERING_SENTINEL)
+    ]
+    steer_tokens = get_tokenizer("claude-sonnet-4-5").count_text(steering)
+    assert tags["turn_hook_tools_saved_tokens"] == _resident_saving() - steer_tokens
+
+
+def test_a_deferred_unloaded_retrieve_tool_is_not_a_cost(monkeypatch) -> None:
+    from headroom.ccr import CCR_TOOL_NAME
+
+    monkeypatch.setenv("HEADROOM_TOOL_SEARCH", "1")
+    monkeypatch.setenv("HEADROOM_TOOL_SEARCH_CORE_TOOLS", "keep,victim")
+    register_turn_hook(_DropResident())
+    tags, upstream = _send(
+        monkeypatch,
+        {
+            "messages": [
+                {"role": "user", "content": "hi"},
+                {
+                    "role": "assistant",
+                    "content": [
+                        {
+                            "type": "tool_use",
+                            "id": "r1",
+                            "name": CCR_TOOL_NAME,
+                            "input": {"hash": "x"},
+                        }
+                    ],
+                },
+                {
+                    "role": "user",
+                    "content": [{"type": "tool_result", "tool_use_id": "r1", "content": "data"}],
+                },
+            ],
+            "tools": [_tool("keep"), _tool("victim")] + [_tool(f"t{i}") for i in range(40)],
+        },
+        optimize=True,
+    )
+    (retrieve,) = [t for t in upstream["tools"] if t.get("name") == CCR_TOOL_NAME]
+    assert retrieve["defer_loading"] is True
+    assert tags["turn_hook_tools_saved_tokens"] == _resident_saving()
+
+
+def test_a_retrieve_tool_the_client_declared_is_not_a_proxy_cost() -> None:
+    from headroom.ccr import CCR_TOOL_NAME
+    from headroom.proxy.tool_schema_savings_policy import proxy_added_tools
+
+    retrieve = _tool(CCR_TOOL_NAME)
+    assert proxy_added_tools([retrieve], [retrieve], CCR_TOOL_NAME) == []
+    assert proxy_added_tools([retrieve], [], CCR_TOOL_NAME) == [retrieve]
