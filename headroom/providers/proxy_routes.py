@@ -112,25 +112,20 @@ def _register_provider_passthrough_route(
         # catch-all do. Clients that speak one wire format but authenticate
         # against a custom OpenAI-compatible gateway must reach that gateway
         # for embeddings/audio/metadata too, not the default provider target
-        # (the same gap as the model-metadata routes, #4302). Telemetry uses
-        # the catch-all's bounded mapping so the request-controlled host never
-        # becomes a stats label (#3759).
+        # (the same gap as the model-metadata routes, #4302). Telemetry keeps
+        # the route spec labels: they are bounded by this module, so the
+        # request-controlled host never becomes a stats label (#3759), while
+        # `handle_passthrough` still records the outcome for these known routes.
         custom_base = request.headers.get("x-headroom-base-url", "").strip()
         if custom_base:
             if not await is_safe_upstream_url_async(custom_base):
                 logger.warning("rejecting unsafe x-headroom-base-url: %r", custom_base)
                 raise HTTPException(status_code=400, detail="Rejected unsafe upstream base URL")
-            base_url = custom_base.rstrip("/")
-            endpoint_name, provider_name = _custom_base_passthrough_telemetry(
-                request.method,
-                request.url.path,
-                base_url,
-            )
             return await proxy.handle_passthrough(
                 request,
-                base_url,
-                endpoint_name,
-                provider_name,
+                custom_base.rstrip("/"),
+                spec.sub_path,
+                spec.provider_name,
             )
         return await proxy.handle_passthrough(
             request,

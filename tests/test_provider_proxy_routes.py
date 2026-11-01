@@ -154,16 +154,25 @@ def test_provider_passthrough_routes_forward_expected_targets(monkeypatch) -> No
         ).json()
         assert custom_embeddings["base_url"] == "https://custom.example/base"
         assert custom_embeddings["path"] == "/v1/embeddings"
+        # Known provider routes keep their bounded labels so handle_passthrough
+        # records the outcome for the overridden upstream; the custom host is
+        # never turned into a label.
+        assert custom_embeddings["sub_path"] == "embeddings"
+        assert custom_embeddings["provider"] == "openai"
         custom_count_tokens = client.post(
             "/v1/messages/count_tokens",
             headers={"x-headroom-base-url": "https://custom.example/anthropic/"},
         ).json()
         assert custom_count_tokens["base_url"] == "https://custom.example/anthropic"
+        assert custom_count_tokens["sub_path"] == "count_tokens"
+        assert custom_count_tokens["provider"] == "anthropic"
         custom_gemini = client.get(
             "/v1beta/models",
             headers={"x-headroom-base-url": "https://custom.example/gemini/"},
         ).json()
         assert custom_gemini["base_url"] == "https://custom.example/gemini"
+        assert custom_gemini["sub_path"] == "models"
+        assert custom_gemini["provider"] == "gemini"
         # An unsafe override is rejected instead of being relayed.
         unsafe_embeddings = client.post(
             "/v1/embeddings",
