@@ -978,7 +978,10 @@ class HeadroomMCPServer:
             if ctx is None:
                 return "unknown"
             params = ctx.session.client_params
-            info = getattr(params, "clientInfo", None) if params else None
+            # SDK 2 types are snake_case (`client_info`); SDK 1 exposed `clientInfo`.
+            # Both handshakes fill `client_params`: `initialize`, and the
+            # `_meta` client info that `server/discover` clients send per request.
+            info = getattr(params, "client_info", None) if params else None
             name = getattr(info, "name", None)
             if name:
                 return str(name)
