@@ -20258,12 +20258,15 @@ function headroomShellEnv(proxyUrl, project, options) {
     ...options.backend ? { HEADROOM_BACKEND: options.backend } : {}
   };
 }
-function openAiWireSuffix(pkg) {
+function modelWireSuffix(pkg) {
   if (!pkg?.startsWith("@opencode/ai/providers/")) return void 0;
   if (pkg === "@opencode/ai/providers/openai-compatible" || pkg.endsWith("/chat")) {
     return "/chat/completions";
   }
   if (pkg.endsWith("-responses") || pkg.endsWith("/responses")) return "/responses";
+  if (pkg === "@opencode/ai/providers/anthropic" || pkg === "@opencode/ai/providers/anthropic-compatible" || pkg.endsWith("/messages")) {
+    return "/messages";
+  }
   return void 0;
 }
 function routeModelsThroughProxy(models, proxyUrl, project, excludeHosts, sessionToken) {
@@ -20271,7 +20274,7 @@ function routeModelsThroughProxy(models, proxyUrl, project, excludeHosts, sessio
     const providerID = String(model.providerID);
     const modelID = String(model.id);
     const provider = models.provider.get(providerID)?.provider;
-    const suffix = openAiWireSuffix(model.package ?? provider?.package);
+    const suffix = modelWireSuffix(model.package ?? provider?.package);
     const baseURL = model.settings?.baseURL ?? provider?.settings?.baseURL;
     if (!suffix || typeof baseURL !== "string") continue;
     if (!modelBaseRoutesThroughProxy(baseURL, proxyUrl, excludeHosts)) continue;

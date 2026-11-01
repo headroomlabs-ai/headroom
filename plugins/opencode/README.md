@@ -57,7 +57,7 @@ The default export is `{ id: "headroom", server, setup }`. OpenCode 1.x calls `s
 
 On 2.x, setup returns a cleanup that releases the transport, so hot reloads do not stack interceptors.
 
-OpenCode 2.x keeps its own reference to `fetch` from before plugins load, so patching `fetch` alone does not catch its model traffic. On 2.x the plugin also rewrites each remote model that uses the OpenAI chat-completions or responses format so that it points at the proxy. Headers name the real upstream, as the transport does. Models on other formats (Anthropic messages, Google) are left alone. `headroom wrap opencode` routes native Anthropic and OpenAI through the proxy separately, via their `baseURL`.
+OpenCode 2.x keeps its own reference to `fetch` from before plugins load, so patching `fetch` alone does not catch its model traffic. For models with a resolved `baseURL`, the plugin also rewrites OpenAI chat-completions, Responses, and Anthropic Messages traffic so that it points at the proxy — including GitHub Copilot's Claude models. Headers name the real upstream and request path, as the transport does, and authentication settings are retained. Local, excluded, and unsupported-protocol models are left alone. `headroom wrap opencode` routes native Anthropic and OpenAI through the proxy separately, via their `baseURL`.
 
 To keep a provider off the proxy, list its host. An entry matches the host and all of its subdomains, and `.example.com` / `*.example.com` are accepted as spellings of `example.com`:
 
