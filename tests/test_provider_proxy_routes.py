@@ -144,6 +144,32 @@ def test_provider_passthrough_routes_forward_expected_targets(monkeypatch) -> No
         assert client.get("/v1beta/models").json()["provider"] == "gemini"
         assert client.get("/v1beta/models/demo").json()["sub_path"] == "models"
         assert client.post("/v1beta/models/demo:embedContent").json()["sub_path"] == "embedContent"
+        # Provider passthrough routes must honor the per-request upstream like
+        # /v1/messages and the catch-all do. Without this, a custom
+        # OpenAI-compatible provider's embeddings/audio/metadata requests are
+        # forwarded to the default provider target and fail with 401.
+        custom_embeddings = client.post(
+            "/v1/embeddings",
+            headers={"x-headroom-base-url": "https://custom.example/base/"},
+        ).json()
+        assert custom_embeddings["base_url"] == "https://custom.example/base"
+        assert custom_embeddings["path"] == "/v1/embeddings"
+        custom_count_tokens = client.post(
+            "/v1/messages/count_tokens",
+            headers={"x-headroom-base-url": "https://custom.example/anthropic/"},
+        ).json()
+        assert custom_count_tokens["base_url"] == "https://custom.example/anthropic"
+        custom_gemini = client.get(
+            "/v1beta/models",
+            headers={"x-headroom-base-url": "https://custom.example/gemini/"},
+        ).json()
+        assert custom_gemini["base_url"] == "https://custom.example/gemini"
+        # An unsafe override is rejected instead of being relayed.
+        unsafe_embeddings = client.post(
+            "/v1/embeddings",
+            headers={"x-headroom-base-url": "http://127.0.0.1:9"},
+        )
+        assert unsafe_embeddings.status_code == 400
         assert client.post(
             "/v1/projects/p/locations/us-central1/publishers/google/models/gemini-2.0-flash:generateContent"
         ).json() == {
