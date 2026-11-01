@@ -164,6 +164,7 @@ class ProxyConfig:
     gemini_api_url: str | None = None  # Custom Gemini API URL override
     cloudcode_api_url: str | None = None  # Custom Cloud Code Assist API URL override
     vertex_api_url: str | None = None  # Custom Vertex AI regional API URL override
+    omlx_target_api_url: str | None = None  # Custom oMLX local inference API URL (e.g. http://127.0.0.1:8888)
     # Extra headers merged into (and overriding) forwarded Anthropic/OpenAI requests.
     # JSON-object config knobs; see settings_store's anthropic_extra_headers/
     # openai_extra_headers and providers.registry.resolve_extra_headers.

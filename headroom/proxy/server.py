@@ -6608,6 +6608,7 @@ def _proxy_config_from_env() -> ProxyConfig:
         ),
         ccr_buffered_chat_streaming=_get_env_bool("HEADROOM_CCR_BUFFERED_CHAT_STREAMING", False),
         vertex_api_url=os.environ.get("VERTEX_TARGET_API_URL"),
+        omlx_target_api_url=os.environ.get("OMLX_TARGET_API_URL") or os.environ.get("HEADROOM_OMLX_URL"),
         backend=_get_env_str("HEADROOM_BACKEND", "anthropic"),
         bedrock_region=_get_env_str("HEADROOM_BEDROCK_REGION", "us-west-2"),
         bedrock_profile=os.environ.get("AWS_PROFILE"),
@@ -7433,6 +7434,7 @@ if __name__ == "__main__":
             min_value=0,
         ),
         vertex_api_url=_get_env_str("VERTEX_TARGET_API_URL", args.vertex_api_url),
+        omlx_target_api_url=_get_env_str("OMLX_TARGET_API_URL", getattr(args, "omlx_api_url", None) or os.environ.get("HEADROOM_OMLX_URL")),
         # Backend settings
         backend=_get_env_str("HEADROOM_BACKEND", args.backend),  # type: ignore[arg-type]
         bedrock_region=_get_env_str("HEADROOM_BEDROCK_REGION", args.bedrock_region),
