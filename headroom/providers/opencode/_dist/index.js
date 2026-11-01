@@ -20269,6 +20269,14 @@ function modelWireSuffix(pkg) {
   }
   return void 0;
 }
+function anthropicBaseKeepsPath(baseURL) {
+  try {
+    const pathname = trimTrailingSlashes(new URL(baseURL).pathname);
+    return pathname === "" || pathname === "/v1";
+  } catch {
+    return false;
+  }
+}
 function routeModelsThroughProxy(models, proxyUrl, project, excludeHosts, sessionToken) {
   for (const model of models.list()) {
     const providerID = String(model.providerID);
@@ -20278,6 +20286,7 @@ function routeModelsThroughProxy(models, proxyUrl, project, excludeHosts, sessio
     const baseURL = model.settings?.baseURL ?? provider?.settings?.baseURL;
     if (!suffix || typeof baseURL !== "string") continue;
     if (!modelBaseRoutesThroughProxy(baseURL, proxyUrl, excludeHosts)) continue;
+    if (suffix === "/messages" && !anthropicBaseKeepsPath(baseURL)) continue;
     const upstream = new URL(baseURL);
     models.update(providerID, modelID, (draft) => {
       draft.settings = { ...draft.settings, baseURL: `${proxyUrl}/v1` };
