@@ -30,9 +30,14 @@ export type MessageFormat = "openai" | "anthropic" | "vercel" | "gemini";
  *   - Gemini: messages have `parts` field (not `content`)
  *   - Vercel: content parts use hyphenated types: `tool-call`, `tool-result`
  *   - Anthropic: content blocks use underscored types: `tool_use`, `tool_result`
- *   - OpenAI: assistant messages have `tool_calls` field; tool messages have `tool_call_id`
+ *   - OpenAI: assistant messages have `tool_calls` field; tool messages have `tool_call_id`;
+ *     content parts of type `image_url`, `input_audio`, `refusal`, or `file` with a `file` object
+ *
+ * A message-level `providerOptions` key is Vercel evidence too, but the public OpenAI message
+ * types allow it as well, so it only decides once no message carries a structural marker.
  */
 export function detectFormat(messages: any[]): MessageFormat {
+  let providerOptions = false;
   for (const msg of messages) {
     // Gemini: uses `parts` instead of `content`
     if ("parts" in msg && !("content" in msg)) return "gemini";
@@ -46,12 +51,11 @@ export function detectFormat(messages: any[]): MessageFormat {
     // OpenAI: tool role with tool_call_id
     if (msg.role === "tool" && "tool_call_id" in msg && typeof msg.content === "string") return "openai";
 
-    // Vercel: provider options on a message (no other format has them)
-    if (msg && typeof msg === "object" && "providerOptions" in msg) return "vercel";
-
     // Check content blocks/parts for format-specific markers
     if (Array.isArray(msg.content)) {
       for (const part of msg.content) {
+        // OpenAI: image_url / input_audio / refusal parts
+        if (part.type === "image_url" || part.type === "input_audio" || part.type === "refusal") return "openai";
         // Vercel: hyphenated types, reasoning parts (Anthropic spells its block `thinking`)
         if (part.type === "tool-call" || part.type === "tool-result") return "vercel";
         if (
@@ -70,15 +74,19 @@ export function detectFormat(messages: any[]): MessageFormat {
         // Vercel: `file` parts carry data/mediaType (OpenAI's `file` part carries a `file` object);
         // `image` parts carry `image` (Anthropic's carry `source`)
         if (part && typeof part === "object") {
+          if (part.type === "file" && "file" in part) return "openai";
           if (part.type === "file" && ("data" in part || "mediaType" in part)) return "vercel";
           if (part.type === "image" && "image" in part) return "vercel";
         }
       }
     }
+
+    if (msg && typeof msg === "object" && "providerOptions" in msg) providerOptions = true;
   }
 
-  // Default: OpenAI (simple {role, content: string} is valid OpenAI)
-  return "openai";
+  // Default: OpenAI (simple {role, content: string} is valid OpenAI), unless a message
+  // carried providerOptions and nothing marked the conversation as another format.
+  return providerOptions ? "vercel" : "openai";
 }
 
 // ============================================================
@@ -566,35 +574,20 @@ export function vercelToOpenAI(messages: any[]): OpenAIMessage[] {
       }
       const parts = Array.isArray(msg.content) ? msg.content : [];
       const textParts = parts.filter((p: any) => p.type === "text");
-      const toolCallParts = parts.filter((p: any) => p.type === "tool-call");
       // Anything other than text and tool calls keeps its place in the content array: files
       // as image_url carriers; reasoning, reasoning-file, custom and provider-executed
-      // tool-result parts verbatim. Text-only content still collapses to a string unless a
-      // text part carries providerOptions.
+      // tool-result parts verbatim. So does a turn whose text follows a tool call, since a
+      // string cannot say which came first. Text-only content otherwise collapses to a
+      // string unless a text part carries providerOptions.
       const keepParts =
         parts.some((p: any) => p.type !== "text" && p.type !== "tool-call") ||
-        textParts.some((p: any) => p.providerOptions);
+        textParts.some((p: any) => p.providerOptions) ||
+        parts.some((p: any, i: number) => p.type === "text" && parts.slice(0, i).some((q: any) => q.type === "tool-call"));
 
-      let content: AssistantMessage["content"];
-      if (keepParts) {
-        content = parts
-          .filter((p: any) => p.type !== "tool-call")
-          .map((p: any) => {
-            if (p.type === "text") return withProviderOptions({ type: "text" as const, text: p.text }, p);
-            if (p.type === "file") {
-              const imageUrl = vercelMediaImageUrl(p);
-              return imageUrl ? { type: "image_url" as const, image_url: imageUrl } : null;
-            }
-            return p;
-          })
-          .filter((p: any): p is NonNullable<typeof p> => p !== null);
-      } else {
-        content = textParts.length > 0 ? textParts.map((p: any) => p.text).join("") : null;
-      }
-      const openaiMsg: AssistantMessage = withProviderOptions({ role: "assistant", content }, msg);
-
-      if (toolCallParts.length > 0) {
-        openaiMsg.tool_calls = toolCallParts.map((p: any): ToolCall => {
+      const content: any[] = [];
+      const toolCalls: ToolCall[] = [];
+      for (const p of parts) {
+        if (p.type === "tool-call") {
           const tc: ToolCall = {
             id: p.toolCallId,
             type: "function",
@@ -602,9 +595,24 @@ export function vercelToOpenAI(messages: any[]): OpenAIMessage[] {
             function: { name: p.toolName, arguments: JSON.stringify(p.input ?? p.args) },
           };
           if (p.providerExecuted !== undefined) tc.providerExecuted = p.providerExecuted;
-          return withProviderOptions(tc, p);
-        });
+          // OpenAI lists tool calls apart from the content, so each one carries how many
+          // content parts preceded it; openAIToVercel puts it back there.
+          if (keepParts) (tc as any).position = content.length;
+          toolCalls.push(withProviderOptions(tc, p));
+        } else if (p.type === "text") {
+          content.push(withProviderOptions({ type: "text", text: p.text }, p));
+        } else if (p.type === "file") {
+          const imageUrl = vercelMediaImageUrl(p);
+          if (imageUrl) content.push({ type: "image_url", image_url: imageUrl });
+        } else {
+          content.push(p);
+        }
       }
+      const openaiMsg: AssistantMessage = withProviderOptions({
+        role: "assistant",
+        content: keepParts ? content : textParts.length > 0 ? textParts.map((p: any) => p.text).join("") : null,
+      }, msg);
+      if (toolCalls.length > 0) openaiMsg.tool_calls = toolCalls;
       result.push(openaiMsg);
       continue;
     }
@@ -634,8 +642,11 @@ export function vercelToOpenAI(messages: any[]): OpenAIMessage[] {
           (toolMsg as any).part = part;
         }
         // One OpenAI tool message is one tool-result part, so the part's providerOptions
-        // take the `providerOptions` key and the message's go under `messageProviderOptions`.
-        if (msg.providerOptions && typeof msg.providerOptions === "object") {
+        // take the `providerOptions` key and the message's go under `messageProviderOptions`
+        // on the last part only: the AI SDK's Anthropic provider applies message-level
+        // options (a cache breakpoint) to a message's last part, and a copy on every split
+        // message would multiply them.
+        if (part === parts[parts.length - 1] && msg.providerOptions && typeof msg.providerOptions === "object") {
           (toolMsg as any).messageProviderOptions = msg.providerOptions;
         }
         result.push(toolMsg);
@@ -684,6 +695,9 @@ export function openAIToVercel(messages: OpenAIMessage[]): any[] {
         }
       }
       if (msg.tool_calls) {
+        // A tool call vercelToOpenAI took out of the content array carries `position`, the
+        // number of content parts that preceded it, and goes back there; others go last.
+        let inserted = 0;
         for (const tc of msg.tool_calls) {
           toolNames.set(tc.id, tc.function.name);
           let input: any;
@@ -695,7 +709,10 @@ export function openAIToVercel(messages: OpenAIMessage[]): any[] {
             input, // AI SDK v6 uses `input`, not `args`
           };
           if (tc.providerExecuted !== undefined) part.providerExecuted = tc.providerExecuted;
-          parts.push(withProviderOptions(part, tc));
+          withProviderOptions(part, tc);
+          const at = (tc as any).position;
+          if (typeof at === "number") parts.splice(at + inserted++, 0, part);
+          else parts.push(part);
         }
       }
       result.push(withProviderOptions({ role: "assistant", content: parts }, msg));

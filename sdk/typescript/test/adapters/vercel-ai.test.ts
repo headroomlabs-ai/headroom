@@ -566,3 +566,33 @@ describe("headroomMiddleware carries provider reasoning state", () => {
     expect(out.prompt).toEqual(expected);
   });
 });
+
+describe("headroomMiddleware keeps provider-executed tool calls in place", () => {
+  beforeEach(() => {
+    mockFetch.mockReset();
+  });
+
+  it("returns an interleaved web-search turn in its original order after the round trip", async () => {
+    const prompt: LanguageModelV3Prompt = [
+      { role: "user", content: [{ type: "text", text: "What is Headroom?" }] },
+      {
+        role: "assistant",
+        content: [
+          { type: "reasoning", text: "Search first.", providerOptions: { openai: { itemId: "rs_1" } } },
+          { type: "tool-call", toolCallId: "ws_1", toolName: "web_search", input: { query: "Headroom" }, providerExecuted: true },
+          { type: "tool-result", toolCallId: "ws_1", toolName: "web_search", output: { type: "json", value: { hits: 3 } } },
+          { type: "reasoning", text: "Three hits.", providerOptions: { openai: { itemId: "rs_2" } } },
+          { type: "text", text: "Headroom is a context-compression proxy." },
+        ],
+      },
+      { role: "user", content: [{ type: "text", text: "Now read the gateway log." }] },
+    ];
+    // The proxy passes this prompt through unchanged.
+    mockFetch.mockImplementationOnce(async (_url: string, init: any) => mockCompressResponse(JSON.parse(init.body).messages));
+
+    const middleware = headroomMiddleware({ baseUrl: "http://localhost:8787" });
+    const out = await middleware.transformParams({ params: { prompt }, model: { specificationVersion: "v3" }, type: "generate" });
+
+    expect(out.prompt).toEqual(prompt);
+  });
+});

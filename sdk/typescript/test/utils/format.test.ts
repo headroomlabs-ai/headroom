@@ -1601,3 +1601,72 @@ describe("Vercel media parts carry providerOptions through the image_url carrier
     expect(openAIToVercel([converted])).toEqual([message]);
   });
 });
+
+describe("Vercel converters keep tool calls in their original place among the content parts", () => {
+  it("round-trips a tool call ahead of a reasoning part (tool-call, reasoning, tool-call)", () => {
+    const message = {
+      role: "assistant",
+      content: [
+        { type: "tool-call", toolCallId: "call_a", toolName: "lookup", input: { id: 1 } },
+        { type: "reasoning", text: "Now the second one.", providerOptions: { openai: { itemId: "rs_1" } } },
+        { type: "tool-call", toolCallId: "call_b", toolName: "lookup", input: { id: 2 } },
+      ],
+    };
+    expect(openAIToVercel(vercelToOpenAI([message]))).toEqual([message]);
+  });
+
+  it("round-trips a provider-executed search turn (reasoning, tool-call, tool-result, reasoning, text) exactly", () => {
+    const message = {
+      role: "assistant",
+      content: [
+        { type: "reasoning", text: "Search first.", providerOptions: { openai: { itemId: "rs_1" } } },
+        { type: "tool-call", toolCallId: "ws_1", toolName: "web_search", input: { q: "headroom" }, providerExecuted: true, providerOptions: { openai: { itemId: "ws_1" } } },
+        { type: "tool-result", toolCallId: "ws_1", toolName: "web_search", output: { type: "json", value: { hits: 3 } } },
+        { type: "reasoning", text: "Three hits.", providerOptions: { openai: { itemId: "rs_2" } } },
+        { type: "text", text: "Found three results." },
+      ],
+    };
+    const [converted] = vercelToOpenAI([message]);
+    // OpenAI keeps tool calls in a separate list, so the call carries where it sat: after one content part.
+    expect(converted.content).toHaveLength(4);
+    expect((converted.tool_calls as any[])[0].position).toBe(1);
+    expect(openAIToVercel([converted])).toEqual([message]);
+  });
+
+  it("round-trips a tool call ahead of a text part", () => {
+    const message = {
+      role: "assistant",
+      content: [
+        { type: "tool-call", toolCallId: "call_1", toolName: "search", input: { q: "x" } },
+        { type: "text", text: "Searching." },
+      ],
+    };
+    expect(openAIToVercel(vercelToOpenAI([message]))).toEqual([message]);
+  });
+
+  it("still sends text followed by tool calls as a string plus tool_calls, with no position", () => {
+    const [converted] = vercelToOpenAI([
+      { role: "assistant", content: [{ type: "text", text: "Searching." }, { type: "tool-call", toolCallId: "call_1", toolName: "search", input: { q: "x" } }] },
+    ]);
+    expect(converted.content).toBe("Searching.");
+    expect(converted.tool_calls).toEqual([{ id: "call_1", type: "function", function: { name: "search", arguments: '{"q":"x"}' } }]);
+  });
+});
+
+describe("Vercel tool messages with several results carry message-level providerOptions once", () => {
+  it("puts the message's providerOptions on the last of the split OpenAI tool messages only", () => {
+    const message = {
+      role: "tool",
+      content: [
+        { type: "tool-result", toolCallId: "call_1", toolName: "a", output: { type: "text", value: "A" } },
+        { type: "tool-result", toolCallId: "call_2", toolName: "b", output: { type: "text", value: "B" } },
+      ],
+      providerOptions: { anthropic: { cacheControl: { type: "ephemeral" } } },
+    };
+    const converted = vercelToOpenAI([message]);
+    expect((converted[0] as any).messageProviderOptions).toBeUndefined();
+    expect((converted[1] as any).messageProviderOptions).toEqual({ anthropic: { cacheControl: { type: "ephemeral" } } });
+    const back = openAIToVercel(converted);
+    expect(back.map((m: any) => m.providerOptions)).toEqual([undefined, { anthropic: { cacheControl: { type: "ephemeral" } } }]);
+  });
+});

@@ -254,3 +254,30 @@ describe("compress() honors a declared input format", () => {
     expect(result.messages).toEqual([{ role: "user", content: [{ type: "text", text: "compressed" }] }]);
   });
 });
+
+describe("compress() keeps OpenAI attachments on the autodetection path when messages carry providerOptions", () => {
+  beforeEach(() => {
+    mockFetch.mockReset();
+  });
+
+  it("passes an OpenAI user message with providerOptions, an image_url and a file part through unconverted", async () => {
+    const messages = [
+      {
+        role: "user",
+        providerOptions: { openai: {} },
+        content: [
+          { type: "text", text: "Describe this" },
+          { type: "image_url", image_url: { url: "https://example.com/cat.png" } },
+          { type: "file", file: { file_id: "file-abc", filename: "notes.pdf" } },
+        ],
+      },
+    ];
+    mockFetch.mockResolvedValueOnce(okResponse({ messages }));
+
+    const result = await compress(messages, { baseUrl: "http://localhost:8787" });
+
+    const body = JSON.parse(mockFetch.mock.calls[0][1].body);
+    expect(body.messages).toEqual(messages);
+    expect(result.messages).toEqual(messages);
+  });
+});
