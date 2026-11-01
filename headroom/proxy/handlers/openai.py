@@ -4566,7 +4566,11 @@ class OpenAIHandlerMixin:
                 # Sticky drop floor: turns dropped on a prior cold turn must stay
                 # dropped on the next warm turn, or the prefix no longer matches
                 # the cached cold-turn prefix and the cache misses (#4548).
-                _rc_drop_upto = getattr(openai_prefix_tracker, "reasoning_drop_upto", 0) or 0
+                _rc_drop_upto = (
+                    openai_prefix_tracker.request_reasoning_drop_floor()
+                    if openai_prefix_tracker is not None
+                    else 0
+                )
                 # Drop needs no compressor; Kompress (warm) does. Sticky drop needs
                 # neither — it just re-applies a previously-dropped shape.
                 if _rc_kompress is not None or _rc_cold or _rc_drop_upto:

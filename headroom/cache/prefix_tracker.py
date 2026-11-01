@@ -1377,6 +1377,10 @@ class PrefixCacheTracker:
                 self.reasoning_drop_upto,
             ) = state
 
+    def request_reasoning_drop_floor(self) -> int:
+        """Return the sticky reasoning-drop floor for this request's resolved turn."""
+        return int(self._request_turn_state()[5])
+
     def record_returned(
         self,
         original_messages: list[dict[str, Any]],

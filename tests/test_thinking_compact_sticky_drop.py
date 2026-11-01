@@ -1,5 +1,6 @@
 """#4548: reasoning dropped on a cold turn stays dropped on the next warm turn."""
 
+import contextvars
 from types import SimpleNamespace
 
 from headroom.transforms.thinking_compactor import compact_reasoning_openai_chat
@@ -111,3 +112,20 @@ def test_resumed_turn_restores_its_own_floor():
     tracker.reasoning_drop_upto = 3  # a cold fork raised it
     tracker._resume_turn(1)
     assert tracker.reasoning_drop_upto == 2
+
+
+def test_request_floor_ignores_a_concurrent_fork_raising_the_live_floor():
+    from headroom.cache.prefix_tracker import _resolved_turn
+
+    tracker = _tracker_with_floor(2)
+    tracker._turn_states[1] = tracker._turn_state()
+    request_a = contextvars.copy_context()
+    request_a.run(_resolved_turn.set, (tracker, 1, tracker._turn_states[1]))
+    tracker.reasoning_drop_upto = 3  # sibling fork went cold after A resolved
+
+    floor = request_a.run(tracker.request_reasoning_drop_floor)
+    assert floor == 2
+    out, _ = compact_reasoning_openai_chat(
+        _history(4, "f"), kompress=_HalfKompress(), keep_last_turns=1, drop_first_turns=floor
+    )
+    assert len(out[5]["reasoning_content"].split()) == 30  # Kompressed, not dropped
