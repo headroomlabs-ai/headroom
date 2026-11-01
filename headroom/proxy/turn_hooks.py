@@ -30,8 +30,10 @@ from typing import Any, Literal, Protocol, runtime_checkable
 
 from headroom.proxy.tool_schema_savings_policy import (
     deferred_booking,
+    hook_tool_counts,
+    loading_history,
     reconcile_deferred_tokens,
-    without_deferral_flags,
+    tools_before_hook,
 )
 
 log = logging.getLogger(__name__)
@@ -67,6 +69,9 @@ class TurnContext:
     # a token set behind the client's own value rather than overwritten. On the
     # gateway contract the merged map is the response's ``headers`` object.
     provider_headers: dict[str, str] = field(default_factory=dict)
+    # A translating backend drops ``defer_loading`` and bills every tool, so the
+    # history does not say which are billed.
+    deferred_tools_billed: bool = False
 
     def record_savings(
         self,
@@ -235,6 +240,12 @@ def clear_turn_hooks() -> None:
     _hooks.clear()
 
 
+def _tool_loading_history(ctx: TurnContext) -> object:
+    if ctx.deferred_tools_billed:
+        return None
+    return loading_history(ctx.provider, ctx.messages)
+
+
 def run_request_hooks(ctx: TurnContext, *, stream_safe_only: bool = False) -> None:
     """Run each hook's ``on_request``. Inert when none registered; never raises.
 
@@ -250,7 +261,7 @@ def run_request_hooks(ctx: TurnContext, *, stream_safe_only: bool = False) -> No
     """
     # Deferral booked before or by a hook; reconciled once every hook has run,
     # since a later hook may un-defer booked tools (tool search's hot tools).
-    booking = deferred_booking(ctx.tags, ctx.tools)
+    booking = deferred_booking(ctx.tags, ctx.tools, _tool_loading_history(ctx))
     # Positive nets wait until every hook has run: a later hook that grows the
     # request (adds a tool) offsets earlier savings, so the ledger never credits
     # more than the whole sequence actually removed.
@@ -268,7 +279,9 @@ def run_request_hooks(ctx: TurnContext, *, stream_safe_only: bool = False) -> No
             if ctx.count_messages is not None:
                 before_messages = ctx.count_messages(ctx.messages)
             if ctx.count_tools is not None:
-                before_tools = ctx.count_tools(without_deferral_flags(ctx.tools))
+                before_tools = tools_before_hook(
+                    ctx.tools, _tool_loading_history(ctx), ctx.count_tools
+                )
             fn(ctx)
             # Signed deltas, netted: a hook that folds messages but ADDS a tool
             # (skill search's ``search_skills``) saved the difference, not the
@@ -278,11 +291,15 @@ def run_request_hooks(ctx: TurnContext, *, stream_safe_only: bool = False) -> No
                 if before_messages is not None and ctx.count_messages is not None
                 else 0
             )
-            tool_saved = (
-                before_tools - ctx.count_tools(without_deferral_flags(ctx.tools))
-                if before_tools is not None and ctx.count_tools is not None
-                else 0
-            )
+            tool_saved = 0
+            if before_tools is not None and ctx.count_tools is not None:
+                tools_was, tools_now = hook_tool_counts(
+                    before_tools,
+                    ctx.tools,
+                    _tool_loading_history(ctx),
+                    ctx.count_tools,
+                )
+                tool_saved = tools_was - tools_now
             net_saved = message_saved + tool_saved
             sequence_net += net_saved
             if net_saved > 0:
@@ -297,8 +314,10 @@ def run_request_hooks(ctx: TurnContext, *, stream_safe_only: bool = False) -> No
             log.exception("turn hook %r on_request failed", getattr(hook, "name", hook))
         if ctx.tags.get("tool_search_deferred_tokens") != booked_tag:
             # This hook booked (or re-booked) the deferral: it is the new baseline.
-            booking = deferred_booking(ctx.tags, ctx.tools)
-    reconcile_deferred_tokens(ctx.tags, booking, ctx.tools, ctx.count_tools)
+            booking = deferred_booking(ctx.tags, ctx.tools, _tool_loading_history(ctx))
+    reconcile_deferred_tokens(
+        ctx.tags, booking, ctx.tools, ctx.count_tools, _tool_loading_history(ctx)
+    )
     # Book gains in run order up to the sequence's net saving; a loss that
     # exceeds them all books nothing (never a negative entry).
     budget = max(0, sequence_net)

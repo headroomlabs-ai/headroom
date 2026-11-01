@@ -83,3 +83,36 @@ def test_compacting_client_deferred_tools_counts_nothing(make_headroom_client) -
 
     assert "tool_schema_compaction" in data["transforms_applied"]
     assert data["tokens_saved"] == 0
+
+
+def test_compacting_a_loaded_deferred_tool_counts_its_delta(make_headroom_client) -> None:
+    # Once a tool_reference in the history loads a deferred tool it is billed,
+    # so its compaction is a saving like a resident tool's.
+    client = make_headroom_client(optimize=False)
+    sent = [{**_annotated_tool(0), "defer_loading": True}]
+    reference = {"type": "tool_reference", "tool_name": "tool_0"}
+    body = {
+        "model": MODEL,
+        "messages": [
+            {"role": "user", "content": "find it"},
+            {
+                "role": "assistant",
+                "content": [{"type": "tool_use", "id": "t1", "name": "search", "input": {}}],
+            },
+            {
+                "role": "user",
+                "content": [{"type": "tool_result", "tool_use_id": "t1", "content": [reference]}],
+            },
+        ],
+        "tools": sent,
+        "gateway": {"can_redrive": False, "can_relay_response": False},
+    }
+    resp = compress(client, body)
+    assert resp.status_code == 200, resp.text
+    data = resp.json()
+    tok = get_tokenizer(MODEL)
+    removed = tok.count_text(json.dumps(sent, default=str)) - tok.count_text(
+        json.dumps(data["body"]["tools"], default=str)
+    )
+    assert removed > 0
+    assert data["tokens_saved"] == removed

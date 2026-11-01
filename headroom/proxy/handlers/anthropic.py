@@ -22,8 +22,10 @@ from urllib.parse import urlsplit
 from headroom.proxy.session_affinity import session_affinity_headers
 from headroom.proxy.stage_timer import StageTimer, emit_stage_timings_log
 from headroom.proxy.tool_schema_savings_policy import (
+    billed_tools,
+    hook_tool_counts,
     net_hook_tool_saving,
-    without_deferral_flags,
+    tools_before_hook,
 )
 
 if TYPE_CHECKING:
@@ -3211,6 +3213,8 @@ class AnthropicHandlerMixin:
             _tool_tokens_after = 0
 
             def _count_tool_tokens(value: object) -> int:
+                if not value:
+                    return 0
                 try:
                     return tokenizer.count_text(json.dumps(value, default=str))
                 except Exception as e:
@@ -3220,6 +3224,18 @@ class AnthropicHandlerMixin:
                         describe_exception(e),
                     )
                     return 0
+
+            # A translating backend drops ``defer_loading`` and bills every tool,
+            # so the history says nothing about what is billed.
+            from headroom.proxy.route_advice import resolver_for
+
+            _deferred_billed_eagerly = resolver_for(self).for_request(request) is not None
+
+            def _compaction_counted(value: object) -> object:
+                """The tools whose compaction is a saving: the billed ones."""
+                if _deferred_billed_eagerly:
+                    return value
+                return billed_tools(value, optimized_messages)
 
             _tools_compaction_started = time.time()
             try:
@@ -3235,8 +3251,10 @@ class AnthropicHandlerMixin:
                 if _tools_modified:
                     tools = body["tools"]
                     transforms_applied.append("anthropic:tool_schema_compaction")
-                    _tool_tokens_before = _count_tool_tokens(_pre_compaction_tools)
-                    _tool_tokens_after = _count_tool_tokens(tools)
+                    _tool_tokens_before = _count_tool_tokens(
+                        _compaction_counted(_pre_compaction_tools)
+                    )
+                    _tool_tokens_after = _count_tool_tokens(_compaction_counted(tools))
                     _tools_compaction_ms = (time.time() - _tools_compaction_started) * 1000
                     logger.debug(
                         "[%s] tool schema compaction: %d -> %d bytes (%.0f%% saved) in %.1fms",
@@ -3273,8 +3291,10 @@ class AnthropicHandlerMixin:
                         # Runs after schema compaction, so only seed "before" when that
                         # pass didn't already; "after" always tracks the latest tools.
                         if not _tool_tokens_before:
-                            _tool_tokens_before = _count_tool_tokens(_pre_desc_tools)
-                        _tool_tokens_after = _count_tool_tokens(tools)
+                            _tool_tokens_before = _count_tool_tokens(
+                                _compaction_counted(_pre_desc_tools)
+                            )
+                        _tool_tokens_after = _count_tool_tokens(_compaction_counted(tools))
                         logger.debug(
                             "[%s] tool description compaction: %d -> %d bytes (%.0f%% saved, max_chars=%d)",
                             request_id,
@@ -3483,6 +3503,7 @@ class AnthropicHandlerMixin:
                     tags=tags,
                     count_messages=tokenizer.count_messages,
                     count_tools=_count_tool_tokens,
+                    deferred_tools_billed=_deferred_billed_eagerly,
                 )
                 # Snapshot BEFORE the hook (same tokenizer) so we can tell whether the
                 # hook itself folded — comparing against the pipeline's optimized_tokens
@@ -3491,11 +3512,11 @@ class AnthropicHandlerMixin:
                     _pre_hook_tokens = tokenizer.count_messages(optimized_messages)
                 except Exception:
                     _pre_hook_tokens = None
-                _th_tools_before = body.get("tools")
-                _th_tok_before = (
-                    _count_tool_tokens(without_deferral_flags(_th_tools_before))
-                    if _th_tools_before
-                    else 0
+                # Deferred tools no tool_reference has loaded are not billed, so
+                # a hook condensing one saves nothing (hook_tool_counts).
+                _th_loading = None if _deferred_billed_eagerly else optimized_messages
+                _th_tools_snapshot = tools_before_hook(
+                    body.get("tools"), _th_loading, _count_tool_tokens
                 )
                 run_request_hooks(_req_ctx, stream_safe_only=bool(stream))
                 if _req_ctx.messages is not optimized_messages:
@@ -3508,10 +3529,11 @@ class AnthropicHandlerMixin:
                 # so measure the FINAL tools object. Deferral-shaped (removes schemas
                 # count_messages never saw), hence a tag rather than a fold — mirrors
                 # the OpenAI chat path so a turn-hook extension is credited on both.
-                _th_tok_after = (
-                    _count_tool_tokens(without_deferral_flags(_req_ctx.tools))
-                    if _req_ctx.tools
-                    else 0
+                _th_tok_before, _th_tok_after = hook_tool_counts(
+                    _th_tools_snapshot,
+                    _req_ctx.tools,
+                    None if _deferred_billed_eagerly else optimized_messages,
+                    _count_tool_tokens,
                 )
                 _th_saved = max(0, _th_tok_before - _th_tok_after)
                 _th_tool_growth = max(0, _th_tok_after - _th_tok_before)
@@ -3830,8 +3852,6 @@ class AnthropicHandlerMixin:
             # request from a translating backend for it. Absent, unresolvable,
             # or same-protocol -> `self.anthropic_backend`, i.e. exactly the
             # behaviour this line had before.
-            from headroom.proxy.route_advice import resolver_for
-
             request_backend = resolver_for(self).for_request(request, body=body)
             if request_backend is not None:
                 # Route through Bedrock backend
