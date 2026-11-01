@@ -333,10 +333,11 @@ def register_provider_routes(app: FastAPI, proxy: Any) -> None:
 
     @app.post("/omlx/v1/messages")
     async def omlx_messages(request: Request):
+        from headroom.config import resolve_omlx_target_api_url
+
         omlx_target = (
             getattr(proxy.config, "omlx_target_api_url", None)
-            or os.environ.get("OMLX_TARGET_API_URL")
-            or os.environ.get("HEADROOM_OMLX_URL")
+            or resolve_omlx_target_api_url(environ=os.environ)
             or "http://127.0.0.1:8888"
         )
         return await proxy.handle_anthropic_messages(
