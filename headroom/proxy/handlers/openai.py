@@ -58,7 +58,7 @@ from headroom.proxy.tool_schema_savings_policy import (
     tool_schema_saved_from_tags,
     without_deferral_flags,
 )
-from headroom.proxy.turn_hooks import run_responses_create_hooks
+from headroom.proxy.turn_hooks import count_system_tokens, run_responses_create_hooks
 from headroom.proxy.upstream_guard import is_safe_upstream_url
 from headroom.proxy.ws_headers import WS_HOP_BY_HOP_HEADERS
 from headroom.proxy.ws_session_registry import (
@@ -153,6 +153,30 @@ _CCR_HASH_RE = re.compile(
     r"(?:Retrieve (?:more|original): hash=|<<ccr:)([a-fA-F0-9]{12,24})(?=[^a-fA-F0-9]|$)"
 )
 _BARE_CCR_HASH_RE = re.compile(r"[a-fA-F0-9]{12,24}")
+
+
+def _leading_system_item(items: Any) -> dict[str, Any] | None:
+    """A Responses ``input``'s leading system or developer item, if it has one."""
+    first = items[0] if isinstance(items, list) and items else None
+    if isinstance(first, dict) and first.get("role") in ("system", "developer"):
+        return first
+    return None
+
+
+def _write_responses_system(body: dict[str, Any], item_key: str | None, system: Any) -> None:
+    """Put a turn hook's ``system`` back: into the leading item of ``body[item_key]``,
+    found again because a hook may have rebuilt the list, else ``instructions``.
+    ``None`` removes it, since an item without content is rejected upstream."""
+    item = _leading_system_item(body.get(item_key)) if item_key else None
+    if item is None:
+        if system is None:
+            body.pop("instructions", None)
+        else:
+            body["instructions"] = system
+    elif system is None:
+        body[item_key] = body[item_key][1:]
+    else:
+        item["content"] = system
 
 
 def _response_ccr_hashes(messages: list[dict[str, Any]], markers: list[str]) -> list[str]:
@@ -3061,10 +3085,25 @@ class OpenAIHandlerMixin:
                     )
                 except Exception:
                     _mt_before = 0
+            # The Responses system prompt: `instructions`, or a leading system or
+            # developer input item. On a continuation that item is a turn-level
+            # note, and `instructions` holding only the output shaper's block is
+            # not the client's prompt. The hook gets a copy, so an in-place edit
+            # is not also a message delta, and is booked once, as a system delta.
+            _system_item = (
+                None if working.get("previous_response_id") else _leading_system_item(_msgs_before)
+            )
+            _instructions = working.get("instructions")
+            _system_in_item = _system_item is not None and (
+                not _instructions
+                or (isinstance(_instructions, str) and _instructions.startswith("<headroom_"))
+            )
+            _system_before = _system_item.get("content") if _system_in_item else _instructions
             _req_ctx = TurnContext(
                 provider="openai",
                 model=str(model),
                 messages=_msgs_before,
+                system=copy.deepcopy(_system_before),
                 tools=working.get("tools"),
                 config=getattr(self, "config", None),
                 tags=savings_tags if savings_tags is not None else {},
@@ -3112,6 +3151,21 @@ class OpenAIHandlerMixin:
                         request_id,
                         describe_exception(e),
                     )
+            if _req_ctx.system != _system_before:
+                _write_responses_system(
+                    working, _msg_key if _system_in_item else None, _req_ctx.system
+                )
+                _sys_before = count_system_tokens(_req_ctx.count_messages, _system_before)
+                _sys_after = count_system_tokens(_req_ctx.count_messages, _req_ctx.system)
+                if _sys_before is not None and _sys_after is not None:
+                    if _sys_before > _sys_after and savings_tags is not None:
+                        savings_tags[TURN_HOOK_SYSTEM_SAVED_TAG] = (
+                            int(savings_tags.get(TURN_HOOK_SYSTEM_SAVED_TAG, 0) or 0)
+                            + _sys_before
+                            - _sys_after
+                        )
+                    elif _sys_after > _sys_before:
+                        tokens_saved = max(0, tokens_saved - (_sys_after - _sys_before))
             modified = True
             transforms.append("openai:responses:turn_hook")
 

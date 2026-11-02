@@ -72,14 +72,16 @@ class TurnContext:
     # A translating backend drops ``defer_loading`` and bills every tool, so the
     # history does not say which are billed.
     deferred_tools_billed: bool = False
-    # The request's top-level system prompt (Anthropic ``/v1/messages`` only:
-    # a string or a list of blocks; ``None`` elsewhere). A hook may rewrite it
-    # in place or replace it; the handler forwards the result, and the hook
-    # runner books its token delta with the message and tool deltas. Response
-    # hooks see it as the request hooks left it, which may or may not include
-    # the output shaper's later steering block. ``system`` comes before the
-    # messages in Anthropic's cache key: a rewrite that differs between turns of a
-    # conversation busts the whole message prefix, so it must be deterministic.
+    # The request's system prompt: Anthropic's top-level ``system`` (a string or
+    # ``text`` blocks), or on the proxy's Responses path ``instructions`` or a
+    # leading system or developer input item (``input_text`` blocks); ``None``
+    # elsewhere. A hook may rewrite it in place or replace it; the handler forwards
+    # the result, and the hook runner books its token delta with the message and
+    # tool deltas. Anthropic's response hooks see it as the request hooks left it,
+    # which may or may not include the output shaper's later steering block; on
+    # Responses they see ``None``. It comes before the messages in the cache key: a
+    # rewrite that differs between turns of a conversation busts the whole message
+    # prefix, so it must be deterministic.
     system: Any = None
 
     def record_savings(
@@ -258,7 +260,7 @@ def _tool_loading_history(ctx: TurnContext) -> object:
 def count_system_tokens(
     count_messages: Callable[[list[dict[str, Any]]], int] | None, system: Any
 ) -> int | None:
-    """Tokens of an Anthropic top-level ``system`` (string or blocks), 0 when absent.
+    """Tokens of a request's system prompt (string or blocks), 0 when absent.
 
     Counted as one message with the same counter as the messages, so a hook's
     system delta is on the scale of its message delta. ``None`` when there is
