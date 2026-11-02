@@ -741,3 +741,12 @@ def test_the_orphan_warning_is_throttled(caplog: pytest.LogCaptureFixture) -> No
 
     lines = [r for r in caplog.records if "tool_search_deferred_orphan" in r.getMessage()]
     assert len(lines) == 1
+
+
+def test_copilot_completions_hosts_do_not_keep_deferral() -> None:
+    tools = [ANTHROPIC_SEARCH_REGEX, {"name": "mcp__srv__a", "defer_loading": True}]
+
+    out = strip_first_party_tool_search_tools_for_third_party_upstream(
+        tools, "https://proxy.business.githubcopilot.com"
+    )
+    assert out is not tools

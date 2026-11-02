@@ -305,3 +305,41 @@ def test_a_retrieve_tool_the_client_declared_is_not_a_proxy_cost() -> None:
     retrieve = _tool(CCR_TOOL_NAME)
     assert proxy_added_tools([retrieve], [retrieve], CCR_TOOL_NAME) == []
     assert proxy_added_tools([retrieve], [], CCR_TOOL_NAME) == [retrieve]
+
+
+def test_a_proxy_cost_comes_off_the_tool_search_credit_once_the_rest_is_gone():
+    from headroom.proxy.savings_attribution import from_tags, record_savings
+    from headroom.proxy.tool_schema_savings_policy import (
+        headline_tokens_saved,
+        net_hook_tool_saving,
+    )
+
+    tags = {"tool_search_deferred_tokens": 400}
+    record_savings(tags, "tool_search", tokens=400, estimated=True)
+    saved = net_hook_tool_saving(-70, tags, 0)
+    assert headline_tokens_saved(saved, tags) == 330
+    assert from_tags(tags)[0]["tokens"] == 330
+
+
+def test_a_reference_repair_removes_loads_nothing():
+    from headroom.proxy.tool_schema_savings_policy import unbilled_deferred_tool_names
+
+    tools = [{"name": "lookup", "defer_loading": True}]
+    history = [
+        {
+            "role": "user",
+            "content": [
+                {
+                    "type": "tool_search_tool_result",
+                    "tool_use_id": "s1",
+                    "content": {
+                        "type": "tool_search_tool_search_result",
+                        "tool_references": [{"type": "tool_reference", "tool_name": "lookup"}],
+                    },
+                }
+            ],
+        }
+    ]
+    assert unbilled_deferred_tool_names(tools, history) == {"lookup"}
+    search = {"name": "tool_search_tool_regex", "type": "tool_search_tool_regex_20251119"}
+    assert unbilled_deferred_tool_names([search, *tools], history) == frozenset()

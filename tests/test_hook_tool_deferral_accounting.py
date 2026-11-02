@@ -350,6 +350,7 @@ class _CondenseAll:
 def _client_deferred_run(messages: list[dict]) -> list[dict]:
     """Copilot's shape: one resident tool, two the client itself deferred."""
     tools = [
+        {"name": "tool_search_tool_regex", "type": "tool_search_tool_regex_20251119"},
         _tool("resident"),
         {**_tool("loaded"), "defer_loading": True},
         {**_tool("unloaded"), "defer_loading": True},

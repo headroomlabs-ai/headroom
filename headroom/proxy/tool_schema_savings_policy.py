@@ -95,9 +95,15 @@ def unbilled_deferred_tool_names(tools: object, messages: object) -> frozenset[s
     }
     if not deferred:
         return frozenset()
-    from headroom.proxy.helpers import referenced_tool_names
+    from headroom.proxy.helpers import (
+        referenced_tool_names,
+        strip_unsupported_tool_search_blocks,
+    )
 
-    return frozenset(deferred - referenced_tool_names(messages))
+    # What the provider receives: repair drops a reference this request's tools
+    # cannot support, and that one loads nothing.
+    repaired, _ = strip_unsupported_tool_search_blocks(messages, tools)
+    return frozenset(deferred - referenced_tool_names(repaired))
 
 
 def _tool_names(tools: object) -> set[str]:
@@ -247,10 +253,15 @@ def deferred_booking(tags: object, tools: object, messages: object) -> DeferredB
         for t in (tools if isinstance(tools, list) else [])
         if isinstance(t, dict) and t.get("defer_loading") and t.get("name")
     }
+    return booked, snapshot, _deferral_entry(tags), unbilled_deferred_tool_names(tools, messages)
+
+
+def _deferral_entry(tags: dict[str, Any]) -> dict[str, Any] | None:
+    """The ledger's estimated ``tool_search`` row, if there is one."""
     from headroom.proxy.savings_attribution import SAVINGS_ATTRIBUTION_TAG
 
     ledger = tags.get(SAVINGS_ATTRIBUTION_TAG)
-    entry = next(
+    return next(
         (
             item
             for item in reversed(ledger if isinstance(ledger, list) else [])
@@ -260,7 +271,6 @@ def deferred_booking(tags: object, tools: object, messages: object) -> DeferredB
         ),
         None,
     )
-    return booked, snapshot, entry, unbilled_deferred_tool_names(tools, messages)
 
 
 def reconcile_deferred_tokens(
@@ -355,8 +365,9 @@ def net_hook_tool_saving(raw_saved: int, tags: object, hook_tool_saved: int) -> 
     message text while removing tools leaves ``raw_saved`` negative, and the
     clamp alone would drop the growth while the tag kept the full removal. The
     deficit is debited from the tag first (at most what the hooks booked on
-    this request), then from the system-prompt cut they booked, so headline ==
-    messages + tools + system, signed, clamped once.
+    this request), then from the system-prompt cut they booked, then from the
+    tool-search credit and its ledger row, so headline == messages + tools + system,
+    signed, clamped once.
     """
     raw = int(raw_saved)
     booked = max(0, int(hook_tool_saved or 0))
@@ -370,6 +381,18 @@ def net_hook_tool_saving(raw_saved: int, tags: object, hook_tool_saved: int) -> 
         offset = min(-raw, system_cut)
         if offset:
             tags[TURN_HOOK_SYSTEM_SAVED_TAG] = system_cut - offset
+            raw += offset
+    if raw < 0 and isinstance(tags, dict):
+        try:
+            credit = max(0, int(tags.get("tool_search_deferred_tokens") or 0))
+        except (TypeError, ValueError):
+            credit = 0
+        offset = min(-raw, credit)
+        if offset:
+            tags["tool_search_deferred_tokens"] = credit - offset
+            entry = _deferral_entry(tags)
+            if entry is not None:
+                entry["tokens"] = max(0, int(entry.get("tokens") or 0) - offset)
             raw += offset
     return max(0, raw)
 
