@@ -625,20 +625,28 @@ class AnthropicHandlerMixin:
             return False
 
     @staticmethod
-    def _outgoing_body_has_redeemable_marker(body: Any) -> bool:
-        """Does this turn's new content carry a marker retrieval could expand?
+    def _outgoing_body_has_redeemable_marker(
+        body: Any,
+        previous_forwarded_messages: list[dict[str, Any]] | None = None,
+    ) -> bool:
+        """Does the outgoing body show the model a marker it has not seen yet?
 
         ``headroom_retrieve`` exists only to expand a ``<<ccr:...>>`` marker, so
         a request carrying none cannot benefit from the buffered path (#3071).
 
-        Only messages after the last assistant turn are scanned. A marker stays
-        in the history for the rest of the session, so scanning the whole body
-        buffered every later turn once one tool result had been compressed:
-        the buffered share climbed toward 90% of turns with zero retrievals,
-        and time-to-first-byte became the whole generation (#3587). The model
-        already had the marker in front of it on the turn that introduced it,
-        and that turn was buffered. A later streamed turn that does call
-        ``headroom_retrieve`` behaves like any turn with no marker.
+        Only markers new to the model count. A marker stays in the history for
+        the rest of the session, so counting every marker in the body buffered
+        every later turn once one tool result had been compressed: the buffered
+        share climbed toward 90% of turns with zero retrievals, and
+        time-to-first-byte became the whole generation (#3587). A marker that
+        was already forwarded on an earlier turn was in front of the model on
+        that turn, and that turn was buffered.
+
+        "New" is decided against what this session actually forwarded last
+        turn, not by message position: token mode can compress an earlier tool
+        result on this request, so a marker first seen now may sit anywhere in
+        the history. With no forwarded history to compare against, every owned
+        marker counts as new.
 
         Ownership is verified rather than shape-matched: the marker shape is not
         unique to Headroom, and adopting another context tool's hash would send
@@ -654,30 +662,24 @@ class AnthropicHandlerMixin:
         messages = body.get("messages")
         if not isinstance(messages, list) or not messages:
             return False
-        last_assistant = max(
-            (
-                i
-                for i, message in enumerate(messages)
-                if isinstance(message, dict) and message.get("role") == "assistant"
-            ),
-            default=-1,
-        )
-        new_messages = messages[last_assistant + 1 :]
-        if not new_messages:
-            return False
         try:
             from headroom.ccr.tool_injection import CCRToolInjector
+            from headroom.proxy.helpers import has_new_ccr_markers
 
             probe = CCRToolInjector(
                 provider="anthropic",
                 inject_tool=False,
                 inject_system_instructions=False,
             )
-            probe.scan_for_markers(new_messages)
+            probe.scan_for_markers(messages)
             if not probe.detected_hashes:
                 return False
             probe.verify_ownership()
-            return bool(probe.detected_hashes)
+            return has_new_ccr_markers(
+                current_detected_hashes=list(probe.detected_hashes),
+                previous_forwarded_messages=previous_forwarded_messages,
+                provider="anthropic",
+            )
         except Exception:  # pragma: no cover - defensive
             logger.debug("CCR: marker probe failed; keeping the buffered path", exc_info=True)
             return True
@@ -4164,7 +4166,8 @@ class AnthropicHandlerMixin:
                     and has_ccr_retrieve_tool(tools if tools is not None else body.get("tools"))
                 )
                 buffered_retrieval_can_help = (
-                    retrieve_tool_is_offered and self._outgoing_body_has_redeemable_marker(body)
+                    retrieve_tool_is_offered
+                    and self._outgoing_body_has_redeemable_marker(body, previous_forwarded_messages)
                 )
                 wants_buffered_stream_ccr = bool(buffered_retrieval_can_help)
                 if retrieve_tool_is_offered and not buffered_retrieval_can_help:

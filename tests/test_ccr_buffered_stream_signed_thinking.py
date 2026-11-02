@@ -289,59 +289,52 @@ def test_buffering_is_gated_on_a_redeemable_marker(
         assert calls["stream_body"]["stream"] is True
 
 
-def _agent_turn_body(*, marker: str, marker_in_latest_turn: bool) -> dict:
-    """A two-turn agent loop whose only owned marker is old or new this turn."""
-    old_output = f"earlier output at <<ccr:{marker}>>" if not marker_in_latest_turn else "short"
-    new_output = f"new output at <<ccr:{marker}>>" if marker_in_latest_turn else "short"
+def _owned_marker(content: str) -> str:
+    """Store one more original in the (fixture-reset) store; return its hash."""
+    from headroom.cache.compression_store import get_compression_store
+
+    return get_compression_store().store(
+        content,
+        "<<ccr:placeholder>>",
+        original_tokens=100,
+        compressed_tokens=5,
+        tool_name="Read",
+    )
+
+
+def _tool_turn(tool_use_id: str, output: str) -> list[dict]:
+    return [
+        {
+            "role": "assistant",
+            "content": [{"type": "tool_use", "id": tool_use_id, "name": "Read", "input": {}}],
+        },
+        {
+            "role": "user",
+            "content": [{"type": "tool_result", "tool_use_id": tool_use_id, "content": output}],
+        },
+    ]
+
+
+def _agent_body(messages: list[dict]) -> dict:
     return {
         "model": "claude-sonnet-4-20250514",
         "max_tokens": 64,
         "stream": True,
         "tools": [RETRIEVE_TOOL],
-        "messages": [
-            {"role": "user", "content": "read the logs"},
-            {
-                "role": "assistant",
-                "content": [{"type": "tool_use", "id": "tu_1", "name": "Read", "input": {}}],
-            },
-            {
-                "role": "user",
-                "content": [{"type": "tool_result", "tool_use_id": "tu_1", "content": old_output}],
-            },
-            {
-                "role": "assistant",
-                "content": [{"type": "tool_use", "id": "tu_2", "name": "Read", "input": {}}],
-            },
-            {
-                "role": "user",
-                "content": [{"type": "tool_result", "tool_use_id": "tu_2", "content": new_output}],
-            },
-        ],
+        "messages": messages,
     }
 
 
-@pytest.mark.parametrize(
-    ("marker_in_latest_turn", "expect_buffered"),
-    [
-        (True, True),
-        # The marker was already in front of the model on the turn that
-        # introduced it. Buffering every later turn for it is #3587: the
-        # buffered share climbed toward 90% of turns with zero retrievals.
-        (False, False),
-    ],
-)
-def test_buffering_is_gated_on_a_marker_new_this_turn(
-    marker_in_latest_turn: bool, expect_buffered: bool, ccr_marker: str
-) -> None:
-    """A marker carried forward in history does not make every later turn buffer."""
-    calls: dict[str, object] = {}
+def _replay_session(turns: list[list[dict]]) -> list[str]:
+    """Send each message list as one turn of the same session; report the path taken."""
+    paths: list[str] = []
 
     async def fake_stream_response(url, headers, body, *args, **kwargs):  # noqa: ANN001
-        calls["stream_body"] = body
+        paths.append("streamed")
         return fastapi.responses.StreamingResponse(iter([SSE_BODY]), media_type="text/event-stream")
 
     async def fake_retry(method, url, headers, req_body, *args, **kwargs):  # noqa: ANN001
-        calls["buffered_body"] = json.loads(json.dumps(req_body))
+        paths.append("buffered")
         return httpx.Response(
             200,
             json={
@@ -360,18 +353,50 @@ def test_buffering_is_gated_on_a_marker_new_this_turn(
     with TestClient(app) as client:
         client.app.state.proxy._stream_response = fake_stream_response
         client.app.state.proxy._retry_request = fake_retry
-        resp = client.post(
-            "/v1/messages",
-            json=_agent_turn_body(marker=ccr_marker, marker_in_latest_turn=marker_in_latest_turn),
-            headers=_headers(),
-        )
+        for messages in turns:
+            resp = client.post("/v1/messages", json=_agent_body(messages), headers=_headers())
+            assert resp.status_code == 200, resp.text
+    return paths
 
-    assert resp.status_code == 200, resp.text
-    if expect_buffered:
-        assert "buffered_body" in calls, "a marker new this turn must still buffer"
-    else:
-        assert "stream_body" in calls, "an old marker alone must keep the client streaming"
-        assert "buffered_body" not in calls
+
+def test_a_marker_already_forwarded_does_not_buffer_later_turns(ccr_marker: str) -> None:
+    """A marker carried forward in history does not make every later turn buffer.
+
+    The marker was in front of the model on the turn that introduced it, and
+    that turn buffered. Buffering every later turn for it is #3587: the
+    buffered share climbed toward 90% of turns with zero retrievals.
+    """
+    first = [
+        {"role": "user", "content": "read the logs"},
+        *_tool_turn("tu_1", f"earlier output at <<ccr:{ccr_marker}>>"),
+    ]
+    second = [*first, *_tool_turn("tu_2", "short")]
+
+    assert _replay_session([first, second]) == ["buffered", "streamed"]
+
+
+def test_a_marker_first_shown_in_an_earlier_message_still_buffers(ccr_marker: str) -> None:
+    """New to the model is what counts, not where the marker sits.
+
+    Token mode can compress an earlier tool result on a later request, so the
+    model first sees that marker in the middle of the history. Retrieval has
+    to be handled server-side there too, or the call reaches the client.
+    """
+    newly_compressed = _owned_marker("a different, uncompressed tool output")
+    first = [
+        {"role": "user", "content": "read the logs"},
+        *_tool_turn("tu_1", f"earlier output at <<ccr:{ccr_marker}>>"),
+    ]
+    second = [
+        {"role": "user", "content": "read the logs"},
+        *_tool_turn(
+            "tu_1",
+            f"earlier output at <<ccr:{ccr_marker}>> and <<ccr:{newly_compressed}>>",
+        ),
+        *_tool_turn("tu_2", "short"),
+    ]
+
+    assert _replay_session([first, second]) == ["buffered", "buffered"]
 
 
 def test_cache_hit_never_replays_a_foreign_content_type() -> None:
