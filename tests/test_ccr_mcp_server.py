@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import asyncio
-import concurrent.futures
 import contextlib
 import http.server
 import json
@@ -241,11 +240,20 @@ def _swap_before_open(monkeypatch, swap) -> None:
     monkeypatch.setattr(mcp_server, "_open_nofollow", swap_then_open)
 
 
-def _read_text_promptly(server, file_path: str) -> str:
-    # A FIFO put in the way must not block the open; a stuck call fails here
-    # instead of hanging the suite.
-    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
-        return pool.submit(_read_text, server, file_path).result(timeout=5)
+def _read_text_promptly(server, file_path: str, fifo) -> str:
+    # A FIFO put in the way must not block the open. If the read is stuck,
+    # open the FIFO for writing to release it, then fail: the test ends in
+    # bounded time either way and leaves no worker thread behind.
+    result: list[str] = []
+    worker = threading.Thread(target=lambda: result.append(_read_text(server, file_path)))
+    worker.start()
+    worker.join(timeout=5)
+    if worker.is_alive():
+        with contextlib.suppress(OSError):
+            os.close(os.open(fifo, os.O_WRONLY | os.O_NONBLOCK))
+        worker.join(timeout=5)
+        pytest.fail(f"headroom_read blocked on the FIFO at {fifo}")
+    return result[0]
 
 
 @pytest.mark.parametrize("replaced", ["directory", "root"])
@@ -266,12 +274,16 @@ def test_read_tool_refuses_a_symlink_swapped_in_after_the_check(
             shutil.rmtree(workspace / "data")
             (workspace / "data").symlink_to(secret.parent)
     else:
+        # Configure the workspace as a root instead of working in it: Windows
+        # cannot rename the process's working directory.
+        monkeypatch.setenv("HEADROOM_MCP_READ_ROOTS", str(workspace))
+        monkeypatch.chdir(workspace.parent)
         (workspace / "report.txt").write_text("PUBLIC\n", encoding="utf-8")
-        file_path = "report.txt"
+        file_path = str(workspace / "report.txt")
 
         def swap():
             workspace.rename(workspace.parent / "moved-away")
-            workspace.symlink_to(secret.parent)
+            workspace.symlink_to(secret.parent, target_is_directory=True)
 
     _swap_before_open(monkeypatch, swap)
     server = mcp_server.HeadroomMCPServer(check_proxy=False)
@@ -292,21 +304,23 @@ def test_read_tool_does_not_block_on_a_fifo(
     # runs on the MCP event loop, so it must refuse one without waiting.
     workspace, _ = workspace_and_secret
     if where == "target":
-        os.mkfifo(workspace / "pipe")
+        fifo = workspace / "pipe"
+        os.mkfifo(fifo)
         file_path = "pipe"
     else:
         (workspace / "data").mkdir()
         (workspace / "data" / "report.txt").write_text("PUBLIC\n", encoding="utf-8")
         file_path = "data/report.txt"
+        fifo = workspace / "data"
 
         def swap():
-            shutil.rmtree(workspace / "data")
-            os.mkfifo(workspace / "data")
+            shutil.rmtree(fifo)
+            os.mkfifo(fifo)
 
         _swap_before_open(monkeypatch, swap)
     server = mcp_server.HeadroomMCPServer(check_proxy=False)
 
-    text = _read_text_promptly(server, file_path)
+    text = _read_text_promptly(server, file_path, fifo)
 
     assert "PUBLIC" not in text
     assert json.loads(text)["error"].startswith(("Not a file", "File not found"))
