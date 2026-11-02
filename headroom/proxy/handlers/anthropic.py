@@ -626,10 +626,19 @@ class AnthropicHandlerMixin:
 
     @staticmethod
     def _outgoing_body_has_redeemable_marker(body: Any) -> bool:
-        """Does the body about to be sent carry a marker retrieval could expand?
+        """Does this turn's new content carry a marker retrieval could expand?
 
         ``headroom_retrieve`` exists only to expand a ``<<ccr:...>>`` marker, so
         a request carrying none cannot benefit from the buffered path (#3071).
+
+        Only messages after the last assistant turn are scanned. A marker stays
+        in the history for the rest of the session, so scanning the whole body
+        buffered every later turn once one tool result had been compressed:
+        the buffered share climbed toward 90% of turns with zero retrievals,
+        and time-to-first-byte became the whole generation (#3587). The model
+        already had the marker in front of it on the turn that introduced it,
+        and that turn was buffered. A later streamed turn that does call
+        ``headroom_retrieve`` behaves like any turn with no marker.
 
         Ownership is verified rather than shape-matched: the marker shape is not
         unique to Headroom, and adopting another context tool's hash would send
@@ -645,6 +654,17 @@ class AnthropicHandlerMixin:
         messages = body.get("messages")
         if not isinstance(messages, list) or not messages:
             return False
+        last_assistant = max(
+            (
+                i
+                for i, message in enumerate(messages)
+                if isinstance(message, dict) and message.get("role") == "assistant"
+            ),
+            default=-1,
+        )
+        new_messages = messages[last_assistant + 1 :]
+        if not new_messages:
+            return False
         try:
             from headroom.ccr.tool_injection import CCRToolInjector
 
@@ -653,7 +673,7 @@ class AnthropicHandlerMixin:
                 inject_tool=False,
                 inject_system_instructions=False,
             )
-            probe.scan_for_markers(messages)
+            probe.scan_for_markers(new_messages)
             if not probe.detected_hashes:
                 return False
             probe.verify_ownership()

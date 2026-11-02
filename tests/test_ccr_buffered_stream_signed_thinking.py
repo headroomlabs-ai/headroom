@@ -90,11 +90,13 @@ def ccr_marker() -> str:
 
 
 def _body(*, with_thinking: bool, marker: str | None = None) -> dict:
-    first = "hi" if marker is None else f"hi — earlier output is at <<ccr:{marker}>>"
-    messages: list[dict] = [{"role": "user", "content": first}]
+    # The marker rides in the latest user turn: only content new this turn
+    # gates buffering (#3587).
+    latest = "hi" if marker is None else f"hi — earlier output is at <<ccr:{marker}>>"
+    messages: list[dict] = [{"role": "user", "content": "hi" if with_thinking else latest}]
     if with_thinking:
         messages.append(SIGNED_THINKING_TURN)
-        messages.append({"role": "user", "content": "continue"})
+        messages.append({"role": "user", "content": latest})
     return {
         "model": "claude-sonnet-4-20250514",
         "max_tokens": 64,
@@ -285,6 +287,91 @@ def test_buffering_is_gated_on_a_redeemable_marker(
         assert "stream_body" in calls, "nothing to retrieve — the client must keep streaming"
         assert "buffered_body" not in calls
         assert calls["stream_body"]["stream"] is True
+
+
+def _agent_turn_body(*, marker: str, marker_in_latest_turn: bool) -> dict:
+    """A two-turn agent loop whose only owned marker is old or new this turn."""
+    old_output = f"earlier output at <<ccr:{marker}>>" if not marker_in_latest_turn else "short"
+    new_output = f"new output at <<ccr:{marker}>>" if marker_in_latest_turn else "short"
+    return {
+        "model": "claude-sonnet-4-20250514",
+        "max_tokens": 64,
+        "stream": True,
+        "tools": [RETRIEVE_TOOL],
+        "messages": [
+            {"role": "user", "content": "read the logs"},
+            {
+                "role": "assistant",
+                "content": [{"type": "tool_use", "id": "tu_1", "name": "Read", "input": {}}],
+            },
+            {
+                "role": "user",
+                "content": [{"type": "tool_result", "tool_use_id": "tu_1", "content": old_output}],
+            },
+            {
+                "role": "assistant",
+                "content": [{"type": "tool_use", "id": "tu_2", "name": "Read", "input": {}}],
+            },
+            {
+                "role": "user",
+                "content": [{"type": "tool_result", "tool_use_id": "tu_2", "content": new_output}],
+            },
+        ],
+    }
+
+
+@pytest.mark.parametrize(
+    ("marker_in_latest_turn", "expect_buffered"),
+    [
+        (True, True),
+        # The marker was already in front of the model on the turn that
+        # introduced it. Buffering every later turn for it is #3587: the
+        # buffered share climbed toward 90% of turns with zero retrievals.
+        (False, False),
+    ],
+)
+def test_buffering_is_gated_on_a_marker_new_this_turn(
+    marker_in_latest_turn: bool, expect_buffered: bool, ccr_marker: str
+) -> None:
+    """A marker carried forward in history does not make every later turn buffer."""
+    calls: dict[str, object] = {}
+
+    async def fake_stream_response(url, headers, body, *args, **kwargs):  # noqa: ANN001
+        calls["stream_body"] = body
+        return fastapi.responses.StreamingResponse(iter([SSE_BODY]), media_type="text/event-stream")
+
+    async def fake_retry(method, url, headers, req_body, *args, **kwargs):  # noqa: ANN001
+        calls["buffered_body"] = json.loads(json.dumps(req_body))
+        return httpx.Response(
+            200,
+            json={
+                "id": "msg_1",
+                "type": "message",
+                "role": "assistant",
+                "model": "claude-sonnet-4-20250514",
+                "content": [{"type": "text", "text": "ok"}],
+                "stop_reason": "end_turn",
+                "usage": {"input_tokens": 10, "output_tokens": 5},
+            },
+            headers={"content-type": "application/json"},
+        )
+
+    app = create_app(_config())
+    with TestClient(app) as client:
+        client.app.state.proxy._stream_response = fake_stream_response
+        client.app.state.proxy._retry_request = fake_retry
+        resp = client.post(
+            "/v1/messages",
+            json=_agent_turn_body(marker=ccr_marker, marker_in_latest_turn=marker_in_latest_turn),
+            headers=_headers(),
+        )
+
+    assert resp.status_code == 200, resp.text
+    if expect_buffered:
+        assert "buffered_body" in calls, "a marker new this turn must still buffer"
+    else:
+        assert "stream_body" in calls, "an old marker alone must keep the client streaming"
+        assert "buffered_body" not in calls
 
 
 def test_cache_hit_never_replays_a_foreign_content_type() -> None:
