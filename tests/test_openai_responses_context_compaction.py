@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 from types import SimpleNamespace
 from typing import Any
 
@@ -553,3 +554,66 @@ def test_steering_only_instructions_and_a_continuation_s_note_are_not_the_prompt
     )
     _run_system_hook(look, {"model": "gpt-5.5", "previous_response_id": "r", "input": [item, user]})
     assert seen == ["the real prompt", None]
+
+
+def test_a_hook_replacing_steering_only_instructions_keeps_the_steering() -> None:
+    def replace(ctx: Any) -> None:
+        assert ctx.system is None
+        ctx.system = "be concise"
+
+    def clear(ctx: Any) -> None:
+        ctx.system = None
+
+    steering = "<headroom_output_shaping>x</headroom_output_shaping>"
+    payload = {
+        "model": "gpt-5.5",
+        "instructions": steering,
+        "input": [{"role": "user", "content": "hi"}],
+    }
+    replaced, _ = _run_system_hook(replace, copy.deepcopy(payload))
+    assert replaced["instructions"] == f"be concise\n\n{steering}"
+    cleared, _ = _run_system_hook(clear, copy.deepcopy(payload))
+    assert cleared["instructions"] == steering
+
+
+def test_a_reordered_prompt_is_rewritten_in_place_and_a_lost_one_is_not_added() -> None:
+    user = {"role": "user", "content": "hi"}
+    item = {"role": "developer", "content": LONG_SYSTEM}
+
+    def reorder(ctx: Any) -> None:
+        ctx.messages = [{"role": "user", "content": "first"}, *ctx.messages]
+        ctx.system = "new"
+
+    def lose(ctx: Any) -> None:
+        ctx.messages = [user]
+        ctx.system = "new"
+
+    reordered, _ = _run_system_hook(reorder, {"model": "gpt-5.5", "input": [item, user]})
+    assert reordered["input"][1]["content"] == "new"
+    assert "instructions" not in reordered
+    lost, tags = _run_system_hook(lose, {"model": "gpt-5.5", "input": [item, user]})
+    assert "instructions" not in lost
+    assert "turn_hook_system_saved_tokens" not in tags
+
+
+def test_system_growth_offsets_savings_from_later_stages() -> None:
+    from headroom.proxy.turn_hooks import clear_turn_hooks, register_turn_hook
+
+    class Grow:
+        name = "grow"
+
+        def on_request(self, ctx: Any) -> None:
+            ctx.system = "added words " * 400
+
+    handler = _HandlerHarness(ContentRouter(ContentRouterConfig()))
+    clear_turn_hooks()
+    register_turn_hook(Grow())
+    try:
+        _, _, tokens_saved, *_ = handler._compress_openai_responses_payload(
+            {"model": "gpt-5.5", "input": [{"role": "user", "content": "hi"}]},
+            model="gpt-5.5",
+            request_id="hr_test",
+        )
+    finally:
+        clear_turn_hooks()
+    assert tokens_saved == 0

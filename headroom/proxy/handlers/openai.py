@@ -163,20 +163,45 @@ def _leading_system_item(items: Any) -> dict[str, Any] | None:
     return None
 
 
-def _write_responses_system(body: dict[str, Any], item_key: str | None, system: Any) -> None:
-    """Put a turn hook's ``system`` back: into the leading item of ``body[item_key]``,
-    found again because a hook may have rebuilt the list, else ``instructions``.
-    ``None`` removes it, since an item without content is rejected upstream."""
-    item = _leading_system_item(body.get(item_key)) if item_key else None
-    if item is None:
-        if system is None:
-            body.pop("instructions", None)
-        else:
-            body["instructions"] = system
+def _is_steering_only(instructions: Any) -> bool:
+    """Do ``instructions`` hold only the block the output shaper created?"""
+    return isinstance(instructions, str) and instructions.startswith("<headroom_")
+
+
+def _write_responses_system(
+    body: dict[str, Any], item_key: str | None, item: dict[str, Any] | None, system: Any
+) -> bool:
+    """Put a turn hook's ``system`` back where it was read from, and say if it was.
+
+    With ``item``, into that item of ``body[item_key]``, found again because a hook
+    may have rebuilt or reordered the list; if it is gone nothing is written, so the
+    model never gets two prompts. Otherwise into ``instructions``, keeping the output
+    shaper's block. ``None`` removes it: an item without content is rejected upstream.
+    """
+    if item is not None:
+        items = body.get(item_key) if item_key else None
+        for index, candidate in enumerate(items if isinstance(items, list) else []):
+            if candidate is item or (
+                isinstance(candidate, dict)
+                and candidate.get("role") == item.get("role")
+                and candidate.get("content") == item.get("content")
+            ):
+                if system is None:
+                    body[item_key] = items[:index] + items[index + 1 :]
+                else:
+                    candidate["content"] = system
+                return True
+        logger.warning("turn hook rewrote a system prompt whose input item is gone; not sent")
+        return False
+    instructions = body.get("instructions")
+    if _is_steering_only(instructions):
+        if system is not None:
+            body["instructions"] = f"{system}\n\n{instructions}"
     elif system is None:
-        body[item_key] = body[item_key][1:]
+        body.pop("instructions", None)
     else:
-        item["content"] = system
+        body["instructions"] = system
+    return True
 
 
 def _response_ccr_hashes(messages: list[dict[str, Any]], markers: list[str]) -> list[str]:
@@ -2943,6 +2968,7 @@ class OpenAIHandlerMixin:
         working = payload
         modified = False
         tokens_saved = 0
+        _system_growth = 0
         transforms: list[str] = []
         reason: str | None = None
 
@@ -3094,11 +3120,12 @@ class OpenAIHandlerMixin:
                 None if working.get("previous_response_id") else _leading_system_item(_msgs_before)
             )
             _instructions = working.get("instructions")
-            _system_in_item = _system_item is not None and (
-                not _instructions
-                or (isinstance(_instructions, str) and _instructions.startswith("<headroom_"))
-            )
-            _system_before = _system_item.get("content") if _system_in_item else _instructions
+            _steering_only = _is_steering_only(_instructions)
+            _system_in_item = _system_item is not None and (not _instructions or _steering_only)
+            if _system_in_item:
+                _system_before = _system_item.get("content")
+            else:
+                _system_before = None if _steering_only else _instructions
             _req_ctx = TurnContext(
                 provider="openai",
                 model=str(model),
@@ -3152,12 +3179,15 @@ class OpenAIHandlerMixin:
                         describe_exception(e),
                     )
             if _req_ctx.system != _system_before:
-                _write_responses_system(
-                    working, _msg_key if _system_in_item else None, _req_ctx.system
+                _written = _write_responses_system(
+                    working,
+                    _msg_key,
+                    _system_item if _system_in_item else None,
+                    _req_ctx.system,
                 )
                 _sys_before = count_system_tokens(_req_ctx.count_messages, _system_before)
                 _sys_after = count_system_tokens(_req_ctx.count_messages, _req_ctx.system)
-                if _sys_before is not None and _sys_after is not None:
+                if _written and _sys_before is not None and _sys_after is not None:
                     if _sys_before > _sys_after and savings_tags is not None:
                         savings_tags[TURN_HOOK_SYSTEM_SAVED_TAG] = (
                             int(savings_tags.get(TURN_HOOK_SYSTEM_SAVED_TAG, 0) or 0)
@@ -3165,7 +3195,7 @@ class OpenAIHandlerMixin:
                             - _sys_after
                         )
                     elif _sys_after > _sys_before:
-                        tokens_saved = max(0, tokens_saved - (_sys_after - _sys_before))
+                        _system_growth = _sys_after - _sys_before
             modified = True
             transforms.append("openai:responses:turn_hook")
 
@@ -3220,6 +3250,9 @@ class OpenAIHandlerMixin:
                     request_id,
                     describe_exception(e),
                 )
+
+        # Signed through every stage above, clamped once.
+        tokens_saved = max(0, tokens_saved - _system_growth)
 
         dedupe_started = time.perf_counter()
         deduped: list[str] = []
