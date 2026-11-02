@@ -8,6 +8,7 @@ from headroom.proxy.handlers.openai import (
     OpenAIHandlerMixin,
     _compact_openai_responses_tools,
 )
+from headroom.proxy.output_verbosity_policy import STEERING_SENTINEL, STEERING_SUFFIX
 from headroom.transforms.content_router import (
     CompressionStrategy,
     ContentRouter,
@@ -482,6 +483,7 @@ def _run_system_hook(hook: Any, payload: dict[str, Any]) -> tuple[dict[str, Any]
 
 
 LONG_SYSTEM = "a long system prompt " * 40
+_STEERING = f"{STEERING_SENTINEL}x{STEERING_SUFFIX}"
 
 
 def test_an_in_place_edit_of_a_list_prompt_is_booked_once() -> None:
@@ -550,7 +552,7 @@ def test_steering_only_instructions_and_a_continuation_s_note_are_not_the_prompt
     item = {"role": "developer", "content": "the real prompt"}
     _run_system_hook(
         look,
-        {"model": "gpt-5.5", "instructions": "<headroom_output_shaping>x", "input": [item, user]},
+        {"model": "gpt-5.5", "instructions": _STEERING, "input": [item, user]},
     )
     _run_system_hook(look, {"model": "gpt-5.5", "previous_response_id": "r", "input": [item, user]})
     assert seen == ["the real prompt", None]
@@ -564,7 +566,7 @@ def test_a_hook_replacing_steering_only_instructions_keeps_the_steering() -> Non
     def clear(ctx: Any) -> None:
         ctx.system = None
 
-    steering = "<headroom_output_shaping>x</headroom_output_shaping>"
+    steering = _STEERING
     payload = {
         "model": "gpt-5.5",
         "instructions": steering,
@@ -617,3 +619,35 @@ def test_system_growth_offsets_savings_from_later_stages() -> None:
     finally:
         clear_turn_hooks()
     assert tokens_saved == 0
+
+
+def test_a_copy_added_by_a_hook_does_not_take_the_rewrite_from_the_original() -> None:
+    def copy_then_rewrite(ctx: Any) -> None:
+        ctx.messages = [dict(ctx.messages[0]), *ctx.messages]
+        ctx.system = "new"
+
+    working, _ = _run_system_hook(
+        copy_then_rewrite,
+        {
+            "model": "gpt-5.5",
+            "input": [
+                {"role": "developer", "content": "old"},
+                {"role": "user", "content": "hi"},
+            ],
+        },
+    )
+    assert [item["content"] for item in working["input"][:2]] == ["old", "new"]
+
+
+def test_a_client_prompt_that_only_looks_like_ours_reaches_hooks() -> None:
+    seen: list[Any] = []
+
+    def look(ctx: Any) -> None:
+        seen.append(ctx.system)
+
+    prompt = "<headroom_policy>Keep citations</headroom_policy>"
+    _run_system_hook(
+        look,
+        {"model": "gpt-5.5", "instructions": prompt, "input": [{"role": "user", "content": "hi"}]},
+    )
+    assert seen == [prompt]

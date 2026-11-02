@@ -40,6 +40,7 @@ from headroom.proxy.helpers import (
 from headroom.proxy.identity import resolve_memory_identity
 from headroom.proxy.loopback_guard import is_loopback_host
 from headroom.proxy.modes import is_cache_mode
+from headroom.proxy.output_verbosity_policy import STEERING_SENTINEL, STEERING_SUFFIX
 from headroom.proxy.provider_usage import (
     billed_input_for_provider,
     billed_input_from_usage,
@@ -165,7 +166,14 @@ def _leading_system_item(items: Any) -> dict[str, Any] | None:
 
 def _is_steering_only(instructions: Any) -> bool:
     """Do ``instructions`` hold only the block the output shaper created?"""
-    return isinstance(instructions, str) and instructions.startswith("<headroom_")
+    if not isinstance(instructions, str):
+        return False
+    text = instructions.strip()
+    return (
+        text.startswith(STEERING_SENTINEL)
+        and text.endswith(STEERING_SUFFIX)
+        and text.count(STEERING_SENTINEL) == 1
+    )
 
 
 def _write_responses_system(
@@ -180,17 +188,26 @@ def _write_responses_system(
     """
     if item is not None:
         items = body.get(item_key) if item_key else None
-        for index, candidate in enumerate(items if isinstance(items, list) else []):
-            if candidate is item or (
-                isinstance(candidate, dict)
-                and candidate.get("role") == item.get("role")
-                and candidate.get("content") == item.get("content")
-            ):
-                if system is None:
-                    body[item_key] = items[:index] + items[index + 1 :]
-                else:
-                    candidate["content"] = system
-                return True
+        candidates = items if isinstance(items, list) else []
+        # The item itself first: a hook may also have added a copy of it.
+        index = next((i for i, c in enumerate(candidates) if c is item), None)
+        if index is None:
+            index = next(
+                (
+                    i
+                    for i, c in enumerate(candidates)
+                    if isinstance(c, dict)
+                    and c.get("role") == item.get("role")
+                    and c.get("content") == item.get("content")
+                ),
+                None,
+            )
+        if index is not None:
+            if system is None:
+                body[item_key] = items[:index] + items[index + 1 :]
+            else:
+                candidates[index]["content"] = system
+            return True
         logger.warning("turn hook rewrote a system prompt whose input item is gone; not sent")
         return False
     instructions = body.get("instructions")
