@@ -4131,13 +4131,17 @@ def anthropic_first_party_tool_search_supported(api_base_url: str | None) -> boo
     (``copilot-api.<tenant>.ghe.com``) still downgrade: nobody has verified
     that they accept the shape.
     """
-    from headroom.copilot_auth import is_public_copilot_api_host
+    from headroom.copilot_auth import is_copilot_completions_host, is_public_copilot_api_host
     from headroom.providers.claude.runtime import (
         _gate_view_host,
         is_custom_anthropic_base_url,
     )
 
-    if is_public_copilot_api_host(_gate_view_host((api_base_url or "").strip())):
+    # The ``proxy.*`` hosts are the inline-completions surface: nobody has measured
+    # the deferred shape there.
+    if is_public_copilot_api_host(
+        _gate_view_host((api_base_url or "").strip())
+    ) and not is_copilot_completions_host(api_base_url):
         return True
 
     return not is_custom_anthropic_base_url(api_base_url)
