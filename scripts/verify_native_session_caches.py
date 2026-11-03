@@ -103,7 +103,7 @@ def main():
         client = urllib.request.build_opener(urllib.request.ProxyHandler({}))
         process = None
         try:
-            with log_path.open("w", encoding="utf-8") as log:
+            with log_path.open("w", encoding="utf-8", newline="\n") as log:
                 process = subprocess.Popen(
                     command,
                     env=env,
