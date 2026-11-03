@@ -42,7 +42,7 @@ to make a build pass.
 These are existing test tools, not new product dependencies. Codex is maintained
 by OpenAI; OpenClaw and its transitive dependencies retain their upstream
 maintainers. Their install surface includes registry downloads, native optional
-packages and lifecycle scripts, as before. OpenClaw 2026.10.7 and its fixed
+packages and lifecycle scripts, as before. OpenClaw 2026.10.10 and its fixed
 Undici override follow the upstream #4453 security repair.
 
 The raw audit still reports npm 12.2.1's bundled ip-address and Undici copies.
