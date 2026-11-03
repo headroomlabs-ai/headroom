@@ -1804,6 +1804,72 @@ class TestRealASTRuns:
 
 
 @pytest.mark.skipif(not TREE_SITTER_INSTALLED, reason="tree-sitter grammar pack not installed")
+class TestMultiLineClassHeaders:
+    """Keep the opening brace when a multi-line signature shares its last
+    line with it (``impl<T> Foo<T> where T: Debug {``, ``class Foo
+    implements Bar {``). Dropping that line leaves the rebuilt header
+    without a brace, so the compressed output no longer parses and the
+    compressor falls back to the original.
+    """
+
+    def _compressor(self):
+        return CodeAwareCompressor(
+            CodeCompressorConfig(
+                min_tokens_for_compression=1,
+                max_body_lines=2,
+                enable_ccr=False,
+                semantic_analysis=False,
+            )
+        )
+
+    @pytest.mark.parametrize(
+        ("language", "code", "expected_header"),
+        [
+            (
+                "rust",
+                (
+                    "impl<T> Wrapper<T>\n"
+                    "where T: Debug + Clone {\n"
+                    "    pub fn total(&self) -> u64 {\n"
+                    "        let mut acc = 0;\n"
+                    "        for item in &self.items {\n"
+                    "            acc += item.id;\n"
+                    "        }\n"
+                    "        acc\n"
+                    "    }\n"
+                    "}\n"
+                ),
+                "where T: Debug + Clone {",
+            ),
+            (
+                "java",
+                (
+                    "public class Calc\n"
+                    "    extends Base\n"
+                    "    implements Runnable {\n"
+                    "    public int compute(int x) {\n"
+                    "        int a = x + 1;\n"
+                    "        int b = a * 2;\n"
+                    "        int c = b - 3;\n"
+                    "        return c;\n"
+                    "    }\n"
+                    "}\n"
+                ),
+                "implements Runnable {",
+            ),
+        ],
+    )
+    def test_opening_brace_line_survives_compression(self, language, code, expected_header):
+        result = self._compressor().compress(code, language=language)
+
+        assert result.language == CodeLanguage(language)
+        # A ratio of 1.0 means the syntax check rejected the output and the
+        # compressor returned the original untouched.
+        assert result.compression_ratio < 1.0
+        assert expected_header in result.compressed
+
+
+@pytest.mark.skipif(not TREE_SITTER_INSTALLED, reason="tree-sitter grammar pack not installed")
 class TestCSharpSupport:
     """C# (``csharp`` grammar) parity with Java/C++/Rust: signatures preserved
     verbatim, method/constructor bodies compressed, block-scoped namespaces

@@ -2141,7 +2141,17 @@ class CodeAwareCompressor(Transform):
         if sig_end > 0:
             header_lines = node_lines[:sig_end]
             brace_line = node_lines[sig_end]
-            if brace_line.strip().startswith("{"):
+            # Brace languages put the opening brace on the member container's
+            # start line. A multi-line signature can share that line with its
+            # last fragment (`impl<T> Foo<T> where T: Debug {`,
+            # `class Foo implements Bar {`), so keep the line whenever the
+            # container starts with the brace, not only when it opens the line.
+            brace_starts_line = brace_line.strip().startswith("{")
+            body_starts_with_brace = (
+                not lang_config.uses_colon_after_signature
+                and _slice_code_bytes(code, body_node.start_byte, body_node.start_byte + 1) == "{"
+            )
+            if brace_starts_line or body_starts_with_brace:
                 header_lines = [*header_lines, brace_line]
         else:
             header_lines = [node_lines[0]]
