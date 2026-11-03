@@ -377,24 +377,13 @@ class Mem0Backend:
         client = await self._ensure_client()
 
         # Build search kwargs
-        search_kwargs: dict[str, Any] = {
-            "query": query,
-            "limit": limit,
-        }
-
-        if user_id:
-            search_kwargs["user_id"] = user_id
-        elif filter and filter.user_id:
-            search_kwargs["user_id"] = filter.user_id
-
-        # Add filters if provided
-        if filter:
-            filters = self._build_mem0_filters(filter)
-            if filters:
-                search_kwargs["filters"] = filters
+        filters = self._build_mem0_filters(filter) if filter else {}
+        scoped_user_id = user_id or (filter.user_id if filter else None)
+        if scoped_user_id:
+            filters["user_id"] = scoped_user_id
 
         # Execute search
-        results = await asyncio.to_thread(client.search, **search_kwargs)
+        results = await asyncio.to_thread(client.search, query=query, top_k=limit, filters=filters)
 
         # Convert results to VectorSearchResult objects
         search_results: list[VectorSearchResult] = []
@@ -531,7 +520,9 @@ class Mem0Backend:
         client = await self._ensure_client()
 
         try:
-            results = await asyncio.to_thread(client.get_all, user_id=user_id, limit=limit)
+            results = await asyncio.to_thread(
+                client.get_all, filters={"user_id": user_id}, top_k=limit
+            )
 
             # Handle different response formats
             result_list = results if isinstance(results, list) else results.get("results", [])
@@ -562,8 +553,8 @@ class Mem0Backend:
             # Mem0 doesn't support all our filter options natively
             results = await asyncio.to_thread(
                 client.get_all,
-                user_id=filter.user_id,
-                limit=filter.limit or 100,
+                filters={"user_id": filter.user_id},
+                top_k=filter.limit or 100,
             )
 
             result_list = results if isinstance(results, list) else results.get("results", [])
