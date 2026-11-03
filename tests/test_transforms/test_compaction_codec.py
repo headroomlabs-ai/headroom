@@ -15,6 +15,8 @@ from __future__ import annotations
 
 import json
 
+import pytest
+
 from headroom.transforms.compaction_codec import (
     contains_removal_marker,
     expand_compacted,
@@ -201,3 +203,24 @@ def test_single_column_null_survives_value_factoring() -> None:
     factored = factor_values(block)
     assert expand_compacted(factored) == expand_compacted(block)
     assert expand_compacted(factored) == [{"k": "x"}, {"k": "y"}, {"k": None}]
+
+
+def test_negative_dictionary_index_is_rejected() -> None:
+    # Python's -1 would silently pick the last legend value.
+    assert expand_compacted('[1]{tag:string} __dict:1\n@tag=["first","last"]\n-1\n') is None
+
+
+@pytest.mark.parametrize("legend", ["42", '"ab"', '{"a":1}', "null"])
+def test_non_array_legend_is_rejected(legend: str) -> None:
+    assert expand_compacted(f"[1]{{tag:string}} __dict:1\n@tag={legend}\n0\n") is None
+
+
+def test_dictionary_cells_still_decode_edge_values() -> None:
+    block = '[5]{tag:string?} __dict:1\n@tag=["first","last"]\n0\n1\n"-1"\nnull\n\n'
+    assert expand_compacted(block) == [
+        {"tag": "first"},
+        {"tag": "last"},
+        {"tag": "-1"},
+        {"tag": None},
+        {},
+    ]

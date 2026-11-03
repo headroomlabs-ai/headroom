@@ -1,7 +1,34 @@
 {
   "name": "headroom-ai",
   "version": "0.42.0",
-  "description": "Compress LLM context. Save tokens. Fit more into every request.",
+  "description": "Compress tool outputs, logs, JSON and chat history before each LLM call. Fewer input tokens, same answers. Adapters for OpenAI, Anthropic, Gemini and the Vercel AI SDK. Runs against the local Headroom proxy (pip install \"headroom-ai[proxy]\").",
+  "keywords": [
+    "llm",
+    "openai",
+    "anthropic",
+    "gemini",
+    "vercel-ai-sdk",
+    "token-cost",
+    "reduce-tokens",
+    "input-tokens",
+    "context-window",
+    "token-budget",
+    "tool-output",
+    "chat-history",
+    "context-compression",
+    "prompt-compression",
+    "agents",
+    "mcp"
+  ],
+  "homepage": "https://docs.headroomlabs.ai/docs/quickstart",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/headroomlabs-ai/headroom.git",
+    "directory": "sdk/typescript"
+  },
+  "bugs": {
+    "url": "https://github.com/headroomlabs-ai/headroom/issues"
+  },
   "type": "module",
   "main": "./dist/index.cjs",
   "module": "./dist/index.js",
