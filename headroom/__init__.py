@@ -73,9 +73,14 @@ from __future__ import annotations
 from importlib import import_module
 from typing import Any
 
-from ._ort import ensure_ort_dylib_pinned
+from ._ort import disable_ort_telemetry_by_default, ensure_ort_dylib_pinned
 from ._version import __version__  # noqa: F401
 from .offline import pin_litellm_cost_map_local
+
+# Must run before any ONNX Runtime initializes (Python package or the Rust
+# core's dylib): ORT reads ORT_DISABLE_TELEMETRY once, at startup, and
+# otherwise uploads usage telemetry to Microsoft. See `headroom/_ort.py`.
+disable_ort_telemetry_by_default()
 
 # Must run before anything can import `headroom._core`: on Windows the
 # Rust core resolves onnxruntime.dll at runtime (ort load-dynamic), and
