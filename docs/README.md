@@ -55,3 +55,8 @@ To typecheck this proof independently of illustrative MDX `noErrors` settings:
 ```sh
 node node_modules/typescript/bin/tsc --ignoreConfig --allowJs --checkJs --noEmit --skipLibCheck --module nodenext --target es2022 scripts/verify-sdk-wire.mjs
 ```
+
+Use Node24.22.2 and npm12.2.1 for the qualified installation/build workflow.
+The exact `esbuild@0.28.2` install script is approved in `allowScripts`; it checks
+or acquires the platform binary. `.npmrc` makes newly introduced script identities
+fail until reviewed. The root `fumadocs-mdx` postinstall still runs normally.

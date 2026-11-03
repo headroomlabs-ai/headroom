@@ -45,5 +45,8 @@
 	},
 	"overrides": {
 		"postcss": "$postcss"
+	},
+	"allowScripts": {
+		"esbuild@0.28.2": true
 	}
 }
