@@ -101,8 +101,10 @@ def parser_canary(artifacts, target):
             {"language": language, "sample": i + 1, "source": source}
             for i, source in enumerate(samples)
         )
-    (crate / "inputs.json").write_text(json.dumps(inputs, ensure_ascii=False), encoding="utf-8")
-    (crate / "src/main.rs").write_text(RUST_CANARY, encoding="utf-8")
+    (crate / "inputs.json").write_text(
+        json.dumps(inputs, ensure_ascii=False), encoding="utf-8", newline="\n"
+    )
+    (crate / "src/main.rs").write_text(RUST_CANARY, encoding="utf-8", newline="\n")
     manifest = """[package]
 name="headroom-parser-qualification"
 version="0.0.0"
@@ -122,7 +124,9 @@ tree-sitter-cpp="=0.23.4"
 """
     outputs = []
     for version in ("0.27.0", "0.27.1"):
-        (crate / "Cargo.toml").write_text(manifest.replace("VERSION", version), encoding="utf-8")
+        (crate / "Cargo.toml").write_text(
+            manifest.replace("VERSION", version), encoding="utf-8", newline="\n"
+        )
         result = subprocess.run(
             [
                 "cargo",
@@ -138,7 +142,9 @@ tree-sitter-cpp="=0.23.4"
             text=True,
             check=True,
         )
-        (artifacts / f"parser-{version}.json").write_text(result.stdout, encoding="utf-8")
+        (artifacts / f"parser-{version}.json").write_text(
+            result.stdout, encoding="utf-8", newline="\n"
+        )
         outputs.append(json.loads(result.stdout))
     assert len(outputs[0]) == len(outputs[1]) == 72
     for before, after in zip(*outputs, strict=True):
@@ -196,7 +202,7 @@ def native_runtime(binary, artifacts):
         NO_PROXY="127.0.0.1,localhost",
         TRANSFORMERS_OFFLINE="1",
     )
-    log = open(artifacts / "runtime-proxy.log", "w", encoding="utf-8")
+    log = open(artifacts / "runtime-proxy.log", "w", encoding="utf-8", newline="\n")
     proc = subprocess.Popen(
         [
             str(binary),
@@ -246,11 +252,22 @@ def native_runtime(binary, artifacts):
             "PASS: built binary passthrough + AWS environment provider/SigV4 local wire proof; body byte-equal; payload hash verified. No real AWS/SDK service response emulation."
         )
     finally:
-        proc.terminate()
-        proc.wait(timeout=20)
-        server.shutdown()
-        server.server_close()
-        log.close()
+        try:
+            if proc.poll() is None:
+                proc.terminate()
+                try:
+                    proc.wait(timeout=20)
+                except subprocess.TimeoutExpired:
+                    proc.kill()
+                    proc.wait(timeout=20)
+        finally:
+            try:
+                server.shutdown()
+            finally:
+                try:
+                    server.server_close()
+                finally:
+                    log.close()
 
 
 def main():
