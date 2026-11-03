@@ -17,6 +17,7 @@ from headroom.install.supervisors import (
     _register_windows_task,
     _render_unix_runner,
     _render_windows_runner,
+    _render_windows_vbs_launcher,
     _windows_boot_trigger,
     _windows_health_trigger,
     _windows_task_xml,
@@ -55,6 +56,32 @@ def test_windows_task_xml_user_scope_supports_interactive_token() -> None:
     assert "<LogonType>InteractiveToken</LogonType>" in xml
     assert "<RunLevel>LeastPrivilege</RunLevel>" in xml
     assert "<Interval>PT5M</Interval>" in xml
+
+
+def test_windows_task_xml_vbs_uses_wscript() -> None:
+    xml = _windows_task_xml(
+        "C:\\tmp\\default\\ensure-headroom.vbs",
+        trigger_xml=_windows_health_trigger(),
+        scope="user",
+        logon_type="InteractiveToken",
+    )
+
+    assert "<Command>wscript.exe</Command>" in xml
+    assert '<Arguments>//B //Nologo "C:\\tmp\\default\\ensure-headroom.vbs"</Arguments>' in xml
+
+
+def test_render_windows_vbs_launcher(tmp_path: Path) -> None:
+    vbs_path = tmp_path / "ensure-headroom.vbs"
+    ps1_path = tmp_path / "ensure-headroom.ps1"
+    record = _render_windows_vbs_launcher(vbs_path, ps1_path)
+
+    assert record.path == str(vbs_path)
+    assert record.kind == "script"
+    assert vbs_path.exists()
+    content = vbs_path.read_text(encoding="utf-8")
+    assert "WScript.Shell" in content
+    assert "ensure-headroom.ps1" in content
+    assert ", 0, False" in content
 
 
 def test_windows_task_xml_system_scope_uses_localsystem() -> None:
@@ -558,6 +585,8 @@ def test_install_windows_user_task_failure_cleans_up_and_falls_back(
     assert "<LogonType>InteractiveToken</LogonType>" in fallback_xml
     assert "<RunLevel>LeastPrivilege</RunLevel>" in fallback_xml
     assert "<Interval>PT5M</Interval>" in fallback_xml
+    assert "<Command>wscript.exe</Command>" in fallback_xml
+    assert any(record.path.endswith(".vbs") for record in records)
     assert [record.path for record in records if record.kind == "windows-task"] == [
         "headroom-default-health"
     ]
