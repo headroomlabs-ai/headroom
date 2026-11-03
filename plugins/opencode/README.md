@@ -13,11 +13,11 @@ npm install headroom-opencode
 
 ## Building from source
 
-Building this plugin with tsup 9 requires Node.js `^22.18.0 || ^24.11.0 || >=26.0.0`.
-This requirement applies to the build toolchain, not to the published plugin's
-consumer engine contract. Node.js 24.22.2 is a verified choice for the current
-locked dependency graph (some transitive build dependencies require a newer
-Node.js patch than tsup itself). From `plugins/opencode`, run:
+Tsup 9 requires Node.js `^22.18.0 || ^24.11.0 || >=26.0.0`. The current locked
+graph also includes ini 7, which requires `^22.22.2 || ^24.15.0 || >=26.0.0`.
+These are development-install requirements; the published plugin and its host
+retain their own runtime requirements. Node.js 24.22.2 is a verified choice
+for this dependency graph. From `plugins/opencode`, run:
 
 ```bash
 npm ci
