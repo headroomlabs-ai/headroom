@@ -377,21 +377,13 @@ class Mem0Backend:
         """
         client = await self._ensure_client()
 
-        # Build search kwargs
-        search_kwargs: dict[str, Any] = {
-            "query": query,
-            "limit": limit,
-        }
-
-        # Mem0 2.0.18 requires search identity scopes inside filters.
+        # Mem0 2.x reads identity scopes from filters and the limit as top_k.
         filters = self._build_mem0_filters(filter) if filter else {}
         if user_id:
             filters["user_id"] = user_id
-        if filters:
-            search_kwargs["filters"] = filters
 
         # Execute search
-        results = await asyncio.to_thread(client.search, **search_kwargs)
+        results = await asyncio.to_thread(client.search, query=query, top_k=limit, filters=filters)
 
         # Convert results to VectorSearchResult objects
         search_results: list[VectorSearchResult] = []
