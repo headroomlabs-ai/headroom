@@ -14,6 +14,7 @@ result is known to be umask-independent.
 from __future__ import annotations
 
 import os
+import signal
 import sqlite3
 import stat
 import subprocess
@@ -39,6 +40,55 @@ def _permissive_umask():
         yield
     finally:
         os.umask(old)
+
+
+@pytest.fixture
+def fail_instead_of_hang():
+    def on_alarm(signum, frame):
+        raise AssertionError("blocked opening a FIFO")
+
+    old = signal.signal(signal.SIGALRM, on_alarm)
+    signal.alarm(5)
+    try:
+        yield
+    finally:
+        signal.alarm(0)
+        signal.signal(signal.SIGALRM, old)
+
+
+def _record_opens(monkeypatch, target) -> list:
+    real_open = os.open
+    opened = []
+
+    def record(path, flags, *args, **kwargs):
+        if os.fspath(path) == str(target) and not flags & os.O_CREAT:
+            opened.append(flags)
+        return real_open(path, flags, *args, **kwargs)
+
+    monkeypatch.setattr(os, "open", record)
+    return opened
+
+
+def _report_lstat(monkeypatch, target, *, mode=None, uid=None) -> None:
+    """Make ``os.lstat(target)`` report a different type/mode or owner.
+
+    The real file is untouched; only what ``lstat`` says about it changes, which
+    stands in for a swap or a foreign owner that cannot be arranged without root.
+    """
+    real_lstat = os.lstat
+
+    def lstat(path, *args, **kwargs):
+        st = real_lstat(path, *args, **kwargs)
+        if os.fspath(path) != str(target):
+            return st
+        fields = list(st)
+        if mode is not None:
+            fields[0] = mode
+        if uid is not None:
+            fields[4] = uid
+        return os.stat_result(fields)
+
+    monkeypatch.setattr(os, "lstat", lstat)
 
 
 # ---- primitives -------------------------------------------------------------
@@ -85,6 +135,85 @@ class TestEnsurePrivateFile:
         monkeypatch.setattr(os, "fchmod", boom)
         with pytest.raises(PermissionError):
             fileperms.ensure_private_file(p)
+
+    @pytest.mark.parametrize("mode", [0o400, 0o700, 0o4600])
+    def test_non_0600_mode_is_narrowed_once_then_skipped(self, tmp_path, monkeypatch, mode):
+        p = tmp_path / "store.db"
+        p.write_text("x")
+        p.chmod(mode)
+        assert _mode(p) == mode
+        opened = _record_opens(monkeypatch, p)
+        fileperms.ensure_private_file(p)
+        assert len(opened) == 1
+        assert _mode(p) == 0o600
+        fileperms.ensure_private_file(p)
+        assert len(opened) == 1
+        assert p.read_text() == "x"
+
+    def test_0600_file_owned_by_the_caller_is_not_opened(self, tmp_path, monkeypatch):
+        p = tmp_path / "store.db"
+        p.write_text("x")
+        p.chmod(0o600)
+        opened = _record_opens(monkeypatch, p)
+        fileperms.ensure_private_file(p)
+        assert opened == []
+
+    def test_0600_file_reported_foreign_to_a_non_root_caller_is_opened_once(
+        self, tmp_path, monkeypatch
+    ):
+        # The file is really ours, so the fchmod that follows the open succeeds
+        # and leaves it 0600. A truly foreign file would fail that fchmod with
+        # EPERM and surface as PermissionError, which needs root to arrange.
+        p = tmp_path / "store.db"
+        p.write_text("x")
+        p.chmod(0o600)
+        real_uid = os.geteuid()
+        non_root_uid = real_uid or 1000
+        monkeypatch.setattr(os, "geteuid", lambda: non_root_uid)
+        _report_lstat(monkeypatch, p, uid=non_root_uid + 1)
+        opened = _record_opens(monkeypatch, p)
+        fileperms.ensure_private_file(p)
+        assert len(opened) == 1
+        assert _mode(p) == 0o600
+
+    def test_0600_file_of_another_owner_is_not_opened_when_running_as_root(
+        self, tmp_path, monkeypatch
+    ):
+        # geteuid is patched to 0 and lstat reports owner uid 1, while the file
+        # really belongs to the test user: root on a file of another owner.
+        p = tmp_path / "store.db"
+        p.write_text("x")
+        p.chmod(0o600)
+        monkeypatch.setattr(os, "geteuid", lambda: 0)
+        _report_lstat(monkeypatch, p, uid=1)
+        opened = _record_opens(monkeypatch, p)
+        fileperms.ensure_private_file(p)
+        assert opened == []
+
+    def test_unreadable_wide_file_is_refused_with_context(self, tmp_path):
+        if os.geteuid() == 0:
+            pytest.skip("root can open any file")
+        p = tmp_path / "store.db"
+        p.write_text("x")
+        p.chmod(0o044)
+        with pytest.raises(PermissionError, match="refusing to open memory store") as info:
+            fileperms.ensure_private_file(p, what="memory store")
+        assert isinstance(info.value.__cause__, PermissionError)
+        assert _mode(p) == 0o044
+
+    def test_symlink_swapped_in_after_lstat_is_refused_and_target_untouched(
+        self, tmp_path, monkeypatch
+    ):
+        target = tmp_path / "victim"
+        target.write_text("SECRET")
+        link = tmp_path / "store.db"
+        link.symlink_to(target)
+        _report_lstat(monkeypatch, link, mode=stat.S_IFREG | 0o644)
+        with pytest.raises(PermissionError, match="refusing to open memory store") as info:
+            fileperms.ensure_private_file(link, what="memory store")
+        assert isinstance(info.value.__cause__, OSError)
+        assert _mode(target) == 0o644
+        assert target.read_text() == "SECRET"
 
 
 class TestConnectPrivateSqlite:
@@ -210,6 +339,29 @@ class TestConnectPrivateSqlite:
         ]
         conn.close()
 
+    @pytest.mark.parametrize("suffix", ["-wal", "-shm", "-journal"])
+    def test_refuses_dangling_symlink_sidecar(self, tmp_path, suffix):
+        db = tmp_path / "m.db"
+        sqlite3.connect(db).close()
+        (tmp_path / f"m.db{suffix}").symlink_to(tmp_path / "nowhere")
+        with pytest.raises(PermissionError, match="not a regular file"):
+            fileperms.connect_private_sqlite(db)
+        assert not (tmp_path / "nowhere").exists()
+
+    def test_0400_database_is_writable_after_connecting(self, tmp_path):
+        db = tmp_path / "m.db"
+        seed = sqlite3.connect(db)
+        seed.execute("CREATE TABLE t(x)")
+        seed.commit()
+        seed.close()
+        db.chmod(0o400)
+        conn = fileperms.connect_private_sqlite(db)
+        assert _mode(db) == 0o600
+        conn.execute("INSERT INTO t VALUES (1)")
+        conn.commit()
+        assert conn.execute("SELECT x FROM t").fetchall() == [(1,)]
+        conn.close()
+
     def test_missing_sidecars_are_not_precreated(self, tmp_path):
         db = tmp_path / "m.db"
         fileperms.connect_private_sqlite(db).close()
@@ -244,6 +396,127 @@ class TestConnectPrivateSqlite:
         link.symlink_to(target)
         with pytest.raises(PermissionError):
             fileperms.connect_private_sqlite(link)
+
+    @pytest.mark.parametrize("suffix", ["-wal", "-shm", "-journal"])
+    def test_sidecar_deleted_by_sqlite_before_narrowing_is_skipped(
+        self, tmp_path, monkeypatch, suffix
+    ):
+        # sqlite unlinks -journal after every transaction and -wal/-shm when the
+        # last connection closes, so a sidecar seen a moment ago can be gone by
+        # the time it is opened. That is not a reason to refuse the store, and
+        # the helper must not recreate it.
+        db = tmp_path / "m.db"
+        fileperms.connect_private_sqlite(db).close()
+        sidecar = tmp_path / f"m.db{suffix}"
+        sidecar.write_bytes(b"leftover")
+        assert _mode(sidecar) == 0o644  # precondition under the 022 umask
+        real_open = os.open
+
+        def open_after_sqlite_deletes_it(path, flags, *args, **kwargs):
+            if os.fspath(path) == str(sidecar) and not flags & os.O_CREAT:
+                sidecar.unlink(missing_ok=True)
+            return real_open(path, flags, *args, **kwargs)
+
+        monkeypatch.setattr(os, "open", open_after_sqlite_deletes_it)
+        fileperms.connect_private_sqlite(db).close()
+        assert sorted(p.name for p in tmp_path.iterdir()) == ["m.db"]
+
+    @pytest.mark.parametrize("journal_mode", ["delete", "wal"])
+    def test_connecting_keeps_other_connections_locks(self, tmp_path, journal_mode):
+        # POSIX close() of any descriptor on a file releases every fcntl lock the
+        # process holds on it, so narrowing must not open and close a file that
+        # is already private. If it does, a second process can take the write
+        # lock while this one is mid-transaction and the database is corrupted.
+        db = tmp_path / "m.db"
+        holder = fileperms.connect_private_sqlite(db, isolation_level=None)
+        holder.execute(f"PRAGMA journal_mode={journal_mode}")
+        holder.execute("CREATE TABLE t(x)")
+        holder.execute("BEGIN IMMEDIATE")
+        holder.execute("INSERT INTO t VALUES (1)")
+
+        fileperms.connect_private_sqlite(db).close()
+
+        script = (
+            "import sqlite3, sys\n"
+            "c = sqlite3.connect(sys.argv[1], timeout=0, isolation_level=None)\n"
+            "try:\n"
+            "    c.execute('BEGIN IMMEDIATE')\n"
+            "    print('acquired')\n"
+            "except sqlite3.OperationalError as exc:\n"
+            "    print(exc)\n"
+        )
+        result = subprocess.run(
+            [sys.executable, "-c", script, str(db)],
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        assert result.stdout.strip() == "database is locked"
+        holder.execute("COMMIT")
+        assert holder.execute("PRAGMA integrity_check").fetchall() == [("ok",)]
+        holder.close()
+
+    @pytest.mark.parametrize("suffix", ["", "-wal", "-shm", "-journal"])
+    def test_owner_only_file_is_not_opened(self, tmp_path, monkeypatch, suffix):
+        db = tmp_path / "m.db"
+        fileperms.connect_private_sqlite(db).close()
+        target = tmp_path / f"m.db{suffix}"
+        if suffix:
+            target.write_bytes(b"leftover")
+            target.chmod(0o600)
+        assert _mode(target) == 0o600
+        real_open = os.open
+        opened = []
+
+        def record_opened_fds(path, flags, *args, **kwargs):
+            fd = real_open(path, flags, *args, **kwargs)
+            if os.fspath(path) == str(target):
+                opened.append(fd)
+            return fd
+
+        monkeypatch.setattr(os, "open", record_opened_fds)
+        fileperms.connect_private_sqlite(db).close()
+        assert opened == []
+
+    @pytest.mark.parametrize("suffix", ["", "-wal", "-shm", "-journal"])
+    @pytest.mark.parametrize("kind", ["symlink", "fifo"])
+    def test_refuses_non_regular_file(
+        self, tmp_path, monkeypatch, fail_instead_of_hang, kind, suffix
+    ):
+        db = tmp_path / "m.db"
+        if suffix:
+            fileperms.connect_private_sqlite(db).close()
+        bad = tmp_path / f"m.db{suffix}"
+        victim = tmp_path / "victim"
+        victim.write_text("SECRET")
+        if kind == "symlink":
+            bad.symlink_to(victim)
+        else:
+            os.mkfifo(bad)
+        # A FIFO with no writer blocks an open for reading, so it has to be
+        # refused before anything opens it; the alarm fails the test otherwise.
+        opened = _record_opens(monkeypatch, bad)
+        with pytest.raises(PermissionError, match="not a regular file") as info:
+            fileperms.connect_private_sqlite(db, what="memory store")
+        assert "refusing to open memory store" in str(info.value)
+        assert str(bad) in str(info.value)
+        assert opened == []
+        assert _mode(victim) == 0o644
+        assert victim.read_text() == "SECRET"
+
+    def test_wide_database_is_narrowed(self, tmp_path):
+        db = tmp_path / "m.db"
+        seed = sqlite3.connect(db)
+        seed.execute("CREATE TABLE t(x)")
+        seed.execute("INSERT INTO t VALUES ('kept')")
+        seed.commit()
+        seed.close()
+        assert _mode(db) == 0o644  # precondition under the 022 umask
+        conn = fileperms.connect_private_sqlite(db)
+        assert _mode(db) == 0o600
+        assert conn.execute("SELECT x FROM t").fetchall() == [("kept",)]
+        conn.close()
 
 
 class TestPrivateDir:
