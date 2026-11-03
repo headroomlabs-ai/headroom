@@ -821,10 +821,10 @@ function mergeDefs(...defs) {
 function cloneDef(schema) {
   return mergeDefs(schema._zod.def);
 }
-function getElementAtPath(obj, path) {
-  if (!path)
+function getElementAtPath(obj, path3) {
+  if (!path3)
     return obj;
-  return path.reduce((acc, key) => acc?.[key], obj);
+  return path3.reduce((acc, key) => acc?.[key], obj);
 }
 function promiseAllObject(promisesObj) {
   const keys = Object.keys(promisesObj);
@@ -1164,11 +1164,11 @@ function explicitlyAborted(x, startIndex = 0) {
   }
   return false;
 }
-function prefixIssues(path, issues) {
+function prefixIssues(path3, issues) {
   return issues.map((iss) => {
     var _a3;
     (_a3 = iss).path ?? (_a3.path = []);
-    iss.path.unshift(path);
+    iss.path.unshift(path3);
     return iss;
   });
 }
@@ -1630,16 +1630,16 @@ function flattenError(error62, mapper = (issue2) => issue2.message) {
 }
 function formatError(error62, mapper = (issue2) => issue2.message) {
   const fieldErrors = { _errors: [] };
-  const processError = (error63, path = []) => {
+  const processError = (error63, path3 = []) => {
     for (const issue2 of error63.issues) {
       if (issue2.code === "invalid_union" && issue2.errors.length) {
-        issue2.errors.map((issues) => processError({ issues }, [...path, ...issue2.path]));
+        issue2.errors.map((issues) => processError({ issues }, [...path3, ...issue2.path]));
       } else if (issue2.code === "invalid_key") {
-        processError({ issues: issue2.issues }, [...path, ...issue2.path]);
+        processError({ issues: issue2.issues }, [...path3, ...issue2.path]);
       } else if (issue2.code === "invalid_element") {
-        processError({ issues: issue2.issues }, [...path, ...issue2.path]);
+        processError({ issues: issue2.issues }, [...path3, ...issue2.path]);
       } else {
-        const fullpath = [...path, ...issue2.path];
+        const fullpath = [...path3, ...issue2.path];
         if (fullpath.length === 0) {
           fieldErrors._errors.push(mapper(issue2));
         } else {
@@ -1678,17 +1678,17 @@ function formatError(error62, mapper = (issue2) => issue2.message) {
 }
 function treeifyError(error62, mapper = (issue2) => issue2.message) {
   const result = { errors: [] };
-  const processError = (error63, path = []) => {
+  const processError = (error63, path3 = []) => {
     var _a3;
     for (const issue2 of error63.issues) {
       if (issue2.code === "invalid_union" && issue2.errors.length) {
-        issue2.errors.map((issues) => processError({ issues }, [...path, ...issue2.path]));
+        issue2.errors.map((issues) => processError({ issues }, [...path3, ...issue2.path]));
       } else if (issue2.code === "invalid_key") {
-        processError({ issues: issue2.issues }, [...path, ...issue2.path]);
+        processError({ issues: issue2.issues }, [...path3, ...issue2.path]);
       } else if (issue2.code === "invalid_element") {
-        processError({ issues: issue2.issues }, [...path, ...issue2.path]);
+        processError({ issues: issue2.issues }, [...path3, ...issue2.path]);
       } else {
-        const fullpath = [...path, ...issue2.path];
+        const fullpath = [...path3, ...issue2.path];
         if (fullpath.length === 0) {
           result.errors.push(mapper(issue2));
           continue;
@@ -1727,8 +1727,8 @@ function treeifyError(error62, mapper = (issue2) => issue2.message) {
 }
 function toDotPath(_path) {
   const segs = [];
-  const path = _path.map((seg) => typeof seg === "object" ? seg.key : seg);
-  for (const seg of path) {
+  const path3 = _path.map((seg) => typeof seg === "object" ? seg.key : seg);
+  for (const seg of path3) {
     if (typeof seg === "number")
       segs.push(`[${seg}]`);
     else if (typeof seg === "symbol")
@@ -18866,13 +18866,13 @@ function resolveRef(ref, ctx) {
   if (!ref.startsWith("#")) {
     throw new Error("External $ref is not supported, only local refs (#/...) are allowed");
   }
-  const path = ref.slice(1).split("/").filter(Boolean);
-  if (path.length === 0) {
+  const path3 = ref.slice(1).split("/").filter(Boolean);
+  if (path3.length === 0) {
     return ctx.rootSchema;
   }
   const defsKey = ctx.version === "draft-2020-12" ? "$defs" : "definitions";
-  if (path[0] === defsKey) {
-    const key = path[1] === void 0 ? void 0 : decodeJSONPointerSegment(path[1]);
+  if (path3[0] === defsKey) {
+    const key = path3[1] === void 0 ? void 0 : decodeJSONPointerSegment(path3[1]);
     if (!key || !ctx.defs[key]) {
       throw new Error(`Reference not found: ${ref}`);
     }
@@ -19727,6 +19727,10 @@ function tool(input2) {
 }
 tool.schema = external_exports;
 
+// src/plugin.ts
+import { createHash as createHash2 } from "crypto";
+import path2 from "path";
+
 // src/retrieve.ts
 var _proxyUrlCache = null;
 function getDefaultProxyUrl() {
@@ -19785,6 +19789,10 @@ function createHeadroomRetrieveTool(config2) {
 
 // src/transport.ts
 import { createRequire, syncBuiltinESMExports } from "module";
+import os from "os";
+import path from "path";
+import { createHash, randomUUID } from "crypto";
+import { fileURLToPath } from "url";
 var nodeRequire = createRequire(import.meta.url);
 var http = nodeRequire("node:http");
 var https = nodeRequire("node:https");
@@ -19797,7 +19805,29 @@ var PROJECT_HEADER = "x-headroom-project";
 var SESSION_TOKEN_HEADER = "x-headroom-session-token";
 var PROXY_ENV = "HEADROOM_OPENCODE_TRANSPORT_PROXY_URL";
 var EXCLUDE_HOSTS_ENV = "HEADROOM_OPENCODE_EXCLUDE_HOSTS";
+var TOOL_POLICY_ENV = "HEADROOM_TOOL_POLICY_JSON";
+var TOOL_POLICY_PATH_ENV = "HEADROOM_TOOL_POLICY_PATH";
+var TOOL_POLICY_URL_ENV = "HEADROOM_TOOL_POLICY_URL";
+var TOOL_POLICY_TOKEN_ENV = "HEADROOM_TOOL_POLICY_TOKEN";
+var TOOL_POLICY_REFRESH_SECONDS_ENV = "HEADROOM_TOOL_POLICY_REFRESH_SECONDS";
+var TOOL_POLICY_VALID_UNTIL_ENV = "HEADROOM_INTERNAL_TOOL_POLICY_VALID_UNTIL";
+var TOOL_POLICY_FILE_NAME = "tool_policy.json";
+var POLICY_VERSION = 1;
+var DEFAULT_REFRESH_SECONDS = 300;
+var MAX_REFRESH_SECONDS = 3600;
+var REMOTE_TIMEOUT_MS = 5e3;
+var MAX_REMOTE_POLICY_BYTES = 1024 * 1024;
 var STATE_KEY = /* @__PURE__ */ Symbol.for("headroom.opencode.transport");
+var ToolPolicyEnforcementError = class extends Error {
+  decision;
+  acknowledgement;
+  constructor(message, decision, acknowledgement) {
+    super(message);
+    this.name = "ToolPolicyEnforcementError";
+    this.decision = decision;
+    this.acknowledgement = acknowledgement;
+  }
+};
 function getState() {
   return globalThis[STATE_KEY];
 }
@@ -19818,22 +19848,511 @@ function withNodeImportOption(existing, shim) {
   }
   return parts.join(" ");
 }
+function parseToolPolicyJson(raw, source) {
+  try {
+    const parsed = JSON.parse(raw);
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+      throw new Error("expected a JSON object");
+    }
+    if (parsed.version !== void 0 && parsed.version !== POLICY_VERSION) {
+      throw new Error(`unsupported version ${String(parsed.version)}; expected ${POLICY_VERSION}`);
+    }
+    return parsed;
+  } catch {
+    throw new Error(`Invalid Headroom tool policy JSON in ${source}`);
+  }
+}
+function readToolPolicyFile(filePath, source) {
+  try {
+    return parseToolPolicyJson(fs.readFileSync(filePath, "utf8"), source);
+  } catch (error62) {
+    if (error62 instanceof Error && error62.message.startsWith("Invalid Headroom tool policy JSON")) {
+      throw error62;
+    }
+    throw new Error(`Invalid Headroom tool policy file ${filePath} (${source}): ${String(error62)}`);
+  }
+}
+function defaultGlobalToolPolicyPath() {
+  const explicitConfigDir = process.env.HEADROOM_CONFIG_DIR?.trim();
+  if (explicitConfigDir) {
+    return path.join(explicitConfigDir, TOOL_POLICY_FILE_NAME);
+  }
+  const explicitWorkspaceDir = process.env.HEADROOM_WORKSPACE_DIR?.trim();
+  if (explicitWorkspaceDir) {
+    return path.join(explicitWorkspaceDir, "config", TOOL_POLICY_FILE_NAME);
+  }
+  return path.join(os.homedir(), ".headroom", "config", TOOL_POLICY_FILE_NAME);
+}
+function findLocalToolPolicyPath(project) {
+  let start = path.resolve(project || process.cwd());
+  try {
+    if (fs.statSync(start).isFile()) {
+      start = path.dirname(start);
+    }
+  } catch {
+  }
+  let current = start;
+  while (true) {
+    const candidate = path.join(current, ".headroom", TOOL_POLICY_FILE_NAME);
+    if (fs.existsSync(candidate)) {
+      return candidate;
+    }
+    const parent = path.dirname(current);
+    if (parent === current) {
+      return void 0;
+    }
+    current = parent;
+  }
+}
+function loadToolPolicyConfig(policy, project) {
+  if (policy === void 0) {
+    const raw = process.env[TOOL_POLICY_ENV]?.trim();
+    if (raw) {
+      return parseToolPolicyJson(raw, TOOL_POLICY_ENV);
+    }
+    const rawPath = process.env[TOOL_POLICY_PATH_ENV]?.trim();
+    if (rawPath) {
+      return readToolPolicyFile(rawPath, TOOL_POLICY_PATH_ENV);
+    }
+    if (process.env[TOOL_POLICY_URL_ENV]?.trim()) {
+      return void 0;
+    }
+    const globalPath = defaultGlobalToolPolicyPath();
+    if (fs.existsSync(globalPath)) {
+      return readToolPolicyFile(globalPath, globalPath);
+    }
+    const localPath = findLocalToolPolicyPath(project);
+    if (localPath) {
+      return readToolPolicyFile(localPath, localPath);
+    }
+    return void 0;
+  }
+  if (typeof policy !== "string") {
+    return policy;
+  }
+  const trimmed = policy.trim();
+  if (!trimmed) {
+    return void 0;
+  }
+  if (trimmed.startsWith("{")) {
+    return parseToolPolicyJson(trimmed, "inline string");
+  }
+  return readToolPolicyFile(trimmed, trimmed);
+}
+function compileRegex(source, field, ruleId) {
+  if (!source) {
+    return void 0;
+  }
+  try {
+    return new RegExp(source);
+  } catch {
+    throw new Error(
+      `Invalid Headroom tool policy regex for ${field} in rule ${ruleId}`
+    );
+  }
+}
+function asArray(value) {
+  if (value === void 0) {
+    return void 0;
+  }
+  return Array.isArray(value) ? value : [value];
+}
+function compileToolPolicy(policy, project, source = "configured") {
+  const loaded = loadToolPolicyConfig(policy, project);
+  if (!loaded) {
+    return void 0;
+  }
+  if (!Array.isArray(loaded.rules)) {
+    throw new Error("Headroom tool policy requires a rules array");
+  }
+  if (loaded.version !== void 0 && loaded.version !== POLICY_VERSION) {
+    throw new Error(`Unsupported Headroom tool policy version: ${String(loaded.version)}`);
+  }
+  const compiledRules = loaded.rules.map((rule, index) => {
+    const id = rule.id?.trim() || `rule_${index + 1}`;
+    if (rule.scope !== "tool_call" && rule.scope !== "shell" && rule.scope !== "http") {
+      throw new Error(`Invalid Headroom tool policy scope in rule ${id}: ${String(rule.scope)}`);
+    }
+    if (rule.action !== "allow" && rule.action !== "deny" && rule.action !== "require_approval") {
+      throw new Error(`Invalid Headroom tool policy action in rule ${id}: ${String(rule.action)}`);
+    }
+    return {
+      id,
+      scope: rule.scope,
+      action: rule.action,
+      reason: rule.reason,
+      tools: asArray(rule.tool)?.map((entry) => entry.toLowerCase()),
+      commands: asArray(rule.command)?.map((entry) => entry.toLowerCase()),
+      argsPattern: compileRegex(rule.argsPattern, "argsPattern", id),
+      cwdPattern: compileRegex(rule.cwdPattern, "cwdPattern", id),
+      envKeys: rule.envKeys?.map((entry) => entry.toLowerCase()),
+      domains: asArray(rule.domain)?.map((entry) => entry.toLowerCase()),
+      urlPattern: compileRegex(rule.urlPattern, "urlPattern", id)
+    };
+  });
+  const defaultAction = loaded.defaultAction ?? "allow";
+  if (defaultAction !== "allow" && defaultAction !== "deny") {
+    throw new Error(`Invalid Headroom tool policy defaultAction: ${String(defaultAction)}`);
+  }
+  const mode = loaded.mode ?? "enforce";
+  if (mode !== "enforce" && mode !== "report_only") {
+    throw new Error(`Invalid Headroom tool policy mode: ${String(mode)}`);
+  }
+  return {
+    version: POLICY_VERSION,
+    mode,
+    defaultAction,
+    rules: compiledRules,
+    serialized: JSON.stringify({
+      version: POLICY_VERSION,
+      mode,
+      defaultAction,
+      rules: loaded.rules.map((rule, index) => ({
+        ...rule,
+        id: rule.id?.trim() || `rule_${index + 1}`
+      }))
+    }),
+    source
+  };
+}
+function parsePropagatedValidUntil(value) {
+  const parsed = Number(value);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : void 0;
+}
+function policySourceFingerprint(value) {
+  const serialized = typeof value === "string" ? value : stableJson(value);
+  return createHash("sha256").update(serialized).digest("hex");
+}
+function resolveToolPolicySource(options, existing) {
+  if (options.toolPolicy !== void 0) {
+    return {
+      input: options.toolPolicy,
+      source: "configured",
+      identity: `configured:${policySourceFingerprint(options.toolPolicy)}`,
+      remoteToken: "",
+      repositoryScoped: false
+    };
+  }
+  const installedPolicy = existing?.toolPolicy?.serialized;
+  const currentPolicy = process.env[TOOL_POLICY_ENV]?.trim();
+  const originalPolicy = existing?.previousToolPolicyEnv?.trim();
+  const policyJson = existing && currentPolicy === installedPolicy && currentPolicy !== originalPolicy ? originalPolicy : currentPolicy;
+  if (policyJson) {
+    const propagatedExpiry = existing && currentPolicy === installedPolicy && currentPolicy !== originalPolicy ? existing.previousToolPolicyValidUntilEnv : process.env[TOOL_POLICY_VALID_UNTIL_ENV];
+    return {
+      input: policyJson,
+      source: TOOL_POLICY_ENV,
+      identity: `${TOOL_POLICY_ENV}:${policySourceFingerprint(policyJson)}`,
+      remoteToken: "",
+      validUntil: parsePropagatedValidUntil(propagatedExpiry),
+      repositoryScoped: false
+    };
+  }
+  const configuredPath = process.env[TOOL_POLICY_PATH_ENV]?.trim();
+  if (configuredPath) {
+    return {
+      input: configuredPath,
+      source: TOOL_POLICY_PATH_ENV,
+      identity: `${TOOL_POLICY_PATH_ENV}:${path.resolve(configuredPath)}`,
+      remoteToken: "",
+      repositoryScoped: false
+    };
+  }
+  const remoteUrl = process.env[TOOL_POLICY_URL_ENV]?.trim() || void 0;
+  if (remoteUrl) {
+    const remoteToken = process.env[TOOL_POLICY_TOKEN_ENV]?.trim() ?? "";
+    return {
+      source: TOOL_POLICY_URL_ENV,
+      identity: `${TOOL_POLICY_URL_ENV}:${remoteUrl}`,
+      remoteUrl,
+      remoteToken,
+      repositoryScoped: false
+    };
+  }
+  const globalPath = defaultGlobalToolPolicyPath();
+  if (fs.existsSync(globalPath)) {
+    return {
+      input: globalPath,
+      source: globalPath,
+      identity: `global:${path.resolve(globalPath)}`,
+      remoteToken: "",
+      repositoryScoped: false
+    };
+  }
+  const localPath = findLocalToolPolicyPath(options.policyProject ?? options.project);
+  if (localPath) {
+    return {
+      input: localPath,
+      source: localPath,
+      identity: `repository:${path.resolve(localPath)}`,
+      remoteToken: "",
+      repositoryScoped: true
+    };
+  }
+  return {
+    source: "unconfigured",
+    identity: "unconfigured",
+    remoteToken: "",
+    repositoryScoped: true
+  };
+}
+function workspaceDir() {
+  return process.env.HEADROOM_WORKSPACE_DIR?.trim() || path.join(os.homedir(), ".headroom");
+}
+function processIsStateless() {
+  return ["1", "true", "yes", "on"].includes(
+    process.env.HEADROOM_STATELESS?.trim().toLowerCase() ?? ""
+  );
+}
+function toolPolicyRefreshSeconds(env = process.env) {
+  const raw = env[TOOL_POLICY_REFRESH_SECONDS_ENV]?.trim();
+  if (!raw || !/^\d+$/.test(raw)) {
+    return DEFAULT_REFRESH_SECONDS;
+  }
+  const value = Number(raw);
+  return Number.isSafeInteger(value) && value >= DEFAULT_REFRESH_SECONDS && value <= MAX_REFRESH_SECONDS ? value : DEFAULT_REFRESH_SECONDS;
+}
+function remoteToolPolicyCachePath(url2, token = "") {
+  const digest = createHash("sha256").update(`${url2}\0${token}`).digest("hex");
+  return path.join(workspaceDir(), "policy-cache", `${digest}.json`);
+}
+function isAllowedToolPolicyUrl(value) {
+  let url2;
+  try {
+    url2 = new URL(value);
+  } catch {
+    return false;
+  }
+  if (url2.protocol === "https:") {
+    return true;
+  }
+  if (url2.protocol !== "http:") {
+    return false;
+  }
+  const hostname3 = url2.hostname.toLowerCase().replace(/^\[|\]$/g, "");
+  return hostname3 === "localhost" || hostname3 === "::1" || /^127(?:\.\d{1,3}){3}$/.test(hostname3);
+}
+function readRemotePolicyCache(url2, token) {
+  if (processIsStateless()) {
+    return void 0;
+  }
+  const cachePath = remoteToolPolicyCachePath(url2, token);
+  if (!fs.existsSync(cachePath)) {
+    return void 0;
+  }
+  try {
+    const parsed = JSON.parse(fs.readFileSync(cachePath, "utf8"));
+    if (parsed.cache_version !== 2 || parsed.url_hash !== createHash("sha256").update(url2).digest("hex") || typeof parsed.fetched_at !== "number" || !parsed.policy || typeof parsed.policy !== "object" || Array.isArray(parsed.policy)) {
+      return void 0;
+    }
+    return parsed;
+  } catch {
+    return void 0;
+  }
+}
+function writeRemotePolicyCache(url2, cache, token) {
+  if (processIsStateless()) {
+    return;
+  }
+  const cachePath = remoteToolPolicyCachePath(url2, token);
+  const directory = path.dirname(cachePath);
+  const temporaryPath = path.join(
+    directory,
+    `.${path.basename(cachePath)}.${process.pid}.${randomUUID()}.tmp`
+  );
+  fs.mkdirSync(directory, { recursive: true });
+  try {
+    fs.writeFileSync(temporaryPath, `${JSON.stringify(cache)}
+`, {
+      encoding: "utf8",
+      flag: "wx"
+    });
+    fs.renameSync(temporaryPath, cachePath);
+  } finally {
+    try {
+      fs.rmSync(temporaryPath, { force: true });
+    } catch {
+    }
+  }
+}
+async function readLimitedResponseText(response) {
+  const declaredLength = Number(response.headers.get("content-length"));
+  if (Number.isFinite(declaredLength) && declaredLength > MAX_REMOTE_POLICY_BYTES) {
+    throw new Error("remote Headroom tool policy exceeds 1 MiB");
+  }
+  if (!response.body) {
+    return "";
+  }
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder("utf-8", { fatal: true });
+  let size = 0;
+  let text = "";
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      size += value.byteLength;
+      if (size > MAX_REMOTE_POLICY_BYTES) {
+        await reader.cancel();
+        throw new Error("remote Headroom tool policy exceeds 1 MiB");
+      }
+      text += decoder.decode(value, { stream: true });
+    }
+    return text + decoder.decode();
+  } finally {
+    reader.releaseLock();
+  }
+}
+async function loadRemoteToolPolicy(url2, token, originalFetch, now = Date.now() / 1e3) {
+  const remoteLabel = new URL(url2).hostname.toLowerCase().replace(/^\[|\]$/g, "");
+  const cache = readRemotePolicyCache(url2, token);
+  const cacheAge = cache ? now - cache.fetched_at : void 0;
+  if (cache && cacheAge !== void 0 && cacheAge >= 0 && cacheAge < toolPolicyRefreshSeconds()) {
+    const compiled2 = compileToolPolicy(cache.policy, void 0, `remote-cache:${remoteLabel}`);
+    compiled2.validUntil = cache.fetched_at + toolPolicyRefreshSeconds();
+    return compiled2;
+  }
+  const headers = new Headers({ accept: "application/json" });
+  if (token) {
+    headers.set("authorization", `Bearer ${token}`);
+  }
+  if (cache?.etag) {
+    headers.set("if-none-match", cache.etag);
+  }
+  let response;
+  try {
+    response = await originalFetch(url2, {
+      method: "GET",
+      headers,
+      redirect: "manual",
+      signal: AbortSignal.timeout(REMOTE_TIMEOUT_MS)
+    });
+  } catch {
+    throw new Error(`Headroom tool policy service ${remoteLabel} is unavailable`);
+  }
+  if (response.status === 304 && cache) {
+    const compiled2 = compileToolPolicy(
+      cache.policy,
+      void 0,
+      `remote-cache:${remoteLabel}`
+    );
+    const refreshed = { ...cache, fetched_at: now };
+    writeRemotePolicyCache(url2, refreshed, token);
+    compiled2.validUntil = now + toolPolicyRefreshSeconds();
+    return compiled2;
+  }
+  if (!response.ok) {
+    throw new Error(`Headroom tool policy service ${remoteLabel} returned HTTP ${response.status}`);
+  }
+  const text = await readLimitedResponseText(response);
+  const payload = parseToolPolicyJson(text, remoteLabel);
+  const compiled = compileToolPolicy(payload, void 0, `remote:${remoteLabel}`);
+  compiled.validUntil = now + toolPolicyRefreshSeconds();
+  writeRemotePolicyCache(
+    url2,
+    {
+      cache_version: 2,
+      url_hash: createHash("sha256").update(url2).digest("hex"),
+      etag: response.headers.get("etag") ?? "",
+      fetched_at: now,
+      policy: JSON.parse(compiled.serialized)
+    },
+    token
+  );
+  return compiled;
+}
+async function refreshHeadroomToolPolicy(now = Date.now() / 1e3) {
+  const state = getState();
+  if (!state || state.toolPolicyInput !== void 0) {
+    return;
+  }
+  const url2 = state.remotePolicyUrl;
+  if (!url2) {
+    return;
+  }
+  if (!isAllowedToolPolicyUrl(url2)) {
+    state.toolPolicy = void 0;
+    state.policyUnavailable = `${TOOL_POLICY_URL_ENV} must use HTTPS; HTTP is allowed only for loopback hosts`;
+    return;
+  }
+  try {
+    state.toolPolicy = await loadRemoteToolPolicy(
+      url2,
+      state.remotePolicyToken,
+      state.originalFetch,
+      now
+    );
+    state.policyUnavailable = void 0;
+    installProcessEnv(state.proxyUrl, state.excludeHosts, state.toolPolicy);
+  } catch (error62) {
+    state.toolPolicy = void 0;
+    state.policyUnavailable = error62 instanceof Error ? error62.message : String(error62);
+  }
+}
+function activateHeadroomRepositoryPolicy(policyProject) {
+  const state = getState();
+  if (!state || !state.dynamicRepositoryPolicy) return;
+  const resolvedProject = path.resolve(policyProject);
+  if (state.repositoryPolicyProject === resolvedProject) return;
+  if (state.repositoryPolicyProject) {
+    throw new Error(
+      "[headroom] Multiple OpenCode repository locations share one plugin instance; refusing to replace the active repository policy"
+    );
+  }
+  const selectedSource = resolveToolPolicySource(
+    {
+      proxyUrl: state.proxyUrl,
+      project: state.project,
+      policyProject: resolvedProject
+    },
+    state
+  );
+  try {
+    state.toolPolicy = selectedSource.source === "unconfigured" ? void 0 : compileToolPolicy(
+      selectedSource.input,
+      resolvedProject,
+      selectedSource.source
+    );
+    if (state.toolPolicy && selectedSource.validUntil !== void 0) {
+      state.toolPolicy.validUntil = selectedSource.validUntil;
+    }
+    state.policyUnavailable = void 0;
+  } catch (error62) {
+    state.toolPolicy = void 0;
+    state.policyUnavailable = error62 instanceof Error ? error62.message : String(error62);
+  }
+  state.repositoryPolicyProject = resolvedProject;
+  installProcessEnv(state.proxyUrl, state.excludeHosts, state.toolPolicy);
+}
+function withShimEnv(env, proxyUrl, excludeHosts, toolPolicy) {
+  const nextEnv = { ...env ?? process.env };
+  delete nextEnv[TOOL_POLICY_TOKEN_ENV];
+  delete nextEnv[TOOL_POLICY_URL_ENV];
+  nextEnv[PROXY_ENV] = proxyUrl;
+  withExcludeHostsEnv(nextEnv, excludeHosts);
+  if (toolPolicy) {
+    nextEnv[TOOL_POLICY_ENV] = toolPolicy.serialized;
+    if (toolPolicy.validUntil !== void 0) {
+      nextEnv[TOOL_POLICY_VALID_UNTIL_ENV] = String(toolPolicy.validUntil);
+    } else {
+      delete nextEnv[TOOL_POLICY_VALID_UNTIL_ENV];
+    }
+  } else {
+    delete nextEnv[TOOL_POLICY_ENV];
+    delete nextEnv[TOOL_POLICY_VALID_UNTIL_ENV];
+  }
+  const shim = shimImportSpecifier();
+  if (shim) {
+    nextEnv.NODE_OPTIONS = withNodeImportOption(nextEnv.NODE_OPTIONS, shim);
+  }
+  return nextEnv;
+}
 function withExcludeHostsEnv(env, excludeHosts) {
   if (excludeHosts.length > 0) {
     env[EXCLUDE_HOSTS_ENV] = excludeHosts.join(",");
   } else {
     delete env[EXCLUDE_HOSTS_ENV];
   }
-}
-function withShimEnv(env, proxyUrl, excludeHosts) {
-  const nextEnv = { ...env ?? process.env };
-  nextEnv[PROXY_ENV] = proxyUrl;
-  withExcludeHostsEnv(nextEnv, excludeHosts);
-  const shim = shimImportSpecifier();
-  if (shim) {
-    nextEnv.NODE_OPTIONS = withNodeImportOption(nextEnv.NODE_OPTIONS, shim);
-  }
-  return nextEnv;
 }
 var PROCESS_ENV_KEYS = [PROXY_ENV, EXCLUDE_HOSTS_ENV, "NODE_OPTIONS"];
 function snapshotProcessEnv() {
@@ -19848,9 +20367,20 @@ function restoreProcessEnv(saved) {
     }
   }
 }
-function installProcessEnv(proxyUrl, excludeHosts) {
+function installProcessEnv(proxyUrl, excludeHosts, toolPolicy) {
   process.env[PROXY_ENV] = proxyUrl;
   withExcludeHostsEnv(process.env, excludeHosts);
+  if (toolPolicy) {
+    process.env[TOOL_POLICY_ENV] = toolPolicy.serialized;
+    if (toolPolicy.validUntil !== void 0) {
+      process.env[TOOL_POLICY_VALID_UNTIL_ENV] = String(toolPolicy.validUntil);
+    } else {
+      delete process.env[TOOL_POLICY_VALID_UNTIL_ENV];
+    }
+  } else {
+    delete process.env[TOOL_POLICY_ENV];
+    delete process.env[TOOL_POLICY_VALID_UNTIL_ENV];
+  }
   const shim = shimImportSpecifier();
   if (shim) {
     process.env.NODE_OPTIONS = withNodeImportOption(process.env.NODE_OPTIONS, shim);
@@ -19859,11 +20389,17 @@ function installProcessEnv(proxyUrl, excludeHosts) {
 function isOptions(value) {
   return Boolean(value) && typeof value === "object" && !Array.isArray(value) && !(value instanceof URL);
 }
-function injectOptionsEnv(args, optionIndex, state) {
+function injectOptionsEnv(args, optionIndex, proxyUrl) {
+  const state = getState();
   const nextArgs = [...args];
   const callback = typeof nextArgs.at(-1) === "function" ? nextArgs.pop() : void 0;
   const existing = isOptions(nextArgs[optionIndex]) ? { ...nextArgs[optionIndex] } : {};
-  existing.env = withShimEnv(existing.env, state.proxyUrl, state.excludeHosts);
+  existing.env = withShimEnv(
+    existing.env,
+    proxyUrl,
+    state?.excludeHosts ?? [],
+    state?.toolPolicy
+  );
   if (process.platform === "win32" && existing.windowsHide === void 0) {
     existing.windowsHide = true;
   }
@@ -19877,14 +20413,651 @@ function injectOptionsEnv(args, optionIndex, state) {
   }
   return nextArgs;
 }
+function normalizedCommandName(command) {
+  const trimmed = command.trim();
+  if (!trimmed) {
+    return "";
+  }
+  return path.basename(trimmed).toLowerCase();
+}
+function commandMatches(command, patterns) {
+  if (!patterns?.length) {
+    return true;
+  }
+  const normalized = normalizedCommandName(command);
+  const lowered = command.trim().toLowerCase();
+  return patterns.some((pattern) => {
+    const candidate = pattern.toLowerCase();
+    return candidate === lowered || candidate === normalized || path.basename(candidate) === normalized;
+  });
+}
+function shellTokens(commandLine) {
+  const tokens = [];
+  let current = "";
+  let quote = "";
+  for (let index = 0; index < commandLine.length; index += 1) {
+    const char = commandLine[index];
+    if (quote) {
+      if (char === quote) quote = "";
+      else if (char === "\\" && quote === '"' && index + 1 < commandLine.length) {
+        current += commandLine[++index];
+      } else current += char;
+    } else if (char === "'" || char === '"') {
+      quote = char;
+    } else if (char === "\r" || char === "\n") {
+      if (current) tokens.push(current);
+      current = "";
+      tokens.push(";");
+      if (char === "\r" && commandLine[index + 1] === "\n") index += 1;
+    } else if (/\s/.test(char)) {
+      if (current) tokens.push(current);
+      current = "";
+    } else if (";&|".includes(char)) {
+      if (current) tokens.push(current);
+      current = "";
+      if (commandLine[index + 1] === char) tokens.push(char + commandLine[++index]);
+      else tokens.push(char);
+    } else {
+      current += char;
+    }
+  }
+  if (current) tokens.push(current);
+  return tokens;
+}
+var SHELL_OPERATORS = /* @__PURE__ */ new Set([";", "&&", "||", "|", "&"]);
+var COMMAND_WRAPPERS = /* @__PURE__ */ new Set(["command", "env", "nohup", "sudo", "time"]);
+var SHELL_WRAPPERS = /* @__PURE__ */ new Set(["bash", "cmd", "dash", "ksh", "powershell", "pwsh", "sh", "zsh"]);
+var ENV_ASSIGNMENT = /^[A-Za-z_][A-Za-z0-9_]*=/;
+var WRAPPER_OPTIONS_WITH_VALUE = {
+  env: /* @__PURE__ */ new Set(["-C", "--chdir", "-S", "--split-string", "-u", "--unset"]),
+  sudo: /* @__PURE__ */ new Set([
+    "-C",
+    "--close-from",
+    "-g",
+    "--group",
+    "-h",
+    "--host",
+    "-p",
+    "--prompt",
+    "-R",
+    "--chroot",
+    "-r",
+    "--role",
+    "-T",
+    "--command-timeout",
+    "-t",
+    "--type",
+    "-u",
+    "--user"
+  ]),
+  time: /* @__PURE__ */ new Set(["-f", "--format", "-o", "--output"])
+};
+function shellCommandSubstitutions(commandLine) {
+  const substitutions = [];
+  let quote = "";
+  for (let index = 0; index < commandLine.length; index += 1) {
+    const char = commandLine[index];
+    if (char === "\\") {
+      index += 1;
+      continue;
+    }
+    if (quote === "'") {
+      if (char === "'") quote = "";
+      continue;
+    }
+    if (char === "'" && !quote) {
+      quote = char;
+      continue;
+    }
+    if (char === '"') {
+      quote = quote === '"' ? "" : '"';
+      continue;
+    }
+    if (char === "`") {
+      let end2 = index + 1;
+      for (; end2 < commandLine.length; end2 += 1) {
+        if (commandLine[end2] === "\\") {
+          end2 += 1;
+        } else if (commandLine[end2] === "`") {
+          break;
+        }
+      }
+      if (end2 < commandLine.length) {
+        substitutions.push(commandLine.slice(index + 1, end2));
+        index = end2;
+      }
+      continue;
+    }
+    if (char !== "$" || commandLine[index + 1] !== "(") {
+      continue;
+    }
+    if (commandLine[index + 2] === "(") {
+      index += 2;
+      continue;
+    }
+    let depth = 1;
+    let nestedQuote = "";
+    let end = index + 2;
+    for (; end < commandLine.length; end += 1) {
+      const nestedChar = commandLine[end];
+      if (nestedChar === "\\") {
+        end += 1;
+        continue;
+      }
+      if (nestedQuote) {
+        if (nestedChar === nestedQuote) nestedQuote = "";
+        continue;
+      }
+      if (nestedChar === "'" || nestedChar === '"') {
+        nestedQuote = nestedChar;
+      } else if (nestedChar === "(") {
+        depth += 1;
+      } else if (nestedChar === ")" && --depth === 0) {
+        break;
+      }
+    }
+    if (depth === 0) {
+      substitutions.push(commandLine.slice(index + 2, end));
+      index = end;
+    }
+  }
+  return substitutions;
+}
+var DYNAMIC_COMMANDS = /* @__PURE__ */ new Set([
+  "call",
+  "case",
+  "coproc",
+  "do",
+  "done",
+  "elif",
+  "else",
+  "esac",
+  "eval",
+  "exec",
+  "fi",
+  "for",
+  "function",
+  "get-command",
+  "iex",
+  "if",
+  "invoke-expression",
+  "select",
+  "source",
+  "then",
+  "until",
+  "while"
+]);
+function hasDynamicShellExecution(commandLine, toolName) {
+  const normalizedTool = normalizedCommandName(toolName ?? "");
+  const cmdDelayedExpansion = normalizedTool === "cmd" || normalizedTool === "shell" && process.platform === "win32";
+  let quote = "";
+  let cmdDelayedExpansionStart = -1;
+  let delayedExpansionState = 0;
+  let percentStart = -1;
+  let visible = "";
+  for (let index = 0; index < commandLine.length; index += 1) {
+    const char = commandLine[index];
+    if (char === "\r" || char === "\n") {
+      cmdDelayedExpansionStart = -1;
+      delayedExpansionState = 0;
+      percentStart = -1;
+    }
+    if (cmdDelayedExpansion && char === "!") {
+      if (cmdDelayedExpansionStart >= 0 && index > cmdDelayedExpansionStart + 1) return true;
+      cmdDelayedExpansionStart = index;
+    }
+    if (quote === "'") {
+      delayedExpansionState = 0;
+      visible += " ";
+      if (char === "'") quote = "";
+      continue;
+    }
+    if (char === "'") {
+      delayedExpansionState = 0;
+      quote = "'";
+      visible += " ";
+      continue;
+    }
+    if (char === '"') {
+      delayedExpansionState = 0;
+      quote = quote === '"' ? "" : '"';
+      visible += " ";
+      continue;
+    }
+    if (char === "\\") {
+      delayedExpansionState = 0;
+      const next = commandLine[index + 1];
+      if (quote !== '"' && next && /[A-Za-z0-9]/.test(next)) return true;
+      visible += "  ";
+      index += 1;
+      continue;
+    }
+    if (char === "%") {
+      if (percentStart >= 0 && index > percentStart + 1) return true;
+      percentStart = index;
+    }
+    if (char === "!") {
+      if (delayedExpansionState === 2) return true;
+      delayedExpansionState = 1;
+    } else if (delayedExpansionState === 1) {
+      delayedExpansionState = /[A-Za-z_]/.test(char) ? 2 : 0;
+    } else if (delayedExpansionState === 2 && !/[A-Za-z0-9_]/.test(char)) {
+      delayedExpansionState = 0;
+    }
+    if (char === "`" || char === "$") return true;
+    visible += quote ? " " : char;
+  }
+  if (quote) return true;
+  if (/[<>]\s*\(|(?:^|[;&|]\s*)&\s*\(|[{}]/.test(visible)) return true;
+  return shellCommandBinaries(commandLine).some(
+    (command) => DYNAMIC_COMMANDS.has(normalizedCommandName(command))
+  );
+}
+function shellCommandBinaries(commandLine) {
+  const segments = [[]];
+  for (const token of shellTokens(commandLine)) {
+    if (SHELL_OPERATORS.has(token)) {
+      if (segments.at(-1)?.length) segments.push([]);
+    } else {
+      segments.at(-1).push(token);
+    }
+  }
+  const binaries = [];
+  for (const segment of segments) {
+    let index = 0;
+    while (index < segment.length && ENV_ASSIGNMENT.test(segment[index])) index += 1;
+    while (index < segment.length && COMMAND_WRAPPERS.has(normalizedCommandName(segment[index]))) {
+      const wrapper = normalizedCommandName(segment[index]);
+      index += 1;
+      while (index < segment.length) {
+        const token = segment[index];
+        if (token === "--") {
+          index += 1;
+          break;
+        }
+        if (ENV_ASSIGNMENT.test(token)) {
+          index += 1;
+          continue;
+        }
+        const optionName = token.split("=", 1)[0];
+        if (token.startsWith("-")) {
+          index += 1;
+          if (!token.includes("=") && WRAPPER_OPTIONS_WITH_VALUE[wrapper]?.has(optionName) && index < segment.length) {
+            if (wrapper === "env" && ["-S", "--split-string"].includes(optionName)) {
+              binaries.push(...shellCommandBinaries(segment[index]));
+            }
+            index += 1;
+          }
+          continue;
+        }
+        break;
+      }
+    }
+    if (index >= segment.length) continue;
+    const command = segment[index];
+    binaries.push(command);
+    if (SHELL_WRAPPERS.has(normalizedCommandName(command))) {
+      for (let flagIndex = index + 1; flagIndex < segment.length - 1; flagIndex += 1) {
+        if (["-c", "/c", "-command"].includes(segment[flagIndex].toLowerCase())) {
+          binaries.push(...shellCommandBinaries(segment[flagIndex + 1]));
+          break;
+        }
+      }
+    }
+  }
+  for (const substitution of shellCommandSubstitutions(commandLine)) {
+    binaries.push(...shellCommandBinaries(substitution));
+  }
+  return [...new Set(binaries)];
+}
+function matchesDomain(hostname3, patterns) {
+  if (!patterns?.length) {
+    return true;
+  }
+  const normalized = hostname3.toLowerCase().replace(/^\[|\]$/g, "");
+  return patterns.some((pattern) => {
+    const candidate = pattern.toLowerCase();
+    if (candidate.startsWith("*.")) {
+      const suffix = candidate.slice(2);
+      return normalized === suffix || normalized.endsWith(`.${suffix}`);
+    }
+    return normalized === candidate;
+  });
+}
+function hashPolicyResource(resource) {
+  return createHash("sha256").update(resource).digest("hex").slice(0, 16);
+}
+function safePolicyResource(input2) {
+  if (input2.scope === "shell") {
+    return (input2.atomicCommand ? [input2.command] : shellCommandBinaries(input2.resource)).map((command) => normalizedCommandName(command)).filter(Boolean).join(",");
+  }
+  if (input2.scope === "tool_call") {
+    return input2.toolName;
+  }
+  return input2.url.hostname.toLowerCase().replace(/^\[|\]$/g, "");
+}
+function emitPolicyDecision(decision) {
+  const record2 = {
+    event: "headroom_tool_policy_decision",
+    version: decision.version,
+    decision_id: decision.decisionId,
+    authority: decision.authority,
+    timestamp: (/* @__PURE__ */ new Date()).toISOString(),
+    agent: "opencode",
+    tool_name: decision.scope,
+    scope: decision.scope,
+    action: decision.action,
+    effective_action: decision.effectiveAction,
+    mode: decision.mode,
+    matched_rule: decision.matchedRuleId ?? "",
+    reason: decision.reason ?? "",
+    request_hash: decision.requestHash,
+    resource: decision.resource,
+    source: decision.source,
+    binding: decision.binding
+  };
+  try {
+    process.stderr.write(`${JSON.stringify(record2)}
+`);
+  } catch {
+  }
+  try {
+    if (processIsStateless()) {
+      return;
+    }
+    const target = path.join(workspaceDir(), "tool_policy_audit.jsonl");
+    fs.mkdirSync(path.dirname(target), { recursive: true });
+    fs.appendFileSync(target, `${JSON.stringify(record2)}
+`, "utf8");
+  } catch {
+  }
+}
+function emitPolicyAcknowledgement(acknowledgement) {
+  const record2 = {
+    ...acknowledgement,
+    decision_id: acknowledgement.decisionId,
+    request_hash: acknowledgement.requestHash,
+    decisionId: void 0,
+    requestHash: void 0
+  };
+  try {
+    process.stderr.write(`${JSON.stringify(record2)}
+`);
+  } catch {
+  }
+  try {
+    if (processIsStateless()) return;
+    const target = path.join(workspaceDir(), "tool_policy_audit.jsonl");
+    fs.mkdirSync(path.dirname(target), { recursive: true });
+    fs.appendFileSync(target, `${JSON.stringify(record2)}
+`, "utf8");
+  } catch {
+  }
+}
+function policyDecisionId(requestHash, action, authority, binding) {
+  return createHash("sha256").update(stableJson({ version: 1, requestHash, action, authority, binding })).update(binding ? randomUUID() : "").digest("hex");
+}
+function evaluatePolicy(policy, input2, authority = "advisory", binding) {
+  if (!policy) {
+    return void 0;
+  }
+  const dynamicShellExecution = input2.scope === "shell" && !input2.atomicCommand && (policy.defaultAction === "deny" || policy.rules.some(
+    (rule) => rule.action !== "allow" && (rule.scope === "shell" || rule.scope === "tool_call")
+  )) && hasDynamicShellExecution(input2.resource, input2.toolName);
+  const matchedRule = policy.rules.find((rule) => {
+    if (input2.scope === "tool_call" && rule.scope !== "tool_call" || input2.scope !== "tool_call" && rule.scope !== "tool_call" && rule.scope !== input2.scope) {
+      return false;
+    }
+    if (rule.tools?.length) {
+      if (!("toolName" in input2) || !rule.tools.includes((input2.toolName ?? "").trim().toLowerCase())) {
+        return false;
+      }
+    }
+    if (input2.scope === "shell") {
+      const commands = input2.atomicCommand ? [input2.command] : shellCommandBinaries(input2.resource);
+      if (rule.commands?.length) {
+        const commandsMatch = rule.action === "allow" ? commands.length > 0 && commands.every((candidate) => commandMatches(candidate, rule.commands)) : commands.some((candidate) => commandMatches(candidate, rule.commands));
+        if (!commandsMatch) {
+          return false;
+        }
+      }
+      if (rule.argsPattern && !rule.argsPattern.test(input2.argsText)) {
+        return false;
+      }
+      if (rule.cwdPattern && !rule.cwdPattern.test(input2.cwd ?? "")) {
+        return false;
+      }
+      if (rule.envKeys?.length && !rule.envKeys.every(
+        (entry) => Object.keys(input2.env ?? process.env).some(
+          (key) => key.toLowerCase() === entry
+        )
+      )) {
+        return false;
+      }
+      return true;
+    }
+    if (input2.scope === "tool_call") {
+      if (rule.commands?.length) {
+        return false;
+      }
+      if (rule.argsPattern && !rule.argsPattern.test(input2.argsText)) {
+        return false;
+      }
+      if (rule.cwdPattern && !rule.cwdPattern.test(input2.cwd ?? "")) {
+        return false;
+      }
+      if (rule.envKeys?.length && !rule.envKeys.every(
+        (entry) => Object.keys(input2.env ?? process.env).some(
+          (key) => key.toLowerCase() === entry
+        )
+      )) {
+        return false;
+      }
+      return true;
+    }
+    if (rule.tools?.length) {
+      return false;
+    }
+    if (!matchesDomain(input2.url.hostname, rule.domains)) {
+      return false;
+    }
+    if (rule.urlPattern && !rule.urlPattern.test(input2.url.href)) {
+      return false;
+    }
+    return true;
+  });
+  const dynamicShellDenied = dynamicShellExecution && (!matchedRule || matchedRule.action === "allow");
+  const action = dynamicShellDenied ? "deny" : matchedRule?.action ?? policy.defaultAction;
+  const effectiveAction = policy.mode === "report_only" && action !== "allow" ? "allow" : action;
+  const requestHash = hashPolicyResource(input2.resource);
+  return {
+    version: 1,
+    decisionId: policyDecisionId(requestHash, action, authority, binding),
+    authority,
+    scope: input2.scope,
+    action,
+    effectiveAction,
+    mode: policy.mode,
+    matchedRuleId: matchedRule?.id,
+    reason: dynamicShellDenied ? "dynamic or escaped shell execution cannot be safely authorized" : matchedRule?.reason,
+    resource: safePolicyResource(input2),
+    requestHash,
+    source: policy.source,
+    binding
+  };
+}
+function enforcePolicy(policy, input2, authority = "advisory", binding) {
+  const state = getState();
+  if (state?.policyUnavailable) {
+    throw new Error(`[headroom] Tool policy unavailable; failing closed: ${state.policyUnavailable}`);
+  }
+  if (policy?.validUntil !== void 0 && Date.now() / 1e3 >= policy.validUntil) {
+    throw new Error("[headroom] Remote tool policy expired; failing closed until it is refreshed");
+  }
+  const decision = evaluatePolicy(policy, input2, authority, binding);
+  if (!decision) {
+    return;
+  }
+  emitPolicyDecision(decision);
+  const blockedAcknowledgement = decision.authority === "authoritative" && decision.binding && decision.effectiveAction !== "allow" ? {
+    version: 1,
+    event: "headroom_tool_policy_enforcement_acknowledgement",
+    decisionId: decision.decisionId,
+    authority: "authoritative",
+    effect: "blocked",
+    requestHash: decision.requestHash,
+    binding: decision.binding,
+    timestamp: (/* @__PURE__ */ new Date()).toISOString()
+  } : void 0;
+  if (decision.effectiveAction === "allow") {
+    return { decision };
+  }
+  if (blockedAcknowledgement) emitPolicyAcknowledgement(blockedAcknowledgement);
+  const suffix = (decision.matchedRuleId ? ` (rule=${decision.matchedRuleId})` : "") + (decision.reason ? `: ${decision.reason}` : "");
+  if (decision.effectiveAction === "require_approval") {
+    const message2 = `[headroom] Tool policy requires approval for ${decision.scope} target ${decision.resource}` + suffix + ". No approval handler is installed in the OpenCode transport yet.";
+    if (blockedAcknowledgement) {
+      throw new ToolPolicyEnforcementError(message2, decision, blockedAcknowledgement);
+    }
+    throw new Error(message2);
+  }
+  const message = `[headroom] Tool policy denied ${decision.scope} target ${decision.resource}` + suffix;
+  if (blockedAcknowledgement) {
+    throw new ToolPolicyEnforcementError(message, decision, blockedAcknowledgement);
+  }
+  throw new Error(message);
+}
+async function enforceNativeToolExecution(toolName, args, cwd, execution) {
+  await refreshHeadroomToolPolicy();
+  const state = getState();
+  const canonicalArgs = stableJson(args);
+  const binding = execution ? {
+    caller: "opencode",
+    adapter: "tool.execute.before",
+    sessionID: execution.sessionID,
+    taskID: execution.taskID ?? execution.callID,
+    callID: execution.callID,
+    toolName,
+    cwd,
+    canonicalArgsHash: hashPolicyResource(canonicalArgs)
+  } : void 0;
+  return enforcePolicy(
+    state?.toolPolicy,
+    nativePolicyInput(toolName, args, cwd),
+    binding ? "authoritative" : "advisory",
+    binding
+  );
+}
+function assertNativeToolExecutionBinding(preflight, toolName, args, cwd, execution) {
+  const binding = preflight.decision.binding;
+  const canonicalArgsHash = hashPolicyResource(stableJson(args));
+  if (preflight.decision.authority !== "authoritative" || !binding || binding.caller !== "opencode" || binding.adapter !== "tool.execute.before" || binding.sessionID !== execution.sessionID || binding.callID !== execution.callID || binding.taskID !== (execution.taskID ?? execution.callID) || binding.toolName !== toolName || binding.cwd !== cwd || binding.canonicalArgsHash !== canonicalArgsHash) {
+    throw new Error(
+      "[headroom] OpenCode execution acknowledgement did not match the bound preflight decision"
+    );
+  }
+}
+function acknowledgeNativeToolExecution(preflight, toolName, args, cwd, execution) {
+  assertNativeToolExecutionBinding(preflight, toolName, args, cwd, execution);
+  const binding = preflight.decision.binding;
+  const acknowledgement = {
+    version: 1,
+    event: "headroom_tool_policy_enforcement_acknowledgement",
+    decisionId: preflight.decision.decisionId,
+    authority: "authoritative",
+    effect: "allowed",
+    requestHash: preflight.decision.requestHash,
+    binding,
+    timestamp: (/* @__PURE__ */ new Date()).toISOString()
+  };
+  emitPolicyAcknowledgement(acknowledgement);
+  return acknowledgement;
+}
+function acknowledgeUnknownNativeToolExecution(preflight, reason) {
+  const binding = preflight.decision.binding;
+  if (preflight.decision.authority !== "authoritative" || preflight.decision.effectiveAction !== "allow" || !binding) {
+    throw new Error(
+      "[headroom] Cannot record an unknown outcome for an unbound or blocked preflight"
+    );
+  }
+  const acknowledgement = {
+    version: 1,
+    event: "headroom_tool_policy_enforcement_acknowledgement",
+    decisionId: preflight.decision.decisionId,
+    authority: "authoritative",
+    effect: "unknown",
+    reason,
+    requestHash: preflight.decision.requestHash,
+    binding,
+    timestamp: (/* @__PURE__ */ new Date()).toISOString()
+  };
+  emitPolicyAcknowledgement(acknowledgement);
+  return acknowledgement;
+}
+function nativePolicyInput(toolName, args, cwd) {
+  const stableArgs = stableJson(args);
+  if (!["bash", "cmd", "powershell", "pwsh", "sh", "shell"].includes(
+    normalizedCommandName(toolName)
+  )) {
+    return {
+      scope: "tool_call",
+      resource: `${toolName} ${stableArgs}`,
+      toolName,
+      argsText: stableArgs,
+      cwd,
+      env: isOptions(args.env) ? args.env : void 0
+    };
+  }
+  const commandLine = typeof args.command === "string" ? args.command : "";
+  return {
+    scope: "shell",
+    resource: commandLine,
+    command: shellCommandBinaries(commandLine)[0] ?? "",
+    argsText: commandLine,
+    cwd,
+    env: isOptions(args.env) ? args.env : void 0,
+    toolName
+  };
+}
+function stableJson(value) {
+  if (Array.isArray(value)) {
+    return `[${value.map((entry) => stableJson(entry)).join(",")}]`;
+  }
+  if (value && typeof value === "object") {
+    return `{${Object.entries(value).sort(([left], [right]) => left.localeCompare(right)).map(([key, entry]) => `${JSON.stringify(key)}:${stableJson(entry)}`).join(",")}}`;
+  }
+  return JSON.stringify(value) ?? "null";
+}
+function effectiveChildCwd(value) {
+  if (typeof value === "string") {
+    return path.resolve(process.cwd(), value);
+  }
+  if (value instanceof URL && value.protocol === "file:") {
+    return path.resolve(fileURLToPath(value));
+  }
+  return process.cwd();
+}
 function wrapSpawn(originalSpawn) {
   return function headroomSpawn(...args) {
     const state = getState();
     if (!state) {
       return Reflect.apply(originalSpawn, this, args);
     }
+    const command = String(args[0] ?? "");
+    const commandArgs = Array.isArray(args[1]) ? args[1].map((entry) => String(entry)) : [];
+    const resource = [command, ...commandArgs].join(" ").trim() || command;
+    const options = isOptions(args[Array.isArray(args[1]) ? 2 : 1]) ? args[Array.isArray(args[1]) ? 2 : 1] : void 0;
+    enforcePolicy(state.toolPolicy, {
+      scope: "shell",
+      resource,
+      command,
+      argsText: resource,
+      cwd: effectiveChildCwd(options?.cwd),
+      env: options?.env,
+      atomicCommand: options?.shell !== true && typeof options?.shell !== "string"
+    });
     const optionIndex = Array.isArray(args[1]) ? 2 : 1;
-    return Reflect.apply(originalSpawn, this, injectOptionsEnv(args, optionIndex, state));
+    return Reflect.apply(originalSpawn, this, injectOptionsEnv(args, optionIndex, state.proxyUrl));
   };
 }
 function wrapExec(originalExec) {
@@ -19893,7 +21066,17 @@ function wrapExec(originalExec) {
     if (!state) {
       return Reflect.apply(originalExec, this, args);
     }
-    return Reflect.apply(originalExec, this, injectOptionsEnv(args, 1, state));
+    const commandLine = String(args[0] ?? "");
+    const options = isOptions(args[1]) ? args[1] : void 0;
+    enforcePolicy(state.toolPolicy, {
+      scope: "shell",
+      resource: commandLine,
+      command: shellCommandBinaries(commandLine)[0] ?? "",
+      argsText: commandLine,
+      cwd: effectiveChildCwd(options?.cwd),
+      env: options?.env
+    });
+    return Reflect.apply(originalExec, this, injectOptionsEnv(args, 1, state.proxyUrl));
   };
 }
 function wrapExecFile(originalExecFile) {
@@ -19902,8 +21085,21 @@ function wrapExecFile(originalExecFile) {
     if (!state) {
       return Reflect.apply(originalExecFile, this, args);
     }
+    const command = String(args[0] ?? "");
+    const commandArgs = Array.isArray(args[1]) ? args[1].map((entry) => String(entry)) : [];
+    const resource = [command, ...commandArgs].join(" ").trim() || command;
+    const options = isOptions(args[Array.isArray(args[1]) ? 2 : 1]) ? args[Array.isArray(args[1]) ? 2 : 1] : void 0;
+    enforcePolicy(state.toolPolicy, {
+      scope: "shell",
+      resource,
+      command,
+      argsText: resource,
+      cwd: effectiveChildCwd(options?.cwd),
+      env: options?.env,
+      atomicCommand: options?.shell !== true && typeof options?.shell !== "string"
+    });
     const optionIndex = Array.isArray(args[1]) ? 2 : 1;
-    return Reflect.apply(originalExecFile, this, injectOptionsEnv(args, optionIndex, state));
+    return Reflect.apply(originalExecFile, this, injectOptionsEnv(args, optionIndex, state.proxyUrl));
   };
 }
 function wrapFork(originalFork) {
@@ -19912,8 +21108,21 @@ function wrapFork(originalFork) {
     if (!state) {
       return Reflect.apply(originalFork, this, args);
     }
+    const command = String(args[0] ?? "");
+    const commandArgs = Array.isArray(args[1]) ? args[1].map((entry) => String(entry)) : [];
+    const resource = [command, ...commandArgs].join(" ").trim() || command;
+    const options = isOptions(args[Array.isArray(args[1]) ? 2 : 1]) ? args[Array.isArray(args[1]) ? 2 : 1] : void 0;
+    enforcePolicy(state.toolPolicy, {
+      scope: "shell",
+      resource,
+      command,
+      argsText: resource,
+      cwd: effectiveChildCwd(options?.cwd),
+      env: options?.env,
+      atomicCommand: true
+    });
     const optionIndex = Array.isArray(args[1]) ? 2 : 1;
-    return Reflect.apply(originalFork, this, injectOptionsEnv(args, optionIndex, state));
+    return Reflect.apply(originalFork, this, injectOptionsEnv(args, optionIndex, state.proxyUrl));
   };
 }
 function normalizeProxyUrl(proxyUrl) {
@@ -20066,9 +21275,9 @@ function urlFromRequestOptions(options) {
   }
   const hostname3 = String(hostValue).replace(/:\d+$/, "");
   const port = options.port ? `:${String(options.port)}` : "";
-  const path = String(options.path ?? "/");
+  const path3 = String(options.path ?? "/");
   try {
-    return new URL(`${protocol}//${hostname3}${port}${path}`);
+    return new URL(`${protocol}//${hostname3}${port}${path3}`);
   } catch {
     return void 0;
   }
@@ -20134,7 +21343,20 @@ function wrapRequest(originalHttpRequest, originalHttpsRequest, originalRequest)
     }
     const proxy = normalizeProxyUrl(state.proxyUrl);
     const parts = splitNodeArgs(args);
-    const nextOptions = routedNodeOptions(parts, proxy, state.project, state.excludeHosts, state.sessionToken);
+    if (parts.url) {
+      enforcePolicy(state.toolPolicy, {
+        scope: "http",
+        resource: parts.url.href,
+        url: parts.url
+      });
+    }
+    const nextOptions = routedNodeOptions(
+      parts,
+      proxy,
+      state.project,
+      state.excludeHosts,
+      state.sessionToken
+    );
     if (!nextOptions) {
       return Reflect.apply(originalRequest, this, args);
     }
@@ -20151,29 +21373,83 @@ function wrapGet(request) {
   };
 }
 function wrapHttp2Connect(originalConnect) {
-  return function headroomHttp2Connect(...args) {
-    return Reflect.apply(originalConnect, this, args);
+  return function headroomHttp2Connect(authority, ...args) {
+    const state = getState();
+    if (state) {
+      const upstream = authority instanceof URL ? authority : new URL(String(authority));
+      enforcePolicy(state.toolPolicy, {
+        scope: "http",
+        resource: upstream.href,
+        url: upstream
+      });
+    }
+    return Reflect.apply(originalConnect, this, [authority, ...args]);
   };
 }
 function installHeadroomTransport(options) {
-  const excludeHosts = normalizeExcludeHosts(options.excludeHosts ?? process.env[EXCLUDE_HOSTS_ENV] ?? "");
+  const excludeHosts = normalizeExcludeHosts(
+    options.excludeHosts ?? process.env[EXCLUDE_HOSTS_ENV] ?? ""
+  );
   const existing = getState();
+  const selectedSource = resolveToolPolicySource(options, existing);
+  let toolPolicy;
+  let policyUnavailable;
+  try {
+    toolPolicy = compileToolPolicy(
+      selectedSource.input,
+      options.policyProject ?? options.project,
+      selectedSource.source
+    );
+    if (toolPolicy && selectedSource.validUntil !== void 0) {
+      toolPolicy.validUntil = selectedSource.validUntil;
+    }
+  } catch (error62) {
+    policyUnavailable = error62 instanceof Error ? error62.message : String(error62);
+  }
+  if (selectedSource.remoteUrl && !toolPolicy) {
+    policyUnavailable ??= "remote Headroom tool policy has not been loaded";
+  }
+  const policyContextKey = createHash("sha256").update(
+    stableJson({
+      identity: selectedSource.identity,
+      remoteToken: selectedSource.remoteToken,
+      policy: selectedSource.remoteUrl ? void 0 : toolPolicy?.serialized,
+      validUntil: selectedSource.validUntil
+    })
+  ).digest("hex");
   if (existing) {
+    if (existing.policyContextKey !== policyContextKey) {
+      throw new Error(
+        "[headroom] Multiple OpenCode workspaces with different tool policies share one process; refusing to replace the active policy"
+      );
+    }
     existing.refs += 1;
     existing.proxyUrl = options.proxyUrl;
     existing.project = options.project;
     existing.excludeHosts = excludeHosts;
     existing.debug = Boolean(options.debug);
     existing.sessionToken = options.sessionToken;
-    installProcessEnv(options.proxyUrl, excludeHosts);
+    installProcessEnv(options.proxyUrl, excludeHosts, existing.toolPolicy);
     return () => uninstallHeadroomTransport();
   }
   const state = {
     refs: 1,
+    policyContextKey,
     proxyUrl: options.proxyUrl,
     project: options.project,
     excludeHosts,
     debug: Boolean(options.debug),
+    toolPolicy,
+    toolPolicyInput: options.toolPolicy,
+    remotePolicyUrl: selectedSource.remoteUrl,
+    remotePolicyToken: selectedSource.remoteToken,
+    policyUnavailable,
+    dynamicRepositoryPolicy: selectedSource.repositoryScoped,
+    previousNodeOptions: process.env.NODE_OPTIONS,
+    previousProxyUrlEnv: process.env[PROXY_ENV],
+    previousExcludeHostsEnv: process.env[EXCLUDE_HOSTS_ENV],
+    previousToolPolicyEnv: process.env[TOOL_POLICY_ENV],
+    previousToolPolicyValidUntilEnv: process.env[TOOL_POLICY_VALID_UNTIL_ENV],
     sessionToken: options.sessionToken,
     originalFetch: globalThis.fetch,
     originalHttpRequest: http.request,
@@ -20188,14 +21464,28 @@ function installHeadroomTransport(options) {
     originalEnv: snapshotProcessEnv()
   };
   setState(state);
-  installProcessEnv(options.proxyUrl, excludeHosts);
+  installProcessEnv(options.proxyUrl, excludeHosts, toolPolicy);
   globalThis.fetch = async (...args) => {
     const current = getState();
     if (!current) {
       return state.originalFetch(...args);
     }
+    await refreshHeadroomToolPolicy();
+    const upstream = requestUrl(args[0]);
+    enforcePolicy(current.toolPolicy, {
+      scope: "http",
+      resource: upstream.href,
+      url: upstream
+    });
     const proxy = normalizeProxyUrl(current.proxyUrl);
-    const [nextInput, nextInit] = withRoutedFetchInput(args[0], args[1], proxy, current.project, current.excludeHosts, current.sessionToken);
+    const [nextInput, nextInit] = withRoutedFetchInput(
+      args[0],
+      args[1],
+      proxy,
+      current.project,
+      current.excludeHosts,
+      current.sessionToken
+    );
     return state.originalFetch(nextInput, nextInit);
   };
   http.request = wrapRequest(state.originalHttpRequest, state.originalHttpsRequest, state.originalHttpRequest);
@@ -20231,13 +21521,186 @@ function uninstallHeadroomTransport() {
   childProcess.fork = state.originalChildFork;
   restoreProcessEnv(state.originalEnv);
   syncBuiltinESMExports();
+  if (state.previousNodeOptions === void 0) {
+    delete process.env.NODE_OPTIONS;
+  } else {
+    process.env.NODE_OPTIONS = state.previousNodeOptions;
+  }
+  if (state.previousProxyUrlEnv === void 0) {
+    delete process.env[PROXY_ENV];
+  } else {
+    process.env[PROXY_ENV] = state.previousProxyUrlEnv;
+  }
+  if (state.previousExcludeHostsEnv === void 0) {
+    delete process.env[EXCLUDE_HOSTS_ENV];
+  } else {
+    process.env[EXCLUDE_HOSTS_ENV] = state.previousExcludeHostsEnv;
+  }
+  if (state.previousToolPolicyEnv === void 0) {
+    delete process.env[TOOL_POLICY_ENV];
+  } else {
+    process.env[TOOL_POLICY_ENV] = state.previousToolPolicyEnv;
+  }
+  if (state.previousToolPolicyValidUntilEnv === void 0) {
+    delete process.env[TOOL_POLICY_VALID_UNTIL_ENV];
+  } else {
+    process.env[TOOL_POLICY_VALID_UNTIL_ENV] = state.previousToolPolicyValidUntilEnv;
+  }
   setState(void 0);
 }
 
 // src/plugin.ts
+var DEFAULT_PENDING_PREFLIGHT_TTL_MS = 5 * 60 * 1e3;
+var DEFAULT_MAX_PENDING_PREFLIGHTS = 1024;
+var DEFAULT_MAX_RETIRED_CALL_IDENTITIES = 65536;
+function positiveInteger(value, fallback) {
+  return Number.isSafeInteger(value) && value > 0 ? value : fallback;
+}
 var HEADROOM_PLUGIN_ID = "headroom";
 function normalizeProxyUrl2(url2) {
   return trimTrailingSlashes(url2);
+}
+function retiredCallFingerprint(key) {
+  return createHash2("sha256").update(key).digest("hex").slice(0, 32);
+}
+function nativeCallKey(execution) {
+  return `${execution.sessionID}\0${execution.callID}`;
+}
+function freezeArguments(value, seen = /* @__PURE__ */ new Set()) {
+  if (!value || typeof value !== "object" || seen.has(value)) return;
+  seen.add(value);
+  for (const child of Object.values(value)) {
+    freezeArguments(child, seen);
+  }
+  Object.freeze(value);
+}
+function toolArguments(value) {
+  if (value && typeof value === "object" && !Array.isArray(value)) {
+    return value;
+  }
+  return { value };
+}
+function createNativeToolLifecycle(projectPath, options) {
+  const pendingPreflights = /* @__PURE__ */ new Map();
+  const retiredCallFingerprints = /* @__PURE__ */ new Set();
+  let retiredCallHistoryExhausted = false;
+  const pendingPreflightTtlMs = positiveInteger(
+    options.pendingPreflightTtlMs,
+    DEFAULT_PENDING_PREFLIGHT_TTL_MS
+  );
+  const maxPendingPreflights = positiveInteger(
+    options.maxPendingPreflights,
+    DEFAULT_MAX_PENDING_PREFLIGHTS
+  );
+  const maxRetiredCallIdentities = positiveInteger(
+    options.maxRetiredCallIdentities,
+    DEFAULT_MAX_RETIRED_CALL_IDENTITIES
+  );
+  const effectiveCwd = (args, effectiveProjectPath = projectPath) => {
+    const configured = typeof args.workdir === "string" ? args.workdir : effectiveProjectPath;
+    return path2.resolve(effectiveProjectPath, configured);
+  };
+  const hasRetiredCallKey = (key) => retiredCallHistoryExhausted || retiredCallFingerprints.has(retiredCallFingerprint(key));
+  const retireCallKey = (key) => {
+    if (retiredCallHistoryExhausted) return;
+    const fingerprint = retiredCallFingerprint(key);
+    if (retiredCallFingerprints.has(fingerprint)) return;
+    if (retiredCallFingerprints.size >= maxRetiredCallIdentities) {
+      retiredCallHistoryExhausted = true;
+      return;
+    }
+    retiredCallFingerprints.add(fingerprint);
+  };
+  const finishUnknown = (key, reason) => {
+    const pending = pendingPreflights.get(key);
+    if (!pending) return;
+    pendingPreflights.delete(key);
+    clearTimeout(pending.timer);
+    retireCallKey(key);
+    acknowledgeUnknownNativeToolExecution(pending.preflight, reason);
+  };
+  const rememberPreflight = (key, preflight, effectiveProjectPath) => {
+    finishUnknown(key, "call_replaced");
+    const ambiguous = hasRetiredCallKey(key);
+    while (pendingPreflights.size >= maxPendingPreflights) {
+      const oldestKey = pendingPreflights.keys().next().value;
+      if (oldestKey === void 0) break;
+      finishUnknown(oldestKey, "capacity_evicted");
+    }
+    const timer = setTimeout(
+      () => finishUnknown(key, "postflight_timeout"),
+      pendingPreflightTtlMs
+    );
+    timer.unref?.();
+    pendingPreflights.set(key, {
+      preflight,
+      ambiguous,
+      projectPath: effectiveProjectPath,
+      timer
+    });
+  };
+  return {
+    async before(toolName, args, execution) {
+      const effectiveProjectPath = execution.projectPath ?? projectPath;
+      const preflight = await enforceNativeToolExecution(
+        toolName,
+        args,
+        effectiveCwd(args, effectiveProjectPath),
+        execution
+      );
+      if (!preflight) return false;
+      freezeArguments(args);
+      rememberPreflight(nativeCallKey(execution), preflight, effectiveProjectPath);
+      return true;
+    },
+    after(toolName, args, execution) {
+      const key = nativeCallKey(execution);
+      const pending = pendingPreflights.get(key);
+      if (!pending) return;
+      if (pending.ambiguous) {
+        finishUnknown(key, "ambiguous_reused_call");
+        return;
+      }
+      try {
+        acknowledgeNativeToolExecution(
+          pending.preflight,
+          toolName,
+          args,
+          effectiveCwd(args, pending.projectPath),
+          execution
+        );
+        pendingPreflights.delete(key);
+        clearTimeout(pending.timer);
+        retireCallKey(key);
+      } catch (error62) {
+        finishUnknown(key, "postflight_mismatch");
+        throw error62;
+      }
+    },
+    afterError(toolName, args, execution) {
+      const key = nativeCallKey(execution);
+      const pending = pendingPreflights.get(key);
+      if (!pending) return;
+      try {
+        assertNativeToolExecutionBinding(
+          pending.preflight,
+          toolName,
+          args,
+          effectiveCwd(args, pending.projectPath),
+          execution
+        );
+        finishUnknown(key, "postflight_error");
+      } catch (error62) {
+        finishUnknown(key, "postflight_mismatch");
+        throw error62;
+      }
+    },
+    dispose() {
+      for (const key of [...pendingPreflights.keys()]) {
+        finishUnknown(key, "plugin_disposed");
+      }
+    }
+  };
 }
 function resolveProxyUrl(options) {
   return normalizeProxyUrl2(
@@ -20258,7 +21721,26 @@ function headroomShellEnv(proxyUrl, project, options) {
     ...options.backend ? { HEADROOM_BACKEND: options.backend } : {}
   };
 }
+function applyHeadroomShellEnv(env, proxyUrl, project, options) {
+  delete env[TOOL_POLICY_TOKEN_ENV];
+  delete env[TOOL_POLICY_URL_ENV];
+  Object.assign(env, headroomShellEnv(proxyUrl, project, options));
+  for (const name of [
+    EXCLUDE_HOSTS_ENV,
+    TOOL_POLICY_ENV,
+    TOOL_POLICY_PATH_ENV,
+    TOOL_POLICY_REFRESH_SECONDS_ENV,
+    TOOL_POLICY_VALID_UNTIL_ENV
+  ]) {
+    if (process.env[name]) {
+      env[name] = process.env[name];
+    } else {
+      delete env[name];
+    }
+  }
+}
 function openAiWireSuffix(pkg) {
+  if (pkg === "aisdk:@ai-sdk/openai-compatible") return "/chat/completions";
   if (!pkg?.startsWith("@opencode/ai/providers/")) return void 0;
   if (pkg === "@opencode/ai/providers/openai-compatible" || pkg.endsWith("/chat")) {
     return "/chat/completions";
@@ -20288,20 +21770,46 @@ function routeModelsThroughProxy(models, proxyUrl, project, excludeHosts, sessio
     });
   }
 }
+function catalogRoutingEditor(catalog) {
+  return {
+    list: () => catalog.provider.list().flatMap(({ models }) => [...models.values()]),
+    update: (providerID, modelID, update) => {
+      catalog.model.update(providerID, modelID, update);
+    },
+    provider: {
+      get: (providerID) => catalog.provider.get(providerID)
+    }
+  };
+}
+async function disposeRegistrations(registrations) {
+  const results = await Promise.allSettled(
+    [...registrations].reverse().map((registration) => registration.dispose())
+  );
+  const failures = results.filter((result) => result.status === "rejected").map((result) => result.reason);
+  if (failures.length) {
+    throw new AggregateError(failures, "Failed to dispose OpenCode registrations");
+  }
+}
 var HeadroomPlugin = async (input2, options = {}) => {
   const pluginOptions = options;
   const proxyUrl = resolveProxyUrl(pluginOptions);
+  const projectPath = input2.worktree || input2.directory;
   const project = pluginOptions.project ?? input2.project?.id ?? input2.directory;
   const retrieveTool = createHeadroomRetrieveTool({ proxyBaseUrl: proxyUrl });
   const uninstallTransport = installHeadroomTransport({
     proxyUrl,
     project,
+    policyProject: projectPath,
     excludeHosts: pluginOptions.excludeHosts,
     debug: pluginOptions.debug,
+    toolPolicy: pluginOptions.toolPolicy,
     sessionToken: resolveSessionToken(pluginOptions)
   });
+  await refreshHeadroomToolPolicy();
+  const nativeLifecycle = createNativeToolLifecycle(projectPath, pluginOptions);
   return {
     dispose: async () => {
+      nativeLifecycle.dispose();
       uninstallTransport();
     },
     tool: {
@@ -20316,29 +21824,92 @@ var HeadroomPlugin = async (input2, options = {}) => {
       })
     },
     "shell.env": async (_input, output2) => {
-      Object.assign(output2.env, headroomShellEnv(proxyUrl, project, pluginOptions));
+      applyHeadroomShellEnv(output2.env, proxyUrl, project, pluginOptions);
+    },
+    "tool.execute.before": async (hookInput, output2) => {
+      const bound = await nativeLifecycle.before(
+        hookInput.tool,
+        output2.args,
+        {
+          sessionID: hookInput.sessionID,
+          callID: hookInput.callID
+        }
+      );
+      if (bound) {
+        Object.freeze(output2);
+      }
+    },
+    "tool.execute.after": async (hookInput) => {
+      nativeLifecycle.after(hookInput.tool, hookInput.args, {
+        sessionID: hookInput.sessionID,
+        callID: hookInput.callID
+      });
     }
   };
 };
 var headroomSetup = async (ctx) => {
+  const runtimeCtx = ctx;
   const pluginOptions = ctx.options;
   const proxyUrl = resolveProxyUrl(pluginOptions);
-  const project = pluginOptions.project ?? ctx.location.project.id ?? ctx.location.directory;
+  const projectPath = runtimeCtx.location?.directory ?? process.cwd();
+  const project = pluginOptions.project ?? runtimeCtx.location?.project?.id ?? projectPath;
   const retrieveTool = createHeadroomRetrieveTool({ proxyBaseUrl: proxyUrl });
   const excludeHosts = resolveExcludeHosts(pluginOptions);
   const sessionToken = resolveSessionToken(pluginOptions);
+  const nativeLifecycle = createNativeToolLifecycle(projectPath, pluginOptions);
+  const registrations = [];
   const uninstallTransport = installHeadroomTransport({
     proxyUrl,
     project,
+    policyProject: projectPath,
     excludeHosts,
     debug: pluginOptions.debug,
+    toolPolicy: pluginOptions.toolPolicy,
     sessionToken
   });
+  const sessionProjectPath = async (sessionID) => {
+    if (runtimeCtx.location?.directory) {
+      return path2.resolve(runtimeCtx.location.directory);
+    }
+    if (!runtimeCtx.session?.get) {
+      throw new Error(
+        "[headroom] OpenCode did not expose a project location or session lookup; repository policy enforcement cannot be initialized safely"
+      );
+    }
+    const session = await runtimeCtx.session.get({ sessionID });
+    const directory = session.location?.directory;
+    if (!directory) {
+      throw new Error(
+        `[headroom] OpenCode session ${sessionID} has no project directory; repository policy enforcement cannot continue`
+      );
+    }
+    return path2.resolve(directory);
+  };
   try {
-    await ctx.model.transform((models) => {
-      routeModelsThroughProxy(models, proxyUrl, project, excludeHosts, sessionToken);
-    });
-    await ctx.tool.transform((editor) => {
+    await refreshHeadroomToolPolicy();
+    if (runtimeCtx.location?.directory) {
+      activateHeadroomRepositoryPolicy(runtimeCtx.location.directory);
+    }
+    if (runtimeCtx.model) {
+      registrations.push(await runtimeCtx.model.transform((models) => {
+        routeModelsThroughProxy(models, proxyUrl, project, excludeHosts, sessionToken);
+      }));
+    } else if (runtimeCtx.catalog) {
+      registrations.push(await runtimeCtx.catalog.transform((catalog) => {
+        routeModelsThroughProxy(
+          catalogRoutingEditor(catalog),
+          proxyUrl,
+          project,
+          excludeHosts,
+          sessionToken
+        );
+      }));
+    } else {
+      throw new Error(
+        "[headroom] OpenCode did not expose a model or catalog transform; model traffic cannot be routed through Headroom safely"
+      );
+    }
+    registrations.push(await ctx.tool.transform((editor) => {
       editor.add({
         name: retrieveTool.name,
         description: retrieveTool.description,
@@ -20350,16 +21921,78 @@ var headroomSetup = async (ctx) => {
           return { content: await retrieveTool.execute(args) };
         }
       });
-    });
-    await ctx.shell.hook("create.before", (shell) => {
-      Object.assign(shell.env, headroomShellEnv(proxyUrl, project, pluginOptions));
-    });
+    }));
+    registrations.push(await ctx.shell.hook("create.before", (shell) => {
+      applyHeadroomShellEnv(shell.env, proxyUrl, project, pluginOptions);
+    }));
+    if (runtimeCtx.session?.hook) {
+      registrations.push(await runtimeCtx.session.hook("model.request", async (input2) => {
+        const directory = await sessionProjectPath(String(input2.sessionID));
+        activateHeadroomRepositoryPolicy(directory);
+        input2.headers[PROJECT_HEADER] = project;
+      }));
+    } else if (!runtimeCtx.location?.directory) {
+      throw new Error(
+        "[headroom] OpenCode did not expose a project location or model-request hook; repository policy enforcement cannot be initialized before model traffic"
+      );
+    }
+    registrations.push(await ctx.tool.hook("execute.before", async (input2) => {
+      const directory = await sessionProjectPath(String(input2.sessionID));
+      activateHeadroomRepositoryPolicy(directory);
+      const execution = {
+        sessionID: String(input2.sessionID),
+        callID: String(input2.id),
+        taskID: String(input2.messageID),
+        projectPath: directory
+      };
+      const bound = await nativeLifecycle.before(
+        input2.tool,
+        toolArguments(input2.input),
+        execution
+      );
+      if (bound) Object.freeze(input2);
+    }));
+    registrations.push(await ctx.tool.hook("execute.after", (input2) => {
+      const execution = {
+        sessionID: String(input2.sessionID),
+        callID: String(input2.id),
+        taskID: String(input2.messageID)
+      };
+      if (input2.status === "error") {
+        nativeLifecycle.afterError(
+          input2.tool,
+          toolArguments(input2.input),
+          execution
+        );
+        return;
+      }
+      nativeLifecycle.after(input2.tool, toolArguments(input2.input), execution);
+    }));
   } catch (error62) {
-    uninstallTransport();
+    let disposalError;
+    try {
+      await disposeRegistrations(registrations);
+    } catch (caught) {
+      disposalError = caught;
+    } finally {
+      nativeLifecycle.dispose();
+      uninstallTransport();
+    }
+    if (disposalError) {
+      throw new AggregateError(
+        [error62, disposalError],
+        "OpenCode setup and registration cleanup both failed"
+      );
+    }
     throw error62;
   }
-  return () => {
-    uninstallTransport();
+  return async () => {
+    try {
+      await disposeRegistrations(registrations);
+    } finally {
+      nativeLifecycle.dispose();
+      uninstallTransport();
+    }
   };
 };
 var HeadroomOpenCodePlugin = {
