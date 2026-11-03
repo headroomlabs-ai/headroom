@@ -8,11 +8,6 @@ includes thinking tokens.
 Scenario A (verbosity steering): a complex code-review ask. Baseline vs
 verbosity levels 2 and 3.
 
-Scenario B (effort routing): an agentic transcript whose last message is a
-clean tool_result (mechanical continuation) with `output_config.effort` set
-to "xhigh" the way Claude Code pins it. The shaper lowers effort to "low"
-for this turn only.
-
 Usage:
     source .venv/bin/activate && python scripts/eval_output_shaper.py
 Requires ANTHROPIC_API_KEY in the environment or in ./.env.
@@ -106,59 +101,6 @@ def scenario_a_body() -> dict[str, Any]:
     }
 
 
-def scenario_b_body() -> dict[str, Any]:
-    """Agentic mechanical continuation — exercises effort routing."""
-    return {
-        "model": MODEL,
-        "max_tokens": 8000,
-        "thinking": {"type": "adaptive"},
-        "output_config": {"effort": "xhigh"},
-        "system": (
-            "You are a coding agent. Use the Read tool to inspect files, then "
-            "report findings concisely."
-        ),
-        "tools": [
-            {
-                "name": "Read",
-                "description": "Read a file from the repository.",
-                "input_schema": {
-                    "type": "object",
-                    "properties": {"path": {"type": "string"}},
-                    "required": ["path"],
-                },
-            }
-        ],
-        "messages": [
-            {
-                "role": "user",
-                "content": "Check whether cache.py has thread-safety issues.",
-            },
-            {
-                "role": "assistant",
-                "content": [
-                    {"type": "text", "text": "Reading cache.py first."},
-                    {
-                        "type": "tool_use",
-                        "id": "toolu_eval_01",
-                        "name": "Read",
-                        "input": {"path": "cache.py"},
-                    },
-                ],
-            },
-            {
-                "role": "user",
-                "content": [
-                    {
-                        "type": "tool_result",
-                        "tool_use_id": "toolu_eval_01",
-                        "content": BUGGY_CODE,
-                    }
-                ],
-            },
-        ],
-    }
-
-
 def run(client: anthropic.Anthropic, body: dict[str, Any]) -> dict[str, int]:
     # The installed SDK may predate output_config as a typed kwarg; the API
     # accepts it either way, so pass it through extra_body.
@@ -192,14 +134,6 @@ def main() -> int:
             body = scenario_a_body()
             shape_request(body, OutputShaperSettings(enabled=True, verbosity_level=level))
             conditions.append(("A:verbosity", f"shaped L{level}", body))
-
-    if which in ("B", "ALL"):
-        # Scenario B: baseline (effort=xhigh) vs shaped (effort routed to low).
-        conditions.append(("B:effort-routing", "baseline xhigh", scenario_b_body()))
-        body = scenario_b_body()
-        result = shape_request(body, OutputShaperSettings(enabled=True, verbosity_level=0))
-        assert body["output_config"]["effort"] == "low", result.labels
-        conditions.append(("B:effort-routing", "shaped low", body))
 
     print(f"model={MODEL}  trials={TRIALS}\n")
     print(f"{'scenario':<18} {'condition':<16} {'trial':<6} {'in_tok':>7} {'out_tok':>8}")

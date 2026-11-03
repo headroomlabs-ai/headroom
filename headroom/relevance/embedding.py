@@ -37,6 +37,12 @@ from headroom.onnx_runtime import _resolve_revision, hf_hub_download_local_first
 
 from .base import RelevanceScore, RelevanceScorer
 
+# Texts per ONNX Runtime run. fastembed pads each batch to its longest text, and
+# its default batch of 256 grows ORT's CPU arena (which never shrinks) to fit
+# the biggest batch a proxy ever scores: 2.5 GB retained in a long-lived macOS
+# proxy. 16 holds ~10x less and runs faster, with less padding per batch.
+EMBED_BATCH_SIZE = 16
+
 # numpy is an optional dependency - import lazily
 _numpy = None
 
@@ -329,7 +335,7 @@ class EmbeddingScorer(RelevanceScorer):
         """
         np = _get_numpy()
         model = self._get_model()
-        embeddings = list(model.embed(texts))
+        embeddings = list(model.embed(texts, batch_size=EMBED_BATCH_SIZE))
         return np.array(embeddings)
 
     def score(self, item: str, context: str) -> RelevanceScore:
