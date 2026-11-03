@@ -50,7 +50,7 @@ class TurnContext:
     (or just sent); a hook's ``on_request`` may mutate them in place.
     """
 
-    provider: str  # "anthropic" | "openai" | "google" | ...
+    provider: str  # the wire shape, not the model's vendor: "anthropic" | "openai" | ...
     model: str
     messages: list[dict[str, Any]]
     tools: Any = None  # provider-native tools value (list, or None)

@@ -42,6 +42,7 @@ from headroom.proxy.gateway_turn import (
     new_turn_id,
     on_turn_expired,
     parse_gateway_block,
+    provider_for_body,
     provider_for_model,
     register_pending_turn,
     shape_gateway_body,
@@ -80,7 +81,7 @@ class GatewayTurn:
         self.body = body
         self.caps = caps
         self.client = client
-        self.provider = provider_for_model(str(body.get("model") or ""))
+        self.provider = provider_for_body(body, str(body.get("model") or ""))
         # The wire shape is a property of the body, not of the model name, and
         # it is fixed for the life of the turn: the response half has to write
         # a re-drive in the same shape the request half read.
@@ -100,7 +101,6 @@ class GatewayTurn:
             request=self.request,
             body=self.body,
             caps=self.caps,
-            provider=self.provider,
             messages=messages,
             tools=self.body.get("tools"),
             obligations=[],
@@ -116,7 +116,7 @@ class GatewayTurn:
         bind_scope(tags, self.request.scope)
         self.model_name = model_name
         self.tags = tags
-        self.provider = provider_for_model(model_name)
+        self.provider = provider_for_body(self.body, model_name)
         self._transformer = RequestTransformer(
             provider=self.provider,
             model_name=model_name,
@@ -198,7 +198,6 @@ class GatewayTurn:
             request=self.request,
             body=self.body,
             caps=self.caps,
-            provider=self.provider,
             messages=messages,
             tools=result.tools,
             obligations=self._obligations,
@@ -213,9 +212,13 @@ class GatewayTurn:
             input_tokens=tokens_before,
             transforms=transforms,
         )
-        if self.provider == "anthropic":
+        if not self.responses_shape and "anthropic" in (
+            self.provider,
+            provider_for_model(self.model_name),
+        ):
             # Last stop before the body leaves: a request over Anthropic's
-            # cache_control budget is a guaranteed 400 on the provider.
+            # cache_control budget is a guaranteed 400 on the provider. The
+            # budget belongs to the upstream, so a chat body to Claude counts.
             from headroom.proxy.helpers import enforce_cache_breakpoint_budget
 
             provider_body = self._fields["body"]
