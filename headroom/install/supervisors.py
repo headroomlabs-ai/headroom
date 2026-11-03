@@ -646,6 +646,11 @@ def install_supervisor(manifest: DeploymentManifest, *, start: bool = True) -> l
     )
 
 
+# `/End` and `/Delete` report a missing task as "cannot find the file specified";
+# `/Change` reports it as "does not exist in the system".
+_SCHTASKS_ABSENT_TEXT = ("cannot find the file specified", "does not exist in the system")
+
+
 def start_supervisor(manifest: DeploymentManifest) -> None:
     """Start the installed supervisor or runtime for a deployment."""
 
@@ -687,16 +692,28 @@ def start_supervisor(manifest: DeploymentManifest) -> None:
         _bootstrap_with_retry(domain, plist_path, action="start")
         return
     if _is_windows():
-        subprocess.run(
-            ["schtasks", "/Change", "/TN", f"{manifest.service_name}-health", "/ENABLE"],
-            check=True,
+        health = f"{manifest.service_name}-health"
+        result = run(
+            ["schtasks", "/Change", "/TN", health, "/ENABLE"],
+            capture_output=True,
+            text=True,
         )
-        subprocess.run(["schtasks", "/Run", "/TN", f"{manifest.service_name}-startup"], check=True)
-
-
-# `/End` and `/Delete` report a missing task as "cannot find the file specified";
-# `/Change` reports it as "does not exist in the system".
-_SCHTASKS_ABSENT_TEXT = ("cannot find the file specified", "does not exist in the system")
+        _require_removal_success(
+            result,
+            "schtasks health enable",
+            absent_text=_SCHTASKS_ABSENT_TEXT,
+        )
+        result = run(
+            ["schtasks", "/Run", "/TN", f"{manifest.service_name}-startup"],
+            capture_output=True,
+            text=True,
+        )
+        _require_removal_success(
+            result,
+            "schtasks startup run",
+            absent_text=_SCHTASKS_ABSENT_TEXT,
+        )
+        return
 
 
 def stop_supervisor(manifest: DeploymentManifest) -> None:
