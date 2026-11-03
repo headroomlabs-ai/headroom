@@ -237,7 +237,7 @@ class Mem0Backend:
 
         # Extract fields from metadata, with defaults
         memory_id = metadata.get("headroom_id", result.get("id", str(uuid.uuid4())))
-        user_id = metadata.get("user_id", "")
+        user_id = result.get("user_id", metadata.get("user_id", ""))
         importance = metadata.get("importance", 0.5)
 
         # Parse timestamps
@@ -269,7 +269,7 @@ class Mem0Backend:
             content=content,
             user_id=user_id,
             session_id=metadata.get("session_id"),
-            agent_id=metadata.get("agent_id"),
+            agent_id=result.get("agent_id", metadata.get("agent_id")),
             turn_id=metadata.get("turn_id"),
             created_at=created_at,
             valid_from=valid_from,
@@ -326,6 +326,7 @@ class Mem0Backend:
             client.add,
             memory.content,
             user_id=memory.user_id,
+            agent_id=memory.agent_id,
             metadata=metadata,
         )
 
@@ -382,16 +383,12 @@ class Mem0Backend:
             "limit": limit,
         }
 
+        # Mem0 2.0.18 requires search identity scopes inside filters.
+        filters = self._build_mem0_filters(filter) if filter else {}
         if user_id:
-            search_kwargs["user_id"] = user_id
-        elif filter and filter.user_id:
-            search_kwargs["user_id"] = filter.user_id
-
-        # Add filters if provided
-        if filter:
-            filters = self._build_mem0_filters(filter)
-            if filters:
-                search_kwargs["filters"] = filters
+            filters["user_id"] = user_id
+        if filters:
+            search_kwargs["filters"] = filters
 
         # Execute search
         results = await asyncio.to_thread(client.search, **search_kwargs)
@@ -531,7 +528,9 @@ class Mem0Backend:
         client = await self._ensure_client()
 
         try:
-            results = await asyncio.to_thread(client.get_all, user_id=user_id, limit=limit)
+            results = await asyncio.to_thread(
+                client.get_all, filters={"user_id": user_id}, top_k=limit
+            )
 
             # Handle different response formats
             result_list = results if isinstance(results, list) else results.get("results", [])
@@ -562,8 +561,8 @@ class Mem0Backend:
             # Mem0 doesn't support all our filter options natively
             results = await asyncio.to_thread(
                 client.get_all,
-                user_id=filter.user_id,
-                limit=filter.limit or 100,
+                filters={"user_id": filter.user_id},
+                top_k=filter.limit or 100,
             )
 
             result_list = results if isinstance(results, list) else results.get("results", [])
