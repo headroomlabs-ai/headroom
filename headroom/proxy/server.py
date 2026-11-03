@@ -487,6 +487,9 @@ logging.basicConfig(
 )
 logger = logging.getLogger("headroom.proxy")
 
+# Liveness/readiness probe routes: auth-exempt, and logged at DEBUG.
+_HEALTH_PROBE_PATHS = frozenset({"/health", "/livez", "/readyz"})
+
 
 def _output_reduction_payload(shaper_active: bool, est: Any = None) -> dict[str, Any]:
     """/stats payload for the output-shaping layer.
@@ -4074,7 +4077,13 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
             safe_headers = redact_for_wire_debug(headers)
         except Exception:
             safe_headers = {"redaction_error": True}
-        logger.info(
+        # A desktop or orchestrator polls these every few seconds; at INFO they
+        # filled half of an idle proxy log and cut a busy one's history to hours.
+        line_level = (
+            logging.DEBUG if method == "GET" and path in _HEALTH_PROBE_PATHS else logging.INFO
+        )
+        logger.log(
+            line_level,
             "event=proxy_inbound_request id=%s method=%s path=%s query=%s client=%s "
             "content_length=%s headers=%s",
             inbound_id,
@@ -4128,7 +4137,8 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
             proxy.metrics.record_inbound_response(status_code=response.status_code)
         except Exception:
             logger.debug("record_inbound_response failed", exc_info=True)
-        logger.info(
+        logger.log(
+            line_level,
             "event=proxy_inbound_response id=%s method=%s path=%s status=%s "
             "duration_ms=%.2f response_content_length=%s",
             inbound_id,
@@ -4172,7 +4182,7 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
     # Anything else on these paths falls through to the catch-all passthrough
     # relay (FastAPI's @app.get does not register HEAD), so exempting it would
     # let an unauthenticated caller relay arbitrary requests upstream.
-    _AUTH_EXEMPT_PATHS = frozenset({"/health", "/livez", "/readyz"})
+    _AUTH_EXEMPT_PATHS = _HEALTH_PROBE_PATHS
 
     # A non-loopback bind with no token is the exact shape (``--host 0.0.0.0``
     # from any launcher) that exposes the unauthenticated /v1/* relay to the
