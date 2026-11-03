@@ -2523,35 +2523,41 @@ def _get_node_text(node: Any, code: str) -> str:
 
 
 _COMMENT_NODE_TYPES = frozenset({"comment", "line_comment", "block_comment"})
+# Grammar siblings that decorate the following declaration instead of standing
+# alone (Rust outer attributes: #[derive(...)], #[inline], #[cfg(...)]).
+_ATTACHED_NODE_TYPES = frozenset({"attribute_item"})
 
 
 def _get_leading_comment_text(
     node: Any, code: str, captured_byte_ranges: list[tuple[int, int]]
 ) -> str:
-    """Collect contiguous doc-comment siblings immediately preceding a node.
+    """Collect contiguous comment and attribute siblings preceding a node.
 
-    Doc comments are top-level siblings of the declaration they document, not
-    children of it. Left uncaptured, they fall through to the leftover
-    top-level sweep and get grouped separately from the declarations they
-    document instead of staying attached. Only comments with no blank line
-    before the node (or the next comment) are treated as attached.
+    Doc comments and Rust outer attributes are top-level siblings of the
+    declaration they decorate, not children of it. Left uncaptured, they fall
+    through to the leftover top-level sweep and get grouped separately from the
+    declarations they decorate instead of staying attached. Only siblings with
+    no blank line before the node (or the next sibling) are treated as attached.
     """
-    comments: list[Any] = []
+    preamble: list[Any] = []
     sibling = getattr(node, "prev_sibling", None)
     anchor_row = node.start_point[0]
     while (
         sibling is not None
-        and sibling.type in _COMMENT_NODE_TYPES
+        and (sibling.type in _COMMENT_NODE_TYPES or sibling.type in _ATTACHED_NODE_TYPES)
         and (anchor_row - sibling.end_point[0] <= 1)
     ):
-        comments.append(sibling)
+        preamble.append(sibling)
         anchor_row = sibling.start_point[0]
         sibling = getattr(sibling, "prev_sibling", None)
-    if not comments:
+    if not preamble:
         return ""
-    comments.reverse()
-    captured_byte_ranges.extend((c.start_byte, c.end_byte) for c in comments)
-    return "\n".join(_get_node_text(c, code) for c in comments) + "\n"
+    preamble.reverse()
+    captured_byte_ranges.extend((c.start_byte, c.end_byte) for c in preamble)
+    # Some grammars (Rust) include the trailing newline in a line comment's
+    # node text; strip it so joining the preamble does not add blank lines.
+    texts = [_get_node_text(c, code).rstrip("\n") for c in preamble]
+    return "\n".join(texts) + "\n"
 
 
 def _get_node_lines(node: Any, code_lines: list[str]) -> list[str]:
