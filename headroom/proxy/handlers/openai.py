@@ -55,6 +55,7 @@ from headroom.proxy.semantic_cache_key_policy import compute_request_cache_parti
 from headroom.proxy.stage_timer import StageTimer, emit_stage_timings_log
 from headroom.proxy.tool_schema_savings_policy import (
     TURN_HOOK_SYSTEM_SAVED_TAG,
+    accumulate_tool_schema_saved,
     net_hook_tool_saving,
     tool_schema_saved_from_tags,
     without_deferral_flags,
@@ -7519,6 +7520,10 @@ class OpenAIHandlerMixin:
         # keeps running and must not book rows for a frame sent uncompressed.
         # Coalesced per source by ``accumulate_savings``, so it stays small.
         ws_turn_savings: list[dict[str, Any]] = []
+        # The same frames' additive prefix tags (a hook's system-prompt cut):
+        # booked on the outcome that claims the rows, so the headline counts them
+        # once, under the same gates.
+        ws_turn_prefix_saved: dict[str, int] = {}
 
         # Extract subprotocol from client — this is an application-level negotiation
         # that MUST be forwarded end-to-end (unlike sec-websocket-key which is per-connection).
@@ -8626,6 +8631,7 @@ class OpenAIHandlerMixin:
                                 accumulate_savings(
                                     ws_turn_savings, savings_from_tags(_frame_savings)
                                 )
+                                accumulate_tool_schema_saved(ws_turn_prefix_saved, _frame_savings)
                                 ws_conversation_tokens_saved = int(_ws_saved)
                                 ws_conversation_key = savings_conversation_key(
                                     _send_body, session_id=f"ws:{session_id}"
@@ -9124,6 +9130,7 @@ class OpenAIHandlerMixin:
                         _record_ws_compression_overhead(_rewrite_ms)
                         tokens_saved += int(frame_saved)
                         accumulate_savings(ws_turn_savings, savings_from_tags(frame_savings))
+                        accumulate_tool_schema_saved(ws_turn_prefix_saved, frame_savings)
                         ws_conversation_tokens_saved = int(frame_saved)
                         ws_conversation_key = savings_conversation_key(
                             new_inner, session_id=f"ws:{session_id}"
@@ -9487,12 +9494,12 @@ class OpenAIHandlerMixin:
                             # Same gate as ``saved_delta``: a usage-less turn
                             # leaves its rows pending for a usage-carrying one.
                             turn_tags = ws_tags
-                            if ws_turn_savings and input_delta > 0:
-                                turn_tags = {
-                                    **ws_tags,
-                                    SAVINGS_ATTRIBUTION_TAG: list(ws_turn_savings),
-                                }
+                            if input_delta > 0 and (ws_turn_savings or ws_turn_prefix_saved):
+                                turn_tags = {**ws_tags, **ws_turn_prefix_saved}
+                                if ws_turn_savings:
+                                    turn_tags[SAVINGS_ATTRIBUTION_TAG] = list(ws_turn_savings)
                                 ws_turn_savings.clear()
+                                ws_turn_prefix_saved.clear()
                             await self._record_request_outcome(
                                 RequestOutcome(
                                     # Per-emission ids keep dashboard request-log keys unique.
@@ -10138,10 +10145,13 @@ class OpenAIHandlerMixin:
                 "cache_write_tokens": str(ws_cache_write_tokens_total),
                 "uncached_input_tokens": str(ws_uncached_input_tokens_total),
             }
-            if ws_turn_savings and residual_input_tokens > 0:
-                # Rows no per-turn record claimed ride with the residual, under
-                # the same input-usage gate as ``residual_tokens_saved``.
-                ws_session_tags[SAVINGS_ATTRIBUTION_TAG] = list(ws_turn_savings)
+            if residual_input_tokens > 0:
+                # Rows and prefix tags no per-turn record claimed ride with the
+                # residual, under the same input-usage gate as
+                # ``residual_tokens_saved``.
+                ws_session_tags.update(ws_turn_prefix_saved)
+                if ws_turn_savings:
+                    ws_session_tags[SAVINGS_ATTRIBUTION_TAG] = list(ws_turn_savings)
             if (
                 residual_input_tokens > 0
                 or residual_output_tokens > 0

@@ -397,6 +397,20 @@ def net_hook_tool_saving(raw_saved: int, tags: object, hook_tool_saved: int) -> 
     return max(0, raw)
 
 
+def accumulate_tool_schema_saved(into: dict[str, int], tags: object) -> None:
+    """Add one request's ``TOOL_SCHEMA_SAVINGS_TAGS`` into ``into``, for a
+    transport that books several requests' savings on one later outcome."""
+    if not isinstance(tags, dict):
+        return
+    for key in TOOL_SCHEMA_SAVINGS_TAGS:
+        try:
+            amount = int(tags.get(key, 0) or 0)
+        except (TypeError, ValueError):
+            continue
+        if amount > 0:
+            into[key] = into.get(key, 0) + amount
+
+
 def headline_tokens_saved(tokens_saved: object, tags: object) -> int:
     """Return the single "Tokens saved" figure for one request.
 
