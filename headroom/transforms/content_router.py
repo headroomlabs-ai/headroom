@@ -35,6 +35,7 @@ Pipeline Usage:
 from __future__ import annotations
 
 import asyncio
+import getopt
 import hashlib
 import itertools
 import json
@@ -42,6 +43,7 @@ import logging
 import math
 import os
 import re
+import shlex
 import sys
 import threading
 import time
@@ -907,13 +909,82 @@ def _segment_is_read(c: str) -> bool:
                 return _is_read_command(" ".join(rest[j + 1 :]).strip("'\""))
         return False
     is_read = prog in _READ_VERBS or (
-        # `sed -n '1,20p' file` prints a range (read); bare `sed` is a stream editor.
-        prog == "sed" and bool(re.search(r"(^|\s)-n(\s|$)", c))
+        # Quiet mode prints selected file contents; bare sed is a stream editor.
+        prog == "sed" and _sed_is_quiet_read(rest)
     )
     if not is_read:
         return False
     # Lockfiles are tool-regenerated, not byte-patched — never protect (keep compressible).
     return not _LOCKFILE_RE.search(c)
+
+
+def _strip_shell_comment(command: str) -> str:
+    """Strip a comment at an unquoted word boundary, retaining literal hashes."""
+    quote = ""
+    escaped = False
+    word_start = True
+    for i, char in enumerate(command):
+        if escaped:
+            escaped = False
+            continue
+        if char == "\\" and quote != "'":
+            escaped = True
+            word_start = False
+        elif quote:
+            if char == quote:
+                quote = ""
+        elif char in {"'", '"'}:
+            quote = char
+            word_start = False
+        elif char == "#" and word_start:
+            return command[:i]
+        else:
+            word_start = char.isspace()
+    return command
+
+
+def _sed_is_quiet_read(rest: list[str]) -> bool:
+    """Recognize quiet sed options without treating script arguments as flags."""
+    try:
+        # _bash_program retains shell quotes in its whitespace-split arguments.
+        # Reconstruct them before parsing options, including grouped flags (-ne).
+        args = shlex.split(_strip_shell_comment(" ".join(rest)))
+    except ValueError:
+        return False
+    # GNU -l takes a line length; BSD -l is a line-buffering flag. Recognize
+    # either dialect so existing BSD reads do not lose their protection.
+    is_quiet = False
+    for short_options in ("anErsuzbiIe:f:l:", "anErsuzbliIe:f:"):
+        try:
+            options, _ = getopt.gnu_getopt(
+                args,
+                short_options,
+                [
+                    "quiet",
+                    "silent",
+                    "expression=",
+                    "file=",
+                    "line-length=",
+                    "regexp-extended",
+                    "separate",
+                    "unbuffered",
+                    "null-data",
+                    "binary",
+                    "posix",
+                    "sandbox",
+                    "debug",
+                    "follow-symlinks",
+                    "in-place",
+                ],
+            )
+        except getopt.GetoptError:
+            continue
+        # Check both dialects: GNU -l may consume a BSD -n or in-place flag.
+        # Any in-place interpretation takes precedence over quiet mode.
+        if any(opt in {"-i", "-I", "--in-place"} for opt, _ in options):
+            return False
+        is_quiet |= any(opt in {"-n", "--quiet", "--silent"} for opt, _ in options)
+    return is_quiet
 
 
 # Shell wrappers that prefix the real program — peeled to find it. Shell
