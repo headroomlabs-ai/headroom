@@ -433,6 +433,24 @@ async def test_get_memory_survives_an_out_of_range_errno(level: int) -> None:
         logging.Formatter().format(record)
 
 
+@pytest.mark.asyncio
+async def test_search_scopes_by_user_through_filters() -> None:
+    """Mem0 2.x raises ValueError on a top-level user_id, so scope must go through filters."""
+    adapter = _adapter()
+    adapter._ensure_initialized = AsyncMock()  # type: ignore[method-assign]
+    adapter._mem0_client = MagicMock()
+    adapter._mem0_client.search.return_value = {
+        "results": [{"id": "m1", "memory": "Uses Rust", "score": 0.9}]
+    }
+
+    results = await adapter.search_memories(query="language", user_id="u1", top_k=2)
+
+    adapter._mem0_client.search.assert_called_once_with(
+        query="language", filters={"user_id": "u1"}, top_k=2
+    )
+    assert [r.memory.content for r in results] == ["Uses Rust"]
+
+
 def _vec3(text: str) -> list[float]:
     """Deterministic 3-d unit vector so identical strings cosine-match at 1.0."""
     digest = hashlib.sha256(text.encode()).digest()
