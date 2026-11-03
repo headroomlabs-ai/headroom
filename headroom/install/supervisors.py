@@ -181,6 +181,19 @@ def _render_windows_runner(
     ]
 
 
+def _render_windows_vbs_launcher(vbs_path: Path, ps1_path: Path) -> ArtifactRecord:
+    """Render a non-interactive VBS launcher that runs powershell with SW_HIDE (no console window)."""
+    vbs_path.parent.mkdir(parents=True, exist_ok=True)
+    vbs_content = (
+        'Set WshShell = CreateObject("WScript.Shell")\r\n'
+        'Set fso = CreateObject("Scripting.FileSystemObject")\r\n'
+        "scriptDir = fso.GetParentFolderName(WScript.ScriptFullName)\r\n"
+        f'WshShell.Run "powershell.exe -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File """ & scriptDir & "\\{ps1_path.name}""", 0, False\r\n'
+    )
+    _write_private_text(vbs_path, vbs_content, OWNER_ONLY_FILE_MODE)
+    return ArtifactRecord(kind="script", path=str(vbs_path))
+
+
 def render_runner_scripts(manifest: DeploymentManifest) -> list[ArtifactRecord]:
     """Render runner/watchdog scripts for the deployment profile."""
 
@@ -356,8 +369,15 @@ def _windows_task_xml(
         "    <StartWhenAvailable>true</StartWhenAvailable>\n"
         "  </Settings>\n"
         '  <Actions Context="Author">\n'
-        f"    <Exec>\n      <Command>{_xml_escape(command)}</Command>\n    </Exec>\n"
-        "  </Actions>\n"
+        + (
+            "    <Exec>\n"
+            "      <Command>wscript.exe</Command>\n"
+            f'      <Arguments>//B //Nologo "{_xml_escape(command)}"</Arguments>\n'
+            "    </Exec>\n"
+            if command.lower().endswith(".vbs")
+            else f"    <Exec>\n      <Command>{_xml_escape(command)}</Command>\n    </Exec>\n"
+        )
+        + "  </Actions>\n"
         "</Task>\n"
     )
 
@@ -615,10 +635,15 @@ def install_supervisor(manifest: DeploymentManifest, *, start: bool = True) -> l
                 [name for name, _task_cmd, _trigger_xml in preferred_tasks],
                 must_delete=must_delete,
             )
+            vbs_record = _render_windows_vbs_launcher(
+                Path(health_cmd).with_suffix(".vbs"),
+                Path(health_cmd).with_suffix(".ps1"),
+            )
+            records.append(vbs_record)
             _register_windows_task(
                 health_name,
                 _windows_task_xml(
-                    health_cmd,
+                    vbs_record.path,
                     trigger_xml=_windows_health_trigger(),
                     scope=manifest.scope,
                     logon_type="InteractiveToken",
