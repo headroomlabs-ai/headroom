@@ -237,7 +237,7 @@ class Mem0Backend:
 
         # Extract fields from metadata, with defaults
         memory_id = metadata.get("headroom_id", result.get("id", str(uuid.uuid4())))
-        user_id = metadata.get("user_id", "")
+        user_id = result.get("user_id", metadata.get("user_id", ""))
         importance = metadata.get("importance", 0.5)
 
         # Parse timestamps
@@ -269,7 +269,7 @@ class Mem0Backend:
             content=content,
             user_id=user_id,
             session_id=metadata.get("session_id"),
-            agent_id=metadata.get("agent_id"),
+            agent_id=result.get("agent_id", metadata.get("agent_id")),
             turn_id=metadata.get("turn_id"),
             created_at=created_at,
             valid_from=valid_from,
@@ -326,6 +326,7 @@ class Mem0Backend:
             client.add,
             memory.content,
             user_id=memory.user_id,
+            agent_id=memory.agent_id,
             metadata=metadata,
         )
 
@@ -376,11 +377,10 @@ class Mem0Backend:
         """
         client = await self._ensure_client()
 
-        # Build search kwargs
+        # Mem0 2.x reads identity scopes from filters and the limit as top_k.
         filters = self._build_mem0_filters(filter) if filter else {}
-        scoped_user_id = user_id or (filter.user_id if filter else None)
-        if scoped_user_id:
-            filters["user_id"] = scoped_user_id
+        if user_id:
+            filters["user_id"] = user_id
 
         # Execute search
         results = await asyncio.to_thread(client.search, query=query, top_k=limit, filters=filters)
