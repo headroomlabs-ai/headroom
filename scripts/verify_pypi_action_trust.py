@@ -36,4 +36,5 @@ for cert in removed:
     print("removed:", cert["subject"], "serial:", cert["serialNumber"])
 assert removed, "No roots removed from the old trust store"
 assert all("emsign" in str(cert["subject"]).lower() for cert in removed), removed
+assert any(cert["serialNumber"] == "3CF607A968700EDA8B84" for cert in removed), removed
 print("PASS: removed emSign root certificates are absent from the action trust store")
