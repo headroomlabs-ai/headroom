@@ -47,8 +47,8 @@
   },
   "overrides": {
     "esbuild": "^0.28.1",
-    "zod": "^4.6.6",
-    "toml": "^5.0.1"
+    "zod": "4.6.7",
+    "toml": "5.0.1"
   },
   "license": "Apache-2.0"
 }

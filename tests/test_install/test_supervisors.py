@@ -948,6 +948,63 @@ def test_start_and_stop_supervisor_darwin_windows_and_none(monkeypatch) -> None:
     ]
 
 
+@pytest.mark.parametrize(
+    "stderr",
+    [
+        "ERROR: The system cannot find the file specified.",
+        'ERROR: The specified task name "headroom-default-health" does not exist in the system.',
+    ],
+)
+def test_windows_stop_tolerates_absent_tasks(monkeypatch: pytest.MonkeyPatch, stderr: str) -> None:
+    # Session-scoped fallback installs never create the `-startup` task, and
+    # the health task can be missing too, so stop must not raise when
+    # schtasks reports the task as missing.
+    monkeypatch.setattr("headroom.install.supervisors.sys.platform", "win32")
+    calls: list[list[str]] = []
+    monkeypatch.setattr(
+        "headroom.install.supervisors.subprocess.run",
+        lambda command, **kwargs: _LaunchctlResult(0),
+    )
+
+    def fake_run(command: list[str], **kwargs: object) -> object:
+        calls.append(command)
+        return type(
+            "Result",
+            (),
+            {
+                "returncode": 1,
+                "stdout": "",
+                "stderr": stderr,
+            },
+        )()
+
+    monkeypatch.setattr("headroom.install.supervisors.run", fake_run)
+    stop_supervisor(_manifest(supervisor=SupervisorKind.SERVICE.value))
+    assert calls == [
+        ["schtasks", "/Change", "/TN", "headroom-default-health", "/DISABLE"],
+        ["schtasks", "/End", "/TN", "headroom-default-startup"],
+    ]
+
+
+def test_windows_stop_surfaces_access_denied(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr("headroom.install.supervisors.sys.platform", "win32")
+
+    def fake_run(command: list[str], **kwargs: object) -> object:
+        return type(
+            "Result",
+            (),
+            {
+                "returncode": 1,
+                "stdout": "",
+                "stderr": "ERROR: Access is denied.",
+            },
+        )()
+
+    monkeypatch.setattr("headroom.install.supervisors.run", fake_run)
+    with pytest.raises(click.ClickException, match="Access is denied"):
+        stop_supervisor(_manifest(supervisor=SupervisorKind.SERVICE.value))
+
+
 def test_macos_start_bootstraps_when_job_not_registered(monkeypatch, tmp_path: Path) -> None:
     # Post-`stop`/`restart` state: the job was booted out, so `kickstart` fails
     # (launchctl 113) and start must bootstrap the plist instead.

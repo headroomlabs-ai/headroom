@@ -112,10 +112,10 @@ headroom proxy --mode cache
 
 | Profile | Target savings | Mode | Notes |
 |---------|----------------|------|-------|
-| `coding` | emergent (~50%) | `cache` | **Default.** Delta-only compression at ~0 prefix-cache busts; never lossy-compresses file reads. |
-| `balanced` | ~70% | `token` | Moderate compression with structural compaction. |
-| `agent-90` | ~90% | `token` | Aggressive; pins a `0.10` keep-ratio and forces Kompress. |
-| `general` | emergent (~60%) | `token` | Non-coding workloads. |
+| `coding` | ~50% of new input tokens (emergent) | `cache` | **Default.** Delta-only compression at ~0 prefix-cache busts; never lossy-compresses file reads. Whole-request and lifetime ratios are much lower in cache mode. |
+| `balanced` | ~70% of new input tokens | `token` | Moderate compression with structural compaction. |
+| `agent-90` | ~90% of new input tokens | `token` | Aggressive; pins a `0.10` keep-ratio and forces Kompress. |
+| `general` | ~60% of new input tokens (emergent) | `token` | Non-coding workloads. |
 
 An unrecognized `HEADROOM_SAVINGS_PROFILE` value logs a warning and falls back to `coding` (the same default an unset variable resolves to) — the proxy never fails to start over a bad profile name. `balanced` is used only as a last-resort fallback when the runtime has no `coding` entry at all (old-runtime/new-client version skew). See `headroom/agent_savings.py` for each profile's full set of knobs.
 
@@ -194,10 +194,10 @@ HEADROOM_SAVINGS_PROFILE=agent-90 headroom proxy
 
 | Profile | Target savings | proxy_mode | force_kompress | Best for |
 |---------|---------------|------------|---------------|----------|
-| `coding` (default) | ~50% (emergent) | `cache` | No | Coding agents — preserves Anthropic prefix-cache stability |
-| `agent-90` | 90% | `token` | Yes | Non-coding, cost-sensitive, or high-volume workloads |
-| `balanced` | 70% | `token` | No | General-purpose moderate compression |
-| `general` | ~60% (emergent) | `token` | No | Non-coding chat, little code in context |
+| `coding` (default) | ~50% of new input tokens (emergent) | `cache` | No | Coding agents — preserves Anthropic prefix-cache stability. Whole-request and lifetime ratios are much lower in cache mode. |
+| `agent-90` | ~90% of new input tokens | `token` | Yes | Non-coding, cost-sensitive, or high-volume workloads |
+| `balanced` | ~70% of new input tokens | `token` | No | General-purpose moderate compression |
+| `general` | ~60% of new input tokens (emergent) | `token` | No | Non-coding chat, little code in context |
 
 **`coding` (default)** — Optimizes for coding-agent workloads with Anthropic. Uses **cache mode** (`proxy_mode="cache"`): compresses only the newest delta in each turn so the provider's prefix-cache is never busted. User messages are compressed, system prompts preserved (hottest cache). `protect_recent` is `0` — in cache mode the delta already *is* the newest turn, so a turn-count guard would suppress the only thing cache mode compresses; byte-exact fidelity instead comes from `protect_reads=True` (file reads are never lossy-compressed). Lossless-first with lossy fallback; tool search and cross-turn dedup enabled. This is the profile that `headroom wrap` uses.
 
@@ -320,6 +320,7 @@ Fine-grained control over what gets compressed and how hard. Most users pick a [
 | `--mode` / `HEADROOM_MODE` | `cache` | `cache` compresses only the newest delta (prefix-cache safe); `token` maximizes removal. |
 | `--target-ratio` / `HEADROOM_TARGET_RATIO` | unset | Keep-ratio for ML text compression; lower = more aggressive (e.g. `0.10`). |
 | `HEADROOM_MIN_TOKENS` | `500` | Minimum block size before a tool output is compressed. |
+| `HEADROOM_SHELL_RESULT_MIN_CHARS` | `2000` | Shell tool results shorter than this many characters bypass lossy compression. For top-level text blocks, the threshold uses their combined text length. Byte-lossless folds such as search grouping may still apply. Applies to `bash`, `shell`, `local_shell`, and aliases such as `run_shell_command`/`execute_command`; set `0` to restore lossy compression. |
 | `HEADROOM_COMPRESS_USER_MESSAGES` | profile | Compress text inside user-role messages. The `coding` profile turns this on; set `0` to keep user text verbatim under it. Anthropic `tool_result` blocks compress either way. No `--compress-user-messages` flag on `headroom proxy`; the direct module entry point (`python -m headroom.proxy.server`) does accept one. |
 | `HEADROOM_COMPRESS_SYSTEM_MESSAGES` | unset | Compress system prompts. Off by default to keep the hottest cache prefix stable. |
 | `HEADROOM_PROTECT_RECENT` | profile | Never compress the N most recent turns. |

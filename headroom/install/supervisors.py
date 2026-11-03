@@ -694,6 +694,11 @@ def start_supervisor(manifest: DeploymentManifest) -> None:
         subprocess.run(["schtasks", "/Run", "/TN", f"{manifest.service_name}-startup"], check=True)
 
 
+# `/End` and `/Delete` report a missing task as "cannot find the file specified";
+# `/Change` reports it as "does not exist in the system".
+_SCHTASKS_ABSENT_TEXT = ("cannot find the file specified", "does not exist in the system")
+
+
 def stop_supervisor(manifest: DeploymentManifest) -> None:
     """Stop the installed supervisor for a deployment."""
 
@@ -730,10 +735,32 @@ def stop_supervisor(manifest: DeploymentManifest) -> None:
             )
         return
     if _is_windows():
+        # Session-scoped fallback installs never create the `-startup` task,
+        # and the health task may already be absent, so tolerate missing
+        # tasks (schtasks reports "cannot find the file specified") while
+        # still surfacing real failures such as access denied.
         health = f"{manifest.service_name}-health"
-        subprocess.run(["schtasks", "/Change", "/TN", health, "/DISABLE"], check=True)
+        result = run(
+            ["schtasks", "/Change", "/TN", health, "/DISABLE"],
+            capture_output=True,
+            text=True,
+        )
+        _require_removal_success(
+            result,
+            "schtasks health disable",
+            absent_text=_SCHTASKS_ABSENT_TEXT,
+        )
         subprocess.run(["schtasks", "/End", "/TN", health], check=False)
-        subprocess.run(["schtasks", "/End", "/TN", f"{manifest.service_name}-startup"], check=True)
+        result = run(
+            ["schtasks", "/End", "/TN", f"{manifest.service_name}-startup"],
+            capture_output=True,
+            text=True,
+        )
+        _require_removal_success(
+            result,
+            "schtasks startup end",
+            absent_text=_SCHTASKS_ABSENT_TEXT,
+        )
 
 
 def remove_supervisor(manifest: DeploymentManifest) -> None:
@@ -828,7 +855,7 @@ def remove_supervisor(manifest: DeploymentManifest) -> None:
             _require_removal_success(
                 result,
                 f"schtasks {suffix} delete",
-                absent_text="cannot find the file specified",
+                absent_text=_SCHTASKS_ABSENT_TEXT,
             )
 
 
@@ -843,7 +870,7 @@ def _require_removal_success(
     operation: str,
     *,
     absent_codes: set[int] | None = None,
-    absent_text: str | None = None,
+    absent_text: str | tuple[str, ...] | None = None,
 ) -> None:
     returncode = int(getattr(result, "returncode", 0))
     detail = _result_text(result)
@@ -851,6 +878,7 @@ def _require_removal_success(
         return
     if absent_codes and returncode in absent_codes:
         return
-    if absent_text and absent_text in detail.lower():
+    texts = (absent_text,) if isinstance(absent_text, str) else absent_text or ()
+    if any(text in detail.lower() for text in texts):
         return
     raise click.ClickException(f"{operation} failed: {detail}")

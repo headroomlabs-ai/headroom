@@ -3701,7 +3701,7 @@ class OpenAIHandlerMixin:
         # `messages`, but it runs before this snapshot, so its output is already
         # captured — keep this snapshot after image compression, or a reorder
         # silently reintroduces the drift.
-        cache_lookup_messages = messages
+        cache_lookup_messages = copy.deepcopy(messages) if self.cache and not stream else messages
         # Response-cache partition: a cached response is only ever replayed to a
         # caller presenting the same provider credentials and principal (01-F15).
         # Snapshotted with the key fields so lookup and store agree. None means
@@ -4333,6 +4333,24 @@ class OpenAIHandlerMixin:
         optimized_messages = mirror_client_message_cache_control(
             optimized_messages, original_client_messages
         )
+
+        from headroom.proxy.helpers import enforce_cache_breakpoint_budget
+
+        # Bypass (x-headroom-bypass: true, _bypass computed at ~L3458) opts out
+        # of ALL compression: never mutate those requests here.
+        # client_messages=None: passing the client list runs
+        # normalize_message_cache_control, whose block-level legacy fallback can
+        # add a marker to a list-content user message on chat requests and then
+        # cost a real system marker. Without it only the oldest-first drop runs
+        # — stale replayed markers are oldest, so they go first.
+        if not _bypass:
+            _, optimized_messages, tools, _ = enforce_cache_breakpoint_budget(
+                None,
+                optimized_messages,
+                tools,
+                client_messages=None,
+                request_id=request_id,
+            )
 
         # Memory: inject context and tools for OpenAI requests.
         #
