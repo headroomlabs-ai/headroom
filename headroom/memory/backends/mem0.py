@@ -528,7 +528,9 @@ class Mem0Backend:
         client = await self._ensure_client()
 
         try:
-            results = await asyncio.to_thread(client.get_all, user_id=user_id, limit=limit)
+            results = await asyncio.to_thread(
+                client.get_all, filters={"user_id": user_id}, top_k=limit
+            )
 
             # Handle different response formats
             result_list = results if isinstance(results, list) else results.get("results", [])
@@ -559,8 +561,8 @@ class Mem0Backend:
             # Mem0 doesn't support all our filter options natively
             results = await asyncio.to_thread(
                 client.get_all,
-                user_id=filter.user_id,
-                limit=filter.limit or 100,
+                filters={"user_id": filter.user_id},
+                top_k=filter.limit or 100,
             )
 
             result_list = results if isinstance(results, list) else results.get("results", [])

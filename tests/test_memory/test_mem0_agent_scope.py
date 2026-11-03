@@ -6,7 +6,7 @@ import pytest
 
 from headroom.memory.backends.mem0 import Mem0Backend
 from headroom.memory.models import Memory
-from headroom.memory.ports import VectorFilter
+from headroom.memory.ports import MemoryFilter, VectorFilter
 
 
 @pytest.mark.asyncio
@@ -62,3 +62,36 @@ def test_result_restores_identity_scope(top_level):
     assert memory.id == "hr-id"
     assert memory.user_id == "user"
     assert memory.agent_id == "agent-a"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("method", ["get_all_memories", "query"])
+async def test_listing_uses_mem0_filters_and_top_k(method):
+    def get_all(*, filters, top_k):
+        assert filters == {"user_id": "user"}
+        assert top_k == 3
+        return {
+            "results": [
+                {
+                    "id": "mem0-id",
+                    "memory": "tea",
+                    "user_id": "user",
+                    "agent_id": "agent-a",
+                    "metadata": {"headroom_id": "hr-id"},
+                }
+            ]
+        }
+
+    backend = Mem0Backend()
+    backend._client = MagicMock()
+    backend._initialized = True
+    backend._client.get_all.side_effect = get_all
+
+    if method == "query":
+        memories = await backend.query(MemoryFilter(user_id="user", agent_id="agent-a", limit=3))
+    else:
+        memories = await backend.get_all_memories("user", limit=3)
+
+    assert [memory.id for memory in memories] == ["hr-id"]
+    assert memories[0].user_id == "user"
+    assert memories[0].agent_id == "agent-a"

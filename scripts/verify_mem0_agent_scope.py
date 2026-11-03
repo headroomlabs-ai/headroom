@@ -13,7 +13,7 @@ from mem0 import Memory as Mem0
 
 from headroom.memory.backends.mem0 import Mem0Backend
 from headroom.memory.models import Memory
-from headroom.memory.ports import VectorFilter
+from headroom.memory.ports import MemoryFilter, VectorFilter
 
 
 async def main():
@@ -63,7 +63,14 @@ async def main():
             assert results[0].memory.agent_id == agent, (agent, results)
             assert results[0].memory.user_id == "scope-user", results
             assert results[0].memory.id == saved[agent], (agent, saved, results)
+            queried = await backend.query(MemoryFilter(user_id="scope-user", agent_id=agent))
+            assert [memory.id for memory in queried] == [saved[agent]], (agent, queried)
             print(f"{agent}: one persisted memory retrieved; sibling agent excluded")
+        all_memories = await backend.get_all_memories("scope-user", limit=10)
+        assert {memory.id for memory in all_memories} == set(saved.values()), all_memories
+        assert await backend.get_all_memories("other-user", limit=10) == []
+        assert await backend.query(MemoryFilter(user_id="other-user")) == []
+        print("get_all/query: persisted memories visible; unrelated user excluded")
         print(
             "mem0ai="
             + version("mem0ai")
