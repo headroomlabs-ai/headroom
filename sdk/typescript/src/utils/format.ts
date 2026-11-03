@@ -54,6 +54,8 @@ export function detectFormat(messages: any[]): MessageFormat {
         if (part.type === "tool_use" || part.type === "tool_result") return "anthropic";
         // Anthropic: image / document with source.type
         if ((part.type === "image" || part.type === "document") && part.source?.type) return "anthropic";
+        // Anthropic: thinking blocks (the Vercel AI SDK spells its equivalent part `reasoning`)
+        if (part.type === "thinking" || part.type === "redacted_thinking") return "anthropic";
         // Vercel: `file` parts carry data/mediaType (OpenAI's `file` part carries a `file` object);
         // `image` parts carry `image` (Anthropic's carry `source`)
         if (part && typeof part === "object") {

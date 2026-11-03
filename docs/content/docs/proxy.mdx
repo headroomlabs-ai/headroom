@@ -112,10 +112,10 @@ headroom proxy --mode cache
 
 | Profile | Target savings | Mode | Notes |
 |---------|----------------|------|-------|
-| `coding` | emergent (~50%) | `cache` | **Default.** Delta-only compression at ~0 prefix-cache busts; never lossy-compresses file reads. |
-| `balanced` | ~70% | `token` | Moderate compression with structural compaction. |
-| `agent-90` | ~90% | `token` | Aggressive; pins a `0.10` keep-ratio and forces Kompress. |
-| `general` | emergent (~60%) | `token` | Non-coding workloads. |
+| `coding` | ~50% of new input tokens (emergent) | `cache` | **Default.** Delta-only compression at ~0 prefix-cache busts; never lossy-compresses file reads. Whole-request and lifetime ratios are much lower in cache mode. |
+| `balanced` | ~70% of new input tokens | `token` | Moderate compression with structural compaction. |
+| `agent-90` | ~90% of new input tokens | `token` | Aggressive; pins a `0.10` keep-ratio and forces Kompress. |
+| `general` | ~60% of new input tokens (emergent) | `token` | Non-coding workloads. |
 
 An unrecognized `HEADROOM_SAVINGS_PROFILE` value logs a warning and falls back to `coding` (the same default an unset variable resolves to) — the proxy never fails to start over a bad profile name. `balanced` is used only as a last-resort fallback when the runtime has no `coding` entry at all (old-runtime/new-client version skew). See `headroom/agent_savings.py` for each profile's full set of knobs.
 
@@ -194,10 +194,10 @@ HEADROOM_SAVINGS_PROFILE=agent-90 headroom proxy
 
 | Profile | Target savings | proxy_mode | force_kompress | Best for |
 |---------|---------------|------------|---------------|----------|
-| `coding` (default) | ~50% (emergent) | `cache` | No | Coding agents — preserves Anthropic prefix-cache stability |
-| `agent-90` | 90% | `token` | Yes | Non-coding, cost-sensitive, or high-volume workloads |
-| `balanced` | 70% | `token` | No | General-purpose moderate compression |
-| `general` | ~60% (emergent) | `token` | No | Non-coding chat, little code in context |
+| `coding` (default) | ~50% of new input tokens (emergent) | `cache` | No | Coding agents — preserves Anthropic prefix-cache stability. Whole-request and lifetime ratios are much lower in cache mode. |
+| `agent-90` | ~90% of new input tokens | `token` | Yes | Non-coding, cost-sensitive, or high-volume workloads |
+| `balanced` | ~70% of new input tokens | `token` | No | General-purpose moderate compression |
+| `general` | ~60% of new input tokens (emergent) | `token` | No | Non-coding chat, little code in context |
 
 **`coding` (default)** — Optimizes for coding-agent workloads with Anthropic. Uses **cache mode** (`proxy_mode="cache"`): compresses only the newest delta in each turn so the provider's prefix-cache is never busted. User messages are compressed, system prompts preserved (hottest cache). `protect_recent` is `0` — in cache mode the delta already *is* the newest turn, so a turn-count guard would suppress the only thing cache mode compresses; byte-exact fidelity instead comes from `protect_reads=True` (file reads are never lossy-compressed). Lossless-first with lossy fallback; tool search and cross-turn dedup enabled. This is the profile that `headroom wrap` uses.
 
@@ -320,6 +320,7 @@ Fine-grained control over what gets compressed and how hard. Most users pick a [
 | `--mode` / `HEADROOM_MODE` | `cache` | `cache` compresses only the newest delta (prefix-cache safe); `token` maximizes removal. |
 | `--target-ratio` / `HEADROOM_TARGET_RATIO` | unset | Keep-ratio for ML text compression; lower = more aggressive (e.g. `0.10`). |
 | `HEADROOM_MIN_TOKENS` | `500` | Minimum block size before a tool output is compressed. |
+| `HEADROOM_SHELL_RESULT_MIN_CHARS` | `2000` | Shell tool results shorter than this many characters bypass lossy compression. For top-level text blocks, the threshold uses their combined text length. Byte-lossless folds such as search grouping may still apply. Applies to `bash`, `shell`, `local_shell`, and aliases such as `run_shell_command`/`execute_command`; set `0` to restore lossy compression. |
 | `HEADROOM_COMPRESS_USER_MESSAGES` | profile | Compress text inside user-role messages. The `coding` profile turns this on; set `0` to keep user text verbatim under it. Anthropic `tool_result` blocks compress either way. No `--compress-user-messages` flag on `headroom proxy`; the direct module entry point (`python -m headroom.proxy.server`) does accept one. |
 | `HEADROOM_COMPRESS_SYSTEM_MESSAGES` | unset | Compress system prompts. Off by default to keep the hottest cache prefix stable. |
 | `HEADROOM_PROTECT_RECENT` | profile | Never compress the N most recent turns. |
@@ -652,7 +653,7 @@ Keep carrying both yourself and send them upstream unchanged. Two consequences w
 | `transforms_applied` | array | Transform labels that ran. |
 | `transforms_summary` | object | Per-transform counts. |
 | `ccr_hashes` | array | Retrieval hashes for markers inserted (empty unless `mode: "ccr"`). |
-| `session` | object | [Session mode](#session-mode) only: `{ "id", "frozen_message_count", "cached_prefix_replayed" }`. |
+| `session` | object | [Session mode](#session-mode) only: `{ "id", "frozen_message_count", "cached_prefix_replayed" }`, described there. |
 
 ```json
 {
@@ -741,15 +742,27 @@ Pass `config.session_id` and Headroom keeps the conversation's replay state itse
 The response gains a `session` object:
 
 ```json
-"session": { "id": "conv-8f1c", "frozen_message_count": 12, "cached_prefix_replayed": true }
+"session": { "id": "conv-8f1c", "frozen_message_count": 12, "cached_prefix_replayed": false }
 ```
+
+| Field | Type | Description |
+| --- | --- | --- |
+| `id` | string | The session id this turn ran under: `config.session_id` as sent, or the `x-headroom-session-id` header when `HEADROOM_COMPRESS_SESSION_FROM_HEADER=1` and `config.session_id` is absent. |
+| `frozen_message_count` | integer | How many leading messages the pipeline was told not to recompress this turn. Headroom counts the leading run it can replay from the session's compression cache: plain messages always count, a tool result counts only once its content is in that cache, and the last message never counts. An explicit `config.frozen_message_count` wins when larger. It is derived from Headroom's own state, not from the provider, and it can be non-zero on a first turn. |
+| `cached_prefix_replayed` | boolean | `true` when the pipeline's output for some leading messages differed from what this endpoint returned for the session last turn, and Headroom overwrote those messages with last turn's bytes. `false` when nothing was overwritten: when the serving process holds no previous turn for the session (a first turn, expired state, or a replica that never served or loaded it), when the pipeline already produced last turn's bytes (the usual case), or when the replay was skipped as unsafe (this turn's messages do not line up with last turn's, or the replay would be larger than the pipeline's output). So `false` does not mean the returned prefix matches last turn's. |
+
+<Callout type="warning" title="cached_prefix_replayed is not a prompt-cache hit">
+`cached_prefix_replayed` reports Headroom's own repair step. It says nothing about whether the provider served the prefix from its prompt cache. `false` is the normal value on a healthy session, and it is also what a turn that changed the prefix returns when there was nothing to replay. Read cache hits and misses from the provider's usage (`cache_read_input_tokens`, `prompt_tokens_details.cached_tokens`).
+</Callout>
 
 What differs from the stateless contract:
 
 - **Forward the returned messages verbatim.** They are what the next turn replays.
 - **`compress_user_messages` is refused** (`400`). User-message rewrites are not byte-replayable across turns, so they would bust the prefix later.
 - **Timeouts and busy sessions are a `503`, never fail-open.** Handing back originals would leave the caller forwarding bytes the replay state does not know about, so a compression timeout answers `503` with `error.type = "compression_timeout"`; retry the turn and it lands on consistent state. Turns for one session are serialized under a per-session lock, and a concurrent turn for the same session that waits more than 10 seconds gets the same `503`.
-- **State is in-process.** The replay cache lives for `HEADROOM_COMPRESSION_CACHE_TTL_SECONDS` of idle time (3900 by default, floor 600); the tracker's usage state expires after 10 idle minutes. Multi-process deployments (gunicorn workers, replicas) must pin a session to one process — hash the upstream on the session id — or replay silently misses.
+- **State is in-process by default.** The replay cache lives for `HEADROOM_COMPRESSION_CACHE_TTL_SECONDS` of idle time (3900 by default, floor 600); the tracker's usage state expires after 10 idle minutes. Without a shared store, multi-process deployments (gunicorn workers, replicas) must pin a session to one process — hash the upstream on the session id — or replay silently misses.
+- **`HEADROOM_COMPRESS_SESSION_STORE=redis://...` shares sessions across replicas.** Every replica also keeps each session's tracker in Redis, so any replica can serve the session's next turn and its `POST /v1/usage`. It needs the `redis` extra, which every Docker image includes. It also selects the Redis CCR store unless `HEADROOM_CCR_BACKEND` names another, so CCR markers resolve on any replica. Two limits remain. The per-session lock is per process: two concurrent turns of one session on two replicas both run, the first write wins (compare-and-set), and the next turn continues from the winner. Gateway-mode pending turns stay in-process, so `POST /v1/compress/response` must reach the replica that answered the request half; re-drive therefore still needs real affinity (`gateway.session_affinity`).
+- **An unreachable Redis does not fail turns.** A Redis error is a miss: the replica serves from its own memory, logs one `WARNING` when a kind of call (read, write) starts failing and an `INFO` when it works again, and skips Redis for 5 seconds after a connection error (each command times out after 1 second). The cost is the sharing. A replica with no local state for the session recompresses the history, which is slower, and the prefix it returns can differ from last turn's, which is a provider prompt-cache miss. `cached_prefix_replayed` stays `false` on those turns. A Redis that comes back empty is refilled as each session's next turn writes it whole. Run Redis with high availability if prompt-cache hits matter.
 - `HEADROOM_COMPRESS_SESSION_FROM_HEADER=1` lets the `x-headroom-session-id` header stand in for `config.session_id`. Off by default: gateways commonly stamp that header on all traffic, and a value shared across conversations (Claude Code subagents do this) would blend them into one replay state.
 
 **Relaying provider usage: `POST /v1/usage`.** Session mode never sees the provider's response, so cache-hit attribution and savings accounting for the session come from this optional relay (same exposure rules as `/v1/compress`). Post the provider's `usage` block under the session id:
@@ -779,7 +792,7 @@ The rule behind it is the proxy's own **no shrink without reload**, moved to the
 | --- | --- | --- | --- |
 | `can_redrive` | boolean | `false` | The gateway can call the provider again with a request Headroom hands it and post the result back. Unlocks re-driving turn hooks and, with `config.mode: "ccr"`, in-band CCR retrieval. Send `false` for streaming requests. |
 | `can_relay_response` | boolean | `false` | The gateway will post the provider's status and usage to `/v1/compress/response` after every turn. |
-| `session_affinity` | boolean | `true` | The gateway pins this session to one Headroom replica. Pending turns are in-process state, so `false` disables re-driving for the turn even when `can_redrive` is set. |
+| `session_affinity` | boolean | `true` | The gateway pins this session to one Headroom replica. Pending turns are in-process state, so `false` disables re-driving for the turn even when `can_redrive` is set. `HEADROOM_COMPRESS_SESSION_STORE` shares replay state, not pending turns, so it does not lift this. |
 | `plugin_version` | string | unset | Diagnostics only. |
 | `request_headers` | object | `{}` | The client's request headers the gateway is willing to hand over, as lowercase name → string value. Only `anthropic-beta` is read today: when a turn hook asks for an `anthropic-beta` token, the client's tokens go first in the returned `headers`; every other name is ignored, so a gateway may pass its whole header map. A non-object block or a non-string value is a `400`. Never forwarded anywhere by Headroom. |
 
