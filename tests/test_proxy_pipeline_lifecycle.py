@@ -254,6 +254,7 @@ def test_anthropic_messages_pipeline_events_cover_proxy_lifecycle(monkeypatch) -
         )
         proxy.memory_handler = SimpleNamespace(
             config=SimpleNamespace(inject_context=True, inject_tools=False),
+            is_project_unresolved=lambda request_context: False,
             search_and_format_context=AsyncMock(return_value="memory"),
             has_memory_tool_calls=lambda response, provider: False,
         )
