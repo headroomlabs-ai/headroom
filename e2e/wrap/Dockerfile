@@ -90,8 +90,8 @@ RUN npm install -g --no-fund --no-audit npm@12.2.1
 # Freeze transitive CLI dependencies as well as the top-level versions.
 # Global npm install re-resolves ranges and can select partially published
 # dependency releases; npm ci consumes the reviewed lockfile instead.
-COPY e2e/wrap/tools/package.json e2e/wrap/tools/package-lock.json /opt/wrap-tools/
-RUN npm ci --prefix /opt/wrap-tools --no-fund --no-audit
+COPY e2e/wrap/tools/package.json e2e/wrap/tools/package-lock.json e2e/wrap/tools/.npmrc /opt/wrap-tools/
+RUN npm ci --prefix /opt/wrap-tools --no-fund --no-audit --strict-allow-scripts
 
 # Exercise the installed dependency fixes in both existing wrap-E2E CI callers.
 COPY e2e/wrap/tools/dependency-regression.test.cjs /opt/wrap-tools/
