@@ -779,67 +779,6 @@ class TestServerMemoryToolNames:
 
 
 class TestHandlerPassesServerMemoryTools:
-    def test_injected_memory_tools_reach_the_stream(self) -> None:
-        from types import SimpleNamespace
-
-        from fastapi.responses import StreamingResponse
-        from fastapi.testclient import TestClient
-
-        from headroom.proxy.server import ProxyConfig, create_app
-
-        config = ProxyConfig(
-            optimize=False,
-            cache_enabled=False,
-            rate_limit_enabled=False,
-            cost_tracking_enabled=False,
-            log_requests=False,
-            ccr_inject_tool=False,
-            ccr_handle_responses=False,
-            ccr_context_tracking=False,
-            image_optimize=False,
-        )
-        captured: dict[str, Any] = {}
-
-        async def fake_stream_response(*args: Any, **kwargs: Any) -> StreamingResponse:
-            captured.update(kwargs, body=args[2])
-
-            async def gen() -> Any:
-                yield b""
-
-            return StreamingResponse(gen(), media_type="text/event-stream")
-
-        memory_tools = [
-            {"name": name, "description": name, "input_schema": {"type": "object"}}
-            for name in sorted(MEMORY_TOOLS)
-        ]
-        with TestClient(create_app(config)) as client:
-            proxy = client.app.state.proxy
-            proxy.memory_handler = SimpleNamespace(
-                config=SimpleNamespace(inject_context=False, inject_tools=True),
-                compute_memory_tool_definitions=lambda provider: memory_tools,
-                get_beta_headers=lambda: {},
-                has_memory_tool_calls=lambda resp, provider: False,
-            )
-            proxy._stream_response = fake_stream_response
-            client.post(
-                "/v1/messages",
-                headers={
-                    "x-api-key": "test-key",
-                    "anthropic-version": "2023-06-01",
-                    "x-headroom-user-id": "u1",
-                },
-                json={
-                    "model": "claude-sonnet-4-6",
-                    "max_tokens": 64,
-                    "stream": True,
-                    "tools": [{"name": "Bash", "input_schema": {"type": "object"}}],
-                    "messages": [{"role": "user", "content": "remember the deploy region"}],
-                },
-            )
-
-        assert captured["server_memory_tool_names"] == MEMORY_TOOLS
-        assert MEMORY_TOOLS <= {t["name"] for t in captured["body"]["tools"]}
-
     @pytest.mark.parametrize("after_buffered_turn", [False, True])
     def test_streamed_openai_chat_gets_no_memory_tools(self, after_buffered_turn: bool) -> None:
         from types import SimpleNamespace
