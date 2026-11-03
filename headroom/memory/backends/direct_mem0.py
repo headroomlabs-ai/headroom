@@ -317,6 +317,7 @@ class DirectMem0Adapter:
 
             # Build metadata payload
             payload = {
+                "data": fact,  # the key Mem0 search reads; points without it are skipped
                 "memory": fact,
                 "user_id": user_id,
                 "importance": importance,
@@ -813,8 +814,8 @@ class DirectMem0Adapter:
         results = await asyncio.to_thread(
             self._mem0_client.search,
             query=query,
-            user_id=user_id,
-            limit=top_k,
+            filters={"user_id": user_id},
+            top_k=top_k,
         )
 
         search_results: list[MemorySearchResult] = []
