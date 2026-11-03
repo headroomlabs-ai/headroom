@@ -23,6 +23,7 @@ PLATFORM_MACHINE_MARKER = "platform_machine"
 TORCH_PACKAGE_NAME = "torch"
 TORCH_TRANSITIVE_PACKAGE_NAMES = frozenset({"sentence-transformers"})
 ORJSON_PACKAGE_NAME = "orjson"
+PYTHON_SOCKS_PACKAGE_NAME = "python-socks"
 PROXY_EXTRA = "proxy"
 UV_LOCK_FILE = "uv.lock"
 
@@ -127,3 +128,19 @@ def test_proxy_extra_includes_orjson_for_litellm_backends() -> None:
 
     assert ORJSON_PACKAGE_NAME in selected_proxy_dependency_names
     assert ORJSON_PACKAGE_NAME in selected_all_dependency_names
+
+
+def test_proxy_extra_includes_socks_support_for_websocket_proxy_discovery() -> None:
+    """A system SOCKS proxy must not disable Codex Responses WebSockets."""
+
+    pyproject = tomllib.loads((ROOT / PYPROJECT_FILE).read_text(encoding="utf-8"))
+    optional_deps = pyproject["project"]["optional-dependencies"]
+    environment = default_environment()
+
+    selected_proxy_dependency_names = _selected_dependency_names_for_extra(
+        optional_deps,
+        PROXY_EXTRA,
+        environment,
+    )
+
+    assert PYTHON_SOCKS_PACKAGE_NAME in selected_proxy_dependency_names
