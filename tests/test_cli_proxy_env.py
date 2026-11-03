@@ -540,16 +540,23 @@ class TestCLIProxyEnvVars:
         assert result.exit_code == 0, result.output
         assert captured_config["config"].code_aware_enabled is True
 
-    def test_code_aware_enabled_defaults_true(self, runner):
-        """Without HEADROOM_CODE_AWARE_ENABLED, code-aware defaults ON (coding
-        posture; consistent with the argparse server path). It degrades to a no-op
-        when tree-sitter isn't installed, so defaulting it on is safe."""
+    @pytest.mark.parametrize(("profile", "expected"), [(None, False), ("balanced", True)])
+    def test_code_aware_enabled_defaults_to_the_savings_profile(self, runner, profile, expected):
+        """Without HEADROOM_CODE_AWARE_ENABLED, code-aware follows the savings
+        profile: off for the default ``coding`` profile, so code an agent
+        fetches goes through unchanged."""
         captured_config = {}
 
         def mock_run_server(config, **kwargs):
             captured_config["config"] = config
 
-        env = {k: v for k, v in os.environ.items() if k != "HEADROOM_CODE_AWARE_ENABLED"}
+        env = {
+            k: v
+            for k, v in os.environ.items()
+            if k not in ("HEADROOM_CODE_AWARE_ENABLED", "HEADROOM_SAVINGS_PROFILE")
+        }
+        if profile:
+            env["HEADROOM_SAVINGS_PROFILE"] = profile
 
         with (
             patch("headroom.proxy.server.run_server", mock_run_server),
@@ -562,7 +569,7 @@ class TestCLIProxyEnvVars:
             )
 
         assert result.exit_code == 0, result.output
-        assert captured_config["config"].code_aware_enabled is True
+        assert captured_config["config"].code_aware_enabled is expected
 
     def test_code_aware_enabled_from_cli_flag(self, runner):
         """--code-aware should enable code-aware compression in the wrapper."""

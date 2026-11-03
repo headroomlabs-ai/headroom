@@ -29,7 +29,7 @@ The router auto-detects content type by analyzing structure and patterns. No man
 | Content Type | Detection Signal | Compressor | Typical Savings |
 |---|---|---|---|
 | JSON arrays | Valid JSON with array elements | SmartCrusher | Varies with redundancy -- measured 26-54% on realistic (non-duplicate) tool-output arrays of 100-10,000 items; highly repetitive arrays compress far more. See `benchmarks/compression_benchmark.py`. |
-| Source code | Syntax patterns, indentation, keywords | Kompress via the library `compress()`/`HeadroomClient` path (`enable_code_aware` defaults to `False` there); CodeAwareCompressor via `headroom proxy` (`HEADROOM_CODE_AWARE_ENABLED` defaults to on) | workload-dependent |
+| Source code | Syntax patterns, indentation, keywords | Unchanged by default; CodeAwareCompressor when enabled (`HEADROOM_CODE_AWARE_ENABLED=1` or `ContentRouterConfig(enable_code_aware=True)`). Never Kompress | 0% by default |
 | Search results | `file:line:content` format | SearchCompressor | 80-95% (measured ~91% on a synthetic 40-file ripgrep-style corpus) |
 | Build/test logs | Timestamps, log levels, pytest/npm markers | LogCompressor | 85-95% (measured ~93% on a synthetic 1,000-line log with clustered errors) |
 | Diffs | Unified diff format | DiffCompressor | 60-80% (measured ~70% on a multi-file diff with default `max_context_lines`/`max_hunks_per_file` limits) |

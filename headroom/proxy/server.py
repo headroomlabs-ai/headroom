@@ -68,7 +68,7 @@ except ImportError:
 sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
 from headroom._version import __version__
-from headroom.agent_savings import DEFAULT_PROFILE, proxy_pipeline_kwargs
+from headroom.agent_savings import DEFAULT_PROFILE, code_aware_default, proxy_pipeline_kwargs
 from headroom.cache.compression_feedback import get_compression_feedback
 from headroom.cache.compression_store import format_retrieval_miss_detail, get_compression_store
 from headroom.ccr import (
@@ -7158,7 +7158,7 @@ if __name__ == "__main__":
 
     # Environment variable defaults (HEADROOM_* prefix)
     # CLI args override env vars, env vars override ProxyConfig defaults
-    env_code_aware = _get_env_bool("HEADROOM_CODE_AWARE_ENABLED", True)
+    env_code_aware = code_aware_default()
     env_optimize = _get_env_bool("HEADROOM_OPTIMIZE", True)
     env_cache = _get_env_bool("HEADROOM_CACHE_ENABLED", True)
     env_rate_limit = _get_env_bool("HEADROOM_RATE_LIMIT_ENABLED", True)
