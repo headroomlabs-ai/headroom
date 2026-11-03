@@ -38,6 +38,7 @@
     "crewai",
     "autogen",
     "litellm",
+    "kong-ai-gateway",
     "claude-code-vertex",
     "claude-code-azure-foundry",
     "vscode-claude-code",
