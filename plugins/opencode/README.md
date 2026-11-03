@@ -11,6 +11,22 @@ OpenCode integration helpers for Headroom. The package supports two integration 
 npm install headroom-opencode
 ```
 
+## Building from source
+
+Building this plugin with tsup 9 requires Node.js `^22.18.0 || ^24.11.0 || >=26.0.0`.
+This requirement applies to the build toolchain, not to the published plugin's
+consumer engine contract. Node.js 24.22.2 is a verified choice for the current
+locked dependency graph (some transitive build dependencies require a newer
+Node.js patch than tsup itself). From `plugins/opencode`, run:
+
+```bash
+npm ci
+npm test
+npm run typecheck
+npm run build
+npm run build:standalone
+```
+
 ## Provider Config Helpers
 
 Use these helpers when you need to generate OpenCode config that routes a `headroom` provider through a running Headroom proxy.
