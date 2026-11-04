@@ -91,6 +91,42 @@ def test_extract_user_query_skips_system_reminder_blocks() -> None:
     assert utils.extract_user_query(messages, latest_user_turn_only=True) == ""
 
 
+@pytest.mark.parametrize("as_blocks", [False, True])
+@pytest.mark.parametrize(
+    ("content", "expected"),
+    [
+        ("<system-reminder>context</system-reminder>\nFind Kafka lag", "Find Kafka lag"),
+        ("Find <system-reminder>context</system-reminder> Kafka lag", "Find  Kafka lag"),
+        (
+            "<system-reminder id='1'>a</system-reminder>Find <system-reminder>b</system-reminder>Kafka",
+            "Find Kafka",
+        ),
+        ("<System-Reminder>context</System-Reminder>Find Kafka", "Find Kafka"),
+        ("İ<system-reminder>x</system-reminder>Kafka", "İ Kafka"),
+        ("Find <system-reminder>unfinished", "Find <system-reminder>unfinished"),
+        (
+            "Find <system-reminder-extra>example</system-reminder> Kafka",
+            "Find <system-reminder-extra>example</system-reminder> Kafka",
+        ),
+    ],
+)
+def test_extract_user_query_keeps_text_around_reminders(
+    content: str, expected: str, as_blocks: bool
+) -> None:
+    body = [{"type": "text", "text": content}] if as_blocks else content
+    messages = [{"role": "user", "content": body}]
+    assert utils.extract_user_query(messages, latest_user_turn_only=True) == expected
+
+
+@pytest.mark.parametrize("as_blocks", [False, True])
+def test_reminder_only_turn_keeps_user_query_fallback(as_blocks: bool) -> None:
+    reminder = "<system-reminder>context</system-reminder>"
+    content = [{"type": "text", "text": reminder}] if as_blocks else reminder
+    messages = [{"role": "user", "content": "older question"}, {"role": "user", "content": content}]
+    assert utils.extract_user_query(messages) == "older question"
+    assert utils.extract_user_query(messages, latest_user_turn_only=True) == ""
+
+
 def test_extract_user_query_latest_user_turn_only() -> None:
     """The flag stops at the newest user turn instead of resurrecting an older one."""
     # A tool_result continuation: the newest user turn carries no text at all.
