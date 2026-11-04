@@ -472,3 +472,42 @@ def test_apply_recoverable_default_and_true_still_fold():
 
     true_out = _apply_with_recoverable(msgs, recoverable=True)
     assert "[↑" in true_out[2]["content"]  # explicit recoverable -> folds
+
+
+def _five_numbered(digits):
+    return "\n".join("1" * digits + f":alpha line {i} of the file contents" for i in range(5))
+
+
+def test_long_digit_run_does_not_disable_dedup():
+    # int() raises ValueError on 4,301+ digits; that must not skip dedup.
+    for digits in (10, 4300, 4301):
+        t = _five_numbered(digits)
+        out, stats = dedup_blocks([_blk(t, 1), _blk(t, 2)])
+        assert stats["spans_folded"] == 1, digits
+        assert out[1].text != t
+
+
+def test_fold_never_longer_than_span():
+    # A 40-char 3-line span would fold into a 43-char pointer: leave it alone.
+    t = "a" * 21 + "\n" + "b" * 9 + "\n" + "c" * 8
+    assert len(t) == 40
+    out, stats = dedup_blocks([_blk(t, 1), _blk(t, 2)])
+    assert stats["spans_folded"] == 0
+    assert out[1].text == t
+    # Byte boundary: the pointer's "↑" is 3 UTF-8 bytes. A 44-char span has a
+    # 43-char pointer (shorter in characters) that is 45 bytes, so folding
+    # would grow the output; it must stay. A 46-byte span folds.
+    t44 = "a" * 25 + "\n" + "b" * 9 + "\n" + "c" * 8
+    assert len(t44) == 44
+    out, stats = dedup_blocks([_blk(t44, 1), _blk(t44, 2)])
+    assert stats["spans_folded"] == 0
+    assert out[1].text == t44
+    t46 = "a" * 27 + "\n" + "b" * 9 + "\n" + "c" * 8
+    out, stats = dedup_blocks([_blk(t46, 1), _blk(t46, 2)])
+    assert stats["spans_folded"] == 1
+    assert len(out[1].text.encode("utf-8")) < len(t46.encode("utf-8"))
+    # A long span still folds.
+    long_t = _code("", 5)
+    out, stats = dedup_blocks([_blk(long_t, 1), _blk(long_t, 2)])
+    assert stats["spans_folded"] == 1
+    assert len(out[1].text) < len(long_t)

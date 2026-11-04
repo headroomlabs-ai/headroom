@@ -96,8 +96,11 @@
                                         <select class="rounded px-2 py-1 text-sm w-56"
                                                 :disabled="isLocked(field)"
                                                 x-model="values[field.key]">
+                                            <!-- :selected, not just x-model: these options render after
+                                                 x-model sets the value, so the browser would show the first. -->
                                             <template x-for="choice in field.choices" :key="choice">
-                                                <option :value="choice" x-text="choice"></option>
+                                                <option :value="choice" x-text="choice"
+                                                        :selected="choice === values[field.key]"></option>
                                             </template>
                                         </select>
                                     </template>

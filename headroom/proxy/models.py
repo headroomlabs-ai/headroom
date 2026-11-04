@@ -312,8 +312,8 @@ class ProxyConfig:
     # Read lifecycle management
     read_lifecycle: bool = True
 
-    # Mechanism B: activity-based read maturation (hold fresh Reads out of
-    # the provider prefix cache; compress once their file quiesces).
+    # Mechanism B: activity-based read maturation (hold fresh Reads
+    # verbatim; compress once their file quiesces, unless already cached).
     # Experimental — default off. CLI: --read-maturation;
     # env: HEADROOM_READ_MATURATION=1
     read_maturation: bool = False
