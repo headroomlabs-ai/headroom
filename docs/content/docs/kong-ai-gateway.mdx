@@ -37,7 +37,7 @@ export HEADROOM_PROXY_TOKEN="$(openssl rand -hex 32)"
 HEADROOM_COMPRESS_ALLOW_REMOTE=1 headroom proxy --host 0.0.0.0 --port 8787
 ```
 
-By default, Headroom accepts compression requests only from the machine it runs on. `HEADROOM_COMPRESS_ALLOW_REMOTE=1` accepts them from the data plane, and `HEADROOM_PROXY_TOKEN` is the token Kong sends with each one. Keep the token for the next step. To run Headroom in a container instead, see [Docker install](/docs/docker-install) and set the same two variables.
+By default, Headroom accepts compression requests only from the machine it runs on. `HEADROOM_COMPRESS_ALLOW_REMOTE=1` accepts them from the data plane, and `HEADROOM_PROXY_TOKEN` is the token Kong sends with each one. Keep the token for the next step. To run Headroom in a container instead, see the manual `docker run` instructions in [Docker install](/docs/docker-install), pass both variables to the container, and publish its port on an interface the data plane can reach. The Docker-native wrapper publishes on loopback only; setting these variables does not change that binding.
 
 <Callout type="warning" title="Use one Headroom process">
 Point Kong at a single Headroom process, such as one next to each data plane node or one that all nodes share. A conversation's session lives in the process that served it, so don't put several instances behind a load balancer.
@@ -67,7 +67,7 @@ ai_gateway_policies:
         proxy_token: !env HEADROOM_PROXY_TOKEN
 ```
 
-`compressor_url` is the address of Headroom's [`/v1/compress`](/docs/proxy#post-v1compress) endpoint as the data plane sees it. `host.docker.internal` works when the data plane runs in Docker Desktop on the same machine as Headroom, for example the local data plane from Kong's getting started guide. Otherwise, use the host name or IP address of the machine that runs Headroom, and keep the `/v1/compress` path.
+`compressor_url` is the address of Headroom's [`/v1/compress`](/docs/proxy#post-v1compress) endpoint as the data plane sees it. `host.docker.internal` works when the data plane runs in Docker Desktop on the same machine as Headroom, for example the local data plane from Kong's getting started guide. For a data plane on a separate host, use an HTTPS endpoint with a trusted certificate, such as `https://headroom.example.com/v1/compress`, through a TLS reverse proxy in front of Headroom. The connection carries both the proxy token and prompt content. Restrict access to the Headroom listener to the data plane or TLS reverse proxy; do not expose the HTTP listener directly on a public network.
 
 kongctl reads `AI_GATEWAY_ID` and `HEADROOM_PROXY_TOKEN` from the environment when it applies the file. In the terminal where you run kongctl, set the token to the value Headroom runs with, then apply the file:
 
