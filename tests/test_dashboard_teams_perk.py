@@ -24,7 +24,7 @@ def _no_license_env(monkeypatch: pytest.MonkeyPatch) -> None:
 
 def _assert_offer(html: str, shown: bool) -> None:
     assert ('data-testid="teams-perk"' in html) is shown
-    assert ("headroom-perks.vercel.app" in html) is shown
+    assert ("hello@headroomlabs.ai" in html) is shown
     assert ("teams-perk:start" in html) is shown
     # Only the offer block ever goes; the dashboard around it is intact.
     assert 'data-testid="session-view"' in html
