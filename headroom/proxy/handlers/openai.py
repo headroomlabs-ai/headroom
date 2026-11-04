@@ -1513,7 +1513,9 @@ def _buffered_chat_reply_as_sse(
         reply = json.loads(result.body)
     except (TypeError, ValueError):
         reply = None
-    if not isinstance(reply, dict) or not reply.get("choices"):
+    choices = reply.get("choices") if isinstance(reply, dict) else None
+    first_choice = choices[0] if isinstance(choices, list) and choices else None
+    if not isinstance(first_choice, dict) or not isinstance(first_choice.get("message"), dict):
         logger.warning(f"[{request_id}] CCR: rejecting malformed buffered chat 200 reply")
         return JSONResponse(
             status_code=502,
@@ -1533,7 +1535,8 @@ def _buffered_chat_reply_as_sse(
 
     # A retrieval call standing alone means the continuation failed, and the
     # client cannot act on a tool it never declared. Next to a client tool it is
-    # the intentional hand-back from #839, which stays as it is. A plain JSON
+    # the turn handle_response gives back when a continuation fails, because the
+    # model made no newer decision, so that goes to the client as is. A plain JSON
     # error works on both sides of the commit: the wrapper turns it into a typed
     # stream error if SSE is already on the wire, so a rate limit on the
     # continuation still reads as a rate limit.

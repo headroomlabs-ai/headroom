@@ -483,10 +483,8 @@ def test_response_hooks_do_not_run_on_a_buffered_turn(monkeypatch):
     assert calls == []
 
 
-def test_retrieval_next_to_a_client_tool_is_handed_back():
-    """#839: the proxy cannot answer the client's half, so the turn goes back whole."""
-    hash_key = _stored_hash()
-    reply = _completion(
+def _mixed_reply(hash_key: str) -> dict:
+    return _completion(
         {
             "role": "assistant",
             "content": None,
@@ -498,10 +496,29 @@ def test_retrieval_next_to_a_client_tool_is_handed_back():
         "tool_calls",
         USAGE_FIRST,
     )
-    with _Proxy([reply]) as proxy:
+
+
+def test_retrieval_next_to_a_client_tool_lets_the_model_decide_again():
+    """The unrun client call is dropped, and the continuation replaces the turn."""
+    hash_key = _stored_hash()
+    with _Proxy([_mixed_reply(hash_key), _final_reply()]) as proxy:
         resp = proxy.post(_request(hash_key))
 
-    assert resp.status_code == 200
+    assert resp.status_code == 200, resp.text
+    assert CCR_TOOL_NAME not in resp.text
+    assert "there are 2 rows" in resp.text
+    replayed = proxy.sent[1]["messages"][-2]
+    assert [call["function"]["name"] for call in replayed["tool_calls"]] == [CCR_TOOL_NAME]
+
+
+def test_mixed_turn_goes_back_whole_when_its_continuation_fails():
+    """The model made no newer decision, so the client gets the turn it did make."""
+    hash_key = _stored_hash()
+    upstream = [_mixed_reply(hash_key), (500, {"error": {"message": "nope"}})]
+    with _Proxy(upstream) as proxy:
+        resp = proxy.post(_request(hash_key))
+
+    assert resp.status_code == 200, resp.text
     choices = [chunk["choices"][0] for chunk in _chunks(resp.text) if chunk["choices"]]
     names = [
         choice["delta"]["tool_calls"][0]["function"]["name"]
@@ -512,9 +529,40 @@ def test_retrieval_next_to_a_client_tool_is_handed_back():
     assert choices[-1]["finish_reason"] == "tool_calls"
 
 
-def test_a_200_with_no_choices_is_not_replayed_as_an_empty_stream():
+def test_continuation_replays_what_the_provider_put_on_the_assistant_message():
+    """DeepSeek rejects a tool-call turn replayed without its reasoning_content."""
     hash_key = _stored_hash()
-    with _Proxy([{"error": {"message": "gateway said no"}}]) as proxy:
+    reply = _retrieve_reply(hash_key)
+    message = reply["choices"][0]["message"]
+    message["reasoning_content"] = "thinking it over"
+    message["reasoning_details"] = [{"text": "t"}]
+    message["refusal"] = None
+    message["annotations"] = []
+    with _Proxy([reply, _final_reply()]) as proxy:
+        resp = proxy.post(_request(hash_key))
+
+    assert resp.status_code == 200, resp.text
+    replayed = proxy.sent[1]["messages"][-2]
+    assert replayed["role"] == "assistant"
+    assert replayed["reasoning_content"] == "thinking it over"
+    assert replayed["reasoning_details"] == [{"text": "t"}]
+    assert "refusal" not in replayed, "empty fields stay out of the replayed message"
+    assert "annotations" not in replayed
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {"error": {"message": "gateway said no"}},
+        {"choices": []},
+        {"choices": [None]},
+        {"choices": [{"finish_reason": "stop"}]},
+        {"choices": [{"message": None, "finish_reason": "stop"}]},
+    ],
+)
+def test_a_200_with_no_usable_choice_is_not_replayed_as_an_empty_stream(payload):
+    hash_key = _stored_hash()
+    with _Proxy([payload]) as proxy:
         resp = proxy.post(_request(hash_key))
 
     assert resp.status_code == 502

@@ -54,6 +54,20 @@ RESIDUAL_CCR_SKIPPED_MIXED = "skipped_mixed_tools"
 RESIDUAL_CCR_ERROR = "error"
 
 
+def _openai_message_extras(message: dict[str, Any]) -> dict[str, Any]:
+    """The fields a provider put on a chat message besides the standard three.
+
+    Whoever replays the turn may have to send these back (DeepSeek's
+    ``reasoning_content``, OpenRouter's ``reasoning_details``) and gets rejected
+    if they went missing. Empty ones (``refusal: null``) stay behind.
+    """
+    return {
+        key: value
+        for key, value in message.items()
+        if key not in ("role", "content", "tool_calls") and value
+    }
+
+
 @dataclass
 class CCRToolResult:
     """Result of handling a CCR tool call."""
@@ -397,6 +411,7 @@ class CCRResponseHandler:
             first = choices[0] if isinstance(choices, list) and choices else {}
             message = first.get("message", {}) if isinstance(first, dict) else {}
             return {
+                **_openai_message_extras(message),
                 "role": "assistant",
                 "content": message.get("content"),
                 "tool_calls": message.get("tool_calls"),
@@ -980,15 +995,7 @@ class StreamingCCRHandler:
 
         frames = [frame({"role": message.get("role") or "assistant"}, None)]
 
-        # Everything else the provider put on the message goes along untouched.
-        # A client may have to replay it on its next turn (DeepSeek's
-        # `reasoning_content`, OpenRouter's `reasoning_details`) and gets rejected
-        # if it went missing here.
-        extras = {
-            key: value
-            for key, value in message.items()
-            if key not in ("role", "content", "tool_calls") and value
-        }
+        extras = _openai_message_extras(message)
         if extras:
             frames.append(frame(extras, None))
 
