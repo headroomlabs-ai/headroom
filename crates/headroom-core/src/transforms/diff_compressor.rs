@@ -1071,6 +1071,25 @@ fn reduce_context(hunk: &DiffHunk, max_context: usize) -> Vec<DiffHunk> {
         .as_ref()
         .map_or(hunk.lines.len(), |r| hunk_body_len(&hunk.lines, parents, r));
 
+    let signature = (body_len..hunk.lines.len()).find(|&i| hunk.lines[i] == "-- ");
+
+    // An edit before any signature means the header understates its hunk.
+    // That is malformed input, so the hunk passes through as it came.
+    let understated = hunk.lines[body_len..signature.unwrap_or(hunk.lines.len())]
+        .iter()
+        .any(|l| {
+            let (added, deleted) = change_kind(l);
+            added || deleted
+        });
+    if understated {
+        return vec![build_hunk(
+            hunk.header.clone(),
+            hunk.lines.clone(),
+            &change_kind,
+            hunk.score,
+        )];
+    }
+
     // Indices of `+`/`-` lines.
     let change_positions: Vec<usize> = hunk
         .lines
@@ -1117,7 +1136,14 @@ fn reduce_context(hunk: &DiffHunk, max_context: usize) -> Vec<DiffHunk> {
         }
     }
 
-    let untouched = keep.is_empty() || keep.len() == hunk.lines.len();
+    // A format-patch signature and what follows it stay whatever the context
+    // radius, up to the blank lines at the very end.
+    let last = hunk.lines.iter().rposition(|l| !l.is_empty());
+    if let (Some(signature), Some(last)) = (signature, last) {
+        keep.extend(signature..=last);
+    }
+
+    let untouched = keep.range(..body_len).next().is_none() || keep.len() == hunk.lines.len();
     let Some(ranges) = ranges.filter(|_| !untouched) else {
         // Nothing trimmed, or a header we can't renumber: one hunk under
         // the original header.
@@ -1230,7 +1256,8 @@ fn parse_hunk_ranges(header: &str, parents: usize) -> Option<HunkRanges> {
         return None;
     }
     // Returns (next line number, line count). A zero-length range names the
-    // line *before* the hunk.
+    // line *before* the hunk, except in a combined header, where it names the
+    // next one.
     let parse = |range: &str, sign: char| -> Option<(usize, usize)> {
         let body = range.strip_prefix(sign)?;
         let (start, count) = match body.split_once(',') {
@@ -1238,7 +1265,7 @@ fn parse_hunk_ranges(header: &str, parents: usize) -> Option<HunkRanges> {
             None => (body.parse::<usize>().ok()?, 1),
         };
         Some((
-            if count == 0 {
+            if count == 0 && parents == 1 {
                 start.checked_add(1)?
             } else {
                 start
@@ -2133,6 +2160,122 @@ mod tests {
         assert!(
             r.compressed
                 .contains("@@@ -2,5 -2,5 +2,5 @@@\n  c2\n  c3\n- p1_old\n"),
+            "{}",
+            r.compressed
+        );
+    }
+
+    /// An empty range in a combined header names the next line, not the one
+    /// before. Inputs and expected headers come from `git show --cc`, and
+    /// `-U0` for the second.
+    #[test]
+    fn empty_combined_ranges_match_git() {
+        let compress = |input: &[&str], max_context_lines| {
+            let cfg = DiffCompressorConfig {
+                min_lines_for_ccr: 5,
+                max_context_lines,
+                ..Default::default()
+            };
+            DiffCompressor::new(cfg)
+                .compress(&input.join("\n"), "")
+                .compressed
+        };
+
+        let empty_first_parent = [
+            "diff --cc f.txt",
+            "--- a/f.txt",
+            "+++ b/f.txt",
+            "@@@ -1,0 -1,4 +1,4 @@@",
+            "+ a",
+            "+ b",
+            "+ c",
+            " -d",
+            "++X",
+            "",
+        ];
+        let r = compress(&empty_first_parent, 0);
+        assert!(r.contains("@@@ -1,0 -1,4 +1,4 @@@\n+ a\n"), "{r}");
+
+        let empty_mid_file = [
+            "diff --cc g.txt",
+            "--- a/g.txt",
+            "+++ b/g.txt",
+            "@@@ -17,6 -17,8 +17,7 @@@ tw",
+            "  17",
+            "  18",
+            "  19",
+            " -two-a",
+            " -two-b",
+            "++x",
+            "  20",
+            "  21",
+            "  22",
+            "",
+        ];
+        let r = compress(&empty_mid_file, 0);
+        assert!(r.contains("@@@ -20,0 -20,2 +20,1 @@@ tw\n -two-a\n"), "{r}");
+    }
+
+    /// Edits past the extent the header declares are malformed input: the
+    /// hunk passes through as it came.
+    #[test]
+    fn edits_past_an_understated_header_are_kept() {
+        let compress = |hunk: &[&str]| {
+            let input = ["diff --git a/f b/f", "--- a/f", "+++ b/f"]
+                .iter()
+                .chain(hunk)
+                .copied()
+                .collect::<Vec<_>>()
+                .join("\n");
+            let cfg = DiffCompressorConfig {
+                min_lines_for_ccr: 5,
+                max_context_lines: 0,
+                ..Default::default()
+            };
+            DiffCompressor::new(cfg).compress(&input, "").compressed
+        };
+
+        let r = compress(&["@@ -1 +1 @@", "-a", "+b", "-c", "+d", ""]);
+        assert!(r.contains("@@ -1 +1 @@\n-a\n+b\n-c\n+d"), "{r}");
+
+        let r = compress(&["@@ -1,2 +1,2 @@", " x", "-a", "+b", "-c", "+d", ""]);
+        assert!(r.contains("@@ -1,2 +1,2 @@\n x\n-a\n+b\n-c\n+d"), "{r}");
+    }
+
+    /// What follows a hunk in `git format-patch` output stays whatever the
+    /// context radius, and doesn't count towards the hunk's line numbers.
+    #[test]
+    fn format_patch_envelope_survives_trimming() {
+        let input = [
+            "diff --git a/f b/f",
+            "--- a/f",
+            "+++ b/f",
+            "@@ -1,5 +1,5 @@",
+            "-a",
+            "+b",
+            " c1",
+            " c2",
+            " c3",
+            " c4",
+            "-- ",
+            "2.43.0",
+            "",
+            "From 0000000 Mon Sep 17 00:00:00 2001",
+            "---",
+            " g | 2 +-",
+            "",
+        ]
+        .join("\n");
+        let cfg = DiffCompressorConfig {
+            min_lines_for_ccr: 5,
+            max_context_lines: 2,
+            ..Default::default()
+        };
+        let r = DiffCompressor::new(cfg).compress(&input, "");
+        assert!(
+            r.compressed.contains(
+                "@@ -1,3 +1,3 @@\n-a\n+b\n c1\n c2\n-- \n2.43.0\n\nFrom 0000000 Mon Sep 17 00:00:00 2001\n---\n g | 2 +-"
+            ),
             "{}",
             r.compressed
         );
