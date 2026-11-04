@@ -908,7 +908,7 @@ def _echo_installed(manifest: DeploymentManifest, *, prefix: str = "Installed pe
     help=(
         "Enable/disable AST-based code compression in the persistent runtime. "
         "Requires the optional tree-sitter dependency: pip install headroom-ai[code]. "
-        "Default: disabled, matching `headroom proxy`."
+        "Default: enabled, matching `headroom proxy`."
     ),
 )
 @click.option(
