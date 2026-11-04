@@ -578,3 +578,23 @@ def test_token_source_and_dollar_source_coexist(tmp_path, monkeypatch):
 def test_no_section_when_nothing_attributed(tmp_path, monkeypatch):
     out = _report_for([_savings_perf_line("none")], tmp_path, monkeypatch)
     assert "Savings by Source" not in out
+
+
+def test_coalesced_savings_rows_count_every_event_in_text_and_summary():
+    """A PERF row summed from 3 recordings is 3 events; a row without the field is 1."""
+    report = PerfReport(
+        perf_records=[
+            PerfRecord(
+                timestamp="2026-06-05 10:00:00,000",
+                request_id="hr_1",
+                savings_breakdown=[
+                    {"source": "tool_search", "tokens": 300, "events": 3},
+                    {"source": "router", "tokens": 5},
+                ],
+            )
+        ]
+    )
+
+    by_source = {row["source"]: row["events"] for row in build_perf_summary(report)["by_source"]}
+    assert by_source == {"tool_search": 3, "router": 1}
+    assert "tool_search: 3 events" in analyzer.format_report(report)
