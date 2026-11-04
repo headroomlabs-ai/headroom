@@ -122,7 +122,17 @@ Enable or disable automatic Copilot review in **Settings → Rules → Rulesets 
 - [Ruff](https://github.com/astral-sh/ruff) for lint + format, line length 100, PEP 8.
 - Type hints on public functions; Google-style docstrings.
 - Cover new behavior + edge cases; aim >80% coverage on new code.
-- Python 3.10+. Optional features go behind extras.
+- Python 3.11+. Optional features go behind extras.
+- **Headroom writes LF and normalizes on read, on every platform.** Pass
+  `newline="\n"` to every `write_text`/`open` that writes a context, memory,
+  or state file, and normalize `\r\n`/`\r` when you read one back. Without
+  the pin, `TextIOWrapper` translates `\n` to `\r\n` on Windows, and a reader
+  that decodes bytes directly then re-writes accumulates carriage returns
+  (#3594); even with a normalizing reader, two subsystems writing the same
+  file (`CLAUDE.md`, `AGENTS.md`) flip it between LF and CRLF (#3698). Cover
+  new write sites with `@pytest.mark.windows_newline` — those tests assert the
+  `newline=` kwarg (an artifact assertion cannot fail on POSIX) and also run
+  on `windows-latest` in CI.
 
 ## Architecture principles
 
