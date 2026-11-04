@@ -15,7 +15,7 @@
 //! construction may need network access to fetch the model. The files
 //! live in the HuggingFace hub cache directory Python's `huggingface_hub`
 //! would pick (`HF_HUB_CACHE`, `HF_HOME/hub`, `~/.cache/huggingface/hub`,
-//! …; see `hf_hub_cache_dir`), shared with Python.
+//! …; see `crate::hf_cache::hub_cache_dir`), shared with Python.
 //!
 //! When constructed, `is_available()` returns `true` and `HybridScorer`
 //! switches off the BM25-fallback path automatically. If construction
@@ -95,230 +95,16 @@ const DEFAULT_MODEL_FILES: [&str; 5] = [
 /// pinning off (same values as Python's `onnx_runtime._resolve_revision`).
 #[cfg(feature = "ml")]
 fn default_model_revision() -> &'static str {
-    let pin = std::env::var("HEADROOM_HF_PIN").unwrap_or_default();
-    match pin.trim().to_ascii_lowercase().as_str() {
-        "off" | "0" | "false" | "no" => "main",
-        _ => DEFAULT_MODEL_REVISION,
-    }
-}
-
-/// The HuggingFace hub cache directory, resolved the way Python's
-/// `huggingface_hub` resolves `constants.HF_HUB_CACHE`, so both languages look
-/// up and download into the same place: `HF_HUB_CACHE`, then
-/// `HUGGINGFACE_HUB_CACHE` (its legacy name), then `HF_HOME/hub`, then
-/// `XDG_CACHE_HOME/huggingface/hub`, then `~/.cache/huggingface/hub`.
-///
-/// It is exactly one directory. A snapshot in a lower-priority cache is not
-/// used when a higher one is configured, which is also what Python does: with
-/// `HF_HUB_CACHE` set, a model under `~/.cache` is neither found nor reused.
-///
-/// Both expansions happen as in `huggingface_hub.constants`:
-/// `expandvars(expanduser(...))`, first on `HF_HOME` (or its
-/// `XDG_CACHE_HOME` default) and then on the hub path itself. So
-/// `HF_HUB_CACHE=${ROOT}/hub` names the same directory in both languages, and
-/// a `~` that only appears once a variable is expanded stays literal, as it
-/// does in Python. The home directory comes from `std::env::home_dir`, which
-/// falls back to the user database when `HOME` is unset, as `expanduser`
-/// does. A variable that is set but empty still counts, as with `os.getenv`:
-/// `HF_HUB_CACHE=''` is the working directory itself, `HF_HOME=''` is `hub`
-/// and `XDG_CACHE_HOME=''` is `huggingface/hub` under it, and none of them
-/// falls through to a lower-priority cache. `tests/parity/fixtures/hf_hub_cache/`
-/// holds the cases both languages are checked against.
-#[cfg(feature = "ml")]
-fn hf_hub_cache_dir() -> Option<PathBuf> {
-    let var = |name: &str| std::env::var_os(name).map(PathBuf::from);
-    let home = std::env::home_dir();
-    let expand = |path: PathBuf| expand_vars(&expand_user(path, home.as_deref()));
-    let hub = match var("HF_HUB_CACHE").or_else(|| var("HUGGINGFACE_HUB_CACHE")) {
-        Some(dir) => dir,
-        None => {
-            let hf_home = match var("HF_HOME") {
-                Some(dir) => dir,
-                None => var("XDG_CACHE_HOME")
-                    .or_else(|| home.as_ref().map(|home| home.join(".cache")))?
-                    .join("huggingface"),
-            };
-            expand(hf_home).join("hub")
-        }
-    };
-    Some(expand(hub))
-}
-
-/// Python's `os.path.expanduser` for a leading bare `~` component. `~user`
-/// stays as written, which is also what `expanduser` does when it cannot
-/// resolve the user.
-#[cfg(feature = "ml")]
-fn expand_user(path: PathBuf, home: Option<&Path>) -> PathBuf {
-    match (path.strip_prefix("~"), home) {
-        (Ok(rest), Some(home)) => home.join(rest),
-        _ => path,
-    }
-}
-
-/// Python's `os.path.expandvars`: `posixpath` rules off Windows, `ntpath`
-/// rules on it. A path that is not valid Unicode is returned unchanged.
-#[cfg(feature = "ml")]
-fn expand_vars(path: &Path) -> PathBuf {
-    let Some(text) = path.to_str() else {
-        return path.to_path_buf();
-    };
-    #[cfg(windows)]
-    let expanded = expand_vars_nt(text, env_lookup);
-    #[cfg(not(windows))]
-    let expanded = expand_vars_posix(text, env_lookup);
-    PathBuf::from(expanded)
-}
-
-/// An environment value for `expand_vars`. Names the OS cannot hold (empty,
-/// or containing `=` or NUL) are unset, which is how Python's `os.environ`
-/// lookup fails for them too.
-#[cfg(feature = "ml")]
-fn env_lookup(name: &str) -> Option<std::ffi::OsString> {
-    if name.is_empty() || name.contains(['=', '\0']) {
-        return None;
-    }
-    std::env::var_os(name)
-}
-
-/// `posixpath.expandvars`: `$name` (ASCII letters, digits, `_`) or
-/// `${anything but a brace}`. An unset name, and a `$` that starts neither
-/// form, stay as written. Expanded values are not scanned again.
-#[cfg(feature = "ml")]
-#[cfg_attr(windows, allow(dead_code))] // tests run both rule sets everywhere
-fn expand_vars_posix(
-    text: &str,
-    lookup: impl Fn(&str) -> Option<std::ffi::OsString>,
-) -> std::ffi::OsString {
-    let mut out = std::ffi::OsString::new();
-    let mut rest = text;
-    while let Some(at) = rest.find('$') {
-        out.push(&rest[..at]);
-        let after = &rest[at + 1..];
-        let word = after
-            .find(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
-            .unwrap_or(after.len());
-        // (name, length of the reference after the `$`)
-        let reference = if word > 0 {
-            Some((&after[..word], word))
-        } else {
-            after
-                .strip_prefix('{')
-                .and_then(|braced| braced.find('}').map(|end| (&braced[..end], end + 2)))
-        };
-        match reference {
-            Some((name, len)) => {
-                match lookup(name) {
-                    Some(value) => out.push(value),
-                    None => out.push(&rest[at..at + 1 + len]),
-                }
-                rest = &after[len..];
-            }
-            None => {
-                out.push("$");
-                rest = after;
-            }
-        }
-    }
-    out.push(rest);
-    out
-}
-
-/// `ntpath.expandvars`: `%name%`, `${name}` and `$name` (ASCII letters,
-/// digits, `_`, `-`); `%%` and `$$` are a literal `%` and `$`; nothing inside
-/// single quotes expands. An unset or unterminated reference stays as
-/// written.
-#[cfg(feature = "ml")]
-#[cfg_attr(not(windows), allow(dead_code))] // tests run both rule sets everywhere
-fn expand_vars_nt(
-    text: &str,
-    lookup: impl Fn(&str) -> Option<std::ffi::OsString>,
-) -> std::ffi::OsString {
-    let mut out = std::ffi::OsString::new();
-    let mut rest = text;
-    while let Some(c) = rest.chars().next() {
-        let after = &rest[c.len_utf8()..];
-        match c {
-            '\'' => match after.find('\'') {
-                Some(end) => {
-                    out.push(&rest[..end + 2]);
-                    rest = &after[end + 1..];
-                }
-                None => {
-                    out.push(rest);
-                    rest = "";
-                }
-            },
-            '%' if after.starts_with('%') => {
-                out.push("%");
-                rest = &after[1..];
-            }
-            '%' => match after.find('%') {
-                Some(end) => {
-                    let name = &after[..end];
-                    match lookup(name) {
-                        Some(value) => out.push(value),
-                        None => out.push(&rest[..end + 2]),
-                    }
-                    rest = &after[end + 1..];
-                }
-                None => {
-                    out.push(rest);
-                    rest = "";
-                }
-            },
-            '$' if after.starts_with('$') => {
-                out.push("$");
-                rest = &after[1..];
-            }
-            '$' if after.starts_with('{') => match after[1..].find('}') {
-                Some(end) => {
-                    let name = &after[1..1 + end];
-                    match lookup(name) {
-                        Some(value) => out.push(value),
-                        None => out.push(&rest[..end + 3]),
-                    }
-                    rest = &after[end + 2..];
-                }
-                None => {
-                    out.push(rest);
-                    rest = "";
-                }
-            },
-            '$' => {
-                let end = after
-                    .find(|c: char| !(c.is_ascii_alphanumeric() || c == '_' || c == '-'))
-                    .unwrap_or(after.len());
-                let name = &after[..end];
-                match lookup(name) {
-                    Some(value) => out.push(value),
-                    None => out.push(&rest[..end + 1]),
-                }
-                rest = &after[end..];
-            }
-            _ => {
-                out.push(&rest[..c.len_utf8()]);
-                rest = after;
-            }
-        }
-    }
-    out
+    crate::hf_cache::pinned_or_main(DEFAULT_MODEL_REVISION)
 }
 
 /// Find a snapshot of [`DEFAULT_MODEL_REPO`] at `revision` in the hub cache
 /// `cache` that holds every file in [`DEFAULT_MODEL_FILES`]. Never touches the
-/// network.
-///
-/// Looks the snapshot up by directory rather than through `hf_hub::Cache`:
-/// that resolves every revision through `refs/<revision>`, which Python's
-/// `huggingface_hub` does not write for a commit SHA, so a snapshot Python
-/// downloaded would be missed. A branch name still goes through its ref.
+/// network; see [`crate::hf_cache::snapshot_path`] for how `revision`
+/// resolves.
 #[cfg(feature = "ml")]
 fn cached_snapshot(cache: &Path, revision: &str) -> Option<PathBuf> {
-    let repo = cache.join(format!("models--{}", DEFAULT_MODEL_REPO.replace('/', "--")));
-    let commit = std::fs::read_to_string(repo.join("refs").join(revision))
-        .map(|c| c.trim().to_string())
-        .unwrap_or_else(|_| revision.to_string());
-    let snapshot = repo.join("snapshots").join(commit);
+    let snapshot = crate::hf_cache::snapshot_path(cache, DEFAULT_MODEL_REPO, revision);
     // `is_file` follows the snapshot's symlinks, so blobs deleted from under
     // it count as a miss rather than a load failure.
     DEFAULT_MODEL_FILES
@@ -328,32 +114,30 @@ fn cached_snapshot(cache: &Path, revision: &str) -> Option<PathBuf> {
 }
 
 /// The Hub handle for [`DEFAULT_MODEL_REPO`] at `revision`, caching under
-/// `cache_root`. Honors `HF_ENDPOINT` like the Python side does.
+/// `cache_root`, with Python's endpoint and token ([`crate::hf_cache::hub_api`]).
 #[cfg(feature = "ml")]
 fn default_model_repo(
     cache_root: &Path,
     revision: &str,
 ) -> Result<hf_hub::api::sync::ApiRepo, String> {
-    // Air-gap chokepoint, ahead of the client: building it resolves the Hub
-    // endpoint and the `ureq` agent, and `hf-hub` downloads on a cache miss
-    // even with `HF_HUB_OFFLINE` set. Callers reach this only on a cache
+    // `hub_api` is the air-gap chokepoint: under `HEADROOM_OFFLINE` it
+    // refuses before building the client. Callers reach this only on a cache
     // miss, so a pre-seeded air-gapped host still loads.
     //
     // The refusal is soft by design: every caller degrades to the BM25
     // scorer on `Err`, so an air-gapped box loses embedding relevance instead
     // of failing a request. The message names the switch so the operator can
     // tell the causes apart in the log.
-    crate::offline::guard_egress("fastembed embedding model download", DEFAULT_MODEL_REPO)
-        .map_err(|e| format!("EmbeddingScorer model load refused: {e}"))?;
-    let mut builder =
-        hf_hub::api::sync::ApiBuilder::from_cache(hf_hub::Cache::new(cache_root.to_path_buf()))
-            .with_progress(false);
-    if let Ok(endpoint) = std::env::var("HF_ENDPOINT") {
-        builder = builder.with_endpoint(endpoint);
-    }
-    let api = builder
-        .build()
-        .map_err(|e| format!("EmbeddingScorer: HuggingFace client init failed: {e}"))?;
+    use crate::hf_cache::HubApiError;
+    let api = crate::hf_cache::hub_api(
+        cache_root,
+        "fastembed embedding model download",
+        DEFAULT_MODEL_REPO,
+    )
+    .map_err(|e| match e {
+        HubApiError::Offline(e) => format!("EmbeddingScorer model load refused: {e}"),
+        HubApiError::Build(e) => format!("EmbeddingScorer: HuggingFace client init failed: {e}"),
+    })?;
     Ok(api.repo(hf_hub::Repo::with_revision(
         DEFAULT_MODEL_REPO.to_string(),
         hf_hub::RepoType::Model,
@@ -493,7 +277,7 @@ impl EmbeddingScorer {
     /// offline, network failure during download, missing ONNX runtime
     /// binaries, etc.).
     pub fn try_new() -> Result<Self, String> {
-        let cache = hf_hub_cache_dir().ok_or_else(|| {
+        let cache = crate::hf_cache::hub_cache_dir().ok_or_else(|| {
             "EmbeddingScorer: no HuggingFace cache directory (set HF_HUB_CACHE or HF_HOME)"
                 .to_string()
         })?;
@@ -729,6 +513,8 @@ fn cosine_similarity(a: &[f32], b: &[f32]) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(feature = "ml")]
+    use crate::hf_cache::tests::CacheEnv;
 
     // The real-model tests are gated behind RUN_FASTEMBED_TESTS=1
     // since they require network access on first run (~67 MB model
@@ -843,209 +629,12 @@ mod tests {
         assert_eq!(cached_snapshot(cache.path(), DEFAULT_MODEL_REVISION), None);
     }
 
-    /// Every variable `hf_hub_cache_dir` reads.
-    #[cfg(feature = "ml")]
-    const CACHE_ENV: [&str; 6] = [
-        "HF_HUB_CACHE",
-        "HUGGINGFACE_HUB_CACHE",
-        "HF_HOME",
-        "XDG_CACHE_HOME",
-        "HOME",
-        "USERPROFILE",
-    ];
-
-    /// Saves [`CACHE_ENV`], clears it, and puts it back on drop, so a failing
-    /// assertion cannot leak a fake cache into later tests. Take
-    /// `env_lock()` first.
-    #[cfg(feature = "ml")]
-    struct CacheEnv(Vec<(String, Option<std::ffi::OsString>)>);
-
-    #[cfg(feature = "ml")]
-    impl CacheEnv {
-        fn cleared() -> Self {
-            Self::cleared_with(std::iter::empty())
-        }
-
-        /// [`Self::cleared`], plus `extra` variables (the ones a test's
-        /// paths reference).
-        fn cleared_with(extra: impl IntoIterator<Item = String>) -> Self {
-            let names: Vec<String> = CACHE_ENV
-                .iter()
-                .map(|name| name.to_string())
-                .chain(extra)
-                .collect();
-            let saved = names
-                .into_iter()
-                .map(|name| {
-                    let value = std::env::var_os(&name);
-                    std::env::remove_var(&name);
-                    (name, value)
-                })
-                .collect();
-            CacheEnv(saved)
-        }
-    }
-
-    #[cfg(feature = "ml")]
-    impl Drop for CacheEnv {
-        fn drop(&mut self) {
-            for (name, value) in &self.0 {
-                match value {
-                    Some(value) => std::env::set_var(name, value),
-                    None => std::env::remove_var(name),
-                }
-            }
-        }
-    }
-
-    /// Same order as `huggingface_hub.constants.HF_HUB_CACHE`: each variable
-    /// wins over every one after it, and only one directory comes back.
-    #[cfg(feature = "ml")]
-    #[test]
-    fn hf_hub_cache_dir_follows_huggingface_hub_precedence() {
-        let _guard = crate::test_support::env_lock();
-        let _env = CacheEnv::cleared();
-        let t = tempfile::tempdir().unwrap();
-        let p = |name: &str| t.path().join(name);
-        std::env::set_var("HOME", p("home"));
-        std::env::set_var("USERPROFILE", p("home"));
-        std::env::set_var("XDG_CACHE_HOME", p("xdg"));
-        std::env::set_var("HF_HOME", p("hf-home"));
-        std::env::set_var("HUGGINGFACE_HUB_CACHE", p("legacy"));
-        std::env::set_var("HF_HUB_CACHE", p("explicit"));
-
-        assert_eq!(hf_hub_cache_dir(), Some(p("explicit")));
-        std::env::remove_var("HF_HUB_CACHE");
-        assert_eq!(hf_hub_cache_dir(), Some(p("legacy")));
-        std::env::remove_var("HUGGINGFACE_HUB_CACHE");
-        assert_eq!(hf_hub_cache_dir(), Some(p("hf-home").join("hub")));
-        std::env::remove_var("HF_HOME");
-        assert_eq!(
-            hf_hub_cache_dir(),
-            Some(p("xdg").join("huggingface").join("hub"))
-        );
-        std::env::remove_var("XDG_CACHE_HOME");
-        assert_eq!(
-            hf_hub_cache_dir(),
-            Some(p("home").join(".cache").join("huggingface").join("hub"))
-        );
-
-        // A leading `~` expands.
-        std::env::set_var("HF_HOME", "~/models");
-        assert_eq!(
-            hf_hub_cache_dir(),
-            Some(p("home").join("models").join("hub"))
-        );
-
-        // A set but empty variable is the working directory, as in Python,
-        // and still wins over every variable after it.
-        std::env::set_var("HF_HUB_CACHE", "");
-        assert_eq!(hf_hub_cache_dir(), Some(PathBuf::new()));
-        std::env::remove_var("HF_HUB_CACHE");
-        std::env::set_var("HF_HOME", "");
-        std::env::set_var("XDG_CACHE_HOME", p("xdg"));
-        assert_eq!(hf_hub_cache_dir(), Some(PathBuf::from("hub")));
-    }
-
-    /// Cases checked against Python itself (`posixpath`, `ntpath` and
-    /// `huggingface_hub.constants`) by `tests/test_fastembed_pinned_snapshot.py`.
-    #[cfg(feature = "ml")]
-    const HF_CACHE_FIXTURE: &str = include_str!(concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/../../tests/parity/fixtures/hf_hub_cache/cases.json"
-    ));
-
-    /// Both rule sets on every platform, so the Windows port is exercised by
-    /// the macOS and Linux runs too.
-    #[cfg(feature = "ml")]
-    #[test]
-    fn expand_vars_matches_python_posixpath_and_ntpath() {
-        let fixture: serde_json::Value = serde_json::from_str(HF_CACHE_FIXTURE).unwrap();
-        let section = &fixture["expandvars"];
-        let env: std::collections::HashMap<String, String> =
-            serde_json::from_value(section["env"].clone()).unwrap();
-        let lookup = |name: &str| env.get(name).map(std::ffi::OsString::from);
-        for case in section["cases"].as_array().unwrap() {
-            let input = case["input"].as_str().unwrap();
-            let want = |key: &str| std::ffi::OsString::from(case[key].as_str().unwrap());
-            assert_eq!(
-                expand_vars_posix(input, lookup),
-                want("posix"),
-                "posix {input:?}"
-            );
-            assert_eq!(expand_vars_nt(input, lookup), want("nt"), "nt {input:?}");
-        }
-    }
-
-    /// The review case among them: `HF_HUB_CACHE=${ROOT}/hub` is
-    /// `<ROOT>/hub` in Python, so Rust must not look up or download into a
-    /// literal `${ROOT}` directory instead.
-    #[cfg(feature = "ml")]
-    #[test]
-    fn hf_hub_cache_dir_matches_the_shared_fixture() {
-        let fixture: serde_json::Value = serde_json::from_str(HF_CACHE_FIXTURE).unwrap();
-        let section = &fixture["cache_dir"];
-        let probe_vars: Vec<String> =
-            serde_json::from_value(section["probe_vars"].clone()).unwrap();
-        let _guard = crate::test_support::env_lock();
-        let _env = CacheEnv::cleared_with(probe_vars.clone());
-        let t = tempfile::tempdir().unwrap();
-        let (root, home) = (t.path().join("root"), t.path().join("home"));
-        let fill = |text: &str| {
-            text.replace("{root}", root.to_str().unwrap())
-                .replace("{home}", home.to_str().unwrap())
-        };
-        for case in section["cases"].as_array().unwrap() {
-            for name in CACHE_ENV
-                .iter()
-                .copied()
-                .chain(probe_vars.iter().map(String::as_str))
-            {
-                std::env::remove_var(name);
-            }
-            std::env::set_var("HOME", &home);
-            std::env::set_var("USERPROFILE", &home);
-            for (name, value) in case["env"].as_object().unwrap() {
-                std::env::set_var(name, fill(value.as_str().unwrap()));
-            }
-            let expected = match &case["expected"] {
-                serde_json::Value::Object(by_os) => {
-                    &by_os[if cfg!(windows) { "nt" } else { "posix" }]
-                }
-                expected => expected,
-            };
-            assert_eq!(
-                hf_hub_cache_dir(),
-                Some(PathBuf::from(fill(expected.as_str().unwrap()))),
-                "{}",
-                case["name"]
-            );
-        }
-    }
-
-    /// With no `HOME` (a service started with a bare environment) the home
-    /// directory still comes from the user database, as Python's
-    /// `expanduser` does, instead of leaving the scorer with no cache.
-    #[cfg(all(feature = "ml", unix))]
-    #[test]
-    fn hf_hub_cache_dir_without_home_uses_the_user_database() {
-        let _guard = crate::test_support::env_lock();
-        let _env = CacheEnv::cleared();
-        let dir = hf_hub_cache_dir().expect("a cache directory without HOME");
-        assert!(dir.is_absolute(), "{}", dir.display());
-        assert!(
-            dir.ends_with(Path::new(".cache").join("huggingface").join("hub")),
-            "{}",
-            dir.display()
-        );
-    }
-
     /// The case from review: an explicit, empty `HF_HUB_CACHE` next to a
     /// complete snapshot in the default cache under `HOME`. Python looks only
     /// in the explicit cache and downloads there, so Rust must not find the
     /// `HOME` copy, for the pinned revision or for floating `main`
     /// (`HEADROOM_HF_PIN=off`). `try_new` is `try_new_pinned` on
-    /// `hf_hub_cache_dir()`, which looks up and downloads only in the
+    /// `hub_cache_dir()`, which looks up and downloads only in the
     /// directory it is given (see the two offline tests above), so checking
     /// the resolver and the lookup here covers it without flipping
     /// `HEADROOM_OFFLINE` for a long stretch of the parallel run.
@@ -1068,14 +657,14 @@ mod tests {
         std::env::set_var("USERPROFILE", home.path());
 
         std::env::set_var("HF_HUB_CACHE", explicit.path());
-        let cache = hf_hub_cache_dir().expect("cache directory");
+        let cache = crate::hf_cache::hub_cache_dir().expect("cache directory");
         assert_eq!(cache, explicit.path());
         assert_eq!(cached_snapshot(&cache, DEFAULT_MODEL_REVISION), None);
         assert_eq!(cached_snapshot(&cache, "main"), None);
 
         // Without the explicit cache, the same HOME snapshots are the cache.
         std::env::remove_var("HF_HUB_CACHE");
-        let cache = hf_hub_cache_dir().expect("cache directory");
+        let cache = crate::hf_cache::hub_cache_dir().expect("cache directory");
         assert_eq!(cache, default_cache);
         assert_eq!(
             cached_snapshot(&cache, DEFAULT_MODEL_REVISION),
