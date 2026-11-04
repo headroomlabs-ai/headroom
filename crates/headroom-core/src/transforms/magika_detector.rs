@@ -154,8 +154,30 @@ fn init_ort_from_path(path: &Path) -> Result<(), String> {
             path.display()
         )
     })?;
-    let _committed = builder.commit();
+    // `ort` enables ONNX Runtime's usage telemetry by default, and ORT 1.31+
+    // uploads it to Microsoft on Linux and macOS too. Importing `headroom`
+    // sets ORT_DISABLE_TELEMETRY, which stops the uploader before it starts;
+    // this only stops later events, for Rust-only callers that skip Python.
+    let enable = ort_telemetry_opted_in(std::env::var("ORT_DISABLE_TELEMETRY").ok().as_deref());
+    let _committed = builder.with_telemetry(enable).commit();
     Ok(())
+}
+
+/// Whether the caller explicitly allowed ONNX Runtime telemetry.
+///
+/// Mirrors the Python default (`headroom._ort.disable_ort_telemetry_by_default`):
+/// off unless `ORT_DISABLE_TELEMETRY` is set to a value ORT itself does not
+/// treat as "disabled" (ORT disables on `1`/`true`/`yes`/`on`/`y`, case- and
+/// space-insensitive). So `ORT_DISABLE_TELEMETRY=0` turns it on for Rust-loaded
+/// models exactly as it does for Python ones, and unset stays off.
+fn ort_telemetry_opted_in(value: Option<&str>) -> bool {
+    match value {
+        None => false,
+        Some(raw) => !matches!(
+            raw.trim().to_ascii_lowercase().as_str(),
+            "1" | "true" | "yes" | "on" | "y"
+        ),
+    }
 }
 
 fn discover_onnxruntime_libraries() -> Vec<PathBuf> {
@@ -504,6 +526,17 @@ pub fn map_magika_label(label: &str) -> ContentType {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ort_telemetry_stays_off_unless_explicitly_allowed() {
+        assert!(!ort_telemetry_opted_in(None), "unset must stay off");
+        for disabled in ["1", "true", "TRUE", " yes ", "on", "Y"] {
+            assert!(!ort_telemetry_opted_in(Some(disabled)), "{disabled:?}");
+        }
+        for allowed in ["0", "false", "no", "off", ""] {
+            assert!(ort_telemetry_opted_in(Some(allowed)), "{allowed:?}");
+        }
+    }
 
     fn assert_detect(content: &str, expected: ContentType, hint: &str) {
         if let Err(init_reason) = magika_runtime_available_for_session_init() {
