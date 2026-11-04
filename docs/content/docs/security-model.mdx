@@ -349,6 +349,7 @@ Beyond your configured LLM providers, Headroom may contact:
 | `pypi.org` | Daily version check for update notices | On | `HEADROOM_UPDATE_CHECK=off`; also skipped in `--stateless`, in CI, and from source checkouts |
 | `huggingface.co` | Downloads models for the optional ML compression paths | On first use of those features | Pre-provision the model cache, or leave the features disabled |
 | `app.headroomlabs.ai` | License validation and usage reporting | Only with a license key configured | Omit the license key |
+| `mobile.events.data.microsoft.com` | ONNX Runtime's own usage telemetry to Microsoft (ORT 1.31+ on Linux and macOS): hashed device id, model file and graph names, model hashes, execution providers, hardware ids | **Off**: importing `headroom` sets `ORT_DISABLE_TELEMETRY=1` unless it is already set | Leave `ORT_DISABLE_TELEMETRY` unset or `1`; setting it to `0` turns ORT's telemetry back on |
 
 ### The beacon is on by default
 
