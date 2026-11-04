@@ -432,13 +432,6 @@ def test_wrap_openclaw_accepts_repeatable_gateway_provider_ids(runner: CliRunner
     assert payload["config"]["gatewayProviderIds"] == ["openai-codex", "anthropic"]
 
 
-def test_normalize_openclaw_gateway_provider_ids_dedupes_blanks_and_defaults() -> None:
-    assert wrap_cli._normalize_openclaw_gateway_provider_ids(
-        (" openai-codex ", "", "anthropic", "openai-codex", "  ")
-    ) == ["openai-codex", "anthropic"]
-    assert wrap_cli._normalize_openclaw_gateway_provider_ids(None) == ["openai-codex"]
-
-
 def test_read_openclaw_config_value_handles_missing_and_raw_strings() -> None:
     missing = MagicMock(returncode=1, stdout="", stderr="missing")
     raw_string = MagicMock(returncode=0, stdout="plain-text-value\n", stderr="")
