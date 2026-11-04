@@ -21,6 +21,7 @@ from collections.abc import AsyncIterator
 from dataclasses import dataclass, field
 from typing import Any
 
+from headroom.offline import pin_litellm_cost_map_local
 from headroom.proxy.public_errors import client_message
 from headroom.utils import format_exception_message
 
@@ -67,6 +68,7 @@ try:
     import os as _os
 
     _env_snapshot = set(_os.environ)
+    pin_litellm_cost_map_local()
     import litellm
     from litellm import acompletion
     from litellm.utils import supports_prompt_caching
@@ -536,6 +538,7 @@ def _caller_key_travels_to(model: str, key: str) -> bool:
     if not key.startswith("sk-ant-"):
         return True
     try:
+        pin_litellm_cost_map_local()
         from litellm import get_llm_provider
 
         provider = (get_llm_provider(model)[1] or "").lower()
@@ -649,6 +652,8 @@ def _anthropic_usage_from_litellm(litellm_usage: Any) -> dict[str, Any]:
 def _convert_anthropic_tool(tool: dict[str, Any]) -> dict[str, Any]:
     """Convert Anthropic tool format to OpenAI function format.
 
+    Shared with the any-llm backend, so both OpenAI-compatible backends send the same shape.
+
     Anthropic: {"name": "...", "description": "...", "input_schema": {...}}
     OpenAI:    {"type": "function", "function": {"name": "...", "description": "...", "parameters": {...}}}
     """
@@ -661,7 +666,7 @@ def _convert_anthropic_tool(tool: dict[str, Any]) -> dict[str, Any]:
 
 
 def _convert_tool_choice(choice: Any) -> Any:
-    """Convert Anthropic tool_choice to OpenAI format.
+    """Convert Anthropic tool_choice to OpenAI format (shared with the any-llm backend).
 
     Anthropic: {"type": "auto"}, {"type": "any"}, {"type": "none"}, {"type": "tool", "name": "..."}
     OpenAI:    "auto", "required", "none", {"type": "function", "function": {"name": "..."}}
