@@ -59,9 +59,12 @@ from datetime import datetime, timezone
 from time import monotonic
 from typing import Any
 
+from headroom.log_safety import describe_exception, safe_id
 from headroom.memory import qdrant_env
+from headroom.memory.backends.mem0 import disable_mem0_telemetry_by_default
 from headroom.memory.models import Memory
 from headroom.memory.ports import MemorySearchResult
+from headroom.offline import guard_egress
 
 logger = logging.getLogger(__name__)
 
@@ -175,7 +178,12 @@ class DirectMem0Adapter:
         if self._initialized:
             return
 
-        # Initialize embedder (OpenAI)
+        # Initialize embedder (OpenAI). The air-gap switch outranks the
+        # backend configuration: this embeds the user's memories by shipping
+        # them to api.openai.com, which is precisely what an operator who set
+        # HEADROOM_OFFLINE is refusing. Use the ONNX or Ollama embedder
+        # instead on an air-gapped box.
+        guard_egress("OpenAI embedding API (direct mem0 backend)", "api.openai.com")
         try:
             from openai import OpenAI
 
@@ -218,6 +226,7 @@ class DirectMem0Adapter:
                 self._neo4j_driver = None
 
         # Initialize Mem0 client for fallback path
+        disable_mem0_telemetry_by_default()
         try:
             from mem0 import Memory as Mem0Memory
 
@@ -314,6 +323,7 @@ class DirectMem0Adapter:
 
             # Build metadata payload
             payload = {
+                "data": fact,  # the key Mem0 search reads; points without it are skipped
                 "memory": fact,
                 "user_id": user_id,
                 "importance": importance,
@@ -851,8 +861,8 @@ class DirectMem0Adapter:
         results = await asyncio.to_thread(
             self._mem0_client.search,
             query=query,
-            user_id=user_id,
-            limit=top_k,
+            filters={"user_id": user_id},
+            top_k=top_k,
         )
 
         search_results: list[MemorySearchResult] = []
@@ -962,7 +972,29 @@ class DirectMem0Adapter:
         try:
             await asyncio.to_thread(self._mem0_client.delete, memory_id=memory_id)
             return True
-        except Exception:
+        except Exception as e:
+            # mem0 (Memory.delete, mem0ai 2.x) raises exactly
+            # ValueError(f"Memory with id {memory_id} not found") for an unknown id.
+            # The delete is model-driven, so a stale or invented id is expected. Any
+            # other ValueError (e.g. a missing collection) is a real failure.
+            if isinstance(e, ValueError) and str(e).startswith(
+                f"Memory with id {memory_id} not found"
+            ):
+                logger.debug("DirectMem0: delete_memory(%s): memory not found", safe_id(memory_id))
+                return False
+            # Backend exception text can carry stored memory or connection details,
+            # so no level logs its message; DEBUG gets describe_exception.
+            logger.warning(
+                "DirectMem0: delete_memory(%s) failed (%s)",
+                safe_id(memory_id),
+                safe_id(e),
+            )
+            if logger.isEnabledFor(logging.DEBUG):
+                logger.debug(
+                    "DirectMem0: delete_memory(%s) failure: %s",
+                    safe_id(memory_id),
+                    describe_exception(e),
+                )
             return False
 
     async def get_memory(self, memory_id: str) -> Memory | None:
@@ -990,7 +1022,14 @@ class DirectMem0Adapter:
                 valid_from=_utcnow(),
                 metadata=result.get("metadata") or {},
             )
-        except Exception:
+        except Exception as e:
+            logger.warning("DirectMem0: get_memory(%s) failed (%s)", safe_id(memory_id), safe_id(e))
+            if logger.isEnabledFor(logging.DEBUG):
+                logger.debug(
+                    "DirectMem0: get_memory(%s) failure: %s",
+                    safe_id(memory_id),
+                    describe_exception(e),
+                )
             return None
 
     @property

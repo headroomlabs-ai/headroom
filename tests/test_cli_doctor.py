@@ -10,6 +10,7 @@ from click.testing import CliRunner
 
 import headroom.cli.doctor as doctor_mod
 from headroom.cli.doctor import (
+    DEFAULT_PROXY_PORT,
     FAIL,
     PASS,
     SKIP,
@@ -25,6 +26,7 @@ from headroom.cli.doctor import (
     check_savings,
     check_shell_env,
     check_version_drift,
+    resolve_probe_port,
 )
 from headroom.cli.main import main
 from headroom.providers.claude.runtime import remote_control_gate_message
@@ -184,6 +186,42 @@ class TestClaudeRouting:
         result = check_claude_routing(path, 8787)
         assert result.status == WARN
         assert "gateway.corp.example" in result.summary
+
+    def test_foundry_url_passes(self, tmp_path):
+        # In Foundry mode ANTHROPIC_BASE_URL is absent by design; routing lives
+        # in ANTHROPIC_FOUNDRY_BASE_URL. doctor must recognize it as routed.
+        path = tmp_path / "settings.json"
+        path.write_text(
+            json.dumps(
+                {
+                    "env": {
+                        "CLAUDE_CODE_USE_FOUNDRY": "1",
+                        "ANTHROPIC_FOUNDRY_BASE_URL": "http://127.0.0.1:8787",
+                    }
+                }
+            ),
+            encoding="utf-8",
+        )
+        assert check_claude_routing(path, 8787).status == PASS
+
+    def test_foundry_without_base_url_warns(self, tmp_path):
+        # Foundry mode on but no upstream URL configured: still unrouted.
+        path = tmp_path / "settings.json"
+        path.write_text(
+            json.dumps({"env": {"CLAUDE_CODE_USE_FOUNDRY": "1"}}),
+            encoding="utf-8",
+        )
+        assert check_claude_routing(path, 8787).status == WARN
+
+    def test_foundry_url_ignored_without_flag(self, tmp_path):
+        # Without CLAUDE_CODE_USE_FOUNDRY the foundry URL is not consulted, so a
+        # settings file carrying only the foundry key reads as unrouted.
+        path = tmp_path / "settings.json"
+        path.write_text(
+            json.dumps({"env": {"ANTHROPIC_FOUNDRY_BASE_URL": "http://127.0.0.1:8787"}}),
+            encoding="utf-8",
+        )
+        assert check_claude_routing(path, 8787).status == WARN
 
 
 class TestClaudeDesktop:
@@ -549,6 +587,57 @@ class TestCodexRouting:
         assert result.status == WARN
         assert "9999" in result.summary
 
+    def test_root_openai_base_url_on_builtin_provider_passes(self, tmp_path):
+        """Headroom Desktop's layout: built-in `openai` provider, root base URL."""
+        path = tmp_path / "config.toml"
+        path.write_text(
+            'model_provider = "openai"\n'
+            'openai_base_url = "http://127.0.0.1:6767/v1"\n'
+            '[projects."/work/app"]\n'
+            'trust_level = "trusted"\n',
+            encoding="utf-8",
+        )
+        result = check_codex_routing(path, 6767)
+        assert result.status == PASS, result.summary
+        assert check_codex_routing(path, 8787).status == WARN
+
+    def test_root_openai_base_url_without_model_provider_passes(self, tmp_path):
+        path = tmp_path / "config.toml"
+        path.write_text('openai_base_url = "http://127.0.0.1:8787/v1"\n', encoding="utf-8")
+        assert check_codex_routing(path, 8787).status == PASS
+
+    def test_openai_base_url_inside_a_table_is_not_root(self, tmp_path):
+        path = tmp_path / "config.toml"
+        path.write_text(
+            'model_provider = "openai"\n'
+            "[profiles.fast]\n"
+            'openai_base_url = "http://127.0.0.1:8787/v1"\n',
+            encoding="utf-8",
+        )
+        assert check_codex_routing(path, 8787).status == WARN
+
+    def test_root_openai_base_url_beats_an_inactive_headroom_table(self, tmp_path):
+        """No root `model_provider`: Codex uses its built-in `openai`, not the table."""
+        path = tmp_path / "config.toml"
+        path.write_text(
+            'openai_base_url = "http://127.0.0.1:6767/v1"\n'
+            "[model_providers.headroom]\n"
+            'base_url = "http://127.0.0.1:8787/v1"\n',
+            encoding="utf-8",
+        )
+        assert check_codex_routing(path, 6767).status == PASS
+        assert check_codex_routing(path, 8787).status == WARN
+
+    def test_profile_model_provider_does_not_hide_the_default_route(self, tmp_path):
+        path = tmp_path / "config.toml"
+        path.write_text(
+            'openai_base_url = "http://127.0.0.1:6767/v1"\n'
+            "[profiles.work]\n"
+            'model_provider = "azure"\n',
+            encoding="utf-8",
+        )
+        assert check_codex_routing(path, 6767).status == PASS
+
     def test_no_marker_warns(self, tmp_path):
         path = tmp_path / "config.toml"
         path.write_text('model = "gpt-5"\n', encoding="utf-8")
@@ -768,6 +857,7 @@ class TestBudget:
 class _FakeManifest:
     profile: str
     health_url: str
+    port: int = 8787
 
 
 class TestDeployments:
@@ -784,6 +874,33 @@ class TestDeployments:
         result = check_deployments(manifests, probe=lambda url: None)
         assert result is not None and result.status == FAIL
         assert "prod" in result.summary
+
+
+class TestResolveProbePort:
+    def test_explicit_port_wins_over_deployment(self):
+        manifests = [_FakeManifest("default", "", port=8789)]
+        assert resolve_probe_port(9000, manifests) == 9000
+
+    def test_default_profile_deployment_port_is_preferred(self):
+        manifests = [
+            _FakeManifest("prod", "", port=9999),
+            _FakeManifest("default", "", port=8789),
+        ]
+        assert resolve_probe_port(None, manifests) == 8789
+
+    def test_single_non_default_deployment_is_used(self):
+        assert resolve_probe_port(None, [_FakeManifest("prod", "", port=9999)]) == 9999
+
+    def test_builtin_default_without_deployments(self):
+        assert resolve_probe_port(None, []) == DEFAULT_PROXY_PORT
+
+    def test_ambiguous_named_deployments_fall_back_to_the_default(self):
+        """Several named profiles and no request: any pick would be arbitrary."""
+        manifests = [
+            _FakeManifest("prod", "", port=9998),
+            _FakeManifest("staging", "", port=9999),
+        ]
+        assert resolve_probe_port(None, manifests) == DEFAULT_PROXY_PORT
 
 
 class TestDoctorCommand:
@@ -901,6 +1018,67 @@ class TestDoctorCommand:
         monkeypatch.setattr(doctor_mod, "probe_json", recording_probe)
         runner.invoke(main, ["doctor"], env={"HEADROOM_PORT": "9999"})
         assert "http://127.0.0.1:9999/livez" in seen
+
+    def test_deployment_port_probed_when_shell_has_no_override(self, runner, isolated, monkeypatch):
+        """`headroom deploy --port N` only sets HEADROOM_PORT inside the deployment."""
+        seen: list[str] = []
+
+        def recording_probe(url, timeout=2.0):
+            seen.append(url)
+            return None
+
+        monkeypatch.setattr(
+            doctor_mod,
+            "list_manifests",
+            lambda: [_FakeManifest("default", "http://127.0.0.1:8789/readyz", port=8789)],
+        )
+        monkeypatch.setattr(doctor_mod, "probe_json", recording_probe)
+        runner.invoke(main, ["doctor"])
+        assert "http://127.0.0.1:8789/livez" in seen
+        assert not any("127.0.0.1:8787" in url for url in seen)
+
+    def test_names_the_live_port_the_agents_are_configured_for(self, runner, isolated, monkeypatch):
+        """Headroom Desktop runs on 6767 and records no deployment manifest."""
+        monkeypatch.setenv("HEADROOM_PORT_DISCOVERY", "1")
+        (isolated / "settings.json").write_text(
+            json.dumps({"env": {"ANTHROPIC_BASE_URL": "http://127.0.0.1:6767"}}),
+            encoding="utf-8",
+        )
+
+        def desktop_probe(url, timeout=2.0):
+            return LIVEZ_OK if url == "http://127.0.0.1:6767/livez" else None
+
+        monkeypatch.setattr(doctor_mod, "probe_json", desktop_probe)
+        result = runner.invoke(main, ["doctor", "--json"])
+        proxy = next(c for c in json.loads(result.output)["checks"] if c["name"] == "proxy")
+        assert "a Headroom proxy IS running on port 6767" in proxy["summary"]
+
+    @pytest.mark.parametrize(
+        ("relative", "content"),
+        [
+            ("project-codex.toml", 'openai_base_url = "http://127.0.0.1:6767/v1"\n'),
+            (
+                ".claude/settings.local.json",
+                json.dumps({"env": {"ANTHROPIC_BASE_URL": "http://127.0.0.1:6767"}}),
+            ),
+        ],
+    )
+    def test_names_the_live_port_only_a_project_config_routes_to(
+        self, runner, isolated, monkeypatch, relative, content
+    ):
+        monkeypatch.setenv("HEADROOM_PORT_DISCOVERY", "1")
+        monkeypatch.chdir(isolated)
+        path = isolated / relative
+        path.parent.mkdir(exist_ok=True)
+        path.write_text(content, encoding="utf-8")
+
+        def desktop_probe(url, timeout=2.0):
+            return LIVEZ_OK if url == "http://127.0.0.1:6767/livez" else None
+
+        monkeypatch.setattr(doctor_mod, "probe_json", desktop_probe)
+        result = runner.invoke(main, ["doctor", "--json"])
+        proxy = next(c for c in json.loads(result.output)["checks"] if c["name"] == "proxy")
+        assert "a Headroom proxy IS running on port 6767" in proxy["summary"]
 
 
 class TestCostTrackerBudgetKeys:

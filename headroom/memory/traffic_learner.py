@@ -33,6 +33,8 @@ from enum import Enum
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, ClassVar
 
+from headroom.learn._shared import classify_error
+
 if TYPE_CHECKING:
     from headroom.learn.models import ProjectInfo
     from headroom.memory.backends.local import LocalBackend
@@ -61,6 +63,10 @@ _BASH_VOLATILE_SUFFIX_RE = re.compile(
     r"|\s+-A\s*\d+|\s+-B\s*\d+|\s+-C\s*\d+"
     r"|\s+2>&1|\s+2>/dev/null)+\s*$"
 )
+
+# Leading `cd <dir> && ` / `cd <dir>; ` prefixes. Agents prepend them to most
+# commands, so they carry no signal about which operation was retried.
+_BASH_LEADING_CD_RE = re.compile(r"""^\s*cd\s+(?:"[^"]*"|'[^']*'|(?:\\.|[^\s\\])+)\s*(?:&&|;)\s*""")
 
 # Agent harnesses can encode orchestration metadata as user-role messages.
 # These prefixes identify whole messages that are not authored by the user.
@@ -119,17 +125,6 @@ class PatternCategory(str, Enum):
     ENVIRONMENT = "environment"  # Working commands, paths, tool availability
     PREFERENCE = "preference"  # Repeated choices, corrections
     ARCHITECTURE = "architecture"  # File structure, dependencies, conventions
-
-
-class AgentType(str, Enum):
-    """Supported coding agent types."""
-
-    CLAUDE = "claude"
-    CURSOR = "cursor"
-    CODEX = "codex"
-    AIDER = "aider"
-    GEMINI = "gemini"
-    UNKNOWN = "unknown"
 
 
 # =============================================================================
@@ -194,7 +189,7 @@ def _normalize_bash_for_hash(cmd: str) -> str:
     if not cmd:
         return ""
     # Drop paging, line-context flags, and redirections that vary between runs.
-    trimmed = _BASH_VOLATILE_SUFFIX_RE.sub("", cmd).strip()
+    trimmed = _BASH_VOLATILE_SUFFIX_RE.sub("", _strip_leading_cd(cmd)).strip()
     # Cut at the first pipe or && so we hash the primary command, not the tail.
     for sep in (" | ", " && "):
         idx = trimmed.find(sep)
@@ -204,52 +199,80 @@ def _normalize_bash_for_hash(cmd: str) -> str:
     return trimmed
 
 
+def _strip_leading_cd(cmd: str) -> str:
+    """Remove leading `cd <dir> &&` / `cd <dir>;` segments from a Bash command."""
+    prev = None
+    while prev != cmd:
+        prev = cmd
+        cmd = _BASH_LEADING_CD_RE.sub("", cmd, count=1)
+    return cmd
+
+
 # =============================================================================
-# Error Classification (reused from learn/scanner.py patterns)
+# Error Detection
 # =============================================================================
 
-_ERROR_PATTERNS: list[tuple[re.Pattern[str], str]] = [
-    (
-        re.compile(r"No such file or directory|ENOENT|FileNotFoundError|does not exist", re.I),
-        "file_not_found",
-    ),
-    (re.compile(r"ModuleNotFoundError|ImportError|No module named", re.I), "module_not_found"),
-    (re.compile(r"command not found", re.I), "command_not_found"),
-    (re.compile(r"Permission denied|EACCES|EPERM|auto-denied", re.I), "permission_denied"),
-    (re.compile(r"file is too large|too many lines|exceeds.*limit", re.I), "file_too_large"),
-    (re.compile(r"SyntaxError|IndentationError", re.I), "syntax_error"),
-    (re.compile(r"Traceback \(most recent|Exception:|Error:", re.I), "runtime_error"),
-    (re.compile(r"timed? ?out|TimeoutError|deadline exceeded", re.I), "timeout"),
-    (re.compile(r"exit code|non-zero|exited with", re.I), "exit_code"),
-    (re.compile(r"BUILD FAILED|compilation error|compile error", re.I), "build_failure"),
-]
+# OpenAI-format tool results carry no is_error flag, so failures are sniffed
+# from the output. Categories come from headroom.learn._shared.classify_error;
+# these patterns only decide *whether* the output is an error.
+_ERROR_SIGNALS: tuple[re.Pattern[str], ...] = (
+    re.compile(r"No such file or directory|ENOENT|FileNotFoundError|does not exist", re.I),
+    re.compile(r"ModuleNotFoundError|ImportError|No module named", re.I),
+    re.compile(r"command not found", re.I),
+    re.compile(r"Permission denied|EACCES|EPERM|auto-denied", re.I),
+    re.compile(r"file is too large|too many lines|exceeds.*limit", re.I),
+    re.compile(r"SyntaxError|IndentationError", re.I),
+    re.compile(r"Traceback \(most recent|Exception:|Error:", re.I),
+    re.compile(r"timed? ?out|TimeoutError|deadline exceeded", re.I),
+    re.compile(r"BUILD FAILED|compilation error|compile error", re.I),
+)
+
+# Agent harnesses (Codex, Grok, opencode, ...) append "exit code 0" to every
+# SUCCESSFUL shell command, so an exit code only signals an error when it is
+# nonzero (signed codes such as -9 included). Status evidence belongs to its own
+# line: a zero code never hides a separate explicit failure elsewhere in the
+# output (a nonzero code, "non-zero", a signal kill, or an "exited with ..." line
+# that carries no code of its own). A line that ends at "exited with" continues
+# on the next line ("Process exited with\nexit code 0"), so it is not a failure.
+# A standalone "Killed" line is the shell's SIGKILL message, but a successful
+# command can also print that word, so it counts only when no exit status is
+# reported at all. It is recognized even below the short-content cut-off.
+_EXIT_STATUS_RE = re.compile(
+    r"\bexit(?:ed)?(?:\s+with)?(?:\s+exit)?\s+(?:code|status)\s*:?\s*([+-]?\d+)", re.I
+)
+_EXIT_FAILURE_RE = re.compile(r"non-zero|nonzero|exited with signal|killed by signal", re.I)
+_KILLED_LINE_RE = re.compile(r"^\s*Killed(?::\s*\d+)?\s*$", re.M)
+_EXITED_WITH_RE = re.compile(r"exited with(?=\s*\S)", re.I)
 
 
-def _classify_error(content: str) -> str | None:
-    """Classify error content. Returns category or None if not an error."""
-    snippet = content[:2000]
-    for pattern, category in _ERROR_PATTERNS:
-        if pattern.search(snippet):
-            return category
-    return None
+def _exit_status_is_error(snippet: str) -> bool:
+    codes = _EXIT_STATUS_RE.findall(snippet)
+    if any(int(code) != 0 for code in codes) or _EXIT_FAILURE_RE.search(snippet):
+        return True
+    if any(
+        _EXITED_WITH_RE.search(line) and not _EXIT_STATUS_RE.search(line)
+        for line in snippet.splitlines()
+    ):
+        return True
+    return not codes and bool(_KILLED_LINE_RE.search(snippet))
 
 
 def _is_error(content: str) -> bool:
     """Quick check if tool output looks like an error."""
-    if not content or len(content) < 10:
+    if not content:
         return False
-    return _classify_error(content) is not None
+    if len(content) < 10:
+        return bool(_KILLED_LINE_RE.fullmatch(content))
+    snippet = content[:2000]
+    if any(pattern.search(snippet) for pattern in _ERROR_SIGNALS):
+        return True
+    return _exit_status_is_error(snippet)
 
 
 # =============================================================================
 # Tool Call Extractors
 # =============================================================================
 
-# Extract command from Bash tool calls
-_COMMAND_RE = re.compile(r"^(?:source\s+\S+\s*&&\s*)?(.+)", re.I)
-
-# Extract file paths
-_FILE_PATH_RE = re.compile(r"(?:/[\w./-]+(?:\.\w+)?)")
 
 # Extract package/module names from errors
 _MODULE_RE = re.compile(r"No module named ['\"]?(\w[\w.]*)['\"]?")
@@ -297,6 +320,10 @@ def _paths_related_as_typo(failed: str, success: str) -> bool:
         return False
     if a == b:
         return True
+    # Basenames come from tool traffic; no real file name comes near this cap,
+    # so skip the quadratic edit distance rather than run it on an oversized one.
+    if max(len(a), len(b)) > _RETRY_EDIT_DISTANCE_MAX_CHARS:
+        return False
     threshold = max(2, max(len(a), len(b)) // 3)
     return _levenshtein(a, b) <= threshold
 
@@ -352,11 +379,19 @@ def _bash_binaries_match(a: str, b: str) -> bool:
     b_base = b.rsplit("/", 1)[-1]
     if a_base == b_base:
         return True
-    if (a_base.startswith(b_base) or b_base.startswith(a_base)) and _levenshtein(
-        a_base, b_base
+    # One name is a prefix of the other, so their edit distance is exactly the
+    # length difference: compare lengths instead of running _levenshtein (O(n*m))
+    # on an unbounded, traffic-derived token.
+    if (a_base.startswith(b_base) or b_base.startswith(a_base)) and abs(
+        len(a_base) - len(b_base)
     ) <= 2:
         return True
     return False
+
+
+# _levenshtein is O(n*m) pure Python and runs on the request path; longer
+# commands skip it and are judged by the linear token-overlap check below.
+_RETRY_EDIT_DISTANCE_MAX_CHARS = 512
 
 
 def _commands_related_as_retry(failed: str, success: str) -> bool:
@@ -372,6 +407,8 @@ def _commands_related_as_retry(failed: str, success: str) -> bool:
     arguments, and gets rejected. Genuine retries (extra flag, single
     arg edit) pass via the edit-distance path.
     """
+    failed = _strip_leading_cd(failed)
+    success = _strip_leading_cd(success)
     if not failed or not success or failed == success:
         return False
     bin_a = _bash_first_binary(failed)
@@ -380,7 +417,10 @@ def _commands_related_as_retry(failed: str, success: str) -> bool:
         return False
 
     max_len = max(len(failed), len(success))
-    if max_len > 0 and _levenshtein(failed, success) / max_len <= 0.40:
+    if (
+        0 < max_len <= _RETRY_EDIT_DISTANCE_MAX_CHARS
+        and _levenshtein(failed, success) / max_len <= 0.40
+    ):
         return True
 
     def _substantive(cmd: str, binary: str) -> set[str]:
@@ -525,6 +565,10 @@ class TrafficLearner:
         # Hydrate persisted dedup state before workers spin up so cross-session
         # re-sightings bump existing rows instead of creating duplicates.
         await self._hydrate_persisted_state()
+        # Rehydrate sub-threshold evidence from the previous process. Without
+        # this every restart zeroed pending counts, so users with short or
+        # restart-heavy sessions could never cross min_evidence.
+        await self._load_pending_state()
         if self._save_task is None or self._save_task.done():
             self._save_task = asyncio.create_task(self._save_worker())
         if self._flush_task is None or self._flush_task.done():
@@ -569,6 +613,9 @@ class TrafficLearner:
             except Exception:
                 break
 
+        # Snapshot sub-threshold evidence so it survives the restart.
+        await self._save_pending_state()
+
         # Final flush on shutdown — bypass debounce.
         await self.flush_to_file()
 
@@ -586,6 +633,9 @@ class TrafficLearner:
                 self._flush_dirty = False
                 self._last_flush_at = time.monotonic()
                 await self.flush_to_file()
+                # Same debounce cycle also snapshots pending evidence, so a
+                # crash (vs clean stop) loses at most one debounce window.
+                await self._save_pending_state()
             except asyncio.CancelledError:
                 break
             except Exception as e:
@@ -733,14 +783,6 @@ class TrafficLearner:
 
         return list(by_hash.values())
 
-    def get_learned_patterns(self) -> list[ExtractedPattern]:
-        """Return patterns from the in-memory accumulator.
-
-        Retained for backwards compatibility. Reads only the accumulator;
-        does not consult persisted rows. Use flush_to_file() for full data.
-        """
-        return [pattern for pattern, count in self._pattern_counts.values() if count >= 1]
-
     async def on_tool_result(
         self,
         tool_name: str,
@@ -768,7 +810,7 @@ class TrafficLearner:
             "input": tool_input,
             "output": tool_output[:2000],  # Cap for memory
             "is_error": is_error,
-            "error_category": _classify_error(tool_output) if is_error else None,
+            "error_category": classify_error(tool_output).value if is_error else None,
             "timestamp": time.time(),
             "agent_type": agent_type,
         }
@@ -831,6 +873,7 @@ class TrafficLearner:
             "patterns_extracted": self._patterns_extracted,
             "patterns_saved": self._patterns_saved,
             "pending_patterns": len(self._pattern_counts),
+            "min_evidence": self._min_evidence,
             "history_size": len(self._tool_history),
         }
 
@@ -1346,7 +1389,8 @@ class TrafficLearner:
             uri = f"file:{db_path}?mode=ro"
             try:
                 conn = sqlite3.connect(uri, uri=True)
-            except sqlite3.OperationalError:
+            except sqlite3.OperationalError as e:
+                logger.warning("Traffic learner hydrate: failed to open %s: %s", db_path, e)
                 return []
             try:
                 rows = conn.execute(
@@ -1362,13 +1406,14 @@ class TrafficLearner:
                     "LIMIT ?",
                     (self._dedup_window,),
                 ).fetchall()
-            except sqlite3.DatabaseError:
+            except sqlite3.DatabaseError as e:
+                logger.warning("Traffic learner hydrate: failed to read %s: %s", db_path, e)
                 return []
             finally:
                 try:
                     conn.close()
-                except Exception:
-                    pass
+                except sqlite3.Error as e:
+                    logger.debug("Traffic learner hydrate: closing %s failed: %s", db_path, e)
             return [(row[0], row[1] or "", row[2] or "{}") for row in rows]
 
         try:
@@ -1400,6 +1445,82 @@ class TrafficLearner:
             # last-wins — we only need one id to target the bump.
             self._persisted_ids[h] = memory_id
 
+    def _pending_state_path(self) -> Path | None:
+        """Sidecar JSON next to memory.db holding sub-threshold evidence."""
+        db_path = _resolve_backend_db_path(self._backend)
+        if db_path is None:
+            return None
+        return db_path.with_name("pending_patterns.json")
+
+    async def _save_pending_state(self) -> None:
+        """Snapshot the pending accumulator so evidence survives restarts.
+
+        Best-effort: failures are logged at debug and never propagate — the
+        accumulator degrades gracefully back to per-process behavior.
+        """
+        path = self._pending_state_path()
+        if path is None:
+            return
+        entries = [
+            {
+                "category": pattern.category.value,
+                "content": pattern.content,
+                "importance": pattern.importance,
+                "count": count,
+                "entity_refs": pattern.entity_refs,
+                "metadata": pattern.metadata,
+                "content_hash": h,
+            }
+            for h, (pattern, count) in self._pattern_counts.items()
+        ]
+
+        def _write() -> None:
+            # tmp + rename so a crash mid-write can't truncate the file.
+            tmp = path.with_name(path.name + ".tmp")
+            tmp.write_text(json.dumps({"version": 1, "patterns": entries}))
+            os.replace(tmp, path)
+
+        try:
+            await asyncio.to_thread(_write)
+        except Exception as e:
+            logger.debug("Traffic learner pending-state save failed: %s", e)
+
+    async def _load_pending_state(self) -> None:
+        """Rehydrate sub-threshold evidence saved by a previous process.
+
+        Runs after _hydrate_persisted_state so entries whose pattern crossed
+        the threshold in the meantime (hash now in _saved_hashes) are skipped;
+        their re-sightings bump the persisted row instead. Unreadable or
+        malformed files are ignored — the next snapshot overwrites them.
+        """
+        path = self._pending_state_path()
+        if path is None or not path.exists():
+            return
+        try:
+            data = json.loads(await asyncio.to_thread(path.read_text))
+        except Exception as e:
+            logger.debug("Traffic learner pending-state load failed: %s", e)
+            return
+        entries = data.get("patterns") if isinstance(data, dict) else None
+        if not isinstance(entries, list):
+            return
+        for entry in entries[: self._max_pending_patterns]:
+            try:
+                h = entry["content_hash"]
+                if not h or h in self._saved_hashes or h in self._pattern_counts:
+                    continue
+                pattern = ExtractedPattern(
+                    category=PatternCategory(entry["category"]),
+                    content=entry["content"],
+                    importance=float(entry.get("importance", 0.5)),
+                    entity_refs=list(entry.get("entity_refs", [])),
+                    metadata=dict(entry.get("metadata", {})),
+                    content_hash=h,
+                )
+                self._pattern_counts[h] = (pattern, max(1, int(entry.get("count", 1))))
+            except Exception:
+                continue
+
     async def _bump_persisted_evidence(self, memory_id: str) -> None:
         """Atomically increment a persisted row's metadata.evidence_count."""
         db_path = _resolve_backend_db_path(self._backend)
@@ -1409,7 +1530,9 @@ class TrafficLearner:
         now_iso = datetime.now(timezone.utc).isoformat()
 
         def _bump() -> bool:
-            conn = sqlite3.connect(str(db_path))
+            from ..fileperms import connect_private_sqlite
+
+            conn = connect_private_sqlite(db_path, what="memory store")
             try:
                 cursor = conn.execute(
                     "UPDATE memories SET metadata = json_set("
@@ -1627,12 +1750,17 @@ def _project_for_pattern(pattern: ExtractedPattern, roots: list[ProjectInfo]) ->
     if not candidates:
         return None
 
+    # A path inside a worktree folded into a project belongs to that project.
     # Longest root first — most specific wins
-    roots_sorted = sorted(roots, key=lambda p: len(str(p.project_path)), reverse=True)
+    roots_sorted = sorted(
+        ((path, root) for root in roots for path in (root.project_path, *root.worktree_paths)),
+        key=lambda item: len(str(item[0])),
+        reverse=True,
+    )
 
     for cand in candidates:
-        for root in roots_sorted:
-            root_str = str(root.project_path).rstrip("/\\")
+        for path, root in roots_sorted:
+            root_str = str(path).rstrip("/\\")
             if not root_str:
                 continue
             if (
@@ -1670,7 +1798,8 @@ def _load_persisted_patterns_from_sqlite(db_path: Path) -> list[ExtractedPattern
     patterns: dict[str, ExtractedPattern] = {}
     try:
         conn = sqlite3.connect(uri, uri=True)
-    except sqlite3.OperationalError:
+    except sqlite3.OperationalError as e:
+        logger.warning("Traffic learner: failed to open persisted patterns %s: %s", db_path, e)
         return []
     try:
         conn.row_factory = sqlite3.Row
@@ -1679,14 +1808,14 @@ def _load_persisted_patterns_from_sqlite(db_path: Path) -> list[ExtractedPattern
             "FROM memories "
             "WHERE json_extract(metadata, '$.source') = 'traffic_learner'"
         ).fetchall()
-    except sqlite3.DatabaseError:
-        conn.close()
+    except sqlite3.DatabaseError as e:
+        logger.warning("Traffic learner: failed to read persisted patterns %s: %s", db_path, e)
         return []
     finally:
         try:
             conn.close()
-        except Exception:
-            pass
+        except sqlite3.Error as e:
+            logger.debug("Traffic learner: closing persisted patterns %s failed: %s", db_path, e)
 
     for row in rows:
         content = row["content"] or ""
@@ -1767,6 +1896,14 @@ def _patterns_to_recommendations(patterns: list[ExtractedPattern]) -> list:
     """
     from headroom.learn.models import Recommendation, RecommendationTarget
 
+    # Authoritative lifecycle signal for the item-level merge in the writer:
+    # every pattern the learner still holds for this project, captured before
+    # any per-category ranking or capping so that an item omitted from a
+    # rendered section is not mistaken for an expired one. `_collect_all_patterns`
+    # already dropped rows that no longer exist in memory.db, so an id missing
+    # here means the pattern is gone, not merely unrendered.
+    active_item_ids = frozenset(p.content_hash for p in patterns if p.content_hash)
+
     by_category: dict[PatternCategory, list[ExtractedPattern]] = {}
     for p in patterns:
         by_category.setdefault(p.category, []).append(p)
@@ -1788,7 +1925,15 @@ def _patterns_to_recommendations(patterns: list[ExtractedPattern]) -> list:
             items.sort(key=lambda p: p.evidence_count, reverse=True)
         if not items:
             continue
-        bullets = "\n".join(f"- {p.content}" for p in items)
+        preserve_prior_items = category is not PatternCategory.ERROR_RECOVERY
+        bullets = "\n".join(
+            (
+                f"- {p.content} <!-- headroom:pattern-id:{p.content_hash} -->"
+                if preserve_prior_items
+                else f"- {p.content}"
+            )
+            for p in items
+        )
         recs.append(
             Recommendation(
                 target=target,
@@ -1796,6 +1941,12 @@ def _patterns_to_recommendations(patterns: list[ExtractedPattern]) -> list:
                 content=bullets,
                 confidence=max((p.importance for p in items), default=0.5),
                 evidence_count=sum(p.evidence_count for p in items),
+                preserve_prior_items=preserve_prior_items,
+                # error_recovery is rebuilt from scratch on every render and
+                # `_refine_error_recovery` deliberately drops rows, so the
+                # pre-refine set above is not its lifecycle signal; it must
+                # stay unset while that section replaces rather than merges.
+                active_item_ids=active_item_ids if preserve_prior_items else None,
             )
         )
     return recs
