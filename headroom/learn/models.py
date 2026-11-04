@@ -134,6 +134,10 @@ class ProjectInfo:
     data_path: Path  # Where conversation logs are stored
     context_file: Path | None = None  # CLAUDE.md / .cursorrules / AGENTS.md
     memory_file: Path | None = None  # MEMORY.md or equivalent
+    # Linked git worktrees folded into this project: their checkouts, and the
+    # extra folders their conversation logs are stored in.
+    worktree_paths: list[Path] = field(default_factory=list)
+    extra_data_paths: list[Path] = field(default_factory=list)
 
 
 # =============================================================================
