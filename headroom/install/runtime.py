@@ -160,6 +160,18 @@ def build_runtime_command(manifest: DeploymentManifest) -> list[str]:
         container_home,
         "--env",
         f"HOME={container_home}",
+        # Docker creates the parent of every bind mount as root:root when it is
+        # absent from the image, so $HOME itself is NOT writable by the
+        # --user <host-uid> process (issue #4207). Anything that writes under
+        # $HOME outside the mounts then fails, which is what breaks the
+        # HuggingFace download of the Kompress model. Point the HuggingFace and
+        # XDG caches at the bind-mounted workspace instead: that directory
+        # belongs to the host user the container runs as, so it is writable,
+        # and it survives `docker rm` of the container.
+        "--env",
+        f"HF_HOME={container_home}/.headroom/cache/huggingface",
+        "--env",
+        f"XDG_CACHE_HOME={container_home}/.headroom/cache",
         "--env",
         "PYTHONUNBUFFERED=1",
         # Canonical Headroom filesystem contract (issue #175).
