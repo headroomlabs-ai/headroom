@@ -207,12 +207,14 @@ Compression is lossless via CCR (Compress-Cache-Retrieve): originals are stored 
 | `pythonPath` | auto-detected | Optional Python executable override for Python fallback launcher. |
 | `autoStart` | `false` | Opt-in auto-start for a local `headroom proxy` if not already running (local URLs only; ignored for remote proxies). Keep `false` when systemd owns the proxy. |
 | `startupTimeoutMs` | `20000` | Time to wait for auto-started proxy to become healthy |
-| `requestTimeoutMs` | `30000` | Maximum milliseconds to wait for a single `compress()` call. If the proxy hangs or is slow, the call is cancelled after this deadline and the original uncompressed messages are used as a fallback. |
+| `requestTimeoutMs` | `2000` | Maximum milliseconds to wait for a single `compress()` call. The SDK aborts the request at this deadline and the original messages are used as a fallback. |
+| `minContextChars` | `800` | Skip proxy compression below this approximate 200-token context floor. Large single tool results still qualify; set to `0` to disable the gate. |
 | `circuitBreakerThreshold` | `3` | Number of consecutive `assemble()` errors before the circuit breaker opens and all requests bypass the proxy. Prevents cascading failures when the proxy is unhealthy. |
 | `circuitBreakerCooldownMs` | `60000` | How long (ms) the circuit breaker stays open after the threshold is reached. After the cool-down the breaker resets automatically and the next request re-probes the proxy via `/health`. |
 | `routeCodexViaProxy` | `true` | Rewrite OpenClaw's built-in `openai-codex` provider to use the active Headroom proxy in memory so upstream Codex requests pass through Headroom. |
 | `gatewayProviderIds` | `[]` | Optional explicit list of OpenClaw provider ids to route through the active Headroom proxy in memory. Friendly aliases `codex`, `claude`, `copilot`, and `gemini` are also accepted. When set, this overrides the default `openai-codex` routing list. |
 | `announceCompression` | `true` | Adds a static, cache-stable notice to the system prompt the first time a session compresses more than 100 tokens, then keeps it unchanged for the rest of the session. Set to `false` to guarantee Headroom never modifies the system prompt. |
+| `commitLogPath` | `$HEADROOM_WORKSPACE_DIR/openclaw/commit-log.json`, else `~/.headroom/openclaw/commit-log.json` | Where the plugin records each turn OpenClaw has accepted (one small marker file per turn, in a sibling `commit-log.d/` directory), so a retried commit is answered as a duplicate even after a restart. Must be on a writable filesystem: on a read-only root (common in Kubernetes), point this or `HEADROOM_WORKSPACE_DIR` at a writable volume. While commits fail, OpenClaw 2026.9.9+ runs each later turn of the session on its legacy context path. |
 
 ## Comparison with lossless-claw
 
