@@ -1,10 +1,8 @@
 """``MemoryQuery``: multi-source, full-fidelity retrieval query.
 
-Pre-this-PR, the retrieval query was "latest user message, truncated
-to 500 chars" (memory_handler.py:807). The truncation was a real bug
-— none of Letta / Mem0 / Cognee / Supermemory truncate the embedding
-input. Tool outputs are often the strongest retrieval signal in
-coding sessions, and they were ignored entirely.
+Raw user messages and recent tool/assistant turns are retained for retrieval
+strategies that need their full content. Time-limited proxy lookups can render
+a separate bounded embedding input without mutating those sources.
 
 This value type captures the query at full fidelity from three
 sources:
@@ -13,10 +11,8 @@ sources:
   * ``recent_tool_outputs`` — last N tool results
   * ``recent_assistant_turns`` — last K assistant turns for intent
 
-The embedding model handles its own context window (MiniLM 512 tok;
-BGE-small 8K tok). Long inputs that exceed the model window become
-the model's problem to mean-pool or chunk — they don't get
-truncated upstream.
+The default embedding representation preserves the full sources. A caller can
+request a character budget when embedding latency must fit a request deadline.
 """
 
 from __future__ import annotations
@@ -34,11 +30,9 @@ from .memory_query_policy import (
 class MemoryQuery:
     """Frozen multi-source query for memory retrieval.
 
-    All fields preserve full input fidelity — no truncation, no
-    summarization. The caller assembles the sources; this type only
-    holds them. The retrieval backend decides how to embed
-    (mean-pool, chunk, model-side truncation, etc.) but cannot lose
-    information before it sees the data.
+    Raw fields preserve full input fidelity. Budgeted embedding rendering
+    produces a derived query without changing those fields; backends that
+    chunk or mean-pool full inputs can still use the original sources.
 
     Tuples for the recent-* fields so the dataclass stays hashable
     (frozen + value-equal).
@@ -49,18 +43,20 @@ class MemoryQuery:
     recent_assistant_turns: tuple[str, ...]
     conversation_id: str | None
 
-    def to_embedding_input(self) -> str:
-        """Concatenate sources into a delimited embedding input.
+    def to_embedding_input(self, *, max_chars: int | None = None) -> str:
+        """Render delimited embedding input, optionally within a character budget.
 
-        Order: prior assistant turns (oldest first) → tool outputs
-        (oldest first) → latest user text. User text last because the
-        embedder's positional weighting often emphasizes the tail of
-        the input.
+        By default, context is chronological and user text comes last.
+        With a character budget, user text comes first and recent context is
+        selected newest-first, then rendered chronologically so a tokenizer
+        can retain its newest tail. Proxy lookups separately reserve space
+        for both sources inside the active local model's token window.
         """
         return render_embedding_input(
             user_text=self.user_text,
             recent_tool_outputs=self.recent_tool_outputs,
             recent_assistant_turns=self.recent_assistant_turns,
+            max_chars=max_chars,
         )
 
     @classmethod
