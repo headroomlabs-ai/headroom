@@ -1047,6 +1047,7 @@ class AnthropicHandlerMixin:
 
         from fastapi import HTTPException
         from fastapi.responses import JSONResponse, Response, StreamingResponse
+        from starlette.requests import ClientDisconnect
 
         from headroom.cache.compression_store import get_compression_store
         from headroom.ccr import CCRToolInjector
@@ -1218,6 +1219,16 @@ class AnthropicHandlerMixin:
             try:
                 async with stage_timer.measure("read_request_json"):
                     body, original_body_bytes = await read_request_json_with_bytes(request)
+            except ClientDisconnect:
+                # The client (e.g. an interrupted/compacting Claude Code
+                # session) went away mid-read. There is no one left to answer
+                # and nothing to compress — bail out quietly instead of
+                # letting Starlette's own ClientDisconnect propagate up as an
+                # unhandled 500. Mirrors the existing guard on the batch
+                # passthrough path a few hundred lines below.
+                logger.debug("Client disconnected during body read for anthropic messages")
+                await _finalize_pre_upstream()
+                return Response(status_code=204)
             except (json.JSONDecodeError, ValueError) as e:
                 return JSONResponse(
                     status_code=400,
@@ -1240,7 +1251,13 @@ class AnthropicHandlerMixin:
                 sanitize_anthropic_model_id(raw_model) if isinstance(raw_model, str) else raw_model
             )
             body_model = body.get("model")
-            if isinstance(body_model, str) and model != body_model:
+            # Only inject model for LiteLLM-backed requests: native Vertex passthrough
+            # preserves the rawPredict wire format, where the model only exists in the URL.
+            if (isinstance(body_model, str) and model != body_model) or (
+                body_model is None
+                and model_override is not None
+                and self.anthropic_backend is not None
+            ):
                 body["model"] = model
                 body_mutation_tracker.mark_mutated("sanitize_model_id")
             messages = body.get("messages", [])

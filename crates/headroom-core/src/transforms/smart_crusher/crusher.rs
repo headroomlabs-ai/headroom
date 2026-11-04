@@ -372,14 +372,13 @@ impl SmartCrusher {
     ///
     /// Parses `content` as JSON, recursively processes it (compressing
     /// arrays at every depth via the appropriate per-type crusher),
-    /// then re-serializes with Python-compatible formatting (`, ` and
-    /// `: ` separators, ASCII-escaped non-ASCII).
+    /// then returns original bytes for unchanged values. Transformed
+    /// values use compact JSON, unescaped Unicode, and insertion order.
     ///
     /// Returns a `CrushResult` with:
-    /// - `compressed`: the re-serialized JSON.
+    /// - `compressed`: transformed JSON, or original bytes on passthrough.
     /// - `original`: the input string (unmodified).
-    /// - `was_modified`: whether `compressed` differs from `content`'s
-    ///   trimmed form.
+    /// - `was_modified`: whether processing changed the parsed JSON value.
     /// - `strategy`: combined strategy info from all crushed arrays
     ///   (or `"passthrough"`).
     pub fn crush(&self, content: &str, query: &str, bias: f64) -> CrushResult {
@@ -418,9 +417,9 @@ impl SmartCrusher {
         }
     }
 
-    /// `SmartCrusher._smart_crush_content` (Python line 2243-2301).
-    /// JSON-parse, recursively process, re-serialize. CCR marker
-    /// injection is stubbed (CCR is disabled in this stage).
+    /// Apply recursive JSON transforms without rewriting unchanged values.
+    /// Actual transformations use compact JSON; unchanged values retain
+    /// the original bytes, including whitespace and escapes.
     ///
     /// Returns `(crushed_content, was_modified, info)`.
     pub fn smart_crush_content(
@@ -446,46 +445,12 @@ impl SmartCrusher {
         let (crushed, info) =
             self.process_value_with_hook(&parsed, 0, query_context, bias, prose_hook);
 
-        // When a document and its descendants were left structurally
-        // unchanged, keep the original bytes. Re-serializing would rewrite
-        // Unicode escapes and numeric lexical forms, then advertise a false
-        // compression. Spaced JSON without a nested strategy is
-        // compact-serialized for historical crush() / parity fixtures.
+        // An unchanged value is passthrough, regardless of container type
+        // or whitespace. Preserve its bytes, escapes, and numeric forms
+        // instead of advertising re-serialization as compression. Keep
+        // diagnostic strategy information for decisions that made no edit.
         if crushed == parsed {
-            // Without `arbitrary-precision`, `Value` cannot represent a
-            // JSON number outside serde_json's native `i64`/`u64`/`f64`
-            // range: the parse already rounded it, so serializing here
-            // would both corrupt the data and (because the bytes moved)
-            // advertise a modification that never happened. The document
-            // is structurally untouched (`info` may still describe an
-            // attempted strategy, but no bytes changed), so strip
-            // insignificant whitespace lexically and keep every numeric
-            // token verbatim. This mirrors `JsonMinifier`'s feature-off
-            // strategy.
-            //
-            // Modified documents fall through to the `Value`
-            // re-serialization below; in this configuration their
-            // out-of-range numbers are NOT preserved (an inherent
-            // serde_json property — see `smart_crusher` module docs).
-            #[cfg(not(feature = "arbitrary-precision"))]
-            {
-                let minified =
-                    crate::transforms::pipeline::reformats::json_minifier::minify_lossless(
-                        content.trim(),
-                    );
-                if minified.len() >= content.len() {
-                    return (content.to_string(), false, info);
-                }
-                let was_modified = minified != content.trim();
-                return (minified, was_modified, info);
-            }
-            #[cfg(feature = "arbitrary-precision")]
-            if info.is_empty()
-                && matches!(parsed, Value::Object(_))
-                && !has_json_insignificant_whitespace(content)
-            {
-                return (content.to_string(), false, String::new());
-            }
+            return (content.to_string(), false, info);
         }
 
         // Re-serialize with Python `safe_json_dumps` formatting:
@@ -1322,41 +1287,6 @@ fn hash_canonical(canonical: &str) -> String {
 // here because `process_string`'s `string_ccr:<kind>` strategy-info
 // label is local to this module's debug-string convention.
 
-/// True when `s` has JSON whitespace outside of string literals
-/// (spaces after `:` / `,`, pretty-print newlines, etc.). Used to
-/// keep compact unchanged objects on the original-bytes path while
-/// still compact-serializing spaced inputs for historical crush()
-/// output.
-///
-/// Only the `arbitrary-precision` branch consults this: without the
-/// feature the untouched-document path strips whitespace lexically
-/// (preserving numeric tokens) instead of deciding via `Value`.
-#[cfg(feature = "arbitrary-precision")]
-fn has_json_insignificant_whitespace(s: &str) -> bool {
-    let mut in_string = false;
-    let mut escape = false;
-    for ch in s.trim().chars() {
-        if in_string {
-            if escape {
-                escape = false;
-            } else if ch == '\\' {
-                escape = true;
-            } else if ch == '"' {
-                in_string = false;
-            }
-            continue;
-        }
-        if ch == '"' {
-            in_string = true;
-            continue;
-        }
-        if ch.is_whitespace() {
-            return true;
-        }
-    }
-    false
-}
-
 fn opaque_kind_label(kind: &super::compaction::OpaqueKind) -> &str {
     use super::compaction::OpaqueKind;
     match kind {
@@ -2036,36 +1966,45 @@ mod tests {
     }
 
     #[test]
-    fn crush_unchanged_object_keeps_original_bytes() {
+    fn crush_unchanged_values_preserve_original_bytes() {
         let c = crusher();
-        // Compact input: escaped Unicode and numeric lexical forms must
-        // survive the passthrough branch rather than being reserialized
-        // (`\u00e9` → `é`, `1.0` → `1`).
-        let compact = r#"{"cafe":"caf\u00e9","n":1.0,"ok":true}"#;
-        let result = c.crush(compact, "", 1.0);
-        assert_eq!(result.compressed, compact);
-        assert!(!result.was_modified);
-        assert_eq!(result.strategy, "passthrough");
-        assert!(
-            !result.compressed.contains("<<ccr:"),
-            "unchanged object must not invent a CCR marker"
-        );
+        let cases = [
+            r#"{"cafe":"caf\u00e9","n":1.0,"ok":true}"#,
+            r#"{ "cafe": "caf\u00e9", "n": 1.0, "ok": true }"#,
+            " \n{\n \"cafe\": \"caf\\u00e9\", \"n\": 1.0\n}\n\t",
+            r#"[ "\u0061", 1.0, { "ok": true } ]"#,
+            " \t\"caf\\u00e9\"\r\n ",
+            " \n1.0e+03\t ",
+            " \tnull\r\n ",
+        ];
+        for input in cases {
+            let result = c.crush(input, "", 1.0);
+            assert_eq!(
+                result.compressed, input,
+                "passthrough must preserve the original representation"
+            );
+            assert!(!result.was_modified);
+            assert_eq!(result.strategy, "passthrough");
+            assert!(
+                !result.compressed.contains("<<ccr:"),
+                "unchanged values must not invent CCR retrieval markers"
+            );
+        }
+    }
 
-        // Spaced / pretty-printed unchanged objects still compact-serialize
-        // (historical crush() output, required by parity fixtures) but
-        // must not advertise a key-drop strategy or invent a CCR hash.
-        let spaced = "{ \"cafe\": \"caf\\u00e9\", \"n\": 1.0, \"ok\": true }";
-        let spaced_result = c.crush(spaced, "", 1.0);
-        assert_eq!(spaced_result.strategy, "passthrough");
-        assert!(
-            !spaced_result.strategy.contains("adaptive"),
-            "must not report a key-drop strategy: {}",
-            spaced_result.strategy
-        );
-        assert!(!spaced_result.compressed.contains("<<ccr:"));
-        let parsed: Value = serde_json::from_str(&spaced_result.compressed).unwrap();
-        assert_eq!(parsed["cafe"], "café");
-        assert_eq!(parsed["ok"], true);
+    #[test]
+    fn crush_unchanged_analyzed_values_do_not_report_compression() {
+        let c = SmartCrusher::without_compaction(SmartCrusherConfig::default());
+        let rows: Vec<Value> = (0..15)
+            .map(|i| json!({"i": i, "kind": "deep", "v": format!("x{i}")}))
+            .collect();
+        let nested = serde_json::to_string_pretty(&json!({"a": {"b": {"events": rows}}}))
+            .expect("valid nested JSON");
+        for input in ["[null, true, false, null, true, false, null]", &nested] {
+            let result = c.crush(input, "", 1.0);
+            assert_eq!(result.compressed, input);
+            assert!(!result.was_modified);
+        }
     }
 
     #[test]
@@ -2803,98 +2742,5 @@ mod tests {
         let parsed: Value =
             serde_json::from_str(&result.compressed).expect("lossless_only output is JSON");
         assert_eq!(parsed, doc, "lossless_only output must decode to the input");
-    }
-
-    // ── Numeric precision with the `arbitrary-precision` feature off ──
-    //
-    // `serde_json::Value` stores numbers as i64/u64/f64 unless
-    // `arbitrary-precision` is enabled, so in a `--no-default-features`
-    // build any JSON number outside those ranges is already rounded by
-    // `from_str`. The crate's feature docs describe the opt-out; these
-    // tests pin what `SmartCrusher` does in that configuration.
-
-    /// Documents the crusher leaves untouched keep their original numeric
-    /// tokens: the untouched path strips whitespace lexically instead of
-    /// round-tripping through `Value`, so `18446744073709551617` survives
-    /// and no false "compression" is advertised.
-    #[cfg(not(feature = "arbitrary-precision"))]
-    #[test]
-    fn unchanged_documents_keep_numeric_tokens_without_arbitrary_precision() {
-        let c = crusher();
-
-        // Compact object: byte-identical passthrough.
-        let compact = r#"{"id":18446744073709551617}"#;
-        let r = c.crush(compact, "", 1.0);
-        assert_eq!(r.compressed, compact);
-        assert!(!r.was_modified);
-
-        // Spaced object: only insignificant whitespace is removed.
-        let spaced = r#"{ "id": 18446744073709551617, "f": 1.0, "e": 1e2 }"#;
-        let r = c.crush(spaced, "", 1.0);
-        assert_eq!(
-            r.compressed,
-            r#"{"id":18446744073709551617,"f":1.0,"e":1e2}"#
-        );
-        assert!(r.was_modified, "whitespace compaction is a modification");
-        assert_eq!(r.strategy, "passthrough");
-
-        // Top-level array and scalar are untouched too (they used to be
-        // re-serialized through `Value` unconditionally).
-        let array = r#"[18446744073709551617,1]"#;
-        let r = c.crush(array, "", 1.0);
-        assert_eq!(r.compressed, array);
-        assert!(!r.was_modified);
-
-        let scalar = "18446744073709551617";
-        let r = c.crush(scalar, "", 1.0);
-        assert_eq!(r.compressed, scalar);
-        assert!(!r.was_modified);
-    }
-
-    /// Documented feature-off limitation: once any descendant changes, the
-    /// whole document is re-serialized from `Value`, and the big integer
-    /// was already rounded to `f64` by `from_str`. Pinned so a future
-    /// RawValue fix is a deliberate, test-visible change.
-    #[cfg(not(feature = "arbitrary-precision"))]
-    #[test]
-    fn modified_documents_round_through_value_without_arbitrary_precision() {
-        let input = format!(
-            r#"{{"a":1,"data":[{}],"id":18446744073709551617}}"#,
-            vec![r#"{"s":"ok"}"#; 30].join(",")
-        );
-        let r = crusher().crush(&input, "", 1.0);
-        assert!(
-            r.strategy.starts_with("lossless:table"),
-            "expected the lossless table path, got {}",
-            r.strategy
-        );
-        assert!(
-            r.compressed.contains("1.8446744073709552e+19"),
-            "feature-off modified output re-serializes through f64 \
-             (documented opt-out semantics); got {}",
-            r.compressed
-        );
-        assert!(
-            !r.compressed.contains("18446744073709551617"),
-            "feature-off modified output is not precision-preserving: {}",
-            r.compressed
-        );
-    }
-
-    /// Contrast case: with the default-on feature, the same modified
-    /// document keeps the literal numeric token.
-    #[cfg(feature = "arbitrary-precision")]
-    #[test]
-    fn modified_documents_keep_numeric_tokens_with_arbitrary_precision() {
-        let input = format!(
-            r#"{{"a":1,"data":[{}],"id":18446744073709551617}}"#,
-            vec![r#"{"s":"ok"}"#; 30].join(",")
-        );
-        let r = crusher().crush(&input, "", 1.0);
-        assert!(
-            r.compressed.contains("18446744073709551617"),
-            "arbitrary-precision must preserve the literal token; got {}",
-            r.compressed
-        );
     }
 }

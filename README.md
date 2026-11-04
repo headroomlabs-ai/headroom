@@ -131,6 +131,12 @@ Headroom. For Claude Code, Serena is registered for the wrapped project only
 `--code-memory-scope user` to make it available in every project, or
 `--code-memory none` to skip it. `headroom unwrap` removes either registration.
 
+`headroom wrap ...` is session-scoped: its proxy exits with the wrapped agent.
+For a proxy that survives reboots, use the turnkey `headroom deploy` command.
+Use `headroom install apply` when you need to choose a specific persistent
+service, scheduled task, Docker runtime, scope, or provider target; see the
+[persistent installs guide](https://docs.headroomlabs.ai/docs/persistent-installs).
+
 The `headroom` CLI ships only in the PyPI package. The npm `headroom-ai` package
 is the TypeScript SDK — a library you import
 (`import { compress } from 'headroom-ai'`) — and provides no `headroom` command.
@@ -249,7 +255,7 @@ Saved** card then reads `measured` rather than `estimated`, with the band.
 | Goose | ✅ | starts proxy + launches |
 | OpenHands | ✅ | starts proxy + launches |
 | Mistral Vibe | ✅ | starts proxy + launches |
-| Oh My Pi | ✅ | injects config · starts proxy + launches |
+| Oh My Pi | ✅ | Anthropic + OpenAI/Codex · injects config · starts proxy + launches |
 | Cortex Code | Library only | 60–65% savings in library mode; no `wrap` |
 | Kimi CLI | ✅ | OAuth bearer forwarded — log in once |
 | ZCode | ✅ | starts the proxy and prints base URLs for ZCode settings |

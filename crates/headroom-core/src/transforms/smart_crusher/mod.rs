@@ -47,13 +47,15 @@
 //! `arbitrary-precision` feature (`default-features = false` turns it off).
 //! In a feature-off build:
 //!
-//! * Documents the crusher leaves **unchanged** keep their original bytes:
-//!   whitespace is stripped lexically and numeric tokens are never
-//!   re-serialized (mirrors [`JsonMinifier`](crate::transforms::pipeline::reformats::json_minifier)).
-//! * Documents it **modifies** are re-serialized from `Value`, so
-//!   out-of-range numbers are not preserved. The same applies to rendered
-//!   table/CSV compaction and to CCR-store payloads, which are serialized
-//!   from the parsed tree (retrieval therefore returns the rounded value).
+//! * Documents the crusher leaves **unchanged** are returned with their
+//!   original bytes (independent of this feature; see the passthrough path in
+//!   `crusher::SmartCrusher::smart_crush_content`), so numeric tokens survive.
+//! * Documents it **modifies** are re-serialized from `Value`, so out-of-range
+//!   numbers are not preserved. The same applies to rendered table/CSV
+//!   compaction and to CCR-store payloads, which are serialized from the
+//!   parsed tree (retrieval therefore returns the rounded value). Untouched
+//!   stringified-JSON cells are an exception: `compaction::walker` keeps their
+//!   original bytes.
 //! * Byte-for-byte parity with the Python implementation is only guaranteed
 //!   with the feature enabled.
 //!
