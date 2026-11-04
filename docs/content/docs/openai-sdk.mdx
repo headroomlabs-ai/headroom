@@ -46,7 +46,7 @@ That's it. Every call to `client.chat.completions.create()` compresses the messa
 3. Replaces the original messages with the compressed result
 4. Forwards the request to OpenAI as normal
 
-The SDK talks to a **local** proxy, which is why no extra configuration is needed: `/v1/compress` is loopback-only by default. If you move the proxy to another host, set `HEADROOM_COMPRESS_ALLOW_REMOTE=1` on it or requests come back `404`.
+The SDK talks to a **local** proxy, which is why no extra configuration is needed: `/v1/compress` is loopback-only by default (in container environments, host gateway traffic is admitted automatically). If you move the proxy to another host, set `HEADROOM_COMPRESS_ALLOW_REMOTE=1` on it or requests come back `404`.
 
 All other client methods are untouched:
 

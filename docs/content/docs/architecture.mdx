@@ -38,7 +38,7 @@ Headroom can be used three ways, all feeding the same compression pipeline:
 | Entry point | How it works | Code changes |
 |-------------|-------------|--------------|
 | **Proxy mode** | Run `headroom proxy` and point your client's base URL at it | Zero — just change the base URL |
-| **SDK mode** | Call `compress()` (Python or TypeScript) on your messages before you send them | Minimal — one function call |
+| **SDK mode** | Call `compress()` (Python or TypeScript) on your messages before you send them, or wrap an existing client with `HeadroomClient` for automatic per-call optimization and stats | Minimal — one function call, or a client wrapper |
 | **Integrations** | LangChain, Vercel AI SDK, Agno, Strands, LiteLLM, MCP adapters | Framework-specific setup |
 
 In proxy mode the server is a FastAPI app with per-provider handlers (Anthropic, OpenAI, Gemini, Bedrock) that each run the same compression pipeline before forwarding through the selected [backend](/docs/proxy#cloud-providers).
@@ -51,7 +51,7 @@ The proxy assembles a small, ordered pipeline. Every transform is independent, s
 2. **CacheAligner** *(off by default)* — a detector that reports dynamic-prefix drift (dates, UUIDs, session tokens). It **never mutates, moves, or rewrites** content. It is disabled by default and hard-disabled inside the proxy; it exists to surface prefix-stability metrics, not to change your messages.
 3. **ContentRouter** — the workhorse that does essentially all of the compression. See below.
 
-The pipeline **never drops or reorders messages**. Earlier versions shipped a "context manager" stage (rolling-window / intelligent-context scoring) that deleted old turns to make the request fit the context window. That stage was **removed** — the `RollingWindowConfig`, `IntelligentContextConfig`, and `ScoringWeights` classes no longer exist. Headroom now does *live-zone-only* compression: it compresses content in place and leaves the message list intact. See [Context Management](/docs/context-management).
+The pipeline **never drops or reorders messages**. Earlier versions shipped a "context manager" stage (rolling-window / intelligent-context scoring) that deleted old turns to make the request fit the context window. That stage was **removed** — the pipeline no longer runs any dropping/scoring logic, and the `RollingWindowConfig`, `IntelligentContextConfig`, and `ScoringWeights` classes are gone from the Python package (the TypeScript SDK's types still export the equivalent field names, but wired to nothing). Headroom now does *live-zone-only* compression: it compresses content in place and leaves the message list intact. See [Context Management](/docs/context-management).
 
 ### ContentRouter
 
@@ -64,7 +64,7 @@ ContentRouter detects the type of each content block and dispatches it to exactl
 | Search / grep results | SearchCompressor | 80–95% |
 | Build / test logs | LogCompressor | 85–95% |
 | Diffs | DiffCompressor | 40–80% |
-| HTML | HTMLExtractor (trafilatura) | ~95% |
+| HTML | HTMLExtractor (trafilatura) | 70–90% |
 | Tabular (CSV/TSV/markdown tables) | TabularCompressor | 60–90% |
 | Structured config (YAML/TOML/INI) | ConfigCompressor | 40–70% |
 | Plain text | TextCrusher | 30–60% |

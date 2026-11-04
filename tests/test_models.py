@@ -13,6 +13,7 @@ from headroom.models import (
     list_models,
     register_model,
 )
+from tests._pricing_models import anthropic_pricing_model
 
 
 class TestModelInfo:
@@ -285,8 +286,9 @@ class TestBuiltInModels:
         info = get_model_info("claude-3-5-sonnet-20241022")
         assert info.provider == "anthropic"
         assert info.context_window == 200000
-        # Pricing fetched from LiteLLM (falls back to alias for retired models)
-        pricing = ModelRegistry.get_pricing("claude-sonnet-4-20250514")
+        # Pricing comes from litellm's live table, so name a model it currently
+        # prices; the retired-id path is the MODEL_ALIASES assertion below.
+        pricing = ModelRegistry.get_pricing(anthropic_pricing_model())
         assert pricing is not None
         assert pricing[0] == 3.00  # input cost per 1M
         assert pricing[1] == 15.00  # output cost per 1M
@@ -312,3 +314,27 @@ class TestBuiltInModels:
         info = get_model_info("mistral-large")
         assert info.provider == "mistral"
         assert info.supports_tools is True
+
+
+def test_deepseek_flash_is_registered_with_vision_and_legacy_aliases() -> None:
+    """The current DeepSeek id carries V4.1-Flash capabilities; retired ids alias it."""
+    from headroom.models.registry import ModelRegistry
+
+    flash = ModelRegistry.get("deepseek-flash")
+    assert flash is not None
+    assert flash.provider == "deepseek"
+    assert flash.context_window == 1_000_000
+    assert flash.max_output_tokens == 384_000
+    assert flash.supports_vision is True
+    assert flash.supports_tools is True
+    assert flash.tokenizer_backend == "huggingface"
+    assert set(flash.aliases) == {"deepseek-v4-flash", "deepseek-v4-flash-vision-exp"}
+
+    for alias in ("deepseek-v4-flash", "deepseek-v4-flash-vision-exp"):
+        resolved = ModelRegistry.get(alias)
+        assert resolved is not None
+        assert resolved.name == "deepseek-flash"
+
+    pro = ModelRegistry.get("deepseek-v4-pro")
+    assert pro is not None
+    assert pro.supports_vision is False

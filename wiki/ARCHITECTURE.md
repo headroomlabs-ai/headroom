@@ -91,6 +91,14 @@ When you use AI models like GPT-4 or Claude, you pay for **tokens** - the pieces
 
 ### 1. HeadroomClient (`client.py`) - The Wrapper
 
+`HeadroomClient` is still exported (`headroom/__init__.py:93,197`), but it is
+no longer the only SDK entry point: the site's current architecture
+documentation (`docs/content/docs/architecture.mdx`) describes SDK mode as
+calling the one-function `compress()` API (`headroom.compress`,
+`headroom.CompressConfig`) directly on your messages, with `HeadroomClient`
+as the client-wrapping alternative. Both exist; this section covers only the
+wrapper.
+
 This is what you interact with. It wraps your existing OpenAI or Anthropic client:
 
 ```python
@@ -500,19 +508,19 @@ When SmartCrusher compresses, the original content is stored for on-demand retri
 ```python
 @dataclass
 class CompressionEntry:
-    hash: str  # 16-char SHA256 for retrieval
+    hash: str  # 24-char SHA256 prefix for retrieval
     original_content: str  # Full JSON before compression
     compressed_content: str  # Compressed JSON
     original_item_count: int
     compressed_item_count: int
     tool_name: str | None  # For feedback tracking
     created_at: float
-    ttl: int = 300  # 5 minute default
+    ttl: int = 1800  # 30 minute default (DEFAULT_CCR_TTL_SECONDS)
 ```
 
 **Features:**
 - Thread-safe in-memory storage
-- TTL-based expiration (default 5 minutes)
+- TTL-based expiration (default 30 minutes; `DEFAULT_CCR_TTL_SECONDS`, override via `HEADROOM_CCR_TTL_SECONDS`)
 - LRU-style eviction when capacity reached
 - Hash-keyed retrieval that always returns the full original content
 
@@ -1085,12 +1093,17 @@ This means:
 
 ## The Numbers (From Our Tests)
 
-Real-world SRE incident investigation:
-- **5 tool calls**: Metrics, logs, status, deployments, runbook
-- **Original**: 22,048 tokens
-- **After SmartCrusher**: 2,190 tokens
-- **Reduction**: 90%
-- **Quality Score**: 5.0/5 (no information loss)
+> **Audit note (2026-09-02):** the specific token counts previously shown here
+> (a "5 tool call SRE incident" example) could not be traced to any benchmark,
+> test, or committed artifact in this repo and have been removed rather than
+> replaced with another unverified figure. For sourced compression numbers see
+> [Benchmarks](benchmarks.md) / `docs/content/docs/benchmarks.mdx`.
+
+Real-world SRE incident investigation (metrics, logs, status, deployments,
+runbook tool calls in one turn) is the kind of workload SmartCrusher targets:
+statistical, repetitive tool output where most of the redundancy is in
+constant fields and stable regions, not in the handful of data points (spikes,
+errors) that actually matter to the model's answer.
 
 The model could still:
 - Identify the CPU spike (preserved by change point detection)
