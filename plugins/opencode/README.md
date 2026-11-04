@@ -27,6 +27,9 @@ npm run build
 npm run build:standalone
 ```
 
+For a reproducible real OpenCode 2.x → proxy → local SSE upstream check, see
+[the transport runtime proof](RUNTIME_PROOF.md). It records the tested scope and limitations.
+
 ## Provider Config Helpers
 
 Use these helpers when you need to generate OpenCode config that routes a `headroom` provider through a running Headroom proxy.
