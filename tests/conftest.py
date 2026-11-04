@@ -63,8 +63,24 @@ def _skip_proxy_dependency_gate_unless_exercised(
     monkeypatch.setattr(proxy, "ensure_proxy_dependencies", lambda: None)
 
 
+# `headroom proxy` refuses to start when its port is already bound. Tests that
+# invoke it with a stubbed run_server use the default 8787, which a developer's
+# own running proxy holds, so the check is off unless a test exercises it.
 @pytest.fixture(autouse=True)
-def _scrub_developer_headroom_env(monkeypatch, tmp_path):
+def _skip_proxy_port_preflight_unless_exercised(
+    request: pytest.FixtureRequest, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    if request.node.get_closest_marker("proxy_port_preflight") is not None:
+        return
+    try:
+        from headroom.cli import proxy
+    except ModuleNotFoundError:
+        return
+    monkeypatch.setattr(proxy, "_refuse_busy_port", lambda *args, **kwargs: None)
+
+
+@pytest.fixture(autouse=True)
+def _scrub_developer_headroom_env(monkeypatch, tmp_path, tmp_path_factory):
     for key in list(os.environ):
         if key.startswith("HEADROOM_"):
             monkeypatch.delenv(key, raising=False)
@@ -73,6 +89,11 @@ def _scrub_developer_headroom_env(monkeypatch, tmp_path):
     # test its own store so proxy/CLI startup cannot load developer settings and
     # saves cannot rewrite them. Tests of path precedence can override this.
     monkeypatch.setenv("HEADROOM_SETTINGS_PATH", str(tmp_path / "headroom-settings.json"))
+    # The proxy's compression cache keeps results on disk; never in the
+    # developer's ~/.headroom, never shared between tests, and not in tmp_path,
+    # which tests assert stays empty when nothing is persisted.
+    cache_dir = tmp_path_factory.mktemp("compression-cache")
+    monkeypatch.setenv("HEADROOM_COMPRESSION_CACHE_PATH", str(cache_dir / "compression_cache.db"))
     # The scrub also deletes the HEADROOM_HARD_WATCHDOG_SECS=0 opt-out CI sets
     # (#3845), so every test that enters the proxy lifespan armed the 90s
     # production watchdog inside pytest; it hard-exits the process with code 1
@@ -250,13 +271,11 @@ def _null_binary_pins():
 def _reset_headroom_logger_propagation():
     """Keep `headroom.*` log records flowing to pytest's caplog handler.
 
-    Two sources disable propagation on the headroom logger tree and never
-    restore it, which then makes later `caplog`-based assertions flaky in
+    A benchmark helper disables propagation on the headroom logger tree and
+    never restores it, which then makes later `caplog`-based assertions flaky in
     full-suite runs (caplog attaches to root, so a `propagate=False` anywhere
     on the chain silently drops the records):
 
-    - ``headroom.proxy.helpers._setup_file_logging`` sets
-      ``getLogger("headroom").propagate = False`` on proxy startup.
     - ``benchmarks.claude_session_mode_benchmark._disable_headroom_benchmark_logging``
       (exercised by ``test_claude_session_mode_benchmark``) sets
       ``propagate = False`` + ``CRITICAL`` on ``headroom``, ``headroom.proxy``,

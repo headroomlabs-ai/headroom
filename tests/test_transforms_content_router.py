@@ -705,6 +705,378 @@ def test_smart_crusher_log_fallback_skipped_for_invalid_json(
     assert CompressionStrategy.KOMPRESS.value in strategy_chain
 
 
+def test_smart_crusher_fallback_skips_kompress_for_valid_json_object(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Kompress must not delete records from parseable single-line JSON (#3673).
+
+    SmartCrusher passes a compact JSON object through when it has no applicable
+    array transform. The no-savings fallback used to hand the whole document to
+    Kompress; when Kompress dropped a span around ``},{``, the result remained
+    valid JSON but silently lost a record.
+    """
+    router = ContentRouter(ContentRouterConfig())
+    payload = json.dumps(
+        {
+            "domains": [
+                {"name": "first", "description": "First collection description"},
+                {"name": "second", "description": "Second collection description"},
+                {"name": "third", "description": "Third collection description"},
+            ]
+        },
+        separators=(",", ":"),
+    )
+    kompress_calls: list[str] = []
+
+    class NoopSmartCrusher:
+        def crush(self, content: str, query: str = "", bias: float = 1.0) -> SimpleNamespace:
+            return SimpleNamespace(compressed=content)
+
+    class RecordEatingKompress:
+        def is_ready(self) -> bool:
+            return True
+
+        def compress(self, content: str, **_kwargs: object) -> SimpleNamespace:
+            kompress_calls.append("kompress")
+            return SimpleNamespace(
+                compressed='{"domains":["record deleted"]}',
+                compressed_tokens=1,
+            )
+
+    monkeypatch.setattr(router, "_get_smart_crusher", lambda: NoopSmartCrusher())
+    monkeypatch.setattr(router, "_get_log_compressor", lambda: None)
+    monkeypatch.setattr(router, "_get_kompress", lambda: RecordEatingKompress())
+
+    result = router.compress(payload)
+
+    assert result.compressed == payload
+    assert kompress_calls == []
+
+
+def test_force_kompress_skips_valid_json_object(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The forced-Kompress fast path keeps the same parseable-JSON guard."""
+    router = ContentRouter(ContentRouterConfig(force_kompress_all=True))
+    router._runtime_force_kompress = True
+    payload = json.dumps({"items": [{"id": 1}, {"id": 2}]}, separators=(",", ":"))
+    calls: list[str] = []
+
+    class RecordEatingKompress:
+        def is_ready(self) -> bool:
+            return True
+
+        def compress(self, content: str, **_kwargs: object) -> SimpleNamespace:
+            calls.append("kompress")
+            return SimpleNamespace(compressed='{"items":[{"id":1}]}', compressed_tokens=1)
+
+    monkeypatch.setattr(router, "_get_kompress", lambda: RecordEatingKompress())
+
+    result = router.compress(payload)
+
+    assert calls == []
+    assert result.compressed == payload
+
+
+def test_prefixed_same_line_json_skips_kompress(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Embedded JSON must be guarded even when the block itself is not JSON.
+
+    The mixed splitter gives a JSON span its own section only when a line starts
+    with ``{``/``[``. With ``Tool result:`` on the same line, embedded routing
+    finds the span but SmartCrusher may produce no savings; the full block then
+    reaches the Kompress fallback. That final input still contains JSON and must
+    not reach the prose model (#3673).
+    """
+    router = ContentRouter(ContentRouterConfig())
+    payload = 'Tool result: {"items":[{"id":1},{"id":2},{"id":3}]}'
+    kompress_calls: list[str] = []
+
+    class NoopSmartCrusher:
+        def crush(self, content: str, query: str = "", bias: float = 1.0) -> SimpleNamespace:
+            return SimpleNamespace(compressed=content)
+
+    class RecordEatingKompress:
+        def is_ready(self) -> bool:
+            return True
+
+        def compress(self, content: str, **_kwargs: object) -> SimpleNamespace:
+            kompress_calls.append("kompress")
+            return SimpleNamespace(
+                compressed='Tool result: {"items":[{"id":1}]}',
+                compressed_tokens=1,
+            )
+
+    monkeypatch.setattr(router, "_get_smart_crusher", lambda: NoopSmartCrusher())
+    monkeypatch.setattr(router, "_get_log_compressor", lambda: None)
+    monkeypatch.setattr(router, "_get_kompress", lambda: RecordEatingKompress())
+
+    result = router.compress(payload)
+
+    assert kompress_calls == []
+    assert result.compressed == payload
+
+
+def test_record_stream_of_separate_objects_still_compresses(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Separate top-level objects (search hits, JSONL) are NOT protected.
+
+    Welding two of them yields an unparseable record rather than a silently
+    shorter document, so the #3673 invisible-loss argument does not apply.
+    Protecting them turns forced Kompress into a no-op on real search payloads
+    — ``test_force_kompress_routes_anthropic_tool_result_to_targeted_kompress``
+    in tests/test_transforms/test_content_router.py depends on this line.
+    """
+    router = ContentRouter(ContentRouterConfig())
+    stream = " ".join(
+        json.dumps({"file": f"src/mod_{i}.py", "line": i, "text": "repeated search payload"})
+        for i in range(160)
+    )
+    kompress_inputs: list[str] = []
+
+    class HalvingKompress:
+        def is_ready(self) -> bool:
+            return True
+
+        def compress(self, content: str, **_kwargs: object) -> SimpleNamespace:
+            kompress_inputs.append(content)
+            out = " ".join(content.split()[::2])
+            return SimpleNamespace(compressed=out, compressed_tokens=len(out.split()))
+
+    monkeypatch.setattr(router, "_get_kompress", lambda: HalvingKompress())
+
+    out, _tokens = router._try_ml_compressor(stream, context="")
+
+    assert kompress_inputs == [stream]
+    assert out != stream
+
+
+def test_record_array_is_protected_even_beside_a_lone_object(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The protected shape is the record array, at any offset in the block."""
+    router = ContentRouter(ContentRouterConfig())
+    document = json.dumps({"domains": [{"name": "a"}, {"name": "b"}, {"name": "c"}]})
+    block = (
+        "The listing call returned two payloads on this line: "
+        + json.dumps({"file": "src/mod.py", "line": 1})
+        + " and then "
+        + document
+        + " done."
+    )
+    kompress_inputs: list[str] = []
+
+    class RecordEatingKompress:
+        def is_ready(self) -> bool:
+            return True
+
+        def compress(self, content: str, **_kwargs: object) -> SimpleNamespace:
+            kompress_inputs.append(content)
+            return SimpleNamespace(compressed="eaten", compressed_tokens=1)
+
+    monkeypatch.setattr(router, "_get_kompress", lambda: RecordEatingKompress())
+
+    out, _tokens = router._try_ml_compressor(block, context="")
+
+    assert out == block
+    assert kompress_inputs == []
+
+
+def test_protection_scan_stays_linear_on_brace_heavy_text(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Source and logs are full of ``{`` that never close. The protection guard
+    scans at every Kompress boundary; it must not re-read the rest of the block
+    for each brace, or large tool output spends its compression time in scans."""
+    import headroom.transforms.recursive_json as rj
+
+    router = ContentRouter(ContentRouterConfig())
+    line = "    if (flags & MASK) { log.debug(state); retry(ctx, {timeout: 30, max attempts\n"
+    block = line * 800  # ~65 KB, two unmatched `{` per line, no JSON at all
+    walked = 0
+    real = rj._scan_from
+
+    def counting(text, start, known):  # noqa: ANN001, ANN202
+        nonlocal walked
+        end, n = real(text, start, known)
+        walked += n
+        return end, n
+
+    monkeypatch.setattr(rj, "_scan_from", counting)
+    kompress_inputs: list[str] = []
+
+    class HalvingKompress:
+        def is_ready(self) -> bool:
+            return True
+
+        def compress(self, content: str, **_kwargs: object) -> SimpleNamespace:
+            kompress_inputs.append(content)
+            out = " ".join(content.split()[::2])
+            return SimpleNamespace(compressed=out, compressed_tokens=len(out.split()))
+
+    monkeypatch.setattr(router, "_get_kompress", lambda: HalvingKompress())
+
+    out, _tokens = router._try_ml_compressor(block, context="")
+
+    # No JSON to protect, so prose compression still runs...
+    assert kompress_inputs
+    assert out != block
+    # ...and every scan of the call together stays a small multiple of one pass
+    # (the quadratic walk read hundreds of times the block here).
+    assert walked <= 8 * len(block), (walked, len(block))
+
+
+def test_unfinished_protection_scan_protects_the_whole_block(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """If the scan ever stops at its budget, a record array past that point
+    cannot be ruled out, so the block is kept away from the prose model."""
+    import headroom.transforms.recursive_json as rj
+
+    monkeypatch.setattr(rj, "_SCAN_BUDGET_PER_CHAR", 0)
+    monkeypatch.setattr(rj, "_SCAN_BUDGET_FLOOR", 0)
+    router = ContentRouter(ContentRouterConfig())
+    block = "Results below. " + json.dumps([{"id": i, "v": "x" * 20} for i in range(5)])
+    kompress_inputs: list[str] = []
+
+    class RecordEatingKompress:
+        def is_ready(self) -> bool:
+            return True
+
+        def compress(self, content: str, **_kwargs: object) -> SimpleNamespace:
+            kompress_inputs.append(content)
+            return SimpleNamespace(compressed="eaten", compressed_tokens=1)
+
+    monkeypatch.setattr(router, "_get_kompress", lambda: RecordEatingKompress())
+
+    out, _tokens = router._try_ml_compressor(block, context="")
+
+    assert out == block
+    assert kompress_inputs == []
+
+
+def test_relevance_split_still_runs_for_line_contained_json(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """JSONL keeps each object inside one line, so no window cuts a document and
+    the split — which exists for log payloads — proceeds as before."""
+    router = ContentRouter(ContentRouterConfig(relevance_split=True))
+    payload = "\n".join(
+        json.dumps({"level": "info", "msg": f"event {i} with a prose-like description"})
+        for i in range(40)
+    )
+    planned: list[str] = []
+
+    router._relevance_scorer = object()
+    router._relevance_scorer_tried = True
+    monkeypatch.setattr(
+        content_router_module,
+        "plan_relevance_split",
+        lambda content, query, scorer, **_kw: planned.append(content) or [(True, content)],
+    )
+
+    router._relevance_split_compress(payload, "log", "event 3")
+
+    assert planned == [payload]
+
+
+def test_relevance_split_runs_when_a_record_array_sits_inside_one_window(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Only a STRADDLING span blocks the split.
+
+    A log whose paragraphs happen to embed a small record array is windowed at
+    the blank lines, so the array stays whole inside one window. That window is
+    safe to score and drop: if it is dropped, the Kompress boundary sees the
+    intact array and passes it through. Declining here instead would disable
+    the relevance split for most log payloads.
+    """
+    router = ContentRouter(ContentRouterConfig(relevance_split=True))
+    array = json.dumps([{"id": 1, "state": "ok"}, {"id": 2, "state": "ok"}])
+    paragraphs = [
+        "worker started and connected to the queue, waiting for the first batch",
+        "batch 1 finished; per-item results were reported as " + array,
+        "worker idle for 30 seconds, then shut down cleanly on SIGTERM",
+    ]
+    payload = (chr(10) + chr(10)).join(paragraphs)
+    planned: list[str] = []
+    kompress_inputs: list[str] = []
+
+    class HalvingKompress:
+        def is_ready(self) -> bool:
+            return True
+
+        def compress(self, content: str, **_kwargs: object) -> SimpleNamespace:
+            kompress_inputs.append(content)
+            out = " ".join(content.split()[::2])
+            return SimpleNamespace(compressed=out, compressed_tokens=len(out.split()))
+
+    router._relevance_scorer = object()
+    router._relevance_scorer_tried = True
+    monkeypatch.setattr(router, "_get_kompress", lambda: HalvingKompress())
+    monkeypatch.setattr(
+        content_router_module,
+        "plan_relevance_split",
+        lambda content, query, scorer, **_kw: (
+            planned.append(content)
+            or [(False, piece) for piece in content_router_module.segment(content)]
+        ),
+    )
+
+    router._relevance_split_compress(payload, "log", "worker shutdown")
+
+    # The split ran...
+    assert planned == [payload]
+    # ...and the window carrying the array reached the Kompress boundary, which
+    # passed it through untouched rather than letting the prose model see it.
+    carrying = [text for text in kompress_inputs if array in text]
+    assert carrying == [], f"a record array reached the prose model: {carrying}"
+
+
+def test_relevance_split_does_not_fragment_json_payloads(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Relevance windowing must not cut JSON before the Kompress guard.
+
+    A detector can misclassify JSON as LOG/SEARCH. Windowing such a payload at
+    blank-line-free boundaries produces fragments that no longer parse, so a
+    whole-block JSON check cannot help. Skip the split and let the structural
+    JSON boundary preserve the document (#3673).
+    """
+    router = ContentRouter(ContentRouterConfig(relevance_split=True))
+    payload = json.dumps(
+        {
+            "items": [
+                {"id": index, "value": f"record {index} with prose-like description"}
+                for index in range(8)
+            ]
+        },
+        indent=2,
+    )
+    kompress_inputs: list[str] = []
+
+    class DeterministicScorer:
+        def score_batch(self, items: list[str], _context: str) -> list[SimpleNamespace]:
+            return [SimpleNamespace(score=0.0) for _ in items]
+
+    def record_kompress(
+        content: str,
+        _context: str,
+        question: str | None = None,
+    ) -> tuple[str, int]:
+        kompress_inputs.append(content)
+        return content, _estimate_tokens(content)
+
+    router._relevance_scorer = DeterministicScorer()
+    router._relevance_scorer_tried = True
+    monkeypatch.setattr(router, "_try_ml_compressor", record_kompress)
+
+    assert router._relevance_split_compress(payload, "log", "find record 3") is None
+    assert kompress_inputs == []
+
+
 def test_smart_crusher_log_fallback_runs_for_valid_json(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1635,6 +2007,51 @@ def _block_out(router: ContentRouter, content: str, model_limit: int) -> str:
         model_limit=model_limit,
     )
     return result.messages[0]["content"][0]["content"]
+
+
+@pytest.mark.parametrize(
+    "suffix",
+    ["", '\n```python\nprint("hello")\n```\n', '\n{"records":[{"name":"extra","value":1}]}\n'],
+    ids=["status", "fenced-code", "json"],
+)
+def test_git_status_output_stays_byte_exact_on_direct_and_tool_routes(
+    monkeypatch: pytest.MonkeyPatch, suffix: str
+) -> None:
+    status = """On branch feature/status
+Changes to be committed:
+  (use "git restore --staged <file>..." to unstage)
+\tnew file:   staged path with spaces.txt
+\tmodified:   another staged path.txt
+	new file:   staged path with several spaces and a longer filename.txt
+	modified:   additional staged file.txt
+
+Changes not staged for commit:
+  (use "git add <file>..." to update what will be committed)
+\tmodified:   edited path with spaces.txt
+\tdeleted:    removed path.txt
+
+Untracked files:
+  (use "git add <file>..." to include in what will be committed)
+\tnew untracked path.txt
+"""
+    status += suffix
+    router = ContentRouter(ContentRouterConfig())
+
+    class LossyProseCompressor:
+        def is_ready(self) -> bool:
+            return True
+
+        def compress(self, content: str, **_kwargs: object) -> SimpleNamespace:
+            compressed = "\n".join(content.splitlines()[::2])
+            return SimpleNamespace(compressed=compressed, compressed_tokens=1)
+
+    monkeypatch.setattr(router, "_get_kompress", lambda: LossyProseCompressor())
+
+    direct = router.compress(status)
+    tool_result = _block_out(router, status, model_limit=100_000)
+
+    assert direct.compressed == status
+    assert tool_result == status
 
 
 def test_block_freeze_off_is_byte_identical_flapping_baseline(

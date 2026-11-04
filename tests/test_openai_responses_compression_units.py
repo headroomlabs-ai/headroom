@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import threading
+import time
 from types import MethodType, SimpleNamespace
 
 import pytest
@@ -14,6 +16,24 @@ from headroom.transforms.content_router import (
     ContentRouter,
     RouterCompressionResult,
 )
+
+
+def test_cached_ccr_store_failure_does_not_log_sensitive_details(monkeypatch, caplog):
+    from headroom.cache import compression_store
+
+    def exists(hash_key):
+        raise RuntimeError("PRIVATE_CREDENTIAL_CANARY")
+
+    monkeypatch.setattr(
+        compression_store, "get_compression_store", lambda: SimpleNamespace(exists=exists)
+    )
+    result = SimpleNamespace(original="tool output", compressed="<<ccr:abcdef123456>>")
+    with caplog.at_level("DEBUG", logger="headroom.proxy"):
+        assert openai_handler._openai_responses_cached_ccr_markers_live(result) is True
+
+    assert "CCR liveness check for a cached Responses unit failed" in caplog.text
+    assert "PRIVATE_CREDENTIAL_CANARY" not in caplog.text
+    assert all(record.exc_info is None for record in caplog.records)
 
 
 class TokenCounter:
@@ -464,6 +484,165 @@ def test_openai_responses_adapter_reuses_exact_tool_output_cache():
     assert new_payload_two["input"][1]["output"] == "cached output summary"
 
 
+def _marker_compressing_handler(store):
+    """Handler whose router stores each original in ``store`` and emits a kompress marker."""
+    router = ContentRouter()
+    calls = {"count": 0}
+
+    def compress(self, content: str, **_kwargs):
+        calls["count"] += 1
+        hash_key = store.store(content, "summary", compression_strategy="kompress")
+        return RouterCompressionResult(
+            compressed=f"summary [Retrieve more: hash={hash_key}]",
+            original=content,
+            strategy_used=CompressionStrategy.KOMPRESS,
+        )
+
+    router.compress = MethodType(compress, router)
+    return _handler_with_router(router), calls
+
+
+def _compress_shell_output(handler, text: str, request_id: str):
+    payload = {
+        "model": "gpt-5",
+        "input": [{"type": "local_shell_call_output", "call_id": request_id, "output": text}],
+    }
+    new_payload, *_ = handler._compress_openai_responses_live_text_units_with_router(
+        payload,
+        model="gpt-5",
+        request_id=request_id,
+    )
+    return new_payload["input"][0]["output"]
+
+
+@pytest.mark.parametrize(
+    "marker",
+    ["<<ccr:deadbeefdead>>", "[Retrieve more: hash=deadbeefdead]"],
+)
+def test_openai_responses_unit_cache_reuses_result_with_missing_inherited_marker(marker):
+    from headroom.cache.compression_store import (
+        CompressionStore,
+        clear_request_compression_store,
+        set_request_compression_store,
+    )
+
+    store = CompressionStore(max_entries=100, default_ttl=60)
+    set_request_compression_store(store)
+    try:
+        handler, calls = _marker_compressing_handler(store)
+        text = " ".join(f"word{i}" for i in range(180)) + "\n" + marker
+        outputs = [_compress_shell_output(handler, text, f"req_inherited_{i}") for i in range(3)]
+
+        assert outputs[0] == outputs[1] == outputs[2]
+        assert marker in outputs[0]
+        assert not store.exists("deadbeefdead")
+        assert calls["count"] == 1
+    finally:
+        clear_request_compression_store()
+
+
+@pytest.mark.parametrize("same_hash", [True, False])
+@pytest.mark.parametrize("marker_format", ["<<ccr:{hash}>>", "[Retrieve more: hash={hash}]"])
+def test_openai_responses_unit_cache_renews_generated_hash_with_inherited_marker(
+    same_hash, marker_format
+):
+    from headroom.cache.compression_store import (
+        CompressionStore,
+        clear_request_compression_store,
+        set_request_compression_store,
+    )
+
+    store = CompressionStore(max_entries=100, default_ttl=60)
+    set_request_compression_store(store)
+    try:
+        handler, calls = _marker_compressing_handler(store)
+        text = " ".join(f"word{i}" for i in range(180))
+        seeded = _compress_shell_output(handler, text, "req_seed")
+        generated_hash = seeded.rsplit("hash=", 1)[1].rstrip("]")
+        inherited_hash = generated_hash if same_hash else store.store("other original", "other")
+        marker = marker_format.format(hash=inherited_hash)
+        # Both marker-free spans generate the same hash; neither may be hidden
+        # by the preserved inherited marker or the last router result.
+        mixed = f"{text}\n{marker}\n{text}"
+        first = _compress_shell_output(handler, mixed, "req_mixed_one")
+        assert first == f"{seeded}\n{marker}\n{seeded}"
+        assert calls["count"] == 3
+        assert _compress_shell_output(handler, mixed, "req_mixed_cached") == first
+        assert calls["count"] == 3
+
+        entry = store.retrieve(generated_hash)
+        assert entry is not None
+        assert entry.original_content == text
+        entry.created_at -= entry.ttl + 1
+        store._backend.set(generated_hash, entry)
+        assert store.retrieve(generated_hash) is None
+        if not same_hash:
+            assert store.exists(inherited_hash)
+
+        second = _compress_shell_output(handler, mixed, "req_mixed_expired")
+        assert calls["count"] == 5
+        assert second == first
+        renewed = store.retrieve(generated_hash)
+        assert renewed is not None
+        assert renewed.original_content == text
+    finally:
+        clear_request_compression_store()
+
+
+def test_openai_responses_unit_cache_recompresses_when_ccr_entry_expired():
+    # The unit cache has no TTL; the CCR entry behind its marker does. Reusing the
+    # cached result after the entry expired would ship a marker no retrieval can
+    # redeem, so the unit must be compressed (and its entry stored) again.
+    from headroom.cache.compression_store import (
+        CompressionStore,
+        clear_request_compression_store,
+        set_request_compression_store,
+    )
+
+    store = CompressionStore(max_entries=100, default_ttl=60)
+    set_request_compression_store(store)
+    try:
+        handler, calls = _marker_compressing_handler(store)
+        long_text = " ".join(f"word{i}" for i in range(180))
+
+        first = _compress_shell_output(handler, long_text, "req_expire_one")
+        hash_key = first.rsplit("hash=", 1)[1].rstrip("]")
+        assert store.exists(hash_key)
+
+        store._backend.delete(hash_key)  # what TTL expiry does to the entry
+        assert not store.exists(hash_key)
+
+        second = _compress_shell_output(handler, long_text, "req_expire_two")
+
+        assert calls["count"] == 2
+        assert second == first
+        assert store.exists(hash_key)
+    finally:
+        clear_request_compression_store()
+
+
+def test_openai_responses_unit_cache_reuses_result_while_ccr_entry_live():
+    from headroom.cache.compression_store import (
+        CompressionStore,
+        clear_request_compression_store,
+        set_request_compression_store,
+    )
+
+    store = CompressionStore(max_entries=100, default_ttl=60)
+    set_request_compression_store(store)
+    try:
+        handler, calls = _marker_compressing_handler(store)
+        long_text = " ".join(f"word{i}" for i in range(180))
+
+        first = _compress_shell_output(handler, long_text, "req_live_one")
+        second = _compress_shell_output(handler, long_text, "req_live_two")
+
+        assert calls["count"] == 1
+        assert second == first
+    finally:
+        clear_request_compression_store()
+
+
 def test_openai_responses_adapter_reuses_identical_tool_output_in_same_request():
     router = ContentRouter()
     calls = {"count": 0}
@@ -880,14 +1059,12 @@ def test_openai_responses_adapter_never_folds_a_file_read(tool, as_content_part)
     assert new_payload["input"][1]["output"] == output
 
 
-def test_openai_responses_adapter_excludes_tool_case_insensitively_with_debug(monkeypatch):
-    """Excluded match is case-insensitive, and the debug path stays exercised.
+def test_openai_responses_adapter_excludes_tool_case_insensitively():
+    """Excluded match is case-insensitive.
 
     The configured name is lowercase only; the call advertises a mixed-case
-    name, so the protection must hit via the lowercased fallback. Debug logging
-    is enabled so the protected-extraction debug record is also covered.
+    name, so the protection must hit via the lowercased fallback.
     """
-    monkeypatch.setattr(openai_handler, "_log_codex_compression_debug", lambda *_a, **_k: None)
     router = ContentRouter()
     router.config.exclude_tools = {"serena.find_symbol"}
 
@@ -1365,3 +1542,218 @@ def test_openai_responses_cache_mode_never_batches_old_small_outputs():
     assert calls == []
     assert modified is False
     assert second["input"][:4] == first["input"]
+
+
+def test_openai_responses_adapter_compresses_historical_messages_not_current_user():
+    router = ContentRouter()
+
+    def compress(self, content: str, **_kwargs) -> RouterCompressionResult:
+        return RouterCompressionResult(
+            compressed="compressed history",
+            original=content,
+            strategy_used=CompressionStrategy.KOMPRESS,
+        )
+
+    router.compress = MethodType(compress, router)
+    handler = _handler_with_router(router)
+    historical_text = " ".join(f"history{i}" for i in range(2000))
+    current_text = " ".join(f"current{i}" for i in range(2000))
+    payload = {
+        "model": "gpt-5",
+        "input": [
+            {
+                "type": "message",
+                "role": "user",
+                "content": [{"type": "input_text", "text": historical_text}],
+            },
+            {
+                "type": "message",
+                "role": "assistant",
+                "content": [{"type": "output_text", "text": historical_text}],
+            },
+            {
+                "type": "message",
+                "role": "user",
+                "content": [{"type": "input_text", "text": current_text}],
+            },
+        ],
+    }
+
+    new_payload, modified, saved, transforms, units_by_category, _chain, _attempted = (
+        handler._compress_openai_responses_live_text_units_with_router(
+            payload, model="gpt-5", request_id="req_history"
+        )
+    )
+
+    assert modified is True
+    assert saved > 0
+    assert new_payload["input"][0]["content"][0]["text"] == "compressed history"
+    assert new_payload["input"][1]["content"][0]["text"] == "compressed history"
+    assert new_payload["input"][2]["content"][0]["text"] == current_text
+    assert units_by_category == {"applied": 2}
+    assert any(t.startswith("router:openai:responses:message:") for t in transforms)
+
+
+class _RecordingKompress:
+    """Stands in for KompressCompressor, recording the deadline origin it gets."""
+
+    shares_request_deadline = True
+
+    def __init__(self, delay: float = 0.0) -> None:
+        self.delay = delay
+        self.deadlines: list[float | None] = []
+
+    def is_ready(self) -> bool:
+        return True
+
+    def compress(self, content: str, **kwargs):
+        self.deadlines.append(kwargs.get("_deadline_started_at"))
+        time.sleep(self.delay)
+        compressed = " ".join(content.split()[:20])
+        return SimpleNamespace(compressed=compressed, compressed_tokens=20)
+
+
+def _kompress_payload(units: int) -> dict:
+    return {
+        "model": "gpt-5",
+        "input": [
+            {
+                "type": "function_call_output",
+                "call_id": f"call_{i}",
+                "output": "\n".join(
+                    " ".join(f"unit{i}line{line}word{j}" for j in range(10)) for line in range(70)
+                ),
+            }
+            for i in range(units)
+        ],
+    }
+
+
+def _compress_through_executor(router: ContentRouter, payload: dict) -> tuple:
+    handler = _handler_with_router(router)
+
+    async def _run_compression(fn, *, timeout):  # noqa: ANN001, ANN202
+        return fn()
+
+    handler._run_compression_in_executor = _run_compression
+    return asyncio.run(
+        handler._compress_openai_responses_payload_in_executor(
+            payload, model="gpt-5", request_id="req_deadline"
+        )
+    )
+
+
+def test_openai_responses_units_share_one_kompress_deadline(monkeypatch):
+    """The fan-out must draw down ONE request deadline (#3693), pool threads too.
+
+    Each unit is its own ContentRouter.compress call, and Kompress started a
+    fresh HEADROOM_COMPRESSION_DEADLINE_MS clock in every one, so a request
+    that blew its timeout kept running inference for minutes afterwards.
+    """
+    monkeypatch.setenv("HEADROOM_TOOL_OUTPUT_COMPRESSION_PARALLELISM", "4")
+    monkeypatch.setenv("HEADROOM_COMPRESSION_DEADLINE_MS", "20000")
+    router = ContentRouter()
+    kompress = _RecordingKompress()
+    monkeypatch.setattr(router, "_get_kompress", lambda: kompress)
+
+    _compress_through_executor(router, _kompress_payload(6))
+
+    assert len(kompress.deadlines) >= 6, kompress.deadlines
+    assert None not in kompress.deadlines, kompress.deadlines
+    assert len(set(kompress.deadlines)) == 1, kompress.deadlines
+
+
+def test_openai_responses_units_after_the_deadline_pass_through_unchanged(monkeypatch):
+    """Finished units are kept; units not started by the deadline are not started."""
+    monkeypatch.setenv("HEADROOM_TOOL_OUTPUT_COMPRESSION_PARALLELISM", "1")
+    monkeypatch.setenv("HEADROOM_COMPRESSION_DEADLINE_MS", "200")
+    router = ContentRouter()
+    kompress = _RecordingKompress(delay=0.3)
+    monkeypatch.setattr(router, "_get_kompress", lambda: kompress)
+    payload = _kompress_payload(4)
+    original = json.loads(json.dumps(payload))
+
+    result = _compress_through_executor(router, payload)
+
+    assert len(kompress.deadlines) == 1
+    outputs = [item["output"] for item in result[0]["input"]]
+    assert outputs[0] != original["input"][0]["output"]
+    assert outputs[1:] == [item["output"] for item in original["input"][1:]]
+    assert result[2] > 0
+
+
+@pytest.mark.parametrize(
+    ("deadline_ms", "timeout", "budget"),
+    [("20000", 30.0, 20.0), ("20000", 5.0, 3.75), ("0", 30.0, None)],
+    ids=["deadline-binds", "timeout-binds", "disabled"],
+)
+def test_openai_responses_deadline_budget_stays_inside_the_timeout(
+    monkeypatch, deadline_ms, timeout, budget
+):
+    monkeypatch.setenv("HEADROOM_COMPRESSION_DEADLINE_MS", deadline_ms)
+    before = time.perf_counter()
+    origin = openai_handler._openai_responses_deadline_started_at(timeout)
+    after = time.perf_counter()
+
+    if budget is None:
+        assert origin is None
+        return
+    expires_at = origin + int(deadline_ms) / 1000
+    assert before + budget <= expires_at <= after + budget
+
+
+@pytest.mark.parametrize(
+    ("compress_user_messages", "expected_user_text"),
+    [(False, None), (None, "compressed history")],
+)
+def test_openai_responses_adapter_historical_user_follows_compress_user_messages(
+    compress_user_messages, expected_user_text
+):
+    # An explicit off (HEADROOM_COMPRESS_USER_MESSAGES=0) keeps earlier user
+    # turns verbatim on Responses too; unset keeps the coding profile's default.
+    from headroom.proxy.models import ProxyConfig
+
+    router = ContentRouter()
+
+    def compress(self, content: str, **_kwargs) -> RouterCompressionResult:
+        return RouterCompressionResult(
+            compressed="compressed history",
+            original=content,
+            strategy_used=CompressionStrategy.KOMPRESS,
+        )
+
+    router.compress = MethodType(compress, router)
+    handler = _handler_with_router(router)
+    handler.config = ProxyConfig(
+        savings_profile="coding", compress_user_messages=compress_user_messages
+    )
+    historical_text = " ".join(f"history{i}" for i in range(2000))
+    tool_output = " ".join(f"line{i}" for i in range(2000))
+    current_text = " ".join(f"current{i}" for i in range(2000))
+    payload = {
+        "model": "gpt-5",
+        "input": [
+            {
+                "type": "message",
+                "role": "user",
+                "content": [{"type": "input_text", "text": historical_text}],
+            },
+            {"type": "function_call_output", "call_id": "c1", "output": tool_output},
+            {
+                "type": "message",
+                "role": "user",
+                "content": [{"type": "input_text", "text": current_text}],
+            },
+        ],
+    }
+
+    new_payload, modified, _saved, _transforms, _units, _chain, _attempted = (
+        handler._compress_openai_responses_live_text_units_with_router(
+            payload, model="gpt-5", request_id="req_user_flag"
+        )
+    )
+
+    assert modified is True
+    assert new_payload["input"][0]["content"][0]["text"] == (expected_user_text or historical_text)
+    assert new_payload["input"][1]["output"] == "compressed history"
+    assert new_payload["input"][2]["content"][0]["text"] == current_text

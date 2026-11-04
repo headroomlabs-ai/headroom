@@ -9,7 +9,7 @@
 
 import { compress } from "headroom-ai";
 import { ProxyManager, defaultLogger, type ProxyManagerConfig, type ProxyManagerLogger } from "./proxy-manager.js";
-import { agentToOpenAI, normalizeAgentMessages, openAIToAgent } from "./convert.js";
+import { agentToOpenAIIndexed, normalizeAgentMessages, restoreAgentMessages } from "./convert.js";
 import { DurableAdvancementKeyStore, defaultCommitLogPath } from "./advancement-key-store.js";
 import {
   delegateCompactionToRuntime,
@@ -17,25 +17,20 @@ import {
   type OpenClawCompactResult,
 } from "./openclaw-compaction.js";
 
-/** Race a promise against a timeout and always release the timer. */
-function withTimeout<T>(promise: Promise<T>, ms: number): Promise<T> {
-  let timerId: ReturnType<typeof setTimeout> | undefined;
-  const timer = new Promise<never>((_, reject) => {
-    timerId = setTimeout(() => reject(new Error(`headroom compress() timed out after ${ms}ms`)), ms);
-  });
-  return Promise.race([promise, timer]).finally(() => {
-    if (timerId !== undefined) clearTimeout(timerId);
-  });
-}
+// Must stay static — OpenClaw prepends it to the cached system prompt.
+const HEADROOM_COMPRESSION_NOTICE =
+  "[Headroom is compressing tool outputs in this session. Use headroom_retrieve if you need the original, uncompressed content.]";
 
 export interface HeadroomEngineConfig extends ProxyManagerConfig {
   enabled?: boolean;
   requestTimeoutMs?: number;
+  minContextChars?: number;
   circuitBreakerThreshold?: number;
   circuitBreakerCooldownMs?: number;
   /** Where to durably record committed turn-advancement keys (see
    * `DurableAdvancementKeyStore`). Defaults to `defaultCommitLogPath()`. */
   commitLogPath?: string;
+  announceCompression?: boolean;
 }
 
 export class HeadroomContextEngine {
@@ -69,6 +64,10 @@ export class HeadroomContextEngine {
     compactions: 0,
   };
   private circuit = { errors: 0, openUntilMs: 0 };
+  // Sessions shown the compression notice. Bounded via insertion-order
+  // eviction — no session lifecycle callback exists here to bound it otherwise.
+  private announcedSessions = new Set<string>();
+  private static readonly MAX_ANNOUNCED_SESSIONS = 1000;
 
   constructor(config: HeadroomEngineConfig = {}, logger?: ProxyManagerLogger) {
     this.config = config;
@@ -114,7 +113,9 @@ export class HeadroomContextEngine {
   /**
    * Assemble context for the model — THE CORE HOOK.
    *
-   * Converts AgentMessage[] → OpenAI format → compress() → AgentMessage[]
+   * Converts AgentMessage[] → OpenAI format → compress() → AgentMessage[]. Only messages the proxy
+   * actually changed are rebuilt; the rest are returned exactly as OpenClaw passed them, so the
+   * provider prompt cache survives up to the first compressed message (see restoreAgentMessages).
    */
   async assemble(params: {
     sessionId: string;
@@ -130,39 +131,64 @@ export class HeadroomContextEngine {
     if (!this.proxyUrl || this.config.enabled === false) {
       this.ensureProxyStarted();
       // Fallback: return messages unchanged
-      return { messages: normalizeAgentMessages(params.messages), estimatedTokens: 0 };
+      return {
+        messages: normalizeAgentMessages(params.messages),
+        estimatedTokens: 0,
+        systemPromptAddition: this.sessionCompressionNotice(params.sessionId),
+      };
     }
 
     if (this.isCircuitOpen()) {
       this.logger.warn("[headroom] Circuit open — using uncompressed messages");
-      return { messages: normalizeAgentMessages(params.messages), estimatedTokens: 0 };
+      return {
+        messages: normalizeAgentMessages(params.messages),
+        estimatedTokens: 0,
+        systemPromptAddition: this.sessionCompressionNotice(params.sessionId),
+      };
     }
 
     try {
       // Convert AgentMessage → OpenAI format
-      const openaiMessages = agentToOpenAI(params.messages);
+      const openaiMessages = agentToOpenAIIndexed(params.messages);
+      const minContextChars = this.config.minContextChars ?? 800;
+      if (minContextChars > 0 && countContextChars(openaiMessages) < minContextChars) {
+        this.logger.debug("[headroom] Context below compression threshold — using original messages");
+        return {
+          messages: normalizeAgentMessages(params.messages),
+          estimatedTokens: 0,
+          systemPromptAddition: this.sessionCompressionNotice(params.sessionId),
+        };
+      }
 
       // Compress via proxy — pass tokenBudget so RollingWindow enforces it
-      const result = await withTimeout(
-        compress(openaiMessages, {
-          model: params.model ?? "claude-sonnet-4-5",
-          baseUrl: this.proxyUrl,
-          fallback: true,
-          tokenBudget: params.tokenBudget,
-        } as any),
-        this.config.requestTimeoutMs ?? 30_000,
-      );
+      const result = await compress(openaiMessages, {
+        model: params.model ?? "claude-sonnet-4-5",
+        baseUrl: this.proxyUrl,
+        fallback: true,
+        tokenBudget: params.tokenBudget,
+        // The SDK applies this to AbortSignal.timeout(), so a timed-out call is
+        // cancelled instead of continuing in the background after fail-open.
+        timeout: this.config.requestTimeoutMs ?? 2_000,
+      } as any);
+
+      const shouldAnnounceCompression =
+        (this.hasAnnouncedCompression(params.sessionId) || result.tokensSaved > 100) &&
+        this.config.announceCompression !== false;
+      if (shouldAnnounceCompression) {
+        this.markCompressionAnnounced(params.sessionId);
+      }
 
       if (!result.compressed || result.tokensSaved === 0) {
         this.resetCircuit();
         return {
           messages: normalizeAgentMessages(params.messages),
           estimatedTokens: result.tokensBefore,
+          systemPromptAddition: this.sessionCompressionNotice(params.sessionId),
         };
       }
 
       // Convert back to AgentMessage format
-      const compressedAgentMessages = openAIToAgent(result.messages);
+      const compressedAgentMessages = restoreAgentMessages(params.messages, openaiMessages, result.messages);
       this.resetCircuit();
 
       // Track stats
@@ -177,16 +203,17 @@ export class HeadroomContextEngine {
       return {
         messages: compressedAgentMessages,
         estimatedTokens: result.tokensAfter,
-        systemPromptAddition:
-          result.tokensSaved > 100
-            ? `[Context compressed by Headroom: ${result.tokensSaved} tokens saved. Use headroom_retrieve with the hash to get full details.]`
-            : undefined,
+        systemPromptAddition: this.sessionCompressionNotice(params.sessionId),
       };
     } catch (error) {
       this.logger.error(`Assemble failed: ${error}`);
       this.tripCircuit(error);
       // Graceful fallback: return original messages
-      return { messages: normalizeAgentMessages(params.messages), estimatedTokens: 0 };
+      return {
+        messages: normalizeAgentMessages(params.messages),
+        estimatedTokens: 0,
+        systemPromptAddition: this.sessionCompressionNotice(params.sessionId),
+      };
     }
   }
 
@@ -293,6 +320,26 @@ export class HeadroomContextEngine {
     this.circuit = { errors: 0, openUntilMs: 0 };
   }
 
+  private hasAnnouncedCompression(sessionId: string): boolean {
+    return this.announcedSessions.has(sessionId);
+  }
+
+  private markCompressionAnnounced(sessionId: string): void {
+    if (this.announcedSessions.has(sessionId)) return;
+    if (this.announcedSessions.size >= HeadroomContextEngine.MAX_ANNOUNCED_SESSIONS) {
+      const oldest = this.announcedSessions.values().next().value;
+      if (oldest !== undefined) this.announcedSessions.delete(oldest);
+    }
+    this.announcedSessions.add(sessionId);
+  }
+
+  /** The sticky notice if this session already earned it and announcements aren't opted out. */
+  private sessionCompressionNotice(sessionId: string): string | undefined {
+    return this.hasAnnouncedCompression(sessionId) && this.config.announceCompression !== false
+      ? HEADROOM_COMPRESSION_NOTICE
+      : undefined;
+  }
+
   ensureProxyStarted(): void {
     if (this.config.enabled === false || this.proxyUrl || this.proxyStartupPromise) {
       return;
@@ -351,4 +398,15 @@ export class HeadroomContextEngine {
       }
     }
   }
+}
+
+function countContextChars(messages: ReturnType<typeof agentToOpenAIIndexed>): number {
+  let total = 0;
+  for (const message of messages) {
+    total += message.content?.length ?? 0;
+    for (const toolCall of message.tool_calls ?? []) {
+      total += toolCall.function?.arguments?.length ?? 0;
+    }
+  }
+  return total;
 }
