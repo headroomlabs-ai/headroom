@@ -46,7 +46,7 @@ from headroom.providers.claude import (
 )
 
 from .main import get_version, main
-from .port_discovery import find_live_proxy_elsewhere, is_headroom_livez
+from .port_discovery import find_live_proxy_elsewhere, is_headroom_livez, loopback_port
 from .wrap import _read_wrap_marker, _wrap_marker_is_stale
 
 PASS = "pass"
@@ -59,6 +59,7 @@ DEFAULT_PROXY_PORT = 8787
 _LOOPBACK_URL_RE = re.compile(r"https?://(?:127\.0\.0\.1|localhost):(\d+)")
 _CODEX_BASE_URL_RE = re.compile(r'(?m)^[ \t]*base_url\s*=\s*"([^"\r\n]+)"')
 _CODEX_MODEL_PROVIDER_RE = re.compile(r'(?m)^[ \t]*model_provider\s*=\s*"([^"\r\n]+)"')
+_CODEX_OPENAI_BASE_URL_RE = re.compile(r'(?m)^[ \t]*openai_base_url\s*=\s*"([^"\r\n]+)"')
 
 # Ollama's fixed default port. `ollama launch claude` writes
 # ``ANTHROPIC_BASE_URL=http://127.0.0.1:11434`` into the launched Claude Code
@@ -573,7 +574,19 @@ def check_wrap_marker_staleness(settings_path: Path) -> CheckResult:
 
 def codex_active_base_url(text: str) -> tuple[str, str | None]:
     """Return ``(provider_id, base_url)`` for the active Codex provider in ``text``."""
-    active_match = _CODEX_MODEL_PROVIDER_RE.search(text)
+    first_table = re.search(r"(?m)^[ \t]*\[", text)
+    root = text[: first_table.start()] if first_table is not None else text
+    # Only a root `model_provider` picks the default session's provider; one
+    # under `[profiles.*]` applies only when that profile is selected.
+    active_match = _CODEX_MODEL_PROVIDER_RE.search(root)
+    if active_match is None or active_match.group(1) == "openai":
+        # A root `openai_base_url` re-points Codex's built-in `openai` provider
+        # (the default when `model_provider` is unset), so it beats an inactive
+        # `[model_providers.headroom]` table. Headroom Desktop routes this way
+        # because the ChatGPT app hides features for any other provider.
+        root_url = _CODEX_OPENAI_BASE_URL_RE.search(root)
+        if root_url is not None:
+            return "openai", root_url.group(1)
     provider_id = active_match.group(1) if active_match else "headroom"
     return provider_id, _codex_provider_base_url(text, provider_id)
 
@@ -659,6 +672,24 @@ def _codex_provider_base_url(text: str, provider_id: str) -> str | None:
         section = section[: next_section.start()]
     base_url_match = _CODEX_BASE_URL_RE.search(section)
     return base_url_match.group(1) if base_url_match else None
+
+
+def _configured_client_ports(
+    claude_paths: Sequence[Path], codex_paths: Sequence[Path]
+) -> list[int]:
+    """Loopback ports the Claude Code and Codex configs (project and user) send traffic to.
+
+    Headroom Desktop (port 6767) and ``wrap --port N`` leave no deployment
+    manifest, so without these a bare ``doctor`` only ever finds 8787.
+    """
+    urls = [_claude_base_url_in(path)[0] for path in claude_paths]
+    for path in codex_paths:
+        try:
+            text = path.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        urls.append(codex_active_base_url(text)[1] or "")
+    return [port for port in map(loopback_port, urls) if port is not None]
 
 
 def _codex_block_missing_openai_auth(
@@ -1211,20 +1242,25 @@ def doctor(
     health = probe_json(f"{base_url}/health", timeout=5.0) if livez else None
     stats = probe_json(f"{base_url}/stats", timeout=5.0) if livez else None
     installed = get_version()
+    project_claude_settings = Path.cwd() / ".claude" / "settings.json"
+    project_local_claude_settings = Path.cwd() / ".claude" / "settings.local.json"
     live_elsewhere = None
     if livez is None:
         # Cheap, bounded: only ports Headroom recorded (HEADROOM_PORT, 8787,
-        # deployment manifests, the project's wrap marker), probed in parallel.
+        # deployment manifests, the project's wrap marker) and the ports the
+        # agents are configured for, probed in parallel.
         live_elsewhere = find_live_proxy_elsewhere(
             port,
             manifests=manifests,
+            extra=_configured_client_ports(
+                [project_local_claude_settings, project_claude_settings, claude_settings_path()],
+                [codex_project_config_path(), codex_config_path()],
+            ),
             probe=lambda p: is_headroom_livez(
                 probe_json(f"http://127.0.0.1:{p}/livez", timeout=0.5)
             ),
         )
 
-    project_claude_settings = Path.cwd() / ".claude" / "settings.json"
-    project_local_claude_settings = Path.cwd() / ".claude" / "settings.local.json"
     checks = [
         note_live_proxy_elsewhere(check_proxy_liveness(livez, base_url), live_elsewhere),
         check_proxy_readiness(livez, readyz, base_url),
