@@ -2970,7 +2970,7 @@ class AnthropicHandlerMixin:
 
             # Memory: Inject context and tools — gated on MemoryDecision.
             # ``inject`` is False under bypass, missing handler, missing
-            # user_id, or HEADROOM_MEMORY_INJECTION_MODE in disabled/tool.
+            # user_id, or HEADROOM_MEMORY_INJECTION_MODE=disabled.
             # Pre-PR-this the gate was a raw conjunction that silently
             # ignored bypass; now bypass is honoured here on Anthropic
             # /v1/messages just as on /v1/responses.
@@ -2980,8 +2980,21 @@ class AnthropicHandlerMixin:
             # streaming path withholds their calls from the client.
             server_memory_tool_names: frozenset[str] = frozenset()
             if memory_decision.inject:
+                if self.memory_handler.config.inject_context and is_cache_mode(self.config.mode):
+                    # Cache mode never injects context, so the next-turn prefix
+                    # bytes stay byte-equal to this turn's bytes. Skip the search
+                    # too: its result could only be discarded (#4600).
+                    from headroom.proxy.helpers import log_memory_injection
+
+                    log_memory_injection(
+                        request_id=request_id,
+                        session_id=session_id,
+                        decision="skipped_cache_mode",
+                        bytes_injected=0,
+                        query=extract_user_query(optimized_messages) or "",
+                    )
                 # Search and inject memory context
-                if self.memory_handler.config.inject_context:
+                elif self.memory_handler.config.inject_context:
                     try:
                         async with stage_timer.measure("memory_context"):
                             memory_context = await asyncio.wait_for(
@@ -3016,16 +3029,6 @@ class AnthropicHandlerMixin:
                                     request_id=request_id,
                                     session_id=session_id,
                                     decision="skipped_disabled",
-                                    bytes_injected=0,
-                                    query=user_query,
-                                )
-                            elif is_cache_mode(self.config.mode):
-                                # Cache mode: skip injection entirely so the next-turn
-                                # prefix bytes remain byte-equal to this turn's bytes.
-                                log_memory_injection(
-                                    request_id=request_id,
-                                    session_id=session_id,
-                                    decision="skipped_cache_mode",
                                     bytes_injected=0,
                                     query=user_query,
                                 )
