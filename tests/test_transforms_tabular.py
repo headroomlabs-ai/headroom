@@ -410,6 +410,30 @@ def test_parse_markdown_table_drops_separator() -> None:
     assert all("---" not in cell for row in rows for cell in row)
 
 
+def test_parse_csv_keeps_empty_records() -> None:
+    headers, rows = parse_csv("a,b\n1,2\n,\n3,4")
+    assert headers == ["a", "b"]
+    assert rows == [["1", "2"], ["", ""], ["3", "4"]]
+
+
+def test_parse_csv_keeps_empty_records_tsv() -> None:
+    headers, rows = parse_csv("a\tb\n1\t2\n\t\n3\t4", delimiter="\t")
+    assert headers == ["a", "b"]
+    assert rows == [["1", "2"], ["", ""], ["3", "4"]]
+
+
+def test_parse_csv_keeps_quoted_empty_record() -> None:
+    headers, rows = parse_csv('a,b\n"",""\n1,2')
+    assert headers == ["a", "b"]
+    assert rows[0] == ["", ""]
+
+
+def test_parse_markdown_table_keeps_separator_like_body_row() -> None:
+    headers, rows = parse_markdown_table("| a | b |\n|---|---|\n| 1 | 2 |\n| --- | --- |")
+    assert headers == ["a", "b"]
+    assert rows == [["1", "2"], ["---", "---"]]
+
+
 def test_parse_tabular_rejects_ragged_fixed_width(monkeypatch) -> None:
     # Rows with differing cell counts can't be zipped under the headers
     # without misattributing columns (#1652) — must pass through.
@@ -562,7 +586,7 @@ def test_parse_tabular_rejects_single_column_fixed_width(monkeypatch) -> None:
 def test_parse_tabular_none_when_no_data_rows_survive() -> None:
     # Detected as a markdown table, but it is header + separator rows only:
     # nothing survives as a data row, so parse_tabular bails to None.
-    assert parse_tabular("| a | b |\n| --- | --- |\n| --- | --- |") is None
+    assert parse_tabular("| a | b |\n| --- | --- |") is None
 
 
 def test_compression_ratio_zero_for_empty_original() -> None:
