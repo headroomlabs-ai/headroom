@@ -114,10 +114,12 @@ HeadroomStrandsModel supports Strands' structured output feature:
 ```python
 from pydantic import BaseModel
 
+
 class Analysis(BaseModel):
     severity: str
     root_cause: str
     recommendation: str
+
 
 result = optimized.structured_output(Analysis, messages)
 ```

@@ -22,7 +22,7 @@ MODEL = "claude-haiku-4-5"
 
 
 def _key(cache: SemanticCache, **kw) -> str:
-    return cache._compute_key(MESSAGES, MODEL, **kw)
+    return cache._compute_key(MESSAGES, MODEL, partition="p_test", **kw)
 
 
 # --- too loose: different inputs must NOT collide (the bug) --------------------
@@ -40,6 +40,28 @@ def test_different_tools_distinct_keys():
     tools_a = [{"name": "read", "description": "read a file"}]
     tools_b = [{"name": "bash", "description": "run a command"}]
     assert _key(cache, tools=tools_a) != _key(cache, tools=tools_b)
+
+
+def test_tool_schema_cache_control_property_produces_distinct_key():
+    """A user-defined schema property is not a prompt-cache annotation."""
+    tools_without = [{"name": "maintain", "input_schema": {"type": "object", "properties": {}}}]
+    tools_with = [
+        {
+            "name": "maintain",
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "cache_control": {
+                        "type": "boolean",
+                        "description": "Flush the application cache",
+                    }
+                },
+            },
+        }
+    ]
+
+    cache = SemanticCache()
+    assert _key(cache, tools=tools_without) != _key(cache, tools=tools_with)
 
 
 @pytest.mark.parametrize(
@@ -106,6 +128,38 @@ def test_tools_cache_control_ignored():
     assert _key(cache, tools=tools_cc) == _key(cache, tools=tools_plain)
 
 
+def test_message_cache_control_breakpoint_move_same_key():
+    """A moved cache_control breakpoint on a *message* must not fragment the key.
+
+    Messages are the primary key component and, on the Anthropic path, the most
+    common place a client (e.g. Claude Code) moves a breakpoint between turns.
+    cache_control is a prompt-caching directive that never changes the
+    completion, so the two requests must share a cache entry — previously only
+    system/tools breakpoints were stripped, so a message breakpoint missed.
+    """
+    cache = SemanticCache()
+    messages_with_cc = [
+        {
+            "role": "user",
+            "content": [{"type": "text", "text": "hello", "cache_control": {"type": "ephemeral"}}],
+        }
+    ]
+    messages_without_cc = [{"role": "user", "content": [{"type": "text", "text": "hello"}]}]
+    assert cache._compute_key(messages_with_cc, MODEL, partition="p_test") == cache._compute_key(
+        messages_without_cc, MODEL, partition="p_test"
+    )
+
+
+def test_message_content_change_still_distinct_key():
+    """Stripping cache_control must not collapse genuinely different messages."""
+    cache = SemanticCache()
+    a = [{"role": "user", "content": [{"type": "text", "text": "hello"}]}]
+    b = [{"role": "user", "content": [{"type": "text", "text": "goodbye"}]}]
+    assert cache._compute_key(a, MODEL, partition="p_test") != cache._compute_key(
+        b, MODEL, partition="p_test"
+    )
+
+
 # --- behavioral get/set: collision prevented end to end -----------------------
 
 
@@ -113,11 +167,13 @@ async def test_get_set_collision_prevented():
     """Store under system A; fetching with system B is a MISS (no contamination),
     fetching with system A is a HIT."""
     cache = SemanticCache()
-    await cache.set(MESSAGES, MODEL, b"french-body", {}, system="Answer only in French.")
+    await cache.set(
+        MESSAGES, MODEL, b"french-body", {}, partition="p_test", system="Answer only in French."
+    )
 
-    miss = await cache.get(MESSAGES, MODEL, system="Answer only in English.")
+    miss = await cache.get(MESSAGES, MODEL, partition="p_test", system="Answer only in English.")
     assert miss is None
 
-    hit = await cache.get(MESSAGES, MODEL, system="Answer only in French.")
+    hit = await cache.get(MESSAGES, MODEL, partition="p_test", system="Answer only in French.")
     assert hit is not None
     assert hit.response_body == b"french-body"

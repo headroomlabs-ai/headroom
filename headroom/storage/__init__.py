@@ -1,5 +1,10 @@
 """Storage modules for Headroom SDK."""
 
+import logging
+import os
+
+from headroom.log_safety import describe_exception, safe_id
+
 from .base import Storage
 from .jsonl import JSONLStorage
 from .sqlite import SQLiteStorage
@@ -9,6 +14,23 @@ __all__ = [
     "SQLiteStorage",
     "JSONLStorage",
 ]
+
+logger = logging.getLogger(__name__)
+
+
+def _builtin_storage_path(store_url: str, scheme: str) -> str:
+    """Return the filesystem portion of a built-in storage URL."""
+    path = store_url.removeprefix(f"{scheme}://")
+    if (
+        os.name == "nt"
+        and len(path) >= 4
+        and path[0] == "/"
+        and path[1].isalpha()
+        and path[2] == ":"
+        and path[3] in ("/", "\\")
+    ):
+        return path[1:]
+    return path
 
 
 def create_storage(store_url: str) -> Storage:
@@ -29,15 +51,10 @@ def create_storage(store_url: str) -> Storage:
         Storage instance.
     """
     if store_url.startswith("sqlite://"):
-        path = store_url.replace("sqlite://", "")
-        # Handle sqlite:/// (3 slashes for absolute path)
-        if path.startswith("/"):
-            path = path  # Already absolute
+        path = _builtin_storage_path(store_url, "sqlite")
         return SQLiteStorage(path)
     elif store_url.startswith("jsonl://"):
-        path = store_url.replace("jsonl://", "")
-        if path.startswith("/"):
-            path = path
+        path = _builtin_storage_path(store_url, "jsonl")
         return JSONLStorage(path)
     else:
         # Unknown scheme: try entry point headroom.storage_backend[name=scheme]
@@ -52,7 +69,23 @@ def create_storage(store_url: str) -> Storage:
                     create_fn = ep.load()
                     result: Storage = create_fn(store_url)
                     return result
-            except Exception:
-                pass
+                logger.warning(
+                    "No headroom.storage_backend entry point for scheme %r; "
+                    "falling back to SQLite storage",
+                    scheme,
+                )
+            except Exception as e:
+                # The plugin's exception can echo the store URL, credentials included,
+                # so no level logs its message; DEBUG gets describe_exception (types and frames).
+                logger.warning(
+                    "Failed to load storage backend for scheme %r (%s); "
+                    "falling back to SQLite storage",
+                    scheme,
+                    safe_id(e),
+                )
+                if logger.isEnabledFor(logging.DEBUG):
+                    logger.debug(
+                        "Storage backend %r load failure: %s", scheme, describe_exception(e)
+                    )
         # Default to SQLite (legacy behavior)
         return SQLiteStorage(store_url)

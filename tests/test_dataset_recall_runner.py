@@ -72,7 +72,7 @@ def test_dataset_recall_records_compression_errors(monkeypatch) -> None:
     # as failed, the error is recorded, and the detail row carries it.
     from headroom.transforms.content_router import ContentRouter
 
-    def _boom(self, content, context="", question=None, bias=1.0):
+    def _boom(self, content, context="", question=None, bias=1.0, precomputed_detection=None):
         raise RuntimeError("router exploded")
 
     monkeypatch.setattr(ContentRouter, "compress", _boom)

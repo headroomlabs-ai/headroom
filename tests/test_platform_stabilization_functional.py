@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import time
 from typing import Any
+from unittest.mock import AsyncMock, Mock
 
 import pytest
 
@@ -13,6 +14,7 @@ from fastapi.testclient import TestClient
 
 from headroom.config import TransformResult
 from headroom.proxy.server import ProxyConfig, create_app
+from headroom.tokenizer import Tokenizer
 
 
 def _proxy_config(**overrides: Any) -> ProxyConfig:
@@ -56,6 +58,7 @@ def test_v1_compress_success_reports_actual_metrics(monkeypatch) -> None:
     proxy = app.state.proxy
     request_messages = [{"role": "user", "content": "summarize this repeated payload"}]
     compressed_messages = [{"role": "user", "content": "summary payload"}]
+    ccr_hash = "abc123def4567890abc123de"
 
     def fake_apply(**kwargs):
         assert kwargs["messages"] == request_messages
@@ -65,7 +68,7 @@ def test_v1_compress_success_reports_actual_metrics(monkeypatch) -> None:
             tokens_before=100,
             tokens_after=40,
             transforms_applied=["test:compress"],
-            markers_inserted=["marker-1"],
+            markers_inserted=[ccr_hash],
         )
 
     # The default /v1/compress mode runs a marker-free pipeline derived from
@@ -88,32 +91,37 @@ def test_v1_compress_success_reports_actual_metrics(monkeypatch) -> None:
     assert body["compression_ratio"] == 0.4
     assert body["transforms_applied"] == ["test:compress"]
     assert body["transforms_summary"] == {"test:compress": 1}
-    assert body["ccr_hashes"] == ["marker-1"]
+    assert body["ccr_hashes"] == [ccr_hash]
 
 
-def test_v1_compress_timeout_fails_open_quickly(monkeypatch) -> None:
+def test_v1_compress_timeout_fails_open_without_retry_or_recount(monkeypatch) -> None:
     monkeypatch.setenv("HEADROOM_SKIP_UPSTREAM_CHECK", "1")
     app = create_app(_proxy_config())
     proxy = app.state.proxy
     request_messages = [{"role": "user", "content": "do not mutate me"}]
 
-    async def timeout_executor(fn, *, timeout):  # noqa: ANN001
-        raise TimeoutError("compression deadline exceeded")
-
+    timeout_executor = AsyncMock(side_effect=TimeoutError("compression deadline exceeded"))
+    pipeline_apply = Mock(side_effect=AssertionError("compression must not retry inline"))
+    count_messages = Mock(side_effect=AssertionError("timeout must not recount tokens"))
     monkeypatch.setattr(proxy, "_run_compression_in_executor", timeout_executor)
+    monkeypatch.setattr(proxy._compress_pipeline_cache["no_ccr"], "apply", pipeline_apply)
 
     with TestClient(app, base_url="http://127.0.0.1", client=("127.0.0.1", 12345)) as client:
-        started = time.perf_counter()
+        # Check the fail-open contract, not host speed: outcome bookkeeping
+        # after the timeout can include pricing and durable savings writes.
+        monkeypatch.setattr(Tokenizer, "count_messages", count_messages)
         response = client.post(
             "/v1/compress",
             json={"model": "gpt-4o", "messages": request_messages},
         )
-        elapsed = time.perf_counter() - started
 
     body = response.json()
     assert response.status_code == 200
-    assert elapsed < 0.5
+    timeout_executor.assert_awaited_once()
+    pipeline_apply.assert_not_called()
+    count_messages.assert_not_called()
     assert body["messages"] == request_messages
+    assert body["tokens_before"] == body["tokens_after"] == 0
     assert body["tokens_saved"] == 0
     assert body["compression_ratio"] == 1.0
     assert body["transforms_applied"] == []
@@ -167,3 +175,35 @@ def test_v1_compress_real_json_tool_payload_reduces_tokens(monkeypatch) -> None:
     assert body["tokens_saved"] > 0
     assert body["compression_ratio"] < 1.0
     assert body["transforms_applied"], body
+
+
+def test_compression_quarantine_releases_after_time_cap(monkeypatch) -> None:
+    """A leaked/hung timed-out worker must not pin the quarantine open forever:
+    once the time cap lapses, compression resumes and the release is counted
+    once (#2360)."""
+    import asyncio
+
+    from headroom.proxy.server import CompressionQuarantinedError
+
+    monkeypatch.setenv("HEADROOM_SKIP_UPSTREAM_CHECK", "1")
+    app = create_app(_proxy_config())
+    proxy = app.state.proxy
+
+    # Simulate a timed-out worker that is still running (debt standing).
+    proxy._compression_timed_out_in_flight = 1
+
+    # Within the cap: new compression is quarantined.
+    proxy._compression_quarantine_deadline = time.monotonic() + 1000.0
+    with pytest.raises(CompressionQuarantinedError):
+        asyncio.run(proxy._run_compression_in_executor(lambda: "unused", timeout=5.0))
+    assert proxy._compression_quarantine_releases == 0
+
+    # Past the cap: the worker is presumed leaked and compression runs again;
+    # the release is recorded once.
+    proxy._compression_quarantine_deadline = time.monotonic() - 1.0
+    assert asyncio.run(proxy._run_compression_in_executor(lambda: "ran", timeout=5.0)) == "ran"
+    assert proxy._compression_quarantine_releases == 1
+
+    # A subsequent request is not re-counted and still runs.
+    assert asyncio.run(proxy._run_compression_in_executor(lambda: "ok", timeout=5.0)) == "ok"
+    assert proxy._compression_quarantine_releases == 1

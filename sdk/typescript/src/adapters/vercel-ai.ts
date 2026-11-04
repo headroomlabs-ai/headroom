@@ -5,8 +5,7 @@ import { vercelToOpenAI, openAIToVercel } from "../utils/format.js";
 
 /**
  * Minimal structural type for Vercel AI SDK language models.
- * Compatible with both LanguageModelV1 (@ai-sdk/provider <=1.x)
- * and LanguageModelV3 (@ai-sdk/provider >=2.x).
+ * Compatible with LanguageModelV1, LanguageModelV3, and LanguageModelV4.
  */
 interface LanguageModel {
   readonly specificationVersion: string;
@@ -21,7 +20,7 @@ interface LanguageModel {
 type VercelMessage = any;
 
 /**
- * Vercel AI SDK LanguageModelV3Middleware that compresses messages
+ * Vercel AI SDK language model middleware that compresses messages
  * before they reach the LLM.
  *
  * @example

@@ -69,7 +69,14 @@ _ERROR_PATTERNS: list[tuple[re.Pattern[str], ErrorCategory]] = [
         ErrorCategory.USER_REJECTED,
     ),
     (re.compile(r"[Ss]ibling tool call errored", re.I), ErrorCategory.SIBLING_ERROR),
-    (re.compile(r"exit code|non-zero|exited with", re.I), ErrorCategory.EXIT_CODE),
+    # A signal kill is the shell's exit status 128+N, so it shares EXIT_CODE.
+    (
+        re.compile(
+            r"exit code|non-zero|exited with|killed by signal|^\s*Killed(?::\s*\d+)?\s*$",
+            re.I | re.M,
+        ),
+        ErrorCategory.EXIT_CODE,
+    ),
     (
         re.compile(r"BUILD FAILED|compilation error|compile error", re.I),
         ErrorCategory.BUILD_FAILURE,
@@ -83,6 +90,14 @@ def classify_error(content: str) -> ErrorCategory:
         if pattern.search(content[:2000]):  # Only check first 2KB
             return category
     return ErrorCategory.UNKNOWN
+
+
+# "exit code" only signals an error for a NONZERO code. Agent harnesses (Codex,
+# Grok, opencode, ...) append "exit code 0" to every SUCCESSFUL shell command,
+# so a bare "exit code" substring wrongly flagged those as errors and inflated
+# the learned failure rate. Match a nonzero code (case-insensitive, so
+# "Exit code: 1" counts too), never "exit code 0".
+_NONZERO_EXIT_RE = re.compile(r"exit code:?\s*(?!0\b)\d", re.IGNORECASE)
 
 
 def is_error_content(content: str) -> bool:
@@ -105,10 +120,11 @@ def is_error_content(content: str) -> bool:
         "auto-denied",
         "Sibling tool call errored",
         "timed out",
-        "exit code",
         "FileNotFoundError",
     ]
-    return any(ind in snippet for ind in indicators)
+    if any(ind in snippet for ind in indicators):
+        return True
+    return bool(_NONZERO_EXIT_RE.search(snippet))
 
 
 # =============================================================================

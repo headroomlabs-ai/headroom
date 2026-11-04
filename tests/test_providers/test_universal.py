@@ -1,6 +1,7 @@
 """Tests for universal provider support.
 
-Tests OpenAICompatibleProvider, GoogleProvider, and LiteLLMProvider.
+Tests OpenAICompatibleProvider, OpenAIProvider, GoogleProvider, and
+LiteLLMProvider.
 """
 
 from __future__ import annotations
@@ -12,6 +13,7 @@ from headroom.providers import (
     LiteLLMProvider,
     ModelCapabilities,
     OpenAICompatibleProvider,
+    OpenAIProvider,
     create_anyscale_provider,
     create_fireworks_provider,
     create_groq_provider,
@@ -90,7 +92,13 @@ class TestOpenAICompatibleProvider:
         assert provider.get_context_limit("deepseek-v2") == 128000
         assert provider.get_context_limit("deepseek-v3.2") == 128000
         assert provider.get_context_limit("deepseek-v4-pro") == 1_000_000
-        assert provider.get_context_limit("deepseek-v4-flash") == 1_000_000
+        # All three flash-family ids — the current one plus the two retired
+        # aliases DeepSeek still accepts — are served by V4.1-Flash at 1M on
+        # both providers that carry a DeepSeek row.
+        for p in (provider, OpenAIProvider()):
+            assert p.get_context_limit("deepseek-flash") == 1_000_000
+            assert p.get_context_limit("deepseek-v4-flash") == 1_000_000
+            assert p.get_context_limit("deepseek-v4-flash-vision-exp") == 1_000_000
         assert provider.get_context_limit("deepseek-r1") == 131072
         assert provider.get_context_limit("deepseek-coder-v2") == 128000
 
@@ -443,22 +451,13 @@ class TestLiteLLMProvider:
                 "output-model": {"max_output_tokens": 6000},
             }[model],
         )
+        # Cost now resolves through the shared pricing helper rather than a
+        # direct `litellm.completion_cost` call, so patch that seam. The helper
+        # returns None (not an exception) for a model LiteLLM can't price.
         monkeypatch.setattr(
             litellm_module,
-            "litellm",
-            type(
-                "LiteLLM",
-                (),
-                {
-                    "completion_cost": staticmethod(
-                        lambda **kwargs: (
-                            1.23
-                            if kwargs["model"] == "priced-model"
-                            else (_ for _ in ()).throw(RuntimeError("missing price"))
-                        )
-                    )
-                },
-            )(),
+            "estimate_cost_from_tokens",
+            lambda model, **kwargs: 1.23 if model == "priced-model" else None,
         )
 
         provider = litellm_module.LiteLLMProvider()

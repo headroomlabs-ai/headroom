@@ -16,12 +16,13 @@ from __future__ import annotations
 import asyncio
 import logging
 import uuid
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from headroom.memory.adapters.graph_models import Entity, Relationship, Subgraph
-from headroom.memory.models import Memory
+from headroom.memory.models import Memory, normalize_entity_refs
 from headroom.memory.ports import MemorySearchResult
 from headroom.models.config import ML_MODEL_DEFAULTS
 
@@ -284,8 +285,15 @@ class LocalBackend:
         # Determine if using pre-extraction mode
         has_pre_extraction = bool(facts or extracted_entities or extracted_relationships)
 
-        # Merge entity names from both simple and typed formats
-        all_entity_names: list[str] = list(entities) if entities else []
+        # Merge entity names from both simple and typed formats.
+        #
+        # `entities` is typed list[str], but it is populated straight from
+        # LLM-supplied memory_save tool arguments, and callers do sometimes
+        # pass the typed {"entity": ..., "entity_type": ...} shape here (that
+        # is what extracted_entities is for). Normalizing keeps those dicts out
+        # of entity_refs, where they used to crash every later search that
+        # retrieved the row -- see issue #2947.
+        all_entity_names: list[str] = normalize_entity_refs(entities)
         entity_types: dict[str, str] = {}
 
         if extracted_entities:
@@ -398,6 +406,19 @@ class LocalBackend:
         # Return primary memory
         return primary_memory
 
+    async def prepare_search_query(self, user_text: str, context: str) -> str:
+        """Apply the active local model's query window, including on cold backends."""
+        await self._ensure_initialized()
+        assert self._hierarchical_memory is not None
+        prepare: Callable[[str, str], Awaitable[str]] | None = getattr(
+            self._hierarchical_memory.embedder, "prepare_query", None
+        )
+        if prepare is not None:
+            return await prepare(user_text, context)
+        # Remote embedders do not expose their tokenizer; callers still supply
+        # character-bounded sources, without claiming a remote token guarantee.
+        return "\n".join(part for part in (user_text, context) if part)
+
     async def search_memories(
         self,
         query: str,
@@ -448,13 +469,17 @@ class LocalBackend:
                 continue
 
             seen_memory_ids.add(vr.memory.id)
-            all_entity_refs.update(vr.memory.entity_refs)
+            # Defense in depth: the storage adapters normalize entity_refs on
+            # load, but a backend that hands us Memory objects some other way
+            # must not be able to abort the whole search with one bad row.
+            entity_refs = normalize_entity_refs(vr.memory.entity_refs)
+            all_entity_refs.update(entity_refs)
 
             results.append(
                 MemorySearchResult(
                     memory=vr.memory,
                     score=vr.similarity,
-                    related_entities=list(vr.memory.entity_refs),
+                    related_entities=entity_refs,
                     related_memories=[],
                 )
             )
@@ -503,15 +528,17 @@ class LocalBackend:
                         MemorySearchResult(
                             memory=memory,
                             score=0.5,  # Default score for graph-expanded results
-                            related_entities=list(memory.entity_refs),
+                            related_entities=normalize_entity_refs(memory.entity_refs),
                             related_memories=[],
                         )
                     )
                     seen_memory_ids.add(mem_id)
 
-        # Filter by specified entities if provided
+        # Filter by specified entities if provided. Like the save path, this
+        # argument arrives from LLM-supplied tool input, so it gets the same
+        # normalization rather than trusting its list[str] annotation.
         if entities:
-            entities_lower = {e.lower() for e in entities}
+            entities_lower = {e.lower() for e in normalize_entity_refs(entities)}
             results = [
                 r
                 for r in results
@@ -527,6 +554,12 @@ class LocalBackend:
         await self._ensure_initialized()
         assert self._hierarchical_memory is not None
         return await self._hierarchical_memory.record_access(memory_ids)
+
+    async def refresh_memory_indexes(self, memory_id: str) -> Memory | None:
+        """Refresh vector metadata and cache state from the primary store."""
+        await self._ensure_initialized()
+        assert self._hierarchical_memory is not None
+        return await self._hierarchical_memory.refresh_memory_indexes(memory_id)
 
     async def update_memory(
         self,
@@ -820,7 +853,7 @@ class LocalBackend:
             MemorySearchResult(
                 memory=tr.memory,
                 score=tr.score,
-                related_entities=list(tr.memory.entity_refs),
+                related_entities=normalize_entity_refs(tr.memory.entity_refs),
                 related_memories=[],
             )
             for tr in text_results

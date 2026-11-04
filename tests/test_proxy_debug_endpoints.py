@@ -35,7 +35,11 @@ from headroom.proxy.ws_session_registry import (
 
 
 @pytest.fixture
-def client():
+def client(monkeypatch):
+    # Debug endpoint tests must not depend on live upstream network access.
+    # Dedicated health-check tests cover both successful and failed upstream
+    # probes in tests/test_proxy_healthchecks.py.
+    monkeypatch.setenv("HEADROOM_SKIP_UPSTREAM_CHECK", "1")
     config = ProxyConfig(
         optimize=False,
         cache_enabled=False,
@@ -123,8 +127,9 @@ def app_and_rebinding_client():
 def test_is_loopback_host_accepts_canonical_hosts():
     for host in LOOPBACK_HOSTS:
         assert is_loopback_host(host) is True
-    # None (TestClient with no client info) is treated as loopback.
-    assert is_loopback_host(None) is True
+    # None (no peer address: UDS, adapters, bare request doubles) is NOT
+    # loopback — every guard built on this must fail closed, not open.
+    assert is_loopback_host(None) is False
 
 
 def test_is_loopback_host_rejects_external_hosts():

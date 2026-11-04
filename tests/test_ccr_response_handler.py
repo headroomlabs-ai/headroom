@@ -419,6 +419,53 @@ class TestCCRResponseHandling:
         assert result == final_response
 
     @pytest.mark.asyncio
+    async def test_continuation_failure_logs_cause_for_empty_str_exception(self, caplog):
+        """A continuation exception whose str() is empty (e.g.
+        httpx.TimeoutException(''), a bare Exception()) must still log its
+        cause. Interpolating str(e) alone produced a log line with nothing
+        after the colon, losing the type entirely (#3129)."""
+        store = get_compression_store()
+        hash_key = store.store(
+            original=json.dumps([{"id": i} for i in range(50)]),
+            compressed="[]",
+            original_item_count=50,
+        )
+
+        handler = CCRResponseHandler()
+        initial_response = {
+            "content": [
+                {"type": "text", "text": "Let me get that data."},
+                {
+                    "type": "tool_use",
+                    "id": "tool_123",
+                    "name": CCR_TOOL_NAME,
+                    "input": {"hash": hash_key},
+                },
+            ]
+        }
+
+        async def failing_api_call(messages, tools):
+            raise Exception("")  # empty str(e), non-empty repr()
+
+        with caplog.at_level("ERROR", logger="headroom.ccr.response_handler"):
+            result = await handler.handle_response(
+                initial_response,
+                [{"role": "user", "content": "Get me the data"}],
+                None,
+                failing_api_call,
+                "anthropic",
+            )
+
+        # Degrades to the current response rather than raising.
+        assert result == initial_response
+        # The cause survives: the type name appears even though str(e) is "".
+        failure_logs = [r.getMessage() for r in caplog.records if "Continuation" in r.getMessage()]
+        assert failure_logs
+        assert "Exception" in failure_logs[0]
+        # Regression guard: never a bare "...failed: " with nothing after it.
+        assert not failure_logs[0].rstrip().endswith("failed:")
+
+    @pytest.mark.asyncio
     async def test_handle_response_max_rounds(self):
         """Respects max retrieval rounds limit."""
         store = get_compression_store()
@@ -476,14 +523,13 @@ class TestCCRResponseHandling:
         assert result == response
 
     @pytest.mark.asyncio
-    async def test_handle_response_mixed_tools_skips_ccr(self):
-        """When CCR and non-CCR tools are called together, skip CCR.
+    async def test_handle_response_mixed_tools_serves_retrieval(self):
+        """CCR called alongside a client tool: serve the retrieval now.
 
-        Building a valid continuation is impossible without results for the
-        non-CCR tools (Anthropic requires every tool_use to have a
-        tool_result). Skipping CCR avoids a wasted 400 API call and returns
-        the original response immediately so the client can resolve all
-        tool calls itself.
+        The client has no headroom_retrieve, so handing the turn back made
+        Claude Code answer "No such tool available: headroom_retrieve" and the
+        model never got the content. The client tool has not run yet, so it is
+        dropped from the continuation and the model re-issues it there.
         """
         store = get_compression_store()
         hash_key = store.store(original="[1,2,3]", compressed="[]")
@@ -492,6 +538,7 @@ class TestCCRResponseHandling:
 
         mixed_response = {
             "content": [
+                {"type": "text", "text": "Reading both."},
                 {
                     "type": "tool_use",
                     "id": "ccr_call",
@@ -504,21 +551,269 @@ class TestCCRResponseHandling:
                     "name": "read_file",
                     "input": {"path": "/etc/config"},
                 },
-            ]
+            ],
+            "stop_reason": "tool_use",
         }
-
-        api_call_count = 0
+        reissued = {
+            "content": [
+                {
+                    "type": "tool_use",
+                    "id": "user_call_2",
+                    "name": "read_file",
+                    "input": {"path": "/etc/config"},
+                }
+            ],
+            "stop_reason": "tool_use",
+        }
+        sent = []
 
         async def mock_api_call(messages, tools):
-            nonlocal api_call_count
-            api_call_count += 1
-            return {"content": [{"type": "text", "text": "continuation"}]}
+            sent.append(messages)
+            return reissued
 
         result = await handler.handle_response(mixed_response, [], None, mock_api_call, "anthropic")
 
-        # CCR skipped — no continuation call made (avoids the 400 API round-trip)
-        assert api_call_count == 0, "should not attempt continuation with mixed tools"
-        # Original response returned unchanged so client can handle all tool calls
+        assert len(sent) == 1
+        assistant, tool_result = sent[0]
+        assert [b.get("id") for b in assistant["content"]] == [None, "ccr_call"]
+        assert tool_result["content"][0]["tool_use_id"] == "ccr_call"
+        assert "[1,2,3]" in tool_result["content"][0]["content"]
+        # The client gets the re-issued client tool, never headroom_retrieve.
+        assert result is reissued
+        assert handler.residual_ccr_status(result, "anthropic") == "resolved"
+        # The model's own response is not mutated.
+        assert len(mixed_response["content"]) == 3
+
+    @pytest.mark.asyncio
+    async def test_handle_response_mixed_tools_serves_retrieval_openai(self):
+        store = get_compression_store()
+        hash_key = store.store(original="[1,2,3]", compressed="[]")
+
+        handler = CCRResponseHandler()
+
+        def call(call_id, name, arguments):
+            return {
+                "id": call_id,
+                "type": "function",
+                "function": {"name": name, "arguments": arguments},
+            }
+
+        mixed_response = {
+            "choices": [
+                {
+                    "message": {
+                        "role": "assistant",
+                        "content": None,
+                        "tool_calls": [
+                            call("call_user", "read_file", '{"path": "/etc/config"}'),
+                            call("call_ccr", CCR_TOOL_NAME, json.dumps({"hash": hash_key})),
+                        ],
+                    },
+                    "finish_reason": "tool_calls",
+                }
+            ]
+        }
+        final = {
+            "choices": [
+                {
+                    "message": {
+                        "role": "assistant",
+                        "content": None,
+                        "tool_calls": [call("call_user_2", "read_file", '{"path":"/etc/config"}')],
+                    },
+                    "finish_reason": "tool_calls",
+                }
+            ]
+        }
+        sent = []
+
+        async def mock_api_call(messages, tools):
+            sent.append(messages)
+            return final
+
+        result = await handler.handle_response(mixed_response, [], None, mock_api_call, "openai")
+
+        assert result is final
+        assistant, tool_result = sent[0]
+        assert [c["id"] for c in assistant["tool_calls"]] == ["call_ccr"]
+        assert tool_result["tool_call_id"] == "call_ccr"
+
+    @staticmethod
+    def _mixed_turn(hash_key, client_input):
+        return {
+            "content": [
+                {
+                    "type": "tool_use",
+                    "id": "ccr_call",
+                    "name": CCR_TOOL_NAME,
+                    "input": {"hash": hash_key},
+                },
+                {
+                    "type": "tool_use",
+                    "id": "user_call",
+                    "name": "write_file",
+                    "input": client_input,
+                },
+            ],
+            "stop_reason": "tool_use",
+        }
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "continuation",
+        [
+            # Withdraws the client call once it has the content.
+            {
+                "content": [{"type": "text", "text": "Do not overwrite old.txt."}],
+                "stop_reason": "end_turn",
+            },
+            # Changes it.
+            {
+                "content": [
+                    {
+                        "type": "tool_use",
+                        "id": "user_call_2",
+                        "name": "write_file",
+                        "input": {"path": "new.txt", "content": "safe output"},
+                    }
+                ],
+                "stop_reason": "tool_use",
+            },
+            # Re-issues it unchanged.
+            {
+                "content": [
+                    {
+                        "type": "tool_use",
+                        "id": "user_call_2",
+                        "name": "write_file",
+                        "input": {"path": "old.txt", "content": "overwrite"},
+                    }
+                ],
+                "stop_reason": "tool_use",
+            },
+        ],
+        ids=["withdrawn", "changed", "reissued"],
+    )
+    async def test_handle_response_mixed_tools_returns_the_continuation(self, continuation):
+        """The continuation is the model's newer decision, made with the
+        retrieved content: the client gets it, never the dropped call."""
+        store = get_compression_store()
+        hash_key = store.store(original="[1,2,3]", compressed="[]")
+        mixed_response = self._mixed_turn(hash_key, {"path": "old.txt", "content": "overwrite"})
+
+        async def mock_api_call(messages, tools):
+            return continuation
+
+        result = await CCRResponseHandler().handle_response(
+            mixed_response, [], None, mock_api_call, "anthropic"
+        )
+
+        assert result is continuation
+        assert "user_call" not in [b.get("id") for b in result["content"]]
+
+    @pytest.mark.asyncio
+    async def test_handle_response_mixed_tools_failed_continuation_returns_turn(self):
+        """No newer decision: the client gets the model's own turn, client
+        call included, as before (#839)."""
+        store = get_compression_store()
+        hash_key = store.store(original="[1,2,3]", compressed="[]")
+        mixed_response = self._mixed_turn(hash_key, {"path": "/tmp/out"})
+
+        async def mock_api_call(messages, tools):
+            raise RuntimeError("upstream down")
+
+        result = await CCRResponseHandler().handle_response(
+            mixed_response, [], None, mock_api_call, "anthropic"
+        )
+
+        assert result is mixed_response
+
+    @pytest.mark.asyncio
+    async def test_handle_response_mixed_tools_later_failure_keeps_the_continuation(self):
+        """A continuation that succeeded supersedes the mixed turn even when a
+        later retrieval round fails."""
+        store = get_compression_store()
+        hash_key = store.store(original="[1,2,3]", compressed="[]")
+        mixed_response = self._mixed_turn(hash_key, {"path": "/tmp/out"})
+        retrieve_again = {
+            "content": [
+                {
+                    "type": "tool_use",
+                    "id": "ccr_call_2",
+                    "name": CCR_TOOL_NAME,
+                    "input": {"hash": hash_key},
+                }
+            ],
+            "stop_reason": "tool_use",
+        }
+        calls = 0
+
+        async def mock_api_call(messages, tools):
+            nonlocal calls
+            calls += 1
+            if calls > 1:
+                raise RuntimeError("upstream down")
+            return retrieve_again
+
+        result = await CCRResponseHandler().handle_response(
+            mixed_response, [], None, mock_api_call, "anthropic"
+        )
+
+        assert calls == 2
+        assert result is retrieve_again
+
+    @pytest.mark.asyncio
+    async def test_handle_response_malformed_ccr_call_keeps_turn(self):
+        """A headroom_retrieve without a valid hash is not a client call to
+        drop: the turn is handed back unchanged."""
+        store = get_compression_store()
+        hash_key = store.store(original="[1,2,3]", compressed="[]")
+        mixed_response = self._mixed_turn(hash_key, {})
+        mixed_response["content"][1]["name"] = CCR_TOOL_NAME
+
+        async def mock_api_call(messages, tools):
+            raise AssertionError("no continuation when a CCR call is malformed")
+
+        result = await CCRResponseHandler().handle_response(
+            mixed_response, [], None, mock_api_call, "anthropic"
+        )
+
+        assert result is mixed_response
+
+    @pytest.mark.asyncio
+    async def test_handle_response_mixed_tools_responses_still_skips(self):
+        """Responses API: a function_call can be the item a reasoning item
+        requires next, so a sibling is not dropped there; the turn is handed
+        back unchanged as before (#839)."""
+        store = get_compression_store()
+        hash_key = store.store(original="[1,2,3]", compressed="[]")
+
+        handler = CCRResponseHandler()
+        mixed_response = {
+            "output": [
+                {"type": "reasoning", "id": "rs_1", "summary": []},
+                {
+                    "type": "function_call",
+                    "call_id": "call_user",
+                    "name": "read_file",
+                    "arguments": "{}",
+                },
+                {
+                    "type": "function_call",
+                    "call_id": "call_ccr",
+                    "name": CCR_TOOL_NAME,
+                    "arguments": json.dumps({"hash": hash_key}),
+                },
+            ]
+        }
+
+        async def mock_api_call(messages, tools):
+            raise AssertionError("no continuation for a Responses mixed turn")
+
+        result = await handler.handle_response(
+            mixed_response, [], None, mock_api_call, "openai_responses"
+        )
+
         assert result is mixed_response
 
 

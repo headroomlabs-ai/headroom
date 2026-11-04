@@ -40,6 +40,16 @@ Closes #
 - Observed result:
 - Not tested:
 
+## Runtime Rollout Safety
+
+- Rollout-managed feature(s):
+- Minimum rollout channel:
+- Stable/default behavior changed:
+- Kill switch / disable path:
+- Unsafe override required:
+- Qualification impact:
+- Rollback path:
+
 ## Review Readiness
 
 - [ ] I have performed a self-review

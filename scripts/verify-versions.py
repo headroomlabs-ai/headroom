@@ -40,9 +40,13 @@ def main() -> None:
     versions = {
         "pyproject.toml": py_ver,
         "plugins/openclaw/package.json": _read_json_version(ROOT / "plugins/openclaw/package.json"),
+        "plugins/opencode/package.json": _read_json_version(ROOT / "plugins/opencode/package.json"),
         "sdk/typescript/package.json": _read_json_version(ROOT / "sdk/typescript/package.json"),
         "plugins/headroom-agent-hooks/.claude-plugin/plugin.json": _read_json_version(
             ROOT / "plugins/headroom-agent-hooks/.claude-plugin/plugin.json"
+        ),
+        "plugins/headroom-snip/.claude-plugin/plugin.json": _read_json_version(
+            ROOT / "plugins/headroom-snip/.claude-plugin/plugin.json"
         ),
         "plugins/headroom-agent-hooks/.github/plugin/plugin.json": _read_json_version(
             ROOT / "plugins/headroom-agent-hooks/.github/plugin/plugin.json"

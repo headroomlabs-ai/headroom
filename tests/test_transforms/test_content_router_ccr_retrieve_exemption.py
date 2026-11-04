@@ -181,6 +181,20 @@ class TestContentRouterCcrRetrieveExemption:
         assert "<<ccr:" not in tool_msg["content"]
         assert "router:excluded:ccr_retrieve" in result.transforms_applied
 
+    def test_server_tool_mcp_name_not_recompressed(self):
+        """OpenCode's <server>_<tool> name must resolve to the excluded tool."""
+        content = _big_json()
+        router = ContentRouter(ContentRouterConfig(min_section_tokens=10))
+        tokenizer = _get_tokenizer()
+
+        messages = _openai_messages("headroom_headroom_retrieve", content)
+        result = router.apply(messages, tokenizer)
+
+        tool_msg = next(m for m in result.messages if m.get("tool_call_id") == "call_ccr_1")
+        assert tool_msg["content"] == content
+        assert "<<ccr:" not in tool_msg["content"]
+        assert "router:excluded:ccr_retrieve" in result.transforms_applied
+
     def test_bare_tool_name_also_protected(self):
         """The proxy's own internally-injected retrieval tool uses the bare
         name (not MCP-qualified) — must be protected too, matching the

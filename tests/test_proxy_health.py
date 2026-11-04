@@ -69,7 +69,8 @@ def test_readyz_excludes_kompress_from_aggregate_readiness(monkeypatch):
     assert payload["checks"]["kompress"] == {
         "enabled": True,
         "ready": False,
-        "status": "unhealthy",
+        "status": "degraded",
+        "optional": True,
         "backend": None,
     }
 
@@ -85,6 +86,7 @@ def test_readyz_promotes_deferred_kompress_after_runtime_load(monkeypatch):
         "enabled": True,
         "ready": True,
         "status": "healthy",
+        "optional": True,
         "backend": "onnx",
     }
     # The promotion must also clear the startup marker, otherwise the slot
@@ -110,6 +112,7 @@ def test_readyz_promotes_kompress_from_module_cache(monkeypatch, attached):
         "enabled": True,
         "ready": True,
         "status": "healthy",
+        "optional": True,
         "backend": "onnx",
     }
     assert proxy.warmup.kompress.handle is model
@@ -141,7 +144,8 @@ def test_readyz_keeps_pending_kompress_unloaded(monkeypatch):
     assert payload["checks"]["kompress"] == {
         "enabled": True,
         "ready": False,
-        "status": "unhealthy",
+        "status": "degraded",
+        "optional": True,
         "backend": None,
     }
     assert compressor.calls == ["is_ready"]
@@ -181,6 +185,7 @@ def test_readyz_disabled_kompress_skips_inspection(monkeypatch):
         "enabled": False,
         "ready": True,
         "status": "disabled",
+        "optional": True,
         "backend": None,
     }
     assert compressor.calls == []
@@ -202,6 +207,7 @@ def test_readyz_per_provider_kompress_override_reenables_health(monkeypatch):
         "enabled": True,
         "ready": True,
         "status": "healthy",
+        "optional": True,
         "backend": "onnx",
     }
     assert compressor.calls == ["is_ready", "ready_backend"]
@@ -222,7 +228,8 @@ def test_readyz_never_calls_lazy_kompress_getters(monkeypatch):
     assert payload["checks"]["kompress"] == {
         "enabled": True,
         "ready": False,
-        "status": "unhealthy",
+        "status": "degraded",
+        "optional": True,
         "backend": None,
     }
 
@@ -234,37 +241,73 @@ def test_readyz_never_calls_lazy_kompress_getters(monkeypatch):
             "null",
             None,
             False,
-            {"enabled": True, "ready": False, "status": "unhealthy", "backend": None},
+            {
+                "enabled": True,
+                "ready": False,
+                "status": "degraded",
+                "optional": True,
+                "backend": None,
+            },
         ),
         (
             "null",
             _ReadyCompressor(),
             False,
-            {"enabled": True, "ready": True, "status": "healthy", "backend": "onnx"},
+            {
+                "enabled": True,
+                "ready": True,
+                "status": "healthy",
+                "optional": True,
+                "backend": "onnx",
+            },
         ),
         (
             "null",
             _ReadyCompressor(backend="remote"),
             False,
-            {"enabled": True, "ready": True, "status": "healthy", "backend": "remote"},
+            {
+                "enabled": True,
+                "ready": True,
+                "status": "healthy",
+                "optional": True,
+                "backend": "remote",
+            },
         ),
         (
             "error",
             _ReadyCompressor(),
             False,
-            {"enabled": True, "ready": True, "status": "healthy", "backend": "onnx"},
+            {
+                "enabled": True,
+                "ready": True,
+                "status": "healthy",
+                "optional": True,
+                "backend": "onnx",
+            },
         ),
         (
             "loaded",
             _ReadyCompressor(),
             False,
-            {"enabled": True, "ready": True, "status": "healthy", "backend": "existing"},
+            {
+                "enabled": True,
+                "ready": True,
+                "status": "healthy",
+                "optional": True,
+                "backend": "existing",
+            },
         ),
         (
             "null",
             _ReadyCompressor(),
             True,
-            {"enabled": False, "ready": True, "status": "disabled", "backend": None},
+            {
+                "enabled": False,
+                "ready": True,
+                "status": "disabled",
+                "optional": True,
+                "backend": None,
+            },
         ),
     ],
 )
@@ -280,3 +323,29 @@ def test_readyz_kompress_state_matrix(monkeypatch, slot_status, compressor, disa
     payload = TestClient(app).get("/readyz").json()["checks"]["kompress"]
 
     assert payload == expected
+
+
+def test_remote_kompress_endpoint_skips_local_model_at_startup(monkeypatch):
+    """With HEADROOM_KOMPRESS_ENDPOINT set, startup neither fetches nor warms the
+    local model, and /readyz still names the remote backend."""
+    import threading
+
+    monkeypatch.setenv("HEADROOM_SKIP_UPSTREAM_CHECK", "1")
+    monkeypatch.setenv("HEADROOM_KOMPRESS_ENDPOINT", "https://kompress.example.test")
+    monkeypatch.setenv("HEADROOM_KOMPRESS_WARMUP", "1")
+    monkeypatch.setenv("HEADROOM_KOMPRESS_WARMUP_DELAY_SECONDS", "3600")
+    prefetched: list[str] = []
+    monkeypatch.setattr(
+        kompress_compressor,
+        "ensure_background_prefetch",
+        lambda model_id: (prefetched.append(model_id), True)[1],
+    )
+    app = create_app(ProxyConfig(optimize=True, cache_enabled=False, rate_limit_enabled=False))
+
+    with TestClient(app) as client:
+        app.state.proxy.http_client = object()
+        payload = client.get("/readyz").json()
+
+    assert prefetched == []
+    assert not any(t.name == "kompress-warmup" for t in threading.enumerate())
+    assert payload["checks"]["kompress"]["backend"] == "remote"
