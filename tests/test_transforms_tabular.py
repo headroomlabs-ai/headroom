@@ -17,6 +17,7 @@ from headroom.transforms.content_detector import (
     ContentType,
     DetectionResult,
     _is_md_separator,
+    _is_whole_markdown_table,
     _looks_like_prose,
     _try_detect_delimited,
     _try_detect_markdown_table,
@@ -93,6 +94,143 @@ def test_detects_tabular(content: str, fmt: str) -> None:
 )
 def test_does_not_misroute_to_tabular(content: str, expected: ContentType) -> None:
     assert detect_content_type(content).content_type is expected
+
+
+# Detection: a markdown table inside other content (#4215) -------------------
+
+_PROSE = "\n".join(
+    f"Paragraph {i}: this sentence is ordinary prose that an agent needs to read verbatim."
+    for i in range(12)
+)
+_TABLE = (
+    "| Step | Owner | Command |\n"
+    "|------|-------|---------|\n"
+    "| Build | CI | `make build` |\n"
+    "| Test | CI | `make test` |\n"
+    "| Tag | Maintainer | `git tag vX.Y.Z` |\n"
+    "| Publish | Maintainer | `make publish` |"
+)
+_PIPE_BULLET = "- Create an issue: `tracker new --type=bug|feature|task --priority=2`"
+_PIPELESS_TABLE = (
+    "Step | Owner | Command\n--- | --- | ---\nBuild | CI | make build\nTest | CI | make test"
+)
+# `cat` of a doc with a table, plus another command's output in the same result.
+_DOC_WITH_TABLE = (
+    f"# Release checklist\n\n{_PROSE}\n\n{_TABLE}\n\n{_PIPE_BULLET}\n\n{_PROSE}\n"
+    "----\n412 other-command-output.txt\n"
+)
+
+
+@pytest.mark.parametrize(
+    "content",
+    [
+        _DOC_WITH_TABLE,
+        f"Results:\n{_TABLE}",
+        # A blank line ends the table; a later line with pipes is not a row.
+        f"{_TABLE}\n\n{_PIPE_BULLET}",
+        # A line with pipes above the table is not its header.
+        f"{_PIPE_BULLET}\n{_TABLE}",
+        # Nor is text sitting on top of a separator row.
+        f"Title\n|---|---|\n{_TABLE}",
+        # Past the 50 lines the detector samples.
+        f"{_verbose_markdown(60)}\n\nTotal: 60 users",
+        # Lines with as many pipe fields as the header, straight after the rows:
+        # a list item, a note in another style, a second separator.
+        f"{_TABLE}\n{_PIPE_BULLET}",
+        f"{_TABLE}\nNote: pick one of bug|feature|task",
+        f"{_PIPELESS_TABLE}\n- Next: bug|feature|task",
+        f"{_TABLE}\n|---|---|---|\n| Ship | CI | `make ship` |",
+    ],
+    ids=[
+        "doc_with_table",
+        "heading_line",
+        "pipe_line_after_table",
+        "pipe_line_before_table",
+        "text_above_a_separator_row",
+        "line_after_a_long_table",
+        "list_item_right_after_rows",
+        "note_without_leading_pipe",
+        "list_item_after_pipeless_rows",
+        "second_separator_row",
+    ],
+)
+def test_markdown_table_inside_other_content_is_not_tabular(content: str) -> None:
+    assert detect_content_type(content).content_type is not ContentType.TABULAR
+
+
+@pytest.mark.parametrize(
+    "content",
+    [f"{_TABLE}\n", f"\n\n{_TABLE}\n\n", _TABLE.replace("\n", "\r\n"), _PIPELESS_TABLE],
+    ids=["trailing_newline", "surrounding_blank_lines", "crlf", "pipeless"],
+)
+def test_whole_markdown_table_is_still_tabular(content: str) -> None:
+    result = detect_content_type(content)
+    assert result.content_type is ContentType.TABULAR
+    assert result.metadata.get("format") == "markdown"
+
+
+_LONG_ROWS = [(f"step_{i}", f"ok_{i}") for i in range(40)]
+
+
+@pytest.mark.parametrize(
+    "content",
+    [
+        "Name | Value\n--- | ---\n"
+        + "\n".join(f"{a} | {b}" for a, b in _LONG_ROWS)
+        + "\nImportant: use x | y | DO_NOT_DELETE",
+        "| Name | Value |\n| --- | --- |\n"
+        + "\n".join(f"| {a} | {b} |" for a, b in _LONG_ROWS)
+        + "\n| Important: use x | y | DO_NOT_DELETE |",
+        # Splitting on the escaped pipe gives the header's three cells, but the
+        # literal `|` would be lost.
+        "| Name | Value | Note |\n| --- | --- | --- |\n"
+        + "\n".join(f"| {a} | {b} | none |" for a, b in _LONG_ROWS)
+        + "\n| `a \\| b` | DO_NOT_DELETE |",
+    ],
+    ids=["over_width_row_pipeless", "over_width_row_piped", "escaped_pipe"],
+)
+def test_table_with_a_row_records_cannot_hold_is_kept_whole(content: str) -> None:
+    # Not claimed as markdown. Aligned rows may still read as fixed-width, which
+    # splits only on whitespace runs and passes ragged rows through.
+    assert detect_content_type(content).metadata.get("format") != "markdown"
+    result = TabularCompressor().compress(content)
+    assert not result.was_modified
+    assert result.compressed == content
+
+
+_KEEP_ROWS = range(40)
+
+
+@pytest.mark.parametrize(
+    "content",
+    [
+        "| Name | Name |\n| --- | --- |\n"
+        + "\n".join(f"| DO_NOT_DELETE_{i} | value_{i} |" for i in _KEEP_ROWS),
+        # Equal once the parser strips each cell.
+        "| Name |   Name   |\n| --- | --- |\n"
+        + "\n".join(f"| DO_NOT_DELETE_{i} | value_{i} |" for i in _KEEP_ROWS),
+        "name,name\n" + "\n".join(f"DO_NOT_DELETE_{i},value_{i}" for i in _KEEP_ROWS),
+        "name, name \n" + "\n".join(f"DO_NOT_DELETE_{i},value_{i}" for i in _KEEP_ROWS),
+    ],
+    ids=["markdown", "markdown_whitespace", "csv", "csv_whitespace"],
+)
+def test_table_with_repeated_headers_is_kept_whole(content: str) -> None:
+    # Records key cells by header, so the second column would overwrite the first.
+    assert parse_tabular(content) is None
+    result = TabularCompressor().compress(content)
+    assert not result.was_modified
+    assert result.compressed == content
+
+
+def test_csv_with_markdown_in_a_quoted_field_is_still_csv() -> None:
+    rows = "\n".join(f"{i},value_{i}" for i in range(1, 20))
+    csv = f'id,notes\n{rows}\n20,"| x | y |\n| --- | --- |\n| foo | bar |"\n21,value_21'
+    result = detect_content_type(csv)
+    assert result.content_type is ContentType.TABULAR
+    assert result.metadata.get("delimiter") == ","
+    headers, data, _fmt = parse_tabular(csv)
+    assert headers == ["id", "notes"]
+    assert len(data) == 21
 
 
 # Detection: fixed-width command output (#3652) ------------------------------
@@ -211,6 +349,13 @@ def test_is_md_separator_needs_two_columns() -> None:
     assert _is_md_separator("| --- | --- |")
     assert not _is_md_separator("| --- |")  # single column is not a separator
     assert not _is_md_separator("| a | b |")  # cells must be dashes
+
+
+def test_whole_markdown_table_needs_a_piped_header_then_a_separator() -> None:
+    assert _is_whole_markdown_table("| a | b |\n|---|---|\n| 1 | 2 |")
+    assert not _is_whole_markdown_table("| a | b |\n| 1 | 2 |\n| 3 | 4 |")
+    assert not _is_whole_markdown_table("Title\n|---|---|\na | b")
+    assert not _is_whole_markdown_table("Title\n|---|---|\nfoo\nbar")
 
 
 def test_markdown_table_needs_multiple_columns() -> None:
@@ -445,6 +590,14 @@ def test_compact_unique_csv_passes_through() -> None:
     assert result.compressed == CSV
 
 
+def test_compress_keeps_a_document_with_a_table_whole() -> None:
+    # Only the table's rows used to come back, as JSON, with the prose and the
+    # other command's output silently gone.
+    result = TabularCompressor().compress(_DOC_WITH_TABLE)
+    assert not result.was_modified
+    assert result.compressed == _DOC_WITH_TABLE
+
+
 def test_non_tabular_passes_through_unmodified() -> None:
     # Unparseable prose returns the original content untouched.
     text = "just a normal paragraph here"
@@ -512,6 +665,12 @@ def test_router_keeps_ls_output_verbatim(monkeypatch) -> None:
     assert result.compressed == payload
     assert calls == []
     assert result.strategy_used is CompressionStrategy.TABULAR
+
+
+def test_router_does_not_route_a_document_with_a_table_to_tabular(monkeypatch) -> None:
+    _record_kompress_calls(monkeypatch)
+    result = ContentRouter(ContentRouterConfig()).compress(_DOC_WITH_TABLE)
+    assert result.strategy_used is not CompressionStrategy.TABULAR
 
 
 def test_router_does_not_kompress_a_ragged_csv(monkeypatch) -> None:
