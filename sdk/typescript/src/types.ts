@@ -38,7 +38,11 @@ export interface UserMessage {
 
 export interface AssistantMessage {
   role: "assistant";
-  content: string | null;
+  /**
+   * A string, or an ordered part array when the assistant turn carries media
+   * (e.g. a Vercel AI SDK file part): text parts plus `image_url` parts.
+   */
+  content: string | ContentPart[] | null;
   tool_calls?: ToolCall[];
 }
 
