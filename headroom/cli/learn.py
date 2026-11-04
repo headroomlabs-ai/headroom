@@ -7,6 +7,8 @@ from typing import TYPE_CHECKING, Any, NamedTuple
 
 import click
 
+from headroom.offline import pin_litellm_cost_map_local
+
 if TYPE_CHECKING:
     from ..learn.base import LearnPlugin
 
@@ -393,6 +395,7 @@ def _make_llm_judge(model: str) -> Any:
         try:
             import json
 
+            pin_litellm_cost_map_local()
             import litellm
         except ImportError:
             return None

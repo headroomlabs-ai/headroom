@@ -25,6 +25,7 @@ import time
 import typing
 
 from headroom._subprocess import Popen, run
+from headroom.offline import pin_litellm_cost_map_local
 
 from .loops import LoopPattern, apply_loop_weighting, detect_loops, format_loops_for_digest
 from .models import (
@@ -1100,6 +1101,7 @@ def _call_llm(
         guard_egress(f"{model} provider CLI for headroom learn session analysis")
         return _call_cli_llm(digest, model, on_progress=on_progress)
 
+    pin_litellm_cost_map_local()
     import litellm
 
     # Suppress LiteLLM's verbose logging
