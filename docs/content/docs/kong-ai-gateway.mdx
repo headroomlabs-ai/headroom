@@ -1,0 +1,101 @@
+---
+title: Kong AI Gateway
+description: Use Headroom as the compression service for Kong AI Gateway, so requests are compressed at the gateway before they reach the LLM provider.
+---
+
+Headroom integrates with [Kong AI Gateway](https://developer.konghq.com/ai-gateway/) as its compression service. Kong sends each request to Headroom, Headroom compresses it, and Kong forwards the compressed request to the LLM provider. Applications that call the gateway get compressed requests without installing Headroom themselves.
+
+Kong AI Gateway routes requests from applications to LLM providers. You configure it in Kong Konnect, and data plane nodes that you run handle the traffic. Headroom connects to it through Kong's [AI Prompt Compressor](https://developer.konghq.com/ai-gateway/policies/ai-prompt-compressor/#headroom-compressor-service) policy.
+
+## How it works
+
+```
+Your app ──▶ Kong AI Gateway ──▶ LLM provider
+                  │    ▲
+                  ▼    │
+                Headroom
+```
+
+1. Your app sends a chat request to a model on Kong AI Gateway.
+2. Kong sends the request to Headroom. Headroom compresses the large parts, such as tool results, logs, and JSON, and sends the request back.
+3. Kong forwards the compressed request to the LLM provider and returns the response to your app.
+
+Kong also sends a session ID with each request, built from a header such as `x-session-id` when the request carries one. Headroom uses it to return the earlier turns of a conversation unchanged, so the provider's prompt cache keeps matching them. See [Session mode](/docs/proxy#session-mode).
+
+## Installation
+
+Install Headroom 0.37.0 or later with the proxy extra, on a host the Kong data plane can reach:
+
+```bash
+pip install "headroom-ai[proxy]"
+```
+
+Start the proxy so the data plane can call it:
+
+```bash
+export HEADROOM_PROXY_TOKEN="$(openssl rand -hex 32)"
+HEADROOM_COMPRESS_ALLOW_REMOTE=1 headroom proxy --host 0.0.0.0 --port 8787
+```
+
+By default, Headroom accepts compression requests only from the machine it runs on. `HEADROOM_COMPRESS_ALLOW_REMOTE=1` accepts them from the data plane, and `HEADROOM_PROXY_TOKEN` is the token Kong sends with each one. Keep the token for the next step. To run Headroom in a container instead, see the manual `docker run` instructions in [Docker install](/docs/docker-install), pass both variables to the container, and publish its port on an interface the data plane can reach. The Docker-native wrapper publishes on loopback only; setting these variables does not change that binding.
+
+<Callout type="warning" title="Use one Headroom process">
+Point Kong at a single Headroom process, such as one next to each data plane node or one that all nodes share. A conversation's session lives in the process that served it, so don't put several instances behind a load balancer.
+</Callout>
+
+## Quick start
+
+You need an AI Gateway (version 2.2 or later) with at least one AI Model, and kongctl, Kong's command-line tool for Konnect. If you don't have them yet, follow Kong's [AI Gateway getting started guide](https://developer.konghq.com/ai-gateway/get-started/). It creates a gateway with a local data plane, exports the gateway's ID as `AI_GATEWAY_ID`, and adds a model. To use a gateway you already have, run `kongctl get ai-gateways -o yaml` and export the `id` of your gateway as `AI_GATEWAY_ID`. On Kubernetes, Kong's [Kong Operator guide](https://developer.konghq.com/operator/konnect/how-to/ai-gateway-headroom/) deploys Headroom and the policy together instead.
+
+The policy below tells Kong where Headroom runs. Save it as `headroom-policy.yaml`:
+
+```yaml
+ai_gateway_policies:
+  - ref: headroom-compressor
+    ai_gateway: !lookup {id: !env AI_GATEWAY_ID}
+    name: headroom-compressor
+    display_name: Headroom compressor
+    type: ai-prompt-compressor
+    enabled: true
+    global: true
+    config:
+      provider: headroom
+      compressor_url: http://host.docker.internal:8787/v1/compress
+      timeout: 45000
+      stop_on_error: true
+      headroom:
+        proxy_token: !env HEADROOM_PROXY_TOKEN
+```
+
+`compressor_url` is the address of Headroom's [`/v1/compress`](/docs/proxy#post-v1compress) endpoint as the data plane sees it. `host.docker.internal` works when the data plane runs in Docker Desktop on the same machine as Headroom, for example the local data plane from Kong's getting started guide. For a data plane on a separate host, use an HTTPS endpoint with a trusted certificate, such as `https://headroom.example.com/v1/compress`, through a TLS reverse proxy in front of Headroom. The connection carries both the proxy token and prompt content. Restrict access to the Headroom listener to the data plane or TLS reverse proxy; do not expose the HTTP listener directly on a public network.
+
+kongctl reads `AI_GATEWAY_ID` and `HEADROOM_PROXY_TOKEN` from the environment when it applies the file. In the terminal where you run kongctl, set the token to the value Headroom runs with, then apply the file:
+
+```bash
+export HEADROOM_PROXY_TOKEN='<the token Headroom runs with>'
+kongctl apply -f headroom-policy.yaml
+```
+
+kongctl shows the change it's about to make and asks you to type `yes` to confirm.
+
+With `global: true`, the policy applies to every AI Model on the gateway. To see it work, send a request that carries a large tool result or log output, since short prompts aren't compressed. Headroom logs a line like this for each request it compresses:
+
+```
+Pipeline complete: 10275 -> 5148 tokens (saved 5127, 49.9% reduction)
+```
+
+`curl http://localhost:8787/stats` on the Headroom host shows the totals.
+
+## Options
+
+These fields go under `config` in the policy. See Kong's [policy reference](https://developer.konghq.com/ai-gateway/policies/ai-prompt-compressor/#configure-headroom-connection) for the rest of the configuration.
+
+| Field | Description |
+| --- | --- |
+| `compressor_url` | The address of Headroom's `/v1/compress` endpoint as the data plane sees it. Include the path: Kong uses the URL exactly as written. |
+| `headroom.proxy_token` | The token Headroom runs with (`HEADROOM_PROXY_TOKEN`). Kong requires it whenever `compressor_url` isn't a loopback address. |
+| `headroom.session_id_headers` | The request headers Kong builds the session ID from. The default list includes `x-session-id`. |
+| `stop_on_error` | `true` (default) returns an error to your app when the call to Headroom fails. `false` sends the original, uncompressed request to the provider instead. |
+| `timeout` | How long Kong waits for Headroom, in milliseconds. The default is `10000`. |
+
+`global` sits next to `config`. To compress only some models, set `global: false` and add `headroom-compressor` to the `policies` list of each AI Model that should use it.
