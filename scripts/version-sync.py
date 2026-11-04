@@ -71,6 +71,7 @@ def update_marketplace_manifest(file_path: Path, version: str) -> None:
                 "headroom",
                 "headroom-agent-hooks",
                 "headroom-snip",
+                "headroom-skill",
             }:
                 plugin["version"] = version
     with open(file_path, "w", encoding="utf-8") as f:
