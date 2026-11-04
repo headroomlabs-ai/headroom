@@ -202,6 +202,7 @@ class Messages:
         model: str,
         messages: list[dict[str, Any]],
         max_tokens: int = 1024,
+        stream: bool = False,
         # Headroom-specific parameters
         headroom_mode: str | None = None,
         headroom_cache_prefix_tokens: int | None = None,
@@ -218,6 +219,7 @@ class Messages:
             model: Model name.
             messages: List of messages.
             max_tokens: Maximum tokens in response.
+            stream: Return an iterator of raw message events when True.
             headroom_mode: Override default mode ("audit" | "optimize").
             headroom_cache_prefix_tokens: Target cache-aligned prefix size.
             headroom_output_buffer_tokens: Reserve tokens for output.
@@ -231,13 +233,13 @@ class Messages:
         return self._client._create(
             model=model,
             messages=messages,
-            stream=False,
+            stream=stream,
             headroom_mode=headroom_mode,
             headroom_cache_prefix_tokens=headroom_cache_prefix_tokens,
             headroom_output_buffer_tokens=headroom_output_buffer_tokens,
             headroom_keep_turns=headroom_keep_turns,
             headroom_tool_profiles=headroom_tool_profiles,
-            api_style="anthropic",
+            api_style="anthropic_create",
             max_tokens=max_tokens,
             **kwargs,
         )
@@ -406,7 +408,7 @@ class HeadroomClient:
         self._cache_optimizer: BaseCacheOptimizer | None = None
         self._semantic_cache_layer: SemanticCacheLayer | None = None
 
-        if enable_cache_optimizer:
+        if self._config.cache_optimizer.enabled:
             if cache_optimizer is not None:
                 self._cache_optimizer = cache_optimizer
             else:
@@ -440,7 +442,7 @@ class HeadroomClient:
             provider=self._provider.name.lower(),
             metadata={
                 "default_mode": self._default_mode.value,
-                "cache_optimizer_enabled": enable_cache_optimizer,
+                "cache_optimizer_enabled": self._config.cache_optimizer.enabled,
                 "semantic_cache_enabled": enable_semantic_cache,
             },
         )
@@ -474,6 +476,9 @@ class HeadroomClient:
         **kwargs: Any,
     ) -> Any:
         """Internal implementation of create."""
+        transport_style = api_style
+        if api_style == "anthropic_create":
+            api_style = "anthropic"
         request_id = generate_request_id()
         timestamp = datetime.now(timezone.utc).replace(tzinfo=None)
         mode = HeadroomMode(headroom_mode) if headroom_mode else self._default_mode
@@ -675,7 +680,7 @@ class HeadroomClient:
         # Call underlying client based on API style
         try:
             response = call_client_transport(
-                api_style,
+                transport_style,
                 self,
                 model=model,
                 messages=optimized_messages,
