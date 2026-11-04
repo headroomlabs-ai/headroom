@@ -230,10 +230,7 @@ def compute_release_version(
 def get_canonical_version(root: Path) -> str:
     """Read the canonical project version from pyproject.toml."""
 
-    try:
-        import tomllib
-    except ModuleNotFoundError:  # pragma: no cover - Python 3.10 compatibility
-        import tomli as tomllib
+    import tomllib
 
     with open(root / "pyproject.toml", "rb") as file:
         project = tomllib.load(file)["project"]

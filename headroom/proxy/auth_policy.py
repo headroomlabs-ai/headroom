@@ -19,7 +19,6 @@ SUBSCRIPTION_UA_PREFIXES: tuple[str, ...] = (
     "claude-code/",
     "codex-cli/",
     "cursor/",
-    "grok/",
     "claude-vscode/",
     "github-copilot/",
     "anthropic-cli/",
@@ -34,6 +33,11 @@ CLIENT_UA_MAP: tuple[tuple[str, str], ...] = (
     ("anthropic-cli/", "anthropic-cli"),
     ("codex-cli/", "codex"),
     ("cursor/", "cursor"),
+    # Current Grok Build releases send "grok-shell/<version>" (verified against
+    # grok 0.2.112); older builds sent "grok/". Deliberately NOT added to
+    # SUBSCRIPTION_UA_PREFIXES: API-key grok traffic is pay-per-token and
+    # should keep the aggressive compression policy.
+    ("grok-shell/", "grok_build"),
     ("grok/", "grok_build"),
     ("zed/", "zed"),
     ("aider/", "aider"),
