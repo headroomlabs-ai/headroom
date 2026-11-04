@@ -4379,6 +4379,8 @@ class OpenAIHandlerMixin:
                     from headroom.proxy.helpers import log_memory_injection
                     from headroom.utils import extract_user_query
 
+                    if tags is not None:
+                        tags["memory_skip_reason"] = "cache_mode"
                     log_memory_injection(
                         request_id=request_id,
                         session_id=None,
@@ -6233,6 +6235,8 @@ class OpenAIHandlerMixin:
                     from headroom.proxy.helpers import log_memory_injection
                     from headroom.utils import extract_user_query
 
+                    if tags is not None:
+                        tags["memory_skip_reason"] = "cache_mode"
                     log_memory_injection(
                         request_id=request_id,
                         session_id=None,
@@ -8312,6 +8316,8 @@ class OpenAIHandlerMixin:
                         # Cache mode never injects context, so the next-turn prefix
                         # bytes stay byte-equal to this turn's bytes. Skip the search
                         # too: its result could only be discarded (#4600, #4622).
+                        if ws_tags is not None:
+                            ws_tags["memory_skip_reason"] = "cache_mode"
                         ws_input = ws_response_body.get("input", "")
                         log_memory_injection(
                             request_id=request_id,
