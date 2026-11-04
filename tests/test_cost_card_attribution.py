@@ -11,6 +11,8 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 
+import pytest
+
 from tests._dotenv import (
     autouse_apply_env,
     importorskip_no_env_leak,
@@ -84,10 +86,11 @@ def test_warm_prefix_does_not_drag_the_live_delta_down_to_the_read_rate():
     ct.record_tokens(
         MODEL,
         tokens_saved=10_000,
-        tokens_sent=200_000,
-        cache_read_tokens=190_000,
-        cache_write_tokens=5_000,
-        uncached_tokens=5_000,
+        # Inside one tier: the uncompressed 110K stays under the 200K threshold.
+        tokens_sent=100_000,
+        cache_read_tokens=95_000,
+        cache_write_tokens=2_500,
+        uncached_tokens=2_500,
     )
     stats = ct.stats()
 
@@ -171,6 +174,66 @@ def test_long_context_turn_is_priced_at_the_above_200k_rates():
 
     assert abs(stats["output_cost_usd"] - 5_000 * long_output) < 1e-6
     assert abs(stats["cache_aware_savings_usd"] - 10_000 * long_input) < 1e-6
+
+
+def test_haiku_5_5_prompt_over_100k_is_priced_at_its_long_prompt_card():
+    """Haiku 5.5's tier starts at 100K: a 150K turn pays 5x on input and output."""
+    import litellm
+
+    from headroom.proxy.server import CostTracker
+
+    info = litellm.model_cost.get("claude-haiku-5-5", {})
+    if "input_cost_per_token_above_100k_tokens" not in info:
+        pytest.skip("installed LiteLLM catalog predates Claude Haiku 5.5")
+
+    ct = CostTracker()
+    ct.record_tokens(
+        "claude-haiku-5-5",
+        tokens_saved=10_000,
+        tokens_sent=150_000,
+        cache_read_tokens=0,
+        cache_write_tokens=0,
+        uncached_tokens=150_000,
+        output_tokens=5_000,
+    )
+    stats = ct.stats()
+
+    # $2.50/M output and $0.50/M input above 100K (base card: $0.50 / $0.10).
+    assert abs(stats["output_cost_usd"] - 5_000 * 2.5e-6) < 1e-9
+    assert abs(stats["cache_aware_savings_usd"] - 10_000 * 5e-7) < 1e-9
+
+
+def test_compression_below_haiku_5_5_tier_credits_the_avoided_long_card():
+    """110K compressed to 90K: the whole request avoided the 5x card.
+
+    Uncompressed bill: 110K x $0.50/M + 1K x $2.50/M = $0.0575.
+    Forwarded bill:     90K x $0.10/M + 1K x $0.50/M = $0.0095.
+    """
+    import litellm
+
+    from headroom.proxy.server import CostTracker
+
+    if "input_cost_per_token_above_100k_tokens" not in litellm.model_cost.get(
+        "claude-haiku-5-5", {}
+    ):
+        pytest.skip("installed LiteLLM catalog predates Claude Haiku 5.5")
+
+    ct = CostTracker()
+    ct.record_tokens(
+        "claude-haiku-5-5",
+        tokens_saved=20_000,
+        tokens_sent=90_000,
+        cache_read_tokens=0,
+        cache_write_tokens=0,
+        uncached_tokens=90_000,
+        output_tokens=1_000,
+    )
+    stats = ct.stats()
+
+    # The forwarded request still bills at the base card...
+    assert abs(stats["output_cost_usd"] - 1_000 * 5e-7) < 1e-12
+    # ...and the saving is the difference of the two whole bills.
+    assert abs(stats["cache_aware_savings_usd"] - (0.0575 - 0.0095)) < 1e-9
 
 
 def _summary(cache_net_usd: float, cost_stats: dict) -> dict:
