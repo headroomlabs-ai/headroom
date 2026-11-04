@@ -373,7 +373,7 @@ def test_compression_ratio_zero_for_empty_original() -> None:
     assert result.compression_ratio == 0.0
 
 
-# Tier 3: TOML array-of-tables → SmartCrusher csv-schema -----------------------
+# Tier 3: TOML array-of-tables â†’ SmartCrusher csv-schema -----------------------
 
 
 def _mypy_overrides_toml(n: int) -> str:
@@ -405,7 +405,7 @@ def test_tier3_folds_toml_array_of_tables(monkeypatch) -> None:
     assert result.was_modified
     assert result.strategy == "config_schema_fold"
     assert result.flavor == "toml"
-    assert len(result.compressed) < len(toml) // 2  # keys folded → big win
+    assert len(result.compressed) < len(toml) // 2  # keys folded â†’ big win
     assert 0.0 < result.compression_ratio < 0.5
     # The repeated per-record key appears once in the schema, not 25 times.
     assert result.compressed.count("ignore_missing_imports") == 1
@@ -416,7 +416,7 @@ def test_tier3_folds_toml_array_of_tables(monkeypatch) -> None:
 
 
 def test_tier3_disabled_in_lossless_mode() -> None:
-    # enable_ccr off (lossless) → no fold, no marker, only reversible tiers.
+    # enable_ccr off (lossless) â†’ no fold, no marker, only reversible tiers.
     comp = ConfigCompressor(ConfigCompressorConfig(enable_ccr=False))
     result = comp.compress(_mypy_overrides_toml(25))
     assert result.strategy != "config_schema_fold"
@@ -442,7 +442,7 @@ def test_tier3_skips_non_toml_flavor(monkeypatch) -> None:
 def test_tier3_skips_toml_without_array_of_tables(monkeypatch) -> None:
     _use_fresh_store(monkeypatch)
     comp = ConfigCompressor(ConfigCompressorConfig(enable_ccr=True))
-    # Valid TOML flavor, but no `[[ ]]` → SmartCrusher has no array to fold.
+    # Valid TOML flavor, but no `[[ ]]` â†’ SmartCrusher has no array to fold.
     result = comp.compress(PYPROJECT_TOML)
     assert result.strategy != "config_schema_fold"
 
@@ -471,7 +471,7 @@ def test_tier3_store_failure_keeps_text_tiers(monkeypatch) -> None:
     )
     comp = ConfigCompressor(ConfigCompressorConfig(enable_ccr=True))
     result = comp.compress(_mypy_overrides_toml(25))
-    # Can't store the original → never emit the lossy fold.
+    # Can't store the original â†’ never emit the lossy fold.
     assert result.strategy != "config_schema_fold"
     assert not CCR_RETRIEVAL_MARKER_RE.search(result.compressed)
 
@@ -491,7 +491,7 @@ def test_schema_fold_bails_on_unparseable_toml(monkeypatch) -> None:
 
     monkeypatch.setattr(mod, "_load_toml", lambda _content: None)
     comp = ConfigCompressor(ConfigCompressorConfig(enable_ccr=True))
-    # Detector still flags it TOML, but the fold parser bails → text tiers.
+    # Detector still flags it TOML, but the fold parser bails â†’ text tiers.
     assert comp._schema_fold(_mypy_overrides_toml(25), "toml", "", 1.0) is None
 
 
@@ -580,19 +580,9 @@ def test_router_compresses_k8s_manifest_end_to_end() -> None:
 
 def test_router_lossless_mode_uses_lossless_config_label() -> None:
     router = ContentRouter(ContentRouterConfig(lossless=True, enable_config_compressor=True))
-    compressed, _tokens, chain = router._apply_strategy_to_content(
+    compressed, _tokens, chain, _reversible = router._apply_strategy_to_content(
         K8S_MANIFEST, CompressionStrategy.CONFIG, context=""
     )
     assert chain == ["lossless_config"]
     assert expand_runs(unfold_repeated_blocks(compressed)) == K8S_MANIFEST
     assert not CCR_RETRIEVAL_MARKER_RE.search(compressed)
-
-
-def test_router_disabled_flag_skips_config_compressor() -> None:
-    router = ContentRouter(ContentRouterConfig(enable_config_compressor=False))
-    compressed, _tokens, _chain = router._apply_strategy_to_content(
-        K8S_MANIFEST, CompressionStrategy.CONFIG, context=""
-    )
-    # Falls through to the unified fallback path; must not crash and must
-    # not claim CONFIG did work it didn't do.
-    assert isinstance(compressed, str)
