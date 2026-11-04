@@ -25,9 +25,11 @@ from __future__ import annotations
 import argparse
 import asyncio
 import contextlib
+import errno
 import json
 import logging
 import os
+import stat
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -83,7 +85,8 @@ READ_TOOL_NAME = "headroom_read"
 logger = logging.getLogger("headroom.ccr.mcp")
 
 # Feature flag: enable headroom_read tool (file read caching via CCR)
-# Set HEADROOM_MCP_READ=on to enable
+# Set HEADROOM_MCP_READ=on to enable. Reads are confined to the server's working
+# directory, or to the os.pathsep-separated directories in HEADROOM_MCP_READ_ROOTS.
 _READ_ENABLED = os.environ.get("HEADROOM_MCP_READ", "off").lower().strip() in (
     "on",
     "true",
@@ -374,6 +377,73 @@ class SessionStats:
             "estimated_cost_saved_usd": cost_saved,
             "recent_events": self.events[-10:],
         }
+
+
+def _read_roots() -> list[Path]:
+    """Directories ``headroom_read`` may read under, resolved like the paths checked against them.
+
+    Without HEADROOM_MCP_READ_ROOTS the root is the working directory, unless
+    that is the filesystem root or the home directory (GUI hosts such as
+    Claude Desktop launch MCP servers from ``/``): then nothing is readable
+    until roots are configured.
+    """
+    configured = os.environ.get("HEADROOM_MCP_READ_ROOTS", "")
+    entries = [entry.strip() for entry in configured.split(os.pathsep) if entry.strip()]
+    if entries:
+        return [Path(entry).expanduser().resolve() for entry in entries]
+    cwd = Path.cwd().resolve()
+    if cwd == Path(cwd.anchor) or cwd == Path.home().resolve():
+        return []
+    return [cwd]
+
+
+_O_CLOEXEC = getattr(os, "O_CLOEXEC", 0)
+_O_NONBLOCK = getattr(os, "O_NONBLOCK", 0)
+
+
+def _open_nofollow(path: Path) -> int:
+    """Open the resolved ``path`` for reading without following any symlink.
+
+    The boundary check and the open are separate steps. ``path`` had no
+    symlinks when it was resolved, but any component -- the file, a directory
+    on the way, the permitted root itself or one of its parents -- can have
+    been replaced by a symlink since, and a plain ``open()`` would follow it
+    wherever it points. So walk the whole path from its anchor one component
+    at a time with O_NOFOLLOW: a component that has become a symlink is
+    refused (ELOOP) rather than followed. Opens are non-blocking so a FIFO
+    put in the way cannot stall the event loop; the caller's S_ISREG check
+    rejects it, and a regular file reads the same either way.
+
+    Without openat semantics (Windows) open directly and confirm the path
+    still resolves to what was checked; best effort there.
+    """
+    if os.open not in os.supports_dir_fd or not hasattr(os, "O_NOFOLLOW"):
+        fd = os.open(path, os.O_RDONLY | getattr(os, "O_BINARY", 0) | _O_CLOEXEC)
+        if path.resolve() != path:
+            os.close(fd)
+            raise OSError(errno.ELOOP, "path changed between check and open", str(path))
+        return fd
+    import fcntl
+
+    flags = os.O_RDONLY | os.O_NOFOLLOW | _O_NONBLOCK | _O_CLOEXEC
+    parts = path.parts
+    fd = os.open(parts[0], os.O_RDONLY | os.O_DIRECTORY | _O_CLOEXEC)
+    try:
+        for part in parts[1:-1]:
+            next_fd = os.open(part, flags, dir_fd=fd)
+            os.close(fd)
+            fd = next_fd
+            # S_ISDIR here rather than O_DIRECTORY on the open: with both
+            # flags macOS reports a symlink as ENOTDIR, which would make a
+            # swapped component look like a missing file instead of a refusal.
+            if not stat.S_ISDIR(os.fstat(fd).st_mode):
+                raise NotADirectoryError(errno.ENOTDIR, "Not a directory", str(path))
+        file_fd = os.open(parts[-1] if len(parts) > 1 else ".", flags, dir_fd=fd)
+    finally:
+        os.close(fd)
+    if _O_NONBLOCK:
+        fcntl.fcntl(file_fd, fcntl.F_SETFL, fcntl.fcntl(file_fd, fcntl.F_GETFL) & ~_O_NONBLOCK)
+    return file_fd
 
 
 class HeadroomMCPServer:
@@ -750,7 +820,10 @@ class HeadroomMCPServer:
                             "properties": {
                                 "file_path": {
                                     "type": "string",
-                                    "description": "Absolute path to the file to read.",
+                                    "description": (
+                                        "Path to the file to read, inside the workspace "
+                                        "(the server's working directory or HEADROOM_MCP_READ_ROOTS)."
+                                    ),
                                 },
                                 "fresh": {
                                     "type": "boolean",
@@ -1027,38 +1100,82 @@ class HeadroomMCPServer:
                 )
             ]
 
-        path = Path(file_path).expanduser().resolve()
-        if not path.exists():
+        # Check the resolved path, so `..` and symlinks cannot leave the roots,
+        # and check it before exists() so the tool is not an existence oracle.
+        # A path that cannot be resolved (symlink loop, NUL byte) gets the same
+        # answer, so its error text cannot reveal anything outside either.
+        def outside() -> list[TextContent]:
+            return [
+                TextContent(
+                    type="text",
+                    text=json.dumps(
+                        {
+                            "error": (
+                                f"File is outside the workspace: {file_path}. "
+                                "Ask the user to add its directory to HEADROOM_MCP_READ_ROOTS."
+                            )
+                        }
+                    ),
+                )
+            ]
+
+        try:
+            path: Path | None = Path(file_path).expanduser().resolve()
+        except (OSError, RuntimeError, ValueError):
+            path = None
+        root = (
+            None
+            if path is None
+            else next((r for r in _read_roots() if path.is_relative_to(r)), None)
+        )
+        if path is None or root is None:
+            return outside()
+
+        # Open without following symlinks, so a component swapped for one
+        # after the check above is refused rather than followed (see
+        # _open_nofollow). Inside the roots, a missing path and a directory
+        # keep their specific answers.
+        fd = -1
+        try:
+            fd = _open_nofollow(path)
+            if not stat.S_ISREG(os.fstat(fd).st_mode):
+                return [
+                    TextContent(
+                        type="text",
+                        text=json.dumps({"error": f"Not a file: {file_path}"}),
+                    )
+                ]
+            handle = os.fdopen(fd, "rb")
+            fd = -1
+            with handle:
+                raw = handle.read()
+        except (FileNotFoundError, NotADirectoryError):
             return [
                 TextContent(
                     type="text",
                     text=json.dumps({"error": f"File not found: {file_path}"}),
                 )
             ]
-        if not path.is_file():
-            return [
-                TextContent(
-                    type="text",
-                    text=json.dumps({"error": f"Not a file: {file_path}"}),
-                )
-            ]
-
-        # Read file from disk. PR-A8 / P1-8: avoid lossy decode kwargs
-        # in headroom/ccr/ — use the centralized safe-log decoder so
-        # the project-wide grep stays clean (this path is for tool
-        # output display, not SSE/wire path, so a replacement char on
-        # invalid bytes is acceptable).
-        try:
-            from headroom.proxy.helpers import safe_decode_for_logging
-
-            content = safe_decode_for_logging(path.read_bytes())
-        except Exception as e:
+        except OSError as e:
+            if e.errno == errno.ELOOP:
+                return outside()
             return [
                 TextContent(
                     type="text",
                     text=json.dumps({"error": f"Cannot read file: {e}"}),
                 )
             ]
+        finally:
+            if fd != -1:
+                os.close(fd)
+
+        # PR-A8 / P1-8: avoid lossy decode kwargs in headroom/ccr/ — use the
+        # centralized safe-log decoder so the project-wide grep stays clean
+        # (this path is for tool output display, not SSE/wire path, so a
+        # replacement char on invalid bytes is acceptable).
+        from headroom.proxy.helpers import safe_decode_for_logging
+
+        content = safe_decode_for_logging(raw)
 
         content_hash = hashlib.sha256(content.encode()).hexdigest()[:24]
         line_count = content.count("\n") + (1 if content and not content.endswith("\n") else 0)
