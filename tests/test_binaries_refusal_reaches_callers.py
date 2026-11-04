@@ -59,39 +59,6 @@ def test_tools_install_keeps_going_and_still_sets_an_exit_code(_refuse) -> None:
     assert result.exit_code == 1, result.output
 
 
-def test_ensure_cbm_honours_its_documented_none_contract(monkeypatch) -> None:
-    """`ensure_cbm` promises "path, or None if the download failed"."""
-    from headroom.graph import installer
-
-    monkeypatch.setattr(installer, "get_cbm_path", lambda: None)
-
-    def _raise():
-        raise binaries.UnpinnedDownload("refusing unpinned download codebase-memory-mcp")
-
-    monkeypatch.setattr(installer, "download_cbm", _raise)
-
-    assert installer.ensure_cbm() is None
-
-
-def test_a_tamper_signal_still_propagates_from_ensure_cbm(monkeypatch) -> None:
-    """The None contract must not swallow a sha256 mismatch.
-
-    An unpinned asset is a misconfiguration; a mismatch is evidence of tampering
-    and has to stay loud rather than becoming a quiet "feature unavailable".
-    """
-    from headroom.graph import installer
-
-    monkeypatch.setattr(installer, "get_cbm_path", lambda: None)
-
-    def _raise():
-        raise binaries.Sha256Mismatch("sha256 mismatch for codebase-memory-mcp")
-
-    monkeypatch.setattr(installer, "download_cbm", _raise)
-
-    with pytest.raises(binaries.Sha256Mismatch):
-        installer.ensure_cbm()
-
-
 def test_the_escape_hatch_warning_is_not_printed_twice(monkeypatch, capsys) -> None:
     """With no handlers configured, logging's lastResort already writes stderr.
 

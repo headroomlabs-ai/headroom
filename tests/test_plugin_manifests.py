@@ -10,10 +10,32 @@ def _load_json(relative_path: str) -> object:
     return json.loads((REPO_ROOT / relative_path).read_text(encoding="utf-8"))
 
 
+# Plugins built on Claude Code's function hooks, which Copilot CLI cannot load.
+CLAUDE_CODE_ONLY = {"headroom-snip"}
+
+
 def test_marketplace_manifests_match() -> None:
-    assert _load_json(".claude-plugin/marketplace.json") == _load_json(
-        ".github/plugin/marketplace.json"
-    )
+    claude = _load_json(".claude-plugin/marketplace.json")
+    assert isinstance(claude, dict)
+    shared = {
+        **claude,
+        "plugins": [p for p in claude["plugins"] if p["name"] not in CLAUDE_CODE_ONLY],
+    }
+    assert shared == _load_json(".github/plugin/marketplace.json")
+
+
+def test_claude_code_only_plugins_are_listed_and_versioned() -> None:
+    marketplace = _load_json(".claude-plugin/marketplace.json")
+    assert isinstance(marketplace, dict)
+    for entry in marketplace["plugins"]:
+        if entry["name"] not in CLAUDE_CODE_ONLY:
+            continue
+        plugin_root = (REPO_ROOT / entry["source"]).resolve()
+        manifest = _load_json(f"{entry['source']}/.claude-plugin/plugin.json")
+        assert isinstance(manifest, dict)
+        assert manifest["name"] == entry["name"]
+        assert manifest["version"] == entry["version"] == marketplace["metadata"]["version"]
+        assert (plugin_root / "hooks" / "hooks.json").is_file()
 
 
 def test_plugin_manifests_share_core_metadata() -> None:
