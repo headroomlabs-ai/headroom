@@ -71,8 +71,7 @@ use md5::{Digest, Md5};
 use crate::ccr::CcrStore;
 use crate::signals::{ImportanceContext, LineImportanceDetector};
 
-/// True for CJK ideographs, kana, and Hangul. Code-point ranges kept
-/// byte-identical with the Python `_is_cjk_char` for search-compressor parity.
+/// True for CJK ideographs, kana, and Hangul.
 fn is_cjk_char(c: char) -> bool {
     matches!(
         c as u32,
@@ -81,7 +80,7 @@ fn is_cjk_char(c: char) -> bool {
 }
 
 /// CJK character bigrams from the CJK runs of a (lowercased) query, so a
-/// spaceless CJK query can match content. Mirrors the Python `_cjk_bigrams`.
+/// spaceless CJK query can match content.
 fn cjk_bigrams(text: &str) -> BTreeSet<String> {
     let mut out = BTreeSet::new();
     let mut run: Vec<char> = Vec::new();
@@ -297,6 +296,21 @@ impl SearchCompressor {
         bias: f64,
         store: Option<&dyn CcrStore>,
     ) -> (SearchCompressionResult, SearchCompressorStats) {
+        self.compress_with_ccr_source(content, context, bias, store, content)
+    }
+
+    /// Like [`Self::compress_with_store`], but the CCR entry and its
+    /// hash come from `ccr_source` rather than `content`. Use when
+    /// `content` is a derived form of the original (e.g. after a
+    /// reformat) and retrieval must return the original.
+    pub fn compress_with_ccr_source(
+        &self,
+        content: &str,
+        context: &str,
+        bias: f64,
+        store: Option<&dyn CcrStore>,
+        ccr_source: &str,
+    ) -> (SearchCompressionResult, SearchCompressorStats) {
         let mut stats = SearchCompressorStats::default();
         let parsed = self.parse_search_results(content, &mut stats);
 
@@ -335,8 +349,8 @@ impl SearchCompressor {
             } else if ratio >= self.config.min_compression_ratio_for_ccr {
                 stats.ccr_skip_reason = Some("compression ratio too high");
             } else if let Some(store) = store {
-                let key = md5_hex_24(content);
-                store.put(&key, content);
+                let key = md5_hex_24(ccr_source);
+                store.put(&key, ccr_source);
                 let marker = format!(
                     "\n[{} matches compressed to {}. Retrieve more: hash={}]",
                     original_count, compressed_count, key
@@ -452,9 +466,8 @@ impl SearchCompressor {
         bias: f64,
         stats: &mut SearchCompressorStats,
     ) -> BTreeMap<String, FileMatches> {
-        // Python `_select_matches` sorts files by total match score
-        // descending. `BTreeMap` iterates in key order, so we collect
-        // and sort explicitly.
+        // Sort files by total match score, descending. `BTreeMap`
+        // iterates in key order, so we collect and sort explicitly.
         let mut by_score: Vec<(&String, &FileMatches)> = files.iter().collect();
         by_score.sort_by(|a, b| {
             b.1.total_score()
@@ -1363,8 +1376,8 @@ src/main.py-44-context line";
 
     #[test]
     fn select_respects_per_file_cap_and_global_cap() {
-        // Note: compute_optimal_k enforces a hard `min_k=5` floor (matches
-        // Python `_select_matches`), so `max_total_matches` is a soft cap
+        // Note: compute_optimal_k enforces a hard `min_k=5` floor, so
+        // `max_total_matches` is a soft cap
         // that bites only above that floor. Configure 6 here to exercise
         // the cap path.
         let compressor = SearchCompressor::new(SearchCompressorConfig {
