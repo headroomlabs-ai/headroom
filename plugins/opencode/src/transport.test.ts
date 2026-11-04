@@ -233,6 +233,40 @@ describe("Headroom OpenCode transport", () => {
     globalThis.fetch = originalFetch;
   });
 
+  it("passes non-POST fetches to /messages and /responses suffix paths through unchanged (#4417)", async () => {
+    const originalFetch = globalThis.fetch;
+    const fetchMock = vi.fn(async (..._args: FetchCall) => new Response("ok"));
+    globalThis.fetch = fetchMock as unknown as typeof fetch;
+
+    installHeadroomTransport({ proxyUrl: "http://127.0.0.1:8787/v1" });
+
+    await fetch("https://chat.example.com/api/v2/messages");
+    await fetch("https://forms.example.com/forms/123/responses", { method: "GET" });
+    await fetch(new Request("https://chat.example.com/api/v2/messages", { method: "DELETE" }));
+    await fetch("https://api.anthropic.com/v1/messages", { method: "post" });
+
+    expect(fetchMock).toHaveBeenCalledTimes(4);
+    expect(fetchMock.mock.calls[0][0]).toBe("https://chat.example.com/api/v2/messages");
+    expect(fetchMock.mock.calls[1][0]).toBe("https://forms.example.com/forms/123/responses");
+    expect(new Headers(fetchMock.mock.calls[1][1]?.headers).get("x-headroom-original-path")).toBeNull();
+    expect((fetchMock.mock.calls[2][0] as Request).url).toBe("https://chat.example.com/api/v2/messages");
+    expect(fetchMock.mock.calls[3][0]).toEqual(new URL("http://127.0.0.1:8787/v1/messages"));
+
+    globalThis.fetch = originalFetch;
+  });
+
+  it("leaves non-POST Node https.request calls to LLM-suffix paths alone (#4417)", () => {
+    installHeadroomTransport({ proxyUrl: "http://127.0.0.1:8787/v1" });
+    const req = https.request("https://chat.example.com/api/v2/messages", { method: "GET" });
+    req.on("error", () => {});
+    expect(req.host).toBe("chat.example.com");
+    req.destroy();
+    const req2 = https.request("https://forms.example.com/forms/123/responses");
+    req2.on("error", () => {});
+    expect(req2.host).toBe("forms.example.com");
+    req2.destroy();
+  });
+
   it("routes Gemini native :generateContent and :streamGenerateContent through the proxy", async () => {
     const originalFetch = globalThis.fetch;
     const fetchMock = vi.fn(async (..._args: FetchCall) => new Response("ok"));
