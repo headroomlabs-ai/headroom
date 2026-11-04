@@ -70,7 +70,7 @@ class BedrockHandlerMixin:
                 URL path (may contain ``.``, ``:`` and ``/``).
             stream: ``True`` for ``invoke-with-response-stream``.
         """
-        from fastapi.responses import JSONResponse
+        from fastapi.responses import JSONResponse, Response
 
         from headroom.proxy.auth_mode import classify_client
         from headroom.proxy.helpers import (
