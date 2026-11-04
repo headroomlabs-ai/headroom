@@ -191,6 +191,17 @@ class TestSocketTrap:
 @pytest.fixture
 def offline(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("HEADROOM_OFFLINE", "1")
+    # An import of litellm or CrewAI under the switch writes its pin variable
+    # directly, out of monkeypatch's sight. Record each variable (setenv saves
+    # the original, delenv then clears it) so teardown puts it back...
+    import headroom.offline
+
+    for pin in (headroom.offline._litellm_cost_map_pin, headroom.offline._crewai_telemetry_pin):
+        monkeypatch.setenv(pin.name, "")
+        monkeypatch.delenv(pin.name)
+        # ...and the pin's memory of the value it replaced, which would
+        # otherwise outlive the variable it describes.
+        monkeypatch.setattr(pin, "before", None)
 
 
 # ``"example.com" in url`` is true of ``https://example.com.attacker.test``
@@ -413,6 +424,374 @@ class TestLangfuseExporterOffline:
         )
 
         assert configure_langfuse_tracing(LangfuseTracingConfig(enabled=False)) is not None
+
+
+# ────────────── path 2c: litellm's import-time pricing fetch ────────────────
+
+# Runs in a fresh interpreter: the fetch happens once, on the first
+# ``import litellm``, and inside this pytest process an earlier test has
+# usually imported it already, which is how the leak hid behind test order.
+_LITELLM_IMPORT_PROBE = """
+import json, os, socket, sys
+
+attempts = []
+
+def _trap(address):
+    host = address[0] if isinstance(address, tuple) else address
+    if host not in ("127.0.0.1", "::1", "localhost"):
+        attempts.append(str(host))
+        raise OSError("outbound connection attempted while offline")
+
+_create_connection = socket.create_connection
+_connect = socket.socket.connect
+socket.create_connection = lambda address, *a, **k: (
+    _trap(address) or _create_connection(address, *a, **k)
+)
+socket.socket.connect = lambda self, address: _trap(address) or _connect(self, address)
+
+import headroom
+
+if sys.argv[1] == "late":
+    os.environ["HEADROOM_OFFLINE"] = "1"
+import importlib
+
+importlib.import_module(sys.argv[2])
+if "crewai" in sys.modules:
+    # CrewAI tracks the install from a background thread; give it the chance
+    # to dial before reporting, or a leak could race past the report.
+    import threading, time
+
+    deadline = time.monotonic() + 3
+    for thread in threading.enumerate():
+        if thread is not threading.main_thread():
+            thread.join(max(0.0, deadline - time.monotonic()))
+print(json.dumps({
+    "attempts": attempts,
+    "litellm": "litellm" in sys.modules,
+    "crewai": "crewai" in sys.modules,
+}))
+"""
+
+# Variables that turn a library's import-time phone-home off. The probe clears
+# them all, so each run starts from the libraries' own defaults.
+_PHONE_HOME_OPT_OUTS = (
+    "LITELLM_LOCAL_MODEL_COST_MAP",
+    "CREWAI_DISABLE_TELEMETRY",
+    "CREWAI_DISABLE_TRACKING",
+    "OTEL_SDK_DISABLED",
+)
+
+
+def _run_import_probe(
+    when: str,
+    module: str,
+    env_overrides: dict[str, str] | None = None,
+    pythonpath: Path | None = None,
+) -> dict[str, object]:
+    """Import ``module`` in a fresh interpreter with every outbound connect
+    trapped. ``when`` is ``early`` (offline from the start), ``late`` (offline
+    switched on after ``import headroom``) or ``online``."""
+    import json
+    import subprocess
+    import sys
+
+    env = {k: v for k, v in os.environ.items() if k not in _PHONE_HOME_OPT_OUTS}
+    env.pop("HEADROOM_OFFLINE", None)
+    if when == "early":
+        env["HEADROOM_OFFLINE"] = "1"
+    env.update(env_overrides or {})
+    if pythonpath is not None:
+        env["PYTHONPATH"] = os.pathsep.join(
+            p for p in (str(pythonpath), env.get("PYTHONPATH", "")) if p
+        )
+    result = subprocess.run(
+        [sys.executable, "-c", _LITELLM_IMPORT_PROBE, when, module],
+        capture_output=True,
+        text=True,
+        cwd=REPO_ROOT,
+        env=env,
+        timeout=120,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr[-2000:]
+    return json.loads(result.stdout.strip().splitlines()[-1])
+
+
+def _is_pin_call(statement: ast.stmt, pin: str) -> bool:
+    if not (isinstance(statement, ast.Expr) and isinstance(statement.value, ast.Call)):
+        return False
+    func = statement.value.func
+    name = func.id if isinstance(func, ast.Name) else getattr(func, "attr", None)
+    return name == pin
+
+
+def _pinned_before(node: ast.AST, parents: dict[ast.AST, ast.AST], pin: str) -> bool:
+    """True when a ``pin()`` call precedes ``node`` in its own block or an
+    enclosing block of the same function/module — i.e. it always runs first."""
+    child = node
+    while child in parents:
+        parent = parents[child]
+        for field in ("body", "orelse", "finalbody", "handlers"):
+            block = getattr(parent, field, None)
+            if isinstance(block, list) and child in block:
+                if any(_is_pin_call(s, pin) for s in block[: block.index(child)]):
+                    return True
+        if isinstance(parent, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)):
+            return False
+        child = parent
+    return False
+
+
+def _unpinned_imports(package: str, pin: str) -> list[str]:
+    """Every import of ``package`` (or a submodule) in ``headroom/`` that no
+    ``pin()`` call precedes in the same scope. A pin in another scope does not
+    count: it ran at a different time from the import."""
+    unpinned: list[str] = []
+    for path in sorted(PACKAGE_ROOT.rglob("*.py")):
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+        parents = {
+            child: parent for parent in ast.walk(tree) for child in ast.iter_child_nodes(parent)
+        }
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Import):
+                names = [alias.name for alias in node.names]
+            elif isinstance(node, ast.ImportFrom) and node.level == 0 and node.module:
+                names = [node.module]
+            else:
+                continue
+            if not any(n == package or n.startswith(f"{package}.") for n in names):
+                continue
+            if not _pinned_before(node, parents, pin):
+                unpinned.append(f"{path.relative_to(REPO_ROOT)}:{node.lineno}")
+    return unpinned
+
+
+class TestLiteLLMCostMapOffline:
+    """``import litellm`` refreshes its pricing table from
+    raw.githubusercontent.com unless ``LITELLM_LOCAL_MODEL_COST_MAP`` is set,
+    and every litellm-backed module (the pricing helpers, the LiteLLM provider
+    and backend, both Headroom Cloud integrations) triggers it on first import.
+    """
+
+    @staticmethod
+    def _probe(when: str, module: str, cost_map_env: str | None = None) -> dict[str, object]:
+        pytest.importorskip("litellm")
+        overrides = {} if cost_map_env is None else {"LITELLM_LOCAL_MODEL_COST_MAP": cost_map_env}
+        return _run_import_probe(when, module, overrides)
+
+    _LITELLM_MODULES = [
+        "headroom.providers.litellm",
+        "headroom.backends.litellm",
+        "headroom.pricing.litellm_pricing",
+        "headroom.integrations.litellm_callback",
+    ]
+
+    @pytest.mark.parametrize("module", _LITELLM_MODULES)
+    def test_import_with_offline_set_at_start_opens_no_socket(self, module: str) -> None:
+        outcome = self._probe("early", module)
+        assert outcome["litellm"] is True
+        assert outcome["attempts"] == []
+
+    @pytest.mark.parametrize("module", _LITELLM_MODULES)
+    def test_import_with_offline_set_after_package_load_opens_no_socket(self, module: str) -> None:
+        """The switch is read when it is checked, not when the package loads:
+        ``create_app(ProxyConfig(offline=True))`` turns it on after
+        ``import headroom``. So a pin in ``headroom/__init__.py`` is not enough
+        on its own; each litellm import pins again first."""
+        outcome = self._probe("late", module)
+        assert outcome["litellm"] is True
+        assert outcome["attempts"] == []
+
+    @pytest.mark.parametrize("operator_value", ["1", "False", ""])
+    def test_operator_value_cannot_reopen_the_fetch(self, operator_value: str) -> None:
+        """litellm accepts only ``true``, so an operator ``1`` (the form every
+        Headroom switch accepts), ``False`` or empty value would make it fetch.
+        The air-gap switch wins over it."""
+        outcome = self._probe("early", "headroom.providers.litellm", operator_value)
+        assert outcome["litellm"] is True
+        assert outcome["attempts"] == []
+
+    def test_every_litellm_import_is_pinned_first(self) -> None:
+        """Each ``import litellm`` / ``from litellm…`` in ``headroom/`` must
+        follow a ``pin_litellm_cost_map_local()`` call in the same function (or
+        at module level for a module-level import). A pin in another scope does
+        not count: it ran at a different time from the import."""
+        unpinned = _unpinned_imports("litellm", "pin_litellm_cost_map_local")
+        assert unpinned == [], (
+            "litellm imported without pin_litellm_cost_map_local() first in the same "
+            f"scope; under HEADROOM_OFFLINE it fetches its pricing table: {unpinned}"
+        )
+
+    @staticmethod
+    def _fresh_pin_state(monkeypatch: pytest.MonkeyPatch, value: str | None) -> None:
+        import headroom.offline
+
+        monkeypatch.setattr(headroom.offline._litellm_cost_map_pin, "before", None)
+        # setenv first so teardown restores the real value even after the
+        # pin writes the variable behind monkeypatch's back.
+        monkeypatch.setenv("LITELLM_LOCAL_MODEL_COST_MAP", "")
+        if value is None:
+            monkeypatch.delenv("LITELLM_LOCAL_MODEL_COST_MAP")
+        else:
+            monkeypatch.setenv("LITELLM_LOCAL_MODEL_COST_MAP", value)
+
+    def test_online_leaves_litellm_alone(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        from headroom.offline import pin_litellm_cost_map_local
+
+        self._fresh_pin_state(monkeypatch, None)
+        monkeypatch.delenv("HEADROOM_OFFLINE", raising=False)
+        pin_litellm_cost_map_local()
+        assert "LITELLM_LOCAL_MODEL_COST_MAP" not in os.environ
+
+    @pytest.mark.parametrize("before", [None, "False"])
+    def test_leaving_offline_puts_back_what_the_pin_replaced(
+        self, monkeypatch: pytest.MonkeyPatch, before: str | None
+    ) -> None:
+        """Offline turned off before the first litellm import must give the
+        online pricing refresh back, not leave Headroom's pin behind."""
+        from headroom.offline import pin_litellm_cost_map_local
+
+        self._fresh_pin_state(monkeypatch, before)
+        monkeypatch.setenv("HEADROOM_OFFLINE", "1")
+        pin_litellm_cost_map_local()
+        pin_litellm_cost_map_local()  # a second pin must not record its own value
+        assert os.environ["LITELLM_LOCAL_MODEL_COST_MAP"] == "True"
+
+        monkeypatch.delenv("HEADROOM_OFFLINE")
+        pin_litellm_cost_map_local()
+        assert os.environ.get("LITELLM_LOCAL_MODEL_COST_MAP") == before
+
+    def test_a_value_changed_after_the_pin_is_not_overwritten(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from headroom.offline import pin_litellm_cost_map_local
+
+        self._fresh_pin_state(monkeypatch, None)
+        monkeypatch.setenv("HEADROOM_OFFLINE", "1")
+        pin_litellm_cost_map_local()
+        os.environ["LITELLM_LOCAL_MODEL_COST_MAP"] = "false"  # the operator's own change
+
+        monkeypatch.delenv("HEADROOM_OFFLINE")
+        pin_litellm_cost_map_local()
+        assert os.environ["LITELLM_LOCAL_MODEL_COST_MAP"] == "false"
+
+
+# ─────────────── path 2d: CrewAI's import-time install tracking ─────────────
+
+# Stands in for CrewAI where it is not installed (no extra or CI job installs
+# it): the same import-time behaviour as crewai 1.6.1's ``_track_install`` —
+# a background thread dialling api.scarf.sh unless one of its opt-out
+# variables is ``true`` — plus the one name Headroom imports from it.
+_CREWAI_STUB = {
+    "crewai/__init__.py": (
+        "import os, socket, threading\n"
+        "\n"
+        "def _track_install():\n"
+        "    names = ('OTEL_SDK_DISABLED', 'CREWAI_DISABLE_TELEMETRY', 'CREWAI_DISABLE_TRACKING')\n"
+        "    if any(os.getenv(n, 'false').lower() == 'true' for n in names):\n"
+        "        return\n"
+        "    try:\n"
+        "        socket.create_connection(('api.scarf.sh', 443), timeout=2).close()\n"
+        "    except OSError:\n"
+        "        pass\n"
+        "\n"
+        "threading.Thread(target=_track_install, daemon=True).start()\n"
+    ),
+    "crewai/tools/__init__.py": "",
+    "crewai/tools/base_tool.py": "class BaseTool:\n    pass\n",
+}
+
+# The modules a Headroom user imports that pull CrewAI in: the integration
+# itself, and any sibling under ``headroom.integrations``, whose package
+# ``__init__`` imports the CrewAI integration whenever CrewAI is installed.
+_CREWAI_REACHING_MODULES = [
+    "headroom.integrations.crewai",
+    "headroom.integrations.litellm_callback",
+]
+
+
+class TestCrewAITelemetryOffline:
+    """Importing ``headroom.integrations.litellm_callback`` under the air-gap
+    switch dialled api.scarf.sh whenever CrewAI was installed, because the
+    package ``__init__`` imports the CrewAI integration and ``import crewai``
+    tracks the install from a background thread (found in review of #4242
+    with crewai 1.6.1 and litellm 1.101.0)."""
+
+    @pytest.fixture
+    def crewai_stub(self, tmp_path: Path) -> Path:
+        for relative, source in _CREWAI_STUB.items():
+            path = tmp_path / relative
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(source, encoding="utf-8")
+        return tmp_path
+
+    def test_the_stub_phones_home_when_online(self, crewai_stub: Path) -> None:
+        """Without this, a stub that never dials would pass every test below."""
+        outcome = _run_import_probe(
+            "online", "headroom.integrations.crewai", pythonpath=crewai_stub
+        )
+        assert outcome["crewai"] is True
+        # litellm's own pricing refresh also runs online; only the tracking matters here.
+        assert "api.scarf.sh" in outcome["attempts"]
+
+    @pytest.mark.parametrize("when", ["early", "late"])
+    @pytest.mark.parametrize("module", _CREWAI_REACHING_MODULES)
+    def test_import_offline_opens_no_socket(
+        self, crewai_stub: Path, module: str, when: str
+    ) -> None:
+        if module.endswith("litellm_callback"):
+            pytest.importorskip("litellm")
+        outcome = _run_import_probe(when, module, pythonpath=crewai_stub)
+        assert outcome["crewai"] is True
+        assert outcome["attempts"] == []
+
+    @pytest.mark.parametrize("operator_value", ["1", "False", ""])
+    def test_operator_value_cannot_reopen_the_tracking(
+        self, crewai_stub: Path, operator_value: str
+    ) -> None:
+        outcome = _run_import_probe(
+            "early",
+            "headroom.integrations.crewai",
+            {"CREWAI_DISABLE_TELEMETRY": operator_value},
+            pythonpath=crewai_stub,
+        )
+        assert outcome["attempts"] == []
+
+    @pytest.mark.parametrize("module", _CREWAI_REACHING_MODULES)
+    def test_real_crewai_import_offline_opens_no_socket(self, module: str) -> None:
+        """The same against the installed CrewAI, telemetry at its default."""
+        import importlib.util
+
+        if importlib.util.find_spec("crewai") is None:
+            pytest.skip("crewai is not installed")
+        if module.endswith("litellm_callback"):
+            pytest.importorskip("litellm")
+        outcome = _run_import_probe("early", module)
+        assert outcome["crewai"] is True
+        assert outcome["attempts"] == []
+
+    def test_every_crewai_import_is_pinned_first(self) -> None:
+        unpinned = _unpinned_imports("crewai", "pin_crewai_telemetry_off")
+        assert unpinned == [], (
+            "crewai imported without pin_crewai_telemetry_off() first in the same "
+            f"scope; under HEADROOM_OFFLINE it tracks the install over the network: {unpinned}"
+        )
+
+    def test_leaving_offline_puts_back_what_the_pin_replaced(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        import headroom.offline
+        from headroom.offline import pin_crewai_telemetry_off
+
+        monkeypatch.setattr(headroom.offline._crewai_telemetry_pin, "before", None)
+        monkeypatch.setenv("CREWAI_DISABLE_TELEMETRY", "False")
+        monkeypatch.setenv("HEADROOM_OFFLINE", "1")
+        pin_crewai_telemetry_off()
+        assert os.environ["CREWAI_DISABLE_TELEMETRY"] == "true"
+
+        monkeypatch.delenv("HEADROOM_OFFLINE")
+        pin_crewai_telemetry_off()
+        assert os.environ["CREWAI_DISABLE_TELEMETRY"] == "False"
 
 
 # ────────── path 4: the Python half of the HuggingFace download ─────────────
