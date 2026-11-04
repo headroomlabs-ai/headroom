@@ -868,7 +868,8 @@ class TestHuggingFaceDownloadOffline:
 # ───────────────── path 3: the Rust HuggingFace fetch (parity) ──────────────
 
 _RUST_OFFLINE = REPO_ROOT / "crates" / "headroom-core" / "src" / "offline.rs"
-_RUST_HF = REPO_ROOT / "crates" / "headroom-core" / "src" / "tokenizer" / "hf_impl.rs"
+# Every Rust Hub download (tokenizer, embedder) builds its client in hf_cache::hub_api.
+_RUST_HF = REPO_ROOT / "crates" / "headroom-core" / "src" / "hf_cache.rs"
 
 
 class TestRustOfflineParity:
@@ -976,11 +977,14 @@ class TestRustOfflineParity:
 
     def test_hf_fetch_guards_before_it_builds_a_client(self) -> None:
         source = _RUST_HF.read_text(encoding="utf-8")
-        assert "guard_egress(" in source, "hf_impl.rs does not consult the offline guard"
-        guard_at = source.index("guard_egress(")
-        api_at = source.index("hf_hub::api::sync::Api::new()")
+        # Within hub_api itself: a guard elsewhere in the file does not count.
+        fn_at = source.index("pub(crate) fn hub_api(")
+        body = source[fn_at : source.index("\n}\n", fn_at)]
+        assert "guard_egress(" in body, "hf_cache::hub_api does not consult the offline guard"
+        guard_at = body.index("guard_egress(")
+        api_at = body.index("hf_hub::api::sync::ApiBuilder::from_cache(")
         assert guard_at < api_at, (
-            "the offline guard runs after Api::new(), which already resolves the "
+            "the offline guard runs after ApiBuilder::build(), which already resolves the "
             "Hub endpoint and builds the ureq agent — guard before the client "
             "exists, not before the request"
         )
@@ -3225,7 +3229,7 @@ _RUST_ALLOWLIST: dict[str, tuple[int, str]] = {
         "cache-only: TextEmbedding::try_new_from_user_defined in load_snapshot "
         "builds the ONNX session from bytes already read off disk and has no "
         "Hub client at all. The files reach the disk through "
-        "default_model_repo, whose ApiBuilder is guarded, and only on a cache "
+        "default_model_repo, whose hf_cache::hub_api is guarded, and only on a cache "
         "miss, so a pre-seeded air-gapped host still loads.",
     ),
     "headroom-proxy/src/proxy.rs": (
@@ -3329,7 +3333,7 @@ class TestRustEgressChokepointCoverage:
     def test_the_guarded_rust_paths_are_seen_as_guarded(self) -> None:
         sites = _rust_egress_sites()
         for relpath in (
-            "headroom-core/src/tokenizer/hf_impl.rs",
+            "headroom-core/src/hf_cache.rs",
             "headroom-core/src/transforms/kompress.rs",
             "headroom-core/src/relevance/embedding.rs",
         ):
