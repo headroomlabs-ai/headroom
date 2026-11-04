@@ -343,6 +343,162 @@ class _FakeUpstream:
             await asyncio.Event().wait()
 
 
+def _delta_compression_handler():
+    from types import MethodType
+
+    from headroom.transforms.content_router import (
+        CompressionStrategy,
+        ContentRouter,
+        RouterCompressionResult,
+    )
+
+    router = ContentRouter()
+
+    def compress(self, content, **kwargs):
+        return RouterCompressionResult(
+            original=content,
+            compressed="ordinary output compressed",
+            strategy_used=CompressionStrategy.KOMPRESS,
+        )
+
+    router.compress = MethodType(compress, router)
+    handler = _DummyOpenAIHandler()
+    handler.config.optimize = True
+    handler.openai_pipeline = SimpleNamespace(transforms=[router])
+    return handler
+
+
+async def _relay_delta_outputs(handler, calls, call_ids):
+    """Compact Codex wire fixture: the continuation omits its producing calls."""
+    output = " ".join(f"synthetic_original_{i}" for i in range(300))
+    deltas = [
+        {
+            "type": "response.create",
+            "response": {
+                "model": "gpt-5.4",
+                "previous_response_id": "resp_tools",
+                "input": [
+                    {"type": "custom_tool_call_output", "call_id": call_id, "output": output}
+                ],
+            },
+        }
+        for call_id in call_ids
+    ]
+    completed = asyncio.Event()
+
+    class DeltaClient(_FakeWebSocket):
+        first = True
+
+        async def receive_text(self):
+            if not self.first:
+                await completed.wait()
+            self.first = False
+            return await super().receive_text()
+
+        async def send_text(self, text):
+            await super().send_text(text)
+            if json.loads(text).get("type") == "response.completed":
+                completed.set()
+
+    client = DeltaClient(frames=[_first_frame(), *(json.dumps(frame) for frame in deltas)])
+    upstream = _FakeUpstream(
+        [
+            json.dumps({"type": "response.created", "response": {"id": "resp_tools"}}),
+            *(json.dumps({"type": "response.output_item.done", "item": call}) for call in calls),
+            json.dumps({"type": "response.completed", "response": {"id": "resp_tools"}}),
+        ],
+        hold_after_events=True,
+    )
+    with patch.dict(sys.modules, {"websockets": _make_fake_websockets_module(upstream)}):
+        await asyncio.wait_for(handler.handle_openai_responses_ws(client), timeout=2.0)
+    forwarded = [json.loads(frame)["response"] for frame in upstream.sent[1:]]
+    return output, deltas, forwarded
+
+
+def _retrieval_call(call_id):
+    return {
+        "type": "custom_tool_call",
+        "call_id": call_id,
+        "name": "exec",
+        "input": 'const r = await tools.mcp__headroom__headroom_retrieve({hash: "fixture"});text(r);',
+    }
+
+
+@pytest.mark.asyncio
+async def test_ws_delta_retrieval_outputs_and_retries_stay_verbatim():
+    handler = _delta_compression_handler()
+    original, deltas, forwarded = await _relay_delta_outputs(
+        handler, [_retrieval_call("call_delta")], ["call_delta", "call_delta"]
+    )
+
+    assert len(forwarded) == 2
+    assert forwarded == [frame["response"] for frame in deltas]
+    assert all(frame["input"][0]["output"] == original for frame in forwarded)
+
+
+@pytest.mark.asyncio
+async def test_ws_delta_retrieval_old_compressor_signature_fails_open():
+    handler = _delta_compression_handler()
+    calls = 0
+
+    def old_compress(
+        payload,
+        *,
+        model,
+        request_id,
+        timing=None,
+        client=None,
+        savings_tags=None,
+        deadline_started_at=None,
+    ):
+        nonlocal calls
+        calls += 1
+        return {"model": model, "input": "legacy compressed"}, True, 5, ["text"], None, 10, 5, 10
+
+    handler._compress_openai_responses_payload = old_compress
+    original, deltas, forwarded = await _relay_delta_outputs(
+        handler, [_retrieval_call("call_old")], ["call_old", "call_old"]
+    )
+
+    assert calls == 1  # Only the first frame, before any retrieval identity exists.
+    assert forwarded == [frame["response"] for frame in deltas]
+    assert all(frame["input"][0]["output"] == original for frame in forwarded)
+
+
+@pytest.mark.asyncio
+async def test_ws_delta_retrieval_context_does_not_cross_connections():
+    handler = _delta_compression_handler()
+    await _relay_delta_outputs(handler, [_retrieval_call("reused_id")], ["reused_id"])
+    ordinary = {
+        "type": "custom_tool_call",
+        "call_id": "ordinary_id",
+        "name": "exec",
+        "input": 'const r = await tools.exec_command({cmd: "echo synthetic"});text(r);',
+    }
+    original, _deltas, forwarded = await _relay_delta_outputs(
+        handler, [ordinary], ["ordinary_id", "reused_id"]
+    )
+
+    assert len(forwarded) == 2
+    assert all(frame["input"][0]["output"] != original for frame in forwarded)
+
+
+@pytest.mark.asyncio
+async def test_ws_delta_tool_context_limit_preserves_untracked_outputs(monkeypatch, caplog):
+    monkeypatch.setattr(openai_module, "_OPENAI_RESPONSES_TOOL_CONTEXT_LIMIT", 1, raising=False)
+    handler = _delta_compression_handler()
+    original, deltas, forwarded = await _relay_delta_outputs(
+        handler,
+        [_retrieval_call("call_first"), _retrieval_call("call_overflow")],
+        ["call_first", "call_overflow"],
+    )
+
+    assert len(forwarded) == 2
+    assert forwarded == [frame["response"] for frame in deltas]
+    assert all(frame["input"][0]["output"] == original for frame in forwarded)
+    assert "WS retrieval context limit reached" in caplog.text
+
+
 def _make_fake_websockets_module(
     upstream: _FakeUpstream | None,
     *,
