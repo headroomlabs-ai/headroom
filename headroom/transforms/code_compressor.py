@@ -1818,6 +1818,11 @@ class CodeAwareCompressor(Transform):
         for child in root.children:
             child_range = (child.start_byte, child.end_byte)
             if child_range not in captured_byte_ranges:
+                # In Python a `;` between two statements on one physical line
+                # is a root-level anonymous token. Emitted as its own fragment
+                # it becomes a bare `;` line and invalidates the output.
+                if not child.is_named and child.type in (";", ","):
+                    continue
                 text = _get_node_text(child, code).strip()
                 if text:
                     if first_captured is not None and child.end_byte <= first_captured:
@@ -2042,6 +2047,21 @@ class CodeAwareCompressor(Transform):
                 continue
             body_stmts.append((child.start_point[0], child.end_point[0]))
 
+        # Statements can share a physical line (`a = 1; b = 2`). Lines are kept
+        # whole, so merge overlapping ranges into one entry: keeping both would
+        # duplicate the shared line, and dropping the later range would lose
+        # continuation lines of a multi-line statement after the `;`.
+        merged_stmts: list[tuple[int, int]] = []
+        for start_row, end_row in body_stmts:
+            if merged_stmts and start_row <= merged_stmts[-1][1]:
+                merged_stmts[-1] = (
+                    merged_stmts[-1][0],
+                    max(merged_stmts[-1][1], end_row),
+                )
+            else:
+                merged_stmts.append((start_row, end_row))
+        body_stmts = merged_stmts
+
         # Calculate lines per statement and keep whole statements until budget
         kept_lines: list[str] = []
         kept_line_count = 0
@@ -2149,6 +2169,7 @@ class CodeAwareCompressor(Transform):
         # Process each child of the class body individually
         body_parts: list[str] = []
         processed_ranges: list[tuple[int, int]] = []
+        last_processed_end = -1
 
         for child in body_node.children:
             if not child.is_named:
@@ -2159,6 +2180,14 @@ class CodeAwareCompressor(Transform):
             child_end = child.end_point[0]
             if child.end_point[1] == 0 and child_end > child_start:
                 child_end -= 1
+            # Statements can share a physical line (`x = 1; y = 2`). The line
+            # slice already carries all of them; skip only rows already
+            # emitted, keeping any continuation lines of this node.
+            if child_start <= last_processed_end:
+                child_start = last_processed_end + 1
+                if child_start > child_end:
+                    continue
+            last_processed_end = child_end
             child_text = "\n".join(code_lines[child_start : child_end + 1])
 
             # Methods/functions inside the class — compress individually
