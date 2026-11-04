@@ -278,6 +278,20 @@ impl DiffCompressor {
         context: &str,
         store: Option<&dyn CcrStore>,
     ) -> (DiffCompressionResult, DiffCompressorStats) {
+        self.compress_with_ccr_source(content, context, store, content)
+    }
+
+    /// Like [`Self::compress_with_store`], but the CCR entry and its
+    /// hash come from `ccr_source` rather than `content`. Use when
+    /// `content` is a derived form of the original (e.g. after a
+    /// reformat) and retrieval must return the original.
+    pub fn compress_with_ccr_source(
+        &self,
+        content: &str,
+        context: &str,
+        store: Option<&dyn CcrStore>,
+        ccr_source: &str,
+    ) -> (DiffCompressionResult, DiffCompressorStats) {
         let start = Instant::now();
         let mut stats = DiffCompressorStats::default();
 
@@ -473,7 +487,7 @@ impl DiffCompressor {
         if self.config.enable_ccr
             && (compressed_line_count as f64) < (original_line_count as f64) * savings_threshold
         {
-            let key = md5_hex_24(content);
+            let key = md5_hex_24(ccr_source);
             compressed_output.push('\n');
             compressed_output.push_str(&format!(
                 "[{} lines compressed to {}. Retrieve full diff: hash={}]",
@@ -485,7 +499,7 @@ impl DiffCompressor {
             // (typically the Python shim) is responsible — see the
             // method-level docs.
             if let Some(s) = store {
-                s.put(&key, content);
+                s.put(&key, ccr_source);
             }
             cache_key = Some(key);
             stats.cache_key_emitted = true;
