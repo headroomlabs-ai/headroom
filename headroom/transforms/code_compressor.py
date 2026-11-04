@@ -2536,17 +2536,21 @@ def _get_leading_comment_text(
     Doc comments and Rust outer attributes are top-level siblings of the
     declaration they decorate, not children of it. Left uncaptured, they fall
     through to the leftover top-level sweep and get grouped separately from the
-    declarations they decorate instead of staying attached. Only siblings with
-    no blank line before the node (or the next sibling) are treated as attached.
+    declarations they decorate instead of staying attached.
+
+    Comments only attach when there is no blank line before the node (or the
+    next sibling). Attributes always attach: Rust permits whitespace between an
+    outer attribute and the item it decorates, and detaching it produces
+    ``expected item after attributes`` at the end of the output.
     """
     preamble: list[Any] = []
     sibling = getattr(node, "prev_sibling", None)
     anchor_row = node.start_point[0]
-    while (
-        sibling is not None
-        and (sibling.type in _COMMENT_NODE_TYPES or sibling.type in _ATTACHED_NODE_TYPES)
-        and (anchor_row - sibling.end_point[0] <= 1)
+    while sibling is not None and (
+        sibling.type in _COMMENT_NODE_TYPES or sibling.type in _ATTACHED_NODE_TYPES
     ):
+        if sibling.type in _COMMENT_NODE_TYPES and (anchor_row - sibling.end_point[0] > 1):
+            break
         preamble.append(sibling)
         anchor_row = sibling.start_point[0]
         sibling = getattr(sibling, "prev_sibling", None)

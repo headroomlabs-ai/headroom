@@ -2270,3 +2270,24 @@ class TestRustAttributeAttachment:
 
         assert result.compression_ratio < 1.0
         assert "/// Records one item.\n#[inline]\npub fn record" in result.compressed
+
+    def test_attribute_attaches_across_blank_line(self):
+        """Rust allows whitespace between an outer attribute and its item."""
+        code = (
+            "pub struct Item { pub id: u64 }\n"
+            "\n"
+            "#[inline]\n"
+            "\n"
+            "pub fn record(item: &Item, sink: &mut Vec<u64>) {\n"
+            "    sink.push(item.id);\n"
+            "    sink.push(item.id + 1);\n"
+            "    sink.push(item.id + 2);\n"
+            "}\n"
+        )
+
+        result = self._compressor().compress(code, language="rust")
+
+        assert result.compression_ratio < 1.0
+        assert result.syntax_valid is True
+        assert "#[inline]\npub fn record" in result.compressed
+        assert not result.compressed.rstrip().endswith("#[inline]")
