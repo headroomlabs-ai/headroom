@@ -70,7 +70,7 @@ class BedrockHandlerMixin:
                 URL path (may contain ``.``, ``:`` and ``/``).
             stream: ``True`` for ``invoke-with-response-stream``.
         """
-        from fastapi.responses import JSONResponse
+        from fastapi.responses import JSONResponse, Response
 
         from headroom.proxy.auth_mode import classify_client
         from headroom.proxy.helpers import (
@@ -243,6 +243,14 @@ class BedrockHandlerMixin:
         # contract treats 0 as "not measured") — Bedrock responses are forwarded
         # byte-faithfully and never parsed. The valuable figure, request-side
         # compression, is recorded in full.
+        #
+        # status_code=response.status_code: unlike streaming.py's SDK-based
+        # _stream_response_bedrock (which never holds an HTTP response object
+        # and so keeps the dataclass default of 200 — see PR #2682), this
+        # handler forwards via raw httpx and always has the real upstream
+        # status on the returned Response/StreamingResponse. Leaving it out
+        # here made every upstream 4xx/5xx (throttling, auth failure, model
+        # not found) record as a 200 success in the savings/cost funnel.
         try:
             from headroom.proxy.outcome import RequestOutcome
 
@@ -261,6 +269,7 @@ class BedrockHandlerMixin:
                     pipeline_timing=pipeline_timing,
                     tags=tags,
                     client=client,
+                    status_code=response.status_code,
                 )
             )
         except Exception:
@@ -301,14 +310,15 @@ class BedrockHandlerMixin:
             upstream = await self.http_client.send(upstream_request, stream=True)  # type: ignore[attr-defined]
         except (httpx.ConnectError, httpx.TimeoutException) as err:
             logger.warning("[%s] %s upstream connect failed: %s", request_id, LOG_TAG, err)
+            from headroom.proxy import public_errors
+
             return JSONResponse(
                 status_code=502,
-                content={
-                    "error": {
-                        "type": "connection_error",
-                        "message": f"Failed to connect to Bedrock upstream: {err}",
-                    }
-                },
+                content=public_errors.openai_error_body(
+                    public_errors.classify_or_internal(err),
+                    request_id=str(request_id),
+                    error_type="connection_error",
+                ),
             )
 
         # Forward raw (still-encoded) bytes, so strip hop-by-hop headers that

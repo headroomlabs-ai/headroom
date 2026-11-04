@@ -13,6 +13,7 @@ Or via headroom extras:
 
 from __future__ import annotations
 
+import heapq
 import json
 from dataclasses import dataclass
 from datetime import datetime
@@ -22,6 +23,7 @@ from typing import TYPE_CHECKING, Any
 
 import numpy as np
 
+from ...fileperms import ensure_private_file, open_owner_only
 from ..models import Memory, ScopeLevel, normalize_entity_refs
 from ..ports import VectorFilter, VectorSearchResult
 
@@ -393,15 +395,19 @@ class HNSWVectorIndex:
         if not self._metadata:
             return 0
 
-        # Sort entries by importance (ascending), then by created_at (oldest first)
-        sorted_entries = sorted(
+        # Select the `count` lowest-importance (then oldest) entries. nsmallest
+        # is O(n log count); fully sorting all entries just to take the first
+        # `count` was O(n log n), and eviction runs on every insert once a
+        # bounded index is at capacity. The selection is identical.
+        lowest_entries = heapq.nsmallest(
+            count,
             self._metadata.items(),
             key=lambda x: (x[1].importance, x[1].created_at),
         )
 
         # Evict the lowest importance entries
         evicted = 0
-        for memory_id, _metadata in sorted_entries[:count]:
+        for memory_id, _metadata in lowest_entries:
             if memory_id not in self._memory_to_hnsw:
                 continue
 
@@ -807,8 +813,11 @@ class HNSWVectorIndex:
         path = Path(path)
 
         with self._lock:
-            # Save HNSW index
+            # Save HNSW index. hnswlib opens the path itself and would create
+            # it at the umask, so make it a private regular file first (refusing
+            # a symlink); its truncating write keeps the 0600 mode.
             hnsw_path = path.with_suffix(".hnsw")
+            ensure_private_file(hnsw_path, what="HNSW index")
             self._index.save_index(str(hnsw_path))
 
             # Save metadata, mappings, and embeddings
@@ -829,7 +838,9 @@ class HNSWVectorIndex:
                 "embeddings": {mid: emb.tolist() for mid, emb in self._embeddings.items()},
             }
 
-            with open(meta_path, "w") as f:
+            # Memory metadata and raw embeddings: owner-only, like every other
+            # memory store file.
+            with open_owner_only(meta_path, "w") as f:
                 json.dump(meta_data, f)
 
     def load_index(self, path: str | Path) -> None:

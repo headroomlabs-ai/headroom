@@ -128,4 +128,70 @@ describe("Gemini withHeadroom", () => {
 
     expect(result).toBe(originalResult);
   });
+
+  it("preserves inline image parts through compression", async () => {
+    const mockModel = {
+      generateContent: vi.fn().mockResolvedValue({ response: { text: () => "a cat" } }),
+    };
+    // The proxy keeps the image part (it only compresses text).
+    mockFetch.mockResolvedValue({
+      ok: true,
+      json: async () => ({
+        messages: [
+          {
+            role: "user",
+            content: [
+              { type: "text", text: "what is this?" },
+              { type: "image_url", image_url: { url: "data:image/png;base64,AAAA" } },
+            ],
+          },
+        ],
+        tokens_before: 500,
+        tokens_after: 100,
+        tokens_saved: 400,
+        compression_ratio: 0.2,
+        transforms_applied: ["smart_crusher"],
+        ccr_hashes: [],
+      }),
+    });
+
+    const wrapped = withHeadroom(mockModel, { baseUrl: "http://test:8787" });
+    await wrapped.generateContent({
+      contents: [
+        {
+          role: "user",
+          parts: [{ text: "what is this?" }, { inlineData: { mimeType: "image/png", data: "AAAA" } }],
+        },
+      ],
+    });
+
+    // The image must reach the proxy as an image_url part ...
+    const body = JSON.parse(mockFetch.mock.calls[0][1].body);
+    expect(body.messages[0].content).toEqual([
+      { type: "text", text: "what is this?" },
+      { type: "image_url", image_url: { url: "data:image/png;base64,AAAA" } },
+    ]);
+    // ... and come back to the model as an inlineData part.
+    expect(mockModel.generateContent).toHaveBeenCalledWith({
+      contents: [
+        {
+          role: "user",
+          parts: [{ text: "what is this?" }, { inlineData: { mimeType: "image/png", data: "AAAA" } }],
+        },
+      ],
+    });
+  });
+
+  it("keeps an image-only turn when the proxy is unreachable", async () => {
+    const mockModel = { generateContent: vi.fn().mockResolvedValue({}) };
+    mockFetch.mockRejectedValue(new Error("connect ECONNREFUSED"));
+
+    const wrapped = withHeadroom(mockModel, { baseUrl: "http://test:8787" });
+    const contents = [
+      { role: "user", parts: [{ inlineData: { mimeType: "image/png", data: "AAAA" } }] },
+    ];
+    await wrapped.generateContent({ contents });
+
+    expect(mockModel.generateContent).toHaveBeenCalledWith({ contents });
+  });
 });
