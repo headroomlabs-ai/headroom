@@ -10,7 +10,11 @@ monkeypatched so every branch runs on any CI OS.
 
 from __future__ import annotations
 
+import json
+import os
+import subprocess
 import sys
+import textwrap
 from types import SimpleNamespace
 
 import pytest
@@ -157,3 +161,42 @@ def test_never_raises(monkeypatch):
     monkeypatch.setattr(_ort.importlib.util, "find_spec", boom)
     assert _ort.ensure_ort_dylib_pinned() is None
     assert "ORT_DYLIB_PATH" not in _ort.os.environ
+
+
+# ---- ORT_DISABLE_TELEMETRY default ----------------------------------------
+
+
+def test_telemetry_disabled_by_default(monkeypatch):
+    monkeypatch.delenv("ORT_DISABLE_TELEMETRY", raising=False)
+    _ort.disable_ort_telemetry_by_default()
+    assert _ort.os.environ["ORT_DISABLE_TELEMETRY"] == "1"
+
+
+def test_telemetry_choice_of_caller_wins(monkeypatch):
+    monkeypatch.setenv("ORT_DISABLE_TELEMETRY", "0")
+    _ort.disable_ort_telemetry_by_default()
+    assert _ort.os.environ["ORT_DISABLE_TELEMETRY"] == "0"
+
+
+def test_importing_headroom_disables_ort_telemetry_before_ort_loads():
+    """ORT reads the variable once at startup, so it must be set at package import."""
+    script = textwrap.dedent(
+        """
+        import json
+        import os
+        import sys
+
+        import headroom
+
+        print(json.dumps({
+            "value": os.environ.get("ORT_DISABLE_TELEMETRY"),
+            "ort_loaded": "onnxruntime" in sys.modules,
+        }))
+        """
+    )
+    env = {k: v for k, v in os.environ.items() if k != "ORT_DISABLE_TELEMETRY"}
+    result = subprocess.run(
+        [sys.executable, "-c", script], capture_output=True, text=True, check=True, env=env
+    )
+    data = json.loads(result.stdout.strip().splitlines()[-1])
+    assert data == {"value": "1", "ort_loaded": False}

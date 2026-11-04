@@ -30,6 +30,10 @@ _CANDIDATES: tuple[str, ...] = (
     "claude-sonnet-4-20250514",
     "claude-opus-4-5-20251101",
     "claude-opus-4-5",
+    # Last resort. By 2026-10, litellm had dropped the 200k-tier fields from
+    # every bare Anthropic id; only this Bedrock id still carries the full set,
+    # at the same rates as claude-sonnet-4-5.
+    "claude-sonnet-4-5-20250929-v1:0",
 )
 
 _BASE_FIELDS = ("input_cost_per_token", "output_cost_per_token")
