@@ -180,6 +180,12 @@ pub enum KompressError {
         #[source]
         source: Box<dyn std::error::Error + Send + Sync>,
     },
+    /// `HEADROOM_OFFLINE` is set, so the Hub fetch was refused before any
+    /// socket was opened. A separate variant from [`Self::Hub`] for the same
+    /// reason as [`crate::tokenizer::HfTokenizerError::Offline`]: retrying or
+    /// falling back on a policy refusal is just a slower refusal.
+    #[error(transparent)]
+    Offline(#[from] crate::offline::OfflineEgressBlocked),
 }
 
 // ─── Compressor ─────────────────────────────────────────────────────────
@@ -255,6 +261,22 @@ impl Kompress {
     /// downloading on miss). Blocking — call off the hot path. Tries the
     /// [`ONNX_CANDIDATES`] in order.
     pub fn from_pretrained(config: KompressConfig) -> Result<Self, KompressError> {
+        // Air-gap chokepoint — the same one `hf_impl.rs` uses for the
+        // tokenizer, for the same reason. `HF_HUB_OFFLINE` only shortcuts the
+        // cache *lookup*; on a cache miss `hf-hub` still dials huggingface.co,
+        // so the Kompress model download is a live egress path under
+        // `HEADROOM_OFFLINE=1` and was not covered.
+        //
+        // It sits before `Api::new()` because that already resolves the Hub
+        // endpoint and builds the `ureq` agent, so guarding at the `get` call
+        // would leak the setup packets the switch promises not to send.
+        //
+        // Trade-off, stated plainly: this refuses even when the artifacts are
+        // already in `~/.cache/huggingface/hub`, because `hf-hub` 0.5 gives no
+        // cache-hit/cache-miss split at this layer. An air-gapped caller that
+        // has pre-seeded artifacts should use [`Self::from_files`], which is
+        // network-free by construction and unaffected by this guard.
+        crate::offline::guard_egress("Kompress model download", &config.model_id)?;
         let api = hf_hub::api::sync::Api::new().map_err(|e| KompressError::Hub {
             repo: config.model_id.clone(),
             source: Box::new(e),
@@ -634,6 +656,38 @@ fn hf_hub_roots() -> Vec<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `from_pretrained` must refuse before `Api::new()` when the operator
+    /// air-gapped the box.
+    ///
+    /// The model id cannot exist, which is what makes this a real assertion
+    /// rather than a tautology: without the guard the call reaches `hf-hub`,
+    /// dials `huggingface.co` and comes back `KompressError::Hub`. Only the
+    /// guard can produce `Offline`, and only by returning before the client is
+    /// built — so `Offline` *is* the "no socket was opened" assertion here.
+    #[test]
+    fn from_pretrained_refuses_while_offline() {
+        let _guard = crate::test_support::env_lock();
+        std::env::set_var(crate::offline::OFFLINE_ENV, "1");
+        let config = KompressConfig {
+            model_id: "headroomlabs-ai/this-model-does-not-exist-a2".to_string(),
+            ..KompressConfig::default()
+        };
+        let result = Kompress::from_pretrained(config);
+        std::env::remove_var(crate::offline::OFFLINE_ENV);
+
+        match result {
+            Err(KompressError::Offline(blocked)) => {
+                assert_eq!(blocked.purpose, "Kompress model download");
+                assert_eq!(
+                    blocked.destination,
+                    "headroomlabs-ai/this-model-does-not-exist-a2"
+                );
+            }
+            Err(other) => panic!("expected an offline refusal, got a network error: {other}"),
+            Ok(_) => panic!("expected an offline refusal, got a loaded model"),
+        }
+    }
 
     #[test]
     fn config_defaults_match_kompress_v2_base() {

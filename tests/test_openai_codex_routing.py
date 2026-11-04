@@ -3,6 +3,7 @@ import base64
 import json
 import sys
 from copy import deepcopy
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -11,6 +12,7 @@ import httpx
 import pytest
 from fastapi import Request
 
+from headroom.memory.storage_router import RequestContext
 from headroom.proxy.handlers.openai import (
     OpenAIHandlerMixin,
     _is_allowed_websocket_origin,
@@ -279,7 +281,7 @@ class _MemoryToolsOnlyHandler:
         self.config = SimpleNamespace(
             inject_context=False,
             inject_tools=True,
-            project_root_override="",
+            project_root_override=str(Path(__file__).resolve().parent),
         )
         self.compute_calls = 0
 
@@ -311,7 +313,11 @@ class _MemoryContinuationHandler(_MemoryToolsOnlyHandler):
         args: dict,
         user_id: str,
         provider: str,
+        *,
+        request_context: RequestContext | None = None,
     ) -> str:
+        assert request_context is not None
+        assert request_context.base_user_id == user_id
         assert (name, args, user_id, provider) == (
             "memory_search",
             {},
@@ -401,7 +407,7 @@ class _ZdrResponsesHandler(_DummyOpenAIHandler):
         )
 
 
-def _build_request(body: dict, headers: dict[str, str]) -> Request:
+def _build_request(body: dict, headers: dict[str, str], path: str = "/v1/responses") -> Request:
     payload = json.dumps(body).encode("utf-8")
 
     async def receive():
@@ -413,8 +419,8 @@ def _build_request(body: dict, headers: dict[str, str]) -> Request:
         "http_version": "1.1",
         "method": "POST",
         "scheme": "https",
-        "path": "/v1/responses",
-        "raw_path": b"/v1/responses",
+        "path": path,
+        "raw_path": path.encode("utf-8"),
         "query_string": b"",
         "headers": [
             (key.lower().encode("utf-8"), value.encode("utf-8")) for key, value in headers.items()
@@ -578,6 +584,30 @@ def test_handle_openai_responses_api_auth_store_false_injects_stateless_memory_t
     assert [tool["name"] for tool in body["tools"]] == ["memory_search"]
     assert body["include"] == ["reasoning.encrypted_content"]
     assert memory_handler.compute_calls == 1
+
+
+def test_handle_openai_responses_stream_skips_memory_tools(monkeypatch):
+    request = _build_request(
+        {"model": "gpt-4o-mini", "input": "hello", "store": False, "stream": True},
+        {
+            "Authorization": "Bearer sk-test",
+            "User-Agent": "codex-cli/0.5",
+            "x-headroom-user-id": "user-1",
+        },
+    )
+    handler = _DummyOpenAIHandler()
+    handler.memory_handler = _MemoryToolsOnlyHandler()
+    handler.session_tracker_store = SimpleNamespace(
+        compute_session_id=lambda *a, **k: "sess-api-memory-tools-stream",
+    )
+
+    monkeypatch.setattr("headroom.tokenizers.get_tokenizer", lambda model: _DummyTokenizer())
+
+    anyio.run(handler.handle_openai_responses, request)
+
+    assert handler.captured_stream_request is not None
+    assert "memory_search" not in json.dumps(handler.captured_stream_request[2].get("tools", []))
+    assert handler.memory_handler.compute_calls == 0
 
 
 @pytest.mark.parametrize("store", [pytest.param(None, id="omitted"), True, False])

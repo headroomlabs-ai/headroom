@@ -948,6 +948,9 @@ def install_individual_grammar_parsers() -> None:
     cache: dict[str, Any] = {}
 
     def _get_parser(language: str) -> Any:
+        if language not in langs:
+            # detect_language skips unsupported grammars on ValueError.
+            raise ValueError(f"unsupported recorder grammar: {language}")
         if language not in cache:
             try:
                 cache[language] = Parser(langs[language])
