@@ -797,6 +797,27 @@ class TestCLIProxyEnvVars:
         assert captured_config["config"].openai_api_url == "http://my-vllm:4000"
         assert captured_config["config"].gemini_api_url == "http://my-gemini:5000"
 
+    @pytest.mark.parametrize(
+        ("args", "env", "expected"),
+        [
+            ([], {}, False),
+            (["--ccr-buffered-chat-streaming"], {}, True),
+            ([], {"HEADROOM_CCR_BUFFERED_CHAT_STREAMING": "1"}, True),
+        ],
+    )
+    def test_ccr_buffered_chat_streaming_reaches_config(self, runner, args, env, expected):
+        """`headroom proxy` builds its own ProxyConfig, so the flag has to be wired here too."""
+        captured_config = {}
+
+        def mock_run_server(config, **kwargs):
+            captured_config["config"] = config
+
+        with patch("headroom.proxy.server.run_server", mock_run_server):
+            result = runner.invoke(main, ["proxy", *args], env=env, catch_exceptions=False)
+
+        assert result.exit_code == 0, result.output
+        assert captured_config["config"].ccr_buffered_chat_streaming is expected
+
     @pytest.mark.parametrize("timeout", [-1, 0, 1, 10000])
     def test_request_timeout_cli_flags(self, runner, timeout):
         """Fast-fail CLI flags should map into ProxyConfig."""

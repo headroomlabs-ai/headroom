@@ -578,6 +578,7 @@ class ToolIntelligenceNetwork:
 
         # Tracking
         self._last_save_time = time.time()
+        self._last_auto_save_attempt = 0.0
         self._dirty = False
 
         # Load existing data from backend
@@ -1760,8 +1761,12 @@ class ToolIntelligenceNetwork:
             if not self._dirty:
                 return
 
-            elapsed = time.time() - self._last_save_time
+            now = time.time()
+            elapsed = now - max(self._last_save_time, self._last_auto_save_attempt)
             if elapsed >= self._config.auto_save_interval:
+                # Failed saves retain dirty state, but must not turn every
+                # observation into synchronous disk I/O and another warning.
+                self._last_auto_save_attempt = now
                 # save() uses the same RLock, so this is safe
                 self.save()
 

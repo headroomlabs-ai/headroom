@@ -73,6 +73,7 @@ class FileSystemTOINBackend:
 
         Raises:
             ValueError: The existing file or serialized data exceeds the size limit.
+            OSError: If persistence fails, so the caller can retain pending changes.
         """
         try:
             # A file skipped by load() must not be replaced with partial state.
@@ -113,3 +114,4 @@ class FileSystemTOINBackend:
 
         except OSError as e:
             logger.warning("Failed to save TOIN data to %s: %s", self._path, e)
+            raise
