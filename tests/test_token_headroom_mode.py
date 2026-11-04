@@ -528,8 +528,12 @@ class TestSwapToolResultListContent:
         from headroom.cache.compression_cache import _swap_tool_result_content
 
         msg = _make_openai_tool_list_content_msg("tc1", ["original"])
+        msg["content"][0]["cache_control"] = {"type": "ephemeral"}
         swapped = _swap_tool_result_content(msg, "compressed")
-        assert swapped["content"] == "compressed"
+        assert swapped["content"] == [
+            {"type": "text", "text": "compressed", "cache_control": {"type": "ephemeral"}}
+        ]
+        assert msg["content"][0]["text"] == "original"
 
     def test_swap_does_not_mutate_original(self):
         """_swap_tool_result_content performs a deep copy."""
