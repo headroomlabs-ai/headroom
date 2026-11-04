@@ -14,12 +14,10 @@ from functools import lru_cache
 from pathlib import Path
 from typing import Any, Literal, cast
 
-try:
-    import tomllib
-except ModuleNotFoundError:  # pragma: no cover - Python 3.10
-    import tomli as tomllib
+import tomllib
 
 from headroom.memory.storage_router import ProjectResolver, RequestContext
+from headroom.providers.codex.config_toml import loads_codex_config
 from headroom.providers.codex.threads import _codex_state_db_paths
 
 logger = logging.getLogger(__name__)
@@ -298,7 +296,7 @@ class CodexProjectContextResolver:
             return self._configured_sqlite_home
         codex_home = Path(os.environ.get("CODEX_HOME", "").strip() or Path.home() / ".codex")
         try:
-            config = tomllib.loads((codex_home / "config.toml").read_text(encoding="utf-8"))
+            config = loads_codex_config((codex_home / "config.toml").read_text(encoding="utf-8"))
             configured_sqlite_home = config.get("sqlite_home")
             if isinstance(configured_sqlite_home, str) and configured_sqlite_home.strip():
                 return Path(configured_sqlite_home).expanduser()
