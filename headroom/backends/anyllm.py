@@ -16,6 +16,7 @@ from headroom.proxy.public_errors import client_message
 from headroom.utils import format_exception_message
 
 from .base import Backend, BackendResponse, StreamEvent
+from .litellm import _convert_anthropic_tool, _convert_tool_choice
 
 logger = logging.getLogger(__name__)
 
@@ -26,44 +27,6 @@ try:
 except ImportError:
     ANYLLM_AVAILABLE = False
     AnyLLM = None  # type: ignore
-
-
-def _convert_anthropic_tool(tool: dict[str, Any]) -> dict[str, Any]:
-    """Convert an Anthropic tool definition to the OpenAI function shape.
-
-    any-llm speaks OpenAI, so an Anthropic ``{name, description, input_schema}``
-    tool must become ``{type: function, function: {name, description,
-    parameters}}`` before it is forwarded, or the provider ignores/rejects the
-    tools array and the model never calls a tool. Mirrors the LiteLLM backend's
-    converter so both OpenAI-compatible backends send the same shape.
-    """
-    func: dict[str, Any] = {"name": tool.get("name", "")}
-    if "description" in tool:
-        func["description"] = tool["description"]
-    if "input_schema" in tool:
-        func["parameters"] = tool["input_schema"]
-    return {"type": "function", "function": func}
-
-
-def _convert_tool_choice(choice: Any) -> Any:
-    """Convert an Anthropic ``tool_choice`` to the OpenAI shape (mirrors LiteLLM).
-
-    Anthropic: ``{"type": "auto"}``, ``{"type": "any"}``, ``{"type": "tool",
-    "name": ...}``. OpenAI: ``"auto"``, ``"required"``, ``{"type": "function",
-    "function": {"name": ...}}``. Passing the raw Anthropic dict through makes
-    the provider reject or ignore it.
-    """
-    if isinstance(choice, str):
-        return choice
-    if isinstance(choice, dict):
-        choice_type = choice.get("type", "auto")
-        if choice_type == "auto":
-            return "auto"
-        if choice_type == "any":
-            return "required"
-        if choice_type == "tool":
-            return {"type": "function", "function": {"name": choice.get("name", "")}}
-    return "auto"
 
 
 class AnyLLMBackend(Backend):

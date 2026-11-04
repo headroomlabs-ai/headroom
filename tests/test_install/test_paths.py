@@ -22,6 +22,9 @@ def test_profile_and_artifact_paths(monkeypatch, tmp_path: Path) -> None:
     assert install_paths.deploy_root() == tmp_path / "deploy"
     assert install_paths.profile_root("demo") == tmp_path / "deploy" / "demo"
     assert install_paths.manifest_path("demo") == tmp_path / "deploy" / "demo" / "manifest.json"
+    assert install_paths.recovery_manifest_path("demo") == (
+        tmp_path / "deploy" / "demo.recovery.json"
+    )
     assert install_paths.log_path("demo") == tmp_path / "deploy" / "demo" / "runner.log"
     assert install_paths.pid_path("demo") == tmp_path / "deploy" / "demo" / "runner.pid"
     assert (

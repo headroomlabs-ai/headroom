@@ -17,6 +17,7 @@ import ssl
 
 import pytest
 
+from headroom import binaries, update_check
 from headroom.proxy import ssl_context
 from headroom.proxy.ssl_context import (
     apply_global_tls_relaxation,
@@ -339,6 +340,53 @@ class TestBuildUrlopenContext:
 
         assert ctx is created_context
         assert created_context.alpn_protocols == ["http/1.1"]
+
+
+@pytest.mark.parametrize(
+    "context_helper",
+    [
+        pytest.param(binaries._ssl_context, id="binary-download"),
+        pytest.param(update_check._urlopen_ssl_context, id="update-check"),
+    ],
+)
+def test_urlopen_context_helpers_use_valid_configured_bundle(
+    monkeypatch, ca_pem_file, context_helper
+):
+    _clean_env(monkeypatch)
+    monkeypatch.setenv("REQUESTS_CA_BUNDLE", ca_pem_file)
+
+    context = context_helper()
+
+    assert isinstance(context, ssl.SSLContext)
+    assert context.verify_mode == ssl.CERT_REQUIRED
+
+
+@pytest.mark.parametrize(
+    "context_helper",
+    [
+        pytest.param(binaries._ssl_context, id="binary-download"),
+        pytest.param(update_check._urlopen_ssl_context, id="update-check"),
+    ],
+)
+def test_urlopen_context_helpers_propagate_invalid_configured_bundle(
+    monkeypatch, tmp_path, context_helper
+):
+    _clean_env(monkeypatch)
+    invalid_bundle = tmp_path / "invalid.pem"
+    invalid_bundle.write_text("not a PEM certificate", encoding="ascii")
+    monkeypatch.setenv("REQUESTS_CA_BUNDLE", str(invalid_bundle))
+
+    with pytest.raises(ssl.SSLError):
+        context_helper()
+
+
+def test_update_check_returns_none_when_configured_bundle_is_invalid(monkeypatch, tmp_path):
+    _clean_env(monkeypatch)
+    invalid_bundle = tmp_path / "invalid.pem"
+    invalid_bundle.write_text("not a PEM certificate", encoding="ascii")
+    monkeypatch.setenv("REQUESTS_CA_BUNDLE", str(invalid_bundle))
+
+    assert update_check.fetch_latest_version() is None
 
 
 class TestApplyGlobalTlsRelaxation:
