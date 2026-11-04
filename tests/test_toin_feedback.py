@@ -10,7 +10,6 @@ from headroom.cache.compression_store import get_compression_store, reset_compre
 from headroom.telemetry import (
     TOINConfig,
     ToolIntelligenceNetwork,
-    ToolPattern,
     ToolSignature,
     get_toin,
     reset_toin,
@@ -79,94 +78,6 @@ def test_kompress_ccr_retrieval_updates_toin():
     stats = get_toin().get_stats()
     assert stats["total_compressions"] == 1
     assert stats["total_retrievals"] == 1
-
-
-@pytest.mark.skip(reason="PR-B5: observations counter and request-time hint API retired")
-class TestGetRecommendationObservations:
-    """Bug 1: get_recommendation() should increment observations counter."""
-
-    def test_increments_observations_when_pattern_exists(self):
-        """get_recommendation() should increment observations when pattern exists."""
-        config = _make_config(min_samples=5)
-        toin = ToolIntelligenceNetwork(config=config)
-        sig = _make_signature("obs_test_hash")
-
-        # Record enough compressions to create a pattern with sufficient samples
-        for _ in range(15):
-            toin.record_compression(
-                tool_signature=sig,
-                original_count=100,
-                compressed_count=20,
-                original_tokens=5000,
-                compressed_tokens=1000,
-                strategy="top_n",
-            )
-
-        # Get recommendation
-        toin.get_recommendation(sig)
-
-        # Check observations incremented
-        pattern = toin._patterns[("global", "unknown", "unknown", sig.structure_hash)]
-        assert pattern.observations == 1
-
-        # Call again
-        toin.get_recommendation(sig)
-        assert pattern.observations == 2
-
-    def test_increments_observations_even_below_min_samples(self):
-        """observations increments even when sample_size < min_samples."""
-        config = _make_config(min_samples=100)
-        toin = ToolIntelligenceNetwork(config=config)
-        sig = _make_signature("low_sample_hash")
-
-        # Record just a few compressions (below min_samples)
-        for _ in range(3):
-            toin.record_compression(
-                tool_signature=sig,
-                original_count=50,
-                compressed_count=10,
-                original_tokens=2000,
-                compressed_tokens=500,
-                strategy="top_n",
-            )
-
-        result = toin.get_recommendation(sig)
-        assert result.source == "local"  # Not enough samples
-
-        pattern = toin._patterns[("global", "unknown", "unknown", sig.structure_hash)]
-        assert pattern.observations == 1
-
-    def test_no_increment_for_unknown_pattern(self):
-        """get_recommendation() should NOT increment for unknown patterns."""
-        config = _make_config()
-        toin = ToolIntelligenceNetwork(config=config)
-        sig = _make_signature("nonexistent_hash")
-
-        result = toin.get_recommendation(sig)
-        assert result.source == "default"
-        assert result.reason == "No pattern data for this tool type"
-
-        # No pattern exists, nothing to increment
-        assert "nonexistent_hash" not in toin._patterns
-
-    def test_observations_survives_serialization(self):
-        """observations field should serialize and deserialize correctly."""
-        pattern = ToolPattern(
-            tool_signature_hash="serial_test",
-            total_compressions=10,
-            observations=42,
-        )
-
-        d = pattern.to_dict()
-        assert d["observations"] == 42
-
-        restored = ToolPattern.from_dict(d)
-        assert restored.observations == 42
-
-    def test_observations_defaults_to_zero(self):
-        """observations defaults to 0 for new patterns."""
-        pattern = ToolPattern(tool_signature_hash="new_pattern")
-        assert pattern.observations == 0
 
 
 class TestRecordRetrievalPopulatesFields:
