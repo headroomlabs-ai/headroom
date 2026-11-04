@@ -1687,6 +1687,38 @@ class TestHydrateEdgeCases:
         assert learner._persisted_ids == {}
 
     @pytest.mark.asyncio
+    async def test_unreadable_db_warns_on_hydration(self, tmp_path):
+        """A memory.db that cannot be read must say so; a missing one stays quiet."""
+        import logging
+
+        records: list[logging.LogRecord] = []
+
+        class _Collect(logging.Handler):
+            def emit(self, record: logging.LogRecord) -> None:
+                records.append(record)
+
+        handler = _Collect(level=logging.DEBUG)
+        logger = logging.getLogger("headroom.memory.traffic_learner")
+        logger.addHandler(handler)
+        try:
+            await TrafficLearner(
+                backend=_FakeBackend(tmp_path / "not-there.db"), min_evidence=1
+            )._hydrate_persisted_state()
+            assert [r for r in records if r.levelno >= logging.WARNING] == []
+
+            bad = tmp_path / "memory.db"
+            bad.write_bytes(b"this is not a sqlite database" * 100)
+            learner = TrafficLearner(backend=_FakeBackend(bad), min_evidence=1)
+            await learner._hydrate_persisted_state()
+            warnings = [r for r in records if r.levelno == logging.WARNING]
+            assert len(warnings) == 1
+            assert "hydrate" in warnings[0].getMessage()
+            assert str(bad) in warnings[0].getMessage()
+            assert learner._saved_hashes == set()
+        finally:
+            logger.removeHandler(handler)
+
+    @pytest.mark.asyncio
     async def test_hydration_is_bounded_to_dedup_window(self, tmp_path):
         """A persisted history larger than dedup_window must not start the
         in-memory dedup maps oversized. Hydration keeps at most dedup_window
@@ -2886,3 +2918,98 @@ class TestPendingStatePersistence:
         await second.start()
         assert second.get_stats()["pending_patterns"] == 0
         await second.stop()
+
+
+def test_long_commands_skip_the_quadratic_edit_distance(monkeypatch):
+    """#4367: commands past the cap are judged without _levenshtein."""
+    import headroom.memory.traffic_learner as tl
+
+    real = tl._levenshtein
+
+    def _guarded(a, b):
+        # binary-name matching may still use it on short names
+        if max(len(a), len(b)) > tl._RETRY_EDIT_DISTANCE_MAX_CHARS:
+            raise AssertionError("edit distance computed on an oversized command")
+        return real(a, b)
+
+    monkeypatch.setattr(tl, "_levenshtein", _guarded)
+    body = "x" * (tl._RETRY_EDIT_DISTANCE_MAX_CHARS + 1)
+    # shared substantive token -> still related, via the linear path
+    assert tl._commands_related_as_retry(f"python {body} run", f"python3 {body} run")
+    # no shared substantive token -> unrelated
+    assert not tl._commands_related_as_retry(f"python {body}", "python other.py")
+
+
+def test_short_commands_still_use_edit_distance():
+    """Commands within the cap keep the existing edit-distance behaviour."""
+    assert _commands_related_as_retry("cargo build", "cargo build --release")
+
+
+def _record_oversized_levenshtein(monkeypatch):
+    """Wrap _levenshtein and record every call on an input past the cap."""
+    import headroom.memory.traffic_learner as tl
+
+    real = tl._levenshtein
+    oversized: list[tuple[int, int]] = []
+
+    def _recording(a, b):
+        if max(len(a), len(b)) > tl._RETRY_EDIT_DISTANCE_MAX_CHARS:
+            oversized.append((len(a), len(b)))
+        return real(a, b)
+
+    monkeypatch.setattr(tl, "_levenshtein", _recording)
+    return oversized
+
+
+def test_oversized_first_token_skips_the_quadratic_edit_distance(monkeypatch):
+    """Review of #4371: a long executable token must not reach _levenshtein either."""
+    import headroom.memory.traffic_learner as tl
+
+    oversized = _record_oversized_levenshtein(monkeypatch)
+    head = "x" * 2000
+    # the first tokens (2000 and 2001 chars) are prefix-related; "execute" is shared
+    assert tl._commands_related_as_retry(f"{head} execute", f"{head}3 execute")
+    assert tl._bash_binaries_match(head, f"{head}3")
+    assert not tl._bash_binaries_match(head, f"{head}333")
+    assert oversized == []
+
+
+def test_short_binary_names_keep_the_prefix_tolerance():
+    assert _bash_binaries_match("python", "python3")
+    assert _bash_binaries_match("python3", "python")
+    assert _bash_binaries_match("python", "python32")
+    assert not _bash_binaries_match("python", "python321")
+    assert not _bash_binaries_match("pyth", "python3")
+
+
+@pytest.mark.asyncio
+async def test_oversized_first_token_through_on_tool_result(monkeypatch):
+    """Same case through the entry point the proxy handlers await."""
+    oversized = _record_oversized_levenshtein(monkeypatch)
+    learner = TrafficLearner(backend=None, user_id="test-user", min_evidence=1)
+    head = "x" * 2000
+    await learner.on_tool_result(
+        tool_name="Bash",
+        tool_input={"command": f"{head} execute"},
+        tool_output="Error: execute failed with status 2",
+        is_error=True,
+    )
+    await learner.on_tool_result(
+        tool_name="Bash",
+        tool_input={"command": f"{head}3 execute"},
+        tool_output="done",
+        is_error=False,
+    )
+    assert oversized == []
+    assert learner.get_stats()["patterns_extracted"] >= 1
+
+
+def test_oversized_path_basename_skips_the_quadratic_edit_distance(monkeypatch):
+    """The file-path typo check runs the same edit distance on traffic basenames."""
+    import headroom.memory.traffic_learner as tl
+
+    oversized = _record_oversized_levenshtein(monkeypatch)
+    name = "y" * 2000
+    assert not tl._paths_related_as_typo(f"/a/{name}.rs", f"/a/{name}x.rs")
+    assert tl._paths_related_as_typo("/a/staet.rs", "/a/state.rs")
+    assert oversized == []
