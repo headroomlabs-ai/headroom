@@ -156,7 +156,7 @@ def _text_blocks_msg(role: str, content: str) -> dict:
     if role == "tool":
         msg["tool_call_id"] = "call_bash_1"
     else:
-        msg["name"] = "bash"
+        msg["name"] = "qualification_tool"
     return msg
 
 
