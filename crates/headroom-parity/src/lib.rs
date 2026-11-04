@@ -648,37 +648,16 @@ impl KompressComparator {
         Self::default()
     }
 
-    fn hf_cache_file(repo_dir: &str, rel: &[&str]) -> Option<PathBuf> {
-        let home = std::env::var("HOME").ok()?;
-        let snapshots = Path::new(&home)
-            .join(".cache/huggingface/hub")
-            .join(repo_dir)
-            .join("snapshots");
-        for snap in fs::read_dir(snapshots).ok()?.filter_map(|e| e.ok()) {
-            let mut cand = snap.path();
-            for part in rel {
-                cand = cand.join(part);
-            }
-            if cand.exists() {
-                return Some(cand);
-            }
-        }
-        None
-    }
-
     fn model(&self) -> Option<&headroom_core::transforms::kompress::Kompress> {
         self.model
             .get_or_init(|| {
-                use headroom_core::transforms::kompress::{Kompress, KompressConfig};
-                let tok = Self::hf_cache_file(
-                    "models--answerdotai--ModernBERT-base",
-                    &["tokenizer.json"],
-                )?;
-                let onnx = Self::hf_cache_file(
-                    "models--chopratejas--kompress-v2-base",
-                    &["onnx", "kompress-int8-wo.onnx"],
-                )?;
-                Kompress::from_files(&tok, &onnx, KompressConfig::default()).ok()
+                use headroom_core::transforms::kompress::{self, Kompress, KompressConfig};
+                // The pinned snapshots in Python's hub cache, as production
+                // loads them.
+                let config = KompressConfig::default();
+                let (tok, onnx) =
+                    kompress::cached_artifacts(&config, "onnx/kompress-int8-wo.onnx")?;
+                Kompress::from_files(&tok, &onnx, config).ok()
             })
             .as_ref()
     }
