@@ -181,3 +181,23 @@ def test_a_caller_chosen_base_url_is_left_alone() -> None:
 
     assert send.url is not None
     assert send.url.startswith("https://api.githubcopilot.com/")
+
+
+@pytest.mark.parametrize("stream", [False, True])
+def test_explicit_next_edit_route_keeps_its_selected_destination(monkeypatch, stream):
+    import json
+
+    monkeypatch.setenv(
+        "HEADROOM_UPSTREAM_ROUTES",
+        json.dumps(
+            [
+                {
+                    "model_prefix": "copilot-nes-",
+                    "upstream": "https://api.enterprise.githubcopilot.com",
+                    "auth": "passthrough",
+                }
+            ]
+        ),
+    )
+    send = _post(NES_MODEL, stream=stream)
+    assert send.url == "https://api.enterprise.githubcopilot.com/chat/completions"

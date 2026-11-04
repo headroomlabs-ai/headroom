@@ -82,6 +82,13 @@ def _make_handler():
         write_timeout_seconds=33,
         request_timeout_seconds=999,
     )
+    # Legacy single-upstream resolve: HEADROOM_UPSTREAM_ROUTES routing is
+    # exercised separately in test_multi_upstream_*; here we reproduce the
+    # pre-routing behavior (return OPENAI_API_URL, headers unchanged).
+    obj.resolve_upstream = lambda *, protocol, model, headers: (
+        obj.OPENAI_API_URL,
+        headers,
+    )
     return obj
 
 
