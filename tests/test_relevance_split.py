@@ -215,7 +215,9 @@ def test_router_lossless_mode_folds_only_no_drop():
     # irrelevant "widget" records must be PRESERVED, not silently dropped, and the
     # Kompress tail stub must never run.
     r = _router(split_on=True)  # lossless mode
-    out, _, chain = r._apply_strategy_to_content(_SEARCH, CompressionStrategy.SEARCH, "oauth token")
+    out, _, chain, _reversible = r._apply_strategy_to_content(
+        _SEARCH, CompressionStrategy.SEARCH, "oauth token"
+    )
     assert chain == ["lossless_search"]
     assert "oauth token" in out  # relevant records kept
     assert "widget" in out  # irrelevant tail ALSO kept — no silent drop in lossless mode
@@ -228,7 +230,9 @@ def test_router_relevance_split_fires_in_ccr_mode():
     # #1721); the _try_ml_compressor stub stands in for it here. Proves the
     # split is mode-agnostic, not lossless-only.
     r = _router(split_on=True, lossless=False)
-    out, _, chain = r._apply_strategy_to_content(_SEARCH, CompressionStrategy.SEARCH, "oauth token")
+    out, _, chain, _reversible = r._apply_strategy_to_content(
+        _SEARCH, CompressionStrategy.SEARCH, "oauth token"
+    )
     assert chain == ["search", "relevance_split"]
     assert "oauth token" in out
     assert "[TAIL]" in out
@@ -237,14 +241,18 @@ def test_router_relevance_split_fires_in_ccr_mode():
 def test_router_diff_stays_pure_lossless():
     r = _router(split_on=True)
     diff = "diff --git a/x b/x\nindex 111..222 100644\n@@ -1 +1 @@\n-old widget\n+new oauth token\n"
-    _, _, chain = r._apply_strategy_to_content(diff, CompressionStrategy.DIFF, "oauth token")
+    _, _, chain, _reversible = r._apply_strategy_to_content(
+        diff, CompressionStrategy.DIFF, "oauth token"
+    )
     assert "relevance_split" not in chain  # Kompressing hunks would break apply
     assert chain == ["lossless_diff"]
 
 
 def test_router_split_can_be_disabled():
     r = _router(split_on=False)
-    _, _, chain = r._apply_strategy_to_content(_SEARCH, CompressionStrategy.SEARCH, "oauth token")
+    _, _, chain, _reversible = r._apply_strategy_to_content(
+        _SEARCH, CompressionStrategy.SEARCH, "oauth token"
+    )
     assert "relevance_split" not in chain
 
 
