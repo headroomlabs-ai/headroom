@@ -277,40 +277,77 @@ describe("HeadroomContextEngine proxy startup helpers", () => {
     expect(mocked.start).toHaveBeenCalledTimes(1);
   });
 
-  it("clears the request timeout after successful compression", async () => {
-    vi.useFakeTimers();
-    try {
-      vi.mocked(compress).mockResolvedValue({
-        compressed: false,
-        messages: [{ role: "user", content: "hello" }],
-        tokensBefore: 5,
-        tokensAfter: 5,
-        tokensSaved: 0,
-      });
+  it("passes the configured request timeout to the aborting SDK client", async () => {
+    vi.mocked(compress).mockResolvedValue({
+      compressed: false,
+      messages: [{ role: "user", content: "hello" }],
+      tokensBefore: 5,
+      tokensAfter: 5,
+      tokensSaved: 0,
+    });
 
-      const engine = new HeadroomContextEngine({ requestTimeoutMs: 30_000 });
-      (engine as { proxyUrl: string | null }).proxyUrl = "http://127.0.0.1:8787";
+    const engine = new HeadroomContextEngine({ requestTimeoutMs: 1_234, minContextChars: 0 });
+    (engine as { proxyUrl: string | null }).proxyUrl = "http://127.0.0.1:8787";
 
-      await expect(
-        engine.assemble({
-          sessionId: "session-1",
-          messages: [{ role: "user", content: "hello" }],
-        }),
-      ).resolves.toEqual({
-        messages: [{ role: "user", content: "hello" }],
-        estimatedTokens: 5,
-      });
+    await engine.assemble({
+      sessionId: "session-1",
+      messages: [{ role: "user", content: "hello" }],
+    });
 
-      expect(vi.getTimerCount()).toBe(0);
-    } finally {
-      vi.useRealTimers();
-    }
+    expect(compress).toHaveBeenCalledWith(
+      expect.any(Array),
+      expect.objectContaining({ timeout: 1_234 }),
+    );
+  });
+
+  it("skips proxy compression for short contexts with no meaningful savings", async () => {
+    const messages = [{ role: "user", content: "hello" }];
+    const engine = new HeadroomContextEngine();
+    (engine as { proxyUrl: string | null }).proxyUrl = "http://127.0.0.1:8787";
+
+    await expect(engine.assemble({ sessionId: "session-1", messages })).resolves.toEqual({
+      messages,
+      estimatedTokens: 0,
+    });
+    expect(compress).not.toHaveBeenCalled();
+  });
+
+  it("counts a single large tool result as eligible context", async () => {
+    const messages = [{ role: "toolResult", toolCallId: "call-1", content: "x".repeat(800) }];
+    vi.mocked(compress).mockResolvedValue({
+      compressed: false,
+      messages: [{ role: "tool", tool_call_id: "call-1", content: "x".repeat(800) }],
+      tokensBefore: 200,
+      tokensAfter: 200,
+      tokensSaved: 0,
+    });
+    const engine = new HeadroomContextEngine();
+    (engine as { proxyUrl: string | null }).proxyUrl = "http://127.0.0.1:8787";
+
+    await engine.assemble({ sessionId: "session-1", messages });
+    expect(compress).toHaveBeenCalledTimes(1);
+  });
+
+  it("allows the short-context gate to be disabled", async () => {
+    vi.mocked(compress).mockResolvedValue({
+      compressed: false,
+      messages: [{ role: "user", content: "hello" }],
+      tokensBefore: 2,
+      tokensAfter: 2,
+      tokensSaved: 0,
+    });
+    const engine = new HeadroomContextEngine({ minContextChars: 0 });
+    (engine as { proxyUrl: string | null }).proxyUrl = "http://127.0.0.1:8787";
+
+    await engine.assemble({ sessionId: "session-1", messages: [{ role: "user", content: "hello" }] });
+    expect(compress).toHaveBeenCalledTimes(1);
   });
 
   it("opens the circuit after consecutive compression failures", async () => {
     vi.mocked(compress).mockRejectedValue(new Error("proxy stalled"));
     const messages = [{ role: "user", content: "hello" }];
     const engine = new HeadroomContextEngine({
+      minContextChars: 0,
       circuitBreakerThreshold: 2,
       circuitBreakerCooldownMs: 60_000,
     });
@@ -451,7 +488,7 @@ describe("HeadroomContextEngine assemble() compression notice", () => {
   }
 
   function readyEngine(config?: HeadroomEngineConfig) {
-    const engine = new HeadroomContextEngine(config);
+    const engine = new HeadroomContextEngine({ minContextChars: 0, ...config });
     (engine as unknown as { proxyUrl: string | null }).proxyUrl = "http://127.0.0.1:8787";
     return engine;
   }
@@ -489,6 +526,18 @@ describe("HeadroomContextEngine assemble() compression notice", () => {
 
     expect(first.systemPromptAddition).toBe(HEADROOM_COMPRESSION_NOTICE);
     expect(second.systemPromptAddition).toBe(HEADROOM_COMPRESSION_NOTICE);
+  });
+
+  it("keeps an earned notice on a later context below the compression threshold", async () => {
+    vi.mocked(compress).mockResolvedValueOnce(mockCompressResult({ tokensSaved: 150 }));
+    const engine = readyEngine({ minContextChars: 800 });
+    const first = await engine.assemble({
+      sessionId: "s1", messages: [{ role: "user", content: "x".repeat(1000) }],
+    });
+    const second = await engine.assemble({ sessionId: "s1", messages });
+    expect(first.systemPromptAddition).toBe(HEADROOM_COMPRESSION_NOTICE);
+    expect(second.systemPromptAddition).toBe(first.systemPromptAddition);
+    expect(compress).toHaveBeenCalledTimes(1);
   });
 
   it("never returns a notice when announceCompression is false", async () => {
@@ -571,7 +620,9 @@ describe("HeadroomContextEngine assemble() compression notice", () => {
       const firstNotice = turn1.systemPromptAddition;
       expect(firstNotice).toBe(HEADROOM_COMPRESSION_NOTICE);
 
-      vi.mocked(compress).mockImplementationOnce(() => new Promise(() => {}));
+      vi.mocked(compress).mockImplementationOnce(() => new Promise((_, reject) => {
+        setTimeout(() => reject(new Error("SDK request timed out")), requestTimeoutMs);
+      }));
       const turn2Promise = engine.assemble({ sessionId: "s1", messages });
       await vi.advanceTimersByTimeAsync(requestTimeoutMs);
       const turn2 = await turn2Promise;
@@ -619,7 +670,9 @@ describe("HeadroomContextEngine assemble() compression notice", () => {
       const turn1 = await engine.assemble({ sessionId: "s1", messages });
       expect(turn1.systemPromptAddition).toBeUndefined();
 
-      vi.mocked(compress).mockImplementationOnce(() => new Promise(() => {}));
+      vi.mocked(compress).mockImplementationOnce(() => new Promise((_, reject) => {
+        setTimeout(() => reject(new Error("SDK request timed out")), requestTimeoutMs);
+      }));
       const turn2Promise = engine.assemble({ sessionId: "s1", messages });
       await vi.advanceTimersByTimeAsync(requestTimeoutMs);
       const turn2 = await turn2Promise;
