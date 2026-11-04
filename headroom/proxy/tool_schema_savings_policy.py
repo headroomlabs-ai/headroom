@@ -84,9 +84,10 @@ def deferred_booking(tags: object, tools: object) -> DeferredBooking | None:
 
     ``None`` when nothing is booked. The schemas are copied as they were when
     booked, so a later in-place edit cannot change what the credit stands for.
-    The ledger entry is the latest ``tool_search`` one marked ``estimated``:
-    both the core deferral and the native deferral hook book that way, and a
-    hook's own measured saving never is, so it is never the one debited.
+    The ledger entry is the ``tool_search`` row marked ``estimated``: both the
+    core deferral and the native deferral hook book that way (rows coalesce, so
+    they share it), and a hook's own measured saving never is, so it is never
+    the one debited.
     """
     if not isinstance(tags, dict) or "tool_search_deferred_tokens" not in tags:
         return None

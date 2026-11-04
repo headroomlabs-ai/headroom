@@ -476,6 +476,39 @@ describe("Headroom OpenCode transport", () => {
     }
   });
 
+  it("restores the process env keys it set once the last install is disposed", () => {
+    const keys = ["NODE_OPTIONS", "HEADROOM_OPENCODE_TRANSPORT_PROXY_URL", "HEADROOM_OPENCODE_EXCLUDE_HOSTS"] as const;
+    const saved = Object.fromEntries(keys.map((key) => [key, process.env[key]]));
+
+    try {
+      process.env.NODE_OPTIONS = "--trace-warnings";
+      delete process.env.HEADROOM_OPENCODE_TRANSPORT_PROXY_URL;
+      process.env.HEADROOM_OPENCODE_EXCLUDE_HOSTS = "keep.example.com";
+
+      const first = installHeadroomTransport({ proxyUrl: "http://127.0.0.1:8787/v1", excludeHosts: ["a.example.com"] });
+      const second = installHeadroomTransport({ proxyUrl: "http://127.0.0.1:8787/v1", excludeHosts: ["a.example.com"] });
+      expect(process.env.HEADROOM_OPENCODE_TRANSPORT_PROXY_URL).toBe("http://127.0.0.1:8787/v1");
+
+      // A nested dispose keeps the env: the transport is still installed.
+      first();
+      expect(process.env.HEADROOM_OPENCODE_TRANSPORT_PROXY_URL).toBe("http://127.0.0.1:8787/v1");
+
+      second();
+      expect(process.env.NODE_OPTIONS).toBe("--trace-warnings");
+      expect(process.env.HEADROOM_OPENCODE_TRANSPORT_PROXY_URL).toBeUndefined();
+      expect(process.env.HEADROOM_OPENCODE_EXCLUDE_HOSTS).toBe("keep.example.com");
+    } finally {
+      for (const key of keys) {
+        if (saved[key] === undefined) {
+          delete process.env[key];
+        } else {
+          process.env[key] = saved[key];
+        }
+      }
+      uninstallHeadroomTransport();
+    }
+  });
+
   it("skips the shim preload when the bundle ships without it (#2798)", () => {
     const originalNodeOptions = process.env.NODE_OPTIONS;
     const originalSpawn = childProcess.spawn;
@@ -772,6 +805,7 @@ describe("Headroom OpenCode transport", () => {
       expect(fetchMock.mock.calls[1][0]).toEqual(new URL("http://127.0.0.1:8787/v1/messages"));
       expect(process.env.HEADROOM_OPENCODE_EXCLUDE_HOSTS).toBe("opencode.ai");
     } finally {
+      uninstallHeadroomTransport();
       globalThis.fetch = originalFetch;
       if (originalExclude === undefined) {
         delete process.env.HEADROOM_OPENCODE_EXCLUDE_HOSTS;
@@ -871,6 +905,8 @@ describe("Headroom OpenCode transport", () => {
         expect(options.env.HEADROOM_OPENCODE_TRANSPORT_PROXY_URL).toBe("http://127.0.0.1:8787/v1");
       }
     } finally {
+      // Dispose first: uninstall now restores the env it saved at install time.
+      uninstallHeadroomTransport();
       globalThis.fetch = originalFetch;
       childProcess.spawn = originalSpawn;
       if (originalExclude === undefined) {
