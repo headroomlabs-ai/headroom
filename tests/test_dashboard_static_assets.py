@@ -2,11 +2,12 @@
 
 Edge's Tracking Prevention (and corporate proxies) block unpkg.com and
 cdn.tailwindcss.com, which left the dashboard unstyled and dataless on some
-Windows machines. Tailwind/htmx/alpine are vendored and served locally instead.
+Windows machines. Tailwind/alpine are vendored and served locally instead.
 """
 
 from __future__ import annotations
 
+import re
 from unittest.mock import AsyncMock, patch
 
 import pytest
@@ -16,10 +17,14 @@ pytest.importorskip("fastapi")
 from fastapi.responses import Response  # noqa: E402
 from fastapi.testclient import TestClient  # noqa: E402
 
-from headroom.dashboard import get_dashboard_html, get_settings_html  # noqa: E402
+from headroom.dashboard import (  # noqa: E402
+    STATIC_DIR,
+    get_dashboard_html,
+    get_settings_html,
+)
 from headroom.proxy.server import ProxyConfig, create_app  # noqa: E402
 
-ASSETS = ["tailwind.min.js", "htmx.min.js", "alpine.min.js"]
+ASSETS = ["tailwind.min.js", "alpine.min.js"]
 
 
 @pytest.fixture
@@ -88,6 +93,12 @@ def test_unrelated_unknown_path_still_reaches_passthrough(client, passthrough):
 
 
 def test_dashboard_only_references_served_assets(client):
+    """Both directions: nothing vendored goes unloaded, nothing loaded is missing.
+
+    htmx shipped 47 KB to every dashboard visitor for months without a single
+    ``hx-*`` attribute or API call anywhere in the tree.
+    """
     html = client.get("/dashboard").text
-    for asset in ASSETS:
-        assert f"/dashboard/static/{asset}" in html
+
+    assert set(re.findall(r"/dashboard/static/([\w.-]+)", html)) == set(ASSETS)
+    assert {path.name for path in STATIC_DIR.iterdir() if path.is_file()} == set(ASSETS)

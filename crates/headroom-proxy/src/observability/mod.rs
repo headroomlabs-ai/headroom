@@ -39,10 +39,14 @@
 //! revisit if multi-process aggregation lands.
 
 pub mod cache_hit_rate;
+pub mod capture;
 pub mod compression_ratio;
+pub mod ledger;
 pub mod metric_names;
+pub mod pricing;
 pub mod prometheus;
 pub mod proxy_metrics;
+pub mod stats_http;
 
 pub use prometheus::{
     handle_metrics, observe_bedrock_invoke_latency, record_bedrock_eventstream_message,
