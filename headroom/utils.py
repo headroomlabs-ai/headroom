@@ -85,11 +85,16 @@ def extract_user_query(
             if isinstance(content, str) and content.strip():
                 return content.strip()
             if isinstance(content, list):
-                for block in content:
-                    if isinstance(block, dict) and block.get("type") == "text":
-                        text = str(block.get("text", "")).strip()
-                        if text:
-                            return text
+                # Harness reminders are not part of the user's information need.
+                user_text = "\n".join(
+                    text
+                    for block in content
+                    if isinstance(block, dict) and block.get("type") == "text"
+                    for text in (str(block.get("text", "")).strip(),)
+                    if text and not text.startswith("<system-reminder")
+                )
+                if user_text:
+                    return user_text
             if latest_user_turn_only:
                 return ""
     return ""

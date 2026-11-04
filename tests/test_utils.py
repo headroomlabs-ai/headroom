@@ -48,6 +48,49 @@ def test_extract_user_query_and_message_hashes() -> None:
     assert utils.extract_user_query([{"role": "assistant", "content": "skip"}]) == ""
 
 
+@pytest.mark.parametrize("latest_only", [False, True])
+def test_extract_user_query_combines_text_blocks(latest_only: bool) -> None:
+    messages = [
+        {
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "  Review incidents  "},
+                {"type": "image", "source": "example"},
+                {"type": "text", "text": " "},
+                {"type": "text", "text": "  Focus on Kafka replication  "},
+            ],
+        }
+    ]
+    assert utils.extract_user_query(messages, latest_user_turn_only=latest_only) == (
+        "Review incidents\nFocus on Kafka replication"
+    )
+
+
+def test_extract_user_query_skips_system_reminder_blocks() -> None:
+    messages = [
+        {"role": "user", "content": "older question"},
+        {
+            "role": "user",
+            "content": [
+                {
+                    "type": "text",
+                    "text": "<system-reminder>injected instructions</system-reminder>",
+                },
+                {"type": "text", "text": "real question"},
+                {"type": "text", "text": "<system-reminder>more instructions</system-reminder>"},
+            ],
+        },
+    ]
+    assert utils.extract_user_query(messages) == "real question"
+    assert utils.extract_user_query(messages, latest_user_turn_only=True) == "real question"
+
+    messages[-1]["content"] = [
+        {"type": "text", "text": "<system-reminder>injected</system-reminder>"}
+    ]
+    assert utils.extract_user_query(messages) == "older question"
+    assert utils.extract_user_query(messages, latest_user_turn_only=True) == ""
+
+
 def test_extract_user_query_latest_user_turn_only() -> None:
     """The flag stops at the newest user turn instead of resurrecting an older one."""
     # A tool_result continuation: the newest user turn carries no text at all.
