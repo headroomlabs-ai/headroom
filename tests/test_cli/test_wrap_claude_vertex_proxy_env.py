@@ -158,6 +158,7 @@ def test_wrap_claude_plain_mode_api_key_auth_skips_remote_control_warning(
 def test_wrap_claude_rejects_conflicting_auth_before_proxy_mutation(
     runner: CliRunner, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
+    _clear_claude_mode_env(monkeypatch)
     monkeypatch.chdir(tmp_path)
     user_settings = tmp_path / "user-settings.json"
     user_settings.write_text('{"env":{"ANTHROPIC_AUTH_TOKEN":"token-value"}}', encoding="utf-8")
@@ -188,6 +189,7 @@ def test_wrap_claude_rejects_conflicting_auth_before_proxy_mutation(
 def test_wrap_claude_includes_shared_project_settings_in_auth_precedence(
     runner: CliRunner, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
+    _clear_claude_mode_env(monkeypatch)
     monkeypatch.chdir(tmp_path)
     user_settings = tmp_path / "user-settings.json"
     user_settings.write_text("{}", encoding="utf-8")
