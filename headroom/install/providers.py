@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 import re
+import shlex
 import subprocess
 from pathlib import Path
 
@@ -32,7 +33,8 @@ def _merge_marker_block(file_path: Path, block: str, pattern: re.Pattern[str], m
     if file_path.exists():
         existing = fsutil.read_text(file_path)
         if marker in existing:
-            return pattern.sub(block, existing)
+            # A callable replacement: the block is literal text, not a template.
+            return pattern.sub(lambda _match: block, existing)
         return existing.rstrip() + "\n\n" + block + "\n"
     return block + "\n"
 
@@ -40,7 +42,8 @@ def _merge_marker_block(file_path: Path, block: str, pattern: re.Pattern[str], m
 def _env_block(values: dict[str, str]) -> str:
     lines = [_ENV_MARKER_START]
     for name, value in values.items():
-        lines.append(f'export {name}="{value}"')
+        # shlex.quote so `$`, `"` and backticks reach the shell verbatim.
+        lines.append(f"export {name}={shlex.quote(value)}")
     lines.append(_ENV_MARKER_END)
     return "\n".join(lines)
 
@@ -192,7 +195,8 @@ def apply_mutations(manifest: DeploymentManifest) -> list[ManagedMutation]:
     except Exception as exc:
         if mutations:
             try:
-                revert_mutations(manifest)
+                revert_mutations(manifest, restore_backup=False)
+
             except Exception as rollback_exc:
                 raise RuntimeError(
                     f"mutation application failed: {exc}; rollback failed: {rollback_exc}"
@@ -202,7 +206,11 @@ def apply_mutations(manifest: DeploymentManifest) -> list[ManagedMutation]:
         raise
 
 
-def revert_mutations(manifest: DeploymentManifest) -> None:
+def revert_mutations(
+    manifest: DeploymentManifest,
+    *,
+    restore_backup: bool = True,
+) -> None:
     """Undo the stored mutations for a deployment."""
 
     if manifest.scope in {ConfigScope.USER.value, ConfigScope.SYSTEM.value}:
@@ -213,4 +221,4 @@ def revert_mutations(manifest: DeploymentManifest) -> None:
             _remove_unix_env_scope(shell_mutations)
 
     for mutation in manifest.mutations:
-        revert_provider_scope_mutation(manifest, mutation)
+        revert_provider_scope_mutation(manifest, mutation, restore_backup=restore_backup)

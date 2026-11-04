@@ -136,6 +136,10 @@ def parse_tabular(
         return None
 
     fmt = detection.metadata.get("format", "csv")
+    if fmt == "git_status":
+        # Status headings and state/path entries are structured control data,
+        # but not a rectangular table; never reinterpret them as CSV rows.
+        return None
     if fmt == "markdown":
         headers, rows = parse_markdown_table(content)
     elif fmt == "fixed_width":
@@ -152,6 +156,11 @@ def parse_tabular(
     # didn't (#1652). Treat them as non-tabular and pass through verbatim.
     width = len(headers)
     if any(len(row) != width for row in rows):
+        return None
+    # Repeated header names (a SQL join's `id,name,id,name`, or blank markdown
+    # header cells) collide as record keys: each row keeps only the last
+    # column of each name, and the others are dropped. Pass through verbatim.
+    if len(set(headers)) != width:
         return None
     # The detector finds fixed-width columns by single-space gutters, but the
     # parser splits on 2+ spaces, so a table like GNU `ls -l` can come back as

@@ -7,6 +7,7 @@ import re
 from dataclasses import dataclass
 
 from .content_detector import ContentType, _is_search_result_line
+from .lossless_compaction import _TIMESTAMP_ROW_RE
 
 
 @dataclass
@@ -29,7 +30,9 @@ class ContentSection:
 
 
 _CODE_FENCE_PATTERN = re.compile(r"^```(\w*)\s*$", re.MULTILINE)
-_JSON_BLOCK_START = re.compile(r"^\s*[\[{]", re.MULTILINE)
+# ``[^\S\n]*``, not ``\s*``: under MULTILINE, ``^\s*`` rescans every
+# following blank line from each line start (quadratic in a blank run).
+_JSON_BLOCK_START = re.compile(r"^[^\S\n]*[\[{]", re.MULTILINE)
 _SEARCH_RESULT_PATTERN = re.compile(r"^\S+:\d+:", re.MULTILINE)
 _PROSE_PATTERN = re.compile(r"[A-Z][a-z]+\s+\w+\s+\w+")
 
@@ -43,7 +46,13 @@ def _is_search_line(line: str) -> bool:
     Sharing it keeps the splitter carving the same lines the detector claims
     (#3580); otherwise code in context lines would strand in PLAIN_TEXT
     sections and reach the prose compressor.
+
+    Timestamped log rows (``2026-09-23T10:05:07Z ...``) match the legacy
+    pattern but are never grep output; the detector rejects them (#3736), so
+    the splitter must too or it hands them to the lossy search compressor.
     """
+    if _TIMESTAMP_ROW_RE.match(line):
+        return False
     return bool(_SEARCH_RESULT_PATTERN.match(line)) or _is_search_result_line(line)
 
 

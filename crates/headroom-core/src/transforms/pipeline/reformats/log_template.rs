@@ -23,9 +23,17 @@
 //! ...
 //! ```
 //!
-//! Every original line is reconstructible from `template + variants`,
-//! so this is **lossless** — no CCR retrieval needed. The win is the
-//! template prefix (often 30+ chars) emitted once instead of N times.
+//! Every line is reconstructible from `template + variants` at token
+//! level: the tokens are kept, but whitespace is normalized. Runs of
+//! spaces, tabs, indentation, and `\r` are not preserved, so the
+//! output is not a byte-exact copy of the input. The exact original is
+//! recoverable only through CCR, when an offload runs after this
+//! reformat. The win is the template prefix (often 30+ chars) emitted
+//! once instead of N times.
+//!
+//! Constant tokens that are `<*>` behind zero or more backslashes are
+//! escaped with one more leading backslash (`<*>` → `\<*>`), so a
+//! header position reads as a wildcard only when it is exactly `<*>`.
 //!
 //! Order is preserved: only *consecutive* runs collapse, so the
 //! temporal flow of the log stays intact for the LLM.
@@ -244,7 +252,7 @@ impl LogTemplate {
                 out.push(' ');
             }
             match slot {
-                Some(constant) => out.push_str(constant),
+                Some(constant) => push_constant(out, constant),
                 None => out.push_str(WILDCARD),
             }
         }
@@ -287,6 +295,17 @@ impl Run {
             template: tokens.iter().map(|t| Some((*t).to_string())).collect(),
         }
     }
+}
+
+/// Write a constant template token. A literal `<*>` would print the
+/// same as the wildcard, and a literal `\<*>` (any number of leading
+/// backslashes) would read as an escape, so each gets one extra
+/// leading backslash.
+fn push_constant(out: &mut String, token: &str) {
+    if token.trim_start_matches('\\') == WILDCARD {
+        out.push('\\');
+    }
+    out.push_str(token);
 }
 
 /// Whitespace-split tokenizer. Empty result = blank line.
@@ -357,7 +376,7 @@ mod tests {
             r.output.chars().take(200).collect::<String>()
         );
         assert!(r.output.contains("(50 occurrences)"));
-        // Variants should still be in output (lossless guarantee).
+        // Variants should still be in output (token-level guarantee).
         assert!(r.output.contains("worker-7"));
     }
 
@@ -384,9 +403,10 @@ mod tests {
     }
 
     #[test]
-    fn lossless_round_trip_via_template_and_variants() {
-        // The flushed output must be reconstructible: each template
-        // line + its variant rows reproduces the original input lines.
+    fn token_round_trip_via_template_and_variants() {
+        // The flushed output must be reconstructible at token level:
+        // each template line + its variant rows reproduces the original
+        // tokens. Whitespace is normalized, so compare token lists.
         let mut log = String::new();
         for i in 0..25 {
             log.push_str(&format!("TOK1 TOK2 var{i} TOK3\n"));
@@ -420,7 +440,14 @@ mod tests {
             full[var_pos] = var_tokens[0];
             reconstructed.push(full.join(" "));
         }
-        let original: Vec<String> = log.lines().map(|s| s.to_string()).collect();
+        let original: Vec<Vec<String>> = log
+            .lines()
+            .map(|s| s.split_whitespace().map(str::to_string).collect())
+            .collect();
+        let reconstructed: Vec<Vec<String>> = reconstructed
+            .iter()
+            .map(|s: &String| s.split_whitespace().map(str::to_string).collect())
+            .collect();
         assert_eq!(reconstructed, original);
     }
 
@@ -463,7 +490,7 @@ mod tests {
         }
         // These all share token-count and "event-" prefix is varying.
         // Similarity might trigger collapse — that's fine if it does
-        // (still lossless), but we mainly assert no panic + no
+        // (still token-level preserving), but we mainly assert no panic + no
         // information loss.
         let r = reformat().apply(&log).expect("processes");
         // Either way: every variant value must survive.
@@ -541,5 +568,30 @@ mod tests {
         }
         let r = reformat().apply(&log).expect("processes");
         assert!(!r.output.contains("[Template"));
+    }
+
+    #[test]
+    fn literal_wildcard_constant_header_differs_from_variable_position() {
+        // "<*>" as a literal constant and "x{i}" as a varying token must
+        // not print the same template header.
+        let mut cfg = cfg();
+        cfg.min_lines = 10;
+        let r = LogTemplate::new(cfg);
+        let mut literal = String::new();
+        let mut varying = String::new();
+        for i in 0..30 {
+            literal.push_str(&format!("svc up <*> ok {i}\n"));
+            varying.push_str(&format!("svc up x{i} ok {i}\n"));
+        }
+        let header = |log: &str| {
+            let out = r.apply(log).expect("collapses").output;
+            out.lines().next().expect("has header").to_string()
+        };
+        let literal_header = header(&literal);
+        let varying_header = header(&varying);
+        assert!(literal_header.starts_with("[Template T1:"));
+        assert!(varying_header.starts_with("[Template T1:"));
+        assert_ne!(literal_header, varying_header);
+        assert!(literal_header.contains("\\<*>"));
     }
 }
