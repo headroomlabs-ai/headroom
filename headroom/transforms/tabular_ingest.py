@@ -74,7 +74,7 @@ def parse_csv(content: str, delimiter: str = ",") -> tuple[list[str], list[list[
     """
     reader = csv.reader(io.StringIO(content), delimiter=delimiter)
     try:
-        parsed = [row for row in reader if any(cell.strip() for cell in row)]
+        parsed = [row for row in reader if row and not (len(row) == 1 and not row[0].strip())]
     except csv.Error:
         return [], []
     if not parsed:
@@ -97,7 +97,10 @@ def parse_markdown_table(content: str) -> tuple[list[str], list[list[str]]]:
     if len(lines) < 2:
         return [], []
     headers = split_row(lines[0])
-    rows = [split_row(ln) for ln in lines[1:] if not is_separator(ln)]
+    body_lines = lines[1:]
+    if body_lines and is_separator(body_lines[0]):
+        body_lines = body_lines[1:]
+    rows = [split_row(ln) for ln in body_lines]
     return headers, rows
 
 
