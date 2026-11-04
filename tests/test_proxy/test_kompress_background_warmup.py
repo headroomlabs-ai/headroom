@@ -29,10 +29,25 @@ class _Kompress:
         return "onnx"
 
 
+class _Slot:
+    """Minimal stand-in for ``WarmupRegistry``'s kompress component slot."""
+
+    def __init__(self) -> None:
+        self.status = "null"
+        self.info: dict[str, object] = {}
+
+    def mark_loaded(self, *, handle: object, backend: str, **_: object) -> None:
+        self.status = "loaded"
+        self.info["handle"] = handle
+        self.info["backend"] = backend
+
+
 def _proxy_with(compressor: object | None) -> SimpleNamespace:
     router = SimpleNamespace(_get_kompress=lambda: compressor)
     pipeline = SimpleNamespace(transforms=[router])
-    return SimpleNamespace(anthropic_pipeline=pipeline, openai_pipeline=pipeline)
+    # The warm-up promotes this slot so /health stops reporting backend=null.
+    warmup = SimpleNamespace(kompress=_Slot())
+    return SimpleNamespace(anthropic_pipeline=pipeline, openai_pipeline=pipeline, warmup=warmup)
 
 
 @pytest.fixture(autouse=True)
@@ -55,8 +70,16 @@ def test_warms_on_a_background_thread(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr("platform.libc_ver", lambda: ("glibc", "2.35"))
     monkeypatch.delenv("PYTEST_CURRENT_TEST", raising=False)
     kompress = _Kompress()
-    assert HeadroomProxy._start_kompress_background_warmup(_proxy_with(kompress)) is True
+    proxy = _proxy_with(kompress)
+    assert HeadroomProxy._start_kompress_background_warmup(proxy) is True
     assert kompress.preloaded.wait(5)
+    # /health reads this slot; without the promotion an idle proxy reports
+    # kompress backend=null forever (GH #2730).
+    assert proxy.warmup.kompress.status == "loaded"
+    assert proxy.warmup.kompress.info["backend"] == "onnx"
+    thread = proxy._kompress_warm_thread
+    thread.join(timeout=5)
+    assert not thread.is_alive()
 
 
 def test_skipped_on_the_glibc_family_that_crashes(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -65,6 +88,19 @@ def test_skipped_on_the_glibc_family_that_crashes(monkeypatch: pytest.MonkeyPatc
     kompress = _Kompress()
     assert HeadroomProxy._start_kompress_background_warmup(_proxy_with(kompress)) is False
     assert not kompress.preloaded.wait(0.2)
+
+
+def test_unreadable_interpreter_does_not_fail_startup(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Microsoft Store Python's python.exe can't be opened, so libc_ver() raises."""
+
+    def _raise() -> tuple[str, str]:
+        raise OSError(22, "Invalid argument")
+
+    monkeypatch.setattr("platform.libc_ver", _raise)
+    monkeypatch.delenv("PYTEST_CURRENT_TEST", raising=False)
+    kompress = _Kompress()
+    assert HeadroomProxy._start_kompress_background_warmup(_proxy_with(kompress)) is True
+    assert kompress.preloaded.wait(5)
 
 
 def test_env_switch_wins_both_ways(monkeypatch: pytest.MonkeyPatch) -> None:
