@@ -199,8 +199,17 @@ class LogCompressor:
         del context
         rust_result = self._rust.compress(content, bias)
         cache_key: str | None = rust_result.cache_key
-        if cache_key is not None:
-            persist_rust_ccr_entry(content, rust_result.compressed, cache_key, source="log")
+        if cache_key is not None and not persist_rust_ccr_entry(
+            content, rust_result.compressed, cache_key, source="log"
+        ):
+            return LogCompressionResult(  # unstored original: no marker
+                compressed=content,
+                original=content,
+                original_line_count=rust_result.original_line_count,
+                compressed_line_count=rust_result.original_line_count,
+                format_detected=_format_from_str(rust_result.format_detected),
+                compression_ratio=1.0,
+            )
 
         stats_dict = {k: int(v) for k, v in cast("dict[str, int]", rust_result.stats).items()}
         return LogCompressionResult(

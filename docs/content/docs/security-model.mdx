@@ -284,6 +284,8 @@ accept arbitrary environment variables — writes are restricted to a hardcoded 
 | `HEADROOM_INTERCEPT_READ_MIN_CHARS` | ast-grep read-interception threshold |
 | `HEADROOM_VERIFY_TRUNCATION_ON_DISK` | Verify ast-grep Read truncation against disk when no client banner is found. Always returns `UNKNOWN` on Windows, where `dir_fd` / `O_NOFOLLOW` support is unavailable. |
 | `HEADROOM_VERIFY_TRUNCATION_MAX_BYTES` | Max on-disk file size (bytes) the disk-verify fallback will read |
+| `HEADROOM_DEFERRED_TOOL_AFFINITY` | Keep `defer_loading` tools out of the Anthropic prefix-tracker lineage key (default on; `0` counts them again) |
+| `HEADROOM_WEB_SEARCH_HISTORY` | Drop `web_search_call` history from a Responses request that declares no web_search tool (default on; `0` disables) |
 | `HEADROOM_BUFFERED_UPSTREAM_STREAM` | Send buffered CCR requests (and their continuations) upstream as `stream: true` and fold the reply (default on; `0` sends `stream: false`) |
 
 Keys outside this list are ignored, and `/admin/upstream` is read-only — there is no
@@ -347,6 +349,7 @@ Beyond your configured LLM providers, Headroom may contact:
 | `pypi.org` | Daily version check for update notices | On | `HEADROOM_UPDATE_CHECK=off`; also skipped in `--stateless`, in CI, and from source checkouts |
 | `huggingface.co` | Downloads models for the optional ML compression paths | On first use of those features | Pre-provision the model cache, or leave the features disabled |
 | `app.headroomlabs.ai` | License validation and usage reporting | Only with a license key configured | Omit the license key |
+| `mobile.events.data.microsoft.com` | ONNX Runtime's own usage telemetry to Microsoft (ORT 1.31+ on Linux and macOS): hashed device id, model file and graph names, model hashes, execution providers, hardware ids | **Off**: importing `headroom` sets `ORT_DISABLE_TELEMETRY=1` unless it is already set | Leave `ORT_DISABLE_TELEMETRY` unset or `1`; setting it to `0` turns ORT's telemetry back on |
 
 ### The beacon is on by default
 

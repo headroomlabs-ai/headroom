@@ -183,64 +183,10 @@ def test_held_read_keeps_client_breakpoint_then_matures(monkeypatch):
         cost_tracking_enabled=False,
         log_requests=False,
     )
-    app = create_app(config)
-    forwarded: list[list[dict]] = []
-
-    with TestClient(app) as client:
-        proxy = client.app.state.proxy
-        original_retry = proxy._retry_request
-
-        async def _mock_upstream(method, url, headers, body, stream=False, **kwargs):
-            msgs = body.get("messages", []) or []
-            forwarded.append(copy.deepcopy(msgs))
-            # Simulate Anthropic honestly caching up to the handler's breakpoint
-            # (system blocks are cached too), so the prefix tracker advances
-            # frozen_message_count as in prod.
-            bp = _breakpoint_index(msgs)
-            sys_tokens = sum(
-                max(1, len(str(b.get("text", ""))) // 4)
-                for b in (body.get("system") or [])
-                if isinstance(b, dict)
-            )
-            cached = sys_tokens + (sum(_est_tokens(m) for m in msgs[: bp + 1]) if bp >= 0 else 0)
-            return httpx.Response(
-                200,
-                json={
-                    "id": "msg_x",
-                    "type": "message",
-                    "role": "assistant",
-                    "content": [{"type": "text", "text": "ok"}],
-                    "usage": {
-                        "input_tokens": 20,
-                        "output_tokens": 2,
-                        "cache_read_input_tokens": cached,
-                        "cache_creation_input_tokens": 0,
-                    },
-                },
-            )
-
-        proxy._retry_request = _mock_upstream
-        try:
-            for n in range(0, 7):
-                r = client.post(
-                    "/v1/messages",
-                    headers={
-                        "x-api-key": "test-key",
-                        "anthropic-version": "2023-06-01",
-                        "x-headroom-session-id": "nobust-1",
-                        "content-type": "application/json",
-                    },
-                    json={
-                        "model": MODEL,
-                        "max_tokens": 20,
-                        "system": SYSTEM,
-                        "tools": [READ_TOOL],
-                        "messages": _convo(n),
-                    },
-                )
-                assert r.status_code == 200, f"turn {n}: {r.text[:300]}"
-        finally:
-            proxy._retry_request = original_retry
+    # The provider confirms no cache (as after a lapse), so nothing is frozen
+    # and a quiet Read may mature. Once the provider has cached it, it stays
+    # verbatim instead: test_read_inside_the_cached_prefix_stays_verbatim.
+    forwarded = _drive_session(config, n_turns=7, session_id="nobust-1", cache_hits=False)
 
     assert forwarded, "no requests were forwarded"
 
@@ -263,7 +209,7 @@ def test_held_read_keeps_client_breakpoint_then_matures(monkeypatch):
     # Read, which dropped Claude Code's tail breakpoint for the whole hold and
     # re-sent the Read and everything after it uncached on every held turn, to
     # save one cache write of the Read. The held Read is now cached with its
-    # turn, and maturing it re-writes the cache from the Read onward once.
+    # turn.
     moved = [
         turn
         for turn, msgs in enumerate(forwarded)
@@ -288,11 +234,14 @@ def _drive_session(
     session_id: str,
     saved_out: list[int] | None = None,
     convo=_convo,
+    cache_hits: bool = True,
+    tools: list[dict] | None = None,
 ) -> list[list[dict]]:
     """Drive ``n_turns`` cumulative turns of ``convo`` through the real handler
     with a mocked upstream; return the forwarded message arrays per turn. When
     ``saved_out`` is given, each turn's emitted ``x-headroom-tokens-saved`` is
-    appended to it."""
+    appended to it. The upstream caches up to the handler's breakpoint, or
+    reports no cache at all when ``cache_hits`` is False."""
     app = create_app(config)
     forwarded: list[list[dict]] = []
     with TestClient(app) as client:
@@ -309,6 +258,8 @@ def _drive_session(
                 if isinstance(b, dict)
             )
             cached = sys_tokens + (sum(_est_tokens(m) for m in msgs[: bp + 1]) if bp >= 0 else 0)
+            if not cache_hits:
+                cached = 0
             return httpx.Response(
                 200,
                 json={
@@ -340,7 +291,7 @@ def _drive_session(
                         "model": MODEL,
                         "max_tokens": 20,
                         "system": SYSTEM,
-                        "tools": [READ_TOOL],
+                        "tools": tools or [READ_TOOL],
                         "messages": convo(n),
                     },
                 )
@@ -406,6 +357,161 @@ def test_read_cached_with_its_turn_stays_verbatim(monkeypatch):
     assert _first_matured_turn(forwarded) is None, "a cached Read was matured"
 
 
+DEFERRED_TOOL = {
+    "name": "mcp__notes__search",
+    "description": "Search notes",
+    "defer_loading": True,
+    "input_schema": {"type": "object", "properties": {"q": {"type": "string"}}},
+}
+
+
+def _tool_search_convo(nquiet: int) -> list[dict]:
+    """``_busy_convo`` after a ToolSearch whose result holds only tool_reference
+    blocks, as Claude Code loads deferred tools. Such textless results are
+    stable; tests must not rely on them stopping the local replay window."""
+    msgs = _busy_convo(nquiet)
+    search = [
+        {
+            "role": "assistant",
+            "content": [
+                {
+                    "type": "tool_use",
+                    "id": "toolu_ts",
+                    "name": "ToolSearch",
+                    "input": {"query": "notes"},
+                }
+            ],
+        },
+        {
+            "role": "user",
+            "content": [
+                {
+                    "type": "tool_result",
+                    "tool_use_id": "toolu_ts",
+                    "content": [{"type": "tool_reference", "tool_name": DEFERRED_TOOL["name"]}],
+                }
+            ],
+        },
+    ]
+    return msgs[:1] + search + msgs[1:]
+
+
+def _without_cache_control(messages: list[dict]) -> list[dict]:
+    return json.loads(
+        json.dumps(messages),
+        object_hook=lambda d: {k: v for k, v in d.items() if k != "cache_control"},
+    )
+
+
+def _prefix_rewrites(forwarded: list[list[dict]]) -> list[int]:
+    """Turns whose forwarded messages do not start with the previous turn's.
+    The mock caches each turn through its last message, so any such turn
+    re-writes the provider cache. Breakpoints move every turn and are ignored."""
+    rewrites = []
+    for turn in range(1, len(forwarded)):
+        prev = _without_cache_control(forwarded[turn - 1])
+        if _without_cache_control(forwarded[turn])[: len(prev)] != prev:
+            rewrites.append(turn)
+    return rewrites
+
+
+def _record_pipeline_freeze(monkeypatch) -> list[int]:
+    from headroom.proxy import session_engine
+
+    seen: list[int] = []
+    prepare = session_engine.prepare_turn
+
+    def _recording_prepare(*args, **kwargs):
+        prep = prepare(*args, **kwargs)
+        seen.append(prep.frozen_message_count)
+        return prep
+
+    monkeypatch.setattr(session_engine, "prepare_turn", _recording_prepare)
+    return seen
+
+
+@pytest.mark.parametrize(
+    ("convo", "tools", "pipeline_stop"),
+    [
+        # Both input shapes exercise the same explicitly bounded local cache.
+        (_convo, [READ_TOOL], 2),
+        (_tool_search_convo, [READ_TOOL, DEFERRED_TOOL], 2),
+    ],
+    ids=["quiet", "tool-reference"],
+)
+@pytest.mark.parametrize("cache_hits", [True, False], ids=["provider-cached", "provider-uncached"])
+def test_read_inside_the_cached_prefix_stays_verbatim(
+    monkeypatch, convo, tools, pipeline_stop, cache_hits
+):
+    """By the time the Read's file quiesces the provider has cached it, so
+    maturing it would re-write the cache from the Read onward. The pipeline's
+    own freeze stops below the Read here; maturation must follow the
+    provider-confirmed floor that finalize_turn replays instead. The uncached
+    control must still mature, so retaining the Read cannot pass vacuously."""
+    from headroom.cache.compression_cache import CompressionCache
+    from headroom.cache.compression_store import reset_compression_store
+    from headroom.transforms.read_maturation import ReadMaturationManager
+
+    monkeypatch.setenv("HEADROOM_CCR_BACKEND", "memory")
+    reset_compression_store()
+    # Explicitly model a local replay window shorter than the provider's
+    # confirmed prefix (e.g. after local cache eviction). Keep real preparation
+    # and tracking; do not depend on any particular tool-result shape being a
+    # cache miss. Textless ToolSearch results are legitimately stable now.
+    compute_frozen = CompressionCache.compute_frozen_count
+
+    def _bounded_local_replay(self, messages):
+        return min(compute_frozen(self, messages), pipeline_stop)
+
+    monkeypatch.setattr(CompressionCache, "compute_frozen_count", _bounded_local_replay)
+    pipeline_freeze = _record_pipeline_freeze(monkeypatch)
+    maturation_freeze: list[int] = []
+    apply = ReadMaturationManager.apply
+
+    def _recording_apply(self, messages, frozen_message_count=0):
+        maturation_freeze.append(frozen_message_count)
+        return apply(self, messages, frozen_message_count=frozen_message_count)
+
+    monkeypatch.setattr(ReadMaturationManager, "apply", _recording_apply)
+    config = ProxyConfig(
+        optimize=True,
+        read_maturation=True,
+        mode="token",
+        cache_enabled=True,
+        rate_limit_enabled=False,
+        cost_tracking_enabled=False,
+        log_requests=False,
+    )
+
+    forwarded = _drive_session(
+        config,
+        n_turns=8,
+        session_id="cached-read-2",
+        convo=convo,
+        tools=tools,
+        cache_hits=cache_hits,
+    )
+
+    assert pipeline_freeze and max(pipeline_freeze) <= pipeline_stop, (
+        f"fixture must keep the pipeline freeze below the Read: {pipeline_freeze}"
+    )
+    assert len(forwarded) == 8, "every turn must reach the upstream"
+    read_at = next(i for i, msg in enumerate(convo(0)) if _read_result_content(msg) is not None)
+    assert pipeline_stop <= read_at, "the local replay window must exclude the held Read"
+    if not cache_hits:
+        assert maturation_freeze and not any(maturation_freeze)
+        assert _first_matured_turn(forwarded) is not None, "uncached control never matured"
+        return
+    assert len(maturation_freeze) == 8 and all(f > read_at for f in maturation_freeze[1:]), (
+        f"provider-confirmed maturation floor must protect the Read: {maturation_freeze}"
+    )
+    assert all(_read_result_content(msgs[read_at]) == BIG for msgs in forwarded), (
+        "the held Read must remain present and verbatim on every turn"
+    )
+    assert _first_matured_turn(forwarded) is None, "a cached Read was matured"
+    assert not _prefix_rewrites(forwarded), "the forwarded cached prefix changed"
+
+
 def test_quiesce_turns_config_is_honored(monkeypatch):
     """`quiesce_turns` must be runtime-configurable end-to-end: a fresh Read of
     /x/foo.py matures `quiesce_turns` quiet turns after it appears (the convo
@@ -428,7 +534,7 @@ def test_quiesce_turns_config_is_honored(monkeypatch):
         cost_tracking_enabled=False,
         log_requests=False,
     )
-    forwarded = _drive_session(config, n_turns=4, session_id="quiesce-cfg-1")
+    forwarded = _drive_session(config, n_turns=4, session_id="quiesce-cfg-1", cache_hits=False)
     first = _first_matured_turn(forwarded)
     assert first == 2, (
         f"expected the Read to mature at turn 2 with quiesce_turns=2, "
@@ -503,7 +609,9 @@ def test_replayed_marker_is_not_rebooked_in_the_emitted_savings(monkeypatch):
         log_requests=False,
     )
     saved: list[int] = []
-    forwarded = _drive_session(config, n_turns=5, session_id="first-appearance-1", saved_out=saved)
+    forwarded = _drive_session(
+        config, n_turns=5, session_id="first-appearance-1", saved_out=saved, cache_hits=False
+    )
 
     first = _first_matured_turn(forwarded)
     assert first is not None, "the Read never matured, so there is nothing to replay"
