@@ -552,7 +552,7 @@ def test_cache_mode_skips_memory_context_search_openai_responses() -> None:
 
         assert response.status_code == 200
         proxy.memory_handler.search_and_format_context.assert_not_awaited()
-        if "body" in captured:
-            sent = captured["body"]
-            assert isinstance(sent, dict)
-            assert sent.get("input") == "latest user prompt"
+        assert "body" in captured
+        sent = captured["body"]
+        assert isinstance(sent, dict)
+        assert sent.get("input") == "latest user prompt"
