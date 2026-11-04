@@ -1,13 +1,12 @@
 """Synthetic session fixtures that reproduce known waste patterns.
 
 These build :class:`SessionData` shaped like the real patterns Headroom Learn
-must catch, so both unit tests and the RTK-loop eval (``benchmarks/
-rtk_loop_learn_eval.py``) drive the analyzer from one source of truth instead
+must catch, so unit tests drive the analyzer from one source of truth instead
 of hand-mocking calls inline.
 
-The headline fixture is the **RTK re-fetch loop**. RTK truncates a shell
-command's output; when the truncation drops what the agent needed, the agent
-re-runs a *variant* to fetch more. Critically these calls SUCCEED
+The headline fixture is the **re-fetch loop**. A shell command's output is
+truncated by an output limit; when the truncation drops what the agent needed,
+the agent re-runs a *variant* to fetch more. Critically these calls SUCCEED
 (``is_error=False``) — the loop is invisible to failure-only analysis, which
 is exactly why it was historically under-weighted.
 """
@@ -22,11 +21,17 @@ def _tc(
     command: str,
     output: str,
     *,
+    session_id: str,
     msg_index: int,
     is_error: bool = False,
     error_category: ErrorCategory = ErrorCategory.UNKNOWN,
 ) -> ToolCall:
-    """Build a ToolCall, keying input on the field the tool's summary reads."""
+    """Build a ToolCall, keying input on the field the tool's summary reads.
+
+    ``tool_call_id`` is scoped by session: ``detect_loops`` counts a call once
+    per id, so an id unique only within a session would make two sessions
+    running the same loop look like one session replayed twice.
+    """
     if name.lower() in ("bash", "shell"):
         input_data = {"command": command}
     elif name.lower() in ("read",):
@@ -37,7 +42,7 @@ def _tc(
         input_data = {"command": command}
     return ToolCall(
         name=name,
-        tool_call_id=f"tc_{msg_index}",
+        tool_call_id=f"{session_id}_tc_{msg_index}",
         input_data=input_data,
         output=output,
         is_error=is_error,
@@ -47,28 +52,28 @@ def _tc(
     )
 
 
-def rtk_refetch_loop_session(
-    session_id: str = "rtk-loop",
+def refetch_loop_session(
+    session_id: str = "refetch-loop",
     *,
     repetitions: int = 5,
     bytes_per_call: int = 4000,
 ) -> SessionData:
-    """A session where RTK truncation forces repeated re-fetches of one command.
+    """A session where output truncation forces repeated re-fetches of one command.
 
-    The agent greps a large log; RTK rewrites each invocation with an output
-    limit. Each call succeeds but returns a truncated window, so the agent
-    bumps the limit / shifts the window and re-runs — ``repetitions`` times.
-    None of the calls error. The fix a good guardrail should produce: fetch the
-    full result up front (e.g., disable RTK truncation for this command, or
-    grep into a file and read it once).
+    The agent greps a large log with an output limit on each invocation. Each
+    call succeeds but returns a truncated window, so the agent bumps the limit
+    / shifts the window and re-runs — ``repetitions`` times. None of the calls
+    error. The fix a good guardrail should produce: fetch the full result up
+    front (e.g., raise the output limit for this command, or grep into a file
+    and read it once).
     """
     calls: list[ToolCall] = []
     limit = 50
     for i in range(repetitions):
-        # Same base command; only the output-limit varies — the RTK signature.
+        # Same base command; only the output-limit varies — the loop signature.
         command = f"grep -rn 'TimeoutError' logs/ | head -{limit}"
         output = "logs/app.log:" + ("x" * (bytes_per_call - 20)) + "\n(truncated)"
-        calls.append(_tc("Bash", command, output, msg_index=i * 2))
+        calls.append(_tc("Bash", command, output, session_id=session_id, msg_index=i * 2))
         limit += 50  # agent asks for more next time — still truncated
     return SessionData(session_id=session_id, tool_calls=calls)
 
@@ -86,6 +91,7 @@ def error_loop_session(
                 "Bash",
                 "python3 run_tests.py",
                 "python3: command not found",
+                session_id=session_id,
                 msg_index=i * 2,
                 is_error=True,
                 error_category=ErrorCategory.COMMAND_NOT_FOUND,
@@ -103,10 +109,11 @@ def one_off_error_session(session_id: str = "one-off") -> SessionData:
                 "Read",
                 "/etc/missing.conf",
                 "Error: file not found",
+                session_id=session_id,
                 msg_index=0,
                 is_error=True,
                 error_category=ErrorCategory.FILE_NOT_FOUND,
             ),
-            _tc("Bash", "ls -la", "total 8\ndrwxr-xr-x", msg_index=1),
+            _tc("Bash", "ls -la", "total 8\ndrwxr-xr-x", session_id=session_id, msg_index=1),
         ],
     )

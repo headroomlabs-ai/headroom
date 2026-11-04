@@ -27,7 +27,6 @@ import {
   pluginConfigDir,
   pluginWorkspaceDir,
   proxyLogPath,
-  rtkPath,
   savingsPath,
   sessionStatsPath,
   subscriptionStatePath,
@@ -257,12 +256,6 @@ describe("derived-only resources", () => {
     expect(binDir()).toBe(path.join(os.homedir(), ".headroom", "bin"));
   });
 
-  it("rtkPath ends with rtk or rtk.exe", () => {
-    const p = rtkPath();
-    const expected = process.platform === "win32" ? "rtk.exe" : "rtk";
-    expect(path.basename(p)).toBe(expected);
-  });
-
   it("deployRoot", () => {
     expect(deployRoot()).toBe(path.join(os.homedir(), ".headroom", "deploy"));
   });
@@ -346,10 +339,6 @@ describe("derived-only helpers follow workspace env", () => {
   });
   it("binDir", () => {
     expect(binDir()).toBe(path.join("/tmp/alt_ws", "bin"));
-  });
-  it("rtkPath", () => {
-    const expected = process.platform === "win32" ? "rtk.exe" : "rtk";
-    expect(rtkPath()).toBe(path.join("/tmp/alt_ws", "bin", expected));
   });
   it("deployRoot", () => {
     expect(deployRoot()).toBe(path.join("/tmp/alt_ws", "deploy"));

@@ -350,7 +350,7 @@ fn calculate_structural_uniqueness(item: &Value, all_items: &[Value]) -> f64 {
 pub fn compute_item_hash(item: &Value) -> String {
     let content = python_json_dumps_sort_keys(item);
     let digest = Md5::digest(content.as_bytes());
-    let hex = format!("{:x}", digest);
+    let hex: String = digest.iter().map(|byte| format!("{byte:02x}")).collect();
     hex[..16].to_string()
 }
 

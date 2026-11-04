@@ -205,3 +205,36 @@ def test_memory_api_methods_delegate_to_underlying_memory() -> None:
     assert api.clear() == 2
     assert api.stats() == {"total": 2}
     assert fake_memory.last_clear == {"user_id": "alice"}
+
+
+def test_parse_response_with_memory_tolerates_non_object_memory_block() -> None:
+    from headroom.memory.inline_extractor import parse_response_with_memory
+
+    # The model controls the <memory> block. A valid-JSON non-object (a bare
+    # array) or a non-list `memories` field must not crash the parse: the
+    # `json.loads` succeeds, so the JSONDecodeError guard does not apply, and
+    # `.get`/iteration on the wrong type would otherwise raise.
+    assert parse_response_with_memory('hi <memory>["x"]</memory> bye').memories == []
+    assert parse_response_with_memory('<memory>{"memories": "nope"}</memory>').memories == []
+
+    # Malformed JSON is still handled, and a well-formed block still parses.
+    assert parse_response_with_memory("<memory>{not json</memory>").memories == []
+    parsed = parse_response_with_memory(
+        'text <memory>{"memories": [{"content": "User likes Python"}]}</memory>'
+    )
+    assert parsed.memories == [{"content": "User likes Python"}]
+    assert parsed.content == "text"
+
+
+def test_parse_response_with_memory_tolerates_none_content() -> None:
+    from headroom.memory.inline_extractor import parse_response_with_memory
+
+    # `chat.completions` returns `message.content == None` whenever the model
+    # answers with tool/function calls instead of text. The callers forward that
+    # `None` straight in, where `re.search(pattern, None)` used to raise
+    # `TypeError` and crash the whole request. It must degrade gracefully and
+    # preserve `None` (not coerce a tool-call turn to text).
+    parsed = parse_response_with_memory(None)
+    assert parsed.content is None
+    assert parsed.memories == []
+    assert parsed.raw is None

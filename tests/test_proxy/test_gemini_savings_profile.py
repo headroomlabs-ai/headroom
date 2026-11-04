@@ -199,3 +199,76 @@ def test_gemini_zero_usage_prompt_count_is_preserved():
     outcome = captured["outcome"]
     assert outcome.optimized_tokens == 0
     assert outcome.uncached_input_tokens == 0
+
+
+def test_gemini_provider_count_above_local_estimate_does_not_inflate_eligible():
+    """When Gemini's promptTokenCount exceeds our local estimate, the outcome must
+    not ship attempted_input_tokens > original_tokens (a structurally impossible
+    eligible_pct > 100) or a phantom tokens_inflated. The local baseline is lifted
+    onto the provider scale, matching the streaming finalizer's tested handling."""
+    config = ProxyConfig(
+        optimize=True,
+        cache_enabled=False,
+        rate_limit_enabled=False,
+        cost_tracking_enabled=False,
+    )
+
+    # Local pipeline count: 100 tokens before compression, 80 after (saved 20).
+    # Return genuinely-changed messages so the handler adopts the pipeline's
+    # tokens_before/after (the override only fires when messages actually change).
+    def passthrough_apply(**kwargs):
+        sent = kwargs["messages"]
+        compressed = [dict(m) for m in sent]
+        if compressed:
+            compressed[0] = {**compressed[0], "content": "compressed"}
+        return SimpleNamespace(
+            messages=compressed,
+            transforms_applied=["gemini_compress"],
+            timing={},
+            tokens_before=100,
+            tokens_after=80,
+            waste_signals=None,
+        )
+
+    # Gemini counts the forwarded prompt at 150 -- higher than our local 80, so
+    # attempted = 150 + 20 = 170 would exceed a local original of 100.
+    resp = MagicMock()
+    resp.status_code = 200
+    resp.headers = {"content-type": "application/json"}
+    resp.content = (
+        b'{"candidates":[{"content":{"parts":[{"text":"ok"}]}}],'
+        b'"usageMetadata":{"promptTokenCount":150,"candidatesTokenCount":2}}'
+    )
+    resp.json.return_value = {
+        "candidates": [{"content": {"parts": [{"text": "ok"}]}}],
+        "usageMetadata": {"promptTokenCount": 150, "candidatesTokenCount": 2},
+    }
+
+    captured: dict[str, object] = {}
+
+    async def recording_outcome(outcome):  # noqa: ANN001
+        captured["outcome"] = outcome
+
+    big = "word " * 4000
+    app = create_app(config)
+    with TestClient(app) as client:
+        proxy = client.app.state.proxy
+        proxy.openai_pipeline.apply = MagicMock(side_effect=passthrough_apply)
+        proxy._retry_request = AsyncMock(return_value=resp)
+        proxy._record_request_outcome = AsyncMock(side_effect=recording_outcome)
+
+        r = client.post(
+            "/v1beta/models/gemini-2.0-flash:generateContent?key=test-key",
+            json={"contents": [{"parts": [{"text": big}]}]},
+        )
+
+    assert r.status_code == 200, r.text
+    outcome = captured["outcome"]
+    # The provider's own count is still carried for billing/dashboard.
+    assert outcome.optimized_tokens == 150
+    # The eligible ratio cannot exceed 100%: attempted must not exceed original.
+    assert outcome.attempted_input_tokens <= outcome.original_tokens
+    # No phantom growth (optimized - original clamped to >= 0 was 50 before).
+    assert outcome.tokens_inflated == 0
+    # Baseline lifted onto the provider scale: max(local 100, provider 150 + saved 20).
+    assert outcome.original_tokens == 170

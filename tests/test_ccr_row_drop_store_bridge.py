@@ -385,6 +385,9 @@ def test_v1_compress_then_v1_retrieve_resolves_marker_hash() -> None:
     ]
     req = {
         "model": "gpt-4o",
+        # /v1/compress is marker-free by default (no gateway caller can resolve a
+        # marker); mode="ccr" is the opt-in for callers that run the retrieve loop.
+        "config": {"mode": "ccr"},
         "messages": [
             {"role": "user", "content": "Get items"},
             {

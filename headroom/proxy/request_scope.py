@@ -3,10 +3,11 @@
 from __future__ import annotations
 
 from collections.abc import MutableMapping
-from typing import Any
+from typing import TYPE_CHECKING, Any
 from urllib.parse import quote
 
-from fastapi import Request
+if TYPE_CHECKING:
+    from fastapi import Request
 
 
 def normalize_scope_path(scope: MutableMapping[str, Any], path: str) -> None:

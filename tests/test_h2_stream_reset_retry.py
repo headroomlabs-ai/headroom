@@ -30,6 +30,7 @@ def _mock_proxy():
     proxy._config.retry_max_delay_ms = 0
     proxy.config = proxy._config
     proxy.memory_handler = None
+    proxy.metrics = MagicMock()
     proxy._parse_sse_usage_from_buffer = MagicMock(return_value=None)
     proxy._finalize_stream_response = AsyncMock(return_value=None)
     return proxy
@@ -142,3 +143,37 @@ async def test_stream_reset_exhaustion_yields_sse_error_not_crash():
     assert proxy.http_client.send.await_count == 2
     assert b"event: error" in body
     assert b"connection_error" in body
+
+
+@pytest.mark.asyncio
+async def test_stream_reset_exhaustion_status_is_not_200():
+    """The synthesized error response must not claim success.
+
+    A 200 here is indistinguishable, to every Anthropic/OpenAI SDK, from a
+    successful stream that produced no events — the client reports "empty or
+    malformed response (HTTP 200)" and cannot retry, because 200 is not a
+    retryable status. This asserts the status line specifically: the body
+    assertions above passed for the entire time the status was 200.
+    """
+    proxy = _mock_proxy()
+    proxy.http_client.build_request = MagicMock(return_value=MagicMock())
+    proxy.http_client.send = AsyncMock(side_effect=httpx.RemoteProtocolError("reset"))
+
+    result = await _run_stream(proxy)
+
+    assert result.status_code == 502
+    proxy.metrics.record_upstream_connection_error.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_successful_stream_still_returns_200():
+    """Guard the happy path against the 502 change above."""
+    proxy = _mock_proxy()
+    good = _good_stream_response([b'event: message_stop\ndata: {"type":"message_stop"}\n\n'])
+    proxy.http_client.build_request = MagicMock(return_value=MagicMock())
+    proxy.http_client.send = AsyncMock(return_value=good)
+
+    result = await _run_stream(proxy)
+
+    assert result.status_code == 200
+    proxy.metrics.record_upstream_connection_error.assert_not_called()

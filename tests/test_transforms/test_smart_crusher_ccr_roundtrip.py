@@ -343,3 +343,68 @@ def test_distinct_payloads_have_distinct_hashes_and_separate_storage() -> None:
     # And they don't cross-contaminate.
     assert pa != b
     assert pb != a
+
+
+def test_nested_table_markers_resolve_to_source_bytes() -> None:
+    """Regression for #2694: every marker the walker emits must resolve.
+
+    Nested shape (rows whose field is a stringified sub-array of base64
+    blobs) hit two defects at once:
+
+    1. ``walk_array`` compacted via the store-LESS ``compact()``, so opaque
+       cells inside a compacted table got a ``<<ccr:HASH,...>>`` marker whose
+       payload was never written — retrieval 404'd forever.
+    2. The rendered sub-table (already full of markers) was itself long
+       enough to be re-classified opaque and offloaded again, so the CCR
+       entry's "original" was compressed output, and the inner hashes — the
+       only handle on the real bytes — vanished from the visible text.
+
+    Both collapsed 6 payloads into one dead marker. Assert the payloads are
+    verbatim-retrievable, not merely that a marker was emitted.
+    """
+    import re
+
+    from headroom.config import SmartCrusherConfig as PyConfig
+    from headroom.transforms.smart_crusher import SmartCrusher
+
+    crusher = SmartCrusher(PyConfig())
+    blobs = [
+        ("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/" * 6) + f"{i:04d}"
+        for i in range(6)
+    ]
+    inner = [{"k": f"key{i}", "tok": b, "v": i} for i, b in enumerate(blobs)]
+    doc = {"rows": [{"id": i, "detail": json.dumps(inner), "note": "x"} for i in range(5)]}
+
+    out = crusher.compact_document_json(json.dumps(doc))
+
+    hashes = set(re.findall(r"<<ccr:([a-f0-9]+)", out))
+    assert hashes, f"expected retrieval markers, got: {out[:200]}"
+    for h in hashes:
+        payload = crusher.ccr_get(h)
+        assert payload is not None, f"marker <<ccr:{h}>> points at an unstored key (data loss)"
+        assert "<<ccr:" not in payload, (
+            f"<<ccr:{h}>> resolves to compressed output, not the original: {payload[:120]!r}"
+        )
+    # Every source blob is recoverable through some marker.
+    recovered = {crusher.ccr_get(h) for h in hashes}
+    assert set(blobs) <= recovered, "a source payload is unreachable from any emitted marker"
+
+
+def test_already_marked_content_is_not_re_offloaded() -> None:
+    """A cell that already carries a marker must never be offloaded again.
+
+    Re-offloading stores the MARKER as the new entry's original_content —
+    the exact corruption reported in #2694.
+    """
+    from headroom.config import SmartCrusherConfig as PyConfig
+    from headroom.transforms.smart_crusher import SmartCrusher
+
+    crusher = SmartCrusher(PyConfig())
+    # Long enough to clear the 256-byte opaque threshold, but it is our own
+    # output — a rendered row of markers, not source content.
+    marked = "\n".join(f"row{i},<<ccr:{i:012x},base64,1.6KB>>,ok" for i in range(12))
+    assert len(marked) > 256
+
+    out = crusher.compact_document_json(json.dumps({"table": marked}))
+
+    assert json.loads(out)["table"] == marked, "already-marked content was re-offloaded"

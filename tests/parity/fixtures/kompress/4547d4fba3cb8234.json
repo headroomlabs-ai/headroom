@@ -1,0 +1,22 @@
+{
+  "config": {
+    "chunk_words": 350,
+    "device": "auto",
+    "enable_ccr": false,
+    "model_id": "chopratejas/kompress-v2-base",
+    "score_threshold": 0.5
+  },
+  "input": "just a handful of words below the threshold now",
+  "input_sha256": "4547d4fba3cb8234b17cb8c0c5196cc9c983da011c0e025fa99e2dc22d5e00ed",
+  "output": {
+    "cache_key": null,
+    "compressed": "just a handful of words below the threshold now",
+    "compressed_tokens": 9,
+    "compression_ratio": 1.0,
+    "model_used": "chopratejas/kompress-v2-base",
+    "original": "just a handful of words below the threshold now",
+    "original_tokens": 9
+  },
+  "recorded_at": "2026-06-18T23:18:19.224369+00:00",
+  "transform": "kompress"
+}

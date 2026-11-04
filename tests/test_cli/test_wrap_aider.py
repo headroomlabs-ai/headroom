@@ -33,7 +33,7 @@ def test_wrap_aider_sets_provider_envs(
 
     with patch("headroom.cli.wrap.shutil.which", return_value="aider"):
         with patch("headroom.cli.wrap._launch_tool", side_effect=fake_launch_tool):
-            result = runner.invoke(main, ["wrap", "aider", "--no-rtk", "--", "--model", "gpt-4o"])
+            result = runner.invoke(main, ["wrap", "aider", "--", "--model", "gpt-4o"])
 
     assert result.exit_code == 0, result.output
     env = captured["env"]

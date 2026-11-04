@@ -12,7 +12,7 @@ FIXTURES ?= tests/parity/fixtures
 help:
 	@echo "Headroom Rust targets:"
 	@echo "  make test               - cargo test --workspace"
-	@echo "  make test-parity        - maturin develop + parity-run against fixtures"
+	@echo "  make test-parity        - parity-run against recorded fixtures"
 	@echo "  make bench              - cargo bench --workspace"
 	@echo "  make build-proxy        - release build + strip headroom-proxy, print size"
 	@echo "  make build-wheel        - release wheel for headroom-py"
@@ -36,12 +36,12 @@ help:
 test:
 	$(CARGO) test --workspace
 
+# headroom-parity has no pyo3 dependency — its comparators call headroom-core
+# directly, so this target needs neither a venv nor a built extension module.
+# (See crates/headroom-parity/Cargo.toml: "Phase 0 does not invoke Python from
+# Rust.") Dropping the `maturin develop` step keeps the harness runnable from a
+# bare checkout and takes the Python toolchain off the CI parity job.
 test-parity:
-	@if [ -z "$$VIRTUAL_ENV" ]; then \
-		echo "error: activate a venv first (e.g. source .venv/bin/activate)"; \
-		exit 1; \
-	fi
-	$(MATURIN) develop -m crates/headroom-py/Cargo.toml
 	$(CARGO) run -p headroom-parity -- run --fixtures $(FIXTURES)
 
 bench:

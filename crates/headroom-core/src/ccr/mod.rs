@@ -27,7 +27,7 @@
 //! [`backends::from_config`] selects one at startup and surfaces every
 //! init error to the caller (per `feedback_no_silent_fallbacks.md`).
 //!
-//! [`CompressionStore`]: https://github.com/chopratejas/headroom/blob/main/headroom/cache/compression_store.py
+//! [`CompressionStore`]: https://github.com/headroomlabs-ai/headroom/blob/main/headroom/cache/compression_store.py
 
 pub mod backends;
 
@@ -64,6 +64,20 @@ pub const DEFAULT_CAPACITY: usize = 1000;
 /// routinely outlive the old 5-minute default, and an expired entry
 /// silently converts "lossless with retrieval" into "lossy".
 pub const DEFAULT_TTL: Duration = Duration::from_secs(1800);
+
+/// The TTL is an **idle window**, not a wall clock: every successful
+/// `get` restarts the entry's clock, so an entry a session keeps
+/// touching survives a long multi-agent burst (#2604). To keep
+/// constant access from pinning an entry forever, an absolute max
+/// lifetime of `DEFAULT_MAX_LIFETIME_MULTIPLIER * ttl` (measured from
+/// insertion) caps the sliding window. Mirrors the Python
+/// `CompressionStore` semantics.
+pub const DEFAULT_MAX_LIFETIME_MULTIPLIER: u32 = 8;
+
+/// Absolute max lifetime for an entry with idle window `idle_ttl`.
+pub fn max_lifetime_for(idle_ttl: Duration) -> Duration {
+    idle_ttl.saturating_mul(DEFAULT_MAX_LIFETIME_MULTIPLIER)
+}
 
 /// Compute the canonical CCR key for `payload`. BLAKE3 → first 24 hex
 /// chars (96 bits — collision-resistant for the bounded LRU population

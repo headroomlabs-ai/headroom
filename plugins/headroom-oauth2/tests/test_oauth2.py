@@ -1,9 +1,11 @@
 import asyncio
 import base64
 import json
+import logging
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, HTTPServer
+from urllib.error import HTTPError
 
 import pytest
 
@@ -159,6 +161,26 @@ def test_error_on_bad_status_hides_body(idp):
     with pytest.raises(OAuth2Error) as ei:
         p.token()
     assert "SENSITIVE" not in str(ei.value)  # IdP error body must not leak into the exception
+
+
+def test_error_body_drain_failure_is_sanitized(monkeypatch, caplog):
+    class _UnreadableHTTPError(HTTPError):
+        def read(self):
+            raise RuntimeError("SENSITIVE")
+
+    def fail(*_args, **_kwargs):
+        raise _UnreadableHTTPError("https://idp.example/token", 503, "unavailable", {}, None)
+
+    monkeypatch.setattr("urllib.request.urlopen", fail)
+    caplog.set_level(logging.DEBUG, logger="headroom_oauth2")
+    p = OAuth2ClientCredentials(
+        token_url="https://idp.example/token", client_id="c", client_secret="s"
+    )
+
+    with pytest.raises(OAuth2Error, match="HTTP 503") as exc_info:
+        p.token()
+    assert "SENSITIVE" not in str(exc_info.value)
+    assert "SENSITIVE" not in caplog.text
 
 
 def test_malformed_200_no_token(idp):
@@ -492,3 +514,24 @@ def test_install_sets_static_headers(monkeypatch):
 
     install(App(), _cfg("litellm-openai"))
     assert fake.headers == {"X-App": "demo"}  # valid header set on litellm; malformed key dropped
+
+
+def test_install_handles_invalid_litellm_headers(monkeypatch, caplog):
+    import sys
+    import types
+
+    fake = types.ModuleType("litellm")
+    fake.headers = object()
+    monkeypatch.setitem(sys.modules, "litellm", fake)
+    monkeypatch.setenv("HEADROOM_OAUTH2_TOKEN_URL", "https://idp.example.com/token")
+    monkeypatch.setenv("HEADROOM_OAUTH2_CLIENT_ID", "c")
+    monkeypatch.setenv("HEADROOM_OAUTH2_CLIENT_SECRET", "s")
+    monkeypatch.setenv("HEADROOM_OAUTH2_HEADERS", "X-App=demo")
+    caplog.set_level(logging.WARNING, logger="headroom_oauth2")
+
+    class App:
+        def add_middleware(self, *a, **k):
+            pass
+
+    install(App(), _cfg("litellm-openai"))
+    assert "could not set litellm.headers" in caplog.text

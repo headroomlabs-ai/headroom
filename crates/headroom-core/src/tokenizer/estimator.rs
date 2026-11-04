@@ -1,11 +1,34 @@
 //! Character-density estimator. Used as a fallback for any tokenizer family
 //! we haven't wired in yet (Anthropic Claude, Google Gemini, Cohere, …).
 //!
-//! Mirrors `headroom.tokenizers.estimator.EstimatingTokenCounter`. The formula
-//! is `ceil(chars / chars_per_token)`. `chars` is *Unicode scalar count*, not
-//! byte length, to match Python's `len(text)` semantics on str.
+//! Mirrors `headroom.tokenizers.estimator.EstimatingTokenCounter`. Latin chars
+//! are priced at `chars_per_token`; dense scripts (CJK / Kana / Hangul / full-
+//! width) are priced separately at `CHARS_PER_TOKEN_CJK`, since they tokenize at
+//! ~1 token/char and the Latin ratio under-counts them 2-4x. `chars` is a
+//! *Unicode scalar count*, not byte length, to match Python's `len(text)`.
 
 use super::{Backend, Tokenizer};
+
+/// Chars-per-token for dense scripts. Byte-identical with Python
+/// `EstimatingTokenCounter.CHARS_PER_TOKEN_CJK`.
+const CHARS_PER_TOKEN_CJK: f64 = 1.5;
+
+/// True for a "dense-script" codepoint (CJK ideographs + punctuation, Kana,
+/// Hangul, CJK compatibility, half/full-width forms, CJK Ext-A/B). Ranges kept
+/// byte-identical with Python `EstimatingTokenCounter.CJK_PATTERN`.
+fn is_dense_script(c: char) -> bool {
+    matches!(
+        c as u32,
+        0x3000..=0x303F         // CJK symbols and punctuation
+            | 0x3040..=0x30FF   // Hiragana + Katakana
+            | 0x3400..=0x4DBF   // CJK Unified Ideographs Ext A
+            | 0x4E00..=0x9FFF   // CJK Unified Ideographs
+            | 0xAC00..=0xD7AF   // Hangul syllables
+            | 0xF900..=0xFAFF   // CJK compatibility ideographs
+            | 0xFF00..=0xFFEF   // Half/full-width forms
+            | 0x20000..=0x2A6DF // CJK Unified Ideographs Ext B
+    )
+}
 
 #[derive(Debug, Clone, Copy)]
 pub struct EstimatingCounter {
@@ -42,15 +65,15 @@ impl Tokenizer for EstimatingCounter {
         if text.is_empty() {
             return 0;
         }
-        // Match Python `EstimatingTokenCounter.count_text`:
-        //     max(1, int(len(text) / chars_per_token + 0.5))
-        // Python `int()` truncates toward zero; for non-negative inputs that's
-        // identical to `as usize` saturating-cast semantics in Rust >= 1.45.
-        // Adding 0.5 then truncating yields round-half-up. We previously used
-        // ceil, which over-counted in the middle of the range (e.g. "aaaaa"
-        // at 4.0 cpt returned 2 here vs 1 in Python).
-        let chars = text.chars().count() as f64;
-        let raw = (chars / self.chars_per_token + 0.5) as usize;
+        // Match Python `EstimatingTokenCounter.count_text` (fixed-ratio path):
+        //     cjk = count_dense_script(text); other = len(text) - cjk
+        //     max(1, int(other / chars_per_token + cjk / CHARS_PER_TOKEN_CJK + 0.5))
+        // Dense scripts tokenize at ~1 token/char, so the Latin `chars_per_token`
+        // under-counts them; price them separately. `int()` truncates toward
+        // zero (== `as usize` for non-negative); the `+ 0.5` gives round-half-up.
+        let cjk = text.chars().filter(|&c| is_dense_script(c)).count();
+        let other = (text.chars().count() - cjk) as f64;
+        let raw = (other / self.chars_per_token + cjk as f64 / CHARS_PER_TOKEN_CJK + 0.5) as usize;
         raw.max(1)
     }
 
@@ -102,6 +125,27 @@ mod tests {
         assert_eq!(est.count_text("héllo"), 1);
         // 4 emojis = 4 chars; 4/4.0 = 1.0 -> int(1.5) -> 1
         assert_eq!(est.count_text("🦀🦀🦀🦀"), 1);
+    }
+
+    #[test]
+    fn dense_scripts_priced_at_cjk_ratio() {
+        let est = EstimatingCounter::default(); // 4.0 for Latin
+                                                // Pure CJK: cjk=3, other=0 -> 0/4 + 3/1.5 + 0.5 = 2.5 -> int -> 2
+        assert_eq!(est.count_text("数据库"), 2);
+        // 7 CJK -> 7/1.5 + 0.5 = 5.16 -> 5 (the old flat 7/4 -> 2 under-counted ~2.5x)
+        assert_eq!(est.count_text("数据库连接失败"), 5);
+        // Kana is dense: 3 hiragana -> 3/1.5 + 0.5 = 2.5 -> 2
+        assert_eq!(est.count_text("ひらが"), 2);
+        // Full-width Latin is dense (U+FF00-FFEF): ＡＰＩ -> 2, vs plain "API" -> 1
+        assert_eq!(est.count_text("ＡＰＩ"), 2);
+        assert_eq!(est.count_text("API"), 1);
+    }
+
+    #[test]
+    fn mixed_ascii_and_cjk_prices_each_separately() {
+        let est = EstimatingCounter::default();
+        // "api数据": other=3, cjk=2 -> 3/4 + 2/1.5 + 0.5 = 0.75+1.33+0.5 = 2.58 -> 2
+        assert_eq!(est.count_text("api数据"), 2);
     }
 
     #[test]

@@ -1,0 +1,111 @@
+name: Release Metadata Sync
+
+# Keep generated version-carrying files in sync on release-please's branch.
+#
+# Why this exists
+# ---------------
+# release-please only rewrites `pyproject.toml` plus the `extra-files` listed in
+# `.release-please-config.json` (currently the TypeScript SDK and OpenClaw
+# package.json). Several other tracked files also carry the version, and
+# `server.json` is asserted byte-for-byte against `render_server_json()` — which
+# derives its version from `pyproject.toml`. So the moment release-please bumps
+# the version, `tests/test_mcp_registry/test_server_json.py::
+# test_root_server_json_matches_builder` fails on the release PR, and the release
+# cannot be merged. That is what blocked v0.33.0 (PR #2339).
+#
+# `release.yml` already runs `scripts/version-sync.py` before its own
+# `verify-versions.py` gate, so the release *build* self-heals in the workspace.
+# The regular CI test job does not, so the fix has to be committed.
+#
+# Why a workflow rather than more `extra-files` entries
+# ----------------------------------------------------
+# `scripts/version-sync.py` is the single place that knows every version-carrying
+# file. Restating that list as per-file jsonpaths would duplicate it, and a
+# jsonpath that silently fails to match produces exactly the failure we are trying
+# to remove. Running the script instead means files added to it in future are
+# covered with no change here.
+#
+# Why the push trigger
+# --------------------
+# release-please regenerates (force-pushes) its branch on every merge to main.
+# That is what repeatedly wiped the hand-pushed metadata fixes on #2339. Keying
+# off a push to the branch means the sync re-applies after every regeneration
+# instead of being lost.
+
+on:
+  push:
+    branches:
+      - "release-please--branches--**"
+
+permissions:
+  contents: write
+
+concurrency:
+  # Never cancel: a half-applied sync would leave the release PR inconsistent.
+  group: release-metadata-sync-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      # Prefer a short-lived, repo-scoped GitHub App installation token over a
+      # personal PAT. Gated on the repo variable so an unconfigured app simply
+      # falls through to the existing chain instead of breaking the release.
+      - name: Mint installation token
+        id: app-token
+        if: ${{ vars.RELEASE_APP_ID != '' }}
+        continue-on-error: true
+        uses: actions/create-github-app-token@v3
+        with:
+          app-id: ${{ vars.RELEASE_APP_ID }}
+          private-key: ${{ secrets.RELEASE_APP_PRIVATE_KEY }}
+
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ github.ref_name }}
+          # Do NOT persist the credential into .git/config. The next step runs
+          # scripts/version-sync.py *from the checked-out branch*, and this job
+          # triggers on a push to the unprotected glob release-please--branches--**.
+          # A persisted token would be readable by that script.
+          persist-credentials: false
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+
+      # version-sync.py is stdlib-only (json/re/tomllib), so no install step.
+      - name: Sync version-carrying files release-please does not bump
+        run: python scripts/version-sync.py
+
+      - name: Verify all versions agree
+        run: python scripts/verify-versions.py
+
+      - name: Commit and push if anything changed
+        env:
+          # An app installation token if one was minted, else the existing
+          # chain. A PAT (not GITHUB_TOKEN) is still preferred here for the same
+          # reason release-please.yml wants one: a push made with GITHUB_TOKEN
+          # does not trigger workflows, so the release PR's checks would never
+          # re-run against the synced commit and would stay red. Supplied only
+          # to this step, after the branch-supplied script has already run.
+          SYNC_TOKEN: ${{ steps.app-token.outputs.token || secrets.RELEASE_PLEASE_TOKEN || secrets.GITHUB_TOKEN }}
+        run: |
+          if git diff --quiet; then
+            echo "Already in sync — nothing to commit."
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git commit -m "chore: sync generated version metadata"
+          # Push via an explicit remote URL because the checkout no longer
+          # persists credentials. Passed on stdin-free env expansion so the
+          # token is not written to the command line or into .git/config.
+          # This push re-triggers this workflow. version-sync.py is idempotent, so
+          # the next run finds no diff and exits above without pushing — the loop
+          # terminates after one no-op run.
+          git push \
+            "https://x-access-token:${SYNC_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" \
+            HEAD:"${GITHUB_REF_NAME}"

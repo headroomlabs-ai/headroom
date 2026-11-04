@@ -17,6 +17,116 @@ def small_cache() -> CompressionCache:
     return CompressionCache(max_entries=3)
 
 
+class TestCompressionCacheRetention:
+    def test_stable_hashes_are_bounded(self) -> None:
+        cache = CompressionCache(max_entries=3)
+        hashes = [CompressionCache.content_hash(f"stable-{index}") for index in range(4)]
+
+        for content_hash in hashes:
+            cache.mark_stable(content_hash)
+
+        assert len(cache._stable_hashes) == 3
+        assert hashes[0] not in cache._stable_hashes
+        assert hashes[-1] in cache._stable_hashes
+
+    def test_first_seen_is_bounded(self) -> None:
+        cache = CompressionCache(max_entries=3)
+        hashes = [CompressionCache.content_hash(f"first-seen-{index}") for index in range(4)]
+
+        for content_hash in hashes:
+            cache.should_defer_compression(content_hash)
+
+        assert len(cache._first_seen) == 3
+        assert hashes[0] not in cache._first_seen
+        assert hashes[-1] in cache._first_seen
+
+    def test_expired_first_seen_starts_new_window(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        cache = CompressionCache(max_entries=3)
+        content_hash = CompressionCache.content_hash("repeated content")
+        timestamps = iter([1_000.0, 1_271.0, 1_272.0])
+
+        monkeypatch.setattr(
+            "headroom.cache.compression_cache.time.time",
+            lambda: next(timestamps),
+        )
+
+        assert (
+            cache.should_defer_compression(
+                content_hash,
+                ttl_seconds=300,
+                batch_window=30,
+            )
+            is False
+        )
+        assert (
+            cache.should_defer_compression(
+                content_hash,
+                ttl_seconds=300,
+                batch_window=30,
+            )
+            is False
+        )
+        assert cache._first_seen[content_hash] == 1_271.0
+        assert (
+            cache.should_defer_compression(
+                content_hash,
+                ttl_seconds=300,
+                batch_window=30,
+            )
+            is True
+        )
+
+    def test_evicted_stable_hash_does_not_extend_frozen_prefix(self) -> None:
+        cache = CompressionCache(max_entries=1)
+        old_content = "old stable tool output"
+        new_content = "new stable tool output"
+
+        cache.mark_stable(CompressionCache.content_hash(old_content))
+        cache.mark_stable(CompressionCache.content_hash(new_content))
+
+        messages = [
+            {"role": "user", "content": "start"},
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "tool_result",
+                        "tool_use_id": "tool-1",
+                        "content": old_content,
+                    }
+                ],
+            },
+            {"role": "user", "content": "follow up"},
+        ]
+
+        assert cache.compute_frozen_count(messages) == 1
+
+    def test_concurrent_bookkeeping_stays_bounded(self) -> None:
+        import threading
+
+        cache = CompressionCache(max_entries=50)
+        errors: list[Exception] = []
+
+        def worker(thread_id: int) -> None:
+            try:
+                for index in range(100):
+                    content_hash = CompressionCache.content_hash(f"thread-{thread_id}-{index}")
+                    cache.mark_stable(content_hash)
+                    cache.should_defer_compression(content_hash)
+            except Exception as exc:  # pragma: no cover
+                errors.append(exc)
+
+        threads = [threading.Thread(target=worker, args=(index,)) for index in range(8)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+
+        assert errors == []
+        assert len(cache._stable_hashes) <= cache.max_entries
+        assert len(cache._first_seen) <= cache.max_entries
+
+
 class TestCompressionCache:
     def test_cache_miss_returns_none(self, cache: CompressionCache) -> None:
         h = CompressionCache.content_hash("some content")
@@ -200,6 +310,60 @@ class TestCompressionCacheFrozenCount:
         # count = 3, then capped at len-1 = 2 (live-zone reservation).
         assert cache.compute_frozen_count(messages) == 2
 
+    @pytest.mark.parametrize(
+        "blocks",
+        [
+            [{"type": "tool_reference", "tool_name": "mcp__notes__search"}],
+            [
+                {
+                    "type": "image",
+                    "source": {"type": "base64", "media_type": "image/png", "data": "iVBO"},
+                }
+            ],
+            [],
+        ],
+        ids=["tool-reference", "image", "empty"],
+    )
+    def test_tool_result_without_text_does_not_stop_frozen(
+        self, cache: CompressionCache, blocks: list
+    ) -> None:
+        """Claude Code's ToolSearch answers with tool_reference blocks only. The
+        cache has nothing to replay for such a result; as a miss it stopped the
+        count at that message for the rest of the session."""
+        messages = [
+            {"role": "user", "content": "hello"},
+            {
+                "role": "user",
+                "content": [{"type": "tool_result", "tool_use_id": "t1", "content": blocks}],
+            },
+            {"role": "assistant", "content": "found it"},
+            {"role": "user", "content": "follow up"},
+        ]
+        assert cache.compute_frozen_count(messages) == 3
+
+    def test_text_beside_a_textless_tool_result_still_stops_frozen(
+        self, cache: CompressionCache
+    ) -> None:
+        """Parallel calls put several tool_results in one message, and the cache
+        keys it by the first. Text after a textless first result was never
+        stored, so it cannot be replayed."""
+        messages = [
+            {"role": "user", "content": "hello"},
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "tool_result",
+                        "tool_use_id": "t1",
+                        "content": [{"type": "tool_reference", "tool_name": "mcp__notes__search"}],
+                    },
+                    {"type": "tool_result", "tool_use_id": "t2", "content": "uncached output"},
+                ],
+            },
+            {"role": "user", "content": "follow up"},
+        ]
+        assert cache.compute_frozen_count(messages) == 1
+
     def test_update_from_result_identical_content_marks_stable(
         self, cache: CompressionCache
     ) -> None:
@@ -291,6 +455,53 @@ class TestCompressionCacheFrozenCount:
 
 
 class TestCompressionCacheApplyAndUpdate:
+    @pytest.mark.parametrize(
+        "metadata",
+        [{}, {"cache_control": {"type": "ephemeral", "ttl": "1h"}}, {"custom": {"nested": [1, 2]}}],
+    )
+    def test_openai_cached_text_block_preserves_shape_and_metadata(self, metadata: dict) -> None:
+        import copy
+
+        cache = CompressionCache()
+        original = "synthetic records " * 50
+        older = {"role": "tool", "tool_call_id": "old", "content": original}
+        cache.update_from_result([older], [{**older, "content": "short output"}])
+        message = {
+            "role": "tool",
+            "tool_call_id": "new",
+            "content": [{"type": "text", "text": original, **metadata}],
+        }
+        snapshot = copy.deepcopy(message)
+
+        result = cache.apply_cached([message])[0]
+
+        assert result == {**message, "content": [{**message["content"][0], "text": "short output"}]}
+        assert message == snapshot
+        assert result is not message
+        assert result["content"][0] is not message["content"][0]
+
+    @pytest.mark.parametrize(
+        "extra",
+        [
+            {"type": "text", "text": "second", "cache_control": {"type": "ephemeral"}},
+            {"type": "image_url", "image_url": {"url": "https://example.com/synthetic.png"}},
+            {"type": "unknown", "value": "keep me"},
+        ],
+    )
+    def test_openai_cached_multiblock_content_is_not_collapsed(self, extra: dict) -> None:
+        import copy
+
+        cache = CompressionCache()
+        blocks = [{"type": "text", "text": "first"}, extra]
+        text = "first\nsecond" if extra["type"] == "text" else "first"
+        cache.store_compressed(cache.content_hash(text), "short", tokens_saved=1)
+        message = {"role": "tool", "tool_call_id": "new", "content": blocks}
+        snapshot = copy.deepcopy(message)
+
+        assert cache.apply_cached([message]) == [snapshot]
+        assert message == snapshot
+        assert cache.get_stats()["hits"] == 0
+
     def test_apply_cached_swaps_tool_results(self, cache: CompressionCache) -> None:
         original_content = "big tool output"
         h = CompressionCache.content_hash(original_content)
@@ -687,3 +898,33 @@ def test_get_compression_cache_returns_same_instance_under_contention() -> None:
     first = results[0]
     for c in results[1:]:
         assert c is first, "Concurrent _get_compression_cache returned different instances"
+
+
+@pytest.mark.parametrize(
+    "content",
+    [
+        [{"type": "text", "text": "first"}, {"type": "text", "text": "second"}],
+        [
+            {"type": "image_url", "image_url": {"url": "data:image/png;base64,AA=="}},
+            {"type": "text", "text": "second"},
+        ],
+        [],
+        ["not a block"],
+        [{"type": "text"}],
+        [{"type": "text", "text": 42}],
+    ],
+)
+def test_shared_swap_and_cache_preserve_unsupported_openai_blocks(content):
+    from copy import deepcopy
+
+    from headroom.cache.compression_cache import _swap_tool_result_content
+
+    message = {"role": "tool", "content": content}
+    original = deepcopy(message)
+    assert _swap_tool_result_content(message, "short") == original
+    cache = CompressionCache()
+    cache.store_compressed(cache.content_hash("first\nsecond"), "short", tokens_saved=10)
+    before = cache.get_stats().copy()
+    assert cache.apply_cached([message]) == [original]
+    assert cache.get_stats() == before
+    assert message == original

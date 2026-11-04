@@ -11,6 +11,7 @@ bind still happens and transforms fall back to lazy loading.
 
 from __future__ import annotations
 
+import logging
 import threading
 import time
 
@@ -22,9 +23,20 @@ import headroom.proxy.server as server_mod
 from headroom.proxy.server import ProxyConfig, create_app
 
 
-def _make_proxy(*, optimize: bool):
+def _make_proxy(
+    *,
+    optimize: bool,
+    disable_kompress: bool = False,
+    disable_kompress_anthropic: bool | None = None,
+    disable_kompress_openai: bool | None = None,
+    compressors: set[str] | None = None,
+):
     config = ProxyConfig(
         optimize=optimize,
+        disable_kompress=disable_kompress,
+        disable_kompress_anthropic=disable_kompress_anthropic,
+        disable_kompress_openai=disable_kompress_openai,
+        compressors=compressors,
         cache_enabled=False,
         rate_limit_enabled=False,
         cost_tracking_enabled=False,
@@ -35,7 +47,14 @@ def _make_proxy(*, optimize: bool):
         image_optimize=False,
         subscription_tracking_enabled=False,
     )
-    return create_app(config).state.proxy
+    proxy = create_app(config).state.proxy
+    # Every test here substitutes fake pipelines to control exactly what the
+    # preload walks. The proxy also eagerly builds the default /v1/compress
+    # pipeline (a derived ContentRouter, warmed alongside the request
+    # pipelines), which would inject real transform statuses into those
+    # assertions — drop it so the fakes remain the only input.
+    proxy._compress_pipeline_cache = {}
+    return proxy
 
 
 class _FastTransform:
@@ -83,8 +102,15 @@ def test_eager_preload_dedupes_and_swallows_failures():
 
     eager_status, statuses = proxy._eager_preload_transforms()
 
-    assert eager_status == {"shared": "enabled", "kompress": "enabled"}
+    # Keys the preload contributes itself rather than collecting from a
+    # transform, so this assertion stays about dedupe/swallowing.
+    non_transform_keys = {"litellm"}
+    assert {k: v for k, v in eager_status.items() if k not in non_transform_keys} == {
+        "shared": "enabled",
+        "kompress": "enabled",
+    }
     assert statuses == [{"shared": "enabled"}, {"kompress": "enabled"}]
+    assert eager_status["litellm"] in {"ready", "not installed", "skipped"}
 
 
 async def test_startup_binds_despite_hung_preload(monkeypatch):
@@ -116,5 +142,144 @@ async def test_startup_merges_warmup_for_normal_transforms(monkeypatch):
         await proxy.startup()
         assert {"kompress": "enabled"} in captured
         assert proxy._kompress_status == "enabled"
+    finally:
+        await proxy.shutdown()
+
+
+async def test_startup_reports_deferred_kompress(caplog):
+    proxy = _make_proxy(optimize=True)
+    proxy.anthropic_pipeline = _FakePipeline([_FastTransform({"kompress": "deferred"})])
+    proxy.openai_pipeline = _FakePipeline([])
+
+    try:
+        # Attach caplog directly so unrelated propagation mutations cannot
+        # affect this assertion.
+        server_mod.logger.addHandler(caplog.handler)
+        try:
+            with caplog.at_level(logging.INFO, logger=server_mod.logger.name):
+                await proxy.startup()
+        finally:
+            server_mod.logger.removeHandler(caplog.handler)
+
+        assert proxy._kompress_status == "deferred"
+        assert "Kompress: DEFERRED (model loads on first request)" in caplog.messages
+        assert not any("Kompress: not installed" in message for message in caplog.messages)
+    finally:
+        await proxy.shutdown()
+
+
+@pytest.mark.parametrize("optimize", [True, False])
+async def test_startup_reports_disabled_kompress(caplog, monkeypatch, optimize):
+    proxy = _make_proxy(optimize=optimize, disable_kompress=True)
+    monkeypatch.setattr(proxy, "_eager_preload_transforms", lambda: ({}, []))
+
+    try:
+        server_mod.logger.addHandler(caplog.handler)
+        try:
+            with caplog.at_level(logging.INFO, logger=server_mod.logger.name):
+                await proxy.startup()
+        finally:
+            server_mod.logger.removeHandler(caplog.handler)
+
+        assert "Kompress: DISABLED" in caplog.messages
+        assert (
+            "Kompress: not installed (pip install headroom-ai[ml] for ML compression)"
+            not in caplog.messages
+        )
+    finally:
+        await proxy.shutdown()
+
+
+async def test_startup_keeps_not_installed_message_when_kompress_is_missing(caplog, monkeypatch):
+    proxy = _make_proxy(optimize=True)
+    monkeypatch.setattr(proxy, "_eager_preload_transforms", lambda: ({}, []))
+
+    try:
+        server_mod.logger.addHandler(caplog.handler)
+        try:
+            with caplog.at_level(logging.INFO, logger=server_mod.logger.name):
+                await proxy.startup()
+        finally:
+            server_mod.logger.removeHandler(caplog.handler)
+
+        assert (
+            "Kompress: not installed (pip install headroom-ai[ml] for ML compression)"
+            in caplog.messages
+        )
+    finally:
+        await proxy.shutdown()
+
+
+async def test_startup_keeps_missing_message_when_provider_override_enables_kompress(
+    caplog, monkeypatch
+):
+    proxy = _make_proxy(
+        optimize=True,
+        disable_kompress=True,
+        disable_kompress_anthropic=False,
+    )
+    monkeypatch.setattr(proxy, "_eager_preload_transforms", lambda: ({}, []))
+
+    try:
+        server_mod.logger.addHandler(caplog.handler)
+        try:
+            with caplog.at_level(logging.INFO, logger=server_mod.logger.name):
+                await proxy.startup()
+        finally:
+            server_mod.logger.removeHandler(caplog.handler)
+
+        assert "Kompress: DISABLED" not in caplog.messages
+        assert (
+            "Kompress: not installed (pip install headroom-ai[ml] for ML compression)"
+            in caplog.messages
+        )
+    finally:
+        await proxy.shutdown()
+
+
+async def test_startup_reports_disabled_when_both_providers_disable_kompress(caplog, monkeypatch):
+    proxy = _make_proxy(
+        optimize=True,
+        disable_kompress_anthropic=True,
+        disable_kompress_openai=True,
+    )
+    monkeypatch.setattr(proxy, "_eager_preload_transforms", lambda: ({}, []))
+
+    try:
+        server_mod.logger.addHandler(caplog.handler)
+        try:
+            with caplog.at_level(logging.INFO, logger=server_mod.logger.name):
+                await proxy.startup()
+        finally:
+            server_mod.logger.removeHandler(caplog.handler)
+
+        assert "Kompress: DISABLED" in caplog.messages
+        assert (
+            "Kompress: not installed (pip install headroom-ai[ml] for ML compression)"
+            not in caplog.messages
+        )
+    finally:
+        await proxy.shutdown()
+
+
+async def test_startup_reports_disabled_when_compressor_selection_omits_kompress(
+    caplog, monkeypatch
+):
+    proxy = _make_proxy(optimize=True, compressors={"smart_crusher"})
+    monkeypatch.setattr(proxy, "_eager_preload_transforms", lambda: ({}, []))
+
+    try:
+        server_mod.logger.addHandler(caplog.handler)
+        try:
+            with caplog.at_level(logging.INFO, logger=server_mod.logger.name):
+                await proxy.startup()
+        finally:
+            server_mod.logger.removeHandler(caplog.handler)
+
+        assert "Kompress: DISABLED" in caplog.messages
+        assert (
+            "Kompress: not installed (pip install headroom-ai[ml] for ML compression)"
+            not in caplog.messages
+        )
     finally:
         await proxy.shutdown()

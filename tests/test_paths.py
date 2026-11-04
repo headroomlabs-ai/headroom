@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import os
 from pathlib import Path
 
 import pytest
@@ -136,7 +135,6 @@ def test_per_resource_getters_no_mkdir(fake_home: Path) -> None:
     paths.proxy_log_path()
     paths.debug_400_dir()
     paths.bin_dir()
-    paths.rtk_path()
     paths.deploy_root()
     paths.beacon_lock_path(8787)
     paths.models_config_path()
@@ -320,18 +318,6 @@ def test_bin_dir_default(fake_home: Path) -> None:
     assert paths.bin_dir() == fake_home / ".headroom" / "bin"
 
 
-def test_rtk_path_suffix(fake_home: Path) -> None:
-    expected_name = "rtk.exe" if os.name == "nt" else "rtk"
-    assert paths.rtk_path().name == expected_name
-    assert paths.rtk_path().parent == paths.bin_dir()
-
-
-def test_lean_ctx_path_suffix(fake_home: Path) -> None:
-    expected_name = "lean-ctx.exe" if os.name == "nt" else "lean-ctx"
-    assert paths.lean_ctx_path().name == expected_name
-    assert paths.lean_ctx_path().parent == paths.bin_dir()
-
-
 def test_deploy_root_default(fake_home: Path) -> None:
     assert paths.deploy_root() == fake_home / ".headroom" / "deploy"
 
@@ -379,24 +365,6 @@ def test_proxy_log_path_follows_workspace_env(
     ws = tmp_path / "state"
     clean_env.setenv(paths.HEADROOM_WORKSPACE_DIR_ENV, str(ws))
     assert paths.proxy_log_path() == ws / "logs" / "proxy.log"
-
-
-def test_rtk_path_follows_workspace_env(
-    fake_home: Path, clean_env: pytest.MonkeyPatch, tmp_path: Path
-) -> None:
-    ws = tmp_path / "state"
-    clean_env.setenv(paths.HEADROOM_WORKSPACE_DIR_ENV, str(ws))
-    expected_name = "rtk.exe" if os.name == "nt" else "rtk"
-    assert paths.rtk_path() == ws / "bin" / expected_name
-
-
-def test_lean_ctx_path_follows_workspace_env(
-    fake_home: Path, clean_env: pytest.MonkeyPatch, tmp_path: Path
-) -> None:
-    ws = tmp_path / "state"
-    clean_env.setenv(paths.HEADROOM_WORKSPACE_DIR_ENV, str(ws))
-    expected_name = "lean-ctx.exe" if os.name == "nt" else "lean-ctx"
-    assert paths.lean_ctx_path() == ws / "bin" / expected_name
 
 
 def test_beacon_lock_path_follows_workspace_env(

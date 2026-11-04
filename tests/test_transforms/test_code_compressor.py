@@ -21,6 +21,7 @@ from headroom.transforms.code_compressor import (
     CodeCompressorConfig,
     CodeLanguage,
     DocstringMode,
+    coerce_language,
     detect_language,
     is_tree_sitter_available,
     is_tree_sitter_loaded,
@@ -2096,3 +2097,116 @@ class TestCSharpSupport:
         lang, confidence = detect_language(code)
         assert lang == CodeLanguage.CSHARP
         assert confidence > 0.0
+
+
+@pytest.mark.skipif(not TREE_SITTER_INSTALLED, reason="tree-sitter grammar pack not installed")
+class TestPhpSupport:
+    """PHP (``php`` grammar) parity with C#: signatures preserved verbatim,
+    function/method bodies compressed, ``<?php`` tag and ``namespace``/``use``
+    header order preserved, Perl sigil-overlap disambiguated in detection,
+    malformed input passed through.
+    """
+
+    def _compressor(self):
+        return CodeAwareCompressor(
+            CodeCompressorConfig(
+                min_tokens_for_compression=1,
+                max_body_lines=1,
+                enable_ccr=False,
+            )
+        )
+
+    def test_class_methods_compress_signatures_preserved(self):
+        code = (
+            "<?php\n"
+            "namespace App\\Service;\n"
+            "\n"
+            "use App\\Model\\User;\n"
+            "\n"
+            "final class UserService {\n"
+            "    private $logger;\n"
+            "\n"
+            "    public function process(User $u): bool {\n"
+            "        $name = strtolower(trim($u->getName()));\n"
+            "        $tags = [];\n"
+            "        foreach ($u->getTags() as $tag) {\n"
+            "            $tags[] = $tag->normalize();\n"
+            "        }\n"
+            "        $this->logger->info($name);\n"
+            "        return true;\n"
+            "    }\n"
+            "}\n"
+        )
+        result = self._compressor().compress(code, language="php")
+
+        assert result.language == CodeLanguage.PHP
+        assert result.syntax_valid is True
+        assert result.compression_ratio < 1.0
+        # signature + class header preserved verbatim
+        assert "final class UserService" in result.compressed
+        assert "public function process(User $u): bool" in result.compressed
+        # method body actually compressed
+        assert "lines omitted" in result.compressed
+        assert "$tag->normalize()" not in result.compressed
+        # the class is emitted exactly once
+        assert result.compressed.count("class UserService") == 1
+
+    def test_php_tag_and_namespace_precede_uses_and_types(self):
+        """``<?php`` must stay first and ``namespace X;`` must precede the
+        ``use`` imports and type declarations — any other order is not valid
+        PHP."""
+        code = (
+            "<?php\n"
+            "namespace App\\Tools;\n"
+            "\n"
+            "use App\\Model\\Item;\n"
+            "\n"
+            "function helper(int $x): int {\n"
+            "    $acc = 0;\n"
+            "    for ($i = 0; $i < $x; $i++) {\n"
+            "        $acc += $i;\n"
+            "        $acc -= 1;\n"
+            "    }\n"
+            "    return $acc;\n"
+            "}\n"
+        )
+        result = self._compressor().compress(code, language="php")
+
+        assert result.language == CodeLanguage.PHP
+        assert result.syntax_valid is True
+        assert result.compression_ratio < 1.0
+        compressed = result.compressed
+        assert compressed.lstrip().startswith("<?php")
+        assert compressed.index("<?php") < compressed.index("namespace App\\Tools;")
+        assert compressed.index("namespace App\\Tools;") < compressed.index("use App\\Model\\Item;")
+        assert compressed.index("use App\\Model\\Item;") < compressed.index("function helper")
+        assert "lines omitted" in compressed
+
+    def test_detect_language_identifies_php(self):
+        """Auto-detection recognizes PHP despite the Perl sigil overlap
+        (``$var`` matches Perl's prefilter; the ``<?php`` tag disambiguates)."""
+        code = (
+            "<?php\n"
+            "namespace Acme;\n"
+            "\n"
+            "use Acme\\Widget;\n"
+            "\n"
+            "class Svc {\n"
+            "    public function add(int $a, int $b): int {\n"
+            "        $sum = $a + $b;\n"
+            "        return $sum;\n"
+            "    }\n"
+            "}\n"
+        )
+        lang, confidence = detect_language(code)
+        assert lang == CodeLanguage.PHP
+        assert confidence > 0.0
+
+    def test_phtml_alias_coerces_to_php(self):
+        assert coerce_language("phtml") == CodeLanguage.PHP
+        assert coerce_language("php8") == CodeLanguage.PHP
+
+    def test_malformed_php_passes_through_unchanged(self):
+        code = "<?php\nclass Broken {\n    public function oops( {\n"
+        result = self._compressor().compress(code, language="php")
+        assert result.compressed == code

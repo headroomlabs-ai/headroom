@@ -267,6 +267,64 @@ def test_update_externally_managed_refuses_via_command(monkeypatch):
     assert "PEP 668" in res.output
 
 
+def test_venv_inside_bare_dockerenv_still_self_updates(monkeypatch):
+    """A venv/pip install inside a container (bare /.dockerenv, no explicit
+    HEADROOM_IN_DOCKER) must self-update, not be refused with image guidance (#2816).
+    """
+    monkeypatch.setattr(up, "_is_source_checkout", lambda: False)
+    monkeypatch.setattr(up, "_is_editable_install", lambda: False)
+    monkeypatch.delenv("HEADROOM_IN_DOCKER", raising=False)
+    # Deterministic, pipx/uv-free venv layout (mirrors the issue's environment).
+    monkeypatch.setenv("PIPX_HOME", "")
+    monkeypatch.setenv("UV_TOOL_DIR", "")
+    monkeypatch.setattr(up.sys, "executable", "/config/.headroom-venv/bin/python")
+    monkeypatch.setattr(up.sys, "prefix", "/config/.headroom-venv")
+    monkeypatch.setattr(
+        up, "_package_location", lambda: "/config/.headroom-venv/lib/python3.12/headroom"
+    )
+    # The container is real (/.dockerenv), but a venv owns the install.
+    monkeypatch.setattr(up, "_in_docker", lambda: True)
+    monkeypatch.setattr(up, "_in_virtualenv", lambda: True)
+
+    method = up.detect_install_method()
+    assert method.kind == "pip"
+    assert method.can_self_update is True
+    assert method.argv[:4] == [up.sys.executable, "-m", "pip", "install"]
+
+
+def test_explicit_headroom_in_docker_still_refuses_over_venv(monkeypatch):
+    """The official image's explicit HEADROOM_IN_DOCKER opt-out wins up front,
+    even when a venv owns the install."""
+    monkeypatch.setattr(up, "_is_source_checkout", lambda: False)
+    monkeypatch.setattr(up, "_is_editable_install", lambda: False)
+    monkeypatch.setenv("HEADROOM_IN_DOCKER", "1")
+    monkeypatch.setattr(up, "_in_virtualenv", lambda: True)
+
+    method = up.detect_install_method()
+    assert method.kind == "docker"
+    assert method.can_self_update is False
+
+
+def test_bare_dockerenv_without_owner_refuses(monkeypatch):
+    """A container whose system interpreter owns the install (bare /.dockerenv, no
+    venv/pipx/uv/user-site) still refuses with the pull-a-new-image guidance."""
+    monkeypatch.setattr(up, "_is_source_checkout", lambda: False)
+    monkeypatch.setattr(up, "_is_editable_install", lambda: False)
+    monkeypatch.delenv("HEADROOM_IN_DOCKER", raising=False)
+    monkeypatch.setenv("PIPX_HOME", "")
+    monkeypatch.setenv("UV_TOOL_DIR", "")
+    monkeypatch.setattr(up.sys, "executable", "/usr/bin/python3")
+    monkeypatch.setattr(up.sys, "prefix", "/usr")
+    monkeypatch.setattr(up, "_package_location", lambda: "/usr/lib/python3.12/headroom")
+    monkeypatch.setattr(up, "_in_docker", lambda: True)
+    monkeypatch.setattr(up, "_in_virtualenv", lambda: False)
+    monkeypatch.setattr(up, "_is_user_site_install", lambda loc: False)
+
+    method = up.detect_install_method()
+    assert method.kind == "docker"
+    assert method.can_self_update is False
+
+
 # --------------------------------------------------------------------------- #
 # update_check helpers / branches
 # --------------------------------------------------------------------------- #

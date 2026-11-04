@@ -162,6 +162,28 @@ def should_stamp_codex_client(path: str, headers: Mapping[str, Any] | Any) -> bo
     return should_stamp_codex_client_signals(path, _auth_signals(headers))
 
 
+# Client harnesses that can consume Headroom's mid-turn message-coalescing
+# protocol: the 202 ``headroom_queued`` reply and the synthetic
+# ``headroom_pending_messages`` SSE event. This is a custom protocol only Claude
+# Code parses today; other harnesses would receive events they can't decode, so
+# a concurrent same-session request from them must stream normally instead of
+# being queued and replayed. Keeping the capability in one named place — rather
+# than scattering ``client == "claude-code"`` string checks across the request
+# handlers — makes it a single, documented decision to revisit as more clients
+# learn the protocol (#1608).
+_COALESCING_CAPABLE_CLIENTS = frozenset({"claude-code"})
+
+
+def supports_mid_turn_coalescing(client: str | None) -> bool:
+    """Whether ``client`` can consume the mid-turn coalescing protocol.
+
+    ``client`` is a value returned by :func:`classify_client`. See
+    :data:`_COALESCING_CAPABLE_CLIENTS` for why the set is currently limited to
+    Claude Code.
+    """
+    return client in _COALESCING_CAPABLE_CLIENTS
+
+
 __all__ = [
     "AuthMode",
     "CLIENT_UA_MAP",
@@ -170,4 +192,5 @@ __all__ = [
     "classify_auth_mode",
     "classify_client",
     "should_stamp_codex_client",
+    "supports_mid_turn_coalescing",
 ]

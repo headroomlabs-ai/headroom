@@ -254,6 +254,30 @@ class TestShouldSkipCompression:
         skip_reason = hook._should_skip_compression(result)
         assert skip_reason is None
 
+    @pytest.mark.parametrize(
+        "tool_name",
+        ["mcp__Headroom__headroom_retrieve", "mcp_Headroom_headroom_retrieve"],
+    )
+    def test_skip_qualified_ccr_retrieval_results(self, tool_name):
+        """Qualified CCR retrieval names use the shared exclusion authority."""
+        from headroom.integrations.strands import HeadroomHookProvider
+
+        hook = HeadroomHookProvider()
+        result = {"content": [{"text": "retrieved content"}]}
+
+        assert hook._should_skip_compression(result, tool_name) == "tool_excluded"
+
+    def test_near_match_ccr_tool_name_is_not_excluded(self):
+        """A similar qualified name remains eligible for compression."""
+        from headroom.integrations.strands import HeadroomHookProvider
+
+        hook = HeadroomHookProvider()
+        result = {"content": [{"text": "retrieved content"}]}
+
+        assert (
+            hook._should_skip_compression(result, "mcp__Headroom__headroom_retrieve_extra") is None
+        )
+
 
 class TestCompressToolResult:
     """Tests for _compress_tool_result hook handler."""
@@ -322,6 +346,24 @@ class TestCompressToolResult:
         metrics = hook.metrics_history[0]
         assert metrics.was_compressed is False
         assert metrics.skip_reason == "compression_disabled"
+
+    def test_qualified_ccr_retrieval_result_is_preserved(self):
+        """The production hook skips qualified CCR retrieval results."""
+        from headroom.integrations.strands import HeadroomHookProvider
+
+        hook = HeadroomHookProvider(min_tokens_to_compress=1)
+        original = json.dumps([{"id": i, "data": "x" * 50} for i in range(50)])
+        mock_event = MagicMock()
+        mock_event.tool_use = {
+            "name": "mcp__Headroom__headroom_retrieve",
+            "toolUseId": "tool-ccr",
+        }
+        mock_event.result = {"content": [{"text": original}]}
+
+        hook._compress_tool_result(mock_event)
+
+        assert mock_event.result["content"][0]["text"] == original
+        assert hook.metrics_history[-1].skip_reason == "tool_excluded"
 
 
 class TestMetricsTracking:

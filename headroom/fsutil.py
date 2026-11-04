@@ -22,6 +22,8 @@ from __future__ import annotations
 
 import locale
 import os
+import shutil
+import tempfile
 from pathlib import Path
 
 # Sentinel so ``default=None`` can be a real return value if a caller wants it.
@@ -65,14 +67,47 @@ def read_text(path: str | os.PathLike[str], *, default: object = _RAISE) -> str:
 
 
 def write_text(path: str | os.PathLike[str], content: str) -> None:
-    """Write text as UTF-8 without translating line endings.
+    """Write text as UTF-8 without translating line endings, atomically.
 
     ``newline=""`` disables the platform ``\\n`` → ``\\r\\n`` rewrite, so the
     bytes written match ``content`` exactly and existing ``\\r\\n`` endings are
     never doubled.
+
+    The write goes to a temp file in the same directory, is fsynced, then moved
+    into place with :func:`os.replace` (atomic on POSIX and Windows). Opening a
+    config file ``"w"`` truncates it to zero bytes *before* the new content is
+    written, so a crash, SIGKILL, OOM or ENOSPC mid-write left the user with a
+    half-written ``~/.claude.json`` / ``settings.local.json``. Callers now see
+    either the old file or the complete new one.
+
+    A symlink is followed rather than replaced (dotfile managers symlink these
+    configs), and an existing file's mode is preserved — ``mkstemp`` creates
+    0600, which would otherwise silently tighten a 0644 config.
+
+    Known tradeoff: this needs a writable *parent directory*, whereas an in-place
+    truncate only needed a writable *file*, so a read-only directory holding a
+    writable config now raises ``PermissionError``. That is deliberate — there is
+    no in-place fallback, because falling back on ``OSError`` would turn the
+    ENOSPC case into "file truncated, rewrite failed", the exact data loss this
+    function exists to prevent. A ``PermissionError`` naming the directory is
+    both rarer and actionable.
     """
-    with Path(path).open("w", encoding="utf-8", newline="") as f:
-        f.write(content)
+    target = Path(path)
+    if target.is_symlink():
+        target = Path(os.path.realpath(target))
+    fd, tmp_name = tempfile.mkstemp(dir=target.parent, prefix=f".{target.name}.", suffix=".tmp")
+    tmp_path = Path(tmp_name)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8", newline="") as f:
+            f.write(content)
+            f.flush()
+            os.fsync(f.fileno())
+        if target.exists():
+            shutil.copymode(target, tmp_path)
+        os.replace(tmp_path, target)
+    except BaseException:
+        tmp_path.unlink(missing_ok=True)
+        raise
 
 
 def append_text(path: str | os.PathLike[str], content: str) -> None:

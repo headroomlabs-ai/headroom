@@ -107,6 +107,18 @@ class TestSmallArrays:
         items = _make_unique_items(8)
         assert compute_optimal_k(items) == 8
 
+    def test_small_array_respects_max_k(self):
+        """A small array (n <= 8) must still honor a tight ``max_k`` cap.
+
+        ``max_k`` is documented as "never return more than this"; the fast path
+        used to return the raw ``n`` and blow past a small cap.
+        """
+        items = _make_unique_items(8)
+        assert compute_optimal_k(items, max_k=5) == 5
+        assert compute_optimal_k(items, max_k=3) == 3
+        # A cap >= n leaves the array unchanged.
+        assert compute_optimal_k(items, max_k=20) == 8
+
 
 class TestNearTotalRedundancy:
     def test_identical_items_returns_min(self):

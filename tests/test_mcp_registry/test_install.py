@@ -89,8 +89,9 @@ def test_build_serena_spec_uses_agent_context() -> None:
     assert spec.name == "serena"
     assert spec.command == "uvx"
     assert spec.args == (
+        # PyPI package with prebuilt wheels, not the git source (#2871).
         "--from",
-        "git+https://github.com/oraios/serena",
+        "serena-agent",
         "serena",
         "start-mcp-server",
         "--project-from-cwd",
@@ -100,6 +101,15 @@ def test_build_serena_spec_uses_agent_context() -> None:
         "False",
     )
     assert spec.env == {}
+
+
+def test_build_serena_spec_uses_pypi_not_git_source() -> None:
+    """Serena is installed from the PyPI package (prebuilt wheels), not the git
+    source, which forces a from-source build that fails under proot-based
+    filesystems where uv cannot hardlink into a build venv (#2871)."""
+    spec = build_serena_spec("codex")
+    assert "serena-agent" in spec.args
+    assert not any("git+" in arg for arg in spec.args)
 
 
 def test_build_serena_spec_disables_dashboard_popup_by_default() -> None:

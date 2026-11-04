@@ -76,12 +76,58 @@ def _extract_tool_result_content(msg: dict) -> str | None:
     return None
 
 
+def _can_swap_tool_result_content(msg: dict) -> bool:
+    """Whether replacing extracted text preserves the OpenAI content shape.
+
+    A joined replacement cannot be mapped back to multiple blocks without
+    losing boundaries, metadata or media. All rewrite callers must check this
+    before extraction, transformation or savings accounting. Anthropic's
+    existing tool-result rewrite contract is unchanged.
+    """
+    if msg.get("role") != "tool":
+        return True
+    content = msg.get("content")
+    if isinstance(content, str):
+        return True
+    return (
+        isinstance(content, list)
+        and len(content) == 1
+        and isinstance(content[0], dict)
+        and content[0].get("type") == "text"
+        and isinstance(content[0].get("text"), str)
+    )
+
+
+def _carries_tool_result_text(msg: dict) -> bool:
+    """Whether any tool result in ``msg`` holds text (both formats)."""
+    if msg.get("role") == "tool":
+        results = [msg.get("content")]
+    else:
+        results = [
+            b.get("content")
+            for b in msg.get("content") or []
+            if isinstance(b, dict) and b.get("type") == "tool_result"
+        ]
+    return any(
+        isinstance(c, str) or (isinstance(c, list) and _extract_text_from_blocks(c) is not None)
+        for c in results
+    )
+
+
 def _swap_tool_result_content(msg: dict, new_content: str) -> dict:
-    """Deep copy msg and replace tool result content with new_content."""
+    """Deep copy and rewrite supported content; preserve unsupported layouts."""
     new_msg = copy.deepcopy(msg)
+    if not _can_swap_tool_result_content(msg):
+        return new_msg
     # OpenAI format
     if new_msg.get("role") == "tool":
-        new_msg["content"] = new_content
+        content = new_msg.get("content")
+        if isinstance(content, list):
+            # The shared guard permits only an unambiguous single text block.
+            # Keep its shape and metadata, including gateway cache breakpoints.
+            content[0]["text"] = new_content
+        else:
+            new_msg["content"] = new_content
         return new_msg
     # Anthropic format
     content = new_msg.get("content")
@@ -123,6 +169,12 @@ class CompressionCache:
         # `RLock` (not `Lock`) so future code can call locked methods from
         # inside another locked method without self-deadlock.
         self._lock = threading.RLock()
+        # Serializes one sidecar-mode compress turn per session (pre-work,
+        # pipeline, post-work run as one block on an executor thread). The
+        # sidecar contract is sequential turns per conversation; this lock
+        # keeps a contract-violating concurrent pair from interleaving and
+        # tearing the tracker's prev-original/prev-returned snapshots.
+        self.session_turn_lock = threading.Lock()
         self._cache: OrderedDict[str, _CacheEntry] = OrderedDict()
         # `_stable_hashes` is CONTENT-KEYED, not positional. It records "we
         # have seen this content before and it is known not to compress
@@ -135,8 +187,10 @@ class CompressionCache:
         # `compute_frozen_count` (bounded above by the `min` clamp at
         # `proxy/handlers/anthropic.py`) and `update_from_result`'s
         # "unchanged content" tracking.
-        self._stable_hashes: set[str] = set()
-        self._first_seen: dict[str, float] = {}
+        # Ordered mappings preserve set/dict-style membership while allowing
+        # deterministic oldest-first eviction.
+        self._stable_hashes: OrderedDict[str, None] = OrderedDict()
+        self._first_seen: OrderedDict[str, float] = OrderedDict()
         self._hits: int = 0
         self._misses: int = 0
         self._total_tokens_saved: int = 0
@@ -172,6 +226,34 @@ class CompressionCache:
                 _, evicted = self._cache.popitem(last=False)
                 self._total_tokens_saved -= evicted.tokens_saved
 
+    def _mark_stable_locked(self, content_hash: str) -> None:
+        """Record a stable hash while bounding retained bookkeeping."""
+        self._stable_hashes[content_hash] = None
+        self._stable_hashes.move_to_end(content_hash)
+
+        while len(self._stable_hashes) > self.max_entries:
+            self._stable_hashes.popitem(last=False)
+
+    def _record_first_seen_locked(self, content_hash: str, seen_at: float) -> None:
+        """Record a first-seen timestamp while bounding retained bookkeeping."""
+        self._first_seen[content_hash] = seen_at
+        self._first_seen.move_to_end(content_hash)
+
+        while len(self._first_seen) > self.max_entries:
+            self._first_seen.popitem(last=False)
+
+    def _prune_expired_first_seen_locked(
+        self,
+        now: float,
+        ttl_seconds: float,
+    ) -> None:
+        """Remove first-seen entries whose cache timing window has expired."""
+        while self._first_seen:
+            _, oldest_seen_at = next(iter(self._first_seen.items()))
+            if now - oldest_seen_at < ttl_seconds:
+                break
+            self._first_seen.popitem(last=False)
+
     def mark_stable(self, content_hash: str) -> None:
         """Mark a content hash as stable (unchanged, not compressed).
 
@@ -180,7 +262,7 @@ class CompressionCache:
         even though no compressed version exists in the cache.
         """
         with self._lock:
-            self._stable_hashes.add(content_hash)
+            self._mark_stable_locked(content_hash)
 
     def mark_stable_from_messages(self, messages: list[dict], up_to: int) -> None:
         """Mark all tool_result hashes in messages[:up_to] as stable."""
@@ -189,7 +271,7 @@ class CompressionCache:
                 if _is_tool_result_message(msg):
                     content = _extract_tool_result_content(msg)
                     if content is not None:
-                        self._stable_hashes.add(self.content_hash(content))
+                        self._mark_stable_locked(self.content_hash(content))
 
     def should_defer_compression(
         self,
@@ -216,13 +298,18 @@ class CompressionCache:
         """
         with self._lock:
             now = time.time()
+            self._prune_expired_first_seen_locked(now, ttl_seconds)
+
             first_seen = self._first_seen.get(content_hash)
             if first_seen is None:
-                self._first_seen[content_hash] = now
+                self._record_first_seen_locked(content_hash, now)
                 return False  # First time — compress now (no cache entry to preserve)
+
             age = now - first_seen
             if age >= ttl_seconds - batch_window:
+                self._record_first_seen_locked(content_hash, now)
                 return False  # Near TTL boundary — compress now (batch window)
+
             return True  # Seen recently within TTL — defer to preserve cache
 
     def get_stats(self) -> dict:
@@ -253,9 +340,10 @@ class CompressionCache:
         """Count consecutive stable messages from the start.
 
         A message is stable if it is a plain user/assistant/system message,
-        an assistant message with tool_use blocks, or a tool_result whose
-        content hash is already in the cache. The first unstable tool_result
-        (cache miss) stops the count.
+        an assistant message with tool_use blocks, an Anthropic tool_result with no text
+        (nothing to replay), or a tool_result whose cached text and shape can
+        be replayed. A cache miss or unsupported text shape stops the count.
+        A joined text hash alone does not prove shape-safe replay.
 
         The trailing message is *always* excluded from the frozen prefix
         (cap of ``len(messages) - 1``). The trailing message represents
@@ -273,14 +361,25 @@ class CompressionCache:
             count = 0
             for msg in messages:
                 if _is_tool_result_message(msg):
+                    # A joined-text cache/stable hash cannot prove replay for
+                    # shapes that apply_cached deliberately leaves untouched.
+                    # Anthropic textless results retain their no-rewrite path.
+                    if not _can_swap_tool_result_content(msg):
+                        break
                     content = _extract_tool_result_content(msg)
                     if content is not None:
                         h = self.content_hash(content)
                         if h not in self._cache and h not in self._stable_hashes:
                             break
-                    else:
-                        # tool_result with non-string content; treat as unstable
+                    elif _carries_tool_result_text(msg):
+                        # Text after a textless first tool_result: the cache
+                        # keys a message by its first one, so this text was
+                        # never stored and cannot be byte-replayed.
                         break
+                    # A tool_result with no text at all (a ToolSearch
+                    # tool_reference list, an image) gives the cache nothing
+                    # to replay, so it is stable. As a miss it stopped the
+                    # count for the rest of the session.
                 # Regular user/assistant/system messages and assistant+tool_use
                 # are always stable — fall through.
                 count += 1
@@ -300,6 +399,9 @@ class CompressionCache:
         with self._lock:
             result: list[dict] = []
             for msg in messages:
+                if not _can_swap_tool_result_content(msg):
+                    result.append(msg)
+                    continue
                 if _is_tool_result_message(msg):
                     content = _extract_tool_result_content(msg)
                     if content is not None:
@@ -335,7 +437,7 @@ class CompressionCache:
                     continue
                 if orig_content == comp_content:
                     # Content unchanged — mark as stable for frozen count walk
-                    self._stable_hashes.add(self.content_hash(orig_content))
+                    self._mark_stable_locked(self.content_hash(orig_content))
                     continue
                 h = self.content_hash(orig_content)
                 tokens_saved = len(orig_content) // 4 - len(comp_content) // 4

@@ -283,10 +283,10 @@ pub fn record_response_status(status: &str, reason: Option<&str>, request_id: &s
 // Phase G PR-G3 remediation (C3 + C4): the image-redacted counter
 // and the wrap_rtk_invocations counter were originally registered
 // here but neither had a production emit site that crossed the
-// Python/Rust boundary. Both have moved Python-side
-// (`headroom.proxy.request_logger::redactions_total` and
-// `headroom.cli.wrap_rtk_metrics::rtk_invocation_counts`) and the
-// Python proxy's `/metrics` exporter surfaces them — see
+// Python/Rust boundary. The image-redacted counter moved Python-side
+// (`headroom.proxy.request_logger::redactions_total`) and the Python
+// proxy's `/metrics` exporter surfaces it; the RTK counter is gone
+// entirely along with the rtk integration itself — see
 // `docs/observability.md` for the placement decision. Keeping a
 // dead Rust counter would (a) violate the "no dead metrics
 // registered" review finding and (b) mislead Phase H canary

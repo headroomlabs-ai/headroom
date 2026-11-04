@@ -105,6 +105,24 @@ class TestProjectDiscovery:
         assert len(projects) == 1
         assert projects[0].data_path == chats_dir
 
+    def test_detects_project_path_from_jsonl_cwd(self, tmp_path):
+        # A JSONL session must not be read with a whole-file json.load (which
+        # raises on the 2nd line and silently fell back to cwd). The project
+        # cwd carried in the session_metadata line must be recovered.
+        gemini_dir, chats_dir = _setup_gemini_dir(tmp_path)
+        project = tmp_path / "myproject"
+        project.mkdir()
+        session_path = _write_jsonl_session(
+            chats_dir,
+            [
+                {"type": "session_metadata", "id": "s1", "cwd": str(project)},
+                {"type": "user", "parts": [{"text": "hi"}]},
+            ],
+        )
+
+        scanner = GeminiScanner(gemini_dir=gemini_dir)
+        assert scanner._detect_project_path(session_path) == project
+
 
 # =============================================================================
 # JSON Session Parsing
@@ -154,6 +172,30 @@ class TestJsonSessionParsing:
         assert tc.name == "Read"  # Normalized from read_file
         assert tc.output == "port: 8080\nhost: localhost"
         assert not tc.is_error
+
+    def test_token_counts_not_double_counted(self, tmp_path):
+        # promptTokenCount is the full input (cachedContentTokenCount is a subset
+        # of it) and totalTokenCount == prompt + candidates, so the input must be
+        # promptTokenCount and the output candidatesTokenCount, each once.
+        gemini_dir, _ = _setup_gemini_dir(tmp_path)
+        scanner = GeminiScanner(gemini_dir=gemini_dir)
+        messages = [
+            {
+                "role": "model",
+                "parts": [{"text": "ok"}],
+                "usageMetadata": {
+                    "promptTokenCount": 1000,
+                    "cachedContentTokenCount": 300,
+                    "candidatesTokenCount": 500,
+                    "totalTokenCount": 1500,
+                },
+            },
+        ]
+
+        session = scanner._parse_messages("s1", messages)
+
+        assert session.total_input_tokens == 1000
+        assert session.total_output_tokens == 500
 
     def test_multiple_tool_calls(self, tmp_path):
         gemini_dir, chats_dir = _setup_gemini_dir(tmp_path)

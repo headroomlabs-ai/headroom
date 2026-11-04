@@ -28,8 +28,9 @@ class FileSystemTOINBackend:
         path: Path to the JSON storage file.
     """
 
-    def __init__(self, path: str) -> None:
+    def __init__(self, path: str, *, max_load_bytes: int | None = None) -> None:
         self._path = Path(path)
+        self._max_load_bytes = max_load_bytes
 
     def load(self) -> dict[str, Any]:
         """Load TOIN data from the JSON file.
@@ -41,6 +42,17 @@ class FileSystemTOINBackend:
             return {}
 
         try:
+            if (
+                self._max_load_bytes is not None
+                and self._path.stat().st_size > self._max_load_bytes
+            ):
+                logger.warning(
+                    "TOIN data file %s exceeds the configured load limit (%d bytes); "
+                    "ignoring it until the store is rebuilt",
+                    self._path,
+                    self._max_load_bytes,
+                )
+                return {}
             with open(self._path) as f:
                 data: dict[str, Any] = json.load(f)
                 return data
@@ -60,12 +72,13 @@ class FileSystemTOINBackend:
         try:
             self._path.parent.mkdir(parents=True, exist_ok=True)
 
-            json_data = json.dumps(data, indent=2)
-
             fd, tmp_path = tempfile.mkstemp(dir=self._path.parent, prefix=".toin_", suffix=".tmp")
             try:
+                # Stream compact JSON directly to the temp file. Building a
+                # second multi-gigabyte string was the primary autosave RSS
+                # spike reported in #2886.
                 with open(fd, "w") as f:
-                    f.write(json_data)
+                    json.dump(data, f, separators=(",", ":"))
                 Path(tmp_path).replace(self._path)
             except Exception:
                 try:

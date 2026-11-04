@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import secrets
 import shutil
 import signal
 import stat
@@ -21,7 +22,6 @@ import httpx
 REPO_ROOT = Path("/workspace")
 PLUGIN_DIR = REPO_ROOT / "plugins" / "openclaw"
 SDK_DIR = REPO_ROOT / "sdk" / "typescript"
-RTK_MARKER = "<!-- headroom:rtk-instructions -->"
 PROXY_PORT = 28887
 CODEX_PORT = 28888
 AIDER_PORT = 28889
@@ -36,6 +36,10 @@ CONTINUE_PORT = 28893
 GOOSE_PORT = 28894
 OPENHANDS_PORT = 28895
 OPENCODE_PORT = 28896
+CLAUDE_PORT = 28897
+VSCODE_PORT = 28898
+VSCODE_CLAUDE_PORT = 28899
+MOCK_UPSTREAM_PORT = 19001
 
 
 def log(message: str) -> None:
@@ -117,6 +121,13 @@ class MockOpenAIHandler(BaseHTTPRequestHandler):
 
     def do_GET(self) -> None:  # noqa: N802
         self._record()
+        if self.path == "/copilot_internal/user":
+            port = self.server.server_address[1]
+            self._write_json(
+                200,
+                {"endpoints": {"api": f"http://127.0.0.1:{port}/v1"}},
+            )
+            return
         if self.path == "/v1/models":
             self._write_json(
                 200,
@@ -162,6 +173,38 @@ class MockOpenAIHandler(BaseHTTPRequestHandler):
                         "completion_tokens": 5,
                         "total_tokens": 17,
                     },
+                },
+            )
+            return
+        if self.path in {"/responses", "/v1/responses"}:
+            self._write_json(
+                200,
+                {
+                    "id": "resp-e2e",
+                    "object": "response",
+                    "model": payload.get("model"),
+                    "output": [
+                        {
+                            "type": "message",
+                            "role": "assistant",
+                            "content": [{"type": "output_text", "text": "mock response"}],
+                        }
+                    ],
+                    "usage": {"input_tokens": 4, "output_tokens": 2, "total_tokens": 6},
+                },
+            )
+            return
+        if self.path == "/v1/messages":
+            self._write_json(
+                200,
+                {
+                    "id": "msg_e2e",
+                    "type": "message",
+                    "role": "assistant",
+                    "model": payload.get("model", "claude-sonnet-4-6"),
+                    "content": [{"type": "text", "text": "mock Claude response"}],
+                    "stop_reason": "end_turn",
+                    "usage": {"input_tokens": 12, "output_tokens": 4},
                 },
             )
             return
@@ -368,25 +411,10 @@ def create_shims(shim_dir: Path) -> None:
         raise SystemExit(0)
         """
     )
-    rtk_shim = textwrap.dedent(
-        """\
-        #!/usr/bin/env python3
-        from __future__ import annotations
-
-        import sys
-
-        if "--version" in sys.argv:
-            print("rtk e2e-shim")
-        else:
-            print("rtk shim")
-        raise SystemExit(0)
-        """
-    )
     write_executable(shim_dir / "claude", generic_shim)
     write_executable(shim_dir / "codex", codex_shim)
     write_executable(shim_dir / "aider", generic_shim)
     write_executable(shim_dir / "opencode", generic_shim)
-    write_executable(shim_dir / "rtk", rtk_shim)
 
 
 def start_mock_server(port: int) -> tuple[MockOpenAIServer, threading.Thread]:
@@ -467,7 +495,9 @@ def wait_for_command_success(
 def start_openclaw_gateway(env: dict[str, str], cwd: Path) -> subprocess.Popen[str]:
     log("Starting OpenClaw gateway for e2e verification")
     return subprocess.Popen(
-        ["openclaw", "gateway"],
+        # Container defaults now bind to all interfaces; this isolated harness
+        # only needs local clients and must not expose an unauthenticated port.
+        ["openclaw", "gateway", "--bind", "loopback"],
         env=env,
         cwd=str(cwd),
         stdout=subprocess.PIPE,
@@ -478,17 +508,15 @@ def start_openclaw_gateway(env: dict[str, str], cwd: Path) -> subprocess.Popen[s
     )
 
 
-def stop_openclaw_gateway(env: dict[str, str], cwd: Path) -> None:
-    log("Stopping OpenClaw gateway after e2e verification")
-    run(["openclaw", "gateway", "stop"], env=env, cwd=cwd, timeout=60)
-
-
 def verify_installs() -> None:
     log("Verifying installed packages and binaries")
     for tool in ("headroom", "codex", "aider", "openclaw"):
         assert_true(shutil.which(tool) is not None, f"Expected '{tool}' on PATH")
     run(["headroom", "--help"], timeout=30)
-    run(["npm", "list", "-g", "--depth=0", "@openai/codex", "openclaw"], timeout=60)
+    run(
+        ["npm", "list", "--prefix", "/opt/wrap-tools", "--depth=0", "@openai/codex", "openclaw"],
+        timeout=60,
+    )
     run(["/opt/aider-venv/bin/python", "-m", "pip", "show", "aider-chat"], timeout=60)
 
 
@@ -569,16 +597,6 @@ def verify_codex_wrap(
         cwd=project_dir,
         timeout=120,
     )
-    # RTK guidance for Codex is global-only (#1240): it is injected into
-    # ~/.codex/AGENTS.md, never a project-level AGENTS.md. A project AGENTS.md is
-    # written only when `wrap codex --memory` is used (for memory guidance), which
-    # this scenario does not exercise.
-    global_agents = Path(base_env["HOME"]) / ".codex" / "AGENTS.md"
-    assert_true(global_agents.exists(), "Codex wrap should create ~/.codex/AGENTS.md")
-    assert_true(
-        RTK_MARKER in global_agents.read_text(encoding="utf-8"), "Missing global RTK marker"
-    )
-
     config_path = Path(base_env["HOME"]) / ".codex" / "config.toml"
     assert_true(
         config_path.exists(),
@@ -660,7 +678,7 @@ def verify_codex_wrap(
 
 
 def verify_claude_wrap(base_env: dict[str, str], project_dir: Path, log_dir: Path) -> None:
-    port = PROXY_PORT + 10
+    port = CLAUDE_PORT
     run(
         ["headroom", "wrap", "claude", "--port", str(port), "--", "--help"],
         env=base_env,
@@ -688,13 +706,6 @@ def verify_aider_wrap(base_env: dict[str, str], project_dir: Path, log_dir: Path
         cwd=project_dir,
         timeout=120,
     )
-    conventions = project_dir / "CONVENTIONS.md"
-    assert_true(conventions.exists(), "Aider wrap should create CONVENTIONS.md")
-    assert_true(
-        RTK_MARKER in conventions.read_text(encoding="utf-8"),
-        "Aider wrap should inject RTK instructions",
-    )
-
     entries = read_jsonl(log_dir / "aider.jsonl")
     assert_true(len(entries) > 0, "Aider shim should have been invoked")
     env_vars = entries[-1]["env"]
@@ -745,84 +756,224 @@ def verify_cursor_wrap(base_env: dict[str, str], project_dir: Path) -> None:
             "Cursor wrap should print the Anthropic base URL override",
         )
         wait_for_http(f"http://127.0.0.1:{port}/health", timeout=15)
-        # rtk registers a native Cursor hook (rtk init --agent cursor) when it
-        # can (~/.cursor exists); headroom only falls back to injecting
-        # .cursorrules text if that registration fails (GH #756). Accept
-        # either outcome rather than assuming the fallback path.
-        cursorrules = project_dir / ".cursorrules"
-        cursor_hooks_json = Path(base_env["HOME"]) / ".cursor" / "hooks.json"
-        native_hook_registered = (
-            cursor_hooks_json.exists() and "rtk" in cursor_hooks_json.read_text(encoding="utf-8")
-        )
-        if not native_hook_registered:
-            assert_true(
-                cursorrules.exists(),
-                "Cursor wrap should create .cursorrules when the native rtk hook is unavailable",
-            )
-            assert_true(
-                RTK_MARKER in cursorrules.read_text(encoding="utf-8"),
-                "Cursor wrap should inject RTK instructions",
-            )
     finally:
         stop_process(proc)
 
 
+def verify_vscode_wrap(
+    base_env: dict[str, str], project_dir: Path, mock_server: MockOpenAIServer
+) -> None:
+    """Exercise the Linux settings lifecycle without real Copilot credentials."""
+    port = VSCODE_PORT
+    settings_path = Path(base_env["HOME"]) / ".config" / "Code" / "User" / "settings.json"
+    settings_path.parent.mkdir(parents=True)
+    original = b'{\n  // existing user setting\n  "editor.fontSize": 15\n}\n'
+    settings_path.write_bytes(original)
+
+    env = base_env.copy()
+    for name in (
+        "COPILOT_GITHUB_TOKEN",
+        "COPILOT_PROVIDER_BEARER_TOKEN",
+        "GH_TOKEN",
+        "GITHUB_COPILOT_GITHUB_TOKEN",
+        "GITHUB_COPILOT_REFRESH_OAUTH_TOKEN",
+        "GITHUB_COPILOT_TOKEN",
+        "GITHUB_TOKEN",
+    ):
+        env.pop(name, None)
+    env.update(
+        {
+            "GITHUB_COPILOT_API_TOKEN": "synthetic-e2e-token",
+            "GITHUB_COPILOT_API_URL": f"http://127.0.0.1:{MOCK_UPSTREAM_PORT}/v1",
+            "GITHUB_COPILOT_USER_INFO_URL": (
+                f"http://127.0.0.1:{MOCK_UPSTREAM_PORT}/copilot_internal/user"
+            ),
+            "HEADROOM_COPILOT_AUTH_FILE": str(Path(base_env["HOME"]) / "copilot-auth.json"),
+        }
+    )
+
+    proc = subprocess.Popen(
+        ["headroom", "wrap", "vscode", "--port", str(port)],
+        env=env,
+        cwd=str(project_dir),
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+    )
+    try:
+        output = wait_for_output(proc, "Press Ctrl+C to stop the proxy.", timeout=30)
+        project_prefix = f"/p/{quote(project_dir.name, safe='')}"
+        configured = settings_path.read_text(encoding="utf-8")
+        assert_true(
+            f'"github.copilot.advanced.debug.overrideProxyUrl": '
+            f'"http://127.0.0.1:{port}{project_prefix}"' in configured,
+            "VS Code wrap should configure the project-scoped proxy URL",
+        )
+        assert_true(
+            f'"github.copilot.advanced.debug.overrideCapiUrl": '
+            f'"http://127.0.0.1:{port}{project_prefix}"' in configured,
+            "VS Code wrap should route Copilot Chat generation through Headroom",
+        )
+        assert_true(
+            "overrideAuthType" not in configured,
+            "VS Code wrap must not write overrideAuthType: no such setting exists in "
+            "the modern Copilot Chat extension, so VS Code flags it as unknown (#3076)",
+        )
+        assert_true(
+            "synthetic-e2e-token" not in configured, "Settings must not contain credentials"
+        )
+        assert_true("model" not in configured.lower(), "Settings must not override model selection")
+        assert_true(
+            str(settings_path) in output, "Wrap output should identify the Linux settings path"
+        )
+
+        health = wait_for_http(f"http://127.0.0.1:{port}/health", timeout=15).json()
+        assert_true(
+            health.get("config", {}).get("openai_api_url")
+            == f"http://127.0.0.1:{MOCK_UPSTREAM_PORT}/v1",
+            "VS Code proxy should use the mocked Copilot upstream",
+        )
+        models = ["gpt-model-swap-a", "gpt-model-swap-b", "gpt-model-swap-a"]
+        start = len(mock_server.requests)
+        for model in models:
+            response = httpx.post(
+                f"http://127.0.0.1:{port}{project_prefix}/v1/responses",
+                json={"model": model, "input": "model swap probe", "stream": False},
+                timeout=10.0,
+            )
+            assert_true(
+                response.status_code == 200,
+                f"VS Code route failed for {model}: {response.status_code} {response.text}",
+            )
+            assert_true(
+                response.json().get("model") == model,
+                f"VS Code response did not reflect selected model {model}",
+            )
+        forwarded = [
+            item["body"].get("model")
+            for item in mock_server.requests[start:]
+            if item["path"].endswith("/responses") and isinstance(item["body"], dict)
+        ]
+        assert_true(
+            forwarded == models,
+            f"VS Code outbound model sequence changed: {forwarded!r}",
+        )
+    finally:
+        stop_process(proc)
+
+    assert_true(settings_path.read_bytes() != original, "Ctrl+C should leave managed settings")
+    run(["headroom", "unwrap", "vscode"], env=env, cwd=project_dir, timeout=60)
+    assert_true(
+        settings_path.read_bytes() == original,
+        "VS Code unwrap should restore the original settings byte-for-byte",
+    )
+
+
+def verify_vscode_claude_wrap(base_env: dict[str, str], project_dir: Path) -> None:
+    """Exercise Claude Code's settings, proxy request, and restore lifecycle."""
+    port = VSCODE_CLAUDE_PORT
+    settings_path = Path(base_env["HOME"]) / ".claude" / "settings.json"
+    settings_path.parent.mkdir(parents=True, exist_ok=True)
+    original = {"env": {"KEEP": "yes"}, "permissions": {"allow": ["Read"]}}
+    settings_path.write_text(json.dumps(original), encoding="utf-8")
+
+    env = base_env.copy()
+    env["ANTHROPIC_TARGET_API_URL"] = f"http://127.0.0.1:{MOCK_UPSTREAM_PORT}"
+    proc = subprocess.Popen(
+        ["headroom", "wrap", "vscode-claude", "--port", str(port)],
+        env=env,
+        cwd=str(project_dir),
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+    )
+    try:
+        output = wait_for_output(proc, "Press Ctrl+C to stop the proxy.", timeout=30)
+        project_prefix = f"/p/{quote(project_dir.name, safe='')}"
+        configured = json.loads(settings_path.read_text(encoding="utf-8"))
+        proxy_url = configured["env"]["ANTHROPIC_BASE_URL"]
+        assert_true(
+            proxy_url == f"http://127.0.0.1:{port}{project_prefix}",
+            "VS Code Claude wrap should configure the project-scoped Anthropic URL",
+        )
+        assert_true(
+            configured["env"]["ENABLE_TOOL_SEARCH"] == "false",
+            "VS Code Claude wrap should disable tool deferral for webview compatibility",
+        )
+        assert_true(configured["env"]["KEEP"] == "yes", "Existing Claude env must remain")
+        assert_true(str(settings_path) in output, "Wrap output should identify Claude settings")
+
+        response = httpx.post(
+            f"{proxy_url}/v1/messages",
+            headers={"x-api-key": "synthetic-anthropic-key", "anthropic-version": "2023-06-01"},
+            json={
+                "model": "claude-sonnet-4-6",
+                "max_tokens": 16,
+                "messages": [{"role": "user", "content": "Reply briefly"}],
+            },
+            timeout=30,
+        )
+        assert_true(response.status_code == 200, "Claude request should traverse Headroom")
+        assert_true(
+            response.json()["content"][0]["text"] == "mock Claude response",
+            "Claude response should return through Headroom",
+        )
+    finally:
+        stop_process(proc)
+
+    run(["headroom", "unwrap", "vscode-claude"], env=env, cwd=project_dir, timeout=60)
+    assert_true(
+        json.loads(settings_path.read_text(encoding="utf-8")) == original,
+        "VS Code Claude unwrap should restore existing Claude settings",
+    )
+
+
 def verify_cline_wrap(base_env: dict[str, str], project_dir: Path) -> None:
-    """Smoke test: `wrap cline --prepare-only` writes RTK guidance to .clinerules."""
+    """Smoke test: `wrap cline --prepare-only` exits clean.
+
+    These three wraps used to be verified by the hint-file guidance they wrote.
+    With the CLI context tools removed they produce no on-disk artifact, so the
+    remaining assertion is that the prepare path still runs without crashing —
+    ``run`` raises on a non-zero exit.
+    """
     run(
         ["headroom", "wrap", "cline", "--prepare-only", "--port", str(CLINE_PORT)],
         env=base_env,
         cwd=project_dir,
         timeout=60,
     )
-    clinerules = project_dir / ".clinerules"
-    assert_true(clinerules.exists(), "Cline wrap should create .clinerules")
-    assert_true(
-        RTK_MARKER in clinerules.read_text(encoding="utf-8"),
-        "Cline wrap should inject RTK instructions",
-    )
 
 
 def verify_continue_wrap(base_env: dict[str, str], project_dir: Path) -> None:
-    """Smoke test: `wrap continue --prepare-only` injects RTK into .continue/config.json."""
+    """Smoke test: `wrap continue --prepare-only` exits clean (see verify_cline_wrap)."""
     run(
         ["headroom", "wrap", "continue", "--prepare-only", "--port", str(CONTINUE_PORT)],
         env=base_env,
         cwd=project_dir,
         timeout=60,
     )
-    config_file = project_dir / ".continue" / "config.json"
-    assert_true(config_file.exists(), "Continue wrap should create .continue/config.json")
-    data = json.loads(config_file.read_text(encoding="utf-8"))
-    system_message = data.get("systemMessage", "")
-    assert_true(
-        RTK_MARKER in system_message,
-        "Continue wrap should inject RTK instructions into systemMessage",
-    )
 
 
 def verify_goose_wrap(base_env: dict[str, str], project_dir: Path) -> None:
-    """Smoke test: `wrap goose --prepare-only` writes RTK guidance to .goosehints."""
+    """Smoke test: `wrap goose --prepare-only` exits clean (see verify_cline_wrap)."""
     run(
         ["headroom", "wrap", "goose", "--prepare-only", "--port", str(GOOSE_PORT)],
         env=base_env,
         cwd=project_dir,
         timeout=60,
     )
-    goosehints = project_dir / ".goosehints"
-    assert_true(goosehints.exists(), "Goose wrap should create .goosehints")
-    assert_true(
-        RTK_MARKER in goosehints.read_text(encoding="utf-8"),
-        "Goose wrap should inject RTK instructions",
-    )
 
 
 def verify_openhands_wrap(base_env: dict[str, str], project_dir: Path) -> None:
-    """Smoke test: `wrap openhands --prepare-only` exits clean and ensures rtk is present.
+    """Smoke test: `wrap openhands --prepare-only` exits clean.
 
-    OpenHands wires instructions via the OPENHANDS_INSTRUCTIONS env var at launch
-    time (no on-disk artifact), so --prepare-only just exercises the rtk-binary
-    setup path. The env-var wiring is covered by the unit tests.
+    This one is a real regression guard: openhands used to *require* the rtk
+    binary, so once rtk became opt-in the default path exited 1. Nothing is
+    stubbed here, so a reintroduced hard dependency fails the run.
     """
     run(
         ["headroom", "wrap", "openhands", "--prepare-only", "--port", str(OPENHANDS_PORT)],
@@ -837,6 +988,9 @@ def verify_openclaw_wrap(
     project_dir: Path,
     plugin_dir: Path,
 ) -> None:
+    # Both gateway startup and health checks require credentials in current
+    # OpenClaw. Keep a per-run token in the child environment, out of argv/logs.
+    base_env = {**base_env, "OPENCLAW_GATEWAY_TOKEN": secrets.token_hex(32)}
     port = OPENCLAW_PROXY_PORT
     gateway_proc: subprocess.Popen[str] | None = None
     run(
@@ -851,6 +1005,9 @@ def verify_openclaw_wrap(
             "--startup-timeout-ms",
             # 5s is too tight for cold Python+pyo3 import on a busy CI runner.
             "30000",
+            # This harness owns a foreground gateway under an isolated HOME.
+            # OpenClaw refuses OS service management for noncanonical homes.
+            "--no-restart",
             "--verbose",
         ],
         env=base_env,
@@ -897,6 +1054,7 @@ def verify_openclaw_wrap(
                     ["openclaw", "health"], env=base_env, cwd=project_dir, timeout=30
                 )
             except RuntimeError as exc:
+                stop_process(gateway_proc)
                 gateway_output = ""
                 if gateway_proc.stdout is not None:
                     gateway_output = gateway_proc.stdout.read()
@@ -920,9 +1078,13 @@ def verify_openclaw_wrap(
     finally:
         if gateway_proc is not None:
             stop_process(gateway_proc)
-        stop_openclaw_gateway(base_env, project_dir)
 
-    run(["headroom", "unwrap", "openclaw"], env=base_env, cwd=project_dir, timeout=120)
+    run(
+        ["headroom", "unwrap", "openclaw", "--no-restart"],
+        env=base_env,
+        cwd=project_dir,
+        timeout=120,
+    )
     state = json.loads(config_path.read_text(encoding="utf-8"))
     assert_true(
         state["plugins"]["slots"]["contextEngine"] == "legacy",
@@ -945,17 +1107,14 @@ def main() -> None:
             path.mkdir(parents=True, exist_ok=True)
         create_shims(shim_dir)
 
-        mock_server, mock_thread = start_mock_server(19001)
+        mock_server, mock_thread = start_mock_server(MOCK_UPSTREAM_PORT)
         base_env = os.environ.copy()
         base_env.update(
             {
                 "HOME": str(home_dir),
                 "PATH": f"{shim_dir}{os.pathsep}{base_env['PATH']}",
                 "HEADROOM_E2E_LOG_DIR": str(log_dir),
-                "OPENAI_TARGET_API_URL": "http://127.0.0.1:19001/v1",
-                # RTK is opt-in (off by default). These wrap smoke tests assert
-                # RTK-instruction injection, so exercise the RTK-on path.
-                "HEADROOM_RTK": "1",
+                "OPENAI_TARGET_API_URL": f"http://127.0.0.1:{MOCK_UPSTREAM_PORT}/v1",
             }
         )
 
@@ -965,6 +1124,8 @@ def main() -> None:
             verify_codex_wrap(base_env, project_dir, log_dir, mock_server)
             verify_aider_wrap(base_env, project_dir, log_dir)
             verify_cursor_wrap(base_env, project_dir)
+            verify_vscode_wrap(base_env, project_dir, mock_server)
+            verify_vscode_claude_wrap(base_env, project_dir)
             verify_cline_wrap(base_env, project_dir)
             verify_continue_wrap(base_env, project_dir)
             verify_goose_wrap(base_env, project_dir)
@@ -987,19 +1148,6 @@ def verify_opencode_wrap(base_env: dict[str, str], project_dir: Path, log_dir: P
         cwd=project_dir,
         timeout=120,
     )
-    global_agents = Path(base_env["HOME"]) / ".config" / "opencode" / "AGENTS.md"
-    project_agents = project_dir / "AGENTS.md"
-    assert_true(global_agents.exists(), "Opencode wrap should create ~/.config/opencode/AGENTS.md")
-    assert_true(project_agents.exists(), "Opencode wrap should create project AGENTS.md")
-    assert_true(
-        RTK_MARKER in global_agents.read_text(encoding="utf-8"),
-        "Missing RTK marker in global AGENTS.md",
-    )
-    assert_true(
-        RTK_MARKER in project_agents.read_text(encoding="utf-8"),
-        "Missing RTK marker in project AGENTS.md",
-    )
-
     entries = read_jsonl(log_dir / "opencode.jsonl")
     assert_true(len(entries) > 0, "Opencode shim should have been invoked")
     env_vars = entries[-1]["env"]

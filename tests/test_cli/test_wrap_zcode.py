@@ -2,12 +2,13 @@
 
 ZCode is a desktop Electron app (zcode.z.ai) with no CLI binary. The wrap
 command follows the Pattern-B (proxy-only watcher) approach: it starts the
-proxy, injects RTK guidance into AGENTS.md at the project root, and prints
-the ZCode settings the user should configure in the app's settings UI.
+proxy and prints the ZCode settings the user should configure in the app's
+settings UI.
 """
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 from unittest.mock import patch
 
@@ -18,94 +19,9 @@ from headroom.cli import wrap as wrap_mod
 from headroom.cli.main import main
 
 
-@pytest.fixture(autouse=True)
-def _enable_rtk(monkeypatch: pytest.MonkeyPatch) -> None:
-    # RTK is opt-in (off by default); these tests exercise the RTK-on injection path.
-    monkeypatch.setenv("HEADROOM_RTK", "1")
-
-
 @pytest.fixture
 def runner() -> CliRunner:
     return CliRunner()
-
-
-# ---------------------------------------------------------------------------
-# Wrap: --prepare-only RTK injection into AGENTS.md
-# ---------------------------------------------------------------------------
-
-
-def test_prepare_only_injects_rtk_into_agents_md(
-    runner: CliRunner,
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """``wrap zcode --prepare-only`` writes the RTK block to AGENTS.md at cwd."""
-    monkeypatch.chdir(tmp_path)
-    monkeypatch.delenv("HEADROOM_CONTEXT_TOOL", raising=False)
-
-    with patch.object(wrap_mod, "_ensure_rtk_binary", return_value=Path("/tmp/rtk")):
-        result = runner.invoke(main, ["wrap", "zcode", "--prepare-only"])
-
-    assert result.exit_code == 0, result.output
-    marker = tmp_path / "AGENTS.md"
-    assert marker.exists(), "AGENTS.md should be created"
-    content = marker.read_text(encoding="utf-8")
-    assert wrap_mod._RTK_MARKER in content
-    assert "RTK (Rust Token Killer)" in content
-
-
-def test_prepare_only_idempotent_no_duplicate_block(
-    runner: CliRunner,
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Running prepare-only twice must not duplicate the RTK block in AGENTS.md."""
-    monkeypatch.chdir(tmp_path)
-    monkeypatch.delenv("HEADROOM_CONTEXT_TOOL", raising=False)
-
-    with patch.object(wrap_mod, "_ensure_rtk_binary", return_value=Path("/tmp/rtk")):
-        runner.invoke(main, ["wrap", "zcode", "--prepare-only"])
-        runner.invoke(main, ["wrap", "zcode", "--prepare-only"])
-
-    content = (tmp_path / "AGENTS.md").read_text(encoding="utf-8")
-    assert content.count(wrap_mod._RTK_MARKER) == 1
-
-
-def test_no_context_tool_does_not_create_agents_md(
-    runner: CliRunner,
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """--no-context-tool must not create AGENTS.md and must not invoke rtk."""
-    monkeypatch.chdir(tmp_path)
-
-    with patch.object(wrap_mod, "_ensure_rtk_binary") as ensure:
-        result = runner.invoke(main, ["wrap", "zcode", "--prepare-only", "--no-context-tool"])
-
-    assert result.exit_code == 0, result.output
-    assert not (tmp_path / "AGENTS.md").exists()
-    ensure.assert_not_called()
-
-
-def test_preserves_existing_agents_md_content(
-    runner: CliRunner,
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Pre-existing AGENTS.md content must be preserved when RTK is appended."""
-    monkeypatch.chdir(tmp_path)
-    monkeypatch.delenv("HEADROOM_CONTEXT_TOOL", raising=False)
-    agents_md = tmp_path / "AGENTS.md"
-    original = "# Project conventions\n\nAlways use Python 3.12.\n"
-    agents_md.write_text(original, encoding="utf-8")
-
-    with patch.object(wrap_mod, "_ensure_rtk_binary", return_value=Path("/tmp/rtk")):
-        result = runner.invoke(main, ["wrap", "zcode", "--prepare-only"])
-
-    assert result.exit_code == 0, result.output
-    content = agents_md.read_text(encoding="utf-8")
-    assert "Always use Python 3.12." in content
-    assert wrap_mod._RTK_MARKER in content
 
 
 # ---------------------------------------------------------------------------
@@ -122,100 +38,18 @@ def test_wrap_prints_proxy_urls(
     monkeypatch.chdir(tmp_path)
     monkeypatch.delenv("HEADROOM_CONTEXT_TOOL", raising=False)
 
-    fake_rtk = Path("/tmp/rtk")
-
     def fake_watcher(**kwargs):  # noqa: ANN003
         print_fn = kwargs.get("print_setup_lines")
         if callable(print_fn):
             print_fn(kwargs["port"])
 
-    with patch.object(wrap_mod, "_ensure_rtk_binary", return_value=fake_rtk):
-        with patch.object(wrap_mod, "_run_proxy_only_watcher", side_effect=fake_watcher):
-            result = runner.invoke(main, ["wrap", "zcode", "--port", "9000"])
+    with patch.object(wrap_mod, "_run_proxy_only_watcher", side_effect=fake_watcher):
+        result = runner.invoke(main, ["wrap", "zcode", "--port", "9000"])
 
     assert result.exit_code == 0, result.output
     assert "http://127.0.0.1:9000/v1" in result.output
     assert "http://127.0.0.1:9000" in result.output
     assert "Settings > Model Settings" in result.output
-
-
-# ---------------------------------------------------------------------------
-# Unwrap: RTK removal from AGENTS.md
-# ---------------------------------------------------------------------------
-
-
-def test_unwrap_removes_rtk_from_agents_md(
-    runner: CliRunner,
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """``unwrap zcode`` removes RTK instructions from AGENTS.md."""
-    monkeypatch.chdir(tmp_path)
-    agents_md = tmp_path / "AGENTS.md"
-    agents_md.write_text(
-        "# Project\n\nSome content.\n\n" + wrap_mod.RTK_INSTRUCTIONS_BLOCK + "\n",
-        encoding="utf-8",
-    )
-
-    with patch.object(wrap_mod, "_stop_local_proxy_for_unwrap", return_value="stopped"):
-        result = runner.invoke(main, ["unwrap", "zcode"])
-
-    assert result.exit_code == 0, result.output
-    assert "Removed Headroom rtk instructions" in result.output
-    content = agents_md.read_text(encoding="utf-8")
-    assert wrap_mod._RTK_MARKER not in content
-    assert "Some content." in content
-
-
-def test_unwrap_deletes_empty_agents_md(
-    runner: CliRunner,
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """``unwrap zcode`` deletes AGENTS.md if it only contained RTK instructions."""
-    monkeypatch.chdir(tmp_path)
-    agents_md = tmp_path / "AGENTS.md"
-    agents_md.write_text(wrap_mod.RTK_INSTRUCTIONS_BLOCK + "\n", encoding="utf-8")
-
-    with patch.object(wrap_mod, "_stop_local_proxy_for_unwrap", return_value="stopped"):
-        result = runner.invoke(main, ["unwrap", "zcode"])
-
-    assert result.exit_code == 0, result.output
-    assert not agents_md.exists(), "AGENTS.md should be deleted when only RTK content"
-
-
-def test_unwrap_noop_when_no_markers(
-    runner: CliRunner,
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """``unwrap zcode`` is a safe no-op when AGENTS.md has no Headroom markers."""
-    monkeypatch.chdir(tmp_path)
-    agents_md = tmp_path / "AGENTS.md"
-    agents_md.write_text("# Project\n\nSome content.\n", encoding="utf-8")
-
-    with patch.object(wrap_mod, "_stop_local_proxy_for_unwrap", return_value="stopped"):
-        result = runner.invoke(main, ["unwrap", "zcode"])
-
-    assert result.exit_code == 0, result.output
-    assert "Nothing to undo" in result.output
-    content = agents_md.read_text(encoding="utf-8")
-    assert content == "# Project\n\nSome content.\n"
-
-
-def test_unwrap_noop_when_no_agents_md(
-    runner: CliRunner,
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """``unwrap zcode`` is a safe no-op when AGENTS.md does not exist."""
-    monkeypatch.chdir(tmp_path)
-
-    with patch.object(wrap_mod, "_stop_local_proxy_for_unwrap", return_value="stopped"):
-        result = runner.invoke(main, ["unwrap", "zcode"])
-
-    assert result.exit_code == 0, result.output
-    assert "Nothing to undo" in result.output
 
 
 # ---------------------------------------------------------------------------
@@ -316,6 +150,113 @@ def test_detect_upstream_no_baseurl_skips(tmp_path: Path) -> None:
     upstream = detect_upstream(config)
     assert upstream.provider_name == "Z.ai (default)"
     assert upstream.base_url == "https://api.z.ai/api/anthropic"
+
+
+def test_detect_upstream_skips_provider_pointing_at_proxy(tmp_path: Path) -> None:
+    """A provider set to the Headroom proxy itself must not become the upstream."""
+    import json as _json
+
+    from headroom.providers.zcode.runtime import detect_upstream
+
+    config = tmp_path / "config.json"
+    config.write_text(
+        _json.dumps(
+            {
+                "provider": {
+                    "headroom": {
+                        "name": "Headroom",
+                        "kind": "anthropic",
+                        "enabled": True,
+                        "options": {"baseURL": "http://127.0.0.1:8787"},
+                    },
+                    "local": {
+                        "name": "Local",
+                        "kind": "openai",
+                        "enabled": True,
+                        "options": {"baseURL": "http://localhost:8787/v1"},
+                    },
+                    "other-port": {
+                        "name": "Other",
+                        "kind": "openai",
+                        "enabled": True,
+                        "options": {"baseURL": "http://127.0.0.1:9999/v1"},
+                    },
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    upstream = detect_upstream(config, proxy_port=8787)
+    assert upstream.provider_name == "Other"
+    assert upstream.base_url == "http://127.0.0.1:9999/v1"
+
+
+def test_detect_upstream_only_proxy_provider_falls_back(tmp_path: Path) -> None:
+    """With only a proxy-pointing provider the Z.ai default is used."""
+    from headroom.providers.zcode.runtime import detect_upstream
+
+    config = tmp_path / "config.json"
+    config.write_text(
+        '{"provider": {"headroom": {"name": "Headroom", "kind": "anthropic", '
+        '"enabled": true, "options": {"baseURL": "http://127.0.0.1:8787"}}}}',
+        encoding="utf-8",
+    )
+    upstream = detect_upstream(config, proxy_port=8787)
+    assert upstream.provider_name == "Z.ai (default)"
+
+
+def test_detect_upstream_keeps_ipv6_provider_when_proxy_is_ipv4(tmp_path: Path) -> None:
+    """[::1] is a different socket from the 127.0.0.1 proxy, so it stays selectable."""
+    import json as _json
+
+    from headroom.providers.zcode.runtime import detect_upstream
+
+    config = tmp_path / "config.json"
+    config.write_text(
+        _json.dumps(
+            {
+                "provider": {
+                    "v6": {
+                        "name": "Local v6",
+                        "kind": "anthropic",
+                        "enabled": True,
+                        "options": {"baseURL": "http://[::1]:8787"},
+                    }
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    upstream = detect_upstream(config, proxy_port=8787)
+    assert upstream.provider_name == "Local v6"
+    assert upstream.base_url == "http://[::1]:8787"
+
+
+@pytest.mark.parametrize("base_url", [None, 42, ["x"]], ids=["null", "int", "list"])
+def test_detect_upstream_non_string_baseurl_skips(tmp_path: Path, base_url: object) -> None:
+    """detect_upstream falls back instead of raising when baseURL is not a string."""
+    import json as _json
+
+    from headroom.providers.zcode.runtime import detect_upstream
+
+    config = tmp_path / "config.json"
+    config.write_text(
+        _json.dumps(
+            {
+                "provider": {
+                    "zai": {
+                        "name": "Z.ai",
+                        "kind": "anthropic",
+                        "enabled": True,
+                        "options": {"baseURL": base_url},
+                    }
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    upstream = detect_upstream(config)
+    assert upstream.provider_name == "Z.ai (default)"
 
 
 @pytest.mark.parametrize(
@@ -471,14 +412,81 @@ def test_wrap_zcode_passes_upstream_to_watcher(
         provider_name="Z.ai", base_url="https://api.z.ai/api/anthropic", kind="anthropic"
     )
 
-    with patch.object(wrap_mod, "_ensure_rtk_binary", return_value=Path("/tmp/rtk")):
-        with patch.object(wrap_mod, "_detect_zcode_upstream", return_value=fake_upstream):
-            with patch.object(wrap_mod, "_run_proxy_only_watcher", side_effect=fake_watcher):
-                runner.invoke(main, ["wrap", "zcode", "--port", "9000"])
+    with patch.object(wrap_mod, "_detect_zcode_upstream", return_value=fake_upstream):
+        with patch.object(wrap_mod, "_run_proxy_only_watcher", side_effect=fake_watcher):
+            runner.invoke(main, ["wrap", "zcode", "--port", "9000"])
 
     assert captured.get("anthropic_api_url") == "https://api.z.ai/api/anthropic"
     assert captured.get("openai_api_url") is None
     assert captured.get("port") == 9000
+
+
+def _zcode_config_with(tmp_path: Path, base_url: str) -> Path:
+    home = tmp_path / "zhome"
+    (home / "v2").mkdir(parents=True)
+    (home / "v2" / "config.json").write_text(
+        json.dumps(
+            {
+                "provider": {
+                    "p": {
+                        "name": "P",
+                        "kind": "anthropic",
+                        "enabled": True,
+                        "options": {"baseURL": base_url},
+                    }
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    return home
+
+
+def _run_zcode_with_port_busy(
+    runner: CliRunner, tmp_path: Path, base_url: str, *, busy: bool
+) -> dict[str, object]:
+    """Run ``wrap zcode --port 8787``; port 8787 is held by a foreign service when *busy*."""
+    captured: dict[str, object] = {}
+    home = _zcode_config_with(tmp_path, base_url)
+    with (
+        patch("headroom.providers.zcode.runtime.zcode_config_dir", return_value=home),
+        patch.object(wrap_mod, "_check_proxy", return_value=busy),
+        patch.object(wrap_mod, "_foreign_listener", return_value=busy),
+        patch.object(wrap_mod, "_find_available_port", return_value=8788 if busy else 8787),
+        patch.object(wrap_mod, "_run_proxy_only_watcher", side_effect=captured.update),
+    ):
+        runner.invoke(main, ["wrap", "zcode", "--port", "8787"])
+    return captured
+
+
+def test_wrap_zcode_port_fallback_keeps_backend_on_busy_port(
+    runner: CliRunner, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A backend on the occupied port stays a valid upstream; the proxy moves to 8788."""
+    monkeypatch.delenv("HEADROOM_CONTEXT_TOOL", raising=False)
+    captured = _run_zcode_with_port_busy(runner, tmp_path, "http://127.0.0.1:8787", busy=True)
+    assert captured["port"] == 8788
+    assert captured["anthropic_api_url"] == "http://127.0.0.1:8787"
+
+
+def test_wrap_zcode_port_fallback_skips_provider_on_replacement_port(
+    runner: CliRunner, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A provider pointing at the replacement port is the proxy itself, not an upstream."""
+    monkeypatch.delenv("HEADROOM_CONTEXT_TOOL", raising=False)
+    captured = _run_zcode_with_port_busy(runner, tmp_path, "http://127.0.0.1:8788", busy=True)
+    assert captured["port"] == 8788
+    assert captured["anthropic_api_url"] == "https://api.z.ai/api/anthropic"
+
+
+def test_wrap_zcode_free_port_unchanged(
+    runner: CliRunner, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """With the requested port free, a provider on it is still skipped as the proxy."""
+    monkeypatch.delenv("HEADROOM_CONTEXT_TOOL", raising=False)
+    captured = _run_zcode_with_port_busy(runner, tmp_path, "http://127.0.0.1:8787", busy=False)
+    assert captured["port"] == 8787
+    assert captured["anthropic_api_url"] == "https://api.z.ai/api/anthropic"
 
 
 def test_wrap_zcode_passes_openai_upstream(
@@ -501,10 +509,75 @@ def test_wrap_zcode_passes_openai_upstream(
         provider_name="Custom", base_url="https://my-api.example.com/v1", kind="openai"
     )
 
-    with patch.object(wrap_mod, "_ensure_rtk_binary", return_value=Path("/tmp/rtk")):
-        with patch.object(wrap_mod, "_detect_zcode_upstream", return_value=fake_upstream):
-            with patch.object(wrap_mod, "_run_proxy_only_watcher", side_effect=fake_watcher):
-                runner.invoke(main, ["wrap", "zcode", "--port", "9000"])
+    with patch.object(wrap_mod, "_detect_zcode_upstream", return_value=fake_upstream):
+        with patch.object(wrap_mod, "_run_proxy_only_watcher", side_effect=fake_watcher):
+            runner.invoke(main, ["wrap", "zcode", "--port", "9000"])
 
     assert captured.get("anthropic_api_url") is None
     assert captured.get("openai_api_url") == "https://my-api.example.com/v1"
+
+
+@pytest.mark.parametrize("base_url", ["http://127.0.0.1:99999", "http://127.0.0.1:abc"])
+def test_detect_upstream_keeps_provider_with_unparseable_port(
+    tmp_path: Path, base_url: str
+) -> None:
+    """A port urlsplit cannot read is not the proxy's port, so the provider stays selectable."""
+    from headroom.providers.zcode.runtime import detect_upstream
+
+    config = tmp_path / "config.json"
+    config.write_text(
+        json.dumps(
+            {
+                "provider": {
+                    "odd": {
+                        "name": "Odd port",
+                        "kind": "anthropic",
+                        "enabled": True,
+                        "options": {"baseURL": base_url},
+                    }
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    upstream = detect_upstream(config, proxy_port=8787)
+    assert upstream.provider_name == "Odd port"
+
+
+def test_wrap_zcode_keeps_requested_port_when_no_free_port_is_found(
+    runner: CliRunner, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """If the free-port search fails, the upstream is chosen against the requested port."""
+    monkeypatch.delenv("HEADROOM_CONTEXT_TOOL", raising=False)
+    captured: dict[str, object] = {}
+    home = _zcode_config_with(tmp_path, "http://127.0.0.1:8787")
+    with (
+        patch("headroom.providers.zcode.runtime.zcode_config_dir", return_value=home),
+        patch.object(wrap_mod, "_check_proxy", return_value=False),
+        patch.object(wrap_mod, "_foreign_listener", return_value=False),
+        patch.object(wrap_mod, "_find_available_port", side_effect=RuntimeError("no port")),
+        patch.object(wrap_mod, "_run_proxy_only_watcher", side_effect=captured.update),
+    ):
+        runner.invoke(main, ["wrap", "zcode", "--port", "8787"])
+    assert captured["port"] == 8787
+    assert captured["anthropic_api_url"] == "https://api.z.ai/api/anthropic"
+
+
+def test_wrap_zcode_reuses_running_headroom_proxy_port(
+    runner: CliRunner, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A Headroom proxy already on the port is reused; no other port is searched for."""
+    monkeypatch.delenv("HEADROOM_CONTEXT_TOOL", raising=False)
+    captured: dict[str, object] = {}
+    home = _zcode_config_with(tmp_path, "http://127.0.0.1:8787")
+    with (
+        patch("headroom.providers.zcode.runtime.zcode_config_dir", return_value=home),
+        patch.object(wrap_mod, "_check_proxy", return_value=True),
+        patch.object(wrap_mod, "_foreign_listener", return_value=False),
+        patch.object(wrap_mod, "_find_available_port") as find_port,
+        patch.object(wrap_mod, "_run_proxy_only_watcher", side_effect=captured.update),
+    ):
+        runner.invoke(main, ["wrap", "zcode", "--port", "8787"])
+    find_port.assert_not_called()
+    assert captured["port"] == 8787
+    assert captured["anthropic_api_url"] == "https://api.z.ai/api/anthropic"

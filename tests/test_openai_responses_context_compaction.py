@@ -6,54 +6,13 @@ from typing import Any
 from headroom.proxy.handlers.openai import (
     OpenAIHandlerMixin,
     _compact_openai_responses_tools,
-    _openai_responses_context_budget,
-    _responses_request_allows_memory_tool_continuation,
 )
 from headroom.transforms.content_router import (
     CompressionStrategy,
     ContentRouter,
     ContentRouterConfig,
+    _estimate_tokens,
 )
-
-
-def test_openai_responses_context_budget_breaks_out_static_and_live_buckets() -> None:
-    payload = {
-        "instructions": "stable instructions",
-        "tools": [
-            {
-                "type": "function",
-                "name": "read_file",
-                "description": "Read a file.",
-                "parameters": {
-                    "type": "object",
-                    "properties": {"path": {"type": "string"}},
-                    "required": ["path"],
-                },
-            }
-        ],
-        "input": [
-            {
-                "type": "function_call_output",
-                "call_id": "call_1",
-                "output": "line one\nline two\n",
-            },
-            {
-                "type": "message",
-                "role": "user",
-                "content": [{"type": "input_text", "text": "do the thing"}],
-            },
-        ],
-    }
-
-    budget = _openai_responses_context_budget(payload)
-
-    assert budget["payload_bytes"] > 0
-    assert {"instructions", "tools", "input"}.issubset(budget["buckets"])
-    assert budget["input_breakdown"]["function_call_output"]["items"] == 1
-    assert budget["input_breakdown"]["function_call_output"]["text_bytes"] == len(
-        b"line one\nline two\n"
-    )
-    assert budget["input_breakdown"]["message"]["items"] == 1
 
 
 def test_openai_tool_schema_compaction_preserves_invocation_shape() -> None:
@@ -301,12 +260,12 @@ def test_codex_payload_with_only_messages_field_also_reaches_router() -> None:
 
 
 def test_compression_pass_debug_logs_are_suppressed(caplog) -> None:
-    """Re-entrant Codex websocket passes share one `request_id` but
-    process distinct payloads. The `pass_id` field on every compression
-    event must be content-derived so dashboards can attribute each
-    unit_result to its originating pass. Distinct payloads → distinct
-    pass_ids (per-pass savings sum legitimately across passes); identical
-    payloads → identical pass_ids (idempotent retries should dedup)."""
+    """Compression passes must not log per-pass payload events at INFO.
+
+    Re-entrant Codex websocket passes share one `request_id`; three passes
+    over two distinct payloads must emit no ``event=codex_compression_*``
+    records, which would carry request content.
+    """
 
     import logging as _logging
 
@@ -343,42 +302,12 @@ def test_compression_pass_debug_logs_are_suppressed(caplog) -> None:
     handler._compress_openai_responses_payload(
         payload_b, model="gpt-5.5", request_id="hr_shared_request"
     )
-    # Same content twice → same pass_id (deterministic + idempotent).
+    # A repeat of the first payload, as a re-entrant pass would send.
     handler._compress_openai_responses_payload(
         payload_a, model="gpt-5.5", request_id="hr_shared_request"
     )
 
     assert not any("event=codex_compression_" in record.getMessage() for record in caplog.records)
-    return
-
-    # Collect pass_ids in call order — payload bodies are no longer
-    # embedded at INFO so we can't grep for content; we rely on the
-    # 3-call sequence [a, b, a] producing a [A, B, A] pass_id sequence.
-    pass_id_sequence: list[str] = []
-    for record in caplog.records:
-        message = record.getMessage()
-        if "event=codex_compression_payload_input" not in message:
-            continue
-        match_quoted = '"pass_id":"'
-        idx = message.find(match_quoted)
-        assert idx != -1, f"pass_id missing from event: {message[:200]}"
-        start = idx + len(match_quoted)
-        end = message.find('"', start)
-        pass_id_sequence.append(message[start:end])
-
-    assert len(pass_id_sequence) == 3, (
-        f"expected exactly 3 payload_input events for 3 calls, got {len(pass_id_sequence)}"
-    )
-    # Two distinct payloads + one repeat → two distinct pass_ids overall.
-    assert len(set(pass_id_sequence)) == 2, (
-        f"expected two distinct pass_ids, got {set(pass_id_sequence)}"
-    )
-    # Repeated payload_a must be deterministic — index 0 and 2 are the
-    # same call shape so they must produce the same pass_id.
-    assert pass_id_sequence[0] == pass_id_sequence[2], (
-        f"repeated identical payload produced different pass_ids: {pass_id_sequence}"
-    )
-    assert pass_id_sequence[0] != pass_id_sequence[1]
 
 
 def test_codex_payload_without_either_field_is_skipped() -> None:
@@ -433,30 +362,52 @@ def test_content_router_retries_kompress_when_structured_strategy_noops(monkeypa
     )
 
     assert compressed == "short summary"
-    assert compressed_tokens == 2
+    # Measured with the router's estimator, the unit of the strategy result.
+    assert compressed_tokens == _estimate_tokens("short summary")
     # The fallback chain must record both strategies it tried.
     assert strategy_chain == ["smart_crusher", "kompress"]
 
 
-def test_responses_memory_tools_skip_explicit_store_false() -> None:
-    """Regression: explicit store=false must block Responses memory-tool injection."""
+def test_responses_turn_hook_message_fold_is_applied_and_counted() -> None:
+    """On the Responses path a turn hook may fold the `input` items (in place),
+    not just tools. The fold must be written back to the outbound payload AND its
+    token saving added to tokens_saved — before, this path only wrote tools back,
+    so a message fold was silently dropped and uncounted."""
+    from headroom.proxy.turn_hooks import clear_turn_hooks, register_turn_hook
 
-    payload = {"model": "gpt-5.5", "input": "remember this", "store": False}
+    class FoldInput:
+        name = "fold_input"
 
-    assert _responses_request_allows_memory_tool_continuation(payload) is False
-    assert payload["store"] is False
+        def on_request(self, ctx: Any) -> None:
+            # Fold a big function_call_output IN PLACE (mutate the dict; identity
+            # of ctx.messages is unchanged) — the case an identity gate would miss.
+            for item in ctx.messages:
+                if isinstance(item, dict) and isinstance(item.get("output"), str):
+                    item["output"] = "folded"
 
+    router = ContentRouter(ContentRouterConfig())
+    handler = _HandlerHarness(router)
+    payload: dict[str, Any] = {
+        "type": "response.create",
+        "model": "gpt-5.5",
+        "input": [
+            {
+                "type": "function_call_output",
+                "call_id": "c1",
+                "output": " ".join(["compressible"] * 300),
+            }
+        ],
+    }
 
-def test_responses_memory_tools_allow_default_and_stored_requests() -> None:
-    no_memory_payload = {"model": "gpt-5.5", "input": "plain", "store": False}
-    already_stored_payload = {"model": "gpt-5.5", "input": "plain", "store": True}
-    default_store_payload = {"model": "gpt-5.5", "input": "plain"}
+    clear_turn_hooks()
+    register_turn_hook(FoldInput())
+    try:
+        working, _modified, tokens_saved, *_ = handler._compress_openai_responses_payload(
+            payload, model="gpt-5.5", request_id="hr_test"
+        )
+    finally:
+        clear_turn_hooks()
 
-    assert _responses_request_allows_memory_tool_continuation(no_memory_payload) is False
-    assert no_memory_payload["store"] is False
-
-    assert _responses_request_allows_memory_tool_continuation(already_stored_payload) is True
-    assert already_stored_payload["store"] is True
-
-    assert _responses_request_allows_memory_tool_continuation(default_store_payload) is True
-    assert "store" not in default_store_payload
+    assert working["input"][0]["output"] == "folded"  # fold applied to the outbound payload
+    assert tokens_saved > 0  # ...and the message-fold saving is counted
+    assert payload["input"][0]["output"] != "folded"  # original untouched (deep-copied)

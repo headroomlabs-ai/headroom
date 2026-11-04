@@ -25,6 +25,7 @@ from . import (  # noqa: F401
     perf,
     proxy,
     recover,
+    rollout,
     tools,
     update,
     wrap,

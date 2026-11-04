@@ -114,6 +114,20 @@ class TestFalsePositiveFiltering:
         )
         assert is_error_content("bash: unknown_cmd: command not found")
 
+    def test_exit_code_zero_is_not_an_error(self):
+        """Agent harnesses append 'exit code 0' to every successful command;
+        that must not be classified as an error."""
+        from headroom.learn.scanner import is_error_content
+
+        assert not is_error_content("Ran the tests.\nProcess finished with exit code 0")
+
+    def test_nonzero_exit_code_is_an_error(self):
+        """A nonzero exit code (any casing / with a colon) is still an error."""
+        from headroom.learn.scanner import is_error_content
+
+        assert is_error_content("build failed\ncommand exited with exit code 1")
+        assert is_error_content("npm run build\nExit code: 127")
+
 
 # =============================================================================
 # Real-World Integration Tests (skipped if data not present)
@@ -280,9 +294,20 @@ class TestCodexIntegration:
 
         assert len(sessions) > 0
 
-        # Codex has only Bash tool (shell)
+        # This runs against whatever Codex sessions the machine actually has,
+        # so it must not pin one release's tool vocabulary. Codex has renamed
+        # its shell tool across versions (`Bash` -> `shell` -> `exec`) and
+        # 0.149.0 added agent tools alongside it, which is what the pipeline
+        # has to keep parsing.
         all_tools = {tc.name for s in sessions for tc in s.tool_calls}
-        assert "Bash" in all_tools
+        assert all_tools, "pipeline extracted no tool calls from real Codex sessions"
+
+        shell_tool_aliases = {"Bash", "shell", "exec", "local_shell", "container.exec"}
+        assert all_tools & shell_tool_aliases, (
+            "no shell-execution tool recognised in real Codex sessions; "
+            f"saw {sorted(all_tools)} -- if Codex renamed it again, add the "
+            "new name to shell_tool_aliases"
+        )
 
     def test_codex_writer_targets_agents_md(self, tmp_path):
         """Codex writer should target AGENTS.md, not CLAUDE.md."""

@@ -51,6 +51,8 @@ export {
 // --- Config types ---
 export type {
   HeadroomMode,
+  CompressMode,
+  CompressRequestConfig,
   RelevanceTier,
   ContentType,
   BlockKind,
@@ -131,7 +133,6 @@ export {
   proxyLogPath,
   debug400Dir,
   binDir,
-  rtkPath,
   deployRoot,
   beaconLockPath,
   modelsConfigPath,

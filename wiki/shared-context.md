@@ -28,10 +28,10 @@ Store content under a key. Compresses automatically using Headroom's full pipeli
 ```python
 entry = ctx.put("findings", big_json_output, agent="researcher")
 
-entry.original_tokens     # 20,000
-entry.compressed_tokens   # 4,000
-entry.savings_percent     # 80.0
-entry.transforms          # ["router:json:0.20"]
+entry.original_tokens  # 20,000
+entry.compressed_tokens  # 4,000
+entry.savings_percent  # 80.0
+entry.transforms  # ["router:json:0.20"]
 ```
 
 ### `get(key, *, full=False)`
@@ -39,9 +39,9 @@ entry.transforms          # ["router:json:0.20"]
 Retrieve content. Returns compressed version by default, original with `full=True`.
 
 ```python
-compressed = ctx.get("findings")           # 4K tokens
+compressed = ctx.get("findings")  # 4K tokens
 original = ctx.get("findings", full=True)  # 20K tokens
-missing = ctx.get("nonexistent")           # None
+missing = ctx.get("nonexistent")  # None
 ```
 
 ### `get_entry(key)`
@@ -50,13 +50,13 @@ Get the full `ContextEntry` with metadata.
 
 ```python
 entry = ctx.get_entry("findings")
-entry.key                # "findings"
-entry.agent              # "researcher"
-entry.original_tokens    # 20000
+entry.key  # "findings"
+entry.agent  # "researcher"
+entry.original_tokens  # 20000
 entry.compressed_tokens  # 4000
-entry.savings_percent    # 80.0
-entry.timestamp          # 1710000000.0
-entry.transforms         # ["router:json:0.20"]
+entry.savings_percent  # 80.0
+entry.timestamp  # 1710000000.0
+entry.transforms  # ["router:json:0.20"]
 ```
 
 ### `keys()`
@@ -69,11 +69,11 @@ Aggregated stats across all entries.
 
 ```python
 stats = ctx.stats()
-stats.entries                  # 3
-stats.total_original_tokens    # 60000
+stats.entries  # 3
+stats.total_original_tokens  # 60000
 stats.total_compressed_tokens  # 12000
-stats.total_tokens_saved       # 48000
-stats.savings_percent          # 80.0
+stats.total_tokens_saved  # 48000
+stats.savings_percent  # 80.0
 ```
 
 ### `clear()`
@@ -85,8 +85,8 @@ Remove all entries.
 ```python
 ctx = SharedContext(
     model="claude-sonnet-4-5-20250929",  # For token counting
-    ttl=3600,                             # 1 hour (default)
-    max_entries=100,                       # Evicts oldest when full
+    ttl=3600,  # 1 hour (default)
+    max_entries=100,  # Evicts oldest when full
 )
 ```
 
@@ -113,10 +113,12 @@ from headroom import SharedContext
 
 ctx = SharedContext()
 
+
 def researcher_node(state):
     result = do_research()
     ctx.put("research", result)
     return {"research_summary": ctx.get("research")}
+
 
 def coder_node(state):
     # Compressed summary in state, full details on demand
@@ -131,12 +133,14 @@ from headroom import SharedContext
 
 ctx = SharedContext()
 
+
 def compress_handoff(messages):
     for msg in messages:
         if len(msg.content) > 1000:
             ctx.put(msg.id, msg.content)
             msg.content = ctx.get(msg.id)
     return messages
+
 
 handoff(agent=coder, input_filter=compress_handoff)
 ```

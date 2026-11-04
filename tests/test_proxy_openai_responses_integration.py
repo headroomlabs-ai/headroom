@@ -297,8 +297,7 @@ class TestOpenAIResponsesCompression:
         assert response.status_code == 200
 
         stats = openai_responses_client.get("/stats").json()
-        # With bypass, proxy compression should not save tokens. The headline
-        # saved count may include RTK CLI savings from the developer shell.
+        # With bypass, proxy compression should not save tokens.
         assert stats["tokens"]["proxy_compression_saved"] == 0
 
 

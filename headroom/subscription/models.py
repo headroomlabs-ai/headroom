@@ -383,43 +383,30 @@ class HeadroomContribution:
     tokens_saved_compression: int = 0
     """Input tokens removed by proxy compression."""
 
-    tokens_saved_cli_filtering: int = 0
-    """Tokens avoided by the selected CLI context tool before reaching context."""
-
-    tokens_saved_rtk: int = 0
-    """Deprecated alias for CLI filtering tokens from older persisted state."""
-
     tokens_saved_cache_reads: int = 0
     """Input tokens served from Anthropic prefix-cache (discounted reads)."""
 
     compression_savings_usd: float = 0.0
     cache_savings_usd: float = 0.0
 
-    def cli_filtering_saved(self) -> int:
-        return max(self.tokens_saved_cli_filtering, self.tokens_saved_rtk)
-
     def total_saved(self) -> int:
-        return (
-            self.tokens_saved_compression
-            + self.cli_filtering_saved()
-            + self.tokens_saved_cache_reads
-        )
+        return self.tokens_saved_compression + self.tokens_saved_cache_reads
 
     def compression_saved(self) -> int:
-        """Tokens removed before model context by compression plus CLI filtering."""
+        """Tokens removed before model context by proxy compression."""
 
-        return self.tokens_saved_compression + self.cli_filtering_saved()
+        return self.tokens_saved_compression
 
     def total_savings_usd(self) -> float:
         return self.compression_savings_usd + self.cache_savings_usd
 
     def raw_without_headroom(self) -> int:
-        return self.tokens_submitted + self.tokens_saved_compression + self.cli_filtering_saved()
+        return self.tokens_submitted + self.tokens_saved_compression
 
     def efficiency_pct(self) -> float:
-        # Fraction of the pre-Headroom input that compression + CLI filtering
-        # removed. Use compression_saved() (which excludes cache reads) as the
-        # numerator: raw_without_headroom() also excludes cache reads, so mixing
+        # Fraction of the pre-Headroom input that compression removed. Use
+        # compression_saved() (which excludes cache reads) as the numerator:
+        # raw_without_headroom() also excludes cache reads, so mixing
         # total_saved() (which adds tokens_saved_cache_reads) into this ratio
         # made it inconsistent with its own denominator and let efficiency exceed
         # 100% (e.g. submitted=100, cache_reads=1000 -> 1000%). Cache reads are a
@@ -431,22 +418,17 @@ class HeadroomContribution:
         return round(self.compression_saved() / raw * 100, 1)
 
     def to_dict(self) -> dict[str, Any]:
+        # Older persisted payloads also carry ``cli_filtering`` / ``rtk`` /
+        # ``cli_filtering_raw`` / ``rtk_raw`` keys from the retired CLI
+        # context-tool layer. They are simply no longer written or read;
+        # SubscriptionTracker loads state key-by-key with ``dict.get`` (never
+        # ``HeadroomContribution(**payload)``), so an on-disk payload carrying
+        # those extra keys still loads without raising.
         return {
             "tokens_submitted": self.tokens_submitted,
             "tokens_saved": {
                 "compression": self.compression_saved(),
                 "proxy_compression": self.tokens_saved_compression,
-                "cli_filtering": self.cli_filtering_saved(),
-                "rtk": self.cli_filtering_saved(),
-                # PR-G2 (Realignment) — raw counters, distinct from the
-                # dashboard-facing ``cli_filtering`` / ``rtk`` keys (which
-                # both report ``max(cli_filtering, rtk)`` for legacy
-                # display). Persisted so the tracker can round-trip each
-                # counter independently — the bug PR-G2 retires is that
-                # ``tokens_saved_rtk`` and ``tokens_saved_cli_filtering``
-                # used to be identical.
-                "cli_filtering_raw": self.tokens_saved_cli_filtering,
-                "rtk_raw": self.tokens_saved_rtk,
                 "cache_reads": self.tokens_saved_cache_reads,
                 "total": self.total_saved(),
             },

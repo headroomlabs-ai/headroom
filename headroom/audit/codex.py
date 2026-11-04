@@ -1,8 +1,7 @@
 """Codex transcript audit — read-pattern analysis for shell-based clients.
 
 Codex has no structured Read tool: it reads files through shell commands
-(``cat``, ``sed -n 'a,bp'``, ``head``/``tail``, ``nl``) — frequently
-wrapped by rtk (``rtk read <file>``, ``rtk proxy <cmd>``). This module
+(``cat``, ``sed -n 'a,bp'``, ``head``/``tail``, ``nl``). This module
 classifies ``exec_command`` calls in Codex session transcripts
 (``~/.codex/sessions/**/*.jsonl``) and measures the read pattern so the
 read-maturation mechanism can be sized for Codex workloads.
@@ -23,8 +22,8 @@ from collections import Counter
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
-# Programs whose output is file content. "read" is rtk's read command.
-_READ_PROGS = frozenset({"cat", "sed", "head", "tail", "nl", "bat", "more", "read"})
+# Programs whose output is file content.
+_READ_PROGS = frozenset({"cat", "sed", "head", "tail", "nl", "bat", "more"})
 _SEARCH_PROGS = frozenset({"rg", "grep", "ugrep", "ag", "fd", "find"})
 _BUILD_PROGS = frozenset({"python", "python3", "pytest", "cargo", "npm", "make", "uv", "ruff"})
 _RANGE_RE = re.compile(r"^\d+([,:-]\d+)?p?$")
@@ -55,19 +54,6 @@ class CodexAuditReport:
 
     def to_dict(self) -> dict:
         return asdict(self)
-
-
-def strip_wrappers(cmd: str) -> str:
-    """Peel rtk wrappers: ``rtk <cmd>`` and ``rtk proxy <cmd>``."""
-    c = cmd.strip()
-    while True:
-        if c.startswith("rtk "):
-            c = c[4:].strip()
-            continue
-        if c.startswith("proxy "):
-            c = c[6:].strip()
-            continue
-        return c
 
 
 def _resolve_path(path: str | None, workdir: str = "") -> str | None:
@@ -129,7 +115,7 @@ def classify_command(cmd: str, workdir: str = "") -> tuple[str, str | None, bool
     Categories: read, search, git, edit, build/test, compound, other.
     For reads and edits, the path is resolved against ``workdir`` when relative.
     """
-    c = strip_wrappers(cmd)
+    c = cmd.strip()
     try:
         toks = shlex.split(c)
     except ValueError:

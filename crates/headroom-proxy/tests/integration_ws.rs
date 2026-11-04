@@ -53,7 +53,7 @@ async fn ws_text_and_binary_round_trip() {
 
     for i in 0..5 {
         let m = format!("hello-{i}");
-        ws.send(Message::Text(m.clone())).await.unwrap();
+        ws.send(Message::Text(m.clone().into())).await.unwrap();
         let echoed = ws.next().await.unwrap().unwrap();
         match echoed {
             Message::Text(t) => assert_eq!(t.as_str(), m),
@@ -62,7 +62,7 @@ async fn ws_text_and_binary_round_trip() {
     }
     for i in 0..5u8 {
         let m: Vec<u8> = (0..32u8).map(|b| b ^ i).collect();
-        ws.send(Message::Binary(m.clone())).await.unwrap();
+        ws.send(Message::Binary(m.clone().into())).await.unwrap();
         let echoed = ws.next().await.unwrap().unwrap();
         match echoed {
             Message::Binary(b) => assert_eq!(b.to_vec(), m),

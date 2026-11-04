@@ -204,6 +204,105 @@ def test_force_kompress_routes_anthropic_tool_result_to_targeted_kompress(
     assert captured["target_ratio"] == 0.10
 
 
+def test_diagnostics_content_blocks_unchanged_reports_protected_not_compressed(router, tokenizer):
+    """Regression for PR #3058 review: a content-block (Anthropic-shape)
+    message where every block is protected/passed through must be diagnosed
+    as unchanged -- not falsely reported as "compressed:content_blocks" just
+    because it took the content-blocks route.
+    """
+    messages = [
+        {
+            "role": "user",
+            "content": [
+                {
+                    "type": "tool_result",
+                    "tool_use_id": "toolu_small_1",
+                    # Far below any min_chars compression threshold, so
+                    # _process_content_blocks passes it through untouched.
+                    "content": "ok",
+                }
+            ],
+        }
+    ]
+
+    result = router.apply(
+        messages,
+        tokenizer,
+        collect_diagnostics=True,
+        compress_user_messages=True,
+        min_tokens_to_compress=1,
+        read_protection_window=0,
+    )
+
+    assert len(result.message_decisions) == 1
+    decision = result.message_decisions[0]
+    assert decision.action == "protected:content_blocks_unchanged"
+    assert decision.tokens_before == decision.tokens_after
+    assert decision.tokens_before > 0
+
+
+def test_diagnostics_content_blocks_compressed_reports_accurate_tokens(
+    router, tokenizer, monkeypatch
+):
+    """Regression for PR #3058 review: a genuinely-compressed content-block
+    message must report real before/after token counts (via the content-block
+    tokenizer), not the previous hard-coded 0s that only counted string
+    content.
+    """
+    captured: dict[str, object] = {}
+
+    class FakeKompress:
+        def is_ready(self) -> bool:
+            return True
+
+        def ensure_background_load(self) -> None:
+            pass
+
+        def compress(self, content, **kwargs):
+            captured.update(kwargs)
+            compressed = " ".join(content.split()[:20]) + " Retrieve more: hash=deadbeef"
+            return SimpleNamespace(
+                compressed=compressed,
+                compressed_tokens=len(compressed.split()),
+            )
+
+    monkeypatch.setattr(router, "_get_kompress", lambda: FakeKompress())
+    tool_content = " ".join(
+        f'{{"file":"src/module_{i}.py","line":{i},"text":"repeated search payload"}}'
+        for i in range(160)
+    )
+    messages = [
+        {
+            "role": "user",
+            "content": [
+                {
+                    "type": "tool_result",
+                    "tool_use_id": "toolu_search_1",
+                    "content": tool_content,
+                }
+            ],
+        }
+    ]
+
+    result = router.apply(
+        messages,
+        tokenizer,
+        collect_diagnostics=True,
+        force_kompress=True,
+        target_ratio=0.10,
+        compress_user_messages=True,
+        min_tokens_to_compress=10,
+        read_protection_window=0,
+    )
+
+    assert len(result.message_decisions) == 1
+    decision = result.message_decisions[0]
+    assert decision.action == "compressed:content_blocks"
+    assert decision.tokens_before > 0
+    assert decision.tokens_after > 0
+    assert decision.tokens_after < decision.tokens_before
+
+
 def test_skip_kompress_routes_around_ml_stage(router, tokenizer, monkeypatch):
     """skip_kompress (cold-start fast pass) must never invoke the Kompress ML
     stage — units that would route there take the same fallback as when the
@@ -893,7 +992,19 @@ class TestExcludeTools:
         assert "router:excluded:lossless_json" in result.transforms_applied
 
     def test_anthropic_mcp_bare_tool_alias_exclude_tools(self, tokenizer):
-        """Bare tool exclusions match custom-agent MCP wrappers (#1822)."""
+        """Bare tool exclusions match custom-agent MCP wrappers (#1822).
+
+        Any MCP wrapper's bare tool name can be excluded via config — this test
+        uses a fictitious "HeadroomZai" server name to prove the alias match is
+        server-name-agnostic. ``headroom_retrieve`` specifically is now also an
+        unconditional, config-independent exclusion (see the fix for the
+        ContentRouter self-recompression bug: SmartCrusher.apply() already
+        guarded #1077 on its own call path, but ContentRouter called
+        SmartCrusher.crush() directly, bypassing it). That guard fires before
+        the config-driven `excluded_tool_ids` check below, giving byte-identical
+        passthrough rather than the lossless-JSON fold a narrower custom
+        `exclude_tools` used to produce for this specific tool name.
+        """
         config = ContentRouterConfig(
             min_section_tokens=10,
             exclude_tools={"headroom_retrieve"},
@@ -918,6 +1029,50 @@ class TestExcludeTools:
                     {
                         "type": "tool_result",
                         "tool_use_id": "toolu_retrieve_1",
+                        "content": generate_json_data(50),
+                    }
+                ],
+            },
+        ]
+
+        result = router.apply(messages, tokenizer)
+
+        tool_result_block = result.messages[1]["content"][0]
+        # Byte-identical, not just JSON-semantically-equal: the unconditional
+        # ccr_retrieve guard passes the original block through untouched.
+        assert tool_result_block["content"] == messages[1]["content"][0]["content"]
+        assert "router:excluded:ccr_retrieve" in result.transforms_applied
+
+    def test_anthropic_mcp_bare_tool_alias_exclude_tools_generic(self, tokenizer):
+        """General #1822 coverage: bare-name alias matching through the
+        config-driven ``excluded_tool_ids``/``DEFAULT_VERBATIM_EXCLUDE_TOOLS``
+        path for an arbitrary tool that is NOT ``headroom_retrieve`` (which now
+        has its own unconditional guard that would otherwise mask this path —
+        see ``test_anthropic_mcp_bare_tool_alias_exclude_tools`` above)."""
+        config = ContentRouterConfig(
+            min_section_tokens=10,
+            exclude_tools={"measure"},
+        )
+        router = ContentRouter(config)
+
+        messages = [
+            {
+                "role": "assistant",
+                "content": [
+                    {
+                        "type": "tool_use",
+                        "id": "toolu_measure_1",
+                        "name": "mcp_build123d_measure",
+                        "input": {"key": "abc123"},
+                    }
+                ],
+            },
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "tool_result",
+                        "tool_use_id": "toolu_measure_1",
                         "content": generate_json_data(50),
                     }
                 ],
@@ -1643,3 +1798,70 @@ class TestCompressBlockContent:
         assert any("router:tool_result" in t for t in transforms_applied), (
             f"Expected router:tool_result:* in transforms, got: {transforms_applied}"
         )
+
+
+# =============================================================================
+# Mixed content: custom-tag protection (system-reminder mangling regression)
+# =============================================================================
+
+
+class TestMixedContentTagProtection:
+    """_compress_mixed must protect custom-tag blocks BEFORE section split.
+
+    Splitting first lands the open/close tags of a
+    ``<system-reminder>...</system-reminder>`` pair in different sections;
+    per-section protection then sees only unmatched tags (which protect
+    nothing) and the block's content — Claude Code ships CLAUDE.md this way —
+    is lossy-compressed and arrives word-dropped.
+    """
+
+    REMINDER = (
+        "<system-reminder>\n"
+        "Instruction prose that must survive byte-exact.\n\n"
+        "```bash\nrtk gain\n```\n\n"
+        "More instructions after the fence, also byte-exact.\n"
+        "</system-reminder>"
+    )
+
+    @staticmethod
+    def _mangling_router() -> ContentRouter:
+        """Router whose per-section compressor visibly mangles everything."""
+        router = ContentRouter(ContentRouterConfig(min_section_tokens=1))
+
+        def mangle(content, strategy, context, language=None, question=None, bias=1.0):
+            return "MANGLED", 1, None
+
+        router._apply_strategy_to_content = mangle  # type: ignore[method-assign]
+        return router
+
+    def test_reminder_block_survives_mixed_compression_verbatim(self):
+        router = self._mangling_router()
+        content = (
+            "Prose before the reminder that may compress.\n\n"
+            + self.REMINDER
+            + "\n\nProse after the reminder that may compress."
+        )
+
+        result = router._compress_mixed(content, context="")
+
+        # The tag block (fence and all) is byte-exact in the output...
+        assert self.REMINDER in result.compressed
+        # ...while content outside it still went through the compressor.
+        assert "MANGLED" in result.compressed
+
+    def test_reminder_only_content_passes_through(self):
+        router = self._mangling_router()
+
+        result = router._compress_mixed(self.REMINDER, context="")
+
+        assert self.REMINDER in result.compressed
+        assert "MANGLED" not in result.compressed
+
+    def test_untagged_mixed_content_still_compresses(self):
+        router = self._mangling_router()
+        content = "Plain prose section.\n\n```python\nprint('hi')\n```\n\nMore prose."
+
+        result = router._compress_mixed(content, context="")
+
+        assert "MANGLED" in result.compressed
+        assert result.strategy_used == CompressionStrategy.MIXED

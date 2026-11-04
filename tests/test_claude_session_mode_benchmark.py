@@ -97,7 +97,20 @@ def test_load_session_replay_groups_assistant_request_events(tmp_path: Path) -> 
 
 
 def test_simulation_and_winner_logic() -> None:
-    tool_blob = '{"rows":[1,2,3,4]}' * 80
+    # Realistic varied tool output. A pathologically repetitive blob (the same
+    # JSON object * N) is a degenerate case for a real BPE tokenizer — it merges
+    # the repetition to near-nothing — so a token-mode rewrite can cost MORE real
+    # tokens than the original, which the old character estimate masked by
+    # over-counting the repetition. Varied records keep the fixture representative
+    # of real agent tool output, where the rewrite is a genuine win.
+    tool_blob = json.dumps(
+        {
+            "rows": [
+                {"id": i, "label": f"row-{i}", "value": (i * 37) % 100, "ok": i % 3 == 0}
+                for i in range(150)
+            ]
+        }
+    )
     turn1 = ReplayTurn(
         session_id="s1",
         project_key="C--git-demo",

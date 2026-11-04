@@ -1,32 +1,35 @@
 //! Configuration for the proxy: CLI flags + env vars.
 
 use clap::{Parser, ValueEnum};
+use headroom_core::rollout::{
+    feature_names, split_feature_names, Feature, RolloutChannel, RolloutSnapshot,
+};
 use std::net::SocketAddr;
 use std::time::Duration;
 use url::Url;
 
 /// Compression mode policy for the `/v1/messages` endpoint.
 ///
-/// Drives whether `compress_anthropic_request` does any work. PR-A1
-/// (Phase A lockdown) wires the flag in but both modes currently
-/// passthrough — `live_zone` parses-but-warns until Phase B PR-B2
-/// fills in the live-zone-only block dispatcher.
+/// Drives whether `compress_anthropic_request` does any work. `off` is
+/// byte-faithful passthrough; `live_zone` routes the request through
+/// the headroom-core live-zone dispatcher, which compresses only the
+/// live-zone blocks (latest user message, latest tool/function/shell/
+/// patch outputs) via the per-content-type compressor table.
 ///
 /// We do NOT add an `icm` mode (the deleted code path) or a
 /// `passthrough` alias for `off` — those names are misleading. The
 /// only legal values are `off` (compression disabled) and `live_zone`
-/// (compress only the live-zone blocks; not yet implemented).
+/// (compress only the live-zone blocks).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 #[clap(rename_all = "snake_case")]
 pub enum CompressionMode {
     /// Compression disabled. Body forwards byte-equal to upstream.
-    /// This is the default; Phase B will switch the default to
-    /// `live_zone` once that mode is implemented.
+    /// This is the default.
     Off,
     /// Compress only live-zone blocks (latest user message,
-    /// latest tool/function/shell/patch outputs). NOT YET IMPLEMENTED:
-    /// in PR-A1 this falls through to passthrough behaviour with a
-    /// loud warning. Phase B PR-B2 wires in the actual dispatcher.
+    /// latest tool/function/shell/patch outputs) via the
+    /// headroom-core live-zone dispatcher's per-content-type
+    /// compressors.
     LiveZone,
 }
 
@@ -119,39 +122,35 @@ impl CacheControlAutoFrozen {
     }
 }
 
-/// Phase F PR-F2.1 c3/6: feature flag for the per-auth-mode
+/// Phase F PR-F2.1: feature flag for the per-auth-mode
 /// `CompressionPolicy` enforcement.
 ///
-/// `disabled` (default until c6/6): the proxy still classifies
-/// `auth_mode` and derives a `CompressionPolicy` for telemetry, but
-/// every dispatcher and transform behaves as if the mode were `Payg`
-/// — bit-for-bit current behaviour.
+/// `enabled` (default, from c5/5 onward): the policy struct's
+/// per-mode values take effect. For Subscription specifically, the
+/// cache aligner is skipped and the dispatcher gates on
+/// `policy.live_zone_compression_enabled()` (a no-op in F2.1 since
+/// that helper currently always returns `true`, but kept as a hook
+/// so F2.2 can flip without touching call sites).
 ///
-/// `enabled`: the policy struct's per-mode values take effect. For
-/// Subscription specifically, the cache aligner is skipped and the
-/// dispatcher gates on `policy.live_zone_compression_enabled()` (a
-/// no-op in F2.1 since that helper currently always returns `true`,
-/// but kept as a hook so F2.2 can flip without touching call sites).
-///
-/// Why a flag at all: F2.1 lands behind a default-disabled gate so
-/// commits 4 and 5 of the PR don't ship behaviour change to default
-/// users. Operators can flip this on for dogfooding before commit 6
-/// flips the default. Rollback: flip the env var back to `disabled`
-/// — instant if config is hot-reloaded, redeploy otherwise.
+/// `disabled`: the proxy still classifies `auth_mode` and derives a
+/// `CompressionPolicy` for telemetry, but every dispatcher and
+/// transform behaves as if the mode were `Payg` — bit-for-bit the
+/// pre-F2.1 behaviour. Operators can flip back to this for rollback
+/// if F2.1 surfaces a subscription regression — instant if config is
+/// hot-reloaded, redeploy otherwise.
 ///
 /// Source priority: CLI flag →
 /// `HEADROOM_PROXY_AUTH_MODE_POLICY_ENFORCEMENT` env var →
-/// default (`disabled`).
+/// default (`enabled`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 #[clap(rename_all = "snake_case")]
 pub enum AuthModePolicyEnforcement {
     /// Per-mode policy IS enforced. Subscription users see no
     /// cache_aligner; the dispatcher reads
-    /// `policy.live_zone_compression_enabled()`.
+    /// `policy.live_zone_compression_enabled()`. Default.
     Enabled,
     /// Per-mode policy IS NOT enforced. Every mode runs the PAYG
-    /// pipeline, identical to pre-F2.1 behaviour. Default in F2.1
-    /// commits 1–5 so the feature is dogfood-only until c6/6.
+    /// pipeline, identical to pre-F2.1 behaviour. Rollback opt-out.
     Disabled,
 }
 
@@ -181,6 +180,48 @@ impl CompressionMode {
     }
 }
 
+/// Session-sticky provider beta headers (parity port of the Python
+/// proxy's `HEADROOM_BETA_HEADER_STICKY`; see
+/// `cache_stabilization::beta_sticky`).
+///
+/// When `enabled` (default), the proxy unions each request's
+/// `anthropic-beta` / `openai-beta` tokens with the tokens previously
+/// seen for the same conversation and forwards the union, so a client
+/// dropping a beta token mid-conversation doesn't rotate the upstream
+/// prefix-cache key.
+///
+/// When `disabled`, the client header is forwarded verbatim and no
+/// per-session token state is kept. Diagnostic operator opt-in — NOT
+/// a fallback per realignment build constraint #4.
+///
+/// Source priority: CLI flag → `HEADROOM_PROXY_BETA_HEADER_STICKY`
+/// env var → default (`enabled`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+#[clap(rename_all = "snake_case")]
+pub enum BetaHeaderSticky {
+    /// Union beta tokens per conversation and forward the union.
+    /// Default. Matches the Python proxy's default behaviour.
+    Enabled,
+    /// Forward the client's beta header verbatim; keep no state.
+    /// Diagnostic-only.
+    Disabled,
+}
+
+impl BetaHeaderSticky {
+    /// Stable snake_case name suitable for log fields.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            BetaHeaderSticky::Enabled => "enabled",
+            BetaHeaderSticky::Disabled => "disabled",
+        }
+    }
+
+    /// Convenience: is the sticky union switched on?
+    pub fn is_enabled(self) -> bool {
+        matches!(self, BetaHeaderSticky::Enabled)
+    }
+}
+
 #[derive(Debug, Clone, Parser)]
 #[command(
     name = "headroom-proxy",
@@ -188,9 +229,71 @@ impl CompressionMode {
     about = "Headroom transparent reverse proxy"
 )]
 pub struct CliArgs {
+    /// Runtime rollout channel that bounds which managed features may run.
+    ///
+    /// `stable` admits only features that have completed bake time. `beta` and
+    /// `canary` admit progressively newer features. `dev` is for local work.
+    /// Explicit feature requests still cannot cross this boundary unless the
+    /// unsafe override is set.
+    #[arg(
+        long = "rollout-channel",
+        env = "HEADROOM_ROLLOUT_CHANNEL",
+        default_value = "stable",
+        value_parser = parse_rollout_channel,
+    )]
+    pub rollout_channel: String,
+
+    /// Comma-separated rollout features to request explicitly.
+    #[arg(
+        long = "features",
+        env = "HEADROOM_FEATURES",
+        default_value = "",
+        value_parser = parse_rollout_features,
+    )]
+    pub features: String,
+
+    /// Comma-separated rollout features to force off. Disable wins over defaults
+    /// and explicit enable requests.
+    #[arg(
+        long = "disable-features",
+        env = "HEADROOM_DISABLE_FEATURES",
+        default_value = "",
+        value_parser = parse_rollout_features,
+    )]
+    pub disable_features: String,
+
+    /// Break-glass override that allows unstable features below their channel.
+    /// Intended only for emergency mitigation and should be visible in logs.
+    #[arg(
+        long = "unsafe-allow-unstable-features",
+        env = "HEADROOM_UNSAFE_ALLOW_UNSTABLE_FEATURES",
+        default_value_t = false,
+        action = clap::ArgAction::Set,
+    )]
+    pub unsafe_allow_unstable_features: bool,
+
     /// Address the proxy listens on (e.g. 0.0.0.0:8787).
     #[arg(long, env = "HEADROOM_PROXY_LISTEN", default_value = "0.0.0.0:8787")]
     pub listen: SocketAddr,
+
+    /// Restrict the Prometheus `/metrics` scrape endpoint to loopback
+    /// clients. Default `false` to preserve existing behaviour (the
+    /// endpoint is reachable from wherever the proxy is bound). Set to
+    /// `true` — recommended whenever `--listen` binds a non-loopback
+    /// address — so `/metrics` (token counts, per-session cache-hit
+    /// rates, rate-limit gauges) is served only to `127.0.0.1` / `::1`
+    /// and returns 403 otherwise. This is defense-in-depth alongside
+    /// firewalling the path.
+    ///
+    /// Source priority: CLI flag → `HEADROOM_PROXY_METRICS_REQUIRE_LOOPBACK`
+    /// env var → default (`false`).
+    #[arg(
+        long = "metrics-require-loopback",
+        env = "HEADROOM_PROXY_METRICS_REQUIRE_LOOPBACK",
+        default_value_t = false,
+        action = clap::ArgAction::Set,
+    )]
+    pub metrics_require_loopback: bool,
 
     /// Upstream base URL the proxy forwards to (e.g. http://127.0.0.1:8788).
     /// REQUIRED — there is no default; we want operators to be explicit.
@@ -252,11 +355,9 @@ pub struct CliArgs {
     /// Compression mode policy for `/v1/messages`.
     ///
     /// `off` (default): byte-faithful passthrough on every request.
-    /// `live_zone`: PR-B2 wired the dispatcher; PR-B2's per-type
-    /// compressors are no-ops, so the body still round-trips
-    /// byte-equal until PR-B3+ (which fills the per-type table).
-    /// The flag exists so the default can flip in one config
-    /// change once `live_zone` is the safer choice on real traffic.
+    /// `live_zone`: routes the request through the headroom-core
+    /// live-zone dispatcher, which compresses eligible live-zone
+    /// blocks via its per-content-type compressor table.
     ///
     /// Source priority: CLI flag → `HEADROOM_PROXY_COMPRESSION_MODE`
     /// env var → default (`off`).
@@ -319,6 +420,28 @@ pub struct CliArgs {
         default_value_t = StripInternalHeaders::Enabled,
     )]
     pub strip_internal_headers: StripInternalHeaders,
+
+    /// Session-sticky provider beta headers: union `anthropic-beta` /
+    /// `openai-beta` tokens per conversation so a client dropping a
+    /// token mid-conversation doesn't bust the upstream prefix cache.
+    /// Parity port of the Python proxy's `SessionBetaTracker` (PR-A6).
+    /// Default `enabled`; `disabled` is a diagnostic operator opt-in.
+    ///
+    /// Active only when the compression interceptor is on
+    /// (`--compression` / `HEADROOM_PROXY_COMPRESSION=1`): with the
+    /// interceptor off the proxy is a strict byte-pipe and never
+    /// mutates headers. Startup logs a warning when this is `enabled`
+    /// while `--compression` is off.
+    ///
+    /// Source priority: CLI flag → `HEADROOM_PROXY_BETA_HEADER_STICKY`
+    /// env var → default (`enabled`).
+    #[arg(
+        long = "beta-header-sticky",
+        env = "HEADROOM_PROXY_BETA_HEADER_STICKY",
+        value_enum,
+        default_value_t = BetaHeaderSticky::Enabled,
+    )]
+    pub beta_header_sticky: BetaHeaderSticky,
 
     /// Phase C PR-C4: enable the `/v1/responses` SSE streaming
     /// pipeline. When `true` (default), `Accept: text/event-stream`
@@ -469,10 +592,64 @@ pub struct CliArgs {
         default_value = "https://www.googleapis.com/auth/cloud-platform"
     )]
     pub vertex_adc_scope: String,
+
+    /// Native savings stats: record per-request savings/cost
+    /// telemetry and serve `/stats`, `/stats/timeseries`,
+    /// `/stats/events`, and `/dashboard`. When disabled, nothing is
+    /// recorded and those paths fall through to the catch-all
+    /// forwarder (i.e. they reach the upstream, matching the
+    /// pre-feature behaviour).
+    ///
+    /// Source priority: CLI flag → `HEADROOM_PROXY_STATS` env var →
+    /// default (`false`).
+    #[arg(
+        long = "stats",
+        env = "HEADROOM_PROXY_STATS",
+        default_value_t = false,
+        action = clap::ArgAction::Set,
+    )]
+    pub stats: bool,
+
+    /// Where the savings ledger persists its state. When unset, the
+    /// proxy uses `$HEADROOM_WORKSPACE_DIR/native_stats.json` when
+    /// that env var is set (how the Python proxy resolves its
+    /// workspace), else `~/.headroom/native_stats.json`; if no home
+    /// directory can be resolved, stats stay in-memory (logged).
+    ///
+    /// Source priority: CLI flag → `HEADROOM_PROXY_STATS_PATH`
+    /// env var → workspace-derived default.
+    #[arg(long = "stats-path", env = "HEADROOM_PROXY_STATS_PATH")]
+    pub stats_path: Option<std::path::PathBuf>,
 }
 
 fn parse_duration(s: &str) -> Result<Duration, String> {
     humantime::parse_duration(s).map_err(|e| format!("invalid duration `{s}`: {e}"))
+}
+
+fn parse_rollout_channel(value: &str) -> Result<String, String> {
+    value
+        .parse::<RolloutChannel>()
+        .map(|channel| channel.as_str().to_owned())
+        .map_err(|_| {
+            format!("unknown rollout channel `{value}` (valid: stable, beta, canary, dev)")
+        })
+}
+
+fn parse_rollout_features(value: &str) -> Result<String, String> {
+    let valid = feature_names();
+    let unknown: Vec<_> = split_feature_names(value)
+        .into_iter()
+        .filter(|name| !valid.contains(name.as_str()))
+        .collect();
+    if unknown.is_empty() {
+        Ok(value.to_owned())
+    } else {
+        Err(format!(
+            "unknown rollout feature(s): {}; valid: {}",
+            unknown.join(", "),
+            valid.into_iter().collect::<Vec<_>>().join(", ")
+        ))
+    }
 }
 
 fn parse_bytes(s: &str) -> Result<u64, String> {
@@ -484,7 +661,12 @@ fn parse_bytes(s: &str) -> Result<u64, String> {
 /// Resolved configuration used by the running server.
 #[derive(Debug, Clone)]
 pub struct Config {
+    /// Runtime rollout state resolved from CLI/env.
+    pub rollout: RolloutSnapshot,
     pub listen: SocketAddr,
+    /// Gate the Prometheus `/metrics` endpoint to loopback clients.
+    /// Default `false`; recommend `true` when `listen` is non-loopback.
+    pub metrics_require_loopback: bool,
     pub upstream: Url,
     pub upstream_timeout: Duration,
     pub upstream_connect_timeout: Duration,
@@ -499,24 +681,27 @@ pub struct Config {
     /// Inherits `max_body_bytes` when not overridden. Bodies larger
     /// than this still forward, just unchanged.
     pub compression_max_body_bytes: u64,
-    /// Policy mode for compression on `/v1/messages`. PR-A1 lockdown:
-    /// both `Off` and `LiveZone` result in byte-faithful passthrough;
-    /// `LiveZone` additionally emits a `tracing::warn!` per request
-    /// because the dispatcher isn't implemented yet (Phase B PR-B2
-    /// fills this in).
+    /// Policy mode for compression on `/v1/messages`. `Off` is
+    /// byte-faithful passthrough; `LiveZone` routes the request
+    /// through the headroom-core live-zone dispatcher, which
+    /// compresses eligible live-zone blocks via its per-content-type
+    /// compressor table.
     pub compression_mode: CompressionMode,
     /// Whether the live-zone dispatcher derives `frozen_message_count`
     /// automatically from customer `cache_control` markers. PR-A4
     /// adds the derivation function (`compute_frozen_count`); Phase
     /// B's dispatcher consumes the resolved value here.
     pub cache_control_auto_frozen: CacheControlAutoFrozen,
-    /// Phase F PR-F2.1 c3/6: gate per-auth-mode `CompressionPolicy`
-    /// enforcement. `Disabled` until c6/6 flips the default.
+    /// Phase F PR-F2.1: gate per-auth-mode `CompressionPolicy`
+    /// enforcement. `Enabled` by default (from c5/5 onward).
     pub auth_mode_policy_enforcement: AuthModePolicyEnforcement,
     /// Whether to strip internal `x-headroom-*` headers from
     /// upstream-bound requests. PR-A5 default-on guard against
     /// fingerprinting / leakage of internal flags.
     pub strip_internal_headers: StripInternalHeaders,
+    /// Session-sticky provider beta headers (parity port of the
+    /// Python `SessionBetaTracker`, PR-A6). Default `enabled`.
+    pub beta_header_sticky: BetaHeaderSticky,
     /// PR-C4: enable the `/v1/responses` streaming pipeline (SSE
     /// state-machine + telemetry tee). Default `true`.
     pub enable_responses_streaming: bool,
@@ -551,10 +736,39 @@ pub struct Config {
     /// PR-D4: GCP ADC OAuth scope used when fetching the bearer
     /// token. Default `https://www.googleapis.com/auth/cloud-platform`.
     pub vertex_adc_scope: String,
+    /// Native savings stats: record per-request telemetry and serve
+    /// `/stats`, `/stats/timeseries`, `/stats/events`, `/dashboard`.
+    pub stats: bool,
+    /// Ledger persistence path. `None` keeps stats in-memory.
+    pub stats_path: Option<std::path::PathBuf>,
 }
 
 impl Config {
     pub fn from_cli(args: CliArgs) -> Self {
+        let mut explicit_features = Vec::new();
+        if args.enable_responses_streaming {
+            explicit_features.push(Feature::OpenAiResponsesStreaming);
+        }
+        if args.enable_bedrock_native {
+            explicit_features.push(Feature::NativeBedrock);
+        }
+        // Preserve the pre-rollout rollback controls as legacy disables. Both
+        // features are stable defaults in the registry, so merely omitting a
+        // false flag from `explicit_features` would turn it straight back on.
+        let mut disabled_features = split_feature_names(&args.disable_features);
+        if !args.enable_responses_streaming {
+            disabled_features.push(Feature::OpenAiResponsesStreaming.spec().name.to_owned());
+        }
+        if !args.enable_bedrock_native {
+            disabled_features.push(Feature::NativeBedrock.spec().name.to_owned());
+        }
+        let rollout = RolloutSnapshot::from_parts_with_explicit(
+            &args.rollout_channel,
+            &args.features,
+            &disabled_features.join(","),
+            args.unsafe_allow_unstable_features,
+            &explicit_features,
+        );
         let rewrite_host = if args.no_rewrite_host {
             false
         } else {
@@ -564,7 +778,9 @@ impl Config {
             .compression_max_body_bytes
             .unwrap_or(args.max_body_bytes);
         Self {
+            rollout: rollout.clone(),
             listen: args.listen,
+            metrics_require_loopback: args.metrics_require_loopback,
             upstream: args.upstream,
             upstream_timeout: args.upstream_timeout,
             upstream_connect_timeout: args.upstream_connect_timeout,
@@ -578,15 +794,22 @@ impl Config {
             cache_control_auto_frozen: args.cache_control_auto_frozen,
             auth_mode_policy_enforcement: args.auth_mode_policy_enforcement,
             strip_internal_headers: args.strip_internal_headers,
-            enable_responses_streaming: args.enable_responses_streaming,
+            beta_header_sticky: args.beta_header_sticky,
+            enable_responses_streaming: rollout.is_enabled(
+                Feature::OpenAiResponsesStreaming,
+                args.enable_responses_streaming,
+            ),
             enable_conversations_passthrough: args.enable_conversations_passthrough,
-            enable_bedrock_native: args.enable_bedrock_native,
+            enable_bedrock_native: rollout
+                .is_enabled(Feature::NativeBedrock, args.enable_bedrock_native),
             bedrock_region: args.bedrock_region,
             bedrock_endpoint: args.bedrock_endpoint,
             aws_profile: args.aws_profile,
             bedrock_validate_eventstream_crc: args.bedrock_validate_eventstream_crc,
             vertex_region: args.vertex_region,
             vertex_adc_scope: args.vertex_adc_scope,
+            stats: args.stats,
+            stats_path: args.stats_path.or_else(default_stats_path),
         }
     }
 
@@ -594,7 +817,13 @@ impl Config {
     /// production-default behaviour so existing tests stay unchanged.
     pub fn for_test(upstream: Url) -> Self {
         Self {
+            rollout: RolloutSnapshot::default(),
             listen: "127.0.0.1:0".parse().unwrap(),
+            // Off by default in tests: the metrics integration tests
+            // scrape `/metrics` and assert 200, and oneshot-style tests
+            // carry no `ConnectInfo`. Tests that exercise the gate set
+            // this to `true` explicitly.
+            metrics_require_loopback: false,
             upstream,
             upstream_timeout: Duration::from_secs(60),
             upstream_connect_timeout: Duration::from_secs(5),
@@ -621,6 +850,9 @@ impl Config {
             // from upstream-bound requests. Tests opt out per-case via
             // `start_proxy_with`.
             strip_internal_headers: StripInternalHeaders::Enabled,
+            // Production default: sticky beta-header union per
+            // conversation (Python-parity). Tests opt out per-case.
+            beta_header_sticky: BetaHeaderSticky::Enabled,
             // PR-C4: streaming pipeline + conversations passthrough
             // both default-on so tests exercise the same paths
             // production traffic will hit.
@@ -641,6 +873,106 @@ impl Config {
             // only; the upstream URL is `upstream`).
             vertex_region: "us-central1".to_string(),
             vertex_adc_scope: "https://www.googleapis.com/auth/cloud-platform".to_string(),
+            // Stats on (routes mounted, recording active) but
+            // in-memory: tests never touch a real home directory.
+            stats: true,
+            stats_path: None,
         }
+    }
+}
+
+/// Default persistence location for the savings ledger. Honours the
+/// same `HEADROOM_WORKSPACE_DIR` override the Python proxy uses for
+/// its workspace, falling back to `~/.headroom`. `None` (no home
+/// resolvable) keeps stats in-memory.
+fn default_stats_path() -> Option<std::path::PathBuf> {
+    if let Ok(dir) = std::env::var("HEADROOM_WORKSPACE_DIR") {
+        let dir = dir.trim();
+        if !dir.is_empty() {
+            // Tilde-expand, matching the Python proxy's
+            // `workspace_dir()` semantics (its tests pin
+            // `HEADROOM_WORKSPACE_DIR=~/custom` → `$HOME/custom`).
+            let expanded = if let Some(rest) = dir.strip_prefix("~/") {
+                match home_dir() {
+                    Some(home) => home.join(rest),
+                    None => return None,
+                }
+            } else {
+                std::path::PathBuf::from(dir)
+            };
+            return Some(expanded.join("native_stats.json"));
+        }
+    }
+    Some(home_dir()?.join(".headroom").join("native_stats.json"))
+}
+
+fn home_dir() -> Option<std::path::PathBuf> {
+    std::env::var("HOME")
+        .ok()
+        .filter(|h| !h.trim().is_empty())
+        .or_else(|| std::env::var("USERPROFILE").ok())
+        .map(std::path::PathBuf::from)
+}
+
+#[cfg(test)]
+mod rollout_input_tests {
+    use super::*;
+
+    #[test]
+    fn explicit_rollout_inputs_are_strict_and_diagnosable() {
+        assert_eq!(parse_rollout_channel("CANARY").unwrap(), "canary");
+        assert!(parse_rollout_channel("stabel")
+            .unwrap_err()
+            .contains("unknown rollout channel"));
+        assert!(parse_rollout_features("native-bedrock").is_ok());
+        let error = parse_rollout_features("native_bedrok").unwrap_err();
+        assert!(error.contains("native_bedrok"));
+        assert!(error.contains("native_bedrock"));
+    }
+
+    #[test]
+    fn legacy_false_flags_remain_effective_rollout_disables() {
+        let args = CliArgs::try_parse_from([
+            "headroom-proxy",
+            "--upstream",
+            "http://127.0.0.1:9",
+            "--enable-responses-streaming",
+            "false",
+            "--enable-bedrock-native",
+            "false",
+        ])
+        .unwrap();
+
+        let config = Config::from_cli(args);
+
+        for feature in [Feature::OpenAiResponsesStreaming, Feature::NativeBedrock] {
+            let decision = config.rollout.decision(feature);
+            assert!(!decision.enabled);
+            assert!(decision.disabled);
+            assert_eq!(
+                decision.reason,
+                headroom_core::rollout::FeatureDecisionReason::Disabled
+            );
+        }
+        assert!(!config.enable_responses_streaming);
+        assert!(!config.enable_bedrock_native);
+    }
+
+    #[test]
+    fn native_stats_require_explicit_opt_in() {
+        let base = ["headroom-proxy", "--upstream", "http://127.0.0.1:9"];
+        let default_config = Config::from_cli(CliArgs::try_parse_from(base).unwrap());
+        assert!(!default_config.stats);
+
+        let enabled = Config::from_cli(
+            CliArgs::try_parse_from([
+                "headroom-proxy",
+                "--upstream",
+                "http://127.0.0.1:9",
+                "--stats=true",
+            ])
+            .unwrap(),
+        );
+        assert!(enabled.stats);
     }
 }

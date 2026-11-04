@@ -1,0 +1,22 @@
+{
+  "config": {
+    "chunk_words": 350,
+    "device": "auto",
+    "enable_ccr": false,
+    "model_id": "chopratejas/kompress-v2-base",
+    "score_threshold": 0.5
+  },
+  "input": "Once the migration completes the application reads its runtime feature flags from the host mounted configuration file and hot reloads them on change without requiring a full restart of the running service process. Once the migration completes the application reads its runtime feature flags from the host mounted configuration file and hot reloads them on change without requiring a full restart of the running service process. Once the migration completes the application reads its runtime feature flags from the host mounted configuration file and hot reloads them on change without requiring a full restart of the running service process. ",
+  "input_sha256": "74fde229e9465c817fdb3c259add19c4e20baa74730872dbd325edbc5688cbb4",
+  "output": {
+    "cache_key": null,
+    "compressed": "Once migration completes application reads its runtime feature flags from host mounted configuration file and hot reloads them on change without requiring a full restart running service process. Once migration completes application reads its runtime feature flags from host mounted configuration file hot reloads them on change without requiring a full restart running service process. Once migration completes application reads its runtime feature flags host mounted configuration file and hot reloads them on change without requiring full restart running service process.",
+    "compressed_tokens": 81,
+    "compression_ratio": 0.8181818181818182,
+    "model_used": "chopratejas/kompress-v2-base",
+    "original": "Once the migration completes the application reads its runtime feature flags from the host mounted configuration file and hot reloads them on change without requiring a full restart of the running service process. Once the migration completes the application reads its runtime feature flags from the host mounted configuration file and hot reloads them on change without requiring a full restart of the running service process. Once the migration completes the application reads its runtime feature flags from the host mounted configuration file and hot reloads them on change without requiring a full restart of the running service process. ",
+    "original_tokens": 99
+  },
+  "recorded_at": "2026-06-18T23:18:31.939337+00:00",
+  "transform": "kompress"
+}

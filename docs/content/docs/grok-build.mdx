@@ -3,7 +3,7 @@ title: Grok Build Integration
 description: Route Grok Build traffic through Headroom for token compression and per-project savings attribution.
 ---
 
-Use `headroom wrap grok-build` to route Grok Build LLM traffic through the local Headroom proxy. The wrapper starts or reuses the proxy, injects a reversible `[model.grok-build]` override into `~/.grok/config.toml` (or `$GROK_HOME/config.toml`), optionally sets up RTK or `lean-ctx`, and prints next steps for launching `grok`.
+Use `headroom wrap grok-build` to route Grok Build LLM traffic through the local Headroom proxy. The wrapper starts or reuses the proxy, injects a reversible `[model.grok-build]` override into `~/.grok/config.toml` (or `$GROK_HOME/config.toml`), and prints next steps for launching `grok`.
 
 ## Quick Start
 
@@ -30,7 +30,6 @@ headroom unwrap grok-build
 | Proxy | Starts the Headroom proxy unless `--no-proxy` is set |
 | Model config | Writes or updates `[model.grok-build] base_url` in Grok's `config.toml`, pointing at `http://127.0.0.1:<port>/v1` (with optional `/p/<project>` prefix for savings attribution) |
 | Existing config | If you already have a `[model.grok-build]` table, Headroom rewrites `base_url` in place instead of appending a duplicate table (invalid TOML) |
-| Context tool | Injects RTK or `lean-ctx` guidance into project `AGENTS.md` unless `--no-context-tool` is set |
 | MCP install | `headroom mcp install` can register Headroom MCP via `GrokRegistrar` |
 | Backup | Snapshots `config.toml` to `config.toml.headroom-backup` before the first injection |
 
@@ -39,7 +38,6 @@ headroom unwrap grok-build
 ```bash
 headroom wrap grok-build \
   --port 8787 \            # Proxy port (default: 8787)
-  --no-context-tool \      # Skip RTK / lean-ctx setup
   --no-proxy \             # Use an existing proxy instead of starting one
   --learn \                # Enable live traffic learning
   --memory                 # Enable persistent memory
@@ -50,7 +48,6 @@ headroom wrap grok-build \
 | Variable | Description |
 |---|---|
 | `GROK_HOME` | Override Grok config directory (default: `~/.grok`) |
-| `HEADROOM_CONTEXT_TOOL` | Set to `lean-ctx` to use lean-ctx instead of RTK |
 | `XAI_API_KEY` | Grok API key (also accepts `GROK_CODE_XAI_API_KEY`) |
 
 ## Persistent Install

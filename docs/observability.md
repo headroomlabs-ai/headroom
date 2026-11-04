@@ -3,7 +3,7 @@
 The Headroom Rust proxy exposes Prometheus-format metrics on the
 `/metrics` endpoint of every running proxy instance. The metric
 catalogue below covers Phase D (Bedrock route instrumentation) and
-Phase G PR-G3 (per-invocation RTK + proxy-wide observability).
+Phase G PR-G3 (proxy-wide observability).
 
 All metric names + label keys are constants in
 `crates/headroom-proxy/src/observability/metric_names.rs`, so any
@@ -58,17 +58,6 @@ intentional byte mutations do not trip the alarm.
 |------|------|--------|---------|
 | `proxy_service_tier_count_total` | Counter | `tier` | Service-tier distribution observed at the proxy. |
 | `proxy_response_status_count_total` | Counter | `status` | Terminal status distribution (`completed`, `incomplete`, `failed`, `cancelled`, `in_progress`). |
-
-#### Wrap CLI / RTK (Python-side)
-
-| Name | Type | Labels | Purpose |
-|------|------|--------|---------|
-| `wrap_rtk_invocations_total` | Counter | `tool` | RTK invocations observed via the wrap-CLI tail. Surfaced via the Python proxy's `/metrics` exporter; the wrap CLI bumps `headroom.cli.wrap_rtk_metrics.record_rtk_invocation(...)`. |
-
-> **C4 remediation:** This counter is Python-side because RTK is
-> wrapped by `headroom wrap` (Python CLI) and the wrap-side tail
-> is the natural emit site. The Rust proxy previously held a dead
-> counter for this metric; that has been removed.
 
 #### Image log redaction (Python-side)
 
@@ -140,9 +129,6 @@ sum by (strategy) (rate(proxy_compression_rejected_by_token_check_total{strategy
 
 # Upstream rate-limit headroom (smaller = closer to throttle).
 proxy_rate_limit_remaining_tokens{provider="anthropic"}
-
-# RTK invocation rate (Python-side).
-sum by (tool) (rate(wrap_rtk_invocations_total{tool!="__init__"}[5m]))
 
 # Image-redaction rate (Python-side).
 rate(proxy_image_generation_call_log_redacted_total[5m])
@@ -262,13 +248,24 @@ Every label vocabulary is bounded by code, not customer input:
 - `tool` (Python-side `wrap_rtk_invocations_total`): bounded by the
   set of tools the wrap CLI rewrites, captured by
   `headroom.cli.wrap_rtk_metrics`.
+- `model` (Python-side `requests_by_model` /
+  `_cache_requests_by_model`): unlike the Rust path above, the Python
+  proxy reads `model` from the request body, so it is client-supplied.
+  It is bounded at record time by `MAX_DISTINCT_MODELS`
+  (`headroom.telemetry.context`): once the cap is reached, further
+  distinct models bucket into the `"other"` sentinel and a one-time
+  warning is logged, mirroring the `tier` discipline above. The
+  in-memory dicts and the exported `headroom_requests_by_model` series
+  can never exceed the cap plus `"other"`.
+
+Every label vocabulary listed above is bounded by code, so no
+client-supplied value can drive label cardinality unbounded.
 
 There is no code path where a malicious client can drive label
 cardinality unbounded.
 
 ## See also
 
-- `docs/rtk-architecture.md` — why RTK lives wrap-side, not proxy-side.
 - `crates/headroom-proxy/src/observability/` — implementation.
 - `REALIGNMENT/09-phase-G-rtk-observability.md` — spec.
 - `REALIGNMENT/10-phase-H-python-retirement.md` — H1 acceptance gate.

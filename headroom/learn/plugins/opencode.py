@@ -1,7 +1,9 @@
 """OpenCode plugin for headroom learn.
 
 Reads conversation data from the OpenCode SQLite database at
-``~/.local/share/opencode/opencode.db``.
+``~/.local/share/opencode/opencode.db`` or
+``~/.local/share/opencode/opencode-local.db``. Set
+``HEADROOM_OPENCODE_DB`` to force a specific database path.
 
 OpenCode stores messages and tool parts in two tables:
 - ``message``: one row per turn (user/assistant), with JSON ``data``
@@ -28,6 +30,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import sqlite3
 from datetime import datetime, timezone
 from pathlib import Path
@@ -42,10 +45,14 @@ from ..models import (
     ToolCall,
 )
 from ..writer import CodexWriter, ContextWriter
+from ._paths import path_exists
 
 logger = logging.getLogger(__name__)
 
-_OPENCODE_DB = Path.home() / ".local" / "share" / "opencode" / "opencode.db"
+_OPENCODE_DIR = Path.home() / ".local" / "share" / "opencode"
+_OPENCODE_DB = _OPENCODE_DIR / "opencode.db"
+_OPENCODE_DB_ENV = "HEADROOM_OPENCODE_DB"
+_OPENCODE_DB_CANDIDATES = ("opencode-local.db", "opencode.db")
 
 # Tool part status values that indicate failure.
 _ERROR_STATUSES = {"error", "failed", "aborted"}
@@ -59,7 +66,7 @@ class OpenCodePlugin(LearnPlugin, ConversationScanner):
     """
 
     def __init__(self, db_path: Path | None = None) -> None:
-        self._db_path = db_path or _OPENCODE_DB
+        self._db_path = self._resolve_db_path(db_path)
 
     # ------------------------------------------------------------------
     # LearnPlugin identity
@@ -75,7 +82,10 @@ class OpenCodePlugin(LearnPlugin, ConversationScanner):
 
     @property
     def description(self) -> str:
-        return "OpenCode (~/.local/share/opencode/opencode.db)"
+        return (
+            "OpenCode (~/.local/share/opencode/{opencode.db,opencode-local.db}; "
+            "HEADROOM_OPENCODE_DB overrides)"
+        )
 
     def detect(self) -> bool:
         return self._db_path.exists()
@@ -117,7 +127,7 @@ class OpenCodePlugin(LearnPlugin, ConversationScanner):
                         name=proj_name or worktree_path.name or proj_id,
                         project_path=worktree_path,
                         data_path=self._db_path.parent,
-                        context_file=agents_md if agents_md.exists() else None,
+                        context_file=agents_md if path_exists(agents_md) else None,
                     )
                 )
         finally:
@@ -176,6 +186,29 @@ class OpenCodePlugin(LearnPlugin, ConversationScanner):
                 sessions.append(session)
 
         return sessions
+
+    @staticmethod
+    def _resolve_db_path(db_path: Path | None) -> Path:
+        if db_path is not None:
+            return db_path
+
+        override = os.getenv(_OPENCODE_DB_ENV)
+        if override is not None:
+            return Path(override).expanduser()
+
+        ranked_candidates: list[tuple[int, int, Path]] = []
+        for name in _OPENCODE_DB_CANDIDATES:
+            candidate = _OPENCODE_DIR / name
+            try:
+                mtime_ns = candidate.stat().st_mtime_ns
+            except OSError:
+                continue
+            ranked_candidates.append((mtime_ns, 1 if name == "opencode.db" else 0, candidate))
+
+        if ranked_candidates:
+            return max(ranked_candidates)[2]
+
+        return _OPENCODE_DB
 
     def _scan_session(
         self,

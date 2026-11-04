@@ -26,7 +26,9 @@ const response = await openai.chat.completions.create({
 
 ## How It Works
 
-The TypeScript SDK is an HTTP client. When you call `compress()`, it sends your messages to the Headroom proxy's `POST /v1/compress` endpoint. The proxy runs the full compression pipeline (SmartCrusher, ContentRouter, CacheAligner, etc.) and returns compressed messages. No compression logic runs in Node.js — all the heavy lifting happens in the proxy.
+The TypeScript SDK is an HTTP client. When you call `compress()`, it sends your messages to the Headroom proxy's `POST /v1/compress` endpoint. The proxy runs the compression pipeline (ContentRouter and its compressors, including SmartCrusher) and returns compressed messages. No compression logic runs in Node.js — all the heavy lifting happens in the proxy.
+
+The proxy must be reachable on **loopback**: `/v1/compress` rejects remote callers with `404` unless it was started with `HEADROOM_COMPRESS_ALLOW_REMOTE=1`.
 
 ```
 Your TypeScript App
@@ -37,7 +39,7 @@ headroom-ai (npm)  ← HTTP client
     │
     │  POST /v1/compress
     ▼
-Headroom Proxy / Cloud  ← compression pipeline (Python)
+Headroom Proxy (loopback)  ← compression pipeline (Python)
     │
     │  compressed messages
     ▼
@@ -200,7 +202,7 @@ The `headroom-ai` package has no runtime dependencies. Framework SDKs (Vercel AI
 
 ## OpenClaw Plugin
 
-The TypeScript SDK powers the [`headroom-openclaw`](https://www.npmjs.com/package/headroom-openclaw) plugin for [OpenClaw](https://github.com/openclaw/openclaw) agents. The plugin uses `HeadroomClient` internally to compress context during the `assemble()` lifecycle hook. The preferred install flow is `headroom wrap openclaw`; the direct plugin command is `openclaw plugins install --dangerously-force-unsafe-install headroom-ai/openclaw`. See the [plugin source](https://github.com/chopratejas/headroom/tree/main/plugins/openclaw) for details.
+The TypeScript SDK powers the [`headroom-openclaw`](https://www.npmjs.com/package/headroom-openclaw) plugin for [OpenClaw](https://github.com/openclaw/openclaw) agents. The plugin uses `HeadroomClient` internally to compress context during the `assemble()` lifecycle hook. The preferred install flow is `headroom wrap openclaw`; the direct plugin command is `openclaw plugins install --dangerously-force-unsafe-install headroom-ai/openclaw`. See the [plugin source](https://github.com/headroomlabs-ai/headroom/tree/main/plugins/openclaw) for details.
 
 ## Comparison with Python SDK
 

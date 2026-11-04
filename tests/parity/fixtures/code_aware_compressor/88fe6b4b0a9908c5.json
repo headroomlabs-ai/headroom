@@ -1,0 +1,37 @@
+{
+  "config": {
+    "ccr_ttl": 300,
+    "compress_comments": true,
+    "docstring_mode": "full",
+    "enable_ccr": false,
+    "fallback_to_kompress": false,
+    "language_hint": null,
+    "max_body_lines": 5,
+    "min_tokens_for_compression": 100,
+    "preserve_decorators": true,
+    "preserve_imports": true,
+    "preserve_signatures": true,
+    "preserve_type_annotations": true,
+    "semantic_analysis": true,
+    "target_compression_rate": 0.2
+  },
+  "input": "import logging\n\n\ndef configure(level, handlers, fmt):\n    \"\"\"Configure logging for the whole app.\n\n    Sets up the root logger with the given level and handlers.\n    \"\"\"\n    logger = logging.getLogger()\n    logger.setLevel(level)\n    for h in handlers:\n        logger.addHandler(h)\n    logger.info('configured')\n    return logger\n",
+  "input_sha256": "88fe6b4b0a9908c54185177fa5adfdd8533ececd54e57ba74391fd228ee685c4",
+  "output": {
+    "cache_key": null,
+    "compressed": "import logging\n\n\ndef configure(level, handlers, fmt):\n    \"\"\"Configure logging for the whole app.\n\n    Sets up the root logger with the given level and handlers.\n    \"\"\"\n    logger = logging.getLogger()\n    logger.setLevel(level)\n    for h in handlers:\n        logger.addHandler(h)\n    logger.info('configured')\n    return logger\n",
+    "compressed_bodies": 0,
+    "compressed_tokens": 82,
+    "compression_ratio": 1.0,
+    "language": "unknown",
+    "language_confidence": 0.0,
+    "original": "import logging\n\n\ndef configure(level, handlers, fmt):\n    \"\"\"Configure logging for the whole app.\n\n    Sets up the root logger with the given level and handlers.\n    \"\"\"\n    logger = logging.getLogger()\n    logger.setLevel(level)\n    for h in handlers:\n        logger.addHandler(h)\n    logger.info('configured')\n    return logger\n",
+    "original_tokens": 82,
+    "preserved_imports": 0,
+    "preserved_signatures": 0,
+    "symbol_scores": {},
+    "syntax_valid": true
+  },
+  "recorded_at": "2026-06-19T00:12:54.714085+00:00",
+  "transform": "code_aware_compressor"
+}

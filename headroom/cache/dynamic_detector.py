@@ -748,8 +748,8 @@ class SemanticDetector:
             # normalization sentence_transformers returns raw vectors (norm
             # ~5-15), so the dot product is an unbounded inner product, not a
             # cosine similarity — nearly every sentence would clear the 0.7
-            # threshold and be misflagged as dynamic. Matches the siblings in
-            # prediction/feature_extractor.py and memory/adapters/embedders.py.
+            # threshold and be misflagged as dynamic. Matches the sibling in
+            # memory/adapters/embedders.py.
             self._exemplar_embeddings = self._model.encode(
                 self.DYNAMIC_EXEMPLARS,
                 convert_to_numpy=True,

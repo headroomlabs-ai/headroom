@@ -98,11 +98,11 @@ pub const METRIC_PROXY_RESPONSE_STATUS_COUNT_TOTAL_HELP: &str =
 // for `proxy_image_generation_call_log_redacted_total`,
 // `wrap_rtk_invocations_total`, and `wrap_rtk_tokens_saved_per_session`
 // were removed because the underlying counters had no production
-// emit site on the Rust side. The same metrics are exported by the
-// Python proxy (`headroom/proxy/prometheus_metrics.py`) which is the
-// natural owner: image redaction is a Python-proxy operation and RTK
-// invocation tracking lives in the wrap CLI, both Python-side
-// surfaces. See `docs/observability.md`.
+// emit site on the Rust side. Image redaction is exported by the
+// Python proxy (`headroom/proxy/prometheus_metrics.py`), its natural
+// owner. The two `wrap_rtk_*` names are gone for good: the rtk
+// integration they measured has been removed from Headroom.
+// See `docs/observability.md`.
 
 // ---------- shared label keys ----------
 

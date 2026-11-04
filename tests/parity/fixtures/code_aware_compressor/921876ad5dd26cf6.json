@@ -1,0 +1,40 @@
+{
+  "config": {
+    "ccr_ttl": 300,
+    "compress_comments": true,
+    "docstring_mode": "first_line",
+    "enable_ccr": false,
+    "fallback_to_kompress": false,
+    "language_hint": null,
+    "max_body_lines": 5,
+    "min_tokens_for_compression": 100,
+    "preserve_decorators": true,
+    "preserve_imports": true,
+    "preserve_signatures": true,
+    "preserve_type_annotations": true,
+    "semantic_analysis": true,
+    "target_compression_rate": 0.2
+  },
+  "input": "from collections import defaultdict\n\n\ndef build_index(records):\n    index = defaultdict(list)\n    for rec in records:\n        key = rec.get(\"id\")\n        if key is None:\n            continue\n        index[key].append(rec)\n        if len(index[key]) > 100:\n            index[key] = index[key][:100]\n    return index\n\n\ndef merge(a, b):\n    out = dict(a)\n    for k, v in b.items():\n        out[k] = v\n    return out\n",
+  "input_sha256": "921876ad5dd26cf623a97a7668ec4a1026f9f8b4e2d97af154943f29482c160c",
+  "output": {
+    "cache_key": null,
+    "compressed": "from collections import defaultdict\n\ndef build_index(records):\n    index = defaultdict(list)\n    # [8 lines omitted]\n    pass\ndef merge(a, b):\n    out = dict(a)\n    # [3 lines omitted]\n    pass",
+    "compressed_bodies": 0,
+    "compressed_tokens": 48,
+    "compression_ratio": 0.46601941747572817,
+    "language": "python",
+    "language_confidence": 1.0,
+    "original": "from collections import defaultdict\n\n\ndef build_index(records):\n    index = defaultdict(list)\n    for rec in records:\n        key = rec.get(\"id\")\n        if key is None:\n            continue\n        index[key].append(rec)\n        if len(index[key]) > 100:\n            index[key] = index[key][:100]\n    return index\n\n\ndef merge(a, b):\n    out = dict(a)\n    for k, v in b.items():\n        out[k] = v\n    return out\n",
+    "original_tokens": 103,
+    "preserved_imports": 1,
+    "preserved_signatures": 2,
+    "symbol_scores": {
+      "build_index": 0.5,
+      "merge": 0.5
+    },
+    "syntax_valid": true
+  },
+  "recorded_at": "2026-06-19T00:15:16.319542+00:00",
+  "transform": "code_aware_compressor"
+}

@@ -3,9 +3,9 @@ from __future__ import annotations
 import pytest
 from fastapi.testclient import TestClient
 
-from headroom.proxy import server
 from headroom.proxy.models import ProxyConfig
 from headroom.proxy.server import create_app
+from headroom.rollout import resolve_rollout
 
 
 class FakeRequestLogger:
@@ -27,6 +27,35 @@ class FakeRequestLogger:
 class FakeLogEntry(dict[str, object]):
     def __getattr__(self, name: str) -> object:
         return self.get(name)
+
+
+def test_stats_exposes_actual_running_rollout_snapshot() -> None:
+    rollout = resolve_rollout(
+        {
+            "HEADROOM_ROLLOUT_CHANNEL": "canary",
+            "HEADROOM_FEATURES": "tool_result_interceptors",
+        }
+    )
+    app = create_app(
+        ProxyConfig(
+            rollout=rollout,
+            optimize=False,
+            cache_enabled=False,
+            rate_limit_enabled=False,
+            cost_tracking_enabled=False,
+            log_requests=False,
+            ccr_inject_tool=False,
+            ccr_handle_responses=False,
+            ccr_context_tracking=False,
+            http2=False,
+        )
+    )
+
+    with TestClient(app, base_url="http://127.0.0.1", client=("127.0.0.1", 12345)) as client:
+        payload = client.get("/stats").json()["rollout"]
+
+    assert payload == rollout.to_dict()
+    assert payload["qualification_eligible"] is True
 
 
 def test_stats_refreshes_recent_requests_when_cached() -> None:
@@ -55,6 +84,14 @@ def test_stats_refreshes_recent_requests_when_cached() -> None:
             "input_tokens_optimized": 60,
             "tokens_saved": 40,
             "savings_percent": 40.0,
+            "savings_breakdown": [
+                {
+                    "source": "tool_search",
+                    "tokens": 40,
+                    "usd": 0.0,
+                    "realized": True,
+                }
+            ],
         }
     )
     second_log = FakeLogEntry(
@@ -75,6 +112,14 @@ def test_stats_refreshes_recent_requests_when_cached() -> None:
         first_response = client.get("/stats?cached=1")
         assert first_response.status_code == 200
         assert first_response.json()["recent_requests"][-1]["model"] == "gpt-4.1"
+        assert first_response.json()["recent_requests"][-1]["savings_breakdown"] == [
+            {
+                "source": "tool_search",
+                "tokens": 40,
+                "usd": 0.0,
+                "realized": True,
+            }
+        ]
 
         logger.logs = [first_log, second_log]
         second_response = client.get("/stats?cached=1")
@@ -166,17 +211,6 @@ def test_stats_recent_requests_includes_token_incomplete_requests() -> None:
 
 def test_agent_usage_totals_use_proxy_only_savings(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("HEADROOM_REQUIRE_RUST_CORE", "false")
-    monkeypatch.setattr(
-        server,
-        "_get_context_tool_stats",
-        lambda: {
-            "tool": "rtk",
-            "label": "RTK",
-            "tokens_saved": 500,
-            "session": {},
-            "lifetime": {},
-        },
-    )
     app = create_app(
         ProxyConfig(
             optimize=False,
@@ -220,7 +254,7 @@ def test_agent_usage_totals_use_proxy_only_savings(monkeypatch: pytest.MonkeyPat
     assert response.status_code == 200
     payload = response.json()
 
-    assert payload["tokens"]["saved"] == 600
+    assert payload["tokens"]["saved"] == 100
     assert payload["agent_usage"]["totals"]["before_tokens"] == 1000
     assert payload["agent_usage"]["totals"]["tokens_saved"] == 100
     assert payload["agent_usage"]["totals"]["savings_percent"] == 10.0
@@ -243,3 +277,50 @@ def test_stats_preserves_default_smart_crusher_compaction_state() -> None:
 
     assert response.status_code == 200
     assert response.json()["config"]["smart_crusher_with_compaction"] is None
+
+
+def _read_maturation_app(mode: str, quiesce_turns: int = 5):
+    return create_app(
+        ProxyConfig(
+            mode=mode,
+            read_maturation=True,
+            read_maturation_quiesce_turns=quiesce_turns,
+            optimize=False,
+            cache_enabled=False,
+            rate_limit_enabled=False,
+            cost_tracking_enabled=False,
+            log_requests=False,
+            ccr_inject_tool=False,
+            ccr_handle_responses=False,
+            ccr_context_tracking=False,
+            http2=False,
+        )
+    )
+
+
+@pytest.mark.parametrize(
+    ("mode", "quiesce_turns", "effective", "startup_level"),
+    [
+        ("cache", 5, False, "WARNING"),
+        ("token", 5, True, "INFO"),
+        # A zero threshold matures a Read in the still-mutable latest turn.
+        ("cache", 0, True, "INFO"),
+    ],
+)
+def test_read_maturation_reports_whether_it_can_fire(
+    mode, quiesce_turns, effective, startup_level, caplog
+):
+    """Cache mode freezes a Read before it can quiesce, so enabled maturation
+    never fires there; startup and /stats must say so instead of reporting a
+    silently inert feature as on."""
+    app = _read_maturation_app(mode, quiesce_turns)
+
+    with caplog.at_level("INFO", logger="headroom.proxy"):
+        with TestClient(app, base_url="http://127.0.0.1", client=("127.0.0.1", 12345)) as client:
+            payload = client.get("/stats").json()["read_maturation"]
+
+    assert payload["enabled"] is True
+    assert payload["effective"] is effective
+    assert (payload["inert_reason"] is None) is effective
+    banner = [r for r in caplog.records if r.getMessage().startswith("Read maturation:")]
+    assert [r.levelname for r in banner] == [startup_level]

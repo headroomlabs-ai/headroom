@@ -59,6 +59,7 @@ class ToolTarget(str, Enum):
     GROK = "grok"
     OPENCLAW = "openclaw"
     OPENCODE = "opencode"
+    ANTIGRAVITY = "antigravity"
 
 
 def iso_utc_now() -> str:
@@ -102,10 +103,12 @@ class DeploymentManifest:
     backend: str
     anyllm_provider: str | None = None
     region: str | None = None
-    proxy_mode: str = "token"
+    proxy_mode: str = "cache"
     memory_enabled: bool = False
     memory_db_path: str = ""
-    telemetry_enabled: bool = True
+    # None: the operator chose neither --telemetry nor --no-telemetry. The
+    # default stays True for manifests saved before the field existed.
+    telemetry_enabled: bool | None = True
     image: str = "ghcr.io/headroomlabs-ai/headroom:latest"
     service_name: str = "headroom"
     container_name: str = "headroom-persistent"

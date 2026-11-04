@@ -9,7 +9,6 @@ on:
     paths:
       - 'headroom/cli/**'
       - 'headroom/providers/**'
-      - 'headroom/rtk/**'
       - 'crates/**'
       - 'docker/**'
       - 'Dockerfile'
@@ -30,6 +29,9 @@ on:
 concurrency:
   group: wrap-e2e-${{ github.ref }}
   cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+permissions:
+  contents: read
 
 jobs:
   docker-wrap-e2e:

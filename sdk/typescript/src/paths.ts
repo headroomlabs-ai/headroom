@@ -224,12 +224,6 @@ export function binDir(): string {
   return joinPath(workspaceDir(), "bin");
 }
 
-export function rtkPath(): string {
-  if (!isNode()) return "";
-  const name = process.platform === "win32" ? "rtk.exe" : "rtk";
-  return joinPath(binDir(), name);
-}
-
 export function deployRoot(): string {
   if (!isNode()) return "";
   return joinPath(workspaceDir(), "deploy");

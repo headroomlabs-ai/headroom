@@ -1,0 +1,22 @@
+{
+  "config": {
+    "chunk_words": 350,
+    "device": "auto",
+    "enable_ccr": false,
+    "model_id": "chopratejas/kompress-v2-base",
+    "score_threshold": 0.5
+  },
+  "input": "tokens   with\tirregular\n\nwhitespace   runs   and\ttabs   scattered throughout the body of the text repeatedly again and again here throughout the body of the text repeatedly again and again here throughout the body of the text repeatedly again and again here throughout the body of the text repeatedly again and again here throughout the body of the text repeatedly again and again here ",
+  "input_sha256": "9ef7db920a3d84e9c49aab459c9aa98b5eb4e41a58aab6ec4464b3270b07334c",
+  "output": {
+    "cache_key": null,
+    "compressed": "tokens irregular whitespace runs tabs scattered throughout body text repeatedly again again here throughout body text repeatedly again again here throughout body text repeatedly again again here throughout body text repeatedly again again here throughout body text repeatedly again again here",
+    "compressed_tokens": 41,
+    "compression_ratio": 0.6507936507936508,
+    "model_used": "chopratejas/kompress-v2-base",
+    "original": "tokens   with\tirregular\n\nwhitespace   runs   and\ttabs   scattered throughout the body of the text repeatedly again and again here throughout the body of the text repeatedly again and again here throughout the body of the text repeatedly again and again here throughout the body of the text repeatedly again and again here throughout the body of the text repeatedly again and again here ",
+    "original_tokens": 63
+  },
+  "recorded_at": "2026-06-18T23:18:25.473143+00:00",
+  "transform": "kompress"
+}

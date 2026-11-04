@@ -60,7 +60,6 @@ Examples:
 | Memory bridge state | `${WORKSPACE_DIR}/bridge_state.json` | — |
 | Proxy log directory | `${WORKSPACE_DIR}/logs/` | — |
 | HTTP 400 debug dumps | `${WORKSPACE_DIR}/logs/debug_400/` | — |
-| Vendored `rtk` binary | `${WORKSPACE_DIR}/bin/rtk[.exe]` | — |
 | Deployment profiles | `${WORKSPACE_DIR}/deploy/` | — |
 | Beacon lock file | `${WORKSPACE_DIR}/.beacon_lock_<port>` | — |
 

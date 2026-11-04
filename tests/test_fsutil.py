@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import os
+import stat
+
 import pytest
 
 from headroom import fsutil
@@ -37,6 +40,49 @@ def test_read_text_roundtrips_utf8_non_ascii(tmp_path):
     p = tmp_path / "config.toml"
     fsutil.write_text(p, 'project = "比赛/机器人"\n')
     assert fsutil.read_text(p) == 'project = "比赛/机器人"\n'
+
+
+def test_write_text_leaves_original_intact_when_write_fails(tmp_path, monkeypatch):
+    """A failed write must leave the previous file whole, not truncated.
+
+    ``open(path, "w")`` truncates to zero bytes before the new content lands, so
+    a crash mid-write used to leave users with a half-written ~/.claude.json.
+    """
+    p = tmp_path / "settings.json"
+    fsutil.write_text(p, '{"permissions": {"allow": ["Bash"]}}\n')
+
+    def boom(src, dst):
+        raise OSError("no space left on device")
+
+    monkeypatch.setattr(os, "replace", boom)
+    with pytest.raises(OSError):
+        fsutil.write_text(p, '{"hooks": {}}\n')
+
+    assert p.read_text() == '{"permissions": {"allow": ["Bash"]}}\n'
+    # No .tmp litter left behind in the config directory.
+    assert [f.name for f in tmp_path.iterdir()] == ["settings.json"]
+
+
+def test_write_text_follows_symlink_instead_of_replacing_it(tmp_path):
+    """Dotfile managers symlink these configs; os.replace would clobber the link."""
+    real = tmp_path / "real.json"
+    real.write_text("{}\n")
+    link = tmp_path / "settings.json"
+    link.symlink_to(real)
+
+    fsutil.write_text(link, '{"env": {}}\n')
+
+    assert link.is_symlink()
+    assert real.read_text() == '{"env": {}}\n'
+
+
+def test_write_text_preserves_existing_mode(tmp_path):
+    """mkstemp creates 0600 — an existing 0644 config must not be silently tightened."""
+    p = tmp_path / "settings.json"
+    p.write_text("{}\n")
+    p.chmod(0o644)
+    fsutil.write_text(p, '{"a": 1}\n')
+    assert stat.S_IMODE(p.stat().st_mode) == 0o644
 
 
 def test_read_text_falls_back_to_locale_encoding(tmp_path, monkeypatch):
