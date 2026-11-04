@@ -13,6 +13,7 @@ This is a drop-in replacement for InMemoryGraphStore that:
 
 from __future__ import annotations
 
+import contextlib
 import json
 import logging
 import sqlite3
@@ -22,9 +23,12 @@ from pathlib import Path
 from threading import RLock
 from typing import TYPE_CHECKING, Any
 
+from ...fileperms import connect_private_sqlite
 from .graph_models import Entity, Relationship, RelationshipDirection, Subgraph
 
 if TYPE_CHECKING:
+    from collections.abc import Iterator
+
     from ..tracker import ComponentStats
 
 logger = logging.getLogger(__name__)
@@ -74,13 +78,14 @@ class SQLiteGraphStore:
         self._lock = RLock()
         self._init_db()
 
-    def _get_conn(self) -> sqlite3.Connection:
+    @contextlib.contextmanager
+    def _get_conn(self) -> Iterator[sqlite3.Connection]:
         """Get a new database connection (thread-safe pattern).
 
-        Returns:
-            A new SQLite connection with row factory configured.
+        Commits on clean exit, rolls back on exception, and always closes
+        the connection -- callers use ``with self._get_conn() as conn:``.
         """
-        conn = sqlite3.connect(str(self.db_path))
+        conn = connect_private_sqlite(self.db_path, what="memory graph store")
         conn.row_factory = sqlite3.Row
 
         # Configure page cache size (negative = KB, positive = pages)
@@ -90,7 +95,11 @@ class SQLiteGraphStore:
         # Enable foreign keys
         conn.execute("PRAGMA foreign_keys = ON")
 
-        return conn
+        try:
+            with conn:
+                yield conn
+        finally:
+            conn.close()
 
     def _init_db(self) -> None:
         """Initialize the database schema with indexes."""
@@ -239,7 +248,9 @@ class SQLiteGraphStore:
     async def add_entity(self, entity: Entity) -> None:
         """Add an entity to the graph store.
 
-        If an entity with the same ID already exists, it will be replaced.
+        If an entity with the same ID and owner already exists, its fields are
+        updated without deleting its relationships. Reassigning the owner
+        replaces the entity and deletes its old relationships.
 
         Args:
             entity: The entity to add.
@@ -248,6 +259,14 @@ class SQLiteGraphStore:
 
         with self._lock:
             with self._get_conn() as conn:
+                # Keep owner reassignment's replacement/cascade semantics. Both
+                # statements share a transaction, so a failed save restores the old graph.
+                conn.execute(
+                    "DELETE FROM entities WHERE id = :id AND user_id != :user_id",
+                    row,
+                )
+                # The ID upsert overrides REPLACE's delete. Keep REPLACE's existing
+                # NOT NULL/default handling for the incoming row.
                 conn.execute(
                     """
                     INSERT OR REPLACE INTO entities (
@@ -257,6 +276,16 @@ class SQLiteGraphStore:
                         :id, :user_id, :name, :name_lower, :entity_type, :description,
                         :properties, :created_at, :updated_at, :metadata
                     )
+                    ON CONFLICT(id) DO UPDATE SET
+                        user_id = excluded.user_id,
+                        name = excluded.name,
+                        name_lower = excluded.name_lower,
+                        entity_type = excluded.entity_type,
+                        description = excluded.description,
+                        properties = excluded.properties,
+                        created_at = excluded.created_at,
+                        updated_at = excluded.updated_at,
+                        metadata = excluded.metadata
                     """,
                     row,
                 )

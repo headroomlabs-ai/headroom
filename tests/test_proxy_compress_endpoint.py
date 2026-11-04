@@ -392,12 +392,11 @@ class TestCompressEndpointCompression:
         )
 
         assert response.status_code == 503
-        assert response.json() == {
-            "error": {
-                "type": "compression_error",
-                "message": "compression broke",
-            }
-        }
+        body = response.json()
+        # Exception text stays in the server log; the client sees the code.
+        assert body["error"]["type"] == "compression_error"
+        assert body["error"]["code"] == "internal_error"
+        assert "compression broke" not in response.text
         record_failed.assert_awaited_once_with(provider="compress")
 
     def test_compression_timeout_records_fail_open_outcome(self, client, monkeypatch):

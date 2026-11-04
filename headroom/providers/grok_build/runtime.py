@@ -4,13 +4,10 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+from headroom.providers._setup_text import project_attribution_lines
+from headroom.providers.codex import proxy_base_url
 from headroom.providers.grok.runtime import DEFAULT_API_URL
 from headroom.proxy.project_context import with_project_prefix
-
-
-def proxy_base_url(port: int) -> str:
-    """Return the local proxy base URL for OpenAI-compatible Grok traffic."""
-    return f"http://127.0.0.1:{port}/v1"
 
 
 @dataclass(frozen=True)
@@ -50,11 +47,4 @@ def render_setup_lines(port: int, project: str | None = None) -> list[str]:
         "  Or switch models in an existing session:",
         "    /model grok-build",
     ]
-    if project:
-        lines += [
-            "",
-            f"  Dashboard savings will be attributed to project '{project}'",
-            "  (the directory this command was run from). Re-run from another",
-            "  project directory to get that project's URL.",
-        ]
-    return lines
+    return lines + project_attribution_lines(project)

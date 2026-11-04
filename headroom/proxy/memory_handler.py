@@ -43,6 +43,7 @@ from headroom.memory.storage_router import (
     RequestContext,
     ResolvedScope,
 )
+from headroom.proxy.public_errors import tool_result_error
 
 if TYPE_CHECKING:
     from headroom.memory.backends.local import LocalBackend
@@ -184,12 +185,18 @@ class MemoryHandler:
         self.config = config
         self.agent_type = agent_type
         self._backend: LocalBackend | Any = None
-        # Per-project routing for the local backend. Built in
-        # ``_init_backend_locked`` so a single, shared resolver / LRU is
-        # kept on the handler. Qdrant deployments use composite user-id
-        # partitioning instead (see ``_compose_effective_user_id``) — the
-        # router stays None in that case.
-        self._router: BackendRouter | None = None
+        storage_root = (
+            Path(config.storage_root)
+            if config.storage_root
+            else (Path(config.db_path).resolve().parent / "memories")
+        )
+        self._router = BackendRouter(
+            BackendRouterConfig(
+                mode=config.storage_mode,
+                root_dir=storage_root,
+                global_db_path=Path(config.db_path).resolve(),
+            )
+        )
         self._initialized = False
         # Async singleflight guard for backend init. Ensures concurrent first
         # callers land on one init (double-checked pattern inside
@@ -240,8 +247,11 @@ class MemoryHandler:
 
             self._native_memory_dir = _paths.native_memory_dir()
 
-        # Create directory if it doesn't exist
-        self._native_memory_dir.mkdir(parents=True, exist_ok=True)
+        # Create the directory owner-only (and narrow it if an earlier run left
+        # it wider): it holds the model's memory files verbatim.
+        from headroom import fileperms as _fileperms
+
+        _fileperms.private_dir(self._native_memory_dir)
         logger.info(f"Memory: Native memory directory: {self._native_memory_dir}")
 
     def get_beta_headers(self) -> dict[str, str]:
@@ -406,19 +416,8 @@ class MemoryHandler:
             # remains the GLOBAL-mode fallback / legacy compatibility
             # backend; callers that pass a ``RequestContext`` route
             # through ``self._router`` instead.
-            storage_root = (
-                Path(self.config.storage_root)
-                if self.config.storage_root
-                else (Path(self.config.db_path).resolve().parent / "memories")
-            )
             global_db_path = Path(self.config.db_path).resolve()
-            router_cfg = BackendRouterConfig(
-                mode=self.config.storage_mode,
-                root_dir=storage_root,
-                global_db_path=global_db_path,
-                backend_config_template=backend_config,
-            )
-            self._router = BackendRouter(router_cfg)
+            self._router._config.backend_config_template = backend_config
             # Seed the router's LRU with the already-initialized
             # legacy backend so GLOBAL-mode requests reuse it instead
             # of opening a second handle to the same file.
@@ -427,7 +426,7 @@ class MemoryHandler:
             logger.info(
                 "event=memory_router_initialized mode=%s root=%s global_db=%s",
                 self.config.storage_mode.value,
-                storage_root,
+                self._router._config.root_dir,
                 global_db_path,
             )
 
@@ -666,13 +665,27 @@ class MemoryHandler:
         # Non-local backends: derive scope but keep one shared backend
         # and compose the user_id so the partition lives in the user_id
         # column instead of in a separate file.
-        scope = self._router._resolve_scope(request_context)
+        scope = self._router.scope_for(request_context)
+        if scope.db_path is None:
+            return None, scope, base_user_id
         composed = (
             base_user_id
             if scope.project_key is None or scope.mode is MemoryStorageMode.GLOBAL
             else f"{base_user_id}::{scope.project_key}"
         )
         return self._backend, scope, composed
+
+    def is_project_unresolved(self, request_context: RequestContext | None) -> bool:
+        """Return whether fail-closed project routing has no usable target."""
+
+        if request_context is None or self._router is None:
+            return False
+        scope = self._router.scope_for(request_context)
+        return (
+            scope.mode is MemoryStorageMode.PROJECT
+            and scope.project_key is None
+            and scope.db_path is None
+        )
 
     @staticmethod
     def _unresolved_project_error(scope: ResolvedScope | None) -> str | None:
@@ -714,7 +727,6 @@ class MemoryHandler:
         messages: list[dict[str, Any]],
         request_context: RequestContext | None = None,
         *,
-        ranker: Any | None = None,
         query: Any | None = None,
         budget: Any | None = None,
     ) -> str | None:
@@ -732,14 +744,6 @@ class MemoryHandler:
                 omitted, behaves as before this fix — single-bucket search
                 against the legacy backend. Production handlers always
                 pass it; tests / mocks can keep the simpler call shape.
-            ranker: Optional :class:`~headroom.proxy.memory_ranker.MemoryRanker`
-                — re-ranks the backend's cosine-only candidates by an
-                additional signal (recency, source, access count, …).
-                When ``None`` (default), behaviour is pure cosine +
-                ``budget.min_similarity`` floor. When provided, candidates
-                are adapted to :class:`MemoryCandidate`, re-ranked, then
-                re-filtered by ``budget.min_similarity`` on the boosted
-                score.
             query: Optional :class:`MemoryQuery` — multi-source, full-
                 fidelity retrieval query. When provided, takes precedence
                 over the ``messages``-derived query. Constructed at the
@@ -750,8 +754,7 @@ class MemoryHandler:
                 returned formatted block by tokens / entries / min
                 similarity. When ``None``, defaults are taken from
                 ``self.config`` so the existing top_k / min_similarity
-                contract is preserved. Both the no-ranker and the with-
-                ranker paths honour the same budget.
+                contract is preserved.
 
         Returns:
             Formatted context string, or None if no relevant memories.
@@ -765,15 +768,20 @@ class MemoryHandler:
         if not self.config.inject_context:
             return None
 
+        from headroom.proxy.helpers import get_memory_injection_mode
+
         # PR-B6: Tool mode disables auto-injection. The model calls
-        # ``memory_search`` to retrieve when it wants to.
-        if self.config.mode == MemoryMode.TOOL:
+        # ``memory_search`` to retrieve when it wants to. Selected by the
+        # handler config or by HEADROOM_MEMORY_INJECTION_MODE=tool.
+        if self.config.mode == MemoryMode.TOOL or get_memory_injection_mode() == "tool":
             logger.info(
                 "event=memory_mode_skip mode=tool user_id=%s reason=tool_mode_no_auto_injection",
                 user_id,
             )
             return None
 
+        if self.is_project_unresolved(request_context):
+            return None
         await self._ensure_initialized()
         if not self._backend:
             return None
@@ -803,18 +811,6 @@ class MemoryHandler:
             )
             return None
 
-        # Build the embedding query. When the handler provides a
-        # MemoryQuery, use its multi-source untruncated input; otherwise
-        # fall back to extracting from messages (kept for legacy callers
-        # / tests). Full fidelity in both paths.
-        if query is not None:
-            query_text = query.to_embedding_input()
-        else:
-            query_text = self._extract_user_query(messages)
-        if not query_text:
-            logger.debug("Memory: No query text for context search")
-            return None
-
         # Compose the budget: explicit per-call wins; otherwise derive
         # from self.config so existing top_k/min_similarity callers see
         # no behaviour change.
@@ -828,6 +824,22 @@ class MemoryHandler:
         )
 
         try:
+            if query is not None:
+                from headroom.proxy.memory_query_policy import bounded_embedding_parts
+
+                parts = bounded_embedding_parts(
+                    user_text=query.user_text,
+                    recent_tool_outputs=query.recent_tool_outputs,
+                    recent_assistant_turns=query.recent_assistant_turns,
+                )
+                prepare = getattr(backend, "prepare_search_query", None)
+                query_text = await prepare(*parts) if prepare is not None else "".join(parts)
+            else:
+                query_text = self._extract_user_query(messages)[-4096:]
+            if not query_text:
+                logger.debug("Memory: No query text for context search")
+                return None
+
             # Search memories on the per-request resolved backend.
             results = await backend.search_memories(
                 query=query_text,
@@ -844,74 +856,37 @@ class MemoryHandler:
                 )
                 return None
 
-            # Optional re-rank: when a MemoryRanker is provided, adapt
-            # results to MemoryCandidate, re-rank, then filter by
-            # ``budget.min_similarity`` on the BOOSTED score. The re-rank
-            # can promote a fresh weak-cosine memory above a stale
-            # strong-cosine one (RecencyBoostRanker default behaviour).
-            # Cap by ``budget.max_entries`` after filtering so the budget
-            # contract is honoured on both branches.
+            # Pure cosine + budget min_similarity floor.
             # Each rendered row carries the memory ID in [brackets] so
             # the model can address it directly via memory_update /
             # memory_delete without round-tripping through memory_search.
-            # Both branches below render the same `i. [id] content` shape
-            # so the format is stable regardless of whether a ranker is
-            # in play.
             selected_memory_ids: list[str] = []
-            if ranker is not None:
-                from headroom.proxy.memory_ranker import MemoryCandidate
+            filtered_results = [r for r in results if r.score >= effective_budget.min_similarity]
 
-                candidates = [MemoryCandidate.from_backend_result(r) for r in results]
-                ranked = ranker.rank(candidates)
-                # Filter on the post-rank score (the ranker may have
-                # boosted or attenuated original cosine values).
-                ranked = [c for c in ranked if c.score >= effective_budget.min_similarity]
-                if not ranked:
-                    logger.debug(
-                        f"Memory: {len(results)} memories found but none above threshold "
-                        f"{effective_budget.min_similarity} after re-rank"
-                    )
-                    return None
-                ranked = ranked[: effective_budget.max_entries]
-                memory_lines = []
-                for i, candidate in enumerate(ranked, 1):
-                    memory_id = candidate.id or "?"
-                    if candidate.id:
-                        selected_memory_ids.append(candidate.id)
-                    memory_lines.append(f"{i}. [{memory_id}] {candidate.content}")
-                    if candidate.related_entities:
-                        entities_str = ", ".join(candidate.related_entities[:3])
-                        memory_lines.append(f"   (Related: {entities_str})")
-            else:
-                # No ranker: pure cosine + budget min_similarity floor.
-                filtered_results = [
-                    r for r in results if r.score >= effective_budget.min_similarity
-                ]
+            if not filtered_results:
+                logger.debug(
+                    f"Memory: {len(results)} memories found but none above threshold "
+                    f"{effective_budget.min_similarity}"
+                )
+                return None
 
-                if not filtered_results:
-                    logger.debug(
-                        f"Memory: {len(results)} memories found but none above threshold "
-                        f"{effective_budget.min_similarity}"
-                    )
-                    return None
+            # Cap entry count via the budget (defence-in-depth —
+            # backend already gets top_k=max_entries but this enforces
+            # it on post-filter results too).
+            filtered_results = filtered_results[: effective_budget.max_entries]
 
-                # Cap entry count via the budget (defence-in-depth —
-                # backend already gets top_k=max_entries but this enforces
-                # it on post-filter results too).
-                filtered_results = filtered_results[: effective_budget.max_entries]
-
-                memory_lines = []
-                for i, result in enumerate(filtered_results, 1):
-                    memory_id = getattr(result.memory, "id", None) or "?"
-                    if memory_id != "?":
-                        selected_memory_ids.append(memory_id)
-                    memory_lines.append(f"{i}. [{memory_id}] {result.memory.content}")
-                    if hasattr(result, "related_entities") and result.related_entities:
-                        entities_str = ", ".join(result.related_entities[:3])
-                        memory_lines.append(f"   (Related: {entities_str})")
+            memory_lines = []
+            for i, result in enumerate(filtered_results, 1):
+                memory_id = getattr(result.memory, "id", None) or "?"
+                if memory_id != "?":
+                    selected_memory_ids.append(memory_id)
+                memory_lines.append(f"{i}. [{memory_id}] {result.memory.content}")
+                if hasattr(result, "related_entities") and result.related_entities:
+                    entities_str = ", ".join(result.related_entities[:3])
+                    memory_lines.append(f"   (Related: {entities_str})")
 
         except Exception as e:
-            logger.warning(f"Memory: Search failed for user {effective_user_id}: {e}")
+            logger.warning(f"Memory: Search failed for user {effective_user_id}: {e!r}")
             return None
 
         if not memory_lines:
@@ -944,10 +919,8 @@ pass that ID directly to memory_update or memory_delete — you do not need \
 to call memory_search first to discover IDs. Use this context to inform \
 your responses, not to drive new actions."""
 
-        # Apply the token-budget cap on the formatted block. Pre-this-
-        # PR there was no cap — up to ~4000 tokens could be injected
-        # per request. The budget bounds the output without touching
-        # the input query (which stays full-fidelity per MemoryQuery).
+        # The formatted output budget is separate from the embedding-input
+        # budget above; the original MemoryQuery remains full-fidelity.
         context = effective_budget.apply_to_text(context)
 
         # Track only memories that survived ranking, entry limits, and the
@@ -1143,6 +1116,8 @@ your responses, not to drive new actions."""
         """
         tool_calls = self._extract_tool_calls(response, provider)
         results: list[dict[str, Any]] = []
+        project_unresolved = self.is_project_unresolved(request_context)
+        unresolved_result = json.dumps({"status": "skipped", "reason": "project_unresolved"})
 
         for tc in tool_calls:
             # `tc.get("function", {})` returns None for an explicit
@@ -1167,8 +1142,14 @@ your responses, not to drive new actions."""
                     input_data = {}
 
             # Handle native memory tool
-            if tool_name == NATIVE_MEMORY_TOOL_NAME:
-                result_content = await self._execute_native_memory_tool(input_data, user_id)
+            if tool_name in ({NATIVE_MEMORY_TOOL_NAME} | MEMORY_TOOL_NAMES) and project_unresolved:
+                result_content = unresolved_result
+            elif tool_name == NATIVE_MEMORY_TOOL_NAME:
+                result_content = await self._execute_native_memory_tool(
+                    input_data,
+                    user_id,
+                    request_context=request_context,
+                )
             elif tool_name in MEMORY_TOOL_NAMES:
                 # Custom memory tools need backend
                 await self._ensure_initialized()
@@ -1216,7 +1197,12 @@ your responses, not to drive new actions."""
         request_context: RequestContext | None = None,
     ) -> str:
         """Execute a memory tool and return result string."""
+        if self.is_project_unresolved(request_context):
+            return json.dumps({"status": "skipped", "reason": "project_unresolved"})
         try:
+            await self._ensure_initialized()
+            if self._backend is None:
+                return json.dumps({"status": "error", "error": "Memory backend not initialized"})
             if tool_name == "memory_save":
                 return await self._execute_save(input_data, user_id, provider, request_context)
             elif tool_name == "memory_search":
@@ -1232,7 +1218,7 @@ your responses, not to drive new actions."""
 
         except Exception as e:
             logger.error(f"Memory: Tool {tool_name} failed: {e}")
-            return json.dumps({"status": "error", "error": str(e)})
+            return json.dumps(tool_result_error(e))
 
     async def _execute_save(
         self,
@@ -1521,7 +1507,7 @@ your responses, not to drive new actions."""
                 results = await list_fn(user_id=effective_user_id, limit=limit)
             except Exception as e:
                 logger.warning(f"Memory: list_memories failed for user {effective_user_id}: {e}")
-                return json.dumps({"status": "error", "error": str(e)})
+                return json.dumps(tool_result_error(e))
         else:
             try:
                 results = await backend.search_memories(
@@ -1531,7 +1517,7 @@ your responses, not to drive new actions."""
                 )
             except Exception as e:
                 logger.warning(f"Memory: list fallback search failed: {e}")
-                return json.dumps({"status": "error", "error": str(e)})
+                return json.dumps(tool_result_error(e))
 
         entries: list[dict[str, Any]] = []
         for r in results:
@@ -1575,7 +1561,13 @@ your responses, not to drive new actions."""
     #   str_replace                 → Update memory content
     # =========================================================================
 
-    async def _execute_native_memory_tool(self, input_data: dict[str, Any], user_id: str) -> str:
+    async def _execute_native_memory_tool(
+        self,
+        input_data: dict[str, Any],
+        user_id: str,
+        *,
+        request_context: RequestContext | None = None,
+    ) -> str:
         """Execute Anthropic's native memory tool with semantic backend.
 
         This is a TRANSLATION LAYER: Claude thinks it's doing file operations,
@@ -1589,298 +1581,53 @@ your responses, not to drive new actions."""
         - delete: Remove from vector store
         - rename: Update memory tags/path
         """
+        if self.is_project_unresolved(request_context):
+            return json.dumps({"status": "skipped", "reason": "project_unresolved"})
+
         # Ensure our semantic backend is initialized
         await self._ensure_initialized()
 
         command = input_data.get("command", "")
 
         try:
+            backend, _scope, effective_user_id = self._resolve_for_request(user_id, request_context)
             if command == "view":
-                return await self._native_view_semantic(input_data, user_id)
+                return await self._native_view_semantic(
+                    input_data, effective_user_id, backend=backend
+                )
             elif command == "create":
-                return await self._native_create_semantic(input_data, user_id)
+                return await self._native_create_semantic(
+                    input_data, effective_user_id, backend=backend
+                )
             elif command == "str_replace":
-                return await self._native_update_semantic(input_data, user_id)
+                return await self._native_update_semantic(
+                    input_data, effective_user_id, backend=backend
+                )
             elif command == "insert":
-                return await self._native_append_semantic(input_data, user_id)
+                return await self._native_append_semantic(
+                    input_data, effective_user_id, backend=backend
+                )
             elif command == "delete":
-                return await self._native_delete_semantic(input_data, user_id)
+                return await self._native_delete_semantic(
+                    input_data, effective_user_id, backend=backend
+                )
             elif command == "rename":
-                return await self._native_rename_semantic(input_data, user_id)
+                return await self._native_rename_semantic(
+                    input_data, effective_user_id, backend=backend
+                )
             else:
                 return f"Error: Unknown command '{command}'"
         except Exception as e:
             logger.error(f"Memory: Native tool error: {e}")
             return f"Error: {e}"
 
-    def _resolve_native_path(self, path: str, user_id: str) -> Path:
-        """Resolve path within user's memory directory safely.
-
-        Prevents path traversal attacks by ensuring path stays within
-        the user's memory directory.
-        """
-        assert self._native_memory_dir is not None
-
-        # User-scoped memory directory
-        user_dir = self._native_memory_dir / user_id
-        user_dir.mkdir(parents=True, exist_ok=True)
-
-        # Normalize path (remove /memories prefix if present)
-        if path.startswith("/memories"):
-            path = path[len("/memories") :]
-        if path.startswith("/"):
-            path = path[1:]
-
-        # Resolve and validate
-        resolved = (user_dir / path).resolve()
-
-        # Security: ensure path is within user directory
-        try:
-            resolved.relative_to(user_dir.resolve())
-        except ValueError:
-            raise ValueError(f"Path traversal detected: {path}") from None
-
-        return resolved
-
-    def _native_view(self, input_data: dict[str, Any], user_id: str) -> str:
-        """View directory contents or file contents."""
-        path = input_data.get("path", "/memories")
-        view_range = input_data.get("view_range")
-
-        resolved = self._resolve_native_path(path, user_id)
-
-        if not resolved.exists():
-            return f"The path {path} does not exist. Please provide a valid path."
-
-        if resolved.is_dir():
-            # List directory contents
-            lines = [
-                f"Here're the files and directories up to 2 levels deep in {path}, "
-                "excluding hidden items and node_modules:"
-            ]
-
-            def get_size(p: Path) -> str:
-                if p.is_file():
-                    size = p.stat().st_size
-                    if size < 1024:
-                        return f"{size}B"
-                    elif size < 1024 * 1024:
-                        return f"{size / 1024:.1f}K"
-                    else:
-                        return f"{size / (1024 * 1024):.1f}M"
-                return "4.0K"  # Default for directories
-
-            def list_recursive(p: Path, rel_path: str, depth: int) -> None:
-                if depth > 2:
-                    return
-                if p.name.startswith(".") or p.name == "node_modules":
-                    return
-
-                lines.append(f"{get_size(p)}\t{rel_path}")
-
-                if p.is_dir() and depth < 2:
-                    try:
-                        for child in sorted(p.iterdir()):
-                            child_rel = (
-                                f"{rel_path}/{child.name}"
-                                if rel_path != path
-                                else f"{path}/{child.name}"
-                            )
-                            list_recursive(child, child_rel, depth + 1)
-                    except PermissionError:
-                        pass
-
-            list_recursive(resolved, path, 0)
-            return "\n".join(lines)
-
-        else:
-            # Read file contents with line numbers
-            try:
-                content = resolved.read_text(encoding="utf-8")
-            except UnicodeDecodeError:
-                content = resolved.read_text(encoding="latin-1")
-
-            lines_content = content.split("\n")
-
-            if len(lines_content) > 999999:
-                return f"File {path} exceeds maximum line limit of 999,999 lines."
-
-            # Apply view_range if specified
-            start_line = 1
-            end_line = len(lines_content)
-            if view_range and len(view_range) >= 2:
-                start_line = max(1, view_range[0])
-                end_line = min(len(lines_content), view_range[1])
-
-            result_lines = [f"Here's the content of {path} with line numbers:"]
-            for i, line in enumerate(lines_content[start_line - 1 : end_line], start=start_line):
-                result_lines.append(f"{i:6d}\t{line}")
-
-            return "\n".join(result_lines)
-
-    def _native_create(self, input_data: dict[str, Any], user_id: str) -> str:
-        """Create a new file."""
-        path = input_data.get("path", "")
-        file_text = input_data.get("file_text", "")
-
-        if not path:
-            return "Error: path is required"
-
-        resolved = self._resolve_native_path(path, user_id)
-
-        if resolved.exists():
-            return f"Error: File {path} already exists"
-
-        # Create parent directories if needed
-        resolved.parent.mkdir(parents=True, exist_ok=True)
-
-        resolved.write_text(file_text, encoding="utf-8")
-        logger.info(f"Memory: Native create: {path} for user {user_id}")
-
-        return f"File created successfully at: {path}"
-
-    def _native_str_replace(self, input_data: dict[str, Any], user_id: str) -> str:
-        """Replace text in a file."""
-        path = input_data.get("path", "")
-        old_str = input_data.get("old_str", "")
-        new_str = input_data.get("new_str", "")
-
-        if not path:
-            return "Error: path is required"
-        if not old_str:
-            return "Error: old_str is required"
-
-        resolved = self._resolve_native_path(path, user_id)
-
-        if not resolved.exists():
-            return f"Error: The path {path} does not exist. Please provide a valid path."
-
-        if resolved.is_dir():
-            return f"Error: The path {path} does not exist. Please provide a valid path."
-
-        content = resolved.read_text(encoding="utf-8")
-
-        # Check for occurrences
-        occurrences = content.count(old_str)
-        if occurrences == 0:
-            return f"No replacement was performed, old_str `{old_str}` did not appear verbatim in {path}."
-        if occurrences > 1:
-            # Find line numbers
-            lines = content.split("\n")
-            found_lines = []
-            for i, line in enumerate(lines, 1):
-                if old_str in line:
-                    found_lines.append(str(i))
-            return (
-                f"No replacement was performed. Multiple occurrences of old_str `{old_str}` "
-                f"in lines: {', '.join(found_lines)}. Please ensure it is unique"
-            )
-
-        # Perform replacement
-        new_content = content.replace(old_str, new_str, 1)
-        resolved.write_text(new_content, encoding="utf-8")
-
-        # Show snippet around the change
-        lines = new_content.split("\n")
-        for i, line in enumerate(lines):
-            if new_str in line:
-                start = max(0, i - 2)
-                end = min(len(lines), i + 3)
-                snippet_lines = ["The memory file has been edited."]
-                for j in range(start, end):
-                    snippet_lines.append(f"{j + 1:6d}\t{lines[j]}")
-                return "\n".join(snippet_lines)
-
-        return "The memory file has been edited."
-
-    def _native_insert(self, input_data: dict[str, Any], user_id: str) -> str:
-        """Insert text at a specific line."""
-        path = input_data.get("path", "")
-        insert_line = input_data.get("insert_line", 0)
-        insert_text = input_data.get("insert_text", "")
-
-        if not path:
-            return "Error: path is required"
-
-        resolved = self._resolve_native_path(path, user_id)
-
-        if not resolved.exists():
-            return f"Error: The path {path} does not exist"
-
-        if resolved.is_dir():
-            return f"Error: The path {path} does not exist"
-
-        content = resolved.read_text(encoding="utf-8")
-        lines = content.split("\n")
-        n_lines = len(lines)
-
-        if insert_line < 0 or insert_line > n_lines:
-            return (
-                f"Error: Invalid `insert_line` parameter: {insert_line}. "
-                f"It should be within the range of lines of the file: [0, {n_lines}]"
-            )
-
-        # Insert at specified line
-        lines.insert(insert_line, insert_text.rstrip("\n"))
-
-        resolved.write_text("\n".join(lines), encoding="utf-8")
-
-        return f"The file {path} has been edited."
-
-    def _native_delete_file(self, input_data: dict[str, Any], user_id: str) -> str:
-        """Delete a file or directory."""
-        path = input_data.get("path", "")
-
-        if not path:
-            return "Error: path is required"
-
-        resolved = self._resolve_native_path(path, user_id)
-
-        if not resolved.exists():
-            return f"Error: The path {path} does not exist"
-
-        import shutil
-
-        if resolved.is_dir():
-            shutil.rmtree(resolved)
-        else:
-            resolved.unlink()
-
-        logger.info(f"Memory: Native delete: {path} for user {user_id}")
-        return f"Successfully deleted {path}"
-
-    def _native_rename(self, input_data: dict[str, Any], user_id: str) -> str:
-        """Rename or move a file/directory."""
-        old_path = input_data.get("old_path", "")
-        new_path = input_data.get("new_path", "")
-
-        if not old_path:
-            return "Error: old_path is required"
-        if not new_path:
-            return "Error: new_path is required"
-
-        resolved_old = self._resolve_native_path(old_path, user_id)
-        resolved_new = self._resolve_native_path(new_path, user_id)
-
-        if not resolved_old.exists():
-            return f"Error: The path {old_path} does not exist"
-
-        if resolved_new.exists():
-            return f"Error: The destination {new_path} already exists"
-
-        # Create parent directory if needed
-        resolved_new.parent.mkdir(parents=True, exist_ok=True)
-
-        resolved_old.rename(resolved_new)
-
-        logger.info(f"Memory: Native rename: {old_path} -> {new_path} for user {user_id}")
-        return f"Successfully renamed {old_path} to {new_path}"
-
     # =========================================================================
     # Semantic Translation Methods (Native Tool → Vector Store)
     # =========================================================================
 
-    async def _native_view_semantic(self, input_data: dict[str, Any], user_id: str) -> str:
+    async def _native_view_semantic(
+        self, input_data: dict[str, Any], user_id: str, *, backend: Any
+    ) -> str:
         """Handle VIEW command with semantic search capabilities.
 
         Path patterns:
@@ -1903,31 +1650,35 @@ your responses, not to drive new actions."""
             query = subpath[len("search/") :]
             if not query:
                 return "Error: Please provide a search query. Example: view /memories/search/food preferences"
-            return await self._semantic_search(query, user_id)
+            return await self._semantic_search(query, user_id, backend=backend)
 
         # CASE 2: /memories/recent → Recent memories
         if subpath == "recent":
-            return await self._get_recent_memories(user_id, limit=10)
+            return await self._get_recent_memories(user_id, limit=10, backend=backend)
 
         # CASE 3: /memories/all → List all (paginated)
         if subpath == "all":
-            return await self._list_all_memories(user_id, limit=20)
+            return await self._list_all_memories(user_id, limit=20, backend=backend)
 
         # CASE 4: /memories (root) → Overview with instructions
         if not subpath or subpath == "":
-            return await self._get_memory_overview(user_id)
+            return await self._get_memory_overview(user_id, backend=backend)
 
         # CASE 5: /memories/<something> → Search by topic
         # Treat the path as a search query
-        return await self._semantic_search(subpath.replace("/", " ").replace("_", " "), user_id)
+        return await self._semantic_search(
+            subpath.replace("/", " ").replace("_", " "), user_id, backend=backend
+        )
 
-    async def _semantic_search(self, query: str, user_id: str, top_k: int = 5) -> str:
+    async def _semantic_search(
+        self, query: str, user_id: str, top_k: int = 5, *, backend: Any
+    ) -> str:
         """Perform semantic search and format results."""
-        if not self._backend:
+        if not backend:
             return "Error: Memory backend not initialized"
 
         try:
-            results = await self._backend.search_memories(
+            results = await backend.search_memories(
                 query=query,
                 user_id=user_id,
                 top_k=top_k,
@@ -1958,15 +1709,15 @@ your responses, not to drive new actions."""
             logger.error(f"Memory: Semantic search failed: {e}")
             return f"Error searching memories: {e}"
 
-    async def _get_recent_memories(self, user_id: str, limit: int = 10) -> str:
+    async def _get_recent_memories(self, user_id: str, limit: int = 10, *, backend: Any) -> str:
         """Get most recent memories."""
-        if not self._backend:
+        if not backend:
             return "Error: Memory backend not initialized"
 
         try:
             # Use a generic query to get recent items
             # Most backends will return by recency when query is broad
-            results = await self._backend.search_memories(
+            results = await backend.search_memories(
                 query="recent memories",
                 user_id=user_id,
                 top_k=limit,
@@ -1993,14 +1744,14 @@ your responses, not to drive new actions."""
             logger.error(f"Memory: Get recent failed: {e}")
             return f"Error getting recent memories: {e}"
 
-    async def _list_all_memories(self, user_id: str, limit: int = 20) -> str:
+    async def _list_all_memories(self, user_id: str, limit: int = 20, *, backend: Any) -> str:
         """List all memories (paginated)."""
-        if not self._backend:
+        if not backend:
             return "Error: Memory backend not initialized"
 
         try:
             # Get all memories with a broad search
-            results = await self._backend.search_memories(
+            results = await backend.search_memories(
                 query="*",  # Broad query
                 user_id=user_id,
                 top_k=limit,
@@ -2025,14 +1776,14 @@ your responses, not to drive new actions."""
             logger.error(f"Memory: List all failed: {e}")
             return f"Error listing memories: {e}"
 
-    async def _get_memory_overview(self, user_id: str) -> str:
+    async def _get_memory_overview(self, user_id: str, *, backend: Any) -> str:
         """Get memory directory overview with search instructions."""
-        if not self._backend:
+        if not backend:
             return "Error: Memory backend not initialized"
 
         try:
             # Get count of memories
-            results = await self._backend.search_memories(
+            results = await backend.search_memories(
                 query="*",
                 user_id=user_id,
                 top_k=100,  # Just to get a count
@@ -2084,7 +1835,9 @@ To see RECENT: view /memories/recent
 To SAVE: create /memories/<topic>.txt "content"
 """
 
-    async def _native_create_semantic(self, input_data: dict[str, Any], user_id: str) -> str:
+    async def _native_create_semantic(
+        self, input_data: dict[str, Any], user_id: str, *, backend: Any
+    ) -> str:
         """Handle CREATE command - save to semantic vector store."""
         path = input_data.get("path", "")
         file_text = input_data.get("file_text", "")
@@ -2094,7 +1847,7 @@ To SAVE: create /memories/<topic>.txt "content"
         if not file_text:
             return "Error: file_text is required (the memory content)"
 
-        if not self._backend:
+        if not backend:
             return "Error: Memory backend not initialized"
 
         try:
@@ -2107,7 +1860,7 @@ To SAVE: create /memories/<topic>.txt "content"
             )
 
             # Save to our semantic backend
-            memory = await self._backend.save_memory(
+            memory = await backend.save_memory(
                 content=file_text,
                 user_id=user_id,
                 importance=0.5,
@@ -2121,7 +1874,9 @@ To SAVE: create /memories/<topic>.txt "content"
             logger.error(f"Memory: Semantic create failed: {e}")
             return f"Error: {e}"
 
-    async def _native_update_semantic(self, input_data: dict[str, Any], user_id: str) -> str:
+    async def _native_update_semantic(
+        self, input_data: dict[str, Any], user_id: str, *, backend: Any
+    ) -> str:
         """Handle STR_REPLACE command - update memory content."""
         path = input_data.get("path", "")
         old_str = input_data.get("old_str", "")
@@ -2132,12 +1887,12 @@ To SAVE: create /memories/<topic>.txt "content"
         if not old_str:
             return "Error: old_str is required"
 
-        if not self._backend:
+        if not backend:
             return "Error: Memory backend not initialized"
 
         try:
             # Search for memory containing old_str
-            results = await self._backend.search_memories(
+            results = await backend.search_memories(
                 query=old_str,
                 user_id=user_id,
                 top_k=5,
@@ -2161,15 +1916,15 @@ To SAVE: create /memories/<topic>.txt "content"
             new_content = matching_memory.content.replace(old_str, new_str, 1)
 
             # Update via delete + create (or update if backend supports it)
-            if hasattr(self._backend, "update_memory"):
-                await self._backend.update_memory(
+            if hasattr(backend, "update_memory"):
+                await backend.update_memory(
                     memory_id=matching_memory.id,
                     new_content=new_content,
                     user_id=user_id,
                 )
             else:
-                await self._backend.delete_memory(matching_memory.id)
-                await self._backend.save_memory(
+                await backend.delete_memory(matching_memory.id)
+                await backend.save_memory(
                     content=new_content,
                     user_id=user_id,
                     importance=0.5,
@@ -2186,7 +1941,9 @@ To SAVE: create /memories/<topic>.txt "content"
             logger.error(f"Memory: Semantic update failed: {e}")
             return f"Error: {e}"
 
-    async def _native_append_semantic(self, input_data: dict[str, Any], user_id: str) -> str:
+    async def _native_append_semantic(
+        self, input_data: dict[str, Any], user_id: str, *, backend: Any
+    ) -> str:
         """Handle INSERT command - append to memory or create new."""
         path = input_data.get("path", "")
         insert_text = input_data.get("insert_text", "")
@@ -2197,7 +1954,7 @@ To SAVE: create /memories/<topic>.txt "content"
         if not insert_text:
             return "Error: insert_text is required"
 
-        if not self._backend:
+        if not backend:
             return "Error: Memory backend not initialized"
 
         try:
@@ -2205,7 +1962,7 @@ To SAVE: create /memories/<topic>.txt "content"
             # with the additional context
             topic = path.replace("/memories/", "").replace("/", "_").replace(".txt", "")
 
-            await self._backend.save_memory(
+            await backend.save_memory(
                 content=insert_text,
                 user_id=user_id,
                 importance=0.5,
@@ -2219,14 +1976,16 @@ To SAVE: create /memories/<topic>.txt "content"
             logger.error(f"Memory: Semantic append failed: {e}")
             return f"Error: {e}"
 
-    async def _native_delete_semantic(self, input_data: dict[str, Any], user_id: str) -> str:
+    async def _native_delete_semantic(
+        self, input_data: dict[str, Any], user_id: str, *, backend: Any
+    ) -> str:
         """Handle DELETE command - remove from vector store."""
         path = input_data.get("path", "")
 
         if not path:
             return "Error: path is required"
 
-        if not self._backend:
+        if not backend:
             return "Error: Memory backend not initialized"
 
         try:
@@ -2238,7 +1997,7 @@ To SAVE: create /memories/<topic>.txt "content"
                 .replace(".txt", "")
             )
 
-            results = await self._backend.search_memories(
+            results = await backend.search_memories(
                 query=topic,
                 user_id=user_id,
                 top_k=10,
@@ -2253,7 +2012,7 @@ To SAVE: create /memories/<topic>.txt "content"
                 # Check if metadata matches path
                 metadata = getattr(r.memory, "metadata", {}) or {}
                 if metadata.get("virtual_path") == path or r.score > 0.8:
-                    await self._backend.delete_memory(r.memory.id)
+                    await backend.delete_memory(r.memory.id)
                     deleted_count += 1
 
             if deleted_count == 0:
@@ -2268,7 +2027,9 @@ To SAVE: create /memories/<topic>.txt "content"
             logger.error(f"Memory: Semantic delete failed: {e}")
             return f"Error: {e}"
 
-    async def _native_rename_semantic(self, input_data: dict[str, Any], user_id: str) -> str:
+    async def _native_rename_semantic(
+        self, input_data: dict[str, Any], user_id: str, *, backend: Any
+    ) -> str:
         """Handle RENAME command - update memory path/topic."""
         old_path = input_data.get("old_path", "")
         new_path = input_data.get("new_path", "")
@@ -2278,7 +2039,7 @@ To SAVE: create /memories/<topic>.txt "content"
         if not new_path:
             return "Error: new_path is required"
 
-        if not self._backend:
+        if not backend:
             return "Error: Memory backend not initialized"
 
         try:
@@ -2290,7 +2051,7 @@ To SAVE: create /memories/<topic>.txt "content"
                 .replace(".txt", "")
             )
 
-            results = await self._backend.search_memories(
+            results = await backend.search_memories(
                 query=old_topic,
                 user_id=user_id,
                 top_k=10,
@@ -2307,8 +2068,8 @@ To SAVE: create /memories/<topic>.txt "content"
                 metadata = getattr(r.memory, "metadata", {}) or {}
                 if metadata.get("virtual_path") == old_path or r.score > 0.8:
                     # Delete old and create with new path
-                    await self._backend.delete_memory(r.memory.id)
-                    await self._backend.save_memory(
+                    await backend.delete_memory(r.memory.id)
+                    await backend.save_memory(
                         content=r.memory.content,
                         user_id=user_id,
                         importance=getattr(r.memory, "importance", 0.5),
