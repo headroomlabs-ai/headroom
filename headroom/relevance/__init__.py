@@ -11,7 +11,7 @@ Available scorers:
    - Combines BM25 + embeddings for best accuracy
    - Adaptive alpha: more BM25 for UUIDs, more semantic for natural language
    - Falls back gracefully to BM25 if sentence-transformers not installed
-   - Install for full support: pip install headroom[relevance]
+   - Install for full support: pip install "headroom-ai[relevance]"
 
 2. BM25Scorer (zero dependencies)
    - Fast keyword matching
@@ -21,7 +21,7 @@ Available scorers:
 3. EmbeddingScorer (requires sentence-transformers)
    - Pure semantic similarity
    - Best for natural language queries
-   - Install: pip install headroom[relevance]
+   - Install: pip install "headroom-ai[relevance]"
 
 WHY HYBRID IS DEFAULT:
 - Missing important items during compression is catastrophic
@@ -112,7 +112,7 @@ def create_scorer(
         if not EmbeddingScorer.is_available():
             raise RuntimeError(
                 "EmbeddingScorer requires sentence-transformers. "
-                "Install with: pip install headroom[relevance]"
+                'Install with: pip install "headroom-ai[relevance]"'
             )
         return EmbeddingScorer(**kwargs)
 

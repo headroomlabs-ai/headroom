@@ -28,6 +28,9 @@ from dataclasses import asdict, fields
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
+from ...fileperms import ensure_private_file
+from ...log_safety import WarnOnce, safe_id
+
 if TYPE_CHECKING:
     from ..compression_store import CompressionEntry
 
@@ -49,6 +52,11 @@ DROP INDEX IF EXISTS idx_ccr_expiry;
 # Purge expired rows at most this often (seconds). Purging is hygiene,
 # not correctness — CompressionStore checks TTL on every get().
 _PURGE_INTERVAL = 60.0
+# items() decodes every row on each eviction pass, so an unreadable row warns
+# once per hash per hour (WarnOnce's window), for at most this many hashes per
+# hour; further ones log at debug only. A row that stays broken warns again
+# about once an hour, which keeps it visible without flooding.
+_MAX_REPORTED_UNREADABLE = 1000
 
 
 def default_db_path() -> Path:
@@ -81,9 +89,27 @@ class SQLiteBackend:
         self._path.parent.mkdir(parents=True, exist_ok=True)
         self._lock = threading.Lock()
         self._last_purge = 0.0
+        self._unreadable_warned = WarnOnce(
+            _MAX_REPORTED_UNREADABLE, "unreadable CCR SQLite entries"
+        )
         self._conn = self._open()
 
+    @staticmethod
+    def _ensure_private(path: Path) -> None:
+        """Make the database file 0600 *before* sqlite opens it, failing CLOSED.
+
+        The originals stored here can contain sensitive tool output (file
+        contents, command output). ``mkdir`` created the parent at the umask
+        default and sqlite would create the db at the umask default too, so the
+        file is created (or an existing one narrowed) through
+        :func:`headroom.fileperms.ensure_private_file`, which is symlink-race
+        resistant and raises :class:`PermissionError` rather than opening a
+        wide file. See that function for the exact guarantee per platform.
+        """
+        ensure_private_file(path, what="CCR store")
+
     def _open(self) -> sqlite3.Connection:
+        self._ensure_private(self._path)
         conn = sqlite3.connect(self._path, check_same_thread=False)
         # Wait for competing writers instead of failing with SQLITE_BUSY —
         # multiple proxy workers share this file, and writes are frequent
@@ -130,7 +156,9 @@ class SQLiteBackend:
         log and treat the operation as a miss; never destroy data over a
         transient error."""
         if not self._is_corruption(error):
-            logger.warning("CCR SQLite %s failed (transient, no reset): %s", op, error)
+            logger.warning(
+                "CCR SQLite %s failed on %s (transient, no reset): %s", op, self._path, error
+            )
             return
         logger.warning(
             "CCR SQLite store at %s is corrupt (%s); recreating. "
@@ -144,17 +172,43 @@ class SQLiteBackend:
         except Exception:  # noqa: BLE001 - best-effort close on corrupt handle
             pass
         self._path.unlink(missing_ok=True)
+        self._unreadable_warned = WarnOnce(
+            _MAX_REPORTED_UNREADABLE, "unreadable CCR SQLite entries"
+        )
         self._conn = self._open()
 
-    def _entry_from_json(self, raw: str) -> CompressionEntry | None:
+    def _report_unreadable(self, hash_key: str, reason: object) -> None:
+        first = self._unreadable_warned.first(hash_key, logger)
+        logger.log(
+            logging.WARNING if first else logging.DEBUG,
+            "CCR SQLite entry %s in %s is unreadable (%s); treating as a miss",
+            safe_id(hash_key),
+            self._path,
+            reason,
+        )
+
+    def _entry_from_json(self, raw: str, hash_key: str) -> CompressionEntry | None:
         from ..compression_store import CompressionEntry
 
         try:
             data = json.loads(raw)
-        except (json.JSONDecodeError, TypeError):
+        except (json.JSONDecodeError, TypeError) as e:
+            self._report_unreadable(hash_key, type(e).__name__)
+            return None
+        if not isinstance(data, dict):
+            self._report_unreadable(hash_key, "not a JSON object")
             return None
         known = {f.name for f in fields(CompressionEntry)}
-        return CompressionEntry(**{k: v for k, v in data.items() if k in known})
+        try:
+            return CompressionEntry(**{k: v for k, v in data.items() if k in known})
+        except (TypeError, ValueError) as e:
+            # A blob that parses as JSON but is missing a required field (schema
+            # drift across an upgrade, a partially written row) must degrade to a
+            # miss, not raise. Otherwise a single bad row crashes get() — and,
+            # via items(), _clean_expired() runs it on every store's eviction, so
+            # one poison row would break all reads, evictions, and stores.
+            self._report_unreadable(hash_key, type(e).__name__)
+            return None
 
     def _purge_expired(self, now: float) -> int:
         """Delete expired rows using metadata; caller holds ``_lock``."""
@@ -190,11 +244,11 @@ class SQLiteBackend:
                     (hash_key,),
                 ).fetchone()
             except sqlite3.DatabaseError as e:
-                self._handle_db_error(e, "get")
+                self._handle_db_error(e, f"get {safe_id(hash_key)}")
                 return None
         if row is None:
             return None
-        return self._entry_from_json(row[0])
+        return self._entry_from_json(row[0], hash_key)
 
     def set(self, hash_key: str, entry: CompressionEntry) -> None:
         payload = json.dumps(asdict(entry), ensure_ascii=False)
@@ -208,7 +262,7 @@ class SQLiteBackend:
                 self._conn.commit()
                 self._maybe_purge()
             except sqlite3.DatabaseError as e:
-                self._handle_db_error(e, "set")
+                self._handle_db_error(e, f"set {safe_id(hash_key)}")
 
     def delete(self, hash_key: str) -> bool:
         with self._lock:
@@ -220,7 +274,7 @@ class SQLiteBackend:
                 self._conn.commit()
                 return cur.rowcount > 0
             except sqlite3.DatabaseError as e:
-                self._handle_db_error(e, "op")
+                self._handle_db_error(e, f"delete {safe_id(hash_key)}")
                 return False
 
     def exists(self, hash_key: str) -> bool:
@@ -231,7 +285,7 @@ class SQLiteBackend:
                     (hash_key,),
                 ).fetchone()
             except sqlite3.DatabaseError as e:
-                self._handle_db_error(e, "op")
+                self._handle_db_error(e, f"exists {safe_id(hash_key)}")
                 return False
         return row is not None
 
@@ -241,15 +295,25 @@ class SQLiteBackend:
                 self._conn.execute("DELETE FROM ccr_entries")
                 self._conn.commit()
             except sqlite3.DatabaseError as e:
-                self._handle_db_error(e, "op")
+                self._handle_db_error(e, "clear")
 
     def count(self) -> int:
         with self._lock:
             try:
                 row = self._conn.execute("SELECT COUNT(*) FROM ccr_entries").fetchone()
             except sqlite3.DatabaseError as e:
-                self._handle_db_error(e, "op")
+                self._handle_db_error(e, "count")
                 return 0
+        return int(row[0])
+
+    def external_revision(self) -> int | None:
+        """Return a token that changes when another connection commits."""
+        with self._lock:
+            try:
+                row = self._conn.execute("PRAGMA data_version").fetchone()
+            except sqlite3.DatabaseError as e:
+                self._handle_db_error(e, "revision")
+                return None
         return int(row[0])
 
     def keys(self) -> list[str]:
@@ -257,7 +321,7 @@ class SQLiteBackend:
             try:
                 rows = self._conn.execute("SELECT hash FROM ccr_entries").fetchall()
             except sqlite3.DatabaseError as e:
-                self._handle_db_error(e, "op")
+                self._handle_db_error(e, "keys")
                 return []
         return [r[0] for r in rows]
 
@@ -266,11 +330,11 @@ class SQLiteBackend:
             try:
                 rows = self._conn.execute("SELECT hash, entry_json FROM ccr_entries").fetchall()
             except sqlite3.DatabaseError as e:
-                self._handle_db_error(e, "op")
+                self._handle_db_error(e, "items")
                 return []
         out: list[tuple[str, CompressionEntry]] = []
         for hash_key, raw in rows:
-            entry = self._entry_from_json(raw)
+            entry = self._entry_from_json(raw, hash_key)
             if entry is not None:
                 out.append((hash_key, entry))
         return out
@@ -280,7 +344,7 @@ class SQLiteBackend:
             try:
                 count_row = self._conn.execute("SELECT COUNT(*) FROM ccr_entries").fetchone()
             except sqlite3.DatabaseError as e:
-                self._handle_db_error(e, "op")
+                self._handle_db_error(e, "stats")
                 count_row = (0,)
         try:
             bytes_used = self._path.stat().st_size

@@ -55,15 +55,24 @@ def test_savings_tracker_migrates_v4_lifetime_to_v5_metrics_and_preserves_legacy
     assert lifetime["prefix_cache"]["cache_read_tokens"] == 5
     assert lifetime["cost"] == {
         "input_usd": 1.5,
+        # Migrated from a pre-cache-aware state: its one dollar figure was
+        # list-priced, so it seeds both columns and the aggregate says so.
         "compression_savings_usd": 0.5,
+        "compression_savings_list_usd": 0.5,
+        "savings_basis": "list",
         "cache_savings_usd": 0.2,
     }
     assert lifetime["by_model"]["other"]["input_tokens"] == 80
 
     tracker.flush()
     saved = json.loads(path.read_text(encoding="utf-8"))
-    assert saved["schema_version"] == 5
-    assert saved["lifetime"] == legacy_state["lifetime"]
+    assert saved["schema_version"] == 6
+    # Every legacy field survives the migration untouched. Not exact equality:
+    # v6 ADDS the list-price ceiling and the basis label beside them, which is
+    # the point of the migration rather than a violation of it.
+    assert saved["lifetime"].items() >= legacy_state["lifetime"].items()
+    assert saved["lifetime"]["savings_basis"] == "list"
+    assert isinstance(saved["lifetime"]["savings_basis_migrated_at"], str)
     assert saved["display_session"]["requests"] == 2
     assert saved["projects"]["keep-me"]["requests"] == 1
     assert saved["lifetime_metrics"]["models"]["other"]["input_tokens"] == 80

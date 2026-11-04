@@ -107,8 +107,6 @@ class _DummyAnthropicHandler(AnthropicHandlerMixin):
             mode="cache",
             cache_enabled=False,
             rate_limit_enabled=False,
-            fallback_enabled=False,
-            fallback_provider=None,
             prefix_freeze_enabled=False,
             memory_enabled=False,
         )
@@ -237,3 +235,101 @@ def test_cache_mode_prefix_mismatch_passes_through_with_tag(monkeypatch):
     assert forwarded[0]["content"][0]["content"] == original_text
     # ...but now visibly tagged instead of silent.
     assert handler.recorded_tags["passthrough_reason"] == "cache_mode_prefix_mismatch"
+
+
+def _assistant(turn: int) -> dict:
+    return {
+        "role": "assistant",
+        "content": [{"type": "tool_use", "id": f"toolu_{turn}", "name": "read", "input": {}}],
+    }
+
+
+def _tool_result(turn: int) -> dict:
+    return {
+        "role": "user",
+        "content": [
+            {
+                "type": "tool_result",
+                "tool_use_id": f"toolu_{turn}",
+                "content": f"verbose tool output {turn} " * 200,
+            }
+        ],
+    }
+
+
+def _compress_unfrozen(messages, model, frozen_message_count=0, **kwargs):
+    """Like ``_fake_pipeline_apply`` but leaves frozen messages alone, as the
+    real pipeline does."""
+    result = _fake_pipeline_apply(messages[frozen_message_count:], model)
+    return TransformResult(
+        messages=list(messages[:frozen_message_count]) + result.messages,
+        tokens_before=result.tokens_before,
+        tokens_after=result.tokens_after,
+        transforms_applied=result.transforms_applied,
+    )
+
+
+class _ConversationHandler(_DummyAnthropicHandler):
+    """Real session tracker store; the upstream answers with the next tool call."""
+
+    def __init__(self) -> None:
+        from headroom.cache.prefix_tracker import SessionTrackerStore
+
+        super().__init__()
+        self.session_tracker_store = SessionTrackerStore()
+        self.anthropic_pipeline = SimpleNamespace(apply=MagicMock(side_effect=_compress_unfrozen))
+        self.forwarded: list[list[dict]] = []
+
+    async def _retry_request(self, method, url, headers, body, **_kwargs):
+        self.forwarded.append(json.loads(json.dumps(body["messages"])))
+        reply = {
+            "id": f"msg_{len(self.forwarded)}",
+            "type": "message",
+            "role": "assistant",
+            "content": _assistant(len(self.forwarded) + 1)["content"],
+            "usage": {"input_tokens": 1, "output_tokens": 1},
+        }
+        return SimpleNamespace(
+            status_code=200, headers={}, content=json.dumps(reply).encode(), json=lambda: reply
+        )
+
+
+def test_cache_mode_replaced_system_tail_keeps_compressed_prefix(monkeypatch):
+    """Claude Code replaces a trailing system reminder every turn. Cache mode
+    must replay last turn's compressed prefix without the old reminder and
+    compress only the new messages, not fall back to raw forwarding."""
+    import headroom.tokenizers as _tk
+
+    monkeypatch.setattr(_tk, "get_tokenizer", lambda model: _DummyTokenizer())
+    handler = _ConversationHandler()
+    model = "claude-fable-5"
+    history = [{"role": "user", "content": "Read the files."}, _assistant(1), _tool_result(1)]
+    turns = [
+        history,
+        [*history, _assistant(2), _tool_result(2), {"role": "system", "content": "Reminder A"}],
+        [
+            *history,
+            _assistant(2),
+            _tool_result(2),
+            _assistant(3),
+            _tool_result(3),
+            {"role": "system", "content": "Reminder B"},
+        ],
+    ]
+    for messages in turns:
+        request = _build_request({"model": model, "max_tokens": 16, "messages": messages})
+        anyio.run(handler.handle_anthropic_messages, request)
+
+    from headroom.cache.prefix_tracker import _strip_cache_control
+
+    # The proxy re-places cache_control markers every turn; compare the bytes under them.
+    second, third = (_strip_cache_control(m) for m in handler.forwarded[1:])
+    assert [m["role"] for m in third] == [m["role"] for m in turns[2]]
+    # Everything before the replaced reminder is last turn's forwarded bytes...
+    assert third[:5] == second[:5]
+    assert second[2]["content"][0]["content"] == _COMPRESSED_TEXT
+    assert second[4]["content"][0]["content"] == _COMPRESSED_TEXT
+    # ...the new tool result is compressed, and the current reminder is sent as is.
+    assert third[6]["content"][0]["content"] == _COMPRESSED_TEXT
+    assert third[-1] == {"role": "system", "content": "Reminder B"}
+    assert "passthrough_reason" not in handler.recorded_tags

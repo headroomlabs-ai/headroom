@@ -41,7 +41,7 @@ const client = new HeadroomClient({
 
 <TypeTable type={{
   original_client: { type: 'OpenAI | Anthropic', description: 'The underlying LLM client', default: 'Required' },
-  provider: { type: 'Provider', description: 'Token counting provider', default: 'Auto-detected' },
+  provider: { type: 'Provider', description: 'Token counting provider', default: 'Required' },
   default_mode: { type: '"audit" | "optimize"', description: 'Default compression mode', default: '"audit"' },
   store_url: { type: 'str | None', description: 'Storage URL for metrics database', default: 'None' },
   config: { type: 'HeadroomConfig | None', description: 'Compression and cache alignment settings (set config.smart_crusher / config.cache_aligner)', default: 'Default config' },
