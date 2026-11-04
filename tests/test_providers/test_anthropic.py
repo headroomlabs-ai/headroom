@@ -180,6 +180,122 @@ class TestLongContextPricing:
         cost = manual_provider.estimate_cost(300_000, 5_000, "claude-sonnet-4-5[1m]", 0)
         assert cost == pytest.approx(1.9125, rel=1e-4)
 
+    # Haiku 5.5's tier starts at 100K and multiplies every rate by 5:
+    # 100K in / 5K out  -> 100K*$0.10 + 5K*$0.50  = $0.0125
+    # 150K in / 5K out  -> 150K*$0.50 + 5K*$2.50  = $0.0875  (long-prompt card)
+    # 150K in of which 100K cached, 5K out
+    #                   -> 50K*$0.50 + 100K*$0.05 + 5K*$2.50 = $0.0425
+    @pytest.mark.parametrize(
+        ("input_tokens", "output_tokens", "cached_tokens", "expected"),
+        [
+            (100_000, 5_000, 0, 0.0125),
+            (150_000, 5_000, 0, 0.0875),
+            (150_000, 5_000, 100_000, 0.0425),
+        ],
+    )
+    def test_haiku_5_5_long_prompt_card_starts_at_100k(
+        self, manual_provider, input_tokens, output_tokens, cached_tokens, expected
+    ):
+        cost = manual_provider.estimate_cost(
+            input_tokens, output_tokens, "claude-haiku-5-5", cached_tokens
+        )
+        assert cost == pytest.approx(expected, rel=1e-4)
+
+    @pytest.mark.parametrize(
+        "model",
+        # Gateway ids resolve to the same bare row, so they are guarded too.
+        ["claude-haiku-5-5", "anthropic/claude-haiku-5-5", "openrouter/anthropic/claude-haiku-5-5"],
+    )
+    def test_haiku_5_5_card_survives_litellm_dropping_the_100k_rate(
+        self, provider, monkeypatch, model
+    ):
+        """A Haiku 5.5 entry without the above-100K rate must not bill a long prompt at the base tier."""
+        litellm = pytest.importorskip("litellm")
+        import headroom.providers.anthropic as anthropic_module
+
+        # The LiteLLM pricer would return this sentinel; litellm caches model
+        # info, so the patched row below cannot be relied on to reach it.
+        monkeypatch.setattr(anthropic_module, "estimate_cost_from_tokens", lambda *a, **k: 0.42)
+        # Keeps the 200K field Sonnet's tier reads, so only Haiku's own field decides.
+        monkeypatch.setitem(
+            litellm.model_cost,
+            "claude-haiku-5-5",
+            {
+                "litellm_provider": "anthropic",
+                "mode": "chat",
+                "input_cost_per_token": 1e-07,
+                "output_cost_per_token": 5e-07,
+                "cache_read_input_token_cost": 1e-08,
+                "input_cost_per_token_above_200k_tokens": 5e-07,
+            },
+        )
+
+        assert provider.estimate_cost(150_000, 5_000, model, 0) == pytest.approx(0.0875, rel=1e-4)
+        # At the threshold the LiteLLM path still prices it.
+        assert provider.estimate_cost(100_000, 5_000, model, 0) == 0.42
+
+    def test_haiku_5_5_published_100k_rate_stays_on_litellm(self, provider, monkeypatch):
+        """With its own above-100K rate published, LiteLLM keeps pricing a long Haiku prompt."""
+        litellm = pytest.importorskip("litellm")
+        import headroom.providers.anthropic as anthropic_module
+
+        monkeypatch.setitem(
+            litellm.model_cost,
+            "claude-haiku-5-5",
+            {
+                "litellm_provider": "anthropic",
+                "mode": "chat",
+                "input_cost_per_token": 1e-07,
+                "output_cost_per_token": 5e-07,
+                "input_cost_per_token_above_100k_tokens": 5e-07,
+                "output_cost_per_token_above_100k_tokens": 2.5e-06,
+            },
+        )
+        # Stub the LiteLLM pricer: litellm caches model info, so a patched row
+        # does not reliably reach its own cost_per_token. The manual table
+        # would return $0.0875, so the sentinel shows which path priced it.
+        monkeypatch.setattr(anthropic_module, "estimate_cost_from_tokens", lambda *a, **k: 0.42)
+
+        assert provider.estimate_cost(150_000, 5_000, "claude-haiku-5-5", 0) == 0.42
+
+    @pytest.mark.parametrize(
+        ("model", "expected"),
+        [
+            # 150K*$0.50 + 5K*$2.50: Haiku 5.5's long-prompt card.
+            ("anthropic.claude-haiku-5-5-v1:0", 0.0875),
+            ("us.anthropic.claude-haiku-5-5-v1:0", 0.0875),
+            ("claude-haiku-5-5-20261001", 0.0875),
+            # One version segment away is another model: the `haiku` tier
+            # default, 150K*$0.80 + 5K*$4, with no Haiku 5.5 card.
+            ("claude-haiku-5", 0.14),
+        ],
+    )
+    def test_wrapped_haiku_5_5_ids_get_the_long_prompt_card(self, manual_provider, model, expected):
+        """An id the manual table prices as Haiku 5.5 is also billed on its long-prompt card."""
+        cost = manual_provider.estimate_cost(150_000, 5_000, model, 0)
+        assert cost == pytest.approx(expected, rel=1e-4)
+
+    def test_reseller_flat_haiku_5_5_row_keeps_its_litellm_rate(self, provider, monkeypatch):
+        """A reseller row with no long-prompt tier is flat-rated, not a dropped Anthropic rate."""
+        litellm = pytest.importorskip("litellm")
+        import headroom.providers.anthropic as anthropic_module
+
+        monkeypatch.setitem(
+            litellm.model_cost,
+            "perplexity/anthropic/claude-haiku-5-5",
+            {
+                "litellm_provider": "perplexity",
+                "mode": "chat",
+                "input_cost_per_token": 1e-07,
+                "output_cost_per_token": 5e-07,
+            },
+        )
+        # Stub the LiteLLM pricer (see above); the manual card would be $0.0875.
+        monkeypatch.setattr(anthropic_module, "estimate_cost_from_tokens", lambda *a, **k: 0.42)
+
+        cost = provider.estimate_cost(150_000, 5_000, "perplexity/anthropic/claude-haiku-5-5", 0)
+        assert cost == 0.42
+
 
 class TestLiteLLMCostHelper:
     """The shared helper each provider now uses for LiteLLM-backed pricing.
@@ -324,8 +440,10 @@ class TestAnthropicCostEstimation:
             ("claude-opus-5-5", {"input": 4.00, "output": 20.00, "cached_input": 0.20}),
             ("claude-opus-5", {"input": 5.00, "output": 25.00, "cached_input": 0.50}),
             ("claude-sonnet-5-5", {"input": 2.00, "output": 10.00, "cached_input": 0.20}),
+            ("claude-haiku-5-5", {"input": 0.10, "output": 0.50, "cached_input": 0.01}),
             # Suffixed ids must resolve to their own row, not a shorter prefix's.
             ("claude-sonnet-5-5[1m]", {"input": 2.00, "output": 10.00, "cached_input": 0.20}),
+            ("claude-haiku-5-5-20261001", {"input": 0.10, "output": 0.50, "cached_input": 0.01}),
             ("claude-fable-5-1-20261001", {"input": 10.00, "output": 50.00, "cached_input": 0.25}),
             ("claude-opus-5-5-20261001", {"input": 4.00, "output": 20.00, "cached_input": 0.20}),
         ],
@@ -334,7 +452,50 @@ class TestAnthropicCostEstimation:
         assert anthropic_provider._get_pricing(model) == expected
 
     @pytest.mark.parametrize(
-        "model", ["claude-fable-5-1", "claude-opus-5-5", "claude-opus-5", "claude-sonnet-5-5"]
+        "model",
+        [
+            "claude-fable-5-1",
+            "claude-opus-5-5",
+            "claude-opus-5",
+            "claude-sonnet-5-5",
+            "claude-haiku-5-5",
+        ],
     )
     def test_context_limit_claude_5_point_releases(self, anthropic_provider, model):
         assert anthropic_provider.get_context_limit(model) == 1_000_000
+
+    def test_shorter_id_does_not_inherit_a_newer_release(self, monkeypatch):
+        """``claude-haiku-5`` is not ``claude-haiku-5-5``: no 1M window, no 5.5 card.
+
+        It falls through to the ``haiku`` pattern default instead, as it did
+        before Haiku 5.5 had a row.
+        """
+        import headroom.providers.anthropic as anthropic_module
+
+        monkeypatch.setattr(anthropic_module, "_get_litellm_clients", lambda: (None, None))
+        provider = anthropic_module.AnthropicProvider()
+        haiku_default = anthropic_module._PATTERN_DEFAULTS["haiku"]
+        assert provider.get_context_limit("claude-haiku-5") == haiku_default["context"]
+        assert provider._get_pricing("claude-haiku-5") == haiku_default["pricing"]
+
+    @pytest.mark.parametrize(
+        ("model", "known_model", "expected"),
+        [
+            ("claude-sonnet-4-5-20250929", "claude-sonnet-4-5", True),
+            ("anthropic.claude-haiku-5-5-v1:0", "claude-haiku-5-5", True),
+            ("claude-3-5-sonnet", "claude-3-5-sonnet-20241022", True),
+            ("claude-3-5-haiku", "claude-3-5-haiku-latest", True),
+            ("claude-sonnet-4", "claude-sonnet-4-20250514", True),
+            # One version segment away is another model, in either direction.
+            ("claude-haiku-5", "claude-haiku-5-5", False),
+            ("claude-sonnet-4", "claude-sonnet-4-6", False),
+            ("claude-sonnet-5-5", "claude-sonnet-5", False),
+            ("claude-sonnet-5-5-20261001", "claude-sonnet-5", False),
+            # A bare fragment is not an alias.
+            ("sonnet", "claude-3-5-sonnet-20241022", False),
+        ],
+    )
+    def test_is_release_of(self, model, known_model, expected):
+        from headroom.providers.anthropic import _is_release_of
+
+        assert _is_release_of(model, known_model) is expected
