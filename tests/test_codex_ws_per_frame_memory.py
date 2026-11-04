@@ -297,6 +297,51 @@ async def test_memory_lookup_skips_input_bearing_non_create_first_frame():
 
 
 @pytest.mark.asyncio
+async def test_cache_mode_skips_memory_context_search_ws():
+    upstream = _FakeUpstream(
+        [
+            json.dumps({"type": "response.created", "response": {"id": "r_1"}}),
+            json.dumps({"type": "response.completed", "response": {"id": "r_1"}}),
+            json.dumps({"type": "response.created", "response": {"id": "r_2"}}),
+            json.dumps({"type": "response.completed", "response": {"id": "r_2"}}),
+        ],
+        hold_after_events=True,
+    )
+    first_turn, later_turn = _issue_2059_turns()
+    client_frames = [
+        _turn_with_tools(json.loads(first_turn)["response"]["input"], _client_response_tools()),
+        _turn_with_tools(json.loads(later_turn)["response"]["input"], _client_response_tools()),
+    ]
+    client_ws = _FakeWebSocket(frames=client_frames)
+    handler = _DummyOpenAIHandler()
+    handler.config.mode = "cache"
+    memory = _MemoryHandler()
+    handler.memory_handler = memory
+    recorded_outcomes = []
+
+    async def _capture_outcome(outcome):
+        recorded_outcomes.append(outcome)
+
+    handler._record_request_outcome = _capture_outcome
+
+    with patch.dict(sys.modules, {"websockets": _make_fake_websockets_module(upstream)}):
+        await handler.handle_openai_responses_ws(client_ws)
+
+    assert memory.queries == []
+    assert len(upstream.sent) == 2
+    for i, sent_raw in enumerate(upstream.sent):
+        sent = json.loads(sent_raw)
+        original = json.loads(client_frames[i])
+        assert sent["response"]["input"] == original["response"]["input"]
+        expected_tools = [*_client_response_tools(), *_expected_memory_response_tools()]
+        assert sent["response"]["tools"] == expected_tools
+
+    assert len(recorded_outcomes) >= 1
+    for outcome in recorded_outcomes:
+        assert outcome.tags.get("memory_skip_reason") == "cache_mode"
+
+
+@pytest.mark.asyncio
 async def test_memory_lookup_skips_bypassed_frames():
     upstream = _FakeUpstream(
         [
