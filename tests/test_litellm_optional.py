@@ -26,7 +26,7 @@ from packaging.requirements import Requirement
 from packaging.version import Version
 
 PYPROJECT = Path(__file__).resolve().parents[1] / "pyproject.toml"
-SUPPORTED_PYTHONS = ("3.10", "3.11", "3.12", "3.13", "3.14")
+SUPPORTED_PYTHONS = ("3.11", "3.12", "3.13", "3.14")
 PLATFORMS = ("linux", "darwin", "win32")
 LITELLM_FLOOR = Version("1.96.2")
 
@@ -78,14 +78,17 @@ def test_proxy_starts_without_watchdog(monkeypatch: pytest.MonkeyPatch) -> None:
 
     requested: list[str] = []
 
-    def fake_import(name: str) -> object:
+    from importlib.machinery import ModuleSpec
+
+    def fake_find_spec(name: str) -> ModuleSpec | None:
         requested.append(name)
         if name == "watchdog":
-            raise ImportError("No module named 'watchdog'")
-        return object()
+            return None
+        return ModuleSpec(name, loader=None)
 
-    monkeypatch.setattr(proxy, "import_module", fake_import)
+    monkeypatch.setattr(proxy, "find_spec", fake_find_spec)
     proxy.ensure_proxy_dependencies()
+    assert "fastapi" in requested
     assert "watchdog" not in requested
 
 
