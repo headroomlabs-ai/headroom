@@ -4377,6 +4377,7 @@ class OpenAIHandlerMixin:
                 ):
                     from headroom.proxy.helpers import log_memory_injection
 
+                    tags["memory_skip_reason"] = "cache_mode"
                     log_memory_injection(
                         request_id=request_id,
                         session_id=None,
@@ -6228,6 +6229,7 @@ class OpenAIHandlerMixin:
                 ):
                     from headroom.proxy.helpers import log_memory_injection
 
+                    tags["memory_skip_reason"] = "cache_mode"
                     log_memory_injection(
                         request_id=request_id,
                         session_id=None,
@@ -8305,6 +8307,7 @@ class OpenAIHandlerMixin:
                     ):
                         from headroom.utils import extract_user_query
 
+                        ws_tags["memory_skip_reason"] = "cache_mode"
                         ws_input = ws_response_body.get("input", "")
                         ws_instructions = ws_response_body.get("instructions")
                         ws_msgs: list[dict[str, Any]] = []
