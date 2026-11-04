@@ -156,6 +156,29 @@ def test_every_published_docker_variant_includes_bedrock_auth_dependencies() -> 
     assert {"boto3", "botocore"} <= bedrock_names
 
 
+def test_every_docker_variant_includes_the_redis_extra() -> None:
+    """Without the client, HEADROOM_COMPRESS_SESSION_STORE=redis:// stops
+    startup and HEADROOM_CCR_BACKEND=redis falls back to a per-process store,
+    so the 0.42 image could use neither. Keep the Dockerfile default and every
+    bake target on [redis]."""
+    dockerfile = (ROOT / "Dockerfile").read_text(encoding="utf-8")
+    defaults = re.findall(r"^ARG HEADROOM_EXTRAS=(\S+)$", dockerfile, re.MULTILINE)
+    assert len(defaults) == 1, defaults
+    assert "redis" in defaults[0].split(",")
+
+    bake = (ROOT / "docker-bake.hcl").read_text(encoding="utf-8")
+    targets = re.findall(r'^\s*HEADROOM_EXTRAS = "([^"]*)"$', bake, re.MULTILINE)
+    assert len(targets) == 9
+    assert all("redis" in extras.split(",") for extras in targets), targets
+
+    project = tomllib.loads((ROOT / "pyproject.toml").read_text(encoding="utf-8"))
+    redis_names = {
+        Requirement(requirement).name
+        for requirement in project["project"]["optional-dependencies"]["redis"]
+    }
+    assert "redis" in redis_names
+
+
 def test_public_docker_instructions_use_the_current_organization_package() -> None:
     """Do not send users back to the personal GHCR package frozen at 0.27.0."""
     public_docs = (
@@ -210,7 +233,39 @@ def test_docker_bake_metadata_never_travels_through_env() -> None:
         if step.get("name") == "Export digest"
     )
     assert "<<'__HEADROOM_BAKE_META_EOF__'" in export["run"]
-    assert "${{ steps.bake.outputs.metadata }}" in export["run"]
+    assert (
+        "${{ steps.bake.outcome == 'success' && steps.bake.outputs.metadata || steps.bake-fallback.outputs.metadata }}"
+        in export["run"]
+    )
+
+
+def test_docker_build_cache_failures_are_best_effort() -> None:
+    """A missing remote cache blob must not block publishing an image."""
+    workflow = yaml.safe_load((ROOT / ".github" / "workflows" / "docker.yml").read_text())
+    build_steps = workflow["jobs"]["docker-build"]["steps"]
+    cached = next(step for step in build_steps if step.get("id") == "bake")
+    fallback_builder = next(step for step in build_steps if step.get("id") == "fallback-buildx")
+    fallback = next(step for step in build_steps if step.get("id") == "bake-fallback")
+    digest = next(step for step in build_steps if step.get("id") == "digest")
+
+    cached_overrides = cached["with"]["set"].splitlines()
+    fallback_overrides = fallback["with"]["set"].splitlines()
+    cache_to = next(line for line in cached_overrides if ".cache-to=" in line)
+
+    assert cached["continue-on-error"] is True
+    assert "ignore-error=true" in cache_to
+    assert fallback_builder["if"] == "steps.bake.outcome == 'failure'"
+    assert fallback_builder["uses"] == "docker/setup-buildx-action@v4"
+    assert fallback["if"] == "steps.bake.outcome == 'failure'"
+    assert fallback["uses"] == cached["uses"]
+    assert fallback["with"]["builder"] == "${{ steps.fallback-buildx.outputs.name }}"
+    assert fallback["with"]["no-cache"] is True
+    assert not any(".cache-from=" in line for line in fallback_overrides)
+    assert not any(".cache-to=" in line for line in fallback_overrides)
+    assert (
+        "steps.bake.outcome == 'success' && steps.bake.outputs.metadata || steps.bake-fallback.outputs.metadata"
+        in digest["run"]
+    )
 
 
 def test_docker_latest_promotion_is_owned_by_root_manifest_cell() -> None:
@@ -245,7 +300,8 @@ def test_docker_latest_promotion_is_owned_by_root_manifest_cell() -> None:
     assert '"${IMAGE}:${VERSION}"' in command
     assert "promote-latest" not in jobs
     assert manifest["needs"] == "docker-build"
-    assert manifest["if"] == "${{ always() }}"
+    # Publishing requires every architecture's digest, including after cancellation.
+    assert manifest["if"] == "${{ success() }}"
     step_names = [step["name"] for step in manifest["steps"]]
     assert step_names.index("Sign multi-arch index manifest with cosign") < step_names.index(
         "Re-tag root image as :latest"
@@ -996,7 +1052,7 @@ def test_publish_npm_regenerates_openclaw_dist_metadata_after_version_and_depend
     content = (ROOT / ".github" / "workflows" / "release.yml").read_text(encoding="utf-8")
 
     start = content.index("name: Publish ${{ env.NPM_OPENCLAW_PACKAGE }} to npmjs.org")
-    end = content.index("continue-on-error: true", start)
+    end = content.index("name: Publish ${{ env.NPM_OPENCODE_PACKAGE }}", start)
     block = content[start:end]
 
     version = block.index('npm version "$version"')
@@ -1012,7 +1068,7 @@ def test_publish_npm_rewrites_opencode_dependency_after_version_and_before_publi
     content = (ROOT / ".github" / "workflows" / "release.yml").read_text(encoding="utf-8")
 
     start = content.index("name: Publish ${{ env.NPM_OPENCODE_PACKAGE }} to npmjs.org")
-    end = content.index("continue-on-error: true", start)
+    end = content.index("\n  publish-github-packages:", start)
     block = content[start:end]
 
     version = block.index('npm version "$version"')
@@ -1020,6 +1076,39 @@ def test_publish_npm_rewrites_opencode_dependency_after_version_and_before_publi
     publish = block.index("npm publish --access public")
 
     assert version < dependency < publish
+
+
+def test_publish_npm_authenticates_before_any_publish_and_fails_closed() -> None:
+    """An opted-in npm release must not silently succeed with stale packages."""
+    content = (ROOT / ".github" / "workflows" / "release.yml").read_text(encoding="utf-8")
+    start = content.index("\n  publish-npm:")
+    end = content.index("\n  publish-github-packages:", start)
+    block = content[start:end]
+
+    auth = block.index("name: Verify npm publishing authentication")
+    first_publish = block.index("npm publish --access public")
+    assert auth < first_publish
+    assert 'npm whoami --registry "${NPM_REGISTRY_URL}"' in block
+    assert "NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}" in block
+    assert "continue-on-error: true" not in block
+    assert "npm publish notice" not in block
+
+
+def test_publish_npm_is_rerunnable_after_a_partial_release() -> None:
+    """Immutable versions already published by an earlier attempt must be skipped."""
+    content = (ROOT / ".github" / "workflows" / "release.yml").read_text(encoding="utf-8")
+    start = content.index("\n  publish-npm:")
+    end = content.index("\n  publish-github-packages:", start)
+    block = content[start:end]
+
+    for package_var in ("NPM_SDK_PACKAGE", "NPM_OPENCLAW_PACKAGE", "NPM_OPENCODE_PACKAGE"):
+        lookup = (
+            f'npm view "${{{package_var}}}@${{version}}" version --registry "${{NPM_REGISTRY_URL}}"'
+        )
+        assert lookup in block
+        lookup_index = block.index(lookup)
+        publish_index = block.index("npm publish --access public", lookup_index)
+        assert lookup_index < publish_index
 
 
 def test_sdist_license_is_packaged_and_verified_before_upload() -> None:
@@ -1210,7 +1299,7 @@ def test_release_workflow_has_smoke_import_wheel_gate() -> None:
         # ubuntu:22.04 + Python 3.12.
         'image: "ubuntu:22.04"',
         # macOS native (no container) — Apple Silicon wheel.
-        "runner: macos-14",
+        "runner: macos-26",
     ]
     for sub in required_matrix_substrings:
         assert sub in content, (

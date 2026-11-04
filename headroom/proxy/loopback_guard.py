@@ -76,9 +76,15 @@ LOOPBACK_HOSTS: frozenset[str] = frozenset({"127.0.0.1", "::1", "localhost"})
 def is_loopback_host(host: str | None) -> bool:
     """Return True if ``host`` represents a loopback interface.
 
-    ``None`` is treated as loopback — this covers ``TestClient`` /
-    UDS-style requests where FastAPI does not populate
-    ``request.client``.
+    ``None`` is **not** loopback. A missing peer address (a Unix-domain
+    socket, an ASGI adapter that leaves ``scope["client"]`` unset, a
+    hand-built request double) is no evidence that the caller is local, and
+    every guard built on this helper -- the inbound token gate, the
+    ``/admin`` and ``/debug`` 404 guards, the WebSocket gate -- must fail
+    closed on it rather than silently disable itself. ``identity.py`` has
+    always treated it that way; this makes the rest of the proxy agree.
+    Tests that need a local caller set an explicit loopback peer
+    (``TestClient(app, client=("127.0.0.1", 12345))``).
 
     ``"localhost"`` is special-cased as a string since it is not a
     valid IP literal. The comparison is case-insensitive because
@@ -89,7 +95,7 @@ def is_loopback_host(host: str | None) -> bool:
     default. Malformed input returns ``False``.
     """
     if host is None:
-        return True
+        return False
     if host.lower() == "localhost":
         return True
     try:

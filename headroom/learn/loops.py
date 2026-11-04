@@ -69,6 +69,11 @@ _PAGINATION_RE = re.compile("|".join(_PAGINATION_PATTERNS), re.IGNORECASE)
 # otherwise identical commands do not split a loop into singletons.
 _INT_RE = re.compile(r"\b\d+\b")
 
+# A loop's digest line shows its sample input cut to this many chars and its
+# first _DIGEST_MAX_INDICES message indices beside its full repeat count.
+_SAMPLE_INPUT_CHARS = 120
+_DIGEST_MAX_INDICES = 20
+
 
 @dataclass
 class LoopPattern:
@@ -290,7 +295,7 @@ def detect_loops(
             LoopPattern(
                 tool=calls[0].name,
                 signature=_fuzzy_signature(signatures[key]),
-                sample_input=calls[0].input_summary[:120],
+                sample_input=calls[0].input_summary[:_SAMPLE_INPUT_CHARS],
                 count=count,
                 is_error_loop=is_error_loop,
                 wasted_tokens=wasted,
@@ -302,15 +307,19 @@ def detect_loops(
     return loops
 
 
-def format_loops_for_digest(loops: list[LoopPattern]) -> str:
+def format_loops_for_digest(loops: list[LoopPattern], max_chars: int | None = None) -> str:
     """Render detected loops as a high-priority digest section for the LLM.
 
-    Returns "" when there are no loops so the digest is unchanged in the
-    common case.
+    Loops are rendered in the given order (detect_loops sorts them costliest
+    first). With *max_chars*, rendering stops at the first loop that would
+    take the section past that many chars, so the costliest ones are kept.
+
+    Returns "" when there are no loops, or none fits, so the digest is
+    unchanged in the common case.
     """
     if not loops:
         return ""
-    lines = [
+    header = [
         "=== Detected Loops (HIGHEST PRIORITY) ===",
         (
             "These tool-call patterns REPEATED within a session — the most "
@@ -321,14 +330,21 @@ def format_loops_for_digest(loops: list[LoopPattern]) -> str:
         ),
         "",
     ]
+    used = sum(len(ln) + 1 for ln in header)  # each line plus its newline
+    entries: list[str] = []
     for lp in loops:
-        lines.append(
-            f'- [{lp.kind}] {lp.tool}: "{lp.sample_input}" '
+        entry = (
+            f'- [{lp.kind}] {lp.tool}: "{lp.sample_input[:_SAMPLE_INPUT_CHARS]}" '
             f"repeated {lp.count}x, ~{lp.wasted_tokens:,} tokens wasted "
-            f"(messages {lp.msg_indices})"
+            f"(messages {lp.msg_indices[:_DIGEST_MAX_INDICES]})"
         )
-    lines.append("")
-    return "\n".join(lines)
+        used += len(entry) + 1
+        if max_chars is not None and used > max_chars:
+            break
+        entries.append(entry)
+    if not entries:
+        return ""
+    return "\n".join([*header, *entries, ""])
 
 
 def _signature_tokens(signature: str) -> set[str]:

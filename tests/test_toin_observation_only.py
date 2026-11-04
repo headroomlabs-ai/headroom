@@ -4,9 +4,12 @@ Pins three guarantees:
 
 1. `get_recommendation()` returns `None` and emits a `DeprecationWarning`
    exactly once per process. The request-time hint API is retired.
-2. The aggregation key is `(auth_mode, model_family, structure_hash)` —
-   two patterns with the same `structure_hash` but different `auth_mode`
-   or `model_family` are tracked as distinct rows in the TOIN store.
+2. The aggregation key is `(tenant_key, auth_mode, model_family,
+   structure_hash)` — two patterns with the same `structure_hash` but
+   different `auth_mode`, `model_family`, or `tenant_key` are tracked
+   as distinct rows in the TOIN store. PR-F3 added `tenant_key` so two
+   tenants on the same proxy don't cross-pollinate compression
+   patterns.
 3. Recording a compression event does NOT alter the bytes SmartCrusher
    produces for an identical input. SmartCrusher is deterministic; TOIN
    only observes.
@@ -22,6 +25,7 @@ import pytest
 from headroom.telemetry import (
     DEFAULT_AUTH_MODE,
     DEFAULT_MODEL_FAMILY,
+    DEFAULT_TENANT_KEY,
     TOINConfig,
     ToolIntelligenceNetwork,
     ToolSignature,
@@ -120,15 +124,18 @@ def test_aggregation_key_includes_auth_mode_and_model_family():
     )
 
     sig_hash = sig.structure_hash
-    assert ("payg", "claude-3-5", sig_hash) in toin._patterns
-    assert ("oauth", "claude-3-5", sig_hash) in toin._patterns
-    assert ("payg", "gpt-4o", sig_hash) in toin._patterns
+    # PR-F3: keys are 4-tuples — `(tenant_key, auth_mode, model_family,
+    # sig_hash)`. With no contextvar set the default is "global".
+    assert (DEFAULT_TENANT_KEY, "payg", "claude-3-5", sig_hash) in toin._patterns
+    assert (DEFAULT_TENANT_KEY, "oauth", "claude-3-5", sig_hash) in toin._patterns
+    assert (DEFAULT_TENANT_KEY, "payg", "gpt-4o", sig_hash) in toin._patterns
     # Three distinct slices, each with sample_size=1.
     assert len(toin._patterns) == 3
     for key, pattern in toin._patterns.items():
-        assert pattern.auth_mode == key[0]
-        assert pattern.model_family == key[1]
-        assert pattern.tool_signature_hash == key[2]
+        assert pattern.tenant_key == key[0]
+        assert pattern.auth_mode == key[1]
+        assert pattern.model_family == key[2]
+        assert pattern.tool_signature_hash == key[3]
         assert pattern.sample_size == 1
 
 
@@ -146,9 +153,15 @@ def test_aggregation_key_defaults_to_unknown_when_caller_omits_tenant():
         strategy="smart_crusher",
     )
 
-    expected_key = (DEFAULT_AUTH_MODE, DEFAULT_MODEL_FAMILY, sig.structure_hash)
+    expected_key = (
+        DEFAULT_TENANT_KEY,
+        DEFAULT_AUTH_MODE,
+        DEFAULT_MODEL_FAMILY,
+        sig.structure_hash,
+    )
     assert expected_key in toin._patterns
     pattern = toin._patterns[expected_key]
+    assert pattern.tenant_key == DEFAULT_TENANT_KEY
     assert pattern.auth_mode == DEFAULT_AUTH_MODE
     assert pattern.model_family == DEFAULT_MODEL_FAMILY
 
@@ -168,14 +181,183 @@ def test_storage_round_trip_preserves_aggregation_key(tmp_path: Path):
         strategy="smart_crusher",
         auth_mode="oauth",
         model_family="gpt-4o",
+        tenant_key="cust_xyz",
     )
     toin1.save()
 
     toin2 = ToolIntelligenceNetwork(TOINConfig(storage_path=str(storage)))
-    key = ("oauth", "gpt-4o", sig.structure_hash)
+    key = ("cust_xyz", "oauth", "gpt-4o", sig.structure_hash)
     assert key in toin2._patterns
+    assert toin2._patterns[key].tenant_key == "cust_xyz"
     assert toin2._patterns[key].auth_mode == "oauth"
     assert toin2._patterns[key].model_family == "gpt-4o"
+
+
+# ── PR-F3: per-tenant isolation property ───────────────────────────────────
+
+
+def test_tenants_do_not_cross_pollinate_patterns():
+    """Two tenants compressing identical tool outputs see two isolated pools.
+
+    This is the load-bearing F3 invariant: tenant A's compression
+    patterns must be invisible to tenant B's `get_pattern` calls and
+    vice-versa. The threat model F3 closes is: a multi-tenant proxy
+    that learns a shared pattern pool would cross-pollinate
+    compression decisions between distinct customers, and (worse)
+    leak structural fingerprints across tenancy boundaries when TOIN
+    dumps are shared.
+    """
+    toin = ToolIntelligenceNetwork()
+    sig = ToolSignature.from_items([{"id": "1", "status": "ok"}])
+    sig_hash = sig.structure_hash
+
+    # Tenant A: 3 compressions, no retrievals (perfect-compression
+    # signal — pattern.skip_compression_recommended will stay False
+    # but strategy_success_rate will trend high).
+    for _ in range(3):
+        toin.record_compression(
+            tool_signature=sig,
+            original_count=10,
+            compressed_count=2,
+            original_tokens=1000,
+            compressed_tokens=200,
+            strategy="smart_crusher",
+            tenant_key="tenant_a",
+        )
+
+    # Tenant B: 3 compressions PLUS 3 retrievals (over-compressed
+    # signal — strategy_success_rate will trend down). If isolation
+    # is broken, tenant A's "smart_crusher worked great" signal would
+    # contaminate tenant B's pattern.
+    for _ in range(3):
+        toin.record_compression(
+            tool_signature=sig,
+            original_count=10,
+            compressed_count=2,
+            original_tokens=1000,
+            compressed_tokens=200,
+            strategy="smart_crusher",
+            tenant_key="tenant_b",
+        )
+    for _ in range(3):
+        toin.record_retrieval(
+            tool_signature_hash=sig_hash,
+            retrieval_type="full",
+            strategy="smart_crusher",
+            tenant_key="tenant_b",
+        )
+
+    # Two distinct keys must exist, each with its own dataclass.
+    key_a = ("tenant_a", DEFAULT_AUTH_MODE, DEFAULT_MODEL_FAMILY, sig_hash)
+    key_b = ("tenant_b", DEFAULT_AUTH_MODE, DEFAULT_MODEL_FAMILY, sig_hash)
+    assert key_a in toin._patterns
+    assert key_b in toin._patterns
+
+    pattern_a = toin._patterns[key_a]
+    pattern_b = toin._patterns[key_b]
+
+    # Compression counts isolated: tenant A saw 3 comps + 0 retrievals.
+    assert pattern_a.total_compressions == 3
+    assert pattern_a.total_retrievals == 0
+
+    # Tenant B saw 3 comps + 3 retrievals — divergent learning signal.
+    assert pattern_b.total_compressions == 3
+    assert pattern_b.total_retrievals == 3
+
+    # The success rate diverges: tenant A's "smart_crusher" gets
+    # rewarded; tenant B's gets penalized for triggering retrievals.
+    rate_a = pattern_a.strategy_success_rates.get("smart_crusher", 0.0)
+    rate_b = pattern_b.strategy_success_rates.get("smart_crusher", 0.0)
+    assert rate_a > rate_b, (
+        f"PR-F3: tenant A and B success rates must diverge (tenant A: {rate_a}, tenant B: {rate_b})"
+    )
+
+    # `get_pattern` honors tenant_key — tenant A's lookup returns
+    # tenant A's pattern, not tenant B's.
+    fetched_a = toin.get_pattern(sig_hash, tenant_key="tenant_a")
+    fetched_b = toin.get_pattern(sig_hash, tenant_key="tenant_b")
+    assert fetched_a is not None
+    assert fetched_b is not None
+    assert fetched_a.total_retrievals == 0
+    assert fetched_b.total_retrievals == 3
+
+
+def test_tenant_key_default_is_global_when_no_caller_provides_one():
+    """Pre-F3 callers and CLI / batch jobs land in the literal "global" slice.
+
+    Pins the migration story: when no tenant_key is supplied (and no
+    contextvar is set), patterns aggregate under the literal
+    ``"global"`` namespace, which is exactly where pre-F3 patterns
+    live after the legacy 3-tuple → 4-tuple promotion.
+    """
+    toin = ToolIntelligenceNetwork()
+    sig = ToolSignature.from_items([{"id": "1"}])
+
+    toin.record_compression(
+        tool_signature=sig,
+        original_count=10,
+        compressed_count=5,
+        original_tokens=1000,
+        compressed_tokens=500,
+        strategy="smart_crusher",
+    )
+
+    keys = list(toin._patterns.keys())
+    assert len(keys) == 1
+    assert keys[0][0] == DEFAULT_TENANT_KEY == "global"
+
+
+def test_tenant_key_reads_from_contextvar_when_unspecified():
+    """When caller doesn't pass tenant_key, TOIN reads the request ContextVar."""
+    from headroom.proxy.tenant_key import set_request_tenant_key
+
+    toin = ToolIntelligenceNetwork()
+    sig = ToolSignature.from_items([{"id": "1"}])
+
+    set_request_tenant_key("tenant_from_ctx")
+    try:
+        toin.record_compression(
+            tool_signature=sig,
+            original_count=10,
+            compressed_count=5,
+            original_tokens=1000,
+            compressed_tokens=500,
+            strategy="smart_crusher",
+        )
+    finally:
+        set_request_tenant_key(None)
+
+    # The contextvar's value made it into the key — not the default
+    # "global". This is the actual integration path for the proxy.
+    keys = list(toin._patterns.keys())
+    assert len(keys) == 1
+    assert keys[0][0] == "tenant_from_ctx"
+
+
+def test_explicit_tenant_key_overrides_contextvar():
+    """An explicit tenant_key arg always wins over the ContextVar."""
+    from headroom.proxy.tenant_key import set_request_tenant_key
+
+    toin = ToolIntelligenceNetwork()
+    sig = ToolSignature.from_items([{"id": "1"}])
+
+    set_request_tenant_key("from_contextvar")
+    try:
+        toin.record_compression(
+            tool_signature=sig,
+            original_count=10,
+            compressed_count=5,
+            original_tokens=1000,
+            compressed_tokens=500,
+            strategy="smart_crusher",
+            tenant_key="explicit_arg",
+        )
+    finally:
+        set_request_tenant_key(None)
+
+    keys = list(toin._patterns.keys())
+    assert len(keys) == 1
+    assert keys[0][0] == "explicit_arg"
 
 
 def test_record_does_not_alter_compression_decision():
