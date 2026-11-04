@@ -153,6 +153,14 @@ class GatewayTurn:
     def hook_tool_saved_tokens(self) -> int:
         return self._transformer.hook_tool_saved_tokens if self._transformer is not None else 0
 
+    @property
+    def compaction_tokens_before(self) -> int:
+        return self._transformer.compaction_tokens_before if self._transformer is not None else 0
+
+    @property
+    def compaction_tokens_after(self) -> int:
+        return self._transformer.compaction_tokens_after if self._transformer is not None else 0
+
     # -- event-loop side ---------------------------------------------------
     def finish(
         self,

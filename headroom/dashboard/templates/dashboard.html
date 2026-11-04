@@ -219,13 +219,13 @@
             <p class="text-sm text-gray-300">
                 <span class="font-medium text-accent">Headroom for Teams</span>
                 <span x-text="(stats.summary?.cost?.total_saved_usd || 0) >= 1
-                    ? ' · You have saved $' + formatCurrency(stats.summary.cost.total_saved_usd) + ' on this machine. Get the same savings across your team, with 3 months free on a 12-month plan.'
-                    : ' · Bring these savings to your whole team, with 3 months free on a 12-month plan.'"></span>
+                    ? ' · You have saved $' + formatCurrency(stats.summary.cost.total_saved_usd) + ' on this machine. Want more? Headroom Enterprise saves more, across your whole team. Talk to us at hello@headroomlabs.ai.'
+                    : ' · Want more savings? Headroom Enterprise saves more, across your whole team. Talk to us at hello@headroomlabs.ai.'"></span>
             </p>
             <div class="flex items-center gap-3 shrink-0">
-                <a href="https://headroom-perks.vercel.app/?source=github&utm_source=headroom&utm_medium=dashboard&utm_content=banner"
+                <a href="https://headroomlabs.ai"
                    target="_blank" rel="noopener noreferrer"
-                   class="px-3 py-1.5 text-sm font-medium rounded-md bg-accent text-black hover:opacity-90">Claim 3 months free →</a>
+                   class="px-3 py-1.5 text-sm font-medium rounded-md bg-accent text-black hover:opacity-90">Talk to us →</a>
                 <button type="button" @click="dismissTeamsPerk()" aria-label="Dismiss Headroom for Teams offer"
                         class="text-sm text-gray-500 hover:text-gray-200">✕</button>
             </div>
@@ -2056,12 +2056,12 @@
             return {
                 stats: {},
                 teamsPerkDismissed: (() => {
-                    try { return localStorage.getItem('headroom-teams-perk-dismissed') === '1'; }
+                    try { return localStorage.getItem('headroom-teams-contact-dismissed') === '1'; }
                     catch (e) { return false; }
                 })(),
                 dismissTeamsPerk() {
                     this.teamsPerkDismissed = true;
-                    try { localStorage.setItem('headroom-teams-perk-dismissed', '1'); } catch (e) {}
+                    try { localStorage.setItem('headroom-teams-contact-dismissed', '1'); } catch (e) {}
                 },
                 lifetimeStats: {},
                 historyStats: {},
