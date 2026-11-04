@@ -15,6 +15,8 @@ from __future__ import annotations
 
 import json
 
+import pytest
+
 from headroom.transforms.compaction_codec import (
     contains_removal_marker,
     expand_compacted,
@@ -173,8 +175,52 @@ def test_trailing_newline_beyond_declared_count_is_trimmed() -> None:
     assert expand_compacted("[2]{k:string?}\na\nb\n\n") == [{"k": "a"}, {"k": "b"}]
 
 
+def test_json_column_string_literals_stay_strings_and_values_keep_their_type() -> None:
+    # In a `json` column the native encoder writes a string that looks like a
+    # JSON literal as a quoted JSON string (`"""null"""` is the string `null`),
+    # while real values stay bare. The decoder must tell the two apart.
+    block = (
+        "[9]{id:int,v:json?}\n"
+        '1,"""null"""\n'
+        "2,null\n"
+        '3,"""true"""\n'
+        "4,true\n"
+        '5,"""1"""\n'
+        "6,1\n"
+        '7,"""NaN"""\n'
+        '8,"""[1]"""\n'
+        "9,hello\n"
+    )
+    decoded = expand_compacted(block)
+    assert decoded is not None
+    values = [row["v"] for row in decoded]
+    assert values == ["null", None, "true", True, "1", 1, "NaN", "[1]", "hello"]
+    assert [type(v) for v in values] == [str, type(None), str, bool, str, int, str, str, str]
+
+
 def test_single_column_null_survives_value_factoring() -> None:
     block = "[3]{k:string?}\nx\ny\nnull\n"
     factored = factor_values(block)
     assert expand_compacted(factored) == expand_compacted(block)
     assert expand_compacted(factored) == [{"k": "x"}, {"k": "y"}, {"k": None}]
+
+
+def test_negative_dictionary_index_is_rejected() -> None:
+    # Python's -1 would silently pick the last legend value.
+    assert expand_compacted('[1]{tag:string} __dict:1\n@tag=["first","last"]\n-1\n') is None
+
+
+@pytest.mark.parametrize("legend", ["42", '"ab"', '{"a":1}', "null"])
+def test_non_array_legend_is_rejected(legend: str) -> None:
+    assert expand_compacted(f"[1]{{tag:string}} __dict:1\n@tag={legend}\n0\n") is None
+
+
+def test_dictionary_cells_still_decode_edge_values() -> None:
+    block = '[5]{tag:string?} __dict:1\n@tag=["first","last"]\n0\n1\n"-1"\nnull\n\n'
+    assert expand_compacted(block) == [
+        {"tag": "first"},
+        {"tag": "last"},
+        {"tag": "-1"},
+        {"tag": None},
+        {},
+    ]

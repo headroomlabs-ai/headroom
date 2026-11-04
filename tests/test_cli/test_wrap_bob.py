@@ -162,6 +162,8 @@ class TestBobPreflight:
             {"gatewayUrl": "http://127.0.0.1:8787/p/myproj/"},  # already the proxy
             {"gatewayUrl": "http://127.0.0.1:8787/p/another-project"},  # attribution only
             {"gatewayUrl": "http://localhost:8787"},  # same proxy, spelled differently
+            {"gatewayUrl": "HTTP://LOCALHOST:8787/"},  # case and trailing slash
+            {"gatewayUrl": "http://127.0.0.1:8787/p/my%20proj"},  # as with_project_prefix prints it
             "not json",
         ],
     )
@@ -171,9 +173,37 @@ class TestBobPreflight:
     def test_passes_when_no_settings_file(self, tmp_path):
         assert bob_preflight(self.ENV, tmp_path / "missing.json") is None
 
-    def test_fails_on_same_host_other_port(self, tmp_path):
-        path = self._settings(tmp_path, {"gatewayUrl": "http://127.0.0.1:9999"})
-        assert bob_preflight(self.ENV, path) is not None
+    BYPASS = "would bypass the Headroom proxy"
+    UNROUTABLE = "not a URL the proxy can route"
+    UNPARSABLE = "could not be parsed"
+
+    @pytest.mark.parametrize(
+        ("gateway_url", "reason"),
+        [
+            ("http://127.0.0.1:9999", BYPASS),  # same host, other port
+            ("https://api.eu-de.bob.ibm.com/inference", BYPASS),  # foreign host with a path
+            ("https://api.eu-de.bob.ibm.com/?r=1", BYPASS),
+            ("http://127.0.0.1:8787/p/myproj/v1", UNROUTABLE),  # extra segment
+            ("http://127.0.0.1:8787/inference", UNROUTABLE),  # path without the /p/ prefix
+            ("http://127.0.0.1:8787/p/team%2Fwork", UNROUTABLE),  # ASGI decodes into 2 segments
+            ("http://127.0.0.1:8787/p/myproj?team=a", UNROUTABLE),  # Bob appends after the query
+            ("http://127.0.0.1:8787#frag", UNROUTABLE),
+            ("http://127.0.0.1:8787/p/myproj?", UNROUTABLE),  # bare delimiters parse as empty
+            ("http://127.0.0.1:8787#", UNROUTABLE),
+            ("http://127.0.0.1:not-a-port", UNPARSABLE),  # urlsplit(...).port raises
+            ("/", UNPARSABLE),  # no scheme or host
+        ],
+    )
+    def test_fails_on_non_proxy_shapes(self, tmp_path, gateway_url, reason):
+        path = self._settings(tmp_path, {"gatewayUrl": gateway_url})
+        message = bob_preflight(self.ENV, path)
+        assert message is not None and str(path) in message and reason in message
+
+    def test_unparsable_env_url_never_matches(self, tmp_path):
+        # Two None identities must not compare equal.
+        path = self._settings(tmp_path, {"gatewayUrl": "/"})
+        assert bob_preflight({"BOB_GATEWAY_URL": "http://127.0.0.1:bad"}, path) is not None
+        assert bob_preflight({}, path) is not None
 
     def test_fails_on_foreign_gateway(self, tmp_path):
         path = self._settings(tmp_path, {"gatewayUrl": "https://api.eu-de.bob.ibm.com"})
@@ -289,6 +319,72 @@ class TestModeMismatchWarning:
     )
     def test_silent_otherwise(self, monkeypatch, running_config, requested):
         assert self._warnings(monkeypatch, running_config, requested) == []
+
+
+class TestStartupCompressionMismatchWarning:
+    @pytest.fixture(autouse=True)
+    def _session_env(self, monkeypatch):
+        for name in ("HEADROOM_MODE", "HEADROOM_MIN_TOKENS", "HEADROOM_EXCLUDE_TOOLS"):
+            monkeypatch.delenv(name, raising=False)
+
+    @pytest.mark.parametrize(
+        ("name", "value", "config"),
+        [
+            ("HEADROOM_MIN_TOKENS", "2000", {"min_tokens_to_crush": 120}),
+            ("HEADROOM_MIN_TOKENS", "0", {"min_tokens_to_crush": 120}),
+            ("HEADROOM_EXCLUDE_TOOLS", "Bash,Read", {"exclude_tools": []}),
+            ("HEADROOM_EXCLUDE_TOOLS", "", {"exclude_tools": ["Bash"]}),
+        ],
+    )
+    def test_warns_when_reuse_ignores_explicit_compression_settings(
+        self, monkeypatch, capsys, name, value, config
+    ):
+        monkeypatch.setenv(name, value)
+        _warn_proxy_mode_mismatch(config)
+        output = capsys.readouterr().out
+        assert name in output
+        assert "Restart" in output and "--port" in output
+
+    @pytest.mark.parametrize(
+        ("env", "config"),
+        [
+            ({}, {"min_tokens_to_crush": 120, "exclude_tools": ["Bash"]}),
+            ({"HEADROOM_MIN_TOKENS": "120"}, {"min_tokens_to_crush": 120}),
+            ({"HEADROOM_MIN_TOKENS": "invalid"}, {"min_tokens_to_crush": 120}),
+            ({"HEADROOM_MIN_TOKENS": "2000"}, {}),
+            (
+                {"HEADROOM_EXCLUDE_TOOLS": " Read, BASH, bash "},
+                {"exclude_tools": ["Bash", "bash"]},
+            ),
+            ({"HEADROOM_EXCLUDE_TOOLS": "Read"}, {"exclude_tools": []}),
+            ({"HEADROOM_EXCLUDE_TOOLS": "Bash"}, {}),
+            ({"HEADROOM_EXCLUDE_TOOLS": "Bash"}, {"exclude_tools": None}),
+        ],
+    )
+    def test_does_not_warn_for_matching_unrequested_or_unknown_settings(
+        self, monkeypatch, capsys, env, config
+    ):
+        for name, value in env.items():
+            monkeypatch.setenv(name, value)
+        _warn_proxy_mode_mismatch(config)
+        assert capsys.readouterr().out == ""
+
+    @pytest.mark.parametrize(
+        ("name", "value"),
+        [("HEADROOM_MIN_TOKENS", "2000"), ("HEADROOM_EXCLUDE_TOOLS", "Bash")],
+    )
+    def test_no_start_reuse_warns_without_an_explicit_mode(self, monkeypatch, capsys, name, value):
+        monkeypatch.setenv(name, value)
+        monkeypatch.setattr(wrap_mod, "_check_proxy", lambda _port: True)
+        monkeypatch.setattr(
+            wrap_mod,
+            "_query_proxy_health",
+            lambda _port: {"config": {"min_tokens_to_crush": 120, "exclude_tools": []}},
+        )
+
+        wrap_mod._ensure_proxy_unlocked(18795, True)
+
+        assert name in capsys.readouterr().out
 
 
 def test_passthrough_handler_roots_profile_at_origin_and_strips_region_domain():
