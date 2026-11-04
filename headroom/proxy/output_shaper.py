@@ -9,18 +9,7 @@ output tokens, so every lever here works by reshaping the request:
    provider prefix cache is preserved). Five levels, from "no ceremony" to
    full caveman.
 
-2. Effort routing — agentic loops are mostly mechanical continuations (the
-   last message is a clean tool_result: a file read, a passing test). Thinking
-   bills as output tokens, and harnesses like Claude Code pin
-   ``output_config.effort`` at ``xhigh`` for every turn. On turns classified
-   as mechanical we lower an explicitly-present effort; on errors or new user
-   asks we leave it alone. For legacy models still sending
-   ``thinking.budget_tokens`` we clamp the budget to the API floor instead.
-
 Safety rules (each prevents a concrete failure mode):
-- Never INJECT ``output_config.effort`` where the client didn't send it —
-  models without effort support 400 on it. Lowering an existing value is
-  always valid.
 - Never toggle ``thinking.type`` — disabling thinking while history carries
   thinking blocks 400s on some models, and the toggle busts the messages
   cache tier.
@@ -100,8 +89,7 @@ class OutputShaperSettings:
     verbosity_level: int = DEFAULT_VERBOSITY_LEVEL
     # False in ``mode="cache"``. Steering is the one lever that writes into the
     # provider prefix-cache key (it appends to the system-prompt tail, and on a
-    # body with no system field it creates one); effort routing and the
-    # thinking budget sit outside the key and stay on. See
+    # body with no system field it creates one). See
     # :func:`steering_allowed_for`.
     steering_enabled: bool = True
 
@@ -193,9 +181,7 @@ def steering_allowed_for(config: Any) -> bool:
     prefix-cache key byte-stable (see ``ProxyConfig.mode``). Verbosity steering
     writes into that key, so a block that CHANGES there trades a large, certain
     cache cost for a small, uncertain output saving — the wrong side of a
-    roughly 60x margin on a long context. Effort routing and the thinking
-    budget are unaffected: they ride request parameters outside the cache key,
-    so they keep saving in cache mode.
+    roughly 60x margin on a long context.
 
     This is the gate for the sources that can change mid-conversation. It is
     NOT the last word: :func:`resolve_verbosity_level` lets an explicitly
