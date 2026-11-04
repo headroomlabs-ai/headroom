@@ -458,6 +458,12 @@ def count_cache_breakpoints(
             if not isinstance(msg, dict):
                 continue
             found = 1 if "cache_control" in msg else 0
+            # OpenAI chat shape: markers on an assistant's tool_calls entries.
+            tool_calls = msg.get("tool_calls")
+            if isinstance(tool_calls, list):
+                found += sum(
+                    1 for tc in tool_calls if isinstance(tc, dict) and "cache_control" in tc
+                )
             content = msg.get("content")
             if isinstance(content, list):
                 for block in content:
@@ -847,6 +853,16 @@ def enforce_cache_breakpoint_budget(
                                 budget["left"] -= 1
                         new_blocks.append(block)
                     msg = {**msg, "content": new_blocks}
+                tool_calls = msg.get("tool_calls")
+                if isinstance(tool_calls, list) and budget["left"] > 0:
+                    new_calls = []
+                    for tc in tool_calls:
+                        if budget["left"] > 0 and isinstance(tc, dict) and "cache_control" in tc:
+                            tc = {k: v for k, v in tc.items() if k != "cache_control"}
+                            budget["left"] -= 1
+                        new_calls.append(tc)
+                    if new_calls != tool_calls:
+                        msg = {**msg, "tool_calls": new_calls}
                 if budget["left"] > 0 and "cache_control" in msg:
                     msg = {k: v for k, v in msg.items() if k != "cache_control"}
                     budget["left"] -= 1
@@ -4103,20 +4119,29 @@ def _warn_deferred_without_search_tool(tools: Any) -> None:
     )
 
 
-#: Non-Anthropic upstreams that accept the first-party deferred tool shape.
-#: These bill deferred schemas compactly, so downgrading deferral for them
-#: inlines the whole catalog and multiplies billed prompt tokens.
-_DEFERRAL_CAPABLE_HOSTS: frozenset[str] = frozenset({"api.githubcopilot.com"})
-
-
 def anthropic_first_party_tool_search_supported(api_base_url: str | None) -> bool:
-    """Return whether Anthropic server-side tool search is valid for this upstream."""
+    """Return whether Anthropic server-side tool search is valid for this upstream.
+
+    GitHub's Copilot API also accepts the first-party deferred shape and bills
+    deferred schemas compactly, so downgrading deferral there inlines the whole
+    catalog and multiplies billed prompt tokens (#4356). That holds for the
+    generic host and for the plan hosts Business/Enterprise/Individual seats
+    are routed to (``api.<plan>.githubcopilot.com``, #4155), so any public
+    ``*.githubcopilot.com`` host qualifies. GHE data-residency hosts
+    (``copilot-api.<tenant>.ghe.com``) still downgrade: nobody has verified
+    that they accept the shape.
+    """
+    from headroom.copilot_auth import is_copilot_completions_host, is_public_copilot_api_host
     from headroom.providers.claude.runtime import (
         _gate_view_host,
         is_custom_anthropic_base_url,
     )
 
-    if _gate_view_host((api_base_url or "").strip()) in _DEFERRAL_CAPABLE_HOSTS:
+    # The ``proxy.*`` hosts are the inline-completions surface: nobody has measured
+    # the deferred shape there.
+    if is_public_copilot_api_host(
+        _gate_view_host((api_base_url or "").strip())
+    ) and not is_copilot_completions_host(api_base_url):
         return True
 
     return not is_custom_anthropic_base_url(api_base_url)
