@@ -98,3 +98,22 @@ def test_extract_json_block_ignores_delimiters_inside_strings():
 
     assert end_line == 3
     assert block == "\n".join(lines)
+
+
+def test_split_does_not_carve_timestamped_log_rows_as_search():
+    """Regression (#3736 residual): the detector rejects ISO-timestamped log
+    rows as search output; the splitter must not carve them either, while
+    real ``path:NN:content`` grep lines still carve.
+    """
+    logs = [
+        "2026-09-23T10:05:07Z worker-1 INFO request handled",
+        "2026-09-23T10:05:13Z worker-2 ERROR upstream timeout",
+    ]
+    content = "\n".join(["Intro text", "```python", "print('x')", "```", *logs])
+
+    assert ContentType.SEARCH_RESULTS not in [
+        section.content_type for section in split_into_sections(content)
+    ]
+
+    grep = "\n".join(["Intro text", "```python", "print('x')", "```", "src/app.py:10:print('x')"])
+    assert split_into_sections(grep)[-1].content_type == ContentType.SEARCH_RESULTS
