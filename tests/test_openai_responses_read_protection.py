@@ -384,12 +384,9 @@ def test_responses_protected_read_survives_cross_turn_dedup(monkeypatch):
     assert new_payload["input"][3]["output"] == _NL_OUTPUT
 
 
-def test_responses_debug_path_with_excluded_list_output(monkeypatch):
-    """Regression: debug logging over an excluded tool's content-part output must
-    not raise (latent unbound `fold` variable in the list branch)."""
-    from headroom.proxy.handlers import openai as openai_handler
-
-    monkeypatch.setattr(openai_handler, "_log_codex_compression_debug", lambda *a, **k: None)
+def test_responses_excluded_list_output_does_not_raise():
+    """An excluded tool's content-part output takes the list branch without
+    raising and is forwarded unchanged."""
     handler = _handler_with_router(_lossy_router())
     parts = [{"type": "output_text", "text": _FILE_CONTENT}]
     payload = {
@@ -468,11 +465,8 @@ def test_responses_local_shell_call_string_command_read_stays_verbatim(monkeypat
     assert new_payload["input"][1]["output"] == _NL_OUTPUT
 
 
-def test_responses_debug_path_with_read_protected_output(monkeypatch):
-    """Debug logging over a read-protected output records and does not raise."""
-    from headroom.proxy.handlers import openai as openai_handler
-
-    monkeypatch.setattr(openai_handler, "_log_codex_compression_debug", lambda *a, **k: None)
+def test_responses_read_protected_output_is_forwarded_unchanged(monkeypatch):
+    """A read-protected output does not raise and reaches the model verbatim."""
     monkeypatch.setenv("HEADROOM_PROTECT_READS", "1")
     handler = _handler_with_router(_lossy_router())
     payload = {
@@ -777,3 +771,30 @@ def test_responses_codex_exec_whole_result_read_stays_verbatim(monkeypatch):
     new_payload, _modified, _s, _t, _u, _c, _a = _run(handler, payload)
 
     assert new_payload["input"][1] == output
+
+
+def test_responses_codex_exec_read_output_forms_are_equivalent(monkeypatch):
+    """Printing `r.output` or the whole result protects the same file read."""
+    monkeypatch.setenv("HEADROOM_PROTECT_READS", "1")
+    handler = _handler_with_router(_lossy_router())
+    command = "nl -ba src/models.rs | sed -n '1,400p'"
+    plain_output = _codex_exec_output("call_plain", _RUST_NL)
+    whole_output = _codex_exec_output("call_whole", _exec_envelope(_RUST_NL))
+    whole_call = _codex_exec_call("call_whole", command)
+    whole_call["input"] = whole_call["input"].replace("text(r0.output)", "text(r0)")
+
+    plain_result, plain_modified, *_ = _run(
+        handler,
+        {
+            "model": "gpt-5",
+            "input": [_codex_exec_call("call_plain", command), plain_output],
+        },
+    )
+    whole_result, whole_modified, *_ = _run(
+        handler, {"model": "gpt-5", "input": [whole_call, whole_output]}
+    )
+
+    assert plain_modified is False
+    assert whole_modified is False
+    assert plain_result["input"][1] == plain_output
+    assert whole_result["input"][1] == whole_output
