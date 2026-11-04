@@ -7,15 +7,22 @@
     "test": "node --test --test-concurrency=1 --test-reporter=tap dependency-regression.test.cjs"
   },
   "dependencies": {
-    "@openai/codex": "0.163.0",
-    "openclaw": "2026.10.6"
+    "@openai/codex": "0.166.0",
+    "openclaw": "2026.10.10"
   },
   "overrides": {
-    "@modelcontextprotocol/sdk": "1.32.1",
+    "@modelcontextprotocol/sdk": "1.32.2",
     "npm": "12.2.1",
-    "zod": "4.6.6",
+    "zod": "4.6.7",
     "openclaw": {
+      "minimatch": "11.0.4",
       "undici": "8.12.3"
     }
+  },
+  "allowScripts": {
+    "@google/genai@2.27.0": true,
+    "esbuild@0.28.2": true,
+    "protobufjs@7.6.6": true,
+    "openclaw@2026.10.10": true
   }
 }

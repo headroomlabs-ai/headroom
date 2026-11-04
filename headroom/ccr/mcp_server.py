@@ -25,9 +25,12 @@ from __future__ import annotations
 import argparse
 import asyncio
 import contextlib
+import contextvars
+import errno
 import json
 import logging
 import os
+import stat
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -54,11 +57,12 @@ try:
 except ImportError:
     _HAS_FCNTL = False
 
-# Try to import MCP SDK
+# Try to import MCP SDK (2.x: handlers are constructor callbacks, results are
+# typed ``*Result`` models rather than bare lists).
 try:
     from mcp.server import Server
     from mcp.server.stdio import stdio_server
-    from mcp.types import TextContent, Tool
+    from mcp.types import CallToolResult, ListToolsResult, TextContent, Tool
 
     MCP_AVAILABLE = True
 except ImportError:
@@ -83,7 +87,8 @@ READ_TOOL_NAME = "headroom_read"
 logger = logging.getLogger("headroom.ccr.mcp")
 
 # Feature flag: enable headroom_read tool (file read caching via CCR)
-# Set HEADROOM_MCP_READ=on to enable
+# Set HEADROOM_MCP_READ=on to enable. Reads are confined to the server's working
+# directory, or to the os.pathsep-separated directories in HEADROOM_MCP_READ_ROOTS.
 _READ_ENABLED = os.environ.get("HEADROOM_MCP_READ", "off").lower().strip() in (
     "on",
     "true",
@@ -93,6 +98,14 @@ _READ_ENABLED = os.environ.get("HEADROOM_MCP_READ", "off").lower().strip() in (
 )
 
 DEFAULT_PROXY_URL = os.environ.get("HEADROOM_PROXY_URL", "http://127.0.0.1:8787")
+
+# MCP 2.x removed ``Server.request_context``; the per-request context is now only
+# handed to the handler as an argument. ``_current_client()`` needs it three frames
+# below the handler, so we stash it here instead of threading it through every
+# ``_handle_*`` signature. A ContextVar rather than an instance attribute because
+# concurrent tool calls on one server would race on ``self`` — this is the same
+# mechanism 1.x used internally to back ``request_context``.
+_request_ctx: contextvars.ContextVar[Any] = contextvars.ContextVar("headroom_mcp_request_ctx")
 
 # How often the parent-death watchdog polls os.getppid() (seconds). When the
 # launching MCP client is SIGKILLed, stdin EOF may never arrive and the SDK's
@@ -376,6 +389,73 @@ class SessionStats:
         }
 
 
+def _read_roots() -> list[Path]:
+    """Directories ``headroom_read`` may read under, resolved like the paths checked against them.
+
+    Without HEADROOM_MCP_READ_ROOTS the root is the working directory, unless
+    that is the filesystem root or the home directory (GUI hosts such as
+    Claude Desktop launch MCP servers from ``/``): then nothing is readable
+    until roots are configured.
+    """
+    configured = os.environ.get("HEADROOM_MCP_READ_ROOTS", "")
+    entries = [entry.strip() for entry in configured.split(os.pathsep) if entry.strip()]
+    if entries:
+        return [Path(entry).expanduser().resolve() for entry in entries]
+    cwd = Path.cwd().resolve()
+    if cwd == Path(cwd.anchor) or cwd == Path.home().resolve():
+        return []
+    return [cwd]
+
+
+_O_CLOEXEC = getattr(os, "O_CLOEXEC", 0)
+_O_NONBLOCK = getattr(os, "O_NONBLOCK", 0)
+
+
+def _open_nofollow(path: Path) -> int:
+    """Open the resolved ``path`` for reading without following any symlink.
+
+    The boundary check and the open are separate steps. ``path`` had no
+    symlinks when it was resolved, but any component -- the file, a directory
+    on the way, the permitted root itself or one of its parents -- can have
+    been replaced by a symlink since, and a plain ``open()`` would follow it
+    wherever it points. So walk the whole path from its anchor one component
+    at a time with O_NOFOLLOW: a component that has become a symlink is
+    refused (ELOOP) rather than followed. Opens are non-blocking so a FIFO
+    put in the way cannot stall the event loop; the caller's S_ISREG check
+    rejects it, and a regular file reads the same either way.
+
+    Without openat semantics (Windows) open directly and confirm the path
+    still resolves to what was checked; best effort there.
+    """
+    if os.open not in os.supports_dir_fd or not hasattr(os, "O_NOFOLLOW"):
+        fd = os.open(path, os.O_RDONLY | getattr(os, "O_BINARY", 0) | _O_CLOEXEC)
+        if path.resolve() != path:
+            os.close(fd)
+            raise OSError(errno.ELOOP, "path changed between check and open", str(path))
+        return fd
+    import fcntl
+
+    flags = os.O_RDONLY | os.O_NOFOLLOW | _O_NONBLOCK | _O_CLOEXEC
+    parts = path.parts
+    fd = os.open(parts[0], os.O_RDONLY | os.O_DIRECTORY | _O_CLOEXEC)
+    try:
+        for part in parts[1:-1]:
+            next_fd = os.open(part, flags, dir_fd=fd)
+            os.close(fd)
+            fd = next_fd
+            # S_ISDIR here rather than O_DIRECTORY on the open: with both
+            # flags macOS reports a symlink as ENOTDIR, which would make a
+            # swapped component look like a missing file instead of a refusal.
+            if not stat.S_ISDIR(os.fstat(fd).st_mode):
+                raise NotADirectoryError(errno.ENOTDIR, "Not a directory", str(path))
+        file_fd = os.open(parts[-1] if len(parts) > 1 else ".", flags, dir_fd=fd)
+    finally:
+        os.close(fd)
+    if _O_NONBLOCK:
+        fcntl.fcntl(file_fd, fcntl.F_SETFL, fcntl.fcntl(file_fd, fcntl.F_GETFL) & ~_O_NONBLOCK)
+    return file_fd
+
+
 class HeadroomMCPServer:
     """MCP Server exposing Headroom's context engineering toolkit.
 
@@ -409,8 +489,14 @@ class HeadroomMCPServer:
         if not MCP_AVAILABLE or Server is None:
             raise ImportError("MCP SDK not installed. Install with: pip install mcp")
 
-        self.server: Server = Server("headroom")
-        self._setup_handlers()
+        # MCP 2.x registers handlers as constructor callbacks. Bound methods are
+        # resolved at call time, so passing them here does not require the rest of
+        # ``__init__`` to have run.
+        self.server: Server = Server(
+            "headroom",
+            on_list_tools=self._on_list_tools,
+            on_call_tool=self._on_call_tool,
+        )
 
     def _get_local_store(self) -> Any:
         """Get the shared compression store singleton (lazy init).
@@ -670,147 +756,159 @@ class HeadroomMCPServer:
             )
         return None
 
-    def _setup_handlers(self) -> None:
-        """Register all MCP tool handlers."""
+    async def _on_list_tools(self, ctx: Any, params: Any = None) -> ListToolsResult:
+        """MCP ``tools/list`` handler."""
+        tools = [
+            Tool(
+                name=COMPRESS_TOOL_NAME,
+                description=(
+                    "Compress content to save context window space. "
+                    "Use this on large tool outputs, file contents, search results, "
+                    "or any content you want to shrink before reasoning over it. "
+                    f"The original is stored and can be retrieved later via mcp__headroom__{CCR_TOOL_NAME}. "
+                    "Returns compressed text + a hash for retrieval."
+                ),
+                input_schema={
+                    "type": "object",
+                    "properties": {
+                        "content": {
+                            "type": "string",
+                            "description": (
+                                "The content to compress. Can be any text: file contents, "
+                                "JSON, search results, logs, code, etc."
+                            ),
+                        },
+                    },
+                    "required": ["content"],
+                },
+            ),
+            Tool(
+                name=CCR_TOOL_NAME,
+                description=(
+                    "Retrieve original uncompressed content by hash. "
+                    "Use this when you need full details from previously compressed content. "
+                    "The hash comes from headroom_compress results or from compression "
+                    "markers like [N items compressed... hash=abc123]."
+                ),
+                input_schema={
+                    "type": "object",
+                    "properties": {
+                        "hash": {
+                            "type": "string",
+                            "description": "Hash key from compression (e.g., 'abc123' from hash=abc123)",
+                        },
+                    },
+                    "required": ["hash"],
+                },
+            ),
+            Tool(
+                name=STATS_TOOL_NAME,
+                description=(
+                    "Show compression statistics for this session: "
+                    "total compressions, tokens saved, estimated cost savings, "
+                    "and recent compression events."
+                ),
+                input_schema={
+                    "type": "object",
+                    "properties": {},
+                    "required": [],
+                },
+            ),
+        ]
 
-        @self.server.list_tools()
-        async def list_tools() -> list[Tool]:
-            tools = [
+        # Conditionally add headroom_read (behind feature flag)
+        if _READ_ENABLED:
+            tools.append(
                 Tool(
-                    name=COMPRESS_TOOL_NAME,
+                    name=READ_TOOL_NAME,
                     description=(
-                        "Compress content to save context window space. "
-                        "Use this on large tool outputs, file contents, search results, "
-                        "or any content you want to shrink before reasoning over it. "
-                        f"The original is stored and can be retrieved later via mcp__headroom__{CCR_TOOL_NAME}. "
-                        "Returns compressed text + a hash for retrieval."
+                        "Read a file with smart caching. First read returns full content "
+                        "and caches it. Subsequent reads of the same unchanged file return "
+                        "a lightweight cache marker (~20 tokens instead of thousands). "
+                        f"Use mcp__headroom__{CCR_TOOL_NAME} with the hash to get full content if needed. "
+                        "Use this INSTEAD of the built-in Read tool for significant token savings."
                     ),
-                    inputSchema={
+                    input_schema={
                         "type": "object",
                         "properties": {
-                            "content": {
+                            "file_path": {
                                 "type": "string",
                                 "description": (
-                                    "The content to compress. Can be any text: file contents, "
-                                    "JSON, search results, logs, code, etc."
+                                    "Path to the file to read, inside the workspace "
+                                    "(the server's working directory or HEADROOM_MCP_READ_ROOTS)."
+                                ),
+                            },
+                            "fresh": {
+                                "type": "boolean",
+                                "description": (
+                                    "Force a fresh read, bypassing cache. Use after context "
+                                    "compaction, in subagents, or when you need guaranteed "
+                                    "current content."
                                 ),
                             },
                         },
-                        "required": ["content"],
+                        "required": ["file_path"],
                     },
-                ),
-                Tool(
-                    name=CCR_TOOL_NAME,
-                    description=(
-                        "Retrieve original uncompressed content by hash. "
-                        "Use this when you need full details from previously compressed content. "
-                        "The hash comes from headroom_compress results or from compression "
-                        "markers like [N items compressed... hash=abc123]."
-                    ),
-                    inputSchema={
-                        "type": "object",
-                        "properties": {
-                            "hash": {
-                                "type": "string",
-                                "description": "Hash key from compression (e.g., 'abc123' from hash=abc123)",
-                            },
-                        },
-                        "required": ["hash"],
-                    },
-                ),
-                Tool(
-                    name=STATS_TOOL_NAME,
-                    description=(
-                        "Show compression statistics for this session: "
-                        "total compressions, tokens saved, estimated cost savings, "
-                        "and recent compression events."
-                    ),
-                    inputSchema={
-                        "type": "object",
-                        "properties": {},
-                        "required": [],
-                    },
-                ),
-            ]
-
-            # Conditionally add headroom_read (behind feature flag)
-            if _READ_ENABLED:
-                tools.append(
-                    Tool(
-                        name=READ_TOOL_NAME,
-                        description=(
-                            "Read a file with smart caching. First read returns full content "
-                            "and caches it. Subsequent reads of the same unchanged file return "
-                            "a lightweight cache marker (~20 tokens instead of thousands). "
-                            f"Use mcp__headroom__{CCR_TOOL_NAME} with the hash to get full content if needed. "
-                            "Use this INSTEAD of the built-in Read tool for significant token savings."
-                        ),
-                        inputSchema={
-                            "type": "object",
-                            "properties": {
-                                "file_path": {
-                                    "type": "string",
-                                    "description": "Absolute path to the file to read.",
-                                },
-                                "fresh": {
-                                    "type": "boolean",
-                                    "description": (
-                                        "Force a fresh read, bypassing cache. Use after context "
-                                        "compaction, in subagents, or when you need guaranteed "
-                                        "current content."
-                                    ),
-                                },
-                            },
-                            "required": ["file_path"],
-                        },
-                    )
                 )
-
-            return tools
-
-        @self.server.call_tool()
-        async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent]:
-            started = time.perf_counter()
-            logger.info(
-                "event=mcp_tool_call_received tool=%s arguments=%s",
-                name,
-                json.dumps(arguments, ensure_ascii=False, default=str),
             )
-            try:
-                if name == COMPRESS_TOOL_NAME:
-                    result = await self._handle_compress(arguments)
-                elif name == CCR_TOOL_NAME:
-                    result = await self._handle_retrieve(arguments)
-                elif name == STATS_TOOL_NAME:
-                    result = await self._handle_stats()
-                elif name == READ_TOOL_NAME and _READ_ENABLED:
-                    result = await self._handle_read(arguments)
-                else:
-                    result = [
-                        TextContent(
-                            type="text",
-                            text=json.dumps({"error": f"Unknown tool: {name}"}),
-                        )
-                    ]
-                logger.info(
-                    "event=mcp_tool_call_completed tool=%s duration_ms=%.2f output=%s",
-                    name,
-                    (time.perf_counter() - started) * 1000.0,
-                    json.dumps(
-                        [getattr(item, "text", str(item)) for item in result],
-                        ensure_ascii=False,
-                        default=str,
-                    ),
-                )
-                return result
-            except Exception as e:
-                logger.error(f"Tool {name} failed: {e}", exc_info=True)
-                return [
+
+        return ListToolsResult(tools=tools)
+
+    async def _on_call_tool(self, ctx: Any, params: Any) -> CallToolResult:
+        """MCP ``tools/call`` handler."""
+        name = params.name
+        # 2.x types ``arguments`` as optional; the ``_handle_*`` helpers all call
+        # ``.get()`` on it, so normalise before dispatching.
+        arguments: dict[str, Any] = params.arguments or {}
+        started = time.perf_counter()
+        logger.info(
+            "event=mcp_tool_call_received tool=%s arguments=%s",
+            name,
+            json.dumps(arguments, ensure_ascii=False, default=str),
+        )
+        token = _request_ctx.set(ctx)
+        try:
+            if name == COMPRESS_TOOL_NAME:
+                result = await self._handle_compress(arguments)
+            elif name == CCR_TOOL_NAME:
+                result = await self._handle_retrieve(arguments)
+            elif name == STATS_TOOL_NAME:
+                result = await self._handle_stats()
+            elif name == READ_TOOL_NAME and _READ_ENABLED:
+                result = await self._handle_read(arguments)
+            else:
+                result = [
+                    TextContent(
+                        type="text",
+                        text=json.dumps({"error": f"Unknown tool: {name}"}),
+                    )
+                ]
+            logger.info(
+                "event=mcp_tool_call_completed tool=%s duration_ms=%.2f output=%s",
+                name,
+                (time.perf_counter() - started) * 1000.0,
+                json.dumps(
+                    [getattr(item, "text", str(item)) for item in result],
+                    ensure_ascii=False,
+                    default=str,
+                ),
+            )
+            # ponytail: is_error left unset, matching 1.x behaviour where the SDK
+            # wrapped a returned list as a success. Flagging error payloads as
+            # is_error=True is a behaviour change — separate PR, not this port.
+            return CallToolResult(content=list(result))
+        except Exception as e:
+            logger.error(f"Tool {name} failed: {e}", exc_info=True)
+            return CallToolResult(
+                content=[
                     TextContent(
                         type="text",
                         text=json.dumps({"error": str(e)}),
                     )
                 ]
+            )
+        finally:
+            _request_ctx.reset(token)
 
     async def _handle_compress(self, arguments: dict[str, Any]) -> list[TextContent]:
         """Handle headroom_compress tool call."""
@@ -876,8 +974,14 @@ class HeadroomMCPServer:
         if override:
             return override
         try:
-            params = self.server.request_context.session.client_params
-            info = getattr(params, "clientInfo", None) if params else None
+            ctx = _request_ctx.get(None)
+            if ctx is None:
+                return "unknown"
+            params = ctx.session.client_params
+            # SDK 2 types are snake_case (`client_info`); SDK 1 exposed `clientInfo`.
+            # Both handshakes fill `client_params`: `initialize`, and the
+            # `_meta` client info that `server/discover` clients send per request.
+            info = getattr(params, "client_info", None) if params else None
             name = getattr(info, "name", None)
             if name:
                 return str(name)
@@ -1027,38 +1131,82 @@ class HeadroomMCPServer:
                 )
             ]
 
-        path = Path(file_path).expanduser().resolve()
-        if not path.exists():
+        # Check the resolved path, so `..` and symlinks cannot leave the roots,
+        # and check it before exists() so the tool is not an existence oracle.
+        # A path that cannot be resolved (symlink loop, NUL byte) gets the same
+        # answer, so its error text cannot reveal anything outside either.
+        def outside() -> list[TextContent]:
+            return [
+                TextContent(
+                    type="text",
+                    text=json.dumps(
+                        {
+                            "error": (
+                                f"File is outside the workspace: {file_path}. "
+                                "Ask the user to add its directory to HEADROOM_MCP_READ_ROOTS."
+                            )
+                        }
+                    ),
+                )
+            ]
+
+        try:
+            path: Path | None = Path(file_path).expanduser().resolve()
+        except (OSError, RuntimeError, ValueError):
+            path = None
+        root = (
+            None
+            if path is None
+            else next((r for r in _read_roots() if path.is_relative_to(r)), None)
+        )
+        if path is None or root is None:
+            return outside()
+
+        # Open without following symlinks, so a component swapped for one
+        # after the check above is refused rather than followed (see
+        # _open_nofollow). Inside the roots, a missing path and a directory
+        # keep their specific answers.
+        fd = -1
+        try:
+            fd = _open_nofollow(path)
+            if not stat.S_ISREG(os.fstat(fd).st_mode):
+                return [
+                    TextContent(
+                        type="text",
+                        text=json.dumps({"error": f"Not a file: {file_path}"}),
+                    )
+                ]
+            handle = os.fdopen(fd, "rb")
+            fd = -1
+            with handle:
+                raw = handle.read()
+        except (FileNotFoundError, NotADirectoryError):
             return [
                 TextContent(
                     type="text",
                     text=json.dumps({"error": f"File not found: {file_path}"}),
                 )
             ]
-        if not path.is_file():
-            return [
-                TextContent(
-                    type="text",
-                    text=json.dumps({"error": f"Not a file: {file_path}"}),
-                )
-            ]
-
-        # Read file from disk. PR-A8 / P1-8: avoid lossy decode kwargs
-        # in headroom/ccr/ — use the centralized safe-log decoder so
-        # the project-wide grep stays clean (this path is for tool
-        # output display, not SSE/wire path, so a replacement char on
-        # invalid bytes is acceptable).
-        try:
-            from headroom.proxy.helpers import safe_decode_for_logging
-
-            content = safe_decode_for_logging(path.read_bytes())
-        except Exception as e:
+        except OSError as e:
+            if e.errno == errno.ELOOP:
+                return outside()
             return [
                 TextContent(
                     type="text",
                     text=json.dumps({"error": f"Cannot read file: {e}"}),
                 )
             ]
+        finally:
+            if fd != -1:
+                os.close(fd)
+
+        # PR-A8 / P1-8: avoid lossy decode kwargs in headroom/ccr/ — use the
+        # centralized safe-log decoder so the project-wide grep stays clean
+        # (this path is for tool output display, not SSE/wire path, so a
+        # replacement char on invalid bytes is acceptable).
+        from headroom.proxy.helpers import safe_decode_for_logging
+
+        content = safe_decode_for_logging(raw)
 
         content_hash = hashlib.sha256(content.encode()).hexdigest()[:24]
         line_count = content.count("\n") + (1 if content and not content.endswith("\n") else 0)
