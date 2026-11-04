@@ -33,7 +33,8 @@ def _no_space(fd: int) -> None:
         (
             lambda home: GrokRegistrar(home_dir=home),
             ".grok/config.toml",
-            "headroom.mcp_registry.grok",
+            # Grok shares the marker-block registrar, and its logger, with Codex.
+            "headroom.mcp_registry.codex",
         ),
     ],
     ids=["claude", "codex", "grok"],

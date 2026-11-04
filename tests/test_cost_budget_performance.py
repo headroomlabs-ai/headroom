@@ -89,7 +89,7 @@ def test_budget_window_evicts_expired_entries_once(period, now, expired_at, curr
     assert len(tracker._budget_costs) == 1
 
 
-def test_budget_aggregate_keeps_existing_100k_record_cap() -> None:
+def test_budget_ledger_keeps_in_period_entries_past_record_cap() -> None:
     tracker = CostTracker(budget_limit_usd=1_000_000.0)
     tracker.MAX_COST_ENTRIES = 2
     now = datetime.now()
@@ -97,6 +97,6 @@ def test_budget_aggregate_keeps_existing_100k_record_cap() -> None:
     tracker._record_budget_cost(CostEntry(now, 2.0, COST_BASIS_ESTIMATED))
     tracker._record_budget_cost(CostEntry(now, 4.0, COST_BASIS_MEASURED))
 
-    assert tracker.period_cost_breakdown()["total_usd"] == 6.0
-    assert tracker.period_cost_breakdown()["records"] == 2
+    assert tracker.period_cost_breakdown()["total_usd"] == 7.0
+    assert tracker.period_cost_breakdown()["records"] == 3
     assert tracker.period_cost_breakdown()["estimated_records"] == 1

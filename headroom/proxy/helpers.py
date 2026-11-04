@@ -112,6 +112,7 @@ from headroom.proxy.tool_injection_logging import (
 )
 from headroom.proxy.tool_injection_tracker import SessionToolTracker as _SessionToolTracker
 from headroom.proxy.tool_name_policy import extract_tool_name
+from headroom.proxy.turn_hooks import registered_turn_hooks
 
 if TYPE_CHECKING:
     import httpx
@@ -249,6 +250,9 @@ def capture_codex_wire_debug(
 #     prefix) is never mutated.
 #   - "disabled": Memory context lookup is skipped entirely; the request
 #     forwards untouched.
+#   - "tool": Auto-injection of context is off, but the memory tools are still
+#     registered; the agent calls them explicitly (``search_and_format_context``
+#     returns None in this mode).
 #
 # Configurable via HEADROOM_MEMORY_INJECTION_MODE env var. There is no
 # "system_prompt" option — that path is permanently retired by I2 (cache hot
@@ -454,6 +458,12 @@ def count_cache_breakpoints(
             if not isinstance(msg, dict):
                 continue
             found = 1 if "cache_control" in msg else 0
+            # OpenAI chat shape: markers on an assistant's tool_calls entries.
+            tool_calls = msg.get("tool_calls")
+            if isinstance(tool_calls, list):
+                found += sum(
+                    1 for tc in tool_calls if isinstance(tc, dict) and "cache_control" in tc
+                )
             content = msg.get("content")
             if isinstance(content, list):
                 for block in content:
@@ -843,6 +853,16 @@ def enforce_cache_breakpoint_budget(
                                 budget["left"] -= 1
                         new_blocks.append(block)
                     msg = {**msg, "content": new_blocks}
+                tool_calls = msg.get("tool_calls")
+                if isinstance(tool_calls, list) and budget["left"] > 0:
+                    new_calls = []
+                    for tc in tool_calls:
+                        if budget["left"] > 0 and isinstance(tc, dict) and "cache_control" in tc:
+                            tc = {k: v for k, v in tc.items() if k != "cache_control"}
+                            budget["left"] -= 1
+                        new_calls.append(tc)
+                    if new_calls != tool_calls:
+                        msg = {**msg, "tool_calls": new_calls}
                 if budget["left"] > 0 and "cache_control" in msg:
                     msg = {k: v for k, v in msg.items() if k != "cache_control"}
                     budget["left"] -= 1
@@ -1095,6 +1115,7 @@ def relocate_system_messages_to_top_level(
         family in model_id
         for family in (
             "claude-fable-5",
+            "claude-haiku-5",
             "claude-mythos-5",
             "claude-opus-4-8",
             "claude-opus-5",
@@ -1416,6 +1437,12 @@ def parse_sse_events_from_byte_buffer(
 # Maximum message array length (prevents DoS from deeply nested payloads)
 MAX_MESSAGE_ARRAY_LENGTH = 10000
 
+
+def _warn_invalid_env_number(name: str, default: float) -> None:
+    """Say which numeric knob was ignored, so a typo does not silently revert it."""
+    logger.warning("Ignoring invalid %s=%r; using %s", name, os.environ.get(name), default)
+
+
 # Compression pipeline timeout in seconds. Override via the
 # HEADROOM_COMPRESSION_TIMEOUT_SECONDS env var for slow CPUs or long Claude Code
 # conversations (GH #946). Falls back to 30 on an unparseable value.
@@ -1425,6 +1452,7 @@ try:
     )
 except ValueError:
     COMPRESSION_TIMEOUT_SECONDS = 30.0
+    _warn_invalid_env_number("HEADROOM_COMPRESSION_TIMEOUT_SECONDS", COMPRESSION_TIMEOUT_SECONDS)
 
 # Cold-start fast-pass timeout in seconds. When background compression defers
 # a cold-start-large request, the handler still runs the pipeline synchronously
@@ -1439,6 +1467,9 @@ try:
     )
 except ValueError:
     COLD_START_FAST_PASS_TIMEOUT_SECONDS = 10.0
+    _warn_invalid_env_number(
+        "HEADROOM_COLD_START_FAST_PASS_TIMEOUT_SECONDS", COLD_START_FAST_PASS_TIMEOUT_SECONDS
+    )
 
 # Eager startup preload timeout in seconds. The preload (compressor/parser models,
 # cache-only, allow_download=False) runs off the event loop during startup; this
@@ -1451,6 +1482,9 @@ try:
     )
 except ValueError:
     EAGER_PRELOAD_TIMEOUT_SECONDS = 120.0
+    _warn_invalid_env_number(
+        "HEADROOM_EAGER_PRELOAD_TIMEOUT_SECONDS", EAGER_PRELOAD_TIMEOUT_SECONDS
+    )
 
 # Maximum compression cache sessions (prevents unbounded memory growth).
 # Overridable via HEADROOM_COMPRESSION_CACHE_MAX_SESSIONS for gateway
@@ -1462,6 +1496,9 @@ try:
     )
 except ValueError:
     MAX_COMPRESSION_CACHE_SESSIONS = 500
+    _warn_invalid_env_number(
+        "HEADROOM_COMPRESSION_CACHE_MAX_SESSIONS", MAX_COMPRESSION_CACHE_SESSIONS
+    )
 
 # Idle TTL for per-session compression caches. Eviction is bust-free only
 # once the provider's own prompt cache has lapsed, so this must exceed the
@@ -1486,6 +1523,9 @@ try:
     COMPRESSION_CACHE_TTL_SECONDS = max(600.0, _ttl_env)
 except ValueError:
     COMPRESSION_CACHE_TTL_SECONDS = 3900.0
+    _warn_invalid_env_number(
+        "HEADROOM_COMPRESSION_CACHE_TTL_SECONDS", COMPRESSION_CACHE_TTL_SECONDS
+    )
 
 # Entries per session compression cache. 10k covers a single conversation with
 # ~2x headroom even at a 1M-token context (a compressible tool_result is at
@@ -1500,6 +1540,9 @@ try:
     )
 except ValueError:
     COMPRESSION_CACHE_MAX_ENTRIES = 10000
+    _warn_invalid_env_number(
+        "HEADROOM_COMPRESSION_CACHE_MAX_ENTRIES", COMPRESSION_CACHE_MAX_ENTRIES
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -1838,24 +1881,76 @@ class _OwnerOnlyRotatingFileHandler(RotatingFileHandler):
 _owner_only_warning_emitted = False
 
 
-def _warn_once_if_owner_only_unsupported(log_path: Path) -> None:
-    """Say plainly, once per process, when the file cannot be made owner-only.
+def _warn_once_if_not_protected(log_path: Path) -> None:
+    """Say plainly, once per process, when the file is not actually owner-only.
 
-    A security control that quietly does nothing on a supported platform is
-    worse than no control, so Windows gets told rather than left to assume the
-    0600 in the docs applies to it.
+    Checks the file itself (:func:`headroom.fileperms.verify_owner_only`)
+    rather than assuming from the platform: on Windows the ACL restriction
+    (:mod:`headroom._fileperms_windows`) usually succeeds, in which case this
+    stays silent, but it can fail for reasons that have nothing to do with
+    Headroom's own code — a non-NTFS volume, a missing privilege — and a
+    control that quietly does nothing is worse than no control.
     """
     global _owner_only_warning_emitted
-    if _fileperms.OWNER_ONLY_SUPPORTED or _owner_only_warning_emitted:
+    if _owner_only_warning_emitted or _fileperms.verify_owner_only(log_path):
         return
     _owner_only_warning_emitted = True
     logger.warning(
-        "Headroom cannot create %s owner-only on this platform: file modes do not "
-        "control read access here, and Headroom does not set an ACL. The runtime log "
-        "can contain request and response content (--log-messages, wire debug, "
-        "HEADROOM_LOG_PAYLOAD_PREVIEW) — protect the log directory itself.",
+        "Headroom could not restrict %s to the current user — other accounts "
+        "on this machine may be able to read it. The runtime log can contain "
+        "request and response content (--log-messages, wire debug, "
+        "HEADROOM_LOG_PAYLOAD_PREVIEW); move HEADROOM_WORKSPACE_DIR somewhere "
+        "only you can access, or restrict the containing directory yourself.",
         log_path,
     )
+
+
+def _headroom_log_level() -> int:
+    """Level for the ``headroom`` logger and the proxy.log handler.
+
+    ``HEADROOM_LOG_LEVEL=debug`` (or ``trace``) turns on Headroom's own debug
+    lines as well as uvicorn's; anything else keeps the INFO default, so the
+    default (``warning``, which only quiets uvicorn) never hides Headroom's
+    INFO events.
+    """
+    raw = os.environ.get("HEADROOM_LOG_LEVEL", "").strip().lower()
+    return logging.DEBUG if raw in ("debug", "trace") else logging.INFO
+
+
+class _HeadroomDebugStaysInProxyLog(logging.Filter):
+    """Drop ``headroom.*`` DEBUG records on every handler except proxy.log.
+
+    Headroom's debug lines can carry request-derived data (error messages that
+    quote a request; with HEADROOM_DEBUG_DUMP=full, the tool output the router
+    compresses). proxy.log is owner-only; stdout, container logs
+    and wrap's stdio capture are not, so debug stays out of them, exactly as
+    when debug was unreachable.
+    """
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        if record.levelno >= logging.INFO:
+            return True
+        return record.name != "headroom" and not record.name.startswith("headroom.")
+
+
+def _keep_headroom_debug_out_of_other_handlers() -> None:
+    """Filter every handler that can see ``headroom.*`` records except proxy.log.
+
+    That is the root handlers, plus any handler already attached to ``headroom``
+    or a child logger (e.g. an extension's). Records stop at proxy.log only.
+    """
+    loggers: list[logging.Logger] = [logging.getLogger(), logging.getLogger("headroom")]
+    loggers += [
+        candidate
+        for name, candidate in logging.Logger.manager.loggerDict.items()
+        if name.startswith("headroom.") and isinstance(candidate, logging.Logger)
+    ]
+    for each in loggers:
+        for handler in each.handlers:
+            if handler.get_name() == _PROXY_LOG_HANDLER_NAME:
+                continue
+            if not any(isinstance(f, _HeadroomDebugStaysInProxyLog) for f in handler.filters):
+                handler.addFilter(_HeadroomDebugStaysInProxyLog())
 
 
 def _setup_file_logging(
@@ -1899,12 +1994,12 @@ def _setup_file_logging(
                 log_path,
             )
             return
-        _warn_once_if_owner_only_unsupported(log_path)
         # Attach to the headroom root logger so all sub-loggers are captured.
         # Keep root propagation enabled for container stdout/stderr while
         # this handler writes the separate port/worker-specific proxy log.
         headroom_logger = logging.getLogger("headroom")
-        headroom_logger.setLevel(logging.INFO)
+        level = _headroom_log_level()
+        headroom_logger.setLevel(level)
         # Decide BEFORE constructing the handler: constructing a
         # RotatingFileHandler opens (creates) the file, so building one only to
         # discard it would leave an empty stray worker log and leak
@@ -1916,7 +2011,12 @@ def _setup_file_logging(
             for h in headroom_logger.handlers
             if isinstance(h, RotatingFileHandler) and h.name == _PROXY_LOG_HANDLER_NAME
         ]
-        if any(Path(h.baseFilename) == log_path for h in existing):
+        if level == logging.DEBUG:
+            _keep_headroom_debug_out_of_other_handlers()
+        reused = [h for h in existing if Path(h.baseFilename) == log_path]
+        if reused:
+            for h in reused:
+                h.setLevel(level)
             return
         handler = handler_cls(
             log_path,
@@ -1925,7 +2025,7 @@ def _setup_file_logging(
             encoding="utf-8",
         )
         handler.set_name(_PROXY_LOG_HANDLER_NAME)
-        handler.setLevel(logging.INFO)
+        handler.setLevel(level)
         handler.setFormatter(
             logging.Formatter("%(asctime)s - %(name)s - %(levelname)s - %(message)s")
         )
@@ -1933,9 +2033,30 @@ def _setup_file_logging(
             headroom_logger.removeHandler(stale)
             stale.close()
         headroom_logger.addHandler(handler)
-    except OSError:
-        # Non-fatal: can't write logs (read-only fs, permissions, etc.)
-        pass
+        # After, not before: the handler's _open() is what actually attempts
+        # the protection (mode bits on POSIX, the ACL call on Windows), so
+        # only now is there something real to verify rather than a platform
+        # guess.
+        _warn_once_if_not_protected(log_path)
+        if level == logging.DEBUG:
+            logger.warning(
+                "Headroom debug logging is on (HEADROOM_LOG_LEVEL). %s now records "
+                "request-derived data such as error messages that can quote requests; the "
+                "file is owner-only and debug lines stay out of stdout. Full tool-output "
+                "dumps also need HEADROOM_DEBUG_DUMP=full. Unset HEADROOM_LOG_LEVEL when "
+                "you finish diagnosing.",
+                log_path,
+            )
+    except OSError as exc:
+        # Non-fatal: can't write logs (read-only fs, permissions, etc.). Say so,
+        # or the missing proxy.log is the only clue. str(exc) embeds repr(filename),
+        # which doubles backslashes on Windows -- exc.filename is the raw path.
+        logger.warning(
+            "Headroom runtime log disabled: cannot write the log file: %s: %s. "
+            "Point HEADROOM_WORKSPACE_DIR at a writable directory to restore proxy.log.",
+            exc.filename or log_dir,
+            exc.strerror or exc,
+        )
 
 
 def is_anthropic_auth(headers: dict[str, str]) -> bool:
@@ -2804,27 +2925,20 @@ def apply_session_sticky_ccr_tool(
       * Otherwise, inject only when this turn produced compressed content.
         The first injection records the golden bytes for future turns.
 
-    Tools whose name already equals ``CCR_TOOL_NAME`` (e.g. the client
-    pre-registered it via MCP) are not re-appended; the client's bytes
-    win.
+    Tools registered under ``CCR_TOOL_NAME`` or a supported client/MCP alias
+    are not re-appended; the client's executable name and definition win.
 
     Returns ``(updated_tools, was_injected)``. ``updated_tools`` is a
     fresh list (caller-safe).
     """
-    from headroom.ccr.tool_injection import CCR_TOOL_NAME
+    from headroom.ccr.tool_calls import client_retrieval_tool_name
 
     if provider not in ("anthropic", "openai", "google"):
         raise ValueError(f"unsupported provider: {provider!r}")
 
     tools_out: list[dict[str, Any]] = list(existing_tools) if existing_tools else []
-    existing_names: set[str] = set()
-    for t in tools_out:
-        n = _extract_tool_name(t)
-        if n:
-            existing_names.add(n)
-
-    # Client (or MCP) already provided a tool by this name — don't double up.
-    if CCR_TOOL_NAME in existing_names:
+    # Only default Headroom aliases claim ownership, not arbitrary MCP servers.
+    if client_retrieval_tool_name(tools_out):
         log_tool_injection_decision(
             provider=provider,
             session_id=session_id,
@@ -4006,8 +4120,29 @@ def _warn_deferred_without_search_tool(tools: Any) -> None:
 
 
 def anthropic_first_party_tool_search_supported(api_base_url: str | None) -> bool:
-    """Return whether Anthropic server-side tool search is valid for this upstream."""
-    from headroom.providers.claude.runtime import is_custom_anthropic_base_url
+    """Return whether Anthropic server-side tool search is valid for this upstream.
+
+    GitHub's Copilot API also accepts the first-party deferred shape and bills
+    deferred schemas compactly, so downgrading deferral there inlines the whole
+    catalog and multiplies billed prompt tokens (#4356). That holds for the
+    generic host and for the plan hosts Business/Enterprise/Individual seats
+    are routed to (``api.<plan>.githubcopilot.com``, #4155), so any public
+    ``*.githubcopilot.com`` host qualifies. GHE data-residency hosts
+    (``copilot-api.<tenant>.ghe.com``) still downgrade: nobody has verified
+    that they accept the shape.
+    """
+    from headroom.copilot_auth import is_copilot_completions_host, is_public_copilot_api_host
+    from headroom.providers.claude.runtime import (
+        _gate_view_host,
+        is_custom_anthropic_base_url,
+    )
+
+    # The ``proxy.*`` hosts are the inline-completions surface: nobody has measured
+    # the deferred shape there.
+    if is_public_copilot_api_host(
+        _gate_view_host((api_base_url or "").strip())
+    ) and not is_copilot_completions_host(api_base_url):
+        return True
 
     return not is_custom_anthropic_base_url(api_base_url)
 
@@ -4561,6 +4696,9 @@ _OPENAI_TOOL_SEARCH_UNSUPPORTED_CLIENTS = frozenset({"codex", "opencode"})
 # HEADROOM_OPENAI_TOOL_SEARCH_MODELS (matched against the model name) so new
 # model families can be enabled without a code edit + release.
 _OPENAI_TOOL_SEARCH_MIN_VERSION = (5, 4)
+# Last malformed override pattern warned about, so a bad regex is reported once
+# instead of on every request.
+_openai_tool_search_bad_pattern: str | None = None
 
 
 def _model_supports_openai_tool_search(model: str | None) -> bool:
@@ -4571,14 +4709,27 @@ def _model_supports_openai_tool_search(model: str | None) -> bool:
     when set; a malformed pattern falls back to the version gate rather than
     crashing.
     """
+    global _openai_tool_search_bad_pattern
     if not model:
         return False
     override = os.environ.get("HEADROOM_OPENAI_TOOL_SEARCH_MODELS", "").strip()
     if override:
         try:
-            return re.search(override, model) is not None
-        except re.error:
-            pass  # malformed override → fall back to the version gate
+            matched = re.search(override, model) is not None
+        except re.error as exc:
+            # Malformed override → fall back to the version gate.
+            if override != _openai_tool_search_bad_pattern and logger.isEnabledFor(logging.WARNING):
+                _openai_tool_search_bad_pattern = override
+                logger.warning(
+                    "Ignoring invalid HEADROOM_OPENAI_TOOL_SEARCH_MODELS regex %r (%s); "
+                    "using the gpt-5.4+ version gate",
+                    override,
+                    exc,
+                )
+        else:
+            # A valid pattern re-arms the warning for the next bad one.
+            _openai_tool_search_bad_pattern = None
+            return matched
     match = re.match(r"gpt-(\d+)(?:\.(\d+))?", model.strip().lower())
     if not match:
         return False
@@ -4749,11 +4900,12 @@ def snapshot_original_messages(
 
     Aliasing the live list is safe only while nothing between ingress and the
     pipeline's own deepcopy can mutate it in place. A configured
-    ``config.hooks`` (``pre_compress`` and friends receive the live list) or an
-    enabled pipeline extension can, so in that case the snapshot is an
-    independently owned deep copy; with neither configured the alias is kept
-    and costs nothing.
+    ``config.hooks`` (``pre_compress`` and friends receive the live list), an
+    enabled pipeline extension or a registered turn hook (skill search folds
+    message text in place) can, so in that case the snapshot is an
+    independently owned deep copy; with none of them the alias is kept and
+    costs nothing.
     """
-    if hooks is not None or bool(getattr(extensions, "enabled", False)):
+    if hooks is not None or bool(getattr(extensions, "enabled", False)) or registered_turn_hooks():
         return copy.deepcopy(messages)
     return messages

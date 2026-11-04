@@ -41,6 +41,7 @@ blending two meanings.
 from __future__ import annotations
 
 import json
+import logging
 import os
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
@@ -48,6 +49,7 @@ from pathlib import Path
 from typing import Any
 
 from headroom import paths as _paths
+from headroom.log_safety import WarnOnce, describe_exception, safe_id
 
 # Reuse the proxy tracker's pricing + normalization so MCP and proxy events
 # bucket models identically and price them through one implementation.
@@ -67,6 +69,26 @@ try:
     _HAS_FCNTL = True
 except ImportError:
     _HAS_FCNTL = False
+
+logger = logging.getLogger(__name__)
+
+# The first failed append to each ledger path is a WARNING so an unwritable
+# ledger is visible; repeats drop to DEBUG so a persistent failure cannot flood
+# logs. A successful append re-arms the path.
+_append_warnings = WarnOnce(64, "unwritable savings ledgers")
+
+
+def _warn_append_failure(target: Path, exc: BaseException) -> None:
+    if _append_warnings.first(str(target), logger):
+        logger.warning(
+            "savings ledger: append to %s failed: %s; savings will not be recorded. "
+            "Make the directory writable or set HEADROOM_SAVINGS_EVENTS_PATH.",
+            target,
+            describe_exception(exc),
+        )
+    else:
+        logger.debug("savings ledger: append to %s failed: %s", target, describe_exception(exc))
+
 
 SCHEMA_VERSION = 2
 UNKNOWN = "unknown"
@@ -201,7 +223,8 @@ def _price_event(
     """
     try:
         from headroom.pricing.counterfactual import CacheMix, Region, price_savings
-    except Exception:  # pragma: no cover - defensive
+    except Exception as exc:  # pragma: no cover - defensive
+        logger.debug("savings ledger: pricing module failed to import: %s", describe_exception(exc))
         return None
 
     cache = event.get("cache") or {}
@@ -244,7 +267,12 @@ def _price_event(
             total += priced.usd
             total_list += priced.usd_list
             bases.append(priced.basis)
-    except Exception:  # pragma: no cover - defensive
+    except Exception as exc:  # pragma: no cover - defensive
+        logger.debug(
+            "savings ledger: pricing failed for model=%s: %s",
+            safe_id(model),
+            describe_exception(exc),
+        )
         return None
 
     if not bases:
@@ -412,9 +440,11 @@ def record_savings_event(
             finally:
                 if _HAS_FCNTL and fcntl is not None:
                     fcntl.flock(handle, fcntl.LOCK_UN)
-    except Exception:
+    except Exception as exc:
+        _warn_append_failure(target, exc)
         return False
 
+    _append_warnings.forget(str(target))
     _maybe_compact(target)
     return True
 
@@ -454,7 +484,13 @@ def _read_events(
             finally:
                 if _HAS_FCNTL and fcntl is not None:
                     fcntl.flock(handle, fcntl.LOCK_UN)
-    except Exception:
+    except Exception as exc:
+        logger.warning(
+            "savings ledger: could not read %s: %s. Check that it is a readable file, "
+            "or set HEADROOM_SAVINGS_EVENTS_PATH.",
+            target,
+            describe_exception(exc),
+        )
         return []
     return events
 
@@ -553,7 +589,8 @@ def _weakest(existing: str | None, incoming: str | None) -> str | None:
         from headroom.pricing.counterfactual import weakest_basis
 
         return weakest_basis(existing, incoming)
-    except Exception:  # pragma: no cover - defensive
+    except Exception as exc:  # pragma: no cover - defensive
+        logger.debug("savings ledger: could not compare pricing bases: %s", describe_exception(exc))
         return existing
 
 
@@ -758,7 +795,8 @@ def _maybe_compact(target: Path) -> None:
             finally:
                 if _HAS_FCNTL and fcntl is not None:
                     fcntl.flock(handle, fcntl.LOCK_UN)
-    except Exception:
+    except Exception as exc:
+        logger.debug("savings ledger: compaction of %s failed: %s", target, describe_exception(exc))
         return
 
 
