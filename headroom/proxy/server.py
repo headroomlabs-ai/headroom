@@ -487,6 +487,9 @@ logging.basicConfig(
 )
 logger = logging.getLogger("headroom.proxy")
 
+# Liveness/readiness probe routes: auth-exempt, and logged at DEBUG.
+_HEALTH_PROBE_PATHS = frozenset({"/health", "/livez", "/readyz"})
+
 
 def _output_reduction_payload(shaper_active: bool, est: Any = None) -> dict[str, Any]:
     """/stats payload for the output-shaping layer.
@@ -1040,6 +1043,10 @@ class HeadroomProxy(
         # Runs BEFORE the disable_kompress override below so that flag stays
         # authoritative for turning Kompress off.
         _apply_compressor_selection(router_config, config.compressors)
+        # The proxy is long-lived: keep compression results it has no memory
+        # budget for in a SQLite file instead of compressing them again
+        # (headroom.cache.result_store; off in stateless mode).
+        router_config.result_cache_disk = True
         # External (non-built-in) `headroom.compressor` selections are ignored by
         # `_apply_compressor_selection` (they have no enable_* flag). Thread them
         # to the router here so it can route matching blocks through them; None
@@ -1203,6 +1210,13 @@ class HeadroomProxy(
                 session_ttl_seconds=config.prefix_freeze_session_ttl,
             )
         )
+        # Session-aware /v1/compress state in Redis, so any replica serves any
+        # turn (HEADROOM_COMPRESS_SESSION_STORE); None keeps it in memory.
+        from headroom.cache.shared_sessions import open_shared_sessions
+
+        self.shared_compress_sessions = open_shared_sessions()
+        # Set by startup() when HEADROOM_PREFIX_STATE_FILE opts in.
+        self._prefix_state_file: str | None = None
 
         # Compression cache store for token mode (session-scoped). The dict
         # itself is mutated under `_compression_caches_lock`; the per-session
@@ -1993,7 +2007,12 @@ class HeadroomProxy(
         if raw not in ("1", "true", "yes", "on"):
             import platform
 
-            libc, version = platform.libc_ver()
+            try:
+                libc, version = platform.libc_ver()
+            except OSError:
+                # libc_ver() reads sys.executable; Microsoft Store Python's
+                # python.exe is an app-execution alias that can't be opened.
+                libc, version = "", ""
             if libc == "glibc":
                 try:
                     major, minor = (int(part) for part in version.split(".")[:2])
@@ -2048,6 +2067,17 @@ class HeadroomProxy(
     async def startup(self):
         """Initialize async resources."""
         self._get_shutdown_event().clear()
+        # Opt-in: resume the prefix trackers the previous process saved on its
+        # graceful shutdown, so warm conversations replay their cached prefix.
+        from headroom.cache.prefix_tracker import PREFIX_STATE_FILE_ENV, prefix_state_file
+
+        self._prefix_state_file = prefix_state_file()
+        if self._prefix_state_file and _MULTI_WORKER_CONFIG_ENV in os.environ:
+            # Each worker holds its own trackers; one file cannot hold them all.
+            logger.warning("%s ignored: not supported with multiple workers", PREFIX_STATE_FILE_ENV)
+            self._prefix_state_file = None
+        if self._prefix_state_file:
+            self.session_tracker_store.load_state(self._prefix_state_file)
         self.pipeline_extensions.emit(
             PipelineStage.PRE_START,
             operation="proxy.startup",
@@ -2395,6 +2425,9 @@ class HeadroomProxy(
     async def shutdown(self):
         """Cleanup async resources."""
         self._get_shutdown_event().set()
+        # First, before any await can hit the shutdown step timeout.
+        if self._prefix_state_file:
+            self.session_tracker_store.save_state(self._prefix_state_file)
         if self.http_client_h1 and self.http_client_h1 is not self.http_client:
             await self.http_client_h1.aclose()
         self.http_client_h1 = None
@@ -4012,7 +4045,13 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
             safe_headers = redact_for_wire_debug(headers)
         except Exception:
             safe_headers = {"redaction_error": True}
-        logger.info(
+        # A desktop or orchestrator polls these every few seconds; at INFO they
+        # filled half of an idle proxy log and cut a busy one's history to hours.
+        line_level = (
+            logging.DEBUG if method == "GET" and path in _HEALTH_PROBE_PATHS else logging.INFO
+        )
+        logger.log(
+            line_level,
             "event=proxy_inbound_request id=%s method=%s path=%s query=%s client=%s "
             "content_length=%s headers=%s",
             inbound_id,
@@ -4066,7 +4105,8 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
             proxy.metrics.record_inbound_response(status_code=response.status_code)
         except Exception:
             logger.debug("record_inbound_response failed", exc_info=True)
-        logger.info(
+        logger.log(
+            line_level,
             "event=proxy_inbound_response id=%s method=%s path=%s status=%s "
             "duration_ms=%.2f response_content_length=%s",
             inbound_id,
@@ -4110,7 +4150,7 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
     # Anything else on these paths falls through to the catch-all passthrough
     # relay (FastAPI's @app.get does not register HEAD), so exempting it would
     # let an unauthenticated caller relay arbitrary requests upstream.
-    _AUTH_EXEMPT_PATHS = frozenset({"/health", "/livez", "/readyz"})
+    _AUTH_EXEMPT_PATHS = _HEALTH_PROBE_PATHS
 
     # A non-loopback bind with no token is the exact shape (``--host 0.0.0.0``
     # from any launcher) that exposes the unauthenticated /v1/* relay to the
@@ -5312,7 +5352,7 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
             else {},
             "compressions_by_strategy": dict(m.compressions_by_strategy),
             "tokens_saved_by_strategy": dict(m.tokens_saved_by_strategy),
-            "extension_savings": dict(m.extension_savings),
+            "extension_savings": m.extension_savings_by_source(),
             "codex_ws": {
                 "units_total": m.codex_ws_units_total,
                 "units_modified_total": m.codex_ws_units_modified_total,
@@ -5398,6 +5438,9 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
                 "original_tokens_cached": compression_stats.get("total_original_tokens", 0),
                 "compressed_tokens_cached": compression_stats.get("total_compressed_tokens", 0),
                 "ccr_retrievals": compression_stats.get("total_retrievals", 0),
+                # "this_replica" with a shared store: the token and retrieval
+                # counts are this process's since it started, not the store's.
+                "totals_scope": compression_stats.get("totals_scope", "store"),
             },
             "compression_cache": compression_cache_stats,
             # Per-language AST compression pauses. Empty on a healthy install;
@@ -6528,7 +6571,7 @@ def run_server(
         sys.exit(1)
 
     # Seed the request-time coding-profile toggles (tool-search, dedupe, read
-    # protection, lossless→lossy, effort-router, block-char floor) into the
+    # protection, lossless→lossy, block-char floor) into the
     # process env before serving, so downstream per-request readers pick them up.
     # Done here (not in the CLI command) so unit tests that mock run_server never
     # mutate os.environ. setdefault → explicit env still wins. MODE / profile are
