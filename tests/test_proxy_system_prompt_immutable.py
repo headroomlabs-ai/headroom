@@ -79,7 +79,7 @@ def _install_session_tracker(proxy: object, frozen_count: int) -> None:
         lambda request, model, messages: "stable-session"
     )
     proxy.session_tracker_store.get_or_create = (  # type: ignore[attr-defined]
-        lambda session_id, provider: fake_tracker
+        lambda session_id, provider, cache_ttl_seconds=None: fake_tracker
     )
 
 
@@ -191,6 +191,46 @@ def test_memory_context_appears_in_latest_user_message_tail() -> None:
         # Memory context appended to the *latest* user turn only.
         assert sent["messages"][0]["content"] == "frozen prefix"
         assert sent["messages"][2]["content"].endswith("MEMCTX")
+
+
+def test_cache_mode_skips_memory_context_search() -> None:
+    """Cache mode never injects memory context, so it must not search for it."""
+    captured: dict[str, object] = {}
+    with _make_proxy_client() as client:
+        proxy = client.app.state.proxy
+        proxy.config.mode = "cache"
+        proxy.config.optimize = False
+        proxy.config.image_optimize = False
+        proxy.config.ccr_proactive_expansion = False
+
+        _install_session_tracker(proxy, frozen_count=1)
+        _install_memory_handler(proxy)
+        _install_capture_retry(proxy, captured)
+
+        response = client.post(
+            "/v1/messages",
+            headers={
+                "x-api-key": "test-key",
+                "anthropic-version": "2023-06-01",
+                "x-headroom-user-id": "u1",
+            },
+            json={
+                "model": "claude-sonnet-4-6",
+                "max_tokens": 64,
+                "system": "base system",
+                "messages": [
+                    {"role": "user", "content": "frozen prefix"},
+                    {"role": "assistant", "content": "ack"},
+                    {"role": "user", "content": "latest user"},
+                ],
+            },
+        )
+
+        assert response.status_code == 200
+        proxy.memory_handler.search_and_format_context.assert_not_awaited()
+        sent = captured["body"]
+        assert isinstance(sent, dict)
+        assert sent["messages"][2]["content"] == "latest user"
 
 
 def test_memory_context_byte_deterministic_for_same_query() -> None:

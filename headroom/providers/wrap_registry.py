@@ -20,11 +20,11 @@ from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal
-from urllib.parse import urlsplit
+from urllib.parse import unquote, urlsplit
 
 from headroom.providers.claude import proxy_base_url as claude_proxy_base_url
 from headroom.providers.codex import proxy_base_url as codex_proxy_base_url
-from headroom.proxy.project_context import with_project_prefix
+from headroom.proxy.project_context import split_project_path, with_project_prefix
 
 # How an EnvVar's URL is shaped: ``openai_v1`` ends in ``/v1`` (OpenAI-style
 # clients append ``/chat/completions``); ``anthropic`` is a bare origin
@@ -114,10 +114,39 @@ def build_launch_env(
     return env, display
 
 
-def _origin_key(url: str) -> tuple[str, str, int | None]:
-    parts = urlsplit(url.strip())
-    host = (parts.hostname or "").lower()
-    return parts.scheme, "127.0.0.1" if host == "localhost" else host, parts.port
+def _origin(url: str) -> tuple[str, str, int | None] | None:
+    """(scheme, host, port) of ``url``; None when it cannot be an HTTP origin.
+
+    None for an unparsable URL (a non-numeric port makes ``urlsplit(...).port``
+    raise) or a missing scheme or host.
+    """
+    try:
+        parts = urlsplit(url)
+        port = parts.port
+    except ValueError:
+        return None
+    if not parts.scheme or not parts.hostname:
+        return None
+    host = parts.hostname  # urlsplit lowercases it
+    return parts.scheme, "127.0.0.1" if host == "localhost" else host, port
+
+
+def _routable_proxy_path(url: str) -> bool:
+    """True when Bob's gateway paths appended to ``url`` reach the proxy router.
+
+    Only a bare origin or one ``/p/<project>`` prefix qualifies; anything else
+    leaves Bob's paths under a prefix the router never sees. A ``?`` or ``#``
+    anywhere fails, even bare: Bob appends to the string, so the paths would
+    land in the query or fragment. The path is checked decoded, as the ASGI
+    server hands it to the router, so an encoded slash in the project segment
+    is the extra segment it becomes, while the ``%20`` that
+    ``with_project_prefix`` itself emits is fine. A trailing slash is fine too:
+    bobshell's ``AJ()`` (verified in 2.0.5) collapses repeated slashes and
+    strips a trailing one before appending.
+    """
+    if "?" in url or "#" in url:
+        return False
+    return split_project_path(unquote(urlsplit(url).path))[1] in ("", "/")
 
 
 def bob_preflight(env: Mapping[str, str], settings_path: Path | None = None) -> str | None:
@@ -136,16 +165,27 @@ def bob_preflight(env: Mapping[str, str], settings_path: Path | None = None) -> 
         return None
     if not isinstance(saved, str) or not saved.strip():
         return None
-    # Same proxy if scheme, host and port agree; a different /p/<project>
-    # prefix only changes attribution, and the error below tells users to
-    # point gatewayUrl at the proxy, so that must not then be rejected.
-    if _origin_key(saved) == _origin_key(env.get("BOB_GATEWAY_URL", "")):
-        return None
+    saved = saved.strip()
+    saved_origin = _origin(saved)
+    proxy_origin = _origin(env.get("BOB_GATEWAY_URL", ""))
+    if saved_origin is None:
+        reason = "could not be parsed as an HTTP origin"
+    elif proxy_origin is not None and saved_origin == proxy_origin:
+        # Same proxy. A different /p/<project> prefix only changes attribution,
+        # and the message below tells users to point gatewayUrl at the proxy,
+        # so that must not then be rejected; an extra path segment must be.
+        if _routable_proxy_path(saved):
+            return None
+        reason = (
+            "is not a URL the proxy can route (use the bare proxy origin, optionally "
+            "with one /p/<project> prefix, and no query or fragment)"
+        )
+    else:
+        reason = "overrides BOB_GATEWAY_URL, so Bob would bypass the Headroom proxy"
     return (
-        f"Bob's saved gatewayUrl ({saved.strip()}) overrides BOB_GATEWAY_URL, so Bob "
-        f"would bypass the Headroom proxy. Remove the gatewayUrl entry from {path} "
-        "(or set it to the proxy URL shown by this wrap) and retry. If your "
-        "organisation enforces a GatewayUrl policy, Bob cannot be wrapped."
+        f"Bob's saved gatewayUrl ({saved}) {reason}. Remove the gatewayUrl "
+        f"entry from {path} (or set it to the proxy URL shown by this wrap) and retry. "
+        "If your organisation enforces a GatewayUrl policy, Bob cannot be wrapped."
     )
 
 
@@ -160,14 +200,15 @@ WRAP_TARGETS: dict[str, WrapTarget] = {
                 EnvVar("OPENAI_BASE_URL", "openai_v1"),
                 EnvVar("OPENAI_API_BASE", "openai_v1", display=False),
                 EnvVar("ANTHROPIC_BASE_URL", "anthropic"),
+                EnvVar("ANTHROPIC_HOST", "anthropic"),
             ),
             project_prefix=False,
             help_text=(
                 "Launch Goose (Block) CLI through Headroom proxy.\n"
                 "\n"
                 "\b\n"
-                "Sets OPENAI_BASE_URL and ANTHROPIC_BASE_URL to route Goose's API calls\n"
-                "through Headroom.\n"
+                "Sets OPENAI_BASE_URL, ANTHROPIC_BASE_URL, and ANTHROPIC_HOST to route\n"
+                "Goose's API calls through Headroom.\n"
                 "\n"
                 "\b\n"
                 "Uninstall: there is no ``headroom unwrap goose`` subcommand — nothing is\n"
