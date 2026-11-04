@@ -819,7 +819,8 @@ def dashboard(port: int, no_open: bool) -> None:
     help=(
         "Enable/disable AST-based code compression. Requires the optional "
         "tree-sitter dependency: pip install headroom-ai[code]. "
-        "Default: disabled. Env: HEADROOM_CODE_AWARE_ENABLED=1 to enable."
+        "Default: enabled. Disable with --no-code-aware or "
+        "HEADROOM_CODE_AWARE_ENABLED=0."
     ),
 )
 @click.option(
@@ -1603,10 +1604,9 @@ def proxy(
         # Code-aware compression resolution:
         # 1. Explicit --code-aware / --no-code-aware always wins.
         # 2. Otherwise read HEADROOM_CODE_AWARE_ENABLED (truthy = on).
-        # 3. Otherwise default off — matches the prior cli/proxy.py behavior so
-        #    existing users see no change unless they opt in.
-        # Default ON (coding posture; consistent with the argparse server path).
-        # Degrades gracefully to a no-op when tree-sitter isn't installed.
+        # 3. Otherwise default ON (coding posture; consistent with the argparse
+        #    server path). Degrades gracefully to a no-op when tree-sitter
+        #    isn't installed.
         code_aware_enabled=(
             bool(code_aware_flag)
             if code_aware_flag is not None
