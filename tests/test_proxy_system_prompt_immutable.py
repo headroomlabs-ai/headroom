@@ -21,6 +21,11 @@ from fastapi.testclient import TestClient
 from headroom.proxy.server import ProxyConfig, create_app
 
 
+@pytest.fixture(autouse=True)
+def _stub_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("HEADROOM_REQUIRE_RUST_CORE", "false")
+
+
 class _FakePrefixTracker:
     def __init__(self, frozen_count: int):
         self._frozen_count = frozen_count
@@ -477,6 +482,110 @@ def test_memory_context_appears_in_responses_api_input_tail() -> None:
 
 
 def test_cache_mode_skips_memory_context_search_openai_chat() -> None:
+    """Cache mode never injects memory context on OpenAI chat, so it must not search for it."""
+    captured: dict[str, object] = {}
+    with _make_proxy_client() as client:
+        proxy = client.app.state.proxy
+        proxy.config.mode = "cache"
+        proxy.config.optimize = False
+        proxy.config.image_optimize = False
+        proxy.config.ccr_proactive_expansion = False
+
+        _install_session_tracker(proxy, frozen_count=1)
+        _install_memory_handler(proxy)
+
+        async def _fake_retry(method, url, headers, body, stream=False, **kwargs):  # noqa: ANN001
+            captured["body"] = body
+            return httpx.Response(
+                200,
+                json={
+                    "id": "chatcmpl_1",
+                    "object": "chat.completion",
+                    "choices": [
+                        {
+                            "index": 0,
+                            "message": {"role": "assistant", "content": "ack"},
+                            "finish_reason": "stop",
+                        }
+                    ],
+                    "usage": {"prompt_tokens": 10, "completion_tokens": 2, "total_tokens": 12},
+                },
+            )
+
+        proxy._retry_request = _fake_retry
+
+        response = client.post(
+            "/v1/chat/completions",
+            headers={
+                "authorization": "Bearer sk-test",
+                "x-headroom-user-id": "u1",
+            },
+            json={
+                "model": "gpt-4o",
+                "messages": [
+                    {"role": "system", "content": "base system"},
+                    {"role": "user", "content": "frozen prefix"},
+                    {"role": "assistant", "content": "ack"},
+                    {"role": "user", "content": "latest user"},
+                ],
+            },
+        )
+
+        assert response.status_code == 200
+        proxy.memory_handler.search_and_format_context.assert_not_awaited()
+        sent = captured["body"]
+        assert isinstance(sent, dict)
+        assert sent["messages"][3]["content"] == "latest user"
+
+
+def test_cache_mode_skips_memory_context_search_openai_responses() -> None:
+    """Cache mode never injects memory context on OpenAI responses, so it must not search for it."""
+    captured: dict[str, object] = {}
+    with _make_responses_proxy_client() as client:
+        proxy = client.app.state.proxy
+        proxy.config.mode = "cache"
+        proxy.config.optimize = False
+        proxy.config.image_optimize = False
+        _install_memory_handler(proxy)
+
+        async def _fake_retry(method, url, headers, body, stream=False, **kwargs):  # noqa: ANN001
+            captured["body"] = body
+            return httpx.Response(
+                200,
+                json={
+                    "id": "resp_1",
+                    "object": "response",
+                    "model": "gpt-5.4",
+                    "output": [],
+                    "usage": {"input_tokens": 5, "output_tokens": 1, "total_tokens": 6},
+                },
+            )
+
+        proxy._retry_request = _fake_retry
+
+        response = client.post(
+            "/v1/responses",
+            headers={
+                "authorization": "Bearer sk-test",
+                "x-headroom-user-id": "u1",
+            },
+            json={
+                "model": "gpt-5.4",
+                "instructions": "You are a Codex assistant.",
+                "input": "latest user string input",
+            },
+        )
+
+        assert response.status_code == 200
+        proxy.memory_handler.search_and_format_context.assert_not_awaited()
+        assert "body" in captured
+        sent = captured["body"]
+        assert isinstance(sent, dict)
+        assert sent.get("input") == "latest user string input"
+        assert sent.get("instructions") == "You are a Codex assistant."
+
+
+def test_cache_mode_chat_preserves_tools_and_outcome_skip_reason() -> None:
     """Cache mode never injects memory context on OpenAI /v1/chat/completions."""
     captured: dict[str, object] = {}
     recorded_outcomes = []
@@ -536,7 +645,7 @@ def test_cache_mode_skips_memory_context_search_openai_chat() -> None:
         assert recorded_outcomes[0].tags.get("memory_skip_reason") == "cache_mode"
 
 
-def test_cache_mode_skips_memory_context_search_openai_responses() -> None:
+def test_cache_mode_responses_preserves_tools_and_outcome_skip_reason() -> None:
     """Cache mode never injects memory context on OpenAI /v1/responses."""
     captured: dict[str, object] = {}
     recorded_outcomes = []

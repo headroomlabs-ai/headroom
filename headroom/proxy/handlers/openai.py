@@ -4384,6 +4384,7 @@ class OpenAIHandlerMixin:
                         decision="skipped_cache_mode",
                         bytes_injected=0,
                         query=extract_user_query(optimized_messages) or "",
+                        tags=tags,
                     )
                 elif self.memory_handler.config.inject_context:
                     memory_context = await asyncio.wait_for(
@@ -6236,6 +6237,7 @@ class OpenAIHandlerMixin:
                         decision="skipped_cache_mode",
                         bytes_injected=0,
                         query=extract_user_query(optimized_messages) or "",
+                        tags=tags,
                     )
                 elif self.memory_handler.config.inject_context:
                     try:

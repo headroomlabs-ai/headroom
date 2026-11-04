@@ -197,6 +197,50 @@ async def test_memory_lookup_runs_for_each_issue_artifact_frame_and_preserves_no
 
 
 @pytest.mark.asyncio
+async def test_cache_mode_skips_context_on_each_frame_and_preserves_tools():
+    upstream = _FakeUpstream(
+        [
+            json.dumps({"type": "response.created", "response": {"id": "r_1"}}),
+            json.dumps({"type": "response.completed", "response": {"id": "r_1"}}),
+        ],
+        hold_after_events=True,
+    )
+    first, later = _issue_2059_inputs()
+    cancel = json.dumps({"type": "response.cancel"})
+    frames = [
+        _turn_with_tools(first, _client_response_tools()),
+        cancel,
+        _turn_with_tools(later, _client_response_tools()),
+    ]
+    client_ws = _FakeWebSocket(frames=frames)
+    handler = _DummyOpenAIHandler()
+    handler.config.mode = "cache"
+    memory = _MemoryHandler()
+    handler.memory_handler = memory
+
+    with (
+        patch.dict(sys.modules, {"websockets": _make_fake_websockets_module(upstream)}),
+        patch("headroom.proxy.helpers.log_memory_injection") as log_injection,
+    ):
+        await handler.handle_openai_responses_ws(client_ws)
+
+    assert memory.queries == []
+    assert upstream.sent[1] == cancel
+    forwarded = [json.loads(upstream.sent[i])["response"] for i in (0, 2)]
+    assert [response["input"] for response in forwarded] == [first, later]
+    expected_tools = [*_client_response_tools(), *_expected_memory_response_tools()]
+    assert all(response["tools"] == expected_tools for response in forwarded)
+    skips = [
+        call.kwargs
+        for call in log_injection.call_args_list
+        if call.kwargs.get("decision") == "skipped_cache_mode"
+    ]
+    assert len(skips) == 2
+    assert all(call["bytes_injected"] == 0 for call in skips)
+    assert all(call["tags"]["memory_skip_reason"] == "cache_mode" for call in skips)
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("tools", [None, []], ids=["omitted", "empty"])
 async def test_ws_responses_do_not_inject_memory_tools_without_client_tools(tools):
     upstream = _FakeUpstream(
