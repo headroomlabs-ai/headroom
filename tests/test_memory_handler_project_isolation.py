@@ -268,7 +268,8 @@ def test_user_mode_partitions_by_user_id(tmp_path: Path) -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_unresolved_project_returns_no_context(tmp_path: Path) -> None:
+@pytest.mark.parametrize("preinitialized", [False, True])
+def test_unresolved_project_returns_no_context(tmp_path: Path, preinitialized: bool) -> None:
     """No project signals + PROJECT mode + empty fallback → no memory injection."""
     cfg = MemoryConfig(
         enabled=True,
@@ -283,7 +284,9 @@ def test_unresolved_project_returns_no_context(tmp_path: Path) -> None:
     handler = MemoryHandler(cfg, agent_type="test")
 
     async def run() -> None:
-        await handler._ensure_initialized()
+        if preinitialized:
+            await handler._ensure_initialized()
+        backend_count = len(_FakeBackend.instances)
 
         # Request with NO project-resolution signal: no header, no cwd,
         # no parseable system-prompt cwd: line.
@@ -308,6 +311,9 @@ def test_unresolved_project_returns_no_context(tmp_path: Path) -> None:
 
         msgs = [{"role": "user", "content": "Just a friendly hello"}]
         context = await handler.search_and_format_context("alice", msgs, ctx_unresolved)
+
+        assert len(_FakeBackend.instances) == backend_count
+        assert handler.initialized is preinitialized
 
         # Fail-closed: no memory injected even though backends have data.
         assert context is None, (
@@ -342,7 +348,6 @@ def test_unresolved_project_memory_tools_fail_closed(
     handler = MemoryHandler(cfg, agent_type="test")
 
     async def run() -> None:
-        await handler._ensure_initialized()
         ctx = sr_mod.RequestContext(
             headers={}, system_prompt="You are helpful.", base_user_id="alice"
         )
@@ -350,7 +355,57 @@ def test_unresolved_project_memory_tools_fail_closed(
             tool_name, input_data, "alice", request_context=ctx
         )
         payload = __import__("json").loads(result)
-        assert payload["status"] == "error"
-        assert "project" in payload["error"].lower()
+        assert payload == {"status": "skipped", "reason": "project_unresolved"}
+        assert _FakeBackend.instances == []
 
     asyncio.run(run())
+
+
+def test_unresolved_project_native_memory_tool_fails_closed(tmp_path: Path) -> None:
+    handler = MemoryHandler(
+        MemoryConfig(
+            enabled=True,
+            backend="local",
+            db_path=str(tmp_path / "memory.db"),
+            storage_mode=sr_mod.MemoryStorageMode.PROJECT,
+            use_native_tool=True,
+            native_memory_dir=str(tmp_path / "native"),
+        ),
+        agent_type="test",
+    )
+    ctx = sr_mod.RequestContext(headers={}, system_prompt="You are helpful.", base_user_id="alice")
+
+    results = asyncio.run(
+        handler.handle_memory_tool_calls(
+            {
+                "content": [
+                    {
+                        "type": "tool_use",
+                        "id": "native-create",
+                        "name": "memory",
+                        "input": {
+                            "command": "create",
+                            "path": "/memories/canary.txt",
+                            "file_text": "must not persist",
+                        },
+                    },
+                    {
+                        "type": "tool_use",
+                        "id": "custom-save",
+                        "name": "memory_save",
+                        "input": {"content": "must not persist"},
+                    },
+                ]
+            },
+            "alice",
+            "anthropic",
+            request_context=ctx,
+        )
+    )
+
+    assert all(
+        __import__("json").loads(result["content"])
+        == {"status": "skipped", "reason": "project_unresolved"}
+        for result in results
+    )
+    assert _FakeBackend.instances == []

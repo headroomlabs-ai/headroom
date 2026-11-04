@@ -141,7 +141,7 @@ def test_streaming_headroom_retrieve_is_intercepted_and_returned_as_sse() -> Non
             async def _fake_retry(method, url, headers, body, stream=False, **kwargs):  # noqa: ANN001
                 initial_bodies.append(json.loads(json.dumps(body)))
                 assert stream is False
-                assert body["stream"] is False
+                assert body["stream"] is True
                 return httpx.Response(200, json=initial_response)
 
             proxy._retry_request = _fake_retry  # type: ignore[assignment]
@@ -167,10 +167,10 @@ def test_streaming_headroom_retrieve_is_intercepted_and_returned_as_sse() -> Non
     assert "text/event-stream" in resp.headers["content-type"]
     assert "retrieved answer is now available" in resp.text
     assert "headroom_retrieve" not in resp.text
-    assert initial_bodies and initial_bodies[0]["stream"] is False
+    assert initial_bodies and initial_bodies[0]["stream"] is True
     assert len(continuation_client.post_calls) == 1
     continuation_body = json.loads(continuation_client.post_calls[0]["content"].decode())
-    assert continuation_body["stream"] is False
+    assert continuation_body["stream"] is True
     continuation_headers = {
         key.lower(): value for key, value in continuation_client.post_calls[0]["headers"].items()
     }
@@ -232,7 +232,7 @@ def test_streaming_with_headroom_retrieve_available_but_unused_returns_sse() -> 
             async def _fake_retry(method, url, headers, body, stream=False, **kwargs):  # noqa: ANN001
                 initial_bodies.append(json.loads(json.dumps(body)))
                 assert stream is False
-                assert body["stream"] is False
+                assert body["stream"] is True
                 return httpx.Response(200, json=text_response)
 
             proxy._retry_request = _fake_retry  # type: ignore[assignment]
@@ -253,7 +253,7 @@ def test_streaming_with_headroom_retrieve_available_but_unused_returns_sse() -> 
     assert "text/event-stream" in resp.headers["content-type"]
     assert "plain answer" in resp.text
     assert "headroom_retrieve" not in resp.text
-    assert initial_bodies and initial_bodies[0]["stream"] is False
+    assert initial_bodies and initial_bodies[0]["stream"] is True
     assert continuation_client.post_calls == []
     proxy._stream_response.assert_not_awaited()
 
@@ -311,7 +311,7 @@ def test_mixed_ccr_and_client_tool_serves_retrieval_then_streams_reissued_tool()
             proxy.http_client = continuation_client
 
             async def _fake_retry(method, url, headers, body, stream=False, **kwargs):  # noqa: ANN001
-                assert body["stream"] is False
+                assert body["stream"] is True
                 return httpx.Response(200, json=initial_response)
 
             proxy._retry_request = _fake_retry  # type: ignore[assignment]
@@ -393,7 +393,7 @@ def test_mixed_turn_streams_the_continuation_or_the_turn_on_failure(status_code:
             proxy.http_client = continuation_client
 
             async def _fake_retry(method, url, headers, body, stream=False, **kwargs):  # noqa: ANN001
-                assert body["stream"] is False
+                assert body["stream"] is True
                 return httpx.Response(200, json=initial_response)
 
             proxy._retry_request = _fake_retry  # type: ignore[assignment]
