@@ -1,15 +1,17 @@
-"""The default relevance embedder loads one pinned snapshot.
+"""The default relevance embedder loads one pinned snapshot, in both languages.
 
 fastembed's ``TextEmbedding`` accepts ``revision`` but drops it before
 ``snapshot_download``, so the old pin never reached the Hub and the model
 floated on ``main``. These tests hold the replacement in place: the pinned
-SHA reaches every file download and fastembed only gets the resolved
-directory.
+SHA reaches every file download, fastembed only gets the resolved directory,
+and the Rust scorer names the same repo, SHA and files.
 """
 
 from __future__ import annotations
 
+import json
 import os
+import re
 import sys
 from pathlib import Path
 from types import SimpleNamespace
@@ -26,6 +28,12 @@ from headroom.relevance.embedding import (
     EmbeddingScorer,
 )
 
+REPO_ROOT = Path(__file__).resolve().parents[1]
+RUST_EMBEDDING = REPO_ROOT / "crates/headroom-core/src/relevance/embedding.rs"
+PARITY_FIXTURE = REPO_ROOT / "tests/parity/fixtures/embedding/bge_small_en_v15_pinned.json"
+HF_CACHE_FIXTURE = json.loads(
+    (REPO_ROOT / "tests/parity/fixtures/hf_hub_cache/cases.json").read_text(encoding="utf-8")
+)
 PIN = _PINNED_REVISIONS[DEFAULT_MODEL_REPO]
 
 
@@ -171,3 +179,148 @@ def test_fastembed_loads_specific_model_path_without_a_download(monkeypatch, tmp
         lazy_load=True,
     )
     assert Path(model.model._model_dir) == tmp_path
+
+
+def _rust_const(name: str) -> str:
+    match = re.search(rf'const {name}: &str = "([^"]+)";', RUST_EMBEDDING.read_text())
+    assert match, f"{name} not found in {RUST_EMBEDDING}"
+    return match.group(1)
+
+
+def test_rust_loads_the_same_snapshot():
+    assert _rust_const("DEFAULT_MODEL_REPO") == DEFAULT_MODEL_REPO
+    assert _rust_const("DEFAULT_MODEL_REVISION") == PIN
+    assert _rust_const("DEFAULT_MODEL_FILE") == DEFAULT_MODEL_FILES[0]
+    files = re.search(
+        r"const DEFAULT_MODEL_FILES: \[&str; \d+\] = \[(.*?)\];",
+        RUST_EMBEDDING.read_text(),
+        re.S,
+    )
+    assert files, "DEFAULT_MODEL_FILES not found"
+    entries = [part.strip() for part in files.group(1).split(",") if part.strip()]
+    assert entries == ["DEFAULT_MODEL_FILE", *(f'"{name}"' for name in DEFAULT_MODEL_FILES[1:])]
+
+
+def test_parity_fixture_was_recorded_at_the_pin():
+    fixture = json.loads(PARITY_FIXTURE.read_text(encoding="utf-8"))
+    assert fixture["repo"] == DEFAULT_MODEL_REPO
+    assert fixture["revision"] == PIN
+    assert len(fixture["embeddings"]) == len(fixture["texts"])
+
+
+@pytest.mark.skipif(
+    not os.environ.get("RUN_FASTEMBED_TESTS"),
+    reason="loads the real model (~67 MB download on a cold cache); set RUN_FASTEMBED_TESTS=1",
+)
+def test_python_matches_parity_fixture():
+    """Python half of the cross-language check; the Rust half is
+    ``fastembed_matches_parity_fixture`` in the Rust scorer."""
+    np = pytest.importorskip("numpy")
+    pytest.importorskip("fastembed")
+    fixture = json.loads(PARITY_FIXTURE.read_text(encoding="utf-8"))
+
+    got = EmbeddingScorer()._encode(fixture["texts"])
+
+    for text, row, expected in zip(fixture["texts"], got, fixture["embeddings"]):
+        worst = float(np.abs(np.asarray(row, dtype=np.float64) - np.asarray(expected)).max())
+        assert worst <= fixture["max_abs_diff"], f"{text!r}: max |python - fixture| = {worst:e}"
+
+
+# ── the shared HuggingFace cache directory ──────────────────────────────────
+#
+# Rust's ``hf_cache::hub_cache_dir`` re-implements how ``huggingface_hub`` picks the
+# hub cache, so both languages look up and download into one directory. These
+# check the shared fixture against Python itself; the Rust tests
+# ``expand_vars_matches_python_posixpath_and_ntpath`` and
+# ``hub_cache_dir_matches_the_shared_fixture`` (``crates/headroom-core/src/hf_cache.rs``) check the port against the
+# same file.
+
+_CACHE_VARS = ("HF_HUB_CACHE", "HUGGINGFACE_HUB_CACHE", "HF_HOME", "XDG_CACHE_HOME")
+
+
+@pytest.mark.parametrize(
+    "case", HF_CACHE_FIXTURE["expandvars"]["cases"], ids=lambda case: case["input"]
+)
+def test_expandvars_fixture_matches_posixpath_and_ntpath(
+    case: dict[str, str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import ntpath
+    import posixpath
+
+    for name, value in HF_CACHE_FIXTURE["expandvars"]["env"].items():
+        monkeypatch.setenv(name, value)
+    monkeypatch.delenv(HF_CACHE_FIXTURE["expandvars"]["unset"], raising=False)
+    assert posixpath.expandvars(case["input"]) == case["posix"]
+    assert ntpath.expandvars(case["input"]) == case["nt"]
+
+
+@pytest.mark.parametrize(
+    "case", HF_CACHE_FIXTURE["cache_dir"]["cases"], ids=lambda case: case["name"]
+)
+def test_cache_dir_fixture_matches_huggingface_hub(case: dict, tmp_path: Path) -> None:
+    """``huggingface_hub`` reads these variables once, at import, so each case
+    runs in a fresh interpreter."""
+    import subprocess
+
+    pytest.importorskip("huggingface_hub")
+    root, home = tmp_path / "root", tmp_path / "home"
+
+    def fill(text: str) -> str:
+        return text.replace("{root}", str(root)).replace("{home}", str(home))
+
+    probe_vars = HF_CACHE_FIXTURE["cache_dir"]["probe_vars"]
+    env = {k: v for k, v in os.environ.items() if k not in (*_CACHE_VARS, *probe_vars)}
+    env["HOME"] = env["USERPROFILE"] = str(home)
+    env.update({name: fill(value) for name, value in case["env"].items()})
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            "import sys, huggingface_hub.constants as c; sys.stdout.write(c.HF_HUB_CACHE)",
+        ],
+        capture_output=True,
+        text=True,
+        env=env,
+        timeout=60,
+        check=True,
+    )
+    expected = case["expected"]
+    if isinstance(expected, dict):
+        expected = expected["nt" if os.name == "nt" else "posix"]
+    assert Path(result.stdout) == Path(fill(expected))
+
+
+@pytest.mark.parametrize("case", HF_CACHE_FIXTURE["token"]["cases"], ids=lambda case: case["name"])
+def test_token_fixture_matches_huggingface_hub(case: dict, tmp_path: Path) -> None:
+    """The token Rust's ``hf_cache::hf_token`` must find, from
+    ``huggingface_hub.get_token()`` itself."""
+    import subprocess
+
+    pytest.importorskip("huggingface_hub")
+    root, home = tmp_path / "root", tmp_path / "home"
+
+    def fill(text: str) -> str:
+        return text.replace("{root}", str(root)).replace("{home}", str(home))
+
+    for path, content in case["files"].items():
+        target = Path(fill(path))
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(content, encoding="utf-8")
+    probe_vars = HF_CACHE_FIXTURE["cache_dir"]["probe_vars"]
+    env = {k: v for k, v in os.environ.items() if k not in (*_CACHE_VARS, *probe_vars)}
+    env["HOME"] = env["USERPROFILE"] = str(home)
+    env.update({name: fill(value) for name, value in case["env"].items()})
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            "import json, sys; from huggingface_hub import get_token; "
+            "sys.stdout.write(json.dumps(get_token()))",
+        ],
+        capture_output=True,
+        text=True,
+        env=env,
+        timeout=60,
+        check=True,
+    )
+    assert json.loads(result.stdout) == case["expected"]
