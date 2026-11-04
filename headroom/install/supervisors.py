@@ -188,7 +188,7 @@ def _render_windows_vbs_launcher(vbs_path: Path, ps1_path: Path) -> ArtifactReco
         'Set WshShell = CreateObject("WScript.Shell")\r\n'
         'Set fso = CreateObject("Scripting.FileSystemObject")\r\n'
         "scriptDir = fso.GetParentFolderName(WScript.ScriptFullName)\r\n"
-        f'WshShell.Run "powershell.exe -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File """ & scriptDir & "\\{ps1_path.name}""", 0, False\r\n'
+        f'WshShell.Run "powershell.exe -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File """ & scriptDir & "\\{ps1_path.name}""", 0, True\r\n'
     )
     _write_private_text(vbs_path, vbs_content, OWNER_ONLY_FILE_MODE)
     return ArtifactRecord(kind="script", path=str(vbs_path))
@@ -733,11 +733,15 @@ def start_supervisor(manifest: DeploymentManifest) -> None:
             capture_output=True,
             text=True,
         )
-        _require_removal_success(
-            result,
-            "schtasks startup run",
-            absent_text=_SCHTASKS_ABSENT_TEXT,
-        )
+        detail = _result_text(result)
+        if result.returncode != 0:
+            if any(text in detail.lower() for text in _SCHTASKS_ABSENT_TEXT):
+                from .runtime import runtime_ready, start_detached_agent
+
+                if not runtime_ready(manifest):
+                    start_detached_agent(manifest.profile)
+                return
+            raise click.ClickException(f"schtasks startup run failed: {detail}")
         return
 
 

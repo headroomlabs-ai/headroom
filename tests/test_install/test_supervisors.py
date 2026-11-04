@@ -81,7 +81,7 @@ def test_render_windows_vbs_launcher(tmp_path: Path) -> None:
     content = vbs_path.read_text(encoding="utf-8")
     assert "WScript.Shell" in content
     assert "ensure-headroom.ps1" in content
-    assert ", 0, False" in content
+    assert ", 0, True" in content
 
 
 def test_windows_task_xml_system_scope_uses_localsystem() -> None:
@@ -1044,9 +1044,10 @@ def test_windows_stop_surfaces_access_denied(monkeypatch: pytest.MonkeyPatch) ->
 def test_windows_start_tolerates_absent_tasks(monkeypatch: pytest.MonkeyPatch, stderr: str) -> None:
     # Session-scoped fallback installs never create the `-startup` task, and
     # the health task can be missing too, so start must not raise when
-    # schtasks reports the task as missing.
+    # schtasks reports the task as missing and should start detached agent if not ready.
     monkeypatch.setattr("headroom.install.supervisors.sys.platform", "win32")
     calls: list[list[str]] = []
+    started: list[str] = []
 
     def fake_run(command: list[str], **kwargs: object) -> object:
         calls.append(command)
@@ -1061,11 +1062,44 @@ def test_windows_start_tolerates_absent_tasks(monkeypatch: pytest.MonkeyPatch, s
         )()
 
     monkeypatch.setattr("headroom.install.supervisors.run", fake_run)
+    monkeypatch.setattr("headroom.install.runtime.runtime_ready", lambda manifest: False)
+    monkeypatch.setattr(
+        "headroom.install.runtime.start_detached_agent",
+        lambda profile: started.append(profile),
+    )
     start_supervisor(_manifest(supervisor=SupervisorKind.SERVICE.value))
     assert calls == [
         ["schtasks", "/Change", "/TN", "headroom-default-health", "/ENABLE"],
         ["schtasks", "/Run", "/TN", "headroom-default-startup"],
     ]
+    assert started == ["default"]
+
+
+def test_windows_start_skips_detached_agent_when_already_ready(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr("headroom.install.supervisors.sys.platform", "win32")
+    started: list[str] = []
+
+    def fake_run(command: list[str], **kwargs: object) -> object:
+        return type(
+            "Result",
+            (),
+            {
+                "returncode": 1,
+                "stdout": "",
+                "stderr": "ERROR: The system cannot find the file specified.",
+            },
+        )()
+
+    monkeypatch.setattr("headroom.install.supervisors.run", fake_run)
+    monkeypatch.setattr("headroom.install.runtime.runtime_ready", lambda manifest: True)
+    monkeypatch.setattr(
+        "headroom.install.runtime.start_detached_agent",
+        lambda profile: started.append(profile),
+    )
+    start_supervisor(_manifest(supervisor=SupervisorKind.SERVICE.value))
+    assert started == []
 
 
 def test_windows_start_surfaces_access_denied(monkeypatch: pytest.MonkeyPatch) -> None:
