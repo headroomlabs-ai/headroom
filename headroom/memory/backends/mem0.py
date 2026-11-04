@@ -22,6 +22,22 @@ from headroom.memory import qdrant_env
 from headroom.memory.models import Memory
 from headroom.memory.ports import MemoryFilter, VectorFilter, VectorSearchResult
 
+MEM0_TELEMETRY_ENV = "MEM0_TELEMETRY"
+
+
+def disable_mem0_telemetry_by_default() -> None:
+    """Opt Mem0 out of its PostHog usage telemetry unless the caller chose.
+
+    Mem0 sends ``mem0.init``/``mem0.add``/``mem0.search`` events (config, OS and
+    version fields plus hashed entity ids) to ``us.i.posthog.com`` unless
+    ``MEM0_TELEMETRY`` is false. It reads the variable once, when
+    ``mem0.memory.telemetry`` is imported, so every ``from mem0 import`` in
+    Headroom calls this first. ``setdefault`` keeps an explicit caller value,
+    including ``True`` to allow it. A host that imported mem0 before Headroom
+    has already read the variable and must set it itself.
+    """
+    os.environ.setdefault(MEM0_TELEMETRY_ENV, "False")
+
 
 @dataclass
 class Mem0Config:
@@ -121,6 +137,7 @@ class Mem0Backend:
             ImportError: If mem0 package is not installed.
         """
         if self._client is None:
+            disable_mem0_telemetry_by_default()
             try:
                 from mem0 import Memory as Mem0Memory
             except ImportError:
