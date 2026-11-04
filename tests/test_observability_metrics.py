@@ -262,6 +262,23 @@ def test_request_attribute_provider_enriches_core_and_savings_metrics() -> None:
         unregister_otel_metric_attribute_provider(identity_attributes)
 
 
+def test_coalesced_savings_rows_count_every_event() -> None:
+    """A row summed from 33 recordings is 33 events, not 1; a bare row is 1."""
+    reader = InMemoryMetricReader()
+    otel_metrics = HeadroomOtelMetrics(meter_provider=MeterProvider(metric_readers=[reader]))
+
+    otel_metrics.record_savings_attribution(
+        [
+            {"source": "tool_search", "tokens": 3_300, "events": 33},
+            {"source": "router", "tokens": 5},
+        ]
+    )
+
+    events = _collect_metrics(reader)["headroom.savings.attribution.events"]
+    assert _find_point(events, source="tool_search").value == 33
+    assert _find_point(events, source="router").value == 1
+
+
 def test_failing_request_attribute_provider_is_fail_open() -> None:
     reader = InMemoryMetricReader()
     provider = MeterProvider(metric_readers=[reader])

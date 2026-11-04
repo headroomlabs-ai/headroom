@@ -22,6 +22,7 @@ from headroom.proxy.helpers import (
     _headroom_bypass_enabled,
     relocate_system_messages_to_top_level,
 )
+from headroom.proxy.outcome import emit_request_outcome
 from headroom.proxy.server import HeadroomProxy
 
 
@@ -333,7 +334,17 @@ def test_relocate_system_messages_noop_without_system_entry() -> None:
     assert system == "A"
 
 
-def test_relocate_system_messages_preserves_valid_mid_conversation_section() -> None:
+@pytest.mark.parametrize(
+    "model",
+    [
+        "claude-opus-5",
+        # Claude Haiku 5.5 supports mid-conversation system messages too; it was
+        # missing here, so Claude Code's Haiku subagent traffic had every valid
+        # section hoisted into the top-level system prompt.
+        "claude-haiku-5-5",
+    ],
+)
+def test_relocate_system_messages_preserves_valid_mid_conversation_section(model: str) -> None:
     messages = [
         {"role": "user", "content": "Run the tests."},
         {
@@ -343,9 +354,7 @@ def test_relocate_system_messages_preserves_valid_mid_conversation_section() -> 
         {"role": "assistant", "content": "I will do both."},
     ]
 
-    clean, system, changed = relocate_system_messages_to_top_level(
-        messages, "base", "claude-opus-5"
-    )
+    clean, system, changed = relocate_system_messages_to_top_level(messages, "base", model)
 
     assert changed is False
     assert clean is messages
@@ -392,15 +401,14 @@ def test_relocate_system_messages_still_moves_invalid_mid_conversation_placement
     assert system == [{"type": "text", "text": messages[1]["content"]}]
 
 
-def test_relocate_system_messages_moves_valid_shape_for_unsupported_model() -> None:
+@pytest.mark.parametrize("model", ["claude-sonnet-4-6", "claude-haiku-4-5"])
+def test_relocate_system_messages_moves_valid_shape_for_unsupported_model(model: str) -> None:
     messages = [
         {"role": "user", "content": "question"},
         {"role": "system", "content": "mid-turn instruction"},
     ]
 
-    clean, system, changed = relocate_system_messages_to_top_level(
-        messages, None, "claude-sonnet-4-6"
-    )
+    clean, system, changed = relocate_system_messages_to_top_level(messages, None, model)
 
     assert changed is True
     assert clean == [{"role": "user", "content": "question"}]
@@ -840,6 +848,78 @@ def test_vertex_stream_passthrough_preserves_chunks_and_records_usage() -> None:
     assert outcome.optimized_tokens == 13
     assert outcome.output_tokens == 5
     assert outcome.cache_read_tokens == 2
+
+
+def test_vertex_stream_passthrough_records_outcome_when_stream_ends_mid_character() -> None:
+    closed: list[bool] = []
+
+    class _CountingChunks(_AsyncChunks):
+        async def aclose(self) -> None:
+            closed.append(True)
+
+    class _TruncatedClient(_VertexStreamClient):
+        async def send(self, request, stream=False):  # noqa: ANN001, ANN201
+            return httpx.Response(
+                200,
+                request=request,
+                headers={"content-type": "text/event-stream"},
+                stream=_CountingChunks(
+                    [
+                        b'data: {"usageMetadata":{"promptTokenCount":13,'
+                        b'"candidatesTokenCount":5}}\n\n',
+                        b'data: {"t":"\xe2\x82',  # first 2 bytes of a 3-byte character
+                    ]
+                ),
+            )
+
+    handler = object.__new__(HeadroomProxy)
+    handler.http_client = _TruncatedClient()
+    outcomes = []
+
+    async def next_request_id():  # noqa: ANN202
+        return "req_vertex_truncated"
+
+    async def record(outcome):  # noqa: ANN001, ANN202
+        outcomes.append(outcome)
+
+    handler._next_request_id = next_request_id
+    handler._record_request_outcome = record
+
+    response = asyncio.run(
+        handler.handle_passthrough(
+            _VertexStreamPassthroughRequest(),
+            "https://vertex.test",
+            "streamGenerateContent",
+            "vertex:google",
+        )
+    )
+
+    async def collect():  # noqa: ANN202
+        return [chunk async for chunk in response.body_iterator]
+
+    assert len(asyncio.run(collect())) == 2
+    assert len(outcomes) == 1
+    assert closed == [True]
+    # Usage already received is kept, but a stream cut mid-character did not
+    # complete: it takes the same failure status as other post-start stream
+    # failures, so the outcome funnel books it as failed, not as a success.
+    assert outcomes[0].optimized_tokens == 13
+    assert outcomes[0].output_tokens == 5
+    assert outcomes[0].status_code == 502
+
+    failed: list[str] = []
+    requested: list[dict] = []
+
+    class _Metrics:
+        async def record_failed(self, provider):  # noqa: ANN001, ANN202
+            failed.append(provider)
+
+        async def record_request(self, **kwargs):  # noqa: ANN003, ANN202
+            requested.append(kwargs)
+
+    asyncio.run(emit_request_outcome(SimpleNamespace(metrics=_Metrics()), outcomes[0]))
+    assert failed == [outcomes[0].provider]
+    assert requested == []
 
 
 def test_stream_finalizer_records_vertex_provider_for_dashboard() -> None:
