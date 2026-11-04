@@ -16,8 +16,6 @@ from headroom.rollout import (
     RolloutChannel,
     RolloutConfigurationError,
     RolloutSnapshot,
-    current_rollout,
-    feature_enabled,
     registry_digest,
     resolve_rollout,
 )
@@ -323,8 +321,8 @@ def test_worker_rollout_handoff_rejects_non_object_state() -> None:
         RolloutSnapshot.from_internal_dict([])  # type: ignore[arg-type]
 
 
-def test_snapshot_query_and_compatibility_helpers() -> None:
-    snapshot = current_rollout(
+def test_snapshot_query_helpers() -> None:
+    snapshot = resolve_rollout(
         {
             "HEADROOM_ROLLOUT_CHANNEL": "canary",
             "HEADROOM_FEATURES": "tool_result_interceptors",
@@ -335,12 +333,11 @@ def test_snapshot_query_and_compatibility_helpers() -> None:
     assert snapshot.is_available("tool-result-interceptors") is True
     assert snapshot.enabled == frozenset({"tool_result_interceptors"})
     assert snapshot.disabled == frozenset({"read_maturation"})
-    assert feature_enabled(
-        "tool_result_interceptors",
-        explicit=True,
-        environ={"HEADROOM_ROLLOUT_CHANNEL": "canary"},
-    )
-    assert not feature_enabled("tool_result_interceptors", environ={})
+    assert resolve_rollout(
+        {"HEADROOM_ROLLOUT_CHANNEL": "canary"},
+        requested=("tool_result_interceptors",),
+    ).is_enabled("tool_result_interceptors")
+    assert not resolve_rollout({}).is_enabled("tool_result_interceptors")
     with pytest.raises(KeyError, match="missing"):
         snapshot.decision("missing")
 
