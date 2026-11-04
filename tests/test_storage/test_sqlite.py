@@ -848,6 +848,61 @@ class TestConcurrency:
         storage.close()
 
 
+class TestVolatileDatabases:
+    """Volatile stores must initialize their schema on the serving connection (#4262)."""
+
+    @pytest.mark.parametrize("db_path", [":memory:", ""])
+    def test_save_and_read_back_on_volatile_store(self, db_path):
+        """The first save must not fail with 'no such table: requests'."""
+        storage = SQLiteStorage(db_path)
+        try:
+            metrics = RequestMetrics(
+                request_id="volatile-1",
+                timestamp=datetime(2025, 1, 6, 12, 0, 0),
+                model="local",
+                stream=False,
+                mode="audit",
+                tokens_input_before=123,
+                tokens_input_after=45,
+                block_breakdown={"system": 10},
+                waste_signals={},
+                transforms_applied=[],
+            )
+
+            storage.save(metrics)
+
+            assert storage.get("volatile-1") == metrics
+            assert storage.count() == 1
+            assert [m.request_id for m in storage.query()] == ["volatile-1"]
+            assert storage.get_summary_stats()["total_requests"] == 1
+        finally:
+            storage.close()
+
+    @pytest.mark.parametrize("db_path", [":memory:", ""])
+    def test_close_discards_volatile_rows(self, db_path):
+        """Closing a volatile store drops its rows; the connection is recreated empty."""
+        storage = SQLiteStorage(db_path)
+        metrics = RequestMetrics(
+            request_id="volatile-2",
+            timestamp=datetime(2025, 1, 6, 12, 0, 0),
+            model="local",
+            stream=False,
+            mode="audit",
+            tokens_input_before=1000,
+            tokens_input_after=800,
+            block_breakdown={},
+            waste_signals={},
+        )
+        storage.save(metrics)
+        storage.close()
+
+        # A fresh connection to a volatile database has no rows, but the
+        # schema must be rebuilt so the store keeps working.
+        assert storage.get("volatile-2") is None
+        assert storage.count() == 0
+        storage.close()
+
+
 class TestCacheOptimizerMetrics:
     """Cache-optimizer fields must survive a durable SQLite round trip (#4261)."""
 
