@@ -350,6 +350,59 @@ class TestStreamingRatelimitHeaderForwarding:
         assert result.headers.get("cf-ray") is None
 
     @pytest.mark.asyncio
+    async def test_copilot_accounting_headers_forwarded_in_streaming(self, monkeypatch):
+        """Copilot's ``x-github-*`` / ``*copilot*`` headers survive the streaming path.
+
+        The Copilot CLI derives AI-credit accounting from these headers; when
+        they are dropped it records ``aiCreditsStatus: unavailable`` and
+        under-reports credits while token counts still look correct.
+        """
+
+        # A Copilot URL makes the proxy mint a Copilot OAuth token, which needs a
+        # real login; stub it so the test runs without one.
+        async def fake_copilot_auth(headers: dict[str, str], *, url: str) -> dict[str, str]:
+            return {**headers, "authorization": "Bearer copilot-test-token"}
+
+        monkeypatch.setattr(streaming_module, "apply_copilot_api_auth", fake_copilot_auth)
+        proxy = self._create_mock_proxy()
+        mock_response = self._create_mock_upstream_response()
+        mock_response.headers = httpx.Headers(
+            {
+                "content-type": "text/event-stream",
+                "x-github-request-id": "ABCD:1234:5678",
+                "x-copilot-usage": "nano-aiu=30213500000",
+                "cf-ray": "ray-789",
+            }
+        )
+        proxy.http_client.build_request = MagicMock(return_value=MagicMock())
+        proxy.http_client.send = AsyncMock(return_value=mock_response)
+
+        result = await proxy._stream_response(
+            url="https://api.githubcopilot.com/v1/messages",
+            headers={"authorization": "Bearer test"},
+            body={
+                "model": "claude-opus-4.8",
+                "max_tokens": 100,
+                "stream": True,
+                "messages": [{"role": "user", "content": "hi"}],
+            },
+            provider="anthropic",
+            model="claude-opus-4.8",
+            request_id="test-copilot-accounting",
+            original_tokens=10,
+            optimized_tokens=10,
+            tokens_saved=0,
+            transforms_applied=[],
+            tags={},
+            optimization_latency=0.0,
+        )
+
+        assert result.media_type == "text/event-stream"
+        assert result.headers.get("x-github-request-id") == "ABCD:1234:5678"
+        assert result.headers.get("x-copilot-usage") == "nano-aiu=30213500000"
+        assert result.headers.get("cf-ray") is None
+
+    @pytest.mark.asyncio
     async def test_no_ratelimit_headers_still_works(self):
         """When upstream has no ratelimit headers, streaming should still work."""
         proxy = self._create_mock_proxy()
