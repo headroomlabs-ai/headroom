@@ -6,15 +6,17 @@ injection mechanism for each agent system (CLAUDE.md, .cursorrules, etc.).
 
 from __future__ import annotations
 
+import html
 import re
 import subprocess
 from abc import ABC, abstractmethod
+from dataclasses import replace
 from datetime import datetime, timezone
 from pathlib import Path
 
 from headroom._subprocess import run
 
-from ..managed_block import block_pattern, sanitize_block_text
+from ..managed_block import sanitize_block_text
 from ._shared import claude_config_dir
 from .models import (
     ProjectInfo,
@@ -27,7 +29,40 @@ from .models import (
 # cannot close the block early (see headroom.managed_block).
 _MARKER_START = "<!-- headroom:learn:start -->"
 _MARKER_END = "<!-- headroom:learn:end -->"
-_MARKER_PATTERN = block_pattern(_MARKER_START, _MARKER_END)
+
+
+def _find_managed_block(text: str) -> tuple[int, int] | None:
+    """Return the ``(start, end)`` offsets of the managed block, or None.
+
+    The block is a line that is exactly the start marker through the next line
+    that is exactly the end marker -- the shape ``_build_section`` writes. A
+    marker quoted inside prose (sharing its line with other text, or indented)
+    or inside a fenced code block (a Markdown example) is not a block
+    boundary, and a start marker with no end marker before the next start
+    marker is not a block. Every reader and writer of the block in
+    this module uses this one span, so the block that is parsed is the block
+    that is replaced (#4339). ``end`` stops after the end marker, before its
+    line break.
+    """
+    offset = 0
+    start: int | None = None
+    fence: str | None = None  # the open fence's run, e.g. "```" or "~~~~"
+    for line in text.splitlines(keepends=True):
+        bare = line.rstrip()
+        stripped = bare.lstrip(" ")
+        if len(bare) - len(stripped) <= 3 and stripped[:3] in ("```", "~~~"):
+            run = len(stripped) - len(stripped.lstrip(stripped[0]))
+            if fence is None:
+                fence = stripped[0] * run
+            elif stripped[0] == fence[0] and run >= len(fence) and not stripped[run:]:
+                fence = None
+        elif fence is None:
+            if bare == _MARKER_START:
+                start = offset
+            elif bare == _MARKER_END and start is not None:
+                return start, offset + len(bare)
+        offset += len(line)
+    return None
 
 
 def _read_text_tolerant(file_path: Path) -> str:
@@ -115,6 +150,138 @@ def _build_section(recommendations: list[Recommendation]) -> str:
 
 # Matches the "*~N tokens/session saved*" annotation emitted by _build_section.
 _TOKENS_ANNOTATION_PATTERN = re.compile(r"\*~([\d,]+) tokens/session saved\*\n?")
+# New recommendations contain raw annotations; saved blocks contain the
+# escaped delimiters emitted by sanitize_block_text. Recognize both without
+# unescaping transcript-derived content or weakening managed-block boundaries.
+_PATTERN_ID_PATTERN = re.compile(
+    r"(?:<!--|&lt;!--)\s*headroom:pattern-id:([^\s>]+)\s*(?:-->|--&gt;)\s*$"
+)
+
+
+def _tagged_pattern_id(line: str) -> str | None:
+    """Return the id inside a bullet's pattern-id comment, if any.
+
+    ``_build_section`` sanitizes block content, so on disk the comment reads
+    ``&lt;!-- ... --&gt;``; match against the decoded line so carried-forward
+    sections are still recognized as lifecycle-tracked. Callers keep the
+    original (still-sanitized) line when the bullet survives.
+    """
+    match = _PATTERN_ID_PATTERN.search(html.unescape(line))
+    return match.group(1) if match else None
+
+
+def _merge_markdown_items(
+    new_content: str,
+    prior_content: str,
+    active_item_ids: frozenset[str] | None = None,
+) -> str | None:
+    """Merge simple markdown bullets, preferring new text for stable IDs.
+
+    ``active_item_ids`` is the producing learner's authoritative set of ids
+    that are still alive — it must include the items that this batch omitted
+    only because of ranking or top-N capping, otherwise still-active advice
+    is deleted. When it is supplied, a prior item is carried forward only
+    while its `headroom:pattern-id` is in the set, so an expired or
+    tombstoned item is genuinely removed instead of being pinned forever.
+    Prior items with no id predate id tagging: a still-active one is
+    re-emitted by the current run with an id and collapses into that line by
+    visible text, so dropping the untagged leftovers removes only items the
+    learner no longer considers active.
+
+    Passing ``None`` means the producer exposes no lifecycle signal, and the
+    merge degrades to a plain union of new and prior items.
+    """
+
+    def _items(content: str) -> list[tuple[str | None, str, str]] | None:
+        lines = [line.strip() for line in content.splitlines() if line.strip()]
+        if any(not line.startswith("- ") for line in lines):
+            return None
+        items: list[tuple[str | None, str, str]] = []
+        for line in lines:
+            pattern_id = _tagged_pattern_id(line)
+            visible = _PATTERN_ID_PATTERN.sub("", line).strip().casefold()
+            items.append((pattern_id, visible, line))
+        return items
+
+    new_items = _items(new_content)
+    prior_items = _items(prior_content)
+    if new_items is None or prior_items is None:
+        return None
+
+    if active_item_ids is not None:
+        prior_items = [
+            item for item in prior_items if item[0] is not None and item[0] in active_item_ids
+        ]
+
+    merged: list[str] = []
+    seen_ids: set[str] = set()
+    seen_content: set[str] = set()
+    for pattern_id, visible, line in (*new_items, *prior_items):
+        if (pattern_id is not None and pattern_id in seen_ids) or visible in seen_content:
+            continue
+        if pattern_id is not None:
+            seen_ids.add(pattern_id)
+        seen_content.add(visible)
+        merged.append(line)
+    return "\n".join(merged)
+
+
+def _authoritative_item_ids(
+    recommendations: list[Recommendation],
+) -> frozenset[str] | None:
+    """Union every lifecycle signal the current run carries, or None.
+
+    A section the new run did not re-emit cannot be judged by its own
+    recommendation — that recommendation is exactly what is missing. The
+    sets the run *does* carry stand in for it: a producer publishes one set
+    per run covering all of its live items, so an id absent from every set
+    in the run is one no producer still claims. Returns ``None`` when no
+    recommendation carries a signal, which keeps the historical
+    carry-everything behaviour for runs that cannot speak to lifecycle.
+    """
+    signals = [r.active_item_ids for r in recommendations if r.active_item_ids is not None]
+    if not signals:
+        return None
+    return frozenset().union(*signals)
+
+
+def _prune_carried_section(
+    content: str,
+    active_item_ids: frozenset[str],
+) -> str | None:
+    """Drop expired id-tagged bullets from a section the new run did not re-emit.
+
+    This is the deletion path for a heading whose last item expired: the
+    producer stops emitting the section entirely, so the same-section merge
+    never runs and the heading would otherwise be carried forward forever.
+
+    Only bullets carrying a `headroom:pattern-id` are removable — they come
+    from a lifecycle-tracked producer, so their absence from
+    ``active_item_ids`` means that producer dropped them. Untagged bullets
+    are kept: unlike the same-section merge, where a still-active legacy
+    item is re-emitted with an id by the same run and collapses by visible
+    text, nothing in this path would bring an untagged bullet back, so
+    deleting it would discard content on no evidence.
+
+    Returns the pruned content, or ``None`` when the section carries no
+    tagged bullets at all and is therefore not a tracked section to prune.
+    """
+    lines = [line.strip() for line in content.splitlines() if line.strip()]
+    if not lines or any(not line.startswith("- ") for line in lines):
+        return None
+    kept: list[str] = []
+    saw_tracked_item = False
+    for line in lines:
+        pattern_id = _tagged_pattern_id(line)
+        if pattern_id is None:
+            kept.append(line)
+            continue
+        saw_tracked_item = True
+        if pattern_id in active_item_ids:
+            kept.append(line)
+    if not saw_tracked_item:
+        return None
+    return "\n".join(kept)
 
 
 def extract_marker_block(file_content: str) -> str | None:
@@ -124,8 +291,8 @@ def extract_marker_block(file_content: str) -> str | None:
     (including the start/end markers) so it can be fed back to an LLM as
     context without losing formatting. Returns None if no block is present.
     """
-    match = _MARKER_PATTERN.search(file_content)
-    return match.group(0) if match else None
+    span = _find_managed_block(file_content)
+    return file_content[span[0] : span[1]] if span else None
 
 
 def _parse_prior_recommendations(existing: str) -> list[Recommendation]:
@@ -136,10 +303,10 @@ def _parse_prior_recommendations(existing: str) -> list[Recommendation]:
     _build_section — target is set to a placeholder since the marker block
     itself doesn't record it (blocks are always per-file and per-target).
     """
-    match = _MARKER_PATTERN.search(existing)
-    if not match:
+    span = _find_managed_block(existing)
+    if not span:
         return []
-    inner = match.group(0)[len(_MARKER_START) : -len(_MARKER_END)]
+    inner = existing[span[0] + len(_MARKER_START) : span[1] - len(_MARKER_END)]
 
     recs: list[Recommendation] = []
     for part in re.split(r"\n### ", "\n" + inner)[1:]:
@@ -176,15 +343,52 @@ def _merge_recommendations(
     whose headings do not reappear in the new run are carried forward so
     a re-run doesn't silently drop accumulated learnings. To fully rebuild
     the block, delete it manually and re-run.
+
+    Recommendations that opt into ``preserve_prior_items`` are merged at the
+    item level instead, bounded by their ``active_item_ids`` lifecycle signal
+    so prior items can still expire out of the file.
+
+    That signal also reaches the carried-forward sections. A category whose
+    last item expires stops producing a recommendation at all, so its
+    heading never enters the same-section merge; without pruning the carry
+    path too, those bullets would be pinned in the file forever. Sections
+    holding no id-tagged items are carried untouched, as before.
     """
     if not file_path.exists():
         return new_recommendations
     prior = _parse_prior_recommendations(_read_text_tolerant(file_path))
     if not prior:
         return new_recommendations
-    new_sections = {r.section for r in new_recommendations}
-    carried = [p for p in prior if p.section not in new_sections]
-    return list(new_recommendations) + carried
+    prior_by_section = {r.section: r for r in prior}
+    merged_new: list[Recommendation] = []
+    for recommendation in new_recommendations:
+        prior_recommendation = prior_by_section.get(recommendation.section)
+        if recommendation.preserve_prior_items and prior_recommendation is not None:
+            merged_content = _merge_markdown_items(
+                recommendation.content,
+                prior_recommendation.content,
+                recommendation.active_item_ids,
+            )
+            if merged_content is not None:
+                recommendation = replace(recommendation, content=merged_content)
+        merged_new.append(recommendation)
+
+    new_sections = {r.section for r in merged_new}
+    run_active_item_ids = _authoritative_item_ids(merged_new)
+    carried: list[Recommendation] = []
+    for prior_recommendation in prior:
+        if prior_recommendation.section in new_sections:
+            continue
+        if run_active_item_ids is not None:
+            pruned = _prune_carried_section(prior_recommendation.content, run_active_item_ids)
+            if pruned is not None:
+                if not pruned:
+                    # Every tracked item under this heading is gone; the
+                    # heading goes with them rather than outliving them.
+                    continue
+                prior_recommendation = replace(prior_recommendation, content=pruned)
+        carried.append(prior_recommendation)
+    return merged_new + carried
 
 
 def _merge_into_file(file_path: Path, new_recommendations: list[Recommendation]) -> str:
@@ -193,8 +397,12 @@ def _merge_into_file(file_path: Path, new_recommendations: list[Recommendation])
     section = _build_section(merged)
     if file_path.exists():
         existing = _read_text_tolerant(file_path)
-        if _MARKER_START in existing:
-            return _MARKER_PATTERN.sub(lambda _match: section, existing)
+        # Replace only the managed block itself; marker strings quoted in
+        # prose on either side are hand-written text. No block (including a
+        # start marker without its end marker) -> append a fresh one (#4339).
+        span = _find_managed_block(existing)
+        if span:
+            return existing[: span[0]] + section + existing[span[1] :]
         return existing.rstrip() + "\n\n" + section + "\n"
     return section + "\n"
 
@@ -205,7 +413,9 @@ def _strip_marker_block(content: str) -> str:
     Used when migrating a stale block out of the team-shared CLAUDE.md into the
     personal CLAUDE.local.md. Returns "" if nothing but the block remained.
     """
-    cleaned = _MARKER_PATTERN.sub("", content)
+    cleaned = content
+    while span := _find_managed_block(cleaned):
+        cleaned = cleaned[: span[0]] + cleaned[span[1] :]
     cleaned = re.sub(r"\n{3,}", "\n\n", cleaned).strip()
     return cleaned + "\n" if cleaned else ""
 
@@ -391,11 +601,11 @@ class ClaudeCodeWriter(ContextWriter):
         if target_path == legacy_path or not legacy_path.exists():
             return []
         legacy_text = _read_text_tolerant(legacy_path)
-        if _MARKER_START not in legacy_text:
+        if _find_managed_block(legacy_text) is None:
             return []
         # If the target already owns a block, it is the source of truth -- don't
         # double-migrate or clobber accumulated learnings.
-        if target_path.exists() and _MARKER_START in _read_text_tolerant(target_path):
+        if target_path.exists() and _find_managed_block(_read_text_tolerant(target_path)):
             return []
 
         migrated = _parse_prior_recommendations(legacy_text)

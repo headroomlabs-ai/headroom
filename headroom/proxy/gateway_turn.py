@@ -51,6 +51,7 @@ from typing import Any
 
 from headroom.proxy.gateway_responses import VIEW_MARKER as GATEWAY_RESPONSES_VIEW_MARKER
 from headroom.proxy.outcome import RequestOutcome
+from headroom.proxy.tool_schema_savings_policy import without_deferral_flags
 from headroom.proxy.turn_hooks import (
     TurnContext,
     merge_provider_headers,
@@ -231,6 +232,13 @@ class NormalizedUsage:
     output_tokens: int | None = None
     cache_read: int | None = None
     cache_write: int | None = None
+    # Whether ``input_tokens`` already counts the cached prompt. Anthropic's
+    # ``input_tokens`` is the uncached remainder (reads and writes are reported
+    # beside it); OpenAI's ``prompt_tokens`` is the whole prompt with
+    # ``cached_tokens`` as a subset of it. Billing the prompt correctly needs to
+    # know which of the two arrived, so normalize_usage records it rather than
+    # letting each consumer guess.
+    input_includes_cache: bool = False
 
     @property
     def has_cache_signal(self) -> bool:
@@ -249,6 +257,15 @@ class NormalizedUsage:
             return True
         return self.cache_read is not None and self.cache_write is not None
 
+    def _merged_includes_cache(self, other: NormalizedUsage) -> bool:
+        """Accounting dialect across rounds. A usage block without cache fields
+        carries no dialect (``normalize_usage`` defaults it to inclusive, which
+        is wrong for a cacheless Anthropic round), so the round that reported
+        cache fields decides; the latest such round wins."""
+        if other.has_cache_signal or not self.has_cache_signal:
+            return other.input_includes_cache
+        return self.input_includes_cache
+
     def merged_with(self, other: NormalizedUsage) -> NormalizedUsage:
         """Sum the billed counters across re-drive rounds; cache fields come
         from the latest round that carried them (the last provider call is the
@@ -264,6 +281,7 @@ class NormalizedUsage:
             output_tokens=_sum(self.output_tokens, other.output_tokens),
             cache_read=other.cache_read if other.has_cache_signal else self.cache_read,
             cache_write=other.cache_write if other.has_cache_signal else self.cache_write,
+            input_includes_cache=self._merged_includes_cache(other),
         )
 
     def summed_with(self, other: NormalizedUsage) -> NormalizedUsage:
@@ -282,6 +300,7 @@ class NormalizedUsage:
             output_tokens=_sum(self.output_tokens, other.output_tokens),
             cache_read=_sum(self.cache_read, other.cache_read),
             cache_write=_sum(self.cache_write, other.cache_write),
+            input_includes_cache=self._merged_includes_cache(other),
         )
 
     def as_anthropic(self) -> dict[str, int]:
@@ -327,16 +346,34 @@ def normalize_usage(usage: dict[str, Any]) -> NormalizedUsage:
     input_tokens = _usage_int(usage, "input_tokens")
     if input_tokens is None:
         input_tokens = _usage_int(usage, "prompt_tokens")
+    # Anthropic alone reports the prompt split in two: ``input_tokens`` is the
+    # uncached remainder and the cached part sits in its own two counters.
+    # Everywhere else the reported prompt total already contains the cached
+    # prefix — including OpenAI's Responses API, which names its field
+    # ``input_tokens`` too, so the key name cannot be the discriminator. Keying
+    # off Anthropic's cache fields can misread only a relay that mixes the two
+    # vocabularies, and then it errs towards not inflating the prompt.
+    # Responses' ``input_tokens_details`` marks an inclusive total even when a
+    # relay also flattened a top-level read beside it.
+    input_includes_cache = "input_tokens_details" in usage or not (
+        "cache_read_input_tokens" in usage or "cache_creation_input_tokens" in usage
+    )
     output_tokens = _usage_int(usage, "output_tokens")
     if output_tokens is None:
         output_tokens = _usage_int(usage, "completion_tokens")
 
     cache_read = _usage_int(usage, "cache_read_input_tokens")
     cache_write = _usage_int(usage, "cache_creation_input_tokens")
+    if cache_write is None:
+        # Responses reports billed writes as input_tokens_details.cache_write_tokens;
+        # chat reports none. Read whether or not a top-level read was relayed.
+        details = usage.get("input_tokens_details")
+        if isinstance(details, dict):
+            cache_write = _usage_int(details, "cache_write_tokens")
     if cache_read is None:
-        # OpenAI reports reads only (no write counter exists), nested under
-        # prompt_tokens_details (chat), input_tokens_details (Responses) or —
-        # in Kong's flattened log shape — at the top level.
+        # OpenAI nests reads under prompt_tokens_details (chat),
+        # input_tokens_details (Responses) or — in Kong's flattened log shape —
+        # puts them at the top level.
         for details_key in ("prompt_tokens_details", "input_tokens_details"):
             details = usage.get(details_key)
             if isinstance(details, dict):
@@ -351,6 +388,7 @@ def normalize_usage(usage: dict[str, Any]) -> NormalizedUsage:
         output_tokens=output_tokens,
         cache_read=cache_read,
         cache_write=cache_write,
+        input_includes_cache=input_includes_cache,
     )
 
 
@@ -820,6 +858,19 @@ class RequestTransformer:
         self.tags = tags
         self.caps = caps
         self.result: RequestTransformResult | None = None
+        # Tool-definition tokens the request hooks ADDED (e.g. a search tool).
+        # The compress handler adds it to ``tokens_after``: it is sent too.
+        self.tool_growth_tokens = 0
+        # Message tokens the request hooks ADDED (only counted by the handler
+        # when it did not recount the messages), and tool tokens they removed
+        # (booked on turn_hook_tools_saved_tokens), for signed netting.
+        self.message_growth_tokens = 0
+        self.hook_tool_saved_tokens = 0
+        # Tool-definition tokens before and after schema compaction, both 0 when
+        # it changed nothing or could not be counted. The compress handler folds
+        # them into ``tokens_before``/``tokens_after``, as the chat handlers do.
+        self.compaction_tokens_before = 0
+        self.compaction_tokens_after = 0
         self._tokenizer: Any = None
 
     def _get_tokenizer(self) -> Any:
@@ -860,6 +911,15 @@ class RequestTransformer:
             count_tools = _count_tools_with(tokenizer)
         except Exception:
             logger.debug("gateway turn: tokenizer unavailable; hook savings uncounted")
+        if tool_transforms:
+            # Counted before any hook runs: a hook may edit the compacted list.
+            # Tools the client already deferred are not billed, so their
+            # compaction saves nothing.
+            compacted_before = _safe_count(count_tools, _billed_tools(self.tools))
+            compacted_after = _safe_count(count_tools, _billed_tools(tools))
+            if compacted_before is not None and compacted_after is not None:
+                self.compaction_tokens_before = compacted_before
+                self.compaction_tokens_after = compacted_after
 
         # Built even with no hook registered: the response half drives CCR
         # retrieval through the same context (messages + live tools).
@@ -875,7 +935,7 @@ class RequestTransformer:
         )
         if hooks:
             msg_before = _safe_count(count_messages, messages)
-            tools_before = _safe_count(count_tools, tools)
+            tools_before = _safe_count(count_tools, without_deferral_flags(tools))
             deferred_before = self.tags.get("tool_search_deferred_tools")
             run_request_hooks(ctx, stream_safe_only=not self.caps.redrive_allowed)
             messages = ctx.messages
@@ -890,12 +950,16 @@ class RequestTransformer:
                     f"{int(self.tags.get('tool_search_deferred_tokens', 0) or 0)}tok"
                 )
             msg_after = _safe_count(count_messages, messages)
+            if msg_before is not None and msg_after is not None:
+                self.message_growth_tokens = max(0, msg_after - msg_before)
             if msg_before is not None and msg_after is not None and msg_after < msg_before:
                 transforms.append("turn_hook")
                 messages_rewritten = True
-            tools_after = _safe_count(count_tools, tools)
+            tools_after = _safe_count(count_tools, without_deferral_flags(tools))
             if tools_before is not None and tools_after is not None:
+                self.tool_growth_tokens = max(0, tools_after - tools_before)
                 saved = max(0, tools_before - tools_after)
+                self.hook_tool_saved_tokens = saved
                 if saved > 0:
                     self.tags["turn_hook_tools_saved_tokens"] = (
                         int(self.tags.get("turn_hook_tools_saved_tokens", 0) or 0) + saved
@@ -929,6 +993,13 @@ class RequestTransformer:
             messages_rewritten=messages_rewritten,
         )
         return messages
+
+
+def _billed_tools(tools: Any) -> Any:
+    """The tools that enter the billed context: all but those flagged ``defer_loading``."""
+    if not isinstance(tools, list):
+        return tools
+    return [t for t in tools if not (isinstance(t, dict) and t.get("defer_loading"))]
 
 
 def _safe_count(counter: Callable[[Any], int] | None, value: Any) -> int | None:
@@ -1159,7 +1230,6 @@ def shape_gateway_body(
     and the block is re-appended deterministically. Never raises.
     """
     try:
-        from headroom.proxy import runtime_env
         from headroom.proxy.output_savings import (
             assign_arm,
             conversation_key_from_body,
@@ -1169,6 +1239,7 @@ def shape_gateway_body(
         from headroom.proxy.output_shaper import (
             OutputShaperSettings,
             classify_turn,
+            output_holdout_fraction,
             resolve_verbosity_level,
             shape_openai_chat_request,
             shape_request,
@@ -1182,11 +1253,7 @@ def shape_gateway_body(
         )
         if not settings.enabled:
             return False
-        try:
-            holdout = float(runtime_env.getenv("HEADROOM_OUTPUT_HOLDOUT", "0") or "0")
-        except ValueError:
-            holdout = 0.0
-        arm = assign_arm(conversation_key_from_body(provider_body), holdout)
+        arm = assign_arm(conversation_key_from_body(provider_body), output_holdout_fraction())
         messages = provider_body.get("messages")
         turn_kind = classify_turn(messages if isinstance(messages, list) else []).value
         stratum = stratum_key(
@@ -1358,14 +1425,33 @@ def complete_outcome(
     tokenizer scale), output and the two cache counters as reported, provider
     status so a 5xx is funnelled as a failure, and the gateway's provider
     latency added to the compress-side wall clock.
+
+    ``provider_input_tokens`` is the WHOLE billed prompt, cached part included,
+    matching what the direct Anthropic handler records. Anthropic's
+    ``input_tokens`` counts only the uncached remainder, so on that shape the
+    cache counters are added back; every other shape already contains them, so
+    the cached part is subtracted to get ``uncached_input_tokens``.
+    Recording only the uncached sliver here left every ratio built on the input
+    counter (notably ``/stats`` ``tokens.savings_percent``) dividing savings by
+    a denominator tens of times too small on cache-heavy agent traffic.
     """
     usage = usage or NormalizedUsage()
+    cache_read = usage.cache_read or 0
+    cache_write = usage.cache_write or 0
+    reported_input = usage.input_tokens or 0
+    if usage.input_includes_cache:
+        billed_input = reported_input
+        uncached_input = max(reported_input - cache_read - cache_write, 0)
+    else:
+        billed_input = reported_input + cache_read + cache_write
+        uncached_input = reported_input
     return dataclasses.replace(
         draft,
         output_tokens=usage.output_tokens or 0,
-        provider_input_tokens=usage.input_tokens or 0,
-        cache_read_tokens=usage.cache_read or 0,
-        cache_write_tokens=usage.cache_write or 0,
+        provider_input_tokens=billed_input,
+        uncached_input_tokens=uncached_input,
+        cache_read_tokens=cache_read,
+        cache_write_tokens=cache_write,
         status_code=status,
         total_latency_ms=draft.total_latency_ms + float(latency_ms or 0.0),
     )
@@ -1460,14 +1546,12 @@ async def handle_compress_response(proxy: Any, request: Any) -> Any:
     """``POST /v1/compress/response`` — finish or re-drive a pending turn."""
     from fastapi.responses import JSONResponse
 
-    from headroom.proxy.helpers import _read_request_json
+    from headroom.proxy.helpers import _read_request_json, invalid_request_body_message
 
     try:
         body = await _read_request_json(request)
-    except Exception:
-        return _error(400, "invalid_request", "Invalid JSON in request body.")
-    if not isinstance(body, dict):
-        return _error(400, "invalid_request", "Request body must be a JSON object.")
+    except Exception as exc:
+        return _error(400, "invalid_request", invalid_request_body_message(exc))
 
     turn_id = body.get("turn_id")
     if not isinstance(turn_id, str) or not turn_id.strip() or len(turn_id) > 128:

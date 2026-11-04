@@ -7,11 +7,12 @@ const http2 = nodeRequire("node:http2") as typeof import("node:http2");
 const childProcess = nodeRequire("node:child_process") as typeof import("node:child_process");
 const fs = nodeRequire("node:fs") as typeof import("node:fs");
 
-const BASE_URL_HEADER = "x-headroom-base-url";
-const ORIGINAL_PATH_HEADER = "x-headroom-original-path";
-const PROJECT_HEADER = "x-headroom-project";
+export const BASE_URL_HEADER = "x-headroom-base-url";
+export const ORIGINAL_PATH_HEADER = "x-headroom-original-path";
+export const PROJECT_HEADER = "x-headroom-project";
+export const SESSION_TOKEN_HEADER = "x-headroom-session-token";
 const PROXY_ENV = "HEADROOM_OPENCODE_TRANSPORT_PROXY_URL";
-const EXCLUDE_HOSTS_ENV = "HEADROOM_OPENCODE_EXCLUDE_HOSTS";
+export const EXCLUDE_HOSTS_ENV = "HEADROOM_OPENCODE_EXCLUDE_HOSTS";
 const STATE_KEY = Symbol.for("headroom.opencode.transport");
 
 type FetchArgs = Parameters<typeof fetch>;
@@ -30,6 +31,7 @@ interface InstallOptions {
   project?: string;
   excludeHosts?: string[];
   debug?: boolean;
+  sessionToken?: string;
 }
 
 interface TransportState {
@@ -38,6 +40,7 @@ interface TransportState {
   project: string | undefined;
   excludeHosts: string[];
   debug: boolean;
+  sessionToken: string | undefined;
   originalFetch: typeof fetch;
   originalHttpRequest: HttpRequest;
   originalHttpGet: HttpGet;
@@ -48,6 +51,7 @@ interface TransportState {
   originalChildExec: ChildExec;
   originalChildExecFile: ChildExecFile;
   originalChildFork: ChildFork;
+  originalEnv: Record<string, string | undefined>;
 }
 
 interface GlobalWithHeadroomTransport {
@@ -69,7 +73,7 @@ function setState(state: TransportState | undefined): void {
 }
 
 // ponytail: the shim only exists next to the checkout build
-// (plugins/opencode/dist/). The wheel ships entry.opencode.js alone, so
+// (plugins/opencode/dist/). The wheel shipped the entry bundle alone, so
 // `--import=<missing file>` killed every Node child at startup — including
 // OpenCode's stdio MCP servers (issue #2798). No shim on disk, no injection:
 // children go direct instead of dying. Upgrade path is bundling the shim into
@@ -115,6 +119,23 @@ function withShimEnv(
     nextEnv.NODE_OPTIONS = withNodeImportOption(nextEnv.NODE_OPTIONS, shim);
   }
   return nextEnv;
+}
+
+// installProcessEnv writes these process-wide keys; uninstall puts them back.
+const PROCESS_ENV_KEYS = [PROXY_ENV, EXCLUDE_HOSTS_ENV, "NODE_OPTIONS"] as const;
+
+function snapshotProcessEnv(): Record<string, string | undefined> {
+  return Object.fromEntries(PROCESS_ENV_KEYS.map((key) => [key, process.env[key]]));
+}
+
+function restoreProcessEnv(saved: Record<string, string | undefined>): void {
+  for (const key of PROCESS_ENV_KEYS) {
+    if (saved[key] === undefined) {
+      delete process.env[key];
+    } else {
+      process.env[key] = saved[key];
+    }
+  }
 }
 
 function installProcessEnv(proxyUrl: string, excludeHosts: string[]): void {
@@ -208,7 +229,7 @@ function isLoopback(hostname: string): boolean {
 // string is the comma-separated env form; plugin options arrive from untyped
 // JSON, so a lone string there is treated the same way instead of iterated
 // character by character.
-function normalizeExcludeHosts(entries: string | Iterable<unknown>): string[] {
+export function normalizeExcludeHosts(entries: string | Iterable<unknown>): string[] {
   const hosts = new Set<string>();
   for (const entry of typeof entries === "string" ? entries.split(",") : entries) {
     const host = String(entry).trim().toLowerCase().replace(/^(\*\.|\.)/, "");
@@ -243,7 +264,7 @@ function isLlmEndpointPath(pathname: string): boolean {
   );
 }
 
-function shouldRoute(url: URL, proxy: URL, excludeHosts: string[]): boolean {
+function isRoutableUpstream(url: URL, proxy: URL, excludeHosts: string[]): boolean {
   if (url.protocol !== "http:" && url.protocol !== "https:") {
     return false;
   }
@@ -256,7 +277,28 @@ function shouldRoute(url: URL, proxy: URL, excludeHosts: string[]): boolean {
   if (isExcludedHost(url.hostname, excludeHosts)) {
     return false;
   }
-  return isLlmEndpointPath(url.pathname);
+  return true;
+}
+
+function shouldRoute(url: URL, proxy: URL, excludeHosts: string[]): boolean {
+  return isRoutableUpstream(url, proxy, excludeHosts) && isLlmEndpointPath(url.pathname);
+}
+
+// OpenCode 2.x hands the plugin model base URLs (e.g.
+// https://opencode.ai/zen/go/v1), not inference endpoints: setup appends the
+// wire path when it rewrites the model, so the endpoint-suffix check cannot
+// apply. Eligibility is the shared host/protocol contract only — http(s),
+// not loopback, not the proxy itself, not an excluded host.
+export function modelBaseRoutesThroughProxy(
+  baseUrl: string,
+  proxyUrl: string,
+  excludeHosts: string[] = [],
+): boolean {
+  try {
+    return isRoutableUpstream(new URL(baseUrl), normalizeProxyUrl(proxyUrl), excludeHosts);
+  } catch {
+    return false;
+  }
 }
 
 function routedUrl(upstream: URL, proxy: URL): URL {
@@ -304,6 +346,7 @@ function mergeFetchHeaders(
   upstream: URL | undefined,
   originalPath: string | undefined = undefined,
   project: string | undefined = undefined,
+  sessionToken: string | undefined = undefined,
 ): Headers {
   const headers = new Headers(input instanceof Request ? input.headers : undefined);
   if (init?.headers) {
@@ -319,6 +362,9 @@ function mergeFetchHeaders(
   if (project) {
     headers.set(PROJECT_HEADER, project);
   }
+  if (sessionToken) {
+    headers.set(SESSION_TOKEN_HEADER, sessionToken);
+  }
   return headers;
 }
 
@@ -328,6 +374,7 @@ function withRoutedFetchInput(
   proxy: URL,
   project: string | undefined,
   excludeHosts: string[],
+  sessionToken: string | undefined,
 ): FetchArgs {
   const upstream = requestUrl(input);
   if (!shouldRoute(upstream, proxy, excludeHosts)) {
@@ -337,7 +384,7 @@ function withRoutedFetchInput(
   const { url: nextUrl, originalPath } = routedUrlForOpenCode(upstream, proxy);
   const nextInit = {
     ...init,
-    headers: mergeFetchHeaders(input, init, upstream, originalPath, project),
+    headers: mergeFetchHeaders(input, init, upstream, originalPath, project, sessionToken),
   };
 
   if (input instanceof Request) {
@@ -395,6 +442,7 @@ function headersForNodeRequest(
   upstream: URL,
   originalPath: string | undefined,
   project: string | undefined,
+  sessionToken: string | undefined,
 ): Record<string, string> {
   const headers = new Headers(options.headers as HeadersInit | undefined);
   headers.set(BASE_URL_HEADER, upstream.origin);
@@ -403,6 +451,9 @@ function headersForNodeRequest(
   }
   if (project) {
     headers.set(PROJECT_HEADER, project);
+  }
+  if (sessionToken) {
+    headers.set(SESSION_TOKEN_HEADER, sessionToken);
   }
   headers.delete("host");
 
@@ -418,6 +469,7 @@ function routedNodeOptions(
   proxy: URL,
   project: string | undefined,
   excludeHosts: string[],
+  sessionToken: string | undefined,
 ): Record<string, unknown> | undefined {
   if (!parts.url || !shouldRoute(parts.url, proxy, excludeHosts)) {
     return undefined;
@@ -451,7 +503,7 @@ function routedNodeOptions(
     hostname: nextUrl.hostname,
     port: nextUrl.port || undefined,
     path: `${nextUrl.pathname}${nextUrl.search}`,
-    headers: headersForNodeRequest(parts.options, parts.url, originalPath, project),
+    headers: headersForNodeRequest(parts.options, parts.url, originalPath, project, sessionToken),
   };
 }
 
@@ -468,7 +520,7 @@ function wrapRequest(
 
     const proxy = normalizeProxyUrl(state.proxyUrl);
     const parts = splitNodeArgs(args);
-    const nextOptions = routedNodeOptions(parts, proxy, state.project, state.excludeHosts);
+    const nextOptions = routedNodeOptions(parts, proxy, state.project, state.excludeHosts, state.sessionToken);
     if (!nextOptions) {
       return Reflect.apply(originalRequest, this, args);
     }
@@ -506,6 +558,7 @@ export function installHeadroomTransport(options: InstallOptions): () => void {
     existing.project = options.project;
     existing.excludeHosts = excludeHosts;
     existing.debug = Boolean(options.debug);
+    existing.sessionToken = options.sessionToken;
     installProcessEnv(options.proxyUrl, excludeHosts);
     return () => uninstallHeadroomTransport();
   }
@@ -516,6 +569,7 @@ export function installHeadroomTransport(options: InstallOptions): () => void {
     project: options.project,
     excludeHosts,
     debug: Boolean(options.debug),
+    sessionToken: options.sessionToken,
     originalFetch: globalThis.fetch,
     originalHttpRequest: http.request,
     originalHttpGet: http.get,
@@ -526,6 +580,7 @@ export function installHeadroomTransport(options: InstallOptions): () => void {
     originalChildExec: childProcess.exec,
     originalChildExecFile: childProcess.execFile,
     originalChildFork: childProcess.fork,
+    originalEnv: snapshotProcessEnv(),
   };
 
   setState(state);
@@ -536,7 +591,7 @@ export function installHeadroomTransport(options: InstallOptions): () => void {
       return state.originalFetch(...args);
     }
     const proxy = normalizeProxyUrl(current.proxyUrl);
-    const [nextInput, nextInit] = withRoutedFetchInput(args[0], args[1], proxy, current.project, current.excludeHosts);
+    const [nextInput, nextInit] = withRoutedFetchInput(args[0], args[1], proxy, current.project, current.excludeHosts, current.sessionToken);
     return state.originalFetch(nextInput, nextInit);
   };
 
@@ -575,6 +630,7 @@ export function uninstallHeadroomTransport(): void {
   childProcess.exec = state.originalChildExec;
   childProcess.execFile = state.originalChildExecFile;
   childProcess.fork = state.originalChildFork;
+  restoreProcessEnv(state.originalEnv);
   syncBuiltinESMExports();
   setState(undefined);
 }
