@@ -65,11 +65,23 @@ jobs:
           esac
 
   test:
-    name: test (ubuntu)
+    # `test (ubuntu)` keeps its exact check name, which branch protection may
+    # require. macOS runs only `cargo test`: the magika/ORT tests there take a
+    # different path (Core ML EP, `ps -M` thread counts, #4191) that Linux
+    # never exercises; fmt/clippy stay on Ubuntu.
+    name: test (${{ matrix.name }})
     needs: rust-changes
     if: needs.rust-changes.outputs.rust == 'true'
-    runs-on: ubuntu-latest
+    runs-on: ${{ matrix.os }}
     timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: ubuntu
+            os: ubuntu-latest
+          - name: macos
+            os: macos-26
     steps:
       - uses: actions/checkout@v7
       - name: Install stable toolchain
@@ -139,11 +151,19 @@ jobs:
           print(f"onnxruntime {version} -> {libs[0]}", file=sys.stderr)
           PY
       - name: cargo fmt --check
+        if: matrix.os == 'ubuntu-latest'
         run: cargo fmt --all -- --check
       - name: cargo clippy
+        if: matrix.os == 'ubuntu-latest'
         run: cargo clippy --workspace -- -D warnings
       - name: cargo test
         run: cargo test --workspace
+      - name: cargo test (magika idle threads)
+        # Cargo stops at the first failing test binary, so a failure elsewhere
+        # in the suite would skip this macOS-specific check (#4191). Run it on
+        # its own even then; --nocapture keeps its thread counts in the log.
+        if: ${{ !cancelled() && matrix.os == 'macos-26' }}
+        run: cargo test -p headroom-core --test magika_idle_threads -- --nocapture
 
   simulator-e2e:
     name: simulator e2e (${{ matrix.os }})
