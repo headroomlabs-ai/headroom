@@ -25,9 +25,10 @@ from headroom.cache.compression_store import (  # noqa: E402
     get_compression_store,
     reset_compression_store,
 )
-from headroom.ccr.response_handler import StreamingCCRHandler  # noqa: E402
+from headroom.ccr.response_handler import CCRResponseHandler, StreamingCCRHandler  # noqa: E402
 from headroom.ccr.tool_injection import CCR_TOOL_NAME  # noqa: E402
 from headroom.proxy.handlers.openai import (  # noqa: E402
+    _buffered_chat_reply_as_sse,
     _is_openai_chat_stream_ccr_eligible,
     _take_stream_options_for_buffered_chat,
 )
@@ -550,12 +551,37 @@ def test_continuation_replays_what_the_provider_put_on_the_assistant_message():
     assert "annotations" not in replayed
 
 
+class _RequiresReasoning(_Proxy):
+    """An upstream that rejects a tool-call turn replayed without its reasoning."""
+
+    async def _retry(self, method, url, headers, body, *args, **kwargs):  # noqa: ANN001
+        for message in body["messages"]:
+            if message.get("tool_calls") and "reasoning_content" not in message:
+                self.sent.append(json.loads(json.dumps(body)))
+                return httpx.Response(400, json={"error": {"message": "reasoning_content missing"}})
+        return await super()._retry(method, url, headers, body, *args, **kwargs)
+
+
+def test_a_provider_that_requires_reasoning_on_replay_gets_it():
+    hash_key = _stored_hash()
+    reply = _retrieve_reply(hash_key)
+    reply["choices"][0]["message"]["reasoning_content"] = "required-replay"
+    with _RequiresReasoning([reply, _final_reply()]) as proxy:
+        resp = proxy.post(_request(hash_key))
+
+    assert resp.status_code == 200, resp.text
+    assert "there are 2 rows" in resp.text
+
+
 @pytest.mark.parametrize(
     "payload",
     [
         {"error": {"message": "gateway said no"}},
         {"choices": []},
+        {"choices": None},
+        {"choices": "nope"},
         {"choices": [None]},
+        {"choices": [{}]},
         {"choices": [{"finish_reason": "stop"}]},
         {"choices": [{"message": None, "finish_reason": "stop"}]},
     ],
@@ -567,6 +593,46 @@ def test_a_200_with_no_usable_choice_is_not_replayed_as_an_empty_stream(payload)
 
     assert resp.status_code == 502
     assert resp.json()["error"]["type"] == "upstream_protocol_error"
+
+
+def _as_sse(payload: Any) -> Response:
+    return _buffered_chat_reply_as_sse(
+        Response(json.dumps(payload).encode(), status_code=200),
+        ccr_response_handler=CCRResponseHandler(),
+        include_usage=False,
+        continuation_status=None,
+        request_id="test",
+    )
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        None,
+        [],
+        {"choices": [None]},
+        {"choices": [{}]},
+        {"choices": [{"message": "text"}]},
+    ],
+)
+def test_the_helper_rejects_a_reply_with_no_usable_choice(payload):
+    result = _as_sse(payload)
+
+    assert result.status_code == 502
+    assert json.loads(result.body)["error"]["type"] == "upstream_protocol_error"
+
+
+def test_a_refusal_is_a_valid_reply():
+    hash_key = _stored_hash()
+    reply = _completion(
+        {"role": "assistant", "content": None, "refusal": "no"}, "stop", USAGE_FIRST
+    )
+    with _Proxy([reply]) as proxy:
+        resp = proxy.post(_request(hash_key))
+
+    assert resp.status_code == 200, resp.text
+    deltas = [chunk["choices"][0]["delta"] for chunk in _chunks(resp.text) if chunk["choices"]]
+    assert {"refusal": "no"} in deltas
 
 
 def test_a_buffered_reply_never_lands_in_the_response_cache():
