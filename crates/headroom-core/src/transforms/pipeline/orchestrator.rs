@@ -153,7 +153,9 @@ impl CompressionPipeline {
                 );
                 continue;
             }
-            match offload.apply(&current, ctx, store) {
+            // CCR stores the pipeline input (`content`), not the
+            // reformatted `current`, so retrieval returns the original.
+            match offload.apply(&current, ctx, store, content) {
                 Ok(out) => {
                     if out.bytes_saved == 0 {
                         tracing::trace!(
@@ -422,11 +424,12 @@ mod tests {
             content: &str,
             _ctx: &CompressionContext,
             store: &dyn CcrStore,
+            ccr_source: &str,
         ) -> Result<OffloadOutput, TransformError> {
             // Always halve; emit a cache_key derived from name.
             let half = &content[..content.len() / 2];
             let key = format!("test_{}_key", self.name);
-            store.put(&key, content);
+            store.put(&key, ccr_source);
             Ok(OffloadOutput::from_lengths(
                 content.len(),
                 half.to_string(),
@@ -644,6 +647,7 @@ mod tests {
             _content: &str,
             _ctx: &CompressionContext,
             _store: &dyn CcrStore,
+            _ccr_source: &str,
         ) -> Result<OffloadOutput, TransformError> {
             Err(TransformError::internal("always_internal_err", "by design"))
         }
@@ -699,7 +703,7 @@ mod tests {
 
     #[test]
     fn end_to_end_log_template_collapses_then_log_offload_can_run() {
-        // LogTemplate runs first (lossless reformat), then LogOffload
+        // LogTemplate runs first (token-preserving reformat), then LogOffload
         // sees the collapsed output and may further drop low-priority
         // lines. Both should appear in steps_applied if both fire.
         let cfg = PipelineConfig::default();
@@ -731,6 +735,42 @@ mod tests {
         // the template header) on its own gating logic. Lossless
         // round-trip is asserted in the LogTemplate-alone test below.
         assert!(r.output.len() < log.len());
+    }
+
+    #[test]
+    fn ccr_stores_pipeline_input_not_reformatted_text() {
+        // LogTemplate rewrites the log before LogOffload runs. The CCR
+        // entry behind LogOffload's marker must still be the original
+        // pipeline input, so retrieval gives back the untouched log.
+        let cfg = PipelineConfig::default();
+        let p = CompressionPipeline::builder()
+            .with_reformat(LogTemplate::new(cfg.reformat.log_template))
+            .with_offload(LogOffload::new(cfg.bloat.log))
+            .with_config(cfg)
+            .build();
+        let s = store();
+        let mut input = String::new();
+        for i in 0..300 {
+            input.push_str(&format!(
+                "2025-01-15T12:{:02}:{:02} INFO processing job {i}\n",
+                i / 60 % 60,
+                i % 60
+            ));
+        }
+        for i in 0..300 {
+            input.push_str(&format!(
+                "2025-01-15T13:{:02}:{:02} DEBUG heartbeat ok\n",
+                i / 60 % 60,
+                i % 60
+            ));
+        }
+        input.push_str("2025-01-15T15:00:00 ERROR database connection lost\n");
+
+        let r = p.run(&input, ContentType::BuildOutput, &ctx(), &s);
+        assert!(r.steps_applied.iter().any(|n| n == "log_template"));
+        assert!(r.steps_applied.iter().any(|n| n == "log_offload"));
+        let key = r.cache_keys.first().expect("log_offload emits a cache key");
+        assert_eq!(s.get(key).as_deref(), Some(input.as_str()));
     }
 
     #[test]

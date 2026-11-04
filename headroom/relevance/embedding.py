@@ -2,8 +2,12 @@
 
 This module provides semantic relevance scoring using `fastembed`
 (BAAI/bge-small-en-v1.5 by default — 33M params, 384 dims, ~67 MB
-quantized ONNX), loaded from a pinned Qdrant/bge-small-en-v1.5-onnx-Q
-snapshot in the HuggingFace hub cache.
+quantized ONNX). The Rust scorer (fastembed-rs crate) loads the same
+pinned Qdrant/bge-small-en-v1.5-onnx-Q snapshot, so both languages run
+the same ONNX file and tokenizer. On the same ONNX Runtime build the two
+agree within 1e-6 per component; across ORT versions they drift by up to
+~4e-4, so they are close, not byte-equal. The gated parity fixture in
+tests/parity/fixtures/embedding/ bounds that drift.
 
 Key features:
 - Semantic understanding ("errors" matches "failed", "issues")
@@ -16,8 +20,8 @@ Install with: pip install "headroom-ai[relevance]"
 
 History: this module previously wrapped `sentence-transformers`
 (PyTorch). Switched to fastembed in Stage 3c.1 of the Rust port to:
-1. Match the Rust embedding scorer byte-for-byte (both call into
-   ONNX Runtime over the identical ONNX file).
+1. Run the same ONNX model as the Rust embedding scorer (both call
+   into ONNX Runtime over the identical pinned ONNX file).
 2. Remove the torch dependency from the relevance/ path
    (Phase 6: "drop torch from Python").
 3. Get a better default model (bge-small-en-v1.5 vs MiniLM-L6-v2).
@@ -27,6 +31,7 @@ from __future__ import annotations
 
 import logging
 import os
+import sys
 from collections.abc import Iterator
 from contextlib import contextmanager
 from pathlib import Path
@@ -42,6 +47,32 @@ from .base import RelevanceScore, RelevanceScorer
 # the biggest batch a proxy ever scores: 2.5 GB retained in a long-lived macOS
 # proxy. 16 holds ~10x less and runs faster, with less padding per batch.
 EMBED_BATCH_SIZE = 16
+
+
+def _shrink_arena_after_each_run(model: Any) -> None:  # reaches into fastembed internals
+    """Have ORT hand its free CPU arena regions back after every run.
+
+    The batch cap bounds one run, but concurrent relevance splits share the
+    session and still stack its arena: ~2.2 GB retained after four parallel
+    128-record splits in a macOS proxy, ~80 MB with arena shrinkage, same speed.
+    Only on macOS under ``MallocLargeCache=0``, which the proxy CLI's malloc
+    re-exec sets: with libmalloc's large cache on, the freed regions stay dirty
+    and shrinking re-grows the arena (~3.8 GB). Other platforms are unmeasured.
+    """
+    model._headroom_arena_shrink_checked = True
+    if sys.platform != "darwin" or os.environ.get("MallocLargeCache") != "0":
+        return
+    try:
+        import onnxruntime as ort
+
+        session = model.model.model  # TextEmbedding -> OnnxTextEmbedding -> InferenceSession
+        options = ort.RunOptions()
+        options.add_run_config_entry("memory.enable_memory_arena_shrinkage", "cpu:0")
+        run = session.run
+        session.run = lambda names, feed, run_options=None: run(names, feed, run_options or options)
+    except Exception as exc:  # noqa: BLE001 - memory only, the arena keeps its high-water mark
+        logger.debug("ORT arena shrinkage unavailable: %s", exc)
+
 
 # numpy is an optional dependency - import lazily
 _numpy = None
@@ -130,12 +161,14 @@ def _load_text_embedding(kwargs: dict[str, Any]) -> TextEmbedding:
     return TextEmbedding(**kwargs)
 
 
-# Default model name. Same string used by the Rust embedding scorer.
+# Default model name. Same model the Rust embedding scorer loads.
 DEFAULT_MODEL_NAME = "BAAI/bge-small-en-v1.5"
 
 # The HF repo fastembed resolves DEFAULT_MODEL_NAME to, and every file a
 # fastembed load of it reads. Its revision is pinned in
-# ``onnx_runtime._PINNED_REVISIONS`` (HEADROOM_HF_PIN=off floats it).
+# ``onnx_runtime._PINNED_REVISIONS`` (HEADROOM_HF_PIN=off floats it). The Rust
+# scorer loads the same snapshot: keep both equal to DEFAULT_MODEL_REPO and
+# DEFAULT_MODEL_FILES in crates/headroom-core/src/relevance/embedding.rs.
 DEFAULT_MODEL_REPO = "Qdrant/bge-small-en-v1.5-onnx-Q"
 DEFAULT_MODEL_FILES = (
     "model_optimized.onnx",
@@ -155,9 +188,9 @@ def _resolve_default_model_snapshot() -> str:
     here through ``hf_hub_download_local_first`` instead, which applies the
     pinned SHA, tries the cache first and guards the network fallback.
 
-    The files land in the standard HuggingFace hub cache rather than
-    fastembed's default under the system temp dir, which macOS purges after a
-    few idle days.
+    The files land in the standard HuggingFace hub cache, which the Rust
+    scorer searches too, rather than fastembed's default under the system temp
+    dir, which macOS purges after a few idle days.
 
     Raises:
         OfflineEgressBlocked: ``HEADROOM_OFFLINE`` is set and a file is not cached.
@@ -335,6 +368,8 @@ class EmbeddingScorer(RelevanceScorer):
         """
         np = _get_numpy()
         model = self._get_model()
+        if not getattr(model, "_headroom_arena_shrink_checked", False):
+            _shrink_arena_after_each_run(model)
         embeddings = list(model.embed(texts, batch_size=EMBED_BATCH_SIZE))
         return np.array(embeddings)
 
