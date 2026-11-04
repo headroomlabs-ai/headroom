@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import logging
 import os
+import sys
 from collections.abc import Iterator
 from contextlib import contextmanager
 from pathlib import Path
@@ -42,6 +43,32 @@ from .base import RelevanceScore, RelevanceScorer
 # the biggest batch a proxy ever scores: 2.5 GB retained in a long-lived macOS
 # proxy. 16 holds ~10x less and runs faster, with less padding per batch.
 EMBED_BATCH_SIZE = 16
+
+
+def _shrink_arena_after_each_run(model: Any) -> None:  # reaches into fastembed internals
+    """Have ORT hand its free CPU arena regions back after every run.
+
+    The batch cap bounds one run, but concurrent relevance splits share the
+    session and still stack its arena: ~2.2 GB retained after four parallel
+    128-record splits in a macOS proxy, ~80 MB with arena shrinkage, same speed.
+    Only on macOS under ``MallocLargeCache=0``, which the proxy CLI's malloc
+    re-exec sets: with libmalloc's large cache on, the freed regions stay dirty
+    and shrinking re-grows the arena (~3.8 GB). Other platforms are unmeasured.
+    """
+    model._headroom_arena_shrink_checked = True
+    if sys.platform != "darwin" or os.environ.get("MallocLargeCache") != "0":
+        return
+    try:
+        import onnxruntime as ort
+
+        session = model.model.model  # TextEmbedding -> OnnxTextEmbedding -> InferenceSession
+        options = ort.RunOptions()
+        options.add_run_config_entry("memory.enable_memory_arena_shrinkage", "cpu:0")
+        run = session.run
+        session.run = lambda names, feed, run_options=None: run(names, feed, run_options or options)
+    except Exception as exc:  # noqa: BLE001 - memory only, the arena keeps its high-water mark
+        logger.debug("ORT arena shrinkage unavailable: %s", exc)
+
 
 # numpy is an optional dependency - import lazily
 _numpy = None
@@ -335,6 +362,8 @@ class EmbeddingScorer(RelevanceScorer):
         """
         np = _get_numpy()
         model = self._get_model()
+        if not getattr(model, "_headroom_arena_shrink_checked", False):
+            _shrink_arena_after_each_run(model)
         embeddings = list(model.embed(texts, batch_size=EMBED_BATCH_SIZE))
         return np.array(embeddings)
 
