@@ -16,6 +16,8 @@ WIRE_DEBUG_SECRET_KEYS = (
     "x-api-key",
     "openai-api-key",
     "anthropic-api-key",
+    # Codex's signed device attestation, sent with every request.
+    "x-oai-attestation",
     "access_token",
     "refresh_token",
     "id_token",
