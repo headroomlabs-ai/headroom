@@ -618,3 +618,43 @@ def test_jsonl_query_retains_at_most_requested_window(
     # whole match set.
     assert max(retained) <= window + 1
     assert max(retained) < len(matches)
+
+
+@pytest.mark.parametrize("backend", [JSONLStorage, SQLiteStorage])
+def test_cache_optimizer_fields_survive_durable_reopen(backend, tmp_path: Path) -> None:
+    """Both backends must persist every cache-optimizer field across a reopen (#4261)."""
+    suffix = "jsonl" if backend is JSONLStorage else "db"
+    path = str(tmp_path / f"metrics.{suffix}")
+    metrics = RequestMetrics(
+        request_id="cache-repro",
+        timestamp=datetime(2026, 4, 23, 12, 0, 0),
+        model="claude-3-opus",
+        stream=False,
+        mode="optimize",
+        tokens_input_before=1000,
+        tokens_input_after=800,
+        cache_optimizer_used="anthropic-cache-optimizer",
+        cache_optimizer_strategy="explicit_breakpoints",
+        cacheable_tokens=789,
+        breakpoints_inserted=2,
+        estimated_cache_hit=True,
+        estimated_savings_percent=42.5,
+        semantic_cache_hit=True,
+    )
+
+    storage = backend(path)
+    storage.save(metrics)
+    storage.close()
+
+    reopened = backend(path)
+    restored = reopened.get("cache-repro")
+    reopened.close()
+
+    assert restored is not None
+    assert restored.cache_optimizer_used == metrics.cache_optimizer_used
+    assert restored.cache_optimizer_strategy == metrics.cache_optimizer_strategy
+    assert restored.cacheable_tokens == metrics.cacheable_tokens
+    assert restored.breakpoints_inserted == metrics.breakpoints_inserted
+    assert restored.estimated_cache_hit == metrics.estimated_cache_hit
+    assert restored.estimated_savings_percent == metrics.estimated_savings_percent
+    assert restored.semantic_cache_hit == metrics.semantic_cache_hit
