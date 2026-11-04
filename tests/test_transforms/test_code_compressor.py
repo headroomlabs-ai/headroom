@@ -9,6 +9,7 @@ Comprehensive tests covering:
 - Edge cases: Empty content, unavailable dependency, fallbacks
 """
 
+import sys
 import textwrap
 from unittest.mock import patch
 
@@ -2249,6 +2250,48 @@ class TestSemicolonSeparatedStatements:
 
         assert result.syntax_valid is True
         assert result.compressed.count("x=1; y=2") == 1
+
+    def test_class_body_statement_continuation_is_kept(self):
+        """The second statement starts on the already-emitted row and
+        continues on the next one; trimming the shared row must not drop
+        the continuation line."""
+        code = "class C:\n    x=1; y=(2 +\n            3)\n    z=4\n"
+        result = self._compressor().compress(code, language="python")
+
+        assert result.syntax_valid is True
+        assert result.compressed.count("x=1; y=(2 +") == 1
+        assert result.compressed.count("            3)") == 1
+        assert result.compressed.count("z=4") == 1
+
+    def test_import_after_statement_keeps_source_order(self, tmp_path):
+        """Imports are hoisted to the top of the output, but an import that
+        follows executable code must not jump above it: importing the plugin
+        before the path update fails at runtime."""
+        vendor = tmp_path / "vendor"
+        vendor.mkdir()
+        module_name = "semicolon_order_plugin"
+        (vendor / f"{module_name}.py").write_text("VALUE = 42\n")
+        code = f"import sys; sys.path.insert(0, {str(vendor)!r}); import {module_name}\n"
+
+        result = self._compressor().compress(code, language="python")
+
+        assert result.syntax_valid is True
+        assert result.compressed != code
+        assert (
+            result.compressed.index("import sys")
+            < result.compressed.index("sys.path.insert")
+            < result.compressed.index(f"import {module_name}")
+        )
+
+        saved_path = list(sys.path)
+        saved_modules = set(sys.modules)
+        try:
+            exec(result.compressed, {})
+            assert module_name in sys.modules
+        finally:
+            sys.path[:] = saved_path
+            for name in set(sys.modules) - saved_modules:
+                del sys.modules[name]
 
     def test_function_body_keeps_each_line_once(self):
         """Both statements share one physical line. The line slice already

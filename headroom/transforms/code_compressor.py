@@ -1644,6 +1644,11 @@ class CodeAwareCompressor(Transform):
         """
         structure = CodeStructure()
         captured_byte_ranges: list[tuple[int, int]] = []
+        # Import text keyed by start byte, so a root-level import that turns
+        # out to follow executable code can later be moved back out of
+        # ``structure.imports`` (which is emitted first) unchanged.
+        import_entries: dict[int, str] = {}
+        demoted_import_starts: set[int] = set()
 
         def _validated_candidate(node: Any, compressed: str) -> str:
             if candidate_validator is None:
@@ -1663,7 +1668,9 @@ class CodeAwareCompressor(Transform):
             # Import statements
             if node_type in lang_config.import_nodes:
                 leading = _get_leading_comment_text(node, code, captured_byte_ranges)
-                structure.imports.append(leading + _get_node_text(node, code))
+                entry = leading + _get_node_text(node, code)
+                structure.imports.append(entry)
+                import_entries[node.start_byte] = entry
                 captured_byte_ranges.append((node.start_byte, node.end_byte))
                 return
 
@@ -1815,20 +1822,46 @@ class CodeAwareCompressor(Transform):
         # e.g. tree-sitter-c-sharp rejects top-level `#region` after a type
         # declaration, which would fail validation and forfeit compression.
         first_captured = min((r[0] for r in captured_byte_ranges), default=None)
+        saw_top_level_code = False
         for child in root.children:
             child_range = (child.start_byte, child.end_byte)
-            if child_range not in captured_byte_ranges:
-                # In Python a `;` between two statements on one physical line
-                # is a root-level anonymous token. Emitted as its own fragment
-                # it becomes a bare `;` line and invalidates the output.
-                if not child.is_named and child.type in (";", ","):
-                    continue
-                text = _get_node_text(child, code).strip()
-                if text:
-                    if first_captured is not None and child.end_byte <= first_captured:
-                        structure.header_code.append(text)
-                    else:
-                        structure.top_level_code.append(text)
+            if child_range in captured_byte_ranges:
+                # Python runs top-level statements in source order. An import
+                # that follows executable code cannot be hoisted above it:
+                # `import sys; sys.path.insert(0, 'vendor'); import plugin`
+                # would import the plugin before the path update. Emit such
+                # imports in place with the rest of the top-level code.
+                if (
+                    language == CodeLanguage.PYTHON
+                    and saw_top_level_code
+                    and child.type in lang_config.import_nodes
+                ):
+                    entry = import_entries.get(child.start_byte)
+                    if entry is not None:
+                        structure.top_level_code.append(entry)
+                        demoted_import_starts.add(child.start_byte)
+                continue
+            # In Python a `;` between two statements on one physical line
+            # is a root-level anonymous token. Emitted as its own fragment
+            # it becomes a bare `;` line and invalidates the output.
+            if not child.is_named and child.type in (";", ","):
+                continue
+            text = _get_node_text(child, code).strip()
+            if text:
+                if first_captured is not None and child.end_byte <= first_captured:
+                    structure.header_code.append(text)
+                else:
+                    structure.top_level_code.append(text)
+                    saw_top_level_code = True
+
+        if demoted_import_starts:
+            # Python only: the import branch above is the sole producer of
+            # ``structure.imports`` entries for this language.
+            structure.imports = [
+                entry
+                for start, entry in import_entries.items()
+                if start not in demoted_import_starts
+            ]
 
         return structure
 
