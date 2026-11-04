@@ -5,6 +5,8 @@ import contextlib
 import http.server
 import json
 import logging
+import os
+import shutil
 import threading
 
 import pytest
@@ -110,11 +112,12 @@ def _compact_json(tmp_path):
     return path
 
 
-def test_read_tool_prices_files_in_tokens_not_words(fresh_store, tmp_path) -> None:
+def test_read_tool_prices_files_in_tokens_not_words(fresh_store, tmp_path, monkeypatch) -> None:
     """``headroom_read`` caches a token estimate and stores it as the entry's
     ``original_tokens``. It used to be ``len(content.split())`` — a word count
     in a token field, which is 1 for a single-line JSON document that is
     thousands of tokens long."""
+    monkeypatch.chdir(tmp_path)
     path = _compact_json(tmp_path)
     content = path.read_text(encoding="utf-8")
     server = mcp_server.HeadroomMCPServer(check_proxy=False)
@@ -126,9 +129,10 @@ def test_read_tool_prices_files_in_tokens_not_words(fresh_store, tmp_path) -> No
     assert estimated > len(content.split())
 
 
-def test_read_tool_cache_note_reports_tokens(fresh_store, tmp_path) -> None:
+def test_read_tool_cache_note_reports_tokens(fresh_store, tmp_path, monkeypatch) -> None:
     """The 'already in your context' note is read by the agent to decide whether
     to re-read the file, so its ``~N tokens`` figure has to be a token count."""
+    monkeypatch.chdir(tmp_path)
     path = _compact_json(tmp_path)
     content = path.read_text(encoding="utf-8")
     server = mcp_server.HeadroomMCPServer(check_proxy=False)
@@ -139,6 +143,205 @@ def test_read_tool_cache_note_reports_tokens(fresh_store, tmp_path) -> None:
 
     assert payload["status"] == "cached"
     assert f"~{EstimatingTokenCounter().count_text(content)} tokens" in payload["note"]
+
+
+# --- headroom_read workspace boundary (GHSA-8g49-pg6g-xgrf) -----------------
+# headroom_read is offered to the agent "INSTEAD of the built-in Read tool", so
+# it must not read where the harness's own Read rules would not: it reads only
+# under the server's working directory or HEADROOM_MCP_READ_ROOTS.
+
+
+@pytest.fixture
+def workspace_and_secret(tmp_path, monkeypatch):
+    workspace = tmp_path / "workspace"
+    private = tmp_path / "private"
+    workspace.mkdir()
+    private.mkdir()
+    secret = private / "secret.txt"
+    secret.write_text("TOP_SECRET\n", encoding="utf-8")
+    (workspace / "notes.txt").write_text("hello\n", encoding="utf-8")
+    monkeypatch.chdir(workspace)
+    monkeypatch.delenv("HEADROOM_MCP_READ_ROOTS", raising=False)
+    return workspace, secret
+
+
+def _read_text(server, file_path: str) -> str:
+    return asyncio.run(server._handle_read({"file_path": file_path, "fresh": True}))[0].kwargs[
+        "text"
+    ]
+
+
+@pytest.mark.parametrize(
+    "how", ["absolute", "dotdot", "symlink", "symlinked_dir", "sibling_prefix", "missing", "loop"]
+)
+def test_read_tool_refuses_files_outside_the_workspace(
+    fresh_store, workspace_and_secret, how
+) -> None:
+    workspace, secret = workspace_and_secret
+    if how == "absolute":
+        file_path = str(secret)
+    elif how == "dotdot":
+        file_path = "../private/secret.txt"
+    elif how == "symlink":
+        (workspace / "link.txt").symlink_to(secret)
+        file_path = str(workspace / "link.txt")
+    elif how == "symlinked_dir":
+        (workspace / "d").symlink_to(secret.parent)
+        file_path = "d/secret.txt"
+    elif how == "sibling_prefix":
+        # Same leading characters as the workspace, but a different directory.
+        sibling = workspace.parent / (workspace.name + "-evil")
+        sibling.mkdir()
+        (sibling / "secret.txt").write_text("TOP_SECRET\n", encoding="utf-8")
+        file_path = str(sibling / "secret.txt")
+    elif how == "missing":
+        # Same answer as for a file that exists: no existence oracle.
+        file_path = str(secret.parent / "does-not-exist.txt")
+    else:
+        loop = secret.parent / "loop"
+        loop.symlink_to(loop)
+        file_path = str(loop)
+    server = mcp_server.HeadroomMCPServer(check_proxy=False)
+
+    text = _read_text(server, file_path)
+
+    assert "TOP_SECRET" not in text
+    assert "outside the workspace" in json.loads(text)["error"]
+    assert server._file_cache == {}
+
+
+@pytest.mark.parametrize("start_in", ["filesystem_root", "home"])
+def test_read_tool_reads_nothing_from_root_or_home_without_roots(
+    fresh_store, workspace_and_secret, monkeypatch, start_in
+) -> None:
+    # GUI hosts launch MCP servers from `/`; a working-directory root there
+    # (or in $HOME) would cover ~/.ssh and everything else.
+    _, secret = workspace_and_secret
+    # Path.home(), not $HOME: Windows reads USERPROFILE, so only the former
+    # makes this directory the process home on every platform.
+    monkeypatch.setattr(mcp_server.Path, "home", lambda: secret.parent)
+    monkeypatch.chdir(secret.parent if start_in == "home" else secret.anchor)
+    server = mcp_server.HeadroomMCPServer(check_proxy=False)
+
+    text = _read_text(server, str(secret))
+
+    assert "TOP_SECRET" not in text
+    assert "HEADROOM_MCP_READ_ROOTS" in json.loads(text)["error"]
+
+
+def _swap_before_open(monkeypatch, swap) -> None:
+    """Run ``swap`` between the boundary check and the open, as a racing writer would."""
+    real_open = mcp_server._open_nofollow
+
+    def swap_then_open(path):
+        swap()
+        return real_open(path)
+
+    monkeypatch.setattr(mcp_server, "_open_nofollow", swap_then_open)
+
+
+def _read_text_promptly(server, file_path: str, fifo) -> str:
+    # A FIFO put in the way must not block the open. If the read is stuck,
+    # open the FIFO for writing to release it, then fail: the test ends in
+    # bounded time either way and leaves no worker thread behind.
+    result: list[str] = []
+    worker = threading.Thread(target=lambda: result.append(_read_text(server, file_path)))
+    worker.start()
+    worker.join(timeout=5)
+    if worker.is_alive():
+        with contextlib.suppress(OSError):
+            os.close(os.open(fifo, os.O_WRONLY | os.O_NONBLOCK))
+        worker.join(timeout=5)
+        pytest.fail(f"headroom_read blocked on the FIFO at {fifo}")
+    return result[0]
+
+
+@pytest.mark.parametrize("replaced", ["directory", "root"])
+def test_read_tool_refuses_a_symlink_swapped_in_after_the_check(
+    fresh_store, workspace_and_secret, monkeypatch, replaced
+) -> None:
+    # The boundary check and the open are separate steps. If a directory on
+    # the way, or the permitted root itself, is replaced by a symlink in
+    # between, the open must refuse it rather than follow it out.
+    workspace, secret = workspace_and_secret
+    (workspace / "data").mkdir()
+    (workspace / "data" / "report.txt").write_text("PUBLIC\n", encoding="utf-8")
+    (secret.parent / "report.txt").write_text("OUTSIDE_SECRET\n", encoding="utf-8")
+    if replaced == "directory":
+        file_path = "data/report.txt"
+
+        def swap():
+            shutil.rmtree(workspace / "data")
+            (workspace / "data").symlink_to(secret.parent)
+    else:
+        # Configure the workspace as a root instead of working in it: Windows
+        # cannot rename the process's working directory.
+        monkeypatch.setenv("HEADROOM_MCP_READ_ROOTS", str(workspace))
+        monkeypatch.chdir(workspace.parent)
+        (workspace / "report.txt").write_text("PUBLIC\n", encoding="utf-8")
+        file_path = str(workspace / "report.txt")
+
+        def swap():
+            workspace.rename(workspace.parent / "moved-away")
+            workspace.symlink_to(secret.parent, target_is_directory=True)
+
+    _swap_before_open(monkeypatch, swap)
+    server = mcp_server.HeadroomMCPServer(check_proxy=False)
+
+    text = _read_text(server, file_path)
+
+    assert "OUTSIDE_SECRET" not in text
+    assert "outside the workspace" in json.loads(text)["error"]
+    assert server._file_cache == {}
+
+
+@pytest.mark.skipif(not hasattr(os, "mkfifo"), reason="named pipes are POSIX")
+@pytest.mark.parametrize("where", ["target", "directory"])
+def test_read_tool_does_not_block_on_a_fifo(
+    fresh_store, workspace_and_secret, monkeypatch, where
+) -> None:
+    # Opening a FIFO for reading blocks until a writer appears; the read tool
+    # runs on the MCP event loop, so it must refuse one without waiting.
+    workspace, _ = workspace_and_secret
+    if where == "target":
+        fifo = workspace / "pipe"
+        os.mkfifo(fifo)
+        file_path = "pipe"
+    else:
+        (workspace / "data").mkdir()
+        (workspace / "data" / "report.txt").write_text("PUBLIC\n", encoding="utf-8")
+        file_path = "data/report.txt"
+        fifo = workspace / "data"
+
+        def swap():
+            shutil.rmtree(fifo)
+            os.mkfifo(fifo)
+
+        _swap_before_open(monkeypatch, swap)
+    server = mcp_server.HeadroomMCPServer(check_proxy=False)
+
+    text = _read_text_promptly(server, file_path, fifo)
+
+    assert "PUBLIC" not in text
+    assert json.loads(text)["error"].startswith(("Not a file", "File not found"))
+    assert server._file_cache == {}
+
+
+def test_read_tool_reads_inside_the_workspace(fresh_store, workspace_and_secret) -> None:
+    server = mcp_server.HeadroomMCPServer(check_proxy=False)
+
+    assert "hello" in _read_text(server, "notes.txt")
+
+
+def test_read_tool_reads_under_configured_roots(
+    fresh_store, workspace_and_secret, monkeypatch
+) -> None:
+    _, secret = workspace_and_secret
+    monkeypatch.setenv("HEADROOM_MCP_READ_ROOTS", str(secret.parent))
+    server = mcp_server.HeadroomMCPServer(check_proxy=False)
+
+    assert "TOP_SECRET" in _read_text(server, str(secret))
+    assert "outside the workspace" in _read_text(server, "notes.txt")
 
 
 def test_mcp_compress_surfaces_unreachable_proxy(fresh_store) -> None:
