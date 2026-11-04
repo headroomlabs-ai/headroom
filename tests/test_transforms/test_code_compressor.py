@@ -2291,3 +2291,27 @@ class TestRustAttributeAttachment:
         assert result.syntax_valid is True
         assert "#[inline]\npub fn record" in result.compressed
         assert not result.compressed.rstrip().endswith("#[inline]")
+
+    def test_attribute_attaches_through_detached_comment(self):
+        """A comment between an attribute and its item must not detach it."""
+        code = (
+            "pub struct Item { pub id: u64 }\n"
+            "\n"
+            "#[inline]\n"
+            "\n"
+            "// Keep with the function below.\n"
+            "\n"
+            "pub fn record(item: &Item, sink: &mut Vec<u64>) {\n"
+            "    sink.push(item.id);\n"
+            "    sink.push(item.id + 1);\n"
+            "    sink.push(item.id + 2);\n"
+            "    sink.push(item.id + 3);\n"
+            "}\n"
+        )
+
+        result = self._compressor().compress(code, language="rust")
+
+        assert result.compression_ratio < 1.0
+        assert result.syntax_valid is True
+        assert "#[inline]\npub fn record" in result.compressed
+        assert not result.compressed.rstrip().endswith("#[inline]")

@@ -2539,9 +2539,11 @@ def _get_leading_comment_text(
     declarations they decorate instead of staying attached.
 
     Comments only attach when there is no blank line before the node (or the
-    next sibling). Attributes always attach: Rust permits whitespace between an
-    outer attribute and the item it decorates, and detaching it produces
-    ``expected item after attributes`` at the end of the output.
+    next sibling). Attributes always attach: Rust permits whitespace and
+    comments between an outer attribute and the item it decorates, and
+    detaching it produces ``expected item after attributes`` at the end of the
+    output. Detached comments are skipped while scanning so an attribute
+    behind one is still reached, without capturing those comments.
     """
     preamble: list[Any] = []
     sibling = getattr(node, "prev_sibling", None)
@@ -2549,10 +2551,14 @@ def _get_leading_comment_text(
     while sibling is not None and (
         sibling.type in _COMMENT_NODE_TYPES or sibling.type in _ATTACHED_NODE_TYPES
     ):
-        if sibling.type in _COMMENT_NODE_TYPES and (anchor_row - sibling.end_point[0] > 1):
-            break
-        preamble.append(sibling)
-        anchor_row = sibling.start_point[0]
+        if sibling.type in _ATTACHED_NODE_TYPES:
+            preamble.append(sibling)
+            anchor_row = sibling.start_point[0]
+        elif anchor_row - sibling.end_point[0] <= 1:
+            preamble.append(sibling)
+            anchor_row = sibling.start_point[0]
+        # A detached comment is skipped, not fatal: an outer attribute behind
+        # it still decorates this node.
         sibling = getattr(sibling, "prev_sibling", None)
     if not preamble:
         return ""
