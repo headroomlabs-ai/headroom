@@ -233,6 +233,32 @@ def test_hook_deferral_reaches_body_headers_and_outcome(
     assert "turn_hook_tools_saved_tokens" not in tags
 
 
+def test_deferred_tokens_are_reported_beside_tokens_saved(
+    headroom_client, outcome_spy, deferral_hook
+) -> None:
+    """The answer carries the tool tokens deferral kept out of the context, so a
+    gateway can report the same headline as /stats."""
+    from headroom.proxy.tool_schema_savings_policy import headline_tokens_saved
+
+    outcomes = outcome_spy(headroom_client)
+    sent = _body(tools=_many_anthropic_tools(), gateway={})
+    data = compress(headroom_client, sent).json()
+    n_tok = _assert_deferred(data, sent["tools"])
+
+    assert data["tool_tokens_saved"] == n_tok
+    assert data["tool_tokens_deferred"] == n_tok
+    outcome = outcomes[-1]
+    assert data["tokens_saved"] + data["tool_tokens_saved"] == headline_tokens_saved(
+        outcome.tokens_saved, outcome.tags
+    )
+
+
+def test_no_deferral_reports_no_tool_tokens_saved(headroom_client) -> None:
+    data = compress(headroom_client, _body(tools=_many_anthropic_tools(), gateway={})).json()
+    assert data["tool_tokens_saved"] == 0
+    assert data["tool_tokens_deferred"] == 0
+
+
 def test_hook_header_without_client_value_is_just_the_hooks(headroom_client, deferral_hook) -> None:
     data = compress(headroom_client, _body(tools=_many_anthropic_tools(), gateway={})).json()
     assert data["headers"] == {"anthropic-beta": BETA_TOKEN}

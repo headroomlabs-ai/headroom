@@ -14,7 +14,8 @@ import { extractUserQuery, countTurns, extractToolCalls } from "./hooks.js";
  *
  * Accepts messages in any format: OpenAI, Anthropic, Vercel AI SDK, or Google Gemini.
  * Detects the format automatically, compresses via the proxy, and returns
- * compressed messages in the same format as the input.
+ * compressed messages in the same format as the input. Anthropic messages are
+ * sent to the proxy unconverted (it compresses Anthropic blocks natively).
  */
 export async function compress(
   messages: any[],
@@ -47,21 +48,26 @@ export async function compress(
   // 2. Detect input format
   const inputFormat = detectFormat(processedMessages);
 
-  // 3. Convert to OpenAI format (the proxy's lingua franca)
-  const openaiMessages = toOpenAI(processedMessages);
+  // 3. Shape the messages for the proxy. Anthropic messages go as-is: /v1/compress
+  //    compresses Anthropic content blocks natively, and converting them would drop
+  //    the thinking blocks Anthropic requires back unchanged, along with cache_control
+  //    markers and server-tool blocks. Every other format is converted to OpenAI
+  //    shape, the proxy's lingua franca.
+  const native = inputFormat === "anthropic";
+  const proxyMessages = native ? processedMessages : toOpenAI(processedMessages);
 
   // 4. Compute biases
   let biases: Record<number, number> = {};
   if (hooks) {
-    biases = await hooks.computeBiases(openaiMessages, ctx);
+    biases = await hooks.computeBiases(proxyMessages, ctx);
   }
 
   // 5. Compress via proxy
   const client = providedClient ?? new HeadroomClient(clientOptions);
-  const result = await client.compress(openaiMessages, { model, tokenBudget, config });
+  const result = await client.compress(proxyMessages, { model, tokenBudget, config });
 
   // 6. Convert compressed messages back to original format
-  const outputMessages = fromOpenAI(result.messages, inputFormat);
+  const outputMessages = native ? result.messages : fromOpenAI(result.messages, inputFormat);
 
   const finalResult: CompressResult = {
     ...result,

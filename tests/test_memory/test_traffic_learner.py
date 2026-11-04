@@ -18,10 +18,8 @@ from headroom.memory.traffic_learner import (
     TrafficLearner,
     _bash_binaries_match,
     _bash_first_binary,
-    _classify_error,
     _commands_related_as_retry,
     _drop_contradictions,
-    _is_error,
     _levenshtein,
     _load_persisted_patterns_from_sqlite,
     _normalize_bash_for_hash,
@@ -40,28 +38,145 @@ UTC = timezone.utc
 
 
 class TestErrorClassification:
-    def test_file_not_found(self):
-        assert _classify_error("No such file or directory: foo.py") == "file_not_found"
-        assert _classify_error("FileNotFoundError: [Errno 2]") == "file_not_found"
+    """The learner classifies tool output with the shared learn classifier."""
 
-    def test_command_not_found(self):
-        assert _classify_error("zsh: command not found: ruff") == "command_not_found"
+    @pytest.fixture
+    def learner(self):
+        return TrafficLearner(backend=None, user_id="test-user", min_evidence=1)
 
-    def test_module_not_found(self):
-        assert _classify_error("ModuleNotFoundError: No module named 'foo'") == "module_not_found"
+    @staticmethod
+    def _openai_result(learner: TrafficLearner, output: str) -> dict:
+        messages = [
+            {
+                "role": "assistant",
+                "tool_calls": [
+                    {"id": "c1", "function": {"name": "shell", "arguments": '{"command": "ls"}'}}
+                ],
+            },
+            {"role": "tool", "tool_call_id": "c1", "content": output},
+        ]
+        return learner.extract_tool_results_from_openai_messages(messages)[0]
 
-    def test_permission_denied(self):
-        assert _classify_error("Permission denied: /etc/shadow") == "permission_denied"
+    @pytest.mark.parametrize(
+        ("output", "is_error"),
+        [
+            # Successful shell commands from Codex/Grok/opencode end in "exit code 0".
+            ("Process exited with exit code 0\nall tests passed", False),
+            ("README.md\nsrc\nexit code 0", False),
+            # Nonzero exit codes and other exit-failure wording.
+            ("Exit code: 1\nWall time: 0.2s\nOutput:\nfail", True),
+            ("exit code 2", True),
+            ("Command failed with non-zero status 1", True),
+            ("process exited with status 1", True),
+            ("x" * 1500 + "\nexit code 3", True),
+            ("command terminated\nexit code -9", True),
+            ("Process exited with exit code -1", True),
+            # A zero wrapper status must not hide a separate failure.
+            ("worker exited with signal 9\nexit code 0", True),
+            ("child exit code 2\nwrapper exit code 0", True),
+            ("python train.py\nKilled\n", True),
+            # A successful command may print the word; exit code 0 then wins.
+            ("grep result:\nKilled\nexit code 0", False),
+            ("task killed by signal SIGKILL\nexit code 0", True),
+            # A bare Killed is an error even below the short-content cut-off,
+            # but a reported zero status wins over a printed "Killed".
+            ("Killed", True),
+            ("Killed\nexit code 0", False),
+            # The wrapper's zero status belongs to its own line.
+            ("worker exited with an error\nwrapper exit code 0", True),
+            # One status phrase wrapped across lines is still one zero status.
+            ("Process exited with\nexit code 0", False),
+            ("Killed: 9", True),
+            # Case-insensitive signals the shared is_error_content would miss.
+            ("zsh: no such file or directory: ./run.sh", True),
+            ("fatal: path 'x' does not exist in 'HEAD'", True),
+            ("open /etc/shadow: permission denied", True),
+            ("EACCES: permission denied, open '/x'", True),
+            ("Operation not permitted (EPERM) on /x", True),
+            ("File content exceeds maximum allowed tokens limit (25000)", True),
+            ("file is too large to read", True),
+            ("Exception: something broke badly", True),
+            ("context deadline exceeded while dialing", True),
+            ("x" * 1500 + "\nTraceback (most recent call last):\nValueError: late", True),
+            # Signals the old detector already caught.
+            ("No such file or directory: foo.py", True),
+            ("ModuleNotFoundError: No module named 'foo'", True),
+            ("zsh: command not found: ruff", True),
+            ("Tool call auto-denied by policy", True),
+            ("IndentationError: unexpected indent here", True),
+            ("TimeoutError: deadline exceeded after 30s", True),
+            ("Command timed out after 120s", True),
+            ("BUILD FAILED in 3s", True),
+            # Not errors.
+            ("All tests passed, everything is fine", False),
+            ("2 failed, 10 passed in 1.2s", False),
+            ("Checked 4 files, no errors found in output", False),
+            ("short", False),
+            ("", False),
+        ],
+    )
+    def test_error_detection(self, learner: TrafficLearner, output: str, is_error: bool):
+        assert self._openai_result(learner, output)["is_error"] is is_error
 
-    def test_not_an_error(self):
-        assert _classify_error("Everything is fine, tests passed!") is None
-        assert _classify_error("") is None
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("output", "category"),
+        [
+            ("No such file or directory: foo.py", "file_not_found"),
+            ("zsh: command not found: ruff", "command_not_found"),
+            ("ModuleNotFoundError: No module named 'foo'", "module_not_found"),
+            ("Permission denied: /etc/shadow", "permission_denied"),
+            ("TimeoutError: deadline exceeded after 30s", "timeout"),
+            ("ConnectionError: [Errno 111] Connection refused", "connection_error"),
+            ("task killed by signal SIGKILL", "exit_code"),
+            ("python train.py\nKilled", "exit_code"),
+            ("Killed: 9", "exit_code"),
+        ],
+    )
+    async def test_error_category_recorded(
+        self, learner: TrafficLearner, output: str, category: str
+    ):
+        await learner.on_tool_result(
+            tool_name="Bash", tool_input={"command": "x"}, tool_output=output, is_error=True
+        )
+        assert learner._tool_history[-1]["error_category"] == category
 
-    def test_is_error_helper(self):
-        assert _is_error("No such file or directory")
-        assert not _is_error("All tests passed")
-        assert not _is_error("")
-        assert not _is_error("short")
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("output", "is_error", "category"),
+        [
+            ("Killed", True, "exit_code"),
+            ("worker exited with an error\nwrapper exit code 0", True, "exit_code"),
+            ("Killed\nexit code 0", False, None),
+            ("README.md\nsrc\nexit code 0", False, None),
+            ("worker killed by signal SIGKILL\nwrapper exit code 0", True, "exit_code"),
+            ("command terminated\nexit code -9", True, "exit_code"),
+        ],
+    )
+    async def test_openai_result_recorded_through_on_tool_result(
+        self, learner: TrafficLearner, output: str, is_error: bool, category: str | None
+    ):
+        """End to end: the OpenAI extractor's verdict is what on_tool_result records."""
+        result = self._openai_result(learner, output)
+        await learner.on_tool_result(
+            tool_name=result["tool_name"],
+            tool_input=result["input"],
+            tool_output=result["output"],
+            is_error=result["is_error"],
+        )
+        recorded = learner._tool_history[-1]
+        assert recorded["is_error"] is is_error
+        assert recorded["error_category"] == category
+
+    @pytest.mark.asyncio
+    async def test_success_has_no_error_category(self, learner: TrafficLearner):
+        await learner.on_tool_result(
+            tool_name="Bash",
+            tool_input={"command": "x"},
+            tool_output="Everything is fine, tests passed!",
+            is_error=False,
+        )
+        assert learner._tool_history[-1]["error_category"] is None
 
 
 # =============================================================================
@@ -1572,6 +1687,38 @@ class TestHydrateEdgeCases:
         assert learner._persisted_ids == {}
 
     @pytest.mark.asyncio
+    async def test_unreadable_db_warns_on_hydration(self, tmp_path):
+        """A memory.db that cannot be read must say so; a missing one stays quiet."""
+        import logging
+
+        records: list[logging.LogRecord] = []
+
+        class _Collect(logging.Handler):
+            def emit(self, record: logging.LogRecord) -> None:
+                records.append(record)
+
+        handler = _Collect(level=logging.DEBUG)
+        logger = logging.getLogger("headroom.memory.traffic_learner")
+        logger.addHandler(handler)
+        try:
+            await TrafficLearner(
+                backend=_FakeBackend(tmp_path / "not-there.db"), min_evidence=1
+            )._hydrate_persisted_state()
+            assert [r for r in records if r.levelno >= logging.WARNING] == []
+
+            bad = tmp_path / "memory.db"
+            bad.write_bytes(b"this is not a sqlite database" * 100)
+            learner = TrafficLearner(backend=_FakeBackend(bad), min_evidence=1)
+            await learner._hydrate_persisted_state()
+            warnings = [r for r in records if r.levelno == logging.WARNING]
+            assert len(warnings) == 1
+            assert "hydrate" in warnings[0].getMessage()
+            assert str(bad) in warnings[0].getMessage()
+            assert learner._saved_hashes == set()
+        finally:
+            logger.removeHandler(handler)
+
+    @pytest.mark.asyncio
     async def test_hydration_is_bounded_to_dedup_window(self, tmp_path):
         """A persisted history larger than dedup_window must not start the
         in-memory dedup maps oversized. Hydration keeps at most dedup_window
@@ -2771,3 +2918,98 @@ class TestPendingStatePersistence:
         await second.start()
         assert second.get_stats()["pending_patterns"] == 0
         await second.stop()
+
+
+def test_long_commands_skip_the_quadratic_edit_distance(monkeypatch):
+    """#4367: commands past the cap are judged without _levenshtein."""
+    import headroom.memory.traffic_learner as tl
+
+    real = tl._levenshtein
+
+    def _guarded(a, b):
+        # binary-name matching may still use it on short names
+        if max(len(a), len(b)) > tl._RETRY_EDIT_DISTANCE_MAX_CHARS:
+            raise AssertionError("edit distance computed on an oversized command")
+        return real(a, b)
+
+    monkeypatch.setattr(tl, "_levenshtein", _guarded)
+    body = "x" * (tl._RETRY_EDIT_DISTANCE_MAX_CHARS + 1)
+    # shared substantive token -> still related, via the linear path
+    assert tl._commands_related_as_retry(f"python {body} run", f"python3 {body} run")
+    # no shared substantive token -> unrelated
+    assert not tl._commands_related_as_retry(f"python {body}", "python other.py")
+
+
+def test_short_commands_still_use_edit_distance():
+    """Commands within the cap keep the existing edit-distance behaviour."""
+    assert _commands_related_as_retry("cargo build", "cargo build --release")
+
+
+def _record_oversized_levenshtein(monkeypatch):
+    """Wrap _levenshtein and record every call on an input past the cap."""
+    import headroom.memory.traffic_learner as tl
+
+    real = tl._levenshtein
+    oversized: list[tuple[int, int]] = []
+
+    def _recording(a, b):
+        if max(len(a), len(b)) > tl._RETRY_EDIT_DISTANCE_MAX_CHARS:
+            oversized.append((len(a), len(b)))
+        return real(a, b)
+
+    monkeypatch.setattr(tl, "_levenshtein", _recording)
+    return oversized
+
+
+def test_oversized_first_token_skips_the_quadratic_edit_distance(monkeypatch):
+    """Review of #4371: a long executable token must not reach _levenshtein either."""
+    import headroom.memory.traffic_learner as tl
+
+    oversized = _record_oversized_levenshtein(monkeypatch)
+    head = "x" * 2000
+    # the first tokens (2000 and 2001 chars) are prefix-related; "execute" is shared
+    assert tl._commands_related_as_retry(f"{head} execute", f"{head}3 execute")
+    assert tl._bash_binaries_match(head, f"{head}3")
+    assert not tl._bash_binaries_match(head, f"{head}333")
+    assert oversized == []
+
+
+def test_short_binary_names_keep_the_prefix_tolerance():
+    assert _bash_binaries_match("python", "python3")
+    assert _bash_binaries_match("python3", "python")
+    assert _bash_binaries_match("python", "python32")
+    assert not _bash_binaries_match("python", "python321")
+    assert not _bash_binaries_match("pyth", "python3")
+
+
+@pytest.mark.asyncio
+async def test_oversized_first_token_through_on_tool_result(monkeypatch):
+    """Same case through the entry point the proxy handlers await."""
+    oversized = _record_oversized_levenshtein(monkeypatch)
+    learner = TrafficLearner(backend=None, user_id="test-user", min_evidence=1)
+    head = "x" * 2000
+    await learner.on_tool_result(
+        tool_name="Bash",
+        tool_input={"command": f"{head} execute"},
+        tool_output="Error: execute failed with status 2",
+        is_error=True,
+    )
+    await learner.on_tool_result(
+        tool_name="Bash",
+        tool_input={"command": f"{head}3 execute"},
+        tool_output="done",
+        is_error=False,
+    )
+    assert oversized == []
+    assert learner.get_stats()["patterns_extracted"] >= 1
+
+
+def test_oversized_path_basename_skips_the_quadratic_edit_distance(monkeypatch):
+    """The file-path typo check runs the same edit distance on traffic basenames."""
+    import headroom.memory.traffic_learner as tl
+
+    oversized = _record_oversized_levenshtein(monkeypatch)
+    name = "y" * 2000
+    assert not tl._paths_related_as_typo(f"/a/{name}.rs", f"/a/{name}x.rs")
+    assert tl._paths_related_as_typo("/a/staet.rs", "/a/state.rs")
+    assert oversized == []
