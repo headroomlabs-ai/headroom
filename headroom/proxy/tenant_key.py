@@ -245,26 +245,6 @@ def _get_header(request: Any, name: str) -> str:
     return str(value)
 
 
-def _get_auth_mode_str(request: Any) -> str:
-    """Read ``request.state.auth_mode`` as a string, or ``""`` if unset.
-
-    F1 set this to an :class:`AuthMode` enum (a ``str`` subclass) on
-    every request. We don't import ``AuthMode`` here to keep this
-    module independent of the classifier — we only need the string
-    value, and the enum's ``str`` parent serializes transparently.
-    """
-    state = getattr(request, "state", None)
-    if state is None:
-        return ""
-    auth_mode = getattr(state, "auth_mode", None)
-    if auth_mode is None:
-        return ""
-    # AuthMode subclasses str so ``str(auth_mode)`` returns the enum
-    # name's value (``"payg"`` / ``"oauth"`` / ``"subscription"``) —
-    # not the Python repr.
-    return str(auth_mode)
-
-
 def _sanitize_tenant_key(raw: str) -> str:
     """Sanitize a tenant_key candidate. Returns ``""`` on rejection.
 

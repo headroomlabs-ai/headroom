@@ -7,6 +7,7 @@ import hashlib
 import json
 import re
 import uuid
+import warnings
 from datetime import datetime, timezone
 from typing import Any
 
@@ -43,7 +44,18 @@ def fast_hash(data: str | bytes, length: int = 16) -> str:
 
     Uses MD5 (2-3x faster than SHA256).  Not used for security — only for
     content-addressable lookups in compression caches, prefix tracking, etc.
+
+    .. deprecated::
+        Use ``hashlib.md5(data).hexdigest()[:length]``, encoding ``str``
+        input as UTF-8 first. For ``str`` input and the default length,
+        :func:`headroom.parser.compute_hash` returns the same value.
     """
+    warnings.warn(
+        "fast_hash is deprecated and will be removed in a future release; "
+        "use hashlib.md5(data).hexdigest()[:length], encoding str input as UTF-8 first.",
+        DeprecationWarning,
+        stacklevel=2,
+    )
     if isinstance(data, str):
         data = data.encode("utf-8")
     return hashlib.md5(data).hexdigest()[:length]  # nosec B324
@@ -165,14 +177,34 @@ def create_tool_digest_marker(original_hash: str) -> str:
 
 
 def create_dropped_context_marker(reason: str, count: int | None = None) -> str:
-    """Create marker for dropped context."""
+    """Create marker for dropped context.
+
+    .. deprecated::
+        Use :func:`create_marker` with ``"dropped_context"``.
+    """
+    warnings.warn(
+        "create_dropped_context_marker is deprecated and will be removed in a future release; "
+        "use create_marker('dropped_context', ...) instead.",
+        DeprecationWarning,
+        stacklevel=2,
+    )
     if count is not None:
         return create_marker("dropped_context", reason=reason, count=str(count))
     return create_marker("dropped_context", reason=reason)
 
 
 def create_truncated_marker(original_length: int, truncated_to: int) -> str:
-    """Create marker for truncated content."""
+    """Create marker for truncated content.
+
+    .. deprecated::
+        Use :func:`create_marker` with ``"truncated"``.
+    """
+    warnings.warn(
+        "create_truncated_marker is deprecated and will be removed in a future release; "
+        "use create_marker('truncated', ...) instead.",
+        DeprecationWarning,
+        stacklevel=2,
+    )
     return create_marker(
         "truncated",
         original=str(original_length),
@@ -186,7 +218,16 @@ def extract_markers(text: str) -> list[dict[str, Any]]:
 
     Returns:
         List of dicts with marker_type and attributes.
+
+    .. deprecated::
+        It has no replacement.
     """
+    warnings.warn(
+        "extract_markers is deprecated and will be removed in a future release; "
+        "it has no replacement.",
+        DeprecationWarning,
+        stacklevel=2,
+    )
     pattern = re.compile(r"<headroom:(\w+)([^>]*)>")
     markers = []
 
@@ -215,7 +256,16 @@ def safe_json_loads(text: str) -> tuple[Any | None, bool]:
 
     Returns:
         Tuple of (parsed_result or None, success_bool).
+
+    .. deprecated::
+        Call :func:`json.loads` and catch :class:`ValueError`.
     """
+    warnings.warn(
+        "safe_json_loads is deprecated and will be removed in a future release; "
+        "call json.loads and catch ValueError instead.",
+        DeprecationWarning,
+        stacklevel=2,
+    )
     try:
         return json.loads(text), True
     except (json.JSONDecodeError, ValueError):
@@ -232,7 +282,17 @@ def safe_json_dumps(obj: Any, **kwargs: Any) -> str:
 
     Returns:
         JSON string.
+
+    .. deprecated::
+        Call :func:`json.dumps` with ``ensure_ascii=False`` and
+        ``separators=(",", ":")``.
     """
+    warnings.warn(
+        "safe_json_dumps is deprecated and will be removed in a future release; "
+        "call json.dumps(obj, ensure_ascii=False, separators=(',', ':')) instead.",
+        DeprecationWarning,
+        stacklevel=2,
+    )
     kwargs.setdefault("ensure_ascii", False)
     kwargs.setdefault("separators", (",", ":"))  # Compact by default
     return json.dumps(obj, **kwargs)
@@ -278,3 +338,32 @@ def deep_copy_messages(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
     serialisation overhead on large conversation histories).
     """
     return copy.deepcopy(messages)
+
+
+def strip_streaming_only_content_fields_in_place(messages: Any) -> None:
+    """Remove streaming-only ``index`` keys from request content blocks, in place.
+
+    Shared in-place canonicalizer used right after the shared body readers
+    parse a request (the Anthropic handler has a private copy of this walk).
+    ``index`` is a field some providers emit on streaming RESPONSE content-block
+    deltas; it is not part of the request-message schema, so forwarding it
+    upstream triggers a 400 that aborts multi-turn sessions once a client
+    echoes a reconstructed assistant turn back. Stripping it before any
+    deepcopy / prefix recording keeps every derived copy identical. Nested
+    tool_result content lists are walked too.
+    """
+    if not isinstance(messages, list):
+        return
+    for message in messages:
+        if isinstance(message, dict):
+            _strip_index_from_content_blocks_in_place(message.get("content"))
+
+
+def _strip_index_from_content_blocks_in_place(content: Any) -> None:
+    if not isinstance(content, list):
+        return
+    for block in content:
+        if isinstance(block, dict):
+            block.pop("index", None)
+            # tool_result blocks nest their own content list of blocks.
+            _strip_index_from_content_blocks_in_place(block.get("content"))

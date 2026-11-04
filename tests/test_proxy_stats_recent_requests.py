@@ -277,3 +277,50 @@ def test_stats_preserves_default_smart_crusher_compaction_state() -> None:
 
     assert response.status_code == 200
     assert response.json()["config"]["smart_crusher_with_compaction"] is None
+
+
+def _read_maturation_app(mode: str, quiesce_turns: int = 5):
+    return create_app(
+        ProxyConfig(
+            mode=mode,
+            read_maturation=True,
+            read_maturation_quiesce_turns=quiesce_turns,
+            optimize=False,
+            cache_enabled=False,
+            rate_limit_enabled=False,
+            cost_tracking_enabled=False,
+            log_requests=False,
+            ccr_inject_tool=False,
+            ccr_handle_responses=False,
+            ccr_context_tracking=False,
+            http2=False,
+        )
+    )
+
+
+@pytest.mark.parametrize(
+    ("mode", "quiesce_turns", "effective", "startup_level"),
+    [
+        ("cache", 5, False, "WARNING"),
+        ("token", 5, True, "INFO"),
+        # A zero threshold matures a Read in the still-mutable latest turn.
+        ("cache", 0, True, "INFO"),
+    ],
+)
+def test_read_maturation_reports_whether_it_can_fire(
+    mode, quiesce_turns, effective, startup_level, caplog
+):
+    """Cache mode freezes a Read before it can quiesce, so enabled maturation
+    never fires there; startup and /stats must say so instead of reporting a
+    silently inert feature as on."""
+    app = _read_maturation_app(mode, quiesce_turns)
+
+    with caplog.at_level("INFO", logger="headroom.proxy"):
+        with TestClient(app, base_url="http://127.0.0.1", client=("127.0.0.1", 12345)) as client:
+            payload = client.get("/stats").json()["read_maturation"]
+
+    assert payload["enabled"] is True
+    assert payload["effective"] is effective
+    assert (payload["inert_reason"] is None) is effective
+    banner = [r for r in caplog.records if r.getMessage().startswith("Read maturation:")]
+    assert [r.levelname for r in banner] == [startup_level]
