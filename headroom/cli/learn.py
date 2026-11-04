@@ -755,9 +755,7 @@ def _run_verbosity(
         # Seed the savings baseline: replace baseline, preserve any live
         # treatment/control already accumulated.
         ledger_path = ws / "output_savings.json"
-        ledger = SavingsLedger.load(ledger_path)
-        ledger.baseline = aggregated
-        ledger.save(ledger_path)
+        SavingsLedger.store_baseline(ledger_path, aggregated)
         click.echo(f"\n  [WROTE] {ws / 'verbosity.json'} (level {best_profile.level})")
         click.echo(
             f"  [WROTE] {ledger_path} (baseline: {aggregated.total_samples} samples, "

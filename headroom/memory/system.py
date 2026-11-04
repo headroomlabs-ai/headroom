@@ -8,6 +8,7 @@ function-calling LLMs.
 
 from __future__ import annotations
 
+import inspect
 import logging
 from typing import Any, Protocol, runtime_checkable
 
@@ -16,6 +17,38 @@ from headroom.memory.ports import MemorySearchResult
 from headroom.memory.tools import MEMORY_TOOLS, MEMORY_TOOLS_OPTIMIZED
 
 logger = logging.getLogger(__name__)
+
+
+def _accepts_kwarg(func: Any, name: str) -> bool:
+    """Return True if `func` accepts `name` as a keyword argument."""
+    try:
+        params = inspect.signature(func).parameters
+    except (TypeError, ValueError):
+        # Uninspectable callable: let the call itself decide.
+        return True
+    if any(p.kind is inspect.Parameter.VAR_KEYWORD for p in params.values()):
+        return True
+    return name in params
+
+
+def _filter_supported_kwargs(func: Any, kwargs: dict[str, Any]) -> dict[str, Any]:
+    """Drop keyword arguments the callable's signature does not accept.
+
+    Python raises a binding ``TypeError`` before the callable runs, but from the
+    outside it is indistinguishable from a ``TypeError`` raised *inside* a
+    backend that has already persisted a record. Deciding field support by
+    calling and retrying can therefore save the memory twice, so unsupported
+    fields must be filtered out before the call. Backends that take ``**kwargs``
+    (or whose signature cannot be inspected) receive every field and decide for
+    themselves.
+    """
+    try:
+        params = inspect.signature(func).parameters
+    except (TypeError, ValueError):
+        return kwargs
+    if any(p.kind is inspect.Parameter.VAR_KEYWORD for p in params.values()):
+        return kwargs
+    return {k: v for k, v in kwargs.items() if k in params}
 
 
 # =============================================================================
@@ -347,7 +380,10 @@ class MemorySystem:
             save_kwargs["extracted_entities"] = extracted_entities
         if extracted_relationships is not None:
             save_kwargs["extracted_relationships"] = extracted_relationships
-        if background is not None:
+        # Only pass `background` to backends that accept it. Sending it to a
+        # backend without the parameter would raise TypeError before the save
+        # runs, losing the pre-extracted payload with it.
+        if background is not None and _accepts_kwarg(self._backend.save_memory, "background"):
             save_kwargs["background"] = background
 
         # Log optimization usage
@@ -355,21 +391,22 @@ class MemorySystem:
         if has_pre_extraction:
             logger.info("Using pre-extracted data for optimized storage")
 
-        # Save the memory
-        try:
-            memory = await self._backend.save_memory(**save_kwargs)
-        except TypeError:
-            # Backend doesn't support pre-extraction fields, use basic call
-            logger.debug("Backend doesn't support pre-extraction, falling back to basic save")
-            memory = await self._backend.save_memory(
-                content=content,
-                user_id=self._user_id,
-                importance=importance,
-                entities=entities,
-                relationships=relationships,
-                session_id=self._session_id,
-                metadata=metadata,
-            )
+        # Save the memory. Field support is resolved from the backend's
+        # signature before the call, never by trial and error: a TypeError from
+        # argument binding happens before the backend runs, but one raised
+        # inside the backend may come after it already wrote the record, and
+        # the two cannot be told apart afterwards. A failed save is therefore
+        # never replayed — an internal TypeError propagates to the caller.
+        pre_keys = [
+            k
+            for k in ("facts", "extracted_entities", "extracted_relationships")
+            if k in save_kwargs
+        ]
+        save_kwargs = _filter_supported_kwargs(self._backend.save_memory, save_kwargs)
+        pre_extraction_persisted = bool(pre_keys) and all(k in save_kwargs for k in pre_keys)
+        if pre_keys and not pre_extraction_persisted:
+            logger.debug("Backend doesn't support pre-extraction fields, sending basic fields only")
+        memory = await self._backend.save_memory(**save_kwargs)
 
         logger.info(f"Saved memory {memory.id}: {content[:50]}...")
 
@@ -383,9 +420,16 @@ class MemorySystem:
 
         # Include optimization info if pre-extraction was used
         if has_pre_extraction:
-            result["optimized"] = True
-            if facts:
-                result["fact_count"] = len(facts)
+            if pre_extraction_persisted:
+                result["optimized"] = True
+                if facts:
+                    result["fact_count"] = len(facts)
+            else:
+                # The fallback dropped the pre-extracted payload; report what
+                # was actually stored instead of the facts we were handed.
+                result["optimized"] = False
+                result["facts_stored"] = False
+                result["fact_count"] = 0
 
         # Include async/background info if save was async
         if memory.metadata and memory.metadata.get("_async"):
