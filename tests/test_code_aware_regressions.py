@@ -114,7 +114,7 @@ def test_content_router_code_aware_token_accounting_matches_router_estimate() ->
     router = ContentRouter(ContentRouterConfig(enable_code_aware=True))
     router._code_compressor = _FakeCodeCompressor(compressed_text)
 
-    compressed, compressed_tokens, strategy_chain = router._apply_strategy_to_content(
+    compressed, compressed_tokens, strategy_chain, _reversible = router._apply_strategy_to_content(
         original, CompressionStrategy.CODE_AWARE, context=""
     )
 
