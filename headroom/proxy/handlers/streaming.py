@@ -928,6 +928,9 @@ class StreamingMixin:
             import copy as _copy
 
             forwarded_messages = body.get("messages", [])
+            strip_expansion = getattr(self, "_without_proactive_expansion_messages", None)
+            if callable(strip_expansion) and provider == "anthropic":
+                forwarded_messages = strip_expansion(forwarded_messages)
             if not forwarded_messages and provider == "gemini":
                 # Gemini bodies carry contents[] rather than messages[] (Cloud
                 # Code Assist nests the payload under body["request"]).
@@ -2267,6 +2270,9 @@ class StreamingMixin:
                         if optimized_messages is not None
                         else body.get("messages", [])
                     )
+                    strip_expansion = getattr(self, "_without_proactive_expansion_messages", None)
+                    if callable(strip_expansion) and provider == "anthropic":
+                        tracker_messages = strip_expansion(tracker_messages)
                     next_forwarded = _copy.deepcopy(tracker_messages)
                     next_original = _copy.deepcopy(original_messages or tracker_messages)
                     if full_sse_bytes:
