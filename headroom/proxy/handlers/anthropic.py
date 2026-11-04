@@ -1651,7 +1651,9 @@ class AnthropicHandlerMixin:
             # it was looked up by — the cache would never hit and would fill with
             # unreachable entries. Reuse this raw snapshot verbatim at cache.set
             # (the same reason cache_key_fields is snapshotted here, #327).
-            cache_lookup_messages = messages
+            cache_lookup_messages = (
+                copy.deepcopy(messages) if self.cache and not stream else messages
+            )
             # Response-cache partition: a cached response is only ever replayed to a
             # caller presenting the same provider credentials and principal (01-F15).
             # Snapshotted with the key fields so lookup and store agree. None means
@@ -1858,11 +1860,31 @@ class AnthropicHandlerMixin:
             # parallel sub-calls commonly share model+system+history while
             # carrying different tool sets.  Sharing one tracker across those
             # requests pins cache reads at the early tools segment (#2671).
-            from headroom.cache.prefix_tracker import segment_fingerprint
+            # Deferred tools are not in that key, so a ToolSearch load that
+            # appends one keeps the conversation's lineage, but only where they
+            # reach the provider still deferred. A third-party upstream gets
+            # them eagerly (the tool-search downgrade below uses this same
+            # predicate) and so does a translating backend; there a load does
+            # change the provider's key, and the key here counts them.
+            from headroom.cache.prefix_tracker import cache_key_tools, segment_fingerprint
+            from headroom.proxy.helpers import anthropic_first_party_tool_search_supported
 
+            _anthropic_target_base_url = upstream_base_url or self.ANTHROPIC_API_URL
+            _third_party_anthropic_upstream = provider_name == "anthropic" and (
+                not anthropic_first_party_tool_search_supported(_anthropic_target_base_url)
+            )
             affinity_tools = self._tools_for_forwarding(
                 body.get("tools"), preserve_order=preserve_tool_order
             )
+            from headroom.proxy import runtime_env
+
+            if (
+                not _third_party_anthropic_upstream
+                and getattr(self, "anthropic_backend", None) is None
+                and runtime_env.getenv("HEADROOM_DEFERRED_TOOL_AFFINITY", "1").strip().lower()
+                not in ("0", "false", "no", "off")
+            ):
+                affinity_tools = cache_key_tools(affinity_tools)
             cache_affinity = segment_fingerprint(
                 {
                     "model": model,
@@ -2730,9 +2752,14 @@ class AnthropicHandlerMixin:
                             prefix_tracker.restored_maturation_state = None
                             maturation_mgr.restore_state(state)
                     _maturation_mgr = maturation_mgr
+                    # Never below the floor finalize_turn just replayed: the
+                    # pipeline's freeze is clamped to what the local compression
+                    # cache can byte-replay, which stops at the first tool_result
+                    # it never stored, so on its own it lets a cached Read mature
+                    # and re-write the provider cache from that Read onward.
                     maturation = maturation_mgr.apply(
                         optimized_messages,
-                        frozen_message_count=frozen_message_count,
+                        frozen_message_count=max(frozen_message_count, _confirmed_frozen),
                     )
                     if maturation.replacements_applied or maturation.holding_msg_indices:
                         optimized_messages = maturation.messages
@@ -3021,7 +3048,10 @@ class AnthropicHandlerMixin:
                                 )
 
             # Traffic Learner: Extract patterns from inbound tool results
-            if self.traffic_learner:
+            if self.traffic_learner and not (
+                self.memory_handler
+                and self.memory_handler.is_project_unresolved(memory_request_ctx)
+            ):
                 try:
                     # Wire backend on first use (lazy init after memory handler is ready)
                     if (
@@ -3051,7 +3081,7 @@ class AnthropicHandlerMixin:
 
             # Memory: Inject context and tools — gated on MemoryDecision.
             # ``inject`` is False under bypass, missing handler, missing
-            # user_id, or HEADROOM_MEMORY_INJECTION_MODE in disabled/tool.
+            # user_id, or HEADROOM_MEMORY_INJECTION_MODE=disabled.
             # Pre-PR-this the gate was a raw conjunction that silently
             # ignored bypass; now bypass is honoured here on Anthropic
             # /v1/messages just as on /v1/responses.
@@ -3061,8 +3091,21 @@ class AnthropicHandlerMixin:
             # streaming path withholds their calls from the client.
             server_memory_tool_names: frozenset[str] = frozenset()
             if memory_decision.inject:
+                if self.memory_handler.config.inject_context and is_cache_mode(self.config.mode):
+                    # Cache mode never injects context, so the next-turn prefix
+                    # bytes stay byte-equal to this turn's bytes. Skip the search
+                    # too: its result could only be discarded (#4600).
+                    from headroom.proxy.helpers import log_memory_injection
+
+                    log_memory_injection(
+                        request_id=request_id,
+                        session_id=session_id,
+                        decision="skipped_cache_mode",
+                        bytes_injected=0,
+                        query=extract_user_query(optimized_messages) or "",
+                    )
                 # Search and inject memory context
-                if self.memory_handler.config.inject_context:
+                elif self.memory_handler.config.inject_context:
                     try:
                         async with stage_timer.measure("memory_context"):
                             memory_context = await asyncio.wait_for(
@@ -3097,16 +3140,6 @@ class AnthropicHandlerMixin:
                                     request_id=request_id,
                                     session_id=session_id,
                                     decision="skipped_disabled",
-                                    bytes_injected=0,
-                                    query=user_query,
-                                )
-                            elif is_cache_mode(self.config.mode):
-                                # Cache mode: skip injection entirely so the next-turn
-                                # prefix bytes remain byte-equal to this turn's bytes.
-                                log_memory_injection(
-                                    request_id=request_id,
-                                    session_id=session_id,
-                                    decision="skipped_cache_mode",
                                     bytes_injected=0,
                                     query=user_query,
                                 )
@@ -3435,14 +3468,10 @@ class AnthropicHandlerMixin:
                 tokens_saved = max(0, original_tokens - optimized_tokens)
 
             from headroom.proxy.helpers import (
-                anthropic_first_party_tool_search_supported,
                 strip_first_party_tool_search_tools_for_third_party_upstream,
             )
 
-            _anthropic_target_base_url = upstream_base_url or self.ANTHROPIC_API_URL
-            _third_party_anthropic_upstream = provider_name == "anthropic" and (
-                not anthropic_first_party_tool_search_supported(_anthropic_target_base_url)
-            )
+            # _third_party_anthropic_upstream is decided before the lineage key.
             if _third_party_anthropic_upstream:
                 _tools_before_strip = body.get("tools")
                 _tools_after_strip = strip_first_party_tool_search_tools_for_third_party_upstream(
