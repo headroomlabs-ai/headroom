@@ -157,3 +157,22 @@ def test_recput_of_below_min_key_never_admits_and_never_evicts() -> None:
     assert cache._counts == {"aaaaaaaaaa-1": 10}
     cache.put("x", 5)  # re-put: still no admission, no eviction
     assert cache._counts == {"aaaaaaaaaa-1": 10}
+
+
+def test_oversized_text_is_not_cached() -> None:
+    cache = TokenCountCache(min_chars=1, max_chars=10)
+    cache.put("x" * 20, 5)
+    assert cache.get("x" * 20) is None
+
+
+def test_warm_entry_survives_oversized_put() -> None:
+    cache = TokenCountCache(min_chars=1, max_chars=10)
+    cache.put("warm", 7)
+    cache.put("x" * 20, 5)
+    assert cache.get("warm") == 7
+
+
+def test_text_of_exactly_max_chars_is_admitted() -> None:
+    cache = TokenCountCache(min_chars=1, max_chars=10)
+    cache.put("x" * 10, 5)
+    assert cache.get("x" * 10) == 5
