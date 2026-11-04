@@ -20,9 +20,7 @@ Precedence (highest first):
   2. ``no_handler`` — no memory backend configured
   3. ``no_user_id`` — per-request user_id missing
   4. ``mode_disabled`` — operator HEADROOM_MEMORY_INJECTION_MODE=disabled
-  5. ``mode_tool`` — operator HEADROOM_MEMORY_INJECTION_MODE=tool
-     (auto-inject off; the agent calls memory tools explicitly)
-  6. otherwise → ``inject=True``
+  5. otherwise → ``inject=True``
 
 This module exposes one value type + one factory + one helper. Pure
 function; same Rust-port shape as :class:`CompressionDecision`.
@@ -59,7 +57,6 @@ class MemoryDecision:
     #   * "no_handler"     — no memory backend configured on the proxy
     #   * "no_user_id"     — per-request user_id missing
     #   * "mode_disabled"  — operator HEADROOM_MEMORY_INJECTION_MODE=disabled
-    #   * "mode_tool"      — operator HEADROOM_MEMORY_INJECTION_MODE=tool
     # When ``inject`` is True, this is None.
     skip_reason: str | None
 
