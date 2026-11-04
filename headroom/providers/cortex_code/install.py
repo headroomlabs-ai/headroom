@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from headroom.providers._setup_text import project_attribution_lines
+
 from .runtime import build_launch_env, proxy_base_url
 
 
@@ -20,11 +22,4 @@ def render_setup_lines(port: int, project: str | None = None) -> list[str]:
         "  Set the following environment variable before launching cortex:",
     ]
     lines += [f"    {line}" for line in env_lines]
-    if project:
-        lines += [
-            "",
-            f"  Dashboard savings will be attributed to project '{project}'",
-            "  (the directory this command was run from). Re-run from another",
-            "  project directory to get that project's URL.",
-        ]
-    return lines
+    return lines + project_attribution_lines(project)

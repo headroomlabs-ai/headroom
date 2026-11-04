@@ -801,7 +801,7 @@ class TestHandlerPassesServerMemoryTools:
         captured: dict[str, Any] = {}
 
         async def fake_stream_response(*args: Any, **kwargs: Any) -> StreamingResponse:
-            captured.update(kwargs)
+            captured.update(kwargs, body=args[2])
 
             async def gen() -> Any:
                 yield b""
@@ -838,6 +838,85 @@ class TestHandlerPassesServerMemoryTools:
             )
 
         assert captured["server_memory_tool_names"] == MEMORY_TOOLS
+        assert MEMORY_TOOLS <= {t["name"] for t in captured["body"]["tools"]}
+
+    @pytest.mark.parametrize("after_buffered_turn", [False, True])
+    def test_streamed_openai_chat_gets_no_memory_tools(self, after_buffered_turn: bool) -> None:
+        from types import SimpleNamespace
+
+        from fastapi.responses import StreamingResponse
+        from fastapi.testclient import TestClient
+
+        from headroom.proxy.server import ProxyConfig, create_app
+
+        config = ProxyConfig(
+            optimize=False,
+            cache_enabled=False,
+            rate_limit_enabled=False,
+            cost_tracking_enabled=False,
+            log_requests=False,
+            ccr_inject_tool=False,
+            ccr_handle_responses=False,
+            ccr_context_tracking=False,
+            image_optimize=False,
+        )
+        captured: dict[str, Any] = {}
+
+        async def fake_stream_response(url: str, headers: Any, body: Any, *a: Any, **kw: Any):
+            captured["body"] = body
+
+            async def gen() -> Any:
+                yield b""
+
+            return StreamingResponse(gen(), media_type="text/event-stream")
+
+        memory_tools = [
+            {
+                "type": "function",
+                "function": {"name": name, "description": name, "parameters": {}},
+            }
+            for name in sorted(MEMORY_TOOLS)
+        ]
+        from headroom.proxy.helpers import (
+            _reset_session_tool_tracker_for_test,
+            apply_session_sticky_memory_tools,
+        )
+
+        _reset_session_tool_tracker_for_test()
+        with TestClient(create_app(config)) as client:
+            proxy = client.app.state.proxy
+            proxy.memory_handler = SimpleNamespace(
+                config=SimpleNamespace(inject_context=False, inject_tools=True),
+                compute_memory_tool_definitions=lambda provider: memory_tools,
+                get_beta_headers=lambda: {},
+                has_memory_tool_calls=lambda resp, provider: False,
+            )
+            proxy._stream_response = fake_stream_response
+            proxy.session_tracker_store.compute_session_id = lambda *a, **k: "sess-mixed"
+            if after_buffered_turn:
+                # A buffered turn records the golden memory tools for the session.
+                apply_session_sticky_memory_tools(
+                    provider="openai",
+                    session_id="sess-mixed",
+                    request_id="r0",
+                    existing_tools=[],
+                    memory_tools_to_inject=memory_tools,
+                    inject_this_turn=True,
+                )
+            client.post(
+                "/v1/chat/completions",
+                headers={"authorization": "Bearer sk-test", "x-headroom-user-id": "u1"},
+                json={
+                    "model": "gpt-4o-mini",
+                    "stream": True,
+                    "tools": [{"type": "function", "function": {"name": "Bash", "parameters": {}}}],
+                    "messages": [{"role": "user", "content": "remember the deploy region"}],
+                },
+            )
+
+        _reset_session_tool_tracker_for_test()
+        names = {t["function"]["name"] for t in captured["body"]["tools"]}
+        assert names == {"Bash"}
 
 
 class TestStreamingRetainedByteLimit:

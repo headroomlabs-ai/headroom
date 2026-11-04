@@ -323,3 +323,29 @@ def test_readyz_kompress_state_matrix(monkeypatch, slot_status, compressor, disa
     payload = TestClient(app).get("/readyz").json()["checks"]["kompress"]
 
     assert payload == expected
+
+
+def test_remote_kompress_endpoint_skips_local_model_at_startup(monkeypatch):
+    """With HEADROOM_KOMPRESS_ENDPOINT set, startup neither fetches nor warms the
+    local model, and /readyz still names the remote backend."""
+    import threading
+
+    monkeypatch.setenv("HEADROOM_SKIP_UPSTREAM_CHECK", "1")
+    monkeypatch.setenv("HEADROOM_KOMPRESS_ENDPOINT", "https://kompress.example.test")
+    monkeypatch.setenv("HEADROOM_KOMPRESS_WARMUP", "1")
+    monkeypatch.setenv("HEADROOM_KOMPRESS_WARMUP_DELAY_SECONDS", "3600")
+    prefetched: list[str] = []
+    monkeypatch.setattr(
+        kompress_compressor,
+        "ensure_background_prefetch",
+        lambda model_id: (prefetched.append(model_id), True)[1],
+    )
+    app = create_app(ProxyConfig(optimize=True, cache_enabled=False, rate_limit_enabled=False))
+
+    with TestClient(app) as client:
+        app.state.proxy.http_client = object()
+        payload = client.get("/readyz").json()
+
+    assert prefetched == []
+    assert not any(t.name == "kompress-warmup" for t in threading.enumerate())
+    assert payload["checks"]["kompress"]["backend"] == "remote"

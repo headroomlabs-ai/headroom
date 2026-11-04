@@ -203,6 +203,102 @@ class TestMessageOptimization:
         assert len(text_blocks) == 1
         assert text_blocks[0]["text"] == "What is this?"
 
+    @staticmethod
+    def _png_message(img) -> list[dict]:
+        buf = io.BytesIO()
+        img.save(buf, format="PNG")
+        b64 = base64.b64encode(buf.getvalue()).decode()
+        return [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{b64}"}}
+                ],
+            }
+        ]
+
+    @staticmethod
+    def _decoded(optimized: list[dict]):
+        from PIL import Image
+
+        url = optimized[0]["content"][0]["image_url"]["url"]
+        return Image.open(io.BytesIO(base64.b64decode(url.split(",", 1)[1]))).convert("RGB")
+
+    def test_transparent_png_is_flattened_onto_white(self):
+        """JPEG has no alpha: transparent pixels must not turn black (their hidden RGB)."""
+        from PIL import Image
+
+        img = Image.new("RGBA", (1920, 1080), (0, 0, 0, 0))
+        img.paste((0, 0, 0, 255), (100, 500, 1800, 560))  # black "text" bar
+        optimized, results = optimize_images_in_messages(self._png_message(img), "openai")
+
+        assert len(results) == 1 and results[0].resized
+        out = self._decoded(optimized)
+        assert min(out.getpixel((5, 5))) > 245
+        assert max(out.getpixel((out.width // 2, out.height * 530 // 1080))) < 10
+
+    @pytest.mark.parametrize("mode", ["RGB", "L", "P"])
+    def test_trns_and_palette_transparency_are_flattened_onto_white(self, mode):
+        """PNG tRNS on RGB/L images and a transparent palette entry are transparency too."""
+        from PIL import Image
+
+        img = Image.new("RGBA", (1920, 1080), (0, 0, 0, 0))
+        img.paste((0, 0, 0, 255), (100, 500, 1800, 560))
+        if mode == "P":
+            img = Image.new("P", (1920, 1080), 0)
+            img.putpalette([0, 0, 0, 0, 0, 0])  # index 0 transparent, index 1 opaque black
+            img.paste(1, (100, 500, 1800, 560))
+            img.info["transparency"] = 0
+        else:
+            # tRNS: one colour is transparent; the bar is a different, still dark colour.
+            img = Image.new(mode, (1920, 1080), 0)
+            img.paste(1 if mode == "L" else (1, 1, 1), (100, 500, 1800, 560))
+            img.info["transparency"] = 0 if mode == "L" else (0, 0, 0)
+        optimized, results = optimize_images_in_messages(self._png_message(img), "openai")
+
+        assert len(results) == 1 and results[0].resized
+        out = self._decoded(optimized)
+        assert min(out.getpixel((5, 5))) > 245
+        assert max(out.getpixel((out.width // 2, out.height * 530 // 1080))) < 10
+
+    def test_grayscale_alpha_is_converted_not_raised(self):
+        """LA used to raise "cannot write mode LA as JPEG", skipping the optimization."""
+        from PIL import Image
+
+        img = Image.new("LA", (1920, 1080), (0, 0))
+        img.paste((0, 255), (100, 500, 1800, 560))
+        optimized, results = optimize_images_in_messages(self._png_message(img), "openai")
+
+        assert len(results) == 1 and results[0].resized
+        out = self._decoded(optimized)
+        assert min(out.getpixel((5, 5))) > 245
+
+    def test_high_bit_depth_is_not_squashed_to_8_bit(self):
+        """I;16 has no faithful 8-bit form: leave it unconverted rather than clip to white."""
+        from PIL import Image
+
+        from headroom.image.tile_optimizer import _jpeg_ready
+
+        img = Image.new("I;16", (64, 64), 1000)
+        assert _jpeg_ready(img) is img
+
+    def test_compressor_resize_flattens_transparency_onto_white(self):
+        """ImageCompressor's provider-format resize also writes JPEG."""
+        from PIL import Image
+
+        from headroom.image.compressor import ImageCompressor
+
+        img = Image.new("RGBA", (1600, 1000), (0, 0, 0, 0))
+        img.paste((0, 0, 0, 255), (100, 480, 1500, 520))
+        buf = io.BytesIO()
+        img.save(buf, format="PNG")
+
+        data, media_type = ImageCompressor()._resize_image(buf.getvalue(), max_dimension=512)
+
+        assert media_type == "image/jpeg"
+        out = Image.open(io.BytesIO(data)).convert("RGB")
+        assert min(out.getpixel((5, 5))) > 245
+
     def test_small_image_not_resized(self):
         """Image already at optimal size is not changed."""
         msgs = _make_openai_image_message(512, 512)
