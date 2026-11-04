@@ -24,7 +24,7 @@
   "input_sha256": "3f929019b62fa97b372e2d8aad705dbef029ddb7934acdb237083fdead8162c0",
   "label": "mixed_array",
   "output": {
-    "compressed": "[\"start\",0,1,2,3,18,19,\"middle\",\"end\",\"end\",\"end\",\"end\",\"end\"]",
+    "compressed": "[\"start\",0,1,2,3,18,19,\"middle\",\"end\",\"end\",\"end\",\"end\",\"end\",\"\u2026 14 more items <<ccr:c698823f3fa0 14_items_offloaded>>\"]",
     "original": "[\"start\", 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, \"middle\", \"end\", \"end\", \"end\", \"end\", \"end\"]",
     "strategy": "mixed:adaptive(27->13,str:7->7,num:20)(27->13)",
     "was_modified": true

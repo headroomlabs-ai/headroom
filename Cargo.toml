@@ -23,7 +23,7 @@ default-members = [
 edition = "2021"
 rust-version = "1.80"
 license = "Apache-2.0"
-repository = "https://github.com/chopratejas/headroom"
+repository = "https://github.com/headroomlabs-ai/headroom"
 authors = ["Headroom Maintainers"]
 
 [workspace.dependencies]
@@ -115,6 +115,15 @@ gcp_auth = "0.12"
 strip = "symbols"
 lto = "thin"
 codegen-units = 1
+
+# The proxy binary turns untrusted network input into byte and token counts;
+# a wrapping add there is a silent correctness bug at best, so its release
+# build keeps overflow checks (a panic is caught per task by tokio and
+# surfaces in the log; a wrong number does not). Scoped to this package:
+# `headroom-core` is also the `_core` Python extension's compression hot
+# path and is not included until the cost is benchmarked there.
+[profile.release.package.headroom-proxy]
+overflow-checks = true
 
 # Fast-to-compile profile for CI test wheels. The shipped wheel uses
 # `release` (lto + codegen-units=1) for runtime/size; CI only needs a working

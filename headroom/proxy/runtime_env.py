@@ -62,8 +62,6 @@ RUNTIME_ENV_KNOBS: tuple[Knob, ...] = (
     Knob(
         "HEADROOM_VERBOSITY_LEVEL", "int", "Verbosity steering level 0-4 (unset = learned/default)."
     ),
-    Knob("HEADROOM_EFFORT_ROUTER", "bool", "Lower effort on mechanical tool-result continuations."),
-    Knob("HEADROOM_MECHANICAL_EFFORT", "str", "Effort value used on mechanical continuations."),
     Knob("HEADROOM_VERBOSITY_AUTOTUNE", "bool", "Use the AIMD verbosity controller state."),
     Knob(
         "HEADROOM_OUTPUT_HOLDOUT",
@@ -74,6 +72,35 @@ RUNTIME_ENV_KNOBS: tuple[Knob, ...] = (
         "HEADROOM_INTERCEPT_READ_MIN_CHARS",
         "int",
         "Min tool-output chars before the ast-grep read rewrite.",
+    ),
+    Knob(
+        "HEADROOM_VERIFY_TRUNCATION_ON_DISK",
+        "bool",
+        "Verify ast-grep Read truncation against disk when no client banner is found. "
+        "Always UNKNOWN on Windows (no dir_fd/O_NOFOLLOW support).",
+    ),
+    Knob(
+        "HEADROOM_VERIFY_TRUNCATION_MAX_BYTES",
+        "int",
+        "Max on-disk file size (bytes) the disk-verify fallback will read.",
+    ),
+    Knob(
+        "HEADROOM_DEFERRED_TOOL_AFFINITY",
+        "bool",
+        "Keep defer_loading tools out of the Anthropic prefix-tracker lineage key "
+        "(default on; 0 counts them again).",
+    ),
+    Knob(
+        "HEADROOM_WEB_SEARCH_HISTORY",
+        "bool",
+        "Drop web_search_call history from a Responses request that declares no "
+        "web_search tool (default on; 0 disables).",
+    ),
+    Knob(
+        "HEADROOM_BUFFERED_UPSTREAM_STREAM",
+        "bool",
+        "Send buffered CCR requests upstream as stream:true and fold the reply "
+        "(default on; 0 sends stream:false).",
     ),
 )
 

@@ -25,18 +25,25 @@ from __future__ import annotations
 import argparse
 import asyncio
 import contextlib
+import errno
 import json
 import logging
 import os
+import stat
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from headroom import paths as _paths
 from headroom import savings_ledger
 from headroom.cache.compression_store import format_retrieval_miss_detail
+from headroom.exceptions import StorageError
+from headroom.log_safety import describe_exception, redact_url, safe_id
 from headroom.telemetry import session as telemetry_session
+
+if TYPE_CHECKING:
+    from headroom.tokenizers.estimator import EstimatingTokenCounter
 
 # fcntl is Unix-only; on Windows we skip file locking (stats are best-effort).
 # Keep the module typed as Any so Windows mypy runs don't try to resolve Unix-only attrs.
@@ -78,7 +85,8 @@ READ_TOOL_NAME = "headroom_read"
 logger = logging.getLogger("headroom.ccr.mcp")
 
 # Feature flag: enable headroom_read tool (file read caching via CCR)
-# Set HEADROOM_MCP_READ=on to enable
+# Set HEADROOM_MCP_READ=on to enable. Reads are confined to the server's working
+# directory, or to the os.pathsep-separated directories in HEADROOM_MCP_READ_ROOTS.
 _READ_ENABLED = os.environ.get("HEADROOM_MCP_READ", "off").lower().strip() in (
     "on",
     "true",
@@ -206,7 +214,13 @@ SESSION_WINDOW_SECONDS = 7200  # 2 hours — events older than this are pruned
 
 
 def _append_shared_event(event: dict[str, Any]) -> None:
-    """Append an event to the shared stats file (cross-process, file-locked)."""
+    """Append an event to the shared stats file (cross-process, file-locked).
+
+    No-op in stateless mode (``HEADROOM_STATELESS``): the aggregate then covers
+    only this process, which is the documented stateless trade-off.
+    """
+    if not _paths.persistence_allowed("MCP session stats"):
+        return
     try:
         SHARED_STATS_DIR.mkdir(parents=True, exist_ok=True)
         event["pid"] = os.getpid()
@@ -217,8 +231,13 @@ def _append_shared_event(event: dict[str, Any]) -> None:
             f.write(line)
             if _HAS_FCNTL:
                 fcntl.flock(f, fcntl.LOCK_UN)
-    except Exception:
-        pass  # Never break compression because of stats
+    except Exception as exc:
+        # Never break compression because of stats
+        logger.debug(
+            "MCP session stats: append to %s failed: %s",
+            SHARED_STATS_FILE,
+            describe_exception(exc),
+        )
 
 
 def _read_shared_events(window_seconds: int = SESSION_WINDOW_SECONDS) -> list[dict[str, Any]]:
@@ -246,8 +265,9 @@ def _read_shared_events(window_seconds: int = SESSION_WINDOW_SECONDS) -> list[di
                     keep_lines.append(line + "\n")
             except json.JSONDecodeError:
                 continue
-        # Prune old entries (only if we dropped some)
-        if len(keep_lines) < len(lines):
+        # Prune old entries (only if we dropped some). Never rewrite the file in
+        # stateless mode — reading is fine, writing is not.
+        if len(keep_lines) < len(lines) and _paths.persistence_allowed("MCP session stats"):
             try:
                 with open(SHARED_STATS_FILE, "w") as f:
                     if _HAS_FCNTL:
@@ -255,10 +275,18 @@ def _read_shared_events(window_seconds: int = SESSION_WINDOW_SECONDS) -> list[di
                     f.writelines(keep_lines)
                     if _HAS_FCNTL:
                         fcntl.flock(f, fcntl.LOCK_UN)
-            except Exception:
-                pass
-    except Exception:
-        pass
+            except Exception as exc:
+                logger.debug(
+                    "MCP session stats: pruning %s failed: %s",
+                    SHARED_STATS_FILE,
+                    describe_exception(exc),
+                )
+    except Exception as exc:
+        logger.debug(
+            "MCP session stats: reading %s failed: %s",
+            SHARED_STATS_FILE,
+            describe_exception(exc),
+        )
     return events
 
 
@@ -351,6 +379,73 @@ class SessionStats:
         }
 
 
+def _read_roots() -> list[Path]:
+    """Directories ``headroom_read`` may read under, resolved like the paths checked against them.
+
+    Without HEADROOM_MCP_READ_ROOTS the root is the working directory, unless
+    that is the filesystem root or the home directory (GUI hosts such as
+    Claude Desktop launch MCP servers from ``/``): then nothing is readable
+    until roots are configured.
+    """
+    configured = os.environ.get("HEADROOM_MCP_READ_ROOTS", "")
+    entries = [entry.strip() for entry in configured.split(os.pathsep) if entry.strip()]
+    if entries:
+        return [Path(entry).expanduser().resolve() for entry in entries]
+    cwd = Path.cwd().resolve()
+    if cwd == Path(cwd.anchor) or cwd == Path.home().resolve():
+        return []
+    return [cwd]
+
+
+_O_CLOEXEC = getattr(os, "O_CLOEXEC", 0)
+_O_NONBLOCK = getattr(os, "O_NONBLOCK", 0)
+
+
+def _open_nofollow(path: Path) -> int:
+    """Open the resolved ``path`` for reading without following any symlink.
+
+    The boundary check and the open are separate steps. ``path`` had no
+    symlinks when it was resolved, but any component -- the file, a directory
+    on the way, the permitted root itself or one of its parents -- can have
+    been replaced by a symlink since, and a plain ``open()`` would follow it
+    wherever it points. So walk the whole path from its anchor one component
+    at a time with O_NOFOLLOW: a component that has become a symlink is
+    refused (ELOOP) rather than followed. Opens are non-blocking so a FIFO
+    put in the way cannot stall the event loop; the caller's S_ISREG check
+    rejects it, and a regular file reads the same either way.
+
+    Without openat semantics (Windows) open directly and confirm the path
+    still resolves to what was checked; best effort there.
+    """
+    if os.open not in os.supports_dir_fd or not hasattr(os, "O_NOFOLLOW"):
+        fd = os.open(path, os.O_RDONLY | getattr(os, "O_BINARY", 0) | _O_CLOEXEC)
+        if path.resolve() != path:
+            os.close(fd)
+            raise OSError(errno.ELOOP, "path changed between check and open", str(path))
+        return fd
+    import fcntl
+
+    flags = os.O_RDONLY | os.O_NOFOLLOW | _O_NONBLOCK | _O_CLOEXEC
+    parts = path.parts
+    fd = os.open(parts[0], os.O_RDONLY | os.O_DIRECTORY | _O_CLOEXEC)
+    try:
+        for part in parts[1:-1]:
+            next_fd = os.open(part, flags, dir_fd=fd)
+            os.close(fd)
+            fd = next_fd
+            # S_ISDIR here rather than O_DIRECTORY on the open: with both
+            # flags macOS reports a symlink as ENOTDIR, which would make a
+            # swapped component look like a missing file instead of a refusal.
+            if not stat.S_ISDIR(os.fstat(fd).st_mode):
+                raise NotADirectoryError(errno.ENOTDIR, "Not a directory", str(path))
+        file_fd = os.open(parts[-1] if len(parts) > 1 else ".", flags, dir_fd=fd)
+    finally:
+        os.close(fd)
+    if _O_NONBLOCK:
+        fcntl.fcntl(file_fd, fcntl.F_SETFL, fcntl.fcntl(file_fd, fcntl.F_GETFL) & ~_O_NONBLOCK)
+    return file_fd
+
+
 class HeadroomMCPServer:
     """MCP Server exposing Headroom's context engineering toolkit.
 
@@ -377,7 +472,7 @@ class HeadroomMCPServer:
         self._http_client: httpx.AsyncClient | None = None  # type: ignore[assignment]
         self._stats = SessionStats()
         self._local_store: Any = None  # Lazy-initialized CompressionStore
-        self._compressor_initialized = False
+        self._token_estimator: EstimatingTokenCounter | None = None
         # File read cache: path → (content_hash, ccr_hash, line_count, token_count)
         self._file_cache: dict[str, tuple[str, str, int, int]] = {}
 
@@ -401,6 +496,23 @@ class HeadroomMCPServer:
             self._local_store = get_compression_store()
         return self._local_store
 
+    def _estimate_tokens(self, text: str) -> int:
+        """Price file content in tokens, the way the rest of the pipeline does.
+
+        Whitespace splitting is a word count, not a token count. Measured on
+        real files it under-reports by 1.43x on prose, 1.30x on source, and
+        691x for the 2.2 KB single-line JSON array in the regression test -- a
+        compact document has no spaces, so the whole file is one "word". That
+        figure is stored as ``original_tokens`` (which the savings totals sum
+        over) and echoed back to the agent as ``~N tokens`` in the
+        already-in-context note it uses to decide whether to re-read the file.
+        """
+        if self._token_estimator is None:
+            from headroom.tokenizers.estimator import EstimatingTokenCounter
+
+            self._token_estimator = EstimatingTokenCounter()
+        return max(1, self._token_estimator.count_text(text))
+
     def _compress_content(self, content: str) -> dict[str, Any]:
         """Compress content using Headroom's pipeline.
 
@@ -419,16 +531,31 @@ class HeadroomMCPServer:
 
         # Store original in local store for later retrieval
         store = self._get_local_store()
-        hash_key = store.store(
-            original=content,
-            compressed=compressed_content
-            if isinstance(compressed_content, str)
-            else json.dumps(compressed_content),
-            original_tokens=input_tokens,
-            compressed_tokens=output_tokens,
-            compression_strategy="mcp_compress",
-            ttl=MCP_SESSION_TTL,
-        )
+        try:
+            hash_key = store.store(
+                original=content,
+                compressed=compressed_content
+                if isinstance(compressed_content, str)
+                else json.dumps(compressed_content),
+                original_tokens=input_tokens,
+                compressed_tokens=output_tokens,
+                compression_strategy="mcp_compress",
+                ttl=MCP_SESSION_TTL,
+            )
+        except StorageError as e:
+            # No stored original: hand back the content itself, which also
+            # keeps out any marker the pipeline put in the compressed text.
+            logger.warning("headroom_compress: returning the original, CCR store refused it: %s", e)
+            return {
+                "compressed": content,
+                "hash": None,
+                "original_tokens": input_tokens,
+                "compressed_tokens": input_tokens,
+                "tokens_saved": 0,
+                "savings_percent": 0,
+                "transforms": [],
+                "note": "Not compressed: the CCR store could not keep the original.",
+            }
 
         # Track stats
         strategy = (
@@ -502,8 +629,14 @@ class HeadroomMCPServer:
                     result["source"] = "proxy"
                     self._stats.record_retrieval(hash_key)
                     return result
-            except Exception:
-                pass  # Proxy unavailable, that's fine
+            except Exception as exc:
+                # Proxy unavailable is expected; log so a bug here is not silent.
+                logger.debug(
+                    "MCP retrieve: proxy fallback failed for hash=%s via %s: %s",
+                    safe_id(hash_key),
+                    redact_url(self.proxy_url),
+                    describe_exception(exc),
+                )
 
         if expired_entry_status:
             ttl_seconds = expired_entry_status.get(
@@ -687,7 +820,10 @@ class HeadroomMCPServer:
                             "properties": {
                                 "file_path": {
                                     "type": "string",
-                                    "description": "Absolute path to the file to read.",
+                                    "description": (
+                                        "Path to the file to read, inside the workspace "
+                                        "(the server's working directory or HEADROOM_MCP_READ_ROOTS)."
+                                    ),
                                 },
                                 "fresh": {
                                     "type": "boolean",
@@ -768,15 +904,15 @@ class HeadroomMCPServer:
         # restarts. Best-effort: never let savings bookkeeping break the tool.
         try:
             self._record_savings(result)
-        except Exception:
-            logger.debug("durable savings recording failed", exc_info=True)
+        except Exception as exc:
+            logger.debug("durable savings recording failed: %s", describe_exception(exc))
 
         proxy_status = await self._probe_proxy_unreachable()
         if proxy_status:
             result["proxy"] = proxy_status
             result["warning"] = proxy_status["warning"]
 
-        return [TextContent(type="text", text=json.dumps(result, indent=2))]
+        return [TextContent(type="text", text=json.dumps(result, indent=2, ensure_ascii=False))]
 
     def _record_savings(self, result: dict[str, Any]) -> None:
         """Append a durable savings event for a completed compression."""
@@ -818,8 +954,11 @@ class HeadroomMCPServer:
             name = getattr(info, "name", None)
             if name:
                 return str(name)
-        except Exception:
-            pass
+        except (LookupError, AttributeError) as exc:
+            # Outside a request there is no request context; fall back to "unknown".
+            logger.debug(
+                "MCP client name unavailable; reporting 'unknown': %s", describe_exception(exc)
+            )
         return "unknown"
 
     async def _handle_retrieve(self, arguments: dict[str, Any]) -> list[TextContent]:
@@ -841,7 +980,7 @@ class HeadroomMCPServer:
             json.dumps(result, ensure_ascii=False, default=str),
         )
 
-        return [TextContent(type="text", text=json.dumps(result, indent=2))]
+        return [TextContent(type="text", text=json.dumps(result, indent=2, ensure_ascii=False))]
 
     async def _handle_stats(self) -> list[TextContent]:
         """Handle headroom_stats tool call."""
@@ -906,7 +1045,7 @@ class HeadroomMCPServer:
                     stats["proxy"] = proxy_status
                     stats["warning"] = proxy_status["warning"]
 
-        return [TextContent(type="text", text=json.dumps(stats, indent=2))]
+        return [TextContent(type="text", text=json.dumps(stats, indent=2, ensure_ascii=False))]
 
     async def _fetch_full_proxy_stats(self) -> dict[str, Any] | None:
         """Fetch full stats from the proxy (includes summary)."""
@@ -918,7 +1057,12 @@ class HeadroomMCPServer:
                 return None
             result: dict[str, Any] = response.json()
             return result
-        except Exception:
+        except Exception as exc:
+            logger.debug(
+                "MCP stats: proxy /stats fetch failed via %s: %s",
+                redact_url(self.proxy_url),
+                describe_exception(exc),
+            )
             return None
 
     @staticmethod
@@ -956,38 +1100,82 @@ class HeadroomMCPServer:
                 )
             ]
 
-        path = Path(file_path).expanduser().resolve()
-        if not path.exists():
+        # Check the resolved path, so `..` and symlinks cannot leave the roots,
+        # and check it before exists() so the tool is not an existence oracle.
+        # A path that cannot be resolved (symlink loop, NUL byte) gets the same
+        # answer, so its error text cannot reveal anything outside either.
+        def outside() -> list[TextContent]:
+            return [
+                TextContent(
+                    type="text",
+                    text=json.dumps(
+                        {
+                            "error": (
+                                f"File is outside the workspace: {file_path}. "
+                                "Ask the user to add its directory to HEADROOM_MCP_READ_ROOTS."
+                            )
+                        }
+                    ),
+                )
+            ]
+
+        try:
+            path: Path | None = Path(file_path).expanduser().resolve()
+        except (OSError, RuntimeError, ValueError):
+            path = None
+        root = (
+            None
+            if path is None
+            else next((r for r in _read_roots() if path.is_relative_to(r)), None)
+        )
+        if path is None or root is None:
+            return outside()
+
+        # Open without following symlinks, so a component swapped for one
+        # after the check above is refused rather than followed (see
+        # _open_nofollow). Inside the roots, a missing path and a directory
+        # keep their specific answers.
+        fd = -1
+        try:
+            fd = _open_nofollow(path)
+            if not stat.S_ISREG(os.fstat(fd).st_mode):
+                return [
+                    TextContent(
+                        type="text",
+                        text=json.dumps({"error": f"Not a file: {file_path}"}),
+                    )
+                ]
+            handle = os.fdopen(fd, "rb")
+            fd = -1
+            with handle:
+                raw = handle.read()
+        except (FileNotFoundError, NotADirectoryError):
             return [
                 TextContent(
                     type="text",
                     text=json.dumps({"error": f"File not found: {file_path}"}),
                 )
             ]
-        if not path.is_file():
-            return [
-                TextContent(
-                    type="text",
-                    text=json.dumps({"error": f"Not a file: {file_path}"}),
-                )
-            ]
-
-        # Read file from disk. PR-A8 / P1-8: avoid lossy decode kwargs
-        # in headroom/ccr/ — use the centralized safe-log decoder so
-        # the project-wide grep stays clean (this path is for tool
-        # output display, not SSE/wire path, so a replacement char on
-        # invalid bytes is acceptable).
-        try:
-            from headroom.proxy.helpers import safe_decode_for_logging
-
-            content = safe_decode_for_logging(path.read_bytes())
-        except Exception as e:
+        except OSError as e:
+            if e.errno == errno.ELOOP:
+                return outside()
             return [
                 TextContent(
                     type="text",
                     text=json.dumps({"error": f"Cannot read file: {e}"}),
                 )
             ]
+        finally:
+            if fd != -1:
+                os.close(fd)
+
+        # PR-A8 / P1-8: avoid lossy decode kwargs in headroom/ccr/ — use the
+        # centralized safe-log decoder so the project-wide grep stays clean
+        # (this path is for tool output display, not SSE/wire path, so a
+        # replacement char on invalid bytes is acceptable).
+        from headroom.proxy.helpers import safe_decode_for_logging
+
+        content = safe_decode_for_logging(raw)
 
         content_hash = hashlib.sha256(content.encode()).hexdigest()[:24]
         line_count = content.count("\n") + (1 if content and not content.endswith("\n") else 0)
@@ -1029,17 +1217,22 @@ class HeadroomMCPServer:
 
         # Fresh read: store in CCR and cache the hash
         store = self._get_local_store()
-        ccr_hash = store.store(
-            original=content,
-            compressed=f"[File: {path.name}, {line_count} lines]",
-            original_tokens=len(content.split()),
-            compressed_tokens=5,
-            tool_name="headroom_read",
-            ttl=MCP_SESSION_TTL,
-        )
-
-        token_estimate = len(content.split())
-        self._file_cache[str_path] = (content_hash, ccr_hash, line_count, token_estimate)
+        token_estimate = self._estimate_tokens(content)
+        try:
+            ccr_hash = store.store(
+                original=content,
+                compressed=f"[File: {path.name}, {line_count} lines]",
+                original_tokens=token_estimate,
+                compressed_tokens=5,
+                tool_name="headroom_read",
+                ttl=MCP_SESSION_TTL,
+            )
+        except StorageError as e:
+            # The full content is returned below either way; without a stored
+            # original, a re-read must not answer with a hash.
+            logger.warning("headroom_read: not cached, the CCR store refused it: %s", e)
+        else:
+            self._file_cache[str_path] = (content_hash, ccr_hash, line_count, token_estimate)
 
         # Return full content with line numbers (like Claude Code's Read tool)
         numbered_lines = []
@@ -1086,7 +1279,7 @@ class HeadroomMCPServer:
         watchdog forces shutdown once we are reparented.
         """
         async with stdio_server() as (read_stream, write_stream):
-            logger.info(f"Headroom MCP Server starting (proxy: {self.proxy_url})")
+            logger.info("Headroom MCP Server starting (proxy: %s)", redact_url(self.proxy_url))
             serve_task = asyncio.create_task(
                 self.server.run(
                     read_stream,

@@ -55,9 +55,10 @@ Images are automatically compressed based on your queries.
 ### With HeadroomClient
 
 ```python
-from headroom import HeadroomClient
+from headroom import HeadroomClient, OpenAIProvider
+from openai import OpenAI
 
-client = HeadroomClient(provider="openai")
+client = HeadroomClient(original_client=OpenAI(), provider=OpenAIProvider())
 
 response = client.chat.completions.create(
     model="gpt-4o",
@@ -94,11 +95,10 @@ print(f"Technique: {compressor.last_result.technique.value}")
 ### Proxy Configuration
 
 ```bash
-# Enable image compression (default: true)
-headroom proxy --image-optimize
-
-# Disable image compression
-headroom proxy --no-image-optimize
+# Image compression runs as part of the `image` built-in compressor and is
+# enabled by default. There is no dedicated --image-optimize toggle; select
+# compressors explicitly to disable it (flag is singular: --compressor):
+headroom proxy --compressor smart_crusher,kompress,code_aware,search,log,tabular,config,html
 ```
 
 ### Programmatic Configuration
@@ -183,7 +183,7 @@ For text extraction (converts image to text):
 - "What does it say?"
 - "Transcribe the document"
 
-*Note: Requires vision model call. Currently falls back to preserve.*
+*Note: Runs OCR and replaces the image with the extracted text. If OCR fails or returns low confidence, it falls back to `full_low` (not `preserve`).*
 
 ## The Trained Router
 
@@ -249,10 +249,12 @@ compressor = ImageCompressor(device="cpu")
 
 ### Disable Image Compression
 
-```python
-# Proxy
-headroom proxy --no-image-optimize
+```bash
+# Proxy (flag is singular: --compressor)
+headroom proxy --compressor smart_crusher,kompress,code_aware,search,log,tabular,config,html
+```
 
+```python
 # Direct
 # Simply don't call compress()
 ```
@@ -265,7 +267,7 @@ headroom proxy --no-image-optimize
 class ImageCompressor:
     def __init__(
         self,
-        model_id: str = "chopratejas/technique-router",
+        model_id: str | None = None,  # resolves to "chopratejas/technique-router" if unset
         use_siglip: bool = True,
         device: str | None = None,
     ): ...

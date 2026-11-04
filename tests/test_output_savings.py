@@ -2,12 +2,19 @@
 
 from __future__ import annotations
 
+import json
+
+import pytest
+
 from headroom.proxy.output_savings import (
+    MEASURED_MIN_CLUSTERS,
+    MEASURED_SUPERSEDE_MIN_CLUSTERS,
     BaselineModel,
     SavingsLedger,
     SavingsRecorder,
     assign_arm,
     conversation_key_from_body,
+    conversation_label,
     echo_ratio,
     input_bucket,
     model_family,
@@ -18,6 +25,11 @@ from headroom.proxy.output_savings import (
 # ---------------------------------------------------------------------------
 # stratification primitives
 # ---------------------------------------------------------------------------
+
+
+# A treatment observation only counts when the request was actually shaped,
+# evidenced by the shaper's own verbosity label on the same channel.
+SHAPED = "output_shaper:verbosity:L2"
 
 
 class TestStratification:
@@ -178,13 +190,37 @@ class TestBaselineModel:
         assert mean == 500.0
         assert n == 1
 
-    def test_lookup_falls_back_to_global(self):
+    def test_an_unobserved_family_is_not_scored_against_the_global_mean(self):
+        # The baseline is seeded once, from what the user ran before installing.
+        # Every family adopted later lands here, and the all-requests mean is
+        # not a control for any of them.
         m = BaselineModel()
         m.observe("opus|a|s|tools", 100)
         m.observe("sonnet|b|m|notools", 300)
-        mean, _, n = m.lookup("gpt|totally|xl|tools")
+        assert m.lookup("gpt|totally|xl|tools") == (0.0, 0.0, 0)
+
+    def test_the_global_mean_remains_available_on_request(self):
+        m = BaselineModel()
+        m.observe("opus|a|s|tools", 100)
+        m.observe("sonnet|b|m|notools", 300)
+        mean, _, n = m.lookup("gpt|totally|xl|tools", fall_back_to_global=True)
         assert mean == 200.0  # global mean of 100 and 300
         assert n == 2
+
+    def test_prefix_backoff_merges_every_neighbour_not_the_first_one_hashed(self):
+        # Taking the first matching stratum in dict order made the answer
+        # depend on insertion order, so a round-tripped ledger could score the
+        # same request differently.
+        m = BaselineModel()
+        m.observe("opus|ask|l|tools", 1000)
+        m.observe("opus|ask|l|notools", 100)
+        mean, _, n = m.lookup("opus|ask|l|other")
+        assert (mean, n) == (550.0, 2)
+
+        reversed_order = BaselineModel()
+        reversed_order.observe("opus|ask|l|notools", 100)
+        reversed_order.observe("opus|ask|l|tools", 1000)
+        assert reversed_order.lookup("opus|ask|l|other") == m.lookup("opus|ask|l|other")
 
     def test_roundtrip_serialization(self):
         m = BaselineModel()
@@ -277,6 +313,28 @@ class TestEstimateFromBaseline:
 # ---------------------------------------------------------------------------
 
 
+class TestEstimateExcludesUnobservedStrata:
+    def test_requests_without_baseline_evidence_are_left_out(self):
+        ledger = SavingsLedger()
+        for _ in range(10):
+            ledger.baseline.observe("opus|ask|l|tools", 1000)
+            ledger.record("treatment", "opus|ask|l|tools", 800)
+        # A family the baseline never saw, with far shorter replies. Scoring it
+        # against the global mean would credit ~950 saved tokens per request.
+        for _ in range(40):
+            ledger.record("treatment", "sonnet|new_user_ask|m|notools", 50)
+
+        est = ledger.estimate_from_baseline()
+        assert est.n_requests == 10, "only the observed stratum is scored"
+        assert abs(est.tokens_saved - 2000) < 1e-6  # 10 * (1000 - 800)
+        assert abs(est.pct - 20.0) < 1e-6
+
+    def test_per_request_savings_are_zero_without_evidence(self):
+        ledger = SavingsLedger()
+        ledger.baseline.observe("opus|ask|l|tools", 1000)
+        assert ledger.baseline.lookup("sonnet|new_user_ask|m|notools") == (0.0, 0.0, 0)
+
+
 class TestEstimateFromHoldout:
     def test_none_without_control_data(self):
         ledger = SavingsLedger()
@@ -285,9 +343,9 @@ class TestEstimateFromHoldout:
 
     def test_measured_difference_of_means(self):
         ledger = SavingsLedger()
-        for _ in range(30):
-            ledger.record("control", "opus|new_user_ask|s|tools", 1000)
-            ledger.record("treatment", "opus|new_user_ask|s|tools", 750)
+        for i in range(30):
+            ledger.record("control", "opus|new_user_ask|s|tools", 1000, f"c{i}")
+            ledger.record("treatment", "opus|new_user_ask|s|tools", 750, f"t{i}")
         est = ledger.estimate_from_holdout()
         assert est is not None
         assert est.kind == "measured"
@@ -297,21 +355,21 @@ class TestEstimateFromHoldout:
 
     def test_only_strata_present_in_both_arms_contribute(self):
         ledger = SavingsLedger()
-        for _ in range(10):
-            ledger.record("control", "opus|a|s|tools", 1000)
-            ledger.record("treatment", "opus|a|s|tools", 800)
+        for i in range(10):
+            ledger.record("control", "opus|a|s|tools", 1000, f"c{i}")
+            ledger.record("treatment", "opus|a|s|tools", 800, f"t{i}")
         # Treatment-only stratum must not contribute (no control to compare).
-        ledger.record("treatment", "opus|b|m|notools", 50)
+        ledger.record("treatment", "opus|b|m|notools", 50, "t99")
         est = ledger.estimate_from_holdout()
         assert est is not None
         assert est.n_requests == 10
 
     def test_best_estimate_prefers_measured(self):
         ledger = SavingsLedger()
-        for _ in range(10):
+        for i in range(MEASURED_SUPERSEDE_MIN_CLUSTERS):
             ledger.baseline.observe("opus|a|s|tools", 1000)
-            ledger.record("control", "opus|a|s|tools", 1000)
-            ledger.record("treatment", "opus|a|s|tools", 900)
+            ledger.record("control", "opus|a|s|tools", 1000, f"c{i}")
+            ledger.record("treatment", "opus|a|s|tools", 900, f"t{i}")
         assert ledger.best_estimate().kind == "measured"
 
     def test_best_estimate_falls_back_to_estimated(self):
@@ -320,6 +378,281 @@ class TestEstimateFromHoldout:
             ledger.baseline.observe("opus|a|s|tools", 1000)
             ledger.record("treatment", "opus|a|s|tools", 900)
         assert ledger.best_estimate().kind == "estimated"
+
+    def test_a_wide_band_does_not_take_over_even_at_full_size(self):
+        """The width gate still bites once the cluster gate is cleared."""
+        ledger = SavingsLedger()
+        for i in range(200):
+            ledger.baseline.observe("opus|a|s|tools", 1000)
+            ledger.record("treatment", "opus|a|s|tools", 800, f"t{i}")
+        for i in range(30):
+            ledger.record("control", "opus|a|s|tools", (200, 1000, 5000)[i % 3], f"c{i}")
+
+        measured = ledger.estimate_from_holdout()
+        assert measured is not None, "the arm is spread over enough conversations"
+        assert (measured.ci_high_pct - measured.ci_low_pct) / 2 > 10, "and too noisy to believe"
+        assert ledger.best_estimate().kind == "estimated"
+
+    def test_a_holdout_covering_a_corner_of_traffic_does_not_take_over(self):
+        ledger = SavingsLedger()
+        # One stratum measured cleanly, but it is a fraction of the traffic.
+        for i in range(30):
+            ledger.baseline.observe("opus|a|s|tools", 1000)
+            ledger.record("control", "opus|a|s|tools", 1000, f"c{i}")
+            ledger.record("treatment", "opus|a|s|tools", 900, f"t{i}")
+        for i in range(200):
+            ledger.baseline.observe("opus|b|xl|tools", 4000)
+            ledger.record("treatment", "opus|b|xl|tools", 3000, f"b{i}")
+        assert ledger.best_estimate().kind == "estimated"
+
+    def test_a_few_long_conversations_do_not_take_the_headline(self):
+        """Five control conversations clear the cluster gate, and their
+        per-request band looks tight, but they are five draws, not 1,000."""
+        ledger = SavingsLedger()
+        for i in range(200):
+            ledger.baseline.observe("opus|a|s|tools", 1000)
+            ledger.record("treatment", "opus|a|s|tools", 800, f"t{i}")
+        for conv in range(5):
+            for j in range(200):
+                ledger.record("control", "opus|a|s|tools", 900 + 100 * conv + j % 3, f"c{conv}")
+
+        measured = ledger.estimate_from_holdout()
+        assert measured is not None, "a real arm by the cluster gate"
+        assert (measured.ci_high_pct - measured.ci_low_pct) / 2 < 10, "and a tight-looking band"
+        assert ledger.best_estimate().kind == "estimated"
+
+    def test_unlabelled_legacy_traffic_does_not_block_the_measurement(self):
+        """Requests recorded before conversations were tracked can never be
+        measured, so they must not count against the measurement's coverage."""
+        ledger = SavingsLedger()
+        for _ in range(2000):
+            ledger.baseline.observe("opus|a|s|tools", 1000)
+            ledger.record("treatment", "opus|a|s|tools", 800)
+        for i in range(MEASURED_SUPERSEDE_MIN_CLUSTERS):
+            ledger.record("control", "opus|a|s|tools", 1000 + i % 3, f"c{i}")
+            ledger.record("treatment", "opus|a|s|tools", 900 + i % 3, f"t{i}")
+
+        assert ledger.estimate_from_baseline().n_requests == 2030
+        assert ledger.best_estimate().kind == "measured"
+
+    def test_a_young_holdout_still_reports_without_a_baseline(self):
+        """Below the supersede floor there is nothing to displace, so the
+        cluster-gated measurement is reported rather than nothing."""
+        ledger = SavingsLedger()
+        for i in range(MEASURED_MIN_CLUSTERS):
+            ledger.record("control", "opus|a|s|tools", 1000, f"c{i}")
+            ledger.record("treatment", "opus|a|s|tools", 800, f"t{i}")
+        assert ledger.best_estimate().kind == "measured"
+
+    def test_a_corner_holdout_does_not_set_the_headline_without_a_baseline(self):
+        ledger = SavingsLedger()
+        for i in range(MEASURED_MIN_CLUSTERS):
+            ledger.record("control", "opus|a|s|tools", 1000, f"c{i}")
+            ledger.record("treatment", "opus|a|s|tools", 100, f"t{i}")
+        # The rest of the traffic has no control to compare against.
+        for i in range(200):
+            ledger.record("treatment", "opus|b|xl|tools", 3000, f"b{i}")
+        assert ledger.estimate_from_holdout() is not None
+        assert ledger.best_estimate().kind != "measured"
+
+    def test_measured_wins_without_a_baseline_to_fall_back_on(self):
+        """A holdout-only deployment (no ``learn --verbosity`` run) still reports."""
+        ledger = SavingsLedger()
+        for i in range(50):
+            ledger.record("control", "opus|a|s|tools", 1000, f"c{i}")
+            ledger.record("treatment", "opus|a|s|tools", 800, f"t{i}")
+        assert ledger.estimate_from_baseline().n_requests == 0
+        assert ledger.best_estimate().kind == "measured"
+
+
+class TestHoldoutClusterGate:
+    """A stratum needs distinct CONVERSATIONS in both arms, not requests.
+
+    Assignment is conversation-stable, so one long agent session is one draw.
+    Counting its requests as independent is what let four control requests
+    decide a fleet machine's headline reduction.
+    """
+
+    @staticmethod
+    def _fill(ledger, *, conversations, per_conversation, control_tokens=1000, treat_tokens=800):
+        for i in range(conversations):
+            for _ in range(per_conversation):
+                ledger.record("control", "opus|a|s|tools", control_tokens, f"c{i}")
+                ledger.record("treatment", "opus|a|s|tools", treat_tokens, f"t{i}")
+
+    def test_one_conversation_per_arm_does_not_qualify(self):
+        ledger = SavingsLedger()
+        # 2,500 requests an arm, all from one session each side: the shape that
+        # produced a -1.6% "measured" number on a real ledger.
+        self._fill(ledger, conversations=1, per_conversation=2_500)
+        assert ledger.estimate_from_holdout() is None
+
+    def test_enough_conversations_qualifies(self):
+        ledger = SavingsLedger()
+        self._fill(ledger, conversations=MEASURED_MIN_CLUSTERS, per_conversation=2)
+        est = ledger.estimate_from_holdout()
+        assert est is not None
+        assert est.kind == "measured"
+
+    def test_thin_control_arm_does_not_ride_on_a_thick_treatment_one(self):
+        ledger = SavingsLedger()
+        for i in range(50):
+            ledger.record("treatment", "opus|a|s|tools", 800, f"t{i}")
+        for _ in range(400):
+            ledger.record("control", "opus|a|s|tools", 1000, "one-session")
+        assert ledger.estimate_from_holdout() is None
+
+    def test_best_estimate_falls_back_when_the_holdout_is_one_conversation(self):
+        ledger = SavingsLedger()
+        for i in range(20):
+            ledger.baseline.observe("opus|a|s|tools", 1000)
+            ledger.record("treatment", "opus|a|s|tools", 900, f"t{i}")
+            ledger.record("control", "opus|a|s|tools", 1000, "one-session")
+        assert ledger.best_estimate().kind == "estimated"
+
+    def test_a_ledger_written_before_conversations_were_tracked_does_not_qualify(self):
+        # No cluster data at all: unverifiable, so it cannot clear the gate.
+        ledger = SavingsLedger()
+        for _ in range(100):
+            ledger.record("control", "opus|a|s|tools", 1000)
+            ledger.record("treatment", "opus|a|s|tools", 800)
+        assert ledger.estimate_from_holdout() is None
+
+    def test_cluster_tracking_saturates(self):
+        ledger = SavingsLedger()
+        for i in range(500):
+            ledger.record("treatment", "opus|a|s|tools", 800, f"t{i}")
+        # Bounded: the count is only ever compared against a threshold, so the
+        # ledger does not grow a set entry per conversation forever.
+        assert ledger.treatment["opus|a|s|tools"].n_clusters <= 32
+        assert ledger.treatment["opus|a|s|tools"].n_clusters >= MEASURED_MIN_CLUSTERS
+
+    def test_conversation_survives_a_save_load_cycle(self, tmp_path):
+        ledger = SavingsLedger()
+        for i in range(MEASURED_MIN_CLUSTERS):
+            ledger.record("control", "opus|a|s|tools", 1000, f"c{i}")
+            ledger.record("treatment", "opus|a|s|tools", 800, f"t{i}")
+        path = tmp_path / "savings.json"
+        ledger.save(path)
+        assert SavingsLedger.load(path).estimate_from_holdout() is not None
+
+    def test_recorder_reads_the_conversation_off_the_label_channel(self, tmp_path):
+        recorder = SavingsRecorder(tmp_path / "savings.json", flush_every=1)
+        for i in range(MEASURED_MIN_CLUSTERS):
+            key = conversation_key_from_body({"messages": [{"role": "user", "content": f"q{i}"}]})
+            assert recorder.record_from_labels(
+                [
+                    "router:noop",
+                    "output_shaper:verbosity:concise",
+                    stratum_label("treatment", "opus|a|s|tools"),
+                    conversation_label(key),
+                ],
+                800,
+            )
+            assert recorder.record_from_labels(
+                [conversation_label(key + "control"), stratum_label("control", "opus|a|s|tools")],
+                1000,
+            )
+        assert SavingsLedger.load(tmp_path / "savings.json").estimate_from_holdout() is not None
+
+    def test_a_request_without_a_conversation_label_still_records(self, tmp_path):
+        recorder = SavingsRecorder(tmp_path / "savings.json", flush_every=1)
+        assert recorder.record_from_labels(
+            [stratum_label("treatment", "opus|a|s|tools"), "output_shaper:verbosity:concise"], 800
+        )
+        ledger = SavingsLedger.load(tmp_path / "savings.json")
+        assert ledger.treatment["opus|a|s|tools"].n == 1
+        assert ledger.treatment["opus|a|s|tools"].n_clusters == 0
+
+    # -- provenance: clusters vouch for labelled observations, nothing else ---
+
+    @staticmethod
+    def _legacy_ledger_dict(requests=2_500, control_tokens=1000, treat_tokens=2000):
+        """An arm as an upgraded ledger holds it: totals, no conversations.
+
+        Those requests could all be one conversation -- the exact case the
+        cluster gate exists to exclude -- and nothing on disk can say.
+        """
+        return {
+            # Shaped-only arms can predate conversation provenance.
+            "shaped_only": True,
+            "baseline": {"strata": {}},
+            "treatment": {
+                "opus|a|s|tools": {
+                    "n": requests,
+                    "sum": float(requests * treat_tokens),
+                    "sumsq": float(requests * treat_tokens**2),
+                }
+            },
+            "control": {
+                "opus|a|s|tools": {
+                    "n": requests,
+                    "sum": float(requests * control_tokens),
+                    "sumsq": float(requests * control_tokens**2),
+                }
+            },
+        }
+
+    def test_upgraded_legacy_traffic_never_joins_the_measured_arm(self, tmp_path):
+        """Five fresh conversations qualify the STRATUM, not the back catalogue.
+
+        Before this split the reload kept n/sum/sumsq and the new labelled
+        observations only added clusters to the same accumulator, so the moment
+        the gate opened all 2,500 unattributable requests an arm were measured
+        too -- reporting -99.8% over 2,505 requests while the conversations
+        actually observed showed no difference at all.
+        """
+        path = tmp_path / "savings.json"
+        path.write_text(json.dumps(self._legacy_ledger_dict()))
+        ledger = SavingsLedger.load(path)
+        assert ledger.estimate_from_holdout() is None, "legacy traffic alone cannot qualify"
+
+        for i in range(MEASURED_MIN_CLUSTERS):
+            ledger.record("control", "opus|a|s|tools", 1000, f"c{i}")
+            ledger.record("treatment", "opus|a|s|tools", 1000, f"t{i}")
+
+        est = ledger.estimate_from_holdout()
+        assert est is not None, "the labelled conversations are a real sample"
+        # Only the labelled requests are measured, and they show no difference.
+        assert est.n_requests == MEASURED_MIN_CLUSTERS
+        assert est.tokens_saved == pytest.approx(0.0)
+        assert est.pct == pytest.approx(0.0)
+        # The totals survive for the estimated / modelled tiers and reporting.
+        assert ledger.treatment["opus|a|s|tools"].n == 2_500 + MEASURED_MIN_CLUSTERS
+
+    def test_the_qualified_subset_survives_a_save_load_cycle(self, tmp_path):
+        """The split has to persist, or the next restart re-merges the arms."""
+        path = tmp_path / "savings.json"
+        path.write_text(json.dumps(self._legacy_ledger_dict()))
+        ledger = SavingsLedger.load(path)
+        for i in range(MEASURED_MIN_CLUSTERS):
+            ledger.record("control", "opus|a|s|tools", 1000, f"c{i}")
+            ledger.record("treatment", "opus|a|s|tools", 1000, f"t{i}")
+        ledger.save(path)
+
+        reloaded = SavingsLedger.load(path)
+        est = reloaded.estimate_from_holdout()
+        assert est is not None
+        assert est.n_requests == MEASURED_MIN_CLUSTERS
+        assert est.tokens_saved == pytest.approx(0.0)
+        assert reloaded.treatment["opus|a|s|tools"].n == 2_500 + MEASURED_MIN_CLUSTERS
+
+    def test_later_unlabelled_requests_stay_out_of_a_qualified_stratum(self):
+        """Qualifying a stratum does not open it to unattributable traffic."""
+        ledger = SavingsLedger()
+        for i in range(MEASURED_MIN_CLUSTERS):
+            ledger.record("control", "opus|a|s|tools", 1000, f"c{i}")
+            ledger.record("treatment", "opus|a|s|tools", 1000, f"t{i}")
+        before = ledger.estimate_from_holdout()
+        assert before is not None
+
+        for _ in range(2_000):
+            ledger.record("treatment", "opus|a|s|tools", 5)
+
+        after = ledger.estimate_from_holdout()
+        assert after is not None
+        assert after.n_requests == before.n_requests
+        assert after.tokens_saved == pytest.approx(before.tokens_saved)
 
 
 # ---------------------------------------------------------------------------
@@ -331,8 +664,9 @@ class TestLedgerPersistence:
     def test_roundtrip(self, tmp_path):
         ledger = SavingsLedger()
         ledger.baseline.observe("opus|a|s|tools", 1000)
-        ledger.record("treatment", "opus|a|s|tools", 800)
-        ledger.record("control", "opus|a|s|tools", 1000)
+        for i in range(MEASURED_MIN_CLUSTERS):
+            ledger.record("treatment", "opus|a|s|tools", 800, f"t{i}")
+            ledger.record("control", "opus|a|s|tools", 1000, f"c{i}")
         path = tmp_path / "savings.json"
         ledger.save(path)
         loaded = SavingsLedger.load(path)
@@ -389,12 +723,7 @@ class TestRecorderBaselineReload:
 
     @staticmethod
     def _key() -> str:
-        return stratum_key(
-            turn_kind="code",
-            input_tokens=8000,
-            model="claude-opus-4-8",
-            has_tools=True,
-        )
+        return SAMPLE_KEY
 
     def test_adopts_baseline_learned_after_start(self, tmp_path):
         path = str(tmp_path / "output_savings.json")
@@ -402,7 +731,7 @@ class TestRecorderBaselineReload:
 
         recorder = SavingsRecorder(path, flush_every=1)
         for output_tokens in (200, 210, 190):
-            recorder.record_from_labels([stratum_label("treatment", key)], output_tokens)
+            recorder.record_from_labels([stratum_label("treatment", key), SHAPED], output_tokens)
 
         # No baseline to compare against yet, so there is nothing to estimate.
         assert recorder.estimate().n_requests == 0
@@ -433,7 +762,7 @@ class TestRecorderBaselineReload:
         learned.save(path)
         assert SavingsLedger.load(path).baseline.total_samples == 4
 
-        recorder.record_from_labels([stratum_label("treatment", key)], 200)
+        recorder.record_from_labels([stratum_label("treatment", key), SHAPED], 200)
         recorder.flush()
 
         # The flush must keep the learned baseline rather than writing the empty
@@ -462,7 +791,7 @@ class TestRecorderBaselineReload:
 
         recorder = SavingsRecorder(path, flush_every=1)
         for output_tokens in (200, 210, 190):
-            recorder.record_from_labels([stratum_label("treatment", key)], output_tokens)
+            recorder.record_from_labels([stratum_label("treatment", key), SHAPED], output_tokens)
 
         # First learn writes a baseline; the recorder adopts it.
         first = SavingsLedger.load(path)
@@ -482,3 +811,233 @@ class TestRecorderBaselineReload:
         relearned.save(path)
 
         assert recorder.estimate().baseline_tokens > baseline_tokens_v1
+
+
+# ---------------------------------------------------------------------------
+# flush durability + event-loop safety
+# ---------------------------------------------------------------------------
+
+# Deterministic stratum key shared by the recorder tests below.
+SAMPLE_KEY = stratum_key(
+    turn_kind="code",
+    input_tokens=8000,
+    model="claude-opus-4-8",
+    has_tools=True,
+)
+
+
+class TestFlushDurability:
+    def test_crash_mid_write_leaves_previous_ledger_intact(self, tmp_path, monkeypatch):
+        import headroom.fsutil
+
+        path = str(tmp_path / "output_savings.json")
+        key = SAMPLE_KEY
+
+        recorder = SavingsRecorder(path, flush_every=1)
+        recorder.record_from_labels([stratum_label("treatment", key), SHAPED], 200)
+        recorder.flush()
+        assert SavingsLedger.load(path).treatment[key].n == 1
+
+        def _die_before_rename(*args, **kwargs):
+            raise OSError(5, "simulated crash before rename")
+
+        monkeypatch.setattr(headroom.fsutil.os, "replace", _die_before_rename)
+        recorder.record_from_labels([stratum_label("treatment", key), SHAPED], 210)
+        recorder.flush()  # OSError swallowed by the recorder — fail-open by design
+
+        # The pre-crash sample must survive and no temp residue may be left
+        # behind: a failed save may not corrupt or clutter the ledger.
+        assert SavingsLedger.load(path).treatment[key].n == 1
+        assert not list(tmp_path.glob("*.tmp"))
+
+    def test_corrupt_ledger_warns_and_starts_empty(self, tmp_path, caplog):
+        import logging
+
+        path = tmp_path / "output_savings.json"
+        path.write_text("{not json")
+
+        with caplog.at_level(logging.WARNING):
+            SavingsRecorder(str(path))
+
+        assert caplog.records, "corrupt ledger was swallowed silently"
+
+    def test_emit_request_outcome_flushes_off_the_loop_thread(self, tmp_path, monkeypatch):
+        import asyncio
+        import threading
+
+        from headroom.proxy.outcome import RequestOutcome, emit_request_outcome
+
+        path = str(tmp_path / "output_savings.json")
+        recorder = SavingsRecorder(path, flush_every=1)
+        monkeypatch.setattr("headroom.proxy.output_savings.get_recorder", lambda: recorder)
+
+        saved_on_threads = []
+        real_save = SavingsLedger.save
+
+        def _spy_save(self, save_path):
+            saved_on_threads.append(threading.get_ident())
+            real_save(self, save_path)
+
+        monkeypatch.setattr(SavingsLedger, "save", _spy_save)
+
+        class _Metrics:
+            async def record_request(self, **kwargs):
+                pass
+
+        class _Handler:
+            def __init__(self):
+                self.metrics = _Metrics()
+                self.cost_tracker = None
+                self.logger = None
+
+        outcome = RequestOutcome(
+            request_id="req-shaper",
+            provider="openai",
+            model="gpt-5",
+            status_code=200,
+            original_tokens=100,
+            optimized_tokens=80,
+            output_tokens=50,
+            tokens_saved=20,
+            attempted_input_tokens=100,
+            transforms_applied=(stratum_label("treatment", SAMPLE_KEY), SHAPED),
+        )
+        asyncio.run(emit_request_outcome(_Handler(), outcome))
+
+        loop_thread = threading.get_ident()
+        assert saved_on_threads, "flush never ran"
+        assert all(t != loop_thread for t in saved_on_threads)
+
+
+class TestModelledTier:
+    """The fallback for a deployment with no counterfactual of its own.
+
+    The factor table ships EMPTY: open-source Headroom applies steering but
+    does not claim a savings figure it has not measured. Factors arrive either
+    from a holdout (which outranks this tier entirely) or from an extension
+    calling ``register_modelled_factors``. These tests therefore register their
+    own factors and restore the table afterwards -- they exercise the
+    arithmetic, which is permanent, not the numbers, which are not.
+    """
+
+    @staticmethod
+    @pytest.fixture
+    def factors():
+        """Install factors for level 3, then restore the real table."""
+        from headroom.proxy.output_savings import (
+            MODELLED_REDUCTION,
+            register_modelled_factors,
+        )
+
+        saved = dict(MODELLED_REDUCTION)
+        register_modelled_factors(3, 0.20, 0.40)
+        try:
+            yield (0.20, 0.40)
+        finally:
+            MODELLED_REDUCTION.clear()
+            MODELLED_REDUCTION.update(saved)
+
+    @staticmethod
+    def _ledger_with(observed_total: int, n: int):
+        from headroom.proxy.output_savings import SavingsLedger, stratum_key
+
+        ledger = SavingsLedger()
+        key = stratum_key(
+            turn_kind="new_user_ask", input_tokens=1000, model="claude-sonnet-5", has_tools=False
+        )
+        for _ in range(n):
+            ledger.record("treatment", key, observed_total // n)
+        return ledger
+
+    def test_ships_empty_so_an_unmeasured_deployment_claims_nothing(self):
+        """No factors by default -> no modelled estimate, at any level.
+
+        The dash this produces is the point: it is the correct rendering of
+        "not measured". A built-in constant would be a number nobody measured
+        on this deployment's traffic, which is the failure mode the tiering
+        exists to prevent.
+        """
+        from headroom.proxy.output_savings import MODELLED_REDUCTION
+
+        assert MODELLED_REDUCTION == {}
+        led = self._ledger_with(5_000, 5)
+        assert all(led.estimate_from_model(lv) is None for lv in (1, 2, 3, 4))
+
+    def test_registering_factors_enables_the_tier(self, factors):
+        assert self._ledger_with(5_000, 5).estimate_from_model(3) is not None
+
+    def test_nonsense_factors_are_rejected_at_registration(self):
+        """r=0 and r=1 break the r/(1-r) inversion; catch it at the door."""
+        from headroom.proxy.output_savings import register_modelled_factors
+
+        for bad in ((0.0, 0.4), (1.0, 1.0), (-0.1, 0.4), (0.5, 1.2)):
+            with pytest.raises(ValueError):
+                register_modelled_factors(3, *bad)
+        with pytest.raises(ValueError, match="exceeds optimistic"):
+            register_modelled_factors(3, 0.5, 0.2)
+
+    def test_saving_inverts_the_reduction_rather_than_scaling_by_it(self, factors):
+        """Observed output is POST-shaping, so saved is observed*r/(1-r).
+
+        The naive observed*r understates the saving. This is the single
+        arithmetic mistake the tier can make, so it is pinned.
+
+        r is read from the table rather than hardcoded: the factors are
+        re-measured whenever the steering text changes, and a test that
+        snapshots them fails on every remeasure while testing nothing about
+        the arithmetic it exists to protect.
+        """
+        from headroom.proxy.output_savings import MODELLED_REDUCTION
+
+        ledger = self._ledger_with(10_000, 10)
+        est = ledger.estimate_from_model(3)
+        assert est is not None
+        r = MODELLED_REDUCTION[3][0]
+        assert 0 < r < 1, "a reduction factor outside (0,1) makes the inversion nonsense"
+        assert est.tokens_saved == pytest.approx(10_000 * r / (1 - r), rel=1e-6)
+        assert est.tokens_saved > 10_000 * r, "naive scaling would understate"
+        # baseline = what the unshaped run would have emitted
+        assert est.baseline_tokens == pytest.approx(10_000 + est.tokens_saved, rel=1e-6)
+
+    def test_kind_is_modelled_so_the_ui_can_refuse_to_call_it_a_ci(self, factors):
+        est = self._ledger_with(5_000, 5).estimate_from_model(3)
+        assert est is not None and est.kind == "modelled"
+
+    def test_band_is_the_two_provider_spread(self, factors):
+        from headroom.proxy.output_savings import MODELLED_REDUCTION
+
+        low, high = MODELLED_REDUCTION[3]
+        est = self._ledger_with(5_000, 5).estimate_from_model(3)
+        assert est is not None
+        assert est.ci_low_pct == pytest.approx(low * 100)
+        assert est.ci_high_pct == pytest.approx(high * 100)
+        assert low <= high, "conservative end must not exceed the optimistic one"
+        assert est.pct == est.ci_low_pct, "headline uses the conservative end"
+
+    def test_unbenchmarked_level_yields_nothing_rather_than_a_guess(self):
+        assert self._ledger_with(5_000, 5).estimate_from_model(1) is None
+
+    def test_no_traffic_yields_nothing(self):
+        from headroom.proxy.output_savings import SavingsLedger
+
+        assert SavingsLedger().estimate_from_model(3) is None
+
+    def test_a_real_baseline_supersedes_the_model(self):
+        """The modelled tier is last resort; a learned baseline outranks it."""
+        from headroom.proxy.output_savings import BaselineModel, SavingsLedger, stratum_key
+
+        key = stratum_key(
+            turn_kind="new_user_ask", input_tokens=1000, model="claude-sonnet-5", has_tools=False
+        )
+        baseline = BaselineModel()
+        for _ in range(50):
+            baseline.observe(key, 2000)
+        ledger = SavingsLedger(baseline=baseline)
+        for _ in range(10):
+            ledger.record("treatment", key, 1000)
+        assert ledger.best_estimate(3).kind == "estimated"
+
+    def test_without_a_level_behaviour_is_unchanged(self):
+        """Existing callers that pass no level must not silently gain a number."""
+        est = self._ledger_with(5_000, 5).best_estimate()
+        assert est.kind == "estimated" and est.n_requests == 0

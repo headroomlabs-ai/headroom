@@ -104,15 +104,31 @@ FEATURES: dict[str, FeatureSpec] = {
     ),
     "proxy_output_shaper": FeatureSpec(
         name="proxy_output_shaper",
-        available_in=RolloutChannel.BETA,
+        available_in=RolloutChannel.STABLE,
+        # Deliberately NOT default-enabled. Steering appends a block to the
+        # system prompt, and at L3 that is a visible behaviour change ("give
+        # conclusions only") -- a user who did not ask for it would read the
+        # terseness as the model getting worse. Available in every channel, so
+        # HEADROOM_OUTPUT_SHAPER=1 is all it takes to turn on.
         legacy_env=("HEADROOM_OUTPUT_SHAPER",),
-        description="Proxy output-shaping path for response-side experiments.",
+        description="Output-token shaping: verbosity steering (opt-in).",
     ),
     "read_maturation": FeatureSpec(
         name="read_maturation",
         available_in=RolloutChannel.BETA,
         legacy_env=("HEADROOM_READ_MATURATION",),
-        description="Hold-back Read maturation before provider cache entry.",
+        description="Hold-back Read maturation: compress a Read once its file quiesces.",
+    ),
+    "bedrock_openai_prompt_caching": FeatureSpec(
+        name="bedrock_openai_prompt_caching",
+        available_in=RolloutChannel.STABLE,
+        # Deliberately NOT default-enabled. A cache breakpoint bills the system
+        # prompt at the cache-write rate (1.25x) until it is read back, so a
+        # one-shot caller who did not ask for it would pay more, not less.
+        description=(
+            "Place a system-prompt cache breakpoint on OpenAI-compatible requests "
+            "to Bedrock models that support prompt caching (opt-in)."
+        ),
     ),
 }
 
@@ -462,26 +478,3 @@ def _resolve_snapshot(
         config=config,
         decisions=tuple(decisions),
     )
-
-
-def current_rollout(environ: Mapping[str, str] | None = None) -> RolloutSnapshot:
-    """Compatibility name for resolving a snapshot at a composition boundary."""
-
-    return resolve_rollout(environ)
-
-
-def feature_enabled(
-    feature: str,
-    *,
-    explicit: bool = False,
-    environ: Mapping[str, str] | None = None,
-) -> bool:
-    """Compatibility helper for composition roots; do not use in deep components."""
-
-    requested = (feature,) if explicit else ()
-    return resolve_rollout(environ, requested=requested).is_enabled(feature)
-
-
-# The PR was never released, but this narrow source alias keeps in-branch callers
-# importable while the correction migrates them. It is intentionally undocumented.
-Rollout = RolloutSnapshot

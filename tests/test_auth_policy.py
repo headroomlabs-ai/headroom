@@ -43,11 +43,22 @@ def test_client_explicit_override_wins_over_user_agent() -> None:
     assert classify_client_signals(signals) == "aider"
 
 
-def test_grok_build_user_agent_is_subscription_client() -> None:
+def test_grok_build_user_agent_keeps_credential_driven_policy() -> None:
     signals = AuthSignals(user_agent="grok/1.2.3")
 
-    assert classify_auth_signals(signals) is AuthMode.SUBSCRIPTION
+    assert classify_auth_signals(signals) is AuthMode.PAYG
     assert classify_client_signals(signals) == "grok_build"
+
+
+def test_grok_shell_user_agent_maps_to_grok_build_but_not_subscription() -> None:
+    # Current Grok Build releases send grok-shell/<version> (grok 0.2.112).
+    # Client classification must recognize it; auth mode deliberately stays
+    # key-driven (API-key grok is pay-per-token and should keep the
+    # aggressive policy), so grok-shell/ is NOT a subscription UA prefix.
+    signals = AuthSignals(user_agent="grok-shell/0.2.112 (macos; aarch64)")
+
+    assert classify_client_signals(signals) == "grok_build"
+    assert classify_auth_signals(signals) is not AuthMode.SUBSCRIPTION
 
 
 def test_codex_stamp_only_for_unidentified_responses_callers() -> None:
@@ -60,3 +71,34 @@ def test_codex_stamp_only_for_unidentified_responses_callers() -> None:
         is False
     )
     assert should_stamp_codex_client_signals("/v1/chat/completions", AuthSignals()) is False
+
+
+def test_bearer_scheme_is_case_insensitive() -> None:
+    # RFC 7235 §2.1: the auth-scheme token is case-insensitive. A lowercase or
+    # mixed-case "bearer" carrying a PAYG key must classify as PAYG, not fall
+    # through to the non-Bearer OAUTH branch.
+    for scheme in ("bearer", "BEARER", "Bearer", "BeArEr"):
+        signals = AuthSignals(authorization=f"{scheme} sk-ant-api03-abc")
+        assert classify_auth_signals(signals) is AuthMode.PAYG, scheme
+
+
+def test_bearer_case_insensitive_preserves_oauth_and_jwt_shapes() -> None:
+    jwt = "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0In0.signature"
+    assert classify_auth_signals(AuthSignals(authorization="bearer sk-ant-oat01-abc")) is (
+        AuthMode.OAUTH
+    )
+    assert classify_auth_signals(AuthSignals(authorization=f"bearer {jwt}")) is AuthMode.OAUTH
+
+
+def test_credential_case_is_not_folded() -> None:
+    # Only the scheme is case-folded; the token keeps its case, so a PAYG
+    # `sk-...` prefix still matches exactly (it is lowercase by construction).
+    signals = AuthSignals(authorization="Bearer sk-PROJ-Abc123")
+    assert classify_auth_signals(signals) is AuthMode.PAYG
+
+
+def test_non_bearer_scheme_still_oauth() -> None:
+    # AWS SigV4 (Bedrock) and any other non-Bearer scheme keep the OAUTH
+    # passthrough-prefer classification.
+    signals = AuthSignals(authorization="AWS4-HMAC-SHA256 Credential=AKIA/...")
+    assert classify_auth_signals(signals) is AuthMode.OAUTH
