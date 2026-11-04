@@ -302,13 +302,55 @@ Configure context limits and pricing for new or custom models. Useful when:
 
 ### Configuration Methods
 
-Settings are resolved in this order (later overrides earlier):
-1. Built-in defaults
-2. `${HEADROOM_CONFIG_DIR}/models.json` (defaults to
+Headroom reads public model metadata from the **installed LiteLLM model database**
+(`litellm.model_cost`). That data ships with the LiteLLM package rather than being
+fetched at runtime, so it is as current as your installed LiteLLM version and
+refreshes when you upgrade it. No network call is made.
+
+Explicit configuration comes from three places, later overriding earlier:
+
+1. `${HEADROOM_CONFIG_DIR}/models.json` (defaults to
    `~/.headroom/config/models.json`); falls back to the legacy location
    `~/.headroom/models.json` when the canonical file is absent
-3. `HEADROOM_MODEL_LIMITS` environment variable
-4. SDK constructor arguments
+2. `HEADROOM_MODEL_LIMITS` environment variable
+3. SDK constructor arguments
+
+Limits and prices then resolve with **different** precedence. Both are
+first-match-wins:
+
+**Context limits**
+
+1. **Explicit configuration and the built-in table, checked together** — they are
+   merged into one mapping, so an exact match in either returns immediately,
+   followed by partial/prefix matches.
+2. **LiteLLM** (`max_input_tokens`) — reached only for models step 1 didn't match.
+3. **Pattern inference**, then a generic default.
+
+**Pricing**
+
+1. **Explicit configuration** — a configured value is a decision, so it beats
+   everything below.
+2. **LiteLLM.**
+3. **Built-in table**, then pattern inference, then a generic default.
+
+The asymmetry is deliberate. For limits a built-in entry outranks LiteLLM because
+LiteLLM reports a model's maximum *capability* while Headroom needs its *effective
+default*: LiteLLM gives `claude-sonnet-4-20250514` 1,000,000, but that window is
+an opt-in beta, so the built-in 200,000 is the safe assumption for a client that
+has not enabled it. Pricing has no capability-vs-default split, so there LiteLLM
+wins outright.
+
+Limits are an **input** budget (`max_input_tokens`), not the total window: `gpt-5`
+resolves to 272K input, not the 400K total (272K in + 128K out).
+
+LiteLLM also resolves gateway-routed names (`azure/...`, `bedrock/...`,
+`vertex_ai/...`, `groq/...`) that the built-in tables never covered, and the
+built-in tables additionally cover installs where LiteLLM is unavailable (the
+dependency is gated `python_version < '3.14'`).
+
+Configure only models Headroom can't already look up — fine-tunes, private
+deployments, gateway aliases. Pinning a public model's *price* here means
+maintaining a number yourself that would otherwise stay current.
 
 ### Config File Format
 
@@ -331,11 +373,11 @@ Create `~/.headroom/models.json`:
   },
   "openai": {
     "context_limits": {
-      "gpt-5": 256000,
-      "ft:gpt-4o:my-org": 128000
+      "ft:gpt-4o:my-org": 128000,
+      "my-private-deployment": 200000
     },
     "pricing": {
-      "gpt-5": [5.00, 15.00]
+      "my-private-deployment": [5.00, 15.00]
     }
   }
 }
