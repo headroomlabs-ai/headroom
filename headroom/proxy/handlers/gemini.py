@@ -27,6 +27,7 @@ from headroom.proxy.helpers import (
     COMPRESSION_TIMEOUT_SECONDS,
     extract_tags,
     invalid_request_body_message,
+    sanitize_forwarded_response_headers,
 )
 from headroom.proxy.identity import resolve_memory_identity
 from headroom.proxy.outcome import RequestOutcome
@@ -656,9 +657,7 @@ class GeminiHandlerMixin:
                         client=client,
                     )
                 )
-                response_headers = dict(response.headers)
-                response_headers.pop("content-encoding", None)
-                response_headers.pop("content-length", None)
+                response_headers = sanitize_forwarded_response_headers(response.headers)
                 response_headers["x-headroom-tokens-before"] = str(total_input_tokens)
                 response_headers["x-headroom-tokens-after"] = str(total_input_tokens)
                 response_headers["x-headroom-tokens-saved"] = "0"
@@ -1171,12 +1170,9 @@ class GeminiHandlerMixin:
                 else:
                     logger.info(f"[{request_id}] Gemini {model}: {original_tokens:,} tokens")
 
-                # Remove compression headers
-                response_headers = dict(response.headers)
-                response_headers.pop("content-encoding", None)
-                response_headers.pop("content-length", None)
-
-                # Inject Headroom compression metrics (for SaaS metering)
+                # Remove transport framing headers (the body is re-framed here)
+                # and inject Headroom compression metrics (for SaaS metering).
+                response_headers = sanitize_forwarded_response_headers(response.headers)
                 response_headers["x-headroom-tokens-before"] = str(original_tokens)
                 response_headers["x-headroom-tokens-after"] = str(optimized_tokens)
                 response_headers["x-headroom-tokens-saved"] = str(tokens_saved)
@@ -1199,9 +1195,7 @@ class GeminiHandlerMixin:
                 )
         except _GeminiContinuationError as e:
             await self.metrics.record_failed(provider=provider_name)
-            response_headers = dict(e.headers)
-            response_headers.pop("content-encoding", None)
-            response_headers.pop("content-length", None)
+            response_headers = sanitize_forwarded_response_headers(e.headers)
             return Response(content=e.content, status_code=e.status_code, headers=response_headers)
         except Exception as e:
             await self.metrics.record_failed(provider=provider_name)
@@ -1515,9 +1509,7 @@ class GeminiHandlerMixin:
                 url += f"?key={query_params['key']}"
 
             response = await self._retry_request("POST", url, headers, body)
-            response_headers = dict(response.headers)
-            response_headers.pop("content-encoding", None)
-            response_headers.pop("content-length", None)
+            response_headers = sanitize_forwarded_response_headers(response.headers)
             return Response(
                 content=response.content,
                 status_code=response.status_code,
@@ -1666,10 +1658,8 @@ class GeminiHandlerMixin:
                     f"[{request_id}] Gemini countTokens {model}: {compressed_tokens:,} tokens"
                 )
 
-            # Remove compression headers
-            response_headers = dict(response.headers)
-            response_headers.pop("content-encoding", None)
-            response_headers.pop("content-length", None)
+            # Remove transport framing headers (the body is re-framed here).
+            response_headers = sanitize_forwarded_response_headers(response.headers)
 
             return Response(
                 content=response.content,
