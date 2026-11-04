@@ -28,6 +28,8 @@ def temp_project(tmp_path: Path) -> dict[str, Path]:
     agent_hooks_claude.mkdir(parents=True)
     agent_hooks_github = plugins / "headroom-agent-hooks" / ".github" / "plugin"
     agent_hooks_github.mkdir(parents=True)
+    snip_claude = plugins / "headroom-snip" / ".claude-plugin"
+    snip_claude.mkdir(parents=True)
     sdk = root / "sdk"
     typescript = sdk / "typescript"
     typescript.mkdir(parents=True)
@@ -89,6 +91,9 @@ def temp_project(tmp_path: Path) -> dict[str, Path]:
     github_plugin = agent_hooks_github / "plugin.json"
     github_plugin.write_text(json.dumps({"name": "headroom-agent-hooks", "version": "0.1.0"}))
 
+    snip_plugin = snip_claude / "plugin.json"
+    snip_plugin.write_text(json.dumps({"name": "headroom-snip", "version": "0.1.0"}))
+
     # sdk/typescript/package.json
     typescript_pkg = typescript / "package.json"
     typescript_pkg.write_text(json.dumps({"name": "test", "version": "0.5.25"}))
@@ -116,6 +121,7 @@ def temp_project(tmp_path: Path) -> dict[str, Path]:
         "repo_claude_marketplace": repo_claude_marketplace,
         "repo_github_marketplace": repo_github_marketplace,
         "claude_plugin": claude_plugin,
+        "snip_plugin": snip_plugin,
         "github_plugin": github_plugin,
         "typescript_pkg": typescript_pkg,
         "server_json": server_json,
@@ -344,6 +350,7 @@ def test_plugin_manifests_only_leaves_package_versions_unchanged(
     assert json.loads(temp_project["opencode_pkg"].read_text())["version"] == "0.5.25"
     assert json.loads(temp_project["typescript_pkg"].read_text())["version"] == "0.5.25"
     assert json.loads(temp_project["claude_plugin"].read_text())["version"] == "0.8.0"
+    assert json.loads(temp_project["snip_plugin"].read_text())["version"] == "0.8.0"
     assert (
         json.loads(temp_project["repo_github_marketplace"].read_text())["metadata"]["version"]
         == "0.8.0"
@@ -414,3 +421,46 @@ def test_opencode_headroom_dependency_is_preserved_for_registry_installability(
     opencode_pkg = json.loads(temp_project["opencode_pkg"].read_text())
     assert opencode_pkg["version"] == "0.28.0"
     assert opencode_pkg["dependencies"]["headroom-ai"] == "^0.22.3"
+
+
+@pytest.mark.parametrize("plugin_only", [False, True])
+def test_version_sync_preserves_locked_dependencies_and_syncs_editable_root(
+    temp_project: dict[str, Path], plugin_only: bool
+) -> None:
+    root = temp_project["root"]
+    lock = root / "uv.lock"
+    before = """version = 1
+
+[[package]]
+name = "dependency"
+version = "0.5.25"
+source = { registry = "https://pypi.org/simple" }
+
+[[package]]
+name = "headroom-ai"
+version = "0.5.25"
+source = { editable = "." }
+dependencies = [{ name = "dependency" }]
+"""
+    lock.write_text(before, encoding="utf-8", newline="\n")
+    args = [
+        sys.executable,
+        str(Path(__file__).parent.parent / "version-sync.py"),
+        "--root",
+        str(root),
+        "--version",
+        "0.7.0",
+    ]
+    if plugin_only:
+        args.append("--plugin-manifests-only")
+    result = subprocess.run(args, capture_output=True, text=True)
+    assert result.returncode == 0, result.stderr
+    expected = (
+        before
+        if plugin_only
+        else before.replace(
+            'name = "headroom-ai"\nversion = "0.5.25"',
+            'name = "headroom-ai"\nversion = "0.7.0"',
+        )
+    )
+    assert lock.read_bytes() == expected.encode()

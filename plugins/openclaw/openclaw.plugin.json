@@ -26,6 +26,10 @@
       "label": "Compression Request Timeout",
       "help": "Maximum milliseconds to wait for one compression request before returning the original messages."
     },
+    "minContextChars": {
+      "label": "Minimum Context Size",
+      "help": "Skip the proxy for smaller contexts that cannot produce meaningful savings. Set to 0 to disable."
+    },
     "circuitBreakerThreshold": {
       "label": "Circuit Breaker Threshold",
       "help": "Consecutive compression failures before temporarily bypassing Headroom."
@@ -41,6 +45,10 @@
     "gatewayProviderIds": {
       "label": "Gateway Provider IDs",
       "help": "Optional list of OpenClaw provider ids to route through the active Headroom proxy in memory. Friendly aliases codex, claude, copilot, and gemini are also accepted. When set, this overrides the default openai-codex-only routing."
+    },
+    "announceCompression": {
+      "label": "Announce Compression In System Prompt",
+      "help": "When enabled, a static, cache-stable notice is added to the system prompt the first time a session compresses more than 100 tokens. Disable to guarantee the plugin never modifies the system prompt."
     }
   },
   "configSchema": {
@@ -84,7 +92,12 @@
       "requestTimeoutMs": {
         "type": "integer",
         "minimum": 1,
-        "default": 30000
+        "default": 2000
+      },
+      "minContextChars": {
+        "type": "integer",
+        "minimum": 0,
+        "default": 800
       },
       "circuitBreakerThreshold": {
         "type": "integer",
@@ -106,6 +119,10 @@
           "type": "string"
         },
         "default": []
+      },
+      "announceCompression": {
+        "type": "boolean",
+        "default": true
       }
     }
   },
