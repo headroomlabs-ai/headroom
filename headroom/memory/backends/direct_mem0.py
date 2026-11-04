@@ -59,6 +59,7 @@ from typing import Any
 
 from headroom.log_safety import describe_exception, safe_id
 from headroom.memory import qdrant_env
+from headroom.memory.backends.mem0 import disable_mem0_telemetry_by_default
 from headroom.memory.models import Memory
 from headroom.memory.ports import MemorySearchResult
 from headroom.offline import guard_egress
@@ -219,6 +220,7 @@ class DirectMem0Adapter:
                 self._neo4j_driver = None
 
         # Initialize Mem0 client for fallback path
+        disable_mem0_telemetry_by_default()
         try:
             from mem0 import Memory as Mem0Memory
 
