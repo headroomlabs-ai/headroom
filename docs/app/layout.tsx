@@ -1,4 +1,5 @@
 import { RootProvider } from 'fumadocs-ui/provider/next';
+import { Banner } from 'fumadocs-ui/components/banner';
 import './global.css';
 import { Inter } from 'next/font/google';
 import type { Metadata } from 'next';
@@ -48,7 +49,18 @@ export default function Layout({ children }: LayoutProps<'/'>) {
   return (
     <html lang="en" className={inter.className} suppressHydrationWarning>
       <body className="flex flex-col min-h-screen">
-        <RootProvider>{children}</RootProvider>
+        <RootProvider>
+          {/* Dismissible; Fumadocs remembers the dismissal per id in localStorage. */}
+          <Banner id="teams-contact-2026">
+            <a
+              href="https://headroomlabs.ai"
+              className="font-medium underline-offset-4 hover:underline"
+            >
+              Want more savings? Headroom for teams and enterprises: talk to us →
+            </a>
+          </Banner>
+          {children}
+        </RootProvider>
       </body>
     </html>
   );
