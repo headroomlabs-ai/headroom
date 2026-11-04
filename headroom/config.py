@@ -923,7 +923,9 @@ class PrefixFreezeConfig:
 class HeadroomConfig:
     """Main configuration for HeadroomClient."""
 
-    store_url: str = "sqlite:///headroom.db"
+    # None defers to HeadroomClient: its ``store_url`` argument, else a
+    # headroom.db in the system temp directory.
+    store_url: str | None = None
     default_mode: HeadroomMode = HeadroomMode.AUDIT
     model_context_limits: dict[str, int] = field(
         default_factory=lambda: DEFAULT_MODEL_CONTEXT_LIMITS.copy()
