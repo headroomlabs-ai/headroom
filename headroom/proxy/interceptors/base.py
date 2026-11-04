@@ -9,6 +9,7 @@ from dataclasses import dataclass
 from typing import Any, Protocol, runtime_checkable
 
 from headroom.cache.compression_cache import (
+    _can_swap_tool_result_content,
     _extract_tool_result_content,
     _is_tool_result_message,
     _swap_tool_result_content,
@@ -250,6 +251,10 @@ def apply_to_messages(
     new_messages: list[dict[str, Any]] = list(messages[:frozen_count])
     for msg in messages[frozen_count:]:
         if not _is_tool_result_message(msg):
+            new_messages.append(msg)
+            continue
+
+        if not _can_swap_tool_result_content(msg):
             new_messages.append(msg)
             continue
 

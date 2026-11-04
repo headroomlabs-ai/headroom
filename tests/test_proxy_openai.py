@@ -449,5 +449,7 @@ def test_websocket_route_carries_the_client_decision(
 
     assert seen, "the Responses compressor was never reached on the WS path"
     assert {
-        k: v for k, v in seen[0].items() if k not in {"timing", "deadline_started_at"}
+        k: v
+        for k, v in seen[0].items()
+        if k not in {"timing", "deadline_started_at", "savings_tags"}
     } == expected

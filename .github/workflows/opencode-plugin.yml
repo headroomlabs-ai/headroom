@@ -44,15 +44,15 @@ jobs:
       - run: npm run build
       - run: npm test
       # The wheel ships a committed self-contained bundle at
-      # headroom/providers/opencode/_dist/entry.opencode.js so pip installs
-      # get the transport plugin too. Rebuild it and fail if the committed
-      # artifact has drifted from the source.
+      # headroom/providers/opencode/_dist/index.js so pip installs get the
+      # transport plugin too. Rebuild it and fail if the committed artifact
+      # has drifted from the source.
       - run: npm run build:standalone
       - name: verify committed wheel bundle matches source
         run: |
-          cmp dist-standalone/entry.opencode.js \
-            ../../headroom/providers/opencode/_dist/entry.opencode.js \
-            || { echo "::error::headroom/providers/opencode/_dist/entry.opencode.js is stale - run 'npm run build:standalone' in plugins/opencode and commit the result"; exit 1; }
+          cmp dist-standalone/index.js \
+            ../../headroom/providers/opencode/_dist/index.js \
+            || { echo "::error::headroom/providers/opencode/_dist/index.js is stale - run 'npm run build:standalone' in plugins/opencode and commit the result"; exit 1; }
           cmp dist-standalone/hook-shim/handler.js \
             ../../headroom/providers/opencode/hook-shim/handler.js \
             || { echo "::error::headroom/providers/opencode/hook-shim/handler.js is stale - run 'npm run build:standalone' in plugins/opencode and commit the result"; exit 1; }
