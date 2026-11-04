@@ -475,11 +475,22 @@ class TestSessionAnalyzer:
         assert result.recommendations == []
         assert result.analysis_error == "API key not set"
 
+    @pytest.mark.parametrize(
+        "error",
+        [
+            "`claude -p` failed (exit 1):\nPrompt is too long",
+            # What codex exec printed on a real learn run: it refuses a prompt over 2**20 chars.
+            "`codex exec` failed (exit 1):\nError: turn/start: turn/start failed: Input exceeds "
+            "the maximum length of 1048576 characters. (code -32602), data: "
+            '{"input_error_code":"input_too_large","max_chars":1048576,"actual_chars":1786526}',
+        ],
+        ids=["claude", "codex"],
+    )
     @patch("headroom.learn.analyzer._call_llm")
-    def test_retries_smaller_digest_on_prompt_too_long(self, mock_call_llm: MagicMock):
+    def test_retries_smaller_digest_on_prompt_too_long(self, mock_call_llm: MagicMock, error):
         """A context-overflow error rebuilds the digest at half the budget and retries."""
         mock_call_llm.side_effect = [
-            RuntimeError("`claude -p` failed (exit 1):\nPrompt is too long"),
+            RuntimeError(error),
             {"context_file_rules": [], "memory_file_rules": []},
         ]
 

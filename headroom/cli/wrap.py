@@ -41,10 +41,7 @@ from functools import wraps
 from pathlib import Path
 from typing import Any, NamedTuple, cast
 
-try:
-    import tomllib
-except ModuleNotFoundError:  # pragma: no cover - Python < 3.11
-    import tomli as tomllib
+import tomllib
 
 from headroom._subprocess import identity_mismatch as _shared_identity_mismatch
 from headroom._subprocess import pid_alive, proc_identity, run
@@ -113,6 +110,11 @@ from headroom.providers.claude import (
 )
 from headroom.providers.claude.runtime import TOOL_SEARCH_FOUNDRY_DEFAULT
 from headroom.providers.codex import build_launch_env as _build_codex_launch_env
+from headroom.providers.codex.config_toml import (
+    loads_codex_config,
+    root_assignment_lines,
+    split_toml_lines,
+)
 from headroom.providers.codex.install import (
     CodexAuthConfigError,
     build_codex_auth_config,
@@ -763,6 +765,7 @@ def _start_proxy(
     copilot_api_token: str | None = None,
     copilot_refresh_oauth_token: str | None = None,
     copilot_api_token_expires_at: float | None = None,
+    proxy_extensions: list[str] | None = None,
 ) -> subprocess.Popen:
     """Start Headroom proxy as a background subprocess.
 
@@ -823,6 +826,13 @@ def _start_proxy(
 
     if vertex_api_url:
         cmd.extend(["--vertex-api-url", vertex_api_url])
+
+    # Extensions carried over from the proxy this one replaces (see
+    # ``_dedicated_proxy_extensions``). The flag outranks the envvar in click,
+    # so callers must not pass this when HEADROOM_PROXY_EXTENSIONS is set;
+    # ``_ensure_proxy_unlocked`` checks that before asking.
+    if proxy_extensions:
+        cmd.extend(["--proxy-extension", ",".join(proxy_extensions)])
 
     timeout_seconds = _resolve_wrap_proxy_timeout_seconds()
     log_path = _get_log_path(port)
@@ -3078,7 +3088,7 @@ def _codex_session_launch_settings(
     """Build process-local routing while preserving the selected provider id."""
     config_file, _ = _codex_config_paths()
     try:
-        config = tomllib.loads(_read_text(config_file)) if config_file.exists() else {}
+        config = loads_codex_config(_read_text(config_file)) if config_file.exists() else {}
     except (OSError, tomllib.TOMLDecodeError) as exc:
         raise click.ClickException(
             f"could not read Codex config for session routing: {exc}"
@@ -3339,19 +3349,28 @@ def _redirect_existing_top_level_keys(content: str, port: int) -> str:
 
         return _replace
 
-    redirected = content
+    # Only root assignments: the same keys inside [profiles.*] tables or a
+    # multi-line inline ``profiles = {`` table are the user's per-profile routing.
+    lines = split_toml_lines(content, keepends=True)
+    root_lines = sorted(root_assignment_lines(content))
     for key in _REDIRECTABLE_KEYS:
-        pattern = re.compile(rf'(?m)^[ \t]*{re.escape(key)}[ \t]*=[ \t]*"(?P<value>[^"\n]*)"[^\n]*')
-        redirected = pattern.sub(_make_replacer(key, port), redirected, count=1)
-    return redirected
+        pattern = re.compile(rf'[ \t]*{re.escape(key)}[ \t]*=[ \t]*"(?P<value>[^"\n]*)"[^\n]*')
+        replace = _make_replacer(key, port)
+        for index in root_lines:
+            match = pattern.match(lines[index])
+            if match:
+                lines[index] = replace(match) + lines[index][match.end() :]
+                break
+    return "".join(lines)
 
 
 def _has_redirectable_top_level_key(content: str, key: str) -> bool:
     """Return True if ``content`` declares ``key = "..."`` as a top-level key."""
     import re  # local import to match the module's existing convention
 
-    pattern = re.compile(rf'(?m)^[ \t]*{key}[ \t]*=[ \t]*"[^"\n]*"')
-    return pattern.search(content) is not None
+    pattern = re.compile(rf'[ \t]*{key}[ \t]*=[ \t]*"[^"\n]*"')
+    lines = split_toml_lines(content, keepends=True)
+    return any(pattern.match(lines[index]) for index in root_assignment_lines(content))
 
 
 def _codex_config_has_headroom_markers(content: str) -> bool:
@@ -3710,10 +3729,10 @@ def _inject_codex_provider_config(port: int) -> str | None:
             # name a line the user never wrote. Only the user's part has to
             # parse: stripping a stale Headroom block may be what repairs it.
             try:
-                tomllib.loads(content)
+                loads_codex_config(content)
             except tomllib.TOMLDecodeError:
                 try:
-                    tomllib.loads(original)
+                    loads_codex_config(original)
                     reason = "it is no longer valid TOML once Headroom's block is removed"
                 except tomllib.TOMLDecodeError as exc:
                     reason = f"it is not valid TOML ({exc})"
@@ -3761,7 +3780,7 @@ def _inject_codex_provider_config(port: int) -> str | None:
             )
 
         # Never replace a usable config with a malformed generated candidate.
-        tomllib.loads(content)
+        loads_codex_config(content)
         _write_text(config_file, content)
         click.echo(f"  Codex config: injected Headroom provider (WS + HTTP) into {config_file}")
         if custom_upstream_base_url:
@@ -4058,7 +4077,7 @@ def _inject_memory_mcp_config(user_id: str) -> None:
             content = mcp_section
 
         # Never replace a usable config with a malformed generated candidate.
-        tomllib.loads(content)
+        loads_codex_config(content)
         _write_text(config_file, content)
         click.echo(f"  Memory MCP: registered in {config_file}")
     except Exception as e:
@@ -4584,6 +4603,68 @@ def _echo_unwrap_proxy_stop_status(status: str, port: int) -> None:
         click.echo(f"  Warning: failed to stop Headroom proxy on port {port}; stop it manually.")
 
 
+def _manifest_proxy_extensions(manifest: Any) -> list[str] | None:
+    """Extension names a persistent deployment was installed with.
+
+    Two places in the manifest can say: ``--proxy-extension`` flags in
+    ``proxy_args``, which the runtime passes to the proxy verbatim (an operator
+    who edited the manifest by hand), and ``HEADROOM_PROXY_EXTENSIONS`` in
+    ``base_env`` (``headroom install --env ...``, the only form the installer
+    writes). They are read the way the proxy reads them: click lets the flag
+    outrank the environment variable, so when ``proxy_args`` names any
+    extension that list is the whole answer and ``base_env`` is ignored.
+    A manifest with neither is no evidence either way: the deployment's
+    runtime env is layered on the launch environment, so the proxy may still
+    have inherited a set. Only an explicit value (possibly empty) is an answer.
+    """
+    flags: list[str] = []
+    args = getattr(manifest, "proxy_args", None)
+    if isinstance(args, (list, tuple)):
+        for i, arg in enumerate(args):
+            if arg == "--proxy-extension" and i + 1 < len(args):
+                flags.append(str(args[i + 1]))
+            elif isinstance(arg, str) and arg.startswith("--proxy-extension="):
+                flags.append(arg.partition("=")[2])
+    if flags:
+        values = flags
+    else:
+        base_env = getattr(manifest, "base_env", None)
+        configured = (
+            base_env.get("HEADROOM_PROXY_EXTENSIONS") if isinstance(base_env, dict) else None
+        )
+        if not isinstance(configured, str):
+            return None
+        values = [configured]
+    return sorted({name.strip() for value in values for name in value.split(",") if name.strip()})
+
+
+def _dedicated_proxy_extensions(port: int, manifest: Any) -> list[str] | None:
+    """Extensions the proxy owning *port* runs with, for a dedicated proxy to carry.
+
+    A wrap that cannot reuse the proxy on its port (a Copilot subscription
+    seed, or a persistent deployment with other routing) starts a dedicated
+    proxy from the shell environment alone. An enterprise install enables its
+    savings sinks on the shared proxy as ``--proxy-extension``, so without
+    this the dedicated proxy would report nothing upstream while its local
+    dashboard fills (#3716). Prefers the running proxy's own answer over the
+    manifest. Returns ``None`` when neither says, so the caller warns rather
+    than start bare on a guess.
+    """
+    helpers = _live_wrap_module()
+    payload = helpers._query_proxy_health(port)
+    if payload is not None and not helpers._is_headroom_health(payload):
+        return []  # a foreign service holds the port; it ran no extensions
+    running = helpers._proxy_health_config(payload)
+    found = running.get("proxy_extensions") if running is not None else None
+    if isinstance(found, list):
+        return sorted(str(name) for name in found)
+    # No config, or a proxy too old to report the field: the manifest is the
+    # next best witness.
+    if manifest is not None:
+        return _manifest_proxy_extensions(manifest)
+    return None
+
+
 def _find_persistent_manifest(port: int) -> Any:
     """Return a matching persistent deployment manifest for the requested port."""
     from headroom.install.state import list_manifests
@@ -5015,13 +5096,13 @@ def _ensure_proxy_unlocked(
                 f"  Port {port} is in use by a non-Headroom service; selecting another port..."
             )
             proxy_listener = False
+        # Set False when the running proxy must not serve this session at all
+        # (unverifiable config, or a routing-level mismatch with live clients
+        # attached): fall through to a fresh start on a different port.
+        reuse_running = True
         if proxy_listener:
             # Proxy is running — check if it has the features we need
             needs_restart = False
-            # Set False when the running proxy must not serve this session at
-            # all (routing-level mismatch with live clients attached): fall
-            # through to a fresh start on a different port.
-            reuse_running = True
             routing_mismatches = (
                 None
                 if running_config is None
@@ -5223,6 +5304,30 @@ def _ensure_proxy_unlocked(
             else:
                 click.echo(f"  Port {port} is in use, using port {actual_port} instead.")
 
+        # This start leaves a running proxy on `port` in place and serves the
+        # session from `actual_port` beside it. Whatever that proxy reports
+        # through (an enterprise install's extensions) must come along, or the
+        # session's traffic vanishes from the team's dashboard while the local
+        # one fills (#3716).
+        replaces_running_proxy = (
+            isolated_copilot_subscription_proxy
+            or persistent_routing_mismatch
+            or (proxy_listener and not reuse_running)
+        )
+        proxy_extensions: list[str] | None = None
+        if replaces_running_proxy and "HEADROOM_PROXY_EXTENSIONS" not in os.environ:
+            proxy_extensions = helpers._dedicated_proxy_extensions(port, manifest)
+            if proxy_extensions is None:
+                click.echo(
+                    f"  Warning: could not read the extensions of the proxy on port {port}; "
+                    f"the dedicated proxy on port {actual_port} starts without any. "
+                    "Set HEADROOM_PROXY_EXTENSIONS=<names> to carry them."
+                )
+            elif proxy_extensions:
+                click.echo(
+                    f"  Extensions carried over from the proxy on port {port}: "
+                    f"{','.join(proxy_extensions)}"
+                )
         click.echo(f"  Starting Headroom proxy on port {actual_port}...")
         try:
             proc = cast(
@@ -5243,6 +5348,7 @@ def _ensure_proxy_unlocked(
                     copilot_api_token=copilot_api_token,
                     copilot_refresh_oauth_token=copilot_refresh_oauth_token,
                     copilot_api_token_expires_at=copilot_api_token_expires_at,
+                    proxy_extensions=proxy_extensions,
                 ),
             )
             click.echo(_proxy_status_line("Proxy ready", actual_port))
@@ -6632,11 +6738,13 @@ def copilot(
         headroom wrap copilot --subscription -- --model gpt-4.1
 
     \b
-    Copilot hosted API (--subscription and the implicit OAuth path) routes to the
-    generic host https://api.githubcopilot.com, which serves the full model set.
-    Enterprise / data-residency accounts provisioned on a dedicated host pin it
-    explicitly with GITHUB_COPILOT_API_URL (the override flows through to upstream).
-    See TESTING-copilot-subscription.md for details.
+    Copilot hosted API: --subscription routes Business / Enterprise seats to
+    the plan host GitHub advertises (GITHUB_COPILOT_USE_ADVERTISED_HOST=0 folds
+    them back to the generic host) and individual seats to the generic host
+    https://api.githubcopilot.com; the implicit OAuth path always uses the
+    generic host. Data-residency accounts provisioned on a dedicated host pin
+    it explicitly with GITHUB_COPILOT_API_URL (the override flows through to
+    upstream). See TESTING-copilot-subscription.md for details.
     """
     copilot_bin = _require_binary(
         "copilot",
@@ -7808,21 +7916,19 @@ def antigravity(
     verbose: bool,
     prepare_only: bool,
 ) -> None:
-    """Start Headroom proxy for use with Antigravity IDE.
+    """Start Headroom proxy for use with the Antigravity IDE.
 
     \b
-    Antigravity reads its model endpoints from its model-provider settings,
-    not from environment variables. This command starts the proxy and prints
-    the settings to add as a custom OpenAI-compatible model provider.
-
-    \b
-    After running this command, open Antigravity and add a custom model
-    provider with the printed base URL. Antigravity fetches the model list
-    from GET /v1/models automatically.
+    The Antigravity IDE does not support third-party model providers —
+    its agent models are Google-managed. This command starts the proxy
+    and prints what the integration actually covers: MCP server
+    registration (`headroom mcp install --agent antigravity`) and the
+    native `POST /v1internal:streamGenerateContent` endpoint for
+    `google-antigravity` clients.
 
     \b
     Example:
-        headroom wrap antigravity                # Start proxy + Antigravity settings
+        headroom wrap antigravity                # Start proxy + Antigravity setup
         headroom wrap antigravity --port 9999    # Custom proxy port
     """
     if prepare_only:
@@ -8015,7 +8121,15 @@ def zcode(
     if prepare_only:
         return
 
-    upstream = _detect_zcode_upstream()
+    # _ensure_proxy moves to another port when the requested one is held by a
+    # non-Headroom service. Resolve that port first so the upstream is chosen
+    # against the port the proxy will actually bind.
+    if not no_proxy and not (_check_proxy(port) and not _foreign_listener(port)):
+        try:
+            port = _find_available_port(port)
+        except (OSError, RuntimeError):
+            pass  # _ensure_proxy reports the same error
+    upstream = _detect_zcode_upstream(proxy_port=port)
     anthropic_url, openai_url = _zcode_upstream_to_urls(upstream)
 
     def _print_zcode_setup(actual_port: int = port) -> None:

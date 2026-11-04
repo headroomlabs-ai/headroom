@@ -61,6 +61,7 @@ _SUPPRESS_CONTEXT = vars(BaseException)["__suppress_context__"]
 _TRACEBACK = vars(BaseException)["__traceback__"]
 _ERRNO = vars(OSError)["errno"]
 _QUALNAME = vars(type)["__qualname__"]
+_CLASS_MODULE = vars(type)["__module__"]
 # Ints above this many bits have more than 4300 digits, which repr refuses.
 _MAX_ID_INT_BITS = 14_000
 # The module __dict__ descriptor itself, so a ModuleType subclass cannot override it.
@@ -300,6 +301,15 @@ def _int_repr(value: int) -> str:
     if bits > _MAX_ID_INT_BITS or (limit and bits * 0.30103 + 1 >= limit):
         return f"<int of {bits} bits>"
     return int.__repr__(value)
+
+
+def describe_class(cls: type) -> str:
+    """Name a class without emitting arbitrary plugin-defined metadata."""
+    name = _class_name(cls)
+    module = _CLASS_MODULE.__get__(cls)
+    if name is None or type(module) is not str or not _QUALIFIED_NAME.fullmatch(module):
+        return "<class>"
+    return f"{module}.{name}"
 
 
 def _class_name(cls: type) -> str | None:

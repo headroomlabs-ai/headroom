@@ -563,6 +563,17 @@ class TestCLIProxyEnvVars:
         assert result.exit_code == 0, result.output
         assert captured_config["config"].code_aware_enabled is True
 
+    @pytest.mark.parametrize("path", [["proxy"], ["install", "apply"]])
+    def test_code_aware_help_documents_enabled_default(self, path):
+        """--code-aware help must describe the default it resolves to (ON)."""
+        cmd = main
+        for name in path:
+            cmd = cmd.commands[name]
+        option = next(p for p in cmd.params if "--code-aware" in p.opts)
+
+        assert "Default: enabled" in option.help
+        assert "Default: disabled" not in option.help
+
     def test_code_aware_enabled_from_cli_flag(self, runner):
         """--code-aware should enable code-aware compression in the wrapper."""
         captured_config = {}
