@@ -33,6 +33,17 @@
 //! while its Bedrock form is present). Those price at $0 with a WARN
 //! until the table is refreshed — see the module note below.
 //!
+//! # Long-context tiers
+//!
+//! Some models publish a second, higher rate card for long prompts
+//! (LiteLLM's `*_above_<N>k_tokens` fields: Claude Haiku 5.5 above
+//! 100K, Sonnet 4 / 4.5 above 200K, GPT-5.x above 272K). Above the
+//! threshold the provider re-prices the WHOLE request — input, output
+//! and cache alike — not just the tokens past it, so [`lookup_card`]
+//! keeps both cards and [`PriceCard::for_prompt`] picks one from the
+//! billed prompt. A tier field a row leaves out falls back to that
+//! rate's base price, the same rule the Python cost path follows.
+//!
 //! # Unknown models price at $0
 //!
 //! A miss returns `None`; the ledger then records $0 for every USD
@@ -121,7 +132,71 @@ impl ModelPrice {
     }
 }
 
-static BOOK: OnceLock<HashMap<String, ModelPrice>> = OnceLock::new();
+/// A model's rate cards: the base one, plus the long-context one for
+/// models that publish it (see the module doc).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct PriceCard {
+    pub base: ModelPrice,
+    pub long_context: Option<LongContextTier>,
+}
+
+/// The card a request bills at once its prompt passes `above_tokens`.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct LongContextTier {
+    /// Prompt size (uncached + cache read + cache write tokens) the
+    /// request must exceed for this card to apply.
+    pub above_tokens: u64,
+    pub price: ModelPrice,
+}
+
+impl PriceCard {
+    /// The rates a request with `prompt_tokens` of billed prompt pays.
+    pub fn for_prompt(&self, prompt_tokens: u64) -> ModelPrice {
+        match self.long_context {
+            Some(tier) if prompt_tokens > tier.above_tokens => tier.price,
+            _ => self.base,
+        }
+    }
+
+    /// USD compression saved on one request: what it would have cost
+    /// uncompressed minus what it did cost.
+    ///
+    /// Inside one tier that is the removed tokens at that tier's input
+    /// rate. When the uncompressed prompt would have passed the
+    /// long-context threshold and the forwarded one does not, the
+    /// provider would have re-priced the WHOLE request — every input
+    /// bucket and the output — at the long card, so the saving is the
+    /// difference of the two full bills, not the removed tokens at the
+    /// cheap rate.
+    pub fn compression_savings_usd(
+        &self,
+        uncached_input_tokens: u64,
+        cache_read_tokens: u64,
+        cache_write_tokens: u64,
+        output_tokens: u64,
+        tokens_saved: u64,
+    ) -> f64 {
+        let prompt = uncached_input_tokens
+            .saturating_add(cache_read_tokens)
+            .saturating_add(cache_write_tokens);
+        let sent = self.for_prompt(prompt);
+        let unsent = self.for_prompt(prompt.saturating_add(tokens_saved));
+        if unsent == sent {
+            return sent.compression_savings_usd(tokens_saved);
+        }
+        let without = unsent.input_cost_usd(
+            uncached_input_tokens.saturating_add(tokens_saved),
+            cache_read_tokens,
+            cache_write_tokens,
+        ) + unsent.output_cost_usd(output_tokens);
+        let with =
+            sent.input_cost_usd(uncached_input_tokens, cache_read_tokens, cache_write_tokens)
+                + sent.output_cost_usd(output_tokens);
+        (without - with).max(0.0)
+    }
+}
+
+static BOOK: OnceLock<HashMap<String, PriceCard>> = OnceLock::new();
 
 /// Bounded once-per-model warn set so an unknown model logs one WARN,
 /// not one per request. Capped so attacker-controlled model ids can't
@@ -140,11 +215,48 @@ pub fn warm() {
     let _ = book();
 }
 
-fn book() -> &'static HashMap<String, ModelPrice> {
+fn book() -> &'static HashMap<String, PriceCard> {
     BOOK.get_or_init(parse_vendored)
 }
 
-fn parse_vendored() -> HashMap<String, ModelPrice> {
+/// A finite, non-negative price field, or `None`.
+fn price_field(spec: &serde_json::Map<String, serde_json::Value>, key: &str) -> Option<f64> {
+    spec.get(key)
+        .and_then(|v| v.as_f64())
+        .filter(|c| c.is_finite() && *c >= 0.0)
+}
+
+/// The row's long-context card, keyed off its
+/// `input_cost_per_token_above_<N>k_tokens` field. Every row in the
+/// vendored table publishes at most one such threshold.
+fn parse_long_context_tier(
+    spec: &serde_json::Map<String, serde_json::Value>,
+    base: &ModelPrice,
+) -> Option<LongContextTier> {
+    let (thousands, input) = spec.keys().find_map(|key| {
+        let n = key
+            .strip_prefix("input_cost_per_token_above_")?
+            .strip_suffix("k_tokens")?;
+        if n.is_empty() || !n.bytes().all(|b| b.is_ascii_digit()) {
+            return None;
+        }
+        Some((n.parse::<u64>().ok()?, price_field(spec, key)?))
+    })?;
+    let tiered = |field: &str, fallback: f64| {
+        price_field(spec, &format!("{field}_above_{thousands}k_tokens")).unwrap_or(fallback)
+    };
+    Some(LongContextTier {
+        above_tokens: thousands.saturating_mul(1000),
+        price: ModelPrice {
+            input,
+            output: tiered("output_cost_per_token", base.output),
+            cache_read: tiered("cache_read_input_token_cost", base.cache_read),
+            cache_write: tiered("cache_creation_input_token_cost", base.cache_write),
+        },
+    })
+}
+
+fn parse_vendored() -> HashMap<String, PriceCard> {
     let raw: serde_json::Value = serde_json::from_str(VENDORED_JSON)
         .expect("vendored LiteLLM JSON must parse — same invariant as model_limits");
     let mut out = HashMap::new();
@@ -166,23 +278,17 @@ fn parse_vendored() -> HashMap<String, ModelPrice> {
         if !input.is_finite() || !output.is_finite() || input < 0.0 || output < 0.0 {
             continue;
         }
-        let cache_read = spec
-            .get("cache_read_input_token_cost")
-            .and_then(|v| v.as_f64())
-            .filter(|c| c.is_finite() && *c >= 0.0)
-            .unwrap_or(input);
-        let cache_write = spec
-            .get("cache_creation_input_token_cost")
-            .and_then(|v| v.as_f64())
-            .filter(|c| c.is_finite() && *c >= 0.0)
-            .unwrap_or(input);
+        let base = ModelPrice {
+            input,
+            output,
+            cache_read: price_field(spec, "cache_read_input_token_cost").unwrap_or(input),
+            cache_write: price_field(spec, "cache_creation_input_token_cost").unwrap_or(input),
+        };
         out.insert(
             model_id.to_ascii_lowercase(),
-            ModelPrice {
-                input,
-                output,
-                cache_read,
-                cache_write,
+            PriceCard {
+                long_context: parse_long_context_tier(spec, &base),
+                base,
             },
         );
     }
@@ -236,18 +342,24 @@ fn push_revision_trimmed(push: &mut impl FnMut(String), id: &str) {
     }
 }
 
-/// Look up per-token pricing for a model id. `None` means "not in
-/// the vendored table" — the caller records $0 for USD fields and
-/// this module logs one WARN per distinct model id.
-pub fn lookup(model: &str) -> Option<ModelPrice> {
+/// Look up a model's rate cards. `None` means "not in the vendored
+/// table" — the caller records $0 for USD fields and this module logs
+/// one WARN per distinct model id.
+pub fn lookup_card(model: &str) -> Option<PriceCard> {
     let table = book();
     for key in candidates(model) {
-        if let Some(p) = table.get(&key) {
-            return Some(*p);
+        if let Some(card) = table.get(&key) {
+            return Some(*card);
         }
     }
     warn_once(model);
     None
+}
+
+/// Look up a model's base per-token pricing — the card a prompt below
+/// any long-context threshold pays. See [`lookup_card`].
+pub fn lookup(model: &str) -> Option<ModelPrice> {
+    lookup_card(model).map(|card| card.base)
 }
 
 fn warn_once(model: &str) {
@@ -286,6 +398,98 @@ mod tests {
         assert!(p.input > 0.0 && p.output > p.input);
         assert!(p.cache_read < p.input, "cache reads are discounted");
         assert!(p.cache_write > p.input, "cache writes carry a premium");
+    }
+
+    #[test]
+    fn claude_haiku_5_5_base_rate_card() {
+        let p = lookup("claude-haiku-5-5").expect("priced");
+        assert!((p.input - 1e-7).abs() < 1e-15, "input $0.10/MTok");
+        assert!((p.output - 5e-7).abs() < 1e-15, "output $0.50/MTok");
+        assert!((p.cache_read - 1e-8).abs() < 1e-15, "cache read $0.01/MTok");
+        assert!(
+            (p.cache_write - 1.25e-7).abs() < 1e-15,
+            "5m cache write $0.125/MTok"
+        );
+    }
+
+    /// Haiku 5.5 re-prices the whole request at 5x once the prompt
+    /// passes 100K; at exactly 100K it still pays the base card.
+    #[test]
+    fn claude_haiku_5_5_long_prompt_card_above_100k() {
+        let card = lookup_card("claude-haiku-5-5").expect("priced");
+        let tier = card.long_context.expect("Haiku 5.5 publishes a 100K tier");
+        assert_eq!(tier.above_tokens, 100_000);
+        assert_eq!(card.for_prompt(100_000), card.base);
+        let long = card.for_prompt(100_001);
+        assert!((long.input - 5e-7).abs() < 1e-15, "input $0.50/MTok");
+        assert!((long.output - 2.5e-6).abs() < 1e-15, "output $2.50/MTok");
+        assert!(
+            (long.cache_read - 5e-8).abs() < 1e-15,
+            "cache read $0.05/MTok"
+        );
+        assert!(
+            (long.cache_write - 6.25e-7).abs() < 1e-15,
+            "5m cache write $0.625/MTok"
+        );
+    }
+
+    /// The threshold comes from each row's own field name, not a
+    /// shared constant: Sonnet 4.5's card switches at 200K.
+    #[test]
+    fn long_context_threshold_is_read_per_model() {
+        let card = lookup_card("claude-sonnet-4-5").expect("priced");
+        let tier = card.long_context.expect("Sonnet 4.5 publishes a 200K tier");
+        assert_eq!(tier.above_tokens, 200_000);
+        assert_eq!(card.for_prompt(150_000), card.base);
+        assert!((card.for_prompt(200_001).input - 6e-6).abs() < 1e-15);
+    }
+
+    /// Compression that keeps a prompt under the threshold saves the
+    /// long card on the whole request, not just the removed tokens at
+    /// the base rate: 110K -> 90K uncached on Haiku 5.5, 1K output, is
+    /// (110K x $0.50 + 1K x $2.50) - (90K x $0.10 + 1K x $0.50) per MTok.
+    #[test]
+    fn compression_across_the_threshold_saves_the_whole_premium() {
+        let card = lookup_card("claude-haiku-5-5").expect("priced");
+        let usd = card.compression_savings_usd(90_000, 0, 0, 1_000, 20_000);
+        assert!((usd - (0.0575 - 0.0095)).abs() < 1e-9, "usd: {usd}");
+        // Inside one tier it stays removed tokens at that tier's rate.
+        let below = card.compression_savings_usd(50_000, 0, 0, 1_000, 20_000);
+        assert!((below - 20_000.0 * 1e-7).abs() < 1e-12, "below: {below}");
+        let above = card.compression_savings_usd(120_000, 0, 0, 1_000, 20_000);
+        assert!((above - 20_000.0 * 5e-7).abs() < 1e-12, "above: {above}");
+    }
+
+    /// A model without a published tier bills the base card at any size.
+    #[test]
+    fn flat_rated_model_has_no_long_context_tier() {
+        let card = lookup_card("claude-opus-4-6").expect("priced");
+        assert!(card.long_context.is_none());
+        assert_eq!(card.for_prompt(900_000), card.base);
+    }
+
+    /// A tier that omits a rate falls back to that rate's base price.
+    #[test]
+    fn missing_tier_field_falls_back_to_base_rate() {
+        let spec: serde_json::Map<String, serde_json::Value> = serde_json::from_str(
+            r#"{"input_cost_per_token_above_128k_tokens": 2e-6,
+                "output_cost_per_token_above_128k_tokens_priority": 9e-6}"#,
+        )
+        .unwrap();
+        let base = ModelPrice {
+            input: 1e-6,
+            output: 4e-6,
+            cache_read: 1e-7,
+            cache_write: 1e-6,
+        };
+        let tier = parse_long_context_tier(&spec, &base).expect("tier parsed");
+        assert_eq!(tier.above_tokens, 128_000);
+        assert_eq!(tier.price.input, 2e-6);
+        assert_eq!(
+            tier.price.output, base.output,
+            "a _priority variant is not the tier"
+        );
+        assert_eq!(tier.price.cache_read, base.cache_read);
     }
 
     /// Bedrock cross-region pricing is region-specific, so an exact
