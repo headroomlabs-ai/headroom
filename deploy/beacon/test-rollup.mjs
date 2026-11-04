@@ -13,7 +13,7 @@
  */
 import { readdirSync, readFileSync } from 'node:fs';
 import assert from 'node:assert/strict';
-import { inflate, oldestRawDay, rollupHour } from './worker.js';
+import worker, { inflate, oldestRawDay, rollupHour } from './worker.js';
 
 // R2 returns at most 1000 keys per list page, so on a real hour (~4,000
 // objects) the cursor loop in rollupHour is load-bearing. The stub paginates at
@@ -252,6 +252,41 @@ if (dir) {
   );
 
   console.log(`gzip: ${payload.length} B -> ${packed.length} B, bomb refused`);
+}
+
+// ---- fetch(): the RATE_LIMIT binding -----------------------------------------
+//
+// A body with no log records stops at the 204 right after parsing, so these
+// exercise the limiter without touching R2.
+{
+  const post = () =>
+    new Request('https://beacon.test/v1/logs', { method: 'POST', body: '{}' });
+  const limiter = (impl) => ({ RATE_LIMIT: { limit: impl } });
+
+  const over = await worker.fetch(post(), limiter(async () => ({ success: false })), {});
+  assert.equal(over.status, 429, 'over the limit is refused');
+
+  const under = await worker.fetch(post(), limiter(async () => ({ success: true })), {});
+  assert.equal(under.status, 204, 'under the limit proceeds');
+
+  const quiet = console.error;
+  console.error = () => {};
+  let down;
+  try {
+    down = await worker.fetch(post(), limiter(async () => { throw new Error('limiter down'); }), {});
+  } finally {
+    console.error = quiet;
+  }
+  assert.equal(down.status, 204, 'a limiter outage fails open instead of dropping beacons');
+
+  const unbound = await worker.fetch(post(), {}, {});
+  assert.equal(unbound.status, 204, 'no binding fails open');
+
+  let keys = [];
+  await worker.fetch(post(), limiter(async (opts) => { keys.push(opts.key); return { success: true }; }), {});
+  assert.deepEqual(keys, ['all'], 'one shared key: the sender is never read');
+
+  console.log('rate limit: 429 over, fail-open on outage and when unbound');
 }
 
 console.log('ok');

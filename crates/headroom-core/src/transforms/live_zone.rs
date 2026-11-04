@@ -189,6 +189,9 @@ const THRESHOLD_SOURCE_CODE: usize = 2048;
 /// gate fires before dispatch, so sub-threshold prose never reaches the
 /// Kompress arm wired below.
 const THRESHOLD_PLAIN_TEXT: usize = 5120;
+/// Tabular text has no native compressor; keep it lossless.
+const THRESHOLD_TABULAR: usize = 512;
+
 /// HTML blocks have no compressor. 512 was PlainText's pre-PR-B4 value;
 /// HTML deliberately keeps it rather than following PlainText to 5120,
 /// because `REALIGNMENT/04` pins no HTML threshold — when an HTML
@@ -212,6 +215,7 @@ pub const fn threshold_for(content_type: ContentType) -> usize {
         ContentType::SourceCode => THRESHOLD_SOURCE_CODE,
         ContentType::PlainText => THRESHOLD_PLAIN_TEXT,
         ContentType::Html => THRESHOLD_HTML,
+        ContentType::Tabular => THRESHOLD_TABULAR,
     }
 }
 
@@ -1732,6 +1736,12 @@ fn dispatch_compressor(text: &str, content_type: ContentType) -> DispatchResult 
         // when the model isn't cache-resident, hasn't finished its
         // background initialization yet, or the `ml` feature is off —
         // no network call and no model build ever happens on this path.
+        // This dispatcher has no tabular compressor; preserve these rows
+        // instead of sending structured output through lossy Kompress.
+        ContentType::Tabular => DispatchResult::NoOp {
+            content_type: content_type.as_str(),
+        },
+
         ContentType::PlainText => kompress_or_noop(text, content_type),
         // No HTML compressor on the Rust side; pages are handled by
         // upstream extractors, not the proxy.
