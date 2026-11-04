@@ -42,6 +42,7 @@ scripts/*
 !scripts/refresh_tool_hashes.py
 !scripts/record_kompress_fixtures.py
 !scripts/record_code_compressor_fixtures.py
+!scripts/qualify_cargo_dependencies.py
 
 # Rust / Cargo build artifacts
 /target/
