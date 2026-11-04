@@ -185,3 +185,26 @@ describe("detectFormat: Anthropic document blocks", () => {
     ).toBe("anthropic");
   });
 });
+
+describe("detectFormat: Anthropic thinking blocks", () => {
+  it("detects a turn whose only Anthropic marker is a thinking block", () => {
+    const messages = [
+      { role: "user", content: "hi" },
+      {
+        role: "assistant",
+        content: [
+          { type: "thinking", thinking: "...", signature: "SIG" },
+          { type: "text", text: "hello" },
+        ],
+      },
+    ];
+    expect(detectFormat(messages)).toBe("anthropic");
+  });
+
+  it("detects a turn whose only Anthropic marker is a redacted_thinking block", () => {
+    const messages = [
+      { role: "assistant", content: [{ type: "redacted_thinking", data: "REDACTED" }, { type: "text", text: "hello" }] },
+    ];
+    expect(detectFormat(messages)).toBe("anthropic");
+  });
+});
