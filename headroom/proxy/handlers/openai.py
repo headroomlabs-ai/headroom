@@ -4372,7 +4372,24 @@ class OpenAIHandlerMixin:
             # /v1/responses) — pre-PR-this site was the only chat
             # path without one.
             try:
-                if self.memory_handler.config.inject_context:
+                if self.memory_handler.config.inject_context and is_cache_mode(self.config.mode):
+                    # Cache mode never injects context, so the next-turn prefix
+                    # bytes stay byte-equal to this turn's bytes. Skip the search
+                    # too: its result could only be discarded (#4600, #4622).
+                    from headroom.proxy.helpers import log_memory_injection
+                    from headroom.utils import extract_user_query
+
+                    if tags is not None:
+                        tags["memory_skip_reason"] = "cache_mode"
+                    log_memory_injection(
+                        request_id=request_id,
+                        session_id=None,
+                        decision="skipped_cache_mode",
+                        bytes_injected=0,
+                        query=extract_user_query(optimized_messages) or "",
+                        tags=tags,
+                    )
+                elif self.memory_handler.config.inject_context:
                     memory_context = await asyncio.wait_for(
                         self.memory_handler.search_and_format_context(
                             memory_user_id,
@@ -6211,7 +6228,24 @@ class OpenAIHandlerMixin:
                 # (latest non-frozen user item). Instructions are part of the
                 # cache hot zone and must never be mutated — invariant I2.
                 # See REALIGNMENT/03-phase-A-lockdown.md PR-A2.
-                if self.memory_handler.config.inject_context:
+                if self.memory_handler.config.inject_context and is_cache_mode(self.config.mode):
+                    # Cache mode never injects context, so the next-turn prefix
+                    # bytes stay byte-equal to this turn's bytes. Skip the search
+                    # too: its result could only be discarded (#4600, #4622).
+                    from headroom.proxy.helpers import log_memory_injection
+                    from headroom.utils import extract_user_query
+
+                    if tags is not None:
+                        tags["memory_skip_reason"] = "cache_mode"
+                    log_memory_injection(
+                        request_id=request_id,
+                        session_id=None,
+                        decision="skipped_cache_mode",
+                        bytes_injected=0,
+                        query=extract_user_query(optimized_messages) or "",
+                        tags=tags,
+                    )
+                elif self.memory_handler.config.inject_context:
                     try:
                         memory_context = await asyncio.wait_for(
                             self.memory_handler.search_and_format_context(
@@ -8276,7 +8310,24 @@ class OpenAIHandlerMixin:
                     )
 
                     # Inject memory context into instructions
-                    if self.memory_handler.config.inject_context:
+                    if self.memory_handler.config.inject_context and is_cache_mode(
+                        self.config.mode
+                    ):
+                        # Cache mode never injects context, so the next-turn prefix
+                        # bytes stay byte-equal to this turn's bytes. Skip the search
+                        # too: its result could only be discarded (#4600, #4622).
+                        if ws_tags is not None:
+                            ws_tags["memory_skip_reason"] = "cache_mode"
+                        ws_input = ws_response_body.get("input", "")
+                        log_memory_injection(
+                            request_id=request_id,
+                            session_id=session_id,
+                            decision="skipped_cache_mode",
+                            bytes_injected=0,
+                            query=ws_input if isinstance(ws_input, str) else "",
+                            tags=ws_tags,
+                        )
+                    elif self.memory_handler.config.inject_context:
                         ws_input = ws_response_body.get("input", "")
                         ws_instructions = ws_response_body.get("instructions")
                         ws_msgs: list[dict[str, Any]] = []
