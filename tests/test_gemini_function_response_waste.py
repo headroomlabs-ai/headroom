@@ -89,6 +89,23 @@ class TestFunctionResponseConversion:
         # verbatim on the wire regardless of the telemetry conversion.
         assert preserved == {1}
 
+    def test_flag_emits_tool_message_for_snake_case_function_response(self, proxy):
+        """The REST API also accepts ``function_response``; its payload counts too."""
+        payload = _big_payload()
+        contents = [
+            {"role": "user", "parts": [{"text": "fetch the data"}]},
+            {
+                "role": "user",
+                "parts": [{"function_response": {"name": "fetch_data", "response": payload}}],
+            },
+        ]
+        messages, preserved = proxy._gemini_contents_to_messages(
+            contents, include_function_responses=True
+        )
+        assert [m["role"] for m in messages] == ["user", "tool"]
+        assert json.loads(messages[1]["content"]) == payload
+        assert preserved == {1}
+
     def test_flag_passes_string_response_through(self, proxy):
         contents = [_function_response_content("plain text tool output")]
         messages, _ = proxy._gemini_contents_to_messages(contents, include_function_responses=True)
