@@ -1,5 +1,5 @@
 version = 1
-revision = 5
+revision = 3
 requires-python = ">=3.11"
 resolution-markers = [
     "python_full_version >= '3.14' and platform_machine == 'x86_64' and sys_platform == 'darwin'",
@@ -1463,7 +1463,7 @@ all = [
     { name = "orjson", marker = "platform_python_implementation != 'PyPy'" },
     { name = "pillow" },
     { name = "python-socks" },
-    { name = "rapidocr", marker = "python_full_version == '3.13.*' or (python_full_version >= '3.14' and platform_machine != 'x86_64') or (python_full_version >= '3.14' and sys_platform != 'darwin')" },
+    { name = "rapidocr", marker = "(python_full_version >= '3.13' and platform_machine != 'x86_64') or (python_full_version == '3.13.*' and platform_machine == 'x86_64' and sys_platform == 'darwin') or (python_full_version >= '3.13' and sys_platform != 'darwin')" },
     { name = "rapidocr-onnxruntime", marker = "python_full_version < '3.13'" },
     { name = "scikit-learn" },
     { name = "sentence-transformers", marker = "platform_machine != 'x86_64' or sys_platform != 'darwin'" },
@@ -1539,7 +1539,7 @@ image = [
     { name = "onnxruntime", version = "1.23.2", source = { registry = "https://pypi.org/simple/" }, marker = "python_full_version == '3.13.*' and platform_machine == 'x86_64' and sys_platform == 'darwin'" },
     { name = "onnxruntime", version = "1.26.0", source = { registry = "https://pypi.org/simple/" }, marker = "(python_full_version >= '3.13' and platform_machine != 'x86_64') or (python_full_version >= '3.13' and sys_platform != 'darwin')" },
     { name = "pillow" },
-    { name = "rapidocr", marker = "python_full_version == '3.13.*' or (python_full_version >= '3.14' and platform_machine != 'x86_64') or (python_full_version >= '3.14' and sys_platform != 'darwin')" },
+    { name = "rapidocr", marker = "(python_full_version >= '3.13' and platform_machine != 'x86_64') or (python_full_version == '3.13.*' and platform_machine == 'x86_64' and sys_platform == 'darwin') or (python_full_version >= '3.13' and sys_platform != 'darwin')" },
     { name = "rapidocr-onnxruntime", marker = "python_full_version < '3.13'" },
     { name = "sentencepiece" },
 ]
@@ -1745,13 +1745,13 @@ requires-dist = [
     { name = "langchain-ollama", marker = "extra == 'dev'", specifier = ">=0.2.0" },
     { name = "langchain-openai", marker = "extra == 'langchain'", specifier = ">=1.1.14,<2.0" },
     { name = "langchain-openai", marker = "extra == 'langgraph'", specifier = ">=1.1.14,<2.0" },
-    { name = "langgraph", marker = "extra == 'langgraph'", specifier = ">=1.0,<2.0" },
+    { name = "langgraph", marker = "extra == 'langgraph'", specifier = ">=1.2.14,<2.0" },
     { name = "litellm", specifier = ">=1.96.2,<2.0" },
     { name = "litellm", marker = "extra == 'dev'", specifier = ">=1.96.2,<2.0" },
     { name = "magika", marker = "(python_full_version < '3.14' and extra == 'proxy') or (platform_machine != 'x86_64' and extra == 'proxy') or (sys_platform != 'darwin' and extra == 'proxy')", specifier = ">=0.6.0" },
     { name = "mcp", marker = "extra == 'mcp'", specifier = ">=1.30.0,<2.0.0" },
     { name = "mcp", marker = "extra == 'proxy'", specifier = ">=1.30.0,<2.0.0" },
-    { name = "mem0ai", marker = "extra == 'memory-stack'", specifier = ">=2.0.0,<3.0" },
+    { name = "mem0ai", marker = "extra == 'memory-stack'", specifier = ">=2.0.18,<3.0" },
     { name = "mypy", marker = "extra == 'dev'", specifier = ">=1.0.0" },
     { name = "neo4j", marker = "extra == 'memory-stack'", specifier = ">=5.20.0,<7.0" },
     { name = "numpy", marker = "extra == 'dev'", specifier = ">=1.24.0" },
@@ -1760,9 +1760,9 @@ requires-dist = [
     { name = "ollama", marker = "extra == 'dev'", specifier = ">=0.4.0" },
     { name = "onnxruntime", marker = "(python_full_version >= '3.11' and platform_machine != 'x86_64' and extra == 'proxy') or (python_full_version >= '3.11' and sys_platform != 'darwin' and extra == 'proxy')", specifier = ">=1.24.0" },
     { name = "onnxruntime", marker = "(python_full_version >= '3.11' and platform_machine != 'x86_64' and extra == 'voice') or (python_full_version >= '3.11' and sys_platform != 'darwin' and extra == 'voice')", specifier = ">=1.24.0" },
-    { name = "onnxruntime", marker = "(python_full_version >= '3.11' and python_full_version < '3.14' and platform_machine == 'x86_64' and sys_platform == 'darwin' and extra == 'proxy') or (python_full_version < '3.11' and extra == 'proxy')", specifier = ">=1.16.0,<1.24.0" },
-    { name = "onnxruntime", marker = "(python_full_version >= '3.11' and python_full_version < '3.14' and platform_machine == 'x86_64' and sys_platform == 'darwin' and extra == 'voice') or (python_full_version < '3.11' and extra == 'voice')", specifier = ">=1.16.0,<1.24.0" },
-    { name = "onnxruntime", marker = "(python_full_version >= '3.14' and platform_machine != 'x86_64' and extra == 'image') or (python_full_version >= '3.14' and sys_platform != 'darwin' and extra == 'image') or (python_full_version == '3.13.*' and extra == 'image')", specifier = ">=1.7,<2" },
+    { name = "onnxruntime", marker = "(python_full_version < '3.14' and platform_machine == 'x86_64' and sys_platform == 'darwin' and extra == 'proxy') or (python_full_version < '3.11' and platform_machine != 'x86_64' and extra == 'proxy') or (python_full_version < '3.11' and sys_platform != 'darwin' and extra == 'proxy')", specifier = ">=1.16.0,<1.24.0" },
+    { name = "onnxruntime", marker = "(python_full_version < '3.14' and platform_machine == 'x86_64' and sys_platform == 'darwin' and extra == 'voice') or (python_full_version < '3.11' and platform_machine != 'x86_64' and extra == 'voice') or (python_full_version < '3.11' and sys_platform != 'darwin' and extra == 'voice')", specifier = ">=1.16.0,<1.24.0" },
+    { name = "onnxruntime", marker = "(python_full_version == '3.13.*' and platform_machine == 'x86_64' and sys_platform == 'darwin' and extra == 'image') or (python_full_version >= '3.13' and platform_machine != 'x86_64' and extra == 'image') or (python_full_version >= '3.13' and sys_platform != 'darwin' and extra == 'image')", specifier = ">=1.7,<2" },
     { name = "openai", marker = "extra == 'dev'", specifier = ">=1.0.0" },
     { name = "openai", marker = "extra == 'evals'", specifier = ">=1.0.0" },
     { name = "openai", marker = "extra == 'proxy'", specifier = ">=2.14.0" },
@@ -1783,7 +1783,7 @@ requires-dist = [
     { name = "python-socks", extras = ["asyncio"], marker = "extra == 'proxy'", specifier = ">=2.7.1" },
     { name = "pyyaml", specifier = ">=6.0" },
     { name = "qdrant-client", marker = "extra == 'memory-stack'", specifier = ">=1.9.0,<2.0" },
-    { name = "rapidocr", marker = "(python_full_version >= '3.14' and platform_machine != 'x86_64' and extra == 'image') or (python_full_version >= '3.14' and sys_platform != 'darwin' and extra == 'image') or (python_full_version == '3.13.*' and extra == 'image')", specifier = ">=3.0,<4" },
+    { name = "rapidocr", marker = "(python_full_version == '3.13.*' and platform_machine == 'x86_64' and sys_platform == 'darwin' and extra == 'image') or (python_full_version >= '3.13' and platform_machine != 'x86_64' and extra == 'image') or (python_full_version >= '3.13' and sys_platform != 'darwin' and extra == 'image')", specifier = ">=3.0,<4" },
     { name = "rapidocr-onnxruntime", marker = "python_full_version < '3.13' and extra == 'image'", specifier = ">=1.4.0,<2" },
     { name = "redis", marker = "extra == 'redis'", specifier = ">=5.0.0" },
     { name = "respx", marker = "extra == 'dev'", specifier = ">=0.20.0" },
@@ -2251,7 +2251,7 @@ wheels = [
 
 [[package]]
 name = "langgraph"
-version = "1.2.11"
+version = "1.2.19"
 source = { registry = "https://pypi.org/simple/" }
 dependencies = [
     { name = "langchain-core" },
@@ -2261,22 +2261,22 @@ dependencies = [
     { name = "pydantic" },
     { name = "xxhash" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/56/0d/c8e7ee98896659e1b6555db0ab115a9ca899844744645d5d894032bab1d7/langgraph-1.2.11.tar.gz", hash = "sha256:9ecfe11e50d338b34b15cf4d8a442642de103e8ae6971320efba84e4542eb363", size = 725753, upload-time = "2026-08-11T14:00:36.945Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/ba/10/329dc49ce3fc40e36faafd407f08607fe3fab75613e709a66758b53faac2/langgraph-1.2.19.tar.gz", hash = "sha256:4a00fa1aad2b5fc2d3a789a8e9eaf993f76218ca924b434902ecf1bbaaf300f6", size = 782618, upload-time = "2026-10-30T22:23:32.962Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/0a/7f/c5c30e4be99ff821029c7ac872a480676bb179c9f3df85ea3f38d13f86d4/langgraph-1.2.11-py3-none-any.whl", hash = "sha256:8bab70de7b2d00b5300fb289bcf38d8b241400f3184c1e95e8ce706fb0e8686b", size = 248854, upload-time = "2026-08-11T14:00:35.494Z" },
+    { url = "https://files.pythonhosted.org/packages/d7/9e/bd29e368fb16feea8d24270d377d56c34b49afea371717124f19cdfa890c/langgraph-1.2.19-py3-none-any.whl", hash = "sha256:6094a5cbed52a77d8c74c276fcd2056abde7b2836eab1c7a6b74bacbd1a269b3", size = 262285, upload-time = "2026-10-30T22:23:31.334Z" },
 ]
 
 [[package]]
 name = "langgraph-checkpoint"
-version = "4.2.0"
+version = "4.3.1"
 source = { registry = "https://pypi.org/simple/" }
 dependencies = [
     { name = "langchain-core" },
     { name = "ormsgpack" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/dc/e1/089c4c9e0a2fec7f883f82ae8e6a727138d50074cfeb6644bc2d13b1019b/langgraph_checkpoint-4.2.0.tar.gz", hash = "sha256:51a593b6bee684b0818e5d6e58e28ab340c6db7794575056ce7bd1b746a84ed7", size = 180239, upload-time = "2026-08-07T20:05:03.756Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/f0/c4/f4107f50dd07169d08d95766cd69104231e694f44a1b25b68ad8b393712d/langgraph_checkpoint-4.3.1.tar.gz", hash = "sha256:625e7c78a72b33e7c47f7e87ca051060fb90aa66f5fd551c472c08376fb669cb", size = 182679, upload-time = "2026-10-26T19:57:31.416Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/05/71/3b475f09bd57d3a5649792c66353312b4432afd843f301739dfcebd157f0/langgraph_checkpoint-4.2.0-py3-none-any.whl", hash = "sha256:0547fd228935a0b758865de3a3d6d7a2537c308895d0f9ab092ce9151b5da942", size = 56833, upload-time = "2026-08-07T20:05:02.655Z" },
+    { url = "https://files.pythonhosted.org/packages/f3/40/4251d676b5c585d42175c901175d4bff56e22939625e18bcef781fc3e893/langgraph_checkpoint-4.3.1-py3-none-any.whl", hash = "sha256:215a826935c8db4d9676e79fd95943e5b3847d78604390898e1d98581cc594e5", size = 58093, upload-time = "2026-10-26T19:57:30.361Z" },
 ]
 
 [[package]]
@@ -2294,7 +2294,7 @@ wheels = [
 
 [[package]]
 name = "langgraph-sdk"
-version = "0.4.6"
+version = "0.4.11"
 source = { registry = "https://pypi.org/simple/" }
 dependencies = [
     { name = "httpx" },
@@ -2303,9 +2303,9 @@ dependencies = [
     { name = "orjson" },
     { name = "websockets" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/78/85/54edf4902c0378510f09a009f64e3d3f5644aeeb51d13cf67ec380a5245b/langgraph_sdk-0.4.6.tar.gz", hash = "sha256:ea5b1749d70987d741c9b9fe2b7e1c5f7da7e4d102f64e390333c1890c9bbd5b", size = 350632, upload-time = "2026-10-06T14:17:53.641Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/64/a8/d5807df5976f2b8e181baddbddf857cc0ba501bba274e81711b10385c65b/langgraph_sdk-0.4.11.tar.gz", hash = "sha256:2550af3bc7cb78ac4facb97d141ec1a76568fa3eb3d29040cff70b45bda84740", size = 366656, upload-time = "2026-10-30T22:17:49.202Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/6c/c7/69d13026db3577c157877dea47a9dc5fffd3dcde2d1ab8009fa8f7e5f6a6/langgraph_sdk-0.4.6-py3-none-any.whl", hash = "sha256:57122b02bda41d37a97a5e09eb018aa8c9b3dc85c433880073779bd9324b7eea", size = 162390, upload-time = "2026-10-06T14:17:52.134Z" },
+    { url = "https://files.pythonhosted.org/packages/01/88/69899bb20b96b80468e98b90377e605c36658125e7e7fba401868a86138e/langgraph_sdk-0.4.11-py3-none-any.whl", hash = "sha256:6a65be4a8f825966a07317b8e34e3337cd227b9b58b185f0123fd13c3d0116fa", size = 169311, upload-time = "2026-10-30T22:17:47.96Z" },
 ]
 
 [[package]]
@@ -2759,7 +2759,7 @@ wheels = [
 
 [[package]]
 name = "mem0ai"
-version = "2.0.18"
+version = "2.2.1"
 source = { registry = "https://pypi.org/simple/" }
 dependencies = [
     { name = "httpx" },
@@ -2771,9 +2771,9 @@ dependencies = [
     { name = "qdrant-client" },
     { name = "sqlalchemy" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/50/42/00de525fc6a4ec4a6bddb180356e7a1587179cfb12e37953075bc7751328/mem0ai-2.0.18.tar.gz", hash = "sha256:7dfd23b119448fe631f2a20c025eeaee2bb2fb28b155e18b791486d2aa01896f", size = 248611, upload-time = "2026-08-11T18:58:00.363Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/08/28/151a796111f90017ec09b052ac09a55e7b3ae5e976542f38f35c54270f8e/mem0ai-2.2.1.tar.gz", hash = "sha256:099a7d58368908d0a05a633c5da3920f607a57db00d4f168800de05966b2a4a8", size = 256091, upload-time = "2026-09-25T17:36:09.406Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/09/eb/733a2c405f2890bbdbb32294f9fa9a4b248f0b7e91378821482caf02c5c4/mem0ai-2.0.18-py3-none-any.whl", hash = "sha256:2c20c78dec21c512e1daf6b7c2cacc306cb34eaab7dd24c2edc81b71386b0a10", size = 344386, upload-time = "2026-08-11T18:57:58.616Z" },
+    { url = "https://files.pythonhosted.org/packages/aa/48/7051dd9009232802c11a4c4d9e58ea32968c8e076ea79e2e8a6d243e49b3/mem0ai-2.2.1-py3-none-any.whl", hash = "sha256:fe91bb91ac8926231993a4aa58df00a60c6c74c709e6a338fe399500776eef4d", size = 351907, upload-time = "2026-09-25T17:36:07.48Z" },
 ]
 
 [[package]]
