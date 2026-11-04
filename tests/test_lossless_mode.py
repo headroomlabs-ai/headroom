@@ -252,7 +252,7 @@ def test_router_lossless_log_strategy_no_marker_and_recoverable() -> None:
         + "connection refused by upstream service alpha\n" * 40
         + "[info] boot sequence complete\n"
     )
-    out, _tokens, chain = router._apply_strategy_to_content(
+    out, _tokens, chain, _reversible = router._apply_strategy_to_content(
         log, CompressionStrategy.LOG, context=""
     )
     _assert_no_marker(out)
@@ -273,7 +273,7 @@ def test_router_lossless_diff_strategy_no_marker() -> None:
         "-old\n"
         "+new\n"
     )
-    out, _tokens, chain = router._apply_strategy_to_content(
+    out, _tokens, chain, _reversible = router._apply_strategy_to_content(
         diff, CompressionStrategy.DIFF, context=""
     )
     _assert_no_marker(out)

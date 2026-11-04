@@ -15,6 +15,11 @@ from unittest.mock import patch
 import pytest
 
 import headroom.transforms.code_compressor as cc
+from headroom.cache.compression_store import (
+    CompressionStore,
+    clear_request_compression_store,
+    set_request_compression_store,
+)
 from headroom.transforms.code_compressor import (
     CodeAwareCompressor,
     CodeCompressionResult,
@@ -208,6 +213,46 @@ def generate_go_code(n_functions: int = 3) -> str:
         )
 
     return "\n".join(lines)
+
+
+@pytest.mark.skipif(not TREE_SITTER_INSTALLED, reason="tree-sitter not installed")
+@pytest.mark.parametrize(
+    ("language", "code", "comment_prefix"),
+    [
+        pytest.param("python", generate_python_code(), "#", id="python"),
+        pytest.param("javascript", generate_javascript_code(), "//", id="javascript"),
+        pytest.param("typescript", generate_javascript_code(), "//", id="typescript"),
+        pytest.param("go", generate_go_code(), "//", id="go"),
+    ],
+)
+def test_ccr_marker_preserves_code_syntax(language, code, comment_prefix):
+    """CCR metadata must be a comment in the final output, not just before storage."""
+    store = CompressionStore()
+    set_request_compression_store(store)
+    try:
+        compressor = CodeAwareCompressor(
+            CodeCompressorConfig(
+                min_tokens_for_compression=10,
+                enable_ccr=True,
+                fallback_to_kompress=False,
+            )
+        )
+        result = compressor.compress(code, language=language)
+
+        assert result.cache_key is not None
+        assert result.syntax_valid
+        # Parse the returned source, including the marker appended after the
+        # compressor's internal syntax check (#4478, item 4).
+        assert compressor._verify_syntax(result.compressed, CodeLanguage(language))
+        marker = result.compressed.splitlines()[-1]
+        assert marker.startswith(f"{comment_prefix} [")
+        assert f"Retrieve more: hash={result.cache_key}." in marker
+        assert "Expires in 5m.]" in marker
+        entry = store.retrieve(result.cache_key)
+        assert entry is not None
+        assert entry.original_content == code
+    finally:
+        clear_request_compression_store()
 
 
 # =============================================================================
@@ -1804,6 +1849,72 @@ class TestRealASTRuns:
 
 
 @pytest.mark.skipif(not TREE_SITTER_INSTALLED, reason="tree-sitter grammar pack not installed")
+class TestMultiLineClassHeaders:
+    """Keep the opening brace when a multi-line signature shares its last
+    line with it (``impl<T> Foo<T> where T: Debug {``, ``class Foo
+    implements Bar {``). Dropping that line leaves the rebuilt header
+    without a brace, so the compressed output no longer parses and the
+    compressor falls back to the original.
+    """
+
+    def _compressor(self):
+        return CodeAwareCompressor(
+            CodeCompressorConfig(
+                min_tokens_for_compression=1,
+                max_body_lines=2,
+                enable_ccr=False,
+                semantic_analysis=False,
+            )
+        )
+
+    @pytest.mark.parametrize(
+        ("language", "code", "expected_header"),
+        [
+            (
+                "rust",
+                (
+                    "impl<T> Wrapper<T>\n"
+                    "where T: Debug + Clone {\n"
+                    "    pub fn total(&self) -> u64 {\n"
+                    "        let mut acc = 0;\n"
+                    "        for item in &self.items {\n"
+                    "            acc += item.id;\n"
+                    "        }\n"
+                    "        acc\n"
+                    "    }\n"
+                    "}\n"
+                ),
+                "where T: Debug + Clone {",
+            ),
+            (
+                "java",
+                (
+                    "public class Calc\n"
+                    "    extends Base\n"
+                    "    implements Runnable {\n"
+                    "    public int compute(int x) {\n"
+                    "        int a = x + 1;\n"
+                    "        int b = a * 2;\n"
+                    "        int c = b - 3;\n"
+                    "        return c;\n"
+                    "    }\n"
+                    "}\n"
+                ),
+                "implements Runnable {",
+            ),
+        ],
+    )
+    def test_opening_brace_line_survives_compression(self, language, code, expected_header):
+        result = self._compressor().compress(code, language=language)
+
+        assert result.language == CodeLanguage(language)
+        # A ratio of 1.0 means the syntax check rejected the output and the
+        # compressor returned the original untouched.
+        assert result.compression_ratio < 1.0
+        assert expected_header in result.compressed
+
+
+@pytest.mark.skipif(not TREE_SITTER_INSTALLED, reason="tree-sitter grammar pack not installed")
 class TestCSharpSupport:
     """C# (``csharp`` grammar) parity with Java/C++/Rust: signatures preserved
     verbatim, method/constructor bodies compressed, block-scoped namespaces
@@ -2210,3 +2321,108 @@ class TestPhpSupport:
         code = "<?php\nclass Broken {\n    public function oops( {\n"
         result = self._compressor().compress(code, language="php")
         assert result.compressed == code
+
+
+@pytest.mark.skipif(not TREE_SITTER_INSTALLED, reason="tree-sitter grammar pack not installed")
+class TestRustAttributeAttachment:
+    """Rust outer attributes (``#[derive(...)]``, ``#[inline]``, ``#[cfg(...)]``)
+    are siblings of the item they decorate, like doc comments. Left
+    uncaptured, they fall through to the leftover sweep and drift away from
+    the item — commonly after the compressed function, which rustc rejects
+    with ``expected item after attributes``.
+    """
+
+    def _compressor(self):
+        return CodeAwareCompressor(
+            CodeCompressorConfig(
+                min_tokens_for_compression=1,
+                max_body_lines=1,
+                enable_ccr=False,
+                semantic_analysis=False,
+            )
+        )
+
+    def test_attributes_stay_attached_to_their_items(self):
+        code = (
+            "#[derive(Debug, Clone, PartialEq)]\n"
+            "pub struct Item {\n"
+            "    pub id: u64,\n"
+            "    pub name: String,\n"
+            "}\n"
+            "\n"
+            "#[inline]\n"
+            '#[cfg(feature = "extra")]\n'
+            "pub fn log_item(item: &Item, sink: &mut Vec<u64>) {\n"
+            "    sink.push(item.id);\n"
+            "    sink.push(item.id + 1);\n"
+            "    sink.push(item.id + 2);\n"
+            "    sink.push(item.id + 3);\n"
+            "}\n"
+        )
+
+        result = self._compressor().compress(code, language="rust")
+
+        assert result.compression_ratio < 1.0
+        assert "#[derive(Debug, Clone, PartialEq)]\npub struct Item {" in result.compressed
+        assert '#[inline]\n#[cfg(feature = "extra")]\npub fn log_item' in result.compressed
+
+    def test_doc_comment_stays_ahead_of_attributes(self):
+        code = (
+            "/// Records one item.\n"
+            "#[inline]\n"
+            "pub fn record(item: &Item, sink: &mut Vec<u64>) {\n"
+            "    sink.push(item.id);\n"
+            "    sink.push(item.id + 1);\n"
+            "    sink.push(item.id + 2);\n"
+            "}\n"
+        )
+
+        result = self._compressor().compress(code, language="rust")
+
+        assert result.compression_ratio < 1.0
+        assert "/// Records one item.\n#[inline]\npub fn record" in result.compressed
+
+    def test_attribute_attaches_across_blank_line(self):
+        """Rust allows whitespace between an outer attribute and its item."""
+        code = (
+            "pub struct Item { pub id: u64 }\n"
+            "\n"
+            "#[inline]\n"
+            "\n"
+            "pub fn record(item: &Item, sink: &mut Vec<u64>) {\n"
+            "    sink.push(item.id);\n"
+            "    sink.push(item.id + 1);\n"
+            "    sink.push(item.id + 2);\n"
+            "}\n"
+        )
+
+        result = self._compressor().compress(code, language="rust")
+
+        assert result.compression_ratio < 1.0
+        assert result.syntax_valid is True
+        assert "#[inline]\npub fn record" in result.compressed
+        assert not result.compressed.rstrip().endswith("#[inline]")
+
+    def test_attribute_attaches_through_detached_comment(self):
+        """A comment between an attribute and its item must not detach it."""
+        code = (
+            "pub struct Item { pub id: u64 }\n"
+            "\n"
+            "#[inline]\n"
+            "\n"
+            "// Keep with the function below.\n"
+            "\n"
+            "pub fn record(item: &Item, sink: &mut Vec<u64>) {\n"
+            "    sink.push(item.id);\n"
+            "    sink.push(item.id + 1);\n"
+            "    sink.push(item.id + 2);\n"
+            "    sink.push(item.id + 3);\n"
+            "}\n"
+        )
+
+        result = self._compressor().compress(code, language="rust")
+
+        assert result.compression_ratio < 1.0
+        assert result.syntax_valid is True
+        assert "#[inline]\npub fn record" in result.compressed
+        assert not result.compressed.rstrip().endswith("#[inline]")
