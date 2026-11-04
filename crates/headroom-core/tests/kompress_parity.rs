@@ -14,37 +14,20 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use headroom_core::transforms::kompress::{Kompress, KompressConfig};
+use headroom_core::transforms::kompress::{self, Kompress, KompressConfig};
 use serde_json::Value;
 
-fn hf_cache_file(repo_dir: &str, rel: &[&str]) -> Option<PathBuf> {
-    let home = std::env::var("HOME").ok()?;
-    let snapshots = Path::new(&home)
-        .join(".cache/huggingface/hub")
-        .join(repo_dir)
-        .join("snapshots");
-    for snap in fs::read_dir(snapshots).ok()?.filter_map(|e| e.ok()) {
-        let mut cand = snap.path();
-        for part in rel {
-            cand = cand.join(part);
-        }
-        if cand.exists() {
-            return Some(cand);
-        }
-    }
-    None
+/// The tokenizer + int8 ONNX artifact production would load: the pinned
+/// snapshots in Python's hub cache. The fixtures were recorded against them.
+fn cached_artifacts() -> Option<(PathBuf, PathBuf)> {
+    kompress::cached_artifacts(&KompressConfig::default(), "onnx/kompress-int8-wo.onnx")
 }
 
 #[test]
 fn kompress_matches_python_fixtures_byte_for_byte() {
-    let tok = hf_cache_file("models--answerdotai--ModernBERT-base", &["tokenizer.json"]);
-    let onnx = hf_cache_file(
-        "models--chopratejas--kompress-v2-base",
-        &["onnx", "kompress-int8-wo.onnx"],
-    );
-    let (tok, onnx) = match (tok, onnx) {
-        (Some(t), Some(o)) => (t, o),
-        _ => {
+    let (tok, onnx) = match cached_artifacts() {
+        Some(paths) => paths,
+        None => {
             eprintln!(
                 "SKIP: kompress model/tokenizer not in HF cache; \
                  run `python scripts/record_kompress_trace.py` first"
@@ -112,12 +95,7 @@ fn short_input_passes_through() {
     // Pure-logic check — no model needed. Fewer than MIN_WORDS words must
     // pass through unchanged regardless of model availability... but the
     // engine needs a model to construct. Guard on cache like the main test.
-    let tok = hf_cache_file("models--answerdotai--ModernBERT-base", &["tokenizer.json"]);
-    let onnx = hf_cache_file(
-        "models--chopratejas--kompress-v2-base",
-        &["onnx", "kompress-int8-wo.onnx"],
-    );
-    let (Some(tok), Some(onnx)) = (tok, onnx) else {
+    let Some((tok, onnx)) = cached_artifacts() else {
         eprintln!("SKIP: model not cached");
         return;
     };
