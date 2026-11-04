@@ -35,12 +35,18 @@ def _server() -> HeadroomMCPServer:
 
 
 def _client_ctx(name: str) -> SimpleNamespace:
-    """Minimal stand-in for ``ServerRequestContext`` for client attribution."""
-    return SimpleNamespace(
-        session=SimpleNamespace(
-            client_params=SimpleNamespace(clientInfo=SimpleNamespace(name=name))
-        )
+    """Stand-in for ``ServerRequestContext`` carrying the SDK's real client params.
+
+    ``client_params`` is the SDK's own ``InitializeRequestParams``, not a stand-in:
+    a hand-made object with SDK 1's ``clientInfo`` name kept this test green while
+    every SDK 2 client was recorded as "unknown".
+    """
+    params = mcp_types.InitializeRequestParams(
+        protocol_version="2025-06-18",
+        capabilities=mcp_types.ClientCapabilities(),
+        client_info=mcp_types.Implementation(name=name, version="1.0"),
     )
+    return SimpleNamespace(session=SimpleNamespace(client_params=params))
 
 
 def test_sdk_registers_handlers_via_constructor_not_decorators() -> None:

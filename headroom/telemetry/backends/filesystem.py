@@ -68,6 +68,9 @@ class FileSystemTOINBackend:
 
         Args:
             data: Serialized TOIN data to persist.
+
+        Raises:
+            OSError: If persistence fails, so the caller can retain pending changes.
         """
         try:
             self._path.parent.mkdir(parents=True, exist_ok=True)
@@ -89,3 +92,4 @@ class FileSystemTOINBackend:
 
         except OSError as e:
             logger.warning("Failed to save TOIN data to %s: %s", self._path, e)
+            raise
