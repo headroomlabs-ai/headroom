@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
-import type { LanguageModelV3 } from "@ai-sdk/provider";
+import type { LanguageModelV3, LanguageModelV4FilePart, LanguageModelV4Prompt } from "@ai-sdk/provider";
 import {
   headroomMiddleware,
   compressVercelMessages,
@@ -134,6 +134,149 @@ describe("headroomMiddleware", () => {
     const body = JSON.parse(mockFetch.mock.calls[0][1].body);
     expect(body.model).toBe("claude-sonnet-4-5-20250929");
   });
+
+  it("keeps a provider-prompt file part through compression", async () => {
+    // The proxy only compresses text and passes the media part back untouched.
+    mockFetch.mockResolvedValueOnce(
+      mockCompressResponse([
+        {
+          role: "user",
+          content: [
+            { type: "text", text: "compressed" },
+            { type: "image_url", image_url: { url: "data:image/png;base64,iVBORw==", part: "file" } },
+          ],
+        },
+      ]),
+    );
+    const middleware = headroomMiddleware({ baseUrl: "http://localhost:8787" });
+    const out = await middleware.transformParams({
+      params: {
+        prompt: [
+          {
+            role: "user",
+            content: [
+              { type: "text", text: "what is this?" },
+              { type: "file", mediaType: "image/png", data: new Uint8Array([137, 80, 78, 71]) },
+            ],
+          },
+        ],
+      },
+      model: {},
+      type: "generate",
+    });
+
+    const body = JSON.parse(mockFetch.mock.calls[0][1].body);
+    expect(body.messages[0].content[1]).toEqual({
+      type: "image_url",
+      image_url: { url: "data:image/png;base64,iVBORw==", part: "file" },
+    });
+    expect(out.prompt[0].content[1]).toEqual({ type: "file", mediaType: "image/png", data: "iVBORw==" });
+  });
+
+  it("keeps an assistant file part (generated media) through compression", async () => {
+    mockFetch.mockResolvedValueOnce(
+      mockCompressResponse([
+        { role: "user", content: "draw a cat" },
+        {
+          role: "assistant",
+          content: [
+            { type: "text", text: "generated image" },
+            { type: "image_url", image_url: { url: "data:image/png;base64,iVBORw==", part: "file" } },
+          ],
+        },
+      ]),
+    );
+    const middleware = headroomMiddleware({ baseUrl: "http://localhost:8787" });
+    const out = await middleware.transformParams({
+      params: {
+        prompt: [
+          { role: "user", content: [{ type: "text", text: "draw a cat" }] },
+          {
+            role: "assistant",
+            content: [
+              { type: "text", text: "generated image" },
+              { type: "file", mediaType: "image/png", data: new Uint8Array([137, 80, 78, 71]) },
+            ],
+          },
+        ],
+      },
+      model: {},
+      type: "generate",
+    });
+
+    const body = JSON.parse(mockFetch.mock.calls[0][1].body);
+    expect(body.messages[1]).toEqual({
+      role: "assistant",
+      content: [
+        { type: "text", text: "generated image" },
+        { type: "image_url", image_url: { url: "data:image/png;base64,iVBORw==", part: "file" } },
+      ],
+    });
+    expect(out.prompt[1]).toEqual({
+      role: "assistant",
+      content: [
+        { type: "text", text: "generated image" },
+        { type: "file", mediaType: "image/png", data: "iVBORw==" },
+      ],
+    });
+  });
+
+  it("round-trips a LanguageModelV4 file part (tagged data) through transformParams", async () => {
+    const filePart: LanguageModelV4FilePart = {
+      type: "file",
+      mediaType: "image/png",
+      data: { type: "data", data: new Uint8Array([137, 80, 78, 71]) },
+    };
+    const prompt: LanguageModelV4Prompt = [{ role: "user", content: [{ type: "text", text: "what is this?" }, filePart] }];
+    // The proxy keeps the media part and compresses only the text.
+    mockFetch.mockResolvedValueOnce(
+      mockCompressResponse([
+        {
+          role: "user",
+          content: [
+            { type: "text", text: "compressed" },
+            { type: "image_url", image_url: { url: "data:image/png;base64,iVBORw==", part: "file", data_tag: "data" } },
+          ],
+        },
+      ]),
+    );
+    const middleware = headroomMiddleware({ baseUrl: "http://localhost:8787" });
+    const out = await middleware.transformParams({ params: { prompt }, model: { specificationVersion: "v4" }, type: "generate" });
+
+    const body = JSON.parse(mockFetch.mock.calls[0][1].body);
+    expect(body.messages[0].content[1]).toEqual({
+      type: "image_url",
+      image_url: { url: "data:image/png;base64,iVBORw==", part: "file", data_tag: "data" },
+    });
+    const restored: LanguageModelV4FilePart = out.prompt[0].content[1];
+    expect(restored).toEqual({ type: "file", mediaType: "image/png", data: { type: "data", data: "iVBORw==" } });
+  });
+
+  it("passes a provider file reference through transformParams untouched", async () => {
+    const filePart: LanguageModelV4FilePart = {
+      type: "file",
+      mediaType: "application/pdf",
+      data: { type: "reference", reference: { openai: "file-abc" } },
+    };
+    mockFetch.mockResolvedValueOnce(
+      mockCompressResponse([
+        {
+          role: "user",
+          content: [
+            { type: "text", text: "compressed" },
+            { type: "image_url", image_url: { url: "data:application/pdf;base64,", part: "file", data_tag: "reference", reference: { openai: "file-abc" } } },
+          ],
+        },
+      ]),
+    );
+    const middleware = headroomMiddleware({ baseUrl: "http://localhost:8787" });
+    const out = await middleware.transformParams({
+      params: { prompt: [{ role: "user", content: [{ type: "text", text: "summarise" }, filePart] }] },
+      model: { specificationVersion: "v4" },
+      type: "generate",
+    });
+    expect(out.prompt[0].content[1]).toEqual(filePart);
+  });
 });
 
 describe("compressVercelMessages", () => {
@@ -204,6 +347,22 @@ describe("compressVercelMessages", () => {
     );
 
     expect(result.messages[1].content[0].toolName).toBe("getWeather");
+  });
+
+  it("does not throw on byte image data", async () => {
+    mockFetch.mockResolvedValueOnce(
+      mockCompressResponse([
+        { role: "user", content: [{ type: "image_url", image_url: { url: "data:image/png;base64,iVBORw==" } }] },
+      ]),
+    );
+    await expect(
+      compressVercelMessages(
+        [{ role: "user", content: [{ type: "image", image: new Uint8Array([137, 80, 78, 71]), mediaType: "image/png" }] }],
+        { baseUrl: "http://localhost:8787" },
+      ),
+    ).resolves.toMatchObject({
+      messages: [{ role: "user", content: [{ type: "image", image: "iVBORw==", mediaType: "image/png" }] }],
+    });
   });
 });
 

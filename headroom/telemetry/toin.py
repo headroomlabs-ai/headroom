@@ -68,7 +68,7 @@ import threading
 import time
 import warnings
 from collections.abc import Callable
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, fields
 from typing import Any, Final
 
 from .models import FieldSemantics, ToolSignature
@@ -409,9 +409,16 @@ class ToolPattern:
             "last_updated",
         }
         filtered = {k: v for k, v in data.items() if k in valid_fields}
+        # A value of the wrong kind (a string where a list belongs) would be
+        # accepted as-is and then iterated or added to when patterns merge.
+        for name, value in filtered.items():
+            if not isinstance(value, _PATTERN_FIELD_KINDS.get(name, object)):
+                raise TypeError(f"{name} is a {type(value).__name__}")
 
         # Handle seen_instance_hashes (serialized without underscore prefix)
         seen_hashes = data.get("seen_instance_hashes", [])
+        if not isinstance(seen_hashes, list) or not all(isinstance(h, str) for h in seen_hashes):
+            raise TypeError("seen_instance_hashes is not a list of strings")
 
         pattern = cls(**filtered)
         pattern._seen_instance_hashes = seen_hashes[:100]  # Limit on load
@@ -436,6 +443,38 @@ class ToolPattern:
             }
 
         return pattern
+
+
+# What each stored ToolPattern field may hold, by the base of its annotation.
+# Merges store some counts as floats, so numeric fields accept either.
+_KIND_BY_ANNOTATION: Final[dict[str, type | tuple[type, ...]]] = {
+    "str": str,
+    "int": (int, float),
+    "float": (int, float),
+    "bool": bool,
+    "list": list,
+    "dict": dict,
+}
+_PATTERN_FIELD_KINDS: Final[dict[str, type | tuple[type, ...]]] = {
+    f.name: _KIND_BY_ANNOTATION.get(str(f.type).split("[")[0], object) for f in fields(ToolPattern)
+}
+_PATTERN_CONTAINER_FIELDS: Final = tuple(
+    f.name for f in fields(ToolPattern) if f.default_factory in (list, dict, set)
+)
+
+
+def _detached_copy(pattern: ToolPattern) -> ToolPattern:
+    """Copy ``pattern`` so that merging into the copy leaves the original intact.
+
+    ``_merge_patterns`` reassigns scalars and adds to the pattern's lists, dicts
+    and sets, so those containers are the parts that need their own copies.
+    """
+    import copy
+
+    clone = copy.copy(pattern)
+    for name in _PATTERN_CONTAINER_FIELDS:
+        setattr(clone, name, getattr(pattern, name).copy())
+    return clone
 
 
 @dataclass
@@ -1397,39 +1436,64 @@ class ToolIntelligenceNetwork:
         patterns_data = data.get("patterns", {})
         source_instance = data.get("instance_id", "unknown")
 
+        skipped = 0
+        first_error: Exception | None = None
         with self._lock:
             for serialized_key, pattern_dict in patterns_data.items():
-                key = _deserialize_pattern_key(serialized_key)
-                imported = ToolPattern.from_dict(pattern_dict)
-                self._sanitize_loaded_pattern(imported)
-                # Make sure dataclass fields agree with the dict key — pre-F3
-                # dumps don't carry tenant_key on the pattern, and pre-B5
-                # dumps don't carry auth_mode/model_family either; promote
-                # from the (possibly default) key.
-                imported.tenant_key = key[0]
-                imported.auth_mode = key[1]
-                imported.model_family = key[2]
+                # Each entry is parsed, tracked and merged into a pattern that is
+                # only stored once all of that succeeds. One unreadable entry must
+                # not abort the rest (the store that did load would be saved over
+                # the whole file) or leave a half-merged pattern behind.
+                try:
+                    key = _deserialize_pattern_key(serialized_key)
+                    imported = ToolPattern.from_dict(pattern_dict)
+                    self._sanitize_loaded_pattern(imported)
+                    # Make sure dataclass fields agree with the dict key — pre-F3
+                    # dumps don't carry tenant_key on the pattern, and pre-B5
+                    # dumps don't carry auth_mode/model_family either; promote
+                    # from the (possibly default) key.
+                    imported.tenant_key = key[0]
+                    imported.auth_mode = key[1]
+                    imported.model_family = key[2]
 
-                if key in self._patterns:
-                    # Merge with existing
-                    self._merge_patterns(self._patterns[key], imported)
-                else:
-                    # Add new pattern - need to track source instance
-                    self._patterns[key] = imported
+                    existing = self._patterns.get(key)
+                    if existing is not None:
+                        # Merge with existing
+                        pattern = _detached_copy(existing)
+                        self._merge_patterns(pattern, imported)
+                    else:
+                        # Add new pattern - need to track source instance
+                        pattern = imported
 
-                    # For NEW patterns from another instance, track the source in
-                    # _seen_instance_hashes so user_count reflects cross-user data
-                    if source_instance != self._instance_id:
-                        pattern = self._patterns[key]
-                        if source_instance not in pattern._seen_instance_hashes:
-                            # Limit storage to 100 unique instances to bound memory
-                            if len(pattern._seen_instance_hashes) < 100:
-                                pattern._seen_instance_hashes.append(source_instance)
-                            # CRITICAL: Always increment user_count (even after cap)
-                            pattern.user_count += 1
+                        # For NEW patterns from another instance, track the source in
+                        # _seen_instance_hashes so user_count reflects cross-user data
+                        if source_instance != self._instance_id:
+                            if source_instance not in pattern._seen_instance_hashes:
+                                # Limit storage to 100 unique instances to bound memory
+                                if len(pattern._seen_instance_hashes) < 100:
+                                    pattern._seen_instance_hashes.append(source_instance)
+                                # CRITICAL: Always increment user_count (even after cap)
+                                pattern.user_count += 1
+                except (AttributeError, TypeError, ValueError) as e:
+                    skipped += 1
+                    first_error = first_error or e
+                    continue
+                self._patterns[key] = pattern
 
             self._prune_patterns_locked()
             self._dirty = True
+
+        if first_error is not None:
+            logger.warning(
+                "TOIN skipped malformed patterns on import",
+                extra={
+                    "event": "toin_import_skipped",
+                    "skipped": skipped,
+                    "imported": len(patterns_data) - skipped,
+                    "error_type": type(first_error).__name__,
+                    "error": str(first_error),
+                },
+            )
 
     def _merge_patterns(self, existing: ToolPattern, imported: ToolPattern) -> None:
         """Merge imported pattern into existing."""
