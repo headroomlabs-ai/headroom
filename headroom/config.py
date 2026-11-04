@@ -118,7 +118,7 @@ class RelevanceScorerConfig:
     DEFAULT: "hybrid" - combines exact matching (UUIDs, IDs) with semantic
     understanding. Falls back to BM25 if sentence-transformers not installed.
 
-    For full hybrid support, install: pip install headroom[relevance]
+    For full hybrid support, install: pip install "headroom-ai[relevance]"
 
     WHY HYBRID IS DEFAULT:
     - Missing important items during compression is catastrophic
@@ -923,7 +923,9 @@ class PrefixFreezeConfig:
 class HeadroomConfig:
     """Main configuration for HeadroomClient."""
 
-    store_url: str = "sqlite:///headroom.db"
+    # None defers to HeadroomClient: its ``store_url`` argument, else a
+    # headroom.db in the system temp directory.
+    store_url: str | None = None
     default_mode: HeadroomMode = HeadroomMode.AUDIT
     model_context_limits: dict[str, int] = field(
         default_factory=lambda: DEFAULT_MODEL_CONTEXT_LIMITS.copy()

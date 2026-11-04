@@ -129,6 +129,20 @@ def test_override_changes_astgrep_threshold_without_env():
     assert astgrep._min_chars_to_rewrite() == 500
 
 
+def test_override_disables_web_search_history_drop_without_env():
+    from headroom.proxy.handlers.openai import _drop_undeclared_web_search_calls
+
+    def body() -> dict:
+        return {"input": [{"type": "web_search_call", "id": "ws_1"}], "tools": []}
+
+    assert _drop_undeclared_web_search_calls(body()) == 1
+    rt.set_overrides({"HEADROOM_WEB_SEARCH_HISTORY": "0"})
+    assert _drop_undeclared_web_search_calls(body()) == 0
+    assert rt.explicit_env({"HEADROOM_WEB_SEARCH_HISTORY": "0"}) == {
+        "HEADROOM_WEB_SEARCH_HISTORY": "0"
+    }
+
+
 # ---------------------------------------------------------------------------
 # /health surface + /admin/runtime-env hot-reload endpoint
 # ---------------------------------------------------------------------------

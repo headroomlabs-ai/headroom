@@ -2,12 +2,23 @@
 
 This adapter bridges the Mem0Backend interface to the MemoryBackend protocol
 required by MemorySystem, enabling Mem0 to be used with the memory tools system.
+
+.. deprecated::
+    Nothing in Headroom uses this adapter. For local mode (Qdrant + Neo4j), use
+    ``DirectMem0Adapter`` (``headroom.memory.backends.direct_mem0``), which also
+    satisfies the MemoryBackend protocol. ``save_memory`` skips Mem0's LLM
+    extraction only when the caller passes non-empty pre-extracted ``facts``,
+    ``extracted_entities`` or ``extracted_relationships``. Passing only ``content``
+    with ``entities``/``relationships`` still runs Mem0's extraction. Cloud mode
+    (``Mem0Config(mode="cloud")``) has no replacement in Headroom; use the ``mem0``
+    client directly.
 """
 
 from __future__ import annotations
 
 import asyncio
 import uuid
+import warnings
 from datetime import datetime, timezone
 from typing import Any
 
@@ -23,6 +34,10 @@ def _utcnow() -> datetime:
 
 class Mem0SystemAdapter:
     """Adapter that makes Mem0Backend conform to MemorySystem's MemoryBackend protocol.
+
+    .. deprecated::
+        Use ``DirectMem0Adapter`` for local mode. Cloud mode has no replacement in
+        Headroom; use the ``mem0`` client directly.
 
     This adapter wraps Mem0Backend and provides the interface expected by
     MemorySystem, enabling LLM-driven memory tools (memory_save, memory_search,
@@ -53,6 +68,15 @@ class Mem0SystemAdapter:
         Args:
             config: Configuration for Mem0. If None, uses default local config.
         """
+        warnings.warn(
+            "Mem0SystemAdapter is deprecated and will be removed in a future release; "
+            "for local mode use DirectMem0Adapter (headroom.memory.backends.direct_mem0), "
+            "which skips Mem0's LLM extraction only when given pre-extracted facts, "
+            "extracted_entities or extracted_relationships; "
+            "cloud mode has no Headroom replacement, so use the mem0 client directly.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
         self._backend = Mem0Backend(config)
         self._config = config or Mem0Config()
 

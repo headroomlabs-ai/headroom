@@ -64,14 +64,6 @@ def headroom_provider_entry(port: int) -> dict[str, Any]:
     }
 
 
-def _opencode_home_dir() -> Path:
-    """Return the OpenCode home/config directory."""
-    env_path = os.environ.get("OPENCODE_HOME", "").strip()
-    if env_path:
-        return Path(env_path).expanduser()
-    return Path.home() / ".config" / "opencode"
-
-
 def opencode_config_paths() -> tuple[Path, Path]:
     """Return the selected config and its canonical Headroom backup path."""
     config_file = opencode_config_path()
@@ -132,17 +124,6 @@ def strip_opencode_headroom_blocks(content: str, *, remove_mcp: bool = True) -> 
     # Collapse multiple blank lines left behind by block removal.
     content = re.sub(r"\n{3,}", "\n\n", content)
     return content.strip()
-
-
-def _render_provider_block(port: int) -> str:
-    """Render a Headroom provider block as a JSON comment-wrapped snippet."""
-    provider = {"headroom": headroom_provider_entry(port)}
-    lines = [
-        _PROVIDER_MARKER_START,
-        f'"provider": {json.dumps(provider, indent=2)},',
-        _PROVIDER_MARKER_END,
-    ]
-    return "\n".join(lines)
 
 
 def _strip_jsonc_comments(text: str) -> str:
@@ -215,23 +196,48 @@ def _strip_jsonc_trailing_commas(text: str) -> str:
     return "".join(output)
 
 
-def _parse_json_loose(text: str) -> dict[str, Any]:
+def _try_parse_json_loose(text: str) -> dict[str, Any] | None:
     """Parse JSON text and JSONC comments/trailing commas.
 
     Standard JSON is tried first so URLs containing ``//`` remain untouched.
+    A leading UTF-8 BOM (written by some Windows editors) is ignored.
+    Returns ``None`` when the text is not a JSON object.
     """
+    text = text.lstrip("\ufeff")
     try:
         parsed = json.loads(text)
-        return parsed if isinstance(parsed, dict) else {}
+        return parsed if isinstance(parsed, dict) else None
     except json.JSONDecodeError:
         pass
     cleaned = _strip_jsonc_comments(text)
     cleaned = _strip_jsonc_trailing_commas(cleaned)
     try:
         parsed = json.loads(cleaned)
-        return parsed if isinstance(parsed, dict) else {}
+        return parsed if isinstance(parsed, dict) else None
     except json.JSONDecodeError:
+        return None
+
+
+def _parse_json_loose(text: str) -> dict[str, Any]:
+    """Like :func:`_try_parse_json_loose`, but returns ``{}`` on failure."""
+    return _try_parse_json_loose(text) or {}
+
+
+def load_user_opencode_config(content: str, config_file: Path) -> dict[str, Any]:
+    """Parse the user's OpenCode config, refusing to treat unparseable text as empty.
+
+    Callers rewrite the whole file from the result, so ``{}`` for a non-empty
+    file we could not read would delete every user setting.
+    """
+    data = _try_parse_json_loose(content)
+    if data is None:
+        if content.lstrip("\ufeff").strip():
+            raise click.ClickException(
+                f"could not parse OpenCode config at {config_file}; "
+                "leaving it unchanged. Fix the JSON/JSONC syntax and retry."
+            )
         return {}
+    return data
 
 
 def _inject_key_into_json(data: dict[str, Any], key: str, value: Any) -> dict[str, Any]:
@@ -243,26 +249,6 @@ def _inject_key_into_json(data: dict[str, Any], key: str, value: Any) -> dict[st
     else:
         data[key] = value
     return data
-
-
-def append_headroom_plugin(config: dict[str, object]) -> bool:
-    """Append the optional OpenCode plugin entry if it is not already present."""
-    plugin = config.get("plugin")
-    if plugin is None:
-        config["plugin"] = [HEADROOM_OPENCODE_PLUGIN]
-        return True
-
-    if not isinstance(plugin, list):
-        return False
-
-    for entry in plugin:
-        if entry == HEADROOM_OPENCODE_PLUGIN:
-            return False
-        if isinstance(entry, list) and entry and entry[0] == HEADROOM_OPENCODE_PLUGIN:
-            return False
-
-    plugin.append(HEADROOM_OPENCODE_PLUGIN)
-    return True
 
 
 def inject_opencode_provider_config(port: int, *, keep_user_entries: bool = False) -> None:
@@ -287,7 +273,7 @@ def inject_opencode_provider_config(port: int, *, keep_user_entries: bool = Fals
 
         if config_file.exists():
             content = fsutil.read_text(config_file)
-            data = _parse_json_loose(content)
+            data = load_user_opencode_config(content, config_file)
         else:
             content = ""
             data = {}
@@ -295,7 +281,7 @@ def inject_opencode_provider_config(port: int, *, keep_user_entries: bool = Fals
         # Strip any prior Headroom-managed blocks before re-injecting.
         if _PROVIDER_MARKER_START in content or _MCP_MARKER_START in content:
             content = strip_opencode_headroom_blocks(content)
-            data = _parse_json_loose(content)
+            data = load_user_opencode_config(content, config_file)
 
         # Merge provider into the JSON data structure.
         entry = headroom_provider_entry(port)
