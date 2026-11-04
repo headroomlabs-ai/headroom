@@ -253,6 +253,31 @@ async def test_memory_lookup_skips_input_bearing_non_create_first_frame():
 
 
 @pytest.mark.asyncio
+async def test_cache_mode_skips_memory_context_search_ws():
+    upstream = _FakeUpstream(
+        [
+            json.dumps({"type": "response.created", "response": {"id": "r_1"}}),
+            json.dumps({"type": "response.completed", "response": {"id": "r_1"}}),
+        ],
+        hold_after_events=True,
+    )
+    first_turn, _ = _issue_2059_turns()
+    client_ws = _FakeWebSocket(frames=[first_turn])
+    handler = _DummyOpenAIHandler()
+    handler.config.mode = "cache"
+    memory = _MemoryHandler()
+    handler.memory_handler = memory
+
+    with patch.dict(sys.modules, {"websockets": _make_fake_websockets_module(upstream)}):
+        await handler.handle_openai_responses_ws(client_ws)
+
+    assert memory.queries == []
+    forwarded = json.loads(upstream.sent[0])
+    raw_input = json.loads(first_turn)["response"]["input"]
+    assert forwarded["response"]["input"] == raw_input
+
+
+@pytest.mark.asyncio
 async def test_memory_lookup_skips_bypassed_frames():
     upstream = _FakeUpstream(
         [

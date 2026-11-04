@@ -474,3 +474,85 @@ def test_memory_context_appears_in_responses_api_input_tail() -> None:
                     assert any("MEMCTX" in t for t in text_parts)
             elif isinstance(input_field, str):
                 assert input_field.endswith("MEMCTX")
+
+
+def test_cache_mode_skips_memory_context_search_openai_chat() -> None:
+    """Cache mode never injects memory context on OpenAI /v1/chat/completions."""
+    captured: dict[str, object] = {}
+    with _make_proxy_client() as client:
+        proxy = client.app.state.proxy
+        proxy.config.mode = "cache"
+        proxy.config.optimize = False
+        proxy.config.image_optimize = False
+        proxy.config.ccr_proactive_expansion = False
+
+        _install_session_tracker(proxy, frozen_count=1)
+        _install_memory_handler(proxy)
+        _install_capture_retry(proxy, captured)
+
+        response = client.post(
+            "/v1/chat/completions",
+            headers={
+                "authorization": "Bearer sk-test",
+                "x-headroom-user-id": "u1",
+            },
+            json={
+                "model": "gpt-4o",
+                "messages": [
+                    {"role": "system", "content": "base system"},
+                    {"role": "user", "content": "latest user"},
+                ],
+            },
+        )
+
+        assert response.status_code == 200
+        proxy.memory_handler.search_and_format_context.assert_not_awaited()
+        sent = captured["body"]
+        assert isinstance(sent, dict)
+        assert sent["messages"][1]["content"] == "latest user"
+
+
+def test_cache_mode_skips_memory_context_search_openai_responses() -> None:
+    """Cache mode never injects memory context on OpenAI /v1/responses."""
+    captured: dict[str, object] = {}
+    with _make_responses_proxy_client() as client:
+        proxy = client.app.state.proxy
+        proxy.config.mode = "cache"
+        proxy.config.optimize = False
+        proxy.config.image_optimize = False
+        _install_memory_handler(proxy)
+
+        async def _fake_retry(method, url, headers, body, stream=False, **kwargs):  # noqa: ANN001
+            captured["body"] = body
+            return httpx.Response(
+                200,
+                json={
+                    "id": "resp_1",
+                    "object": "response",
+                    "model": "gpt-5.4",
+                    "output": [],
+                    "usage": {"input_tokens": 5, "output_tokens": 1, "total_tokens": 6},
+                },
+            )
+
+        proxy._retry_request = _fake_retry
+
+        response = client.post(
+            "/v1/responses",
+            headers={
+                "authorization": "Bearer sk-test",
+                "x-headroom-user-id": "u1",
+            },
+            json={
+                "model": "gpt-5.4",
+                "instructions": "You are a Codex assistant.",
+                "input": "latest user prompt",
+            },
+        )
+
+        assert response.status_code == 200
+        proxy.memory_handler.search_and_format_context.assert_not_awaited()
+        if "body" in captured:
+            sent = captured["body"]
+            assert isinstance(sent, dict)
+            assert sent.get("input") == "latest user prompt"
