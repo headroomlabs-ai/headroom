@@ -2,25 +2,34 @@
 
 Edge's Tracking Prevention (and corporate proxies) block unpkg.com and
 cdn.tailwindcss.com, which left the dashboard unstyled and dataless on some
-Windows machines. Tailwind/htmx/alpine are vendored and served locally instead.
+Windows machines. Tailwind/alpine are vendored and served locally instead.
 """
 
 from __future__ import annotations
+
+import re
+from unittest.mock import AsyncMock, patch
 
 import pytest
 
 pytest.importorskip("fastapi")
 
+from fastapi.responses import Response  # noqa: E402
 from fastapi.testclient import TestClient  # noqa: E402
 
-from headroom.dashboard import get_dashboard_html, get_settings_html  # noqa: E402
+from headroom.dashboard import (  # noqa: E402
+    STATIC_DIR,
+    get_dashboard_html,
+    get_settings_html,
+)
 from headroom.proxy.server import ProxyConfig, create_app  # noqa: E402
 
-ASSETS = ["tailwind.min.js", "htmx.min.js", "alpine.min.js"]
+ASSETS = ["tailwind.min.js", "alpine.min.js"]
 
 
 @pytest.fixture
-def client():
+def client(monkeypatch):
+    monkeypatch.setenv("HEADROOM_SKIP_UPSTREAM_CHECK", "1")
     app = create_app(
         ProxyConfig(
             optimize=False,
@@ -28,10 +37,21 @@ def client():
             rate_limit_enabled=False,
             cost_tracking_enabled=False,
             log_requests=False,
+            http2=False,
         )
     )
     with TestClient(app) as c:
         yield c
+
+
+@pytest.fixture
+def passthrough(client):
+    with patch.object(
+        client.app.state.proxy,
+        "handle_passthrough",
+        new=AsyncMock(return_value=Response("upstream", status_code=418)),
+    ) as handler:
+        yield handler
 
 
 @pytest.mark.parametrize("html", [get_dashboard_html(), get_settings_html()])
@@ -41,13 +61,44 @@ def test_templates_reference_no_cdn(html: str):
 
 
 @pytest.mark.parametrize("asset", ASSETS)
-def test_asset_is_served(client, asset: str):
+def test_asset_is_served(client, passthrough, asset: str):
     resp = client.get(f"/dashboard/static/{asset}")
     assert resp.status_code == 200, resp.text
     assert len(resp.content) > 10_000
+    passthrough.assert_not_called()
+
+
+def test_dashboard_trailing_slash_is_served_locally(client, passthrough):
+    resp = client.get("/dashboard/")
+
+    assert resp.status_code == 200
+    assert resp.text == get_dashboard_html()
+    passthrough.assert_not_called()
+
+
+@pytest.mark.parametrize("path", ["/dashboard/static", "/dashboard/static/"])
+def test_static_directory_boundaries_are_not_forwarded(client, passthrough, path: str):
+    resp = client.get(path)
+
+    assert resp.status_code == 404
+    assert resp.text == "Not Found"
+    passthrough.assert_not_called()
+
+
+def test_unrelated_unknown_path_still_reaches_passthrough(client, passthrough):
+    resp = client.get("/unrelated-unknown-path")
+
+    assert resp.status_code == 418
+    passthrough.assert_awaited_once()
 
 
 def test_dashboard_only_references_served_assets(client):
+    """Both directions: nothing vendored goes unloaded, nothing loaded is missing.
+
+    htmx shipped 47 KB to every dashboard visitor for months without a single
+    ``hx-*`` attribute or API call anywhere in the tree.
+    """
     html = client.get("/dashboard").text
-    for asset in ASSETS:
-        assert f"/dashboard/static/{asset}" in html
+
+    assert set(re.findall(r"/dashboard/static/([\w.-]+)", html)) == set(ASSETS)
+    assert {path.name for path in STATIC_DIR.iterdir() if path.is_file()} == set(ASSETS)

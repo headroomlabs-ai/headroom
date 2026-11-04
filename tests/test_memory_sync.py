@@ -24,6 +24,7 @@ import pytest
 
 from headroom.memory.sync import (
     _build_sync_backend,
+    _save_sync_state,
     sync,
     sync_export,
     sync_import,
@@ -758,3 +759,51 @@ def test_sync_backend_uses_onnx_embedder(tmp_path):
     """
     backend = _build_sync_backend(str(tmp_path / "memory.db"))
     assert backend._config.embedder_backend == "onnx"
+
+
+@pytest.mark.windows_newline
+class TestSyncNewlineContract:
+    """Sync adapters and sync state pin ``newline="\n"`` — see #3698.
+
+    AGENTS.md and the Claude memory files are also written by
+    ``headroom/learn/writer.py``, which pins LF. An unpinned write here flips
+    the same file back to CRLF on Windows on the next sync, so the two
+    subsystems fight over the line endings of a committed file.
+
+    Asserted at the call, not the artifact: ``TextIOWrapper`` picks its newline
+    translation target at C-compile time (``#ifdef MS_WINDOWS``), so on POSIX
+    an unpinned write looks identical on disk to a pinned one.
+    """
+
+    @pytest.mark.asyncio
+    async def test_adapter_and_state_writes_pin_lf(self, tmp_path, monkeypatch):
+        claude_dir = tmp_path / "claude"
+        claude_dir.mkdir()
+        (claude_dir / "MEMORY.md").write_text("# Memory\n\n## User\n- existing\n")
+        agents_md = tmp_path / "AGENTS.md"
+        agents_md.write_text("# Existing instructions\n")
+
+        calls: list[tuple[Path, str | None]] = []
+        original = Path.write_text
+
+        def spy(self, data, encoding=None, errors=None, newline=None):
+            calls.append((self, newline))
+            return original(self, data, encoding=encoding, errors=errors, newline=newline)
+
+        monkeypatch.setattr(Path, "write_text", spy)
+
+        await ClaudeCodeAdapter(claude_dir).write_memories(
+            [{"content": "Port 8787 is default", "id": "mem_0001"}]
+        )
+        await CodexAdapter(agents_md).write_memories([{"content": "Uses ruff for linting"}])
+        _save_sync_state(tmp_path / "state" / "sync_state.json", {"version": 1})
+
+        assert calls, "no writes captured — this test no longer drives the adapters"
+        unpinned = sorted(str(path) for path, newline in calls if newline != "\n")
+        assert not unpinned, f"sync writes without newline='\\n': {unpinned}"
+        assert {path.name for path, _ in calls} >= {
+            "MEMORY.md",  # claude_code._update_memory_md_index
+            "AGENTS.md",  # codex_agent.write_memories
+            "sync_state.json",  # sync._save_sync_state
+        }
+        assert any(name.startswith("headroom_") for name in {p.name for p, _ in calls})

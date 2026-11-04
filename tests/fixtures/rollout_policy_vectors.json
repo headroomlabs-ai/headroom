@@ -1,0 +1,8 @@
+[
+  {"channel":"stable","requested":false,"disabled":false,"unsafe":false,"enabled":false,"decision":"not_requested"},
+  {"channel":"stable","requested":true,"disabled":false,"unsafe":false,"enabled":false,"decision":"blocked_by_channel"},
+  {"channel":"canary","requested":true,"disabled":false,"unsafe":false,"enabled":true,"decision":"explicit"},
+  {"channel":"stable","requested":true,"disabled":false,"unsafe":true,"enabled":true,"decision":"unsafe_override"},
+  {"channel":"stable","requested":true,"disabled":true,"unsafe":true,"enabled":false,"decision":"disabled"},
+  {"channel":"dev","requested":false,"disabled":false,"unsafe":false,"enabled":false,"decision":"not_requested"}
+]

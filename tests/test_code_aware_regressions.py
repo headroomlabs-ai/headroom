@@ -7,8 +7,9 @@ default flip).
 2. Multi-line Go signature (`) error {`) — the brace-bearing signature line
    survives truncation instead of being silently dropped.
 3. ContentRouter CODE_AWARE token accounting — compressed_tokens must come
-   from the same word-count metric as original_tokens, not the compressor's
-   own (differently-scaled) estimator, or real savings get misread as none.
+   from the same metric as original_tokens (the router's token estimator),
+   not the compressor's own (differently-scaled) estimator, or real savings
+   get misread as none.
 4. prefer_code_aware_for_code defaults to True, both on the dataclass and via
    the HEADROOM_PREFER_CODE_AWARE_FOR_CODE env var.
 """
@@ -27,6 +28,7 @@ from headroom.transforms.content_router import (
     CompressionStrategy,
     ContentRouter,
     ContentRouterConfig,
+    _estimate_tokens,
 )
 
 pytestmark = pytest.mark.skipif(
@@ -96,13 +98,13 @@ class _FakeCodeCompressor:
         r.compressed = self._compressed
         # Deliberately inflated/differently-scaled "own" token estimate —
         # simulates a compressor whose internal counter isn't comparable to
-        # the router's len(text.split()) word count.
+        # the router's own token estimate.
         r.compressed_tokens = 10_000_000
         return r
 
 
-def test_content_router_code_aware_token_accounting_matches_word_count() -> None:
-    """compressed_tokens must be derived from len(result.compressed.split()),
+def test_content_router_code_aware_token_accounting_matches_router_estimate() -> None:
+    """compressed_tokens must be derived from _estimate_tokens(result.compressed),
     the same metric as original_tokens, not the compressor's own estimator.
     Using the mismatched estimator made a real compression look like "no
     savings" and forced a needless fallback to Kompress."""
@@ -117,7 +119,7 @@ def test_content_router_code_aware_token_accounting_matches_word_count() -> None
     )
 
     assert compressed == compressed_text
-    assert compressed_tokens == len(compressed_text.split())
+    assert compressed_tokens == _estimate_tokens(compressed_text)
     assert strategy_chain == ["code_aware"], (
         f"real compression must not trigger a Kompress fallback, got {strategy_chain}"
     )

@@ -68,8 +68,6 @@ class _DummyAnthropicHandler(AnthropicHandlerMixin):
             mode="token",
             cache_enabled=False,
             rate_limit_enabled=False,
-            fallback_enabled=False,
-            fallback_provider=None,
             prefix_freeze_enabled=False,
             memory_enabled=False,
         )
@@ -335,6 +333,88 @@ def test_anthropic_third_party_upstream_strips_tool_search_tools():
         str(tool.get("type", "")).startswith("tool_search_tool_")
         for tool in forwarded_body["tools"]
     )
+
+
+def test_anthropic_direct_path_repairs_typeless_tool_search_regression():
+    """Do not double-inject a typeless search tool; heal its stale history."""
+    tools = [
+        {
+            "name": f"mcp_tool_{index}",
+            "description": f"tool {index}",
+            "input_schema": {"type": "object", "properties": {}},
+        }
+        for index in range(20)
+    ]
+    tools.append(
+        {
+            "name": "tool_search_tool_regex",
+            "description": "client-provided tool search",
+            "input_schema": {"type": "object", "properties": {}},
+        }
+    )
+    messages = [
+        {"role": "user", "content": "search for a tool"},
+        {
+            "role": "assistant",
+            "content": [
+                {
+                    "type": "server_tool_use",
+                    "id": "srvtoolu_regex",
+                    "name": "tool_search_tool_regex",
+                    "input": {"pattern": "regex"},
+                },
+                {
+                    "type": "tool_search_tool_result",
+                    "tool_use_id": "srvtoolu_regex",
+                    "content": {
+                        "type": "tool_search_tool_search_result",
+                        "tool_references": [
+                            {
+                                "type": "tool_reference",
+                                "tool_name": "tool_search_tool_regex",
+                            }
+                        ],
+                    },
+                },
+            ],
+        },
+        {"role": "user", "content": "continue"},
+    ]
+    request = _build_request(
+        {
+            "model": "claude-sonnet-4-6",
+            "max_tokens": 100,
+            "messages": messages,
+            "tools": tools,
+        },
+        {"authorization": "Bearer sk-ant-api-test"},
+    )
+    handler = _DummyAnthropicHandler()
+
+    import headroom.tokenizers as _tk
+
+    orig_get = _tk.get_tokenizer
+    _tk.get_tokenizer = lambda model: _DummyTokenizer()
+    try:
+        response = anyio.run(handler.handle_anthropic_messages, request)
+    finally:
+        _tk.get_tokenizer = orig_get
+
+    assert response.status_code == 200
+    _, _, _, forwarded_body = handler.captured
+    # The client-owned typeless entry suppresses Headroom's typed search-tool
+    # injection, and the tools array remains byte-for-byte equivalent.
+    assert forwarded_body["tools"] == tools
+    assert not any(tool.get("type") for tool in forwarded_body["tools"])
+    # The stale server-side round trip is removed before Anthropic validates it.
+    block_types = [
+        block.get("type")
+        for message in forwarded_body["messages"]
+        for block in message.get("content", [])
+        if isinstance(message.get("content"), list) and isinstance(block, dict)
+    ]
+    assert "server_tool_use" not in block_types
+    assert "tool_search_tool_result" not in block_types
 
 
 def test_anthropic_http_invalid_body_still_emits_stage_timings(stage_log_capture):

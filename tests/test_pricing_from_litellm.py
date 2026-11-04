@@ -41,7 +41,12 @@ def test_unwrapped_model_forms_drops_leading_segments() -> None:
         ("bedrock/anthropic.claude-3-5-sonnet-20241022-v2:0", 3.00, 15.00),
         ("bedrock/us.anthropic.claude-3-5-sonnet-20241022-v2:0", 3.00, 15.00),
         ("vertex_ai/claude-sonnet-4-5", 3.00, 15.00),
-        ("groq/llama-3.3-70b-versatile", 0.59, 0.79),
+        # Any gateway-prefixed name here must be one litellm still prices:
+        # when it prunes a model the unwrap finds nothing and _get_pricing
+        # silently returns the $2.50/$10.00 GPT-4o default, which is what
+        # this test exists to catch. litellm dropped
+        # groq/llama-3.3-70b-versatile on 2026-09-23; see issue #3732.
+        ("groq/llama-guard-3-8b", 0.20, 0.20),
         # Non-OpenAI models reachable through the OpenAI-compatible passthrough.
         ("gemini-2.5-flash", 0.30, 2.50),
         ("deepseek-chat", 0.28, 0.42),

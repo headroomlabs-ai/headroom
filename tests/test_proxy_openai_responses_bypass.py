@@ -112,3 +112,58 @@ def test_responses_bypass_skips_memory_and_compression_mutation() -> None:
     assert "tools" not in captured["body"]
     assert memory_handler.search_calls == 0
     assert memory_handler.tool_calls == 0
+
+
+@pytest.mark.parametrize("tools", [None, []], ids=["omitted", "empty"])
+def test_responses_do_not_inject_memory_tools_without_client_tools(tools) -> None:
+    app = create_app(
+        ProxyConfig(
+            optimize=False,
+            cache_enabled=False,
+            rate_limit_enabled=False,
+            cost_tracking_enabled=False,
+            log_requests=False,
+        )
+    )
+    app.dependency_overrides[require_loopback] = lambda: None
+    captured: dict[str, Any] = {}
+
+    with TestClient(app) as client:
+        proxy = client.app.state.proxy
+        memory_handler = _MemoryHandler()
+        memory_handler.config.inject_context = False
+        proxy.memory_handler = memory_handler
+
+        async def _fake_retry(
+            method: str,
+            url: str,
+            headers: dict[str, str],
+            body: dict[str, Any],
+            stream: bool = False,
+            **kwargs: Any,
+        ) -> httpx.Response:
+            captured["body"] = dict(body)
+            return httpx.Response(
+                200,
+                json={
+                    "id": "resp_no_memory_tools",
+                    "output": [],
+                    "usage": {"input_tokens": 1, "output_tokens": 1},
+                },
+            )
+
+        proxy._retry_request = _fake_retry
+        payload: dict[str, Any] = {"model": "gpt-4o-mini", "input": "hello"}
+        if tools is not None:
+            payload["tools"] = tools
+        response = client.post(
+            "/v1/responses",
+            headers={
+                "authorization": "Bearer test-key",
+                "x-headroom-user-id": "user-no-memory-tools",
+            },
+            json=payload,
+        )
+
+    assert response.status_code == 200
+    assert captured["body"].get("tools", []) == []
