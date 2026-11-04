@@ -2321,3 +2321,108 @@ class TestPhpSupport:
         code = "<?php\nclass Broken {\n    public function oops( {\n"
         result = self._compressor().compress(code, language="php")
         assert result.compressed == code
+
+
+@pytest.mark.skipif(not TREE_SITTER_INSTALLED, reason="tree-sitter grammar pack not installed")
+class TestRustAttributeAttachment:
+    """Rust outer attributes (``#[derive(...)]``, ``#[inline]``, ``#[cfg(...)]``)
+    are siblings of the item they decorate, like doc comments. Left
+    uncaptured, they fall through to the leftover sweep and drift away from
+    the item — commonly after the compressed function, which rustc rejects
+    with ``expected item after attributes``.
+    """
+
+    def _compressor(self):
+        return CodeAwareCompressor(
+            CodeCompressorConfig(
+                min_tokens_for_compression=1,
+                max_body_lines=1,
+                enable_ccr=False,
+                semantic_analysis=False,
+            )
+        )
+
+    def test_attributes_stay_attached_to_their_items(self):
+        code = (
+            "#[derive(Debug, Clone, PartialEq)]\n"
+            "pub struct Item {\n"
+            "    pub id: u64,\n"
+            "    pub name: String,\n"
+            "}\n"
+            "\n"
+            "#[inline]\n"
+            '#[cfg(feature = "extra")]\n'
+            "pub fn log_item(item: &Item, sink: &mut Vec<u64>) {\n"
+            "    sink.push(item.id);\n"
+            "    sink.push(item.id + 1);\n"
+            "    sink.push(item.id + 2);\n"
+            "    sink.push(item.id + 3);\n"
+            "}\n"
+        )
+
+        result = self._compressor().compress(code, language="rust")
+
+        assert result.compression_ratio < 1.0
+        assert "#[derive(Debug, Clone, PartialEq)]\npub struct Item {" in result.compressed
+        assert '#[inline]\n#[cfg(feature = "extra")]\npub fn log_item' in result.compressed
+
+    def test_doc_comment_stays_ahead_of_attributes(self):
+        code = (
+            "/// Records one item.\n"
+            "#[inline]\n"
+            "pub fn record(item: &Item, sink: &mut Vec<u64>) {\n"
+            "    sink.push(item.id);\n"
+            "    sink.push(item.id + 1);\n"
+            "    sink.push(item.id + 2);\n"
+            "}\n"
+        )
+
+        result = self._compressor().compress(code, language="rust")
+
+        assert result.compression_ratio < 1.0
+        assert "/// Records one item.\n#[inline]\npub fn record" in result.compressed
+
+    def test_attribute_attaches_across_blank_line(self):
+        """Rust allows whitespace between an outer attribute and its item."""
+        code = (
+            "pub struct Item { pub id: u64 }\n"
+            "\n"
+            "#[inline]\n"
+            "\n"
+            "pub fn record(item: &Item, sink: &mut Vec<u64>) {\n"
+            "    sink.push(item.id);\n"
+            "    sink.push(item.id + 1);\n"
+            "    sink.push(item.id + 2);\n"
+            "}\n"
+        )
+
+        result = self._compressor().compress(code, language="rust")
+
+        assert result.compression_ratio < 1.0
+        assert result.syntax_valid is True
+        assert "#[inline]\npub fn record" in result.compressed
+        assert not result.compressed.rstrip().endswith("#[inline]")
+
+    def test_attribute_attaches_through_detached_comment(self):
+        """A comment between an attribute and its item must not detach it."""
+        code = (
+            "pub struct Item { pub id: u64 }\n"
+            "\n"
+            "#[inline]\n"
+            "\n"
+            "// Keep with the function below.\n"
+            "\n"
+            "pub fn record(item: &Item, sink: &mut Vec<u64>) {\n"
+            "    sink.push(item.id);\n"
+            "    sink.push(item.id + 1);\n"
+            "    sink.push(item.id + 2);\n"
+            "    sink.push(item.id + 3);\n"
+            "}\n"
+        )
+
+        result = self._compressor().compress(code, language="rust")
+
+        assert result.compression_ratio < 1.0
+        assert result.syntax_valid is True
+        assert "#[inline]\npub fn record" in result.compressed
+        assert not result.compressed.rstrip().endswith("#[inline]")
