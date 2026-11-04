@@ -585,6 +585,136 @@ def test_cache_mode_skips_memory_context_search_openai_responses() -> None:
         assert sent.get("instructions") == "You are a Codex assistant."
 
 
+def test_cache_mode_chat_preserves_tools_and_outcome_skip_reason() -> None:
+    """Cache mode never injects memory context on OpenAI /v1/chat/completions."""
+    captured: dict[str, object] = {}
+    recorded_outcomes = []
+    with _make_proxy_client() as client:
+        proxy = client.app.state.proxy
+        proxy.config.mode = "cache"
+        proxy.config.optimize = False
+        proxy.config.image_optimize = False
+        proxy.config.ccr_proactive_expansion = False
+
+        async def _capture_outcome(outcome):
+            recorded_outcomes.append(outcome)
+
+        proxy._record_request_outcome = _capture_outcome
+
+        _install_session_tracker(proxy, frozen_count=1)
+        _install_memory_handler(proxy)
+        proxy.memory_handler.config.inject_tools = True
+        proxy.memory_handler.compute_memory_tool_definitions = lambda _provider: [
+            {"type": "function", "function": {"name": "mem_search", "parameters": {}}}
+        ]
+        _install_capture_retry(proxy, captured)
+
+        response = client.post(
+            "/v1/chat/completions",
+            headers={
+                "authorization": "Bearer sk-test",
+                "x-headroom-user-id": "u1",
+            },
+            json={
+                "model": "gpt-4o",
+                "messages": [
+                    {"role": "system", "content": "base system"},
+                    {"role": "user", "content": "latest user"},
+                ],
+                "tools": [
+                    {
+                        "type": "function",
+                        "function": {"name": "client_tool", "parameters": {}},
+                    }
+                ],
+            },
+        )
+
+        assert response.status_code == 200
+        proxy.memory_handler.search_and_format_context.assert_not_awaited()
+        sent = captured["body"]
+        assert isinstance(sent, dict)
+        assert sent["messages"][1]["content"] == "latest user"
+        # Memory tools remain present even when context search is skipped
+        assert "tools" in sent
+        tool_names = [t.get("function", {}).get("name") for t in sent["tools"]]
+        assert "client_tool" in tool_names
+        assert "mem_search" in tool_names
+        # Outcome tags must record memory_skip_reason="cache_mode"
+        assert len(recorded_outcomes) >= 1
+        assert recorded_outcomes[0].tags.get("memory_skip_reason") == "cache_mode"
+
+
+def test_cache_mode_responses_preserves_tools_and_outcome_skip_reason() -> None:
+    """Cache mode never injects memory context on OpenAI /v1/responses."""
+    captured: dict[str, object] = {}
+    recorded_outcomes = []
+    with _make_responses_proxy_client() as client:
+        proxy = client.app.state.proxy
+        proxy.config.mode = "cache"
+        proxy.config.optimize = False
+        proxy.config.image_optimize = False
+
+        async def _capture_outcome(outcome):
+            recorded_outcomes.append(outcome)
+
+        proxy._record_request_outcome = _capture_outcome
+        _install_memory_handler(proxy)
+        proxy.memory_handler.config.inject_tools = True
+        proxy.memory_handler.compute_memory_tool_definitions = lambda _provider: [
+            {"type": "function", "function": {"name": "mem_search", "parameters": {}}}
+        ]
+
+        async def _fake_retry(method, url, headers, body, stream=False, **kwargs):  # noqa: ANN001
+            captured["body"] = body
+            return httpx.Response(
+                200,
+                json={
+                    "id": "resp_1",
+                    "object": "response",
+                    "model": "gpt-5.4",
+                    "output": [],
+                    "usage": {"input_tokens": 5, "output_tokens": 1, "total_tokens": 6},
+                },
+            )
+
+        proxy._retry_request = _fake_retry
+
+        response = client.post(
+            "/v1/responses",
+            headers={
+                "authorization": "Bearer sk-test",
+                "x-headroom-user-id": "u1",
+            },
+            json={
+                "model": "gpt-5.4",
+                "instructions": "You are a Codex assistant.",
+                "input": "latest user prompt",
+                "tools": [
+                    {
+                        "type": "function",
+                        "name": "client_tool",
+                        "description": "client tool",
+                        "parameters": {},
+                    }
+                ],
+            },
+        )
+
+        assert response.status_code == 200
+        proxy.memory_handler.search_and_format_context.assert_not_awaited()
+        assert "body" in captured
+        sent = captured["body"]
+        assert isinstance(sent, dict)
+        assert sent.get("input") == "latest user prompt"
+        assert "tools" in sent
+        tool_names = [t.get("name") for t in sent["tools"]]
+        assert "client_tool" in tool_names
+        assert "mem_search" in tool_names
+        assert len(recorded_outcomes) >= 1
+        assert recorded_outcomes[0].tags.get("memory_skip_reason") == "cache_mode"
+
+
 def test_cache_mode_frozen_prefix_restore_logs_at_info_level(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
