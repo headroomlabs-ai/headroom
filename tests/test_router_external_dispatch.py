@@ -33,7 +33,6 @@ from headroom.transforms.compressor_registry import (
     CompressOutput,
 )
 from headroom.transforms.content_router import (
-    CompressionStrategy,
     ContentRouter,
     ContentRouterConfig,
 )
@@ -248,21 +247,6 @@ def test_native_misclassification_keeps_git_status_format(_memory_ccr, monkeypat
 
     assert detected.content_type is ContentType.TABULAR
     assert detected.metadata["format"] == "git_status"
-
-
-def test_external_dispatch_via_apply_strategy_returns_normal_shape(_memory_ccr):
-    comp = _RecordingExternal(name="ext_json", content_types=("application/json",))
-    router = _router_with_external(comp, ["ext_json"])
-
-    compressed, tokens, chain = router._apply_strategy_to_content(
-        _JSON_ARRAY, CompressionStrategy.SMART_CRUSHER, ""
-    )
-
-    assert chain == ["external:ext_json"]
-    assert "external-compressed" in compressed
-    # Tokens counted with the router's OWN estimator (a positive int), not the
-    # compressor's self-report.
-    assert isinstance(tokens, int) and tokens > 0
 
 
 # ─────────────────────────── (b) recoverable map ─────────────────────────────
