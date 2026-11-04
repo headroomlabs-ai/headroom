@@ -58,6 +58,7 @@ def test_retired_tokensave_selector_maps_to_serena() -> None:
 
 def test_serena_dashboard_disabled_flips_existing_config(tmp_path, monkeypatch) -> None:
     monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("USERPROFILE", str(tmp_path))
     cfg = tmp_path / ".serena" / "serena_config.yml"
     cfg.parent.mkdir(parents=True)
     cfg.write_text(
@@ -84,6 +85,7 @@ def test_serena_config_is_never_created_by_headroom(tmp_path, monkeypatch) -> No
     pins our own key list would go on passing while users broke again.
     """
     monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("USERPROFILE", str(tmp_path))
 
     wrap._ensure_serena_dashboard_disabled()
 
@@ -100,6 +102,7 @@ def test_serena_dashboard_disabled_repairs_config_missing_projects(tmp_path, mon
     import yaml
 
     monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("USERPROFILE", str(tmp_path))
     cfg = tmp_path / ".serena" / "serena_config.yml"
     cfg.parent.mkdir(parents=True)
     cfg.write_text("web_dashboard_open_on_launch: false\n")
@@ -116,6 +119,7 @@ def test_serena_dashboard_disabled_preserves_registered_projects(tmp_path, monke
     import yaml
 
     monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("USERPROFILE", str(tmp_path))
     cfg = tmp_path / ".serena" / "serena_config.yml"
     cfg.parent.mkdir(parents=True)
     cfg.write_text(
@@ -135,6 +139,7 @@ def test_serena_dashboard_disabled_preserves_registered_projects(tmp_path, monke
 
 def test_serena_dashboard_disabled_is_idempotent(tmp_path, monkeypatch) -> None:
     monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("USERPROFILE", str(tmp_path))
     cfg = tmp_path / ".serena" / "serena_config.yml"
     cfg.parent.mkdir(parents=True)
     cfg.write_text("projects: []\nweb_dashboard_open_on_launch: true\n")
