@@ -119,8 +119,11 @@ class TestLiteLLMLogSuppression:
         import os
 
         monkeypatch.delenv("LITELLM_SUPPRESS_DEBUG_INFO", raising=False)
-        sys.modules.pop("headroom.providers.litellm", None)
-        sys.modules.pop("litellm", None)
+        # delitem, not pop: teardown puts the real modules back. A bare pop made
+        # every later `import litellm` load a second copy, so a test pinning a
+        # rate on it missed modules still holding the first (CostTracker).
+        monkeypatch.delitem(sys.modules, "headroom.providers.litellm", raising=False)
+        monkeypatch.delitem(sys.modules, "litellm", raising=False)
 
         original_import = builtins.__import__
         fake_litellm = ModuleType("litellm")

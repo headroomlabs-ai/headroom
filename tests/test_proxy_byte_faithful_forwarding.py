@@ -660,7 +660,9 @@ def _make_anthropic_app(*, optimize: bool) -> tuple[TestClient, _CapturingTransp
     # turn 0 on every run.
     fake_tracker = _FakePrefixTracker(frozen_count=0)
     proxy.session_tracker_store.compute_session_id = lambda request, model, messages: "s1"
-    proxy.session_tracker_store.get_or_create = lambda session_id, provider: fake_tracker
+    proxy.session_tracker_store.get_or_create = (
+        lambda session_id, provider, cache_ttl_seconds=None: fake_tracker
+    )
 
     return TestClient(app), transport
 
@@ -698,7 +700,9 @@ def test_signed_thinking_discarded_mutation_uses_wire_truth_for_all_accounting(
 
     tracker = _FakePrefixTracker(frozen_count=0)
     proxy.session_tracker_store.compute_session_id = lambda request, model, messages: "signed"
-    proxy.session_tracker_store.get_or_create = lambda session_id, provider: tracker
+    proxy.session_tracker_store.get_or_create = (
+        lambda session_id, provider, cache_ttl_seconds=None: tracker
+    )
 
     inbound = {
         "model": "claude-opus-5",
@@ -791,7 +795,9 @@ def test_untouched_thinking_lets_tool_compaction_reach_the_wire(
 
     tracker = _FakePrefixTracker(frozen_count=0)
     proxy.session_tracker_store.compute_session_id = lambda request, model, messages: "signed"
-    proxy.session_tracker_store.get_or_create = lambda session_id, provider: tracker
+    proxy.session_tracker_store.get_or_create = (
+        lambda session_id, provider, cache_ttl_seconds=None: tracker
+    )
 
     signed_block = {"type": "thinking", "thinking": "private", "signature": "sig123"}
     inbound = {
@@ -1469,7 +1475,9 @@ def test_streaming_forwarder_byte_faithful() -> None:
     # Pin session tracker so the cache-stable delta path is a no-op.
     fake_tracker = _FakePrefixTracker(frozen_count=0)
     proxy.session_tracker_store.compute_session_id = lambda request, model, messages: "s_stream"
-    proxy.session_tracker_store.get_or_create = lambda session_id, provider: fake_tracker
+    proxy.session_tracker_store.get_or_create = (
+        lambda session_id, provider, cache_ttl_seconds=None: fake_tracker
+    )
 
     transport = _StreamingCapturingTransport()
     proxy.http_client = httpx.AsyncClient(transport=transport)
@@ -1566,7 +1574,9 @@ def test_messages_custom_upstream_stream_preserves_client_beta_header() -> None:
         proxy.session_tracker_store.compute_session_id = lambda request, model, messages: (
             "custom-stream-beta-1"
         )
-        proxy.session_tracker_store.get_or_create = lambda session_id, provider: fake_tracker
+        proxy.session_tracker_store.get_or_create = (
+            lambda session_id, provider, cache_ttl_seconds=None: fake_tracker
+        )
 
         transport = _StreamingCapturingTransport()
         proxy.http_client = httpx.AsyncClient(transport=transport)

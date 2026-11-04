@@ -281,3 +281,52 @@ def test_provider_exception_falls_back_to_builtin():
     # Falls back to the built-in fold rather than crashing or passing through raw.
     out, kind = _compact(GREP)
     assert kind == "search" and search_unheading(out) == GREP
+
+
+# --- excluded path enforces the same provider contract as the general path ----
+
+
+def _run_excluded_anthropic(tokenizer):
+    router = ContentRouter(ContentRouterConfig())
+    messages = [
+        {"role": "user", "content": "find it"},
+        {
+            "role": "assistant",
+            "content": [{"type": "tool_use", "id": "t1", "name": "Grep", "input": {}}],
+        },
+        {
+            "role": "user",
+            "content": [{"type": "tool_result", "tool_use_id": "t1", "content": GREP}],
+        },
+    ]
+    result = router.apply(messages, tokenizer, compress_user_messages=True)
+    return result.messages[2]["content"][0]["content"], result.transforms_applied
+
+
+def test_excluded_valid_two_tuple_still_applied(tokenizer):
+    set_lossless_provider(lambda content: ("compact", "myfold"))
+    out, applied = _run_excluded_anthropic(tokenizer)
+    assert out == "compact"
+    assert "router:excluded:lossless_myfold" in applied
+
+
+def test_excluded_three_tuple_is_ignored_not_fatal(tokenizer):
+    set_lossless_provider(lambda content: ("compact", "k", "extra"))
+    out, applied = _run_excluded_anthropic(tokenizer)
+    assert out == GREP
+    assert not any(t.startswith("router:excluded:lossless_") for t in applied)
+
+
+def test_excluded_empty_fold_leaves_content_unchanged(tokenizer):
+    set_lossless_provider(lambda content: ("  ", "k"))
+    out, applied = _run_excluded_anthropic(tokenizer)
+    assert out == GREP
+    assert not any(t.startswith("router:excluded:lossless_") for t in applied)
+
+
+def test_excluded_hostile_kind_is_replaced(tokenizer):
+    set_lossless_provider(lambda content: ("compact", "BAD LABEL{x=1}" + chr(10)))
+    out, applied = _run_excluded_anthropic(tokenizer)
+    assert out == "compact"
+    labels = [t for t in applied if t.startswith("router:excluded:lossless_")]
+    assert labels == ["router:excluded:lossless_provider"]
