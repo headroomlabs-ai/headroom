@@ -77,11 +77,6 @@ PROVIDER_PASSTHROUGH_ROUTES: tuple[ProviderPassthroughRoute, ...] = (
 )
 
 
-ANTHROPIC_HANDLER_ROUTES: tuple[ProviderHandlerRoute, ...] = (
-    ProviderHandlerRoute("POST", "/v1/messages", "handle_anthropic_messages"),
-)
-
-
 ANTHROPIC_BATCH_ROUTES: tuple[ProviderHandlerRoute, ...] = (
     ProviderHandlerRoute("POST", "/v1/messages/batches", "handle_anthropic_batch_create"),
     ProviderHandlerRoute("GET", "/v1/messages/batches", "handle_anthropic_batch_passthrough"),
@@ -206,7 +201,6 @@ CLOUDCODE_HANDLER_ROUTES: tuple[ProviderHandlerRoute, ...] = (
 
 
 PROVIDER_HANDLER_ROUTES: tuple[ProviderHandlerRoute, ...] = (
-    *ANTHROPIC_HANDLER_ROUTES,
     *ANTHROPIC_BATCH_ROUTES,
     *OPENAI_HANDLER_ROUTES,
     *OPENAI_BATCH_ROUTES,
