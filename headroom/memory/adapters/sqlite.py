@@ -9,17 +9,22 @@ Provides persistent storage for Memory objects with full support for:
 
 from __future__ import annotations
 
+import contextlib
 import json
 import re
 import sqlite3
+import warnings
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
+from ...fileperms import connect_private_sqlite
 from ..models import Memory, ScopeLevel, normalize_entity_refs
 from ..ports import MemoryFilter
 
 if TYPE_CHECKING:
+    from collections.abc import Iterator
+
     import numpy as np
 
 # Regex pattern for safe metadata keys: alphanumeric, underscores, hyphens only
@@ -44,6 +49,20 @@ def _validate_metadata_key(key: str) -> bool:
     return _SAFE_METADATA_KEY_PATTERN.match(key) is not None
 
 
+def _utc_timestamp(value: str | None) -> str | None:
+    """Comparable UTC text without rewriting stored offsets or rounding fractions.
+
+    Naive timestamps follow Memory's UTC defaults. SQLite date functions round
+    fractional seconds, so keep Python's full microsecond precision here.
+    """
+    if value is None:
+        return None
+    timestamp = datetime.fromisoformat(value)
+    if timestamp.tzinfo is not None:
+        timestamp = timestamp.astimezone(timezone.utc).replace(tzinfo=None)
+    return timestamp.isoformat(timespec="microseconds")
+
+
 class SQLiteMemoryStore:
     """SQLite-based memory store implementing the MemoryStore protocol.
 
@@ -62,6 +81,12 @@ class SQLiteMemoryStore:
     Schema:
         The memories table stores all Memory fields with appropriate indexes
         for efficient querying by scope, category, importance, and time.
+
+    Metadata filters:
+        Numbers and booleans use native SQLite equality. String filters match only
+        JSON text values. None matches an explicit JSON null,
+        not a missing key. Arrays and objects compare as compact JSON text with
+        matching JSON types; array order and object member order are significant.
     """
 
     def __init__(self, db_path: str | Path = "headroom_memory.db") -> None:
@@ -73,15 +98,23 @@ class SQLiteMemoryStore:
         self.db_path = Path(db_path)
         self._init_db()
 
-    def _get_conn(self) -> sqlite3.Connection:
+    @contextlib.contextmanager
+    def _get_conn(self) -> Iterator[sqlite3.Connection]:
         """Get a new database connection (thread-safe pattern).
 
-        Returns:
-            A new SQLite connection with row factory configured.
+        Commits on clean exit, rolls back on exception, and always closes
+        the connection -- callers use ``with self._get_conn() as conn:``.
+        The file is created, or narrowed, owner-only before sqlite opens it:
+        it holds memory content and the user ids it belongs to.
         """
-        conn = sqlite3.connect(str(self.db_path))
+        conn = connect_private_sqlite(self.db_path, what="memory store")
         conn.row_factory = sqlite3.Row
-        return conn
+        conn.create_function("headroom_utc_timestamp", 1, _utc_timestamp, deterministic=True)
+        try:
+            with conn:
+                yield conn
+        finally:
+            conn.close()
 
     def _init_db(self) -> None:
         """Initialize the database schema with indexes."""
@@ -489,21 +522,23 @@ class SQLiteMemoryStore:
             if scope_conditions:
                 conditions.append(f"({' OR '.join(scope_conditions)})")
 
+        # Normalize both sides: persisted rows may retain explicit UTC offsets.
+        # This favors correct instant comparisons over the raw TEXT time index.
         # Temporal filtering
         if filter.created_after is not None:
-            conditions.append("created_at >= ?")
-            params.append(filter.created_after.isoformat())
+            conditions.append("headroom_utc_timestamp(created_at) >= ?")
+            params.append(_utc_timestamp(filter.created_after.isoformat()))
 
         if filter.created_before is not None:
-            conditions.append("created_at <= ?")
-            params.append(filter.created_before.isoformat())
+            conditions.append("headroom_utc_timestamp(created_at) <= ?")
+            params.append(_utc_timestamp(filter.created_before.isoformat()))
 
         # Point-in-time query
         if filter.valid_at is not None:
-            valid_at_str = filter.valid_at.isoformat()
-            conditions.append("valid_from <= ?")
+            valid_at_str = _utc_timestamp(filter.valid_at.isoformat())
+            conditions.append("headroom_utc_timestamp(valid_from) <= ?")
             params.append(valid_at_str)
-            conditions.append("(valid_until IS NULL OR valid_until > ?)")
+            conditions.append("(valid_until IS NULL OR headroom_utc_timestamp(valid_until) > ?)")
             params.append(valid_at_str)
 
         # Superseded filtering
@@ -550,9 +585,31 @@ class SQLiteMemoryStore:
                 # while blocking malicious attempts like "'] OR 1=1--"
                 if not _validate_metadata_key(key):
                     continue
-                # Use JSON extraction for metadata filtering
-                conditions.append(f"json_extract(metadata, '$.{key}') = ?")
-                params.append(json.dumps(value) if not isinstance(value, str) else value)
+                # Use JSON extraction for metadata filtering.
+                #
+                # ``json_extract`` returns a NATIVE SQLite value (INTEGER / REAL /
+                # TEXT), so a scalar filter must bind the native Python value.
+                # Binding ``json.dumps(value)`` instead compared the numeric/boolean
+                # column against its text form ("5", "true") — and SQLite never
+                # equates ``5 = '5'`` — so an int/float/bool metadata filter matched
+                # nothing. ``bool`` is a subclass of ``int``, so it is covered here
+                # (a JSON ``true`` extracts to 1, and Python ``True`` binds to 1).
+                if value is None:
+                    # json_extract returns SQL NULL for both null and missing keys.
+                    conditions.append(f"json_type(metadata, '$.{key}') = 'null'")
+                elif isinstance(value, (str, int, float)):
+                    if isinstance(value, str):
+                        # Extracted JSON arrays/objects are also SQL text.
+                        conditions.append(f"json_type(metadata, '$.{key}') = 'text'")
+                    conditions.append(f"json_extract(metadata, '$.{key}') = ?")
+                    params.append(value)
+                else:
+                    # Normalize whitespace like json_extract does for arrays/objects,
+                    # and do not match a string containing the same JSON text.
+                    encoded = json.dumps(value)
+                    conditions.append(f"json_type(metadata, '$.{key}') = json_type(?)")
+                    conditions.append(f"json_extract(metadata, '$.{key}') = json(?)")
+                    params.extend([encoded, encoded])
 
         return conditions, params
 
@@ -579,6 +636,9 @@ class SQLiteMemoryStore:
             "last_accessed",
         ):
             order_column = "created_at"
+
+        if order_column in ("created_at", "last_accessed"):
+            order_column = f"headroom_utc_timestamp({order_column})"
 
         order_direction = "DESC" if filter.order_desc else "ASC"
 
@@ -773,23 +833,28 @@ class SQLiteMemoryStore:
             return []
 
         history: list[Memory] = [current]
+        # Imported or reused IDs can form cycles. Visit each stored record
+        # only once across both directions instead of blocking indefinitely.
+        visited = {current.id}
 
         # Follow chain backwards (supersedes)
         back_id = current.supersedes
-        while back_id is not None:
+        while back_id is not None and back_id not in visited:
             prev = await self.get(back_id)
             if prev is None:
                 break
+            visited.add(prev.id)
             history.insert(0, prev)  # Add to beginning
             back_id = prev.supersedes
 
         # Follow chain forwards (superseded_by) if requested
         if include_future:
             forward_id = current.superseded_by
-            while forward_id is not None:
+            while forward_id is not None and forward_id not in visited:
                 next_mem = await self.get(forward_id)
                 if next_mem is None:
                     break
+                visited.add(next_mem.id)
                 history.append(next_mem)
                 forward_id = next_mem.superseded_by
 
@@ -854,9 +919,19 @@ class SQLiteMemoryStore:
     def count_sync(self) -> int:
         """Synchronous count of all memories (for diagnostics).
 
+        .. deprecated::
+            Nothing in Headroom calls this. Use the async
+            ``count(MemoryFilter(include_superseded=True))`` instead.
+
         Returns:
             Total number of memories in the store.
         """
+        warnings.warn(
+            "SQLiteMemoryStore.count_sync is deprecated and will be removed in a future "
+            "release; use the async count(MemoryFilter(include_superseded=True)) instead.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
         with self._get_conn() as conn:
             cursor = conn.execute("SELECT COUNT(*) FROM memories")
             result = cursor.fetchone()[0]

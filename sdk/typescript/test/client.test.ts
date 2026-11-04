@@ -119,6 +119,23 @@ describe("HeadroomClient", () => {
     expect(url).toBe("http://localhost:8787/v1/compress");
   });
 
+  it("handles long runs of slashes in baseUrl in linear time", async () => {
+    // The previous /\/+$/ regex backtracked quadratically on a long run of
+    // "/" that is not at the end of the string (CodeQL js/polynomial-redos).
+    const slashes = "/".repeat(100_000);
+    mockFetch.mockResolvedValueOnce(okResponse(sampleProxyResponse));
+
+    const start = performance.now();
+    const client = new HeadroomClient({
+      baseUrl: `http://localhost:8787${slashes}x${slashes}`,
+    });
+    expect(performance.now() - start).toBeLessThan(1000);
+
+    await client.compress(sampleMessages, { model: "gpt-4o" });
+    const [url] = mockFetch.mock.calls[0];
+    expect(url).toBe(`http://localhost:8787${slashes}x/v1/compress`);
+  });
+
   it("throws HeadroomAuthError on 401 (always, even with fallback)", async () => {
     mockFetch.mockResolvedValueOnce(
       errorResponse(401, {
@@ -262,5 +279,49 @@ describe("HeadroomClient", () => {
 
     const body = JSON.parse(mockFetch.mock.calls[0][1].body);
     expect(body.model).toBe("gpt-4o");
+  });
+
+  it("sends a per-call config (snake_cased) in the request body", async () => {
+    mockFetch.mockResolvedValueOnce(okResponse(sampleProxyResponse));
+    const client = new HeadroomClient({ baseUrl: "http://localhost:8787" });
+
+    await client.compress(sampleMessages, {
+      model: "gpt-4o",
+      config: { mode: "ccr", targetRatio: 0.3, compressUserMessages: true },
+    });
+
+    const [, opts] = mockFetch.mock.calls[0];
+    const body = JSON.parse(opts.body);
+    expect(body.config.mode).toBe("ccr");
+    expect(body.config.target_ratio).toBe(0.3);
+    expect(body.config.compress_user_messages).toBe(true);
+  });
+
+  it("per-call config overrides client-level config", async () => {
+    mockFetch.mockResolvedValueOnce(okResponse(sampleProxyResponse));
+    const client = new HeadroomClient({
+      baseUrl: "http://localhost:8787",
+      config: { mode: "lossy_inline" },
+    });
+
+    await client.compress(sampleMessages, {
+      model: "gpt-4o",
+      config: { mode: "ccr" },
+    });
+
+    const [, opts] = mockFetch.mock.calls[0];
+    const body = JSON.parse(opts.body);
+    expect(body.config.mode).toBe("ccr");
+  });
+
+  it("omits the config key when neither client nor call sets config", async () => {
+    mockFetch.mockResolvedValueOnce(okResponse(sampleProxyResponse));
+    const client = new HeadroomClient({ baseUrl: "http://localhost:8787" });
+
+    await client.compress(sampleMessages, { model: "gpt-4o" });
+
+    const [, opts] = mockFetch.mock.calls[0];
+    const body = JSON.parse(opts.body);
+    expect(body.config).toBeUndefined();
   });
 });

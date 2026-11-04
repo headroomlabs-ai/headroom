@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 
 import pytest
@@ -77,6 +78,35 @@ def test_resolver_tier2_explicit_cwd_header() -> None:
     assert len(key.split("-")[-1]) == 16  # sha256 prefix length
 
 
+def test_resolver_project_label_alone_fails_closed() -> None:
+    r = ProjectResolver()
+    # X-Headroom-Project is a display/savings label, not a trusted identity.
+    assert r.resolve(_ctx(headers={"X-Headroom-Project": "wrapped-project"})) is None
+
+
+def test_resolver_project_label_does_not_collapse_distinct_cwds() -> None:
+    r = ProjectResolver()
+    out_a = r.resolve(
+        _ctx(
+            headers={
+                "X-Headroom-Project": "api",
+                "X-Headroom-Cwd": "/work/acme/api",
+            }
+        )
+    )
+    out_b = r.resolve(
+        _ctx(
+            headers={
+                "X-Headroom-Project": "api",
+                "X-Headroom-Cwd": "/work/other/api",
+            }
+        )
+    )
+    assert out_a is not None and out_b is not None
+    assert out_a[0] != out_b[0]
+    assert out_a[1] == out_b[1] == "api"
+
+
 def test_resolver_tier3_cli_override() -> None:
     r = ProjectResolver()
     out = r.resolve(_ctx(project_root_override="/Users/foo/code/project-c"))
@@ -116,10 +146,116 @@ def test_resolver_tier4_env_block_cwd_format() -> None:
     assert display == "cwd-style"
 
 
+def test_resolver_tier4_env_block_bulleted_cwd_format() -> None:
+    r = ProjectResolver()
+    prompt = "- cwd: /Users/foo/code/bulleted-cwd\n"
+    out = r.resolve(_ctx(system_prompt=prompt))
+    assert out is not None
+    _, display = out
+    assert display == "bulleted-cwd"
+
+
+def test_extract_cwd_prefers_primary_working_directory_over_earlier_cwd() -> None:
+    prompt = "cwd: /work/old\nPrimary working directory: /work/current\n"
+
+    assert ProjectResolver._extract_cwd_from_system_prompt(prompt) == "/work/current"
+
+
+def test_extract_cwd_preserves_vertical_tab_inside_path() -> None:
+    cwd = "/work/a\vpart"
+
+    assert ProjectResolver._extract_cwd_from_system_prompt(f"cwd: {cwd}\n") == cwd
+
+
+def test_extract_cwd_supports_crlf_line_endings() -> None:
+    prompt = "cwd: /work/current\r\n"
+
+    assert ProjectResolver._extract_cwd_from_system_prompt(prompt) == "/work/current"
+
+
+def test_resolver_ignores_incidental_cwd_prose() -> None:
+    r = ProjectResolver()
+    assert (
+        r.resolve(_ctx(system_prompt="When describing cwd: use the actual environment path."))
+        is None
+    )
+
+
 def test_resolver_returns_none_when_nothing_resolves() -> None:
     r = ProjectResolver()
     out = r.resolve(_ctx(system_prompt="A generic system prompt with no env block."))
     assert out is None
+
+
+def test_resolver_unencodable_system_prompt_cwd_does_not_raise() -> None:
+    # Issue #4162: a JSON-decoded ``\ud800`` escape leaves an unpaired
+    # surrogate in the cwd. It has no UTF-8 form, so it is not a usable
+    # identity: resolve to "no project" instead of raising.
+    r = ProjectResolver()
+    prompt = "Primary working directory: /work/" + chr(0xD800)
+    assert r.resolve(_ctx(system_prompt=prompt)) is None
+
+
+def test_resolver_unencodable_cli_override_falls_through_to_system_prompt() -> None:
+    # An unusable cwd in one tier must not block a usable one in a later tier.
+    r = ProjectResolver()
+    out = r.resolve(
+        _ctx(
+            project_root_override="/work/" + chr(0xDC80),
+            system_prompt="Primary working directory: /Users/foo/code/headroom\n",
+        )
+    )
+    assert out is not None
+    _, display = out
+    assert display == "headroom"
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX undecodable byte filenames and symlinks only")
+def test_resolver_symlink_to_undecodable_name_does_not_raise(tmp_path: Path) -> None:
+    # The cwd itself is plain UTF-8, but realpath follows the symlink to a
+    # non-UTF-8 filename and returns it as a ``\udcXX`` surrogate escape.
+    # Creating that fixture is a filesystem capability, not product behavior:
+    # skip if it is unavailable (e.g. macOS APFS rejects non-UTF-8 names).
+    # test_resolver_realpath_returning_surrogate_does_not_raise covers the
+    # same path on every platform.
+    base = os.fsencode(tmp_path)
+    try:
+        os.mkdir(base + b"/\xff-target")
+        os.symlink(base + b"/\xff-target", base + b"/link")
+    except (OSError, UnicodeError) as exc:
+        pytest.skip(f"cannot create a non-UTF-8 symlink fixture here: {exc}")
+    prompt = f"Primary working directory: {tmp_path}/link\n"
+    assert ProjectResolver().resolve(_ctx(system_prompt=prompt)) is None
+
+
+def test_resolver_realpath_returning_surrogate_does_not_raise(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Same case as above on any OS: realpath yields what Linux returns for a
+    # symlink to a non-UTF-8 filename.
+    monkeypatch.setattr(os.path, "realpath", lambda _p: "/work/\udcff-target")
+    prompt = "Primary working directory: /work/link\n"
+    assert ProjectResolver().resolve(_ctx(system_prompt=prompt)) is None
+
+
+def test_resolver_valid_non_ascii_cwd_still_resolves() -> None:
+    r = ProjectResolver()
+    out = r.resolve(_ctx(system_prompt="Primary working directory: /Users/foo/code/café\n"))
+    assert out is not None
+    key, display = out
+    assert display == "café"
+    assert key.startswith("caf")
+
+
+def test_router_project_mode_unencodable_cwd_fails_closed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    router = _make_router(tmp_path, MemoryStorageMode.PROJECT, monkeypatch)
+    _, scope = router.backend_for(
+        _ctx(system_prompt="Primary working directory: /work/" + chr(0xD800))
+    )
+    assert scope.mode is MemoryStorageMode.PROJECT
+    assert scope.project_key is None
 
 
 def test_resolver_same_cwd_yields_stable_key_across_calls() -> None:
@@ -225,6 +361,26 @@ def test_extract_system_prompt_system_message_beats_user_cwd_fallback() -> None:
     assert display == "project"
 
 
+def test_extract_system_prompt_ignores_incidental_cwd_prose_for_fallback() -> None:
+    body = {
+        "system": "When describing cwd: use the actual environment path.",
+        "messages": [
+            {
+                "role": "user",
+                "content": "<env>\nPrimary working directory: /work/project-alpha\n</env>",
+            }
+        ],
+    }
+
+    prompt = extract_system_prompt(body)
+    resolved = ProjectResolver().resolve(_ctx(system_prompt=prompt))
+
+    assert "Primary working directory: /work/project-alpha" in prompt
+    assert resolved is not None
+    _, display = resolved
+    assert display == "project-alpha"
+
+
 def test_extract_system_prompt_cwd_in_non_user_message_returns_empty() -> None:
     body = {"messages": [{"role": "assistant", "content": "cwd: /spoof/project"}]}
 
@@ -300,11 +456,14 @@ def test_router_project_mode_unresolved_fails_closed_by_default(
     """
     router = _make_router(tmp_path, MemoryStorageMode.PROJECT, monkeypatch)
 
-    _, scope = router.backend_for(_ctx(system_prompt="no env block"))
+    backend, scope = router.backend_for(_ctx(system_prompt="no env block"))
     # Fail-closed signal: PROJECT mode preserved, project_key is None.
     assert scope.mode is MemoryStorageMode.PROJECT
     assert scope.project_key is None
+    assert scope.db_path is None
     assert scope.display_name == "unresolved (no memory)"
+    assert backend is None
+    assert router.open_backends() == []
 
 
 def test_router_project_mode_unresolved_global_fallback_when_opted_in(
@@ -411,3 +570,134 @@ def test_router_lru_eviction_drops_oldest(tmp_path: Path, monkeypatch: pytest.Mo
     for i in range(5):
         router.backend_for(_ctx(headers={"x-headroom-cwd": f"/code/p{i}"}))
     assert len(router.open_backends()) == 4
+
+
+# ---------------------------------------------------------------------------
+# Percent-decoding is a header-boundary concern only (#3597 review round 2)
+# ---------------------------------------------------------------------------
+
+
+def test_resolver_literal_percent_path_distinct_via_cli_override() -> None:
+    """A literal ``%2F`` directory must not collapse onto the decoded path.
+
+    Only ``x-headroom-cwd`` is percent-encoded by the wrapper. The CLI
+    override carries a literal filesystem path, so decoding it would make
+    ``/work/acme%2Fapi`` and ``/work/acme/api`` share one memory store.
+    """
+    r = ProjectResolver()
+    literal = r.resolve(_ctx(project_root_override="/work/acme%2Fapi"))
+    decoded = r.resolve(_ctx(project_root_override="/work/acme/api"))
+
+    assert literal is not None and decoded is not None
+    assert literal[0] != decoded[0]
+
+
+def test_resolver_literal_percent_path_distinct_via_system_prompt() -> None:
+    """Same guarantee for the ``cwd:`` system-prompt tier."""
+    r = ProjectResolver()
+    literal = r.resolve(_ctx(system_prompt="Primary working directory: /work/acme%2Fapi"))
+    decoded = r.resolve(_ctx(system_prompt="Primary working directory: /work/acme/api"))
+
+    assert literal is not None and decoded is not None
+    assert literal[0] != decoded[0]
+
+
+def test_resolver_literal_percent_space_path_distinct_from_space() -> None:
+    """``%20`` in a real directory name stays distinct from a real space."""
+    r = ProjectResolver()
+    literal = r.resolve(_ctx(project_root_override="/work/my%20proj"))
+    spaced = r.resolve(_ctx(project_root_override="/work/my proj"))
+
+    assert literal is not None and spaced is not None
+    assert literal[0] != spaced[0]
+
+
+def test_resolver_encoded_cwd_header_matches_literal_cwd_identity() -> None:
+    """The wrapper's encoded header still resolves to the literal cwd identity.
+
+    This is the behaviour the encoding exists for, and it must survive the
+    boundary-only decode: ``quote(path)`` in the header and ``path`` from the
+    CLI override have to land on the same project key.
+    """
+    from urllib.parse import quote
+
+    path = "/work/acme/día-api"
+    r = ProjectResolver()
+    via_header = r.resolve(_ctx(headers={"x-headroom-cwd": quote(path, safe="/:._-~()")}))
+    via_override = r.resolve(_ctx(project_root_override=path))
+
+    assert via_header is not None and via_override is not None
+    assert via_header[0] == via_override[0]
+    assert via_header[1] == via_override[1] == "día-api"
+
+
+# Claude Code 2.x sends the env block as an isMeta user message (#3595)
+# ---------------------------------------------------------------------------
+
+
+def test_extract_system_prompt_finds_cwd_in_user_msg_despite_system_string() -> None:
+    """A non-empty ``system`` must not hide the ``cwd:`` in a user message.
+
+    Claude Code 2.x always sends a system prompt *and* puts its ``<env>``
+    block in an ``isMeta`` user message. The old first-match-wins early
+    return made that block unreachable, so resolution fell through to the
+    fail-closed fallback for every 2.x request.
+    """
+    body = {
+        "system": "You are Claude Code.",
+        "messages": [
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "text",
+                        "text": "<env>\nPrimary working directory: /work/myproj\n</env>",
+                    }
+                ],
+            },
+        ],
+    }
+
+    prompt = extract_system_prompt(body)
+    resolved = ProjectResolver().resolve(_ctx(system_prompt=prompt))
+
+    assert "You are Claude Code." in prompt
+    assert resolved is not None
+    assert resolved[1] == "myproj"
+
+
+def test_extract_system_prompt_finds_cwd_in_user_msg_despite_system_blocks() -> None:
+    """Same when ``system`` is a block list rather than a string."""
+    body = {
+        "system": [{"type": "text", "text": "You are Claude Code."}],
+        "messages": [
+            {"role": "user", "content": "Primary working directory: /work/other\nhi"},
+        ],
+    }
+
+    resolved = ProjectResolver().resolve(_ctx(system_prompt=extract_system_prompt(body)))
+
+    assert resolved is not None
+    assert resolved[1] == "other"
+
+
+def test_extract_system_prompt_user_cwd_cannot_override_system_field_cwd() -> None:
+    """A user turn must not redirect resolution away from the system cwd.
+
+    User content is client-controlled, so it stays a fallback only. This is
+    the top-level-``system`` counterpart of the ``role="system"`` precedence
+    already covered above.
+    """
+    body = {
+        "system": "Primary working directory: /system/project",
+        "messages": [
+            {"role": "user", "content": "Primary working directory: /spoofed/evil"},
+        ],
+    }
+
+    prompt = extract_system_prompt(body)
+    resolved = ProjectResolver().resolve(_ctx(system_prompt=prompt))
+
+    assert "spoofed" not in prompt
+    assert resolved is not None
+    assert resolved[1] == "project"

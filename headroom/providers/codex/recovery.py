@@ -404,6 +404,32 @@ def _quote(identifier: str) -> str:
     return '"' + identifier.replace('"', '""') + '"'
 
 
+def _write_private_text(path: Path, text: str) -> None:
+    """Atomically write ``text`` to ``path`` without a world/group-readable window.
+
+    The backup manifest records the recovered account's file layout. Rather than
+    create-or-narrow the destination in place — which fails *open* if a pre-write
+    ``chmod`` is refused, and is exposed to a symlink swap between the check and
+    the ``open`` — write to a fresh private temp file and atomically rename it in:
+    ``tempfile.mkstemp`` creates it ``0o600`` with ``O_EXCL`` (never follows a
+    symlink, never reuses a planted file), and ``os.replace`` swaps it in
+    atomically, the destination inheriting ``0o600``. The existing file is never
+    opened or truncated, so a permission/platform error fails **closed** — it
+    raises before the old file is touched, and the temp is cleaned up. Mirrors the
+    Copilot auth writer.
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp_name = tempfile.mkstemp(dir=str(path.parent), prefix=f".{path.name}.", suffix=".tmp")
+    tmp = Path(tmp_name)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(text)
+        os.replace(tmp, path)
+    except BaseException:
+        tmp.unlink(missing_ok=True)
+        raise
+
+
 def _database_schema(connection: sqlite3.Connection, schema: str) -> dict[str, str]:
     rows = connection.execute(
         f"SELECT name, sql FROM {_quote(schema)}.sqlite_master "
@@ -741,8 +767,5 @@ def recover_codex_home(*, source: Path, target: Path) -> RecoveryReport:
     manifest = asdict(report)
     manifest.update(source=str(source), target=str(target), backup_dir=str(backup_dir))
     manifest_file = backup_dir / "manifest.json"
-    manifest_file.write_text(
-        json.dumps(manifest, indent=2, sort_keys=True) + "\n", encoding="utf-8"
-    )
-    manifest_file.chmod(0o600)
+    _write_private_text(manifest_file, json.dumps(manifest, indent=2, sort_keys=True) + "\n")
     return report
