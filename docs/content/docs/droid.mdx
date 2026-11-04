@@ -1,0 +1,50 @@
+---
+title: Factory Droid Integration
+description: Route Factory Droid traffic through Headroom for token compression on your Factory subscription, without editing customModels or handling API keys.
+---
+
+Use `headroom wrap droid` to route a [Factory Droid](https://factory.ai) session's traffic through the Headroom proxy with a single command. Droid talks to Factory's gateway and honours the `FACTORY_API_BASE_URL` environment variable, so the wrapper points that variable at the local proxy and lets Droid run normally. Every model, including Droid Core, stays on your Factory subscription and is eligible for compression. There are no `customModels` edits and no API keys to manage.
+
+## Quick Start
+
+```bash
+headroom wrap droid
+```
+
+Pass arguments through to Droid after `--`:
+
+```bash
+headroom wrap droid -- exec "explain this repo"
+```
+
+## How it works
+
+Factory exposes four inference shapes and Droid picks per model: Anthropic Messages at `POST /api/llm/a/v1/messages`, OpenAI Chat Completions at `POST /api/llm/o/v1/chat/completions`, OpenAI Responses at `POST /api/llm/o/v1/responses`, and native Gemini at `POST /api/llm/g/v1/generate`. The proxy compresses each through its matching pipeline and forwards other Factory REST paths (whoami, sessions, feature flags, billing) verbatim to the real Factory upstream. Your Factory session credential is passed through untouched. Gemini requests retain their native body and use the body's `stream` flag for streaming. If the body has no usable model, Headroom warns and forwards without compression, preserving Factory's response.
+
+| Step | What happens |
+|---|---|
+| Proxy | Starts or reuses a compatible Factory-mode Headroom proxy unless `--no-proxy` is set |
+| Redirect | Launches Droid with `FACTORY_API_BASE_URL=http://127.0.0.1:<port>` |
+| Compress | Messages, Chat Completions, Responses, and Gemini inference routes use their matching compression pipelines; other Factory paths are forwarded as-is |
+| Upstream | Forwards to `https://api.factory.ai` by default, or to an existing `FACTORY_API_BASE_URL` / `--factory-api-url` (enterprise or EU gateway) |
+
+## Options
+
+```bash
+# Proxy port defaults to 8787; Factory receives forwarded inference requests.
+# --no-proxy reuses a running proxy; --learn enables live traffic learning.
+headroom wrap droid \
+  --port 8787 \
+  --factory-api-url https://api.factory.ai \
+  --no-proxy \
+  --learn \
+  --verbose
+```
+
+The upstream is resolved with this precedence: `--factory-api-url`, then an existing `FACTORY_API_BASE_URL` (so an enterprise or EU gateway you already use is preserved), then `https://api.factory.ai`.
+
+## Notes
+
+- Proxy dashboards bucket the traffic under the `factory` provider and the actual Droid model (for example `minimax-m3` on the Anthropic route, or the Fireworks-backed Kimi model on the OpenAI route). Droid also fires small internal helper calls (for example a Haiku "oneshot"); those are attributed to whatever model they carry.
+- If the target port serves another session or a different Factory upstream, Droid automatically selects a free port without disrupting that session. You can also choose a dedicated port explicitly, e.g. `headroom wrap droid --port 8790`. With `--no-proxy`, the existing proxy must already have compatible Factory routing; otherwise the command fails instead of silently forwarding to another upstream.
+- There is no `headroom unwrap droid`, and nothing durable is written: the wrap only sets the child `FACTORY_API_BASE_URL` env var for the launched Droid process, so ending the session fully undoes it.

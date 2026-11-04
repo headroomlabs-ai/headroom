@@ -376,6 +376,119 @@ def test_ensure_proxy_restarts_idle_stale_ephemeral_proxy(monkeypatch) -> None:
     assert calls[1][0] == "start"
 
 
+def test_ensure_proxy_droid_uses_dedicated_port_for_attached_non_factory_proxy(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Main's dedicated-port fallback preserves attached sessions and Factory routing."""
+    health = {
+        "version": "0.0.1",
+        "runtime": {"websocket_sessions": {"active_sessions": 0, "active_relay_tasks": 0}},
+        "config": {"pid": "12345", "memory": False, "learn": False, "code_graph": False},
+    }
+    started: list[tuple[tuple[object, ...], dict[str, object]]] = []
+    monkeypatch.setattr(wrap_cli, "_find_persistent_manifest", lambda port: None)
+    monkeypatch.setattr(wrap_cli, "_check_proxy", lambda port: port == 8787)
+    monkeypatch.setattr(wrap_cli, "_query_proxy_health", lambda port: health)
+    monkeypatch.setattr(wrap_cli, "_proxy_needs_version_restart", lambda payload: False)
+    monkeypatch.setattr(wrap_cli, "_live_proxy_clients", lambda *a, **kw: [999])
+    monkeypatch.setattr(wrap_cli, "_find_available_port", lambda *a, **kw: 8788)
+
+    def forbidden_stop(*args: object, **kwargs: object) -> None:
+        pytest.fail("attached shared proxy must not be stopped")
+
+    def start(*args: object, **kwargs: object) -> None:
+        started.append((args, kwargs))
+
+    monkeypatch.setattr(wrap_cli, "_kill_proxy_by_pid", forbidden_stop)
+    monkeypatch.setattr(wrap_cli, "_start_proxy", start)
+    assert wrap_cli._ensure_proxy(8787, False, factory_api_url="https://api.factory.ai") == (
+        None,
+        8788,
+    )
+    assert len(started) == 1
+    assert started[0][0][0] == 8788
+    assert started[0][1]["factory_api_url"] == "https://api.factory.ai"
+
+
+def test_ensure_proxy_droid_restarts_idle_non_factory_proxy(monkeypatch) -> None:
+    """With no other wrapper attached, a non-Factory proxy is restarted into
+    Factory mode rather than erroring."""
+    calls: list[object] = []
+    health = {
+        "version": "0.0.1",
+        "runtime": {"websocket_sessions": {"active_sessions": 0, "active_relay_tasks": 0}},
+        "config": {"pid": "12345", "memory": False, "learn": False, "code_graph": False},
+    }
+
+    monkeypatch.setattr(wrap_cli, "_find_persistent_manifest", lambda port: None)
+    monkeypatch.setattr(wrap_cli, "_check_proxy", lambda port: True)
+    monkeypatch.setattr(wrap_cli, "_query_proxy_health", lambda port: health)
+    monkeypatch.setattr(wrap_cli, "_proxy_needs_version_restart", lambda payload: False)
+    monkeypatch.setattr(wrap_cli, "_live_proxy_clients", lambda *a, **kw: [])
+    # Patch the port probe so the restart reuses the requested port
+    # deterministically; a real 8787 listener on the dev machine would
+    # otherwise push `_find_available_port` to 8788 and fail the assertion.
+    monkeypatch.setattr(wrap_cli, "_find_available_port", lambda port, **kw: port)
+    monkeypatch.setattr(
+        wrap_cli,
+        "_kill_proxy_by_pid",
+        lambda pid, port: calls.append(("kill", pid, port)) or True,
+    )
+    monkeypatch.setattr(
+        wrap_cli,
+        "_start_proxy",
+        lambda *args, **kwargs: calls.append(("start", kwargs.get("factory_api_url"))),
+    )
+
+    proc, actual_port = wrap_cli._ensure_proxy(
+        8787, False, factory_api_url="https://api.factory.ai"
+    )
+
+    assert actual_port == 8787
+    assert ("kill", 12345, 8787) in calls
+    assert ("start", "https://api.factory.ai") in calls
+
+
+def test_ensure_proxy_droid_reuses_matching_routing_proxy(monkeypatch) -> None:
+    health = {
+        "version": wrap_cli._HEADROOM_VERSION,
+        "runtime": {"websocket_sessions": {"active_sessions": 0, "active_relay_tasks": 0}},
+        "config": {
+            "pid": "12345",
+            "memory": False,
+            "learn": False,
+            "code_graph": False,
+            "vertex_api_url": "https://vertex.example/v1/",
+            "factory_api_url": "https://api.factory.ai/",
+        },
+    }
+
+    monkeypatch.setattr(wrap_cli, "_find_persistent_manifest", lambda port: None)
+    monkeypatch.setattr(wrap_cli, "_check_proxy", lambda port: True)
+    monkeypatch.setattr(wrap_cli, "_query_proxy_health", lambda port: health)
+    monkeypatch.setattr(wrap_cli, "_live_proxy_clients", lambda *a, **kw: [])
+    monkeypatch.setattr(
+        wrap_cli,
+        "_kill_proxy_by_pid",
+        lambda *args: pytest.fail("matching proxy must not be stopped"),
+    )
+    monkeypatch.setattr(
+        wrap_cli,
+        "_start_proxy",
+        lambda *args, **kwargs: pytest.fail("matching proxy must not be replaced"),
+    )
+
+    proc, actual_port = wrap_cli._ensure_proxy(
+        8787,
+        False,
+        vertex_api_url="https://vertex.example",
+        factory_api_url="https://api.factory.ai",
+    )
+
+    assert proc is None
+    assert actual_port == 8787
+
+
 def test_proxy_version_restart_ignores_non_release_source_labels(monkeypatch) -> None:
     monkeypatch.setattr(wrap_cli, "_HEADROOM_VERSION", "0.29.0")
     assert wrap_cli._proxy_needs_version_restart({"version": "source-build+g6266a1d774b5"}) is False

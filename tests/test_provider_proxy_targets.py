@@ -146,6 +146,21 @@ def test_openai_compatible_base_url_respects_configured_openai_target() -> None:
     assert openai_compatible_base_url(proxy, {}) == "https://legacy.openai.test"
 
 
+def test_select_passthrough_base_url_factory_mode_wins_over_auth_modes() -> None:
+    proxy = _proxy(OPENAI_API_URL="https://legacy.openai.test")
+    proxy.config = type("Config", (), {"factory_api_url": "https://api.factory.ai/"})()
+
+    # In Factory Droid mode every non-LLM REST call is pinned to Factory,
+    # ahead of the header-derived auth modes, with the trailing slash trimmed.
+    assert select_passthrough_base_url(proxy, {}) == "https://api.factory.ai"
+    assert (
+        select_passthrough_base_url(proxy, {"x-goog-api-key": "test"}) == "https://api.factory.ai"
+    )
+    assert (
+        select_passthrough_base_url(proxy, {"chatgpt-account-id": "a"}) == "https://api.factory.ai"
+    )
+
+
 def test_is_anthropic_hello_path() -> None:
     assert is_anthropic_hello_path("/api/hello")
     assert is_anthropic_hello_path("api/hello")

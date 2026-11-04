@@ -45,6 +45,7 @@
     "opencode",
     "opencode-deepseek",
     "grok-build",
+    "droid",
     "hermes",
     "oauth2-upstream",
     "agent-hooks",

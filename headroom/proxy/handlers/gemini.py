@@ -328,11 +328,11 @@ class GeminiHandlerMixin:
     async def handle_gemini_generate_content(
         self,
         request: Request,
-        model: str,
+        model: str | None = None,
         upstream_base_url: str | None = None,
         provider_name: str = "gemini",
     ) -> Response | StreamingResponse:
-        """Handle Gemini native /v1beta/models/{model}:generateContent endpoint.
+        """Handle native Gemini generation and Factory's body-model endpoint.
 
         Gemini's native API differs from OpenAI:
         - Input: `contents[]` with `parts[]` instead of `messages`
@@ -384,6 +384,30 @@ class GeminiHandlerMixin:
                     }
                 },
             )
+
+        if model is None:
+            body_model = body.get("model")
+            if not isinstance(body_model, str) or not body_model.strip():
+                if provider_name == "factory" and upstream_base_url:
+                    logger.warning(
+                        "Factory Gemini request has no usable model; forwarding without compression"
+                    )
+                    streaming = (
+                        body.get("stream") is True or request.query_params.get("alt") == "sse"
+                    )
+                    return await self.handle_passthrough(
+                        request,
+                        upstream_base_url,
+                        endpoint_name="streamGenerateContent" if streaming else "generateContent",
+                        provider="factory",
+                    )
+                return JSONResponse(
+                    status_code=400,
+                    content={
+                        "error": {"message": "A non-empty model string is required.", "code": 400}
+                    },
+                )
+            model = body_model
 
         contents = body.get("contents", [])
         if not isinstance(contents, list):
@@ -507,8 +531,10 @@ class GeminiHandlerMixin:
             # All content has non-text parts, skip compression entirely
             # Just forward the request as-is
             query_params = dict(request.query_params)
-            is_streaming = query_params.get("alt") == "sse" or request.url.path.endswith(
-                ":streamGenerateContent"
+            is_streaming = (
+                query_params.get("alt") == "sse"
+                or request.url.path.endswith(":streamGenerateContent")
+                or (provider_name == "factory" and body.get("stream") is True)
             )
             if upstream_base_url:
                 url = build_copilot_upstream_url(upstream_base_url, request.url.path)
@@ -523,7 +549,9 @@ class GeminiHandlerMixin:
 
             if is_streaming:
                 if upstream_base_url:
-                    stream_url = _stream_url(url.split("?", 1)[0])
+                    stream_url = (
+                        url if provider_name == "factory" else _stream_url(url.split("?", 1)[0])
+                    )
                 else:
                     stream_url = _stream_url(
                         f"{self.GEMINI_API_URL}/v1beta/models/{model}:streamGenerateContent"
@@ -759,8 +787,10 @@ class GeminiHandlerMixin:
                 logger.warning(f"[{request_id}] Memory injection failed (gemini): {e}")
 
         query_params = dict(request.query_params)
-        is_streaming = query_params.get("alt") == "sse" or request.url.path.endswith(
-            ":streamGenerateContent"
+        is_streaming = (
+            query_params.get("alt") == "sse"
+            or request.url.path.endswith(":streamGenerateContent")
+            or (provider_name == "factory" and body.get("stream") is True)
         )
         native_tools = body.get("tools")
         native_function_declarations = None
@@ -854,7 +884,9 @@ class GeminiHandlerMixin:
             if is_streaming:
                 # For streaming, use streamGenerateContent endpoint
                 if upstream_base_url:
-                    stream_url = _stream_url(url.split("?", 1)[0])
+                    stream_url = (
+                        url if provider_name == "factory" else _stream_url(url.split("?", 1)[0])
+                    )
                 else:
                     stream_url = _stream_url(
                         f"{self.GEMINI_API_URL}/v1beta/models/{model}:streamGenerateContent"
