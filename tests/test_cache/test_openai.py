@@ -74,6 +74,37 @@ class TestOpenAICacheOptimizer:
         system_content = result.messages[0]["content"]
         assert "   " not in system_content  # Multiple spaces collapsed
 
+    def test_whitespace_normalization_keeps_indented_lines_intact(self, optimizer, context):
+        """Indented lines keep their indentation and their first characters (#4336)."""
+        code = "Example:\n    def f():\n        return x"
+        assert optimizer._normalize_whitespace(code) == code
+
+        tabbed = "Example:\n\tif ok:\n\t\treturn   x"
+        assert optimizer._normalize_whitespace(tabbed) == "Example:\n\tif ok:\n\t\treturn x"
+
+        messages = [
+            {"role": "system", "content": code},
+            {"role": "user", "content": "Hello!"},
+        ]
+        result = optimizer.optimize(messages, context)
+        assert result.messages[0]["content"] == code
+
+    def test_whitespace_normalization_keeps_first_line_indentation(self, optimizer, context):
+        """A prompt that starts with an indented line keeps that indentation."""
+        code = "    if ready:\n        run()"
+        assert optimizer._normalize_whitespace(code) == code
+
+        # Surrounding blank lines and trailing whitespace are still trimmed.
+        padded = "\n  \n    if ready:\n        run()   \n\n"
+        assert optimizer._normalize_whitespace(padded) == code
+
+        messages = [
+            {"role": "system", "content": code},
+            {"role": "user", "content": "Hello!"},
+        ]
+        result = optimizer.optimize(messages, context)
+        assert result.messages[0]["content"] == code
+
     def test_optimize_disabled(self, context):
         """Test optimization when disabled."""
         config = CacheConfig(enabled=False)

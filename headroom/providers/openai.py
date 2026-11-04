@@ -16,6 +16,8 @@ from functools import lru_cache
 from typing import Any, cast
 
 from headroom import paths as _paths
+from headroom.log_safety import describe_exception, safe_id
+from headroom.offline import pin_litellm_cost_map_local
 from headroom.pricing.litellm_pricing import estimate_cost_from_tokens
 from headroom.tokenizers.base import (
     TokenCountCache,
@@ -48,6 +50,7 @@ def _get_litellm_module() -> Any | None:
         return None
 
     try:
+        pin_litellm_cost_map_local()
         import litellm
     except ImportError:
         return None
@@ -603,8 +606,10 @@ class OpenAIProvider(Provider):
                     max_tokens = info["max_input_tokens"]
                     if max_tokens is not None:
                         return int(max_tokens)
-            except Exception:
-                pass
+            except Exception as e:
+                logger.debug(
+                    f"LiteLLM get_model_info failed for {safe_id(model)}: {describe_exception(e)}"
+                )
 
         # Fall back to hardcoded
         return self._get_context_limit_manual(model)
@@ -641,7 +646,7 @@ class OpenAIProvider(Provider):
         if model not in _UNKNOWN_MODEL_WARNINGS:
             _UNKNOWN_MODEL_WARNINGS.add(model)
             logger.warning(
-                f"Unknown OpenAI model '{model}': {reason} ({limit:,} tokens). "
+                f"Unknown OpenAI model {safe_id(model)}: {reason} ({limit:,} tokens). "
                 f"To configure explicitly, set HEADROOM_MODEL_LIMITS env var or "
                 f"add to ~/.headroom/models.json"
             )

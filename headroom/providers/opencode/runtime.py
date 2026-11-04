@@ -11,14 +11,9 @@ from pathlib import Path
 
 from headroom._subprocess import run
 from headroom.mcp_registry.install import DEFAULT_PROXY_URL
+from headroom.providers.codex import proxy_base_url
 
 from .config import HEADROOM_OPENCODE_PLUGIN, headroom_provider_entry
-
-
-def proxy_base_url(port: int) -> str:
-    """Return the local proxy base URL used by OpenCode integrations."""
-    return f"http://127.0.0.1:{port}/v1"
-
 
 # OpenCode 2.x subcommands. Of these only the interactive ones (the root TUI,
 # ``run`` and ``mini``) get ``--standalone``; the rest are management commands.

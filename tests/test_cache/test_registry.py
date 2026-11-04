@@ -101,6 +101,43 @@ class TestCacheOptimizerRegistry:
         with pytest.raises(KeyError):
             CacheOptimizerRegistry.get("unknown-provider")
 
+    @pytest.mark.parametrize("tier", ["oss", "enterprise"])
+    @pytest.mark.parametrize("replacement", ["override", "reregister"])
+    def test_replacing_registration_invalidates_all_configurations(
+        self, monkeypatch, tier, replacement
+    ):
+        monkeypatch.setattr(CacheOptimizerRegistry, "_optimizers", {})
+        monkeypatch.setattr(CacheOptimizerRegistry, "_instances", {})
+
+        class ReplacementOptimizer(MockOptimizer):
+            pass
+
+        name = "plugin" if tier == "oss" else "plugin-enterprise"
+        CacheOptimizerRegistry.register(name, MockOptimizer)
+        configs = [None, CacheConfig(), CacheConfig(min_cacheable_tokens=2048)]
+        old_instances = [
+            CacheOptimizerRegistry.get("plugin", tier=tier, config=config) for config in configs
+        ]
+        neighbor = f"{name}-neighbor"
+        CacheOptimizerRegistry.register(neighbor, MockOptimizer)
+        unrelated = CacheOptimizerRegistry.get(neighbor, config=configs[1])
+
+        if replacement == "reregister":
+            CacheOptimizerRegistry.unregister(name)
+            assert not any(
+                instance in CacheOptimizerRegistry._instances.values() for instance in old_instances
+            )
+            CacheOptimizerRegistry.register(name, ReplacementOptimizer)
+        else:
+            CacheOptimizerRegistry.register(name, ReplacementOptimizer, override=True)
+
+        for config, old in zip(configs, old_instances):
+            new = CacheOptimizerRegistry.get("plugin", tier=tier, config=config)
+            assert isinstance(new, ReplacementOptimizer)
+            assert new is not old
+            assert CacheOptimizerRegistry.get("plugin", tier=tier, config=config) is new
+        assert CacheOptimizerRegistry.get(neighbor, config=configs[1]) is unrelated
+
     def test_list_providers(self):
         """Test listing providers."""
         providers = CacheOptimizerRegistry.list_providers()

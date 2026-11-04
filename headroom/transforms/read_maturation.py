@@ -153,6 +153,31 @@ class ReadMaturationManager:
         # once per session (content and marker are stable per tool call).
         self._replay_token_deltas: dict[str, int] = {}
 
+    def export_state(self) -> dict[str, Any]:
+        """Session state as JSON, for ``SessionTrackerStore.save_state``."""
+        return {
+            "matured": {k: [m.marker, m.ccr_hash] for k, m in self._matured.items()},
+            "booked": sorted(self._booked),
+            "deltas": self._replay_token_deltas,
+        }
+
+    @staticmethod
+    def validate_state(state: Any) -> dict[str, Any]:
+        """Normalize :meth:`export_state` output read from disk. Raises on a bad
+        shape, so a bad file is rejected at load and never inside a request."""
+        return {
+            "matured": {str(k): [str(m), str(h)] for k, (m, h) in state["matured"].items()},
+            "booked": [str(k) for k in state["booked"]],
+            "deltas": {str(k): int(v) for k, v in state["deltas"].items()},
+        }
+
+    def restore_state(self, state: dict[str, Any]) -> None:
+        """Adopt :meth:`validate_state` output from the previous process, so a
+        matured Read's removal is not booked again after a restart."""
+        self._matured = {k: MaturedRead(m, h) for k, (m, h) in state["matured"].items()}
+        self._booked = set(state["booked"])
+        self._replay_token_deltas = dict(state["deltas"])
+
     # ─── Per-request entry point ────────────────────────────────────────
 
     def apply(
@@ -259,15 +284,21 @@ class ReadMaturationManager:
             for tc in msg.get("tool_calls", []) or []:
                 if not isinstance(tc, dict):
                     continue
-                func = tc.get("function", {})
+                func = tc.get("function")
+                if not isinstance(func, dict):  # "function": null / non-object
+                    continue
                 name = func.get("name", "")
                 if name not in _TOUCH_TOOLS:
                     continue
                 try:
                     args = json.loads(func.get("arguments", "{}"))
-                except (ValueError, TypeError):
-                    args = {}
+                except (ValueError, TypeError):  # not JSON: unknown file
+                    continue
+                if not isinstance(args, dict):  # list/str/number: unknown file
+                    continue
                 fp = args.get("file_path") or args.get("path") or ""
+                if not isinstance(fp, str):  # unknown file: never mature this call
+                    continue
                 if fp:
                     act.file_last_touch[fp] = turn
                 if name in _READ_TOOLS:
@@ -281,8 +312,12 @@ class ReadMaturationManager:
                     name = b.get("name", "")
                     if name not in _TOUCH_TOOLS:
                         continue
-                    inp = b.get("input") or {}
+                    inp = b.get("input")
+                    if not isinstance(inp, dict):  # unknown file: never mature this call
+                        continue
                     fp = inp.get("file_path") or inp.get("path") or ""
+                    if not isinstance(fp, str):  # unknown file: never mature this call
+                        continue
                     if fp:
                         act.file_last_touch[fp] = turn
                     if name in _READ_TOOLS:
@@ -387,7 +422,10 @@ class ReadMaturationManager:
                     compression_strategy="read_maturation",
                 )
             except Exception as e:  # noqa: BLE001 - storage failure must not break the request
+                # Keep it verbatim (a marker would point at nothing); a later
+                # request matures it once the store takes it.
                 logger.warning("read_maturation: CCR store failed for %s: %s", tc_id, e)
+                return None, False
 
         file_display = file_path or "unknown"
         # NOTE: "Retrieve original: hash=" is load-bearing (marker-
