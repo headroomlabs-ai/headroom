@@ -320,6 +320,10 @@ def _paths_related_as_typo(failed: str, success: str) -> bool:
         return False
     if a == b:
         return True
+    # Basenames come from tool traffic; no real file name comes near this cap,
+    # so skip the quadratic edit distance rather than run it on an oversized one.
+    if max(len(a), len(b)) > _RETRY_EDIT_DISTANCE_MAX_CHARS:
+        return False
     threshold = max(2, max(len(a), len(b)) // 3)
     return _levenshtein(a, b) <= threshold
 
@@ -375,11 +379,19 @@ def _bash_binaries_match(a: str, b: str) -> bool:
     b_base = b.rsplit("/", 1)[-1]
     if a_base == b_base:
         return True
-    if (a_base.startswith(b_base) or b_base.startswith(a_base)) and _levenshtein(
-        a_base, b_base
+    # One name is a prefix of the other, so their edit distance is exactly the
+    # length difference: compare lengths instead of running _levenshtein (O(n*m))
+    # on an unbounded, traffic-derived token.
+    if (a_base.startswith(b_base) or b_base.startswith(a_base)) and abs(
+        len(a_base) - len(b_base)
     ) <= 2:
         return True
     return False
+
+
+# _levenshtein is O(n*m) pure Python and runs on the request path; longer
+# commands skip it and are judged by the linear token-overlap check below.
+_RETRY_EDIT_DISTANCE_MAX_CHARS = 512
 
 
 def _commands_related_as_retry(failed: str, success: str) -> bool:
@@ -405,7 +417,10 @@ def _commands_related_as_retry(failed: str, success: str) -> bool:
         return False
 
     max_len = max(len(failed), len(success))
-    if max_len > 0 and _levenshtein(failed, success) / max_len <= 0.40:
+    if (
+        0 < max_len <= _RETRY_EDIT_DISTANCE_MAX_CHARS
+        and _levenshtein(failed, success) / max_len <= 0.40
+    ):
         return True
 
     def _substantive(cmd: str, binary: str) -> set[str]:
@@ -1374,7 +1389,8 @@ class TrafficLearner:
             uri = f"file:{db_path}?mode=ro"
             try:
                 conn = sqlite3.connect(uri, uri=True)
-            except sqlite3.OperationalError:
+            except sqlite3.OperationalError as e:
+                logger.warning("Traffic learner hydrate: failed to open %s: %s", db_path, e)
                 return []
             try:
                 rows = conn.execute(
@@ -1390,13 +1406,14 @@ class TrafficLearner:
                     "LIMIT ?",
                     (self._dedup_window,),
                 ).fetchall()
-            except sqlite3.DatabaseError:
+            except sqlite3.DatabaseError as e:
+                logger.warning("Traffic learner hydrate: failed to read %s: %s", db_path, e)
                 return []
             finally:
                 try:
                     conn.close()
-                except Exception:
-                    pass
+                except sqlite3.Error as e:
+                    logger.debug("Traffic learner hydrate: closing %s failed: %s", db_path, e)
             return [(row[0], row[1] or "", row[2] or "{}") for row in rows]
 
         try:
@@ -1781,7 +1798,8 @@ def _load_persisted_patterns_from_sqlite(db_path: Path) -> list[ExtractedPattern
     patterns: dict[str, ExtractedPattern] = {}
     try:
         conn = sqlite3.connect(uri, uri=True)
-    except sqlite3.OperationalError:
+    except sqlite3.OperationalError as e:
+        logger.warning("Traffic learner: failed to open persisted patterns %s: %s", db_path, e)
         return []
     try:
         conn.row_factory = sqlite3.Row
@@ -1790,14 +1808,14 @@ def _load_persisted_patterns_from_sqlite(db_path: Path) -> list[ExtractedPattern
             "FROM memories "
             "WHERE json_extract(metadata, '$.source') = 'traffic_learner'"
         ).fetchall()
-    except sqlite3.DatabaseError:
-        conn.close()
+    except sqlite3.DatabaseError as e:
+        logger.warning("Traffic learner: failed to read persisted patterns %s: %s", db_path, e)
         return []
     finally:
         try:
             conn.close()
-        except Exception:
-            pass
+        except sqlite3.Error as e:
+            logger.debug("Traffic learner: closing persisted patterns %s failed: %s", db_path, e)
 
     for row in rows:
         content = row["content"] or ""

@@ -51,12 +51,12 @@ export default function Layout({ children }: LayoutProps<'/'>) {
       <body className="flex flex-col min-h-screen">
         <RootProvider>
           {/* Dismissible; Fumadocs remembers the dismissal per id in localStorage. */}
-          <Banner id="teams-perk-2026">
+          <Banner id="teams-contact-2026">
             <a
-              href="https://headroom-perks.vercel.app/?source=github&utm_source=docs&utm_medium=banner"
+              href="https://headroomlabs.ai"
               className="font-medium underline-offset-4 hover:underline"
             >
-              Headroom for Teams: 3 months free with a 12-month plan →
+              Want more savings? Headroom for teams and enterprises: talk to us →
             </a>
           </Banner>
           {children}
