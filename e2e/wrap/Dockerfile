@@ -30,7 +30,7 @@ RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
 
 WORKDIR /build
 
-COPY pyproject.toml uv.lock README.md ./
+COPY pyproject.toml uv.lock README.md README-pypi.md ./
 COPY Cargo.toml Cargo.lock rust-toolchain.toml ./
 COPY crates/ crates/
 COPY headroom/ headroom/
@@ -69,7 +69,7 @@ ENV DEBIAN_FRONTEND=noninteractive \
     PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1
 
-# OpenClaw 2026.9.3 requires Node >=24.16.0 (or >=26.1.0). Install the
+# OpenClaw 2026.10.10 requires Node >=24.16.0 <25 (or >=26.1.0). Install the
 # Node 24 LTS line alongside Python 3.11. Also install git for packages
 # that clone at install time.
 RUN apt-get update && \
@@ -85,13 +85,17 @@ RUN apt-get update && \
 # npm 10.9.8 crashes in Arborist's peer-set resolver when installing the local
 # OpenClaw plugin (Cannot read properties of null, reading 'edgesOut'). Pin the
 # tested npm version so both wrap-e2e callers use the same working installer.
-RUN npm install -g --no-fund --no-audit npm@11.16.0
+RUN npm install -g --no-fund --no-audit npm@12.2.1
 
 # Freeze transitive CLI dependencies as well as the top-level versions.
 # Global npm install re-resolves ranges and can select partially published
 # dependency releases; npm ci consumes the reviewed lockfile instead.
-COPY e2e/wrap/tools/package.json e2e/wrap/tools/package-lock.json /opt/wrap-tools/
-RUN npm ci --prefix /opt/wrap-tools --no-fund --no-audit
+COPY e2e/wrap/tools/package.json e2e/wrap/tools/package-lock.json e2e/wrap/tools/.npmrc /opt/wrap-tools/
+RUN npm ci --prefix /opt/wrap-tools --no-fund --no-audit --strict-allow-scripts
+
+# Exercise the installed dependency fixes in both existing wrap-E2E CI callers.
+COPY e2e/wrap/tools/dependency-regression.test.cjs /opt/wrap-tools/
+RUN npm test --prefix /opt/wrap-tools
 
 WORKDIR /workspace
 

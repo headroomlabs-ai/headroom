@@ -117,7 +117,7 @@ def test_nothing_to_do_returns_the_same_list() -> None:
     assert mirror_client_message_cache_control(messages, client) is messages
 
 
-def test_block_level_markers_are_left_to_the_block_normalizer() -> None:
+def test_block_markers_already_where_the_client_put_them_are_left_alone() -> None:
     block = {"type": "text", "text": "x", "cache_control": CC}
     client = [{"role": "user", "content": [dict(block)]}]
     messages = [{"role": "user", "content": [dict(block)]}]
@@ -222,7 +222,9 @@ def test_forwarded_markers_follow_the_client_not_the_replay(mode: str) -> None:
         proxy.config.mode = mode
         tracker = _Tracker(previous_original, previous_forwarded)
         proxy.session_tracker_store.compute_session_id = lambda request, model, messages: "s"
-        proxy.session_tracker_store.get_or_create = lambda session_id, provider: tracker
+        proxy.session_tracker_store.get_or_create = (
+            lambda session_id, provider, cache_ttl_seconds=None: tracker
+        )
         proxy.openai_pipeline.apply = lambda **kwargs: SimpleNamespace(
             messages=kwargs["messages"],
             transforms_applied=[],

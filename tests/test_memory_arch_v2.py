@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-import builtins
+import importlib
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
@@ -67,14 +67,14 @@ async def test_memory_warmup_remains_eager_by_default(monkeypatch) -> None:
 
 
 def test_peak_rss_is_optional_without_resource(monkeypatch) -> None:
-    real_import = builtins.__import__
+    real_import = importlib.import_module
 
     def import_without_resource(name, *args, **kwargs):
         if name == "resource":
             raise ImportError
         return real_import(name, *args, **kwargs)
 
-    monkeypatch.setattr(builtins, "__import__", import_without_resource)
+    monkeypatch.setattr(importlib, "import_module", import_without_resource)
     assert _peak_rss_mb() is None
 
 

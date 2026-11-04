@@ -108,6 +108,25 @@ def _register_provider_passthrough_route(
     spec: ProviderPassthroughRoute,
 ) -> None:
     async def provider_passthrough(request: Request):
+        # Honor the per-request upstream override like /v1/messages and the
+        # catch-all do. Clients that speak one wire format but authenticate
+        # against a custom OpenAI-compatible gateway must reach that gateway
+        # for embeddings/audio/metadata too, not the default provider target
+        # (the same gap as the model-metadata routes, #4302). Telemetry keeps
+        # the route spec labels: they are bounded by this module, so the
+        # request-controlled host never becomes a stats label (#3759), while
+        # `handle_passthrough` still records the outcome for these known routes.
+        custom_base = request.headers.get("x-headroom-base-url", "").strip()
+        if custom_base:
+            if not await is_safe_upstream_url_async(custom_base):
+                logger.warning("rejecting unsafe x-headroom-base-url: %r", custom_base)
+                raise HTTPException(status_code=400, detail="Rejected unsafe upstream base URL")
+            return await proxy.handle_passthrough(
+                request,
+                custom_base.rstrip("/"),
+                spec.sub_path,
+                spec.provider_name,
+            )
         return await proxy.handle_passthrough(
             request,
             _api_target(proxy, spec.provider_name),
@@ -134,14 +153,21 @@ def _register_provider_handler_route(app: FastAPI, proxy: Any, spec: ProviderHan
         model: str = "",
     ):
         handler = getattr(proxy, spec.handler_name)
+        handler_kwargs: dict[str, str] = {}
+        custom_base = request.headers.get("x-headroom-base-url", "").strip()
+        if custom_base and spec.supports_custom_base_url:
+            if not await is_safe_upstream_url_async(custom_base):
+                logger.warning("rejecting unsafe x-headroom-base-url: %r", custom_base)
+                raise HTTPException(status_code=400, detail="Rejected unsafe upstream base URL")
+            handler_kwargs["upstream_base_url"] = custom_base.rstrip("/")
         if spec.path_param is None:
-            return await handler(request)
+            return await handler(request, **handler_kwargs)
         path_args = {
             "batch_id": batch_id,
             "batch_name": batch_name,
             "model": model,
         }
-        return await handler(request, path_args[spec.path_param])
+        return await handler(request, path_args[spec.path_param], **handler_kwargs)
 
     provider_handler.__name__ = (
         spec.handler_name.replace("handle_", "")
@@ -491,8 +517,19 @@ def register_provider_routes(app: FastAPI, proxy: Any) -> None:
             VERTEX_STREAM_RAW_PREDICT.name,
         )
 
-    @app.get("/v1/models")
-    async def list_models(request: Request):
+    async def _model_metadata_route(request: Request) -> tuple[str, str]:
+        # A caller-named upstream wins, as in the catch-all and the chat
+        # handlers: model discovery must reach the same gateway as inference.
+        custom_base = request.headers.get("x-headroom-base-url", "").strip()
+        if custom_base:
+            if not await is_safe_upstream_url_async(custom_base):
+                logger.warning("rejecting unsafe x-headroom-base-url: %r", custom_base)
+                raise HTTPException(status_code=400, detail="Rejected unsafe upstream base URL")
+            # Only the destination is overridden: keep the provider the request's
+            # auth selects, so Anthropic-auth requests still get model-id
+            # sanitization in handle_passthrough.
+            provider_name = proxy.provider_runtime.model_metadata_provider(dict(request.headers))
+            return provider_name, custom_base.rstrip("/")
         headers = dict(request.headers)
         provider_name = proxy.provider_runtime.model_metadata_provider(headers)
         base_url = (
@@ -500,6 +537,11 @@ def register_provider_routes(app: FastAPI, proxy: Any) -> None:
             if provider_name == "openai"
             else _api_target(proxy, provider_name)
         )
+        return provider_name, base_url
+
+    @app.get("/v1/models")
+    async def list_models(request: Request):
+        provider_name, base_url = await _model_metadata_route(request)
         return await handle_model_metadata_endpoint(
             proxy,
             request,
@@ -510,13 +552,7 @@ def register_provider_routes(app: FastAPI, proxy: Any) -> None:
 
     @app.get("/v1/models/{model_id}")
     async def get_model(request: Request, model_id: str):
-        headers = dict(request.headers)
-        provider_name = proxy.provider_runtime.model_metadata_provider(headers)
-        base_url = (
-            _openai_compatible_base_url(proxy, headers)
-            if provider_name == "openai"
-            else _api_target(proxy, provider_name)
-        )
+        provider_name, base_url = await _model_metadata_route(request)
         return await handle_model_metadata_endpoint(
             proxy,
             request,

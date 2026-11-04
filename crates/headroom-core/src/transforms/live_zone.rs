@@ -115,6 +115,7 @@ use super::diff_compressor::{DiffCompressor, DiffCompressorConfig};
 #[cfg(feature = "ml")]
 use super::kompress::{Kompress, KompressConfig};
 use super::log_compressor::{LogCompressor, LogCompressorConfig};
+use super::pipeline::JsonMinifier;
 use super::search_compressor::{SearchCompressor, SearchCompressorConfig};
 use super::smart_crusher::{SmartCrusher, SmartCrusherConfig};
 use crate::ccr::{compute_key, marker_for, CcrStore};
@@ -189,6 +190,9 @@ const THRESHOLD_SOURCE_CODE: usize = 2048;
 /// gate fires before dispatch, so sub-threshold prose never reaches the
 /// Kompress arm wired below.
 const THRESHOLD_PLAIN_TEXT: usize = 5120;
+/// Tabular text has no native compressor; keep it lossless.
+const THRESHOLD_TABULAR: usize = 512;
+
 /// HTML blocks have no compressor. 512 was PlainText's pre-PR-B4 value;
 /// HTML deliberately keeps it rather than following PlainText to 5120,
 /// because `REALIGNMENT/04` pins no HTML threshold — when an HTML
@@ -212,6 +216,7 @@ pub const fn threshold_for(content_type: ContentType) -> usize {
         ContentType::SourceCode => THRESHOLD_SOURCE_CODE,
         ContentType::PlainText => THRESHOLD_PLAIN_TEXT,
         ContentType::Html => THRESHOLD_HTML,
+        ContentType::Tabular => THRESHOLD_TABULAR,
     }
 }
 
@@ -1172,8 +1177,11 @@ fn compress_one_block(
             // stays honest — the marker costs ~6 tokens and we'd
             // rather forward the original than ship a bigger payload
             // for a 5-byte block.
-            let (compressed_for_replacement, ccr_hash_emitted) =
-                maybe_inject_ccr_marker(content_text, &compressed, ccr_store);
+            let (compressed_for_replacement, ccr_hash_emitted) = if strategy == "json_minifier" {
+                (compressed, None)
+            } else {
+                maybe_inject_ccr_marker(content_text, &compressed, ccr_store)
+            };
             let compressed_bytes = compressed_for_replacement.len();
             // 3. Tokenizer-validated rejection. Per PR-B4 spec we
             //    count both the original and compressed strings
@@ -1655,6 +1663,12 @@ fn dispatch_compressor(text: &str, content_type: ContentType) -> DispatchResult 
             // arrays, and returns the input.
             let result = smart_crusher().crush(text, EMPTY_QUERY, DEFAULT_BIAS);
             if !result.was_modified {
+                if let Ok(Some(minified)) = JsonMinifier.minify(text) {
+                    return DispatchResult::Compressed {
+                        strategy: "json_minifier",
+                        compressed: minified,
+                    };
+                }
                 return DispatchResult::NoOp {
                     content_type: content_type.as_str(),
                 };
@@ -1732,6 +1746,12 @@ fn dispatch_compressor(text: &str, content_type: ContentType) -> DispatchResult 
         // when the model isn't cache-resident, hasn't finished its
         // background initialization yet, or the `ml` feature is off —
         // no network call and no model build ever happens on this path.
+        // This dispatcher has no tabular compressor; preserve these rows
+        // instead of sending structured output through lossy Kompress.
+        ContentType::Tabular => DispatchResult::NoOp {
+            content_type: content_type.as_str(),
+        },
+
         ContentType::PlainText => kompress_or_noop(text, content_type),
         // No HTML compressor on the Rust side; pages are handled by
         // upstream extractors, not the proxy.

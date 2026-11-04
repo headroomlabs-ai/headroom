@@ -23,7 +23,7 @@ from __future__ import annotations
 import json
 import logging
 from dataclasses import dataclass
-from typing import Any, Protocol
+from typing import Any
 
 import httpx
 
@@ -32,19 +32,6 @@ from .response_handler import CCRResponseHandler, ResponseHandlerConfig
 from .tool_injection import CCR_TOOL_NAME
 
 logger = logging.getLogger(__name__)
-
-
-class APIClient(Protocol):
-    """Protocol for making API calls."""
-
-    async def post(
-        self,
-        url: str,
-        headers: dict[str, str],
-        json: dict[str, Any],
-    ) -> httpx.Response:
-        """Make a POST request."""
-        ...
 
 
 @dataclass
@@ -416,7 +403,7 @@ class BatchResultProcessor:
         """Make Google/Gemini continuation call.
 
         Note: Google format uses 'contents' not 'messages',
-        and 'parts' format for messages.
+        and 'parts' format for messages. Tools are already native Google Tool objects.
         """
         model = request_context.model
         url = f"{self.api_urls['google']}/v1beta/models/{model}:generateContent"
@@ -437,7 +424,7 @@ class BatchResultProcessor:
 
         # Add tools
         if tools:
-            body["tools"] = [{"functionDeclarations": tools}]
+            body["tools"] = tools
 
         response = await self.http_client.post(
             url,
