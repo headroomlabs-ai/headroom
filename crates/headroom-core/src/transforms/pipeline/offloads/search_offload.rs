@@ -116,10 +116,15 @@ impl OffloadTransform for SearchOffload {
         content: &str,
         ctx: &CompressionContext,
         store: &dyn CcrStore,
+        ccr_source: &str,
     ) -> Result<OffloadOutput, TransformError> {
-        let (result, stats) =
-            self.compressor
-                .compress_with_store(content, &ctx.query, self.bias, Some(store));
+        let (result, stats) = self.compressor.compress_with_ccr_source(
+            content,
+            &ctx.query,
+            self.bias,
+            Some(store),
+            ccr_source,
+        );
 
         let Some(key) = result.cache_key else {
             let reason = stats.ccr_skip_reason.unwrap_or("no cache_key emitted");
@@ -309,7 +314,7 @@ mod tests {
             .join("\n");
         let store = InMemoryCcrStore::new();
         let r = offload()
-            .apply(&s, &CompressionContext::default(), &store)
+            .apply(&s, &CompressionContext::default(), &store, &s)
             .expect("offload should produce a key on clustered input");
         assert!(!r.cache_key.is_empty());
         assert_eq!(store.get(&r.cache_key).as_deref(), Some(s.as_str()));
@@ -321,7 +326,7 @@ mod tests {
         let s = "only.py:1:trivial";
         let store = InMemoryCcrStore::new();
         let err = offload()
-            .apply(s, &CompressionContext::default(), &store)
+            .apply(s, &CompressionContext::default(), &store, s)
             .expect_err("must skip");
         match err {
             TransformError::Skipped { transform, .. } => assert_eq!(transform, "search_offload"),
