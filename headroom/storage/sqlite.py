@@ -37,8 +37,77 @@ class SQLiteStorage(Storage):
             db_path: Path to SQLite database file.
         """
         self.db_path = db_path
-        self._ensure_db_exists()
+        # Volatile databases (":memory:" and the empty string) belong to the
+        # connection that opens them: a schema created on a throwaway
+        # connection is gone once that connection closes, so the serving
+        # connection must create its own. Disk-backed files still get their
+        # eager initialization here.
+        self._volatile = db_path == "" or db_path == ":memory:"
+        if not self._volatile:
+            self._ensure_db_exists()
         self._conn: sqlite3.Connection | None = None
+
+    @staticmethod
+    def _create_schema(cursor: sqlite3.Cursor) -> None:
+        """Create the requests table, indices, and migrate legacy columns."""
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS requests (
+                id TEXT PRIMARY KEY,
+                timestamp TEXT NOT NULL,
+                model TEXT NOT NULL,
+                stream INTEGER NOT NULL,
+                mode TEXT NOT NULL,
+                tokens_input_before INTEGER NOT NULL,
+                tokens_input_after INTEGER NOT NULL,
+                tokens_output INTEGER,
+                block_breakdown TEXT NOT NULL,
+                waste_signals TEXT NOT NULL,
+                stable_prefix_hash TEXT,
+                cache_alignment_score REAL,
+                cached_tokens INTEGER,
+                cache_optimizer_used TEXT,
+                cache_optimizer_strategy TEXT,
+                cacheable_tokens INTEGER DEFAULT 0,
+                breakpoints_inserted INTEGER DEFAULT 0,
+                estimated_cache_hit INTEGER DEFAULT 0,
+                estimated_savings_percent REAL DEFAULT 0.0,
+                semantic_cache_hit INTEGER DEFAULT 0,
+                transforms_applied TEXT NOT NULL,
+                tool_units_dropped INTEGER DEFAULT 0,
+                turns_dropped INTEGER DEFAULT 0,
+                messages_hash TEXT,
+                error TEXT
+            )
+        """)
+
+        # Upgrade databases created before the cache optimizer columns
+        # existed, preserving existing rows. On disk the reserved lock in
+        # _ensure_db_exists serializes this check-and-alter against concurrent
+        # constructors.
+        cursor.execute("PRAGMA table_info(requests)")
+        existing_columns = {row[1] for row in cursor.fetchall()}
+        for column, ddl in _CACHE_OPTIMIZER_COLUMNS:
+            if column not in existing_columns:
+                try:
+                    cursor.execute(  # nosec B608
+                        f"ALTER TABLE requests ADD COLUMN {column} {ddl}"
+                    )
+                except sqlite3.OperationalError as exc:
+                    # Another connection may have added the column
+                    # between our schema read and this ALTER.
+                    if "duplicate column name" not in str(exc).lower():
+                        raise
+
+        # Create indices
+        cursor.execute("""
+            CREATE INDEX IF NOT EXISTS idx_timestamp ON requests(timestamp)
+        """)
+        cursor.execute("""
+            CREATE INDEX IF NOT EXISTS idx_model ON requests(model)
+        """)
+        cursor.execute("""
+            CREATE INDEX IF NOT EXISTS idx_mode ON requests(mode)
+        """)
 
     def _ensure_db_exists(self) -> None:
         """Create database and tables if they don't exist."""
@@ -53,64 +122,7 @@ class SQLiteStorage(Storage):
             cursor = conn.cursor()
             cursor.execute("BEGIN IMMEDIATE")
             try:
-                cursor.execute("""
-                    CREATE TABLE IF NOT EXISTS requests (
-                        id TEXT PRIMARY KEY,
-                        timestamp TEXT NOT NULL,
-                        model TEXT NOT NULL,
-                        stream INTEGER NOT NULL,
-                        mode TEXT NOT NULL,
-                        tokens_input_before INTEGER NOT NULL,
-                        tokens_input_after INTEGER NOT NULL,
-                        tokens_output INTEGER,
-                        block_breakdown TEXT NOT NULL,
-                        waste_signals TEXT NOT NULL,
-                        stable_prefix_hash TEXT,
-                        cache_alignment_score REAL,
-                        cached_tokens INTEGER,
-                        cache_optimizer_used TEXT,
-                        cache_optimizer_strategy TEXT,
-                        cacheable_tokens INTEGER DEFAULT 0,
-                        breakpoints_inserted INTEGER DEFAULT 0,
-                        estimated_cache_hit INTEGER DEFAULT 0,
-                        estimated_savings_percent REAL DEFAULT 0.0,
-                        semantic_cache_hit INTEGER DEFAULT 0,
-                        transforms_applied TEXT NOT NULL,
-                        tool_units_dropped INTEGER DEFAULT 0,
-                        turns_dropped INTEGER DEFAULT 0,
-                        messages_hash TEXT,
-                        error TEXT
-                    )
-                """)
-
-                # Upgrade databases created before the cache optimizer columns
-                # existed, preserving existing rows. The reserved lock above
-                # serializes this check-and-alter against concurrent constructors.
-                cursor.execute("PRAGMA table_info(requests)")
-                existing_columns = {row[1] for row in cursor.fetchall()}
-                for column, ddl in _CACHE_OPTIMIZER_COLUMNS:
-                    if column not in existing_columns:
-                        try:
-                            cursor.execute(  # nosec B608
-                                f"ALTER TABLE requests ADD COLUMN {column} {ddl}"
-                            )
-                        except sqlite3.OperationalError as exc:
-                            # Another connection may have added the column
-                            # between our schema read and this ALTER.
-                            if "duplicate column name" not in str(exc).lower():
-                                raise
-
-                # Create indices
-                cursor.execute("""
-                    CREATE INDEX IF NOT EXISTS idx_timestamp ON requests(timestamp)
-                """)
-                cursor.execute("""
-                    CREATE INDEX IF NOT EXISTS idx_model ON requests(model)
-                """)
-                cursor.execute("""
-                    CREATE INDEX IF NOT EXISTS idx_mode ON requests(mode)
-                """)
-
+                self._create_schema(cursor)
                 conn.commit()
             except Exception:
                 conn.rollback()
@@ -123,6 +135,11 @@ class SQLiteStorage(Storage):
         if self._conn is None:
             self._conn = sqlite3.connect(self.db_path)
             self._conn.row_factory = sqlite3.Row
+            if self._volatile:
+                # The throwaway connection in __init__ cannot initialize a
+                # volatile database, so build the schema on this connection.
+                self._create_schema(self._conn.cursor())
+                self._conn.commit()
         return self._conn
 
     def save(self, metrics: RequestMetrics) -> None:
