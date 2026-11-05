@@ -154,7 +154,7 @@ Commit as `feat(release): add qualification evidence contracts`.
 **Files:**
 - Create: `scripts/candidate_manifest.py`
 - Create: `tests/test_candidate_manifest.py`
-- Modify: `.gitignore` to unignore `scripts/candidate_manifest.py`
+- Modify: `.gitignore` to unignore `scripts/candidate_manifest.py` and ignore `.candidate/` output
 
 **Interfaces:**
 - Consumes: `release/contracts/candidate-manifest.schema.json` and common definitions.

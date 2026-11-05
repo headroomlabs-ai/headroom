@@ -137,7 +137,7 @@ pub fn from_config(config: &CcrBackendConfig) -> Result<Box<dyn CcrStore>, CcrBa
             tracing::info!(
                 target = "ccr.backend",
                 backend = "redis",
-                url = %url,
+                url = %redact_redis_url(url),
                 ttl_seconds = *ttl_seconds,
                 "ccr_backend_initialized"
             );
@@ -148,5 +148,36 @@ pub fn from_config(config: &CcrBackendConfig) -> Result<Box<dyn CcrStore>, CcrBa
             backend: "redis",
             feature: "redis",
         }),
+    }
+}
+
+/// Redis URL with userinfo, path and query dropped (`scheme://host[:port]`),
+/// safe to log. Mirrors the Python client, which logs only the host.
+#[cfg_attr(not(feature = "redis"), allow(dead_code))]
+fn redact_redis_url(url: &str) -> String {
+    let Some((scheme, rest)) = url.split_once("://") else {
+        return "<unparseable redis url>".to_string();
+    };
+    let authority = &rest[..rest.find(['/', '?', '#']).unwrap_or(rest.len())];
+    let host = authority.rsplit('@').next().unwrap_or(authority);
+    format!("{scheme}://{host}")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::redact_redis_url;
+
+    #[test]
+    fn redis_url_credentials_are_not_logged() {
+        let out = redact_redis_url("redis://:secret@host:6379/0");
+        assert!(!out.contains("secret"), "{out}");
+        assert_eq!(out, "redis://host:6379");
+        let out = redact_redis_url("rediss://user:p@ss@cache.example.com?password=secret");
+        assert_eq!(out, "rediss://cache.example.com");
+        assert_eq!(
+            redact_redis_url("redis://localhost:6379"),
+            "redis://localhost:6379"
+        );
+        assert!(!redact_redis_url("secret-without-scheme").contains("secret"));
     }
 }

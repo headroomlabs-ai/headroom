@@ -58,17 +58,21 @@ def _resolve_secs() -> float:
     return max(secs, MIN_SECS)
 
 
-def _arm(secs: float) -> None:
+def _arm(secs: float, fd: int) -> None:
     # Re-arming replaces the previous timer, so a healthy interpreter never
-    # lets it expire. ``file`` is the underlying stderr fd, which supervisors
-    # already redirect into the proxy log.
-    faulthandler.dump_traceback_later(secs, exit=True, file=sys.stderr)
+    # lets it expire. ``fd`` is the stderr fd resolved once at start, which
+    # supervisors already redirect into the proxy log. Passing ``sys.stderr``
+    # on every tick would raise whenever something swaps it for a stream
+    # without a fileno (redirect_stderr(StringIO()), click's CliRunner,
+    # pytest's capsys): the heartbeat thread dies and the timer armed on the
+    # previous tick shoots a healthy process.
+    faulthandler.dump_traceback_later(secs, exit=True, file=fd)
 
 
-def _heartbeat(secs: float) -> None:
+def _heartbeat(secs: float, fd: int) -> None:
     while True:
         time.sleep(secs / 3.0)
-        _arm(secs)
+        _arm(secs, fd)
 
 
 def start_hard_watchdog() -> bool:
@@ -90,9 +94,10 @@ def start_hard_watchdog() -> bool:
     # First arm happens here, synchronously: the caller is covered from the
     # moment this returns, even if the very next call seizes the GIL before
     # the heartbeat thread gets scheduled.
-    _arm(secs)
+    fd = sys.stderr.fileno()
+    _arm(secs, fd)
     threading.Thread(
-        target=_heartbeat, args=(secs,), name="headroom-hard-watchdog", daemon=True
+        target=_heartbeat, args=(secs, fd), name="headroom-hard-watchdog", daemon=True
     ).start()
     logger.info(
         "Hard watchdog armed: dump all stacks and exit if the interpreter "

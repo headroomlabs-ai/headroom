@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+from headroom.providers._setup_text import project_attribution_lines
 from headroom.providers.claude import proxy_base_url as claude_proxy_base_url
 from headroom.providers.codex import proxy_base_url as codex_proxy_base_url
 from headroom.proxy.project_context import with_project_prefix
@@ -48,11 +49,4 @@ def render_setup_lines(port: int, project: str | None = None) -> list[str]:
         "    Settings > Models > OpenAI API Key > Override OpenAI Base URL",
         f"    Set to: {targets.openai_base_url}",
     ]
-    if project:
-        lines += [
-            "",
-            f"  Dashboard savings will be attributed to project '{project}'",
-            "  (the directory this command was run from). Re-run from another",
-            "  project directory to get that project's URL.",
-        ]
-    return lines
+    return lines + project_attribution_lines(project)

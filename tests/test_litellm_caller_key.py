@@ -15,7 +15,7 @@ from __future__ import annotations
 
 import pytest
 
-from headroom.backends.litellm import _caller_key_travels_to
+from headroom.backends.litellm import _caller_key_from_headers, _caller_key_travels_to
 
 ANTHROPIC_KEY = "sk-ant-api03-abc123"
 
@@ -65,3 +65,36 @@ def test_unknown_provider_keeps_the_pass_through() -> None:
     key -- including when `get_llm_provider` raises on the model string."""
     assert _caller_key_travels_to("some-self-hosted-thing", ANTHROPIC_KEY) is True
     assert _caller_key_travels_to("", ANTHROPIC_KEY) is True
+
+
+# ---------------------------------------------------------------------------
+# _caller_key_from_headers — the Authorization scheme is case-insensitive
+# (RFC 7235 §2.1), so `bearer <key>` must be read the same as `Bearer <key>`.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "scheme",
+    ["Bearer", "bearer", "BEARER", "BeArEr"],
+)
+def test_bearer_scheme_is_matched_case_insensitively(scheme: str) -> None:
+    """A differently-cased Bearer scheme must still yield the caller key."""
+    headers = {"authorization": f"{scheme} {ANTHROPIC_KEY}"}
+    assert _caller_key_from_headers(headers) == ANTHROPIC_KEY
+
+
+def test_uppercase_authorization_header_name_is_accepted() -> None:
+    headers = {"Authorization": f"bearer {ANTHROPIC_KEY}"}
+    assert _caller_key_from_headers(headers) == ANTHROPIC_KEY
+
+
+def test_falls_back_to_x_api_key_without_a_bearer_credential() -> None:
+    assert _caller_key_from_headers({"x-api-key": ANTHROPIC_KEY}) == ANTHROPIC_KEY
+    # A bare scheme with no credential is not a bearer credential.
+    assert _caller_key_from_headers({"authorization": "Bearer"}) == ""
+
+
+def test_credential_itself_is_returned_verbatim() -> None:
+    """Only the scheme is case-folded; the credential keeps its exact case."""
+    mixed = "sk-AbC-123-XyZ"
+    assert _caller_key_from_headers({"authorization": f"bearer {mixed}"}) == mixed

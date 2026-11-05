@@ -1,6 +1,8 @@
 //! headroom-proxy library: transparent reverse proxy in front of the Python
 //! Headroom proxy. Used by both `main.rs` and the integration tests.
 
+#![forbid(unsafe_code)]
+
 pub mod bedrock;
 pub mod cache_stabilization;
 pub mod compression;
@@ -14,6 +16,7 @@ pub mod proxy;
 pub mod responses_items;
 pub mod sse;
 pub mod tls;
+pub mod upstream_path;
 pub mod vertex;
 pub mod websocket;
 
