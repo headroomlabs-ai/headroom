@@ -170,7 +170,10 @@ def get_encoding_for_model(model: str) -> str:
     # verbatim, matched no prefix, and silently took DEFAULT_ENCODING -- so the
     # encoding a model got depended on the casing of whichever request warmed
     # the cache first, and flipped across restarts.
-    model = model.lower()
+    # Gateway-wrapped ids ("azure/gpt-4o", "openrouter/openai/gpt-5") are picked
+    # for tiktoken by the registry's unwrapping but arrive here as-is, so match on
+    # the bare id or they all take DEFAULT_ENCODING.
+    model = model.lower().rsplit("/", 1)[-1]
 
     # Direct lookup
     if model in MODEL_TO_ENCODING:
