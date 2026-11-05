@@ -54,6 +54,20 @@ RESIDUAL_CCR_SKIPPED_MIXED = "skipped_mixed_tools"
 RESIDUAL_CCR_ERROR = "error"
 
 
+def _openai_message_extras(message: dict[str, Any]) -> dict[str, Any]:
+    """The fields a provider put on a chat message besides the standard three.
+
+    Whoever replays the turn may have to send these back (DeepSeek's
+    ``reasoning_content``, OpenRouter's ``reasoning_details``) and gets rejected
+    if they went missing. Empty ones (``refusal: null``) stay behind.
+    """
+    return {
+        key: value
+        for key, value in message.items()
+        if key not in ("role", "content", "tool_calls") and value
+    }
+
+
 @dataclass
 class CCRToolResult:
     """Result of handling a CCR tool call."""
@@ -397,6 +411,7 @@ class CCRResponseHandler:
             first = choices[0] if isinstance(choices, list) and choices else {}
             message = first.get("message", {}) if isinstance(first, dict) else {}
             return {
+                **_openai_message_extras(message),
                 "role": "assistant",
                 "content": message.get("content"),
                 "tool_calls": message.get("tool_calls"),
@@ -951,7 +966,8 @@ class StreamingCCRHandler:
             response["usage"] = usage
         return response
 
-    def _openai_response_to_chunks(self, response: dict[str, Any]) -> list[bytes]:
+    @staticmethod
+    def _openai_response_to_chunks(response: dict[str, Any]) -> list[bytes]:
         """Split a non-streaming ``chat.completion`` body into SSE chunk frames.
 
         A streaming client reads ``choices[].delta``, not ``choices[].message``.
@@ -968,10 +984,7 @@ class StreamingCCRHandler:
             message = {}
         finish_reason = choice.get("finish_reason") or "stop"
 
-        base: dict[str, Any] = {"object": "chat.completion.chunk"}
-        for key in ("id", "created", "model", "system_fingerprint"):
-            if response.get(key) is not None:
-                base[key] = response[key]
+        base = StreamingCCRHandler._openai_chunk_envelope(response)
 
         def frame(delta: dict[str, Any], reason: str | None) -> bytes:
             payload = {
@@ -981,6 +994,10 @@ class StreamingCCRHandler:
             return f"data: {json.dumps(payload)}\n\n".encode()
 
         frames = [frame({"role": message.get("role") or "assistant"}, None)]
+
+        extras = _openai_message_extras(message)
+        if extras:
+            frames.append(frame(extras, None))
 
         content = message.get("content")
         if content:
@@ -999,10 +1016,15 @@ class StreamingCCRHandler:
                         {
                             "tool_calls": [
                                 {
+                                    # Spread first: gateways hang opaque fields
+                                    # off a tool call that must survive the
+                                    # round trip (Gemini's thought signatures).
+                                    **tool_call,
                                     "index": index,
                                     "id": tool_call.get("id", ""),
                                     "type": tool_call.get("type", "function"),
                                     "function": {
+                                        **function,
                                         "name": function.get("name", ""),
                                         "arguments": function.get("arguments", ""),
                                     },
@@ -1014,6 +1036,31 @@ class StreamingCCRHandler:
                 )
 
         frames.append(frame({}, finish_reason))
+        return frames
+
+    @staticmethod
+    def _openai_chunk_envelope(response: dict[str, Any]) -> dict[str, Any]:
+        """The fields every ``chat.completion.chunk`` frame of a reply repeats."""
+        envelope: dict[str, Any] = {"object": "chat.completion.chunk"}
+        for key in ("id", "created", "model", "system_fingerprint"):
+            if response.get(key) is not None:
+                envelope[key] = response[key]
+        return envelope
+
+    @staticmethod
+    def openai_chat_sse_frames(response: dict[str, Any], *, include_usage: bool) -> list[bytes]:
+        """Render a whole ``chat.completion`` body as the SSE a stream would be.
+
+        ``include_usage`` adds the trailing usage-only chunk (``choices: []``)
+        that ``stream_options.include_usage`` asks for.
+        """
+        frames = StreamingCCRHandler._openai_response_to_chunks(response)
+        usage = response.get("usage")
+        if include_usage and usage is not None:
+            envelope = StreamingCCRHandler._openai_chunk_envelope(response)
+            payload = {**envelope, "choices": [], "usage": usage}
+            frames.append(f"data: {json.dumps(payload)}\n\n".encode())
+        frames.append(b"data: [DONE]\n\n")
         return frames
 
     async def _response_to_sse(
