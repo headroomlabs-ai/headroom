@@ -5,6 +5,7 @@ from __future__ import annotations
 import os
 from collections.abc import Mapping
 
+from headroom.providers.codex import proxy_base_url
 from headroom.proxy.project_context import with_project_prefix
 
 SNOWFLAKE_ACCOUNT_ENV = "SNOWFLAKE_ACCOUNT"
@@ -24,15 +25,10 @@ def default_api_url(environ: Mapping[str, str] | None = None) -> str:
     if host:
         if host.startswith("https://"):
             return host
-        if ".snowflakecomputing.com" in host:
+        if host.endswith(".snowflakecomputing.com"):
             return f"https://{host}"
         return f"https://{host}.snowflakecomputing.com"
     return _FALLBACK_API_URL
-
-
-def proxy_base_url(port: int) -> str:
-    """Return the local proxy base URL for OpenAI-compatible Cortex requests."""
-    return f"http://127.0.0.1:{port}/v1"
 
 
 def build_launch_env(

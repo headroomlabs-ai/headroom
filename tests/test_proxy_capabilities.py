@@ -97,6 +97,7 @@ def test_capabilities_endpoint_health_stats_and_metrics_share_report() -> None:
         capabilities = client.get("/capabilities")
         health = client.get("/health")
         stats = client.get("/stats")
+    with TestClient(app, client=("127.0.0.1", 50000), headers={"host": "127.0.0.1"}) as client:
         metrics = client.get("/metrics")
 
     assert capabilities.status_code == 200
@@ -128,7 +129,8 @@ def test_loopback_capabilities_include_operator_workspace_path() -> None:
     assert stats["capabilities"]["local_state"]["workspace_dir"] == expected
 
 
-def test_remote_health_never_exposes_workspace_path() -> None:
+def test_remote_health_never_exposes_workspace_path(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("HEADROOM_PROXY_TOKEN", "test-remote-bind-token")
     app = create_app(_minimal_config(stateless=True, host="0.0.0.0"))
 
     with TestClient(
@@ -146,6 +148,7 @@ def test_remote_health_never_exposes_workspace_path() -> None:
 def test_remote_capabilities_redact_workspace_paths_in_reasons(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    monkeypatch.setenv("HEADROOM_PROXY_TOKEN", "test-remote-bind-token")
     workspace = str(Path(os.environ["HEADROOM_WORKSPACE_DIR"]))
     import headroom.proxy.capabilities as capabilities_module
 
@@ -161,7 +164,9 @@ def test_remote_capabilities_redact_workspace_paths_in_reasons(
         client=("203.0.113.10", 50000),
         headers={"host": "proxy.example.test"},
     ) as client:
-        response = client.get("/capabilities")
+        response = client.get(
+            "/capabilities", headers={"authorization": "Bearer test-remote-bind-token"}
+        )
 
     assert workspace not in response.text
     assert "<workspace>/private-file" in response.text

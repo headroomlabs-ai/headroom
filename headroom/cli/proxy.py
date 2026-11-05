@@ -1,10 +1,14 @@
 """Proxy server CLI commands."""
 
+import errno
+import ipaddress
 import logging
 import os
+import platform
+import socket
 import sys
 import warnings
-from importlib import import_module
+from importlib.util import find_spec
 from pathlib import Path
 from typing import Any, Literal, cast
 
@@ -21,6 +25,15 @@ from headroom.proxy.modes import PROXY_MODE_CACHE, normalize_proxy_mode
 from .main import main
 
 
+def _proxy_requires_onnx_backends() -> bool:
+    """Match extras that omit unavailable Intel macOS Python 3.14+ wheels."""
+    return not (
+        sys.platform == "darwin"
+        and platform.machine() == "x86_64"
+        and sys.version_info[:2] >= (3, 14)
+    )
+
+
 def ensure_proxy_dependencies() -> None:
     """Verify optional proxy extras are installed before starting or wrapping."""
     required_modules: list[str] = [
@@ -29,19 +42,19 @@ def ensure_proxy_dependencies() -> None:
         "httpx",
         "openai",
         "mcp",
-        "magika",
         "zstandard",
         "websockets",
-        "onnxruntime",
         "transformers",
-        "watchdog",
     ]
+    if _proxy_requires_onnx_backends():
+        required_modules.extend(["magika", "onnxruntime"])
     if sys.implementation.name != "pypy":
         required_modules.append("orjson")
 
     try:
-        for module in required_modules:
-            import_module(module)
+        missing = next((module for module in required_modules if find_spec(module) is None), None)
+        if missing is not None:
+            raise ImportError(f"No module named '{missing}'")
     except ImportError as e:
         click.secho(
             "Error: Proxy dependencies not installed. Run: pip install headroom-ai[proxy]",
@@ -185,14 +198,97 @@ def _get_env_int(name: str, default: int) -> int:
     return default if value is None else value
 
 
-def _get_env_float_optional(name: str) -> float | None:
-    val = os.environ.get(name)
-    if val is None or val == "":
+def _tcp_port_in_use(host: str, port: int, *, workers: int) -> tuple[OSError, Any] | None:
+    """Return ``(EADDRINUSE error, busy address)`` uvicorn would hit binding ``host:port``.
+
+    Returns None when the bind would succeed.
+
+    Mirrors uvicorn's own bind so the probe never refuses a bind uvicorn would
+    accept: ``SO_REUSEADDR`` (both uvicorn paths set it on POSIX, so a port in
+    TIME_WAIT after a restart is not "in use"); a single process binds every
+    address ``host`` resolves to (asyncio ``create_server``), while
+    ``--workers > 1`` binds one AF_INET/AF_INET6 socket in the parent.
+    Windows ``SO_REUSEADDR`` semantics differ, so Windows is left to uvicorn,
+    as is any error other than EADDRINUSE (unresolvable host, address not on
+    this machine); uvicorn reports those as before.
+    """
+    if sys.platform == "win32":
+        return None
+    if workers > 1:
+        family = socket.AF_INET6 if ":" in host else socket.AF_INET
+        targets: list[tuple[Any, Any]] = [(family, (host, port))]
+    else:
+        try:
+            infos = socket.getaddrinfo(
+                host or None, port, type=socket.SOCK_STREAM, flags=socket.AI_PASSIVE
+            )
+        except (OSError, UnicodeError):
+            return None
+        targets = [(info[0], info[4]) for info in infos]
+    for family, address in targets:
+        try:
+            with socket.socket(family, socket.SOCK_STREAM) as probe:
+                probe.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                if family == socket.AF_INET6 and workers <= 1:
+                    # asyncio binds v4 and v6 separately; match it.
+                    probe.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 1)
+                probe.bind(address)
+        except OSError as exc:
+            if exc.errno == errno.EADDRINUSE:
+                return exc, address
+    return None
+
+
+_WILDCARD_PROBE_HOSTS = {"": "127.0.0.1", "0.0.0.0": "127.0.0.1", "::": "::1"}
+
+
+def _probe_host_for(address: Any) -> str | None:
+    """The numeric address to ask "is this Headroom?", or None when it can't be targeted.
+
+    A wildcard bind is reached through loopback of the same family. A
+    hostname (the ``--workers > 1`` path binds it unresolved) is resolved for
+    IPv4. A scoped IPv6 address cannot go in a probe URL.
+    """
+    host = str(address[0])
+    if host in _WILDCARD_PROBE_HOSTS:
+        return _WILDCARD_PROBE_HOSTS[host]
+    if "%" in host:
         return None
     try:
-        return float(val)
+        ipaddress.ip_address(host)
     except ValueError:
-        raise click.ClickException(f"{name} must be a number, got {val!r}") from None
+        try:
+            infos = socket.getaddrinfo(host, None, socket.AF_INET, socket.SOCK_STREAM)
+        except (OSError, UnicodeError):
+            return None
+        return str(infos[0][4][0]) if infos else None
+    return host
+
+
+def _refuse_busy_port(host: str, port: int, *, workers: int) -> None:
+    """Fail before the banner when ``host:port`` is already taken.
+
+    Without this the banner prints "Press Ctrl+C to stop", then uvicorn's bind
+    error is buried among startup and shutdown log lines.
+    """
+    busy = _tcp_port_in_use(host, port, workers=workers)
+    if busy is None:
+        return
+    error, address = busy
+    from headroom.cli.port_discovery import probe_headroom_proxy
+
+    reason = error.strerror or str(error)
+    probe_host = _probe_host_for(address)
+    if probe_host is None:
+        holder = f"({reason})"
+    elif probe_headroom_proxy(port, host=probe_host):
+        holder = "by a running Headroom proxy (reuse it, or stop it first)"
+    else:
+        holder = f"by another process ({reason})"
+    raise click.ClickException(
+        f"Port {port} on {host} is already in use {holder}. "
+        "Start this proxy on another port with --port N (env: HEADROOM_PORT)."
+    )
 
 
 @main.command()
@@ -223,10 +319,33 @@ def dashboard(port: int, no_open: bool) -> None:
 
 @main.command()
 @click.option(
+    "--headroom-deployment-profile",
+    hidden=True,
+    expose_value=False,
+    help="Internal persistent-deployment identity marker.",
+)
+@click.option(
+    "--headroom-deployment-runtime",
+    hidden=True,
+    expose_value=False,
+    help="Internal persistent-deployment identity marker.",
+)
+@click.option(
     "--host",
     default="127.0.0.1",
     envvar="HEADROOM_HOST",
     help="Host to bind to (default: 127.0.0.1, env: HEADROOM_HOST)",
+)
+@click.option(
+    "--uds",
+    default=None,
+    envvar="HEADROOM_UDS",
+    metavar="PATH",
+    help=(
+        "Serve on a Unix domain socket instead of --host/--port. POSIX only. "
+        "Lets a client keep a first-party base URL while its traffic still "
+        "reaches Headroom (env: HEADROOM_UDS)."
+    ),
 )
 @click.option(
     "--port",
@@ -373,7 +492,7 @@ def dashboard(port: int, no_open: bool) -> None:
     default=None,
     type=click.IntRange(min=1),
     envvar="HEADROOM_TPM",
-    help="Max tokens per minute. Env: HEADROOM_TPM. Default: 100000.",
+    help="Max tokens per minute. Env: HEADROOM_TPM. Default: unlimited.",
 )
 @click.option(
     "--no-ccr",
@@ -407,6 +526,17 @@ def dashboard(port: int, no_open: bool) -> None:
         "LiteLLM guardrail/proxy hop, see issue #2509). Applies to non-streaming "
         "responses only. Off by default. "
         "Env: HEADROOM_CCR_INLINE_RESOLVE."
+    ),
+)
+@click.option(
+    "--ccr-buffered-chat-streaming",
+    is_flag=True,
+    envvar="HEADROOM_CCR_BUFFERED_CHAT_STREAMING",
+    help=(
+        "Answer headroom_retrieve on streaming /v1/chat/completions. A turn that "
+        "carries a redeemable marker runs as stream:false upstream and is "
+        "re-emitted as chat.completion.chunk frames, so that turn's text arrives "
+        "all at once. Off by default. Env: HEADROOM_CCR_BUFFERED_CHAT_STREAMING."
     ),
 )
 @click.option(
@@ -525,6 +655,18 @@ def dashboard(port: int, no_open: bool) -> None:
         "large bodies over a slow link. Lower it to fail over a dead pooled "
         "connection faster; --connect-timeout-seconds only guards a fresh connect. "
         "Env: HEADROOM_WRITE_TIMEOUT_SECONDS."
+    ),
+)
+@click.option(
+    "--upstream-tcp-keepalive-seconds",
+    type=click.IntRange(min=0),
+    default=None,
+    envvar="HEADROOM_UPSTREAM_TCP_KEEPALIVE_SECONDS",
+    help=(
+        "Seconds an upstream connection may sit silent before TCP keepalive "
+        "probes it (default: 30, 0 disables). A link that dies without a reset "
+        "then fails over after about this + 60s instead of waiting out the read "
+        "timeout. Env: HEADROOM_UPSTREAM_TCP_KEEPALIVE_SECONDS."
     ),
 )
 @click.option(
@@ -669,7 +811,8 @@ def dashboard(port: int, no_open: bool) -> None:
     help=(
         "Enable/disable AST-based code compression. Requires the optional "
         "tree-sitter dependency: pip install headroom-ai[code]. "
-        "Default: disabled. Env: HEADROOM_CODE_AWARE_ENABLED=1 to enable."
+        "Default: enabled. Disable with --no-code-aware or "
+        "HEADROOM_CODE_AWARE_ENABLED=0."
     ),
 )
 @click.option(
@@ -736,9 +879,9 @@ def dashboard(port: int, no_open: bool) -> None:
     envvar="HEADROOM_READ_MATURATION",
     help=(
         "EXPERIMENTAL: activity-based read maturation — hold fresh Reads "
-        "out of the provider prefix cache and compress them once their "
-        "file quiesces. Requires HEADROOM_ROLLOUT_CHANNEL=beta (or dev); "
-        "env: HEADROOM_READ_MATURATION=1."
+        "verbatim and compress them once their file quiesces, unless the "
+        "provider cache already holds them. Requires "
+        "HEADROOM_ROLLOUT_CHANNEL=beta (or dev); env: HEADROOM_READ_MATURATION=1."
     ),
 )
 @click.option(
@@ -981,7 +1124,7 @@ def dashboard(port: int, no_open: bool) -> None:
 @click.option(
     "--no-telemetry",
     is_flag=True,
-    help="Force anonymous usage telemetry off (already the default; env: HEADROOM_TELEMETRY=off)",
+    help="Turn off local stats and the anonymous upload beacon (env: HEADROOM_TELEMETRY=off)",
 )
 @click.option(
     "--stateless",
@@ -1038,6 +1181,7 @@ def proxy(
     mode: str | None,
     target_ratio: float | None,
     host: str,
+    uds: str | None,
     port: int,
     workers: int,
     limit_concurrency: int,
@@ -1056,6 +1200,7 @@ def proxy(
     no_ccr: bool,
     lossless: bool,
     ccr_inline_resolve: bool,
+    ccr_buffered_chat_streaming: bool,
     no_ccr_proactive_expansion: bool,
     proxy_extension: tuple[str, ...],
     compressor: tuple[str, ...],
@@ -1067,6 +1212,7 @@ def proxy(
     request_timeout_seconds: int | None,
     connect_timeout_seconds: int | None,
     write_timeout_seconds: int | None,
+    upstream_tcp_keepalive_seconds: int | None,
     anthropic_buffered_request_timeout_seconds: int | None,
     anthropic_pre_upstream_concurrency: int | None,
     anthropic_pre_upstream_acquire_timeout_seconds: float | None,
@@ -1142,14 +1288,27 @@ def proxy(
         OPENAI_BASE_URL=http://localhost:8787/v1 your-app
     """
     _reexec_with_malloc_tuning()
+
+    # Fail before any dependency loading or config work: an unusable --uds is a
+    # typo or an unsupported platform, and both are cheaper to report up front.
+    if uds:
+        from headroom.proxy.uds import UdsError, require_uds_support
+
+        try:
+            require_uds_support()
+        except UdsError as exc:
+            raise click.ClickException(str(exc)) from exc
+
     ensure_proxy_dependencies()
 
     # Import here to avoid slow startup
     from headroom.proxy.server import (
         ProxyConfig,
+        _get_env_optional_bool,
         _parse_csv_tools,
         _parse_exclude_tools,
         _parse_tool_profiles,
+        default_periodic_malloc_trim,
         run_server,
     )
 
@@ -1299,12 +1458,20 @@ def proxy(
             _paths.codex_wire_debug_dir()
         )
 
-    # Stateless mode: suppress TOIN filesystem persistence
+    # Stateless mode: suppress TOIN filesystem persistence, and export the flag
+    # so code that runs before the proxy records it (the update check) and
+    # child processes see the same answer as paths.process_is_stateless().
     if is_stateless:
         os.environ["HEADROOM_TOIN_BACKEND"] = "none"
+        os.environ["HEADROOM_STATELESS"] = "1"
 
-    # License key for managed/enterprise deployments (optional)
-    license_key = os.environ.get("HEADROOM_LICENSE_KEY")
+    # Licence token (HEADROOM_LICENSE; HEADROOM_LICENSE_KEY is a deprecated
+    # alias). Having one set never enables outbound usage reporting: that
+    # needs the explicit HEADROOM_USAGE_REPORTING=1 opt-in.
+    from headroom.license_env import resolve_license_token, usage_reporting_enabled
+
+    license_key = resolve_license_token()
+    usage_reporting = usage_reporting_enabled()
 
     # Qdrant connection for the qdrant-neo4j backend. CLI flags default
     # to None; when omitted we let ProxyConfig's default_factory resolve
@@ -1322,6 +1489,7 @@ def proxy(
     config = ProxyConfig(
         host=host,
         port=port,
+        uds=uds,
         rollout=rollout_snapshot,
         anthropic_api_url=provider_api_overrides.anthropic,
         anthropic_extra_headers=resolved_anthropic_extra_headers,
@@ -1336,10 +1504,11 @@ def proxy(
         cache_enabled=not no_cache,
         rate_limit_enabled=not no_rate_limit,
         rate_limit_requests_per_minute=rpm if rpm is not None else 60,
-        rate_limit_tokens_per_minute=tpm if tpm is not None else 100_000,
-        compress_user_messages=_get_env_bool("HEADROOM_COMPRESS_USER_MESSAGES", False),
+        rate_limit_tokens_per_minute=tpm,
+        # Same parse as the server entry points: empty means unset (profile).
+        compress_user_messages=_get_env_optional_bool("HEADROOM_COMPRESS_USER_MESSAGES"),
         periodic_malloc_trim_enabled=_get_env_bool(
-            "HEADROOM_MALLOC_TRIM", sys.platform == "darwin"
+            "HEADROOM_MALLOC_TRIM", default_periodic_malloc_trim()
         ),
         malloc_trim_interval_seconds=_get_env_int("HEADROOM_MALLOC_TRIM_INTERVAL_SECONDS", 60),
         min_tokens_to_crush=_get_env_int("HEADROOM_MIN_TOKENS", 500),
@@ -1373,6 +1542,7 @@ def proxy(
         ccr_inject_marker=not no_ccr,
         ccr_handle_responses=not no_ccr,
         ccr_resolve_markers_inline=ccr_inline_resolve,
+        ccr_buffered_chat_streaming=ccr_buffered_chat_streaming,
         lossless=lossless,
         ccr_proactive_expansion=not no_ccr_proactive_expansion,
         # Flatten repeat-flag tuple AND any comma-separated values inside it.
@@ -1403,6 +1573,9 @@ def proxy(
         if connect_timeout_seconds is not None
         else 10,
         write_timeout_seconds=write_timeout_seconds if write_timeout_seconds is not None else 150,
+        upstream_tcp_keepalive_seconds=(
+            upstream_tcp_keepalive_seconds if upstream_tcp_keepalive_seconds is not None else 30
+        ),
         anthropic_buffered_request_timeout_seconds=(
             anthropic_buffered_request_timeout_seconds
             if anthropic_buffered_request_timeout_seconds is not None
@@ -1422,10 +1595,9 @@ def proxy(
         # Code-aware compression resolution:
         # 1. Explicit --code-aware / --no-code-aware always wins.
         # 2. Otherwise read HEADROOM_CODE_AWARE_ENABLED (truthy = on).
-        # 3. Otherwise default off — matches the prior cli/proxy.py behavior so
-        #    existing users see no change unless they opt in.
-        # Default ON (coding posture; consistent with the argparse server path).
-        # Degrades gracefully to a no-op when tree-sitter isn't installed.
+        # 3. Otherwise default ON (coding posture; consistent with the argparse
+        #    server path). Degrades gracefully to a no-op when tree-sitter
+        #    isn't installed.
         code_aware_enabled=(
             bool(code_aware_flag)
             if code_aware_flag is not None
@@ -1474,6 +1646,7 @@ def proxy(
         anyllm_provider=effective_anyllm_provider,
         # License / Usage Reporting (managed/enterprise)
         license_key=license_key,
+        usage_reporting=usage_reporting,
         # Stateless mode: disable all filesystem writes
         stateless=is_stateless,
         detached_profile=cast(
@@ -1503,9 +1676,16 @@ def proxy(
     if config.memory_enabled:
         memory_status = "ENABLED (multi-provider)"
 
-    license_status = "OSS (no license key)"
+    license_status = "OSS (no licence)"
     if license_key:
-        license_status = f"MANAGED (key={license_key[:8]}...)"
+        # Never print licence material, not even a prefix.
+        if not usage_reporting:
+            reporting = "off"
+        elif config.offline:
+            reporting = "suppressed by HEADROOM_OFFLINE"
+        else:
+            reporting = "ON"
+        license_status = f"LICENSED (usage reporting {reporting})"
 
     provider_api_targets = resolve_api_targets(config.provider_api_overrides)
     anthropic_url = provider_api_targets.anthropic
@@ -1563,18 +1743,36 @@ Memory (Multi-Provider):
             "  Stateless:    YES (no filesystem writes — memory, logs, TOIN disabled)\n"
         )
 
-    from headroom.telemetry.beacon import is_telemetry_enabled
+    # Build telemetry section for the startup banner.
+    #
+    # HEADROOM_TELEMETRY (local aggregate stats, off by default) and
+    # HEADROOM_BEACON (the anonymous upload beacon, ON by default —
+    # see telemetry/beacon.py) are two independent switches. This banner
+    # used to check only is_telemetry_enabled() and print "DISABLED" for
+    # any operator who had merely turned local stats off, even though the
+    # beacon — the switch that actually ships data off the machine — was
+    # still on and unmentioned. Delegate to format_telemetry_notice(), the
+    # one place that already gets the beacon-vs-local distinction right,
+    # instead of re-deriving (and re-drifting from) the same wording here.
+    from headroom.telemetry.beacon import (
+        format_telemetry_notice,
+        is_beacon_enabled,
+        is_telemetry_enabled,
+    )
 
-    # Build telemetry section for the startup banner. Telemetry is opt-in
-    # (off by default); the disabled line surfaces how to opt in.
-    if is_telemetry_enabled():
-        telemetry_line = (
-            "  Telemetry:    ENABLED (anonymous aggregate stats — you opted in)\n"
-            "                Disable: HEADROOM_TELEMETRY=off or headroom proxy --no-telemetry"
-        )
+    _notice = format_telemetry_notice(prefix="  ")
+    if _notice:
+        telemetry_line = _notice
+    elif is_beacon_enabled() or is_telemetry_enabled():
+        # format_telemetry_notice() returns "" when HEADROOM_TELEMETRY_WARN=off
+        # suppresses the notice text itself — still say ON/OFF plainly rather
+        # than silently showing nothing in the one place an operator is most
+        # likely to be checking.
+        telemetry_line = "  Telemetry:    ON (notice suppressed via HEADROOM_TELEMETRY_WARN=off)"
     else:
         telemetry_line = (
-            "  Telemetry:    DISABLED (opt in: HEADROOM_TELEMETRY=on or headroom proxy --telemetry)"
+            "  Telemetry:    OFF (local stats: HEADROOM_TELEMETRY=on to enable | "
+            "beacon: HEADROOM_BEACON=on to enable)"
         )
 
     # Discover proxy extensions (third-party packages registered via the
@@ -1604,21 +1802,35 @@ Memory (Multi-Provider):
             f"(available: {','.join(_ext_available)})"
         )
 
-    # Security posture line: inbound auth token + air-gap mode, and a loud
-    # flag for the open-bind case (non-loopback host with no token).
-    from headroom.proxy.loopback_guard import is_loopback_host
+    # Security posture line: inbound auth token + air-gap mode. An open bind
+    # (non-loopback host, no token) is refused here, before the banner, unless
+    # the operator acknowledged it explicitly; see headroom/proxy/bind_policy.py.
+    from headroom.proxy.bind_policy import OPEN_BIND_ACK_ENV, evaluate_bind_policy
 
-    _auth_on = bool(config.proxy_token or os.environ.get("HEADROOM_PROXY_TOKEN"))
+    _bind = evaluate_bind_policy(config.host, config.proxy_token)
+    if _bind.refused:
+        raise click.ClickException(_bind.message())
+    if not config.uds:
+        _refuse_busy_port(config.host, config.port, workers=workers)
+    _auth_on = _bind.token_configured
+    _open_bind_note = (
+        f" · WARNING open bind, /v1/* UNAUTHENTICATED (acknowledged via {OPEN_BIND_ACK_ENV}=1)"
+        if _bind.open_bind
+        else ""
+    )
     if config.offline:
-        _security_status = "OFFLINE (all egress disabled)" + (
-            " · inbound token REQUIRED (non-loopback)" if _auth_on else ""
+        # Offline masks nothing: an acknowledged open bind is still an open bind.
+        _security_status = (
+            "OFFLINE (all egress disabled)"
+            + (" · inbound token REQUIRED (non-loopback)" if _auth_on else "")
+            + _open_bind_note
         )
     elif _auth_on:
         _security_status = "inbound token REQUIRED for non-loopback callers"
-    elif not is_loopback_host(config.host):
+    elif _bind.open_bind:
         _security_status = (
             "WARNING non-loopback bind with NO token — /v1/* is UNAUTHENTICATED "
-            "(set HEADROOM_PROXY_TOKEN)"
+            f"(acknowledged via {OPEN_BIND_ACK_ENV}=1; set HEADROOM_PROXY_TOKEN instead)"
         )
     else:
         _security_status = "loopback-only (no inbound token)"
@@ -1643,6 +1855,22 @@ Memory (Multi-Provider):
     else:
         tuning_section = ""
 
+    # A socket has no URL, and no per-agent recipe belongs here — see
+    # uds.socket_usage_lines() for why the banner stays transport-neutral.
+    if config.uds:
+        from headroom.proxy.uds import socket_usage_lines
+
+        listen_display = f"unix:{config.uds}"
+        usage_section = "\n".join(socket_usage_lines(config.uds))
+    else:
+        listen_display = f"http://{config.host}:{config.port}"
+        usage_section = "\n".join(
+            (
+                f"  Claude Code:   ANTHROPIC_BASE_URL=http://{config.host}:{config.port} claude",
+                f"  Codex / OpenAI: OPENAI_BASE_URL=http://{config.host}:{config.port}/v1 your-app",
+            )
+        )
+
     click.echo(f"""
 ╔═══════════════════════════════════════════════════════════════════════╗
 ║                         HEADROOM PROXY                                 ║
@@ -1651,7 +1879,7 @@ Memory (Multi-Provider):
 
 Starting proxy server...
 
-  URL:          http://{config.host}:{config.port}
+  URL:          {listen_display}
   Mode:         {config.mode}
   Optimization: {"ENABLED" if config.optimize else "DISABLED"}
   Caching:      {"ENABLED" if config.cache_enabled else "DISABLED"}
@@ -1672,8 +1900,7 @@ Routing:
   /v1/projects/.../publishers/... → {vertex_url}
 
 Usage:
-  Claude Code:   ANTHROPIC_BASE_URL=http://{config.host}:{config.port} claude
-  Codex / OpenAI: OPENAI_BASE_URL=http://{config.host}:{config.port}/v1 your-app
+{usage_section}
 {memory_section}
 Endpoints:
   GET  /livez      Process liveness

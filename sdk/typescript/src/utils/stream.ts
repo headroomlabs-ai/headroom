@@ -15,11 +15,13 @@ export async function* parseSSE<T = any>(
   try {
     while (true) {
       const { done, value } = await reader.read();
-      if (done) break;
-
-      buffer += decoder.decode(value, { stream: true });
+      // On the final read, flush any buffered multi-byte remainder and process
+      // every remaining line — including a last `data:` line that arrived
+      // without a trailing newline, which would otherwise be held back in
+      // `buffer` and dropped when the loop exits.
+      buffer += done ? decoder.decode() : decoder.decode(value, { stream: true });
       const lines = buffer.split("\n");
-      buffer = lines.pop()!;
+      buffer = done ? "" : lines.pop()!;
 
       for (const line of lines) {
         if (line.startsWith("data: ")) {
@@ -32,6 +34,8 @@ export async function* parseSSE<T = any>(
           }
         }
       }
+
+      if (done) break;
     }
   } finally {
     reader.releaseLock();

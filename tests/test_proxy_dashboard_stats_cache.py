@@ -175,7 +175,8 @@ def test_stats_reset_clears_runtime_proxy_counters(monkeypatch: pytest.MonkeyPat
 def test_dashboard_uses_cached_stats_and_lazy_history_feed_polling() -> None:
     html = get_dashboard_html()
 
-    assert "fetch('/stats?cached=1')" in html
+    assert "this.fetchJson('/stats?cached=1')" in html
+    assert "cache: 'no-store'" in html
     assert "version: 'loading'" in html
     assert 'x-text="formatVersion(version)"' in html
     assert "return /^\\d+\\.\\d+\\.\\d+$/.test(label)" in html
@@ -204,6 +205,8 @@ def test_dashboard_session_metrics_do_not_repeat_proxy_tokens_without_new_contex
     html = get_dashboard_html()
 
     assert "proxy tokens removed" not in html
+    assert "'Proxy ' + formatNumber(stats.tokens?.proxy_compression_saved" not in html
+    assert "formatNumber(stats.tokens?.saved || 0) + ' tokens total'" not in html
     assert '<span class="text-sm text-gray-400">Headroom Overhead</span>' not in html
     assert '<span class="text-sm text-gray-400">TTFB (upstream)</span>' not in html
     assert "Overhead Range" in html

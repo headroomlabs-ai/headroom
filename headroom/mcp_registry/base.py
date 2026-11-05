@@ -16,6 +16,7 @@ from __future__ import annotations
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from enum import Enum
+from typing import Any
 
 
 class RegisterStatus(str, Enum):
@@ -104,3 +105,61 @@ class MCPRegistrar(ABC):
     @abstractmethod
     def unregister_server(self, server_name: str) -> bool:
         """Remove the named server. Returns True on success."""
+
+
+# ----------------------------------------------------------------------
+# Spec helpers shared by the registrars whose entries use the common
+# ``{"command", "args", "env"}`` shape (Claude, Antigravity, Codex, Grok).
+# OpenCode has its own entry format and keeps its own converters.
+# ----------------------------------------------------------------------
+
+
+def _spec_to_entry(spec: ServerSpec) -> dict[str, Any]:
+    entry: dict[str, Any] = {"command": spec.command}
+    if spec.args:
+        entry["args"] = list(spec.args)
+    if spec.env:
+        entry["env"] = dict(spec.env)
+    return entry
+
+
+def _entry_to_spec(name: str, entry: dict[str, Any]) -> ServerSpec:
+    args_value = entry.get("args", [])
+    if isinstance(args_value, list):
+        args = tuple(str(x) for x in args_value)
+    else:
+        args = ()
+    env_value = entry.get("env", {})
+    env: dict[str, str] = {}
+    if isinstance(env_value, dict):
+        env = {str(k): str(v) for k, v in env_value.items()}
+    return ServerSpec(
+        name=name,
+        command=str(entry.get("command", "")),
+        args=args,
+        env=env,
+    )
+
+
+def _specs_equivalent(a: ServerSpec, b: ServerSpec) -> bool:
+    """Two specs match when every field is equal."""
+    return (
+        a.name == b.name
+        and a.command == b.command
+        and tuple(a.args) == tuple(b.args)
+        and dict(a.env) == dict(b.env)
+    )
+
+
+def _diff_specs(existing: ServerSpec, requested: ServerSpec) -> str:
+    """Render the difference between two specs for human consumption."""
+    parts: list[str] = []
+    if existing.command != requested.command:
+        parts.append(f"command {existing.command!r} -> {requested.command!r}")
+    if tuple(existing.args) != tuple(requested.args):
+        parts.append(f"args {list(existing.args)} -> {list(requested.args)}")
+    if dict(existing.env) != dict(requested.env):
+        parts.append(f"env {dict(existing.env)} -> {dict(requested.env)}")
+    if not parts:
+        return "spec differs in unidentified field(s)"
+    return "; ".join(parts)

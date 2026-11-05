@@ -2,15 +2,23 @@
 
 from __future__ import annotations
 
+import heapq
 import json
 from collections.abc import Iterator
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
 from ..config import RequestMetrics
 from ..utils import format_timestamp, parse_timestamp
 from .base import Storage
+
+
+def _utc_bound(dt: datetime | None) -> datetime | None:
+    """Normalize a filter bound to the naive UTC used by stored timestamps."""
+    if dt is not None and dt.tzinfo is not None:
+        return dt.astimezone(timezone.utc).replace(tzinfo=None)
+    return dt
 
 
 class JSONLStorage(Storage):
@@ -49,6 +57,13 @@ class JSONLStorage(Storage):
             "stable_prefix_hash": metrics.stable_prefix_hash,
             "cache_alignment_score": metrics.cache_alignment_score,
             "cached_tokens": metrics.cached_tokens,
+            "cache_optimizer_used": metrics.cache_optimizer_used,
+            "cache_optimizer_strategy": metrics.cache_optimizer_strategy,
+            "cacheable_tokens": metrics.cacheable_tokens,
+            "breakpoints_inserted": metrics.breakpoints_inserted,
+            "estimated_cache_hit": metrics.estimated_cache_hit,
+            "estimated_savings_percent": metrics.estimated_savings_percent,
+            "semantic_cache_hit": metrics.semantic_cache_hit,
             "transforms_applied": metrics.transforms_applied,
             "tool_units_dropped": metrics.tool_units_dropped,
             "turns_dropped": metrics.turns_dropped,
@@ -72,6 +87,13 @@ class JSONLStorage(Storage):
             stable_prefix_hash=data.get("stable_prefix_hash", ""),
             cache_alignment_score=data.get("cache_alignment_score", 0.0),
             cached_tokens=data.get("cached_tokens"),
+            cache_optimizer_used=data.get("cache_optimizer_used"),
+            cache_optimizer_strategy=data.get("cache_optimizer_strategy"),
+            cacheable_tokens=data.get("cacheable_tokens", 0),
+            breakpoints_inserted=data.get("breakpoints_inserted", 0),
+            estimated_cache_hit=data.get("estimated_cache_hit", False),
+            estimated_savings_percent=data.get("estimated_savings_percent", 0.0),
+            semantic_cache_hit=data.get("semantic_cache_hit", False),
             transforms_applied=data.get("transforms_applied", []),
             tool_units_dropped=data.get("tool_units_dropped", 0),
             turns_dropped=data.get("turns_dropped", 0),
@@ -101,35 +123,55 @@ class JSONLStorage(Storage):
         limit: int = 100,
         offset: int = 0,
     ) -> list[RequestMetrics]:
-        """Query metrics with filters."""
-        results: list[RequestMetrics] = []
-        skipped = 0
+        """Query metrics with filters.
 
-        for metrics in self.iter_all():
-            # Apply filters
+        Matches are ordered by timestamp descending, then request_id
+        descending (the order SQLiteStorage.query() applies), before the
+        ``[offset : offset + limit]`` page is returned. Selection is bounded
+        to that window instead of materializing the full match set.
+
+        Args:
+            start_time: Filter by timestamp >= start_time.
+            end_time: Filter by timestamp <= end_time.
+            model: Filter by model name.
+            mode: Filter by mode (audit/optimize).
+            limit: Maximum results to return; must be non-negative.
+            offset: Number of results to skip; must be non-negative.
+
+        Returns:
+            List of matching RequestMetrics for the requested page.
+
+        Raises:
+            ValueError: If limit or offset is negative.
+        """
+        if limit < 0:
+            raise ValueError(f"limit must be non-negative, got {limit}")
+        if offset < 0:
+            raise ValueError(f"offset must be non-negative, got {offset}")
+        if limit == 0:
+            return []
+
+        # Stored timestamps are naive UTC; apply the same normalization to filters.
+        start_time = _utc_bound(start_time)
+        end_time = _utc_bound(end_time)
+
+        def _matches(metrics: RequestMetrics) -> bool:
             if start_time is not None and metrics.timestamp < start_time:
-                continue
+                return False
             if end_time is not None and metrics.timestamp > end_time:
-                continue
+                return False
             if model is not None and metrics.model != model:
-                continue
+                return False
             if mode is not None and metrics.mode != mode:
-                continue
+                return False
+            return True
 
-            # Handle offset
-            if skipped < offset:
-                skipped += 1
-                continue
+        filtered = (metrics for metrics in self.iter_all() if _matches(metrics))
 
-            results.append(metrics)
-
-            # Handle limit
-            if len(results) >= limit:
-                break
-
-        # Sort by timestamp descending
-        results.sort(key=lambda m: m.timestamp, reverse=True)
-        return results
+        # Keep only the top offset + limit matches under the shared
+        # timestamp DESC, request_id DESC order, then drop the offset prefix.
+        top = heapq.nlargest(offset + limit, filtered, key=lambda m: (m.timestamp, m.request_id))
+        return top[offset : offset + limit]
 
     def count(
         self,
@@ -139,6 +181,9 @@ class JSONLStorage(Storage):
         mode: str | None = None,
     ) -> int:
         """Count metrics matching filters."""
+        start_time = _utc_bound(start_time)
+        end_time = _utc_bound(end_time)
+
         count = 0
 
         for metrics in self.iter_all():
@@ -177,6 +222,9 @@ class JSONLStorage(Storage):
         end_time: datetime | None = None,
     ) -> dict[str, Any]:
         """Get summary statistics."""
+        start_time = _utc_bound(start_time)
+        end_time = _utc_bound(end_time)
+
         total_requests = 0
         total_tokens_before = 0
         total_tokens_after = 0

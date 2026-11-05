@@ -21,11 +21,17 @@ def _tc(
     command: str,
     output: str,
     *,
+    session_id: str,
     msg_index: int,
     is_error: bool = False,
     error_category: ErrorCategory = ErrorCategory.UNKNOWN,
 ) -> ToolCall:
-    """Build a ToolCall, keying input on the field the tool's summary reads."""
+    """Build a ToolCall, keying input on the field the tool's summary reads.
+
+    ``tool_call_id`` is scoped by session: ``detect_loops`` counts a call once
+    per id, so an id unique only within a session would make two sessions
+    running the same loop look like one session replayed twice.
+    """
     if name.lower() in ("bash", "shell"):
         input_data = {"command": command}
     elif name.lower() in ("read",):
@@ -36,7 +42,7 @@ def _tc(
         input_data = {"command": command}
     return ToolCall(
         name=name,
-        tool_call_id=f"tc_{msg_index}",
+        tool_call_id=f"{session_id}_tc_{msg_index}",
         input_data=input_data,
         output=output,
         is_error=is_error,
@@ -67,7 +73,7 @@ def refetch_loop_session(
         # Same base command; only the output-limit varies — the loop signature.
         command = f"grep -rn 'TimeoutError' logs/ | head -{limit}"
         output = "logs/app.log:" + ("x" * (bytes_per_call - 20)) + "\n(truncated)"
-        calls.append(_tc("Bash", command, output, msg_index=i * 2))
+        calls.append(_tc("Bash", command, output, session_id=session_id, msg_index=i * 2))
         limit += 50  # agent asks for more next time — still truncated
     return SessionData(session_id=session_id, tool_calls=calls)
 
@@ -85,6 +91,7 @@ def error_loop_session(
                 "Bash",
                 "python3 run_tests.py",
                 "python3: command not found",
+                session_id=session_id,
                 msg_index=i * 2,
                 is_error=True,
                 error_category=ErrorCategory.COMMAND_NOT_FOUND,
@@ -102,10 +109,11 @@ def one_off_error_session(session_id: str = "one-off") -> SessionData:
                 "Read",
                 "/etc/missing.conf",
                 "Error: file not found",
+                session_id=session_id,
                 msg_index=0,
                 is_error=True,
                 error_category=ErrorCategory.FILE_NOT_FOUND,
             ),
-            _tc("Bash", "ls -la", "total 8\ndrwxr-xr-x", msg_index=1),
+            _tc("Bash", "ls -la", "total 8\ndrwxr-xr-x", session_id=session_id, msg_index=1),
         ],
     )

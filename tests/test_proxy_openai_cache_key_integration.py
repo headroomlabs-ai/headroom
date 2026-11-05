@@ -114,3 +114,59 @@ def test_openai_differing_field_not_served_from_cache(field, a, b) -> None:
         assert ra2.status_code == 200
         assert _content(ra2) == "resp-1"
         assert calls["n"] == 2
+
+
+def test_openai_different_custom_upstream_not_served_from_cache(monkeypatch) -> None:
+    """Two OpenAI-compatible gateways must not share a response entry (#3346)."""
+    calls: list[str] = []
+
+    monkeypatch.setattr(
+        "headroom.proxy.handlers.openai._resolve_openai_upstream_base",
+        lambda headers: headers.get("x-headroom-base-url"),
+    )
+
+    with _make_cached_proxy_client() as client:
+        proxy = client.app.state.proxy
+
+        async def _fake_retry(method, url, headers, body, stream=False, **kwargs):  # noqa: ANN001
+            calls.append(str(url))
+            content = "gateway-A" if "gateway-a" in str(url) else "gateway-B"
+            return httpx.Response(
+                200,
+                json={
+                    "id": f"chatcmpl_{len(calls)}",
+                    "object": "chat.completion",
+                    "choices": [
+                        {
+                            "index": 0,
+                            "message": {"role": "assistant", "content": content},
+                            "finish_reason": "stop",
+                        }
+                    ],
+                    "usage": {"prompt_tokens": 10, "completion_tokens": 3, "total_tokens": 13},
+                },
+            )
+
+        proxy._retry_request = _fake_retry
+        headers = {"authorization": "Bearer test-key"}
+        body = _body()
+
+        first = client.post(
+            "/v1/chat/completions",
+            headers={**headers, "x-headroom-base-url": "https://gateway-a.example"},
+            json=body,
+        )
+        second = client.post(
+            "/v1/chat/completions",
+            headers={**headers, "x-headroom-base-url": "https://gateway-b.example"},
+            json=body,
+        )
+
+    assert first.status_code == 200
+    assert second.status_code == 200
+    assert _content(first) == "gateway-A"
+    assert _content(second) == "gateway-B"
+    assert calls == [
+        "https://gateway-a.example/v1/chat/completions",
+        "https://gateway-b.example/v1/chat/completions",
+    ]

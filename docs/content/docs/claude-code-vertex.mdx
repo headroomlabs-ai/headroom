@@ -114,5 +114,9 @@ and has the smallest moving parts. Use this alternative only if you can't set
 - Pick a Claude model that is enabled in your Vertex project/region
   (e.g. `claude-sonnet-4-6`, `claude-haiku-4-5`).
 - Streaming, tool use, and prompt caching all work through Headroom.
+- Claude Code's server-side auto-mode classifier is supported only by the
+  native Anthropic-compatible wire path. The Vertex translation path remains
+  fail-open but may use Claude Code's billable client-side classifier fallback
+  until a provider-native safeguard fixture is verified.
 - Want to point at a private Vertex gateway instead of Google's host? Start the
   proxy with `--vertex-api-url https://your-gateway` and Headroom will forward there.

@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import re
 from pathlib import Path
+from typing import Any
 
 from packaging.markers import default_environment
 from packaging.requirements import Requirement
@@ -23,8 +25,11 @@ PLATFORM_MACHINE_MARKER = "platform_machine"
 TORCH_PACKAGE_NAME = "torch"
 TORCH_TRANSITIVE_PACKAGE_NAMES = frozenset({"sentence-transformers"})
 ORJSON_PACKAGE_NAME = "orjson"
+PYTHON_SOCKS_PACKAGE_NAME = "python-socks"
 PROXY_EXTRA = "proxy"
+LEAN_EXTRA = "lean"
 UV_LOCK_FILE = "uv.lock"
+EXTRA_MARKER = re.compile(r"^extra == '([^']+)'$")
 
 
 def _selected_dependency_names_for_extra(
@@ -59,12 +64,32 @@ def _selected_dependency_names_for_extra(
     return selected
 
 
-def _locked_dependency_names(package_name: str) -> set[str]:
+def _locked_package(package_name: str) -> dict[str, Any]:
     lock = tomllib.loads((ROOT / UV_LOCK_FILE).read_text(encoding="utf-8"))
-    for package in lock["package"]:
+    packages: list[dict[str, Any]] = lock["package"]
+    for package in packages:
         if package["name"] == package_name:
-            return {dependency["name"] for dependency in package.get("dependencies", [])}
+            return package
     raise AssertionError(f"{package_name} not found in {UV_LOCK_FILE}")
+
+
+def _locked_dependency_names(package_name: str) -> set[str]:
+    package = _locked_package(package_name)
+    return {dependency["name"] for dependency in package.get("dependencies", [])}
+
+
+def _locked_extra_requirements(
+    locked_extras: dict[str, list[dict[str, Any]]], extra_name: str
+) -> dict[str, set[str]]:
+    """Each package in an extra's flattened lock list, with the extras it requests.
+
+    A package can appear once bare and once with extras (`httpx`, `httpx[http2]`);
+    both mean one install, so the extras are merged.
+    """
+    requirements: dict[str, set[str]] = {}
+    for dependency in locked_extras[extra_name]:
+        requirements.setdefault(dependency["name"], set()).update(dependency.get("extra", []))
+    return requirements
 
 
 def test_all_extra_does_not_require_torch_on_macos_x86_64() -> None:
@@ -127,3 +152,47 @@ def test_proxy_extra_includes_orjson_for_litellm_backends() -> None:
 
     assert ORJSON_PACKAGE_NAME in selected_proxy_dependency_names
     assert ORJSON_PACKAGE_NAME in selected_all_dependency_names
+
+
+def test_proxy_extra_includes_socks_support_for_websocket_proxy_discovery() -> None:
+    """A system SOCKS proxy must not disable Codex Responses WebSockets."""
+
+    pyproject = tomllib.loads((ROOT / PYPROJECT_FILE).read_text(encoding="utf-8"))
+    optional_deps = pyproject["project"]["optional-dependencies"]
+    environment = default_environment()
+
+    selected_proxy_dependency_names = _selected_dependency_names_for_extra(
+        optional_deps,
+        PROXY_EXTRA,
+        environment,
+    )
+
+    assert PYTHON_SOCKS_PACKAGE_NAME in selected_proxy_dependency_names
+
+
+def test_locked_composite_extras_include_their_nested_extras() -> None:
+    """`uv sync --extra lean` must install everything `--extra proxy` does.
+
+    uv installs an extra from its own flattened list in uv.lock, and neither
+    `uv lock --check` nor a plain `uv lock` re-derives that list when a nested
+    extra gains a dependency: python-socks reached `proxy` but not `lean`.
+    """
+
+    package = _locked_package(HEADROOM_PACKAGE_NAME)
+    locked_extras = package["optional-dependencies"]
+    composites = {
+        match.group(1): requirement["extras"]
+        for requirement in package["metadata"]["requires-dist"]
+        if requirement["name"] == HEADROOM_PACKAGE_NAME
+        and (match := EXTRA_MARKER.match(requirement.get("marker", "")))
+    }
+    missing: dict[str, list[str]] = {}
+    for composite, nested in composites.items():
+        locked = _locked_extra_requirements(locked_extras, composite)
+        for nested_extra in nested:
+            for name, extras in _locked_extra_requirements(locked_extras, nested_extra).items():
+                if name not in locked or not extras <= locked[name]:
+                    missing.setdefault(composite, []).append(f"{name} (from {nested_extra})")
+
+    assert LEAN_EXTRA in composites
+    assert missing == {}

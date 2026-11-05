@@ -48,6 +48,14 @@ from benchmarks.scenarios.tool_outputs import (
 from headroom.transforms.smart_crusher import SmartCrusherConfig, smart_crush_tool_output
 
 # =============================================================================
+#: Share of turns in a steady-state agent session whose prefix is already
+#: cached. A 50-turn session writes its prefix once and reads it on the other
+#: 49 turns, so 0.98 is the arithmetic rather than a guess; the round 0.95 below
+#: leaves room for the TTL expiries a real session hits mid-run. Used ONLY by
+#: this synthetic benchmark -- the proxy never assumes a hit rate, it reads the
+#: provider's reported mix per request (headroom.pricing.counterfactual).
+WARM_CACHE_SHARE = 0.95
+
 # PRICING DATA (as of 2025)
 # =============================================================================
 
@@ -77,6 +85,25 @@ PRICING = {
 CHARS_PER_TOKEN = 4
 
 
+def _warm_savings(tokens_saved: int, pricing: dict) -> float:
+    """Value ``tokens_saved`` for a session whose prefix is mostly already cached.
+
+    The share given by :data:`WARM_CACHE_SHARE` would have been billed as cache
+    READS had those tokens been sent; the rest as ordinary input. For Anthropic
+    that is a 10x difference per token, which is why the cold-only figure this
+    benchmark used to print was the single most misleading number it produced.
+
+    Falls back to the list rate for a pricing row with no cached rate, which is
+    the correct answer for a provider that does not discount cache reads.
+    """
+    if tokens_saved <= 0:
+        return 0.0
+    cached_rate = pricing.get("cached_input", pricing["input"])
+    warm = tokens_saved * WARM_CACHE_SHARE * cached_rate
+    cold = tokens_saved * (1.0 - WARM_CACHE_SHARE) * pricing["input"]
+    return warm + cold
+
+
 @dataclass
 class CostAnalysis:
     """Cost analysis for a workload."""
@@ -92,6 +119,17 @@ class CostAnalysis:
     savings_from_compression: float = 0.0
     savings_from_caching: float = 0.0
     total_savings_percent: float = 0.0
+
+    # Compression savings under a WARM cache -- the realistic steady state for
+    # an agent session, where the prefix is written once and read on every
+    # later turn. `savings_from_compression` above is the COLD figure: it
+    # prices every removed token as a cache miss, which is true only for the
+    # first request of a cache window. Reporting the cold number alone
+    # overstates a long session's saving by up to 10x, so both are carried and
+    # the report names which assumption each one is under.
+    savings_from_compression_warm: float = 0.0
+    #: Fraction of turns whose prefix was already cached. See WARM_CACHE_SHARE.
+    cache_profile: str = "cold"
 
 
 @dataclass
@@ -221,6 +259,10 @@ def benchmark_coding_agent_explosion() -> BenchmarkResult:
         cost_optimized=result.tokens_optimized * pricing["input"],
         savings_from_compression=(result.tokens_original - result.tokens_optimized)
         * pricing["input"],
+        savings_from_compression_warm=_warm_savings(
+            result.tokens_original - result.tokens_optimized, pricing
+        ),
+        cache_profile="cold+warm",
     )
     result.cost_analysis.total_savings_percent = result.compression_ratio * 100
 
@@ -402,6 +444,10 @@ def benchmark_rag_scaling() -> BenchmarkResult:
         cost_optimized=result.tokens_optimized * pricing["input"],
         savings_from_compression=(result.tokens_original - result.tokens_optimized)
         * pricing["input"],
+        savings_from_compression_warm=_warm_savings(
+            result.tokens_original - result.tokens_optimized, pricing
+        ),
+        cache_profile="cold+warm",
         total_savings_percent=result.compression_ratio * 100,
     )
 
@@ -605,6 +651,7 @@ def _generate_terminal_report(results: list[BenchmarkResult]) -> str:
     lines.append("=" * 80)
 
     total_savings = 0.0
+    total_savings_warm = 0.0
     total_baseline = 0.0
 
     for result in results:
@@ -640,12 +687,31 @@ def _generate_terminal_report(results: list[BenchmarkResult]) -> str:
             if ca.cost_with_cache > 0:
                 lines.append(f"  Cost (with cache):   ${ca.cost_with_cache:>11.4f}")
             lines.append(f"  Savings:             {ca.total_savings_percent:>11.1f}%")
+            if ca.savings_from_compression > 0:
+                # Both assumptions, named. The cold figure prices every removed
+                # token as a cache miss (true only for the first request of a
+                # cache window); the warm one prices them the way a steady-state
+                # agent session is actually billed. Printing only the first is
+                # what made this benchmark's dollar claims unreproducible
+                # against a real invoice.
+                lines.append(f"  $ saved (cold cache):${ca.savings_from_compression:>11.4f}")
+                lines.append(
+                    f"  $ saved (warm cache):{ca.savings_from_compression_warm:>11.4f}"
+                    f"   <- {WARM_CACHE_SHARE:.0%} of turns hit the prefix cache"
+                )
 
             total_baseline += ca.cost_baseline
             if ca.cost_optimized > 0:
                 total_savings += ca.cost_baseline - ca.cost_optimized
             elif ca.cost_with_cache > 0:
                 total_savings += ca.cost_baseline - ca.cost_with_cache
+            # The warm total is what a steady-state agent session actually
+            # saves. It is tracked alongside the cold one rather than replacing
+            # it so the summary can show the range instead of asserting a point
+            # estimate the reader cannot reproduce from an invoice.
+            total_savings_warm += ca.savings_from_compression_warm or (
+                ca.cost_baseline - ca.cost_optimized if ca.cost_optimized > 0 else 0.0
+            )
 
         # Performance
         if result.optimization_latency_ms > 0:
@@ -658,13 +724,24 @@ def _generate_terminal_report(results: list[BenchmarkResult]) -> str:
     lines.append("=" * 80)
     if total_baseline > 0:
         lines.append(f"  Total Baseline Cost:   ${total_baseline:.4f}")
-        lines.append(f"  Total Savings:         ${total_savings:.4f}")
-        lines.append(f"  Overall Reduction:     {(total_savings / total_baseline) * 100:.1f}%")
+        # A RANGE, not a point. The two ends are the same tokens under the two
+        # cache assumptions; which one a deployment lands on depends on how
+        # much of its prefix is warm, which only its own traffic can say.
+        lines.append(
+            f"  Total Savings:         ${total_savings_warm:.4f} (warm cache) "
+            f".. ${total_savings:.4f} (cold cache)"
+        )
+        lines.append(
+            f"  Overall Reduction:     {(total_savings_warm / total_baseline) * 100:.1f}%"
+            f" .. {(total_savings / total_baseline) * 100:.1f}%"
+        )
     lines.append("")
-    lines.append("  At 1M requests/month:")
+    lines.append("  At 1M requests/month (warm cache -- the steady-state case):")
     lines.append(f"    Without Headroom:    ${total_baseline * 1_000_000:.2f}")
-    lines.append(f"    With Headroom:       ${(total_baseline - total_savings) * 1_000_000:.2f}")
-    lines.append(f"    Monthly Savings:     ${total_savings * 1_000_000:.2f}")
+    lines.append(
+        f"    With Headroom:       ${(total_baseline - total_savings_warm) * 1_000_000:.2f}"
+    )
+    lines.append(f"    Monthly Savings:     ${total_savings_warm * 1_000_000:.2f}")
     lines.append("")
 
     return "\n".join(lines)

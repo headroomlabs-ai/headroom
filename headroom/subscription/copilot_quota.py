@@ -41,6 +41,7 @@ from dataclasses import dataclass, field
 from threading import Lock
 from typing import Any
 
+from headroom.offline import OfflineEgressBlocked, guard_egress, note_refusal
 from headroom.subscription.base import QuotaTracker
 
 logger = logging.getLogger(__name__)
@@ -314,6 +315,7 @@ class _CopilotQuotaTracker(QuotaTracker):
         }
 
         try:
+            guard_egress("GitHub Copilot quota polling", _GITHUB_API_BASE)
             async with aiohttp.ClientSession() as session:
                 async with session.get(
                     url, headers=headers, timeout=aiohttp.ClientTimeout(total=10)
@@ -333,6 +335,13 @@ class _CopilotQuotaTracker(QuotaTracker):
                         return
 
                     data = await resp.json()
+        except OfflineEgressBlocked as blocked:
+            # Say it twice, in the two places an operator looks: once in the
+            # log, and once in the quota panel's own error slot, so the empty
+            # panel carries its reason instead of looking like a broken poll.
+            with self._lock:
+                self._state.last_error = note_refusal(blocked, logger)
+            return
         except Exception as exc:
             with self._lock:
                 self._state.last_error = str(exc)

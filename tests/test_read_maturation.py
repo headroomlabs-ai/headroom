@@ -1,8 +1,8 @@
 """Tests for Mechanism B: activity-based hold-back Read maturation.
 
 The invariants under test, beyond decision behavior:
-1. No cached byte is ever mutated — frozen-prefix content and content
-   carrying a client cache_control breakpoint are untouched.
+1. The provider-cached (frozen) prefix is never mutated, and a client
+   cache_control breakpoint is never moved or dropped.
 2. Replay is deterministic — once matured, the same marker is applied on
    every subsequent request, byte-identical.
 3. Holding is derived from the conversation (file activity), so the
@@ -14,10 +14,7 @@ from __future__ import annotations
 import pytest
 
 from headroom.config import ReadMaturationConfig
-from headroom.transforms.read_maturation import (
-    ReadMaturationManager,
-    relocate_cache_breakpoint,
-)
+from headroom.transforms.read_maturation import ReadMaturationManager
 
 CONTENT = "     1\tdef foo():\n     2\t    return 42\n" * 60  # > 2048B
 SMALL = "     1\tok\n"
@@ -177,6 +174,26 @@ class TestActivityDecision:
         assert res.holding_msg_indices == []
         assert read_content(res) == CONTENT
 
+    def test_held_read_matures_only_outside_frozen_prefix(self):
+        """A held Read is cached with its turn. At quiesce it matures if it
+        is still outside the frozen prefix (e.g. a cold prefix); once the
+        frozen prefix covers it, it stays verbatim — maturing it would
+        re-write everything after it at the cache-write rate."""
+        held = base_conv()
+        msgs = [*held, *quiet(5)]
+
+        m = manager(quiesce_turns=5)
+        assert m.apply(held).holding_msg_indices == [2]
+        res = m.apply(msgs, frozen_message_count=2)  # Read in the live zone
+        assert res.newly_matured == 1
+        assert "compressed after use" in read_content(res)
+
+        m = manager(quiesce_turns=5)
+        assert m.apply(held).holding_msg_indices == [2]
+        res = m.apply(msgs, frozen_message_count=3)  # frozen prefix covers it
+        assert res.newly_matured == 0
+        assert res.messages is msgs
+
     def test_respects_lifecycle_markers(self):
         marker = "[Read content stale: /x/foo.py ... Retrieve original: hash=abc123]" + " " * 2048
         msgs = [
@@ -188,21 +205,21 @@ class TestActivityDecision:
         assert res.holding_msg_indices == []
         assert res.newly_matured == 0
 
-    def test_client_breakpoint_on_fresh_read_is_held_and_relocated(self):
+    def test_client_breakpoint_on_fresh_read_is_held_and_kept(self):
         """Claude Code parks its tail breakpoint on the newest block —
         right after a Read, that's the Read result itself. The read must
-        still be held (verbatim) and relocation must move the breakpoint
-        off it, otherwise the verbatim form gets cache-written."""
+        still be held (verbatim) and the breakpoint must stay on it, so
+        the turn is cached; it also survives the block's maturation."""
         msgs = base_conv()
         msgs[2]["content"][0]["cache_control"] = {"type": "ephemeral"}
-        res = manager().apply(msgs)
+        m = manager(quiesce_turns=5)
+        res = m.apply(msgs)
         assert res.holding_msg_indices == [2]
-        assert res.messages[2]["content"][0]["content"] == CONTENT
+        assert res.messages[2]["content"][0] == msgs[2]["content"][0]
 
-        out = relocate_cache_breakpoint(res.messages, res.holding_msg_indices)
-        # Breakpoint stripped from the held read, re-anchored before it.
-        assert "cache_control" not in out[2]["content"][0]
-        assert out[1]["content"][-1].get("cache_control") == {"type": "ephemeral"}
+        res = m.apply([*msgs, *quiet(5)])
+        assert res.newly_matured == 1
+        assert res.messages[2]["content"][0]["cache_control"] == {"type": "ephemeral"}
 
     def test_openai_format(self):
         msgs = [{"role": "user", "content": "look"}, *openai_read("r1", "/x/foo.py", CONTENT)]
@@ -267,15 +284,12 @@ class TestProxyWiring:
         tracker carries matured markers across requests."""
         from headroom.cache.prefix_tracker import PrefixCacheTracker
         from headroom.config import ReadMaturationConfig
-        from headroom.transforms.read_maturation import (
-            ReadMaturationManager,
-            relocate_cache_breakpoint,
-        )
+        from headroom.transforms.read_maturation import ReadMaturationManager
 
         tracker = PrefixCacheTracker("anthropic")
         assert tracker.read_maturation_manager is None
 
-        # Request 1: fresh read — held; breakpoint relocated.
+        # Request 1: fresh read — held.
         tracker.read_maturation_manager = ReadMaturationManager(
             ReadMaturationConfig(enabled=True, quiesce_turns=5)
         )
@@ -285,8 +299,6 @@ class TestProxyWiring:
         }
         res = tracker.read_maturation_manager.apply(msgs)
         assert res.holding_msg_indices == [2]
-        out = relocate_cache_breakpoint(res.messages, res.holding_msg_indices)
-        assert len(out) == len(msgs)
 
         # Request N (file quiet): same manager matures and replays.
         later = [*base_conv(), *quiet(5)]
@@ -295,58 +307,6 @@ class TestProxyWiring:
         replay = tracker.read_maturation_manager.apply(later)
         assert replay.replacements_applied == 1
         assert replay.newly_matured == 0
-
-
-class TestBreakpointRelocation:
-    def _msgs_with_tail_breakpoint(self) -> list[dict]:
-        msgs = [
-            {"role": "user", "content": [{"type": "text", "text": "earlier turn"}]},
-            *anthropic_read("r1", "/x/foo.py", CONTENT),
-        ]
-        msgs[-1]["content"][-1] = {
-            **msgs[-1]["content"][-1],
-            "cache_control": {"type": "ephemeral"},
-        }
-        return msgs
-
-    @staticmethod
-    def _breakpoint_indices(msgs: list[dict]) -> list[int]:
-        return [
-            i
-            for i, m in enumerate(msgs)
-            if isinstance(m.get("content"), list)
-            and any(isinstance(b, dict) and "cache_control" in b for b in m["content"])
-        ]
-
-    def test_noop_without_holds(self):
-        msgs = self._msgs_with_tail_breakpoint()
-        assert relocate_cache_breakpoint(msgs, []) is msgs
-
-    def test_relocates_before_held_read(self):
-        msgs = self._msgs_with_tail_breakpoint()
-        out = relocate_cache_breakpoint(msgs, [2])
-
-        # Held region [2:] carries no breakpoint; re-anchored on the
-        # latest eligible message before it (index 1 — the assistant
-        # tool_use message), so everything up to but excluding the held
-        # Read still gets cached.
-        assert self._breakpoint_indices(out) == [1]
-        assert out[1]["content"][-1]["cache_control"] == {"type": "ephemeral"}
-        assert len(self._breakpoint_indices(out)) <= len(self._breakpoint_indices(msgs))
-
-    def test_noop_when_no_breakpoint_in_held_region(self):
-        msgs = [
-            {"role": "user", "content": [{"type": "text", "text": "x"}]},
-            *anthropic_read("r1", "/x/foo.py", CONTENT),
-        ]
-        out = relocate_cache_breakpoint(msgs, [2])
-        assert self._breakpoint_indices(out) == []
-
-    def test_originals_not_mutated(self):
-        msgs = self._msgs_with_tail_breakpoint()
-        before = [str(m) for m in msgs]
-        relocate_cache_breakpoint(msgs, [2])
-        assert [str(m) for m in msgs] == before
 
 
 if __name__ == "__main__":
