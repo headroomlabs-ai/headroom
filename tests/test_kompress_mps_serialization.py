@@ -51,6 +51,10 @@ def test_single_and_batch_device_copies_hold_execution_slot(monkeypatch):
         def __init__(self, row_lengths):
             self.row_lengths = row_lengths
 
+        def __getitem__(self, index):
+            # Real attention masks expose each row for padding-aware counts.
+            return [1] * self.row_lengths[index]
+
         def to(self, _device):
             acquired = semaphore.acquire(blocking=False)
             if acquired:
