@@ -359,7 +359,9 @@ class OpenCodePlugin(LearnPlugin, ConversationScanner):
                     continue
                 raw_tool_name = str(item.get("name") or item.get("tool") or "unknown")
                 tool_name = (
-                    "Bash" if raw_tool_name.lower() == "bash" else normalize_tool_name(raw_tool_name)
+                    "Bash"
+                    if raw_tool_name.lower() == "bash"
+                    else normalize_tool_name(raw_tool_name)
                 )
                 call_id = str(item.get("id") or item.get("callID") or f"oc_{session_id}_{idx}")
                 state_raw = item.get("state")
@@ -371,7 +373,9 @@ class OpenCodePlugin(LearnPlugin, ConversationScanner):
 
                 if output == "...output truncated..." or output.startswith("...output truncated"):
                     truncated_ref = (
-                        state.get("outputRef") or state.get("outputFile") or state.get("outputRefFile")
+                        state.get("outputRef")
+                        or state.get("outputFile")
+                        or state.get("outputRefFile")
                     )
                     if truncated_ref:
                         try:

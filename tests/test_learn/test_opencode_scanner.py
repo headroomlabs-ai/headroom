@@ -375,10 +375,12 @@ def _create_opencode_db_v2(
             );
             """
         )
+
         # NOTE: compact separators mirror production storage (no spaces), which
         # the scanner's LIKE prefilter matches.
         def _dump(obj: object) -> str:
             return json.dumps(obj, separators=(",", ":"))
+
         conn.execute(
             "INSERT INTO project (id, worktree, name) VALUES (?, ?, ?)",
             (project_id, str(project_path), project_name),
@@ -625,7 +627,15 @@ def test_opencode_plugin_v2_skips_non_dict_message_data(
             conn.execute(
                 "INSERT INTO session_message (id, session_id, type, seq, time_created, time_updated, data)"
                 " VALUES (?, ?, ?, ?, ?, ?, ?)",
-                (msg_id, "session-v2", "assistant", 1, 1_700_000_000_000, 1_700_000_000_000, payload),
+                (
+                    msg_id,
+                    "session-v2",
+                    "assistant",
+                    1,
+                    1_700_000_000_000,
+                    1_700_000_000_000,
+                    payload,
+                ),
             )
         conn.commit()
     finally:

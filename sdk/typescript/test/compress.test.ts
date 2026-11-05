@@ -235,3 +235,49 @@ describe("compress() sends Anthropic-format input to the proxy natively", () => 
     expect(result.messages).toEqual(returned);
   });
 });
+
+describe("compress() honors a declared input format", () => {
+  beforeEach(() => {
+    mockFetch.mockReset();
+  });
+
+  it("converts a text-only Vercel prompt both ways when format is declared, instead of autodetecting OpenAI", async () => {
+    // Nothing in this prompt distinguishes it from OpenAI, so autodetection would hand it
+    // to the proxy unconverted and return OpenAI shape (a string) to an AI SDK caller.
+    const prompt = [{ role: "user", content: [{ type: "text", text: "hi" }] }];
+    mockFetch.mockResolvedValueOnce(okResponse({ messages: [{ role: "user", content: "compressed" }] }));
+
+    const result = await compress(prompt, { baseUrl: "http://localhost:8787", format: "vercel" });
+
+    const body = JSON.parse(mockFetch.mock.calls[0][1].body);
+    expect(body.messages).toEqual([{ role: "user", content: "hi" }]);
+    expect(result.messages).toEqual([{ role: "user", content: [{ type: "text", text: "compressed" }] }]);
+  });
+});
+
+describe("compress() keeps OpenAI attachments on the autodetection path when messages carry providerOptions", () => {
+  beforeEach(() => {
+    mockFetch.mockReset();
+  });
+
+  it("passes an OpenAI user message with providerOptions, an image_url and a file part through unconverted", async () => {
+    const messages = [
+      {
+        role: "user",
+        providerOptions: { openai: {} },
+        content: [
+          { type: "text", text: "Describe this" },
+          { type: "image_url", image_url: { url: "https://example.com/cat.png" } },
+          { type: "file", file: { file_id: "file-abc", filename: "notes.pdf" } },
+        ],
+      },
+    ];
+    mockFetch.mockResolvedValueOnce(okResponse({ messages }));
+
+    const result = await compress(messages, { baseUrl: "http://localhost:8787" });
+
+    const body = JSON.parse(mockFetch.mock.calls[0][1].body);
+    expect(body.messages).toEqual(messages);
+    expect(result.messages).toEqual(messages);
+  });
+});

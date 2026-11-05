@@ -225,15 +225,6 @@ class SemanticCache:
         base = messages_hash or self._generate_key(query)
         key = self._combined_key(namespace, base)
 
-        # Evict if adding a NEW key would exceed capacity. Overwriting a key that
-        # is already present is an in-place update that does not grow the map, so
-        # it must NOT evict — the old code ran the eviction loop before computing
-        # the key, so re-storing an existing entry at capacity dropped an
-        # unrelated live entry and turned a later lookup for it into a false miss.
-        # (Mirrors CompressionCache.store_compressed, which deletes-then-inserts.)
-        while key not in self._cache and len(self._cache) >= self.config.max_entries:
-            self._evict_oldest()
-
         # Generate embedding if available — but never for an empty/blank query.
         # A stored empty-query entry with an embedding would be a false-match
         # target for the semantic get() path; leaving its embedding empty makes
@@ -253,6 +244,18 @@ class SemanticCache:
             messages_hash=messages_hash or "",
             namespace=namespace,
         )
+
+        # Evict if adding a NEW key would exceed capacity. Overwriting a key that
+        # is already present is an in-place update that does not grow the map, so
+        # it must NOT evict — the old code ran the eviction loop before computing
+        # the key, so re-storing an existing entry at capacity dropped an
+        # unrelated live entry and turned a later lookup for it into a false miss.
+        # (Mirrors CompressionCache.store_compressed, which deletes-then-inserts.)
+        # The embedding call above may raise, so evict only once the new entry is
+        # built — never before, or a failed store would drop a live entry without
+        # replacing it.
+        while key not in self._cache and len(self._cache) >= self.config.max_entries:
+            self._evict_oldest()
 
         self._cache[key] = entry
 
