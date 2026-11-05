@@ -51,6 +51,21 @@ def _is_windows() -> bool:
     return sys.platform.startswith("win")
 
 
+# Runs argv[1] with no console window and exits with its status, so Task
+# Scheduler still sees a failing health script (conhost --headless exits 0).
+_WINDOWS_HIDDEN_LAUNCHER = (
+    "import subprocess,sys;sys.exit(subprocess.call([sys.argv[1]],creationflags=0x08000000))"
+)
+
+
+def _windows_hidden_launcher(script: str) -> tuple[str, str] | None:
+    """Return (command, arguments) running ``script`` hidden via pythonw, if present."""
+    pythonw = Path(sys.executable).with_name("pythonw.exe")
+    if not pythonw.is_file():
+        return None
+    return str(pythonw), f'-c "{_WINDOWS_HIDDEN_LAUNCHER}" "{script}"'
+
+
 def _write_private_text(path: Path, data: str, mode: int) -> None:
     """Atomically replace a secret-bearing runner with a private new inode.
 
@@ -337,6 +352,17 @@ def _windows_task_xml(
             f"    <LogonType>{logon_type}</LogonType>\n"
             "    <RunLevel>LeastPrivilege</RunLevel>"
         )
+    exec_xml = f"      <Command>{_xml_escape(command)}</Command>\n"
+    launcher = _windows_hidden_launcher(command) if logon_type == "InteractiveToken" else None
+    if launcher is not None:
+        # Interactive-token runs land on the user's desktop, so a bare .cmd
+        # pops a console every five minutes. Without pythonw the bare .cmd
+        # stays: visible, but recovery still runs.
+        launcher_exe, launcher_args = launcher
+        exec_xml = (
+            f"      <Command>{_xml_escape(launcher_exe)}</Command>\n"
+            f"      <Arguments>{_xml_escape(launcher_args)}</Arguments>\n"
+        )
     return (
         '<?xml version="1.0" encoding="UTF-16"?>\n'
         '<Task version="1.2" '
@@ -356,7 +382,7 @@ def _windows_task_xml(
         "    <StartWhenAvailable>true</StartWhenAvailable>\n"
         "  </Settings>\n"
         '  <Actions Context="Author">\n'
-        f"    <Exec>\n      <Command>{_xml_escape(command)}</Command>\n    </Exec>\n"
+        f"    <Exec>\n{exec_xml}    </Exec>\n"
         "  </Actions>\n"
         "</Task>\n"
     )
