@@ -196,8 +196,14 @@ def resolve_api_targets(overrides: ProviderApiOverrides) -> ProviderApiTargets:
     )
 
 
-def stream_usage_provider(provider: str) -> str:
+def stream_usage_provider(provider: str, *, endpoint_name: str | None = None) -> str:
     """Resolve provider name used by streaming usage parsers."""
+    if endpoint_name is not None:
+        if provider in {"gemini", "vertex:google"}:
+            return "gemini"
+        if endpoint_name in {"chat/completions", "responses"}:
+            return "openai"
+        return "anthropic"
     return {"vertex:google": "gemini"}.get(provider, provider)
 
 

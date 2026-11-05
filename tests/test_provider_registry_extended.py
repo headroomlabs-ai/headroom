@@ -20,6 +20,23 @@ from headroom.proxy import upstream_guard
 
 
 @pytest.mark.parametrize(
+    ("provider", "endpoint", "expected"),
+    [
+        ("bedrock", "messages", "anthropic"),
+        ("vertex:anthropic", "predict", "anthropic"),
+        ("compatible-vendor", "chat/completions", "openai"),
+        ("openai", "responses", "openai"),
+        ("gemini", "generateContent", "gemini"),
+        ("vertex:google", "messages", "gemini"),
+    ],
+)
+def test_stream_parser_follows_wire_protocol(provider, endpoint, expected):
+    from headroom.providers.registry import stream_usage_provider
+
+    assert stream_usage_provider(provider, endpoint_name=endpoint) == expected
+
+
+@pytest.mark.parametrize(
     ("provider", "model", "expected"),
     [
         ("anthropic", "claude-sonnet-4-6", True),
