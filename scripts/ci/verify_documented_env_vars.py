@@ -314,7 +314,7 @@ def main(argv: list[str] | None = None) -> int:
         for name, occurrences in sorted(missing.items()):
             first = occurrences[0]
             print(
-                f"::error file={first.path},line={first.line}::"
+                f"::error file={first.path.as_posix()},line={first.line}::"
                 f"Documented environment variable {name} has no implementation reference",
                 file=sys.stderr,
             )
