@@ -9,11 +9,17 @@ import re
 import uuid
 import warnings
 from datetime import datetime, timezone
-from typing import Any
+from typing import Any, TypeVar
+
+_K = TypeVar("_K")
+_V = TypeVar("_V")
 
 # Marker format for Headroom modifications
 MARKER_PREFIX = "<headroom:"
 MARKER_SUFFIX = ">"
+
+_REMINDER_OPEN = re.compile(r"<system-reminder(?=[\s>])[^<>]*>", re.IGNORECASE)
+_REMINDER_CLOSE = re.compile(r"</system-reminder\s*>", re.IGNORECASE)
 
 
 def generate_request_id() -> str:
@@ -39,6 +45,41 @@ def compute_short_hash(data: str | bytes, length: int = 16) -> str:
     return compute_hash(data)[:length]
 
 
+def remember_bounded(cache: dict[_K, _V], key: _K, value: _V, maxsize: int) -> None:
+    """Store ``key`` as the newest entry of ``cache``, keeping at most ``maxsize``.
+
+    ``cache`` is a plain dict used as a least-recently-used cache: insertion
+    order is recency order, so the first key is the stalest and is evicted
+    first. Call this again on a cache hit to mark the key recently used.
+
+    Meant for caches keyed by client-controlled strings, such as a proxied
+    request's ``model`` field: the entry count stays bounded however many
+    distinct keys arrive, and an evicted key is recomputed on its next use
+    rather than answered wrongly.
+
+    Safe to call from several threads without a lock: a race can evict a key
+    early or leave the cache briefly one entry over ``maxsize``, never raise.
+
+    Args:
+        cache: The dict to update in place.
+        key: Cache key.
+        value: Value to store.
+        maxsize: Maximum number of entries. ``<= 0`` stores nothing.
+    """
+    if maxsize <= 0:
+        cache.clear()
+        return
+    cache.pop(key, None)
+    while len(cache) >= maxsize:
+        try:
+            oldest = next(iter(cache))
+        except (StopIteration, RuntimeError):
+            # Emptied, or resized by another thread mid-iteration.
+            break
+        cache.pop(oldest, None)
+    cache[key] = value
+
+
 def fast_hash(data: str | bytes, length: int = 16) -> str:
     """Fast non-cryptographic content hash for caches and dedup.
 
@@ -59,6 +100,24 @@ def fast_hash(data: str | bytes, length: int = 16) -> str:
     if isinstance(data, str):
         data = data.encode("utf-8")
     return hashlib.md5(data).hexdigest()[:length]  # nosec B324
+
+
+def _strip_system_reminders(text: str) -> str:
+    """Remove complete harness reminders while keeping surrounding user text."""
+    parts: list[str] = []
+    cursor = 0
+    while opening := _REMINDER_OPEN.search(text, cursor):
+        closing = _REMINDER_CLOSE.search(text, opening.end())
+        if closing is None:
+            break
+        parts.append(text[cursor : opening.start()])
+        end = closing.end()
+        if opening.start() and end < len(text):
+            if not text[opening.start() - 1].isspace() and not text[end].isspace():
+                parts.append(" ")
+        cursor = end
+    parts.append(text[cursor:])
+    return "".join(parts).strip()
 
 
 def extract_user_query(
@@ -82,14 +141,20 @@ def extract_user_query(
     for msg in reversed(messages):
         if msg.get("role") == "user":
             content = msg.get("content", "")
-            if isinstance(content, str) and content.strip():
-                return content.strip()
+            if isinstance(content, str):
+                user_text = _strip_system_reminders(content)
+                if user_text:
+                    return user_text
             if isinstance(content, list):
-                for block in content:
-                    if isinstance(block, dict) and block.get("type") == "text":
-                        text = str(block.get("text", "")).strip()
-                        if text:
-                            return text
+                user_text = "\n".join(
+                    text
+                    for block in content
+                    if isinstance(block, dict) and block.get("type") == "text"
+                    for text in (_strip_system_reminders(str(block.get("text", ""))),)
+                    if text
+                )
+                if user_text:
+                    return user_text
             if latest_user_turn_only:
                 return ""
     return ""
