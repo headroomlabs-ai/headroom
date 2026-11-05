@@ -55,10 +55,12 @@ fn missing_onnx_runtime_is_an_error_not_a_hang() {
 
     match rx.recv_timeout(Duration::from_secs(60)) {
         Ok(Err(err @ KompressError::Onnx { .. })) => {
+            // On an x86 CPU without AVX2 the CPU gate answers first, before
+            // any library is loaded; either reason proves it returned.
             let message = err.to_string();
             assert!(
-                message.contains("ORT_DYLIB_PATH"),
-                "error should name ORT_DYLIB_PATH: {message}"
+                message.contains("ORT_DYLIB_PATH") || message.contains("cpu_unsupported"),
+                "error should name ORT_DYLIB_PATH (or the CPU gate): {message}"
             );
         }
         Ok(Err(other)) => panic!("expected KompressError::Onnx, got: {other}"),

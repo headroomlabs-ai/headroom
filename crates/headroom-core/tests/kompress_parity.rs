@@ -11,10 +11,13 @@
 //! locally after `python scripts/record_kompress_trace.py` to get the
 //! real assertion.
 //!
-//! Runtime-gated too: with the model cached but no ONNX Runtime library to
-//! run it (`ORT_DYLIB_PATH` unset and no pip `onnxruntime` under
-//! `VIRTUAL_ENV`, `CONDA_PREFIX` or `./.venv`), it also SKIPS, the way
-//! `magika_idle_threads` skips without an ONNX Runtime.
+//! Runtime-gated too: with the model cached but no way to run it (a CPU
+//! without AVX2, or no ONNX Runtime library: `ORT_DYLIB_PATH` unset and no
+//! pip `onnxruntime` under `VIRTUAL_ENV`, `CONDA_PREFIX` or `./.venv`), it
+//! also SKIPS, the way `magika_idle_threads` skips without an ONNX Runtime.
+//! The check is `kompress::onnx_runtime_ready`, the constructors' own
+//! CPU-then-loader preconditions, so it never loads the runtime on a CPU
+//! that can't run it.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -29,7 +32,7 @@ fn cached_artifacts() -> Option<(PathBuf, PathBuf)> {
 }
 
 /// [`cached_artifacts`], or `None` (with the reason on stderr) when the
-/// model isn't cached or no ONNX Runtime can be loaded to run it.
+/// model isn't cached or this machine can't run ONNX Runtime.
 fn loadable_artifacts() -> Option<(PathBuf, PathBuf)> {
     let Some(paths) = cached_artifacts() else {
         eprintln!(
@@ -39,7 +42,7 @@ fn loadable_artifacts() -> Option<(PathBuf, PathBuf)> {
         return None;
     };
     if let Err(reason) = kompress::onnx_runtime_ready() {
-        eprintln!("SKIP: no ONNX Runtime to run kompress: {reason}");
+        eprintln!("SKIP: can't run ONNX Runtime for kompress here: {reason}");
         return None;
     }
     Some(paths)
