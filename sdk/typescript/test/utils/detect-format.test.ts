@@ -208,3 +208,62 @@ describe("detectFormat: Anthropic thinking blocks", () => {
     expect(detectFormat(messages)).toBe("anthropic");
   });
 });
+
+describe("detectFormat: Vercel reasoning parts and providerOptions", () => {
+  it("detects a turn whose only Vercel marker is a reasoning part", () => {
+    const messages = [
+      { role: "user", content: "hi" },
+      { role: "assistant", content: [{ type: "reasoning", text: "..." }, { type: "text", text: "hello" }] },
+    ];
+    expect(detectFormat(messages)).toBe("vercel");
+  });
+
+  it("detects a message-level providerOptions key as Vercel", () => {
+    const messages = [{ role: "user", content: "hi", providerOptions: { anthropic: { cacheControl: { type: "ephemeral" } } } }];
+    expect(detectFormat(messages)).toBe("vercel");
+  });
+});
+
+describe("detectFormat: OpenAI content markers outrank message-level providerOptions", () => {
+  // The public OpenAI message types allow `providerOptions`, so the key alone must not route
+  // an OpenAI conversation through the Vercel converter, which keeps only text/image/file parts.
+  it("keeps an OpenAI user message with providerOptions and an image_url part as openai", () => {
+    const messages = [
+      {
+        role: "user",
+        providerOptions: { openai: {} },
+        content: [
+          { type: "text", text: "Describe this" },
+          { type: "image_url", image_url: { url: "https://example.com/cat.png" } },
+        ],
+      },
+    ];
+    expect(detectFormat(messages)).toBe("openai");
+  });
+
+  it("keeps an OpenAI user message with providerOptions and a file part (file object) as openai", () => {
+    const messages = [
+      {
+        role: "user",
+        providerOptions: { openai: {} },
+        content: [{ type: "text", text: "Summarize" }, { type: "file", file: { file_id: "file-abc" } }],
+      },
+    ];
+    expect(detectFormat(messages)).toBe("openai");
+  });
+
+  it("keeps an OpenAI user message with providerOptions and an input_audio part as openai", () => {
+    const messages = [
+      { role: "user", providerOptions: { openai: {} }, content: [{ type: "input_audio", input_audio: { data: "AAAA", format: "wav" } }] },
+    ];
+    expect(detectFormat(messages)).toBe("openai");
+  });
+
+  it("lets an image_url part on a later message outrank providerOptions on an earlier one", () => {
+    const messages = [
+      { role: "system", content: "You describe images.", providerOptions: { openai: {} } },
+      { role: "user", content: [{ type: "image_url", image_url: { url: "https://example.com/cat.png" } }] },
+    ];
+    expect(detectFormat(messages)).toBe("openai");
+  });
+});
