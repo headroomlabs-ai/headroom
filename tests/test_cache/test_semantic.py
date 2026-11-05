@@ -1,6 +1,8 @@
 """Tests for SemanticCache and SemanticCacheLayer."""
 
+import hashlib
 import time
+from datetime import datetime
 
 import pytest
 
@@ -50,6 +52,43 @@ class TestSemanticCache:
         """Test cache miss."""
         entry = cache.get("Unknown query", messages_hash="unknown")
         assert entry is None
+
+    @pytest.mark.parametrize("max_entries", [0, -1])
+    def test_put_rejects_nonpositive_capacity(self, max_entries, monkeypatch):
+        cache = SemanticCache(SemanticCacheConfig(max_entries=max_entries))
+        # Fail promptly instead of hanging if the unguarded eviction loop returns.
+        monkeypatch.setattr(
+            cache, "_evict_oldest", lambda: pytest.fail("Invalid capacity must not evict entries")
+        )
+
+        with pytest.raises(ValueError, match="max_entries must be positive"):
+            cache.put("query", "response", messages_hash="request")
+
+        assert cache.get_stats()["entries"] == 0
+
+    @pytest.mark.parametrize("max_entries", [0, -1])
+    @pytest.mark.parametrize("messages_hash", ["existing", "new"])
+    def test_invalid_capacity_change_preserves_entries(
+        self, max_entries, messages_hash, monkeypatch
+    ):
+        cache = SemanticCache(SemanticCacheConfig(max_entries=1))
+        cache.put("query", "original", messages_hash="existing")
+        cache.config.max_entries = max_entries
+        stats = cache.get_stats()
+        monkeypatch.setattr(
+            cache, "_evict_oldest", lambda: pytest.fail("Invalid capacity must not evict entries")
+        )
+
+        with pytest.raises(ValueError, match="max_entries must be positive"):
+            cache.put("query", "replacement", messages_hash=messages_hash)
+
+        assert cache.get_stats() == stats
+        assert cache.get("query", messages_hash="existing").response == "original"
+        assert cache.get("query", messages_hash="new") is None
+
+        cache.config.max_entries = 1
+        cache.put("query", "updated", messages_hash="existing")
+        assert cache.get("query", messages_hash="existing").response == "updated"
 
     def test_same_query_different_context_does_not_collide(self, cache):
         """Two requests that share a trailing user message but differ in earlier
@@ -120,6 +159,52 @@ class TestSemanticCache:
         # h2 reflects the update.
         got2 = cache.get("query2", messages_hash="h2")
         assert got2 is not None and got2.response == "response2b"
+
+    def test_put_failure_after_eviction_keeps_live_entry(self):
+        """A failed embedding must not silently drop an already-evicted entry.
+
+        The eviction loop used to run before the embedding call, so if the
+        embedding function raised, an old live entry was already evicted while
+        the new entry was never stored — a permanent data loss on a transient
+        error. The exception must still propagate.
+        """
+        config = SemanticCacheConfig(max_entries=1, similarity_threshold=0.9)
+        cache = SemanticCache(config)
+
+        call_count = {"n": 0}
+
+        def flaky_embedding(text: str) -> list[float]:
+            call_count["n"] += 1
+            if call_count["n"] == 1:
+                return [1.0, 0.0]
+            raise RuntimeError("embedding backend unavailable")
+
+        cache._embedding_fn = flaky_embedding
+
+        # First put succeeds and fills the cache to capacity.
+        cache.put("a", "response-a", messages_hash="ha")
+        assert cache.get("a", messages_hash="ha") is not None
+        assert len(cache._cache) == 1
+
+        # Second put raises, but the live entry must survive untouched.
+        with pytest.raises(RuntimeError, match="embedding backend unavailable"):
+            cache.put("b", "response-b", messages_hash="hb")
+
+        assert cache.get("a", messages_hash="ha") is not None
+        assert len(cache._cache) == 1
+
+        # With the embedding working again, a new put evicts "a" normally.
+        def stable_embedding(text: str) -> list[float]:
+            # Distinct vectors per query so "a" and "c" never false-hit.
+            if text == "a":
+                return [1.0, 0.0]
+            return [0.0, 1.0]
+
+        cache._embedding_fn = stable_embedding
+        cache.put("c", "response-c", messages_hash="hc")
+        assert cache.get("a", messages_hash="ha") is None
+        assert cache.get("c", messages_hash="hc") is not None
+        assert len(cache._cache) == 1
 
     def test_ttl_expiration(self):
         """Test TTL expiration."""
@@ -237,6 +322,63 @@ class TestSemanticCache:
         # A whitespace-only query is treated the same as empty.
         cache.put("   \n\t", "response-C", messages_hash="ctxC")
         assert cache.get("   ", messages_hash="ctxD") is None
+
+    def test_namespace_isolation_exact_match(self, cache):
+        """Same messages_hash in different namespaces must not collide."""
+        cache.put("continue", "response A", messages_hash="shared", namespace="ns-a")
+        cache.put("continue", "response B", messages_hash="shared", namespace="ns-b")
+
+        assert (
+            cache.get("continue", messages_hash="shared", namespace="ns-a").response == "response A"
+        )
+        assert (
+            cache.get("continue", messages_hash="shared", namespace="ns-b").response == "response B"
+        )
+        # A third namespace that never stored the hash is a miss.
+        assert cache.get("continue", messages_hash="shared", namespace="ns-c") is None
+
+    def test_namespace_isolation_semantic(self):
+        """Semantic matches never cross namespace boundaries."""
+
+        def embedding(text: str) -> list[float]:
+            return [1.0, 0.0, 0.0] if "weather" in text.lower() else [0.0, 1.0, 0.0]
+
+        config = SemanticCacheConfig(similarity_threshold=0.9)
+        cache = SemanticCache(config, embedding_fn=embedding)
+
+        cache.put("What is the weather?", "sunny", namespace="ns-a")
+
+        # Same query, different namespace: no hit.
+        assert cache.get("How is the weather?", namespace="ns-b") is None
+        # Same namespace: still hits.
+        assert cache.get("How is the weather?", namespace="ns-a").response == "sunny"
+
+    def test_query_derived_key_includes_namespace(self, cache):
+        """Without messages_hash the query-derived key is still namespace-scoped."""
+        key_a = cache.put("run the tests", "response A", namespace="ns-a")
+        key_b = cache.put("run the tests", "response B", namespace="ns-b")
+
+        # Different namespaces produce different keys for the same query.
+        assert key_a != key_b
+        # Re-storing in the same namespace reuses the key (in-place update).
+        key_a_again = cache.put("run the tests", "response A2", namespace="ns-a")
+        assert key_a_again == key_a
+
+    def test_max_entries_enforced_globally_across_namespaces(self):
+        """Eviction counts entries across all namespaces, not per namespace."""
+        config = SemanticCacheConfig(max_entries=2)
+        cache = SemanticCache(config)
+
+        cache.put("query1", "response1", messages_hash="h1", namespace="ns-a")
+        cache.put("query2", "response2", messages_hash="h2", namespace="ns-b")
+
+        # Cache is full: a new entry in a third namespace evicts the LRU entry
+        # even though that entry belongs to a different namespace.
+        cache.put("query3", "response3", messages_hash="h3", namespace="ns-c")
+
+        assert cache.get("query1", messages_hash="h1", namespace="ns-a") is None
+        assert cache.get("query2", messages_hash="h2", namespace="ns-b") is not None
+        assert cache.get("query3", messages_hash="h3", namespace="ns-c") is not None
 
 
 class TestSemanticCacheLayer:
@@ -373,3 +515,149 @@ class TestSemanticCacheLayer:
         result = layer.process(messages, context)
 
         assert result.semantic_cache_hit is True
+
+    def test_different_model_no_hit(self, layer):
+        """Cached responses must not replay across models."""
+        messages = [{"role": "user", "content": "Find alpha."}]
+        context_a = OptimizationContext(provider="anthropic", model="claude-3-opus")
+        context_b = OptimizationContext(provider="anthropic", model="claude-3-sonnet")
+
+        layer.store_response(messages, {"answer": "opus response"}, context_a)
+
+        result = layer.process(messages, context_b)
+        assert result.semantic_cache_hit is False
+
+    def test_different_provider_no_hit(self, layer):
+        """Cached responses must not replay across providers."""
+        messages = [{"role": "user", "content": "Find alpha."}]
+        context_a = OptimizationContext(provider="anthropic", model="claude-3-opus")
+        context_b = OptimizationContext(provider="bedrock", model="claude-3-opus")
+
+        layer.store_response(messages, {"answer": "opus response"}, context_a)
+
+        result = layer.process(messages, context_b)
+        assert result.semantic_cache_hit is False
+
+    def test_different_metadata_no_hit(self, layer):
+        """Cached responses must not replay across different metadata."""
+        messages = [{"role": "user", "content": "Find alpha."}]
+        context_a = OptimizationContext(
+            provider="anthropic",
+            model="claude-3-opus",
+            metadata={"temperature": 0.7},
+        )
+        context_b = OptimizationContext(
+            provider="anthropic",
+            model="claude-3-opus",
+            metadata={"temperature": 0.9},
+        )
+
+        layer.store_response(messages, {"answer": "opus response"}, context_a)
+
+        result = layer.process(messages, context_b)
+        assert result.semantic_cache_hit is False
+
+    def test_embedding_different_model_no_hit_same_context_hit(self):
+        """Semantic embedding lookup is namespace-scoped too."""
+        messages = [{"role": "user", "content": "What is 2+2?"}]
+
+        def deterministic_embedding(text: str) -> list[float]:
+            digest = hashlib.sha256(text.encode()).digest()
+            return [float(b) / 255.0 for b in digest[:4]]
+
+        layer = SemanticCacheLayer(
+            AnthropicCacheOptimizer(),
+            similarity_threshold=0.9,
+            max_entries=100,
+            ttl_seconds=60,
+            embedding_fn=deterministic_embedding,
+        )
+
+        context_a = OptimizationContext(provider="anthropic", model="claude-3-opus")
+        context_b = OptimizationContext(provider="anthropic", model="claude-3-sonnet")
+
+        layer.store_response(messages, {"text": "4"}, context_a)
+
+        # Same context: exact messages_hash hit via the embedding path's store.
+        assert layer.process(messages, context_a).semantic_cache_hit is True
+        # Different model: namespace differs, so no hit even though the query
+        # embedding is identical.
+        assert layer.process(messages, context_b).semantic_cache_hit is False
+
+    def test_request_id_and_timestamp_do_not_affect_matching(self, layer):
+        """request_id and timestamp are not part of the namespace."""
+        messages = [{"role": "user", "content": "Hello!"}]
+        context_a = OptimizationContext(
+            provider="anthropic",
+            model="claude-3-opus",
+            request_id="req-1",
+            timestamp=datetime(2024, 1, 1),
+        )
+        context_b = OptimizationContext(
+            provider="anthropic",
+            model="claude-3-opus",
+            request_id="req-2",
+            timestamp=datetime(2025, 6, 15),
+        )
+
+        layer.store_response(messages, {"text": "hi"}, context_a)
+
+        result = layer.process(messages, context_b)
+        assert result.semantic_cache_hit is True
+        assert result.cached_response == {"text": "hi"}
+
+    def test_unserializable_metadata_store_returns_empty_and_no_hit(self, layer):
+        """Unserializable metadata yields a None namespace: store refuses and
+        lookup skips the cache entirely."""
+        messages = [{"role": "user", "content": "Hello!"}]
+        context = OptimizationContext(
+            provider="anthropic",
+            model="claude-3-opus",
+            metadata={"x": object()},
+        )
+
+        key = layer.store_response(messages, {"text": "hi"}, context)
+        assert key == ""
+
+        result = layer.process(messages, context)
+        assert result.semantic_cache_hit is False
+
+
+class TestSemanticCoverage:
+    def test_process_namespace_none_delegates(self):
+        from headroom.cache import AnthropicCacheOptimizer, OptimizationContext, SemanticCacheLayer
+
+        layer = SemanticCacheLayer(AnthropicCacheOptimizer())
+        messages = [{"role": "user", "content": "hi"}]
+        context = OptimizationContext(provider="anthropic", model="m", metadata={"x": object()})
+        result = layer.process(messages, context)
+        assert result.semantic_cache_hit is False
+
+    def test_invalidate_namespaced_entry(self):
+        from headroom.cache.semantic import SemanticCache, SemanticCacheConfig
+
+        cache = SemanticCache(SemanticCacheConfig())
+        key = cache.put("q", "r", messages_hash="h1", namespace="ns-a")
+        assert cache.get("q", messages_hash="h1", namespace="ns-a") is not None
+        assert cache.invalidate(key) is True
+        assert cache.get("q", messages_hash="h1", namespace="ns-a") is None
+        cache.put("q", "r2", messages_hash="h1", namespace="ns-a")
+        assert cache.get("q", messages_hash="h1", namespace="ns-a").response == "r2"
+
+    def test_evict_oldest_removes_namespaced_index(self):
+        from headroom.cache.semantic import SemanticCache, SemanticCacheConfig
+
+        cache = SemanticCache(SemanticCacheConfig(max_entries=1))
+        cache.put("q1", "r1", messages_hash="h1", namespace="ns-a")
+        cache.put("q2", "r2", messages_hash="h2", namespace="ns-b")
+        assert cache.get("q1", messages_hash="h1", namespace="ns-a") is None
+
+    def test_context_free_store_policy(self):
+        from headroom.cache import AnthropicCacheOptimizer, OptimizationContext, SemanticCacheLayer
+
+        layer = SemanticCacheLayer(AnthropicCacheOptimizer())
+        messages = [{"role": "user", "content": "Hello!"}]
+        layer.store_response(messages, {"text": "hi"})
+        assert layer.process(messages, OptimizationContext()).semantic_cache_hit is True
+        ctx = OptimizationContext(provider="anthropic", model="claude-3-opus")
+        assert layer.process(messages, ctx).semantic_cache_hit is False

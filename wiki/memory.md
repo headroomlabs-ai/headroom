@@ -85,6 +85,14 @@ with `--memory-db-path` for a custom location.
 > memory store should pass `--memory-db-path` explicitly. See the
 > [Filesystem Contract](filesystem-contract.md) for the rationale.
 
+### Traffic Learning Recovery
+
+The live traffic learner retains sightings received while a save is queued or
+running. If SQLite commits but indexing fails, a later attempt reuses the same
+row and adds only the missing observations. The pattern and its save-attempt
+token stay pending if index repair fails again; the learner marks it saved only
+after that repair succeeds.
+
 ### User Identity
 
 User ID is auto-detected from `$USER` (your OS username). Override per-request with the `x-headroom-user-id` header. All memories are scoped to the user — multiple developers on the same project have separate memory stores.
@@ -727,6 +735,40 @@ for m in client.memory.get_all():
 2. Check if memories exist: `client.memory.get_all()`
 3. Try a more specific search query
 4. Check similarity threshold
+
+### DirectMem0 / qdrant-neo4j search returns nothing after a mem0 2.x upgrade
+
+mem0ai 2.x `Memory.search` only returns Qdrant points whose payload includes a `data` field. `DirectMem0Adapter` historically wrote the fact under `memory` only, so those records stay in Qdrant but are invisible to search.
+
+New writes store both `data` (required) and `memory` (legacy alias). To migrate existing points, copy `memory` onto `data` once:
+
+```python
+from qdrant_client import QdrantClient
+
+client = QdrantClient(...)  # same URL/host as Headroom
+collection = "headroom_memories"  # Mem0Config.collection_name
+offset = None
+while True:
+    points, offset = client.scroll(
+        collection_name=collection,
+        with_payload=True,
+        limit=100,
+        offset=offset,
+    )
+    for point in points:
+        payload = point.payload or {}
+        if payload.get("data") or not payload.get("memory"):
+            continue
+        client.set_payload(
+            collection_name=collection,
+            payload={"data": payload["memory"]},
+            points=[point.id],
+        )
+    if offset is None:
+        break
+```
+
+Also confirm search is called with mem0 2.x `filters={"user_id": ...}` and `top_k`, not the removed top-level `user_id` / `limit` kwargs.
 
 ### High latency
 

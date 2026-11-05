@@ -368,7 +368,9 @@ def _tool_name_aliases(name: str) -> tuple[str, ...]:
     aliases = [name]
     lname = name.lower()
 
-    if lname == "headroom_headroom_retrieve":
+    # Clients that prefix MCP tools with the server name: OpenCode joins with a
+    # single underscore, Cline with a double one (<server>__<tool>, #4585).
+    if lname in ("headroom_headroom_retrieve", "headroom__headroom_retrieve"):
         aliases.append("headroom_retrieve")
     elif lname.startswith("mcp__"):
         # OpenAI-style MCP wrappers use mcp__server__tool. Custom agents that
@@ -923,7 +925,9 @@ class PrefixFreezeConfig:
 class HeadroomConfig:
     """Main configuration for HeadroomClient."""
 
-    store_url: str = "sqlite:///headroom.db"
+    # None defers to HeadroomClient: its ``store_url`` argument, else a
+    # headroom.db in the system temp directory.
+    store_url: str | None = None
     default_mode: HeadroomMode = HeadroomMode.AUDIT
     model_context_limits: dict[str, int] = field(
         default_factory=lambda: DEFAULT_MODEL_CONTEXT_LIMITS.copy()
@@ -978,10 +982,12 @@ class HeadroomConfig:
         """
         if model in self.model_context_limits:
             return self.model_context_limits[model]
-        # Try prefix matching for versioned model names
-        for known_model, limit in self.model_context_limits.items():
-            if model.startswith(known_model):
-                return limit
+        # Try prefix matching for versioned model names. The longest prefix
+        # wins, so "gpt-4o-2024-08-06" uses a "gpt-4o" override rather than a
+        # "gpt-4" one that happens to come first in the dict.
+        matches = [known for known in self.model_context_limits if model.startswith(known)]
+        if matches:
+            return self.model_context_limits[max(matches, key=len)]
         return None
 
 
