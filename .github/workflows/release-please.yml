@@ -59,6 +59,16 @@ jobs:
           app-id: ${{ vars.RELEASE_APP_ID }}
           private-key: ${{ secrets.RELEASE_APP_PRIVATE_KEY }}
 
+      # A Windows body edit can introduce CRCRLF. release-please strips one CR,
+      # then cannot find its exact `---` delimiters and silently skips release
+      # creation. Repair only merged, pending release PR envelopes before the
+      # action reads them; do not infer versions or rewrite generated notes.
+      - uses: actions/checkout@v7
+      - name: Normalize pending release PR body line endings
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token || secrets.RELEASE_PLEASE_TOKEN || secrets.GITHUB_TOKEN }}
+        run: python scripts/normalize_release_pr_bodies.py --repo "${{ github.repository }}" --apply
+
       - uses: googleapis/release-please-action@v5
         with:
           # Neither an app token nor a PAT is GITHUB_TOKEN, and that matters: a
