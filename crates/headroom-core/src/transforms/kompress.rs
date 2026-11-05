@@ -612,9 +612,19 @@ fn build_session(path: &Path) -> Result<Session, Box<dyn std::error::Error + Sen
     // Resolve and commit the ONNX Runtime dylib before touching `ort`: with
     // `ort-load-dynamic`, a failed load inside `ort` deadlocks instead of
     // erroring (see `dynamic_ort_loader_ready`).
-    crate::transforms::magika_detector::dynamic_ort_loader_ready()?;
+    onnx_runtime_ready()?;
     let session = Session::builder()?.commit_from_file(path)?;
     Ok(session)
+}
+
+/// Whether an ONNX Runtime library can be loaded for Kompress sessions:
+/// `ORT_DYLIB_PATH`, or the pip `onnxruntime` found through `VIRTUAL_ENV`,
+/// `CONDA_PREFIX` or `./.venv`. Resolved and committed once per process;
+/// `Err` carries the reason. For harnesses that should skip, not fail, on a
+/// machine without ONNX Runtime; every `Kompress` constructor already checks
+/// it before building a session.
+pub fn onnx_runtime_ready() -> Result<(), String> {
+    crate::transforms::magika_detector::dynamic_ort_loader_ready()
 }
 
 /// The tokenizer and the ONNX artifact `onnx` (e.g.

@@ -10,6 +10,11 @@
 //! mirroring the parity harness's "stub → Skipped" tolerance. Run it
 //! locally after `python scripts/record_kompress_trace.py` to get the
 //! real assertion.
+//!
+//! Runtime-gated too: with the model cached but no ONNX Runtime library to
+//! run it (`ORT_DYLIB_PATH` unset and no pip `onnxruntime` under
+//! `VIRTUAL_ENV`, `CONDA_PREFIX` or `./.venv`), it also SKIPS, the way
+//! `magika_idle_threads` skips without an ONNX Runtime.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -23,17 +28,27 @@ fn cached_artifacts() -> Option<(PathBuf, PathBuf)> {
     kompress::cached_artifacts(&KompressConfig::default(), "onnx/kompress-int8-wo.onnx")
 }
 
+/// [`cached_artifacts`], or `None` (with the reason on stderr) when the
+/// model isn't cached or no ONNX Runtime can be loaded to run it.
+fn loadable_artifacts() -> Option<(PathBuf, PathBuf)> {
+    let Some(paths) = cached_artifacts() else {
+        eprintln!(
+            "SKIP: kompress model/tokenizer not in HF cache; \
+             run `python scripts/record_kompress_trace.py` first"
+        );
+        return None;
+    };
+    if let Err(reason) = kompress::onnx_runtime_ready() {
+        eprintln!("SKIP: no ONNX Runtime to run kompress: {reason}");
+        return None;
+    }
+    Some(paths)
+}
+
 #[test]
 fn kompress_matches_python_fixtures_byte_for_byte() {
-    let (tok, onnx) = match cached_artifacts() {
-        Some(paths) => paths,
-        None => {
-            eprintln!(
-                "SKIP: kompress model/tokenizer not in HF cache; \
-                 run `python scripts/record_kompress_trace.py` first"
-            );
-            return;
-        }
+    let Some((tok, onnx)) = loadable_artifacts() else {
+        return;
     };
 
     let fixtures_dir =
@@ -94,9 +109,8 @@ fn kompress_matches_python_fixtures_byte_for_byte() {
 fn short_input_passes_through() {
     // Pure-logic check — no model needed. Fewer than MIN_WORDS words must
     // pass through unchanged regardless of model availability... but the
-    // engine needs a model to construct. Guard on cache like the main test.
-    let Some((tok, onnx)) = cached_artifacts() else {
-        eprintln!("SKIP: model not cached");
+    // engine needs a model to construct. Guard like the main test.
+    let Some((tok, onnx)) = loadable_artifacts() else {
         return;
     };
     let kompress = Kompress::from_files(&tok, &onnx, KompressConfig::default()).unwrap();
