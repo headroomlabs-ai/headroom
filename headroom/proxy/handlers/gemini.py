@@ -22,10 +22,12 @@ from headroom.agent_savings import proxy_pipeline_kwargs
 from headroom.copilot_auth import build_copilot_upstream_url
 from headroom.proxy.auth_mode import classify_client
 from headroom.proxy.compression_decision import CompressionDecision
+from headroom.proxy.handlers._failure_logging import log_request_failure
 from headroom.proxy.helpers import (
     COMPRESSION_TIMEOUT_SECONDS,
     extract_tags,
     invalid_request_body_message,
+    sanitize_forwarded_response_headers,
 )
 from headroom.proxy.identity import resolve_memory_identity
 from headroom.proxy.outcome import RequestOutcome
@@ -61,11 +63,6 @@ class GeminiHandlerMixin:
         from headroom.proxy.token_counting import count_tokens_offloaded
 
         return await count_tokens_offloaded(self, model, messages)
-
-    async def _count_texts_offloaded(self, model, texts):  # noqa: ANN001, ANN201
-        from headroom.proxy.token_counting import count_texts_offloaded
-
-        return await count_texts_offloaded(self, model, texts)
 
     def _gemini_replay_forwarded_prefix(
         self,
@@ -160,6 +157,10 @@ class GeminiHandlerMixin:
         - thought / thoughtSignature: thinking parts, which must round-trip intact
         - non-string text, which the text round trip cannot rebuild
 
+        The REST API accepts both the camelCase JSON names and the snake_case
+        proto field names (``inline_data``, ``function_call``, ...), so both
+        spellings are checked.
+
         Args:
             content: A single Gemini content entry with 'parts' list.
 
@@ -178,6 +179,13 @@ class GeminiHandlerMixin:
                     "codeExecutionResult",
                     "thought",
                     "thoughtSignature",
+                    "inline_data",
+                    "file_data",
+                    "function_call",
+                    "function_response",
+                    "executable_code",
+                    "code_execution_result",
+                    "thought_signature",
                 )
             ):
                 return True
@@ -273,9 +281,10 @@ class GeminiHandlerMixin:
 
             if include_function_responses:
                 for part in parts:
-                    if "functionResponse" not in part:
+                    function_response = part.get("functionResponse", part.get("function_response"))
+                    if function_response is None:
                         continue
-                    payload = self._function_response_text(part["functionResponse"])
+                    payload = self._function_response_text(function_response)
                     if payload:
                         messages.append({"role": "tool", "content": payload})
 
@@ -565,6 +574,8 @@ class GeminiHandlerMixin:
                         status_code=response.status_code,
                         original_tokens=total_input_tokens,
                         optimized_tokens=total_input_tokens,
+                        # Gemini's own promptTokenCount (inclusive of cached content).
+                        provider_input_tokens=total_input_tokens,
                         output_tokens=output_tokens,
                         tokens_saved=0,
                         attempted_input_tokens=total_input_tokens,
@@ -576,9 +587,7 @@ class GeminiHandlerMixin:
                         client=client,
                     )
                 )
-                response_headers = dict(response.headers)
-                response_headers.pop("content-encoding", None)
-                response_headers.pop("content-length", None)
+                response_headers = sanitize_forwarded_response_headers(response.headers)
                 response_headers["x-headroom-tokens-before"] = str(total_input_tokens)
                 response_headers["x-headroom-tokens-after"] = str(total_input_tokens)
                 response_headers["x-headroom-tokens-saved"] = "0"
@@ -872,6 +881,9 @@ class GeminiHandlerMixin:
                 total_latency = (time.time() - start_time) * 1000
 
                 total_input_tokens = optimized_tokens  # fallback
+                # Gemini's own promptTokenCount, only when it reported one; the
+                # fallback above is Headroom's estimate and must not pass as billed.
+                provider_prompt_tokens = 0
                 output_tokens = 0
                 cache_read_tokens = 0
                 resp_json = None
@@ -890,6 +902,8 @@ class GeminiHandlerMixin:
                         if usage.get("promptTokenCount") is None
                         else usage["promptTokenCount"]
                     )
+                    if usage.get("promptTokenCount") is not None:
+                        provider_prompt_tokens = total_input_tokens
                     output_tokens = gemini_output_tokens(
                         usage
                     )  # includes thinking tokens (2.5-family)
@@ -988,6 +1002,8 @@ class GeminiHandlerMixin:
                     total_input_tokens = _usage_int(
                         usage.get("promptTokenCount"), total_input_tokens
                     )
+                    if usage.get("promptTokenCount") is not None:
+                        provider_prompt_tokens = total_input_tokens
                     output_tokens = _usage_int(usage.get("candidatesTokenCount"), output_tokens)
                     cache_read_tokens = _usage_int(
                         usage.get("cachedContentTokenCount"), cache_read_tokens
@@ -1048,6 +1064,8 @@ class GeminiHandlerMixin:
                     status_code=response.status_code,
                     original_tokens=effective_original_tokens,
                     optimized_tokens=total_input_tokens,
+                    # Gemini's own promptTokenCount (inclusive of cached content).
+                    provider_input_tokens=provider_prompt_tokens,
                     output_tokens=output_tokens,
                     tokens_saved=tokens_saved,
                     attempted_input_tokens=total_input_tokens + tokens_saved,
@@ -1071,12 +1089,9 @@ class GeminiHandlerMixin:
                 else:
                     logger.info(f"[{request_id}] Gemini {model}: {original_tokens:,} tokens")
 
-                # Remove compression headers
-                response_headers = dict(response.headers)
-                response_headers.pop("content-encoding", None)
-                response_headers.pop("content-length", None)
-
-                # Inject Headroom compression metrics (for SaaS metering)
+                # Remove transport framing headers (the body is re-framed here)
+                # and inject Headroom compression metrics (for SaaS metering).
+                response_headers = sanitize_forwarded_response_headers(response.headers)
                 response_headers["x-headroom-tokens-before"] = str(original_tokens)
                 response_headers["x-headroom-tokens-after"] = str(optimized_tokens)
                 response_headers["x-headroom-tokens-saved"] = str(tokens_saved)
@@ -1099,13 +1114,13 @@ class GeminiHandlerMixin:
                 )
         except _GeminiContinuationError as e:
             await self.metrics.record_failed(provider=provider_name)
-            response_headers = dict(e.headers)
-            response_headers.pop("content-encoding", None)
-            response_headers.pop("content-length", None)
+            response_headers = sanitize_forwarded_response_headers(e.headers)
             return Response(content=e.content, status_code=e.status_code, headers=response_headers)
         except Exception as e:
             await self.metrics.record_failed(provider=provider_name)
-            logger.error(f"[{request_id}] Gemini request failed: {type(e).__name__}: {e}")
+            log_request_failure(
+                request_id, "Gemini request", e, provider=provider_name, model=model
+            )
             return JSONResponse(
                 status_code=502,
                 content={
@@ -1413,9 +1428,7 @@ class GeminiHandlerMixin:
                 url += f"?key={query_params['key']}"
 
             response = await self._retry_request("POST", url, headers, body)
-            response_headers = dict(response.headers)
-            response_headers.pop("content-encoding", None)
-            response_headers.pop("content-length", None)
+            response_headers = sanitize_forwarded_response_headers(response.headers)
             return Response(
                 content=response.content,
                 status_code=response.status_code,
@@ -1530,28 +1543,29 @@ class GeminiHandlerMixin:
                 max(0, original_tokens - compressed_tokens) if compressed_tokens > 0 else 0
             )
 
-            # Fallback denominator (see comment on the main gemini
-            # record_request site) — pre-comp request size.
-            # countTokens is a sizing helper; it never generates output
-            # tokens and never touches cache. The funnel handles the
-            # "nothing to report" shape with all-zero cache defaults.
-            await self._record_request_outcome(
-                RequestOutcome(
-                    request_id=request_id,
-                    provider=provider_name,
-                    model=model,
-                    status_code=response.status_code,
-                    original_tokens=original_tokens,
-                    optimized_tokens=compressed_tokens,
-                    output_tokens=0,
-                    tokens_saved=tokens_saved,
-                    attempted_input_tokens=compressed_tokens + tokens_saved,
-                    total_latency_ms=total_latency,
-                    transforms_applied=tuple(transforms_applied),
-                    tags=tags,
-                    client=client,
+            # countTokens is a sizing helper: the provider generates and bills
+            # nothing for it, so a successful call is logged below but never
+            # booked as a request or as savings. An upstream rejection (429,
+            # 5xx) still goes through the funnel, which records it under the
+            # rate-limit / failure counters and stops before any success stats.
+            if response.status_code >= 400:
+                await self._record_request_outcome(
+                    RequestOutcome(
+                        request_id=request_id,
+                        provider=provider_name,
+                        model=model,
+                        status_code=response.status_code,
+                        original_tokens=original_tokens,
+                        optimized_tokens=compressed_tokens,
+                        output_tokens=0,
+                        tokens_saved=tokens_saved,
+                        attempted_input_tokens=compressed_tokens + tokens_saved,
+                        total_latency_ms=total_latency,
+                        transforms_applied=tuple(transforms_applied),
+                        tags=tags,
+                        client=client,
+                    )
                 )
-            )
 
             if tokens_saved > 0:
                 logger.info(
@@ -1563,10 +1577,8 @@ class GeminiHandlerMixin:
                     f"[{request_id}] Gemini countTokens {model}: {compressed_tokens:,} tokens"
                 )
 
-            # Remove compression headers
-            response_headers = dict(response.headers)
-            response_headers.pop("content-encoding", None)
-            response_headers.pop("content-length", None)
+            # Remove transport framing headers (the body is re-framed here).
+            response_headers = sanitize_forwarded_response_headers(response.headers)
 
             return Response(
                 content=response.content,
@@ -1575,7 +1587,9 @@ class GeminiHandlerMixin:
             )
         except Exception as e:
             await self.metrics.record_failed(provider=provider_name)
-            logger.error(f"[{request_id}] Gemini countTokens failed: {type(e).__name__}: {e}")
+            log_request_failure(
+                request_id, "Gemini countTokens", e, provider=provider_name, model=model
+            )
             return JSONResponse(
                 status_code=502,
                 content={

@@ -1,8 +1,11 @@
 """Proxy server CLI commands."""
 
+import errno
+import ipaddress
 import logging
 import os
 import platform
+import socket
 import sys
 import warnings
 from importlib.util import find_spec
@@ -195,14 +198,97 @@ def _get_env_int(name: str, default: int) -> int:
     return default if value is None else value
 
 
-def _get_env_float_optional(name: str) -> float | None:
-    val = os.environ.get(name)
-    if val is None or val == "":
+def _tcp_port_in_use(host: str, port: int, *, workers: int) -> tuple[OSError, Any] | None:
+    """Return ``(EADDRINUSE error, busy address)`` uvicorn would hit binding ``host:port``.
+
+    Returns None when the bind would succeed.
+
+    Mirrors uvicorn's own bind so the probe never refuses a bind uvicorn would
+    accept: ``SO_REUSEADDR`` (both uvicorn paths set it on POSIX, so a port in
+    TIME_WAIT after a restart is not "in use"); a single process binds every
+    address ``host`` resolves to (asyncio ``create_server``), while
+    ``--workers > 1`` binds one AF_INET/AF_INET6 socket in the parent.
+    Windows ``SO_REUSEADDR`` semantics differ, so Windows is left to uvicorn,
+    as is any error other than EADDRINUSE (unresolvable host, address not on
+    this machine); uvicorn reports those as before.
+    """
+    if sys.platform == "win32":
+        return None
+    if workers > 1:
+        family = socket.AF_INET6 if ":" in host else socket.AF_INET
+        targets: list[tuple[Any, Any]] = [(family, (host, port))]
+    else:
+        try:
+            infos = socket.getaddrinfo(
+                host or None, port, type=socket.SOCK_STREAM, flags=socket.AI_PASSIVE
+            )
+        except (OSError, UnicodeError):
+            return None
+        targets = [(info[0], info[4]) for info in infos]
+    for family, address in targets:
+        try:
+            with socket.socket(family, socket.SOCK_STREAM) as probe:
+                probe.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                if family == socket.AF_INET6 and workers <= 1:
+                    # asyncio binds v4 and v6 separately; match it.
+                    probe.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 1)
+                probe.bind(address)
+        except OSError as exc:
+            if exc.errno == errno.EADDRINUSE:
+                return exc, address
+    return None
+
+
+_WILDCARD_PROBE_HOSTS = {"": "127.0.0.1", "0.0.0.0": "127.0.0.1", "::": "::1"}
+
+
+def _probe_host_for(address: Any) -> str | None:
+    """The numeric address to ask "is this Headroom?", or None when it can't be targeted.
+
+    A wildcard bind is reached through loopback of the same family. A
+    hostname (the ``--workers > 1`` path binds it unresolved) is resolved for
+    IPv4. A scoped IPv6 address cannot go in a probe URL.
+    """
+    host = str(address[0])
+    if host in _WILDCARD_PROBE_HOSTS:
+        return _WILDCARD_PROBE_HOSTS[host]
+    if "%" in host:
         return None
     try:
-        return float(val)
+        ipaddress.ip_address(host)
     except ValueError:
-        raise click.ClickException(f"{name} must be a number, got {val!r}") from None
+        try:
+            infos = socket.getaddrinfo(host, None, socket.AF_INET, socket.SOCK_STREAM)
+        except (OSError, UnicodeError):
+            return None
+        return str(infos[0][4][0]) if infos else None
+    return host
+
+
+def _refuse_busy_port(host: str, port: int, *, workers: int) -> None:
+    """Fail before the banner when ``host:port`` is already taken.
+
+    Without this the banner prints "Press Ctrl+C to stop", then uvicorn's bind
+    error is buried among startup and shutdown log lines.
+    """
+    busy = _tcp_port_in_use(host, port, workers=workers)
+    if busy is None:
+        return
+    error, address = busy
+    from headroom.cli.port_discovery import probe_headroom_proxy
+
+    reason = error.strerror or str(error)
+    probe_host = _probe_host_for(address)
+    if probe_host is None:
+        holder = f"({reason})"
+    elif probe_headroom_proxy(port, host=probe_host):
+        holder = "by a running Headroom proxy (reuse it, or stop it first)"
+    else:
+        holder = f"by another process ({reason})"
+    raise click.ClickException(
+        f"Port {port} on {host} is already in use {holder}. "
+        "Start this proxy on another port with --port N (env: HEADROOM_PORT)."
+    )
 
 
 @main.command()
@@ -440,6 +526,17 @@ def dashboard(port: int, no_open: bool) -> None:
         "LiteLLM guardrail/proxy hop, see issue #2509). Applies to non-streaming "
         "responses only. Off by default. "
         "Env: HEADROOM_CCR_INLINE_RESOLVE."
+    ),
+)
+@click.option(
+    "--ccr-buffered-chat-streaming",
+    is_flag=True,
+    envvar="HEADROOM_CCR_BUFFERED_CHAT_STREAMING",
+    help=(
+        "Answer headroom_retrieve on streaming /v1/chat/completions. A turn that "
+        "carries a redeemable marker runs as stream:false upstream and is "
+        "re-emitted as chat.completion.chunk frames, so that turn's text arrives "
+        "all at once. Off by default. Env: HEADROOM_CCR_BUFFERED_CHAT_STREAMING."
     ),
 )
 @click.option(
@@ -714,7 +811,8 @@ def dashboard(port: int, no_open: bool) -> None:
     help=(
         "Enable/disable AST-based code compression. Requires the optional "
         "tree-sitter dependency: pip install headroom-ai[code]. "
-        "Default: disabled. Env: HEADROOM_CODE_AWARE_ENABLED=1 to enable."
+        "Default: enabled. Disable with --no-code-aware or "
+        "HEADROOM_CODE_AWARE_ENABLED=0."
     ),
 )
 @click.option(
@@ -1026,7 +1124,7 @@ def dashboard(port: int, no_open: bool) -> None:
 @click.option(
     "--no-telemetry",
     is_flag=True,
-    help="Force anonymous usage telemetry off (already the default; env: HEADROOM_TELEMETRY=off)",
+    help="Turn off local stats and the anonymous upload beacon (env: HEADROOM_TELEMETRY=off)",
 )
 @click.option(
     "--stateless",
@@ -1091,6 +1189,7 @@ def proxy(
     no_ccr: bool,
     lossless: bool,
     ccr_inline_resolve: bool,
+    ccr_buffered_chat_streaming: bool,
     no_ccr_proactive_expansion: bool,
     proxy_extension: tuple[str, ...],
     compressor: tuple[str, ...],
@@ -1431,6 +1530,7 @@ def proxy(
         ccr_inject_marker=not no_ccr,
         ccr_handle_responses=not no_ccr,
         ccr_resolve_markers_inline=ccr_inline_resolve,
+        ccr_buffered_chat_streaming=ccr_buffered_chat_streaming,
         lossless=lossless,
         ccr_proactive_expansion=not no_ccr_proactive_expansion,
         # Flatten repeat-flag tuple AND any comma-separated values inside it.
@@ -1483,10 +1583,9 @@ def proxy(
         # Code-aware compression resolution:
         # 1. Explicit --code-aware / --no-code-aware always wins.
         # 2. Otherwise read HEADROOM_CODE_AWARE_ENABLED (truthy = on).
-        # 3. Otherwise default off — matches the prior cli/proxy.py behavior so
-        #    existing users see no change unless they opt in.
-        # Default ON (coding posture; consistent with the argparse server path).
-        # Degrades gracefully to a no-op when tree-sitter isn't installed.
+        # 3. Otherwise default ON (coding posture; consistent with the argparse
+        #    server path). Degrades gracefully to a no-op when tree-sitter
+        #    isn't installed.
         code_aware_enabled=(
             bool(code_aware_flag)
             if code_aware_flag is not None
@@ -1695,6 +1794,8 @@ Memory (Multi-Provider):
     _bind = evaluate_bind_policy(config.host, config.proxy_token)
     if _bind.refused:
         raise click.ClickException(_bind.message())
+    if not config.uds:
+        _refuse_busy_port(config.host, config.port, workers=workers)
     _auth_on = _bind.token_configured
     _open_bind_note = (
         f" · WARNING open bind, /v1/* UNAUTHENTICATED (acknowledged via {OPEN_BIND_ACK_ENV}=1)"
