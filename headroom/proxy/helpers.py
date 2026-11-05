@@ -1085,10 +1085,24 @@ def _system_message_to_blocks(message: dict[str, Any]) -> list[Any]:
     return []
 
 
+def is_third_party_model(model: str | None, *, third_party_upstream: bool) -> bool:
+    """Whether a request is for a non-Claude model on an upstream Headroom does not own.
+
+    Headroom has no wire contract for such a model (a vLLM or GLM endpoint
+    speaking the Anthropic Messages format), and the client already sends its
+    mid-conversation system sections there directly. A Claude-named model
+    behind a gateway may still reach a provider without that feature, so it is
+    not one.
+    """
+    return third_party_upstream and "claude" not in str(model or "").lower()
+
+
 def relocate_system_messages_to_top_level(
     messages: list[dict[str, Any]],
     system: Any,
     model: str | None = None,
+    *,
+    third_party_model: bool = False,
 ) -> tuple[list[dict[str, Any]], Any, bool]:
     """Relocate only system messages invalid for the selected Anthropic model.
 
@@ -1097,6 +1111,12 @@ def relocate_system_messages_to_top_level(
     placed at the end. Hoisting those changes semantics and invalidates the
     cached prefix. The initial/invalid forms are still moved to the top-level
     field as the issue-765 last-line wire-contract guard.
+
+    ``third_party_model`` (see :func:`is_third_party_model`) treats the model as
+    supported: the client's sections stay where it put them. Hoisting them
+    there would append to the top-level ``system`` whenever a turn adds a
+    section, so the upstream's prefix cache would miss the whole conversation
+    on every such turn.
 
     The relocated content is appended after any existing top-level ``system``
     so wire order (system prompt, then conversation) is preserved. Only
@@ -1111,7 +1131,7 @@ def relocate_system_messages_to_top_level(
     the common path is untouched.
     """
     model_id = str(model or "").lower()
-    supports_mid_conversation = any(
+    supports_mid_conversation = third_party_model or any(
         family in model_id
         for family in (
             "claude-fable-5",
@@ -1307,8 +1327,11 @@ def append_text_to_latest_user_input_item(
     return body_input, 0
 
 
-# Maximum request body size (100MB - increased to support image-heavy requests)
-MAX_REQUEST_BODY_SIZE = 100 * 1024 * 1024
+# Bound the entire history before JSON parsing or compression. Larger image-heavy
+# bodies can amplify far beyond their wire size during preprocessing (#4139).
+MAX_REQUEST_BODY_SIZE = request_limit_policy.resolve_request_body_max_bytes(
+    os.environ.get(request_limit_policy.REQUEST_BODY_MAX_BYTES_ENV)
+)
 
 # A *decompressed* body obeys the same ceiling as an uncompressed one. The
 # Content-Length gate at the handlers only ever saw the compressed wire size, so
@@ -3486,6 +3509,11 @@ async def read_request_json_with_bytes(request: Request) -> tuple[dict[str, Any]
         raise RequestBodyNotObject(
             "Request body must be a JSON object, not " + type(result).__name__
         )
+
+    # Large histories are routed from their envelope only. Leave their content
+    # untouched for the soft-limit passthrough, before any normalization/copies.
+    if len(raw) > request_limit_policy.COMPRESSION_BODY_MAX_BYTES:
+        return result, raw
 
     # Drop output-only blocks (see ``strip_output_only_request_blocks``) before
     # any downstream deepcopy / compression / 400-retry path. This is the shared

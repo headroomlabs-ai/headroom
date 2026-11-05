@@ -242,6 +242,8 @@ class AnyLLMBackend(Backend):
 
         kwargs: dict[str, Any] = {"model": original_model, "messages": messages}
 
+        if "service_tier" in body:
+            kwargs["service_tier"] = body["service_tier"]
         if "max_tokens" in body:
             kwargs["max_tokens"] = body["max_tokens"]
         if "temperature" in body:
@@ -489,6 +491,7 @@ class AnyLLMBackend(Backend):
                 "response_format",
                 "seed",
                 "n",
+                "service_tier",
             ]:
                 if param in body:
                     kwargs[param] = body[param]
@@ -610,6 +613,7 @@ class AnyLLMBackend(Backend):
                 "response_format",
                 "seed",
                 "n",
+                "service_tier",
             ]:
                 if param in body:
                     kwargs[param] = body[param]

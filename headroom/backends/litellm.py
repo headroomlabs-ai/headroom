@@ -47,6 +47,7 @@ _OPENAI_STANDARD_PARAMS = (
     # reasoning request routed cross-protocol to a Claude model fails.
     "reasoning_effort",
     "max_completion_tokens",
+    "service_tier",
 )
 
 _OPENAI_CONSUMED_BODY_KEYS = frozenset(
@@ -1271,6 +1272,8 @@ class LiteLLMBackend(Backend):
         }
 
         # Optional parameters
+        if "service_tier" in body:
+            kwargs["service_tier"] = body["service_tier"]
         if "max_tokens" in body:
             kwargs["max_tokens"] = body["max_tokens"]
         if "temperature" in body:
