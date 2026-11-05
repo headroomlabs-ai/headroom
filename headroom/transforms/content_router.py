@@ -1350,8 +1350,12 @@ def _detect_content(content: str) -> DetectionResult:
     from headroom._ort import rust_ort_runtime_compatible
 
     if not rust_ort_runtime_compatible():
+        # Expected on every install without the proxy extra's ONNX Runtime
+        # (plain ``pip install headroom-ai``): the pure-Python detector is the
+        # supported path there, so this is information, not a warning. The
+        # circuit breaker above makes it fire once per process.
         _detect_native_unhealthy = True
-        logger.warning(
+        logger.info(
             "Native content detection requires ONNX Runtime 1.24+; "
             "using pure-Python detection for this process."
         )
@@ -5189,6 +5193,13 @@ class ContentRouter(Transform):
                 self._kompress_max_tokens,
                 self._kompress_gate_fires,
             )
+            if protected:
+                # The fallback compressors take no ``ccr_original`` and would
+                # store the ``{{HEADROOM_TAG_N}}`` placeholder text in CCR; any
+                # placeholder line they drop is also discarded by
+                # ``restore_tags``, losing the tagged block outright. Pass the
+                # original through unchanged instead (as the budget branch above).
+                return content, _estimate_tokens(content)
             out = text_to_compress
             crusher = self._get_text_crusher()
             if crusher is not None:
@@ -5209,8 +5220,6 @@ class ContentRouter(Transform):
                             "Kompress size-gate -> LogCompressor failed (%s); passing through", e
                         )
                         out = text_to_compress
-            if protected:
-                out = restore_tags(out, protected)
             return out, _estimate_tokens(out)
 
         # Reached only when the gate is enabled and this eligible block is
@@ -8109,11 +8118,14 @@ class ContentRouter(Transform):
                             route_counts["already_compressed"] += 1
                         continue
 
-                    # Two-tier compression cache → shared helper
+                    # Two-tier compression cache → shared helper. Tool output is
+                    # gated (#1307), so it keys into the gated namespace like the
+                    # string path: an ungated entry for the same bytes must not
+                    # answer this lookup before the gate runs (#4477).
                     compressed_content, was_compressed = self._compress_block_content(
                         content=tool_text,
                         content_key=self._content_cache_key(
-                            tool_text, bias=bias, context=block_context
+                            tool_text, bias=bias, context=block_context, gated=True
                         ),
                         context=block_context,
                         bias=bias,
@@ -8204,11 +8216,15 @@ class ContentRouter(Transform):
                             route_counts["already_compressed"] += 1
                         continue
 
-                    # Two-tier compression cache → shared helper
+                    # Two-tier compression cache → shared helper. A role:"tool" /
+                    # "function" message in block-list form is tool output, the
+                    # same ground truth as its string form, so it gets the same
+                    # #1307 gate and the gated cache namespace (#4477).
+                    enforce_reversibility = role in ("tool", "function")
                     compressed_content, _was_compressed = self._compress_block_content(
                         content=text_content,
                         content_key=self._content_cache_key(
-                            text_content, bias=1.0, context=context
+                            text_content, bias=1.0, context=context, gated=enforce_reversibility
                         ),
                         context=context,
                         bias=1.0,
@@ -8219,6 +8235,7 @@ class ContentRouter(Transform):
                         compressed_details=compressed_details,
                         strategy_label="text_block",
                         details_prefix="text",
+                        enforce_reversibility=enforce_reversibility,
                     )
                     if compressed_content is not None:
                         new_blocks.append({**block, "text": compressed_content})
@@ -8398,8 +8415,9 @@ class ContentRouter(Transform):
             # (kompress/text/code/html) that emitted no CCR retrieve marker is
             # unrecoverable, so the agent would act on a fabricated summary
             # (#1307). The string/`role=="tool"` path guards this; mirror it
-            # here for tool_result blocks (never cached, so the Tier-2 path
-            # above can't serve a poisoned entry).
+            # here for tool output in block form. Callers that enforce the gate
+            # key with ``gated=True``, so the Tier-2 path above never serves
+            # them an ungated entry for the same bytes.
             #
             # EXCEPTION: no-CCR mode (config.ccr_inject_marker=False). Here the
             # operator has *deliberately* disabled retrieval markers — recovery

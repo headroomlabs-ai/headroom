@@ -57,7 +57,8 @@ def _parse_frame(frame: bytes) -> tuple[str | None, dict[str, Any] | None]:
     """Return ``(event_name, payload)`` for one complete SSE frame."""
     event_name: str | None = None
     data_lines: list[str] = []
-    for line in frame.decode("utf-8").splitlines():
+    for raw_line in frame.splitlines():
+        line = raw_line.decode("utf-8")
         if line.startswith(SSE_EVENT_LINE_PREFIX):
             event_name = line[len(SSE_EVENT_LINE_PREFIX) :].strip()
         elif line.startswith(SSE_DATA_LINE_PREFIX):
@@ -90,6 +91,12 @@ class MemoryToolStreamFilter:
             extend the message the client already opened.
         max_retained_bytes: Limit on the bytes held back at any time;
             ``DEFAULT_MAX_RETAINED_BYTES`` when None.
+        hold_tool_use: Hold every block from the round's first ``tool_use``
+            on, until the caller decides with ``release_held``. A withheld
+            ``headroom_retrieve`` alongside a client tool is served by
+            dropping the client call for the model to re-issue, which is
+            only possible while that call has not reached the client.
+            Text before the first tool call still streams live.
     """
 
     def __init__(
@@ -99,8 +106,17 @@ class MemoryToolStreamFilter:
         index_offset: int = 0,
         forward_message_start: bool = True,
         max_retained_bytes: int | None = None,
+        hold_tool_use: bool = False,
     ) -> None:
         self._tool_names = frozenset(tool_names)
+        self._hold_tool_use = hold_tool_use
+        self._holding = False
+        # Frames held from the first tool_use on, with their upstream index;
+        # client indices are assigned when they are released.
+        self._held: list[tuple[str, dict[str, Any], bytes, int]] = []
+        self._held_bytes = 0
+        # Upstream indices of held client tool_use blocks.
+        self._held_tool_use: set[int] = set()
         self._max_retained_bytes = (
             DEFAULT_MAX_RETAINED_BYTES if max_retained_bytes is None else max_retained_bytes
         )
@@ -129,6 +145,39 @@ class MemoryToolStreamFilter:
     @property
     def hidden_tool_names(self) -> list[str]:
         return [block["name"] for block, _ in self._hidden.values()]
+
+    @property
+    def holds_client_tool_use(self) -> bool:
+        """A client ``tool_use`` block is held and has not reached the client."""
+        return bool(self._held_tool_use)
+
+    def release_held(self, *, drop_tool_use: bool = False) -> list[bytes]:
+        """Return the held frames, re-indexed, for the client.
+
+        ``drop_tool_use`` leaves out the held client ``tool_use`` blocks: the
+        round goes back to the model with the proxy's results instead, and
+        the model re-issues whatever it still needs.
+        """
+        frames: list[bytes] = []
+        dropped = self._held_tool_use if drop_tool_use else set()
+        for event_name, payload, frame, upstream_index in self._held:
+            if upstream_index in dropped:
+                continue
+            if event_name == "content_block_start":
+                block = payload.get("content_block")
+                if isinstance(block, dict) and block.get("type") == "tool_use":
+                    self.visible_tool_use = True
+                self._index_map[upstream_index] = self.next_index
+                self.next_index += 1
+            client_index = self._index_map.get(upstream_index, upstream_index)
+            if client_index == upstream_index:
+                frames.append(frame)
+            else:
+                frames.append(_render_frame(event_name, {**payload, "index": client_index}))
+        self._held.clear()
+        self._held_bytes = 0
+        self._held_tool_use.clear()
+        return frames
 
     def hidden_calls(self) -> list[dict[str, Any]]:
         """The withheld ``tool_use`` blocks that finished with a complete input.
@@ -181,7 +230,12 @@ class MemoryToolStreamFilter:
             forwarded = self._route(frame)
             if forwarded is not None:
                 out.append(forwarded)
-        retained = len(self._buffer) + self._tail_bytes + sum(self._hidden_bytes.values())
+        retained = (
+            len(self._buffer)
+            + self._tail_bytes
+            + self._held_bytes
+            + sum(self._hidden_bytes.values())
+        )
         if retained > self._max_retained_bytes:
             self._buffer.clear()
             self._hidden.clear()
@@ -189,6 +243,9 @@ class MemoryToolStreamFilter:
             self._hidden_stopped.clear()
             self._tail.clear()
             self._tail_bytes = 0
+            self._held.clear()
+            self._held_bytes = 0
+            self._held_tool_use.clear()
             raise MemoryToolStreamOverflowError(
                 f"memory tool stream filter would retain {retained} bytes "
                 f"(limit {self._max_retained_bytes})"
@@ -232,11 +289,18 @@ class MemoryToolStreamFilter:
                 self._hidden[upstream_index] = (block, [])
                 self._hidden_bytes[upstream_index] = len(frame)
                 self._hidden_stopped.discard(upstream_index)
+                self._holding = self._hold_tool_use
                 return None
-            if isinstance(block, dict) and block.get("type") == "tool_use":
-                self.visible_tool_use = True
-            self._index_map[upstream_index] = self.next_index
-            self.next_index += 1
+            is_tool_use = isinstance(block, dict) and block.get("type") == "tool_use"
+            if self._hold_tool_use and (self._holding or is_tool_use):
+                self._holding = True
+                if is_tool_use:
+                    self._held_tool_use.add(upstream_index)
+            else:
+                if is_tool_use:
+                    self.visible_tool_use = True
+                self._index_map[upstream_index] = self.next_index
+                self.next_index += 1
 
         if upstream_index in self._hidden:
             delta = payload.get("delta")
@@ -252,17 +316,26 @@ class MemoryToolStreamFilter:
             elif event_name == "content_block_stop":
                 self._hidden_stopped.add(upstream_index)
             return None
+        if self._holding and upstream_index not in self._index_map:
+            self._held.append((event_name, payload, frame, upstream_index))
+            self._held_bytes += len(frame)
+            return None
         client_index = self._index_map.get(upstream_index, upstream_index)
         if client_index == upstream_index:
             return frame
         return _render_frame(event_name, {**payload, "index": client_index})
 
     def closing_frames(self, *, prior_usage: dict[str, int] | None = None) -> list[bytes]:
-        """End the client message after this round without a continuation."""
+        """End the client message after this round without a continuation.
+
+        Held frames are released first, client tool calls included: with no
+        continuation, the round is the model's answer as it stands.
+        """
+        held = self.release_held()
         ends_on_hidden_call = (
             self.hid_tool_calls and not self.visible_tool_use and self.stop_reason == "tool_use"
         )
-        return self.tail_frames(
+        return held + self.tail_frames(
             stop_reason="end_turn" if ends_on_hidden_call else None,
             prior_usage=prior_usage,
         )

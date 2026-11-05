@@ -1,7 +1,8 @@
 """Session aggregation for the anonymous telemetry beacon.
 
 One wide event per session, emitted when the session goes idle. Everything here
-is off unless ``HEADROOM_TELEMETRY`` is explicitly on — see
+is on by default and off when the beacon is disabled (``HEADROOM_BEACON=off``,
+``HEADROOM_TELEMETRY=off``, ``DO_NOT_TRACK=1`` or offline mode) — see
 :mod:`headroom.telemetry.beacon`.
 
 # What counts as a session
@@ -119,6 +120,7 @@ from pathlib import Path
 from typing import Any
 
 from headroom.offline import pin_litellm_cost_map_local
+from headroom.utils import remember_bounded
 
 logger = logging.getLogger(__name__)
 
@@ -510,7 +512,11 @@ def _config_snapshot() -> dict[str, str]:
     return out
 
 
+# Least-recently-used first. ``model`` comes from the request body, so the
+# entry count is capped (#4479); a model that falls out is simply looked up
+# again the next time it is seen.
 _model_cache: dict[str, str | None] = {}
+_MODEL_CACHE_MAXSIZE = 256
 
 
 def _public_model(model: str) -> str | None:
@@ -529,8 +535,13 @@ def _public_model(model: str) -> str | None:
     """
     if not model:
         return None
-    if model in _model_cache:
-        return _model_cache[model]
+    try:
+        cached = _model_cache[model]
+    except KeyError:
+        pass
+    else:
+        remember_bounded(_model_cache, model, cached, _MODEL_CACHE_MAXSIZE)
+        return cached
 
     resolved: str | None = None
     try:
@@ -545,9 +556,7 @@ def _public_model(model: str) -> str | None:
     except Exception:
         resolved = None
 
-    # ponytail: unbounded dict, but it is keyed by distinct model ids seen in
-    # one process — a handful. Cap it if a router ever fans out over hundreds.
-    _model_cache[model] = resolved
+    remember_bounded(_model_cache, model, resolved, _MODEL_CACHE_MAXSIZE)
     return resolved
 
 
@@ -1905,8 +1914,8 @@ def record_compression(strategy: str, original_tokens: int, compressed_tokens: i
     (``PrometheusMetrics.tokens_saved_by_strategy``); they just never left the
     process.
 
-    Same discipline as the rest of this module: off by default and cheap when
-    off, never raises. This runs once per routing decision, so it must not do
+    Same discipline as the rest of this module: cheap when the beacon is
+    disabled, never raises. This runs once per routing decision, so it must not do
     anything a request would notice.
     """
     from headroom.telemetry.beacon import is_beacon_enabled
@@ -2022,7 +2031,7 @@ def record_content_shape(
 
     Single-observation form of :func:`record_content_shapes`, which is what the
     router actually calls. Same discipline as everything else in this module:
-    off by default, cheap when off, never raises, and never touches the
+    cheap when the beacon is disabled, never raises, and never touches the
     aggregator lock.
     """
     record_content_shapes(((content_type, strategy, original_tokens, compressed_tokens),))
@@ -2200,8 +2209,8 @@ def _drain_staged_tool_shapes() -> dict[str, list[int]]:
 def record_outcome(outcome: Any) -> None:
     """Beacon entry point, called from the proxy's outcome funnel.
 
-    Off by default and cheap when off: the enabled check short-circuits before
-    the aggregator is ever constructed, so a user who never opted in pays one
+    Cheap when the beacon is disabled: the enabled check short-circuits before
+    the aggregator is ever constructed, so a user who has opted out pays one
     env lookup per request and allocates nothing.
     """
     from headroom.telemetry.beacon import is_beacon_enabled
