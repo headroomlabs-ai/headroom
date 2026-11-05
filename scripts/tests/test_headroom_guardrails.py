@@ -88,6 +88,32 @@ def convert(messages):
     assert any(f.rule == "PY001" and "preserve_message_fields" in f.message for f in findings)
 
 
+def test_backend_rule_tracks_variable_backed_assistant_reconstruction(tmp_path: Path) -> None:
+    guardrails = _load_guardrails()
+    backends = tmp_path / "headroom" / "backends"
+    backends.mkdir(parents=True)
+    (backends / "anyllm.py").write_text(
+        "from headroom.message_contract import preserve_message_fields\n", encoding="utf-8"
+    )
+    path = backends / "litellm.py"
+    source = (
+        "from headroom.message_contract import preserve_message_fields\n"
+        "def convert(msg, converted):\n"
+        "    assistant_msg = {'role': 'assistant'}\n"
+        "    assistant_msg['content'] = None\n"
+        "    assistant_msg['tool_calls'] = []\n"
+        "    {bridge}\n"
+        "    converted.append(assistant_msg)\n"
+    )
+    path.write_text(
+        source.replace("{bridge}", "preserve_message_fields(msg, assistant_msg)"), encoding="utf-8"
+    )
+    assert guardrails.BackendMessagePreservationRule().check(tmp_path) == []
+    path.write_text(source.replace("{bridge}", "pass"), encoding="utf-8")
+    findings = guardrails.BackendMessagePreservationRule().check(tmp_path)
+    assert any(f.rule == "PY001" and f.path == path for f in findings)
+
+
 def test_positional_restore_rule_catches_optimized_message_index_restore(
     tmp_path: Path,
 ) -> None:

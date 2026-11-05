@@ -123,6 +123,65 @@ class BackendMessagePreservationRule:
                 if _call_name(node.func) != "append" or not node.args:
                     continue
                 first = node.args[0]
+                if isinstance(first, ast.Name):
+                    scopes = [
+                        scope
+                        for scope in ast.walk(tree)
+                        if isinstance(scope, (ast.FunctionDef, ast.AsyncFunctionDef))
+                        and scope.lineno <= node.lineno <= (scope.end_lineno or scope.lineno)
+                    ]
+                    scope = (
+                        min(scopes, key=lambda item: (item.end_lineno or item.lineno) - item.lineno)
+                        if scopes
+                        else tree
+                    )
+                    assignments = [
+                        item
+                        for item in ast.walk(scope)
+                        if isinstance(item, (ast.Assign, ast.AnnAssign))
+                        and item.lineno < node.lineno
+                        and isinstance(item.value, ast.Dict)
+                        and any(
+                            isinstance(target, ast.Name) and target.id == first.id
+                            for target in (
+                                item.targets if isinstance(item, ast.Assign) else [item.target]
+                            )
+                        )
+                    ]
+                    if assignments:
+                        assignment = max(assignments, key=lambda item: item.lineno)
+                        literal = assignment.value
+                        role_values = [
+                            value
+                            for key, value in zip(literal.keys, literal.values)
+                            if isinstance(key, ast.Constant) and key.value == "role"
+                        ]
+                        assistant_role = any(
+                            isinstance(value, ast.Constant)
+                            and value.value == "assistant"
+                            or isinstance(value, ast.Name)
+                            and value.id == "role"
+                            for value in role_values
+                        )
+                        bridged = any(
+                            isinstance(call, ast.Call)
+                            and _call_name(call.func) == "preserve_message_fields"
+                            and assignment.lineno <= call.lineno <= node.lineno
+                            and len(call.args) >= 2
+                            and isinstance(call.args[1], ast.Name)
+                            and call.args[1].id == first.id
+                            for call in ast.walk(scope)
+                        )
+                        if assistant_role and not bridged:
+                            findings.append(
+                                Finding(
+                                    self.id,
+                                    path,
+                                    node.lineno,
+                                    "preserve fields in variable-backed assistant reconstruction",
+                                )
+                            )
+                    continue
                 if not isinstance(first, ast.Dict):
                     continue
                 keys = _dict_keys(first)
