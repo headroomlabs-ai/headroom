@@ -28,16 +28,17 @@ describe("headroom_retrieve execute arguments (#4638)", () => {
 
     expect(fetchMock).toHaveBeenCalledTimes(1);
     expect(String(fetchMock.mock.calls[0][0])).toBe(`http://127.0.0.1:8080/v1/retrieve/${HASH}`);
-    expect(result).not.toContain("Invalid hash format");
+    expect(JSON.parse(result)).toEqual({ original_content: "offline fixture" });
   });
 
   it("still accepts a direct execute({ hash }) call", async () => {
     const fetchMock = stubFetch();
     const tool = createHeadroomRetrieveTool({ proxyUrl: "http://127.0.0.1:8080" });
 
-    await tool.execute({ hash: HASH });
+    const result = await tool.execute({ hash: HASH });
 
     expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(JSON.parse(result)).toEqual({ original_content: "offline fixture" });
   });
 
   it("rejects a bad hash in params without sending a request", async () => {
