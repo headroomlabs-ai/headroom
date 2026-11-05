@@ -20,14 +20,14 @@ export function createHeadroomRetrieveTool(config: RetrieveToolConfig) {
     description:
       "Retrieve original uncompressed content from Headroom's compression store. " +
       "Use when compressed context mentions a hash and you need the full details. " +
-      "Pass the hash from the compression marker (24 hex characters). " +
+      "Pass the hash from the compression marker (12 or 24 hex characters). " +
       "Retrieval is by hash and always returns the full original content.",
     parameters: {
       type: "object" as const,
       properties: {
         hash: {
           type: "string",
-          description: "The 24-character hex hash from the compression marker",
+          description: "The 12- or 24-character hex hash from the compression marker",
         },
       },
       required: ["hash"],
@@ -36,9 +36,9 @@ export function createHeadroomRetrieveTool(config: RetrieveToolConfig) {
       const { hash } = args;
 
       // Validate hash format
-      if (!/^[a-f0-9]{24}$/i.test(hash)) {
+      if (!/^(?:[a-f0-9]{12}|[a-f0-9]{24})$/i.test(hash)) {
         return JSON.stringify({
-          error: "Invalid hash format. Expected 24 hex characters.",
+          error: "Invalid hash format. Expected 12 or 24 hex characters.",
         });
       }
 
