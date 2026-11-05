@@ -283,7 +283,10 @@ def test_parse_log_files_tail_cap_reads_only_the_trailing_bytes(workspace: Path)
     assert capped.perf_records[0].request_id > "req-00000"
 
 
-def test_open_log_tail_keeps_a_record_starting_exactly_at_the_window(workspace: Path) -> None:
+@pytest.mark.parametrize("newline", ["\n", "\r\n"])
+def test_open_log_tail_keeps_a_record_starting_exactly_at_the_window(
+    workspace: Path, newline: str
+) -> None:
     """An offset that lands on a line start must not discard that line.
 
     The window begins at ``size - cap``. When that offset is itself a line
@@ -295,11 +298,11 @@ def test_open_log_tail_keeps_a_record_starting_exactly_at_the_window(workspace: 
     lines = [
         _perf_line("2026-10-09 00:00:00,000", f"req-{i:05d}", "claude-opus-4-6") for i in range(6)
     ]
-    body = "\n".join(lines) + "\n"
-    log_path.write_text(body, encoding="utf-8")
+    body = newline.join(lines) + newline
+    log_path.write_bytes(body.encode("utf-8"))
 
     # Cap exactly the last three records, so the window starts on a boundary.
-    encoded = [(line + "\n").encode("utf-8") for line in lines]
+    encoded = [(line + newline).encode("utf-8") for line in lines]
     cap = sum(len(chunk) for chunk in encoded[3:])
 
     with analyzer._open_log_tail(log_path, cap) as handle:
