@@ -43,13 +43,13 @@ This plugin closes the loop by calling the proxy's `POST /v1/retrieve` HTTP endp
 
 ## Supported Hermes providers
 
-`headroom wrap hermes` sets `ANTHROPIC_BASE_URL` and `OPENAI_BASE_URL`. Hermes uses these only for the `anthropic` and `openai` providers. Its default provider (`openrouter`) and others such as `nous` call their own endpoints and skip Headroom. Pick a routed provider, for example:
+`headroom wrap hermes` sets `ANTHROPIC_BASE_URL` and `OPENAI_BASE_URL`. Hermes uses these only for the `anthropic` and `openai` providers. Its default provider (`openrouter`) and others such as `nous` call their own endpoints and skip Headroom. You must pick a routed provider with `--provider`, for example:
 
 ```bash
 headroom wrap hermes -- --provider anthropic
 ```
 
-The wrapper prints a note when `--provider` is missing or is not a routed provider.
+The wrapper stops with an error before it starts the proxy or Hermes when `--provider` is missing or is not `anthropic` or `openai`. This includes a provider set only in `~/.hermes/config.yaml`. To use another provider, run `hermes` directly, without Headroom.
 
 ## Recommended proxy configuration
 

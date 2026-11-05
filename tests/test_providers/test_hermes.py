@@ -36,17 +36,19 @@ def test_build_launch_env_empty_mapping_does_not_inherit_host(monkeypatch) -> No
     assert "HEADROOM_TEST_HOST_ONLY" not in env
 
 
-def test_unrouted_provider_warning_for_default_and_openrouter() -> None:
-    from headroom.providers.hermes import unrouted_provider_warning
+def test_provider_error_for_default_and_unsupported_providers() -> None:
+    from headroom.providers.hermes import unsupported_provider_error
 
-    assert unrouted_provider_warning(()) is not None
-    assert unrouted_provider_warning(("--provider", "openrouter")) is not None
-    assert unrouted_provider_warning(("--provider=nous",)) is not None
+    assert unsupported_provider_error(()) is not None
+    assert unsupported_provider_error(("--provider",)) is not None
+    assert unsupported_provider_error(("--provider", "openrouter")) is not None
+    assert unsupported_provider_error(("--provider=nous",)) is not None
+    assert unsupported_provider_error(("--provider", "custom")) is not None
 
 
-def test_unrouted_provider_warning_silent_for_routed_providers() -> None:
-    from headroom.providers.hermes import unrouted_provider_warning
+def test_provider_error_silent_for_routed_providers() -> None:
+    from headroom.providers.hermes import unsupported_provider_error
 
-    assert unrouted_provider_warning(("-z", "hi", "--provider", "anthropic")) is None
-    assert unrouted_provider_warning(("--provider=OpenAI",)) is None
-    assert unrouted_provider_warning(("--provider", "custom")) is None
+    assert unsupported_provider_error(("-z", "hi", "--provider", "anthropic")) is None
+    assert unsupported_provider_error(("--provider=OpenAI",)) is None
+    assert unsupported_provider_error(("--provider", "openrouter", "--provider", "openai")) is None

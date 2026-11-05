@@ -44,30 +44,33 @@ def build_launch_env(
 
 # Hermes honors OPENAI_BASE_URL / ANTHROPIC_BASE_URL only for these providers.
 # Its default (openrouter) and others such as nous call their own endpoints.
-_ROUTED_PROVIDERS = frozenset({"anthropic", "openai", "custom"})
+_ROUTED_PROVIDERS = frozenset({"anthropic", "openai"})
 
 
-def unrouted_provider_warning(hermes_args: tuple[str, ...] | list[str]) -> str | None:
-    """Return a warning unless ``--provider`` names a provider Headroom can route.
+def unsupported_provider_error(hermes_args: tuple[str, ...] | list[str]) -> str | None:
+    """Return an error unless ``--provider`` names a provider Headroom can route.
 
-    ponytail: only reads ``--provider`` from the CLI args, not
-    ~/.hermes/config.yaml, so a config-only anthropic/openai setup still sees
-    the note. Parse the config if that noise matters.
+    ponytail: the flag is required on purpose. Hermes also resolves a provider
+    from config.yaml and HERMES_INFERENCE_PROVIDER; mirroring that order here
+    would drift. Parse them only if requiring the flag proves too strict.
     """
     args = list(hermes_args)
-    provider = None
+    provider = ""
     for index, arg in enumerate(args):
         if arg == "--provider" and index + 1 < len(args):
             provider = args[index + 1]
         elif arg.startswith("--provider="):
             provider = arg.split("=", 1)[1]
-    if provider and provider.lower() in _ROUTED_PROVIDERS:
+    if provider.strip().lower() in _ROUTED_PROVIDERS:
         return None
+    selected = f"'{provider}'" if provider else "no --provider flag"
     return (
-        "Note: Headroom only routes Hermes traffic for the anthropic and openai "
-        "providers. Hermes's default provider (openrouter) and others such as "
-        "nous call their own endpoints and skip Headroom. "
-        "Use e.g. `headroom wrap hermes -- --provider anthropic`."
+        f"Error: Headroom cannot route this Hermes launch ({selected}).\n"
+        "Only the anthropic and openai providers go through Headroom. Hermes's "
+        "default provider (openrouter) and others such as nous call their own "
+        "endpoints.\n"
+        "Run: headroom wrap hermes -- --provider anthropic\n"
+        "To use another provider, run `hermes` directly, without Headroom."
     )
 
 

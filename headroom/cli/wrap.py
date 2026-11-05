@@ -179,7 +179,7 @@ from headroom.providers.grok_build.config import (
     restore_grok_provider_config,
 )
 from headroom.providers.hermes import build_launch_env as _build_hermes_launch_env
-from headroom.providers.hermes import unrouted_provider_warning as _hermes_unrouted_warning
+from headroom.providers.hermes import unsupported_provider_error as _hermes_provider_error
 from headroom.providers.kimi import build_launch_env as _build_kimi_launch_env
 from headroom.providers.mistral_vibe import build_launch_env as _build_mistral_vibe_launch_env
 from headroom.providers.omp import build_launch_env as _build_omp_launch_env
@@ -8272,10 +8272,12 @@ def hermes(
         click.echo("Install Hermes: https://hermes-agent.nousresearch.com/")
         raise SystemExit(1)
 
+    provider_error = _hermes_provider_error(hermes_args)
+    if provider_error:
+        click.echo(provider_error)
+        raise SystemExit(1)
+
     env, env_vars_display = _build_hermes_launch_env(port, os.environ)
-    warning = _hermes_unrouted_warning(hermes_args)
-    if warning:
-        click.echo(warning)
     _launch_tool(
         binary=hermes_bin,
         args=hermes_args,

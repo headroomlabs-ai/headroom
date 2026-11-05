@@ -30,7 +30,9 @@ def test_wrap_hermes_sets_provider_envs(
 
     with patch.object(wrap_mod.shutil, "which", return_value="hermes"):
         with patch.object(wrap_mod, "_launch_tool", side_effect=fake_launch_tool):
-            result = runner.invoke(main, ["wrap", "hermes", "--port", "9000", "--", "session"])
+            result = runner.invoke(
+                main, ["wrap", "hermes", "--port", "9000", "--", "--provider", "anthropic"]
+            )
 
     assert result.exit_code == 0, result.output
     env = captured["env"]
@@ -39,7 +41,7 @@ def test_wrap_hermes_sets_provider_envs(
     assert env["ANTHROPIC_BASE_URL"] == "http://127.0.0.1:9000"
     assert captured["tool_label"] == "HERMES"
     assert captured["agent_type"] == "hermes"
-    assert captured["args"] == ("session",)
+    assert captured["args"] == ("--provider", "anthropic")
 
 
 def test_wrap_hermes_missing_binary_errors_clearly(
@@ -74,20 +76,38 @@ def test_wrap_hermes_prepare_only_exits_cleanly(
 
 
 @pytest.mark.parametrize(
-    ("hermes_args", "warned"),
-    [((), True), (("--provider", "openrouter"), True), (("--provider", "anthropic"), False)],
+    "hermes_args",
+    [(), ("--provider", "openrouter"), ("--provider=nous",), ("--provider", "custom")],
 )
-def test_wrap_hermes_warns_when_provider_is_not_routed(
+def test_wrap_hermes_rejects_unrouted_provider_before_launch(
     runner: CliRunner,
     tmp_path,
     monkeypatch: pytest.MonkeyPatch,
     hermes_args: tuple[str, ...],
-    warned: bool,
 ) -> None:
     monkeypatch.chdir(tmp_path)
     with patch.object(wrap_mod.shutil, "which", return_value="hermes"):
-        with patch.object(wrap_mod, "_launch_tool"):
+        with patch.object(wrap_mod, "_launch_tool") as launch:
             result = runner.invoke(main, ["wrap", "hermes", "--", *hermes_args])
 
+    assert result.exit_code == 1
+    assert "cannot route" in result.output
+    assert "routed through Headroom" not in result.output
+    launch.assert_not_called()
+
+
+@pytest.mark.parametrize("provider", ["anthropic", "openai"])
+def test_wrap_hermes_launches_routed_provider(
+    runner: CliRunner,
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+    provider: str,
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    with patch.object(wrap_mod.shutil, "which", return_value="hermes"):
+        with patch.object(wrap_mod, "_launch_tool") as launch:
+            result = runner.invoke(main, ["wrap", "hermes", "--", "--provider", provider])
+
     assert result.exit_code == 0, result.output
-    assert ("skip Headroom" in result.output) is warned
+    launch.assert_called_once()
+    assert launch.call_args.kwargs["args"] == ("--provider", provider)
