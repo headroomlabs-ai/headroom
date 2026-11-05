@@ -147,6 +147,20 @@ def test_non_reads_are_not_detected(command: str) -> None:
         ('bash -lc "cat foo.py > copy.py"', False),
         ('bash -lc "cat foo.py | tee copy.py"', False),
         ('bash -lc "cat foo.py"', True),
+        # A backslash-newline is a line continuation: the write on the next line
+        # still counts (review of #4646).
+        ("cat foo.py \\\n> copy.py", False),
+        ("cat foo.py \\\n>> copy.py", False),
+        ("cat foo.py | \\\ntee copy.py", False),
+        ("sed -n '/x >/p' foo.py \\\n> out.txt", False),
+        ("sed -n '1,60p' \\\nfoo.py", True),
+        # A comment ends at the newline; its quote marks do not open a quote that
+        # would hide the next line's separators (review of #4646).
+        ('echo start # " unclosed in comment\nls; cat foo.py', True),
+        ("echo ok # author's note\ntrue; cat foo.py", True),
+        ("cat foo.py # > not a redirect", True),
+        # A hash inside a word is not a comment.
+        ("cat foo#bar.py > out.txt", False),
     ],
 )
 def test_quoted_shell_operators_are_arguments(command: str, expected: bool) -> None:
