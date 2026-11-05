@@ -27,14 +27,16 @@ MEMORY_BLOCK = "<memory>user prefers metric units</memory>"
 
 def _request(body: dict) -> Request:
     payload = json.dumps(body).encode("utf-8")
-    sent = False
+    split = len(payload) // 2
+    messages = iter(
+        [
+            {"type": "http.request", "body": payload[:split], "more_body": True},
+            {"type": "http.request", "body": payload[split:], "more_body": False},
+        ]
+    )
 
     async def receive() -> dict:
-        nonlocal sent
-        if sent:
-            return {"type": "http.disconnect"}
-        sent = True
-        return {"type": "http.request", "body": payload, "more_body": False}
+        return next(messages, {"type": "http.disconnect"})
 
     return Request(
         {
