@@ -46,6 +46,12 @@ CJK = "这是一个测试文档，用于验证分词器的差异。" * 30
         ("O4-Mini", "o200k_base"),
         ("GPT-4", "cl100k_base"),
         ("GPT-4-Turbo", "cl100k_base"),
+        # Gateway prefixes must resolve like the bare id.
+        ("azure/gpt-4o", "o200k_base"),
+        ("openai/gpt-4.1-mini", "o200k_base"),
+        ("openrouter/openai/gpt-5", "o200k_base"),
+        ("Azure/GPT-4o", "o200k_base"),
+        ("openai/gpt-4", "cl100k_base"),
         # Must not regress.
         ("gpt-4o", "o200k_base"),
         ("gpt-4.1", "o200k_base"),
@@ -66,6 +72,15 @@ def test_cold_cache_uppercase_still_gets_the_right_encoding(model: str) -> None:
     Without clear_cache() a preceding lowercase lookup would populate the shared
     (lowercased) cache key and mask the defect entirely.
     """
+    tiktoken = pytest.importorskip("tiktoken")
+    o200k = len(tiktoken.get_encoding("o200k_base").encode(CJK))
+
+    TokenizerRegistry.clear_cache()
+    assert get_tokenizer(model).count_text(CJK) == o200k
+
+
+@pytest.mark.parametrize("model", ["azure/gpt-4o", "openrouter/openai/gpt-5"])
+def test_gateway_wrapped_model_counts_like_bare_id(model: str) -> None:
     tiktoken = pytest.importorskip("tiktoken")
     o200k = len(tiktoken.get_encoding("o200k_base").encode(CJK))
 
