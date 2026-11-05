@@ -4,7 +4,7 @@ build-backend = "maturin"
 
 [project]
 name = "headroom-ai"
-version = "0.42.0"
+version = "0.43.0"
 description = "Compress tool outputs, logs, JSON and chat history before each LLM call. Fewer input tokens, same answers; in-process, no API key. Library, proxy and MCP server."
 # PyPI renders this file; GitHub renders README.md. Keep the two in step on the
 # install commands and the savings claim (README.md "Proof" is the source).
@@ -328,7 +328,7 @@ dev = [
     "pytest>=7.0.0",
     "pytest-cov>=4.0.0",
     "pytest-asyncio>=0.21.0",
-    "ruff==0.17.3",
+    "ruff==0.17.2",
     "mypy>=1.0.0",
     "pre-commit>=3.0.0",
     "openai>=1.0.0",
