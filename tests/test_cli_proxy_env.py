@@ -824,6 +824,10 @@ class TestCLIProxyEnvVars:
             ([], {}, False),
             (["--ccr-inject-system-instructions"], {}, True),
             ([], {"HEADROOM_CCR_INJECT_SYSTEM_INSTRUCTIONS": "1"}, True),
+            (["--ccr-inject-system-instructions", "--no-ccr"], {}, False),
+            (["--ccr-inject-system-instructions", "--lossless"], {}, False),
+            ([], {"HEADROOM_CCR_INJECT_SYSTEM_INSTRUCTIONS": "1", "HEADROOM_NO_CCR": "1"}, False),
+            ([], {"HEADROOM_CCR_INJECT_SYSTEM_INSTRUCTIONS": "1", "HEADROOM_LOSSLESS": "1"}, False),
         ],
     )
     def test_ccr_inject_system_instructions_reaches_config(self, runner, args, env, expected):
@@ -1469,8 +1473,21 @@ class TestArgparseBackendValidation:
 
         with patch.dict(os.environ, {"HEADROOM_CCR_INJECT_SYSTEM_INSTRUCTIONS": "1"}):
             config = _proxy_config_from_env()
-
         assert config.ccr_inject_system_instructions is True
+
+        with patch.dict(
+            os.environ,
+            {"HEADROOM_CCR_INJECT_SYSTEM_INSTRUCTIONS": "1", "HEADROOM_NO_CCR": "1"},
+        ):
+            config = _proxy_config_from_env()
+        assert config.ccr_inject_system_instructions is False
+
+        with patch.dict(
+            os.environ,
+            {"HEADROOM_CCR_INJECT_SYSTEM_INSTRUCTIONS": "1", "HEADROOM_LOSSLESS": "1"},
+        ):
+            config = _proxy_config_from_env()
+        assert config.ccr_inject_system_instructions is False
 
     def test_argparse_registers_keepalive_expiry_flag(self):
         """The argparse path (python -m headroom.proxy.server) must register
