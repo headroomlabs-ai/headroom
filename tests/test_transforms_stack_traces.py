@@ -12,6 +12,8 @@ from __future__ import annotations
 
 import pytest
 
+from headroom import _core
+
 from headroom.transforms.content_detector import ContentType, detect_content_type
 from headroom.transforms.log_compressor import LogCompressor, LogCompressorConfig
 
@@ -68,6 +70,21 @@ def java_chained_trace(runtime_frames: int = 30) -> str:
         lines.append(f"at java.base/java.lang.Thread{i}.run(Thread.java:{i + 1})")
     lines.append("... 17 more")
     return "\n".join(lines)
+
+
+def test_native_log_config_requires_explicit_frame_collapse() -> None:
+    content = java_chained_trace()
+    omitted = _core.LogCompressor(_core.LogCompressorConfig(enable_ccr=False)).compress(content)
+    disabled = _core.LogCompressor(
+        _core.LogCompressorConfig(enable_ccr=False, collapse_runtime_frames=False)
+    ).compress(content)
+    enabled = _core.LogCompressor(
+        _core.LogCompressorConfig(enable_ccr=False, collapse_runtime_frames=True)
+    ).compress(content)
+
+    assert omitted.compressed == disabled.compressed
+    assert "com.example.Disk.read" not in disabled.compressed
+    assert "com.example.Disk.read" in enabled.compressed
 
 
 def dotnet_trace() -> str:

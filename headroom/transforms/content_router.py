@@ -3807,7 +3807,14 @@ class ContentRouter(Transform):
         # that DEPENDS on the registered provider, so a provider registered (or
         # cleared) after a block was first folded must not be served the old
         # answer forever.
-        memo_key = (hash(content), len(content), strategy, get_lossless_generation())
+        config_enabled = getattr(getattr(self, "config", None), "enable_config_compressor", False)
+        memo_key = (
+            hash(content),
+            len(content),
+            strategy,
+            get_lossless_generation(),
+            config_enabled,
+        )
         memoized = memo.get(memo_key)
         if memoized is not None:
             return memoized
@@ -3823,7 +3830,7 @@ class ContentRouter(Transform):
             CompressionStrategy.SEARCH: "search",
             CompressionStrategy.LOG: "log",
             CompressionStrategy.DIFF: "diff",
-            CompressionStrategy.CONFIG: "config",
+            CompressionStrategy.CONFIG: "config" if config_enabled else None,
         }.get(strategy)
         order = ([primary] if primary else []) + [
             k for k in ("search", "paths", "log", "diff", "text") if k != primary

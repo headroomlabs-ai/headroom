@@ -586,3 +586,23 @@ def test_router_lossless_mode_uses_lossless_config_label() -> None:
     assert chain == ["lossless_config"]
     assert expand_runs(unfold_repeated_blocks(compressed)) == K8S_MANIFEST
     assert not CCR_RETRIEVAL_MARKER_RE.search(compressed)
+
+
+def test_disabled_config_compressor_does_not_fold_repeated_stanzas() -> None:
+    router = object.__new__(ContentRouter)
+    router.config = ContentRouterConfig(enable_config_compressor=False)
+    content = "\n".join(["[section]", "key=value", "enabled=true"] * 20)
+
+    assert router._lossless_first(content, CompressionStrategy.CONFIG) == (content, None)
+
+
+def test_config_fold_memo_respects_changed_opt_in() -> None:
+    router = object.__new__(ContentRouter)
+    router.config = ContentRouterConfig(enable_config_compressor=False)
+    content = "\n".join(["[section]", "key=value", "enabled=true"] * 20)
+    assert router._lossless_first(content, CompressionStrategy.CONFIG) == (content, None)
+
+    router.config.enable_config_compressor = True
+    compressed, label = router._lossless_first(content, CompressionStrategy.CONFIG)
+    assert label == "lossless_config"
+    assert expand_runs(unfold_repeated_blocks(compressed)) == content
