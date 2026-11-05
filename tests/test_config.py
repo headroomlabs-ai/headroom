@@ -173,6 +173,22 @@ class TestHeadroomConfig:
         assert config.get_context_limit("claude-3-opus") == 200000
         assert config.get_context_limit("claude-3-sonnet") == 200000
 
+    def test_get_context_limit_prefers_longest_prefix(self):
+        """A more specific override wins over a shorter one, whatever the dict order."""
+        config = HeadroomConfig(
+            model_context_limits={
+                "gpt-4": 8192,
+                "gpt-4o": 128000,
+                "claude-3": 100000,
+                "claude-3-5-sonnet": 200000,
+            }
+        )
+        assert config.get_context_limit("gpt-4o-2024-08-06") == 128000
+        assert config.get_context_limit("claude-3-5-sonnet-20241022") == 200000
+        # The shorter prefix still applies when it is the only match.
+        assert config.get_context_limit("gpt-4-0613") == 8192
+        assert config.get_context_limit("claude-3-opus") == 100000
+
     def test_get_context_limit_not_found(self):
         """get_context_limit returns None for unknown model."""
         config = HeadroomConfig(model_context_limits={"gpt-4": 128000})

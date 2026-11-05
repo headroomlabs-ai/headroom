@@ -251,6 +251,12 @@ mitmdump --listen-host 127.0.0.1 --listen-port 8790 \
   Headroom's upstream client honours `HTTPS_PROXY`. When the Headroom proxy is started by a Claude Code hook (`headroom init hook ensure`), it inherits Claude Code's environment, so its own upstream calls would come back through mitmproxy. Prefix those hook commands with `env -u HTTPS_PROXY -u HTTP_PROXY -u NODE_EXTRA_CA_CERTS`. The addon also marks the requests it redirects, so a second pass goes straight to Anthropic instead of looping.
 </Callout>
 
+Remove `ANTHROPIC_BASE_URL` from your shell and every active Claude settings scope,
+including `~/.claude/settings.json`, project `.claude/settings.json`, and project
+`.claude/settings.local.json`. A project-scoped `headroom init claude` writes it to
+the last file, so removing only the user setting can leave Remote Control disabled.
+Keep the other environment entries and hooks intact.
+
 Full setup, verification steps, caveats and rollback: [`examples/claude_code_remote_control`](https://github.com/headroomlabs-ai/headroom/tree/main/examples/claude_code_remote_control).
 
 ### Why the Unix socket route does not help

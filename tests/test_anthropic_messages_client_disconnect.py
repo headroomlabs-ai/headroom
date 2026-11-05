@@ -25,17 +25,22 @@ import asyncio
 from fastapi import Request
 
 from headroom.proxy.handlers.anthropic import AnthropicHandlerMixin
+from headroom.proxy.models import ProxyConfig
 
 
 class _MinimalAnthropicHandler(AnthropicHandlerMixin):
     """The smallest handler that can reach the ClientDisconnect guard.
 
-    The guard sits before any of the heavier machinery (compression,
-    memory, CCR, upstream dispatch) executes, so none of that needs
-    stubbing here — only ``_next_request_id``, which the real
-    implementation backs with an ``asyncio.Lock`` + counter this
-    minimal handler never initializes.
+    Header policy and optional limit checks may precede body reading. Provide
+    their normal configuration while leaving rate/budget limiting disabled;
+    the disconnect still comes from the real ASGI receive channel, before
+    compression, memory, CCR, or upstream dispatch.
     """
+
+    def __init__(self) -> None:
+        self.config = ProxyConfig()
+        self.rate_limiter = None
+        self.cost_tracker = None
 
     async def _next_request_id(self) -> str:
         return "req-test"

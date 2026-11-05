@@ -59,7 +59,12 @@ auth is unchanged: Claude Code still believes it talks to the first-party API.
    }
    ```
 
-   and **remove `ANTHROPIC_BASE_URL`** from that `env` block and from your shell.
+   and **remove `ANTHROPIC_BASE_URL` from every active settings scope and your
+   shell**. Check the user `env` block above and the project's
+   `.claude/settings.json` and `.claude/settings.local.json`; a project-scoped
+   `headroom init claude` writes it to `.claude/settings.local.json`. Remove only
+   that variable, preserving the other environment entries and hooks. Removing it
+   from user settings alone does not unset a project-level value.
    `remoteControlAtStartup` is optional: without it, run `/remote-control` when needed.
 
 4. Start Headroom **without** the proxy variables. If `headroom init claude`
@@ -89,7 +94,7 @@ auth is unchanged: Claude Code still believes it talks to the first-party API.
   `HTTPS_PROXY`. Non-Anthropic hosts are tunnelled untouched, but if mitmdump is
   down, Claude Code loses network access: keep it supervised.
 - `headroom init claude` or a Headroom update may write `ANTHROPIC_BASE_URL` back;
-  Remote Control then disappears again.
+  Remote Control then disappears again. Recheck all the settings scopes above.
 - On a successful first pass the `x-rc-proxy-hop` marker reaches Anthropic through
   Headroom (Headroom only strips `x-headroom-*`); it is an inert extra header.
 
