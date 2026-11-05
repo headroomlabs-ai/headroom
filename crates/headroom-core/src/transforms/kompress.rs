@@ -645,6 +645,29 @@ fn build_session(path: &Path) -> Result<Session, Box<dyn std::error::Error + Sen
     Ok(session)
 }
 
+/// Whether this process can build Kompress sessions: the same CPU-then-loader
+/// preconditions every `Kompress` constructor checks, in the same order. The
+/// CPU must run the precompiled ONNX Runtime (AVX2 on x86), and only then is
+/// the library resolved (`ORT_DYLIB_PATH`, or the pip `onnxruntime` under
+/// `VIRTUAL_ENV`, `CONDA_PREFIX` or `./.venv`) and committed, once per
+/// process. `Err` is `"<reason>: <detail>"`. For harnesses that should skip,
+/// not fail, on a machine that can't run Kompress.
+pub fn onnx_runtime_ready() -> Result<(), String> {
+    onnx_runtime_ready_with(
+        crate::onnx_cpu::onnx_runtime_supported_by_cpu(),
+        crate::transforms::magika_detector::dynamic_ort_loader_ready,
+    )
+}
+
+/// [`onnx_runtime_ready`] with the CPU verdict and loader passed in, so tests
+/// can check the loader never runs on an unsupported CPU.
+fn onnx_runtime_ready_with(
+    cpu_ok: bool,
+    loader: impl FnOnce() -> Result<(), String>,
+) -> Result<(), String> {
+    ort_session_gate(cpu_ok, loader).map_err(|(reason, e)| format!("{reason}: {e}"))
+}
+
 /// The tokenizer and the ONNX artifact `onnx` (e.g.
 /// `"onnx/kompress-int8-wo.onnx"`) that the cache-only loader reads for
 /// `config`: the pinned snapshots in Python's hub cache, as
@@ -888,6 +911,27 @@ mod tests {
             Ok(())
         });
         assert!(called.get());
+    }
+
+    #[test]
+    fn onnx_runtime_ready_checks_the_cpu_before_the_loader() {
+        // The public readiness check (used by harnesses to skip) must keep
+        // the constructors' order: on an unsupported CPU it reports the CPU
+        // reason without initializing the native runtime.
+        let called = std::cell::Cell::new(false);
+        let out = onnx_runtime_ready_with(false, || {
+            called.set(true);
+            Ok(())
+        });
+        let message = out.unwrap_err();
+        assert!(message.starts_with("cpu_unsupported: "), "{message}");
+        assert!(!called.get(), "loader ran although the CPU check failed");
+
+        assert_eq!(
+            onnx_runtime_ready_with(true, || Err("no dylib".into())),
+            Err("ort_loader_unavailable: no dylib".to_string())
+        );
+        assert_eq!(onnx_runtime_ready_with(true, || Ok(())), Ok(()));
     }
 
     /// `from_pretrained` must refuse before `Api::new()` when the operator
