@@ -494,7 +494,11 @@ class HNSWVectorIndex:
                     self._metadata[memory.id] = IndexedMemoryMetadata.from_memory(memory)
                     self._embeddings[memory.id] = embedding.copy()
 
-            # Updates: add_items with an existing label replaces its vector.
+            # Updates: add_items with an existing label replaces its vector. A batch
+            # can name the same id more than once; keep only the last entry so the
+            # graph, the cached embedding and the metadata end on the same vector
+            # (hnswlib may apply rows for one label out of order across threads).
+            update_memories = list({m.id: (m, emb) for m, emb in update_memories}.values())
             if update_memories:
                 self._index.add_items(
                     np.vstack([emb for _, emb in update_memories]).astype(np.float32),

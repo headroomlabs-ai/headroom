@@ -88,3 +88,20 @@ async def test_index_batch_on_existing_id_replaces_the_vector() -> None:
     found, similarity = await _top(index, NEW)
     assert found == "m1"
     assert similarity == pytest.approx(1.0, abs=1e-5)
+
+
+async def test_index_batch_repeated_id_ends_on_the_last_vector() -> None:
+    index = _index()
+    await _seed(index)
+
+    first = Memory(
+        id="m1", content="first", user_id="u", embedding=np.eye(DIM, dtype=np.float32)[2]
+    )
+    last = Memory(id="m1", content="last", user_id="u", embedding=NEW.copy())
+    await index.index_batch([first, last])
+
+    assert index.size == 2
+    found, similarity = await _top(index, NEW)
+    assert found == "m1"
+    assert similarity == pytest.approx(1.0, abs=1e-5)
+    assert np.array_equal(index._embeddings["m1"], NEW)
