@@ -31,3 +31,11 @@ def test_parse_sse_events_preserves_split_utf8_tail() -> None:
 def test_parse_sse_events_raises_on_complete_invalid_utf8_event() -> None:
     with pytest.raises(UnicodeDecodeError):
         parse_sse_events_from_byte_buffer(bytearray(b"data: \xff\n\n"))
+
+
+def test_parse_sse_events_strips_only_one_leading_space() -> None:
+    # SSE spec: "If value starts with a U+0020 SPACE character, remove it".
+    # Further leading whitespace is part of the payload.
+    buf = bytearray(b"event: delta\ndata:   indented\ndata:\ttab\ndata:none\n\n")
+
+    assert parse_sse_events_from_byte_buffer(buf) == [("delta", "  indented\n\ttab\nnone")]

@@ -630,28 +630,41 @@ class AnthropicHandlerMixin:
             return False
 
     @staticmethod
-    def _outgoing_body_has_redeemable_marker(body: Any) -> bool:
-        """Does the body about to be sent carry a marker retrieval could expand?
+    def _outgoing_redeemable_markers(
+        body: Any,
+        previous_forwarded_messages: list[dict[str, Any]] | None = None,
+    ) -> tuple[bool, bool]:
+        """Which owned markers does the outgoing body carry?
 
-        ``headroom_retrieve`` exists only to expand a ``<<ccr:...>>`` marker, so
-        a request carrying none cannot benefit from the buffered path (#3071).
+        Returns ``(any_owned, new_owned)``. ``headroom_retrieve`` exists only to
+        expand a ``<<ccr:...>>`` marker, so a request carrying none cannot use
+        it (#3071).
+
+        ``new_owned`` is a marker the model has not seen yet: one absent from
+        what this session forwarded last turn. With no forwarded history to
+        compare against, every owned marker counts as new. "New" is decided
+        against the forwarded history, not by message position: token mode can
+        compress an earlier tool result on this request, so a marker first
+        seen now may sit anywhere in the history.
 
         Ownership is verified rather than shape-matched: the marker shape is not
         unique to Headroom, and adopting another context tool's hash would send
         the model to an endpoint that is guaranteed to miss (#2836). A hash that
         survives ``verify_ownership`` is redeemable right now.
 
-        Errors are swallowed deliberately and answered ``True``. This gates a
-        wire-format decision, and the safe direction on an unexpected message
-        shape is the long-standing buffered behavior, not a silent change.
+        Errors are swallowed deliberately and answered ``(True, True)``. This
+        gates a wire-format decision, and the safe direction on an unexpected
+        message shape is the long-standing buffered behavior, not a silent
+        change.
         """
         if not isinstance(body, dict):
-            return True
+            return True, True
         messages = body.get("messages")
         if not isinstance(messages, list) or not messages:
-            return False
+            return False, False
         try:
             from headroom.ccr.tool_injection import CCRToolInjector
+            from headroom.proxy.helpers import has_new_ccr_markers
 
             probe = CCRToolInjector(
                 provider="anthropic",
@@ -660,12 +673,27 @@ class AnthropicHandlerMixin:
             )
             probe.scan_for_markers(messages)
             if not probe.detected_hashes:
-                return False
+                return False, False
             probe.verify_ownership()
-            return bool(probe.detected_hashes)
+            if not probe.detected_hashes:
+                return False, False
+            return True, has_new_ccr_markers(
+                current_detected_hashes=list(probe.detected_hashes),
+                previous_forwarded_messages=previous_forwarded_messages,
+                provider="anthropic",
+            )
         except Exception:  # pragma: no cover - defensive
             logger.debug("CCR: marker probe failed; keeping the buffered path", exc_info=True)
-            return True
+            return True, True
+
+    @classmethod
+    def _outgoing_body_has_redeemable_marker(
+        cls,
+        body: Any,
+        previous_forwarded_messages: list[dict[str, Any]] | None = None,
+    ) -> bool:
+        """Does the outgoing body show the model an owned marker it has not seen?"""
+        return cls._outgoing_redeemable_markers(body, previous_forwarded_messages)[1]
 
     @staticmethod
     def _extract_anthropic_cache_ttl_metrics(usage: dict[str, Any] | None) -> tuple[int, int]:
@@ -4340,19 +4368,34 @@ class AnthropicHandlerMixin:
                     and ccr_response_handler_enabled
                     and has_ccr_retrieve_tool(tools if tools is not None else body.get("tools"))
                 )
-                buffered_retrieval_can_help = (
-                    retrieve_tool_is_offered and self._outgoing_body_has_redeemable_marker(body)
+                #
+                # A marker the model already saw on an earlier turn can still be
+                # retrieved, so it does not justify buffering every later turn
+                # (#3587), but it does mean a retrieval call may come. Those
+                # turns stream with ``headroom_retrieve`` withheld from the
+                # client and served by the proxy in a continuation round.
+                owned_marker, new_owned_marker = (
+                    self._outgoing_redeemable_markers(body, previous_forwarded_messages)
+                    if retrieve_tool_is_offered
+                    else (False, False)
                 )
-                wants_buffered_stream_ccr = bool(buffered_retrieval_can_help)
-                if retrieve_tool_is_offered and not buffered_retrieval_can_help:
+                wants_buffered_stream_ccr = bool(new_owned_marker)
+                if retrieve_tool_is_offered and not owned_marker:
                     logger.info(
                         f"[{request_id}] CCR: headroom_retrieve is resident but this "
                         "request carries no redeemable marker, so server-side "
                         "retrieval cannot fire; keeping the streaming path (#3071)"
                     )
+                elif retrieve_tool_is_offered and not new_owned_marker:
+                    logger.info(
+                        f"[{request_id}] CCR: every redeemable marker was already "
+                        "forwarded; streaming with headroom_retrieve served by the "
+                        "proxy (#3587)"
+                    )
                 buffered_stream_ccr = (
                     wants_buffered_stream_ccr and not outbound_locked_to_client_bytes
                 )
+                serve_ccr_retrieval_in_stream = bool(owned_marker) and not buffered_stream_ccr
                 if wants_buffered_stream_ccr and outbound_locked_to_client_bytes:
                     logger.info(
                         f"[{request_id}] CCR: signed thinking blocks force byte-faithful "
@@ -4526,6 +4569,7 @@ class AnthropicHandlerMixin:
                         session_key=session_key,
                         server_memory_tool_names=server_memory_tool_names,
                         client_beta=client_anthropic_beta or "",
+                        serve_ccr_retrieval=serve_ccr_retrieval_in_stream,
                     )
                 else:
                     # Whatever set it — the client's own ``stream: false`` or
