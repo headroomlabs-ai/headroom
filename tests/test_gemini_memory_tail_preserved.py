@@ -25,12 +25,19 @@ MEMORY_BLOCK = "<memory>user prefers metric units</memory>"
 
 
 class _FakeRequest:
-    def __init__(self) -> None:
+    def __init__(self, body: dict) -> None:
+        # The handler reads the body through ``request.stream()``
+        # (``read_request_json_with_bytes``), so serve the real bytes there
+        # instead of stubbing a helper the handler may no longer call.
+        self._raw = json.dumps(body).encode("utf-8")
         self.headers: dict[str, str] = {"x-headroom-user-id": "alice"}
         self.query_params: dict[str, str] = {}
         self.url = SimpleNamespace(path="/v1beta/models/gemini-pro:generateContent", query="")
         self.scope: dict = {"type": "http", "method": "POST"}
         self.client = SimpleNamespace(host="127.0.0.1", port=50000)
+
+    async def stream(self):  # noqa: ANN201
+        yield self._raw
 
 
 class _UpstreamResponse:
@@ -101,14 +108,10 @@ class _Handler(GeminiHandlerMixin):
 
 
 async def _send(monkeypatch: pytest.MonkeyPatch, body: dict) -> dict:
-    async def payload(request):  # noqa: ANN001, ANN202
-        return body
-
-    monkeypatch.setattr("headroom.proxy.helpers._read_request_json", payload)
     monkeypatch.setenv("HEADROOM_MEMORY_INJECTION_MODE", "live_zone_tail")
 
     handler = _Handler()
-    response = await handler.handle_gemini_generate_content(_FakeRequest(), "gemini-pro")
+    response = await handler.handle_gemini_generate_content(_FakeRequest(body), "gemini-pro")
     assert response.status_code == 200
     (forwarded,) = handler.forwarded
     return forwarded
