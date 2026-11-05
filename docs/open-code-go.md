@@ -233,7 +233,7 @@ and [http://127.0.0.1:8789/dashboard](http://127.0.0.1:8789/dashboard).
 
 If you also want DeepSeek's direct API (separate API key, per-token pricing,
 no Go usage caps), add a third proxy and provider. See the companion guide:
-**[open-code-deepseek.md](open-code-deepseek.md)**.
+**[DeepSeek integration guide](https://docs.headroomlabs.ai/docs/opencode-deepseek)**.
 
 The three-proxy full setup gives you 25+ compressed models across DeepSeek
 direct + OpenCode Go.
@@ -283,7 +283,7 @@ headroom learn --verbosity --apply
 
 - **Claude or GPT models** — use [OpenCode Zen](https://opencode.ai/docs/zen) for those
 - **`headroom wrap`** — do not use it; it overrides your config
-- **Direct DeepSeek API** — see the [DeepSeek guide](open-code-deepseek.md) for that setup
+- **Direct DeepSeek API** — see the [DeepSeek guide](https://docs.headroomlabs.ai/docs/opencode-deepseek) for that setup
 - **Deprecated model names** — `deepseek-chat` and `deepseek-reasoner` are compatibility
   aliases; use `deepseek-v4-pro` and `deepseek-v4-flash` instead
 - **Kompress (ML compression)** — requires extra dependencies; SmartCrusher handles
