@@ -529,6 +529,17 @@ def dashboard(port: int, no_open: bool) -> None:
     ),
 )
 @click.option(
+    "--ccr-buffered-chat-streaming",
+    is_flag=True,
+    envvar="HEADROOM_CCR_BUFFERED_CHAT_STREAMING",
+    help=(
+        "Answer headroom_retrieve on streaming /v1/chat/completions. A turn that "
+        "carries a redeemable marker runs as stream:false upstream and is "
+        "re-emitted as chat.completion.chunk frames, so that turn's text arrives "
+        "all at once. Off by default. Env: HEADROOM_CCR_BUFFERED_CHAT_STREAMING."
+    ),
+)
+@click.option(
     "--no-ccr-proactive-expansion",
     is_flag=True,
     envvar="HEADROOM_NO_CCR_PROACTIVE_EXPANSION",
@@ -1183,6 +1194,7 @@ def proxy(
     no_ccr: bool,
     lossless: bool,
     ccr_inline_resolve: bool,
+    ccr_buffered_chat_streaming: bool,
     no_ccr_proactive_expansion: bool,
     proxy_extension: tuple[str, ...],
     compressor: tuple[str, ...],
@@ -1526,6 +1538,7 @@ def proxy(
         ccr_inject_marker=not no_ccr,
         ccr_handle_responses=not no_ccr,
         ccr_resolve_markers_inline=ccr_inline_resolve,
+        ccr_buffered_chat_streaming=ccr_buffered_chat_streaming,
         lossless=lossless,
         ccr_proactive_expansion=not no_ccr_proactive_expansion,
         # Flatten repeat-flag tuple AND any comma-separated values inside it.
