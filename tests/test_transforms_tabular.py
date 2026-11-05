@@ -403,6 +403,37 @@ def test_parse_csv_and_records() -> None:
     assert records[1] == {"name": "Bob", "age": "25", "city": "LA"}
 
 
+def test_parse_csv_keeps_interior_blank_rows_and_trims_the_ends() -> None:
+    headers, rows = parse_csv("a,b\n1,2\n,\n3,4\n,\n5,6\n,\n")
+    assert headers == ["a", "b"]
+    assert rows == [["1", "2"], ["", ""], ["3", "4"], ["", ""], ["5", "6"]]
+    # Empty and whitespace-only lines have no real cells and are still skipped.
+    assert parse_csv("a,b\n1,2\n\n3,4\n")[1] == [["1", "2"], ["3", "4"]]
+    assert parse_csv("a,b\n1,2\n  \n3,4\n")[1] == [["1", "2"], ["3", "4"]]
+
+
+def test_parse_csv_normalizes_whitespace_only_interior_rows() -> None:
+    headers, rows = parse_csv("a,b\n1,2\n  ,  \n3,4\n")
+    assert rows == [["1", "2"], ["", ""], ["3", "4"]]
+
+
+def test_parse_csv_trims_a_large_blank_prefix_in_linear_time() -> None:
+    import time
+
+    def run(n: int) -> float:
+        text = ",\n" * n + "a,b\n1,2\n"
+        t0 = time.perf_counter()
+        headers, rows = parse_csv(text)
+        elapsed = time.perf_counter() - t0
+        assert headers == ["a", "b"]
+        assert rows == [["1", "2"]]
+        return elapsed
+
+    small, large = run(25_000), run(200_000)
+    # 8x the rows: linear stays near 8x; the old pop(0) loop was ~57x.
+    assert large < max(small, 1e-3) * 25, (small, large)
+
+
 def test_parse_markdown_table_drops_separator() -> None:
     headers, rows = parse_markdown_table(MARKDOWN)
     assert headers == ["name", "age"]
