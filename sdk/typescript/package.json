@@ -1,6 +1,6 @@
 {
   "name": "headroom-ai",
-  "version": "0.42.0",
+  "version": "0.43.0",
   "description": "Compress tool outputs, logs, JSON and chat history before each LLM call. Fewer input tokens, same answers. Adapters for OpenAI, Anthropic, Gemini and the Vercel AI SDK. Runs against the local Headroom proxy (pip install \"headroom-ai[proxy]\").",
   "keywords": [
     "llm",
