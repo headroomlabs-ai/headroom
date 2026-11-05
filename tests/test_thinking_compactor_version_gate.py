@@ -51,3 +51,23 @@ def test_date_suffix_is_not_read_as_minor_version() -> None:
     assert bills_prior_thinking("claude-sonnet-4-20250514") is False
     # Sanity: the real 4.6 id still bills.
     assert bills_prior_thinking("claude-sonnet-4-6-20260101") is True
+
+
+def test_compact_thinking_to_text_leaves_null_thinking_block_alone() -> None:
+    """``"thinking": null`` must not raise (docstring: "Never raises")."""
+    from headroom.transforms.thinking_compactor import compact_thinking_to_text
+
+    class _K:
+        def compress(self, text, **kwargs):
+            return type("R", (), {"compressed": text[:10]})()
+
+    null_block = {"type": "thinking", "thinking": None, "signature": "s"}
+    msgs = [
+        {"role": "user", "content": "q"},
+        {"role": "assistant", "content": [null_block, {"type": "text", "text": "a"}]},
+        {"role": "user", "content": "q2"},
+        {"role": "assistant", "content": [{"type": "text", "text": "b"}]},
+    ]
+    out, stats = compact_thinking_to_text(msgs, kompress=_K())
+    assert out[1]["content"][0] == null_block
+    assert stats["blocks"] == 0
