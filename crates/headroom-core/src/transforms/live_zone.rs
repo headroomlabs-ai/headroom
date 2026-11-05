@@ -115,6 +115,7 @@ use super::diff_compressor::{DiffCompressor, DiffCompressorConfig};
 #[cfg(feature = "ml")]
 use super::kompress::{Kompress, KompressConfig};
 use super::log_compressor::{LogCompressor, LogCompressorConfig};
+use super::pipeline::JsonMinifier;
 use super::search_compressor::{SearchCompressor, SearchCompressorConfig};
 use super::smart_crusher::{SmartCrusher, SmartCrusherConfig};
 use crate::ccr::{compute_key, marker_for, CcrStore};
@@ -644,11 +645,18 @@ pub fn kompress_init_runs() -> usize {
 #[cfg(feature = "ml")]
 fn run_kompress_init() {
     KOMPRESS_INIT_RUNS.fetch_add(1, Ordering::Relaxed);
-    let slot = match Kompress::from_cache(KompressConfig::default()) {
-        Ok(k) => k, // None => HF cache cold: deterministic NoOp downstream
-        Err(e) => {
-            tracing::warn!(event = "kompress_init_failed", error = %e);
-            None
+    // Before any `ort` call: unsupported CPU => SIGILL, unpinned loader =>
+    // deadlock. Same guards magika and the embedding scorer run first.
+    let slot = if let Err((reason, error)) = super::kompress::ort_session_preconditions() {
+        tracing::warn!(event = "kompress_init_skipped", reason, error = %error);
+        None
+    } else {
+        match Kompress::from_cache(KompressConfig::default()) {
+            Ok(k) => k, // None => HF cache cold: deterministic NoOp downstream
+            Err(e) => {
+                tracing::warn!(event = "kompress_init_failed", error = %e);
+                None
+            }
         }
     };
     let ready = slot.is_some();
@@ -1176,8 +1184,11 @@ fn compress_one_block(
             // stays honest — the marker costs ~6 tokens and we'd
             // rather forward the original than ship a bigger payload
             // for a 5-byte block.
-            let (compressed_for_replacement, ccr_hash_emitted) =
-                maybe_inject_ccr_marker(content_text, &compressed, ccr_store);
+            let (compressed_for_replacement, ccr_hash_emitted) = if strategy == "json_minifier" {
+                (compressed, None)
+            } else {
+                maybe_inject_ccr_marker(content_text, &compressed, ccr_store)
+            };
             let compressed_bytes = compressed_for_replacement.len();
             // 3. Tokenizer-validated rejection. Per PR-B4 spec we
             //    count both the original and compressed strings
@@ -1659,6 +1670,12 @@ fn dispatch_compressor(text: &str, content_type: ContentType) -> DispatchResult 
             // arrays, and returns the input.
             let result = smart_crusher().crush(text, EMPTY_QUERY, DEFAULT_BIAS);
             if !result.was_modified {
+                if let Ok(Some(minified)) = JsonMinifier.minify(text) {
+                    return DispatchResult::Compressed {
+                        strategy: "json_minifier",
+                        compressed: minified,
+                    };
+                }
                 return DispatchResult::NoOp {
                     content_type: content_type.as_str(),
                 };

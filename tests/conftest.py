@@ -19,6 +19,37 @@ import pytest
 from tests._skip_helpers import external_model_skip_reason
 
 
+@pytest.fixture
+def gemini_request():
+    """A real ASGI request whose JSON arrives in two stream messages."""
+    from starlette.requests import Request
+
+    body = json.dumps({"contents": [{"role": "user", "parts": [{"text": "hello"}]}]}).encode()
+    middle = len(body) // 2
+    messages = iter(
+        [
+            {"type": "http.request", "body": body[:middle], "more_body": True},
+            {"type": "http.request", "body": body[middle:], "more_body": False},
+        ]
+    )
+
+    async def receive():
+        return next(messages, {"type": "http.disconnect"})
+
+    return Request(
+        {
+            "type": "http",
+            "method": "POST",
+            "path": "/v1beta/models/gemini-pro:generateContent",
+            "query_string": b"",
+            "headers": [(b"content-type", b"application/json")],
+            "scheme": "https",
+            "server": ("gemini.example", 443),
+        },
+        receive,
+    )
+
+
 @pytest.fixture(autouse=True)
 def _undo_process_trust_injection():
     """Undo ``truststore.inject_into_ssl()`` after any test that triggered it.

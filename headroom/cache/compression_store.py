@@ -71,6 +71,8 @@ _SECRET_KEY_VALUE_RE = re.compile(
 )
 _AUTH_VALUE_RE = re.compile(r"(?i)\b(Bearer|Basic)\s+[A-Za-z0-9._~+/=-]{12,}")
 _API_KEY_VALUE_RE = re.compile(r"\bsk-[A-Za-z0-9_-]{12,}\b")
+# Exactly one CCR marker and nothing else (see ``store`` and #2694, #4266).
+_BARE_CCR_MARKER_RE = re.compile(r"<<ccr:[^>\n]+>>")
 
 
 def _get_env_default_ttl_seconds() -> int:
@@ -383,7 +385,9 @@ class CompressionStore:
         # loudly rather than silently converting "retrievable" into "gone".
         # Narrow by design: only a *bare* marker is rejected. Legitimate
         # originals may legally CONTAIN markers (nested offloads, a tool that
-        # echoed one), and refusing those would drop recoverable data.
+        # echoed one), and refusing those would drop recoverable data. That
+        # includes an original that starts with one marker and ends with
+        # another (#4266), so the check is a full match of a single marker.
         #
         # The rejected value is never echoed into the log. It is provably a
         # bare marker here, but `original` is the store's credential-bearing
@@ -391,7 +395,7 @@ class CompressionStore:
         # OAuth token), and an error path is exactly where that sort of leak
         # survives review. `hash_key` already identifies the entry.
         stripped = original.strip()
-        if stripped.startswith("<<ccr:") and stripped.endswith(">>") and "\n" not in stripped:
+        if _BARE_CCR_MARKER_RE.fullmatch(stripped):
             logger.error(
                 "CCR store: refusing to persist a bare retrieval marker as "
                 "original_content (hash=%s tool=%s strategy=%s len=%d) — the "

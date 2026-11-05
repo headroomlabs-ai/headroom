@@ -242,6 +242,60 @@ describe("headroomSetup (OpenCode 2.x)", () => {
     });
   });
 
+  it.each([
+    ["@opencode/ai/providers/anthropic", "https://api.githubcopilot.com", "/messages"],
+    ["@opencode/ai/providers/anthropic-compatible", "https://gateway.example/v1", "/v1/messages"],
+  ])("routes Anthropic Messages models through the proxy (%s)", async (packageName, baseURL, originalPath) => {
+    // GitHub Copilot serves Claude models as @opencode/ai/providers/anthropic
+    // with a prefix-free Copilot baseURL; the OpenAI-only wire check used to
+    // skip them.
+    const models: FakeModel[] = [{ id: "claude-sonnet-5.5", providerID: "github-copilot" }];
+    const { context } = pluginContextV2(
+      { proxyUrl: "http://127.0.0.1:8787" },
+      {
+        providers: [{ id: "github-copilot", package: packageName, settings: { baseURL } }],
+        models,
+      },
+    );
+
+    const cleanup = await headroomSetup(context);
+    await cleanup?.();
+
+    expect(models[0]).toMatchObject({
+      settings: { baseURL: "http://127.0.0.1:8787/v1" },
+      headers: {
+        "x-headroom-base-url": new URL(baseURL).origin,
+        "x-headroom-original-path": originalPath,
+        "x-headroom-project": "project-1",
+      },
+    });
+  });
+
+  it("leaves a prefixed Anthropic Messages gateway on its own base URL", async () => {
+    // The proxy's Anthropic route rebuilds the upstream path from its incoming
+    // /v1/messages and ignores x-headroom-original-path, so rewriting a
+    // prefixed gateway would drop that prefix. Keep those models direct.
+    const models: FakeModel[] = [{ id: "glm-5.2", providerID: "zai-coding-plan" }];
+    const { context } = pluginContextV2(
+      { proxyUrl: "http://127.0.0.1:8787" },
+      {
+        providers: [
+          {
+            id: "zai-coding-plan",
+            package: "@opencode/ai/providers/zai-coding-plan/messages",
+            settings: { baseURL: "https://api.z.ai/api/coding/paas/v4" },
+          },
+        ],
+        models,
+      },
+    );
+
+    const cleanup = await headroomSetup(context);
+    await cleanup?.();
+
+    expect(models[0]).toEqual({ id: "glm-5.2", providerID: "zai-coding-plan" });
+  });
+
   it("prefers a model's own baseURL over its provider's", async () => {
     const models: FakeModel[] = [
       {
@@ -404,12 +458,10 @@ describe("headroomSetup (OpenCode 2.x)", () => {
     });
   });
 
-  it("leaves local, already-proxied, non-OpenAI-wire and URL-less models alone", async () => {
+  it("leaves local, already-proxied, URL-less and unsupported-protocol models alone", async () => {
     const models: FakeModel[] = [
       { id: "llama", providerID: "ollama" },
       { id: "gpt-4o", providerID: "openai" },
-      { id: "claude", providerID: "anthropic-gateway" },
-      { id: "glm", providerID: "zai-coding-plan", package: "@opencode/ai/providers/zai-coding-plan/messages" },
       { id: "sonnet", providerID: "anthropic" },
       { id: "gemini", providerID: "google" },
     ];
@@ -427,16 +479,6 @@ describe("headroomSetup (OpenCode 2.x)", () => {
             id: "openai",
             package: "@opencode/ai/providers/openai/responses",
             settings: { baseURL: "http://127.0.0.1:8787/v1" },
-          },
-          {
-            id: "anthropic-gateway",
-            package: "@opencode/ai/providers/anthropic",
-            settings: { baseURL: "https://gateway.example/v1" },
-          },
-          {
-            id: "zai-coding-plan",
-            package: "@opencode/ai/providers/zai-coding-plan/chat",
-            settings: { baseURL: "https://api.z.ai/api/coding/paas/v4" },
           },
           { id: "anthropic", package: "@opencode/ai/providers/anthropic" },
           {
