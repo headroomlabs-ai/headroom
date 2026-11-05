@@ -79,6 +79,12 @@ pub fn max_lifetime_for(idle_ttl: Duration) -> Duration {
     idle_ttl.saturating_mul(DEFAULT_MAX_LIFETIME_MULTIPLIER)
 }
 
+/// `u64` seconds -> `i64` for SQLite/Redis. Saturates: `u64::MAX` ("never
+/// expire") must not wrap to -1 and expire at once.
+pub(crate) fn secs_i64(secs: u64) -> i64 {
+    i64::try_from(secs).unwrap_or(i64::MAX)
+}
+
 /// Compute the canonical CCR key for `payload`. BLAKE3 → first 24 hex
 /// chars (96 bits — collision-resistant for the bounded LRU population
 /// the proxy will hold). Centralized here so every call site (live-zone

@@ -409,11 +409,66 @@ def test_parse_csv_and_records() -> None:
     assert records[1] == {"name": "Bob", "age": "25", "city": "LA"}
 
 
+def test_parse_csv_keeps_interior_blank_rows_and_trims_the_ends() -> None:
+    headers, rows = parse_csv("a,b\n1,2\n,\n3,4\n,\n5,6\n,\n")
+    assert headers == ["a", "b"]
+    assert rows == [["1", "2"], ["", ""], ["3", "4"], ["", ""], ["5", "6"]]
+    # Empty and whitespace-only lines have no real cells and are still skipped.
+    assert parse_csv("a,b\n1,2\n\n3,4\n")[1] == [["1", "2"], ["3", "4"]]
+    assert parse_csv("a,b\n1,2\n  \n3,4\n")[1] == [["1", "2"], ["3", "4"]]
+
+
+def test_parse_csv_normalizes_whitespace_only_interior_rows() -> None:
+    headers, rows = parse_csv("a,b\n1,2\n  ,  \n3,4\n")
+    assert rows == [["1", "2"], ["", ""], ["3", "4"]]
+
+
+def test_parse_csv_trims_a_large_blank_prefix_in_linear_time() -> None:
+    import time
+
+    def run(n: int) -> float:
+        text = ",\n" * n + "a,b\n1,2\n"
+        t0 = time.perf_counter()
+        headers, rows = parse_csv(text)
+        elapsed = time.perf_counter() - t0
+        assert headers == ["a", "b"]
+        assert rows == [["1", "2"]]
+        return elapsed
+
+    small, large = run(25_000), run(200_000)
+    # 8x the rows: linear stays near 8x; the old pop(0) loop was ~57x.
+    assert large < max(small, 1e-3) * 25, (small, large)
+
+
 def test_parse_markdown_table_drops_separator() -> None:
     headers, rows = parse_markdown_table(MARKDOWN)
     assert headers == ["name", "age"]
     assert ["Alice", "30"] in rows
     assert all("---" not in cell for row in rows for cell in row)
+
+
+def test_parse_csv_keeps_empty_records() -> None:
+    headers, rows = parse_csv("a,b\n1,2\n,\n3,4")
+    assert headers == ["a", "b"]
+    assert rows == [["1", "2"], ["", ""], ["3", "4"]]
+
+
+def test_parse_csv_keeps_empty_records_tsv() -> None:
+    headers, rows = parse_csv("a\tb\n1\t2\n\t\n3\t4", delimiter="\t")
+    assert headers == ["a", "b"]
+    assert rows == [["1", "2"], ["", ""], ["3", "4"]]
+
+
+def test_parse_csv_keeps_quoted_empty_record() -> None:
+    headers, rows = parse_csv('a,b\n"",""\n1,2')
+    assert headers == ["a", "b"]
+    assert rows[0] == ["", ""]
+
+
+def test_parse_markdown_table_keeps_separator_like_body_row() -> None:
+    headers, rows = parse_markdown_table("| a | b |\n|---|---|\n| 1 | 2 |\n| --- | --- |")
+    assert headers == ["a", "b"]
+    assert rows == [["1", "2"], ["---", "---"]]
 
 
 def test_parse_tabular_rejects_ragged_fixed_width(monkeypatch) -> None:
@@ -464,6 +519,42 @@ def test_compress_passes_through_ragged_table(monkeypatch) -> None:
     assert result.compressed == ragged
 
 
+# Duplicate header names ------------------------------------------------------
+
+
+def _duplicate_header_csv() -> str:
+    # A SQL join result: the same column name appears twice (#4277).
+    return "id,name,id,name\n" + "".join(f"{i},user_{i},{100 + i},org_{i % 3}\n" for i in range(40))
+
+
+def test_parse_tabular_rejects_duplicate_headers() -> None:
+    # Two columns with the same name cannot be zipped into records without one
+    # overwriting the other, so the earlier column's values would be lost.
+    assert parse_tabular(_duplicate_header_csv()) is None
+
+
+def test_parse_tabular_rejects_duplicate_blank_markdown_headers(monkeypatch) -> None:
+    import headroom.transforms.tabular_ingest as ti
+
+    monkeypatch.setattr(
+        ti,
+        "detect_content_type",
+        lambda _c: DetectionResult(ContentType.TABULAR, 0.9, {"format": "markdown"}),
+    )
+    # Two blank header cells collapse to the same "" key.
+    blank = "|  |  |\n| --- | --- |\n| 1 | 2 |\n| 3 | 4 |"
+    assert ti.parse_tabular(blank) is None
+
+
+def test_compress_passes_through_a_table_with_duplicate_headers() -> None:
+    content = _duplicate_header_csv()
+
+    result = TabularCompressor().compress(content)
+
+    assert not result.was_modified
+    assert result.compressed == content
+
+
 _JOIN_CSV = "id,name,id,name\n1,alice,10,acme\n2,bob,20,globex\n3,carol,30,initech\n"
 _BLANK_HEADER_MARKDOWN = (
     "| id | | |\n| --- | --- | --- |\n| 1 | alice | x |\n| 2 | bob | y |\n| 3 | carol | z |"
@@ -471,13 +562,13 @@ _BLANK_HEADER_MARKDOWN = (
 
 
 @pytest.mark.parametrize("content", [_JOIN_CSV, _BLANK_HEADER_MARKDOWN])
-def test_parse_tabular_rejects_duplicate_headers(content: str) -> None:
+def test_parse_tabular_rejects_duplicate_headers_upstream(content: str) -> None:
     # Records are keyed by header, so a repeated name keeps only its last
     # column: `alice` and `bob` would vanish from the compressed table.
     assert parse_tabular(content) is None
 
 
-def test_compress_passes_through_duplicate_headers() -> None:
+def test_compress_passes_through_duplicate_headers_upstream() -> None:
     # Large enough that SmartCrusher would otherwise save bytes on it.
     content = "id,name,id,name\n" + "".join(
         f"{i},user_{i},{100 + i},org_{i % 3}\n" for i in range(40)
@@ -485,6 +576,17 @@ def test_compress_passes_through_duplicate_headers() -> None:
     result = TabularCompressor().compress(content)
     assert not result.was_modified
     assert result.compressed == content
+
+
+def test_router_keeps_every_column_of_a_table_with_duplicate_headers() -> None:
+    content = _duplicate_header_csv()
+
+    result = ContentRouter().compress(content)
+
+    # No column may be dropped, and the remaining values must not be
+    # relabelled as if they came from the dropped columns.
+    for value in ("user_7", "org_1", "100", "107"):
+        assert value in result.compressed
 
 
 def _csv_with_an_oversized_cell() -> str:
@@ -568,7 +670,7 @@ def test_parse_tabular_rejects_single_column_fixed_width(monkeypatch) -> None:
 def test_parse_tabular_none_when_no_data_rows_survive() -> None:
     # Detected as a markdown table, but it is header + separator rows only:
     # nothing survives as a data row, so parse_tabular bails to None.
-    assert parse_tabular("| a | b |\n| --- | --- |\n| --- | --- |") is None
+    assert parse_tabular("| a | b |\n| --- | --- |") is None
 
 
 def test_compression_ratio_zero_for_empty_original() -> None:
