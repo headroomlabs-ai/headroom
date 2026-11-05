@@ -7,6 +7,29 @@ from headroom.proxy.gateway.egress import EgressPolicy, build_managed_upstream_h
 from headroom.proxy.gateway.errors import GatewayEgressDenied
 
 
+@pytest.mark.asyncio
+async def test_offline_gateway_forwarding_client_construction_never_dials(monkeypatch):
+    import socket
+    from pathlib import Path
+
+    from headroom.proxy.gateway.config import GatewayConfigSnapshot
+    from headroom.proxy.gateway.transport import http_client
+
+    monkeypatch.setenv("HEADROOM_OFFLINE", "1")
+
+    def forbidden(*args, **kwargs):
+        raise AssertionError("constructing a gateway client opened a connection")
+
+    monkeypatch.setattr(socket.socket, "connect", forbidden)
+    monkeypatch.setattr(socket, "create_connection", forbidden)
+    example = (
+        Path(__file__).parents[2]
+        / "docs/proposals/unified-api-gateway/examples/gateway.api-keys.json"
+    )
+    client = http_client(GatewayConfigSnapshot.load(example))
+    await client.aclose()
+
+
 @pytest.fixture
 def lease() -> CredentialLease:
     return CredentialLease(

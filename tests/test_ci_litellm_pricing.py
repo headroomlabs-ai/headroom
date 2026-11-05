@@ -35,6 +35,8 @@ def test_ci_jobs_load_bundled_litellm_pricing() -> None:
             )
 
     # Exercise LiteLLM itself with the environment inherited by a CI test job.
+    # Newer wheels extract fallback_generalizations as routing metadata; it is
+    # not a model/pricing row in the runtime map. Every model row must match.
     # A remote fetch can succeed while silently removing models required by tests.
     test_env = os.environ | workflow.get("env", {}) | jobs["test"].get("env", {})
     result = subprocess.run(
@@ -44,11 +46,14 @@ def test_ci_jobs_load_bundled_litellm_pricing() -> None:
             "import litellm; "
             "from litellm.litellm_core_utils.get_model_cost_map import "
             "get_model_cost_map_source_info; "
+            "litellm.model_cost.get('gpt-4o'); "
+            "loaded = dict(litellm.model_cost.items()); "
             "assert get_model_cost_map_source_info()['is_env_forced']; "
             "import json; from importlib.resources import files; "
             "bundled = json.loads(files('litellm').joinpath("
             "'model_prices_and_context_window_backup.json').read_text(encoding='utf-8')); "
-            "assert bundled and litellm.model_cost == bundled",
+            "bundled.pop('fallback_generalizations', None); "
+            "assert bundled and loaded == bundled",
         ],
         env=test_env,
         capture_output=True,

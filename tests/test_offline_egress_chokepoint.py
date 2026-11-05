@@ -2825,6 +2825,14 @@ _PERMITTED_CATEGORIES = frozenset(
 )
 
 _EGRESS_ALLOWLIST: dict[str, tuple[int, str]] = {
+    "proxy/gateway/transport.py": (
+        1,
+        "user-traffic: the gateway client forwards only caller requests to the "
+        "operator-configured route through credential-bound, DNS-pinned transport. "
+        "Its construction does not dial; it is not an autonomous downloader, "
+        "telemetry exporter, or identity-refresh client. Offline forwarding uses "
+        "the same documented exception as the normal proxy.",
+    ),
     "proxy/server.py": (
         2,
         "user-traffic: the proxy forwarding the caller's request to the "
