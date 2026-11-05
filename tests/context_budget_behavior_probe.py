@@ -434,7 +434,10 @@ def run_backend(*, stream=False, cross_vendor=False, reject=True, form="text", b
     blocks.append(
         {"type": "tool_use", "id": "t", "name": "sample", "input": {}}
         if form == "tool"
-        else {"type": "text", "text": "ok"}
+        # Main normalizes the last text block's prompt-cache marker before
+        # preparing backend arguments. Seed that same wire shape so the probe
+        # isolates guard/SDK immutability rather than cache-marker insertion.
+        else {"type": "text", "text": "ok", "cache_control": {"type": "ephemeral"}}
     )
     body = {
         "model": "source-model",
