@@ -18,10 +18,11 @@ import ssl
 import threading
 import time
 import uuid
-from collections import OrderedDict
+from collections import Counter, OrderedDict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import replace
 from datetime import datetime
+from types import MappingProxyType
 from typing import TYPE_CHECKING, Any
 from urllib.parse import quote, unquote, urlparse
 
@@ -46,12 +47,17 @@ from headroom.proxy.provider_usage import (
 )
 from headroom.proxy.rate_limit_identity import rate_limit_identity
 from headroom.proxy.savings import ItemMeasure, get_item_ledger, prefix_key, responses_items
+from headroom.proxy.savings_attribution import SAVINGS_ATTRIBUTION_TAG
+from headroom.proxy.savings_attribution import accumulate as accumulate_savings
+from headroom.proxy.savings_attribution import from_tags as savings_from_tags
 from headroom.proxy.semantic_cache_key_policy import compute_request_cache_partition
 from headroom.proxy.stage_timer import StageTimer, emit_stage_timings_log
 from headroom.proxy.tool_schema_savings_policy import (
     net_hook_tool_saving,
+    tool_schema_saved_from_tags,
     without_deferral_flags,
 )
+from headroom.proxy.turn_hooks import run_responses_create_hooks
 from headroom.proxy.upstream_guard import is_safe_upstream_url
 from headroom.proxy.ws_headers import WS_HOP_BY_HOP_HEADERS
 from headroom.proxy.ws_session_registry import (
@@ -108,6 +114,7 @@ from headroom.proxy.buffered_ccr_response import (
 from headroom.proxy.compression_decision import CompressionDecision
 from headroom.proxy.cost import header_safe_transforms
 from headroom.proxy.handlers._debug_dump import _debug_dump_mode, _redact_debug_value
+from headroom.proxy.handlers.streaming import _stream_outcome_status
 from headroom.proxy.image_isolation import run_image_compression_isolated
 from headroom.proxy.outcome import RequestOutcome
 from headroom.proxy.output_shaper import shaper_enabled_for, steering_allowed_for
@@ -127,6 +134,7 @@ from headroom.proxy.token_counting import gemini_output_tokens
 logger = logging.getLogger("headroom.proxy")
 
 _OPENAI_RESPONSES_UNIT_CACHE_MAX_ENTRIES = 10_000
+_OPENAI_RESPONSES_TOOL_CONTEXT_LIMIT = 512
 _OPENAI_RESPONSES_UNIT_CACHE_VERSION = "openai_responses_unit_v1"
 _OPENAI_RESPONSES_UNIT_PARALLELISM_ENV = "HEADROOM_TOOL_OUTPUT_COMPRESSION_PARALLELISM"
 _OPENAI_RESPONSES_UNIT_PARALLELISM_DEFAULT = 4
@@ -737,6 +745,35 @@ def _openai_responses_result_with_cache_hit(result: Any) -> Any:
     return replace(result, router_result=replace(router_result, cache_hit=True))
 
 
+def _openai_responses_cached_ccr_markers_live(result: Any) -> bool:
+    """Return whether CCR markers generated for a cached unit are still retrievable.
+
+    The unit-result cache outlives CCR entries: it has no TTL, while a CCR entry
+    expires after the CCR TTL and is written only when the unit is compressed.
+    Treat an expired generated entry as a miss so compression stores it again.
+    Inherited markers cannot be restored by recompressing the unit. A store that
+    cannot be consulted keeps the previous behaviour (reuse).
+    """
+    compressed = getattr(result, "compressed", None)
+    if not isinstance(compressed, str):
+        return True
+    hashes = Counter(match.group(1).lower() for match in _CCR_HASH_RE.finditer(compressed))
+    original = getattr(result, "original", "")
+    if isinstance(original, str):
+        # Inherited markers are preserved byte-for-byte; extra occurrences are generated.
+        hashes -= Counter(match.group(1).lower() for match in _CCR_HASH_RE.finditer(original))
+    if not hashes:
+        return True
+    try:
+        from headroom.cache.compression_store import get_compression_store
+
+        store = get_compression_store()
+        return all(store.exists(hash_key) for hash_key in hashes)
+    except Exception:
+        logger.debug("CCR liveness check for a cached Responses unit failed")
+        return True
+
+
 def _codex_ws_text_shape(text: str) -> str:
     stripped = text.strip()
     if not stripped:
@@ -826,7 +863,7 @@ def _shape_openai_responses_payload(
     The Responses counterpart of the Anthropic handler's shaping block:
     conversation-stable holdout assignment, stratum labelling for the
     output-savings ledger, then verbosity steering on the ``instructions``
-    tail and ``reasoning.effort`` routing on mechanical continuations.
+    tail.
 
     Returns ``(labels, mutated)``. ``labels`` are carried on the transforms
     channel for both arms (the control arm's stratum label is what feeds the
@@ -1094,6 +1131,109 @@ def _ensure_chatgpt_responses_store_false(
     return False
 
 
+def _web_search_history_drop_enabled() -> bool:
+    from headroom.proxy import runtime_env
+
+    return (runtime_env.getenv("HEADROOM_WEB_SEARCH_HISTORY", "1") or "1").strip().lower() not in (
+        "0",
+        "false",
+        "no",
+        "off",
+    )
+
+
+def _drop_undeclared_web_search_calls(
+    payload: dict[str, Any],
+    *,
+    request_id: str | None = None,
+) -> int:
+    """Drop hosted ``web_search_call`` items from a request that cannot search.
+
+    Workaround for an OpenAI backend behaviour, not a Headroom bug. Codex on a
+    custom model provider (how Headroom wraps it) compacts locally: it resends
+    the whole history to ``/v1/responses`` with ``tools: []``. When that
+    history holds a hosted ``web_search_call`` item, the ChatGPT backend
+    answers 200 and then the in-band error "response protection is
+    unavailable". Codex ignores in-band ``error`` events, reports "stream
+    closed before response.completed", retries, and runs the same compaction
+    before every later prompt, so the session never answers again. The same
+    body completes with the ``web_search_call`` items removed, or with a
+    web_search tool declared.
+
+    Only the search action (its query or URL) leaves the history; the results
+    were never in it, and the model's answer that followed is a separate
+    ``message`` item that stays. A tool counts as declared in top-level
+    ``tools`` or in a Codex ``additional_tools`` input item (Codex >= 0.149
+    sends tools that way), under any ``web_search*`` type spelling. A request
+    continuing ``previous_response_id`` is left alone: its declarations may
+    live server-side.
+
+    Mutates *payload* in place and returns the number of items dropped
+    (0 = untouched). Callers skip it for a bypass request
+    (``x-headroom-bypass: true``), which asked for its bytes untouched.
+    Disable with ``HEADROOM_WEB_SEARCH_HISTORY=0`` (a registered runtime-env
+    knob, so ``headroom wrap`` also pushes it to a reused proxy). Remove once
+    the backend accepts such a body.
+    """
+    items = payload.get("input")
+    if not isinstance(items, list) or payload.get("previous_response_id"):
+        return 0
+    if not any(isinstance(item, dict) and item.get("type") == "web_search_call" for item in items):
+        return 0
+    tools = payload.get("tools")
+    declared = list(tools) if isinstance(tools, list) else []
+    for item in items:
+        if isinstance(item, dict) and item.get("type") == "additional_tools":
+            declared.extend(item["tools"] if isinstance(item.get("tools"), list) else [])
+    if any(
+        isinstance(tool, dict) and str(tool.get("type") or "").startswith("web_search")
+        for tool in declared
+    ):
+        return 0
+    if not _web_search_history_drop_enabled():
+        return 0
+    kept = [
+        item
+        for item in items
+        if not (isinstance(item, dict) and item.get("type") == "web_search_call")
+    ]
+    payload["input"] = kept
+    dropped = len(items) - len(kept)
+    logger.info(
+        "event=web_search_history request_id=%s dropped=%d reason=no_web_search_tool",
+        request_id or "-",
+        dropped,
+    )
+    return dropped
+
+
+def _drop_undeclared_web_search_calls_from_frame(
+    raw_msg: str,
+    *,
+    request_id: str | None = None,
+) -> str:
+    """Apply :func:`_drop_undeclared_web_search_calls` to a WS ``response.create`` frame.
+
+    Returns *raw_msg* unchanged (same object) unless items were dropped. The
+    substring prescreen keeps every frame without a ``web_search_call`` from
+    paying a parse. JSON can spell the type with ``\\uXXXX`` escapes
+    (``"web_search\\u005fcall"``), and a letter or underscore can only be
+    escaped that way, so a frame holding any ``\\u`` is parsed too.
+    """
+    if '"web_search_call"' not in raw_msg and "\\u" not in raw_msg:
+        return raw_msg
+    try:
+        frame = json.loads(raw_msg)
+    except (json.JSONDecodeError, TypeError, ValueError):
+        return raw_msg
+    if not isinstance(frame, dict) or frame.get("type") != "response.create":
+        return raw_msg
+    payload = frame["response"] if isinstance(frame.get("response"), dict) else frame
+    if not _drop_undeclared_web_search_calls(payload, request_id=request_id):
+        return raw_msg
+    return json.dumps(frame)
+
+
 _RESPONSES_OUTPUT_ITEM_TYPES = frozenset(
     {
         "custom_tool_call_output",
@@ -1259,16 +1399,171 @@ def _should_buffer_openai_responses_stream_ccr(
     )
 
 
-def _should_inject_openai_chat_ccr_tool(*, ccr_inject_tool: bool, stream: bool) -> bool:
+def _should_inject_openai_chat_ccr_tool(
+    *, ccr_inject_tool: bool, stream: bool, buffered_eligible: bool = False
+) -> bool:
     """Return whether chat-completions can redeem an injected CCR tool.
 
-    The chat streaming path forwards SSE events immediately and deliberately
-    does not run the response continuation loop. Injecting ``headroom_retrieve``
-    there makes OpenAI-compatible clients attempt an unknown tool call. The
+    A plain chat streaming turn forwards SSE events immediately and does not run
+    the response continuation loop, so injecting ``headroom_retrieve`` there
+    makes OpenAI-compatible clients attempt an unknown tool call. The
     non-streaming path can intercept and resolve it; Responses streaming has a
     separate buffered-CCR path and is unaffected by this predicate.
+
+    ``buffered_eligible`` is the third case: if this turn carries a marker it
+    will run the continuation loop before replying, so the tool is redeemable.
+    If it carries none, the model has no hash to call it with and the tool stays
+    resident only to keep the tools array byte-stable.
     """
-    return bool(ccr_inject_tool and not stream)
+    return bool(ccr_inject_tool and (buffered_eligible or not stream))
+
+
+def _is_openai_chat_stream_ccr_eligible(
+    *,
+    body: dict[str, Any],
+    enabled: bool,
+    ccr_response_handler_enabled: bool,
+    ccr_inject_tool: bool,
+    routed_to_backend: bool,
+    upstream_base_url: str | None = None,
+) -> bool:
+    """Return whether a streaming chat turn may answer retrievals by buffering.
+
+    Unlike :func:`_should_buffer_openai_responses_stream_ccr` this cannot key on
+    ``headroom_retrieve`` already being in ``tools``: on this path that test is
+    what decides injection, so it would never pass.
+
+    Requiring a non-empty client ``tools`` array keeps the rule from #3810: a
+    request with no tools is not an agent harness and must not be handed a tools
+    array it never sent. The rest are turns buffering cannot serve:
+
+    - A backend route streams through its own path, with no continuation loop.
+    - ``n > 1`` and ``logprobs`` ask for output that resynthesis does not carry.
+    - OpenCode Zen rejects requests Headroom has reshaped (``stream:false`` plus
+      ``accept: application/json``) with ``403 FreeTierError`` (#3656).
+    """
+    n = body.get("n")
+    return bool(
+        body.get("stream")
+        and enabled
+        and ccr_response_handler_enabled
+        and ccr_inject_tool
+        and body.get("tools")
+        and not routed_to_backend
+        and not (isinstance(n, int) and n > 1)
+        and not body.get("logprobs")
+        and not is_opencode_zen_base(upstream_base_url)
+    )
+
+
+def _chat_body_has_ccr_marker(body: dict[str, Any]) -> bool:
+    """Is there anything in the outgoing messages a resident tool could be called for?
+
+    Goes by marker shape alone, without the ownership check that decides
+    injection (#2836). An expired hash can still draw a retrieval call once the
+    tool is resident, and only the continuation loop can answer that call.
+    """
+    from headroom.ccr.tool_injection import CCRToolInjector
+
+    messages = body.get("messages")
+    if not isinstance(messages, list):
+        return False
+    probe = CCRToolInjector(provider="openai", inject_tool=False, inject_system_instructions=False)
+    try:
+        return bool(probe.scan_for_markers(messages))
+    except Exception:  # pragma: no cover - defensive
+        logger.debug("CCR: marker probe failed; keeping the buffered path", exc_info=True)
+        return True
+
+
+def _take_stream_options_for_buffered_chat(body: dict[str, Any]) -> bool:
+    """Drop ``stream_options`` from a body going out as ``stream: false``.
+
+    OpenAI answers 400 to ``stream_options`` on a non-streaming request. Returns
+    whether the client should still get the usage chunk, decided by the same
+    rule a plain streamed turn uses so the two cannot drift apart.
+    """
+    _apply_stream_usage_option(body)
+    stream_options = body.pop("stream_options", None)
+    return isinstance(stream_options, dict) and bool(stream_options.get("include_usage"))
+
+
+def _buffered_chat_reply_as_sse(
+    result: Response,
+    *,
+    ccr_response_handler: Any,
+    include_usage: bool,
+    continuation_status: int | None,
+    request_id: str,
+) -> Response:
+    """Turn the direct chat path's JSON reply into what a streaming client reads.
+
+    Anything but a 200 goes back untouched. Inside the grace window that hands
+    the client the real status, and past it :func:`buffered_ccr_asgi_call` turns
+    it into a typed stream error (#2997, #3079).
+    """
+    from fastapi.responses import JSONResponse, StreamingResponse
+
+    from headroom.ccr.response_handler import RESIDUAL_CCR_ERROR, StreamingCCRHandler
+
+    if result.status_code != 200:
+        return result
+
+    try:
+        reply = json.loads(result.body)
+    except (TypeError, ValueError):
+        reply = None
+    choices = reply.get("choices") if isinstance(reply, dict) else None
+    first_choice = choices[0] if isinstance(choices, list) and choices else None
+    if not isinstance(first_choice, dict) or not isinstance(first_choice.get("message"), dict):
+        logger.warning(f"[{request_id}] CCR: rejecting malformed buffered chat 200 reply")
+        return JSONResponse(
+            status_code=502,
+            content={
+                "error": {
+                    "type": "upstream_protocol_error",
+                    "message": "Upstream returned an invalid buffered response.",
+                }
+            },
+        )
+
+    sse_headers = {
+        k: v
+        for k, v in result.headers.items()
+        if k.lower() not in ("content-length", "content-type")
+    }
+
+    # A retrieval call standing alone means the continuation failed, and the
+    # client cannot act on a tool it never declared. Next to a client tool it is
+    # the turn handle_response gives back when a continuation fails, because the
+    # model made no newer decision, so that goes to the client as is. A plain JSON
+    # error works on both sides of the commit: the wrapper turns it into a typed
+    # stream error if SSE is already on the wire, so a rate limit on the
+    # continuation still reads as a rate limit.
+    if ccr_response_handler.residual_ccr_status(reply, "openai") == RESIDUAL_CCR_ERROR:
+        status = continuation_status or 502
+        logger.warning(
+            f"[{request_id}] CCR: buffered chat reply still contains headroom_retrieve "
+            f"after handling; failing closed with {status}"
+        )
+        return JSONResponse(
+            status_code=status,
+            headers=sse_headers,
+            content={
+                "error": {
+                    "message": "Unable to safely complete streamed CCR retrieval.",
+                    "type": OPENAI_ERROR_FORMAT.error_type_for_status(status),
+                }
+            },
+        )
+
+    frames = StreamingCCRHandler.openai_chat_sse_frames(reply, include_usage=include_usage)
+
+    async def _frames():
+        for frame in frames:
+            yield frame
+
+    return StreamingResponse(_frames(), media_type="text/event-stream", headers=sse_headers)
 
 
 def _responses_input_to_items(input_data: Any) -> list[dict[str, Any]]:
@@ -1806,6 +2101,11 @@ class OpenAIHandlerMixin:
             if result is None:
                 return None
             cache.move_to_end(key)
+        if not _openai_responses_cached_ccr_markers_live(result):
+            with lock:
+                if cache.get(key) is result:
+                    del cache[key]
+            return None
         return _openai_responses_result_with_cache_hit(result)
 
     def _store_openai_responses_cached_unit(self, key: str, result: Any) -> None:
@@ -1821,6 +2121,7 @@ class OpenAIHandlerMixin:
         body: dict[str, Any],
         *,
         request_id: str,
+        request_context: Any = None,
     ) -> None:
         """Feed one Responses HTTP request into the live traffic learner."""
         traffic_learner = getattr(self, "traffic_learner", None)
@@ -1828,6 +2129,8 @@ class OpenAIHandlerMixin:
             return
         try:
             memory_handler = getattr(self, "memory_handler", None)
+            if memory_handler and memory_handler.is_project_unresolved(request_context):
+                return
             if (
                 traffic_learner._backend is None
                 and memory_handler
@@ -1857,6 +2160,7 @@ class OpenAIHandlerMixin:
         messages: list[dict[str, Any]],
         *,
         request_id: str,
+        request_context: Any = None,
     ) -> None:
         """Feed one chat/completions request into the live traffic learner.
 
@@ -1873,6 +2177,8 @@ class OpenAIHandlerMixin:
             return
         try:
             memory_handler = getattr(self, "memory_handler", None)
+            if memory_handler and memory_handler.is_project_unresolved(request_context):
+                return
             if (
                 traffic_learner._backend is None
                 and memory_handler
@@ -1900,6 +2206,7 @@ class OpenAIHandlerMixin:
         seen_call_ids: set[str],
         baseline: bool,
         request_id: str,
+        request_context: Any = None,
     ) -> None:
         """Feed one Codex WS ``response.create`` turn into the traffic learner.
 
@@ -1923,6 +2230,8 @@ class OpenAIHandlerMixin:
             return
         try:
             memory_handler = getattr(self, "memory_handler", None)
+            if memory_handler and memory_handler.is_project_unresolved(request_context):
+                return
             if (
                 traffic_learner._backend is None
                 and memory_handler
@@ -1958,6 +2267,24 @@ class OpenAIHandlerMixin:
                 await traffic_learner.on_messages(learner_messages)
         except Exception as exc:
             logger.debug("[%s] Traffic learner (ws): %s", request_id, exc)
+
+    @staticmethod
+    async def _run_ws_create_hooks(
+        frame: Any, ws_headers: dict[str, str], connection_id: str
+    ) -> bool:
+        """Run ``on_responses_create`` on a WS create frame's inner payload.
+
+        True when a hook changed it, so the caller re-serializes the frame.
+        """
+        inner = frame.get("response", frame) if isinstance(frame, dict) else None
+        if not isinstance(inner, dict):
+            return False
+        return await run_responses_create_hooks(
+            inner,
+            headers=MappingProxyType(ws_headers),
+            transport="websocket",
+            connection_id=connection_id,
+        )
 
     @staticmethod
     def _headroom_bypass_enabled(headers: Any) -> bool:
@@ -2051,6 +2378,7 @@ class OpenAIHandlerMixin:
         request_id: str,
         timing: dict[str, float] | None = None,
         deadline_started_at: float | None = None,
+        tool_names_by_call_id: dict[str, str] | None = None,
     ) -> tuple[dict[str, Any], bool, int, list[str], dict[str, int], list[str], int]:
         """Run ContentRouter on OpenAI Responses text units.
 
@@ -2173,7 +2501,6 @@ class OpenAIHandlerMixin:
                         return True
             return False
 
-        headroom_retrieve_call_ids: set[str] = set()
         # Map each Responses tool call to its name so that outputs belonging to
         # excluded tools (HEADROOM_EXCLUDE_TOOLS) can be protected from
         # compression. The chat/Anthropic paths get this via
@@ -2181,7 +2508,7 @@ class OpenAIHandlerMixin:
         # name on the `function_call` (or Codex `custom_tool_call`) item and
         # the originating call_id on the matching output, so we correlate
         # them here.
-        function_name_by_call_id: dict[str, str] = {}
+        function_name_by_call_id = dict(tool_names_by_call_id or {})
         for item in items:
             if not isinstance(item, dict):
                 continue
@@ -2195,12 +2522,13 @@ class OpenAIHandlerMixin:
                 name = unwrap_tool_call_name(name, item.get("arguments") or item.get("input"))
             if isinstance(name, str) and isinstance(call_id, str) and call_id:
                 function_name_by_call_id[call_id] = name
-            # Same matcher ContentRouter uses for its ccr_retrieve guard, so the
-            # MCP alias forms (mcp__srv__x, Hermes' mcp_srv_x, OpenCode's
-            # headroom_headroom_retrieve) are recognized here too.
-            if isinstance(name, str) and is_tool_excluded(name, ("headroom_retrieve",)):
-                if isinstance(call_id, str) and call_id:
-                    headroom_retrieve_call_ids.add(call_id)
+        # Continuations may contain outputs only; observed WS names retain the
+        # same unconditional retrieval guard as calls present in this payload.
+        headroom_retrieve_call_ids = {
+            call_id
+            for call_id, name in function_name_by_call_id.items()
+            if is_tool_excluded(name, ("headroom_retrieve",))
+        }
 
         # Resolve the effective exclude set once (None -> built-in defaults),
         # mirroring ContentRouter's policy. exclude_tools already contains both
@@ -2725,6 +3053,7 @@ class OpenAIHandlerMixin:
         client: str | None = None,
         savings_tags: dict[str, Any] | None = None,
         deadline_started_at: float | None = None,
+        tool_names_by_call_id: dict[str, str] | None = None,
     ) -> tuple[dict[str, Any], bool, int, list[str], str | None, int, int, int]:
         """Compress an OpenAI Responses payload through the shared router.
 
@@ -2958,6 +3287,7 @@ class OpenAIHandlerMixin:
             request_id=request_id,
             timing=timing_sink,
             deadline_started_at=deadline_started_at,
+            tool_names_by_call_id=tool_names_by_call_id,
         )
         _add_timing("compression_live_units_total", live_units_started)
         if router_modified:
@@ -3025,6 +3355,7 @@ class OpenAIHandlerMixin:
         timeout: float = COMPRESSION_TIMEOUT_SECONDS,
         client: str | None = None,
         savings_tags: dict[str, Any] | None = None,
+        tool_names_by_call_id: dict[str, str] | None = None,
     ) -> tuple[dict[str, Any], bool, int, list[str], str | None, int, int, int, dict[str, float]]:
         timing: dict[str, float] = {}
 
@@ -3074,6 +3405,8 @@ class OpenAIHandlerMixin:
             }
             if savings_tags is not None:
                 compression_kwargs["savings_tags"] = savings_tags
+            if tool_names_by_call_id:
+                compression_kwargs["tool_names_by_call_id"] = tool_names_by_call_id
             while True:
                 try:
                     result = self._compress_openai_responses_payload(
@@ -3292,8 +3625,6 @@ class OpenAIHandlerMixin:
         # compression mutates it, mirroring the Responses and Anthropic
         # ingestion paths. Without this, chat/completions traffic (Copilot CLI,
         # opencode, OpenAI SDKs) fed nothing to the learner (part of #2060).
-        await self._observe_openai_chat_traffic(original_client_messages, request_id=request_id)
-
         # Bypass: skip ALL compression for explicit opt-out
         _bypass = self._headroom_bypass_enabled(request.headers)
         if _bypass:
@@ -3443,6 +3774,12 @@ class OpenAIHandlerMixin:
                 ),
             )
 
+        await self._observe_openai_chat_traffic(
+            original_client_messages,
+            request_id=request_id,
+            request_context=memory_request_ctx,
+        )
+
         # Canonical memory-injection gate (parallels Anthropic). Pre-
         # PR-this the inline conjunction at the memory site silently
         # ignored `x-headroom-bypass: true`, mutating request bytes
@@ -3526,7 +3863,7 @@ class OpenAIHandlerMixin:
         # `messages`, but it runs before this snapshot, so its output is already
         # captured — keep this snapshot after image compression, or a reorder
         # silently reintroduces the drift.
-        cache_lookup_messages = messages
+        cache_lookup_messages = copy.deepcopy(messages) if self.cache and not stream else messages
         # Response-cache partition: a cached response is only ever replayed to a
         # caller presenting the same provider credentials and principal (01-F15).
         # Snapshotted with the key fields so lookup and store agree. None means
@@ -3798,6 +4135,12 @@ class OpenAIHandlerMixin:
 
                 if is_token_mode(self.config.mode):
                     comp_cache = self._get_compression_cache(openai_session_id)
+                    from headroom.cache.prefix_tracker import seed_restored_compression_cache
+
+                    # Seeds the empty cache after a restart
+                    # (HEADROOM_PREFIX_STATE_FILE); without it the freeze below
+                    # freezes nothing.
+                    seed_restored_compression_cache(openai_prefix_tracker, comp_cache)
 
                     if not is_cache_mode(self.config.mode):
                         # Token mode: shared engine, REPLAYABLE policy — its
@@ -4049,14 +4392,34 @@ class OpenAIHandlerMixin:
         # anchored on the previous turn's tool list never busts.
         tools = body.get("tools")
         _original_tools = tools  # Preserve for diagnostic / future retry
+        # Decided before injection: a turn that can buffer can answer the tool,
+        # so it may carry it even though the client asked for a stream. Whether
+        # it actually buffers is settled at dispatch, from the final body.
+        from headroom.proxy.route_advice import advice_from
+
+        _ccr_handler = getattr(self, "ccr_response_handler", None)
+        chat_stream_ccr_eligible = _is_openai_chat_stream_ccr_eligible(
+            body=body,
+            enabled=self.config.ccr_buffered_chat_streaming,
+            ccr_response_handler_enabled=bool(
+                _ccr_handler and getattr(_ccr_handler.config, "enabled", True)
+            ),
+            ccr_inject_tool=self.config.ccr_inject_tool,
+            routed_to_backend=(
+                getattr(self, "anthropic_backend", None) is not None
+                or advice_from(request) is not None
+            ),
+            upstream_base_url=upstream_base_url,
+        )
         can_inject_ccr_tool = _should_inject_openai_chat_ccr_tool(
             ccr_inject_tool=self.config.ccr_inject_tool,
             stream=stream,
+            buffered_eligible=chat_stream_ccr_eligible,
         )
         if (
             self.config.ccr_inject_tool or self.config.ccr_inject_system_instructions
         ) and not _bypass:
-            if self.config.ccr_inject_tool and stream:
+            if self.config.ccr_inject_tool and stream and not chat_stream_ccr_eligible:
                 logger.info(
                     f"[{request_id}] CCR: skipping retrieval-tool injection for "
                     "OpenAI chat streaming; this path cannot intercept tool calls"
@@ -4065,7 +4428,8 @@ class OpenAIHandlerMixin:
                 provider="openai",
                 inject_tool=False,  # routed through sticky helper below
                 inject_system_instructions=(
-                    self.config.ccr_inject_system_instructions and not stream
+                    self.config.ccr_inject_system_instructions
+                    and (not stream or chat_stream_ccr_eligible)
                 ),
             )
             injector.scan_for_markers(optimized_messages)
@@ -4075,10 +4439,12 @@ class OpenAIHandlerMixin:
             injector.verify_ownership()
             if (
                 self.config.ccr_inject_system_instructions
-                and not stream
+                and (not stream or chat_stream_ccr_eligible)
                 and injector.has_compressed_content
             ):
-                optimized_messages = injector.inject_into_system_message(optimized_messages)
+                optimized_messages = injector.inject_into_system_message(
+                    optimized_messages, tools=tools
+                )
 
             if can_inject_ccr_tool:
                 from headroom.proxy.helpers import (
@@ -4140,16 +4506,33 @@ class OpenAIHandlerMixin:
 
         # Both replays above forward earlier turns' messages byte-identical,
         # including the cache_control each carried back then. Chat Completions
-        # clients mark the message dict and an assistant's tool_calls, which the
-        # block-level normalizer does not see, so without this the markers
-        # accumulate turn over turn and an Anthropic-backed gateway rejects the
-        # request (more than four breakpoints). Content is untouched: only the
-        # markers move.
+        # clients mark the message dict, an assistant's tool_calls and content
+        # blocks, so without this the markers accumulate turn over turn and an
+        # Anthropic-backed gateway rejects the request (more than four
+        # breakpoints). Only the markers move; every other byte stays replayed.
         from headroom.cache.prefix_tracker import mirror_client_message_cache_control
 
         optimized_messages = mirror_client_message_cache_control(
             optimized_messages, original_client_messages
         )
+
+        from headroom.proxy.helpers import enforce_cache_breakpoint_budget
+
+        # Bypass (x-headroom-bypass: true, _bypass computed at ~L3458) opts out
+        # of ALL compression: never mutate those requests here.
+        # client_messages=None: passing the client list runs
+        # normalize_message_cache_control, whose block-level legacy fallback can
+        # add a marker to a list-content user message on chat requests and then
+        # cost a real system marker. Without it only the oldest-first drop runs
+        # — stale replayed markers are oldest, so they go first.
+        if not _bypass:
+            _, optimized_messages, tools, _ = enforce_cache_breakpoint_budget(
+                None,
+                optimized_messages,
+                tools,
+                client_messages=None,
+                request_id=request_id,
+            )
 
         # Memory: inject context and tools for OpenAI requests.
         #
@@ -4165,7 +4548,21 @@ class OpenAIHandlerMixin:
             # /v1/responses) — pre-PR-this site was the only chat
             # path without one.
             try:
-                if self.memory_handler.config.inject_context:
+                if self.memory_handler.config.inject_context and is_cache_mode(
+                    getattr(getattr(self, "config", None), "mode", "token")
+                ):
+                    from headroom.proxy.helpers import log_memory_injection
+
+                    tags["memory_skip_reason"] = "cache_mode"
+                    log_memory_injection(
+                        request_id=request_id,
+                        session_id=None,
+                        decision="skipped_cache_mode",
+                        bytes_injected=0,
+                        query=extract_user_query(optimized_messages) or "",
+                        tags=tags,
+                    )
+                elif self.memory_handler.config.inject_context:
                     memory_context = await asyncio.wait_for(
                         self.memory_handler.search_and_format_context(
                             memory_user_id,
@@ -4225,25 +4622,29 @@ class OpenAIHandlerMixin:
                     apply_session_sticky_memory_tools as _apply_sticky_mem_tools,
                 )
 
-                memory_tool_defs = (
-                    self.memory_handler.compute_memory_tool_definitions("openai")
-                    if self.memory_handler.config.inject_tools
-                    else []
-                )
-                tools, mem_tools_injected = _apply_sticky_mem_tools(
-                    provider="openai",
-                    session_id=openai_session_id,
-                    request_id=request_id,
-                    existing_tools=tools,
-                    memory_tools_to_inject=memory_tool_defs,
-                    inject_this_turn=bool(self.memory_handler.config.inject_tools),
-                    client_declared_tools=bool(_original_tools),
-                )
-                if mem_tools_injected:
-                    memory_tools_injected = True
-                    logger.info(f"[{request_id}] Memory: Injected memory tools (openai)")
+                # Only the Anthropic stream path executes memory tool calls
+                # (streaming.py `memory_enabled`). Skip the whole call on a
+                # streamed turn: the sticky replay would re-add golden tools.
+                if not stream:
+                    memory_tool_defs = (
+                        self.memory_handler.compute_memory_tool_definitions("openai")
+                        if self.memory_handler.config.inject_tools
+                        else []
+                    )
+                    tools, mem_tools_injected = _apply_sticky_mem_tools(
+                        provider="openai",
+                        session_id=openai_session_id,
+                        request_id=request_id,
+                        existing_tools=tools,
+                        memory_tools_to_inject=memory_tool_defs,
+                        inject_this_turn=bool(self.memory_handler.config.inject_tools),
+                        client_declared_tools=bool(_original_tools),
+                    )
+                    if mem_tools_injected:
+                        memory_tools_injected = True
+                        logger.info(f"[{request_id}] Memory: Injected memory tools (openai)")
             except Exception as e:
-                logger.warning(f"[{request_id}] Memory injection failed: {e}")
+                logger.warning(f"[{request_id}] Memory injection failed: {e!r}")
 
         if memory_context_injected or memory_tools_injected:
             remembered_event = self.pipeline_extensions.emit(
@@ -4950,8 +5351,31 @@ class OpenAIHandlerMixin:
         )
         url = _append_request_query(url, request.url.query)
 
+        # The tool stays resident for the session so the tools array is
+        # byte-stable, but the model has nothing to call it with unless this body
+        # carries a marker. A turn with none keeps its real stream: buffering it
+        # would make time-to-first-byte the whole generation for nothing (#3071).
+        # Checking for the tool too keeps a bypassed turn, which got none, streaming.
+        buffered_chat_ccr = (
+            chat_stream_ccr_eligible
+            and has_ccr_retrieve_tool(body.get("tools"))
+            and _chat_body_has_ccr_marker(body)
+        )
+        buffered_chat_include_usage = False
+        buffered_chat_continuation_status: int | None = None
+        if buffered_chat_ccr:
+            buffered_chat_include_usage = _take_stream_options_for_buffered_chat(body)
+            body["stream"] = False
+            # A strict gateway rejects `stream: false` with `Accept: text/event-stream` (#3078).
+            _accept_key = next((k for k in headers if k.lower() == "accept"), "accept")
+            headers[_accept_key] = "application/json"
+            logger.info(
+                f"[{request_id}] CCR: buffering streaming chat turn "
+                "(stream:false upstream, resynthesized as chat.completion.chunk)"
+            )
+
         try:
-            if stream:
+            if stream and not buffered_chat_ccr:
                 # Request usage stats for accurate token counting instead of
                 # byte-based estimation — without overriding an explicit client
                 # choice (see _apply_stream_usage_option).
@@ -4985,7 +5409,12 @@ class OpenAIHandlerMixin:
                     original_messages=original_client_messages,
                     outcome_provider=openai_chat_outcome_provider,
                 )
-            else:
+
+            async def _direct_chat_turn() -> Response:
+                # Usage, the prefix tracker, savings and CCR continuations all
+                # live in here, so a buffered turn is accounted for exactly like
+                # a non-streaming one instead of through a second copy.
+                nonlocal headers, buffered_chat_continuation_status
                 headers = await apply_copilot_api_auth(headers, url=url)
                 response = await self._retry_request("POST", url, headers, body)
 
@@ -5007,7 +5436,13 @@ class OpenAIHandlerMixin:
                 # hook actually calls the model again.
                 _hook_usage = TurnHookUsage()
 
-                if _registered_turn_hooks() and response.status_code == 200:
+                # A buffered turn only ran stream-safe on_request hooks (that is
+                # decided before dispatch), so it skips their response half too.
+                if (
+                    _registered_turn_hooks()
+                    and response.status_code == 200
+                    and not buffered_chat_ccr
+                ):
                     try:
                         _hook_resp_json = response.json()
                     except (ValueError, json.JSONDecodeError):
@@ -5287,6 +5722,7 @@ class OpenAIHandlerMixin:
                             # means on a path that changed nothing.
                             if _ccr_cont_error is not None or _ccr_final_json is _pre_ccr_json:
                                 if _ccr_cont_error is not None:
+                                    buffered_chat_continuation_status = _ccr_cont_error
                                     logger.warning(
                                         f"[{request_id}] CCR: continuation returned HTTP "
                                         f"{_ccr_cont_error}; forwarding the upstream reply "
@@ -5443,13 +5879,9 @@ class OpenAIHandlerMixin:
                 # the live (hooked) `messages` (#327).
                 #
                 # ``not stream`` mirrors the read gate at the cache lookup
-                # above. It is currently redundant here — a streaming chat
-                # request returns via ``_stream_response`` well before this
-                # point — but the Anthropic handler had the same shape until a
-                # buffered-CCR branch started falling through to its store
-                # site, which let a response built for a stream:true request
-                # answer a later non-streaming caller (#3019). Stating the
-                # invariant keeps that from being reintroduced silently.
+                # above. A buffered turn reaches this point with ``stream`` still
+                # true, and a response built for a stream:true request must not
+                # answer a later non-streaming caller (#3019).
                 if (
                     self.cache
                     and not stream
@@ -5570,6 +6002,37 @@ class OpenAIHandlerMixin:
                     status_code=response.status_code,
                     headers=response_headers,
                 )
+
+            if not buffered_chat_ccr:
+                return await _direct_chat_turn()
+
+            async def _buffered_chat_turn() -> Response:
+                return _buffered_chat_reply_as_sse(
+                    await _direct_chat_turn(),
+                    ccr_response_handler=_ccr_handler,
+                    include_usage=buffered_chat_include_usage,
+                    continuation_status=buffered_chat_continuation_status,
+                    request_id=request_id,
+                )
+
+            async def _record_buffered_failure(**_: Any) -> None:
+                # The shared wrapper only knows "openai"; keep the label this
+                # handler uses for xAI and custom upstreams.
+                await self.metrics.record_failed(provider=openai_chat_outcome_provider)
+
+            _buffered_call = buffered_ccr_asgi_call(
+                operation=asyncio.create_task(_buffered_chat_turn()),
+                fmt=OPENAI_ERROR_FORMAT,
+                grace_seconds=self.config.buffered_ccr_grace_seconds,
+                record_failed=_record_buffered_failure,
+                request_id=request_id,
+            )
+
+            class _BufferedCCRResponse(Response):
+                async def __call__(self, scope, receive, send):  # noqa: ANN001
+                    await _buffered_call(scope, receive, send)
+
+            return _BufferedCCRResponse(media_type="text/event-stream")
         except Exception as e:
             await self.metrics.record_failed(provider=openai_chat_outcome_provider)
             # Error names the failure; text and traceback go to debug.
@@ -5669,8 +6132,6 @@ class OpenAIHandlerMixin:
                 },
             )
 
-        model = body.get("model", "unknown")
-        stream = body.get("stream", False)
         body_mutation_tracker = BodyMutationTracker()
         _bypass = self._headroom_bypass_enabled(request.headers)
         if _bypass:
@@ -5690,8 +6151,17 @@ class OpenAIHandlerMixin:
             url=str(request.url),
             headers=dict(request.headers.items()),
             body=body,
-            metadata={"path": request.url.path, "stream": stream},
+            metadata={"path": request.url.path, "stream": body.get("stream", False)},
         )
+        # Before every stage that reads the body, so a hook's replacement is
+        # what compression, deferral, token counting, pricing and the
+        # stream/buffered dispatch all see.
+        if not _bypass and await run_responses_create_hooks(
+            body, headers=request.headers, transport="http"
+        ):
+            body_mutation_tracker.mark_mutated("responses_create_hook")
+        model = body.get("model", "unknown")
+        stream = body.get("stream", False)
 
         # /v1/responses uses provider-specific CompressionUnit extraction
         # below, then routes mutable text through ContentRouter. The
@@ -5700,6 +6170,12 @@ class OpenAIHandlerMixin:
         # minimal `messages` list purely for downstream memory injection and
         # telemetry; list-typed `input` is consulted directly by the unit
         # extraction helpers.
+        #
+        # Before anything reads `input`: drop web_search_call history from a
+        # request that declares no web_search tool (Codex local compaction).
+        # A bypass request asked for its bytes untouched, so it is left alone.
+        if not _bypass and _drop_undeclared_web_search_calls(body, request_id=request_id):
+            body_mutation_tracker.mark_mutated("responses_web_search_history")
         input_data = body.get("input", "")
         instructions = body.get("instructions")
 
@@ -5823,12 +6299,6 @@ class OpenAIHandlerMixin:
         resolved_project_root_override = codex_project_root_override or (
             str(codex_project.cwd) if codex_project and codex_project.cwd else None
         )
-        # The shared learner cannot isolate project state. Scoped Codex turns
-        # skip learning until a project-scoped learner is available.
-        if not codex_project_scope_required and (
-            codex_project is None or codex_project.reason == "metadata_missing"
-        ):
-            await self._observe_openai_responses_traffic(body, request_id=request_id)
         memory_client = (
             "codex"
             if is_chatgpt_auth
@@ -5839,7 +6309,10 @@ class OpenAIHandlerMixin:
         ) or _client_can_receive_memory_tools(memory_client)
         if _ensure_chatgpt_responses_store_false(body, is_chatgpt_auth=is_chatgpt_auth):
             logger.info(f"[{request_id}] Responses: forced store=false for ChatGPT auth")
-        responses_memory_tools_allowed = _allow_responses_memory_tools(is_chatgpt_auth)
+        # Streamed Responses turns do not execute memory tool calls; keep tools off.
+        responses_memory_tools_allowed = (
+            _allow_responses_memory_tools(is_chatgpt_auth) and not stream
+        )
 
         # PR-A6 (P5-50, preps P0-6): session-sticky `OpenAI-Beta` merge
         # for /v1/responses. Compute a session_id off the same store the
@@ -5898,6 +6371,17 @@ class OpenAIHandlerMixin:
                 system_prompt=_extract_sys_prompt(body),
                 base_user_id=memory_user_id,
                 project_root_override=resolved_project_root_override,
+            )
+
+        # The shared learner cannot isolate project state. Scoped Codex turns
+        # skip learning until a project-scoped learner is available.
+        if not codex_project_scope_required and (
+            codex_project is None or codex_project.reason == "metadata_missing"
+        ):
+            await self._observe_openai_responses_traffic(
+                body,
+                request_id=request_id,
+                request_context=memory_request_ctx,
             )
 
         # Rate limiting
@@ -5979,7 +6463,21 @@ class OpenAIHandlerMixin:
                 # (latest non-frozen user item). Instructions are part of the
                 # cache hot zone and must never be mutated — invariant I2.
                 # See REALIGNMENT/03-phase-A-lockdown.md PR-A2.
-                if self.memory_handler.config.inject_context:
+                if self.memory_handler.config.inject_context and is_cache_mode(
+                    getattr(getattr(self, "config", None), "mode", "token")
+                ):
+                    from headroom.proxy.helpers import log_memory_injection
+
+                    tags["memory_skip_reason"] = "cache_mode"
+                    log_memory_injection(
+                        request_id=request_id,
+                        session_id=None,
+                        decision="skipped_cache_mode",
+                        bytes_injected=0,
+                        query=extract_user_query(optimized_messages) or "",
+                        tags=tags,
+                    )
+                elif self.memory_handler.config.inject_context:
                     try:
                         memory_context = await asyncio.wait_for(
                             self.memory_handler.search_and_format_context(
@@ -6122,7 +6620,7 @@ class OpenAIHandlerMixin:
                             f"[{request_id}] Memory: Injected memory tools (openai/responses)"
                         )
             except Exception as e:
-                logger.warning(f"[{request_id}] Memory injection failed (responses): {e}")
+                logger.warning(f"[{request_id}] Memory injection failed (responses): {e!r}")
         elif self.memory_handler and memory_user_id and _bypass:
             logger.info(
                 "[%s] Responses memory passthrough reason=bypass_header",
@@ -6808,13 +7306,13 @@ class OpenAIHandlerMixin:
                                 except (json.JSONDecodeError, TypeError):
                                     args = {}
 
-                                await self.memory_handler._ensure_initialized()
-                                if self.memory_handler._backend:
-                                    result = await self.memory_handler._execute_memory_tool(
-                                        name, args, memory_user_id, "openai"
-                                    )
-                                else:
-                                    result = json.dumps({"error": "Memory backend not initialized"})
+                                result = await self.memory_handler._execute_memory_tool(
+                                    name,
+                                    args,
+                                    memory_user_id,
+                                    "openai",
+                                    request_context=memory_request_ctx,
+                                )
 
                                 tool_outputs.append(
                                     {
@@ -7182,6 +7680,12 @@ class OpenAIHandlerMixin:
         # handshake. Returns `{}` when no tags are present.
         _extract_ws_tags = getattr(self, "_extract_tags", None)
         ws_tags = _extract_ws_tags(ws_headers) if callable(_extract_ws_tags) else {}
+        # Savings attribution rows (turn hooks, tool-search deferral) from frames
+        # that were rewritten and sent, waiting for the next turn's outcome. Each
+        # frame compresses into its own dict: a timed-out compression thread
+        # keeps running and must not book rows for a frame sent uncompressed.
+        # Coalesced per source by ``accumulate_savings``, so it stays small.
+        ws_turn_savings: list[dict[str, Any]] = []
 
         # Extract subprotocol from client — this is an application-level negotiation
         # that MUST be forwarded end-to-end (unlike sec-websocket-key which is per-connection).
@@ -7596,6 +8100,14 @@ class OpenAIHandlerMixin:
                     model or "unknown",
                 )
 
+            # Resolved before the frame helpers below, which read it.
+            _ws_bypass = self._headroom_bypass_enabled(ws_headers)
+            if _ws_bypass:
+                logger.info(
+                    "[%s] WS /v1/responses passthrough reason=bypass_header mutation=disabled",
+                    request_id,
+                )
+
             def _normalize_ws_response_create_for_upstream(raw_msg: str) -> str:
                 """Optionally flatten Codex WS response.create frames for gateways.
 
@@ -7603,7 +8115,18 @@ class OpenAIHandlerMixin:
                 OpenAI-compatible gateways accept the WebSocket upgrade but expect
                 model/input/tools at the top level of response.create frames.
                 Preserve default upstream behavior unless explicitly enabled.
+
+                Every response.create frame headed upstream (first frame, which
+                the HTTP fallback also replays, later frames, memory
+                continuations) passes through here, so it also drops
+                web_search_call history the frame declares no tool for (see
+                ``_drop_undeclared_web_search_calls``), except on a bypass
+                session, whose frames stay as the client sent them.
                 """
+                if not _ws_bypass:
+                    raw_msg = _drop_undeclared_web_search_calls_from_frame(
+                        raw_msg, request_id=request_id
+                    )
                 if os.environ.get(
                     "HEADROOM_OPENAI_WS_FLATTEN_RESPONSE_CREATE", ""
                 ).strip().lower() not in (
@@ -7633,6 +8156,43 @@ class OpenAIHandlerMixin:
             body: dict[str, Any] = {}
             current_response_input: list[dict[str, Any]] = []
             current_response_template: dict[str, Any] = {}
+            # Codex sends only tool outputs on previous_response_id continuations.
+            # Retain resolved retrieval identities, never tool arguments or results,
+            # for this connection (including rejected/repeated continuations).
+            ws_tool_names_by_call_id: dict[str, str] = {}
+            ws_tool_context_exhausted = False
+
+            def _remember_ws_tool_call(item: Any) -> None:
+                nonlocal ws_tool_context_exhausted
+                if ws_tool_context_exhausted or not isinstance(item, dict):
+                    return
+                if item.get("type") not in {"function_call", "custom_tool_call"}:
+                    return
+                call_id = item.get("call_id")
+                name = item.get("name")
+                if not isinstance(call_id, str) or not call_id or not isinstance(name, str):
+                    return
+                from headroom.config import is_tool_excluded, unwrap_tool_call_name
+
+                name = unwrap_tool_call_name(name, item.get("arguments") or item.get("input"))
+                if not is_tool_excluded(name, ("headroom_retrieve",)):
+                    ws_tool_names_by_call_id.pop(call_id, None)
+                    return
+                if (
+                    call_id not in ws_tool_names_by_call_id
+                    and len(ws_tool_names_by_call_id) >= _OPENAI_RESPONSES_TOOL_CONTEXT_LIMIT
+                ):
+                    # Evicting an unconsumed identity would silently re-compress
+                    # its original. Bound metadata and fail safe for this connection.
+                    ws_tool_context_exhausted = True
+                    logger.warning(
+                        "[%s] WS retrieval context limit reached; "
+                        "preserving tool outputs without compression for this connection",
+                        request_id,
+                    )
+                    return
+                ws_tool_names_by_call_id[call_id] = name
+
             tokens_saved = 0
             # Session-scoped accumulator for tokens we *attempted* to
             # compress (extracted units + schema). Drives the active-
@@ -7653,6 +8213,19 @@ class OpenAIHandlerMixin:
             except json.JSONDecodeError:
                 # Not JSON — pass through as-is
                 pass
+            first_frame_is_create = isinstance(body, dict) and (
+                body.get("type") == "response.create" or ("type" not in body and "input" in body)
+            )
+            _ws_bypass = self._headroom_bypass_enabled(ws_headers)
+            if _ws_bypass:
+                logger.info(
+                    "[%s] WS /v1/responses passthrough reason=bypass_header mutation=disabled",
+                    request_id,
+                )
+            elif first_frame_is_create and await self._run_ws_create_hooks(
+                body, ws_headers, session_id
+            ):
+                first_msg_raw = json.dumps(body)
             if isinstance(body, dict) and body:
                 ws_response_body_for_store = (
                     body["response"] if isinstance(body.get("response"), dict) else body
@@ -7698,12 +8271,6 @@ class OpenAIHandlerMixin:
             ws_recorded_compression_timing_totals: dict[str, float] = {}
             ws_ttfb_ms: float | None = None
             ws_recorded_ttfb_ms = False
-            _ws_bypass = self._headroom_bypass_enabled(ws_headers)
-            if _ws_bypass:
-                logger.info(
-                    "[%s] WS /v1/responses passthrough reason=bypass_header mutation=disabled",
-                    request_id,
-                )
 
             capture_codex_wire_debug(
                 "ws_inbound_first_frame",
@@ -7909,21 +8476,37 @@ class OpenAIHandlerMixin:
                         resolved_project.project_key if ws_turn_project_features_allowed else None
                     )
 
-                if first_project_resolution and ws_turn_learning_allowed:
-                    inner_payload = frame_body.get("response", frame_body)
-                    if isinstance(inner_payload, dict):
-                        await self._observe_openai_ws_response_create(
-                            inner_payload,
-                            seen_call_ids=ws_learner_seen_call_ids,
-                            baseline=True,
-                            request_id=request_id,
-                        )
-
                 memory_user_id_candidate = (
                     resolve_memory_identity(websocket)
                     if self.memory_handler and ws_turn_project_features_allowed
                     else None
                 )
+                ws_response_body = frame_body.get("response", frame_body)
+                if memory_user_id_candidate is not None and isinstance(ws_response_body, dict):
+                    from headroom.memory.storage_router import (
+                        RequestContext as _MemRequestContext,
+                    )
+
+                    memory_request_ctx = _MemRequestContext(
+                        headers=dict(ws_headers),
+                        system_prompt=str(ws_response_body.get("instructions") or ""),
+                        base_user_id=memory_user_id_candidate,
+                        project_root_override=resolved_project_root_override,
+                    )
+
+                if (
+                    first_project_resolution
+                    and ws_turn_learning_allowed
+                    and isinstance(ws_response_body, dict)
+                ):
+                    await self._observe_openai_ws_response_create(
+                        ws_response_body,
+                        seen_call_ids=ws_learner_seen_call_ids,
+                        baseline=True,
+                        request_id=request_id,
+                        request_context=memory_request_ctx,
+                    )
+
                 memory_decision = MemoryDecision.decide(
                     headers=ws_headers,
                     memory_handler=(
@@ -7940,24 +8523,8 @@ class OpenAIHandlerMixin:
 
                 memory_user_id = memory_user_id_candidate
                 try:
-                    # Unwrap response.create envelope to access the response body
-                    ws_response_body = frame_body.get("response", frame_body)
                     if not isinstance(ws_response_body, dict):
                         return frame_raw
-                    # Per-project memory routing (GH #462). For WS,
-                    # ``ws_response_body`` carries ``instructions`` —
-                    # that's the system-prompt-equivalent we feed to the
-                    # resolver.
-                    from headroom.memory.storage_router import (
-                        RequestContext as _MemRequestContext,
-                    )
-
-                    memory_request_ctx = _MemRequestContext(
-                        headers=dict(ws_headers),
-                        system_prompt=str(ws_response_body.get("instructions") or ""),
-                        base_user_id=memory_user_id,
-                        project_root_override=resolved_project_root_override,
-                    )
 
                     # Debug: log what Codex sends so we can see the full tool list
                     existing_tool_names = [
@@ -7975,7 +8542,28 @@ class OpenAIHandlerMixin:
                     )
 
                     # Inject memory context into instructions
-                    if self.memory_handler.config.inject_context:
+                    if self.memory_handler.config.inject_context and is_cache_mode(
+                        getattr(getattr(self, "config", None), "mode", "token")
+                    ):
+                        from headroom.utils import extract_user_query
+
+                        ws_tags["memory_skip_reason"] = "cache_mode"
+                        ws_input = ws_response_body.get("input", "")
+                        ws_instructions = ws_response_body.get("instructions")
+                        ws_msgs: list[dict[str, Any]] = []
+                        if ws_instructions:
+                            ws_msgs.append({"role": "system", "content": ws_instructions})
+                        if isinstance(ws_input, str) and ws_input:
+                            ws_msgs.append({"role": "user", "content": ws_input})
+                        log_memory_injection(
+                            request_id=request_id,
+                            session_id=session_id,
+                            decision="skipped_cache_mode",
+                            bytes_injected=0,
+                            query=extract_user_query(ws_msgs) or "",
+                            tags=ws_tags,
+                        )
+                    elif self.memory_handler.config.inject_context:
                         ws_input = ws_response_body.get("input", "")
                         ws_instructions = ws_response_body.get("instructions")
                         ws_msgs: list[dict[str, Any]] = []
@@ -8132,12 +8720,10 @@ class OpenAIHandlerMixin:
 
                     return json.dumps(frame_body)
                 except Exception as e:
-                    logger.warning(f"[{request_id}] WS Memory injection failed: {e}")
+                    logger.warning(f"[{request_id}] WS Memory injection failed: {e!r}")
                     return frame_raw
 
-            if isinstance(body, dict) and (
-                body.get("type") == "response.create" or ("type" not in body and "input" in body)
-            ):
+            if first_frame_is_create:
                 first_msg_raw = await _prepare_memory_frame(body, first_msg_raw)
                 first_response_body = body.get("response", body)
                 current_response_input = _responses_input_to_items(
@@ -8193,6 +8779,7 @@ class OpenAIHandlerMixin:
                         )
                         _record_ws_compression_overhead(_preflight_ms)
                         _compression_started = time.perf_counter()
+                        _frame_savings: dict[str, Any] = {}
                         try:
                             (
                                 _new_inner,
@@ -8212,6 +8799,7 @@ class OpenAIHandlerMixin:
                                 if client == "codex"
                                 else COMPRESSION_TIMEOUT_SECONDS,
                                 client=client,
+                                savings_tags=_frame_savings,
                             )
                             for _timing_name, _timing_ms in _ws_compression_timing.items():
                                 _record_ws_compression_timing(_timing_name, _timing_ms)
@@ -8260,6 +8848,9 @@ class OpenAIHandlerMixin:
                                 )
                                 _record_ws_compression_overhead(_rewrite_ms)
                                 tokens_saved += int(_ws_saved)
+                                accumulate_savings(
+                                    ws_turn_savings, savings_from_tags(_frame_savings)
+                                )
                                 ws_conversation_tokens_saved = int(_ws_saved)
                                 ws_conversation_key = savings_conversation_key(
                                     _send_body, session_id=f"ws:{session_id}"
@@ -8536,6 +9127,7 @@ class OpenAIHandlerMixin:
                                 seen_call_ids=ws_learner_seen_call_ids,
                                 baseline=False,
                                 request_id=request_id,
+                                request_context=memory_request_ctx,
                             )
                         store_forced = _ensure_chatgpt_responses_store_false(
                             inner_payload,
@@ -8562,9 +9154,14 @@ class OpenAIHandlerMixin:
                                 store_forced,
                                 "chatgpt_store_false" if store_forced else "bypass_header",
                             )
-                        if not self.config.optimize:
+                        if ws_tool_context_exhausted or not self.config.optimize:
+                            passthrough_reason = (
+                                "tool_context_limit"
+                                if ws_tool_context_exhausted
+                                else "optimize_disabled"
+                            )
                             _log_ws_passthrough(
-                                "optimize_disabled",
+                                passthrough_reason,
                                 frame_index=frame_index,
                                 raw_bytes=len(raw_after_store.encode("utf-8", errors="replace")),
                                 frame_type="response.create",
@@ -8573,7 +9170,7 @@ class OpenAIHandlerMixin:
                             return (
                                 raw_after_store,
                                 store_forced,
-                                "chatgpt_store_false" if store_forced else "optimize_disabled",
+                                "chatgpt_store_false" if store_forced else passthrough_reason,
                             )
                         frame_compression_elapsed_ms = 0.0
                         try:
@@ -8586,6 +9183,7 @@ class OpenAIHandlerMixin:
                             )
                             _record_ws_compression_overhead(_preflight_ms)
                             _compression_started = time.perf_counter()
+                            frame_savings: dict[str, Any] = {}
                             try:
                                 (
                                     new_inner,
@@ -8605,6 +9203,8 @@ class OpenAIHandlerMixin:
                                     if client == "codex"
                                     else COMPRESSION_TIMEOUT_SECONDS,
                                     client=client,
+                                    savings_tags=frame_savings,
+                                    tool_names_by_call_id=dict(ws_tool_names_by_call_id),
                                 )
                                 for _timing_name, _timing_ms in frame_compression_timing.items():
                                     _record_ws_compression_timing(_timing_name, _timing_ms)
@@ -8754,6 +9354,7 @@ class OpenAIHandlerMixin:
                         )
                         _record_ws_compression_overhead(_rewrite_ms)
                         tokens_saved += int(frame_saved)
+                        accumulate_savings(ws_turn_savings, savings_from_tags(frame_savings))
                         ws_conversation_tokens_saved = int(frame_saved)
                         ws_conversation_key = savings_conversation_key(
                             new_inner, session_id=f"ws:{session_id}"
@@ -8855,6 +9456,10 @@ class OpenAIHandlerMixin:
                                     inbound_response = _inbound_frame_body.get(
                                         "response", _inbound_frame_body
                                     )
+                                    if not _ws_bypass and await self._run_ws_create_hooks(
+                                        _inbound_frame_body, ws_headers, session_id
+                                    ):
+                                        msg = json.dumps(_inbound_frame_body)
                                     current_response_input = _responses_input_to_items(
                                         inbound_response.get("input")
                                         if isinstance(inbound_response, dict)
@@ -9110,6 +9715,15 @@ class OpenAIHandlerMixin:
                             # at the WS upgrade) so dashboards can
                             # slice WS turns by tag — same surface
                             # as HTTP turns.
+                            # Same gate as ``saved_delta``: a usage-less turn
+                            # leaves its rows pending for a usage-carrying one.
+                            turn_tags = ws_tags
+                            if ws_turn_savings and input_delta > 0:
+                                turn_tags = {
+                                    **ws_tags,
+                                    SAVINGS_ATTRIBUTION_TAG: list(ws_turn_savings),
+                                }
+                                ws_turn_savings.clear()
                             await self._record_request_outcome(
                                 RequestOutcome(
                                     # Per-emission ids keep dashboard request-log keys unique.
@@ -9140,7 +9754,7 @@ class OpenAIHandlerMixin:
                                     )
                                     if isinstance(body, dict)
                                     else 0,
-                                    tags=ws_tags,
+                                    tags=turn_tags,
                                     conversation_key=ws_conversation_key,
                                     conversation_tokens_saved=ws_conversation_tokens_saved,
                                     client=client,
@@ -9248,6 +9862,8 @@ class OpenAIHandlerMixin:
                                     upstream_frame_index,
                                     ws_last_upstream_frame_type,
                                 )
+                                if event_type == "response.output_item.done":
+                                    _remember_ws_tool_call(event.get("item"))
                                 response = event.get("response")
                                 completed_response_model = (
                                     str(response.get("model") or "unknown")
@@ -9386,19 +10002,19 @@ class OpenAIHandlerMixin:
                                     except (json.JSONDecodeError, TypeError):
                                         fc_args = {}
 
-                                    await self.memory_handler._ensure_initialized()
+                                    if not self.memory_handler.is_project_unresolved(
+                                        response_memory_request_ctx
+                                    ):
+                                        await self.memory_handler._ensure_initialized()
                                     if response_memory_generation != ws_memory_generation:
                                         break
-                                    if self.memory_handler._backend:
-                                        result = await self.memory_handler._execute_memory_tool(
-                                            fc_name,
-                                            fc_args,
-                                            response_memory_user_id,
-                                            "openai",
-                                            request_context=response_memory_request_ctx,
-                                        )
-                                    else:
-                                        result = json.dumps({"error": "backend not ready"})
+                                    result = await self.memory_handler._execute_memory_tool(
+                                        fc_name,
+                                        fc_args,
+                                        response_memory_user_id,
+                                        "openai",
+                                        request_context=response_memory_request_ctx,
+                                    )
 
                                     tool_outputs.append(
                                         {
@@ -9755,6 +10371,10 @@ class OpenAIHandlerMixin:
                 "cache_write_tokens": str(ws_cache_write_tokens_total),
                 "uncached_input_tokens": str(ws_uncached_input_tokens_total),
             }
+            if ws_turn_savings and residual_input_tokens > 0:
+                # Rows no per-turn record claimed ride with the residual, under
+                # the same input-usage gate as ``residual_tokens_saved``.
+                ws_session_tags[SAVINGS_ATTRIBUTION_TAG] = list(ws_turn_savings)
             if (
                 residual_input_tokens > 0
                 or residual_output_tokens > 0
@@ -10689,6 +11309,21 @@ class OpenAIHandlerMixin:
                         "(a previous turn for this session is still running)"
                     )
                 try:
+                    nonlocal session_tracker
+                    from headroom.cache.prefix_tracker import seed_restored_compression_cache
+
+                    shared = self.shared_compress_sessions
+                    if shared is not None:
+                        # Another replica may have served this session's last
+                        # turn: take its tracker when it is newer than ours.
+                        newer = shared.fetch(
+                            self.session_tracker_store, _session_key, session_tracker
+                        )
+                        if newer is not None:
+                            # The key is present (get_or_create above).
+                            self.session_tracker_store.install(_session_key, newer)
+                            session_tracker = newer
+                    seed_restored_compression_cache(session_tracker, comp_cache)
                     prev_original = session_tracker.get_last_original_messages()
                     prev_returned = session_tracker.get_last_forwarded_messages()
                     prep = prepare_turn(
@@ -10763,6 +11398,8 @@ class OpenAIHandlerMixin:
                     # return time because whatever we hand back IS what the
                     # caller sends upstream.
                     session_tracker.record_returned(messages, final)
+                    if shared is not None:
+                        shared.publish(self.session_tracker_store, _session_key, session_tracker)
                     info = {
                         "id": session_id,
                         "frozen_message_count": session_frozen,
@@ -10794,6 +11431,13 @@ class OpenAIHandlerMixin:
             # the saving, and offset tools the hook removed (signed, clamped once).
             _hook_tool_saved = 0
             if _turn is not None:
+                # Tool-schema compaction, folded into both endpoints as the chat
+                # handlers do: the message counts never see tool bytes.
+                _compacted_before = int(getattr(_turn, "compaction_tokens_before", 0) or 0)
+                _compacted_after = int(getattr(_turn, "compaction_tokens_after", 0) or 0)
+                if 0 < _compacted_after < _compacted_before:
+                    tokens_before += _compacted_before
+                    tokens_after += _compacted_after
                 tokens_after += max(0, int(getattr(_turn, "tool_growth_tokens", 0) or 0))
                 # Only a count of pre-hook messages lacks the text a hook added;
                 # a recount of the final messages (stateless fold, session) has it.
@@ -10873,6 +11517,19 @@ class OpenAIHandlerMixin:
             }
             if session_info is not None:
                 _payload["session"] = session_info
+            if _turn is not None:
+                # Tool definitions kept out of the context (deferral, a hook's
+                # tool shrink), which the message counts never see. The headline
+                # /stats reports is tokens_saved + tool_tokens_saved. The
+                # deferral share is an estimate (booked ``estimated``), so it is
+                # also reported on its own for a caller that bills on measured
+                # savings only.
+                _payload["tool_tokens_saved"] = tool_schema_saved_from_tags(tags)
+                try:
+                    _deferred = int(tags.get("tool_search_deferred_tokens", 0) or 0)
+                except (TypeError, ValueError):
+                    _deferred = 0
+                _payload["tool_tokens_deferred"] = max(0, _deferred)
             if _finished is not None and _finished.fields:
                 _payload.update(_finished.fields)
             return JSONResponse(_payload)
@@ -11074,6 +11731,40 @@ class OpenAIHandlerMixin:
         # from here.
         _session_key = f"compress\x00{session_id}"
         tracker = self.session_tracker_store.peek(_session_key)
+        shared = self.shared_compress_sessions
+        if shared is not None:
+            # The session's last turn may have run on another replica. Fetched
+            # under the turn lock (a local turn in flight must finish first),
+            # installed here on the loop: the key may be new to this store.
+            _local = tracker
+            _lock_cache = self._peek_compression_cache(_session_key)
+
+            def _fetch():
+                lock = _lock_cache.session_turn_lock if _lock_cache is not None else None
+                if lock is not None and not lock.acquire(
+                    timeout=_SESSION_TURN_LOCK_TIMEOUT_SECONDS
+                ):
+                    return None
+                try:
+                    return shared.fetch(self.session_tracker_store, _session_key, _local)
+                finally:
+                    if lock is not None:
+                        lock.release()
+
+            try:
+                newer = await self._run_compression_in_executor(
+                    _fetch, timeout=COMPRESSION_TIMEOUT_SECONDS
+                )
+            except TimeoutError:
+                newer = None  # answer from this replica's state, as without the store
+            if newer is not None:
+                current = self.session_tracker_store.peek(_session_key)
+                if current is _local:
+                    self.session_tracker_store.install(_session_key, newer)
+                    tracker = newer
+                else:
+                    # A local turn installed a tracker meanwhile: it is newer.
+                    tracker = current
         if tracker is None:
             return self._compress_usage_unknown_session(session_id)
         # No create, no LRU bump: the cache is only needed for its turn lock.
@@ -11120,6 +11811,8 @@ class OpenAIHandlerMixin:
                     messages=last_returned,
                     original_messages=tracker.get_last_original_messages(),
                 )
+                if shared is not None:
+                    shared.publish(self.session_tracker_store, _session_key, tracker)
                 return tracker.get_frozen_message_count()
             finally:
                 if lock is not None:
@@ -11634,10 +12327,20 @@ class OpenAIHandlerMixin:
                         )
                         yield chunk
             finally:
+                completed_normally = True
                 buf = stream_state["sse_buffer"]
                 if len(buf) > 0:
                     buf.extend(b"\n\n")
-                    _absorb_usage(self._parse_sse_usage_from_buffer(stream_state, stream_provider))
+                    # A truncated stream can end inside a multi-byte character;
+                    # the strict decoder then raises and would skip the outcome
+                    # below. Keep the usage already parsed, drop the unusable
+                    # tail, and report the stream as failed.
+                    try:
+                        _absorb_usage(
+                            self._parse_sse_usage_from_buffer(stream_state, stream_provider)
+                        )
+                    except UnicodeDecodeError:
+                        completed_normally = False
 
                 output_tokens = stream_state["output_tokens"] or 0
                 cache_read_tokens = stream_state["cache_read_input_tokens"] or 0
@@ -11678,6 +12381,9 @@ class OpenAIHandlerMixin:
                         total_latency_ms=(time.time() - start_time) * 1000,
                         ttfb_ms=stream_state["ttfb_ms"] or 0,
                         tags=tags,
+                        status_code=_stream_outcome_status(
+                            upstream_response.status_code, completed_normally
+                        ),
                         client=client,
                     )
                 )

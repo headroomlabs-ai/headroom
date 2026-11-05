@@ -3,10 +3,133 @@
 from __future__ import annotations
 
 import json
+import logging
+from types import SimpleNamespace
+
+import pytest
 
 from headroom.telemetry.backends.filesystem import FileSystemTOINBackend
 from headroom.telemetry.models import ToolSignature
 from headroom.telemetry.toin import TOINConfig, ToolIntelligenceNetwork
+
+
+def test_failed_auto_saves_respect_interval_and_retry_pending_data(tmp_path, caplog, monkeypatch):
+    import headroom.telemetry.toin as toin_module
+
+    clock = [10000.0]
+    monkeypatch.setattr(toin_module, "time", SimpleNamespace(time=lambda: clock[0]))
+    parent = tmp_path / "state"
+    parent.write_text("blocked", encoding="utf-8", newline="\n")
+    path = parent / "toin.json"
+    toin = ToolIntelligenceNetwork(TOINConfig(storage_path=str(path), auto_save_interval=60))
+    clock[0] += 60
+    with caplog.at_level(logging.WARNING):
+        for _ in range(4):
+            toin.record_compression(
+                tool_signature=_signature(456),
+                original_count=10,
+                compressed_count=5,
+                original_tokens=100,
+                compressed_tokens=50,
+                strategy="test",
+            )
+    failures = [
+        record for record in caplog.records if getattr(record, "event", None) == "toin_save_failed"
+    ]
+    assert len(failures) == 1
+    assert toin._dirty is True
+
+    parent.unlink()
+    clock[0] += 60
+    toin._maybe_auto_save()
+    restored = ToolIntelligenceNetwork(TOINConfig(storage_path=str(path)))
+    assert restored.get_pattern(_signature(456).structure_hash).total_compressions == 4
+    assert toin._dirty is False
+
+
+def test_manual_save_can_retry_before_auto_save_interval(tmp_path):
+    parent = tmp_path / "state"
+    parent.write_text("blocked", encoding="utf-8", newline="\n")
+    path = parent / "toin.json"
+    toin = ToolIntelligenceNetwork(TOINConfig(storage_path=str(path), auto_save_interval=3600))
+    toin.record_compression(
+        tool_signature=_signature(789),
+        original_count=10,
+        compressed_count=5,
+        original_tokens=100,
+        compressed_tokens=50,
+        strategy="test",
+    )
+    toin._last_save_time = 0
+    toin._maybe_auto_save()
+    assert toin._dirty is True
+    parent.unlink()
+
+    toin.save()
+
+    assert path.is_file()
+    assert toin._dirty is False
+
+
+def test_filesystem_save_reports_parent_directory_failure(tmp_path) -> None:
+    blocked = tmp_path / "blocked"
+    blocked.write_text("not a directory", encoding="utf-8", newline="\n")
+    backend = FileSystemTOINBackend(str(blocked / "toin.json"))
+
+    with pytest.raises(OSError):
+        backend.save({"patterns": {}})
+
+
+def test_failed_replace_preserves_store_and_cleans_temporary_file(tmp_path, monkeypatch) -> None:
+    from pathlib import Path
+
+    path = tmp_path / "toin.json"
+    backend = FileSystemTOINBackend(str(path))
+    backend.save({"patterns": {"original": {}}})
+    original = path.read_bytes()
+
+    def fail_replace(self, target):
+        raise OSError("replace unavailable")
+
+    monkeypatch.setattr(Path, "replace", fail_replace)
+    with pytest.raises(OSError, match="replace unavailable"):
+        backend.save({"patterns": {"new": {}}})
+
+    assert path.read_bytes() == original
+    assert not list(tmp_path.glob(".toin_*.tmp"))
+
+
+def test_filesystem_failure_keeps_toin_dirty_for_automatic_retry(tmp_path, caplog) -> None:
+    parent = tmp_path / "state"
+    path = parent / "toin.json"
+    toin = ToolIntelligenceNetwork(TOINConfig(storage_path=str(path), auto_save_interval=3600))
+    toin.record_compression(
+        tool_signature=_signature(123),
+        original_count=10,
+        compressed_count=5,
+        original_tokens=100,
+        compressed_tokens=50,
+        strategy="test",
+    )
+    toin._last_save_time = 0
+    parent.write_text("temporarily blocked", encoding="utf-8", newline="\n")
+
+    with caplog.at_level(logging.WARNING):
+        toin.save()
+
+    assert toin._dirty is True
+    assert toin._last_save_time == 0
+    assert any(getattr(record, "event", None) == "toin_save_failed" for record in caplog.records)
+
+    parent.unlink()
+    toin._maybe_auto_save()
+
+    assert toin._dirty is False
+    assert toin._last_save_time > 0
+    restored = ToolIntelligenceNetwork(TOINConfig(storage_path=str(path)))
+    pattern = restored.get_pattern(_signature(123).structure_hash)
+    assert pattern is not None
+    assert pattern.total_compressions == 1
 
 
 def _signature(index: int) -> ToolSignature:
@@ -81,6 +204,150 @@ def test_legacy_raw_query_keys_are_removed_on_load(tmp_path) -> None:
 
     assert pattern.query_pattern_frequency == {"status:* user:*": 2}
     assert pattern.common_query_patterns == ["status:* user:*"]
+
+
+def _record(toin: ToolIntelligenceNetwork, index: int) -> None:
+    toin.record_compression(
+        tool_signature=_signature(index),
+        original_count=10,
+        compressed_count=5,
+        original_tokens=100,
+        compressed_tokens=50,
+        strategy="test",
+    )
+
+
+def _saved_store(path, count: int) -> dict:
+    toin = ToolIntelligenceNetwork(TOINConfig(storage_path=str(path), auto_save_interval=0))
+    for index in range(count):
+        _record(toin, index)
+    toin.save()
+    return json.loads(path.read_text(encoding="utf-8"))
+
+
+def _skip_warnings(caplog) -> list[logging.LogRecord]:
+    return [r for r in caplog.records if getattr(r, "event", None) == "toin_import_skipped"]
+
+
+@pytest.mark.parametrize(
+    "corrupt",
+    [
+        lambda entry: {k: v for k, v in entry.items() if k != "tool_signature_hash"},
+        lambda entry: {**entry, "field_semantics": {"field_1": "not a dict"}},
+        lambda entry: {**entry, "query_pattern_frequency": "not a dict"},
+        lambda entry: {**entry, "query_pattern_frequency": {"status:*": "many"}},
+        lambda entry: {**entry, "seen_instance_hashes": "bad"},
+        lambda entry: {**entry, "commonly_retrieved_fields": "abc"},
+        lambda entry: {**entry, "sample_size": "x"},
+        lambda entry: "not a pattern",
+    ],
+    ids=[
+        "missing_signature_hash",
+        "bad_field_semantics",
+        "bad_query_frequencies",
+        "bad_query_count",
+        "tracking_list_is_a_string",
+        "list_field_is_a_string",
+        "count_is_a_string",
+        "not_a_dict",
+    ],
+)
+def test_malformed_pattern_does_not_drop_the_rest_of_the_store(tmp_path, caplog, corrupt) -> None:
+    path = tmp_path / "toin.json"
+    data = _saved_store(path, 5)
+    keys = list(data["patterns"])
+    data["patterns"][keys[1]] = corrupt(data["patterns"][keys[1]])
+    path.write_text(json.dumps(data), encoding="utf-8")
+
+    with caplog.at_level(logging.WARNING, logger="headroom.telemetry.toin"):
+        toin = ToolIntelligenceNetwork(TOINConfig(storage_path=str(path), auto_save_interval=0))
+
+    assert len(toin._patterns) == 4
+    [warning] = _skip_warnings(caplog)
+    assert warning.skipped == 1
+    assert warning.imported == 4
+
+    # The next save used to write only the patterns read before the bad one.
+    _record(toin, 99)
+    toin.save()
+    saved = json.loads(path.read_text(encoding="utf-8"))["patterns"]
+    assert set(keys) - {keys[1]} <= set(saved)
+    assert len(saved) == 5
+
+
+def test_foreign_store_keeps_the_healthy_entries_after_a_malformed_one(tmp_path, caplog) -> None:
+    path = tmp_path / "toin.json"
+    data = _saved_store(path, 3)
+    keys = list(data["patterns"])
+    # A string tracking list used to pass from_dict and then fail on .append()
+    # while tracking the foreign source, outside the per-entry guard.
+    data["patterns"][keys[0]]["seen_instance_hashes"] = "bad"
+    data["instance_id"] = "foreign-instance"
+    path.write_text(json.dumps(data), encoding="utf-8")
+
+    with caplog.at_level(logging.WARNING, logger="headroom.telemetry.toin"):
+        toin = ToolIntelligenceNetwork(TOINConfig(storage_path=str(path), auto_save_interval=0))
+
+    assert len(toin._patterns) == 2
+    [warning] = _skip_warnings(caplog)
+    assert warning.skipped == 1
+    assert all("foreign-instance" in p._seen_instance_hashes for p in toin._patterns.values())
+
+    toin.save()
+    saved = json.loads(path.read_text(encoding="utf-8"))["patterns"]
+    assert set(saved) == set(keys[1:])
+
+
+def test_failed_merge_leaves_the_existing_pattern_unchanged(caplog) -> None:
+    toin = ToolIntelligenceNetwork(TOINConfig(storage_path=""))
+    for index in range(2):
+        _record(toin, index)
+    exported = toin.export_patterns()
+    keys = list(exported["patterns"])
+    # to_dict() shares the pattern's containers, so snapshot through JSON.
+    before = {key: json.loads(json.dumps(p.to_dict())) for key, p in toin._patterns.items()}
+
+    bad = dict(exported["patterns"][keys[0]])
+    # Passes from_dict, then fails part-way through _merge_patterns: the counts
+    # and the "field_new" key are already added when the "x" value raises.
+    bad["field_retrieval_frequency"] = {"field_new": 1, "field_0": "x"}
+    healthy = dict(exported["patterns"][keys[1]])
+    with caplog.at_level(logging.WARNING, logger="headroom.telemetry.toin"):
+        toin.import_patterns(
+            {"instance_id": "foreign-instance", "patterns": {keys[0]: bad, keys[1]: healthy}}
+        )
+
+    [warning] = _skip_warnings(caplog)
+    assert warning.skipped == 1
+    first, second = (toin._patterns[key] for key in before)
+    assert json.loads(json.dumps(first.to_dict())) == before[next(iter(before))]
+    assert second.total_compressions == 2
+
+
+def test_float_counts_written_by_merges_still_load(tmp_path, caplog) -> None:
+    # _merge_patterns stores optimal_max_items as a weighted float.
+    path = tmp_path / "toin.json"
+    data = _saved_store(path, 2)
+    for entry in data["patterns"].values():
+        entry["optimal_max_items"] = 37.5
+    path.write_text(json.dumps(data), encoding="utf-8")
+
+    with caplog.at_level(logging.WARNING, logger="headroom.telemetry.toin"):
+        toin = ToolIntelligenceNetwork(TOINConfig(storage_path=str(path), auto_save_interval=0))
+
+    assert len(toin._patterns) == 2
+    assert _skip_warnings(caplog) == []
+
+
+def test_valid_store_loads_without_a_skip_warning(tmp_path, caplog) -> None:
+    path = tmp_path / "toin.json"
+    _saved_store(path, 5)
+
+    with caplog.at_level(logging.WARNING, logger="headroom.telemetry.toin"):
+        toin = ToolIntelligenceNetwork(TOINConfig(storage_path=str(path), auto_save_interval=0))
+
+    assert len(toin._patterns) == 5
+    assert _skip_warnings(caplog) == []
 
 
 def test_filesystem_backend_writes_compact_json(tmp_path) -> None:

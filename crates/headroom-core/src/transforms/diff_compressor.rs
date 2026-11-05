@@ -278,6 +278,20 @@ impl DiffCompressor {
         context: &str,
         store: Option<&dyn CcrStore>,
     ) -> (DiffCompressionResult, DiffCompressorStats) {
+        self.compress_with_ccr_source(content, context, store, content)
+    }
+
+    /// Like [`Self::compress_with_store`], but the CCR entry and its
+    /// hash come from `ccr_source` rather than `content`. Use when
+    /// `content` is a derived form of the original (e.g. after a
+    /// reformat) and retrieval must return the original.
+    pub fn compress_with_ccr_source(
+        &self,
+        content: &str,
+        context: &str,
+        store: Option<&dyn CcrStore>,
+        ccr_source: &str,
+    ) -> (DiffCompressionResult, DiffCompressorStats) {
         let start = Instant::now();
         let mut stats = DiffCompressorStats::default();
 
@@ -473,7 +487,7 @@ impl DiffCompressor {
         if self.config.enable_ccr
             && (compressed_line_count as f64) < (original_line_count as f64) * savings_threshold
         {
-            let key = md5_hex_24(content);
+            let key = md5_hex_24(ccr_source);
             compressed_output.push('\n');
             compressed_output.push_str(&format!(
                 "[{} lines compressed to {}. Retrieve full diff: hash={}]",
@@ -485,7 +499,7 @@ impl DiffCompressor {
             // (typically the Python shim) is responsible — see the
             // method-level docs.
             if let Some(s) = store {
-                s.put(&key, content);
+                s.put(&key, ccr_source);
             }
             cache_key = Some(key);
             stats.cache_key_emitted = true;
@@ -788,7 +802,18 @@ fn parse_diff(lines: &[&str]) -> ParsedDiff {
 
         // Hunk content.
         if let Some(h) = current_hunk.as_mut() {
-            if line.starts_with('+') && !line.starts_with("+++") {
+            let parents = hunk_parents(&h.header);
+            if parents > 1 && !line.starts_with('\\') {
+                let (added, deleted) = combined_change(line, parents);
+                if deleted {
+                    h.deletions += 1;
+                } else if added {
+                    h.additions += 1;
+                } else {
+                    h.context_lines += 1;
+                }
+                h.lines.push(line.to_string());
+            } else if line.starts_with('+') && !line.starts_with("+++") {
                 h.additions += 1;
                 h.lines.push(line.to_string());
             } else if line.starts_with('-') && !line.starts_with("---") {
@@ -982,6 +1007,24 @@ fn select_hunks(hunks: Vec<DiffHunk>, max_per_file: usize) -> (Vec<DiffHunk>, Ve
     )
 }
 
+/// Number of `+`/`-` prefix columns on a hunk's lines: one per parent, so 1
+/// for `@@` and N for a combined-diff `@@@…` header with N parents.
+fn hunk_parents(header: &str) -> usize {
+    header
+        .bytes()
+        .take_while(|&b| b == b'@')
+        .count()
+        .saturating_sub(1)
+        .max(1)
+}
+
+/// `(is_addition, is_deletion)` for a combined-diff hunk line. A change can
+/// sit in any parent column, e.g. ` -old` / ` +new` against the second parent.
+fn combined_change(line: &str, parents: usize) -> (bool, bool) {
+    let cols = &line.as_bytes()[..parents.min(line.len())];
+    (cols.contains(&b'+'), cols.contains(&b'-'))
+}
+
 fn extract_line_number(header: &str) -> usize {
     // Use the dedicated `+N` regex — works for both `@@` and `@@@` headers.
     // The previous implementation captured group(1) of the hunk-header
@@ -1000,13 +1043,23 @@ fn extract_line_number(header: &str) -> usize {
 // ─── Context trimming ──────────────────────────────────────────────────────
 
 fn reduce_context(hunk: &DiffHunk, max_context: usize) -> DiffHunk {
+    let parents = hunk_parents(&hunk.header);
+    let change_kind = |l: &str| -> (bool, bool) {
+        if parents > 1 {
+            combined_change(l, parents)
+        } else {
+            (l.starts_with('+'), l.starts_with('-'))
+        }
+    };
+
     // Indices of `+`/`-` lines.
     let change_positions: Vec<usize> = hunk
         .lines
         .iter()
         .enumerate()
         .filter_map(|(i, l)| {
-            if l.starts_with('+') || l.starts_with('-') {
+            let (added, deleted) = change_kind(l);
+            if added || deleted {
                 Some(i)
             } else {
                 None
@@ -1061,10 +1114,11 @@ fn reduce_context(hunk: &DiffHunk, max_context: usize) -> DiffHunk {
     for &i in &keep {
         let line = &hunk.lines[i];
         new_lines.push(line.clone());
-        if line.starts_with('+') {
-            additions += 1;
-        } else if line.starts_with('-') {
+        let (added, deleted) = change_kind(line);
+        if deleted {
             deletions += 1;
+        } else if added {
+            additions += 1;
         } else {
             context_lines += 1;
         }
@@ -1728,6 +1782,56 @@ mod tests {
         assert_eq!(r.files_affected, 1);
         assert!(r.compressed.contains("diff --cc cc_target.py"));
         assert!(r.compressed.contains("++merge_added"));
+    }
+
+    /// A combined-diff change against the second parent (` -old` / ` +new`)
+    /// starts with a space, like context. It must still count as a change
+    /// and survive the context trim, wherever it sits in the hunk.
+    #[test]
+    fn combined_diff_second_parent_changes_survive_context_trim() {
+        let lines = [
+            "diff --combined merge.py",
+            "--- a/merge.py",
+            "+++ b/merge.py",
+            "@@@ -1,7 -1,7 +1,7 @@@",
+            "  ctx_1",
+            "  ctx_2",
+            "  ctx_3",
+            " -old_from_p2",
+            " +new_from_p1",
+            "  ctx_4",
+            "  ctx_5",
+            "  ctx_6",
+            "@@@ -20,8 -20,8 +20,8 @@@",
+            "- old_p1",
+            " -old_p2",
+            "++merged",
+            "  ctx_a",
+            "  ctx_b",
+            "  ctx_c",
+            "  ctx_d",
+            " -far_old_from_p2",
+            " +far_new_from_p1",
+        ];
+        let input = lines.join("\n");
+        let cfg = DiffCompressorConfig {
+            min_lines_for_ccr: 5,
+            ..Default::default()
+        };
+        let r = DiffCompressor::new(cfg).compress(&input, "");
+        for change in [
+            " -old_from_p2",
+            " +new_from_p1",
+            " -far_old_from_p2",
+            " +far_new_from_p1",
+        ] {
+            assert!(
+                r.compressed.lines().any(|l| l == change),
+                "{change:?} dropped as context:\n{}",
+                r.compressed
+            );
+        }
+        assert_eq!((r.additions, r.deletions), (3, 4));
     }
 
     /// Bug-fix test: pre-diff content (commit headers, email-style
