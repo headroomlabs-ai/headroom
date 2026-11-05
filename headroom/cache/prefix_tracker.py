@@ -1388,6 +1388,23 @@ class PrefixCacheTracker:
         """Return the sticky reasoning-drop floor for this request's resolved turn."""
         return int(self._request_turn_state()[5])
 
+    def raise_reasoning_drop_floor(self, floor: int) -> None:
+        """Raise the sticky reasoning-drop floor for this request.
+
+        A cold turn's drop must survive into the response recorded for this
+        request, without letting a sibling fork's live mutation leak in.
+        Updates the live floor (never shrinking it) and the resolved request's
+        turn snapshot so response recording persists the deliberate increase.
+        """
+        floor = int(floor)
+        self.reasoning_drop_upto = max(self.reasoning_drop_upto, floor)
+        resolved = _resolved_turn.get()
+        if resolved is not None and resolved[0] is self and resolved[2] is not None:
+            state = list(resolved[2])
+            if len(state) > 5:
+                state[5] = max(int(state[5]), floor)
+                _resolved_turn.set((self, resolved[1], tuple(state)))
+
     def record_returned(
         self,
         original_messages: list[dict[str, Any]],

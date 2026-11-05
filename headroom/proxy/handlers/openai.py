@@ -4586,9 +4586,11 @@ class OpenAIHandlerMixin:
                     # On a cold turn drop=True drops every non-kept prior turn, so
                     # record that count as the new sticky floor for the next warm
                     # turn. Never shrink it — a later cold turn can only drop more.
+                    # Keep the increase on this request's resolved state so response
+                    # recording persists it without adopting a sibling fork's floor.
                     if _rc_cold and openai_prefix_tracker is not None:
-                        openai_prefix_tracker.reasoning_drop_upto = max(
-                            _rc_drop_upto, _rc_stats.get("dropped_upto", 0)
+                        openai_prefix_tracker.raise_reasoning_drop_floor(
+                            max(_rc_drop_upto, _rc_stats.get("dropped_upto", 0))
                         )
                     if _rc_stats["turns_compacted"]:
                         transforms_applied.append(
