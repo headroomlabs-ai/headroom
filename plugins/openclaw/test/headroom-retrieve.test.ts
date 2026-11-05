@@ -43,12 +43,13 @@ describe("headroom_retrieve hash validation", () => {
     expect(JSON.parse(result)).toEqual({ original_content: "the full original text" });
   });
 
-  it("accepts an uppercase 12-character hex hash", async () => {
+  it("queries the store with the lowercased key for an uppercase 12-character hash", async () => {
     const fetchMock = stubRetrieveOk();
 
     await retrieve("A1B2C3D4E5F6");
 
     expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(fetchMock.mock.calls[0][0]).toBe(`${PROXY_URL}/v1/retrieve/a1b2c3d4e5f6`);
   });
 
   it("still accepts a 24-character hex hash", async () => {
@@ -59,6 +60,15 @@ describe("headroom_retrieve hash validation", () => {
     expect(fetchMock).toHaveBeenCalledTimes(1);
     expect(fetchMock.mock.calls[0][0]).toBe(`${PROXY_URL}/v1/retrieve/a1b2c3d4e5f6a1b2c3d4e5f6`);
     expect(JSON.parse(result)).toEqual({ original_content: "the full original text" });
+  });
+
+  it("queries the store with the lowercased key for an uppercase 24-character hash", async () => {
+    const fetchMock = stubRetrieveOk();
+
+    await retrieve("A1B2C3D4E5F6A1B2C3D4E5F6");
+
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(fetchMock.mock.calls[0][0]).toBe(`${PROXY_URL}/v1/retrieve/a1b2c3d4e5f6a1b2c3d4e5f6`);
   });
 
   it("rejects a non-hex 12-character hash without querying the store", async () => {

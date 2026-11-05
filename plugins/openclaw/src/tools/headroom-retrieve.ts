@@ -43,7 +43,10 @@ export function createHeadroomRetrieveTool(config: RetrieveToolConfig) {
       }
 
       try {
-        const url = `${proxyOrigin}/v1/retrieve/${hash}`;
+        // The store keys entries by lowercase hex, so normalize once here
+        // instead of requiring every caller to pass a pre-lowercased hash.
+        const normalizedHash = hash.toLowerCase();
+        const url = `${proxyOrigin}/v1/retrieve/${normalizedHash}`;
 
         const resp = await fetch(url, {
           signal: AbortSignal.timeout(10_000),
