@@ -53,9 +53,15 @@ and two separate guards bound it.
 on a private, loopback, link-local, or otherwise non-public address: the confused-deputy
 case where the proxy is used to reach cloud metadata (`169.254.169.254`) or RFC1918
 hosts the caller cannot reach directly. NAT64-embedded IPv4 is unwrapped before the
-check, so it cannot be smuggled through an IPv6 literal. A rejected override is
-**ignored rather than fatal** — the request proceeds to the configured upstream and a
-warning is logged. `HEADROOM_ALLOWED_BASE_URLS` (comma-separated hosts or URLs)
+check, so it cannot be smuggled through an IPv6 literal. What happens to a rejected
+override depends on the route. The OpenAI Chat Completions and Responses handlers
+(`/v1/chat/completions`, `/v1/responses` and their unprefixed and Codex/ChatGPT-backend
+aliases) **ignore** it: the request proceeds to the configured upstream and a warning
+is logged. The other routes that read the header **reject** the request with HTTP 400
+(`Rejected unsafe upstream base URL`) before contacting any upstream: Anthropic
+Messages and token counting, the native Gemini routes, model listing, embeddings,
+moderations, audio, and the generic passthrough. A client that sends an unsafe override
+should be ready for either outcome. `HEADROOM_ALLOWED_BASE_URLS` (comma-separated hosts or URLs)
 re-permits specific internal endpoints as an explicit operator choice: a bare host
 permits every safe scheme and port on that host, a full URL permits only its exact
 normalized origin. DNS resolution is bounded by `HEADROOM_UPSTREAM_RESOLVE_TIMEOUT_S`
