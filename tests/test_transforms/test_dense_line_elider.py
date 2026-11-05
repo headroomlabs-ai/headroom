@@ -34,6 +34,40 @@ def test_prose_code_and_short_lines_untouched():
         assert elide_dense_lines(text) == (text, 0)
 
 
+# Chinese, Japanese and Thai prose carries no spaces between words, so a
+# paragraph has the same space ratio as a minified bundle.
+CJK_PROSE = {
+    "zh": "人工智能是计算机科学的一个分支，它企图了解智能的实质，并生产出一种新的能以人类智能相似的方式做出反应的智能机器。"
+    * 8,
+    "ja": "人工知能は、人間の知的能力をコンピュータ上で実現する様々な技術やソフトウェアの総称であり、研究は現在も続いている。"
+    * 8,
+    "th": "ปัญญาประดิษฐ์เป็นสาขาหนึ่งของวิทยาการคอมพิวเตอร์ที่ศึกษาการสร้างเครื่องจักรที่สามารถคิดและเรียนรู้ได้เหมือนมนุษย์"
+    * 8,
+}
+
+
+@pytest.mark.parametrize("lang", sorted(CJK_PROSE))
+def test_space_free_scripts_are_prose_not_dense(lang):
+    text = "\n\n".join([CJK_PROSE[lang]] * 6)
+    assert elide_dense_lines(text) == (text, 0)
+
+
+def test_cjk_prose_wrapped_in_long_ascii_markup_is_kept():
+    """Scraped HTML: long ASCII attributes can outweigh the prose in a line."""
+    url = "https://news.example.com/articles/2026/10/19/" + "a1b2c3d4" * 37
+    line = f'<p data-article-url="{url}">{CJK_PROSE["zh"][:84]}</p>'
+    assert len(line) >= 300 and 0.1 < sum(ord(c) > 0x7F for c in line) / len(line) < 0.2
+    text = "\n".join([line] * 6)
+    assert elide_dense_lines(text) == (text, 0)
+
+
+def test_dense_lines_still_elided_next_to_cjk_prose():
+    text = f"{CJK_PROSE['zh']}\n{MINIFIED_JS}\n{BASE64}\n"
+    out, n = elide_dense_lines(text)
+    assert n == 2
+    assert CJK_PROSE["zh"] in out
+
+
 def test_dense_lines_elided_others_kept():
     text = f"Script completed\nOutput:\n{MINIFIED_JS}\n{PROSE}\n{BASE64}\n"
     out, n = elide_dense_lines(text)
