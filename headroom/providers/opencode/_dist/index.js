@@ -19955,8 +19955,11 @@ function isRoutableUpstream(url2, proxy, excludeHosts) {
   }
   return true;
 }
-function shouldRoute(url2, proxy, excludeHosts) {
-  return isRoutableUpstream(url2, proxy, excludeHosts) && isLlmEndpointPath(url2.pathname);
+function isLlmMethod(method) {
+  return typeof method === "string" && method.toUpperCase() === "POST";
+}
+function shouldRoute(url2, proxy, excludeHosts, method) {
+  return isLlmMethod(method) && isRoutableUpstream(url2, proxy, excludeHosts) && isLlmEndpointPath(url2.pathname);
 }
 function modelBaseRoutesThroughProxy(baseUrl, proxyUrl, excludeHosts = []) {
   try {
@@ -20021,7 +20024,8 @@ function mergeFetchHeaders(input2, init, upstream, originalPath = void 0, projec
 }
 function withRoutedFetchInput(input2, init, proxy, project, excludeHosts, sessionToken) {
   const upstream = requestUrl(input2);
-  if (!shouldRoute(upstream, proxy, excludeHosts)) {
+  const method = init?.method ?? (input2 instanceof Request ? input2.method : "GET");
+  if (!shouldRoute(upstream, proxy, excludeHosts, method)) {
     return [input2, init];
   }
   const { url: nextUrl, originalPath } = routedUrlForOpenCode(upstream, proxy);
@@ -20093,7 +20097,7 @@ function headersForNodeRequest(options, upstream, originalPath, project, session
   return result;
 }
 function routedNodeOptions(parts, proxy, project, excludeHosts, sessionToken) {
-  if (!parts.url || !shouldRoute(parts.url, proxy, excludeHosts)) {
+  if (!parts.url || !shouldRoute(parts.url, proxy, excludeHosts, parts.options.method ?? "GET")) {
     return void 0;
   }
   const { url: nextUrl, originalPath } = routedUrlForOpenCode(parts.url, proxy);
@@ -20258,23 +20262,35 @@ function headroomShellEnv(proxyUrl, project, options) {
     ...options.backend ? { HEADROOM_BACKEND: options.backend } : {}
   };
 }
-function openAiWireSuffix(pkg) {
+function modelWireSuffix(pkg) {
   if (!pkg?.startsWith("@opencode/ai/providers/")) return void 0;
   if (pkg === "@opencode/ai/providers/openai-compatible" || pkg.endsWith("/chat")) {
     return "/chat/completions";
   }
   if (pkg.endsWith("-responses") || pkg.endsWith("/responses")) return "/responses";
+  if (pkg === "@opencode/ai/providers/anthropic" || pkg === "@opencode/ai/providers/anthropic-compatible" || pkg.endsWith("/messages")) {
+    return "/messages";
+  }
   return void 0;
+}
+function anthropicBaseKeepsPath(baseURL) {
+  try {
+    const pathname = trimTrailingSlashes(new URL(baseURL).pathname);
+    return pathname === "" || pathname === "/v1";
+  } catch {
+    return false;
+  }
 }
 function routeModelsThroughProxy(models, proxyUrl, project, excludeHosts, sessionToken) {
   for (const model of models.list()) {
     const providerID = String(model.providerID);
     const modelID = String(model.id);
     const provider = models.provider.get(providerID)?.provider;
-    const suffix = openAiWireSuffix(model.package ?? provider?.package);
+    const suffix = modelWireSuffix(model.package ?? provider?.package);
     const baseURL = model.settings?.baseURL ?? provider?.settings?.baseURL;
     if (!suffix || typeof baseURL !== "string") continue;
     if (!modelBaseRoutesThroughProxy(baseURL, proxyUrl, excludeHosts)) continue;
+    if (suffix === "/messages" && !anthropicBaseKeepsPath(baseURL)) continue;
     const upstream = new URL(baseURL);
     models.update(providerID, modelID, (draft) => {
       draft.settings = { ...draft.settings, baseURL: `${proxyUrl}/v1` };
