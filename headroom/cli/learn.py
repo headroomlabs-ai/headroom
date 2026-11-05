@@ -387,6 +387,9 @@ def _make_llm_judge(model: str) -> Any:
     best-effort: any failure (no key, parse error) returns None so the caller
     falls back to the heuristic.
     """
+    from headroom.offline import guard_egress
+
+    guard_egress(f"{model} API for the headroom learn --llm-judge verbosity judge")
 
     def judge(signals: dict) -> tuple[int, str] | None:
         try:
@@ -755,9 +758,7 @@ def _run_verbosity(
         # Seed the savings baseline: replace baseline, preserve any live
         # treatment/control already accumulated.
         ledger_path = ws / "output_savings.json"
-        ledger = SavingsLedger.load(ledger_path)
-        ledger.baseline = aggregated
-        ledger.save(ledger_path)
+        SavingsLedger.store_baseline(ledger_path, aggregated)
         click.echo(f"\n  [WROTE] {ws / 'verbosity.json'} (level {best_profile.level})")
         click.echo(
             f"  [WROTE] {ledger_path} (baseline: {aggregated.total_samples} samples, "
