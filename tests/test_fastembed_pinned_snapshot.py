@@ -228,11 +228,11 @@ def test_python_matches_parity_fixture():
 
 # ── the shared HuggingFace cache directory ──────────────────────────────────
 #
-# Rust's ``hf_hub_cache_dir`` re-implements how ``huggingface_hub`` picks the
+# Rust's ``hf_cache::hub_cache_dir`` re-implements how ``huggingface_hub`` picks the
 # hub cache, so both languages look up and download into one directory. These
 # check the shared fixture against Python itself; the Rust tests
 # ``expand_vars_matches_python_posixpath_and_ntpath`` and
-# ``hf_hub_cache_dir_matches_the_shared_fixture`` check the port against the
+# ``hub_cache_dir_matches_the_shared_fixture`` (``crates/headroom-core/src/hf_cache.rs``) check the port against the
 # same file.
 
 _CACHE_VARS = ("HF_HUB_CACHE", "HUGGINGFACE_HUB_CACHE", "HF_HOME", "XDG_CACHE_HOME")
@@ -288,3 +288,39 @@ def test_cache_dir_fixture_matches_huggingface_hub(case: dict, tmp_path: Path) -
     if isinstance(expected, dict):
         expected = expected["nt" if os.name == "nt" else "posix"]
     assert Path(result.stdout) == Path(fill(expected))
+
+
+@pytest.mark.parametrize("case", HF_CACHE_FIXTURE["token"]["cases"], ids=lambda case: case["name"])
+def test_token_fixture_matches_huggingface_hub(case: dict, tmp_path: Path) -> None:
+    """The token Rust's ``hf_cache::hf_token`` must find, from
+    ``huggingface_hub.get_token()`` itself."""
+    import subprocess
+
+    pytest.importorskip("huggingface_hub")
+    root, home = tmp_path / "root", tmp_path / "home"
+
+    def fill(text: str) -> str:
+        return text.replace("{root}", str(root)).replace("{home}", str(home))
+
+    for path, content in case["files"].items():
+        target = Path(fill(path))
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(content, encoding="utf-8")
+    probe_vars = HF_CACHE_FIXTURE["cache_dir"]["probe_vars"]
+    env = {k: v for k, v in os.environ.items() if k not in (*_CACHE_VARS, *probe_vars)}
+    env["HOME"] = env["USERPROFILE"] = str(home)
+    env.update({name: fill(value) for name, value in case["env"].items()})
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            "import json, sys; from huggingface_hub import get_token; "
+            "sys.stdout.write(json.dumps(get_token()))",
+        ],
+        capture_output=True,
+        text=True,
+        env=env,
+        timeout=60,
+        check=True,
+    )
+    assert json.loads(result.stdout) == case["expected"]
