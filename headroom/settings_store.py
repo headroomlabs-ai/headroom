@@ -188,6 +188,19 @@ SETTINGS: tuple[SettingField, ...] = (
         ),
         tier="advanced",
     ),
+    SettingField(
+        "HEADROOM_CCR_INJECT_SYSTEM_INSTRUCTIONS",
+        "ccr_inject_system_instructions",
+        "Inject CCR system instructions",
+        "Compression",
+        "bool",
+        default=False,
+        help=(
+            "Append compressed context instructions to the system message "
+            "listing active CCR retrieval hashes."
+        ),
+        tier="advanced",
+    ),
     # --- Limits ---
     SettingField(
         "HEADROOM_RPM",

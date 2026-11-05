@@ -818,6 +818,27 @@ class TestCLIProxyEnvVars:
         assert result.exit_code == 0, result.output
         assert captured_config["config"].ccr_buffered_chat_streaming is expected
 
+    @pytest.mark.parametrize(
+        ("args", "env", "expected"),
+        [
+            ([], {}, False),
+            (["--ccr-inject-system-instructions"], {}, True),
+            ([], {"HEADROOM_CCR_INJECT_SYSTEM_INSTRUCTIONS": "1"}, True),
+        ],
+    )
+    def test_ccr_inject_system_instructions_reaches_config(self, runner, args, env, expected):
+        """`headroom proxy` builds its own ProxyConfig, so the flag has to be wired here too."""
+        captured_config = {}
+
+        def mock_run_server(config, **kwargs):
+            captured_config["config"] = config
+
+        with patch("headroom.proxy.server.run_server", mock_run_server):
+            result = runner.invoke(main, ["proxy", *args], env=env, catch_exceptions=False)
+
+        assert result.exit_code == 0, result.output
+        assert captured_config["config"].ccr_inject_system_instructions is expected
+
     @pytest.mark.parametrize("timeout", [-1, 0, 1, 10000])
     def test_request_timeout_cli_flags(self, runner, timeout):
         """Fast-fail CLI flags should map into ProxyConfig."""
@@ -1442,6 +1463,15 @@ class TestArgparseBackendValidation:
 
         assert config.disable_kompress_fallback is True
 
+    def test_proxy_config_from_env_reads_ccr_inject_system_instructions(self):
+        """The direct server env path should honor HEADROOM_CCR_INJECT_SYSTEM_INSTRUCTIONS."""
+        from headroom.proxy.server import _proxy_config_from_env
+
+        with patch.dict(os.environ, {"HEADROOM_CCR_INJECT_SYSTEM_INSTRUCTIONS": "1"}):
+            config = _proxy_config_from_env()
+
+        assert config.ccr_inject_system_instructions is True
+
     def test_argparse_registers_keepalive_expiry_flag(self):
         """The argparse path (python -m headroom.proxy.server) must register
         --keepalive-expiry as a float flag, so it can override the
@@ -1731,3 +1761,27 @@ class TestSettingsFileToEnv:
 
         assert result.exit_code == 0, result.output
         assert captured_config["config"].port == 7777
+
+    def test_settings_file_reaches_ccr_inject_system_instructions(self, runner, tmp_path):
+        (tmp_path / "settings.json").write_text(
+            '{"ccr_inject_system_instructions": true}', encoding="utf-8"
+        )
+        captured_config = {}
+
+        def mock_run_server(config, **kwargs):
+            captured_config["config"] = config
+
+        with patch("headroom.proxy.server.run_server", mock_run_server):
+            result = runner.invoke(
+                main,
+                ["proxy"],
+                env={
+                    "HEADROOM_WORKSPACE_DIR": str(tmp_path),
+                    "HEADROOM_SETTINGS_PATH": None,
+                    "HEADROOM_CCR_INJECT_SYSTEM_INSTRUCTIONS": None,
+                },
+                catch_exceptions=False,
+            )
+
+        assert result.exit_code == 0, result.output
+        assert captured_config["config"].ccr_inject_system_instructions is True
