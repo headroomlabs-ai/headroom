@@ -79,6 +79,7 @@ def test_codex_responses_subpath_aliases_delegate_to_passthrough():
     with TestClient(create_app(ProxyConfig())) as client:
         fake_http_client = FakeAsyncClient()
         client.app.state.proxy.http_client = fake_http_client
+        client.app.state.proxy.http_client_h1 = fake_http_client
         client.app.state.proxy.OPENAI_API_URL = "https://api.openai.test"
 
         pi_response = client.post(
@@ -141,6 +142,7 @@ def test_codex_responses_subpath_passthrough_derives_chatgpt_routing_from_jwt(pa
     with TestClient(create_app(ProxyConfig())) as client:
         fake_http_client = FakeAsyncClient()
         client.app.state.proxy.http_client = fake_http_client
+        client.app.state.proxy.http_client_h1 = fake_http_client
         client.app.state.proxy.OPENAI_API_URL = "https://api.openai.test"
 
         response = client.post(
@@ -192,6 +194,7 @@ def test_codex_model_metadata_fetches_codex_registry_for_chatgpt_auth(monkeypatc
     with TestClient(create_app(ProxyConfig())) as client:
         fake_http_client = FakeAsyncClient()
         client.app.state.proxy.http_client = fake_http_client
+        client.app.state.proxy.http_client_h1 = fake_http_client
         client.app.state.proxy.OPENAI_API_URL = "https://api.openai.test"
 
         list_response = client.get(
