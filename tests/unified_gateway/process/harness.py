@@ -8,8 +8,10 @@ import os
 import socket
 import subprocess
 import sys
+import threading
 import time
-from dataclasses import dataclass
+from collections import deque
+from dataclasses import dataclass, field
 from pathlib import Path
 
 import httpx
@@ -22,20 +24,21 @@ class GatewayProcess:
     process: subprocess.Popen[str] | None
     base_url: str
     owned_pid: int | None = None
+    output: deque[str] = field(default_factory=lambda: deque(maxlen=100))
+    output_thread: threading.Thread | None = None
 
     def close(self) -> None:
-        if (
-            self.process is None
-            or self.owned_pid != self.process.pid
-            or self.process.poll() is not None
-        ):
+        if self.process is None or self.owned_pid != self.process.pid:
             return
-        self.process.terminate()
-        try:
-            self.process.wait(timeout=10)
-        except subprocess.TimeoutExpired:
-            self.process.kill()
-            self.process.wait(timeout=5)
+        if self.process.poll() is None:
+            self.process.terminate()
+            try:
+                self.process.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                self.process.kill()
+                self.process.wait(timeout=5)
+        if self.output_thread is not None:
+            self.output_thread.join(timeout=1)
 
 
 def gateway_config_digest(raw: dict) -> str:
@@ -119,10 +122,20 @@ def start_gateway_process(tmp_path: Path) -> GatewayProcess:
     gateway = GatewayProcess(
         process=process, base_url=f"http://127.0.0.1:{port}", owned_pid=process.pid
     )
+
+    def drain_output() -> None:
+        if process.stdout is not None:
+            for line in process.stdout:
+                gateway.output.append(line[-4096:])
+
+    # Drain Windows' small pipe before startup can block on its own banner.
+    gateway.output_thread = threading.Thread(target=drain_output, daemon=True)
+    gateway.output_thread.start()
     deadline = time.monotonic() + 30
     while time.monotonic() < deadline:
         if process.poll() is not None:
-            output = process.stdout.read() if process.stdout is not None else ""
+            gateway.output_thread.join(timeout=1)
+            output = "".join(gateway.output)
             raise RuntimeError(f"gateway process exited ({process.returncode}):\n{output}")
         try:
             response = httpx.get(f"{gateway.base_url}/readyz", timeout=0.5)
@@ -142,7 +155,7 @@ def start_gateway_process(tmp_path: Path) -> GatewayProcess:
             pass
         time.sleep(0.1)
     gateway.close()
-    raise RuntimeError("gateway process did not become ready")
+    raise RuntimeError("gateway process did not become ready:\n" + "".join(gateway.output))
 
 
 def _unused_loopback_port() -> int:

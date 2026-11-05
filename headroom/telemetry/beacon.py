@@ -8,7 +8,8 @@ Never leaves the machine.
 
 ``HEADROOM_BEACON`` — **on by default, opt-out.** Uploads an anonymous,
 content-free session summary to Headroom Labs. Disable with
-``HEADROOM_BEACON=off``, ``DO_NOT_TRACK=1``, or offline mode. See
+``HEADROOM_BEACON=off``, ``HEADROOM_TELEMETRY=off``, ``DO_NOT_TRACK=1``, or
+offline mode. See
 :mod:`headroom.telemetry.session` for the exact payload and
 ``deploy/beacon/worker.js`` for what the receiver does with it.
 
@@ -17,7 +18,9 @@ collector via ``HEADROOM_OTEL_METRICS_*`` — a destination you control, that
 Headroom Labs never sees.
 
 Keeping these separate matters: an operator who turned on local stats has not
-thereby agreed to upload anything, and must not start doing so on upgrade.
+thereby agreed to upload anything, and must not start doing so on upgrade. The
+one crossing is deliberate and only ever turns the upload off: an explicit
+``HEADROOM_TELEMETRY=off`` reads as "send nothing", so the beacon honours it.
 """
 
 from __future__ import annotations
@@ -56,40 +59,53 @@ def is_telemetry_enabled() -> bool:
 BEACON_DEFAULT_ON = True
 
 
-def is_beacon_enabled() -> bool:
-    """Check if the anonymous upload beacon is enabled.
+def beacon_off_reason() -> str | None:
+    """Name the setting that turns the anonymous upload beacon off, or ``None`` when on.
 
-    Default is :data:`BEACON_DEFAULT_ON`. Three things switch it off regardless,
-    in this order:
+    Default is :data:`BEACON_DEFAULT_ON`. Checked in this order, first match wins:
 
     * offline mode — no network is no network;
     * ``DO_NOT_TRACK`` — the cross-tool convention, honoured because a user who
       has already stated this preference should not have to state it again;
-    * ``HEADROOM_BEACON=off`` (or false/0/no/disable/disabled).
+    * ``HEADROOM_BEACON`` — the beacon's own switch; an explicit on-value keeps
+      the beacon on even when local stats are off;
+    * ``HEADROOM_TELEMETRY=off`` (or false/0/no/disable/disabled) — people set
+      the telemetry switch to mean "send nothing", so an explicit off stops the
+      upload too.
 
-    Deliberately a *separate* switch from ``HEADROOM_TELEMETRY``. That flag
-    means "aggregate stats locally so ``/stats`` has something to show" — data
-    that never leaves the machine. Overloading it to also authorise upload
-    would mean every operator who had turned on local stats begins transmitting
-    the moment they upgrade, having answered a different question.
+    Only an explicit *off* on ``HEADROOM_TELEMETRY`` reaches the beacon. Its
+    *on* still means only "aggregate stats locally": turning on local stats must
+    never be read as agreeing to upload.
+
+    The result is what ``headroom telemetry`` prints, so it is the variable and
+    value as the operator wrote them (lowercased), e.g. ``HEADROOM_TELEMETRY=off``.
+    """
+    from headroom.offline import OFFLINE_ENV, is_offline
+
+    if is_offline():
+        return f"{OFFLINE_ENV} (offline mode)"
+    dnt = os.environ.get("DO_NOT_TRACK", "").lower().strip()
+    if dnt and dnt not in _OFF_VALUES:
+        return f"DO_NOT_TRACK={dnt}"
+    raw = os.environ.get("HEADROOM_BEACON", "").lower().strip()
+    if raw in _OFF_VALUES:
+        return f"HEADROOM_BEACON={raw}"
+    if raw in _ON_VALUES:
+        return None
+    local = os.environ.get("HEADROOM_TELEMETRY", "").lower().strip()
+    if local in _OFF_VALUES:
+        return f"HEADROOM_TELEMETRY={local}"
+    return None if BEACON_DEFAULT_ON else "default (opt-in)"
+
+
+def is_beacon_enabled() -> bool:
+    """Check if the anonymous upload beacon is enabled; see :func:`beacon_off_reason`.
 
     Note the asymmetry with :func:`is_telemetry_enabled`, which is fail-closed:
     this one is fail-open by construction while ``BEACON_DEFAULT_ON`` is True,
     so an unrecognised value uploads rather than staying silent.
     """
-    from headroom.offline import is_offline
-
-    if is_offline():
-        return False
-    dnt = os.environ.get("DO_NOT_TRACK", "").lower().strip()
-    if dnt and dnt not in _OFF_VALUES:
-        return False
-    raw = os.environ.get("HEADROOM_BEACON", "").lower().strip()
-    if raw in _OFF_VALUES:
-        return False
-    if raw in _ON_VALUES:
-        return True
-    return BEACON_DEFAULT_ON
+    return beacon_off_reason() is None
 
 
 def is_telemetry_warn_enabled() -> bool:

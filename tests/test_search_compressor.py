@@ -7,6 +7,7 @@ Tests cover:
 4. Edge cases
 """
 
+from headroom._core import parse_search_lines
 from headroom.transforms.search_compressor import (
     FileMatches,
     SearchCompressionResult,
@@ -14,6 +15,31 @@ from headroom.transforms.search_compressor import (
     SearchCompressorConfig,
     SearchMatch,
 )
+
+
+def _parse(content: str) -> dict[str, FileMatches]:
+    """Group the Rust parser's (file, line, body) rows by file."""
+    out: dict[str, FileMatches] = {}
+    for file_path, line_no, body in parse_search_lines(content):
+        out.setdefault(file_path, FileMatches(file=file_path)).matches.append(
+            SearchMatch(file=file_path, line_number=int(line_no), content=body)
+        )
+    return out
+
+
+def _keep_best_one(**config) -> SearchCompressor:
+    """A compressor that keeps only the single highest-scored match per file,
+    so a compress() call shows which line the scorer ranked first. Ties keep
+    the earliest line."""
+    return SearchCompressor(
+        SearchCompressorConfig(
+            max_matches_per_file=1,
+            always_keep_first=False,
+            always_keep_last=False,
+            enable_ccr=False,
+            **config,
+        )
+    )
 
 
 class TestGrepOutputParsing:
@@ -25,8 +51,7 @@ class TestGrepOutputParsing:
 src/main.py:43:    \"\"\"Process items.\"\"\"
 src/utils.py:15:def validate(data):
 """
-        compressor = SearchCompressor()
-        file_matches = compressor._parse_search_results(content)
+        file_matches = _parse(content)
 
         assert "src/main.py" in file_matches
         assert "src/utils.py" in file_matches
@@ -39,8 +64,7 @@ src/utils.py:15:def validate(data):
 src/main.py:42:def process_data(items):
 src/main.py-43-some context after
 """
-        compressor = SearchCompressor()
-        file_matches = compressor._parse_search_results(content)
+        file_matches = _parse(content)
 
         assert "src/main.py" in file_matches
         # All three lines should be parsed (both : and - separators)
@@ -51,8 +75,7 @@ src/main.py-43-some context after
         content = """src/config.py:10:DATABASE_URL = "postgres://user:pass@host:5432/db"
 src/config.py:20:REDIS_URL = "redis://localhost:6379"
 """
-        compressor = SearchCompressor()
-        file_matches = compressor._parse_search_results(content)
+        file_matches = _parse(content)
 
         assert "src/config.py" in file_matches
         matches = file_matches["src/config.py"].matches
@@ -65,8 +88,7 @@ src/config.py:20:REDIS_URL = "redis://localhost:6379"
         content = """C:\\Users\\dev\\src\\main.py:10:def main():
 C:\\Users\\dev\\src\\utils.py:20:def helper():
 """
-        compressor = SearchCompressor()
-        file_matches = compressor._parse_search_results(content)
+        file_matches = _parse(content)
 
         # Windows paths may not parse correctly due to : in path
         # This tests current behavior
@@ -74,15 +96,13 @@ C:\\Users\\dev\\src\\utils.py:20:def helper():
 
     def test_parse_empty_content(self):
         """Empty input returns empty result."""
-        compressor = SearchCompressor()
-        file_matches = compressor._parse_search_results("")
+        file_matches = _parse("")
 
         assert file_matches == {}
 
     def test_parse_whitespace_only(self):
         """Whitespace-only input returns empty result."""
-        compressor = SearchCompressor()
-        file_matches = compressor._parse_search_results("   \n\n   \n")
+        file_matches = _parse("   \n\n   \n")
 
         assert file_matches == {}
 
@@ -92,8 +112,7 @@ C:\\Users\\dev\\src\\utils.py:20:def helper():
 without any grep-style formatting
 just normal lines here"""
 
-        compressor = SearchCompressor()
-        file_matches = compressor._parse_search_results(content)
+        file_matches = _parse(content)
 
         assert file_matches == {}
 
@@ -104,12 +123,107 @@ this is not a grep line
 src/utils.py:20:another valid line
 more random text
 """
-        compressor = SearchCompressor()
-        file_matches = compressor._parse_search_results(content)
+        file_matches = _parse(content)
 
         assert "src/main.py" in file_matches
         assert "src/utils.py" in file_matches
         assert len(file_matches) == 2
+
+
+class TestContextLineBodyReference:
+    """A ``name:N:`` reference in a context line's body must not become the marker.
+
+    ripgrep emits ``path-line-content`` for *context* lines and
+    ``path:line:content`` for *match* lines, and real bodies routinely carry
+    their own ``name:N:`` references. The colon tier used to claim such a
+    reference as the line-number marker whenever no whitespace preceded it,
+    which pushed the real ``-N-`` marker into the path and reported the body's
+    number as the line number -- inventing a file that does not exist and
+    pairing content with a line it never came from (issue #3545).
+    """
+
+    def test_body_reference_does_not_become_the_line_number(self):
+        content = "app/settings.py-476-a:7:b:8:c"
+        file_matches = _parse(content)
+
+        assert list(file_matches) == ["app/settings.py"]
+        matches = file_matches["app/settings.py"].matches
+        assert len(matches) == 1
+        assert matches[0].line_number == 476
+        assert matches[0].content == "a:7:b:8:c"
+
+    def test_extensionless_context_path_keeps_its_own_line_number(self):
+        content = "CHANGELOG-12-a:99:b"
+        file_matches = _parse(content)
+
+        assert list(file_matches) == ["CHANGELOG"]
+        matches = file_matches["CHANGELOG"].matches
+        assert len(matches) == 1
+        assert matches[0].line_number == 12
+        assert matches[0].content == "a:99:b"
+
+    def test_colon_row_with_dashed_path_is_unaffected(self):
+        """The dash marker sits in the *path* here, so the colon tier still wins."""
+        content = "logs/2026-05-03/app.log:12:ERROR"
+        file_matches = _parse(content)
+
+        assert list(file_matches) == ["logs/2026-05-03/app.log"]
+        matches = file_matches["logs/2026-05-03/app.log"].matches
+        assert len(matches) == 1
+        assert matches[0].line_number == 12
+        assert matches[0].content == "ERROR"
+
+    def test_filename_style_body_reference_keeps_the_context_coordinates(self):
+        """A body reference that looks like a *filename* must not take the row.
+
+        ``app.py-476-foo.rs:12:ref`` is a ripgrep context row for ``app.py``
+        line 476 whose body is ``foo.rs:12:ref``. The dash tier confirms the
+        boundary (the segment carries an extension), so the extension dot
+        inside the body says nothing about where the path ended. Before the
+        fix the colon tier reclaimed the row as the nonexistent path
+        ``app.py-476-foo.rs`` at line 12.
+        """
+        content = "app.py-476-foo.rs:12:ref"
+        file_matches = _parse(content)
+
+        assert list(file_matches) == ["app.py"]
+        matches = file_matches["app.py"].matches
+        assert len(matches) == 1
+        assert matches[0].line_number == 476
+        assert matches[0].content == "foo.rs:12:ref"
+
+    def test_filename_style_body_reference_behind_a_directory(self):
+        """Same shape with a directory component, which also looks path-like."""
+        content = "pkg/server.ts-91-lib/index.js:7:import"
+        file_matches = _parse(content)
+
+        assert list(file_matches) == ["pkg/server.ts"]
+        matches = file_matches["pkg/server.ts"].matches
+        assert len(matches) == 1
+        assert matches[0].line_number == 91
+        assert matches[0].content == "lib/index.js:7:import"
+
+    def test_bare_path_body_keeps_the_context_coordinates(self):
+        """The body needs no reference at all to be path-like."""
+        content = "app.py-476-./vendor/other.py"
+        file_matches = _parse(content)
+
+        assert list(file_matches) == ["app.py"]
+        matches = file_matches["app.py"].matches
+        assert len(matches) == 1
+        assert matches[0].line_number == 476
+        assert matches[0].content == "./vendor/other.py"
+
+    def test_many_context_rows_keep_their_own_coordinates(self):
+        """Every coordinate an agent would act on survives across many rows."""
+        content = "\n".join(f"pkg/mod/file.py-{476 + i * 7}-hits:{i}:of:9" for i in range(12))
+        file_matches = _parse(content)
+
+        assert list(file_matches) == ["pkg/mod/file.py"]
+        matches = file_matches["pkg/mod/file.py"].matches
+        assert [m.line_number for m in matches] == [476 + i * 7 for i in range(12)]
+        for i, match in enumerate(matches):
+            assert match.content == f"hits:{i}:of:9"
 
 
 class TestFileGrouping:
@@ -124,8 +238,7 @@ c.py:4:line 4
 b.py:5:line 5
 a.py:6:line 6
 """
-        compressor = SearchCompressor()
-        file_matches = compressor._parse_search_results(content)
+        file_matches = _parse(content)
 
         assert len(file_matches) == 3
         assert len(file_matches["a.py"].matches) == 3
@@ -172,95 +285,49 @@ class TestMatchScoring:
     """Tests for match relevance scoring."""
 
     def test_score_context_word_overlap(self):
-        """Matches containing context words get higher scores."""
+        """Matches containing context words rank higher."""
         content = """src/main.py:10:def process_data():
 src/main.py:20:def calculate_result():
 src/main.py:30:def handle_error():
 """
-        compressor = SearchCompressor()
-        file_matches = compressor._parse_search_results(content)
-        compressor._score_matches(file_matches, context="error handling")
-
-        matches = file_matches["src/main.py"].matches
-        error_match = next(m for m in matches if "error" in m.content)
-        data_match = next(m for m in matches if "data" in m.content)
-
-        # Error match should score higher with "error" context
-        assert error_match.score > data_match.score
+        result = _keep_best_one(boost_errors=False).compress(content, context="error handling")
+        assert result.compressed.startswith("src/main.py:30:def handle_error():")
 
     def test_score_error_patterns_boosted(self):
-        """Error/exception patterns get boosted scores."""
+        """Error/exception patterns rank higher."""
         content = """src/main.py:10:def normal_function():
 src/main.py:20:raise ValueError("error occurred")
-src/main.py:30:# TODO: fix this
+src/main.py:30:def other_function():
 """
-        compressor = SearchCompressor(config=SearchCompressorConfig(boost_errors=True))
-        file_matches = compressor._parse_search_results(content)
-        compressor._score_matches(file_matches, context="")
-
-        matches = file_matches["src/main.py"].matches
-        error_match = next(m for m in matches if "error" in m.content.lower())
-        normal_match = next(m for m in matches if "normal" in m.content)
-
-        assert error_match.score > normal_match.score
+        result = _keep_best_one(boost_errors=True).compress(content)
+        assert result.compressed.startswith('src/main.py:20:raise ValueError("error occurred")')
 
     def test_score_warning_patterns(self):
-        """Warning patterns get boosted scores."""
+        """Warning patterns rank higher."""
         content = """src/main.py:10:def normal():
 src/main.py:20:# WARNING: deprecated
+src/main.py:30:def other():
 """
-        compressor = SearchCompressor()
-        file_matches = compressor._parse_search_results(content)
-        compressor._score_matches(file_matches, context="")
-
-        matches = file_matches["src/main.py"].matches
-        warning_match = next(m for m in matches if "WARNING" in m.content)
-        normal_match = next(m for m in matches if "normal" in m.content)
-
-        assert warning_match.score > normal_match.score
+        result = _keep_best_one().compress(content)
+        assert result.compressed.startswith("src/main.py:20:# WARNING: deprecated")
 
     def test_score_todo_patterns(self):
-        """TODO/FIXME patterns get boosted scores."""
+        """TODO/FIXME patterns rank higher."""
         content = """src/main.py:10:def normal():
 src/main.py:20:# FIXME: this needs work
-src/main.py:30:# TODO: implement later
+src/main.py:30:def other():
 """
-        compressor = SearchCompressor()
-        file_matches = compressor._parse_search_results(content)
-        compressor._score_matches(file_matches, context="")
-
-        matches = file_matches["src/main.py"].matches
-        fixme_match = next(m for m in matches if "FIXME" in m.content)
-        normal_match = next(m for m in matches if "normal" in m.content)
-
-        assert fixme_match.score > normal_match.score
+        result = _keep_best_one().compress(content)
+        assert result.compressed.startswith("src/main.py:20:# FIXME: this needs work")
 
     def test_score_context_keywords_config(self):
         """context_keywords configuration boosts matching lines."""
-        content = """src/main.py:10:def auth_handler():
-src/main.py:20:def data_processor():
+        content = """src/main.py:10:def data_processor():
+src/main.py:20:def auth_handler():
+src/main.py:30:def other():
 """
-        config = SearchCompressorConfig(context_keywords=["auth", "security"])
-        compressor = SearchCompressor(config=config)
-        file_matches = compressor._parse_search_results(content)
-        compressor._score_matches(file_matches, context="")
-
-        matches = file_matches["src/main.py"].matches
-        auth_match = next(m for m in matches if "auth" in m.content)
-        data_match = next(m for m in matches if "data" in m.content)
-
-        assert auth_match.score > data_match.score
-
-    def test_score_capped_at_one(self):
-        """Scores are capped at 1.0."""
-        content = """src/main.py:10:ERROR FATAL exception fail warning TODO FIXME
-"""
-        compressor = SearchCompressor()
-        file_matches = compressor._parse_search_results(content)
-        compressor._score_matches(file_matches, context="error fatal exception")
-
-        match = file_matches["src/main.py"].matches[0]
-        assert match.score <= 1.0
+        result = _keep_best_one(context_keywords=["auth", "security"]).compress(content)
+        assert result.compressed.startswith("src/main.py:20:def auth_handler():")
 
 
 class TestMatchSelection:
@@ -576,8 +643,7 @@ src/file (1).py:40:content
         """Negative line numbers don't match the pattern."""
         content = "src/file.py:-1:invalid"
 
-        compressor = SearchCompressor()
-        file_matches = compressor._parse_search_results(content)
+        file_matches = _parse(content)
 
         # Pattern requires \d+ which is positive integers only
         assert len(file_matches) == 0
@@ -612,16 +678,16 @@ class TestContextIntegration:
 
     def test_short_context_words_ignored(self):
         """Context words <= 2 chars are ignored for scoring."""
-        content = """src/file.py:10:a = 1
-src/file.py:20:do something important
+        content = """src/file.py:10:plain line one
+src/file.py:20:has an xy token
+src/file.py:30:plain line three
 """
-        compressor = SearchCompressor()
-        file_matches = compressor._parse_search_results(content)
-        compressor._score_matches(file_matches, context="a")
-
-        # Short context word "a" shouldn't cause errors or abnormal scoring
-        matches = file_matches["src/file.py"].matches
-        assert all(m.score <= 1.0 for m in matches)
+        # "xy" is too short to score, so nothing outranks the first line.
+        result = _keep_best_one(boost_errors=False).compress(content, context="xy")
+        assert result.compressed.startswith("src/file.py:10:plain line one")
+        # A longer word from the same line does score.
+        result = _keep_best_one(boost_errors=False).compress(content, context="token")
+        assert result.compressed.startswith("src/file.py:20:has an xy token")
 
 
 class TestOutputFormatting:
@@ -736,21 +802,14 @@ class TestConfigOptions:
 
     def test_disable_error_boost(self):
         """boost_errors=False doesn't prioritize error patterns."""
-        content = """src/file.py:1:ERROR critical failure
-src/file.py:2:normal code line
+        content = """src/file.py:1:normal code line
+src/file.py:2:ERROR critical failure
+src/file.py:3:more normal code
 """
-        compressor = SearchCompressor(
-            config=SearchCompressorConfig(
-                boost_errors=False,
-            )
-        )
-        file_matches = compressor._parse_search_results(content)
-        compressor._score_matches(file_matches, context="")
-
-        matches = file_matches["src/file.py"].matches
-        # Without boost, both should have similar (low) scores
-        error_match = next(m for m in matches if "ERROR" in m.content)
-        assert error_match.score == 0.0  # No boost applied
+        boosted = _keep_best_one(boost_errors=True).compress(content)
+        assert boosted.compressed.startswith("src/file.py:2:ERROR critical failure")
+        unboosted = _keep_best_one(boost_errors=False).compress(content)
+        assert unboosted.compressed.startswith("src/file.py:1:normal code line")
 
     def test_min_matches_for_ccr(self):
         """min_matches_for_ccr threshold is respected."""

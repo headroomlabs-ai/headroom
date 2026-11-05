@@ -101,6 +101,8 @@ def resolve_learned_ttl(provider: str, model: str) -> int | None:
     ``"provider/model"`` first, then ``"provider"``. Cached by mtime so a hot-path
     call is a dict lookup. Best-effort: returns None on any error, so the caller
     falls back to its own default (config TTL for CC, static default elsewhere).
+    Invalid table shapes are ignored; invalid model values fall through to the
+    provider fallback. Only positive, finite TTLs (not booleans) are accepted.
     """
     global _learned_cache, _learned_mtime
     path = _learned_path()
@@ -108,17 +110,24 @@ def resolve_learned_ttl(provider: str, model: str) -> int | None:
         mt = os.path.getmtime(path)
         if _learned_cache is None or mt != _learned_mtime:
             with open(path, encoding="utf-8") as f:
-                _learned_cache = json.load(f)
+                loaded = json.load(f)
+            _learned_cache = loaded if isinstance(loaded, dict) else {}
             _learned_mtime = mt
     except Exception:
         return None
     table = _learned_cache or {}
     for key in (f"{provider}/{model}", provider):
         v = table.get(key)
-        if isinstance(v, dict) and isinstance(v.get("ttl_seconds"), int | float):
-            return int(v["ttl_seconds"])
-        if isinstance(v, int | float):
-            return int(v)
+        if isinstance(v, dict):
+            v = v.get("ttl_seconds")
+        if isinstance(v, bool) or not isinstance(v, int | float):
+            continue
+        try:
+            ttl = int(v)
+        except (ValueError, OverflowError):
+            continue  # JSON may decode NaN/Infinity; never fail a live request.
+        if ttl > 0:
+            return ttl
     return None
 
 

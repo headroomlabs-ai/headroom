@@ -65,6 +65,25 @@ def test_provider_prices_models_its_table_never_covered(
     assert (round(got_in, 2), round(got_out, 2)) == (want_in, want_out)
 
 
+def test_gateway_pricing_uses_unwrapped_catalog_entry(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Retiring a vendor model must not break the gateway-resolution regression."""
+    bare_model = "headroom-pricing-fixture"
+    monkeypatch.setattr(
+        litellm,
+        "model_cost",
+        {
+            bare_model: {
+                "input_cost_per_token": 0.20 / 1_000_000,
+                "output_cost_per_token": 0.20 / 1_000_000,
+            }
+        },
+    )
+
+    # Only the unwrapped key exists. Returning the unknown-model default instead
+    # of looking through the gateway prefix must still fail this assertion.
+    assert OpenAIProvider()._get_pricing(f"groq/{bare_model}") == pytest.approx((0.20, 0.20))
+
+
 def test_explicit_config_outranks_litellm() -> None:
     """A configured price is a decision, not a guess."""
     provider = OpenAIProvider()

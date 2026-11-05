@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "headroom-oauth2"
-version = "0.1.0"
+version = "0.1.1"
 description = "Generic OAuth2 client-credentials upstream-auth extension for the Headroom proxy"
 readme = "README.md"
 requires-python = ">=3.10"

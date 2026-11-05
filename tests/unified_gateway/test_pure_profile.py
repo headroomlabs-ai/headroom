@@ -5,6 +5,23 @@ from pathlib import Path
 from headroom.proxy.gateway.config import GatewayConfigSnapshot, gateway_proxy_overrides
 from headroom.proxy.models import ProxyConfig
 
+
+def test_gateway_app_construction_does_not_create_legacy_state(monkeypatch, tmp_path) -> None:
+    from headroom import paths
+    from headroom.proxy.server import create_app
+
+    workspace = tmp_path / "workspace"
+    config_dir = tmp_path / "config"
+    monkeypatch.setenv("HEADROOM_WORKSPACE_DIR", str(workspace))
+    monkeypatch.setenv("HEADROOM_CONFIG_DIR", str(config_dir))
+    monkeypatch.setenv("HEADROOM_GATEWAY_CLIENT_TOKEN", "client-secret")
+    monkeypatch.setattr(paths, "_PROCESS_STATELESS", False)
+    snapshot = GatewayConfigSnapshot.load(EXAMPLE)
+    app = create_app(ProxyConfig(gateway=snapshot))
+    assert app.state.proxy.config.gateway is snapshot
+    assert not [path for path in tmp_path.rglob("*") if path.is_file()]
+
+
 EXAMPLE = (
     Path(__file__).parents[2]
     / "docs"
@@ -31,6 +48,12 @@ def test_gateway_profile_disables_every_hidden_transform() -> None:
         "code_graph_watcher": False,
         "image_optimize": False,
         "retry_enabled": False,
+        "cost_tracking_enabled": False,
+        "subscription_tracking_enabled": False,
+        "discover_pipeline_extensions": False,
+        "hooks": (),
+        "log_requests": False,
+        "log_full_messages": False,
         "stateless": False,
     }
 

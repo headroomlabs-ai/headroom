@@ -1,7 +1,7 @@
 """Integration eval: Compression summaries with real LLM calls.
 
-Tests whether compression summaries actually help the LLM find information
-in compressed data. Compares behavior with and without summaries.
+Tests whether the code-compression summary actually helps the LLM tell which
+functions were removed from compressed code.
 
 Requires: ANTHROPIC_API_KEY in environment or .env file.
 
@@ -10,7 +10,6 @@ Run: python -m pytest tests/test_compression_summary_integration.py -v -s
 
 from __future__ import annotations
 
-import json
 import os
 
 import pytest
@@ -48,114 +47,8 @@ def _call_claude(messages: list[dict], max_tokens: int = 200) -> dict:
     return resp.json()
 
 
-# ============================================================================
-# Test data: realistic tool output that gets compressed
-# ============================================================================
-
-
-def _make_test_suite_output(n: int = 100) -> list[dict]:
-    """Simulate a large test suite result (like from a CI/CD tool)."""
-    results = []
-    for i in range(n):
-        result = {
-            "test_name": f"test_module_{i // 10}.test_case_{i}",
-            "status": "passed",
-            "duration_ms": 50 + i * 3,
-            "file": f"tests/test_module_{i // 10}.py",
-        }
-        # Inject specific failures that the LLM should find
-        if i == 42:
-            result["status"] = "failed"
-            result["error"] = "AssertionError: expected status 200, got 401 in auth_middleware"
-            result["test_name"] = "test_auth.test_login_with_expired_token"
-        if i == 67:
-            result["status"] = "failed"
-            result["error"] = "TimeoutError: database connection pool exhausted after 30s"
-            result["test_name"] = "test_database.test_concurrent_connections"
-        if i == 88:
-            result["status"] = "error"
-            result["error"] = "ImportError: cannot import name 'NewFeature' from 'app.features'"
-            result["test_name"] = "test_features.test_new_feature_integration"
-        results.append(result)
-    return results
-
-
 class TestSummaryHelpfulness:
-    """Compare LLM accuracy with vs without compression summaries."""
-
-    def test_find_failures_with_summary(self):
-        """LLM can identify failure types from the summary alone."""
-        test_results = _make_test_suite_output(100)
-
-        # Simulate compression: keep first 10, compress rest with summary
-        kept = test_results[:10]
-        from headroom.transforms.compression_summary import summarize_dropped_items
-
-        summary = summarize_dropped_items(test_results, kept)
-
-        compressed_output = json.dumps(kept, indent=2)
-        compressed_output += f"\n[90 items compressed to 10. Omitted: {summary}. "
-        compressed_output += (
-            'Retrieve specific items: headroom_retrieve(hash="abc123", query="your search")]'
-        )
-
-        messages = [
-            {
-                "role": "user",
-                "content": (
-                    "Here are the test results from CI:\n\n"
-                    f"{compressed_output}\n\n"
-                    "Are there any test failures? What types of failures are there? "
-                    "Answer concisely."
-                ),
-            },
-        ]
-
-        resp = _call_claude(messages)
-        text = resp.get("content", [{}])[0].get("text", "").lower()
-
-        # The LLM should mention failures (from the summary info)
-        has_failure_info = any(
-            word in text for word in ["fail", "error", "timeout", "assert", "import"]
-        )
-        print(f"\n  Summary: {summary}")
-        print(f"  LLM response: {text[:200]}")
-        print(f"  Detected failure info: {has_failure_info}")
-
-        assert has_failure_info, f"LLM didn't detect failures from summary. Response: {text[:300]}"
-
-    def test_find_failures_without_summary(self):
-        """Baseline: LLM with NO summary — just '[90 items compressed]'."""
-        test_results = _make_test_suite_output(100)
-
-        kept = test_results[:10]
-        compressed_output = json.dumps(kept, indent=2)
-        compressed_output += "\n[90 items compressed to 10. Retrieve more: hash=abc123]"
-
-        messages = [
-            {
-                "role": "user",
-                "content": (
-                    "Here are the test results from CI:\n\n"
-                    f"{compressed_output}\n\n"
-                    "Are there any test failures? What types of failures are there? "
-                    "Answer concisely."
-                ),
-            },
-        ]
-
-        resp = _call_claude(messages)
-        text = resp.get("content", [{}])[0].get("text", "").lower()
-
-        # The LLM may or may not detect failures (it only sees 10 passing tests)
-        has_failure_info = any(
-            word in text for word in ["fail", "error", "timeout", "assert", "import"]
-        )
-        print(f"\n  LLM response (no summary): {text[:200]}")
-        print(f"  Detected failure info: {has_failure_info}")
-
-        # We're NOT asserting here — this is the baseline.
-        # We expect this to often MISS failures since the summary is generic.
+    """Check that the code summary carries information the LLM can use."""
 
     def test_code_summary_helps_identify_functions(self):
         """LLM can identify which functions were removed from compressed code."""

@@ -20,6 +20,12 @@ INCLUDE_HOSTS = {
     if host.strip()
 }
 BODY_BYTES = int(os.environ.get("CAPTURE_BODY_BYTES", "262144"))
+PROXY_TOKEN = os.environ.get("CAPTURE_PROXY_TOKEN") if LANE == "headroom-client" else None
+TOKEN_DESTINATION_HOSTS = {
+    host.strip().lower()
+    for host in os.environ.get("CAPTURE_PROXY_TOKEN_HOSTS", "").split(",")
+    if host.strip()
+}
 SENSITIVE_HEADER_PARTS = ("authorization", "api-key", "apikey", "token", "secret", "cookie")
 SENSITIVE_QUERY_PARTS = ("key", "token", "secret", "signature", "code")
 _sequence = 0
@@ -53,10 +59,26 @@ def _request_json(content: bytes) -> object | None:
         return None
 
 
+def _host_is_included(host: str) -> bool:
+    return not INCLUDE_HOSTS or host.lower() in INCLUDE_HOSTS
+
+
+def _destination_is_allowed(flow: http.HTTPFlow) -> bool:
+    address = getattr(getattr(flow, "server_conn", None), "address", None)
+    destination = address[0] if address else ""
+    return bool(destination) and destination.lower() in TOKEN_DESTINATION_HOSTS
+
+
+def request(flow: http.HTTPFlow) -> None:
+    """Authenticate only the internal Headroom client lane."""
+    if PROXY_TOKEN and _destination_is_allowed(flow):
+        flow.request.headers["X-Headroom-Proxy-Token"] = PROXY_TOKEN
+
+
 def response(flow: http.HTTPFlow) -> None:
     global _sequence
     host = flow.request.pretty_host.lower()
-    if INCLUDE_HOSTS and host not in INCLUDE_HOSTS:
+    if not _host_is_included(host):
         return
 
     _sequence += 1

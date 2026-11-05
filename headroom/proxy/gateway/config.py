@@ -474,6 +474,12 @@ def gateway_proxy_overrides(snapshot: GatewayConfigSnapshot) -> dict[str, object
         "code_graph_watcher": False,
         "image_optimize": False,
         "retry_enabled": False,
+        "cost_tracking_enabled": False,
+        "subscription_tracking_enabled": False,
+        "discover_pipeline_extensions": False,
+        "hooks": (),
+        "log_requests": False,
+        "log_full_messages": False,
         "stateless": snapshot.runtime.stateless,
     }
 

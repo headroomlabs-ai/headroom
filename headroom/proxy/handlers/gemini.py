@@ -10,6 +10,7 @@ import json
 import logging
 import time
 from typing import TYPE_CHECKING, Any
+from urllib.parse import unquote_plus
 
 if TYPE_CHECKING:
     from fastapi import Request
@@ -21,9 +22,16 @@ from headroom.agent_savings import proxy_pipeline_kwargs
 from headroom.copilot_auth import build_copilot_upstream_url
 from headroom.proxy.auth_mode import classify_client
 from headroom.proxy.compression_decision import CompressionDecision
-from headroom.proxy.helpers import COMPRESSION_TIMEOUT_SECONDS, extract_tags
+from headroom.proxy.handlers._failure_logging import log_request_failure
+from headroom.proxy.helpers import (
+    COMPRESSION_TIMEOUT_SECONDS,
+    extract_tags,
+    invalid_request_body_message,
+    sanitize_forwarded_response_headers,
+)
 from headroom.proxy.identity import resolve_memory_identity
 from headroom.proxy.outcome import RequestOutcome
+from headroom.proxy.rate_limit_identity import rate_limit_identity
 from headroom.proxy.token_counting import gemini_output_tokens
 
 logger = logging.getLogger("headroom.proxy")
@@ -56,10 +64,49 @@ class GeminiHandlerMixin:
 
         return await count_tokens_offloaded(self, model, messages)
 
-    async def _count_texts_offloaded(self, model, texts):  # noqa: ANN001, ANN201
-        from headroom.proxy.token_counting import count_texts_offloaded
+    def _gemini_replay_forwarded_prefix(
+        self,
+        optimized_messages: list[dict],
+        messages: list[dict],
+        prefix_tracker,  # noqa: ANN001 - PrefixCacheTracker (avoid runtime import)
+        frozen_count: int,
+        tokenizer,  # noqa: ANN001
+    ):
+        """Replay the previously forwarded (compressed) prefix byte-identical (#3394).
 
-        return await count_texts_offloaded(self, model, texts)
+        ``frozen_message_count`` only stops the pipeline from RECOMPRESSING the
+        prefix; the freeze branch then forwards the client's ORIGINAL bytes -
+        but Gemini's implicit cache holds the COMPRESSED form forwarded last
+        turn, so raw originals would bust it. ``finalize_turn`` overlays the
+        tracker's last-forwarded (compressed) bytes over the pipeline output.
+        Self-guarded: no-op unless this turn provably extends the previous one
+        (positional, append-only, non-inflating); a decline forwards the
+        pipeline's own output.
+        """
+        from headroom.proxy.session_engine import finalize_turn
+
+        return finalize_turn(
+            optimized_messages,
+            messages,
+            prefix_tracker.get_last_original_messages(),
+            prefix_tracker.get_last_forwarded_messages(),
+            count_tokens=tokenizer.count_messages,
+            confirmed_frozen_count=frozen_count,
+        )
+
+    def _gemini_resolve_prefix_tracker(self, request, model, messages):  # noqa: ANN001, ANN202
+        """Session tracker + freeze floor for this Gemini conversation (#3394).
+
+        Mirrors the Anthropic/OpenAI handlers: the tracker is fed from the
+        response's cache usage (buffered: ``update_from_response`` after the
+        upstream reply; streaming: the ``prefix_tracker`` param of
+        ``_stream_response``) so the next turn freezes the forwarded prefix.
+        """
+        session_id = self.session_tracker_store.compute_session_id(request, model, messages)
+        tracker = self.session_tracker_store.resolve_tracker(
+            session_id, "gemini", messages=messages
+        )
+        return tracker, tracker.get_frozen_message_count()
 
     def _is_cloudcode_antigravity_request(
         self, body: dict[str, Any], headers: dict[str, str]
@@ -107,6 +154,12 @@ class GeminiHandlerMixin:
         - functionResponse: Responses to function calls
         - executableCode / codeExecutionResult: Gemini code-execution parts,
           echoed back in contents[] on later turns
+        - thought / thoughtSignature: thinking parts, which must round-trip intact
+        - non-string text, which the text round trip cannot rebuild
+
+        The REST API accepts both the camelCase JSON names and the snake_case
+        proto field names (``inline_data``, ``function_call``, ...), so both
+        spellings are checked.
 
         Args:
             content: A single Gemini content entry with 'parts' list.
@@ -115,7 +168,7 @@ class GeminiHandlerMixin:
             True if any part contains non-text data.
         """
         for part in self._dict_parts(content):
-            if any(
+            if not isinstance(part.get("text", ""), str) or any(
                 key in part
                 for key in (
                     "inlineData",
@@ -124,6 +177,15 @@ class GeminiHandlerMixin:
                     "functionResponse",
                     "executableCode",
                     "codeExecutionResult",
+                    "thought",
+                    "thoughtSignature",
+                    "inline_data",
+                    "file_data",
+                    "function_call",
+                    "function_response",
+                    "executable_code",
+                    "code_execution_result",
+                    "thought_signature",
                 )
             ):
                 return True
@@ -150,7 +212,7 @@ class GeminiHandlerMixin:
         opt_iter = iter(optimized_contents)
         result: list[dict] = []
         for idx, content in enumerate(original_contents):
-            had_text = any("text" in p for p in self._dict_parts(content))
+            had_text = any(isinstance(p.get("text"), str) for p in self._dict_parts(content))
             if idx in preserved_indices:
                 result.append(preserved_contents[idx])
                 if had_text:
@@ -162,6 +224,76 @@ class GeminiHandlerMixin:
                     result.append(opt_entry)
                 # else: dropped by compression — omit
         return result
+
+    @staticmethod
+    def _carry_tail_append_into_preserved(
+        original_contents: list[dict],
+        preserved_indices: set[int],
+        preserved_contents: dict[int, dict],
+        before_messages: list[dict],
+        after_messages: list[dict],
+    ) -> bool:
+        """Carry a memory tail append onto a preserved contents[] entry.
+
+        ``_rebuild_gemini_contents`` forwards preserved (non-text) entries
+        verbatim and discards their converted message, so text appended to
+        that message never reaches the upstream body (#4419). Find the one
+        message the tail append changed, map it to its contents[] index the
+        same way the rebuild does (the k-th non-system message pairs with the
+        k-th entry that has a text part), and, when that entry is preserved
+        and is the latest user entry, append the same suffix to a copy of its
+        last text part.
+
+        Returns False when the append would be dropped: the target is a
+        preserved entry older than the latest user entry. Writing memory into
+        that older turn would change an already-cached prefix, so the caller
+        skips the injection instead of logging one that never reaches the wire.
+        """
+        if len(before_messages) != len(after_messages):
+            return True
+        changed = [i for i, (b, a) in enumerate(zip(before_messages, after_messages)) if b is not a]
+        if len(changed) != 1:
+            return True
+        msg_idx = changed[0]
+        before = before_messages[msg_idx].get("content")
+        after = after_messages[msg_idx].get("content")
+        if not (isinstance(before, str) and isinstance(after, str)):
+            return True
+        if not after.startswith(before) or len(after) == len(before):
+            return True
+        suffix = after[len(before) :]
+
+        ordinal = sum(1 for m in before_messages[:msg_idx] if m.get("role") != "system")
+        text_entry_indices = [
+            idx
+            for idx, content in enumerate(original_contents)
+            if any(isinstance(p.get("text"), str) for p in GeminiHandlerMixin._dict_parts(content))
+        ]
+        if ordinal >= len(text_entry_indices):
+            return True
+        content_idx = text_entry_indices[ordinal]
+        if content_idx not in preserved_indices:
+            return True
+        latest_user_idx = max(
+            (
+                idx
+                for idx, content in enumerate(original_contents)
+                if (content.get("role", "user") if isinstance(content, dict) else "user") == "user"
+            ),
+            default=None,
+        )
+        if content_idx != latest_user_idx:
+            return False
+
+        entry = preserved_contents[content_idx]
+        # Copy the raw list so every part (including non-dict ones) is kept as-is.
+        parts = list(entry["parts"])
+        last_text = max(
+            i for i, p in enumerate(parts) if isinstance(p, dict) and isinstance(p.get("text"), str)
+        )
+        parts[last_text] = {**parts[last_text], "text": parts[last_text]["text"] + suffix}
+        preserved_contents[content_idx] = {**entry, "parts": parts}
+        return True
 
     def _gemini_contents_to_messages(
         self,
@@ -196,7 +328,7 @@ class GeminiHandlerMixin:
         # Add system instruction as system message
         if system_instruction:
             sys_parts = self._dict_parts(system_instruction)
-            text_parts = [p.get("text", "") for p in sys_parts if "text" in p]
+            text_parts = [p["text"] for p in sys_parts if isinstance(p.get("text"), str)]
             if text_parts:
                 messages.append({"role": "system", "content": "\n".join(text_parts)})
 
@@ -212,16 +344,17 @@ class GeminiHandlerMixin:
                 role = "assistant"
 
             parts = self._dict_parts(content)
-            text_parts = [p.get("text", "") for p in parts if "text" in p]
+            text_parts = [p["text"] for p in parts if isinstance(p.get("text"), str)]
 
             if text_parts:
                 messages.append({"role": role, "content": "\n".join(text_parts)})
 
             if include_function_responses:
                 for part in parts:
-                    if "functionResponse" not in part:
+                    function_response = part.get("functionResponse", part.get("function_response"))
+                    if function_response is None:
                         continue
-                    payload = self._function_response_text(part["functionResponse"])
+                    payload = self._function_response_text(function_response)
                     if payload:
                         messages.append({"role": "tool", "content": payload})
 
@@ -281,8 +414,22 @@ class GeminiHandlerMixin:
         from fastapi import HTTPException
         from fastapi.responses import JSONResponse, Response
 
-        from headroom.proxy.helpers import MAX_REQUEST_BODY_SIZE, _read_request_json
+        from headroom.proxy.helpers import (
+            MAX_REQUEST_BODY_SIZE,
+            RequestBodyTooLarge,
+            read_request_json_with_bytes,
+        )
+        from headroom.proxy.request_limit_policy import COMPRESSION_BODY_MAX_BYTES
         from headroom.utils import extract_user_query
+
+        def _stream_url(base_url: str) -> str:
+            query_parts = []
+            for part in request.url.query.split("&") if request.url.query else []:
+                key = unquote_plus(part.split("=", 1)[0])
+                if key != "alt":
+                    query_parts.append(part)
+            query_parts.append("alt=sse")
+            return f"{base_url}?{'&'.join(query_parts)}"
 
         start_time = time.time()
         request_id = await self._next_request_id()
@@ -302,19 +449,24 @@ class GeminiHandlerMixin:
 
         # Parse request
         try:
-            body = await _read_request_json(request)
+            body, original_body_bytes = await read_request_json_with_bytes(request)
+        except RequestBodyTooLarge:
+            raise
         except (json.JSONDecodeError, ValueError) as e:
             return JSONResponse(
                 status_code=400,
                 content={
                     "error": {
-                        "message": f"Invalid request body: {e!s}",
+                        "message": invalid_request_body_message(e),
                         "code": 400,
                     }
                 },
             )
 
         contents = body.get("contents", [])
+        if not isinstance(contents, list):
+            # Malformed contents: nothing to compress, so forward the body as-is
+            contents = []
 
         headers = dict(request.headers.items())
         headers.pop("host", None)
@@ -340,6 +492,64 @@ class GeminiHandlerMixin:
             stripped_count=_pre_strip_count_gem,
             request_id=request_id,
         )
+        # Rate limiting: one identity rule for every provider
+        # (headroom/proxy/rate_limit_identity.py).
+        if self.rate_limiter:
+            rate_key = rate_limit_identity(request, headers)
+            allowed, wait_seconds = await self.rate_limiter.check_request(rate_key)
+            if not allowed:
+                await self.metrics.record_rate_limited(provider=provider_name, source="headroom")
+                raise HTTPException(
+                    status_code=429,
+                    detail=f"Rate limited. Retry after {wait_seconds:.1f}s",
+                )
+
+        # Budget check
+        cost_tracker = self.cost_tracker
+        if cost_tracker:
+            allowed, remaining = cost_tracker.check_budget()
+            if not allowed:
+                raise HTTPException(
+                    status_code=429,
+                    detail=cost_tracker.budget_denial_detail(),
+                )
+        if len(original_body_bytes) > COMPRESSION_BODY_MAX_BYTES:
+            is_streaming = request.query_params.get("alt") == "sse" or request.url.path.endswith(
+                ":streamGenerateContent"
+            )
+            passthrough_path = request.url.path
+            if is_streaming:
+                passthrough_path = passthrough_path.replace(
+                    ":generateContent", ":streamGenerateContent"
+                )
+            passthrough_base = upstream_base_url or self.GEMINI_API_URL
+            passthrough_url = build_copilot_upstream_url(passthrough_base, passthrough_path)
+            if is_streaming:
+                passthrough_url = _stream_url(passthrough_url)
+            elif request.url.query:
+                passthrough_url = f"{passthrough_url}?{request.url.query}"
+            headers.pop("content-encoding", None)
+            headers.pop("transfer-encoding", None)
+            assert self.http_client is not None, "http_client must be initialized"
+            upstream_request = self.http_client.build_request(
+                request.method, passthrough_url, headers=headers, content=original_body_bytes
+            )
+            logger.info(
+                "[%s] event=compression_passthrough reason=request_body_soft_limit "
+                "bytes=%d threshold=%d",
+                request_id,
+                len(original_body_bytes),
+                COMPRESSION_BODY_MAX_BYTES,
+            )
+            return await self.handle_passthrough(
+                request,
+                passthrough_base,
+                endpoint_name="streamGenerateContent" if is_streaming else "generateContent",
+                provider=provider_name,
+                _upstream_request=upstream_request,
+                _model=model,
+                _start_time=start_time,
+            )
 
         # Memory: Get user ID when memory is enabled. Reads `request.headers`
         # directly because `headers` was stripped of `x-headroom-*` (PR-A5).
@@ -397,27 +607,6 @@ class GeminiHandlerMixin:
         )
         memory_decision.apply_to_tags(tags)
 
-        # Rate limiting (use Gemini API key)
-        if self.rate_limiter:
-            rate_key = headers.get("x-goog-api-key", "default")[:20]
-            allowed, wait_seconds = await self.rate_limiter.check_request(rate_key)
-            if not allowed:
-                await self.metrics.record_rate_limited(provider=provider_name, source="headroom")
-                raise HTTPException(
-                    status_code=429,
-                    detail=f"Rate limited. Retry after {wait_seconds:.1f}s",
-                )
-
-        # Budget check
-        cost_tracker = self.cost_tracker
-        if cost_tracker:
-            allowed, remaining = cost_tracker.check_budget()
-            if not allowed:
-                raise HTTPException(
-                    status_code=429,
-                    detail=cost_tracker.budget_denial_detail(),
-                )
-
         # Convert Gemini format to messages for optimization
         system_instruction = body.get("systemInstruction")
         messages, preserved_indices = self._gemini_contents_to_messages(
@@ -448,16 +637,11 @@ class GeminiHandlerMixin:
 
             if is_streaming:
                 if upstream_base_url:
-                    stream_url = url
-                    separator = "&" if "?" in stream_url else "?"
-                    if "alt=" not in request.url.query:
-                        stream_url = f"{stream_url}{separator}alt=sse"
+                    stream_url = _stream_url(url.split("?", 1)[0])
                 else:
-                    stream_url = (
-                        f"{self.GEMINI_API_URL}/v1beta/models/{model}:streamGenerateContent?alt=sse"
+                    stream_url = _stream_url(
+                        f"{self.GEMINI_API_URL}/v1beta/models/{model}:streamGenerateContent"
                     )
-                if "key" in query_params and not upstream_base_url:
-                    stream_url = f"{self.GEMINI_API_URL}/v1beta/models/{model}:streamGenerateContent?key={query_params['key']}&alt=sse"
                 return await self._stream_response(
                     stream_url,
                     headers,
@@ -503,6 +687,8 @@ class GeminiHandlerMixin:
                         status_code=response.status_code,
                         original_tokens=total_input_tokens,
                         optimized_tokens=total_input_tokens,
+                        # Gemini's own promptTokenCount (inclusive of cached content).
+                        provider_input_tokens=total_input_tokens,
                         output_tokens=output_tokens,
                         tokens_saved=0,
                         attempted_input_tokens=total_input_tokens,
@@ -514,9 +700,7 @@ class GeminiHandlerMixin:
                         client=client,
                     )
                 )
-                response_headers = dict(response.headers)
-                response_headers.pop("content-encoding", None)
-                response_headers.pop("content-length", None)
+                response_headers = sanitize_forwarded_response_headers(response.headers)
                 response_headers["x-headroom-tokens-before"] = str(total_input_tokens)
                 response_headers["x-headroom-tokens-after"] = str(total_input_tokens)
                 response_headers["x-headroom-tokens-saved"] = "0"
@@ -529,8 +713,22 @@ class GeminiHandlerMixin:
                     headers=response_headers,
                 )
 
+        # Prefix freeze floor + compressed-prefix replay (#3394).
+        gemini_prefix_tracker, gemini_frozen_count = self._gemini_resolve_prefix_tracker(
+            request, model, messages
+        )
+
         # Token counting (offloaded off the event loop — GH #1701)
         tokenizer, original_tokens = await self._count_tokens_offloaded(model, messages)
+
+        if self.rate_limiter:
+            allowed, wait_seconds = await self.rate_limiter.check_tokens(rate_key, original_tokens)
+            if not allowed:
+                await self.metrics.record_rate_limited(provider=provider_name)
+                raise HTTPException(
+                    status_code=429,
+                    detail=f"Token rate limited. Retry after {wait_seconds:.1f}s",
+                )
 
         # Optimization
         transforms_applied: list[str] = []
@@ -565,6 +763,7 @@ class GeminiHandlerMixin:
                         model=model,
                         model_limit=context_limit,
                         context=extract_user_query(messages),
+                        frozen_message_count=gemini_frozen_count,
                         waste_messages=waste_messages,
                         **proxy_pipeline_kwargs(self.config),
                     ),
@@ -591,6 +790,21 @@ class GeminiHandlerMixin:
             optimized_messages = messages
             optimized_tokens = original_tokens
             transforms_applied = []
+
+        if _decision.should_compress:
+            # Replay last turn's compressed prefix over this turn's output so
+            # the frozen region goes out byte-identical (#3394). Gated on the
+            # compression decision: a bypassed request's bytes stay untouched.
+            _final = self._gemini_replay_forwarded_prefix(
+                optimized_messages,
+                messages,
+                gemini_prefix_tracker,
+                gemini_frozen_count,
+                tokenizer,
+            )
+            optimized_messages = _final.messages
+            if _final.tokens is not None:
+                optimized_tokens = _final.tokens
 
         tokens_saved = original_tokens - optimized_tokens
         optimization_latency = (time.time() - start_time) * 1000
@@ -634,6 +848,17 @@ class GeminiHandlerMixin:
                                 provider="openai",
                             )
                         )
+                        # Entries with non-text parts are restored verbatim by
+                        # _rebuild_gemini_contents; carry the append onto them so
+                        # it is not dropped after being logged, or skip it.
+                        if bytes_appended > 0 and not self._carry_tail_append_into_preserved(
+                            contents,
+                            preserved_indices,
+                            preserved_contents,
+                            optimized_messages,
+                            new_messages,
+                        ):
+                            bytes_appended = 0
                         if bytes_appended > 0:
                             optimized_messages = new_messages
                             logger.info(
@@ -752,16 +977,11 @@ class GeminiHandlerMixin:
             if is_streaming:
                 # For streaming, use streamGenerateContent endpoint
                 if upstream_base_url:
-                    stream_url = url
-                    separator = "&" if "?" in stream_url else "?"
-                    if "alt=" not in request.url.query:
-                        stream_url = f"{stream_url}{separator}alt=sse"
+                    stream_url = _stream_url(url.split("?", 1)[0])
                 else:
-                    stream_url = (
-                        f"{self.GEMINI_API_URL}/v1beta/models/{model}:streamGenerateContent?alt=sse"
+                    stream_url = _stream_url(
+                        f"{self.GEMINI_API_URL}/v1beta/models/{model}:streamGenerateContent"
                     )
-                if "key" in query_params and not upstream_base_url:
-                    stream_url = f"{self.GEMINI_API_URL}/v1beta/models/{model}:streamGenerateContent?key={query_params['key']}&alt=sse"
 
                 return await self._stream_response(
                     stream_url,
@@ -777,12 +997,17 @@ class GeminiHandlerMixin:
                     tags,
                     optimization_latency,
                     outcome_provider=provider_name,
+                    prefix_tracker=gemini_prefix_tracker,
+                    original_messages=messages,
                 )
             else:
                 response = await self._retry_request("POST", url, headers, body)
                 total_latency = (time.time() - start_time) * 1000
 
                 total_input_tokens = optimized_tokens  # fallback
+                # Gemini's own promptTokenCount, only when it reported one; the
+                # fallback above is Headroom's estimate and must not pass as billed.
+                provider_prompt_tokens = 0
                 output_tokens = 0
                 cache_read_tokens = 0
                 resp_json = None
@@ -801,6 +1026,8 @@ class GeminiHandlerMixin:
                         if usage.get("promptTokenCount") is None
                         else usage["promptTokenCount"]
                     )
+                    if usage.get("promptTokenCount") is not None:
+                        provider_prompt_tokens = total_input_tokens
                     output_tokens = gemini_output_tokens(
                         usage
                     )  # includes thinking tokens (2.5-family)
@@ -899,12 +1126,28 @@ class GeminiHandlerMixin:
                     total_input_tokens = _usage_int(
                         usage.get("promptTokenCount"), total_input_tokens
                     )
+                    if usage.get("promptTokenCount") is not None:
+                        provider_prompt_tokens = total_input_tokens
                     output_tokens = _usage_int(usage.get("candidatesTokenCount"), output_tokens)
                     cache_read_tokens = _usage_int(
                         usage.get("cachedContentTokenCount"), cache_read_tokens
                     )
 
                 uncached_input_tokens = max(0, total_input_tokens - cache_read_tokens)
+
+                # Feed the prefix tracker (#3394). Gemini reports cache reads
+                # only (cachedContentTokenCount); implicit caching exposes no
+                # write counter, so the uncached input portion is the write
+                # proxy - the same inference the OpenAI path makes. Only a
+                # clean 200 with a parsed body feeds the tracker: nothing was
+                # cached for an error or an unparseable response.
+                if response.status_code == 200 and isinstance(resp_json, dict):
+                    gemini_prefix_tracker.update_from_response(
+                        cache_read_tokens=cache_read_tokens,
+                        cache_write_tokens=max(total_input_tokens - cache_read_tokens, 0),
+                        messages=optimized_messages,
+                        original_messages=messages,
+                    )
 
                 # optimized_tokens carries Gemini's own promptTokenCount, which is
                 # on the provider's tokenizer scale (it feeds billing/dashboard),
@@ -945,6 +1188,8 @@ class GeminiHandlerMixin:
                     status_code=response.status_code,
                     original_tokens=effective_original_tokens,
                     optimized_tokens=total_input_tokens,
+                    # Gemini's own promptTokenCount (inclusive of cached content).
+                    provider_input_tokens=provider_prompt_tokens,
                     output_tokens=output_tokens,
                     tokens_saved=tokens_saved,
                     attempted_input_tokens=total_input_tokens + tokens_saved,
@@ -968,12 +1213,9 @@ class GeminiHandlerMixin:
                 else:
                     logger.info(f"[{request_id}] Gemini {model}: {original_tokens:,} tokens")
 
-                # Remove compression headers
-                response_headers = dict(response.headers)
-                response_headers.pop("content-encoding", None)
-                response_headers.pop("content-length", None)
-
-                # Inject Headroom compression metrics (for SaaS metering)
+                # Remove transport framing headers (the body is re-framed here)
+                # and inject Headroom compression metrics (for SaaS metering).
+                response_headers = sanitize_forwarded_response_headers(response.headers)
                 response_headers["x-headroom-tokens-before"] = str(original_tokens)
                 response_headers["x-headroom-tokens-after"] = str(optimized_tokens)
                 response_headers["x-headroom-tokens-saved"] = str(tokens_saved)
@@ -996,13 +1238,13 @@ class GeminiHandlerMixin:
                 )
         except _GeminiContinuationError as e:
             await self.metrics.record_failed(provider=provider_name)
-            response_headers = dict(e.headers)
-            response_headers.pop("content-encoding", None)
-            response_headers.pop("content-length", None)
+            response_headers = sanitize_forwarded_response_headers(e.headers)
             return Response(content=e.content, status_code=e.status_code, headers=response_headers)
         except Exception as e:
             await self.metrics.record_failed(provider=provider_name)
-            logger.error(f"[{request_id}] Gemini request failed: {type(e).__name__}: {e}")
+            log_request_failure(
+                request_id, "Gemini request", e, provider=provider_name, model=model
+            )
             return JSONResponse(
                 status_code=502,
                 content={
@@ -1034,7 +1276,7 @@ class GeminiHandlerMixin:
                 status_code=400,
                 content={
                     "error": {
-                        "message": f"Invalid request body: {e!s}",
+                        "message": invalid_request_body_message(e),
                         "code": 400,
                     }
                 },
@@ -1098,6 +1340,11 @@ class GeminiHandlerMixin:
             if isinstance(contents, list) and idx < len(contents)
         }
 
+        # Prefix freeze floor + compressed-prefix replay (#3394).
+        gemini_prefix_tracker, gemini_frozen_count = self._gemini_resolve_prefix_tracker(
+            request, model, messages
+        )
+
         # Token counting (offloaded off the event loop — GH #1701)
         tokenizer, original_tokens = await self._count_tokens_offloaded(model, messages)
         if not messages:
@@ -1131,6 +1378,7 @@ class GeminiHandlerMixin:
                         model=model,
                         model_limit=context_limit,
                         context=extract_user_query(messages),
+                        frozen_message_count=gemini_frozen_count,
                         waste_messages=waste_messages,
                         **proxy_pipeline_kwargs(self.config),
                     ),
@@ -1152,6 +1400,24 @@ class GeminiHandlerMixin:
             optimized_messages = messages
             optimized_tokens = original_tokens
             transforms_applied = []
+
+        # Replay BEFORE the contents/systemInstruction conversion below: the
+        # payload is rebuilt from the replayed messages, so the frozen prefix
+        # goes upstream byte-identical (#3394 review).
+        if _decision.should_compress:
+            # Replay last turn's compressed prefix over this turn's output so
+            # the frozen region goes out byte-identical (#3394). Gated on the
+            # compression decision: a bypassed request's bytes stay untouched.
+            _final = self._gemini_replay_forwarded_prefix(
+                optimized_messages,
+                messages,
+                gemini_prefix_tracker,
+                gemini_frozen_count,
+                tokenizer,
+            )
+            optimized_messages = _final.messages
+            if _final.tokens is not None:
+                optimized_tokens = _final.tokens
 
         if optimized_messages != messages:
             optimized_contents, optimized_system = self._messages_to_gemini_contents(
@@ -1190,101 +1456,21 @@ class GeminiHandlerMixin:
             transforms_applied,
             tags,
             optimization_latency,
+            prefix_tracker=gemini_prefix_tracker,
+            original_messages=messages,
         )
 
     async def handle_gemini_stream_generate_content(
         self,
         request: Request,
         model: str,
-    ) -> StreamingResponse | JSONResponse:
+        upstream_base_url: str | None = None,
+    ) -> Response | StreamingResponse | JSONResponse:
         """Handle Gemini streaming endpoint /v1beta/models/{model}:streamGenerateContent."""
-        from fastapi import HTTPException
-        from fastapi.responses import JSONResponse
-
-        from headroom.proxy.helpers import _read_request_json
-
-        start_time = time.time()
-        request_id = await self._next_request_id()
-
-        # Parse request
-        try:
-            body = await _read_request_json(request)
-        except (json.JSONDecodeError, ValueError) as e:
-            return JSONResponse(
-                status_code=400,
-                content={
-                    "error": {
-                        "message": f"Invalid request body: {e!s}",
-                        "code": 400,
-                    }
-                },
-            )
-
-        contents = body.get("contents", [])
-
-        headers = dict(request.headers.items())
-        headers.pop("host", None)
-        headers.pop("content-length", None)
-        tags = extract_tags(headers)
-        from headroom.proxy.savings_attribution import bind_scope
-
-        bind_scope(tags, request.scope)
-        # Streaming variant — delegates to _stream_response which
-        # classifies the client itself from headers.
-        # PR-A5 (P5-49): strip internal x-headroom-* before forwarding upstream.
-        from headroom.proxy.helpers import _strip_internal_headers, log_outbound_headers
-
-        _pre_strip_count_gem_stream = sum(1 for k in headers if k.lower().startswith("x-headroom-"))
-        headers = _strip_internal_headers(headers)
-        log_outbound_headers(
-            forwarder="gemini_stream_generate_content",
-            stripped_count=_pre_strip_count_gem_stream,
-            request_id=request_id,
-        )
-
-        # Budget check
-        cost_tracker = self.cost_tracker
-        if cost_tracker:
-            allowed, remaining = cost_tracker.check_budget()
-            if not allowed:
-                raise HTTPException(
-                    status_code=429,
-                    detail=cost_tracker.budget_denial_detail(),
-                )
-
-        # Token counting (offloaded off the event loop — GH #1701). Reuse the
-        # shared _dict_parts coercion and keep only str text values: count_text
-        # raises on a non-str part value and the fail-open path re-runs the same
-        # input, so a malformed part would otherwise 500 the streaming request.
-        text_parts = [
-            part["text"]
-            for content in (contents if isinstance(contents, list) else [])
-            for part in self._dict_parts(content)
-            if isinstance(part.get("text"), str)
-        ]
-        _, original_tokens = await self._count_texts_offloaded(model, text_parts)
-
-        optimization_latency = (time.time() - start_time) * 1000
-
-        # Build URL with SSE param
-        query_params = dict(request.query_params)
-        url = f"{self.GEMINI_API_URL}/v1beta/models/{model}:streamGenerateContent?alt=sse"
-        if "key" in query_params:
-            url = f"{self.GEMINI_API_URL}/v1beta/models/{model}:streamGenerateContent?key={query_params['key']}&alt=sse"
-
-        return await self._stream_response(
-            url,
-            headers,
-            body,
-            "gemini",
+        return await self.handle_gemini_generate_content(
+            request,
             model,
-            request_id,
-            original_tokens,
-            original_tokens,
-            0,  # tokens_saved
-            [],  # transforms_applied
-            tags,
-            optimization_latency,
+            upstream_base_url=upstream_base_url,
         )
 
     async def handle_gemini_count_tokens(
@@ -1318,7 +1504,7 @@ class GeminiHandlerMixin:
                 status_code=400,
                 content={
                     "error": {
-                        "message": f"Invalid request body: {e!s}",
+                        "message": invalid_request_body_message(e),
                         "code": 400,
                     }
                 },
@@ -1366,14 +1552,19 @@ class GeminiHandlerMixin:
                 url += f"?key={query_params['key']}"
 
             response = await self._retry_request("POST", url, headers, body)
-            response_headers = dict(response.headers)
-            response_headers.pop("content-encoding", None)
-            response_headers.pop("content-length", None)
+            response_headers = sanitize_forwarded_response_headers(response.headers)
             return Response(
                 content=response.content,
                 status_code=response.status_code,
                 headers=response_headers,
             )
+
+        # Prefix freeze floor + compressed-prefix replay (#3394). Read-only:
+        # countTokens feeds the shared session's freeze floor into the pipeline
+        # but has no usage to feed back into the tracker.
+        gemini_prefix_tracker, gemini_frozen_count = self._gemini_resolve_prefix_tracker(
+            request, model, messages
+        )
 
         # Token counting (original, offloaded off the event loop — GH #1701)
         tokenizer, original_tokens = await self._count_tokens_offloaded(model, messages)
@@ -1410,6 +1601,7 @@ class GeminiHandlerMixin:
                         model=model,
                         model_limit=context_limit,
                         context=extract_user_query(messages),
+                        frozen_message_count=gemini_frozen_count,
                         **proxy_pipeline_kwargs(self.config),
                     ),
                     timeout=COMPRESSION_TIMEOUT_SECONDS,
@@ -1419,6 +1611,17 @@ class GeminiHandlerMixin:
                     transforms_applied = result.transforms_applied
             except Exception as e:
                 logger.warning(f"[{request_id}] Gemini countTokens optimization failed: {e}")
+
+        if _decision.should_compress:
+            # Same compressed-prefix replay as generateContent (#3394), so the
+            # count previews what the real call would forward.
+            optimized_messages = self._gemini_replay_forwarded_prefix(
+                optimized_messages,
+                messages,
+                gemini_prefix_tracker,
+                gemini_frozen_count,
+                tokenizer,
+            ).messages
 
         # Convert back to Gemini format for the API call
         if optimized_messages != messages:
@@ -1464,28 +1667,29 @@ class GeminiHandlerMixin:
                 max(0, original_tokens - compressed_tokens) if compressed_tokens > 0 else 0
             )
 
-            # Fallback denominator (see comment on the main gemini
-            # record_request site) — pre-comp request size.
-            # countTokens is a sizing helper; it never generates output
-            # tokens and never touches cache. The funnel handles the
-            # "nothing to report" shape with all-zero cache defaults.
-            await self._record_request_outcome(
-                RequestOutcome(
-                    request_id=request_id,
-                    provider=provider_name,
-                    model=model,
-                    status_code=response.status_code,
-                    original_tokens=original_tokens,
-                    optimized_tokens=compressed_tokens,
-                    output_tokens=0,
-                    tokens_saved=tokens_saved,
-                    attempted_input_tokens=compressed_tokens + tokens_saved,
-                    total_latency_ms=total_latency,
-                    transforms_applied=tuple(transforms_applied),
-                    tags=tags,
-                    client=client,
+            # countTokens is a sizing helper: the provider generates and bills
+            # nothing for it, so a successful call is logged below but never
+            # booked as a request or as savings. An upstream rejection (429,
+            # 5xx) still goes through the funnel, which records it under the
+            # rate-limit / failure counters and stops before any success stats.
+            if response.status_code >= 400:
+                await self._record_request_outcome(
+                    RequestOutcome(
+                        request_id=request_id,
+                        provider=provider_name,
+                        model=model,
+                        status_code=response.status_code,
+                        original_tokens=original_tokens,
+                        optimized_tokens=compressed_tokens,
+                        output_tokens=0,
+                        tokens_saved=tokens_saved,
+                        attempted_input_tokens=compressed_tokens + tokens_saved,
+                        total_latency_ms=total_latency,
+                        transforms_applied=tuple(transforms_applied),
+                        tags=tags,
+                        client=client,
+                    )
                 )
-            )
 
             if tokens_saved > 0:
                 logger.info(
@@ -1497,10 +1701,8 @@ class GeminiHandlerMixin:
                     f"[{request_id}] Gemini countTokens {model}: {compressed_tokens:,} tokens"
                 )
 
-            # Remove compression headers
-            response_headers = dict(response.headers)
-            response_headers.pop("content-encoding", None)
-            response_headers.pop("content-length", None)
+            # Remove transport framing headers (the body is re-framed here).
+            response_headers = sanitize_forwarded_response_headers(response.headers)
 
             return Response(
                 content=response.content,
@@ -1509,7 +1711,9 @@ class GeminiHandlerMixin:
             )
         except Exception as e:
             await self.metrics.record_failed(provider=provider_name)
-            logger.error(f"[{request_id}] Gemini countTokens failed: {type(e).__name__}: {e}")
+            log_request_failure(
+                request_id, "Gemini countTokens", e, provider=provider_name, model=model
+            )
             return JSONResponse(
                 status_code=502,
                 content={

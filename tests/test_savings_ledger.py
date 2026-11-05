@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 import json
+import logging
 from datetime import datetime, timedelta, timezone
 
 import pytest
 
 from headroom import savings_ledger as L
+from headroom.log_safety import WarnOnce
 from tests._pricing_models import anthropic_pricing_model
 
 MODEL = anthropic_pricing_model()
@@ -72,6 +74,13 @@ def test_zero_or_negative_savings_not_recorded(monkeypatch, tmp_path):
     assert L.aggregate_savings().lifetime["calls"] == 0
 
 
+def test_stateless_mode_does_not_create_ledger(monkeypatch, tmp_path):
+    path = _events_env(monkeypatch, tmp_path)
+    monkeypatch.setenv("HEADROOM_STATELESS", "true")
+    assert L.record_savings_event(tokens_before=100, tokens_after=50) is False
+    assert not path.exists()
+
+
 def test_breakdowns_aggregate_by_dimension(monkeypatch, tmp_path):
     _events_env(monkeypatch, tmp_path)
     L.record_savings_event(tokens_before=1000, tokens_after=300, model=None, client="claude-code")
@@ -113,6 +122,50 @@ def test_windows_today_week_last30(monkeypatch, tmp_path):
     assert report.windows["last_30_days"]["calls"] == 3
     # 500 saved out of 1000 before today
     assert report.windows["today"]["savings_percent"] == pytest.approx(50.0)
+
+
+def test_new_input_basis_pairs_compression_only_with_new_input(monkeypatch, tmp_path):
+    _events_env(monkeypatch, tmp_path)
+    # 400 saved, of which 100 is tool-schema deferral; 900 tokens newly entered
+    # context. Compression-only 300 / (900 + 300) = 25%, same as /stats.
+    L.record_savings_event(
+        tokens_before=10_000,
+        tokens_after=9_600,
+        model=None,
+        client="claude-code",
+        new_input_tokens=900,
+        deferred_tokens=100,
+    )
+    # An event without a cache breakdown (MCP tool, Bedrock) keeps writing the
+    # old line and must not lend its savings to the new-input ratio.
+    L.record_savings_event(tokens_before=1000, tokens_after=500, model=None, client="mcp")
+    report = L.aggregate_savings()
+    window = report.windows["today"]
+    assert window["tokens_saved"] == 900
+    assert window["new_input_tokens"] == 900
+    assert window["new_input_savings_percent"] == pytest.approx(25.0)
+    clients = {row["client"]: row for row in report.by_client}
+    assert clients["mcp"]["new_input_tokens"] == 0
+    assert clients["mcp"]["new_input_savings_percent"] == 0.0
+    # The whole-wire ratio is untouched by the new field.
+    assert window["savings_percent"] == pytest.approx(900 / 11_000 * 100, abs=0.1)
+
+
+def test_savings_cli_prints_new_input_line_only_with_cache_data(monkeypatch, tmp_path):
+    from click.testing import CliRunner
+
+    from headroom.cli.savings import savings
+
+    _events_env(monkeypatch, tmp_path)
+    L.record_savings_event(tokens_before=1000, tokens_after=500, model=None, client="mcp")
+    out = CliRunner().invoke(savings, []).output
+    assert "of new input" not in out
+    L.record_savings_event(
+        tokens_before=10_000, tokens_after=9_600, model=None, client="c", new_input_tokens=900
+    )
+    out = CliRunner().invoke(savings, []).output
+    assert "of new input 30.8%" in out
+    assert "newly entered context" in out
 
 
 def test_retention_hard_capped_at_30_days(monkeypatch, tmp_path):
@@ -450,3 +503,271 @@ def test_v1_events_still_aggregate_alongside_v2(tmp_path):
     # ...but the v1 event's list dollar is still counted, not dropped.
     assert lifetime["cost_effective_usd"] > 0.012
     assert lifetime["basis"] == "list"
+
+
+def test_zero_saving_request_keeps_its_place_in_the_new_input_denominator(monkeypatch, tmp_path):
+    """100 saved on 100 new input, then 0 saved on 10,000 new input. The
+    new-input basis is 100 / (10,100 + 100), under 1 percent, not the 50
+    percent that only counting requests that saved would report. The
+    saved-event figures do not see the second request at all."""
+    _events_env(monkeypatch, tmp_path)
+    assert L.record_savings_event(
+        tokens_before=200, tokens_after=100, model=None, client="claude-code", new_input_tokens=100
+    )
+    assert L.record_savings_event(
+        tokens_before=10_000,
+        tokens_after=10_000,
+        model=None,
+        client="claude-code",
+        new_input_tokens=10_000,
+    )
+    # Without a new-input figure a zero-saving request is still not an event.
+    assert not L.record_savings_event(
+        tokens_before=500, tokens_after=500, model=None, client="claude-code"
+    )
+    window = L.aggregate_savings().windows["today"]
+    assert window["tokens_saved"] == 100
+    assert window["new_input_tokens"] == 10_100
+    assert window["new_input_savings_percent"] == pytest.approx(1.0, abs=0.05)
+    assert window["savings_percent"] == pytest.approx(50.0)
+
+
+# --------------------------------------------------------------------------- #
+# failures are logged, not swallowed
+# --------------------------------------------------------------------------- #
+
+
+class _ListHandler(logging.Handler):
+    def __init__(self) -> None:
+        super().__init__(level=logging.DEBUG)
+        self.records: list[logging.LogRecord] = []
+
+    def emit(self, record: logging.LogRecord) -> None:
+        self.records.append(record)
+
+
+@pytest.fixture
+def ledger_records():
+    # Attach directly: caplog misses `headroom.*` loggers once the proxy has
+    # configured logging earlier in the session.
+    logger = logging.getLogger("headroom.savings_ledger")
+    handler = _ListHandler()
+    previous = logger.level
+    logger.addHandler(handler)
+    logger.setLevel(logging.DEBUG)
+    yield handler.records
+    logger.removeHandler(handler)
+    logger.setLevel(previous)
+
+
+@pytest.fixture
+def fresh_append_warnings(monkeypatch):
+    monkeypatch.setattr(L, "_append_warnings", WarnOnce(64, "unwritable savings ledgers"))
+
+
+def _warnings(records: list[logging.LogRecord]) -> list[str]:
+    return [r.getMessage() for r in records if r.levelno == logging.WARNING]
+
+
+def test_unreadable_ledger_warns_instead_of_reporting_zero_silently(tmp_path, ledger_records):
+    readable = tmp_path / "savings_events.jsonl"
+    assert L.record_savings_event(
+        tokens_before=1000, tokens_after=400, model=None, client="c", path=readable
+    )
+    assert L.aggregate_savings(path=readable).lifetime["tokens_saved"] == 600
+    assert _warnings(ledger_records) == []
+
+    # A directory where the ledger file should be: unreadable.
+    report = L.aggregate_savings(path=tmp_path)
+
+    assert report.lifetime["tokens_saved"] == 0
+    warnings = _warnings(ledger_records)
+    assert len(warnings) == 1
+    assert "could not read" in warnings[0]
+    assert str(tmp_path) in warnings[0]
+
+
+def test_failed_append_warns_once_per_ledger_path(tmp_path, ledger_records, fresh_append_warnings):
+    first = tmp_path / "a"
+    second = tmp_path / "b"
+    first.mkdir()
+    second.mkdir()
+
+    # A directory where the ledger file should be: every append fails.
+    assert not L.record_savings_event(tokens_before=1000, tokens_after=400, path=first)
+    assert not L.record_savings_event(tokens_before=1000, tokens_after=400, path=first)
+    assert not L.record_savings_event(tokens_before=1000, tokens_after=400, path=second)
+
+    warnings = _warnings(ledger_records)
+    # One WARNING per path; the repeat on `first` goes to DEBUG only.
+    assert len(warnings) == 2
+    assert str(first) in warnings[0] and "append to" in warnings[0]
+    assert str(second) in warnings[1]
+    assert any(r.levelno == logging.DEBUG and "append to" in r.getMessage() for r in ledger_records)
+
+
+def test_successful_append_rearms_the_warning(tmp_path, ledger_records, fresh_append_warnings):
+    ledger = tmp_path / "savings_events.jsonl"
+    ledger.mkdir()
+
+    assert not L.record_savings_event(tokens_before=1000, tokens_after=400, path=ledger)
+    ledger.rmdir()
+    assert L.record_savings_event(tokens_before=1000, tokens_after=400, path=ledger)
+    ledger.unlink()
+    ledger.mkdir()
+    assert not L.record_savings_event(tokens_before=1000, tokens_after=400, path=ledger)
+
+    # The failure after a recovery is a new episode and warns again.
+    assert len(_warnings(ledger_records)) == 2
+
+
+def test_append_warning_names_only_the_type_of_a_non_os_error(
+    monkeypatch, tmp_path, ledger_records, fresh_append_warnings
+):
+
+    def fail(*_args, **_kwargs):
+        raise TypeError("secret-looking event payload")
+
+    # Shadow open() inside the module only, so nothing else is affected.
+    monkeypatch.setattr(L, "open", fail, raising=False)
+    assert not L.record_savings_event(
+        tokens_before=1000, tokens_after=400, path=tmp_path / "savings_events.jsonl"
+    )
+
+    warnings = _warnings(ledger_records)
+    assert len(warnings) == 1
+    assert "TypeError" in warnings[0]
+    formatted = [logging.Formatter().format(record) for record in ledger_records]
+    assert all("secret-looking" not in line for line in formatted)
+
+    # The repeat goes to DEBUG, and DEBUG carries no payload either.
+    assert not L.record_savings_event(
+        tokens_before=1000, tokens_after=400, path=tmp_path / "savings_events.jsonl"
+    )
+    formatted = [logging.Formatter().format(record) for record in ledger_records]
+    assert any(r.levelno == logging.DEBUG and "TypeError" in r.getMessage() for r in ledger_records)
+    assert all("secret-looking" not in line for line in formatted)
+
+
+def test_many_unwritable_ledgers_do_not_warn_on_every_cycle(
+    tmp_path, ledger_records, fresh_append_warnings
+):
+    # A directory where each ledger file should be: every append fails.
+    ledgers = [tmp_path / f"ledger-{i}" for i in range(65)]
+    for ledger in ledgers:
+        ledger.mkdir()
+
+    for _cycle in range(3):
+        for ledger in ledgers:
+            assert not L.record_savings_event(tokens_before=1000, tokens_after=400, path=ledger)
+
+    warnings = _warnings(ledger_records)
+    # 64 per-path warnings plus one overflow notice, over all three cycles.
+    assert len(warnings) == 65
+    assert sum("append to" in w for w in warnings) == 64
+    assert "More than 64 warnings about unwritable savings ledgers" in warnings[-1]
+
+
+_ROUTING = {  # what routemegood publishes, trimmed to the routing_stats contract
+    "decisions": 11,
+    "window": "lifetime",
+    "pairs": [
+        {
+            "requested": "claude-opus-5-5",
+            "served": "claude-opus-5-5",
+            "direction": "same",
+            "count": 5,
+            "enforced": 0,
+            "holdout": 0,
+            "measured": 0,
+            "savings_usd": 0.0,
+        },
+        {
+            "requested": "claude-sonnet-5-5",
+            "served": "claude-haiku-5-5",
+            "direction": "downgrade",
+            "count": 5,
+            "enforced": 4,
+            "holdout": 1,
+            "measured": 4,
+            "savings_usd": 0.057101,
+        },
+        {
+            "requested": "gpt-5.6-sol",
+            "served": "gpt-5.6-terra",
+            "direction": "downgrade",
+            "count": 2,
+            "enforced": 2,
+            "holdout": 0,
+            "measured": 0,
+            "savings_usd": 0.0,
+        },
+    ],
+}
+
+
+def test_cli_shows_the_proxys_routing_savings_beside_compression(monkeypatch, tmp_path):
+    from click.testing import CliRunner
+
+    from headroom.cli import savings as cli
+
+    _events_env(monkeypatch, tmp_path)
+    L.record_savings_event(tokens_before=1000, tokens_after=300, model=None, client="claude-code")
+    monkeypatch.setattr(cli, "_proxy_routing", lambda: _ROUTING)
+
+    out = CliRunner().invoke(cli.savings, []).output
+    # The headline is the sum of the pairs; a holdout stayed on Sonnet and is not moved.
+    assert "Model routing (lifetime): 6 of 11 requests moved · $0.0571 saved" in out
+    assert "claude-sonnet-5-5 → claude-haiku-5-5" in out
+    assert "not priced (no usage reported)" in out  # Sol -> Terra: a saving we cannot claim
+    assert "claude-opus-5-5 → claude-opus-5-5" not in out
+
+    data = json.loads(CliRunner().invoke(cli.savings, ["--json"]).output)
+    assert data["routing"]["pairs"][1]["savings_usd"] == 0.057101
+
+
+def test_cli_shows_routing_savings_before_any_compression(monkeypatch, tmp_path):
+    from click.testing import CliRunner
+
+    from headroom.cli import savings as cli
+
+    _events_env(monkeypatch, tmp_path)
+    monkeypatch.setattr(cli, "_proxy_routing", lambda: _ROUTING)
+    out = CliRunner().invoke(cli.savings, []).output
+    assert "No savings recorded yet." not in out
+    assert "$0.0571 saved" in out
+
+
+def test_proxy_routing_is_none_without_a_router(monkeypatch):
+    from headroom.cli import savings as cli
+
+    monkeypatch.setattr(
+        "headroom.install.health.probe_json", lambda url, timeout=2.0: {"routing": None}
+    )
+    assert cli._proxy_routing() is None
+    monkeypatch.setattr("headroom.install.health.probe_json", lambda url, timeout=2.0: None)
+    assert cli._proxy_routing() is None
+
+
+def test_cli_names_the_routing_window_the_provider_reports(monkeypatch, tmp_path):
+    from click.testing import CliRunner
+
+    from headroom.cli import savings as cli
+
+    _events_env(monkeypatch, tmp_path)
+    for window, label in (("session", "this proxy session"), (None, "all decisions on record")):
+        monkeypatch.setattr(cli, "_proxy_routing", lambda w=window: {**_ROUTING, "window": w})
+        out = CliRunner().invoke(cli.savings, []).output
+        assert f"Model routing ({label}): 6 of 11 requests moved" in out
+
+
+def test_cli_without_a_router_never_mentions_routing(monkeypatch, tmp_path):
+    from click.testing import CliRunner
+
+    from headroom.cli import savings as cli
+
+    _events_env(monkeypatch, tmp_path)
+    L.record_savings_event(tokens_before=1000, tokens_after=300, model=None, client="claude-code")
+    monkeypatch.setattr(cli, "_proxy_routing", lambda: None)
+    assert "routing" not in CliRunner().invoke(cli.savings, []).output.lower()
+    assert "routing" not in json.loads(CliRunner().invoke(cli.savings, ["--json"]).output)

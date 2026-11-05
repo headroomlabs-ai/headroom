@@ -209,16 +209,22 @@ def test_env_off_wins(make_headroom_client, monkeypatch) -> None:
     assert data["body"]["system"] == SYSTEM_PROMPT
 
 
-def test_cache_mode_labels_but_never_steers(make_headroom_client, monkeypatch) -> None:
-    """``steering_allowed_for`` is false in ``mode="cache"``: the measurement
-    label still rides the outcome but the prefix-cache key is left alone."""
+def test_cache_mode_steers_at_the_default_level(make_headroom_client, monkeypatch) -> None:
+    """``HEADROOM_OUTPUT_SHAPER=1`` alone must steer, in the default mode.
+
+    Cache mode used to resolve the level to 0 here, so the label rode the
+    outcome while the body went out untouched -- the feature did nothing for
+    the mode almost every deployment runs. A level fixed at startup cannot
+    move mid-conversation, so it cannot bust the prefix cache, so it steers.
+    """
     monkeypatch.setenv("HEADROOM_OUTPUT_SHAPER", "1")
+    monkeypatch.delenv("HEADROOM_VERBOSITY_LEVEL", raising=False)
     client = make_headroom_client(mode="cache")
     for sent in (_anthropic_body(gateway={}), _openai_body(gateway={})):
         data = compress(client, sent).json()
         assert _stratum_label(data).startswith(STRATUM_PREFIX)
-        assert not any(t.startswith(VERBOSITY_PREFIX) for t in data["transforms_applied"])
-        assert STEERING_SENTINEL not in canonical(data["body"])
+        assert any(t.startswith(VERBOSITY_PREFIX) for t in data["transforms_applied"])
+        assert STEERING_SENTINEL in canonical(data["body"])
 
 
 def test_control_arm_labels_but_never_steers(make_headroom_client, monkeypatch) -> None:

@@ -9,6 +9,7 @@ from typing import Any
 from fastapi import FastAPI, HTTPException, Request, WebSocket
 from fastapi.responses import JSONResponse, Response
 
+from headroom.log_safety import redact_url
 from headroom.providers.cloudcode import normalize_cloudcode_passthrough_path
 from headroom.providers.codex.endpoints import codex_backend_url
 from headroom.providers.codex.headers import drop_header
@@ -38,6 +39,9 @@ from headroom.providers.openai_responses import (
 )
 from headroom.providers.proxy_targets import (
     api_target as _api_target,
+)
+from headroom.providers.proxy_targets import (
+    openai_compatible_base_url as _openai_compatible_base_url,
 )
 from headroom.providers.proxy_targets import (
     select_passthrough_base_url as _select_passthrough_base_url,
@@ -76,7 +80,7 @@ logger = logging.getLogger("headroom.proxy.routes")
 
 def _gateway_enabled(proxy: Any) -> bool:
     """Return whether this proxy has a configured unified gateway."""
-    return getattr(proxy.config, "gateway", None) is not None
+    return getattr(getattr(proxy, "config", None), "gateway", None) is not None
 
 
 async def _handle_chatgpt_codex_alpha_search(request: Request, proxy: Any) -> Response | None:
@@ -111,6 +115,30 @@ def _register_provider_passthrough_route(
     spec: ProviderPassthroughRoute,
 ) -> None:
     async def provider_passthrough(request: Request):
+        # A reachability probe the token gate let through without a credential
+        # (/api/hello): answer it here, never relay it upstream anonymously.
+        if getattr(request.state, "headroom_local_hello_probe", False):
+            return Response(status_code=200)
+
+        # Honor the per-request upstream override like /v1/messages and the
+        # catch-all do. Clients that speak one wire format but authenticate
+        # against a custom OpenAI-compatible gateway must reach that gateway
+        # for embeddings/audio/metadata too, not the default provider target
+        # (the same gap as the model-metadata routes, #4302). Telemetry keeps
+        # the route spec labels: they are bounded by this module, so the
+        # request-controlled host never becomes a stats label (#3759), while
+        # `handle_passthrough` still records the outcome for these known routes.
+        custom_base = request.headers.get("x-headroom-base-url", "").strip()
+        if custom_base:
+            if not await is_safe_upstream_url_async(custom_base):
+                logger.warning("rejecting unsafe x-headroom-base-url: %r", custom_base)
+                raise HTTPException(status_code=400, detail="Rejected unsafe upstream base URL")
+            return await proxy.handle_passthrough(
+                request,
+                custom_base.rstrip("/"),
+                spec.sub_path,
+                spec.provider_name,
+            )
         return await proxy.handle_passthrough(
             request,
             _api_target(proxy, spec.provider_name),
@@ -164,14 +192,21 @@ def _register_provider_handler_route(app: FastAPI, proxy: Any, spec: ProviderHan
                 },
             )
         handler = getattr(proxy, spec.handler_name)
+        handler_kwargs: dict[str, str] = {}
+        custom_base = request.headers.get("x-headroom-base-url", "").strip()
+        if custom_base and spec.supports_custom_base_url:
+            if not await is_safe_upstream_url_async(custom_base):
+                logger.warning("rejecting unsafe x-headroom-base-url: %r", custom_base)
+                raise HTTPException(status_code=400, detail="Rejected unsafe upstream base URL")
+            handler_kwargs["upstream_base_url"] = custom_base.rstrip("/")
         if spec.path_param is None:
-            return await handler(request)
+            return await handler(request, **handler_kwargs)
         path_args = {
             "batch_id": batch_id,
             "batch_name": batch_name,
             "model": model,
         }
-        return await handler(request, path_args[spec.path_param])
+        return await handler(request, path_args[spec.path_param], **handler_kwargs)
 
     provider_handler.__name__ = (
         spec.handler_name.replace("handle_", "")
@@ -223,9 +258,9 @@ def _register_openai_responses_subpath_route(
             from headroom.proxy.gateway.dispatch import dispatch_stateful_response_http
 
             return await dispatch_stateful_response_http(request, proxy, sub_path)
-        assert proxy.http_client is not None
+        codex_subpath_client = getattr(proxy, "http_client_h1", None) or proxy.http_client
         chatgpt_response = await handle_chatgpt_codex_responses_subpath(
-            proxy.http_client,
+            codex_subpath_client,
             request,
             sub_path,
         )
@@ -579,18 +614,40 @@ def register_provider_routes(app: FastAPI, proxy: Any) -> None:
             VERTEX_STREAM_RAW_PREDICT.name,
         )
 
+    async def _model_metadata_route(request: Request) -> tuple[str, str]:
+        # A caller-named upstream wins, as in the catch-all and the chat
+        # handlers: model discovery must reach the same gateway as inference.
+        custom_base = request.headers.get("x-headroom-base-url", "").strip()
+        if custom_base:
+            if not await is_safe_upstream_url_async(custom_base):
+                logger.warning("rejecting unsafe x-headroom-base-url: %s", redact_url(custom_base))
+                raise HTTPException(status_code=400, detail="Rejected unsafe upstream base URL")
+            # Only the destination is overridden: keep the provider the request's
+            # auth selects, so Anthropic-auth requests still get model-id
+            # sanitization in handle_passthrough.
+            provider_name = proxy.provider_runtime.model_metadata_provider(dict(request.headers))
+            return provider_name, custom_base.rstrip("/")
+        headers = dict(request.headers)
+        provider_name = proxy.provider_runtime.model_metadata_provider(headers)
+        base_url = (
+            _openai_compatible_base_url(proxy, headers)
+            if provider_name == "openai"
+            else _api_target(proxy, provider_name)
+        )
+        return provider_name, base_url
+
     @app.get("/v1/models")
     async def list_models(request: Request):
         if _gateway_enabled(proxy):
             from headroom.proxy.gateway.dispatch import gateway_model_catalog
 
             return gateway_model_catalog(request)
-        provider_name = proxy.provider_runtime.model_metadata_provider(dict(request.headers))
+        provider_name, base_url = await _model_metadata_route(request)
         return await handle_model_metadata_endpoint(
             proxy,
             request,
             endpoint=MODEL_METADATA_LIST_ENDPOINT,
-            provider_api_base_url=_api_target(proxy, provider_name),
+            provider_api_base_url=base_url,
             provider_name=provider_name,
         )
 
@@ -600,12 +657,12 @@ def register_provider_routes(app: FastAPI, proxy: Any) -> None:
             from headroom.proxy.gateway.dispatch import gateway_model_catalog
 
             return gateway_model_catalog(request, model_id)
-        provider_name = proxy.provider_runtime.model_metadata_provider(dict(request.headers))
+        provider_name, base_url = await _model_metadata_route(request)
         return await handle_model_metadata_endpoint(
             proxy,
             request,
             endpoint=model_metadata_get_endpoint(model_id),
-            provider_api_base_url=_api_target(proxy, provider_name),
+            provider_api_base_url=base_url,
             provider_name=provider_name,
         )
 

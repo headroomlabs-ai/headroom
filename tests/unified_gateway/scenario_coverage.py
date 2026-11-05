@@ -256,7 +256,7 @@ _COVERAGE: dict[str, CoverageCell] = {
     ),
     "T078": _unavailable("tests/unified_gateway/test_cli_profile.py::test_gateway_requires_config"),
     "T079": _local(
-        "tests/test_mcp_dependency_contract.py::test_all_shipping_mcp_extras_exclude_incompatible_sdk_v2"
+        "tests/test_mcp_dependency_contract.py::test_all_shipping_mcp_extras_require_the_ported_sdk_v2"
     ),
     "T080": _unavailable(
         "tests/unified_gateway/test_translation.py::test_public_tool_use_and_result_translation_is_unavailable"

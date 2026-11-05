@@ -72,8 +72,15 @@ class ProxyProviderRuntime:
         """Resolve the upstream provider that should serve OpenAI-style model metadata."""
         return "anthropic" if _is_anthropic_auth(headers) else "openai"
 
-    def select_passthrough_base_url(self, headers: Mapping[str, str]) -> str:
+    def select_passthrough_base_url(
+        self, headers: Mapping[str, str], path: str | None = None
+    ) -> str:
         """Resolve the upstream base URL for catch-all passthrough requests."""
+        if path is not None:
+            from headroom.providers.proxy_targets import is_anthropic_hello_path
+
+            if is_anthropic_hello_path(path):
+                return self.api_targets.anthropic
         if _is_anthropic_auth(headers):
             return self.api_targets.anthropic
         if headers.get("x-goog-api-key"):
@@ -366,6 +373,34 @@ def _call_openai_transport(
     return response
 
 
+def _call_anthropic_create_transport(
+    client: Any,
+    *,
+    model: str,
+    messages: list[dict[str, Any]],
+    stream: bool,
+    metrics: Any,
+    **kwargs: Any,
+) -> Any:
+    if stream:
+        response = client._original.messages.create(
+            model=model,
+            messages=messages,
+            stream=True,
+            **kwargs,
+        )
+        return client._wrap_stream(response, metrics)
+
+    return _call_anthropic_transport(
+        client,
+        model=model,
+        messages=messages,
+        stream=False,
+        metrics=metrics,
+        **kwargs,
+    )
+
+
 def _call_anthropic_transport(
     client: Any,
     *,
@@ -402,6 +437,7 @@ def _call_anthropic_transport(
 _ClientTransport = Callable[..., Any]
 _CLIENT_TRANSPORTS: dict[str, _ClientTransport] = {
     "anthropic": _call_anthropic_transport,
+    "anthropic_create": _call_anthropic_create_transport,
     "openai": _call_openai_transport,
 }
 

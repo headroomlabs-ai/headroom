@@ -20,6 +20,7 @@ from datetime import datetime, timedelta
 from pathlib import Path
 
 from headroom import paths as _paths
+from headroom.offline import pin_litellm_cost_map_local
 from headroom.pricing.litellm_pricing import resolve_litellm_model
 
 log = logging.getLogger(__name__)
@@ -67,45 +68,19 @@ _STAGE_TIMINGS_RE = re.compile(
 
 
 # ---------------------------------------------------------------------------
-# Cache-aware pricing via LiteLLM
+# List pricing via LiteLLM
 # ---------------------------------------------------------------------------
 
-# LiteLLM already knows per-token costs for 100+ models including
-# cache_read and cache_creation pricing.  We call it directly instead
-# of maintaining our own pricing tables.
+# LiteLLM already knows per-token costs for 100+ models.  We read it
+# directly instead of maintaining our own pricing tables.
 
 try:
+    pin_litellm_cost_map_local()
     import litellm as _litellm
 
     _LITELLM_AVAILABLE = True
 except ImportError:
     _LITELLM_AVAILABLE = False
-
-
-def _litellm_cost(
-    model: str,
-    prompt_tokens: int,
-    cache_read_tokens: int = 0,
-    cache_write_tokens: int = 0,
-) -> float | None:
-    """Compute input cost via litellm.cost_per_token (cache-aware).
-
-    Returns total input cost in USD, or None if model not found.
-    """
-    if not _LITELLM_AVAILABLE:
-        return None
-    resolved = resolve_litellm_model(model)
-    try:
-        input_cost, _ = _litellm.cost_per_token(
-            model=resolved,
-            prompt_tokens=prompt_tokens,
-            completion_tokens=0,
-            cache_read_input_tokens=cache_read_tokens,
-            cache_creation_input_tokens=cache_write_tokens,
-        )
-        return float(input_cost)
-    except Exception:
-        return None
 
 
 def _get_list_price(model: str) -> float | None:
@@ -249,6 +224,7 @@ class PerfReport:
     oldest_kept_ts: str | None = None
     newest_kept_ts: str | None = None
     records_filtered_out: int = 0
+    records_malformed: int = 0
     # True when no time cutoff was applied (--hours 0, or a value so large it
     # overflows datetime arithmetic). The header says "all data" instead of a
     # misleading "last 0h".
@@ -411,9 +387,8 @@ def parse_log_files(last_n_hours: float = 168.0) -> PerfReport:
                         if not _within_window(ts):
                             report.records_filtered_out += 1
                             continue
-                        _track_window(ts)
-                        report.perf_records.append(
-                            PerfRecord(
+                        try:
+                            record = PerfRecord(
                                 timestamp=ts,
                                 request_id=m.group("rid"),
                                 model=kv.get("model", ""),
@@ -436,7 +411,13 @@ def parse_log_files(last_n_hours: float = 168.0) -> PerfReport:
                                 from_response_cache=kv.get("cached", "0") == "1",
                                 stages=stages_by_rid.get(m.group("rid"), {}),
                             )
-                        )
+                        except ValueError:
+                            # A non-numeric field is not a PERF line Headroom wrote
+                            # (e.g. text a client put into a logged model id).
+                            report.records_malformed += 1
+                            continue
+                        _track_window(ts)
+                        report.perf_records.append(record)
                         continue
 
                     # content_router summary lines
@@ -569,6 +550,11 @@ def format_report(report: PerfReport) -> str:
                 f"Records outside window:  {report.records_filtered_out:,} "
                 "(filtered out — increase --hours to include them)"
             )
+        if report.records_malformed > 0:
+            lines.append(
+                f"Malformed PERF lines:    {report.records_malformed:,} "
+                "(skipped — a numeric field did not parse)"
+            )
     lines.append("")
 
     records = report.perf_records
@@ -611,6 +597,28 @@ def format_report(report: PerfReport) -> str:
         if total_tool_saved > 0:
             lines.append(f"  · messages       {max(0, total_saved):,}")
             lines.append(f"  · tool schemas   {total_tool_saved:,}")
+        lines.append("")
+
+        audit = build_savings_audit(report)
+        lines.append("Savings Audit")
+        lines.append("-" * 40)
+        lines.append(
+            "  Raw prompt reduction: "
+            f"{audit['prompt_reduction_tokens']:,} tokens "
+            f"({audit['prompt_reduction_pct']:.1f}%)"
+        )
+        lines.append(
+            "  Logged savings:       "
+            f"{audit['logged_tokens_saved']:,} tokens "
+            f"({audit['logged_savings_pct']:.1f}%)"
+        )
+        lines.append(f"  Accounting delta:     {audit['accounting_delta_tokens']:+,} tokens")
+        delta_count = audit["record_counts"]["with_accounting_delta"]
+        if delta_count:
+            lines.append(f"  Records with delta:   {delta_count}/{len(records)}")
+        impossible_count = audit["record_counts"]["logged_saved_gt_tokens_before"]
+        if impossible_count:
+            lines.append(f"  Impossible records:   {impossible_count} saved more than before")
         lines.append("")
 
         # Per-model breakdown with list prices
@@ -818,13 +826,15 @@ def format_report(report: PerfReport) -> str:
     # exactly zero tokens; every token-savings channel in the proxy would record
     # it as nothing. Showing `$` beside a `0 tokens` row is the honest rendering
     # of that, and collapsing them into one number would be an invented saving.
+    from headroom.proxy.savings_attribution import event_count
+
     by_source: dict[tuple[str, bool], dict[str, float]] = {}
     for record in report.perf_records:
         for item in getattr(record, "savings_breakdown", ()) or ():
             source = str(item.get("source") or "other")
             realized = bool(item.get("realized", True))
             row = by_source.setdefault((source, realized), {"events": 0, "tokens": 0, "usd": 0.0})
-            row["events"] += 1
+            row["events"] += event_count(item)
             row["tokens"] += max(0, _as_number(item.get("tokens"), int))
             row["usd"] += _as_number(item.get("usd"), float)
     if by_source:
@@ -971,6 +981,106 @@ PERF_RECORD_FIELDS = [
 def _pct(saved: int, before: int) -> float:
     """Reduction percentage, rounded to 1dp, guarding divide-by-zero."""
     return round(saved / before * 100, 1) if before > 0 else 0.0
+
+
+def _prompt_reduction_tokens(record: PerfRecord) -> int:
+    """Raw prompt-token delta for a record, excluding cache/accounting effects."""
+    return max(record.tokens_before - record.tokens_after, 0)
+
+
+def _audit_record(record: PerfRecord) -> dict:
+    prompt_reduction = _prompt_reduction_tokens(record)
+    return {
+        "timestamp": record.timestamp,
+        "request_id": record.request_id,
+        "model": record.model,
+        "client": record.client,
+        "tokens_before": record.tokens_before,
+        "tokens_after": record.tokens_after,
+        "logged_tokens_saved": record.tokens_saved,
+        "prompt_reduction_tokens": prompt_reduction,
+        "accounting_delta_tokens": record.tokens_saved - prompt_reduction,
+        "cache_read_tokens": record.cache_read,
+        "cache_write_tokens": record.cache_write,
+        "optimization_ms": record.optimization_ms,
+        "transforms": record.transforms,
+    }
+
+
+def _record_accounting_reasons(record: PerfRecord) -> list[str]:
+    reasons: list[str] = []
+    if min(record.tokens_before, record.tokens_after, record.tokens_saved) < 0:
+        reasons.append("negative_token_count")
+    if record.tokens_before > 0 and record.tokens_saved > record.tokens_before:
+        reasons.append("logged_saved_gt_tokens_before")
+    if record.tokens_after > record.tokens_before and record.tokens_saved > 0:
+        reasons.append("prompt_grew_but_logged_savings_positive")
+    if record.tokens_saved != _prompt_reduction_tokens(record):
+        reasons.append("logged_saved_ne_prompt_delta")
+    return reasons
+
+
+def build_savings_audit(report: PerfReport, *, limit: int = 10) -> dict:
+    """Explain how headline savings relate to raw before/after token deltas."""
+    records = report.perf_records
+    total_before = sum(r.tokens_before for r in records)
+    total_after = sum(r.tokens_after for r in records)
+    logged_saved = sum(r.tokens_saved for r in records)
+    prompt_reduction = sum(_prompt_reduction_tokens(r) for r in records)
+    prompt_growth = sum(max(r.tokens_after - r.tokens_before, 0) for r in records)
+    accounting_delta = logged_saved - prompt_reduction
+
+    records_with_delta = [r for r in records if r.tokens_saved != _prompt_reduction_tokens(r)]
+    impossible_saved_gt_before = [
+        r for r in records if r.tokens_before > 0 and r.tokens_saved > r.tokens_before
+    ]
+    prompt_growth_with_savings = [
+        r for r in records if r.tokens_after > r.tokens_before and r.tokens_saved > 0
+    ]
+    negative_token_counts = [
+        r for r in records if min(r.tokens_before, r.tokens_after, r.tokens_saved) < 0
+    ]
+
+    suspicious_records = []
+    for record in sorted(
+        records_with_delta,
+        key=lambda r: abs(r.tokens_saved - _prompt_reduction_tokens(r)),
+        reverse=True,
+    )[:limit]:
+        suspicious_records.append(
+            {
+                **_audit_record(record),
+                "reasons": _record_accounting_reasons(record),
+            }
+        )
+
+    return {
+        "formula": {
+            "raw_prompt_reduction": "sum(max(tokens_before - tokens_after, 0))",
+            "logged_savings": "sum(tokens_saved)",
+            "accounting_delta": "logged_savings - raw_prompt_reduction",
+        },
+        "total_tokens_before": total_before,
+        "total_tokens_after": total_after,
+        "logged_tokens_saved": logged_saved,
+        "logged_savings_pct": _pct(logged_saved, total_before),
+        "prompt_reduction_tokens": prompt_reduction,
+        "prompt_reduction_pct": _pct(prompt_reduction, total_before),
+        "prompt_growth_tokens": prompt_growth,
+        "accounting_delta_tokens": accounting_delta,
+        "record_counts": {
+            "total": len(records),
+            "with_accounting_delta": len(records_with_delta),
+            "logged_saved_gt_tokens_before": len(impossible_saved_gt_before),
+            "prompt_grew_but_logged_savings_positive": len(prompt_growth_with_savings),
+            "negative_token_count": len(negative_token_counts),
+        },
+        "top_saving_requests": [
+            _audit_record(r)
+            for r in sorted(records, key=lambda rec: rec.tokens_saved, reverse=True)[:limit]
+        ],
+        "suspicious_records": suspicious_records,
+    }
 
 
 def _percentile(data: list[float], pct: float) -> float:
@@ -1199,6 +1309,7 @@ def build_perf_summary(report: PerfReport) -> dict:
     total_before = sum(r.tokens_before for r in records)
     total_after = sum(r.tokens_after for r in records)
     total_saved = sum(r.tokens_saved for r in records)
+    savings_audit = build_savings_audit(report)
     total_tool_saved = sum(r.tool_saved for r in records)
     total_headline_saved = total_saved + total_tool_saved
 
@@ -1211,12 +1322,17 @@ def build_perf_summary(report: PerfReport) -> dict:
     for r in records:
         by_model_groups.setdefault(r.model, []).append(r)
     by_model = []
+    estimated_list_price_savings_usd = 0.0
     for model, recs in sorted(by_model_groups.items()):
         m_before = sum(r.tokens_before for r in recs)
         m_after = sum(r.tokens_after for r in recs)
         m_message_saved = sum(r.tokens_saved for r in recs)
         m_tool_saved = sum(r.tool_saved for r in recs)
         m_saved = m_message_saved + m_tool_saved
+        m_prompt_reduction = sum(_prompt_reduction_tokens(r) for r in recs)
+        list_price = _get_list_price(model)
+        if list_price:
+            estimated_list_price_savings_usd += m_saved * list_price / 1_000_000
         by_model.append(
             {
                 "model": model,
@@ -1226,8 +1342,13 @@ def build_perf_summary(report: PerfReport) -> dict:
                 "tokens_saved": m_saved,
                 "message_tokens_saved": m_message_saved,
                 "tool_tokens_saved": m_tool_saved,
+                "prompt_reduction_tokens": m_prompt_reduction,
+                "accounting_delta_tokens": m_message_saved - m_prompt_reduction,
                 "savings_pct": _pct(m_saved, m_before + m_tool_saved),
-                "list_price_per_mtok": _get_list_price(model),
+                "list_price_per_mtok": list_price,
+                "estimated_list_price_savings_usd": round(m_saved * list_price / 1_000_000, 4)
+                if list_price
+                else None,
             }
         )
 
@@ -1250,6 +1371,8 @@ def build_perf_summary(report: PerfReport) -> dict:
             }
         )
 
+    from headroom.proxy.savings_attribution import event_count
+
     by_source_groups: dict[tuple[str, bool], dict[str, int | float | str | bool]] = {}
     for record in records:
         for item in record.savings_breakdown:
@@ -1266,7 +1389,7 @@ def build_perf_summary(report: PerfReport) -> dict:
                     "usd": 0.0,
                 },
             )
-            row["events"] = int(row["events"]) + 1
+            row["events"] = int(row["events"]) + event_count(item)
             raw_tokens = item.get("tokens", 0)
             raw_usd = item.get("usd", 0.0)
             tokens = int(raw_tokens) if isinstance(raw_tokens, (str, int, float)) else 0
@@ -1288,6 +1411,7 @@ def build_perf_summary(report: PerfReport) -> dict:
             "newest": report.newest_kept_ts,
         },
         "records_filtered_out": report.records_filtered_out,
+        "records_malformed": report.records_malformed,
         "total_requests": len(records),
         "total_tokens_before": total_before,
         "total_tokens_after": total_after,
@@ -1299,6 +1423,8 @@ def build_perf_summary(report: PerfReport) -> dict:
         "tokens_saved": total_saved,
         "tool_saved": total_tool_saved,
         "savings_pct": _pct(total_saved, total_before),
+        "estimated_list_price_savings_usd": round(estimated_list_price_savings_usd, 4),
+        "savings_audit": savings_audit,
         "cache_read_tokens": total_cr,
         "cache_write_tokens": total_cw,
         "cache_hit_pct": cache_hit_pct,

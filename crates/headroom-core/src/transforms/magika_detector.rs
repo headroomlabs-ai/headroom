@@ -154,8 +154,30 @@ fn init_ort_from_path(path: &Path) -> Result<(), String> {
             path.display()
         )
     })?;
-    let _committed = builder.commit();
+    // `ort` enables ONNX Runtime's usage telemetry by default, and ORT 1.31+
+    // uploads it to Microsoft on Linux and macOS too. Importing `headroom`
+    // sets ORT_DISABLE_TELEMETRY, which stops the uploader before it starts;
+    // this only stops later events, for Rust-only callers that skip Python.
+    let enable = ort_telemetry_opted_in(std::env::var("ORT_DISABLE_TELEMETRY").ok().as_deref());
+    let _committed = builder.with_telemetry(enable).commit();
     Ok(())
+}
+
+/// Whether the caller explicitly allowed ONNX Runtime telemetry.
+///
+/// Mirrors the Python default (`headroom._ort.disable_ort_telemetry_by_default`):
+/// off unless `ORT_DISABLE_TELEMETRY` is set to a value ORT itself does not
+/// treat as "disabled" (ORT disables on `1`/`true`/`yes`/`on`/`y`, case- and
+/// space-insensitive). So `ORT_DISABLE_TELEMETRY=0` turns it on for Rust-loaded
+/// models exactly as it does for Python ones, and unset stays off.
+fn ort_telemetry_opted_in(value: Option<&str>) -> bool {
+    match value {
+        None => false,
+        Some(raw) => !matches!(
+            raw.trim().to_ascii_lowercase().as_str(),
+            "1" | "true" | "yes" | "on" | "y"
+        ),
+    }
 }
 
 fn discover_onnxruntime_libraries() -> Vec<PathBuf> {
@@ -167,10 +189,8 @@ fn discover_onnxruntime_libraries() -> Vec<PathBuf> {
         }
     }
 
-    if let Ok(cwd) = std::env::current_dir() {
-        roots.push(cwd.join(".venv"));
-        roots.push(cwd.join("venv"));
-    }
+    // The cwd may be an untrusted agent workspace. Only discover an environment
+    // there when the operator explicitly selects it with VIRTUAL_ENV/CONDA_PREFIX.
 
     if let Some(user_profile) = env_path("USERPROFILE") {
         roots.extend(versioned_children(
@@ -382,7 +402,11 @@ fn session() -> &'static Mutex<Result<Session, String>> {
         let spawned = std::thread::Builder::new()
             .name("magika-init".into())
             .spawn(move || {
-                let _ = tx.send(Session::new().map_err(|e| e.to_string()));
+                // One intra-op thread means ORT builds no pool: pool threads
+                // spin-wait between inferences, burning ~2 cores under light
+                // load (#4187), and magika's builder has no allow_spinning knob.
+                let built = Session::builder().with_intra_threads(1).build();
+                let _ = tx.send(built.map_err(|e| e.to_string()));
             });
         if let Err(e) = spawned {
             tracing::warn!("magika init thread spawn failed: {e}");
@@ -500,6 +524,92 @@ pub fn map_magika_label(label: &str) -> ContentType {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn check_discovery_root(directory: &str, active_env: Option<&str>) {
+        let root = tempfile::tempdir().unwrap();
+        let environment = root.path().join(directory);
+        #[cfg(target_os = "windows")]
+        let library = environment.join("Lib/site-packages/onnxruntime/capi/onnxruntime.dll");
+        #[cfg(target_os = "macos")]
+        let library =
+            environment.join("lib/python3.11/site-packages/onnxruntime/capi/libonnxruntime.dylib");
+        #[cfg(all(not(target_os = "windows"), not(target_os = "macos")))]
+        let library =
+            environment.join("lib/python3.11/site-packages/onnxruntime/capi/libonnxruntime.so");
+        std::fs::create_dir_all(library.parent().unwrap()).unwrap();
+        std::fs::write(&library, b"not a native library").unwrap();
+
+        // Isolate process cwd and environment from parallel unit tests. The
+        // child enumerates candidates only; it never loads the stub library.
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap());
+        child
+            .arg("--exact")
+            .arg("transforms::magika_detector::tests::discovery_root_child")
+            .arg("--nocapture")
+            .current_dir(root.path())
+            .env_remove("VIRTUAL_ENV")
+            .env_remove("CONDA_PREFIX")
+            .env("HEADROOM_TEST_ORT_LIBRARY", &library)
+            .env(
+                "HEADROOM_TEST_ORT_EXPECTED",
+                if active_env.is_some() { "yes" } else { "no" },
+            );
+        if let Some(variable) = active_env {
+            child.env(variable, &environment);
+        }
+        let output = child.output().unwrap();
+        assert!(
+            output.status.success(),
+            "{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[test]
+    fn discovery_root_child() {
+        let Some(library) = env_path("HEADROOM_TEST_ORT_LIBRARY") else {
+            return;
+        };
+        let expected = std::env::var("HEADROOM_TEST_ORT_EXPECTED").unwrap() == "yes";
+        let candidates = discover_onnxruntime_libraries();
+        assert_eq!(
+            candidates.contains(&library),
+            expected,
+            "candidates: {candidates:?}"
+        );
+    }
+
+    #[test]
+    fn discovery_ignores_cwd_dot_venv() {
+        check_discovery_root(".venv", None);
+    }
+
+    #[test]
+    fn discovery_ignores_cwd_venv() {
+        check_discovery_root("venv", None);
+    }
+
+    #[test]
+    fn discovery_keeps_explicit_virtual_env() {
+        check_discovery_root(".venv", Some("VIRTUAL_ENV"));
+    }
+
+    #[test]
+    fn discovery_keeps_explicit_conda_prefix() {
+        check_discovery_root("venv", Some("CONDA_PREFIX"));
+    }
+
+    #[test]
+    fn ort_telemetry_stays_off_unless_explicitly_allowed() {
+        assert!(!ort_telemetry_opted_in(None), "unset must stay off");
+        for disabled in ["1", "true", "TRUE", " yes ", "on", "Y"] {
+            assert!(!ort_telemetry_opted_in(Some(disabled)), "{disabled:?}");
+        }
+        for allowed in ["0", "false", "no", "off", ""] {
+            assert!(ort_telemetry_opted_in(Some(allowed)), "{allowed:?}");
+        }
+    }
 
     fn assert_detect(content: &str, expected: ContentType, hint: &str) {
         if let Err(init_reason) = magika_runtime_available_for_session_init() {

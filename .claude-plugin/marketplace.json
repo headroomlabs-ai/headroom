@@ -5,14 +5,14 @@
   },
   "metadata": {
     "description": "Headroom marketplace for Claude Code and GitHub Copilot CLI plugins.",
-    "version": "0.38.0"
+    "version": "0.43.1"
   },
   "plugins": [
     {
       "name": "headroom",
       "source": "./plugins/headroom-agent-hooks",
       "description": "Headroom startup hooks for Claude Code and GitHub Copilot CLI.",
-      "version": "0.38.0",
+      "version": "0.43.1",
       "author": {
         "name": "Headroom Contributors",
         "url": "https://github.com/headroomlabs-ai/headroom"
@@ -24,6 +24,47 @@
         "hooks",
         "claude-code",
         "copilot-cli"
+      ]
+    },
+    {
+      "name": "headroom-skill",
+      "source": "./plugins/headroom-skill",
+      "description": "Skill: add headroom-ai compress() to a Python or TypeScript app to cut LLM input tokens (tool outputs, logs, JSON, chat history). No API key.",
+      "version": "0.43.1",
+      "author": {
+        "name": "Headroom Contributors",
+        "url": "https://github.com/headroomlabs-ai/headroom"
+      },
+      "homepage": "https://github.com/headroomlabs-ai/headroom",
+      "repository": "https://github.com/headroomlabs-ai/headroom",
+      "keywords": [
+        "headroom",
+        "skill",
+        "token-cost",
+        "tool-outputs",
+        "context-window",
+        "claude-code",
+        "codex",
+        "copilot-cli"
+      ]
+    },
+    {
+      "name": "headroom-snip",
+      "source": "./plugins/headroom-snip",
+      "description": "Claude Code mod: watch Headroom snip tokens off every request, with an animated band, a /headroom log and a running total.",
+      "version": "0.43.1",
+      "author": {
+        "name": "Headroom Contributors",
+        "url": "https://github.com/headroomlabs-ai/headroom"
+      },
+      "homepage": "https://github.com/headroomlabs-ai/headroom",
+      "repository": "https://github.com/headroomlabs-ai/headroom",
+      "keywords": [
+        "headroom",
+        "claude-code",
+        "tokens",
+        "compression",
+        "mod"
       ]
     }
   ]

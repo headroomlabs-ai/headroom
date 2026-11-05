@@ -4,11 +4,16 @@ Reads the append-only savings ledger (``~/.headroom/savings_events.jsonl``,
 written by both the MCP tool path and the proxy) and renders a cost-avoided
 summary with Today / Last 7 days / All time bars plus per-model and
 per-client breakdowns. Durable across restarts; aggregated on read.
+
+When the local proxy runs a model router (a routing-stats provider, see
+``headroom.proxy.routing_stats``), its savings are shown beside: what each
+moved request cost on the cheaper model against the model it asked for.
 """
 
 from __future__ import annotations
 
 import json
+import os
 from typing import Any
 
 import click
@@ -47,10 +52,18 @@ def _window_line(label: str, window: dict[str, Any]) -> str:
     money = _money(cost)
     if ceiling > 0 and abs(ceiling - cost) / ceiling >= 0.01:
         money = f"{money} (list {_money(ceiling)})"
-    return (
+    line = (
         f"{label:<12} {_bar(pct)} {pct:5.1f}%  "
         f"saved {_tokens(saved)} / {_tokens(before)} tokens  {money}"
     )
+    # Second basis, only when the window has provider cache data: the share of
+    # tokens that newly entered context. The bar's ratio counts a session's
+    # cached history on every turn, so a long session reads near 0% there
+    # while compression is working; this is the figure the dashboard leads with.
+    if int(window.get("new_input_tokens", 0) or 0) > 0:
+        new_pct = float(window.get("new_input_savings_percent", 0.0) or 0.0)
+        line += f"  · of new input {new_pct:.1f}%"
+    return line
 
 
 #: What each pricing basis means for a reader deciding how much to trust the
@@ -72,6 +85,58 @@ _BASIS_NOTES = {
         "provider-level ratio rather than a per-model rate."
     ),
 }
+
+
+def _proxy_routing() -> dict[str, Any] | None:
+    """The running proxy's routing rollup (``/stats`` ``routing``), or None.
+
+    None when no proxy answers or it routes nothing: the ledger sections are
+    unaffected either way, so a stopped proxy only hides this section.
+    """
+    from headroom.install.health import probe_json
+    from headroom.install.state import list_manifests
+
+    from .doctor import resolve_probe_port
+
+    env_port = os.environ.get("HEADROOM_PORT")
+    requested = int(env_port) if env_port and env_port.isdigit() else None
+    port = resolve_probe_port(requested, list_manifests())
+    stats = probe_json(f"http://127.0.0.1:{port}/stats", timeout=2.0)
+    routing = stats.get("routing") if isinstance(stats, dict) else None
+    if not isinstance(routing, dict) or not routing.get("decisions"):
+        return None
+    return routing
+
+
+#: How the routing section names the provider's ``window`` (routing_stats contract).
+_ROUTING_WINDOWS = {"lifetime": "lifetime", "session": "this proxy session"}
+
+
+def _echo_routing(routing: dict[str, Any]) -> None:
+    # Per the routing_stats contract: a pair's `enforced` requests are the ones whose
+    # model was rewritten (holdouts and shadow decisions are not), and the saving is
+    # the sum of the pairs' signed `savings_usd`.
+    pairs = [p for p in routing.get("pairs") or [] if p.get("direction") != "same"]
+    moved = sum(int(p.get("enforced") or 0) for p in pairs)
+    saved = sum(float(p.get("savings_usd") or 0.0) for p in pairs)
+    window = _ROUTING_WINDOWS.get(str(routing.get("window")), "all decisions on record")
+    click.echo("")
+    click.echo(
+        f"Model routing ({window}): {moved:,} of {int(routing.get('decisions') or 0):,} "
+        f"requests moved · {_money(saved)} saved"
+    )
+    for pair in pairs:
+        pair_name = f"{pair.get('requested')} → {pair.get('served')}"
+        priced = (
+            _money(float(pair.get("savings_usd") or 0.0))
+            if int(pair.get("measured") or 0)
+            else "not priced (no usage reported)"
+        )
+        click.echo(f"  {pair_name:<44} {int(pair.get('enforced') or 0):,} moved  {priced}")
+    click.echo(
+        "  Saved = each moved request's usage priced on the model asked for, minus its cost "
+        "on the model served."
+    )
 
 
 def _echo_basis_note(basis: Any) -> None:
@@ -105,13 +170,20 @@ def savings(as_json: bool, days: int, reset: bool) -> None:
         return
 
     report = savings_ledger.aggregate_savings(retention_days=days)
+    routing = _proxy_routing()
 
     if as_json:
-        click.echo(json.dumps(report.to_dict(), indent=2))
+        data = report.to_dict()
+        if routing is not None:  # no router installed: not even an empty key
+            data["routing"] = routing
+        click.echo(json.dumps(data, indent=2))
         return
 
     lifetime = report.lifetime
     calls = int(lifetime.get("calls", 0) or 0)
+    if calls == 0 and routing is not None:
+        _echo_routing(routing)
+        return
     if calls == 0:
         click.echo("No savings recorded yet.")
         click.echo(
@@ -125,6 +197,11 @@ def savings(as_json: bool, days: int, reset: bool) -> None:
     click.echo(_window_line("Today", report.windows["today"]))
     click.echo(_window_line("Last 7 days", report.windows["last_7_days"]))
     click.echo(_window_line("Last 30 days", report.windows["last_30_days"]))
+    if any(int(w.get("new_input_tokens", 0) or 0) > 0 for w in report.windows.values()):
+        click.echo(
+            "  % is of all forwarded input (cached history recounted every turn); "
+            "'of new input' is of tokens that newly entered context."
+        )
 
     if report.by_model:
         click.echo("")
@@ -143,3 +220,6 @@ def savings(as_json: bool, days: int, reset: bool) -> None:
                 f"  {str(row['client']):<24} {int(row['calls']):,} calls · "
                 f"{_tokens(int(row['tokens_saved']))} tokens saved"
             )
+
+    if routing is not None:
+        _echo_routing(routing)

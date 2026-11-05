@@ -16,6 +16,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import uuid
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -386,7 +387,9 @@ class LocalBackend:
                 for rel in all_relationships:
                     source_name = rel.get("source", "").lower()
                     target_name = rel.get("target", "").lower()
-                    rel_type = rel.get("type", "related_to")
+                    # The memory_save tool schema names the key `relation`
+                    # (tools.py); direct callers and older docs use `type`.
+                    rel_type = rel.get("type") or rel.get("relation") or "related_to"
 
                     source_id = entity_id_map.get(source_name)
                     target_id = entity_id_map.get(target_name)
@@ -404,6 +407,19 @@ class LocalBackend:
 
         # Return primary memory
         return primary_memory
+
+    async def prepare_search_query(self, user_text: str, context: str) -> str:
+        """Apply the active local model's query window, including on cold backends."""
+        await self._ensure_initialized()
+        assert self._hierarchical_memory is not None
+        prepare: Callable[[str, str], Awaitable[str]] | None = getattr(
+            self._hierarchical_memory.embedder, "prepare_query", None
+        )
+        if prepare is not None:
+            return await prepare(user_text, context)
+        # Remote embedders do not expose their tokenizer; callers still supply
+        # character-bounded sources, without claiming a remote token guarantee.
+        return "\n".join(part for part in (user_text, context) if part)
 
     async def search_memories(
         self,

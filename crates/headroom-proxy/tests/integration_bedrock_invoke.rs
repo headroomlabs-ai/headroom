@@ -35,8 +35,7 @@
 
 mod common;
 
-use aws_credential_types::Credentials;
-use common::start_proxy_with_state;
+use common::{start_proxy_with_state, test_credentials};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::sync::{Arc, Mutex};
@@ -130,16 +129,6 @@ fn assert_byte_equal_sha256(inbound: &[u8], received: &[u8]) {
         inbound_hash, received_hash,
         "SHA-256 mismatch: inbound={inbound_hash}, upstream-received={received_hash}",
     );
-}
-
-fn test_credentials() -> Credentials {
-    Credentials::new(
-        "AKIAEXAMPLEAKIDFORTEST",
-        "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",
-        None,
-        None,
-        "test",
-    )
 }
 
 /// Boot a proxy pointed at the wiremock upstream as the Bedrock

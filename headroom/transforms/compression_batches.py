@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import hashlib
+import logging
 import re
 from dataclasses import dataclass
 
+from ..log_safety import describe_exception, safe_id
 from .compression_units import (
     _CCR_MARKER_RE,
     _LOSSY_UNMARKED_STRATEGIES,
@@ -14,10 +16,14 @@ from .compression_units import (
     RoutedCompressionUnit,
     TokenCounterLike,
     UnitCompressionResult,
+    _categorize_reason,
     _is_structured_shell_output,
+    check_unit_protection,
 )
 from .content_router import RouterCompressionResult
 from .tag_protector import protect_tags, restore_tags
+
+logger = logging.getLogger(__name__)
 
 DEFAULT_MAX_BATCH_BYTES = 2048
 DEFAULT_MAX_BATCH_UNITS = 16
@@ -100,7 +106,12 @@ def build_compression_batches(
     for entry in entries:
         entry_bytes = _text_bytes(entry.routed.unit.text)
         entry_key = _compatibility_key(entry)
-        if entry_bytes >= min_batch_bytes or entry_bytes > max_batch_bytes:
+        protection_reason = check_unit_protection(entry.routed.unit)
+        if (
+            protection_reason is not None
+            or entry_bytes >= min_batch_bytes
+            or entry_bytes > max_batch_bytes
+        ):
             flush()
             skipped.append(entry)
             continue
@@ -193,7 +204,7 @@ def _passthrough_batch_results(
     batch: CompressionBatch,
     *,
     tokenizer: TokenCounterLike,
-    reason: str,
+    reason: str | None = None,
     router_result: RouterCompressionResult | None = None,
 ) -> list[tuple[object, UnitCompressionResult]]:
     strategy = (
@@ -213,11 +224,13 @@ def _passthrough_batch_results(
                 tokens_saved=0,
                 transforms_applied=[],
                 strategy=strategy,
-                reason=reason,
+                reason=reason or check_unit_protection(entry.routed.unit) or "batch_invalid",
                 router_result=router_result,
                 text_bytes=_text_bytes(entry.routed.unit.text),
                 min_bytes=entry.routed.unit.min_bytes,
-                reason_category=reason,
+                reason_category=_categorize_reason(
+                    reason or check_unit_protection(entry.routed.unit) or "batch_invalid"
+                ),
             ),
         )
         for entry in batch.entries
@@ -230,8 +243,18 @@ def compress_batch_with_router(
     router: ContentRouter,
     tokenizer: TokenCounterLike,
     target_ratio: float | None = None,
+    deadline_started_at: float | None = None,
 ) -> list[tuple[object, UnitCompressionResult]]:
-    """Compress one tagged batch and split only structurally valid output."""
+    """Compress one tagged batch and split only structurally valid output.
+
+    ``deadline_started_at`` works as in ``compress_unit_with_router``.
+    """
+
+    if any(check_unit_protection(entry.routed.unit) is not None for entry in batch.entries):
+        return _passthrough_batch_results(batch, tokenizer=tokenizer)
+
+    if deadline_started_at is not None and not router.share_request_deadline(deadline_started_at):
+        return _passthrough_batch_results(batch, tokenizer=tokenizer, reason="deadline_exceeded")
 
     nonce = _batch_nonce(batch)
     batch_texts, marker_blocks = _protect_ccr_markers(batch, nonce)
@@ -247,7 +270,16 @@ def compress_batch_with_router(
             question=batch.entries[0].routed.unit.question,
             bias=batch.entries[0].routed.unit.bias,
         )
-    except Exception:
+    except Exception as e:
+        # The exception text can quote tool output, so no level logs it;
+        # describe_exception keeps only types and code locations.
+        logger.warning(
+            "Batch compression failed (%s); passing %d units through uncompressed",
+            safe_id(e),
+            len(batch.entries),
+        )
+        if logger.isEnabledFor(logging.DEBUG):
+            logger.debug("Batch compression failure detail: %s", describe_exception(e))
         return _passthrough_batch_results(
             batch,
             tokenizer=tokenizer,

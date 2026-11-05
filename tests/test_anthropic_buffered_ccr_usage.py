@@ -1,9 +1,9 @@
 """A buffered-CCR turn is a billed call and its usage must reach accounting.
 
 When a ``stream:true`` request carries the ``headroom_retrieve`` tool, the
-Anthropic handler rewrites it to ``stream:false`` upstream so it can resolve
-retrievals server-side, then re-synthesizes SSE for the client. That buffered
-response carries the same ``usage`` block any non-stream reply does, so the
+Anthropic handler buffers the whole reply (upstream streams it, the proxy folds
+the stream into one Message) so it can resolve retrievals server-side, then
+re-synthesizes SSE for the client. That buffered response carries the same ``usage`` block any non-stream reply does, so the
 provider's cache-read / cache-write / output counts must land on the outcome.
 
 If they don't, every cached token on the dominant Claude Code path is invisible:
@@ -15,6 +15,7 @@ compression savings on the buffered turns still count in full.
 
 from __future__ import annotations
 
+import json
 from typing import Any
 
 import httpx
@@ -25,6 +26,7 @@ pytest.importorskip("fastapi")
 
 from fastapi.testclient import TestClient  # noqa: E402
 
+from headroom.proxy.anthropic_wire import render_anthropic_sse_response  # noqa: E402
 from headroom.proxy.loopback_guard import require_loopback  # noqa: E402
 from headroom.proxy.server import ProxyConfig, create_app  # noqa: E402
 
@@ -139,15 +141,19 @@ def test_buffered_ccr_turn_records_provider_usage(monkeypatch, ccr_marker: str) 
     """A stream:true + headroom_retrieve turn must book the same usage block."""
     app, outcomes = _app_and_outcomes(monkeypatch)
     route = respx.post("https://api.anthropic.com/v1/messages").mock(
-        return_value=httpx.Response(200, json=_RESPONSE)
+        return_value=httpx.Response(
+            200,
+            content=b"".join(render_anthropic_sse_response(_RESPONSE)),
+            headers={"content-type": "text/event-stream"},
+        )
     )
 
     r = _post(app, stream=True, tools=[_RETRIEVE_TOOL], marker=ccr_marker)
 
     assert r.status_code == 200
-    # The handler must have buffered it: upstream saw stream:false.
+    # The handler buffered it: upstream was asked for the stream it then folded.
     sent = route.calls.last.request
-    assert b'"stream": false' in sent.content or b'"stream":false' in sent.content
+    assert json.loads(sent.content)["stream"] is True
 
     assert outcomes, "an outcome must be recorded"
     o = outcomes[-1]
@@ -179,3 +185,124 @@ def test_buffered_ccr_records_usage_with_compression_on(monkeypatch, ccr_marker:
         f"buffered-CCR turn dropped usage under compression: "
         f"cr={o.cache_read_tokens} cw={o.cache_write_tokens} out={o.output_tokens}"
     )
+
+
+@respx.mock
+def test_buffered_ccr_stream_gets_the_context_guard_nudge(monkeypatch, ccr_marker: str) -> None:
+    """The buffered-CCR stream is resynthesized from the parsed message, so the
+    streaming guard never sees it. Near the wall its gauge must move anyway, or
+    the client gets the raised compression budget without the warning."""
+    import json
+
+    from headroom.proxy.context_guard import REPORT_FRACTION, reset_learned_limits
+
+    reset_learned_limits()
+    app, _ = _app_and_outcomes(monkeypatch)
+    near_wall = {**_RESPONSE, "usage": {**_USAGE, "cache_read_input_tokens": 900_000}}
+    respx.post("https://api.anthropic.com/v1/messages").mock(
+        return_value=httpx.Response(200, json=near_wall)
+    )
+
+    r = _post(app, stream=True, tools=[_RETRIEVE_TOOL], marker=ccr_marker)
+
+    assert r.status_code == 200
+    start = next(
+        json.loads(line[len("data:") :])
+        for line in r.text.splitlines()
+        if line.startswith("data:") and '"message_start"' in line
+    )
+    usage = start["message"]["usage"]
+    reported = (
+        usage["input_tokens"]
+        + usage["cache_read_input_tokens"]
+        + usage["cache_creation_input_tokens"]
+    )
+    # claude-opus-5 is a 1M model; 909k forwarded is past the trigger.
+    assert reported == int(1_000_000 * REPORT_FRACTION)
+
+
+def _reported_input(usage: dict) -> int:
+    return (
+        usage["input_tokens"]
+        + usage["cache_read_input_tokens"]
+        + usage["cache_creation_input_tokens"]
+    )
+
+
+@respx.mock
+def test_non_stream_json_gets_the_context_guard_nudge(monkeypatch) -> None:
+    """The plain non-stream JSON body is nudged near the wall, like the stream."""
+    from headroom.proxy.context_guard import REPORT_FRACTION, reset_learned_limits
+
+    reset_learned_limits()
+    app, _ = _app_and_outcomes(monkeypatch)
+    near_wall = {**_RESPONSE, "usage": {**_USAGE, "cache_read_input_tokens": 900_000}}
+    respx.post("https://api.anthropic.com/v1/messages").mock(
+        return_value=httpx.Response(200, json=near_wall)
+    )
+
+    r = _post(app, stream=False, tools=None)
+
+    assert r.status_code == 200
+    usage = r.json()["usage"]
+    # claude-opus-5 is a 1M model; 909k forwarded is past the trigger.
+    assert _reported_input(usage) == int(1_000_000 * REPORT_FRACTION)
+    assert usage["output_tokens"] == _USAGE["output_tokens"]
+
+
+@respx.mock
+def test_non_stream_json_is_untouched_with_the_guard_off(monkeypatch) -> None:
+    from headroom.proxy.context_guard import reset_learned_limits
+
+    reset_learned_limits()
+    monkeypatch.setenv("HEADROOM_CONTEXT_GUARD", "0")
+    app, _ = _app_and_outcomes(monkeypatch)
+    near_wall = {**_RESPONSE, "usage": {**_USAGE, "cache_read_input_tokens": 900_000}}
+    respx.post("https://api.anthropic.com/v1/messages").mock(
+        return_value=httpx.Response(200, json=near_wall)
+    )
+
+    r = _post(app, stream=False, tools=None)
+
+    assert r.status_code == 200
+    assert r.json()["usage"] == near_wall["usage"]
+
+
+def test_buffered_nudge_follows_the_client_beta_not_the_sticky_one(monkeypatch) -> None:
+    """Session-sticky merging can keep context-1m outbound after the client
+    dropped it. The learned cap keys on the forwarded beta; the client's gauge
+    is its own 200k window, so the nudge targets 95% of 200k, not of 1M."""
+    from headroom.proxy.context_guard import (
+        REPORT_FRACTION,
+        credential_scope,
+        note_prompt_too_long,
+        reset_learned_limits,
+    )
+
+    reset_learned_limits()
+    beta_1m = "context-1m-2025-08-07"
+    note_prompt_too_long(
+        "claude-sonnet-4-5",
+        beta_1m,
+        "prompt is too long: 213021 tokens > 200000 maximum",
+        scope=credential_scope("sk-sticky"),
+    )
+    app, _ = _app_and_outcomes(monkeypatch)
+    proxy = app.state.proxy
+    monkeypatch.setattr(proxy.anthropic_provider, "get_context_limit", lambda _model: 200_000)
+    payload = {
+        **_RESPONSE,
+        "model": "claude-sonnet-4-5",
+        "usage": {**_USAGE, "cache_read_input_tokens": 185_000 - 300 - 8197},
+    }
+
+    changed = proxy._context_guard_nudge_message(
+        payload,
+        model="claude-sonnet-4-5",
+        headers={"x-api-key": "sk-sticky", "anthropic-beta": beta_1m},
+        request_id="test-sticky-buffered",
+        client_beta="",
+    )
+
+    assert changed
+    assert _reported_input(payload["usage"]) == int(200_000 * REPORT_FRACTION)
