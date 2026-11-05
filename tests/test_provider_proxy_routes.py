@@ -757,6 +757,7 @@ def test_openai_response_subpath_aliases_and_chatgpt_auth_use_expected_targets(m
     with TestClient(_app()) as client:
         fake = FakeAsyncClient()
         client.app.state.proxy.http_client = fake
+        client.app.state.proxy.http_client_h1 = fake
         assert client.get("/v1/codex/responses/items/resp_1").status_code == 200
         assert client.post("/backend-api/responses/items/resp_2").status_code == 200
         assert client.delete("/backend-api/codex/responses/items/resp_3").status_code == 200
@@ -1071,6 +1072,7 @@ def test_v1_models_fetches_codex_registry_under_chatgpt_auth(monkeypatch) -> Non
     with TestClient(_app()) as client:
         fake_http_client = FakeAsyncClient()
         client.app.state.proxy.http_client = fake_http_client
+        client.app.state.proxy.http_client_h1 = fake_http_client
         response = client.get(
             "/v1/models?client_version=0.135.0",
             headers={
@@ -1194,6 +1196,7 @@ def test_v1_models_get_single_dynamic_under_chatgpt_auth() -> None:
     with TestClient(_app()) as client:
         fake_http_client = FakeAsyncClient()
         client.app.state.proxy.http_client = fake_http_client
+        client.app.state.proxy.http_client_h1 = fake_http_client
         ok = client.get(
             "/v1/models/gpt-5.3-codex-spark",
             headers={
