@@ -9,6 +9,7 @@ Comprehensive tests covering:
 - Edge cases: Empty content, unavailable dependency, fallbacks
 """
 
+import decimal
 import sys
 import textwrap
 from unittest.mock import patch
@@ -2508,6 +2509,37 @@ class TestSemicolonSeparatedStatements:
             sys.path[:] = saved_path
             for name in set(sys.modules) - saved_modules:
                 del sys.modules[name]
+
+    def test_declaration_after_top_level_code_keeps_source_order(self):
+        """Declarations are assembled before the top-level code bucket, so a
+        class defined after executable code would move ahead of it. Safe
+        reassembly cannot be guaranteed, so the original snippet is kept."""
+        code = "import sys; marker = 1; import decimal\nclass Money(decimal.Decimal):\n    pass\n"
+        result = self._compressor().compress(code, language="python")
+
+        assert result.syntax_valid is True
+        assert result.compressed == code
+        namespace: dict[str, object] = {}
+        exec(result.compressed, namespace)
+        assert issubclass(namespace["Money"], decimal.Decimal)
+
+    def test_decorator_default_after_top_level_code_keeps_source_order(self):
+        """A decorator and a default expression are evaluated when the
+        function is defined, so they cannot move ahead of the import they
+        use."""
+        code = (
+            "import sys; marker = 1; import functools\n"
+            "@functools.lru_cache(maxsize=None)\n"
+            "def compute(value=marker):\n"
+            "    return value\n"
+        )
+        result = self._compressor().compress(code, language="python")
+
+        assert result.syntax_valid is True
+        assert result.compressed == code
+        namespace: dict[str, object] = {}
+        exec(result.compressed, namespace)
+        assert namespace["compute"]() == 1
 
     def test_function_body_keeps_each_line_once(self):
         """Both statements share one physical line. The line slice already

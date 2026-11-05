@@ -643,6 +643,10 @@ class CodeStructure:
     comments: list[str] = field(default_factory=list)
     top_level_code: list[str] = field(default_factory=list)
     other: list[str] = field(default_factory=list)
+    # Set when the fixed assembly order (declarations before top-level code)
+    # moves a definition across executable code, changing class bases,
+    # decorators, or default expressions evaluated at definition time.
+    reorder_unsafe: bool = False
 
 
 @dataclass
@@ -1611,6 +1615,14 @@ class CodeAwareCompressor(Transform):
         else:
             structure = self._extract_generic_structure(root, code)
 
+        # Declarations are assembled before the top-level code bucket, so
+        # executable code that precedes a definition would be moved after it.
+        # That changes definition-time behavior (class bases, decorators,
+        # default expressions), so keep the original instead of returning a
+        # semantically reordered result.
+        if structure.reorder_unsafe:
+            return code, structure, {}
+
         # Assemble compressed code
         compressed = self._assemble_compressed(structure, language)
 
@@ -1823,6 +1835,14 @@ class CodeAwareCompressor(Transform):
         # e.g. tree-sitter-c-sharp rejects top-level `#region` after a type
         # declaration, which would fail validation and forfeit compression.
         first_captured = min((r[0] for r in captured_byte_ranges), default=None)
+        declaration_nodes = (
+            lang_config.function_nodes
+            | lang_config.class_nodes
+            | lang_config.type_nodes
+            | (lang_config.container_node_types or frozenset())
+        )
+        if lang_config.decorator_node:
+            declaration_nodes = declaration_nodes | {lang_config.decorator_node}
         saw_top_level_code = False
         for child in root.children:
             child_range = (child.start_byte, child.end_byte)
@@ -1841,6 +1861,14 @@ class CodeAwareCompressor(Transform):
                     if entry is not None:
                         structure.top_level_code.append(entry)
                         demoted_import_starts.add(child.start_byte)
+                # Declarations are emitted before the top-level code bucket,
+                # so a definition after executable code would run before it.
+                if (
+                    language == CodeLanguage.PYTHON
+                    and saw_top_level_code
+                    and child.type in declaration_nodes
+                ):
+                    structure.reorder_unsafe = True
                 continue
             # In Python a `;` between two statements on one physical line
             # is a root-level anonymous token. Emitted as its own fragment
