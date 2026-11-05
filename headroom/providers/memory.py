@@ -97,9 +97,7 @@ def extract_memory_tool_calls(response: dict[str, Any], provider: str) -> list[d
                 # Filter to dict entries: a null / string element inside
                 # tool_calls (which downstream immediately calls `.get` on)
                 # would otherwise still crash detection.
-                tc_list = [
-                    tc for tc in (message.get("tool_calls") or []) if isinstance(tc, dict)
-                ]
+                tc_list = [tc for tc in (message.get("tool_calls") or []) if isinstance(tc, dict)]
                 if tc_list:
                     return tc_list
 
