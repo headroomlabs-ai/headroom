@@ -4,9 +4,11 @@ build-backend = "maturin"
 
 [project]
 name = "headroom-ai"
-version = "0.42.0"
-description = "The Context Optimization Layer for LLM Applications - Cut costs by 50-90%"
-readme = "README.md"
+version = "0.43.1"
+description = "Compress tool outputs, logs, JSON and chat history before each LLM call. Fewer input tokens, same answers; in-process, no API key. Library, proxy and MCP server."
+# PyPI renders this file; GitHub renders README.md. Keep the two in step on the
+# install commands and the savings claim (README.md "Proof" is the source).
+readme = "README-pypi.md"
 license = "Apache-2.0"
 requires-python = ">=3.11"
 authors = [
@@ -21,14 +23,26 @@ keywords = [
     "anthropic",
     "claude",
     "gpt",
-    "context",
-    "token",
-    "optimization",
-    "compression",
-    "caching",
+    "gemini",
+    "token-cost",
+    "reduce-tokens",
+    "input-tokens",
+    "context-window",
+    "token-budget",
+    "tool-output",
+    "tool-results",
+    "chat-history",
+    "trim-messages",
+    "context-compression",
+    "prompt-compression",
+    "context-engineering",
+    "agents",
+    "coding-agents",
+    "mcp",
     "proxy",
-    "ai",
-    "machine-learning",
+    "fastapi",
+    "langchain",
+    "litellm",
 ]
 classifiers = [
     "Development Status :: 4 - Beta",
@@ -62,7 +76,7 @@ dependencies = [
     # future patched one.
     "ast-grep-cli>=0.30.0,!=0.44.1",
     "pyyaml>=6.0",                # omp wrap: parse/merge omp's models.yml registry
-    "tomlkit>=0.15.0,<1.0",       # Loss-minimizing Codex config recovery
+    "tomlkit>=0.15.2,<1.0",       # Loss-minimizing Codex config recovery
     # Verify upstream TLS through the OS trust store (macOS Keychain, Windows
     # cert store), where IT installs corporate TLS-inspection roots (Zscaler,
     # Netskope). Pure Python, no deps; the same library pip uses by default.
@@ -94,9 +108,9 @@ proxy = [
     "orjson>=3.9.14; platform_python_implementation != 'PyPy'",
     "httpx[http2]>=0.24.0",
     "openai>=2.14.0",             # OpenAI API format support
-    # The server still uses the v1 low-level Server decorator API. Keep this
-    # cap until the SDK 2.x port lands (GH #2658 / regression GH #2977).
-    "mcp>=1.30.0,<2.0.0",         # MCP server (headroom_compress, retrieve, stats)
+    # SDK 2 constructor-callback API (GH #2658). 2.2.0 fixes CVE-2026-59951
+    # and CVE-2026-116684/116685/116686, which affect 2.0.0-2.1.x.
+    "mcp>=2.2.0,<3.0.0",          # MCP server (headroom_compress, retrieve, stats)
     "magika>=0.6.0; python_version<'3.14' or sys_platform != 'darwin' or platform_machine != 'x86_64'", # ML detection needs ORT wheels
     "zstandard>=0.20.0",          # Decompress zstd request bodies (Codex, etc.)
     "websockets>=13.0",           # WebSocket proxy for /v1/responses (Codex gpt-5.4+)
@@ -177,8 +191,10 @@ pytorch-mps = [
 ]
 # Semantic relevance scoring with embeddings.
 # Uses `fastembed` (BAAI/bge-small-en-v1.5 by default — 33M params,
-# 384 dims, ~67 MB quantized ONNX), loaded from a pinned
-# Qdrant/bge-small-en-v1.5-onnx-Q snapshot. Replaced sentence-transformers in
+# 384 dims, ~67 MB quantized ONNX). The Rust scorer (`fastembed` crate)
+# loads the same pinned Qdrant/bge-small-en-v1.5-onnx-Q snapshot, so both
+# languages run the same ONNX file; tests/parity/fixtures/embedding/
+# bounds the remaining ONNX Runtime drift. Replaced sentence-transformers in
 # Stage 3c.1 — fastembed is faster (~2-3x), smaller (no torch
 # dependency), and outranks all-MiniLM-L6-v2 on MTEB by ~6 points.
 # >=0.6.0 for `specific_model_path`, which the pinned-snapshot load needs.
@@ -261,7 +277,7 @@ autogen = [
 ]
 # MCP server for Claude Code integration
 mcp = [
-    "mcp>=1.30.0,<2.0.0",
+    "mcp>=2.2.0,<3.0.0",
     "httpx>=0.24.0",
     "starlette>=0.27.0",
     "uvicorn>=0.23.0,<1.0",
@@ -312,7 +328,7 @@ dev = [
     "pytest>=7.0.0",
     "pytest-cov>=4.0.0",
     "pytest-asyncio>=0.21.0",
-    "ruff==0.17.2",
+    "ruff==0.17.3",
     "mypy>=1.0.0",
     "pre-commit>=3.0.0",
     "openai>=1.0.0",
@@ -388,7 +404,7 @@ sandbox = [
 ]
 
 [project.scripts]
-headroom = "headroom.cli:main"
+headroom = "headroom.cli.main:main"
 headroom-cache-ttl = "headroom.cache.ttl_estimator:main"
 
 [project.urls]
