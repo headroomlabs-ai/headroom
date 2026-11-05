@@ -51,6 +51,7 @@ interface TransportState {
   originalChildExec: ChildExec;
   originalChildExecFile: ChildExecFile;
   originalChildFork: ChildFork;
+  originalEnv: Record<string, string | undefined>;
 }
 
 interface GlobalWithHeadroomTransport {
@@ -118,6 +119,23 @@ function withShimEnv(
     nextEnv.NODE_OPTIONS = withNodeImportOption(nextEnv.NODE_OPTIONS, shim);
   }
   return nextEnv;
+}
+
+// installProcessEnv writes these process-wide keys; uninstall puts them back.
+const PROCESS_ENV_KEYS = [PROXY_ENV, EXCLUDE_HOSTS_ENV, "NODE_OPTIONS"] as const;
+
+function snapshotProcessEnv(): Record<string, string | undefined> {
+  return Object.fromEntries(PROCESS_ENV_KEYS.map((key) => [key, process.env[key]]));
+}
+
+function restoreProcessEnv(saved: Record<string, string | undefined>): void {
+  for (const key of PROCESS_ENV_KEYS) {
+    if (saved[key] === undefined) {
+      delete process.env[key];
+    } else {
+      process.env[key] = saved[key];
+    }
+  }
 }
 
 function installProcessEnv(proxyUrl: string, excludeHosts: string[]): void {
@@ -262,8 +280,16 @@ function isRoutableUpstream(url: URL, proxy: URL, excludeHosts: string[]): boole
   return true;
 }
 
-function shouldRoute(url: URL, proxy: URL, excludeHosts: string[]): boolean {
-  return isRoutableUpstream(url, proxy, excludeHosts) && isLlmEndpointPath(url.pathname);
+// Every LLM endpoint matched above is a POST. A GET/DELETE/... to a path that
+// merely ends in /messages or /responses (chat APIs, form responses) is not an
+// LLM call and must reach its original URL (#4417). A missing method means
+// GET, matching fetch and node:http defaults.
+function isLlmMethod(method: unknown): boolean {
+  return typeof method === "string" && method.toUpperCase() === "POST";
+}
+
+function shouldRoute(url: URL, proxy: URL, excludeHosts: string[], method: unknown): boolean {
+  return isLlmMethod(method) && isRoutableUpstream(url, proxy, excludeHosts) && isLlmEndpointPath(url.pathname);
 }
 
 // OpenCode 2.x hands the plugin model base URLs (e.g.
@@ -359,7 +385,8 @@ function withRoutedFetchInput(
   sessionToken: string | undefined,
 ): FetchArgs {
   const upstream = requestUrl(input);
-  if (!shouldRoute(upstream, proxy, excludeHosts)) {
+  const method = init?.method ?? (input instanceof Request ? input.method : "GET");
+  if (!shouldRoute(upstream, proxy, excludeHosts, method)) {
     return [input, init];
   }
 
@@ -453,7 +480,7 @@ function routedNodeOptions(
   excludeHosts: string[],
   sessionToken: string | undefined,
 ): Record<string, unknown> | undefined {
-  if (!parts.url || !shouldRoute(parts.url, proxy, excludeHosts)) {
+  if (!parts.url || !shouldRoute(parts.url, proxy, excludeHosts, parts.options.method ?? "GET")) {
     return undefined;
   }
 
@@ -562,6 +589,7 @@ export function installHeadroomTransport(options: InstallOptions): () => void {
     originalChildExec: childProcess.exec,
     originalChildExecFile: childProcess.execFile,
     originalChildFork: childProcess.fork,
+    originalEnv: snapshotProcessEnv(),
   };
 
   setState(state);
@@ -611,6 +639,7 @@ export function uninstallHeadroomTransport(): void {
   childProcess.exec = state.originalChildExec;
   childProcess.execFile = state.originalChildExecFile;
   childProcess.fork = state.originalChildFork;
+  restoreProcessEnv(state.originalEnv);
   syncBuiltinESMExports();
   setState(undefined);
 }

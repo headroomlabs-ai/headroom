@@ -233,6 +233,40 @@ describe("Headroom OpenCode transport", () => {
     globalThis.fetch = originalFetch;
   });
 
+  it("passes non-POST fetches to /messages and /responses suffix paths through unchanged (#4417)", async () => {
+    const originalFetch = globalThis.fetch;
+    const fetchMock = vi.fn(async (..._args: FetchCall) => new Response("ok"));
+    globalThis.fetch = fetchMock as unknown as typeof fetch;
+
+    installHeadroomTransport({ proxyUrl: "http://127.0.0.1:8787/v1" });
+
+    await fetch("https://chat.example.com/api/v2/messages");
+    await fetch("https://forms.example.com/forms/123/responses", { method: "GET" });
+    await fetch(new Request("https://chat.example.com/api/v2/messages", { method: "DELETE" }));
+    await fetch("https://api.anthropic.com/v1/messages", { method: "post" });
+
+    expect(fetchMock).toHaveBeenCalledTimes(4);
+    expect(fetchMock.mock.calls[0][0]).toBe("https://chat.example.com/api/v2/messages");
+    expect(fetchMock.mock.calls[1][0]).toBe("https://forms.example.com/forms/123/responses");
+    expect(new Headers(fetchMock.mock.calls[1][1]?.headers).get("x-headroom-original-path")).toBeNull();
+    expect((fetchMock.mock.calls[2][0] as Request).url).toBe("https://chat.example.com/api/v2/messages");
+    expect(fetchMock.mock.calls[3][0]).toEqual(new URL("http://127.0.0.1:8787/v1/messages"));
+
+    globalThis.fetch = originalFetch;
+  });
+
+  it("leaves non-POST Node https.request calls to LLM-suffix paths alone (#4417)", () => {
+    installHeadroomTransport({ proxyUrl: "http://127.0.0.1:8787/v1" });
+    const req = https.request("https://chat.example.com/api/v2/messages", { method: "GET" });
+    req.on("error", () => {});
+    expect(req.host).toBe("chat.example.com");
+    req.destroy();
+    const req2 = https.request("https://forms.example.com/forms/123/responses");
+    req2.on("error", () => {});
+    expect(req2.host).toBe("forms.example.com");
+    req2.destroy();
+  });
+
   it("routes Gemini native :generateContent and :streamGenerateContent through the proxy", async () => {
     const originalFetch = globalThis.fetch;
     const fetchMock = vi.fn(async (..._args: FetchCall) => new Response("ok"));
@@ -471,6 +505,39 @@ describe("Headroom OpenCode transport", () => {
         delete process.env.HEADROOM_OPENCODE_TRANSPORT_PROXY_URL;
       } else {
         process.env.HEADROOM_OPENCODE_TRANSPORT_PROXY_URL = originalProxyUrl;
+      }
+      uninstallHeadroomTransport();
+    }
+  });
+
+  it("restores the process env keys it set once the last install is disposed", () => {
+    const keys = ["NODE_OPTIONS", "HEADROOM_OPENCODE_TRANSPORT_PROXY_URL", "HEADROOM_OPENCODE_EXCLUDE_HOSTS"] as const;
+    const saved = Object.fromEntries(keys.map((key) => [key, process.env[key]]));
+
+    try {
+      process.env.NODE_OPTIONS = "--trace-warnings";
+      delete process.env.HEADROOM_OPENCODE_TRANSPORT_PROXY_URL;
+      process.env.HEADROOM_OPENCODE_EXCLUDE_HOSTS = "keep.example.com";
+
+      const first = installHeadroomTransport({ proxyUrl: "http://127.0.0.1:8787/v1", excludeHosts: ["a.example.com"] });
+      const second = installHeadroomTransport({ proxyUrl: "http://127.0.0.1:8787/v1", excludeHosts: ["a.example.com"] });
+      expect(process.env.HEADROOM_OPENCODE_TRANSPORT_PROXY_URL).toBe("http://127.0.0.1:8787/v1");
+
+      // A nested dispose keeps the env: the transport is still installed.
+      first();
+      expect(process.env.HEADROOM_OPENCODE_TRANSPORT_PROXY_URL).toBe("http://127.0.0.1:8787/v1");
+
+      second();
+      expect(process.env.NODE_OPTIONS).toBe("--trace-warnings");
+      expect(process.env.HEADROOM_OPENCODE_TRANSPORT_PROXY_URL).toBeUndefined();
+      expect(process.env.HEADROOM_OPENCODE_EXCLUDE_HOSTS).toBe("keep.example.com");
+    } finally {
+      for (const key of keys) {
+        if (saved[key] === undefined) {
+          delete process.env[key];
+        } else {
+          process.env[key] = saved[key];
+        }
       }
       uninstallHeadroomTransport();
     }
@@ -772,6 +839,7 @@ describe("Headroom OpenCode transport", () => {
       expect(fetchMock.mock.calls[1][0]).toEqual(new URL("http://127.0.0.1:8787/v1/messages"));
       expect(process.env.HEADROOM_OPENCODE_EXCLUDE_HOSTS).toBe("opencode.ai");
     } finally {
+      uninstallHeadroomTransport();
       globalThis.fetch = originalFetch;
       if (originalExclude === undefined) {
         delete process.env.HEADROOM_OPENCODE_EXCLUDE_HOSTS;
@@ -871,6 +939,8 @@ describe("Headroom OpenCode transport", () => {
         expect(options.env.HEADROOM_OPENCODE_TRANSPORT_PROXY_URL).toBe("http://127.0.0.1:8787/v1");
       }
     } finally {
+      // Dispose first: uninstall now restores the env it saved at install time.
+      uninstallHeadroomTransport();
       globalThis.fetch = originalFetch;
       childProcess.spawn = originalSpawn;
       if (originalExclude === undefined) {
