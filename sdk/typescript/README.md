@@ -384,6 +384,7 @@ const result = await compress(messages, {
   retries: 1,                         // retry on transient failures (default)
   tokenBudget: 4000,                  // compress to fit this limit
   hooks: new MyHooks(),               // pre/post compression hooks
+  format: 'vercel',                   // declare the input format; skips autodetection
 });
 ```
 
