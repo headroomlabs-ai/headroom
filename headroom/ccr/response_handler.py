@@ -24,6 +24,7 @@ from headroom.proxy.anthropic_wire import AnthropicSSEEnvelope
 from ..cache.compression_store import format_retrieval_miss_detail, get_compression_store
 from .tool_calls import (
     CCRToolCall,
+    drop_tool_calls,
     extract_tool_calls,
     has_ccr_tool_calls,
     is_ccr_tool_call,
@@ -51,6 +52,20 @@ logger = logging.getLogger(__name__)
 RESIDUAL_CCR_RESOLVED = "resolved"
 RESIDUAL_CCR_SKIPPED_MIXED = "skipped_mixed_tools"
 RESIDUAL_CCR_ERROR = "error"
+
+
+def _openai_message_extras(message: dict[str, Any]) -> dict[str, Any]:
+    """The fields a provider put on a chat message besides the standard three.
+
+    Whoever replays the turn may have to send these back (DeepSeek's
+    ``reasoning_content``, OpenRouter's ``reasoning_details``) and gets rejected
+    if they went missing. Empty ones (``refusal: null``) stay behind.
+    """
+    return {
+        key: value
+        for key, value in message.items()
+        if key not in ("role", "content", "tool_calls") and value
+    }
 
 
 @dataclass
@@ -116,6 +131,23 @@ class CCRResponseHandler:
         self.config = config or ResponseHandlerConfig()
         self._retrieval_count = 0
         self._retrieval_count_lock = __import__("threading").Lock()
+
+    def serve_withheld_retrievals(self, tool_calls: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        """Run Anthropic ``headroom_retrieve`` calls withheld from a stream.
+
+        Returns one ``tool_result`` block per call that names a hash, in call
+        order, for the continuation round the streaming path sends upstream.
+        A call without a parsable hash gets no result, so the caller can tell
+        the round cannot be replayed.
+        """
+        ccr_calls, _ = self._parse_ccr_tool_calls({"content": tool_calls}, "anthropic")
+        if not ccr_calls:
+            return []
+        with self._retrieval_count_lock:
+            self._retrieval_count += len(ccr_calls)
+        results = [self._execute_retrieval(call) for call in ccr_calls]
+        message = self._create_tool_result_message(results, "anthropic")
+        return list(message.get("content", []))
 
     def has_ccr_tool_calls(
         self,
@@ -401,6 +433,7 @@ class CCRResponseHandler:
             first = choices[0] if isinstance(choices, list) and choices else {}
             message = first.get("message", {}) if isinstance(first, dict) else {}
             return {
+                **_openai_message_extras(message),
                 "role": "assistant",
                 "content": message.get("content"),
                 "tool_calls": message.get("tool_calls"),
@@ -482,18 +515,41 @@ class CCRResponseHandler:
                 # No CCR tool calls, we're done
                 break
 
-            # If the model called CCR alongside non-CCR tools, we cannot build
-            # a valid continuation — every tool_use in the assistant message
-            # requires a matching tool_result, but we only have CCR results.
-            # Skip CCR handling and let the client resolve all tool calls.
+            # The model called CCR alongside client tools. The client has no
+            # headroom_retrieve (Claude Code answers "No such tool available:
+            # headroom_retrieve", so the model never gets the content), and a
+            # continuation needs a tool_result for every tool_use. The client
+            # calls have not run yet, so drop them and serve the retrieval now;
+            # the model decides again, content in hand, in the continuation.
+            # That continuation replaces this turn whatever it does: re-issue
+            # the calls, change them or drop them. Only a failed continuation
+            # hands this turn back (below), since the model made no newer
+            # decision. A CCR-named call without a valid hash, or a provider
+            # where dropping a sibling is not safe (see drop_tool_calls), keeps
+            # the turn as it is for the client to resolve.
+            mixed_turn: dict[str, Any] | None = None
             if other_calls:
-                logger.warning(
-                    "CCR: Skipping CCR handling — model called %d non-CCR tool(s) "
-                    "alongside headroom_retrieve. Cannot create a valid continuation "
-                    "without results for the other tools. Client must handle all tool calls.",
+                trimmed = (
+                    current_response
+                    if any(is_ccr_tool_call(c) for c in other_calls)
+                    else drop_tool_calls(current_response, provider, other_calls)
+                )
+                if trimmed is current_response:
+                    logger.warning(
+                        "CCR: Skipping CCR handling — model called %d non-CCR tool(s) "
+                        "alongside headroom_retrieve. Cannot create a valid continuation "
+                        "without results for the other tools. Client must handle all tool calls.",
+                        len(other_calls),
+                    )
+                    break
+                logger.info(
+                    "CCR: model called headroom_retrieve alongside %d client tool(s); "
+                    "serving the retrieval and dropping the unrun client call(s) "
+                    "for the model to re-issue",
                     len(other_calls),
                 )
-                break
+                mixed_turn = current_response
+                current_response = trimmed
 
             rounds += 1
             with self._retrieval_count_lock:
@@ -546,7 +602,11 @@ class CCRResponseHandler:
                 # entirely (#3129).
                 logger.error("CCR: Continuation API call failed: %s: %r", type(e).__name__, e)
                 # Return the response we had (with unhandled CCR calls)
-                # The client will see the tool_use and might handle it differently
+                # The client will see the tool_use and might handle it differently.
+                # For a mixed turn that is the model's own turn, client calls
+                # included (#839), never the trimmed one that lost them.
+                if mixed_turn is not None:
+                    current_response = mixed_turn
                 break
 
         if rounds >= self.config.max_retrieval_rounds:
@@ -925,7 +985,8 @@ class StreamingCCRHandler:
             response["usage"] = usage
         return response
 
-    def _openai_response_to_chunks(self, response: dict[str, Any]) -> list[bytes]:
+    @staticmethod
+    def _openai_response_to_chunks(response: dict[str, Any]) -> list[bytes]:
         """Split a non-streaming ``chat.completion`` body into SSE chunk frames.
 
         A streaming client reads ``choices[].delta``, not ``choices[].message``.
@@ -942,10 +1003,7 @@ class StreamingCCRHandler:
             message = {}
         finish_reason = choice.get("finish_reason") or "stop"
 
-        base: dict[str, Any] = {"object": "chat.completion.chunk"}
-        for key in ("id", "created", "model", "system_fingerprint"):
-            if response.get(key) is not None:
-                base[key] = response[key]
+        base = StreamingCCRHandler._openai_chunk_envelope(response)
 
         def frame(delta: dict[str, Any], reason: str | None) -> bytes:
             payload = {
@@ -955,6 +1013,10 @@ class StreamingCCRHandler:
             return f"data: {json.dumps(payload)}\n\n".encode()
 
         frames = [frame({"role": message.get("role") or "assistant"}, None)]
+
+        extras = _openai_message_extras(message)
+        if extras:
+            frames.append(frame(extras, None))
 
         content = message.get("content")
         if content:
@@ -973,10 +1035,15 @@ class StreamingCCRHandler:
                         {
                             "tool_calls": [
                                 {
+                                    # Spread first: gateways hang opaque fields
+                                    # off a tool call that must survive the
+                                    # round trip (Gemini's thought signatures).
+                                    **tool_call,
                                     "index": index,
                                     "id": tool_call.get("id", ""),
                                     "type": tool_call.get("type", "function"),
                                     "function": {
+                                        **function,
                                         "name": function.get("name", ""),
                                         "arguments": function.get("arguments", ""),
                                     },
@@ -988,6 +1055,31 @@ class StreamingCCRHandler:
                 )
 
         frames.append(frame({}, finish_reason))
+        return frames
+
+    @staticmethod
+    def _openai_chunk_envelope(response: dict[str, Any]) -> dict[str, Any]:
+        """The fields every ``chat.completion.chunk`` frame of a reply repeats."""
+        envelope: dict[str, Any] = {"object": "chat.completion.chunk"}
+        for key in ("id", "created", "model", "system_fingerprint"):
+            if response.get(key) is not None:
+                envelope[key] = response[key]
+        return envelope
+
+    @staticmethod
+    def openai_chat_sse_frames(response: dict[str, Any], *, include_usage: bool) -> list[bytes]:
+        """Render a whole ``chat.completion`` body as the SSE a stream would be.
+
+        ``include_usage`` adds the trailing usage-only chunk (``choices: []``)
+        that ``stream_options.include_usage`` asks for.
+        """
+        frames = StreamingCCRHandler._openai_response_to_chunks(response)
+        usage = response.get("usage")
+        if include_usage and usage is not None:
+            envelope = StreamingCCRHandler._openai_chunk_envelope(response)
+            payload = {**envelope, "choices": [], "usage": usage}
+            frames.append(f"data: {json.dumps(payload)}\n\n".encode())
+        frames.append(b"data: [DONE]\n\n")
         return frames
 
     async def _response_to_sse(

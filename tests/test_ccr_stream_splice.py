@@ -36,6 +36,100 @@ def _stored_hash() -> str:
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("client_first", [False, True])
+async def test_responses_mixed_turn_retains_client_call_without_private_call(client_first):
+    key = _stored_hash()
+    client = {
+        "id": "client-old",
+        "call_id": "call-old",
+        "type": "function_call",
+        "name": "write_file",
+        "arguments": '{"path":"a"}',
+    }
+    private = {
+        "id": "private",
+        "call_id": "call-private",
+        "type": "function_call",
+        "name": "headroom_retrieve",
+        "arguments": json.dumps({"hash": key}),
+    }
+    items = [client, private] if client_first else [private, client]
+    initial = {
+        "id": "initial",
+        "output": items,
+        "status": "completed",
+        "usage": {"input_tokens": 1, "output_tokens": 2},
+    }
+    events = [_event({"type": "response.created", "response": {"id": "initial", "output": []}})]
+    for index, item in enumerate(items):
+        events.append(
+            _event({"type": "response.output_item.added", "output_index": index, "item": item})
+        )
+        events.append(
+            _event({"type": "response.output_item.done", "output_index": index, "item": item})
+        )
+    events.extend(
+        [_event({"type": "response.completed", "response": initial}), b"data: [DONE]\n\n"]
+    )
+    calls = []
+
+    async def continuation(messages, tools):
+        calls.append(messages)
+        return {
+            "id": "final",
+            "status": "completed",
+            "output": [{**client, "id": "client-new", "call_id": "call-new"}],
+            "usage": {"input_tokens": 2, "output_tokens": 1},
+        }
+
+    interceptor = EventLevelCCRInterceptor(
+        CCRResponseHandler(), provider="openai_responses", render_response=_openai_responses_to_sse
+    )
+    output = b"".join(
+        [chunk async for chunk in interceptor.process(_chunks(events), [], None, continuation)]
+    )
+    assert len(calls) == 0
+    assert b"headroom_retrieve" not in output
+    assert b"client-old" in output
+    assert b"client-new" not in output
+    completed = [
+        json.loads(line[6:])
+        for line in output.splitlines()
+        if line.startswith(b"data: {") and json.loads(line[6:]).get("type") == "response.completed"
+    ]
+    assert [item["id"] for item in completed[0]["response"]["output"]] == ["client-old"]
+
+
+@pytest.mark.asyncio
+async def test_client_tool_tail_overflow_fails_without_exposing_unrun_call(monkeypatch):
+    monkeypatch.setattr(stream_splice_module, "MAX_CCR_STREAM_RECONSTRUCTION_BYTES", 100)
+    events = [
+        _event(
+            {
+                "type": "content_block_start",
+                "index": 0,
+                "content_block": {
+                    "type": "tool_use",
+                    "id": "unrun-client",
+                    "name": "write_file",
+                    "input": {"payload": "x" * 200},
+                },
+            }
+        )
+    ]
+    interceptor = EventLevelCCRInterceptor(
+        CCRResponseHandler(), provider="anthropic", render_response=lambda response: []
+    )
+    continuation = AsyncMock()
+    output = b"".join(
+        [chunk async for chunk in interceptor.process(_chunks(events), [], None, continuation)]
+    )
+    assert b"bounded continuation window" in output
+    assert b"unrun-client" not in output
+    continuation.assert_not_awaited()
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("private_position", [0, 1])
 async def test_responses_hidden_retrieval_keeps_visible_output_indexes_contiguous(private_position):
     key = _stored_hash()
@@ -309,7 +403,10 @@ async def test_responses_splices_continuation_and_combines_terminal_output():
 
 
 @pytest.mark.asyncio
-async def test_anthropic_mixed_private_and_client_tools_preserves_only_client_tool():
+@pytest.mark.parametrize("client_first", [False, True])
+async def test_anthropic_mixed_private_and_client_tools_serves_retrieval_and_reissues_client(
+    client_first,
+):
     hash_key = _stored_hash()
     upstream = [
         _event(
@@ -365,27 +462,43 @@ async def test_anthropic_mixed_private_and_client_tools_preserves_only_client_to
         _event({"type": "message_stop"}),
     ]
 
-    async def unexpected_continuation(messages, tools):  # noqa: ANN001
-        raise AssertionError("mixed client/private tools must return control to the client")
+    if client_first:
+        upstream = upstream[3:6] + upstream[:3] + upstream[6:]
+    continuation_calls = []
+
+    async def continuation(messages, tools):  # noqa: ANN001
+        continuation_calls.append(messages)
+        return {
+            "id": "continued",
+            "type": "message",
+            "role": "assistant",
+            "content": [
+                {
+                    "type": "tool_use",
+                    "id": "tool-client-new",
+                    "name": "write_file",
+                    "input": {"path": "a"},
+                }
+            ],
+            "stop_reason": "tool_use",
+            "usage": {"output_tokens": 4},
+        }
 
     interceptor = EventLevelCCRInterceptor(
         CCRResponseHandler(),
         provider="anthropic",
-        render_response=lambda response: [],
+        render_response=lambda response: StreamingMixin()._response_to_sse(response, "anthropic"),
     )
     output = b"".join(
-        [
-            chunk
-            async for chunk in interceptor.process(
-                _chunks(upstream), [], None, unexpected_continuation
-            )
-        ]
+        [chunk async for chunk in interceptor.process(_chunks(upstream), [], None, continuation)]
     )
 
     assert b"headroom_retrieve" not in output
     assert b"tool-ccr" not in output
     assert b"write_file" in output
-    assert b"tool-client" in output
+    assert len(continuation_calls) == 1
+    assert b'"tool-client"' not in output
+    assert b"tool-client-new" in output
     assert b'"stop_reason": "tool_use"' in output
     assert output.count(b"event: message_stop") == 1
 
@@ -555,6 +668,7 @@ async def test_large_ordinary_stream_stays_live_after_reconstruction_window_clos
 @pytest.mark.parametrize(
     "names",
     [
+        ["write_file", "read_file"],
         ["headroom_retrieve", "write_file"],
         ["write_file", "headroom_retrieve", "read_file"],
         ["headroom_retrieve", "write_file", "headroom_retrieve", "read_file"],
@@ -624,7 +738,9 @@ async def test_anthropic_visible_indexes_are_consumable_by_sdk(names):
         raise AssertionError("client-owned tool calls must return to the client")
 
     interceptor = EventLevelCCRInterceptor(
-        CCRResponseHandler(), provider="anthropic", render_response=lambda response: []
+        CCRResponseHandler(),
+        provider="anthropic",
+        render_response=lambda response: StreamingMixin()._response_to_sse(response, "anthropic"),
     )
     output = b"".join(
         [

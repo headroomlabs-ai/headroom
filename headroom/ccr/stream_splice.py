@@ -54,7 +54,11 @@ class EventLevelCCRInterceptor:
         visible_indexes: dict[int, int] = {}
         private_item_ids: set[str] = set()
         detected_private = False
-        detected_client_tool = False
+        client_indexes: set[int] = set()
+        client_item_ids: set[str] = set()
+        held_client_tail: list[bytes] = []
+        client_tail_started = False
+        client_tail_bytes = 0
         held_terminal: list[bytes] = []
         max_visible_index = -1
         max_sequence = -1
@@ -70,6 +74,16 @@ class EventLevelCCRInterceptor:
                         reconstruction.extend(raw_event)
                 event = _parse_sse_event(raw_event)
                 if event is None:
+                    if client_tail_started:
+                        client_tail_bytes += len(raw_event)
+                        if client_tail_bytes > MAX_CCR_STREAM_RECONSTRUCTION_BYTES:
+                            yield _error_event(
+                                self.provider,
+                                "CCR client-tool stream exceeded bounded continuation window.",
+                            )
+                            return
+                        held_client_tail.append(raw_event)
+                        continue
                     if (
                         self.provider == "openai_responses"
                         and detected_private
@@ -85,6 +99,52 @@ class EventLevelCCRInterceptor:
                 if isinstance(sequence, int):
                     max_sequence = max(max_sequence, sequence)
 
+                # Client calls cannot execute before the turn ends. A mixed
+                # turn first serves retrieval and re-issues those unrun calls.
+                if self.provider == "anthropic":
+                    block = event.get("content_block")
+                    index = event.get("index")
+                    if event_type == "content_block_start" and isinstance(block, dict):
+                        if block.get("type") == "tool_use":
+                            if block.get("name") == "headroom_retrieve":
+                                detected_private = True
+                                if isinstance(index, int):
+                                    private_indexes.add(index)
+                            else:
+                                client_tail_started = True
+                                if isinstance(index, int):
+                                    client_indexes.add(index)
+                else:
+                    item = event.get("item")
+                    if isinstance(item, dict) and item.get("type") == "function_call":
+                        item_id = str(item.get("id") or item.get("call_id") or "")
+                        output_index = event.get("output_index")
+                        if item.get("name") == "headroom_retrieve":
+                            detected_private = True
+                            if item_id:
+                                private_item_ids.add(item_id)
+                            if isinstance(output_index, int):
+                                private_indexes.add(output_index)
+                        else:
+                            if item_id:
+                                client_item_ids.add(item_id)
+                            if isinstance(output_index, int):
+                                client_indexes.add(output_index)
+                    if event_type == "response.completed" and isinstance(
+                        event.get("response"), dict
+                    ):
+                        completed_response = event["response"]
+                if client_tail_started:
+                    client_tail_bytes += len(raw_event)
+                    if client_tail_bytes > MAX_CCR_STREAM_RECONSTRUCTION_BYTES:
+                        yield _error_event(
+                            self.provider,
+                            "CCR client-tool stream exceeded bounded continuation window.",
+                        )
+                        return
+                    held_client_tail.append(raw_event)
+                    continue
+
                 if self.provider == "anthropic":
                     index = event.get("index")
                     if event_type == "content_block_start":
@@ -95,7 +155,6 @@ class EventLevelCCRInterceptor:
                                 if isinstance(index, int):
                                     private_indexes.add(index)
                                 continue
-                            detected_client_tool = True
                     if isinstance(index, int) and index in private_indexes:
                         continue
                     if isinstance(index, int):
@@ -121,7 +180,6 @@ class EventLevelCCRInterceptor:
                             if isinstance(output_index, int):
                                 private_indexes.add(output_index)
                             continue
-                        detected_client_tool = True
                     item_id = str(event.get("item_id") or "")
                     if item_id and item_id in private_item_ids:
                         continue
@@ -158,6 +216,54 @@ class EventLevelCCRInterceptor:
                 else:
                     reconstruction.clear()
                     reconstruction_available = False
+            if client_tail_started:
+                client_tail_bytes += len(raw_event)
+                if client_tail_bytes > MAX_CCR_STREAM_RECONSTRUCTION_BYTES:
+                    yield _error_event(
+                        self.provider,
+                        "CCR client-tool stream exceeded bounded continuation window.",
+                    )
+                    return
+                held_client_tail.append(raw_event)
+            else:
+                for scrubbed in _scrub_event(raw_event):
+                    yield scrubbed
+
+        for raw_event in held_client_tail:
+            event = _parse_sse_event(raw_event)
+            if event is None:
+                if (
+                    self.provider == "openai_responses"
+                    and detected_private
+                    and _is_done_event(raw_event)
+                ):
+                    held_terminal.append(raw_event)
+                    continue
+                if not _is_done_event(raw_event):
+                    yield _error_event(self.provider, "Unable to reconstruct client tool stream.")
+                    return
+            else:
+                event_type = str(event.get("type") or "")
+                index_field = "index" if self.provider == "anthropic" else "output_index"
+                index = event.get(index_field)
+                if detected_private and (
+                    isinstance(index, int)
+                    and (index in private_indexes or index in client_indexes)
+                    or str(event.get("item_id") or "") in private_item_ids | client_item_ids
+                ):
+                    continue
+                if detected_private and event_type in {
+                    "message_delta",
+                    "message_stop",
+                    "response.completed",
+                }:
+                    held_terminal.append(raw_event)
+                    continue
+                if isinstance(index, int):
+                    visible_indexes.setdefault(index, len(visible_indexes))
+                    event[index_field] = visible_indexes[index]
+                    max_visible_index = max(max_visible_index, visible_indexes[index])
+                raw_event = _encode_sse_event(event)
             for scrubbed in _scrub_event(raw_event):
                 yield scrubbed
 
@@ -179,14 +285,16 @@ class EventLevelCCRInterceptor:
             reconstructed = completed_response or {}
 
         residual = self.response_handler.residual_ccr_status(reconstructed, self.provider)
-        if residual == RESIDUAL_CCR_SKIPPED_MIXED or detected_client_tool:
+        if self.provider == "openai_responses" and residual == RESIDUAL_CCR_SKIPPED_MIXED:
+            # This provider's shared handler deliberately does not drop sibling
+            # calls. Preserve that contract while keeping retrieval private.
             for terminal in held_terminal:
                 for scrubbed in _scrub_event(
                     _strip_private_from_terminal(terminal, provider=self.provider)
                 ):
                     yield scrubbed
             return
-        if residual == RESIDUAL_CCR_ERROR:
+        if residual in {RESIDUAL_CCR_ERROR, RESIDUAL_CCR_SKIPPED_MIXED}:
             final_response = await self.response_handler.handle_response(
                 reconstructed,
                 messages,

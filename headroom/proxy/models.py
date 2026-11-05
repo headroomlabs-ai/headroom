@@ -150,6 +150,9 @@ class ProxyConfig:
     # Server
     host: str = "127.0.0.1"
     port: int = 8787
+    # Serve on this Unix domain socket instead of host:port. POSIX only; see
+    # headroom/proxy/uds.py for why a socket transport exists at all (GH #1779).
+    uds: str | None = None
     # Resolved at this configuration boundary and then injected unchanged.
     rollout: RolloutSnapshot | None = None
     anthropic_api_url: str | None = None  # Custom Anthropic API URL override
@@ -287,8 +290,10 @@ class ProxyConfig:
     # prefix-cache zone. Enable for OpenAI/Azure chat workloads where the bulk
     # of input lives in user messages (pasted code/text, RAG context) and the
     # router would otherwise have nothing eligible to compress.
-    # CLI: --compress-user-messages; env: HEADROOM_COMPRESS_USER_MESSAGES=1.
-    compress_user_messages: bool = False
+    # None follows the savings profile (`coding` turns it on); an explicit
+    # True/False overrides the profile either way.
+    # CLI: --compress-user-messages; env: HEADROOM_COMPRESS_USER_MESSAGES=1/0.
+    compress_user_messages: bool | None = None
     # Named savings policy shared across Claude/Codex/Cursor proxy handlers.
     # CLI/env: HEADROOM_SAVINGS_PROFILE=agent-90.
     savings_profile: str | None = None
@@ -311,8 +316,8 @@ class ProxyConfig:
     # Read lifecycle management
     read_lifecycle: bool = True
 
-    # Mechanism B: activity-based read maturation (hold fresh Reads out of
-    # the provider prefix cache; compress once their file quiesces).
+    # Mechanism B: activity-based read maturation (hold fresh Reads
+    # verbatim; compress once their file quiesces, unless already cached).
     # Experimental — default off. CLI: --read-maturation;
     # env: HEADROOM_READ_MATURATION=1
     read_maturation: bool = False
@@ -421,6 +426,16 @@ class ProxyConfig:
     # stream-idle watchdog fires. 0 or less disables the keepalive entirely.
     # See headroom/proxy/buffered_ccr_response.py (#3079).
     buffered_ccr_grace_seconds: float = DEFAULT_BUFFERED_CCR_GRACE_SECONDS
+    # Buffered CCR for /v1/chat/completions streaming. Without it this is the
+    # one streaming path with no way to answer a retrieval: content carries
+    # markers but `headroom_retrieve` is withheld, and the tool toggles in and
+    # out for sessions that mix streaming with non-streaming turns, busting the
+    # tools cache segment each way. Enabling it flips turns that carry a
+    # redeemable marker to `stream: false` upstream and resynthesizes
+    # chat.completion.chunk frames, as Responses streaming already does. Off by
+    # default: this is the most incident-prone path in the proxy (#2465, #2997,
+    # #3079), so the default flips separately, with measurements (#3815).
+    ccr_buffered_chat_streaming: bool = False
 
     # Connection pool
     max_connections: int = 500

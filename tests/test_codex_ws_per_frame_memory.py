@@ -23,7 +23,7 @@ class _MemoryHandler:
         self.config = SimpleNamespace(
             inject_context=True,
             inject_tools=True,
-            project_root_override="",
+            project_root_override=str(Path(__file__).resolve().parent),
         )
         self.queries: list[str] = []
 
@@ -165,7 +165,8 @@ async def test_memory_lookup_runs_for_each_issue_artifact_frame_and_preserves_no
         [
             json.dumps({"type": "response.created", "response": {"id": "r_1"}}),
             json.dumps({"type": "response.completed", "response": {"id": "r_1"}}),
-        ]
+        ],
+        hold_after_events=True,
     )
     first_turn, later_turn = _issue_2059_turns()
     first_input, later_input = _issue_2059_inputs()
@@ -193,6 +194,50 @@ async def test_memory_lookup_runs_for_each_issue_artifact_frame_and_preserves_no
     for frame in forwarded_turns:
         assert frame["response"]["tools"] == expected_tools
     assert forwarded_turns[0]["response"]["tools"] == forwarded_turns[1]["response"]["tools"]
+
+
+@pytest.mark.asyncio
+async def test_cache_mode_skips_context_on_each_frame_and_preserves_tools():
+    upstream = _FakeUpstream(
+        [
+            json.dumps({"type": "response.created", "response": {"id": "r_1"}}),
+            json.dumps({"type": "response.completed", "response": {"id": "r_1"}}),
+        ],
+        hold_after_events=True,
+    )
+    first, later = _issue_2059_inputs()
+    cancel = json.dumps({"type": "response.cancel"})
+    frames = [
+        _turn_with_tools(first, _client_response_tools()),
+        cancel,
+        _turn_with_tools(later, _client_response_tools()),
+    ]
+    client_ws = _FakeWebSocket(frames=frames)
+    handler = _DummyOpenAIHandler()
+    handler.config.mode = "cache"
+    memory = _MemoryHandler()
+    handler.memory_handler = memory
+
+    with (
+        patch.dict(sys.modules, {"websockets": _make_fake_websockets_module(upstream)}),
+        patch("headroom.proxy.helpers.log_memory_injection") as log_injection,
+    ):
+        await handler.handle_openai_responses_ws(client_ws)
+
+    assert memory.queries == []
+    assert upstream.sent[1] == cancel
+    forwarded = [json.loads(upstream.sent[i])["response"] for i in (0, 2)]
+    assert [response["input"] for response in forwarded] == [first, later]
+    expected_tools = [*_client_response_tools(), *_expected_memory_response_tools()]
+    assert all(response["tools"] == expected_tools for response in forwarded)
+    skips = [
+        call.kwargs
+        for call in log_injection.call_args_list
+        if call.kwargs.get("decision") == "skipped_cache_mode"
+    ]
+    assert len(skips) == 2
+    assert all(call["bytes_injected"] == 0 for call in skips)
+    assert all(call["tags"]["memory_skip_reason"] == "cache_mode" for call in skips)
 
 
 @pytest.mark.asyncio
@@ -225,7 +270,8 @@ async def test_memory_lookup_skips_input_bearing_non_create_first_frame():
         [
             json.dumps({"type": "response.created", "response": {"id": "r_1"}}),
             json.dumps({"type": "response.completed", "response": {"id": "r_1"}}),
-        ]
+        ],
+        hold_after_events=True,
     )
     _first_input, later_input = _issue_2059_inputs()
     cancel_frame = json.dumps(
@@ -251,12 +297,58 @@ async def test_memory_lookup_skips_input_bearing_non_create_first_frame():
 
 
 @pytest.mark.asyncio
+async def test_cache_mode_skips_memory_context_search_ws():
+    upstream = _FakeUpstream(
+        [
+            json.dumps({"type": "response.created", "response": {"id": "r_1"}}),
+            json.dumps({"type": "response.completed", "response": {"id": "r_1"}}),
+            json.dumps({"type": "response.created", "response": {"id": "r_2"}}),
+            json.dumps({"type": "response.completed", "response": {"id": "r_2"}}),
+        ],
+        hold_after_events=True,
+    )
+    first_turn, later_turn = _issue_2059_turns()
+    client_frames = [
+        _turn_with_tools(json.loads(first_turn)["response"]["input"], _client_response_tools()),
+        _turn_with_tools(json.loads(later_turn)["response"]["input"], _client_response_tools()),
+    ]
+    client_ws = _FakeWebSocket(frames=client_frames)
+    handler = _DummyOpenAIHandler()
+    handler.config.mode = "cache"
+    memory = _MemoryHandler()
+    handler.memory_handler = memory
+    recorded_outcomes = []
+
+    async def _capture_outcome(outcome):
+        recorded_outcomes.append(outcome)
+
+    handler._record_request_outcome = _capture_outcome
+
+    with patch.dict(sys.modules, {"websockets": _make_fake_websockets_module(upstream)}):
+        await handler.handle_openai_responses_ws(client_ws)
+
+    assert memory.queries == []
+    assert len(upstream.sent) == 2
+    for i, sent_raw in enumerate(upstream.sent):
+        sent = json.loads(sent_raw)
+        original = json.loads(client_frames[i])
+        assert sent["response"]["input"] == original["response"]["input"]
+        expected_tools = [*_client_response_tools(), *_expected_memory_response_tools()]
+        assert sent["response"]["tools"] == expected_tools
+
+    assert len(recorded_outcomes) >= 1
+    for outcome in recorded_outcomes:
+        assert outcome.tags.get("memory_skip_reason") == "cache_mode"
+
+
+@pytest.mark.asyncio
 async def test_memory_lookup_skips_bypassed_frames():
     upstream = _FakeUpstream(
         [
             json.dumps({"type": "response.created", "response": {"id": "r_1"}}),
             json.dumps({"type": "response.completed", "response": {"id": "r_1"}}),
-        ]
+        ],
+        hold_after_events=True,
     )
     first, later = _issue_2059_turns()
     client_ws = _FakeWebSocket(
@@ -280,7 +372,8 @@ async def test_memory_lookup_keeps_legacy_direct_first_frame():
         [
             json.dumps({"type": "response.created", "response": {"id": "r_1"}}),
             json.dumps({"type": "response.completed", "response": {"id": "r_1"}}),
-        ]
+        ],
+        hold_after_events=True,
     )
     first_input, later_input = _issue_2059_inputs()
     first = _direct_turn(first_input)
@@ -307,7 +400,8 @@ async def test_memory_lookup_skips_disabled_memory(monkeypatch):
         [
             json.dumps({"type": "response.created", "response": {"id": "r_1"}}),
             json.dumps({"type": "response.completed", "response": {"id": "r_1"}}),
-        ]
+        ],
+        hold_after_events=True,
     )
     first, later = _issue_2059_turns()
     client_ws = _FakeWebSocket(frames=[first, later])

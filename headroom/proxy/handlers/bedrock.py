@@ -70,7 +70,7 @@ class BedrockHandlerMixin:
                 URL path (may contain ``.``, ``:`` and ``/``).
             stream: ``True`` for ``invoke-with-response-stream``.
         """
-        from fastapi.responses import JSONResponse
+        from fastapi.responses import JSONResponse, Response
 
         from headroom.proxy.auth_mode import classify_client
         from headroom.proxy.helpers import (
@@ -84,6 +84,7 @@ class BedrockHandlerMixin:
             read_request_json_with_bytes,
         )
         from headroom.proxy.modes import is_cache_mode
+        from headroom.proxy.request_limit_policy import COMPRESSION_BODY_MAX_BYTES
         from headroom.utils import extract_user_query
 
         start_time = time.time()
@@ -176,12 +177,22 @@ class BedrockHandlerMixin:
         messages = body.get("messages")
         bypass = (
             _headroom_bypass_enabled(request.headers)
+            or len(raw) > COMPRESSION_BODY_MAX_BYTES
             or not getattr(self.config, "optimize", True)  # type: ignore[attr-defined]
             or is_cache_mode(getattr(self.config, "mode", "token"))  # type: ignore[attr-defined]
             or not isinstance(messages, list)
             or not messages
             or len(messages) > MAX_MESSAGE_ARRAY_LENGTH
         )
+        if len(raw) > COMPRESSION_BODY_MAX_BYTES:
+            tags["passthrough_reason"] = "request_body_soft_limit"
+            logger.info(
+                "[%s] event=compression_passthrough reason=request_body_soft_limit "
+                "bytes=%d threshold=%d",
+                request_id,
+                len(raw),
+                COMPRESSION_BODY_MAX_BYTES,
+            )
 
         outbound = raw
         original_tokens = 0
@@ -243,6 +254,14 @@ class BedrockHandlerMixin:
         # contract treats 0 as "not measured") — Bedrock responses are forwarded
         # byte-faithfully and never parsed. The valuable figure, request-side
         # compression, is recorded in full.
+        #
+        # status_code=response.status_code: unlike streaming.py's SDK-based
+        # _stream_response_bedrock (which never holds an HTTP response object
+        # and so keeps the dataclass default of 200 — see PR #2682), this
+        # handler forwards via raw httpx and always has the real upstream
+        # status on the returned Response/StreamingResponse. Leaving it out
+        # here made every upstream 4xx/5xx (throttling, auth failure, model
+        # not found) record as a 200 success in the savings/cost funnel.
         try:
             from headroom.proxy.outcome import RequestOutcome
 
@@ -261,6 +280,7 @@ class BedrockHandlerMixin:
                     pipeline_timing=pipeline_timing,
                     tags=tags,
                     client=client,
+                    status_code=response.status_code,
                 )
             )
         except Exception:
