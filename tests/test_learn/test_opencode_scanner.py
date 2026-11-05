@@ -342,6 +342,7 @@ def _create_opencode_db_v2(
     project_id: str = "project-v2",
     project_name: str | None = None,
     session_id: str = "session-v2",
+    worktree: str | None = None,
 ) -> None:
     """Build a minimal opencode v2 database (session_v2 + session_message).
 
@@ -383,7 +384,7 @@ def _create_opencode_db_v2(
 
         conn.execute(
             "INSERT INTO project (id, worktree, name) VALUES (?, ?, ?)",
-            (project_id, str(project_path), project_name),
+            (project_id, worktree if worktree is not None else str(project_path), project_name),
         )
         conn.execute(
             "INSERT INTO session_v2 (id, project_id, time_created) VALUES (?, ?, ?)",
@@ -464,6 +465,37 @@ def test_opencode_plugin_v2_schema_discovers_projects_and_scans_tool_calls(
     assert err_call.tool_call_id == "call-v2-2"
     assert err_call.is_error is True
     assert err_call.error_category == ErrorCategory.RUNTIME_ERROR
+
+
+def test_opencode_plugin_v2_forward_slash_windows_worktree_scans_calls(
+    tmp_path: Path,
+) -> None:
+    # opencode stores Windows worktrees with forward slashes, while
+    # str(Path(worktree)) renders them with backslashes on Windows. Scanning
+    # must match both spellings instead of silently returning zero sessions.
+    db_path = tmp_path / "opencode-v2-windows.db"
+    _create_opencode_db_v2(
+        db_path,
+        Path("C:/Users/runner/project"),
+        project_name="WindowsProject",
+        worktree="C:/Users/runner/project",
+    )
+
+    plugin = OpenCodePlugin(db_path=db_path)
+    projects = plugin.discover_projects()
+    assert len(projects) == 1
+
+    # Simulate discovery on Windows: Path() renders the stored worktree with
+    # native separators (and may normalize the drive-letter case).
+    projects[0].project_path = Path(r"c:\users\runner\project")
+
+    sessions = plugin.scan_project(projects[0])
+    assert len(sessions) == 1
+    assert [call.tool_call_id for call in sessions[0].tool_calls] == [
+        "call-v2-1",
+        "call-v2-2",
+    ]
+    assert sessions[0].tool_calls[1].is_error is True
 
 
 def test_opencode_plugin_v2_null_project_name_falls_back_to_worktree(

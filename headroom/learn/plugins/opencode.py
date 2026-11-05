@@ -70,6 +70,20 @@ def _session_table(tables: set[str]) -> str | None:
     return None
 
 
+def _worktree_key(value: str | Path) -> str:
+    """Normalize a worktree path for cross-platform database matching.
+
+    opencode stores Windows worktrees with POSIX separators (``C:/Users/...``)
+    while ``str(Path(...))`` renders them with backslashes on Windows. Compare
+    both spellings, and fold case for drive-letter/UNC paths because Windows
+    filesystems are case-insensitive. POSIX paths stay case-sensitive.
+    """
+    path = str(value).replace("\\", "/")
+    if path.startswith("//") or (len(path) >= 2 and path[1] == ":"):
+        path = path.casefold()
+    return path.rstrip("/") or "/"
+
+
 def _extract_output(state: dict) -> str:
     """Extract human-readable tool output from either schema shape.
 
@@ -235,14 +249,15 @@ class OpenCodePlugin(LearnPlugin, ConversationScanner):
         if sess_tbl is None:
             return []
 
-        cursor.execute(
-            "SELECT id FROM project WHERE worktree = ?",
-            (str(project.project_path),),
-        )
-        row = cursor.fetchone()
-        if row is None:
+        cursor.execute("SELECT id, worktree FROM project")
+        target_worktree = _worktree_key(project.project_path)
+        project_db_id: str | None = None
+        for proj_id, worktree in cursor.fetchall():
+            if isinstance(worktree, str) and _worktree_key(worktree) == target_worktree:
+                project_db_id = proj_id
+                break
+        if project_db_id is None:
             return []
-        project_db_id: str = row[0]
 
         cursor.execute(
             f"SELECT id, time_created FROM {sess_tbl} WHERE project_id = ? ORDER BY time_created DESC LIMIT 200",
