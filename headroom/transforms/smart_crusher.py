@@ -497,6 +497,7 @@ class SmartCrusher(Transform):
         query: str = "",
         bias: float = 1.0,
         lossless_only: bool | None = None,
+        record_toin: bool = True,
     ) -> CrushResult:
         """Crush a single JSON content string.
 
@@ -510,6 +511,12 @@ class SmartCrusher(Transform):
         but any path that would need a CCR marker (row-drop or
         opaque-blob offload) leaves the content uncompacted instead.
         `None` (default) uses the instance's configured value.
+
+        `record_toin=False` skips the TOIN write for this call only. The
+        ContentRouter passes it when the request's ``CompressionPolicy``
+        has ``toin_read_only=True`` (Subscription, F2.2): the crusher is
+        shared across concurrent requests, so the gate has to travel with
+        the call rather than through ``_runtime_compression_policy``.
         """
         # Web search tools often return space-separated JSON objects
         # (``{...} {...} {...}``) rather than a real array. The Rust crusher
@@ -543,12 +550,10 @@ class SmartCrusher(Transform):
         # Bridging the gap here keeps JSON-array compressions fueling
         # the learning system.
         #
-        # Filter on `was_modified AND strategy != "passthrough"`. The
-        # Rust crusher sometimes flips `was_modified=True` from pure
-        # JSON re-canonicalization (whitespace normalization) without
-        # actually compressing — the strategy stays `"passthrough"` in
-        # that case, and there's no learning value in recording it.
-        if r.was_modified and r.strategy != "passthrough":
+        # Record actual transformations with a non-passthrough strategy.
+        # Rust preserves original bytes when the parsed value is unchanged,
+        # including no-op decisions that retain diagnostic strategy info.
+        if record_toin and r.was_modified and r.strategy != "passthrough":
             self._record_to_toin(
                 original=content,
                 compressed=r.compressed,
@@ -899,9 +904,8 @@ class SmartCrusher(Transform):
             tool_name=tool_name,
         ):
             return content, False, "passthrough"
-        # Same passthrough filter as `crush()` — re-canonicalization of
-        # JSON whitespace can flip `was_modified=True` even when the
-        # `info` field reports `passthrough` and no compression happened.
+        # Match `crush()`: unchanged values must not train TOIN, even when
+        # `info` contains a diagnostic about a skipped transformation.
         if was_modified and info != "passthrough":
             self._record_to_toin(
                 original=content,

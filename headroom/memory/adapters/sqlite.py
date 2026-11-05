@@ -49,6 +49,20 @@ def _validate_metadata_key(key: str) -> bool:
     return _SAFE_METADATA_KEY_PATTERN.match(key) is not None
 
 
+def _utc_timestamp(value: str | None) -> str | None:
+    """Comparable UTC text without rewriting stored offsets or rounding fractions.
+
+    Naive timestamps follow Memory's UTC defaults. SQLite date functions round
+    fractional seconds, so keep Python's full microsecond precision here.
+    """
+    if value is None:
+        return None
+    timestamp = datetime.fromisoformat(value)
+    if timestamp.tzinfo is not None:
+        timestamp = timestamp.astimezone(timezone.utc).replace(tzinfo=None)
+    return timestamp.isoformat(timespec="microseconds")
+
+
 class SQLiteMemoryStore:
     """SQLite-based memory store implementing the MemoryStore protocol.
 
@@ -95,6 +109,7 @@ class SQLiteMemoryStore:
         """
         conn = connect_private_sqlite(self.db_path, what="memory store")
         conn.row_factory = sqlite3.Row
+        conn.create_function("headroom_utc_timestamp", 1, _utc_timestamp, deterministic=True)
         try:
             with conn:
                 yield conn
@@ -437,49 +452,18 @@ class SQLiteMemoryStore:
         conditions: list[str] = []
         params: list[Any] = []
 
-        # Hierarchical scope filtering
+        # Every supplied scope narrows the match. IDs can be reused under
+        # different parents, so no child scope can replace a parent predicate.
         if filter.user_id is not None:
             conditions.append("user_id = ?")
             params.append(filter.user_id)
-
-            # Hierarchical filtering: when filtering by user_id only,
-            # return USER-level and below (all that user's memories)
-            # This is implicit - we just filter by user_id
-
-            if filter.session_id is not None:
-                conditions.append("session_id = ?")
-                params.append(filter.session_id)
-
-                # agent_id and turn_id are independent narrowing constraints:
-                # turn_id must be applied even when agent_id is absent. Nesting
-                # the turn_id check inside the agent_id block dropped the turn
-                # filter for a (session_id + turn_id, no agent_id) query, so it
-                # returned the whole session instead of the one turn.
-                if filter.agent_id is not None:
-                    conditions.append("agent_id = ?")
-                    params.append(filter.agent_id)
-
-                if filter.turn_id is not None:
-                    conditions.append("turn_id = ?")
-                    params.append(filter.turn_id)
-            elif filter.agent_id is not None:
-                # Agent without session - unusual but supported
-                conditions.append("agent_id = ?")
-                params.append(filter.agent_id)
-            elif filter.turn_id is not None:
-                # Turn without session/agent - unusual but supported
-                conditions.append("turn_id = ?")
-                params.append(filter.turn_id)
-        elif filter.session_id is not None:
-            # Session without user - filter by session only
+        if filter.session_id is not None:
             conditions.append("session_id = ?")
             params.append(filter.session_id)
-        elif filter.agent_id is not None:
-            # Agent without user/session
+        if filter.agent_id is not None:
             conditions.append("agent_id = ?")
             params.append(filter.agent_id)
-        elif filter.turn_id is not None:
-            # Turn only
+        if filter.turn_id is not None:
             conditions.append("turn_id = ?")
             params.append(filter.turn_id)
 
@@ -507,21 +491,23 @@ class SQLiteMemoryStore:
             if scope_conditions:
                 conditions.append(f"({' OR '.join(scope_conditions)})")
 
+        # Normalize both sides: persisted rows may retain explicit UTC offsets.
+        # This favors correct instant comparisons over the raw TEXT time index.
         # Temporal filtering
         if filter.created_after is not None:
-            conditions.append("created_at >= ?")
-            params.append(filter.created_after.isoformat())
+            conditions.append("headroom_utc_timestamp(created_at) >= ?")
+            params.append(_utc_timestamp(filter.created_after.isoformat()))
 
         if filter.created_before is not None:
-            conditions.append("created_at <= ?")
-            params.append(filter.created_before.isoformat())
+            conditions.append("headroom_utc_timestamp(created_at) <= ?")
+            params.append(_utc_timestamp(filter.created_before.isoformat()))
 
         # Point-in-time query
         if filter.valid_at is not None:
-            valid_at_str = filter.valid_at.isoformat()
-            conditions.append("valid_from <= ?")
+            valid_at_str = _utc_timestamp(filter.valid_at.isoformat())
+            conditions.append("headroom_utc_timestamp(valid_from) <= ?")
             params.append(valid_at_str)
-            conditions.append("(valid_until IS NULL OR valid_until > ?)")
+            conditions.append("(valid_until IS NULL OR headroom_utc_timestamp(valid_until) > ?)")
             params.append(valid_at_str)
 
         # Superseded filtering
@@ -619,6 +605,9 @@ class SQLiteMemoryStore:
             "last_accessed",
         ):
             order_column = "created_at"
+
+        if order_column in ("created_at", "last_accessed"):
+            order_column = f"headroom_utc_timestamp({order_column})"
 
         order_direction = "DESC" if filter.order_desc else "ASC"
 
@@ -858,22 +847,17 @@ class SQLiteMemoryStore:
         Returns:
             Number of memories deleted.
         """
-        conditions = ["user_id = ?"]
-        params: list[Any] = [user_id]
-
-        if turn_id is not None:
-            # Clear only specific turn
-            conditions.append("turn_id = ?")
-            params.append(turn_id)
-        elif agent_id is not None:
-            # Clear agent and its turns
-            conditions.append("agent_id = ?")
-            params.append(agent_id)
-        elif session_id is not None:
-            # Clear session and its agents/turns
-            conditions.append("session_id = ?")
-            params.append(session_id)
-        # If only user_id, clear all user's memories
+        # Use the same scope as the query that selects IDs for index cleanup.
+        # Clearing includes historical versions as well as active memories.
+        conditions, params = self._build_query_conditions(
+            MemoryFilter(
+                user_id=user_id,
+                session_id=session_id,
+                agent_id=agent_id,
+                turn_id=turn_id,
+                include_superseded=True,
+            )
+        )
 
         where_clause = " AND ".join(conditions)
 
