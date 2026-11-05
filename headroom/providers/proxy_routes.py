@@ -9,6 +9,7 @@ from typing import Any
 from fastapi import FastAPI, HTTPException, Request, WebSocket
 from fastapi.responses import Response
 
+from headroom.log_safety import redact_url
 from headroom.providers.cloudcode import normalize_cloudcode_passthrough_path
 from headroom.providers.codex.endpoints import codex_backend_url
 from headroom.providers.codex.headers import drop_header
@@ -528,7 +529,7 @@ def register_provider_routes(app: FastAPI, proxy: Any) -> None:
         custom_base = request.headers.get("x-headroom-base-url", "").strip()
         if custom_base:
             if not await is_safe_upstream_url_async(custom_base):
-                logger.warning("rejecting unsafe x-headroom-base-url: %r", custom_base)
+                logger.warning("rejecting unsafe x-headroom-base-url: %s", redact_url(custom_base))
                 raise HTTPException(status_code=400, detail="Rejected unsafe upstream base URL")
             # Only the destination is overridden: keep the provider the request's
             # auth selects, so Anthropic-auth requests still get model-id
