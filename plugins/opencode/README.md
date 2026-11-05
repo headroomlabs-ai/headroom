@@ -27,6 +27,9 @@ npm run build
 npm run build:standalone
 ```
 
+For a reproducible real OpenCode 2.x → proxy → local SSE upstream check, see
+[the transport runtime proof](RUNTIME_PROOF.md). It records the tested scope and limitations.
+
 ## Provider Config Helpers
 
 Use these helpers when you need to generate OpenCode config that routes a `headroom` provider through a running Headroom proxy.
@@ -73,7 +76,7 @@ The default export is `{ id: "headroom", server, setup }`. OpenCode 1.x calls `s
 
 On 2.x, setup returns a cleanup that releases the transport, so hot reloads do not stack interceptors.
 
-OpenCode 2.x keeps its own reference to `fetch` from before plugins load, so patching `fetch` alone does not catch its model traffic. On 2.x the plugin also rewrites each remote model that uses the OpenAI chat-completions or responses format so that it points at the proxy. Headers name the real upstream, as the transport does. Models on other formats (Anthropic messages, Google) are left alone. `headroom wrap opencode` routes native Anthropic and OpenAI through the proxy separately, via their `baseURL`.
+OpenCode 2.x keeps its own reference to `fetch` from before plugins load, so patching `fetch` alone does not catch its model traffic. For models with a resolved `baseURL`, the plugin also rewrites OpenAI chat-completions, Responses, and Anthropic Messages traffic so that it points at the proxy — including GitHub Copilot's Claude models. Anthropic Messages base URLs with a path prefix (for example a gateway rooted at `/api/...`) stay on their own base URL, because the proxy's Messages route ignores the original-path header and cannot preserve that prefix. Headers name the real upstream and request path, as the transport does, and authentication settings are retained. Local, excluded, and unsupported-protocol models are left alone. `headroom wrap opencode` routes native Anthropic and OpenAI through the proxy separately, via their `baseURL`.
 
 To keep a provider off the proxy, list its host. An entry matches the host and all of its subdomains, and `.example.com` / `*.example.com` are accepted as spellings of `example.com`:
 
