@@ -609,6 +609,10 @@ fn load_tokenizer(path: &Path, repo: &str) -> Result<Tokenizer, KompressError> {
 }
 
 fn build_session(path: &Path) -> Result<Session, Box<dyn std::error::Error + Send + Sync>> {
+    // Resolve and commit the ONNX Runtime dylib before touching `ort`: with
+    // `ort-load-dynamic`, a failed load inside `ort` deadlocks instead of
+    // erroring (see `dynamic_ort_loader_ready`).
+    crate::transforms::magika_detector::dynamic_ort_loader_ready()?;
     let session = Session::builder()?.commit_from_file(path)?;
     Ok(session)
 }
