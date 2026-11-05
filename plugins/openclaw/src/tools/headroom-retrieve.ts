@@ -32,8 +32,16 @@ export function createHeadroomRetrieveTool(config: RetrieveToolConfig) {
       },
       required: ["hash"],
     },
-    execute: async (args: { hash: string }): Promise<string> => {
-      const { hash } = args;
+    // OpenClaw calls a registered tool as execute(toolCallId, params, signal?,
+    // onUpdate?). The hash used to be read from the first argument, so the
+    // tool-call id was validated as a hash and every real call failed before
+    // any request was sent (#4638). A direct execute({ hash }) call still works.
+    execute: async (
+      toolCallIdOrArgs: string | { hash: string },
+      params?: { hash: string },
+    ): Promise<string> => {
+      const args = typeof toolCallIdOrArgs === "string" ? params : toolCallIdOrArgs;
+      const hash = typeof args?.hash === "string" ? args.hash : "";
 
       // Validate hash format
       if (!/^[a-f0-9]{24}$/i.test(hash)) {
