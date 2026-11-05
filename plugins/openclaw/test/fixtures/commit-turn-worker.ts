@@ -1,18 +1,17 @@
 /**
  * Child-process worker for the cross-process DurableAdvancementKeyStore
- * regression tests (PR #3442 review, round 3).
+ * tests.
  *
  * Run as a real, separate OS process (not a Worker thread, which shares the
- * parent's memory and wouldn't exercise inter-process file locking) via
- * `node --experimental-transform-types commit-turn-worker.ts <storePath>
- * <key> <goPath> <resultPath>`.
+ * parent's memory) via `node --experimental-transform-types
+ * commit-turn-worker.ts <storePath> <key> <goPath> <resultPath>`.
  *
  * Blocks until `goPath` exists (the parent test creates it only after every
  * worker has been spawned and had time to reach this poll loop), then
  * commits `key` through the real `DurableAdvancementKeyStore` and writes
  * the outcome to `resultPath` as JSON -- this is what lets two independently
- * launched processes race their read/check/write transactions against the
- * same commit-log file as closely to simultaneously as possible.
+ * launched processes race their commits against the same store as closely
+ * to simultaneously as possible.
  */
 
 import { access, writeFile } from "node:fs/promises";
@@ -45,7 +44,7 @@ async function main(): Promise<void> {
 
   const store = new DurableAdvancementKeyStore(storePath);
   try {
-    const status = await store.tryCommit(key, [key]);
+    const status = await store.tryCommit(key);
     await writeFile(resultPath, JSON.stringify({ status }), "utf8");
   } catch (error) {
     await writeFile(
