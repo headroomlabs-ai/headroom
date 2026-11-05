@@ -129,3 +129,55 @@ def test_request_floor_ignores_a_concurrent_fork_raising_the_live_floor():
         _history(4, "f"), kompress=_HalfKompress(), keep_last_turns=1, drop_first_turns=floor
     )
     assert len(out[5]["reasoning_content"].split()) == 30  # Kompressed, not dropped
+
+
+def test_cold_request_records_raised_floor_through_response():
+    from headroom.cache.prefix_tracker import _resolved_turn
+
+    tracker = _tracker_with_floor(0)
+    tracker._turn_states[1] = tracker._turn_state()
+    request = contextvars.copy_context()
+    request.run(_resolved_turn.set, (tracker, 1, tracker._turn_states[1]))
+
+    cold, stats = compact_reasoning_openai_chat(
+        _history(3, "r"), kompress=None, keep_last_turns=1, drop=True
+    )
+    floor = max(request.run(tracker.request_reasoning_drop_floor), stats["dropped_upto"])
+    request.run(tracker.raise_reasoning_drop_floor, floor)
+    request.run(tracker.update_from_response, 0, 0, cold)
+
+    assert tracker._turn_states[1][5] == 2
+    tracker._resume_turn(1)
+    warm, _ = compact_reasoning_openai_chat(
+        _history(4, "r"),
+        kompress=_HalfKompress(),
+        keep_last_turns=1,
+        drop=False,
+        drop_first_turns=tracker.request_reasoning_drop_floor(),
+    )
+    assert [m.get("reasoning_content") for m in warm[1::2]][:2] == ["", ""]
+    assert warm[:5] == cold[:5]
+
+
+def test_cold_request_floor_write_isolated_from_sibling_through_response():
+    from headroom.cache.prefix_tracker import _resolved_turn
+
+    tracker = _tracker_with_floor(2)
+    tracker._turn_states[1] = tracker._turn_state()
+    request_a = contextvars.copy_context()
+    request_a.run(_resolved_turn.set, (tracker, 1, tracker._turn_states[1]))
+    tracker.reasoning_drop_upto = 3  # sibling fork mutated live floor
+
+    floor = request_a.run(tracker.request_reasoning_drop_floor)
+    assert floor == 2
+    request_a.run(tracker.update_from_response, 0, 0, [])
+
+    assert tracker._turn_states[1][5] == 2
+    tracker._resume_turn(1)
+    out, _ = compact_reasoning_openai_chat(
+        _history(4, "s"),
+        kompress=_HalfKompress(),
+        keep_last_turns=1,
+        drop_first_turns=tracker.request_reasoning_drop_floor(),
+    )
+    assert len(out[5]["reasoning_content"].split()) == 30  # Kompressed, not dropped
