@@ -45,8 +45,10 @@ def test_ci_jobs_load_bundled_litellm_pricing() -> None:
             "from litellm.litellm_core_utils.get_model_cost_map import "
             "get_model_cost_map_source_info; "
             "assert get_model_cost_map_source_info()['is_env_forced']; "
-            "assert 'claude-sonnet-4-20250514' in litellm.model_cost; "
-            "assert 'groq/llama-3.3-70b-versatile' in litellm.model_cost",
+            "import json; from importlib.resources import files; "
+            "bundled = json.loads(files('litellm').joinpath("
+            "'model_prices_and_context_window_backup.json').read_text(encoding='utf-8')); "
+            "assert bundled and litellm.model_cost == bundled",
         ],
         env=test_env,
         capture_output=True,
