@@ -9,7 +9,8 @@ from typing import Any
 from headroom import paths
 from headroom.observability import LangfuseTracingConfig, OTelMetricsConfig
 from headroom.proxy.savings_tracker import get_default_savings_storage_path
-from headroom.telemetry.beacon import is_telemetry_enabled
+from headroom.telemetry.beacon import is_beacon_enabled, is_telemetry_enabled
+from headroom.telemetry.session import DEFAULT_ENDPOINT
 from headroom.telemetry.toin import get_default_toin_storage_path
 
 
@@ -44,14 +45,27 @@ def list_telemetry_surfaces() -> list[TelemetrySurface]:
     return [
         TelemetrySurface(
             surface="anonymous_beacon",
-            status=_status(is_telemetry_enabled()),
+            status=_status(is_beacon_enabled()),
             emits="Aggregate usage counters, version, platform, install mode",
             includes_prompt_content=False,
+            leaves_host_by_default=is_beacon_enabled(),
+            observe="headroom telemetry --show; proxy log startup line",
+            export=DEFAULT_ENDPOINT,
+            retention="Headroom service controlled",
+            notes="Upload is opt-out: HEADROOM_BEACON=off, DO_NOT_TRACK=1, or offline mode. "
+            "HEADROOM_TELEMETRY=off also opts out unless the beacon is explicitly enabled.",
+        ),
+        TelemetrySurface(
+            surface="local_telemetry",
+            status=_status(is_telemetry_enabled()),
+            emits="In-process aggregate usage counters",
+            includes_prompt_content=False,
             leaves_host_by_default=False,
-            observe="Proxy log startup line",
-            export="None; removed anonymous service beacon",
+            observe="GET /stats; GET /v1/telemetry",
+            export="Local process only",
             retention="Local process only",
-            notes="HEADROOM_TELEMETRY only controls local aggregate collection.",
+            notes="Opt-in local collection controlled by HEADROOM_TELEMETRY=on; "
+            "independent from the anonymous upload switch.",
         ),
         TelemetrySurface(
             surface="prometheus",

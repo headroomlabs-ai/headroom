@@ -16,6 +16,7 @@ headroom telemetry list --json
 | Surface | Default | Leaves host by default | Prompt content |
 | --- | --- | --- | --- |
 | Anonymous beacon | On | Yes | No |
+| Local aggregate telemetry | Off | No | No |
 | Prometheus `/metrics` | On | No | No |
 | OTEL metrics | Off | Only when enabled | No |
 | Langfuse tracing | Off | Only when enabled | No |
@@ -25,12 +26,18 @@ headroom telemetry list --json
 | Proxy log | On | No | No by default |
 | Active sessions | On | No unless clustered mode is enabled | No |
 
-Disable anonymous aggregate telemetry with:
+Anonymous uploads are on by default and use `HEADROOM_BEACON`. Local aggregate
+collection is separate, off by default, and uses `HEADROOM_TELEMETRY=on`.
+Disable uploads, optionally retaining local collection, with:
 
 ```bash
-HEADROOM_TELEMETRY=off headroom proxy
-headroom proxy --no-telemetry
+HEADROOM_BEACON=off headroom proxy
+HEADROOM_TELEMETRY=on HEADROOM_BEACON=off headroom proxy
 ```
+
+Legacy `HEADROOM_TELEMETRY=off` and `--no-telemetry` also disable uploads unless
+`HEADROOM_BEACON` is explicitly enabled. `DO_NOT_TRACK=1` and offline mode disable
+uploads regardless of that switch.
 
 Clustered active-session mirroring is opt-in:
 

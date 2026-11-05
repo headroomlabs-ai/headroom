@@ -16,6 +16,7 @@ headroom telemetry list --json
 | Surface | Default | Leaves host by default | Prompt content | How to observe | Retention |
 |---|---:|---:|---:|---|---|
 | Anonymous beacon | On | Yes | No | Proxy startup log | Headroom service controlled |
+| Local aggregate telemetry | Off | No | No | `GET /stats`, `GET /v1/telemetry` | Local process only |
 | Prometheus | On | No | No | `GET /metrics` | Scraper controlled |
 | OTEL metrics | Off | Only when enabled | No | OTEL collector or console exporter | Exporter controlled |
 | Langfuse tracing | Off | Only when enabled | No | Langfuse dashboard | Langfuse controlled |
@@ -27,12 +28,16 @@ headroom telemetry list --json
 
 ## Controls
 
-Anonymous aggregate telemetry is controlled by `HEADROOM_TELEMETRY`.
+Anonymous uploads are on by default and controlled by `HEADROOM_BEACON`.
+Local aggregate collection is separate and opt-in through `HEADROOM_TELEMETRY=on`.
 
 ```bash
-HEADROOM_TELEMETRY=off headroom proxy
-headroom proxy --no-telemetry
+HEADROOM_BEACON=off headroom proxy
+HEADROOM_TELEMETRY=on HEADROOM_BEACON=off headroom proxy
 ```
+
+Legacy `HEADROOM_TELEMETRY=off` and `--no-telemetry` also disable uploads unless
+the beacon is explicitly enabled. `DO_NOT_TRACK=1` and offline mode disable uploads.
 
 OTEL metrics are independent from anonymous telemetry:
 
