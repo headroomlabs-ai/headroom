@@ -152,6 +152,7 @@ Top-level function to compress messages via the Headroom proxy.
   client: { type: 'HeadroomClientInterface', description: 'Pre-configured client instance to use' },
   tokenBudget: { type: 'number', description: 'Token budget — compress to fit within this limit' },
   hooks: { type: 'CompressionHooks', description: 'Compression hooks for pre/post processing' },
+  format: { type: "'openai' | 'anthropic' | 'vercel' | 'gemini'", description: 'Format of `messages`, when known. Skips autodetection, which cannot tell a text-only Vercel AI SDK prompt from OpenAI messages' },
 }} />
 
 ```ts twoslash
@@ -639,16 +640,17 @@ tokens = tokenizer.count_messages(messages)
 
 ### generate_report()
 
-Generate HTML/Markdown reports from stored metrics:
+Generate an HTML report from stored metrics:
 
 ```python
+from datetime import datetime, timedelta, timezone
 from headroom import generate_report
 
-report = generate_report(
-    store_url="sqlite:///headroom.db",
-    format="html",
-    period="day",
-)
+path = generate_report(
+    store_url="sqlite:////absolute/path/to/headroom.db",
+    output_path="report.html",
+    start_time=datetime.now(timezone.utc) - timedelta(days=1),
+)  # returns the path to the generated HTML file
 ```
 
 ---
