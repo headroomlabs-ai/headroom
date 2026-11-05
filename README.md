@@ -492,7 +492,7 @@ their PyTorch dependency can install CUDA runtime packages on Linux.
 
 Granular extras: `[proxy]`, `[mcp]`, `[ml]` (Kompress-v2-base), `[code]`,
 `[memory]`, `[vector]` (optional HNSW backend — needs a C++ toolchain),
-`[relevance]`, `[image]`, `[sandbox]` (lean, torch-free proxy), `[agno]`, `[langchain]`, `[evals]`, `[voice]`, and
+`[relevance]`, `[image]`, `[lean]` (torch-free proxy dependency profile; `[sandbox]` is a deprecated alias), `[agno]`, `[langchain]`, `[evals]`, `[voice]`, and
 `[pytorch-mps]` (Apple-GPU memory-embedder offload — set
 `HEADROOM_EMBEDDER_RUNTIME=pytorch_mps`). Requires **Python 3.11+**.
 
