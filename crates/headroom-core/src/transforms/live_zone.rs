@@ -113,8 +113,8 @@ use super::diff_compressor::{DiffCompressor, DiffCompressorConfig};
 #[cfg(feature = "ml")]
 use super::kompress::{Kompress, KompressConfig};
 use super::log_compressor::{LogCompressor, LogCompressorConfig};
-use super::recommendations::{self, RecommendationStore};
 use super::pipeline::JsonMinifier;
+use super::recommendations::{self, RecommendationStore};
 use super::search_compressor::{SearchCompressor, SearchCompressorConfig};
 use super::smart_crusher::{SmartCrusher, SmartCrusherConfig};
 use crate::ccr::{compute_key, marker_for, CcrStore};

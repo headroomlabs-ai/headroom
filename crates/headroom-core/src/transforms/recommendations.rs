@@ -255,6 +255,9 @@ pub fn structure_hash(content_type: ContentType, text: &str) -> Option<String> {
         ContentType::SourceCode => "code_aware",
         ContentType::PlainText => "text",
         ContentType::Html => "html",
+        // The dispatcher keeps tabular text lossless and has no compression
+        // strategy/signature to join against Python's recommendations.
+        ContentType::Tabular => return None,
         ContentType::JsonArray => unreachable!(),
     };
     let sample: String = text.chars().take(100).collect();
@@ -369,7 +372,12 @@ fn model_family(model: &str) -> Option<&'static str> {
         "o3",
     ]
     .into_iter()
-    .find(|family| model.contains(family))
+    .find(|family| {
+        model.match_indices(family).any(|(start, _)| {
+            let suffix = &model[start + family.len()..];
+            suffix.is_empty() || suffix.starts_with('-')
+        })
+    })
 }
 
 /// Process-wide store populated at first call to [`load_default`].
@@ -426,6 +434,20 @@ pub enum RecommendationsError {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn gpt_4_family_does_not_match_gpt_4_1_requests() {
+        assert_eq!(super::model_family("openai/gpt-4-0613"), Some("gpt-4"));
+        assert_eq!(super::model_family("gpt-4.1"), None);
+        assert_eq!(super::model_family("openai/gpt-4.1-2025-04-14"), None);
+    }
+
+    #[test]
+    fn tabular_content_has_no_compression_recommendation_signature() {
+        assert_eq!(
+            super::structure_hash(super::ContentType::Tabular, "a,b\n1,2"),
+            None
+        );
+    }
     use super::*;
 
     fn sample_toml() -> &'static str {
