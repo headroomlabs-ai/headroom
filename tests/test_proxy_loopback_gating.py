@@ -61,6 +61,26 @@ def _loopback_client() -> TestClient:
     return TestClient(_make_app(), base_url="http://127.0.0.1", client=("127.0.0.1", 12345))
 
 
+def test_debug_memory_is_available_to_loopback_published_container_host(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("HEADROOM_CONTAINER_HOST_GATEWAY", "172.17.0.1")
+    app = create_app(ProxyConfig(optimize=False, cache_enabled=False, stateless=True))
+    loopback = TestClient(app, base_url="http://127.0.0.1:8787", client=("127.0.0.1", 1))
+    host = TestClient(app, base_url="http://127.0.0.1:8787", client=("172.17.0.1", 1))
+    other_container = TestClient(app, base_url="http://127.0.0.1:8787", client=("172.17.0.5", 1))
+    wrong_host = TestClient(app, base_url="http://attacker.example:8787", client=("172.17.0.1", 1))
+
+    assert "/debug/memory" in host.get("/openapi.json").json()["paths"]
+    assert loopback.get("/debug/memory").status_code == 200
+    response = host.get("/debug/memory")
+
+    assert response.status_code == 200, response.text
+    assert "process" in response.json()
+    assert other_container.get("/debug/memory").status_code == 404
+    assert wrong_host.get("/debug/memory").status_code == 404
+
+
 def _seed_ccr_entry() -> str:
     reset_compression_store()
     store = get_compression_store(backend=InMemoryBackend())
