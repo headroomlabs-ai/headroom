@@ -1085,10 +1085,24 @@ def _system_message_to_blocks(message: dict[str, Any]) -> list[Any]:
     return []
 
 
+def is_third_party_model(model: str | None, *, third_party_upstream: bool) -> bool:
+    """Whether a request is for a non-Claude model on an upstream Headroom does not own.
+
+    Headroom has no wire contract for such a model (a vLLM or GLM endpoint
+    speaking the Anthropic Messages format), and the client already sends its
+    mid-conversation system sections there directly. A Claude-named model
+    behind a gateway may still reach a provider without that feature, so it is
+    not one.
+    """
+    return third_party_upstream and "claude" not in str(model or "").lower()
+
+
 def relocate_system_messages_to_top_level(
     messages: list[dict[str, Any]],
     system: Any,
     model: str | None = None,
+    *,
+    third_party_model: bool = False,
 ) -> tuple[list[dict[str, Any]], Any, bool]:
     """Relocate only system messages invalid for the selected Anthropic model.
 
@@ -1097,6 +1111,12 @@ def relocate_system_messages_to_top_level(
     placed at the end. Hoisting those changes semantics and invalidates the
     cached prefix. The initial/invalid forms are still moved to the top-level
     field as the issue-765 last-line wire-contract guard.
+
+    ``third_party_model`` (see :func:`is_third_party_model`) treats the model as
+    supported: the client's sections stay where it put them. Hoisting them
+    there would append to the top-level ``system`` whenever a turn adds a
+    section, so the upstream's prefix cache would miss the whole conversation
+    on every such turn.
 
     The relocated content is appended after any existing top-level ``system``
     so wire order (system prompt, then conversation) is preserved. Only
@@ -1111,7 +1131,7 @@ def relocate_system_messages_to_top_level(
     the common path is untouched.
     """
     model_id = str(model or "").lower()
-    supports_mid_conversation = any(
+    supports_mid_conversation = third_party_model or any(
         family in model_id
         for family in (
             "claude-fable-5",
