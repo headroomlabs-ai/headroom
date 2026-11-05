@@ -481,6 +481,9 @@ def _run_memory_eval(
     # Create answer function based on provider
     answer_fn = None
     if answer_model:
+        from headroom.offline import guard_egress
+
+        guard_egress(f"{answer_model} API for the memory eval answers")
         try:
             pin_litellm_cost_map_local()
             import litellm
