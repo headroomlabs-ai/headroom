@@ -1479,7 +1479,7 @@ class StreamingMixin:
 
         if upstream_response.status_code >= 400:
             logger.warning(
-                "[%s] Forwarding upstream streaming error status=%s url=%s",
+                "[%s] Upstream provider returned an error; forwarding it to the client status=%s url=%s",
                 request_id,
                 upstream_response.status_code,
                 url,
