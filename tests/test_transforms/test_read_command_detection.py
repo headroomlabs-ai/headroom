@@ -123,6 +123,36 @@ def test_non_reads_are_not_detected(command: str) -> None:
     assert _is_read_command(command) is False
 
 
+@pytest.mark.parametrize(
+    ("command", "expected"),
+    [
+        # Shell operators inside a quoted sed script are part of the argument (#4478).
+        ("sed -n '/x >/p' foo.py", True),
+        ("sed -n '/x >> y/p' foo.py", True),
+        ('sed -n "/a > b/p" foo.py', True),
+        ("sed -n '/a|b/p' foo.py", True),
+        ("sed -n '/a;b/p' foo.py", True),
+        ("sed -n '/a && b/p' foo.py", True),
+        ("sed -n '/ tee /p' foo.py", True),
+        ("cat 'a > b.py'", True),
+        # An escaped operator is a literal argument too.
+        (r"cat foo.py \> out", True),
+        # Real operators next to a quoted script still count.
+        ("sed -n '/x >/p' foo.py > out.txt", False),
+        ("sed -n '/a|b/p' foo.py | tee out.txt", False),
+        ("sed -n '/a;b/p' foo.py; echo done", True),
+        ("echo '>' && sed 's/a/b/' foo.py", False),
+        # The -c argument of a shell is quoted at the outer level; the inner
+        # command is checked on its own.
+        ('bash -lc "cat foo.py > copy.py"', False),
+        ('bash -lc "cat foo.py | tee copy.py"', False),
+        ('bash -lc "cat foo.py"', True),
+    ],
+)
+def test_quoted_shell_operators_are_arguments(command: str, expected: bool) -> None:
+    assert _is_read_command(command) is expected
+
+
 def test_heredoc_body_is_not_split_into_a_bogus_read() -> None:
     """A `;` inside a heredoc body must not produce a segment that looks like a
     read — the command as a whole writes a file."""

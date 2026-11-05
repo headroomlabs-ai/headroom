@@ -880,9 +880,44 @@ def _command_segments(command: str) -> list[str]:
 
     Splits on ``;``, ``&&`` and ``||`` — never on a single ``|``. Pipelines are kept
     whole so the segment's own writes (``cat a.py | tee b.py``) stay visible; the
-    reduction to the first stage happens in :func:`_segment_is_read`.
+    reduction to the first stage happens in :func:`_segment_is_read`. Separators inside
+    quotes (``sed -n '/a;b/p' foo.py``) are part of an argument, not a new command.
     """
-    return [seg.strip() for seg in _CMD_SEPARATOR_RE.split(command) if seg.strip()]
+    masked = _mask_quoted(command)
+    segments: list[str] = []
+    start = 0
+    for m in _CMD_SEPARATOR_RE.finditer(masked):
+        segments.append(command[start : m.start()])
+        start = m.end()
+    segments.append(command[start:])
+    return [seg.strip() for seg in segments if seg.strip()]
+
+
+def _mask_quoted(command: str) -> str:
+    """Return ``command`` with quoted and backslash-escaped characters replaced by ``_``.
+
+    The result has the same length, so match positions map back onto ``command``.
+    Shell operators inside quotes (``sed -n '/x >/p' foo.py``) are arguments, and a
+    search over the masked string does not mistake them for a redirect, pipe or
+    command separator. The quote characters themselves are kept.
+    """
+    out = list(command)
+    quote = ""
+    escaped = False
+    for i, char in enumerate(command):
+        if escaped:
+            out[i] = "_"
+            escaped = False
+        elif char == "\\" and quote != "'":
+            escaped = True
+        elif quote:
+            if char == quote:
+                quote = ""
+            else:
+                out[i] = "_"
+        elif char in {"'", '"'}:
+            quote = char
+    return "".join(out)
 
 
 def _segment_is_read(c: str) -> bool:
@@ -890,9 +925,15 @@ def _segment_is_read(c: str) -> bool:
     # A redirect or `tee` in THIS segment means the segment writes a file rather than
     # reading one (`cat a.py > copy.py`, `cat a.py | tee copy.py`). Checked on the whole
     # segment — pipeline included — before reducing to the stage that touches the file.
-    if re.search(r"(^|\s)(>>?|tee\b)", c):
+    # Both checks run on the quote-masked segment: a `>` or `|` inside a quoted sed
+    # script (`sed -n '/x >/p' a.py`) is part of the argument, not shell syntax.
+    masked = _mask_quoted(c)
+    if re.search(r"(^|\s)(>>?|tee\b)", masked):
         return False
-    c = c.split("|", 1)[0].strip()
+    pipe = masked.find("|")
+    if pipe != -1:
+        c = c[:pipe]
+    c = c.strip()
     if not c:
         return False
     # Parse the real program with the SAME structural parser the search-fold uses
