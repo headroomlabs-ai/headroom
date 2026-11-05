@@ -23,6 +23,9 @@ This plugin can auto-start a local `headroom proxy` when needed. OpenClaw treats
 
 ## Local Development Install (Detection-Friendly)
 
+Building from source requires Node.js `^22.18.0 || ^24.11.0 || >=26.0.0` for the tsup 9 toolchain. Use a supported Node release before running `npm ci` and `npm run build`. This is a source-build requirement; the published plugin uses the Node runtime supported by your OpenClaw host and does not run tsup during plugin loading.
+
+
 If you are testing from this repo, run npm install/build from the plugin directory so local launcher detection aligns with runtime paths. These linked installs are supported:
 
 ```bash
