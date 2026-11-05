@@ -30,6 +30,7 @@ from fastapi.testclient import TestClient
 from headroom import paths
 from headroom.cache import compression_store as cs
 from headroom.cache.backends import InMemoryBackend
+from headroom.parser import CCR_RETRIEVAL_MARKER_RE
 
 # The runtime log is the one file stateless mode is documented to keep writing
 # (it is created owner-only and carries no request content by default).
@@ -82,15 +83,14 @@ def _snapshot(root: Path) -> set[str]:
 def _tool_heavy_messages() -> list[dict]:
     large = json.dumps(
         [
-            {
-                "id": i,
-                "name": f"Item {i}",
-                "description": (
-                    f"Detailed description for item {i}: status active, created on "
-                    f"2024-01-{(i % 28) + 1:02d}, category=electronics, price={i * 10.99:.2f}."
-                ),
-                "tags": ["electronics", "sale", "featured"],
-            }
+            # Text rows cannot take table compaction's lossless no-cache path.
+            # Repetition gives the real keep/drop transform and CCR something
+            # to exercise without relying on serialization-only token savings.
+            (
+                f"Detailed description for item {i % 20}: status active, created on "
+                f"2024-01-{(i % 20) + 1:02d}, category=electronics, "
+                f"price={(i % 20) * 10.99:.2f}. Tags: electronics, sale, featured."
+            )
             for i in range(200)
         ]
     )
@@ -123,12 +123,31 @@ def _run_turn(stateless: bool) -> None:
         cost_tracking_enabled=False,
     )
     app = create_app(config)
+    messages = _tool_heavy_messages()
     with TestClient(app, base_url="http://127.0.0.1", client=("127.0.0.1", 12345)) as client:
+        # The default sidecar mode deliberately disables CCR store writes.
         resp = client.post(
-            "/v1/compress", json={"messages": _tool_heavy_messages(), "model": "gpt-4"}
+            "/v1/compress",
+            json={"messages": messages, "model": "gpt-4", "config": {"mode": "ccr"}},
         )
         assert resp.status_code == 200, resp.text
-        assert resp.json()["tokens_saved"] > 0, "turn must actually exercise the CCR store"
+        data = resp.json()
+        assert data["tokens_saved"] > 0, "turn must actually compress content"
+        original = json.loads(messages[2]["content"])
+        compressed, _ = json.JSONDecoder().raw_decode(data["messages"][2]["content"])
+        kept = [
+            row
+            for row in compressed
+            if isinstance(row, str) and not CCR_RETRIEVAL_MARKER_RE.search(row)
+        ]
+        assert len(kept) < len(original)
+        assert all(row in original for row in kept)
+        retrieved = [client.post("/v1/retrieve", json={"hash": key}) for key in data["ccr_hashes"]]
+        for response in retrieved:
+            assert response.status_code == 200, response.text
+        assert any(
+            json.loads(response.json()["original_content"]) == original for response in retrieved
+        ), "the emitted CCR hash must recover every original tool row"
 
 
 # ---- end to end -----------------------------------------------------------
