@@ -66,6 +66,7 @@ from headroom.proxy.handlers._failure_logging import log_hook_failure, log_reque
 from headroom.proxy.helpers import (
     extract_tags,
     invalid_request_body_message,
+    is_third_party_model,
     relocate_system_messages_to_top_level,
     sanitize_forwarded_response_headers,
 )
@@ -148,6 +149,10 @@ def _is_googleapis_endpoint(value: object) -> bool:
     except ValueError:
         return False
     return hostname == "googleapis.com" or hostname.endswith(".googleapis.com")
+
+
+class _ProxyExpansionBlock(dict):
+    pass
 
 
 class _AnthropicTurnHookUsage:
@@ -820,6 +825,7 @@ class AnthropicHandlerMixin:
                     # next turn, so any injection here busts the prefix
                     # cache at this message from then on.
                     and "cache_control" not in block
+                    and not isinstance(block, _ProxyExpansionBlock)
                 ):
                     existing = block.get("text", "")
                     new_content.append({**block, "text": existing + "\n\n" + context_text})
@@ -832,6 +838,108 @@ class AnthropicHandlerMixin:
                 return updated
 
         return messages
+
+    @staticmethod
+    def _is_proactive_expansion_block(block: Any) -> bool:
+        return isinstance(block, _ProxyExpansionBlock)
+
+    @classmethod
+    def _append_proactive_expansion_after_cached_prefix(
+        cls,
+        messages: list[dict[str, Any]],
+        context_text: str,
+    ) -> list[dict[str, Any]]:
+        """Place CCR expansion after the last message-level cache breakpoint.
+
+        The extra text is a new content block with no ``cache_control``, so it
+        sits in this turn's uncached tail. Existing prefix bytes stay
+        identical and role alternation is preserved. The client does not
+        resend the block; callers must omit it from the prefix-tracker
+        snapshot (#4287).
+        """
+        if not messages or not context_text:
+            return messages
+
+        last_message_index: int | None = None
+        last_block_index: int | None = None
+        for message_index, message in enumerate(messages):
+            if not isinstance(message, dict):
+                continue
+            content = message.get("content")
+            if isinstance(content, list):
+                for block_index, block in enumerate(content):
+                    if isinstance(block, dict) and "cache_control" in block:
+                        last_message_index = message_index
+                        last_block_index = block_index
+            if "cache_control" in message:
+                last_message_index = message_index
+                if isinstance(content, list) and content:
+                    last_block_index = len(content) - 1
+
+        expansion_block = _ProxyExpansionBlock({"type": "text", "text": context_text})
+        target_index = last_message_index
+        if target_index is None:
+            target_index = len(messages) - 1
+            while target_index >= 0 and (
+                not isinstance(messages[target_index], dict)
+                or messages[target_index].get("role") == "system"
+            ):
+                target_index -= 1
+            if target_index < 0 or messages[target_index].get("role") != "user":
+                return messages
+            last_block_index = None
+
+        message = messages[target_index]
+        content = message.get("content")
+        updated = list(messages)
+        if isinstance(content, list):
+            new_content = list(content)
+            insert_at = last_block_index + 1 if last_block_index is not None else len(new_content)
+            while (
+                insert_at < len(new_content)
+                and isinstance(new_content[insert_at], dict)
+                and new_content[insert_at].get("type") == "tool_result"
+            ):
+                insert_at += 1
+            new_content.insert(insert_at, expansion_block)
+            updated[target_index] = {**message, "content": new_content}
+            return updated
+        if isinstance(content, str):
+            cached_block: dict[str, Any] = {"type": "text", "text": content}
+            marker = message.get("cache_control")
+            if isinstance(marker, dict):
+                cached_block["cache_control"] = marker
+            updated[target_index] = {
+                **{k: v for k, v in message.items() if k != "cache_control"},
+                "content": [cached_block, expansion_block],
+            }
+            return updated
+        return messages
+
+    @classmethod
+    def _without_proactive_expansion_messages(
+        cls,
+        messages: list[dict[str, Any]],
+    ) -> list[dict[str, Any]]:
+        """Drop proxy-injected CCR expansion blocks from a forwarded snapshot."""
+        stripped: list[dict[str, Any]] = []
+        changed = False
+        for message in messages:
+            if not isinstance(message, dict):
+                stripped.append(message)
+                continue
+            content = message.get("content")
+            if not isinstance(content, list):
+                stripped.append(message)
+                continue
+            kept = [block for block in content if not cls._is_proactive_expansion_block(block)]
+            if kept == content:
+                stripped.append(message)
+                continue
+            changed = True
+            if kept:
+                stripped.append({**message, "content": kept})
+        return stripped if changed else list(messages)
 
     @staticmethod
     def _strict_previous_turn_frozen_count(
@@ -1047,6 +1155,7 @@ class AnthropicHandlerMixin:
 
         from fastapi import HTTPException
         from fastapi.responses import JSONResponse, Response, StreamingResponse
+        from starlette.requests import ClientDisconnect
 
         from headroom.cache.compression_store import get_compression_store
         from headroom.ccr import CCRToolInjector
@@ -1331,6 +1440,16 @@ class AnthropicHandlerMixin:
                     body, original_body_bytes = await read_request_json_with_bytes(request)
             except RequestBodyTooLarge:
                 raise
+            except ClientDisconnect:
+                # The client (e.g. an interrupted/compacting Claude Code
+                # session) went away mid-read. There is no one left to answer
+                # and nothing to compress — bail out quietly instead of
+                # letting Starlette's own ClientDisconnect propagate up as an
+                # unhandled 500. Mirrors the existing guard on the batch
+                # passthrough path a few hundred lines below.
+                logger.debug("Client disconnected during body read for anthropic messages")
+                await _finalize_pre_upstream()
+                return Response(status_code=204)
             except (json.JSONDecodeError, ValueError) as e:
                 return JSONResponse(
                     status_code=400,
@@ -1403,7 +1522,13 @@ class AnthropicHandlerMixin:
                 sanitize_anthropic_model_id(raw_model) if isinstance(raw_model, str) else raw_model
             )
             body_model = body.get("model")
-            if isinstance(body_model, str) and model != body_model:
+            # Only inject model for LiteLLM-backed requests: native Vertex passthrough
+            # preserves the rawPredict wire format, where the model only exists in the URL.
+            if (isinstance(body_model, str) and model != body_model) or (
+                body_model is None
+                and model_override is not None
+                and self.anthropic_backend is not None
+            ):
                 body["model"] = model
                 body_mutation_tracker.mark_mutated("sanitize_model_id")
             messages = body.get("messages", [])
@@ -2982,11 +3107,15 @@ class AnthropicHandlerMixin:
                                     "in cache mode to preserve next-turn prefix stability"
                                 )
                             else:
+                                # After the last cache breakpoint, not into the
+                                # latest user turn: that turn is inside the
+                                # cached prefix (Claude Code's trailing system
+                                # marker sits after it). Mutating it makes the
+                                # next overlay/restart rewrite the conversation.
                                 optimized_messages = (
-                                    self._append_context_to_latest_non_frozen_user_turn(
+                                    self._append_proactive_expansion_after_cached_prefix(
                                         optimized_messages,
                                         expansion_text,
-                                        frozen_message_count=frozen_message_count,
                                     )
                                 )
 
@@ -3809,6 +3938,8 @@ class AnthropicHandlerMixin:
             # compression). Anthropic rejects that with a 400 ("messages.0: use
             # the top-level 'system' parameter ..."), so relocate it back to the
             # top-level ``system`` parameter as the last step before forwarding.
+            # A non-Claude model on a third-party upstream (configured target or
+            # per-request base URL) keeps the client's valid sections in place.
             relocated_messages, relocated_system, system_relocated = (
                 relocate_system_messages_to_top_level(
                     body["messages"],
@@ -3821,6 +3952,12 @@ class AnthropicHandlerMixin:
                             or _is_googleapis_endpoint(upstream_base_url)
                         )
                         else None
+                    ),
+                    third_party_model=is_third_party_model(
+                        model,
+                        third_party_upstream=bool(
+                            upstream_base_url or _third_party_anthropic_upstream
+                        ),
                     ),
                 )
             )
@@ -4037,7 +4174,10 @@ class AnthropicHandlerMixin:
                         # mode falls back to full unmodified passthrough every
                         # turn instead of compressing the append-only delta.
                         next_original_messages = copy.deepcopy(original_client_messages)
-                        next_forwarded_messages = copy.deepcopy(optimized_messages)
+                        tracker_forwarded = self._without_proactive_expansion_messages(
+                            optimized_messages
+                        )
+                        next_forwarded_messages = copy.deepcopy(tracker_forwarded)
                         assistant_message = self._assistant_message_from_response_json(
                             backend_response.body
                         )
@@ -4047,7 +4187,7 @@ class AnthropicHandlerMixin:
                         if hasattr(prefix_tracker, "classify_cache_miss"):
                             miss = prefix_tracker.classify_cache_miss(
                                 cache_read_tokens=cr_tokens,
-                                current_forwarded_messages=optimized_messages,
+                                current_forwarded_messages=tracker_forwarded,
                             )
                             from headroom.cache.ttl_observations import (
                                 record_cache_observation,
@@ -5157,9 +5297,14 @@ class AnthropicHandlerMixin:
                                 )
                                 await self.metrics.record_cache_bust(bust_tokens)
 
-                        # Update prefix cache tracker for next turn
+                        # Update prefix cache tracker for next turn. Omit the
+                        # CCR expansion turn: the client never resends it, so
+                        # overlay must replay the pre-injection bytes (#4287).
                         next_original_messages = copy.deepcopy(original_client_messages)
-                        next_forwarded_messages = copy.deepcopy(optimized_messages)
+                        tracker_forwarded = self._without_proactive_expansion_messages(
+                            optimized_messages
+                        )
+                        next_forwarded_messages = copy.deepcopy(tracker_forwarded)
                         assistant_message = self._assistant_message_from_response_json(resp_json)
                         if assistant_message is not None:
                             next_original_messages.append(copy.deepcopy(assistant_message))
@@ -5171,15 +5316,15 @@ class AnthropicHandlerMixin:
                         # longer TTL) or the cacheable prefix changed (content shifted).
                         # Classify BEFORE update_from_response, which overwrites the
                         # last-turn state the classifier reads (idle clock, prefix,
-                        # cached-token count). `optimized_messages` is the prefix we
-                        # forwarded this turn; compare it against last turn's.
+                        # cached-token count). Compare the snapshot we will record,
+                        # not the expansion turn the client will not resend.
                         # `hasattr` guard: some tests inject a SimpleNamespace stub
                         # tracker that only implements the freeze API, not the full
                         # PrefixCacheTracker surface.
                         if hasattr(prefix_tracker, "classify_cache_miss"):
                             miss = prefix_tracker.classify_cache_miss(
                                 cache_read_tokens=cr_tokens,
-                                current_forwarded_messages=optimized_messages,
+                                current_forwarded_messages=tracker_forwarded,
                             )
                             from headroom.cache.ttl_observations import (
                                 record_cache_observation,
