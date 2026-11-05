@@ -3940,6 +3940,7 @@ def _run_proxy_only_watcher(
     print_setup_lines: Callable[[int], None],
     anthropic_api_url: str | None = None,
     openai_api_url: str | None = None,
+    require_openai_api_url: bool = False,
     copilot_api_token: str | None = None,
     copilot_refresh_oauth_token: str | None = None,
     copilot_api_token_expires_at: float | None = None,
@@ -3982,6 +3983,10 @@ def _run_proxy_only_watcher(
 
     try:
         _print_wrap_banner(agent_label)
+        if no_proxy and require_openai_api_url and openai_api_url:
+            # Reject an incompatible listener before registering a client or
+            # telling the user to send their provider key through it.
+            _require_no_proxy_openai_upstream(port, openai_api_url)
         _register_proxy_client(port)
         proxy_holder[0], actual_port = _ensure_proxy(
             port,
@@ -3991,6 +3996,7 @@ def _run_proxy_only_watcher(
             agent_type=agent_type,
             anthropic_api_url=anthropic_api_url,
             openai_api_url=openai_api_url,
+            require_openai_api_url=require_openai_api_url,
             copilot_api_token=copilot_api_token,
             copilot_refresh_oauth_token=copilot_refresh_oauth_token,
             copilot_api_token_expires_at=copilot_api_token_expires_at,
@@ -8097,6 +8103,7 @@ def cline(
         memory=memory,
         agent_type="cline",
         openai_api_url=openai_api_url,
+        require_openai_api_url=bool(openai_api_url),
         print_setup_lines=_print_cline_setup,
     )
 
