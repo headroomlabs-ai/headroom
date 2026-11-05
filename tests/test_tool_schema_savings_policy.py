@@ -41,6 +41,7 @@ def test_tool_schema_savings_tags_are_stable() -> None:
     assert TOOL_SCHEMA_SAVINGS_TAGS == (
         "tool_search_deferred_tokens",
         "turn_hook_tools_saved_tokens",
+        "turn_hook_system_saved_tokens",
     )
 
 

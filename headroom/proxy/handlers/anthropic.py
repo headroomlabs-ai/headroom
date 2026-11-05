@@ -22,6 +22,7 @@ from urllib.parse import urlsplit
 from headroom.proxy.session_affinity import session_affinity_headers
 from headroom.proxy.stage_timer import StageTimer, emit_stage_timings_log
 from headroom.proxy.tool_schema_savings_policy import (
+    TURN_HOOK_SYSTEM_SAVED_TAG,
     billed_tools,
     hook_tool_counts,
     net_hook_tool_saving,
@@ -3710,6 +3711,7 @@ class AnthropicHandlerMixin:
             # registry check keeps this a no-op when no hook is registered.
             from headroom.proxy.turn_hooks import (
                 TurnContext,
+                count_system_tokens,
                 registered_turn_hooks,
                 run_request_hooks,
             )
@@ -3720,6 +3722,10 @@ class AnthropicHandlerMixin:
             # stays on the turn_hook_tools_saved_tokens tag.
             _th_tool_growth = 0
             _th_saved = 0
+            # System-prompt tokens a turn hook added, folded into the forwarded
+            # count below; shrinkage is on the turn_hook_system_saved_tokens tag
+            # (prefix-priced, like tool schemas).
+            _th_system_growth = 0
             _req_ctx: TurnContext | None = None
             if registered_turn_hooks():
                 _req_ctx = TurnContext(
@@ -3732,7 +3738,9 @@ class AnthropicHandlerMixin:
                     count_messages=tokenizer.count_messages,
                     count_tools=_count_tool_tokens,
                     deferred_tools_billed=_deferred_billed_eagerly,
+                    system=body.get("system"),
                 )
+                _th_sys_before = count_system_tokens(tokenizer.count_messages, body.get("system"))
                 # Snapshot BEFORE the hook (same tokenizer) so we can tell whether the
                 # hook itself folded — comparing against the pipeline's optimized_tokens
                 # instead conflates a real fold with a cross-estimator delta (see below).
@@ -3753,6 +3761,26 @@ class AnthropicHandlerMixin:
                 if _req_ctx.tools is not body.get("tools"):
                     tools = _req_ctx.tools
                     body["tools"] = tools
+                if _req_ctx.system is not body.get("system"):
+                    if _req_ctx.system is None:
+                        body.pop("system", None)
+                    else:
+                        body["system"] = _req_ctx.system
+                _th_sys_after = count_system_tokens(tokenizer.count_messages, _req_ctx.system)
+                if (
+                    _th_sys_before is not None
+                    and _th_sys_after is not None
+                    and _th_sys_before != _th_sys_after
+                ):
+                    _th_system_growth = max(0, _th_sys_after - _th_sys_before)
+                    if _th_sys_before > _th_sys_after:
+                        tags[TURN_HOOK_SYSTEM_SAVED_TAG] = (
+                            int(tags.get(TURN_HOOK_SYSTEM_SAVED_TAG, 0) or 0)
+                            + _th_sys_before
+                            - _th_sys_after
+                        )
+                    body_mutation_tracker.mark_mutated("turn_hook_system")
+                    transforms_applied.append("turn_hook:system")
                 # A hook may shrink the tool array either by replacing it or in place,
                 # so measure the FINAL tools object. Deferral-shaped (removes schemas
                 # count_messages never saw), hence a tag rather than a fold — mirrors
@@ -3892,6 +3920,8 @@ class AnthropicHandlerMixin:
                     optimized_tokens += _tool_tokens_after
                 # A tool a turn hook added is sent too: it reduces the saving.
                 optimized_tokens += _th_tool_growth
+                # So is system-prompt text a turn hook added.
+                optimized_tokens += _th_system_growth
                 # So is the CCR retrieve tool the proxy declared (the client
                 # never sent it), unless deferred and unloaded: its cost comes
                 # off this turn's saving.

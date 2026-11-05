@@ -59,6 +59,7 @@ from headroom.proxy.tool_schema_savings_policy import (
 )
 from headroom.proxy.turn_hooks import (
     TurnContext,
+    count_system_tokens,
     merge_provider_headers,
     registered_turn_hooks,
     run_request_hooks,
@@ -833,6 +834,9 @@ class RequestTransformResult:
     # Messages were rewritten by a stage the pipeline's own count never saw
     # (a hook fold, history repair): the caller must recount ``tokens_after``.
     messages_rewritten: bool = False
+    # The Anthropic top-level ``system`` after the hooks (the input object when
+    # no hook replaced it); ``None`` for other providers.
+    system: Any = None
 
 
 class RequestTransformer:
@@ -855,8 +859,10 @@ class RequestTransformer:
         config: Any,
         tags: dict[str, Any],
         caps: GatewayCapabilities,
+        system: Any = None,
     ) -> None:
         self.provider = provider
+        self.system = system
         self.model_name = model_name
         self.tools = tools
         self.config = config
@@ -876,6 +882,10 @@ class RequestTransformer:
         # them into ``tokens_before``/``tokens_after``, as the chat handlers do.
         self.compaction_tokens_before = 0
         self.compaction_tokens_after = 0
+        # System-prompt tokens before and after the hooks, both 0 when no hook
+        # changed it or it could not be counted; folded like compaction.
+        self.system_tokens_before = 0
+        self.system_tokens_after = 0
         self._tokenizer: Any = None
 
     def _get_tokenizer(self) -> Any:
@@ -938,9 +948,11 @@ class RequestTransformer:
             tags=self.tags,
             count_messages=count_messages,
             count_tools=count_tools,
+            system=self.system,
         )
         if hooks:
             msg_before = _safe_count(count_messages, messages)
+            system_before = count_system_tokens(count_messages, self.system)
             tools_snapshot = (
                 _safe_call(
                     tools_before_hook, tools, loading_history(self.provider, messages), count_tools
@@ -952,6 +964,15 @@ class RequestTransformer:
             run_request_hooks(ctx, stream_safe_only=not self.caps.redrive_allowed)
             messages = ctx.messages
             tools = ctx.tools
+            system_after = count_system_tokens(count_messages, ctx.system)
+            if (
+                system_before is not None
+                and system_after is not None
+                and system_before != system_after
+            ):
+                self.system_tokens_before = system_before
+                self.system_tokens_after = system_after
+                transforms.append("turn_hook:system")
             # Provider headers the hooks asked for become the contract's
             # ``headers`` object; the gateway sets them on the provider call.
             headers = merge_provider_headers(self.caps.request_headers, ctx.provider_headers)
@@ -1014,6 +1035,7 @@ class RequestTransformer:
             redrive_armed=redrive_armed,
             headers=headers,
             messages_rewritten=messages_rewritten,
+            system=ctx.system,
         )
         return messages
 

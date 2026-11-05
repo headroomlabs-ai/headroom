@@ -131,3 +131,46 @@ def test_message_growth_offsets_tools_a_hook_removed(
     else:
         assert entries == []
         assert headline == 0
+
+
+_STYLE = "Follow the house style guide in every answer. " * 40
+
+
+class _ShortenSystem:
+    name = savings_source = "system_trim"
+    stream_safe = True
+
+    def on_request(self, ctx: Any) -> None:
+        ctx.system = [
+            {**block, "text": "Use the house style."} if block.get("text") == _STYLE else block
+            for block in ctx.system
+        ]
+
+
+def test_a_hook_rewriting_the_system_prompt_is_forwarded_and_booked(
+    make_headroom_client,
+) -> None:
+    from headroom.tokenizers import get_tokenizer
+
+    register_turn_hook(_ShortenSystem())
+    client = make_headroom_client(optimize=False)
+    system = [{"type": "text", "text": _STYLE, "cache_control": {"type": "ephemeral"}}]
+    body = {
+        "model": "claude-sonnet-4-5",
+        "system": system,
+        "messages": [{"role": "user", "content": "hi"}],
+        "gateway": {"can_redrive": False, "can_relay_response": False},
+    }
+    resp = compress(client, body)
+    assert resp.status_code == 200, resp.text
+    out = resp.json()
+    forwarded = out["body"]["system"]
+    assert forwarded == [
+        {"type": "text", "text": "Use the house style.", "cache_control": {"type": "ephemeral"}}
+    ]
+    count = get_tokenizer("claude-sonnet-4-5").count_messages
+    expected = count([{"role": "system", "content": system}]) - count(
+        [{"role": "system", "content": forwarded}]
+    )
+    assert out["tokens_saved"] + out["tool_tokens_saved"] == expected > 0
+    assert "turn_hook:system" in out["transforms_applied"]
