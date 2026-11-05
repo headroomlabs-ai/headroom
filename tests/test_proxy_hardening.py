@@ -161,7 +161,8 @@ class TestInboundAuthToken:
 
     @pytest.mark.parametrize("path", ["/api/hello", "/p/demo/api/hello"])
     @pytest.mark.parametrize("method", ["GET", "HEAD"])
-    def test_api_hello_probe_is_answered_locally(self, monkeypatch, method, path):
+    @pytest.mark.parametrize("override", [None, "http://127.0.0.1:1", "http://169.254.169.254"])
+    def test_api_hello_probe_is_answered_locally(self, monkeypatch, method, path, override):
         """The SDK reachability probe never carries custom headers, so it can't
         hold the token. It is answered locally: 200, empty, never relayed, also
         under a /p/<project> base URL."""
@@ -174,7 +175,11 @@ class TestInboundAuthToken:
         monkeypatch.setattr(OpenAIHandlerMixin, "handle_passthrough", _spy_passthrough)
         app = _make_app(proxy_token="s3cr3t-token")
         with TestClient(app, base_url="http://testserver", client=NONLOOPBACK) as c:
-            resp = c.request(method, path)
+            resp = c.request(
+                method,
+                path,
+                headers={"x-headroom-base-url": override} if override else None,
+            )
         assert resp.status_code == 200
         assert resp.content == b""
         assert resp.headers["X-Content-Type-Options"] == "nosniff"
