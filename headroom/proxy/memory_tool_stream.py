@@ -57,7 +57,8 @@ def _parse_frame(frame: bytes) -> tuple[str | None, dict[str, Any] | None]:
     """Return ``(event_name, payload)`` for one complete SSE frame."""
     event_name: str | None = None
     data_lines: list[str] = []
-    for line in frame.decode("utf-8").splitlines():
+    for raw_line in frame.splitlines():
+        line = raw_line.decode("utf-8")
         if line.startswith(SSE_EVENT_LINE_PREFIX):
             event_name = line[len(SSE_EVENT_LINE_PREFIX) :].strip()
         elif line.startswith(SSE_DATA_LINE_PREFIX):
