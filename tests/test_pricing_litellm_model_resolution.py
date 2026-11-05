@@ -47,9 +47,15 @@ def test_retired_claude_3_sonnet_aliases_to_sonnet_tier_not_haiku() -> None:
     alias = MODEL_ALIASES["claude-3-sonnet-20240229"]
 
     assert "haiku" not in alias
+    assert "sonnet" in alias
     # Same-tier target as the other retired-Sonnet aliases.
     assert alias == MODEL_ALIASES["claude-3-5-sonnet-20241022"]
-    assert alias == "claude-sonnet-4-20250514"
+    # Deliberately not a specific release: this asserted
+    # "claude-sonnet-4-20250514" until litellm pruned that id, at which point
+    # the alias had to move and this test broke for naming the target rather
+    # than the property it cares about. That the target is *priced*, and priced
+    # at Sonnet rates rather than the unknown-model default, is asserted in
+    # tests/test_model_alias_targets_are_priced.py.
 
 
 def test_resolve_litellm_model_name_returns_first_known_candidate() -> None:

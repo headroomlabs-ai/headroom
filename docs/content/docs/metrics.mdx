@@ -25,7 +25,9 @@ curl http://localhost:8787/stats
     "total": 42,
     "cached": 5,
     "rate_limited": 0,
-    "failed": 0
+    "rate_limited_by_source": { "headroom": 0, "upstream": 0 },
+    "failed": 0,
+    "failed_by_provider": {}
   },
   "tokens": {
     "input": 50000,
@@ -43,6 +45,14 @@ curl http://localhost:8787/stats
   }
 }
 ```
+
+`requests.total` is the **completed**-request count, not total traffic: a request that
+ended in a 4xx, 5xx or 429 is counted under `requests.failed` or `requests.rate_limited`
+instead and never reaches `total`. `rate_limited_by_source` splits 429s into
+`headroom` (Headroom's own rate limiter refused the request) and `upstream` (the provider
+refused it) — different problems, different fixes. `failed_by_provider` attributes failures
+to the upstream that produced them. The unlabelled `rate_limited` / `failed` totals are
+unchanged.
 
 Persistent savings are stored at `~/.headroom/proxy_savings.json` and survive proxy restarts. Override the path with `HEADROOM_SAVINGS_PATH`.
 
@@ -82,7 +92,26 @@ headroom_latency_ms_count 1234
 
 # HELP headroom_provider_cache_hit_requests_total Requests that read from the provider's prompt cache
 headroom_provider_cache_hit_requests_total{provider="anthropic"} 456
+
+# HELP headroom_requests_failed_total Requests that failed upstream (4xx and 5xx, excluding 429), by provider
+headroom_requests_failed_total{provider="anthropic"} 3
+
+# HELP headroom_requests_rate_limited_total Requests rejected with 429, by who rejected them (headroom=our own limiter, upstream=the provider)
+headroom_requests_rate_limited_total{source="headroom"} 0
+headroom_requests_rate_limited_total{source="upstream"} 12
 ```
+
+<Callout type="warn" title="requests_total is completed requests, not all traffic">
+`headroom_requests_total` counts requests that **completed**. A request that ended in a 4xx,
+5xx or 429 lands in `headroom_requests_failed_total` / `headroom_requests_rate_limited_total`
+and is not in `requests_total` — so a failure rate must add `failed` back into its own
+denominator. `headroom_inbound_requests_total` is the all-traffic counter.
+
+`headroom_requests_failed_total` gained a `provider` label and
+`headroom_requests_rate_limited_total` a `source` label, so unaggregated queries on them now
+return several series. `sum without (provider) (...)` and `sum without (source) (...)`
+reproduce the previous single-series behaviour.
+</Callout>
 
 <Callout type="warn" title="No percentile buckets on /metrics">
 There are no Prometheus histogram buckets for compression ratio or latency — build percentiles or averages from `_sum` / `_count` pairs (`headroom_latency_ms_sum`, `headroom_latency_ms_count`, and so on), or use the `headroom perf` CLI for real p95/p99.
@@ -351,7 +380,8 @@ Env: `HEADROOM_BUDGET_ESTIMATED_BASIS`. `headroom doctor` reports the estimated 
 | `headroom_persistent_savings_tokens_saved_total` | Durable lifetime tokens saved from `/stats.persistent_savings` | Higher is better |
 | `headroom_overhead_ms_sum` / `headroom_overhead_ms_count` | Mean latency Headroom itself adds (there are no percentile buckets — see the callout above) | Low is better |
 | `headroom_provider_cache_hit_requests_total` / `headroom_provider_cache_requests_total` | Cache effectiveness, by provider | >20% is good |
-| `headroom_requests_failed_total` | Reliability (upstream 5xx errors) | 0 |
+| `headroom_requests_failed_total{provider}` | Reliability — upstream **4xx and 5xx** (429s are counted separately), attributed to the provider that failed | 0 |
+| `headroom_requests_rate_limited_total{source}` | Throttling — `source="headroom"` is Headroom's own rate limiter, `source="upstream"` is the provider's | 0 |
 
 ## Grafana Dashboard
 

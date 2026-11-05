@@ -62,11 +62,33 @@ class TabularCompressionResult:
 
 
 def parse_csv(content: str, delimiter: str = ",") -> tuple[list[str], list[list[str]]]:
-    """Parse delimited text via the stdlib csv reader."""
+    """Parse delimited text via the stdlib csv reader.
+
+    Returns no rows when the reader refuses the text. The one that reaches real
+    content is ``csv.field_size_limit``, 128 KB per cell by default: a single
+    pasted document or base64 blob in one column raises
+    ``Error: field larger than field limit (131072)`` for the whole file.
+    Raising that limit is process-global state a library should not be setting
+    on its host, so the table is treated as non-tabular instead and the caller
+    passes the text through verbatim, as it already does for a ragged table.
+    """
     reader = csv.reader(io.StringIO(content), delimiter=delimiter)
-    parsed = [row for row in reader if any(cell.strip() for cell in row)]
-    if not parsed:
+    try:
+        parsed = [row for row in reader if row and not (len(row) == 1 and not row[0].strip())]
+    except csv.Error:
         return [], []
+    # Trim all-blank rows at both ends, but keep interior ones so the row
+    # count survives, like spreadsheet_ingest._rows_to_csv. One pass and one
+    # slice: popping index 0 per leading blank row is quadratic. An interior
+    # all-blank row is normalized to empty cells, so a whitespace-only row and
+    # an empty row compress the same.
+    filled = [i for i, row in enumerate(parsed) if any(cell.strip() for cell in row)]
+    if not filled:
+        return [], []
+    parsed = [
+        row if any(cell.strip() for cell in row) else [""] * len(row)
+        for row in parsed[filled[0] : filled[-1] + 1]
+    ]
     headers = [h.strip() for h in parsed[0]]
     return headers, parsed[1:]
 
@@ -85,7 +107,10 @@ def parse_markdown_table(content: str) -> tuple[list[str], list[list[str]]]:
     if len(lines) < 2:
         return [], []
     headers = split_row(lines[0])
-    rows = [split_row(ln) for ln in lines[1:] if not is_separator(ln)]
+    body_lines = lines[1:]
+    if body_lines and is_separator(body_lines[0]):
+        body_lines = body_lines[1:]
+    rows = [split_row(ln) for ln in body_lines]
     return headers, rows
 
 
@@ -124,6 +149,10 @@ def parse_tabular(
         return None
 
     fmt = detection.metadata.get("format", "csv")
+    if fmt == "git_status":
+        # Status headings and state/path entries are structured control data,
+        # but not a rectangular table; never reinterpret them as CSV rows.
+        return None
     if fmt == "markdown":
         headers, rows = parse_markdown_table(content)
     elif fmt == "fixed_width":
@@ -140,6 +169,16 @@ def parse_tabular(
     # didn't (#1652). Treat them as non-tabular and pass through verbatim.
     width = len(headers)
     if any(len(row) != width for row in rows):
+        return None
+    # Repeated header names (a SQL join's `id,name,id,name`, or blank markdown
+    # header cells) collide as record keys: each row keeps only the last
+    # column of each name, and the others are dropped. Pass through verbatim.
+    if len(set(headers)) != width:
+        return None
+    # The detector finds fixed-width columns by single-space gutters, but the
+    # parser splits on 2+ spaces, so a table like GNU `ls -l` can come back as
+    # one cell per line. That is not a table; leave it verbatim.
+    if fmt == "fixed_width" and width < 2:
         return None
     return headers, rows, fmt
 

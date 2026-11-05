@@ -318,6 +318,50 @@ def test_extension_savings_surface_in_stats(
         }
 
 
+@pytest.mark.asyncio
+async def test_turn_hook_savings_surface_in_stats_extension_savings(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``ctx.record_savings`` from a turn hook must reach ``/stats.extension_savings``.
+
+    Before, only ``record_extension_savings`` filled the field and core never
+    calls it, so ``/stats`` showed ``{}`` while a hook saved ~8K tokens a request.
+    Estimated rows stay out, and a plugin reporting through both APIs (hdr) is
+    not counted twice.
+    """
+    from fastapi.testclient import TestClient
+
+    from headroom.proxy.server import ProxyConfig, create_app
+
+    monkeypatch.setenv("HEADROOM_SAVINGS_PATH", str(tmp_path / "proxy_savings.json"))
+    app = create_app(ProxyConfig(cache_enabled=False, rate_limit_enabled=False, log_requests=False))
+    with TestClient(app) as client:
+        metrics = app.state.proxy.metrics
+        for _ in range(2):
+            await metrics.record_request(
+                provider="openai",
+                model="gpt-5.4",
+                input_tokens=1000,
+                output_tokens=10,
+                tokens_saved=0,
+                latency_ms=1.0,
+                savings_attribution=[
+                    {"source": "tool_search", "realized": True, "tokens": 8000},
+                    {"source": "tool_search", "realized": False, "estimated": True, "tokens": 500},
+                    {"source": "hdr", "realized": True, "tokens": 300},
+                ],
+            )
+            metrics.record_extension_savings("hdr", 300)
+
+        stats = client.get("/stats").json()
+
+    assert stats["extension_savings"] == {"tool_search": 16000, "hdr": 600}
+    by_source = {
+        (row["source"], row["realized"]): row["tokens"] for row in stats["savings"]["by_source"]
+    }
+    assert by_source[("tool_search", False)] == 1000
+
+
 def test_prometheus_metrics_accumulates_codex_ws_unit_and_frame_counters():
     from headroom.proxy.prometheus_metrics import PrometheusMetrics
 
