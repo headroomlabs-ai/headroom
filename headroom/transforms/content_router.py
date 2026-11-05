@@ -2767,7 +2767,7 @@ class ContentRouter(Transform):
         # clear (no LRU bookkeeping — this is a within-request hit, not a
         # long-lived cache; `_cache` is the cross-request one).
         self._lossless_first_memo: dict[
-            tuple[int, int, CompressionStrategy, int], tuple[str, str | None]
+            tuple[int, int, CompressionStrategy, int, bool], tuple[str, str | None]
         ] = {}
         # Companion memo for the third-party half of STAGE 0, keyed by content
         # (plus the provider generation) but NOT by strategy — the provider
@@ -3807,7 +3807,9 @@ class ContentRouter(Transform):
         # that DEPENDS on the registered provider, so a provider registered (or
         # cleared) after a block was first folded must not be served the old
         # answer forever.
-        config_enabled = getattr(getattr(self, "config", None), "enable_config_compressor", False)
+        config_enabled = bool(
+            getattr(getattr(self, "config", None), "enable_config_compressor", False)
+        )
         memo_key = (
             hash(content),
             len(content),
