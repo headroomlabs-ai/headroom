@@ -398,7 +398,9 @@ def test_core_tools_match_leading_underscore_namespace() -> None:
 
 from headroom.proxy.helpers import (  # noqa: E402
     _CLIENT_TOOL_REF_PLACEHOLDER,
+    _tool_search_reference_names,
     strip_unsupported_tool_search_blocks,
+    strip_unsupported_tool_search_references,
 )
 
 _SEARCH_TOOL = {"type": _TOOL_SEARCH_DEFAULT_TYPE, "name": _TOOL_SEARCH_DEFAULT_NAME}
@@ -811,3 +813,115 @@ def test_repair_does_not_move_signed_thinking_blocks() -> None:
         for block in message["content"]
         if block["type"] in ("tool_search_tool_result", "server_tool_use")
     ]
+
+
+# ---------------------------------------------------------------------------
+# tools-array repair: a tool_reference naming the search tool itself
+# ---------------------------------------------------------------------------
+
+
+def test_reference_repair_drops_typed_search_tool_reference() -> None:
+    # Anthropic answered a match-all search (empty input) with a hit on its own
+    # server tool.  Claude Code stored it in the session's loaded-tool set and
+    # replays it as a tool_reference, so every later turn 400s with "Tool
+    # reference 'tool_search_tool_regex' not found in available tools".  The
+    # block repair cannot see this: the poison is in tools, not the history.
+    tools = [
+        _SEARCH_TOOL,
+        {"type": "tool_reference", "name": _TOOL_SEARCH_DEFAULT_NAME},
+        {"type": "tool_reference", "name": "Bash"},
+        {"name": "Read", "input_schema": {}},
+    ]
+    repaired, removed = strip_unsupported_tool_search_references(tools)
+    assert removed == 1
+    assert {"type": "tool_reference", "name": "Bash"} in repaired
+    assert _SEARCH_TOOL in repaired  # the search mechanism itself must survive
+    assert all(
+        t.get("name") != _TOOL_SEARCH_DEFAULT_NAME
+        for t in repaired
+        if t.get("type") == "tool_reference"
+    )
+
+
+def test_reference_repair_is_a_noop_on_a_clean_tools_array() -> None:
+    # Identity return, so the caller skips the write-back and the prefix cache
+    # is not disturbed on the overwhelming majority of requests.
+    tools = [_SEARCH_TOOL, {"type": "tool_reference", "name": "Bash"}]
+    repaired, removed = strip_unsupported_tool_search_references(tools)
+    assert removed == 0
+    assert repaired is tools
+
+
+def test_reference_repair_keeps_a_deferred_tool_named_like_a_search_tool() -> None:
+    # A typeless client tool may legitimately be called "tool_search_tool_*".
+    # It is a normal reference target, not a search mechanism, so a reference to
+    # it must survive: the request carries no typed mechanism under that name.
+    # Matching on the name prefix alone would wrongly strip it.
+    deferred = {"name": "tool_search_tool_custom", "input_schema": {}}
+    tools = [
+        _SEARCH_TOOL,
+        deferred,
+        {"type": "tool_reference", "name": "tool_search_tool_custom"},
+    ]
+    repaired, removed = strip_unsupported_tool_search_references(tools)
+    assert removed == 0
+    assert repaired is tools
+
+
+def test_reference_repair_keeps_prefixed_reference_with_no_matching_mechanism() -> None:
+    # Prefix-shaped reference, but this request carries no typed search tool at
+    # all — there is nothing for it to be a self-reference to, so it is not ours
+    # to remove.  Dropping it here would delete a reference the request needs.
+    tools = [
+        {"name": "Bash", "input_schema": {}},
+        {"type": "tool_reference", "name": _TOOL_SEARCH_DEFAULT_NAME},
+    ]
+    repaired, removed = strip_unsupported_tool_search_references(tools)
+    assert removed == 0
+    assert repaired is tools
+
+
+def test_reference_repair_matches_mechanism_name_exactly() -> None:
+    # Scoped to the mechanism names actually present: the exact name goes, a
+    # merely prefix-sharing sibling stays.
+    tools = [
+        _SEARCH_TOOL,
+        {"type": "tool_reference", "name": _TOOL_SEARCH_DEFAULT_NAME},
+        {"type": "tool_reference", "name": _TOOL_SEARCH_DEFAULT_NAME + "_other"},
+    ]
+    repaired, removed = strip_unsupported_tool_search_references(tools)
+    assert removed == 1
+    kept_names = [t.get("name") for t in repaired if t.get("type") == "tool_reference"]
+    assert kept_names == [_TOOL_SEARCH_DEFAULT_NAME + "_other"]
+
+
+def test_reference_repair_uses_the_file_wide_name_precedence() -> None:
+    # One precedence rule for the file: ``tool_name`` wins over ``name``, as in
+    # _tool_search_reference_names. An entry carrying both keys is judged by
+    # ``tool_name``, so these two readers can never disagree about it.
+    tools = [
+        _SEARCH_TOOL,
+        {"type": "tool_reference", "tool_name": _TOOL_SEARCH_DEFAULT_NAME, "name": "Bash"},
+        {"type": "tool_reference", "tool_name": "Bash", "name": _TOOL_SEARCH_DEFAULT_NAME},
+    ]
+    repaired, removed = strip_unsupported_tool_search_references(tools)
+    assert removed == 1
+    assert repaired == [
+        _SEARCH_TOOL,
+        {"type": "tool_reference", "tool_name": "Bash", "name": _TOOL_SEARCH_DEFAULT_NAME},
+    ]
+    # Same answer from the history-side reader for the same entries.
+    assert _tool_search_reference_names(tools[1:]) == [_TOOL_SEARCH_DEFAULT_NAME, "Bash"]
+
+
+def test_reference_repair_registers_a_mechanism_named_by_tool_name() -> None:
+    # A mechanism shaped like a server-side block (``tool_name``, no ``name``)
+    # must still register, symmetric with the liberal reference matching.
+    tools = [
+        {"type": _TOOL_SEARCH_DEFAULT_TYPE, "tool_name": _TOOL_SEARCH_DEFAULT_NAME},
+        {"type": "tool_reference", "name": _TOOL_SEARCH_DEFAULT_NAME},
+        {"type": "tool_reference", "name": "Bash"},
+    ]
+    repaired, removed = strip_unsupported_tool_search_references(tools)
+    assert removed == 1
+    assert {"type": "tool_reference", "name": "Bash"} in repaired

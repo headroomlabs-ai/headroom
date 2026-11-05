@@ -42,7 +42,16 @@ def test_blocks_internal_and_invalid(url: str) -> None:
     assert is_safe_upstream_url(url) is False
 
 
-@pytest.mark.parametrize("url", ["https://8.8.8.8/v1", "https://1.1.1.1/", "wss://9.9.9.9/rt"])
+@pytest.mark.parametrize(
+    "url",
+    [
+        "https://8.8.8.8/v1",
+        "https://1.1.1.1/",
+        "wss://9.9.9.9/rt",
+        # NAT64 well-known prefix embedding 8.8.8.8: the translator delivers it there.
+        "https://[64:ff9b::808:808]/v1",
+    ],
+)
 def test_allows_public(url: str) -> None:
     assert is_safe_upstream_url(url) is True
 
@@ -63,7 +72,12 @@ def test_allows_public(url: str) -> None:
         ("6to4 embedding loopback", "http://[2002:7f00:1::]/"),
         ("6to4 embedding RFC1918", "http://[2002:a00:1::]/"),
         ("NAT64 embedding loopback", "http://[64:ff9b::7f00:1]/"),
+        ("NAT64 embedding RFC1918", "http://[64:ff9b::a00:1]/"),
+        ("NAT64 embedding metadata", "http://[64:ff9b::a9fe:a9fe]/"),
         ("NAT64 local-use prefix", "http://[64:ff9b:1::7f00:1]/"),
+        # Local-use embedding depends on the operator's prefix length, so the
+        # low 32 bits are not reliably the destination: never unwrapped.
+        ("NAT64 local-use prefix embedding a public IPv4", "http://[64:ff9b:1::808:808]/"),
         ("teredo", "http://[2001:0::7f00:1]/"),
         ("IPv4-mapped metadata", "http://[::ffff:169.254.169.254]/"),
         ("IPv4-mapped loopback", "http://[::ffff:127.0.0.1]/"),
@@ -582,6 +596,33 @@ def test_a_check_pins_every_address_it_accepted(monkeypatch: pytest.MonkeyPatch)
     assert upstream_guard.validated_addresses("multi.homed.example") == ("8.8.8.8", "1.1.1.1")
 
 
+def test_a_dns64_answer_for_a_public_host_is_accepted_and_pinned(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """On a DNS64 network an IPv4-only host also gets a synthesized `64:ff9b::` AAAA.
+
+    Judging that AAAA as reserved rejected every IPv4-only upstream there, and
+    the OpenAI handler then sent the request -- key included -- to the
+    configured upstream instead.
+    """
+    from headroom.proxy import upstream_guard
+
+    def dns64_answer(*args: object, **kwargs: object) -> list[object]:
+        return [
+            (None, None, None, None, ("8.8.8.8", 443)),
+            (None, None, None, None, ("64:ff9b::808:808", 443, 0, 0)),
+        ]
+
+    monkeypatch.setattr(socket, "getaddrinfo", dns64_answer)
+    upstream_guard.clear_validated_addresses()
+
+    assert is_safe_upstream_url("https://ipv4-only.example/v1") is True
+    assert upstream_guard.validated_addresses("ipv4-only.example") == (
+        "8.8.8.8",
+        "64:ff9b::808:808",
+    )
+
+
 def test_a_rejected_or_allowlisted_destination_pins_nothing(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -844,6 +885,136 @@ async def test_a_guarded_upstream_through_a_proxy_is_refused(
 
     assert "rebind.example" in str(refused.value)
     assert "proxy" in str(refused.value)
+
+
+class _ResolvingProxy(httpx.AsyncBaseTransport):
+    """Stands in for the proxy: resolves the target by name, as a real one does.
+
+    Its lookup is the second, independent resolution the guard cannot see, so a
+    test can hand it a different answer from the one the guard judged.
+    """
+
+    def __init__(self) -> None:
+        self.dialled: list[str] = []
+
+    async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
+        infos = socket.getaddrinfo(request.url.host, None)
+        self.dialled.append(str(infos[0][4][0]))
+        return httpx.Response(200)
+
+
+def _proxied_transport(client: httpx.AsyncClient, url: str) -> _ResolvingProxy:
+    from headroom.proxy.upstream_pinning import GuardedUpstreamRefusingTransport
+
+    transport = client._transport_for_url(httpx.URL(url))
+    assert isinstance(transport, GuardedUpstreamRefusingTransport)
+    proxy = _ResolvingProxy()
+    transport._inner = proxy
+    return proxy
+
+
+@pytest.mark.parametrize("listed", [None, "api.example.com"])
+async def test_proxy_rebinding_to_an_internal_address_stays_refused(
+    monkeypatch: pytest.MonkeyPatch, listed: str | None
+) -> None:
+    """Headroom sees a public answer, the proxy would see metadata: refused.
+
+    Neither with HEADROOM_PROXIED_BASE_URLS unset nor with it naming some other
+    host may a guarded destination reach the proxy, because the proxy's own
+    lookup is the one an attacker who controls the name answers differently.
+    The refusal lands before the proxy is contacted, so that lookup never runs.
+    """
+    from headroom.proxy import upstream_guard
+    from headroom.proxy.upstream_pinning import UnpinnableUpstreamError, install_upstream_pinning
+
+    resolver = _RebindingResolver("rebind.example", first="8.8.8.8", then="169.254.169.254")
+    monkeypatch.setattr(socket, "getaddrinfo", resolver)
+    if listed is None:
+        monkeypatch.delenv("HEADROOM_PROXIED_BASE_URLS", raising=False)
+    else:
+        monkeypatch.setenv("HEADROOM_PROXIED_BASE_URLS", listed)
+    upstream_guard.clear_validated_addresses()
+
+    client = install_upstream_pinning(_client_through_proxy("http://proxy.internal:3128"))
+    try:
+        proxy = _proxied_transport(client, "https://rebind.example/v1")
+        assert is_safe_upstream_url("https://rebind.example/v1") is True
+        with pytest.raises(UnpinnableUpstreamError):
+            await client._transport_for_url(
+                httpx.URL("https://rebind.example/v1")
+            ).handle_async_request(httpx.Request("POST", "https://rebind.example/v1"))
+    finally:
+        await client.aclose()
+
+    assert proxy.dialled == []
+    assert resolver.calls == 1  # the guard's lookup only
+
+
+async def test_a_listed_host_leaves_through_the_proxy(monkeypatch: pytest.MonkeyPatch) -> None:
+    """HEADROOM_PROXIED_BASE_URLS forwards the destinations the operator named.
+
+    Behind a proxy a local agent integration (Grok, OpenCode) was refused
+    outright. Listing its provider lets the guarded request out through the
+    proxy after the guard has judged it; an unlisted host on the same client,
+    and a listed URL's other ports, are still refused.
+    """
+    from headroom.proxy import upstream_guard
+    from headroom.proxy.upstream_pinning import UnpinnableUpstreamError, install_upstream_pinning
+
+    monkeypatch.setattr(
+        socket, "getaddrinfo", lambda *a, **k: [(None, None, None, None, ("8.8.8.8", 443))]
+    )
+    monkeypatch.setenv("HEADROOM_PROXIED_BASE_URLS", "api.example, https://gw.example")
+    upstream_guard.clear_validated_addresses()
+
+    client = install_upstream_pinning(_client_through_proxy("http://proxy.internal:3128"))
+    try:
+        for url, forwarded in [
+            ("https://api.example/v1", True),
+            ("http://api.example:8080/v1", True),
+            ("https://gw.example/v1", True),
+            ("https://gw.example:8443/v1", False),
+            ("https://other.example/v1", False),
+        ]:
+            proxy = _proxied_transport(client, url)
+            transport = client._transport_for_url(httpx.URL(url))
+            assert is_safe_upstream_url(url) is True
+            request = httpx.Request("POST", url)
+            if forwarded:
+                assert (await transport.handle_async_request(request)).status_code == 200, url
+                assert proxy.dialled == ["8.8.8.8"], url
+            else:
+                with pytest.raises(UnpinnableUpstreamError):
+                    await transport.handle_async_request(request)
+                assert proxy.dialled == [], url
+    finally:
+        await client.aclose()
+
+
+async def test_a_listed_host_keeps_every_other_refusal(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Listing covers proxy routes only, and never admits an internal answer."""
+    from headroom.proxy import upstream_guard
+    from headroom.proxy.upstream_pinning import (
+        GuardedUpstreamRefusingTransport,
+        UnpinnableUpstreamError,
+    )
+
+    monkeypatch.setattr(
+        socket, "getaddrinfo", lambda *a, **k: [(None, None, None, None, ("8.8.8.8", 443))]
+    )
+    monkeypatch.setenv("HEADROOM_PROXIED_BASE_URLS", "api.example,internal.example")
+    upstream_guard.clear_validated_addresses()
+
+    assert is_safe_upstream_url("https://api.example/v1") is True
+    poolless = GuardedUpstreamRefusingTransport(_ResolvingProxy(), "no pool")
+    with pytest.raises(UnpinnableUpstreamError):
+        await poolless.handle_async_request(httpx.Request("POST", "https://api.example/v1"))
+
+    monkeypatch.setattr(
+        socket, "getaddrinfo", lambda *a, **k: [(None, None, None, None, ("10.0.0.5", 443))]
+    )
+    upstream_guard.clear_validated_addresses()
+    assert is_safe_upstream_url("https://internal.example/v1") is False
 
 
 async def test_a_proxied_client_still_pins_its_direct_transport(

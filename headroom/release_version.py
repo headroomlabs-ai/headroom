@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 import re
+import subprocess
 from collections.abc import Sequence
 from dataclasses import dataclass, replace
 from pathlib import Path
@@ -246,10 +247,7 @@ def compute_release_version(
 def get_canonical_version(root: Path) -> str:
     """Read the canonical project version from pyproject.toml."""
 
-    try:
-        import tomllib
-    except ModuleNotFoundError:  # pragma: no cover - Python 3.10 compatibility
-        import tomli as tomllib
+    import tomllib
 
     with open(root / "pyproject.toml", "rb") as file:
         project = tomllib.load(file)["project"]
@@ -265,6 +263,8 @@ def list_release_tags(root: Path) -> list[str]:
         check=True,
         capture_output=True,
         text=True,
+        stdin=subprocess.DEVNULL,
+        timeout=10,
     )
     return [tag.strip() for tag in result.stdout.splitlines() if tag.strip()]
 
@@ -284,6 +284,8 @@ def list_release_commits(root: Path, previous_tag: str) -> list[CommitInfo]:
         check=True,
         capture_output=True,
         text=True,
+        stdin=subprocess.DEVNULL,
+        timeout=10,
     )
 
     commits: list[CommitInfo] = []
@@ -307,6 +309,8 @@ def commit_height_since(root: Path, previous_tag: str) -> str:
         check=True,
         capture_output=True,
         text=True,
+        stdin=subprocess.DEVNULL,
+        timeout=10,
     )
     return result.stdout.strip() or "0"
 

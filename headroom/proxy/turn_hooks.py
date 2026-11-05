@@ -21,10 +21,18 @@ the same deprecation policy.
 
 from __future__ import annotations
 
+import inspect
 import logging
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass, field
-from typing import Any, Protocol, runtime_checkable
+from types import MappingProxyType
+from typing import Any, Literal, Protocol, runtime_checkable
+
+from headroom.proxy.tool_schema_savings_policy import (
+    deferred_booking,
+    reconcile_deferred_tokens,
+    without_deferral_flags,
+)
 
 log = logging.getLogger(__name__)
 
@@ -84,10 +92,31 @@ class TurnContext:
         )
 
 
+@dataclass(frozen=True)
+class ResponsesCreate:
+    """One OpenAI Responses create request, before the proxy rewrites it.
+
+    ``body`` is a read-only view of the Responses payload (for a WebSocket
+    ``response.create`` frame, the inner ``response`` object). ``headers``
+    are the client's request headers, or the WebSocket handshake headers,
+    looked up by lowercase name. ``connection_id`` names the WebSocket
+    connection the frame arrived on (``None`` over HTTP): a
+    ``previous_response_id`` chain lives within one connection, so it is the
+    key for anything a hook must hold across a chain's frames. A reconnect
+    gets a new id; Codex's first frame on it replays the full transcript
+    rather than continuing the old chain, so it arrives as a fresh request.
+    """
+
+    body: Mapping[str, Any]
+    headers: Mapping[str, str]
+    transport: Literal["http", "websocket"]
+    connection_id: str | None = None
+
+
 @runtime_checkable
 class TurnHook(Protocol):
-    """A registered turn observer. Both methods are optional (a hook may define
-    either); missing methods are simply skipped."""
+    """A registered turn observer. Every method is optional (a hook may define
+    any of them); missing methods are simply skipped."""
 
     name: str
 
@@ -98,9 +127,10 @@ class TurnHook(Protocol):
     stream_safe: bool
 
     # Optional: run order among registered hooks, lowest first (stable for
-    # ties; absent ⇒ DEFAULT_HOOK_PRIORITY). Convention: routers that change
-    # ``ctx.model`` 10-49, message folds 50-99, tool-catalog shaping that is
-    # gated on the final model (deferral) 200+. Registration order is
+    # ties; absent ⇒ DEFAULT_HOOK_PRIORITY). Convention: routers 10-49 (an
+    # OpenAI Responses router rewrites the model in ``on_responses_create``,
+    # which runs before every ``on_request``), message folds 50-99,
+    # tool-catalog shaping that is gated on the final model (deferral) 200+. Registration order is
     # entry-point discovery order, which an operator does not control, so a
     # hook whose correctness depends on running after another must say so.
     priority: int
@@ -115,6 +145,26 @@ class TurnHook(Protocol):
 
         May ``await call_model(messages)`` to re-drive the model (e.g. to resolve
         an injected tool call), looping as needed before returning the final."""
+
+    async def on_responses_create(self, request: ResponsesCreate) -> dict[str, Any] | None:
+        """Return a replacement body for an OpenAI Responses create request,
+        or ``None`` to leave it unchanged.
+
+        Called once per HTTP ``/v1/responses`` body and once per WebSocket
+        ``response.create`` frame, on the event loop, before compression and
+        every model-gated stage (not when the client sent the Headroom bypass
+        header). This is where a router changes the model or reasoning effort:
+        unlike ``on_request`` it runs whether or not compression is enabled.
+
+        Everything after it -- memory, compression, tool-search deferral,
+        token counting, pricing, metrics, the WS continuation template -- sees
+        the replacement; the next hook gets it as its ``request.body``. The
+        view is read-only at the top level and nested values are shared with
+        the live request, so build replacements (``{**body, "reasoning":
+        {...}}``) rather than mutating nested dicts or lists. A hook that
+        raises then leaves nothing half-applied, and a request no hook
+        replaced keeps the client's original bytes. Keep it fast: it is awaited inline on every frame, so
+        no network I/O."""
 
 
 _hooks: list[TurnHook] = []
@@ -198,40 +248,80 @@ def run_request_hooks(ctx: TurnContext, *, stream_safe_only: bool = False) -> No
     working on streamed OpenAI-compatible traffic. Default off ⇒ conservative:
     a hook is treated as buffered-only unless it declares itself stream-safe.
     """
+    # Deferral booked before or by a hook; reconciled once every hook has run,
+    # since a later hook may un-defer booked tools (tool search's hot tools).
+    booking = deferred_booking(ctx.tags, ctx.tools)
+    # Positive nets wait until every hook has run: a later hook that grows the
+    # request (adds a tool) offsets earlier savings, so the ledger never credits
+    # more than the whole sequence actually removed.
+    gains: list[tuple[str, int, dict[str, int]]] = []
+    sequence_net = 0
     for hook in registered_turn_hooks():
         if stream_safe_only and not getattr(hook, "stream_safe", False):
             continue
         fn = getattr(hook, "on_request", None)
         if fn is None:
             continue
+        booked_tag = ctx.tags.get("tool_search_deferred_tokens")
         before_messages = before_tools = None
         try:
             if ctx.count_messages is not None:
                 before_messages = ctx.count_messages(ctx.messages)
             if ctx.count_tools is not None:
-                before_tools = ctx.count_tools(ctx.tools)
+                before_tools = ctx.count_tools(without_deferral_flags(ctx.tools))
             fn(ctx)
+            # Signed deltas, netted: a hook that folds messages but ADDS a tool
+            # (skill search's ``search_skills``) saved the difference, not the
+            # fold alone. Booked only when the net is a saving.
             message_saved = (
-                max(0, before_messages - ctx.count_messages(ctx.messages))
+                before_messages - ctx.count_messages(ctx.messages)
                 if before_messages is not None and ctx.count_messages is not None
                 else 0
             )
             tool_saved = (
-                max(0, before_tools - ctx.count_tools(ctx.tools))
+                before_tools - ctx.count_tools(without_deferral_flags(ctx.tools))
                 if before_tools is not None and ctx.count_tools is not None
                 else 0
             )
-            if message_saved or tool_saved:
-                ctx.record_savings(
-                    getattr(hook, "savings_source", getattr(hook, "name", type(hook).__name__)),
-                    tokens=message_saved + tool_saved,
-                    details={
-                        "message_tokens_saved": message_saved,
-                        "tool_tokens_saved": tool_saved,
-                    },
+            net_saved = message_saved + tool_saved
+            sequence_net += net_saved
+            if net_saved > 0:
+                gains.append(
+                    (
+                        getattr(hook, "savings_source", getattr(hook, "name", type(hook).__name__)),
+                        net_saved,
+                        {"message_tokens_saved": message_saved, "tool_tokens_saved": tool_saved},
+                    )
                 )
         except Exception:  # a hook must never break the proxy
             log.exception("turn hook %r on_request failed", getattr(hook, "name", hook))
+        if ctx.tags.get("tool_search_deferred_tokens") != booked_tag:
+            # This hook booked (or re-booked) the deferral: it is the new baseline.
+            booking = deferred_booking(ctx.tags, ctx.tools)
+    reconcile_deferred_tokens(ctx.tags, booking, ctx.tools, ctx.count_tools)
+    # Book gains in run order up to the sequence's net saving; a loss that
+    # exceeds them all books nothing (never a negative entry).
+    budget = max(0, sequence_net)
+    for source, net_saved, details in gains:
+        tokens = min(net_saved, budget)
+        if tokens <= 0:
+            break
+        budget -= tokens
+        if tokens < net_saved:
+            # Later hooks' cost comes off this credit; share it across the
+            # message and tool parts so the breakdown still sums to ``tokens``.
+            # The uncapped deltas stay for diagnosis.
+            message_part = round(details["message_tokens_saved"] * tokens / net_saved)
+            details = {
+                "message_tokens_saved": message_part,
+                "tool_tokens_saved": tokens - message_part,
+                "uncapped_message_tokens_saved": details["message_tokens_saved"],
+                "uncapped_tool_tokens_saved": details["tool_tokens_saved"],
+            }
+        try:
+            ctx.record_savings(source, tokens=tokens, details=details)
+        except Exception:
+            log.exception("turn hook savings for %r not recorded", source)
 
 
 async def run_response_hooks(
@@ -255,3 +345,43 @@ async def run_response_hooks(
         if replacement is not None:
             current = replacement
     return current
+
+
+async def run_responses_create_hooks(
+    body: dict[str, Any],
+    *,
+    headers: Mapping[str, str],
+    transport: Literal["http", "websocket"],
+    connection_id: str | None = None,
+) -> bool:
+    """Run every hook's ``on_responses_create`` and apply the final body to
+    ``body`` in place. True if any hook replaced it.
+
+    Inert (returns False) when no hook defines the method. A failing hook is
+    logged and skipped. A sync method is accepted as well as a coroutine.
+    """
+    current: dict[str, Any] = body
+    for hook in registered_turn_hooks():
+        fn = getattr(hook, "on_responses_create", None)
+        if fn is None:
+            continue
+        request = ResponsesCreate(
+            body=MappingProxyType(current),
+            headers=headers,
+            transport=transport,
+            connection_id=connection_id,
+        )
+        try:
+            result = fn(request)
+            if inspect.isawaitable(result):
+                result = await result
+        except Exception:  # a hook must never break the proxy
+            log.exception("turn hook %r on_responses_create failed", getattr(hook, "name", hook))
+            continue
+        if isinstance(result, dict):
+            current = result
+    if current is body:
+        return False
+    body.clear()
+    body.update(current)
+    return True
