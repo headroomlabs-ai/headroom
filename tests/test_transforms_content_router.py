@@ -1158,7 +1158,7 @@ def test_ruby_source_code_routes_to_code_aware_compressor(
     )
 
     assert router._determine_strategy(ruby) is CompressionStrategy.CODE_AWARE
-    compressed, _tokens, chain = router._apply_strategy_to_content(
+    compressed, _tokens, chain, unrecoverable = router._apply_strategy_to_content(
         ruby,
         CompressionStrategy.CODE_AWARE,
         context="",
@@ -1169,6 +1169,7 @@ def test_ruby_source_code_routes_to_code_aware_compressor(
     assert compressed.startswith("class Worker")
     assert "# omitted" in compressed
     assert chain == [CompressionStrategy.CODE_AWARE.value]
+    assert unrecoverable is False
 
 
 def test_source_code_passthrough_does_not_invoke_kompress(
