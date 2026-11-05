@@ -1,0 +1,58 @@
+{
+  "schema_version": 1,
+  "result_id": "benchmark-3077ac81-regular-v1",
+  "created_at": "2026-08-13T05:45:00Z",
+  "result_uri": "https://headroom-bench.example/runs/benchmark-3077ac81-regular-v1/result.json",
+  "result_sha256": "sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+  "status": "pass",
+  "experiment": {
+    "experiment_id": "experiment-3077ac81-regular-v1",
+    "taskset_id": "terminal-bench-regular-v1",
+    "taskset_digest": "sha256:1111111111111111111111111111111111111111111111111111111111111111",
+    "attempts_per_arm": 5,
+    "a1": {
+      "name": "a1_passthrough",
+      "optimization_enabled": false,
+      "candidate_sha": "3077ac81e8ef3ddefebbe308ea37a4e9bb2100e6",
+      "artifact_sha256": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "rollout_registry_digest": "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+      "rollout_snapshot_digest": "sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+      "model": "provider/model-version",
+      "agent": "codex/version",
+      "taskset_id": "terminal-bench-regular-v1",
+      "environment": {
+        "runner": "harbor",
+        "platform": "linux/amd64",
+        "image": "headroom-bench@sha256:2222222222222222222222222222222222222222222222222222222222222222",
+        "image_digest": "sha256:2222222222222222222222222222222222222222222222222222222222222222",
+        "resource_limits": { "cpu": 4, "memory_gib": 16 }
+      }
+    },
+    "b": {
+      "name": "b_headroom",
+      "optimization_enabled": true,
+      "candidate_sha": "3077ac81e8ef3ddefebbe308ea37a4e9bb2100e6",
+      "artifact_sha256": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "rollout_registry_digest": "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+      "rollout_snapshot_digest": "sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+      "model": "provider/model-version",
+      "agent": "codex/version",
+      "taskset_id": "terminal-bench-regular-v1",
+      "environment": {
+        "runner": "harbor",
+        "platform": "linux/amd64",
+        "image": "headroom-bench@sha256:2222222222222222222222222222222222222222222222222222222222222222",
+        "image_digest": "sha256:2222222222222222222222222222222222222222222222222222222222222222",
+        "resource_limits": { "cpu": 4, "memory_gib": 16 }
+      }
+    }
+  },
+  "identity_verification": { "status": "pass", "mismatches": [] },
+  "producer": {
+    "repository": "headroomlabs-ai/headroom-bench",
+    "workflow": "release-benchmark.yml",
+    "run_id": 987654321,
+    "run_attempt": 1,
+    "commit_sha": "1234567890abcdef1234567890abcdef12345678"
+  }
+}

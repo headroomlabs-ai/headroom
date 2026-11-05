@@ -1,0 +1,126 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://headroom.dev/schemas/release/v1/benchmark-result-ref.schema.json",
+  "title": "Headroom cross-repository benchmark result reference",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "result_id",
+    "created_at",
+    "result_uri",
+    "result_sha256",
+    "status",
+    "experiment",
+    "identity_verification",
+    "producer"
+  ],
+  "properties": {
+    "schema_version": { "$ref": "common.schema.json#/$defs/schemaVersion" },
+    "result_id": { "$ref": "common.schema.json#/$defs/nonEmptyString" },
+    "created_at": { "type": "string", "format": "date-time" },
+    "result_uri": { "type": "string", "format": "uri" },
+    "result_sha256": { "$ref": "common.schema.json#/$defs/sha256" },
+    "status": { "$ref": "common.schema.json#/$defs/decisionStatus" },
+    "experiment": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["experiment_id", "taskset_id", "taskset_digest", "attempts_per_arm", "a1", "b"],
+      "properties": {
+        "experiment_id": { "$ref": "common.schema.json#/$defs/nonEmptyString" },
+        "taskset_id": { "$ref": "common.schema.json#/$defs/nonEmptyString" },
+        "taskset_digest": { "$ref": "common.schema.json#/$defs/sha256" },
+        "attempts_per_arm": { "type": "integer", "minimum": 1 },
+        "a1": { "$ref": "#/$defs/armA1" },
+        "b": { "$ref": "#/$defs/armB" }
+      }
+    },
+    "identity_verification": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["status", "mismatches"],
+      "properties": {
+        "status": { "type": "string", "enum": ["pass", "inconclusive"] },
+        "mismatches": {
+          "type": "array",
+          "items": { "$ref": "common.schema.json#/$defs/nonEmptyString" },
+          "uniqueItems": true
+        }
+      },
+      "allOf": [
+        {
+          "if": { "properties": { "status": { "const": "pass" } }, "required": ["status"] },
+          "then": { "properties": { "mismatches": { "maxItems": 0 } } },
+          "else": { "properties": { "mismatches": { "minItems": 1 } } }
+        }
+      ]
+    },
+    "producer": { "$ref": "common.schema.json#/$defs/producerIdentity" }
+  },
+  "allOf": [
+    {
+      "if": {
+        "properties": {
+          "identity_verification": {
+            "properties": { "status": { "const": "inconclusive" } },
+            "required": ["status"]
+          }
+        },
+        "required": ["identity_verification"]
+      },
+      "then": { "properties": { "status": { "const": "inconclusive" } } }
+    }
+  ],
+  "$defs": {
+    "armIdentity": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "name",
+        "optimization_enabled",
+        "candidate_sha",
+        "artifact_sha256",
+        "rollout_registry_digest",
+        "rollout_snapshot_digest",
+        "model",
+        "agent",
+        "taskset_id",
+        "environment"
+      ],
+      "properties": {
+        "name": { "type": "string" },
+        "optimization_enabled": { "type": "boolean" },
+        "candidate_sha": { "$ref": "common.schema.json#/$defs/gitSha" },
+        "artifact_sha256": { "$ref": "common.schema.json#/$defs/sha256" },
+        "rollout_registry_digest": { "$ref": "common.schema.json#/$defs/sha256" },
+        "rollout_snapshot_digest": { "$ref": "common.schema.json#/$defs/sha256" },
+        "model": { "$ref": "common.schema.json#/$defs/nonEmptyString" },
+        "agent": { "$ref": "common.schema.json#/$defs/nonEmptyString" },
+        "taskset_id": { "$ref": "common.schema.json#/$defs/nonEmptyString" },
+        "environment": { "$ref": "common.schema.json#/$defs/environmentIdentity" }
+      }
+    },
+    "armA1": {
+      "allOf": [
+        { "$ref": "#/$defs/armIdentity" },
+        {
+          "properties": {
+            "name": { "const": "a1_passthrough" },
+            "optimization_enabled": { "const": false }
+          }
+        }
+      ]
+    },
+    "armB": {
+      "allOf": [
+        { "$ref": "#/$defs/armIdentity" },
+        {
+          "properties": {
+            "name": { "const": "b_headroom" },
+            "optimization_enabled": { "const": true }
+          }
+        }
+      ]
+    }
+  }
+}
