@@ -368,7 +368,9 @@ def _tool_name_aliases(name: str) -> tuple[str, ...]:
     aliases = [name]
     lname = name.lower()
 
-    if lname == "headroom_headroom_retrieve":
+    # Clients that prefix MCP tools with the server name: OpenCode joins with a
+    # single underscore, Cline with a double one (<server>__<tool>, #4585).
+    if lname in ("headroom_headroom_retrieve", "headroom__headroom_retrieve"):
         aliases.append("headroom_retrieve")
     elif lname.startswith("mcp__"):
         # OpenAI-style MCP wrappers use mcp__server__tool. Custom agents that

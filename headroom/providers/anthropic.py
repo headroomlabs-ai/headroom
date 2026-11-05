@@ -811,6 +811,10 @@ class AnthropicProvider(Provider):
         if context_limits:
             self._context_limits.update(context_limits)
 
+        # Dynamically resolved limits belong to an exact model id. Keep them
+        # separate from the configured entries used for release/alias matching.
+        self._context_limit_cache: dict[str, int] = {}
+
     @property
     def name(self) -> str:
         return "anthropic"
@@ -856,6 +860,8 @@ class AnthropicProvider(Provider):
         # Check explicit and loaded limits
         if model in self._context_limits:
             return self._context_limits[model]
+        if model in self._context_limit_cache:
+            return self._context_limit_cache[model]
 
         # Releases and aliases of a known id (e.g. "claude-3-5-sonnet" matches
         # "claude-3-5-sonnet-20241022"); see `_is_release_of`.
@@ -871,11 +877,11 @@ class AnthropicProvider(Provider):
                 if info:
                     if "max_input_tokens" in info and info["max_input_tokens"] is not None:
                         limit = int(info["max_input_tokens"])
-                        self._context_limits[model] = limit
+                        self._context_limit_cache[model] = limit
                         return limit
                     if "max_tokens" in info and info["max_tokens"] is not None:
                         limit = int(info["max_tokens"])
-                        self._context_limits[model] = limit
+                        self._context_limit_cache[model] = limit
                         return limit
             except Exception as e:
                 logger.debug(f"LiteLLM get_model_info failed for {model}: {e}")
@@ -886,20 +892,20 @@ class AnthropicProvider(Provider):
             limit = cast(int, _PATTERN_DEFAULTS[tier]["context"])
             self._warn_unknown_model(model, limit, f"inferred from '{tier}' tier")
             # Cache for future calls
-            self._context_limits[model] = limit
+            self._context_limit_cache[model] = limit
             return limit
 
         # Fallback for unknown Claude models
         if model.startswith("claude"):
             limit = cast(int, _UNKNOWN_CLAUDE_DEFAULT["context"])
             self._warn_unknown_model(model, limit, "using default Claude limit")
-            self._context_limits[model] = limit
+            self._context_limit_cache[model] = limit
             return limit
 
         # Non-Claude model - use conservative default
         limit = 128000
         self._warn_unknown_model(model, limit, "unknown provider, using conservative default")
-        self._context_limits[model] = limit
+        self._context_limit_cache[model] = limit
         return limit
 
     def _warn_unknown_model(self, model: str, limit: int, reason: str) -> None:
@@ -916,7 +922,7 @@ class AnthropicProvider(Provider):
     def supports_model(self, model: str) -> bool:
         """Check if this provider supports the given model."""
         model = sanitize_anthropic_model_id(model)
-        if model in self._context_limits:
+        if model in self._context_limits or model in self._context_limit_cache:
             return True
         # Check prefix matches - support all Claude models
         return model.startswith("claude")
