@@ -28,6 +28,40 @@ def test_guardrail_runner_is_green_on_repo() -> None:
     assert findings == []
 
 
+def test_ccr_rule_checks_shared_bridge_store_and_each_caller(tmp_path: Path) -> None:
+    guardrails = _load_guardrails()
+    transforms = tmp_path / "headroom" / "transforms"
+    transforms.mkdir(parents=True)
+    bridge = transforms / "base.py"
+    bridge.write_text(
+        "def persist_rust_ccr_entry(original, compressed, cache_key, *, source):\n"
+        "    store.store(original, compressed, explicit_hash=cache_key)\n",
+        encoding="utf-8",
+    )
+    for name in ("search_compressor.py", "diff_compressor.py", "log_compressor.py"):
+        (transforms / name).write_text(
+            "from .base import persist_rust_ccr_entry\n"
+            "def compress(original, compressed, cache_key):\n"
+            "    return persist_rust_ccr_entry(original, compressed, cache_key, source='test')\n",
+            encoding="utf-8",
+        )
+    rule = guardrails.CcrExplicitHashRule()
+    assert rule.check(tmp_path) == []
+    bridge.write_text(
+        "def persist_rust_ccr_entry(original, compressed, cache_key, *, source):\n"
+        "    store.store(original, compressed)\n",
+        encoding="utf-8",
+    )
+    assert any("explicit_hash" in finding.message for finding in rule.check(tmp_path))
+    bridge.write_text(
+        "def persist_rust_ccr_entry(original, compressed, cache_key, *, source):\n"
+        "    store.store(original, compressed, explicit_hash=cache_key)\n",
+        encoding="utf-8",
+    )
+    (transforms / "log_compressor.py").write_text("def compress(): pass\n", encoding="utf-8")
+    assert any(finding.path.name == "log_compressor.py" for finding in rule.check(tmp_path))
+
+
 def test_backend_message_rule_catches_raw_role_content_reconstruction(tmp_path: Path) -> None:
     guardrails = _load_guardrails()
     root = tmp_path

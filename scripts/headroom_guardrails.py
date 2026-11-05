@@ -207,10 +207,40 @@ class CcrExplicitHashRule:
                 if isinstance(node, ast.FunctionDef) and node.name == "_persist_to_python_ccr"
             ]
             if not functions:
-                findings.append(
-                    Finding(self.id, path, 1, "missing _persist_to_python_ccr marker bridge")
+                shared_import = any(
+                    isinstance(node, ast.ImportFrom)
+                    and node.level == 1
+                    and node.module == "base"
+                    and any(
+                        alias.name == "persist_rust_ccr_entry" and alias.asname is None
+                        for alias in node.names
+                    )
+                    for node in ast.walk(tree)
                 )
-                continue
+                shared_calls = any(
+                    isinstance(node, ast.Call)
+                    and isinstance(node.func, ast.Name)
+                    and node.func.id == "persist_rust_ccr_entry"
+                    for node in ast.walk(tree)
+                )
+                if not shared_import or not shared_calls:
+                    findings.append(
+                        Finding(self.id, path, 1, "missing CCR marker persistence bridge call")
+                    )
+                    continue
+                path = root / "headroom/transforms/base.py"
+                if path.exists():
+                    functions = [
+                        node
+                        for node in ast.walk(_parse(path))
+                        if isinstance(node, ast.FunctionDef)
+                        and node.name == "persist_rust_ccr_entry"
+                    ]
+                if not functions:
+                    findings.append(
+                        Finding(self.id, path, 1, "missing shared CCR marker persistence bridge")
+                    )
+                    continue
             for fn in functions:
                 store_calls = [
                     node
