@@ -10,6 +10,12 @@ SSE_EVENT_LINE_PREFIX = "event:"
 SSE_DATA_LINE_PREFIX = "data:"
 
 
+def _field_value(line: str, prefix: str) -> str:
+    """Value after ``prefix``; per the SSE spec only one leading space is removed."""
+    value = line[len(prefix) :]
+    return value[1:] if value.startswith(" ") else value
+
+
 def find_sse_event_terminator(buf: bytearray) -> tuple[int, int] | None:
     """Return the earliest complete SSE event terminator in ``buf``."""
     matches = [
@@ -51,9 +57,9 @@ def parse_sse_events_from_byte_buffer(
             if line.startswith(":"):
                 continue
             if line.startswith(SSE_EVENT_LINE_PREFIX):
-                event_name = line[len(SSE_EVENT_LINE_PREFIX) :].lstrip()
+                event_name = _field_value(line, SSE_EVENT_LINE_PREFIX)
             elif line.startswith(SSE_DATA_LINE_PREFIX):
-                data_lines.append(line[len(SSE_DATA_LINE_PREFIX) :].lstrip())
+                data_lines.append(_field_value(line, SSE_DATA_LINE_PREFIX))
 
         if data_lines:
             events.append((event_name, "\n".join(data_lines)))

@@ -53,3 +53,11 @@ def test_parse_sse_events_preserves_unicode_line_separators_in_json(
 
     assert len(events) == 1
     assert json.loads(events[0][1]) == payload
+
+
+def test_parse_sse_events_strips_only_one_leading_space() -> None:
+    # SSE spec: "If value starts with a U+0020 SPACE character, remove it".
+    # Further leading whitespace is part of the payload.
+    buf = bytearray(b"event: delta\ndata:   indented\ndata:\ttab\ndata:none\n\n")
+
+    assert parse_sse_events_from_byte_buffer(buf) == [("delta", "  indented\n\ttab\nnone")]
