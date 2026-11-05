@@ -6,6 +6,7 @@ from typing import Any
 from unittest.mock import patch
 
 import httpx
+import pytest
 from fastapi.responses import JSONResponse
 from fastapi.testclient import TestClient
 
@@ -144,6 +145,41 @@ def test_provider_passthrough_routes_forward_expected_targets(monkeypatch) -> No
         assert client.get("/v1beta/models").json()["provider"] == "gemini"
         assert client.get("/v1beta/models/demo").json()["sub_path"] == "models"
         assert client.post("/v1beta/models/demo:embedContent").json()["sub_path"] == "embedContent"
+        # Provider passthrough routes must honor the per-request upstream like
+        # /v1/messages and the catch-all do. Without this, a custom
+        # OpenAI-compatible provider's embeddings/audio/metadata requests are
+        # forwarded to the default provider target and fail with 401.
+        custom_embeddings = client.post(
+            "/v1/embeddings",
+            headers={"x-headroom-base-url": "https://custom.example/base/"},
+        ).json()
+        assert custom_embeddings["base_url"] == "https://custom.example/base"
+        assert custom_embeddings["path"] == "/v1/embeddings"
+        # Known provider routes keep their bounded labels so handle_passthrough
+        # records the outcome for the overridden upstream; the custom host is
+        # never turned into a label.
+        assert custom_embeddings["sub_path"] == "embeddings"
+        assert custom_embeddings["provider"] == "openai"
+        custom_count_tokens = client.post(
+            "/v1/messages/count_tokens",
+            headers={"x-headroom-base-url": "https://custom.example/anthropic/"},
+        ).json()
+        assert custom_count_tokens["base_url"] == "https://custom.example/anthropic"
+        assert custom_count_tokens["sub_path"] == "count_tokens"
+        assert custom_count_tokens["provider"] == "anthropic"
+        custom_gemini = client.get(
+            "/v1beta/models",
+            headers={"x-headroom-base-url": "https://custom.example/gemini/"},
+        ).json()
+        assert custom_gemini["base_url"] == "https://custom.example/gemini"
+        assert custom_gemini["sub_path"] == "models"
+        assert custom_gemini["provider"] == "gemini"
+        # An unsafe override is rejected instead of being relayed.
+        unsafe_embeddings = client.post(
+            "/v1/embeddings",
+            headers={"x-headroom-base-url": "http://127.0.0.1:9"},
+        )
+        assert unsafe_embeddings.status_code == 400
         assert client.post(
             "/v1/projects/p/locations/us-central1/publishers/google/models/gemini-2.0-flash:generateContent"
         ).json() == {
@@ -1495,3 +1531,32 @@ def test_model_metadata_routes_reject_an_unsafe_custom_base_url(monkeypatch) -> 
     # No upstream call at all: the rejected request must not be redirected to
     # the configured upstream, which would disclose the credential.
     assert calls == []
+
+
+@pytest.mark.parametrize("path", ["/v1/models", "/v1/models/gpt-5"])
+def test_model_metadata_rejection_redacts_url_credentials(monkeypatch, caplog, path) -> None:
+    """Reject unsafe destinations without exposing URL credentials in the warning."""
+    monkeypatch.setenv("HEADROOM_ALLOWED_BASE_URLS", "")
+    calls = []
+
+    async def unexpected_passthrough(*args, **kwargs):
+        calls.append(True)
+        raise AssertionError("Rejected metadata request reached upstream")
+
+    monkeypatch.setattr(HeadroomProxy, "handle_passthrough", unexpected_passthrough)
+    with caplog.at_level("WARNING"), TestClient(_app()) as client:
+        response = client.get(
+            path,
+            headers={
+                "authorization": "Bearer synthetic-gateway-key",
+                "x-headroom-base-url": (
+                    "https://synthetic-user:synthetic-password@127.0.0.1/v1"
+                    "?api_key=synthetic-query-secret"
+                ),
+            },
+        )
+    assert response.status_code == 400
+    assert calls == []
+    assert "rejecting unsafe x-headroom-base-url" in caplog.text
+    for secret in ("synthetic-user", "synthetic-password", "synthetic-query-secret"):
+        assert secret not in caplog.text
