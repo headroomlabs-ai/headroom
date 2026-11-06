@@ -69,8 +69,16 @@ def tls_context(snapshot: GatewayConfigSnapshot) -> ssl.SSLContext:
         context = ssl.create_default_context(cafile=snapshot.transport.ca_bundle)
     except (OSError, ValueError):
         raise ValueError("Invalid gateway CA bundle") from None
-    if context.cert_store_stats()["x509_ca"] == 0:
-        raise ValueError("Gateway CA bundle contains no CA certificates")
+    try:
+        ca_count = context.cert_store_stats()["x509_ca"]
+    except NotImplementedError:
+        # System trust contexts validate with the OS and cannot enumerate its
+        # anchors. Loading an invalid explicit bundle still fails above; peer
+        # and hostname verification remain mandatory on every connection.
+        pass
+    else:
+        if ca_count == 0:
+            raise ValueError("Gateway CA bundle contains no CA certificates")
     context.check_hostname = True
     context.verify_mode = ssl.CERT_REQUIRED
     return context

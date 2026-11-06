@@ -15,6 +15,27 @@ from headroom.proxy.gateway.egress import AuthorizedDestination
 from headroom.proxy.gateway.transport import http_client, tls_context, websocket_connection
 
 
+def test_system_trust_context_does_not_require_openssl_store_introspection(monkeypatch):
+    class SystemTrustContext:
+        check_hostname = False
+        verify_mode = ssl.CERT_NONE
+
+        def cert_store_stats(self):
+            raise NotImplementedError
+
+    context = SystemTrustContext()
+    monkeypatch.setattr(ssl, "create_default_context", lambda **kwargs: context)
+    raw = json.loads(
+        (
+            Path(__file__).parents[2]
+            / "docs/proposals/unified-api-gateway/examples/gateway.private-upstream.json"
+        ).read_text()
+    )
+    assert tls_context(GatewayConfigSnapshot.model_validate(raw)) is context
+    assert context.check_hostname is True
+    assert context.verify_mode == ssl.CERT_REQUIRED
+
+
 @pytest.fixture
 def local_pki(tmp_path):
     pytest.importorskip("cryptography")
@@ -98,7 +119,20 @@ def local_pki(tmp_path):
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("mode", ["trusted", "untrusted", "wrong-hostname"])
-async def test_http_custom_ca_and_hostname_verification_on_real_tls(local_pki, mode):
+@pytest.mark.parametrize("system_trust", [False, True])
+async def test_http_custom_ca_and_hostname_verification_on_real_tls(local_pki, mode, system_trust):
+    truststore = pytest.importorskip("truststore") if system_trust else None
+    inject = truststore is not None and ssl.SSLContext is not truststore.SSLContext
+    if inject:
+        truststore.inject_into_ssl()
+    try:
+        await _verify_http_tls(local_pki, mode)
+    finally:
+        if inject:
+            truststore.extract_from_ssl()
+
+
+async def _verify_http_tls(local_pki, mode):
     context, raw = local_pki
     received = []
 
