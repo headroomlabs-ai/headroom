@@ -64,12 +64,16 @@ def _invoke_wrap_claude(
     *,
     env: dict[str, str],
     extra_args: tuple[str, ...] = (),
+    actual_port: int | None = None,
 ) -> tuple[dict[str, Any], str]:
     captured: dict[str, Any] = {}
 
     _clear_claude_mode_env(monkeypatch)
     monkeypatch.setattr(wrap_mod.shutil, "which", lambda _name: "/usr/bin/claude")
     monkeypatch.setattr(wrap_mod, "_register_proxy_client", lambda _port, session_token=None: None)
+    monkeypatch.setattr(
+        wrap_mod, "_unregister_proxy_client", lambda _port, session_token=None: None
+    )
     monkeypatch.setattr(wrap_mod, "_make_cleanup", lambda _holder, _port: lambda: None)
     monkeypatch.setattr(wrap_mod.signal, "signal", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(wrap_mod, "_push_runtime_env", lambda *_args, **_kwargs: None)
@@ -94,6 +98,8 @@ def _invoke_wrap_claude(
         captured["ensure_args"] = args
         captured["ensure_kwargs"] = kwargs
         captured["proxy_environ"] = dict(os.environ)
+        if actual_port is not None:
+            return None, actual_port
         return None, args[0] if args else 8787
 
     def fake_run(cmd: list[str], *, env: dict[str, str]) -> _Completed:
@@ -145,6 +151,15 @@ def test_wrap_claude_plain_mode_warns_about_remote_control_gate(
     assert "/rc" in output
     assert "may hide" not in output
     assert "#746" in output and "#1158" in output
+
+
+def test_wrap_claude_exports_actual_proxy_port(
+    runner: CliRunner, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    captured, _output = _invoke_wrap_claude(runner, monkeypatch, env={}, actual_port=8788)
+
+    assert captured["child_env"]["HEADROOM_PORT"] == "8788"
+    assert captured["child_env"]["ANTHROPIC_BASE_URL"].startswith("http://127.0.0.1:8788")
 
 
 def test_wrap_claude_plain_mode_api_key_auth_skips_remote_control_warning(
@@ -220,7 +235,7 @@ def test_wrap_claude_sibling_note_accurate_under_1m_and_tool_search_optouts(
 ) -> None:
     # Issue #1779 accuracy under opt-ins: with --1m the note must not advise
     # adding --1m again, and with --tool-search false it must not claim
-    # deferral is kept on — nor may the #746 banner line say "kept on".
+    # deferral is kept on â€” nor may the #746 banner line say "kept on".
     _captured, output = _invoke_wrap_claude(
         runner,
         monkeypatch,
@@ -313,7 +328,7 @@ def test_wrap_claude_default_banner_is_compact(
     # and the long explanation / sibling note / env-var trailer are omitted.
     _captured, output = _invoke_wrap_claude(runner, monkeypatch, env={})
     assert (
-        "Remote Control (/rc) is disabled while routed through Headroom — run `claude` "
+        "Remote Control (/rc) is disabled while routed through Headroom â€” run `claude` "
         "directly (no wrap) for sessions that need it."
     ) in output
     assert "On-demand tool loading: kept on (this session)" in output
@@ -346,7 +361,7 @@ def test_proxy_status_line_keeps_own_signature_and_names_port_once() -> None:
     assert "learn" in inspect.signature(wrap_mod._ensure_proxy).parameters
 
     line = wrap_mod._proxy_status_line("Proxy ready", 8787)
-    assert line == "  Proxy ready — dashboard: http://127.0.0.1:8787/dashboard"
+    assert line == "  Proxy ready â€” dashboard: http://127.0.0.1:8787/dashboard"
     assert line.count("127.0.0.1:8787") == 1
 
 
@@ -381,7 +396,7 @@ def test_wrap_claude_vertex_passes_custom_base_url_to_proxy_before_child_redirec
     )
 
     # Issue #1779: Vertex sessions authenticate with cloud IAM and never had
-    # Remote Control — the RC gate warning must not fire in this mode.
+    # Remote Control â€” the RC gate warning must not fire in this mode.
     assert "Remote Control" not in output
 
     ensure_kwargs = captured["ensure_kwargs"]
@@ -458,7 +473,7 @@ def test_wrap_claude_foundry_proxy_env_uses_process_environment_only_by_default(
     )
 
     # Issue #1779: Foundry sessions authenticate with Azure credentials and
-    # never had Remote Control — the RC gate warning must not fire.
+    # never had Remote Control â€” the RC gate warning must not fire.
     assert "Remote Control" not in output
 
     ensure_kwargs = captured["ensure_kwargs"]
