@@ -1244,6 +1244,12 @@ def install_status(profile: str) -> None:
 
     manifest = _require_manifest(profile)
     payload = probe_json(manifest.health_url.replace("/readyz", "/health"))
+    healthy = probe_ready(manifest.health_url)
+    # The health endpoint is the authoritative process signal. Detached runtimes
+    # can outlive a missing/stale PID file (for example after cleanup or a
+    # supervisor restart), while Docker's local CLI view can also be temporarily
+    # unavailable. Never report a reachable, ready proxy as "stopped" (#3072).
+    status = "running" if healthy else runtime_status(manifest)
     click.echo(f"Profile:    {manifest.profile}")
     click.echo(f"Preset:     {manifest.preset}")
     click.echo(f"Runtime:    {manifest.runtime_kind}")
@@ -1265,8 +1271,8 @@ def install_status(profile: str) -> None:
     click.echo(f"Min evidence: {min_evidence}")
     click.echo(f"Project root: {getattr(manifest, 'memory_project_root', '') or 'runtime default'}")
     click.echo(f"Port:       {manifest.port}")
-    click.echo(f"Status:     {runtime_status(manifest)}")
-    click.echo(f"Healthy:    {'yes' if probe_ready(manifest.health_url) else 'no'}")
+    click.echo(f"Status:     {status}")
+    click.echo(f"Healthy:    {'yes' if healthy else 'no'}")
     if payload and isinstance(payload, dict):
         click.echo(f"Health URL: {manifest.health_url.replace('/readyz', '/health')}")
         # `config` may be a non-dict (null / string / list) if a different or
