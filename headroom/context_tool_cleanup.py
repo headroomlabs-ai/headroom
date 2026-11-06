@@ -470,12 +470,16 @@ def _names_a_managed_script(
     (e.g. ``$HOME/...``), are both simply not recognised — unprovable, so
     kept, per the guard's own rule.
     """
-    tokens = {
-        token
-        for haystack in (command, os.path.expanduser(command))
-        for token in _PATH_TOKEN_SPLIT.split(haystack)
-        if token
-    }
+    tokens: set[str] = set()
+    for haystack in (command, os.path.expanduser(command)):
+        # A colon is normally a shell/path-list boundary, but the one in an
+        # absolute Windows drive prefix is part of the path.  Protect only a
+        # boundary-started ``C:\\``/``C:/`` prefix while tokenising, then put
+        # the colon back before normalising and comparing the path.
+        protected = re.sub(r"(?<!\w)([A-Za-z]):(?=[\\/])", r"\1\0", haystack)
+        tokens.update(
+            token.replace("\0", ":") for token in _PATH_TOKEN_SPLIT.split(protected) if token
+        )
     normalized_tokens = {posixpath.normpath(_norm_path_text(token)) for token in tokens}
     return any(
         verdict is True and _norm_path_text(str(hooks_dir / name)) in normalized_tokens
