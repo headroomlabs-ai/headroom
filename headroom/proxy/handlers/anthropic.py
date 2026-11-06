@@ -66,6 +66,7 @@ from headroom.proxy.handlers._failure_logging import log_hook_failure, log_reque
 from headroom.proxy.helpers import (
     extract_tags,
     invalid_request_body_message,
+    is_third_party_model,
     relocate_system_messages_to_top_level,
     sanitize_forwarded_response_headers,
 )
@@ -629,28 +630,41 @@ class AnthropicHandlerMixin:
             return False
 
     @staticmethod
-    def _outgoing_body_has_redeemable_marker(body: Any) -> bool:
-        """Does the body about to be sent carry a marker retrieval could expand?
+    def _outgoing_redeemable_markers(
+        body: Any,
+        previous_forwarded_messages: list[dict[str, Any]] | None = None,
+    ) -> tuple[bool, bool]:
+        """Which owned markers does the outgoing body carry?
 
-        ``headroom_retrieve`` exists only to expand a ``<<ccr:...>>`` marker, so
-        a request carrying none cannot benefit from the buffered path (#3071).
+        Returns ``(any_owned, new_owned)``. ``headroom_retrieve`` exists only to
+        expand a ``<<ccr:...>>`` marker, so a request carrying none cannot use
+        it (#3071).
+
+        ``new_owned`` is a marker the model has not seen yet: one absent from
+        what this session forwarded last turn. With no forwarded history to
+        compare against, every owned marker counts as new. "New" is decided
+        against the forwarded history, not by message position: token mode can
+        compress an earlier tool result on this request, so a marker first
+        seen now may sit anywhere in the history.
 
         Ownership is verified rather than shape-matched: the marker shape is not
         unique to Headroom, and adopting another context tool's hash would send
         the model to an endpoint that is guaranteed to miss (#2836). A hash that
         survives ``verify_ownership`` is redeemable right now.
 
-        Errors are swallowed deliberately and answered ``True``. This gates a
-        wire-format decision, and the safe direction on an unexpected message
-        shape is the long-standing buffered behavior, not a silent change.
+        Errors are swallowed deliberately and answered ``(True, True)``. This
+        gates a wire-format decision, and the safe direction on an unexpected
+        message shape is the long-standing buffered behavior, not a silent
+        change.
         """
         if not isinstance(body, dict):
-            return True
+            return True, True
         messages = body.get("messages")
         if not isinstance(messages, list) or not messages:
-            return False
+            return False, False
         try:
             from headroom.ccr.tool_injection import CCRToolInjector
+            from headroom.proxy.helpers import has_new_ccr_markers
 
             probe = CCRToolInjector(
                 provider="anthropic",
@@ -659,12 +673,27 @@ class AnthropicHandlerMixin:
             )
             probe.scan_for_markers(messages)
             if not probe.detected_hashes:
-                return False
+                return False, False
             probe.verify_ownership()
-            return bool(probe.detected_hashes)
+            if not probe.detected_hashes:
+                return False, False
+            return True, has_new_ccr_markers(
+                current_detected_hashes=list(probe.detected_hashes),
+                previous_forwarded_messages=previous_forwarded_messages,
+                provider="anthropic",
+            )
         except Exception:  # pragma: no cover - defensive
             logger.debug("CCR: marker probe failed; keeping the buffered path", exc_info=True)
-            return True
+            return True, True
+
+    @classmethod
+    def _outgoing_body_has_redeemable_marker(
+        cls,
+        body: Any,
+        previous_forwarded_messages: list[dict[str, Any]] | None = None,
+    ) -> bool:
+        """Does the outgoing body show the model an owned marker it has not seen?"""
+        return cls._outgoing_redeemable_markers(body, previous_forwarded_messages)[1]
 
     @staticmethod
     def _extract_anthropic_cache_ttl_metrics(usage: dict[str, Any] | None) -> tuple[int, int]:
@@ -1163,11 +1192,13 @@ class AnthropicHandlerMixin:
         from headroom.proxy.helpers import (
             MAX_MESSAGE_ARRAY_LENGTH,
             MAX_REQUEST_BODY_SIZE,
+            RequestBodyTooLarge,
             _get_image_compressor,
             compute_turn_id,
             read_request_json_with_bytes,
         )
         from headroom.proxy.modes import is_cache_mode, is_token_mode
+        from headroom.proxy.request_limit_policy import COMPRESSION_BODY_MAX_BYTES
         from headroom.utils import extract_user_query
 
         start_time = time.time()
@@ -1316,6 +1347,115 @@ class AnthropicHandlerMixin:
                     },
                 )
 
+            # Extract headers and tags
+            headers = dict(request.headers.items())
+            headers.pop("host", None)
+            headers.pop("content-length", None)
+            # The body reader content-decodes the inbound body (zstd/gzip/deflate/br)
+            # before either forwarding path sends plain JSON upstream.
+            # A stale content-encoding makes the upstream try to decompress
+            # already-decoded JSON and reject it with HTTP 400 (#1542 — same
+            # fix the /v1/responses path already carries).
+            headers.pop("content-encoding", None)
+            headers.pop("transfer-encoding", None)
+            # Strip accept-encoding so httpx negotiates its own encoding.
+            # Edge proxies (Cloudflare Workers, etc.) may forward "br, zstd" which
+            # the upstream can honor; if httpx lacks brotli support the response
+            # body is undecipherable → 502.
+            headers.pop("accept-encoding", None)
+            tags = extract_tags(headers)
+            from headroom.proxy.savings_attribution import bind_scope
+
+            bind_scope(tags, request.scope)
+            # Identify the harness (codex / claude-code / aider / etc.)
+            # from User-Agent or X-Client. Surfaced via the funnel into
+            # PERF logs and RequestLog.tags — see RequestOutcome.client.
+            client = classify_client(headers, default="claude")
+            # PR-A5 (P5-49): strip internal x-headroom-* from upstream-bound
+            # headers AFTER `_extract_tags` reads them. Inbound bypass gating
+            # uses the original `request.headers`; memory user-id
+            # is read from `request.headers` below if needed. From this
+            # point on, `headers` is the upstream-bound copy.
+            from headroom.proxy.helpers import (
+                _strip_internal_headers,
+                apply_keep_last_turns,
+                log_outbound_headers,
+                merge_extra_headers,
+            )
+
+            _pre_strip_count = sum(1 for k in headers if k.lower().startswith("x-headroom-"))
+            headers = _strip_internal_headers(headers)
+            # `upstream_base_url` is the per-request `x-headroom-base-url`
+            # override when the client sent one. These headers are secrets, so
+            # they only travel to a host the operator designated.
+            headers = merge_extra_headers(
+                headers,
+                self.config.anthropic_extra_headers,
+                upstream_url=upstream_base_url,
+                config=self.config,
+            )
+            log_outbound_headers(
+                forwarder="anthropic_messages",
+                stripped_count=_pre_strip_count
+                - sum(1 for k in headers if k.lower().startswith("x-headroom-")),
+                request_id=request_id,
+            )
+
+            # Subscription tracker: notify on OAuth requests (not API-key requests)
+            _auth_header = headers.get("authorization", "")
+            if _auth_header.startswith("Bearer ") and not _auth_header.startswith(
+                "Bearer sk-ant-api"
+            ):
+                from headroom.subscription.tracker import (
+                    get_subscription_tracker as _get_sub_tracker,
+                )
+
+                _sub_tracker = _get_sub_tracker()
+                if _sub_tracker is not None:
+                    from headroom.subscription.credential_policy import (
+                        is_local_operator_connection,
+                    )
+
+                    # Only the local operator's bearer may become the polled
+                    # account; a network caller only marks activity (01-F16).
+                    _sub_tracker.notify_active(
+                        _auth_header,
+                        from_local_operator=is_local_operator_connection(request),
+                    )
+
+            # Rate limiting
+            if self.rate_limiter:
+                # One identity rule for every provider: peer-owned, and
+                # credential-scoped only for proxy-token / direct loopback
+                # callers (headroom/proxy/rate_limit_identity.py).
+                rate_key = rate_limit_identity(request, headers)
+                allowed, wait_seconds = await self.rate_limiter.check_request(rate_key)
+                if not allowed:
+                    await self.metrics.record_rate_limited(
+                        provider=provider_name, source="headroom"
+                    )
+                    # Unit 4: release the pre-upstream semaphore before we
+                    # bail out of the handler via HTTPException — FastAPI's
+                    # exception handler will NOT run our ``finally``.
+                    await _finalize_pre_upstream()
+                    raise HTTPException(
+                        status_code=429,
+                        detail=f"Rate limited. Retry after {wait_seconds:.1f}s",
+                        headers={"Retry-After": str(int(wait_seconds) + 1)},
+                    )
+
+            # Budget check
+            cost_tracker = self.cost_tracker
+            if cost_tracker:
+                allowed, remaining = cost_tracker.check_budget()
+                if not allowed:
+                    # Unit 4: release the pre-upstream semaphore before we
+                    # bail out of the handler via HTTPException.
+                    await _finalize_pre_upstream()
+                    raise HTTPException(
+                        status_code=429,
+                        detail=cost_tracker.budget_denial_detail(),
+                    )
             # Parse request — capture both the parsed dict AND the original
             # bytes so the forwarder can pick byte-faithful passthrough when
             # nothing mutated the body (PR-A3, fixes P0-2). The mutation
@@ -1326,6 +1466,8 @@ class AnthropicHandlerMixin:
             try:
                 async with stage_timer.measure("read_request_json"):
                     body, original_body_bytes = await read_request_json_with_bytes(request)
+            except RequestBodyTooLarge:
+                raise
             except ClientDisconnect:
                 # The client (e.g. an interrupted/compacting Claude Code
                 # session) went away mid-read. There is no one left to answer
@@ -1346,6 +1488,56 @@ class AnthropicHandlerMixin:
                             "message": invalid_request_body_message(e),
                         },
                     },
+                )
+            if len(original_body_bytes) > COMPRESSION_BODY_MAX_BYTES:
+                logger.info(
+                    "[%s] event=compression_passthrough reason=request_body_soft_limit "
+                    "bytes=%d threshold=%d",
+                    request_id,
+                    len(original_body_bytes),
+                    COMPRESSION_BODY_MAX_BYTES,
+                )
+                from headroom.proxy.route_advice import resolver_for
+
+                backend = resolver_for(self).for_request(request, body=body)
+                passthrough_model = body.get("model") or model_override or "unknown"
+                if not isinstance(passthrough_model, str):
+                    passthrough_model = "unknown"
+                if backend is not None:
+                    if model_override and not body.get("model"):
+                        body["model"] = model_override
+                    await _finalize_pre_upstream()
+                    return await self._handle_backend_passthrough(
+                        body,
+                        headers,
+                        backend,
+                        "anthropic",
+                        passthrough_model,
+                        request_id,
+                        start_time,
+                        tags,
+                        force_stream=force_stream,
+                    )
+                passthrough_base = upstream_base_url or self.ANTHROPIC_API_URL
+                passthrough_url = build_anthropic_upstream_url(
+                    passthrough_base, request.url.path, request.url.query
+                )
+                assert self.http_client is not None, "http_client must be initialized"
+                upstream_request = self.http_client.build_request(
+                    request.method,
+                    passthrough_url,
+                    headers=headers,
+                    content=original_body_bytes,
+                )
+                await _finalize_pre_upstream()
+                return await self.handle_passthrough(
+                    request,
+                    passthrough_base,
+                    endpoint_name="messages",
+                    provider=provider_name,
+                    _upstream_request=upstream_request,
+                    _model=passthrough_model,
+                    _start_time=start_time,
                 )
             # This is a boolean capability classification only.  The
             # safeguards value itself is never copied into logs, metrics, or
@@ -1479,115 +1671,6 @@ class AnthropicHandlerMixin:
             # NOTE: Upstream temporarily disabled broad image compression due to
             # token-counting inaccuracies. We only compress the latest non-frozen
             # user turn later in this handler to preserve Anthropic prefix caching.
-            # Extract headers and tags
-            headers = dict(request.headers.items())
-            headers.pop("host", None)
-            headers.pop("content-length", None)
-            # read_request_json_with_bytes already content-decoded the inbound
-            # body (zstd/gzip/deflate/br), so the bytes we forward are plain.
-            # A stale content-encoding makes the upstream try to decompress
-            # already-decoded JSON and reject it with HTTP 400 (#1542 — same
-            # fix the /v1/responses path already carries).
-            headers.pop("content-encoding", None)
-            headers.pop("transfer-encoding", None)
-            # Strip accept-encoding so httpx negotiates its own encoding.
-            # Edge proxies (Cloudflare Workers, etc.) may forward "br, zstd" which
-            # the upstream can honor; if httpx lacks brotli support the response
-            # body is undecipherable → 502.
-            headers.pop("accept-encoding", None)
-            tags = extract_tags(headers)
-            from headroom.proxy.savings_attribution import bind_scope
-
-            bind_scope(tags, request.scope)
-            # Identify the harness (codex / claude-code / aider / etc.)
-            # from User-Agent or X-Client. Surfaced via the funnel into
-            # PERF logs and RequestLog.tags — see RequestOutcome.client.
-            client = classify_client(headers, default="claude")
-            # PR-A5 (P5-49): strip internal x-headroom-* from upstream-bound
-            # headers AFTER `_extract_tags` reads them. Inbound bypass gating
-            # uses `request.headers.get(...)` directly above; memory user-id
-            # is read from `request.headers` below if needed. From this
-            # point on, `headers` is the upstream-bound copy.
-            from headroom.proxy.helpers import (
-                _strip_internal_headers,
-                apply_keep_last_turns,
-                log_outbound_headers,
-                merge_extra_headers,
-            )
-
-            _pre_strip_count = sum(1 for k in headers if k.lower().startswith("x-headroom-"))
-            headers = _strip_internal_headers(headers)
-            # `upstream_base_url` is the per-request `x-headroom-base-url`
-            # override when the client sent one. These headers are secrets, so
-            # they only travel to a host the operator designated.
-            headers = merge_extra_headers(
-                headers,
-                self.config.anthropic_extra_headers,
-                upstream_url=upstream_base_url,
-                config=self.config,
-            )
-            log_outbound_headers(
-                forwarder="anthropic_messages",
-                stripped_count=_pre_strip_count
-                - sum(1 for k in headers if k.lower().startswith("x-headroom-")),
-                request_id=request_id,
-            )
-
-            # Subscription tracker: notify on OAuth requests (not API-key requests)
-            _auth_header = headers.get("authorization", "")
-            if _auth_header.startswith("Bearer ") and not _auth_header.startswith(
-                "Bearer sk-ant-api"
-            ):
-                from headroom.subscription.tracker import (
-                    get_subscription_tracker as _get_sub_tracker,
-                )
-
-                _sub_tracker = _get_sub_tracker()
-                if _sub_tracker is not None:
-                    from headroom.subscription.credential_policy import (
-                        is_local_operator_connection,
-                    )
-
-                    # Only the local operator's bearer may become the polled
-                    # account; a network caller only marks activity (01-F16).
-                    _sub_tracker.notify_active(
-                        _auth_header,
-                        from_local_operator=is_local_operator_connection(request),
-                    )
-
-            # Rate limiting
-            if self.rate_limiter:
-                # One identity rule for every provider: peer-owned, and
-                # credential-scoped only for proxy-token / direct loopback
-                # callers (headroom/proxy/rate_limit_identity.py).
-                rate_key = rate_limit_identity(request, headers)
-                allowed, wait_seconds = await self.rate_limiter.check_request(rate_key)
-                if not allowed:
-                    await self.metrics.record_rate_limited(
-                        provider=provider_name, source="headroom"
-                    )
-                    # Unit 4: release the pre-upstream semaphore before we
-                    # bail out of the handler via HTTPException — FastAPI's
-                    # exception handler will NOT run our ``finally``.
-                    await _finalize_pre_upstream()
-                    raise HTTPException(
-                        status_code=429,
-                        detail=f"Rate limited. Retry after {wait_seconds:.1f}s",
-                        headers={"Retry-After": str(int(wait_seconds) + 1)},
-                    )
-
-            # Budget check
-            cost_tracker = self.cost_tracker
-            if cost_tracker:
-                allowed, remaining = cost_tracker.check_budget()
-                if not allowed:
-                    # Unit 4: release the pre-upstream semaphore before we
-                    # bail out of the handler via HTTPException.
-                    await _finalize_pre_upstream()
-                    raise HTTPException(
-                        status_code=429,
-                        detail=cost_tracker.budget_denial_detail(),
-                    )
 
             # Memory: Get user ID when memory is enabled (fallback to "default" for simple DevEx).
             # Reads `request.headers` directly because the local `headers` dict was
@@ -3883,6 +3966,8 @@ class AnthropicHandlerMixin:
             # compression). Anthropic rejects that with a 400 ("messages.0: use
             # the top-level 'system' parameter ..."), so relocate it back to the
             # top-level ``system`` parameter as the last step before forwarding.
+            # A non-Claude model on a third-party upstream (configured target or
+            # per-request base URL) keeps the client's valid sections in place.
             relocated_messages, relocated_system, system_relocated = (
                 relocate_system_messages_to_top_level(
                     body["messages"],
@@ -3895,6 +3980,12 @@ class AnthropicHandlerMixin:
                             or _is_googleapis_endpoint(upstream_base_url)
                         )
                         else None
+                    ),
+                    third_party_model=is_third_party_model(
+                        model,
+                        third_party_upstream=bool(
+                            upstream_base_url or _third_party_anthropic_upstream
+                        ),
                     ),
                 )
             )
@@ -4277,19 +4368,34 @@ class AnthropicHandlerMixin:
                     and ccr_response_handler_enabled
                     and has_ccr_retrieve_tool(tools if tools is not None else body.get("tools"))
                 )
-                buffered_retrieval_can_help = (
-                    retrieve_tool_is_offered and self._outgoing_body_has_redeemable_marker(body)
+                #
+                # A marker the model already saw on an earlier turn can still be
+                # retrieved, so it does not justify buffering every later turn
+                # (#3587), but it does mean a retrieval call may come. Those
+                # turns stream with ``headroom_retrieve`` withheld from the
+                # client and served by the proxy in a continuation round.
+                owned_marker, new_owned_marker = (
+                    self._outgoing_redeemable_markers(body, previous_forwarded_messages)
+                    if retrieve_tool_is_offered
+                    else (False, False)
                 )
-                wants_buffered_stream_ccr = bool(buffered_retrieval_can_help)
-                if retrieve_tool_is_offered and not buffered_retrieval_can_help:
+                wants_buffered_stream_ccr = bool(new_owned_marker)
+                if retrieve_tool_is_offered and not owned_marker:
                     logger.info(
                         f"[{request_id}] CCR: headroom_retrieve is resident but this "
                         "request carries no redeemable marker, so server-side "
                         "retrieval cannot fire; keeping the streaming path (#3071)"
                     )
+                elif retrieve_tool_is_offered and not new_owned_marker:
+                    logger.info(
+                        f"[{request_id}] CCR: every redeemable marker was already "
+                        "forwarded; streaming with headroom_retrieve served by the "
+                        "proxy (#3587)"
+                    )
                 buffered_stream_ccr = (
                     wants_buffered_stream_ccr and not outbound_locked_to_client_bytes
                 )
+                serve_ccr_retrieval_in_stream = bool(owned_marker) and not buffered_stream_ccr
                 if wants_buffered_stream_ccr and outbound_locked_to_client_bytes:
                     logger.info(
                         f"[{request_id}] CCR: signed thinking blocks force byte-faithful "
@@ -4463,6 +4569,7 @@ class AnthropicHandlerMixin:
                         session_key=session_key,
                         server_memory_tool_names=server_memory_tool_names,
                         client_beta=client_anthropic_beta or "",
+                        serve_ccr_retrieval=serve_ccr_retrieval_in_stream,
                     )
                 else:
                     # Whatever set it — the client's own ``stream: false`` or

@@ -129,6 +129,7 @@ class _DummyOpenAIHandler(OpenAIHandlerMixin):
         self.metrics = _DummyMetrics()
         self.config = SimpleNamespace(
             optimize=False,
+            mode="token",
             retry_max_attempts=1,
             retry_base_delay_ms=1,
             retry_max_delay_ms=1,

@@ -125,6 +125,31 @@ def test_split_keeps_relevant_drops_irrelevant():
     assert "".join(t for _, t in runs) == content
 
 
+def test_split_uses_all_user_text_blocks():
+    from headroom.relevance.bm25 import BM25Scorer
+    from headroom.utils import extract_user_query
+
+    messages = [
+        {
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "Review production incidents"},
+                {"type": "text", "text": "Focus on Kafka replication"},
+            ],
+        }
+    ]
+    content = (
+        "Production incident: payment gateway high latency\n\n"
+        "Kafka replication lag on broker 17 exceeded 30 minutes\n\n"
+        "Disk full on backup server\n\n"
+        "Production incident: expired TLS certificate\n"
+    )
+    runs = plan_relevance_split(content, extract_user_query(messages), BM25Scorer(), threshold=0.25)
+    kept = "".join(text for keep, text in runs if keep)
+    assert "Kafka replication lag" in kept
+    assert "Disk full on backup server" not in kept
+
+
 def test_empty_query_yields_no_split():
     assert plan_relevance_split("x\ny\n", "", KeywordScorer(), threshold=0.5) == [(True, "x\ny\n")]
 
