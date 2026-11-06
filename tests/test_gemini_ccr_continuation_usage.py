@@ -20,17 +20,6 @@ import pytest
 from headroom.proxy.handlers.gemini import GeminiHandlerMixin
 
 
-class _FakeRequest:
-    def __init__(self) -> None:
-        self.headers: dict[str, str] = {}
-        self.query_params: dict[str, str] = {}
-        self.url = SimpleNamespace(path="/v1beta/models/gemini-pro:generateContent", query="")
-        # Every real Starlette Request carries a scope, and the Gemini handler
-        # binds the savings-attribution ledger to it (#3051). Without this the
-        # double is a shape that cannot occur in production.
-        self.scope: dict = {"type": "http", "method": "POST"}
-
-
 class _CcrToolCallResponse:
     """Initial 200 carrying a CCR tool call and a valid promptTokenCount."""
 
@@ -117,16 +106,9 @@ class _Handler(GeminiHandlerMixin):
 
 
 @pytest.mark.asyncio
-async def test_ccr_continuation_present_null_usage_does_not_502(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    async def payload(request):  # noqa: ANN001, ANN201
-        return {"contents": [{"role": "user", "parts": [{"text": "hello"}]}]}
-
-    monkeypatch.setattr("headroom.proxy.helpers._read_request_json", payload)
-
+async def test_ccr_continuation_present_null_usage_does_not_502(gemini_request) -> None:
     handler = _Handler()
-    response = await handler.handle_gemini_generate_content(_FakeRequest(), "gemini-pro")
+    response = await handler.handle_gemini_generate_content(gemini_request, "gemini-pro")
 
     # Before the fix this raised TypeError on the None arithmetic and the outer
     # handler returned a synthetic 502 with a recorded failure.
@@ -157,14 +139,7 @@ class _NoCcrHandler(_CcrHandler):
 
 
 @pytest.mark.asyncio
-async def test_missing_prompt_token_count_is_not_reported_as_provider_input(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    async def payload(request):  # noqa: ANN001, ANN201
-        return {"contents": [{"role": "user", "parts": [{"text": "hello"}]}]}
-
-    monkeypatch.setattr("headroom.proxy.helpers._read_request_json", payload)
-
+async def test_missing_prompt_token_count_is_not_reported_as_provider_input(gemini_request) -> None:
     handler = _Handler()
     handler.ccr_response_handler = _NoCcrHandler()
 
@@ -172,7 +147,7 @@ async def test_missing_prompt_token_count_is_not_reported_as_provider_input(
         return _NoUsageResponse()
 
     handler._retry_request = no_usage
-    response = await handler.handle_gemini_generate_content(_FakeRequest(), "gemini-pro")
+    response = await handler.handle_gemini_generate_content(gemini_request, "gemini-pro")
 
     assert response.status_code == 200
     (outcome,) = handler.outcomes
@@ -183,17 +158,10 @@ async def test_missing_prompt_token_count_is_not_reported_as_provider_input(
 
 
 @pytest.mark.asyncio
-async def test_reported_prompt_token_count_is_provider_input(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    async def payload(request):  # noqa: ANN001, ANN201
-        return {"contents": [{"role": "user", "parts": [{"text": "hello"}]}]}
-
-    monkeypatch.setattr("headroom.proxy.helpers._read_request_json", payload)
-
+async def test_reported_prompt_token_count_is_provider_input(gemini_request) -> None:
     handler = _Handler()
     handler.ccr_response_handler = _NoCcrHandler()
-    response = await handler.handle_gemini_generate_content(_FakeRequest(), "gemini-pro")
+    response = await handler.handle_gemini_generate_content(gemini_request, "gemini-pro")
 
     assert response.status_code == 200
     assert handler.outcomes[0].provider_input_tokens == 100
