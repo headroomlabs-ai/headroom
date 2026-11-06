@@ -112,16 +112,55 @@ def test_disable_kompress_fallback_without_disable_kompress_is_noop() -> None:
     assert router.config.fallback_strategy == CompressionStrategy.KOMPRESS
 
 
-def test_disable_kompress_prevents_kompress_instantiation_in_content_router() -> None:
+def test_disable_kompress_prevents_kompress_instantiation_in_content_router(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from unittest.mock import MagicMock
+
+    import headroom.transforms.kompress_compressor as kc
     from headroom.transforms.content_router import ContentRouter, ContentRouterConfig
 
+    mock_avail = MagicMock(return_value=True)
+    mock_compressor = MagicMock()
+    monkeypatch.setattr(kc, "is_kompress_available", mock_avail)
+    monkeypatch.setattr(kc, "KompressCompressor", mock_compressor)
+
     router = ContentRouter(ContentRouterConfig(enable_kompress=False))
-    assert router._get_kompress() is None
+    result = router._get_kompress()
+    assert result is None
+    mock_avail.assert_not_called()
+    mock_compressor.assert_not_called()
 
 
-def test_disable_kompress_reasoning_compaction_skips_kompress_loader() -> None:
+def test_disable_kompress_bypasses_remote_kompress(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from unittest.mock import MagicMock
+
+    from headroom.transforms.content_router import ContentRouter, ContentRouterConfig
+
+    mock_remote = MagicMock()
+    router = ContentRouter(ContentRouterConfig(enable_kompress=False))
+    monkeypatch.setattr(router, "_get_remote_kompress", mock_remote)
+
+    result = router._get_kompress()
+    assert result is None
+    mock_remote.assert_not_called()
+
+
+def test_disable_kompress_reasoning_compaction_skips_kompress_loader(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from unittest.mock import MagicMock
+
+    import headroom.transforms.kompress_compressor as kc
     from headroom.proxy.server import ProxyConfig, create_app
     from headroom.transforms.compression_units import find_content_router
+
+    mock_avail = MagicMock(return_value=True)
+    mock_compressor = MagicMock()
+    monkeypatch.setattr(kc, "is_kompress_available", mock_avail)
+    monkeypatch.setattr(kc, "KompressCompressor", mock_compressor)
 
     config = ProxyConfig(
         optimize=True,
@@ -137,3 +176,5 @@ def test_disable_kompress_reasoning_compaction_skips_kompress_loader() -> None:
     assert router is not None
     assert router.config.enable_kompress is False
     assert router._get_kompress() is None
+    mock_avail.assert_not_called()
+    mock_compressor.assert_not_called()
