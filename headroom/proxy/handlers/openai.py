@@ -4829,7 +4829,7 @@ class OpenAIHandlerMixin:
                 _rc_router = find_content_router(self.openai_pipeline)
                 _rc_kompress = (
                     (_rc_router._get_remote_kompress() or _rc_router._get_kompress())
-                    if _rc_router is not None
+                    if _rc_router is not None and _rc_router.config.enable_kompress
                     else None
                 )
                 # Sticky drop floor: turns dropped on a prior cold turn must stay
@@ -6651,6 +6651,11 @@ class OpenAIHandlerMixin:
                         logger.info(
                             f"[{request_id}] Memory context lookup exceeded "
                             f"{RESPONSES_CONTEXT_SEARCH_TIMEOUT_SECONDS:.1f}s; continuing without it"
+                        )
+                    except Exception as e:
+                        memory_context = None
+                        logger.warning(
+                            f"[{request_id}] Memory context lookup failed: {e}; continuing without it"
                         )
                     if memory_context:
                         from headroom.proxy.helpers import (
