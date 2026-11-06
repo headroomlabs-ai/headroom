@@ -387,7 +387,9 @@ class LocalBackend:
                 for rel in all_relationships:
                     source_name = rel.get("source", "").lower()
                     target_name = rel.get("target", "").lower()
-                    rel_type = rel.get("type", "related_to")
+                    # The memory_save tool schema names the key `relation`
+                    # (tools.py); direct callers and older docs use `type`.
+                    rel_type = rel.get("type") or rel.get("relation") or "related_to"
 
                     source_id = entity_id_map.get(source_name)
                     target_id = entity_id_map.get(target_name)
