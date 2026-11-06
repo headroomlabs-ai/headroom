@@ -2074,14 +2074,19 @@ def _extract_responses_usage(event: dict[str, Any]) -> tuple[int, int, int, int,
     return input_tokens, output_tokens, cached, write, uncached, inferred
 
 
-def _prefers_http1_passthrough(base_url: str) -> bool:
-    """Whether passthrough to this host must use HTTP/1.1.
+def prefers_http1_passthrough(base_url: str) -> bool:
+    """Whether passthrough/streaming to this host must use HTTP/1.1.
 
     ChatGPT's Cloudflare edge issues a managed challenge to our HTTP/2
-    fingerprint on sensitive account endpoints; HTTP/1.1 is accepted.
+    fingerprint on sensitive account endpoints, and multiplexing large
+    streaming request bodies over HTTP/2 can stall on flow-control windows.
+    HTTP/1.1 avoids both issues.
     """
     host = (urlparse(base_url).hostname or "").lower()
     return host == "chatgpt.com" or host.endswith(".chatgpt.com")
+
+
+_prefers_http1_passthrough = prefers_http1_passthrough
 
 
 def _openai_outcome_provider(
@@ -4822,16 +4827,35 @@ class OpenAIHandlerMixin:
                     if _rc_router is not None
                     else None
                 )
-                # Drop needs no compressor; Kompress (warm) does.
-                if _rc_kompress is not None or _rc_cold:
+                # Sticky drop floor: turns dropped on a prior cold turn must stay
+                # dropped on the next warm turn, or the prefix no longer matches
+                # the cached cold-turn prefix and the cache misses (#4548).
+                _rc_drop_upto = (
+                    openai_prefix_tracker.request_reasoning_drop_floor()
+                    if openai_prefix_tracker is not None
+                    else 0
+                )
+                # Drop needs no compressor; Kompress (warm) does. Sticky drop needs
+                # neither — it just re-applies a previously-dropped shape.
+                if _rc_kompress is not None or _rc_cold or _rc_drop_upto:
                     _rc_keep = int(os.environ.get("HEADROOM_THINKING_COMPACT_KEEP_LAST", "1"))
                     optimized_messages, _rc_stats = compact_reasoning_openai_chat(
                         optimized_messages,
                         kompress=_rc_kompress,
                         keep_last_turns=_rc_keep,
                         drop=_rc_cold,
+                        drop_first_turns=_rc_drop_upto,
                     )
                     body["messages"] = optimized_messages
+                    # On a cold turn drop=True drops every non-kept prior turn, so
+                    # record that count as the new sticky floor for the next warm
+                    # turn. Never shrink it — a later cold turn can only drop more.
+                    # Keep the increase on this request's resolved state so response
+                    # recording persists it without adopting a sibling fork's floor.
+                    if _rc_cold and openai_prefix_tracker is not None:
+                        openai_prefix_tracker.raise_reasoning_drop_floor(
+                            max(_rc_drop_upto, _rc_stats.get("dropped_upto", 0))
+                        )
                     if _rc_stats["turns_compacted"]:
                         transforms_applied.append(
                             f"openai:reasoning_{'drop' if _rc_cold else 'compact'}:{_rc_stats['turns_compacted']}"
