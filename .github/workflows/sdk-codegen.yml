@@ -1,0 +1,78 @@
+name: SDK code generation
+
+on:
+  pull_request:
+    paths:
+      - "headroom/proxy/sdk_contracts.py"
+      - "headroom/proxy/server.py"
+      - "tools/sdkgen/**"
+      - "sdk/codegen/**"
+      - "sdk/generated-pilot/**"
+      - "tests/sdkgen/**"
+      - ".github/workflows/sdk-codegen.yml"
+  push:
+    branches: [main]
+    paths:
+      - "headroom/proxy/sdk_contracts.py"
+      - "headroom/proxy/server.py"
+      - "tools/sdkgen/**"
+      - "sdk/codegen/**"
+      - "sdk/generated-pilot/**"
+      - "tests/sdkgen/**"
+      - ".github/workflows/sdk-codegen.yml"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: sdk-codegen-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+jobs:
+  contract-and-wire:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      DOTNET_CLI_TELEMETRY_OPTOUT: "1"
+      DOTNET_NOLOGO: "1"
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97
+        with:
+          python-version: "3.13.5"
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020
+        with:
+          node-version: "22.16.0"
+      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16
+        with:
+          go-version: "1.23.2"
+      - uses: actions/setup-dotnet@26b0ec14cb23fa6904739307f278c14f94c95bf1
+        with:
+          dotnet-version: "10.0.303"
+      - name: Install pinned Rust toolchain
+        run: |
+          rustup toolchain install 1.95.0 --profile minimal --component clippy
+          rustup default 1.95.0
+      - name: Install source-validation tools
+        run: |
+          python -m pip install --disable-pip-version-check ruff==0.16.3 mypy==1.19.1
+          npm install --global typescript@5.8.3
+      - name: Verify source formatting and types
+        run: |
+          ruff format --check headroom/proxy/sdk_contracts.py tools/sdkgen tests/sdkgen
+          ruff check headroom/proxy/sdk_contracts.py tools/sdkgen tests/sdkgen
+          mypy tools/sdkgen
+      - name: Verify deterministic generation and compiler contracts
+        run: |
+          python -m tools.sdkgen check
+          python -m unittest discover -s tests/sdkgen -p 'test_*.py' -v
+      - name: Verify native generated clients
+        env:
+          CARGO_TARGET_DIR: ${{ runner.temp }}/headroom-sdkgen-rust-target
+        run: |
+          cargo test --manifest-path sdk/generated-pilot/rust/Cargo.toml --locked
+          cargo clippy --manifest-path sdk/generated-pilot/rust/Cargo.toml --locked -- -D warnings
+          dotnet build sdk/generated-pilot/dotnet/Headroom.GeneratedPilot.csproj --configuration Release --artifacts-path "${RUNNER_TEMP}/headroom-sdkgen-dotnet-artifacts"
+          go -C sdk/generated-pilot/go vet ./...
+      - name: Verify five-language HTTP wire conformance
+        run: python -m tools.sdkgen.conformance
