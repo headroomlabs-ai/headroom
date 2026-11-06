@@ -38,6 +38,7 @@ from headroom.agent_savings import proxy_pipeline_kwargs
 from headroom.ccr.context_tracker import looks_like_claude_code_compact_summary
 from headroom.ccr.marker_resolution import resolve_markers_in_response
 from headroom.ccr.tool_calls import has_ccr_retrieve_tool
+from headroom.config import resolve_omlx_target_api_url
 from headroom.copilot_auth import apply_copilot_api_auth, is_copilot_upstream_url
 from headroom.log_safety import describe_exception
 from headroom.pipeline import PipelineStage, summarize_routing_markers
@@ -86,6 +87,144 @@ from headroom.proxy.thinking_tokens import ThinkingTokens, extract_thinking_toke
 from headroom.utils import format_exception_message
 
 logger = logging.getLogger("headroom.proxy")
+
+_EXPLICIT_OMLX_ROUTING_PREFIXES: tuple[str, ...] = ("omlx/", "mlx/", "local/")
+_LOCAL_OMLX_MODEL_PREFIXES: tuple[str, ...] = (
+    "omlx/",
+    "mlx/",
+    "local/",
+    "mlx-community/",
+    "gemma",
+    "qwen",
+    "llama",
+    "mistral",
+    "deepseek",
+    "phi",
+    "lfm",
+    "smollm",
+    "starcoder",
+    "codellama",
+    "yi-",
+    "nemotron",
+)
+
+
+def is_omlx_local_model(model: Any) -> bool:
+    """Return True only when ``model`` explicitly targets local oMLX inference.
+
+    Unmatched models and all ``claude*`` models (unless explicitly prefixed with
+    ``omlx/``, ``mlx/``, or ``local/``) stay on the Anthropic cloud target so
+    supported Claude models (e.g. ``claude-haiku-4-5-20251001``,
+    ``claude-haiku-5-5``, ``claude-fable-5``) are never misrouted to localhost.
+    """
+    model_str = str(model or "").strip().lower()
+    if not model_str:
+        return False
+    if model_str.startswith(_EXPLICIT_OMLX_ROUTING_PREFIXES):
+        return True
+    if model_str.startswith("claude") or "claude-" in model_str:
+        return False
+    allowlist_raw = os.environ.get("HEADROOM_OMLX_MODELS", "")
+    if allowlist_raw:
+        allowlist = {entry.strip().lower() for entry in allowlist_raw.split(",") if entry.strip()}
+        if model_str in allowlist:
+            return True
+    return model_str.startswith(_LOCAL_OMLX_MODEL_PREFIXES)
+
+
+def strip_omlx_model_prefix(model: str) -> str:
+    """Strip a leading ``omlx/`` or ``local/`` routing prefix from ``model``."""
+    lowered = model.lower()
+    for prefix in ("omlx/", "local/"):
+        if lowered.startswith(prefix):
+            stripped = model[len(prefix) :].strip()
+            if stripped:
+                return stripped
+            break
+    return model
+
+
+_ANTHROPIC_CLOUD_AUTH_HEADERS: frozenset[str] = frozenset({"x-api-key", "authorization"})
+
+
+def _select_extra_headers_for_destination(
+    extra: dict[str, str] | None,
+    *,
+    routed_to_omlx: bool,
+) -> dict[str, str] | None:
+    """Select configured extra headers appropriate for the target destination.
+
+    Operator-configured ``anthropic_extra_headers`` cloud credentials
+    (``x-api-key``, ``Authorization``) belong exclusively to Anthropic Cloud and
+    must never be merged into local oMLX requests or override
+    ``HEADROOM_OMLX_API_KEY``. Non-credential gateway headers still flow through
+    ``merge_extra_headers`` subject to ``is_trusted_upstream``.
+    """
+    if not extra or not routed_to_omlx:
+        return extra
+    filtered = {k: v for k, v in extra.items() if k.lower() not in _ANTHROPIC_CLOUD_AUTH_HEADERS}
+    return filtered or None
+
+
+def _build_outbound_anthropic_headers(
+    stripped_inbound_headers: dict[str, str],
+    extra_headers: dict[str, str] | None,
+    *,
+    routed_to_omlx: bool,
+    upstream_url: str | None,
+    config: Any,
+) -> dict[str, str]:
+    """Build destination-aware outbound headers for Anthropic Cloud or local oMLX."""
+    from headroom.proxy.helpers import merge_extra_headers
+
+    base_headers = dict(stripped_inbound_headers)
+    if routed_to_omlx:
+        for cred_key in [k for k in base_headers if k.lower() in _ANTHROPIC_CLOUD_AUTH_HEADERS]:
+            base_headers.pop(cred_key, None)
+        omlx_api_key = (
+            os.environ.get("HEADROOM_OMLX_API_KEY") or os.environ.get("OMLX_API_KEY") or ""
+        ).strip()
+        if omlx_api_key:
+            base_headers["x-api-key"] = omlx_api_key
+            base_headers["authorization"] = f"Bearer {omlx_api_key}"
+    return merge_extra_headers(
+        base_headers,
+        _select_extra_headers_for_destination(extra_headers, routed_to_omlx=routed_to_omlx),
+        upstream_url=upstream_url,
+        config=config,
+    )
+
+
+def _normalize_omlx_upstream_path(path: str) -> str:
+    """Normalize ``/omlx/...`` proxy route prefixes to the upstream Anthropic path."""
+    if path.startswith("/omlx"):
+        return path[len("/omlx") :] or "/v1/messages"
+    return path
+
+
+def _notify_subscription_tracker_if_cloud(
+    request: Request,
+    headers: dict[str, str],
+    *,
+    routed_to_omlx: bool,
+) -> None:
+    """Notify the Anthropic OAuth subscription tracker only on cloud-bound requests."""
+    if routed_to_omlx:
+        return
+    auth_header = next((v for k, v in headers.items() if k.lower() == "authorization"), "")
+    if auth_header.startswith("Bearer ") and not auth_header.startswith("Bearer sk-ant-api"):
+        from headroom.subscription.tracker import get_subscription_tracker as _get_sub_tracker
+
+        sub_tracker = _get_sub_tracker()
+        if sub_tracker is not None:
+            from headroom.subscription.credential_policy import is_local_operator_connection
+
+            # Only the local operator's bearer may become the polled
+            # account; a network caller only marks activity (01-F16).
+            sub_tracker.notify_active(
+                auth_header,
+                from_local_operator=is_local_operator_connection(request),
+            )
 
 
 @lru_cache(maxsize=1)
@@ -1380,17 +1519,27 @@ class AnthropicHandlerMixin:
                 _strip_internal_headers,
                 apply_keep_last_turns,
                 log_outbound_headers,
-                merge_extra_headers,
+            )
+
+            omlx_target = getattr(
+                self.config, "omlx_target_api_url", None
+            ) or resolve_omlx_target_api_url(environ=os.environ)
+            routed_to_omlx = request.url.path.startswith("/omlx") or bool(
+                upstream_base_url
+                and omlx_target
+                and upstream_base_url.rstrip("/") == omlx_target.rstrip("/")
             )
 
             _pre_strip_count = sum(1 for k in headers if k.lower().startswith("x-headroom-"))
-            headers = _strip_internal_headers(headers)
+            _stripped_inbound_headers = _strip_internal_headers(headers)
             # `upstream_base_url` is the per-request `x-headroom-base-url`
             # override when the client sent one. These headers are secrets, so
-            # they only travel to a host the operator designated.
-            headers = merge_extra_headers(
-                headers,
+            # they only travel to a host the operator designated, and cloud
+            # credentials in `anthropic_extra_headers` are withheld on local oMLX routes.
+            headers = _build_outbound_anthropic_headers(
+                _stripped_inbound_headers,
                 self.config.anthropic_extra_headers,
+                routed_to_omlx=routed_to_omlx,
                 upstream_url=upstream_base_url,
                 config=self.config,
             )
@@ -1400,28 +1549,6 @@ class AnthropicHandlerMixin:
                 - sum(1 for k in headers if k.lower().startswith("x-headroom-")),
                 request_id=request_id,
             )
-
-            # Subscription tracker: notify on OAuth requests (not API-key requests)
-            _auth_header = headers.get("authorization", "")
-            if _auth_header.startswith("Bearer ") and not _auth_header.startswith(
-                "Bearer sk-ant-api"
-            ):
-                from headroom.subscription.tracker import (
-                    get_subscription_tracker as _get_sub_tracker,
-                )
-
-                _sub_tracker = _get_sub_tracker()
-                if _sub_tracker is not None:
-                    from headroom.subscription.credential_policy import (
-                        is_local_operator_connection,
-                    )
-
-                    # Only the local operator's bearer may become the polled
-                    # account; a network caller only marks activity (01-F16).
-                    _sub_tracker.notify_active(
-                        _auth_header,
-                        from_local_operator=is_local_operator_connection(request),
-                    )
 
             # Rate limiting
             if self.rate_limiter:
@@ -1499,10 +1626,34 @@ class AnthropicHandlerMixin:
                 )
                 from headroom.proxy.route_advice import resolver_for
 
-                backend = resolver_for(self).for_request(request, body=body)
                 passthrough_model = body.get("model") or model_override or "unknown"
                 if not isinstance(passthrough_model, str):
                     passthrough_model = "unknown"
+                passthrough_bytes = original_body_bytes
+                if not upstream_base_url and omlx_target and is_omlx_local_model(passthrough_model):
+                    upstream_base_url = omlx_target.rstrip("/")
+                    routed_to_omlx = True
+                    headers = _build_outbound_anthropic_headers(
+                        _stripped_inbound_headers,
+                        self.config.anthropic_extra_headers,
+                        routed_to_omlx=True,
+                        upstream_url=upstream_base_url,
+                        config=self.config,
+                    )
+                if routed_to_omlx and isinstance(body.get("model"), str):
+                    stripped_passthrough_model = strip_omlx_model_prefix(passthrough_model)
+                    if stripped_passthrough_model != passthrough_model:
+                        passthrough_model = stripped_passthrough_model
+                        body["model"] = stripped_passthrough_model
+                        from headroom.proxy.body_forwarding import serialize_body_canonical
+
+                        passthrough_bytes = serialize_body_canonical(body)
+                _notify_subscription_tracker_if_cloud(
+                    request, headers, routed_to_omlx=routed_to_omlx
+                )
+                backend = (
+                    None if routed_to_omlx else resolver_for(self).for_request(request, body=body)
+                )
                 if backend is not None:
                     if model_override and not body.get("model"):
                         body["model"] = model_override
@@ -1520,14 +1671,16 @@ class AnthropicHandlerMixin:
                     )
                 passthrough_base = upstream_base_url or self.ANTHROPIC_API_URL
                 passthrough_url = build_anthropic_upstream_url(
-                    passthrough_base, request.url.path, request.url.query
+                    passthrough_base,
+                    _normalize_omlx_upstream_path(request.url.path),
+                    request.url.query,
                 )
                 assert self.http_client is not None, "http_client must be initialized"
                 upstream_request = self.http_client.build_request(
                     request.method,
                     passthrough_url,
                     headers=headers,
-                    content=original_body_bytes,
+                    content=passthrough_bytes,
                 )
                 await _finalize_pre_upstream()
                 return await self.handle_passthrough(
@@ -1559,6 +1712,7 @@ class AnthropicHandlerMixin:
             ):
                 body["model"] = model
                 body_mutation_tracker.mark_mutated("sanitize_model_id")
+
             messages = body.get("messages", [])
             # Strip streaming-only "index" keys from request content blocks BEFORE any
             # prefix-cache tracking or compression. The proxy's streaming reconstruction
@@ -1667,6 +1821,45 @@ class AnthropicHandlerMixin:
                 model = self._maybe_route_model(
                     model, messages, body, body_mutation_tracker, _bypass
                 )
+
+            _prev_routed_to_omlx = routed_to_omlx
+            routed_to_omlx = request.url.path.startswith("/omlx") or bool(
+                upstream_base_url
+                and omlx_target
+                and upstream_base_url.rstrip("/") == omlx_target.rstrip("/")
+            )
+            if not upstream_base_url and omlx_target:
+                is_local = is_omlx_local_model(model)
+                if is_local:
+                    upstream_base_url = omlx_target.rstrip("/")
+                    routed_to_omlx = True
+                    logger.info(
+                        "[%s] Unified proxy: routing local model '%s' to oMLX: %s",
+                        request_id,
+                        model,
+                        upstream_base_url,
+                    )
+            if routed_to_omlx != _prev_routed_to_omlx:
+                headers = _build_outbound_anthropic_headers(
+                    _stripped_inbound_headers,
+                    self.config.anthropic_extra_headers,
+                    routed_to_omlx=routed_to_omlx,
+                    upstream_url=upstream_base_url,
+                    config=self.config,
+                )
+            if routed_to_omlx and isinstance(model, str):
+                stripped_model = strip_omlx_model_prefix(model)
+                if stripped_model != model:
+                    model = stripped_model
+                    body["model"] = stripped_model
+                    body_mutation_tracker.mark_mutated("omlx_strip_model_prefix")
+            _notify_subscription_tracker_if_cloud(request, headers, routed_to_omlx=routed_to_omlx)
+            _auth_header = (
+                headers.get("authorization")
+                or headers.get("Authorization")
+                or request.headers.get("authorization")
+                or ""
+            )
 
             # NOTE: Upstream temporarily disabled broad image compression due to
             # token-counting inaccuracies. We only compress the latest non-frozen
@@ -4323,9 +4516,12 @@ class AnthropicHandlerMixin:
             # every one of those turns to "anthropic" on the dashboard.
             # For a non-Copilot base the builder only joins base + path, so the
             # URL itself is unchanged.
+            request_path = request.url.path
+            if request_path.startswith("/omlx"):
+                request_path = request_path[len("/omlx") :] or "/v1/messages"
             url = build_anthropic_upstream_url(
                 upstream_base_url or self.ANTHROPIC_API_URL,
-                request.url.path,
+                request_path,
                 request.url.query,
             )
             # Keep a conversation on one replica of providers that route on a
@@ -5444,8 +5640,10 @@ class AnthropicHandlerMixin:
                         # counters. Provider-specific OAuth/subscription
                         # accounting — stays outside the funnel (different
                         # concern, only fires for Bearer-not-sk-ant tokens).
-                        if _auth_header.startswith("Bearer ") and not _auth_header.startswith(
-                            "Bearer sk-ant-api"
+                        if (
+                            not routed_to_omlx
+                            and _auth_header.startswith("Bearer ")
+                            and not _auth_header.startswith("Bearer sk-ant-api")
                         ):
                             from headroom.subscription.tracker import (
                                 get_subscription_tracker as _get_sub_tracker,

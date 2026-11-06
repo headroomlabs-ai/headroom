@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import logging
+import os
 from typing import Any
 
 from fastapi import FastAPI, HTTPException, Request, WebSocket
@@ -329,6 +330,19 @@ def register_provider_routes(app: FastAPI, proxy: Any) -> None:
                 request, upstream_base_url=custom_base.rstrip("/")
             )
         return await proxy.handle_anthropic_messages(request)
+
+    @app.post("/omlx/v1/messages")
+    async def omlx_messages(request: Request):
+        from headroom.config import resolve_omlx_target_api_url
+
+        omlx_target = (
+            getattr(proxy.config, "omlx_target_api_url", None)
+            or resolve_omlx_target_api_url(environ=os.environ)
+            or "http://127.0.0.1:8888"
+        )
+        return await proxy.handle_anthropic_messages(
+            request, upstream_base_url=omlx_target.rstrip("/")
+        )
 
     @app.post("/anthropic/v1/messages")
     async def foundry_anthropic_messages(request: Request):

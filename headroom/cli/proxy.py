@@ -1122,6 +1122,14 @@ def dashboard(port: int | None, no_open: bool) -> None:
     help=("Custom Vertex AI regional API URL for publisher endpoints (env: VERTEX_TARGET_API_URL)"),
 )
 @click.option(
+    "--omlx-api-url",
+    default=None,
+    help=(
+        "Custom local oMLX API URL for hybrid local/cloud routing "
+        "(env: HEADROOM_OMLX_BASE_URL or OMLX_TARGET_API_URL)"
+    ),
+)
+@click.option(
     "--region",
     default="us-west-2",
     envvar="HEADROOM_REGION",
@@ -1281,6 +1289,7 @@ def proxy(
     gemini_api_url: str | None,
     cloudcode_api_url: str | None,
     vertex_api_url: str | None,
+    omlx_api_url: str | None,
     region: str,
     bedrock_region: str | None,
     bedrock_profile: str | None,
@@ -1506,6 +1515,8 @@ def proxy(
     if memory_qdrant_api_key is not None:
         qdrant_overrides["memory_qdrant_api_key"] = memory_qdrant_api_key
 
+    from headroom.config import resolve_omlx_target_api_url
+
     config = ProxyConfig(
         host=host,
         port=port,
@@ -1519,6 +1530,7 @@ def proxy(
         gemini_api_url=provider_api_overrides.gemini,
         cloudcode_api_url=provider_api_overrides.cloudcode,
         vertex_api_url=provider_api_overrides.vertex,
+        omlx_target_api_url=resolve_omlx_target_api_url(omlx_api_url, os.environ),
         mode=effective_mode,
         optimize=not no_optimize,
         cache_enabled=not no_cache,

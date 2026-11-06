@@ -84,6 +84,7 @@ from headroom.config import (
     DEFAULT_EXCLUDE_TOOLS,
     CacheAlignerConfig,
     ReadLifecycleConfig,
+    resolve_omlx_target_api_url,
 )
 from headroom.dashboard import get_dashboard_html
 from headroom.log_safety import describe_exception, safe_id
@@ -6608,6 +6609,7 @@ def _proxy_config_from_env() -> ProxyConfig:
         ),
         ccr_buffered_chat_streaming=_get_env_bool("HEADROOM_CCR_BUFFERED_CHAT_STREAMING", False),
         vertex_api_url=os.environ.get("VERTEX_TARGET_API_URL"),
+        omlx_target_api_url=resolve_omlx_target_api_url(environ=os.environ),
         backend=_get_env_str("HEADROOM_BACKEND", "anthropic"),
         bedrock_region=_get_env_str("HEADROOM_BEDROCK_REGION", "us-west-2"),
         bedrock_profile=os.environ.get("AWS_PROFILE"),
@@ -7112,6 +7114,10 @@ if __name__ == "__main__":
         "--vertex-api-url",
         help=f"Custom Vertex AI regional API URL (default: {DEFAULT_VERTEX_API_URL})",
     )
+    parser.add_argument(
+        "--omlx-api-url",
+        help="Custom local oMLX API URL (env: HEADROOM_OMLX_BASE_URL or OMLX_TARGET_API_URL)",
+    )
 
     # Backend (anthropic direct, bedrock, openrouter, anyllm, or litellm-<provider>)
     parser.add_argument(
@@ -7433,6 +7439,9 @@ if __name__ == "__main__":
             min_value=0,
         ),
         vertex_api_url=_get_env_str("VERTEX_TARGET_API_URL", args.vertex_api_url),
+        omlx_target_api_url=resolve_omlx_target_api_url(
+            getattr(args, "omlx_api_url", None), os.environ
+        ),
         # Backend settings
         backend=_get_env_str("HEADROOM_BACKEND", args.backend),  # type: ignore[arg-type]
         bedrock_region=_get_env_str("HEADROOM_BEDROCK_REGION", args.bedrock_region),
