@@ -1,10 +1,5 @@
 """Google Vertex provider helpers."""
 
-from .routing import (
-    VertexRouteDecision,
-    dispatch_vertex_publisher_request,
-    resolve_vertex_route,
-)
 from .diagnostics import (
     HINT_HEADER,
     annotate_vertex_error,
@@ -12,6 +7,11 @@ from .diagnostics import (
     public_backend_error_message,
     vertex_error_hint,
     with_vertex_diagnostics,
+)
+from .routing import (
+    VertexRouteDecision,
+    dispatch_vertex_publisher_request,
+    resolve_vertex_route,
 )
 from .runtime import (
     VERTEX_ANTHROPIC_PROVIDER_NAME,
