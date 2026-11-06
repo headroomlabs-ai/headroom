@@ -967,7 +967,7 @@ fn pytest_cap_reserve(log_lines: &[LogLine], scan: &PytestShortSummary) -> BTree
     let mut reserved = scan.totals_lines.clone();
     let first_error_detail = log_lines
         .iter()
-        .take_while(|line| scan.first_header.map_or(true, |h| line.line_number < h))
+        .take_while(|line| scan.first_header.is_none_or(|h| line.line_number < h))
         .find(|line| line.content.starts_with("E "));
     if let Some(line) = first_error_detail {
         reserved.insert(line.line_number);

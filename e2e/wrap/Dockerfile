@@ -20,13 +20,13 @@ FROM quay.io/pypa/manylinux_2_28_x86_64 AS builder
 # perl-IPC-Cmd` line is intentionally absent.
 
 # Install rust toolchain into the manylinux container. Match the
-# rust-toolchain.toml at repo root (1.95.0 + rustfmt + clippy) so cargo
+# rust-toolchain.toml at repo root (1.98.1 + rustfmt + clippy) so cargo
 # doesn't try to mutate the toolchain on first invocation.
 ENV CARGO_HOME=/usr/local/cargo \
     RUSTUP_HOME=/usr/local/rustup \
     PATH=/usr/local/cargo/bin:/opt/python/cp311-cp311/bin:${PATH}
 RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
-      | sh -s -- -y --no-modify-path --profile minimal -c rustfmt -c clippy --default-toolchain 1.95.0
+      | sh -s -- -y --no-modify-path --profile minimal -c rustfmt -c clippy --default-toolchain 1.98.1
 
 WORKDIR /build
 
