@@ -6607,6 +6607,13 @@ def _proxy_config_from_env() -> ProxyConfig:
             DEFAULT_BUFFERED_CCR_GRACE_SECONDS,
         ),
         ccr_buffered_chat_streaming=_get_env_bool("HEADROOM_CCR_BUFFERED_CHAT_STREAMING", False),
+        ccr_inject_system_instructions=(
+            False
+            if (
+                _get_env_bool("HEADROOM_NO_CCR", False) or _get_env_bool("HEADROOM_LOSSLESS", False)
+            )
+            else _get_env_bool("HEADROOM_CCR_INJECT_SYSTEM_INSTRUCTIONS", False)
+        ),
         vertex_api_url=os.environ.get("VERTEX_TARGET_API_URL"),
         backend=_get_env_str("HEADROOM_BACKEND", "anthropic"),
         bedrock_region=_get_env_str("HEADROOM_BEDROCK_REGION", "us-west-2"),
