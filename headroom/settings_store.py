@@ -165,6 +165,19 @@ SETTINGS: tuple[SettingField, ...] = (
         ),
         tier="advanced",
     ),
+    SettingField(
+        "HEADROOM_CCR_BUFFERED_CHAT_STREAMING",
+        "ccr_buffered_chat_streaming",
+        "Buffered CCR for streaming chat",
+        "Compression",
+        "bool",
+        default=False,
+        help=(
+            "Answer retrieval calls on streaming Chat Completions by buffering "
+            "turns that carry CCR markers. Buffered text arrives all at once."
+        ),
+        tier="advanced",
+    ),
     # --- Limits ---
     SettingField(
         "HEADROOM_RPM",
