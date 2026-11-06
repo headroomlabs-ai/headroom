@@ -72,7 +72,7 @@ jobs:
           - { name: arm64, runs_on: ubuntu-24.04-arm, platform: linux/arm64 }
 
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Normalize image name
         id: image-name
@@ -94,7 +94,7 @@ jobs:
 
       - name: Set up Python
         if: steps.version.outputs.version != ''
-        uses: actions/setup-python@v7
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         with:
           python-version: "3.12"
 
@@ -104,10 +104,10 @@ jobs:
           python scripts/version-sync.py --version ${{ steps.version.outputs.version }}
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v4
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
 
       - name: Log in to GHCR
-        uses: docker/login-action@v4
+        uses: docker/login-action@8aa5831fb8d48d8f76594c7ddde61ae58019f550 # v4.8.0
         with:
           registry: ${{ env.REGISTRY }}
           username: ${{ github.actor }}
@@ -117,13 +117,13 @@ jobs:
       # multi-arch index manifest and are applied in docker-manifest.
       - name: Extract image labels
         id: meta
-        uses: docker/metadata-action@v6
+        uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6.2.0
         with:
           images: ${{ env.REGISTRY }}/${{ steps.image-name.outputs.image_name }}
 
       - name: Build and push by digest (single platform)
         id: bake
-        uses: docker/bake-action@v7
+        uses: docker/bake-action@59cb1203cd42bcefd40a1b6d73b589e48c86040e # v7.5.0
         continue-on-error: true
         with:
           files: |
@@ -157,13 +157,13 @@ jobs:
       - name: Set up clean Docker Buildx fallback
         id: fallback-buildx
         if: steps.bake.outcome == 'failure'
-        uses: docker/setup-buildx-action@v4
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
 
       # A real build failure remains fatal on this uncached attempt.
       - name: Retry build without remote cache
         id: bake-fallback
         if: steps.bake.outcome == 'failure'
-        uses: docker/bake-action@v7
+        uses: docker/bake-action@59cb1203cd42bcefd40a1b6d73b589e48c86040e # v7.5.0
         with:
           builder: ${{ steps.fallback-buildx.outputs.name }}
           no-cache: true
@@ -229,7 +229,7 @@ jobs:
           "
 
       - name: Upload digest marker
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           # Variant + arch uniquely identify the marker. The manifest job
           # downloads both architecture artifacts by exact name; a glob such
@@ -291,23 +291,23 @@ jobs:
         run: printf 'sha=%s\n' "${GITHUB_SHA:0:7}" >> "$GITHUB_OUTPUT"
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v4
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
 
       - name: Log in to GHCR
-        uses: docker/login-action@v4
+        uses: docker/login-action@8aa5831fb8d48d8f76594c7ddde61ae58019f550 # v4.8.0
         with:
           registry: ${{ env.REGISTRY }}
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Download amd64 digest for this variant
-        uses: actions/download-artifact@v8
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: digests-${{ matrix.variant.name || 'root' }}-amd64
           path: ${{ runner.temp }}/digests
 
       - name: Download arm64 digest for this variant
-        uses: actions/download-artifact@v8
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: digests-${{ matrix.variant.name || 'root' }}-arm64
           path: ${{ runner.temp }}/digests
@@ -317,7 +317,7 @@ jobs:
       # bare variant) so existing pull URLs keep working.
       - name: Extract metadata (variant)
         id: meta
-        uses: docker/metadata-action@v6
+        uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6.2.0
         with:
           images: ${{ env.REGISTRY }}/${{ steps.image-name.outputs.image_name }}
           # `latest=false` is load-bearing (#3150). The action defaults to
@@ -416,7 +416,7 @@ jobs:
 
       - name: Install cosign
         if: steps.manifest.outputs.index_digest != ''
-        uses: sigstore/cosign-installer@v3
+        uses: sigstore/cosign-installer@398d4b0eeef1380460a10c8013a76f728fb906ac # v3.9.1
 
       - name: Sign multi-arch index manifest with cosign
         if: steps.manifest.outputs.index_digest != ''
