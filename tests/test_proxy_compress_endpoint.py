@@ -4,6 +4,7 @@ These tests verify that the compression-only endpoint works correctly
 for the TypeScript SDK and other HTTP clients.
 """
 
+import gzip
 import json
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock
@@ -19,8 +20,13 @@ from headroom.proxy.server import ProxyConfig, create_app
 
 
 @pytest.fixture
-def client():
+def client(request, monkeypatch):
     """Create test client with optimization enabled."""
+    if hasattr(request, "param"):
+        from headroom.proxy import helpers
+
+        monkeypatch.setattr(helpers, "MAX_REQUEST_BODY_SIZE", request.param)
+        monkeypatch.setattr(helpers, "MAX_DECOMPRESSED_BODY_SIZE", request.param)
     config = ProxyConfig(
         optimize=True,
         cache_enabled=False,
@@ -82,6 +88,42 @@ class TestCompressEndpointValidation:
         assert response.status_code == 400
         data = response.json()
         assert data["error"]["type"] == "invalid_request"
+
+    @pytest.mark.parametrize("bypass", [False, True])
+    @pytest.mark.parametrize("client", [64 * 1024], indirect=True)
+    def test_expanded_image_history_is_refused_before_compression(
+        self, client, bypass, monkeypatch
+    ):
+        body = {
+            "model": "gpt-4o",
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "image_url",
+                            "image_url": {"url": "data:image/png;base64," + "YQ==" * (32 * 1024)},
+                        }
+                    ],
+                }
+            ],
+        }
+
+        async def no_compression(*args, **kwargs):
+            pytest.fail("oversized history reached compression")
+
+        monkeypatch.setattr(client.app.state.proxy, "_run_compression_in_executor", no_compression)
+        headers = {"content-type": "application/json", "content-encoding": "gzip"}
+        if bypass:
+            headers["x-headroom-bypass"] = "true"
+        response = client.post(
+            "/v1/compress",
+            content=gzip.compress(json.dumps(body).encode()),
+            headers=headers,
+        )
+
+        assert response.status_code == 413
+        assert response.json()["error"]["code"] == "request_too_large"
 
 
 class TestCompressEndpointBasic:
