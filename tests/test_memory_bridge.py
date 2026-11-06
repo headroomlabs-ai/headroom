@@ -262,6 +262,59 @@ class TestRelationshipExtraction:
         uses_rels = [r for r in rels if r["relationship"] == "uses"]
         assert len(uses_rels) >= 1
 
+    def test_verb_patterns_still_match_with_long_words(self):
+        """Words up to the bound keep matching normally."""
+        section = ParsedSection(
+            heading="Test",
+            heading_level=2,
+            content="Aaa64 uses Bbb64",
+            facts=[],
+        )
+        rels = extract_relationships_from_section(section)
+        uses_rels = [r for r in rels if r["relationship"] == "uses"]
+        assert uses_rels and uses_rels[0]["source"] == "Aaa64"
+        assert uses_rels[0]["destination"] == "Bbb64"
+
+    def test_long_token_is_linear_not_quadratic(self):
+        """A single long token must not stall relationship extraction (#4370).
+
+        Before the word-boundary anchor, the four verb patterns each
+        backtracked O(n^2) over a long word run (an 8k-char token took
+        seconds). The anchor keeps the scan linear.
+        """
+        import time
+
+        long_token = "a" * 20000
+        section = ParsedSection(
+            heading="Test",
+            heading_level=2,
+            content=f"{long_token}\nHeadroom uses SQLite for storage",
+            facts=[],
+        )
+        start = time.monotonic()
+        rels = extract_relationships_from_section(section)
+        elapsed = time.monotonic() - start
+        assert elapsed < 2.0, f"extraction took {elapsed:.1f}s on one long token"
+        uses_rels = [r for r in rels if r["relationship"] == "uses"]
+        assert any(
+            "Headroom" in r["source"] and r["destination"].split()[0] == "SQLite" for r in uses_rels
+        )
+
+    def test_long_names_bind_whole(self):
+        """A name longer than 64 characters binds whole, not as a 64-char slice."""
+        long_src = "A" * 70
+        long_dst = "B" * 72
+        section = ParsedSection(
+            heading="Test",
+            heading_level=2,
+            content=f"{long_src} uses {long_dst}",
+            facts=[],
+        )
+        rels = extract_relationships_from_section(section)
+        uses_rels = [r for r in rels if r["relationship"] == "uses"]
+        assert uses_rels and uses_rels[0]["source"] == long_src
+        assert uses_rels[0]["destination"] == long_dst
+
 
 # =============================================================================
 # Bridge Tests (require backend)
