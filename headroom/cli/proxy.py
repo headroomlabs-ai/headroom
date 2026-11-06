@@ -1167,6 +1167,17 @@ def dashboard(port: int | None, no_open: bool) -> None:
     "(env: HEADROOM_STATELESS=true)",
 )
 @click.option(
+    "--detached-profile",
+    type=click.Choice(["strict", "lenient", "silent"], case_sensitive=False),
+    default=None,
+    envvar="HEADROOM_DETACHED_PROFILE",
+    help=(
+        "Detached-mode capability policy. strict refuses degraded explicitly "
+        "enabled local-state features; lenient logs degradations; silent only "
+        "exposes them through API/metrics. Env: HEADROOM_DETACHED_PROFILE."
+    ),
+)
+@click.option(
     "--embedding-server/--no-embedding-server",
     default=False,
     help="Run a dedicated embedding server sidecar (Option E). "
@@ -1290,6 +1301,7 @@ def proxy(
     telemetry: bool,
     no_telemetry: bool,
     stateless: bool,
+    detached_profile: str | None,
     embedding_server: bool,
     embedding_server_socket: str | None,
 ) -> None:
@@ -1671,6 +1683,10 @@ def proxy(
         usage_reporting=usage_reporting,
         # Stateless mode: disable all filesystem writes
         stateless=is_stateless,
+        detached_profile=cast(
+            Literal["strict", "lenient", "silent"],
+            (detached_profile or os.environ.get("HEADROOM_DETACHED_PROFILE") or "lenient").lower(),
+        ),
         # Unit 4: bounded pre-upstream concurrency on the Anthropic HTTP
         # path. ``None`` -> HeadroomProxy computes ``max(2, min(8,
         # os.cpu_count() or 4))``; ``<= 0`` -> disabled (unbounded).
@@ -1924,6 +1940,7 @@ Endpoints:
   GET  /livez      Process liveness
   GET  /readyz     Traffic readiness
   GET  /health     Aggregate health
+  GET  /capabilities Detached-mode capability matrix
   GET  /stats      Detailed statistics
   GET  /stats-history Durable compression history + display session
   GET  /metrics    Prometheus metrics

@@ -687,6 +687,18 @@ class CompressionStore:
 
             return status
 
+    @property
+    def backend_kind(self) -> str:
+        """Identify the initialized backend without scanning stored content."""
+        from .backends.memory import InMemoryBackend
+        from .backends.sqlite import SQLiteBackend
+
+        if isinstance(self._backend, InMemoryBackend):
+            return "memory"
+        if isinstance(self._backend, SQLiteBackend):
+            return "sqlite"
+        return "custom"
+
     def get_stats(self) -> dict[str, Any]:
         """Get store statistics for monitoring."""
         if self._backend_expires_entries:

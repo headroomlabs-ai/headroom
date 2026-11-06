@@ -25,6 +25,7 @@
     "failure-learning",
     "---Proxy Server---",
     "proxy",
+    "detached-mode",
     "corporate-networks",
     "local-llm-prefill",
     "---Integrations---",
