@@ -153,6 +153,7 @@ class TestCompressEndpointValidation:
             "type": "invalid_request",
             "message": "bias for message index 0 must be a finite positive number",
         }
+
     @pytest.mark.parametrize("bypass", [False, True])
     @pytest.mark.parametrize("client", [64 * 1024], indirect=True)
     def test_expanded_image_history_is_refused_before_compression(
