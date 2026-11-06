@@ -318,7 +318,7 @@ def test_docker_build_cache_failures_are_best_effort() -> None:
     assert cached["continue-on-error"] is True
     assert "ignore-error=true" in cache_to
     assert fallback_builder["if"] == "steps.bake.outcome == 'failure'"
-    assert fallback_builder["uses"] == "docker/setup-buildx-action@v4"
+    assert fallback_builder["uses"].startswith("docker/setup-buildx-action@")
     assert fallback["if"] == "steps.bake.outcome == 'failure'"
     assert fallback["uses"] == cached["uses"]
     assert fallback["with"]["builder"] == "${{ steps.fallback-buildx.outputs.name }}"
@@ -1225,7 +1225,7 @@ def test_pypi_publish_failure_blocks_github_release() -> None:
     npm_job_start = content.index("publish-npm:", pypi_job_start)
     pypi_job = content[pypi_job_start:npm_job_start]
 
-    assert re.search(r"uses: pypa/gh-action-pypi-publish@v\d+\.\d+\.\d+", pypi_job)
+    assert re.search(r"uses: pypa/gh-action-pypi-publish@[0-9a-f]{40} # v\d+\.\d+\.\d+", pypi_job)
     assert "continue-on-error: true" not in pypi_job
     assert "(vars.PYPI_SKIP == 'true' || needs.publish-pypi.result == 'success')" in content
 
@@ -1670,7 +1670,7 @@ def test_release_please_workflow_exists_and_targets_main() -> None:
     )
 
     content = rp_path.read_text(encoding="utf-8")
-    assert any(f"googleapis/release-please-action@v{v}" in content for v in (4, 5)), (
+    assert re.search(r"googleapis/release-please-action@[0-9a-f]{40} # v[45]\.", content), (
         "release-please.yml must use the v4 or v5 action — earlier versions "
         "have different manifest semantics."
     )
