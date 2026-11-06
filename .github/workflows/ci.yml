@@ -452,6 +452,14 @@ jobs:
       - uses: actions/setup-python@v6
         with:
           python-version: ${{ env.PY_VERSION }}
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.95.0 # Keep in sync with rust-toolchain.toml.
+          components: rustfmt, clippy
+      - name: Verify native build toolchain
+        run: |
+          cargo --version
+          rustc --version
       - name: Install package and focused test dependencies
         run: |
           python -m pip install --upgrade pip
