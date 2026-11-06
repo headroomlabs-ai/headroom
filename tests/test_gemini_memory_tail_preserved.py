@@ -17,6 +17,7 @@ from types import SimpleNamespace
 from typing import Any
 
 import pytest
+from fastapi import Request
 
 from headroom.proxy.handlers.gemini import GeminiHandlerMixin
 from headroom.proxy.memory_handler import MemoryHandler
@@ -24,13 +25,32 @@ from headroom.proxy.memory_handler import MemoryHandler
 MEMORY_BLOCK = "<memory>user prefers metric units</memory>"
 
 
-class _FakeRequest:
-    def __init__(self) -> None:
-        self.headers: dict[str, str] = {"x-headroom-user-id": "alice"}
-        self.query_params: dict[str, str] = {}
-        self.url = SimpleNamespace(path="/v1beta/models/gemini-pro:generateContent", query="")
-        self.scope: dict = {"type": "http", "method": "POST"}
-        self.client = SimpleNamespace(host="127.0.0.1", port=50000)
+def _request(body: dict) -> Request:
+    payload = json.dumps(body).encode("utf-8")
+    split = len(payload) // 2
+    messages = iter(
+        [
+            {"type": "http.request", "body": payload[:split], "more_body": True},
+            {"type": "http.request", "body": payload[split:], "more_body": False},
+        ]
+    )
+
+    async def receive() -> dict:
+        return next(messages, {"type": "http.disconnect"})
+
+    return Request(
+        {
+            "type": "http",
+            "method": "POST",
+            "scheme": "http",
+            "path": "/v1beta/models/gemini-pro:generateContent",
+            "query_string": b"",
+            "headers": [(b"x-headroom-user-id", b"alice"), (b"content-type", b"application/json")],
+            "client": ("127.0.0.1", 50000),
+            "server": ("127.0.0.1", 8787),
+        },
+        receive,
+    )
 
 
 class _UpstreamResponse:
@@ -101,14 +121,10 @@ class _Handler(GeminiHandlerMixin):
 
 
 async def _send(monkeypatch: pytest.MonkeyPatch, body: dict) -> dict:
-    async def payload(request):  # noqa: ANN001, ANN202
-        return body
-
-    monkeypatch.setattr("headroom.proxy.helpers._read_request_json", payload)
     monkeypatch.setenv("HEADROOM_MEMORY_INJECTION_MODE", "live_zone_tail")
 
     handler = _Handler()
-    response = await handler.handle_gemini_generate_content(_FakeRequest(), "gemini-pro")
+    response = await handler.handle_gemini_generate_content(_request(body), "gemini-pro")
     assert response.status_code == 200
     (forwarded,) = handler.forwarded
     return forwarded
