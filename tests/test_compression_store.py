@@ -551,6 +551,36 @@ class TestCompressionStoreRetrieve:
         entry = store.retrieve("nonexistent_hash_key")
         assert entry is None
 
+    @pytest.mark.parametrize(
+        "original",
+        [
+            "<<ccr:abcd>> Keep this original instruction and the next reference <<ccr:ef01>>",
+            "<<ccr:abcd>><<ccr:ef01>>",
+            "<<ccr:abcd,base64,2.0KB>> then <<ccr:ef01 5_rows_offloaded>>",
+        ],
+    )
+    def test_original_with_separate_markers_is_stored(self, store: CompressionStore, original):
+        """An original that starts and ends with two different markers is content (#4266)."""
+        hash_key = store.store(original=original, compressed="x")
+
+        entry = store.retrieve(hash_key)
+
+        assert entry is not None
+        assert entry.original_content == original
+
+    @pytest.mark.parametrize(
+        "marker", ["<<ccr:abcd>>", "  <<ccr:abcd,base64,2.0KB>>\n", "<<ccr:abcd 5_rows_offloaded>>"]
+    )
+    def test_bare_marker_is_refused_and_keeps_existing_entry(self, store: CompressionStore, marker):
+        """A bare marker is never stored, even over an existing entry (#2694)."""
+        hash_key = store.store(original="real bytes", compressed="x", explicit_hash="abcd")
+
+        assert store.store(original=marker, compressed="x", explicit_hash="abcd") == hash_key
+
+        entry = store.retrieve(hash_key)
+        assert entry is not None
+        assert entry.original_content == "real bytes"
+
     def test_retrieve_expired_entry_returns_none(self, store_with_short_ttl: CompressionStore):
         """retrieve() returns None for expired entry."""
         hash_key = store_with_short_ttl.store(original="[1]", compressed="[]")
