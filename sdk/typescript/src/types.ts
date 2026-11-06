@@ -88,10 +88,33 @@ export interface AssistantMessage {
   providerOptions?: ProviderOptions;
 }
 
+/**
+ * A member of a Vercel AI SDK tool-result `content` output other than text: a
+ * LanguageModelV4 `file` or `custom` part, or a LanguageModelV3 `file-data`,
+ * `file-url`, `file-id`, `image-data`, `image-url` or `image-file-id` part.
+ * Carried verbatim through `/v1/compress`, which passes unknown parts through.
+ */
+export interface ToolResultMediaPart {
+  type: string;
+  [key: string]: unknown;
+}
+
 export interface ToolMessage {
   role: "tool";
-  content: string;
+  /**
+   * The tool output. A Vercel AI SDK `content` output keeps its member list: the
+   * proxy compresses the text members as fragments of one tool result and passes
+   * the rest through.
+   */
+  content: string | Array<TextContentPart | ToolResultMediaPart>;
   tool_call_id: string;
+  /**
+   * Vercel AI SDK: the result's `output` without its `value`, which travels as
+   * `content`. Brings the output kind (`error-text`, `execution-denied`, ...), the
+   * denial reason and the output's own providerOptions back. Carried, never sent
+   * to OpenAI.
+   */
+  output?: { type: string; reason?: string; providerOptions?: ProviderOptions };
   providerOptions?: ProviderOptions;
 }
 
