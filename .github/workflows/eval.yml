@@ -49,7 +49,7 @@ jobs:
 
       - name: Install dependencies (builds Rust extension via maturin)
         run: |
-          pip install -e ".[all]"
+          pip install -e ".[all,evals]"
           python -c "from headroom._core import SmartCrusher; print('headroom._core OK:', SmartCrusher)"
 
       - name: Run CCR round-trip (zero cost)
@@ -119,7 +119,7 @@ jobs:
 
       - name: Install dependencies (builds Rust extension via maturin)
         run: |
-          pip install -e ".[all]"
+          pip install -e ".[all,evals,ml]"
           python -c "from headroom._core import SmartCrusher; print('headroom._core OK')"
       - name: Run Tier 1 evaluation suite
         run: |
@@ -157,7 +157,7 @@ jobs:
       # Real-dataset recall on the prose path (HotpotQA): does the ground-truth
       # answer survive compressing the supporting context? Uses the production
       # routing path, so prose flows through Kompress (ModernBERT) — allowed here
-      # because the weekly job installs [all]. Non-blocking and defensive: a
+      # because the weekly job explicitly installs [ml]. Non-blocking and defensive: a
       # dataset download or model failure warns rather than fails the job.
       - name: Dataset recall report — HotpotQA (model-allowed, non-blocking)
         run: |
