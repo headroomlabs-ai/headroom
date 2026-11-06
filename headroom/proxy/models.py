@@ -422,6 +422,16 @@ class ProxyConfig:
     # stream-idle watchdog fires. 0 or less disables the keepalive entirely.
     # See headroom/proxy/buffered_ccr_response.py (#3079).
     buffered_ccr_grace_seconds: float = DEFAULT_BUFFERED_CCR_GRACE_SECONDS
+    # Buffered CCR for /v1/chat/completions streaming. Without it this is the
+    # one streaming path with no way to answer a retrieval: content carries
+    # markers but `headroom_retrieve` is withheld, and the tool toggles in and
+    # out for sessions that mix streaming with non-streaming turns, busting the
+    # tools cache segment each way. Enabling it flips turns that carry a
+    # redeemable marker to `stream: false` upstream and resynthesizes
+    # chat.completion.chunk frames, as Responses streaming already does. Off by
+    # default: this is the most incident-prone path in the proxy (#2465, #2997,
+    # #3079), so the default flips separately, with measurements (#3815).
+    ccr_buffered_chat_streaming: bool = False
 
     # Circuit breaker for runaway tool repetition loops
     # "warn" (log warning & metric), "enforce" (return 429), "off" (disabled)
