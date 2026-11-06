@@ -4,7 +4,7 @@ build-backend = "maturin"
 
 [project]
 name = "headroom-ai"
-version = "0.42.0"
+version = "0.43.1"
 description = "Compress tool outputs, logs, JSON and chat history before each LLM call. Fewer input tokens, same answers; in-process, no API key. Library, proxy and MCP server."
 # PyPI renders this file; GitHub renders README.md. Keep the two in step on the
 # install commands and the savings claim (README.md "Proof" is the source).
@@ -66,7 +66,7 @@ dependencies = [
     # Python 3.11-3.14 on Linux, macOS and Windows: older releases either reject
     # Python 3.14 (GH #956) or fall back to a Rust source build.
     "litellm>=1.96.2,<2.0",
-    "click>=8.3.3",               # CLI framework; PYSEC-2026-2132 fix (command injection in click.edit())
+    "click>=8.5.0",               # CLI framework; PYSEC-2026-2132 fix (command injection in click.edit())
     "rich>=13.0.0",               # Rich terminal output
     "opentelemetry-api>=1.45.1",  # CVE-2026-114603: bounded, linear-time tracestate parsing
     # AST-aware code slicing (CodeCompressor); binary wheel. 0.44.1 is excluded:
@@ -76,7 +76,7 @@ dependencies = [
     # future patched one.
     "ast-grep-cli>=0.30.0,!=0.44.1",
     "pyyaml>=6.0",                # omp wrap: parse/merge omp's models.yml registry
-    "tomlkit>=0.15.0,<1.0",       # Loss-minimizing Codex config recovery
+    "tomlkit>=0.15.2,<1.0",       # Loss-minimizing Codex config recovery
     # Verify upstream TLS through the OS trust store (macOS Keychain, Windows
     # cert store), where IT installs corporate TLS-inspection roots (Zscaler,
     # Netskope). Pure Python, no deps; the same library pip uses by default.
@@ -127,7 +127,7 @@ proxy = [
     # publishes no macOS wheel for Python 3.14, so installing it there needs a C
     # compiler. The watcher is optional and skips itself when watchdog is absent.
     "watchdog>=4.0.0; sys_platform != 'darwin' or python_version < '3.14'",
-    "sqlite-vec>=0.1.6",          # Vector index for memory (--memory). Lightweight, no torch.
+    "sqlite-vec>=0.1.9",          # Vector index for memory (--memory). Lightweight, no torch.
 ]
 # Production ASGI/WSGI server — Unix-only (gunicorn does not support Windows).
 # Kept separate from [proxy] so that dev, CI, and Windows users are not forced
@@ -145,7 +145,7 @@ proxy-prod = [
 # logic continues to work.  See issue #1216.
 code = [
     "tree-sitter-language-pack>=0.10.0,<1.0",
-    "tree-sitter>=0.25.2,<0.27",
+    "tree-sitter>=0.26.0,<0.27",
 ]
 # ML-based compression with Kompress (ModernBERT).
 # (The legacy [llmlingua] extra was removed in 0.9.x — no live code path used it.
@@ -167,7 +167,7 @@ ml = [
 # in the [vector] extra below; installing it here would make `[all]` (which pulls
 # [memory]) fail on any machine without a compiler — see #1368.
 memory = [
-    "sqlite-vec>=0.1.6",
+    "sqlite-vec>=0.1.9",
     "sentence-transformers>=2.2.0,<7.0; sys_platform != 'darwin' or platform_machine != 'x86_64'",
 ]
 # Optional HNSW vector backend. Needs a C++ toolchain to build hnswlib, so it is
@@ -328,7 +328,7 @@ dev = [
     "pytest>=7.0.0",
     "pytest-cov>=4.0.0",
     "pytest-asyncio>=0.21.0",
-    "ruff==0.17.2",
+    "ruff==0.17.3",
     "mypy>=1.0.0",
     "pre-commit>=3.0.0",
     "openai>=1.0.0",
@@ -347,7 +347,7 @@ dev = [
     "ollama>=0.4.0",
     "langchain-ollama>=0.2.0",
     "hnswlib>=0.8.0",
-    "sqlite-vec>=0.1.6",
+    "sqlite-vec>=0.1.9",
     "sentence-transformers>=2.2.0,<7.0",
     "numpy>=1.24.0",
     "openpyxl>=3.1.0",  # exercises spreadsheet_ingest (.xlsx) in the test suite
