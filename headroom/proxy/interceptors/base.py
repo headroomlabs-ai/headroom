@@ -58,6 +58,9 @@ class ToolResultInterceptor(Protocol):
     one-shot behavior: the framework tracks which keys have already been
     rewritten in the current conversation, and skips subsequent matches on
     the same key so that the model gets full content if it asks again.
+
+    Interceptors MAY set `accepts_client_notices = True` to also receive
+    `client_notices=`: text the client sent alongside the tool_result.
     """
 
     name: str  # e.g. "ast-grep", "difft", "scc"
@@ -190,6 +193,32 @@ def _tool_use_id_for_message(msg: dict[str, Any]) -> str | None:
     return None
 
 
+def _text_of(content: Any, *, skip_tool_results: bool) -> list[str]:
+    if isinstance(content, str):
+        return [content] if content else []
+    texts: list[str] = []
+    if isinstance(content, list):
+        for block in content:
+            if not isinstance(block, dict):
+                continue
+            if skip_tool_results and block.get("type") == "tool_result":
+                continue
+            if block.get("type") == "text" and isinstance(block.get("text"), str):
+                texts.append(block["text"])
+    return texts
+
+
+def _client_notices_for(messages: list[dict[str, Any]], index: int) -> tuple[str, ...]:
+    """Sibling text blocks, plus following messages up to the next assistant
+    turn or tool_result."""
+    notices = _text_of(messages[index].get("content"), skip_tool_results=True)
+    for following in messages[index + 1 :]:
+        if following.get("role") == "assistant" or _is_tool_result_message(following):
+            break
+        notices.extend(_text_of(following.get("content"), skip_tool_results=True))
+    return tuple(notices)
+
+
 def apply_to_messages(
     messages: list[dict[str, Any]],
     tokenizer: Tokenizer,
@@ -249,7 +278,8 @@ def apply_to_messages(
     # Pass frozen messages through verbatim; only the mutable tail is
     # considered for rewriting.
     new_messages: list[dict[str, Any]] = list(messages[:frozen_count])
-    for msg in messages[frozen_count:]:
+    for index in range(frozen_count, len(messages)):
+        msg = messages[index]
         if not _is_tool_result_message(msg):
             new_messages.append(msg)
             continue
@@ -273,6 +303,7 @@ def apply_to_messages(
                 logger.debug("tool_result %s has no matching tool_use", tuid)
 
         current = original
+        notices: tuple[str, ...] | None = None
         for interceptor in INTERCEPTORS:
             # Progressive disclosure: skip if already fired for this key.
             key: str | None = None
@@ -298,7 +329,15 @@ def apply_to_messages(
             try:
                 if not interceptor.matches(tool_name, tool_input, current):
                     continue
-                rewritten = interceptor.transform(tool_name, tool_input, current)
+                if getattr(interceptor, "accepts_client_notices", False) is True:
+                    if notices is None:
+                        notices = _client_notices_for(messages, index)
+                    opted_in: Any = interceptor
+                    rewritten = opted_in.transform(
+                        tool_name, tool_input, current, client_notices=notices
+                    )
+                else:
+                    rewritten = interceptor.transform(tool_name, tool_input, current)
             except Exception as e:  # noqa: BLE001 — never crash a request
                 logger.warning(
                     "interceptor %s failed: %s",

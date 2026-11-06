@@ -21,7 +21,9 @@ from headroom.proxy.interceptors import (
 from headroom.proxy.interceptors.astgrep import (
     AstGrepReadOutline,
     ReadVerificationResult,
+    _detect_truncation,
     _open_regular_file_under_root,
+    _strip_read_line_numbers,
     _verify_read_against_disk,
 )
 from headroom.proxy.interceptors.base import reset_interceptor_failure_counts
@@ -368,6 +370,290 @@ def test_astgrep_ignores_offset_window_exceeding_visible_payload(tokenizer):
     assert "truncated upstream" not in new_content
 
 
+# -------- Banner position: real client notice vs. text inside the file ---- #
+
+_SLUG_PATH = "/repo/pages/[slug].tsx"
+
+
+def _tsx_body(n_lines: int) -> str:
+    """A TSX body of exactly `n_lines` lines."""
+    lines: list[str] = []
+    i = 0
+    while len(lines) < n_lines:
+        lines += [
+            f"export function handler{i}(req: Request, res: Response) {{",
+            f"  const total = req.items.reduce((sum, item) => sum + item.price * {i}, 0);",
+            "  const discount = req.promo ? total * 0.1 : 0;",
+            "  const taxed = (total - discount) * 1.0825;",
+            "  return res.json({ total, discount, taxed, status: 'ok' });",
+            "}",
+            "",
+            "",
+        ]
+        i += 1
+    return "\n".join(lines[:n_lines]) + "\n"
+
+
+def _banner(path: str, numbers: str) -> str:
+    return (
+        f"[Truncated: PARTIAL view — {path}: showing lines {numbers} total "
+        "(26031 tokens, cap 25000). Call Read with offset=43 to see more.]"
+    )
+
+
+def _outline_of(source: str, file_path: str = _SLUG_PATH, tokenizer=None) -> str:
+    result = apply_to_messages(_read_result_messages(source, file_path), tokenizer)
+    return result.messages[1]["content"][0]["content"]
+
+
+@pytest.fixture
+def small_reads(monkeypatch):
+    monkeypatch.setenv("HEADROOM_INTERCEPT_READ_MIN_CHARS", "50")
+
+
+def test_detect_truncation_accepts_bracketed_path_trailing_banner():
+    source = _tsx_body(42) + "\n" + _banner(_SLUG_PATH, "1-42 of 90") + "\n"
+    assert _detect_truncation(source) == (42, 90)
+
+
+def test_astgrep_flags_bracketed_path_read(tokenizer, small_reads):
+    source = _tsx_body(42) + "\n" + _banner(_SLUG_PATH, "1-42 of 90") + "\n"
+    new_content = _outline_of(source, tokenizer=tokenizer)
+    assert "outlined by ast-grep" in new_content
+    assert "showing through line 42 of 90 total" in new_content
+
+
+@pytest.mark.parametrize(
+    "template",
+    [
+        pytest.param("{banner}\n{body}", id="leading_bare"),
+        pytest.param("<system-reminder>{banner}</system-reminder>\n{body}", id="leading_inline"),
+        pytest.param(
+            "<system-reminder>\n{banner}\n</system-reminder>\n{body}", id="leading_own_line_tags"
+        ),
+        pytest.param(
+            "{body}\n<system-reminder>\n{banner}\n</system-reminder>\n", id="trailing_own_line_tags"
+        ),
+    ],
+)
+def test_detect_truncation_accepts_banner_in_metadata_position(template):
+    source = template.format(banner=_banner(_SLUG_PATH, "1-42 of 90"), body=_tsx_body(42))
+    assert _detect_truncation(source) == (42, 90)
+
+
+def test_detect_truncation_extra_client_context_does_not_inflate_line_count():
+    """Reminder-block context must not inflate the visible line count."""
+    context = "<system-reminder>\n" + "client note\n" * 12 + "</system-reminder>\n"
+    ok = "<system-reminder>" + _banner(_SLUG_PATH, "1-42 of 90") + "</system-reminder>\n"
+    assert _detect_truncation(ok + context + _tsx_body(42)) == (42, 90)
+    # 50-line window, 42 real lines + 14 context lines (>50 raw) -> rejected.
+    oversized = "<system-reminder>" + _banner(_SLUG_PATH, "1-50 of 90") + "</system-reminder>\n"
+    source = oversized + context + _tsx_body(42)
+    assert len(source.splitlines()) > 50
+    assert _detect_truncation(source) is None
+
+
+@pytest.mark.parametrize("where", ["mid_file", "last_line"])
+def test_astgrep_ignores_banner_quoted_in_comment(tokenizer, small_reads, where):
+    """A complete file that quotes a valid banner in a comment is not truncated."""
+    comment = "// " + _banner(_SLUG_PATH, "1-42 of 90") + "\n"
+    body = _tsx_body(42)
+    source = body[:200] + "\n" + comment + body[200:] if where == "mid_file" else body + comment
+    assert _detect_truncation(source) is None
+    new_content = _outline_of(source, tokenizer=tokenizer)
+    assert "outlined by ast-grep" in new_content
+    assert "truncated upstream" not in new_content
+
+
+def test_detect_truncation_ignores_banner_inside_docstring():
+    """Banner text inside a multiline string is file content."""
+    source = (
+        "def documented():\n"
+        '    """Example of the notice clients emit:\n'
+        + _banner("/repo/payments.py", "1-5 of 90")
+        + "\n"
+        + '    """\n'
+        + "    return 1\n"
+        + _PY_FIXTURE
+    )
+    assert _detect_truncation(source) is None
+
+
+def test_detect_truncation_ignores_bare_banner_mid_payload():
+    body = _tsx_body(42)
+    source = body[:200] + "\n" + _banner(_SLUG_PATH, "1-42 of 90") + "\n" + body[200:]
+    assert _detect_truncation(source) is None
+
+
+def test_detect_truncation_validates_each_candidate_independently():
+    """A valid mid-file candidate isn't rescued by a malformed trailing one."""
+    body = _tsx_body(42)
+    source = (
+        body[:200]
+        + "\n"
+        + _banner(_SLUG_PATH, "1-42 of 90")
+        + "\n"
+        + body[200:]
+        + _banner(_SLUG_PATH, "50-90 of 90")
+        + "\n"
+    )
+    assert _detect_truncation(source) is None
+
+
+def test_detect_truncation_offset_window_unit():
+    """Inclusive window length is what's checked: 100-148 is 49 lines."""
+    trailer = "\n" + _banner(_SLUG_PATH, "100-148 of 300") + "\n"
+    assert _detect_truncation(_tsx_body(49) + trailer) == (148, 300)
+    assert _detect_truncation(_tsx_body(48) + trailer) is None
+
+
+def test_astgrep_passes_offset_read_through_even_with_banner(tokenizer, small_reads):
+    """Ranged Reads are never outlined, banner or not."""
+    source = _tsx_body(49) + "\n" + _banner(_SLUG_PATH, "100-148 of 300") + "\n"
+    messages = _read_result_messages(source, _SLUG_PATH)
+    messages[0]["content"][0]["input"]["offset"] = 100
+    result = apply_to_messages(messages, tokenizer)
+    assert result.spans == []
+    assert result.messages[1]["content"][0]["content"] == source
+
+
+# -------- Client notices sent outside the tool_result (Claude Code) -------- #
+
+
+def _numbered(body: str) -> str:
+    """Claude Code's Read wire format: `N\\t` before every line."""
+    return "".join(f"{i}\t{line}" for i, line in enumerate(body.splitlines(True), start=1))
+
+
+def _messages_with_notice(content: str, notice_msg: dict, file_path: str = _SLUG_PATH):
+    return _read_result_messages(content, file_path) + [notice_msg]
+
+
+def test_astgrep_flags_truncation_from_following_notice_message(tokenizer, small_reads):
+    """Wire shape captured from Claude Code 2.1.302."""
+    content = _numbered(_tsx_body(42))
+    assert "Truncated" not in content
+    notice = {
+        "role": "system",
+        "content": [
+            {
+                "type": "text",
+                "text": _banner(_SLUG_PATH, "1-42 of 90")
+                + "\n\n<total_tokens>14999985 tokens left</total_tokens>",
+            }
+        ],
+    }
+    result = apply_to_messages(_messages_with_notice(content, notice), tokenizer)
+    new_content = result.messages[1]["content"][0]["content"]
+    assert "outlined by ast-grep" in new_content
+    assert "showing through line 42 of 90 total" in new_content
+    # The notice message itself is passed through untouched.
+    assert result.messages[2] == notice
+
+
+def test_astgrep_flags_truncation_from_sibling_text_block(tokenizer, small_reads):
+    messages = _read_result_messages(_numbered(_tsx_body(42)), _SLUG_PATH)
+    messages[1]["content"].append({"type": "text", "text": _banner(_SLUG_PATH, "1-42 of 90")})
+    result = apply_to_messages(messages, tokenizer)
+    assert "showing through line 42 of 90 total" in result.messages[1]["content"][0]["content"]
+
+
+def test_astgrep_accepts_lines_count_notice_variant(tokenizer, small_reads):
+    notice = {
+        "role": "user",
+        "content": f"[Truncated: PARTIAL view — {_SLUG_PATH}: showing 42 of 90 lines. "
+        "Call Read with offset/limit to page through.]",
+    }
+    result = apply_to_messages(_messages_with_notice(_numbered(_tsx_body(42)), notice), tokenizer)
+    assert "showing through line 42 of 90 total" in result.messages[1]["content"][0]["content"]
+
+
+def test_astgrep_ignores_notice_for_a_different_file(tokenizer, small_reads):
+    notice = {"role": "user", "content": _banner("/repo/pages/other.tsx", "1-42 of 90")}
+    result = apply_to_messages(_messages_with_notice(_numbered(_tsx_body(42)), notice), tokenizer)
+    new_content = result.messages[1]["content"][0]["content"]
+    assert "outlined by ast-grep" in new_content
+    assert "truncated upstream" not in new_content
+
+
+def test_astgrep_ignores_notice_after_next_assistant_turn(tokenizer, small_reads):
+    """Only text sent alongside this tool_result counts, not a later turn's."""
+    later = [
+        {"role": "assistant", "content": [{"type": "text", "text": "ok"}]},
+        {"role": "user", "content": _banner(_SLUG_PATH, "1-42 of 90")},
+    ]
+    messages = _read_result_messages(_numbered(_tsx_body(42)), _SLUG_PATH) + later
+    result = apply_to_messages(messages, tokenizer)
+    assert "truncated upstream" not in result.messages[1]["content"][0]["content"]
+
+
+def test_astgrep_ignores_implausible_notice_range(tokenizer, small_reads):
+    notice = {"role": "user", "content": _banner(_SLUG_PATH, "1-500 of 900")}
+    result = apply_to_messages(_messages_with_notice(_numbered(_tsx_body(42)), notice), tokenizer)
+    assert "truncated upstream" not in result.messages[1]["content"][0]["content"]
+
+
+def test_astgrep_ignores_unrelated_text_in_following_message(tokenizer, small_reads):
+    notice = {
+        "role": "system",
+        "content": "Keep going.\n\n<total_tokens>14999985 tokens left</total_tokens>",
+    }
+    result = apply_to_messages(_messages_with_notice(_numbered(_tsx_body(42)), notice), tokenizer)
+    new_content = result.messages[1]["content"][0]["content"]
+    assert "outlined by ast-grep" in new_content
+    assert "truncated upstream" not in new_content
+
+
+def test_astgrep_notice_for_other_read_in_same_turn_is_ignored(tokenizer, small_reads):
+    """Two Reads in one turn: B's notice must not flag A."""
+    other = "/repo/pages/other.tsx"
+    messages = [
+        {
+            "role": "assistant",
+            "content": [
+                {"type": "tool_use", "id": "a", "name": "Read", "input": {"file_path": _SLUG_PATH}},
+                {"type": "tool_use", "id": "b", "name": "Read", "input": {"file_path": other}},
+            ],
+        },
+        {
+            "role": "user",
+            "content": [
+                {"type": "tool_result", "tool_use_id": "a", "content": _numbered(_tsx_body(42))},
+                {"type": "tool_result", "tool_use_id": "b", "content": _numbered(_tsx_body(42))},
+            ],
+        },
+        {"role": "system", "content": [{"type": "text", "text": _banner(other, "1-42 of 90")}]},
+    ]
+    result = apply_to_messages(messages, tokenizer)
+    new_content = result.messages[1]["content"][0]["content"]
+    assert "outlined by ast-grep" in new_content
+    assert "truncated upstream" not in new_content
+
+
+def test_interceptor_without_notice_opt_in_is_called_without_kwarg(tokenizer):
+    """The new keyword is only passed to interceptors that opt in."""
+    calls: list[tuple] = []
+
+    class Legacy:
+        name = "legacy-notices-test"
+
+        def matches(self, tool_name, tool_input, tool_output):
+            return True
+
+        def transform(self, tool_name, tool_input, tool_output):
+            calls.append((tool_name, tool_output))
+            return None
+
+    saved = list(INTERCEPTORS)
+    INTERCEPTORS[:] = [Legacy()]
+    try:
+        notice = {"role": "user", "content": _banner(_SLUG_PATH, "1-42 of 90")}
+        apply_to_messages(_messages_with_notice("x" * 10, notice), tokenizer)
+    finally:
+        INTERCEPTORS[:] = saved
+    assert calls == [("Read", "x" * 10)]
+
+
 # -------- Disk verification: client-independent truncation fallback ----- #
 
 
@@ -697,6 +983,87 @@ def test_astgrep_disk_verification_flags_truncation_when_no_banner(
     assert "def compute_subtotal" in new_content
     assert "def apply_promo" in new_content
     assert "def format_receipt" not in new_content
+
+
+class TestStripReadLineNumbers:
+    def test_strips_consecutive_tab_prefixes(self):
+        assert _strip_read_line_numbers("1\ta\n2\t  b\n3\t\n") == "a\n  b\n\n"
+
+    @pytest.mark.parametrize("sep", ["\t", "→", ":"])
+    def test_accepts_documented_separators_and_padding(self, sep):
+        assert _strip_read_line_numbers(f"     1{sep}x\n     2{sep}y") == "x\ny"
+
+    @pytest.mark.parametrize(
+        "content",
+        [
+            pytest.param("def f():\n    return 1\n", id="not_numbered"),
+            pytest.param("1\ta\n3\tb\n", id="gap"),
+            pytest.param("2\ta\n3\tb\n", id="starts_at_two"),
+            pytest.param("1\ta\n1\tb\n", id="duplicate"),
+            pytest.param("100\ta\n101\tb\n", id="offset_start"),
+            pytest.param("1\ta\nplain\n", id="partially_numbered"),
+            pytest.param("", id="empty"),
+        ],
+    )
+    def test_returns_none_unless_every_line_numbered_from_one(self, content):
+        assert _strip_read_line_numbers(content) is None
+
+
+@pytest.mark.skipif(
+    sys.platform == "win32",
+    reason="dir_fd disk verification unavailable on Windows; falls back to UNKNOWN",
+)
+class TestVerifyNumberedReadAgainstDisk:
+    """Claude Code sends Read content as `N\\t<line>`."""
+
+    def test_numbered_truncated_read_is_truncated(self, tmp_path):
+        f = tmp_path / "payments.py"
+        f.write_text(_PY_FIXTURE, encoding="utf-8")
+        visible = "".join(_PY_FIXTURE.splitlines(True)[:30])
+        verdict, info = _verify_read_against_disk(str(f), _numbered(visible), str(tmp_path))
+        assert verdict is ReadVerificationResult.TRUNCATED
+        assert info == (30, len(_PY_FIXTURE.splitlines()))
+
+    def test_numbered_complete_read_is_complete(self, tmp_path):
+        f = tmp_path / "payments.py"
+        on_disk = _PY_FIXTURE + "\n"
+        f.write_text(on_disk, encoding="utf-8")
+        # Claude Code numbers the empty line after a trailing newline too.
+        numbered = _numbered(on_disk) + f"{len(on_disk.splitlines()) + 1}\t"
+        verdict, info = _verify_read_against_disk(str(f), numbered, str(tmp_path))
+        assert verdict is ReadVerificationResult.COMPLETE
+        assert info is None
+
+    def test_file_whose_lines_look_numbered_is_compared_raw_first(self, tmp_path):
+        """Real `1: a` lines: the raw comparison wins, nothing is stripped."""
+        f = tmp_path / "list.py"
+        f.write_text("1: a\n2: b\n3: c\n", encoding="utf-8")
+        verdict, info = _verify_read_against_disk(str(f), "1: a\n2: b\n3: c\n", str(tmp_path))
+        assert (verdict, info) == (ReadVerificationResult.COMPLETE, None)
+        verdict, info = _verify_read_against_disk(str(f), "1: a\n2: b\n", str(tmp_path))
+        assert (verdict, info) == (ReadVerificationResult.TRUNCATED, (2, 3))
+
+    def test_numbered_read_that_diverges_from_disk_is_unknown(self, tmp_path):
+        f = tmp_path / "payments.py"
+        f.write_text(_PY_FIXTURE, encoding="utf-8")
+        verdict, _ = _verify_read_against_disk(
+            str(f), _numbered("something else\nentirely\n"), str(tmp_path)
+        )
+        assert verdict is ReadVerificationResult.UNKNOWN
+
+    def test_interceptor_flags_numbered_partial_read(self, tokenizer, tmp_path, monkeypatch):
+        monkeypatch.setenv("HEADROOM_VERIFY_TRUNCATION_ON_DISK", "1")
+        monkeypatch.setenv("HEADROOM_INTERCEPT_READ_MIN_CHARS", "50")
+        (tmp_path / "payments.py").write_text(_PY_FIXTURE, encoding="utf-8")
+        partial = _PY_FIXTURE[: _PY_FIXTURE.index("\n\ndef format_receipt")]
+        set_registered_cwd(str(tmp_path))
+        try:
+            result = apply_to_messages(_disk_verification_messages(_numbered(partial)), tokenizer)
+        finally:
+            set_registered_cwd(None)
+        new_content = result.messages[1]["content"][0]["content"]
+        total = len(_PY_FIXTURE.splitlines())
+        assert f"showing through line {len(partial.splitlines())} of {total} total" in new_content
 
 
 def test_astgrep_disk_verification_stays_unknown_when_dir_fd_unsupported(

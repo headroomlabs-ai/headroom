@@ -95,17 +95,26 @@ OUTLINE_MARKER = "    # ... (body elided by Headroom; Read a specific line range
 
 # Per-client banner signatures -- add an entry only once a client's exact
 # banner text is confirmed, never a generic keyword match.
+# A real banner is client metadata: it's on its own line (so `// [...]` in
+# source doesn't match) and before or after the body (`_is_metadata_position`).
 _TRUNCATION_SIGNATURES: tuple[re.Pattern[str], ...] = (
     # Claude Code: "[Truncated: PARTIAL view -- <path>: showing lines A-B of
     # T total (...). Call Read with offset=N to see more.]"
     re.compile(
+        r"^[ \t]*(?:<system-reminder>)?[ \t]*"
         r"\[\s*truncated\s*:\s*partial\s+view\b"
-        r"[^\[\]]*?"
+        r"[^\n]*?"
         r"showing\s+lines?\s+(?P<start_line>\d+)\s*[-–]\s*(?P<end_line>\d+)"
         r"\s+of\s+(?P<total_lines>\d+)\s+total"
-        r"[^\[\]]*\]",
-        re.IGNORECASE,
+        r"[^\n]*\]"
+        r"[ \t]*(?:</system-reminder>)?[ \t]*$",
+        re.IGNORECASE | re.MULTILINE,
     ),
+)
+
+_REMINDER_TAG_RE = re.compile(r"</?system-reminder>", re.IGNORECASE)
+_REMINDER_BLOCK_RE = re.compile(
+    r"<system-reminder>.*?</system-reminder>", re.IGNORECASE | re.DOTALL
 )
 
 
@@ -119,17 +128,71 @@ def _is_plausible_truncation_range(
     return window_length <= source_line_count
 
 
+def _is_metadata_position(source: str, m: re.Match[str]) -> bool:
+    """True if nothing but whitespace/reminder tags is on one side of `m`."""
+    before = _REMINDER_TAG_RE.sub("", source[: m.start()]).strip()
+    after = _REMINDER_TAG_RE.sub("", source[m.end() :]).strip()
+    return not before or not after
+
+
+def _count_visible_source_lines(source: str, m: re.Match[str]) -> int:
+    """Count file lines, excluding the banner and `<system-reminder>` blocks."""
+    body = source[: m.start()] + source[m.end() :]
+    body = _REMINDER_BLOCK_RE.sub("", body)
+    body = _REMINDER_TAG_RE.sub("", body)
+    return len(body.strip("\n").splitlines())
+
+
 def _detect_truncation(source: str) -> tuple[int, int] | None:
-    """Return (end_line, total_lines) if `source` carries a recognized,
-    internally-consistent upstream truncation banner, else None."""
-    source_line_count = len(source.splitlines())
+    """Return (end_line, total_lines) for a valid inline banner, else None."""
     for pattern in _TRUNCATION_SIGNATURES:
         for m in pattern.finditer(source):
+            if not _is_metadata_position(source, m):
+                continue
             start_line = int(m.group("start_line"))
             end_line = int(m.group("end_line"))
             total_lines = int(m.group("total_lines"))
-            if _is_plausible_truncation_range(start_line, end_line, total_lines, source_line_count):
+            visible = _count_visible_source_lines(source, m)
+            if _is_plausible_truncation_range(start_line, end_line, total_lines, visible):
                 return end_line, total_lines
+    return None
+
+
+def _detect_truncation_in_notices(
+    notices: tuple[str, ...] | list[str],
+    file_path: str | None,
+    source: str,
+) -> tuple[int, int] | None:
+    """Like `_detect_truncation`, for a banner sent outside the tool_result
+    (Claude Code 2.1.302 sends it as a separate message). Must name `file_path`."""
+    if not notices or not file_path:
+        return None
+    path = re.escape(file_path)
+    patterns = (
+        # "[Truncated: PARTIAL view — <path>: showing lines A-B of T total ...]"
+        re.compile(
+            r"\[\s*truncated\s*:\s*partial\s+view\s*[—–-]+\s*" + path + r"\s*:\s*"
+            r"showing\s+lines?\s+(?P<start_line>\d+)\s*[-–]\s*(?P<end_line>\d+)"
+            r"\s+of\s+(?P<total_lines>\d+)\s+total\b",
+            re.IGNORECASE,
+        ),
+        # "[Truncated: PARTIAL view — <path>: showing N of T lines. ...]"
+        re.compile(
+            r"\[\s*truncated\s*:\s*partial\s+view\s*[—–-]+\s*" + path + r"\s*:\s*"
+            r"showing\s+(?P<end_line>\d+)\s+of\s+(?P<total_lines>\d+)\s+lines\b",
+            re.IGNORECASE,
+        ),
+    )
+    visible = len(source.strip("\n").splitlines())
+    for notice in notices:
+        for pattern in patterns:
+            for m in pattern.finditer(notice):
+                groups = m.groupdict()
+                start_line = int(groups["start_line"]) if groups.get("start_line") else 1
+                end_line = int(groups["end_line"])
+                total_lines = int(groups["total_lines"])
+                if _is_plausible_truncation_range(start_line, end_line, total_lines, visible):
+                    return end_line, total_lines
     return None
 
 
@@ -300,19 +363,44 @@ def _verify_read_against_disk(
     disk_content = _open_regular_file_under_root(file_path, resolved_root, _max_disk_verify_bytes())
     if disk_content is None:
         return ReadVerificationResult.UNKNOWN, None
-    if disk_content == received_content:
-        return ReadVerificationResult.COMPLETE, None
-    if disk_content.startswith(received_content) and len(disk_content) > len(received_content):
-        visible_lines = len(received_content.splitlines())
-        total_lines = len(disk_content.splitlines())
-        return ReadVerificationResult.TRUNCATED, (visible_lines, total_lines)
+    # Claude Code numbers each line, so also compare the unnumbered form.
+    candidates = [received_content]
+    unnumbered = _strip_read_line_numbers(received_content)
+    if unnumbered is not None:
+        candidates.append(unnumbered)
+    for candidate in candidates:
+        if disk_content == candidate:
+            return ReadVerificationResult.COMPLETE, None
+        if disk_content.startswith(candidate) and len(disk_content) > len(candidate):
+            visible_lines = len(candidate.splitlines())
+            total_lines = len(disk_content.splitlines())
+            return ReadVerificationResult.TRUNCATED, (visible_lines, total_lines)
     return ReadVerificationResult.UNKNOWN, None
+
+
+# `cat -n`-style prefix: line number, then tab, `→` or `:`.
+_READ_LINE_NUMBER_RE = re.compile(r"^ *(\d+)(?:\t|→|:)")
+
+
+def _strip_read_line_numbers(content: str) -> str | None:
+    """Strip line-number prefixes, or None unless every line is numbered 1..N."""
+    lines = content.splitlines(keepends=True)
+    if not lines:
+        return None
+    stripped: list[str] = []
+    for expected, line in enumerate(lines, start=1):
+        m = _READ_LINE_NUMBER_RE.match(line)
+        if m is None or int(m.group(1)) != expected:
+            return None
+        stripped.append(line[m.end() :])
+    return "".join(stripped)
 
 
 class AstGrepReadOutline:
     """Interceptor that outlines verbose code-file Read outputs."""
 
     name = "ast-grep"
+    accepts_client_notices = True
 
     def matches(
         self,
@@ -334,6 +422,8 @@ class AstGrepReadOutline:
         tool_name: str | None,
         tool_input: dict[str, Any],
         tool_output: str,
+        *,
+        client_notices: tuple[str, ...] = (),
     ) -> str | None:
         lang = _detect_lang_from_input(tool_input)
         if not lang:
@@ -351,8 +441,12 @@ class AstGrepReadOutline:
         if not matches:
             return None
 
-        # Banner (cheap, no I/O) wins; disk verification is the opt-in fallback.
-        truncation = _detect_truncation(tool_output)
+        # Out-of-band notice, then inline banner, then opt-in disk check.
+        truncation = _detect_truncation_in_notices(
+            client_notices, _path_from_input(tool_input), tool_output
+        )
+        if truncation is None:
+            truncation = _detect_truncation(tool_output)
         if truncation is None and _verify_truncation_on_disk_enabled():
             verdict, disk_truncation = _verify_read_against_disk(
                 _path_from_input(tool_input),
