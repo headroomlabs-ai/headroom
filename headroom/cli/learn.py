@@ -387,6 +387,9 @@ def _make_llm_judge(model: str) -> Any:
     best-effort: any failure (no key, parse error) returns None so the caller
     falls back to the heuristic.
     """
+    from headroom.offline import guard_egress
+
+    guard_egress(f"{model} API for the headroom learn --llm-judge verbosity judge")
 
     def judge(signals: dict) -> tuple[int, str] | None:
         try:
@@ -600,7 +603,9 @@ def _activate_output_shaper(
     import urllib.error
     import urllib.request
 
-    resolved_port = _local_proxy_port(port)
+    from headroom.cli.port_discovery import resolve_read_port
+
+    resolved_port, _origin = resolve_read_port(port)
     overrides = {"HEADROOM_OUTPUT_SHAPER": "1"}
     if verbosity_level is not None:
         overrides["HEADROOM_VERBOSITY_LEVEL"] = verbosity_level

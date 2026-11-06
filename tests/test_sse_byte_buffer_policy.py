@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import json
+
 import pytest
 
 from headroom.proxy.sse_byte_buffer_policy import (
@@ -26,6 +28,13 @@ def test_parse_sse_events_preserves_split_utf8_tail() -> None:
     assert parse_sse_events_from_byte_buffer(buf) == []
     buf.extend(smile[2:] + b"\n\n")
     assert parse_sse_events_from_byte_buffer(buf) == [(None, "hello \U0001f642")]
+
+
+def test_parse_sse_events_splits_crlf_lines() -> None:
+    buf = bytearray(b"event: delta\r\ndata: one\r\ndata: two\r\n\r\n")
+
+    assert parse_sse_events_from_byte_buffer(buf) == [("delta", "one\ntwo")]
+    assert not buf
 
 
 def test_parse_sse_events_raises_on_complete_invalid_utf8_event() -> None:
@@ -65,3 +74,24 @@ def test_find_sse_event_terminator_waits_for_the_byte_after_a_trailing_cr(raw: b
     assert find_sse_event_terminator(bytearray(raw)) is None
     assert find_sse_event_terminator(bytearray(raw + b"\n")) == (9, len(raw) - 9 + 1)
     assert find_sse_event_terminator(bytearray(raw + b"d")) == (9, len(raw) - 9)
+
+
+@pytest.mark.parametrize("separator", ["\u0085", "\u2028", "\u2029"])
+def test_parse_sse_events_preserves_unicode_line_separators_in_json(
+    separator: str,
+) -> None:
+    payload = {"text": f"before{separator}after"}
+    wire = f"data: {json.dumps(payload, ensure_ascii=False)}\n\n".encode()
+
+    events = parse_sse_events_from_byte_buffer(bytearray(wire))
+
+    assert len(events) == 1
+    assert json.loads(events[0][1]) == payload
+
+
+def test_parse_sse_events_strips_only_one_leading_space() -> None:
+    # SSE spec: "If value starts with a U+0020 SPACE character, remove it".
+    # Further leading whitespace is part of the payload.
+    buf = bytearray(b"event: delta\ndata:   indented\ndata:\ttab\ndata:none\n\n")
+
+    assert parse_sse_events_from_byte_buffer(buf) == [("delta", "  indented\n\ttab\nnone")]
