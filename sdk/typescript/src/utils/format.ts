@@ -622,19 +622,27 @@ export function vercelToOpenAI(messages: any[]): OpenAIMessage[] {
       for (const part of parts) {
         let toolMsg: ToolMessage;
         if (part.type === "tool-result") {
-          // AI SDK v6 uses `output: { type, value }`, earlier versions used `result`
-          let contentStr: string;
-          if (part.output !== undefined) {
-            // v6 format: output is { type: 'json', value } or { type: 'text', value }
-            const val = part.output?.value ?? part.output;
-            contentStr = typeof val === "string" ? val : JSON.stringify(val);
-          } else if (part.result !== undefined) {
-            // Legacy format: result field directly
-            contentStr = typeof part.result === "string" ? part.result : JSON.stringify(part.result);
+          const output = part.output;
+          if (output && typeof output === "object" && typeof output.type === "string") {
+            // AI SDK v6+: `output` is { type, value?, reason?, providerOptions? }. The value goes
+            // out as the tool message content so the proxy compresses it; a `content` output
+            // keeps its member list (text members compress as fragments of one tool result,
+            // file and custom members pass through). The rest of the output rides on `output`
+            // and brings the kind, the denial reason and the output's providerOptions back.
+            const { value, ...rest } = output;
+            const content =
+              rest.type === "content" && Array.isArray(value) ? value
+              : rest.type === "json" || rest.type === "error-json" ? JSON.stringify(value ?? null)
+              : typeof value === "string" ? value
+              : value === undefined ? ""
+              : JSON.stringify(value);
+            toolMsg = withProviderOptions({ role: "tool", content, tool_call_id: part.toolCallId, output: rest }, part);
           } else {
-            contentStr = "";
+            // A bare `output` value, or the pre-v6 `result` field.
+            const raw = output !== undefined ? output : part.result;
+            const contentStr = raw === undefined ? "" : typeof raw === "string" ? raw : JSON.stringify(raw);
+            toolMsg = withProviderOptions({ role: "tool", content: contentStr, tool_call_id: part.toolCallId }, part);
           }
-          toolMsg = withProviderOptions({ role: "tool", content: contentStr, tool_call_id: part.toolCallId }, part);
         } else {
           // tool-approval-response (or any other AI SDK tool part): no OpenAI equivalent,
           // carried verbatim on `part` and restored as-is.
@@ -725,12 +733,25 @@ export function openAIToVercel(messages: OpenAIMessage[]): any[] {
       if (carried && typeof carried === "object") {
         part = carried;
       } else {
-        let parsed: any;
-        try { parsed = JSON.parse(msg.content); } catch { parsed = msg.content; }
-        // AI SDK v6 requires output: { type: 'json' | 'text', value }
-        const output = typeof parsed === "string"
-          ? { type: "text" as const, value: parsed }
-          : { type: "json" as const, value: parsed };
+        const body: any = msg.content;
+        const kind = msg.output;
+        let output: any;
+        if (kind && typeof kind === "object" && typeof kind.type === "string") {
+          const { type, ...meta } = kind;
+          if (type === "execution-denied") output = { type, ...meta };
+          else if (type === "content") output = { type, value: Array.isArray(body) ? body : [{ type: "text", text: String(body ?? "") }], ...meta };
+          else if (type === "json" || type === "error-json") {
+            // A JSON body the proxy rewrote into prose comes back as the kind's text twin.
+            try { output = { type, value: JSON.parse(body), ...meta }; }
+            catch { output = { type: type === "json" ? "text" : "error-text", value: body, ...meta }; }
+          } else output = { type, value: typeof body === "string" ? body : JSON.stringify(body), ...meta };
+        } else {
+          // No carrier (an OpenAI-native tool message): guess the kind from the body.
+          const text = typeof body === "string" ? body : JSON.stringify(body);
+          let parsed: any;
+          try { parsed = JSON.parse(text); } catch { parsed = text; }
+          output = typeof parsed === "string" ? { type: "text", value: parsed } : { type: "json", value: parsed };
+        }
         part = withProviderOptions({
           type: "tool-result",
           toolCallId: msg.tool_call_id,
@@ -923,7 +944,8 @@ export function openAIToGemini(messages: OpenAIMessage[]): any[] {
 
     if (msg.role === "tool") {
       let response: any;
-      try { response = JSON.parse(msg.content); } catch { response = { result: msg.content }; }
+      const text = typeof msg.content === "string" ? msg.content : JSON.stringify(msg.content);
+      try { response = JSON.parse(text); } catch { response = { result: text }; }
       result.push({
         role: "user",
         parts: [{ functionResponse: { name: msg.tool_call_id?.replace("gemini_", "") ?? "unknown", response } }],
