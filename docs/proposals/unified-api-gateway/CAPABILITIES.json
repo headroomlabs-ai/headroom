@@ -1,0 +1,23 @@
+{
+  "version": 1,
+  "profile": "gateway",
+  "status": "draft",
+  "runtime": {"engine": "python", "bind": "loopback-only", "workers": 1, "transforms": "off"},
+  "protocols": ["openai-chat", "openai-responses", "anthropic-messages", "gemini-generate", "vertex-generate", "bedrock-invoke"],
+  "qualified_translations": ["openai-chat->anthropic-messages", "anthropic-messages->openai-chat", "gemini-generate->openai-chat"],
+  "translation_contract": {
+    "direction_notation": "ingress request -> upstream request; reverse response and event mapping included",
+    "transports": ["http-json", "http-stream"],
+    "features": ["text", "inline_images"],
+    "input_details": ["leading text system messages", "ordered text and base64 PNG/JPEG/GIF/WebP input", "explicit output token limit for Anthropic upstream"],
+    "output_details": ["ordered text deltas", "stop and length finish reasons", "available token usage", "bounded protocol-shaped provider errors"],
+    "unavailable_features": ["tools", "parallel_tools", "structured_output", "signed_state", "provider-owned tools", "remote images", "audio", "video", "files", "multiple candidates", "interleaved system messages"],
+    "unavailable_directions": ["openai-responses cross-protocol", "openai-chat->gemini-generate", "anthropic-messages->gemini-generate", "gemini-generate->anthropic-messages"],
+    "reason": "Chat separates text from tool calls while Anthropic/Gemini permit ordered interleaving and provider-owned/signed blocks. Tools and structured-output contracts are not fully qualified end-to-end and are rejected before broker/upstream work. Native routes retain their declared byte-preserving capabilities.",
+    "refusal_policy": "Provider refusals are bounded redacted ingress-shaped failures, including Responses status=completed with refusal output.",
+    "local_evidence": ["tests/unified_gateway/test_protocol_completeness.py", "tests/unified_gateway/process/test_protocol_completeness_runtime.py", "tests/unified_gateway/process/test_streaming_runtime.py"]
+  },
+  "admitted_identities": ["openai:api-key", "anthropic:api-key", "gemini:api-key", "vertex:workload", "bedrock:workload", "compatible:api-key"],
+  "unavailable_native_identities": ["claude-subscription", "antigravity", "codex-native", "gemini-cli", "muse", "davin"],
+  "external_not_run": ["provider entitlement", "real credential expiry and refresh", "OS keychain persistence", "paid or live provider calls", "official retained release qualification"]
+}

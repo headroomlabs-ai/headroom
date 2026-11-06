@@ -1,0 +1,1216 @@
+{
+  "$defs": {
+    "AdmissionPolicy": {
+      "additionalProperties": false,
+      "properties": {
+        "max_concurrency": {
+          "default": 128,
+          "maximum": 10000,
+          "minimum": 1,
+          "title": "Max Concurrency",
+          "type": "integer"
+        },
+        "queue_limit": {
+          "default": 128,
+          "maximum": 10000,
+          "minimum": 0,
+          "title": "Queue Limit",
+          "type": "integer"
+        },
+        "queue_timeout_seconds": {
+          "default": 0,
+          "maximum": 300,
+          "minimum": 0,
+          "title": "Queue Timeout Seconds",
+          "type": "number"
+        },
+        "budget_usd": {
+          "anyOf": [
+            {
+              "pattern": "^(0|[1-9][0-9]*)(\\.[0-9]{1,12})?$",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Budget Usd"
+        },
+        "budget_period": {
+          "const": "process",
+          "default": "process",
+          "title": "Budget Period",
+          "type": "string"
+        },
+        "unknown_cost_policy": {
+          "default": "allow",
+          "enum": [
+            "allow",
+            "block"
+          ],
+          "title": "Unknown Cost Policy",
+          "type": "string"
+        }
+      },
+      "title": "AdmissionPolicy",
+      "type": "object"
+    },
+    "AwsChainSource": {
+      "additionalProperties": false,
+      "properties": {
+        "kind": {
+          "const": "aws-chain",
+          "title": "Kind",
+          "type": "string"
+        },
+        "region": {
+          "minLength": 1,
+          "title": "Region",
+          "type": "string"
+        },
+        "profile": {
+          "minLength": 1,
+          "title": "Profile",
+          "type": "string"
+        }
+      },
+      "required": [
+        "kind",
+        "region",
+        "profile"
+      ],
+      "title": "AwsChainSource",
+      "type": "object"
+    },
+    "BillingConfig": {
+      "additionalProperties": false,
+      "properties": {
+        "allow_paid_fallback": {
+          "const": false,
+          "title": "Allow Paid Fallback",
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "allow_paid_fallback"
+      ],
+      "title": "BillingConfig",
+      "type": "object"
+    },
+    "CapabilityConfig": {
+      "additionalProperties": false,
+      "properties": {
+        "operations": {
+          "default": [
+            "generate"
+          ],
+          "items": {
+            "const": "generate",
+            "type": "string"
+          },
+          "minItems": 1,
+          "title": "Operations",
+          "type": "array"
+        },
+        "features": {
+          "items": {
+            "enum": [
+              "text",
+              "tools",
+              "parallel_tools",
+              "inline_images",
+              "structured_output",
+              "signed_state",
+              "hosted_tools"
+            ],
+            "type": "string"
+          },
+          "minItems": 1,
+          "title": "Features",
+          "type": "array"
+        }
+      },
+      "required": [
+        "features"
+      ],
+      "title": "CapabilityConfig",
+      "type": "object"
+    },
+    "CatalogConfig": {
+      "additionalProperties": false,
+      "properties": {
+        "source": {
+          "default": "configured",
+          "enum": [
+            "configured",
+            "provider"
+          ],
+          "title": "Source",
+          "type": "string"
+        },
+        "ttl_seconds": {
+          "default": 300,
+          "exclusiveMinimum": 0,
+          "maximum": 86400,
+          "title": "Ttl Seconds",
+          "type": "number"
+        },
+        "stale_if_error_seconds": {
+          "default": 0,
+          "maximum": 86400,
+          "minimum": 0,
+          "title": "Stale If Error Seconds",
+          "type": "number"
+        },
+        "refresh_timeout_seconds": {
+          "default": 5,
+          "exclusiveMinimum": 0,
+          "maximum": 60,
+          "title": "Refresh Timeout Seconds",
+          "type": "number"
+        },
+        "entitlements": {
+          "patternProperties": {
+            "^[a-z][a-z0-9_-]{0,63}$": {
+              "enum": [
+                "allowed",
+                "denied",
+                "unknown"
+              ],
+              "type": "string"
+            }
+          },
+          "title": "Entitlements",
+          "type": "object"
+        }
+      },
+      "title": "CatalogConfig",
+      "type": "object"
+    },
+    "ClientAuthConfig": {
+      "additionalProperties": false,
+      "properties": {
+        "required": {
+          "const": true,
+          "title": "Required",
+          "type": "boolean"
+        },
+        "principals": {
+          "items": {
+            "$ref": "#/$defs/PrincipalConfig"
+          },
+          "minItems": 1,
+          "title": "Principals",
+          "type": "array"
+        }
+      },
+      "required": [
+        "required",
+        "principals"
+      ],
+      "title": "ClientAuthConfig",
+      "type": "object"
+    },
+    "CredentialConfig": {
+      "additionalProperties": false,
+      "properties": {
+        "id": {
+          "pattern": "^[a-z][a-z0-9_-]{0,63}$",
+          "title": "Id",
+          "type": "string"
+        },
+        "provider": {
+          "enum": [
+            "openai",
+            "anthropic",
+            "gemini",
+            "vertex",
+            "bedrock",
+            "compatible"
+          ],
+          "title": "Provider",
+          "type": "string"
+        },
+        "source": {
+          "discriminator": {
+            "mapping": {
+              "aws-chain": "#/$defs/AwsChainSource",
+              "env": "#/$defs/EnvironmentSource",
+              "gcp-adc": "#/$defs/GcpAdcSource",
+              "none": "#/$defs/NoCredentialSource"
+            },
+            "propertyName": "kind"
+          },
+          "oneOf": [
+            {
+              "$ref": "#/$defs/EnvironmentSource"
+            },
+            {
+              "$ref": "#/$defs/GcpAdcSource"
+            },
+            {
+              "$ref": "#/$defs/AwsChainSource"
+            },
+            {
+              "$ref": "#/$defs/NoCredentialSource"
+            }
+          ],
+          "title": "Source"
+        },
+        "refresh_owner": {
+          "enum": [
+            "none",
+            "sdk"
+          ],
+          "title": "Refresh Owner",
+          "type": "string"
+        },
+        "allowed_origins": {
+          "items": {
+            "pattern": "^https://",
+            "type": "string"
+          },
+          "minItems": 1,
+          "title": "Allowed Origins",
+          "type": "array"
+        },
+        "allowed_path_prefixes": {
+          "items": {
+            "pattern": "^/",
+            "type": "string"
+          },
+          "minItems": 1,
+          "title": "Allowed Path Prefixes",
+          "type": "array"
+        },
+        "enabled": {
+          "title": "Enabled",
+          "type": "boolean"
+        },
+        "billing_group": {
+          "anyOf": [
+            {
+              "pattern": "^[a-z][a-z0-9_-]{0,63}$",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Billing Group"
+        },
+        "owner_group": {
+          "anyOf": [
+            {
+              "pattern": "^[a-z][a-z0-9_-]{0,63}$",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Owner Group"
+        },
+        "residency": {
+          "anyOf": [
+            {
+              "pattern": "^[a-z][a-z0-9_-]{0,63}$",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Residency"
+        },
+        "max_concurrency": {
+          "default": 128,
+          "maximum": 10000,
+          "minimum": 1,
+          "title": "Max Concurrency",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "id",
+        "provider",
+        "source",
+        "refresh_owner",
+        "allowed_origins",
+        "allowed_path_prefixes",
+        "enabled"
+      ],
+      "title": "CredentialConfig",
+      "type": "object"
+    },
+    "EnvironmentSource": {
+      "additionalProperties": false,
+      "properties": {
+        "kind": {
+          "const": "env",
+          "title": "Kind",
+          "type": "string"
+        },
+        "ref": {
+          "pattern": "^[A-Z][A-Z0-9_]*$",
+          "title": "Ref",
+          "type": "string"
+        }
+      },
+      "required": [
+        "kind",
+        "ref"
+      ],
+      "title": "EnvironmentSource",
+      "type": "object"
+    },
+    "GcpAdcSource": {
+      "additionalProperties": false,
+      "properties": {
+        "kind": {
+          "const": "gcp-adc",
+          "title": "Kind",
+          "type": "string"
+        },
+        "project": {
+          "minLength": 1,
+          "title": "Project",
+          "type": "string"
+        }
+      },
+      "required": [
+        "kind",
+        "project"
+      ],
+      "title": "GcpAdcSource",
+      "type": "object"
+    },
+    "LimitsConfig": {
+      "additionalProperties": false,
+      "properties": {
+        "request_deadline_seconds": {
+          "default": 120,
+          "exclusiveMinimum": 0,
+          "maximum": 86400,
+          "title": "Request Deadline Seconds",
+          "type": "number"
+        },
+        "stream_content_idle_seconds": {
+          "default": 30,
+          "exclusiveMinimum": 0,
+          "maximum": 86400,
+          "title": "Stream Content Idle Seconds",
+          "type": "number"
+        },
+        "partial_frame_seconds": {
+          "default": 10,
+          "exclusiveMinimum": 0,
+          "maximum": 86400,
+          "title": "Partial Frame Seconds",
+          "type": "number"
+        },
+        "max_frame_bytes": {
+          "default": 1048576,
+          "maximum": 16777216,
+          "minimum": 1024,
+          "title": "Max Frame Bytes",
+          "type": "integer"
+        },
+        "max_observed_json_bytes": {
+          "default": 8388608,
+          "maximum": 67108864,
+          "minimum": 1024,
+          "title": "Max Observed Json Bytes",
+          "type": "integer"
+        },
+        "websocket_idle_seconds": {
+          "default": 300,
+          "exclusiveMinimum": 0,
+          "maximum": 86400,
+          "title": "Websocket Idle Seconds",
+          "type": "number"
+        },
+        "resource_ttl_seconds": {
+          "default": 3600,
+          "exclusiveMinimum": 0,
+          "maximum": 86400,
+          "title": "Resource Ttl Seconds",
+          "type": "number"
+        },
+        "max_resource_bindings": {
+          "default": 10000,
+          "maximum": 1000000,
+          "minimum": 1,
+          "title": "Max Resource Bindings",
+          "type": "integer"
+        },
+        "shutdown_drain_seconds": {
+          "default": 2,
+          "exclusiveMinimum": 0,
+          "maximum": 86400,
+          "title": "Shutdown Drain Seconds",
+          "type": "number"
+        },
+        "shutdown_cleanup_seconds": {
+          "default": 3,
+          "exclusiveMinimum": 0,
+          "maximum": 86400,
+          "title": "Shutdown Cleanup Seconds",
+          "type": "number"
+        }
+      },
+      "title": "LimitsConfig",
+      "type": "object"
+    },
+    "ModelBounds": {
+      "additionalProperties": false,
+      "properties": {
+        "max_input_tokens": {
+          "maximum": 100000000,
+          "minimum": 1,
+          "title": "Max Input Tokens",
+          "type": "integer"
+        },
+        "max_output_tokens": {
+          "maximum": 100000000,
+          "minimum": 1,
+          "title": "Max Output Tokens",
+          "type": "integer"
+        },
+        "default_max_output_tokens": {
+          "anyOf": [
+            {
+              "maximum": 100000000,
+              "minimum": 1,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Default Max Output Tokens"
+        },
+        "provider_contract": {
+          "pattern": "^[a-z][a-z0-9_-]{0,63}$",
+          "title": "Provider Contract",
+          "type": "string"
+        }
+      },
+      "required": [
+        "max_input_tokens",
+        "max_output_tokens",
+        "provider_contract"
+      ],
+      "title": "ModelBounds",
+      "type": "object"
+    },
+    "NoCredentialSource": {
+      "additionalProperties": false,
+      "properties": {
+        "kind": {
+          "const": "none",
+          "title": "Kind",
+          "type": "string"
+        }
+      },
+      "required": [
+        "kind"
+      ],
+      "title": "NoCredentialSource",
+      "type": "object"
+    },
+    "PricingConfig": {
+      "additionalProperties": false,
+      "properties": {
+        "currency": {
+          "const": "USD",
+          "default": "USD",
+          "title": "Currency",
+          "type": "string"
+        },
+        "input_usd_per_million": {
+          "pattern": "^(0|[1-9][0-9]*)(\\.[0-9]{1,12})?$",
+          "title": "Input Usd Per Million",
+          "type": "string"
+        },
+        "output_usd_per_million": {
+          "pattern": "^(0|[1-9][0-9]*)(\\.[0-9]{1,12})?$",
+          "title": "Output Usd Per Million",
+          "type": "string"
+        },
+        "cache_read_usd_per_million": {
+          "anyOf": [
+            {
+              "pattern": "^(0|[1-9][0-9]*)(\\.[0-9]{1,12})?$",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Cache Read Usd Per Million"
+        },
+        "cache_create_usd_per_million": {
+          "anyOf": [
+            {
+              "pattern": "^(0|[1-9][0-9]*)(\\.[0-9]{1,12})?$",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Cache Create Usd Per Million"
+        },
+        "revision": {
+          "pattern": "^[a-z][a-z0-9_-]{0,63}$",
+          "title": "Revision",
+          "type": "string"
+        }
+      },
+      "required": [
+        "input_usd_per_million",
+        "output_usd_per_million",
+        "revision"
+      ],
+      "title": "PricingConfig",
+      "type": "object"
+    },
+    "PrincipalAdmissionPolicy": {
+      "additionalProperties": false,
+      "properties": {
+        "max_concurrency": {
+          "default": 8,
+          "maximum": 10000,
+          "minimum": 1,
+          "title": "Max Concurrency",
+          "type": "integer"
+        },
+        "queue_limit": {
+          "default": 8,
+          "maximum": 10000,
+          "minimum": 0,
+          "title": "Queue Limit",
+          "type": "integer"
+        },
+        "queue_timeout_seconds": {
+          "default": 0,
+          "maximum": 300,
+          "minimum": 0,
+          "title": "Queue Timeout Seconds",
+          "type": "number"
+        },
+        "budget_usd": {
+          "anyOf": [
+            {
+              "pattern": "^(0|[1-9][0-9]*)(\\.[0-9]{1,12})?$",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Budget Usd"
+        },
+        "budget_period": {
+          "const": "process",
+          "default": "process",
+          "title": "Budget Period",
+          "type": "string"
+        },
+        "unknown_cost_policy": {
+          "default": "allow",
+          "enum": [
+            "allow",
+            "block"
+          ],
+          "title": "Unknown Cost Policy",
+          "type": "string"
+        },
+        "reserved_concurrency": {
+          "default": 0,
+          "maximum": 10000,
+          "minimum": 0,
+          "title": "Reserved Concurrency",
+          "type": "integer"
+        }
+      },
+      "title": "PrincipalAdmissionPolicy",
+      "type": "object"
+    },
+    "PrincipalConfig": {
+      "additionalProperties": false,
+      "properties": {
+        "id": {
+          "pattern": "^[a-z][a-z0-9_-]{0,63}$",
+          "title": "Id",
+          "type": "string"
+        },
+        "secret_ref": {
+          "pattern": "^env:[A-Z][A-Z0-9_]*$",
+          "title": "Secret Ref",
+          "type": "string"
+        },
+        "scopes": {
+          "items": {
+            "enum": [
+              "inference",
+              "models",
+              "admin"
+            ],
+            "type": "string"
+          },
+          "minItems": 1,
+          "title": "Scopes",
+          "type": "array"
+        },
+        "routes": {
+          "items": {
+            "pattern": "^[a-z][a-z0-9_-]{0,63}$",
+            "type": "string"
+          },
+          "title": "Routes",
+          "type": "array"
+        },
+        "enabled": {
+          "default": true,
+          "title": "Enabled",
+          "type": "boolean"
+        },
+        "admission": {
+          "$ref": "#/$defs/PrincipalAdmissionPolicy",
+          "default": {
+            "max_concurrency": 8,
+            "queue_limit": 8,
+            "queue_timeout_seconds": 0,
+            "budget_usd": null,
+            "budget_period": "process",
+            "unknown_cost_policy": "allow",
+            "reserved_concurrency": 0
+          }
+        }
+      },
+      "required": [
+        "id",
+        "secret_ref",
+        "scopes",
+        "routes"
+      ],
+      "title": "PrincipalConfig",
+      "type": "object"
+    },
+    "PrivacyConfig": {
+      "additionalProperties": false,
+      "properties": {
+        "beacon": {
+          "const": false,
+          "title": "Beacon",
+          "type": "boolean"
+        },
+        "payload_logging": {
+          "const": false,
+          "title": "Payload Logging",
+          "type": "boolean"
+        },
+        "metrics": {
+          "enum": [
+            "off",
+            "local"
+          ],
+          "title": "Metrics",
+          "type": "string"
+        }
+      },
+      "required": [
+        "beacon",
+        "payload_logging",
+        "metrics"
+      ],
+      "title": "PrivacyConfig",
+      "type": "object"
+    },
+    "RetryConfig": {
+      "additionalProperties": false,
+      "properties": {
+        "max_attempts": {
+          "default": 1,
+          "maximum": 3,
+          "minimum": 1,
+          "title": "Max Attempts",
+          "type": "integer"
+        },
+        "max_retry_after_seconds": {
+          "default": 5,
+          "maximum": 60,
+          "minimum": 0,
+          "title": "Max Retry After Seconds",
+          "type": "number"
+        },
+        "base_backoff_seconds": {
+          "default": 0.1,
+          "maximum": 5,
+          "minimum": 0,
+          "title": "Base Backoff Seconds",
+          "type": "number"
+        },
+        "ambiguous_commit": {
+          "const": "never",
+          "title": "Ambiguous Commit",
+          "type": "string"
+        },
+        "after_output": {
+          "const": "never",
+          "title": "After Output",
+          "type": "string"
+        }
+      },
+      "required": [
+        "ambiguous_commit",
+        "after_output"
+      ],
+      "title": "RetryConfig",
+      "type": "object"
+    },
+    "RouteConfig": {
+      "additionalProperties": false,
+      "properties": {
+        "id": {
+          "pattern": "^[a-z][a-z0-9_-]{0,63}$",
+          "title": "Id",
+          "type": "string"
+        },
+        "public_model": {
+          "minLength": 1,
+          "title": "Public Model",
+          "type": "string"
+        },
+        "upstream_model": {
+          "minLength": 1,
+          "title": "Upstream Model",
+          "type": "string"
+        },
+        "provider": {
+          "enum": [
+            "openai",
+            "anthropic",
+            "gemini",
+            "vertex",
+            "bedrock",
+            "compatible"
+          ],
+          "title": "Provider",
+          "type": "string"
+        },
+        "upstream_origin": {
+          "pattern": "^https://",
+          "title": "Upstream Origin",
+          "type": "string"
+        },
+        "upstream_path_prefix": {
+          "pattern": "^/",
+          "title": "Upstream Path Prefix",
+          "type": "string"
+        },
+        "credentials": {
+          "items": {
+            "pattern": "^[a-z][a-z0-9_-]{0,63}$",
+            "type": "string"
+          },
+          "minItems": 1,
+          "title": "Credentials",
+          "type": "array"
+        },
+        "ingress_protocols": {
+          "items": {
+            "enum": [
+              "openai-chat",
+              "openai-responses",
+              "anthropic-messages",
+              "gemini-generate",
+              "vertex-generate",
+              "bedrock-invoke"
+            ],
+            "type": "string"
+          },
+          "minItems": 1,
+          "title": "Ingress Protocols",
+          "type": "array"
+        },
+        "native_protocols": {
+          "items": {
+            "enum": [
+              "openai-chat",
+              "openai-responses",
+              "anthropic-messages",
+              "gemini-generate",
+              "vertex-generate",
+              "bedrock-invoke"
+            ],
+            "type": "string"
+          },
+          "minItems": 1,
+          "title": "Native Protocols",
+          "type": "array"
+        },
+        "translation": {
+          "enum": [
+            "disabled",
+            "qualified"
+          ],
+          "title": "Translation",
+          "type": "string"
+        },
+        "body_contract": {
+          "enum": [
+            "strict-native",
+            "routed-native"
+          ],
+          "title": "Body Contract",
+          "type": "string"
+        },
+        "private_network": {
+          "title": "Private Network",
+          "type": "boolean"
+        },
+        "retry": {
+          "$ref": "#/$defs/RetryConfig"
+        },
+        "billing": {
+          "$ref": "#/$defs/BillingConfig"
+        },
+        "enabled": {
+          "default": true,
+          "title": "Enabled",
+          "type": "boolean"
+        },
+        "selection": {
+          "$ref": "#/$defs/SelectionConfig",
+          "default": {
+            "strategy": "round_robin",
+            "priority": {},
+            "weight": {},
+            "quota_group": null,
+            "required_residency": null
+          }
+        },
+        "capabilities": {
+          "additionalProperties": {
+            "additionalProperties": {
+              "$ref": "#/$defs/CapabilityConfig"
+            },
+            "propertyNames": {
+              "enum": [
+                "http-json",
+                "http-stream",
+                "websocket"
+              ]
+            },
+            "type": "object"
+          },
+          "minProperties": 1,
+          "propertyNames": {
+            "enum": [
+              "openai-chat",
+              "openai-responses",
+              "anthropic-messages",
+              "gemini-generate",
+              "vertex-generate",
+              "bedrock-invoke"
+            ]
+          },
+          "title": "Capabilities",
+          "type": "object"
+        },
+        "catalog": {
+          "$ref": "#/$defs/CatalogConfig",
+          "default": {
+            "source": "configured",
+            "ttl_seconds": 300,
+            "stale_if_error_seconds": 0,
+            "refresh_timeout_seconds": 5,
+            "entitlements": {}
+          }
+        },
+        "pricing": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/PricingConfig"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "model_bounds": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ModelBounds"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        }
+      },
+      "required": [
+        "id",
+        "public_model",
+        "upstream_model",
+        "provider",
+        "upstream_origin",
+        "upstream_path_prefix",
+        "credentials",
+        "ingress_protocols",
+        "native_protocols",
+        "translation",
+        "body_contract",
+        "private_network",
+        "retry",
+        "billing",
+        "capabilities"
+      ],
+      "title": "RouteConfig",
+      "type": "object"
+    },
+    "RuntimeConfig": {
+      "additionalProperties": false,
+      "properties": {
+        "profile": {
+          "const": "gateway",
+          "title": "Profile",
+          "type": "string"
+        },
+        "engine": {
+          "const": "python",
+          "title": "Engine",
+          "type": "string"
+        },
+        "bind": {
+          "const": "127.0.0.1",
+          "title": "Bind",
+          "type": "string"
+        },
+        "port": {
+          "maximum": 65535,
+          "minimum": 1,
+          "title": "Port",
+          "type": "integer"
+        },
+        "workers": {
+          "const": 1,
+          "title": "Workers",
+          "type": "integer"
+        },
+        "remote_enabled": {
+          "const": false,
+          "title": "Remote Enabled",
+          "type": "boolean"
+        },
+        "stateless": {
+          "title": "Stateless",
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "profile",
+        "engine",
+        "bind",
+        "port",
+        "workers",
+        "remote_enabled",
+        "stateless"
+      ],
+      "title": "RuntimeConfig",
+      "type": "object"
+    },
+    "SelectionConfig": {
+      "additionalProperties": false,
+      "properties": {
+        "strategy": {
+          "default": "round_robin",
+          "enum": [
+            "round_robin",
+            "priority",
+            "weighted"
+          ],
+          "title": "Strategy",
+          "type": "string"
+        },
+        "priority": {
+          "patternProperties": {
+            "^[a-z][a-z0-9_-]{0,63}$": {
+              "type": "integer"
+            }
+          },
+          "title": "Priority",
+          "type": "object"
+        },
+        "weight": {
+          "patternProperties": {
+            "^[a-z][a-z0-9_-]{0,63}$": {
+              "maximum": 100,
+              "minimum": 1,
+              "type": "integer"
+            }
+          },
+          "title": "Weight",
+          "type": "object"
+        },
+        "quota_group": {
+          "anyOf": [
+            {
+              "pattern": "^[a-z][a-z0-9_-]{0,63}$",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Quota Group"
+        },
+        "required_residency": {
+          "anyOf": [
+            {
+              "pattern": "^[a-z][a-z0-9_-]{0,63}$",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Required Residency"
+        }
+      },
+      "title": "SelectionConfig",
+      "type": "object"
+    },
+    "TransformConfig": {
+      "additionalProperties": false,
+      "properties": {
+        "mode": {
+          "const": "off",
+          "title": "Mode",
+          "type": "string"
+        }
+      },
+      "required": [
+        "mode"
+      ],
+      "title": "TransformConfig",
+      "type": "object"
+    },
+    "TransportConfig": {
+      "additionalProperties": false,
+      "properties": {
+        "ca_bundle": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Ca Bundle"
+        }
+      },
+      "title": "TransportConfig",
+      "type": "object"
+    }
+  },
+  "additionalProperties": false,
+  "description": "Offline version-1 gateway policy. Configured entitlement and tariffs are operator declarations, not live-provider verification. Reference and adapter-contract validation is additionally enforced by the runtime.",
+  "properties": {
+    "version": {
+      "const": 1,
+      "title": "Version",
+      "type": "integer"
+    },
+    "runtime": {
+      "$ref": "#/$defs/RuntimeConfig"
+    },
+    "transforms": {
+      "$ref": "#/$defs/TransformConfig"
+    },
+    "privacy": {
+      "$ref": "#/$defs/PrivacyConfig"
+    },
+    "client_auth": {
+      "$ref": "#/$defs/ClientAuthConfig"
+    },
+    "credentials": {
+      "items": {
+        "$ref": "#/$defs/CredentialConfig"
+      },
+      "minItems": 1,
+      "title": "Credentials",
+      "type": "array"
+    },
+    "routes": {
+      "items": {
+        "$ref": "#/$defs/RouteConfig"
+      },
+      "minItems": 1,
+      "title": "Routes",
+      "type": "array"
+    },
+    "transport": {
+      "$ref": "#/$defs/TransportConfig",
+      "default": {
+        "ca_bundle": null
+      }
+    },
+    "admission": {
+      "$ref": "#/$defs/AdmissionPolicy",
+      "default": {
+        "max_concurrency": 128,
+        "queue_limit": 128,
+        "queue_timeout_seconds": 0,
+        "budget_usd": null,
+        "budget_period": "process",
+        "unknown_cost_policy": "allow"
+      }
+    },
+    "limits": {
+      "$ref": "#/$defs/LimitsConfig",
+      "default": {
+        "request_deadline_seconds": 120,
+        "stream_content_idle_seconds": 30,
+        "partial_frame_seconds": 10,
+        "max_frame_bytes": 1048576,
+        "max_observed_json_bytes": 8388608,
+        "websocket_idle_seconds": 300,
+        "resource_ttl_seconds": 3600,
+        "max_resource_bindings": 10000,
+        "shutdown_drain_seconds": 2,
+        "shutdown_cleanup_seconds": 3
+      }
+    }
+  },
+  "required": [
+    "version",
+    "runtime",
+    "transforms",
+    "privacy",
+    "client_auth",
+    "credentials",
+    "routes"
+  ],
+  "title": "Headroom unified gateway configuration",
+  "type": "object",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:headroom:gateway-config:1"
+}

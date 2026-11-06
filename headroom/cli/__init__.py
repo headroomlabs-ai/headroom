@@ -17,6 +17,7 @@ from . import (  # noqa: F401
     capture,
     copilot_auth,
     evals,
+    gateway_auth,
     init,
     inspect,
     install,

@@ -52,8 +52,10 @@ try:
     from pydantic import ConfigDict, Field, PrivateAttr
 
     LANGCHAIN_AVAILABLE = True
+    RUNNABLE_BINDING_AVAILABLE = True
 except ImportError:
     LANGCHAIN_AVAILABLE = False
+    RUNNABLE_BINDING_AVAILABLE = False
     BaseChatModel = object  # type: ignore[misc,assignment]
     BaseCallbackHandler = object  # type: ignore[misc,assignment]
     ConfigDict = lambda **kwargs: {}  # type: ignore[assignment,misc]  # noqa: E731

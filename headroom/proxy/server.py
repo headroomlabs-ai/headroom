@@ -1055,7 +1055,7 @@ class HeadroomProxy(
         # The proxy is long-lived: keep compression results it has no memory
         # budget for in a SQLite file instead of compressing them again
         # (headroom.cache.result_store; off in stateless mode).
-        router_config.result_cache_disk = True
+        router_config.result_cache_disk = config.gateway is None
         # External (non-built-in) `headroom.compressor` selections are ignored by
         # `_apply_compressor_selection` (they have no enable_* flag). Thread them
         # to the router here so it can route matching blocks through them; None
@@ -2133,25 +2133,32 @@ class HeadroomProxy(
         # corporate TLS-inspection root) plus certifi by default, else a custom
         # CA bundle, else a strict-relaxed default context when
         # HEADROOM_TLS_STRICT=0, else httpx's default strict verification.
-        # Injection covers the third-party clients that build their own
-        # contexts; it also runs here because uvicorn workers can import the
-        # app without going through the CLI (they inherit the CLI's marker).
-        ensure_process_trust_if_owned()
-        _verify = build_httpx_verify()
-        _http2, _client_kwargs = _provider_httpx_client_options(self.config, _verify)
-        # `install_upstream_pinning` is what makes the SSRF guard's verdict
-        # binding: a caller-supplied upstream that passed `is_safe_upstream_url`
-        # is dialled at the address that was checked, instead of being resolved
-        # a second time here (DNS rebinding). It swaps the pool's DNS layer for
-        # direct routes, and refuses guarded upstreams on routes that cannot
-        # honour a pin at all — a proxy resolves the target itself, on its own
-        # network. Operator-configured upstreams have no pin and are untouched,
-        # so trust_env, limits, HTTP/2 and connection reuse are unchanged.
-        # Keepalive goes on first: pinning hides proxy pools behind a wrapper.
-        _keepalive = self.config.upstream_tcp_keepalive_seconds
-        self.http_client = install_upstream_pinning(
-            install_tcp_keepalive(httpx.AsyncClient(http2=_http2, **_client_kwargs), _keepalive)
-        )
+        if self.config.gateway is not None:
+            from headroom.proxy.gateway.transport import http_client as gateway_http_client
+
+            self.http_client = gateway_http_client(self.config.gateway)
+            _http2 = False
+            _client_kwargs = {}
+        else:
+            # Injection covers the third-party clients that build their own
+            # contexts; it also runs here because uvicorn workers can import the
+            # app without going through the CLI (they inherit the CLI's marker).
+            ensure_process_trust_if_owned()
+            _verify = build_httpx_verify()
+            _http2, _client_kwargs = _provider_httpx_client_options(self.config, _verify)
+            # `install_upstream_pinning` is what makes the SSRF guard's verdict
+            # binding: a caller-supplied upstream that passed `is_safe_upstream_url`
+            # is dialled at the address that was checked, instead of being resolved
+            # a second time here (DNS rebinding). It swaps the pool's DNS layer for
+            # direct routes, and refuses guarded upstreams on routes that cannot
+            # honour a pin at all — a proxy resolves the target itself, on its own
+            # network. Operator-configured upstreams have no pin and are untouched,
+            # so trust_env, limits, HTTP/2 and connection reuse are unchanged.
+            # Keepalive goes on first: pinning hides proxy pools behind a wrapper.
+            _keepalive = self.config.upstream_tcp_keepalive_seconds
+            self.http_client = install_upstream_pinning(
+                install_tcp_keepalive(httpx.AsyncClient(http2=_http2, **_client_kwargs), _keepalive)
+            )
         # Reuse the primary client when HTTP/2 is already off; otherwise keep a
         # dedicated HTTP/1.1 client for ChatGPT passthrough.
         self.http_client_h1 = (
@@ -3192,20 +3199,56 @@ class WebSocketAuthMiddleware:
     logs and browser history.
     """
 
-    def __init__(self, app: Any, *, proxy_token: str | None = None) -> None:
+    def __init__(
+        self,
+        app: Any,
+        *,
+        proxy_token: str | None = None,
+        gateway_authenticator: Any | None = None,
+        gateway_runtime: Any | None = None,
+    ) -> None:
         self.app = app
         self.proxy_token = proxy_token
+        self.gateway_authenticator = gateway_authenticator
+        self.gateway_runtime = gateway_runtime
         # Pre-encoded for constant-time comparison, mirroring the HTTP gate:
         # compare_digest on str raises TypeError for non-ASCII input, which
         # would turn a rejected handshake into a 500.
         self.token_bytes = proxy_token.encode("utf-8") if proxy_token else b""
 
     async def __call__(self, scope: Any, receive: Any, send: Any) -> None:
-        if scope["type"] != "websocket":
+        if scope["type"] != "websocket" or (
+            not self.proxy_token
+            and self.gateway_authenticator is None
+            and self.gateway_runtime is None
+        ):
+            if scope["type"] == "websocket":
+                scrub_proxy_token_headers(scope, self.token_bytes)
             await self.app(scope, receive, send)
             return
-        if not self.proxy_token:
-            scrub_proxy_token_headers(scope, self.token_bytes)
+
+        if self.gateway_authenticator is not None or self.gateway_runtime is not None:
+            from starlette.datastructures import Headers as StarletteHeaders
+
+            from headroom.proxy.gateway.auth import validate_gateway_browser_request
+            from headroom.proxy.gateway.errors import GatewayPublicError
+
+            headers = StarletteHeaders(scope=scope)
+            try:
+                validate_gateway_browser_request(headers)
+                generation = self.gateway_runtime.capture() if self.gateway_runtime else None
+                authenticator = (
+                    generation.authenticator if generation else self.gateway_authenticator
+                )
+                if authenticator is None:
+                    raise RuntimeError("Gateway authentication requires an authenticator")
+                scope["gateway_principal"] = authenticator.authenticate(headers)
+                scope["gateway_generation"] = generation
+            except GatewayPublicError:
+                message = await receive()
+                if message["type"] == "websocket.connect":
+                    await send({"type": "websocket.close", "code": 1008})
+                return
             await self.app(scope, receive, send)
             return
 
@@ -3346,7 +3389,7 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
     # to the user's live proxy log. Multi-worker processes add their PID so
     # same-port workers never share a RotatingFileHandler target. Stateless
     # mode must not create a log directory or file.
-    if not config.stateless:
+    if not config.stateless and config.gateway is None:
         _setup_file_logging(
             config.port,
             process_id=os.getpid() if config.worker_processes > 1 else None,
@@ -3358,22 +3401,23 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
     # explicit env exports authoritative; fail-open so it never blocks startup.
     # settings_store.load() already reports an unreadable or corrupt file; this
     # catches anything else that goes wrong while applying it.
-    settings_file: object = "the saved settings file"
-    try:
-        from headroom import paths as _hr_paths
-        from headroom import settings_store
+    if config.gateway is None:
+        settings_file: object = "the saved settings file"
+        try:
+            from headroom import paths as _hr_paths
+            from headroom import settings_store
 
-        settings_file = _hr_paths.settings_path()
-        settings_store.apply_to_environ(settings_store.load())
-    except Exception as exc:  # noqa: BLE001 — settings load must never break startup
-        # Settings values can hold credentials, so the exception is described by
-        # type and code location only, never its message.
-        logger.warning(
-            "Could not apply saved settings from %s (%s); continuing with env and "
-            "defaults. Fix or remove that file and restart the proxy.",
-            settings_file,
-            describe_exception(exc),
-        )
+            settings_file = _hr_paths.settings_path()
+            settings_store.apply_to_environ(settings_store.load())
+        except Exception as exc:  # noqa: BLE001 — settings load must never break startup
+            # Settings values can hold credentials, so the exception is described by
+            # type and code location only, never its message.
+            logger.warning(
+                "Could not apply saved settings from %s (%s); continuing with env and "
+                "defaults. Fix or remove that file and restart the proxy.",
+                settings_file,
+                describe_exception(exc),
+            )
 
     # Air-gap master switch. Propagate config.offline to the env so the
     # env-based egress predicates (telemetry, update check, license) all honor
@@ -3518,7 +3562,8 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
                 _rust_core_error,
             )
 
-        _configure_observability_or_refuse()
+        if proxy.config.gateway is None:
+            _configure_observability_or_refuse()
 
         app.state.started_at = time.time()
         app.state.ready = False
@@ -3651,6 +3696,16 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
             proxy._background_compression_executor.shutdown(wait=False)
             if proxy.code_graph_watcher:
                 proxy.code_graph_watcher.stop()
+            if config.gateway is not None:
+                await _timed(
+                    app.state.gateway_runtime.shutdown(),
+                    label="gateway_runtime.shutdown",
+                    timeout=(
+                        app.state.gateway_runtime.snapshot.limits.shutdown_drain_seconds
+                        + app.state.gateway_runtime.snapshot.limits.shutdown_cleanup_seconds
+                        + 1
+                    ),
+                )
             await _timed(proxy.shutdown(), label="proxy.shutdown", timeout=5.0)
             shutdown_headroom_tracing()
             shutdown_otel_metrics()
@@ -3661,6 +3716,10 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
         version=__version__,
         lifespan=lifespan,
     )
+    if config.gateway is not None:
+        from headroom.proxy.gateway.middleware import install_gateway_auth_middleware
+
+        install_gateway_auth_middleware(app, config.gateway, os.environ, config.gateway_config_path)
     app.add_middleware(WebSocketProjectPrefixMiddleware)
     loop_health_state: LoopHealthState = {
         "status": "healthy",
@@ -4448,7 +4507,11 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
     # scope), so the same token rule is applied to the `websocket` scope here.
     # Added after it, which makes it the outermost layer — an unauthenticated
     # handshake is refused before any project-prefix or routing work happens.
-    app.add_middleware(WebSocketAuthMiddleware, proxy_token=_proxy_token)
+    app.add_middleware(
+        WebSocketAuthMiddleware,
+        proxy_token=_proxy_token,
+        gateway_runtime=getattr(app.state, "gateway_runtime", None),
+    )
 
     # Health & Metrics
     @app.get("/livez")
@@ -4470,6 +4533,12 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
 
     @app.get("/readyz")
     async def readyz():
+        if config.gateway is not None:
+            runtime = app.state.gateway_runtime
+            return JSONResponse(
+                status_code=200 if runtime.status().ready else 503,
+                content=runtime.status().as_dict(),
+            )
         await _check_upstream()
         payload = _health_payload(include_config=False)
         return JSONResponse(status_code=200 if payload["ready"] else 503, content=payload)
@@ -6896,14 +6965,32 @@ def run_server(
         bind_kwargs = {"host": config.host, "port": config.port}
 
     try:
-        _run_uvicorn(
-            app_target,
-            bind_kwargs,
-            workers,
-            limit_concurrency,
-            uvicorn_log_level,
-            uvicorn_kwargs,
-        )
+        if config.gateway is not None:
+            from headroom.proxy.gateway.lifecycle import GatewayServer
+
+            GatewayServer(
+                uvicorn.Config(
+                    app_target,
+                    **bind_kwargs,
+                    log_level=uvicorn_log_level,
+                    limit_concurrency=limit_concurrency,
+                    proxy_headers=False,
+                    timeout_graceful_shutdown=config.gateway.limits.shutdown_cleanup_seconds,
+                    **uvicorn_kwargs,
+                ),
+                runtime=app_target.state.gateway_runtime,
+            ).run()
+            return
+
+        else:
+            _run_uvicorn(
+                app_target,
+                bind_kwargs,
+                workers,
+                limit_concurrency,
+                uvicorn_log_level,
+                uvicorn_kwargs,
+            )
     finally:
         if uds_path is not None:
             from headroom.proxy.uds import remove_uds_path

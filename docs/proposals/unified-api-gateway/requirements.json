@@ -1,0 +1,258 @@
+{
+  "status": "proposal",
+  "requirements": [
+    {
+      "id": "R01",
+      "title": "Operating profile and backward compatibility",
+      "ticket": "GW02",
+      "priority": "P0",
+      "acceptance_scenarios": [
+        "T001",
+        "T002",
+        "T003",
+        "T004",
+        "T005"
+      ]
+    },
+    {
+      "id": "R02",
+      "title": "Pure forwarding and explicit mutation boundaries",
+      "ticket": "GW02",
+      "priority": "P0",
+      "acceptance_scenarios": [
+        "T006",
+        "T007",
+        "T008",
+        "T009",
+        "T010"
+      ]
+    },
+    {
+      "id": "R03",
+      "title": "Client authentication, authorization, and separation",
+      "ticket": "GW03",
+      "priority": "P0",
+      "acceptance_scenarios": [
+        "T011",
+        "T012",
+        "T013",
+        "T014",
+        "T015"
+      ]
+    },
+    {
+      "id": "R04",
+      "title": "Credential-specific audience and egress",
+      "ticket": "GW03",
+      "priority": "P0",
+      "acceptance_scenarios": [
+        "T016",
+        "T017",
+        "T018",
+        "T019",
+        "T020"
+      ]
+    },
+    {
+      "id": "R05",
+      "title": "Credential lifetime, refresh ownership, and revocation",
+      "ticket": "GW05",
+      "priority": "P0",
+      "acceptance_scenarios": [
+        "T021",
+        "T022",
+        "T023",
+        "T024",
+        "T025"
+      ]
+    },
+    {
+      "id": "R06",
+      "title": "Model registry and capability discovery",
+      "ticket": "GW04",
+      "priority": "P0",
+      "acceptance_scenarios": [
+        "T026",
+        "T027",
+        "T028",
+        "T029",
+        "T030"
+      ]
+    },
+    {
+      "id": "R07",
+      "title": "Qualified cross-protocol semantics",
+      "ticket": "GW07",
+      "priority": "P0",
+      "acceptance_scenarios": [
+        "T031",
+        "T032",
+        "T033",
+        "T034",
+        "T035"
+      ]
+    },
+    {
+      "id": "R08",
+      "title": "HTTP streaming correctness and resource bounds",
+      "ticket": "GW04",
+      "priority": "P0",
+      "acceptance_scenarios": [
+        "T036",
+        "T037",
+        "T038",
+        "T039",
+        "T040"
+      ]
+    },
+    {
+      "id": "R09",
+      "title": "Stateful Responses and WebSocket lifecycle",
+      "ticket": "GW08",
+      "priority": "P0",
+      "acceptance_scenarios": [
+        "T041",
+        "T042",
+        "T043",
+        "T044",
+        "T045"
+      ]
+    },
+    {
+      "id": "R10",
+      "title": "Account selection, cooldowns, and safe retries",
+      "ticket": "GW09",
+      "priority": "P0",
+      "acceptance_scenarios": [
+        "T046",
+        "T047",
+        "T048",
+        "T049",
+        "T050"
+      ]
+    },
+    {
+      "id": "R11",
+      "title": "Atomic budget and concurrency admission",
+      "ticket": "GW09",
+      "priority": "P0",
+      "acceptance_scenarios": [
+        "T051",
+        "T052",
+        "T053",
+        "T054",
+        "T055"
+      ]
+    },
+    {
+      "id": "R12",
+      "title": "Privacy, truthful accounting, and observability",
+      "ticket": "GW10",
+      "priority": "P0",
+      "acceptance_scenarios": [
+        "T056",
+        "T057",
+        "T058",
+        "T059",
+        "T060"
+      ]
+    },
+    {
+      "id": "R13",
+      "title": "Input, browser, and network threat controls",
+      "ticket": "GW03",
+      "priority": "P0",
+      "acceptance_scenarios": [
+        "T061",
+        "T062",
+        "T063",
+        "T064",
+        "T065"
+      ]
+    },
+    {
+      "id": "R14",
+      "title": "Configuration, process ownership, and shutdown",
+      "ticket": "GW10",
+      "priority": "P0",
+      "acceptance_scenarios": [
+        "T066",
+        "T067",
+        "T068",
+        "T069",
+        "T070"
+      ]
+    },
+    {
+      "id": "R15",
+      "title": "System-identity and platform qualification",
+      "ticket": "GW05",
+      "priority": "P0",
+      "acceptance_scenarios": [
+        "T071",
+        "T072",
+        "T073",
+        "T074",
+        "T075"
+      ]
+    },
+    {
+      "id": "R16",
+      "title": "SDK, legacy, and runtime-topology regressions",
+      "ticket": "GW13",
+      "priority": "P0",
+      "acceptance_scenarios": [
+        "T076",
+        "T077",
+        "T078",
+        "T079",
+        "T080"
+      ]
+    },
+    {
+      "id": "R17",
+      "title": "Source and final-artifact release qualification",
+      "ticket": "GW13",
+      "priority": "P0",
+      "acceptance_scenarios": [
+        "T081",
+        "T082",
+        "T083",
+        "T084",
+        "T085"
+      ]
+    },
+    {
+      "id": "R18",
+      "title": "Provider admission and truthful native integration",
+      "ticket": "GW06",
+      "priority": "P0",
+      "acceptance_scenarios": [
+        "T086",
+        "T087",
+        "T088",
+        "T089",
+        "T090"
+      ]
+    },
+    {
+      "id": "R19",
+      "title": "Admitted interactive OAuth onboarding and callback safety",
+      "ticket": "GW06",
+      "priority": "P0",
+      "acceptance_scenarios": [
+        "T091",
+        "T092",
+        "T093",
+        "T094",
+        "T095",
+        "T096",
+        "T097",
+        "T098",
+        "T099",
+        "T100"
+      ]
+    }
+  ]
+}
+

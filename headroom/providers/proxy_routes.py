@@ -7,7 +7,7 @@ import logging
 from typing import Any
 
 from fastapi import FastAPI, HTTPException, Request, WebSocket
-from fastapi.responses import Response
+from fastapi.responses import JSONResponse, Response
 
 from headroom.log_safety import redact_url
 from headroom.providers.cloudcode import normalize_cloudcode_passthrough_path
@@ -68,6 +68,7 @@ from headroom.providers.vertex import (
     vertex_anthropic_target,
     vertex_publisher_provider_name,
 )
+from headroom.proxy.gateway.config import Protocol
 from headroom.proxy.passthrough import (
     custom_base_passthrough_telemetry as _custom_base_passthrough_telemetry,
 )
@@ -75,6 +76,11 @@ from headroom.proxy.request_scope import normalize_request_path
 from headroom.proxy.upstream_guard import is_safe_upstream_url_async
 
 logger = logging.getLogger("headroom.proxy.routes")
+
+
+def _gateway_enabled(proxy: Any) -> bool:
+    """Return whether this proxy has a configured unified gateway."""
+    return getattr(getattr(proxy, "config", None), "gateway", None) is not None
 
 
 async def _handle_chatgpt_codex_alpha_search(request: Request, proxy: Any) -> Response | None:
@@ -158,6 +164,33 @@ def _register_provider_handler_route(app: FastAPI, proxy: Any, spec: ProviderHan
         batch_name: str = "",
         model: str = "",
     ):
+        if _gateway_enabled(proxy):
+            from headroom.proxy.gateway.dispatch import dispatch_native_http
+
+            gateway_protocols: dict[str, Protocol] = {
+                "handle_openai_chat": "openai-chat",
+                "handle_anthropic_messages": "anthropic-messages",
+                "handle_gemini_generate_content": "gemini-generate",
+                "handle_gemini_stream_generate_content": "gemini-generate",
+            }
+            protocol = gateway_protocols.get(spec.handler_name)
+            if protocol is not None:
+                return await dispatch_native_http(
+                    request,
+                    proxy,
+                    protocol,
+                    public_model=model or None,
+                )
+            return JSONResponse(
+                status_code=400,
+                content={
+                    "error": {
+                        "type": "gateway_error",
+                        "code": "gateway_unsupported_capability",
+                        "message": "Requested capability is unavailable",
+                    }
+                },
+            )
         handler = getattr(proxy, spec.handler_name)
         handler_kwargs: dict[str, str] = {}
         custom_base = request.headers.get("x-headroom-base-url", "").strip()
@@ -192,6 +225,10 @@ def _register_provider_handler_routes(app: FastAPI, proxy: Any) -> None:
 
 def _register_openai_responses_root_route(app: FastAPI, proxy: Any, path: str) -> None:
     async def openai_responses_root(request: Request):
+        if _gateway_enabled(proxy):
+            from headroom.proxy.gateway.dispatch import dispatch_native_http
+
+            return await dispatch_native_http(request, proxy, "openai-responses")
         return await proxy.handle_openai_responses(request)
 
     openai_responses_root.__name__ = path.strip("/").replace("/", "_").replace("-", "_") + "_root"
@@ -200,6 +237,11 @@ def _register_openai_responses_root_route(app: FastAPI, proxy: Any, path: str) -
 
 def _register_openai_responses_websocket_route(app: FastAPI, proxy: Any, path: str) -> None:
     async def openai_responses_ws(websocket: WebSocket):
+        if _gateway_enabled(proxy):
+            from headroom.proxy.gateway.websocket import dispatch_native_responses_websocket
+
+            await dispatch_native_responses_websocket(websocket, proxy)
+            return
         await proxy.handle_openai_responses_ws(websocket)
 
     openai_responses_ws.__name__ = path.strip("/").replace("/", "_").replace("-", "_") + "_ws"
@@ -212,6 +254,10 @@ def _register_openai_responses_subpath_route(
     spec: OpenAIResponsesSubpathRoute,
 ) -> None:
     async def openai_responses_subpath(request: Request, sub_path: str):
+        if _gateway_enabled(proxy):
+            from headroom.proxy.gateway.dispatch import dispatch_stateful_response_http
+
+            return await dispatch_stateful_response_http(request, proxy, sub_path)
         codex_subpath_client = getattr(proxy, "http_client_h1", None) or proxy.http_client
         chatgpt_response = await handle_chatgpt_codex_responses_subpath(
             codex_subpath_client,
@@ -306,6 +352,27 @@ def _register_openai_image_routes(app: FastAPI, proxy: Any) -> None:
 def register_provider_routes(app: FastAPI, proxy: Any) -> None:
     """Register provider-specific proxy endpoints."""
 
+    if _gateway_enabled(proxy):
+        from headroom.proxy.gateway.dispatch import gateway_model_catalog
+
+        @app.get("/v1beta/models")
+        @app.get("/v1alpha/models")
+        async def gateway_gemini_models(request: Request):
+            return gateway_model_catalog(request, protocol="gemini-generate")
+
+        @app.get("/v1beta/models/{model_id}")
+        @app.get("/v1alpha/models/{model_id}")
+        async def gateway_gemini_model(request: Request, model_id: str):
+            return gateway_model_catalog(request, model_id, protocol="gemini-generate")
+
+        @app.get("/anthropic/v1/models")
+        async def gateway_anthropic_models(request: Request):
+            return gateway_model_catalog(request, protocol="anthropic-messages")
+
+        @app.get("/anthropic/v1/models/{model_id}")
+        async def gateway_anthropic_model(request: Request, model_id: str):
+            return gateway_model_catalog(request, model_id, protocol="anthropic-messages")
+
     async def vertex_publisher_passthrough(request: Request, publisher: str, action: str):
         return await proxy.handle_passthrough(
             request,
@@ -316,6 +383,10 @@ def register_provider_routes(app: FastAPI, proxy: Any) -> None:
 
     @app.post("/v1/messages")
     async def anthropic_messages(request: Request):
+        if _gateway_enabled(proxy):
+            from headroom.proxy.gateway.dispatch import dispatch_native_http
+
+            return await dispatch_native_http(request, proxy, "anthropic-messages")
         # Honor the per-request upstream override so clients that speak the
         # Anthropic Messages wire format but authenticate against a
         # non-Anthropic gateway route correctly, consistent with the
@@ -342,14 +413,26 @@ def register_provider_routes(app: FastAPI, proxy: Any) -> None:
     # converter captures inference-profile ids that contain dots, colons and
     # slashes (e.g. `us.anthropic.claude-sonnet-4-5-20250929-v1:0`). See
     # headroom/proxy/handlers/bedrock.py for the SigV4 caveat.
-    if getattr(proxy.config, "bedrock_api_url", None):
+    if getattr(proxy.config, "bedrock_api_url", None) or _gateway_enabled(proxy):
 
         @app.post("/model/{model_id:path}/invoke")
         async def bedrock_invoke(request: Request, model_id: str):
+            if _gateway_enabled(proxy):
+                from headroom.proxy.gateway.dispatch import dispatch_native_http
+
+                return await dispatch_native_http(
+                    request, proxy, "bedrock-invoke", public_model=model_id
+                )
             return await proxy.handle_bedrock_invoke(request, model_id, stream=False)
 
         @app.post("/model/{model_id:path}/invoke-with-response-stream")
         async def bedrock_invoke_stream(request: Request, model_id: str):
+            if _gateway_enabled(proxy):
+                from headroom.proxy.gateway.dispatch import dispatch_native_http
+
+                return await dispatch_native_http(
+                    request, proxy, "bedrock-invoke", public_model=model_id
+                )
             return await proxy.handle_bedrock_invoke(request, model_id, stream=True)
 
     _register_openai_responses_routes(app, proxy)
@@ -368,6 +451,10 @@ def register_provider_routes(app: FastAPI, proxy: Any) -> None:
         model: str,
     ):
         del api_version, project
+        if _gateway_enabled(proxy):
+            from headroom.proxy.gateway.dispatch import dispatch_native_http
+
+            return await dispatch_native_http(request, proxy, "vertex-generate", public_model=model)
         if is_vertex_google_publisher(publisher):
             return await proxy.handle_gemini_generate_content(
                 request,
@@ -389,6 +476,10 @@ def register_provider_routes(app: FastAPI, proxy: Any) -> None:
         model: str,
     ):
         del api_version, project
+        if _gateway_enabled(proxy):
+            from headroom.proxy.gateway.dispatch import dispatch_native_http
+
+            return await dispatch_native_http(request, proxy, "vertex-generate", public_model=model)
         if is_vertex_google_publisher(publisher):
             return await proxy.handle_gemini_generate_content(
                 request,
@@ -547,6 +638,10 @@ def register_provider_routes(app: FastAPI, proxy: Any) -> None:
 
     @app.get("/v1/models")
     async def list_models(request: Request):
+        if _gateway_enabled(proxy):
+            from headroom.proxy.gateway.dispatch import gateway_model_catalog
+
+            return gateway_model_catalog(request)
         provider_name, base_url = await _model_metadata_route(request)
         return await handle_model_metadata_endpoint(
             proxy,
@@ -558,6 +653,10 @@ def register_provider_routes(app: FastAPI, proxy: Any) -> None:
 
     @app.get("/v1/models/{model_id}")
     async def get_model(request: Request, model_id: str):
+        if _gateway_enabled(proxy):
+            from headroom.proxy.gateway.dispatch import gateway_model_catalog
+
+            return gateway_model_catalog(request, model_id)
         provider_name, base_url = await _model_metadata_route(request)
         return await handle_model_metadata_endpoint(
             proxy,

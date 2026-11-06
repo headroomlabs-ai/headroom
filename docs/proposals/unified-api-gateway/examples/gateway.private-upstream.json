@@ -1,0 +1,135 @@
+{
+  "version": 1,
+  "runtime": {
+    "profile": "gateway",
+    "engine": "python",
+    "bind": "127.0.0.1",
+    "port": 8787,
+    "workers": 1,
+    "remote_enabled": false,
+    "stateless": false
+  },
+  "transforms": {
+    "mode": "off"
+  },
+  "privacy": {
+    "beacon": false,
+    "payload_logging": false,
+    "metrics": "local"
+  },
+  "client_auth": {
+    "required": true,
+    "principals": [
+      {
+        "id": "local-app",
+        "secret_ref": "env:HEADROOM_GATEWAY_CLIENT_TOKEN",
+        "scopes": [
+          "inference",
+          "models"
+        ],
+        "routes": [
+          "internal-native"
+        ]
+      }
+    ]
+  },
+  "credentials": [
+    {
+      "id": "internal-key",
+      "provider": "compatible",
+      "source": {
+        "kind": "env",
+        "ref": "INTERNAL_LLM_API_KEY"
+      },
+      "refresh_owner": "none",
+      "allowed_origins": [
+        "https://llm.internal.example:443"
+      ],
+      "allowed_path_prefixes": [
+        "/v1/"
+      ],
+      "enabled": true
+    }
+  ],
+  "routes": [
+    {
+      "id": "internal-native",
+      "public_model": "REPLACE_WITH_ENABLED_INTERNAL_MODEL",
+      "upstream_model": "REPLACE_WITH_ENABLED_INTERNAL_MODEL",
+      "provider": "compatible",
+      "upstream_origin": "https://llm.internal.example:443",
+      "upstream_path_prefix": "/v1/",
+      "credentials": [
+        "internal-key"
+      ],
+      "ingress_protocols": [
+        "openai-chat"
+      ],
+      "native_protocols": [
+        "openai-chat"
+      ],
+      "translation": "disabled",
+      "body_contract": "strict-native",
+      "private_network": true,
+      "retry": {
+        "max_attempts": 1,
+        "ambiguous_commit": "never",
+        "after_output": "never"
+      },
+      "billing": {
+        "allow_paid_fallback": false
+      },
+      "enabled": true,
+      "catalog": {
+        "source": "configured",
+        "entitlements": {
+          "internal-key": "allowed"
+        }
+      },
+      "capabilities": {
+        "openai-chat": {
+          "http-json": {
+            "operations": [
+              "generate"
+            ],
+            "features": [
+              "text",
+              "tools",
+              "parallel_tools",
+              "inline_images",
+              "structured_output",
+              "signed_state"
+            ]
+          },
+          "http-stream": {
+            "operations": [
+              "generate"
+            ],
+            "features": [
+              "text",
+              "tools",
+              "parallel_tools",
+              "inline_images",
+              "structured_output",
+              "signed_state"
+            ]
+          }
+        }
+      }
+    }
+  ],
+  "transport": {
+    "ca_bundle": "/REPLACE_WITH_PATH/internal-ca.pem"
+  },
+  "admission": {
+    "max_concurrency": 128,
+    "queue_limit": 128,
+    "queue_timeout_seconds": 0,
+    "budget_usd": null,
+    "budget_period": "process",
+    "unknown_cost_policy": "allow"
+  },
+  "limits": {
+    "request_deadline_seconds": 120
+  }
+}

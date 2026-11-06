@@ -334,6 +334,32 @@ class TestMissingProxyDepsError:
 
         assert exc_info.value.code == 1
 
+    @pytest.mark.proxy_dependency_gate
+    def test_gateway_dependency_gate_excludes_transform_and_mcp_extras(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from headroom.cli.proxy import ensure_proxy_dependencies
+
+        imported: list[str] = []
+
+        def fake_find_spec(name: str):
+            imported.append(name)
+            if name in {"mcp", "magika", "zstandard", "onnxruntime", "transformers"}:
+                return None
+            return object()
+
+        monkeypatch.setattr("headroom.cli.proxy.find_spec", fake_find_spec)
+
+        ensure_proxy_dependencies(gateway=True)
+
+        assert not set(imported) & {
+            "mcp",
+            "magika",
+            "zstandard",
+            "onnxruntime",
+            "transformers",
+        }
+
 
 class TestKeyboardInterruptExitCode:
     """Ctrl+C during proxy run should exit 130 (SIGINT convention)."""
