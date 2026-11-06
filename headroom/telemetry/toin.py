@@ -489,7 +489,7 @@ class TOINConfig:
     storage_path: str = field(default_factory=get_default_toin_storage_path)
     auto_save_interval: int = 600  # Auto-save every 10 minutes
     max_patterns: int = DEFAULT_MAX_PATTERNS
-    max_storage_bytes: int = DEFAULT_MAX_STORAGE_BYTES
+    max_storage_bytes: int = DEFAULT_MAX_STORAGE_BYTES  # Filesystem load and save limit
 
     # Network learning thresholds
     min_samples_for_recommendation: int = 10
