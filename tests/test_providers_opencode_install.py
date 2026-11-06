@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+import click
 import pytest
 
 from headroom.install.models import ConfigScope, DeploymentManifest
@@ -762,3 +763,22 @@ def test_unambiguous_legacy_backup_still_migrates_and_restores(
     revert_provider_scope(mutation, manifest)
     assert config.read_bytes() == original
     assert not canonical.exists()
+
+
+def test_apply_provider_scope_leaves_unparseable_config_untouched(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """apply_provider_scope reports an unparseable config instead of replacing it."""
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("USERPROFILE", str(tmp_path))
+    monkeypatch.delenv("OPENCODE_HOME", raising=False)
+    monkeypatch.delenv("OPENCODE_CONFIG", raising=False)
+    config_file = tmp_path / ".config" / "opencode" / "opencode.json"
+    config_file.parent.mkdir(parents=True)
+    original = '{"model": "gpt-4o" "oops": 1}'
+    config_file.write_text(original, encoding="utf-8")
+
+    with pytest.raises(click.ClickException, match="could not parse"):
+        apply_provider_scope(_manifest())
+
+    assert config_file.read_text(encoding="utf-8") == original

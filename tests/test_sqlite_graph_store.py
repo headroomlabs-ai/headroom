@@ -14,7 +14,10 @@ Tests verify:
 from __future__ import annotations
 
 import os
+import sqlite3
 import tempfile
+from dataclasses import replace
+from datetime import datetime
 
 import pytest
 
@@ -125,6 +128,108 @@ class TestSQLiteGraphStoreEntityOperations:
         assert retrieved.name == "Updated Name"
         assert retrieved.entity_type == "updated_type"
         assert retrieved.properties == {"new_key": "new_value"}
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("update", [False, True], ids=["identical-save", "updated-fields"])
+    async def test_saving_entity_preserves_relationships(self, store, update):
+        entity = Entity(user_id="user1", name="Original Name", entity_type="person")
+        neighbor = Entity(user_id="user1", name="Neighbor", entity_type="person")
+        await store.add_entity(entity)
+        await store.add_entity(neighbor)
+        relationships = [
+            Relationship(user_id="user1", source_id=entity.id, target_id=neighbor.id),
+            Relationship(user_id="user1", source_id=neighbor.id, target_id=entity.id),
+            Relationship(user_id="user1", source_id=entity.id, target_id=entity.id),
+        ]
+        for relationship in relationships:
+            await store.add_relationship(relationship)
+
+        saved = (
+            replace(
+                entity,
+                name="Updated Name",
+                entity_type="updated_type",
+                description="Updated description",
+                properties={"priority": "high"},
+                created_at=datetime(2025, 1, 2),
+                updated_at=datetime(2026, 1, 2),
+                metadata={"source": "updated"},
+            )
+            if update
+            else entity
+        )
+        await store.add_entity(saved)
+
+        # Reopening also verifies that preserving edges is durable, not a cache effect.
+        reopened = SQLiteGraphStore(store.db_path)
+        assert await reopened.get_entity(entity.id) == saved
+        assert await reopened.get_entity_by_name("user1", saved.name.upper()) == saved
+        if update:
+            assert await reopened.get_entity_by_name("user1", entity.name) is None
+        actual = await reopened.get_relationships(entity.id)
+        assert {relationship.id: relationship for relationship in actual} == {
+            relationship.id: relationship for relationship in relationships
+        }
+        subgraph = await reopened.query_subgraph([entity.id], max_hops=1)
+        assert subgraph.entity_ids == {entity.id, neighbor.id}
+        assert subgraph.relationship_ids == {relationship.id for relationship in relationships}
+
+        # Explicit deletion must still cascade; only an upsert preserves relationships.
+        assert await reopened.delete_entity(entity.id)
+        assert reopened.relationship_count == 0
+        assert await reopened.get_entity(neighbor.id) == neighbor
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("reject", [False, True], ids=["reassign-owner", "rollback-error"])
+    async def test_owner_reassignment_preserves_replacement_semantics(self, store, reject):
+        entity = Entity(user_id="old-owner", name="Entity", entity_type="person")
+        neighbor = Entity(user_id="old-owner", name="Neighbor", entity_type="person")
+        await store.add_entity(entity)
+        await store.add_entity(neighbor)
+        relationship = Relationship(user_id="old-owner", source_id=entity.id, target_id=neighbor.id)
+        await store.add_relationship(relationship)
+        reassigned = replace(entity, user_id="new-owner")
+        if reject:
+            # Reject the save after the conditional delete to verify transaction rollback.
+            with store._get_conn() as conn:
+                conn.execute(
+                    """
+                    CREATE TRIGGER reject_entity_insert BEFORE INSERT ON entities
+                    BEGIN SELECT RAISE(ABORT, 'synthetic insert failure'); END
+                    """
+                )
+            with pytest.raises(sqlite3.IntegrityError, match="synthetic insert failure"):
+                await store.add_entity(reassigned)
+        else:
+            await store.add_entity(reassigned)
+
+        reopened = SQLiteGraphStore(store.db_path)
+        assert await reopened.get_entity(entity.id) == (entity if reject else reassigned)
+        assert await reopened.get_relationships(entity.id) == ([relationship] if reject else [])
+        assert await reopened.get_entity(neighbor.id) == neighbor
+        assert reopened.entity_count == 2
+
+    @pytest.mark.asyncio
+    async def test_null_entity_type_keeps_sqlite_replacement_default(self, store):
+        entity = replace(Entity(user_id="user1", name="Entity"), entity_type=None)
+        neighbor = Entity(user_id="user1", name="Neighbor")
+        await store.add_entity(entity)
+        await store.add_entity(neighbor)
+        assert (await store.get_entity(entity.id)).entity_type == "unknown"
+        relationship = Relationship(user_id="user1", source_id=entity.id, target_id=neighbor.id)
+        await store.add_relationship(relationship)
+
+        for user_id in ("user1", "user2"):
+            await store.add_entity(replace(entity, user_id=user_id, name="Updated"))
+            reopened = SQLiteGraphStore(store.db_path)
+            retrieved = await reopened.get_entity(entity.id)
+            assert retrieved is not None
+            assert retrieved.user_id == user_id
+            assert retrieved.name == "Updated"
+            assert retrieved.entity_type == "unknown"
+            assert await reopened.get_relationships(entity.id) == (
+                [relationship] if user_id == "user1" else []
+            )
 
     @pytest.mark.asyncio
     async def test_delete_entity(self, store):

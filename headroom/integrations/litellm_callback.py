@@ -24,12 +24,13 @@ from headroom.integrations._compress_backend import (  # noqa: F401
     _DEFAULT_CLOUD_URL,
     CompressBackend,
 )
-from headroom.offline import guard_egress  # noqa: F401
+from headroom.offline import guard_egress, pin_litellm_cost_map_local  # noqa: F401
 
 logger = logging.getLogger(__name__)
 
 
 try:
+    pin_litellm_cost_map_local()
     from litellm.integrations.custom_logger import CustomLogger as _CustomLogger
 except ImportError:  # litellm not installed — fall back to plain object
     _CustomLogger = object  # type: ignore[assignment,misc]

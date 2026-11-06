@@ -250,6 +250,9 @@ def capture_codex_wire_debug(
 #     prefix) is never mutated.
 #   - "disabled": Memory context lookup is skipped entirely; the request
 #     forwards untouched.
+#   - "tool": Auto-injection of context is off, but the memory tools are still
+#     registered; the agent calls them explicitly (``search_and_format_context``
+#     returns None in this mode).
 #
 # Configurable via HEADROOM_MEMORY_INJECTION_MODE env var. There is no
 # "system_prompt" option — that path is permanently retired by I2 (cache hot
@@ -455,6 +458,12 @@ def count_cache_breakpoints(
             if not isinstance(msg, dict):
                 continue
             found = 1 if "cache_control" in msg else 0
+            # OpenAI chat shape: markers on an assistant's tool_calls entries.
+            tool_calls = msg.get("tool_calls")
+            if isinstance(tool_calls, list):
+                found += sum(
+                    1 for tc in tool_calls if isinstance(tc, dict) and "cache_control" in tc
+                )
             content = msg.get("content")
             if isinstance(content, list):
                 for block in content:
@@ -844,6 +853,16 @@ def enforce_cache_breakpoint_budget(
                                 budget["left"] -= 1
                         new_blocks.append(block)
                     msg = {**msg, "content": new_blocks}
+                tool_calls = msg.get("tool_calls")
+                if isinstance(tool_calls, list) and budget["left"] > 0:
+                    new_calls = []
+                    for tc in tool_calls:
+                        if budget["left"] > 0 and isinstance(tc, dict) and "cache_control" in tc:
+                            tc = {k: v for k, v in tc.items() if k != "cache_control"}
+                            budget["left"] -= 1
+                        new_calls.append(tc)
+                    if new_calls != tool_calls:
+                        msg = {**msg, "tool_calls": new_calls}
                 if budget["left"] > 0 and "cache_control" in msg:
                     msg = {k: v for k, v in msg.items() if k != "cache_control"}
                     budget["left"] -= 1
@@ -1066,10 +1085,24 @@ def _system_message_to_blocks(message: dict[str, Any]) -> list[Any]:
     return []
 
 
+def is_third_party_model(model: str | None, *, third_party_upstream: bool) -> bool:
+    """Whether a request is for a non-Claude model on an upstream Headroom does not own.
+
+    Headroom has no wire contract for such a model (a vLLM or GLM endpoint
+    speaking the Anthropic Messages format), and the client already sends its
+    mid-conversation system sections there directly. A Claude-named model
+    behind a gateway may still reach a provider without that feature, so it is
+    not one.
+    """
+    return third_party_upstream and "claude" not in str(model or "").lower()
+
+
 def relocate_system_messages_to_top_level(
     messages: list[dict[str, Any]],
     system: Any,
     model: str | None = None,
+    *,
+    third_party_model: bool = False,
 ) -> tuple[list[dict[str, Any]], Any, bool]:
     """Relocate only system messages invalid for the selected Anthropic model.
 
@@ -1078,6 +1111,12 @@ def relocate_system_messages_to_top_level(
     placed at the end. Hoisting those changes semantics and invalidates the
     cached prefix. The initial/invalid forms are still moved to the top-level
     field as the issue-765 last-line wire-contract guard.
+
+    ``third_party_model`` (see :func:`is_third_party_model`) treats the model as
+    supported: the client's sections stay where it put them. Hoisting them
+    there would append to the top-level ``system`` whenever a turn adds a
+    section, so the upstream's prefix cache would miss the whole conversation
+    on every such turn.
 
     The relocated content is appended after any existing top-level ``system``
     so wire order (system prompt, then conversation) is preserved. Only
@@ -1092,7 +1131,7 @@ def relocate_system_messages_to_top_level(
     the common path is untouched.
     """
     model_id = str(model or "").lower()
-    supports_mid_conversation = any(
+    supports_mid_conversation = third_party_model or any(
         family in model_id
         for family in (
             "claude-fable-5",
@@ -1288,8 +1327,11 @@ def append_text_to_latest_user_input_item(
     return body_input, 0
 
 
-# Maximum request body size (100MB - increased to support image-heavy requests)
-MAX_REQUEST_BODY_SIZE = 100 * 1024 * 1024
+# Bound the entire history before JSON parsing or compression. Larger image-heavy
+# bodies can amplify far beyond their wire size during preprocessing (#4139).
+MAX_REQUEST_BODY_SIZE = request_limit_policy.resolve_request_body_max_bytes(
+    os.environ.get(request_limit_policy.REQUEST_BODY_MAX_BYTES_ENV)
+)
 
 # A *decompressed* body obeys the same ceiling as an uncompressed one. The
 # Content-Length gate at the handlers only ever saw the compressed wire size, so
@@ -1862,22 +1904,26 @@ class _OwnerOnlyRotatingFileHandler(RotatingFileHandler):
 _owner_only_warning_emitted = False
 
 
-def _warn_once_if_owner_only_unsupported(log_path: Path) -> None:
-    """Say plainly, once per process, when the file cannot be made owner-only.
+def _warn_once_if_not_protected(log_path: Path) -> None:
+    """Say plainly, once per process, when the file is not actually owner-only.
 
-    A security control that quietly does nothing on a supported platform is
-    worse than no control, so Windows gets told rather than left to assume the
-    0600 in the docs applies to it.
+    Checks the file itself (:func:`headroom.fileperms.verify_owner_only`)
+    rather than assuming from the platform: on Windows the ACL restriction
+    (:mod:`headroom._fileperms_windows`) usually succeeds, in which case this
+    stays silent, but it can fail for reasons that have nothing to do with
+    Headroom's own code — a non-NTFS volume, a missing privilege — and a
+    control that quietly does nothing is worse than no control.
     """
     global _owner_only_warning_emitted
-    if _fileperms.OWNER_ONLY_SUPPORTED or _owner_only_warning_emitted:
+    if _owner_only_warning_emitted or _fileperms.verify_owner_only(log_path):
         return
     _owner_only_warning_emitted = True
     logger.warning(
-        "Headroom cannot create %s owner-only on this platform: file modes do not "
-        "control read access here, and Headroom does not set an ACL. The runtime log "
-        "can contain request and response content (--log-messages, wire debug, "
-        "HEADROOM_LOG_PAYLOAD_PREVIEW) — protect the log directory itself.",
+        "Headroom could not restrict %s to the current user — other accounts "
+        "on this machine may be able to read it. The runtime log can contain "
+        "request and response content (--log-messages, wire debug, "
+        "HEADROOM_LOG_PAYLOAD_PREVIEW); move HEADROOM_WORKSPACE_DIR somewhere "
+        "only you can access, or restrict the containing directory yourself.",
         log_path,
     )
 
@@ -1971,7 +2017,6 @@ def _setup_file_logging(
                 log_path,
             )
             return
-        _warn_once_if_owner_only_unsupported(log_path)
         # Attach to the headroom root logger so all sub-loggers are captured.
         # Keep root propagation enabled for container stdout/stderr while
         # this handler writes the separate port/worker-specific proxy log.
@@ -2011,6 +2056,11 @@ def _setup_file_logging(
             headroom_logger.removeHandler(stale)
             stale.close()
         headroom_logger.addHandler(handler)
+        # After, not before: the handler's _open() is what actually attempts
+        # the protection (mode bits on POSIX, the ACL call on Windows), so
+        # only now is there something real to verify rather than a platform
+        # guess.
+        _warn_once_if_not_protected(log_path)
         if level == logging.DEBUG:
             logger.warning(
                 "Headroom debug logging is on (HEADROOM_LOG_LEVEL). %s now records "
@@ -2022,11 +2072,13 @@ def _setup_file_logging(
             )
     except OSError as exc:
         # Non-fatal: can't write logs (read-only fs, permissions, etc.). Say so,
-        # or the missing proxy.log is the only clue. The OSError names the path.
+        # or the missing proxy.log is the only clue. str(exc) embeds repr(filename),
+        # which doubles backslashes on Windows -- exc.filename is the raw path.
         logger.warning(
-            "Headroom runtime log disabled: cannot write the log file: %s. "
+            "Headroom runtime log disabled: cannot write the log file: %s: %s. "
             "Point HEADROOM_WORKSPACE_DIR at a writable directory to restore proxy.log.",
-            exc,
+            exc.filename or log_dir,
+            exc.strerror or exc,
         )
 
 
@@ -2896,27 +2948,20 @@ def apply_session_sticky_ccr_tool(
       * Otherwise, inject only when this turn produced compressed content.
         The first injection records the golden bytes for future turns.
 
-    Tools whose name already equals ``CCR_TOOL_NAME`` (e.g. the client
-    pre-registered it via MCP) are not re-appended; the client's bytes
-    win.
+    Tools registered under ``CCR_TOOL_NAME`` or a supported client/MCP alias
+    are not re-appended; the client's executable name and definition win.
 
     Returns ``(updated_tools, was_injected)``. ``updated_tools`` is a
     fresh list (caller-safe).
     """
-    from headroom.ccr.tool_injection import CCR_TOOL_NAME
+    from headroom.ccr.tool_calls import client_retrieval_tool_name
 
     if provider not in ("anthropic", "openai", "google"):
         raise ValueError(f"unsupported provider: {provider!r}")
 
     tools_out: list[dict[str, Any]] = list(existing_tools) if existing_tools else []
-    existing_names: set[str] = set()
-    for t in tools_out:
-        n = _extract_tool_name(t)
-        if n:
-            existing_names.add(n)
-
-    # Client (or MCP) already provided a tool by this name — don't double up.
-    if CCR_TOOL_NAME in existing_names:
+    # Only default Headroom aliases claim ownership, not arbitrary MCP servers.
+    if client_retrieval_tool_name(tools_out):
         log_tool_injection_decision(
             provider=provider,
             session_id=session_id,
@@ -3464,6 +3509,11 @@ async def read_request_json_with_bytes(request: Request) -> tuple[dict[str, Any]
         raise RequestBodyNotObject(
             "Request body must be a JSON object, not " + type(result).__name__
         )
+
+    # Large histories are routed from their envelope only. Leave their content
+    # untouched for the soft-limit passthrough, before any normalization/copies.
+    if len(raw) > request_limit_policy.COMPRESSION_BODY_MAX_BYTES:
+        return result, raw
 
     # Drop output-only blocks (see ``strip_output_only_request_blocks``) before
     # any downstream deepcopy / compression / 400-retry path. This is the shared
@@ -4098,8 +4148,29 @@ def _warn_deferred_without_search_tool(tools: Any) -> None:
 
 
 def anthropic_first_party_tool_search_supported(api_base_url: str | None) -> bool:
-    """Return whether Anthropic server-side tool search is valid for this upstream."""
-    from headroom.providers.claude.runtime import is_custom_anthropic_base_url
+    """Return whether Anthropic server-side tool search is valid for this upstream.
+
+    GitHub's Copilot API also accepts the first-party deferred shape and bills
+    deferred schemas compactly, so downgrading deferral there inlines the whole
+    catalog and multiplies billed prompt tokens (#4356). That holds for the
+    generic host and for the plan hosts Business/Enterprise/Individual seats
+    are routed to (``api.<plan>.githubcopilot.com``, #4155), so any public
+    ``*.githubcopilot.com`` host qualifies. GHE data-residency hosts
+    (``copilot-api.<tenant>.ghe.com``) still downgrade: nobody has verified
+    that they accept the shape.
+    """
+    from headroom.copilot_auth import is_copilot_completions_host, is_public_copilot_api_host
+    from headroom.providers.claude.runtime import (
+        _gate_view_host,
+        is_custom_anthropic_base_url,
+    )
+
+    # The ``proxy.*`` hosts are the inline-completions surface: nobody has measured
+    # the deferred shape there.
+    if is_public_copilot_api_host(
+        _gate_view_host((api_base_url or "").strip())
+    ) and not is_copilot_completions_host(api_base_url):
+        return True
 
     return not is_custom_anthropic_base_url(api_base_url)
 

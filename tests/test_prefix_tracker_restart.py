@@ -137,13 +137,14 @@ _SCENARIOS = {
 
 
 def _restart_between_turns(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, scenario: str
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, scenario: str, **overrides: Any
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]], int, dict[str, str]]:
     """Some turns in one proxy, the next turn in a fresh one, one warm
     provider cache. Returns (last forwarded before, first forwarded after,
     its read hit, the original behind each retrieval reference forwarded
     before the restart)."""
     build, turns, config, kompress = _SCENARIOS[scenario]
+    config = {**config, **overrides}
     monkeypatch.setenv("HEADROOM_CCR_BACKEND", "memory")
     # As the desktop app runs it: a cold start forwards the fast pass.
     monkeypatch.setenv("HEADROOM_BACKGROUND_COMPRESSION", "1")
@@ -182,8 +183,11 @@ def test_restored_retrieval_references_resolve_to_their_originals(
     tracker kept replaying pointed at a hash that no longer resolved."""
     monkeypatch.setenv(PREFIX_STATE_FILE_ENV, str(tmp_path / "prefix-state.json"))
 
+    # Each Read matures as it arrives, before the provider caches it, so
+    # references exist before the restart. A Read that quiesces later is
+    # already cached by then and stays verbatim.
     previous, current, _, originals = _restart_between_turns(
-        monkeypatch, tmp_path, "read-maturation"
+        monkeypatch, tmp_path, "read-maturation", read_maturation_quiesce_turns=0
     )
 
     emitted = _ccr_hashes(current)

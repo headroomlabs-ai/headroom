@@ -295,21 +295,40 @@ def _refuse_busy_port(host: str, port: int, *, workers: int) -> None:
 @click.option(
     "--port",
     "-p",
-    default=8787,
+    default=None,
     type=click.IntRange(1, 65535),
-    envvar="HEADROOM_PORT",
-    help="Proxy port (default: 8787, env: HEADROOM_PORT)",
+    help=(
+        "Proxy port. Defaults to auto-detecting the most recently started live "
+        "wrap session (falls back to 8787). Env: HEADROOM_PORT."
+    ),
 )
 @click.option("--no-open", is_flag=True, help="Print the URL instead of opening a browser")
-def dashboard(port: int, no_open: bool) -> None:
+def dashboard(port: int | None, no_open: bool) -> None:
     """Open the Headroom savings dashboard in your browser.
 
     Requires a running proxy (start one with `headroom proxy` or `headroom wrap ...`).
+
+    With no ``--port``/``HEADROOM_PORT``, the port is auto-detected from live wrap
+    sessions (e.g. a session bumped to 8788 because 8787 was taken) so the dashboard
+    URL matches whatever proxy is actually running.
     """
     import webbrowser
 
-    url = f"http://127.0.0.1:{port}/dashboard"
+    from headroom.cli.port_discovery import proxy_is_healthy, resolve_read_port
+
+    resolved_port, origin = resolve_read_port(port)
+    url = f"http://127.0.0.1:{resolved_port}/dashboard"
+    if origin == "discovered":
+        click.echo(f"  Detected live proxy on port {resolved_port}")
     click.echo(f"  Dashboard: {url}")
+    if not proxy_is_healthy(resolved_port):
+        click.secho(
+            f"  Warning: no proxy responding on port {resolved_port}. "
+            "Start one with `headroom proxy` or `headroom wrap ...`, "
+            "or pass --port explicitly.",
+            fg="yellow",
+            err=True,
+        )
     if not no_open:
         try:
             webbrowser.open(url)
@@ -529,12 +548,35 @@ def dashboard(port: int, no_open: bool) -> None:
     ),
 )
 @click.option(
+    "--ccr-buffered-chat-streaming",
+    is_flag=True,
+    envvar="HEADROOM_CCR_BUFFERED_CHAT_STREAMING",
+    help=(
+        "Answer headroom_retrieve on streaming /v1/chat/completions. A turn that "
+        "carries a redeemable marker runs as stream:false upstream and is "
+        "re-emitted as chat.completion.chunk frames, so that turn's text arrives "
+        "all at once. Off by default. Env: HEADROOM_CCR_BUFFERED_CHAT_STREAMING."
+    ),
+)
+@click.option(
     "--no-ccr-proactive-expansion",
     is_flag=True,
     envvar="HEADROOM_NO_CCR_PROACTIVE_EXPANSION",
     help=(
         "Disable proactive expansion of previously compressed content. "
         "Env: HEADROOM_NO_CCR_PROACTIVE_EXPANSION."
+    ),
+)
+@click.option(
+    "--no-ccr-response-handling",
+    is_flag=True,
+    envvar="HEADROOM_NO_CCR_RESPONSE_HANDLING",
+    help=(
+        "Disable server-side buffering of streaming responses for CCR response "
+        "handling, independent of --no-ccr. A client that offers the "
+        "headroom_retrieve tool itself (e.g. the bundled OpenCode plugin) "
+        "otherwise always takes the buffered-stream path with no opt-out "
+        "(issue #3082). Env: HEADROOM_NO_CCR_RESPONSE_HANDLING."
     ),
 )
 @click.option(
@@ -800,7 +842,8 @@ def dashboard(port: int, no_open: bool) -> None:
     help=(
         "Enable/disable AST-based code compression. Requires the optional "
         "tree-sitter dependency: pip install headroom-ai[code]. "
-        "Default: disabled. Env: HEADROOM_CODE_AWARE_ENABLED=1 to enable."
+        "Default: enabled. Disable with --no-code-aware or "
+        "HEADROOM_CODE_AWARE_ENABLED=0."
     ),
 )
 @click.option(
@@ -1177,7 +1220,9 @@ def proxy(
     no_ccr: bool,
     lossless: bool,
     ccr_inline_resolve: bool,
+    ccr_buffered_chat_streaming: bool,
     no_ccr_proactive_expansion: bool,
+    no_ccr_response_handling: bool,
     proxy_extension: tuple[str, ...],
     compressor: tuple[str, ...],
     no_subscription_tracking: bool,
@@ -1515,8 +1560,9 @@ def proxy(
         # for exactly the clients told to use it (#3082).
         ccr_inject_tool=not no_ccr,
         ccr_inject_marker=not no_ccr,
-        ccr_handle_responses=not no_ccr,
+        ccr_handle_responses=not (no_ccr or no_ccr_response_handling),
         ccr_resolve_markers_inline=ccr_inline_resolve,
+        ccr_buffered_chat_streaming=ccr_buffered_chat_streaming,
         lossless=lossless,
         ccr_proactive_expansion=not no_ccr_proactive_expansion,
         # Flatten repeat-flag tuple AND any comma-separated values inside it.
@@ -1569,10 +1615,9 @@ def proxy(
         # Code-aware compression resolution:
         # 1. Explicit --code-aware / --no-code-aware always wins.
         # 2. Otherwise read HEADROOM_CODE_AWARE_ENABLED (truthy = on).
-        # 3. Otherwise default off — matches the prior cli/proxy.py behavior so
-        #    existing users see no change unless they opt in.
-        # Default ON (coding posture; consistent with the argparse server path).
-        # Degrades gracefully to a no-op when tree-sitter isn't installed.
+        # 3. Otherwise default ON (coding posture; consistent with the argparse
+        #    server path). Degrades gracefully to a no-op when tree-sitter
+        #    isn't installed.
         code_aware_enabled=(
             bool(code_aware_flag)
             if code_aware_flag is not None

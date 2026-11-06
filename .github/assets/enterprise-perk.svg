@@ -1,96 +1,25 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 880 240" width="880" height="240" role="img"
-     aria-label="Headroom Enterprise for teams: 3 months free with a 12-month plan. Adds tool search, model routing, attack removal and org-wide savings. Claim the perk.">
-  <title>Headroom Enterprise — 3 months free with a 12-month plan</title>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 880 200" width="880" height="200" role="img"
+     aria-label="Headroom for teams and enterprises. Want more savings? Headroom OSS shows what is possible; Enterprise saves more. More cost savings, tokens secured, on premise, deep attribution and many more features. Talk to us: hello@headroomlabs.ai.">
+  <title>Headroom for teams and enterprises — talk to us</title>
 
   <defs>
-    <!-- Brand palette as in hero.svg: Mint #00F0B5, Obsidian #070A0F,
-         Midnight #0C1118, Cyan #65D8FF, White, Slate #98A4B3.
-         Dark in both GitHub themes, matching the hero. -->
-    <pattern id="pgrid" width="44" height="44" patternUnits="userSpaceOnUse">
-      <path d="M44 0H0V44" fill="none" stroke="#00F0B5" stroke-opacity="0.05" stroke-width="1"/>
-    </pattern>
-
-    <radialGradient id="pglow" cx="12%" cy="0%" r="80%">
-      <stop offset="0%"   stop-color="#00F0B5" stop-opacity="0.16"/>
-      <stop offset="100%" stop-color="#00F0B5" stop-opacity="0"/>
-    </radialGradient>
-
-    <linearGradient id="pedge" x1="0" y1="0" x2="1" y2="0">
-      <stop offset="0%"   stop-color="#00F0B5" stop-opacity="0.65"/>
-      <stop offset="55%"  stop-color="#65D8FF" stop-opacity="0.35"/>
-      <stop offset="100%" stop-color="#65D8FF" stop-opacity="0.10"/>
-    </linearGradient>
-
-    <linearGradient id="pbtn" x1="0" y1="0" x2="1" y2="1">
-      <stop offset="0%"   stop-color="#00F0B5"/>
-      <stop offset="100%" stop-color="#0FD9AE"/>
-    </linearGradient>
-
-    <linearGradient id="pshine" gradientUnits="userSpaceOnUse" x1="0" y1="0" x2="70" y2="0">
-      <stop offset="0%"   stop-color="#FFFFFF" stop-opacity="0"/>
-      <stop offset="50%"  stop-color="#FFFFFF" stop-opacity="0.45"/>
-      <stop offset="100%" stop-color="#FFFFFF" stop-opacity="0"/>
-    </linearGradient>
-
-    <clipPath id="pbtnclip"><rect x="646" y="94" width="208" height="58" rx="29"/></clipPath>
-
+    <!-- Brand palette and type scale as in hero.svg: Mint #00F0B5, Obsidian #070A0F,
+         Slate #98A4B3, White; title 42/700, lead 14.5, eyebrow 10.5 tracked. -->
     <style>
       .s { font-family: "Segoe UI", Inter, -apple-system, BlinkMacSystemFont, Helvetica, Arial, sans-serif; }
-
-      /* One light pass over the button per cycle draws the eye to the action. */
-      .shine { animation: shine 5s ease-in-out infinite; }
-      @keyframes shine { 0%, 55% { transform: translateX(-80px) } 85%, 100% { transform: translateX(240px) } }
-
-      .dot { animation: beat 2.4s ease-in-out infinite; }
-      @keyframes beat { 0%, 100% { opacity: 1 } 50% { opacity: .3 } }
-
-      @media (prefers-reduced-motion: reduce) {
-        .shine, .dot { animation: none; }
-        .shine { opacity: 0; }
-      }
     </style>
   </defs>
 
-  <!-- Card. One font family, three sizes: 52 headline, 20 lead and button, 16 everything else. -->
-  <rect x="1" y="1" width="878" height="238" rx="18" fill="#070A0F"/>
-  <rect x="1" y="1" width="878" height="238" rx="18" fill="url(#pgrid)"/>
-  <rect x="1" y="1" width="878" height="238" rx="18" fill="url(#pglow)"/>
-  <rect x="1" y="1" width="878" height="238" rx="18" fill="none" stroke="url(#pedge)" stroke-width="1.5"/>
+  <rect x="1" y="1" width="878" height="198" rx="18" fill="#070A0F" stroke="#00F0B5" stroke-opacity="0.35" stroke-width="1.5"/>
 
   <g class="s">
-    <!-- Eyebrow -->
-    <circle class="dot" cx="46" cy="47" r="5" fill="#00F0B5"/>
-    <text x="60" y="53" font-size="16" font-weight="600" letter-spacing="1.5" fill="#00F0B5">HEADROOM ENTERPRISE · FOR TEAMS</text>
+    <text x="40" y="48" font-size="10.5" letter-spacing="1.6" fill="#00F0B5">HEADROOM FOR TEAMS &amp; ENTERPRISES</text>
+    <text x="40" y="96" font-size="42" font-weight="700" letter-spacing="-0.8" fill="#FFFFFF">Want more savings?</text>
+    <text x="40" y="128" font-size="14.5" fill="#98A4B3">Headroom OSS shows what is possible. Enterprise saves more, and adds:</text>
+    <text x="40" y="160" font-size="14.5" fill="#FFFFFF">More cost savings · Tokens secured · On premise · Deep attribution · and more</text>
 
-    <!-- Headline -->
-    <text x="40" y="116" font-size="52" font-weight="700" fill="#FFFFFF">3 months free</text>
-    <text x="40" y="152" font-size="20" fill="#98A4B3">with a 12-month plan · one perk per company</text>
-
-    <!-- What Enterprise adds -->
-    <g font-size="16" fill="#E6EDF3">
-      <rect x="40"  y="178" width="118" height="36" rx="18" fill="#0C1118" stroke="#00F0B5" stroke-opacity="0.30"/>
-      <text x="99"  y="202" text-anchor="middle">Tool search</text>
-
-      <rect x="168" y="178" width="134" height="36" rx="18" fill="#0C1118" stroke="#00F0B5" stroke-opacity="0.30"/>
-      <text x="235" y="202" text-anchor="middle">Model routing</text>
-
-      <rect x="312" y="178" width="140" height="36" rx="18" fill="#0C1118" stroke="#00F0B5" stroke-opacity="0.30"/>
-      <text x="382" y="202" text-anchor="middle">Attack removal</text>
-
-      <rect x="462" y="178" width="156" height="36" rx="18" fill="#0C1118" stroke="#65D8FF" stroke-opacity="0.30"/>
-      <text x="540" y="202" text-anchor="middle">Org-wide savings</text>
-    </g>
-
-    <!-- Divider -->
-    <line x1="634" y1="36" x2="634" y2="204" stroke="#98A4B3" stroke-opacity="0.18"/>
-
-    <!-- Call to action -->
-    <text x="750" y="72" font-size="16" text-anchor="middle" fill="#98A4B3">SSO · VPC or managed</text>
-    <g clip-path="url(#pbtnclip)">
-      <rect x="646" y="94" width="208" height="58" rx="29" fill="url(#pbtn)"/>
-      <rect class="shine" x="646" y="94" width="70" height="58" fill="url(#pshine)"/>
-    </g>
-    <text x="750" y="130" font-size="20" font-weight="700" text-anchor="middle" fill="#070A0F">Claim the perk  →</text>
-    <text x="750" y="190" font-size="16" text-anchor="middle" fill="#98A4B3">headroom-perks.vercel.app</text>
+    <rect x="676" y="72" width="164" height="44" rx="22" fill="#00F0B5"/>
+    <text x="758" y="99" font-size="14.5" font-weight="700" text-anchor="middle" fill="#070A0F">Talk to us →</text>
+    <text x="758" y="140" font-size="13" text-anchor="middle" fill="#98A4B3">hello@headroomlabs.ai</text>
   </g>
 </svg>

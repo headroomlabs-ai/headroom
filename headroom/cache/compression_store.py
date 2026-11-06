@@ -43,6 +43,7 @@ from contextvars import ContextVar
 from dataclasses import asdict, dataclass, field, replace
 from typing import TYPE_CHECKING, Any
 
+from ..exceptions import StorageError
 from ..log_safety import describe_exception, safe_id
 
 if TYPE_CHECKING:
@@ -70,6 +71,8 @@ _SECRET_KEY_VALUE_RE = re.compile(
 )
 _AUTH_VALUE_RE = re.compile(r"(?i)\b(Bearer|Basic)\s+[A-Za-z0-9._~+/=-]{12,}")
 _API_KEY_VALUE_RE = re.compile(r"\bsk-[A-Za-z0-9_-]{12,}\b")
+# Exactly one CCR marker and nothing else (see ``store`` and #2694, #4266).
+_BARE_CCR_MARKER_RE = re.compile(r"<<ccr:[^>\n]+>>")
 
 
 def _get_env_default_ttl_seconds() -> int:
@@ -279,6 +282,14 @@ class CompressionStore:
         self._heap_rebuild_threshold = 0.5
         external_revision = getattr(self._backend, "external_revision", None)
         self._backend_revision_reader = external_revision if callable(external_revision) else None
+        # A backend that expires entries itself and is shared by replicas
+        # (Redis) is bounded by TTL, not by this process's max_entries: counting
+        # it on every store would scan the shared keyspace, and evicting would
+        # remove other replicas' live entries.
+        self._backend_expires_entries = bool(getattr(self._backend, "expires_entries", False))
+        # A shared store's totals, as this process contributed them since it
+        # started: [original tokens stored, compressed tokens stored, retrievals].
+        self._own_totals = [0, 0, 0]
         self._backend_revision = self._read_backend_revision()
 
     @property
@@ -329,6 +340,11 @@ class CompressionStore:
 
         Returns:
             Hash key for retrieving this content.
+
+        Raises:
+            StorageError: The backend did not keep the entry (a shared store
+                refused the write or was unreachable). No hash is issued for
+                it: the caller must keep the original rather than emit a marker.
         """
         # Generate hash from original content. Default: SHA-256[:24] of the
         # original. When the caller provides `explicit_hash`, use it
@@ -369,7 +385,9 @@ class CompressionStore:
         # loudly rather than silently converting "retrievable" into "gone".
         # Narrow by design: only a *bare* marker is rejected. Legitimate
         # originals may legally CONTAIN markers (nested offloads, a tool that
-        # echoed one), and refusing those would drop recoverable data.
+        # echoed one), and refusing those would drop recoverable data. That
+        # includes an original that starts with one marker and ends with
+        # another (#4266), so the check is a full match of a single marker.
         #
         # The rejected value is never echoed into the log. It is provably a
         # bare marker here, but `original` is the store's credential-bearing
@@ -377,7 +395,7 @@ class CompressionStore:
         # OAuth token), and an error path is exactly where that sort of leak
         # survives review. `hash_key` already identifies the entry.
         stripped = original.strip()
-        if stripped.startswith("<<ccr:") and stripped.endswith(">>") and "\n" not in stripped:
+        if _BARE_CCR_MARKER_RE.fullmatch(stripped):
             logger.error(
                 "CCR store: refusing to persist a bare retrieval marker as "
                 "original_content (hash=%s tool=%s strategy=%s len=%d) — the "
@@ -424,7 +442,8 @@ class CompressionStore:
             # turn a marker is re-encountered, so duplicate stores are common.
             existing = self._backend.get(hash_key)
             if existing is None:
-                self._evict_if_needed()
+                if not self._backend_expires_entries:
+                    self._evict_if_needed()
             else:
                 # Hash already present. Different content means a true (extremely
                 # rare with SHA256[:24]) collision; same content is a duplicate
@@ -445,7 +464,18 @@ class CompressionStore:
                 # Mark old heap entry as stale since we're replacing it.
                 self._mark_heap_entries_stale()
 
-            self._backend.set(hash_key, entry)
+            if self._backend.set(hash_key, entry) is False:
+                # Only a backend that absorbs its errors (Redis) returns False;
+                # it has logged why. A hash here would be a marker that never
+                # resolves, and producers drop the original once they hold one.
+                raise StorageError(
+                    f"CCR store did not keep hash={hash_key}; keep the original content"
+                )
+            if self._backend_expires_entries:
+                if existing is None:
+                    self._own_totals[0] += entry.original_tokens
+                    self._own_totals[1] += entry.compressed_tokens
+                return hash_key  # no local index: Redis expires it
             # MEDIUM FIX #16: Add to eviction heap for O(log n) eviction
             heapq.heappush(self._eviction_heap, (entry.created_at, hash_key))
             heapq.heappush(
@@ -485,8 +515,13 @@ class CompressionStore:
 
             # Track access for feedback
             entry.record_access(query)
-            # Update the backend with the modified entry
-            self._backend.set(hash_key, entry)
+            # Update the backend with the modified entry. Not a shared store:
+            # writing the whole entry back per read races other replicas and
+            # resends the original; retrieval events below stay per process.
+            if self._backend_expires_entries:
+                self._own_totals[2] += 1
+            else:
+                self._backend.set(hash_key, entry)
 
             # Log retrieval event
             if self._enable_feedback:
@@ -654,6 +689,25 @@ class CompressionStore:
 
     def get_stats(self) -> dict[str, Any]:
         """Get store statistics for monitoring."""
+        if self._backend_expires_entries:
+            # Totals over the store would read every replica's entries (a GET
+            # each) under the lock retrievals take: a shared store reports the
+            # entry count across replicas, and the totals this replica added
+            # since it started ("totals_scope").
+            backend_stats = self._backend.get_stats()
+            with self._lock:
+                original, compressed, retrievals = self._own_totals
+            return {
+                "entry_count": backend_stats["entry_count"],
+                "max_entries": self._max_entries,
+                "default_ttl_seconds": self._default_ttl,
+                "total_original_tokens": original,
+                "total_compressed_tokens": compressed,
+                "total_retrievals": retrievals,
+                "totals_scope": "this_replica",
+                "event_count": len(self._retrieval_events),
+                "backend": backend_stats,
+            }
         with self._lock:
             # Clean expired entries
             self._clean_expired()
@@ -704,10 +758,15 @@ class CompressionStore:
 
             return ComponentStats(
                 name="compression_store",
-                entry_count=self._backend.count(),
+                entry_count=backend_stats.get("entry_count", 0)
+                if self._backend_expires_entries
+                else self._backend.count(),
                 size_bytes=bytes_used,
                 budget_bytes=None,  # No budget set yet
-                hits=sum(1 for _, e in self._backend.items() if e.retrieval_count > 0),
+                # A shared store would be read whole to count these.
+                hits=0
+                if self._backend_expires_entries
+                else sum(1 for _, e in self._backend.items() if e.retrieval_count > 0),
                 misses=0,  # CompressionStore doesn't track misses directly
                 evictions=0,  # Would need to track this separately
             )
@@ -868,6 +927,8 @@ class CompressionStore:
 
     def _mark_heap_entries_stale(self) -> None:
         """Record lazy tuples invalidated by deleting or replacing an entry."""
+        if self._backend_expires_entries:
+            return  # no index kept for a self-expiring backend
         self._stale_heap_entries += 1
         self._stale_expiration_heap_entries += 1
 
@@ -892,6 +953,8 @@ class CompressionStore:
 
     def _rebuild_heap_if_needed(self) -> None:
         """Rebuild both indexes when either stale ratio reaches the threshold."""
+        if self._backend_expires_entries:
+            return  # rebuilding would scan the shared store
         heap_size = len(self._eviction_heap)
         expiration_heap_size = len(self._expiration_heap)
         stale_ratio = self._stale_heap_entries / heap_size if heap_size else 0
@@ -1155,8 +1218,10 @@ def _create_default_ccr_backend() -> CompressionStoreBackend | None:
     Default (env unset or "sqlite"): SQLiteBackend at workspace_dir()/ccr_store.db
     — restart-safe and shared across worker processes, which the
     session-scale 30-minute TTL assumes.
-    "memory" opts back into the in-process dict. Other values load
-    adapters via setuptools entry point 'headroom.ccr_backend'.
+    "memory" opts back into the in-process dict. "redis" shares one store
+    across replicas (HEADROOM_REDIS_URL; headroom.cache.backends.redis) unless a
+    plugin registers that name. Other values load adapters via setuptools entry
+    point 'headroom.ccr_backend'.
     Returns None to use InMemoryBackend.
 
     Stateless mode (``--stateless`` / ``HEADROOM_STATELESS``) never opens the
@@ -1171,6 +1236,13 @@ def _create_default_ccr_backend() -> CompressionStoreBackend | None:
     from ..paths import persistence_allowed
 
     backend_type = (os.environ.get("HEADROOM_CCR_BACKEND") or "").strip().lower()
+    session_store = os.environ.get("HEADROOM_COMPRESS_SESSION_STORE", "").strip()
+    if not backend_type and session_store:
+        # Replicas sharing compress sessions share the CCR store too: a marker
+        # in a replayed transcript must resolve on whichever replica serves it.
+        from .backends.redis import RedisBackend
+
+        return RedisBackend(session_store)
     if backend_type == "memory":
         return None
     if not backend_type or backend_type == "sqlite":
@@ -1193,6 +1265,19 @@ def _create_default_ccr_backend() -> CompressionStoreBackend | None:
 
         all_eps = entry_points(group="headroom.ccr_backend")
         ep = next((e for e in all_eps if e.name == backend_type), None)
+        if ep is None and backend_type == "redis":
+            # Built in: one store for every replica behind a gateway. A plugin
+            # registered as "redis" still wins, above.
+            from .backends.redis import RedisBackend
+
+            url = os.environ.get("HEADROOM_REDIS_URL", "").strip() or session_store
+            if not url:
+                logger.error(
+                    "HEADROOM_CCR_BACKEND=redis needs HEADROOM_REDIS_URL; using the "
+                    "in-process store, so a marker resolves only on the replica that made it"
+                )
+                return None
+            return RedisBackend(url)
         if ep is None:
             logger.warning(
                 "HEADROOM_CCR_BACKEND=%s but no entry point headroom.ccr_backend[%s]",
