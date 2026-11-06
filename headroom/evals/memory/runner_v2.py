@@ -467,6 +467,9 @@ Categories to use:
         # Get just the save tool
         save_tool = next(t for t in MEMORY_TOOLS if t["function"]["name"] == "memory_save")
 
+        from headroom.offline import guard_egress
+
+        guard_egress(f"{self._config.save_model} API for the memory eval save phase")
         for session in conversation.sessions:
             # Format session as dialogue
             session_text = f"\n[Session Date: {session.datetime}]\n"
@@ -689,6 +692,9 @@ The answer should contain ONLY the specific information requested, nothing more.
         max_rounds = 3
         final_answer = "Information not found"
 
+        from headroom.offline import guard_egress
+
+        guard_egress(f"{self._config.answer_model} API for the memory eval answers")
         for round_num in range(max_rounds):
             try:
                 response = await asyncio.to_thread(
