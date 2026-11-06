@@ -1,11 +1,14 @@
 from __future__ import annotations
 
 import errno
+from types import SimpleNamespace
 
 import click
 import pytest
 
 import headroom.cli.wrap as wrap_cli
+import headroom.install.health as install_health
+import headroom.install.runtime as install_runtime
 
 
 @pytest.fixture(autouse=True)
@@ -17,6 +20,13 @@ def _no_attached_wrappers(monkeypatch: pytest.MonkeyPatch) -> None:
     flaky. Individual tests override this to simulate attached wrappers.
     """
     monkeypatch.setattr(wrap_cli, "_live_proxy_clients", lambda *a, **kw: [])
+    # These recovery tests control readiness through the health probe; process
+    # identity and launchd ownership have their own runtime-level coverage.
+    monkeypatch.setattr(
+        install_runtime,
+        "runtime_ready",
+        lambda manifest: install_health.probe_ready(manifest.health_url),
+    )
     for name in (
         "ANTHROPIC_TARGET_API_URL",
         "OPENAI_TARGET_API_URL",
@@ -35,9 +45,18 @@ class _Manifest:
     preset = "persistent-service"
     supervisor_kind = "service"
     health_url = "http://127.0.0.1:8787/readyz"
+    runtime_kind = "python"
 
 
-def test_ensure_proxy_recovers_matching_persistent_deployment(monkeypatch) -> None:
+@pytest.fixture(params=["darwin", "linux", "win32"])
+def runtime_platform(monkeypatch: pytest.MonkeyPatch, request) -> None:
+    # Replace only this module's sys reference, never the process-wide object.
+    monkeypatch.setattr(install_runtime, "sys", SimpleNamespace(platform=request.param))
+
+
+def test_ensure_proxy_recovers_matching_persistent_deployment(
+    monkeypatch, runtime_platform
+) -> None:
     calls: list[str] = []
 
     monkeypatch.setattr(wrap_cli, "_check_proxy", lambda port: False)
@@ -66,7 +85,9 @@ def test_ensure_proxy_recovers_matching_persistent_deployment(monkeypatch) -> No
     assert calls == ["start:default"]
 
 
-def test_ensure_proxy_recovers_persistent_deployment_when_socket_is_bound(monkeypatch) -> None:
+def test_ensure_proxy_recovers_persistent_deployment_when_socket_is_bound(
+    monkeypatch, runtime_platform
+) -> None:
     calls: list[str] = []
 
     monkeypatch.setattr(wrap_cli, "_check_proxy", lambda port: True)
@@ -303,14 +324,14 @@ def test_find_persistent_manifest_prefers_default_profile(monkeypatch) -> None:
     assert manifest.profile == "default"
 
 
-def test_recover_persistent_proxy_reuses_healthy_deployment(monkeypatch) -> None:
+def test_recover_persistent_proxy_reuses_healthy_deployment(monkeypatch, runtime_platform) -> None:
     monkeypatch.setattr(wrap_cli, "_find_persistent_manifest", lambda port: _Manifest())
     monkeypatch.setattr("headroom.install.health.probe_ready", lambda url: True)
 
     assert wrap_cli._recover_persistent_proxy(8787) is True
 
 
-def test_recover_persistent_proxy_warns_for_task_deployment(monkeypatch) -> None:
+def test_recover_persistent_proxy_warns_for_task_deployment(monkeypatch, runtime_platform) -> None:
     class TaskManifest(_Manifest):
         supervisor_kind = "task"
 
