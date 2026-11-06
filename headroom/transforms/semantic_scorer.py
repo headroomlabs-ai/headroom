@@ -8,14 +8,14 @@ embeddings — no additional heavy dependencies required.
 
 Example::
 
-    from headroom.transforms.semantic_scorer import score_semantic_preservation
+    from headroom.transforms.semantic_scorer import score_texts
 
-    score = score_semantic_preservation("original text here", "compressed text here")
+    score = score_texts("original text here", "compressed text here")
     # score: 0.85 (meaning well preserved)
 
     # Or with messages:
-    from headroom.transforms.semantic_scorer import score_messages_semantic_preservation
-    score = score_messages_semantic_preservation(original_messages, compressed_messages)
+    from headroom.transforms.semantic_scorer import score_messages
+    score = score_messages(original_messages, compressed_messages)
 """
 
 from __future__ import annotations
