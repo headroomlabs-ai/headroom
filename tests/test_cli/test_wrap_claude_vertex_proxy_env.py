@@ -235,7 +235,7 @@ def test_wrap_claude_sibling_note_accurate_under_1m_and_tool_search_optouts(
 ) -> None:
     # Issue #1779 accuracy under opt-ins: with --1m the note must not advise
     # adding --1m again, and with --tool-search false it must not claim
-    # deferral is kept on â€” nor may the #746 banner line say "kept on".
+    # deferral is kept on — nor may the #746 banner line say "kept on".
     _captured, output = _invoke_wrap_claude(
         runner,
         monkeypatch,
@@ -328,7 +328,7 @@ def test_wrap_claude_default_banner_is_compact(
     # and the long explanation / sibling note / env-var trailer are omitted.
     _captured, output = _invoke_wrap_claude(runner, monkeypatch, env={})
     assert (
-        "Remote Control (/rc) is disabled while routed through Headroom â€” run `claude` "
+        "Remote Control (/rc) is disabled while routed through Headroom — run `claude` "
         "directly (no wrap) for sessions that need it."
     ) in output
     assert "On-demand tool loading: kept on (this session)" in output
@@ -361,7 +361,7 @@ def test_proxy_status_line_keeps_own_signature_and_names_port_once() -> None:
     assert "learn" in inspect.signature(wrap_mod._ensure_proxy).parameters
 
     line = wrap_mod._proxy_status_line("Proxy ready", 8787)
-    assert line == "  Proxy ready â€” dashboard: http://127.0.0.1:8787/dashboard"
+    assert line == "  Proxy ready — dashboard: http://127.0.0.1:8787/dashboard"
     assert line.count("127.0.0.1:8787") == 1
 
 
@@ -396,7 +396,7 @@ def test_wrap_claude_vertex_passes_custom_base_url_to_proxy_before_child_redirec
     )
 
     # Issue #1779: Vertex sessions authenticate with cloud IAM and never had
-    # Remote Control â€” the RC gate warning must not fire in this mode.
+    # Remote Control — the RC gate warning must not fire in this mode.
     assert "Remote Control" not in output
 
     ensure_kwargs = captured["ensure_kwargs"]
@@ -473,7 +473,7 @@ def test_wrap_claude_foundry_proxy_env_uses_process_environment_only_by_default(
     )
 
     # Issue #1779: Foundry sessions authenticate with Azure credentials and
-    # never had Remote Control â€” the RC gate warning must not fire.
+    # never had Remote Control — the RC gate warning must not fire.
     assert "Remote Control" not in output
 
     ensure_kwargs = captured["ensure_kwargs"]
