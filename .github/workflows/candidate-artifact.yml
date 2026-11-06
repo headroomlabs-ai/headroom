@@ -24,7 +24,7 @@ jobs:
       source_sha: ${{ steps.source.outputs.source_sha }}
       version: ${{ steps.version.outputs.version }}
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
           persist-credentials: false
@@ -72,7 +72,7 @@ jobs:
         shell: bash
         run: tar -czf "$RUNNER_TEMP/candidate-producer.tar.gz" .
 
-      - uses: actions/upload-artifact@v7
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: candidate-producer-source
           path: ${{ runner.temp }}/candidate-producer.tar.gz
@@ -97,7 +97,7 @@ jobs:
       VERSION: ${{ needs.validate-source.outputs.version }}
     steps:
       - name: Download trusted producer tooling
-        uses: actions/download-artifact@v8
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: candidate-producer-source
           path: ${{ runner.temp }}/candidate-producer
@@ -107,7 +107,7 @@ jobs:
         run: tar -xzf "$RUNNER_TEMP/candidate-producer/candidate-producer.tar.gz"
 
       - name: Download exact candidate source for rollout identity
-        uses: actions/download-artifact@v8
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: release-source
           path: ${{ runner.temp }}/release-source
@@ -118,10 +118,10 @@ jobs:
           mkdir candidate-source
           tar -xzf "$RUNNER_TEMP/release-source/release-source.tar.gz" -C candidate-source
 
-      - uses: astral-sh/setup-uv@v7
+      - uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78 # v7 (resolved current same-major tag)
 
       - name: Download exact built distributions
-        uses: actions/download-artifact@v8
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: dist
           path: dist/
@@ -180,7 +180,7 @@ jobs:
             --run-attempt "$GITHUB_RUN_ATTEMPT"
 
       - name: Upload immutable candidate and provenance
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: candidate-${{ env.SOURCE_SHA }}
           path: |
@@ -200,7 +200,7 @@ jobs:
       VERSION: ${{ needs.validate-source.outputs.version }}
     steps:
       - name: Download trusted producer tooling
-        uses: actions/download-artifact@v8
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: candidate-producer-source
           path: ${{ runner.temp }}/candidate-producer
@@ -209,10 +209,10 @@ jobs:
         shell: bash
         run: tar -xzf "$RUNNER_TEMP/candidate-producer/candidate-producer.tar.gz"
 
-      - uses: astral-sh/setup-uv@v7
+      - uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78 # v7 (resolved current same-major tag)
 
       - name: Download retained candidate
-        uses: actions/download-artifact@v8
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: candidate-${{ env.SOURCE_SHA }}
           path: candidate/
