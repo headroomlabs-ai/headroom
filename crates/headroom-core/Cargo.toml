@@ -127,7 +127,7 @@ blake3 = "1"
 # a system libsqlite3 — matters for Lambda / container builds where the
 # host image may lag behind. WAL is enabled at connection-open time (see
 # `ccr/backends/sqlite.rs`).
-rusqlite = { version = "0.40", features = ["bundled"], optional = true }
+rusqlite = { version = "0.41", features = ["bundled"], optional = true }
 # `redis` for the optional multi-worker CCR backend. Cfg-gated behind
 # the `redis` feature so deploys that don't need it pay no compile
 # cost. Default features include the sync `Connection` API used in

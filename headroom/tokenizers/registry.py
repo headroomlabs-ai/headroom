@@ -11,6 +11,7 @@ import re
 from collections.abc import Callable
 from typing import TYPE_CHECKING
 
+from ..utils import remember_bounded
 from .base import TokenCounter
 from .estimator import EstimatingTokenCounter
 
@@ -144,8 +145,13 @@ class TokenizerRegistry:
     # Registered model factories (model -> factory function)
     _model_factories: dict[str, Callable[[str], TokenCounter]] = {}
 
-    # Cache for auto-detected tokenizers
+    # Cache for auto-detected tokenizers, least-recently-used first. ``model``
+    # is the ``model`` field of a proxied request body, so the entry count is
+    # capped (#4479): each entry owns its own TokenCountCache, and a client
+    # sending a new name per request must not grow this without limit. Real
+    # traffic uses a handful of models, far below the cap.
     _cache: dict[str, TokenCounter] = {}
+    _CACHE_MAXSIZE = 64
 
     def __new__(cls) -> TokenizerRegistry:
         """Singleton pattern."""
@@ -198,8 +204,10 @@ class TokenizerRegistry:
 
         # Check cache
         cache_key = f"{model_lower}:{backend or 'auto'}"
-        if cache_key in registry._cache:
-            return registry._cache[cache_key]
+        cached = registry._cache.get(cache_key)
+        if cached is not None:
+            remember_bounded(registry._cache, cache_key, cached, cls._CACHE_MAXSIZE)
+            return cached
 
         uses_model_factory = backend is None and model_lower in registry._model_factories
 
@@ -209,7 +217,7 @@ class TokenizerRegistry:
                 tokenizer = registry._model_factories[model_lower](model)
             else:
                 tokenizer = registry._create_tokenizer(model, backend)
-            registry._cache[cache_key] = tokenizer
+            remember_bounded(registry._cache, cache_key, tokenizer, cls._CACHE_MAXSIZE)
             return tokenizer
         except Exception as e:
             if fallback:
@@ -218,7 +226,7 @@ class TokenizerRegistry:
                 )
                 tokenizer = EstimatingTokenCounter()
                 if not uses_model_factory:
-                    registry._cache[cache_key] = tokenizer
+                    remember_bounded(registry._cache, cache_key, tokenizer, cls._CACHE_MAXSIZE)
                 return tokenizer
             raise ValueError(f"No tokenizer available for {model}: {e}") from e
 
