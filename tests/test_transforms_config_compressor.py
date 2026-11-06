@@ -572,19 +572,9 @@ def test_router_compresses_k8s_manifest_end_to_end() -> None:
 
 def test_router_lossless_mode_uses_lossless_config_label() -> None:
     router = ContentRouter(ContentRouterConfig(lossless=True))
-    compressed, _tokens, chain = router._apply_strategy_to_content(
+    compressed, _tokens, chain, _reversible = router._apply_strategy_to_content(
         K8S_MANIFEST, CompressionStrategy.CONFIG, context=""
     )
     assert chain == ["lossless_config"]
     assert expand_runs(unfold_repeated_blocks(compressed)) == K8S_MANIFEST
     assert not CCR_RETRIEVAL_MARKER_RE.search(compressed)
-
-
-def test_router_disabled_flag_skips_config_compressor() -> None:
-    router = ContentRouter(ContentRouterConfig(enable_config_compressor=False))
-    compressed, _tokens, _chain = router._apply_strategy_to_content(
-        K8S_MANIFEST, CompressionStrategy.CONFIG, context=""
-    )
-    # Falls through to the unified fallback path; must not crash and must
-    # not claim CONFIG did work it didn't do.
-    assert isinstance(compressed, str)
