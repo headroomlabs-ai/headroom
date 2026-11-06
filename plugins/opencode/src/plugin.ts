@@ -70,22 +70,45 @@ function headroomShellEnv(
   };
 }
 
-// The endpoint an OpenCode 2.x package calls under its baseURL, for packages
-// on the OpenAI chat-completions or responses wire format; undefined otherwise.
-// `.../messages` (Anthropic wire) and other protocols are left alone.
-function openAiWireSuffix(pkg: string | undefined): string | undefined {
+// The endpoint an OpenCode 2.x package calls under its baseURL, for packages on
+// a wire format the proxy can route; undefined otherwise. GitHub Copilot's
+// Claude models use the Anthropic Messages wire (`/messages`), so they must be
+// rewritten like the OpenAI wires: skipping them let those requests bypass the
+// proxy entirely (#4248).
+function modelWireSuffix(pkg: string | undefined): string | undefined {
   if (!pkg?.startsWith("@opencode/ai/providers/")) return undefined;
   if (pkg === "@opencode/ai/providers/openai-compatible" || pkg.endsWith("/chat")) {
     return "/chat/completions";
   }
   if (pkg.endsWith("-responses") || pkg.endsWith("/responses")) return "/responses";
+  if (
+    pkg === "@opencode/ai/providers/anthropic"
+    || pkg === "@opencode/ai/providers/anthropic-compatible"
+    || pkg.endsWith("/messages")
+  ) {
+    return "/messages";
+  }
   return undefined;
+}
+
+// The proxy's Anthropic route rebuilds the upstream path from its incoming
+// `/v1/messages` and ignores `x-headroom-original-path`, so a rewritten model
+// reaches the right endpoint only when its base URL has no path prefix beyond
+// `/v1`. A prefixed gateway (for example `https://api.z.ai/api/coding/paas/v4`)
+// would lose that prefix, so those models stay on their own base URL.
+function anthropicBaseKeepsPath(baseURL: string): boolean {
+  try {
+    const pathname = trimTrailingSlashes(new URL(baseURL).pathname);
+    return pathname === "" || pathname === "/v1";
+  } catch {
+    return false;
+  }
 }
 
 // OpenCode 2.x sends model traffic through Effect's FetchHttpClient, which
 // captures `globalThis.fetch` on the process's first HTTP request, before any
 // plugin runs, so the transport's fetch patch never sees it. Point each
-// remote OpenAI-wire model at the proxy instead, with the same routing headers
+// remote model on a routable wire format at the proxy instead, with the same
 // the transport sends: the upstream origin, and the real path the proxy
 // appends to it.
 type ModelEditor = Parameters<Parameters<PluginV2.Context["model"]["transform"]>[0]>[0];
@@ -102,10 +125,11 @@ function routeModelsThroughProxy(
     const providerID = String(model.providerID);
     const modelID = String(model.id);
     const provider = models.provider.get(providerID)?.provider;
-    const suffix = openAiWireSuffix(model.package ?? provider?.package);
+    const suffix = modelWireSuffix(model.package ?? provider?.package);
     const baseURL = model.settings?.baseURL ?? provider?.settings?.baseURL;
     if (!suffix || typeof baseURL !== "string") continue;
     if (!modelBaseRoutesThroughProxy(baseURL, proxyUrl, excludeHosts)) continue;
+    if (suffix === "/messages" && !anthropicBaseKeepsPath(baseURL)) continue;
     const upstream = new URL(baseURL);
     models.update(providerID, modelID, (draft) => {
       draft.settings = { ...draft.settings, baseURL: `${proxyUrl}/v1` };
