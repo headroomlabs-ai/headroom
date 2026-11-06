@@ -248,7 +248,7 @@ def test_proxy_throughput_in_stats_endpoint(monkeypatch: pytest.MonkeyPatch) -> 
     monkeypatch.setattr(
         _analyzer_mod,
         "parse_log_files",
-        lambda last_n_hours=1.0: _analyzer_mod.PerfReport(),
+        lambda last_n_hours=1.0, **_kwargs: _analyzer_mod.PerfReport(),
     )
     monkeypatch.setattr(
         _analyzer_mod,
@@ -277,3 +277,126 @@ def test_proxy_throughput_in_stats_endpoint(monkeypatch: pytest.MonkeyPatch) -> 
     payload = response.json()
     assert "throughput" in payload
     assert payload["throughput"] == {"input_wall_clock": 99.0}
+
+
+def test_stats_throughput_timeout_does_not_block_the_endpoint(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A slow log scan must not hold /stats open.
+
+    ``parse_log_files`` is stubbed to sleep well past
+    ``STATS_THROUGHPUT_TIMEOUT_SECONDS``. /stats must still answer, with
+    ``throughput`` falling back to the cached value (None on a cold cache).
+    Removing the ``asyncio.wait_for`` wrapper makes this hang for the full
+    stub sleep instead.
+    """
+    pytest.importorskip("fastapi")
+    import time as _time
+
+    from fastapi.testclient import TestClient
+
+    import headroom.perf.analyzer as _analyzer_mod
+    from headroom.proxy.server import ProxyConfig, create_app
+
+    def _slow_parse(last_n_hours=1.0, **_kwargs):
+        _time.sleep(5.0)
+        return _analyzer_mod.PerfReport()
+
+    monkeypatch.setattr(_analyzer_mod, "parse_log_files", _slow_parse)
+    monkeypatch.setattr(
+        _analyzer_mod,
+        "build_perf_summary",
+        lambda report: {"throughput": {"input_wall_clock": 1.0}},
+    )
+
+    app = create_app(
+        ProxyConfig(
+            optimize=False,
+            cache_enabled=False,
+            rate_limit_enabled=False,
+            cost_tracking_enabled=False,
+            log_requests=False,
+            ccr_inject_tool=False,
+            ccr_handle_responses=False,
+            ccr_context_tracking=False,
+        )
+    )
+
+    with TestClient(app) as client:
+        started = _time.monotonic()
+        response = client.get("/stats")
+        elapsed = _time.monotonic() - started
+
+    assert response.status_code == 200
+    assert response.json()["throughput"] is None
+    # Generous bound: the stub sleeps 5s, the guard trips at 1s. (Measured
+    # around the request only -- loop teardown still joins the abandoned
+    # worker thread, which Python cannot cancel.)
+    assert elapsed < 4.0, elapsed
+
+
+def test_stats_throughput_timeout_reuses_the_in_flight_scan(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A timed-out scan is re-awaited, not restarted.
+
+    The cache gate fires whenever the cached value is null, so a scan that
+    times out before ever producing a value would otherwise be launched again
+    by every later /stats call — piling up executor threads that cannot be
+    cancelled. Three requests against one slow scan must start exactly one.
+    """
+    pytest.importorskip("fastapi")
+    import threading
+    import time as _time
+
+    from fastapi.testclient import TestClient
+
+    import headroom.perf.analyzer as _analyzer_mod
+    from headroom.proxy.server import ProxyConfig, create_app
+
+    started = []
+    gate = threading.Event()
+
+    def _slow_parse(last_n_hours=1.0, **_kwargs):
+        started.append(1)
+        gate.wait(timeout=10.0)
+        return _analyzer_mod.PerfReport()
+
+    monkeypatch.setattr(_analyzer_mod, "parse_log_files", _slow_parse)
+    monkeypatch.setattr(
+        _analyzer_mod,
+        "build_perf_summary",
+        lambda report: {"throughput": {"input_wall_clock": 7.0}},
+    )
+
+    app = create_app(
+        ProxyConfig(
+            optimize=False,
+            cache_enabled=False,
+            rate_limit_enabled=False,
+            cost_tracking_enabled=False,
+            log_requests=False,
+            ccr_inject_tool=False,
+            ccr_handle_responses=False,
+            ccr_context_tracking=False,
+        )
+    )
+
+    try:
+        with TestClient(app) as client:
+            for _ in range(3):
+                response = client.get("/stats")
+                assert response.status_code == 200
+                assert response.json()["throughput"] is None
+            assert len(started) == 1, started
+            # Releasing the scan lets the next request serve its result.
+            gate.set()
+            deadline = _time.monotonic() + 10.0
+            while _time.monotonic() < deadline:
+                payload = client.get("/stats").json()["throughput"]
+                if payload is not None:
+                    break
+            assert payload == {"input_wall_clock": 7.0}
+            assert len(started) == 1, started
+    finally:
+        gate.set()
