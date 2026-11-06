@@ -312,3 +312,31 @@ async def test_openai_late_failures_use_the_openai_error_shape() -> None:
     payload = json.loads(rec.body.split(b"data: ")[-1].strip())
     assert payload["error"]["type"] == "rate_limit_error"
     assert payload["error"]["message"] == "too many"
+
+
+@pytest.mark.asyncio
+async def test_openai_late_failure_carries_a_responses_type_discriminator() -> None:
+    """A Responses stream event is addressed by a top-level ``type``.
+
+    The OpenAI Responses API tags every stream event with one, and a client
+    that parses the stream as Responses events rejects a frame without it.
+    Zed does exactly that: its Responses stream parser is a
+    ``#[serde(tag = "type")]`` enum, so a frame without the discriminator
+    fails to deserialize and the client reports "missing field `type`"
+    instead of the upstream error -- taking the whole agent turn with it.
+
+    Anthropic's envelope is different (it has no such discriminator), which
+    is why the Anthropic twin of this format never needed one.
+    """
+
+    async def produce():
+        await asyncio.sleep(0.3)
+        return _FakeResult(429, b'{"error":{"message":"too many"}}', {})
+
+    rec = await _drive(produce=produce, grace=0.05, fmt=OPENAI_ERROR_FORMAT)
+
+    assert b"event: error\n" in rec.body, "the error frame must name its event"
+    payload = json.loads(rec.body.split(b"data: ")[-1].strip())
+    assert payload["type"] == "error"
+    assert payload["error"]["type"] == "rate_limit_error"
+    assert payload["error"]["message"] == "too many"
