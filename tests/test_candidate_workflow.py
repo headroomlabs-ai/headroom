@@ -136,14 +136,14 @@ def test_candidate_binds_payload_inventory_and_verifies_downloaded_bytes() -> No
     assert "candidate_manifest.py create" in emit
     assert "--runtime-payload candidate-runtime-payload.json" in emit
     assert "retention-days: 90" in emit
-    assert "actions/download-artifact@v8" in verify
+    assert "actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333" in verify
     assert "candidate_manifest.py verify" in verify
     assert "candidate/headroom-candidate-${SOURCE_SHA}.tar" in verify
 
 
 def test_reusable_build_checks_out_the_requested_exact_sha() -> None:
     content = BUILD.read_text(encoding="utf-8")
-    checkout_count = content.count("uses: actions/checkout@v7")
+    checkout_count = content.count("uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1")
     exact_ref_count = content.count("ref: ${{ inputs.source_sha || github.sha }}")
     assert checkout_count == exact_ref_count
 
@@ -154,17 +154,17 @@ def test_historical_source_executes_without_repository_token_authority() -> None
     for name in ("detect-version", "build", "build-wheels", "smoke-import-wheels"):
         job = build["jobs"][name]
         assert job["permissions"] == {}, name
-        assert all(step.get("uses") != "actions/checkout@v7" for step in job["steps"]), name
+        assert all(step.get("uses") != "actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1" for step in job["steps"]), name
         if name != "smoke-import-wheels":
             assert any(
-                step.get("uses") == "actions/download-artifact@v8"
+                step.get("uses") == "actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333"
                 and step["with"].get("name") == "release-source"
                 for step in job["steps"]
             ), name
     for name in ("emit-candidate", "verify-downloaded-candidate"):
         job = candidate["jobs"][name]
         assert job["permissions"] == {}, name
-        assert all(step.get("uses") != "actions/checkout@v7" for step in job["steps"]), name
+        assert all(step.get("uses") != "actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1" for step in job["steps"]), name
     # The only authenticated source checkout does not execute source scripts
     # and removes its token before retaining the snapshot.
     prepare = build["jobs"]["prepare-source"]
