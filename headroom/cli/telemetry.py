@@ -85,7 +85,7 @@ def telemetry(show: bool, as_json: bool) -> None:
         headroom telemetry           Current state and the two switches
         headroom telemetry --show    The exact payload, field by field
     """
-    from headroom.telemetry.beacon import is_beacon_enabled, is_telemetry_enabled
+    from headroom.telemetry.beacon import beacon_off_reason, is_telemetry_enabled
     from headroom.telemetry.session import (
         DEFAULT_ENDPOINT,
         SCHEMA_VERSION,
@@ -94,7 +94,8 @@ def telemetry(show: bool, as_json: bool) -> None:
         resource_attributes,
     )
 
-    beacon_on = is_beacon_enabled()
+    beacon_off_by = beacon_off_reason()
+    beacon_on = beacon_off_by is None
     local_on = is_telemetry_enabled()
     known_id = read_install_id()
     # Reported because it changes what goes on the wire, and because while the
@@ -134,7 +135,7 @@ def telemetry(show: bool, as_json: bool) -> None:
         )
         return
 
-    click.echo(f"Upload beacon:   {'ON (opt-out)' if beacon_on else 'OFF'}")
+    click.echo(f"Upload beacon:   {'ON (opt-out)' if beacon_on else f'OFF ({beacon_off_by})'}")
     click.echo(f"Local stats:     {'ON' if local_on else 'OFF (opt-in)'}")
     click.echo(f"Endpoint:        {DEFAULT_ENDPOINT}")
     click.echo(
@@ -143,5 +144,8 @@ def telemetry(show: bool, as_json: bool) -> None:
     )
     click.echo(f"Install ID:      {known_id or '(none yet — created on first upload)'}")
     click.echo()
-    click.echo("Turn the beacon off:   HEADROOM_BEACON=off   (or DO_NOT_TRACK=1)")
+    if beacon_on:
+        click.echo(
+            "Turn the beacon off:   HEADROOM_BEACON=off   (or HEADROOM_TELEMETRY=off, DO_NOT_TRACK=1)"
+        )
     click.echo("See the exact payload: headroom telemetry --show")

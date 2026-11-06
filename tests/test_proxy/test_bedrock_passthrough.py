@@ -352,6 +352,30 @@ def test_oversized_body_returns_413_and_never_forwards(monkeypatch):
     http.send.assert_not_called()
 
 
+def test_client_disconnect_during_body_read_returns_204(monkeypatch):
+    """A client that hangs up mid-body must not crash the handler: the
+    ClientDisconnect branch returns an empty 204 and never forwards.
+    """
+    from starlette.requests import ClientDisconnect
+
+    import headroom.proxy.helpers as helpers_mod
+
+    async def _disconnect(request):
+        raise ClientDisconnect()
+
+    monkeypatch.setattr(helpers_mod, "read_request_json_with_bytes", _disconnect)
+
+    app = create_app(_make_config())
+    with TestClient(app) as client:
+        proxy = client.app.state.proxy
+        http = _install_fake_client(proxy, _FakeUpstream())
+        resp = client.post(INVOKE, json={"messages": [], "max_tokens": 8})
+
+    assert resp.status_code == 204
+    http.build_request.assert_not_called()
+    http.send.assert_not_called()
+
+
 @pytest.mark.parametrize(
     "route", [INVOKE, INVOKE_STREAM], ids=["invoke", "invoke-with-response-stream"]
 )

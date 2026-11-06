@@ -218,6 +218,21 @@ def _compress_marker_free_text(
     )
 
 
+def check_unit_protection(unit: CompressionUnit) -> str | None:
+    """Return the early refusal reason if a unit is protected, else None."""
+    if not unit.mutable:
+        return "immutable"
+    if unit.role == "user" and unit.metadata.get("compress_user") != "true":
+        return "protected_user_message"
+    if unit.role in {"system", "developer"}:
+        return "protected_system_message"
+    if unit.role == "assistant" and unit.metadata.get("compress_assistant") != "true":
+        return "protected_assistant_message"
+    if unit.cache_zone != "live":
+        return f"cache_zone_{unit.cache_zone}"
+    return None
+
+
 def compress_unit_with_router(
     unit: CompressionUnit,
     *,
@@ -263,16 +278,9 @@ def compress_unit_with_router(
             kw["reason_category"] = _categorize_reason(reason_val)
         return replace(base, **kw)  # type: ignore[arg-type]
 
-    if not unit.mutable:
-        return _with_reason(reason="immutable")
-    if unit.role == "user" and unit.metadata.get("compress_user") != "true":
-        return _with_reason(reason="protected_user_message")
-    if unit.role in {"system", "developer"}:
-        return _with_reason(reason="protected_system_message")
-    if unit.role == "assistant" and unit.metadata.get("compress_assistant") != "true":
-        return _with_reason(reason="protected_assistant_message")
-    if unit.cache_zone != "live":
-        return _with_reason(reason=f"cache_zone_{unit.cache_zone}")
+    protection_reason = check_unit_protection(unit)
+    if protection_reason is not None:
+        return _with_reason(reason=protection_reason)
     if text_bytes < unit.min_bytes:
         return _with_reason(reason="below_unit_floor")
     if deadline_started_at is not None and not router.share_request_deadline(deadline_started_at):

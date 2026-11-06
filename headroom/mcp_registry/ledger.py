@@ -14,7 +14,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from headroom import paths
+from headroom import fsutil, paths
 
 from .base import ServerSpec
 
@@ -129,6 +129,10 @@ def _read_ledger(path: Path, *, for_mutation: bool = False) -> dict[str, Any]:
         if for_mutation:
             raise LedgerMutationError(f"MCP install ledger is unreadable: {path}") from exc
         return {}
+    except UnicodeDecodeError as exc:
+        if for_mutation:
+            raise LedgerMutationError(f"MCP install ledger is not valid UTF-8: {path}") from exc
+        return {}
     try:
         data = json.loads(raw)
     except json.JSONDecodeError as exc:
@@ -137,7 +141,7 @@ def _read_ledger(path: Path, *, for_mutation: bool = False) -> dict[str, Any]:
         return {}
     if not isinstance(data, dict):
         if for_mutation:
-            raise LedgerMutationError("MCP install ledger must contain a JSON object")
+            raise LedgerMutationError(f"MCP install ledger must contain a JSON object: {path}")
         return {}
     if for_mutation:
         for section in ("agents",):
@@ -168,4 +172,4 @@ def _read_ledger(path: Path, *, for_mutation: bool = False) -> dict[str, Any]:
 
 def _write_ledger(path: Path, data: dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(data, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    fsutil.write_text(path, json.dumps(data, indent=2, sort_keys=True) + "\n")

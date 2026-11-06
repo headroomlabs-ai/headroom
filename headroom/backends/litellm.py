@@ -21,6 +21,7 @@ from collections.abc import AsyncIterator
 from dataclasses import dataclass, field
 from typing import Any
 
+from headroom.offline import pin_litellm_cost_map_local
 from headroom.proxy.public_errors import client_message
 from headroom.utils import format_exception_message
 
@@ -46,6 +47,7 @@ _OPENAI_STANDARD_PARAMS = (
     # reasoning request routed cross-protocol to a Claude model fails.
     "reasoning_effort",
     "max_completion_tokens",
+    "service_tier",
 )
 
 _OPENAI_CONSUMED_BODY_KEYS = frozenset(
@@ -67,6 +69,7 @@ try:
     import os as _os
 
     _env_snapshot = set(_os.environ)
+    pin_litellm_cost_map_local()
     import litellm
     from litellm import acompletion
     from litellm.utils import supports_prompt_caching
@@ -536,6 +539,7 @@ def _caller_key_travels_to(model: str, key: str) -> bool:
     if not key.startswith("sk-ant-"):
         return True
     try:
+        pin_litellm_cost_map_local()
         from litellm import get_llm_provider
 
         provider = (get_llm_provider(model)[1] or "").lower()
@@ -649,6 +653,8 @@ def _anthropic_usage_from_litellm(litellm_usage: Any) -> dict[str, Any]:
 def _convert_anthropic_tool(tool: dict[str, Any]) -> dict[str, Any]:
     """Convert Anthropic tool format to OpenAI function format.
 
+    Shared with the any-llm backend, so both OpenAI-compatible backends send the same shape.
+
     Anthropic: {"name": "...", "description": "...", "input_schema": {...}}
     OpenAI:    {"type": "function", "function": {"name": "...", "description": "...", "parameters": {...}}}
     """
@@ -661,7 +667,7 @@ def _convert_anthropic_tool(tool: dict[str, Any]) -> dict[str, Any]:
 
 
 def _convert_tool_choice(choice: Any) -> Any:
-    """Convert Anthropic tool_choice to OpenAI format.
+    """Convert Anthropic tool_choice to OpenAI format (shared with the any-llm backend).
 
     Anthropic: {"type": "auto"}, {"type": "any"}, {"type": "none"}, {"type": "tool", "name": "..."}
     OpenAI:    "auto", "required", "none", {"type": "function", "function": {"name": "..."}}
@@ -1032,7 +1038,10 @@ class LiteLLMBackend(Backend):
                     block_type = block.get("type", "")
                     if block_type == "text":
                         text_parts.append(block.get("text", ""))
-                        parts.append({"type": "text", "text": block.get("text", "")})
+                        text_part: dict[str, Any] = {"type": "text", "text": block.get("text", "")}
+                        if "cache_control" in block:
+                            text_part["cache_control"] = block["cache_control"]
+                        parts.append(text_part)
                     elif block_type == "image":
                         image_part = _anthropic_image_to_openai(block)
                         if image_part:
@@ -1126,6 +1135,11 @@ class LiteLLMBackend(Backend):
                 # assistant-turn image, which this code has always dropped.
                 if has_image and role == "user":
                     simple_msg["content"] = parts
+                elif any("cache_control" in p for p in parts):
+                    # A joined string can't carry the breakpoint: litellm's Bedrock
+                    # Converse transform only emits a cachePoint for a marked content
+                    # part, as with the tool_result and system paths.
+                    simple_msg["content"] = [p for p in parts if p["type"] == "text"]
                 if preserve_thinking and thinking_blocks and role == "assistant":
                     simple_msg["thinking_blocks"] = thinking_blocks
                 converted.append(simple_msg)
@@ -1289,6 +1303,9 @@ class LiteLLMBackend(Backend):
                 kwargs["tools"] = [_convert_anthropic_tool(t) for t in tools_in]
             if "tool_choice" in body:
                 kwargs["tool_choice"] = _convert_tool_choice(body["tool_choice"])
+            # Standard provider param — forward it instead of silently dropping.
+            if "service_tier" in body:
+                kwargs["service_tier"] = body["service_tier"]
 
             # System prompt (Anthropic puts it in body, OpenAI in messages)
             if "system" in body:
@@ -1391,6 +1408,8 @@ class LiteLLMBackend(Backend):
                 "stream": True,
             }
 
+            if "service_tier" in body:
+                kwargs["service_tier"] = body["service_tier"]
             if "max_tokens" in body:
                 kwargs["max_tokens"] = body["max_tokens"]
             if "temperature" in body:

@@ -598,7 +598,7 @@ def show_memory(
         # If not found with exact ID, try partial match
         if mem is None:
             # Query all and filter by prefix
-            all_memories = asyncio.run(store.query(MemoryFilter(limit=1000)))
+            all_memories = asyncio.run(store.query(MemoryFilter()))
             matches = [m for m in all_memories if m.id.startswith(memory_id)]
 
             if len(matches) == 0:

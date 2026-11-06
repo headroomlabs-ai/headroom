@@ -489,6 +489,7 @@ class TestStreamingToolCallObjects:
         assert tool_call_blocks[0].flags.get("function_name") == "dummy_tool"
         assert "dummy_tool" in tool_call_blocks[0].text
 
+    @pytest.mark.filterwarnings("ignore:find_tool_units is deprecated:DeprecationWarning")
     def test_find_tool_units_with_sdk_tool_call(self):
         """The second `.get()` site: find_tool_units must still pair an
         SDK-object tool_call with its tool response message."""
@@ -675,6 +676,7 @@ class TestRereadDetection:
 # --- TestFindToolUnits ---
 
 
+@pytest.mark.filterwarnings("ignore:find_tool_units is deprecated:DeprecationWarning")
 class TestFindToolUnits:
     """Tests for find_tool_units function."""
 
@@ -864,6 +866,7 @@ class TestFindToolUnits:
 # --- TestGetMessageContentText ---
 
 
+@pytest.mark.filterwarnings("ignore:get_message_content_text is deprecated:DeprecationWarning")
 class TestGetMessageContentText:
     """Tests for get_message_content_text function."""
 
@@ -929,6 +932,16 @@ class TestGetMessageContentText:
         msg = {"role": "user", "content": []}
         text = get_message_content_text(msg)
         assert text == ""
+
+
+def test_find_tool_units_is_deprecated() -> None:
+    with pytest.warns(DeprecationWarning, match="find_tool_units is deprecated"):
+        assert find_tool_units([]) == []
+
+
+def test_get_message_content_text_is_deprecated() -> None:
+    with pytest.warns(DeprecationWarning, match="get_message_content_text is deprecated"):
+        assert get_message_content_text({"content": "hi"}) == "hi"
 
 
 # --- Additional fixtures for complex tests ---

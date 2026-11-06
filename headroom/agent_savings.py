@@ -5,7 +5,7 @@ from __future__ import annotations
 import logging
 import os
 from collections.abc import MutableMapping
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 from typing import Protocol
 
 logger = logging.getLogger(__name__)
@@ -173,7 +173,7 @@ _PROFILES: dict[str, AgentSavingsProfile] = {
         # Coding posture: defer non-core tool schemas, dedupe re-reads, extend
         # lossy coverage when lossless found nothing, and NEVER lossy-compress a
         # file read (the agent patches exact bytes). CCR stays ON (unset) so any
-        # lossy loss is recoverable. Effort router off; low block floor so modest
+        # lossy loss is recoverable. Low block floor so modest
         # deltas are eligible.
         tool_search=True,
         cross_turn_dedup=True,
@@ -408,18 +408,3 @@ def seed_proxy_env_defaults(
     # already in the env and otherwise falls back to DEFAULT_PROFILE (coding).
     apply_agent_savings_env_defaults(target)
     return frozenset(key for key in target if key not in before)
-
-
-def with_target_savings(
-    profile: AgentSavingsProfile,
-    target_savings: float,
-) -> AgentSavingsProfile:
-    """Return a copy of ``profile`` adjusted to a specific savings target."""
-
-    if not 0 < target_savings < 1:
-        raise ValueError("target_savings must be between 0 and 1")
-    return replace(
-        profile,
-        target_savings=target_savings,
-        target_ratio=round(1 - target_savings, 4),
-    )

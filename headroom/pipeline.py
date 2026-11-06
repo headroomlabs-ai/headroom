@@ -77,6 +77,15 @@ class OutcomeSnapshot:
     cache_write_tokens: int = 0
     turn_index: int = 0
     transforms_applied: tuple[str, ...] = ()
+    #: Input tokens Headroom removed from THIS request's payload (the wire
+    #: figure PERF logs as ``tok_saved``), message compression only.
+    tokens_saved: int = 0
+    #: The share of ``tokens_saved`` new to this conversation, which is what
+    #: running totals book (PERF ``tok_novel``). The proxy funnel always sets
+    #: both; they differ only on ``/v1/responses``, where the whole transcript
+    #: is re-sent and recompressed every turn, and ``tokens_saved -
+    #: novel_tokens_saved`` is the re-sent history removed again.
+    novel_tokens_saved: int = 0
 
     @property
     def truncated(self) -> bool:

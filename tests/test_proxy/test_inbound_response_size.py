@@ -114,3 +114,22 @@ def test_streaming_response_no_content_length(capture_logs):
     m = re.search(r"response_content_length=(\S*)", line)
     assert m, f"expected response_content_length field in: {line}"
     assert m.group(1) in ("", '""'), f"expected empty for streaming, got: {m.group(1)}"
+
+
+def test_health_probes_log_at_debug_and_traffic_at_info(capture_logs):
+    """A desktop polls /readyz every few seconds: at INFO it filled half the log."""
+    app = create_app(_make_config())
+    with TestClient(app) as client:
+        client.app.state.proxy.handle_anthropic_messages = _json_handler
+        client.get("/readyz")
+        client.get("/livez")
+        client.post("/v1/messages", json={"model": "glm-5.2", "messages": []})
+
+    levels = {}
+    for r in capture_logs:
+        m = re.search(r"event=proxy_inbound_(?:request|response) .*?path=(\S+)", r.getMessage())
+        if m:
+            levels.setdefault(m.group(1), set()).add(r.levelno)
+    assert levels["/readyz"] == {logging.DEBUG}
+    assert levels["/livez"] == {logging.DEBUG}
+    assert levels["/v1/messages"] == {logging.INFO}

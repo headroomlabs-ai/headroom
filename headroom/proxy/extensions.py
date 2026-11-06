@@ -103,6 +103,8 @@ import sys
 from collections.abc import Callable, Iterable, Iterator
 from typing import Any
 
+from headroom.log_safety import describe_exception
+
 log = logging.getLogger(__name__)
 
 ENTRY_POINT_GROUP = "headroom.proxy_extension"
@@ -123,7 +125,11 @@ def discover() -> Iterator[tuple[str, ProxyExtension]]:
     try:
         entries = importlib.metadata.entry_points(group=ENTRY_POINT_GROUP)
     except Exception as exc:  # noqa: BLE001 — importlib.metadata can raise varied types
-        log.debug("proxy extensions: entry-point enumeration failed: %s", exc)
+        log.warning(
+            "proxy extensions: entry-point enumeration failed (%s), so no proxy "
+            "extensions will be installed",
+            describe_exception(exc),
+        )
         return
     for entry in entries:
         try:

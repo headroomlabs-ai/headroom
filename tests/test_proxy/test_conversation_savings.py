@@ -322,6 +322,36 @@ def test_explicit_ids_and_caller_vouched_sessions() -> None:
     )
 
 
+def _codex_body(text: str, thread_id: str, *, session_id: str = "root-thread") -> dict[str, Any]:
+    """Codex's shape: both ids flat in ``client_metadata``, the session id
+    being the root thread's id on every request of the session."""
+    return _responses_body(text, client_metadata={"session_id": session_id, "thread_id": thread_id})
+
+
+def test_a_thread_id_wins_over_the_session_beside_it() -> None:
+    root = savings_conversation_key(_codex_body("fix it", "root-thread"))
+    guardian = savings_conversation_key(_codex_body("review this", "guardian-thread"))
+    subagent = savings_conversation_key(_codex_body("explore", "subagent-thread"))
+    assert None not in (root, guardian, subagent)
+    assert len({root, guardian, subagent}) == 3
+    top = _responses_body("x", session_id="s-1", thread_id="t-1")
+    assert savings_conversation_key(top) == savings_conversation_key(
+        _responses_body("y", thread_id="t-1")
+    )
+
+
+def test_a_side_thread_in_the_session_does_not_re_book_the_root() -> None:
+    """Root turns at running totals 1000 then 1200, with the guardian's
+    request (total 0) in between. Keyed on the shared session the guardian
+    reset the total and the root booked 1000 + 0 + 1200; keyed per thread
+    the root books 1000 + 200."""
+    ledger = ConversationSavings()
+    root = savings_conversation_key(_codex_body("fix it", "root-thread"))
+    guardian = savings_conversation_key(_codex_body("review this", "guardian-thread"))
+    booked = [ledger.novel(root, 1000), ledger.novel(guardian, 0), ledger.novel(root, 1200)]
+    assert booked == [1000, 0, 200]
+
+
 def test_server_side_state_means_incremental_input() -> None:
     """With ``previous_response_id`` or a ``conversation`` the provider holds
     the history and each payload is a fresh increment: its ``tokens_saved``
@@ -337,3 +367,29 @@ def test_server_side_state_means_incremental_input() -> None:
         savings_conversation_key(_responses_body("more", conversation={"id": "conv_abc"})) is None
     )
     assert savings_conversation_key({"model": "gpt-6-astra", "messages": []}) is None
+
+
+@pytest.mark.asyncio
+async def test_pipeline_extensions_read_both_figures_from_the_snapshot() -> None:
+    """An extension sees the wire figure and the novel share the totals book,
+    so it never has to parse PERF lines to tell re-sent history from new."""
+    from headroom.pipeline import PipelineExtensionManager, PipelineStage
+
+    seen: list[Any] = []
+
+    class _Recorder:
+        def on_pipeline_event(self, event: Any) -> None:
+            if event.stage is PipelineStage.OUTCOME_OBSERVED:
+                seen.append(event.outcome)
+
+    handler = _Handler()
+    handler.pipeline_extensions = PipelineExtensionManager(extensions=[_Recorder()], discover=False)
+    await emit_request_outcome(
+        handler, _responses_outcome(tokens_saved=62_806, conversation_tokens_saved=62_806)
+    )
+    await emit_request_outcome(handler, _responses_outcome())
+
+    assert [(s.tokens_saved, s.novel_tokens_saved) for s in seen] == [
+        (62_806, 62_806),
+        (76_020, 13_214),
+    ]

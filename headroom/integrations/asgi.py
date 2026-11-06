@@ -28,17 +28,19 @@ from __future__ import annotations
 
 import json
 import logging
-import os
 from collections.abc import MutableMapping
 from typing import Any
 
 from starlette.types import ASGIApp, Receive, Scope, Send
 
-from headroom.offline import guard_egress
+# _DEFAULT_CLOUD_URL and guard_egress stay importable from this module.
+from headroom.integrations._compress_backend import (  # noqa: F401
+    _DEFAULT_CLOUD_URL,
+    CompressBackend,
+)
+from headroom.offline import guard_egress  # noqa: F401
 
 logger = logging.getLogger(__name__)
-
-_DEFAULT_CLOUD_URL = "https://api.headroomlabs.ai"
 
 # Paths that contain LLM messages to compress
 _LLM_PATHS = (
@@ -49,7 +51,7 @@ _LLM_PATHS = (
 )
 
 
-class CompressionMiddleware:
+class CompressionMiddleware(CompressBackend):
     """ASGI middleware that compresses LLM request messages.
 
     Two modes:
@@ -64,6 +66,8 @@ class CompressionMiddleware:
     - x-headroom-compressed: "true" if compression occurred
     """
 
+    _log = logger
+
     def __init__(
         self,
         app: ASGIApp,
@@ -75,20 +79,7 @@ class CompressionMiddleware:
     ) -> None:
         self.app = app
         self._min_tokens = min_tokens
-        self._model_limit = model_limit
-        self._hooks = hooks
-
-        # Cloud mode: if api_key is set, compress via Headroom Cloud API
-        self._api_key = api_key or os.environ.get("HEADROOM_API_KEY", "").strip() or None
-        self._api_url = (
-            api_url or os.environ.get("HEADROOM_API_URL", "").strip() or _DEFAULT_CLOUD_URL
-        ).rstrip("/")
-        self._client: Any = None  # Lazy-initialized httpx.AsyncClient
-
-    @property
-    def cloud_mode(self) -> bool:
-        """Whether cloud compression is enabled."""
-        return self._api_key is not None
+        self._init_compress_backend(model_limit, hooks, api_key, api_url)
 
     async def aclose(self) -> None:
         """Close the underlying httpx.AsyncClient, if one was created."""
@@ -186,67 +177,3 @@ class CompressionMiddleware:
             await send(message)
 
         await self.app(scope, modified_receive, metrics_send)
-
-    def _local_compress(self, messages: list[dict], model: str) -> dict[str, Any] | None:
-        """Compress locally using headroom.compress()."""
-        from headroom.compress import compress
-
-        result = compress(
-            messages=messages,
-            model=model or "claude-sonnet-4-5-20250929",
-            model_limit=self._model_limit,
-            hooks=self._hooks,
-        )
-        return {
-            "messages": result.messages,
-            "tokens_before": result.tokens_before,
-            "tokens_after": result.tokens_after,
-            "tokens_saved": result.tokens_saved,
-            "compression_ratio": result.compression_ratio,
-        }
-
-    async def _cloud_compress(self, messages: list[dict], model: str) -> dict[str, Any] | None:
-        """Compress via Headroom Cloud API (managed CCR, TOIN, analytics).
-
-        This is the one path in this file that puts the caller's prompt
-        content on the wire to a Headroom-operated host, so it is exactly what
-        HEADROOM_OFFLINE exists to stop. "Opt-in by configuration" was the old
-        reason for leaving it open, and it is not good enough: an operator who
-        sets an air-gap switch is overriding earlier configuration on purpose.
-        The refusal is loud rather than a silent fall-through to local
-        compression, because silently compressing locally would hide the fact
-        that the deployment is no longer doing what it was configured to do.
-        """
-        guard_egress("Headroom Cloud compression", self._api_url)
-        if self._client is None:
-            try:
-                import httpx
-            except ImportError as e:
-                raise ImportError(
-                    "httpx is required for Headroom Cloud mode: pip install httpx"
-                ) from e
-            self._client = httpx.AsyncClient(timeout=30.0)
-
-        client = self._client
-        assert client is not None
-        resp = await client.post(
-            f"{self._api_url}/v1/saas/compress",
-            headers={
-                "X-Headroom-Key": self._api_key,
-                "Content-Type": "application/json",
-            },
-            content=json.dumps(
-                {
-                    "messages": messages,
-                    "model": model or "claude-sonnet-4-5-20250929",
-                    "model_limit": self._model_limit,
-                }
-            ),
-        )
-
-        if resp.status_code != 200:
-            logger.warning("Headroom Cloud API error: %d %s", resp.status_code, resp.text[:200])
-            return None
-
-        result: dict[str, Any] = resp.json()
-        return result

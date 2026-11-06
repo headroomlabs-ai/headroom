@@ -661,6 +661,54 @@ def test_ensure_codex_provider_preserves_profile_overrides(monkeypatch, tmp_path
     assert parsed["profiles"]["work"]["openai_base_url"] == "https://azure.example/v1"
 
 
+def test_ensure_codex_provider_preserves_multiline_inline_profile_overrides(
+    monkeypatch, tmp_path: Path
+) -> None:
+    """A profile in a multi-line inline table (TOML 1.1) keeps its provider."""
+    from headroom.providers.codex.config_toml import loads_codex_config
+
+    init_cli, _ = _load_init_module(monkeypatch)
+    path = tmp_path / "config.toml"
+    path.write_text(
+        'model_provider = "openai"\n'
+        "profiles = {\n"
+        "  work = {\n"
+        '    model_provider = "company",\n'
+        '    openai_base_url = "https://company.example/v1",\n'
+        "  },\n"
+        "}\n",
+        encoding="utf-8",
+    )
+
+    init_cli._ensure_codex_provider(path, 8787)
+
+    parsed = loads_codex_config(path.read_text(encoding="utf-8"))
+    assert parsed["model_provider"] == "headroom"
+    assert parsed["profiles"]["work"] == {
+        "model_provider": "company",
+        "openai_base_url": "https://company.example/v1",
+    }
+
+
+@pytest.mark.parametrize("sep", [" ", "\x85"])
+def test_ensure_codex_provider_keeps_single_line_string_with_unicode_separator(
+    monkeypatch, tmp_path: Path, sep: str
+) -> None:
+    """Provider-looking text after U+2028/U+0085 in a string stays in the value."""
+    from headroom.providers.codex.config_toml import loads_codex_config
+
+    init_cli, _ = _load_init_module(monkeypatch)
+    path = tmp_path / "config.toml"
+    notes = f'hello{sep}model_provider = "company"{sep}world'
+    path.write_text(f"notes = '{notes}'\n\n[features]\nhooks = true\n", encoding="utf-8")
+
+    init_cli._ensure_codex_provider(path, 8787)
+
+    parsed = loads_codex_config(path.read_text(encoding="utf-8"))
+    assert parsed["notes"] == notes
+    assert parsed["model_provider"] == "headroom"
+
+
 def test_ensure_codex_provider_emits_requires_openai_auth_for_chatgpt(
     monkeypatch, tmp_path: Path
 ) -> None:
@@ -705,6 +753,23 @@ def test_ensure_codex_feature_flag_replaces_existing_marker(monkeypatch, tmp_pat
     assert content.count(init_cli._CODEX_FEATURE_MARKER_START) == 1
     assert "hooks = true" in content
     assert "codex_hooks" not in content
+
+
+@pytest.mark.parametrize("sep", [" ", "\x85"])
+def test_ensure_codex_feature_flag_keeps_single_line_string_with_unicode_separator(
+    monkeypatch, tmp_path: Path, sep: str
+) -> None:
+    from headroom.providers.codex.config_toml import loads_codex_config
+
+    init_cli, _ = _load_init_module(monkeypatch)
+    path = tmp_path / "config.toml"
+    notes = f"hello{sep}codex_hooks = true{sep}world"
+    path.write_text(f"[features]\nnotes = '{notes}'\n", encoding="utf-8")
+
+    init_cli._ensure_codex_feature_flag(path)
+
+    parsed = loads_codex_config(path.read_text(encoding="utf-8"))
+    assert parsed["features"] == {"notes": notes, "hooks": True}
 
 
 @pytest.mark.parametrize("custom_home", [False, True])
@@ -1259,7 +1324,8 @@ def test_ensure_profile_running_covers_runtime_modes(monkeypatch) -> None:
 
     monkeypatch.setattr(init_cli, "acquire_runtime_start_lock", fake_start_lock)
 
-    def fake_wait_ready(manifest, timeout_seconds: int) -> bool:
+    def fake_wait_ready(manifest, timeout_seconds: int, require_identity: bool) -> bool:
+        assert require_identity is True
         wait_calls.append((manifest.profile, timeout_seconds))
         return False
 
@@ -1297,7 +1363,9 @@ def test_ensure_profile_running_suppresses_hook_recovery_output(monkeypatch, cap
     )
 
     monkeypatch.setattr(init_cli, "load_manifest", lambda profile: manifest)
-    monkeypatch.setattr(init_cli, "wait_ready", lambda manifest, timeout_seconds: False)
+    monkeypatch.setattr(
+        init_cli, "wait_ready", lambda manifest, timeout_seconds, require_identity: False
+    )
 
     def noisy_start_supervisor(manifest) -> None:
         print("python stdout")
@@ -1324,7 +1392,9 @@ def test_ensure_profile_running_returns_when_ready_or_on_exception(monkeypatch) 
     )
     detached_calls: list[str] = []
     monkeypatch.setattr(init_cli, "load_manifest", lambda profile: manifest)
-    monkeypatch.setattr(init_cli, "wait_ready", lambda manifest, timeout_seconds: True)
+    monkeypatch.setattr(
+        init_cli, "wait_ready", lambda manifest, timeout_seconds, require_identity: True
+    )
     monkeypatch.setattr(
         init_cli,
         "start_detached_agent",
@@ -1340,7 +1410,9 @@ def test_ensure_profile_running_returns_when_ready_or_on_exception(monkeypatch) 
 
     monkeypatch.setattr(init_cli, "acquire_runtime_start_lock", fake_start_lock)
     monkeypatch.setattr(init_cli, "runtime_status", lambda manifest: "stopped")
-    monkeypatch.setattr(init_cli, "wait_ready", lambda manifest, timeout_seconds: False)
+    monkeypatch.setattr(
+        init_cli, "wait_ready", lambda manifest, timeout_seconds, require_identity: False
+    )
     monkeypatch.setattr(
         init_cli,
         "start_detached_agent",
@@ -1363,7 +1435,9 @@ def test_ensure_profile_running_skips_spawn_when_start_lock_is_held(monkeypatch)
         yield False
 
     monkeypatch.setattr(init_cli, "load_manifest", lambda profile: manifest)
-    monkeypatch.setattr(init_cli, "wait_ready", lambda manifest, timeout_seconds: False)
+    monkeypatch.setattr(
+        init_cli, "wait_ready", lambda manifest, timeout_seconds, require_identity: False
+    )
     monkeypatch.setattr(init_cli, "acquire_runtime_start_lock", fake_start_lock)
     monkeypatch.setattr(
         init_cli,
@@ -1391,7 +1465,8 @@ def test_ensure_profile_running_does_not_spawn_again_during_slow_startup(monkeyp
     def fake_start_lock(profile: str):
         yield True
 
-    def fake_wait_ready(manifest, timeout_seconds: int) -> bool:
+    def fake_wait_ready(manifest, timeout_seconds: int, require_identity: bool) -> bool:
+        assert require_identity is True
         wait_calls.append(timeout_seconds)
         return bool(detached_calls and timeout_seconds == init_cli._STARTUP_READY_TIMEOUT_SECONDS)
 
@@ -1711,3 +1786,137 @@ def test_local_profile_distinguishes_identical_non_ascii_names(monkeypatch, tmp_
     second.mkdir(parents=True)
 
     assert init_cli._local_profile(first) != init_cli._local_profile(second)
+
+
+def test_write_json_keeps_the_existing_file_when_the_write_fails(monkeypatch, tmp_path) -> None:
+    """``init`` rewrites user-owned files such as ~/.claude/settings.json.
+
+    A plain ``write_text`` truncates first, so a failure mid-write (ENOSPC,
+    SIGKILL) left a half-written file; the write must be atomic.
+    """
+    init_cli, _ = _load_init_module(monkeypatch)
+    settings = tmp_path / ".claude" / "settings.json"
+    settings.parent.mkdir(parents=True)
+    settings.write_text('{"theme": "dark"}\n', encoding="utf-8")
+
+    def fail_fsync(_fd: int) -> None:
+        raise OSError(28, "No space left on device")
+
+    monkeypatch.setattr("headroom.fsutil.os.fsync", fail_fsync)
+
+    with pytest.raises(OSError, match="No space left"):
+        init_cli._write_json(settings, {"theme": "dark", "env": {"A": "1"}})
+
+    assert settings.read_text(encoding="utf-8") == '{"theme": "dark"}\n'
+    assert [p.name for p in settings.parent.iterdir()] == ["settings.json"]
+
+
+def test_ensure_profile_running_never_retries_wait_ready_without_identity(monkeypatch) -> None:
+    """A TypeError from wait_ready must surface, not trigger an unchecked retry.
+
+    A removed fallback caught TypeError and re-called wait_ready without
+    require_identity=True, silently dropping the runtime identity check.
+    """
+    init_cli, _ = _load_init_module(monkeypatch)
+    manifest = SimpleNamespace(
+        preset=init_cli.InstallPreset.PERSISTENT_TASK.value,
+        supervisor_kind=init_cli.SupervisorKind.NONE.value,
+        profile="task-profile",
+    )
+    calls: list[dict[str, object]] = []
+
+    def strict_wait_ready(manifest, **kwargs) -> bool:
+        calls.append(kwargs)
+        if "require_identity" in kwargs:
+            raise TypeError("boom")
+        return False
+
+    @contextmanager
+    def held_lock(profile: str):
+        yield False
+
+    monkeypatch.setattr(init_cli, "load_manifest", lambda profile: manifest)
+    monkeypatch.setattr(init_cli, "wait_ready", strict_wait_ready)
+    monkeypatch.setattr(init_cli, "acquire_runtime_start_lock", held_lock)
+
+    with pytest.raises(TypeError, match="boom"):
+        init_cli._ensure_profile_running("task-profile")
+
+    assert calls == [{"timeout_seconds": 1, "require_identity": True}]
+
+
+def test_ensure_profile_running_logs_a_failed_recovery(monkeypatch, caplog) -> None:
+    init_cli, _ = _load_init_module(monkeypatch)
+    manifest = SimpleNamespace(
+        preset=init_cli.InstallPreset.PERSISTENT_TASK.value,
+        supervisor_kind=init_cli.SupervisorKind.SERVICE.value,
+        profile="service-profile",
+    )
+
+    @contextmanager
+    def fake_start_lock(profile: str):
+        yield True
+
+    monkeypatch.setattr(init_cli, "load_manifest", lambda profile: manifest)
+    monkeypatch.setattr(init_cli, "acquire_runtime_start_lock", fake_start_lock)
+    monkeypatch.setattr(init_cli, "runtime_status", lambda manifest: "stopped")
+    monkeypatch.setattr(init_cli, "runtime_ownership", lambda manifest: "service")
+    monkeypatch.setattr(
+        init_cli,
+        "wait_ready",
+        lambda manifest, timeout_seconds, require_identity: timeout_seconds == 45,
+    )
+    monkeypatch.setattr(init_cli, "start_supervisor", lambda manifest: None)
+
+    with caplog.at_level("WARNING", logger="headroom.cli.init"):
+        init_cli._ensure_profile_running("service-profile")
+    assert not [r for r in caplog.records if r.name == "headroom.cli.init"]
+
+    monkeypatch.setattr(
+        init_cli,
+        "start_supervisor",
+        lambda manifest: (_ for _ in ()).throw(RuntimeError("launchctl bootstrap failed")),
+    )
+    with caplog.at_level("WARNING", logger="headroom.cli.init"):
+        init_cli._ensure_profile_running("service-profile")
+
+    messages = [r.getMessage() for r in caplog.records if r.name == "headroom.cli.init"]
+    assert messages == [
+        "headroom: could not start persistent proxy 'service-profile': launchctl bootstrap "
+        "failed. Check it with `headroom install status --profile service-profile`."
+    ]
+
+
+def test_ensure_profile_running_logs_a_recovery_that_never_becomes_ready(
+    monkeypatch, caplog
+) -> None:
+    init_cli, _ = _load_init_module(monkeypatch)
+    manifest = SimpleNamespace(
+        preset=init_cli.InstallPreset.PERSISTENT_TASK.value,
+        supervisor_kind=init_cli.SupervisorKind.NONE.value,
+        profile="task-profile",
+    )
+    started: list[str] = []
+
+    @contextmanager
+    def fake_start_lock(profile: str):
+        yield True
+
+    monkeypatch.setattr(init_cli, "load_manifest", lambda profile: manifest)
+    monkeypatch.setattr(init_cli, "acquire_runtime_start_lock", fake_start_lock)
+    monkeypatch.setattr(init_cli, "runtime_status", lambda manifest: "stopped")
+    monkeypatch.setattr(init_cli, "runtime_ownership", lambda manifest: "task")
+    monkeypatch.setattr(
+        init_cli, "wait_ready", lambda manifest, timeout_seconds, require_identity: False
+    )
+    monkeypatch.setattr(init_cli, "start_detached_agent", started.append)
+
+    with caplog.at_level("WARNING", logger="headroom.cli.init"):
+        init_cli._ensure_profile_running("task-profile")
+
+    assert started == ["task-profile"]
+    messages = [r.getMessage() for r in caplog.records if r.name == "headroom.cli.init"]
+    assert messages == [
+        "headroom: could not start persistent proxy 'task-profile': it did not become ready "
+        "within 45s. Check it with `headroom install status --profile task-profile`."
+    ]

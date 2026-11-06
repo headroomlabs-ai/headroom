@@ -154,3 +154,30 @@ def test_a_live_thread_is_never_duplicated(monkeypatch):
     finally:
         gate.set()
         _drain()
+
+
+def test_warm_up_waits_for_a_live_loader_it_replaces(monkeypatch):
+    """A startup prefetch still downloading stays covered, even if the warm-up fails."""
+    started = _spawned(monkeypatch, fails=False)
+    prefetch_done = threading.Event()
+    prefetch = threading.Thread(target=prefetch_done.wait, args=(10,), daemon=True)
+    with kc._download_threads_lock:
+        prefetch.start()
+        kc._download_threads["some/model"] = prefetch
+
+    # A warm-up that returns without caching the model stands in for a failed one.
+    warmed = threading.Event()
+    warm_up = kc.start_kompress_warmup_thread("some/model", warmed.set)
+    try:
+        kc.ensure_background_download("some/model")
+        assert not warmed.wait(0.2), "warm-up ran while the prefetch was still live"
+        assert started == [], "a request started a download beside the live prefetch"
+    finally:
+        prefetch_done.set()
+        warm_up.join(timeout=10)
+    assert warmed.is_set()
+
+    # Both are done and the model is still not cached: a request may load it now.
+    kc.ensure_background_download("some/model")
+    _drain()
+    assert started == ["some/model"]

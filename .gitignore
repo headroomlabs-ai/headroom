@@ -18,8 +18,10 @@ scripts/*
 !scripts/changelog-gen.py
 !scripts/verify-versions.py
 !scripts/verify-ruff-version.py
+!scripts/normalize_release_pr_bodies.py
 !scripts/pr-governance.py
 !scripts/bootstrap-windows-dev.ps1
+!scripts/codeql_triage.sh
 !scripts/build_npm_release_assets.mjs
 !scripts/build_python_release_smoke.py
 !scripts/release_smoke_all.py
@@ -41,6 +43,7 @@ scripts/*
 !scripts/refresh_tool_hashes.py
 !scripts/record_kompress_fixtures.py
 !scripts/record_code_compressor_fixtures.py
+!scripts/qualify_cargo_dependencies.py
 
 # Rust / Cargo build artifacts
 /target/

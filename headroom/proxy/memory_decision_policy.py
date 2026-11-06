@@ -42,9 +42,6 @@ def decide_memory_injection(
     elif mode_name == "disabled":
         reason = "mode_disabled"
         inject = False
-    elif mode_name == "tool":
-        reason = "mode_tool"
-        inject = False
     else:
         reason = None
         inject = True

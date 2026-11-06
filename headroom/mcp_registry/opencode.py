@@ -9,37 +9,51 @@ from __future__ import annotations
 
 import json
 import logging
-import re
 import shutil
 from pathlib import Path
 from typing import Any
 
+from headroom import fsutil
 from headroom.install.paths import opencode_config_path
 
-from .base import MCPRegistrar, RegisterResult, RegisterStatus, ServerSpec
+from .base import (
+    MCPRegistrar,
+    RegisterResult,
+    RegisterStatus,
+    ServerSpec,
+    _diff_specs,
+    _specs_equivalent,
+)
 
 logger = logging.getLogger(__name__)
 
 
-def _strip_json_line_comments(text: str) -> str:
-    """Strip ``//`` line comments from JSONC text.
-
-    Tries standard JSON first (via the caller) so URLs containing ``//`` are
-    never mangled; this is only invoked as a fallback once plain
-    ``json.loads`` has already failed. Two-pass: (1) remove comment-only
-    lines, (2) strip inline trailing comments that follow a comma.
-    """
-    cleaned = re.sub(r"^\s*//[^\n]*\n", "", text, flags=re.MULTILINE)
-    return re.sub(r",\s*//[^\n]*", ",", cleaned)
-
-
 def _parse_json_loose(raw: str) -> dict[str, Any] | None:
-    """Parse JSON or JSONC text, returning ``None`` if it can't be parsed as an object."""
+    """Parse JSON or JSONC text, returning ``None`` if it can't be parsed as an object.
+
+    Standard JSON is tried first so URLs containing ``//`` are never touched.
+    The JSONC fallback reuses the OpenCode provider's string-aware stripping
+    of ``//`` and ``/* */`` comments and trailing commas, so this accepts the
+    same files ``headroom wrap``/``install`` already edit.
+    """
     try:
         data = json.loads(raw)
     except json.JSONDecodeError:
+        # Imported here: headroom.providers.opencode imports this package.
+        from headroom.providers.opencode.config import (
+            _strip_jsonc_comments,
+            _strip_jsonc_trailing_commas,
+        )
+
+        # The stripper treats an unterminated ``/*`` as running to EOF. That is
+        # malformed input, and accepting what precedes it would let the write
+        # path drop the rest of the file. A ``*/`` appended after a newline
+        # survives stripping unless it closes such a comment.
+        if not _strip_jsonc_comments(raw + "\n*/").endswith("*/"):
+            return None
+        cleaned = _strip_jsonc_trailing_commas(_strip_jsonc_comments(raw))
         try:
-            data = json.loads(_strip_json_line_comments(raw))
+            data = json.loads(cleaned)
         except json.JSONDecodeError:
             return None
     return data if isinstance(data, dict) else None
@@ -57,7 +71,7 @@ def _read_json(path: Path) -> dict[str, Any]:
         return {}
     try:
         raw = path.read_text(encoding="utf-8")
-    except OSError:
+    except (OSError, UnicodeDecodeError):
         return {}
     return _parse_json_loose(raw) or {}
 
@@ -74,8 +88,8 @@ def _read_json_for_write(path: Path) -> dict[str, Any]:
     """Read a JSON/JSONC object for a subsequent full-file rewrite.
 
     Returns ``{}`` only when the file is absent or empty (safe to start fresh).
-    ``//`` line comments are stripped before parsing, matching the loose JSONC
-    handling used by the OpenCode provider-block writer — note the rewritten
+    JSONC comments and trailing commas are stripped before parsing, matching
+    the loose JSONC handling used by the OpenCode provider-block writer — note the rewritten
     file loses any comments it had. If the file exists with content but still
     does not parse as a JSON object, raise :class:`_MalformedConfigError` so
     the caller aborts instead of overwriting unrelated user config — the
@@ -84,7 +98,10 @@ def _read_json_for_write(path: Path) -> dict[str, Any]:
     """
     if not path.exists():
         return {}
-    raw = path.read_text(encoding="utf-8")  # OSError propagates to the caller
+    try:
+        raw = path.read_text(encoding="utf-8")  # OSError propagates to the caller
+    except UnicodeDecodeError as exc:
+        raise _MalformedConfigError(f"not valid UTF-8: {exc}") from exc
     if not raw.strip():
         return {}
     data = _parse_json_loose(raw)
@@ -95,9 +112,7 @@ def _read_json_for_write(path: Path) -> dict[str, Any]:
 
 def _write_json(path: Path, data: dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump(data, f, indent=2)
-        f.write("\n")
+    fsutil.write_text(path, json.dumps(data, indent=2) + "\n")
 
 
 def _entry_to_spec(name: str, entry: dict[str, Any]) -> ServerSpec:
@@ -124,28 +139,6 @@ def _spec_to_entry(spec: ServerSpec) -> dict[str, Any]:
     if spec.env:
         entry["environment"] = dict(spec.env)
     return entry
-
-
-def _specs_equivalent(a: ServerSpec, b: ServerSpec) -> bool:
-    return (
-        a.name == b.name
-        and a.command == b.command
-        and tuple(a.args) == tuple(b.args)
-        and dict(a.env) == dict(b.env)
-    )
-
-
-def _diff_specs(existing: ServerSpec, requested: ServerSpec) -> str:
-    parts: list[str] = []
-    if existing.command != requested.command:
-        parts.append(f"command {existing.command!r} -> {requested.command!r}")
-    if tuple(existing.args) != tuple(requested.args):
-        parts.append(f"args {list(existing.args)} -> {list(requested.args)}")
-    if dict(existing.env) != dict(requested.env):
-        parts.append(f"env {dict(existing.env)} -> {dict(requested.env)}")
-    if not parts:
-        return "spec differs in unidentified field(s)"
-    return "; ".join(parts)
 
 
 class OpencodeRegistrar(MCPRegistrar):

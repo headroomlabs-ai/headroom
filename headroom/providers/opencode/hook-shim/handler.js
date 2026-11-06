@@ -50,6 +50,19 @@ function withShimEnv(env, proxyUrl2, excludeHosts) {
   }
   return nextEnv;
 }
+var PROCESS_ENV_KEYS = [PROXY_ENV, EXCLUDE_HOSTS_ENV, "NODE_OPTIONS"];
+function snapshotProcessEnv() {
+  return Object.fromEntries(PROCESS_ENV_KEYS.map((key) => [key, process.env[key]]));
+}
+function restoreProcessEnv(saved) {
+  for (const key of PROCESS_ENV_KEYS) {
+    if (saved[key] === void 0) {
+      delete process.env[key];
+    } else {
+      process.env[key] = saved[key];
+    }
+  }
+}
 function installProcessEnv(proxyUrl2, excludeHosts) {
   process.env[PROXY_ENV] = proxyUrl2;
   withExcludeHostsEnv(process.env, excludeHosts);
@@ -157,8 +170,11 @@ function isRoutableUpstream(url, proxy, excludeHosts) {
   }
   return true;
 }
-function shouldRoute(url, proxy, excludeHosts) {
-  return isRoutableUpstream(url, proxy, excludeHosts) && isLlmEndpointPath(url.pathname);
+function isLlmMethod(method) {
+  return typeof method === "string" && method.toUpperCase() === "POST";
+}
+function shouldRoute(url, proxy, excludeHosts, method) {
+  return isLlmMethod(method) && isRoutableUpstream(url, proxy, excludeHosts) && isLlmEndpointPath(url.pathname);
 }
 function routedUrl(upstream, proxy) {
   return new URL(`${upstream.pathname}${upstream.search}`, proxy.origin);
@@ -216,7 +232,8 @@ function mergeFetchHeaders(input, init, upstream, originalPath = void 0, project
 }
 function withRoutedFetchInput(input, init, proxy, project, excludeHosts, sessionToken) {
   const upstream = requestUrl(input);
-  if (!shouldRoute(upstream, proxy, excludeHosts)) {
+  const method = init?.method ?? (input instanceof Request ? input.method : "GET");
+  if (!shouldRoute(upstream, proxy, excludeHosts, method)) {
     return [input, init];
   }
   const { url: nextUrl, originalPath } = routedUrlForOpenCode(upstream, proxy);
@@ -288,7 +305,7 @@ function headersForNodeRequest(options, upstream, originalPath, project, session
   return result;
 }
 function routedNodeOptions(parts, proxy, project, excludeHosts, sessionToken) {
-  if (!parts.url || !shouldRoute(parts.url, proxy, excludeHosts)) {
+  if (!parts.url || !shouldRoute(parts.url, proxy, excludeHosts, parts.options.method ?? "GET")) {
     return void 0;
   }
   const { url: nextUrl, originalPath } = routedUrlForOpenCode(parts.url, proxy);
@@ -379,7 +396,8 @@ function installHeadroomTransport(options) {
     originalChildSpawn: childProcess.spawn,
     originalChildExec: childProcess.exec,
     originalChildExecFile: childProcess.execFile,
-    originalChildFork: childProcess.fork
+    originalChildFork: childProcess.fork,
+    originalEnv: snapshotProcessEnv()
   };
   setState(state);
   installProcessEnv(options.proxyUrl, excludeHosts);
@@ -423,6 +441,7 @@ function uninstallHeadroomTransport() {
   childProcess.exec = state.originalChildExec;
   childProcess.execFile = state.originalChildExecFile;
   childProcess.fork = state.originalChildFork;
+  restoreProcessEnv(state.originalEnv);
   syncBuiltinESMExports();
   setState(void 0);
 }

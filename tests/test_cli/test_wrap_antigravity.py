@@ -17,11 +17,12 @@ def test_wrap_help_lists_antigravity() -> None:
     assert "antigravity" in result.output
 
 
-def test_wrap_antigravity_help_mentions_custom_model_provider() -> None:
+def test_wrap_antigravity_help_says_ide_has_no_third_party_providers() -> None:
     result = CliRunner().invoke(main, ["wrap", "antigravity", "--help"])
     assert result.exit_code == 0, result.output
     assert "Antigravity" in result.output
-    assert "OpenAI-compatible" in result.output
+    assert "does not support third-party model providers" in result.output
+    assert "custom OpenAI-compatible model provider" not in result.output
 
 
 def test_wrap_antigravity_prepare_only_exits_cleanly() -> None:

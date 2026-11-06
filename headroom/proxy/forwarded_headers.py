@@ -59,7 +59,6 @@ from typing import TYPE_CHECKING, Any
 
 from headroom.proxy.forwarded_policy import (
     ForwardedHeaderInputs,
-    header_first,
     normalize_ip,
     parse_cidr_list,
     peer_is_trusted_gateway,
@@ -150,17 +149,6 @@ def _peer_host(request: Any) -> str | None:
     if client is None:
         return None
     return getattr(client, "host", None)
-
-
-def _header_first(value: str) -> str:
-    """Return the leftmost element of a comma-separated header value.
-
-    ``X-Forwarded-For: client, proxy1, proxy2`` → ``"client"``. Empty
-    input returns ``""``. We intentionally do NOT walk the chain — the
-    leftmost hop is the only one whose authenticity the immediate
-    gateway can vouch for, and beyond that we have no trust signal.
-    """
-    return header_first(value)
 
 
 def _read_header(request: Any, name: str) -> str:

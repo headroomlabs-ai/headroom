@@ -56,10 +56,16 @@ def test_antigravity_render_setup_lines_contains_proxy_url() -> None:
     assert "Antigravity" in joined
 
 
-def test_antigravity_render_setup_lines_mentions_custom_provider() -> None:
+def test_antigravity_setup_lines_do_not_claim_ide_provider_settings() -> None:
     joined = "\n".join(render_setup_lines(8787))
-    assert "OpenAI-compatible" in joined
-    assert "/v1/models" in joined
+    assert "does not support third-party model providers" in joined
+    assert "Add a custom OpenAI-compatible" not in joined
+    assert "model-provider settings" not in joined
+    assert "mcp install --agent antigravity" in joined
+    assert "/v1internal:streamGenerateContent" in joined
+    assert "GOOGLE_GEMINI_BASE_URL" in joined
+    assert "GOOGLE_GEMINI_BASE_URL=http://127.0.0.1:8787" in joined
+    assert "For OpenAI-speaking clients" in joined
 
 
 def test_antigravity_render_setup_lines_project_attribution() -> None:

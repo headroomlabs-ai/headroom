@@ -1,7 +1,7 @@
 """Separate thinking tokens from visible output tokens.
 
 ``output_tokens`` is a single number today, and it pools two quantities that
-different levers move in opposite directions. Reasoning-effort routing cuts
+different levers move in opposite directions. Thinking-budget levers cut
 *thinking*; verbosity steering cuts *visible text*. Summed into one counter,
 neither can be attributed: a request whose thinking dropped 4,000 tokens while
 its prose grew 200 looks identical to one where nothing happened.
