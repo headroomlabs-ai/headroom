@@ -435,8 +435,8 @@ another/file.py:1:some code here
         # File with ERROR should be selected
         assert "important/file.py" in result.compressed
 
-    def test_output_sorted_by_line_number(self):
-        """Matches in output are sorted by line number within file."""
+    def test_output_preserves_input_order_within_file(self):
+        """Kept rows retain their input order rather than sorting line numbers."""
         content = """src/file.py:50:middle line
 src/file.py:10:first line
 src/file.py:90:last line
@@ -452,7 +452,7 @@ src/file.py:90:last line
                 if len(parts) >= 2 and parts[1].isdigit():
                     line_numbers.append(int(parts[1]))
 
-        assert line_numbers == sorted(line_numbers)
+        assert line_numbers == [50, 10, 90]
 
 
 class TestCompressionBehavior:
@@ -630,14 +630,15 @@ src/file (1).py:40:content
         assert "my-file.py" in result.compressed
         assert "my_file.py" in result.compressed
 
-    def test_line_number_zero(self):
-        """Line number 0 is handled (edge case)."""
+    def test_line_number_zero_is_not_parsed_but_passes_through(self):
+        """A zero line number is invalid grep output and remains unchanged."""
         content = "src/file.py:0:line at position 0"
+        assert _parse(content) == {}
 
         compressor = SearchCompressor()
         result = compressor.compress(content)
 
-        assert ":0:" in result.compressed
+        assert result.compressed == content
 
     def test_negative_line_number_skipped(self):
         """Negative line numbers don't match the pattern."""
@@ -722,11 +723,12 @@ src/file.py:20:def bar():
         assert "src/file.py" in result.summaries
         assert "more matches" in result.summaries["src/file.py"]
 
-    def test_files_sorted_in_output(self):
-        """Files are sorted alphabetically in output."""
+    def test_files_follow_first_appearance_and_keep_rows_grouped(self):
+        """Interleaved files are grouped in order of their first appearance."""
         content = """z_file.py:1:content
 a_file.py:1:content
 m_file.py:1:content
+z_file.py:2:later content
 """
         compressor = SearchCompressor()
         result = compressor.compress(content)
@@ -736,7 +738,7 @@ m_file.py:1:content
         ]
         files = [line.split(":")[0] for line in lines]
 
-        assert files == sorted(files)
+        assert files == ["z_file.py", "z_file.py", "a_file.py", "m_file.py"]
 
 
 class TestSearchMatchDataclass:

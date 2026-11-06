@@ -216,7 +216,13 @@ def cold_recompact_messages(
         # enable_cross_turn_dedup stays on: whether the fold may EMIT pointers
         # is decided per-path by the router's recoverability gate below, not
         # hardcoded here.
-        router = ContentRouter(ContentRouterConfig(lossless=True, enable_cross_turn_dedup=True))
+        router = ContentRouter(
+            ContentRouterConfig(
+                lossless=True,
+                enable_cross_turn_dedup=True,
+                enable_kompress=False,
+            )
+        )
         res = router.apply(
             list(messages),
             tokenizer,
