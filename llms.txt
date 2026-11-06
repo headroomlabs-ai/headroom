@@ -1,6 +1,6 @@
 # Headroom
 
-> Context optimization layer for LLM applications. Compress tool outputs, logs, files, and RAG chunks before they reach the model. Same answers, 60–95% fewer tokens. Library, proxy, and MCP server. Apache 2.0, local-first.
+> Headroom (`headroom-ai`) compresses tool outputs, logs, JSON, files, RAG chunks and chat history before each LLM call. Same answers, fewer input tokens. Measured: 21–57% fewer input tokens on four agent scenarios, 90%+ on repeated JSON arrays and log lines, little on prose. Library (no API key, in-process), proxy, and MCP server. Apache 2.0, local-first.
 
 Headroom is shipped as a Python package (`headroom-ai`), a TypeScript package (`headroom-ai`), an OpenAI + Anthropic-compatible HTTP proxy (`headroom proxy`), and an MCP server (`headroom_compress`, `headroom_retrieve`, `headroom_stats` tools). All four modes use the same compression pipeline: per-content-type compressors (JSON, code, logs, diffs, text) feed into a Compress-Cache-Retrieve (CCR) store so compression stays reversible — the LLM can ask for the original whenever it wants.
 
@@ -17,11 +17,24 @@ The canonical, always-current documentation index lives at the docs site below. 
 
 ## Install (copy-paste-runnable)
 
-- Python: `pip install headroom-ai` (add `[all]` for every optional extra)
+- Python: `pip install headroom-ai` is enough for `compress()`; add `[proxy]` for the HTTP proxy and `headroom wrap`, `[all]` for every optional extra
 - TypeScript / Node: `npm install headroom-ai` (or `pnpm add headroom-ai`, `bun add headroom-ai`)
 - Docker local: `docker run --rm -p 127.0.0.1:8787:8787 ghcr.io/headroomlabs-ai/headroom:latest --host 0.0.0.0`
 - Run the proxy: `headroom proxy --port 8787` then point any client at `http://127.0.0.1:8787`
-- Wrap an agent in one command: `headroom wrap claude` (also: `codex`, `copilot`, `cursor`, `aider`, `opencode`, `cline`, `continue`, `goose`, `openhands`, `openclaw`, `vibe`, `omp`)
+- Wrap an agent in one command: `headroom wrap claude` (also: `codex`, `grok`, `copilot`, `cursor`, `aider`, `opencode`, `cline`, `continue`, `goose`, `openhands`, `openclaw`, `vibe`, `omp`, `zcode`)
+- Zero-network check, no provider key: `HEADROOM_OFFLINE=1 python -c "from headroom import compress; log='\n'.join(f'INFO step {i} ok' for i in range(3000))+'\nFATAL disk full'; r=compress([{'role':'user','content':'What failed?'},{'role':'assistant','content':None,'tool_calls':[{'id':'c1','type':'function','function':{'name':'logs','arguments':'{}'}}]},{'role':'tool','tool_call_id':'c1','content':log}], model='gpt-4o'); print(r.tokens_before, '->', r.tokens_after, 'FATAL kept:', 'FATAL' in str(r.messages))"` (prints roughly `20000 -> 95 FATAL kept: True`)
+
+## By task (plain-language jobs this package does)
+
+- Reduce input tokens / cut LLM token cost in a Python app: `pip install headroom-ai`, then `from headroom import compress; result = compress(messages, model=...)`, send `result.messages`. No API key, no model download. [FastAPI example](https://docs.headroomlabs.ai/docs/fastapi)
+- Trim or compress large tool outputs / tool results before they re-enter the context: the same `compress()` call; tool messages are compressed, error lines, stack traces, first/last items and statistical outliers are kept. [Text & logs](https://docs.headroomlabs.ai/docs/text-and-logs) · [SmartCrusher](https://docs.headroomlabs.ai/docs/smart-crusher)
+- Keep a long chat history inside the context window: `compress(messages, model=..., model_limit=N)` compresses harder as the prompt approaches N tokens; it never drops messages. [Context management](https://docs.headroomlabs.ai/docs/context-management)
+- Compress RAG chunks / search results / database rows: the same call; JSON arrays are compressed statistically. Put the data in a `tool` message: user messages are left alone by default (`compress_user_messages=True` opts them in). [SmartCrusher](https://docs.headroomlabs.ai/docs/smart-crusher)
+- Cut the token spend of Claude Code / Codex / Cursor without code changes: `headroom wrap <agent>` or `headroom proxy`. [Proxy](https://docs.headroomlabs.ai/docs/proxy)
+- Give an MCP host a compress tool: `pip install "headroom-ai[mcp]"` then `headroom mcp install`. [MCP](https://docs.headroomlabs.ai/docs/mcp)
+- Run fully offline / air-gapped: set `HEADROOM_OFFLINE=1`. [Security model](https://docs.headroomlabs.ai/docs/security-model)
+
+Not a fit: short conversational prompts, prose, already-dense payloads.
 
 ## Entry points
 
@@ -34,7 +47,7 @@ The canonical, always-current documentation index lives at the docs site below. 
 ## How it works
 
 - [How compression works](https://docs.headroomlabs.ai/docs/how-compression-works): Three-stage pipeline + automatic content routing.
-- [SmartCrusher](https://docs.headroomlabs.ai/docs/smart-crusher): Statistical JSON / array compression (70–90% on tool outputs).
+- [SmartCrusher](https://docs.headroomlabs.ai/docs/smart-crusher): Statistical JSON / array compression (90%+ on repeated arrays; keeps errors, outliers and boundaries).
 - [Code compression](https://docs.headroomlabs.ai/docs/code-compression): AST-aware via tree-sitter (preserves imports, signatures, types).
 - [Text & log compression](https://docs.headroomlabs.ai/docs/text-and-logs): Search results, build logs, diffs.
 - [CCR (reversible)](https://docs.headroomlabs.ai/docs/ccr): Compress-Cache-Retrieve — originals never deleted; LLM retrieves on demand.
