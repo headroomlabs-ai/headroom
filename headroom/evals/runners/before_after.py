@@ -26,6 +26,7 @@ from headroom.evals.core import (
 )
 from headroom.evals.metrics import compute_semantic_similarity
 from headroom.offline import guard_egress
+from headroom.providers.evals import call_eval_llm, create_eval_client
 from headroom.transforms.content_router import ContentRouter, ContentRouterConfig
 from headroom.transforms.smart_crusher import SmartCrusherConfig
 
@@ -96,42 +97,10 @@ class BeforeAfterRunner:
         self._judge_fn: Any = None
 
     def _init_llm_client(self) -> Any:
-        """Initialize the appropriate LLM client.
-
-        Ollama is not guarded: like the Ollama embedder it is an
-        operator-configured endpoint that defaults to localhost.
-        """
-        if self.llm_config.provider == "anthropic":
-            guard_egress("anthropic API for the before/after eval runner")
-            try:
-                import anthropic
-
-                return anthropic.Anthropic()
-            except ImportError as e:
-                raise ImportError(
-                    "anthropic package required. Install with: pip install anthropic"
-                ) from e
-        elif self.llm_config.provider == "openai":
-            guard_egress("openai API for the before/after eval runner")
-            try:
-                import openai
-
-                return openai.OpenAI()
-            except ImportError as e:
-                raise ImportError(
-                    "openai package required. Install with: pip install openai"
-                ) from e
-        elif self.llm_config.provider == "ollama":
-            try:
-                import ollama
-
-                return ollama.Client()
-            except ImportError as e:
-                raise ImportError(
-                    "ollama package required. Install with: pip install ollama"
-                ) from e
-        else:
-            raise ValueError(f"Unknown provider: {self.llm_config.provider}")
+        """Initialize the appropriate LLM client."""
+        if self.llm_config.provider in ("anthropic", "openai"):
+            guard_egress(f"{self.llm_config.provider} API for the before/after eval runner")
+        return create_eval_client(self.llm_config.provider)
 
     def _init_proxy_client(self) -> Any:
         """Initialize an OpenAI client pointing at the Headroom proxy."""
@@ -177,32 +146,14 @@ Question: {query}
 
 Answer:"""
 
-        if self.llm_config.provider == "anthropic":
-            response = self._llm_client.messages.create(
-                model=self.llm_config.model,
-                max_tokens=self.llm_config.max_tokens,
-                temperature=self.llm_config.temperature,
-                messages=[{"role": "user", "content": prompt}],
-            )
-            return str(response.content[0].text)
-        elif self.llm_config.provider == "openai":
-            response = self._llm_client.chat.completions.create(
-                model=self.llm_config.model,
-                max_tokens=self.llm_config.max_tokens,
-                temperature=self.llm_config.temperature,
-                messages=[{"role": "user", "content": prompt}],
-            )
-            content = response.choices[0].message.content
-            return str(content) if content else ""
-        elif self.llm_config.provider == "ollama":
-            response = self._llm_client.chat(
-                model=self.llm_config.model,
-                messages=[{"role": "user", "content": prompt}],
-                options={"temperature": self.llm_config.temperature},
-            )
-            return str(response["message"]["content"])
-
-        return ""
+        return call_eval_llm(
+            self.llm_config.provider,
+            self._llm_client,
+            self.llm_config.model,
+            [{"role": "user", "content": prompt}],
+            max_tokens=self.llm_config.max_tokens,
+            temperature=self.llm_config.temperature,
+        )
 
     def _estimate_tokens(self, text: str) -> int:
         """Estimate token count."""
