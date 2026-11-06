@@ -10,47 +10,48 @@
 //! mirroring the parity harness's "stub → Skipped" tolerance. Run it
 //! locally after `python scripts/record_kompress_trace.py` to get the
 //! real assertion.
+//!
+//! Runtime-gated too: with the model cached but no way to run it (a CPU
+//! without AVX2, or no ONNX Runtime library: `ORT_DYLIB_PATH` unset and no
+//! pip `onnxruntime` under `VIRTUAL_ENV`, `CONDA_PREFIX` or `./.venv`), it
+//! also SKIPS, the way `magika_idle_threads` skips without an ONNX Runtime.
+//! The check is `kompress::onnx_runtime_ready`, the constructors' own
+//! CPU-then-loader preconditions, so it never loads the runtime on a CPU
+//! that can't run it.
 
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use headroom_core::transforms::kompress::{Kompress, KompressConfig};
+use headroom_core::transforms::kompress::{self, Kompress, KompressConfig};
 use serde_json::Value;
 
-fn hf_cache_file(repo_dir: &str, rel: &[&str]) -> Option<PathBuf> {
-    let home = std::env::var("HOME").ok()?;
-    let snapshots = Path::new(&home)
-        .join(".cache/huggingface/hub")
-        .join(repo_dir)
-        .join("snapshots");
-    for snap in fs::read_dir(snapshots).ok()?.filter_map(|e| e.ok()) {
-        let mut cand = snap.path();
-        for part in rel {
-            cand = cand.join(part);
-        }
-        if cand.exists() {
-            return Some(cand);
-        }
+/// The tokenizer + int8 ONNX artifact production would load: the pinned
+/// snapshots in Python's hub cache. The fixtures were recorded against them.
+fn cached_artifacts() -> Option<(PathBuf, PathBuf)> {
+    kompress::cached_artifacts(&KompressConfig::default(), "onnx/kompress-int8-wo.onnx")
+}
+
+/// [`cached_artifacts`], or `None` (with the reason on stderr) when the
+/// model isn't cached or this machine can't run ONNX Runtime.
+fn loadable_artifacts() -> Option<(PathBuf, PathBuf)> {
+    let Some(paths) = cached_artifacts() else {
+        eprintln!(
+            "SKIP: kompress model/tokenizer not in HF cache; \
+             run `python scripts/record_kompress_trace.py` first"
+        );
+        return None;
+    };
+    if let Err(reason) = kompress::onnx_runtime_ready() {
+        eprintln!("SKIP: can't run ONNX Runtime for kompress here: {reason}");
+        return None;
     }
-    None
+    Some(paths)
 }
 
 #[test]
 fn kompress_matches_python_fixtures_byte_for_byte() {
-    let tok = hf_cache_file("models--answerdotai--ModernBERT-base", &["tokenizer.json"]);
-    let onnx = hf_cache_file(
-        "models--chopratejas--kompress-v2-base",
-        &["onnx", "kompress-int8-wo.onnx"],
-    );
-    let (tok, onnx) = match (tok, onnx) {
-        (Some(t), Some(o)) => (t, o),
-        _ => {
-            eprintln!(
-                "SKIP: kompress model/tokenizer not in HF cache; \
-                 run `python scripts/record_kompress_trace.py` first"
-            );
-            return;
-        }
+    let Some((tok, onnx)) = loadable_artifacts() else {
+        return;
     };
 
     let fixtures_dir =
@@ -111,14 +112,8 @@ fn kompress_matches_python_fixtures_byte_for_byte() {
 fn short_input_passes_through() {
     // Pure-logic check — no model needed. Fewer than MIN_WORDS words must
     // pass through unchanged regardless of model availability... but the
-    // engine needs a model to construct. Guard on cache like the main test.
-    let tok = hf_cache_file("models--answerdotai--ModernBERT-base", &["tokenizer.json"]);
-    let onnx = hf_cache_file(
-        "models--chopratejas--kompress-v2-base",
-        &["onnx", "kompress-int8-wo.onnx"],
-    );
-    let (Some(tok), Some(onnx)) = (tok, onnx) else {
-        eprintln!("SKIP: model not cached");
+    // engine needs a model to construct. Guard like the main test.
+    let Some((tok, onnx)) = loadable_artifacts() else {
         return;
     };
     let kompress = Kompress::from_files(&tok, &onnx, KompressConfig::default()).unwrap();
