@@ -138,8 +138,8 @@ class TestOpenAITokenCounting:
         assert count > openai_tokenizer.count_text(text)
         assert count < openai_tokenizer.count_text(text) + 5_000
 
-    def test_tool_use_input_serialization_is_deterministic(self, openai_tokenizer):
-        """Equivalent mappings must have a stable wire-shaped token estimate."""
+    def test_sample_tool_use_key_orders_have_equal_counts(self, openai_tokenizer):
+        """These two mapping orders have equal counts; this is not a general invariant."""
         first = {
             "role": "assistant",
             "content": [{"type": "tool_use", "name": "search", "input": {"a": 1, "b": 2}}],
