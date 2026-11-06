@@ -9,6 +9,7 @@ code-memory-capable subcommands (claude/codex/grok) but not others.
 from __future__ import annotations
 
 import os
+from pathlib import Path
 from unittest.mock import patch
 
 import click
@@ -16,6 +17,12 @@ import pytest
 from click.testing import CliRunner
 
 from headroom.cli import wrap
+
+
+@pytest.fixture(autouse=True)
+def isolated_home(tmp_path, monkeypatch):
+    """Keep config edits in the test home on Windows as well as POSIX."""
+    monkeypatch.setattr(Path, "home", classmethod(lambda cls: tmp_path))
 
 
 def _clean_env() -> dict[str, str]:
