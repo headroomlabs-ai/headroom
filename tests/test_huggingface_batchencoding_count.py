@@ -17,7 +17,9 @@ class _BatchEncodingLike(dict):
 
 
 class _FakeInnerTokenizer:
-    def apply_chat_template(self, messages, tokenize=True, add_generation_prompt=True):
+    def apply_chat_template(
+        self, messages, tokenize=True, add_generation_prompt=True, return_dict=False
+    ):
         return _BatchEncodingLike(
             input_ids=list(range(1234)),
             attention_mask=[1] * 1234,
@@ -44,7 +46,9 @@ def test_count_messages_unwraps_batch_encoding():
 
 def test_count_messages_accepts_flat_token_list():
     class _LegacyInner(_FakeInnerTokenizer):
-        def apply_chat_template(self, messages, tokenize=True, add_generation_prompt=True):
+        def apply_chat_template(
+            self, messages, tokenize=True, add_generation_prompt=True, return_dict=False
+        ):
             return list(range(777))
 
     tok = _make_tokenizer(_LegacyInner())
