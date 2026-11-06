@@ -5870,6 +5870,9 @@ class ContentRouter(Transform):
           (model weights are cached at module level in kompress_compressor.py,
           so repeated calls with the same model_id are cheap)
         """
+        if not self.config.enable_kompress:
+            return None
+
         model_id = getattr(self, "_runtime_kompress_model", None)
 
         # Explicitly disabled — no ML compression

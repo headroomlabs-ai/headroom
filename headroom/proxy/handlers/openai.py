@@ -4841,7 +4841,7 @@ class OpenAIHandlerMixin:
                 _rc_router = find_content_router(self.openai_pipeline)
                 _rc_kompress = (
                     (_rc_router._get_remote_kompress() or _rc_router._get_kompress())
-                    if _rc_router is not None
+                    if _rc_router is not None and _rc_router.config.enable_kompress
                     else None
                 )
                 # Sticky drop floor: turns dropped on a prior cold turn must stay
