@@ -151,6 +151,16 @@ SETTINGS: tuple[SettingField, ...] = (
         tier="basic",
     ),
     SettingField(
+        "HEADROOM_NO_CCR_RESPONSE_HANDLING",
+        "no_ccr_response_handling",
+        "Disable CCR response handling",
+        "Compression",
+        "bool",
+        default=False,
+        help="Disable CCR response buffering while preserving retrieval tool and marker settings.",
+        tier="advanced",
+    ),
+    SettingField(
         "HEADROOM_CCR_INLINE_RESOLVE",
         "ccr_inline_resolve",
         "Resolve CCR markers inline",
