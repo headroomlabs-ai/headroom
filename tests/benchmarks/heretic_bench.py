@@ -9,13 +9,13 @@ exact token survival rate. Designed to run in CI with exit codes.
 Output: JSON to stdout, exit 0=pass, 1=fail, 2=error
 
 Usage:
-    python3 bench/heretic_bench.py --model PeetPedro/kompress-v8
-    python3 bench/heretic_bench.py --model PeetPedro/kompress-v8 --min-exact 0.94
+    python3 tests/benchmarks/heretic_bench.py --model PeetPedro/kompress-v8
+    python3 tests/benchmarks/heretic_bench.py --model PeetPedro/kompress-v8 --min-exact 0.94
 
 CI Integration (GitHub Actions):
     - name: Heretic compression benchmark
       run: |
-        python3 bench/heretic_bench.py --model PeetPedro/kompress-v8 --min-exact 0.94 --json > heretic_results.json
+        python3 tests/benchmarks/heretic_bench.py --model PeetPedro/kompress-v8 --min-exact 0.94 --json > heretic_results.json
 """
 
 from __future__ import annotations

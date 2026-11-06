@@ -10,8 +10,8 @@ Simulates agent tool-call patterns through headroom.compress() and measures:
 Runs WITHOUT a real LLM — just measures compression fidelity.
 
 Usage:
-    python3 bench/agent_regression.py
-    python3 bench/agent_regression.py --model PeetPedro/kompress-v8 --json > regression.json
+    python3 tests/benchmarks/agent_regression.py
+    python3 tests/benchmarks/agent_regression.py --model PeetPedro/kompress-v8 --json > regression.json
 """
 
 from __future__ import annotations

@@ -7,9 +7,9 @@ Works with any provider (Anthropic, OpenAI, Gemini) since it reads the proxy's
 own log format. Also generates CO2 and cost estimates.
 
 Usage:
-    python3 bench/savings_dashboard.py --log-file proxy.log
-    python3 bench/savings_dashboard.py --log-file proxy.log --json > dashboard.json
-    python3 bench/savings_dashboard.py --log-dir ~/.headroom/logs --last-hours 168
+    python3 tests/benchmarks/savings_dashboard.py --log-file proxy.log
+    python3 tests/benchmarks/savings_dashboard.py --log-file proxy.log --json > dashboard.json
+    python3 tests/benchmarks/savings_dashboard.py --log-dir ~/.headroom/logs --last-hours 168
 
 Output:
     - Per content-type savings (code, search, logs, JSON, text)
@@ -228,7 +228,7 @@ def main():
     if not log_files:
         print("No log files found. Use --log-file or --log-dir.", file=sys.stderr)
         print(
-            "Example: python3 bench/savings_dashboard.py --log-file /tmp/headroom-c3/requests.jsonl",
+            "Example: python3 tests/benchmarks/savings_dashboard.py --log-file /tmp/headroom-c3/requests.jsonl",
             file=sys.stderr,
         )
         sys.exit(2)

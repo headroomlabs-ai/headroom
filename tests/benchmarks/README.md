@@ -13,10 +13,10 @@ compression quality gate.
 
 ```bash
 # Quick check
-python3 bench/heretic_bench.py --model PeetPedro/kompress-v8
+python3 tests/benchmarks/heretic_bench.py --model PeetPedro/kompress-v8
 
 # CI mode (exit 0=pass, 1=fail)
-python3 bench/heretic_bench.py --model PeetPedro/kompress-v8 --min-exact 0.94 --json > results.json
+python3 tests/benchmarks/heretic_bench.py --model PeetPedro/kompress-v8 --min-exact 0.94 --json > results.json
 ```
 
 ### 2. Agent Regression Suite (`agent_regression.py`)
@@ -26,8 +26,8 @@ results, JSON API responses) and measures compression fidelity without
 needing a real LLM.
 
 ```bash
-python3 bench/agent_regression.py --model PeetPedro/kompress-v8
-python3 bench/agent_regression.py --json --min-mk 0.85
+python3 tests/benchmarks/agent_regression.py --model PeetPedro/kompress-v8
+python3 tests/benchmarks/agent_regression.py --json --min-mk 0.85
 ```
 
 ### 3. Savings Dashboard (`savings_dashboard.py`)
@@ -37,13 +37,13 @@ savings breakdowns with CO2 and cost estimates.
 
 ```bash
 # From proxy logs
-python3 bench/savings_dashboard.py --log-file proxy.log
+python3 tests/benchmarks/savings_dashboard.py --log-file proxy.log
 
 # Last week of logs
-python3 bench/savings_dashboard.py --log-dir ~/.headroom/logs --last-hours 168
+python3 tests/benchmarks/savings_dashboard.py --log-dir ~/.headroom/logs --last-hours 168
 
 # JSON for dashboards
-python3 bench/savings_dashboard.py --log-file proxy.log --json
+python3 tests/benchmarks/savings_dashboard.py --log-file proxy.log --json
 ```
 
 ## CI Integration (GitHub Actions)
@@ -51,10 +51,10 @@ python3 bench/savings_dashboard.py --log-file proxy.log --json
 ```yaml
 - name: Heretic benchmark
   run: |
-    python3 bench/heretic_bench.py --model PeetPedro/kompress-v8 --min-exact 0.94 --json > heretic.json
+    python3 tests/benchmarks/heretic_bench.py --model PeetPedro/kompress-v8 --min-exact 0.94 --json > heretic.json
 - name: Agent regression
   run: |
-    python3 bench/agent_regression.py --min-mk 0.85
+    python3 tests/benchmarks/agent_regression.py --min-mk 0.85
 ```
 
 ## Current Scores
