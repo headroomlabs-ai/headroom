@@ -233,13 +233,15 @@ class _TruncatingTok:
 
 
 class TestTruncatedWordsCompression:
-    """Words past the tokenizer's 512-token cut are kept, not dropped (#4309).
+    """Words past the tokenizer's 512-token cut are never dropped unseen (#4309).
 
     Chunks are cut by words (``chunk_words``) but tokenized with
     ``truncation=True, max_length=512``. A chunk of token-heavy words hits
     the token limit well before its word budget, so the tail of the chunk had
     no score and was dropped silently from the default proxy path
-    (``target_ratio=None``).
+    (``target_ratio=None``). The sequential path now scores that tail as the
+    next window and the model's decision on it stands; the batch path builds
+    its chunks before tokenizing, so it keeps the tail verbatim instead.
     """
 
     # One chunk is `chunk_words` words long, so 350 words is exactly one.
@@ -265,22 +267,24 @@ class TestTruncatedWordsCompression:
         kept = compressor.compress(" ".join(words)).compressed.split()
         return kept, words
 
-    def test_words_past_the_truncation_point_survive(self, monkeypatch):
+    def test_words_past_the_truncation_point_are_scored(self, monkeypatch):
         # Two tokens per word: the 350-word chunk needs 700 tokens, so the
-        # tokenizer cuts it at 512. The 256 words it covered were scored, the
-        # other 94 were never seen and used to vanish from the output.
+        # tokenizer cuts it at 512. Words 0-254 are scored in the first
+        # window; word 255 (the cut may have split it) and the 94 the
+        # tokenizer never saw start the next window. The fake model keeps the
+        # first word of each window, so the second window's decision decides
+        # their fate, not a blanket keep.
         kept, words = self._compress(monkeypatch, tokens_per_word=2)
-        # 256 words were covered; the cut landed at a word boundary here, but
-        # the last covered word is kept too, because the cut may have fallen
-        # inside it.
-        assert kept == [words[0]] + words[255:]
+        assert kept == [words[0], words[255]]
 
-    def test_the_word_the_cut_landed_in_is_kept(self, monkeypatch):
+    def test_the_word_the_cut_landed_in_is_scored_whole(self, monkeypatch):
         # Three tokens per word: the cut at 512 falls inside word 170, whose
         # last token never reached the tokenizer. The model only saw part of
-        # that word, so dropping it would take its unseen suffix with it.
+        # that word, so it is not judged there: it opens the next window and
+        # is scored whole. That window is cut inside word 340 the same way,
+        # and the last ten words fit in a third.
         kept, words = self._compress(monkeypatch, tokens_per_word=3)
-        assert kept == [words[0]] + words[170:]
+        assert kept == [words[0], words[170], words[340]]
 
     def test_fully_covered_chunk_is_unchanged(self, monkeypatch):
         # One token per word: the chunk fits in 512 tokens, so nothing was
