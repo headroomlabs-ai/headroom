@@ -15,6 +15,7 @@ import tempfile
 
 import numpy as np
 import pytest
+import pytest_asyncio
 
 from headroom.memory.models import Memory
 from headroom.memory.ports import VectorFilter
@@ -32,8 +33,8 @@ except ImportError:
 class TestSQLiteVectorIndex:
     """Tests for SQLiteVectorIndex."""
 
-    @pytest.fixture
-    def index(self):
+    @pytest_asyncio.fixture
+    async def index(self):
         """Create a temporary SQLite vector index."""
         with tempfile.NamedTemporaryFile(suffix=".db", delete=False) as f:
             db_path = f.name
@@ -41,10 +42,12 @@ class TestSQLiteVectorIndex:
         from headroom.memory.adapters.sqlite_vector import SQLiteVectorIndex
 
         index = SQLiteVectorIndex(dimension=384, db_path=db_path)
-        yield index
-
-        if os.path.exists(db_path):
-            os.unlink(db_path)
+        try:
+            yield index
+        finally:
+            await index.close()
+            if os.path.exists(db_path):
+                os.unlink(db_path)
 
     @pytest.mark.asyncio
     async def test_index_and_search(self, index):
@@ -270,6 +273,7 @@ class TestSQLiteVectorIndexPersistence:
         with tempfile.NamedTemporaryFile(suffix=".db", delete=False) as f:
             db_path = f.name
 
+        index1 = index2 = None
         try:
             from headroom.memory.adapters.sqlite_vector import SQLiteVectorIndex
 
@@ -287,7 +291,8 @@ class TestSQLiteVectorIndexPersistence:
 
             memory_id = memory.id
 
-            # Create new index instance
+            # Close the first connection before reopening the persisted index.
+            await index1.close()
             index2 = SQLiteVectorIndex(dimension=384, db_path=db_path)
 
             assert index2.size == 1
@@ -302,6 +307,9 @@ class TestSQLiteVectorIndexPersistence:
             assert len(results) == 1
             assert results[0].memory.id == memory_id
         finally:
+            for index in (index1, index2):
+                if index is not None:
+                    await index.close()
             if os.path.exists(db_path):
                 os.unlink(db_path)
 
@@ -310,8 +318,8 @@ class TestSQLiteVectorIndexPersistence:
 class TestSQLiteVectorIndexMemoryStats:
     """Tests for memory statistics."""
 
-    @pytest.fixture
-    def index(self):
+    @pytest_asyncio.fixture
+    async def index(self):
         """Create a temporary SQLite vector index."""
         with tempfile.NamedTemporaryFile(suffix=".db", delete=False) as f:
             db_path = f.name
@@ -319,10 +327,12 @@ class TestSQLiteVectorIndexMemoryStats:
         from headroom.memory.adapters.sqlite_vector import SQLiteVectorIndex
 
         index = SQLiteVectorIndex(dimension=384, db_path=db_path, page_cache_size_kb=4096)
-        yield index
-
-        if os.path.exists(db_path):
-            os.unlink(db_path)
+        try:
+            yield index
+        finally:
+            await index.close()
+            if os.path.exists(db_path):
+                os.unlink(db_path)
 
     @pytest.mark.asyncio
     async def test_memory_stats(self, index):
@@ -375,8 +385,8 @@ class TestSQLiteVectorIndexMemoryStats:
 class TestSQLiteVectorIndexEdgeCases:
     """Tests for edge cases."""
 
-    @pytest.fixture
-    def index(self):
+    @pytest_asyncio.fixture
+    async def index(self):
         """Create a temporary SQLite vector index."""
         with tempfile.NamedTemporaryFile(suffix=".db", delete=False) as f:
             db_path = f.name
@@ -384,10 +394,12 @@ class TestSQLiteVectorIndexEdgeCases:
         from headroom.memory.adapters.sqlite_vector import SQLiteVectorIndex
 
         index = SQLiteVectorIndex(dimension=384, db_path=db_path)
-        yield index
-
-        if os.path.exists(db_path):
-            os.unlink(db_path)
+        try:
+            yield index
+        finally:
+            await index.close()
+            if os.path.exists(db_path):
+                os.unlink(db_path)
 
     @pytest.mark.asyncio
     async def test_search_empty_index(self, index):
