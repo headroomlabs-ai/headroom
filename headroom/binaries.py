@@ -19,8 +19,10 @@ Env vars:
     HEADROOM_BINARIES_CACHE    override cache dir
     HEADROOM_BINARIES_OFFLINE  if set, never reach the network
     HEADROOM_BINARIES_ALLOW_UNVERIFIED
-        Escape hatch: if set, skip SHA-256 verification entirely and accept
-        whatever the mirror served. This disables Headroom's only defence
+        Escape hatch: only 1, true, yes, or on (case-insensitive, with surrounding
+        whitespace ignored) skip SHA-256 verification and accept whatever the
+        mirror served. Unset, false, and unrecognized values retain verification.
+        This disables Headroom's only defence
         against a tampered or substituted binary, so it is announced on
         stderr every time it takes effect. Intended for developers testing a
         locally built asset or an off-registry version; never set it in CI or
