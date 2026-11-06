@@ -379,7 +379,7 @@ class HeadroomChatModel(BaseChatModel):
         pass them explicitly.
         """
         bound_kwargs: dict[str, Any] = {}
-        if not RUNNABLE_BINDING_AVAILABLE:
+        if not LANGCHAIN_AVAILABLE:
             return model, bound_kwargs
         # isinstance, not hasattr: a Mock answers hasattr("bound") truthfully
         # and would be unwrapped into one of its own auto-created children.

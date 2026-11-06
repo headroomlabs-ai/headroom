@@ -29,7 +29,7 @@ The canonical, always-current documentation index lives at the docs site below. 
 
 ## Install (copy-paste-runnable)
 
-- Python: `pip install headroom-ai` is enough for `compress()`; add `[proxy]` for the HTTP proxy and `headroom wrap`, `[all]` for every optional extra
+- Python: `pip install headroom-ai` is enough for `compress()`; add `[proxy]` for the HTTP proxy and `headroom wrap`, `[all]` for the CLI/proxy feature set. PyTorch-backed `[ml]`, `[memory]`, `[evals]`, and `[voice]` are separate opt-ins.
 - TypeScript / Node: `npm install headroom-ai` (or `pnpm add headroom-ai`, `bun add headroom-ai`)
 - Docker local: `docker run --rm -p 127.0.0.1:8787:8787 ghcr.io/headroomlabs-ai/headroom:latest --host 0.0.0.0`
 - Run the proxy: `headroom proxy --port 8787` then point any client at `http://127.0.0.1:8787`
