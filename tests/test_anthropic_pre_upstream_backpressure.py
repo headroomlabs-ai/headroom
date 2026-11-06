@@ -746,6 +746,9 @@ def test_memory_context_exception_fails_open_and_releases_semaphore():
             self.initialized = False
             self.backend = None
 
+        def is_project_unresolved(self, _request_context: object) -> bool:
+            return False
+
         async def search_and_format_context(self, _user_id, _messages, **_kwargs):
             import sqlite3
 
