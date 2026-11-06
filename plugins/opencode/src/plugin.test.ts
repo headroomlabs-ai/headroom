@@ -1,4 +1,5 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { z } from "zod";
 
 import HeadroomOpenCodePlugin, { HeadroomPlugin, headroomSetup } from "./plugin.js";
 
@@ -114,6 +115,17 @@ describe("HeadroomPlugin", () => {
       OPENAI_BASE_URL: "https://deepseek.example/v1",
       ANTHROPIC_BASE_URL: "https://anthropic.example",
     });
+  });
+
+  it("validates the full supported CCR identifier range", async () => {
+    const plugin = await HeadroomPlugin(pluginInput(), { proxyUrl: "http://127.0.0.1:8787" });
+    const schema = plugin.tool?.headroom_retrieve.args.hash;
+    expect(z.safeParse(schema!, "ab").success).toBe(true);
+    expect(z.safeParse(schema!, "0123456789abcdef01234567").success).toBe(true);
+    for (const hash of ["a", "a".repeat(25), "zz", "ab cd"]) {
+      expect(z.safeParse(schema!, hash).success).toBe(false);
+    }
+    await plugin.dispose?.();
   });
 
   it("exposes a headroom_retrieve tool backed by the proxy", async () => {
