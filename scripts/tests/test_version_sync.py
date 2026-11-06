@@ -475,3 +475,37 @@ dependencies = [{ name = "dependency" }]
         )
     )
     assert lock.read_bytes() == expected.encode()
+
+
+@pytest.mark.parametrize("plugin_only", [False, True])
+def test_skill_marketplace_tracks_release_while_sidebar_stays_independent(
+    temp_project: dict[str, Path], plugin_only: bool
+) -> None:
+    for key in ("repo_claude_marketplace", "repo_github_marketplace"):
+        path = temp_project[key]
+        data = json.loads(path.read_text())
+        data["plugins"].extend(
+            [
+                {"name": "headroom-skill", "version": "0.1.0"},
+                {"name": "headroom-sidebar", "version": "0.1.3"},
+            ]
+        )
+        path.write_text(json.dumps(data))
+    args = [
+        sys.executable,
+        str(Path(__file__).parent.parent / "version-sync.py"),
+        "--root",
+        str(temp_project["root"]),
+        "--version",
+        "0.8.0",
+    ]
+    if plugin_only:
+        args.append("--plugin-manifests-only")
+    result = subprocess.run(args, capture_output=True, text=True)
+    assert result.returncode == 0, result.stderr
+    for key in ("repo_claude_marketplace", "repo_github_marketplace"):
+        versions = {
+            p["name"]: p["version"] for p in json.loads(temp_project[key].read_text())["plugins"]
+        }
+        assert versions["headroom-skill"] == "0.8.0"
+        assert versions["headroom-sidebar"] == "0.1.3"

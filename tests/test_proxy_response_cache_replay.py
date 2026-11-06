@@ -227,6 +227,54 @@ def _ccr_cache_config() -> ProxyConfig:
     )
 
 
+@pytest.mark.parametrize("bypass", [True, False])
+@pytest.mark.parametrize("cache_hit", [True, False])
+def test_anthropic_bypass_skips_response_cache_lookup_and_store(bypass, cache_hit):
+    with patch("headroom.proxy.server.AnyLLMBackend"):
+        app = create_app(_cache_config())
+        with TestClient(app) as client:
+            proxy = client.app.state.proxy
+            proxy.cache.get = AsyncMock(return_value=_poisoned_entry() if cache_hit else None)
+            proxy.cache.set = AsyncMock()
+            proxy._retry_request = AsyncMock(
+                return_value=httpx.Response(
+                    200,
+                    json={
+                        **json.loads(_CACHED_BODY),
+                        "content": [{"type": "text", "text": "fresh upstream"}],
+                    },
+                )
+            )
+            result = client.post(
+                "/v1/messages",
+                headers={
+                    "x-api-key": "test-key",
+                    "anthropic-version": "2023-06-01",
+                    "x-headroom-bypass": str(bypass).lower(),
+                },
+                json={
+                    "model": "claude-sonnet-4-6",
+                    "max_tokens": 64,
+                    "messages": [{"role": "user", "content": "hello"}],
+                },
+            )
+            assert result.status_code == 200
+            if bypass:
+                assert result.json()["content"][0]["text"] == "fresh upstream"
+                proxy.cache.get.assert_not_awaited()
+                proxy.cache.set.assert_not_awaited()
+                proxy._retry_request.assert_awaited_once()
+            elif cache_hit:
+                assert result.json()["content"][0]["text"] == "served from cache"
+                proxy.cache.get.assert_awaited_once()
+                proxy._retry_request.assert_not_awaited()
+            else:
+                assert result.json()["content"][0]["text"] == "fresh upstream"
+                proxy.cache.get.assert_awaited_once()
+                proxy.cache.set.assert_awaited_once()
+                proxy._retry_request.assert_awaited_once()
+
+
 def test_buffered_ccr_turn_does_not_write_the_response_cache():
     """A client ``stream: true`` turn is converted to a buffered ``stream:
     false`` upstream call. Its reply is shaped by that flip plus CCR tool
