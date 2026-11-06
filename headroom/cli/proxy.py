@@ -295,21 +295,40 @@ def _refuse_busy_port(host: str, port: int, *, workers: int) -> None:
 @click.option(
     "--port",
     "-p",
-    default=8787,
+    default=None,
     type=click.IntRange(1, 65535),
-    envvar="HEADROOM_PORT",
-    help="Proxy port (default: 8787, env: HEADROOM_PORT)",
+    help=(
+        "Proxy port. Defaults to auto-detecting the most recently started live "
+        "wrap session (falls back to 8787). Env: HEADROOM_PORT."
+    ),
 )
 @click.option("--no-open", is_flag=True, help="Print the URL instead of opening a browser")
-def dashboard(port: int, no_open: bool) -> None:
+def dashboard(port: int | None, no_open: bool) -> None:
     """Open the Headroom savings dashboard in your browser.
 
     Requires a running proxy (start one with `headroom proxy` or `headroom wrap ...`).
+
+    With no ``--port``/``HEADROOM_PORT``, the port is auto-detected from live wrap
+    sessions (e.g. a session bumped to 8788 because 8787 was taken) so the dashboard
+    URL matches whatever proxy is actually running.
     """
     import webbrowser
 
-    url = f"http://127.0.0.1:{port}/dashboard"
+    from headroom.cli.port_discovery import proxy_is_healthy, resolve_read_port
+
+    resolved_port, origin = resolve_read_port(port)
+    url = f"http://127.0.0.1:{resolved_port}/dashboard"
+    if origin == "discovered":
+        click.echo(f"  Detected live proxy on port {resolved_port}")
     click.echo(f"  Dashboard: {url}")
+    if not proxy_is_healthy(resolved_port):
+        click.secho(
+            f"  Warning: no proxy responding on port {resolved_port}. "
+            "Start one with `headroom proxy` or `headroom wrap ...`, "
+            "or pass --port explicitly.",
+            fg="yellow",
+            err=True,
+        )
     if not no_open:
         try:
             webbrowser.open(url)
@@ -546,6 +565,18 @@ def dashboard(port: int, no_open: bool) -> None:
     help=(
         "Disable proactive expansion of previously compressed content. "
         "Env: HEADROOM_NO_CCR_PROACTIVE_EXPANSION."
+    ),
+)
+@click.option(
+    "--no-ccr-response-handling",
+    is_flag=True,
+    envvar="HEADROOM_NO_CCR_RESPONSE_HANDLING",
+    help=(
+        "Disable server-side buffering of streaming responses for CCR response "
+        "handling, independent of --no-ccr. A client that offers the "
+        "headroom_retrieve tool itself (e.g. the bundled OpenCode plugin) "
+        "otherwise always takes the buffered-stream path with no opt-out "
+        "(issue #3082). Env: HEADROOM_NO_CCR_RESPONSE_HANDLING."
     ),
 )
 @click.option(
@@ -1191,6 +1222,7 @@ def proxy(
     ccr_inline_resolve: bool,
     ccr_buffered_chat_streaming: bool,
     no_ccr_proactive_expansion: bool,
+    no_ccr_response_handling: bool,
     proxy_extension: tuple[str, ...],
     compressor: tuple[str, ...],
     no_subscription_tracking: bool,
@@ -1528,7 +1560,7 @@ def proxy(
         # for exactly the clients told to use it (#3082).
         ccr_inject_tool=not no_ccr,
         ccr_inject_marker=not no_ccr,
-        ccr_handle_responses=not no_ccr,
+        ccr_handle_responses=not (no_ccr or no_ccr_response_handling),
         ccr_resolve_markers_inline=ccr_inline_resolve,
         ccr_buffered_chat_streaming=ccr_buffered_chat_streaming,
         lossless=lossless,
