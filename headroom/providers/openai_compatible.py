@@ -427,6 +427,62 @@ def create_together_provider(
     return provider
 
 
+def create_runcrate_provider(api_key: str | None = None) -> OpenAICompatibleProvider:
+    """Create provider for Runcrate.
+
+    Runcrate offers high-performance inference for open models.
+
+    Args:
+        api_key: Runcrate API key.
+
+    Returns:
+        Configured provider with Runcrate pricing.
+    """
+    import os
+
+    api_key = api_key or os.environ.get("RUNCRATE_API_KEY")
+    provider = OpenAICompatibleProvider(
+        name="runcrate",
+        base_url="https://api.runcrate.ai/v1",
+        api_key=api_key,
+    )
+
+    # Register common Runcrate models with pricing
+    # Pricing as of Oct 2026 (verify current rates at https://www.runcrate.ai/api/models/catalog)
+    provider.register_model(
+        "deepseek-ai/DeepSeek-V4.1-Flash",
+        context_window=1048576,
+        input_cost_per_1m=0.147,
+        output_cost_per_1m=0.441,
+    )
+    provider.register_model(
+        "zai-org/GLM-5.3",
+        context_window=1048576,
+        input_cost_per_1m=0.590625,
+        output_cost_per_1m=2.625,
+    )
+    provider.register_model(
+        "Qwen/Qwen3.8-Flash",
+        context_window=1000000,
+        input_cost_per_1m=0.11865,
+        output_cost_per_1m=0.4011,
+    )
+    provider.register_model(
+        "openai/gpt-oss-120b",
+        context_window=131072,
+        input_cost_per_1m=0.03885,
+        output_cost_per_1m=0.1785,
+    )
+    provider.register_model(
+        "moonshotai/Kimi-K2.6",
+        context_window=262144,
+        input_cost_per_1m=0.7875,
+        output_cost_per_1m=3.675,
+    )
+
+    return provider
+
+
 def create_groq_provider(
     api_key: str | None = None,
 ) -> OpenAICompatibleProvider:
