@@ -181,6 +181,19 @@ def _render_windows_runner(
     ]
 
 
+def _render_windows_vbs_launcher(vbs_path: Path, ps1_path: Path) -> ArtifactRecord:
+    """Render a non-interactive VBS launcher that runs powershell with SW_HIDE (no console window)."""
+    vbs_path.parent.mkdir(parents=True, exist_ok=True)
+    vbs_content = (
+        'Set WshShell = CreateObject("WScript.Shell")\r\n'
+        'Set fso = CreateObject("Scripting.FileSystemObject")\r\n'
+        "scriptDir = fso.GetParentFolderName(WScript.ScriptFullName)\r\n"
+        f'WshShell.Run "powershell.exe -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File """ & scriptDir & "\\{ps1_path.name}""", 0, True\r\n'
+    )
+    _write_private_text(vbs_path, vbs_content, OWNER_ONLY_FILE_MODE)
+    return ArtifactRecord(kind="script", path=str(vbs_path))
+
+
 def render_runner_scripts(manifest: DeploymentManifest) -> list[ArtifactRecord]:
     """Render runner/watchdog scripts for the deployment profile."""
 
@@ -356,8 +369,15 @@ def _windows_task_xml(
         "    <StartWhenAvailable>true</StartWhenAvailable>\n"
         "  </Settings>\n"
         '  <Actions Context="Author">\n'
-        f"    <Exec>\n      <Command>{_xml_escape(command)}</Command>\n    </Exec>\n"
-        "  </Actions>\n"
+        + (
+            "    <Exec>\n"
+            "      <Command>wscript.exe</Command>\n"
+            f'      <Arguments>//B //Nologo "{_xml_escape(command)}"</Arguments>\n'
+            "    </Exec>\n"
+            if command.lower().endswith(".vbs")
+            else f"    <Exec>\n      <Command>{_xml_escape(command)}</Command>\n    </Exec>\n"
+        )
+        + "  </Actions>\n"
         "</Task>\n"
     )
 
@@ -385,12 +405,39 @@ def _parse_windows_task_xml(raw: bytes | str) -> ElementTree.Element:
     if isinstance(raw, bytes):
         try:
             return ElementTree.fromstring(raw)
-        except ElementTree.ParseError:
-            raw = raw.decode(errors="replace")
+        except (ElementTree.ParseError, ValueError, LookupError):
+            pass
+
+        raw_bytes = raw
+        raw_str = None
+        if b"\x00" in raw_bytes:
+            try:
+                raw_str = raw_bytes.decode("utf-16")
+            except UnicodeDecodeError:
+                raw_str = raw_bytes.decode(errors="replace")
+        else:
+            declared_enc = None
+            match = re.search(rb'<\?xml\s+[^>]*encoding=["\']([^"\']+)["\']', raw_bytes)
+            if match:
+                enc_name = match.group(1).decode("ascii", errors="ignore").lower()
+                if "utf-16" not in enc_name and "utf-32" not in enc_name:
+                    declared_enc = enc_name
+            if declared_enc:
+                try:
+                    raw_str = raw_bytes.decode(declared_enc)
+                except (LookupError, UnicodeDecodeError):
+                    pass
+            if raw_str is None:
+                try:
+                    raw_str = raw_bytes.decode("utf-8-sig")
+                except UnicodeDecodeError:
+                    raw_str = raw_bytes.decode(errors="replace")
+    else:
+        raw_str = raw
     normalized = re.sub(
-        r'<\?xml\s+version="1\.0"\s+encoding="[^"]+"\?>',
-        '<?xml version="1.0"?>',
-        raw,
+        r'<\?xml\s+version="1\.0"\s+encoding="[^"]+"\?>\s*',
+        "",
+        raw_str,
         count=1,
     )
     return ElementTree.fromstring(normalized)
@@ -424,7 +471,7 @@ def _register_windows_task(name: str, xml: str, *, expected_logon_type: str) -> 
 
         try:
             task = _parse_windows_task_xml(query.stdout or b"")
-        except ElementTree.ParseError as exc:
+        except (ElementTree.ParseError, ValueError, LookupError) as exc:
             raise _WindowsTaskRegistrationError(
                 f"Could not parse registered Windows task {name!r}", task_created=True
             ) from exc
@@ -615,10 +662,15 @@ def install_supervisor(manifest: DeploymentManifest, *, start: bool = True) -> l
                 [name for name, _task_cmd, _trigger_xml in preferred_tasks],
                 must_delete=must_delete,
             )
+            vbs_record = _render_windows_vbs_launcher(
+                Path(health_cmd).with_suffix(".vbs"),
+                Path(health_cmd).with_suffix(".ps1"),
+            )
+            records.append(vbs_record)
             _register_windows_task(
                 health_name,
                 _windows_task_xml(
-                    health_cmd,
+                    vbs_record.path,
                     trigger_xml=_windows_health_trigger(),
                     scope=manifest.scope,
                     logon_type="InteractiveToken",
@@ -644,6 +696,11 @@ def install_supervisor(manifest: DeploymentManifest, *, start: bool = True) -> l
     raise click.ClickException(
         f"Persistent {manifest.supervisor_kind} mode is not supported on this platform."
     )
+
+
+# `/End` and `/Delete` report a missing task as "cannot find the file specified";
+# `/Change` reports it as "does not exist in the system".
+_SCHTASKS_ABSENT_TEXT = ("cannot find the file specified", "does not exist in the system")
 
 
 def start_supervisor(manifest: DeploymentManifest) -> None:
@@ -687,16 +744,32 @@ def start_supervisor(manifest: DeploymentManifest) -> None:
         _bootstrap_with_retry(domain, plist_path, action="start")
         return
     if _is_windows():
-        subprocess.run(
-            ["schtasks", "/Change", "/TN", f"{manifest.service_name}-health", "/ENABLE"],
-            check=True,
+        health = f"{manifest.service_name}-health"
+        result = run(
+            ["schtasks", "/Change", "/TN", health, "/ENABLE"],
+            capture_output=True,
+            text=True,
         )
-        subprocess.run(["schtasks", "/Run", "/TN", f"{manifest.service_name}-startup"], check=True)
+        _require_removal_success(
+            result,
+            "schtasks health enable",
+            absent_text=_SCHTASKS_ABSENT_TEXT,
+        )
+        result = run(
+            ["schtasks", "/Run", "/TN", f"{manifest.service_name}-startup"],
+            capture_output=True,
+            text=True,
+        )
+        detail = _result_text(result)
+        if result.returncode != 0:
+            if any(text in detail.lower() for text in _SCHTASKS_ABSENT_TEXT):
+                from .runtime import runtime_ready, start_detached_agent
 
-
-# `/End` and `/Delete` report a missing task as "cannot find the file specified";
-# `/Change` reports it as "does not exist in the system".
-_SCHTASKS_ABSENT_TEXT = ("cannot find the file specified", "does not exist in the system")
+                if not runtime_ready(manifest):
+                    start_detached_agent(manifest.profile)
+                return
+            raise click.ClickException(f"schtasks startup run failed: {detail}")
+        return
 
 
 def stop_supervisor(manifest: DeploymentManifest) -> None:

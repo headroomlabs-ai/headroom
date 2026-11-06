@@ -19,14 +19,17 @@ def _build_mcp_sdk_stub() -> dict[str, ModuleType]:
     mcp_types_module = type(sys)("mcp.types")
 
     class DummyServer:
-        def __init__(self, name: str) -> None:
+        """Mirrors the MCP 2.x surface: handlers arrive as constructor callbacks.
+
+        Deliberately does NOT expose ``list_tools()`` / ``call_tool()`` decorators.
+        Those were the 1.x API, and a stub that keeps accepting them lets a caller
+        still on decorators pass its tests while the real SDK rejects it — which is
+        how the 2.0.0 startup crash reached users with a green suite.
+        """
+
+        def __init__(self, name: str, **handlers) -> None:
             self.name = name
-
-        def list_tools(self):
-            return lambda fn: fn
-
-        def call_tool(self):
-            return lambda fn: fn
+            self.handlers = handlers
 
         def create_initialization_options(self):
             return {}
@@ -39,6 +42,16 @@ def _build_mcp_sdk_stub() -> dict[str, ModuleType]:
         def __init__(self, **kwargs) -> None:
             self.kwargs = kwargs
 
+    class DummyListToolsResult:
+        def __init__(self, tools=None, **kwargs) -> None:
+            self.tools = list(tools or [])
+            self.kwargs = kwargs
+
+    class DummyCallToolResult:
+        def __init__(self, content=None, **kwargs) -> None:
+            self.content = list(content or [])
+            self.kwargs = kwargs
+
     async def dummy_stdio_server():
         raise RuntimeError("stdio_server should not run in unit tests")
 
@@ -46,6 +59,8 @@ def _build_mcp_sdk_stub() -> dict[str, ModuleType]:
     mcp_stdio_module.stdio_server = dummy_stdio_server
     mcp_types_module.TextContent = DummyTextContent
     mcp_types_module.Tool = DummyTool
+    mcp_types_module.ListToolsResult = DummyListToolsResult
+    mcp_types_module.CallToolResult = DummyCallToolResult
 
     return {
         "mcp": mcp_module,
