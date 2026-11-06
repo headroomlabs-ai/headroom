@@ -156,6 +156,69 @@ def test_every_published_docker_variant_includes_bedrock_auth_dependencies() -> 
     assert {"boto3", "botocore"} <= bedrock_names
 
 
+def _dockerfile_stages() -> dict[str, list[str]]:
+    """Map each Dockerfile stage to its instruction lines, parent stages first.
+
+    A stage that is ``FROM <earlier stage>`` inherits that stage's filesystem
+    and metadata (VOLUME, WORKDIR, ARG-derived values), so the parent's lines
+    are part of what the child ships.
+    """
+    own: dict[str, list[str]] = {}
+    parent: dict[str, str] = {}
+    current: list[str] | None = None
+    for raw in (ROOT / "Dockerfile").read_text(encoding="utf-8").splitlines():
+        line = raw.strip()
+        from_match = re.match(r"FROM\s+(\S+)\s+AS\s+(\S+)$", line, re.IGNORECASE)
+        if from_match:
+            base, name = from_match.groups()
+            current = own.setdefault(name, [])
+            if base in own:
+                parent[name] = base
+        elif current is not None and line and not line.startswith("#"):
+            current.append(line)
+    stages: dict[str, list[str]] = {}
+    for name in own:
+        chain, node = [], name
+        while node:
+            chain.insert(0, node)
+            node = parent.get(node, "")
+        stages[name] = [line for stage in chain for line in own[stage]]
+    return stages
+
+
+def test_docker_bake_runtime_args_are_declared_by_the_selected_stage() -> None:
+    """Each bake target's runtime args must reach the stage it builds (#4443).
+
+    Build args are scoped to one Dockerfile stage, so passing ``RUNTIME_HOME``
+    to a target whose ``target =`` stage has no ``ARG RUNTIME_HOME`` is a
+    silent no-op. The distroless ``runtime-slim`` stage once ignored it, so the
+    slim root variants shipped without the state volume.
+    """
+    stages = _dockerfile_stages()
+    bake = (ROOT / "docker-bake.hcl").read_text(encoding="utf-8")
+    blocks = re.findall(r'^target "([^"]+)" \{\n(.*?)^\}', bake, flags=re.S | re.M)
+    checked = {}
+    for name, body in blocks:
+        stage_match = re.search(r'^\s*target\s*=\s*"([^"]+)"', body, re.M)
+        if not stage_match:
+            continue
+        stage = stage_match.group(1)
+        assert stage in stages, f"{name} selects unknown Dockerfile stage {stage}"
+        declared = {m.group(1) for line in stages[stage] if (m := re.match(r"ARG\s+(\w+)", line))}
+        passed = set(re.findall(r"^\s*(RUNTIME_\w+)\s*=", body, re.M))
+        assert passed <= declared, f"{name}: stage {stage} does not declare {passed - declared}"
+        home = re.search(r'RUNTIME_HOME\s*=\s*"([^"]+)"', body)
+        user = re.search(r'RUNTIME_USER\s*=\s*"([^"]+)"', body)
+        if user and user.group(1) == "root":
+            assert home and home.group(1) == "/root", f"{name}: root target needs /root"
+        if home:
+            # The stage must put its state volume under the home it was given.
+            assert "VOLUME ${RUNTIME_HOME}/.headroom" in stages[stage], f"{name}: {stage}"
+        checked[name] = stage
+    assert {"runtime", "runtime-code", "runtime-slim", "runtime-code-slim"} <= set(checked)
+    assert {checked[n] for n in ("runtime-slim", "runtime-code-slim")} == {"runtime-slim"}
+
+
 def test_every_docker_variant_includes_the_redis_extra() -> None:
     """Without the client, HEADROOM_COMPRESS_SESSION_STORE=redis:// stops
     startup and HEADROOM_CCR_BACKEND=redis falls back to a per-process store,
@@ -255,7 +318,7 @@ def test_docker_build_cache_failures_are_best_effort() -> None:
     assert cached["continue-on-error"] is True
     assert "ignore-error=true" in cache_to
     assert fallback_builder["if"] == "steps.bake.outcome == 'failure'"
-    assert fallback_builder["uses"] == "docker/setup-buildx-action@v4"
+    assert fallback_builder["uses"].startswith("docker/setup-buildx-action@")
     assert fallback["if"] == "steps.bake.outcome == 'failure'"
     assert fallback["uses"] == cached["uses"]
     assert fallback["with"]["builder"] == "${{ steps.fallback-buildx.outputs.name }}"
@@ -1162,7 +1225,7 @@ def test_pypi_publish_failure_blocks_github_release() -> None:
     npm_job_start = content.index("publish-npm:", pypi_job_start)
     pypi_job = content[pypi_job_start:npm_job_start]
 
-    assert re.search(r"uses: pypa/gh-action-pypi-publish@v\d+\.\d+\.\d+", pypi_job)
+    assert re.search(r"uses: pypa/gh-action-pypi-publish@[0-9a-f]{40} # v\d+\.\d+\.\d+", pypi_job)
     assert "continue-on-error: true" not in pypi_job
     assert "(vars.PYPI_SKIP == 'true' || needs.publish-pypi.result == 'success')" in content
 
@@ -1607,7 +1670,7 @@ def test_release_please_workflow_exists_and_targets_main() -> None:
     )
 
     content = rp_path.read_text(encoding="utf-8")
-    assert any(f"googleapis/release-please-action@v{v}" in content for v in (4, 5)), (
+    assert re.search(r"googleapis/release-please-action@[0-9a-f]{40} # v[45]\.", content), (
         "release-please.yml must use the v4 or v5 action — earlier versions "
         "have different manifest semantics."
     )
@@ -1750,6 +1813,8 @@ def test_version_sync_covers_every_file_the_verifier_gates() -> None:
         "sdk/typescript/package.json",
         "plugins/headroom-agent-hooks/.claude-plugin/plugin.json",
         "plugins/headroom-agent-hooks/.github/plugin/plugin.json",
+        "plugins/headroom-skill/.claude-plugin/plugin.json",
+        "plugins/headroom-skill/.github/plugin/plugin.json",
         "marketplace.json",
     ]
     for path in gated:
@@ -1760,6 +1825,7 @@ def test_version_sync_covers_every_file_the_verifier_gates() -> None:
         "openclaw",
         "typescript",
         "headroom-agent-hooks",
+        "headroom-skill",
         "marketplace.json",
         "server.json",
     ]:

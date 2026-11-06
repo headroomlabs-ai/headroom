@@ -14,6 +14,7 @@ Usage:
     headroom wrap antigravity               # Start proxy + print Antigravity config instructions
     headroom wrap grok-build                # Start proxy + configure Grok Build
     headroom wrap openclaw                  # Install + configure OpenClaw plugin
+    headroom wrap hermes                    # Start proxy + Hermes agent
     headroom wrap claude --port 9999        # Custom proxy port
     headroom wrap claude -- --model opus    # Pass args to claude
 """
@@ -177,6 +178,8 @@ from headroom.providers.grok_build.config import (
     inject_grok_provider_config,
     restore_grok_provider_config,
 )
+from headroom.providers.hermes import build_launch_env as _build_hermes_launch_env
+from headroom.providers.hermes import unsupported_provider_error as _hermes_provider_error
 from headroom.providers.kimi import build_launch_env as _build_kimi_launch_env
 from headroom.providers.mistral_vibe import build_launch_env as _build_mistral_vibe_launch_env
 from headroom.providers.omp import build_launch_env as _build_omp_launch_env
@@ -5669,6 +5672,10 @@ def _launch_tool(
         port_holder[0] = actual_port
         _push_runtime_env(actual_port, no_proxy)
 
+        # Let Headroom commands launched inside the wrapped session target the
+        # proxy's actual port, including fallback/dedicated-session ports.
+        env["HEADROOM_PORT"] = str(actual_port)
+
         # If port fell back, update environment URLs to point at the actual port.
         if actual_port != port:
             for k, v in dict(env).items():
@@ -6376,6 +6383,7 @@ def claude(
         click.echo()
 
         env = os.environ.copy()
+        env["HEADROOM_PORT"] = str(actual_port)
         if use_vertex:
             # Claude Code stays in Vertex mode (keeps CLAUDE_CODE_USE_VERTEX,
             # ANTHROPIC_VERTEX_PROJECT_ID, CLOUD_ML_REGION, ADC — all inherited);
@@ -8229,7 +8237,71 @@ def continue_dev(
 
 
 # =============================================================================
+# Hermes (Nous Research)
+# =============================================================================
 
+
+@wrap.command(context_settings={"ignore_unknown_options": True})
+@_retired_context_tool_option
+@proxy_port_option()
+@click.option("--code-graph", is_flag=True, help="Enable code graph indexing")
+@click.option("--no-proxy", is_flag=True, help="Skip proxy startup (use existing proxy)")
+@click.option("--learn", is_flag=True, help="Enable live traffic learning")
+@click.option("--memory", is_flag=True, help="Enable persistent cross-session memory")
+@click.option("--backend", default=None, help="API backend")
+@click.option("--anyllm-provider", default=None, help="Provider for any-llm backend")
+@click.option("--region", default=None, help="Cloud region for Bedrock/Vertex")
+@click.option("--verbose", "-v", is_flag=True, help="Verbose output")
+@click.option("--prepare-only", is_flag=True, hidden=True)
+@click.argument("hermes_args", nargs=-1, type=click.UNPROCESSED)
+def hermes(
+    port: int,
+    code_graph: bool,
+    no_proxy: bool,
+    learn: bool,
+    memory: bool,
+    backend: str | None,
+    anyllm_provider: str | None,
+    region: str | None,
+    verbose: bool,
+    prepare_only: bool,
+    hermes_args: tuple,
+) -> None:
+    """Launch the Hermes agent through the Headroom proxy."""
+    if prepare_only:
+        return
+
+    hermes_bin = shutil.which("hermes")
+    if not hermes_bin:
+        click.echo("Error: 'hermes' not found in PATH.")
+        click.echo("Install Hermes: https://hermes-agent.nousresearch.com/")
+        raise SystemExit(1)
+
+    provider_error = _hermes_provider_error(hermes_args)
+    if provider_error:
+        click.echo(provider_error)
+        raise SystemExit(1)
+
+    env, env_vars_display = _build_hermes_launch_env(port, os.environ)
+    _launch_tool(
+        binary=hermes_bin,
+        args=hermes_args,
+        env=env,
+        port=port,
+        no_proxy=no_proxy,
+        tool_label="HERMES",
+        env_vars_display=env_vars_display,
+        learn=learn,
+        memory=memory,
+        agent_type="hermes",
+        code_graph=code_graph,
+        backend=backend,
+        anyllm_provider=anyllm_provider,
+        region=region,
+    )
+
+
+# =============================================================================
 # OpenClaw
 # =============================================================================
 
@@ -9100,14 +9172,14 @@ def omp(
     """Launch Oh My Pi (omp) through Headroom proxy.
 
     \b
-    Points omp's built-in `anthropic` provider at Headroom by injecting a
-    marker-fenced `providers.anthropic.baseUrl` override into
-    ~/.omp/agent/models.yml (pre-wrap file backed up byte-for-byte; undo with
-    `headroom unwrap omp`). omp resolves its Anthropic chat endpoint from
-    models.yml — ANTHROPIC_BASE_URL only affects its web-search helper — and a
-    same-ID override keeps omp's bundled model catalog and stored credentials.
-    omp's other providers (OpenAI-direct, Gemini, ...) keep their normal
-    endpoints; route those via your own custom provider in models.yml.
+    Points omp's built-in `anthropic`, `openai` (API-key), and `openai-codex`
+    (OAuth) providers at Headroom by injecting marker-fenced base-URL overrides
+    into ~/.omp/agent/models.yml (pre-wrap file backed up byte-for-byte; undo
+    with `headroom unwrap omp`). omp resolves these endpoints from models.yml —
+    ANTHROPIC_BASE_URL only affects its web-search helper — and same-ID
+    overrides keep omp's bundled model catalog and stored credentials. OMP
+    Codex appends `/codex/responses`, which Headroom already aliases. Gemini
+    and other providers keep their normal endpoints.
 
     \b
     Examples:
