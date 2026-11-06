@@ -17,6 +17,7 @@ class AuthMode(str, enum.Enum):
 SUBSCRIPTION_UA_PREFIXES: tuple[str, ...] = (
     "claude-cli/",
     "claude-code/",
+    "codebuddy/",
     "codex-cli/",
     "cursor/",
     "claude-vscode/",
@@ -31,6 +32,7 @@ CLIENT_UA_MAP: tuple[tuple[str, str], ...] = (
     ("claude-cli/", "claude-code"),
     ("claude-vscode/", "claude-vscode"),
     ("anthropic-cli/", "anthropic-cli"),
+    ("codebuddy/", "codebuddy"),
     ("codex-cli/", "codex"),
     ("cursor/", "cursor"),
     # Current Grok Build releases send "grok-shell/<version>" (verified against

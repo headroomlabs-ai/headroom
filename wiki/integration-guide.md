@@ -9,7 +9,7 @@ You don't need to run the Headroom proxy. Headroom is a compression library that
 | Any Python app | [`compress()`](#compress-function) | 2 lines |
 | LiteLLM | [LiteLLM callback](#litellm) | 1 line |
 | A Python proxy (FastAPI, custom) | [ASGI middleware](#asgi-middleware) | 1 line |
-| Claude Code / Cursor / Copilot CLI | [Headroom proxy](#proxy) | 1 command or env var |
+| Claude Code / CodeBuddy / Cursor / Copilot CLI | [Headroom proxy](#proxy) | 1 command or env var |
 | Agno agents | [Agno integration](#agno) | Wrap model |
 | LangChain | [LangChain integration](#langchain) | Wrap model |
 | Non-Python app | [Headroom proxy](#proxy) | HTTP |
@@ -187,7 +187,7 @@ Response headers include:
 
 ## Proxy
 
-The Headroom proxy is a standalone HTTP server. Best for non-Python apps or tools that only support base URL configuration (Claude Code, Cursor, GitHub Copilot CLI).
+The Headroom proxy is a standalone HTTP server. Best for non-Python apps or tools that only support base URL configuration (Claude Code, CodeBuddy, Cursor, GitHub Copilot CLI).
 
 ```bash
 pip install "headroom-ai[all]"
@@ -197,6 +197,9 @@ headroom proxy --port 8787
 ```bash
 # Claude Code
 ANTHROPIC_BASE_URL=http://localhost:8787 claude
+
+# CodeBuddy
+CODEBUDDY_BASE_URL=http://localhost:8787/v2 codebuddy
 
 # GitHub Copilot CLI
 headroom wrap copilot -- --model claude-sonnet-4-20250514

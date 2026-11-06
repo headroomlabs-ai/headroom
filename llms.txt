@@ -21,7 +21,7 @@ The canonical, always-current documentation index lives at the docs site below. 
 - TypeScript / Node: `npm install headroom-ai` (or `pnpm add headroom-ai`, `bun add headroom-ai`)
 - Docker local: `docker run --rm -p 127.0.0.1:8787:8787 ghcr.io/headroomlabs-ai/headroom:latest --host 0.0.0.0`
 - Run the proxy: `headroom proxy --port 8787` then point any client at `http://127.0.0.1:8787`
-- Wrap an agent in one command: `headroom wrap claude` (also: `codex`, `grok`, `copilot`, `cursor`, `aider`, `opencode`, `cline`, `continue`, `goose`, `openhands`, `openclaw`, `vibe`, `omp`, `zcode`)
+- Wrap an agent in one command: `headroom wrap claude` (also: `codebuddy`, `codex`, `grok`, `copilot`, `cursor`, `aider`, `opencode`, `cline`, `continue`, `goose`, `openhands`, `openclaw`, `vibe`, `omp`, `zcode`)
 - Zero-network check, no provider key: `HEADROOM_OFFLINE=1 python -c "from headroom import compress; log='\n'.join(f'INFO step {i} ok' for i in range(3000))+'\nFATAL disk full'; r=compress([{'role':'user','content':'What failed?'},{'role':'assistant','content':None,'tool_calls':[{'id':'c1','type':'function','function':{'name':'logs','arguments':'{}'}}]},{'role':'tool','tool_call_id':'c1','content':log}], model='gpt-4o'); print(r.tokens_before, '->', r.tokens_after, 'FATAL kept:', 'FATAL' in str(r.messages))"` (prints roughly `20000 -> 95 FATAL kept: True`)
 
 ## By task (plain-language jobs this package does)

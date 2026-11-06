@@ -42,6 +42,7 @@ This page is the authoritative reference for the **Python Headroom CLI** exposed
 | `headroom memory ...` | Inspect and manage stored memories | **native in container** |
 | `headroom mcp ...` | Install, inspect, remove, or serve MCP integration | **native in container** |
 | `headroom wrap claude` | Start proxy and launch Claude Code | **host-bridged** |
+| `headroom wrap codebuddy` | Start proxy and launch CodeBuddy | **host-bridged** |
 | `headroom wrap copilot` | Start proxy and launch GitHub Copilot CLI | **python-native only** |
 | `headroom wrap codex` | Start proxy and launch Codex CLI | **host-bridged** |
 | `headroom wrap aider` | Start proxy and launch Aider | **host-bridged** |
@@ -239,12 +240,13 @@ Usage: headroom wrap [OPTIONS] COMMAND [ARGS]...
   Wrap CLI tools to run through Headroom.
 
 Commands:
-  aider     Launch aider through Headroom proxy.
-  claude    Launch Claude Code through Headroom proxy.
-  copilot   Launch GitHub Copilot CLI through Headroom proxy.
-  codex     Launch OpenAI Codex CLI through Headroom proxy.
-  cursor    Start Headroom proxy for use with Cursor.
-  openclaw  Install and configure Headroom OpenClaw plugin in one command.
+  aider      Launch aider through Headroom proxy.
+  claude     Launch Claude Code through Headroom proxy.
+  codebuddy  Launch CodeBuddy through Headroom proxy.
+  copilot    Launch GitHub Copilot CLI through Headroom proxy.
+  codex      Launch OpenAI Codex CLI through Headroom proxy.
+  cursor     Start Headroom proxy for use with Cursor.
+  openclaw   Install and configure Headroom OpenClaw plugin in one command.
 ```
 
 </details>
@@ -337,7 +339,7 @@ headroom learn --agent codex --all
 | `--project` | current project resolution | Target project path |
 | `--all` | off | Analyze all discovered projects |
 | `--apply` | off | Write recommendations instead of dry-run output |
-| `--agent` | `auto` | Agent source: `auto`, built-ins (`claude`, `codex`, `gemini`), or plugin-provided names |
+| `--agent` | `auto` | Agent source: `auto`, built-ins (`claude`, `codebuddy`, `codex`, `gemini`), or plugin-provided names |
 | `--model` | auto-detect | LLM model used for analysis |
 
 Notes:
@@ -683,7 +685,7 @@ Options:
 
 ```bash
 headroom install apply --preset persistent-service --providers auto
-headroom install apply --preset persistent-task --providers manual --target claude --target codex
+headroom install apply --preset persistent-task --providers manual --target claude --target codebuddy --target codex
 headroom install apply --preset persistent-docker --scope user
 ```
 
@@ -930,6 +932,7 @@ Legend:
 | `headroom mcp serve` | native | native in container | full |
 | `headroom install apply|status|start|stop|restart|remove` | native | Docker-native wrapper for `persistent-docker`; compose remains an alternative | partial |
 | `headroom wrap claude` | native | host-bridged | partial |
+| `headroom wrap codebuddy` | native | host-bridged | partial |
 | `headroom wrap copilot` | native | not implemented in Docker-native wrapper | none |
 | `headroom wrap codex` | native | host-bridged | partial |
 | `headroom wrap aider` | native | host-bridged | partial |

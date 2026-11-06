@@ -97,6 +97,7 @@ Headroom works as a **transparent proxy** (zero code changes), a **Python functi
 
     ```bash
     headroom wrap claude       # Claude Code
+    headroom wrap codebuddy    # CodeBuddy
     headroom wrap copilot -- --model claude-sonnet-4-20250514
     headroom wrap codex        # OpenAI Codex CLI
     headroom wrap aider        # Aider
