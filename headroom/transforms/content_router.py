@@ -1214,6 +1214,11 @@ def _resolve_detect_backend() -> str:
 _DETECT_TIMEOUT_ENV = "HEADROOM_DETECT_TIMEOUT_SECS"
 _DEFAULT_DETECT_TIMEOUT_SECS = 5.0
 
+# A complete document starts with a DOCTYPE or the root element. The HTML
+# detector scores tags anywhere in the sample, so this is what separates a real
+# page from a fenced example embedded in prose.
+_TOP_LEVEL_HTML_DOCUMENT = re.compile(r"^\s*(?:<!doctype\s+html|<html[\s>])", re.IGNORECASE)
+
 
 def _detect_timeout_secs() -> float:
     """Watchdog budget (seconds) for one native detect call.
@@ -1350,8 +1355,12 @@ def _detect_content(content: str) -> DetectionResult:
     from headroom._ort import rust_ort_runtime_compatible
 
     if not rust_ort_runtime_compatible():
+        # Expected on every install without the proxy extra's ONNX Runtime
+        # (plain ``pip install headroom-ai``): the pure-Python detector is the
+        # supported path there, so this is information, not a warning. The
+        # circuit breaker above makes it fire once per process.
         _detect_native_unhealthy = True
-        logger.warning(
+        logger.info(
             "Native content detection requires ONNX Runtime 1.24+; "
             "using pure-Python detection for this process."
         )
@@ -3503,6 +3512,31 @@ class ContentRouter(Transform):
             # trust it over the regex heuristics.
             if detection.content_type == ContentType.SOURCE_CODE and detection.confidence >= 0.8:
                 return self._strategy_from_detection(detection)
+            # Same false-positive shape on a complete HTML document: embedded
+            # JSON (``<script type="application/ld+json">``) or ordinary body
+            # prose trips ``has_json_blocks``/``has_prose``, so a page with a
+            # clear DOCTYPE/``<html>`` root still gets routed through MIXED —
+            # split section-by-section instead of reaching the HTML extractor.
+            # The split JSON section can compress well in isolation while the
+            # surrounding markup never gets HTML-specific extraction, and the
+            # split sections lose the parent HTML type entirely.
+            #
+            # No confidence gate here on purpose. ``detect_content_type`` only
+            # returns HTML when its own score clears 0.7 (content_detector
+            # ``_try_detect_html``), and the native backend hardcodes
+            # ``confidence=1.0`` for every result, so a threshold at this call
+            # site would read as "high-confidence only" while never filtering
+            # anything. The detector's gate is the real one.
+            if detection.content_type == ContentType.HTML:
+                # Only a complete top-level document gets the override. The
+                # detector scores tags anywhere in the sample, so a fenced HTML
+                # example inside a prose answer also reads as HTML; extracting
+                # the whole response would drop the surrounding instructions and
+                # the fence lines. Keep that shape on MIXED.
+                document = _strip_detection_envelope(content)
+                if _TOP_LEVEL_HTML_DOCUMENT.match(document):
+                    return self._strategy_from_detection(detection)
+                return CompressionStrategy.MIXED
             return CompressionStrategy.MIXED
 
         # 2. Not mixed — map the detected type straight to a strategy.
@@ -5189,6 +5223,13 @@ class ContentRouter(Transform):
                 self._kompress_max_tokens,
                 self._kompress_gate_fires,
             )
+            if protected:
+                # The fallback compressors take no ``ccr_original`` and would
+                # store the ``{{HEADROOM_TAG_N}}`` placeholder text in CCR; any
+                # placeholder line they drop is also discarded by
+                # ``restore_tags``, losing the tagged block outright. Pass the
+                # original through unchanged instead (as the budget branch above).
+                return content, _estimate_tokens(content)
             out = text_to_compress
             crusher = self._get_text_crusher()
             if crusher is not None:
@@ -5209,8 +5250,6 @@ class ContentRouter(Transform):
                             "Kompress size-gate -> LogCompressor failed (%s); passing through", e
                         )
                         out = text_to_compress
-            if protected:
-                out = restore_tags(out, protected)
             return out, _estimate_tokens(out)
 
         # Reached only when the gate is enabled and this eligible block is
