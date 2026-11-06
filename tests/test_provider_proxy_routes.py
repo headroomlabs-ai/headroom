@@ -6,6 +6,7 @@ from typing import Any
 from unittest.mock import patch
 
 import httpx
+import pytest
 from fastapi.responses import JSONResponse
 from fastapi.testclient import TestClient
 
@@ -756,6 +757,7 @@ def test_openai_response_subpath_aliases_and_chatgpt_auth_use_expected_targets(m
     with TestClient(_app()) as client:
         fake = FakeAsyncClient()
         client.app.state.proxy.http_client = fake
+        client.app.state.proxy.http_client_h1 = fake
         assert client.get("/v1/codex/responses/items/resp_1").status_code == 200
         assert client.post("/backend-api/responses/items/resp_2").status_code == 200
         assert client.delete("/backend-api/codex/responses/items/resp_3").status_code == 200
@@ -1070,6 +1072,7 @@ def test_v1_models_fetches_codex_registry_under_chatgpt_auth(monkeypatch) -> Non
     with TestClient(_app()) as client:
         fake_http_client = FakeAsyncClient()
         client.app.state.proxy.http_client = fake_http_client
+        client.app.state.proxy.http_client_h1 = fake_http_client
         response = client.get(
             "/v1/models?client_version=0.135.0",
             headers={
@@ -1193,6 +1196,7 @@ def test_v1_models_get_single_dynamic_under_chatgpt_auth() -> None:
     with TestClient(_app()) as client:
         fake_http_client = FakeAsyncClient()
         client.app.state.proxy.http_client = fake_http_client
+        client.app.state.proxy.http_client_h1 = fake_http_client
         ok = client.get(
             "/v1/models/gpt-5.3-codex-spark",
             headers={
@@ -1444,3 +1448,118 @@ def test_anthropic_messages_strips_ansi_model_id_before_upstream() -> None:
 
     assert response.status_code == 200
     assert fake_http_client.bodies[0]["model"] == "claude-opus-4-8"
+
+
+def test_model_metadata_routes_honor_the_custom_base_url(monkeypatch) -> None:
+    # A client that names its own upstream must get its model list from that
+    # upstream, not from the proxy's default OpenAI one: the chat and
+    # responses handlers already honor the header (#4302).
+    monkeypatch.setenv("HEADROOM_ALLOWED_BASE_URLS", "custom.example")
+    calls: list[tuple[str, str, str]] = []
+
+    async def fake_passthrough(self, request, base_url, sub_path="", provider_name=""):  # type: ignore[no-untyped-def]
+        calls.append((request.url.path, base_url, provider_name))
+        return JSONResponse(
+            {
+                "path": request.url.path,
+                "base_url": base_url,
+                "sub_path": sub_path,
+                "provider": provider_name,
+            }
+        )
+
+    monkeypatch.setattr(HeadroomProxy, "handle_passthrough", fake_passthrough)
+
+    with TestClient(_app()) as client:
+        listed = client.get(
+            "/v1/models",
+            headers={"x-headroom-base-url": "https://custom.example"},
+        )
+        fetched = client.get(
+            "/v1/models/gpt-5",
+            headers={"x-headroom-base-url": "https://custom.example/"},
+        )
+        # An Anthropic-compatible gateway names its upstream the same way.
+        anthropic = client.get(
+            "/v1/models",
+            headers={
+                "x-api-key": "gateway-key",
+                "x-headroom-base-url": "https://custom.example",
+            },
+        )
+
+    assert listed.json()["base_url"] == "https://custom.example"
+    assert fetched.json()["base_url"] == "https://custom.example"
+    assert calls[0][2] == "openai"
+    assert anthropic.json()["base_url"] == "https://custom.example"
+    assert calls[-1][2] == "anthropic"
+
+
+def test_model_metadata_routes_reject_an_unsafe_custom_base_url(monkeypatch) -> None:
+    # A client-named upstream goes through the same SSRF guard as the other
+    # routes: an unsafe one is refused, and the request never reaches an
+    # upstream. Falling back to the configured upstream would have sent the
+    # authenticated request, and its credentials, to a host the client did
+    # not name.
+    monkeypatch.setenv("HEADROOM_ALLOWED_BASE_URLS", "custom.example")
+    calls: list[tuple[str, str, str]] = []
+
+    async def fake_passthrough(self, request, base_url, sub_path="", provider_name=""):  # type: ignore[no-untyped-def]
+        calls.append((request.url.path, base_url, provider_name))
+        return JSONResponse(
+            {
+                "path": request.url.path,
+                "base_url": base_url,
+                "sub_path": sub_path,
+                "provider": provider_name,
+            }
+        )
+
+    monkeypatch.setattr(HeadroomProxy, "handle_passthrough", fake_passthrough)
+
+    credential = {"authorization": "Bearer synthetic-private-gateway-key"}
+    with TestClient(_app()) as client:
+        listed = client.get(
+            "/v1/models",
+            headers={**credential, "x-headroom-base-url": "http://169.254.169.254"},
+        )
+        fetched = client.get(
+            "/v1/models/gpt-5",
+            headers={**credential, "x-headroom-base-url": "http://169.254.169.254"},
+        )
+
+    assert listed.status_code == 400
+    assert listed.json()["detail"] == "Rejected unsafe upstream base URL"
+    assert fetched.status_code == 400
+    # No upstream call at all: the rejected request must not be redirected to
+    # the configured upstream, which would disclose the credential.
+    assert calls == []
+
+
+@pytest.mark.parametrize("path", ["/v1/models", "/v1/models/gpt-5"])
+def test_model_metadata_rejection_redacts_url_credentials(monkeypatch, caplog, path) -> None:
+    """Reject unsafe destinations without exposing URL credentials in the warning."""
+    monkeypatch.setenv("HEADROOM_ALLOWED_BASE_URLS", "")
+    calls = []
+
+    async def unexpected_passthrough(*args, **kwargs):
+        calls.append(True)
+        raise AssertionError("Rejected metadata request reached upstream")
+
+    monkeypatch.setattr(HeadroomProxy, "handle_passthrough", unexpected_passthrough)
+    with caplog.at_level("WARNING"), TestClient(_app()) as client:
+        response = client.get(
+            path,
+            headers={
+                "authorization": "Bearer synthetic-gateway-key",
+                "x-headroom-base-url": (
+                    "https://synthetic-user:synthetic-password@127.0.0.1/v1"
+                    "?api_key=synthetic-query-secret"
+                ),
+            },
+        )
+    assert response.status_code == 400
+    assert calls == []
+    assert "rejecting unsafe x-headroom-base-url" in caplog.text
+    for secret in ("synthetic-user", "synthetic-password", "synthetic-query-secret"):
+        assert secret not in caplog.text
