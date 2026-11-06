@@ -1,0 +1,124 @@
+---
+title: FastAPI
+description: Cut LLM input tokens in a FastAPI app. Compress tool outputs, logs and chat history with compress() before calling OpenAI or Anthropic. No API key needed to try it.
+---
+
+Headroom's `compress()` is a function over your message list, so in FastAPI it
+is one call before your model call. This page builds a `POST /chat` endpoint
+that returns the compressed messages and token counts, then shows the one-line
+change that forwards them to a provider.
+
+## Install
+
+```bash
+pip install fastapi "uvicorn[standard]" headroom-ai
+```
+
+No provider key, no model download. The base package is enough for
+`compress()`; `[ml]` adds the Kompress text model later if you want more
+savings on prose-heavy tool output.
+
+## Endpoint
+
+```python
+# main.py
+from typing import Any
+
+from fastapi import FastAPI
+from pydantic import BaseModel
+
+from headroom import compress
+
+app = FastAPI()
+
+
+class ChatIn(BaseModel):
+    messages: list[dict[str, Any]]  # OpenAI or Anthropic message dicts
+    model: str = "gpt-4o"  # used for token counting and the context limit
+
+
+@app.post("/chat")
+def chat(body: ChatIn) -> dict[str, Any]:
+    result = compress(body.messages, model=body.model)
+    return {
+        "messages": result.messages,
+        "tokens_before": result.tokens_before,
+        "tokens_after": result.tokens_after,
+        "tokens_saved": result.tokens_saved,
+        "transforms": result.transforms_applied,
+    }
+```
+
+Save it as `main.py` and run it with no network at all:
+
+```bash
+HEADROOM_OFFLINE=1 uvicorn main:app --port 8000
+```
+
+Then post a 3,000-line tool output with one error in it:
+
+```bash
+python - <<'EOF_PY'
+import json, urllib.request
+log = "\n".join([f"INFO step {i} ok" for i in range(3000)] + ["FATAL disk full"])
+msgs = [
+  {"role": "user", "content": "What failed?"},
+  {"role": "assistant", "content": None, "tool_calls": [{"id": "c1", "type": "function", "function": {"name": "logs", "arguments": "{}"}}]},
+  {"role": "tool", "tool_call_id": "c1", "content": log},
+]
+req = urllib.request.Request("http://127.0.0.1:8000/chat", data=json.dumps({"messages": msgs}).encode(), headers={"content-type": "application/json"})
+out = json.load(urllib.request.urlopen(req))
+print(out["tokens_before"], "->", out["tokens_after"], "FATAL kept:", "FATAL" in json.dumps(out["messages"]))
+EOF_PY
+```
+
+Expected output is on the order of `20000 -> 95 FATAL kept: True`: the
+repeated `INFO` lines collapse, the `FATAL` line survives.
+
+## Forward to the provider
+
+Replace `messages=body.messages` with `messages=result.messages` in your
+existing call. Nothing else changes:
+
+```python
+from openai import OpenAI
+
+client = OpenAI()
+
+
+@app.post("/answer")
+def answer(body: ChatIn) -> dict[str, Any]:
+    result = compress(body.messages, model=body.model)
+    completion = client.chat.completions.create(model=body.model, messages=result.messages)
+    return {
+        "answer": completion.choices[0].message.content,
+        "tokens_saved": result.tokens_saved,
+    }
+```
+
+For Anthropic, pass `result.messages` to `client.messages.create` the same way.
+
+## What it keeps
+
+Error lines, stack traces, first and last items, and statistical outliers in
+JSON arrays are kept. Repeated and low-information lines are dropped. Originals
+are cached locally; the model can ask for them back when it has the retrieval
+tool, which the [proxy](/docs/proxy) and the [MCP server](/docs/mcp) provide
+([CCR](/docs/ccr)). The plain `compress()` call above does not expose it.
+Compression applies to tool and assistant messages; user messages are left alone
+unless you pass `compress_user_messages=True`. Short prompts and prose compress
+very little; see [Limitations](/docs/limitations).
+
+## Not this page
+
+`headroom.integrations.asgi.CompressionMiddleware` is for FastAPI apps that
+*serve* an LLM-shaped endpoint (`/v1/messages`, `/v1/chat/completions`), such
+as a proxy you built. For an app that *calls* a provider, use `compress()` as
+above.
+
+## Settings you will reach for
+
+- `HEADROOM_OFFLINE=1`: no update check, no model or pricing-table downloads, no beacon. Use it in CI and sandboxes. See [Security model](/docs/security-model).
+- `compress(..., model_limit=N)`: tell Headroom the model's window is N tokens, so it compresses harder as the prompt approaches it. It never truncates history.
+- `compress(..., protect_recent=K)`: leave source code in the last K messages uncompressed.
+- [Configuration](/docs/configuration) has the rest.

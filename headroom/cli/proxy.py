@@ -529,6 +529,17 @@ def dashboard(port: int, no_open: bool) -> None:
     ),
 )
 @click.option(
+    "--ccr-buffered-chat-streaming",
+    is_flag=True,
+    envvar="HEADROOM_CCR_BUFFERED_CHAT_STREAMING",
+    help=(
+        "Answer headroom_retrieve on streaming /v1/chat/completions. A turn that "
+        "carries a redeemable marker runs as stream:false upstream and is "
+        "re-emitted as chat.completion.chunk frames, so that turn's text arrives "
+        "all at once. Off by default. Env: HEADROOM_CCR_BUFFERED_CHAT_STREAMING."
+    ),
+)
+@click.option(
     "--no-ccr-proactive-expansion",
     is_flag=True,
     envvar="HEADROOM_NO_CCR_PROACTIVE_EXPANSION",
@@ -800,7 +811,8 @@ def dashboard(port: int, no_open: bool) -> None:
     help=(
         "Enable/disable AST-based code compression. Requires the optional "
         "tree-sitter dependency: pip install headroom-ai[code]. "
-        "Default: disabled. Env: HEADROOM_CODE_AWARE_ENABLED=1 to enable."
+        "Default: enabled. Disable with --no-code-aware or "
+        "HEADROOM_CODE_AWARE_ENABLED=0."
     ),
 )
 @click.option(
@@ -1123,7 +1135,7 @@ def dashboard(port: int, no_open: bool) -> None:
 @click.option(
     "--no-telemetry",
     is_flag=True,
-    help="Force anonymous usage telemetry off (already the default; env: HEADROOM_TELEMETRY=off)",
+    help="Turn off local stats and the anonymous upload beacon (env: HEADROOM_TELEMETRY=off)",
 )
 @click.option(
     "--stateless",
@@ -1188,6 +1200,7 @@ def proxy(
     no_ccr: bool,
     lossless: bool,
     ccr_inline_resolve: bool,
+    ccr_buffered_chat_streaming: bool,
     no_ccr_proactive_expansion: bool,
     proxy_extension: tuple[str, ...],
     compressor: tuple[str, ...],
@@ -1529,6 +1542,7 @@ def proxy(
         ccr_inject_marker=not no_ccr,
         ccr_handle_responses=not no_ccr,
         ccr_resolve_markers_inline=ccr_inline_resolve,
+        ccr_buffered_chat_streaming=ccr_buffered_chat_streaming,
         lossless=lossless,
         ccr_proactive_expansion=not no_ccr_proactive_expansion,
         # Flatten repeat-flag tuple AND any comma-separated values inside it.
@@ -1581,10 +1595,9 @@ def proxy(
         # Code-aware compression resolution:
         # 1. Explicit --code-aware / --no-code-aware always wins.
         # 2. Otherwise read HEADROOM_CODE_AWARE_ENABLED (truthy = on).
-        # 3. Otherwise default off — matches the prior cli/proxy.py behavior so
-        #    existing users see no change unless they opt in.
-        # Default ON (coding posture; consistent with the argparse server path).
-        # Degrades gracefully to a no-op when tree-sitter isn't installed.
+        # 3. Otherwise default ON (coding posture; consistent with the argparse
+        #    server path). Degrades gracefully to a no-op when tree-sitter
+        #    isn't installed.
         code_aware_enabled=(
             bool(code_aware_flag)
             if code_aware_flag is not None

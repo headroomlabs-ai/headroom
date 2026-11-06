@@ -102,6 +102,13 @@ Headroom uses a `pyproject.toml`/`maturin` build backend. Older `pip`
 versions may fail editable installs by looking for `setup.py`; upgrade `pip`
 first or use `uv sync --extra dev`.
 
+Handler tests that read request bodies should use a real Starlette `Request`
+with ASGI receive messages, including streamed chunks, rather than patching the
+body reader. Size-limit regressions must configure an explicit test ceiling;
+the production ceiling is independent of the compression admission threshold.
+Avoid replacing imported proxy packages in `sys.modules`: it can split live
+helper and exception identities across full-suite test orderings.
+
 ### Dev Containers
 
 Two configs ship for VS Code / Codespaces:
@@ -122,7 +129,7 @@ Enable or disable automatic Copilot review in **Settings → Rules → Rulesets 
 - [Ruff](https://github.com/astral-sh/ruff) for lint + format, line length 100, PEP 8.
 - Type hints on public functions; Google-style docstrings.
 - Cover new behavior + edge cases; aim >80% coverage on new code.
-- Python 3.10+. Optional features go behind extras.
+- Python 3.11+. Optional features go behind extras.
 - **Headroom writes LF and normalizes on read, on every platform.** Pass
   `newline="\n"` to every `write_text`/`open` that writes a context, memory,
   or state file, and normalize `\r\n`/`\r` when you read one back. Without

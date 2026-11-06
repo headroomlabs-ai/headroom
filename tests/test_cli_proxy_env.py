@@ -564,6 +564,17 @@ class TestCLIProxyEnvVars:
         assert result.exit_code == 0, result.output
         assert captured_config["config"].code_aware_enabled is True
 
+    @pytest.mark.parametrize("path", [["proxy"], ["install", "apply"]])
+    def test_code_aware_help_documents_enabled_default(self, path):
+        """--code-aware help must describe the default it resolves to (ON)."""
+        cmd = main
+        for name in path:
+            cmd = cmd.commands[name]
+        option = next(p for p in cmd.params if "--code-aware" in p.opts)
+
+        assert "Default: enabled" in option.help
+        assert "Default: disabled" not in option.help
+
     def test_code_aware_enabled_from_cli_flag(self, runner):
         """--code-aware should enable code-aware compression in the wrapper."""
         captured_config = {}
@@ -785,6 +796,27 @@ class TestCLIProxyEnvVars:
         assert result.exit_code == 0, result.output
         assert captured_config["config"].openai_api_url == "http://my-vllm:4000"
         assert captured_config["config"].gemini_api_url == "http://my-gemini:5000"
+
+    @pytest.mark.parametrize(
+        ("args", "env", "expected"),
+        [
+            ([], {}, False),
+            (["--ccr-buffered-chat-streaming"], {}, True),
+            ([], {"HEADROOM_CCR_BUFFERED_CHAT_STREAMING": "1"}, True),
+        ],
+    )
+    def test_ccr_buffered_chat_streaming_reaches_config(self, runner, args, env, expected):
+        """`headroom proxy` builds its own ProxyConfig, so the flag has to be wired here too."""
+        captured_config = {}
+
+        def mock_run_server(config, **kwargs):
+            captured_config["config"] = config
+
+        with patch("headroom.proxy.server.run_server", mock_run_server):
+            result = runner.invoke(main, ["proxy", *args], env=env, catch_exceptions=False)
+
+        assert result.exit_code == 0, result.output
+        assert captured_config["config"].ccr_buffered_chat_streaming is expected
 
     @pytest.mark.parametrize("timeout", [-1, 0, 1, 10000])
     def test_request_timeout_cli_flags(self, runner, timeout):

@@ -42,7 +42,16 @@ def test_blocks_internal_and_invalid(url: str) -> None:
     assert is_safe_upstream_url(url) is False
 
 
-@pytest.mark.parametrize("url", ["https://8.8.8.8/v1", "https://1.1.1.1/", "wss://9.9.9.9/rt"])
+@pytest.mark.parametrize(
+    "url",
+    [
+        "https://8.8.8.8/v1",
+        "https://1.1.1.1/",
+        "wss://9.9.9.9/rt",
+        # NAT64 well-known prefix embedding 8.8.8.8: the translator delivers it there.
+        "https://[64:ff9b::808:808]/v1",
+    ],
+)
 def test_allows_public(url: str) -> None:
     assert is_safe_upstream_url(url) is True
 
@@ -63,7 +72,12 @@ def test_allows_public(url: str) -> None:
         ("6to4 embedding loopback", "http://[2002:7f00:1::]/"),
         ("6to4 embedding RFC1918", "http://[2002:a00:1::]/"),
         ("NAT64 embedding loopback", "http://[64:ff9b::7f00:1]/"),
+        ("NAT64 embedding RFC1918", "http://[64:ff9b::a00:1]/"),
+        ("NAT64 embedding metadata", "http://[64:ff9b::a9fe:a9fe]/"),
         ("NAT64 local-use prefix", "http://[64:ff9b:1::7f00:1]/"),
+        # Local-use embedding depends on the operator's prefix length, so the
+        # low 32 bits are not reliably the destination: never unwrapped.
+        ("NAT64 local-use prefix embedding a public IPv4", "http://[64:ff9b:1::808:808]/"),
         ("teredo", "http://[2001:0::7f00:1]/"),
         ("IPv4-mapped metadata", "http://[::ffff:169.254.169.254]/"),
         ("IPv4-mapped loopback", "http://[::ffff:127.0.0.1]/"),
@@ -580,6 +594,33 @@ def test_a_check_pins_every_address_it_accepted(monkeypatch: pytest.MonkeyPatch)
     assert is_safe_upstream_url("https://Multi.Homed.Example/v1") is True
     # Hostnames are case-insensitive; the connection will ask in lower case.
     assert upstream_guard.validated_addresses("multi.homed.example") == ("8.8.8.8", "1.1.1.1")
+
+
+def test_a_dns64_answer_for_a_public_host_is_accepted_and_pinned(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """On a DNS64 network an IPv4-only host also gets a synthesized `64:ff9b::` AAAA.
+
+    Judging that AAAA as reserved rejected every IPv4-only upstream there, and
+    the OpenAI handler then sent the request -- key included -- to the
+    configured upstream instead.
+    """
+    from headroom.proxy import upstream_guard
+
+    def dns64_answer(*args: object, **kwargs: object) -> list[object]:
+        return [
+            (None, None, None, None, ("8.8.8.8", 443)),
+            (None, None, None, None, ("64:ff9b::808:808", 443, 0, 0)),
+        ]
+
+    monkeypatch.setattr(socket, "getaddrinfo", dns64_answer)
+    upstream_guard.clear_validated_addresses()
+
+    assert is_safe_upstream_url("https://ipv4-only.example/v1") is True
+    assert upstream_guard.validated_addresses("ipv4-only.example") == (
+        "8.8.8.8",
+        "64:ff9b::808:808",
+    )
 
 
 def test_a_rejected_or_allowlisted_destination_pins_nothing(

@@ -58,6 +58,52 @@ async def test_batch_context_store_core_operations(monkeypatch) -> None:
     assert await store.remove("b2") is False
 
 
+async def test_replacing_full_store_context_preserves_other_batch_and_refreshes_ttl(
+    monkeypatch,
+) -> None:
+    now = {"value": 100.0}
+    monkeypatch.setattr("headroom.ccr.batch_store.time.time", lambda: now["value"])
+    store = BatchContextStore(ttl=10, max_contexts=2)
+    first = BatchContext(batch_id="first", provider="openai", created_at=0)
+    second = BatchContext(batch_id="second", provider="openai", created_at=1)
+    await store.store(first)
+    await store.store(second)
+
+    now["value"] = 105.0
+    replacement = BatchContext(batch_id="second", provider="openai")
+    replacement.add_request(
+        BatchRequestContext(custom_id="request", messages=[], model="updated-model")
+    )
+    await store.store(replacement)
+
+    assert await store.get("first") is first
+    assert (await store.get("second")).get_request("request").model == "updated-model"
+    now["value"] = 111.0
+    assert await store.get("first") is None
+    assert await store.get("second") is replacement
+
+
+async def test_full_store_reclaims_expired_batch_before_evicting_live_batch(
+    monkeypatch,
+) -> None:
+    now = {"value": 100.0}
+    monkeypatch.setattr("headroom.ccr.batch_store.time.time", lambda: now["value"])
+    store = BatchContextStore(ttl=10, max_contexts=2)
+    expired = BatchContext(batch_id="expired", provider="openai", created_at=1)
+    await store.store(expired)
+    now["value"] = 105.0
+    live = BatchContext(batch_id="live", provider="openai", created_at=0)
+    await store.store(live)
+
+    now["value"] = 111.0
+    new = BatchContext(batch_id="new", provider="openai", created_at=2)
+    await store.store(new)
+
+    assert await store.get("live") is live
+    assert await store.get("expired") is None
+    assert await store.get("new") is new
+
+
 async def test_batch_context_store_cleanup_stats_and_memory_stats(monkeypatch) -> None:
     now = {"value": 200.0}
     monkeypatch.setattr("headroom.ccr.batch_store.time.time", lambda: now["value"])

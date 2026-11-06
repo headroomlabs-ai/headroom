@@ -214,13 +214,11 @@ class ToolSignature:
     def from_items(cls, items: list[dict[str, Any]]) -> ToolSignature:
         """Create signature from sample items."""
         if not items:
-            # HIGH FIX: Generate unique hash for empty outputs to prevent
-            # different tools' empty responses from colliding into one pattern.
-            # Use a random component to ensure uniqueness across tool types.
-            import uuid
-
-            # MEDIUM FIX #15: Use 24 chars (96 bits) instead of 16 (64 bits) to reduce collision risk
-            empty_hash = hashlib.sha256(f"empty:{uuid.uuid4()}".encode()).hexdigest()[:24]
+            # Fixed hash (not random): a per-call uuid made every empty result a new
+            # signature, so collector._tool_stats grew without bound. Empty outputs carry
+            # no structure to distinguish, so they share one bucket. Not the literal
+            # "empty", to stay distinct from any caller-supplied string key.
+            empty_hash = hashlib.sha256(b"empty").hexdigest()[:24]
             return cls(
                 structure_hash=empty_hash,
                 field_count=0,

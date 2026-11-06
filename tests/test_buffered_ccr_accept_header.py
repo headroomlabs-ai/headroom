@@ -35,6 +35,17 @@ from headroom.proxy.server import ProxyConfig, create_app  # noqa: E402
 
 
 @pytest.fixture(autouse=True)
+def _stream_false_leg(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Pin the ``stream: false`` request #3078 is about.
+
+    A first-party buffered turn now asks upstream for a stream and folds it
+    (``test_buffered_ccr_upstream_stream.py``). This request is still what a
+    custom upstream such as Copilot gets, and what the kill switch restores.
+    """
+    monkeypatch.setenv("HEADROOM_BUFFERED_UPSTREAM_STREAM", "0")
+
+
+@pytest.fixture(autouse=True)
 def _store():
     reset_compression_store()
     get_compression_store(backend=InMemoryBackend())

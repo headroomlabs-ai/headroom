@@ -156,6 +156,92 @@ def test_every_published_docker_variant_includes_bedrock_auth_dependencies() -> 
     assert {"boto3", "botocore"} <= bedrock_names
 
 
+def _dockerfile_stages() -> dict[str, list[str]]:
+    """Map each Dockerfile stage to its instruction lines, parent stages first.
+
+    A stage that is ``FROM <earlier stage>`` inherits that stage's filesystem
+    and metadata (VOLUME, WORKDIR, ARG-derived values), so the parent's lines
+    are part of what the child ships.
+    """
+    own: dict[str, list[str]] = {}
+    parent: dict[str, str] = {}
+    current: list[str] | None = None
+    for raw in (ROOT / "Dockerfile").read_text(encoding="utf-8").splitlines():
+        line = raw.strip()
+        from_match = re.match(r"FROM\s+(\S+)\s+AS\s+(\S+)$", line, re.IGNORECASE)
+        if from_match:
+            base, name = from_match.groups()
+            current = own.setdefault(name, [])
+            if base in own:
+                parent[name] = base
+        elif current is not None and line and not line.startswith("#"):
+            current.append(line)
+    stages: dict[str, list[str]] = {}
+    for name in own:
+        chain, node = [], name
+        while node:
+            chain.insert(0, node)
+            node = parent.get(node, "")
+        stages[name] = [line for stage in chain for line in own[stage]]
+    return stages
+
+
+def test_docker_bake_runtime_args_are_declared_by_the_selected_stage() -> None:
+    """Each bake target's runtime args must reach the stage it builds (#4443).
+
+    Build args are scoped to one Dockerfile stage, so passing ``RUNTIME_HOME``
+    to a target whose ``target =`` stage has no ``ARG RUNTIME_HOME`` is a
+    silent no-op. The distroless ``runtime-slim`` stage once ignored it, so the
+    slim root variants shipped without the state volume.
+    """
+    stages = _dockerfile_stages()
+    bake = (ROOT / "docker-bake.hcl").read_text(encoding="utf-8")
+    blocks = re.findall(r'^target "([^"]+)" \{\n(.*?)^\}', bake, flags=re.S | re.M)
+    checked = {}
+    for name, body in blocks:
+        stage_match = re.search(r'^\s*target\s*=\s*"([^"]+)"', body, re.M)
+        if not stage_match:
+            continue
+        stage = stage_match.group(1)
+        assert stage in stages, f"{name} selects unknown Dockerfile stage {stage}"
+        declared = {m.group(1) for line in stages[stage] if (m := re.match(r"ARG\s+(\w+)", line))}
+        passed = set(re.findall(r"^\s*(RUNTIME_\w+)\s*=", body, re.M))
+        assert passed <= declared, f"{name}: stage {stage} does not declare {passed - declared}"
+        home = re.search(r'RUNTIME_HOME\s*=\s*"([^"]+)"', body)
+        user = re.search(r'RUNTIME_USER\s*=\s*"([^"]+)"', body)
+        if user and user.group(1) == "root":
+            assert home and home.group(1) == "/root", f"{name}: root target needs /root"
+        if home:
+            # The stage must put its state volume under the home it was given.
+            assert "VOLUME ${RUNTIME_HOME}/.headroom" in stages[stage], f"{name}: {stage}"
+        checked[name] = stage
+    assert {"runtime", "runtime-code", "runtime-slim", "runtime-code-slim"} <= set(checked)
+    assert {checked[n] for n in ("runtime-slim", "runtime-code-slim")} == {"runtime-slim"}
+
+
+def test_every_docker_variant_includes_the_redis_extra() -> None:
+    """Without the client, HEADROOM_COMPRESS_SESSION_STORE=redis:// stops
+    startup and HEADROOM_CCR_BACKEND=redis falls back to a per-process store,
+    so the 0.42 image could use neither. Keep the Dockerfile default and every
+    bake target on [redis]."""
+    dockerfile = (ROOT / "Dockerfile").read_text(encoding="utf-8")
+    defaults = re.findall(r"^ARG HEADROOM_EXTRAS=(\S+)$", dockerfile, re.MULTILINE)
+    assert len(defaults) == 1, defaults
+    assert "redis" in defaults[0].split(",")
+
+    bake = (ROOT / "docker-bake.hcl").read_text(encoding="utf-8")
+    targets = re.findall(r'^\s*HEADROOM_EXTRAS = "([^"]*)"$', bake, re.MULTILINE)
+    assert len(targets) == 9
+    assert all("redis" in extras.split(",") for extras in targets), targets
+
+    project = tomllib.loads((ROOT / "pyproject.toml").read_text(encoding="utf-8"))
+    redis_names = {
+        Requirement(requirement).name
+        for requirement in project["project"]["optional-dependencies"]["redis"]
+    }
+    assert "redis" in redis_names
+
+
 def test_public_docker_instructions_use_the_current_organization_package() -> None:
     """Do not send users back to the personal GHCR package frozen at 0.27.0."""
     public_docs = (
@@ -1029,7 +1115,7 @@ def test_publish_npm_regenerates_openclaw_dist_metadata_after_version_and_depend
     content = (ROOT / ".github" / "workflows" / "release.yml").read_text(encoding="utf-8")
 
     start = content.index("name: Publish ${{ env.NPM_OPENCLAW_PACKAGE }} to npmjs.org")
-    end = content.index("continue-on-error: true", start)
+    end = content.index("name: Publish ${{ env.NPM_OPENCODE_PACKAGE }}", start)
     block = content[start:end]
 
     version = block.index('npm version "$version"')
@@ -1045,7 +1131,7 @@ def test_publish_npm_rewrites_opencode_dependency_after_version_and_before_publi
     content = (ROOT / ".github" / "workflows" / "release.yml").read_text(encoding="utf-8")
 
     start = content.index("name: Publish ${{ env.NPM_OPENCODE_PACKAGE }} to npmjs.org")
-    end = content.index("continue-on-error: true", start)
+    end = content.index("\n  publish-github-packages:", start)
     block = content[start:end]
 
     version = block.index('npm version "$version"')
@@ -1053,6 +1139,39 @@ def test_publish_npm_rewrites_opencode_dependency_after_version_and_before_publi
     publish = block.index("npm publish --access public")
 
     assert version < dependency < publish
+
+
+def test_publish_npm_authenticates_before_any_publish_and_fails_closed() -> None:
+    """An opted-in npm release must not silently succeed with stale packages."""
+    content = (ROOT / ".github" / "workflows" / "release.yml").read_text(encoding="utf-8")
+    start = content.index("\n  publish-npm:")
+    end = content.index("\n  publish-github-packages:", start)
+    block = content[start:end]
+
+    auth = block.index("name: Verify npm publishing authentication")
+    first_publish = block.index("npm publish --access public")
+    assert auth < first_publish
+    assert 'npm whoami --registry "${NPM_REGISTRY_URL}"' in block
+    assert "NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}" in block
+    assert "continue-on-error: true" not in block
+    assert "npm publish notice" not in block
+
+
+def test_publish_npm_is_rerunnable_after_a_partial_release() -> None:
+    """Immutable versions already published by an earlier attempt must be skipped."""
+    content = (ROOT / ".github" / "workflows" / "release.yml").read_text(encoding="utf-8")
+    start = content.index("\n  publish-npm:")
+    end = content.index("\n  publish-github-packages:", start)
+    block = content[start:end]
+
+    for package_var in ("NPM_SDK_PACKAGE", "NPM_OPENCLAW_PACKAGE", "NPM_OPENCODE_PACKAGE"):
+        lookup = (
+            f'npm view "${{{package_var}}}@${{version}}" version --registry "${{NPM_REGISTRY_URL}}"'
+        )
+        assert lookup in block
+        lookup_index = block.index(lookup)
+        publish_index = block.index("npm publish --access public", lookup_index)
+        assert lookup_index < publish_index
 
 
 def test_sdist_license_is_packaged_and_verified_before_upload() -> None:
@@ -1694,6 +1813,8 @@ def test_version_sync_covers_every_file_the_verifier_gates() -> None:
         "sdk/typescript/package.json",
         "plugins/headroom-agent-hooks/.claude-plugin/plugin.json",
         "plugins/headroom-agent-hooks/.github/plugin/plugin.json",
+        "plugins/headroom-skill/.claude-plugin/plugin.json",
+        "plugins/headroom-skill/.github/plugin/plugin.json",
         "marketplace.json",
     ]
     for path in gated:
@@ -1704,6 +1825,7 @@ def test_version_sync_covers_every_file_the_verifier_gates() -> None:
         "openclaw",
         "typescript",
         "headroom-agent-hooks",
+        "headroom-skill",
         "marketplace.json",
         "server.json",
     ]:

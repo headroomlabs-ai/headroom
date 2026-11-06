@@ -5,13 +5,20 @@ from __future__ import annotations
 import heapq
 import json
 from collections.abc import Iterator
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
 from ..config import RequestMetrics
 from ..utils import format_timestamp, parse_timestamp
 from .base import Storage
+
+
+def _utc_bound(dt: datetime | None) -> datetime | None:
+    """Normalize a filter bound to the naive UTC used by stored timestamps."""
+    if dt is not None and dt.tzinfo is not None:
+        return dt.astimezone(timezone.utc).replace(tzinfo=None)
+    return dt
 
 
 class JSONLStorage(Storage):
@@ -50,6 +57,13 @@ class JSONLStorage(Storage):
             "stable_prefix_hash": metrics.stable_prefix_hash,
             "cache_alignment_score": metrics.cache_alignment_score,
             "cached_tokens": metrics.cached_tokens,
+            "cache_optimizer_used": metrics.cache_optimizer_used,
+            "cache_optimizer_strategy": metrics.cache_optimizer_strategy,
+            "cacheable_tokens": metrics.cacheable_tokens,
+            "breakpoints_inserted": metrics.breakpoints_inserted,
+            "estimated_cache_hit": metrics.estimated_cache_hit,
+            "estimated_savings_percent": metrics.estimated_savings_percent,
+            "semantic_cache_hit": metrics.semantic_cache_hit,
             "transforms_applied": metrics.transforms_applied,
             "tool_units_dropped": metrics.tool_units_dropped,
             "turns_dropped": metrics.turns_dropped,
@@ -73,6 +87,13 @@ class JSONLStorage(Storage):
             stable_prefix_hash=data.get("stable_prefix_hash", ""),
             cache_alignment_score=data.get("cache_alignment_score", 0.0),
             cached_tokens=data.get("cached_tokens"),
+            cache_optimizer_used=data.get("cache_optimizer_used"),
+            cache_optimizer_strategy=data.get("cache_optimizer_strategy"),
+            cacheable_tokens=data.get("cacheable_tokens", 0),
+            breakpoints_inserted=data.get("breakpoints_inserted", 0),
+            estimated_cache_hit=data.get("estimated_cache_hit", False),
+            estimated_savings_percent=data.get("estimated_savings_percent", 0.0),
+            semantic_cache_hit=data.get("semantic_cache_hit", False),
             transforms_applied=data.get("transforms_applied", []),
             tool_units_dropped=data.get("tool_units_dropped", 0),
             turns_dropped=data.get("turns_dropped", 0),
@@ -130,6 +151,10 @@ class JSONLStorage(Storage):
         if limit == 0:
             return []
 
+        # Stored timestamps are naive UTC; apply the same normalization to filters.
+        start_time = _utc_bound(start_time)
+        end_time = _utc_bound(end_time)
+
         def _matches(metrics: RequestMetrics) -> bool:
             if start_time is not None and metrics.timestamp < start_time:
                 return False
@@ -156,6 +181,9 @@ class JSONLStorage(Storage):
         mode: str | None = None,
     ) -> int:
         """Count metrics matching filters."""
+        start_time = _utc_bound(start_time)
+        end_time = _utc_bound(end_time)
+
         count = 0
 
         for metrics in self.iter_all():
@@ -194,6 +222,9 @@ class JSONLStorage(Storage):
         end_time: datetime | None = None,
     ) -> dict[str, Any]:
         """Get summary statistics."""
+        start_time = _utc_bound(start_time)
+        end_time = _utc_bound(end_time)
+
         total_requests = 0
         total_tokens_before = 0
         total_tokens_after = 0

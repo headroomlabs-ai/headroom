@@ -59,6 +59,13 @@ _ACCUMULATED_FIELDS = {
     "input_json_delta": "_partial_json",
     "thinking_delta": "thinking",
 }
+# What a non-streaming Message carries for block types whose stream form adds
+# placeholders: a thinking ``content_block_start`` carries
+# ``estimated_tokens: null``, which the Message schema lacks.
+_MESSAGE_BLOCK_FIELDS: dict[str, frozenset[str]] = {
+    "thinking": frozenset({"type", "thinking", "signature"}),
+    "redacted_thinking": frozenset({"type", "data"}),
+}
 _KNOWN_MESSAGE_FIELDS = frozenset(
     {
         "id",
@@ -421,7 +428,11 @@ def _response_from_events(frames: list[_SSEFrame]) -> _Reconstruction:
                         response[key] = copy.deepcopy(delta[key])
                 extensions.message_delta_delta.update(_extensions(delta, _MESSAGE_DELTA_FIELDS))
             if isinstance(usage, dict):
-                response.setdefault("usage", {}).update(copy.deepcopy(usage))
+                # Merged the way the Anthropic SDK's MessageStream does: a null
+                # count here never overwrites the one message_start reported.
+                response.setdefault("usage", {}).update(
+                    {key: copy.deepcopy(value) for key, value in usage.items() if value is not None}
+                )
                 for key in usage:
                     if key not in extensions.message_delta_usage_keys:
                         extensions.message_delta_usage_keys.append(key)
@@ -682,3 +693,51 @@ def render_anthropic_sse_response(response: dict[str, Any]) -> list[bytes]:
     """
 
     return _render_known_response(response)
+
+
+def fold_anthropic_stream(raw_sse_bytes: bytes) -> dict[str, Any] | None:
+    """Fold a whole Anthropic event stream into the body ``stream: false`` returns.
+
+    Blocks are accumulated as the Anthropic SDK's ``MessageStream`` does (see
+    ``_response_from_events``), then trimmed to the non-streaming Message
+    shape: a null member leaves every block, and thinking blocks keep only
+    their schema. The proxy's own continuations resend these blocks as
+    history, and Anthropic rejects a block carrying a stream-only member with
+    400 "Extra inputs are not permitted".
+
+    Args:
+        raw_sse_bytes: The complete Anthropic SSE reply.
+
+    Returns:
+        The Message; the stream's ``error`` event when it carried one (the
+        same shape as an Anthropic HTTP error body); or None when the stream
+        ended before ``message_stop`` or with a block still open.
+
+    Raises:
+        ValueError: The stream is complete but holds a known event this
+            module cannot fold, such as a delta type it does not know.
+    """
+
+    envelope = AnthropicSSEEnvelope.parse(raw_sse_bytes)
+    if envelope.saw_error:
+        for raw in _split_frames(raw_sse_bytes):
+            event_type, payload = _json_payload(raw)
+            if event_type == "error" and payload is not None:
+                return payload
+    if not envelope.is_complete():
+        return None
+    if envelope.saw_unreconstructable_frame:
+        raise ValueError("the event stream holds a frame that cannot be folded")
+    message = envelope.message
+    content = []
+    for block in message["content"]:
+        fields = _MESSAGE_BLOCK_FIELDS.get(block.get("type"))
+        content.append(
+            {
+                key: value
+                for key, value in block.items()
+                if value is not None and (fields is None or key in fields)
+            }
+        )
+    message["content"] = content
+    return message

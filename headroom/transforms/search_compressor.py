@@ -39,12 +39,10 @@ exactly what the previous Python implementation provided.
 
 from __future__ import annotations
 
-import logging
 from dataclasses import dataclass, field
-from typing import Any, cast
+from typing import cast
 
-logger = logging.getLogger(__name__)
-
+from .base import persist_rust_ccr_entry
 
 # ─── Public dataclasses (preserve existing import surface) ──────────────────
 
@@ -173,12 +171,21 @@ class SearchCompressor:
     ) -> SearchCompressionResult:
         rust_result = self._rust.compress(content, context, bias)
         cache_key: str | None = rust_result.cache_key
-        if cache_key is not None:
-            # Mirror the original Python: persist to the production CCR
-            # store. The Rust crate already wrote to its in-memory test
-            # store; promote that to the long-lived Python store so the
-            # marker remains retrievable beyond the request lifecycle.
-            self._persist_to_python_ccr(content, rust_result.compressed, cache_key)
+        # Mirror the original Python: persist to the production CCR
+        # store. The Rust crate already wrote to its in-memory test
+        # store; promote that to the long-lived Python store so the
+        # marker remains retrievable beyond the request lifecycle.
+        if cache_key is not None and not persist_rust_ccr_entry(
+            content, rust_result.compressed, cache_key, source="search"
+        ):
+            return SearchCompressionResult(  # unstored original: no marker
+                compressed=content,
+                original=content,
+                original_match_count=rust_result.original_match_count,
+                compressed_match_count=rust_result.original_match_count,
+                files_affected=rust_result.files_affected,
+                compression_ratio=1.0,
+            )
 
         summaries = dict(cast("dict[str, str]", rust_result.summaries))
         return SearchCompressionResult(
@@ -191,36 +198,6 @@ class SearchCompressor:
             cache_key=cache_key,
             summaries=summaries,
         )
-
-    # ─── Internal CCR persistence ───────────────────────────────────────
-
-    def _persist_to_python_ccr(self, original: str, compressed: str, cache_key: str) -> None:
-        """Promote the Rust-emitted cache_key into the production Python
-        `CompressionStore`. Failures are surfaced via logging instead of
-        being silently swallowed (see no-silent-fallbacks rule).
-
-        Note: the Rust path computes the hash and embeds it in the
-        emitted marker text — the Rust hash IS the canonical one
-        (MD5(original)[:24]). The store must be keyed by that exact
-        hash or the marker dangles.
-        """
-        try:
-            from ..cache.compression_store import get_compression_store
-        except ImportError as e:
-            logger.warning("CCR store import failed; cache_key %s won't persist: %s", cache_key, e)
-            return
-
-        try:
-            store: Any = get_compression_store()
-            # The Rust-emitted marker embeds MD5(original)[:24], but
-            # store() has defaulted to SHA-256(original)[:24] since
-            # PR #395. Pass the marker's key explicitly so retrieving
-            # the marker hash actually finds the entry (issue #816).
-            store.store(original, compressed, explicit_hash=cache_key)
-        except Exception as e:
-            logger.warning(
-                "CCR store write failed; cache_key %s remains in-marker only: %s", cache_key, e
-            )
 
 
 __all__ = [

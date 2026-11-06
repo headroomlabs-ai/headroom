@@ -8,8 +8,9 @@ deployment exists to carry.
 Refused (this is not a sample — it is the rule, and the meta-test enforces it):
 the telemetry beacon, the update check, the license/usage reporter, OTLP and
 Langfuse export, HuggingFace/Kompress/fastembed model downloads, release-binary
-downloads (codebase-memory-mcp among them), eval dataset downloads and the provider SDK
-clients the eval harness drives, GitHub Copilot device-flow auth and token
+downloads (codebase-memory-mcp among them), litellm's import-time pricing-table
+refresh, CrewAI's import-time install tracking, eval dataset downloads and the
+provider SDK clients the eval harness drives, GitHub Copilot device-flow auth and token
 exchange, the Anthropic / Codex / Copilot subscription pollers, the OpenAI
 embedders, both Headroom Cloud compression integrations, and the TLS
 diagnostics (``doctor --network`` endpoint checks and the certificate-chain
@@ -99,6 +100,87 @@ def apply_offline_env() -> None:
     if is_offline():
         os.environ.setdefault("HF_HUB_OFFLINE", "1")
         os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")
+
+
+class _OfflineEnvPin:
+    """An environment variable Headroom forces while ``HEADROOM_OFFLINE`` is
+    on, for a third-party library that dials out during its own import and
+    only listens to that variable.
+
+    Overwritten rather than ``setdefault``: these libraries accept only
+    ``true``, so an operator ``1``, ``False`` or empty value would reopen a
+    connection the air-gap switch exists to refuse. The pin is Headroom's, so
+    it is also undone: called with the switch off, it puts back the value it
+    replaced, provided the variable still holds the pin. An operator's own
+    value is never touched outside offline mode.
+    """
+
+    def __init__(self, name: str, value: str) -> None:
+        self.name = name
+        self.value = value
+        # Unset while no pin is in place; otherwise a 1-tuple of the value the
+        # pin replaced (None when the variable was absent).
+        self.before: tuple[str | None] | None = None
+
+    def __call__(self) -> None:
+        if is_offline():
+            if self.before is None:
+                self.before = (os.environ.get(self.name),)
+            os.environ[self.name] = self.value
+        elif self.before is not None:
+            (before,) = self.before
+            self.before = None
+            if os.environ.get(self.name) == self.value:
+                if before is None:
+                    os.environ.pop(self.name, None)
+                else:
+                    os.environ[self.name] = before
+
+
+LITELLM_LOCAL_COST_MAP_ENV = "LITELLM_LOCAL_MODEL_COST_MAP"
+_litellm_cost_map_pin = _OfflineEnvPin(LITELLM_LOCAL_COST_MAP_ENV, "True")
+
+CREWAI_TELEMETRY_ENV = "CREWAI_DISABLE_TELEMETRY"
+_crewai_telemetry_pin = _OfflineEnvPin(CREWAI_TELEMETRY_ENV, "true")
+
+
+def pin_litellm_cost_map_local() -> None:
+    """Keep litellm on its bundled pricing table under ``HEADROOM_OFFLINE``.
+
+    ``import litellm`` fetches ``model_prices_and_context_window.json`` from
+    raw.githubusercontent.com at import time (three attempts) unless
+    ``LITELLM_LOCAL_MODEL_COST_MAP`` is ``true``. That is not a client Headroom
+    builds, so no ``guard_egress`` site can dominate it; the only lever is the
+    env var, read once during that import. So every ``import litellm`` in
+    ``headroom/`` calls this first, in the same scope, because the switch is
+    read when it is checked rather than when the package loads
+    (``create_app(ProxyConfig(offline=True))`` turns it on after import). The
+    chokepoint meta-test fails the build for an import that does not.
+    ``headroom/__init__.py`` also calls it, which covers a host process that
+    imports litellm itself after importing Headroom; a host that imports
+    litellm *before* Headroom has made that fetch already and must set the
+    variable itself.
+
+    Forced and given back as described on :class:`_OfflineEnvPin`, so a
+    process that leaves offline mode before its first litellm import gets the
+    online pricing refresh again.
+    """
+    _litellm_cost_map_pin()
+
+
+def pin_crewai_telemetry_off() -> None:
+    """Keep CrewAI's install tracking quiet under ``HEADROOM_OFFLINE``.
+
+    ``import crewai`` starts a thread that requests a Scarf pixel from
+    api.scarf.sh unless ``CREWAI_DISABLE_TELEMETRY`` (or ``OTEL_SDK_DISABLED``
+    / ``CREWAI_DISABLE_TRACKING``) is ``true``. Headroom imports CrewAI
+    whenever it is installed, through ``headroom.integrations``, so even a
+    LiteLLM callback import under the air-gap switch dialled out. As with
+    litellm, the variable is the only lever, so every ``crewai`` import in
+    ``headroom/`` calls this first (the chokepoint meta-test enforces it), and
+    it is forced and given back as described on :class:`_OfflineEnvPin`.
+    """
+    _crewai_telemetry_pin()
 
 
 class OfflineEgressBlocked(BaseException):
