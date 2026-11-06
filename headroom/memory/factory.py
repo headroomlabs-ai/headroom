@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import threading
 from importlib.metadata import entry_points
+from inspect import iscoroutinefunction
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -21,7 +22,17 @@ from headroom.memory.config import (
 )
 
 if TYPE_CHECKING:
-    from headroom.memory.ports import Embedder, MemoryCache, MemoryStore, TextIndex, VectorIndex
+    from collections.abc import Awaitable, Callable
+
+    from headroom.memory.ports import (
+        Embedder,
+        MemoryCache,
+        MemoryStore,
+        TextFilter,
+        TextIndex,
+        TextSearchResult,
+        VectorIndex,
+    )
 
 
 # Extension groups for memory backends registered via setuptools entry points.
@@ -347,6 +358,27 @@ def _create_text_index(config: MemoryConfig) -> TextIndex:
         )
 
     raise ValueError(f"Unknown text backend: {config.text_backend}")
+
+
+def _adapt_text_search(
+    text_index: TextIndex,
+) -> Callable[[TextFilter], Awaitable[list[TextSearchResult]]]:
+    """Adapt built-in legacy search without changing the supplied index.
+
+    FTS5 keeps its synchronous string API; external backends use the TextIndex
+    search contract even when they have an unrelated ``search_memories`` helper.
+    An FTS5 subclass with an async search override also uses that contract.
+    Look up the method when called so construction does not require search for
+    callers that only use indexing, and method replacements remain visible.
+    """
+    from headroom.memory.adapters.fts5 import FTS5TextIndex
+
+    def search(filter: TextFilter) -> Awaitable[list[TextSearchResult]]:
+        if isinstance(text_index, FTS5TextIndex) and not iscoroutinefunction(text_index.search):
+            return text_index.search_memories(filter)
+        return text_index.search(filter)
+
+    return search
 
 
 def _create_cache(config: MemoryConfig) -> MemoryCache:
