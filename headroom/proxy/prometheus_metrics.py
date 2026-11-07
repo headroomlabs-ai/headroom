@@ -22,7 +22,7 @@ if TYPE_CHECKING:
 
 from headroom import savings_ledger
 from headroom.observability import get_otel_metrics
-from headroom.proxy.savings_attribution import event_count
+from headroom.proxy.savings_attribution import UNFOLDED_SOURCES, event_count
 from headroom.proxy.savings_tracker import SavingsTracker, estimate_request_savings_usd
 
 logger = logging.getLogger("headroom.proxy")
@@ -44,8 +44,8 @@ _OTHER_PATH = "other"
 # from extensions and turn hooks, so one that mints a name per request would grow
 # savings_by_source, and its three exported series, without bound. Past this many
 # rows, new sources are summed into ``_OTHER_SOURCE``: only the name is lost,
-# never a token or a dollar. Unlike the per-request ledger's bound, ``tool_search``
-# may fold here: nothing reads this table by source name, every reader sums it.
+# never a token or a dollar. As in the per-request ledger, ``UNFOLDED_SOURCES``
+# never fold: the documented headline query selects ``source="tool_search"``.
 MAX_DISTINCT_SAVINGS_ROWS = 256
 _OTHER_SOURCE = "other"
 
@@ -997,6 +997,7 @@ class PrometheusMetrics:
                 key = f"{source}:{int(realized)}"
                 if (
                     key not in self.savings_by_source
+                    and source not in UNFOLDED_SOURCES
                     and len(self.savings_by_source) >= MAX_DISTINCT_SAVINGS_ROWS
                 ):
                     source, key = _OTHER_SOURCE, f"{_OTHER_SOURCE}:{int(realized)}"

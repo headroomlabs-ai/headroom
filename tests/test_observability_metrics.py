@@ -671,6 +671,45 @@ async def test_prometheus_metrics_caps_savings_source_cardinality() -> None:
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("realized", [True, False])
+async def test_tool_search_first_seen_after_the_savings_cap_keeps_its_row(realized) -> None:
+    """The headline query selects source="tool_search", so a tool-search saving
+    that first arrives after the cap must keep its named row, not fold."""
+    metrics = PrometheusMetrics(stateless=True)
+    for i in range(MAX_DISTINCT_SAVINGS_ROWS):
+        await metrics.record_request(
+            provider="openai",
+            model="gpt-4o",
+            input_tokens=10,
+            output_tokens=1,
+            tokens_saved=0,
+            latency_ms=1.0,
+            savings_attribution=[{"source": f"plugin_{i}", "realized": realized, "tokens": 1}],
+        )
+    await metrics.record_request(
+        provider="openai",
+        model="gpt-4o",
+        input_tokens=10,
+        output_tokens=1,
+        tokens_saved=0,
+        latency_ms=1.0,
+        savings_attribution=[
+            {"source": "tool_search", "realized": realized, "tokens": 100},
+            {"source": "late_plugin", "realized": realized, "tokens": 7},
+        ],
+    )
+
+    rows = metrics.savings_by_source
+    assert rows[f"tool_search:{int(realized)}"]["tokens"] == 100
+    assert rows[f"other:{int(realized)}"]["tokens"] == 7
+    exported = await metrics.export()
+    assert (
+        f'headroom_savings_attributed_tokens_total{{realized="{str(realized).lower()}",'
+        f'source="tool_search"}} 100' in exported
+    )
+
+
+@pytest.mark.asyncio
 async def test_prometheus_metrics_export_bounds_model_series() -> None:
     """export() emits at most MAX_DISTINCT_MODELS model series plus the 'other' bucket."""
     metrics = PrometheusMetrics(stateless=True)
