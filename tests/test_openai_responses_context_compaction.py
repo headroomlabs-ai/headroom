@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 from types import SimpleNamespace
 from typing import Any
 
@@ -7,6 +8,7 @@ from headroom.proxy.handlers.openai import (
     OpenAIHandlerMixin,
     _compact_openai_responses_tools,
 )
+from headroom.proxy.output_verbosity_policy import STEERING_SENTINEL, STEERING_SUFFIX
 from headroom.transforms.content_router import (
     CompressionStrategy,
     ContentRouter,
@@ -411,3 +413,241 @@ def test_responses_turn_hook_message_fold_is_applied_and_counted() -> None:
     assert working["input"][0]["output"] == "folded"  # fold applied to the outbound payload
     assert tokens_saved > 0  # ...and the message-fold saving is counted
     assert payload["input"][0]["output"] != "folded"  # original untouched (deep-copied)
+
+
+def _rewrite_system_on(payload: dict[str, Any]) -> tuple[dict[str, Any], int]:
+    from headroom.proxy.turn_hooks import clear_turn_hooks, register_turn_hook
+
+    class ShortenSystem:
+        name = "shorten_system"
+
+        def on_request(self, ctx: Any) -> None:
+            ctx.system = "short"
+
+    handler = _HandlerHarness(ContentRouter(ContentRouterConfig()))
+    clear_turn_hooks()
+    register_turn_hook(ShortenSystem())
+    try:
+        working, _modified, tokens_saved, *_ = handler._compress_openai_responses_payload(
+            payload, model="gpt-5.5", request_id="hr_test"
+        )
+    finally:
+        clear_turn_hooks()
+    return working, tokens_saved
+
+
+def test_responses_hook_rewrites_instructions_without_booking_it_as_a_message_fold() -> None:
+    payload: dict[str, Any] = {
+        "model": "gpt-5.5",
+        "instructions": "a long system prompt " * 40,
+        "input": [{"role": "user", "content": "hi"}],
+    }
+    working, tokens_saved = _rewrite_system_on(payload)
+    assert working["instructions"] == "short"
+    assert tokens_saved == 0
+    assert payload["instructions"] != "short"
+
+
+def test_responses_hook_rewrites_a_leading_developer_item() -> None:
+    payload: dict[str, Any] = {
+        "model": "gpt-5.5",
+        "input": [
+            {"role": "developer", "content": "a long system prompt " * 40},
+            {"role": "user", "content": "hi"},
+        ],
+    }
+    working, tokens_saved = _rewrite_system_on(payload)
+    assert working["input"][0]["content"] == "short"
+    assert working["input"][1]["content"] == "hi"
+    assert tokens_saved == 0
+
+
+def _run_system_hook(hook: Any, payload: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any]]:
+    from headroom.proxy.turn_hooks import clear_turn_hooks, register_turn_hook
+
+    class Hook:
+        name = "system_hook"
+        on_request = staticmethod(hook)
+
+    handler = _HandlerHarness(ContentRouter(ContentRouterConfig()))
+    tags: dict[str, Any] = {}
+    clear_turn_hooks()
+    register_turn_hook(Hook())
+    try:
+        working, *_ = handler._compress_openai_responses_payload(
+            payload, model="gpt-5.5", request_id="hr_test", savings_tags=tags
+        )
+    finally:
+        clear_turn_hooks()
+    return working, tags
+
+
+LONG_SYSTEM = "a long system prompt " * 40
+_STEERING = f"{STEERING_SENTINEL}x{STEERING_SUFFIX}"
+
+
+def test_an_in_place_edit_of_a_list_prompt_is_booked_once() -> None:
+    from headroom.proxy.savings_attribution import from_tags
+
+    def edit(ctx: Any) -> None:
+        ctx.system[0]["text"] = "short"
+
+    working, tags = _run_system_hook(
+        edit,
+        {
+            "model": "gpt-5.5",
+            "input": [
+                {"role": "developer", "content": [{"type": "input_text", "text": LONG_SYSTEM}]},
+                {"role": "user", "content": "hi"},
+            ],
+        },
+    )
+    assert working["input"][0]["content"][0]["text"] == "short"
+    assert tags["turn_hook_system_saved_tokens"] > 0
+    assert sum(r["tokens"] for r in from_tags(tags)) == tags["turn_hook_system_saved_tokens"]
+
+
+def test_a_rewrite_reaches_the_item_after_another_hook_rebuilt_the_list() -> None:
+    def rebuild_then_cut(ctx: Any) -> None:
+        ctx.messages = [dict(m) for m in ctx.messages]
+        ctx.system = "short"
+
+    working, _ = _run_system_hook(
+        rebuild_then_cut,
+        {
+            "model": "gpt-5.5",
+            "input": [
+                {"role": "developer", "content": LONG_SYSTEM},
+                {"role": "user", "content": "hi"},
+            ],
+        },
+    )
+    assert working["input"][0]["content"] == "short"
+
+
+def test_a_prompt_added_or_removed_by_a_hook_reaches_the_request() -> None:
+    def add(ctx: Any) -> None:
+        ctx.system = "added"
+
+    def remove(ctx: Any) -> None:
+        ctx.system = None
+
+    user = {"role": "user", "content": "hi"}
+    added, _ = _run_system_hook(add, {"model": "gpt-5.5", "input": [user]})
+    assert added["instructions"] == "added"
+    removed, _ = _run_system_hook(
+        remove,
+        {"model": "gpt-5.5", "input": [{"role": "developer", "content": LONG_SYSTEM}, user]},
+    )
+    assert removed["input"] == [user]
+
+
+def test_steering_only_instructions_and_a_continuation_s_note_are_not_the_prompt() -> None:
+    seen: list[Any] = []
+
+    def look(ctx: Any) -> None:
+        seen.append(ctx.system)
+
+    user = {"role": "user", "content": "hi"}
+    item = {"role": "developer", "content": "the real prompt"}
+    _run_system_hook(
+        look,
+        {"model": "gpt-5.5", "instructions": _STEERING, "input": [item, user]},
+    )
+    _run_system_hook(look, {"model": "gpt-5.5", "previous_response_id": "r", "input": [item, user]})
+    assert seen == ["the real prompt", None]
+
+
+def test_a_hook_replacing_steering_only_instructions_keeps_the_steering() -> None:
+    def replace(ctx: Any) -> None:
+        assert ctx.system is None
+        ctx.system = "be concise"
+
+    def clear(ctx: Any) -> None:
+        ctx.system = None
+
+    steering = _STEERING
+    payload = {
+        "model": "gpt-5.5",
+        "instructions": steering,
+        "input": [{"role": "user", "content": "hi"}],
+    }
+    replaced, _ = _run_system_hook(replace, copy.deepcopy(payload))
+    assert replaced["instructions"] == f"be concise\n\n{steering}"
+    cleared, _ = _run_system_hook(clear, copy.deepcopy(payload))
+    assert cleared["instructions"] == steering
+
+
+def test_a_reordered_prompt_is_rewritten_in_place_and_a_lost_one_is_not_added() -> None:
+    user = {"role": "user", "content": "hi"}
+    item = {"role": "developer", "content": LONG_SYSTEM}
+
+    def reorder(ctx: Any) -> None:
+        ctx.messages = [{"role": "user", "content": "first"}, *ctx.messages]
+        ctx.system = "new"
+
+    def lose(ctx: Any) -> None:
+        ctx.messages = [user]
+        ctx.system = "new"
+
+    reordered, _ = _run_system_hook(reorder, {"model": "gpt-5.5", "input": [item, user]})
+    assert reordered["input"][1]["content"] == "new"
+    assert "instructions" not in reordered
+    lost, tags = _run_system_hook(lose, {"model": "gpt-5.5", "input": [item, user]})
+    assert "instructions" not in lost
+    assert "turn_hook_system_saved_tokens" not in tags
+
+
+def test_system_growth_offsets_savings_from_later_stages() -> None:
+    from headroom.proxy.turn_hooks import clear_turn_hooks, register_turn_hook
+
+    class Grow:
+        name = "grow"
+
+        def on_request(self, ctx: Any) -> None:
+            ctx.system = "added words " * 400
+
+    handler = _HandlerHarness(ContentRouter(ContentRouterConfig()))
+    clear_turn_hooks()
+    register_turn_hook(Grow())
+    try:
+        _, _, tokens_saved, *_ = handler._compress_openai_responses_payload(
+            {"model": "gpt-5.5", "input": [{"role": "user", "content": "hi"}]},
+            model="gpt-5.5",
+            request_id="hr_test",
+        )
+    finally:
+        clear_turn_hooks()
+    assert tokens_saved == 0
+
+
+def test_a_copy_added_by_a_hook_does_not_take_the_rewrite_from_the_original() -> None:
+    def copy_then_rewrite(ctx: Any) -> None:
+        ctx.messages = [dict(ctx.messages[0]), *ctx.messages]
+        ctx.system = "new"
+
+    working, _ = _run_system_hook(
+        copy_then_rewrite,
+        {
+            "model": "gpt-5.5",
+            "input": [
+                {"role": "developer", "content": "old"},
+                {"role": "user", "content": "hi"},
+            ],
+        },
+    )
+    assert [item["content"] for item in working["input"][:2]] == ["old", "new"]
+
+
+def test_a_client_prompt_that_only_looks_like_ours_reaches_hooks() -> None:
+    seen: list[Any] = []
+
+    def look(ctx: Any) -> None:
+        seen.append(ctx.system)
+
+    prompt = "<headroom_policy>Keep citations</headroom_policy>"
+    _run_system_hook(
+        look,
+        {"model": "gpt-5.5", "instructions": prompt, "input": [{"role": "user", "content": "hi"}]},
+    )
+    assert seen == [prompt]

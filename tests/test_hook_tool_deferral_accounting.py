@@ -137,14 +137,14 @@ class _UndeferFirstGrowSecond:
         ctx.tools[1]["description"] += "g" * self.grow
 
 
-def _booked(*hooks: object) -> tuple[dict, list]:
+def _booked(*hooks: object, messages: list[dict] | None = None) -> tuple[dict, list]:
     for hook in hooks:
         register_turn_hook(hook)
     tags: dict = {}
     ctx = TurnContext(
         provider="anthropic",
         model="claude-sonnet-4-6",
-        messages=[{"role": "user", "content": "hi"}],
+        messages=messages or [{"role": "user", "content": "hi"}],
         tools=[_tool("a"), _tool("b")],
         count_messages=_count,
         count_tools=_count,
@@ -278,23 +278,207 @@ class _ShrinkSecondUndeferFirst:
         ctx.tools[1]["description"] = "short"
 
 
-def test_release_debits_the_deferral_entry_not_a_hooks_own_saving() -> None:
+def test_shortening_an_unloaded_deferred_tool_keeps_its_booked_credit() -> None:
+    # b is deferred and unloaded on both sides of the hook: it is not billed, so
+    # the hook books nothing for shortening it and the deferral keeps crediting
+    # b's booked schema -- the tokens a client without the proxy would pay.
     tags, entries = _booked(_BookDeferral(), _ShrinkSecondUndeferFirst())
-    deferral = [e for e in entries if e.get("estimated")]
-    measured = [e for e in entries if not e.get("estimated")]
-    (deferral_entry,) = deferral
-    (hook_entry,) = measured
-    shrunk = {**_tool("b"), "description": "short"}
-    # The hook keeps its own measured saving (b's shrink, flags ignored)...
-    assert hook_entry["tokens"] == _count([_tool("a"), _tool("b")]) - _count([_tool("a"), shrunk])
-    # ...and only the deferral entry is debited, down to what is still deferred.
+    (deferral_entry,) = entries
+    assert deferral_entry.get("estimated")
+    booked_b = {**_tool("b"), "defer_loading": True}
+    assert tags["tool_search_deferred_tokens"] == _count([booked_b])
+    assert tags["tool_search_deferred_tools"] == 1
     assert deferral_entry["tokens"] == tags["tool_search_deferred_tokens"]
 
 
-def test_a_shortened_deferred_schema_is_credited_once() -> None:
-    # b's shrink is the hook's saving; the deferral credits b at its final
-    # (smaller) size, so those tokens are not counted twice.
-    tags, _ = _booked(_BookDeferral(), _ShrinkSecondUndeferFirst())
+def test_a_shortened_loaded_deferred_schema_is_credited_once() -> None:
+    # Once a tool_reference loads b it is billed: the shrink is the hook's own
+    # saving and the deferral credits b at its final (smaller) size, so those
+    # tokens are not counted twice.
+    tags, entries = _booked(
+        _BookDeferral(), _ShrinkSecondUndeferFirst(), messages=_history_loading("b")
+    )
+    measured = [e for e in entries if not e.get("estimated")]
+    (hook_entry,) = measured
+    shrunk = {**_tool("b"), "description": "short"}
+    assert hook_entry["tokens"] == _count([_tool("a"), _tool("b")]) - _count([_tool("a"), shrunk])
+    assert tags["tool_search_deferred_tokens"] == _count([{**shrunk, "defer_loading": True}])
+
+
+# ── a deferred tool is billed only once a tool_reference loads it ────────────
+
+
+def _history_loading(name: str, *, server_side: bool = False) -> list[dict]:
+    """A transcript in which a tool search returned ``name``."""
+    reference = {"type": "tool_reference", "tool_name": name}
+    if server_side:
+        result = {
+            "type": "tool_search_tool_result",
+            "tool_use_id": "srv_1",
+            "content": {"type": "tool_search_tool_search_result", "tool_references": [reference]},
+        }
+        return [
+            {"role": "user", "content": "find it"},
+            {"role": "assistant", "content": [result]},
+            {"role": "user", "content": "go on"},
+        ]
+    # Client-side search (VS Code Copilot Chat): a plain tool_use/tool_result.
+    return [
+        {"role": "user", "content": "find it"},
+        {
+            "role": "assistant",
+            "content": [{"type": "tool_use", "id": "t1", "name": "tool_search", "input": {}}],
+        },
+        {
+            "role": "user",
+            "content": [{"type": "tool_result", "tool_use_id": "t1", "content": [reference]}],
+        },
+    ]
+
+
+class _CondenseAll:
+    """Shaped like a description-trim hook: shortens every tool in place."""
+
+    name = savings_source = "tool_desc_trim"
+    stream_safe = True
+
+    def on_request(self, ctx: TurnContext) -> None:
+        for tool in ctx.tools:
+            if "type" not in tool:  # a server tool has no description
+                tool["description"] = "short"
+
+
+def _client_deferred_run(messages: list[dict]) -> list[dict]:
+    """Copilot's shape: one resident tool, two the client itself deferred."""
+    tools = [
+        {"name": "tool_search_tool_regex", "type": "tool_search_tool_regex_20251119"},
+        _tool("resident"),
+        {**_tool("loaded"), "defer_loading": True},
+        {**_tool("unloaded"), "defer_loading": True},
+    ]
+    register_turn_hook(_CondenseAll())
+    ctx = TurnContext(
+        provider="anthropic",
+        model="claude-sonnet-4-6",
+        messages=messages,
+        tools=tools,
+        count_messages=_count,
+        count_tools=_count,
+    )
+    run_request_hooks(ctx)
+    return from_tags(ctx.tags)
+
+
+def _condensed_delta(*names: str) -> int:
+    full = [_tool(n) for n in names]
+    short = [{**_tool(n), "description": "short"} for n in names]
+    return _count(full) - _count(short)
+
+
+def test_condensing_an_unloaded_deferred_tool_books_nothing() -> None:
+    (entry,) = _client_deferred_run([{"role": "user", "content": "hi"}])
+    # Only the resident tool's trim is on the bill.
+    assert entry["tokens"] == _condensed_delta("resident")
+
+
+@pytest.mark.parametrize("server_side", [False, True])
+def test_condensing_a_loaded_deferred_tool_books_its_delta(server_side: bool) -> None:
+    (entry,) = _client_deferred_run(_history_loading("loaded", server_side=server_side))
+    # The stand-in tokenizer floors, so tool order moves the total by a token.
+    assert entry["tokens"] == pytest.approx(_condensed_delta("resident", "loaded"), abs=1)
+
+
+def test_deferred_tools_still_count_on_other_providers() -> None:
+    # OpenAI tool search loads tools outside an Anthropic history, which this
+    # accounting cannot read: every deferred tool is measured as before.
+    register_turn_hook(_CondenseAll())
+    tools = [{**_tool("a"), "defer_loading": True}]
+    ctx = TurnContext(
+        provider="openai",
+        model="gpt-5",
+        messages=[{"role": "user", "content": "hi"}],
+        tools=tools,
+        count_messages=_count,
+        count_tools=_count,
+    )
+    run_request_hooks(ctx)
+    (entry,) = from_tags(ctx.tags)
+    assert entry["tokens"] == _condensed_delta("a")
+
+
+class _DropDeferred:
+    name = savings_source = "tool_router"
+    stream_safe = True
+
+    def on_request(self, ctx: TurnContext) -> None:
+        ctx.tools = [t for t in ctx.tools if not t.get("defer_loading")]
+
+
+def test_removing_an_unloaded_deferred_tool_books_nothing() -> None:
+    register_turn_hook(_DropDeferred())
+    ctx = TurnContext(
+        provider="anthropic",
+        model="claude-sonnet-4-6",
+        messages=[{"role": "user", "content": "hi"}],
+        tools=[_tool("a"), {**_tool("b"), "defer_loading": True}],
+        count_messages=_count,
+        count_tools=_count,
+    )
+    run_request_hooks(ctx)
+    assert from_tags(ctx.tags) == []
+
+
+class _ShrinkBAndDropItsReference:
+    """Trims b while b is loaded, then folds away the message that loaded it."""
+
+    name = savings_source = "fold"
+    stream_safe = True
+
+    def on_request(self, ctx: TurnContext) -> None:
+        ctx.tools[1]["description"] = "short"
+        ctx.messages = [{"role": "user", "content": "folded"}]
+
+
+def test_a_tool_billed_when_booked_is_not_credited_twice_after_a_fold() -> None:
+    # b was loaded (billed) when booked, so the hook's trim is a real saving;
+    # the fold then unloads b, but its credit must not go back to the full
+    # booked schema on top of the trim.
+    tags, entries = _booked(
+        _BookDeferral(), _ShrinkBAndDropItsReference(), messages=_history_loading("b")
+    )
     shrunk = {**_tool("b"), "description": "short", "defer_loading": True}
-    assert tags["tool_search_deferred_tokens"] == _count([shrunk])
-    assert tags["tool_search_deferred_tools"] == 1
+    assert tags["tool_search_deferred_tokens"] == _count(
+        [{**_tool("a"), "defer_loading": True}, shrunk]
+    )
+
+
+def test_the_gateway_turn_books_only_loaded_deferred_tools() -> None:
+    from headroom.proxy import gateway_turn as gt
+    from headroom.proxy.gateway_turn import GatewayCapabilities
+
+    register_turn_hook(_CondenseAll())
+    tools = [
+        _tool("resident"),
+        {**_tool("loaded"), "defer_loading": True},
+        {**_tool("unloaded"), "defer_loading": True},
+    ]
+    tags: dict = {}
+    tr = gt.RequestTransformer(
+        provider="anthropic",
+        model_name="claude-sonnet-4-5",
+        tools=tools,
+        config=None,
+        tags=tags,
+        caps=GatewayCapabilities(can_redrive=False),
+    )
+    tr.run(_history_loading("loaded"))
+    from headroom.tokenizers import get_tokenizer
+
+    tok = get_tokenizer("claude-sonnet-4-5")
+
+    def count(value: list) -> int:
+        return tok.count_text(json.dumps(value, default=str))
+
+    full = [_tool("resident"), _tool("loaded")]
+    short = [{**t, "description": "short"} for t in full]
+    assert tags["turn_hook_tools_saved_tokens"] == count(full) - count(short)

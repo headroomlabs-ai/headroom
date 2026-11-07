@@ -51,9 +51,15 @@ from typing import Any
 
 from headroom.proxy.gateway_responses import VIEW_MARKER as GATEWAY_RESPONSES_VIEW_MARKER
 from headroom.proxy.outcome import RequestOutcome
-from headroom.proxy.tool_schema_savings_policy import without_deferral_flags
+from headroom.proxy.tool_schema_savings_policy import (
+    billed_tools,
+    hook_tool_counts,
+    loading_history,
+    tools_before_hook,
+)
 from headroom.proxy.turn_hooks import (
     TurnContext,
+    count_system_tokens,
     merge_provider_headers,
     registered_turn_hooks,
     run_request_hooks,
@@ -828,6 +834,9 @@ class RequestTransformResult:
     # Messages were rewritten by a stage the pipeline's own count never saw
     # (a hook fold, history repair): the caller must recount ``tokens_after``.
     messages_rewritten: bool = False
+    # The Anthropic top-level ``system`` after the hooks (the input object when
+    # no hook replaced it); ``None`` for other providers.
+    system: Any = None
 
 
 class RequestTransformer:
@@ -850,8 +859,10 @@ class RequestTransformer:
         config: Any,
         tags: dict[str, Any],
         caps: GatewayCapabilities,
+        system: Any = None,
     ) -> None:
         self.provider = provider
+        self.system = system
         self.model_name = model_name
         self.tools = tools
         self.config = config
@@ -871,6 +882,10 @@ class RequestTransformer:
         # them into ``tokens_before``/``tokens_after``, as the chat handlers do.
         self.compaction_tokens_before = 0
         self.compaction_tokens_after = 0
+        # System-prompt tokens before and after the hooks, both 0 when no hook
+        # changed it or it could not be counted; folded like compaction.
+        self.system_tokens_before = 0
+        self.system_tokens_after = 0
         self._tokenizer: Any = None
 
     def _get_tokenizer(self) -> Any:
@@ -915,8 +930,9 @@ class RequestTransformer:
             # Counted before any hook runs: a hook may edit the compacted list.
             # Tools the client already deferred are not billed, so their
             # compaction saves nothing.
-            compacted_before = _safe_count(count_tools, _billed_tools(self.tools))
-            compacted_after = _safe_count(count_tools, _billed_tools(tools))
+            history = loading_history(self.provider, messages)
+            compacted_before = _safe_count(count_tools, billed_tools(self.tools, history))
+            compacted_after = _safe_count(count_tools, billed_tools(tools, history))
             if compacted_before is not None and compacted_after is not None:
                 self.compaction_tokens_before = compacted_before
                 self.compaction_tokens_after = compacted_after
@@ -932,14 +948,31 @@ class RequestTransformer:
             tags=self.tags,
             count_messages=count_messages,
             count_tools=count_tools,
+            system=self.system,
         )
         if hooks:
             msg_before = _safe_count(count_messages, messages)
-            tools_before = _safe_count(count_tools, without_deferral_flags(tools))
+            system_before = count_system_tokens(count_messages, self.system)
+            tools_snapshot = (
+                _safe_call(
+                    tools_before_hook, tools, loading_history(self.provider, messages), count_tools
+                )
+                if count_tools is not None
+                else None
+            )
             deferred_before = self.tags.get("tool_search_deferred_tools")
             run_request_hooks(ctx, stream_safe_only=not self.caps.redrive_allowed)
             messages = ctx.messages
             tools = ctx.tools
+            system_after = count_system_tokens(count_messages, ctx.system)
+            if (
+                system_before is not None
+                and system_after is not None
+                and system_before != system_after
+            ):
+                self.system_tokens_before = system_before
+                self.system_tokens_after = system_after
+                transforms.append("turn_hook:system")
             # Provider headers the hooks asked for become the contract's
             # ``headers`` object; the gateway sets them on the provider call.
             headers = merge_provider_headers(self.caps.request_headers, ctx.provider_headers)
@@ -955,8 +988,19 @@ class RequestTransformer:
             if msg_before is not None and msg_after is not None and msg_after < msg_before:
                 transforms.append("turn_hook")
                 messages_rewritten = True
-            tools_after = _safe_count(count_tools, without_deferral_flags(tools))
-            if tools_before is not None and tools_after is not None:
+            counts = (
+                _safe_call(
+                    hook_tool_counts,
+                    tools_snapshot,
+                    tools,
+                    loading_history(self.provider, messages),
+                    count_tools,
+                )
+                if tools_snapshot is not None and count_tools is not None
+                else None
+            )
+            if counts is not None:
+                tools_before, tools_after = counts
                 self.tool_growth_tokens = max(0, tools_after - tools_before)
                 saved = max(0, tools_before - tools_after)
                 self.hook_tool_saved_tokens = saved
@@ -991,15 +1035,18 @@ class RequestTransformer:
             redrive_armed=redrive_armed,
             headers=headers,
             messages_rewritten=messages_rewritten,
+            system=ctx.system,
         )
         return messages
 
 
-def _billed_tools(tools: Any) -> Any:
-    """The tools that enter the billed context: all but those flagged ``defer_loading``."""
-    if not isinstance(tools, list):
-        return tools
-    return [t for t in tools if not (isinstance(t, dict) and t.get("defer_loading"))]
+def _safe_call(fn: Callable[..., Any], *args: Any) -> Any:
+    """``fn(*args)``, or ``None`` when it raises: accounting never fails a turn."""
+    try:
+        return fn(*args)
+    except Exception:
+        logger.debug("gateway turn: %s failed; savings uncounted", fn.__name__, exc_info=True)
+        return None
 
 
 def _safe_count(counter: Callable[[Any], int] | None, value: Any) -> int | None:

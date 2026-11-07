@@ -99,6 +99,9 @@ class CompressTurn(Protocol):
     # And ``compaction_tokens_before``/``compaction_tokens_after``, the tool
     # definitions before and after the schema compaction ``transform`` ran,
     # which the handler folds into both endpoints as the chat handlers do.
+    # And ``system_tokens_before``/``system_tokens_after``, the Anthropic
+    # system prompt before and after the hooks when one changed it, folded
+    # the same way.
 
     def finish(
         self,

@@ -122,7 +122,6 @@ class _Handler(GeminiHandlerMixin):
 
 async def _send(monkeypatch: pytest.MonkeyPatch, body: dict) -> dict:
     monkeypatch.setenv("HEADROOM_MEMORY_INJECTION_MODE", "live_zone_tail")
-
     handler = _Handler()
     response = await handler.handle_gemini_generate_content(_request(body), "gemini-pro")
     assert response.status_code == 200

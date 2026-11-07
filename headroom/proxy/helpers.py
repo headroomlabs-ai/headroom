@@ -4376,6 +4376,30 @@ def _tool_search_reference_names(content: Any) -> list[str]:
     return names
 
 
+def referenced_tool_names(messages: Any) -> set[str]:
+    """Return the tool names a ``tool_reference`` anywhere in ``messages`` loads.
+
+    A deferred (``defer_loading``) tool is billed only once a reference to it
+    is in the history. Both carriers count: Anthropic's server-side
+    ``tool_search_tool_result`` block and a client-side search's plain
+    ``tool_result`` (VS Code Copilot Chat). Never raises on odd shapes.
+    """
+    names: set[str] = set()
+    if not isinstance(messages, list):
+        return names
+    for message in messages:
+        content = message.get("content") if isinstance(message, dict) else None
+        if not isinstance(content, list):
+            continue
+        for block in content:
+            if isinstance(block, dict) and block.get("type") in (
+                _TOOL_SEARCH_RESULT_TYPE,
+                "tool_result",
+            ):
+                names.update(_tool_search_reference_names(block.get("content")))
+    return names
+
+
 def strip_unsupported_tool_search_references(tools: Any) -> tuple[Any, int]:
     """Drop ``tool_reference`` entries in ``tools`` that name a typed search tool.
 
