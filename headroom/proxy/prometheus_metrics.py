@@ -1859,6 +1859,45 @@ class PrometheusMetrics:
                     )
                 lines.append("")
 
+            # Shared Redis store availability (lazy import: module must not
+            # require the redis package at import time). ``headroom_redis_checked``
+            # is emitted for every configured feature so a store that has not
+            # been called yet (or not built yet) stays visible;
+            # ``headroom_redis_available`` is emitted only for observed ones (1
+            # when available, 0 during an outage or backoff), so an unknown
+            # store does not advertise connectivity.
+            from headroom.cache.redis_client import states as _redis_states
+
+            _states = _redis_states()
+            if _states:
+                lines.extend(
+                    [
+                        "# HELP headroom_redis_checked 1 when the shared Redis store has been called at least once, 0 when unobserved",
+                        "# TYPE headroom_redis_checked gauge",
+                    ]
+                )
+                for _label in sorted(_states):
+                    lines.append(
+                        f'headroom_redis_checked{{feature="{_escape_label_value(_label)}"}}'
+                        f" {int(_states[_label] != 'unknown')}"
+                    )
+                lines.append("")
+
+                _observed = [_label for _label in sorted(_states) if _states[_label] != "unknown"]
+                if _observed:
+                    lines.extend(
+                        [
+                            "# HELP headroom_redis_available 1 when the shared Redis store answered its last call, 0 during an outage or backoff",
+                            "# TYPE headroom_redis_available gauge",
+                        ]
+                    )
+                    for _label in _observed:
+                        lines.append(
+                            f'headroom_redis_available{{feature="{_escape_label_value(_label)}"}}'
+                            f" {int(_states[_label] == 'available')}"
+                        )
+                    lines.append("")
+
             # Unit 3: WS session lifecycle gauges + duration histogram.
             lines.extend(
                 [
