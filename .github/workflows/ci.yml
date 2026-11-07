@@ -63,6 +63,7 @@ jobs:
               - 'tests/**'
               - 'scripts/**'
               - '.github/workflows/**'
+              - '.github/actions/**'
             # native = anything that can change the compiled wrapper, the native
             # install flow, or the docker image (drives the scarce macOS/Windows
             # runners + docker E2E). A pure-Python logic change hits none of these.
@@ -99,6 +100,7 @@ jobs:
               - '.github/workflows/**'
             workflows:
               - '.github/workflows/**'
+              - '.github/actions/**'
 
   lint:
     needs: changes
