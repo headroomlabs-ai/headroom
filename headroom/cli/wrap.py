@@ -370,6 +370,13 @@ def _raise_on_claude_auth_conflict(layers: list[tuple[str, Mapping[str, object]]
 
 
 _CLAUDE_BEDROCK_ENV = "CLAUDE_CODE_USE_BEDROCK"
+# Every cloud mode Claude Code can be in. A routed Bedrock session turns all of
+# them off: with any one left on, Claude Code calls that cloud directly.
+_CLAUDE_CLOUD_MODE_ENVS = (
+    _CLAUDE_BEDROCK_ENV,
+    "CLAUDE_CODE_USE_VERTEX",
+    "CLAUDE_CODE_USE_FOUNDRY",
+)
 # AWS settings a Bedrock user may keep only in a Claude settings env block. The
 # proxy calls Bedrock itself, so it needs them in its own environment.
 _CLAUDE_BEDROCK_AWS_KEYS = (
@@ -399,6 +406,12 @@ def _claude_bedrock_bypass_reason(
     """Why wrap cannot route this Bedrock-mode session through Headroom, or None."""
     if claude_env[_CLAUDE_BEDROCK_ENV][1] == managed_source:
         return f"it is set in {managed_source}, which outranks wrap; ask your admin to remove it"
+    for key in (*_CLAUDE_CLOUD_MODE_ENVS[1:], "ANTHROPIC_BASE_URL"):
+        if claude_env.get(key, ("", ""))[1] == managed_source:
+            return (
+                f"{key} is set in {managed_source}, which outranks wrap; "
+                "ask your admin to remove it"
+            )
     if "ANTHROPIC_BEDROCK_BASE_URL" in claude_env or _is_env_truthy(
         claude_env.get("CLAUDE_CODE_SKIP_BEDROCK_AUTH", ("", ""))[0]
     ):
@@ -6535,15 +6548,24 @@ def claude(
         else:
             env["ANTHROPIC_BASE_URL"] = proxy_url
         if use_bedrock:
-            env[_CLAUDE_BEDROCK_ENV] = "0"
+            # Settings files outrank the shell, so the session's route goes in a
+            # --settings override (only managed settings outrank it, and those
+            # were checked above): every cloud mode off, base URL on the proxy.
+            session_env = dict.fromkeys(_CLAUDE_CLOUD_MODE_ENVS, "0")
+            session_env["ANTHROPIC_BASE_URL"] = proxy_url
+            env.update(session_env)
             claude_args = (
                 "--settings",
-                json.dumps({"env": {_CLAUDE_BEDROCK_ENV: "0"}}),
+                json.dumps({"env": session_env}),
                 *claude_args,
             )
             # Anthropic mode needs a credential to start; the proxy ignores it
-            # and signs its Bedrock calls with the AWS credentials.
+            # and signs its Bedrock calls with the AWS credentials. With no
+            # effective credential, a shell key a settings file cleared must not
+            # reach Claude Code next to the placeholder.
             if not any(key in _claude_env for key in CLAUDE_AUTH_KEYS):
+                for key in CLAUDE_AUTH_KEYS:
+                    env.pop(key, None)
                 env["ANTHROPIC_AUTH_TOKEN"] = "headroom-bedrock"
 
         # Recover an older crashed wrap even when new project settings writes
