@@ -11084,6 +11084,7 @@ class OpenAIHandlerMixin:
         # outcome (`commit`). With none claiming it — legacy mode — nothing
         # below this comment changes behaviour.
         from headroom.proxy.compress_turn import CompressTurnError, begin_compress_turn
+        from headroom.proxy.gateway_native import attach_view as attach_native_view
         from headroom.proxy.gateway_responses import build_view as build_responses_view
         from headroom.proxy.gateway_responses import is_responses_body
         from headroom.proxy.gateway_responses import mark_view as mark_responses_view
@@ -11155,9 +11156,13 @@ class OpenAIHandlerMixin:
         # `input` in place: `build_provider_body` rebuilds the same view to put
         # the compressed text back, so nothing outside these two points needs
         # to know which wire shape arrived. See `gateway_responses`.
+        # Gemini `contents` and Bedrock Converse get the same kind of view;
+        # see `gateway_native`.
         if is_responses_body(body):
             body["messages"] = build_responses_view(body).messages
             mark_responses_view(body)
+        elif isinstance(body, dict):
+            attach_native_view(body)
 
         messages = body.get("messages")
         model = body.get("model")

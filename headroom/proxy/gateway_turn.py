@@ -49,6 +49,8 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any
 
+from headroom.proxy.gateway_native import VIEW_MARKER as GATEWAY_NATIVE_VIEW_MARKER
+from headroom.proxy.gateway_native import native_shape, view_shape
 from headroom.proxy.gateway_responses import VIEW_MARKER as GATEWAY_RESPONSES_VIEW_MARKER
 from headroom.proxy.gateway_responses import carries_view, is_responses_body
 from headroom.proxy.outcome import RequestOutcome
@@ -65,7 +67,13 @@ logger = logging.getLogger(__name__)
 
 # Keys that steer Headroom itself and must never reach the provider.
 BODY_CONTROL_KEYS: frozenset[str] = frozenset(
-    {"config", "gateway", "token_budget", GATEWAY_RESPONSES_VIEW_MARKER}
+    {
+        "config",
+        "gateway",
+        "token_budget",
+        GATEWAY_RESPONSES_VIEW_MARKER,
+        GATEWAY_NATIVE_VIEW_MARKER,
+    }
 )
 
 OBLIGATION_REDRIVE = "redrive"
@@ -223,7 +231,9 @@ _ANTHROPIC_ONLY_BLOCKS = frozenset(
 
 def _wire_provider_from_shape(body: dict[str, Any]) -> str | None:
     """The provider a body's shape proves, or None when only the model can tell."""
-    if carries_view(body) or is_responses_body(body):
+    # A view (Responses, Gemini, Converse) is chat-shaped: the pipeline and
+    # hooks see OpenAI chat messages, whatever the provider body looks like.
+    if carries_view(body) or is_responses_body(body) or view_shape(body) or native_shape(body):
         return "openai"
     if body.get("system") is not None:
         return "anthropic"
@@ -1160,9 +1170,20 @@ def build_provider_body(
     forwarded uncompressed -- a smaller request is worth nothing next to a
     transcript the provider will reject.
     """
+    from headroom.proxy.gateway_native import apply_view as apply_native_view
     from headroom.proxy.gateway_responses import apply_view as apply_responses_view
 
     out = {k: v for k, v in body.items() if k not in BODY_CONTROL_KEYS}
+    if view_shape(body):
+        # Gemini and Converse: same contract as Responses, and their tools
+        # are not a chat `tools` list, so they are forwarded as sent.
+        out, aligned = apply_native_view(out, body[GATEWAY_NATIVE_VIEW_MARKER], messages)
+        if not aligned:
+            logger.warning(
+                "gateway turn: %s view did not map back; forwarding the original transcript",
+                view_shape(body),
+            )
+        return out
     if carries_view(body):
         out, applied = apply_responses_view(out, messages)
         out.pop("messages", None)
@@ -1173,7 +1194,7 @@ def build_provider_body(
             logger.warning(
                 "gateway turn: Responses view did not map back; forwarding the original input"
             )
-    elif is_responses_body(out):
+    elif is_responses_body(out) or native_shape(out):
         # A Responses body that never got a view: the bypass header returns
         # before one is built. Adding `messages` here is a guaranteed 400
         # ("Unsupported parameter: 'messages'"), so the safest path in the
