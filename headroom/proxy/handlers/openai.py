@@ -120,7 +120,11 @@ from headroom.proxy.handlers.streaming import _stream_outcome_status
 from headroom.proxy.image_isolation import run_image_compression_isolated
 from headroom.proxy.outcome import RequestOutcome
 from headroom.proxy.output_shaper import shaper_enabled_for, steering_allowed_for
-from headroom.proxy.passthrough import CUSTOM_BASE_PROVIDER, is_opencode_zen_base
+from headroom.proxy.passthrough import (
+    CUSTOM_BASE_PROVIDER,
+    is_opencode_zen_base,
+    provider_label_from_model,
+)
 from headroom.proxy.passthrough import (
     custom_base_passthrough_telemetry as _custom_base_passthrough_telemetry,
 )
@@ -3836,8 +3840,18 @@ class OpenAIHandlerMixin:
         _image_decision.apply_to_tags(tags)
         custom_upstream_base_url = _resolve_openai_upstream_base(request.headers)
         handler_path = _resolve_openai_chat_forward_path(request.headers, custom_upstream_base_url)
-        openai_chat_outcome_provider = _openai_outcome_provider(
-            request.method, handler_path, custom_upstream_base_url, upstream_base_url
+        _, custom_chat_provider = _custom_base_passthrough_telemetry(
+            request.method,
+            handler_path,
+            custom_upstream_base_url or "",
+        )
+        # Keep upstream labels and xAI routing ahead of model-based DeepSeek reporting.
+        # Unknown custom hosts remain in the fixed custom bucket.
+        openai_chat_outcome_provider = custom_chat_provider or (
+            "xai"
+            if _is_xai_upstream(upstream_base_url)
+            else provider_label_from_model(model)
+            or (CUSTOM_BASE_PROVIDER if custom_upstream_base_url else "openai")
         )
 
         # Memory: Get user ID when memory is enabled. Reads `request.headers`
