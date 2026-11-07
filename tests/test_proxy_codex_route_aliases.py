@@ -7,6 +7,7 @@ from fastapi import WebSocket
 from fastapi.responses import JSONResponse
 from fastapi.testclient import TestClient
 
+from headroom.proxy.auth_mode import classify_client
 from headroom.proxy.server import HeadroomProxy, ProxyConfig, create_app
 
 
@@ -258,15 +259,18 @@ _CODEX_DESKTOP_UA = (
 )
 
 
-def test_responses_middleware_stamps_x_client_codex_for_unidentified_caller(monkeypatch):
-    # Codex Desktop's User-Agent isn't a known codex UA, so the HTTP middleware
-    # must stamp X-Client: codex on /v1/responses before the handler classifies
-    # the caller — otherwise a compression timeout is refused with a 413 that
-    # Codex treats as a hard connection failure.
+@pytest.mark.parametrize(
+    ("user_agent", "expected_stamp"),
+    [("pi/0.11.11 (darwin 25.5.0; arm64)", "codex"), (_CODEX_DESKTOP_UA, None)],
+)
+def test_responses_middleware_classifies_codex_callers(monkeypatch, user_agent, expected_stamp):
+    # Unknown callers need the fallback stamp; recognized Desktop UAs classify
+    # directly. Both must reach the handler as Codex for timeout fail-open.
     seen: dict[str, str | None] = {}
 
     async def fake_handle(self, request):  # type: ignore[no-untyped-def]
         seen["x-client"] = request.headers.get("x-client")
+        seen["client"] = classify_client(request.headers)
         return JSONResponse({"ok": True})
 
     monkeypatch.setattr(HeadroomProxy, "handle_openai_responses", fake_handle)
@@ -274,12 +278,13 @@ def test_responses_middleware_stamps_x_client_codex_for_unidentified_caller(monk
     with TestClient(create_app(ProxyConfig())) as client:
         response = client.post(
             "/v1/responses",
-            headers={"user-agent": _CODEX_DESKTOP_UA},
+            headers={"user-agent": user_agent},
             json={"model": "gpt-5.3-codex"},
         )
 
     assert response.status_code == 200
-    assert seen["x-client"] == "codex"
+    assert seen["x-client"] == expected_stamp
+    assert seen["client"] == "codex"
 
 
 def test_responses_middleware_preserves_explicit_x_client(monkeypatch):

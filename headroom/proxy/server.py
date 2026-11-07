@@ -4191,7 +4191,8 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
         )
         # Path-based Codex identification: stamp X-Client: codex on the
         # Responses endpoint for callers that don't otherwise classify (e.g.
-        # Codex Desktop, whose User-Agent isn't a known codex UA). Without it
+        # Pi-compatible clients with an unknown User-Agent). Known Codex UAs
+        # classify directly. Without the fallback stamp
         # the backend refuses oversized
         # requests with a 413 on a compression timeout, which Codex treats as a
         # hard connection failure. Mutating scope["headers"] before call_next

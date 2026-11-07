@@ -152,8 +152,8 @@ def should_stamp_codex_client(path: str, headers: Mapping[str, Any] | Any) -> bo
     Stamping ``X-Client: codex`` on the Responses endpoint makes the backend
     take the codex fail-open branch on a compression timeout — Codex treats the
     proxy's 413/1009 refusal as a hard connection failure. This is needed
-    because Codex Desktop's User-Agent (``Codex Desktop/...``) isn't in
-    :data:`CLIENT_UA_MAP` and would otherwise be refused.
+    for Responses callers with missing or unrecognized User-Agents. Known
+    Codex User-Agents classify directly through :data:`CLIENT_UA_MAP`.
 
     Returns ``True`` only for an unidentified caller (no ``X-Client`` and no
     recognized User-Agent) on the Responses endpoint. A caller that already
