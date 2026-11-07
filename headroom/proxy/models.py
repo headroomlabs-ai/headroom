@@ -96,6 +96,12 @@ class RequestLog:
     cache_write_tokens: int = 0
     uncached_input_tokens: int = 0
 
+    # The provider's own prompt-token count, when it reported one (0 otherwise).
+    # ``input_tokens_optimized`` is the local tokenizer's count, which can differ;
+    # this is the figure the cost tracker bills, so per-request cost prices it
+    # in preference to the local count (#1079).
+    provider_input_tokens: int = 0
+
     # Waste signals detected in original messages
     waste_signals: dict[str, int] | None = None
 
