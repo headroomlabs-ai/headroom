@@ -88,8 +88,6 @@ _KOMPRESS_MUST_KEEP_RE = re.compile(
     r"|(?i:\b(?:and|or|nor|xor)\b)"
 )
 _KOMPRESS_MUST_KEEP_ENV = "HEADROOM_KOMPRESS_MUST_KEEP"
-#: Tokenizer budget per chunk. Words past it are never scored (#4309).
-_KOMPRESS_MAX_TOKENS = 512
 KOMPRESS_BACKEND_ENV = "HEADROOM_KOMPRESS_BACKEND"
 KOMPRESS_ONNX_FILENAME_ENV = "HEADROOM_KOMPRESS_ONNX_FILENAME"
 
@@ -2368,7 +2366,6 @@ class KompressCompressor(Transform):
                 input_ids = encoding["input_ids"]
                 attention_mask = encoding["attention_mask"]
                 word_ids = encoding.word_ids(batch_index=0)
-                token_count = _real_token_count(attention_mask[0])
                 # One row, so no padding: every token in it is real.
                 scored = _words_seen_whole(word_ids, len(word_ids), len(chunk_words))
                 if scored == 0:
@@ -2477,11 +2474,6 @@ class KompressCompressor(Transform):
                             continue
                         if bool(mask_list[idx]):
                             kept_ids.add(wid + chunk_start)
-                    # The words past the tokenizer's token cut were never
-                    # scored, so the model cannot have kept them. A forced
-                    # ratio is a hard budget the caller asked for, so only the
-                    # model-decides path takes them back (#4309).
-                    _add_truncated_words(kept_ids, word_ids, chunk_words, chunk_start, token_count)
 
                 # Hard override: always keep must-keep tokens regardless of model score.
                 # Numbers, error names, paths, and flags carry meaning agents cannot
@@ -2918,17 +2910,6 @@ class KompressCompressor(Transform):
                         for wid, score in word_scores.items():
                             if score > self.config.score_threshold:
                                 kept_ids_per_text[text_idx].add(wid + chunk_start)
-                        # The words past the tokenizer's token cut were never
-                        # scored, so the model cannot have kept them. A forced
-                        # ratio is a hard budget the caller asked for, so only
-                        # the model-decides path takes them back (#4309).
-                        _add_truncated_words(
-                            kept_ids_per_text[text_idx],
-                            word_ids,
-                            chunk_words,
-                            chunk_start,
-                            _real_token_count(attention_mask[batch_idx]),
-                        )
 
                     _add_kompress_must_keep_words(
                         kept_ids_per_text[text_idx], chunk_words, chunk_start

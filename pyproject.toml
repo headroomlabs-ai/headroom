@@ -66,7 +66,7 @@ dependencies = [
     # Python 3.11-3.14 on Linux, macOS and Windows: older releases either reject
     # Python 3.14 (GH #956) or fall back to a Rust source build.
     "litellm>=1.96.2,<2.0",
-    "click>=8.3.3",               # CLI framework; PYSEC-2026-2132 fix (command injection in click.edit())
+    "click>=8.5.0",               # CLI framework; PYSEC-2026-2132 fix (command injection in click.edit())
     "rich>=13.0.0",               # Rich terminal output
     "opentelemetry-api>=1.45.1",  # CVE-2026-114603: bounded, linear-time tracestate parsing
     # AST-aware code slicing (CodeCompressor); binary wheel. 0.44.1 is excluded:
@@ -127,7 +127,7 @@ proxy = [
     # publishes no macOS wheel for Python 3.14, so installing it there needs a C
     # compiler. The watcher is optional and skips itself when watchdog is absent.
     "watchdog>=4.0.0; sys_platform != 'darwin' or python_version < '3.14'",
-    "sqlite-vec>=0.1.6",          # Vector index for memory (--memory). Lightweight, no torch.
+    "sqlite-vec>=0.1.9",          # Vector index for memory (--memory). Lightweight, no torch.
 ]
 # Production ASGI/WSGI server — Unix-only (gunicorn does not support Windows).
 # Kept separate from [proxy] so that dev, CI, and Windows users are not forced
@@ -137,6 +137,17 @@ proxy-prod = [
     "headroom-ai[proxy]",
     "gunicorn>=21.0.0; sys_platform != 'win32'",
 ]
+# Google Vertex through the LiteLLM translation backend
+# (`--backend vertex` / `vertex_ai` / `litellm-vertex`), which imports `vertexai`.
+# Kept separate from [proxy] for the same reason as proxy-prod: this pulls
+# google-cloud-aiplatform and its transitive tree (~175MB installed), and the
+# proxy's *native* Vertex passthrough routes
+# (/v1/projects/.../locations/.../publishers/...) do not need it at all.  Only
+# the LiteLLM backend does.  Install with:
+#   pip install headroom-ai[proxy,vertex]
+vertex = [
+    "google-cloud-aiplatform>=1.38",
+]
 # AST-based code compression (tree-sitter)
 # tree-sitter-language-pack >=1.0 removed the bundled tree-sitter package and
 # switched to an incompatible internal node API (.kind vs .type, callable
@@ -145,7 +156,7 @@ proxy-prod = [
 # logic continues to work.  See issue #1216.
 code = [
     "tree-sitter-language-pack>=0.10.0,<1.0",
-    "tree-sitter>=0.25.2,<0.27",
+    "tree-sitter>=0.26.0,<0.27",
 ]
 # ML-based compression with Kompress (ModernBERT).
 # (The legacy [llmlingua] extra was removed in 0.9.x — no live code path used it.
@@ -167,7 +178,7 @@ ml = [
 # in the [vector] extra below; installing it here would make `[all]` (which pulls
 # [memory]) fail on any machine without a compiler — see #1368.
 memory = [
-    "sqlite-vec>=0.1.6",
+    "sqlite-vec>=0.1.9",
     "sentence-transformers>=2.2.0,<7.0; sys_platform != 'darwin' or platform_machine != 'x86_64'",
 ]
 # Optional HNSW vector backend. Needs a C++ toolchain to build hnswlib, so it is
@@ -347,7 +358,7 @@ dev = [
     "ollama>=0.4.0",
     "langchain-ollama>=0.2.0",
     "hnswlib>=0.8.0",
-    "sqlite-vec>=0.1.6",
+    "sqlite-vec>=0.1.9",
     "sentence-transformers>=2.2.0,<7.0",
     "numpy>=1.24.0",
     "openpyxl>=3.1.0",  # exercises spreadsheet_ingest (.xlsx) in the test suite
@@ -361,7 +372,9 @@ dev = [
     "cryptography>=50.0.0",
     "respx>=0.20.0",    # HTTP mock transport for passthrough handler tests
 ]
-# All optional dependencies (everything you need).
+# All optional dependencies for the default CLI/proxy feature set.
+# PyTorch-backed features stay opt-in because Linux PyPI wheels include CUDA
+# runtime packages and dependency metadata cannot detect installed hardware.
 #
 # The EleutherAI lm-evaluation-harness is intentionally not exposed as a
 # project extra. Headroom invokes it as an external subprocess
@@ -371,7 +384,7 @@ dev = [
 # who need standard accuracy benchmarks can install `lm-eval[api]` in their
 # benchmark environment separately.
 all = [
-    "headroom-ai[proxy,code,ml,memory,relevance,image,reports,otel,evals,voice,html,mcp,spreadsheet]",
+    "headroom-ai[proxy,code,relevance,image,reports,otel,html,mcp,spreadsheet]",
 ]
 # Lean: a proxy with ALL torch-free capability — for running Headroom in a
 # constrained or low-resource environment and offloading heavy ML elsewhere.
