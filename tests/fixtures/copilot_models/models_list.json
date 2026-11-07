@@ -1,0 +1,1637 @@
+{
+  "object": "list",
+  "data": [
+    {
+      "capabilities": {
+        "family": "claude-opus-4.6",
+        "limits": {
+          "max_context_window_tokens": 264000,
+          "max_non_streaming_output_tokens": 16000,
+          "max_output_tokens": 64000,
+          "max_prompt_tokens": 200000,
+          "vision": {
+            "max_prompt_image_size": 3145728,
+            "max_prompt_images": 1,
+            "supported_media_types": [
+              "image/jpeg",
+              "image/png",
+              "image/webp",
+              "image/gif",
+              "application/pdf"
+            ]
+          }
+        },
+        "object": "model_capabilities",
+        "supports": {
+          "adaptive_thinking": true,
+          "max_thinking_budget": 32000,
+          "min_thinking_budget": 1024,
+          "parallel_tool_calls": true,
+          "reasoning_effort": [
+            "low",
+            "medium",
+            "high",
+            "max"
+          ],
+          "streaming": true,
+          "structured_outputs": true,
+          "tool_calls": true,
+          "vision": true
+        },
+        "tokenizer": "o200k_base",
+        "type": "chat"
+      },
+      "id": "claude-opus-4.6",
+      "model_picker_category": "powerful",
+      "model_picker_enabled": true,
+      "name": "Claude Opus 4.6",
+      "object": "model",
+      "policy": {
+        "state": "enabled"
+      },
+      "preview": false,
+      "supported_endpoints": [
+        "/v1/messages",
+        "/chat/completions"
+      ],
+      "vendor": "Anthropic",
+      "version": "claude-opus-4.6"
+    },
+    {
+      "capabilities": {
+        "family": "claude-opus-4.7",
+        "limits": {
+          "max_context_window_tokens": 264000,
+          "max_non_streaming_output_tokens": 16000,
+          "max_output_tokens": 64000,
+          "max_prompt_tokens": 200000,
+          "vision": {
+            "max_prompt_image_size": 3145728,
+            "max_prompt_images": 1,
+            "supported_media_types": [
+              "image/jpeg",
+              "image/png",
+              "image/webp",
+              "image/gif",
+              "application/pdf"
+            ]
+          }
+        },
+        "object": "model_capabilities",
+        "supports": {
+          "adaptive_thinking": true,
+          "max_thinking_budget": 32000,
+          "min_thinking_budget": 1024,
+          "parallel_tool_calls": true,
+          "reasoning_effort": [
+            "low",
+            "medium",
+            "high",
+            "xhigh",
+            "max"
+          ],
+          "streaming": true,
+          "structured_outputs": true,
+          "tool_calls": true,
+          "vision": true
+        },
+        "tokenizer": "o200k_base",
+        "type": "chat"
+      },
+      "id": "claude-opus-4.7",
+      "model_picker_category": "powerful",
+      "model_picker_enabled": true,
+      "name": "Claude Opus 4.7",
+      "object": "model",
+      "policy": {
+        "state": "enabled"
+      },
+      "preview": false,
+      "supported_endpoints": [
+        "/v1/messages",
+        "/chat/completions"
+      ],
+      "vendor": "Anthropic",
+      "version": "claude-opus-4.7"
+    },
+    {
+      "capabilities": {
+        "family": "claude-opus-4.8",
+        "limits": {
+          "max_context_window_tokens": 264000,
+          "max_non_streaming_output_tokens": 16000,
+          "max_output_tokens": 64000,
+          "max_prompt_tokens": 200000,
+          "vision": {
+            "max_prompt_image_size": 3145728,
+            "max_prompt_images": 1,
+            "supported_media_types": [
+              "image/jpeg",
+              "image/png",
+              "image/webp",
+              "image/gif",
+              "application/pdf"
+            ]
+          }
+        },
+        "object": "model_capabilities",
+        "supports": {
+          "adaptive_thinking": true,
+          "max_thinking_budget": 32000,
+          "min_thinking_budget": 1024,
+          "parallel_tool_calls": true,
+          "reasoning_effort": [
+            "low",
+            "medium",
+            "high",
+            "xhigh",
+            "max"
+          ],
+          "streaming": true,
+          "structured_outputs": true,
+          "tool_calls": true,
+          "vision": true
+        },
+        "tokenizer": "o200k_base",
+        "type": "chat"
+      },
+      "id": "claude-opus-4.8",
+      "model_picker_category": "powerful",
+      "model_picker_enabled": true,
+      "name": "Claude Opus 4.8",
+      "object": "model",
+      "policy": {
+        "state": "enabled"
+      },
+      "preview": false,
+      "supported_endpoints": [
+        "/v1/messages",
+        "/chat/completions"
+      ],
+      "vendor": "Anthropic",
+      "version": "claude-opus-4.8"
+    },
+    {
+      "capabilities": {
+        "family": "claude-opus-5",
+        "limits": {
+          "max_context_window_tokens": 264000,
+          "max_non_streaming_output_tokens": 16000,
+          "max_output_tokens": 64000,
+          "max_prompt_tokens": 200000,
+          "vision": {
+            "max_prompt_image_size": 3145728,
+            "max_prompt_images": 1,
+            "supported_media_types": [
+              "image/jpeg",
+              "image/png",
+              "image/webp",
+              "image/gif",
+              "application/pdf"
+            ]
+          }
+        },
+        "object": "model_capabilities",
+        "supports": {
+          "adaptive_thinking": true,
+          "max_thinking_budget": 32000,
+          "min_thinking_budget": 1024,
+          "parallel_tool_calls": true,
+          "reasoning_effort": [
+            "low",
+            "medium",
+            "high",
+            "xhigh",
+            "max"
+          ],
+          "streaming": true,
+          "structured_outputs": true,
+          "tool_calls": true,
+          "vision": true
+        },
+        "tokenizer": "o200k_base",
+        "type": "chat"
+      },
+      "id": "claude-opus-5",
+      "model_picker_category": "powerful",
+      "model_picker_enabled": true,
+      "name": "Claude Opus 5",
+      "object": "model",
+      "policy": {
+        "state": "enabled"
+      },
+      "preview": false,
+      "supported_endpoints": [
+        "/v1/messages",
+        "/chat/completions"
+      ],
+      "vendor": "Anthropic",
+      "version": "claude-opus-5"
+    },
+    {
+      "capabilities": {
+        "family": "claude-sonnet-4.6",
+        "limits": {
+          "max_context_window_tokens": 264000,
+          "max_non_streaming_output_tokens": 16000,
+          "max_output_tokens": 64000,
+          "max_prompt_tokens": 200000,
+          "vision": {
+            "max_prompt_image_size": 3145728,
+            "max_prompt_images": 5,
+            "supported_media_types": [
+              "image/jpeg",
+              "image/png",
+              "image/webp",
+              "image/gif",
+              "application/pdf"
+            ]
+          }
+        },
+        "object": "model_capabilities",
+        "supports": {
+          "adaptive_thinking": true,
+          "max_thinking_budget": 32000,
+          "min_thinking_budget": 1024,
+          "parallel_tool_calls": true,
+          "reasoning_effort": [
+            "low",
+            "medium",
+            "high",
+            "max"
+          ],
+          "streaming": true,
+          "structured_outputs": true,
+          "tool_calls": true,
+          "vision": true
+        },
+        "tokenizer": "o200k_base",
+        "type": "chat"
+      },
+      "id": "claude-sonnet-4.6",
+      "model_picker_category": "versatile",
+      "model_picker_enabled": true,
+      "name": "Claude Sonnet 4.6",
+      "object": "model",
+      "policy": {
+        "state": "enabled"
+      },
+      "preview": false,
+      "supported_endpoints": [
+        "/chat/completions",
+        "/v1/messages"
+      ],
+      "vendor": "Anthropic",
+      "version": "claude-sonnet-4.6"
+    },
+    {
+      "capabilities": {
+        "family": "claude-sonnet-5",
+        "limits": {
+          "max_context_window_tokens": 264000,
+          "max_non_streaming_output_tokens": 16000,
+          "max_output_tokens": 64000,
+          "max_prompt_tokens": 200000,
+          "vision": {
+            "max_prompt_image_size": 3145728,
+            "max_prompt_images": 5,
+            "supported_media_types": [
+              "image/jpeg",
+              "image/png",
+              "image/webp",
+              "image/gif",
+              "application/pdf"
+            ]
+          }
+        },
+        "object": "model_capabilities",
+        "supports": {
+          "adaptive_thinking": true,
+          "max_thinking_budget": 32000,
+          "min_thinking_budget": 1024,
+          "parallel_tool_calls": true,
+          "reasoning_effort": [
+            "low",
+            "medium",
+            "high",
+            "xhigh",
+            "max"
+          ],
+          "streaming": true,
+          "structured_outputs": true,
+          "tool_calls": true,
+          "vision": true
+        },
+        "tokenizer": "o200k_base",
+        "type": "chat"
+      },
+      "id": "claude-sonnet-5",
+      "model_picker_category": "versatile",
+      "model_picker_enabled": true,
+      "name": "Claude Sonnet 5",
+      "object": "model",
+      "policy": {
+        "state": "enabled"
+      },
+      "preview": false,
+      "supported_endpoints": [
+        "/v1/messages",
+        "/chat/completions"
+      ],
+      "vendor": "Anthropic",
+      "version": "claude-sonnet-5"
+    },
+    {
+      "capabilities": {
+        "family": "gemini-3.1-pro-preview",
+        "limits": {
+          "max_context_window_tokens": 264000,
+          "max_output_tokens": 64000,
+          "max_prompt_tokens": 200000,
+          "vision": {
+            "max_prompt_image_size": 3145728,
+            "max_prompt_images": 10,
+            "supported_media_types": [
+              "image/jpeg",
+              "image/png",
+              "image/webp",
+              "image/heic",
+              "image/heif",
+              "application/pdf"
+            ]
+          }
+        },
+        "object": "model_capabilities",
+        "supports": {
+          "max_thinking_budget": 32000,
+          "min_thinking_budget": 256,
+          "parallel_tool_calls": true,
+          "reasoning_effort": [
+            "low",
+            "medium",
+            "high"
+          ],
+          "streaming": true,
+          "tool_calls": true,
+          "vision": true
+        },
+        "tokenizer": "o200k_base",
+        "type": "chat"
+      },
+      "id": "gemini-3.1-pro-preview",
+      "model_picker_category": "powerful",
+      "model_picker_enabled": true,
+      "name": "Gemini 3.1 Pro",
+      "object": "model",
+      "policy": {
+        "state": "enabled"
+      },
+      "preview": true,
+      "supported_endpoints": [
+        "/chat/completions"
+      ],
+      "vendor": "Google",
+      "version": "gemini-3.1-pro-preview"
+    },
+    {
+      "capabilities": {
+        "family": "gemini-3.5-flash",
+        "limits": {
+          "max_context_window_tokens": 264000,
+          "max_output_tokens": 64000,
+          "max_prompt_tokens": 200000,
+          "vision": {
+            "max_prompt_image_size": 3145728,
+            "max_prompt_images": 10,
+            "supported_media_types": [
+              "image/jpeg",
+              "image/png",
+              "image/webp",
+              "image/heic",
+              "image/heif",
+              "application/pdf"
+            ]
+          }
+        },
+        "object": "model_capabilities",
+        "supports": {
+          "max_thinking_budget": 24000,
+          "min_thinking_budget": 256,
+          "parallel_tool_calls": true,
+          "reasoning_effort": [
+            "minimal",
+            "low",
+            "medium",
+            "high"
+          ],
+          "streaming": true,
+          "tool_calls": true,
+          "vision": true
+        },
+        "tokenizer": "o200k_base",
+        "type": "chat"
+      },
+      "id": "gemini-3.5-flash",
+      "model_picker_category": "lightweight",
+      "model_picker_enabled": true,
+      "name": "Gemini 3.5 Flash",
+      "object": "model",
+      "policy": {
+        "state": "enabled"
+      },
+      "preview": false,
+      "supported_endpoints": [
+        "/chat/completions"
+      ],
+      "vendor": "Google",
+      "version": "gemini-3.5-flash"
+    },
+    {
+      "capabilities": {
+        "family": "gemini-3.6-flash",
+        "limits": {
+          "max_context_window_tokens": 264000,
+          "max_output_tokens": 64000,
+          "max_prompt_tokens": 200000,
+          "vision": {
+            "max_prompt_image_size": 3145728,
+            "max_prompt_images": 10,
+            "supported_media_types": [
+              "image/jpeg",
+              "image/png",
+              "image/webp",
+              "image/heic",
+              "image/heif",
+              "application/pdf"
+            ]
+          }
+        },
+        "object": "model_capabilities",
+        "supports": {
+          "max_thinking_budget": 32000,
+          "min_thinking_budget": 256,
+          "parallel_tool_calls": true,
+          "reasoning_effort": [
+            "minimal",
+            "low",
+            "medium",
+            "high"
+          ],
+          "streaming": true,
+          "tool_calls": true,
+          "vision": true
+        },
+        "tokenizer": "o200k_base",
+        "type": "chat"
+      },
+      "id": "gemini-3.6-flash",
+      "model_picker_category": "versatile",
+      "model_picker_enabled": true,
+      "name": "Gemini 3.6 Flash",
+      "object": "model",
+      "policy": {
+        "state": "enabled"
+      },
+      "preview": false,
+      "supported_endpoints": [
+        "/chat/completions"
+      ],
+      "vendor": "Google",
+      "version": "gemini-3.6-flash"
+    },
+    {
+      "capabilities": {
+        "family": "gpt-5.3-codex",
+        "limits": {
+          "max_context_window_tokens": 400000,
+          "max_output_tokens": 128000,
+          "max_prompt_tokens": 272000,
+          "vision": {
+            "max_prompt_image_size": 3145728,
+            "max_prompt_images": 1,
+            "supported_media_types": [
+              "image/jpeg",
+              "image/png",
+              "image/webp",
+              "image/gif",
+              "application/pdf"
+            ]
+          }
+        },
+        "object": "model_capabilities",
+        "supports": {
+          "parallel_tool_calls": true,
+          "reasoning_effort": [
+            "low",
+            "medium",
+            "high",
+            "xhigh"
+          ],
+          "streaming": true,
+          "structured_outputs": true,
+          "tool_calls": true,
+          "vision": true
+        },
+        "tokenizer": "o200k_base",
+        "type": "chat"
+      },
+      "id": "gpt-5.3-codex",
+      "model_picker_category": "powerful",
+      "model_picker_enabled": true,
+      "name": "GPT-5.3-Codex",
+      "object": "model",
+      "preview": false,
+      "supported_endpoints": [
+        "/responses",
+        "ws:/responses"
+      ],
+      "vendor": "OpenAI",
+      "version": "gpt-5.3-codex"
+    },
+    {
+      "capabilities": {
+        "family": "gpt-5.4-mini",
+        "limits": {
+          "max_context_window_tokens": 400000,
+          "max_output_tokens": 128000,
+          "max_prompt_tokens": 272000,
+          "vision": {
+            "max_prompt_image_size": 3145728,
+            "max_prompt_images": 1,
+            "supported_media_types": [
+              "image/jpeg",
+              "image/png",
+              "image/webp",
+              "image/gif",
+              "application/pdf"
+            ]
+          }
+        },
+        "object": "model_capabilities",
+        "supports": {
+          "parallel_tool_calls": true,
+          "reasoning_effort": [
+            "none",
+            "low",
+            "medium",
+            "high",
+            "xhigh"
+          ],
+          "streaming": true,
+          "structured_outputs": true,
+          "tool_calls": true,
+          "vision": true
+        },
+        "tokenizer": "o200k_base",
+        "type": "chat"
+      },
+      "id": "gpt-5.4-mini",
+      "model_picker_category": "lightweight",
+      "model_picker_enabled": true,
+      "name": "GPT-5.4 mini",
+      "object": "model",
+      "policy": {
+        "state": "enabled"
+      },
+      "preview": false,
+      "supported_endpoints": [
+        "/responses",
+        "ws:/responses"
+      ],
+      "vendor": "OpenAI",
+      "version": "gpt-5.4-mini"
+    },
+    {
+      "capabilities": {
+        "family": "gpt-5.4",
+        "limits": {
+          "max_context_window_tokens": 400000,
+          "max_output_tokens": 128000,
+          "max_prompt_tokens": 272000,
+          "vision": {
+            "max_prompt_image_size": 3145728,
+            "max_prompt_images": 1,
+            "supported_media_types": [
+              "image/jpeg",
+              "image/png",
+              "image/webp",
+              "image/gif",
+              "application/pdf"
+            ]
+          }
+        },
+        "object": "model_capabilities",
+        "supports": {
+          "parallel_tool_calls": true,
+          "reasoning_effort": [
+            "none",
+            "low",
+            "medium",
+            "high",
+            "xhigh"
+          ],
+          "streaming": true,
+          "structured_outputs": true,
+          "tool_calls": true,
+          "vision": true
+        },
+        "tokenizer": "o200k_base",
+        "type": "chat"
+      },
+      "id": "gpt-5.4",
+      "model_picker_category": "powerful",
+      "model_picker_enabled": true,
+      "name": "GPT-5.4",
+      "object": "model",
+      "policy": {
+        "state": "enabled"
+      },
+      "preview": false,
+      "supported_endpoints": [
+        "/responses",
+        "/chat/completions",
+        "ws:/responses"
+      ],
+      "vendor": "OpenAI",
+      "version": "gpt-5.4"
+    },
+    {
+      "capabilities": {
+        "family": "gpt-5.5",
+        "limits": {
+          "max_context_window_tokens": 400000,
+          "max_output_tokens": 128000,
+          "max_prompt_tokens": 272000,
+          "vision": {
+            "max_prompt_image_size": 3145728,
+            "max_prompt_images": 1,
+            "supported_media_types": [
+              "image/jpeg",
+              "image/png",
+              "image/webp",
+              "image/gif",
+              "application/pdf"
+            ]
+          }
+        },
+        "object": "model_capabilities",
+        "supports": {
+          "parallel_tool_calls": true,
+          "reasoning_effort": [
+            "none",
+            "low",
+            "medium",
+            "high",
+            "xhigh"
+          ],
+          "streaming": true,
+          "structured_outputs": true,
+          "tool_calls": true,
+          "vision": true
+        },
+        "tokenizer": "o200k_base",
+        "type": "chat"
+      },
+      "id": "gpt-5.5",
+      "model_picker_category": "powerful",
+      "model_picker_enabled": true,
+      "name": "GPT-5.5",
+      "object": "model",
+      "policy": {
+        "state": "enabled"
+      },
+      "preview": false,
+      "supported_endpoints": [
+        "/responses",
+        "ws:/responses"
+      ],
+      "vendor": "OpenAI",
+      "version": "gpt-5.5"
+    },
+    {
+      "capabilities": {
+        "family": "gpt-5.6-luna",
+        "limits": {
+          "max_context_window_tokens": 328000,
+          "max_output_tokens": 128000,
+          "max_prompt_tokens": 200000,
+          "vision": {
+            "max_prompt_image_size": 3145728,
+            "max_prompt_images": 1,
+            "supported_media_types": [
+              "image/jpeg",
+              "image/png",
+              "image/webp",
+              "image/gif",
+              "application/pdf"
+            ]
+          }
+        },
+        "object": "model_capabilities",
+        "supports": {
+          "parallel_tool_calls": true,
+          "reasoning_effort": [
+            "none",
+            "low",
+            "medium",
+            "high",
+            "xhigh",
+            "max"
+          ],
+          "streaming": true,
+          "structured_outputs": true,
+          "tool_calls": true,
+          "vision": true
+        },
+        "tokenizer": "o200k_base",
+        "type": "chat"
+      },
+      "id": "gpt-5.6-luna",
+      "model_picker_category": "lightweight",
+      "model_picker_enabled": true,
+      "name": "GPT-5.6 Luna",
+      "object": "model",
+      "policy": {
+        "state": "enabled"
+      },
+      "preview": false,
+      "supported_endpoints": [
+        "/responses",
+        "ws:/responses"
+      ],
+      "vendor": "OpenAI",
+      "version": "gpt-5.6-luna"
+    },
+    {
+      "capabilities": {
+        "family": "gpt-5.6-sol",
+        "limits": {
+          "max_context_window_tokens": 400000,
+          "max_output_tokens": 128000,
+          "max_prompt_tokens": 272000,
+          "vision": {
+            "max_prompt_image_size": 3145728,
+            "max_prompt_images": 1,
+            "supported_media_types": [
+              "image/jpeg",
+              "image/png",
+              "image/webp",
+              "image/gif",
+              "application/pdf"
+            ]
+          }
+        },
+        "object": "model_capabilities",
+        "supports": {
+          "parallel_tool_calls": true,
+          "reasoning_effort": [
+            "none",
+            "low",
+            "medium",
+            "high",
+            "xhigh",
+            "max"
+          ],
+          "streaming": true,
+          "structured_outputs": true,
+          "tool_calls": true,
+          "vision": true
+        },
+        "tokenizer": "o200k_base",
+        "type": "chat"
+      },
+      "id": "gpt-5.6-sol",
+      "model_picker_category": "powerful",
+      "model_picker_enabled": true,
+      "name": "GPT-5.6 Sol",
+      "object": "model",
+      "policy": {
+        "state": "enabled"
+      },
+      "preview": false,
+      "supported_endpoints": [
+        "/responses",
+        "ws:/responses"
+      ],
+      "vendor": "OpenAI",
+      "version": "gpt-5.6-sol"
+    },
+    {
+      "capabilities": {
+        "family": "gpt-5.6-terra",
+        "limits": {
+          "max_context_window_tokens": 400000,
+          "max_output_tokens": 128000,
+          "max_prompt_tokens": 272000,
+          "vision": {
+            "max_prompt_image_size": 3145728,
+            "max_prompt_images": 1,
+            "supported_media_types": [
+              "image/jpeg",
+              "image/png",
+              "image/webp",
+              "image/gif",
+              "application/pdf"
+            ]
+          }
+        },
+        "object": "model_capabilities",
+        "supports": {
+          "parallel_tool_calls": true,
+          "reasoning_effort": [
+            "none",
+            "low",
+            "medium",
+            "high",
+            "xhigh",
+            "max"
+          ],
+          "streaming": true,
+          "structured_outputs": true,
+          "tool_calls": true,
+          "vision": true
+        },
+        "tokenizer": "o200k_base",
+        "type": "chat"
+      },
+      "id": "gpt-5.6-terra",
+      "model_picker_category": "versatile",
+      "model_picker_enabled": true,
+      "name": "GPT-5.6 Terra",
+      "object": "model",
+      "policy": {
+        "state": "enabled"
+      },
+      "preview": false,
+      "supported_endpoints": [
+        "/responses",
+        "ws:/responses"
+      ],
+      "vendor": "OpenAI",
+      "version": "gpt-5.6-terra"
+    },
+    {
+      "capabilities": {
+        "family": "kimi-k2.7-code",
+        "limits": {
+          "max_context_window_tokens": 256000,
+          "max_output_tokens": 32000,
+          "max_prompt_tokens": 224000,
+          "vision": {
+            "max_prompt_image_size": 3145728,
+            "max_prompt_images": 1,
+            "supported_media_types": [
+              "image/jpeg",
+              "image/png",
+              "image/webp",
+              "image/gif"
+            ]
+          }
+        },
+        "object": "model_capabilities",
+        "supports": {
+          "parallel_tool_calls": true,
+          "streaming": true,
+          "structured_outputs": true,
+          "tool_calls": true,
+          "vision": true
+        },
+        "tokenizer": "o200k_base",
+        "type": "chat"
+      },
+      "id": "kimi-k2.7-code",
+      "model_picker_category": "lightweight",
+      "model_picker_enabled": true,
+      "name": "Kimi K2.7 Code",
+      "object": "model",
+      "policy": {
+        "state": "enabled"
+      },
+      "preview": false,
+      "supported_endpoints": [
+        "/chat/completions"
+      ],
+      "vendor": "Moonshot AI",
+      "version": "kimi-k2.7-code"
+    },
+    {
+      "capabilities": {
+        "family": "oswe-vscode-modelD",
+        "limits": {
+          "max_context_window_tokens": 256000,
+          "max_output_tokens": 128000,
+          "max_prompt_tokens": 128000
+        },
+        "object": "model_capabilities",
+        "supports": {
+          "parallel_tool_calls": true,
+          "reasoning_effort": [
+            "low",
+            "medium",
+            "high"
+          ],
+          "streaming": true,
+          "structured_outputs": true,
+          "tool_calls": true
+        },
+        "tokenizer": "o200k_base",
+        "type": "chat"
+      },
+      "id": "mai-code-1-flash-picker",
+      "model_picker_category": "lightweight",
+      "model_picker_enabled": true,
+      "name": "MAI-Code-1-Flash",
+      "object": "model",
+      "policy": {
+        "state": "enabled"
+      },
+      "preview": false,
+      "supported_endpoints": [
+        "/responses"
+      ],
+      "vendor": "Microsoft",
+      "version": "mai-code-1-flash-picker"
+    },
+    {
+      "capabilities": {
+        "family": "trajectory-compaction",
+        "limits": {
+          "max_context_window_tokens": 262144,
+          "max_output_tokens": 16384,
+          "max_prompt_tokens": 245760
+        },
+        "object": "model_capabilities",
+        "supports": {
+          "parallel_tool_calls": true,
+          "streaming": true,
+          "tool_calls": true
+        },
+        "tokenizer": "o200k_base",
+        "type": "chat"
+      },
+      "id": "trajectory-compaction",
+      "model_picker_enabled": false,
+      "name": "Trajectory Compaction",
+      "object": "model",
+      "preview": true,
+      "supported_endpoints": [
+        "/chat/completions"
+      ],
+      "vendor": "Fireworks",
+      "version": "trajectory-compaction"
+    },
+    {
+      "capabilities": {
+        "family": "gpt-5-mini",
+        "limits": {
+          "max_context_window_tokens": 264000,
+          "max_output_tokens": 64000,
+          "max_prompt_tokens": 128000,
+          "vision": {
+            "max_prompt_image_size": 3145728,
+            "max_prompt_images": 1,
+            "supported_media_types": [
+              "image/jpeg",
+              "image/png",
+              "image/webp",
+              "image/gif",
+              "application/pdf"
+            ]
+          }
+        },
+        "object": "model_capabilities",
+        "supports": {
+          "parallel_tool_calls": true,
+          "reasoning_effort": [
+            "low",
+            "medium",
+            "high"
+          ],
+          "streaming": true,
+          "structured_outputs": true,
+          "tool_calls": true,
+          "vision": true
+        },
+        "tokenizer": "o200k_base",
+        "type": "chat"
+      },
+      "id": "gpt-5-mini",
+      "model_picker_category": "lightweight",
+      "model_picker_enabled": true,
+      "name": "GPT-5 mini",
+      "object": "model",
+      "policy": {
+        "state": "enabled"
+      },
+      "preview": false,
+      "supported_endpoints": [
+        "/chat/completions",
+        "/responses",
+        "ws:/responses"
+      ],
+      "vendor": "Azure OpenAI",
+      "version": "gpt-5-mini"
+    },
+    {
+      "capabilities": {
+        "family": "gpt-4o-mini",
+        "limits": {
+          "max_context_window_tokens": 128000,
+          "max_output_tokens": 4096,
+          "max_prompt_tokens": 12288
+        },
+        "object": "model_capabilities",
+        "supports": {
+          "parallel_tool_calls": true,
+          "streaming": true,
+          "tool_calls": true
+        },
+        "tokenizer": "o200k_base",
+        "type": "chat"
+      },
+      "id": "gpt-4o-mini-2024-07-18",
+      "model_picker_enabled": false,
+      "name": "GPT-4o mini",
+      "object": "model",
+      "preview": false,
+      "vendor": "Azure OpenAI",
+      "version": "gpt-4o-mini-2024-07-18"
+    },
+    {
+      "capabilities": {
+        "family": "gpt-4o",
+        "limits": {
+          "max_context_window_tokens": 128000,
+          "max_output_tokens": 16384,
+          "max_prompt_tokens": 64000
+        },
+        "object": "model_capabilities",
+        "supports": {
+          "parallel_tool_calls": true,
+          "streaming": true,
+          "tool_calls": true
+        },
+        "tokenizer": "o200k_base",
+        "type": "chat"
+      },
+      "id": "gpt-4o-2024-11-20",
+      "model_picker_enabled": false,
+      "name": "GPT-4o",
+      "object": "model",
+      "preview": false,
+      "vendor": "Azure OpenAI",
+      "version": "gpt-4o-2024-11-20"
+    },
+    {
+      "capabilities": {
+        "family": "gpt-4o",
+        "limits": {
+          "max_context_window_tokens": 128000,
+          "max_output_tokens": 16384,
+          "max_prompt_tokens": 64000
+        },
+        "object": "model_capabilities",
+        "supports": {
+          "parallel_tool_calls": true,
+          "streaming": true,
+          "tool_calls": true
+        },
+        "tokenizer": "o200k_base",
+        "type": "chat"
+      },
+      "id": "gpt-4o-2024-08-06",
+      "model_picker_enabled": false,
+      "name": "GPT-4o",
+      "object": "model",
+      "preview": false,
+      "vendor": "Azure OpenAI",
+      "version": "gpt-4o-2024-08-06"
+    },
+    {
+      "capabilities": {
+        "family": "text-embedding-3-small",
+        "limits": {
+          "max_inputs": 512
+        },
+        "object": "model_capabilities",
+        "supports": {
+          "dimensions": true
+        },
+        "tokenizer": "cl100k_base",
+        "type": "embeddings"
+      },
+      "id": "text-embedding-3-small",
+      "model_picker_enabled": false,
+      "name": "Embedding V3 small",
+      "object": "model",
+      "preview": false,
+      "vendor": "Azure OpenAI",
+      "version": "text-embedding-3-small"
+    },
+    {
+      "capabilities": {
+        "family": "text-embedding-3-small",
+        "object": "model_capabilities",
+        "supports": {
+          "dimensions": true
+        },
+        "tokenizer": "cl100k_base",
+        "type": "embeddings"
+      },
+      "id": "text-embedding-3-small-inference",
+      "model_picker_enabled": false,
+      "name": "Embedding V3 small (Inference)",
+      "object": "model",
+      "preview": false,
+      "vendor": "Azure OpenAI",
+      "version": "text-embedding-3-small"
+    },
+    {
+      "capabilities": {
+        "family": "claude-sonnet-4.5",
+        "limits": {
+          "max_context_window_tokens": 200000,
+          "max_non_streaming_output_tokens": 16000,
+          "max_output_tokens": 32000,
+          "max_prompt_tokens": 168000,
+          "vision": {
+            "max_prompt_image_size": 3145728,
+            "max_prompt_images": 5,
+            "supported_media_types": [
+              "image/jpeg",
+              "image/png",
+              "image/webp",
+              "application/pdf"
+            ]
+          }
+        },
+        "object": "model_capabilities",
+        "supports": {
+          "max_thinking_budget": 32000,
+          "min_thinking_budget": 1024,
+          "parallel_tool_calls": true,
+          "streaming": true,
+          "tool_calls": true,
+          "vision": true
+        },
+        "tokenizer": "o200k_base",
+        "type": "chat"
+      },
+      "id": "claude-sonnet-4.5",
+      "model_picker_category": "versatile",
+      "model_picker_enabled": true,
+      "name": "Claude Sonnet 4.5",
+      "object": "model",
+      "policy": {
+        "state": "enabled"
+      },
+      "preview": false,
+      "supported_endpoints": [
+        "/chat/completions",
+        "/v1/messages"
+      ],
+      "vendor": "Anthropic",
+      "version": "claude-sonnet-4.5"
+    },
+    {
+      "capabilities": {
+        "family": "claude-opus-4.5",
+        "limits": {
+          "max_context_window_tokens": 200000,
+          "max_non_streaming_output_tokens": 16000,
+          "max_output_tokens": 32000,
+          "max_prompt_tokens": 168000,
+          "vision": {
+            "max_prompt_image_size": 3145728,
+            "max_prompt_images": 5,
+            "supported_media_types": [
+              "image/jpeg",
+              "image/png",
+              "image/webp",
+              "application/pdf"
+            ]
+          }
+        },
+        "object": "model_capabilities",
+        "supports": {
+          "max_thinking_budget": 32000,
+          "min_thinking_budget": 1024,
+          "parallel_tool_calls": true,
+          "streaming": true,
+          "tool_calls": true,
+          "vision": true
+        },
+        "tokenizer": "o200k_base",
+        "type": "chat"
+      },
+      "id": "claude-opus-4.5",
+      "model_picker_category": "powerful",
+      "model_picker_enabled": true,
+      "name": "Claude Opus 4.5",
+      "object": "model",
+      "policy": {
+        "state": "enabled"
+      },
+      "preview": false,
+      "supported_endpoints": [
+        "/chat/completions",
+        "/v1/messages"
+      ],
+      "vendor": "Anthropic",
+      "version": "claude-opus-4.5"
+    },
+    {
+      "capabilities": {
+        "family": "claude-haiku-4.5",
+        "limits": {
+          "max_context_window_tokens": 200000,
+          "max_non_streaming_output_tokens": 16000,
+          "max_output_tokens": 64000,
+          "max_prompt_tokens": 136000,
+          "vision": {
+            "max_prompt_image_size": 3145728,
+            "max_prompt_images": 5,
+            "supported_media_types": [
+              "image/jpeg",
+              "image/png",
+              "image/webp",
+              "application/pdf"
+            ]
+          }
+        },
+        "object": "model_capabilities",
+        "supports": {
+          "max_thinking_budget": 32000,
+          "min_thinking_budget": 1024,
+          "parallel_tool_calls": true,
+          "streaming": true,
+          "tool_calls": true,
+          "vision": true
+        },
+        "tokenizer": "o200k_base",
+        "type": "chat"
+      },
+      "id": "claude-haiku-4.5",
+      "model_picker_category": "lightweight",
+      "model_picker_enabled": true,
+      "name": "Claude Haiku 4.5",
+      "object": "model",
+      "policy": {
+        "state": "enabled"
+      },
+      "preview": false,
+      "supported_endpoints": [
+        "/chat/completions",
+        "/v1/messages"
+      ],
+      "vendor": "Anthropic",
+      "version": "claude-haiku-4.5"
+    },
+    {
+      "capabilities": {
+        "family": "gpt-4.1",
+        "limits": {
+          "max_context_window_tokens": 128000,
+          "max_output_tokens": 16384,
+          "max_prompt_tokens": 128000,
+          "vision": {
+            "max_prompt_image_size": 3145728,
+            "max_prompt_images": 1,
+            "supported_media_types": [
+              "image/jpeg",
+              "image/png",
+              "image/webp",
+              "image/gif",
+              "application/pdf"
+            ]
+          }
+        },
+        "object": "model_capabilities",
+        "supports": {
+          "parallel_tool_calls": true,
+          "streaming": true,
+          "structured_outputs": true,
+          "tool_calls": true,
+          "vision": true
+        },
+        "tokenizer": "o200k_base",
+        "type": "chat"
+      },
+      "id": "gpt-4.1-2025-04-14",
+      "model_picker_enabled": false,
+      "name": "GPT-4.1",
+      "object": "model",
+      "policy": {
+        "state": "enabled"
+      },
+      "preview": false,
+      "vendor": "Azure OpenAI",
+      "version": "gpt-4.1-2025-04-14"
+    },
+    {
+      "capabilities": {
+        "family": "gpt-3.5-turbo",
+        "limits": {
+          "max_context_window_tokens": 16384,
+          "max_output_tokens": 4096,
+          "max_prompt_tokens": 12288
+        },
+        "object": "model_capabilities",
+        "supports": {
+          "streaming": true,
+          "tool_calls": true
+        },
+        "tokenizer": "cl100k_base",
+        "type": "chat"
+      },
+      "id": "gpt-3.5-turbo-0613",
+      "model_picker_enabled": false,
+      "name": "GPT 3.5 Turbo",
+      "object": "model",
+      "preview": false,
+      "vendor": "Azure OpenAI",
+      "version": "gpt-3.5-turbo-0613"
+    },
+    {
+      "capabilities": {
+        "family": "gpt-4",
+        "limits": {
+          "max_context_window_tokens": 32768,
+          "max_output_tokens": 4096,
+          "max_prompt_tokens": 32768
+        },
+        "object": "model_capabilities",
+        "supports": {
+          "streaming": true,
+          "tool_calls": true
+        },
+        "tokenizer": "cl100k_base",
+        "type": "chat"
+      },
+      "id": "gpt-4",
+      "model_picker_enabled": false,
+      "name": "GPT 4",
+      "object": "model",
+      "preview": false,
+      "vendor": "Azure OpenAI",
+      "version": "gpt-4-0613"
+    },
+    {
+      "capabilities": {
+        "family": "gpt-4",
+        "limits": {
+          "max_context_window_tokens": 32768,
+          "max_output_tokens": 4096,
+          "max_prompt_tokens": 32768
+        },
+        "object": "model_capabilities",
+        "supports": {
+          "streaming": true,
+          "tool_calls": true
+        },
+        "tokenizer": "cl100k_base",
+        "type": "chat"
+      },
+      "id": "gpt-4-0613",
+      "model_picker_enabled": false,
+      "name": "GPT 4",
+      "object": "model",
+      "preview": false,
+      "vendor": "Azure OpenAI",
+      "version": "gpt-4-0613"
+    },
+    {
+      "capabilities": {
+        "family": "gpt-4-turbo",
+        "limits": {
+          "max_context_window_tokens": 128000,
+          "max_output_tokens": 4096,
+          "max_prompt_tokens": 64000
+        },
+        "object": "model_capabilities",
+        "supports": {
+          "parallel_tool_calls": true,
+          "streaming": true,
+          "tool_calls": true
+        },
+        "tokenizer": "cl100k_base",
+        "type": "chat"
+      },
+      "id": "gpt-4-0125-preview",
+      "model_picker_enabled": false,
+      "name": "GPT 4 Turbo",
+      "object": "model",
+      "preview": false,
+      "vendor": "Azure OpenAI",
+      "version": "gpt-4-0125-preview"
+    },
+    {
+      "capabilities": {
+        "family": "gpt-4o",
+        "limits": {
+          "max_context_window_tokens": 128000,
+          "max_output_tokens": 4096,
+          "max_prompt_tokens": 64000,
+          "vision": {
+            "max_prompt_image_size": 3145728,
+            "max_prompt_images": 1,
+            "supported_media_types": [
+              "image/jpeg",
+              "image/png",
+              "image/webp",
+              "image/gif",
+              "application/pdf"
+            ]
+          }
+        },
+        "object": "model_capabilities",
+        "supports": {
+          "parallel_tool_calls": true,
+          "streaming": true,
+          "tool_calls": true,
+          "vision": true
+        },
+        "tokenizer": "o200k_base",
+        "type": "chat"
+      },
+      "id": "gpt-4o-2024-05-13",
+      "model_picker_enabled": false,
+      "name": "GPT-4o",
+      "object": "model",
+      "preview": false,
+      "vendor": "Azure OpenAI",
+      "version": "gpt-4o-2024-05-13"
+    },
+    {
+      "capabilities": {
+        "family": "gpt-4o",
+        "limits": {
+          "max_context_window_tokens": 128000,
+          "max_output_tokens": 4096,
+          "max_prompt_tokens": 64000
+        },
+        "object": "model_capabilities",
+        "supports": {
+          "parallel_tool_calls": true,
+          "streaming": true,
+          "tool_calls": true
+        },
+        "tokenizer": "o200k_base",
+        "type": "chat"
+      },
+      "id": "gpt-4-o-preview",
+      "model_picker_enabled": false,
+      "name": "GPT-4o",
+      "object": "model",
+      "preview": false,
+      "vendor": "Azure OpenAI",
+      "version": "gpt-4o-2024-05-13"
+    },
+    {
+      "capabilities": {
+        "family": "gpt-4.1",
+        "limits": {
+          "max_context_window_tokens": 128000,
+          "max_output_tokens": 16384,
+          "max_prompt_tokens": 128000,
+          "vision": {
+            "max_prompt_image_size": 3145728,
+            "max_prompt_images": 1,
+            "supported_media_types": [
+              "image/jpeg",
+              "image/png",
+              "image/webp",
+              "image/gif",
+              "application/pdf"
+            ]
+          }
+        },
+        "object": "model_capabilities",
+        "supports": {
+          "parallel_tool_calls": true,
+          "streaming": true,
+          "structured_outputs": true,
+          "tool_calls": true,
+          "vision": true
+        },
+        "tokenizer": "o200k_base",
+        "type": "chat"
+      },
+      "id": "gpt-4.1",
+      "model_picker_category": "versatile",
+      "model_picker_enabled": false,
+      "name": "GPT-4.1",
+      "object": "model",
+      "policy": {
+        "state": "enabled"
+      },
+      "preview": false,
+      "vendor": "Azure OpenAI",
+      "version": "gpt-4.1-2025-04-14"
+    },
+    {
+      "capabilities": {
+        "family": "gpt-3.5-turbo",
+        "limits": {
+          "max_context_window_tokens": 16384,
+          "max_output_tokens": 4096,
+          "max_prompt_tokens": 12288
+        },
+        "object": "model_capabilities",
+        "supports": {
+          "streaming": true,
+          "tool_calls": true
+        },
+        "tokenizer": "cl100k_base",
+        "type": "chat"
+      },
+      "id": "gpt-3.5-turbo",
+      "model_picker_enabled": false,
+      "name": "GPT 3.5 Turbo",
+      "object": "model",
+      "preview": false,
+      "vendor": "Azure OpenAI",
+      "version": "gpt-3.5-turbo-0613"
+    },
+    {
+      "capabilities": {
+        "family": "gpt-4o-mini",
+        "limits": {
+          "max_context_window_tokens": 128000,
+          "max_output_tokens": 4096,
+          "max_prompt_tokens": 12288
+        },
+        "object": "model_capabilities",
+        "supports": {
+          "parallel_tool_calls": true,
+          "streaming": true,
+          "tool_calls": true
+        },
+        "tokenizer": "o200k_base",
+        "type": "chat"
+      },
+      "id": "gpt-4o-mini",
+      "model_picker_enabled": false,
+      "name": "GPT-4o mini",
+      "object": "model",
+      "preview": false,
+      "vendor": "Azure OpenAI",
+      "version": "gpt-4o-mini-2024-07-18"
+    },
+    {
+      "capabilities": {
+        "family": "gpt-4o",
+        "limits": {
+          "max_context_window_tokens": 128000,
+          "max_output_tokens": 4096,
+          "max_prompt_tokens": 64000,
+          "vision": {
+            "max_prompt_image_size": 3145728,
+            "max_prompt_images": 1,
+            "supported_media_types": [
+              "image/jpeg",
+              "image/png",
+              "image/webp",
+              "image/gif"
+            ]
+          }
+        },
+        "object": "model_capabilities",
+        "supports": {
+          "parallel_tool_calls": true,
+          "streaming": true,
+          "tool_calls": true,
+          "vision": true
+        },
+        "tokenizer": "o200k_base",
+        "type": "chat"
+      },
+      "id": "gpt-4o",
+      "model_picker_enabled": false,
+      "name": "GPT-4o",
+      "object": "model",
+      "preview": false,
+      "vendor": "Azure OpenAI",
+      "version": "gpt-4o-2024-11-20"
+    },
+    {
+      "capabilities": {
+        "family": "text-embedding-ada-002",
+        "limits": {
+          "max_inputs": 512
+        },
+        "object": "model_capabilities",
+        "supports": {},
+        "tokenizer": "cl100k_base",
+        "type": "embeddings"
+      },
+      "id": "text-embedding-ada-002",
+      "model_picker_enabled": false,
+      "name": "Embedding V2 Ada",
+      "object": "model",
+      "preview": false,
+      "vendor": "Azure OpenAI",
+      "version": "text-embedding-3-small"
+    }
+  ]
+}
