@@ -448,6 +448,41 @@ def test_normalize_openai_responses_shape() -> None:
     assert u == NormalizedUsage(10, 2, 8, None, input_includes_cache=True)
 
 
+@pytest.mark.parametrize(
+    "relayed, expected",
+    [
+        # Gemini: the whole response, usage under usageMetadata; the prompt
+        # count already includes the cached part.
+        (
+            {
+                "candidates": [],
+                "usageMetadata": {
+                    "promptTokenCount": 100,
+                    "candidatesTokenCount": 20,
+                    "cachedContentTokenCount": 64,
+                },
+            },
+            NormalizedUsage(100, 20, 64, None, input_includes_cache=True),
+        ),
+        # Bedrock Converse: inputTokens is the uncached remainder.
+        (
+            {
+                "usage": {
+                    "inputTokens": 30,
+                    "outputTokens": 20,
+                    "cacheReadInputTokens": 60,
+                    "cacheWriteInputTokens": 10,
+                }
+            },
+            NormalizedUsage(30, 20, 60, 10, input_includes_cache=False),
+        ),
+    ],
+    ids=["gemini", "converse"],
+)
+def test_normalize_native_shapes(relayed, expected) -> None:
+    assert normalize_usage(relayed) == expected
+
+
 def test_normalize_openai_responses_reported_cache_writes() -> None:
     u = normalize_usage(
         {
