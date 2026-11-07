@@ -1126,30 +1126,39 @@ class BatchCompressionEvaluator:
         compression_ratio = 1 - (compressed_tokens / original_tokens) if original_tokens > 0 else 0
         tokens_saved = original_tokens - compressed_tokens
 
+        errors: list[str] = []
+
         # Call LLM with ORIGINAL messages
         start = time.time()
         try:
             response_original = self._call_llm(messages)
         except Exception as e:
             response_original = f"ERROR: {e}"
+            errors.append(f"original: {type(e).__name__}: {e}")
         latency_original = (time.time() - start) * 1000
 
+        compressed_failed = False
         # Call LLM with COMPRESSED messages
         start = time.time()
         try:
             response_compressed = self._call_llm(compressed_messages)
         except Exception as e:
             response_compressed = f"ERROR: {e}"
+            errors.append(f"compressed: {type(e).__name__}: {e}")
+            compressed_failed = True
         latency_compressed = (time.time() - start) * 1000
 
         # Compute metrics
-        exact_match = compute_exact_match(response_original, response_compressed)
-        f1_score = compute_f1(response_original, response_compressed)
-        rouge_l_score = compute_rouge_l(response_original, response_compressed)
+        # Diagnostic exception strings are not answers, even if they match.
+        exact_match = not errors and compute_exact_match(response_original, response_compressed)
+        f1_score = compute_f1(response_original, response_compressed) if not errors else 0.0
+        rouge_l_score = (
+            compute_rouge_l(response_original, response_compressed) if not errors else 0.0
+        )
 
         # Semantic similarity
         semantic_sim = None
-        if self.use_semantic_similarity:
+        if self.use_semantic_similarity and not errors:
             try:
                 semantic_sim = compute_semantic_similarity(response_original, response_compressed)
             except (ImportError, Exception):
@@ -1157,14 +1166,20 @@ class BatchCompressionEvaluator:
 
         # Check ground truth and keywords
         response_lower = response_compressed.lower()
-        ground_truth_match = (
+        ground_truth_match = not compressed_failed and (
             case.ground_truth.lower() in response_lower
             or compute_f1(response_compressed, case.ground_truth) > 0.5
         )
 
-        keywords_found = [kw for kw in case.ground_truth_keywords if kw.lower() in response_lower]
+        keywords_found = (
+            [kw for kw in case.ground_truth_keywords if kw.lower() in response_lower]
+            if not compressed_failed
+            else []
+        )
         keywords_missing = [
-            kw for kw in case.ground_truth_keywords if kw.lower() not in response_lower
+            kw
+            for kw in case.ground_truth_keywords
+            if compressed_failed or kw.lower() not in response_lower
         ]
 
         # Determine accuracy preservation
@@ -1173,7 +1188,7 @@ class BatchCompressionEvaluator:
         # 2. Semantic similarity > 0.85
         # 3. Ground truth match
         # 4. Most keywords found
-        accuracy_preserved = (
+        accuracy_preserved = not errors and (
             f1_score > 0.7
             or (semantic_sim is not None and semantic_sim > 0.85)
             or ground_truth_match
@@ -1199,6 +1214,7 @@ class BatchCompressionEvaluator:
             latency_original_ms=latency_original,
             latency_compressed_ms=latency_compressed,
             accuracy_preserved=accuracy_preserved,
+            error="; ".join(errors) if errors else None,
         )
 
     def run(
