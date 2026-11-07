@@ -55,6 +55,9 @@ RUN /opt/python/cp311-cp311/bin/pip install 'maturin>=1.5,<2.0' && \
 # headers). Bookworm's libc.so.6 doesn't export these wrappers, so
 # `import headroom._core` fails at runtime. Trixie's glibc 2.41 does.
 #
+# Node 24.22.2 from the official multi-platform image; no NodeSource setup script.
+FROM node:24-bookworm-slim@sha256:01d566e8d94d8c619591d78652babfccd3c6992a3dffa9ed5ab39e11cf6c70e9 AS wrap-node
+
 # We need Python 3.11 here (aider-chat==0.86.2 requires Python <3.12).
 # Trixie's default `python3` is 3.13 — too new for aider. python:3.11-slim
 # gives us Python 3.11 + trixie glibc + apt access for installing Node.
@@ -77,10 +80,16 @@ RUN apt-get update && \
       ca-certificates \
       curl \
       git \
-      gnupg && \
-    curl -fsSL https://deb.nodesource.com/setup_24.x | bash - && \
-    apt-get install -y --no-install-recommends nodejs && \
+        gnupg \
+        libstdc++6 \
+        libatomic1 && \
     rm -rf /var/lib/apt/lists/*
+
+COPY --from=wrap-node /usr/local/bin/node /usr/local/bin/node
+COPY --from=wrap-node /usr/local/lib/node_modules/ /usr/local/lib/node_modules/
+RUN ln -s ../lib/node_modules/npm/bin/npm-cli.js /usr/local/bin/npm && \
+    ln -s ../lib/node_modules/npm/bin/npx-cli.js /usr/local/bin/npx && \
+    ln -s ../lib/node_modules/corepack/dist/corepack.js /usr/local/bin/corepack
 
 # npm 10.9.8 crashes in Arborist's peer-set resolver when installing the local
 # OpenClaw plugin (Cannot read properties of null, reading 'edgesOut'). Pin the
@@ -110,6 +119,7 @@ COPY --from=builder /dist/*.whl /tmp/wheels/
 # triggering the same `ModuleNotFoundError` the wheel install fixes.
 COPY sdk/typescript ./sdk/typescript
 COPY plugins/openclaw ./plugins/openclaw
+COPY scripts/install-opencode.sh /tmp/install-opencode.sh
 
 # Install the prebuilt manylinux wheel with [proxy] extras. Pip resolves
 # extras from the wheel's metadata and pulls deps from public PyPI. The
@@ -122,11 +132,10 @@ RUN python -m venv /opt/headroom-venv && \
     python -m venv /opt/aider-venv && \
     /opt/aider-venv/bin/python -m pip install --upgrade pip && \
     /opt/aider-venv/bin/python -m pip install "aider-chat==${AIDER_CHAT_VERSION}" && \
-    curl -fsSL https://opencode.ai/install | VERSION="${OPENCODE_VERSION}" bash
+    sh /tmp/install-opencode.sh "${OPENCODE_VERSION}"
 
-# The opencode installer adds its bin dir to .bashrc. Non-login shells
-# (including CMD, docker run, and e2e shims spawned by subprocess) won't
-# source .bashrc, so add the dir to PATH explicitly. The e2e shim shadows
+# Expose the installed binary to non-login shells (including CMD, docker run,
+# and e2e shims spawned by subprocess). The e2e shim shadows
 # opencode anyway, but this guarantees `which opencode` works for
 # diagnostics.
 ENV PATH="/root/.opencode/bin:${PATH}"
