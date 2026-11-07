@@ -109,8 +109,9 @@ class TestSanitizeForwardedResponseHeaders:
         headers = httpx.Headers(
             [
                 ("Connection", "X-Upstream-Hop, upgrade"),
-                ("Connection", "Keep-Alive"),
+                ("Connection", "X-Second-Hop, Keep-Alive"),
                 ("X-Upstream-Hop", "1"),
+                ("X-Second-Hop", "2"),
                 ("Upgrade", "h2c"),
                 ("TE", "trailers"),
                 ("Trailer", "Digest"),
