@@ -976,7 +976,11 @@ impl SmartCrusher {
         // we keep the row drops (compression is still requested) but
         // skip the marker text and the store write — there's no point
         // storing a payload that nothing in the prompt can reference.
-        let dropped_count = items.len().saturating_sub(result.len());
+        // The `_constant_fields` sentinel is not a kept row.
+        let sentinel_rows = usize::from(
+            self.config.factor_out_constants && constant_fields_sentinel(&result).is_some(),
+        );
+        let dropped_count = items.len().saturating_sub(result.len() - sentinel_rows);
         let (ccr_hash, dropped_summary) = if dropped_count > 0 && self.config.enable_ccr_marker {
             // Serialize the original array exactly ONCE. The hash is
             // taken over those bytes, and (if a store is configured) the
@@ -1060,15 +1064,29 @@ impl SmartCrusher {
                     // Find which original indices survived by matching
                     // canonical-JSON serialization. Mirrors Python's
                     // `json.dumps(c, sort_keys=True, default=str)`-keyed
-                    // set match.
+                    // set match. With `factor_out_constants`, kept rows
+                    // come back stripped behind a leading sentinel, so the
+                    // originals are stripped the same way before matching.
+                    let constants = if self.config.factor_out_constants {
+                        constant_fields_sentinel(&crushed)
+                    } else {
+                        None
+                    };
+                    let rows = &crushed[usize::from(constants.is_some())..];
                     let crushed_keys: std::collections::HashSet<String> =
-                        crushed.iter().map(canonical_json_for_match).collect();
+                        rows.iter().map(canonical_json_for_match).collect();
                     for (i, idx) in indices.iter().enumerate() {
-                        if crushed_keys.contains(&canonical_json_for_match(&values[i])) {
+                        let key = match constants {
+                            Some(c) => {
+                                canonical_json_for_match(&strip_constant_fields(&values[i], c))
+                            }
+                            None => canonical_json_for_match(&values[i]),
+                        };
+                        if crushed_keys.contains(&key) {
                             keep_indices.insert(*idx);
                         }
                     }
-                    strategy_parts.push(format!("dict:{}->{}", values.len(), crushed.len()));
+                    strategy_parts.push(format!("dict:{}->{}", values.len(), rows.len()));
                 }
                 "str" => {
                     let strs: Vec<&str> = values.iter().filter_map(|v| v.as_str()).collect();
@@ -1225,6 +1243,29 @@ impl IntoIterator for GroupBuckets {
 /// is already JSON-native, so plain canonical JSON suffices.
 fn canonical_json_for_match(value: &Value) -> String {
     crate::transforms::anchor_selector::python_json_dumps_sort_keys(value)
+}
+
+/// The constants map of the leading `{"_constant_fields": {...}}`
+/// sentinel that `execute_plan` inserts, if `items` starts with one.
+fn constant_fields_sentinel(items: &[Value]) -> Option<&serde_json::Map<String, Value>> {
+    match items.first() {
+        Some(Value::Object(map)) if map.len() == 1 => map.get("_constant_fields")?.as_object(),
+        _ => None,
+    }
+}
+
+/// `item` with the same defensive strip `execute_plan` applies: a key is
+/// removed only when its value equals the recorded constant.
+fn strip_constant_fields(item: &Value, constants: &serde_json::Map<String, Value>) -> Value {
+    let mut item = item.clone();
+    if let Value::Object(map) = &mut item {
+        for (key, constant) in constants {
+            if map.get(key) == Some(constant) {
+                map.remove(key);
+            }
+        }
+    }
+    item
 }
 
 /// Maps a `Compaction` to a stable kind tag exposed via `CrushArrayResult`.
@@ -2742,5 +2783,96 @@ mod tests {
         let parsed: Value =
             serde_json::from_str(&result.compressed).expect("lossless_only output is JSON");
         assert_eq!(parsed, doc, "lossless_only output must decode to the input");
+    }
+
+    // Regression tests for headroomlabs-ai/headroom#4683:
+    // `factor_out_constants` dropped every dict row of a mixed array,
+    // and the `_constant_fields` sentinel was counted as a kept row.
+
+    /// Crusher with `factor_out_constants` set as given; dedup off so the
+    /// row counts below are the planner's, not dedup's.
+    fn factoring_crusher(factor_out_constants: bool) -> SmartCrusher {
+        SmartCrusher::without_compaction(SmartCrusherConfig {
+            factor_out_constants,
+            dedup_identical_items: false,
+            ..SmartCrusherConfig::default()
+        })
+    }
+
+    /// `n` dict rows with two constant keys and two varying ones.
+    fn rows_with_constants(n: usize) -> Vec<Value> {
+        (0..n)
+            .map(|i| {
+                json!({
+                    "level": i % 3,
+                    "msg": format!("request handled in {} ms", i % 10),
+                    "region": "us-west-2",
+                    "kind": "event",
+                })
+            })
+            .collect()
+    }
+
+    #[test]
+    fn factored_mixed_array_keeps_the_same_dict_rows() {
+        let mut items = rows_with_constants(40);
+        items.extend((0..10).map(|i| json!(format!("note {i}"))));
+
+        let (plain, plain_strategy) = factoring_crusher(false).crush_mixed_array(&items, "", 1.0);
+        let (factored, factored_strategy) =
+            factoring_crusher(true).crush_mixed_array(&items, "", 1.0);
+
+        assert!(
+            plain.iter().any(Value::is_object),
+            "control keeps dict rows"
+        );
+        assert_eq!(factored, plain, "flag must not change which rows survive");
+        assert_eq!(factored_strategy, plain_strategy);
+    }
+
+    #[test]
+    fn factored_marker_counts_only_real_dropped_rows() {
+        let items = rows_with_constants(40);
+        let plain = factoring_crusher(false).crush_array(&items, "", 1.0);
+        let factored = factoring_crusher(true).crush_array(&items, "", 1.0);
+
+        assert!(factored.items[0].get("_constant_fields").is_some());
+        let real_kept = factored.items.len() - 1;
+        let dropped = items.len() - real_kept;
+        assert!(dropped > 1);
+        assert!(
+            factored
+                .dropped_summary
+                .ends_with(&format!(" {dropped}_rows_offloaded>>")),
+            "marker {:?} must count {dropped} dropped rows",
+            factored.dropped_summary
+        );
+        assert_eq!(factored.dropped_summary, plain.dropped_summary);
+    }
+
+    #[test]
+    fn factored_single_dropped_row_still_writes_marker_and_stores() {
+        let items = rows_with_constants(16);
+        let c = factoring_crusher(true);
+        let result = c.crush_array(&items, "", 1.0);
+
+        assert!(result.items[0].get("_constant_fields").is_some());
+        assert_eq!(
+            result.items.len() - 1,
+            items.len() - 1,
+            "one real row dropped"
+        );
+        assert!(
+            result.dropped_summary.ends_with(" 1_rows_offloaded>>"),
+            "marker missing: {:?}",
+            result.dropped_summary
+        );
+        let hash = result.ccr_hash.expect("ccr_hash set when a row is dropped");
+        let stored = c
+            .ccr_store()
+            .and_then(|store| store.get(&hash))
+            .expect("dropped row must be retrievable from the CCR store");
+        let stored: Vec<Value> = serde_json::from_str(&stored).expect("stored payload is JSON");
+        assert_eq!(stored, items);
     }
 }
