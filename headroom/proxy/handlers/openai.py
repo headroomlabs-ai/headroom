@@ -4630,6 +4630,25 @@ class OpenAIHandlerMixin:
                         query=extract_user_query(optimized_messages) or "",
                         tags=tags,
                     )
+                elif self.memory_handler.config.inject_context and not (
+                    optimized_messages
+                    and isinstance(optimized_messages[-1], dict)
+                    and optimized_messages[-1].get("role") == "user"
+                ):
+                    # Live-zone tail only (#4419): when the request ends with
+                    # assistant tool calls and tool results, the latest user
+                    # message is an older turn the provider has already
+                    # cached. Skip the search, so nothing is retrieved, marked
+                    # as accessed, or appended inside a cached prefix.
+                    from headroom.proxy.helpers import log_memory_injection
+
+                    log_memory_injection(
+                        request_id=request_id,
+                        session_id=None,
+                        decision="no_eligible_user_message",
+                        bytes_injected=0,
+                        query=None,
+                    )
                 elif self.memory_handler.config.inject_context:
                     memory_context = await asyncio.wait_for(
                         self.memory_handler.search_and_format_context(
