@@ -1,0 +1,91 @@
+---
+title: Attribution
+description: Split savings and spend by project, client, team or any label you choose — in /stats, `headroom savings --by`, the dashboard, OpenTelemetry and pipeline extensions.
+---
+
+Every number the proxy reports is a sum over requests. **Attribution** puts named
+labels on each request — which project, which harness, which team — so those sums can
+be split. One proxy shared by a team, or several projects on one laptop, then answers
+"who is spending, and where is Headroom saving the most?"
+
+Labels are **self-reported by clients**. They attribute usage; they do not
+authenticate anyone. Authenticated identity is a separate concern (see
+`set_identity_resolver` in `headroom.proxy.identity`); a deployment that has one can
+publish it as a label with `register_dimension`, and everything below picks it up.
+
+## Built-in dimensions
+
+| Dimension | Where it comes from |
+|---|---|
+| `project` | `X-Headroom-Project` (sent by `headroom wrap`) or a `/p/<name>` base-URL prefix |
+| `client` | The harness: `X-Client`, else the User-Agent (`claude-code`, `codex`, `cursor`, …) |
+| `tenant` | The tenant-id header (`HEADROOM_TENANT_KEY_HEADER`), when sent |
+
+A dimension with nothing to report is left off the request — never filled with a
+placeholder — so unattributed traffic changes only the totals.
+
+## Your own labels
+
+List extra dimensions in `HEADROOM_ATTRIBUTION_DIMENSIONS` on the proxy. A name with no
+built-in resolver is read from the `X-Headroom-<name>` header, or from the combined
+`X-Headroom-Labels` header:
+
+```bash
+# proxy
+HEADROOM_ATTRIBUTION_DIMENSIONS=default,team,cost-center headroom proxy
+
+# clients: one header per label, or several at once
+X-Headroom-Team: infra
+X-Headroom-Labels: team=infra; cost-center=42
+```
+
+Any client that can set a header can send them; Claude Code takes them from
+`ANTHROPIC_CUSTOM_HEADERS`.
+
+`HEADROOM_ATTRIBUTION_DIMENSIONS` accepts `default` (the built-ins), `-name` to drop one,
+`none` to turn attribution off, and `labels` to accept **any** dimension a client names
+in `X-Headroom-Labels`. That last one is off by default: each dimension is persisted
+state, so the operator opts in. At most 16 dimensions and 50 labels per dimension are
+kept; the smallest, oldest label is evicted first.
+
+## Seeing it
+
+```bash
+headroom savings --by project
+headroom savings --by client --where team=infra
+headroom savings --by team --json
+```
+
+`--by` and `--where` work on the durable ledger, so every window (today, 7 days, 30
+days) splits the same way. Events written before attribution existed show as
+`unknown`.
+
+`/stats` (`savings.by_dimension`) and `/stats-lifetime` (`by_dimension`) carry the
+lifetime totals, and the dashboard shows them in **Savings by Label**. Because labels
+can name machines and people, these fields are returned only to callers allowed
+to see per-request `/stats` metadata (loopback, a trusted dashboard client, or a
+caller holding `HEADROOM_PROXY_TOKEN`; see the
+[security model](/docs/security-model#what-the-proxy-token-unlocks)), never to other
+network callers.
+
+## OpenTelemetry
+
+```bash
+HEADROOM_OTEL_ATTRIBUTION=project,team   # or "all"
+```
+
+adds the request's labels as `headroom.attribution.<dimension>` attributes on every
+Headroom OTel datapoint. Off by default: every label value becomes a metric series.
+
+## Extensions
+
+Labels reach every [pipeline extension](/docs/pipeline-extensions) on
+`OutcomeSnapshot.attribution` at `OUTCOME_OBSERVED`, alongside `conversation_key`, so an
+exporter, a chargeback job or a budget alert needs no change to the proxy. An extension
+can add its own dimension:
+
+```python
+from headroom.proxy.attribution import register_dimension
+
+register_dimension("region", lambda request: request.header("x-region"))
+```

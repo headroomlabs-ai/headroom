@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any
@@ -224,6 +225,11 @@ class RequestOutcome:
     tags: dict[str, Any] = field(default_factory=dict)
     client: str | None = None
     project: str | None = None
+    # Attribution labels (``{dimension: label}``) a handler knows beyond what
+    # the request middleware bound (see :mod:`headroom.proxy.attribution`).
+    # Merged over the context's labels; ``client`` / ``project`` above win
+    # their own dimensions so the two spellings can never disagree.
+    attribution: Mapping[str, str] | None = None
 
     # ── Derived (computed once, no caching needed — properties are cheap) ─
 
@@ -508,6 +514,11 @@ async def emit_request_outcome(handler: Any, outcome: RequestOutcome) -> None:
     if/when another contract surface emerges, but YAGNI.
     """
     from headroom.copilot_auth import consume_request_routed_to_copilot
+    from headroom.proxy.attribution import (
+        get_current_attribution,
+        get_current_conversation,
+        merge_attribution,
+    )
     from headroom.proxy.cost import _summarize_transforms
     from headroom.proxy.models import RequestLog
     from headroom.proxy.project_context import get_current_project
@@ -615,6 +626,16 @@ async def emit_request_outcome(handler: Any, outcome: RequestOutcome) -> None:
     # HTTP middleware / WS accept captured from ``X-Headroom-Project``.
     project = outcome.project or get_current_project()
 
+    # Every attribution label for this request: what the middleware resolved,
+    # then what the handler knew, then the two legacy fields, so a project the
+    # handler identified late (Codex project context) wins over the header.
+    attribution = merge_attribution(
+        get_current_attribution(),
+        outcome.attribution,
+        {"project": project} if project else None,
+        {"client": outcome.client} if outcome.client else None,
+    )
+
     # Savings that are new to this conversation. Per-request descriptions
     # below keep ``outcome.tokens_saved`` -- the wire truth for THIS request --
     # while everything that accumulates across turns uses this, so a removed
@@ -665,12 +686,10 @@ async def emit_request_outcome(handler: Any, outcome: RequestOutcome) -> None:
                     transforms_applied=tuple(str(t) for t in (outcome.transforms_applied or ())),
                     tokens_saved=outcome.tokens_saved,
                     novel_tokens_saved=novel_tokens_saved,
-                    attribution={
-                        dimension: label
-                        for dimension, label in (("project", project), ("client", outcome.client))
-                        if label
-                    },
-                    conversation_key=outcome.conversation_key,
+                    attribution=attribution,
+                    # The handler's key when it derived one; else the conversation
+                    # the client named (Claude Code's session id), for reporting.
+                    conversation_key=outcome.conversation_key or get_current_conversation(),
                     original_tokens=outcome.original_tokens,
                     output_tokens_saved=output_tokens_saved_est,
                 ),
@@ -733,6 +752,7 @@ async def emit_request_outcome(handler: Any, outcome: RequestOutcome) -> None:
         output_tokens_saved=output_tokens_saved_est,
         project=project,
         client=outcome.client,
+        attribution=attribution,
         tool_search_saved=tool_search_saved,
         local_input_tokens=outcome.optimized_tokens,
         savings_attribution=savings_breakdown,
@@ -778,6 +798,8 @@ async def emit_request_outcome(handler: Any, outcome: RequestOutcome) -> None:
             log_tags["client"] = outcome.client
         if project:
             log_tags["project"] = project
+        for dimension, label in attribution.items():
+            log_tags.setdefault(dimension, label)
         request_logger.log(
             RequestLog(
                 request_id=outcome.request_id,

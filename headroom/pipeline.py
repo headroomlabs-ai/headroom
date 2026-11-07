@@ -116,9 +116,9 @@ class OutcomeSnapshot:
     #: is re-sent and recompressed every turn, and ``tokens_saved -
     #: novel_tokens_saved`` is the re-sent history removed again.
     novel_tokens_saved: int = 0
-    #: Whose request this was: ``{dimension: label}``, for now ``project`` and
-    #: ``client`` when known. Self-reported labels, not authenticated
-    #: identity. Read-only.
+    #: Whose request this was: ``{dimension: label}`` from
+    #: :mod:`headroom.proxy.attribution` (``project``, ``client``, …).
+    #: Self-reported labels, not authenticated identity. Read-only.
     attribution: Mapping[str, str] = field(default_factory=dict)
     #: Stable across every turn of one conversation, when the handler knows it.
     conversation_key: str | None = None

@@ -103,6 +103,7 @@ from headroom.providers.copilot import model_prefers_responses_api
 from headroom.providers.grok.runtime import DEFAULT_API_URL as XAI_API_URL
 from headroom.providers.proxy_targets import route_grok_to_xai
 from headroom.proxy import public_errors
+from headroom.proxy.attribution import bind_label
 from headroom.proxy.auth_mode import (
     classify_auth_mode,
     classify_client,
@@ -6501,6 +6502,7 @@ class OpenAIHandlerMixin:
             tags["codex_project_context"] = codex_project.reason
             if codex_project.project_key and classify_project(request.headers) is None:
                 set_current_project(codex_project.project_key)
+                bind_label("project", get_current_project())
         codex_project_scope_required = client == "codex" and (
             is_chatgpt_auth
             or bool(request.headers.get("x-codex-turn-metadata"))
@@ -7866,6 +7868,8 @@ class OpenAIHandlerMixin:
         # /p/<name> path prefix already bound by WebSocketProjectPrefixMiddleware
         # so prefix-only clients (aider, Copilot BYOK, Cursor) stay attributed.
         set_current_project(classify_project(ws_headers) or get_current_project())
+        bind_label("project", get_current_project())
+        bind_label("client", client)
         metrics_for_inbound_ws = getattr(self, "metrics", None)
         if metrics_for_inbound_ws is not None and hasattr(
             metrics_for_inbound_ws, "record_inbound_request"

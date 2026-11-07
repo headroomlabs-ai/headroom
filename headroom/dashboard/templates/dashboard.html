@@ -1625,6 +1625,61 @@
                         </div>
                     </template>
                 </section>
+                <!-- Savings by attribution label (project, client, team, ...) -->
+                <section class="bg-surface rounded-lg border border-border overflow-hidden mt-6"
+                         x-data="{ dim: '' }"
+                         x-effect="if (!dim || !(lifetimeStats.by_dimension || {})[dim]) { dim = Object.keys(lifetimeStats.by_dimension || {}).filter(d => d !== 'project')[0] || '' }">
+                    <div class="px-4 py-3 border-b border-border flex justify-between items-center gap-3 flex-wrap">
+                        <div>
+                            <span class="text-sm font-medium text-gray-300">Savings by Label</span>
+                            <div class="text-xs text-gray-500 mt-0.5">Lifetime totals per attribution label — self-reported by clients</div>
+                        </div>
+                        <div class="flex gap-1 flex-wrap">
+                            <template x-for="name in Object.keys(lifetimeStats.by_dimension || {}).filter(d => d !== 'project')" :key="name">
+                                <button type="button" class="px-2 py-0.5 text-xs font-mono rounded border border-border"
+                                        :class="dim === name ? 'bg-accent/20 text-accent' : 'text-gray-400 hover:bg-border/40'"
+                                        @click="dim = name" x-text="name"></button>
+                            </template>
+                        </div>
+                    </div>
+                    <template x-if="!dim">
+                        <div class="px-4 py-8 text-center text-xs text-gray-500">
+                            No labelled requests yet. <span class="font-mono">headroom wrap</span> sends
+                            <span class="font-mono">X-Headroom-Host</span>; add your own with
+                            <span class="font-mono">HEADROOM_LABELS="team=infra"</span>.
+                        </div>
+                    </template>
+                    <template x-if="dim">
+                        <div class="overflow-x-auto">
+                            <table class="w-full text-sm" style="table-layout:fixed">
+                                <thead class="text-xs text-gray-500 tracking-wide">
+                                    <tr>
+                                        <th class="px-4 py-3 font-medium text-left" x-text="dim"></th>
+                                        <th class="px-4 py-3 font-medium text-right">Requests</th>
+                                        <th class="px-4 py-3 font-medium text-right">Tokens Saved</th>
+                                        <th class="px-4 py-3 font-medium text-right">Saved $</th>
+                                        <th class="px-4 py-3 font-medium text-right">Input $</th>
+                                        <th class="px-4 py-3 font-medium text-right">Savings %</th>
+                                    </tr>
+                                </thead>
+                                <tbody class="divide-y divide-border">
+                                    <template x-for="[label, info] in Object.entries((lifetimeStats.by_dimension || {})[dim] || {})" :key="dim + ':' + label">
+                                        <tr class="hover:bg-border/30 transition-colors">
+                                            <td class="px-4 py-3 text-left truncate">
+                                                <span class="px-2 py-0.5 bg-border text-xs font-mono" x-text="label"></span>
+                                            </td>
+                                            <td class="px-4 py-3 text-right font-mono tabular-nums" x-text="formatNumber(info.requests || 0)"></td>
+                                            <td class="px-4 py-3 text-right font-mono tabular-nums text-accent" x-text="formatNumber(info.tokens_saved || 0)"></td>
+                                            <td class="px-4 py-3 text-right font-mono tabular-nums text-emerald-400" x-text="'$' + formatCurrency(info.compression_savings_usd || 0)"></td>
+                                            <td class="px-4 py-3 text-right font-mono tabular-nums" x-text="'$' + formatCurrency(info.total_input_cost_usd || 0)"></td>
+                                            <td class="px-4 py-3 text-right font-mono tabular-nums text-xs text-accent" x-text="(info.savings_percent || 0).toFixed(1) + '%'"></td>
+                                        </tr>
+                                    </template>
+                                </tbody>
+                            </table>
+                        </div>
+                    </template>
+                </section>
             </div>
         </template>
 
