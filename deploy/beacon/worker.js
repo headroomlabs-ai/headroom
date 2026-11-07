@@ -196,6 +196,11 @@ if ([...ALLOWED_KEYS].sort().join() !== Object.keys(NESTED).sort().join()) {
 }
 
 const TOKEN = /^[\w.:/@+|-]{0,128}$/;
+// A slug-shaped string can still be a URL or a credential. Model ids and the
+// other slugs the client sends never carry a scheme or a well-known key prefix,
+// so those are dropped even though they pass TOKEN.
+const SECRETISH = /:\/\/|^(?:sk|pk|rk)[-_]|^(?:ghp|gho|ghu|ghs|ghr)_|^github_pat_|^glpat-|^xox[abposr]-|^(?:AKIA|ASIA)[A-Z0-9]{12}|^AIza|^hf_|^eyJ/i;
+const isToken = (s) => TOKEN.test(s) && !SECRETISH.test(s);
 const ROUTING_DEPTH = 4;
 
 /** `value` reduced to what `spec` allows, or undefined when none of it is. */
@@ -209,7 +214,7 @@ function clean(spec, value, depth = 0) {
   }
   if (spec === 'num') return Number.isFinite(value) ? value : undefined;
   if (spec === 'bool') return typeof value === 'boolean' ? value : undefined;
-  if (spec === 'str') spec = TOKEN;
+  if (spec === 'str') return typeof value === 'string' && isToken(value) ? value : undefined;
   if (spec instanceof RegExp) {
     return typeof value === 'string' && spec.test(value) ? value : undefined;
   }
@@ -221,7 +226,7 @@ function clean(spec, value, depth = 0) {
   const out = {};
   if (spec[MAP]) {
     for (const [key, v] of Object.entries(value)) {
-      const kept = TOKEN.test(key) ? clean(spec[MAP], v, depth + 1) : undefined;
+      const kept = isToken(key) ? clean(spec[MAP], v, depth + 1) : undefined;
       if (kept !== undefined) out[key] = kept;
     }
     return out;

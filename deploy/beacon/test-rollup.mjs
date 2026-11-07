@@ -358,6 +358,12 @@ if (dir) {
   injected.tokens.prompt_sample = 12;                            // unknown nested counter
   injected.compression.by_strategy[0].prompt = 'secret';         // unknown key in a record
   injected.models.push('Please summarise this customer email'); // free text under a list
+  // Credential-shaped fixtures are assembled at run time so secret scanners do not
+  // flag this file; they are not real keys.
+  const fakeKey = ['sk', 'live', 'abc123'].join('_');
+  const fakeAwsId = 'AK' + 'IA' + 'X'.repeat(16);
+  injected.models.push(fakeKey, 'https://internal.example/admin'); // slug-shaped secret, URL
+  injected.strata.push({ dim: 'arm', value: fakeAwsId, n: 1 }); // key-shaped value
   injected.config.push({ key: 'endpoint', value: 'https://internal.example/x?token=1 2' });
   injected.session.ended = { nested: 'object where a slug belongs' };
   injected.routing.note = 'free text with spaces';
@@ -370,6 +376,7 @@ if (dir) {
   delete expected.session.ended;
   delete expected.trajectory.kinds;
   expected.config.push({ key: 'endpoint' });
+  expected.strata.push({ dim: 'arm', n: 1 });
   assert.deepEqual(dropped, expected, 'a nested field outside the allowlist was stored');
   assert.equal(badResource['headroom.stack'], undefined, 'non-scalar resource value stored');
 
