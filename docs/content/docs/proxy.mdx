@@ -137,7 +137,7 @@ HEADROOM_SAVINGS_PROFILE=agent-90 headroom proxy --port 8787
 | `--memory-top-k` | `10` | Number of memories to inject as context |
 | `--learn` | `false` | Enable live traffic learning; implies `--memory` |
 | `--no-learn` | `false` | Explicitly disable traffic learning |
-| `--min-evidence` | `5` | Minimum observations before a learned pattern is persisted |
+| `--min-evidence` | `5` | Minimum observations before a learned pattern is persisted; `1` saves the first sighting |
 | `--codex-wire-debug` | `false` | Write local Codex wire snapshots and matching proxy log traces |
 | `HEADROOM_COMPRESS_PASSTHROUGH` | `0` | Also compress custom proxy paths that fall through to the catch-all handler (OpenAI Responses-shaped bodies, path ends in `/responses`). No `--compress-passthrough` flag on `headroom proxy`; the direct module entry point (`python -m headroom.proxy.server`) does accept one |
 
@@ -147,6 +147,15 @@ headroom proxy --learn --min-evidence 3
 headroom proxy --codex-wire-debug
 HEADROOM_COMPRESS_PASSTHROUGH=1 headroom proxy
 ```
+
+Live learning includes observations received while a save is queued or in flight.
+A pattern is marked as saved only after its evidence total is persisted. A full
+queue, failed save or cancellation retains the accumulated evidence for the next
+sighting and the shutdown snapshot.
+
+With LocalBackend, recovery reuses a row that committed before indexing failed
+instead of inserting another memory, and refreshes its indexes. Reconciliation
+is idempotent even when a cancelled SQLite update finishes late.
 
 Automatic memory lookup renders a separate, bounded embedding query:
 
@@ -349,6 +358,7 @@ By default Headroom stores originals so the model can recover them via `headroom
 |---|---|---|
 | `--no-ccr` / `HEADROOM_NO_CCR` | CCR on | Disable retrieval markers **and** the injected `headroom_retrieve` tool. |
 | `--lossless` / `HEADROOM_LOSSLESS` | `false` | Format-native lossless compaction only — no CCR marker, no retrieval tool. |
+| `--ccr-buffered-chat-streaming` / `HEADROOM_CCR_BUFFERED_CHAT_STREAMING` | `false` | Answer `headroom_retrieve` on streaming `/v1/chat/completions`. A turn carrying a redeemable marker runs as `stream: false` upstream and is re-emitted as `chat.completion.chunk` frames, so its text arrives all at once; other turns keep their real stream |
 | `--no-ccr-proactive-expansion` | expansion on | Stop proactively re-expanding compressed content when the model appears to need it. |
 
 ### File-read handling
@@ -1022,16 +1032,23 @@ OPENROUTER_API_KEY=sk-or-... headroom proxy --backend openrouter
 `--backend vertex_ai` delegates to [LiteLLM](https://docs.litellm.ai/docs/providers/vertex),
 which brings two requirements that are easy to miss:
 
-**1. Install the Vertex SDK.** `google-cloud-aiplatform` is not included in any
-Headroom extra (`[proxy]`, `[all]`, …) or Docker image variant, so install it
-alongside Headroom:
+**1. Install the Vertex SDK.** `google-cloud-aiplatform` ships in the dedicated
+`[vertex]` extra, kept out of `[proxy]` because it and its transitive tree add
+roughly 175 MB and only this backend needs it:
 
 ```bash
-pip install "headroom-ai[proxy]" "google-cloud-aiplatform>=1.38"
+pip install "headroom-ai[proxy,vertex]"
 ```
 
-Without it, the first Vertex request fails with
-`litellm.BadRequestError: … vertexai import failed … No module named 'vertexai'`.
+Without it the proxy **refuses to start**, naming the fix and exiting `2`:
+
+```text
+Cannot start proxy: Vertex backend selected but the Vertex SDK is missing. ...
+```
+
+This is a startup check rather than a per-request failure, because the backend
+would otherwise construct cleanly and then fail on every call with an opaque
+`litellm.BadRequestError: … No module named 'vertexai'`.
 
 **2. Set the LiteLLM project/location variables.** LiteLLM reads the GCP project
 and region from `VERTEXAI_PROJECT` / `VERTEXAI_LOCATION` — these are **not** the
@@ -1083,11 +1100,33 @@ mirror Vertex's native REST shape verbatim — no backend flag needed:
 ```
 
 Requests with `publisher=google` (Gemini models) go through Headroom's full
-Gemini optimization handler; `publisher=anthropic` (Claude on Vertex) routes
-through the same LiteLLM-Vertex path as `--backend vertex_ai`. Any client that
+Gemini optimization handler; `publisher=anthropic` (Claude on Vertex) is
+forwarded to Vertex directly, preserving your bearer token. Any client that
 already speaks the native Vertex REST API can simply point its endpoint at the
 proxy — this is the mechanism `headroom wrap claude` uses in
 [Vertex mode](/docs/claude-code-vertex).
+
+<Callout type="warn">
+These routes need **neither** `--backend vertex_ai` nor the `[vertex]` extra. Do
+not combine the two: with the backend flag set, Claude publisher requests are
+re-routed through LiteLLM, which derives the project, region and model from its
+own configuration and ignores the ones in your URL — a request that works
+without the flag can return a `404` for a model you never asked for.
+</Callout>
+
+### Reading Vertex errors
+
+When Vertex rejects a request with `401`, `403`, `404` or `429`, Headroom appends
+a `[headroom] hint: …` note to `error.message`, sets an `x-headroom-hint`
+response header, and logs a warning. The hint names the likely cause — expired
+ADC, a partner model not yet enabled in Model Garden, or a model that is not
+served in the requested location. Successful responses are never modified.
+
+Hints are fixed text: they never echo your request path, project, credentials or
+the underlying exception. With `--backend vertex`, a backend that cannot serve
+(missing Vertex SDK, no ADC) returns the standard sanitized proxy error plus the
+same kind of fixed hint; the raw provider detail is only in the proxy log, under
+the response's `request_id`.
 
 ### Bedrock via a local gateway
 
