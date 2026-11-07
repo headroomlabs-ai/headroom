@@ -1670,3 +1670,95 @@ describe("Vercel tool messages with several results carry message-level provider
     expect(back.map((m: any) => m.providerOptions)).toEqual([undefined, { anthropic: { cacheControl: { type: "ephemeral" } } }]);
   });
 });
+
+describe("Vercel tool-result output kinds survive the round trip", () => {
+  // The result's value travels as the OpenAI tool message content, so the proxy still compresses
+  // it; the rest of the output object rides beside it and brings the kind back on the way out.
+  const turn = (output: any) => [
+    { role: "assistant", content: [{ type: "tool-call", toolCallId: "call_1", toolName: "deploy", input: {} }] },
+    { role: "tool", content: [{ type: "tool-result", toolCallId: "call_1", toolName: "deploy", output }] },
+  ];
+  const roundTrip = (output: any) => openAIToVercel(vercelToOpenAI(turn(output)))[1].content[0].output;
+
+  it("keeps an error-text result an error", () => {
+    expect(roundTrip({ type: "error-text", value: "ECONNREFUSED 10.0.0.7:443" })).toEqual({ type: "error-text", value: "ECONNREFUSED 10.0.0.7:443" });
+  });
+
+  it("keeps an error-json result an error", () => {
+    expect(roundTrip({ type: "error-json", value: { code: 7 } })).toEqual({ type: "error-json", value: { code: 7 } });
+  });
+
+  it("restores an execution-denied result with its reason and no value", () => {
+    expect(roundTrip({ type: "execution-denied", reason: "Not from CI." })).toEqual({ type: "execution-denied", reason: "Not from CI." });
+    expect(roundTrip({ type: "execution-denied" })).toEqual({ type: "execution-denied" });
+  });
+
+  it("keeps a text result whose body parses as JSON a text result", () => {
+    expect(roundTrip({ type: "text", value: "42" })).toEqual({ type: "text", value: "42" });
+  });
+
+  it("keeps a json result whose value is a string a json result", () => {
+    expect(roundTrip({ type: "json", value: "ok" })).toEqual({ type: "json", value: "ok" });
+  });
+
+  it("keeps the output's own providerOptions", () => {
+    const output = { type: "text", value: "ok", providerOptions: { openai: { approvalId: "apr_1" } } };
+    expect(roundTrip(output)).toEqual(output);
+  });
+
+  it("keeps a content result's members: text as text, file and custom parts verbatim", () => {
+    const output = {
+      type: "content",
+      value: [
+        { type: "text", text: "Dashboard at 12:00.", providerOptions: { anthropic: { cacheControl: { type: "ephemeral" } } } },
+        { type: "file", data: { type: "data", data: "iVBORw0KGgo=" }, mediaType: "image/png", filename: "shot.png", providerOptions: { openai: { imageDetail: "low" } } },
+        { type: "custom", providerOptions: { anthropic: { toolReference: { type: "tool_reference", toolName: "bash" } } } },
+      ],
+    };
+    expect(roundTrip(output)).toEqual(output);
+  });
+
+  it("carries LanguageModelV3 media members (image-data, file-url, file-id) the same way", () => {
+    const output = {
+      type: "content",
+      value: [
+        { type: "text", text: "Three attachments." },
+        { type: "image-data", data: "iVBORw0KGgo=", mediaType: "image/png" },
+        { type: "file-url", url: "https://example.com/report.pdf" },
+        { type: "file-id", fileId: { openai: "file-abc" } },
+      ],
+    };
+    expect(roundTrip(output)).toEqual(output);
+  });
+
+  it("sends an error-text body as the tool message content, with the kind beside it", () => {
+    const [, toolMsg] = vercelToOpenAI(turn({ type: "error-text", value: "ECONNREFUSED 10.0.0.7:443" })) as any[];
+    expect(toolMsg.content).toBe("ECONNREFUSED 10.0.0.7:443");
+    expect(toolMsg.output).toEqual({ type: "error-text" });
+  });
+
+  it("sends a content result as the tool message's content array", () => {
+    const value = [{ type: "text", text: "Dashboard at 12:00." }, { type: "file", data: { type: "data", data: "iVBORw0KGgo=" }, mediaType: "image/png" }];
+    const [, toolMsg] = vercelToOpenAI(turn({ type: "content", value })) as any[];
+    expect(toolMsg.content).toEqual(value);
+    expect(toolMsg.output).toEqual({ type: "content" });
+  });
+
+  it("sends an execution-denied result as empty content with the reason beside it", () => {
+    const [, toolMsg] = vercelToOpenAI(turn({ type: "execution-denied", reason: "Not from CI." })) as any[];
+    expect(toolMsg.content).toBe("");
+    expect(toolMsg.output).toEqual({ type: "execution-denied", reason: "Not from CI." });
+  });
+
+  it("keeps the error flag when a compressed error-json body no longer parses", () => {
+    const converted = vercelToOpenAI(turn({ type: "error-json", value: { rows: [1, 2, 3, 4] } })) as any[];
+    converted[1].content = "[rows: 4 items, 1-4]";
+    expect(openAIToVercel(converted)[1].content[0].output).toEqual({ type: "error-text", value: "[rows: 4 items, 1-4]" });
+  });
+
+  it("returns a json result whose compressed body no longer parses as its text twin", () => {
+    const converted = vercelToOpenAI(turn({ type: "json", value: { rows: [1, 2, 3, 4] } })) as any[];
+    converted[1].content = "[rows: 4 items, 1-4]";
+    expect(openAIToVercel(converted)[1].content[0].output).toEqual({ type: "text", value: "[rows: 4 items, 1-4]" });
+  });
+});
