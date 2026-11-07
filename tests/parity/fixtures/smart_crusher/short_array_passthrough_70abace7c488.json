@@ -1,11 +1,18 @@
 {
   "config": {
+    "compaction_core_field_fraction": 0.8,
+    "compaction_heterogeneous_core_ratio": 0.6,
+    "compaction_max_buckets": 8,
+    "compaction_max_flatten_inner_keys": 6,
+    "compaction_min_buckets": 2,
     "dedup_identical_items": true,
     "enabled": true,
     "factor_out_constants": false,
     "first_fraction": 0.3,
     "include_summaries": false,
     "last_fraction": 0.15,
+    "lossless_min_savings_ratio": 0.15,
+    "lossless_only": false,
     "max_items_after_crush": 15,
     "min_items_to_analyze": 5,
     "min_tokens_to_crush": 200,
@@ -18,17 +25,17 @@
   },
   "input": {
     "bias": 1.0,
-    "content": "[null, true, false, null, true, false, null]",
+    "content": "[1, 2, 3]",
     "query": ""
   },
-  "input_sha256": "06d6fd6adcab251afc35de66e5cd54cfc21f15175bb082286cd1255b0f5bd965",
-  "label": "nulls_and_bools",
+  "input_sha256": "70abace7c488b4acb90c60cef985af22980bdd4d58dfb275140cc909c8a3d97f",
+  "label": "short_array_passthrough",
   "output": {
-    "compressed": "[null,true,false,null,true,false,null]",
-    "original": "[null, true, false, null, true, false, null]",
-    "strategy": "mixed:passthrough(7->7)",
-    "was_modified": true
+    "compressed": "[1, 2, 3]",
+    "original": "[1, 2, 3]",
+    "strategy": "passthrough",
+    "was_modified": false
   },
-  "recorded_at": "2026-04-27T06:59:40.029745+00:00",
+  "recorded_at": "2026-10-09T03:59:17.333122+00:00",
   "transform": "smart_crusher"
 }

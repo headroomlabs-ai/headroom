@@ -403,11 +403,66 @@ def test_parse_csv_and_records() -> None:
     assert records[1] == {"name": "Bob", "age": "25", "city": "LA"}
 
 
+def test_parse_csv_keeps_interior_blank_rows_and_trims_the_ends() -> None:
+    headers, rows = parse_csv("a,b\n1,2\n,\n3,4\n,\n5,6\n,\n")
+    assert headers == ["a", "b"]
+    assert rows == [["1", "2"], ["", ""], ["3", "4"], ["", ""], ["5", "6"]]
+    # Empty and whitespace-only lines have no real cells and are still skipped.
+    assert parse_csv("a,b\n1,2\n\n3,4\n")[1] == [["1", "2"], ["3", "4"]]
+    assert parse_csv("a,b\n1,2\n  \n3,4\n")[1] == [["1", "2"], ["3", "4"]]
+
+
+def test_parse_csv_normalizes_whitespace_only_interior_rows() -> None:
+    headers, rows = parse_csv("a,b\n1,2\n  ,  \n3,4\n")
+    assert rows == [["1", "2"], ["", ""], ["3", "4"]]
+
+
+def test_parse_csv_trims_a_large_blank_prefix_in_linear_time() -> None:
+    import time
+
+    def run(n: int) -> float:
+        text = ",\n" * n + "a,b\n1,2\n"
+        t0 = time.perf_counter()
+        headers, rows = parse_csv(text)
+        elapsed = time.perf_counter() - t0
+        assert headers == ["a", "b"]
+        assert rows == [["1", "2"]]
+        return elapsed
+
+    small, large = run(25_000), run(200_000)
+    # 8x the rows: linear stays near 8x; the old pop(0) loop was ~57x.
+    assert large < max(small, 1e-3) * 25, (small, large)
+
+
 def test_parse_markdown_table_drops_separator() -> None:
     headers, rows = parse_markdown_table(MARKDOWN)
     assert headers == ["name", "age"]
     assert ["Alice", "30"] in rows
     assert all("---" not in cell for row in rows for cell in row)
+
+
+def test_parse_csv_keeps_empty_records() -> None:
+    headers, rows = parse_csv("a,b\n1,2\n,\n3,4")
+    assert headers == ["a", "b"]
+    assert rows == [["1", "2"], ["", ""], ["3", "4"]]
+
+
+def test_parse_csv_keeps_empty_records_tsv() -> None:
+    headers, rows = parse_csv("a\tb\n1\t2\n\t\n3\t4", delimiter="\t")
+    assert headers == ["a", "b"]
+    assert rows == [["1", "2"], ["", ""], ["3", "4"]]
+
+
+def test_parse_csv_keeps_quoted_empty_record() -> None:
+    headers, rows = parse_csv('a,b\n"",""\n1,2')
+    assert headers == ["a", "b"]
+    assert rows[0] == ["", ""]
+
+
+def test_parse_markdown_table_keeps_separator_like_body_row() -> None:
+    headers, rows = parse_markdown_table("| a | b |\n|---|---|\n| 1 | 2 |\n| --- | --- |")
+    assert headers == ["a", "b"]
+    assert rows == [["1", "2"], ["---", "---"]]
 
 
 def test_parse_tabular_rejects_ragged_fixed_width(monkeypatch) -> None:
@@ -458,6 +513,42 @@ def test_compress_passes_through_ragged_table(monkeypatch) -> None:
     assert result.compressed == ragged
 
 
+# Duplicate header names ------------------------------------------------------
+
+
+def _duplicate_header_csv() -> str:
+    # A SQL join result: the same column name appears twice (#4277).
+    return "id,name,id,name\n" + "".join(f"{i},user_{i},{100 + i},org_{i % 3}\n" for i in range(40))
+
+
+def test_parse_tabular_rejects_duplicate_headers() -> None:
+    # Two columns with the same name cannot be zipped into records without one
+    # overwriting the other, so the earlier column's values would be lost.
+    assert parse_tabular(_duplicate_header_csv()) is None
+
+
+def test_parse_tabular_rejects_duplicate_blank_markdown_headers(monkeypatch) -> None:
+    import headroom.transforms.tabular_ingest as ti
+
+    monkeypatch.setattr(
+        ti,
+        "detect_content_type",
+        lambda _c: DetectionResult(ContentType.TABULAR, 0.9, {"format": "markdown"}),
+    )
+    # Two blank header cells collapse to the same "" key.
+    blank = "|  |  |\n| --- | --- |\n| 1 | 2 |\n| 3 | 4 |"
+    assert ti.parse_tabular(blank) is None
+
+
+def test_compress_passes_through_a_table_with_duplicate_headers() -> None:
+    content = _duplicate_header_csv()
+
+    result = TabularCompressor().compress(content)
+
+    assert not result.was_modified
+    assert result.compressed == content
+
+
 _JOIN_CSV = "id,name,id,name\n1,alice,10,acme\n2,bob,20,globex\n3,carol,30,initech\n"
 _BLANK_HEADER_MARKDOWN = (
     "| id | | |\n| --- | --- | --- |\n| 1 | alice | x |\n| 2 | bob | y |\n| 3 | carol | z |"
@@ -465,13 +556,13 @@ _BLANK_HEADER_MARKDOWN = (
 
 
 @pytest.mark.parametrize("content", [_JOIN_CSV, _BLANK_HEADER_MARKDOWN])
-def test_parse_tabular_rejects_duplicate_headers(content: str) -> None:
+def test_parse_tabular_rejects_duplicate_headers_upstream(content: str) -> None:
     # Records are keyed by header, so a repeated name keeps only its last
     # column: `alice` and `bob` would vanish from the compressed table.
     assert parse_tabular(content) is None
 
 
-def test_compress_passes_through_duplicate_headers() -> None:
+def test_compress_passes_through_duplicate_headers_upstream() -> None:
     # Large enough that SmartCrusher would otherwise save bytes on it.
     content = "id,name,id,name\n" + "".join(
         f"{i},user_{i},{100 + i},org_{i % 3}\n" for i in range(40)
@@ -479,6 +570,17 @@ def test_compress_passes_through_duplicate_headers() -> None:
     result = TabularCompressor().compress(content)
     assert not result.was_modified
     assert result.compressed == content
+
+
+def test_router_keeps_every_column_of_a_table_with_duplicate_headers() -> None:
+    content = _duplicate_header_csv()
+
+    result = ContentRouter().compress(content)
+
+    # No column may be dropped, and the remaining values must not be
+    # relabelled as if they came from the dropped columns.
+    for value in ("user_7", "org_1", "100", "107"):
+        assert value in result.compressed
 
 
 def _csv_with_an_oversized_cell() -> str:
@@ -511,6 +613,69 @@ def test_parse_fixed_width() -> None:
     headers, rows = parse_fixed_width("name    age   city\nAlice   30    NYC\nBob     25    LA")
     assert headers == ["name", "age", "city"]
     assert rows[0] == ["Alice", "30", "NYC"]
+
+
+def test_parse_fixed_width_never_splits_on_double_spaces_inside_a_cell() -> None:
+    # One-space gutter between USER and COMMAND on the 4444 row, and a double
+    # space inside that row's COMMAND cell. A 2+ space split returned
+    # ['4444', 'sysadmin1 sleep', '60'] (COMMAND=60), still three cells. A
+    # one-space gap cannot be told apart from a space inside a cell, so the
+    # table is not parsed and passes through verbatim.
+    table = (
+        "PID   USER      COMMAND\n"
+        "1     root      /sbin/init\n"
+        "22    www-data  nginx\n"
+        "4444  sysadmin1 sleep  60\n"
+        "5     root      cron"
+    )
+    assert parse_fixed_width(table) == ([], [])
+
+
+def test_parse_fixed_width_keeps_an_empty_cell_empty() -> None:
+    # An empty STATUS next to a NOTE with a double space used to read as
+    # STATUS='two', NOTE='words'. Here the other NOTE cells are longer, so the
+    # grid is unambiguous and the empty cell stays empty.
+    table = (
+        "NAME   STATUS  NOTE\n"
+        "alpha  ok      fine-and-dandy-things\n"
+        "beta           two  words\n"
+        "gamma  ok      fine-and-dandy-things"
+    )
+    headers, rows = parse_fixed_width(table)
+    assert headers == ["NAME", "STATUS", "NOTE"]
+    assert rows[1] == ["beta", "", "two  words"]
+
+
+def test_parse_fixed_width_never_shifts_a_value_when_the_grid_is_ambiguous() -> None:
+    # 'fine' covers one of the two spaces inside 'two  words', so no 2-wide
+    # gutter opens there and NOTE keeps the whole value. The one wrong answer
+    # is putting 'two' under STATUS.
+    table = (
+        "NAME   STATUS  NOTE\nalpha  ok      fine\nbeta           two  words\ngamma  ok      fine"
+    )
+    headers, rows = parse_fixed_width(table)
+    assert headers == ["NAME", "STATUS", "NOTE"]
+    assert rows[1] == ["beta", "", "two  words"]
+
+
+def test_parse_fixed_width_refuses_a_row_that_crosses_a_column_boundary() -> None:
+    table = "NAME  STATUS\nalphabetical  ok\nbeta  ok"
+    assert parse_fixed_width(table) == ([], [])
+
+
+def test_parse_tabular_fixed_width_control_matches_kubectl_columns(monkeypatch) -> None:
+    import headroom.transforms.tabular_ingest as ti
+
+    monkeypatch.setattr(
+        ti,
+        "detect_content_type",
+        lambda _c: DetectionResult(ContentType.TABULAR, 0.9, {"format": "fixed_width"}),
+    )
+    parsed = ti.parse_tabular(KUBECTL)
+    assert parsed is not None
+    headers, rows, _fmt = parsed
+    assert headers == ["NAME", "READY", "STATUS", "RESTARTS", "AGE"]
+    assert rows[2] == ["worker-5c8d7f9b8-lq2vx", "1/1", "Running", "2", "5h"]
 
 
 def test_to_records_empty_headers_returns_empty() -> None:
@@ -562,7 +727,7 @@ def test_parse_tabular_rejects_single_column_fixed_width(monkeypatch) -> None:
 def test_parse_tabular_none_when_no_data_rows_survive() -> None:
     # Detected as a markdown table, but it is header + separator rows only:
     # nothing survives as a data row, so parse_tabular bails to None.
-    assert parse_tabular("| a | b |\n| --- | --- |\n| --- | --- |") is None
+    assert parse_tabular("| a | b |\n| --- | --- |") is None
 
 
 def test_compression_ratio_zero_for_empty_original() -> None:
@@ -1024,3 +1189,30 @@ def test_load_spreadsheet_missing_file(tmp_path) -> None:
 
     with pytest.raises(FileNotFoundError):
         load_spreadsheet(tmp_path / "nope.xlsx")
+
+
+def test_parse_fixed_width_keeps_multiword_headers_and_values_whole():
+    text = (
+        "First Name      AGE  CITY\n"
+        "Alice Brown     30   LA\n"
+        "Carol Green     25   SF\n"
+        "David White     40   NY\n"
+        "Frank Young     32   TX"
+    )
+    headers, rows = parse_fixed_width(text)
+    assert headers == ["First Name", "AGE", "CITY"]
+    assert rows[0] == ["Alice Brown", "30", "LA"]
+
+
+def test_parse_fixed_width_cost_follows_input_length():
+    # Many short rows plus one very long cell: checking every row at every
+    # position of the longest row was ~20M checks for 33 KB of input.
+    import time
+
+    text = "KEY  FLAG  VALUE\n" + "a    b     c\n" * 1000 + "a    b     " + "z" * 20000
+    t0 = time.perf_counter()
+    headers, rows = parse_fixed_width(text)
+    elapsed = time.perf_counter() - t0
+    assert headers == ["KEY", "FLAG", "VALUE"]
+    assert rows[-1][2] == "z" * 20000
+    assert elapsed < 0.05, f"parse took {elapsed:.3f}s for {len(text)} chars"
