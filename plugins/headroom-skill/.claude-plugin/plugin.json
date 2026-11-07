@@ -1,6 +1,6 @@
 {
   "name": "headroom-skill",
-  "version": "0.43.1",
+  "version": "0.44.0",
   "description": "Skill: add headroom-ai compress() to a Python or TypeScript app to cut LLM input tokens (tool outputs, logs, JSON, chat history). No API key.",
   "author": {
     "name": "Headroom Contributors",
