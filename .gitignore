@@ -18,6 +18,8 @@ scripts/*
 !scripts/changelog-gen.py
 !scripts/verify-versions.py
 !scripts/verify-ruff-version.py
+!scripts/check_copilot_wiring.py
+!scripts/verify_copilot_model_routing.py
 !scripts/normalize_release_pr_bodies.py
 !scripts/pr-governance.py
 !scripts/bootstrap-windows-dev.ps1
