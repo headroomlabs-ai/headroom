@@ -4305,7 +4305,7 @@ class OpenAIHandlerMixin:
                 frozen_message_count=openai_frozen_count,
             )
             if restored_count > 0:
-                logger.warning(
+                logger.info(
                     f"[{request_id}] Restored {restored_count} frozen prefix message(s) "
                     "to preserve cache stability (openai)"
                 )
