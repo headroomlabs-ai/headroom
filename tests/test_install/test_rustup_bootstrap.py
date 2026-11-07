@@ -25,6 +25,7 @@ class RustupBootstrapTests(unittest.TestCase):
             PROBE_KERNEL="x86_64",
             PROBE_NEON="neon",
             PROBE_ARGS=str(self.root / "args"),
+            PROBE_INSTALL_NAME=str(self.root / "installer-name"),
         )
         self.stub("dpkg", 'printf "%s\\n" "$PROBE_ARCH"\n[ -n "$PROBE_ARCH" ]')
         self.stub("uname", 'printf "%s\\n" "$PROBE_KERNEL"')
@@ -46,6 +47,7 @@ while [ "$#" -gt 0 ]; do
 done
 cat > "$out" <<'INSTALLER'
 #!/bin/sh
+printf '%s' "${0##*/}" > "$PROBE_INSTALL_NAME"
 printf 'executed\\n' >> "$PROBE_TRACE"
 printf '%s\\n' "$@" > "$PROBE_ARGS"
 INSTALLER
@@ -128,6 +130,13 @@ INSTALLER
         result = self.run_bootstrap(*args)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(Path(self.env["PROBE_ARGS"]).read_text().splitlines(), args)
+
+    def test_binary_keeps_rustup_init_dispatch_name(self):
+        # rustup-init selects installer/proxy mode from argv[0], before options.
+        self.allow_fixture_checksum()
+        result = self.run_bootstrap("-y")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(Path(self.env["PROBE_INSTALL_NAME"]).read_text(), "rustup-init")
 
 
 if __name__ == "__main__":

@@ -42,8 +42,10 @@ case "$target" in
     s390x-unknown-linux-gnu) checksum=df1762614062280a326ac988019ed1f8ceebeafa5fac95164a7201ff10e31d4b ;;
 esac
 
-installer=$(mktemp)
-trap 'rm -f -- "$installer"' EXIT
+temporary=$(mktemp -d)
+trap 'rm -rf -- "$temporary"' EXIT
+# rustup dispatches installer/proxy mode by argv[0], so retain this basename.
+installer="$temporary/rustup-init"
 curl --proto '=https' --proto-redir '=https' --tlsv1.2 -fsSL \
     "https://static.rust-lang.org/rustup/archive/$version/$target/rustup-init" \
     --output "$installer"
