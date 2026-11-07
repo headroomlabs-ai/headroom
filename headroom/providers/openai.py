@@ -499,6 +499,7 @@ class OpenAIProvider(Provider):
 
         # Load from config file and env var
         custom_config = _load_custom_model_config()
+        self._operator_context_limits: dict[str, int] = dict(custom_config["context_limits"])
         self._context_limits.update(custom_config["context_limits"])
         self._encodings.update(custom_config["encodings"])
 
@@ -514,6 +515,7 @@ class OpenAIProvider(Provider):
         # Explicit overrides take precedence
         if context_limits:
             self._context_limits.update(context_limits)
+            self._operator_context_limits.update(context_limits)
 
         # Holds OpenAITokenCounter for models with a real tiktoken encoding and
         # registry tokenizers for everything else (see get_token_counter).
@@ -538,6 +540,12 @@ class OpenAIProvider(Provider):
             or model_lower.startswith("o1")
             or model_lower.startswith("o3")
         )
+
+    def get_operator_context_limit(self, model: str) -> int | None:
+        """Return only the context limit the operator declared for *model*."""
+        if model in self._operator_context_limits:
+            return self._operator_context_limits[model]
+        return self._operator_context_limits.get(model.removeprefix("openai/"))
 
     def get_token_counter(self, model: str) -> TokenCounter:
         """Get token counter for ``model``, deferring non-OpenAI models.

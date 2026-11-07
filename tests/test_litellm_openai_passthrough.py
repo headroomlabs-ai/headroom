@@ -280,3 +280,14 @@ async def test_lowercase_bearer_caller_key_is_forwarded() -> None:
         )
 
     assert mock_acomp.await_args.kwargs.get("api_key") == "sk-caller-123"
+
+
+def test_prepare_message_forwards_lowercase_bearer_caller_key() -> None:
+    backend = make_backend()
+
+    prepared = backend.prepare_message(
+        request_body(),
+        {"authorization": "bearer sk-caller-123"},
+    )
+
+    assert prepared["api_key"] == "sk-caller-123"
