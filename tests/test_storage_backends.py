@@ -279,6 +279,30 @@ def test_storage_plugin_class_name_cannot_leak_or_forge_log_lines(
         assert "\n" not in rendered
 
 
+def test_jsonl_storage_get_returns_latest_snapshot_for_a_repeated_request_id(
+    tmp_path: Path,
+) -> None:
+    """Saving a request ID again must be visible to get(), as in SQLite (#4254)."""
+    now = datetime(2026, 4, 23, 12, 0, 0)
+    initial = _metrics("req", now, after=80)
+    other = _metrics("other", now + timedelta(seconds=1))
+    updated = _metrics("req", now, after=40)
+
+    jsonl_storage = JSONLStorage(str(tmp_path / "metrics.jsonl"))
+    sqlite_storage = SQLiteStorage(str(tmp_path / "metrics.db"))
+    try:
+        for storage in (jsonl_storage, sqlite_storage):
+            storage.save(initial)
+            storage.save(other)
+            storage.save(updated)
+
+        reopened = JSONLStorage(str(tmp_path / "metrics.jsonl"))
+        assert reopened.get("req") == updated
+        assert jsonl_storage.get("req") == sqlite_storage.get("req") == updated
+    finally:
+        sqlite_storage.close()
+
+
 def test_jsonl_storage_round_trip_query_count_and_summary(tmp_path: Path) -> None:
     storage = JSONLStorage(str(tmp_path / "metrics.jsonl"))
     now = datetime(2026, 4, 23, 12, 0, 0)
