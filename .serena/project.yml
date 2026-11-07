@@ -107,20 +107,22 @@ ignored_memory_patterns: []
 ls_additional_workspace_folders: []
 
 # list of language servers to start when using the LSP backend; choose from:
-#   ada                    al                     angular                ansible                bash
-#   bsl                    clojure                cpp                    cpp_ccls               crystal
-#   csharp                 csharp_omnisharp       cue                    dart                   elixir
-#   elm                    erlang                 fortran                fsharp                 gdscript
-#   go                     groovy                 haskell                haxe                   hlsl
-#   html                   java                   json                   julia                  kotlin
-#   latex                  lean4                  lua                    luau                   markdown
-#   matlab                 msl                    nix                    ocaml                  pascal
-#   perl                   php                    php_phpactor           php_phpantom           powershell
-#   python                 python_basedpyright    python_jedi            python_pyrefly         python_ty
-#   qml                    r                      rego                   ruby                   ruby_solargraph
-#   rust                   scala                  scss                   solidity               svelte
-#   swift                  systemverilog          terraform              toml                   typescript
-#   typescript_vts         vue                    yaml                   zig
+#   ada                    al                     angular                ansible                astro
+#   bash                   bsl                    clojure                cpp                    cpp_ccls
+#   crystal                csharp                 csharp_omnisharp       cue                    dart
+#   deno                   elixir                 elm                    erlang                 fortran
+#   fsharp                 gdscript               gleam                  go                     groovy
+#   haskell                haxe                   hlsl                   html                   java
+#   json                   julia                  julia_fatou            kotlin                 latex
+#   lean4                  lua                    lua_emmylua            luau                   markdown
+#   matlab                 msl                    nextflow               nix                    ocaml
+#   pascal                 perl                   php                    php_devsense           php_phpactor
+#   php_phpantom           powershell             python                 python_basedpyright    python_jedi
+#   python_pyrefly         python_ty              qml                    r                      rego
+#   ruby                   ruby_solargraph        rust                   scala                  scss
+#   solidity               svelte                 swift                  systemverilog          terraform
+#   toml                   typescript             typescript_tsgo        typescript_vts         vue
+#   vbnet                  wolfram                yaml                   zig
 #   (This list may be outdated; generated with scripts/print_language_list.py;
 #   For the current list, see values of the LanguageServerId enum here:
 #   https://github.com/oraios/serena/blob/main/src/solidlsp/ls_config.py)
@@ -129,9 +131,13 @@ ls_additional_workspace_folders: []
 #   - For C, use cpp
 #   - For JavaScript, use typescript
 #   - For Angular projects, use angular (subsumes typescript+html; requires `npm install` in the project root)
+#   - For Astro projects, use astro (subsumes typescript/javascript for .astro projects; requires npm)
 #   - For Svelte projects, use svelte (subsumes typescript/javascript for .svelte projects; requires npm)
+#   - For Deno projects, use deno (serves the same .ts/.js files as typescript; requires the deno CLI on PATH)
 #   - For SCSS / Sass / plain CSS, use scss (some-sass-language-server handles all three)
 #   - For Free Pascal/Lazarus, use pascal
+#   - External Python adapters may add further registered IDs; install the adapter package first
+#     and then use its ID here, for example: example
 # Special requirements:
 #   Some language servers require additional setup/installations.
 #   See here for details: https://oraios.github.io/serena/01-about/020_programming-languages.html#language-servers
@@ -167,3 +173,17 @@ activation_command:
 # maximum time in seconds to wait for activation_command to complete before killing it (default 180s).
 # must be a positive number.
 activation_command_timeout: 180.0
+
+# list of APIs (facades or facade methods, e.g. "lsp" or "lsp.get_diagnostics_for_symbol") to include in the REPL
+# that would otherwise be disabled (particularly optional methods, which are disabled by default).
+# This extends the existing inclusions (e.g. from the global configuration).
+included_apis: []
+
+# list of APIs (facades or facade methods, e.g. "lsp" or "lsp.find_symbol") to exclude from the REPL.
+# This extends the existing exclusions (e.g. from the global configuration).
+excluded_apis: []
+
+# The interface through which the agent (LLM) accesses Serena's functionality (overrides the global setting).
+# Valid values: tools, REPL (see the global configuration for details); leave empty to use the global setting.
+# Note: the interface is fixed at startup. If a project is activated post-init, its setting is not applied.
+agent_interface:

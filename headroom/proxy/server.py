@@ -3794,19 +3794,9 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
         return KOMPRESS_DETAIL_NOT_INSTALLED
 
     def _health_checks() -> dict[str, dict[str, Any]]:
-        from headroom.cache.redis_client import guards as _redis_guards
+        from headroom.cache.redis_client import states as _redis_states
 
-        gs = _redis_guards()
-        features = {k: g.state for k, g in sorted(gs.items())}
-        ccr_backend_env = (os.environ.get("HEADROOM_CCR_BACKEND") or "").strip().lower()
-        redis_url_env = (os.environ.get("HEADROOM_REDIS_URL") or "").strip()
-        session_store_env = (os.environ.get("HEADROOM_COMPRESS_SESSION_STORE") or "").strip()
-        if (
-            "ccr" not in features
-            and ccr_backend_env == "redis"
-            and (redis_url_env or session_store_env)
-        ):
-            features["ccr"] = "unknown"
+        features = _redis_states()
         kompress_enabled = _reconcile_kompress_health()
         memory_status = (
             proxy.memory_handler.health_status()

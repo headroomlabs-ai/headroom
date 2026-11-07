@@ -54,6 +54,35 @@ def guards() -> dict[str, Guard]:
     return dict(_GUARDS)
 
 
+def states() -> dict[str, str]:
+    """Label -> state for ``/health`` and ``/metrics``.
+
+    A ``"ccr"`` entry in ``"unknown"`` is added when the lazy CCR store is
+    configured for Redis but has not been built yet: ``get_compression_store()``
+    constructs it on first use, so no guard exists to report before that.
+    """
+    snapshot = {label: guard.state for label, guard in _GUARDS.items()}
+    if "ccr" not in snapshot and _lazy_ccr_uses_redis():
+        snapshot["ccr"] = "unknown"
+    return snapshot
+
+
+def _lazy_ccr_uses_redis() -> bool:
+    """True when the not-yet-built CCR store would use Redis. Mirrors
+    :func:`_create_default_ccr_backend`."""
+    from . import compression_store
+
+    if compression_store._compression_store is not None:
+        # Built already: a Redis backend would have registered its guard, so
+        # nothing here is Redis (e.g. it fell back to the in-process store).
+        return False
+    backend = os.environ.get("HEADROOM_CCR_BACKEND", "").strip().lower()
+    session_store = os.environ.get("HEADROOM_COMPRESS_SESSION_STORE", "").strip()
+    if backend == "redis":
+        return bool(os.environ.get("HEADROOM_REDIS_URL", "").strip() or session_store)
+    return not backend and bool(session_store)
+
+
 def unregister(guard: Guard) -> None:
     """Remove ``guard`` from the module-level registry if it is registered
     under its label. A no-op when another guard already holds that label or

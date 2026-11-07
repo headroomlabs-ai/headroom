@@ -16,6 +16,7 @@ Covers:
 from __future__ import annotations
 
 import pytest
+from fastapi.testclient import TestClient
 
 from headroom.cache import redis_client  # noqa: E402
 from headroom.cache.redis_client import Guard, guards  # noqa: E402
@@ -158,7 +159,6 @@ class TestHealthSessionStore:
         monkeypatch.setenv("HEADROOM_SKIP_UPSTREAM_CHECK", "1")
         monkeypatch.setattr(redis_client, "BACKOFF_SECONDS", 60.0)
         import redis
-        from fastapi.testclient import TestClient
 
         from headroom.proxy.models import ProxyConfig
         from headroom.proxy.server import create_app
@@ -201,8 +201,6 @@ class TestHealthSessionStore:
     def test_session_store_disabled_when_no_guards(self, monkeypatch):
         monkeypatch.setenv("HEADROOM_SKIP_UPSTREAM_CHECK", "1")
 
-        from fastapi.testclient import TestClient
-
         from headroom.proxy.models import ProxyConfig
         from headroom.proxy.server import create_app
 
@@ -226,10 +224,57 @@ class TestHealthSessionStore:
         assert ss["enabled"] is False
         assert ss["status"] == "disabled"
 
+    @pytest.mark.asyncio
+    async def test_lazy_ccr_redis_visible_on_first_scrape(self, monkeypatch):
+        """Configured-but-lazy CCR Redis shows ``checked 0`` on the first
+        scrape, before any traffic has built the store; ``available`` stays
+        absent and /health reports the same unknown state. No connection is
+        attempted for the observation."""
+        monkeypatch.setenv("HEADROOM_SKIP_UPSTREAM_CHECK", "1")
+        monkeypatch.setenv("HEADROOM_STATELESS", "0")
+        monkeypatch.setenv("HEADROOM_CCR_BACKEND", "redis")
+        monkeypatch.setenv("HEADROOM_REDIS_URL", "redis://127.0.0.1:1")
+
+        from headroom.cache import compression_store, redis_client
+        from headroom.proxy.models import ProxyConfig
+        from headroom.proxy.prometheus_metrics import PrometheusMetrics
+        from headroom.proxy.server import create_app
+
+        compression_store.reset_compression_store()
+        try:
+            # Full startup, no store created yet: no guard registered.
+            app = create_app(
+                ProxyConfig(
+                    optimize=False,
+                    cache_enabled=False,
+                    rate_limit_enabled=False,
+                )
+            )
+            app.state.ready = True
+            proxy = app.state.proxy
+            proxy.http_client = object()
+
+            assert redis_client.guards() == {}  # nothing connected
+
+            text = await PrometheusMetrics(stateless=False).export()
+            assert 'headroom_redis_checked{feature="ccr"} 0' in text
+            assert "headroom_redis_available" not in text
+
+            response = TestClient(app).get("/readyz")
+            assert response.status_code == 200
+            payload = response.json()
+            ss = payload["checks"]["session_store"]
+            assert ss["enabled"] is True
+            assert ss["ready"] is False
+            assert ss["status"] == "degraded"
+            assert ss["optional"] is True
+            assert ss["features"]["ccr"] == "unknown"
+            assert payload["ready"] is True
+        finally:
+            compression_store.reset_compression_store()
+
     def test_session_store_healthy_when_available(self, monkeypatch):
         monkeypatch.setenv("HEADROOM_SKIP_UPSTREAM_CHECK", "1")
-
-        from fastapi.testclient import TestClient
 
         from headroom.proxy.models import ProxyConfig
         from headroom.proxy.server import create_app
