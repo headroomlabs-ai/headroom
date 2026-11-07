@@ -11085,6 +11085,7 @@ class OpenAIHandlerMixin:
         # below this comment changes behaviour.
         from headroom.proxy.compress_turn import CompressTurnError, begin_compress_turn
         from headroom.proxy.gateway_native import attach_view as attach_native_view
+        from headroom.proxy.gateway_native import native_count, view_count, view_recent
         from headroom.proxy.gateway_responses import build_view as build_responses_view
         from headroom.proxy.gateway_responses import is_responses_body
         from headroom.proxy.gateway_responses import mark_view as mark_responses_view
@@ -11380,11 +11381,14 @@ class OpenAIHandlerMixin:
                 pipeline_kwargs["compress_user_messages"] = True
             if target_ratio is not None:
                 pipeline_kwargs["target_ratio"] = float(target_ratio)
+            # Both counts are in the caller's messages; a native body's
+            # pipeline sees view messages.
             if protect_recent is not None:
-                pipeline_kwargs["protect_recent"] = int(protect_recent)
+                pipeline_kwargs["protect_recent"] = view_recent(body, int(protect_recent))
             if protect_analysis_context is not None:
                 pipeline_kwargs["protect_analysis_context"] = bool(protect_analysis_context)
             if frozen_message_count is not None:
+                frozen_message_count = view_count(body, frozen_message_count)
                 pipeline_kwargs["frozen_message_count"] = frozen_message_count
 
             # Sidecar session pre-work: swap in previously-computed compressed
@@ -11570,7 +11574,7 @@ class OpenAIHandlerMixin:
                         shared.publish(self.session_tracker_store, _session_key, session_tracker)
                     info = {
                         "id": session_id,
-                        "frozen_message_count": session_frozen,
+                        "frozen_message_count": native_count(body, session_frozen),
                         "cached_prefix_replayed": turn.replayed,
                     }
                     return result, final, raw_tokens_before, final_tokens_after, info

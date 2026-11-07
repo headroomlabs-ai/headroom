@@ -22,6 +22,12 @@ so the body is never rebuilt from chat messages.
 Converse bodies carry ``messages`` too, so the original list is kept under the
 view marker while the view sits in ``messages``. The marker is a Headroom
 control key and never reaches a provider.
+
+Only a gateway turn (a body with a ``gateway`` block) gets a view; a legacy
+caller's body goes through unchanged. Message counts the caller states
+(``frozen_message_count``, ``protect_recent``) are in native messages, so
+:func:`view_count`, :func:`view_recent` and :func:`native_count` convert
+between native and view indices.
 """
 
 from __future__ import annotations
@@ -70,7 +76,9 @@ def _is_converse(body: dict[str, Any]) -> bool:
         return False
     seen = False
     for message in messages:
-        content = message.get("content") if isinstance(message, dict) else None
+        if not isinstance(message, dict) or message.get("role") not in ("user", "assistant"):
+            return False
+        content = message.get("content")
         if not isinstance(content, list):
             return False
         for block in content:
@@ -100,7 +108,13 @@ class _ViewBuilder:
     def __init__(self) -> None:
         self.messages: list[dict[str, Any]] = []
         self.slots: list[_Slot] = []
+        # starts[i]: index of the first view message for native message i,
+        # with one extra entry for the end of the view.
+        self.starts: list[int] = []
         self._pending: dict[str, list[str]] = {}
+
+    def begin_message(self) -> None:
+        self.starts.append(len(self.messages))
 
     def text(
         self,
@@ -145,11 +159,13 @@ class _ViewBuilder:
     def result_id(self, explicit: Any, name: Any, fallback: str) -> str:
         """Gemini pairs a response with its call by id when present, else by name."""
         queue = self._pending.get(name if isinstance(name, str) else "", [])
-        if isinstance(explicit, str) and explicit:
-            if explicit in queue:
-                queue.remove(explicit)
+        if isinstance(explicit, str) and explicit in queue:
+            queue.remove(explicit)
             return explicit
-        return queue.pop(0) if queue else fallback
+        # A call with no id got a generated one; pair by name instead.
+        if queue:
+            return queue.pop(0)
+        return explicit if isinstance(explicit, str) and explicit else fallback
 
 
 def _gemini_view(body: dict[str, Any], view: _ViewBuilder) -> None:
@@ -160,6 +176,7 @@ def _gemini_view(body: dict[str, Any], view: _ViewBuilder) -> None:
             if isinstance(part, dict) and not any(t in part for t in _THOUGHT_KEYS):
                 view.text("system", part.get("text"), (key, "parts", k, "text"))
     for i, content in enumerate(body["contents"]):
+        view.begin_message()
         if not isinstance(content, dict) or not isinstance(content.get("parts"), list):
             continue
         role = "assistant" if content.get("role") == "model" else "user"
@@ -199,6 +216,7 @@ def _converse_view(body: dict[str, Any], messages: list[Any], view: _ViewBuilder
         if isinstance(block, dict):
             view.text("system", block.get("text"), ("system", k, "text"))
     for i, message in enumerate(messages):
+        view.begin_message()
         role = "assistant" if message.get("role") == "assistant" else "user"
         for j, block in enumerate(message["content"]):
             here: tuple[str | int, ...] = ("messages", i, "content", j)
@@ -230,18 +248,54 @@ def _build_view(shape: str, body: dict[str, Any], messages: Any) -> _ViewBuilder
         _gemini_view(body, view)
     else:
         _converse_view(body, messages, view)
+    view.starts.append(len(view.messages))
     return view
 
 
 def attach_view(body: dict[str, Any]) -> bool:
-    """Give a native body a chat-shaped view under ``messages``. True if attached."""
+    """Give a gateway turn's native body a chat-shaped view under ``messages``.
+
+    True if attached. A marker the client sent is dropped first: only this
+    function may set it.
+    """
+    body.pop(VIEW_MARKER, None)
     shape = native_shape(body)
-    if shape is None:
+    if shape is None or not isinstance(body.get("gateway"), dict):
         return False
     original = body.get("messages") if shape == CONVERSE else None
-    body["messages"] = _build_view(shape, body, original).messages
-    body[VIEW_MARKER] = {"shape": shape, "messages": original}
+    view = _build_view(shape, body, original)
+    body["messages"] = view.messages
+    body[VIEW_MARKER] = {"shape": shape, "messages": original, "starts": view.starts}
     return True
+
+
+def _starts(body: Any) -> list[int] | None:
+    marker = body.get(VIEW_MARKER) if isinstance(body, dict) else None
+    return marker.get("starts") if isinstance(marker, dict) else None
+
+
+def view_count(body: Any, native: int) -> int:
+    """View messages covering the first *native* native messages."""
+    starts = _starts(body)
+    if starts is None or native <= 0:
+        return native
+    return starts[min(native, len(starts) - 1)]
+
+
+def view_recent(body: Any, native: int) -> int:
+    """View messages covering the last *native* native messages."""
+    starts = _starts(body)
+    if starts is None or native <= 0:
+        return native
+    return starts[-1] - starts[max(0, len(starts) - 1 - native)]
+
+
+def native_count(body: Any, view: int) -> int:
+    """Native messages wholly inside the first *view* view messages."""
+    starts = _starts(body)
+    if starts is None:
+        return view
+    return max(i for i, start in enumerate(starts) if i == 0 or start <= view)
 
 
 def _set(root: Any, path: tuple[str | int, ...], kind: str, text: str) -> None:

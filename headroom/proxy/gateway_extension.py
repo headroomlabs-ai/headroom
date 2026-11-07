@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import logging
 import os
+from dataclasses import replace
 from typing import Any
 
 from starlette.requests import Request
@@ -101,7 +102,7 @@ class GatewayTurn:
     # -- fail-open ---------------------------------------------------------
     def fail_open_fields(self, messages: list[dict[str, Any]]) -> dict[str, Any]:
         # Originals, no obligations: the gateway forwards the body as sent.
-        return gateway_response_fields(
+        fields = gateway_response_fields(
             request=self.request,
             body=self.body,
             caps=self.caps,
@@ -110,6 +111,10 @@ class GatewayTurn:
             obligations=[],
             turn_id=new_turn_id(),
         )
+        if self.native_shape and "messages" in fields["body"]:
+            # I-BODY, as in `finish`: a Converse answer's `messages` is its own list.
+            fields["messages"] = fields["body"]["messages"]
+        return fields
 
     # -- before the executor ----------------------------------------------
     def prepare(self, *, model_name: str, tags: dict[str, Any], config: Any) -> None:
@@ -127,7 +132,8 @@ class GatewayTurn:
             tools=None if self.native_shape else self.body.get("tools"),
             config=config,
             tags=tags,
-            caps=self.caps,
+            # No re-drive for native shapes, so only stream-safe hooks run.
+            caps=replace(self.caps, can_redrive=False) if self.native_shape else self.caps,
         )
 
     # -- executor side -----------------------------------------------------
