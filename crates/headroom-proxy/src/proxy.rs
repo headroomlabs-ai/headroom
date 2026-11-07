@@ -259,7 +259,9 @@ pub fn build_app(state: AppState) -> Router {
         // proxy for everything else.
         .route(
             "/v1/chat/completions",
-            post(crate::handlers::chat_completions::handle_chat_completions),
+            post(crate::handlers::chat_completions::handle_chat_completions)
+                // axum's `Bytes` extractor caps at 2 MiB unless a `DefaultBodyLimit` is set.
+                .layer(DefaultBodyLimit::max(state.config.max_body_bytes as usize)),
         )
         // PR-C3: explicit POST route for /v1/responses. Same forward
         // pattern as /v1/chat/completions — the handler buffers the
@@ -267,7 +269,8 @@ pub fn build_app(state: AppState) -> Router {
         // Responses live-zone walker via `compress_openai_responses_request`.
         .route(
             "/v1/responses",
-            post(crate::handlers::responses::handle_responses),
+            post(crate::handlers::responses::handle_responses)
+                .layer(DefaultBodyLimit::max(state.config.max_body_bytes as usize)),
         )
         // PR-D4: native Vertex publisher path. The Vertex AI Anthropic
         // publisher endpoints look like
