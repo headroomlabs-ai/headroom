@@ -434,10 +434,17 @@ mod tests {
     #[test]
     fn long_model_id_is_clipped() {
         let long = "x".repeat(MAX_MODEL_LABEL_LEN + 50);
+        // Clipping itself, on a fresh set: the process-wide set may already
+        // be full from another test, and then the metric path folds to "other".
+        let mut seen = HashSet::new();
+        assert_eq!(
+            bound_label(&mut seen, &long, MAX_TRACKED_MODELS),
+            "x".repeat(MAX_MODEL_LABEL_LEN)
+        );
+        // Through the metric path the raw id never becomes a label, whichever
+        // way it is bounded.
         record_bedrock_invoke(&long, "us-long-1", AuthMode::OAuth);
-        let labels = model_labels("bedrock_invoke_count_total");
-        assert!(labels.contains(&"x".repeat(MAX_MODEL_LABEL_LEN)));
-        assert!(!labels.contains(&long));
+        assert!(!model_labels("bedrock_invoke_count_total").contains(&long));
     }
 
     #[test]
