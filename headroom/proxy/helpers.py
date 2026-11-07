@@ -1008,12 +1008,6 @@ def append_text_to_latest_user_chat_message(
     PR-A3 to retire the legacy system-prepend memory-injection path
     (P0-equivalent for /v1/chat/completions).
 
-    Only the last message is eligible, and only when it is a user message.
-    When the list ends with assistant tool calls and tool results, the
-    latest user message is an older turn the provider has already cached;
-    appending there would change a cached prefix instead of the tail, so
-    nothing is appended (#4419).
-
     Returns ``(new_messages, bytes_appended)``. ``bytes_appended == 0``
     when no eligible user message was found (no mutation occurred).
     """
@@ -1021,38 +1015,42 @@ def append_text_to_latest_user_chat_message(
         return messages, 0
 
     new_messages = list(messages)
-    idx = len(new_messages) - 1
-    msg = new_messages[idx]
-    if not isinstance(msg, dict) or msg.get("role") != "user":
-        return messages, 0
+    for idx in range(len(new_messages) - 1, -1, -1):
+        msg = new_messages[idx]
+        if not isinstance(msg, dict):
+            continue
+        if msg.get("role") != "user":
+            continue
 
-    content = msg.get("content")
-    if isinstance(content, str):
-        updated_msg = {**msg, "content": content + "\n\n" + context_text}
-        new_messages[idx] = updated_msg
-        return new_messages, len(context_text)
-
-    if isinstance(content, list) and content:
-        new_content: list[dict[str, Any]] = []
-        appended = False
-        for part in content:
-            if (
-                not appended
-                and isinstance(part, dict)
-                and part.get("type") in ("text", "input_text")
-            ):
-                existing_text = part.get("text", "")
-                new_part = {**part, "text": existing_text + "\n\n" + context_text}
-                new_content.append(new_part)
-                appended = True
-            else:
-                new_content.append(part)
-        if appended:
-            updated_msg = {**msg, "content": new_content}
+        content = msg.get("content")
+        if isinstance(content, str):
+            updated_msg = {**msg, "content": content + "\n\n" + context_text}
             new_messages[idx] = updated_msg
             return new_messages, len(context_text)
 
-    # User message but no eligible text block — leave untouched.
+        if isinstance(content, list) and content:
+            new_content: list[dict[str, Any]] = []
+            appended = False
+            for part in content:
+                if (
+                    not appended
+                    and isinstance(part, dict)
+                    and part.get("type") in ("text", "input_text")
+                ):
+                    existing_text = part.get("text", "")
+                    new_part = {**part, "text": existing_text + "\n\n" + context_text}
+                    new_content.append(new_part)
+                    appended = True
+                else:
+                    new_content.append(part)
+            if appended:
+                updated_msg = {**msg, "content": new_content}
+                new_messages[idx] = updated_msg
+                return new_messages, len(context_text)
+
+        # User message but no eligible text block — leave untouched and stop.
+        return messages, 0
+
     return messages, 0
 
 

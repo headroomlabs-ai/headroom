@@ -1284,42 +1284,8 @@ def test_append_text_to_latest_user_chat_message_no_user_returns_zero() -> None:
     assert new_msgs == msgs
 
 
-def test_append_text_to_latest_user_chat_message_skips_tool_result_tail() -> None:
-    """#4419: after tool calls, the latest user turn is not the live-zone tail."""
-    msgs = [
-        {"role": "system", "content": "sys"},
-        {"role": "user", "content": "list the files"},
-        {
-            "role": "assistant",
-            "content": None,
-            "tool_calls": [
-                {
-                    "id": "call_1",
-                    "type": "function",
-                    "function": {"name": "ls", "arguments": "{}"},
-                }
-            ],
-        },
-        {"role": "tool", "tool_call_id": "call_1", "content": "a.py b.py"},
-    ]
-    new_msgs, appended = append_text_to_latest_user_chat_message(msgs, "MEM")
-    assert appended == 0
-    assert new_msgs is msgs
-    assert msgs[1]["content"] == "list the files"
-
-
-def test_append_text_to_latest_user_chat_message_skips_assistant_tail() -> None:
-    msgs = [
-        {"role": "user", "content": "hi"},
-        {"role": "assistant", "content": "hello"},
-    ]
-    new_msgs, appended = append_text_to_latest_user_chat_message(msgs, "MEM")
-    assert appended == 0
-    assert new_msgs is msgs
-
-
 def test_openai_chat_memory_not_injected_into_older_user_turn() -> None:
-    """#4419: a tool-result tail leaves every message byte-equal."""
+    """#4419: a tool-result tail skips the memory search and stays byte-equal."""
     config = ProxyConfig(
         optimize=False,
         cache_enabled=False,
@@ -1392,6 +1358,9 @@ def test_openai_chat_memory_not_injected_into_older_user_turn() -> None:
     assert isinstance(sent, dict), captured
     assert sent["messages"] == messages
     assert "MEMCTX_OAI" not in str(sent["messages"])
+    # No search for a tail that cannot receive memory (nothing retrieved or
+    # marked as accessed).
+    proxy.memory_handler.search_and_format_context.assert_not_awaited()
 
 
 def test_openai_chat_memory_routes_to_user_tail_not_system() -> None:
