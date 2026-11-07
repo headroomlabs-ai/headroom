@@ -850,6 +850,7 @@ class RequestTransformer:
         config: Any,
         tags: dict[str, Any],
         caps: GatewayCapabilities,
+        conversation: str | None = None,
     ) -> None:
         self.provider = provider
         self.model_name = model_name
@@ -857,6 +858,8 @@ class RequestTransformer:
         self.config = config
         self.tags = tags
         self.caps = caps
+        # ``TurnContext.conversation``: the gateway session, when one is named.
+        self.conversation = conversation
         self.result: RequestTransformResult | None = None
         # Tool-definition tokens the request hooks ADDED (e.g. a search tool).
         # The compress handler adds it to ``tokens_after``: it is sent too.
@@ -932,6 +935,7 @@ class RequestTransformer:
             tags=self.tags,
             count_messages=count_messages,
             count_tools=count_tools,
+            conversation=self.conversation,
         )
         if hooks:
             msg_before = _safe_count(count_messages, messages)

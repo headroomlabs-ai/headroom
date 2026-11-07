@@ -3682,6 +3682,7 @@ class AnthropicHandlerMixin:
             # registry check keeps this a no-op when no hook is registered.
             from headroom.proxy.turn_hooks import (
                 TurnContext,
+                conversation_from,
                 registered_turn_hooks,
                 run_request_hooks,
             )
@@ -3703,6 +3704,14 @@ class AnthropicHandlerMixin:
                     tags=tags,
                     count_messages=tokenizer.count_messages,
                     count_tools=_count_tool_tokens,
+                    # Claude Code sends one session id on every request and
+                    # retry of a session; other clients may send Headroom's.
+                    conversation=conversation_from(
+                        "claude-code", request.headers.get("x-claude-code-session-id")
+                    )
+                    or conversation_from(
+                        "headroom-session", request.headers.get("x-headroom-session-id")
+                    ),
                 )
                 # Snapshot BEFORE the hook (same tokenizer) so we can tell whether the
                 # hook itself folded — comparing against the pipeline's optimized_tokens
