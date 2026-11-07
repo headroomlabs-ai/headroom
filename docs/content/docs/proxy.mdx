@@ -637,7 +637,7 @@ Keep carrying both yourself and send them upstream unchanged. Two consequences w
 
 | Field | Type | Default | Description |
 | --- | --- | --- | --- |
-| `mode` | string | unset | `ccr`, `lossy_inline`, or `lossless_then_lossy`. Unset selects the default marker-free pipeline. Any other value is a `400`. |
+| `mode` | string | unset | `ccr`, `lossy_inline`, `lossless_then_lossy`, or `lossless`. Unset selects the default marker-free pipeline. Any other value is a `400`. |
 | `frozen_message_count` | integer | unset | Pin a prefix: the first N messages are returned byte-for-byte unchanged while staying visible to cross-message transforms like dedup. Set it to the number of messages the provider has already cached so compression cannot rewrite the prefix and bust that cache. Must be a non-negative integer; anything else is a `400`. |
 | `session_id` | string | unset | Opt into [session mode](#session-mode): Headroom keeps this conversation's replay state itself, so you can resend the raw conversation every turn and get a byte-identical prefix back. Non-empty, at most 256 characters; anything else is a `400`. Cannot be combined with `compress_user_messages` (`400`). |
 | `compress_user_messages` | boolean | `false` | Also compress user-role messages. |
@@ -650,6 +650,7 @@ Keep carrying both yourself and send them upstream unchanged. Two consequences w
 - **unset (default)** — marker-free. Emits no `<<ccr:…>>` retrieval markers and writes nothing to the CCR store, so you can forward the returned messages straight to a provider. This is the right mode for a gateway or guardrail that just swaps `messages` and forwards.
 - **`ccr`** — emits CCR markers and writes to the store. Only for callers that also inject the `headroom_retrieve` tool *and* can reach `/v1/retrieve` (itself loopback-only). Markers are a dangling pointer for the model otherwise.
 - **`lossy_inline`** (alias `lossless_then_lossy`) — runs the lossless byte/data fold first, then compresses the folded remainder. Marker-free.
+- **`lossless`** — format-native folds only, with no markers and no retrieval. For a sidecar with no retrieval loop; a registered lossless provider still applies. Keep the mode stable within a `session_id`, because session mode replays earlier turns byte-for-byte.
 
 #### Response
 
