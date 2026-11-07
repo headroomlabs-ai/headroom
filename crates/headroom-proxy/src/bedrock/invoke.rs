@@ -24,6 +24,9 @@
 //! - **Missing credentials**: log
 //!   `event=bedrock_credentials_missing` at WARN, return `500` with
 //!   a JSON error body. NEVER forwards an unsigned request.
+//! - **Credentials refresh failure** (the provider errors when the
+//!   cached credentials are near expiry): log
+//!   `event=bedrock_credentials_refresh_failed`, return `500`.
 //! - **Envelope parse failure**: log `event=bedrock_envelope_parse_error`,
 //!   pass the bytes through unchanged. Bedrock will reject anyway,
 //!   but the failure is the customer's, not ours — we just route.
@@ -264,7 +267,7 @@ pub async fn handle_invoke(
     };
 
     // Resolve credentials. No silent fallback: missing creds → 5xx.
-    let creds = match state.bedrock_credentials.as_ref() {
+    let creds_source = match state.bedrock_credentials.as_ref() {
         Some(c) => c.clone(),
         None => {
             tracing::warn!(
@@ -281,6 +284,24 @@ pub async fn handle_invoke(
             );
         }
     };
+    let creds = match creds_source.get().await {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::error!(
+                event = "bedrock_credentials_refresh_failed",
+                request_id = %request_id,
+                model_id = %model_id,
+                error = %e,
+                "bedrock invoke: AWS credentials refresh failed; refusing to forward unsigned"
+            );
+            capture::finalize_rejected(pending_stats.take());
+            return error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "bedrock_credentials_refresh_failed",
+                &e.to_string(),
+            );
+        }
+    };
 
     // Build the headers we sign + forward. Start from the inbound
     // headers, drop the ones the upstream client manages, then sign.
@@ -294,7 +315,7 @@ pub async fn handle_invoke(
         method: method.as_str(),
         url: &upstream_url,
         region: &state.config.bedrock_region,
-        credentials: creds.as_ref(),
+        credentials: &creds,
         body: &outbound_body,
         extra_signed_headers: &extra_signed_refs,
         time: SystemTime::now(),

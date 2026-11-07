@@ -54,14 +54,15 @@ use headroom_core::compression_policy::CompressionPolicy;
 pub struct AppState {
     pub config: Arc<Config>,
     pub client: reqwest::Client,
-    /// PR-D1: AWS credentials resolved at startup via the
-    /// `aws-config` default chain. `None` when the proxy boots
+    /// PR-D1: AWS credentials source (the `aws-config` default chain,
+    /// asked again before the cached credentials expire; see
+    /// `bedrock::credentials`). `None` when the proxy boots
     /// without AWS creds available (operator running locally
     /// against a non-Bedrock upstream); the Bedrock invoke handler
     /// returns 5xx with a structured `event=bedrock_credentials_missing`
     /// log so failures are LOUD — no silent fallback to unsigned
     /// requests.
-    pub bedrock_credentials: Option<Arc<aws_credential_types::Credentials>>,
+    pub bedrock_credentials: Option<Arc<crate::bedrock::BedrockCredentials>>,
     /// PR-E6: per-session structural-hash LRU for the cache-bust
     /// drift detector. Bounded to 1000 sessions in production. The
     /// detector is read-only — observing it never mutates the
@@ -161,8 +162,17 @@ impl AppState {
     /// modified state; intended to be chained off `AppState::new`.
     /// Tests that don't exercise the Bedrock route can leave
     /// credentials unset (the catch-all paths never read them).
-    pub fn with_bedrock_credentials(mut self, creds: aws_credential_types::Credentials) -> Self {
-        self.bedrock_credentials = Some(Arc::new(creds));
+    pub fn with_bedrock_credentials(self, creds: aws_credential_types::Credentials) -> Self {
+        self.with_bedrock_credentials_source(crate::bedrock::BedrockCredentials::new(creds))
+    }
+
+    /// Attach a credentials source that is asked again before the
+    /// cached credentials expire (temporary IMDS / ECS / SSO creds).
+    pub fn with_bedrock_credentials_source(
+        mut self,
+        source: crate::bedrock::BedrockCredentials,
+    ) -> Self {
+        self.bedrock_credentials = Some(Arc::new(source));
         self
     }
 
