@@ -46,7 +46,8 @@
 //! operation while still being available under
 //! `RUST_LOG=headroom_proxy::observability=debug`.
 
-use std::sync::OnceLock;
+use std::collections::HashSet;
+use std::sync::{Mutex, OnceLock};
 
 use axum::body::Body;
 use axum::http::{header, StatusCode};
@@ -63,6 +64,42 @@ use headroom_core::auth_mode::AuthMode;
 /// long completions (5-60s). Mirrors the bucket layout the AWS
 /// CloudWatch sample dashboards use.
 const LATENCY_BUCKETS_SECONDS: &[f64] = &[0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0, 60.0];
+
+/// Longest `model` label value kept; mirrors `MAX_LABEL_LENGTH` in
+/// `headroom/proxy/persistent_metrics.py`.
+const MAX_MODEL_LABEL_LEN: usize = 128;
+/// Distinct `model` label values before new ones fold into
+/// [`OTHER_MODEL_LABEL`]; mirrors `MAX_TRACKED_MODELS` in
+/// `headroom/proxy/persistent_metrics.py`.
+const MAX_TRACKED_MODELS: usize = 200;
+const OTHER_MODEL_LABEL: &str = "other";
+
+/// Clip `raw` to [`MAX_MODEL_LABEL_LEN`] chars and fold it into
+/// [`OTHER_MODEL_LABEL`] once `seen` already holds `cap` values. The
+/// model id is the client-supplied URL path segment, so without this
+/// every distinct value is a new series that lives until exit.
+fn bound_label(seen: &mut HashSet<String>, raw: &str, cap: usize) -> String {
+    let key: String = raw.chars().take(MAX_MODEL_LABEL_LEN).collect();
+    if key == OTHER_MODEL_LABEL || seen.contains(&key) {
+        return key;
+    }
+    if seen.len() < cap {
+        seen.insert(key.clone());
+        return key;
+    }
+    OTHER_MODEL_LABEL.to_string()
+}
+
+/// [`bound_label`] over the process-wide set shared by all three
+/// Bedrock metric families.
+fn bounded_model(raw: &str) -> String {
+    static SEEN: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
+    let mut seen = SEEN
+        .get_or_init(|| Mutex::new(HashSet::new()))
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    bound_label(&mut seen, raw, MAX_TRACKED_MODELS)
+}
 
 /// Lazy singleton registry. Borrowed by `handle_metrics` for
 /// scrape rendering and by every metric registration helper.
@@ -145,6 +182,8 @@ fn eventstream_counter() -> &'static IntCounterVec {
 /// correlate this metric with the request's structured log line via
 /// the `request_id` field (callers thread that through).
 pub fn record_bedrock_invoke(model: &str, region: &str, auth_mode: AuthMode) {
+    let model = bounded_model(model);
+    let model = model.as_str();
     invoke_counter()
         .with_label_values(&[model, region, auth_mode.as_str()])
         .inc();
@@ -164,6 +203,8 @@ pub fn record_bedrock_invoke(model: &str, region: &str, auth_mode: AuthMode) {
 /// free of `Instant` types so unit tests can assert on synthetic
 /// values.
 pub fn observe_bedrock_invoke_latency(model: &str, region: &str, seconds: f64) {
+    let model = bounded_model(model);
+    let model = model.as_str();
     invoke_latency()
         .with_label_values(&[model, region])
         .observe(seconds);
@@ -182,6 +223,8 @@ pub fn observe_bedrock_invoke_latency(model: &str, region: &str, seconds: f64) {
 /// the message (or `unknown` when the message header was missing,
 /// which itself is loud-logged at the call site).
 pub fn record_bedrock_eventstream_message(model: &str, region: &str, event_type: &str) {
+    let model = bounded_model(model);
+    let model = model.as_str();
     eventstream_counter()
         .with_label_values(&[model, region, event_type])
         .inc();
@@ -349,6 +392,70 @@ mod tests {
             body.contains("region=\"us-east-1\""),
             "scrape missing region label: {body}"
         );
+    }
+
+    /// Distinct `model="..."` values on lines of `metric` in the scrape.
+    fn model_labels(metric: &str) -> HashSet<String> {
+        scrape()
+            .lines()
+            .filter(|l| l.starts_with(metric))
+            .filter_map(|l| l.split("model=\"").nth(1))
+            .filter_map(|r| r.split('"').next())
+            .map(str::to_string)
+            .collect()
+    }
+
+    #[test]
+    fn many_distinct_model_ids_stay_bounded_across_all_families() {
+        for i in 0..(MAX_TRACKED_MODELS + 100) {
+            let m = format!("flood-model-{i}");
+            record_bedrock_invoke(&m, "us-flood-1", AuthMode::OAuth);
+            observe_bedrock_invoke_latency(&m, "us-flood-1", 0.1);
+            record_bedrock_eventstream_message(&m, "us-flood-1", "chunk");
+        }
+        for metric in [
+            "bedrock_invoke_count_total",
+            "bedrock_invoke_latency_seconds_count",
+            "bedrock_eventstream_message_count_total",
+        ] {
+            // Other tests write straight into the vectors; count only ours.
+            let n = model_labels(metric)
+                .iter()
+                .filter(|l| l.starts_with("flood-model-") || *l == "other")
+                .count();
+            assert!(
+                n <= MAX_TRACKED_MODELS + 1,
+                "{metric}: {n} distinct model labels"
+            );
+        }
+        assert!(model_labels("bedrock_invoke_count_total").contains("other"));
+    }
+
+    #[test]
+    fn long_model_id_is_clipped() {
+        let long = "x".repeat(MAX_MODEL_LABEL_LEN + 50);
+        // Clipping itself, on a fresh set: the process-wide set may already
+        // be full from another test, and then the metric path folds to "other".
+        let mut seen = HashSet::new();
+        assert_eq!(
+            bound_label(&mut seen, &long, MAX_TRACKED_MODELS),
+            "x".repeat(MAX_MODEL_LABEL_LEN)
+        );
+        // Through the metric path the raw id never becomes a label, whichever
+        // way it is bounded.
+        record_bedrock_invoke(&long, "us-long-1", AuthMode::OAuth);
+        assert!(!model_labels("bedrock_invoke_count_total").contains(&long));
+    }
+
+    #[test]
+    fn bound_label_keeps_normal_ids_and_folds_past_cap() {
+        let mut seen = HashSet::new();
+        let id = "anthropic.claude-3-haiku-20240307-v1:0";
+        assert_eq!(bound_label(&mut seen, id, 2), id);
+        assert_eq!(bound_label(&mut seen, "b", 2), "b");
+        assert_eq!(bound_label(&mut seen, "c", 2), "other");
+        assert_eq!(bound_label(&mut seen, id, 2), id, "known ids stay exact");
+        assert_eq!(bound_label(&mut seen, "other", 2), "other");
     }
 
     #[test]
