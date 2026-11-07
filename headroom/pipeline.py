@@ -5,9 +5,10 @@ from __future__ import annotations
 import importlib.metadata
 import logging
 import os
-from collections.abc import Iterable
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
 from enum import Enum
+from types import MappingProxyType
 from typing import Any, Protocol
 
 log = logging.getLogger(__name__)
@@ -86,6 +87,21 @@ class OutcomeSnapshot:
     #: is re-sent and recompressed every turn, and ``tokens_saved -
     #: novel_tokens_saved`` is the re-sent history removed again.
     novel_tokens_saved: int = 0
+    #: Whose request this was: ``{dimension: label}``, for now ``project`` and
+    #: ``client`` when known. Self-reported labels, not authenticated
+    #: identity. Read-only.
+    attribution: Mapping[str, str] = field(default_factory=dict)
+    #: Stable across every turn of one conversation, when the handler knows it.
+    conversation_key: str | None = None
+    #: Pre-compression input size on the same tokenizer as ``tokens_saved``.
+    original_tokens: int = 0
+    #: Estimated output tokens avoided by output shaping on this request.
+    output_tokens_saved: int = 0
+
+    def __post_init__(self) -> None:
+        # Frozen fields can still hold a mutable dict; freeze it so an
+        # extension cannot rewrite the labels another extension will read.
+        object.__setattr__(self, "attribution", MappingProxyType(dict(self.attribution or {})))
 
     @property
     def truncated(self) -> bool:
@@ -246,6 +262,17 @@ class PipelineExtensionManager:
     @property
     def enabled(self) -> bool:
         return bool(self._extensions)
+
+    def add(self, extension: Any) -> None:
+        """Attach an extension after construction.
+
+        For a proxy extension (``headroom.proxy_extension``) that also needs
+        lifecycle events: it is installed after the proxy and its manager
+        exist, so it cannot be passed to the constructor. Adding the same
+        object twice is a no-op.
+        """
+        if all(existing is not extension for existing in self._extensions):
+            self._extensions.append(extension)
 
     def emit(
         self,
