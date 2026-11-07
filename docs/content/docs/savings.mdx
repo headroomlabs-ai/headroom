@@ -60,3 +60,22 @@ Cost avoided is the dollar value of the saved **input** tokens. Headroom uses [l
 <Callout type="info">
   `headroom savings` is distinct from `headroom_stats` (a per-session, in-memory snapshot) and from the proxy's live `/stats` endpoint (backed by `proxy_savings.json`). The savings ledger is the durable, cross-process source of truth.
 </Callout>
+
+## Proxy lifetime pricing migration
+
+`proxy_savings.json` schema v7 records `pricing_basis="cache-region-v1"` for the
+pricing method; `savings_basis` separately describes estimate quality.
+Unversioned compression/tool-schema dollars move to `legacy_compression_savings_usd`
+and `legacy_tool_schema_savings_usd`, excluded from current priced headlines,
+including `/stats-lifetime`. Requests, tokens, spend, and retained history remain.
+New estimates accumulate separately across restarts; signed lifetime audit balances
+remain authoritative, with missing components recovered independently from history.
+JSON/CSV retain audit fields; new CSV columns follow the original positional columns.
+Legacy tool-schema amounts may overlap compression totals, so do not add them together.
+The list-price ceiling can still contain historical nominal dollars; it is not the
+priced headline or a provider-invoice reconciliation. `headroom savings` and its
+event ledger are unchanged.
+
+Before downgrading, stop the proxy and back up `proxy_savings.json`: older writers
+discard pricing-version/audit fields. Keep the v7 file; restoring an older file
+restores unqualified dollars until this migration runs again.
