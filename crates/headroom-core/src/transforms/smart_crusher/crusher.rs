@@ -102,6 +102,9 @@ pub struct CrushArrayResult {
     /// Top-level [`Compaction`] variant tag — `"table"`, `"buckets"`,
     /// `"ccr"`. Mirrors `compacted` — populated only when lossless won.
     pub compaction_kind: Option<&'static str>,
+    /// `true` when `items[0]` is the `{"_constant_fields": {...}}`
+    /// sentinel added by `factor_out_constants`, not a kept input row.
+    pub constant_fields_sentinel: bool,
 }
 
 /// Top-level SmartCrusher.
@@ -333,6 +336,13 @@ impl SmartCrusher {
     /// equals the recorded constant, so a drifted item keeps its own
     /// value. The CCR store always holds the full unfactored original.
     pub fn execute_plan(&self, plan: &CompressionPlan, items: &[Value]) -> Vec<Value> {
+        self.execute_plan_tracked(plan, items).0
+    }
+
+    /// [`Self::execute_plan`], plus whether it prepended the
+    /// `_constant_fields` sentinel (an input row can have the same shape).
+    fn execute_plan_tracked(&self, plan: &CompressionPlan, items: &[Value]) -> (Vec<Value>, bool) {
+        let mut sentinel_added = false;
         let mut indices = plan.keep_indices.clone();
         indices.sort_unstable();
         let mut kept: Vec<Value> = indices
@@ -360,10 +370,11 @@ impl SmartCrusher {
                     Value::Object(plan.constant_fields.clone().into_iter().collect()),
                 );
                 kept.insert(0, Value::Object(sentinel));
+                sentinel_added = true;
             }
         }
 
-        kept
+        (kept, sentinel_added)
     }
 
     /// Top-level entry point. Mirrors Python `SmartCrusher.crush`
@@ -857,6 +868,7 @@ impl SmartCrusher {
                 dropped_summary: String::new(),
                 compacted: None,
                 compaction_kind: None,
+                constant_fields_sentinel: false,
             };
         }
 
@@ -889,6 +901,7 @@ impl SmartCrusher {
                         dropped_summary: String::new(),
                         compacted: Some(rendered),
                         compaction_kind: Some(kind),
+                        constant_fields_sentinel: false,
                     };
                 }
             }
@@ -909,6 +922,7 @@ impl SmartCrusher {
                 dropped_summary: String::new(),
                 compacted: None,
                 compaction_kind: None,
+                constant_fields_sentinel: false,
             };
         }
 
@@ -951,6 +965,7 @@ impl SmartCrusher {
                 dropped_summary: String::new(),
                 compacted: None,
                 compaction_kind: None,
+                constant_fields_sentinel: false,
             };
         }
 
@@ -962,7 +977,7 @@ impl SmartCrusher {
             Some(effective_max_items),
             Some(&item_strings),
         );
-        let result = self.execute_plan(&plan, items);
+        let (result, constant_fields_sentinel) = self.execute_plan_tracked(&plan, items);
 
         // Emit CCR-Dropped marker iff rows were actually dropped AND
         // the marker gate is on. **The marker is the cornerstone of
@@ -977,10 +992,9 @@ impl SmartCrusher {
         // skip the marker text and the store write — there's no point
         // storing a payload that nothing in the prompt can reference.
         // The `_constant_fields` sentinel is not a kept row.
-        let sentinel_rows = usize::from(
-            self.config.factor_out_constants && constant_fields_sentinel(&result).is_some(),
-        );
-        let dropped_count = items.len().saturating_sub(result.len() - sentinel_rows);
+        let dropped_count = items
+            .len()
+            .saturating_sub(result.len() - usize::from(constant_fields_sentinel));
         let (ccr_hash, dropped_summary) = if dropped_count > 0 && self.config.enable_ccr_marker {
             // Serialize the original array exactly ONCE. The hash is
             // taken over those bytes, and (if a store is configured) the
@@ -1007,6 +1021,7 @@ impl SmartCrusher {
             dropped_summary,
             compacted: None,
             compaction_kind: None,
+            constant_fields_sentinel,
         }
     }
 
@@ -1059,16 +1074,19 @@ impl SmartCrusher {
 
             match type_key {
                 "dict" => {
-                    let CrushArrayResult { items: crushed, .. } =
-                        self.crush_array(&values, query_context, bias);
+                    let CrushArrayResult {
+                        items: crushed,
+                        constant_fields_sentinel,
+                        ..
+                    } = self.crush_array(&values, query_context, bias);
                     // Find which original indices survived by matching
                     // canonical-JSON serialization. Mirrors Python's
                     // `json.dumps(c, sort_keys=True, default=str)`-keyed
                     // set match. With `factor_out_constants`, kept rows
                     // come back stripped behind a leading sentinel, so the
                     // originals are stripped the same way before matching.
-                    let constants = if self.config.factor_out_constants {
-                        constant_fields_sentinel(&crushed)
+                    let constants = if constant_fields_sentinel {
+                        crushed[0]["_constant_fields"].as_object()
                     } else {
                         None
                     };
@@ -1243,15 +1261,6 @@ impl IntoIterator for GroupBuckets {
 /// is already JSON-native, so plain canonical JSON suffices.
 fn canonical_json_for_match(value: &Value) -> String {
     crate::transforms::anchor_selector::python_json_dumps_sort_keys(value)
-}
-
-/// The constants map of the leading `{"_constant_fields": {...}}`
-/// sentinel that `execute_plan` inserts, if `items` starts with one.
-fn constant_fields_sentinel(items: &[Value]) -> Option<&serde_json::Map<String, Value>> {
-    match items.first() {
-        Some(Value::Object(map)) if map.len() == 1 => map.get("_constant_fields")?.as_object(),
-        _ => None,
-    }
 }
 
 /// `item` with the same defensive strip `execute_plan` applies: a key is
@@ -2874,5 +2883,19 @@ mod tests {
             .expect("dropped row must be retrievable from the CCR store");
         let stored: Vec<Value> = serde_json::from_str(&stored).expect("stored payload is JSON");
         assert_eq!(stored, items);
+    }
+
+    #[test]
+    fn factored_mixed_array_keeps_a_real_row_shaped_like_the_sentinel() {
+        // An input row that looks like the sentinel, in a dict group
+        // small enough that crush_array passes it through unchanged.
+        let mut items = vec![json!({"_constant_fields": {"source": "upstream"}})];
+        items.extend((0..5).map(|i| json!({"id": i, "name": format!("row {i}")})));
+        items.extend((0..3).map(|i| json!(format!("note {i}"))));
+
+        let (crushed, strategy) = factoring_crusher(true).crush_mixed_array(&items, "", 1.0);
+
+        assert!(strategy.contains("dict:6->6"), "strategy {strategy:?}");
+        assert_eq!(crushed, items, "every row passes through unchanged");
     }
 }
