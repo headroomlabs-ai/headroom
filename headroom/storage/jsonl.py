@@ -108,11 +108,16 @@ class JSONLStorage(Storage):
             f.write(json.dumps(data) + "\n")
 
     def get(self, request_id: str) -> RequestMetrics | None:
-        """Get metrics by request ID."""
+        """Get metrics by request ID.
+
+        ``save`` appends, so a request saved twice has two rows; return the last
+        one, matching SQLiteStorage where a later save replaces the earlier row.
+        """
+        latest: RequestMetrics | None = None
         for metrics in self.iter_all():
             if metrics.request_id == request_id:
-                return metrics
-        return None
+                latest = metrics
+        return latest
 
     def query(
         self,
