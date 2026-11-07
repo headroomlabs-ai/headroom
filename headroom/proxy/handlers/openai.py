@@ -11061,7 +11061,9 @@ class OpenAIHandlerMixin:
           ``headroom_retrieve`` tool and can reach loopback ``/v1/retrieve``.
         * ``"lossy_inline"`` (alias ``"lossless_then_lossy"``) — marker-free,
           lossless fold first then Kompress the remainder.
-        * ``"lossless"`` — marker-free, lossless folds only.
+        * ``"lossless"`` — marker-free, lossless folds only. This covers message
+          compression; on a gateway turn, tool schema compaction and registered
+          turn hooks still run as configured.
 
         Any other ``config.mode`` value is a 400 (see ``COMPRESS_MODES``).
 

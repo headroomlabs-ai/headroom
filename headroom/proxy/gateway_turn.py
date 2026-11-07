@@ -41,6 +41,7 @@ import dataclasses
 import json
 import logging
 import os
+import re
 import threading
 import time
 import uuid
@@ -221,6 +222,12 @@ _ANTHROPIC_ONLY_BLOCKS = frozenset(
 )
 
 
+# Anthropic's own tools (server tools such as ``web_search_20250305`` and
+# client tools such as ``bash_20250124``) carry a dated ``type`` and no
+# ``input_schema``; OpenAI chat tools are ``function`` or ``custom``.
+_ANTHROPIC_DATED_TOOL_TYPE = re.compile(r"_\d{8}$")
+
+
 def _wire_provider_from_shape(body: dict[str, Any]) -> str | None:
     """The provider a body's shape proves, or None when only the model can tell."""
     if carries_view(body) or is_responses_body(body):
@@ -230,6 +237,9 @@ def _wire_provider_from_shape(body: dict[str, Any]) -> str | None:
     tools = body.get("tools")
     for tool in tools if isinstance(tools, list) else ():
         if isinstance(tool, dict) and "input_schema" in tool:
+            return "anthropic"
+        tool_type = tool.get("type") if isinstance(tool, dict) else None
+        if isinstance(tool_type, str) and _ANTHROPIC_DATED_TOOL_TYPE.search(tool_type):
             return "anthropic"
         if isinstance(tool, dict) and "function" in tool:
             return "openai"

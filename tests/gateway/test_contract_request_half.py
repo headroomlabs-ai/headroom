@@ -497,6 +497,16 @@ def test_turn_ids_are_unique_per_request(headroom_client) -> None:
             "openai",
         ),
         (
+            "anthropic_first_turn_server_tool_only",
+            {
+                "messages": [{"role": "user", "content": "x"}],
+                "tools": [{"type": "web_search_20250305", "name": "web_search"}],
+            },
+            "gemini/gemini-2.5-pro",
+            "anthropic",
+            "openai",
+        ),
+        (
             "openai_tools_to_claude",
             {"messages": [{"role": "user", "content": "x"}], "tools": openai_tools()},
             "claude-opus-5-5",
