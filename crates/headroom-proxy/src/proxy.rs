@@ -117,7 +117,7 @@ impl AppState {
         for cert in crate::tls::extra_root_certificates() {
             builder = builder.add_root_certificate(cert);
         }
-        let client = builder
+        builder = builder
             .connect_timeout(config.upstream_connect_timeout)
             .timeout(config.upstream_timeout)
             // Don't auto-follow redirects: pass them through verbatim.
@@ -125,8 +125,11 @@ impl AppState {
             // Pool needs to be allowed to be idle for long-lived streams.
             .pool_idle_timeout(std::time::Duration::from_secs(90))
             // Both HTTP/1.1 and HTTP/2 negotiated via ALPN.
-            .build()
-            .map_err(ProxyError::Upstream)?;
+            ;
+        if let Some(proxy_url) = &config.outbound_proxy {
+            builder = builder.proxy(reqwest::Proxy::all(proxy_url).map_err(ProxyError::Upstream)?);
+        }
+        let client = builder.build().map_err(ProxyError::Upstream)?;
 
         // PR-D4: lazy ADC token source. Provider resolution is
         // deferred to first `bearer()` call so proxy startup stays

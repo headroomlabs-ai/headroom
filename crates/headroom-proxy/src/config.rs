@@ -300,6 +300,15 @@ pub struct CliArgs {
     #[arg(long, env = "HEADROOM_PROXY_UPSTREAM")]
     pub upstream: Url,
 
+    /// Corporate/outbound HTTP(S) proxy for upstream requests
+    /// (e.g. http://proxy.corp.example.com:8080).
+    /// Applied to all traffic headroom forwards to upstream.
+    /// Reads HTTPS_PROXY / HTTP_PROXY env vars as a fallback when unset.
+    ///
+    /// Source priority: CLI flag → `HEADROOM_PROXY_OUTBOUND_PROXY` env var → unset.
+    #[arg(long = "outbound-proxy", env = "HEADROOM_PROXY_OUTBOUND_PROXY")]
+    pub outbound_proxy: Option<String>,
+
     /// End-to-end timeout for a single upstream request (long, since LLM
     /// streams may run for many minutes).
     #[arg(long, default_value = "600s", value_parser = parse_duration)]
@@ -736,6 +745,9 @@ pub struct Config {
     /// PR-D4: GCP ADC OAuth scope used when fetching the bearer
     /// token. Default `https://www.googleapis.com/auth/cloud-platform`.
     pub vertex_adc_scope: String,
+    /// Optional outbound proxy URL for all upstream-bound requests.
+    /// `None` means reqwest falls back to `HTTPS_PROXY` / `HTTP_PROXY` env vars.
+    pub outbound_proxy: Option<String>,
     /// Native savings stats: record per-request telemetry and serve
     /// `/stats`, `/stats/timeseries`, `/stats/events`, `/dashboard`.
     pub stats: bool,
@@ -808,6 +820,7 @@ impl Config {
             bedrock_validate_eventstream_crc: args.bedrock_validate_eventstream_crc,
             vertex_region: args.vertex_region,
             vertex_adc_scope: args.vertex_adc_scope,
+            outbound_proxy: args.outbound_proxy,
             stats: args.stats,
             stats_path: args.stats_path.or_else(default_stats_path),
         }
@@ -873,6 +886,7 @@ impl Config {
             // only; the upstream URL is `upstream`).
             vertex_region: "us-central1".to_string(),
             vertex_adc_scope: "https://www.googleapis.com/auth/cloud-platform".to_string(),
+            outbound_proxy: None,
             // Stats on (routes mounted, recording active) but
             // in-memory: tests never touch a real home directory.
             stats: true,
