@@ -1284,6 +1284,116 @@ def test_append_text_to_latest_user_chat_message_no_user_returns_zero() -> None:
     assert new_msgs == msgs
 
 
+def test_append_text_to_latest_user_chat_message_skips_tool_result_tail() -> None:
+    """#4419: after tool calls, the latest user turn is not the live-zone tail."""
+    msgs = [
+        {"role": "system", "content": "sys"},
+        {"role": "user", "content": "list the files"},
+        {
+            "role": "assistant",
+            "content": None,
+            "tool_calls": [
+                {
+                    "id": "call_1",
+                    "type": "function",
+                    "function": {"name": "ls", "arguments": "{}"},
+                }
+            ],
+        },
+        {"role": "tool", "tool_call_id": "call_1", "content": "a.py b.py"},
+    ]
+    new_msgs, appended = append_text_to_latest_user_chat_message(msgs, "MEM")
+    assert appended == 0
+    assert new_msgs is msgs
+    assert msgs[1]["content"] == "list the files"
+
+
+def test_append_text_to_latest_user_chat_message_skips_assistant_tail() -> None:
+    msgs = [
+        {"role": "user", "content": "hi"},
+        {"role": "assistant", "content": "hello"},
+    ]
+    new_msgs, appended = append_text_to_latest_user_chat_message(msgs, "MEM")
+    assert appended == 0
+    assert new_msgs is msgs
+
+
+def test_openai_chat_memory_not_injected_into_older_user_turn() -> None:
+    """#4419: a tool-result tail leaves every message byte-equal."""
+    config = ProxyConfig(
+        optimize=False,
+        cache_enabled=False,
+        rate_limit_enabled=False,
+        cost_tracking_enabled=False,
+        log_requests=False,
+        ccr_inject_tool=False,
+        ccr_handle_responses=False,
+        ccr_context_tracking=False,
+        image_optimize=False,
+    )
+    app = create_app(config)
+    proxy = app.state.proxy
+    proxy.memory_handler = SimpleNamespace(
+        config=SimpleNamespace(inject_context=True, inject_tools=False),
+        search_and_format_context=AsyncMock(return_value="MEMCTX_OAI"),
+        has_memory_tool_calls=lambda resp, provider: False,
+    )
+
+    captured: dict[str, object] = {}
+
+    async def _fake_retry(method, url, headers, body, stream=False, **kwargs):  # noqa: ANN001
+        captured["body"] = body
+        return httpx.Response(
+            200,
+            json={
+                "id": "chatcmpl_1",
+                "object": "chat.completion",
+                "model": "gpt-4o",
+                "choices": [
+                    {
+                        "index": 0,
+                        "message": {"role": "assistant", "content": "ok"},
+                        "finish_reason": "stop",
+                    }
+                ],
+                "usage": {"prompt_tokens": 10, "completion_tokens": 1, "total_tokens": 11},
+            },
+        )
+
+    proxy._retry_request = _fake_retry  # type: ignore[attr-defined]
+    client = TestClient(app)
+
+    messages = [
+        {"role": "system", "content": "you are helpful"},
+        {"role": "user", "content": "list the files"},
+        {
+            "role": "assistant",
+            "content": None,
+            "tool_calls": [
+                {
+                    "id": "call_1",
+                    "type": "function",
+                    "function": {"name": "ls", "arguments": "{}"},
+                }
+            ],
+        },
+        {"role": "tool", "tool_call_id": "call_1", "content": "a.py b.py"},
+    ]
+    resp = client.post(
+        "/v1/chat/completions",
+        headers={
+            "authorization": "Bearer sk-test",
+            "x-headroom-user-id": "u1",
+        },
+        json={"model": "gpt-4o", "messages": messages},
+    )
+    assert resp.status_code == 200, resp.text
+    sent = captured.get("body")
+    assert isinstance(sent, dict), captured
+    assert sent["messages"] == messages
+    assert "MEMCTX_OAI" not in str(sent["messages"])
+
+
 def test_openai_chat_memory_routes_to_user_tail_not_system() -> None:
     """A2 follow-up: Chat Completions memory injection lives in user tail."""
     config = ProxyConfig(
