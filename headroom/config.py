@@ -632,7 +632,7 @@ class ReadLifecycleConfig:
     """Event-driven Read lifecycle management.
 
     Detects stale and superseded Read outputs in the conversation and replaces
-    them with compact markers + CCR hashes. Fresh Reads are never touched.
+    them with compact markers (+ CCR hashes when retrieval markers are on). Fresh Reads are never touched.
 
     A Read is STALE when the file was subsequently edited (content is factually
     wrong). A Read is SUPERSEDED when the file was subsequently re-Read (content
