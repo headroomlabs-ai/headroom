@@ -33,6 +33,7 @@ from headroom.proxy.helpers import (
     COMPRESSION_TIMEOUT_SECONDS,
     RequestBodyTooLarge,
     _headroom_bypass_enabled,
+    apply_openai_api_key_fallback,
     extract_tags,
     invalid_request_body_message,
     jitter_delay_ms,
@@ -5503,6 +5504,12 @@ class OpenAIHandlerMixin:
                 # a non-streaming one instead of through a second copy.
                 nonlocal headers, buffered_chat_continuation_status
                 headers = await apply_copilot_api_auth(headers, url=url)
+                headers = apply_openai_api_key_fallback(
+                    headers,
+                    upstream_url=upstream_base_url,
+                    config=self.config,
+                    request_id=request_id,
+                )
                 response = await self._retry_request("POST", url, headers, body)
 
                 # Turn hooks: a registered extension may re-drive this turn
@@ -7090,6 +7097,12 @@ class OpenAIHandlerMixin:
                 async def _buffered_ccr_operation():
                     nonlocal headers
                     headers = await apply_copilot_api_auth(headers, url=url)
+                    headers = apply_openai_api_key_fallback(
+                        headers,
+                        upstream_url=url,
+                        config=self.config,
+                        request_id=request_id,
+                    )
                     response = await self._retry_request(
                         "POST",
                         url,
