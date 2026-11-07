@@ -59,6 +59,7 @@ _RETRIEVE_TOOL = {
 def _app_and_outcomes(monkeypatch, **overrides):
     """App with a spy on the outcome record — where billed counts land."""
     kwargs: dict[str, Any] = {
+        "ccr_event_streaming": False,  # These fixtures qualify the buffered fallback.
         "optimize": False,
         "cache_enabled": False,
         "rate_limit_enabled": False,

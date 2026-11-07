@@ -1156,6 +1156,7 @@ class StreamingMixin:
         outcome_provider: str | None = None,
         waste_signals: dict[str, int] | None = None,
         session_key: str | None = None,
+        ccr_stream_provider: str | None = None,
         conversation_key: str | None = None,
         conversation_tokens_saved: int | None = None,
         savings_measure: ItemMeasure | None = None,
@@ -1205,6 +1206,7 @@ class StreamingMixin:
                 outcome_provider=outcome_provider,
                 waste_signals=waste_signals,
                 session_key=session_key,
+                ccr_stream_provider=ccr_stream_provider,
                 conversation_key=conversation_key,
                 conversation_tokens_saved=conversation_tokens_saved,
                 savings_measure=savings_measure,
@@ -1241,6 +1243,7 @@ class StreamingMixin:
         outcome_provider: str | None,
         waste_signals: dict[str, int] | None,
         session_key: str,
+        ccr_stream_provider: str | None,
         conversation_key: str | None = None,
         conversation_tokens_saved: int | None = None,
         savings_measure: ItemMeasure | None = None,
@@ -1738,6 +1741,24 @@ class StreamingMixin:
         async def generate():
             nonlocal body, memory_enabled  # May need to modify for continuation requests
 
+            # CCR markers are an internal proxy/model protocol.  Keep one SSE
+            # event in flight so a marker split across arbitrary HTTP chunks —
+            # including inside streamed tool arguments — cannot cross the
+            # client boundary (#1877).
+            marker_egress_filter = None
+            if getattr(self.config, "ccr_inject_tool", False):
+                from headroom.ccr.egress import CCRMarkerEgressFilter
+
+                marker_egress_filter = CCRMarkerEgressFilter()
+
+            def _finish_marker_egress() -> list[bytes]:
+                nonlocal marker_egress_filter
+                if marker_egress_filter is None:
+                    return []
+                output = marker_egress_filter.finish()
+                marker_egress_filter = None
+                return output
+
             # For memory mode, we buffer the response to check for tool calls
             buffered_chunks: list[bytes] = []
             # Bytes-level mirror of the SSE stream for memory/prefix
@@ -1796,7 +1817,84 @@ class StreamingMixin:
             try:
                 async with contextlib.aclosing(upstream_response) as response:
                     sse_chunk_index = 0
-                    async for chunk in response.aiter_bytes():
+                    stream_iterator = response.aiter_bytes()
+                    if ccr_stream_provider is not None:
+                        from headroom.ccr.stream_splice import EventLevelCCRInterceptor
+
+                        ccr_response_handler = getattr(self, "ccr_response_handler", None)
+                        if ccr_response_handler is None:
+                            raise RuntimeError(
+                                "CCR stream interception requires a response handler"
+                            )
+
+                        async def _ccr_continuation(
+                            continuation_items: list[dict[str, Any]],
+                            continuation_tools: list[dict[str, Any]] | None,
+                        ) -> dict[str, Any]:
+                            continuation_body = {**body, "stream": False}
+                            if ccr_stream_provider == "anthropic":
+                                continuation_body["messages"] = continuation_items
+                            else:
+                                continuation_body["input"] = continuation_items
+                                continuation_body.pop("previous_response_id", None)
+                            if continuation_tools is not None:
+                                continuation_body["tools"] = continuation_tools
+                            continuation_headers = {
+                                key: value
+                                for key, value in headers.items()
+                                if key.lower()
+                                not in {
+                                    "accept",
+                                    "content-encoding",
+                                    "transfer-encoding",
+                                    "accept-encoding",
+                                    "content-length",
+                                }
+                            }
+                            continuation_headers["accept"] = "application/json"
+                            continuation_response = await self._retry_request(
+                                "POST",
+                                url,
+                                continuation_headers,
+                                continuation_body,
+                                request_id=request_id,
+                                forwarder_name="ccr_event_stream_continuation",
+                                path_for_log=url,
+                            )
+                            if not 200 <= continuation_response.status_code < 300:
+                                raise RuntimeError(
+                                    "CCR continuation failed with HTTP "
+                                    f"{continuation_response.status_code}"
+                                )
+                            return continuation_response.json()
+
+                        if ccr_stream_provider == "anthropic":
+
+                            def render_response(value: dict[str, Any]) -> list[bytes]:
+                                return self._response_to_sse(value, "anthropic")
+
+                            continuation_messages = list(body.get("messages") or [])
+                        else:
+                            from headroom.proxy.handlers.openai import (
+                                _openai_responses_to_sse,
+                                _responses_input_to_items,
+                            )
+
+                            render_response = _openai_responses_to_sse
+                            continuation_messages = _responses_input_to_items(body.get("input"))
+                        interceptor = EventLevelCCRInterceptor(
+                            ccr_response_handler,
+                            provider=ccr_stream_provider,
+                            render_response=render_response,
+                        )
+                        stream_iterator = interceptor.process(
+                            stream_iterator,
+                            continuation_messages,
+                            body.get("tools"),
+                            _ccr_continuation,
+                        )
+
+                    async for chunk in stream_iterator:
                         sse_chunk_index += 1
                         # Record TTFB on first chunk
                         if stream_state["ttfb_ms"] is None:
@@ -1898,11 +1996,22 @@ class StreamingMixin:
                             [chunk] if memory_filter is None else memory_filter.feed(chunk)
                         )
                         for frame in client_frames:
-                            guarded_frame = _client_frame(frame)
-                            if guarded_frame:
-                                yield guarded_frame
+                            scrubbed_frames = (
+                                [frame]
+                                if marker_egress_filter is None
+                                else marker_egress_filter.feed(frame)
+                            )
+                            for scrubbed_frame in scrubbed_frames:
+                                guarded_frame = _client_frame(scrubbed_frame)
+                                if guarded_frame:
+                                    yield guarded_frame
                         if parse_error is not None:
                             raise parse_error
+
+                for scrubbed_chunk in _finish_marker_egress():
+                    guarded_frame = _client_frame(scrubbed_chunk)
+                    if guarded_frame:
+                        yield guarded_frame
 
                 # Memory tool handling after stream completes
                 # Chunks were already yielded in real-time above, so we only
@@ -2058,6 +2167,10 @@ class StreamingMixin:
                 raise
             except (httpx.ConnectError, httpx.ConnectTimeout, httpx.PoolTimeout) as e:
                 logger.error(f"[{request_id}] Connection error to upstream API: {e}")
+                for scrubbed_chunk in _finish_marker_egress():
+                    guarded_frame = _client_frame(scrubbed_chunk)
+                    if guarded_frame:
+                        yield guarded_frame
                 guarded_tail = _drain_context_guard()
                 if guarded_tail:
                     yield guarded_tail
@@ -2073,7 +2186,12 @@ class StreamingMixin:
                 if guarded_tail:
                     yield guarded_tail
                 # Forward the upstream error response
-                yield e.response.content
+                if marker_egress_filter is None:
+                    yield e.response.content
+                for scrubbed_chunk in _finish_marker_egress():
+                    guarded_frame = _client_frame(scrubbed_chunk)
+                    if guarded_frame:
+                        yield guarded_frame
             except MemoryToolStreamOverflowError as e:
                 # The filter dropped what it withheld; end the stream rather
                 # than forward it.
@@ -2084,6 +2202,10 @@ class StreamingMixin:
                 yield f"event: error\ndata: {json.dumps(error_event)}\n\n".encode()
             except Exception as e:
                 logger.error(f"[{request_id}] Unexpected streaming error: {e}")
+                for scrubbed_chunk in _finish_marker_egress():
+                    guarded_frame = _client_frame(scrubbed_chunk)
+                    if guarded_frame:
+                        yield guarded_frame
                 guarded_tail = _drain_context_guard()
                 if guarded_tail:
                     yield guarded_tail
