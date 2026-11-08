@@ -2207,6 +2207,35 @@ mod tests {
     }
 
     #[test]
+    fn query_named_row_survives_lossy_crush() {
+        // An issue list where every 4th title is a bug report: the error
+        // rows alone fill the lossy budget, and the row the question names
+        // by number (index 81, past the first/last anchors) must be kept
+        // rather than cut by position.
+        let c = SmartCrusher::without_compaction(SmartCrusherConfig::default());
+        let items: Vec<Value> = (0..100)
+            .map(|i| {
+                let title = if i % 4 == 0 {
+                    format!("[BUG] request failed in module {}", i % 7)
+                } else {
+                    format!("Add option for module {}", i % 7)
+                };
+                json!({
+                    "number": if i == 81 { 4475 } else { 4300 + 2 * i },
+                    "title": title,
+                    "state": if i % 3 == 0 { "OPEN" } else { "CLOSED" },
+                })
+            })
+            .collect();
+        let result = c.crush_array(&items, "Who opened issue #4475?", 1.0);
+        assert!(
+            result.items.iter().any(|it| it["number"] == json!(4475)),
+            "issue 4475 was dropped: {}",
+            result.strategy_info
+        );
+    }
+
+    #[test]
     fn crusher_with_custom_scorer() {
         use crate::relevance::BM25Scorer;
         let c = SmartCrusher::with_scorer(
