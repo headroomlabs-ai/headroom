@@ -47,7 +47,7 @@
 //! `RUST_LOG=headroom_proxy::observability=debug`.
 
 use std::collections::HashSet;
-use std::sync::{Mutex, OnceLock};
+use std::sync::OnceLock;
 
 use axum::body::Body;
 use axum::http::{header, StatusCode};
@@ -90,15 +90,32 @@ fn bound_label(seen: &mut HashSet<String>, raw: &str, cap: usize) -> String {
     OTHER_MODEL_LABEL.to_string()
 }
 
-/// [`bound_label`] over the process-wide set shared by all three
-/// Bedrock metric families.
+/// [`bound_label`] over the set shared by all three Bedrock metric
+/// families.
 fn bounded_model(raw: &str) -> String {
-    static SEEN: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
+    with_seen_models(|seen| bound_label(seen, raw, MAX_TRACKED_MODELS))
+}
+
+/// The admitted model ids: one process-wide set.
+#[cfg(not(test))]
+fn with_seen_models<R>(f: impl FnOnce(&mut HashSet<String>) -> R) -> R {
+    static SEEN: OnceLock<std::sync::Mutex<HashSet<String>>> = OnceLock::new();
     let mut seen = SEEN
-        .get_or_init(|| Mutex::new(HashSet::new()))
+        .get_or_init(|| std::sync::Mutex::new(HashSet::new()))
         .lock()
         .unwrap_or_else(|e| e.into_inner());
-    bound_label(&mut seen, raw, MAX_TRACKED_MODELS)
+    f(&mut seen)
+}
+
+/// Under test the set is per thread. libtest runs each test on its own
+/// thread, so a test that fills the cap cannot fold another test's ids
+/// to `other`, whatever order or parallelism the runner picks.
+#[cfg(test)]
+fn with_seen_models<R>(f: impl FnOnce(&mut HashSet<String>) -> R) -> R {
+    thread_local! {
+        static SEEN: std::cell::RefCell<HashSet<String>> = Default::default();
+    }
+    SEEN.with(|s| f(&mut s.borrow_mut()))
 }
 
 /// Lazy singleton registry. Borrowed by `handle_metrics` for
@@ -407,6 +424,8 @@ mod tests {
 
     #[test]
     fn many_distinct_model_ids_stay_bounded_across_all_families() {
+        let known = "anthropic.claude-3-haiku-20240307-v1:0";
+        assert_eq!(bounded_model(known), known);
         for i in 0..(MAX_TRACKED_MODELS + 100) {
             let m = format!("flood-model-{i}");
             record_bedrock_invoke(&m, "us-flood-1", AuthMode::OAuth);
@@ -429,13 +448,21 @@ mod tests {
             );
         }
         assert!(model_labels("bedrock_invoke_count_total").contains("other"));
+        // Past the cap: an id admitted earlier stays exact, a new one folds.
+        assert_eq!(bounded_model(known), known);
+        assert_eq!(bounded_model("brand-new-model"), "other");
+        // Flood before normal: a test that runs after this one, on its own
+        // thread, still gets its exact model label.
+        let fresh = std::thread::spawn(move || bounded_model(known))
+            .join()
+            .unwrap();
+        assert_eq!(fresh, known);
     }
 
     #[test]
     fn long_model_id_is_clipped() {
         let long = "x".repeat(MAX_MODEL_LABEL_LEN + 50);
-        // Clipping itself, on a fresh set: the process-wide set may already
-        // be full from another test, and then the metric path folds to "other".
+        // Clipping itself, on a fresh set.
         let mut seen = HashSet::new();
         assert_eq!(
             bound_label(&mut seen, &long, MAX_TRACKED_MODELS),
