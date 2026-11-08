@@ -8,10 +8,39 @@ import os
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
 from enum import Enum
-from types import MappingProxyType
-from typing import Any, Protocol
+from typing import Any, NoReturn, Protocol
 
 log = logging.getLogger(__name__)
+
+
+class FrozenLabels(dict[str, str]):
+    """A ``dict`` that refuses changes: what :attr:`OutcomeSnapshot.attribution` holds.
+
+    A subclass of ``dict`` rather than a ``MappingProxyType`` so the snapshot
+    stays what it was before it carried labels: hashable, picklable, and safe
+    for ``dataclasses.asdict``, ``copy.deepcopy`` and ``json.dumps``.
+    """
+
+    __slots__ = ()
+
+    def _read_only(self, *args: Any, **kwargs: Any) -> NoReturn:
+        raise TypeError("attribution labels are read-only")
+
+    __setitem__ = __delitem__ = __ior__ = _read_only
+    clear = pop = popitem = setdefault = update = _read_only
+
+    def __hash__(self) -> int:  # type: ignore[override]
+        return hash(frozenset(self.items()))
+
+    def __reduce__(self) -> tuple[Any, ...]:
+        return (type(self), (dict(self),))
+
+    def __copy__(self) -> FrozenLabels:
+        return self
+
+    def __deepcopy__(self, memo: dict[int, Any]) -> FrozenLabels:
+        return self
+
 
 ENTRY_POINT_GROUP = "headroom.pipeline_extension"
 ENV_VAR = "HEADROOM_PIPELINE_EXTENSIONS"
@@ -101,7 +130,7 @@ class OutcomeSnapshot:
     def __post_init__(self) -> None:
         # Frozen fields can still hold a mutable dict; freeze it so an
         # extension cannot rewrite the labels another extension will read.
-        object.__setattr__(self, "attribution", MappingProxyType(dict(self.attribution or {})))
+        object.__setattr__(self, "attribution", FrozenLabels(self.attribution or {}))
 
     @property
     def truncated(self) -> bool:

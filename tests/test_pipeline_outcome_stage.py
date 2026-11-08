@@ -113,6 +113,24 @@ class TestOutcomeSnapshot:
             40,
         )
 
+    @pytest.mark.parametrize("labels", [{}, {"project": "web"}])
+    def test_snapshot_still_serializes_copies_and_hashes(self, labels):
+        """Carrying labels must not cost the snapshot what a frozen dataclass of
+        scalars always had: asdict, deepcopy, pickle, JSON and hashing."""
+        import copy
+        import dataclasses
+        import json
+        import pickle
+
+        snap = OutcomeSnapshot(request_id="r1", attribution=labels)
+        assert dataclasses.asdict(snap)["attribution"] == labels
+        assert json.loads(json.dumps(dataclasses.asdict(snap)))["attribution"] == labels
+        assert copy.deepcopy(snap) == snap
+        restored = pickle.loads(pickle.dumps(snap))
+        assert restored == snap and hash(restored) == hash(snap)
+        with pytest.raises(TypeError):
+            restored.attribution["project"] = "other"  # type: ignore[index]
+
     def test_attribution_labels_are_read_only(self):
         """Frozen fields can still hold a mutable dict; one extension must not
         be able to rewrite the labels the next one reads."""
