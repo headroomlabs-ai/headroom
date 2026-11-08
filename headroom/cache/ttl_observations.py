@@ -67,7 +67,7 @@ def record_cache_observation(*, provider: str, model: str, attribution: Any) -> 
         return
     try:
         path = _obs_path()
-        os.makedirs(os.path.dirname(path), exist_ok=True)
+        os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
         try:
             if os.path.getsize(path) > _OBS_MAX_BYTES:
                 os.replace(path, path + ".1")  # bounded: single-backup rotation
@@ -84,7 +84,7 @@ def record_cache_observation(*, provider: str, model: str, attribution: Any) -> 
             "cache_read": int(getattr(attribution, "cache_read_tokens", 0) or 0),
             "expected_cached": int(getattr(attribution, "expected_cached_tokens", 0) or 0),
         }
-        with open(path, "a", encoding="utf-8") as f:
+        with open(path, "a", encoding="utf-8", newline="\n") as f:
             f.write(json.dumps(row) + "\n")
     except Exception:
         pass  # observability must never break a request
