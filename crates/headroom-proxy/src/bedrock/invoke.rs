@@ -25,7 +25,8 @@
 //!   `event=bedrock_credentials_missing` at WARN, return `500` with
 //!   a JSON error body. NEVER forwards an unsigned request.
 //! - **Credentials refresh failure** (the provider errors when the
-//!   cached credentials are near expiry): log
+//!   cached credentials are near expiry, or when none have been
+//!   resolved yet since startup): log
 //!   `event=bedrock_credentials_refresh_failed`, return `500`.
 //! - **Envelope parse failure**: log `event=bedrock_envelope_parse_error`,
 //!   pass the bytes through unchanged. Bedrock will reject anyway,
