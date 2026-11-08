@@ -683,6 +683,29 @@ class TestSemanticCacheLayer:
         result = layer.process(messages, context)
         assert result.semantic_cache_hit is False
 
+    @pytest.fixture(params=["object", "set", "cycle"])
+    def unhashable_messages(self, request):
+        if request.param == "cycle":
+            opaque = []
+            opaque.append(opaque)
+        else:
+            opaque = object() if request.param == "object" else {"opaque"}
+        return [{"role": "user", "content": "Hello!", "opaque": opaque}]
+
+    def test_unhashable_messages_are_not_stored(self, layer, context, unhashable_messages):
+        assert layer.store_response(unhashable_messages, "private answer", context) == ""
+        assert layer.cache.get_stats()["entries"] == 0
+
+    def test_unhashable_messages_skip_query_only_entries(self, layer, context, unhashable_messages):
+        namespace = layer._compute_namespace(context)
+        layer.cache.put("Hello!", "another context's answer", namespace=namespace)
+
+        result = layer.process(unhashable_messages, context)
+
+        assert result.semantic_cache_hit is False
+        assert result.cached_response is None
+        assert result.messages[-1]["content"] == "Hello!"
+
 
 class TestSemanticCoverage:
     def test_process_namespace_none_delegates(self):

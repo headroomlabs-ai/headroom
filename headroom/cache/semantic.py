@@ -459,9 +459,9 @@ class SemanticCacheLayer:
         messages_hash = self._compute_messages_hash(messages)
         namespace = self._compute_namespace(context)
 
-        # Unserializable context: never share cached responses across contexts,
-        # so skip the cache and just delegate to the provider optimizer.
-        if namespace is None:
+        # Failed serialization is an unknown identity, not a query-only request.
+        # Skip both exact and semantic lookup when the full context cannot hash.
+        if namespace is None or not messages_hash:
             return self.provider_optimizer.optimize(messages, context, config)
 
         # Check semantic cache
@@ -510,9 +510,8 @@ class SemanticCacheLayer:
         messages_hash = self._compute_messages_hash(messages)
         namespace = self._compute_namespace(context)
 
-        # Unserializable context: don't store anything that could be replayed
-        # for a different provider/model/metadata.
-        if namespace is None:
+        # Refuse incomplete identities instead of creating a query-only entry.
+        if namespace is None or not messages_hash:
             return ""
 
         return self.cache.put(query, response, messages_hash, namespace)
