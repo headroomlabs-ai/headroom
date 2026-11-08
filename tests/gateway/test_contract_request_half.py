@@ -467,3 +467,170 @@ def test_turn_ids_are_unique_per_request(headroom_client) -> None:
     """I-KEYS: every request half mints a fresh id, registered or not."""
     ids = {compress(headroom_client, _body(gateway={})).json()["turn_id"] for _ in range(5)}
     assert len(ids) == 5
+
+
+@pytest.mark.parametrize(
+    ("label", "shape", "model", "provider", "route_provider"),
+    [
+        (
+            "anthropic_system",
+            {"messages": [{"role": "user", "content": "x"}], "system": SYSTEM_PROMPT},
+            "gemini/gemini-2.5-pro",
+            "anthropic",
+            "openai",
+        ),
+        (
+            "anthropic_tools",
+            {"messages": [{"role": "user", "content": "x"}], "tools": anthropic_tools()},
+            "gemini/gemini-2.5-pro",
+            "anthropic",
+            "openai",
+        ),
+        (
+            "anthropic_history_with_server_tool",
+            {
+                "messages": anthropic_tool_history(),
+                "tools": [{"type": "web_search_20250305", "name": "web_search"}],
+            },
+            "gpt-5.5",
+            "anthropic",
+            "openai",
+        ),
+        (
+            "anthropic_first_turn_server_tool_only",
+            {
+                "messages": [{"role": "user", "content": "x"}],
+                "tools": [{"type": "web_search_20250305", "name": "web_search"}],
+            },
+            "gemini/gemini-2.5-pro",
+            "anthropic",
+            "openai",
+        ),
+        (
+            "openai_tools_to_claude",
+            {"messages": [{"role": "user", "content": "x"}], "tools": openai_tools()},
+            "claude-opus-5-5",
+            "openai",
+            "anthropic",
+        ),
+        (
+            "openai_tool_row_to_claude",
+            {"messages": [{"role": "tool", "tool_call_id": "c", "content": "x"}]},
+            "claude-opus-5-5",
+            "openai",
+            "anthropic",
+        ),
+        (
+            "responses_input_to_claude",
+            {"input": [{"role": "user", "content": "x"}], "instructions": "be brief"},
+            "claude-opus-5-5",
+            "openai",
+            "anthropic",
+        ),
+        (
+            "chat_system_role_to_claude",
+            {
+                "messages": [
+                    {"role": "system", "content": "be brief"},
+                    {"role": "user", "content": "x"},
+                ]
+            },
+            "claude-opus-5-5",
+            "openai",
+            "anthropic",
+        ),
+        (
+            "chat_image_to_claude",
+            {
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": [
+                            {"type": "image_url", "image_url": {"url": "https://x.test/a.png"}}
+                        ],
+                    }
+                ]
+            },
+            "claude-opus-5-5",
+            "openai",
+            "anthropic",
+        ),
+        (
+            "anthropic_thinking_to_gpt",
+            {
+                "messages": [
+                    {"role": "user", "content": "x"},
+                    {
+                        "role": "assistant",
+                        "content": [{"type": "thinking", "thinking": "t", "signature": "s"}],
+                    },
+                    {"role": "user", "content": "y"},
+                ]
+            },
+            "gpt-5.5",
+            "anthropic",
+            "openai",
+        ),
+        (
+            "anthropic_server_tool_result_to_gpt",
+            {
+                "messages": [
+                    {"role": "user", "content": "x"},
+                    {
+                        "role": "assistant",
+                        "content": [
+                            {"type": "web_search_tool_result", "tool_use_id": "s", "content": []}
+                        ],
+                    },
+                    {"role": "user", "content": "y"},
+                ],
+                "tools": [{"type": "web_search_20250305", "name": "web_search"}],
+            },
+            "gpt-5.5",
+            "anthropic",
+            "openai",
+        ),
+        (
+            "plain_text_follows_model",
+            {"messages": [{"role": "user", "content": "x"}], "system": None},
+            "claude-opus-5-5",
+            "anthropic",
+            "anthropic",
+        ),
+    ],
+)
+def test_hooks_see_the_wire_shape_and_route_follows_the_model(
+    headroom_client, label, shape, model, provider, route_provider
+) -> None:
+    """A gateway can send any client's shape to any model."""
+    seen: list[str] = []
+
+    class Recorder:
+        name = f"provider_recorder_{label}"
+        stream_safe = True
+
+        def on_request(self, ctx: Any) -> None:
+            seen.append(ctx.provider)
+
+    register_turn_hook(Recorder())
+    data = compress(headroom_client, {**shape, "model": model, "gateway": {}}).json()
+    assert seen == [provider]
+    assert data["route"]["provider"] == route_provider
+
+
+def test_chat_body_to_claude_stays_within_the_cache_breakpoint_budget(headroom_client) -> None:
+    """The budget belongs to the upstream model, not to the body's wire shape."""
+    marked = [
+        {"role": "user", "content": [{"type": "text", "text": f"m{i}", "cache_control": {}}]}
+        for i in range(7)
+    ]
+    body = _body(messages=marked, tools=openai_tools(), model="claude-opus-5-5", gateway={})
+    data = compress(headroom_client, body).json()
+    sent = [
+        block
+        for message in data["body"]["messages"]
+        for block in message["content"]
+        if isinstance(block, dict) and "cache_control" in block
+    ]
+    assert len(sent) <= 4
+    assert "cache_breakpoint_budget" in data["transforms_applied"]
