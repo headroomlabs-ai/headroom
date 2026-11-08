@@ -6662,6 +6662,29 @@ class OpenAIHandlerMixin:
                         query=extract_user_query(optimized_messages) or "",
                         tags=tags,
                     )
+                elif (
+                    self.memory_handler.config.inject_context
+                    and isinstance(body.get("input"), list)
+                    and not (
+                        body["input"]
+                        and isinstance(body["input"][-1], dict)
+                        and body["input"][-1].get("role") == "user"
+                    )
+                ):
+                    # Live-zone tail only, as on Chat Completions (#4680): when
+                    # the input ends with a function call and its output, the
+                    # latest user item is an older turn the provider has already
+                    # cached. Skip the search, so nothing is retrieved, marked
+                    # as accessed, or appended inside a cached prefix.
+                    from headroom.proxy.helpers import log_memory_injection
+
+                    log_memory_injection(
+                        request_id=request_id,
+                        session_id=None,
+                        decision="no_eligible_user_item",
+                        bytes_injected=0,
+                        query=None,
+                    )
                 elif self.memory_handler.config.inject_context:
                     try:
                         memory_context = await asyncio.wait_for(
