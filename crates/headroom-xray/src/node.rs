@@ -38,6 +38,12 @@ pub enum NodeError {
     InvocationFailed(#[from] std::io::Error),
 }
 
+/// The npx launcher to spawn. npm installs it as `npx.cmd` on Windows, and
+/// process creation there appends only `.exe` to a bare name, so `npx` alone
+/// is never found. Rust runs `.cmd` files through `cmd.exe` with each argument
+/// escaped, so argv boundaries and the exit code survive.
+pub const NPX: &str = if cfg!(windows) { "npx.cmd" } else { "npx" };
+
 /// Probe the environment and return Ok(()) if Node ≥20 + npx are usable.
 pub fn check() -> Result<(), NodeError> {
     // node --version
@@ -72,7 +78,7 @@ pub fn check() -> Result<(), NodeError> {
     }
 
     // npx --version (presence is enough; we don't need a min)
-    match Command::new("npx").arg("--version").output() {
+    match Command::new(NPX).arg("--version").output() {
         Ok(out) if out.status.success() => Ok(()),
         Ok(_) => Err(NodeError::NpxMissing),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Err(NodeError::NpxMissing),

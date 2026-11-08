@@ -41,7 +41,7 @@ pub async fn run(
     capture_stdout: Option<&mut Vec<u8>>,
 ) -> Result<i32, CodeBurnError> {
     let pkg = format!("codeburn@{PINNED_CODEBURN_VERSION}");
-    let mut cmd = Command::new("npx");
+    let mut cmd = Command::new(crate::node::NPX);
     cmd.arg(&pkg).args(args);
 
     // Stdin always inherited. Stderr always passthrough.
