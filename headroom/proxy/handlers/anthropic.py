@@ -3649,10 +3649,13 @@ class AnthropicHandlerMixin:
                     return 0
 
             # A translating backend drops ``defer_loading`` and bills every tool,
-            # so the history says nothing about what is billed.
+            # so the history says nothing about what is billed. ``force_direct``
+            # never uses one, so the resolver is not consulted.
             from headroom.proxy.route_advice import resolver_for
 
-            _deferred_billed_eagerly = resolver_for(self).for_request(request) is not None
+            _deferred_billed_eagerly = (
+                not force_direct and resolver_for(self).for_request(request) is not None
+            )
 
             def _billed_view(value: object) -> object:
                 if _deferred_billed_eagerly:
