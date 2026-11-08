@@ -264,6 +264,18 @@ def _parsed_spec(spec: str | None, defaults: tuple[str, ...]) -> tuple[str, ...]
     return parse_dimension_spec(spec, defaults)
 
 
+def dimension_enabled(name: str, environ: Mapping[str, str] | None = None) -> bool:
+    """Whether labels for ``name`` are recorded under the current configuration.
+
+    Listed in ``HEADROOM_ATTRIBUTION_DIMENSIONS``, or accepted through the open
+    ``labels`` token (which never admits a registered dimension).
+    """
+    enabled = enabled_dimensions(environ)
+    if name in enabled:
+        return True
+    return OPEN_LABELS_TOKEN in enabled and name not in registered_dimensions()
+
+
 def parse_labels(value: Any) -> dict[str, str]:
     """Parse ``name=value; name=value`` (``,`` also separates) into labels.
 
@@ -280,8 +292,21 @@ def parse_labels(value: Any) -> dict[str, str]:
 
 
 def format_labels(labels: Mapping[str, str]) -> str:
-    """Inverse of :func:`parse_labels`, for building ``X-Headroom-Labels``."""
-    return "; ".join(f"{k}={v}" for k, v in normalize_attribution(labels).items())
+    """Inverse of :func:`parse_labels`, for building ``X-Headroom-Labels``.
+
+    The header has no escaping, so a label containing ``,`` or ``;`` cannot
+    survive the round trip; it is left out (with a warning) rather than sent
+    truncated. Send such a label in its own ``X-Headroom-<name>`` header.
+    """
+    pairs = []
+    for name, label in normalize_attribution(labels).items():
+        if "," in label or ";" in label:
+            logger.warning(
+                "attribution: label for %r has a separator; not sent in %s", name, LABELS_HEADER
+            )
+            continue
+        pairs.append(f"{name}={label}")
+    return "; ".join(pairs)
 
 
 def header_name_for(dimension: str) -> str:
@@ -425,6 +450,8 @@ def bind_label(dimension: str, value: Any) -> None:
         return
     labels = dict(_current_attribution.get())
     label = sanitize_label(value)
+    if label is not None and not dimension_enabled(name):
+        return  # turned off by the operator: never added, still removable
     if label is None:
         labels.pop(name, None)
     else:

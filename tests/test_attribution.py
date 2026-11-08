@@ -188,6 +188,8 @@ def test_parse_and_format_labels_roundtrip():
     assert labels == {"team": "infra", "owner": "sam"}
     assert parse_labels(format_labels(labels)) == labels
     assert parse_labels(None) == {}
+    # No escaping in the header: a label with a separator is left out, not cut.
+    assert format_labels({"team": "design, ops", "owner": "sam"}) == "owner=sam"
 
 
 def test_bind_label_updates_context_copy_on_write():

@@ -196,7 +196,9 @@ def savings(
     report = savings_ledger.aggregate_savings(
         retention_days=days, group_by=group_by, where=where_filter
     )
-    routing = _proxy_routing()
+    # The routing rollup is proxy-wide; next to a filtered report it would
+    # read as the filtered label's routing savings.
+    routing = None if where_filter else _proxy_routing()
 
     if as_json:
         data = report.to_dict()

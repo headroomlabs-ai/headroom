@@ -1644,9 +1644,9 @@
                     </div>
                     <template x-if="!dim">
                         <div class="px-4 py-8 text-center text-xs text-gray-500">
-                            No labelled requests yet. <span class="font-mono">headroom wrap</span> sends
-                            <span class="font-mono">X-Headroom-Host</span>; add your own with
-                            <span class="font-mono">HEADROOM_LABELS="team=infra"</span>.
+                            No labelled requests yet. Clients send labels as
+                            <span class="font-mono">X-Headroom-&lt;name&gt;</span> headers or
+                            <span class="font-mono">X-Headroom-Labels: team=infra</span>.
                         </div>
                     </template>
                     <template x-if="dim">

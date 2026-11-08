@@ -515,6 +515,7 @@ async def emit_request_outcome(handler: Any, outcome: RequestOutcome) -> None:
     """
     from headroom.copilot_auth import consume_request_routed_to_copilot
     from headroom.proxy.attribution import (
+        dimension_enabled,
         get_current_attribution,
         get_current_conversation,
         merge_attribution,
@@ -629,11 +630,14 @@ async def emit_request_outcome(handler: Any, outcome: RequestOutcome) -> None:
     # Every attribution label for this request: what the middleware resolved,
     # then what the handler knew, then the two legacy fields, so a project the
     # handler identified late (Codex project context) wins over the header.
+    # The legacy fields win because ``projects`` and the ledger's ``client``
+    # key book them too, and the two spellings must not disagree; a dimension
+    # the operator turned off (``-client``) is still left out.
     attribution = merge_attribution(
         get_current_attribution(),
         outcome.attribution,
-        {"project": project} if project else None,
-        {"client": outcome.client} if outcome.client else None,
+        {"project": project} if project and dimension_enabled("project") else None,
+        {"client": outcome.client} if outcome.client and dimension_enabled("client") else None,
     )
 
     # Savings that are new to this conversation. Per-request descriptions

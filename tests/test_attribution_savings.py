@@ -190,6 +190,13 @@ def test_savings_cli_by_and_where(tmp_path, monkeypatch):
     result = runner.invoke(savings_cli.savings, ["--where", "nonsense"])
     assert result.exit_code != 0
 
+    # The proxy-wide routing rollup is not shown beside a filtered report.
+    routing = {"decisions": 3, "savings_usd": 20.0}
+    monkeypatch.setattr(savings_cli, "_proxy_routing", lambda: routing)
+    assert "routing" in json.loads(runner.invoke(savings_cli.savings, ["--json"]).output)
+    filtered = runner.invoke(savings_cli.savings, ["--where", "host=studio", "--json"])
+    assert "routing" not in json.loads(filtered.output)
+
     result = runner.invoke(savings_cli.savings, ["--by", "team"])
     assert "No attributed events" in result.output
     assert "host" in result.output
@@ -245,6 +252,22 @@ def test_funnel_books_context_labels_and_outcome_fields_win(tmp_path, monkeypatc
 
     events = [json.loads(x) for x in (tmp_path / "events.jsonl").read_text().splitlines()]
     assert events[-1]["dims"] == {"host": "studio", "project": "late-project", "team": "core"}
+
+
+def test_a_dimension_turned_off_is_not_booked_from_the_legacy_field(tmp_path, monkeypatch):
+    from headroom.proxy import attribution
+
+    monkeypatch.setenv(attribution.ATTRIBUTION_DIMENSIONS_ENV_VAR, "default,-client")
+    with _proxy_client(tmp_path, monkeypatch) as client:
+        _emit(client.app.state.proxy, project="web", client="codex")
+        by_dim = client.get("/stats").json()["savings"]["by_dimension"]
+        assert "client" not in by_dim
+        assert set(by_dim["project"]) == {"web"}
+        attribution.bind_label("client", "codex")
+        assert "client" not in attribution.get_current_attribution()
+    event = json.loads((tmp_path / "events.jsonl").read_text().splitlines()[-1])
+    # The ledger's own client key predates labels and is unchanged.
+    assert event["client"] == "codex"
 
 
 def test_snapshot_carries_labels_to_pipeline_extensions(tmp_path, monkeypatch):
