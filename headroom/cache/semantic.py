@@ -170,6 +170,21 @@ class SemanticCache:
                     self._touch(key)
                     self._hits += 1
                     return entry
+        elif self.config.use_exact_matching and query.strip():
+            # put() uses a query-derived key when no context hash is supplied.
+            # Only read entries stored the same way; a context-keyed response
+            # must never become a query-only hit, even if the keys coincide.
+            key = self._combined_key(namespace, self._generate_key(query))
+            query_entry = self._cache.get(key)
+            if (
+                query_entry is not None
+                and not query_entry.messages_hash
+                and query_entry.namespace == namespace
+                and query_entry.query == query
+            ):
+                self._touch(key)
+                self._hits += 1
+                return query_entry
 
         # Try semantic similarity if we have embedding function.
         #
