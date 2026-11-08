@@ -12,6 +12,7 @@ from dataclasses import InitVar, dataclass, field
 from datetime import datetime
 from typing import Any, Literal
 
+from headroom.config import resolve_omlx_target_api_url
 from headroom.memory import qdrant_env
 from headroom.providers.registry import ProviderApiOverrides
 from headroom.proxy.buffered_ccr_response import DEFAULT_BUFFERED_CCR_GRACE_SECONDS
@@ -164,6 +165,9 @@ class ProxyConfig:
     gemini_api_url: str | None = None  # Custom Gemini API URL override
     cloudcode_api_url: str | None = None  # Custom Cloud Code Assist API URL override
     vertex_api_url: str | None = None  # Custom Vertex AI regional API URL override
+    omlx_target_api_url: str | None = (
+        None  # Custom oMLX local inference API URL (e.g. http://127.0.0.1:8888)
+    )
     # Extra headers merged into (and overriding) forwarded Anthropic/OpenAI requests.
     # JSON-object config knobs; see settings_store's anthropic_extra_headers/
     # openai_extra_headers and providers.registry.resolve_extra_headers.
@@ -587,6 +591,8 @@ class ProxyConfig:
     def __post_init__(self, smart_routing: bool | None = None) -> None:
         if self.rollout is None:
             self.rollout = resolve_rollout()
+        if self.omlx_target_api_url is None:
+            self.omlx_target_api_url = resolve_omlx_target_api_url()
         # ``read_maturation`` remains a concrete, already-resolved runtime
         # setting for programmatic/config-file callers.  The CLI composition
         # root derives it from this same snapshot before constructing the
