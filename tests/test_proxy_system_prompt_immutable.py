@@ -713,3 +713,78 @@ def test_cache_mode_responses_preserves_tools_and_outcome_skip_reason() -> None:
         assert "mem_search" in tool_names
         assert len(recorded_outcomes) >= 1
         assert recorded_outcomes[0].tags.get("memory_skip_reason") == "cache_mode"
+
+
+def test_cache_mode_frozen_prefix_restore_logs_at_info_level(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Issue #4505: routine cache-mode prefix restore logs at INFO rather than WARNING."""
+    import logging
+    from types import SimpleNamespace
+
+    from headroom.proxy.handlers.openai import logger as openai_logger
+
+    captured: dict[str, object] = {}
+    with _make_proxy_client() as client:
+        proxy = client.app.state.proxy
+        proxy.config.mode = "cache"
+        proxy.config.optimize = True
+        proxy.config.image_optimize = False
+        proxy.config.ccr_proactive_expansion = False
+
+        _install_session_tracker(proxy, frozen_count=1)
+        _install_capture_retry(proxy, captured)
+
+        # Simulate pipeline mutating the frozen prefix message
+        def _fake_apply(**kwargs):
+            mutated = list(kwargs["messages"])
+            mutated[0] = {**mutated[0], "content": "MUTATED_SYSTEM"}
+            return SimpleNamespace(
+                messages=mutated,
+                transforms_applied=["fake:mutated"],
+                timing={},
+                tokens_before=20,
+                tokens_after=18,
+                waste_signals=None,
+            )
+
+        proxy.openai_pipeline.apply = _fake_apply
+
+        caplog.set_level(logging.INFO, logger=openai_logger.name)
+
+        response = client.post(
+            "/v1/chat/completions",
+            headers={
+                "authorization": "Bearer sk-test",
+            },
+            json={
+                "model": "gpt-4o",
+                "messages": [
+                    {"role": "system", "content": "frozen system"},
+                    {"role": "user", "content": "user prompt"},
+                ],
+            },
+        )
+
+        assert response.status_code == 200
+
+        # Verify no WARNING records were emitted for routine prefix restore
+        warning_records = [
+            r
+            for r in caplog.records
+            if r.levelno >= logging.WARNING
+            and "Restored" in r.getMessage()
+            and "frozen prefix" in r.getMessage()
+        ]
+        assert not warning_records, f"Found unexpected WARNING records: {warning_records}"
+
+        # Verify an INFO record was emitted when frozen prefix restoration occurred
+        info_records = [
+            r
+            for r in caplog.records
+            if r.levelno == logging.INFO
+            and "Restored" in r.getMessage()
+            and "frozen prefix message(s)" in r.getMessage()
+        ]
+        assert len(info_records) == 1
+        assert "to preserve cache stability (openai)" in info_records[0].getMessage()

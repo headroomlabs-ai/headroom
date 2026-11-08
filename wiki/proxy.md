@@ -283,7 +283,7 @@ Compression-only endpoint. Compresses messages without ever making a **completio
   "model": "gpt-4o",          // tokenizer + context limit
   "token_budget": 8000,       // optional: override the context limit
   "config": {                 // optional
-    "mode": "lossy_inline",       // ccr | lossy_inline | lossless_then_lossy
+    "mode": "lossy_inline",       // ccr | lossy_inline | lossless_then_lossy | lossless
     "frozen_message_count": 12,   // pin an already-cached prefix
     "session_id": "conv-8f1c",    // session mode: Headroom keeps the replay state
     "compress_user_messages": false,
