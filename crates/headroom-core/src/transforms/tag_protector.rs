@@ -564,12 +564,14 @@ fn identify_spans(
                 match matching {
                     Some(stack_idx) => {
                         if compress_tagged_content {
-                            // Pop everything above (orphan opens
-                            // inside the matched span — their open
-                            // markers were already recorded as spans
-                            // and we keep them).
+                            // Drop the matched frame and everything
+                            // above it (orphan opens inside the matched
+                            // span — their open markers were already
+                            // recorded as spans and we keep them).
+                            // `truncate` already removes the matched
+                            // frame; popping again would drop the
+                            // enclosing tag's frame and orphan its close.
                             stack.truncate(stack_idx);
-                            let _ = stack.pop();
                             spans.push(Span {
                                 start: i,
                                 end: tag_end,
@@ -864,6 +866,17 @@ mod tests {
         assert!(!cleaned.contains("</system-reminder>"));
         assert!(cleaned.contains("Compressible content"));
         assert_eq!(blocks.len(), 2);
+    }
+
+    #[test]
+    fn marker_mode_nested_custom_tags_keep_outer_close() {
+        let text = "<outer><inner>body</inner></outer>";
+        let (cleaned, blocks, stats) = protect_tags(text, true);
+        assert_eq!(blocks.len(), 4, "{cleaned}");
+        assert!(!cleaned.contains("</outer>"), "{cleaned}");
+        assert!(cleaned.contains("body"));
+        assert_eq!(stats.orphan_closes, 0);
+        assert_eq!(restore_tags(&cleaned, &blocks), text);
     }
 
     #[test]
