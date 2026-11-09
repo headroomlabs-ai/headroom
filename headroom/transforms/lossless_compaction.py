@@ -387,9 +387,9 @@ def diff_strip_index(text: str) -> str:
 # then a basename. No whitespace or ':' (so grep ``path:line:content`` rows —
 # handled by search_heading — are excluded). Directory-only lines (trailing '/')
 # don't match (empty basename), which keeps the fold unambiguous. No '<' or
-# '>' either: markup such as ``</body>`` is not a path, and folding a closing
-# tag into ``</`` + ``body>`` round-trips but shows the model broken HTML that
-# it then reads and writes back.
+# '>' either: markup such as ``</body>`` is not a path. Folded into ``</`` +
+# ``body>`` it still round-trips, but the model reads broken HTML and writes
+# it back.
 _PATH_ROW_RE = re.compile(r"^(?P<dir>(?:\.{0,2}/)?(?:[^/\s:<>]+/)+)(?P<base>[^/\s:<>]+)$")
 
 
@@ -398,20 +398,22 @@ def path_heading(text: str) -> str:
     into ripgrep-heading form: each parent directory printed once on its own
     line (ending in ``/``), then the bare basenames beneath it.
 
+    Every non-blank line must be a path row, and there must be >=2 of them.
+    Text that merely holds path-shaped lines (a template's ``{{/if}}``
+    closers, a ``N/A`` table column) passes through: folding it round-trips,
+    but the model only sees the folded side and reads fragments.
     Reversibility is not assumed here — ``compact_lossless`` verifies the exact
-    round-trip via :func:`path_unheading` and discards the fold on any mismatch
-    (e.g. a stray no-slash line mistaken for a basename), so mixed content is
-    always safe. Requires >=2 path rows or there is nothing to group.
+    round-trip via :func:`path_unheading` and discards the fold on any mismatch.
     Complements ``search_heading``, which only handles the ``path:line:content``
     grep shape, not plain path lists.
     """
     lines, had_trailing = _split_keep_trailing(text)
-    if sum(1 for ln in lines if _PATH_ROW_RE.match(ln)) < 2:
+    matches = [_PATH_ROW_RE.match(ln) for ln in lines]
+    if sum(1 for m in matches if m) < 2 or any(ln and not m for ln, m in zip(lines, matches)):
         return text
     out: list[str] = []
     current: str | None = None
-    for line in lines:
-        m = _PATH_ROW_RE.match(line)
+    for line, m in zip(lines, matches):
         if m:
             d = m.group("dir")
             if d != current:

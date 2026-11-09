@@ -169,6 +169,8 @@ def test_path_fold_roundtrip_and_shrinks_pure_list():
     assert _puh(_ph(c)) == c  # exact inverse
     assert len(folded) < len(c)  # shrinks
     assert folded != c
+    c = "src/app/main.rs\nsrc/app/lib.rs\nsrc/app/util.rs\ntests/a.rs\n"
+    assert _cl(c, "paths") == "src/app/\nmain.rs\nlib.rs\nutil.rs\ntests/\na.rs\n"
 
 
 def test_path_fold_safe_passthrough_on_non_path_shapes():
@@ -197,16 +199,24 @@ def test_path_fold_leaves_html_closing_tags_alone():
     assert _cl("</body>\n</html>", "paths") == "</body>\n</html>"
 
 
-def test_path_fold_still_folds_real_paths_after_markup_guard():
-    c = "src/app/main.rs\nsrc/app/lib.rs\nsrc/app/util.rs\ntests/a.rs\n"
-    folded = _cl(c, "paths")
-    assert folded == "src/app/\nmain.rs\nlib.rs\nutil.rs\ntests/\na.rs\n"
-    assert _puh(folded) == c
+@pytest.mark.parametrize(
+    "text",
+    [
+        "{{#each people}}\n{{#if active}}\n<p>{{name}}</p>\n{{/if}}\n{{/each}}\n",
+        "{#each items as item}\n  <li>{item}</li>\n{/each}\n{/if}\n",
+        "<pre>\n&lt;/body&gt;\n&lt;/html&gt;\n</pre>\n",
+        "Results for 3 hosts:\nN/A\nN/A\nN/A\n",
+    ],
+)
+def test_path_fold_skips_text_that_only_contains_path_shaped_lines(text):
+    # Closers and slashed values among other lines are not a path listing.
+    assert _cl(text, "paths") == text
 
 
-def test_router_keeps_html_closing_tags_in_mixed_content():
+def test_router_keeps_html_closing_tags_in_mixed_content(monkeypatch):
     # A page tail (no DOCTYPE/<html> root, so no HTML override) with a JSON-LD
     # block routes MIXED; every section gets the lossless folds tried on it.
+    monkeypatch.delenv("HEADROOM_LOSSLESS_COMPACTION", raising=False)
     ld = json.dumps(
         {
             "@context": "https://schema.org",
@@ -225,8 +235,11 @@ def test_router_keeps_html_closing_tags_in_mixed_content():
         '  <script type="application/ld+json">\n' + ld + "\n  </script>\n</body>\n</html>\n"
     )
     result = ContentRouter(ContentRouterConfig()).compress(tail)
+    # Fails loudly if routing changes, so the test cannot silently stop
+    # covering the mixed path.
     assert result.strategy_used.value == "mixed"
-    assert result.compressed.endswith("</body>\n</html>\n")
+    assert result.compressed.endswith("  </script>\n</body>\n</html>\n")
+    assert "</\n" not in result.compressed
 
 
 # ---- EXPERIMENT: HEADROOM_EXPERIMENTAL_READ_KEEP_RATIO (light Kompress on reads) ----
