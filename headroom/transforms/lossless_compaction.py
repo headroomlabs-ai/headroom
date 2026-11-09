@@ -386,8 +386,11 @@ def diff_strip_index(text: str) -> str:
 # A whole-line file path: optional ``./``/``../`` root, >=1 directory segment,
 # then a basename. No whitespace or ':' (so grep ``path:line:content`` rows —
 # handled by search_heading — are excluded). Directory-only lines (trailing '/')
-# don't match (empty basename), which keeps the fold unambiguous.
-_PATH_ROW_RE = re.compile(r"^(?P<dir>(?:\.{0,2}/)?(?:[^/\s:]+/)+)(?P<base>[^/\s:]+)$")
+# don't match (empty basename), which keeps the fold unambiguous. No '<' or
+# '>' either: markup such as ``</body>`` is not a path, and folding a closing
+# tag into ``</`` + ``body>`` round-trips but shows the model broken HTML that
+# it then reads and writes back.
+_PATH_ROW_RE = re.compile(r"^(?P<dir>(?:\.{0,2}/)?(?:[^/\s:<>]+/)+)(?P<base>[^/\s:<>]+)$")
 
 
 def path_heading(text: str) -> str:

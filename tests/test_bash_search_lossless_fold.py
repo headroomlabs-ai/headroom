@@ -189,6 +189,46 @@ def test_path_fold_mixed_content_roundtrips_or_passes_through():
     assert _puh(_ph(c)) == c or _cl(c, "paths") == c
 
 
+def test_path_fold_leaves_html_closing_tags_alone():
+    # `</body>` is markup, not dir `</` + base `body>`. The fold round-trips,
+    # but the model only sees the folded side and reads broken HTML.
+    tail = "  </script>\n</body>\n</html>\n"
+    assert _cl(tail, "paths") == tail
+    assert _cl("</body>\n</html>", "paths") == "</body>\n</html>"
+
+
+def test_path_fold_still_folds_real_paths_after_markup_guard():
+    c = "src/app/main.rs\nsrc/app/lib.rs\nsrc/app/util.rs\ntests/a.rs\n"
+    folded = _cl(c, "paths")
+    assert folded == "src/app/\nmain.rs\nlib.rs\nutil.rs\ntests/\na.rs\n"
+    assert _puh(folded) == c
+
+
+def test_router_keeps_html_closing_tags_in_mixed_content():
+    # A page tail (no DOCTYPE/<html> root, so no HTML override) with a JSON-LD
+    # block routes MIXED; every section gets the lossless folds tried on it.
+    ld = json.dumps(
+        {
+            "@context": "https://schema.org",
+            "@type": "Product",
+            "name": "Example Widget",
+            "offers": {"@type": "Offer", "price": "19.00", "priceCurrency": "USD"},
+        },
+        indent=2,
+    )
+    body = "".join(
+        f"    <p>Paragraph {i} of the example page with some ordinary text.</p>\n"
+        for i in range(20)
+    )
+    tail = (
+        "  <main>\n" + body + "  </main>\n"
+        '  <script type="application/ld+json">\n' + ld + "\n  </script>\n</body>\n</html>\n"
+    )
+    result = ContentRouter(ContentRouterConfig()).compress(tail)
+    assert result.strategy_used.value == "mixed"
+    assert result.compressed.endswith("</body>\n</html>\n")
+
+
 # ---- EXPERIMENT: HEADROOM_EXPERIMENTAL_READ_KEEP_RATIO (light Kompress on reads) ----
 def test_experimental_read_keep_ratio_flag_and_gating(monkeypatch):
     from headroom.transforms.content_router import ContentRouter, ContentRouterConfig
