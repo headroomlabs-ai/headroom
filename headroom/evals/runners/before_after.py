@@ -181,7 +181,6 @@ Answer:"""
             response = self._llm_client.messages.create(
                 model=self.llm_config.model,
                 max_tokens=self.llm_config.max_tokens,
-                temperature=self.llm_config.temperature,
                 messages=[{"role": "user", "content": prompt}],
             )
             return str(response.content[0].text)

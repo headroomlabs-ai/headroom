@@ -1058,7 +1058,6 @@ class BatchCompressionEvaluator:
             response = self._llm_client.messages.create(
                 model=self.model,
                 max_tokens=1024,
-                temperature=0.0,
                 messages=messages,
             )
             return str(response.content[0].text)
