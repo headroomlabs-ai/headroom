@@ -745,3 +745,41 @@ def test_undo_leaves_a_handler_installed_later_alone(tmp_path: Path) -> None:
 
     asyncio.run(serve())
     assert signal.getsignal(signal.SIGTERM) is later
+
+
+@pytest.mark.usefixtures("_restore_exit_handlers")
+def test_undo_off_the_main_thread_only_disarms(tmp_path: Path) -> None:
+    """signal.signal raises off the main thread, so a shutdown that runs there
+    leaves the wrapper in place, disarmed: a signal reaches the app, no save."""
+    import asyncio
+    import signal
+    import threading
+
+    from headroom.proxy.server import _save_prefix_state_on_exit_signal
+
+    calls: list[Any] = []
+    signal.signal(signal.SIGTERM, lambda signum, frame: calls.append(("app", signum)))
+    loop = asyncio.new_event_loop()
+
+    async def install() -> Any:
+        return _save_prefix_state_on_exit_signal(_RecordingStore(calls), str(tmp_path / "s.json"))
+
+    undo = loop.run_until_complete(install())
+    wrapper = signal.getsignal(signal.SIGTERM)
+    errors: list[BaseException] = []
+
+    def run() -> None:
+        try:
+            undo()
+        except BaseException as exc:  # noqa: BLE001
+            errors.append(exc)
+
+    worker = threading.Thread(target=run)
+    worker.start()
+    worker.join()
+    assert errors == []
+    assert signal.getsignal(signal.SIGTERM) is wrapper
+    signal.raise_signal(signal.SIGTERM)
+    loop.run_until_complete(asyncio.sleep(0))
+    loop.close()
+    assert calls == [("app", signal.SIGTERM)]
