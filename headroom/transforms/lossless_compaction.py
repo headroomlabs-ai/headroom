@@ -386,11 +386,14 @@ def diff_strip_index(text: str) -> str:
 # A whole-line file path: optional ``./``/``../`` root, >=1 directory segment,
 # then a basename. No whitespace or ':' (so grep ``path:line:content`` rows —
 # handled by search_heading — are excluded). Directory-only lines (trailing '/')
-# don't match (empty basename), which keeps the fold unambiguous. No '<' or
-# '>' either: markup such as ``</body>`` is not a path. Folded into ``</`` +
-# ``body>`` it still round-trips, but the model reads broken HTML and writes
-# it back.
-_PATH_ROW_RE = re.compile(r"^(?P<dir>(?:\.{0,2}/)?(?:[^/\s:<>]+/)+)(?P<base>[^/\s:<>]+)$")
+# don't match (empty basename), which keeps the fold unambiguous. Markup is
+# not a path either: no '<', '>' or ';' (``</body>``, ``&lt;/body&gt;``), and
+# every directory segment holds a letter, digit or '_', so a template closer
+# such as ``{{/if}}`` is not dir ``{{`` + base ``if}}``. Folded, those still
+# round-trip, but the model reads broken markup and writes it back.
+_PATH_ROW_RE = re.compile(
+    r"^(?P<dir>(?:\.{0,2}/)?(?:(?=[^/]*\w)[^/\s:<>;]+/)+)(?P<base>[^/\s:<>;]+)$"
+)
 
 
 def path_heading(text: str) -> str:
@@ -408,8 +411,13 @@ def path_heading(text: str) -> str:
     grep shape, not plain path lists.
     """
     lines, had_trailing = _split_keep_trailing(text)
-    matches = [_PATH_ROW_RE.match(ln) for ln in lines]
-    if sum(1 for m in matches if m) < 2 or any(ln and not m for ln, m in zip(lines, matches)):
+    matches = []
+    for ln in lines:
+        m = _PATH_ROW_RE.match(ln)
+        if ln and not m:  # not a pure listing; stop at the first such line
+            return text
+        matches.append(m)
+    if sum(1 for m in matches if m) < 2:
         return text
     out: list[str] = []
     current: str | None = None

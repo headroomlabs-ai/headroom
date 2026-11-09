@@ -171,6 +171,8 @@ def test_path_fold_roundtrip_and_shrinks_pure_list():
     assert folded != c
     c = "src/app/main.rs\nsrc/app/lib.rs\nsrc/app/util.rs\ntests/a.rs\n"
     assert _cl(c, "paths") == "src/app/\nmain.rs\nlib.rs\nutil.rs\ntests/\na.rs\n"
+    c = "app/[slug]/page.tsx\napp/[slug]/layout.tsx\n"
+    assert _cl(c, "paths") == "app/[slug]/\npage.tsx\nlayout.tsx\n"
 
 
 def test_path_fold_safe_passthrough_on_non_path_shapes():
@@ -206,6 +208,11 @@ def test_path_fold_leaves_html_closing_tags_alone():
         "{#each items as item}\n  <li>{item}</li>\n{/each}\n{/if}\n",
         "<pre>\n&lt;/body&gt;\n&lt;/html&gt;\n</pre>\n",
         "Results for 3 hosts:\nN/A\nN/A\nN/A\n",
+        # sections made only of closers
+        "{{/if}}\n{{/each}}\n",
+        "{/if}\n{/each}\n",
+        "[/quote]\n[/b]\n",
+        "&lt;/body&gt;\n&lt;/html&gt;\n",
     ],
 )
 def test_path_fold_skips_text_that_only_contains_path_shaped_lines(text):
