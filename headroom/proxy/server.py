@@ -34,6 +34,7 @@ import json
 import logging
 import math
 import os
+import signal
 import sys
 import threading
 import time
@@ -599,6 +600,47 @@ class CompressionQuarantinedError(asyncio.TimeoutError):
 
 
 _MULTI_WORKER_CONFIG_ENV = "HEADROOM_PROXY_CONFIG_JSON"
+
+
+def _save_prefix_state_on_exit_signal(store: Any, path: str) -> None:
+    """Save prefix-tracker state as soon as an exit signal arrives.
+
+    ``HeadroomProxy.shutdown`` saves it too, but uvicorn runs the lifespan
+    shutdown only after waiting up to ``timeout_graceful_shutdown`` for
+    in-flight requests, so a supervisor that SIGKILLs sooner (a desktop app's
+    short stop, systemd's ``TimeoutStopSec``) loses that save whenever a request
+    is open. This wraps the handler uvicorn installed (the lifespan runs inside
+    its ``capture_signals``), so uvicorn's shutdown is unchanged and the later
+    save still writes the newer state. The save runs on the event loop, never
+    inside the signal handler, so it cannot read a tracker that a paused
+    coroutine was midway through updating.
+    """
+    if threading.current_thread() is not threading.main_thread():
+        return  # signals are only delivered to the main thread
+    loop = asyncio.get_running_loop()
+    saved = False
+
+    def save() -> None:
+        nonlocal saved
+        if not saved:
+            saved = True
+            store.save_state(path)
+
+    def chained(previous: Callable[[int, Any], Any]) -> Callable[[int, Any], None]:
+        def handler(signum: int, frame: Any) -> None:
+            loop.call_soon_threadsafe(save)
+            previous(signum, frame)
+
+        return handler
+
+    for sig in (signal.SIGINT, signal.SIGTERM, getattr(signal, "SIGBREAK", None)):
+        if sig is None:
+            continue
+        previous = signal.getsignal(sig)
+        if not callable(previous):
+            continue  # nobody installed a handler: keep the default exit
+        signal.signal(sig, chained(previous))
+
 
 # Env var that opts out of the Rust core deployment smoke test (Hotfix-A0).
 # Default behavior: hard-fail at startup if `headroom._core` is unimportable
@@ -2126,6 +2168,7 @@ class HeadroomProxy(
             self._prefix_state_file = None
         if self._prefix_state_file:
             self.session_tracker_store.load_state(self._prefix_state_file)
+            _save_prefix_state_on_exit_signal(self.session_tracker_store, self._prefix_state_file)
         self.pipeline_extensions.emit(
             PipelineStage.PRE_START,
             operation="proxy.startup",

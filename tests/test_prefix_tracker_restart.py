@@ -556,3 +556,93 @@ def test_compress_sidecar_session_replays_its_prefix_after_a_restart(
 
     assert previous[2]["content"] != _chat_turns(1)[2]["content"], "nothing was compressed"
     assert current[: len(previous)] == previous
+
+
+@pytest.fixture
+def _restore_exit_handlers():
+    import signal
+
+    sigs = [s for s in (signal.SIGINT, signal.SIGTERM, getattr(signal, "SIGBREAK", None)) if s]
+    saved = {s: signal.getsignal(s) for s in sigs}
+    yield
+    for s, handler in saved.items():
+        signal.signal(s, handler)
+
+
+class _RecordingStore:
+    def __init__(self, calls: list[Any]) -> None:
+        self.calls = calls
+
+    def save_state(self, path: str) -> int:
+        self.calls.append(("save", path))
+        return 1
+
+
+@pytest.mark.usefixtures("_restore_exit_handlers")
+def test_an_exit_signal_saves_while_uvicorn_still_drains(tmp_path: Path) -> None:
+    """uvicorn waits for in-flight requests before the lifespan shutdown save;
+    the signal-time save lands first, on the loop, and uvicorn still gets the
+    signal (so its shutdown is unchanged). A second signal does not save again."""
+    import asyncio
+    import signal
+
+    from headroom.proxy.server import _save_prefix_state_on_exit_signal
+
+    calls: list[Any] = []
+    path = str(tmp_path / "state.json")
+    signal.signal(signal.SIGTERM, lambda signum, frame: calls.append(("uvicorn", signum)))
+
+    async def serve() -> None:
+        _save_prefix_state_on_exit_signal(_RecordingStore(calls), path)
+        signal.raise_signal(signal.SIGTERM)
+        assert calls == [("uvicorn", signal.SIGTERM)]  # never saves inside the handler
+        await asyncio.sleep(0)
+        signal.raise_signal(signal.SIGTERM)
+        await asyncio.sleep(0)
+
+    asyncio.run(serve())
+    assert calls == [("uvicorn", signal.SIGTERM), ("save", path), ("uvicorn", signal.SIGTERM)]
+
+
+@pytest.mark.usefixtures("_restore_exit_handlers")
+def test_the_default_exit_is_left_alone(tmp_path: Path) -> None:
+    import asyncio
+    import signal
+
+    from headroom.proxy.server import _save_prefix_state_on_exit_signal
+
+    signal.signal(signal.SIGTERM, signal.SIG_DFL)
+
+    async def serve() -> None:
+        _save_prefix_state_on_exit_signal(_RecordingStore([]), str(tmp_path / "s.json"))
+
+    asyncio.run(serve())
+    assert signal.getsignal(signal.SIGTERM) is signal.SIG_DFL
+
+
+@pytest.mark.usefixtures("_restore_exit_handlers")
+def test_off_the_main_thread_no_handler_is_installed(tmp_path: Path) -> None:
+    """TestClient runs the lifespan in a worker thread, where signal.signal raises."""
+    import asyncio
+    import signal
+    import threading
+
+    from headroom.proxy.server import _save_prefix_state_on_exit_signal
+
+    before = signal.getsignal(signal.SIGTERM)
+    errors: list[BaseException] = []
+
+    def run() -> None:
+        async def serve() -> None:
+            _save_prefix_state_on_exit_signal(_RecordingStore([]), str(tmp_path / "s.json"))
+
+        try:
+            asyncio.run(serve())
+        except BaseException as exc:  # noqa: BLE001
+            errors.append(exc)
+
+    worker = threading.Thread(target=run)
+    worker.start()
+    worker.join()
+    assert errors == []
+    assert signal.getsignal(signal.SIGTERM) is before
