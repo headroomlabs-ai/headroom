@@ -59,6 +59,19 @@ describe("HeadroomClient", () => {
     expect(body.model).toBe("gpt-4o");
   });
 
+  it("serializes per-message biases in the compression request", async () => {
+    mockFetch.mockResolvedValueOnce(okResponse(sampleProxyResponse));
+
+    const client = new HeadroomClient({ baseUrl: "http://localhost:8787" });
+    await client.compress(sampleMessages, {
+      model: "gpt-4o",
+      biases: { 0: 2.0, 1: 0.5 },
+    });
+
+    const body = JSON.parse(mockFetch.mock.calls[0][1].body);
+    expect(body.biases).toEqual({ 0: 2.0, 1: 0.5 });
+  });
+
   it("maps snake_case proxy response to camelCase result", async () => {
     mockFetch.mockResolvedValueOnce(
       okResponse({
