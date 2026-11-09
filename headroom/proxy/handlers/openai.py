@@ -79,7 +79,7 @@ import httpx
 from headroom.agent_savings import proxy_pipeline_kwargs
 from headroom.ccr.marker_resolution import resolve_markers_in_response
 from headroom.ccr.tool_calls import has_ccr_retrieve_tool
-from headroom.config import is_tool_excluded, unwrap_tool_call_name
+from headroom.config import ReadLifecycleConfig, is_tool_excluded, unwrap_tool_call_name
 from headroom.copilot_auth import (
     apply_copilot_api_auth,
     build_copilot_upstream_url,
@@ -120,7 +120,11 @@ from headroom.proxy.handlers.streaming import _stream_outcome_status
 from headroom.proxy.image_isolation import run_image_compression_isolated
 from headroom.proxy.outcome import RequestOutcome
 from headroom.proxy.output_shaper import shaper_enabled_for, steering_allowed_for
-from headroom.proxy.passthrough import CUSTOM_BASE_PROVIDER, is_opencode_zen_base
+from headroom.proxy.passthrough import (
+    CUSTOM_BASE_PROVIDER,
+    is_opencode_zen_base,
+    provider_label_from_model,
+)
 from headroom.proxy.passthrough import (
     custom_base_passthrough_telemetry as _custom_base_passthrough_telemetry,
 )
@@ -1925,9 +1929,8 @@ WS_FIRST_FRAME_TIMEOUT_SECONDS = 60.0
 
 # Accepted values for ``config.mode`` on POST /v1/compress. Unset/None means
 # the default marker-free pipeline. Anything else is a 400 rather than a
-# silent fall-through to the default (a typo or an unsupported mode like
-# "lossless" would otherwise look like it worked).
-COMPRESS_MODES = ("ccr", "lossy_inline", "lossless_then_lossy")
+# silent fall-through to the default (a typo would otherwise look like it worked).
+COMPRESS_MODES = ("ccr", "lossy_inline", "lossless_then_lossy", "lossless")
 
 # Max wait for a sidecar session's turn lock, on the executor. MUST stay
 # well below COMPRESSION_TIMEOUT_SECONDS: with an untimed acquire, a slow
@@ -3836,8 +3839,18 @@ class OpenAIHandlerMixin:
         _image_decision.apply_to_tags(tags)
         custom_upstream_base_url = _resolve_openai_upstream_base(request.headers)
         handler_path = _resolve_openai_chat_forward_path(request.headers, custom_upstream_base_url)
-        openai_chat_outcome_provider = _openai_outcome_provider(
-            request.method, handler_path, custom_upstream_base_url, upstream_base_url
+        _, custom_chat_provider = _custom_base_passthrough_telemetry(
+            request.method,
+            handler_path,
+            custom_upstream_base_url or "",
+        )
+        # Keep upstream labels and xAI routing ahead of model-based DeepSeek reporting.
+        # Unknown custom hosts remain in the fixed custom bucket.
+        openai_chat_outcome_provider = custom_chat_provider or (
+            "xai"
+            if _is_xai_upstream(upstream_base_url)
+            else provider_label_from_model(model)
+            or (CUSTOM_BASE_PROVIDER if custom_upstream_base_url else "openai")
         )
 
         # Memory: Get user ID when memory is enabled. Reads `request.headers`
@@ -4629,6 +4642,25 @@ class OpenAIHandlerMixin:
                         bytes_injected=0,
                         query=extract_user_query(optimized_messages) or "",
                         tags=tags,
+                    )
+                elif self.memory_handler.config.inject_context and not (
+                    optimized_messages
+                    and isinstance(optimized_messages[-1], dict)
+                    and optimized_messages[-1].get("role") == "user"
+                ):
+                    # Live-zone tail only (#4419): when the request ends with
+                    # assistant tool calls and tool results, the latest user
+                    # message is an older turn the provider has already
+                    # cached. Skip the search, so nothing is retrieved, marked
+                    # as accessed, or appended inside a cached prefix.
+                    from headroom.proxy.helpers import log_memory_injection
+
+                    log_memory_injection(
+                        request_id=request_id,
+                        session_id=None,
+                        decision="no_eligible_user_message",
+                        bytes_injected=0,
+                        query=None,
                     )
                 elif self.memory_handler.config.inject_context:
                     memory_context = await asyncio.wait_for(
@@ -11029,6 +11061,25 @@ class OpenAIHandlerMixin:
             smart_crusher_lossless_only=False,  # keep SmartCrusher lossy
         )
 
+    def _lossless_pipeline(self) -> Any:
+        """Pipeline for ``/v1/compress`` ``config.mode="lossless"``.
+
+        The per-request form of the proxy's ``--lossless``: format-native folds
+        only, with no markers and no CCR store, so a sidecar with no retrieval
+        loop loses nothing. A registered lossless provider still competes.
+        ``handle_compress`` also turns off cross-turn dedup pointers, which a
+        client that never numbers its messages cannot resolve.
+        """
+        return self._derived_compress_pipeline(
+            "lossless",
+            lossless=True,
+            smart_crusher_lossless_only=True,
+            ccr_inject_marker=False,
+            ccr_enabled=False,
+            # Stale-Read pointers drop the file body and need the retrieval tool.
+            read_lifecycle=ReadLifecycleConfig(enabled=False),
+        )
+
     async def handle_compress(self, request: Request) -> JSONResponse:
         """Compress messages without calling an LLM.
 
@@ -11043,6 +11094,9 @@ class OpenAIHandlerMixin:
           ``headroom_retrieve`` tool and can reach loopback ``/v1/retrieve``.
         * ``"lossy_inline"`` (alias ``"lossless_then_lossy"``) — marker-free,
           lossless fold first then Kompress the remainder.
+        * ``"lossless"`` — marker-free, lossless folds only. This covers message
+          compression; on a gateway turn, tool schema compaction and registered
+          turn hooks still run as configured.
 
         Any other ``config.mode`` value is a 400 (see ``COMPRESS_MODES``).
 
@@ -11068,6 +11122,7 @@ class OpenAIHandlerMixin:
         from headroom.proxy.gateway_responses import build_view as build_responses_view
         from headroom.proxy.gateway_responses import is_responses_body
         from headroom.proxy.gateway_responses import mark_view as mark_responses_view
+        from headroom.proxy.gateway_turn import provider_for_body
         from headroom.proxy.helpers import RequestBodyTooLarge, _read_request_json
 
         def _gateway_invalid(e: CompressTurnError) -> JSONResponse:
@@ -11330,7 +11385,9 @@ class OpenAIHandlerMixin:
                         }
                     },
                 )
-            if mode in ("lossy_inline", "lossless_then_lossy"):
+            if mode == "lossless":
+                pipeline = self._lossless_pipeline()
+            elif mode in ("lossy_inline", "lossless_then_lossy"):
                 pipeline = self._lossy_inline_pipeline()
             elif mode == "ccr":
                 # Markers + store writes wanted, so inherit the live router config
@@ -11347,6 +11404,8 @@ class OpenAIHandlerMixin:
                 "model_limit": context_limit,
                 **proxy_pipeline_kwargs(self.config),
             }
+            if mode == "lossless":
+                pipeline_kwargs["cross_turn_dedup_recoverable"] = False
             if compress_user_messages:
                 pipeline_kwargs["compress_user_messages"] = True
             if target_ratio is not None:
@@ -11383,11 +11442,7 @@ class OpenAIHandlerMixin:
                 # trick SessionTrackerStore uses for its synthetic lineage
                 # keys). A plain "compress:" string prefix was spoofable.
                 _session_key = f"compress\x00{session_id}"
-                _tracker_provider = (
-                    "anthropic"
-                    if ("claude" in model_name.lower() or "anthropic" in model_name.lower())
-                    else "openai"
-                )
+                _tracker_provider = provider_for_body(body, model_name)
                 comp_cache = self._get_compression_cache(_session_key)
                 session_tracker = self.session_tracker_store.get_or_create(
                     _session_key, _tracker_provider
@@ -12172,6 +12227,7 @@ class OpenAIHandlerMixin:
         endpoint_name: str | None = None,
         provider: str | None = None,
         *,
+        verbatim: bool = False,
         _upstream_request: httpx.Request | None = None,
         _model: str | None = None,
         _start_time: float | None = None,
@@ -12183,6 +12239,8 @@ class OpenAIHandlerMixin:
             base_url: The upstream API base URL
             endpoint_name: Optional name for stats tracking (e.g., "models", "embeddings")
             provider: Optional provider name for stats (e.g., "openai", "anthropic", "gemini")
+            verbatim: Skip the opt-in ``compress_passthrough`` Responses
+                compressor, so the body reaches the upstream unchanged.
         """
         from fastapi.responses import Response
 
@@ -12284,7 +12342,8 @@ class OpenAIHandlerMixin:
         # the exact same ContentRouter/Kompress path the native handler runs.
         _pt_config = getattr(self, "config", None)
         if (
-            not soft_passthrough
+            not verbatim
+            and not soft_passthrough
             and getattr(_pt_config, "compress_passthrough", False)
             and getattr(_pt_config, "optimize", False)
             and request.method == "POST"

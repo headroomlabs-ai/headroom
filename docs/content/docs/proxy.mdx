@@ -65,6 +65,7 @@ Disable it with `HEADROOM_BEACON=off`, `HEADROOM_TELEMETRY=off` (or `--no-teleme
 | `--gemini-api-url` | Gemini default | Custom Gemini API URL |
 | `--backend` | `anthropic` | Backend: `anthropic`, `bedrock`, `openrouter`, `anyllm`, or `litellm-<provider>` |
 | `--bedrock-api-url` | None | Bedrock InvokeModel upstream for the `/model/{id}/invoke` passthrough routes (see [Bedrock via a local gateway](#bedrock-via-a-local-gateway)) |
+| `--factory-api-url` | None | Factory Droid upstream (env: `FACTORY_TARGET_API_URL`). Registers `/api/*` routes: `/api/llm/a/v1/messages` is compressed, other `/api/*` paths pass through verbatim. Paths outside `/api/` are never sent to Factory. Set automatically by `headroom wrap droid` (see [Factory Droid](/docs/droid)) |
 | `--telemetry` | `false` | Enable local, in-process usage stats (for your own `/stats` and dashboard; nothing leaves the machine) |
 | `--no-telemetry` | `false` | Force local telemetry off (already the default) |
 | `--stateless` | `false` | Disable filesystem writes and keep runtime state in memory |
@@ -441,7 +442,7 @@ with a privileged job.
 
 | Flag / env | Default | Effect |
 |---|---|---|
-| `HEADROOM_PROXY_TOKEN` | none | Require a token from non-loopback callers, as `X-Headroom-Proxy-Token: <token>` or `Authorization: Bearer <token>`. The token is removed from the request before it is forwarded upstream; clients that also send a provider credential should use `X-Headroom-Proxy-Token` and keep `Authorization` for the provider. Also gates the read-only operator routes (`/stats-history`, `/quota`, `/subscription-window`, `/metrics`), which otherwise answer loopback and trusted-CIDR callers only. |
+| `HEADROOM_PROXY_TOKEN` | none | Require a token from non-loopback callers, as `X-Headroom-Proxy-Token: <token>` or `Authorization: Bearer <token>`. The token is removed from the request before it is forwarded upstream; clients that also send a provider credential should use `X-Headroom-Proxy-Token` and keep `Authorization` for the provider. Also gates the read-only operator routes (`/stats-history`, `/quota`, `/subscription-window`, `/metrics`), which otherwise answer loopback and trusted-CIDR callers only. A token holder also sees the per-request metadata `/stats` and `/stats-lifetime` withhold from other network callers. That metadata covers every caller of the proxy, so only share the token between clients that may see each other's traffic metadata; see [What the proxy token unlocks](/docs/security-model#what-the-proxy-token-unlocks). |
 | `HEADROOM_ALLOW_UNAUTHENTICATED_BIND` | `false` | Acknowledge a non-loopback bind (`--host 0.0.0.0`, `::`, a LAN address) with **no** `HEADROOM_PROXY_TOKEN`. Without a token or this flag the proxy refuses to start, because `/v1/*` would relay upstream with the operator's credentials for every peer that can reach the port. Only set it when the runtime already restricts reachability (a container published on `127.0.0.1`). |
 | `HEADROOM_COMPRESS_ALLOW_REMOTE` | `false` | Allow non-loopback callers to reach [`POST /v1/compress`](#post-v1compress) and `POST /v1/usage`. Required to run Headroom as a remote gateway/sidecar; without it remote callers get `404`. |
 | `HEADROOM_OFFLINE` | `false` | Air-gap mode: refuse every connection Headroom itself initiates — telemetry, update checks, license reporting, model/tokenizer/binary/dataset downloads, litellm's pricing-table refresh, CrewAI's install tracking, remote Kompress, OTLP and Langfuse export, Copilot auth, the subscription pollers, the OpenAI embedders, Headroom Cloud compression and the TLS diagnostics (`headroom doctor --network` reports them as skipped). Four things still work on purpose: forwarding your own requests to the upstream you configured, operator-configured local endpoints (the Ollama embedder), loopback health probes, and paths an `is_offline()` check already disables. Refusals surface as messages, not tracebacks. See the air-gap notes in `docs/metrics-technical-guide.md`. |
@@ -637,7 +638,7 @@ Keep carrying both yourself and send them upstream unchanged. Two consequences w
 
 | Field | Type | Default | Description |
 | --- | --- | --- | --- |
-| `mode` | string | unset | `ccr`, `lossy_inline`, or `lossless_then_lossy`. Unset selects the default marker-free pipeline. Any other value is a `400`. |
+| `mode` | string | unset | `ccr`, `lossy_inline`, `lossless_then_lossy`, or `lossless`. Unset selects the default marker-free pipeline. Any other value is a `400`. |
 | `frozen_message_count` | integer | unset | Pin a prefix: the first N messages are returned byte-for-byte unchanged while staying visible to cross-message transforms like dedup. Set it to the number of messages the provider has already cached so compression cannot rewrite the prefix and bust that cache. Must be a non-negative integer; anything else is a `400`. |
 | `session_id` | string | unset | Opt into [session mode](#session-mode): Headroom keeps this conversation's replay state itself, so you can resend the raw conversation every turn and get a byte-identical prefix back. Non-empty, at most 256 characters; anything else is a `400`. Cannot be combined with `compress_user_messages` (`400`). |
 | `compress_user_messages` | boolean | `false` | Also compress user-role messages. |
@@ -650,6 +651,7 @@ Keep carrying both yourself and send them upstream unchanged. Two consequences w
 - **unset (default)** — marker-free. Emits no `<<ccr:…>>` retrieval markers and writes nothing to the CCR store, so you can forward the returned messages straight to a provider. This is the right mode for a gateway or guardrail that just swaps `messages` and forwards.
 - **`ccr`** — emits CCR markers and writes to the store. Only for callers that also inject the `headroom_retrieve` tool *and* can reach `/v1/retrieve` (itself loopback-only). Markers are a dangling pointer for the model otherwise.
 - **`lossy_inline`** (alias `lossless_then_lossy`) — runs the lossless byte/data fold first, then compresses the folded remainder. Marker-free.
+- **`lossless`** — format-native folds only, with no markers and no retrieval. For a sidecar with no retrieval loop; a registered lossless provider still applies. Keep the mode stable within a `session_id`, because session mode replays earlier turns byte-for-byte.
 
 #### Response
 

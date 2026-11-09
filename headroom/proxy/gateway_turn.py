@@ -41,6 +41,7 @@ import dataclasses
 import json
 import logging
 import os
+import re
 import threading
 import time
 import uuid
@@ -50,6 +51,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from headroom.proxy.gateway_responses import VIEW_MARKER as GATEWAY_RESPONSES_VIEW_MARKER
+from headroom.proxy.gateway_responses import carries_view, is_responses_body
 from headroom.proxy.outcome import RequestOutcome
 from headroom.proxy.tool_schema_savings_policy import without_deferral_flags
 from headroom.proxy.turn_hooks import (
@@ -208,9 +210,65 @@ def _parse_request_headers(raw: Any) -> dict[str, str]:
 
 
 def provider_for_model(model_name: str) -> str:
-    """The tracker-provider inference ``/v1/compress`` already uses."""
+    """The provider a model name implies, for routing advice and event pricing."""
     lowered = (model_name or "").lower()
     return "anthropic" if ("claude" in lowered or "anthropic" in lowered) else "openai"
+
+
+_OPENAI_ONLY_ROLES = frozenset({"system", "developer", "tool", "function"})
+_OPENAI_ONLY_BLOCKS = frozenset({"image_url", "input_audio", "input_text"})
+_ANTHROPIC_ONLY_BLOCKS = frozenset(
+    {"tool_use", "tool_result", "thinking", "redacted_thinking", "server_tool_use", "document"}
+)
+
+
+# Anthropic's own tools (server tools such as ``web_search_20250305`` and
+# client tools such as ``bash_20250124``) carry a dated ``type`` and no
+# ``input_schema``; OpenAI chat tools are ``function`` or ``custom``.
+_ANTHROPIC_DATED_TOOL_TYPE = re.compile(r"_\d{8}$")
+
+
+def _wire_provider_from_shape(body: dict[str, Any]) -> str | None:
+    """The provider a body's shape proves, or None when only the model can tell."""
+    if carries_view(body) or is_responses_body(body):
+        return "openai"
+    if body.get("system") is not None:
+        return "anthropic"
+    tools = body.get("tools")
+    for tool in tools if isinstance(tools, list) else ():
+        if isinstance(tool, dict) and "input_schema" in tool:
+            return "anthropic"
+        tool_type = tool.get("type") if isinstance(tool, dict) else None
+        if isinstance(tool_type, str) and _ANTHROPIC_DATED_TOOL_TYPE.search(tool_type):
+            return "anthropic"
+        if isinstance(tool, dict) and "function" in tool:
+            return "openai"
+    messages = body.get("messages")
+    for message in messages if isinstance(messages, list) else ():
+        if not isinstance(message, dict):
+            continue
+        if message.get("role") in _OPENAI_ONLY_ROLES or message.get("tool_calls"):
+            return "openai"
+        content = message.get("content")
+        for block in content if isinstance(content, list) else ():
+            block_type = block.get("type") if isinstance(block, dict) else None
+            if not isinstance(block_type, str):
+                continue
+            if block_type in _ANTHROPIC_ONLY_BLOCKS or block_type.endswith("_tool_result"):
+                return "anthropic"
+            if block_type in _OPENAI_ONLY_BLOCKS:
+                return "openai"
+    return None
+
+
+def provider_for_body(body: dict[str, Any], model_name: str) -> str:
+    """The wire shape hooks and steering must treat a gateway body as.
+
+    A gateway can send any client's shape to any model: Claude Code's Anthropic
+    body to Gemini, an OpenAI chat body to Claude. The shape wins over the model
+    name; ``route.provider`` stays advice about the model.
+    """
+    return _wire_provider_from_shape(body) or provider_for_model(model_name)
 
 
 # --------------------------------------------------------------------------- #
@@ -560,9 +618,9 @@ class PendingTurn:
     ccr_armed: bool = False
     # The wire shape this turn arrived in, when it is not the one `provider`
     # implies: "openai_responses" for a Codex body. Deliberately separate from
-    # `provider`, which picks pricing, tokenizer and the upstream the gateway
-    # is advised to call -- all three want "openai" for a Responses turn while
-    # the tool-call shape and the re-drive body want "openai_responses".
+    # `provider`, the chat-level wire shape (see `provider_for_body`), which
+    # wants "openai" for a Responses turn while the tool-call shape and the
+    # re-drive body want "openai_responses".
     wire_shape: str | None = None
 
     @property
@@ -1113,7 +1171,6 @@ def build_provider_body(
     transcript the provider will reject.
     """
     from headroom.proxy.gateway_responses import apply_view as apply_responses_view
-    from headroom.proxy.gateway_responses import carries_view, is_responses_body
 
     out = {k: v for k, v in body.items() if k not in BODY_CONTROL_KEYS}
     if carries_view(body):
@@ -1175,7 +1232,6 @@ def gateway_response_fields(
     request: Any,
     body: dict[str, Any],
     caps: GatewayCapabilities,
-    provider: str,
     messages: list[dict[str, Any]],
     tools: Any,
     obligations: list[str],
@@ -1188,7 +1244,9 @@ def gateway_response_fields(
     return {
         "body": provider_body,
         "turn_id": turn_id,
-        "route": build_route(request, provider_body, provider),
+        "route": build_route(
+            request, provider_body, provider_for_model(str(provider_body.get("model") or ""))
+        ),
         "obligations": list(obligations),
         "gateway": caps.echo(),
         "headers": dict(headers or {}),
@@ -1468,7 +1526,7 @@ def _emit_response_received(proxy: Any, turn: PendingTurn, response: Any, status
             PipelineStage.RESPONSE_RECEIVED,
             operation="gateway.turn",
             request_id=(turn.outcome_draft.request_id if turn.outcome_draft else turn.turn_id),
-            provider=turn.provider,
+            provider=provider_for_model(turn.model),
             model=turn.model,
             response=response,
             metadata={

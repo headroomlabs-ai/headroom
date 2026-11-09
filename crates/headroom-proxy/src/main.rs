@@ -77,15 +77,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let mut state = AppState::new(config.clone())?;
 
     // PR-D1: resolve AWS credentials at startup via the `aws-config`
-    // default chain. Loaded once so per-request signing is cheap.
+    // default chain. The provider is kept and asked again before the
+    // cached credentials expire (`bedrock::credentials`).
     // Failure is NOT fatal — the proxy may run in front of a non-AWS
     // upstream — but the Bedrock invoke handler refuses to forward
     // unsigned requests when `bedrock_credentials` is `None`
     // (see `bedrock::invoke::handle_invoke`).
     if config.enable_bedrock_native {
         match load_bedrock_credentials(&config).await {
-            Ok(creds) => {
-                state = state.with_bedrock_credentials(creds);
+            Ok(source) => {
+                state = state.with_bedrock_credentials_source(source);
                 tracing::info!(
                     event = "bedrock_credentials_loaded",
                     region = %config.bedrock_region,
@@ -180,12 +181,13 @@ fn init_tracing(level: &str) {
 /// Uses the `aws-config` default chain (env vars → shared profile
 /// file → IMDS / ECS task role). Honours `Config::aws_profile` when
 /// set; otherwise the chain picks up `AWS_PROFILE` from the
-/// environment automatically.
+/// environment automatically. Resolves once here so a missing
+/// credential is reported at startup; the returned source keeps the
+/// provider for later refreshes.
 async fn load_bedrock_credentials(
     config: &Config,
-) -> Result<aws_credential_types::Credentials, Box<dyn std::error::Error + Send + Sync>> {
+) -> Result<headroom_proxy::bedrock::BedrockCredentials, Box<dyn std::error::Error + Send + Sync>> {
     use aws_config::BehaviorVersion;
-    use aws_credential_types::provider::ProvideCredentials;
 
     let mut loader = aws_config::defaults(BehaviorVersion::latest())
         .region(aws_config::Region::new(config.bedrock_region.clone()));
@@ -196,8 +198,9 @@ async fn load_bedrock_credentials(
     let creds_provider = aws_config
         .credentials_provider()
         .ok_or("no credentials provider configured")?;
-    let creds = creds_provider.provide_credentials().await?;
-    Ok(creds)
+    let source = headroom_proxy::bedrock::BedrockCredentials::new(creds_provider);
+    source.get().await?;
+    Ok(source)
 }
 
 async fn shutdown_signal() {
