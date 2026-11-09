@@ -54,6 +54,22 @@ def _legacy_aggregate(ttl: int) -> dict:
 
 
 class TestEstimateTtls:
+    @pytest.mark.parametrize(
+        ("hit_idles", "expiry_idles", "expected"),
+        [
+            ([300.1, 300.2, 300.4], [300.8, 301.4, 302.5], 301),
+            ([0.1, 0.2, 0.4], [0.8, 1.4, 2.5], 1),
+            ([120, 300, 480], [600, 900, 1200], 600),
+        ],
+    )
+    def test_whole_second_ttl_keeps_the_observed_upper_bound(
+        self, hit_idles, expiry_idles, expected
+    ):
+        estimate = estimate_ttls(_corpus(hit_idles, expiry_idles))["openai/gpt-5.5"]
+        assert estimate["ttl_seconds"] >= min(expiry_idles)
+        assert estimate["ttl_seconds"] > max(hit_idles)
+        assert estimate["ttl_seconds"] == expected
+
     def test_upper_bound_of_interval_is_emitted(self):
         # Alive at up to 480s, first observed death beyond that at 600s
         # -> TTL estimate is the safe upper end: 600.
@@ -186,6 +202,16 @@ class TestWriteLearned:
 
 
 class TestMain:
+    def test_fractional_upper_bound_survives_cli_and_resolver(self, paths):
+        obs, out = paths
+        rows = _corpus([300.1, 300.2, 300.4], [300.8, 301.4, 302.5])
+        obs.write_text("\n".join(json.dumps(row) for row in rows), encoding="utf-8")
+
+        assert main([]) == 0
+
+        assert json.loads(out.read_text())["openai/gpt-5.5"]["ttl_seconds"] == 301
+        assert resolve_learned_ttl("openai", "gpt-5.5") == 301
+
     @pytest.fixture()
     def paths(self, tmp_path, monkeypatch):
         obs = tmp_path / "obs.jsonl"

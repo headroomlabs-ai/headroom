@@ -130,7 +130,9 @@ def estimate_ttls(
         if not deaths_after_life:
             continue  # bounds overlap: no idle at which the cache is provably dead
         table[key] = {
-            "ttl_seconds": int(min(deaths_after_life)),
+            # Keep the upper bound when converting fractional idle gaps to
+            # whole seconds; truncation can put the TTL below an observed HIT.
+            "ttl_seconds": math.ceil(min(deaths_after_life)),
             "max_hit_idle": int(max_hit_idle),
             "hits": len(key_hits),
             "ttl_expiry_misses": len(key_expiries),
