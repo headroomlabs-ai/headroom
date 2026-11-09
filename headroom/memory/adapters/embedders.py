@@ -46,6 +46,9 @@ logging.getLogger("httpx").setLevel(logging.WARNING)
 
 logger = logging.getLogger(__name__)
 
+# MPS models are shared across instances, so encodes need one process-owned queue.
+_MPS_EMBED_EXECUTOR = ThreadPoolExecutor(max_workers=1, thread_name_prefix="mps-embed")
+
 
 # =============================================================================
 # Local (torch / sentence-transformers) CPU thread cap — issue #198
@@ -269,9 +272,7 @@ class LocalEmbedder:
         self._device: str | None = None
         self._dimension: int | None = None
         self._lock = asyncio.Lock()
-        # Dedicated single-worker executor, created only when the resolved device
-        # is MPS (see _load_model). torch-MPS is not thread-safe, so every encode()
-        # must run on one thread. Stays None for CPU/CUDA → default shared executor.
+        # CPU owns its executor; MPS shares a process-owned queue across instances.
         self._executor: ThreadPoolExecutor | None = None
 
     def _check_dependencies(self) -> None:
@@ -331,10 +332,9 @@ class LocalEmbedder:
 
         # torch-MPS is not thread-safe: concurrent encode() calls from the default
         # multi-worker executor abort with "commit an already committed command
-        # buffer" (verified). Funnel every encode through one worker thread when on
-        # MPS so calls serialize; other devices keep the shared default executor.
+        # buffer". Serialize across instances because the model registry shares models.
         if self._device == "mps" and self._executor is None:
-            self._executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="mps-embed")
+            self._executor = _MPS_EMBED_EXECUTOR
 
         # Use centralized registry for shared model instances
         self._model = MLModelRegistry.get_sentence_transformer(self._model_name, self._device)
@@ -470,13 +470,10 @@ class LocalEmbedder:
         return self.DEFAULT_MAX_TOKENS
 
     async def close(self) -> None:
-        """Close resources: shut down the MPS serialization executor and drop the
-        cached model reference so a later embed() fully re-initializes (and
-        re-creates the serialized executor) instead of encoding on a torn-down pool.
-        """
-        if self._executor is not None:
+        """Release this instance without shutting down the shared MPS queue."""
+        if self._executor is not None and self._executor is not _MPS_EMBED_EXECUTOR:
             self._executor.shutdown(wait=False)
-            self._executor = None
+        self._executor = None
         self._model = None
         self._query_tokenizer = None
 
