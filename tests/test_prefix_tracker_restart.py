@@ -646,3 +646,102 @@ def test_off_the_main_thread_no_handler_is_installed(tmp_path: Path) -> None:
     worker.join()
     assert errors == []
     assert signal.getsignal(signal.SIGTERM) is before
+
+
+def _lifespan_proxy() -> Any:
+    from headroom.proxy.server import HeadroomProxy
+
+    proxy = HeadroomProxy(
+        ProxyConfig(
+            optimize=False,
+            cache_enabled=False,
+            rate_limit_enabled=False,
+            cost_tracking_enabled=False,
+            code_aware_enabled=False,
+        )
+    )
+    proxy.anthropic_pipeline.transforms = []
+    proxy.openai_pipeline.transforms = []
+    return proxy
+
+
+@pytest.mark.usefixtures("_restore_exit_handlers")
+def test_repeated_proxy_lifespans_hand_the_signal_back(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A lifespan run without uvicorn (an embedding app, tests) has no
+    capture_signals to restore handlers, so shutdown must: after two lifespans
+    on separate loops, SIGTERM reaches the app's own handler, not a wrapper
+    bound to a closed loop."""
+    import asyncio
+    import signal
+
+    monkeypatch.setenv(PREFIX_STATE_FILE_ENV, str(tmp_path / "state.json"))
+    calls: list[int] = []
+
+    def app_handler(signum: int, frame: Any) -> None:
+        calls.append(signum)
+
+    signal.signal(signal.SIGTERM, app_handler)
+
+    async def lifespan() -> None:
+        proxy = _lifespan_proxy()
+        await proxy.startup()
+        assert signal.getsignal(signal.SIGTERM) is not app_handler
+        await proxy.shutdown()
+
+    asyncio.run(lifespan())
+    asyncio.run(lifespan())
+    assert signal.getsignal(signal.SIGTERM) is app_handler
+    signal.raise_signal(signal.SIGTERM)
+    assert calls == [signal.SIGTERM]
+
+
+@pytest.mark.usefixtures("_restore_exit_handlers")
+def test_a_wrapper_left_behind_after_its_loop_closed_passes_through(tmp_path: Path) -> None:
+    """Overlapping lifespans: the first one's undo cannot remove its wrapper
+    while the second wraps it. Once the first is shut down and its loop closed,
+    a signal still reaches the app handler and saves nothing."""
+    import asyncio
+    import signal
+
+    from headroom.proxy.server import _save_prefix_state_on_exit_signal
+
+    calls: list[Any] = []
+    signal.signal(signal.SIGTERM, lambda signum, frame: calls.append(("app", signum)))
+    first = asyncio.new_event_loop()
+    second = asyncio.new_event_loop()
+
+    async def install() -> Any:
+        return _save_prefix_state_on_exit_signal(_RecordingStore(calls), str(tmp_path / "s.json"))
+
+    undo_first = first.run_until_complete(install())
+    undo_second = second.run_until_complete(install())
+    undo_first()  # the second wrapper is current: leave it in place
+    first.close()
+    undo_second()  # restores the first wrapper, now inert
+    second.close()
+
+    signal.raise_signal(signal.SIGTERM)
+    assert calls == [("app", signal.SIGTERM)]
+
+
+@pytest.mark.usefixtures("_restore_exit_handlers")
+def test_undo_leaves_a_handler_installed_later_alone(tmp_path: Path) -> None:
+    import asyncio
+    import signal
+
+    from headroom.proxy.server import _save_prefix_state_on_exit_signal
+
+    signal.signal(signal.SIGTERM, lambda signum, frame: None)
+
+    def later(signum: int, frame: Any) -> None:
+        pass
+
+    async def serve() -> None:
+        undo = _save_prefix_state_on_exit_signal(_RecordingStore([]), str(tmp_path / "s.json"))
+        signal.signal(signal.SIGTERM, later)
+        undo()
+
+    asyncio.run(serve())
+    assert signal.getsignal(signal.SIGTERM) is later
