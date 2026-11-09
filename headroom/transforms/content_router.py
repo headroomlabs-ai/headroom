@@ -5499,6 +5499,10 @@ class ContentRouter(Transform):
                     self._code_compressor = CodeAwareCompressor(
                         CodeCompressorConfig(
                             enable_ccr=self.config.ccr_inject_marker,
+                            # The code compressor's Kompress fallback builds its
+                            # own KompressCompressor, so it must honour the same
+                            # switch as _get_kompress() (#4719).
+                            fallback_to_kompress=self.config.enable_kompress,
                         )
                     )
                 else:
