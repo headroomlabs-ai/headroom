@@ -5499,6 +5499,10 @@ class ContentRouter(Transform):
                     self._code_compressor = CodeAwareCompressor(
                         CodeCompressorConfig(
                             enable_ccr=self.config.ccr_inject_marker,
+                            # One switch covers both Kompress paths: the
+                            # router's own dispatch and code_aware's
+                            # unknown-language fallback (GH #4719).
+                            fallback_to_kompress=self.config.enable_kompress,
                         )
                     )
                 else:
