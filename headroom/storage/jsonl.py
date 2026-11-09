@@ -216,9 +216,17 @@ class JSONLStorage(Storage):
                     continue
                 try:
                     data = json.loads(line)
-                    yield self._dict_to_metrics(data)
                 except json.JSONDecodeError:
-                    # Skip malformed lines
+                    # Skip malformed lines. The journal is not rewritten.
+                    continue
+                if not isinstance(data, dict):
+                    continue
+                try:
+                    yield self._dict_to_metrics(data)
+                except (KeyError, TypeError, ValueError, AttributeError):
+                    # Skip syntactically valid rows that are not metric objects,
+                    # such as `{}` (no `id`). A later bad row must not hide an
+                    # earlier valid snapshot from get(), query(), or count().
                     continue
 
     def get_summary_stats(
