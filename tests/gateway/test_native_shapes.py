@@ -96,6 +96,7 @@ def test_a_gemini_body_comes_back_as_gemini_with_its_tool_output_folded(headroom
     data = _compress(headroom_client, sent)
     body = data["body"]
 
+    assert data["wire_shape"] == "gemini"
     assert "messages" not in body
     assert {k: v for k, v in body.items() if k != "contents"} == {
         k: v for k, v in sent.items() if k != "contents"
@@ -111,6 +112,7 @@ def test_a_converse_body_comes_back_as_converse_with_its_tool_output_folded(head
     data = _compress(headroom_client, sent)
     body = data["body"]
 
+    assert data["wire_shape"] == "converse"
     assert {k: v for k, v in body.items() if k != "messages"} == {
         k: v for k, v in sent.items() if k != "messages"
     }
@@ -145,6 +147,7 @@ def test_a_messages_body_is_not_mistaken_for_converse(headroom_client, messages)
     assert native_shape(sent) is None
     data = _compress(headroom_client, sent)
 
+    assert data["wire_shape"] == "messages"
     assert [m["role"] for m in data["body"]["messages"]] == [m["role"] for m in messages]
     assert data["messages"] == data["body"]["messages"]
 

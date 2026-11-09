@@ -1284,7 +1284,19 @@ def gateway_response_fields(
         "obligations": list(obligations),
         "gateway": caps.echo(),
         "headers": dict(headers or {}),
+        "wire_shape": wire_shape(body),
     }
+
+
+def wire_shape(body: dict[str, Any]) -> str:
+    """The request shape this turn read: ``gemini``, ``converse``,
+    ``openai_responses``, or ``messages`` (Chat Completions or Anthropic).
+
+    Echoed so a caller can tell an answer in its own shape from one by an
+    older Headroom that read the body as something else."""
+    if carries_view(body):
+        return "openai_responses"
+    return view_shape(body) or "messages"
 
 
 # --------------------------------------------------------------------------- #

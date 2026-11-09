@@ -847,6 +847,7 @@ The response keeps every field above and adds six:
 | `route` | Advisory. `provider` is inferred from the model name (`anthropic` for names containing `claude` or `anthropic`, else `openai`) unless a routing extension published advice; when it did, its model is also written into `body.model`, so `route.model` and `body.model` never disagree. `service_tier` echoes the request. Headroom never switches the upstream itself. |
 | `obligations` | `redrive` — a transform ran whose reload step needs the response; post `response` to `/v1/compress/response` and honour `redrive` answers. `relay_usage` — you offered `can_relay_response`; post status and usage when the provider answers. |
 | `gateway` | Echo of the capabilities Headroom honoured. |
+| `wire_shape` | The request shape Headroom read: `gemini`, `converse`, `openai_responses`, or `messages` (Chat Completions or Anthropic). `body` comes back in that shape. A caller that sent a native body and gets anything else, or no field (older Headroom), should forward its original body. |
 
 Fail-open answers (bypass header, empty `messages`, stateless timeout) carry the same six keys with your original body, `obligations: []` and `headers: {}`.
 
