@@ -6553,20 +6553,21 @@ def claude(
             # were checked above): every cloud mode off, base URL on the proxy.
             session_env = dict.fromkeys(_CLAUDE_CLOUD_MODE_ENVS, "0")
             session_env["ANTHROPIC_BASE_URL"] = proxy_url
+            # Anthropic mode needs a credential to start; the proxy ignores it
+            # and signs its Bedrock calls with the AWS credentials. The
+            # placeholder goes in the override too, or a settings file that
+            # cleared the credential would clear it as well; a shell key that
+            # file cleared must not reach Claude Code next to it.
+            if not any(key in _claude_env for key in CLAUDE_AUTH_KEYS):
+                for key in CLAUDE_AUTH_KEYS:
+                    env.pop(key, None)
+                session_env["ANTHROPIC_AUTH_TOKEN"] = "headroom-bedrock"
             env.update(session_env)
             claude_args = (
                 "--settings",
                 json.dumps({"env": session_env}),
                 *claude_args,
             )
-            # Anthropic mode needs a credential to start; the proxy ignores it
-            # and signs its Bedrock calls with the AWS credentials. With no
-            # effective credential, a shell key a settings file cleared must not
-            # reach Claude Code next to the placeholder.
-            if not any(key in _claude_env for key in CLAUDE_AUTH_KEYS):
-                for key in CLAUDE_AUTH_KEYS:
-                    env.pop(key, None)
-                env["ANTHROPIC_AUTH_TOKEN"] = "headroom-bedrock"
 
         # Recover an older crashed wrap even when new project settings writes
         # are disabled. The marker records the prior value to restore; without

@@ -12,6 +12,7 @@ from click.testing import CliRunner
 
 from headroom.cli import wrap as wrap_mod
 from headroom.cli.main import main
+from headroom.providers.claude.runtime import claude_effective_env
 from headroom.providers.registry import DEFAULT_VERTEX_API_URL
 
 
@@ -747,15 +748,28 @@ def _session_override(child_cmd: list[str]) -> dict[str, str]:
         return {}
 
 
-def _assert_routed_override(captured: dict) -> None:
+def _assert_routed_override(captured: dict, *, placeholder: bool) -> None:
     override = _session_override(captured["child_cmd"])
-    assert override == {
+    expected = {
         "CLAUDE_CODE_USE_BEDROCK": "0",
         "CLAUDE_CODE_USE_VERTEX": "0",
         "CLAUDE_CODE_USE_FOUNDRY": "0",
         "ANTHROPIC_BASE_URL": captured["child_env"]["ANTHROPIC_BASE_URL"],
     }
+    if placeholder:
+        expected["ANTHROPIC_AUTH_TOKEN"] = "headroom-bedrock"
+    assert override == expected
     assert override["ANTHROPIC_BASE_URL"].startswith("http://127.0.0.1:")
+
+
+def _claude_sees(captured: dict, user_env: dict[str, str]) -> dict[str, str]:
+    """The env Claude Code resolves: child env < user settings < --settings override."""
+    effective = claude_effective_env(
+        ("shell", captured["child_env"]),
+        ("user", user_env),
+        ("--settings", _session_override(captured["child_cmd"])),
+    )
+    return {key: value for key, (value, _source) in effective.items()}
 
 
 def test_wrap_claude_bedrock_from_shell_routes_through_the_bedrock_backend(
@@ -772,7 +786,7 @@ def test_wrap_claude_bedrock_from_shell_routes_through_the_bedrock_backend(
     assert child["CLAUDE_CODE_USE_BEDROCK"] == "0"
     assert child["ANTHROPIC_BASE_URL"].startswith("http://127.0.0.1:")
     assert child["ANTHROPIC_AUTH_TOKEN"]
-    _assert_routed_override(captured)
+    _assert_routed_override(captured, placeholder=True)
     assert len(captured["child_cmd"]) == 3
     assert "Bedrock mode" in output
 
@@ -797,7 +811,7 @@ def test_wrap_claude_bedrock_set_in_user_settings_is_overridden_for_the_session(
     assert captured["ensure_kwargs"]["backend"] == "bedrock"
     assert captured["ensure_kwargs"]["region"] == "us-west-2"
     assert captured["proxy_environ"]["AWS_PROFILE"] == "bedrock-sso"
-    _assert_routed_override(captured)
+    _assert_routed_override(captured, placeholder=False)
     # A credential is already configured; adding another would conflict.
     assert "ANTHROPIC_AUTH_TOKEN" not in captured["child_env"]
     assert "CLAUDE_CODE_USE_BEDROCK=true from" in output
@@ -936,24 +950,37 @@ def test_wrap_claude_bedrock_session_override_beats_every_lower_layer(
     captured, output = _invoke_wrap_claude(runner, monkeypatch, env=shell_env)
 
     assert captured["ensure_kwargs"]["backend"] == "bedrock"
-    _assert_routed_override(captured)
+    _assert_routed_override(captured, placeholder=True)
     assert captured["child_env"]["CLAUDE_CODE_USE_VERTEX"] == "0"
     assert captured["child_env"]["CLAUDE_CODE_USE_FOUNDRY"] == "0"
     assert "Bedrock mode" in output
 
 
-def test_wrap_claude_bedrock_shell_key_cleared_by_settings_is_not_sent_with_the_placeholder(
-    runner: CliRunner, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+@pytest.mark.parametrize(
+    ("shell_env", "cleared"),
+    [
+        ({"ANTHROPIC_API_KEY": "sk-ant-shell"}, {"ANTHROPIC_API_KEY": ""}),
+        ({"ANTHROPIC_AUTH_TOKEN": "shell-token"}, {"ANTHROPIC_AUTH_TOKEN": ""}),
+        (
+            {"ANTHROPIC_API_KEY": "sk-ant-shell"},
+            {"ANTHROPIC_API_KEY": "", "ANTHROPIC_AUTH_TOKEN": ""},
+        ),
+    ],
+    ids=["api_key_cleared", "auth_token_cleared", "both_keys_cleared"],
+)
+def test_wrap_claude_bedrock_credential_cleared_by_settings_still_gets_the_placeholder(
+    runner: CliRunner,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    shell_env: dict[str, str],
+    cleared: dict[str, str],
 ) -> None:
-    _bedrock_settings(
-        monkeypatch,
-        tmp_path,
-        user_env={"CLAUDE_CODE_USE_BEDROCK": "1", "ANTHROPIC_API_KEY": ""},
-    )
-    captured, _output = _invoke_wrap_claude(
-        runner, monkeypatch, env={"ANTHROPIC_API_KEY": "sk-ant-shell"}
-    )
+    user_env = {"CLAUDE_CODE_USE_BEDROCK": "1", **cleared}
+    _bedrock_settings(monkeypatch, tmp_path, user_env=user_env)
+    captured, _output = _invoke_wrap_claude(runner, monkeypatch, env=shell_env)
 
-    child = captured["child_env"]
-    assert "ANTHROPIC_API_KEY" not in child
-    assert child["ANTHROPIC_AUTH_TOKEN"] == "headroom-bedrock"
+    sees = _claude_sees(captured, user_env)
+    assert sees["ANTHROPIC_AUTH_TOKEN"] == "headroom-bedrock"
+    assert "ANTHROPIC_API_KEY" not in sees
+    assert "ANTHROPIC_API_KEY" not in captured["child_env"]
+    _assert_routed_override(captured, placeholder=True)
