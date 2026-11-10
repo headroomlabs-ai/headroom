@@ -645,7 +645,7 @@ Keep carrying both yourself and send them upstream unchanged. Two consequences w
 | `session_id` | string | unset | Opt into [session mode](#session-mode): Headroom keeps this conversation's replay state itself, so you can resend the raw conversation every turn and get a byte-identical prefix back. Non-empty, at most 256 characters; anything else is a `400`. Cannot be combined with `compress_user_messages` (`400`). |
 | `compress_user_messages` | boolean | `false` | Also compress user-role messages. |
 | `target_ratio` | number | unset | Target compression ratio. |
-| `protect_recent` | integer | unset | Leave the last N messages uncompressed. |
+| `protect_recent` | integer | unset | Leave recent code uncompressed in the last N messages (non-code tool payloads are not shielded). |
 | `protect_analysis_context` | boolean | unset | Preserve analysis context blocks. |
 
 **`config.mode` values:**
