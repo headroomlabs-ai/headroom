@@ -196,6 +196,54 @@ def test_priced_lifetime_recovers_missing_audits_independently_after_restart(tmp
     assert recovered_tool["compression_savings_usd"] == pytest.approx(0.012)
 
 
+def test_tool_only_checkpoint_recovers_prices_through_flush_and_restart(tmp_path):
+    hour = datetime.now(timezone.utc).replace(minute=0, second=0, microsecond=0)
+    hour -= timedelta(hours=2)
+    path = tmp_path / "savings.json"
+    tracker = SavingsTracker(path=str(path))
+    tracker.record_request(
+        model="sample-model",
+        input_tokens=1000,
+        tokens_saved=100,
+        tool_search_saved=10,
+        estimated_savings_usd={
+            "compression": 0.01,
+            "tool_schema": 0.002,
+            "basis": BASIS_CATALOG,
+        },
+        timestamp=hour,
+    )
+    tracker.flush()
+    older_lifetime = json.loads(path.read_text(encoding="utf-8"))["lifetime"]
+
+    tracker.record_request(
+        model="sample-model",
+        input_tokens=1000,
+        tokens_saved=0,
+        tool_search_saved=10,
+        estimated_savings_usd={
+            "compression": 0.0,
+            "tool_schema": 0.002,
+            "basis": BASIS_CATALOG,
+        },
+        timestamp=hour + timedelta(hours=1),
+    )
+    tracker.flush()
+    state = json.loads(path.read_text(encoding="utf-8"))
+    state["lifetime"] = older_lifetime
+    path.write_text(json.dumps(state), encoding="utf-8", newline="\n")
+
+    for restart in range(2):
+        recovered = SavingsTracker(path=str(path))
+        lifetime = recovered.snapshot()["lifetime"]
+        assert lifetime["tokens_saved"] == 100
+        assert lifetime["tool_tokens_saved"] == 20
+        assert lifetime["compression_savings_usd"] == pytest.approx(0.014)
+        assert lifetime["tool_schema_savings_usd"] == pytest.approx(0.004)
+        if restart == 0:
+            recovered.flush()
+
+
 def test_durable_lifetime_cost_does_not_mix_unversioned_and_new_prices(tmp_path):
     state = _legacy_state()
     state["lifetime_metrics"] = {

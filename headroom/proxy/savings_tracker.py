@@ -226,7 +226,9 @@ def _coerce_float(value: Any, default: float = 0.0) -> float:
 def _recover_component(lifetime_raw: Any, last: dict[str, Any], key: str) -> float:
     """Prefer authoritative lifetime prices; otherwise recover the checkpoint."""
     raw = lifetime_raw if isinstance(lifetime_raw, dict) else {}
-    if _coerce_int(last.get("total_tokens_saved")) > _coerce_int(raw.get("tokens_saved")):
+    if _coerce_int(last.get("total_tokens_saved")) > _coerce_int(
+        raw.get("tokens_saved")
+    ) or _coerce_int(last.get("tool_tokens_saved")) > _coerce_int(raw.get("tool_tokens_saved")):
         return _coerce_signed_float(last.get(key))
     current = raw.get("pricing_basis") == PRICING_BASIS
     if key.startswith("legacy_"):
