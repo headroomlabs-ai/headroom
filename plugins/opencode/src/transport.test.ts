@@ -1,9 +1,11 @@
-import childProcess from "node:child_process";
+import childProcess, { type ChildProcess } from "node:child_process";
 import fs from "node:fs";
 import http from "node:http";
 import http2 from "node:http2";
 import https from "node:https";
-import { afterEach, describe, expect, it, vi } from "vitest";
+import os from "node:os";
+import path from "node:path";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { installHeadroomTransport, uninstallHeadroomTransport } from "./transport.js";
 
@@ -1109,5 +1111,140 @@ describe("Headroom OpenCode transport", () => {
 
     firstDispose();
     globalThis.fetch = originalFetch;
+  });
+
+  describe("child_process wrappers with omitted or null args/options slots", () => {
+    // Real children, not mocks: the bug is that Node reads the injected env
+    // object from the wrong parameter, so only a real call shows it. The shim
+    // preload is switched off because the checkout has no dist/ for it to load.
+    function probeScript(): { dir: string; script: string; run: string } {
+      const dir = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "headroom-cp-")));
+      const script = path.join(dir, "probe.cjs");
+      fs.writeFileSync(
+        script,
+        "process.stdout.write(JSON.stringify({cwd: process.cwd(), proxy: process.env.HEADROOM_OPENCODE_TRANSPORT_PROXY_URL}));",
+      );
+      return { dir, script, run: `"${process.execPath}" "${script}"` };
+    }
+
+    function collect(child: ChildProcess): Promise<{ cwd: string; proxy?: string }> {
+      return new Promise((resolve, reject) => {
+        const timer = setTimeout(() => reject(new Error("child did not finish")), 5000);
+        let out = "";
+        child.stdout?.on("data", (chunk) => {
+          out += chunk;
+        });
+        child.on("error", (err) => {
+          clearTimeout(timer);
+          reject(err);
+        });
+        child.on("close", () => {
+          clearTimeout(timer);
+          try {
+            resolve(JSON.parse(out));
+          } catch {
+            reject(new Error(`child printed ${JSON.stringify(out)}`));
+          }
+        });
+      });
+    }
+
+    function viaCallback(
+      call: (cb: (err: Error | null, stdout: string | Buffer) => void) => unknown,
+    ): Promise<{ cwd: string; proxy?: string }> {
+      return new Promise((resolve, reject) => {
+        const timer = setTimeout(() => reject(new Error("callback was never called")), 3000);
+        call((err, stdout) => {
+          clearTimeout(timer);
+          if (err) reject(err);
+          else resolve(JSON.parse(String(stdout)));
+        });
+      });
+    }
+
+    const cp = childProcess as unknown as Record<string, (...args: unknown[]) => any>;
+
+    // Earlier tests in this file can leave a mock behind in child_process, so
+    // start from the functions Node loaded.
+    const real = {
+      spawn: childProcess.spawn,
+      exec: childProcess.exec,
+      execFile: childProcess.execFile,
+      fork: childProcess.fork,
+    };
+    beforeEach(() => {
+      Object.assign(childProcess, real);
+    });
+
+    function install(): void {
+      vi.spyOn(fs, "existsSync").mockReturnValue(false);
+      installHeadroomTransport({ proxyUrl: "http://127.0.0.1:8787/v1" });
+    }
+
+    const plainShapes: Array<[string, (p: { dir: string; script: string; run: string }) => Promise<{ cwd: string }>]> = [
+      ["spawn(file, [args], { cwd })", (p) => collect(cp.spawn(process.execPath, [p.script], { cwd: p.dir }))],
+      ["spawn(cmd, { cwd, shell })", (p) => collect(cp.spawn(p.run, { cwd: p.dir, shell: true }))],
+      ["exec(cmd, { cwd }, cb)", (p) => viaCallback((cb) => cp.exec(p.run, { cwd: p.dir }, cb))],
+      ["exec(cmd, cb)", (p) => viaCallback((cb) => cp.exec(p.run, cb)).then((r) => ({ ...r, cwd: p.dir }))],
+      ["execFile(file, [args], { cwd }, cb)", (p) => viaCallback((cb) => cp.execFile(process.execPath, [p.script], { cwd: p.dir }, cb))],
+      ["execFile(file, [args], cb)", (p) => viaCallback((cb) => cp.execFile(process.execPath, [p.script], cb)).then((r) => ({ ...r, cwd: p.dir }))],
+      ["fork(module, [args], { cwd })", (p) => collect(cp.fork(p.script, [], { cwd: p.dir, silent: true }))],
+      ["fork(module, { cwd })", (p) => collect(cp.fork(p.script, { cwd: p.dir, silent: true }))],
+    ];
+
+    it.each(plainShapes)("plain shape %s is unchanged", async (_name, call) => {
+      const probe = probeScript();
+      install();
+      const seen = await call(probe);
+      expect(seen.cwd).toBe(probe.dir);
+    });
+
+    it.each([undefined, null])("spawn(cmd, %s, { cwd }) keeps cwd and still injects the env", async (args) => {
+      const { dir, run } = probeScript();
+      install();
+      const seen = await collect(cp.spawn(run, args, { cwd: dir, shell: true }));
+      expect(seen.cwd).toBe(dir);
+      expect(seen.proxy).toBe("http://127.0.0.1:8787/v1");
+    });
+
+    it.each([undefined, null])("fork(module, %s, { cwd }) keeps cwd and still injects the env", async (args) => {
+      const { dir, script } = probeScript();
+      install();
+      const seen = await collect(cp.fork(script, args, { cwd: dir, silent: true }));
+      expect(seen.cwd).toBe(dir);
+      expect(seen.proxy).toBe("http://127.0.0.1:8787/v1");
+    });
+
+    it.each([undefined, null])("exec(cmd, %s, callback) still calls the callback", async (options) => {
+      const { run } = probeScript();
+      install();
+      const seen = await viaCallback((cb) => cp.exec(run, options, cb));
+      expect(seen.proxy).toBe("http://127.0.0.1:8787/v1");
+    });
+
+    it.each([undefined, null])("execFile(file, args, %s, callback) still calls the callback", async (options) => {
+      const { script } = probeScript();
+      install();
+      const seen = await viaCallback((cb) => cp.execFile(process.execPath, [script], options, cb));
+      expect(seen.proxy).toBe("http://127.0.0.1:8787/v1");
+    });
+
+    it("execFile(file, null, callback) and execFile(file, callback) still call the callback", async () => {
+      install();
+      for (const call of [
+        (cb: any) => cp.execFile(process.execPath, null, cb),
+        (cb: any) => cp.execFile(process.execPath, cb),
+      ]) {
+        // no script: node starts, reads the closed stdin and exits; only the callback matters
+        await new Promise<void>((resolve, reject) => {
+          const timer = setTimeout(() => reject(new Error("callback was never called")), 3000);
+          const child = call(() => {
+            clearTimeout(timer);
+            resolve();
+          });
+          child.stdin?.end();
+        });
+      }
+    });
   });
 });
