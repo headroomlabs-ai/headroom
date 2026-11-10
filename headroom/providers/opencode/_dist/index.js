@@ -20400,15 +20400,26 @@ function resolveConfiguredWireRoots(client, onResolved) {
   if (!client?.config?.get && !client?.provider?.list) {
     return;
   }
-  const settled = [client.config?.get?.(), client.provider?.list?.()];
-  void Promise.allSettled(settled).then(([configResult, providerResult]) => {
-    const config2 = configResult?.status === "fulfilled" ? configResult.value : void 0;
-    const providers = providerResult?.status === "fulfilled" ? providerResult.value : void 0;
-    onResolved(
-      collectBaseUrls(config2?.data ?? config2, providers?.data ?? providers)
-    );
-  }).catch(() => {
-  });
+  const apply = (read, pick2) => {
+    if (!read) {
+      return;
+    }
+    void Promise.resolve().then(read).then((value) => {
+      const urls = pick2(value);
+      if (urls.length > 0) {
+        onResolved(urls);
+      }
+    }).catch(() => {
+    });
+  };
+  apply(
+    client.config?.get?.bind(client.config),
+    (config2) => collectBaseUrls(config2?.data ?? config2, void 0)
+  );
+  apply(
+    client.provider?.list?.bind(client.provider),
+    (providers) => collectBaseUrls(void 0, providers?.data ?? providers)
+  );
 }
 function normalizeProxyUrl2(url2) {
   return trimTrailingSlashes(url2);

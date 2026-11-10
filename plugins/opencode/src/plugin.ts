@@ -70,6 +70,11 @@ function collectBaseUrls(config: unknown, providers: unknown): string[] {
 // loading it, and a server that is not serving yet must not disable routing.
 // So install first with whatever is known, then widen the rule when the answer
 // arrives. Requests that land in between fall back to the path heuristics.
+//
+// Each endpoint is applied on its own: keeping a base back because the other
+// request is still pending would leave a configured wire bypassing Headroom for
+// as long as that request stalls (#4747 review). A failed or missing read only
+// costs its own bases, never the other's.
 function resolveConfiguredWireRoots(
   client: { config?: { get?: () => Promise<unknown> }; provider?: { list?: () => Promise<unknown> } } | undefined,
   onResolved: (urls: string[]) => void,
@@ -77,18 +82,32 @@ function resolveConfiguredWireRoots(
   if (!client?.config?.get && !client?.provider?.list) {
     return;
   }
-  const settled = [client.config?.get?.(), client.provider?.list?.()];
-  void Promise.allSettled(settled)
-    .then(([configResult, providerResult]) => {
-      const config = configResult?.status === "fulfilled" ? configResult.value : undefined;
-      const providers = providerResult?.status === "fulfilled" ? providerResult.value : undefined;
-      onResolved(
-        collectBaseUrls((config as { data?: unknown })?.data ?? config, (providers as { data?: unknown })?.data ?? providers),
-      );
-    })
-    .catch(() => {
-      // Routing stays on the path heuristics; not worth failing a session for.
-    });
+
+  const apply = (read: (() => Promise<unknown>) | undefined, pick: (value: unknown) => string[]) => {
+    if (!read) {
+      return;
+    }
+    // Promise.resolve() turns a synchronous throw into a rejection, and the
+    // catch keeps a failing read on the path heuristics instead of surfacing.
+    void Promise.resolve()
+      .then(read)
+      .then((value) => {
+        const urls = pick(value);
+        if (urls.length > 0) {
+          onResolved(urls);
+        }
+      })
+      .catch(() => {
+        // Routing stays on the path heuristics; not worth failing a session for.
+      });
+  };
+
+  apply(client.config?.get?.bind(client.config), (config) =>
+    collectBaseUrls((config as { data?: unknown })?.data ?? config, undefined),
+  );
+  apply(client.provider?.list?.bind(client.provider), (providers) =>
+    collectBaseUrls(undefined, (providers as { data?: unknown })?.data ?? providers),
+  );
 }
 
 function normalizeProxyUrl(url: string): string {
