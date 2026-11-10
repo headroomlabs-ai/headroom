@@ -78,8 +78,13 @@ import httpx
 
 from headroom.agent_savings import proxy_pipeline_kwargs
 from headroom.ccr.marker_resolution import resolve_markers_in_response
-from headroom.ccr.tool_calls import has_ccr_retrieve_tool
-from headroom.config import ReadLifecycleConfig, is_tool_excluded, unwrap_tool_call_name
+from headroom.ccr.tool_calls import has_ccr_retrieve_tool, is_ccr_retrieval_call
+from headroom.config import (
+    CCR_RETRIEVAL_TOOL_NAMES,
+    ReadLifecycleConfig,
+    is_tool_excluded,
+    unwrap_tool_call_name,
+)
 from headroom.copilot_auth import (
     apply_copilot_api_auth,
     build_copilot_upstream_url,
@@ -2417,6 +2422,7 @@ class OpenAIHandlerMixin:
         timing: dict[str, float] | None = None,
         deadline_started_at: float | None = None,
         tool_names_by_call_id: dict[str, str] | None = None,
+        ccr_retrieval_call_ids: frozenset[str] = frozenset(),
     ) -> tuple[dict[str, Any], bool, int, list[str], dict[str, int], list[str], int]:
         """Run ContentRouter on OpenAI Responses text units.
 
@@ -2539,6 +2545,7 @@ class OpenAIHandlerMixin:
                         return True
             return False
 
+        headroom_retrieve_call_ids = set(ccr_retrieval_call_ids)
         # Map each Responses tool call to its name so that outputs belonging to
         # excluded tools (HEADROOM_EXCLUDE_TOOLS) can be protected from
         # compression. The chat/Anthropic paths get this via
@@ -2560,13 +2567,18 @@ class OpenAIHandlerMixin:
                 name = unwrap_tool_call_name(name, item.get("arguments") or item.get("input"))
             if isinstance(name, str) and isinstance(call_id, str) and call_id:
                 function_name_by_call_id[call_id] = name
+            if is_ccr_retrieval_call(item):
+                if isinstance(call_id, str) and call_id:
+                    headroom_retrieve_call_ids.add(call_id)
         # Continuations may contain outputs only; observed WS names retain the
         # same unconditional retrieval guard as calls present in this payload.
-        headroom_retrieve_call_ids = {
-            call_id
-            for call_id, name in function_name_by_call_id.items()
-            if is_tool_excluded(name, ("headroom_retrieve",))
-        }
+        headroom_retrieve_call_ids.update(
+            {
+                call_id
+                for call_id, name in function_name_by_call_id.items()
+                if is_tool_excluded(name, CCR_RETRIEVAL_TOOL_NAMES)
+            }
+        )
 
         # Resolve the effective exclude set once (None -> built-in defaults),
         # mirroring ContentRouter's policy. exclude_tools already contains both
@@ -3092,6 +3104,7 @@ class OpenAIHandlerMixin:
         savings_tags: dict[str, Any] | None = None,
         deadline_started_at: float | None = None,
         tool_names_by_call_id: dict[str, str] | None = None,
+        ccr_retrieval_call_ids: frozenset[str] = frozenset(),
     ) -> tuple[dict[str, Any], bool, int, list[str], str | None, int, int, int]:
         """Compress an OpenAI Responses payload through the shared router.
 
@@ -3326,6 +3339,7 @@ class OpenAIHandlerMixin:
             timing=timing_sink,
             deadline_started_at=deadline_started_at,
             tool_names_by_call_id=tool_names_by_call_id,
+            ccr_retrieval_call_ids=ccr_retrieval_call_ids,
         )
         _add_timing("compression_live_units_total", live_units_started)
         if router_modified:
@@ -3394,6 +3408,7 @@ class OpenAIHandlerMixin:
         client: str | None = None,
         savings_tags: dict[str, Any] | None = None,
         tool_names_by_call_id: dict[str, str] | None = None,
+        ccr_retrieval_call_ids: frozenset[str] = frozenset(),
     ) -> tuple[dict[str, Any], bool, int, list[str], str | None, int, int, int, dict[str, float]]:
         timing: dict[str, float] = {}
 
@@ -3445,6 +3460,8 @@ class OpenAIHandlerMixin:
                 compression_kwargs["savings_tags"] = savings_tags
             if tool_names_by_call_id:
                 compression_kwargs["tool_names_by_call_id"] = tool_names_by_call_id
+            if ccr_retrieval_call_ids:
+                compression_kwargs["ccr_retrieval_call_ids"] = ccr_retrieval_call_ids
             while True:
                 try:
                     result = self._compress_openai_responses_payload(
@@ -8343,10 +8360,10 @@ class OpenAIHandlerMixin:
                 name = item.get("name")
                 if not isinstance(call_id, str) or not call_id or not isinstance(name, str):
                     return
-                from headroom.config import is_tool_excluded, unwrap_tool_call_name
+                from headroom.config import unwrap_tool_call_name
 
                 name = unwrap_tool_call_name(name, item.get("arguments") or item.get("input"))
-                if not is_tool_excluded(name, ("headroom_retrieve",)):
+                if not is_ccr_retrieval_call(item):
                     ws_tool_names_by_call_id.pop(call_id, None)
                     return
                 if (
@@ -8430,6 +8447,19 @@ class OpenAIHandlerMixin:
             # the full history; reconnect replays it wholesale) is not counted
             # as new evidence. Seeded from the first frame as a baseline.
             ws_learner_seen_call_ids: set[str] = set()
+
+            def _remember_ccr_retrievals(items: Any) -> None:
+                if isinstance(items, list):
+                    for item in items:
+                        _remember_ws_tool_call(item)
+
+            if first_frame_is_create:
+                _ws_first_inner = (
+                    body["response"] if isinstance(body.get("response"), dict) else body
+                )
+                _remember_ccr_retrievals(
+                    _ws_first_inner.get("input") or _ws_first_inner.get("messages")
+                )
             ws_client_frames_total = 1
             ws_upstream_frames_total = 0
             ws_cancel_frames = 0
@@ -8971,6 +9001,7 @@ class OpenAIHandlerMixin:
                                 else COMPRESSION_TIMEOUT_SECONDS,
                                 client=client,
                                 savings_tags=_frame_savings,
+                                ccr_retrieval_call_ids=frozenset(ws_tool_names_by_call_id),
                             )
                             for _timing_name, _timing_ms in _ws_compression_timing.items():
                                 _record_ws_compression_timing(_timing_name, _timing_ms)
@@ -9289,6 +9320,9 @@ class OpenAIHandlerMixin:
                                 frame_type="response.create",
                             )
                             return raw_msg, False, "invalid_inner_payload"
+                        _remember_ccr_retrievals(
+                            inner_payload.get("input") or inner_payload.get("messages")
+                        )
                         # Learn from this turn's newly appended tool results.
                         # Dedup against the per-connection baseline so the
                         # replayed transcript prefix is not re-counted.
@@ -9376,6 +9410,7 @@ class OpenAIHandlerMixin:
                                     client=client,
                                     savings_tags=frame_savings,
                                     tool_names_by_call_id=dict(ws_tool_names_by_call_id),
+                                    ccr_retrieval_call_ids=frozenset(ws_tool_names_by_call_id),
                                 )
                                 for _timing_name, _timing_ms in frame_compression_timing.items():
                                     _record_ws_compression_timing(_timing_name, _timing_ms)
@@ -10036,6 +10071,10 @@ class OpenAIHandlerMixin:
                                 if event_type == "response.output_item.done":
                                     _remember_ws_tool_call(event.get("item"))
                                 response = event.get("response")
+                                if event_type == "response.completed" and isinstance(
+                                    response, dict
+                                ):
+                                    _remember_ccr_retrievals(response.get("output"))
                                 completed_response_model = (
                                     str(response.get("model") or "unknown")
                                     if isinstance(response, dict)

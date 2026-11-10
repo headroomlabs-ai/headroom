@@ -633,6 +633,94 @@ async def test_ws_output_shaper_stratum_uses_frame_input_tokens(monkeypatch):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("wrapped", [False, True])
+@pytest.mark.parametrize("call_source", ["history", "output_item", "completed"])
+async def test_ws_delta_multiple_retrieval_outputs_stay_verbatim(monkeypatch, wrapped, call_source):
+    from headroom.transforms.content_router import ContentRouter, ContentRouterConfig
+
+    handler = _DummyOpenAIHandler()
+    handler.config.optimize = True
+    handler.openai_pipeline = SimpleNamespace(
+        transforms=[
+            ContentRouter(ContentRouterConfig(min_section_tokens=10, exclude_tools=frozenset()))
+        ]
+    )
+    call = (
+        {
+            "type": "custom_tool_call",
+            "call_id": "call_multiple",
+            "name": "exec",
+            "input": 'text(await tools.mcp__headroom__headroom_retrieve_multiple({hashes: ["a", "b"]}));',
+        }
+        if wrapped
+        else {
+            "type": "function_call",
+            "call_id": "call_multiple",
+            "name": "mcp__headroom__headroom_retrieve_multiple",
+            "arguments": '{"hashes": ["a", "b"]}',
+        }
+    )
+
+    original = json.dumps([{"id": i, "value": "x" * 40} for i in range(100)], indent=2)
+    output = {
+        "type": "custom_tool_call_output" if wrapped else "function_call_output",
+        "call_id": "call_multiple",
+        "output": original,
+    }
+    first = {
+        "type": "response.create",
+        "response": {"model": "gpt-5.4", "input": [call, output]},
+    }
+    delta = {
+        "type": "response.create",
+        "response": {
+            "model": "gpt-5.4",
+            "previous_response_id": "r_1",
+            "input": [output, {**output, "call_id": "ordinary"}],
+        },
+    }
+    events = []
+    if call_source != "history":
+        first["response"]["input"] = "Retrieve the originals"
+        event = (
+            {"type": "response.output_item.done", "item": call}
+            if call_source == "output_item"
+            else {"type": "response.completed", "response": {"id": "r_1", "output": [call]}}
+        )
+        events.append(json.dumps(event))
+    upstream = _FakeUpstream(events, hold_after_events=True)
+    client_ws = _FakeWebSocket(frames=[json.dumps(frame) for frame in (first, delta, delta)])
+    if events:
+        call_delivered = asyncio.Event()
+        receive = client_ws.receive_text
+        send = client_ws.send_text
+        received = 0
+
+        async def receive_after_call():
+            nonlocal received
+            if received:
+                await call_delivered.wait()
+            received += 1
+            return await receive()
+
+        async def send_call(text):
+            await send(text)
+            call_delivered.set()
+
+        monkeypatch.setattr(client_ws, "receive_text", receive_after_call)
+        monkeypatch.setattr(client_ws, "send_text", send_call)
+
+    with patch.dict(sys.modules, {"websockets": _make_fake_websockets_module(upstream)}):
+        await asyncio.wait_for(handler.handle_openai_responses_ws(client_ws), timeout=2.0)
+
+    assert len(upstream.sent) == 3
+    assert json.loads(upstream.sent[0])["response"] == first["response"]
+    forwarded = [json.loads(frame)["response"] for frame in upstream.sent[1:]]
+    assert all(frame["input"][0]["output"] == original for frame in forwarded)
+    assert all(frame["input"][1]["output"] != original for frame in forwarded)
+
+
+@pytest.mark.asyncio
 async def test_ws_output_shaper_respects_bypass(monkeypatch):
     monkeypatch.setenv("HEADROOM_OUTPUT_SHAPER", "1")
     upstream_events = [

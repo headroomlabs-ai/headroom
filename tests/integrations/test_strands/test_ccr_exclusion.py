@@ -66,6 +66,9 @@ def test_qualified_ccr_result_is_preserved_through_the_registered_hook(
         "mcp__headroom__headroom_retrieve",
         "mcp_headroom_headroom_retrieve",
         "headroom_retrieve",
+        "headroom_retrieve_multiple",
+        "mcp__headroom__headroom_retrieve_multiple",
+        "headroom_headroom_retrieve_multiple",
     ],
 )
 def test_qualified_ccr_tool_result_is_preserved(

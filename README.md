@@ -654,6 +654,27 @@ The Rust core's downloads use rustls with Mozilla's roots and are unaffected by
 
 </details>
 
+## MCP examples
+
+Run these examples from the repository root:
+
+```bash
+# Run the full agent evaluation (requires OPENAI_API_KEY)
+export OPENAI_API_KEY='your-key-here'
+PYTHONPATH=. python -m examples.mcp_demo.run_agent_eval
+
+# Compress and batch-retrieve through the real MCP server (requires [mcp], no API key)
+HEADROOM_OFFLINE=1 PYTHONPATH=. python -m examples.mcp_demo.retrieve_multiple
+```
+
+| Script | Purpose |
+|--------|---------|
+| `show_compression.py` | Compresses mock MCP tool results (Slack search, database queries, GitHub issues, log analysis) via `compress_tool_result_with_metrics` and prints before/after sizes. |
+| `show_before_after.py` | Prints the minimal code diff needed to add Headroom compression to MCP tool outputs in your host application. |
+| `retrieve_multiple.py` | Starts the real stdio MCP server, compresses two outputs, then verifies batch retrieval with ordering, duplicates, and a missing hash. |
+| `run_agent_eval.py` | Simulates an agent with multiple MCP tools and tests whether compression preserves the information needed to answer correctly. Deterministic test-data generators keep the eval reproducible. |
+| `mock_mcp_servers.py` | Test-data generators simulating real MCP server outputs. |
+
 ## headroom learn
 
 <div align="center">

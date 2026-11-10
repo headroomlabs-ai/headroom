@@ -22,14 +22,14 @@ def _big_content() -> str:
     return json.dumps([{"id": i, "value": "x" * 20} for i in range(60)])
 
 
-def _apply_for_tool(tool_name: str):
+def _apply_for_tool(tool_name: str, arguments: str = "{}"):
     messages = [
         {
             "role": "assistant",
             "tool_calls": [
                 {
                     "id": "call_1",
-                    "function": {"name": tool_name, "arguments": "{}"},
+                    "function": {"name": tool_name, "arguments": arguments},
                 }
             ],
         },
@@ -44,7 +44,13 @@ def _apply_for_tool(tool_name: str):
 
 @pytest.mark.parametrize(
     "tool_name",
-    ["mcp__Headroom__headroom_retrieve", "mcp_Headroom_headroom_retrieve"],
+    [
+        "mcp__Headroom__headroom_retrieve",
+        "mcp_Headroom_headroom_retrieve",
+        "headroom_retrieve_multiple",
+        "mcp__Headroom__headroom_retrieve_multiple",
+        "headroom_headroom_retrieve_multiple",
+    ],
 )
 def test_qualified_ccr_retrieval_result_is_preserved(tool_name: str) -> None:
     original, result = _apply_for_tool(tool_name)
@@ -65,13 +71,23 @@ def test_bare_ccr_tool_name_remains_preserved() -> None:
     assert result.messages[1]["content"] == original
 
 
-def _apply_anthropic_for_tool(tool_name: str):
+@pytest.mark.parametrize("tool_name", ["headroom_retrieve", "headroom_retrieve_multiple"])
+def test_deferred_ccr_retrieval_result_is_preserved(tool_name: str) -> None:
+    original, result = _apply_for_tool(
+        "tool_call", json.dumps({"name": tool_name, "arguments": {}})
+    )
+
+    assert result.messages[1]["content"] == original
+    assert not result.transforms_applied
+
+
+def _apply_anthropic_for_tool(tool_name: str, tool_input: dict | None = None):
     """Anthropic block shape: tool_use in the assistant turn, tool_result in the user turn."""
     messages = [
         {
             "role": "assistant",
             "content": [
-                {"type": "tool_use", "id": "tu_1", "name": tool_name, "input": {}},
+                {"type": "tool_use", "id": "tu_1", "name": tool_name, "input": tool_input or {}},
             ],
         },
         {
@@ -94,6 +110,9 @@ def _apply_anthropic_for_tool(tool_name: str):
         "mcp__Headroom__headroom_retrieve",
         "mcp_Headroom_headroom_retrieve",
         CCR_TOOL_NAME,
+        "headroom_retrieve_multiple",
+        "mcp__Headroom__headroom_retrieve_multiple",
+        "headroom_headroom_retrieve_multiple",
     ],
 )
 def test_qualified_ccr_tool_result_block_is_preserved(tool_name: str) -> None:
@@ -103,9 +122,23 @@ def test_qualified_ccr_tool_result_block_is_preserved(tool_name: str) -> None:
     assert not any("smart" in transform for transform in result.transforms_applied)
 
 
+@pytest.mark.parametrize("tool_name", ["headroom_retrieve", "headroom_retrieve_multiple"])
+def test_deferred_ccr_tool_result_block_is_preserved(tool_name: str) -> None:
+    original, result = _apply_anthropic_for_tool("tool_call", {"name": tool_name, "arguments": {}})
+
+    assert result.messages[1]["content"][0]["content"] == original
+    assert not result.transforms_applied
+
+
 @pytest.mark.parametrize(
     "tool_name",
-    ["mcp__Headroom__headroom_retrieve", "mcp_Headroom_headroom_retrieve", CCR_TOOL_NAME],
+    [
+        "mcp__Headroom__headroom_retrieve",
+        "mcp_Headroom_headroom_retrieve",
+        CCR_TOOL_NAME,
+        "headroom_retrieve_multiple",
+        "mcp__Headroom__headroom_retrieve_multiple",
+    ],
 )
 def test_mcp_compressor_preserves_qualified_ccr_output(tool_name: str) -> None:
     """`HeadroomMCPCompressor.compress` is the production entry point issue #2656 names.

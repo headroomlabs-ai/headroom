@@ -1,16 +1,61 @@
 from __future__ import annotations
 
+import pytest
+
 from headroom.ccr.tool_calls import (
     CCRToolCall,
     drop_tool_calls,
     extract_tool_calls,
     has_ccr_tool_calls,
+    is_ccr_retrieval_call,
     parse_ccr_tool_calls,
     tool_call_id_for_provider,
 )
 from headroom.ccr.tool_injection import CCR_TOOL_NAME
 
 HASH = "abc123def456abc123def456"
+
+
+@pytest.mark.parametrize(
+    "call,expected",
+    [
+        ({"name": "headroom_retrieve"}, True),
+        ({"name": "mcp__headroom__headroom_retrieve_multiple"}, True),
+        ({"function": {"name": "headroom_retrieve_multiple"}}, True),
+        ({"name": "tool_call", "arguments": '{"name": "headroom_retrieve_multiple"}'}, True),
+        ({"name": "tool_call", "input": {"name": "headroom_retrieve_multiple"}}, True),
+        ({"name": "headroom_retrieve_multiple_extra"}, False),
+        ({"name": "tool_call", "arguments": "invalid"}, False),
+        ({"function": 42}, False),
+        ({"type": "custom_tool_call", "name": "exec", "input": None}, False),
+        (
+            {
+                "type": "custom_tool_call",
+                "name": "exec",
+                "input": "tools.headroom_retrieve_multiple({})",
+            },
+            True,
+        ),
+        (
+            {
+                "type": "custom_tool_call",
+                "name": "exec",
+                "input": "tools.headroom_retrieve_multiple_extra({})",
+            },
+            False,
+        ),
+        (
+            {
+                "type": "custom_tool_call",
+                "name": "other",
+                "input": "tools.headroom_retrieve_multiple({})",
+            },
+            False,
+        ),
+    ],
+)
+def test_retrieval_protection_recognizes_wrappers_without_near_matches(call, expected):
+    assert is_ccr_retrieval_call(call) is expected
 
 
 def test_extract_tool_calls_handles_provider_shapes() -> None:

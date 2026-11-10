@@ -31,7 +31,7 @@ def mcp() -> None:
         ANTHROPIC_BASE_URL=http://127.0.0.1:8787 claude
 
     \b
-    The MCP server provides on-demand tools (compress, retrieve, stats).
+    The MCP server provides on-demand tools (compress, retrieve, retrieve_multiple, stats).
     For automatic compression of ALL traffic, also set ANTHROPIC_BASE_URL
     to route through the proxy.
 

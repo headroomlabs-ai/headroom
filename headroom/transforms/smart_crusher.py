@@ -51,8 +51,13 @@ from collections import Counter
 from dataclasses import dataclass
 from typing import Any
 
-from ..ccr.tool_injection import CCR_TOOL_NAME
-from ..config import CCRConfig, TransformResult, is_tool_excluded, unwrap_tool_call_name
+from ..config import (
+    CCR_RETRIEVAL_TOOL_NAMES,
+    CCRConfig,
+    TransformResult,
+    is_tool_excluded,
+    unwrap_tool_call_name,
+)
 from ..log_safety import describe_exception, safe_id
 from ..tokenizer import Tokenizer
 from ..utils import compute_short_hash, create_tool_digest_marker, deep_copy_messages
@@ -1331,7 +1336,7 @@ class SmartCrusher(Transform):
                 # compress (conservative: unknown tool names don't get a free pass).
                 if is_tool_excluded(
                     tool_names_by_id.get(msg.get("tool_call_id") or "") or "",
-                    (CCR_TOOL_NAME,),
+                    CCR_RETRIEVAL_TOOL_NAMES,
                 ):
                     continue
                 content = msg.get("content", "")
@@ -1364,7 +1369,7 @@ class SmartCrusher(Transform):
                     # ponytail: ceiling is tool_use_id lookup; unknown ids pass through.
                     if is_tool_excluded(
                         tool_names_by_id.get(block.get("tool_use_id") or "") or "",
-                        (CCR_TOOL_NAME,),
+                        CCR_RETRIEVAL_TOOL_NAMES,
                     ):
                         continue
                     tool_content = block.get("content", "")
