@@ -58,6 +58,7 @@ def harness(monkeypatch: pytest.MonkeyPatch) -> types.ModuleType:
             "savings_pct": 50.0,
             "transforms": [],
         }
+
     tool = {"result": [{"path": "src/a.py", "score": 1}]}
     monkeypatch.setattr(module, "seed_everything", lambda seed: seed)
     monkeypatch.setattr(module, "measure", _fake_measure)
