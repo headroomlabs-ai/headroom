@@ -2024,6 +2024,113 @@ class TestSubscriptionPollersRefuseLegibly:
         assert "HEADROOM_OFFLINE" in (tracker._state.last_error or "")
 
 
+class TestTiktokenVocabOffline:
+    """tiktoken's BPE vocabulary download.
+
+    ``tiktoken.get_encoding`` fetches the vocabulary from
+    openaipublic.blob.core.windows.net on a cache miss. Headroom loads it on
+    its own initiative (to count tokens), so the air-gap switch refuses a cold
+    cache, while a pre-seeded ``TIKTOKEN_CACHE_DIR`` keeps working, and a host
+    application's own tiktoken calls are left alone.
+    """
+
+    _URL = "https://openaipublic.blob.core.windows.net/encodings/headroom-test.tiktoken"
+
+    @pytest.fixture(autouse=True)
+    def _fresh_tiktoken_state(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> Iterator[None]:
+        import tiktoken.registry
+
+        from headroom.tokenizers import tiktoken_counter as tc
+
+        # tiktoken keeps loaded encodings for the life of the process; an
+        # earlier test that loaded one would make the load below a no-op.
+        monkeypatch.setattr(tiktoken.registry, "ENCODINGS", {})
+        monkeypatch.setenv("TIKTOKEN_CACHE_DIR", str(tmp_path))
+        monkeypatch.setenv("HEADROOM_TIKTOKEN_LOAD_TIMEOUT_SECONDS", "5")
+        tc._get_encoding.cache_clear()
+        tc._load_failed.clear()
+        yield
+        tc._get_encoding.cache_clear()
+        tc._load_failed.clear()
+
+    def _stub_encoding_reading(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """An encoding constructor that reads its vocab the way tiktoken's do."""
+        import tiktoken
+        import tiktoken.load
+
+        monkeypatch.setattr(
+            tiktoken, "get_encoding", lambda _name: tiktoken.load.read_file_cached(self._URL)
+        )
+
+    def test_a_cold_cache_refuses_instead_of_dialling(
+        self, offline: None, no_sockets: None
+    ) -> None:
+        from headroom.tokenizers.tiktoken_counter import TiktokenLoadError, load_encoding
+
+        with pytest.raises(TiktokenLoadError) as caught:
+            load_encoding("o200k_base")
+        blocked = caught.value.__cause__
+        assert isinstance(blocked, OfflineEgressBlocked)
+        assert _refused_hostname(blocked) == "openaipublic.blob.core.windows.net"
+        assert "HEADROOM_OFFLINE" in str(caught.value)
+
+    def test_the_token_counter_falls_back_to_estimation(
+        self, offline: None, no_sockets: None
+    ) -> None:
+        from headroom.tokenizers.registry import TokenizerRegistry
+
+        counter = TokenizerRegistry()._create_tiktoken("gpt-4o")
+        assert counter.count_text("hello world") > 0
+
+    def test_a_warm_cache_still_loads_offline(
+        self,
+        offline: None,
+        no_sockets: None,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+    ) -> None:
+        import hashlib
+
+        from headroom.tokenizers.tiktoken_counter import load_encoding
+
+        (tmp_path / hashlib.sha1(self._URL.encode()).hexdigest()).write_bytes(b"vocab")
+        self._stub_encoding_reading(monkeypatch)
+        assert load_encoding("headroom-test") == b"vocab"
+
+    def test_a_refusal_is_not_remembered_as_a_failure(
+        self, offline: None, no_sockets: None, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Leaving offline mode must make the encoding loadable again."""
+        from headroom.tokenizers import tiktoken_counter as tc
+
+        self._stub_encoding_reading(monkeypatch)
+        with pytest.raises(tc.TiktokenLoadError):
+            tc.load_encoding("headroom-test")
+        assert "headroom-test" not in tc._load_failed
+
+    def test_a_host_applications_own_load_is_not_refused(
+        self, offline: None, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The guard applies to Headroom's loads, not to tiktoken globally."""
+        import requests
+        import tiktoken.load
+
+        from headroom.tokenizers import tiktoken_counter as tc
+
+        assert tc._install_vocab_download_guard()
+        fetched: list[str] = []
+
+        def _fake_get(url: str, *args: object, **kwargs: object) -> SimpleNamespace:
+            fetched.append(url)
+            return SimpleNamespace(content=b"host vocab", raise_for_status=lambda: None)
+
+        monkeypatch.setattr(requests, "get", _fake_get)
+        assert tiktoken.load.read_file_cached(self._URL) == b"host vocab"
+        assert fetched == [self._URL]
+
+
 class TestDoctorNetworkOffline:
     """`headroom doctor --network` and the TLS-error chain re-probe.
 
@@ -2582,6 +2689,7 @@ _EGRESS_CALLEES = re.compile(
       | (?:anthropic\.)?(?:Async)?Anthropic(?:Bedrock|Vertex)?
       | litellm\.a?completion                          # litellm-routed provider calls
       | _call_cli_llm                                  # learn's provider CLIs call their APIs
+      | tiktoken\.(?:get_encoding|encoding_for_model)  # BPE vocab download on a cache miss
     )$""",
     re.VERBOSE,
 )
@@ -2825,6 +2933,15 @@ _PERMITTED_CATEGORIES = frozenset(
 )
 
 _EGRESS_ALLOWLIST: dict[str, tuple[int, str]] = {
+    "tokenizers/tiktoken_counter.py": (
+        1,
+        "cache-only: _guarded_get_encoding wraps tiktoken.load.read_file, "
+        "tiktoken's only network read, so inside Headroom's load a cold "
+        "vocabulary cache raises OfflineEgressBlocked before a socket exists "
+        "and only a pre-seeded TIKTOKEN_CACHE_DIR is read. Every other "
+        "tiktoken load in headroom/ goes through load_encoding(). Pinned by "
+        "TestTiktokenVocabOffline.",
+    ),
     "proxy/server.py": (
         2,
         "user-traffic: the proxy forwarding the caller's request to the "
@@ -3292,6 +3409,12 @@ class TestSiteScannerRules:
     def test_module_level_httpx_verbs_are_sites(self) -> None:
         source = "def f():\n    return httpx.get('https://x')\n"
         assert [site.callee for site in _python_egress_sites(source)] == ["httpx.get"]
+
+    def test_a_bare_tiktoken_load_is_a_site(self) -> None:
+        """tiktoken downloads its vocabulary on a cache miss, so a direct load
+        that skips ``load_encoding()`` has to be seen by the scanner."""
+        source = "import tiktoken\ndef f():\n    return tiktoken.get_encoding('cl100k_base')\n"
+        assert [site.callee for site in _python_egress_sites(source)] == ["tiktoken.get_encoding"]
 
 
 # ───────────────── the documented claim vs the actual guarantee ─────────────
