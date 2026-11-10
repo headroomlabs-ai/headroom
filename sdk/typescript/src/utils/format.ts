@@ -937,10 +937,11 @@ export function openAIToGemini(messages: OpenAIMessage[]): any[] {
       }
       if (msg.tool_calls) {
         for (const tc of msg.tool_calls) {
-          // `arguments` may be missing or malformed: a proxy round-trip drops
-          // `undefined`, and Gemini only requires an object here.
+          // `arguments` may be missing or malformed; a proxy round-trip drops
+          // `undefined`. Keep whatever is there rather than discarding a tool
+          // input, matching the Vercel conversion.
           let args: any;
-          try { args = JSON.parse(tc.function.arguments ?? "{}"); } catch { args = {}; }
+          try { args = JSON.parse(tc.function.arguments ?? "{}"); } catch { args = tc.function.arguments ?? {}; }
           parts.push({ functionCall: { name: tc.function.name, args } });
         }
       }

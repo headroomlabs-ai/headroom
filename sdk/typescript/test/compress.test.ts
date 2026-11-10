@@ -138,6 +138,16 @@ describe("compress()", () => {
     });
   });
 
+  it("leaves a non-object entry alone instead of dropping it", async () => {
+    const result = await compress(["Keep this instruction", { role: "user", content: "hi" }], {
+      model: "gpt-4o",
+    });
+
+    expect(result.compressed).toBe(false);
+    expect(result.messages).toEqual(["Keep this instruction", { role: "user", content: "hi" }]);
+    expect(mockFetch).not.toHaveBeenCalled();
+  });
+
   it("forwards a per-call config, overriding a provided client's config", async () => {
     mockFetch.mockResolvedValueOnce(okResponse());
     const client = new HeadroomClient({
