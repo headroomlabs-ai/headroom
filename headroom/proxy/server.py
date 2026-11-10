@@ -1118,6 +1118,12 @@ class HeadroomProxy(
         # Runs BEFORE the disable_kompress override below so that flag stays
         # authoritative for turning Kompress off.
         _apply_compressor_selection(router_config, config.compressors)
+        # The provider handlers gate their image stage on
+        # `config.image_optimize`, not on the router's `enable_image_optimizer`,
+        # so a selection that leaves out `image` must turn that gate off too or
+        # the proxy keeps compressing images (#4613).
+        if not router_config.enable_image_optimizer:
+            config.image_optimize = False
         # The proxy is long-lived: keep compression results it has no memory
         # budget for in a SQLite file instead of compressing them again
         # (headroom.cache.result_store; off in stateless mode).
