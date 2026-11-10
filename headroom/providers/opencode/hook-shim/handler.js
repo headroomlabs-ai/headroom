@@ -137,11 +137,13 @@ function normalizeProxyUrl(proxyUrl2) {
 var reportedProxyUrls = /* @__PURE__ */ new Set();
 function usableProxyUrl(proxyUrl2) {
   try {
-    return normalizeProxyUrl(proxyUrl2);
+    const proxy = normalizeProxyUrl(proxyUrl2);
+    if (proxy.protocol !== "http:" && proxy.protocol !== "https:") throw new TypeError("unsupported scheme");
+    return proxy;
   } catch {
     if (!reportedProxyUrls.has(proxyUrl2)) {
       reportedProxyUrls.add(proxyUrl2);
-      console.warn(`headroom: ignoring unusable proxy URL ${JSON.stringify(proxyUrl2)}; requests are not routed`);
+      console.warn(`headroom: the configured proxy URL is ${proxyUrl2 === "" ? "empty" : "not a valid http(s) URL"}; requests are not routed`);
     }
     return void 0;
   }
