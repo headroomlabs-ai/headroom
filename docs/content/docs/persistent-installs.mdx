@@ -50,6 +50,19 @@ headroom install apply --preset persistent-task --providers manual --target clau
 
 This installs a scheduled recovery path instead of a traditional always-running service.
 
+### Windows happy path: auto-start and warm-join
+
+```powershell
+headroom install apply --preset persistent-task --providers manual --target claude --target codex
+headroom install status
+```
+
+1. **Auto-start.** Apply registers hidden Task Scheduler tasks `headroom-<profile>-startup` (at boot) and `headroom-<profile>-health` (every 5 minutes). Whichever fires first starts the proxy, so it is already up when your first agent launches. If Windows rejects the logged-off (S4U) registration for a non-elevated account, Headroom automatically falls back to a session-scoped health task that runs every 5 minutes while you are logged on and prints a warning. No admin prompt or manual step is required.
+2. **Warm-join.** Every later agent joins the running proxy instead of starting another one. `headroom wrap claude|codex|copilot ...` checks for a matching persistent deployment on the requested port, reuses it when healthy, recovers it when stopped, and serializes startup per port so concurrent launches never start duplicate proxies.
+3. **Verify.** `headroom install status` should report `Status: running` and `Healthy: yes`, and `curl http://127.0.0.1:<port>/health` should return `ok`. Launch each agent and confirm it appears in the proxy log (`client=claude`, `client=codex`, ...).
+
+After the one-time apply, no further user interaction is needed.
+
 ### Persistent Docker
 
 ```bash
