@@ -488,10 +488,9 @@ def dashboard(port: int | None, no_open: bool) -> None:
     "--tray/--no-tray",
     "tray",
     default=False,
-    envvar="HEADROOM_TRAY",
     help=(
         "Show a system tray icon with savings, dashboard link and update alerts "
-        "(opt-in, Windows; needs headroom-ai[tray]; env: HEADROOM_TRAY)"
+        "(opt-in, Windows; needs headroom-ai[tray])"
     ),
 )
 @click.option("--no-optimize", is_flag=True, help="Disable optimization (passthrough mode)")
