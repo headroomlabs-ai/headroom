@@ -7,7 +7,7 @@ Headroom compresses everything your AI agent reads -- tool outputs, database res
 
 ## Quick preview
 
-<Tabs groupId="lang" items={['TypeScript', 'Python']}>
+<Tabs groupId="lang" items={['TypeScript', 'Python', 'Go']}>
 <Tab value="TypeScript">
 ```ts twoslash
 import { compress } from 'headroom-ai';
@@ -36,6 +36,24 @@ response = client.chat.completions.create(
     messages=result.messages,
 )
 print(f"Saved {result.tokens_saved} tokens ({result.compression_ratio:.0%})")
+```
+</Tab>
+<Tab value="Go">
+```go
+import (
+    "context"
+    headroom "github.com/headroomlabs-ai/headroom/sdk/golang"
+)
+
+ctx := context.Background()
+client := headroom.NewClient()
+
+messages := []headroom.Message{
+    {Role: "user", Content: headroom.TextContent("Analyze these results")},
+}
+
+result, _ := client.Compress(ctx, messages, headroom.CompressOptions{Model: "gpt-4o"})
+fmt.Printf("Saved %d tokens (%.0f%%)\n", result.TokensSaved, result.CompressionRatio*100)
 ```
 </Tab>
 </Tabs>
@@ -69,7 +87,7 @@ Your Agent / App
  LLM Provider  (OpenAI, Anthropic, Google, Bedrock, 100+ via LiteLLM)
 ```
 
-Headroom works as a **transparent proxy** (zero code changes), a **Python function** (`compress()`), a **TypeScript function** (`compress()`), or a **framework integration** (LangChain, Agno, Strands, LiteLLM, Vercel AI SDK, MCP).
+Headroom works as a **transparent proxy** (zero code changes), a **Python function** (`compress()`), a **TypeScript function** (`compress()`), a **Go function** (`headroom.Compress()`), or a **framework integration** (LangChain, Agno, Strands, LiteLLM, Vercel AI SDK, MCP).
 
 ## Real-world results
 

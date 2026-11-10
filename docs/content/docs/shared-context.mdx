@@ -7,7 +7,7 @@ When agents hand off to each other, context gets replayed in full. SharedContext
 
 ## Quick Start
 
-<Tabs groupId="lang" items={['TypeScript', 'Python']}>
+<Tabs groupId="lang" items={['TypeScript', 'Python', 'Go']}>
 <Tab value="TypeScript">
 ```ts twoslash
 import { SharedContext } from "headroom-ai";
@@ -42,6 +42,27 @@ summary = ctx.get("research")
 full = ctx.get("research", full=True)
 ```
 </Tab>
+<Tab value="Go">
+```go
+import (
+    "context"
+    "github.com/headroomlabs-ai/headroom/sdk/golang"
+)
+
+ctx := context.Background()
+sc := headroom.NewSharedContext(headroom.SharedContextOptions{})
+
+// Agent A stores large output
+_, _ = sc.Put(ctx, "research", bigResearchOutput, "researcher")
+
+// Agent B gets compressed version (~80% smaller)
+summary, _ := sc.Get("research", false)
+
+// Agent B needs full details on demand
+full, _ := sc.Get("research", true)
+_ = summary; _ = full
+```
+</Tab>
 </Tabs>
 
 ## API
@@ -50,7 +71,7 @@ full = ctx.get("research", full=True)
 
 Store content under a key. Compresses automatically using Headroom's full pipeline (SmartCrusher for JSON, CodeCompressor for code, Kompress for text).
 
-<Tabs groupId="lang" items={['TypeScript', 'Python']}>
+<Tabs groupId="lang" items={['TypeScript', 'Python', 'Go']}>
 <Tab value="TypeScript">
 ```ts twoslash
 import { SharedContext } from "headroom-ai";
@@ -76,13 +97,23 @@ entry.savings_percent     # 80.0
 entry.transforms          # ["router:json:0.20"]
 ```
 </Tab>
+<Tab value="Go">
+```go
+entry, _ := sc.Put(ctx, "findings", bigJSONOutput, "researcher")
+
+entry.OriginalTokens    // 20000
+entry.CompressedTokens  // 4000
+entry.SavingsPercent    // 80.0
+entry.Transforms        // ["router:json:0.20"]
+```
+</Tab>
 </Tabs>
 
 ### `get(key, full?)`
 
 Retrieve content. Returns the compressed version by default, or the original with `full=True`.
 
-<Tabs groupId="lang" items={['TypeScript', 'Python']}>
+<Tabs groupId="lang" items={['TypeScript', 'Python', 'Go']}>
 <Tab value="TypeScript">
 ```ts twoslash
 import { SharedContext } from "headroom-ai";
@@ -100,13 +131,21 @@ original = ctx.get("findings", full=True)     # 20K tokens
 missing = ctx.get("nonexistent")              # None
 ```
 </Tab>
+<Tab value="Go">
+```go
+compressed, _ := sc.Get("findings", false)        // 4K tokens
+original, _ := sc.Get("findings", true)           // 20K tokens
+_, ok := sc.Get("nonexistent", false)             // ok=false
+_ = compressed; _ = original; _ = ok
+```
+</Tab>
 </Tabs>
 
 ### `stats()`
 
 Aggregated statistics across all entries.
 
-<Tabs groupId="lang" items={['TypeScript', 'Python']}>
+<Tabs groupId="lang" items={['TypeScript', 'Python', 'Go']}>
 <Tab value="TypeScript">
 ```ts twoslash
 import { SharedContext } from "headroom-ai";
@@ -130,6 +169,16 @@ stats.total_tokens_saved       # 48000
 stats.savings_percent          # 80.0
 ```
 </Tab>
+<Tab value="Go">
+```go
+stats := sc.Stats()
+stats.Entries                 // 3
+stats.TotalOriginalTokens     // 60000
+stats.TotalCompressedTokens   // 12000
+stats.TotalTokensSaved        // 48000
+stats.SavingsPercent          // 80.0
+```
+</Tab>
 </Tabs>
 
 ### `keys()` and `clear()`
@@ -138,7 +187,7 @@ stats.savings_percent          # 80.0
 
 ## Configuration
 
-<Tabs groupId="lang" items={['TypeScript', 'Python']}>
+<Tabs groupId="lang" items={['TypeScript', 'Python', 'Go']}>
 <Tab value="TypeScript">
 ```ts twoslash
 import { SharedContext } from "headroom-ai";
@@ -157,6 +206,21 @@ ctx = SharedContext(
     ttl=3600,                             # 1 hour (default)
     max_entries=100,                       # Evicts oldest when full
 )
+```
+</Tab>
+<Tab value="Go">
+```go
+import (
+    "time"
+    "github.com/headroomlabs-ai/headroom/sdk/golang"
+)
+
+sc := headroom.NewSharedContext(headroom.SharedContextOptions{
+    Model:      "claude-sonnet-4-5-20250929",
+    TTL:        time.Hour,
+    MaxEntries: 100,
+})
+_ = sc
 ```
 </Tab>
 </Tabs>
