@@ -1,6 +1,7 @@
 import { tool } from "@opencode-ai/plugin";
-import { Effect, FileSystem, Path } from "effect";
+import { Effect, FileSystem, Path, Stdio, Terminal } from "effect";
 import { Primitive } from "effect/unstable/cli";
+import { ChildProcessSpawner } from "effect/unstable/process";
 import { describe, expect, it } from "vitest";
 
 function parseConfig(content: string): Promise<unknown> {
@@ -10,10 +11,29 @@ function parseConfig(content: string): Promise<unknown> {
     readFileString: () => Effect.succeed(content),
   });
   return Effect.runPromise(
-    Primitive.fileParse({ format: "toml" }).parse("/headroom/config.toml").pipe(
-      Effect.provideService(FileSystem.FileSystem, fs),
-      Effect.provide(Path.layer),
-    ),
+    Primitive.fileParse({ format: "toml" })
+      .parse("/headroom/config.toml")
+      .pipe(
+        Effect.provideService(FileSystem.FileSystem, fs),
+        Effect.provide(Path.layer),
+        Effect.provide(Stdio.layerTest({})),
+        Effect.provideService(
+          Terminal.Terminal,
+          Terminal.make({
+            columns: Effect.succeed(80),
+            rows: Effect.succeed(24),
+            readInput: Effect.die("unexpected terminal input"),
+            readLine: Effect.die("unexpected terminal input"),
+            display: () => Effect.void,
+          }),
+        ),
+        Effect.provideService(
+          ChildProcessSpawner.ChildProcessSpawner,
+          ChildProcessSpawner.make(() =>
+            Effect.die("unexpected child process"),
+          ),
+        ),
+      ),
   );
 }
 
@@ -29,7 +49,9 @@ describe("patched OpenCode dependency compatibility", () => {
         return args.hash;
       },
     });
-    expect(schema.parse({ hash: "a".repeat(24) })).toEqual({ hash: "a".repeat(24) });
+    expect(schema.parse({ hash: "a".repeat(24) })).toEqual({
+      hash: "a".repeat(24),
+    });
     expect(schema.safeParse({ hash: "invalid" }).success).toBe(false);
     expect(retrieve.args.hash).toBe(schema.shape.hash);
   });
@@ -57,6 +79,8 @@ name = "review"
   });
 
   it("keeps malformed TOML on Effect's parse-error channel", async () => {
-    await expect(parseConfig("[unclosed")).rejects.toThrow("Failed to parse '.toml'");
+    await expect(parseConfig("[unclosed")).rejects.toThrow(
+      "Failed to parse '.toml'",
+    );
   });
 });

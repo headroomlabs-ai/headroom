@@ -229,6 +229,12 @@ class AnchorConfig:
 #   Compressing would break the edit workflow.
 # Glob: Returns compact file path lists used for navigation. Low token count,
 #   not worth compressing.
+# Retrieval tools return stored originals and must never be recompressed.
+# Keep this leaf module independent of the optional CCR/MCP import graph.
+CCR_RETRIEVAL_TOOL_NAMES: frozenset[str] = frozenset(
+    {"headroom_retrieve", "headroom_retrieve_multiple"}
+)
+
 # Tool outputs that are reference data and must NOT be compressed.
 # Read/Glob/Grep contain exact file contents/search results the agent needs for edits.
 # Write/Edit record what changes were made — compressing them causes duplicate/conflicting edits.
@@ -248,7 +254,7 @@ DEFAULT_EXCLUDE_TOOLS: frozenset[str] = frozenset(
         "Edit",
         "WebSearch",
         "WebFetch",
-        "headroom_retrieve",
+        *CCR_RETRIEVAL_TOOL_NAMES,
         # Caveman's recovery tool: like headroom_retrieve, it returns the stored
         # original of something Caveman compressed upstream of us. Compressing it
         # again hands the model a lossy copy of the "complete original" (#4010).
@@ -305,7 +311,7 @@ DEFAULT_VERBATIM_EXCLUDE_TOOLS: frozenset[str] = frozenset(
         "WebFetch",
         "web_search",
         "web_fetch",
-        "headroom_retrieve",
+        *CCR_RETRIEVAL_TOOL_NAMES,
         # A recovery tool's output must reach the model exactly as stored; even
         # the lossless fold (e.g. JSON minify) changes it (#4010).
         "caveman_retrieve",
@@ -390,8 +396,8 @@ def _tool_name_aliases(name: str) -> tuple[str, ...]:
 
     # Clients that prefix MCP tools with the server name: OpenCode joins with a
     # single underscore, Cline with a double one (<server>__<tool>, #4585).
-    if lname in ("headroom_headroom_retrieve", "headroom__headroom_retrieve"):
-        aliases.append("headroom_retrieve")
+    if any(lname in (f"headroom_{tool}", f"headroom__{tool}") for tool in CCR_RETRIEVAL_TOOL_NAMES):
+        aliases.append(lname.removeprefix("headroom_").removeprefix("_"))
     elif lname.startswith("mcp__"):
         # OpenAI-style MCP wrappers use mcp__server__tool. Custom agents that
         # speak Anthropic sometimes emit the same wrapper as mcp_Server_tool.

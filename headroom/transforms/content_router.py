@@ -56,6 +56,7 @@ from enum import Enum
 from typing import TYPE_CHECKING, Any
 
 from ..config import (
+    CCR_RETRIEVAL_TOOL_NAMES,
     DEFAULT_BYTE_EXACT_EXCLUDE_TOOLS,
     DEFAULT_EXCLUDE_TOOLS,
     DEFAULT_VERBATIM_EXCLUDE_TOOLS,
@@ -6499,7 +6500,7 @@ class ContentRouter(Transform):
         ccr_retrieve_tool_ids = {
             tool_id
             for tool_id, name in tool_name_map.items()
-            if is_tool_excluded(name, ("headroom_retrieve",))
+            if is_tool_excluded(name, CCR_RETRIEVAL_TOOL_NAMES)
         }
 
         # Read protection (HEADROOM_PROTECT_READS=1): for bash-family agents the
@@ -6857,7 +6858,7 @@ class ContentRouter(Transform):
                 tool_call_id in ccr_retrieve_tool_ids
                 or (
                     role == "function"
-                    and is_tool_excluded(message.get("name", ""), ("headroom_retrieve",))
+                    and is_tool_excluded(message.get("name", ""), CCR_RETRIEVAL_TOOL_NAMES)
                 )
             ):
                 result_slots[i] = message
@@ -8276,7 +8277,7 @@ class ContentRouter(Transform):
                     _msg_tool_id = message.get("tool_call_id") or message.get("tool_use_id") or ""
                     if _msg_tool_id in ccr_retrieve_tool_ids or (
                         role == "function"
-                        and is_tool_excluded(message.get("name", ""), ("headroom_retrieve",))
+                        and is_tool_excluded(message.get("name", ""), CCR_RETRIEVAL_TOOL_NAMES)
                     ):
                         new_blocks.append(block)
                         transforms_applied.append("router:excluded:ccr_retrieve")

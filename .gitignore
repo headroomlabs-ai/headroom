@@ -211,6 +211,10 @@ benchmark_results.json
 benchmark_results/
 examples/vertex_gemini_benchmark/results.json
 
+# perfkit per-run artifacts (specs/002-perf-testing-granularities).
+# Tier-subdir of <commit_sha>; regenerated locally; not committed.
+benchmarks/artifacts/
+
 # DeepEval cache
 .deepeval/
 

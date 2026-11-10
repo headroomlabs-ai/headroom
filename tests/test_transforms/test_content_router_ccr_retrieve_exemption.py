@@ -20,6 +20,8 @@ from __future__ import annotations
 
 import json
 
+import pytest
+
 from headroom.transforms.content_router import ContentRouter, ContentRouterConfig
 
 
@@ -147,6 +149,27 @@ def _anthropic_list_form_messages(tool_name: str, content: str) -> list[dict]:
             ],
         },
     ]
+
+
+@pytest.mark.parametrize(
+    "message_builder",
+    [
+        _openai_messages,
+        _anthropic_messages,
+        _tool_role_top_level_text_messages,
+        _legacy_function_messages,
+        _anthropic_list_form_messages,
+    ],
+)
+def test_multiple_retrieval_stays_verbatim_even_with_no_excluded_tools(message_builder):
+    content = json.dumps({"results": [{"hash": "abc123", "original_content": _big_json()}]})
+    messages = message_builder("mcp__headroom__headroom_retrieve_multiple", content)
+    router = ContentRouter(ContentRouterConfig(min_section_tokens=10, exclude_tools=frozenset()))
+
+    result = router.apply(messages, _get_tokenizer())
+
+    assert result.messages[1] == messages[1]
+    assert "router:excluded:ccr_retrieve" in result.transforms_applied
 
 
 class TestContentRouterCcrRetrieveExemption:

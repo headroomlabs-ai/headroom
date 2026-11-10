@@ -77,13 +77,33 @@ Retrieve original uncompressed content by hash.
 
 **Parameters:**
 - `hash` (required) -- hash key from a previous compression
-- `query` (optional) -- search within the original to return only matching items
 
 **Returns:**
-- `original_content` (full retrieval) or `results` (filtered search)
+- `original_content` -- the full original content
 - `source` -- `"local"` or `"proxy"`
 
 Retrieval checks the local store first, then falls back to the proxy's store. Hashes from either source work transparently.
+
+### headroom_retrieve_multiple
+
+Retrieve full originals for several hashes in one MCP call.
+
+**Parameters:**
+- `hashes` (required) -- an array of 1–100 non-empty hash strings from compression results or markers
+
+**Returns:**
+- `results` -- one retrieval result per input hash, in the same order, including duplicates
+- Each successful result includes `hash`, `original_content`, and `source` (`"local"` or `"proxy"`), as with `headroom_retrieve`.
+- Missing or expired entries include `hash`, `error`, and recovery guidance. Other entries still succeed if one lookup fails.
+
+```json
+{"hashes": ["a1b2c3d4e5f6", "b2c3d4e5f6a1"]}
+```
+
+Each hash uses the same local-store lookup and proxy fallback as `headroom_retrieve`.
+Invalid input rejects the entire call before any lookup. Proxy lookups run with bounded
+concurrency; retrieving a batch does not extend the stored entries' TTL. Retrieved
+results stay uncompressed when passed back through Headroom.
 
 ### headroom_stats
 
@@ -197,7 +217,7 @@ The LLM calls `headroom_compress` on demand. Compression happens locally in the 
 
 The proxy compresses all traffic at the HTTP level (before the LLM sees content). MCP tools operate after the LLM receives content. They handle different data and do not double-compress.
 
-`headroom_retrieve` checks the local store first, then falls back to the proxy's store.
+`headroom_retrieve` and `headroom_retrieve_multiple` check the local store first, then fall back to the proxy's store.
 
 ## Troubleshooting
 

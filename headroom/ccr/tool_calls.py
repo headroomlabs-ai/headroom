@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 from typing import Any
 
+from headroom.config import CCR_RETRIEVAL_TOOL_NAMES, is_tool_excluded, unwrap_tool_call_name
 from headroom.proxy.tool_name_policy import extract_tool_name
 
 from .tool_injection import CCR_TOOL_NAME, parse_tool_call
@@ -108,6 +110,27 @@ def drop_tool_calls(
                 first = {**choices[0], "message": {**message, "tool_calls": tool_calls}}
                 return {**response, "choices": [first, *choices[1:]]}
     return response
+
+
+def is_ccr_retrieval_call(tool_call: dict[str, Any]) -> bool:
+    """Identify retrieval outputs to protect, without intercepting MCP calls."""
+    function = tool_call.get("function") or tool_call.get("functionCall") or tool_call
+    if not isinstance(function, dict):
+        return False
+    name = function.get("name")
+    if not isinstance(name, str):
+        return False
+    name = unwrap_tool_call_name(name, function.get("arguments") or function.get("input"))
+    if is_tool_excluded(name, CCR_RETRIEVAL_TOOL_NAMES):
+        return True
+    script = tool_call.get("input")
+    if tool_call.get("type") != "custom_tool_call" or name != "exec" or not isinstance(script, str):
+        return False
+    # shortcut: recognize direct tools.name(...) calls; extend for other exec access patterns.
+    return any(
+        is_tool_excluded(tool_name, CCR_RETRIEVAL_TOOL_NAMES)
+        for tool_name in re.findall(r"\btools\.([\w$]+)\s*\(", script)
+    )
 
 
 def is_ccr_tool_call(tool_call: dict[str, Any]) -> bool:

@@ -29,7 +29,13 @@ def _messages(tool_name: str) -> list:
 
 @pytest.mark.parametrize(
     "tool_name",
-    ["mcp__Headroom__headroom_retrieve", "mcp_Headroom_headroom_retrieve"],
+    [
+        "mcp__Headroom__headroom_retrieve",
+        "mcp_Headroom_headroom_retrieve",
+        "headroom_retrieve_multiple",
+        "mcp__Headroom__headroom_retrieve_multiple",
+        "headroom_headroom_retrieve_multiple",
+    ],
 )
 def test_qualified_ccr_retrieval_message_is_preserved(tool_name: str) -> None:
     messages = _messages(tool_name)
@@ -77,7 +83,12 @@ def test_near_match_ccr_tool_name_is_not_excluded() -> None:
 
 @pytest.mark.parametrize(
     "tool_name",
-    ["mcp__Headroom__headroom_retrieve", "mcp_Headroom_headroom_retrieve"],
+    [
+        "mcp__Headroom__headroom_retrieve",
+        "mcp_Headroom_headroom_retrieve",
+        "headroom_retrieve_multiple",
+        "mcp__Headroom__headroom_retrieve_multiple",
+    ],
 )
 def test_qualified_name_on_the_tool_message_is_enough(tool_name: str) -> None:
     """`ToolNode` populates `ToolMessage.name`, so the id index is only a fallback."""

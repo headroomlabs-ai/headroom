@@ -6,6 +6,7 @@ that any MCP-compatible host (Claude Code, Cursor, Codex, etc.) can use.
 Tools:
     headroom_compress   — Compress content on demand (no proxy needed)
     headroom_retrieve   — Retrieve original uncompressed content by hash
+    headroom_retrieve_multiple — Retrieve originals for several hashes in one call
     headroom_stats      — Session compression statistics
 
 Usage:
@@ -80,6 +81,8 @@ except ImportError:
     httpx = None  # type: ignore[assignment]
 
 CCR_TOOL_NAME = "headroom_retrieve"
+RETRIEVE_MULTIPLE_TOOL_NAME = "headroom_retrieve_multiple"
+MAX_RETRIEVAL_HASHES = 100
 COMPRESS_TOOL_NAME = "headroom_compress"
 STATS_TOOL_NAME = "headroom_stats"
 READ_TOOL_NAME = "headroom_read"
@@ -464,6 +467,7 @@ class HeadroomMCPServer:
                            retrieval. Works without a proxy.
         headroom_retrieve — Retrieve original uncompressed content by hash.
                            Checks local store first, then proxy if configured.
+        headroom_retrieve_multiple — Retrieve several originals in input order.
         headroom_stats    — Session statistics: compressions, savings, cost.
 
     Modes:
@@ -802,6 +806,28 @@ class HeadroomMCPServer:
                 },
             ),
             Tool(
+                name=RETRIEVE_MULTIPLE_TOOL_NAME,
+                description=(
+                    "Retrieve full original uncompressed content for multiple hashes in one call. "
+                    "Use hashes from headroom_compress results or compression markers. "
+                    "Returns one result per hash in input order, including errors for hashes "
+                    "that are missing or expired. Checks the local store, then the proxy."
+                ),
+                input_schema={
+                    "type": "object",
+                    "properties": {
+                        "hashes": {
+                            "type": "array",
+                            "items": {"type": "string", "minLength": 1, "pattern": r"\S"},
+                            "minItems": 1,
+                            "maxItems": MAX_RETRIEVAL_HASHES,
+                            "description": "Hash keys from compression results or markers.",
+                        },
+                    },
+                    "required": ["hashes"],
+                },
+            ),
+            Tool(
                 name=STATS_TOOL_NAME,
                 description=(
                     "Show compression statistics for this session: "
@@ -872,6 +898,8 @@ class HeadroomMCPServer:
                 result = await self._handle_compress(arguments)
             elif name == CCR_TOOL_NAME:
                 result = await self._handle_retrieve(arguments)
+            elif name == RETRIEVE_MULTIPLE_TOOL_NAME:
+                result = await self._handle_retrieve_multiple(arguments)
             elif name == STATS_TOOL_NAME:
                 result = await self._handle_stats()
             elif name == READ_TOOL_NAME and _READ_ENABLED:
@@ -1012,6 +1040,53 @@ class HeadroomMCPServer:
         )
 
         return [TextContent(type="text", text=json.dumps(result, indent=2, ensure_ascii=False))]
+
+    async def _handle_retrieve_multiple(self, arguments: dict[str, Any]) -> list[TextContent]:
+        """Retrieve each hash independently, preserving input order and duplicates."""
+        hashes = arguments.get("hashes")
+        if (
+            not isinstance(hashes, list)
+            or not 1 <= len(hashes) <= MAX_RETRIEVAL_HASHES
+            or any(not isinstance(key, str) or not key.strip() for key in hashes)
+        ):
+            return [
+                TextContent(
+                    type="text",
+                    text=json.dumps(
+                        {
+                            "error": (
+                                f"hashes must be an array of 1 to {MAX_RETRIEVAL_HASHES} "
+                                "non-empty strings"
+                            )
+                        }
+                    ),
+                )
+            ]
+
+        # Bound concurrent proxy fallbacks so a batch cannot exhaust connections.
+        semaphore = asyncio.Semaphore(8)
+
+        async def retrieve_one(hash_key: str) -> dict[str, Any]:
+            async with semaphore:
+                try:
+                    return await self._retrieve_content(hash_key)
+                except Exception as exc:
+                    logger.warning(
+                        "MCP batch retrieve failed (%s)",
+                        type(exc).__name__,
+                    )
+                    return {
+                        "hash": hash_key,
+                        "error": "Retrieval failed. Retry this hash individually.",
+                    }
+
+        results = await asyncio.gather(*(retrieve_one(key) for key in hashes))
+        return [
+            TextContent(
+                type="text",
+                text=json.dumps({"results": results}, indent=2, ensure_ascii=False),
+            )
+        ]
 
     async def _handle_stats(self) -> list[TextContent]:
         """Handle headroom_stats tool call."""

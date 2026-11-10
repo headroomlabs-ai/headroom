@@ -48,8 +48,7 @@ except ImportError:
     ToolResult = dict  # type: ignore[misc,assignment]
 
 from headroom import HeadroomConfig
-from headroom.ccr.tool_injection import CCR_TOOL_NAME
-from headroom.config import is_tool_excluded
+from headroom.config import CCR_RETRIEVAL_TOOL_NAMES, is_tool_excluded
 from headroom.telemetry.session import BeaconCompressionObserver
 from headroom.transforms.smart_crusher import SmartCrusher, SmartCrusherConfig
 
@@ -445,7 +444,7 @@ class HeadroomHookProvider(HookProvider):  # type: ignore[misc]
         if not self.compress_tool_outputs:
             return "compression_disabled"
 
-        if tool_name and is_tool_excluded(tool_name, (CCR_TOOL_NAME,)):
+        if tool_name and is_tool_excluded(tool_name, CCR_RETRIEVAL_TOOL_NAMES):
             return "tool_excluded"
 
         # Skip error results if preserve_errors is True

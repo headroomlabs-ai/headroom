@@ -47,8 +47,7 @@ except ImportError:
     BaseMessage = object  # type: ignore[misc,assignment]
     ToolMessage = object  # type: ignore[misc,assignment]
 
-from headroom.ccr.tool_injection import CCR_TOOL_NAME
-from headroom.config import is_tool_excluded
+from headroom.config import CCR_RETRIEVAL_TOOL_NAMES, is_tool_excluded
 from headroom.telemetry.session import BeaconCompressionObserver
 from headroom.transforms.smart_crusher import SmartCrusher, SmartCrusherConfig
 
@@ -172,7 +171,7 @@ def _should_skip(
     if not content:
         return "empty_content"
 
-    if tool_name and is_tool_excluded(tool_name, (CCR_TOOL_NAME,)):
+    if tool_name and is_tool_excluded(tool_name, CCR_RETRIEVAL_TOOL_NAMES):
         return "tool_excluded"
 
     tokens = _estimate_tokens(content)
