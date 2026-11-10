@@ -89,7 +89,7 @@ def learned_file(tmp_path, monkeypatch):
     monkeypatch.setenv("HEADROOM_CACHE_TTL_LEARNED_PATH", str(path))
     monkeypatch.setattr(ttl_observations, "_learned_cache", None)
     monkeypatch.setattr(ttl_observations, "_learned_mtime", -1.0)
-    monkeypatch.setattr(ttl_observations, "_learned_cache_path", None)
+    monkeypatch.setattr(ttl_observations, "_learned_cache_path", None, raising=False)
     return path
 
 
