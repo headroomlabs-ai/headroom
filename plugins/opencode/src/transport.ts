@@ -226,11 +226,15 @@ const reportedProxyUrls = new Set<string>();
 
 function usableProxyUrl(proxyUrl: string): URL | undefined {
   try {
-    return normalizeProxyUrl(proxyUrl);
+    const proxy = normalizeProxyUrl(proxyUrl);
+    // "user:pass@host:8787" parses with scheme "user:"; only http(s) can be routed to.
+    if (proxy.protocol !== "http:" && proxy.protocol !== "https:") throw new TypeError("unsupported scheme");
+    return proxy;
   } catch {
     if (!reportedProxyUrls.has(proxyUrl)) {
       reportedProxyUrls.add(proxyUrl);
-      console.warn(`headroom: ignoring unusable proxy URL ${JSON.stringify(proxyUrl)}; requests are not routed`);
+      // The value is never logged: a malformed URL can still carry user:password@.
+      console.warn(`headroom: the configured proxy URL is ${proxyUrl === "" ? "empty" : "not a valid http(s) URL"}; requests are not routed`);
     }
     return undefined;
   }

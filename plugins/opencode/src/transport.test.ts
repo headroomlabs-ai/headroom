@@ -1137,8 +1137,31 @@ describe("Headroom OpenCode transport", () => {
 
       // The problem is reported once, not once per request.
       expect(warn).toHaveBeenCalledTimes(1);
+      expect(warn).toHaveBeenCalledWith(
+        `headroom: the configured proxy URL is ${proxyUrl === "" ? "empty" : "not a valid http(s) URL"}; requests are not routed`,
+      );
     } finally {
       globalThis.fetch = originalFetch;
+      warn.mockRestore();
+    }
+  });
+
+  it("does not log any part of an unusable proxy URL that carries credentials", async () => {
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = vi.fn(async (..._args: FetchCall) => new Response("ok")) as unknown as typeof fetch;
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+
+    try {
+      installHeadroomTransport({ proxyUrl: "user:secretpass@host:8787" });
+      await fetch("https://api.anthropic.com/v1/messages", { method: "POST" });
+
+      expect(warn).toHaveBeenCalledTimes(1);
+      const logged = warn.mock.calls.flat().join(" ");
+      expect(logged).not.toContain("secretpass");
+      expect(logged).not.toContain("host:8787");
+    } finally {
+      globalThis.fetch = originalFetch;
+      warn.mockRestore();
     }
   });
 });
