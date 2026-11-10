@@ -337,7 +337,7 @@ Fine-grained control over what gets compressed and how hard. Most users pick a [
 | `HEADROOM_COMPRESS_SYSTEM_MESSAGES` | unset | Compress system prompts. Off by default to keep the hottest cache prefix stable. |
 | `HEADROOM_PROTECT_RECENT` | profile | Never compress the N most recent turns. |
 | `--protect-tool-results` / `HEADROOM_PROTECT_TOOL_RESULTS` | empty | Comma-separated tool names whose output is never lossy-compressed. |
-| `--compressor` (repeatable) / `HEADROOM_COMPRESSORS` | all | Restrict to specific compressors: `smart_crusher,kompress,code_aware,search,log,tabular,config,html,image`. |
+| `--compressor` (repeatable) / `HEADROOM_COMPRESSORS` | all | Restrict to specific compressors: `smart_crusher,kompress,code_aware,search,log,tabular,config,html,image`. Leaving out `image` also turns off the proxy's image stage. |
 | `--code-aware` / `--no-code-aware` | off | AST-based [code compression](/docs/code-compression). Requires `headroom-ai[code]`. |
 
 ### Kompress (ML compression)
