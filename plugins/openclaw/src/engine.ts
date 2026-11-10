@@ -166,12 +166,28 @@ export class HeadroomContextEngine {
       const result = await compress(openaiMessages, {
         model: params.model ?? "claude-sonnet-4-5",
         baseUrl: this.proxyUrl,
-        fallback: true,
+        // Failures must throw so they reach the catch below and count towards the
+        // circuit. With the SDK's default `fallback: true`, a connection error,
+        // timeout or 5xx resolves to a zero-token stub, which this method would
+        // otherwise treat as a successful no-op and reset the breaker with.
+        fallback: false,
         tokenBudget: params.tokenBudget,
         // The SDK applies this to AbortSignal.timeout(), so a timed-out call is
         // cancelled instead of continuing in the background after fail-open.
         timeout: this.config.requestTimeoutMs ?? 2_000,
       } as any);
+
+      // A zero token count means the proxy never answered — the SDK's fallback
+      // stub, or a response that was never tokenized. Count it as a failure so a
+      // resolved-but-empty result can't keep the breaker closed.
+      if (result.tokensBefore === 0) {
+        this.tripCircuit(new Error("compress() returned no token count"));
+        return {
+          messages: normalizeAgentMessages(params.messages),
+          estimatedTokens: 0,
+          systemPromptAddition: this.sessionCompressionNotice(params.sessionId),
+        };
+      }
 
       const shouldAnnounceCompression =
         (this.hasAnnouncedCompression(params.sessionId) || result.tokensSaved > 100) &&
