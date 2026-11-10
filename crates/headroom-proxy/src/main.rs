@@ -83,16 +83,29 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // upstream — but the Bedrock invoke handler refuses to forward
     // unsigned requests when `bedrock_credentials` is `None`
     // (see `bedrock::invoke::handle_invoke`).
+    // A first resolution that fails keeps the provider too: a failed
+    // fetch is not cached, so each Bedrock request asks it again and
+    // the proxy recovers once credentials appear, without a restart.
     if config.enable_bedrock_native {
         match load_bedrock_credentials(&config).await {
             Ok(source) => {
+                let first = source.get().await;
                 state = state.with_bedrock_credentials_source(source);
-                tracing::info!(
-                    event = "bedrock_credentials_loaded",
-                    region = %config.bedrock_region,
-                    profile = ?config.aws_profile,
-                    "AWS credentials resolved for Bedrock SigV4 signing"
-                );
+                match first {
+                    Ok(_) => tracing::info!(
+                        event = "bedrock_credentials_loaded",
+                        region = %config.bedrock_region,
+                        profile = ?config.aws_profile,
+                        "AWS credentials resolved for Bedrock SigV4 signing"
+                    ),
+                    Err(e) => tracing::warn!(
+                        event = "bedrock_credentials_unavailable",
+                        region = %config.bedrock_region,
+                        profile = ?config.aws_profile,
+                        error = %e,
+                        "AWS credentials not available at startup; each Bedrock request asks the provider again until it succeeds"
+                    ),
+                }
             }
             Err(e) => {
                 tracing::warn!(
@@ -181,9 +194,10 @@ fn init_tracing(level: &str) {
 /// Uses the `aws-config` default chain (env vars → shared profile
 /// file → IMDS / ECS task role). Honours `Config::aws_profile` when
 /// set; otherwise the chain picks up `AWS_PROFILE` from the
-/// environment automatically. Resolves once here so a missing
-/// credential is reported at startup; the returned source keeps the
-/// provider for later refreshes.
+/// environment automatically. Only fails when the chain has no
+/// provider at all; the caller resolves once so a missing credential
+/// is reported at startup, and the returned source keeps the provider
+/// for later attempts and refreshes.
 async fn load_bedrock_credentials(
     config: &Config,
 ) -> Result<headroom_proxy::bedrock::BedrockCredentials, Box<dyn std::error::Error + Send + Sync>> {
@@ -198,9 +212,9 @@ async fn load_bedrock_credentials(
     let creds_provider = aws_config
         .credentials_provider()
         .ok_or("no credentials provider configured")?;
-    let source = headroom_proxy::bedrock::BedrockCredentials::new(creds_provider);
-    source.get().await?;
-    Ok(source)
+    Ok(headroom_proxy::bedrock::BedrockCredentials::new(
+        creds_provider,
+    ))
 }
 
 async fn shutdown_signal() {

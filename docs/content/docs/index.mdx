@@ -82,7 +82,9 @@ signal survives even when the surrounding noise is compressed away
 aggressively.
 
 Measured on local, seeded test data built from real MCP server output
-formats. These are not production telemetry, and they are reproducible:
+formats, run through the default `compress()` configuration
+(`protect_recent=4`). These are not production telemetry, and they are
+reproducible:
 
 | Scenario | Before | After | Savings |
 |---|---|---|---|
