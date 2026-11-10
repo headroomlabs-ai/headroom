@@ -108,7 +108,8 @@ export function mapProxyError(
   message: string,
 ): HeadroomError {
   if (status === 401) return new HeadroomAuthError(message);
-  const ErrorClass = ERROR_TYPE_MAP[type];
+  // `type` comes from the proxy response; ignore inherited keys like "constructor".
+  const ErrorClass = Object.hasOwn(ERROR_TYPE_MAP, type) ? ERROR_TYPE_MAP[type] : undefined;
   if (ErrorClass) return new ErrorClass(message, { statusCode: status, errorType: type });
   return new HeadroomCompressError(status, type, message);
 }
