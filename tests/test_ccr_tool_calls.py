@@ -26,6 +26,11 @@ HASH = "abc123def456abc123def456"
         ({"name": "tool_call", "input": {"name": "headroom_retrieve_multiple"}}, True),
         ({"name": "headroom_retrieve_multiple_extra"}, False),
         ({"name": "tool_call", "arguments": "invalid"}, False),
+        ({}, False),
+        ({"name": None}, False),
+        ({"name": 42}, False),
+        ({"function": {"name": ["headroom_retrieve"]}}, False),
+        ({"functionCall": {"name": {"tool": "headroom_retrieve"}}}, False),
         ({"function": 42}, False),
         ({"type": "custom_tool_call", "name": "exec", "input": None}, False),
         (

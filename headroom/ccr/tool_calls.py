@@ -117,9 +117,10 @@ def is_ccr_retrieval_call(tool_call: dict[str, Any]) -> bool:
     function = tool_call.get("function") or tool_call.get("functionCall") or tool_call
     if not isinstance(function, dict):
         return False
-    name = unwrap_tool_call_name(
-        function.get("name"), function.get("arguments") or function.get("input")
-    )
+    name = function.get("name")
+    if not isinstance(name, str):
+        return False
+    name = unwrap_tool_call_name(name, function.get("arguments") or function.get("input"))
     if is_tool_excluded(name, CCR_RETRIEVAL_TOOL_NAMES):
         return True
     script = tool_call.get("input")
