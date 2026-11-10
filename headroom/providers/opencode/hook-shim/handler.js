@@ -134,6 +134,20 @@ function wrapFork(originalFork) {
 function normalizeProxyUrl(proxyUrl2) {
   return new URL(proxyUrl2);
 }
+var reportedProxyUrls = /* @__PURE__ */ new Set();
+function usableProxyUrl(proxyUrl2) {
+  try {
+    const proxy = normalizeProxyUrl(proxyUrl2);
+    if (proxy.protocol !== "http:" && proxy.protocol !== "https:") throw new TypeError("unsupported scheme");
+    return proxy;
+  } catch {
+    if (!reportedProxyUrls.has(proxyUrl2)) {
+      reportedProxyUrls.add(proxyUrl2);
+      console.warn(`headroom: the configured proxy URL is ${proxyUrl2 === "" ? "empty" : "not a valid http(s) URL"}; requests are not routed`);
+    }
+    return void 0;
+  }
+}
 function isLoopback(hostname) {
   const normalized = hostname.toLowerCase().replace(/^\[|\]$/g, "");
   return normalized === "localhost" || normalized === "127.0.0.1" || normalized === "::1";
@@ -344,7 +358,10 @@ function wrapRequest(originalHttpRequest, originalHttpsRequest, originalRequest)
     if (!state) {
       return Reflect.apply(originalRequest, this, args);
     }
-    const proxy = normalizeProxyUrl(state.proxyUrl);
+    const proxy = usableProxyUrl(state.proxyUrl);
+    if (!proxy) {
+      return Reflect.apply(originalRequest, this, args);
+    }
     const parts = splitNodeArgs(args, originalRequest === originalHttpsRequest ? "https:" : "http:");
     const nextOptions = routedNodeOptions(parts, proxy, state.project, state.excludeHosts, state.sessionToken);
     if (!nextOptions) {
@@ -406,7 +423,10 @@ function installHeadroomTransport(options) {
     if (!current) {
       return state.originalFetch(...args);
     }
-    const proxy = normalizeProxyUrl(current.proxyUrl);
+    const proxy = usableProxyUrl(current.proxyUrl);
+    if (!proxy) {
+      return state.originalFetch(...args);
+    }
     const [nextInput, nextInit] = withRoutedFetchInput(args[0], args[1], proxy, current.project, current.excludeHosts, current.sessionToken);
     return state.originalFetch(nextInput, nextInit);
   };

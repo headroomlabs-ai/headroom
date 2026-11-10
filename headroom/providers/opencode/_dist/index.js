@@ -19730,7 +19730,7 @@ tool.schema = external_exports;
 // src/retrieve.ts
 var _proxyUrlCache = null;
 function getDefaultProxyUrl() {
-  return _proxyUrlCache ?? process.env.HEADROOM_BASE_URL ?? "http://localhost:8787";
+  return _proxyUrlCache || process.env.HEADROOM_BASE_URL || "http://localhost:8787";
 }
 function trimTrailingSlashes(value) {
   let end = value.length;
@@ -19918,6 +19918,20 @@ function wrapFork(originalFork) {
 }
 function normalizeProxyUrl(proxyUrl) {
   return new URL(proxyUrl);
+}
+var reportedProxyUrls = /* @__PURE__ */ new Set();
+function usableProxyUrl(proxyUrl) {
+  try {
+    const proxy = normalizeProxyUrl(proxyUrl);
+    if (proxy.protocol !== "http:" && proxy.protocol !== "https:") throw new TypeError("unsupported scheme");
+    return proxy;
+  } catch {
+    if (!reportedProxyUrls.has(proxyUrl)) {
+      reportedProxyUrls.add(proxyUrl);
+      console.warn(`headroom: the configured proxy URL is ${proxyUrl === "" ? "empty" : "not a valid http(s) URL"}; requests are not routed`);
+    }
+    return void 0;
+  }
 }
 function isLoopback(hostname3) {
   const normalized = hostname3.toLowerCase().replace(/^\[|\]$/g, "");
@@ -20136,7 +20150,10 @@ function wrapRequest(originalHttpRequest, originalHttpsRequest, originalRequest)
     if (!state) {
       return Reflect.apply(originalRequest, this, args);
     }
-    const proxy = normalizeProxyUrl(state.proxyUrl);
+    const proxy = usableProxyUrl(state.proxyUrl);
+    if (!proxy) {
+      return Reflect.apply(originalRequest, this, args);
+    }
     const parts = splitNodeArgs(args, originalRequest === originalHttpsRequest ? "https:" : "http:");
     const nextOptions = routedNodeOptions(parts, proxy, state.project, state.excludeHosts, state.sessionToken);
     if (!nextOptions) {
@@ -20198,7 +20215,10 @@ function installHeadroomTransport(options) {
     if (!current) {
       return state.originalFetch(...args);
     }
-    const proxy = normalizeProxyUrl(current.proxyUrl);
+    const proxy = usableProxyUrl(current.proxyUrl);
+    if (!proxy) {
+      return state.originalFetch(...args);
+    }
     const [nextInput, nextInit] = withRoutedFetchInput(args[0], args[1], proxy, current.project, current.excludeHosts, current.sessionToken);
     return state.originalFetch(nextInput, nextInit);
   };
@@ -20245,7 +20265,7 @@ function normalizeProxyUrl2(url2) {
 }
 function resolveProxyUrl(options) {
   return normalizeProxyUrl2(
-    options?.proxyUrl ?? process.env.HEADROOM_PROXY_URL ?? process.env.HEADROOM_BASE_URL ?? getDefaultProxyUrl()
+    options?.proxyUrl || process.env.HEADROOM_PROXY_URL || process.env.HEADROOM_BASE_URL || getDefaultProxyUrl()
   );
 }
 function resolveSessionToken(options) {
