@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import logging
-import os
 import signal
 import subprocess
 import sys
@@ -13,7 +12,16 @@ from .app import QUIT_EXIT_CODE, tray_available
 
 logger = logging.getLogger(__name__)
 
-_FORCE_EXIT_AFTER_S = 30.0
+
+def request_graceful_shutdown() -> None:
+    """Signal the proxy to shut down via its normal SIGINT path.
+
+    No hard-exit deadline is scheduled: uvicorn's request drain, the sequential
+    cleanup steps and the savings flush have no single bounded total, so a fixed
+    timer could kill the process before persistence completes. A second SIGINT
+    (or the OS) remains the operator's escape hatch for a hung shutdown.
+    """
+    signal.raise_signal(signal.SIGINT)
 
 
 def start_tray_for_proxy(host: str, port: int) -> subprocess.Popen[bytes] | None:
@@ -44,15 +52,8 @@ def start_tray_for_proxy(host: str, port: int) -> subprocess.Popen[bytes] | None
         return None
 
     def _watch() -> None:
-        if child.wait() != QUIT_EXIT_CODE:
-            return
-        # "Quit Headroom" was chosen: shut the proxy down gracefully, then force
-        # exit only as a last resort. The grace period is longer than uvicorn's
-        # request-drain timeout so savings are flushed during normal teardown.
-        signal.raise_signal(signal.SIGINT)
-        timer = threading.Timer(_FORCE_EXIT_AFTER_S, lambda: os._exit(0))
-        timer.daemon = True
-        timer.start()
+        if child.wait() == QUIT_EXIT_CODE:
+            request_graceful_shutdown()
 
     threading.Thread(target=_watch, name="headroom-tray-watch", daemon=True).start()
     return child

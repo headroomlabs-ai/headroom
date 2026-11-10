@@ -2855,11 +2855,6 @@ _EGRESS_ALLOWLIST: dict[str, tuple[int, str]] = {
         "loopback: readiness/health probes against the operator's own proxy "
         "URL, used by the installers and `headroom doctor`.",
     ),
-    "tray/core.py": (
-        1,
-        "loopback: the tray polls GET <proxy_url>/stats on the operator's own "
-        "locally running proxy (the host/port `headroom proxy` is bound to).",
-    ),
     "cli/wrap.py": (
         2,
         "loopback: both sites are hard-coded http://127.0.0.1:<port> calls to "

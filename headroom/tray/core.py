@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+import ipaddress
 import json
 import urllib.request
 from dataclasses import dataclass
 from typing import Any
+from urllib.parse import urlparse
 
 DEFAULT_PORT = 8787
 
@@ -54,13 +56,40 @@ def parse_stats(payload: dict[str, Any]) -> Snapshot:
     )
 
 
-def fetch_snapshot(url: str, *, timeout: float = 3.0) -> Snapshot:
-    """Poll the local proxy. Never raises; an unreachable proxy yields ``online=False``."""
+def is_loopback_url(url: str) -> bool:
+    """True only for http URLs whose host is localhost or a loopback IP literal."""
     try:
-        req = urllib.request.Request(  # noqa: S310 — http URL built from local config
+        parsed = urlparse(url)
+        host = (parsed.hostname or "").lower()
+        if parsed.scheme != "http" or not host:
+            return False
+        return host == "localhost" or ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        return False
+
+
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, *args: Any, **kwargs: Any) -> None:
+        return None
+
+
+# No environment proxies and no redirects: the poll can never leave loopback.
+_OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}), _NoRedirect())
+
+
+def fetch_snapshot(url: str, *, timeout: float = 3.0) -> Snapshot:
+    """Poll the local proxy. Never raises; an unreachable proxy yields ``online=False``.
+
+    Only loopback URLs are polled, regardless of ``HEADROOM_OFFLINE``; any other
+    host is refused without making a request.
+    """
+    if not is_loopback_url(url):
+        return Snapshot()
+    try:
+        req = urllib.request.Request(  # noqa: S310 — loopback-only, validated above
             f"{url}/stats?cached=1", headers={"Accept": "application/json"}
         )
-        with urllib.request.urlopen(req, timeout=timeout) as resp:  # noqa: S310
+        with _OPENER.open(req, timeout=timeout) as resp:
             data = json.loads(resp.read().decode("utf-8"))
         return parse_stats(data) if isinstance(data, dict) else Snapshot()
     except Exception:

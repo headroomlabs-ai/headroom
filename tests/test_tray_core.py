@@ -87,3 +87,90 @@ def test_icon_renders_all_states() -> None:
     for online in (True, False):
         for update in (True, False):
             assert render_icon(online=online, update=update, size=32).size == (32, 32)
+
+
+@pytest.mark.parametrize(
+    ("url", "expected"),
+    [
+        ("http://127.0.0.1:8787", True),
+        ("http://localhost:8787", True),
+        ("http://[::1]:8787", True),
+        ("http://example.com:8787", False),
+        ("http://10.0.0.5:8787", False),
+        ("https://127.0.0.1:8787", False),
+        ("http://127.0.0.1.evil.com:8787", False),
+    ],
+)
+def test_is_loopback_url(url: str, expected: bool) -> None:
+    assert core.is_loopback_url(url) is expected
+
+
+def test_fetch_snapshot_refuses_remote_host_even_when_offline(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("HEADROOM_OFFLINE", "1")
+    calls: list[object] = []
+    monkeypatch.setattr(core._OPENER, "open", lambda *a, **k: calls.append(a))
+    monkeypatch.setattr("urllib.request.urlopen", lambda *a, **k: calls.append(a))
+    assert core.fetch_snapshot(core.base_url("example.com", 8787)).online is False
+    assert calls == []
+
+
+def test_fetch_snapshot_does_not_follow_redirects_off_loopback() -> None:
+    import http.server
+    import threading
+
+    hits: list[str] = []
+
+    class Target(http.server.BaseHTTPRequestHandler):
+        def do_GET(self) -> None:
+            hits.append(self.path)
+            self.send_response(200)
+            self.end_headers()
+            self.wfile.write(b'{"persistent_savings": {"lifetime": {"tokens_saved": 5}}}')
+
+        def log_message(self, *args: object) -> None:
+            pass
+
+    target = http.server.HTTPServer(("127.0.0.1", 0), Target)
+
+    class Redirector(http.server.BaseHTTPRequestHandler):
+        def do_GET(self) -> None:
+            self.send_response(302)
+            self.send_header("Location", f"http://127.0.0.1:{target.server_port}/stats")
+            self.end_headers()
+
+        def log_message(self, *args: object) -> None:
+            pass
+
+    redirector = http.server.HTTPServer(("127.0.0.1", 0), Redirector)
+    servers = (target, redirector)
+    for server in servers:
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+    try:
+        snap = core.fetch_snapshot(f"http://127.0.0.1:{redirector.server_port}", timeout=2)
+    finally:
+        for server in servers:
+            server.shutdown()
+            server.server_close()
+    assert snap.online is False
+    assert hits == []
+
+
+def test_quit_requests_sigint_without_scheduling_a_hard_exit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import os
+    import signal
+    import threading
+
+    from headroom.tray import launcher
+
+    raised: list[int] = []
+    monkeypatch.setattr(signal, "raise_signal", raised.append)
+    monkeypatch.setattr(os, "_exit", lambda code: pytest.fail("hard exit must not be forced"))
+    monkeypatch.setattr(
+        threading, "Timer", lambda *a, **k: pytest.fail("no force-exit timer allowed")
+    )
+    launcher.request_graceful_shutdown()
+    assert raised == [signal.SIGINT]
