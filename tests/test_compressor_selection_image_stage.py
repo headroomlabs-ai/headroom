@@ -1,9 +1,10 @@
 """A compressor selection without ``image`` turns off the proxy image stage (#4613).
 
 ``--compressor`` / ``HEADROOM_COMPRESSORS`` maps a selection onto the router's
-``enable_*`` flags, but the provider handlers gate image compression on
-``ProxyConfig.image_optimize``. A selection that leaves out ``image`` has to
-switch that gate off as well, or screenshots still go through the image stage.
+``enable_*`` flags, but the provider handlers gate image compression through
+``ImageCompressionDecision``. That decision has to honor the selection too, or
+screenshots still go through the image stage. It reads the selection on each
+request and never overwrites the operator's ``image_optimize``.
 """
 
 from __future__ import annotations
@@ -42,9 +43,10 @@ def image_stage(monkeypatch: pytest.MonkeyPatch) -> _CountingCompressor:
     return stub
 
 
-def _config(mode: str, compressors: set[str] | None) -> ProxyConfig:
+def _config(mode: str, compressors: set[str] | None, *, image_optimize: bool = True) -> ProxyConfig:
     return ProxyConfig(
         mode=mode,
+        image_optimize=image_optimize,
         optimize=False,
         cache_enabled=False,
         rate_limit_enabled=False,
@@ -130,15 +132,14 @@ def _openai_image_request(client: TestClient) -> httpx.Response:
     )
 
 
-def _image_stage_runs(
-    config: ProxyConfig, send: Any, image_stage: _CountingCompressor
-) -> tuple[int, bool]:
+def _image_stage_runs(config: ProxyConfig, send: Any, image_stage: _CountingCompressor) -> int:
+    """Send one image request through a fresh proxy; return image-stage entries."""
+    before = image_stage.calls
     with TestClient(create_app(config)) as client:
-        proxy = client.app.state.proxy
-        proxy._retry_request = _fake_retry
+        client.app.state.proxy._retry_request = _fake_retry
         response = send(client)
         assert response.status_code == 200, response.text
-        return image_stage.calls, proxy.config.image_optimize
+    return image_stage.calls - before
 
 
 @pytest.mark.parametrize(
@@ -155,30 +156,36 @@ class TestImageStageFollowsSelection:
     def test_selection_without_image_skips_the_image_stage(
         self, mode: str, send: Any, image_stage: _CountingCompressor
     ) -> None:
-        runs, image_optimize = _image_stage_runs(
-            _config(mode, {"smart_crusher"}), send, image_stage
-        )
-        assert image_optimize is False
-        assert runs == 0
+        config = _config(mode, {"smart_crusher"})
+        assert _image_stage_runs(config, send, image_stage) == 0
+        # The operator's setting is left as given.
+        assert config.image_optimize is True
 
     def test_selection_with_image_keeps_the_image_stage(
         self, mode: str, send: Any, image_stage: _CountingCompressor
     ) -> None:
-        runs, image_optimize = _image_stage_runs(
-            _config(mode, {"smart_crusher", "image"}), send, image_stage
-        )
-        assert image_optimize is True
-        assert runs == 1
+        assert _image_stage_runs(_config(mode, {"smart_crusher", "image"}), send, image_stage) == 1
 
     def test_wildcard_keeps_the_image_stage(
         self, mode: str, send: Any, image_stage: _CountingCompressor
     ) -> None:
-        runs, _ = _image_stage_runs(_config(mode, {"*"}), send, image_stage)
-        assert runs == 1
+        assert _image_stage_runs(_config(mode, {"*"}), send, image_stage) == 1
 
     def test_no_selection_keeps_the_image_stage(
         self, mode: str, send: Any, image_stage: _CountingCompressor
     ) -> None:
-        runs, image_optimize = _image_stage_runs(_config(mode, None), send, image_stage)
-        assert image_optimize is True
-        assert runs == 1
+        assert _image_stage_runs(_config(mode, None), send, image_stage) == 1
+
+    def test_reused_config_follows_the_current_selection(
+        self, mode: str, send: Any, image_stage: _CountingCompressor
+    ) -> None:
+        config = _config(mode, {"smart_crusher"})
+        assert _image_stage_runs(config, send, image_stage) == 0
+        config.compressors = {"image"}
+        assert _image_stage_runs(config, send, image_stage) == 1
+
+    def test_image_optimize_off_wins_over_selecting_image(
+        self, mode: str, send: Any, image_stage: _CountingCompressor
+    ) -> None:
+        config = _config(mode, {"image"}, image_optimize=False)
+        assert _image_stage_runs(config, send, image_stage) == 0
