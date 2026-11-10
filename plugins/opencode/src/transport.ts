@@ -312,9 +312,11 @@ function isExcludedHost(hostname: string, excludeHosts: string[]): boolean {
 // caller's Authorization header - to the proxy (#4747). A path therefore also
 // has to be rooted where providers mount a wire:
 //
-// * the segment right before the endpoint is a version ("v1", "v1beta", "v4"),
+// * the segment right before the endpoint is a version ("v1", "v1beta", "v4")
+//   or a base a compatible gateway mounts the wire directly under ("api"),
 //   which keeps prefixed gateways working (/api/coding/paas/v4/chat/completions,
-//   /base/v1/messages, /zen/v1/responses), or
+//   /base/v1/messages, /zen/v1/responses, and a custom base URL of
+//   https://gateway.example/api), or
 // * the path contains a named wire root, which is what Azure OpenAI needs: its
 //   deployment name sits between /openai/ and the endpoint
 //   (/openai/deployments/{name}/chat/completions).
@@ -322,11 +324,20 @@ function isExcludedHost(hostname: string, excludeHosts: string[]): boolean {
 // A bare /messages or /responses on a provider origin still counts: there is no
 // segment at all.
 //
-// A version segment anywhere would be too weak - Discord's /api/v10/... has
-// one. So the residual over-match is narrower but real: /api/v2/messages still
-// routes. Telling that apart from a provider needs the host or the body;
+// The immediate segment is what keeps this tight. "api" is a root only when it
+// abuts the endpoint, so /api/chat/completions routes while Discord's
+// /api/v10/channels/123/messages (immediate segment "123") does not. For the
+// same reason a version segment counts only in that position, not anywhere.
+//
+// The residual over-match is documented, not solved: /api/v2/messages still
+// routes. Telling that apart from a provider needs the host or the body, and
 // excludeHosts already covers any host a user controls.
 const NAMED_WIRE_ROOTS = new Set(["backend-api", "codex", "openai", "anthropic", "zen"]);
+
+// Custom OpenAI-compatible gateways commonly mount the wire directly under one
+// of these, with no version segment: a model base URL of `.../api` plus
+// `/chat/completions` is a real configuration (#4747 review).
+const IMMEDIATE_WIRE_ROOTS = new Set(["api"]);
 
 function isVersionSegment(segment: string): boolean {
   return /^v\d+[a-z0-9]*$/i.test(segment);
@@ -335,7 +346,12 @@ function isVersionSegment(segment: string): boolean {
 function hasWireRootBefore(body: string): boolean {
   const segments = body.split("/").filter(Boolean);
   const last = segments.at(-1);
-  return last === undefined || isVersionSegment(last) || segments.some((s) => NAMED_WIRE_ROOTS.has(s));
+  return (
+    last === undefined ||
+    isVersionSegment(last) ||
+    IMMEDIATE_WIRE_ROOTS.has(last) ||
+    segments.some((s) => NAMED_WIRE_ROOTS.has(s))
+  );
 }
 
 // Native Gemini model-generation endpoints use colon-action suffixes

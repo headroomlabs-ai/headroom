@@ -19976,13 +19976,14 @@ function isExcludedHost(hostname3, excludeHosts) {
   return excludeHosts.some((host) => normalized === host || normalized.endsWith(`.${host}`));
 }
 var NAMED_WIRE_ROOTS = /* @__PURE__ */ new Set(["backend-api", "codex", "openai", "anthropic", "zen"]);
+var IMMEDIATE_WIRE_ROOTS = /* @__PURE__ */ new Set(["api"]);
 function isVersionSegment(segment) {
   return /^v\d+[a-z0-9]*$/i.test(segment);
 }
 function hasWireRootBefore(body) {
   const segments = body.split("/").filter(Boolean);
   const last = segments.at(-1);
-  return last === void 0 || isVersionSegment(last) || segments.some((s) => NAMED_WIRE_ROOTS.has(s));
+  return last === void 0 || isVersionSegment(last) || IMMEDIATE_WIRE_ROOTS.has(last) || segments.some((s) => NAMED_WIRE_ROOTS.has(s));
 }
 function isLlmEndpointPath(pathname) {
   if (pathname.endsWith(":generateContent") || pathname.endsWith(":streamGenerateContent")) {

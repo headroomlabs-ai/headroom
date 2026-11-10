@@ -302,12 +302,13 @@ describe("Headroom OpenCode transport", () => {
     const init = { method: "POST" };
     await fetch("https://api.example.com/messages", init);
     await fetch("https://api.example.com/responses", init);
+    await fetch("https://gateway.example.com/api/chat/completions", init);
     await fetch("https://gateway.example.com/api/v2/chat/completions", init);
     await fetch("https://gateway.example.com/openai/deployments/x/chat/completions", init);
     await fetch("https://opencode.ai/zen/v1/responses", init);
     await fetch("https://cloud.example.com/backend-api/codex/responses", init);
 
-    expect(fetchMock).toHaveBeenCalledTimes(6);
+    expect(fetchMock).toHaveBeenCalledTimes(7);
     for (const call of fetchMock.mock.calls as FetchCall[]) {
       expect(call[0]).toBeInstanceOf(URL);
       expect(new Headers(call[1]?.headers).get("x-headroom-base-url")).not.toBeNull();
@@ -344,24 +345,30 @@ describe("Headroom OpenCode transport", () => {
     globalThis.fetch = originalFetch;
   });
 
-  it("keeps loopback spellings and a trailing-dot excluded host off the proxy for Node https.request (#4747)", () => {
+  it("keeps loopback spellings and a trailing-dot excluded host off the proxy for Node http/https.request (#4747)", () => {
     const fakeRequest = { on: vi.fn(), end: vi.fn(), destroy: vi.fn() };
-    const requestSpy = vi.spyOn(https, "request").mockImplementation(() => fakeRequest as never);
+    const httpsSpy = vi.spyOn(https, "request").mockImplementation(() => fakeRequest as never);
+    const httpSpy = vi.spyOn(http, "request").mockImplementation(() => fakeRequest as never);
 
     installHeadroomTransport({ proxyUrl: "http://127.0.0.1:8787/v1", excludeHosts: ["api.x.example"] });
     const options = { method: "POST" };
 
     try {
+      // http:// goes through http.request: real https.request rejects that
+      // protocol, so asserting it against the https spy would prove nothing.
+      http.request("http://127.0.0.2:11434/v1/chat/completions", options);
+      http.request("http://[::ffff:127.0.0.2]:11434/v1/chat/completions", options);
       https.request("https://api.x.example./v1/chat/completions", options);
-      https.request("http://127.0.0.2:11434/v1/chat/completions", options);
       https.request("https://discord.com/api/v10/channels/123/messages", options);
 
-      expect(requestSpy.mock.calls[0][0]).toBe("https://api.x.example./v1/chat/completions");
-      expect(requestSpy.mock.calls[1][0]).toBe("http://127.0.0.2:11434/v1/chat/completions");
-      expect(requestSpy.mock.calls[2][0]).toBe("https://discord.com/api/v10/channels/123/messages");
+      expect(httpSpy.mock.calls[0][0]).toBe("http://127.0.0.2:11434/v1/chat/completions");
+      expect(httpSpy.mock.calls[1][0]).toBe("http://[::ffff:127.0.0.2]:11434/v1/chat/completions");
+      expect(httpsSpy.mock.calls[0][0]).toBe("https://api.x.example./v1/chat/completions");
+      expect(httpsSpy.mock.calls[1][0]).toBe("https://discord.com/api/v10/channels/123/messages");
     } finally {
       uninstallHeadroomTransport();
-      requestSpy.mockRestore();
+      httpsSpy.mockRestore();
+      httpSpy.mockRestore();
     }
   });
 
