@@ -148,14 +148,38 @@ function usableProxyUrl(proxyUrl2) {
     return void 0;
   }
 }
+function canonicalHostname(hostname) {
+  return hostname.toLowerCase().replace(/^\[|\]$/g, "").replace(/\.+$/, "");
+}
 function isLoopback(hostname) {
-  const normalized = hostname.toLowerCase().replace(/^\[|\]$/g, "");
-  return normalized === "localhost" || normalized === "127.0.0.1" || normalized === "::1";
+  const normalized = canonicalHostname(hostname);
+  if (normalized === "localhost" || normalized === "::1" || normalized === "0.0.0.0") {
+    return true;
+  }
+  if (isLoopbackIpv4(normalized)) {
+    return true;
+  }
+  const mapped = /^::ffff:(.+)$/.exec(normalized)?.[1];
+  if (!mapped) {
+    return false;
+  }
+  if (isLoopbackIpv4(mapped)) {
+    return true;
+  }
+  const groups = /^([0-9a-f]{1,4}):([0-9a-f]{1,4})$/.exec(mapped);
+  if (!groups) {
+    return false;
+  }
+  const address = parseInt(groups[1], 16) << 16 | parseInt(groups[2], 16);
+  return address >>> 24 === 127;
+}
+function isLoopbackIpv4(host) {
+  return /^127\.\d{1,3}\.\d{1,3}\.\d{1,3}$/.test(host);
 }
 function normalizeExcludeHosts(entries) {
   const hosts = /* @__PURE__ */ new Set();
   for (const entry of typeof entries === "string" ? entries.split(",") : entries) {
-    const host = String(entry).trim().toLowerCase().replace(/^(\*\.|\.)/, "");
+    const host = canonicalHostname(String(entry).trim()).replace(/^(?:\*\.|\.)/, "");
     if (host) {
       hosts.add(host);
     }
@@ -163,11 +187,28 @@ function normalizeExcludeHosts(entries) {
   return [...hosts];
 }
 function isExcludedHost(hostname, excludeHosts) {
-  const normalized = hostname.toLowerCase().replace(/^\[|\]$/g, "");
+  const normalized = canonicalHostname(hostname);
   return excludeHosts.some((host) => normalized === host || normalized.endsWith(`.${host}`));
 }
+var NAMED_WIRE_ROOTS = /* @__PURE__ */ new Set(["backend-api", "codex", "openai", "anthropic", "zen"]);
+function isVersionSegment(segment) {
+  return /^v\d+[a-z0-9]*$/i.test(segment);
+}
+function hasWireRootBefore(body) {
+  const segments = body.split("/").filter(Boolean);
+  const last = segments.at(-1);
+  return last === void 0 || isVersionSegment(last) || segments.some((s) => NAMED_WIRE_ROOTS.has(s));
+}
 function isLlmEndpointPath(pathname) {
-  return pathname.endsWith("/chat/completions") || pathname.endsWith("/responses") || pathname.endsWith("/messages") || pathname.endsWith(":generateContent") || pathname.endsWith(":streamGenerateContent");
+  if (pathname.endsWith(":generateContent") || pathname.endsWith(":streamGenerateContent")) {
+    return true;
+  }
+  for (const suffix of ["/chat/completions", "/responses", "/messages"]) {
+    if (pathname.endsWith(suffix)) {
+      return hasWireRootBefore(pathname.slice(0, -suffix.length));
+    }
+  }
+  return false;
 }
 function isRoutableUpstream(url, proxy, excludeHosts) {
   if (url.protocol !== "http:" && url.protocol !== "https:") {

@@ -240,9 +240,45 @@ function usableProxyUrl(proxyUrl: string): URL | undefined {
   }
 }
 
+// A hostname reaches this module as WHATWG `URL.hostname`, so a few spellings of
+// the same host are still distinct strings: "example.com." is the same name as
+// "example.com" (a fully qualified name), and an IPv4-mapped IPv6 loopback
+// arrives canonicalized as "[::ffff:7f00:1]" - never as "127.0.0.1" or "::1".
+// Compare canonical forms, or the loopback and exclude checks miss (#4747).
+function canonicalHostname(hostname: string): string {
+  return hostname.toLowerCase().replace(/^\[|\]$/g, "").replace(/\.+$/, "");
+}
+
 function isLoopback(hostname: string): boolean {
-  const normalized = hostname.toLowerCase().replace(/^\[|\]$/g, "");
-  return normalized === "localhost" || normalized === "127.0.0.1" || normalized === "::1";
+  const normalized = canonicalHostname(hostname);
+  if (normalized === "localhost" || normalized === "::1" || normalized === "0.0.0.0") {
+    return true;
+  }
+  // 127.0.0.0/8 is entirely loopback, not just 127.0.0.1.
+  if (isLoopbackIpv4(normalized)) {
+    return true;
+  }
+  const mapped = /^::ffff:(.+)$/.exec(normalized)?.[1];
+  if (!mapped) {
+    return false;
+  }
+  // URL canonicalization writes the embedded IPv4 in hex ("::ffff:7f00:1"),
+  // but accept the dotted form too, which some non-WHATWG callers pass through.
+  if (isLoopbackIpv4(mapped)) {
+    return true;
+  }
+  // Two remaining groups are the full 32-bit address: 127.1.2.3 is
+  // "::ffff:7f01:203", so the last two octets share the low group.
+  const groups = /^([0-9a-f]{1,4}):([0-9a-f]{1,4})$/.exec(mapped);
+  if (!groups) {
+    return false;
+  }
+  const address = (parseInt(groups[1], 16) << 16) | parseInt(groups[2], 16);
+  return address >>> 24 === 127;
+}
+
+function isLoopbackIpv4(host: string): boolean {
+  return /^127\.\d{1,3}\.\d{1,3}\.\d{1,3}$/.test(host);
 }
 
 // "example.com", ".example.com" and "*.example.com" all mean the host itself
@@ -253,7 +289,7 @@ function isLoopback(hostname: string): boolean {
 export function normalizeExcludeHosts(entries: string | Iterable<unknown>): string[] {
   const hosts = new Set<string>();
   for (const entry of typeof entries === "string" ? entries.split(",") : entries) {
-    const host = String(entry).trim().toLowerCase().replace(/^(\*\.|\.)/, "");
+    const host = canonicalHostname(String(entry).trim()).replace(/^(?:\*\.|\.)/, "");
     if (host) {
       hosts.add(host);
     }
@@ -262,27 +298,61 @@ export function normalizeExcludeHosts(entries: string | Iterable<unknown>): stri
 }
 
 function isExcludedHost(hostname: string, excludeHosts: string[]): boolean {
-  const normalized = hostname.toLowerCase().replace(/^\[|\]$/g, "");
+  const normalized = canonicalHostname(hostname);
   return excludeHosts.some((host) => normalized === host || normalized.endsWith(`.${host}`));
 }
 
 // Only recognized LLM API endpoints route through Headroom; any other path
 // (WebFetch, registries, GitHub, unknown services) must reach its original URL
-// untouched. A bare suffix match keeps provider-prefixed variants working
-// (/api/coding/paas/v4/chat/completions, /base/v1/messages, ...).
+// untouched.
 //
+// The endpoint suffix alone cannot decide this. Discord's
+// /api/v10/channels/123/messages and a forms API's /forms/123/responses end in
+// the same two segments, so a bare suffix match rerouted them - with the
+// caller's Authorization header - to the proxy (#4747). A path therefore also
+// has to be rooted where providers mount a wire:
+//
+// * the segment right before the endpoint is a version ("v1", "v1beta", "v4"),
+//   which keeps prefixed gateways working (/api/coding/paas/v4/chat/completions,
+//   /base/v1/messages, /zen/v1/responses), or
+// * the path contains a named wire root, which is what Azure OpenAI needs: its
+//   deployment name sits between /openai/ and the endpoint
+//   (/openai/deployments/{name}/chat/completions).
+//
+// A bare /messages or /responses on a provider origin still counts: there is no
+// segment at all.
+//
+// A version segment anywhere would be too weak - Discord's /api/v10/... has
+// one. So the residual over-match is narrower but real: /api/v2/messages still
+// routes. Telling that apart from a provider needs the host or the body;
+// excludeHosts already covers any host a user controls.
+const NAMED_WIRE_ROOTS = new Set(["backend-api", "codex", "openai", "anthropic", "zen"]);
+
+function isVersionSegment(segment: string): boolean {
+  return /^v\d+[a-z0-9]*$/i.test(segment);
+}
+
+function hasWireRootBefore(body: string): boolean {
+  const segments = body.split("/").filter(Boolean);
+  const last = segments.at(-1);
+  return last === undefined || isVersionSegment(last) || segments.some((s) => NAMED_WIRE_ROOTS.has(s));
+}
+
 // Native Gemini model-generation endpoints use colon-action suffixes
 // (:generateContent, :streamGenerateContent). These are matched by exact
 // suffix so that lookalike paths containing the marker but not ending with it
-// (e.g. /v1/models/gemini:generateContent/status) remain unrouted.
+// (e.g. /v1/models/gemini:generateContent/status) remain unrouted. They are
+// specific enough to need no wire root.
 function isLlmEndpointPath(pathname: string): boolean {
-  return (
-    pathname.endsWith("/chat/completions") ||
-    pathname.endsWith("/responses") ||
-    pathname.endsWith("/messages") ||
-    pathname.endsWith(":generateContent") ||
-    pathname.endsWith(":streamGenerateContent")
-  );
+  if (pathname.endsWith(":generateContent") || pathname.endsWith(":streamGenerateContent")) {
+    return true;
+  }
+  for (const suffix of ["/chat/completions", "/responses", "/messages"]) {
+    if (pathname.endsWith(suffix)) {
+      return hasWireRootBefore(pathname.slice(0, -suffix.length));
+    }
+  }
+  return false;
 }
 
 function isRoutableUpstream(url: URL, proxy: URL, excludeHosts: string[]): boolean {
