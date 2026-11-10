@@ -82,7 +82,7 @@ def estimate_ttls(
     a cross-model aggregate is not a sound interval.
 
     A key is emitted only when it has both enough life evidence (``min_hits``
-    hits with a positive, finite idle) and enough death evidence
+    explicit ``hit`` outcomes with a positive, finite idle) and enough death evidence
     (``min_expiry_misses`` ``ttl_expiry`` misses), AND at least one death was
     observed at an idle larger than every observed life — otherwise the
     interval has no safe upper end and the static default is the better
@@ -109,10 +109,12 @@ def estimate_ttls(
         # would abort the whole batch. Drop them with the other bad input.
         if not math.isfinite(idle) or idle <= 0:
             continue
-        if row.get("is_miss"):
+        if row.get("is_miss") is True:
             if row.get("reason") == "ttl_expiry":
                 expiries[key].append(idle)
-        else:
+        elif row.get("is_miss") is False and row.get("reason") == "hit":
+            # cold_start also has is_miss=False, but no previous cached prefix
+            # existed: it supplies no evidence that a cache survived this idle.
             hits[key].append(idle)
 
     now = round(time.time(), 3)
