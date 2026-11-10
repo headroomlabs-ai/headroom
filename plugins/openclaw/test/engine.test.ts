@@ -416,6 +416,32 @@ describe("HeadroomContextEngine proxy startup helpers", () => {
     );
   });
 
+  it("does not count an empty context as a failure", async () => {
+    // The proxy answers 200 with tokens_before: 0 for an empty message list, so
+    // zero tokens there is a real answer, not a failure.
+    vi.mocked(compress).mockResolvedValue({
+      compressed: false,
+      messages: [],
+      tokensBefore: 0,
+      tokensAfter: 0,
+      tokensSaved: 0,
+    });
+    const engine = new HeadroomContextEngine({
+      minContextChars: 0,
+      circuitBreakerThreshold: 1,
+    });
+    (engine as { proxyUrl: string | null }).proxyUrl = "http://127.0.0.1:8787";
+
+    await engine.assemble({ sessionId: "session-1", messages: [] });
+    await engine.assemble({ sessionId: "session-1", messages: [] });
+
+    // The breaker must stay closed, so the next call still reaches the proxy.
+    expect(compress).toHaveBeenCalledTimes(2);
+    expect(mocked.logger.warn).not.toHaveBeenCalledWith(
+      expect.stringContaining("Circuit breaker opened"),
+    );
+  });
+
   it("does not count a genuine no-savings result as a failure", async () => {
     vi.mocked(compress).mockResolvedValue({
       compressed: false,

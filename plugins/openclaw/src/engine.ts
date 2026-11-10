@@ -177,10 +177,11 @@ export class HeadroomContextEngine {
         timeout: this.config.requestTimeoutMs ?? 2_000,
       } as any);
 
-      // A zero token count means the proxy never answered — the SDK's fallback
-      // stub, or a response that was never tokenized. Count it as a failure so a
-      // resolved-but-empty result can't keep the breaker closed.
-      if (result.tokensBefore === 0) {
+      // A zero token count on nonempty input means the proxy never answered — the
+      // SDK's fallback stub, or a response that was never tokenized. Count it as a
+      // failure so a resolved-but-empty result can't keep the breaker closed. Empty
+      // input is exempt: the proxy legitimately answers 0 tokens for it.
+      if (result.tokensBefore === 0 && openaiMessages.length > 0) {
         this.tripCircuit(new Error("compress() returned no token count"));
         return {
           messages: normalizeAgentMessages(params.messages),
