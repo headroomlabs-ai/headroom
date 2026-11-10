@@ -65,6 +65,22 @@ def test_dirty_worktree_is_refused_and_left_intact(repo, run_main):
     assert (repo / "notes.md").read_text() == "untracked work"
 
 
+def test_untracked_work_is_refused_even_when_git_hides_untracked_files(repo, run_main, monkeypatch):
+    # status.showUntrackedFiles=no makes a bare `git status --porcelain` blind to
+    # untracked files, while the cleanup's `git clean -fd` still deletes them.
+    _git(repo, "config", "status.showUntrackedFiles", "no")
+    (repo / "precious-notes.txt").write_text("untracked work")
+
+    def never_called(*a, **k):
+        raise AssertionError("the benchmark must not start on a worktree with untracked work")
+
+    monkeypatch.setattr(codemode_ab, "run_one", never_called)
+    rc, err = run_main(repo)
+    assert rc == 2
+    assert "uncommitted changes" in err
+    assert (repo / "precious-notes.txt").read_text() == "untracked work"
+
+
 def test_non_git_directory_is_refused(tmp_path, run_main):
     plain = tmp_path / "plain"
     plain.mkdir()

@@ -295,7 +295,14 @@ def main() -> int:
 
     # The per-run cleanup below is `git reset --hard` + `git clean -fd`: refuse a
     # worktree that is not a clean git checkout so it cannot destroy user work.
-    git = subprocess.run(["git", "status", "--porcelain"], cwd=wt, capture_output=True, text=True)
+    # --untracked-files=all: `status.showUntrackedFiles=no` would hide the untracked
+    # files that `git clean -fd` deletes.
+    git = subprocess.run(
+        ["git", "status", "--porcelain", "--untracked-files=all"],
+        cwd=wt,
+        capture_output=True,
+        text=True,
+    )
     if git.returncode != 0:
         print(f"error: --worktree {wt} is not inside a git work tree", file=sys.stderr)
         return 2
