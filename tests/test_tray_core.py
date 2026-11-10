@@ -68,10 +68,15 @@ def test_available_update(monkeypatch: pytest.MonkeyPatch) -> None:
     import headroom.update_check as uc
 
     monkeypatch.setattr(uc, "is_update_check_enabled", lambda: True)
+    monkeypatch.setattr(uc, "_is_source_checkout", lambda: False)
+    monkeypatch.setattr(uc, "_in_docker", lambda: False)
     monkeypatch.setattr(uc, "installed_version", lambda: "1.0.0")
     monkeypatch.setattr(uc, "read_cache", lambda: {"latest_version": "1.2.0"})
     assert core.available_update() == "1.2.0"
     monkeypatch.setattr(uc, "read_cache", lambda: {"latest_version": "1.0.0"})
+    assert core.available_update() is None
+    monkeypatch.setattr(uc, "_in_docker", lambda: True)
+    monkeypatch.setattr(uc, "read_cache", lambda: {"latest_version": "1.2.0"})
     assert core.available_update() is None
 
 

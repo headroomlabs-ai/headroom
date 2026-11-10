@@ -117,12 +117,14 @@ def available_update() -> str | None:
         from packaging.version import Version
 
         from headroom.update_check import (
+            _in_docker,
+            _is_source_checkout,
             installed_version,
             is_update_check_enabled,
             read_cache,
         )
 
-        if not is_update_check_enabled():
+        if not is_update_check_enabled() or _is_source_checkout() or _in_docker():
             return None
         cache = read_cache() or {}
         latest, current = cache.get("latest_version"), installed_version()
