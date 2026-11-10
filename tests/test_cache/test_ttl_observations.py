@@ -2,12 +2,85 @@
 
 import json
 import os
+from types import SimpleNamespace
 
 import pytest
 
 from headroom.cache import ttl_observations
 from headroom.cache.prefix_tracker import PrefixCacheTracker
 from headroom.transforms.cold_prefix import is_cold_prefix
+
+
+@pytest.mark.parametrize("layout", ["filename", "nested", "absolute"])
+def test_observation_path_records_each_turn(tmp_path, monkeypatch, layout):
+    monkeypatch.chdir(tmp_path)
+    path = {
+        "filename": "observations.jsonl",
+        "nested": "nested/observations.jsonl",
+        "absolute": str(tmp_path / "absolute" / "observations.jsonl"),
+    }[layout]
+    monkeypatch.setenv("HEADROOM_CACHE_TTL_LEARN", "1")
+    monkeypatch.delenv("HEADROOM_STATELESS", raising=False)
+    monkeypatch.setenv("HEADROOM_CACHE_TTL_OBS_PATH", path)
+    for miss in (False, True):
+        attribution = SimpleNamespace(reason="ttl_expiry" if miss else "hit", is_miss=miss)
+        ttl_observations.record_cache_observation(
+            provider="openai", model="fixture", attribution=attribution
+        )
+
+    with open(path, encoding="utf-8") as stream:
+        rows = [json.loads(line) for line in stream]
+    assert [row["is_miss"] for row in rows] == [False, True]
+    assert all(row["model"] == "fixture" for row in rows)
+
+
+@pytest.mark.parametrize("stateless", [False, True])
+def test_relative_observation_path_respects_write_gates(tmp_path, monkeypatch, stateless):
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("HEADROOM_CACHE_TTL_OBS_PATH", "observations.jsonl")
+    monkeypatch.setenv("HEADROOM_CACHE_TTL_LEARN", "1" if stateless else "0")
+    monkeypatch.setenv("HEADROOM_STATELESS", "1" if stateless else "0")
+    ttl_observations.record_cache_observation(
+        provider="openai", model="fixture", attribution=SimpleNamespace()
+    )
+    assert not (tmp_path / "observations.jsonl").exists()
+
+
+def test_observation_path_failure_still_does_not_raise(tmp_path, monkeypatch):
+    parent = tmp_path / "not-a-directory"
+    parent.write_bytes(b"keep")
+    monkeypatch.setenv("HEADROOM_CACHE_TTL_OBS_PATH", str(parent / "observations.jsonl"))
+    monkeypatch.setenv("HEADROOM_CACHE_TTL_LEARN", "1")
+    monkeypatch.delenv("HEADROOM_STATELESS", raising=False)
+    ttl_observations.record_cache_observation(
+        provider="openai", model="fixture", attribution=SimpleNamespace()
+    )
+    assert parent.read_bytes() == b"keep"
+
+
+@pytest.mark.windows_newline
+def test_observation_writer_pins_lf(tmp_path, monkeypatch):
+    import builtins
+
+    path = tmp_path / "observations.jsonl"
+    monkeypatch.setenv("HEADROOM_CACHE_TTL_OBS_PATH", str(path))
+    monkeypatch.setenv("HEADROOM_CACHE_TTL_LEARN", "1")
+    monkeypatch.delenv("HEADROOM_STATELESS", raising=False)
+    real_open = builtins.open
+    writes = []
+
+    def recording_open(*args, **kwargs):
+        if args[0] == str(path) and len(args) > 1 and args[1] == "a":
+            writes.append(kwargs.get("newline"))
+        return real_open(*args, **kwargs)
+
+    monkeypatch.setattr(builtins, "open", recording_open)
+    ttl_observations.record_cache_observation(
+        provider="openai", model="fixture", attribution=SimpleNamespace()
+    )
+    assert writes == ["\n"]
+    assert path.read_bytes().endswith(b"\n")
+    assert b"\r" not in path.read_bytes()
 
 
 @pytest.fixture

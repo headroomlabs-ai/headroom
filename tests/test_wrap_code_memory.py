@@ -1,9 +1,9 @@
-"""Code-memory MCP is selectable via --code-memory (default serena).
+"""Code-memory MCP is selectable via --code-memory (default none; Serena is opt-in).
 
 Covers the resolver precedence (selector > deprecated flags > default), the
 graceful retirement of the removed ``tokensave`` option, the orchestrator
 dispatch for each selection, and that --code-memory is exposed on the
-code-memory-capable subcommands (claude/codex/grok) but not others.
+code-memory-capable subcommands (claude/codex/grok/opencode) but not others.
 """
 
 from __future__ import annotations
@@ -24,9 +24,9 @@ def _clean_env() -> dict[str, str]:
     return env
 
 
-def test_default_is_serena() -> None:
+def test_default_is_none() -> None:
     with patch.dict(os.environ, _clean_env(), clear=True):
-        assert wrap._resolve_code_memory({}) == wrap._CODE_MEMORY_SERENA
+        assert wrap._resolve_code_memory({}) == wrap._CODE_MEMORY_NONE
 
 
 def test_selector_env_wins() -> None:
@@ -39,10 +39,14 @@ def test_selector_env_wins() -> None:
 def test_deprecated_flags_map_into_selector() -> None:
     with patch.dict(os.environ, _clean_env(), clear=True):
         assert wrap._resolve_code_memory({"serena": True}) == wrap._CODE_MEMORY_SERENA
-        # tokensave is retired: --no-tokensave is now a no-op → default serena
-        assert wrap._resolve_code_memory({"no_tokensave": True}) == wrap._CODE_MEMORY_SERENA
+        # tokensave is retired: --no-tokensave is a no-op → default none
+        assert wrap._resolve_code_memory({"no_tokensave": True}) == wrap._CODE_MEMORY_NONE
         # --no-serena means "no code memory" now that tokensave is gone
         assert wrap._resolve_code_memory({"no_serena": True}) == wrap._CODE_MEMORY_NONE
+        # opt-out wins over opt-in when both legacy flags are given
+        assert (
+            wrap._resolve_code_memory({"serena": True, "no_serena": True}) == wrap._CODE_MEMORY_NONE
+        )
 
 
 def test_retired_tokensave_selector_maps_to_serena() -> None:
@@ -54,6 +58,7 @@ def test_retired_tokensave_selector_maps_to_serena() -> None:
 
 def test_serena_dashboard_disabled_flips_existing_config(tmp_path, monkeypatch) -> None:
     monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("USERPROFILE", str(tmp_path))
     cfg = tmp_path / ".serena" / "serena_config.yml"
     cfg.parent.mkdir(parents=True)
     cfg.write_text(
@@ -80,6 +85,7 @@ def test_serena_config_is_never_created_by_headroom(tmp_path, monkeypatch) -> No
     pins our own key list would go on passing while users broke again.
     """
     monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("USERPROFILE", str(tmp_path))
 
     wrap._ensure_serena_dashboard_disabled()
 
@@ -96,6 +102,7 @@ def test_serena_dashboard_disabled_repairs_config_missing_projects(tmp_path, mon
     import yaml
 
     monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("USERPROFILE", str(tmp_path))
     cfg = tmp_path / ".serena" / "serena_config.yml"
     cfg.parent.mkdir(parents=True)
     cfg.write_text("web_dashboard_open_on_launch: false\n")
@@ -112,6 +119,7 @@ def test_serena_dashboard_disabled_preserves_registered_projects(tmp_path, monke
     import yaml
 
     monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("USERPROFILE", str(tmp_path))
     cfg = tmp_path / ".serena" / "serena_config.yml"
     cfg.parent.mkdir(parents=True)
     cfg.write_text(
@@ -131,6 +139,7 @@ def test_serena_dashboard_disabled_preserves_registered_projects(tmp_path, monke
 
 def test_serena_dashboard_disabled_is_idempotent(tmp_path, monkeypatch) -> None:
     monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("USERPROFILE", str(tmp_path))
     cfg = tmp_path / ".serena" / "serena_config.yml"
     cfg.parent.mkdir(parents=True)
     cfg.write_text("projects: []\nweb_dashboard_open_on_launch: true\n")
@@ -202,7 +211,7 @@ def test_orchestrator_dispatch() -> None:
 
 def test_code_memory_option_present_only_on_code_memory_agents() -> None:
     runner = CliRunner()
-    for tool in ("claude", "codex", "grok"):
+    for tool in ("claude", "codex", "grok", "opencode"):
         out = runner.invoke(wrap.wrap, [tool, "--help"]).output
         assert "--code-memory" in out, f"--code-memory missing from `wrap {tool} --help`"
     # aider does not register a code-memory MCP → no flag

@@ -372,7 +372,10 @@ fn parse_tag_at(bytes: &[u8], start: usize) -> TagParse {
                 };
             }
             b'/' => {
-                self_closing = true;
+                // Only the `/>` pair closes the tag. A `/` inside an
+                // unquoted attribute value (`path=/src/main.rs`) is an
+                // ordinary character and must not make the tag self-closing.
+                self_closing = bytes.get(i + 1) == Some(&b'>');
                 i += 1;
             }
             b'"' | b'\'' => {
@@ -877,6 +880,20 @@ mod tests {
         assert!(cleaned.contains("body"));
         assert_eq!(stats.orphan_closes, 0);
         assert_eq!(restore_tags(&cleaned, &blocks), text);
+    }
+
+    #[test]
+    fn unquoted_attribute_value_with_slash_is_not_self_closing() {
+        let text = "Before <file path=/src/main.rs>body</file> After";
+        let (cleaned, blocks) = protect(text);
+        assert_eq!(blocks.len(), 1, "{cleaned}");
+        assert_eq!(blocks[0].1, "<file path=/src/main.rs>body</file>");
+        assert!(!cleaned.contains("body"), "{cleaned}");
+        assert!(!cleaned.contains("</file>"), "{cleaned}");
+        // `/>` still self-closes, with or without an unquoted value before it.
+        let (_cleaned, blocks) = protect("x <marker path=/a/b/> y");
+        assert_eq!(blocks.len(), 1);
+        assert_eq!(blocks[0].1, "<marker path=/a/b/>");
     }
 
     #[test]
