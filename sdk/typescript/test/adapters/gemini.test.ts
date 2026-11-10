@@ -194,4 +194,32 @@ describe("Gemini withHeadroom", () => {
 
     expect(mockModel.generateContent).toHaveBeenCalledWith({ contents });
   });
+
+  it("accepts a plain string and an array of strings as contents", async () => {
+    const mockModel = { generateContent: vi.fn().mockResolvedValue({}) };
+    mockFetch.mockResolvedValue(mockCompressResponse([]));
+
+    const wrapped = withHeadroom(mockModel, { baseUrl: "http://test:8787" });
+
+    await wrapped.generateContent("text");
+    const firstBody = JSON.parse(mockFetch.mock.calls[0][1].body);
+    expect(firstBody.messages).toEqual([{ role: "user", content: "text" }]);
+
+    await wrapped.generateContent(["a", "b"]);
+    const secondBody = JSON.parse(mockFetch.mock.calls[1][1].body);
+    expect(secondBody.messages).toEqual([
+      { role: "user", content: "a" },
+      { role: "user", content: "b" },
+    ]);
+  });
+
+  it("passes string params through when nothing was compressed", async () => {
+    const mockModel = { generateContent: vi.fn().mockResolvedValue({}) };
+    mockFetch.mockRejectedValue(new Error("connect ECONNREFUSED"));
+
+    const wrapped = withHeadroom(mockModel, { baseUrl: "http://test:8787" });
+    await wrapped.generateContent("text");
+
+    expect(mockModel.generateContent).toHaveBeenCalledWith("text");
+  });
 });

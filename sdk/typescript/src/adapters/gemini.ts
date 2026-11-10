@@ -15,6 +15,18 @@ interface GeminiModelLike {
 }
 
 /**
+ * Normalize `contents` the way the Gemini SDK does: a bare string (or an array
+ * of them) is shorthand for a user turn, and must not reach format detection,
+ * which only understands `{ role, parts }` objects.
+ */
+function normalizeContents(contents: any): any[] {
+  const list = Array.isArray(contents) ? contents : [contents];
+  return list.map((c) =>
+    typeof c === "string" ? { role: "user", parts: [{ text: c }] } : c,
+  );
+}
+
+/**
  * Wrap a Google Generative AI model to auto-compress before each request.
  *
  * Intercepts `model.generateContent()` and `model.generateContentStream()`.
@@ -37,39 +49,29 @@ export function withHeadroom<T extends GeminiModelLike>(
   const originalGenerate = model.generateContent.bind(model);
   const originalStream = model.generateContentStream?.bind(model);
 
-  const compressedGenerate = async (params: any) => {
-    const contents = params.contents ?? params;
+  const compressParams = async (params: any): Promise<any> => {
     const modelName = options.model ?? "gemini-2.0-flash";
 
     // compress() auto-detects Gemini format
     const result = await compress(
-      Array.isArray(contents) ? contents : [contents],
+      normalizeContents(params?.contents ?? params),
       { stack: "adapter_ts_gemini", ...options, model: modelName },
     );
 
-    const newParams = Array.isArray(params)
+    // Unchanged request (proxy down / nothing to compress): hand the original
+    // params through untouched, as the Anthropic and Vercel adapters do.
+    if (!result.compressed) return params;
+
+    return Array.isArray(params) || typeof params === "string"
       ? result.messages
       : { ...params, contents: result.messages };
-
-    return originalGenerate(newParams);
   };
 
+  const compressedGenerate = async (params: any) =>
+    originalGenerate(await compressParams(params));
+
   const compressedStream = originalStream
-    ? async (params: any) => {
-        const contents = params.contents ?? params;
-        const modelName = options.model ?? "gemini-2.0-flash";
-
-        const result = await compress(
-          Array.isArray(contents) ? contents : [contents],
-          { stack: "adapter_ts_gemini", ...options, model: modelName },
-        );
-
-        const newParams = Array.isArray(params)
-          ? result.messages
-          : { ...params, contents: result.messages };
-
-        return originalStream(newParams);
-      }
+    ? async (params: any) => originalStream(await compressParams(params))
     : undefined;
 
   return new Proxy(model, {

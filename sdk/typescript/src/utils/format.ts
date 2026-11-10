@@ -39,6 +39,9 @@ export type MessageFormat = "openai" | "anthropic" | "vercel" | "gemini";
 export function detectFormat(messages: any[]): MessageFormat {
   let providerOptions = false;
   for (const msg of messages) {
+    // Skip anything that isn't a message object (e.g. a bare string).
+    if (!msg || typeof msg !== "object") continue;
+
     // Gemini: uses `parts` instead of `content`
     if ("parts" in msg && !("content" in msg)) return "gemini";
 
@@ -880,7 +883,8 @@ export function geminiToOpenAI(messages: any[]): OpenAIMessage[] {
           type: "function",
           function: {
             name: p.functionCall.name,
-            arguments: JSON.stringify(p.functionCall.args),
+            // `args` is optional in the Gemini API; OpenAI requires an object.
+            arguments: JSON.stringify(p.functionCall.args ?? {}),
           },
         }));
       }
@@ -933,9 +937,11 @@ export function openAIToGemini(messages: OpenAIMessage[]): any[] {
       }
       if (msg.tool_calls) {
         for (const tc of msg.tool_calls) {
-          parts.push({
-            functionCall: { name: tc.function.name, args: JSON.parse(tc.function.arguments) },
-          });
+          // `arguments` may be missing or malformed: a proxy round-trip drops
+          // `undefined`, and Gemini only requires an object here.
+          let args: any;
+          try { args = JSON.parse(tc.function.arguments ?? "{}"); } catch { args = {}; }
+          parts.push({ functionCall: { name: tc.function.name, args } });
         }
       }
       result.push({ role: "model", parts });
