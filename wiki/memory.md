@@ -74,21 +74,9 @@ Claude Code                  Codex CLI                  Gemini CLI
 
 ### Project-Scoped Database
 
-In local `project` mode (the default), each resolved workspace gets its own
-SQLite database at `<memory-db-parent>/memories/projects/<project-key>/memory.db`.
-Use `--memory-db-path` to choose the base database path.
-
-Resolution checks `x-headroom-project-id`, then `x-headroom-cwd`, then
-`--memory-project-root`, then the client's system-prompt working directory.
-Claude Code / Codex cwd lines and pi's `<cwd>...</cwd>` block are supported.
-The same directory produces the same project key across these formats;
-explicit request headers still win.
-
-With the default `empty` fallback, Anthropic requests with an unresolved project
-receive neither memory context nor Headroom memory tools, even when the session
-previously injected those tools. Client-owned tools are left alone. Once scope
-is restored, the session can replay its memory definitions. Explicit `user` /
-`global` storage and configured global fallback keep their existing behavior.
+Memory is stored per-project at `{cwd}/.headroom/memory.db`. Each
+project has its own memory — no cross-project contamination. Override
+with `--memory-db-path` for a custom location.
 
 > **Filesystem contract note.** Project-scoped memory paths resolve
 > relative to the current working directory and **do not** obey the
