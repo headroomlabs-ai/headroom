@@ -39,7 +39,7 @@ System messages are never dropped. They contain critical instructions, persona d
 
 ### Turn protection
 
-The last N messages are always preserved, ensuring the model has immediate conversational context. The one-function `compress()` API exposes this as `CompressConfig.protect_recent`, which defaults to `4` messages -- see `headroom/compress.py`. It guards recent **code** only: tool payloads detected as JSON, logs or text are not shielded by it, and neither are file reads (those are held back by read protection instead).
+The last N messages are always preserved, ensuring the model has immediate conversational context. The one-function `compress()` API exposes this as `CompressConfig.protect_recent`, which defaults to `4` messages -- see `headroom/compress.py`. It guards recent **code** only: tool payloads detected as JSON, logs or text are not shielded by it. File reads are held back by read protection instead, which protects by default and releases only confidently non-code data (JSON, CSV/tabular, build/test logs, git diffs, HTML, search output) -- see `_read_output_should_be_protected`.
 
 ## Configuration
 
