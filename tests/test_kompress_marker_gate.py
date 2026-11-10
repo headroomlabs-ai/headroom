@@ -103,6 +103,30 @@ def test_payload_tokens_is_cl100k_or_one_per_character(monkeypatch):
     assert payload_tokens(marker) == len(marker)
 
 
+def test_an_unavailable_encoder_is_retried_not_pinned(monkeypatch):
+    """A failed load (e.g. HEADROOM_OFFLINE refusing a cold vocabulary cache)
+    falls back to character counts for that call only; once the encoder can
+    load, the gate measures in tokens again."""
+    from headroom.tokenizers import tiktoken_counter as tc
+
+    class _OneTokenPerWord:
+        def encode(self, text: str, disallowed_special: object = ()) -> list[str]:
+            return text.split()
+
+    available = False
+
+    def _load(_name: str) -> _OneTokenPerWord:
+        if not available:
+            raise tc.TiktokenLoadError("refused")
+        return _OneTokenPerWord()
+
+    monkeypatch.setattr(kc, "_payload_encoder", None)
+    monkeypatch.setattr(tc, "load_encoding", _load)
+    assert payload_tokens("two words") == len("two words")
+    available = True
+    assert payload_tokens("two words") == 2
+
+
 @pytest.mark.parametrize(
     ("source", "drop"),
     [(SINGLE_TOKEN_SOURCE, 41), (HEAD_WORD_SOURCE, 36)],

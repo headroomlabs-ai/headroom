@@ -1688,7 +1688,12 @@ def payload_tokens(text: str) -> int:
 
             _payload_encoder = load_encoding("cl100k_base")
         except Exception:
-            _payload_encoder = False
+            # Not memoised: an offline refusal of a cold vocabulary cache
+            # must not pin the gate to character counts after the cache is
+            # seeded or the switch is turned off. Retrying is cheap, because
+            # load_encoding fails fast for a refusal (one cache lookup) and
+            # for a timed-out download (its _load_failed short-circuit).
+            pass
     if _payload_encoder:
         try:
             return len(_payload_encoder.encode(text, disallowed_special=()))
