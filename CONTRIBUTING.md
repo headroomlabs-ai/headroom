@@ -86,6 +86,29 @@ A human maintainer reviews every dep change. PRs that add or bump a package must
 
 **Review:** CI green, one maintainer review, coverage held/improved.
 
+## Posting PR/issue comments from scripts or agents
+
+Scripted replies can succeed (`gh api` exits 0) while posting garbage. Build the body from a single string, send it as JSON or a file, and read it back before reporting success.
+
+```powershell
+# Wrong: passes the whole hashtable; the reply body becomes "System.Collections.Hashtable"
+foreach ($k in $m.Keys) { gh api "$r/$k/replies" -f body=$m }
+
+# Right: one string per call, sent via --input, then verified
+foreach ($k in $m.Keys) {
+  $tmp = New-TemporaryFile
+  @{ body = [string]$m[$k] } | ConvertTo-Json | Set-Content -Encoding utf8 $tmp
+  $reply = gh api "$r/$k/replies" --input $tmp | ConvertFrom-Json
+  Remove-Item $tmp
+  gh api "repos/<owner>/<repo>/pulls/comments/$($reply.id)" --jq .body   # confirm it reads as intended
+}
+```
+
+- Never pass a collection to `-f`/`-F`; index it (`$m[$k]`) first.
+- Prefer `--input <json-file>` or `--body-file` over inline multi-line strings. PowerShell has no `<<` heredocs.
+- After posting, re-fetch the comment and check the body. A successful POST only proves a comment was created.
+- A body that is a bare type name such as `System.Collections.Hashtable` means the script stringified an object; delete the comment (`gh api -X DELETE repos/<owner>/<repo>/pulls/comments/<id>`) and repost.
+
 ## Development setup
 
 ```bash
