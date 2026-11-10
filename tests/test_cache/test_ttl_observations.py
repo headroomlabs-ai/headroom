@@ -89,7 +89,76 @@ def learned_file(tmp_path, monkeypatch):
     monkeypatch.setenv("HEADROOM_CACHE_TTL_LEARNED_PATH", str(path))
     monkeypatch.setattr(ttl_observations, "_learned_cache", None)
     monkeypatch.setattr(ttl_observations, "_learned_mtime", -1.0)
+    monkeypatch.setattr(ttl_observations, "_learned_cache_path", None)
     return path
+
+
+@pytest.mark.parametrize(
+    "second_table, expected", [({"openai": 1800}, 1800), ({}, None), ([300], None)]
+)
+def test_learned_cache_follows_configured_path_with_equal_mtimes(
+    learned_file, monkeypatch, second_table, expected
+):
+    learned_file.write_text(json.dumps({"openai": 300}), encoding="utf-8")
+    second = learned_file.with_name("other.json")
+    second.write_text(json.dumps(second_table), encoding="utf-8")
+    for path in (learned_file, second):
+        os.utime(path, ns=(1_700_000_000_000_000_000,) * 2)
+    assert ttl_observations.resolve_learned_ttl("openai", "fixture") == 300
+
+    monkeypatch.setenv("HEADROOM_CACHE_TTL_LEARNED_PATH", str(second))
+    ttl = ttl_observations.resolve_learned_ttl("openai", "fixture")
+    assert ttl == expected
+    if expected is not None:
+        tracker = PrefixCacheTracker("openai")
+        tracker._idle_seconds_at_fetch = 600
+        assert not is_cold_prefix(tracker, ttl_seconds=ttl)
+
+    monkeypatch.setenv("HEADROOM_CACHE_TTL_LEARNED_PATH", str(learned_file))
+    assert ttl_observations.resolve_learned_ttl("openai", "fixture") == 300
+
+
+def test_relative_learned_path_tracks_its_current_directory(learned_file, tmp_path, monkeypatch):
+    first, second = tmp_path / "first", tmp_path / "second"
+    for directory, ttl in ((first, 300), (second, 1800)):
+        directory.mkdir()
+        path = directory / "learned.json"
+        path.write_text(json.dumps({"openai": ttl}), encoding="utf-8")
+        os.utime(path, ns=(1_700_000_000_000_000_000,) * 2)
+    monkeypatch.setenv("HEADROOM_CACHE_TTL_LEARNED_PATH", "learned.json")
+    monkeypatch.chdir(first)
+    assert ttl_observations.resolve_learned_ttl("openai", "fixture") == 300
+    monkeypatch.chdir(second)
+    assert ttl_observations.resolve_learned_ttl("openai", "fixture") == 1800
+
+
+def test_unchanged_learned_source_is_read_only_once(learned_file, monkeypatch):
+    import builtins
+
+    learned_file.write_text(json.dumps({"openai": 900}), encoding="utf-8")
+    real_open = builtins.open
+    reads = []
+
+    def recording_open(*args, **kwargs):
+        if os.fspath(args[0]) == str(learned_file):
+            reads.append(args[0])
+        return real_open(*args, **kwargs)
+
+    monkeypatch.setattr(builtins, "open", recording_open)
+    assert ttl_observations.resolve_learned_ttl("openai", "fixture") == 900
+    assert ttl_observations.resolve_learned_ttl("openai", "fixture") == 900
+    assert len(reads) == 1
+
+
+def test_missing_switched_source_stays_best_effort(learned_file, monkeypatch):
+    learned_file.write_text(json.dumps({"openai": 900}), encoding="utf-8")
+    assert ttl_observations.resolve_learned_ttl("openai", "fixture") == 900
+    monkeypatch.setenv(
+        "HEADROOM_CACHE_TTL_LEARNED_PATH", str(learned_file.with_name("missing.json"))
+    )
+    assert ttl_observations.resolve_learned_ttl("openai", "fixture") is None
+    monkeypatch.setenv("HEADROOM_CACHE_TTL_LEARNED_PATH", str(learned_file))
+    assert ttl_observations.resolve_learned_ttl("openai", "fixture") == 900
 
 
 @pytest.mark.parametrize("table", [[300], "not a table", 300, True])
