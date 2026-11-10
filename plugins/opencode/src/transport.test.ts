@@ -1110,4 +1110,35 @@ describe("Headroom OpenCode transport", () => {
     firstDispose();
     globalThis.fetch = originalFetch;
   });
+
+  it.each(["", "127.0.0.1:8787"])("leaves all traffic alone when the proxy URL is unusable (%j)", async (proxyUrl) => {
+    const originalFetch = globalThis.fetch;
+    const fetchMock = vi.fn(async (..._args: FetchCall) => new Response("ok"));
+    globalThis.fetch = fetchMock as unknown as typeof fetch;
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+
+    try {
+      installHeadroomTransport({ proxyUrl });
+
+      // Neither an LLM endpoint nor a plain download may throw or be rewritten.
+      await fetch("https://api.anthropic.com/v1/messages", { method: "POST" });
+      await fetch("https://registry.npmjs.org/left-pad");
+      expect(fetchMock).toHaveBeenCalledTimes(2);
+      expect(fetchMock.mock.calls[0][0]).toBe("https://api.anthropic.com/v1/messages");
+      expect(fetchMock.mock.calls[1][0]).toBe("https://registry.npmjs.org/left-pad");
+      expect(new Headers(fetchMock.mock.calls[0][1]?.headers).get("x-headroom-base-url")).toBeNull();
+
+      for (const [request, scheme] of [[http.request, "http"], [https.request, "https"]] as const) {
+        const req = request(`${scheme}://registry.npmjs.org/left-pad`, { method: "POST" });
+        req.on("error", () => {});
+        expect(req.host).toBe("registry.npmjs.org");
+        req.destroy();
+      }
+
+      // The problem is reported once, not once per request.
+      expect(warn).toHaveBeenCalledTimes(1);
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
 });

@@ -219,6 +219,23 @@ function normalizeProxyUrl(proxyUrl: string): URL {
   return new URL(proxyUrl);
 }
 
+// A proxy URL that does not parse must not break traffic that is not LLM
+// traffic: the caller falls through to the original function. Reported once
+// per value, not once per request.
+const reportedProxyUrls = new Set<string>();
+
+function usableProxyUrl(proxyUrl: string): URL | undefined {
+  try {
+    return normalizeProxyUrl(proxyUrl);
+  } catch {
+    if (!reportedProxyUrls.has(proxyUrl)) {
+      reportedProxyUrls.add(proxyUrl);
+      console.warn(`headroom: ignoring unusable proxy URL ${JSON.stringify(proxyUrl)}; requests are not routed`);
+    }
+    return undefined;
+  }
+}
+
 function isLoopback(hostname: string): boolean {
   const normalized = hostname.toLowerCase().replace(/^\[|\]$/g, "");
   return normalized === "localhost" || normalized === "127.0.0.1" || normalized === "::1";
@@ -527,7 +544,10 @@ function wrapRequest(
       return Reflect.apply(originalRequest, this, args);
     }
 
-    const proxy = normalizeProxyUrl(state.proxyUrl);
+    const proxy = usableProxyUrl(state.proxyUrl);
+    if (!proxy) {
+      return Reflect.apply(originalRequest, this, args);
+    }
     const parts = splitNodeArgs(args);
     const nextOptions = routedNodeOptions(parts, proxy, state.project, state.excludeHosts, state.sessionToken);
     if (!nextOptions) {
@@ -599,7 +619,10 @@ export function installHeadroomTransport(options: InstallOptions): () => void {
     if (!current) {
       return state.originalFetch(...args);
     }
-    const proxy = normalizeProxyUrl(current.proxyUrl);
+    const proxy = usableProxyUrl(current.proxyUrl);
+    if (!proxy) {
+      return state.originalFetch(...args);
+    }
     const [nextInput, nextInit] = withRoutedFetchInput(args[0], args[1], proxy, current.project, current.excludeHosts, current.sessionToken);
     return state.originalFetch(nextInput, nextInit);
   };
