@@ -13,8 +13,8 @@ The floor also publishes the absolute hard ceiling for latency-critical tiers
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass
-from typing import Mapping
 
 # Per-tier thresholds for meaningful regression (percent).
 TIER_FLOOR_PCT: Mapping[str, Mapping[str, float]] = {
@@ -67,8 +67,8 @@ HARD_P99_CEILING_S: Mapping[str, float] = {
 # Trend thresholds for G5 soak (per hour).
 SOAK_TREND_THRESHOLDS: Mapping[str, tuple[float, str]] = {
     # metric -> (threshold value, unit string)
-    "rss_mb_per_h": (1.0, "MB/h"),       # > 1 MB RSS growth per hour
-    "fd_per_h": (1.0, "fds/h"),         # > 1 leaked fd per hour
+    "rss_mb_per_h": (1.0, "MB/h"),  # > 1 MB RSS growth per hour
+    "fd_per_h": (1.0, "fds/h"),  # > 1 leaked fd per hour
     "p99_drift_pct_per_h": (5.0, "%/h"),  # > 5% P99 drift per hour
     "ccr_store_mb_per_h": (5.0, "MB/h"),  # CCR store growth (advisory only)
 }

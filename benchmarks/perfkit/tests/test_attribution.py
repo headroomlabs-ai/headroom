@@ -6,8 +6,6 @@ display form used by Markdown drill-down links.
 
 from __future__ import annotations
 
-import pytest
-
 from benchmarks.perfkit.attribution import (
     attribution_from,
     build_id,

@@ -14,9 +14,10 @@ from __future__ import annotations
 
 import hashlib
 import json
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Iterable, Mapping
+from typing import Any
 
 FIXTURE_HASH_VERSION = "sha256-v1"
 
@@ -137,7 +138,9 @@ def write_fixture_immutable(
                 f"refusing to rewrite fixture {p.name!r}; "
                 f"immutable policy (FR-012 / contracts/mock-upstream-contract.md §4)"
             )
-        return Fixture(path=p, data=existing, fixture_hash=fixture_hash(existing), byte_size=p.stat().st_size)
+        return Fixture(
+            path=p, data=existing, fixture_hash=fixture_hash(existing), byte_size=p.stat().st_size
+        )
 
     p.write_text(
         json.dumps(_strip_to_jsonable(data), indent=2, ensure_ascii=False, sort_keys=True),

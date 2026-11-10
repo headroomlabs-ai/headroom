@@ -15,8 +15,8 @@ maintainer can click one link from a G4 report to the matching G1 artifact.
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from dataclasses import dataclass
-from typing import Sequence
 
 from .schema import Attribution
 

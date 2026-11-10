@@ -24,9 +24,10 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Mapping
+from typing import Any
 
 from .schema import SCHEMA_VERSION
 
@@ -177,13 +178,13 @@ class BaselinePolicyDecision:
     reason_for_action: str | None  # one of REASON_*; populated when ``exists=False``
 
     @classmethod
-    def missing(cls, *, reason: str) -> "BaselinePolicyDecision":
+    def missing(cls, *, reason: str) -> BaselinePolicyDecision:
         if reason not in _VALID_REASONS:
             raise ValueError(f"invalid baseline reason {reason!r}; valid: {sorted(_VALID_REASONS)}")
         return cls(exists=False, path=None, reason_for_action=reason)
 
     @classmethod
-    def present(cls, path: Path) -> "BaselinePolicyDecision":
+    def present(cls, path: Path) -> BaselinePolicyDecision:
         return cls(exists=True, path=path, reason_for_action=None)
 
 
@@ -214,6 +215,4 @@ def assert_reason(reason: str) -> None:
     """Raise if ``reason`` is not a known update-baseline reason."""
 
     if reason not in _VALID_REASONS:
-        raise ValueError(
-            f"invalid --reason {reason!r}; valid: {sorted(_VALID_REASONS)}"
-        )
+        raise ValueError(f"invalid --reason {reason!r}; valid: {sorted(_VALID_REASONS)}")

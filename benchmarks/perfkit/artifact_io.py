@@ -13,20 +13,14 @@ Per ``contracts/json-artifact-schema.md`` §2 + §7:
 from __future__ import annotations
 
 import json
-import os
-from dataclasses import dataclass
+from collections.abc import Mapping
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Iterable, Mapping
+from typing import Any
 
 from .schema import (
-    Attribution,
-    ColdWarmSplit,
-    G6Verdict,
-    HarnessOverhead,
-    PerfArtifact,
     SCHEMA_VERSION,
-    Trend,
+    PerfArtifact,
 )
 
 DEFAULT_ARTIFACTS_DIR = Path("benchmarks/artifacts")

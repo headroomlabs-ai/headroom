@@ -7,8 +7,8 @@ so the CLI can be invoked without raising at import time.
 
 from __future__ import annotations
 
+from collections.abc import Iterable, Sequence
 from pathlib import Path
-from typing import Iterable, Sequence
 
 from ..cli import EXIT_OK
 
