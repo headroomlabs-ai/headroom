@@ -18,7 +18,10 @@ SCRIPT = (
     / "install.sh"
 )
 
-pytestmark = pytest.mark.skipif(shutil.which("bash") is None, reason="bash is not on PATH")
+pytestmark = pytest.mark.skipif(
+    os.name == "nt" or shutil.which("bash") is None,
+    reason="needs POSIX Python and bash: the fixture passes native paths and env to bash",
+)
 
 
 def _stub(directory: Path, name: str, body: str) -> None:
