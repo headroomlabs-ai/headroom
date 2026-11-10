@@ -345,6 +345,64 @@ describe("Headroom OpenCode transport", () => {
     globalThis.fetch = originalFetch;
   });
 
+  it("routes a configured compatible base with no version or reserved prefix, in fetch and Node requests (#4747)", async () => {
+    const originalFetch = globalThis.fetch;
+    const fetchMock = vi.fn(async (..._args: FetchCall) => new Response("ok"));
+    globalThis.fetch = fetchMock as unknown as typeof fetch;
+
+    const fakeRequest = { on: vi.fn(), end: vi.fn(), destroy: vi.fn() };
+    const httpsSpy = vi.spyOn(https, "request").mockImplementation(() => fakeRequest as never);
+    const httpSpy = vi.spyOn(http, "request").mockImplementation(() => fakeRequest as never);
+
+    // The base the user configured for an OpenAI-compatible provider. Its path
+    // has no version segment and no reserved root name, so only knowing the
+    // configured base can route it.
+    installHeadroomTransport({
+      proxyUrl: "http://127.0.0.1:8787/v1",
+      wireRoots: ["https://gateway.invalid/tenant/acme"],
+    });
+    const init = { method: "POST" };
+
+    try {
+      await fetch("https://gateway.invalid/tenant/acme/chat/completions", init);
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+      expect(fetchMock.mock.calls[0][0]).toBeInstanceOf(URL);
+      expect(new Headers(fetchMock.mock.calls[0][1]?.headers).get("x-headroom-base-url")).toBe(
+        "https://gateway.invalid",
+      );
+      // The configured base is a root, not a blanket route for its host: an
+      // unrelated path on that host still passes through untouched.
+      await fetch("https://gateway.invalid/tenant/acme/files/1", init);
+      expect(fetchMock).toHaveBeenCalledTimes(2);
+      expect(fetchMock.mock.calls[1][0]).toBe("https://gateway.invalid/tenant/acme/files/1");
+
+      https.request("https://gateway.invalid/tenant/acme/chat/completions", init);
+      // The proxy is http://, so a routed request is re-issued through
+      // http.request; https.request keeps only the untouched pass-through.
+      expect(httpSpy).toHaveBeenCalledTimes(1);
+      const routed = httpSpy.mock.calls[0][0] as { headers?: Record<string, string>; hostname?: string; path?: string };
+      expect(routed).toMatchObject({
+        hostname: "127.0.0.1",
+        path: "/v1/chat/completions",
+      });
+      expect(new Headers(routed.headers).get("x-headroom-base-url")).toBe("https://gateway.invalid");
+      https.request("https://gateway.invalid/tenant/acme/files/1", init);
+      expect(httpSpy).toHaveBeenCalledTimes(1);
+      expect(httpsSpy).toHaveBeenCalledTimes(1);
+      expect(httpsSpy.mock.calls[0][0]).toBe("https://gateway.invalid/tenant/acme/files/1");
+
+      // A different origin that merely shares a path prefix must not match.
+      await fetch("https://other.invalid/tenant/acme/chat/completions", init);
+      expect(fetchMock).toHaveBeenCalledTimes(3);
+      expect(fetchMock.mock.calls[2][0]).toBe("https://other.invalid/tenant/acme/chat/completions");
+    } finally {
+      uninstallHeadroomTransport();
+      globalThis.fetch = originalFetch;
+      httpsSpy.mockRestore();
+      httpSpy.mockRestore();
+    }
+  });
+
   it("keeps loopback spellings and a trailing-dot excluded host off the proxy for Node http/https.request (#4747)", () => {
     const fakeRequest = { on: vi.fn(), end: vi.fn(), destroy: vi.fn() };
     const httpsSpy = vi.spyOn(https, "request").mockImplementation(() => fakeRequest as never);

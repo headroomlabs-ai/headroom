@@ -85,6 +85,13 @@ function transportState(): { refs: number } | undefined {
   return (globalThis as Record<symbol, { refs: number } | undefined>)[TRANSPORT_STATE];
 }
 
+function transportWireRoots(): string[] {
+  const state = (globalThis as Record<symbol, { wireRoots?: Array<{ origin: string; path: string }> }>)[
+    TRANSPORT_STATE
+  ];
+  return (state?.wireRoots ?? []).map((root) => `${root.origin}${root.path}`);
+}
+
 afterEach(() => {
   vi.restoreAllMocks();
   vi.unstubAllGlobals();
@@ -114,6 +121,42 @@ describe("HeadroomPlugin", () => {
       OPENAI_BASE_URL: "https://deepseek.example/v1",
       ANTHROPIC_BASE_URL: "https://anthropic.example",
     });
+  });
+
+  it("widens transport routing to base URLs from OpenCode's config (#4747)", async () => {
+    const fetchMock = vi.fn(async (..._args: unknown[]) => new Response("ok"));
+    vi.stubGlobal("fetch", fetchMock);
+
+    const client = {
+      config: {
+        get: async () => ({
+          data: {
+            provider: {
+              acme: { options: { baseURL: "https://gateway.invalid/tenant/acme" } },
+            },
+          },
+        }),
+      },
+      provider: { list: async () => ({ data: { all: [] } }) },
+    };
+    const plugin = await HeadroomPlugin(
+      { ...(pluginInput() as Record<string, unknown>), client } as never,
+      { proxyUrl: "http://127.0.0.1:8787" },
+    );
+
+    try {
+      // The config read is deliberately not awaited by the plugin, so let it land.
+      await vi.waitFor(() => {
+        expect(transportWireRoots()).toContain("https://gateway.invalid/tenant/acme");
+      });
+
+      await fetch("https://gateway.invalid/tenant/acme/chat/completions", { method: "POST" });
+
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+      expect(String(fetchMock.mock.calls[0][0])).toBe("http://127.0.0.1:8787/v1/chat/completions");
+    } finally {
+      await plugin.dispose?.();
+    }
   });
 
   it("treats an empty HEADROOM_PROXY_URL as unset and falls through to HEADROOM_BASE_URL", async () => {

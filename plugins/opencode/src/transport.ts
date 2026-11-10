@@ -13,6 +13,7 @@ export const PROJECT_HEADER = "x-headroom-project";
 export const SESSION_TOKEN_HEADER = "x-headroom-session-token";
 const PROXY_ENV = "HEADROOM_OPENCODE_TRANSPORT_PROXY_URL";
 export const EXCLUDE_HOSTS_ENV = "HEADROOM_OPENCODE_EXCLUDE_HOSTS";
+export const WIRE_ROOTS_ENV = "HEADROOM_OPENCODE_WIRE_ROOTS";
 const STATE_KEY = Symbol.for("headroom.opencode.transport");
 
 type FetchArgs = Parameters<typeof fetch>;
@@ -32,6 +33,7 @@ interface InstallOptions {
   excludeHosts?: string[];
   debug?: boolean;
   sessionToken?: string;
+  wireRoots?: string | Iterable<unknown>;
 }
 
 interface TransportState {
@@ -39,6 +41,7 @@ interface TransportState {
   proxyUrl: string;
   project: string | undefined;
   excludeHosts: string[];
+  wireRoots: WireRoot[];
   debug: boolean;
   sessionToken: string | undefined;
   originalFetch: typeof fetch;
@@ -106,14 +109,26 @@ function withExcludeHostsEnv(env: NodeJS.ProcessEnv, excludeHosts: string[]): vo
   }
 }
 
+// Same rule as excludeHosts: the child must inherit this process's roots, so
+// the variable always mirrors the effective set and is removed when empty.
+function withWireRootsEnv(env: NodeJS.ProcessEnv, wireRoots: WireRoot[]): void {
+  if (wireRoots.length > 0) {
+    env[WIRE_ROOTS_ENV] = wireRoots.map((root) => `${root.origin}${root.path}`).join(",");
+  } else {
+    delete env[WIRE_ROOTS_ENV];
+  }
+}
+
 function withShimEnv(
   env: NodeJS.ProcessEnv | Record<string, unknown> | undefined,
   proxyUrl: string,
   excludeHosts: string[],
+  wireRoots: WireRoot[],
 ): NodeJS.ProcessEnv {
   const nextEnv = { ...(env ?? process.env) } as NodeJS.ProcessEnv;
   nextEnv[PROXY_ENV] = proxyUrl;
   withExcludeHostsEnv(nextEnv, excludeHosts);
+  withWireRootsEnv(nextEnv, wireRoots);
   const shim = shimImportSpecifier();
   if (shim) {
     nextEnv.NODE_OPTIONS = withNodeImportOption(nextEnv.NODE_OPTIONS, shim);
@@ -122,7 +137,7 @@ function withShimEnv(
 }
 
 // installProcessEnv writes these process-wide keys; uninstall puts them back.
-const PROCESS_ENV_KEYS = [PROXY_ENV, EXCLUDE_HOSTS_ENV, "NODE_OPTIONS"] as const;
+const PROCESS_ENV_KEYS = [PROXY_ENV, EXCLUDE_HOSTS_ENV, WIRE_ROOTS_ENV, "NODE_OPTIONS"] as const;
 
 function snapshotProcessEnv(): Record<string, string | undefined> {
   return Object.fromEntries(PROCESS_ENV_KEYS.map((key) => [key, process.env[key]]));
@@ -138,9 +153,10 @@ function restoreProcessEnv(saved: Record<string, string | undefined>): void {
   }
 }
 
-function installProcessEnv(proxyUrl: string, excludeHosts: string[]): void {
+function installProcessEnv(proxyUrl: string, excludeHosts: string[], wireRoots: WireRoot[]): void {
   process.env[PROXY_ENV] = proxyUrl;
   withExcludeHostsEnv(process.env, excludeHosts);
+  withWireRootsEnv(process.env, wireRoots);
   const shim = shimImportSpecifier();
   if (shim) {
     process.env.NODE_OPTIONS = withNodeImportOption(process.env.NODE_OPTIONS, shim);
@@ -155,7 +171,12 @@ function injectOptionsEnv(args: unknown[], optionIndex: number, state: Transport
   const nextArgs = [...args];
   const callback = typeof nextArgs.at(-1) === "function" ? nextArgs.pop() : undefined;
   const existing = isOptions(nextArgs[optionIndex]) ? { ...(nextArgs[optionIndex] as Record<string, unknown>) } : {};
-  existing.env = withShimEnv(existing.env as NodeJS.ProcessEnv | undefined, state.proxyUrl, state.excludeHosts);
+  existing.env = withShimEnv(
+    existing.env as NodeJS.ProcessEnv | undefined,
+    state.proxyUrl,
+    state.excludeHosts,
+    state.wireRoots,
+  );
   if (process.platform === "win32" && existing.windowsHide === undefined) {
     existing.windowsHide = true;
   }
@@ -302,6 +323,52 @@ function isExcludedHost(hostname: string, excludeHosts: string[]): boolean {
   return excludeHosts.some((host) => normalized === host || normalized.endsWith(`.${host}`));
 }
 
+// A provider base URL the user configured (for example
+// https://gateway.invalid/tenant/acme) says where that provider mounts its
+// wire: the client appends /chat/completions to exactly that path. These are
+// facts about the configuration, not guesses from a path's shape, so they are
+// matched by origin and path prefix instead of by root name (#4747 review).
+//
+// This is what keeps arbitrary compatible gateways routable. A root-name
+// allowlist can only ever recognise the names we thought of, so
+// /tenant/acme/chat/completions fell through while OpenCode 1.x still sent it
+// through the patched fetch - silently disabling compression for a base that
+// modelBaseRoutesThroughProxy accepts.
+interface WireRoot {
+  origin: string;
+  path: string;
+}
+
+function normalizeWireRoots(entries: string | Iterable<unknown>): WireRoot[] {
+  const roots = new Map<string, WireRoot>();
+  for (const entry of typeof entries === "string" ? entries.split(",") : entries) {
+    const raw = String(entry).trim();
+    if (!raw) {
+      continue;
+    }
+    try {
+      const url = new URL(raw);
+      if (url.protocol !== "http:" && url.protocol !== "https:") {
+        continue;
+      }
+      const path = url.pathname.replace(/\/+$/, "");
+      roots.set(`${url.origin}${path}`, { origin: url.origin, path });
+    } catch {
+      // Not a URL: nothing to match against. A bad entry must not disable the
+      // root set, so skip it rather than throwing.
+    }
+  }
+  return [...roots.values()];
+}
+
+function isConfiguredWireRoot(origin: string, pathname: string, wireRoots: WireRoot[]): boolean {
+  return wireRoots.some(
+    (root) =>
+      root.origin === origin &&
+      (root.path === "" ? pathname.startsWith("/") : pathname === root.path || pathname.startsWith(`${root.path}/`)),
+  );
+}
+
 // Only recognized LLM API endpoints route through Headroom; any other path
 // (WebFetch, registries, GitHub, unknown services) must reach its original URL
 // untouched.
@@ -359,14 +426,21 @@ function hasWireRootBefore(body: string): boolean {
 // suffix so that lookalike paths containing the marker but not ending with it
 // (e.g. /v1/models/gemini:generateContent/status) remain unrouted. They are
 // specific enough to need no wire root.
-function isLlmEndpointPath(pathname: string): boolean {
+function isLlmEndpointPath(pathname: string, origin = "", wireRoots: WireRoot[] = []): boolean {
   if (pathname.endsWith(":generateContent") || pathname.endsWith(":streamGenerateContent")) {
     return true;
   }
   for (const suffix of ["/chat/completions", "/responses", "/messages"]) {
-    if (pathname.endsWith(suffix)) {
-      return hasWireRootBefore(pathname.slice(0, -suffix.length));
+    if (!pathname.endsWith(suffix)) {
+      continue;
     }
+    // A configured base URL is authoritative for its own origin: the client
+    // appends the endpoint to it. Still require the suffix, so a WebFetch to
+    // some other path on that host stays out (#4747 review).
+    if (isConfiguredWireRoot(origin, pathname, wireRoots)) {
+      return true;
+    }
+    return hasWireRootBefore(pathname.slice(0, -suffix.length));
   }
   return false;
 }
@@ -395,8 +469,17 @@ function isLlmMethod(method: unknown): boolean {
   return typeof method === "string" && method.toUpperCase() === "POST";
 }
 
-function shouldRoute(url: URL, proxy: URL, excludeHosts: string[], method: unknown): boolean {
-  return isLlmMethod(method) && isRoutableUpstream(url, proxy, excludeHosts) && isLlmEndpointPath(url.pathname);
+function shouldRoute(
+  url: URL,
+  proxy: URL,
+  excludeHosts: string[],
+  method: unknown,
+  wireRoots: WireRoot[] = [],
+): boolean {
+  if (!isLlmMethod(method) || !isRoutableUpstream(url, proxy, excludeHosts)) {
+    return false;
+  }
+  return isLlmEndpointPath(url.pathname, url.origin, wireRoots);
 }
 
 // OpenCode 2.x hands the plugin model base URLs (e.g.
@@ -490,10 +573,11 @@ function withRoutedFetchInput(
   project: string | undefined,
   excludeHosts: string[],
   sessionToken: string | undefined,
+  wireRoots: WireRoot[] = [],
 ): FetchArgs {
   const upstream = requestUrl(input);
   const method = init?.method ?? (input instanceof Request ? input.method : "GET");
-  if (!shouldRoute(upstream, proxy, excludeHosts, method)) {
+  if (!shouldRoute(upstream, proxy, excludeHosts, method, wireRoots)) {
     return [input, init];
   }
 
@@ -586,8 +670,9 @@ function routedNodeOptions(
   project: string | undefined,
   excludeHosts: string[],
   sessionToken: string | undefined,
+  wireRoots: WireRoot[] = [],
 ): Record<string, unknown> | undefined {
-  if (!parts.url || !shouldRoute(parts.url, proxy, excludeHosts, parts.options.method ?? "GET")) {
+  if (!parts.url || !shouldRoute(parts.url, proxy, excludeHosts, parts.options.method ?? "GET", wireRoots)) {
     return undefined;
   }
 
@@ -639,7 +724,14 @@ function wrapRequest(
       return Reflect.apply(originalRequest, this, args);
     }
     const parts = splitNodeArgs(args);
-    const nextOptions = routedNodeOptions(parts, proxy, state.project, state.excludeHosts, state.sessionToken);
+    const nextOptions = routedNodeOptions(
+      parts,
+      proxy,
+      state.project,
+      state.excludeHosts,
+      state.sessionToken,
+      state.wireRoots,
+    );
     if (!nextOptions) {
       return Reflect.apply(originalRequest, this, args);
     }
@@ -670,15 +762,17 @@ function wrapHttp2Connect(originalConnect: Http2Connect): Http2Connect {
 
 export function installHeadroomTransport(options: InstallOptions): () => void {
   const excludeHosts = normalizeExcludeHosts(options.excludeHosts ?? process.env[EXCLUDE_HOSTS_ENV] ?? "");
+  const wireRoots = normalizeWireRoots(options.wireRoots ?? process.env[WIRE_ROOTS_ENV] ?? "");
   const existing = getState();
   if (existing) {
     existing.refs += 1;
     existing.proxyUrl = options.proxyUrl;
     existing.project = options.project;
     existing.excludeHosts = excludeHosts;
+    existing.wireRoots = wireRoots;
     existing.debug = Boolean(options.debug);
     existing.sessionToken = options.sessionToken;
-    installProcessEnv(options.proxyUrl, excludeHosts);
+    installProcessEnv(options.proxyUrl, excludeHosts, wireRoots);
     return () => uninstallHeadroomTransport();
   }
 
@@ -687,6 +781,7 @@ export function installHeadroomTransport(options: InstallOptions): () => void {
     proxyUrl: options.proxyUrl,
     project: options.project,
     excludeHosts,
+    wireRoots,
     debug: Boolean(options.debug),
     sessionToken: options.sessionToken,
     originalFetch: globalThis.fetch,
@@ -703,7 +798,7 @@ export function installHeadroomTransport(options: InstallOptions): () => void {
   };
 
   setState(state);
-  installProcessEnv(options.proxyUrl, excludeHosts);
+  installProcessEnv(options.proxyUrl, excludeHosts, wireRoots);
   globalThis.fetch = async (...args: FetchArgs) => {
     const current = getState();
     if (!current) {
@@ -713,7 +808,15 @@ export function installHeadroomTransport(options: InstallOptions): () => void {
     if (!proxy) {
       return state.originalFetch(...args);
     }
-    const [nextInput, nextInit] = withRoutedFetchInput(args[0], args[1], proxy, current.project, current.excludeHosts, current.sessionToken);
+    const [nextInput, nextInit] = withRoutedFetchInput(
+      args[0],
+      args[1],
+      proxy,
+      current.project,
+      current.excludeHosts,
+      current.sessionToken,
+      current.wireRoots,
+    );
     return state.originalFetch(nextInput, nextInit);
   };
 
@@ -729,6 +832,23 @@ export function installHeadroomTransport(options: InstallOptions): () => void {
   syncBuiltinESMExports();
 
   return () => uninstallHeadroomTransport();
+}
+
+// The configured bases are only known after a round trip to OpenCode's server,
+// which may still be starting. Routing must not wait for it, so this widens the
+// rule afterwards instead: requests in between use the path heuristics.
+export function setHeadroomWireRoots(wireRoots: string): void {
+  const state = getState();
+  if (!state) {
+    return;
+  }
+  const existing = new Set(state.wireRoots.map((root) => `${root.origin}${root.path}`));
+  const added = normalizeWireRoots(wireRoots).filter((root) => !existing.has(`${root.origin}${root.path}`));
+  if (added.length === 0) {
+    return;
+  }
+  state.wireRoots = [...state.wireRoots, ...added];
+  withWireRootsEnv(process.env, state.wireRoots);
 }
 
 export function uninstallHeadroomTransport(): void {
