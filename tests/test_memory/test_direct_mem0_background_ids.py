@@ -1,10 +1,4 @@
-"""DirectMem0Adapter background saves must return the id that is actually stored.
-
-Regression for #4362 item 6: ``save_memory(background=True)`` used to return an
-id from a second ``_generate_id`` call. That helper salts with the current time,
-so the returned id never matched the Qdrant point id the background task wrote,
-and a follow-up ``memory_update`` / ``memory_delete`` with it targeted nothing.
-"""
+"""Background DirectMem0Adapter saves return the stored id (#4362 item 6)."""
 
 from __future__ import annotations
 
@@ -79,6 +73,24 @@ async def test_background_save_returns_stored_fact_id(adapter: DirectMem0Adapter
     status = adapter.get_task_status(returned.metadata["_task_id"])
     assert status["status"] == "completed"
     assert status["result"].id == returned.id
+
+
+@pytest.mark.asyncio
+async def test_mutating_lists_after_queueing_does_not_break_the_save(
+    adapter: DirectMem0Adapter,
+) -> None:
+    facts = ["A"]
+    returned = await adapter.save_memory(
+        content="x", user_id="alice", importance=0.5, facts=facts, background=True
+    )
+    facts.append("B")
+    returned.metadata["_all_memory_ids"].append("bogus")
+    await adapter.flush_pending()
+
+    status = adapter.get_task_status(returned.metadata["_task_id"])
+    assert status["status"] == "completed", status
+    assert [p.payload["memory"] for p in adapter._qdrant_client.points] == ["A"]
+    assert [p.id for p in adapter._qdrant_client.points] == [returned.id]
 
 
 @pytest.mark.asyncio

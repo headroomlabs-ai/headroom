@@ -335,11 +335,7 @@ class DirectMem0Adapter:
         return list(response.data[0].embedding)
 
     def _generate_id(self, content: str, user_id: str) -> str:
-        """Generate a new ID for a memory.
-
-        Salted with the current time, so two calls for the same content return
-        different IDs: generate an ID once and reuse it, never regenerate it.
-        """
+        """Generate a unique (time-salted) ID for a memory."""
         hash_input = f"{user_id}:{content}:{_utcnow().isoformat()}"
         return hashlib.sha256(hash_input.encode()).hexdigest()[:32]
 
@@ -363,8 +359,7 @@ class DirectMem0Adapter:
             user_id: User identifier.
             importance: Importance score.
             metadata: Optional additional metadata.
-            memory_ids: IDs to store the facts under, one per fact. Generated
-                here when omitted.
+            memory_ids: Optional IDs to store the facts under, one per fact.
 
         Returns:
             List of memory IDs for the stored facts.
@@ -664,9 +659,10 @@ class DirectMem0Adapter:
             task_id = self._generate_task_id()
             now = _utcnow()
 
-            # The direct-write path chooses its own IDs, so fix them now and
-            # return the one the background task will store. Mem0's extraction
-            # path assigns IDs itself, so none is known until the task finishes.
+            # Snapshot facts so a caller mutating its list can't desync the IDs.
+            facts = list(facts) if facts is not None else None
+
+            # Pick the IDs now so the returned ID is the one actually stored.
             fact_ids: list[str] | None = None
             if facts or extracted_entities or extracted_relationships:
                 fact_ids = [self._generate_id(fact, user_id) for fact in (facts or [content])]
@@ -693,9 +689,9 @@ class DirectMem0Adapter:
             pending_metadata: dict[str, Any]
             if fact_ids is not None:
                 primary_id = fact_ids[0]
-                pending_metadata = {"_all_memory_ids": fact_ids}
+                pending_metadata = {"_all_memory_ids": list(fact_ids)}
             else:
-                # Not a memory ID: the real one is in get_task_status(task_id).
+                # Mem0 assigns the ID later; see get_task_status(task_id).
                 primary_id = task_id
                 pending_metadata = {"_id_pending": True}
             return Memory(
@@ -744,11 +740,7 @@ class DirectMem0Adapter:
         extracted_relationships: list[dict[str, str]] | None = None,
         fact_ids: list[str] | None = None,
     ) -> Memory:
-        """Internal save implementation (can run in background).
-
-        ``fact_ids``, when given, are the IDs to store the direct-write facts
-        under; a background save passes the IDs it already returned.
-        """
+        """Internal save implementation (can run in background)."""
         now = _utcnow()
         has_pre_extraction = bool(facts or extracted_entities or extracted_relationships)
 
@@ -758,8 +750,7 @@ class DirectMem0Adapter:
 
             memory_ids = []
 
-            # Write facts to Qdrant (vector store); with no facts, the content
-            # is written as a single fact.
+            # Write facts to Qdrant (vector store)
             stored_ids = await self._write_facts_to_qdrant(
                 facts=facts or [content],
                 user_id=user_id,

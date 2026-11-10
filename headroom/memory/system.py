@@ -438,8 +438,7 @@ class MemorySystem:
             result["status"] = memory.metadata.get("_status", "processing")
             result["message"] = f"Memory save queued (task: {result['task_id']})"
             if memory.metadata.get("_id_pending"):
-                # The backend assigns the ID when the task runs; don't hand
-                # back a placeholder that memory_update/delete can't resolve.
+                # The real ID isn't known until the background task runs.
                 result["memory_id"] = None
 
         return result
