@@ -2293,6 +2293,24 @@ def _mcp_result_min_chars() -> int:
 _MCP_NAME_PREFIXES = ("mcp_", "mcp--")
 
 
+def _join_tool_result_text_blocks(blocks: list[Any]) -> str:
+    """Flatten list-form ``tool_result`` text blocks into one string.
+
+    Each block is a separate piece of tool output (an MCP server returning
+    several ``TextContent`` items, for example), so a newline goes between
+    blocks unless the block already ends with one. A bare ``"".join`` fuses
+    the last line of one block with the first line of the next, and the
+    line-oriented compressors then emit a line the tool never produced.
+    """
+    parts: list[str] = []
+    for i, b in enumerate(blocks):
+        text = b.get("text", "")
+        parts.append(text)
+        if i < len(blocks) - 1 and text and not text.endswith("\n"):
+            parts.append("\n")
+    return "".join(parts)
+
+
 def _is_small_mcp_result(tool_name: Any, text: Any) -> bool:
     """True when ``text`` is an MCP tool's output short enough to keep verbatim.
 
@@ -8038,7 +8056,7 @@ class ContentRouter(Transform):
                     and all(isinstance(b, dict) and b.get("type") == "text" for b in _tr_content)
                 )
                 _tr_text = (
-                    "".join(b.get("text", "") for b in _tr_content)
+                    _join_tool_result_text_blocks(_tr_content)
                     if _tr_list_form_early
                     else _tr_content
                 )
@@ -8143,9 +8161,7 @@ class ContentRouter(Transform):
                     and all(isinstance(b, dict) and b.get("type") == "text" for b in tool_content)
                 )
                 tool_text = (
-                    "".join(b.get("text", "") for b in tool_content)
-                    if _tr_list_form
-                    else tool_content
+                    _join_tool_result_text_blocks(tool_content) if _tr_list_form else tool_content
                 )
 
                 # Small MCP results stay verbatim (see _is_small_mcp_result).
