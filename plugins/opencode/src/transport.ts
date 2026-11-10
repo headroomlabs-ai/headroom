@@ -402,7 +402,7 @@ function withRoutedFetchInput(
   return [nextUrl, nextInit];
 }
 
-function splitNodeArgs(args: unknown[]): NodeRequestParts {
+function splitNodeArgs(args: unknown[], defaultProtocol: string): NodeRequestParts {
   const callback = typeof args.at(-1) === "function" ? (args.at(-1) as (...args: unknown[]) => unknown) : undefined;
   const withoutCallback = callback ? args.slice(0, -1) : args;
   const [first, second] = withoutCallback;
@@ -420,13 +420,15 @@ function splitNodeArgs(args: unknown[]): NodeRequestParts {
   }
   if (typeof first === "object" && first !== null) {
     const requestOptions = { ...(first as Record<string, unknown>), ...options };
-    return { url: urlFromRequestOptions(requestOptions), options: requestOptions, callback };
+    return { url: urlFromRequestOptions(requestOptions, defaultProtocol), options: requestOptions, callback };
   }
   return { options, callback };
 }
 
-function urlFromRequestOptions(options: Record<string, unknown>): URL | undefined {
-  const protocol = String(options.protocol ?? "http:");
+// An options object without `protocol` means the module's own default:
+// https.request({ hostname }) is https, http.request({ hostname }) is http.
+function urlFromRequestOptions(options: Record<string, unknown>, defaultProtocol: string): URL | undefined {
+  const protocol = String(options.protocol ?? defaultProtocol);
   if (protocol !== "http:" && protocol !== "https:") {
     return undefined;
   }
@@ -528,7 +530,7 @@ function wrapRequest(
     }
 
     const proxy = normalizeProxyUrl(state.proxyUrl);
-    const parts = splitNodeArgs(args);
+    const parts = splitNodeArgs(args, originalRequest === originalHttpsRequest ? "https:" : "http:");
     const nextOptions = routedNodeOptions(parts, proxy, state.project, state.excludeHosts, state.sessionToken);
     if (!nextOptions) {
       return Reflect.apply(originalRequest, this, args);
