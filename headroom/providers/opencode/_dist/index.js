@@ -19797,6 +19797,7 @@ var PROJECT_HEADER = "x-headroom-project";
 var SESSION_TOKEN_HEADER = "x-headroom-session-token";
 var PROXY_ENV = "HEADROOM_OPENCODE_TRANSPORT_PROXY_URL";
 var EXCLUDE_HOSTS_ENV = "HEADROOM_OPENCODE_EXCLUDE_HOSTS";
+var WIRE_ROOTS_ENV = "HEADROOM_OPENCODE_WIRE_ROOTS";
 var STATE_KEY = /* @__PURE__ */ Symbol.for("headroom.opencode.transport");
 function getState() {
   return globalThis[STATE_KEY];
@@ -19825,17 +19826,25 @@ function withExcludeHostsEnv(env, excludeHosts) {
     delete env[EXCLUDE_HOSTS_ENV];
   }
 }
-function withShimEnv(env, proxyUrl, excludeHosts) {
+function withWireRootsEnv(env, wireRoots) {
+  if (wireRoots.length > 0) {
+    env[WIRE_ROOTS_ENV] = wireRoots.map((root) => `${root.origin}${root.path}`).join(",");
+  } else {
+    delete env[WIRE_ROOTS_ENV];
+  }
+}
+function withShimEnv(env, proxyUrl, excludeHosts, wireRoots) {
   const nextEnv = { ...env ?? process.env };
   nextEnv[PROXY_ENV] = proxyUrl;
   withExcludeHostsEnv(nextEnv, excludeHosts);
+  withWireRootsEnv(nextEnv, wireRoots);
   const shim = shimImportSpecifier();
   if (shim) {
     nextEnv.NODE_OPTIONS = withNodeImportOption(nextEnv.NODE_OPTIONS, shim);
   }
   return nextEnv;
 }
-var PROCESS_ENV_KEYS = [PROXY_ENV, EXCLUDE_HOSTS_ENV, "NODE_OPTIONS"];
+var PROCESS_ENV_KEYS = [PROXY_ENV, EXCLUDE_HOSTS_ENV, WIRE_ROOTS_ENV, "NODE_OPTIONS"];
 function snapshotProcessEnv() {
   return Object.fromEntries(PROCESS_ENV_KEYS.map((key) => [key, process.env[key]]));
 }
@@ -19848,9 +19857,10 @@ function restoreProcessEnv(saved) {
     }
   }
 }
-function installProcessEnv(proxyUrl, excludeHosts) {
+function installProcessEnv(proxyUrl, excludeHosts, wireRoots) {
   process.env[PROXY_ENV] = proxyUrl;
   withExcludeHostsEnv(process.env, excludeHosts);
+  withWireRootsEnv(process.env, wireRoots);
   const shim = shimImportSpecifier();
   if (shim) {
     process.env.NODE_OPTIONS = withNodeImportOption(process.env.NODE_OPTIONS, shim);
@@ -19863,7 +19873,12 @@ function injectOptionsEnv(args, optionIndex, state) {
   const nextArgs = [...args];
   const callback = typeof nextArgs.at(-1) === "function" ? nextArgs.pop() : void 0;
   const existing = isOptions(nextArgs[optionIndex]) ? { ...nextArgs[optionIndex] } : {};
-  existing.env = withShimEnv(existing.env, state.proxyUrl, state.excludeHosts);
+  existing.env = withShimEnv(
+    existing.env,
+    state.proxyUrl,
+    state.excludeHosts,
+    state.wireRoots
+  );
   if (process.platform === "win32" && existing.windowsHide === void 0) {
     existing.windowsHide = true;
   }
@@ -19933,14 +19948,38 @@ function usableProxyUrl(proxyUrl) {
     return void 0;
   }
 }
+function canonicalHostname(hostname3) {
+  return hostname3.toLowerCase().replace(/^\[|\]$/g, "").replace(/\.+$/, "");
+}
 function isLoopback(hostname3) {
-  const normalized = hostname3.toLowerCase().replace(/^\[|\]$/g, "");
-  return normalized === "localhost" || normalized === "127.0.0.1" || normalized === "::1";
+  const normalized = canonicalHostname(hostname3);
+  if (normalized === "localhost" || normalized === "::1" || normalized === "0.0.0.0") {
+    return true;
+  }
+  if (isLoopbackIpv4(normalized)) {
+    return true;
+  }
+  const mapped = /^::ffff:(.+)$/.exec(normalized)?.[1];
+  if (!mapped) {
+    return false;
+  }
+  if (isLoopbackIpv4(mapped)) {
+    return true;
+  }
+  const groups = /^([0-9a-f]{1,4}):([0-9a-f]{1,4})$/.exec(mapped);
+  if (!groups) {
+    return false;
+  }
+  const address = parseInt(groups[1], 16) << 16 | parseInt(groups[2], 16);
+  return address >>> 24 === 127;
+}
+function isLoopbackIpv4(host) {
+  return /^127\.\d{1,3}\.\d{1,3}\.\d{1,3}$/.test(host);
 }
 function normalizeExcludeHosts(entries) {
   const hosts = /* @__PURE__ */ new Set();
   for (const entry of typeof entries === "string" ? entries.split(",") : entries) {
-    const host = String(entry).trim().toLowerCase().replace(/^(\*\.|\.)/, "");
+    const host = canonicalHostname(String(entry).trim()).replace(/^(?:\*\.|\.)/, "");
     if (host) {
       hosts.add(host);
     }
@@ -19948,11 +19987,57 @@ function normalizeExcludeHosts(entries) {
   return [...hosts];
 }
 function isExcludedHost(hostname3, excludeHosts) {
-  const normalized = hostname3.toLowerCase().replace(/^\[|\]$/g, "");
+  const normalized = canonicalHostname(hostname3);
   return excludeHosts.some((host) => normalized === host || normalized.endsWith(`.${host}`));
 }
-function isLlmEndpointPath(pathname) {
-  return pathname.endsWith("/chat/completions") || pathname.endsWith("/responses") || pathname.endsWith("/messages") || pathname.endsWith(":generateContent") || pathname.endsWith(":streamGenerateContent");
+function normalizeWireRoots(entries) {
+  const roots = /* @__PURE__ */ new Map();
+  for (const entry of typeof entries === "string" ? entries.split(",") : entries) {
+    const raw = String(entry).trim();
+    if (!raw) {
+      continue;
+    }
+    try {
+      const url2 = new URL(raw);
+      if (url2.protocol !== "http:" && url2.protocol !== "https:") {
+        continue;
+      }
+      const path = url2.pathname.replace(/\/+$/, "");
+      roots.set(`${url2.origin}${path}`, { origin: url2.origin, path });
+    } catch {
+    }
+  }
+  return [...roots.values()];
+}
+function isConfiguredWireRoot(origin, pathname, wireRoots) {
+  return wireRoots.some(
+    (root) => root.origin === origin && (root.path === "" ? pathname.startsWith("/") : pathname === root.path || pathname.startsWith(`${root.path}/`))
+  );
+}
+var NAMED_WIRE_ROOTS = /* @__PURE__ */ new Set(["backend-api", "codex", "openai", "anthropic", "zen"]);
+var IMMEDIATE_WIRE_ROOTS = /* @__PURE__ */ new Set(["api"]);
+function isVersionSegment(segment) {
+  return /^v\d+[a-z0-9]*$/i.test(segment);
+}
+function hasWireRootBefore(body) {
+  const segments = body.split("/").filter(Boolean);
+  const last = segments.at(-1);
+  return last === void 0 || isVersionSegment(last) || IMMEDIATE_WIRE_ROOTS.has(last) || segments.some((s) => NAMED_WIRE_ROOTS.has(s));
+}
+function isLlmEndpointPath(pathname, origin = "", wireRoots = []) {
+  if (pathname.endsWith(":generateContent") || pathname.endsWith(":streamGenerateContent")) {
+    return true;
+  }
+  for (const suffix of ["/chat/completions", "/responses", "/messages"]) {
+    if (!pathname.endsWith(suffix)) {
+      continue;
+    }
+    if (isConfiguredWireRoot(origin, pathname, wireRoots)) {
+      return true;
+    }
+    return hasWireRootBefore(pathname.slice(0, -suffix.length));
+  }
+  return false;
 }
 function isRoutableUpstream(url2, proxy, excludeHosts) {
   if (url2.protocol !== "http:" && url2.protocol !== "https:") {
@@ -19972,8 +20057,11 @@ function isRoutableUpstream(url2, proxy, excludeHosts) {
 function isLlmMethod(method) {
   return typeof method === "string" && method.toUpperCase() === "POST";
 }
-function shouldRoute(url2, proxy, excludeHosts, method) {
-  return isLlmMethod(method) && isRoutableUpstream(url2, proxy, excludeHosts) && isLlmEndpointPath(url2.pathname);
+function shouldRoute(url2, proxy, excludeHosts, method, wireRoots = []) {
+  if (!isLlmMethod(method) || !isRoutableUpstream(url2, proxy, excludeHosts)) {
+    return false;
+  }
+  return isLlmEndpointPath(url2.pathname, url2.origin, wireRoots);
 }
 function modelBaseRoutesThroughProxy(baseUrl, proxyUrl, excludeHosts = []) {
   try {
@@ -20036,10 +20124,10 @@ function mergeFetchHeaders(input2, init, upstream, originalPath = void 0, projec
   }
   return headers;
 }
-function withRoutedFetchInput(input2, init, proxy, project, excludeHosts, sessionToken) {
+function withRoutedFetchInput(input2, init, proxy, project, excludeHosts, sessionToken, wireRoots = []) {
   const upstream = requestUrl(input2);
   const method = init?.method ?? (input2 instanceof Request ? input2.method : "GET");
-  if (!shouldRoute(upstream, proxy, excludeHosts, method)) {
+  if (!shouldRoute(upstream, proxy, excludeHosts, method, wireRoots)) {
     return [input2, init];
   }
   const { url: nextUrl, originalPath } = routedUrlForOpenCode(upstream, proxy);
@@ -20110,8 +20198,8 @@ function headersForNodeRequest(options, upstream, originalPath, project, session
   });
   return result;
 }
-function routedNodeOptions(parts, proxy, project, excludeHosts, sessionToken) {
-  if (!parts.url || !shouldRoute(parts.url, proxy, excludeHosts, parts.options.method ?? "GET")) {
+function routedNodeOptions(parts, proxy, project, excludeHosts, sessionToken, wireRoots = []) {
+  if (!parts.url || !shouldRoute(parts.url, proxy, excludeHosts, parts.options.method ?? "GET", wireRoots)) {
     return void 0;
   }
   const { url: nextUrl, originalPath } = routedUrlForOpenCode(parts.url, proxy);
@@ -20155,7 +20243,14 @@ function wrapRequest(originalHttpRequest, originalHttpsRequest, originalRequest)
       return Reflect.apply(originalRequest, this, args);
     }
     const parts = splitNodeArgs(args, originalRequest === originalHttpsRequest ? "https:" : "http:");
-    const nextOptions = routedNodeOptions(parts, proxy, state.project, state.excludeHosts, state.sessionToken);
+    const nextOptions = routedNodeOptions(
+      parts,
+      proxy,
+      state.project,
+      state.excludeHosts,
+      state.sessionToken,
+      state.wireRoots
+    );
     if (!nextOptions) {
       return Reflect.apply(originalRequest, this, args);
     }
@@ -20178,15 +20273,17 @@ function wrapHttp2Connect(originalConnect) {
 }
 function installHeadroomTransport(options) {
   const excludeHosts = normalizeExcludeHosts(options.excludeHosts ?? process.env[EXCLUDE_HOSTS_ENV] ?? "");
+  const wireRoots = normalizeWireRoots(options.wireRoots ?? process.env[WIRE_ROOTS_ENV] ?? "");
   const existing = getState();
   if (existing) {
     existing.refs += 1;
     existing.proxyUrl = options.proxyUrl;
     existing.project = options.project;
     existing.excludeHosts = excludeHosts;
+    existing.wireRoots = wireRoots;
     existing.debug = Boolean(options.debug);
     existing.sessionToken = options.sessionToken;
-    installProcessEnv(options.proxyUrl, excludeHosts);
+    installProcessEnv(options.proxyUrl, excludeHosts, wireRoots);
     return () => uninstallHeadroomTransport();
   }
   const state = {
@@ -20194,6 +20291,7 @@ function installHeadroomTransport(options) {
     proxyUrl: options.proxyUrl,
     project: options.project,
     excludeHosts,
+    wireRoots,
     debug: Boolean(options.debug),
     sessionToken: options.sessionToken,
     originalFetch: globalThis.fetch,
@@ -20209,7 +20307,7 @@ function installHeadroomTransport(options) {
     originalEnv: snapshotProcessEnv()
   };
   setState(state);
-  installProcessEnv(options.proxyUrl, excludeHosts);
+  installProcessEnv(options.proxyUrl, excludeHosts, wireRoots);
   globalThis.fetch = async (...args) => {
     const current = getState();
     if (!current) {
@@ -20219,7 +20317,15 @@ function installHeadroomTransport(options) {
     if (!proxy) {
       return state.originalFetch(...args);
     }
-    const [nextInput, nextInit] = withRoutedFetchInput(args[0], args[1], proxy, current.project, current.excludeHosts, current.sessionToken);
+    const [nextInput, nextInit] = withRoutedFetchInput(
+      args[0],
+      args[1],
+      proxy,
+      current.project,
+      current.excludeHosts,
+      current.sessionToken,
+      current.wireRoots
+    );
     return state.originalFetch(nextInput, nextInit);
   };
   http.request = wrapRequest(state.originalHttpRequest, state.originalHttpsRequest, state.originalHttpRequest);
@@ -20233,6 +20339,19 @@ function installHeadroomTransport(options) {
   childProcess.fork = wrapFork(state.originalChildFork);
   syncBuiltinESMExports();
   return () => uninstallHeadroomTransport();
+}
+function setHeadroomWireRoots(wireRoots) {
+  const state = getState();
+  if (!state) {
+    return;
+  }
+  const existing = new Set(state.wireRoots.map((root) => `${root.origin}${root.path}`));
+  const added = normalizeWireRoots(wireRoots).filter((root) => !existing.has(`${root.origin}${root.path}`));
+  if (added.length === 0) {
+    return;
+  }
+  state.wireRoots = [...state.wireRoots, ...added];
+  withWireRootsEnv(process.env, state.wireRoots);
 }
 function uninstallHeadroomTransport() {
   const state = getState();
@@ -20260,6 +20379,48 @@ function uninstallHeadroomTransport() {
 
 // src/plugin.ts
 var HEADROOM_PLUGIN_ID = "headroom";
+function collectBaseUrls(config2, providers) {
+  const urls = /* @__PURE__ */ new Set();
+  const add = (value) => {
+    if (typeof value === "string" && value.trim()) {
+      urls.add(value.trim());
+    }
+  };
+  const configProviders = config2?.provider;
+  for (const entry of Object.values(configProviders ?? {})) {
+    add(entry?.options?.baseURL);
+  }
+  const list = Array.isArray(providers) ? providers : providers?.all;
+  for (const entry of Array.isArray(list) ? list : []) {
+    add(entry?.options?.baseURL);
+  }
+  return [...urls];
+}
+function resolveConfiguredWireRoots(client, onResolved) {
+  if (!client?.config?.get && !client?.provider?.list) {
+    return;
+  }
+  const apply = (read, pick2) => {
+    if (!read) {
+      return;
+    }
+    void Promise.resolve().then(read).then((value) => {
+      const urls = pick2(value);
+      if (urls.length > 0) {
+        onResolved(urls);
+      }
+    }).catch(() => {
+    });
+  };
+  apply(
+    client.config?.get?.bind(client.config),
+    (config2) => collectBaseUrls(config2?.data ?? config2, void 0)
+  );
+  apply(
+    client.provider?.list?.bind(client.provider),
+    (providers) => collectBaseUrls(void 0, providers?.data ?? providers)
+  );
+}
 function normalizeProxyUrl2(url2) {
   return trimTrailingSlashes(url2);
 }
@@ -20324,6 +20485,17 @@ function routeModelsThroughProxy(models, proxyUrl, project, excludeHosts, sessio
     });
   }
 }
+function modelBaseUrls(models) {
+  const urls = /* @__PURE__ */ new Set();
+  for (const model of models.list()) {
+    const provider = models.provider.get(String(model.providerID))?.provider;
+    const baseURL = model.settings?.baseURL ?? provider?.settings?.baseURL;
+    if (typeof baseURL === "string" && baseURL.trim()) {
+      urls.add(baseURL.trim());
+    }
+  }
+  return [...urls];
+}
 var HeadroomPlugin = async (input2, options = {}) => {
   const pluginOptions = options;
   const proxyUrl = resolveProxyUrl(pluginOptions);
@@ -20334,7 +20506,13 @@ var HeadroomPlugin = async (input2, options = {}) => {
     project,
     excludeHosts: pluginOptions.excludeHosts,
     debug: pluginOptions.debug,
-    sessionToken: resolveSessionToken(pluginOptions)
+    sessionToken: resolveSessionToken(pluginOptions),
+    wireRoots: pluginOptions.wireRoots
+  });
+  resolveConfiguredWireRoots(input2.client, (urls) => {
+    if (urls.length > 0) {
+      setHeadroomWireRoots(urls.join(","));
+    }
   });
   return {
     dispose: async () => {
@@ -20368,10 +20546,15 @@ var headroomSetup = async (ctx) => {
     project,
     excludeHosts,
     debug: pluginOptions.debug,
-    sessionToken
+    sessionToken,
+    wireRoots: pluginOptions.wireRoots
   });
   try {
     await ctx.model.transform((models) => {
+      const wireRoots = modelBaseUrls(models);
+      if (wireRoots.length > 0) {
+        setHeadroomWireRoots(wireRoots.join(","));
+      }
       routeModelsThroughProxy(models, proxyUrl, project, excludeHosts, sessionToken);
     });
     await ctx.tool.transform((editor) => {
