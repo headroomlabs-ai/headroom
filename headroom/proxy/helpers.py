@@ -4762,7 +4762,16 @@ def strip_unsupported_ccr_retrieve_blocks(messages: Any, tools: Any) -> tuple[An
 
 _OPENAI_TOOL_SEARCH_TYPE = _RESPONSES_TOOL_SEARCH_TYPE
 _OPENAI_TOOL_SEARCH_MIN_TOOLS = 12
-_OPENAI_TOOL_SEARCH_RESIDENT_NAMES = frozenset({"terminal"})
+_OPENAI_TOOL_SEARCH_RESIDENT_NAMES = frozenset(
+    {
+        "terminal",
+        "file_search",
+        "web_search",
+        "code_interpreter",
+        "computer",
+        "image_generation",
+    }
+)
 _OPENAI_TOOL_SEARCH_UNSUPPORTED_CLIENTS = frozenset({"codex", "opencode"})
 # gpt-5.4 is the first model with Responses tool_search (OpenAI docs). Version-
 # gated by default; overridable per deployment via a regex in
