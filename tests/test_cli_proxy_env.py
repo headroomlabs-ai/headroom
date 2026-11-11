@@ -606,6 +606,24 @@ class TestCLIProxyEnvVars:
         assert captured_config["config"].stateless is True
         assert captured_config["config"].detached_profile == "strict"
 
+    def test_stateless_keeps_requested_memory_and_learning_for_strict_profile(self, runner):
+        """Strict mode must see --memory/--learn even when --stateless is set."""
+        captured_config = {}
+
+        def mock_run_server(config, **kwargs):
+            captured_config["config"] = config
+
+        with patch("headroom.proxy.server.run_server", mock_run_server):
+            result = runner.invoke(
+                main,
+                ["proxy", "--stateless", "--memory", "--learn", "--detached-profile", "strict"],
+                catch_exceptions=False,
+            )
+
+        assert result.exit_code == 0, result.output
+        assert captured_config["config"].memory_enabled is True
+        assert captured_config["config"].traffic_learning_enabled is True
+
     def test_disable_kompress_from_env(self, runner):
         """HEADROOM_DISABLE_KOMPRESS should be passed to ProxyConfig."""
         captured_config = {}

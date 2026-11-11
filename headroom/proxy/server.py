@@ -872,6 +872,25 @@ from headroom.proxy.handlers import (  # noqa: E402
 )
 
 
+def _apply_saved_settings() -> None:
+    settings_file: object = "the saved settings file"
+    try:
+        from headroom import paths as _hr_paths
+        from headroom import settings_store
+
+        settings_file = _hr_paths.settings_path()
+        settings_store.apply_to_environ(settings_store.load())
+    except Exception as exc:  # noqa: BLE001 — settings load must never break startup
+        # Settings values can hold credentials, so the exception is described by
+        # type and code location only, never its message.
+        logger.warning(
+            "Could not apply saved settings from %s (%s); continuing with env and "
+            "defaults. Fix or remove that file and restart the proxy.",
+            settings_file,
+            describe_exception(exc),
+        )
+
+
 def _apply_stateless_persistence(config: ProxyConfig) -> None:
     """When the proxy runs stateless, force global persisters to in-memory so no
     files are written to the workspace.
@@ -1530,6 +1549,9 @@ class HeadroomProxy(
 
         # Memory Handler (persistent user memory)
         self.memory_handler: MemoryHandler | None = None
+        memory_blocked_by_state = capability_report is not None and not (
+            capability_report.feature_enabled("memory")
+        )
         if config.memory_enabled and config.stateless:
             # Persistent memory writes a SQLite DB + markdown files to disk,
             # which stateless mode forbids. Memory is cross-session learning and
@@ -1538,6 +1560,11 @@ class HeadroomProxy(
             logger.warning(
                 "Memory is disabled in stateless mode (it persists to disk). "
                 "Run without --stateless to enable persistent memory."
+            )
+        elif config.memory_enabled and memory_blocked_by_state:
+            logger.warning(
+                "Memory is disabled: the detached capability report found no usable "
+                "local state for it (see the capability matrix)."
             )
         elif config.memory_enabled:
             # Resolve memory DB path: empty → project-scoped default
@@ -3472,22 +3499,7 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
     # explicit env exports authoritative; fail-open so it never blocks startup.
     # settings_store.load() already reports an unreadable or corrupt file; this
     # catches anything else that goes wrong while applying it.
-    settings_file: object = "the saved settings file"
-    try:
-        from headroom import paths as _hr_paths
-        from headroom import settings_store
-
-        settings_file = _hr_paths.settings_path()
-        settings_store.apply_to_environ(settings_store.load())
-    except Exception as exc:  # noqa: BLE001 — settings load must never break startup
-        # Settings values can hold credentials, so the exception is described by
-        # type and code location only, never its message.
-        logger.warning(
-            "Could not apply saved settings from %s (%s); continuing with env and "
-            "defaults. Fix or remove that file and restart the proxy.",
-            settings_file,
-            describe_exception(exc),
-        )
+    _apply_saved_settings()
 
     if not config_was_provided:
         config.detached_profile = normalize_detached_profile()
@@ -4155,8 +4167,8 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
                 "disable_kompress_fallback": config.disable_kompress_fallback,
                 "disable_kompress_anthropic": config.disable_kompress_anthropic,
                 "disable_kompress_openai": config.disable_kompress_openai,
-                "memory": config.memory_enabled,
-                "learn": config.traffic_learning_enabled,
+                "memory": config.memory_enabled and not config.stateless,
+                "learn": config.traffic_learning_enabled and not config.stateless,
                 "code_graph": config.code_graph_watcher,
                 "anthropic_api_url": config.anthropic_api_url,
                 "openai_api_url": config.openai_api_url,
@@ -6839,6 +6851,10 @@ def create_app_from_env() -> FastAPI:
     config.profile_seeded_env_keys = frozenset(
         set(config.profile_seeded_env_keys) | set(seeded_env_keys)
     )
+    # create_app() treats this config as caller-provided and skips profile
+    # hydration, so a saved detached profile must be resolved here.
+    _apply_saved_settings()
+    config.detached_profile = normalize_detached_profile()
     return create_app(config)
 
 

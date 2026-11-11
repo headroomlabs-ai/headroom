@@ -68,6 +68,9 @@ class CapabilityReport:
             feature for feature in self.features if feature.strict_required and feature.degraded
         )
 
+    def feature_enabled(self, feature: str) -> bool:
+        return any(f.feature == feature and f.enabled for f in self.features)
+
     def to_dict(self, *, include_workspace_dir: bool = True) -> dict[str, Any]:
         violations = self.strict_violations
 
@@ -133,7 +136,7 @@ def _probe_local_state(config: ProxyConfig) -> tuple[bool, str]:
 
 
 def build_capability_report(config: ProxyConfig) -> CapabilityReport:
-    from headroom.cache.compression_store import get_compression_store
+    from headroom.cache.compression_store import detach_compression_store, get_compression_store
     from headroom.telemetry.toin import TOINConfig, get_toin, reset_toin
 
     # Resolve the same process-wide store that request handling will use.
@@ -147,6 +150,9 @@ def build_capability_report(config: ProxyConfig) -> CapabilityReport:
     if config.stateless:
         reset_toin()
         toin = get_toin(TOINConfig(storage_path=""))
+        # An embedded process may already hold a SQLite-backed CCR singleton;
+        # drop it so stateless startup cannot keep writing originals to disk.
+        detach_compression_store()
     else:
         toin = get_toin()
     toin_backend = toin.backend_kind
@@ -225,10 +231,9 @@ def build_capability_report(config: ProxyConfig) -> CapabilityReport:
         local_optional(
             feature="savings_tracker",
             label="Savings tracker",
-            enabled=config.cost_tracking_enabled,
             full_reason="persistent savings ledger is available",
             degraded_mode="memory-only",
-            disabled_reason="cost tracking disabled by configuration",
+            disabled_reason="savings tracker disabled",
         ),
     ]
 

@@ -453,3 +453,44 @@ def test_stateful_learning_remains_enabled_and_strict_stateless_refuses_it() -> 
             )
         )
     assert [f.feature for f in exc.value.report.strict_violations] == ["learn_plugins"]
+
+
+def test_savings_tracker_is_reported_enabled_when_cost_tracking_is_off() -> None:
+    report = build_capability_report(_minimal_config())
+    assert report.feature_enabled("savings_tracker")
+
+
+def test_stateless_startup_detaches_preexisting_sqlite_ccr_store() -> None:
+    from headroom.cache.compression_store import get_compression_store
+
+    assert get_compression_store().backend_kind == "sqlite"
+
+    feature = _ccr_feature(_minimal_config(stateless=True))
+
+    assert feature["backend"] == "memory"
+    assert get_compression_store().backend_kind == "memory"
+
+
+def test_unusable_workspace_skips_memory_startup(monkeypatch: pytest.MonkeyPatch) -> None:
+    import headroom.proxy.capabilities as capabilities_module
+
+    monkeypatch.setattr(
+        capabilities_module, "_probe_local_state", lambda config: (False, "read-only workspace")
+    )
+    app = create_app(_minimal_config(memory_enabled=True))
+
+    memory = next(f for f in app.state.capabilities["features"] if f["feature"] == "memory")
+    assert memory["enabled"] is False
+    assert app.state.proxy.memory_handler is None
+
+
+def test_factory_startup_honors_saved_strict_profile(monkeypatch: pytest.MonkeyPatch) -> None:
+    from headroom import settings_store
+    from headroom.proxy.server import create_app_from_env
+
+    monkeypatch.setattr(settings_store, "load", lambda: {"detached_profile": "silent"})
+    monkeypatch.setenv("HEADROOM_STATELESS", "true")
+
+    app = create_app_from_env()
+
+    assert app.state.capabilities["profile"] == "silent"
