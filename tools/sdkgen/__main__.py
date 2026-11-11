@@ -39,16 +39,142 @@ def validate_output_paths(generated: dict[str, bytes]) -> None:
 def compare(before: dict, after: dict) -> list[dict[str, str]]:
     """Conservative review gate; deliberately not a JSON-Schema inclusion solver."""
 
-    def clean(value: object) -> object:
-        if isinstance(value, dict):
-            return {
-                k: clean(v)
-                for k, v in value.items()
-                if k not in {"description", "summary", "examples", "title"}
-            }
+    annotations = {"description", "summary", "examples", "title"}
+    schema_maps = {
+        "properties",
+        "patternProperties",
+        "$defs",
+        "definitions",
+        "dependentSchemas",
+        "dependencies",
+    }
+    schema_children = {
+        "items",
+        "additionalItems",
+        "additionalProperties",
+        "unevaluatedItems",
+        "unevaluatedProperties",
+        "propertyNames",
+        "contains",
+        "not",
+        "if",
+        "then",
+        "else",
+        "contentSchema",
+        "allOf",
+        "anyOf",
+        "oneOf",
+        "prefixItems",
+    }
+    component_maps = {
+        "schemas",
+        "responses",
+        "parameters",
+        "examples",
+        "requestBodies",
+        "headers",
+        "securitySchemes",
+        "links",
+        "callbacks",
+        "pathItems",
+    }
+    openapi_maps = {
+        "paths",
+        "webhooks",
+        "responses",
+        "headers",
+        "parameters",
+        "content",
+        "encoding",
+        "variables",
+        "mapping",
+        "scopes",
+        "links",
+        "callbacks",
+    }
+    openapi_children = {
+        "info",
+        "requestBody",
+        "get",
+        "put",
+        "post",
+        "delete",
+        "options",
+        "head",
+        "patch",
+        "trace",
+        "servers",
+        "tags",
+        "flows",
+        "implicit",
+        "password",
+        "clientCredentials",
+        "authorizationCode",
+    }
+
+    def children(value: object, schema: bool, node_kind: str = "object") -> object:
         if isinstance(value, list):
-            return [clean(v) for v in value]
-        return value
+            return [clean(item, schema, node_kind) for item in value]
+        return clean(value, schema, node_kind)
+
+    def namespace(value: object, schema: bool, node_kind: str = "object") -> object:
+        if isinstance(value, dict):
+            # Names are identifiers, even when spelled "title" or "examples".
+            return {name: clean(item, schema, node_kind) for name, item in value.items()}
+        return children(value, schema, node_kind)
+
+    def clean(value: object, schema: bool, node_kind: str = "object") -> object:
+        if not isinstance(value, dict):
+            return deepcopy(value)
+        if not schema and node_kind == "callback" and "$ref" not in value:
+            # Callback expression keys name Path Items; they are not annotations.
+            return {
+                name: deepcopy(item)
+                if name == "$ref" or name.startswith("x-")
+                else clean(item, False)
+                for name, item in value.items()
+            }
+        result = {}
+        for key, item in value.items():
+            if key in annotations:
+                continue
+            if not schema and node_kind == "link":
+                # Link parameters and requestBody accept literal JSON, not Parameter
+                # or Request Body Objects. Only the optional server is structural.
+                result[key] = children(item, False) if key == "server" else deepcopy(item)
+                continue
+            if schema and key in schema_maps:
+                result[key] = namespace(item, True)
+            elif schema and key in schema_children:
+                result[key] = children(item, True)
+            elif not schema and key == "components" and isinstance(item, dict):
+                result[key] = {
+                    kind: namespace(
+                        entries,
+                        kind == "schemas",
+                        {"links": "link", "callbacks": "callback"}.get(kind, "object"),
+                    )
+                    if kind in component_maps
+                    else deepcopy(entries)
+                    for kind, entries in item.items()
+                }
+            elif not schema and key == "schema":
+                result[key] = children(item, True)
+            elif not schema and key in openapi_maps:
+                result[key] = namespace(
+                    item, False, {"links": "link", "callbacks": "callback"}.get(key, "object")
+                )
+            elif not schema and key in openapi_children:
+                result[key] = children(item, False)
+            else:
+                # Defaults, constants, enums, dependentRequired, security requirements,
+                # and unknown extension/vocabulary payloads are data, not annotations.
+                result[key] = deepcopy(item)
+        return result
+
+    schema_document = not any(
+        key in document for document in (before, after) for key in ("openapi", "paths")
+    )
 
     findings = []
     remaining_before = deepcopy(before)
@@ -68,7 +194,7 @@ def compare(before: dict, after: dict) -> list[dict[str, str]]:
                 findings.append(
                     {"severity": "breaking", "change": f"renamed operation {method.upper()} {path}"}
                 )
-    if clean(remaining_before) != clean(after):
+    if clean(remaining_before, schema_document) != clean(after, schema_document):
         findings.append(
             {
                 "severity": "review",

@@ -674,5 +674,220 @@ class HandlerContractTests(unittest.TestCase):
         self.assertEqual(result["future_extension"]["snake_case"], "unchanged")
 
 
+class AnnotationNameComparisonTests(unittest.TestCase):
+    NAMES = ("title", "summary", "description", "examples")
+
+    def test_schema_namespace_names_do_not_hide_type_changes(self):
+        for keyword in (
+            "properties",
+            "patternProperties",
+            "$defs",
+            "definitions",
+            "dependentSchemas",
+        ):
+            for name in self.NAMES:
+                with self.subTest(keyword=keyword, name=name):
+                    before = {"type": "object", keyword: {name: {"type": "string"}}}
+                    after = {"type": "object", keyword: {name: {"type": "integer"}}}
+                    self.assertTrue(compare(before, after))
+
+    def test_boolean_schemas_with_annotation_names_are_compared(self):
+        for keyword in ("properties", "$defs", "definitions"):
+            for name in self.NAMES:
+                with self.subTest(keyword=keyword, name=name):
+                    self.assertTrue(compare({keyword: {name: True}}, {keyword: {name: False}}))
+
+    def test_non_schema_payloads_keep_meaningful_annotation_named_keys(self):
+        for keyword in (
+            "default",
+            "const",
+            "dependentRequired",
+            "x-contract-data",
+            "unknownVocabulary",
+        ):
+            for name in self.NAMES:
+                with self.subTest(keyword=keyword, name=name):
+                    left = ["a"] if keyword == "dependentRequired" else "a"
+                    right = ["b"] if keyword == "dependentRequired" else "b"
+                    self.assertTrue(compare({keyword: {name: left}}, {keyword: {name: right}}))
+        for name in self.NAMES:
+            with self.subTest(keyword="enum", name=name):
+                self.assertTrue(compare({"enum": [{name: "a"}]}, {"enum": [{name: "b"}]}))
+
+    def test_openapi_definition_labels_and_security_requirements_are_preserved(self):
+        for name in self.NAMES:
+            before = {"openapi": "3.1.0", "components": {"schemas": {name: {"type": "string"}}}}
+            after = copy.deepcopy(before)
+            after["components"]["schemas"][name]["type"] = "integer"
+            with self.subTest(component=name):
+                self.assertTrue(compare(before, after))
+            before = {"openapi": "3.1.0", "security": [{name: ["read"]}]}
+            after = {"openapi": "3.1.0", "security": [{name: ["write"]}]}
+            with self.subTest(security=name):
+                self.assertTrue(compare(before, after))
+
+    def test_annotations_still_do_not_require_contract_review(self):
+        before = {"type": "object", "title": "Old", "description": "Old", "examples": [{"a": 1}]}
+        after = {"type": "object", "title": "New", "description": "New", "examples": [{"a": 2}]}
+        self.assertEqual(compare(before, after), [])
+        before = {
+            "openapi": "3.1.0",
+            "paths": {"/x": {"get": {"summary": "Old", "description": "Old"}}},
+        }
+        after = copy.deepcopy(before)
+        after["paths"]["/x"]["get"].update(summary="New", description="New")
+        self.assertEqual(compare(before, after), [])
+
+
+class OpenAPIPayloadContextTests(unittest.TestCase):
+    def document(self):
+        return {
+            "openapi": "3.1.0",
+            "info": {"title": "Probe", "version": "1.0"},
+            "paths": {
+                "/source": {
+                    "get": {
+                        "operationId": "source",
+                        "parameters": [
+                            {
+                                "name": "callbackUrl",
+                                "in": "query",
+                                "schema": {"type": "string", "format": "uri"},
+                            }
+                        ],
+                        "responses": {"200": {"description": "OK", "links": {}}},
+                    }
+                },
+                "/target": {
+                    "post": {
+                        "operationId": "target",
+                        "parameters": [
+                            {
+                                "name": "payload",
+                                "in": "query",
+                                "schema": {"type": "object", "additionalProperties": True},
+                            }
+                        ],
+                        "requestBody": {
+                            "content": {
+                                "application/json": {
+                                    "schema": {"type": "object", "additionalProperties": True}
+                                }
+                            }
+                        },
+                        "responses": {"200": {"description": "OK"}},
+                    }
+                },
+            },
+            "components": {},
+        }
+
+    def test_link_literal_parameters_and_request_body_are_contract_data(self):
+        for component in (False, True):
+            for field in ("parameters", "requestBody"):
+                for name in ("title", "summary", "description", "examples"):
+                    with self.subTest(component=component, field=field, name=name):
+                        before = self.document()
+                        payload = {name: "old"}
+                        link = {
+                            "operationId": "target",
+                            field: {"payload": payload} if field == "parameters" else payload,
+                        }
+                        inline = before["paths"]["/source"]["get"]["responses"]["200"]["links"]
+                        if component:
+                            before["components"]["links"] = {"next": link}
+                            inline["next"] = {"$ref": "#/components/links/next"}
+                        else:
+                            inline["next"] = link
+                        after = copy.deepcopy(before)
+                        changed = (
+                            after["components"]["links"]["next"]
+                            if component
+                            else after["paths"]["/source"]["get"]["responses"]["200"]["links"][
+                                "next"
+                            ]
+                        )
+                        (changed[field]["payload"] if field == "parameters" else changed[field])[
+                            name
+                        ] = "new"
+                        self.assertTrue(compare(before, after))
+
+    def test_link_description_is_still_an_annotation(self):
+        before = self.document()
+        before["components"]["links"] = {
+            "next": {
+                "operationId": "target",
+                "description": "Old",
+                "requestBody": {"title": "literal"},
+            }
+        }
+        after = copy.deepcopy(before)
+        after["components"]["links"]["next"]["description"] = "New"
+        self.assertEqual(compare(before, after), [])
+
+    def test_callback_path_item_annotations_and_contract_changes(self):
+        expression = "{$request.query.callbackUrl}"
+        for component in (False, True):
+            with self.subTest(component=component):
+                before = self.document()
+                callback = {
+                    expression: {
+                        "post": {
+                            "description": "Old",
+                            "requestBody": {
+                                "content": {"application/json": {"schema": {"type": "string"}}}
+                            },
+                            "responses": {"200": {"description": "OK"}},
+                        }
+                    }
+                }
+                source = before["paths"]["/source"]["get"]
+                if component:
+                    before["components"]["callbacks"] = {"notify": callback}
+                    source["callbacks"] = {"notify": {"$ref": "#/components/callbacks/notify"}}
+                else:
+                    source["callbacks"] = {"notify": callback}
+                after = copy.deepcopy(before)
+                changed = (
+                    after["components"]["callbacks"]["notify"]
+                    if component
+                    else after["paths"]["/source"]["get"]["callbacks"]["notify"]
+                )
+                changed[expression]["post"]["description"] = "New"
+                self.assertEqual(compare(before, after), [])
+                changed[expression]["post"]["requestBody"]["content"]["application/json"]["schema"][
+                    "type"
+                ] = "integer"
+                self.assertTrue(compare(before, after))
+
+
+class CallbackReferenceComparisonTests(unittest.TestCase):
+    def test_callback_reference_annotations_and_reference_changes(self):
+        callback = {
+            "{$request.query.callbackUrl}": {"post": {"responses": {"200": {"description": "OK"}}}}
+        }
+        before = {
+            "openapi": "3.1.0",
+            "info": {"title": "Probe", "version": "1.0"},
+            "paths": {},
+            "components": {
+                "callbacks": {
+                    "notify": {
+                        "$ref": "#/components/callbacks/first",
+                        "summary": "Old",
+                        "description": "Old",
+                    },
+                    "first": callback,
+                    "second": copy.deepcopy(callback),
+                }
+            },
+        }
+        after = copy.deepcopy(before)
+        after["components"]["callbacks"]["notify"].update(summary="New", description="New")
+        self.assertEqual(compare(before, after), [])
+        after["components"]["callbacks"]["notify"]["$ref"] = "#/components/callbacks/second"
+        self.assertTrue(compare(before, after))
+
+
 if __name__ == "__main__":
     unittest.main()
