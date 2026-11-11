@@ -42,6 +42,9 @@ CJK = "这是一个测试文档，用于验证分词器的差异。" * 30
         ("GPT-4o", "o200k_base"),
         ("GPT-4.1", "o200k_base"),
         ("Gpt-4O-Mini", "o200k_base"),
+        # chatgpt-4o-* aliases are GPT-4o (#4268).
+        ("chatgpt-4o-latest", "o200k_base"),
+        ("ChatGPT-4o-Latest", "o200k_base"),
         ("GPT-5", "o200k_base"),
         ("O4-Mini", "o200k_base"),
         ("GPT-4", "cl100k_base"),
@@ -65,7 +68,7 @@ def test_encoding_resolution(model: str, expected: str) -> None:
     assert get_encoding_for_model(model) == expected
 
 
-@pytest.mark.parametrize("model", ["gpt-5", "GPT-4o", "GPT-4.1"])
+@pytest.mark.parametrize("model", ["gpt-5", "GPT-4o", "GPT-4.1", "chatgpt-4o-latest"])
 def test_cold_cache_uppercase_still_gets_the_right_encoding(model: str) -> None:
     """End-to-end through the registry, with the uppercase spelling resolved first.
 

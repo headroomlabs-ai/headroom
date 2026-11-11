@@ -38,6 +38,8 @@ import os
 from typing import Any
 from urllib.parse import urlparse
 
+from headroom.config import resolve_omlx_target_api_url
+
 logger = logging.getLogger("headroom.proxy")
 
 ALLOWED_HOSTS_ENV = "HEADROOM_UPSTREAM_ALLOWED_HOSTS"
@@ -50,6 +52,7 @@ _API_URL_ATTRS = (
     "cloudcode_api_url",
     "vertex_api_url",
     "bedrock_api_url",
+    "omlx_target_api_url",
 )
 
 # Hosts that are always operator-designated: they are what the provider targets
@@ -106,6 +109,9 @@ def trusted_upstream_hosts(config: Any = None) -> frozenset[str]:
         host = url_host(getattr(config, attr, None))
         if host:
             hosts.add(host)
+    omlx_env_host = url_host(resolve_omlx_target_api_url(environ=os.environ))
+    if omlx_env_host:
+        hosts.add(omlx_env_host)
     hosts |= _env_allowed_hosts()
     return frozenset(hosts)
 
