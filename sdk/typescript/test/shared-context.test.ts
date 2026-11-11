@@ -208,6 +208,30 @@ describe("SharedContext eviction", () => {
   });
 });
 
+describe("SharedContext maxEntries validation", () => {
+  it.each([0, -1, Number.NaN])("rejects maxEntries %s", (maxEntries) => {
+    expect(
+      () => new SharedContext({ baseUrl: "http://test:8787", maxEntries }),
+    ).toThrow(RangeError);
+  });
+
+  it("accepts maxEntries 1", async () => {
+    mockFetch.mockResolvedValue(mockCompressResponse("data"));
+    const ctx = new SharedContext({ baseUrl: "http://test:8787", maxEntries: 1 });
+    await ctx.put("a", "data");
+    await ctx.put("b", "data");
+    expect(ctx.keys()).toEqual(["b"]);
+  });
+
+  it("evictIfFull returns on an empty map even if the bound is 0", () => {
+    const ctx = new SharedContext({ baseUrl: "http://test:8787" });
+    // Bypass the constructor check to prove the loop itself terminates.
+    (ctx as unknown as { maxEntries: number }).maxEntries = 0;
+    (ctx as unknown as { evictIfFull(): void }).evictIfFull();
+    expect(ctx.keys()).toEqual([]);
+  });
+});
+
 describe("SharedContext clear", () => {
   beforeEach(() => {
     vi.clearAllMocks();

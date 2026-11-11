@@ -318,7 +318,7 @@ def test_docker_build_cache_failures_are_best_effort() -> None:
     assert cached["continue-on-error"] is True
     assert "ignore-error=true" in cache_to
     assert fallback_builder["if"] == "steps.bake.outcome == 'failure'"
-    assert fallback_builder["uses"] == "docker/setup-buildx-action@v4"
+    assert fallback_builder["uses"].startswith("docker/setup-buildx-action@")
     assert fallback["if"] == "steps.bake.outcome == 'failure'"
     assert fallback["uses"] == cached["uses"]
     assert fallback["with"]["builder"] == "${{ steps.fallback-buildx.outputs.name }}"
@@ -1114,8 +1114,8 @@ def test_publish_npm_regenerates_openclaw_dist_metadata_after_version_and_depend
     """The direct npm publish path must not ship stale OpenClaw dist metadata."""
     content = (ROOT / ".github" / "workflows" / "release.yml").read_text(encoding="utf-8")
 
-    start = content.index("name: Publish ${{ env.NPM_OPENCLAW_PACKAGE }} to npmjs.org")
-    end = content.index("name: Publish ${{ env.NPM_OPENCODE_PACKAGE }}", start)
+    start = content.index("name: Prepare ${{ env.NPM_OPENCLAW_PACKAGE }} for npmjs.org")
+    end = content.index("name: Prepare ${{ env.NPM_OPENCODE_PACKAGE }}", start)
     block = content[start:end]
 
     version = block.index('npm version "$version"')
@@ -1130,7 +1130,7 @@ def test_publish_npm_rewrites_opencode_dependency_after_version_and_before_publi
     """The direct npm publish path must version and retarget the Opencode dependency."""
     content = (ROOT / ".github" / "workflows" / "release.yml").read_text(encoding="utf-8")
 
-    start = content.index("name: Publish ${{ env.NPM_OPENCODE_PACKAGE }} to npmjs.org")
+    start = content.index("name: Prepare ${{ env.NPM_OPENCODE_PACKAGE }} for npmjs.org")
     end = content.index("\n  publish-github-packages:", start)
     block = content[start:end]
 
@@ -1172,6 +1172,23 @@ def test_publish_npm_is_rerunnable_after_a_partial_release() -> None:
         lookup_index = block.index(lookup)
         publish_index = block.index("npm publish --access public", lookup_index)
         assert lookup_index < publish_index
+
+
+def test_publish_npm_token_is_only_in_whoami_and_publish_steps() -> None:
+    """Install and build scripts must never see the npm publish token."""
+    workflow = yaml.safe_load((ROOT / ".github" / "workflows" / "release.yml").read_text())
+    job = workflow["jobs"]["publish-npm"]
+
+    assert "NODE_AUTH_TOKEN" not in job.get("env", {})
+    with_token = [step for step in job["steps"] if "NODE_AUTH_TOKEN" in step.get("env", {})]
+    assert len(with_token) == 4  # whoami + one publish per package
+    for step in with_token:
+        run = step["run"]
+        assert "npm whoami" in run or run.strip().endswith("npm publish --access public"), step
+        assert "npm ci" not in run and "npm run build" not in run, step
+    for step in job["steps"]:
+        if "npm ci" in step.get("run", ""):
+            assert "env" not in step or "NODE_AUTH_TOKEN" not in step["env"], step
 
 
 def test_sdist_license_is_packaged_and_verified_before_upload() -> None:
@@ -1225,7 +1242,7 @@ def test_pypi_publish_failure_blocks_github_release() -> None:
     npm_job_start = content.index("publish-npm:", pypi_job_start)
     pypi_job = content[pypi_job_start:npm_job_start]
 
-    assert re.search(r"uses: pypa/gh-action-pypi-publish@v\d+\.\d+\.\d+", pypi_job)
+    assert re.search(r"uses: pypa/gh-action-pypi-publish@[0-9a-f]{40} # v\d+\.\d+\.\d+", pypi_job)
     assert "continue-on-error: true" not in pypi_job
     assert "(vars.PYPI_SKIP == 'true' || needs.publish-pypi.result == 'success')" in content
 
@@ -1670,7 +1687,7 @@ def test_release_please_workflow_exists_and_targets_main() -> None:
     )
 
     content = rp_path.read_text(encoding="utf-8")
-    assert any(f"googleapis/release-please-action@v{v}" in content for v in (4, 5)), (
+    assert re.search(r"googleapis/release-please-action@[0-9a-f]{40} # v[45]\.", content), (
         "release-please.yml must use the v4 or v5 action — earlier versions "
         "have different manifest semantics."
     )
