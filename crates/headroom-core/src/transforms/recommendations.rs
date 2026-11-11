@@ -442,6 +442,12 @@ mod tests {
     }
 
     #[test]
+    fn python_json_string_escapes_del_like_json_dumps() {
+        assert_eq!(super::python_json_string("a\u{7f}b"), "\"a\\u007fb\"");
+        assert_eq!(super::python_json_string("\u{1f600}"), "\"\\ud83d\\ude00\"");
+    }
+
+    #[test]
     fn tabular_content_has_no_compression_recommendation_signature() {
         assert_eq!(
             super::structure_hash(super::ContentType::Tabular, "a,b\n1,2"),
