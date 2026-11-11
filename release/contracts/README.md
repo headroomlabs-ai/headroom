@@ -1,14 +1,18 @@
 # Release evidence contracts
 
-This policy-contract slice supplies `common.schema.json`, `policy.schema.json`,
-and the validated example `examples/policy.valid.json`. The common schema owns
-shared identities and status values; the policy schema defines versioned Gate A
-and Gate B requirements.
+This evidence/tooling slice includes the policy contracts and the following
+evidence schemas. Inspect the inventory at the pinned commit before selecting a
+schema; the earlier policy-only slice supplies only the common and policy files.
 
-Candidate manifests, deterministic/integration results, benchmark references,
-gate decisions, and the assembled qualification manifest belong to subsequent
-evidence-contract PRs in the HEAOSS-6 stack. They are not supplied by this slice.
-Inspect the contract inventory at the pinned commit before selecting a schema.
+| Schema | Contract |
+| --- | --- |
+| `common.schema.json` | Shared identities and status values |
+| `policy.schema.json` | Versioned Gate A and Gate B requirements |
+| `candidate-manifest.schema.json` | Immutable candidate bytes and provenance |
+| `integration-result.schema.json` | Deterministic and integration check results |
+| `benchmark-result-ref.schema.json` | Cross-repository benchmark evidence reference |
+| `gate-result.schema.json` | Gate decisions and evidence references |
+| `qualification-manifest.schema.json` | Assembled artifact qualification |
 
 Producers must emit the supported schema version, validate the complete document
 before upload, and publish bytes immutably with a SHA-256 digest. Consumers must
