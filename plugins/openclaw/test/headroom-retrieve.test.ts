@@ -23,9 +23,10 @@ function stubRetrieveOk() {
   return mock;
 }
 
-function retrieve(hash: string) {
+async function retrieve(hash: string) {
   const tool = createHeadroomRetrieveTool({ proxyUrl: PROXY_URL });
-  return tool.execute({ hash });
+  const result = await tool.execute({ hash });
+  return result.content[0].text;
 }
 
 afterEach(() => {
