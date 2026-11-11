@@ -4,8 +4,9 @@ from __future__ import annotations
 
 import fnmatch
 import json
+import os
 import re
-from collections.abc import Iterable
+from collections.abc import Iterable, Mapping
 from dataclasses import InitVar, dataclass, field
 from datetime import datetime
 from enum import Enum
@@ -13,6 +14,25 @@ from typing import Any, Literal
 
 from headroom.models.config import ML_MODEL_DEFAULTS
 from headroom.rollout import RolloutSnapshot, resolve_rollout
+
+OMLX_TARGET_API_URL_ENV = "OMLX_TARGET_API_URL"
+HEADROOM_OMLX_BASE_URL_ENV = "HEADROOM_OMLX_BASE_URL"
+HEADROOM_OMLX_URL_ENV = "HEADROOM_OMLX_URL"
+
+
+def resolve_omlx_target_api_url(
+    explicit: str | None = None,
+    environ: Mapping[str, str] | None = None,
+) -> str | None:
+    """Resolve the local oMLX target API URL from an explicit override or environment."""
+    if explicit and explicit.strip():
+        return explicit.strip().rstrip("/")
+    env = environ if environ is not None else os.environ
+    for key in (OMLX_TARGET_API_URL_ENV, HEADROOM_OMLX_BASE_URL_ENV, HEADROOM_OMLX_URL_ENV):
+        value = env.get(key)
+        if value and value.strip():
+            return value.strip().rstrip("/")
+    return None
 
 
 class HeadroomMode(str, Enum):
@@ -368,7 +388,9 @@ def _tool_name_aliases(name: str) -> tuple[str, ...]:
     aliases = [name]
     lname = name.lower()
 
-    if lname == "headroom_headroom_retrieve":
+    # Clients that prefix MCP tools with the server name: OpenCode joins with a
+    # single underscore, Cline with a double one (<server>__<tool>, #4585).
+    if lname in ("headroom_headroom_retrieve", "headroom__headroom_retrieve"):
         aliases.append("headroom_retrieve")
     elif lname.startswith("mcp__"):
         # OpenAI-style MCP wrappers use mcp__server__tool. Custom agents that
@@ -961,11 +983,14 @@ class HeadroomConfig:
     # Canonical pipeline lifecycle extensions
     pipeline_extensions: list[Any] = field(default_factory=list)
     discover_pipeline_extensions: bool = True
+    omlx_target_api_url: str | None = None
 
     def __post_init__(self, content_router_enabled: bool | None = None) -> None:
         if self.rollout is None:
             requested = ("tool_result_interceptors",) if self.intercept_tool_results else ()
             self.rollout = resolve_rollout(requested=requested)
+        if self.omlx_target_api_url is None:
+            self.omlx_target_api_url = resolve_omlx_target_api_url()
 
     def get_context_limit(self, model: str) -> int | None:
         """
@@ -980,10 +1005,12 @@ class HeadroomConfig:
         """
         if model in self.model_context_limits:
             return self.model_context_limits[model]
-        # Try prefix matching for versioned model names
-        for known_model, limit in self.model_context_limits.items():
-            if model.startswith(known_model):
-                return limit
+        # Try prefix matching for versioned model names. The longest prefix
+        # wins, so "gpt-4o-2024-08-06" uses a "gpt-4o" override rather than a
+        # "gpt-4" one that happens to come first in the dict.
+        matches = [known for known in self.model_context_limits if model.startswith(known)]
+        if matches:
+            return self.model_context_limits[max(matches, key=len)]
         return None
 
 
@@ -1040,6 +1067,14 @@ class WasteSignals:
             "reread": self.reread_tokens,
             "reread_compressed": self.reread_compressed_tokens,
         }
+
+
+# Canonical names consumed by durable metrics. Keep this derived from the
+# request-level WasteSignals representation so the two views cannot drift.
+WASTE_SIGNAL_KEYS = tuple(WasteSignals().to_dict())
+
+# Persisted versions before the JSON signal was renamed can still be read.
+WASTE_SIGNAL_ALIASES = {"json_noise": "json_bloat"}
 
 
 @dataclass

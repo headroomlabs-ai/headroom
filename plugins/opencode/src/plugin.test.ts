@@ -1,3 +1,5 @@
+import http from "node:http";
+import https from "node:https";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import HeadroomOpenCodePlugin, { HeadroomPlugin, headroomSetup } from "./plugin.js";
@@ -85,6 +87,13 @@ function transportState(): { refs: number } | undefined {
   return (globalThis as Record<symbol, { refs: number } | undefined>)[TRANSPORT_STATE];
 }
 
+function transportWireRoots(): string[] {
+  const state = (globalThis as Record<symbol, { wireRoots?: Array<{ origin: string; path: string }> }>)[
+    TRANSPORT_STATE
+  ];
+  return (state?.wireRoots ?? []).map((root) => `${root.origin}${root.path}`);
+}
+
 afterEach(() => {
   vi.restoreAllMocks();
   vi.unstubAllGlobals();
@@ -114,6 +123,124 @@ describe("HeadroomPlugin", () => {
       OPENAI_BASE_URL: "https://deepseek.example/v1",
       ANTHROPIC_BASE_URL: "https://anthropic.example",
     });
+  });
+
+  it("widens transport routing to base URLs from OpenCode's config (#4747)", async () => {
+    const fetchMock = vi.fn(async (..._args: unknown[]) => new Response("ok"));
+    vi.stubGlobal("fetch", fetchMock);
+
+    const client = {
+      config: {
+        get: async () => ({
+          data: {
+            provider: {
+              acme: { options: { baseURL: "https://gateway.invalid/tenant/acme" } },
+            },
+          },
+        }),
+      },
+      provider: { list: async () => ({ data: { all: [] } }) },
+    };
+    const plugin = await HeadroomPlugin(
+      { ...(pluginInput() as Record<string, unknown>), client } as never,
+      { proxyUrl: "http://127.0.0.1:8787" },
+    );
+
+    try {
+      // The config read is deliberately not awaited by the plugin, so let it land.
+      await vi.waitFor(() => {
+        expect(transportWireRoots()).toContain("https://gateway.invalid/tenant/acme");
+      });
+
+      await fetch("https://gateway.invalid/tenant/acme/chat/completions", { method: "POST" });
+
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+      expect(String(fetchMock.mock.calls[0][0])).toBe("http://127.0.0.1:8787/v1/chat/completions");
+    } finally {
+      await plugin.dispose?.();
+    }
+  });
+
+  it("applies a config result without waiting for a pending provider listing (#4747)", async () => {
+    const fetchMock = vi.fn(async (..._args: unknown[]) => new Response("ok"));
+    vi.stubGlobal("fetch", fetchMock);
+    const fakeRequest = { on: vi.fn(), end: vi.fn(), destroy: vi.fn() };
+    const httpSpy = vi.spyOn(http, "request").mockImplementation(() => fakeRequest as never);
+    const httpsSpy = vi.spyOn(https, "request").mockImplementation(() => fakeRequest as never);
+
+    // The provider listing never settles: a stalled server must not hold back a
+    // base the config already reported.
+    const client = {
+      config: {
+        get: async () => ({
+          data: {
+            provider: {
+              acme: { options: { baseURL: "https://gateway.invalid/tenant/acme" } },
+            },
+          },
+        }),
+      },
+      provider: { list: () => new Promise<never>(() => {}) },
+    };
+    const plugin = await HeadroomPlugin(
+      { ...(pluginInput() as Record<string, unknown>), client } as never,
+      { proxyUrl: "http://127.0.0.1:8787" },
+    );
+
+    try {
+      // The read is still not awaited by the plugin, but nothing else blocks it.
+      await vi.waitFor(() => {
+        expect(transportWireRoots()).toContain("https://gateway.invalid/tenant/acme");
+      });
+
+      await fetch("https://gateway.invalid/tenant/acme/chat/completions", { method: "POST" });
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+      expect(String(fetchMock.mock.calls[0][0])).toBe("http://127.0.0.1:8787/v1/chat/completions");
+
+      https.request("https://gateway.invalid/tenant/acme/chat/completions", { method: "POST" });
+      expect(httpSpy).toHaveBeenCalledTimes(1);
+      expect(httpsSpy).not.toHaveBeenCalled();
+
+      // Still a root, not a blanket route for the host.
+      await fetch("https://gateway.invalid/tenant/acme/files/1", { method: "POST" });
+      expect(String(fetchMock.mock.calls[1][0])).toBe("https://gateway.invalid/tenant/acme/files/1");
+    } finally {
+      await plugin.dispose?.();
+      httpSpy.mockRestore();
+      httpsSpy.mockRestore();
+    }
+  });
+
+  it("treats an empty HEADROOM_PROXY_URL as unset and falls through to HEADROOM_BASE_URL", async () => {
+    vi.stubEnv("HEADROOM_PROXY_URL", "");
+    vi.stubEnv("HEADROOM_BASE_URL", "http://127.0.0.1:9999");
+    try {
+      const plugin = await HeadroomPlugin(pluginInput(), {});
+      const output = { env: {} as Record<string, string> };
+
+      await plugin["shell.env"]?.({ cwd: "/repo" }, output);
+      await plugin.dispose?.();
+
+      expect(output.env.HEADROOM_PROXY_URL).toBe("http://127.0.0.1:9999");
+    } finally {
+      vi.unstubAllEnvs();
+    }
+  });
+
+  it("treats an empty proxyUrl option as unset", async () => {
+    vi.stubEnv("HEADROOM_PROXY_URL", "");
+    vi.stubEnv("HEADROOM_BASE_URL", "");
+    try {
+      const plugin = await HeadroomPlugin(pluginInput(), { proxyUrl: "" });
+      const output = { env: {} as Record<string, string> };
+
+      await plugin["shell.env"]?.({ cwd: "/repo" }, output);
+      await plugin.dispose?.();
+
+      expect(output.env.HEADROOM_PROXY_URL).toBe("http://localhost:8787");
+    } finally {
+      vi.unstubAllEnvs();
+    }
   });
 
   it("exposes a headroom_retrieve tool backed by the proxy", async () => {
@@ -240,6 +367,60 @@ describe("headroomSetup (OpenCode 2.x)", () => {
         "x-headroom-original-path": "/api/v1/responses",
       },
     });
+  });
+
+  it.each([
+    ["@opencode/ai/providers/anthropic", "https://api.githubcopilot.com", "/messages"],
+    ["@opencode/ai/providers/anthropic-compatible", "https://gateway.example/v1", "/v1/messages"],
+  ])("routes Anthropic Messages models through the proxy (%s)", async (packageName, baseURL, originalPath) => {
+    // GitHub Copilot serves Claude models as @opencode/ai/providers/anthropic
+    // with a prefix-free Copilot baseURL; the OpenAI-only wire check used to
+    // skip them.
+    const models: FakeModel[] = [{ id: "claude-sonnet-5.5", providerID: "github-copilot" }];
+    const { context } = pluginContextV2(
+      { proxyUrl: "http://127.0.0.1:8787" },
+      {
+        providers: [{ id: "github-copilot", package: packageName, settings: { baseURL } }],
+        models,
+      },
+    );
+
+    const cleanup = await headroomSetup(context);
+    await cleanup?.();
+
+    expect(models[0]).toMatchObject({
+      settings: { baseURL: "http://127.0.0.1:8787/v1" },
+      headers: {
+        "x-headroom-base-url": new URL(baseURL).origin,
+        "x-headroom-original-path": originalPath,
+        "x-headroom-project": "project-1",
+      },
+    });
+  });
+
+  it("leaves a prefixed Anthropic Messages gateway on its own base URL", async () => {
+    // The proxy's Anthropic route rebuilds the upstream path from its incoming
+    // /v1/messages and ignores x-headroom-original-path, so rewriting a
+    // prefixed gateway would drop that prefix. Keep those models direct.
+    const models: FakeModel[] = [{ id: "glm-5.2", providerID: "zai-coding-plan" }];
+    const { context } = pluginContextV2(
+      { proxyUrl: "http://127.0.0.1:8787" },
+      {
+        providers: [
+          {
+            id: "zai-coding-plan",
+            package: "@opencode/ai/providers/zai-coding-plan/messages",
+            settings: { baseURL: "https://api.z.ai/api/coding/paas/v4" },
+          },
+        ],
+        models,
+      },
+    );
+
+    const cleanup = await headroomSetup(context);
+    await cleanup?.();
+
+    expect(models[0]).toEqual({ id: "glm-5.2", providerID: "zai-coding-plan" });
   });
 
   it("prefers a model's own baseURL over its provider's", async () => {
@@ -404,12 +585,10 @@ describe("headroomSetup (OpenCode 2.x)", () => {
     });
   });
 
-  it("leaves local, already-proxied, non-OpenAI-wire and URL-less models alone", async () => {
+  it("leaves local, already-proxied, URL-less and unsupported-protocol models alone", async () => {
     const models: FakeModel[] = [
       { id: "llama", providerID: "ollama" },
       { id: "gpt-4o", providerID: "openai" },
-      { id: "claude", providerID: "anthropic-gateway" },
-      { id: "glm", providerID: "zai-coding-plan", package: "@opencode/ai/providers/zai-coding-plan/messages" },
       { id: "sonnet", providerID: "anthropic" },
       { id: "gemini", providerID: "google" },
     ];
@@ -427,16 +606,6 @@ describe("headroomSetup (OpenCode 2.x)", () => {
             id: "openai",
             package: "@opencode/ai/providers/openai/responses",
             settings: { baseURL: "http://127.0.0.1:8787/v1" },
-          },
-          {
-            id: "anthropic-gateway",
-            package: "@opencode/ai/providers/anthropic",
-            settings: { baseURL: "https://gateway.example/v1" },
-          },
-          {
-            id: "zai-coding-plan",
-            package: "@opencode/ai/providers/zai-coding-plan/chat",
-            settings: { baseURL: "https://api.z.ai/api/coding/paas/v4" },
           },
           { id: "anthropic", package: "@opencode/ai/providers/anthropic" },
           {

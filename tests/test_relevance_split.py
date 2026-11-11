@@ -125,6 +125,31 @@ def test_split_keeps_relevant_drops_irrelevant():
     assert "".join(t for _, t in runs) == content
 
 
+def test_split_uses_all_user_text_blocks():
+    from headroom.relevance.bm25 import BM25Scorer
+    from headroom.utils import extract_user_query
+
+    messages = [
+        {
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "Review production incidents"},
+                {"type": "text", "text": "Focus on Kafka replication"},
+            ],
+        }
+    ]
+    content = (
+        "Production incident: payment gateway high latency\n\n"
+        "Kafka replication lag on broker 17 exceeded 30 minutes\n\n"
+        "Disk full on backup server\n\n"
+        "Production incident: expired TLS certificate\n"
+    )
+    runs = plan_relevance_split(content, extract_user_query(messages), BM25Scorer(), threshold=0.25)
+    kept = "".join(text for keep, text in runs if keep)
+    assert "Kafka replication lag" in kept
+    assert "Disk full on backup server" not in kept
+
+
 def test_empty_query_yields_no_split():
     assert plan_relevance_split("x\ny\n", "", KeywordScorer(), threshold=0.5) == [(True, "x\ny\n")]
 
@@ -215,7 +240,9 @@ def test_router_lossless_mode_folds_only_no_drop():
     # irrelevant "widget" records must be PRESERVED, not silently dropped, and the
     # Kompress tail stub must never run.
     r = _router(split_on=True)  # lossless mode
-    out, _, chain = r._apply_strategy_to_content(_SEARCH, CompressionStrategy.SEARCH, "oauth token")
+    out, _, chain, _reversible = r._apply_strategy_to_content(
+        _SEARCH, CompressionStrategy.SEARCH, "oauth token"
+    )
     assert chain == ["lossless_search"]
     assert "oauth token" in out  # relevant records kept
     assert "widget" in out  # irrelevant tail ALSO kept — no silent drop in lossless mode
@@ -228,7 +255,9 @@ def test_router_relevance_split_fires_in_ccr_mode():
     # #1721); the _try_ml_compressor stub stands in for it here. Proves the
     # split is mode-agnostic, not lossless-only.
     r = _router(split_on=True, lossless=False)
-    out, _, chain = r._apply_strategy_to_content(_SEARCH, CompressionStrategy.SEARCH, "oauth token")
+    out, _, chain, _reversible = r._apply_strategy_to_content(
+        _SEARCH, CompressionStrategy.SEARCH, "oauth token"
+    )
     assert chain == ["search", "relevance_split"]
     assert "oauth token" in out
     assert "[TAIL]" in out
@@ -237,14 +266,18 @@ def test_router_relevance_split_fires_in_ccr_mode():
 def test_router_diff_stays_pure_lossless():
     r = _router(split_on=True)
     diff = "diff --git a/x b/x\nindex 111..222 100644\n@@ -1 +1 @@\n-old widget\n+new oauth token\n"
-    _, _, chain = r._apply_strategy_to_content(diff, CompressionStrategy.DIFF, "oauth token")
+    _, _, chain, _reversible = r._apply_strategy_to_content(
+        diff, CompressionStrategy.DIFF, "oauth token"
+    )
     assert "relevance_split" not in chain  # Kompressing hunks would break apply
     assert chain == ["lossless_diff"]
 
 
 def test_router_split_can_be_disabled():
     r = _router(split_on=False)
-    _, _, chain = r._apply_strategy_to_content(_SEARCH, CompressionStrategy.SEARCH, "oauth token")
+    _, _, chain, _reversible = r._apply_strategy_to_content(
+        _SEARCH, CompressionStrategy.SEARCH, "oauth token"
+    )
     assert "relevance_split" not in chain
 
 

@@ -87,7 +87,7 @@ class SemanticCacheConfig:
     # Similarity threshold for cache hit (0.0 - 1.0)
     similarity_threshold: float = 0.95
 
-    # Maximum entries in cache
+    # Maximum entries in cache (must be positive)
     max_entries: int = 1000
 
     # TTL in seconds (0 = no expiry)
@@ -170,6 +170,21 @@ class SemanticCache:
                     self._touch(key)
                     self._hits += 1
                     return entry
+        elif self.config.use_exact_matching and query.strip():
+            # put() uses a query-derived key when no context hash is supplied.
+            # Only read entries stored the same way; a context-keyed response
+            # must never become a query-only hit, even if the keys coincide.
+            key = self._combined_key(namespace, self._generate_key(query))
+            query_entry = self._cache.get(key)
+            if (
+                query_entry is not None
+                and not query_entry.messages_hash
+                and query_entry.namespace == namespace
+                and query_entry.query == query
+            ):
+                self._touch(key)
+                self._hits += 1
+                return query_entry
 
         # Try semantic similarity if we have embedding function.
         #
@@ -212,7 +227,13 @@ class SemanticCache:
 
         Returns:
             Cache key for the entry
+
+        Raises:
+            ValueError: If max_entries is not positive.
         """
+        if self.config.max_entries <= 0:
+            raise ValueError("max_entries must be positive")
+
         self._cleanup_expired()
 
         # Create cache key. Prefer the full-context hash: two requests that share
@@ -224,15 +245,6 @@ class SemanticCache:
         # metadata contexts never share a slot.
         base = messages_hash or self._generate_key(query)
         key = self._combined_key(namespace, base)
-
-        # Evict if adding a NEW key would exceed capacity. Overwriting a key that
-        # is already present is an in-place update that does not grow the map, so
-        # it must NOT evict — the old code ran the eviction loop before computing
-        # the key, so re-storing an existing entry at capacity dropped an
-        # unrelated live entry and turned a later lookup for it into a false miss.
-        # (Mirrors CompressionCache.store_compressed, which deletes-then-inserts.)
-        while key not in self._cache and len(self._cache) >= self.config.max_entries:
-            self._evict_oldest()
 
         # Generate embedding if available — but never for an empty/blank query.
         # A stored empty-query entry with an embedding would be a false-match
@@ -253,6 +265,18 @@ class SemanticCache:
             messages_hash=messages_hash or "",
             namespace=namespace,
         )
+
+        # Evict if adding a NEW key would exceed capacity. Overwriting a key that
+        # is already present is an in-place update that does not grow the map, so
+        # it must NOT evict — the old code ran the eviction loop before computing
+        # the key, so re-storing an existing entry at capacity dropped an
+        # unrelated live entry and turned a later lookup for it into a false miss.
+        # (Mirrors CompressionCache.store_compressed, which deletes-then-inserts.)
+        # The embedding call above may raise, so evict only once the new entry is
+        # built — never before, or a failed store would drop a live entry without
+        # replacing it.
+        while key not in self._cache and len(self._cache) >= self.config.max_entries:
+            self._evict_oldest()
 
         self._cache[key] = entry
 
@@ -435,9 +459,9 @@ class SemanticCacheLayer:
         messages_hash = self._compute_messages_hash(messages)
         namespace = self._compute_namespace(context)
 
-        # Unserializable context: never share cached responses across contexts,
-        # so skip the cache and just delegate to the provider optimizer.
-        if namespace is None:
+        # Failed serialization is an unknown identity, not a query-only request.
+        # Skip both exact and semantic lookup when the full context cannot hash.
+        if namespace is None or not messages_hash:
             return self.provider_optimizer.optimize(messages, context, config)
 
         # Check semantic cache
@@ -486,9 +510,8 @@ class SemanticCacheLayer:
         messages_hash = self._compute_messages_hash(messages)
         namespace = self._compute_namespace(context)
 
-        # Unserializable context: don't store anything that could be replayed
-        # for a different provider/model/metadata.
-        if namespace is None:
+        # Refuse incomplete identities instead of creating a query-only entry.
+        if namespace is None or not messages_hash:
             return ""
 
         return self.cache.put(query, response, messages_hash, namespace)

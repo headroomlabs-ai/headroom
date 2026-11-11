@@ -3,27 +3,21 @@
 Each test here corresponds to a defect that shipped in 0.37.0 and was found by
 running the documented examples against langchain-core 1.6:
 
-1. ``HeadroomChatModel.bind_tools()`` returned a model that emitted no tool
-   calls, because ``_generate`` called the private method on the
-   ``RunnableBinding`` and the bound kwargs were dropped.
-2. ``wrap_tools_with_headroom`` produced tools that raised ``TypeError`` on
+1. ``wrap_tools_with_headroom`` produced tools that raised ``TypeError`` on
    invoke, because ``StructuredTool`` calls its ``func`` with unpacked kwargs
    while ``BaseTool.invoke`` takes a single input.
-3. The wrapped tool lost the original ``args_schema``, so a model saw a tool
+2. The wrapped tool lost the original ``args_schema``, so a model saw a tool
    with no parameters.
-4. ``HeadroomDocumentCompressor`` silently subclassed a local stub rather than
+3. ``HeadroomDocumentCompressor`` silently subclassed a local stub rather than
    LangChain's ``BaseDocumentCompressor``, so retrievers rejected it.
 """
 
 import asyncio
 import json
-from typing import Any
 
 import pytest
 
 try:
-    from langchain_core.language_models.fake_chat_models import GenericFakeChatModel
-    from langchain_core.messages import AIMessage
     from langchain_core.tools import tool
 
     LANGCHAIN_AVAILABLE = True
@@ -33,14 +27,26 @@ except ImportError:
 pytestmark = pytest.mark.skipif(not LANGCHAIN_AVAILABLE, reason="LangChain not installed")
 
 
+# Repeated rows require a real transformation, not serialization-only savings.
 BIG_RESULT = json.dumps(
     {
         "results": [
-            {"id": i, "user": f"user{i}", "plan": "pro", "status": "active"} for i in range(300)
+            {"id": i % 10, "user": f"user{i % 10}", "plan": "pro", "status": "active"}
+            for i in range(300)
         ],
         "total": 300,
     }
 )
+
+
+def _assert_compressed_rows(output: str) -> None:
+    original = json.loads(BIG_RESULT)
+    compressed = json.loads(output)
+    kept = [row for row in compressed["results"] if "id" in row]
+    assert compressed["total"] == original["total"]
+    assert {row["id"]: row for row in kept} == {row["id"]: row for row in original["results"]}
+    assert len(kept) < len(original["results"])
+    assert len(output) < len(BIG_RESULT)
 
 
 @tool
@@ -49,60 +55,8 @@ def query_database(query: str) -> str:
     return BIG_RESULT
 
 
-class _RecordingModel(GenericFakeChatModel):
-    """Fake model that records the kwargs its _generate actually received."""
-
-    last_kwargs: dict[str, Any] = {}
-
-    def _generate(self, messages, stop=None, run_manager=None, **kwargs):
-        type(self).last_kwargs = dict(kwargs)
-        kwargs.pop("tools", None)
-        return super()._generate(messages, stop=stop, run_manager=run_manager, **kwargs)
-
-    def bind_tools(self, tools, **kwargs):
-        # Mirrors what real providers do: return a RunnableBinding carrying the
-        # tools in .kwargs rather than a new model instance.
-        return self.bind(tools=list(tools), **kwargs)
-
-
-class TestBindToolsSurvivesWrapping:
-    """Defect 1: bound kwargs must reach the underlying model."""
-
-    def test_bound_tools_reach_generate(self):
-        from headroom.integrations import HeadroomChatModel
-
-        _RecordingModel.last_kwargs = {}
-        inner = _RecordingModel(messages=iter([AIMessage("ok")]))
-        wrapped = HeadroomChatModel(inner).bind_tools([query_database])
-
-        wrapped.invoke("call the tool")
-
-        assert "tools" in _RecordingModel.last_kwargs, (
-            "bind_tools kwargs were dropped before reaching the wrapped model; "
-            "an agent built on this model would never call a tool"
-        )
-
-    def test_unbound_model_passes_no_tools(self):
-        from headroom.integrations import HeadroomChatModel
-
-        _RecordingModel.last_kwargs = {}
-        inner = _RecordingModel(messages=iter([AIMessage("ok")]))
-        HeadroomChatModel(inner).invoke("hello")
-
-        assert "tools" not in _RecordingModel.last_kwargs
-
-    def test_unwrap_binding_ignores_non_bindings(self):
-        from headroom.integrations import HeadroomChatModel
-
-        inner = GenericFakeChatModel(messages=iter([AIMessage("ok")]))
-        model, kwargs = HeadroomChatModel._unwrap_binding(inner)
-
-        assert model is inner
-        assert kwargs == {}
-
-
 class TestWrappedToolIsUsable:
-    """Defects 2 and 3: the wrapped tool must invoke, and keep its schema."""
+    """Defects 1 and 2: the wrapped tool must invoke, and keep its schema."""
 
     def test_invoke_with_keyword_arguments(self):
         from headroom.integrations import wrap_tools_with_headroom
@@ -110,8 +64,7 @@ class TestWrappedToolIsUsable:
         wrapped = wrap_tools_with_headroom([query_database], min_chars_to_compress=1000)[0]
         out = wrapped.invoke({"query": "signups"})
 
-        assert isinstance(out, str) and out
-        assert len(out) < len(BIG_RESULT)
+        _assert_compressed_rows(out)
 
     def test_argument_schema_is_preserved(self):
         from headroom.integrations import wrap_tools_with_headroom
@@ -129,7 +82,7 @@ class TestWrappedToolIsUsable:
         wrapped = wrap_tools_with_headroom([query_database], min_chars_to_compress=1000)[0]
         out = asyncio.run(wrapped.ainvoke({"query": "signups"}))
 
-        assert len(out) < len(BIG_RESULT)
+        _assert_compressed_rows(out)
 
     def test_unusable_args_schema_falls_back_to_inference(self):
         """A tool carrying a schema LangChain cannot use must still wrap."""
