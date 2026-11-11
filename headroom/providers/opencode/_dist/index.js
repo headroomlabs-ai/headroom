@@ -19730,7 +19730,7 @@ tool.schema = external_exports;
 // src/retrieve.ts
 var _proxyUrlCache = null;
 function getDefaultProxyUrl() {
-  return _proxyUrlCache ?? process.env.HEADROOM_BASE_URL ?? "http://localhost:8787";
+  return _proxyUrlCache || process.env.HEADROOM_BASE_URL || "http://localhost:8787";
 }
 function trimTrailingSlashes(value) {
   let end = value.length;
@@ -19919,6 +19919,20 @@ function wrapFork(originalFork) {
 function normalizeProxyUrl(proxyUrl) {
   return new URL(proxyUrl);
 }
+var reportedProxyUrls = /* @__PURE__ */ new Set();
+function usableProxyUrl(proxyUrl) {
+  try {
+    const proxy = normalizeProxyUrl(proxyUrl);
+    if (proxy.protocol !== "http:" && proxy.protocol !== "https:") throw new TypeError("unsupported scheme");
+    return proxy;
+  } catch {
+    if (!reportedProxyUrls.has(proxyUrl)) {
+      reportedProxyUrls.add(proxyUrl);
+      console.warn(`headroom: the configured proxy URL is ${proxyUrl === "" ? "empty" : "not a valid http(s) URL"}; requests are not routed`);
+    }
+    return void 0;
+  }
+}
 function isLoopback(hostname3) {
   const normalized = hostname3.toLowerCase().replace(/^\[|\]$/g, "");
   return normalized === "localhost" || normalized === "127.0.0.1" || normalized === "::1";
@@ -19955,8 +19969,11 @@ function isRoutableUpstream(url2, proxy, excludeHosts) {
   }
   return true;
 }
-function shouldRoute(url2, proxy, excludeHosts) {
-  return isRoutableUpstream(url2, proxy, excludeHosts) && isLlmEndpointPath(url2.pathname);
+function isLlmMethod(method) {
+  return typeof method === "string" && method.toUpperCase() === "POST";
+}
+function shouldRoute(url2, proxy, excludeHosts, method) {
+  return isLlmMethod(method) && isRoutableUpstream(url2, proxy, excludeHosts) && isLlmEndpointPath(url2.pathname);
 }
 function modelBaseRoutesThroughProxy(baseUrl, proxyUrl, excludeHosts = []) {
   try {
@@ -20021,7 +20038,8 @@ function mergeFetchHeaders(input2, init, upstream, originalPath = void 0, projec
 }
 function withRoutedFetchInput(input2, init, proxy, project, excludeHosts, sessionToken) {
   const upstream = requestUrl(input2);
-  if (!shouldRoute(upstream, proxy, excludeHosts)) {
+  const method = init?.method ?? (input2 instanceof Request ? input2.method : "GET");
+  if (!shouldRoute(upstream, proxy, excludeHosts, method)) {
     return [input2, init];
   }
   const { url: nextUrl, originalPath } = routedUrlForOpenCode(upstream, proxy);
@@ -20093,7 +20111,7 @@ function headersForNodeRequest(options, upstream, originalPath, project, session
   return result;
 }
 function routedNodeOptions(parts, proxy, project, excludeHosts, sessionToken) {
-  if (!parts.url || !shouldRoute(parts.url, proxy, excludeHosts)) {
+  if (!parts.url || !shouldRoute(parts.url, proxy, excludeHosts, parts.options.method ?? "GET")) {
     return void 0;
   }
   const { url: nextUrl, originalPath } = routedUrlForOpenCode(parts.url, proxy);
@@ -20132,7 +20150,10 @@ function wrapRequest(originalHttpRequest, originalHttpsRequest, originalRequest)
     if (!state) {
       return Reflect.apply(originalRequest, this, args);
     }
-    const proxy = normalizeProxyUrl(state.proxyUrl);
+    const proxy = usableProxyUrl(state.proxyUrl);
+    if (!proxy) {
+      return Reflect.apply(originalRequest, this, args);
+    }
     const parts = splitNodeArgs(args);
     const nextOptions = routedNodeOptions(parts, proxy, state.project, state.excludeHosts, state.sessionToken);
     if (!nextOptions) {
@@ -20194,7 +20215,10 @@ function installHeadroomTransport(options) {
     if (!current) {
       return state.originalFetch(...args);
     }
-    const proxy = normalizeProxyUrl(current.proxyUrl);
+    const proxy = usableProxyUrl(current.proxyUrl);
+    if (!proxy) {
+      return state.originalFetch(...args);
+    }
     const [nextInput, nextInit] = withRoutedFetchInput(args[0], args[1], proxy, current.project, current.excludeHosts, current.sessionToken);
     return state.originalFetch(nextInput, nextInit);
   };
@@ -20241,7 +20265,7 @@ function normalizeProxyUrl2(url2) {
 }
 function resolveProxyUrl(options) {
   return normalizeProxyUrl2(
-    options?.proxyUrl ?? process.env.HEADROOM_PROXY_URL ?? process.env.HEADROOM_BASE_URL ?? getDefaultProxyUrl()
+    options?.proxyUrl || process.env.HEADROOM_PROXY_URL || process.env.HEADROOM_BASE_URL || getDefaultProxyUrl()
   );
 }
 function resolveSessionToken(options) {
@@ -20258,23 +20282,35 @@ function headroomShellEnv(proxyUrl, project, options) {
     ...options.backend ? { HEADROOM_BACKEND: options.backend } : {}
   };
 }
-function openAiWireSuffix(pkg) {
+function modelWireSuffix(pkg) {
   if (!pkg?.startsWith("@opencode/ai/providers/")) return void 0;
   if (pkg === "@opencode/ai/providers/openai-compatible" || pkg.endsWith("/chat")) {
     return "/chat/completions";
   }
   if (pkg.endsWith("-responses") || pkg.endsWith("/responses")) return "/responses";
+  if (pkg === "@opencode/ai/providers/anthropic" || pkg === "@opencode/ai/providers/anthropic-compatible" || pkg.endsWith("/messages")) {
+    return "/messages";
+  }
   return void 0;
+}
+function anthropicBaseKeepsPath(baseURL) {
+  try {
+    const pathname = trimTrailingSlashes(new URL(baseURL).pathname);
+    return pathname === "" || pathname === "/v1";
+  } catch {
+    return false;
+  }
 }
 function routeModelsThroughProxy(models, proxyUrl, project, excludeHosts, sessionToken) {
   for (const model of models.list()) {
     const providerID = String(model.providerID);
     const modelID = String(model.id);
     const provider = models.provider.get(providerID)?.provider;
-    const suffix = openAiWireSuffix(model.package ?? provider?.package);
+    const suffix = modelWireSuffix(model.package ?? provider?.package);
     const baseURL = model.settings?.baseURL ?? provider?.settings?.baseURL;
     if (!suffix || typeof baseURL !== "string") continue;
     if (!modelBaseRoutesThroughProxy(baseURL, proxyUrl, excludeHosts)) continue;
+    if (suffix === "/messages" && !anthropicBaseKeepsPath(baseURL)) continue;
     const upstream = new URL(baseURL);
     models.update(providerID, modelID, (draft) => {
       draft.settings = { ...draft.settings, baseURL: `${proxyUrl}/v1` };

@@ -76,15 +76,21 @@ def test_intel_macos_python314_omits_ort_dependent_optional_backends() -> None:
         assert not selected & ort_backends, (extra, selected & ort_backends)
 
 
-def test_all_extra_includes_proxy_and_voice() -> None:
+def test_all_extra_includes_proxy_without_torch_dependency_extras() -> None:
     project = tomllib.loads((ROOT / "pyproject.toml").read_text())["project"]
-    all_requirements = project["optional-dependencies"]["all"]
+    optional = project["optional-dependencies"]
+    all_requirements = optional["all"]
 
-    assert any(
-        requirement.name == "headroom-ai" and {"proxy", "voice"} <= set(requirement.extras)
+    included_extras = {
+        extra
         for raw_requirement in all_requirements
-        if (requirement := Requirement(raw_requirement))
-    )
+        if (requirement := Requirement(raw_requirement)) and requirement.name == "headroom-ai"
+        for extra in requirement.extras
+    }
+
+    assert {"proxy", "image"} <= included_extras
+    assert not {"ml", "memory", "evals", "voice"} & included_extras
+    assert {"ml", "memory", "evals", "voice", "sandbox"} <= optional.keys()
 
 
 @pytest.mark.proxy_dependency_gate

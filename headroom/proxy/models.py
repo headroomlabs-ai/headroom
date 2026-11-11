@@ -12,6 +12,7 @@ from dataclasses import InitVar, dataclass, field
 from datetime import datetime
 from typing import Any, Literal
 
+from headroom.config import resolve_omlx_target_api_url
 from headroom.memory import qdrant_env
 from headroom.providers.registry import ProviderApiOverrides
 from headroom.proxy.buffered_ccr_response import DEFAULT_BUFFERED_CCR_GRACE_SECONDS
@@ -96,6 +97,12 @@ class RequestLog:
     cache_write_tokens: int = 0
     uncached_input_tokens: int = 0
 
+    # The provider's own prompt-token count, when it reported one (0 otherwise).
+    # ``input_tokens_optimized`` is the local tokenizer's count, which can differ;
+    # this is the figure the cost tracker bills, so per-request cost prices it
+    # in preference to the local count (#1079).
+    provider_input_tokens: int = 0
+
     # Waste signals detected in original messages
     waste_signals: dict[str, int] | None = None
 
@@ -164,6 +171,9 @@ class ProxyConfig:
     gemini_api_url: str | None = None  # Custom Gemini API URL override
     cloudcode_api_url: str | None = None  # Custom Cloud Code Assist API URL override
     vertex_api_url: str | None = None  # Custom Vertex AI regional API URL override
+    omlx_target_api_url: str | None = (
+        None  # Custom oMLX local inference API URL (e.g. http://127.0.0.1:8888)
+    )
     # Extra headers merged into (and overriding) forwarded Anthropic/OpenAI requests.
     # JSON-object config knobs; see settings_store's anthropic_extra_headers/
     # openai_extra_headers and providers.registry.resolve_extra_headers.
@@ -182,6 +192,12 @@ class ProxyConfig:
     # SigV4 signature. Leave unset (default) to keep `--backend bedrock`'s
     # direct-to-AWS, re-signing behavior unchanged.
     bedrock_api_url: str | None = None
+    # Factory Droid upstream (`--factory-api-url` / FACTORY_TARGET_API_URL).
+    # When set, `/api/llm/a/v1/messages` is compressed and forwarded here and
+    # every other `/api/*` path is passed through verbatim; it serves `/api/*`
+    # only and never becomes the catch-all upstream. Leave unset (default) to
+    # keep `/api/*` on the normal catch-all.
+    factory_api_url: str | None = None
     anyllm_provider: str = "openai"
 
     # Optimization mode: "token" (rewrite for max compression) or
@@ -422,6 +438,16 @@ class ProxyConfig:
     # stream-idle watchdog fires. 0 or less disables the keepalive entirely.
     # See headroom/proxy/buffered_ccr_response.py (#3079).
     buffered_ccr_grace_seconds: float = DEFAULT_BUFFERED_CCR_GRACE_SECONDS
+    # Buffered CCR for /v1/chat/completions streaming. Without it this is the
+    # one streaming path with no way to answer a retrieval: content carries
+    # markers but `headroom_retrieve` is withheld, and the tool toggles in and
+    # out for sessions that mix streaming with non-streaming turns, busting the
+    # tools cache segment each way. Enabling it flips turns that carry a
+    # redeemable marker to `stream: false` upstream and resynthesizes
+    # chat.completion.chunk frames, as Responses streaming already does. Off by
+    # default: this is the most incident-prone path in the proxy (#2465, #2997,
+    # #3079), so the default flips separately, with measurements (#3815).
+    ccr_buffered_chat_streaming: bool = False
 
     # Connection pool
     max_connections: int = 500
@@ -577,6 +603,8 @@ class ProxyConfig:
     def __post_init__(self, smart_routing: bool | None = None) -> None:
         if self.rollout is None:
             self.rollout = resolve_rollout()
+        if self.omlx_target_api_url is None:
+            self.omlx_target_api_url = resolve_omlx_target_api_url()
         # ``read_maturation`` remains a concrete, already-resolved runtime
         # setting for programmatic/config-file callers.  The CLI composition
         # root derives it from this same snapshot before constructing the

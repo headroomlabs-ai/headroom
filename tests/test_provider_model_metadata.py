@@ -54,6 +54,37 @@ def test_handle_model_metadata_endpoint_returns_chatgpt_response_when_present(mo
     assert response.json() == {"client": "h2", "upstream_path": "/backend-api/models"}
 
 
+def test_handle_model_metadata_endpoint_prefers_http1_client(monkeypatch) -> None:
+    async def fake_chatgpt_metadata(
+        http_client,
+        request: Request,
+        upstream_path: str,
+    ) -> Response:
+        return JSONResponse({"client": http_client, "upstream_path": upstream_path})
+
+    monkeypatch.setattr(
+        "headroom.providers.model_metadata.handle_chatgpt_model_metadata",
+        fake_chatgpt_metadata,
+    )
+    proxy = type("Proxy", (), {"http_client": "h2", "http_client_h1": "h1"})()
+    app = FastAPI()
+
+    @app.get("/probe")
+    async def probe(request: Request):
+        return await handle_model_metadata_endpoint(
+            proxy,
+            request,
+            endpoint=MODEL_METADATA_LIST_ENDPOINT,
+            provider_api_base_url="https://api.openai.test",
+            provider_name="openai",
+        )
+
+    with TestClient(app) as client:
+        response = client.get("/probe")
+
+    assert response.json() == {"client": "h1", "upstream_path": "/backend-api/models"}
+
+
 def test_handle_model_metadata_endpoint_falls_back_to_selected_provider(monkeypatch) -> None:
     async def fake_chatgpt_metadata(http_client, request: Request, upstream_path: str) -> None:
         return None
