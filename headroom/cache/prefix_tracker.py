@@ -563,12 +563,30 @@ def classify_history_relation(
     return _classify_history_canonical(current, previous)
 
 
+def cache_key_tools(tools: Any) -> Any:
+    """The Anthropic ``tools`` that count toward the prompt-cache key.
+
+    A ``defer_loading`` tool is kept out of the prompt until the model loads
+    it, so adding one to ``tools`` leaves the cached prefix readable. Claude
+    Code appends every tool its ToolSearch loads to ``tools``, still marked
+    deferred; counting those would start a new lineage at frozen=0 after each
+    load and re-run the whole history. Every other tool, and a tool whose
+    ``defer_loading`` is cleared, still counts. The Anthropic handler decides
+    when to apply this (first-party upstream, ``HEADROOM_DEFERRED_TOOL_AFFINITY``).
+    """
+    if not isinstance(tools, list):
+        return tools
+    return [t for t in tools if not (isinstance(t, dict) and t.get("defer_loading"))]
+
+
 def segment_fingerprint(value: Any) -> str:
     """Stable hash for non-message provider cache-key segments.
 
     Cache-control placement and transport annotations are deliberately ignored;
-    semantic tool/model/thinking changes remain visible.  The hash is affinity
-    metadata only and is never used to reconstruct or forward request content.
+    semantic tool/model/thinking changes remain visible.  It hashes what it is
+    given, so callers pass only what the provider keys its cache on (for
+    Anthropic tools, :func:`cache_key_tools`).  The hash is affinity metadata
+    only and is never used to reconstruct or forward request content.
     """
     canonical = _lineage_snapshot(_canonicalize_for_prefix_compare(value))
     encoded = json.dumps(
@@ -1087,33 +1105,37 @@ def mirror_client_message_cache_control(
     messages: list[dict[str, Any]],
     client_messages: list[dict[str, Any]] | None,
 ) -> list[dict[str, Any]]:
-    """Keep ``cache_control`` outside content blocks exactly where the client put it.
+    """Keep Chat Completions ``cache_control`` exactly where the client put it.
 
     OpenAI-compatible clients that talk to Anthropic models through a gateway
-    (OpenCode via ``@ai-sdk/openai-compatible``, then LiteLLM) do not mark
-    content blocks. They mark the MESSAGE dict — ``{"role": "tool", "content":
-    "...", "cache_control": {...}}`` — and, on an assistant turn, the entries of
-    its ``tool_calls`` list, which the gateway turns into ``tool_use`` blocks.
-    ``normalize_message_cache_control`` only sees block markers
-    (``_client_marker_positions`` reads list content), so after
-    ``overlay_cached_prefix`` / ``finalize_turn`` replay an earlier turn's
-    forwarded messages, these markers ride along untouched. A client that marks
-    three places per request (system, the newest tool call, the newest tool
-    result) ends up forwarding four, then five and more, and the gateway's
-    translation to Anthropic blocks crosses the limit of four (``A maximum of 4
-    blocks with cache_control may be provided. Found 6``).
+    (OpenCode via ``@ai-sdk/openai-compatible``, then LiteLLM) mark three kinds
+    of holder: the MESSAGE dict — ``{"role": "tool", "content": "...",
+    "cache_control": {...}}`` —, the entries of an assistant's ``tool_calls``
+    list, which the gateway turns into ``tool_use`` blocks, and the content
+    blocks of list-form content (OpenCode V2 sends system, user and tool
+    content as text blocks). After ``overlay_cached_prefix`` /
+    ``finalize_turn`` replay an earlier turn's forwarded messages, last turn's
+    markers ride along with the replayed bytes. A client that moves its
+    breakpoint forward each step then forwards one marker more per step, and
+    the gateway's translation to Anthropic blocks crosses the limit of four
+    (``A maximum of 4 blocks with cache_control may be provided. Found 5``).
 
-    The client's current request is the authority for these markers, the same
-    rule the block-level normalizer applies: on each message and on each of its
-    ``tool_calls``, drop the marker unless the client put one there in this
-    request, in which case copy the client's own value. Content — and any
-    block-level marker in it — is left alone, so the replayed bytes the provider
-    cached stay byte-identical.
+    The client's current request is the authority for these markers: on each
+    message, each of its ``tool_calls`` and each of its content blocks, drop the
+    marker unless the client put one there in this request, in which case copy
+    the client's own value (an explicit ``ttl`` survives per position). Only the
+    ``cache_control`` keys move; every other byte of the replayed content stays
+    what the provider cached.
 
-    Index alignment is the invariant (the pipeline preserves message count and
-    each message's tool calls); where it does not hold, that message or list is
-    returned unchanged rather than guessing, and the breakpoint budget guard
-    still bounds the total.
+    Unlike ``normalize_message_cache_control`` this never creates a marker and
+    never moves one to a different block: in Chat the system prompt is part of
+    ``messages``, so a consolidating fallback would also strip the client's
+    system breakpoints. Index alignment is the invariant (the pipeline preserves
+    message count and each message's tool calls); where it does not hold, that
+    message or list is left unchanged rather than guessing. A replay may also
+    bring back an earlier turn's block-form content where the client now sends
+    a string (OpenCode does this for older user turns): the client marks no
+    block there, so the replayed block markers are dropped.
     """
     if not isinstance(client_messages, list) or len(client_messages) != len(messages):
         return messages
@@ -1135,9 +1157,39 @@ def mirror_client_message_cache_control(
             if any(c for _, c in mirrored):
                 new_msg = {**new_msg, "tool_calls": [c for c, _ in mirrored]}
                 msg_changed = True
+        blocks = new_msg.get("content")
+        client_blocks = client.get("content") if isinstance(client, dict) else None
+        if isinstance(blocks, list):
+            mirrored = _mirror_block_markers(blocks, client_blocks)
+            if mirrored is not blocks:
+                new_msg = {**new_msg, "content": mirrored}
+                msg_changed = True
         out.append(new_msg)
         changed = changed or msg_changed
     return out if changed else messages
+
+
+def _mirror_block_markers(blocks: list[Any], client_content: Any) -> list[Any]:
+    """Give each forwarded content block the client's block marker (or none).
+
+    A client message that marks no block (string content, which a replay may
+    bring back in an earlier turn's block form, or unmarked blocks) leaves no
+    block marker to keep, so every one is dropped. When the client does mark
+    blocks, positions map 1:1 only if the block counts match; otherwise the
+    blocks are returned unchanged rather than guessing.
+    """
+    client_blocks = client_content if isinstance(client_content, list) else []
+    client_marks = any(
+        isinstance(b, dict) and isinstance(b.get("cache_control"), dict) for b in client_blocks
+    )
+    if not client_marks:
+        client_blocks = [None] * len(blocks)
+    elif len(client_blocks) != len(blocks):
+        return blocks
+    mirrored = [_mirror_marker(b, cb) for b, cb in zip(blocks, client_blocks)]
+    if not any(c for _, c in mirrored):
+        return blocks
+    return [b for b, _ in mirrored]
 
 
 def _mirror_marker(holder: Any, client_holder: Any) -> tuple[Any, bool]:
@@ -1206,18 +1258,32 @@ class PrefixCacheTracker:
         # builds the manager.
         self.restored_from_disk = False
         self.restored_maturation_state: dict[str, Any] | None = None
+        # Shared-store state (headroom.cache.shared_sessions): the write token
+        # this tracker matches ("" when never shared) and the digests of the
+        # messages known to be stored with it.
+        self.shared_token = ""
+        self.shared_digests: frozenset[str] = frozenset()
 
         # Stats
         self._busts_avoided: int = 0
         self._tokens_preserved: int = 0
         self._compression_foregone_tokens: int = 0
 
+        # Sticky reasoning-drop floor (#4548): on a cold turn the OpenAI reasoning
+        # compactor drops non-kept prior turns outright (safe — the cold turn
+        # re-caches from scratch). The next warm turn must DROP those same turns
+        # again instead of re-Kompressing them, or the forwarded prefix no longer
+        # matches the cached cold-turn prefix and the cache misses. This is the
+        # highest assistant ordinal dropped + 1, i.e. the count of leading
+        # non-kept turns to keep dropped on subsequent warm turns.
+        self.reasoning_drop_upto: int = 0
+
     def get_frozen_message_count(self) -> int:
         """How many leading messages to skip compression on the next turn.
 
         Returns 0 on turn 0 (cold start) or if caching is disabled/below threshold.
         """
-        turn_number, cached_tokens, cached_messages, _, _ = self._request_turn_state()
+        turn_number, cached_tokens, cached_messages, *_ = self._request_turn_state()
         if not self.config.enabled:
             return 0
         if turn_number == 0:
@@ -1304,6 +1370,7 @@ class PrefixCacheTracker:
             self._cached_message_count,
             self._last_original_messages,
             self._last_forwarded_messages,
+            self.reasoning_drop_upto,
         )
 
     def _request_turn_state(self) -> tuple[Any, ...]:
@@ -1323,7 +1390,14 @@ class PrefixCacheTracker:
         resolved = _resolved_turn.get()
         if resolved is not None and resolved[0] is self:
             if resolved[1] in self._turn_states:
-                self._turn_states[resolved[1]] = self._turn_state()
+                state = self._turn_state()
+                # Keep writes associated with the resolved request's floor,
+                # not a sibling fork that mutated the live value (#4548).
+                if resolved[2] is not None and len(resolved[2]) > 5:
+                    state = list(state)
+                    state[5] = resolved[2][5]
+                    state = tuple(state)
+                self._turn_states[resolved[1]] = state
             # The request has its response; later reads see the current state.
             _resolved_turn.set((self, resolved[1], None))
 
@@ -1341,7 +1415,29 @@ class PrefixCacheTracker:
                 self._cached_message_count,
                 self._last_original_messages,
                 self._last_forwarded_messages,
+                self.reasoning_drop_upto,
             ) = state
+
+    def request_reasoning_drop_floor(self) -> int:
+        """Return the sticky reasoning-drop floor for this request's resolved turn."""
+        return int(self._request_turn_state()[5])
+
+    def raise_reasoning_drop_floor(self, floor: int) -> None:
+        """Raise the sticky reasoning-drop floor for this request.
+
+        A cold turn's drop must survive into the response recorded for this
+        request, without letting a sibling fork's live mutation leak in.
+        Updates the live floor (never shrinking it) and the resolved request's
+        turn snapshot so response recording persists the deliberate increase.
+        """
+        floor = int(floor)
+        self.reasoning_drop_upto = max(self.reasoning_drop_upto, floor)
+        resolved = _resolved_turn.get()
+        if resolved is not None and resolved[0] is self and resolved[2] is not None:
+            state = list(resolved[2])
+            if len(state) > 5:
+                state[5] = max(int(state[5]), floor)
+                _resolved_turn.set((self, resolved[1], tuple(state)))
 
     def record_returned(
         self,
@@ -1509,16 +1605,20 @@ class PrefixCacheTracker:
 
     def is_expired_for_cache_ttl(self, cache_ttl_seconds: int | None) -> bool:
         """Check expiry including the longest configured or observed cache lifetime."""
+        return (time.time() - self._last_activity) > self.retention_seconds(cache_ttl_seconds)
+
+    def retention_seconds(self, cache_ttl_seconds: int | None = None) -> float:
+        """How long this tracker is kept after its last activity: the session
+        TTL, or the longest configured or observed cache lifetime plus a margin."""
         observed_ttl = max(
             self._cache_ttl_seconds or 0,
             self.config.cache_ttl_seconds or 0,
             cache_ttl_seconds or 0,
         )
-        retention = max(
+        return max(
             self.config.session_ttl_seconds,
             observed_ttl + _CACHE_TTL_CLEANUP_MARGIN_SECONDS if observed_ttl else 0,
         )
-        return (time.time() - self._last_activity) > retention
 
     def observe_cache_ttl(self, cache_ttl_seconds: int | None) -> None:
         """Remember the longest provider cache lifetime observed for this lineage."""
@@ -1644,13 +1744,18 @@ def _deref(table: list[Any], refs: list[int]) -> list[Any]:
 
 
 def _decode_turn_state(table: list[Any], state: list[Any]) -> tuple[Any, ...]:
-    turn, cached_tokens, cached_messages, original, forwarded = state
+    if len(state) >= 6:
+        turn, cached_tokens, cached_messages, original, forwarded, drop_upto = state
+    else:
+        turn, cached_tokens, cached_messages, original, forwarded = state
+        drop_upto = 0
     return (
         int(turn),
         int(cached_tokens),
         int(cached_messages),
         _deref(table, original),
         _deref(table, forwarded),
+        int(drop_upto),
     )
 
 
@@ -2144,6 +2249,14 @@ class SessionTrackerStore:
         pairs mostly repeat the same messages, so this keeps the file near one
         copy of each conversation instead of up to eleven.
         """
+        meta, table = self._tracker_parts(key, tracker, session_id)
+        return f'{{"meta":{json.dumps(meta)},"messages":[{",".join(table)}]}}'
+
+    def _tracker_parts(
+        self, key: str, tracker: PrefixCacheTracker, session_id: str | None
+    ) -> tuple[dict[str, Any], list[str]]:
+        """A tracker as its metadata, whose message lists are indexes into the
+        table, and the table: each distinct message once, as JSON."""
         index: dict[str, int] = {}
         memo: dict[int, list[int]] = {}
 
@@ -2157,7 +2270,7 @@ class SessionTrackerStore:
             return memo[id(messages)]
 
         def state(s: tuple[Any, ...]) -> list[Any]:
-            return [s[0], s[1], s[2], ref(s[3]), ref(s[4])]
+            return [s[0], s[1], s[2], ref(s[3]), ref(s[4]), s[5]]
 
         maturation = tracker.read_maturation_manager
         meta = {
@@ -2172,7 +2285,7 @@ class SessionTrackerStore:
             "history": [[ref(snap), t] for snap, t in self._lineage_history.get(key, ())],
             "maturation": None if maturation is None else maturation.export_state(),
         }
-        return f'{{"meta":{json.dumps(meta)},"messages":[{",".join(index)}]}}'
+        return meta, list(index)
 
     def load_state(self, path: str) -> int:
         """Resume the trackers :meth:`save_state` wrote, before serving.
@@ -2213,6 +2326,59 @@ class SessionTrackerStore:
         )
         return restored
 
+    def _decode_tracker(self, entry: Any, now: float) -> PrefixCacheTracker | None:
+        """One :meth:`_encode_tracker` entry as a tracker marked restored, or
+        ``None`` when it has expired. Raises on a malformed entry."""
+        meta, table = entry["meta"], entry["messages"]
+        tracker = PrefixCacheTracker(str(meta["provider"]), self._default_config)
+        tracker._last_activity = float(meta["last_activity"])
+        tracker.observe_cache_ttl(meta["cache_ttl"])
+        # NaN or a future stamp would never expire.
+        if tracker.is_expired or not tracker._last_activity <= now:
+            return None
+        (
+            tracker._turn_number,
+            tracker._cached_token_count,
+            tracker._cached_message_count,
+            tracker._last_original_messages,
+            tracker._last_forwarded_messages,
+            tracker.reasoning_drop_upto,
+        ) = _decode_turn_state(table, meta["state"])
+        tracker._turn_states = {int(t): _decode_turn_state(table, s) for t, s in meta["turns"]}
+        tracker.restored_from_disk = True
+        if meta["maturation"] is not None:
+            from headroom.transforms.read_maturation import ReadMaturationManager
+
+            tracker.restored_maturation_state = ReadMaturationManager.validate_state(
+                meta["maturation"]
+            )
+        return tracker
+
+    def encode_shared(
+        self, key: str, tracker: PrefixCacheTracker
+    ) -> tuple[dict[str, Any], list[str]]:
+        """``tracker`` for another process (headroom.cache.shared_sessions): its
+        metadata and its message table, each distinct message once, as JSON.
+        Raises when its messages are not JSON."""
+        return self._tracker_parts(key, tracker, None)
+
+    def decode_shared(self, meta: Any, messages: list[Any]) -> PrefixCacheTracker | None:
+        """The tracker :meth:`encode_shared` described, marked restored so its
+        next turn seeds the compression cache from it; ``None`` when it has
+        expired. Raises on malformed input. Does not install it."""
+        if not isinstance(meta, dict):
+            raise ValueError("tracker metadata is not an object")
+        now = time.time()
+        # Written on another host: a clock ahead of ours is not a future stamp.
+        meta = {**meta, "last_activity": min(float(meta["last_activity"]), now)}
+        return self._decode_tracker({"meta": meta, "messages": messages}, now)
+
+    def install(self, key: str, tracker: PrefixCacheTracker) -> None:
+        """Make ``tracker`` the one under ``key``. Call on the event loop, or
+        from a worker thread only for a key already present (replacing a value
+        does not resize the dict the loop may be iterating)."""
+        self._trackers[key] = tracker
+
     def _decode_state(self, data: Any) -> int:
         """Validate the whole file first, then install it; a bad file installs nothing."""
         from headroom.cache.compression_store import CompressionEntry, get_compression_store
@@ -2228,27 +2394,9 @@ class SessionTrackerStore:
         # Oldest first, so each family keeps its lineages in creation order.
         for entry in reversed(data["trackers"]):
             meta, table = entry["meta"], entry["messages"]
-            tracker = PrefixCacheTracker(str(meta["provider"]), self._default_config)
-            tracker._last_activity = float(meta["last_activity"])
-            tracker.observe_cache_ttl(meta["cache_ttl"])
-            # NaN or a future stamp would never expire.
-            if tracker.is_expired or not tracker._last_activity <= now:
+            tracker = self._decode_tracker(entry, now)
+            if tracker is None:
                 continue
-            (
-                tracker._turn_number,
-                tracker._cached_token_count,
-                tracker._cached_message_count,
-                tracker._last_original_messages,
-                tracker._last_forwarded_messages,
-            ) = _decode_turn_state(table, meta["state"])
-            tracker._turn_states = {int(t): _decode_turn_state(table, s) for t, s in meta["turns"]}
-            tracker.restored_from_disk = True
-            if meta["maturation"] is not None:
-                from headroom.transforms.read_maturation import ReadMaturationManager
-
-                tracker.restored_maturation_state = ReadMaturationManager.validate_state(
-                    meta["maturation"]
-                )
             key = str(meta["key"])
             trackers[key] = tracker
             history = deque(

@@ -117,6 +117,37 @@ describe("compress()", () => {
     expect(body.messages).toHaveLength(5);
   });
 
+  it("round-trips a Gemini functionCall with no args", async () => {
+    const client = new HeadroomClient({ baseUrl: "http://127.0.0.1:9", fallback: true });
+    const messages = [
+      { role: "user", parts: [{ text: "call f" }] },
+      { role: "model", parts: [{ functionCall: { name: "f" } }] },
+      { role: "user", parts: [{ functionResponse: { name: "f", response: { ok: true } } }] },
+    ];
+
+    const result = await compress(messages, { client });
+
+    expect(result.compressed).toBe(false);
+    // The proxy sent an empty object for the missing args...
+    const body = JSON.parse(mockFetch.mock.calls[0][1].body);
+    expect(body.messages[1].tool_calls[0].function.arguments).toBe("{}");
+    // ...and it survives conversion back to Gemini.
+    expect(result.messages[1]).toEqual({
+      role: "model",
+      parts: [{ functionCall: { name: "f", args: {} } }],
+    });
+  });
+
+  it("leaves a non-object entry alone instead of dropping it", async () => {
+    const result = await compress(["Keep this instruction", { role: "user", content: "hi" }], {
+      model: "gpt-4o",
+    });
+
+    expect(result.compressed).toBe(false);
+    expect(result.messages).toEqual(["Keep this instruction", { role: "user", content: "hi" }]);
+    expect(mockFetch).not.toHaveBeenCalled();
+  });
+
   it("forwards a per-call config, overriding a provided client's config", async () => {
     mockFetch.mockResolvedValueOnce(okResponse());
     const client = new HeadroomClient({
@@ -133,5 +164,151 @@ describe("compress()", () => {
     const body = JSON.parse(opts.body);
     expect(body.config.mode).toBe("ccr");
     expect(body.config.target_ratio).toBe(0.25);
+  });
+});
+
+describe("compress() autodetects Vercel media-only conversations", () => {
+  beforeEach(() => {
+    mockFetch.mockReset();
+  });
+
+  it("sends binary file parts as image_url data URIs and restores Vercel file parts", async () => {
+    mockFetch.mockResolvedValueOnce(
+      okResponse({
+        messages: [
+          {
+            role: "user",
+            content: [
+              { type: "text", text: "compressed" },
+              { type: "image_url", image_url: { url: "data:image/png;base64,iVBORw==", part: "file" } },
+            ],
+          },
+        ],
+      }),
+    );
+
+    const result = await compress(
+      [
+        {
+          role: "user",
+          content: [
+            { type: "text", text: "what is this?" },
+            { type: "file", mediaType: "image/png", data: new Uint8Array([137, 80, 78, 71]) },
+          ],
+        },
+      ],
+      { baseUrl: "http://localhost:8787" },
+    );
+
+    const body = JSON.parse(mockFetch.mock.calls[0][1].body);
+    expect(body.messages[0].content[1]).toEqual({
+      type: "image_url",
+      image_url: { url: "data:image/png;base64,iVBORw==", part: "file" },
+    });
+    expect(JSON.stringify(body)).not.toContain('"0":137');
+    expect(result.messages[0].content[1]).toEqual({ type: "file", mediaType: "image/png", data: "iVBORw==" });
+  });
+});
+
+describe("compress() keeps Anthropic text documents through the public path", () => {
+  beforeEach(() => {
+    mockFetch.mockReset();
+  });
+
+  it("posts a document-only turn as the native document block and returns it unchanged", async () => {
+    const doc = {
+      type: "document",
+      source: { type: "text", media_type: "text/plain", data: "Critical contract: do not delete account 123" },
+      title: "Contract",
+      citations: { enabled: true },
+    };
+    // The proxy passes non-text blocks through unchanged; echo the request's messages back.
+    mockFetch.mockImplementationOnce(async (_url: string, init: any) => okResponse({ messages: JSON.parse(init.body).messages }));
+
+    const result = await compress([{ role: "user", content: [doc] }], { baseUrl: "http://localhost:8787" });
+
+    // Anthropic input is not converted: the document block itself reaches the proxy.
+    const body = JSON.parse(mockFetch.mock.calls[0][1].body);
+    expect(body.messages).toEqual([{ role: "user", content: [doc] }]);
+    expect(result.messages).toEqual([{ role: "user", content: [doc] }]);
+  });
+});
+
+describe("compress() sends Anthropic-format input to the proxy natively", () => {
+  beforeEach(() => {
+    mockFetch.mockReset();
+  });
+
+  const anthropicTurn = [
+    { role: "user", content: "search for X" },
+    {
+      role: "assistant",
+      content: [
+        { type: "thinking", thinking: "Search first.", signature: "SIG-1" },
+        { type: "tool_use", id: "toolu_1", name: "search", input: { q: "X" } },
+      ],
+    },
+    {
+      role: "user",
+      content: [{ type: "tool_result", tool_use_id: "toolu_1", content: "a\nb\nc" }],
+    },
+  ];
+
+  it("posts the Anthropic blocks as-is and returns the proxy's messages unconverted", async () => {
+    const returned = structuredClone(anthropicTurn);
+    (returned[2].content as any[])[0].content = "[3 lines]";
+    mockFetch.mockResolvedValueOnce(okResponse({ messages: returned }));
+
+    const result = await compress(anthropicTurn, { baseUrl: "http://localhost:8787" });
+
+    const body = JSON.parse(mockFetch.mock.calls[0][1].body);
+    expect(body.messages).toEqual(anthropicTurn);
+    expect(result.messages).toEqual(returned);
+  });
+});
+
+describe("compress() honors a declared input format", () => {
+  beforeEach(() => {
+    mockFetch.mockReset();
+  });
+
+  it("converts a text-only Vercel prompt both ways when format is declared, instead of autodetecting OpenAI", async () => {
+    // Nothing in this prompt distinguishes it from OpenAI, so autodetection would hand it
+    // to the proxy unconverted and return OpenAI shape (a string) to an AI SDK caller.
+    const prompt = [{ role: "user", content: [{ type: "text", text: "hi" }] }];
+    mockFetch.mockResolvedValueOnce(okResponse({ messages: [{ role: "user", content: "compressed" }] }));
+
+    const result = await compress(prompt, { baseUrl: "http://localhost:8787", format: "vercel" });
+
+    const body = JSON.parse(mockFetch.mock.calls[0][1].body);
+    expect(body.messages).toEqual([{ role: "user", content: "hi" }]);
+    expect(result.messages).toEqual([{ role: "user", content: [{ type: "text", text: "compressed" }] }]);
+  });
+});
+
+describe("compress() keeps OpenAI attachments on the autodetection path when messages carry providerOptions", () => {
+  beforeEach(() => {
+    mockFetch.mockReset();
+  });
+
+  it("passes an OpenAI user message with providerOptions, an image_url and a file part through unconverted", async () => {
+    const messages = [
+      {
+        role: "user",
+        providerOptions: { openai: {} },
+        content: [
+          { type: "text", text: "Describe this" },
+          { type: "image_url", image_url: { url: "https://example.com/cat.png" } },
+          { type: "file", file: { file_id: "file-abc", filename: "notes.pdf" } },
+        ],
+      },
+    ];
+    mockFetch.mockResolvedValueOnce(okResponse({ messages }));
+
+    const result = await compress(messages, { baseUrl: "http://localhost:8787" });
+
+    const body = JSON.parse(mockFetch.mock.calls[0][1].body);
+    expect(body.messages).toEqual(messages);
+    expect(result.messages).toEqual(messages);
   });
 });

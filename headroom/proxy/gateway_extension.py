@@ -42,6 +42,7 @@ from headroom.proxy.gateway_turn import (
     new_turn_id,
     on_turn_expired,
     parse_gateway_block,
+    provider_for_body,
     provider_for_model,
     register_pending_turn,
     shape_gateway_body,
@@ -80,7 +81,7 @@ class GatewayTurn:
         self.body = body
         self.caps = caps
         self.client = client
-        self.provider = provider_for_model(str(body.get("model") or ""))
+        self.provider = provider_for_body(body, str(body.get("model") or ""))
         # The wire shape is a property of the body, not of the model name, and
         # it is fixed for the life of the turn: the response half has to write
         # a re-drive in the same shape the request half read.
@@ -92,6 +93,9 @@ class GatewayTurn:
         self._obligations: list[str] = []
         self._turn_id: str | None = None
         self._ccr_armed = False
+        # Set by the compress handler from the session id (see CompressTurn);
+        # hooks see it as ``TurnContext.conversation``.
+        self.conversation: str | None = None
 
     # -- fail-open ---------------------------------------------------------
     def fail_open_fields(self, messages: list[dict[str, Any]]) -> dict[str, Any]:
@@ -100,7 +104,6 @@ class GatewayTurn:
             request=self.request,
             body=self.body,
             caps=self.caps,
-            provider=self.provider,
             messages=messages,
             tools=self.body.get("tools"),
             obligations=[],
@@ -116,7 +119,7 @@ class GatewayTurn:
         bind_scope(tags, self.request.scope)
         self.model_name = model_name
         self.tags = tags
-        self.provider = provider_for_model(model_name)
+        self.provider = provider_for_body(self.body, model_name)
         self._transformer = RequestTransformer(
             provider=self.provider,
             model_name=model_name,
@@ -124,6 +127,7 @@ class GatewayTurn:
             config=config,
             tags=tags,
             caps=self.caps,
+            conversation=self.conversation,
         )
 
     # -- executor side -----------------------------------------------------
@@ -152,6 +156,14 @@ class GatewayTurn:
     @property
     def hook_tool_saved_tokens(self) -> int:
         return self._transformer.hook_tool_saved_tokens if self._transformer is not None else 0
+
+    @property
+    def compaction_tokens_before(self) -> int:
+        return self._transformer.compaction_tokens_before if self._transformer is not None else 0
+
+    @property
+    def compaction_tokens_after(self) -> int:
+        return self._transformer.compaction_tokens_after if self._transformer is not None else 0
 
     # -- event-loop side ---------------------------------------------------
     def finish(
@@ -190,7 +202,6 @@ class GatewayTurn:
             request=self.request,
             body=self.body,
             caps=self.caps,
-            provider=self.provider,
             messages=messages,
             tools=result.tools,
             obligations=self._obligations,
@@ -205,9 +216,13 @@ class GatewayTurn:
             input_tokens=tokens_before,
             transforms=transforms,
         )
-        if self.provider == "anthropic":
+        if not self.responses_shape and "anthropic" in (
+            self.provider,
+            provider_for_model(self.model_name),
+        ):
             # Last stop before the body leaves: a request over Anthropic's
-            # cache_control budget is a guaranteed 400 on the provider.
+            # cache_control budget is a guaranteed 400 on the provider. The
+            # budget belongs to the upstream, so a chat body to Claude counts.
             from headroom.proxy.helpers import enforce_cache_breakpoint_budget
 
             provider_body = self._fields["body"]

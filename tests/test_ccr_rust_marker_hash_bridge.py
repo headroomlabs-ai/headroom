@@ -50,7 +50,7 @@ def test_persist_warning_rejects_malformed_exception_names(monkeypatch, caplog, 
     monkeypatch.delenv("HEADROOM_DEBUG_DUMP", raising=False)
     monkeypatch.setattr(compression_store, "get_compression_store", lambda: BrokenStore())
     with caplog.at_level(level, logger=base.logger.name):
-        assert persist_rust_ccr_entry("original", "compressed", "a" * 24, source="diff") is None
+        assert persist_rust_ccr_entry("original", "compressed", "a" * 24, source="diff") is False
     assert len([record for record in caplog.records if record.levelno == logging.WARNING]) == 1
     for record in caplog.records:
         rendered = logging.Formatter().format(record)

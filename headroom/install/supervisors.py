@@ -21,6 +21,10 @@ from headroom._subprocess import run
 
 from .models import ArtifactRecord, DeploymentManifest, SupervisorKind
 from .paths import (
+    OWNER_ONLY_FILE_MODE,
+    OWNER_ONLY_SCRIPT_MODE,
+    POSIX_MODES_ENFORCED,
+    chmod_owner_only,
     unix_ensure_script_path,
     unix_run_script_path,
     windows_ensure_cmd_path,
@@ -45,6 +49,32 @@ _ENV_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 
 def _is_windows() -> bool:
     return sys.platform.startswith("win")
+
+
+def _write_private_text(path: Path, data: str, mode: int) -> None:
+    """Atomically replace a secret-bearing runner with a private new inode.
+
+    Creating the temporary file exclusively avoids following a replacement
+    hard link. Restrict it before publishing; a failed write, restriction or
+    replacement leaves the previous runner and unrelated files untouched.
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, name = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=path.parent)
+    temporary = Path(name)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            if hasattr(os, "fchmod"):
+                os.fchmod(handle.fileno(), mode)
+            handle.write(data)
+        if not chmod_owner_only(temporary, mode) and POSIX_MODES_ENFORCED:
+            raise click.ClickException(
+                f"Refusing to write {path}: permissions could not be restricted "
+                f"to {oct(mode)}, and the file carries any API key passed via "
+                f"`headroom install --env`. Fix directory permissions and re-run."
+            )
+        os.replace(temporary, path)
+    finally:
+        temporary.unlink(missing_ok=True)
 
 
 def _validated_env_items(env: dict[str, str] | None) -> list[tuple[str, str]]:
@@ -101,14 +131,19 @@ def _render_unix_runner(
     export_lines = "".join(
         f"export {name}={shlex.quote(value)}\n" for name, value in _validated_env_items(env)
     )
-    path.write_text(
+    # 0700, not 0755: `export_lines` can contain a provider API key in
+    # cleartext (see `_write_private_text`). The supervisor runs this script as
+    # the installing user for a user-scope install and as root for a
+    # system-scope one, so dropping group/other loses nothing.
+    _write_private_text(
+        path,
         "#!/usr/bin/env bash\nset -euo pipefail\n"
         + export_lines
         + "exec "
         + " ".join(shlex.quote(x) for x in command)
-        + "\n"
+        + "\n",
+        OWNER_ONLY_SCRIPT_MODE,
     )
-    path.chmod(0o755)
     return ArtifactRecord(kind="script", path=str(path))
 
 
@@ -124,9 +159,17 @@ def _render_windows_runner(
     env_lines = "".join(
         f"$env:{name} = {_powershell_literal(value)}\n" for name, value in _validated_env_items(env)
     )
-    ps1_path.write_text(
-        f"$ErrorActionPreference = 'Stop'\n{env_lines}& {escaped}\nexit $LASTEXITCODE\n"
+    # The .ps1 carries `$env:` assignments that can include a provider API key,
+    # so it is owner-only like its POSIX counterpart. Windows resolves access
+    # by ACL rather than by these bits, but the mode still matters when the
+    # profile directory is read from WSL, a backup, or a synced home.
+    _write_private_text(
+        ps1_path,
+        f"$ErrorActionPreference = 'Stop'\n{env_lines}& {escaped}\nexit $LASTEXITCODE\n",
+        OWNER_ONLY_FILE_MODE,
     )
+    # The .cmd shim holds no secrets — it only invokes the .ps1 — so it keeps a
+    # conventional mode.
     cmd_path.write_text(
         '@echo off\r\npowershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0'
         + ps1_path.name
@@ -136,6 +179,19 @@ def _render_windows_runner(
         ArtifactRecord(kind="script", path=str(ps1_path)),
         ArtifactRecord(kind="script", path=str(cmd_path)),
     ]
+
+
+def _render_windows_vbs_launcher(vbs_path: Path, ps1_path: Path) -> ArtifactRecord:
+    """Render a non-interactive VBS launcher that runs powershell with SW_HIDE (no console window)."""
+    vbs_path.parent.mkdir(parents=True, exist_ok=True)
+    vbs_content = (
+        'Set WshShell = CreateObject("WScript.Shell")\r\n'
+        'Set fso = CreateObject("Scripting.FileSystemObject")\r\n'
+        "scriptDir = fso.GetParentFolderName(WScript.ScriptFullName)\r\n"
+        f'WshShell.Run "powershell.exe -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File """ & scriptDir & "\\{ps1_path.name}""", 0, True\r\n'
+    )
+    _write_private_text(vbs_path, vbs_content, OWNER_ONLY_FILE_MODE)
+    return ArtifactRecord(kind="script", path=str(vbs_path))
 
 
 def render_runner_scripts(manifest: DeploymentManifest) -> list[ArtifactRecord]:
@@ -313,8 +369,15 @@ def _windows_task_xml(
         "    <StartWhenAvailable>true</StartWhenAvailable>\n"
         "  </Settings>\n"
         '  <Actions Context="Author">\n'
-        f"    <Exec>\n      <Command>{_xml_escape(command)}</Command>\n    </Exec>\n"
-        "  </Actions>\n"
+        + (
+            "    <Exec>\n"
+            "      <Command>wscript.exe</Command>\n"
+            f'      <Arguments>//B //Nologo "{_xml_escape(command)}"</Arguments>\n'
+            "    </Exec>\n"
+            if command.lower().endswith(".vbs")
+            else f"    <Exec>\n      <Command>{_xml_escape(command)}</Command>\n    </Exec>\n"
+        )
+        + "  </Actions>\n"
         "</Task>\n"
     )
 
@@ -342,12 +405,39 @@ def _parse_windows_task_xml(raw: bytes | str) -> ElementTree.Element:
     if isinstance(raw, bytes):
         try:
             return ElementTree.fromstring(raw)
-        except ElementTree.ParseError:
-            raw = raw.decode(errors="replace")
+        except (ElementTree.ParseError, ValueError, LookupError):
+            pass
+
+        raw_bytes = raw
+        raw_str = None
+        if b"\x00" in raw_bytes:
+            try:
+                raw_str = raw_bytes.decode("utf-16")
+            except UnicodeDecodeError:
+                raw_str = raw_bytes.decode(errors="replace")
+        else:
+            declared_enc = None
+            match = re.search(rb'<\?xml\s+[^>]*encoding=["\']([^"\']+)["\']', raw_bytes)
+            if match:
+                enc_name = match.group(1).decode("ascii", errors="ignore").lower()
+                if "utf-16" not in enc_name and "utf-32" not in enc_name:
+                    declared_enc = enc_name
+            if declared_enc:
+                try:
+                    raw_str = raw_bytes.decode(declared_enc)
+                except (LookupError, UnicodeDecodeError):
+                    pass
+            if raw_str is None:
+                try:
+                    raw_str = raw_bytes.decode("utf-8-sig")
+                except UnicodeDecodeError:
+                    raw_str = raw_bytes.decode(errors="replace")
+    else:
+        raw_str = raw
     normalized = re.sub(
-        r'<\?xml\s+version="1\.0"\s+encoding="[^"]+"\?>',
-        '<?xml version="1.0"?>',
-        raw,
+        r'<\?xml\s+version="1\.0"\s+encoding="[^"]+"\?>\s*',
+        "",
+        raw_str,
         count=1,
     )
     return ElementTree.fromstring(normalized)
@@ -381,7 +471,7 @@ def _register_windows_task(name: str, xml: str, *, expected_logon_type: str) -> 
 
         try:
             task = _parse_windows_task_xml(query.stdout or b"")
-        except ElementTree.ParseError as exc:
+        except (ElementTree.ParseError, ValueError, LookupError) as exc:
             raise _WindowsTaskRegistrationError(
                 f"Could not parse registered Windows task {name!r}", task_created=True
             ) from exc
@@ -572,10 +662,15 @@ def install_supervisor(manifest: DeploymentManifest, *, start: bool = True) -> l
                 [name for name, _task_cmd, _trigger_xml in preferred_tasks],
                 must_delete=must_delete,
             )
+            vbs_record = _render_windows_vbs_launcher(
+                Path(health_cmd).with_suffix(".vbs"),
+                Path(health_cmd).with_suffix(".ps1"),
+            )
+            records.append(vbs_record)
             _register_windows_task(
                 health_name,
                 _windows_task_xml(
-                    health_cmd,
+                    vbs_record.path,
                     trigger_xml=_windows_health_trigger(),
                     scope=manifest.scope,
                     logon_type="InteractiveToken",
@@ -601,6 +696,11 @@ def install_supervisor(manifest: DeploymentManifest, *, start: bool = True) -> l
     raise click.ClickException(
         f"Persistent {manifest.supervisor_kind} mode is not supported on this platform."
     )
+
+
+# `/End` and `/Delete` report a missing task as "cannot find the file specified";
+# `/Change` reports it as "does not exist in the system".
+_SCHTASKS_ABSENT_TEXT = ("cannot find the file specified", "does not exist in the system")
 
 
 def start_supervisor(manifest: DeploymentManifest) -> None:
@@ -644,11 +744,32 @@ def start_supervisor(manifest: DeploymentManifest) -> None:
         _bootstrap_with_retry(domain, plist_path, action="start")
         return
     if _is_windows():
-        subprocess.run(
-            ["schtasks", "/Change", "/TN", f"{manifest.service_name}-health", "/ENABLE"],
-            check=True,
+        health = f"{manifest.service_name}-health"
+        result = run(
+            ["schtasks", "/Change", "/TN", health, "/ENABLE"],
+            capture_output=True,
+            text=True,
         )
-        subprocess.run(["schtasks", "/Run", "/TN", f"{manifest.service_name}-startup"], check=True)
+        _require_removal_success(
+            result,
+            "schtasks health enable",
+            absent_text=_SCHTASKS_ABSENT_TEXT,
+        )
+        result = run(
+            ["schtasks", "/Run", "/TN", f"{manifest.service_name}-startup"],
+            capture_output=True,
+            text=True,
+        )
+        detail = _result_text(result)
+        if result.returncode != 0:
+            if any(text in detail.lower() for text in _SCHTASKS_ABSENT_TEXT):
+                from .runtime import runtime_ready, start_detached_agent
+
+                if not runtime_ready(manifest):
+                    start_detached_agent(manifest.profile)
+                return
+            raise click.ClickException(f"schtasks startup run failed: {detail}")
+        return
 
 
 def stop_supervisor(manifest: DeploymentManifest) -> None:
@@ -687,10 +808,32 @@ def stop_supervisor(manifest: DeploymentManifest) -> None:
             )
         return
     if _is_windows():
+        # Session-scoped fallback installs never create the `-startup` task,
+        # and the health task may already be absent, so tolerate missing
+        # tasks (schtasks reports "cannot find the file specified") while
+        # still surfacing real failures such as access denied.
         health = f"{manifest.service_name}-health"
-        subprocess.run(["schtasks", "/Change", "/TN", health, "/DISABLE"], check=True)
+        result = run(
+            ["schtasks", "/Change", "/TN", health, "/DISABLE"],
+            capture_output=True,
+            text=True,
+        )
+        _require_removal_success(
+            result,
+            "schtasks health disable",
+            absent_text=_SCHTASKS_ABSENT_TEXT,
+        )
         subprocess.run(["schtasks", "/End", "/TN", health], check=False)
-        subprocess.run(["schtasks", "/End", "/TN", f"{manifest.service_name}-startup"], check=True)
+        result = run(
+            ["schtasks", "/End", "/TN", f"{manifest.service_name}-startup"],
+            capture_output=True,
+            text=True,
+        )
+        _require_removal_success(
+            result,
+            "schtasks startup end",
+            absent_text=_SCHTASKS_ABSENT_TEXT,
+        )
 
 
 def remove_supervisor(manifest: DeploymentManifest) -> None:
@@ -785,7 +928,7 @@ def remove_supervisor(manifest: DeploymentManifest) -> None:
             _require_removal_success(
                 result,
                 f"schtasks {suffix} delete",
-                absent_text="cannot find the file specified",
+                absent_text=_SCHTASKS_ABSENT_TEXT,
             )
 
 
@@ -800,7 +943,7 @@ def _require_removal_success(
     operation: str,
     *,
     absent_codes: set[int] | None = None,
-    absent_text: str | None = None,
+    absent_text: str | tuple[str, ...] | None = None,
 ) -> None:
     returncode = int(getattr(result, "returncode", 0))
     detail = _result_text(result)
@@ -808,6 +951,7 @@ def _require_removal_success(
         return
     if absent_codes and returncode in absent_codes:
         return
-    if absent_text and absent_text in detail.lower():
+    texts = (absent_text,) if isinstance(absent_text, str) else absent_text or ()
+    if any(text in detail.lower() for text in texts):
         return
     raise click.ClickException(f"{operation} failed: {detail}")

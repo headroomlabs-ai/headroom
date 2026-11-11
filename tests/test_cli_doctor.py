@@ -167,6 +167,28 @@ class TestClaudeRouting:
         )
         assert check_claude_routing(path, 8787).status == PASS
 
+    @pytest.mark.parametrize(
+        "base_url",
+        [
+            "http://localhost:8787",
+            "http://[::1]:8787",  # IPv6 loopback literal
+            "http://[::1]:8787/v1",
+            "HTTP://Localhost:8787",  # scheme/host are case-insensitive
+            "http://LOCALHOST:8787",
+        ],
+    )
+    def test_loopback_url_variants_pass(self, tmp_path, base_url):
+        """A correctly-routed loopback URL must not read as 'not routed'.
+
+        The routing regex only matched lowercase ``127.0.0.1``/``localhost`` with
+        an explicit port, so an IPv6 (``[::1]``) or upper-cased loopback URL — a
+        valid route — produced a misleading WARN (the false-negative class of
+        #3205 / #3213).
+        """
+        path = tmp_path / "settings.json"
+        path.write_text(json.dumps({"env": {"ANTHROPIC_BASE_URL": base_url}}), encoding="utf-8")
+        assert check_claude_routing(path, 8787).status == PASS
+
     def test_port_mismatch_warns(self, tmp_path):
         path = tmp_path / "settings.json"
         path.write_text(
@@ -186,6 +208,28 @@ class TestClaudeRouting:
         result = check_claude_routing(path, 8787)
         assert result.status == WARN
         assert "gateway.corp.example" in result.summary
+
+    @pytest.mark.parametrize(
+        "base_url",
+        [
+            # Userinfo lookalike: a prefix match sees "localhost:8787" but the
+            # URL's real host is evil.example (the loopback text is credentials).
+            "http://localhost:8787@evil.example/v1",
+            "http://127.0.0.1:8787@evil.example/v1",
+            # Userinfo present at all — a real Headroom route never carries it.
+            "http://evil.example@127.0.0.1:8787",
+            # Hostname-suffix lookalikes: not an exact loopback host.
+            "http://localhost.evil.example:8787",
+            "http://127.0.0.1.evil.example:8787",
+        ],
+    )
+    def test_loopback_lookalikes_warn(self, tmp_path, base_url):
+        """URL classification (not prefix matching) must reject userinfo and
+        hostname-suffix lookalikes that resolve to a non-loopback host, so
+        ``doctor`` never reports an attacker-controlled destination as routed."""
+        path = tmp_path / "settings.json"
+        path.write_text(json.dumps({"env": {"ANTHROPIC_BASE_URL": base_url}}), encoding="utf-8")
+        assert check_claude_routing(path, 8787).status == WARN
 
     def test_foundry_url_passes(self, tmp_path):
         # In Foundry mode ANTHROPIC_BASE_URL is absent by design; routing lives
@@ -587,10 +631,111 @@ class TestCodexRouting:
         assert result.status == WARN
         assert "9999" in result.summary
 
+    def test_root_openai_base_url_on_builtin_provider_passes(self, tmp_path):
+        """Headroom Desktop's layout: built-in `openai` provider, root base URL."""
+        path = tmp_path / "config.toml"
+        path.write_text(
+            'model_provider = "openai"\n'
+            'openai_base_url = "http://127.0.0.1:6767/v1"\n'
+            '[projects."/work/app"]\n'
+            'trust_level = "trusted"\n',
+            encoding="utf-8",
+        )
+        result = check_codex_routing(path, 6767)
+        assert result.status == PASS, result.summary
+        assert check_codex_routing(path, 8787).status == WARN
+
+    def test_root_openai_base_url_without_model_provider_passes(self, tmp_path):
+        path = tmp_path / "config.toml"
+        path.write_text('openai_base_url = "http://127.0.0.1:8787/v1"\n', encoding="utf-8")
+        assert check_codex_routing(path, 8787).status == PASS
+
+    def test_openai_base_url_inside_a_table_is_not_root(self, tmp_path):
+        path = tmp_path / "config.toml"
+        path.write_text(
+            'model_provider = "openai"\n'
+            "[profiles.fast]\n"
+            'openai_base_url = "http://127.0.0.1:8787/v1"\n',
+            encoding="utf-8",
+        )
+        assert check_codex_routing(path, 8787).status == WARN
+
+    def test_root_openai_base_url_beats_an_inactive_headroom_table(self, tmp_path):
+        """No root `model_provider`: Codex uses its built-in `openai`, not the table."""
+        path = tmp_path / "config.toml"
+        path.write_text(
+            'openai_base_url = "http://127.0.0.1:6767/v1"\n'
+            "[model_providers.headroom]\n"
+            'base_url = "http://127.0.0.1:8787/v1"\n',
+            encoding="utf-8",
+        )
+        assert check_codex_routing(path, 6767).status == PASS
+        assert check_codex_routing(path, 8787).status == WARN
+
+    def test_profile_model_provider_does_not_hide_the_default_route(self, tmp_path):
+        path = tmp_path / "config.toml"
+        path.write_text(
+            'openai_base_url = "http://127.0.0.1:6767/v1"\n'
+            "[profiles.work]\n"
+            'model_provider = "azure"\n',
+            encoding="utf-8",
+        )
+        assert check_codex_routing(path, 6767).status == PASS
+
     def test_no_marker_warns(self, tmp_path):
         path = tmp_path / "config.toml"
         path.write_text('model = "gpt-5"\n', encoding="utf-8")
         assert check_codex_routing(path, 8787).status == WARN
+
+    @pytest.mark.parametrize(
+        "base_url",
+        [
+            "http://localhost:8787@evil.example/v1",  # userinfo lookalike
+            "http://localhost.evil.example:8787/v1",  # hostname suffix lookalike
+            "https://gateway.corp.example/v1",  # plainly remote
+        ],
+    )
+    def test_non_loopback_base_url_warns(self, tmp_path, base_url):
+        """The Headroom block's base_url is classified through the same URL
+        parser, so a non-loopback (or lookalike) base_url reads as not routed
+        rather than passing on a prefix match."""
+        path = tmp_path / "config.toml"
+        path.write_text(
+            f'[model_providers.headroom]\nbase_url = "{base_url}"\n',
+            encoding="utf-8",
+        )
+        result = check_codex_routing(path, 8787)
+        assert result.status == WARN
+
+    def test_base_url_read_from_headroom_block_not_earlier_provider(self, tmp_path):
+        """A base_url in an earlier provider block must not be mistaken for the
+        Headroom route; only the Headroom block's own base_url counts."""
+        path = tmp_path / "config.toml"
+        path.write_text(
+            "[model_providers.openai]\n"
+            'base_url = "https://api.openai.com/v1"\n'
+            "\n"
+            "[model_providers.headroom]\n"
+            'base_url = "http://127.0.0.1:8787/v1"\n',
+            encoding="utf-8",
+        )
+        assert check_codex_routing(path, 8787).status == PASS
+
+    def test_marker_block_without_base_url_warns(self, tmp_path):
+        """A provider block that exists but has no base_url must not read as
+        routed: with no base_url there is nothing pointing Codex at the proxy,
+        so it WARNs rather than falling through to PASS."""
+        path = tmp_path / "config.toml"
+        path.write_text(
+            'model_provider = "headroom"\n'
+            "[model_providers.headroom]\n"
+            "requires_openai_auth = true\n",
+            encoding="utf-8",
+        )
+        result = check_codex_routing(path, 8787)
+        assert result.status == WARN
+        assert "base_url" in result.summary
+        assert "wrap" in (result.hint or "")
 
     def test_garbage_bytes_warn_not_crash(self, tmp_path):
         path = tmp_path / "config.toml"
@@ -940,7 +1085,7 @@ class TestDoctorCommand:
 
     def test_json_output_parses(self, runner, isolated, monkeypatch):
         monkeypatch.setattr(doctor_mod, "probe_json", self._probe(LIVEZ_OK, STATS_OK))
-        result = runner.invoke(main, ["doctor", "--json"])
+        result = runner.invoke(main, ["doctor", "--json", "--port", "8787"])
         payload = json.loads(result.output)
         assert payload["port"] == 8787
         assert {c["name"] for c in payload["checks"]} >= {"proxy", "version", "budget"}
@@ -985,6 +1130,49 @@ class TestDoctorCommand:
         runner.invoke(main, ["doctor"])
         assert "http://127.0.0.1:8789/livez" in seen
         assert not any("127.0.0.1:8787" in url for url in seen)
+
+    def test_names_the_live_port_the_agents_are_configured_for(self, runner, isolated, monkeypatch):
+        """Headroom Desktop runs on 6767 and records no deployment manifest."""
+        monkeypatch.setenv("HEADROOM_PORT_DISCOVERY", "1")
+        (isolated / "settings.json").write_text(
+            json.dumps({"env": {"ANTHROPIC_BASE_URL": "http://127.0.0.1:6767"}}),
+            encoding="utf-8",
+        )
+
+        def desktop_probe(url, timeout=2.0):
+            return LIVEZ_OK if url == "http://127.0.0.1:6767/livez" else None
+
+        monkeypatch.setattr(doctor_mod, "probe_json", desktop_probe)
+        result = runner.invoke(main, ["doctor", "--json"])
+        proxy = next(c for c in json.loads(result.output)["checks"] if c["name"] == "proxy")
+        assert "a Headroom proxy IS running on port 6767" in proxy["summary"]
+
+    @pytest.mark.parametrize(
+        ("relative", "content"),
+        [
+            ("project-codex.toml", 'openai_base_url = "http://127.0.0.1:6767/v1"\n'),
+            (
+                ".claude/settings.local.json",
+                json.dumps({"env": {"ANTHROPIC_BASE_URL": "http://127.0.0.1:6767"}}),
+            ),
+        ],
+    )
+    def test_names_the_live_port_only_a_project_config_routes_to(
+        self, runner, isolated, monkeypatch, relative, content
+    ):
+        monkeypatch.setenv("HEADROOM_PORT_DISCOVERY", "1")
+        monkeypatch.chdir(isolated)
+        path = isolated / relative
+        path.parent.mkdir(exist_ok=True)
+        path.write_text(content, encoding="utf-8")
+
+        def desktop_probe(url, timeout=2.0):
+            return LIVEZ_OK if url == "http://127.0.0.1:6767/livez" else None
+
+        monkeypatch.setattr(doctor_mod, "probe_json", desktop_probe)
+        result = runner.invoke(main, ["doctor", "--json"])
+        proxy = next(c for c in json.loads(result.output)["checks"] if c["name"] == "proxy")
+        assert "a Headroom proxy IS running on port 6767" in proxy["summary"]
 
 
 class TestCostTrackerBudgetKeys:

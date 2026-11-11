@@ -124,7 +124,7 @@ class RequestOutcome:
 
     # ── Output composition ────────────────────────────────────────────
     # ``output_tokens`` pools two quantities that different levers move in
-    # opposite directions: reasoning-effort routing cuts thinking, verbosity
+    # opposite directions: thinking-budget levers cut thinking, verbosity
     # steering cuts visible text. Summed, neither can be attributed — a turn
     # whose thinking dropped 4,000 tokens while its prose grew 200 is
     # indistinguishable from one where nothing happened.
@@ -250,7 +250,7 @@ class RequestOutcome:
         The quantity verbosity steering actually targets. Callers must handle
         ``None`` rather than defaulting it to ``output_tokens``: on a provider
         that reports no thinking count, treating the whole output as visible
-        would credit steering with reductions that reasoning-effort routing
+        would credit steering with reductions that a lower thinking budget
         produced.
 
         Clamped at zero because an inferred count comes from Headroom's
@@ -665,6 +665,14 @@ async def emit_request_outcome(handler: Any, outcome: RequestOutcome) -> None:
                     transforms_applied=tuple(str(t) for t in (outcome.transforms_applied or ())),
                     tokens_saved=outcome.tokens_saved,
                     novel_tokens_saved=novel_tokens_saved,
+                    attribution={
+                        dimension: label
+                        for dimension, label in (("project", project), ("client", outcome.client))
+                        if label
+                    },
+                    conversation_key=outcome.conversation_key,
+                    original_tokens=outcome.original_tokens,
+                    output_tokens_saved=output_tokens_saved_est,
                 ),
             )
         except Exception:  # noqa: BLE001 - telemetry must never break a response
@@ -791,6 +799,7 @@ async def emit_request_outcome(handler: Any, outcome: RequestOutcome) -> None:
                 cache_read_tokens=outcome.cache_read_tokens,
                 cache_write_tokens=outcome.cache_write_tokens,
                 uncached_input_tokens=outcome.uncached_input_tokens,
+                provider_input_tokens=outcome.provider_input_tokens,
                 transforms_applied=list(outcome.transforms_applied),
                 savings_breakdown=savings_breakdown,
                 waste_signals=outcome.waste_signals,

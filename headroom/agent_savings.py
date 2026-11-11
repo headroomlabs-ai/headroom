@@ -173,7 +173,7 @@ _PROFILES: dict[str, AgentSavingsProfile] = {
         # Coding posture: defer non-core tool schemas, dedupe re-reads, extend
         # lossy coverage when lossless found nothing, and NEVER lossy-compress a
         # file read (the agent patches exact bytes). CCR stays ON (unset) so any
-        # lossy loss is recoverable. Effort router off; low block floor so modest
+        # lossy loss is recoverable. Low block floor so modest
         # deltas are eligible.
         tool_search=True,
         cross_turn_dedup=True,

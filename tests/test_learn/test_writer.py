@@ -299,6 +299,129 @@ class TestClaudeCodeWriter:
         assert r"C:\Users\john.doe\repo" in full_content
         assert "stale" not in full_content
 
+    def test_merge_keeps_prose_that_quotes_the_start_marker_above_the_block(self, tmp_path):
+        """Prose quoting the start marker above the block must survive the rewrite."""
+        context_file = tmp_path / "CLAUDE.local.md"
+        prose = f"The block below starts with {_MARKER_START} and is managed."
+        context_file.write_text(
+            f"{prose}\n"
+            "- Hand-written rule: never force-push\n\n"
+            f"{_MARKER_START}\n"
+            "## Headroom Learned Patterns\n\n"
+            "### Environment\n"
+            "- old bullet\n\n"
+            f"{_MARKER_END}\n"
+        )
+        recommendation = _rec(RecommendationTarget.CONTEXT_FILE, "Tooling", "- Use uv")
+
+        final = _merge_into_file(context_file, [recommendation])
+
+        assert "- Hand-written rule: never force-push" in final
+        assert prose in final
+        assert "- Use uv" in final
+        assert final.count(_MARKER_START) == 2
+        assert final.count(_MARKER_END) == 1
+
+    def test_merge_appends_a_block_when_the_end_marker_is_missing(self, tmp_path):
+        """A start marker with no end marker is not a block: the recommendations must land."""
+        context_file = tmp_path / "CLAUDE.local.md"
+        original = f"{_MARKER_START}\n- Hand-written rule: never force-push\n"
+        context_file.write_text(original)
+        recommendation = _rec(RecommendationTarget.CONTEXT_FILE, "Tooling", "- Use uv")
+
+        final = _merge_into_file(context_file, [recommendation])
+
+        assert final != original
+        assert "- Use uv" in final
+        assert "- Hand-written rule: never force-push" in final
+
+    def test_merge_keeps_prose_quoting_both_markers_after_the_block(self, tmp_path):
+        """Marker quotes in prose below the block are hand-written text, not a second block."""
+        context_file = tmp_path / "CLAUDE.local.md"
+        context_file.write_text(
+            f"{_MARKER_START}\n"
+            "## Headroom Learned Patterns\n\n"
+            "### Environment\n"
+            "- old bullet\n\n"
+            f"{_MARKER_END}\n\n"
+            f"Example: {_MARKER_START}\n"
+            "- Hand-written rule: never force-push\n"
+            f"{_MARKER_END}\n"
+        )
+        recommendation = _rec(RecommendationTarget.CONTEXT_FILE, "Tooling", "- Use uv")
+
+        final = _merge_into_file(context_file, [recommendation])
+
+        assert "- Hand-written rule: never force-push" in final
+        assert final.startswith(f"{_MARKER_START}\n## Headroom Learned Patterns")
+        block = final[: final.index(_MARKER_END)]
+        assert "- Use uv" in block
+        assert "- old bullet" in block
+        assert final.count(f"Example: {_MARKER_START}") == 1
+
+    def test_prior_sections_come_from_the_block_not_from_quoting_prose(self, tmp_path):
+        """Headings in prose that quotes the start marker must not become generated sections."""
+        context_file = tmp_path / "CLAUDE.local.md"
+        context_file.write_text(
+            f"Example: {_MARKER_START}\n"
+            "### Manual policy\n"
+            "- Hand-written rule: never force-push\n\n"
+            f"{_MARKER_START}\n"
+            "## Headroom Learned Patterns\n\n"
+            "### Environment\n"
+            "- old bullet\n\n"
+            f"{_MARKER_END}\n"
+        )
+        recommendation = _rec(RecommendationTarget.CONTEXT_FILE, "Tooling", "- Use uv")
+
+        final = _merge_into_file(context_file, [recommendation])
+
+        assert final.count("### Manual policy") == 1
+        block = final[final.index(f"\n{_MARKER_START}\n") :]
+        assert "### Manual policy" not in block
+        assert "### Environment" in block
+        assert "- Use uv" in block
+
+    def test_merge_leaves_a_fenced_example_of_the_block_untouched(self, tmp_path):
+        """Markers inside a fenced Markdown example are not the managed block."""
+        context_file = tmp_path / "CLAUDE.local.md"
+        example = f"```markdown\n{_MARKER_START}\nEXAMPLE_SENTINEL\n{_MARKER_END}\n```\n"
+        context_file.write_text(
+            "How the managed block looks:\n\n" + example + "\n"
+            f"{_MARKER_START}\n"
+            "## Headroom Learned Patterns\n\n"
+            "### Environment\n"
+            "- old bullet\n\n"
+            f"{_MARKER_END}\n"
+        )
+        recommendation = _rec(RecommendationTarget.CONTEXT_FILE, "Tooling", "- Use uv")
+
+        final = _merge_into_file(context_file, [recommendation])
+
+        assert example in final
+        real_block = final[final.index(example) + len(example) :]
+        assert "- Use uv" in real_block
+        assert "- old bullet" in real_block
+        assert "- Use uv" not in final[: final.index(example) + len(example)]
+
+    def test_fenced_code_inside_the_block_does_not_hide_its_end_marker(self, tmp_path):
+        """A closed code fence in a recommendation body keeps the block recognisable."""
+        context_file = tmp_path / "CLAUDE.local.md"
+        context_file.write_text(
+            f"{_MARKER_START}\n"
+            "## Headroom Learned Patterns\n\n"
+            "### Build\n"
+            "```bash\nmake test\n```\n\n"
+            f"{_MARKER_END}\n"
+        )
+        recommendation = _rec(RecommendationTarget.CONTEXT_FILE, "Tooling", "- Use uv")
+
+        final = _merge_into_file(context_file, [recommendation])
+
+        assert final.count(_MARKER_START) == 1
+        assert final.count(_MARKER_END) == 1
+        assert "- Use uv" in final
+
     def test_memory_md_carry_forward(self, tmp_path):
         """Carry-forward also works for MEMORY.md."""
         proj = _project(tmp_path)

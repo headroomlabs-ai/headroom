@@ -259,7 +259,8 @@ def compact_tools(
         if after >= before:
             return payload, False, before, after
         updated = copy.deepcopy(payload)
-        updated["tools"] = compacted_tools
+        # deepcopy: the cached list is shared across requests; callers mutate tools in place
+        updated["tools"] = copy.deepcopy(compacted_tools)
         return updated, True, before, after
 
     compacted_tools = compact_tool_schema_value(tools)
@@ -271,7 +272,8 @@ def compact_tools(
         return payload, False, before, after
 
     updated = copy.deepcopy(payload)
-    updated["tools"] = compacted_tools
+    # deepcopy: the cached list is shared across requests; callers mutate tools in place
+    updated["tools"] = copy.deepcopy(compacted_tools)
     return updated, True, before, after
 
 
@@ -420,7 +422,8 @@ def compact_tool_descriptions(
         if after >= before:
             return payload, False, before, after
         updated = copy.deepcopy(payload)
-        updated["tools"] = compacted_tools
+        # deepcopy: the cached list is shared across requests; callers mutate tools in place
+        updated["tools"] = copy.deepcopy(compacted_tools)
         return updated, True, before, after
 
     compacted_tools = _truncate_descriptions_in_schema(tools, max_chars, strip_sem)
@@ -432,5 +435,6 @@ def compact_tool_descriptions(
         return payload, False, before, after
 
     updated = copy.deepcopy(payload)
-    updated["tools"] = compacted_tools
+    # deepcopy: the cached list is shared across requests; callers mutate tools in place
+    updated["tools"] = copy.deepcopy(compacted_tools)
     return updated, True, before, after

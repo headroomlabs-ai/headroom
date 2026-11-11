@@ -27,7 +27,10 @@ from __future__ import annotations
 import logging
 from typing import Any
 
+from headroom.offline import pin_crewai_telemetry_off
+
 try:
+    pin_crewai_telemetry_off()
     from crewai.tools.base_tool import BaseTool
 
     CREWAI_AVAILABLE = True

@@ -26,7 +26,7 @@ from packaging.requirements import Requirement
 from packaging.version import Version
 
 PYPROJECT = Path(__file__).resolve().parents[1] / "pyproject.toml"
-SUPPORTED_PYTHONS = ("3.10", "3.11", "3.12", "3.13", "3.14")
+SUPPORTED_PYTHONS = ("3.11", "3.12", "3.13", "3.14")
 PLATFORMS = ("linux", "darwin", "win32")
 LITELLM_FLOOR = Version("1.96.2")
 

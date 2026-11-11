@@ -44,6 +44,26 @@ The `with_memory()` wrapper intercepts every chat completion call:
 
 Memory extraction happens **inline** as part of the LLM response. No extra API calls, no extra latency.
 
+## Proxy Project Scope
+
+With proxy memory enabled, local `project` mode gives each resolved workspace
+its own SQLite database at
+`<memory-db-parent>/memories/projects/<project-key>/memory.db`.
+Use `--memory-db-path` to choose the base database path.
+
+Resolution checks `x-headroom-project-id`, then `x-headroom-cwd`, then
+`--memory-project-root`, then the client's system-prompt working directory.
+Claude Code / Codex cwd lines and pi's `<cwd>...</cwd>` block are supported.
+The same directory produces the same project key across these formats;
+explicit request headers still win. A pi cwd block in ordinary user content
+does not select a project.
+
+With the default `empty` fallback, Anthropic requests with an unresolved project
+receive neither memory context nor Headroom memory tools, even when the session
+previously injected those tools. Client-owned tools are left alone. Once scope
+is restored, the session can replay its memory definitions. Explicit `user` /
+`global` storage and configured global fallback keep their existing behavior.
+
 ## Hierarchical Scoping
 
 Memories exist at four scope levels, from broadest to narrowest:
@@ -247,6 +267,45 @@ config = MemoryConfig(
     cache_max_size=1000,
 )
 ```
+
+### Direct Mem0 / Qdrant payload (mem0 2.x)
+
+The `qdrant-neo4j` backend (`DirectMem0Adapter`) writes facts straight into Qdrant so Mem0 can skip its extra LLM extraction. mem0ai 2.x search (`Memory.search` → `_search_vector_store`) **skips any point whose payload has no `data` field**. New writes store the fact under both:
+
+- `data` — required for mem0 2.x search
+- `memory` — legacy alias for older payload readers
+
+Existing collections written before this contract only have `memory`. Those points still sit in Qdrant, but `search_memories` returns nothing for them until you copy `memory` onto `data`:
+
+```python
+from qdrant_client import QdrantClient
+
+client = QdrantClient(...)  # same URL/host as Headroom
+collection = "headroom_memories"  # Mem0Config.collection_name
+offset = None
+while True:
+    points, offset = client.scroll(
+        collection_name=collection,
+        with_payload=True,
+        limit=100,
+        offset=offset,
+    )
+    updates = []
+    for point in points:
+        payload = point.payload or {}
+        if payload.get("data") or not payload.get("memory"):
+            continue
+        updates.append(point.id)
+        client.set_payload(
+            collection_name=collection,
+            payload={"data": payload["memory"]},
+            points=[point.id],
+        )
+    if offset is None:
+        break
+```
+
+Run this once per collection after upgrading. New saves already write `data` and do not need a second pass.
 
 ## Provider Compatibility
 

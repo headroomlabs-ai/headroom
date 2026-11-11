@@ -16,7 +16,7 @@ from pathlib import Path
 
 from headroom._subprocess import run
 
-from ..managed_block import block_pattern, sanitize_block_text
+from ..managed_block import sanitize_block_text
 from ._shared import claude_config_dir
 from .models import (
     ProjectInfo,
@@ -29,7 +29,40 @@ from .models import (
 # cannot close the block early (see headroom.managed_block).
 _MARKER_START = "<!-- headroom:learn:start -->"
 _MARKER_END = "<!-- headroom:learn:end -->"
-_MARKER_PATTERN = block_pattern(_MARKER_START, _MARKER_END)
+
+
+def _find_managed_block(text: str) -> tuple[int, int] | None:
+    """Return the ``(start, end)`` offsets of the managed block, or None.
+
+    The block is a line that is exactly the start marker through the next line
+    that is exactly the end marker -- the shape ``_build_section`` writes. A
+    marker quoted inside prose (sharing its line with other text, or indented)
+    or inside a fenced code block (a Markdown example) is not a block
+    boundary, and a start marker with no end marker before the next start
+    marker is not a block. Every reader and writer of the block in
+    this module uses this one span, so the block that is parsed is the block
+    that is replaced (#4339). ``end`` stops after the end marker, before its
+    line break.
+    """
+    offset = 0
+    start: int | None = None
+    fence: str | None = None  # the open fence's run, e.g. "```" or "~~~~"
+    for line in text.splitlines(keepends=True):
+        bare = line.rstrip()
+        stripped = bare.lstrip(" ")
+        if len(bare) - len(stripped) <= 3 and stripped[:3] in ("```", "~~~"):
+            run = len(stripped) - len(stripped.lstrip(stripped[0]))
+            if fence is None:
+                fence = stripped[0] * run
+            elif stripped[0] == fence[0] and run >= len(fence) and not stripped[run:]:
+                fence = None
+        elif fence is None:
+            if bare == _MARKER_START:
+                start = offset
+            elif bare == _MARKER_END and start is not None:
+                return start, offset + len(bare)
+        offset += len(line)
+    return None
 
 
 def _read_text_tolerant(file_path: Path) -> str:
@@ -258,8 +291,8 @@ def extract_marker_block(file_content: str) -> str | None:
     (including the start/end markers) so it can be fed back to an LLM as
     context without losing formatting. Returns None if no block is present.
     """
-    match = _MARKER_PATTERN.search(file_content)
-    return match.group(0) if match else None
+    span = _find_managed_block(file_content)
+    return file_content[span[0] : span[1]] if span else None
 
 
 def _parse_prior_recommendations(existing: str) -> list[Recommendation]:
@@ -270,10 +303,10 @@ def _parse_prior_recommendations(existing: str) -> list[Recommendation]:
     _build_section — target is set to a placeholder since the marker block
     itself doesn't record it (blocks are always per-file and per-target).
     """
-    match = _MARKER_PATTERN.search(existing)
-    if not match:
+    span = _find_managed_block(existing)
+    if not span:
         return []
-    inner = match.group(0)[len(_MARKER_START) : -len(_MARKER_END)]
+    inner = existing[span[0] + len(_MARKER_START) : span[1] - len(_MARKER_END)]
 
     recs: list[Recommendation] = []
     for part in re.split(r"\n### ", "\n" + inner)[1:]:
@@ -364,8 +397,12 @@ def _merge_into_file(file_path: Path, new_recommendations: list[Recommendation])
     section = _build_section(merged)
     if file_path.exists():
         existing = _read_text_tolerant(file_path)
-        if _MARKER_START in existing:
-            return _MARKER_PATTERN.sub(lambda _match: section, existing)
+        # Replace only the managed block itself; marker strings quoted in
+        # prose on either side are hand-written text. No block (including a
+        # start marker without its end marker) -> append a fresh one (#4339).
+        span = _find_managed_block(existing)
+        if span:
+            return existing[: span[0]] + section + existing[span[1] :]
         return existing.rstrip() + "\n\n" + section + "\n"
     return section + "\n"
 
@@ -376,7 +413,9 @@ def _strip_marker_block(content: str) -> str:
     Used when migrating a stale block out of the team-shared CLAUDE.md into the
     personal CLAUDE.local.md. Returns "" if nothing but the block remained.
     """
-    cleaned = _MARKER_PATTERN.sub("", content)
+    cleaned = content
+    while span := _find_managed_block(cleaned):
+        cleaned = cleaned[: span[0]] + cleaned[span[1] :]
     cleaned = re.sub(r"\n{3,}", "\n\n", cleaned).strip()
     return cleaned + "\n" if cleaned else ""
 
@@ -562,11 +601,11 @@ class ClaudeCodeWriter(ContextWriter):
         if target_path == legacy_path or not legacy_path.exists():
             return []
         legacy_text = _read_text_tolerant(legacy_path)
-        if _MARKER_START not in legacy_text:
+        if _find_managed_block(legacy_text) is None:
             return []
         # If the target already owns a block, it is the source of truth -- don't
         # double-migrate or clobber accumulated learnings.
-        if target_path.exists() and _MARKER_START in _read_text_tolerant(target_path):
+        if target_path.exists() and _find_managed_block(_read_text_tolerant(target_path)):
             return []
 
         migrated = _parse_prior_recommendations(legacy_text)

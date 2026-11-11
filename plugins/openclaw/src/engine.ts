@@ -17,17 +17,6 @@ import {
   type OpenClawCompactResult,
 } from "./openclaw-compaction.js";
 
-/** Race a promise against a timeout and always release the timer. */
-function withTimeout<T>(promise: Promise<T>, ms: number): Promise<T> {
-  let timerId: ReturnType<typeof setTimeout> | undefined;
-  const timer = new Promise<never>((_, reject) => {
-    timerId = setTimeout(() => reject(new Error(`headroom compress() timed out after ${ms}ms`)), ms);
-  });
-  return Promise.race([promise, timer]).finally(() => {
-    if (timerId !== undefined) clearTimeout(timerId);
-  });
-}
-
 // Must stay static — OpenClaw prepends it to the cached system prompt.
 const HEADROOM_COMPRESSION_NOTICE =
   "[Headroom is compressing tool outputs in this session. Use headroom_retrieve if you need the original, uncompressed content.]";
@@ -35,10 +24,13 @@ const HEADROOM_COMPRESSION_NOTICE =
 export interface HeadroomEngineConfig extends ProxyManagerConfig {
   enabled?: boolean;
   requestTimeoutMs?: number;
+  minContextChars?: number;
   circuitBreakerThreshold?: number;
   circuitBreakerCooldownMs?: number;
   /** Where to durably record committed turn-advancement keys (see
-   * `DurableAdvancementKeyStore`). Defaults to `defaultCommitLogPath()`. */
+   * `DurableAdvancementKeyStore`; the markers live beside it in
+   * `markerDirFor(commitLogPath)`). Must be on a writable filesystem.
+   * Defaults to `defaultCommitLogPath()`. */
   commitLogPath?: string;
   announceCompression?: boolean;
 }
@@ -160,17 +152,43 @@ export class HeadroomContextEngine {
     try {
       // Convert AgentMessage → OpenAI format
       const openaiMessages = agentToOpenAIIndexed(params.messages);
+      const minContextChars = this.config.minContextChars ?? 800;
+      if (minContextChars > 0 && countContextChars(openaiMessages) < minContextChars) {
+        this.logger.debug("[headroom] Context below compression threshold — using original messages");
+        return {
+          messages: normalizeAgentMessages(params.messages),
+          estimatedTokens: 0,
+          systemPromptAddition: this.sessionCompressionNotice(params.sessionId),
+        };
+      }
 
       // Compress via proxy — pass tokenBudget so RollingWindow enforces it
-      const result = await withTimeout(
-        compress(openaiMessages, {
-          model: params.model ?? "claude-sonnet-4-5",
-          baseUrl: this.proxyUrl,
-          fallback: true,
-          tokenBudget: params.tokenBudget,
-        } as any),
-        this.config.requestTimeoutMs ?? 30_000,
-      );
+      const result = await compress(openaiMessages, {
+        model: params.model ?? "claude-sonnet-4-5",
+        baseUrl: this.proxyUrl,
+        // Failures must throw so they reach the catch below and count towards the
+        // circuit. With the SDK's default `fallback: true`, a connection error,
+        // timeout or 5xx resolves to a zero-token stub, which this method would
+        // otherwise treat as a successful no-op and reset the breaker with.
+        fallback: false,
+        tokenBudget: params.tokenBudget,
+        // The SDK applies this to AbortSignal.timeout(), so a timed-out call is
+        // cancelled instead of continuing in the background after fail-open.
+        timeout: this.config.requestTimeoutMs ?? 2_000,
+      } as any);
+
+      // A zero token count on nonempty input means the proxy never answered — the
+      // SDK's fallback stub, or a response that was never tokenized. Count it as a
+      // failure so a resolved-but-empty result can't keep the breaker closed. Empty
+      // input is exempt: the proxy legitimately answers 0 tokens for it.
+      if (result.tokensBefore === 0 && openaiMessages.length > 0) {
+        this.tripCircuit(new Error("compress() returned no token count"));
+        return {
+          messages: normalizeAgentMessages(params.messages),
+          estimatedTokens: 0,
+          systemPromptAddition: this.sessionCompressionNotice(params.sessionId),
+        };
+      }
 
       const shouldAnnounceCompression =
         (this.hasAnnouncedCompression(params.sessionId) || result.tokensSaved > 100) &&
@@ -236,17 +254,18 @@ export class HeadroomContextEngine {
   /**
    * Durable turn-advancement commit — required by OpenClaw's transcriptSemantics
    * contract. Called only for the accepted, successful turn; failed or aborted
-   * turns never reach here. Must be an atomic, idempotent write of the
-   * accepted `messages` keyed by `advancementKey` so a host retry with the
-   * same key reports "duplicate" instead of re-applying the advancement —
-   * including a retry that arrives after this process restarted, which is
-   * why the record lives on disk (see `DurableAdvancementKeyStore`) rather
-   * than in memory, and includes the messages rather than just the key.
+   * turns never reach here. Must be one atomic, idempotent write keyed by
+   * `advancementKey`, so a host retry with the same key reports "duplicate"
+   * instead of re-applying the advancement — including a retry that arrives
+   * after this process restarted, which is why the record lives on disk (see
+   * `DurableAdvancementKeyStore`) rather than in memory. This engine keeps no
+   * turn state of its own (OpenClaw's transcript holds the accepted
+   * `messages`), so recording the key is the whole advancement.
    */
   async commitTurn(params: { advancementKey: string; messages: any[] }): Promise<{
     status: "committed" | "duplicate";
   }> {
-    const status = await this.advancementKeyStore.tryCommit(params.advancementKey, params.messages);
+    const status = await this.advancementKeyStore.tryCommit(params.advancementKey);
     return { status };
   }
 
@@ -399,4 +418,15 @@ export class HeadroomContextEngine {
       }
     }
   }
+}
+
+function countContextChars(messages: ReturnType<typeof agentToOpenAIIndexed>): number {
+  let total = 0;
+  for (const message of messages) {
+    total += message.content?.length ?? 0;
+    for (const toolCall of message.tool_calls ?? []) {
+      total += toolCall.function?.arguments?.length ?? 0;
+    }
+  }
+  return total;
 }
