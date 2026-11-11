@@ -87,6 +87,85 @@ def test_scrubber_flushes_truncated_tail_without_marker_leak():
     assert b"compressed content unavailable" in output
 
 
+def _sse(event_type: str, **fields: object) -> bytes:
+    data = json.dumps({"type": event_type, **fields})
+    return f"event: {event_type}\ndata: {data}\n\n".encode()
+
+
+def _data_events(output: list[bytes]) -> list[dict]:
+    return [
+        json.loads(line.removeprefix(b"data:").strip())
+        for chunk in output
+        for line in chunk.splitlines()
+        if line.startswith(b"data:")
+    ]
+
+
+def test_scrubber_resolves_marker_split_across_anthropic_argument_deltas():
+    hash_key = _store_entry("full source")
+    marker = f"<<ccr:{hash_key},code,11B>>"
+    cut = 9
+    delta = lambda text: {"type": "input_json_delta", "partial_json": text}  # noqa: E731
+    output = scrub_sse_chunks(
+        [
+            _sse("content_block_delta", index=1, delta=delta('{"body": "' + marker[:cut])),
+            _sse("content_block_delta", index=1, delta=delta(marker[cut:] + '"}')),
+            _sse("content_block_stop", index=1),
+        ]
+    )
+
+    assert b"<<ccr:" not in b"".join(output)
+    fragments = "".join(
+        event["delta"]["partial_json"]
+        for event in _data_events(output)
+        if event["type"] == "content_block_delta"
+    )
+    assert json.loads(fragments) == {"body": "full source"}
+
+
+def test_scrubber_resolves_marker_split_across_responses_argument_deltas():
+    hash_key = _store_entry("full source")
+    marker = f"<<ccr:{hash_key},code,11B>>"
+    output = scrub_sse_chunks(
+        [
+            _sse(
+                "response.function_call_arguments.delta",
+                item_id="fc_1",
+                delta='{"body": "<<c',
+            ),
+            _sse(
+                "response.function_call_arguments.delta",
+                item_id="fc_1",
+                delta=marker[3:] + '"}',
+            ),
+        ]
+    )
+
+    assert b"<<ccr:" not in b"".join(output)
+    assert json.loads("".join(e["delta"] for e in _data_events(output))) == {"body": "full source"}
+
+
+def test_scrubber_flushes_held_argument_tail_before_call_closes():
+    output = scrub_sse_chunks(
+        [
+            _sse(
+                "content_block_delta",
+                index=0,
+                delta={"type": "input_json_delta", "partial_json": '{"a": "<<c'},
+            ),
+            _sse("content_block_stop", index=0),
+        ]
+    )
+
+    events = _data_events(output)
+    assert [event["type"] for event in events] == [
+        "content_block_delta",
+        "content_block_delta",
+        "content_block_stop",
+    ]
+    assert "".join(e["delta"]["partial_json"] for e in events[:2]) == '{"a": "<<c'
+
+
 def test_scrubber_fails_closed_on_unbounded_unterminated_event():
     marker_filter = CCRMarkerEgressFilter()
 

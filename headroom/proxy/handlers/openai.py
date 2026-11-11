@@ -77,6 +77,7 @@ if TYPE_CHECKING:
 import httpx
 
 from headroom.agent_savings import proxy_pipeline_kwargs
+from headroom.ccr.egress import ToolArgumentMarkerAssembler
 from headroom.ccr.marker_resolution import (
     resolve_markers_in_response,
     scrub_client_payload,
@@ -9833,6 +9834,7 @@ class OpenAIHandlerMixin:
                         pending_fcs: list[dict[str, Any]] = []
                         response_output_items: list[dict[str, Any]] = []
                         private_ccr_item_ids: set[str] = set()
+                        ws_argument_assembler = ToolArgumentMarkerAssembler()
 
                         async def _send_client_event(raw_event: str) -> None:
                             """Enforce the CCR boundary on one complete WS event."""
@@ -9859,8 +9861,10 @@ class OpenAIHandlerMixin:
                                 client_event["response"] = strip_internal_retrieve_calls(
                                     response_payload, "openai_responses"
                                 )
-                            client_event = scrub_client_payload(client_event)
-                            await websocket.send_text(json.dumps(client_event))
+                            for outgoing in ws_argument_assembler.process(client_event):
+                                await websocket.send_text(
+                                    json.dumps(scrub_client_payload(outgoing))
+                                )
 
                         response_memory_generation = ws_memory_generation
                         response_memory_user_id = memory_user_id
