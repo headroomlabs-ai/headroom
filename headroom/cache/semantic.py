@@ -279,6 +279,7 @@ class SemanticCache:
             self._evict_oldest()
 
         self._cache[key] = entry
+        self._cache.move_to_end(key)
 
         # Index by hash for fast exact matching
         if messages_hash:

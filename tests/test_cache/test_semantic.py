@@ -172,6 +172,45 @@ class TestSemanticCache:
         # A lookup for a hash that isn't stored is a miss, not a wrong hit.
         assert cache.get("continue", messages_hash="hB") is None
 
+    @pytest.mark.parametrize("context", [False, True])
+    @pytest.mark.parametrize("namespace", ["", "provider/model"])
+    def test_successful_update_refreshes_lru(self, context, namespace):
+        cache = SemanticCache(SemanticCacheConfig(max_entries=2))
+        first_hash, second_hash = ("first-context", "second-context") if context else (None, None)
+        cache.put("first", "old", first_hash, namespace)
+        cache.put("second", "two", second_hash, namespace)
+        cache.put("first", "updated", first_hash, namespace)
+        assert cache.get_stats()["evictions"] == 0
+
+        # Looking up first before this insertion would refresh it and hide the bug.
+        cache.put("third", "three", "third-context" if context else None, namespace)
+
+        first = cache.get("first", first_hash, namespace)
+        assert first is not None and first.response == "updated"
+        assert cache.get("second", second_hash, namespace) is None
+        assert cache.get_stats()["entries"] == 2
+        assert cache.get_stats()["evictions"] == 1
+
+    def test_failed_update_does_not_refresh_lru(self):
+        def embed(query):
+            return [1.0, 0.0]
+
+        cache = SemanticCache(SemanticCacheConfig(max_entries=2), embedding_fn=embed)
+        cache.put("first", "one", "first")
+        cache.put("second", "two", "second")
+
+        def unavailable(query):
+            raise RuntimeError("embedding service offline")
+
+        cache._embedding_fn = unavailable
+        with pytest.raises(RuntimeError, match="embedding service offline"):
+            cache.put("first", "replacement", "first")
+        cache._embedding_fn = None
+        cache.put("third", "three", "third")
+
+        assert cache.get("first", "first") is None
+        assert cache.get("second", "second").response == "two"
+
     def test_lru_eviction(self):
         """Test LRU eviction when at capacity."""
         config = SemanticCacheConfig(max_entries=3)
