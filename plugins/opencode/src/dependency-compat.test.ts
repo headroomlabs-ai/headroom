@@ -13,7 +13,7 @@ function parseConfig(content: string): Promise<unknown> {
     Primitive.fileParse({ format: "toml" }).parse("/headroom/config.toml").pipe(
       Effect.provideService(FileSystem.FileSystem, fs),
       Effect.provide(Path.layer),
-    ),
+    ) as Effect.Effect<unknown, string>,
   );
 }
 

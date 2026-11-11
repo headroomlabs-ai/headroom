@@ -99,6 +99,69 @@ class TestOutcomeSnapshot:
         event = mgr.emit(PipelineStage.OUTCOME_OBSERVED, operation="proxy.outcome", outcome=snap)
         assert event.outcome is snap
 
+    def test_snapshot_carries_attribution_and_conversation(self):
+        snap = OutcomeSnapshot(
+            attribution={"project": "web", "client": "codex"},
+            conversation_key="conv-a",
+            original_tokens=1_000,
+            output_tokens_saved=40,
+        )
+        assert dict(snap.attribution) == {"project": "web", "client": "codex"}
+        assert (snap.conversation_key, snap.original_tokens, snap.output_tokens_saved) == (
+            "conv-a",
+            1_000,
+            40,
+        )
+
+    @pytest.mark.parametrize("labels", [{}, {"project": "web"}])
+    def test_snapshot_still_serializes_copies_and_hashes(self, labels):
+        """Carrying labels must not cost the snapshot what a frozen dataclass of
+        scalars always had: asdict, deepcopy, pickle, JSON and hashing."""
+        import copy
+        import dataclasses
+        import json
+        import pickle
+
+        snap = OutcomeSnapshot(request_id="r1", attribution=labels)
+        assert dataclasses.asdict(snap)["attribution"] == labels
+        assert json.loads(json.dumps(dataclasses.asdict(snap)))["attribution"] == labels
+        assert copy.deepcopy(snap) == snap
+        restored = pickle.loads(pickle.dumps(snap))
+        assert restored == snap and hash(restored) == hash(snap)
+        with pytest.raises(TypeError):
+            restored.attribution["project"] = "other"  # type: ignore[index]
+
+    def test_attribution_labels_are_read_only(self):
+        """Frozen fields can still hold a mutable dict; one extension must not
+        be able to rewrite the labels the next one reads."""
+        labels = {"project": "web"}
+        snap = OutcomeSnapshot(attribution=labels)
+        with pytest.raises(TypeError):
+            snap.attribution["project"] = "other"  # type: ignore[index]
+        labels["project"] = "changed-after"
+        assert snap.attribution["project"] == "web"
+
+
+class TestAdd:
+    def test_an_extension_added_later_receives_events(self):
+        mgr = PipelineExtensionManager(extensions=[], discover=False)
+        rec = _Recorder()
+        mgr.add(rec)
+        assert mgr.enabled
+        mgr.emit(
+            PipelineStage.OUTCOME_OBSERVED, operation="proxy.outcome", outcome=OutcomeSnapshot()
+        )
+        assert rec.stages() == [PipelineStage.OUTCOME_OBSERVED]
+
+    def test_adding_the_same_extension_twice_is_a_no_op(self):
+        rec = _Recorder()
+        mgr = PipelineExtensionManager(extensions=[rec], discover=False)
+        mgr.add(rec)
+        mgr.emit(
+            PipelineStage.OUTCOME_OBSERVED, operation="proxy.outcome", outcome=OutcomeSnapshot()
+        )
+        assert len(rec.seen) == 1
+
 
 class TestDiscoveryGate:
     """Installing a package must not silently start rewriting live requests."""

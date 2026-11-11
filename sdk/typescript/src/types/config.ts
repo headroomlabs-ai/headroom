@@ -9,7 +9,7 @@ export type HeadroomMode = "audit" | "optimize" | "simulate";
 
 /** Pipeline mode accepted by POST /v1/compress. Unset = default marker-free
  *  pipeline. Any other value is rejected (400) by the proxy. */
-export type CompressMode = "ccr" | "lossy_inline" | "lossless_then_lossy";
+export type CompressMode = "ccr" | "lossy_inline" | "lossless_then_lossy" | "lossless";
 
 /** Config accepted by the POST /v1/compress endpoint. camelCase keys are
  *  snake_cased on the wire (e.g. targetRatio -> target_ratio). Every field is
