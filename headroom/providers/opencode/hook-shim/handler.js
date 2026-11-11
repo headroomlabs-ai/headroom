@@ -134,6 +134,20 @@ function wrapFork(originalFork) {
 function normalizeProxyUrl(proxyUrl2) {
   return new URL(proxyUrl2);
 }
+var reportedProxyUrls = /* @__PURE__ */ new Set();
+function usableProxyUrl(proxyUrl2) {
+  try {
+    const proxy = normalizeProxyUrl(proxyUrl2);
+    if (proxy.protocol !== "http:" && proxy.protocol !== "https:") throw new TypeError("unsupported scheme");
+    return proxy;
+  } catch {
+    if (!reportedProxyUrls.has(proxyUrl2)) {
+      reportedProxyUrls.add(proxyUrl2);
+      console.warn(`headroom: the configured proxy URL is ${proxyUrl2 === "" ? "empty" : "not a valid http(s) URL"}; requests are not routed`);
+    }
+    return void 0;
+  }
+}
 function isLoopback(hostname) {
   const normalized = hostname.toLowerCase().replace(/^\[|\]$/g, "");
   return normalized === "localhost" || normalized === "127.0.0.1" || normalized === "::1";
@@ -170,8 +184,11 @@ function isRoutableUpstream(url, proxy, excludeHosts) {
   }
   return true;
 }
-function shouldRoute(url, proxy, excludeHosts) {
-  return isRoutableUpstream(url, proxy, excludeHosts) && isLlmEndpointPath(url.pathname);
+function isLlmMethod(method) {
+  return typeof method === "string" && method.toUpperCase() === "POST";
+}
+function shouldRoute(url, proxy, excludeHosts, method) {
+  return isLlmMethod(method) && isRoutableUpstream(url, proxy, excludeHosts) && isLlmEndpointPath(url.pathname);
 }
 function routedUrl(upstream, proxy) {
   return new URL(`${upstream.pathname}${upstream.search}`, proxy.origin);
@@ -229,7 +246,8 @@ function mergeFetchHeaders(input, init, upstream, originalPath = void 0, project
 }
 function withRoutedFetchInput(input, init, proxy, project, excludeHosts, sessionToken) {
   const upstream = requestUrl(input);
-  if (!shouldRoute(upstream, proxy, excludeHosts)) {
+  const method = init?.method ?? (input instanceof Request ? input.method : "GET");
+  if (!shouldRoute(upstream, proxy, excludeHosts, method)) {
     return [input, init];
   }
   const { url: nextUrl, originalPath } = routedUrlForOpenCode(upstream, proxy);
@@ -301,7 +319,7 @@ function headersForNodeRequest(options, upstream, originalPath, project, session
   return result;
 }
 function routedNodeOptions(parts, proxy, project, excludeHosts, sessionToken) {
-  if (!parts.url || !shouldRoute(parts.url, proxy, excludeHosts)) {
+  if (!parts.url || !shouldRoute(parts.url, proxy, excludeHosts, parts.options.method ?? "GET")) {
     return void 0;
   }
   const { url: nextUrl, originalPath } = routedUrlForOpenCode(parts.url, proxy);
@@ -340,7 +358,10 @@ function wrapRequest(originalHttpRequest, originalHttpsRequest, originalRequest)
     if (!state) {
       return Reflect.apply(originalRequest, this, args);
     }
-    const proxy = normalizeProxyUrl(state.proxyUrl);
+    const proxy = usableProxyUrl(state.proxyUrl);
+    if (!proxy) {
+      return Reflect.apply(originalRequest, this, args);
+    }
     const parts = splitNodeArgs(args);
     const nextOptions = routedNodeOptions(parts, proxy, state.project, state.excludeHosts, state.sessionToken);
     if (!nextOptions) {
@@ -402,7 +423,10 @@ function installHeadroomTransport(options) {
     if (!current) {
       return state.originalFetch(...args);
     }
-    const proxy = normalizeProxyUrl(current.proxyUrl);
+    const proxy = usableProxyUrl(current.proxyUrl);
+    if (!proxy) {
+      return state.originalFetch(...args);
+    }
     const [nextInput, nextInit] = withRoutedFetchInput(args[0], args[1], proxy, current.project, current.excludeHosts, current.sessionToken);
     return state.originalFetch(nextInput, nextInit);
   };

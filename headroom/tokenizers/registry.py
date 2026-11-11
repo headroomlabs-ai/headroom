@@ -11,6 +11,7 @@ import re
 from collections.abc import Callable
 from typing import TYPE_CHECKING
 
+from ..utils import remember_bounded
 from .base import TokenCounter
 from .estimator import EstimatingTokenCounter
 
@@ -26,6 +27,7 @@ MODEL_PATTERNS: list[tuple[str, str]] = [
     # OpenAI models -> tiktoken
     (r"^gpt-5", "tiktoken"),
     (r"^gpt-4o", "tiktoken"),
+    (r"^chatgpt-4o-", "tiktoken"),
     (r"^gpt-4", "tiktoken"),
     (r"^gpt-3\.5", "tiktoken"),
     (r"^o1", "tiktoken"),
@@ -141,8 +143,16 @@ class TokenizerRegistry:
     # Registered factories (backend -> factory function)
     _factories: dict[str, Callable[[str], TokenCounter]] = {}
 
-    # Cache for auto-detected tokenizers
+    # Registered model factories (model -> factory function)
+    _model_factories: dict[str, Callable[[str], TokenCounter]] = {}
+
+    # Cache for auto-detected tokenizers, least-recently-used first. ``model``
+    # is the ``model`` field of a proxied request body, so the entry count is
+    # capped (#4479): each entry owns its own TokenCountCache, and a client
+    # sending a new name per request must not grow this without limit. Real
+    # traffic uses a handful of models, far below the cap.
     _cache: dict[str, TokenCounter] = {}
+    _CACHE_MAXSIZE = 64
 
     def __new__(cls) -> TokenizerRegistry:
         """Singleton pattern."""
@@ -163,6 +173,7 @@ class TokenizerRegistry:
             "moonshot": self._create_moonshot,
             "estimation": self._create_estimation,
         }
+        self._model_factories = {}
 
     @classmethod
     def get(
@@ -194,13 +205,20 @@ class TokenizerRegistry:
 
         # Check cache
         cache_key = f"{model_lower}:{backend or 'auto'}"
-        if cache_key in registry._cache:
-            return registry._cache[cache_key]
+        cached = registry._cache.get(cache_key)
+        if cached is not None:
+            remember_bounded(registry._cache, cache_key, cached, cls._CACHE_MAXSIZE)
+            return cached
+
+        uses_model_factory = backend is None and model_lower in registry._model_factories
 
         # Create tokenizer
         try:
-            tokenizer = registry._create_tokenizer(model, backend)
-            registry._cache[cache_key] = tokenizer
+            if uses_model_factory:
+                tokenizer = registry._model_factories[model_lower](model)
+            else:
+                tokenizer = registry._create_tokenizer(model, backend)
+            remember_bounded(registry._cache, cache_key, tokenizer, cls._CACHE_MAXSIZE)
             return tokenizer
         except Exception as e:
             if fallback:
@@ -208,7 +226,8 @@ class TokenizerRegistry:
                     f"Failed to create tokenizer for {model}: {e}. Falling back to estimation."
                 )
                 tokenizer = EstimatingTokenCounter()
-                registry._cache[cache_key] = tokenizer
+                if not uses_model_factory:
+                    remember_bounded(registry._cache, cache_key, tokenizer, cls._CACHE_MAXSIZE)
                 return tokenizer
             raise ValueError(f"No tokenizer available for {model}: {e}") from e
 
@@ -234,8 +253,10 @@ class TokenizerRegistry:
 
         if tokenizer is not None:
             registry._tokenizers[model_lower] = tokenizer
+            registry._model_factories.pop(model_lower, None)
         elif factory is not None:
-            registry._factories[model_lower] = factory
+            registry._model_factories[model_lower] = factory
+            registry._tokenizers.pop(model_lower, None)
         else:
             raise ValueError("Must provide either tokenizer or factory")
 
@@ -269,7 +290,7 @@ class TokenizerRegistry:
     def list_registered(cls) -> list[str]:
         """List explicitly registered models."""
         registry = cls()
-        return list(registry._tokenizers.keys())
+        return list(dict.fromkeys((*registry._tokenizers, *registry._model_factories)))
 
     @classmethod
     def clear_cache(cls) -> None:
