@@ -839,6 +839,7 @@ class TestHandlerPassesServerMemoryTools:
             proxy = client.app.state.proxy
             proxy.memory_handler = SimpleNamespace(
                 config=SimpleNamespace(inject_context=False, inject_tools=True),
+                is_project_unresolved=lambda _ctx: False,
                 compute_memory_tool_definitions=lambda provider: memory_tools,
                 get_beta_headers=lambda: {},
                 has_memory_tool_calls=lambda resp, provider: False,
