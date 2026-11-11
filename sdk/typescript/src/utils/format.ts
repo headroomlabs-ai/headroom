@@ -928,7 +928,15 @@ export function geminiToOpenAI(messages: any[]): OpenAIMessage[] {
         const call = fr.functionResponse;
         // The response may omit its id; fall back to the call of the same name that is
         // still unanswered, so both sides of the round trip agree on one id.
-        const id = call.id ?? pendingCallIds.get(call.name)?.shift() ?? `gemini_${call.name}`;
+        const pending = pendingCallIds.get(call.name);
+        let id = call.id;
+        if (id === undefined) {
+          id = pending?.shift() ?? `gemini_${call.name}`;
+        } else if (pending) {
+          // An explicitly answered call must not be picked later by an id-less response.
+          const index = pending.indexOf(id);
+          if (index >= 0) pending.splice(index, 1);
+        }
         result.push(withGeminiExtras({
           role: "tool",
           content: JSON.stringify(call.response),

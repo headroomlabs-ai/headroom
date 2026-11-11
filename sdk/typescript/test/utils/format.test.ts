@@ -927,6 +927,28 @@ describe("Gemini part fields survive the compress round trip (issue #4770)", () 
       "call_1",
       "call_2",
     ]);
+
+    // An explicitly answered call is not reused by a later id-less response.
+    const outOfOrder = geminiToOpenAI([
+      {
+        role: "model",
+        parts: [
+          { functionCall: { id: "call_1", name: "read", args: { p: "a" } } },
+          { functionCall: { id: "call_2", name: "read", args: { p: "b" } } },
+        ],
+      },
+      {
+        role: "user",
+        parts: [
+          { functionResponse: { id: "call_2", name: "read", response: { b: 2 } } },
+          { functionResponse: { name: "read", response: { a: 1 } } },
+        ],
+      },
+    ]);
+    expect(outOfOrder.filter((m) => m.role === "tool").map((m) => (m as any).tool_call_id)).toEqual([
+      "call_2",
+      "call_1",
+    ]);
   });
 
   it("restores a thoughtSignature carried on a functionResponse part", () => {
