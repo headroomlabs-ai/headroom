@@ -38,6 +38,7 @@
     }
   },
   "devDependencies": {
+    "effect": "4.0.0-beta.103",
     "@opencode/plugin": "^2.0.14",
     "@types/node": "^26.1.1",
     "@typescript/native": "npm:typescript@^7.0.2",
@@ -46,6 +47,7 @@
     "vitest": "^5.0.0"
   },
   "overrides": {
+    "effect": "$effect",
     "esbuild": "^0.28.2",
     "glob": "14.0.3",
     "minimatch": "11.0.3",
