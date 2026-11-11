@@ -6,10 +6,15 @@ every in-flight request. Those are transport errors, so the proxy must retry
 them (dropping the bad connection and re-sending on a fresh one) instead of
 collapsing to a 502. These tests drive the real `_retry_request` and
 `_stream_response` paths.
+
+A corrupt TLS record on a reused HTTP/1.1 keep-alive connection is the same
+class of failure, but surfaces as a raw `ssl.SSLError` that is not an
+`httpx.TransportError`, so it gets the same retry.
 """
 
 from __future__ import annotations
 
+import ssl
 from unittest.mock import AsyncMock, MagicMock
 
 import httpx
@@ -177,3 +182,53 @@ async def test_successful_stream_still_returns_200():
 
     assert result.status_code == 200
     proxy.metrics.record_upstream_connection_error.assert_not_called()
+
+
+def _bad_record() -> ssl.SSLError:
+    # What httpx raises on a reused connection whose next TLS record is corrupt.
+    return ssl.SSLError(1, "[SSL] record layer failure (_ssl.c:2580)")
+
+
+async def test_retry_request_retries_ssl_error_on_reused_connection():
+    proxy = _mock_proxy()
+    good = MagicMock()
+    good.status_code = 200
+    good.request = MagicMock()
+    proxy.http_client.post = AsyncMock(side_effect=[_bad_record(), good])
+
+    result = await proxy._retry_request(
+        "POST",
+        "https://api.anthropic.com/v1/messages",
+        {"x-api-key": "sk-test"},
+        {"model": "claude-sonnet-4-20250514", "messages": []},
+    )
+
+    assert result is good
+    assert proxy.http_client.post.await_count == 2
+
+
+async def test_stream_retries_ssl_error_on_reused_connection():
+    proxy = _mock_proxy()
+    good = _good_stream_response([b'event: message_stop\ndata: {"type":"message_stop"}\n\n'])
+    proxy.http_client.build_request = MagicMock(return_value=MagicMock())
+    proxy.http_client.send = AsyncMock(side_effect=[_bad_record(), good])
+
+    result = await _run_stream(proxy)
+    body = b"".join([chunk async for chunk in result.body_iterator])
+
+    assert proxy.http_client.send.await_count == 2
+    assert result.status_code == 200
+    assert b"connection_error" not in body
+
+
+async def test_stream_ssl_error_exhaustion_is_a_tls_error_502():
+    proxy = _mock_proxy()
+    proxy.http_client.build_request = MagicMock(return_value=MagicMock())
+    proxy.http_client.send = AsyncMock(side_effect=_bad_record())
+
+    result = await _run_stream(proxy)
+    body = b"".join([chunk async for chunk in result.body_iterator])
+
+    assert proxy.http_client.send.await_count == 2
+    assert result.status_code == 502
+    assert b"upstream_tls_error" in body

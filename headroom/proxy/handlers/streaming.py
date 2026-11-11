@@ -9,6 +9,7 @@ import asyncio
 import contextlib
 import json
 import logging
+import ssl
 import time
 from collections.abc import AsyncIterator
 from typing import TYPE_CHECKING, Any
@@ -1502,7 +1503,10 @@ class StreamingMixin:
                 # `StreamReset`) from a poisoned shared h2 connection. This runs
                 # before any body byte is forwarded to the client, so re-sending
                 # on a fresh connection is safe and avoids a 502. (#1639)
-                except httpx.TransportError as e:
+                # A corrupt TLS record on a reused keep-alive connection is a
+                # raw ssl.SSLError, not a TransportError: anyio re-raises it and
+                # httpcore maps SSL errors only during the handshake.
+                except (httpx.TransportError, ssl.SSLError) as e:
                     last_connect_error = e
                     if attempt >= retry_attempts - 1:
                         raise
@@ -1534,7 +1538,7 @@ class StreamingMixin:
         # 502 keeps the structured SSE body for clients that read it while
         # letting SDK retry logic treat a transient upstream transport failure
         # as what it is.
-        except httpx.TransportError as e:
+        except (httpx.TransportError, ssl.SSLError) as e:
             error_msg = str(e) or repr(e)
             logger.error(f"[{request_id}] Connection error to upstream API: {error_msg}")
             self.metrics.record_upstream_connection_error(provider)
