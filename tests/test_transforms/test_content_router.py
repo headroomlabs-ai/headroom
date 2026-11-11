@@ -1589,6 +1589,37 @@ class TestSmartCrusherFallback:
             f"{strategy_chain}"
         )
 
+    def test_code_aware_declining_never_falls_back_to_kompress(self, router, monkeypatch):
+        """Code-aware declining a block leaves it unchanged; prose ML never runs (#4214).
+
+        Replaces the old "no double Kompress" check: with the CODE_AWARE ->
+        Kompress fallbacks removed, Kompress must not run even once.
+        """
+        import headroom.transforms.content_router as crm
+
+        ml_calls: list[str] = []
+
+        def spy(self, content, context="", question=None):
+            ml_calls.append(content)
+            return content, len(content.split())
+
+        monkeypatch.setattr(crm.ContentRouter, "_try_ml_compressor", spy)
+
+        plain = "This is just plain text. " * 200
+
+        compressed, _compressed_tokens, strategy_chain, _reversible = (
+            router._apply_strategy_to_content(
+                plain,
+                CompressionStrategy.CODE_AWARE,
+                context="",
+            )
+        )
+
+        assert "code_aware" in strategy_chain
+        assert "kompress" not in strategy_chain
+        assert ml_calls == []
+        assert compressed == plain
+
 
 # =============================================================================
 # TestCompressBlockContent — PR #704 shared-path regression

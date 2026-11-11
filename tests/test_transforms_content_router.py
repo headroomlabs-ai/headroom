@@ -2829,6 +2829,14 @@ def test_json_in_html_preserves_records_and_markup() -> None:
     assert not result.unrecoverable_sections
 
 
+# A Claude Code Read of Rust: line-numbered code that code_aware hands back
+# unchanged (it cannot parse the number column) while reporting compressed=True.
+# Code runs ~2 tokens per whitespace word, so a word count badly undercounts it.
+_NUMBERED_RUST = "\n".join(
+    f"{i}\tlet value_{i} = compute(&items[{i}..], Some(opts.clone()))?;" for i in range(1, 121)
+)
+
+
 def _noop_code_aware_router(monkeypatch: pytest.MonkeyPatch, kompress_out: str) -> ContentRouter:
     monkeypatch.delenv("HEADROOM_LOSSLESS_THEN_LOSSY", raising=False)
     router = ContentRouter(ContentRouterConfig(enable_code_aware=True))
@@ -2848,6 +2856,52 @@ def _noop_code_aware_router(monkeypatch: pytest.MonkeyPatch, kompress_out: str) 
 
     monkeypatch.setattr(router, "_try_ml_compressor", kompress)
     return router
+
+
+@pytest.mark.parametrize("layer_lossy", [False, True], ids=["default", "lossless-then-lossy"])
+def test_code_aware_noop_never_hands_code_to_kompress(
+    monkeypatch: pytest.MonkeyPatch, layer_lossy: bool
+) -> None:
+    """A code_aware no-op leaves the block unchanged even if Kompress would shrink it (#4214).
+
+    Kompress is a prose model: it drops keywords, so it never sees code, neither as
+    the CODE_AWARE fallback nor as the lossless-then-lossy inline attempt.
+    """
+    kompressed = "\n".join(f"{i}\tvalue_{i} compute(&items[{i}..])" for i in range(1, 121))
+    assert _estimate_tokens(kompressed) < _estimate_tokens(_NUMBERED_RUST)
+    router = _noop_code_aware_router(monkeypatch, kompressed)
+    router._lossless_then_lossy = layer_lossy
+    calls: list[str] = []
+    kompress = router._try_ml_compressor
+
+    def counting(content: str, *args: object, **kwargs: object) -> tuple[str, int]:
+        calls.append(content)
+        return kompress(content, *args, **kwargs)
+
+    monkeypatch.setattr(router, "_try_ml_compressor", counting)
+
+    compressed, compressed_tokens, strategy_chain, _reversible = router._apply_strategy_to_content(
+        _NUMBERED_RUST, CompressionStrategy.CODE_AWARE, context=""
+    )
+
+    assert compressed == _NUMBERED_RUST
+    assert compressed_tokens == _estimate_tokens(_NUMBERED_RUST)
+    assert strategy_chain == ["code_aware"]
+    assert calls == []
+
+
+def test_code_aware_noop_reports_tokens_without_kompress(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An unchanged block is reported at its own token count, never its word count."""
+    router = _noop_code_aware_router(monkeypatch, _NUMBERED_RUST)
+
+    compressed, compressed_tokens, _chain, _reversible = router._apply_strategy_to_content(
+        _NUMBERED_RUST, CompressionStrategy.CODE_AWARE, context=""
+    )
+
+    assert compressed == _NUMBERED_RUST
+    assert compressed_tokens == _estimate_tokens(_NUMBERED_RUST)
 
 
 @pytest.mark.parametrize(
@@ -2879,6 +2933,75 @@ def test_fenced_code_keeps_keywords_when_code_compression_declines(
     )
 
     assert f"```python\n{code}\n```" in result.compressed
+
+
+# The ctx_execute shape from #4214: a fenced Python script followed by its output.
+# The reporter's own 1324-character fence is not published, so this is a
+# reconstruction: it keeps the four lines quoted in the issue, parses, and is
+# exactly 1324 characters. The fake Kompress deletes the keywords the issue lists.
+_ISSUE_4214_SCRIPT = """import json, collections
+
+d = json.load(open('turns.json'))
+segs=[s for s in open('segs.txt').read().split() if s]
+def load(path):
+    try:
+        return json.load(open(path))
+    except Exception as e: return None
+for i,s in enumerate(segs):
+    t0=(d or {}).get('turns') or []
+    if not t0 or len(t0) < 2:
+        continue
+    else:
+        label = s if s else 'unknown'
+    counts = collections.Counter(x.get('role') for x in t0)
+    for role, n in counts.items():
+        if n > 1 or role == 'tool':
+            print(i, label, role, n)
+        else:
+            print(i, label, role)
+    total = sum(counts.values())
+    if total > 10 or label == 'big':
+        print('large session', label, total)
+    out = [k for k in counts if counts[k] > 0]
+    print(json.dumps(out))
+summary = {s: i for i, s in enumerate(segs)}
+for k, v in summary.items():
+    if v % 2 == 0 or k.startswith('a'):
+        print(k, v)
+print('done', len(segs))"""
+_ISSUE_4214_FENCE = _ISSUE_4214_SCRIPT + "\n#" + "x" * (1324 - len(_ISSUE_4214_SCRIPT) - 2)
+
+
+@pytest.mark.parametrize("enabled", [False, True], ids=["code-aware-off", "code-aware-on"])
+def test_issue_4214_fenced_script_survives_kompress_unchanged(
+    monkeypatch: pytest.MonkeyPatch, enabled: bool
+) -> None:
+    import ast
+    import re
+
+    assert len(_ISSUE_4214_FENCE) == 1324
+    ast.parse(_ISSUE_4214_FENCE)
+    monkeypatch.delenv("HEADROOM_LOSSLESS_THEN_LOSSY", raising=False)
+    router = ContentRouter(ContentRouterConfig(enable_code_aware=enabled))
+    seen: list[str] = []
+
+    def drop_keywords(content: str, *_args: object, **_kwargs: object) -> tuple[str, int]:
+        seen.append(content)
+        dropped = re.sub(r"\b(for|in|if|as|or|else) ?", "", content)
+        return dropped, _estimate_tokens(dropped)
+
+    monkeypatch.setattr(router, "_try_ml_compressor", drop_keywords)
+    output = "\n".join(
+        f"Segment {i}: The job read the batch, checked each record against the schema "
+        "and wrote a summary line for the report because the operator asked."
+        for i in range(40)
+    )
+    content = f"```python\n{_ISSUE_4214_FENCE}\n```\n\n{output}"
+
+    result = router.compress(content, context="")
+
+    assert f"```python\n{_ISSUE_4214_FENCE}\n```" in result.compressed
+    assert not any("def load" in section for section in seen)
 
 
 @pytest.mark.parametrize("as_block", [False, True], ids=["string-tool", "tool-result-block"])
