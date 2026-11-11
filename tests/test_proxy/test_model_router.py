@@ -324,6 +324,58 @@ def test_estimate_input_tokens_counts_system_blocks() -> None:
     assert estimate_input_tokens([{"content": "hi"}], system=blocks) > 100
 
 
+# ---------------------------------------------------------------------------
+# Shadow mode (HEADROOM_MODEL_ROUTER_LOG_ONLY)
+# ---------------------------------------------------------------------------
+
+
+def test_from_env_parses_log_only() -> None:
+    cfg = ModelRouterConfig.from_env("1", '[{"to_model":"cheap","max_input_tokens":10000}]', "true")
+    assert cfg.enabled is True
+    assert cfg.log_only is True
+
+
+def test_log_only_defaults_false() -> None:
+    cfg = ModelRouterConfig.from_env("1", '[{"to_model":"cheap"}]')
+    assert cfg.log_only is False
+    assert ModelRouter(cfg).log_only is False
+
+
+def test_log_only_matches_but_leaves_model_unchanged() -> None:
+    router = _router(
+        ModelRoute(to_model="cheap", max_input_tokens=10_000, name="small"),
+    )
+    # Force shadow mode via config.
+    router = ModelRouter(
+        ModelRouterConfig(
+            enabled=True,
+            routes=(ModelRoute(to_model="cheap", max_input_tokens=10_000, name="small"),),
+            log_only=True,
+        )
+    )
+    d = router.select(model="strong", input_tokens=100, has_tools=False)
+    # A rule matched, but the model is NOT rewritten (changed is False).
+    assert d.matched is True
+    assert d.changed is False
+    assert d.routed_model == "strong"
+    assert d.rule_name == "small"
+    # The reason records what routing WOULD have done, for the handler log.
+    assert d.reason.startswith("[shadow] would route strong -> cheap")
+
+
+def test_log_only_off_still_routes() -> None:
+    router = ModelRouter(
+        ModelRouterConfig(
+            enabled=True,
+            routes=(ModelRoute(to_model="cheap", max_input_tokens=10_000),),
+            log_only=False,
+        )
+    )
+    d = router.select(model="strong", input_tokens=100, has_tools=False)
+    assert d.changed is True
+    assert d.routed_model == "cheap"
+
+
 def test_select_passes_max_tokens_to_rules() -> None:
     router = ModelRouter(
         ModelRouterConfig(
@@ -361,3 +413,21 @@ def test_request_max_tokens() -> None:
     assert request_max_tokens({"max_tokens": "4000"}) is None
     assert request_max_tokens({"max_tokens": 1.5}) is None
     assert request_max_tokens(None) is None
+
+
+def test_shadow_mode_respects_max_output_tokens_condition() -> None:
+    router = ModelRouter(
+        ModelRouterConfig(
+            enabled=True,
+            log_only=True,
+            routes=(ModelRoute(to_model="cheap", max_output_tokens=512, name="small-output"),),
+        )
+    )
+    small = router.select(model="strong", input_tokens=10, has_tools=False, max_tokens=256)
+    assert small.matched
+    assert not small.changed
+    assert small.routed_model == "strong"
+    assert "[shadow]" in small.reason
+    large = router.select(model="strong", input_tokens=10, has_tools=False, max_tokens=4000)
+    assert not large.matched
+    assert not large.changed
