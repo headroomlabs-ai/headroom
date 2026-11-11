@@ -289,4 +289,98 @@ if (dir) {
   console.log('rate limit: 429 over, fail-open on outage and when unbound');
 }
 
+// ---- fetch(): the nested allowlist -------------------------------------------
+//
+// The allowlist has to hold BELOW the top-level keys too: a nested field a
+// client bug adds, or free text under an allowed key, must not be stored. And
+// nothing the current client sends may be lost on the way in. The sample event
+// is the real client's output; the lists it leaves empty are filled with rows
+// of the shape session.py emits, so every nested field is exercised.
+{
+  /** Plain JS -> OTLP AnyValue, as _any_value() in session.py builds it. */
+  const any = (v) =>
+    typeof v === 'boolean' ? { boolValue: v }
+    : Number.isInteger(v) ? { intValue: String(v) }
+    : typeof v === 'number' ? { doubleValue: v }
+    : typeof v === 'string' ? { stringValue: v }
+    : Array.isArray(v) ? { arrayValue: { values: v.map(any) } }
+    : { kvlistValue: { values: Object.entries(v).map(([key, x]) => ({ key, value: any(x) })) } };
+
+  const sample = JSON.parse(readFileSync(new URL('./sample-event.json', import.meta.url), 'utf8'));
+  const resourceAttrs = sample.resourceLogs[0].resource.attributes;
+  const plain = (v) =>
+    'kvlistValue' in v
+      ? Object.fromEntries(v.kvlistValue.values.map((kv) => [kv.key, plain(kv.value)]))
+      : 'arrayValue' in v ? v.arrayValue.values.map(plain)
+      : 'intValue' in v ? Number(v.intValue)
+      : Object.values(v)[0];
+  const full = plain(sample.resourceLogs[0].scopeLogs[0].logRecords[0].body);
+  full.compression.transforms.extracted_3_dynamic_elements = 2;
+  full.compression.by_strategy = [{ strategy: 'smart_crusher', n: 2, tokens_in: 1500, tokens_out: 700 }];
+  full.skips = { 'passthrough:bypass_header': 1 };
+  full.failure_statuses = { 529: 1 };
+  full.models.push('us.anthropic.claude-3-5-sonnet-20241022-v2:0', 'vertex_ai/gemini-1.5-pro@001');
+  full.quality.waste = [{ kind: 'json_bloat', tokens: 40 }];
+  full.shapes.by_content = [{ content: 'json', strategy: 'smart_crusher', n: 1, tokens_in: 9, tokens_out: 3 }];
+  full.shapes.by_tool = [{ shape: 'f2d3_a', n: 1, tokens_in: 9, tokens_out: 3 }];
+  full.trajectory.kinds = 's12p3z40';
+  full.errors = { count: 1, by_status: { 429: 1 } };
+  full.strata = [{ dim: 'arm', value: 'treatment', n: 2 }];
+  full.config = [{ key: 'mode', value: 'token' }];
+  full.routing = { decisions: 3, by_model: [{ model: 'claude-haiku-4-5', n: 3 }], min_prefix: 1024 };
+
+  /** One OTLP record through fetch(); returns what would be written to R2. */
+  const store = async (body, resource = resourceAttrs) => {
+    const otlp = { resourceLogs: [{ resource: { attributes: resource },
+      scopeLogs: [{ logRecords: [{ body: any(body) }] }] }] };
+    const pending = [];
+    const written = {};
+    const CORPUS = { put: async (key, value) => { written[key] = value; } };
+    const res = await worker.fetch(
+      new Request('https://beacon.test/v1/logs', { method: 'POST', body: JSON.stringify(otlp) }),
+      { CORPUS },
+      { waitUntil: (p) => pending.push(p) }
+    );
+    await Promise.all(pending);
+    assert.equal(res.status, 204);
+    const [line] = Object.values(written);
+    const { received_at, ...rec } = JSON.parse(line);
+    assert.ok(received_at);
+    return rec;
+  };
+
+  const { resource, ...stored } = await store(full);
+  assert.deepEqual(stored, full, 'a field the current client sends was dropped');
+  assert.deepEqual(resource, plain({ kvlistValue: { values: resourceAttrs } }));
+
+  const injected = structuredClone(full);
+  injected.session.note = 'hello';                               // unknown nested key
+  injected.tokens.prompt_sample = 12;                            // unknown nested counter
+  injected.compression.by_strategy[0].prompt = 'secret';         // unknown key in a record
+  injected.models.push('Please summarise this customer email'); // free text under a list
+  // Credential-shaped fixtures are assembled at run time so secret scanners do not
+  // flag this file; they are not real keys.
+  const fakeKey = ['sk', 'live', 'abc123'].join('_');
+  const fakeAwsId = 'AK' + 'IA' + 'X'.repeat(16);
+  injected.models.push(fakeKey, 'https://internal.example/admin'); // slug-shaped secret, URL
+  injected.strata.push({ dim: 'arm', value: fakeAwsId, n: 1 }); // key-shaped value
+  injected.config.push({ key: 'endpoint', value: 'https://internal.example/x?token=1 2' });
+  injected.session.ended = { nested: 'object where a slug belongs' };
+  injected.routing.note = 'free text with spaces';
+  injected.trajectory.kinds = 'see attached transcript';
+  const hostile = [...resourceAttrs.filter((a) => a.key !== 'headroom.stack'),
+    { key: 'headroom.stack', value: any({ cwd: '/home/me' }) }];
+  const { resource: badResource, ...dropped } = await store(injected, hostile);
+
+  const expected = structuredClone(full);
+  delete expected.session.ended;
+  delete expected.trajectory.kinds;
+  expected.config.push({ key: 'endpoint' });
+  expected.strata.push({ dim: 'arm', n: 1 });
+  assert.deepEqual(dropped, expected, 'a nested field outside the allowlist was stored');
+  assert.equal(badResource['headroom.stack'], undefined, 'non-scalar resource value stored');
+
+  console.log('nested allowlist: client fields kept, unknown nested keys and free text dropped');
+}
+
 console.log('ok');
