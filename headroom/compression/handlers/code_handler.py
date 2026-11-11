@@ -605,16 +605,24 @@ class CodeStructureHandler(BaseStructureHandler):
         returned unchanged. Otherwise a byte->char table is built once
         and every span endpoint is remapped.
         """
-        n_bytes = len(content.encode("utf-8"))
-        if n_bytes == len(content):
+        # ASCII fast path: every byte is one character, so tree-sitter's byte
+        # offsets are already character offsets. ``content.isascii()`` checks
+        # this in C without allocating, where ``len(content.encode("utf-8"))``
+        # built (and discarded) a full UTF-8 copy of the content on every code
+        # block just to compare lengths.
+        if content.isascii():
             return spans
 
         # byte_to_char[b] = index of the character containing byte b;
-        # byte_to_char[n_bytes] = len(content) so exclusive ends map.
+        # byte_to_char[n_bytes] = len(content) so exclusive ends map. A
+        # character's UTF-8 width is derived from its code point (1-4 bytes)
+        # rather than re-encoding every character individually in the loop.
+        n_bytes = len(content.encode("utf-8"))
         byte_to_char = [0] * (n_bytes + 1)
         byte_pos = 0
         for char_idx, ch in enumerate(content):
-            ch_width = len(ch.encode("utf-8"))
+            cp = ord(ch)
+            ch_width = 1 if cp < 0x80 else 2 if cp < 0x800 else 3 if cp < 0x10000 else 4
             for b in range(byte_pos, byte_pos + ch_width):
                 byte_to_char[b] = char_idx
             byte_pos += ch_width

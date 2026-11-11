@@ -159,6 +159,29 @@ def test_maybe_route_model_routes_when_enabled() -> None:
     tracker.mark_mutated.assert_called_once_with("model_router")
 
 
+def test_maybe_route_model_honors_max_output_tokens() -> None:
+    # Issue #2765: the request's own max_tokens reaches the router.
+    host = _RouterHost()
+    host.model_router = ModelRouter(
+        ModelRouterConfig(
+            enabled=True,
+            routes=(ModelRoute(to_model="claude-haiku-4-5", max_output_tokens=512),),
+        )
+    )
+    long_answer = {"model": "claude-opus-4-8", "max_tokens": 4000}
+    out = host._maybe_route_model(
+        "claude-opus-4-8", [{"content": "OK?"}], long_answer, MagicMock(), False
+    )
+    assert out == "claude-opus-4-8"
+    assert long_answer["model"] == "claude-opus-4-8"
+
+    trivial = {"model": "claude-opus-4-8", "max_tokens": 256}
+    out = host._maybe_route_model(
+        "claude-opus-4-8", [{"content": "OK?"}], trivial, MagicMock(), False
+    )
+    assert out == "claude-haiku-4-5"
+
+
 @pytest.mark.parametrize(
     ("routes", "expected_reason"),
     [

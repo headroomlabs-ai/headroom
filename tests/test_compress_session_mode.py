@@ -566,3 +566,77 @@ def test_usage_404_for_ttl_expired_tracker() -> None:
         )
         assert resp.status_code == 404
         assert resp.json()["error"]["type"] == "unknown_session"
+
+
+# --------------------------------------------------------------------------- #
+# cache_control markers stay bounded across replayed turns.                   #
+# --------------------------------------------------------------------------- #
+
+
+def _count_message_markers(messages: list[dict]) -> int:
+    total = 0
+    for msg in messages:
+        content = msg.get("content")
+        if isinstance(content, list):
+            total += sum(1 for b in content if isinstance(b, dict) and "cache_control" in b)
+    return total
+
+
+def _anthropic_turns(n: int) -> list[dict]:
+    """An agent loop in Anthropic shape, as a caller sends it on turn n: the
+    breakpoint rides on the newest block only, moved forward every turn."""
+    messages: list[dict] = [{"role": "user", "content": [{"type": "text", "text": "fix the bug"}]}]
+    for i in range(n):
+        messages.append(
+            {
+                "role": "assistant",
+                "content": [
+                    {
+                        "type": "tool_use",
+                        "id": f"t{i}",
+                        "name": "bash",
+                        "input": {"cmd": f"step {i}"},
+                    }
+                ],
+            }
+        )
+        messages.append(
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "tool_result",
+                        "tool_use_id": f"t{i}",
+                        # Large and compressible, so the fresh turn rewrites it
+                        # and the replay has compressed bytes to carry forward.
+                        "content": _big_tool_history()[2]["content"],
+                    }
+                ],
+            }
+        )
+    messages[-1]["content"][-1]["cache_control"] = {"type": "ephemeral"}
+    return messages
+
+
+def test_session_turns_do_not_accumulate_cache_control_markers() -> None:
+    # Anthropic rejects a request with more than four cache_control blocks.
+    # Across replayed turns the returned markers must track the caller's
+    # moving breakpoint, never accumulate behind it.
+    with _make_client() as client:
+        saved = 0
+        for turn in range(1, 9):
+            resp = client.post(
+                "/v1/compress",
+                json={
+                    "model": "claude-sonnet-5",
+                    "messages": _anthropic_turns(turn),
+                    "config": {"session_id": "markers-bounded"},
+                },
+            )
+            assert resp.status_code == 200, resp.text
+            body = resp.json()
+            returned = body["messages"]
+            saved += body["tokens_saved"]
+            assert _count_message_markers(returned) == 1, (turn, _count_message_markers(returned))
+        # Precondition: compression rewrote tool results, so replay was live.
+        assert saved > 0

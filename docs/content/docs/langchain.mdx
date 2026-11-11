@@ -1,19 +1,32 @@
 ---
-title: LangChain
-description: Automatic context compression for LangChain chat models, memory, retrievers, and agents.
+title: LangChain & LangGraph
+description: Compress context in LangChain chat models, memory, retrievers, and LangGraph agents.
 ---
 
-Headroom integrates with LangChain to compress context across all LangChain patterns: chat models, memory, retrievers, agents, and streaming.
+Headroom plugs into LangChain at four points: the chat model, tool output, retrieved documents, and conversation history. In LangGraph it also works as a graph node, compressing `ToolMessage` content between the tool step and the agent step.
 
-## Installation
+## Install
 
 ```bash
-pip install "headroom-ai[langchain]"
+pip install "headroom-ai[langchain]"    # langchain-core + langchain-openai
+pip install "headroom-ai[langgraph]"    # the above, plus langgraph
 ```
 
-## Quick start
+Provider packages are separate, as they are in LangChain itself:
 
-Wrap any chat model in one line:
+```bash
+pip install langchain-anthropic         # ChatAnthropic
+pip install langchain                   # create_agent, init_chat_model
+pip install langchain-classic           # ContextualCompressionRetriever
+```
+
+<Callout type="warn">
+LangChain 1.0 removed several modules that older Headroom docs referenced. `langchain.memory` and `langchain.retrievers` no longer exist, and `create_openai_tools_agent` and `AgentExecutor` are gone from `langchain.agents`. The [migration table](#migrating-from-langchain-0x) at the bottom of this page maps each one to its replacement. Verified against langchain-core 1.6.1, langchain 1.3.18 and langgraph 1.2.11.
+</Callout>
+
+## Chat model
+
+`HeadroomChatModel` wraps any LangChain chat model. Messages are compressed on the way out; everything else about the model is unchanged.
 
 ```python
 from langchain_openai import ChatOpenAI
@@ -21,125 +34,78 @@ from headroom.integrations import HeadroomChatModel
 
 llm = HeadroomChatModel(ChatOpenAI(model="gpt-4o"))
 
-# Use exactly like before
 response = llm.invoke("Hello!")
 
-# Check savings
-print(llm.get_metrics())
-# {'tokens_saved': 12500, 'savings_percent': 45.2, 'requests': 50}
+print(llm.get_savings_summary())
+# {'total_requests': 1, 'total_tokens_saved': 0, 'average_savings_percent': 0.0,
+#  'total_tokens_before': 9, 'total_tokens_after': 9}
 ```
 
-Works with any provider:
+Short prompts compress to nothing, which is the intended behaviour — savings appear once tool output and history are in the context.
+
+Any provider works:
 
 ```python
 from langchain_anthropic import ChatAnthropic
+from headroom.integrations import HeadroomChatModel
 
 llm = HeadroomChatModel(ChatAnthropic(model="claude-sonnet-4-20250514"))
 ```
 
-## Memory integration
+Tool binding is forwarded to the underlying model, so `llm.bind_tools(...)` and the agent runtimes built on it behave the same as the unwrapped model.
 
-`HeadroomChatMessageHistory` wraps any chat history with automatic compression. Long conversations stay under your token budget:
+## Agents
 
-```python
-from langchain.memory import ConversationBufferMemory
-from langchain_community.chat_message_histories import ChatMessageHistory
-from headroom.integrations import HeadroomChatMessageHistory
-
-base_history = ChatMessageHistory()
-compressed_history = HeadroomChatMessageHistory(
-    base_history,
-    compress_threshold_tokens=4000,  # Compress when over 4K tokens
-    keep_recent_turns=5,             # Always keep last 5 turns
-)
-
-memory = ConversationBufferMemory(chat_memory=compressed_history)
-```
-
-After usage:
+`wrap_tools_with_headroom` compresses tool output before it re-enters the agent's context. The wrapped tool keeps the original argument schema, so the model sees the same parameters.
 
 ```python
-print(compressed_history.get_compression_stats())
-# {'compression_count': 12, 'total_tokens_saved': 28000}
-```
-
-## Retriever integration
-
-`HeadroomDocumentCompressor` filters retrieved documents by relevance. Retrieve many for recall, keep the best for precision:
-
-```python
-from langchain.retrievers import ContextualCompressionRetriever
-from langchain_community.vectorstores import FAISS
-from headroom.integrations import HeadroomDocumentCompressor
-
-base_retriever = vectorstore.as_retriever(search_kwargs={"k": 50})
-
-compressor = HeadroomDocumentCompressor(
-    max_documents=10,
-    min_relevance=0.3,
-    prefer_diverse=True,  # MMR-style diversity
-)
-
-retriever = ContextualCompressionRetriever(
-    base_compressor=compressor,
-    base_retriever=base_retriever,
-)
-
-# Retrieves 50 docs, returns best 10
-docs = retriever.invoke("What is Python?")
-```
-
-## Agent tool wrapping
-
-`wrap_tools_with_headroom` compresses tool outputs before they re-enter the agent's context:
-
-```python
+import json
 from langchain_core.tools import tool
-from headroom.integrations import wrap_tools_with_headroom
+from langchain_openai import ChatOpenAI
+from langchain.agents import create_agent
+from headroom.integrations import HeadroomChatModel, wrap_tools_with_headroom
 
 @tool
-def search_database(query: str) -> str:
-    """Search the database."""
-    return json.dumps({"results": [...], "total": 1000})
+def query_database(query: str) -> str:
+    """Query the users database. Returns JSON rows."""
+    return json.dumps({"results": [...], "total": 300})
 
-wrapped_tools = wrap_tools_with_headroom(
-    [search_database],
-    min_chars_to_compress=1000,
-)
+llm = HeadroomChatModel(ChatOpenAI(model="gpt-4o-mini"))
+tools = wrap_tools_with_headroom([query_database], min_chars_to_compress=1000)
 
-agent = create_openai_tools_agent(llm, wrapped_tools, prompt)
-executor = AgentExecutor(agent=agent, tools=wrapped_tools)
+agent = create_agent(llm, tools)
+result = agent.invoke({
+    "messages": [("user", "How many users signed up last week?")]
+})
 ```
 
-Per-tool metrics:
+`create_agent` comes from the `langchain` package. LangGraph's `create_react_agent` still works and is a drop-in substitute, but it is deprecated as of LangGraph 1.0 and slated for removal in 2.0.
+
+Per-tool metrics are collected globally:
 
 ```python
 from headroom.integrations import get_tool_metrics
 
-metrics = get_tool_metrics()
-print(metrics.get_summary())
-# {'total_invocations': 25, 'total_compressions': 18, 'total_chars_saved': 450000}
+print(get_tool_metrics().get_summary())
+# {'total_invocations': 1, 'total_compressions': 1, 'total_chars_saved': 4202,
+#  'average_compression_ratio': 0.901,
+#  'by_tool': {'query_database': {'invocations': 1, 'compressions': 1, 'chars_saved': 4202}}}
 ```
 
-## LangGraph ReAct agent
+Async agents work too — the wrapped tool exposes a coroutine, so `await agent.ainvoke(...)` compresses on the async path as well.
 
-```python
-from langchain_openai import ChatOpenAI
-from langgraph.prebuilt import create_react_agent
-from headroom.integrations import HeadroomChatModel, wrap_tools_with_headroom
+## LangGraph compression node
 
-llm = HeadroomChatModel(ChatOpenAI(model="gpt-4o"))
-tools = wrap_tools_with_headroom([search_web, query_database])
+Wrapping tools and compressing in the graph are not equivalent, and the difference is large. On the same 300-row JSON result:
 
-agent = create_react_agent(llm, tools)
-result = agent.invoke({
-    "messages": [("user", "Find users who signed up last week")]
-})
-```
+| Path | Result | Saved |
+|---|---:|---:|
+| `wrap_tools_with_headroom` | 38,395 chars | 10% |
+| `create_compress_tool_messages_node` | 18,390 chars | 57% |
 
-## LangGraph custom graph
+The tool wrapper routes through the MCP compressor, which deliberately keeps its output parseable as JSON for downstream tool consumers. That rules out the schema-hoisting rewrite — the one that turns 300 repeated objects into a single schema line plus CSV rows — so on an array of similar records it mostly removes whitespace. The graph node has no such constraint, because the value only has to be read by the model.
 
-Insert a compression node between tools and the agent in a custom `StateGraph`:
+Use the graph node when the output is going to the model and nothing else parses it. Use tool wrapping when something downstream still needs JSON.
 
 ```python
 from langgraph.graph import StateGraph, MessagesState, START, END
@@ -152,37 +118,125 @@ graph.add_node("compress", create_compress_tool_messages_node(
     min_tokens_to_compress=100,
 ))
 
-# Wire: tools -> compress -> agent
 graph.add_edge(START, "agent")
 graph.add_edge("tools", "compress")
 graph.add_edge("compress", "agent")
+
+app = graph.compile()
 ```
+
+On a 300-row JSON tool result — 42,597 characters — the node returns 18,390, a 57% reduction, with `tool_call_id` preserved so the graph stays valid.
+
+To call it directly rather than as a node:
+
+```python
+from headroom.integrations.langchain import compress_tool_messages
+
+result = compress_tool_messages(state["messages"], min_tokens_to_compress=100)
+
+result.messages            # the rewritten message list
+result.messages_compressed # 1
+result.total_tokens_saved  # 6052
+```
+
+Messages below the threshold are returned unchanged.
+
+## Memory
+
+`HeadroomChatMessageHistory` wraps any `BaseChatMessageHistory` and compresses older turns once the history crosses a token budget.
+
+```python
+from langchain_core.chat_history import InMemoryChatMessageHistory
+from headroom.integrations import HeadroomChatMessageHistory
+
+history = HeadroomChatMessageHistory(
+    InMemoryChatMessageHistory(),
+    compress_threshold_tokens=4000,   # start compressing above 4K tokens
+    keep_recent_turns=5,              # never touch the last 5 turns
+)
+
+history.add_user_message("...")
+history.add_ai_message("...")
+
+print(history.get_compression_stats())
+# {'compression_count': 0, 'total_tokens_saved': 0,
+#  'threshold_tokens': 4000, 'keep_recent_turns': 5}
+```
+
+Use it anywhere a chat history is accepted:
+
+```python
+from langchain_core.runnables.history import RunnableWithMessageHistory
+
+chain = RunnableWithMessageHistory(llm, lambda session_id: history)
+```
+
+`ConversationBufferMemory` was removed in LangChain 1.0. `RunnableWithMessageHistory`, or a LangGraph checkpointer, replaces it.
+
+## Retriever
+
+`HeadroomDocumentCompressor` scores retrieved documents against the query and keeps the best. Retrieve widely for recall, then narrow for precision.
+
+```python
+from headroom.integrations import HeadroomDocumentCompressor
+
+compressor = HeadroomDocumentCompressor(
+    max_documents=10,
+    min_relevance=0.3,
+    prefer_diverse=True,   # MMR-style diversity
+)
+
+docs = compressor.compress_documents(retrieved_docs, "What is Python?")
+```
+
+It is a real `langchain_core.documents.compressor.BaseDocumentCompressor`, so it also drops into the classic retriever pattern:
+
+```python
+from langchain_classic.retrievers import ContextualCompressionRetriever
+
+retriever = ContextualCompressionRetriever(
+    base_compressor=compressor,
+    base_retriever=vectorstore.as_retriever(search_kwargs={"k": 50}),
+)
+
+docs = retriever.invoke("What is Python?")   # retrieves 50, returns 10
+```
+
+`ContextualCompressionRetriever` moved out of `langchain.retrievers` in 1.0 and now ships in `langchain-classic`.
 
 ## Streaming
 
-Full async support:
-
 ```python
-# Async invoke
+for chunk in llm.stream("Tell me a story"):
+    print(chunk.content, end="", flush=True)
+
 response = await llm.ainvoke("Hello!")
 
-# Async streaming
 async for chunk in llm.astream("Tell me a story"):
     print(chunk.content, end="", flush=True)
 ```
 
-## Custom configuration
+## Configuration
 
 ```python
 from headroom import HeadroomConfig, HeadroomMode
+from headroom.integrations import HeadroomChatModel
+from langchain_openai import ChatOpenAI
 
-config = HeadroomConfig(
-    default_mode=HeadroomMode.OPTIMIZE,
-    smart_crusher_target_ratio=0.3,
-)
+config = HeadroomConfig(default_mode=HeadroomMode.OPTIMIZE)
 
-llm = HeadroomChatModel(
-    ChatOpenAI(model="gpt-4o"),
-    headroom_config=config,
-)
+llm = HeadroomChatModel(ChatOpenAI(model="gpt-4o"), config=config)
 ```
+
+## Migrating from LangChain 0.x
+
+| Removed in LangChain 1.0 | Use instead | Package |
+|---|---|---|
+| `langchain.memory.ConversationBufferMemory` | `RunnableWithMessageHistory`, or a LangGraph checkpointer | `langchain-core` |
+| `langchain_community.chat_message_histories.ChatMessageHistory` | `langchain_core.chat_history.InMemoryChatMessageHistory` | `langchain-core` |
+| `langchain.retrievers.ContextualCompressionRetriever` | same class, moved | `langchain-classic` |
+| `langchain.agents.create_openai_tools_agent` + `AgentExecutor` | `langchain.agents.create_agent` | `langchain` |
+| `langgraph.prebuilt.create_react_agent` | `langchain.agents.create_agent` (the old name still works, deprecated in LangGraph 1.0) | `langchain` |
+| `langchain_community.vectorstores.*` | provider packages, or `langchain_core.vectorstores.InMemoryVectorStore` for tests | varies |
+
+Headroom's own API did not change across the LangChain 1.0 boundary. `HeadroomChatModel`, `HeadroomChatMessageHistory`, `HeadroomDocumentCompressor` and `wrap_tools_with_headroom` take the same arguments they always did.

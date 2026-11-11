@@ -91,9 +91,9 @@ class BatchContextStore:
 
     Features:
     - TTL-based expiration
-    - Automatic cleanup of expired entries
+    - Expired entries reclaimed before live contexts are evicted at capacity
     - Thread-safe operations
-    - Memory limits
+    - Memory limits; replacing a batch refreshes its TTL without evicting another batch
 
     Usage:
         store = BatchContextStore()
@@ -126,7 +126,6 @@ class BatchContextStore:
         self._ttl = ttl
         self._max_contexts = max_contexts
         self._lock = asyncio.Lock()
-        self._cleanup_task: asyncio.Task | None = None
 
     async def store(self, context: BatchContext) -> None:
         """Store a batch context.
@@ -136,7 +135,7 @@ class BatchContextStore:
         """
         async with self._lock:
             # Enforce memory limit
-            if len(self._contexts) >= self._max_contexts:
+            if context.batch_id not in self._contexts and len(self._contexts) >= self._max_contexts:
                 # Remove oldest entries
                 await self._cleanup_oldest()
 
@@ -206,9 +205,14 @@ class BatchContextStore:
 
     async def _cleanup_oldest(self) -> None:
         """Remove oldest entries to make room for new ones."""
-        # Sort by creation time, remove oldest 10%
-        if not self._contexts:
+        now = time.time()
+        expired = [batch_id for batch_id, ctx in self._contexts.items() if ctx.expires_at < now]
+        for batch_id in expired:
+            del self._contexts[batch_id]
+        if len(self._contexts) < self._max_contexts:
             return
+
+        # Sort remaining live contexts by creation time, remove oldest 10%.
 
         sorted_entries = sorted(
             self._contexts.items(),

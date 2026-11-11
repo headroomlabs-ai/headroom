@@ -182,6 +182,15 @@ class TestHasNonTextParts:
             # turns; previously not detected, so they were dropped on round-trip.
             "executableCode",
             "codeExecutionResult",
+            # The REST API also accepts the proto field names, which Google's
+            # own curl examples use; these were dropped on round-trip too.
+            "inline_data",
+            "file_data",
+            "function_call",
+            "function_response",
+            "executable_code",
+            "code_execution_result",
+            "thought_signature",
         ],
     )
     def test_each_non_text_key_detected(self, proxy, non_text_key):
@@ -193,6 +202,36 @@ class TestHasNonTextParts:
         """Content missing 'parts' key returns False (graceful handling)."""
         content = {"role": "user"}
         assert proxy._has_non_text_parts(content) is False
+
+    def test_snake_case_parts_survive_compression_round_trip(self, proxy):
+        """snake_case image and tool parts are restored after compression rewrites text."""
+        contents = [
+            {
+                "role": "user",
+                "parts": [
+                    {"text": "Describe this image"},
+                    {"inline_data": {"mime_type": "image/png", "data": "iVBORw0KGgo="}},
+                ],
+            },
+            {"role": "model", "parts": [{"function_call": {"name": "lookup", "args": {}}}]},
+            {
+                "role": "user",
+                "parts": [{"function_response": {"name": "lookup", "response": {"r": "ok"}}}],
+            },
+            {"role": "user", "parts": [{"text": "thanks " * 100}]},
+        ]
+        messages, preserved = proxy._gemini_contents_to_messages(contents)
+        assert preserved == {0, 1, 2}
+
+        optimized = [dict(m) for m in messages]
+        optimized[-1]["content"] = "thanks (compressed)"
+        optimized_contents, _ = proxy._messages_to_gemini_contents(optimized)
+        rebuilt = proxy._rebuild_gemini_contents(
+            contents, preserved, {i: contents[i] for i in preserved}, optimized_contents
+        )
+
+        assert rebuilt[:3] == contents[:3]
+        assert rebuilt[3] == {"role": "user", "parts": [{"text": "thanks (compressed)"}]}
 
 
 # =============================================================================

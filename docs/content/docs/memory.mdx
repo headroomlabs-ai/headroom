@@ -86,7 +86,11 @@ response = client2.chat.completions.create(
 
 ## Memory Categories
 
-Each memory carries a free-form `category` string -- pass any label you like. These are the conventional categories Headroom uses for organization and retrieval:
+There is no dedicated `category` field on `Memory` or parameter on `add()`
+(`headroom/memory/models.py`, `headroom/memory/core.py`) -- store a
+free-form category string in the `metadata` dict instead, e.g.
+`metadata={"category": "fact"}`. These are the conventional category values
+used in Headroom's own examples for organization and retrieval:
 
 | Category | Description | Examples |
 |----------|-------------|----------|
@@ -122,9 +126,10 @@ all_memories = client.memory.get_all()
 client.memory.clear()
 
 # Get stats
+# `stats()` currently returns only {"total": N} -- there is no
+# per-category breakdown (`headroom/memory/wrapper.py:342-348`).
 stats = client.memory.stats()
 print(f"Total memories: {stats['total']}")
-print(f"By category: {stats['categories']}")
 ```
 
 ## Temporal Versioning
@@ -137,10 +142,12 @@ from headroom.memory import HierarchicalMemory, MemoryFilter
 memory = await HierarchicalMemory.create()
 
 # Original fact
+# `category` is a convention, not a keyword argument -- `add()` has no
+# `category` param (`headroom/memory/core.py`); store it in `metadata`.
 orig = await memory.add(
     content="User works at Google",
     user_id="alice",
-    category="fact",
+    metadata={"category": "fact"},
 )
 
 # User changes jobs -- supersede the old memory
@@ -240,6 +247,45 @@ config = MemoryConfig(
     cache_max_size=1000,
 )
 ```
+
+### Direct Mem0 / Qdrant payload (mem0 2.x)
+
+The `qdrant-neo4j` backend (`DirectMem0Adapter`) writes facts straight into Qdrant so Mem0 can skip its extra LLM extraction. mem0ai 2.x search (`Memory.search` → `_search_vector_store`) **skips any point whose payload has no `data` field**. New writes store the fact under both:
+
+- `data` — required for mem0 2.x search
+- `memory` — legacy alias for older payload readers
+
+Existing collections written before this contract only have `memory`. Those points still sit in Qdrant, but `search_memories` returns nothing for them until you copy `memory` onto `data`:
+
+```python
+from qdrant_client import QdrantClient
+
+client = QdrantClient(...)  # same URL/host as Headroom
+collection = "headroom_memories"  # Mem0Config.collection_name
+offset = None
+while True:
+    points, offset = client.scroll(
+        collection_name=collection,
+        with_payload=True,
+        limit=100,
+        offset=offset,
+    )
+    updates = []
+    for point in points:
+        payload = point.payload or {}
+        if payload.get("data") or not payload.get("memory"):
+            continue
+        updates.append(point.id)
+        client.set_payload(
+            collection_name=collection,
+            payload={"data": payload["memory"]},
+            points=[point.id],
+        )
+    if offset is None:
+        break
+```
+
+Run this once per collection after upgrading. New saves already write `data` and do not need a second pass.
 
 ## Provider Compatibility
 

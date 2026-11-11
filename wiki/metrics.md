@@ -29,7 +29,9 @@ curl http://localhost:8787/stats
     "total": 42,
     "cached": 5,
     "rate_limited": 0,
-    "failed": 0
+    "rate_limited_by_source": { "headroom": 0, "upstream": 0 },
+    "failed": 0,
+    "failed_by_provider": {}
   },
   "tokens": {
     "input": 50000,
@@ -48,6 +50,14 @@ curl http://localhost:8787/stats
 }
 ```
 
+`requests.total` is the **completed**-request count, not total traffic: a request that
+ended in a 4xx, 5xx or 429 is counted under `requests.failed` or `requests.rate_limited`
+instead and never reaches `total`. `rate_limited_by_source` splits 429s into
+`headroom` (Headroom's own rate limiter refused the request) and `upstream` (the provider
+refused it) — different problems, different fixes. `failed_by_provider` attributes failures
+to the upstream that produced them. The unlabelled `rate_limited` / `failed` totals are
+unchanged.
+
 `/stats` keeps the existing live/session fields, including `savings_history`,
 for backward compatibility. The new `persistent_savings` block is durable local
 proxy compression history stored by default at
@@ -57,14 +67,12 @@ Use `HEADROOM_SAVINGS_PATH` to override the file location directly, or
 set `HEADROOM_WORKSPACE_DIR` to relocate the entire state root. See the
 [Filesystem Contract](filesystem-contract.md) for details.
 
-> **`compression_savings_usd` needs LiteLLM (Python 3.13).** Dollar figures are
-> priced entirely from LiteLLM's cost tables, and LiteLLM can't be installed on
-> Python 3.14+. On 3.14 the token counts are unaffected but every USD field
-> (and the dashboard's *Proxy $ Saved* tile) reads `0`. `/stats` exposes a
-> top-level `"litellm_available"` boolean so clients can tell "genuinely $0"
-> apart from "pricing unavailable"; the dashboard uses it to prompt a reinstall
-> on 3.13 (`pipx reinstall headroom-ai --python python3.13`) rather than showing
-> a misleading `$0.00`.
+> **`compression_savings_usd` needs LiteLLM.** Dollar figures are priced
+> entirely from LiteLLM's cost tables. LiteLLM is a core dependency on every
+> supported Python (3.10 to 3.14); if it is missing from the environment, token
+> counts are unaffected but every USD field (and the dashboard's *Proxy $ Saved*
+> tile) reads `0`. `/stats` exposes a top-level `"litellm_available"` boolean so
+> clients can tell "genuinely $0" apart from "pricing unavailable".
 
 For Anthropic-style providers that return cache-write TTL buckets, `/stats`
 also surfaces observed cache TTL usage under `prefix_cache`:

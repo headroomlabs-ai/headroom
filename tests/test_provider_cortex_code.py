@@ -97,3 +97,10 @@ def test_cortex_code_install_registry_unknown_target_skipped() -> None:
     )
     assert "unknown-tool" not in result
     assert "cortex-code" in result
+
+
+def test_cortex_code_default_api_url_only_trusts_snowflake_suffix() -> None:
+    # The domain must end the host, not merely appear somewhere in it.
+    url = default_api_url({"SNOWFLAKE_HOST": "acct.snowflakecomputing.com.evil.io"})
+    assert url != "https://acct.snowflakecomputing.com.evil.io"
+    assert url.endswith(".snowflakecomputing.com")

@@ -81,6 +81,63 @@ class TestMustKeepRegex:
         assert not _KOMPRESS_MUST_KEEP_RE.search("process")
         assert not _KOMPRESS_MUST_KEEP_RE.search("raised")
 
+    def test_boolean_connectives(self):
+        assert _KOMPRESS_MUST_KEEP_RE.search("or")
+        assert _KOMPRESS_MUST_KEEP_RE.search("and")
+        assert _KOMPRESS_MUST_KEEP_RE.search("nor")
+        assert _KOMPRESS_MUST_KEEP_RE.search("xor")
+        assert _KOMPRESS_MUST_KEEP_RE.search("or,")
+        assert _KOMPRESS_MUST_KEEP_RE.search("(and)")
+        # Tokens that merely contain a connective are not connectives.
+        for word in ("orange", "random", "android", "core", "sort", "concat", "node"):
+            assert not _KOMPRESS_MUST_KEEP_RE.search(word), word
+
+
+class TestBooleanConnectivesCompression:
+    """`and`/`or` hold a condition together, so dropping one changes the
+    predicate rather than degrading the sentence. Issue #3545 measured 12 of 40
+    `or` lost from a repeated Python return line on the released compressor,
+    while `not` from the very same line survived because negation is already
+    pinned -- the result still reads as a line of Python and nothing marks it
+    as altered."""
+
+    CODE = 'return name == "__init__" or not name.startswith("_") alpha beta gamma delta'
+
+    def _compress(self, monkeypatch, env):
+        _install_fake_kompress(monkeypatch)
+        if env:
+            monkeypatch.delenv(_KOMPRESS_MUST_KEEP_ENV, raising=False)
+        else:
+            monkeypatch.setenv(_KOMPRESS_MUST_KEEP_ENV, "0")
+        compressor = KompressCompressor(KompressConfig(enable_ccr=False, min_input_words=10))
+        monkeypatch.setattr(compressor, "_should_batch_single_content", lambda *a, **k: False)
+        return compressor.compress(self.CODE)
+
+    def test_keeps_both_operands_of_a_negated_disjunction(self, monkeypatch):
+        kept = self._compress(monkeypatch, env=True).compressed.split()
+        assert "not" in kept
+        assert "or" in kept
+
+    def test_batch_path_keeps_connectives_too(self, monkeypatch):
+        _install_fake_kompress(monkeypatch)
+        monkeypatch.delenv(_KOMPRESS_MUST_KEEP_ENV, raising=False)
+        compressor = KompressCompressor(KompressConfig(enable_ccr=False, min_input_words=10))
+        monkeypatch.setattr(compressor, "_should_use_sequential_fallback", lambda: False)
+
+        [result] = compressor.compress_batch(
+            ["alpha beta gamma delta epsilon zeta eta theta iota kappa one and two or three"],
+            batch_size=8,
+        )
+
+        kept = result.compressed.split()
+        assert "and" in kept
+        assert "or" in kept
+
+    def test_disabling_must_keep_leaves_the_connective_to_the_model(self, monkeypatch):
+        kept = self._compress(monkeypatch, env=False).compressed.split()
+        assert "or" not in kept
+        assert "not" not in kept
+
 
 class TestMustKeepEnvVar:
     def test_env_var_name(self):
@@ -135,3 +192,127 @@ class TestMustKeepCompression:
         )
 
         assert result.compressed.split() == ["alpha", "0x7fff2038"]
+
+
+class _TruncatingTok:
+    """Tokenizer that models ``truncation=True, max_length=512``.
+
+    Every word costs ``tokens_per_word`` tokens, which is how a chunk of
+    token-heavy words (logs, IDs, paths, numbers) runs past the token limit
+    before its word budget is used up. Words past the limit get no
+    ``word_id`` at all, exactly as the real tokenizer reports them. The cut
+    can also land inside a word: that word keeps the tokens that fit and
+    the rest of it never reaches the tokenizer.
+    """
+
+    def __init__(self, tokens_per_word: int = 1, max_length: int = 512):
+        self.tokens_per_word = tokens_per_word
+        self.max_length = max_length
+
+    def __call__(self, chunk_words, **kw):
+        batch_words = (
+            chunk_words if (chunk_words and isinstance(chunk_words[0], list)) else [chunk_words]
+        )
+        word_ids = []
+        for words in batch_words:
+            ids: list[int] = []
+            used = 0
+            for idx in range(len(words)):
+                room = self.max_length - used
+                if room <= 0:
+                    break
+                take = min(self.tokens_per_word, room)
+                ids.extend([idx] * take)
+                used += take
+            word_ids.append(ids)
+        return _Enc(
+            input_ids=[[0] * len(ids) for ids in word_ids],
+            attention_mask=[[1] * len(ids) for ids in word_ids],
+            _word_ids=word_ids,
+        )
+
+
+class TestTruncatedWordsCompression:
+    """Words past the tokenizer's 512-token cut are never dropped unseen (#4309).
+
+    Chunks are cut by words (``chunk_words``) but tokenized with
+    ``truncation=True, max_length=512``. A chunk of token-heavy words hits
+    the token limit well before its word budget, so the tail of the chunk had
+    no score and was dropped silently from the default proxy path
+    (``target_ratio=None``). The sequential path now scores that tail as the
+    next window and the model's decision on it stands; the batch path builds
+    its chunks before tokenizing, so it keeps the tail verbatim instead.
+    """
+
+    # One chunk is `chunk_words` words long, so 350 words is exactly one.
+    CHUNK_WORDS = 350
+
+    def _words(self, count: int) -> list[str]:
+        return [f"word{i}" for i in range(count)]
+
+    def _install(self, monkeypatch, tokens_per_word):
+        monkeypatch.setattr(
+            kc,
+            "_load_kompress",
+            lambda *a, **k: (_Model(), _TruncatingTok(tokens_per_word), "onnx"),
+        )
+        monkeypatch.setattr(kc, "_model_device_type", lambda *a, **k: "cpu")
+        monkeypatch.delenv(_KOMPRESS_MUST_KEEP_ENV, raising=False)
+
+    def _compress(self, monkeypatch, tokens_per_word):
+        self._install(monkeypatch, tokens_per_word)
+        words = self._words(self.CHUNK_WORDS)
+        compressor = KompressCompressor(KompressConfig(enable_ccr=False, min_input_words=10))
+        monkeypatch.setattr(compressor, "_should_batch_single_content", lambda *a, **k: False)
+        kept = compressor.compress(" ".join(words)).compressed.split()
+        return kept, words
+
+    def test_words_past_the_truncation_point_are_scored(self, monkeypatch):
+        # Two tokens per word: the 350-word chunk needs 700 tokens, so the
+        # tokenizer cuts it at 512. Words 0-254 are scored in the first
+        # window; word 255 (the cut may have split it) and the 94 the
+        # tokenizer never saw start the next window. The fake model keeps the
+        # first word of each window, so the second window's decision decides
+        # their fate, not a blanket keep.
+        kept, words = self._compress(monkeypatch, tokens_per_word=2)
+        assert kept == [words[0], words[255]]
+
+    def test_the_word_the_cut_landed_in_is_scored_whole(self, monkeypatch):
+        # Three tokens per word: the cut at 512 falls inside word 170, whose
+        # last token never reached the tokenizer. The model only saw part of
+        # that word, so it is not judged there: it opens the next window and
+        # is scored whole. That window is cut inside word 340 the same way,
+        # and the last ten words fit in a third.
+        kept, words = self._compress(monkeypatch, tokens_per_word=3)
+        assert kept == [words[0], words[170], words[340]]
+
+    def test_fully_covered_chunk_is_unchanged(self, monkeypatch):
+        # One token per word: the chunk fits in 512 tokens, so nothing was
+        # truncated and the model's own choice stands. It kept the first word
+        # and dropped the rest.
+        kept, words = self._compress(monkeypatch, tokens_per_word=1)
+        assert kept == [words[0]]
+
+    def test_batch_path_keeps_truncated_words_too(self, monkeypatch):
+        self._install(monkeypatch, 2)
+        words = self._words(self.CHUNK_WORDS)
+        compressor = KompressCompressor(KompressConfig(enable_ccr=False, min_input_words=10))
+        monkeypatch.setattr(compressor, "_should_use_sequential_fallback", lambda: False)
+
+        [result] = compressor.compress_batch([" ".join(words)], batch_size=8)
+
+        assert result.compressed.split() == [words[0]] + words[255:]
+
+    def test_a_forced_ratio_still_gets_its_budget(self, monkeypatch):
+        # A forced ratio selects scored words within each token window.
+        self._install(monkeypatch, 2)
+        words = self._words(self.CHUNK_WORDS)
+        compressor = KompressCompressor(KompressConfig(enable_ccr=False, min_input_words=10))
+        monkeypatch.setattr(compressor, "_should_batch_single_content", lambda *a, **k: False)
+
+        kept = compressor.compress(" ".join(words), target_ratio=0.5).compressed.split()
+
+        # Main now scores the formerly unseen tail in another window.
+        # Windows score 255 and 95 complete words, each applying the
+        # requested ratio independently with rounding down (127 + 47).
+        assert kept == words[:127] + words[255:302]

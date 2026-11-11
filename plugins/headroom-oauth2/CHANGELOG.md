@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.1.1
+
+- Inject the upstream bearer only on requests that go upstream. Local routes
+  (`/health`, `/stats*`, `/metrics`, `/v1/compress*`, `/ext/*`, …; see README)
+  are passed through untouched, so an unreachable IdP no longer 502s health
+  probes and management calls no longer mint tokens. `/p/<project>/` prefixes
+  are stripped first.
+- Startup log carries `scheme://host` of the token URL and the mint log a scope
+  count, instead of the full URL and scope list.
+- Requires `headroom-ai` ≥ 0.40 (extension middleware inside the proxy-token gate).
+
 ## 0.1.0
 
 Initial release — generic OAuth2 client-credentials upstream-auth extension for the Headroom proxy.

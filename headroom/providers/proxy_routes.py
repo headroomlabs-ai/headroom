@@ -4,20 +4,24 @@
 from __future__ import annotations
 
 import logging
+import os
 from typing import Any
 
 from fastapi import FastAPI, HTTPException, Request, WebSocket
 from fastapi.responses import Response
 
+from headroom.log_safety import redact_url
 from headroom.providers.cloudcode import normalize_cloudcode_passthrough_path
 from headroom.providers.codex.endpoints import codex_backend_url
 from headroom.providers.codex.headers import drop_header
 from headroom.providers.codex.live import (
     CODEX_LIVE_ROUTE_PATHS,
+    handle_codex_live_http,
     handle_codex_live_websocket,
 )
 from headroom.providers.codex.responses import handle_chatgpt_codex_responses_subpath
 from headroom.providers.codex.runtime import resolve_codex_routing
+from headroom.providers.hermes import SCOPED_PATH_PREFIXES as HERMES_SCOPED_PATH_PREFIXES
 from headroom.providers.model_metadata import (
     MODEL_METADATA_LIST_ENDPOINT,
     handle_model_metadata_endpoint,
@@ -37,6 +41,9 @@ from headroom.providers.openai_responses import (
 )
 from headroom.providers.proxy_targets import (
     api_target as _api_target,
+)
+from headroom.providers.proxy_targets import (
+    openai_compatible_base_url as _openai_compatible_base_url,
 )
 from headroom.providers.proxy_targets import (
     select_passthrough_base_url as _select_passthrough_base_url,
@@ -62,6 +69,7 @@ from headroom.providers.vertex import (
     is_vertex_google_publisher,
     vertex_anthropic_target,
     vertex_publisher_provider_name,
+    with_vertex_diagnostics,
 )
 from headroom.proxy.passthrough import (
     custom_base_passthrough_telemetry as _custom_base_passthrough_telemetry,
@@ -104,6 +112,30 @@ def _register_provider_passthrough_route(
     spec: ProviderPassthroughRoute,
 ) -> None:
     async def provider_passthrough(request: Request):
+        # A reachability probe the token gate let through without a credential
+        # (/api/hello): answer it here, never relay it upstream anonymously.
+        if getattr(request.state, "headroom_local_hello_probe", False):
+            return Response(status_code=200)
+
+        # Honor the per-request upstream override like /v1/messages and the
+        # catch-all do. Clients that speak one wire format but authenticate
+        # against a custom OpenAI-compatible gateway must reach that gateway
+        # for embeddings/audio/metadata too, not the default provider target
+        # (the same gap as the model-metadata routes, #4302). Telemetry keeps
+        # the route spec labels: they are bounded by this module, so the
+        # request-controlled host never becomes a stats label (#3759), while
+        # `handle_passthrough` still records the outcome for these known routes.
+        custom_base = request.headers.get("x-headroom-base-url", "").strip()
+        if custom_base:
+            if not await is_safe_upstream_url_async(custom_base):
+                logger.warning("rejecting unsafe x-headroom-base-url: %r", custom_base)
+                raise HTTPException(status_code=400, detail="Rejected unsafe upstream base URL")
+            return await proxy.handle_passthrough(
+                request,
+                custom_base.rstrip("/"),
+                spec.sub_path,
+                spec.provider_name,
+            )
         return await proxy.handle_passthrough(
             request,
             _api_target(proxy, spec.provider_name),
@@ -130,14 +162,21 @@ def _register_provider_handler_route(app: FastAPI, proxy: Any, spec: ProviderHan
         model: str = "",
     ):
         handler = getattr(proxy, spec.handler_name)
+        handler_kwargs: dict[str, str] = {}
+        custom_base = request.headers.get("x-headroom-base-url", "").strip()
+        if custom_base and spec.supports_custom_base_url:
+            if not await is_safe_upstream_url_async(custom_base):
+                logger.warning("rejecting unsafe x-headroom-base-url: %r", custom_base)
+                raise HTTPException(status_code=400, detail="Rejected unsafe upstream base URL")
+            handler_kwargs["upstream_base_url"] = custom_base.rstrip("/")
         if spec.path_param is None:
-            return await handler(request)
+            return await handler(request, **handler_kwargs)
         path_args = {
             "batch_id": batch_id,
             "batch_name": batch_name,
             "model": model,
         }
-        return await handler(request, path_args[spec.path_param])
+        return await handler(request, path_args[spec.path_param], **handler_kwargs)
 
     provider_handler.__name__ = (
         spec.handler_name.replace("handle_", "")
@@ -176,9 +215,9 @@ def _register_openai_responses_subpath_route(
     spec: OpenAIResponsesSubpathRoute,
 ) -> None:
     async def openai_responses_subpath(request: Request, sub_path: str):
-        assert proxy.http_client is not None
+        codex_subpath_client = getattr(proxy, "http_client_h1", None) or proxy.http_client
         chatgpt_response = await handle_chatgpt_codex_responses_subpath(
-            proxy.http_client,
+            codex_subpath_client,
             request,
             sub_path,
         )
@@ -212,6 +251,25 @@ def _register_openai_responses_routes(app: FastAPI, proxy: Any) -> None:
 
 def _register_codex_live_routes(app: FastAPI, proxy: Any) -> None:
     for path in CODEX_LIVE_ROUTE_PATHS:
+
+        async def codex_live_http(request: Request, route_path: str = path):
+            response = await handle_codex_live_http(
+                request,
+                proxy.http_client,
+                _api_target(proxy, "openai"),
+                route_path,
+            )
+            if response is not None:
+                return response
+            return await proxy.handle_passthrough(
+                request,
+                _api_target(proxy, "openai"),
+                route_path,
+                "openai",
+            )
+
+        codex_live_http.__name__ = path.strip("/").replace("/", "_") + "_live_http"
+        app.post(path)(codex_live_http)
 
         def register_websocket_route(route_path: str) -> None:
             async def codex_live_websocket(websocket: WebSocket):
@@ -251,271 +309,12 @@ def _register_openai_image_routes(app: FastAPI, proxy: Any) -> None:
 def register_provider_routes(app: FastAPI, proxy: Any) -> None:
     """Register provider-specific proxy endpoints."""
 
-    async def vertex_publisher_passthrough(request: Request, publisher: str, action: str):
-        return await proxy.handle_passthrough(
-            request,
-            _api_target(proxy, "vertex"),
-            action,
-            vertex_publisher_provider_name(publisher),
-        )
+    async def _default_passthrough(request: Request, path: str):
+        """Catch-all forwarding for paths no provider route claims.
 
-    @app.post("/v1/messages")
-    async def anthropic_messages(request: Request):
-        # Honor the per-request upstream override so clients that speak the
-        # Anthropic Messages wire format but authenticate against a
-        # non-Anthropic gateway route correctly, consistent with the
-        # OpenAI-compatible and generic passthrough routes.
-        custom_base = request.headers.get("x-headroom-base-url", "").strip()
-        if custom_base:
-            if not await is_safe_upstream_url_async(custom_base):
-                logger.warning("rejecting unsafe x-headroom-base-url: %r", custom_base)
-                raise HTTPException(status_code=400, detail="Rejected unsafe upstream base URL")
-            return await proxy.handle_anthropic_messages(
-                request, upstream_base_url=custom_base.rstrip("/")
-            )
-        return await proxy.handle_anthropic_messages(request)
-
-    @app.post("/anthropic/v1/messages")
-    async def foundry_anthropic_messages(request: Request):
-        normalize_request_path(request, "/v1/messages")
-        return await proxy.handle_anthropic_messages(request, _api_target(proxy, "anthropic"))
-
-    # AWS Bedrock InvokeModel passthrough. Registered ONLY when an upstream is
-    # configured (`--bedrock-api-url` / BEDROCK_TARGET_API_URL): without it,
-    # `/model/{id}/invoke` keeps falling through to the catch-all (verbatim,
-    # signature-intact) so existing behavior is unchanged. The `{model_id:path}`
-    # converter captures inference-profile ids that contain dots, colons and
-    # slashes (e.g. `us.anthropic.claude-sonnet-4-5-20250929-v1:0`). See
-    # headroom/proxy/handlers/bedrock.py for the SigV4 caveat.
-    if getattr(proxy.config, "bedrock_api_url", None):
-
-        @app.post("/model/{model_id:path}/invoke")
-        async def bedrock_invoke(request: Request, model_id: str):
-            return await proxy.handle_bedrock_invoke(request, model_id, stream=False)
-
-        @app.post("/model/{model_id:path}/invoke-with-response-stream")
-        async def bedrock_invoke_stream(request: Request, model_id: str):
-            return await proxy.handle_bedrock_invoke(request, model_id, stream=True)
-
-    _register_openai_responses_routes(app, proxy)
-
-    _register_provider_handler_routes(app, proxy)
-
-    @app.post(
-        "/{api_version}/projects/{project}/locations/{location}/publishers/{publisher}/models/{model}:generateContent"
-    )
-    async def vertex_generate_content(
-        request: Request,
-        api_version: str,
-        project: str,
-        location: str,
-        publisher: str,
-        model: str,
-    ):
-        del api_version, project
-        if is_vertex_google_publisher(publisher):
-            return await proxy.handle_gemini_generate_content(
-                request,
-                model,
-                _vertex_target_for_location(proxy, location),
-                VERTEX_GOOGLE_PROVIDER_NAME,
-            )
-        return await vertex_publisher_passthrough(request, publisher, VERTEX_GENERATE_CONTENT.name)
-
-    @app.post(
-        "/{api_version}/projects/{project}/locations/{location}/publishers/{publisher}/models/{model}:streamGenerateContent"
-    )
-    async def vertex_stream_generate_content(
-        request: Request,
-        api_version: str,
-        project: str,
-        location: str,
-        publisher: str,
-        model: str,
-    ):
-        del api_version, project
-        if is_vertex_google_publisher(publisher):
-            return await proxy.handle_gemini_generate_content(
-                request,
-                model,
-                _vertex_target_for_location(proxy, location),
-                VERTEX_GOOGLE_PROVIDER_NAME,
-            )
-        return await vertex_publisher_passthrough(
-            request,
-            publisher,
-            VERTEX_STREAM_GENERATE_CONTENT.name,
-        )
-
-    @app.post(
-        "/{api_version}/projects/{project}/locations/{location}/publishers/{publisher}/models/{model}:countTokens"
-    )
-    async def vertex_count_tokens(
-        request: Request,
-        api_version: str,
-        project: str,
-        location: str,
-        publisher: str,
-        model: str,
-    ):
-        del api_version, project
-        if is_vertex_google_publisher(publisher):
-            return await proxy.handle_gemini_count_tokens(
-                request,
-                model,
-                _vertex_target_for_location(proxy, location),
-                VERTEX_GOOGLE_PROVIDER_NAME,
-            )
-        return await vertex_publisher_passthrough(request, publisher, VERTEX_COUNT_TOKENS.name)
-
-    @app.post(
-        "/{api_version}/projects/{project}/locations/{location}/publishers/{publisher}/models/{model}:rawPredict"
-    )
-    async def vertex_raw_predict(
-        request: Request,
-        api_version: str,
-        project: str,
-        location: str,
-        publisher: str,
-        model: str,
-    ):
-        del api_version, project
-        if is_vertex_anthropic_publisher(publisher):
-            return await proxy.handle_anthropic_messages(
-                request,
-                _vertex_target_for_location(proxy, location),
-                VERTEX_ANTHROPIC_PROVIDER_NAME,
-                model,
-            )
-        return await vertex_publisher_passthrough(request, publisher, VERTEX_RAW_PREDICT.name)
-
-    @app.post(
-        "/projects/{project}/locations/{location}/publishers/{publisher}/models/{model}:rawPredict"
-    )
-    async def vertex_raw_predict_no_version(
-        request: Request,
-        project: str,
-        location: str,
-        publisher: str,
-        model: str,
-    ):
-        if is_vertex_anthropic_publisher(publisher):
-            del project
-            target = vertex_anthropic_target(
-                _vertex_target_for_location(proxy, location),
-                versionless_route=True,
-            )
-            return await proxy.handle_anthropic_messages(
-                request,
-                target,
-                VERTEX_ANTHROPIC_PROVIDER_NAME,
-                model,
-            )
-        return await vertex_publisher_passthrough(request, publisher, VERTEX_RAW_PREDICT.name)
-
-    @app.post(
-        "/{api_version}/projects/{project}/locations/{location}/publishers/{publisher}/models/{model}:streamRawPredict"
-    )
-    async def vertex_stream_raw_predict(
-        request: Request,
-        api_version: str,
-        project: str,
-        location: str,
-        publisher: str,
-        model: str,
-    ):
-        del api_version, project
-        if is_vertex_anthropic_publisher(publisher):
-            return await proxy.handle_anthropic_messages(
-                request,
-                _vertex_target_for_location(proxy, location),
-                VERTEX_ANTHROPIC_PROVIDER_NAME,
-                model,
-                VERTEX_STREAM_RAW_PREDICT.force_stream,
-            )
-        return await vertex_publisher_passthrough(
-            request,
-            publisher,
-            VERTEX_STREAM_RAW_PREDICT.name,
-        )
-
-    @app.post(
-        "/projects/{project}/locations/{location}/publishers/{publisher}/models/{model}:streamRawPredict"
-    )
-    async def vertex_stream_raw_predict_no_version(
-        request: Request,
-        project: str,
-        location: str,
-        publisher: str,
-        model: str,
-    ):
-        if is_vertex_anthropic_publisher(publisher):
-            del project
-            target = vertex_anthropic_target(
-                _vertex_target_for_location(proxy, location),
-                versionless_route=True,
-            )
-            return await proxy.handle_anthropic_messages(
-                request,
-                target,
-                VERTEX_ANTHROPIC_PROVIDER_NAME,
-                model,
-                VERTEX_STREAM_RAW_PREDICT.force_stream,
-            )
-        return await vertex_publisher_passthrough(
-            request,
-            publisher,
-            VERTEX_STREAM_RAW_PREDICT.name,
-        )
-
-    @app.get("/v1/models")
-    async def list_models(request: Request):
-        provider_name = proxy.provider_runtime.model_metadata_provider(dict(request.headers))
-        return await handle_model_metadata_endpoint(
-            proxy,
-            request,
-            endpoint=MODEL_METADATA_LIST_ENDPOINT,
-            provider_api_base_url=_api_target(proxy, provider_name),
-            provider_name=provider_name,
-        )
-
-    @app.get("/v1/models/{model_id}")
-    async def get_model(request: Request, model_id: str):
-        provider_name = proxy.provider_runtime.model_metadata_provider(dict(request.headers))
-        return await handle_model_metadata_endpoint(
-            proxy,
-            request,
-            endpoint=model_metadata_get_endpoint(model_id),
-            provider_api_base_url=_api_target(proxy, provider_name),
-            provider_name=provider_name,
-        )
-
-    @app.post("/v1/alpha/search")
-    async def codex_alpha_search(request: Request):
-        chatgpt_response = await _handle_chatgpt_codex_alpha_search(request, proxy)
-        if chatgpt_response is not None:
-            return chatgpt_response
-        # This route resolves a caller-named upstream like the catch-all does,
-        # so it needs the same rejection. Without it a client could point the
-        # proxy at loopback/RFC1918/cloud-metadata and read the response back
-        # (CVE-2026-77775).
-        custom_base = request.headers.get("x-headroom-base-url", "").strip()
-        if custom_base and not await is_safe_upstream_url_async(custom_base):
-            logger.warning("rejecting unsafe x-headroom-base-url: %r", custom_base)
-            raise HTTPException(status_code=400, detail="Rejected unsafe upstream base URL")
-        return await proxy.handle_passthrough(
-            request,
-            _select_passthrough_base_url(proxy, dict(request.headers)),
-        )
-
-    _register_openai_image_routes(app, proxy)
-
-    _register_codex_live_routes(app, proxy)
-
-    _register_provider_passthrough_routes(app, proxy)
-
-    @app.api_route("/{path:path}", methods=["GET", "POST", "PUT", "DELETE", "HEAD"])
-    async def passthrough(request: Request, path: str):
+        ``path`` is the request path without its leading slash, as the
+        ``/{path:path}`` catch-all captures it.
+        """
         custom_base = request.headers.get("x-headroom-base-url")
         if custom_base:
             if not await is_safe_upstream_url_async(custom_base):
@@ -549,3 +348,354 @@ def register_provider_routes(app: FastAPI, proxy: Any) -> None:
             # Copilot's inline completions are one of them (#3076).
             _select_passthrough_base_url(proxy, dict(request.headers), request.url.path),
         )
+
+    async def vertex_publisher_passthrough(request: Request, publisher: str, action: str):
+        return await proxy.handle_passthrough(
+            request,
+            _api_target(proxy, "vertex"),
+            action,
+            vertex_publisher_provider_name(publisher),
+        )
+
+    @app.post("/v1/messages")
+    async def anthropic_messages(request: Request):
+        # Honor the per-request upstream override so clients that speak the
+        # Anthropic Messages wire format but authenticate against a
+        # non-Anthropic gateway route correctly, consistent with the
+        # OpenAI-compatible and generic passthrough routes.
+        custom_base = request.headers.get("x-headroom-base-url", "").strip()
+        if custom_base:
+            if not await is_safe_upstream_url_async(custom_base):
+                logger.warning("rejecting unsafe x-headroom-base-url: %r", custom_base)
+                raise HTTPException(status_code=400, detail="Rejected unsafe upstream base URL")
+            return await proxy.handle_anthropic_messages(
+                request, upstream_base_url=custom_base.rstrip("/")
+            )
+        return await proxy.handle_anthropic_messages(request)
+
+    @app.post("/omlx/v1/messages")
+    async def omlx_messages(request: Request):
+        from headroom.config import resolve_omlx_target_api_url
+
+        omlx_target = (
+            getattr(proxy.config, "omlx_target_api_url", None)
+            or resolve_omlx_target_api_url(environ=os.environ)
+            or "http://127.0.0.1:8888"
+        )
+        return await proxy.handle_anthropic_messages(
+            request, upstream_base_url=omlx_target.rstrip("/")
+        )
+
+    @app.post("/anthropic/v1/messages")
+    async def foundry_anthropic_messages(request: Request):
+        normalize_request_path(request, "/v1/messages")
+        return await proxy.handle_anthropic_messages(request, _api_target(proxy, "anthropic"))
+
+    # AWS Bedrock InvokeModel passthrough. Registered ONLY when an upstream is
+    # configured (`--bedrock-api-url` / BEDROCK_TARGET_API_URL): without it,
+    # `/model/{id}/invoke` keeps falling through to the catch-all (verbatim,
+    # signature-intact) so existing behavior is unchanged. The `{model_id:path}`
+    # converter captures inference-profile ids that contain dots, colons and
+    # slashes (e.g. `us.anthropic.claude-sonnet-4-5-20250929-v1:0`). See
+    # headroom/proxy/handlers/bedrock.py for the SigV4 caveat.
+    if getattr(proxy.config, "bedrock_api_url", None):
+
+        @app.post("/model/{model_id:path}/invoke")
+        async def bedrock_invoke(request: Request, model_id: str):
+            return await proxy.handle_bedrock_invoke(request, model_id, stream=False)
+
+        @app.post("/model/{model_id:path}/invoke-with-response-stream")
+        async def bedrock_invoke_stream(request: Request, model_id: str):
+            return await proxy.handle_bedrock_invoke(request, model_id, stream=True)
+
+    # Factory Droid. Registered ONLY when an upstream is configured
+    # (`--factory-api-url` / FACTORY_TARGET_API_URL, set by `headroom wrap
+    # droid`). Droid sends everything under `/api/`; nothing outside `/api/`
+    # ever goes to Factory, so another tool still pointed at this port (a
+    # leftover Codex/Claude config) keeps its usual upstream and its
+    # credentials never reach Factory.
+    factory_api_url = getattr(proxy.config, "factory_api_url", None)
+    if factory_api_url:
+        factory_base = factory_api_url.rstrip("/")
+
+        @app.post("/api/llm/a/v1/messages")
+        async def factory_anthropic_messages(request: Request):
+            # Anthropic-shaped inference: compressed, then forwarded to
+            # `{factory}/api/llm/a/v1/messages`. A client-sent
+            # `x-headroom-base-url` is deliberately ignored (the handler strips
+            # `x-headroom-*`), and Factory is not a trusted host, so operator
+            # Anthropic extra headers are withheld. `force_direct` keeps a
+            # configured translating backend or route advice from taking it.
+            return await proxy.handle_anthropic_messages(
+                request,
+                upstream_base_url=factory_base,
+                provider_name="factory",
+                force_direct=True,
+            )
+
+        @app.api_route(
+            "/api/{path:path}", methods=["GET", "POST", "PUT", "PATCH", "DELETE", "HEAD"]
+        )
+        async def factory_passthrough(request: Request, path: str):
+            # Hermes Studio's scoped proxies and callers that name their own
+            # upstream are not Droid traffic: keep the catch-all behaviour.
+            if request.headers.get(
+                "x-headroom-base-url", ""
+            ).strip() or request.url.path.startswith(HERMES_SCOPED_PATH_PREFIXES):
+                return await _default_passthrough(request, request.url.path[1:])
+            # Factory REST (and, for now, OpenAI-shaped `/api/llm/o/*`):
+            # verbatim and buffered, even with `compress_passthrough` on. No
+            # endpoint name, so no LLM telemetry.
+            return await proxy.handle_passthrough(
+                request, factory_base, None, "factory", verbatim=True
+            )
+
+    _register_openai_responses_routes(app, proxy)
+
+    _register_provider_handler_routes(app, proxy)
+
+    @app.post(
+        "/{api_version}/projects/{project}/locations/{location}/publishers/{publisher}/models/{model}:generateContent"
+    )
+    @with_vertex_diagnostics
+    async def vertex_generate_content(
+        request: Request,
+        api_version: str,
+        project: str,
+        location: str,
+        publisher: str,
+        model: str,
+    ):
+        del api_version, project
+        if is_vertex_google_publisher(publisher):
+            return await proxy.handle_gemini_generate_content(
+                request,
+                model,
+                _vertex_target_for_location(proxy, location),
+                VERTEX_GOOGLE_PROVIDER_NAME,
+            )
+        return await vertex_publisher_passthrough(request, publisher, VERTEX_GENERATE_CONTENT.name)
+
+    @app.post(
+        "/{api_version}/projects/{project}/locations/{location}/publishers/{publisher}/models/{model}:streamGenerateContent"
+    )
+    @with_vertex_diagnostics
+    async def vertex_stream_generate_content(
+        request: Request,
+        api_version: str,
+        project: str,
+        location: str,
+        publisher: str,
+        model: str,
+    ):
+        del api_version, project
+        if is_vertex_google_publisher(publisher):
+            return await proxy.handle_gemini_generate_content(
+                request,
+                model,
+                _vertex_target_for_location(proxy, location),
+                VERTEX_GOOGLE_PROVIDER_NAME,
+            )
+        return await vertex_publisher_passthrough(
+            request,
+            publisher,
+            VERTEX_STREAM_GENERATE_CONTENT.name,
+        )
+
+    @app.post(
+        "/{api_version}/projects/{project}/locations/{location}/publishers/{publisher}/models/{model}:countTokens"
+    )
+    @with_vertex_diagnostics
+    async def vertex_count_tokens(
+        request: Request,
+        api_version: str,
+        project: str,
+        location: str,
+        publisher: str,
+        model: str,
+    ):
+        del api_version, project
+        if is_vertex_google_publisher(publisher):
+            return await proxy.handle_gemini_count_tokens(
+                request,
+                model,
+                _vertex_target_for_location(proxy, location),
+                VERTEX_GOOGLE_PROVIDER_NAME,
+            )
+        return await vertex_publisher_passthrough(request, publisher, VERTEX_COUNT_TOKENS.name)
+
+    @app.post(
+        "/{api_version}/projects/{project}/locations/{location}/publishers/{publisher}/models/{model}:rawPredict"
+    )
+    @with_vertex_diagnostics
+    async def vertex_raw_predict(
+        request: Request,
+        api_version: str,
+        project: str,
+        location: str,
+        publisher: str,
+        model: str,
+    ):
+        del api_version, project
+        if is_vertex_anthropic_publisher(publisher):
+            return await proxy.handle_anthropic_messages(
+                request,
+                _vertex_target_for_location(proxy, location),
+                VERTEX_ANTHROPIC_PROVIDER_NAME,
+                model,
+            )
+        return await vertex_publisher_passthrough(request, publisher, VERTEX_RAW_PREDICT.name)
+
+    @app.post(
+        "/projects/{project}/locations/{location}/publishers/{publisher}/models/{model}:rawPredict"
+    )
+    @with_vertex_diagnostics
+    async def vertex_raw_predict_no_version(
+        request: Request,
+        project: str,
+        location: str,
+        publisher: str,
+        model: str,
+    ):
+        if is_vertex_anthropic_publisher(publisher):
+            del project
+            target = vertex_anthropic_target(
+                _vertex_target_for_location(proxy, location),
+                versionless_route=True,
+            )
+            return await proxy.handle_anthropic_messages(
+                request,
+                target,
+                VERTEX_ANTHROPIC_PROVIDER_NAME,
+                model,
+            )
+        return await vertex_publisher_passthrough(request, publisher, VERTEX_RAW_PREDICT.name)
+
+    @app.post(
+        "/{api_version}/projects/{project}/locations/{location}/publishers/{publisher}/models/{model}:streamRawPredict"
+    )
+    @with_vertex_diagnostics
+    async def vertex_stream_raw_predict(
+        request: Request,
+        api_version: str,
+        project: str,
+        location: str,
+        publisher: str,
+        model: str,
+    ):
+        del api_version, project
+        if is_vertex_anthropic_publisher(publisher):
+            return await proxy.handle_anthropic_messages(
+                request,
+                _vertex_target_for_location(proxy, location),
+                VERTEX_ANTHROPIC_PROVIDER_NAME,
+                model,
+                VERTEX_STREAM_RAW_PREDICT.force_stream,
+            )
+        return await vertex_publisher_passthrough(
+            request,
+            publisher,
+            VERTEX_STREAM_RAW_PREDICT.name,
+        )
+
+    @app.post(
+        "/projects/{project}/locations/{location}/publishers/{publisher}/models/{model}:streamRawPredict"
+    )
+    @with_vertex_diagnostics
+    async def vertex_stream_raw_predict_no_version(
+        request: Request,
+        project: str,
+        location: str,
+        publisher: str,
+        model: str,
+    ):
+        if is_vertex_anthropic_publisher(publisher):
+            del project
+            target = vertex_anthropic_target(
+                _vertex_target_for_location(proxy, location),
+                versionless_route=True,
+            )
+            return await proxy.handle_anthropic_messages(
+                request,
+                target,
+                VERTEX_ANTHROPIC_PROVIDER_NAME,
+                model,
+                VERTEX_STREAM_RAW_PREDICT.force_stream,
+            )
+        return await vertex_publisher_passthrough(
+            request,
+            publisher,
+            VERTEX_STREAM_RAW_PREDICT.name,
+        )
+
+    async def _model_metadata_route(request: Request) -> tuple[str, str]:
+        # A caller-named upstream wins, as in the catch-all and the chat
+        # handlers: model discovery must reach the same gateway as inference.
+        custom_base = request.headers.get("x-headroom-base-url", "").strip()
+        if custom_base:
+            if not await is_safe_upstream_url_async(custom_base):
+                logger.warning("rejecting unsafe x-headroom-base-url: %s", redact_url(custom_base))
+                raise HTTPException(status_code=400, detail="Rejected unsafe upstream base URL")
+            # Only the destination is overridden: keep the provider the request's
+            # auth selects, so Anthropic-auth requests still get model-id
+            # sanitization in handle_passthrough.
+            provider_name = proxy.provider_runtime.model_metadata_provider(dict(request.headers))
+            return provider_name, custom_base.rstrip("/")
+        headers = dict(request.headers)
+        provider_name = proxy.provider_runtime.model_metadata_provider(headers)
+        base_url = (
+            _openai_compatible_base_url(proxy, headers)
+            if provider_name == "openai"
+            else _api_target(proxy, provider_name)
+        )
+        return provider_name, base_url
+
+    @app.get("/v1/models")
+    async def list_models(request: Request):
+        provider_name, base_url = await _model_metadata_route(request)
+        return await handle_model_metadata_endpoint(
+            proxy,
+            request,
+            endpoint=MODEL_METADATA_LIST_ENDPOINT,
+            provider_api_base_url=base_url,
+            provider_name=provider_name,
+        )
+
+    @app.get("/v1/models/{model_id}")
+    async def get_model(request: Request, model_id: str):
+        provider_name, base_url = await _model_metadata_route(request)
+        return await handle_model_metadata_endpoint(
+            proxy,
+            request,
+            endpoint=model_metadata_get_endpoint(model_id),
+            provider_api_base_url=base_url,
+            provider_name=provider_name,
+        )
+
+    @app.post("/v1/alpha/search")
+    async def codex_alpha_search(request: Request):
+        chatgpt_response = await _handle_chatgpt_codex_alpha_search(request, proxy)
+        if chatgpt_response is not None:
+            return chatgpt_response
+        # This route resolves a caller-named upstream like the catch-all does,
+        # so it needs the same rejection. Without it a client could point the
+        # proxy at loopback/RFC1918/cloud-metadata and read the response back
+        # (CVE-2026-77775).
+        custom_base = request.headers.get("x-headroom-base-url", "").strip()
+        if custom_base and not await is_safe_upstream_url_async(custom_base):
+            logger.warning("rejecting unsafe x-headroom-base-url: %r", custom_base)
+            raise HTTPException(status_code=400, detail="Rejected unsafe upstream base URL")
+        return await proxy.handle_passthrough(
+            request,
+            _select_passthrough_base_url(proxy, dict(request.headers)),
+        )
+
+    _register_openai_image_routes(app, proxy)
+
+    _register_codex_live_routes(app, proxy)
+
+    _register_provider_passthrough_routes(app, proxy)
+
+    @app.api_route("/{path:path}", methods=["GET", "POST", "PUT", "DELETE", "HEAD"])
+    async def passthrough(request: Request, path: str):
+        return await _default_passthrough(request, path)

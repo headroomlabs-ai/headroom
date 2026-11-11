@@ -71,8 +71,7 @@ use md5::{Digest, Md5};
 use crate::ccr::CcrStore;
 use crate::signals::{ImportanceContext, LineImportanceDetector};
 
-/// True for CJK ideographs, kana, and Hangul. Code-point ranges kept
-/// byte-identical with the Python `_is_cjk_char` for search-compressor parity.
+/// True for CJK ideographs, kana, and Hangul.
 fn is_cjk_char(c: char) -> bool {
     matches!(
         c as u32,
@@ -81,7 +80,7 @@ fn is_cjk_char(c: char) -> bool {
 }
 
 /// CJK character bigrams from the CJK runs of a (lowercased) query, so a
-/// spaceless CJK query can match content. Mirrors the Python `_cjk_bigrams`.
+/// spaceless CJK query can match content.
 fn cjk_bigrams(text: &str) -> BTreeSet<String> {
     let mut out = BTreeSet::new();
     let mut run: Vec<char> = Vec::new();
@@ -112,6 +111,14 @@ pub struct SearchMatch {
     pub content: String,
     /// Relevance score in [0.0, 1.0]; populated by [`SearchCompressor::score_matches`].
     pub score: f32,
+    /// The `<sep><digits><sep>` text exactly as it appeared between path and
+    /// content. Output reuses it so a context line (`-`) stays a context line
+    /// and the digits are never re-formatted.
+    pub marker: String,
+    /// Leading whitespace before the path, as it appeared (usually empty).
+    /// Parsing runs on the line without it, so an indented row splits like
+    /// any other; output puts it back.
+    pub indent: String,
 }
 
 impl SearchMatch {
@@ -121,7 +128,17 @@ impl SearchMatch {
             line_number,
             content: content.into(),
             score: 0.0,
+            marker: format!(":{line_number}:"),
+            indent: String::new(),
         }
+    }
+
+    /// `indent file<marker>content`, byte-identical to the parsed line.
+    pub fn render(&self) -> String {
+        format!(
+            "{}{}{}{}",
+            self.indent, self.file, self.marker, self.content
+        )
     }
 }
 
@@ -130,6 +147,9 @@ impl SearchMatch {
 pub struct FileMatches {
     pub file: String,
     pub matches: Vec<SearchMatch>,
+    /// Position of the file's first row among the input's files: output
+    /// follows it, and it breaks score ties (key order is not input order).
+    pub order: usize,
 }
 
 impl FileMatches {
@@ -137,6 +157,7 @@ impl FileMatches {
         Self {
             file: file.into(),
             matches: Vec::new(),
+            order: 0,
         }
     }
 
@@ -297,6 +318,21 @@ impl SearchCompressor {
         bias: f64,
         store: Option<&dyn CcrStore>,
     ) -> (SearchCompressionResult, SearchCompressorStats) {
+        self.compress_with_ccr_source(content, context, bias, store, content)
+    }
+
+    /// Like [`Self::compress_with_store`], but the CCR entry and its
+    /// hash come from `ccr_source` rather than `content`. Use when
+    /// `content` is a derived form of the original (e.g. after a
+    /// reformat) and retrieval must return the original.
+    pub fn compress_with_ccr_source(
+        &self,
+        content: &str,
+        context: &str,
+        bias: f64,
+        store: Option<&dyn CcrStore>,
+        ccr_source: &str,
+    ) -> (SearchCompressionResult, SearchCompressorStats) {
         let mut stats = SearchCompressorStats::default();
         let parsed = self.parse_search_results(content, &mut stats);
 
@@ -335,8 +371,8 @@ impl SearchCompressor {
             } else if ratio >= self.config.min_compression_ratio_for_ccr {
                 stats.ccr_skip_reason = Some("compression ratio too high");
             } else if let Some(store) = store {
-                let key = md5_hex_24(content);
-                store.put(&key, content);
+                let key = md5_hex_24(ccr_source);
+                store.put(&key, ccr_source);
                 let marker = format!(
                     "\n[{} matches compressed to {}. Retrieve more: hash={}]",
                     original_count, compressed_count, key
@@ -372,18 +408,30 @@ impl SearchCompressor {
         stats: &mut SearchCompressorStats,
     ) -> BTreeMap<String, FileMatches> {
         let mut out: BTreeMap<String, FileMatches> = BTreeMap::new();
-        for raw in content.split('\n') {
-            let line = raw.trim();
-            if line.is_empty() {
+        for line in content.split('\n') {
+            // Keep the trailing whitespace (and any `\r`): trimming it made
+            // kept rows differ from the input. Leading whitespace is set
+            // aside instead: the colon/dash tiers stop at whitespace before a
+            // separator, so an indented row would fall to the permissive tier
+            // and split inside its path (`  logs/2026-12-13/app.log:12:x`).
+            if line.trim().is_empty() {
                 continue;
             }
             stats.lines_scanned += 1;
-            match parse_match_line(line) {
+            let rest = line.trim_start();
+            match parse_match_line(rest) {
                 Some((file, line_no, body)) => {
+                    let mut m = SearchMatch::new(file, line_no, body);
+                    m.marker = rest[file.len()..rest.len() - body.len()].to_string();
+                    m.indent = line[..line.len() - rest.len()].to_string();
+                    let order = out.len();
                     out.entry(file.to_string())
-                        .or_insert_with(|| FileMatches::new(file))
+                        .or_insert_with(|| FileMatches {
+                            order,
+                            ..FileMatches::new(file)
+                        })
                         .matches
-                        .push(SearchMatch::new(file, line_no, body));
+                        .push(m);
                 }
                 None => stats.lines_unparsed += 1,
             }
@@ -452,14 +500,14 @@ impl SearchCompressor {
         bias: f64,
         stats: &mut SearchCompressorStats,
     ) -> BTreeMap<String, FileMatches> {
-        // Python `_select_matches` sorts files by total match score
-        // descending. `BTreeMap` iterates in key order, so we collect
-        // and sort explicitly.
+        // Sort files by total match score, descending. `BTreeMap`
+        // iterates in key order, so we collect and sort explicitly.
         let mut by_score: Vec<(&String, &FileMatches)> = files.iter().collect();
         by_score.sort_by(|a, b| {
             b.1.total_score()
                 .partial_cmp(&a.1.total_score())
                 .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| a.1.order.cmp(&b.1.order))
         });
 
         if by_score.len() > self.config.max_files {
@@ -469,11 +517,7 @@ impl SearchCompressor {
 
         let all_match_strings: Vec<String> = by_score
             .iter()
-            .flat_map(|(file, fm)| {
-                fm.matches
-                    .iter()
-                    .map(move |m| format!("{}:{}:{}", file, m.line_number, m.content))
-            })
+            .flat_map(|(_, fm)| fm.matches.iter().map(|m| m.render()))
             .collect();
         let all_refs: Vec<&str> = all_match_strings.iter().map(|s| s.as_str()).collect();
         let adaptive_total =
@@ -491,18 +535,21 @@ impl SearchCompressor {
             // Sort by score desc, ties broken by line number asc for
             // determinism (Python's `sorted` is stable; order in is
             // line-asc by construction so highest-score-first picks the
-            // earliest line on ties).
-            let mut sorted = fm.matches.clone();
-            sorted.sort_by(|a, b| {
+            // earliest line on ties). Rows are handled by input index so
+            // the output emits exactly the occurrence that was selected.
+            let mut sorted: Vec<usize> = (0..fm.matches.len()).collect();
+            sorted.sort_by(|&a, &b| {
+                let (a, b) = (&fm.matches[a], &fm.matches[b]);
                 b.score
                     .partial_cmp(&a.score)
                     .unwrap_or(std::cmp::Ordering::Equal)
                     .then_with(|| a.line_number.cmp(&b.line_number))
             });
 
-            let mut file_selected: Vec<SearchMatch> = Vec::new();
-            // BTreeSet for O(log n) "already in selection" check (Python
-            // uses linear `not in` — quadratic for big files).
+            // Selected input indices, plus the (line, content) keys already
+            // taken: a row repeating a selected row's number and content is
+            // still skipped (BTreeSet: O(log n), Python uses linear `not in`).
+            let mut picked: BTreeSet<usize> = BTreeSet::new();
             let mut seen: BTreeSet<(u64, u64)> = BTreeSet::new();
 
             let remaining_cap = self
@@ -510,43 +557,36 @@ impl SearchCompressor {
                 .max_matches_per_file
                 .min(adaptive_total.saturating_sub(total_selected));
 
-            let push_unique = |m: &SearchMatch,
-                               file_selected: &mut Vec<SearchMatch>,
-                               seen: &mut BTreeSet<(u64, u64)>| {
-                let key = (m.line_number, hash_u64(&m.content));
-                if seen.insert(key) {
-                    file_selected.push(m.clone());
-                    true
-                } else {
-                    false
-                }
-            };
-
-            if self.config.always_keep_first {
-                if let Some(first) = fm.first() {
-                    if file_selected.len() < remaining_cap {
-                        push_unique(first, &mut file_selected, &mut seen);
+            let push_unique =
+                |i: usize, picked: &mut BTreeSet<usize>, seen: &mut BTreeSet<(u64, u64)>| {
+                    let m = &fm.matches[i];
+                    if seen.insert((m.line_number, hash_u64(&m.content))) {
+                        picked.insert(i);
                     }
-                }
+                };
+
+            let n = fm.matches.len();
+            if self.config.always_keep_first && n > 0 && picked.len() < remaining_cap {
+                push_unique(0, &mut picked, &mut seen);
             }
 
-            if self.config.always_keep_last && fm.matches.len() > 1 {
-                if let Some(last) = fm.last() {
-                    if file_selected.len() < remaining_cap {
-                        push_unique(last, &mut file_selected, &mut seen);
-                    }
-                }
+            if self.config.always_keep_last && n > 1 && picked.len() < remaining_cap {
+                push_unique(n - 1, &mut picked, &mut seen);
             }
 
-            for m in &sorted {
-                if file_selected.len() >= remaining_cap {
+            for &i in &sorted {
+                if picked.len() >= remaining_cap {
                     break;
                 }
-                push_unique(m, &mut file_selected, &mut seen);
+                push_unique(i, &mut picked, &mut seen);
             }
 
-            // Restore line order for output.
-            file_selected.sort_by_key(|m| m.line_number);
+            // Restore INPUT order for output (grep emits line order, so this is
+            // line order for real grep). Sorting by line number alone put the
+            // forced first/last rows ahead of any rows sharing their number,
+            // e.g. `api:12:00:03 ...` log rows whose "line" is the hour.
+            let file_selected: Vec<SearchMatch> =
+                picked.iter().map(|&i| fm.matches[i].clone()).collect();
 
             let dropped_here = fm.matches.len().saturating_sub(file_selected.len());
             stats.matches_dropped_by_per_file_cap += dropped_here;
@@ -557,6 +597,7 @@ impl SearchCompressor {
                 FileMatches {
                     file: file.clone(),
                     matches: file_selected,
+                    order: fm.order,
                 },
             );
         }
@@ -573,7 +614,9 @@ impl SearchCompressor {
         let mut summaries: BTreeMap<String, String> = BTreeMap::new();
         let grouped = self.config.group_by_file;
 
-        for (file, fm) in selected {
+        let mut in_order: Vec<(&String, &FileMatches)> = selected.iter().collect();
+        in_order.sort_by_key(|(_, fm)| fm.order);
+        for (file, fm) in in_order {
             if grouped {
                 // `rg --heading` style: path once, then line:content rows.
                 if !lines.is_empty() {
@@ -581,11 +624,11 @@ impl SearchCompressor {
                 }
                 lines.push(file.clone());
                 for m in &fm.matches {
-                    lines.push(format!("{}:{}", m.line_number, m.content));
+                    lines.push(format!("{}{}", &m.marker[1..], m.content));
                 }
             } else {
                 for m in &fm.matches {
-                    lines.push(format!("{}:{}:{}", m.file, m.line_number, m.content));
+                    lines.push(m.render());
                 }
             }
             if let Some(orig_fm) = original.get(file) {
@@ -648,7 +691,10 @@ impl SearchCompressor {
 ///    practically never contains one (the Windows drive colon is
 ///    already skipped above), so the leftmost is the right one. The
 ///    no-whitespace guard keeps a `foo.rs:12:` reference *inside the
-///    body* of a `-`-separated context line from hijacking the parse.
+///    body* of a `-`-separated context line from hijacking the parse. A
+///    whitespace-free body reference (`a:7:b`) still slips past it, so
+///    [`parse_match_line`] hands priority back to the dash tier for that
+///    one shape; see the comment there.
 /// 2. **Dash tier** — `-` is grep's *context*-line separator, and unlike
 ///    `:` it appears inside real paths (`2026-05-03`, `CVE-2021-44228`,
 ///    `20240101-002-add_users.sql`), so the leftmost triplet is often
@@ -684,9 +730,50 @@ impl SearchCompressor {
 ///    Only reached when neither tier matched (e.g. a path containing a
 ///    space), so behaviour for those lines is exactly as before.
 fn parse_match_line(line: &str) -> Option<(&str, u64, &str)> {
-    scan_match_line(line, ScanTier::Colon)
-        .or_else(|| scan_match_line(line, ScanTier::Dash))
-        .or_else(|| scan_match_line(line, ScanTier::Permissive))
+    let colon = scan_marker(line, ScanTier::Colon);
+    let dash = scan_marker(line, ScanTier::Dash);
+
+    // The colon tier keeps priority: `path:line:content` is what grep emits for
+    // matches and a path practically never contains a colon. It yields in
+    // exactly one shape — a `-`-separated context line whose body carries a
+    // whitespace-free `name:N:` reference (`app.py-476-a:7:b`). The dash tier
+    // *positively confirmed* a boundary before the colon marker, so that colon
+    // triplet is body text, not a marker.
+    //
+    // Without the hand-off the body's number is read as the line number, the
+    // path swallows the real `-N-`, and the model is shown a file that does not
+    // exist holding content attributed to a line it never came from
+    // (issue #3545). The whitespace guard inside the colon tier cannot catch
+    // this, because the body ahead of the reference need not contain any.
+    //
+    // The `true` in the dash arm is load-bearing, and it is the *whole* test.
+    // A confirmed boundary means the dash tier saw the path end there — either
+    // the segment carried an extension (`app.py-476-`) or nothing after the
+    // marker looked like path structure (`CHANGELOG-12-`) — so the bytes from
+    // the closing dash onwards are body text and may look like anything. Bodies
+    // routinely carry a filename-style reference of their own
+    // (`app.py-476-foo.rs:12:ref`), and an extension dot there says nothing
+    // about where the path ended.
+    //
+    // The rows that must keep the colon tier are the ones where the dash tier
+    // could *not* confirm: `logs/2026-05-03/app.log:12:ERROR` and
+    // `migrations/20240101-002-add_users.sql:12:SELECT` both leave the digits
+    // inside the path, so the flag is false and the hand-off never applies. See
+    // [`path_continues`], which is what decides the flag.
+    let dash_overrides = match (colon, dash) {
+        (Some((colon_marker, _)), Some((dash_marker, true))) => colon_marker.0 > dash_marker.2,
+        _ => false,
+    };
+
+    let marker = if dash_overrides {
+        dash
+    } else {
+        colon
+            .or(dash)
+            .or_else(|| scan_marker(line, ScanTier::Permissive))
+    };
+
+    build_match(line, marker?.0)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -752,7 +839,22 @@ fn path_continues(rest: &str) -> bool {
         .is_some_and(|tok| tok.contains('/') || tok.contains('\\') || has_extension_dot(tok))
 }
 
-fn scan_match_line(line: &str, tier: ScanTier) -> Option<(&str, u64, &str)> {
+/// Byte offsets of one `<sep><digits><sep>` marker: where the path ends, where
+/// the digits start, and where the closing separator sits.
+type Marker = (usize, usize, usize);
+
+/// Assemble `(file, line_number, content)` from a marker's byte offsets.
+fn build_match(line: &str, marker: Marker) -> Option<(&str, u64, &str)> {
+    let (path_end, digits_start, digits_end) = marker;
+    let line_no = line[digits_start..digits_end].parse::<u64>().ok()?;
+    Some((&line[..path_end], line_no, &line[digits_end + 1..]))
+}
+
+/// Scan `line` under `tier`, returning the marker it settled on plus whether
+/// that marker was a *positively confirmed* boundary (`chosen`) rather than the
+/// leftmost fallback (`first`). Callers need that flag to tell a proven boundary
+/// from a guess.
+fn scan_marker(line: &str, tier: ScanTier) -> Option<(Marker, bool)> {
     let bytes = line.as_bytes();
     // Windows drive prefix: starts with [A-Za-z]:[\\/]
     let scan_start = if bytes.len() >= 3
@@ -810,7 +912,14 @@ fn scan_match_line(line: &str, tier: ScanTier) -> Option<(&str, u64, &str)> {
             }
             // The closing separator must match the opening one: grep
             // emits `file:12:body` or `file-12-body`, never a mix.
+            // grep/ripgrep line numbers start at 1 and never carry a leading
+            // zero. A `0`-led run is a clock or date field (`12:00:01`,
+            // `2026-10-03 12:05:00`), not a line marker; accepting it would
+            // group the row under a made-up file and line number.
+            // Cost: `grep -b` without `-n` prints byte offset 0 for a file's
+            // first line; that one row is left unparsed.
             let closes = j > digits_start
+                && bytes[digits_start] != b'0'
                 && j < bytes.len()
                 && match tier {
                     ScanTier::Permissive => bytes[j] == b':' || bytes[j] == b'-',
@@ -865,11 +974,7 @@ fn scan_match_line(line: &str, tier: ScanTier) -> Option<(&str, u64, &str)> {
     // is genuinely ambiguous (`Makefile-7-include-2-src/foo.mk`). Fall back
     // to the leftmost marker — precisely what the leftmost-wins rule this
     // tier refines would have returned.
-    let (path_end, digits_start, digits_end) = chosen.or(first)?;
-    let line_no = std::str::from_utf8(&bytes[digits_start..digits_end])
-        .ok()
-        .and_then(|s| s.parse::<u64>().ok())?;
-    Some((&line[..path_end], line_no, &line[digits_end + 1..]))
+    Some((chosen.or(first)?, chosen.is_some()))
 }
 
 // ─── Internals ──────────────────────────────────────────────────────────
@@ -916,6 +1021,60 @@ mod tests {
         assert!(b.contains("认证") && b.contains("证令") && b.contains("令牌") && b.len() == 3);
         assert!(cjk_bigrams("hello").is_empty());
         assert!(cjk_bigrams("a认b证").is_empty()); // isolated CJK chars -> no pair
+    }
+
+    #[test]
+    fn dash_context_line_wins_over_a_colon_marker_in_its_body() {
+        // A whitespace-free `name:N:` reference in the body of a `-`-separated
+        // context line used to be read as the line-number marker: the path
+        // absorbed the real `-N-` and the body's number was reported as the
+        // line number, inventing both a file that does not exist and a
+        // line<->content pair that never existed (issue #3545).
+        assert_eq!(
+            parse_line("app/settings.py-476-a:7:b:8:c"),
+            Some(("app/settings.py".into(), 476, "a:7:b:8:c".into()))
+        );
+        // Extension-less paths reach the dash tier through its negative stop
+        // rather than the extension rule, and must keep resolving.
+        assert_eq!(
+            parse_line("CHANGELOG-12-a:99:b"),
+            Some(("CHANGELOG".into(), 12, "a:99:b".into()))
+        );
+        // A body reference that looks like a *filename* is the canonical form
+        // the hand-off used to miss. `app.py-476-foo.rs:12:ref` is a context
+        // row for `app.py` line 476 whose body is `foo.rs:12:ref`. The dash
+        // tier confirms the boundary (the segment carries an extension), so the
+        // extension dot inside the body must not veto it — before the fix the
+        // colon tier reclaimed the row as path `app.py-476-foo.rs`, line 12.
+        assert_eq!(
+            parse_line("app.py-476-foo.rs:12:ref"),
+            Some(("app.py".into(), 476, "foo.rs:12:ref".into()))
+        );
+        // Same shape behind a directory, and with a Windows separator in the
+        // body reference.
+        assert_eq!(
+            parse_line("pkg/server.ts-91-lib/index.js:7:import"),
+            Some(("pkg/server.ts".into(), 91, "lib/index.js:7:import".into()))
+        );
+        // The body may even be a bare path with no reference at all.
+        assert_eq!(
+            parse_line("app.py-476-./vendor/other.py"),
+            Some(("app.py".into(), 476, "./vendor/other.py".into()))
+        );
+        // A colon row whose *path* holds the dash triplet is untouched: the
+        // dash tier never confirmed a boundary there, so the colon tier wins.
+        assert_eq!(
+            parse_line("logs/2026-05-03/app.log:12:ERROR"),
+            Some(("logs/2026-05-03/app.log".into(), 12, "ERROR".into()))
+        );
+        assert_eq!(
+            parse_line("migrations/20240101-002-add_users.sql:12:SELECT"),
+            Some((
+                "migrations/20240101-002-add_users.sql".into(),
+                12,
+                "SELECT".into()
+            ))
+        );
     }
 
     #[test]
@@ -1212,6 +1371,214 @@ logs/2026-05-04/app.log:7:ERROR bang";
     }
 
     #[test]
+    fn the_selected_occurrence_is_emitted_not_its_twin() {
+        // A match row and a context row sharing number and content: keeping
+        // only the last row must emit the context row, not the match.
+        let c = SearchCompressor::new(SearchCompressorConfig {
+            always_keep_first: false,
+            always_keep_last: true,
+            max_matches_per_file: 1,
+            ..SearchCompressorConfig::default()
+        });
+        let mut stats = SearchCompressorStats::default();
+        let files = c.parse_search_results("a.py:12:x\na.py-12-x\n", &mut stats);
+        let mut files = files;
+        for fm in files.values_mut() {
+            for m in &mut fm.matches {
+                m.score = 0.5;
+            }
+        }
+        let picked = c.select_matches(&files, 1.0, &mut stats);
+        let rows: Vec<String> = picked["a.py"].matches.iter().map(|m| m.render()).collect();
+        assert_eq!(rows, vec!["a.py-12-x".to_string()]);
+    }
+
+    #[test]
+    fn indented_rows_split_at_the_real_marker_and_render_verbatim() {
+        let c = SearchCompressor::new(SearchCompressorConfig::default());
+        let mut stats = SearchCompressorStats::default();
+        let input =
+            "  logs/2026-12-13/app.log:12:ERROR one\n  src/my-2-x.py:12:y\nsrc/my-2-x.py:13:z\n";
+        let files = c.parse_search_results(input, &mut stats);
+        let log = &files["logs/2026-12-13/app.log"].matches[0];
+        assert_eq!((log.line_number, log.content.as_str()), (12, "ERROR one"));
+        assert_eq!(log.render(), "  logs/2026-12-13/app.log:12:ERROR one");
+        let py = &files["src/my-2-x.py"].matches;
+        assert_eq!(
+            py.len(),
+            2,
+            "indented and unindented rows share one file group"
+        );
+        assert_eq!(py[0].render(), "  src/my-2-x.py:12:y");
+        assert_eq!(py[1].render(), "src/my-2-x.py:13:z");
+    }
+
+    #[test]
+    fn rejects_zero_led_line_numbers() {
+        // Clock/date fields are `0`-padded; grep line numbers never are.
+        // Parsing `12:00:01` as file `12`, line `00` printed it back as
+        // `12:0:01`, silently rewriting the time.
+        for line in [
+            "12:00:01.123Z ERROR worker failed job 1",
+            "app|12:00:01|ERROR job 1 failed",
+            "2026-10-03 12:05:00 INFO step",
+            "<td>12:00:01</td><td>ERROR</td>",
+        ] {
+            if let Some(m) = parse_line(line) {
+                assert!(
+                    !m.0.bytes().all(|b| b.is_ascii_digit()) || m.1 >= 10,
+                    "{line:?} parsed a clock field as a line number: {m:?}"
+                );
+            }
+        }
+        assert!(parse_line("src/a.py:012:x").is_none());
+        // Real rows still parse, including one whose content is a time.
+        let m = parse_line("src/a.py:12:12:00:01 is noon").unwrap();
+        assert_eq!(
+            (m.0.as_str(), m.1, m.2.as_str()),
+            ("src/a.py", 12, "12:00:01 is noon")
+        );
+        assert_eq!(parse_line("src/a.py:120:x").unwrap().1, 120);
+    }
+
+    #[test]
+    fn compress_output_rows_are_verbatim_and_in_input_order() {
+        // Through `compress` in both layouts: every kept row is one of the
+        // input lines unchanged, kept rows keep their input order (rows
+        // sharing a number included), and the old renderers would fail.
+        let mut lines: Vec<String> = Vec::new();
+        for i in 1..60 {
+            // trailing spaces on some rows: kept rows must keep them
+            let pad = "  ";
+            lines.push(format!("src/a.py:{i}:def f{i}(): pass{pad}"));
+            lines.push(format!("src/a.py-{}-ctx {i}", i + 100));
+        }
+        for s in 1..60 {
+            let svc = ["api", "db", "web"][s % 3];
+            lines.push(format!("{svc}:12:{:02}:{:02} job {s} done", s / 60, s % 60));
+        }
+        lines.push("2026-10-03 12:05:00 INFO step".into());
+        let content = lines.join("\n");
+        let pos = |l: &str| lines.iter().position(|x| x == l);
+        for grouped in [false, true] {
+            let cfg = SearchCompressorConfig {
+                group_by_file: grouped,
+                ..SearchCompressorConfig::default()
+            };
+            let (r, _) = SearchCompressor::new(cfg).compress(&content, "", 1.0);
+            let mut heading = String::new();
+            // Rows keep input order per file; files keep first-appearance order.
+            let mut last: BTreeMap<String, usize> = BTreeMap::new();
+            let mut files_seen: Vec<String> = Vec::new();
+            let mut kept = 0;
+            // Grouped: a heading is the first line or follows a blank line.
+            let mut at_heading = true;
+            for row in r.compressed.lines() {
+                if row.is_empty() {
+                    at_heading = true;
+                    continue;
+                }
+                if row.starts_with('[') {
+                    continue;
+                }
+                let full = if grouped && at_heading {
+                    heading = row.to_string();
+                    at_heading = false;
+                    continue;
+                } else if grouped {
+                    // The heading drops the marker's leading separator.
+                    [':', '-']
+                        .iter()
+                        .map(|s| format!("{heading}{s}{row}"))
+                        .find(|f| pos(f).is_some())
+                        .unwrap_or_else(|| format!("{heading}?{row}"))
+                } else {
+                    row.to_string()
+                };
+                let p = pos(&full)
+                    .unwrap_or_else(|| panic!("grouped={grouped}: {full:?} is not an input line"));
+                let file = parse_match_line(&full).unwrap().0.to_string();
+                if !files_seen.contains(&file) {
+                    files_seen.push(file.clone());
+                }
+                if let Some(l) = last.insert(file, p) {
+                    assert!(l < p, "grouped={grouped}: {full:?} out of input order");
+                }
+                kept += 1;
+            }
+            assert!(kept > 10, "grouped={grouped}: only {kept} rows kept");
+            let first_at = |f: &String| {
+                lines
+                    .iter()
+                    .position(|l| parse_match_line(l).unwrap().0 == f)
+            };
+            let mut sorted_files = files_seen.clone();
+            sorted_files.sort_by_key(first_at);
+            assert_eq!(
+                files_seen, sorted_files,
+                "grouped={grouped}: files out of input order"
+            );
+            assert!(r.compressed.contains("pass  "), "trailing spaces lost");
+            assert!(
+                r.compressed.contains("-ctx "),
+                "a context row should survive"
+            );
+        }
+    }
+
+    #[test]
+    fn max_files_keeps_the_earliest_files_on_equal_scores() {
+        // Key order (`pkg10` < `pkg2`) used to decide which tied files the
+        // `max_files` cap dropped; it is the first files in the input now.
+        let content: String = (0..20)
+            .map(|i| format!("pkg{i}/mod.py:7:value = {i}\n"))
+            .collect();
+        let cfg = SearchCompressorConfig {
+            max_files: 5,
+            ..SearchCompressorConfig::default()
+        };
+        let (r, _) = SearchCompressor::new(cfg).compress(&content, "", 1.0);
+        let kept: Vec<&str> = r
+            .compressed
+            .lines()
+            .filter_map(|l| parse_match_line(l).map(|m| m.0))
+            .collect();
+        assert_eq!(
+            kept,
+            [
+                "pkg0/mod.py",
+                "pkg1/mod.py",
+                "pkg2/mod.py",
+                "pkg3/mod.py",
+                "pkg4/mod.py"
+            ]
+        );
+    }
+
+    #[test]
+    fn rendering_reproduces_each_parsed_line_byte_for_byte() {
+        // Output used to be re-assembled as `file:N:content`, turning a
+        // context line into a match line and a date into `2026:10:03`.
+        let content = "src/a.py:12:match\nsrc/a.py-13-context\n2026-10-03 12:05:00 INFO step\nC:\\x\\b.rs:7:win";
+        let compressor = SearchCompressor::new(SearchCompressorConfig::default());
+        let mut stats = SearchCompressorStats::default();
+        let parsed = compressor.parse_search_results(content, &mut stats);
+        let mut rendered: Vec<String> = parsed
+            .values()
+            .flat_map(|fm| fm.matches.iter().map(|m| m.render()))
+            .collect();
+        let mut want: Vec<&str> = content.split('\n').collect();
+        rendered.sort();
+        want.sort();
+        assert_eq!(rendered, want);
+        let a = &parsed["src/a.py"].matches;
+        assert_eq!(
+            format!("{}{}", &a[1].marker[1..], a[1].content),
+            "13-context"
+        );
+    }
+
+    #[test]
     fn parser_groups_by_file_and_counts() {
         let compressor = SearchCompressor::new(SearchCompressorConfig::default());
         let content = "\
@@ -1254,8 +1621,8 @@ src/main.py-44-context line";
 
     #[test]
     fn select_respects_per_file_cap_and_global_cap() {
-        // Note: compute_optimal_k enforces a hard `min_k=5` floor (matches
-        // Python `_select_matches`), so `max_total_matches` is a soft cap
+        // Note: compute_optimal_k enforces a hard `min_k=5` floor, so
+        // `max_total_matches` is a soft cap
         // that bites only above that floor. Configure 6 here to exercise
         // the cap path.
         let compressor = SearchCompressor::new(SearchCompressorConfig {

@@ -3,11 +3,11 @@
 import httpx
 from fastapi.testclient import TestClient
 
-from headroom.proxy.helpers import is_anthropic_auth
+from headroom.providers.registry import _is_anthropic_auth as is_anthropic_auth
 from headroom.proxy.server import ProxyConfig, create_app
 
 # ---------------------------------------------------------------------------
-# Unit tests: is_anthropic_auth
+# Unit tests: the auth classifier the router uses (providers.registry)
 # ---------------------------------------------------------------------------
 
 
@@ -49,6 +49,18 @@ class TestIsAnthropicAuth:
 
     def test_empty_authorization(self):
         assert is_anthropic_auth({"authorization": ""}) is False
+
+    def test_claude_code_user_agent_with_gateway_bearer(self):
+        """Claude Code behind a gateway token is still routed to Anthropic."""
+        assert (
+            is_anthropic_auth(
+                {
+                    "authorization": "Bearer 1a18a113-ab50-43c8",
+                    "user-agent": "claude-cli/2.1.0 (external, cli)",
+                }
+            )
+            is True
+        )
 
 
 # ---------------------------------------------------------------------------

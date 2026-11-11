@@ -100,6 +100,53 @@ async def test_ensure_initialized_noop_when_disabled(tmp_path):
     assert handler._backend is None
 
 
+@pytest.mark.asyncio
+async def test_ensure_initialized_fails_open_on_backend_init_error(tmp_path, monkeypatch):
+    """A backend that cannot open must NOT propagate — memory is optional.
+
+    Regression (#3251): a SQLite ``unable to open database file`` on a Docker
+    Desktop macOS bind-mount escaped ``_ensure_initialized`` (which only caught
+    TimeoutError/CancelledError) and 500'd every request. It must fail open: log,
+    leave ``_initialized=False`` and ``_backend=None``, and let the request
+    proceed without memory.
+    """
+    import sqlite3
+
+    closed = {"n": 0}
+
+    class BrokenLocalBackend:
+        def __init__(self, config):
+            self.config = config
+
+        async def _ensure_initialized(self) -> None:
+            # Mirrors the real failure: sqlite3.connect raising mid-init after
+            # the backend object has already been assigned to self._backend.
+            raise sqlite3.OperationalError("unable to open database file")
+
+        async def close(self) -> None:
+            closed["n"] += 1
+
+    import headroom.memory.backends.local as local_mod
+
+    monkeypatch.setattr(local_mod, "LocalBackend", BrokenLocalBackend)
+
+    handler = MemoryHandler(
+        MemoryConfig(enabled=True, backend="local", db_path=str(tmp_path / "mem.db"))
+    )
+
+    # Must not raise — the whole point.
+    await handler._ensure_initialized()
+
+    assert handler._initialized is False
+    assert handler._backend is None
+    # The half-assigned backend was cleaned up.
+    assert closed["n"] == 1
+
+    # A later call retries (and fails open again) rather than short-circuiting.
+    await handler._ensure_initialized()
+    assert handler._initialized is False
+
+
 # -------------------------------------------------------------------
 # Timeout fail-open
 # -------------------------------------------------------------------

@@ -267,7 +267,7 @@ def test_load_bfcl_success_and_download_failure(monkeypatch: pytest.MonkeyPatch)
         datasets.load_bfcl(category="parallel")
 
 
-def test_tool_output_samples_custom_dataset_and_probe_generation(tmp_path) -> None:
+def test_tool_output_samples_and_custom_dataset(tmp_path) -> None:
     tool_outputs = datasets.load_tool_output_samples()
     assert tool_outputs.name == "ToolOutputSamples"
     assert len(tool_outputs.cases) >= 8
@@ -283,16 +283,6 @@ def test_tool_output_samples_custom_dataset_and_probe_generation(tmp_path) -> No
     )
     custom_suite = datasets.load_custom_dataset(custom_path)
     assert custom_suite.cases[0].id == "case1"
-
-    probes = datasets.generate_retrieval_probes(
-        'Alice Smith deployed API on 2024-01-15 at 99.9% confidence for "Launch Ready" and build_id',
-        n_probes=5,
-    )
-    assert "Alice Smith" in probes
-    assert "2024-01-15" in probes
-    assert "API" in probes
-    assert "99.9" in probes
-    assert "Launch Ready" in probes
 
 
 def test_dataset_registry_helpers(monkeypatch: pytest.MonkeyPatch) -> None:

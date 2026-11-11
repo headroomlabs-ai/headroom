@@ -11,7 +11,6 @@ from unittest.mock import MagicMock, patch
 import anyio
 import pytest
 
-import headroom.proxy.handlers.openai as openai_handler
 from headroom.proxy.handlers.openai import OpenAIHandlerMixin
 
 
@@ -350,21 +349,3 @@ def test_codex_ws_request_id_and_session_id_present_in_log(stage_log_capture):
     assert payload["request_id"] == "req-ws-test"
     assert isinstance(payload["session_id"], str)
     assert len(payload["session_id"]) >= 16
-
-
-def test_codex_compression_debug_noop_skips_expensive_payload_debug(monkeypatch):
-    handler = _DummyOpenAIHandler()
-
-    def _fail_context_budget(_payload):
-        raise AssertionError("debug context budget should not be built")
-
-    monkeypatch.setattr(openai_handler, "_openai_responses_context_budget", _fail_context_budget)
-
-    result = handler._compress_openai_responses_payload(
-        {"model": "gpt-5.4", "input": "hello"},
-        model="gpt-5.4",
-        request_id="req-ws-test",
-    )
-
-    assert result[1] is False
-    assert result[4] == "router_no_compression"

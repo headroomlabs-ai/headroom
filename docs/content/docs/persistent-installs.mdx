@@ -60,6 +60,23 @@ This uses Docker's restart policy instead of an OS supervisor.
 
 If you are using the Docker-native host wrapper instead of a Python install, you can use `headroom install apply|status|start|stop|restart|remove` for the `persistent-docker` preset directly from the installed wrapper. Service/task installs and provider/user/system mutation flows still belong to the Python-native CLI.
 
+### Rootless Podman file ownership
+
+For the Python-native `persistent-docker` preset, if `docker` is a Podman wrapper
+script rather than a symlink, set `HEADROOM_CONTAINER_RUNTIME=podman` in the
+installer/runtime environment so it selects the Podman path.
+
+On Linux the Podman command combines `--userns=keep-id` with an
+explicit `--user` using the invoking user's UID and GID. Both are needed on
+Podman versions that honor the image's `USER root` even with `keep-id`: the
+namespace preserves the host mapping, and the process user keeps newly created
+files owned by the host user. The configured image is not changed.
+
+Restart the deployment with the updated installer to use these flags. This
+prevents new ownership mismatches; it does not repair files created by an older
+container. Inspect and restore ownership of affected files separately before
+restarting if the host user can no longer read them.
+
 ## Command surface
 
 ```text
@@ -72,6 +89,8 @@ headroom install remove
 ```
 
 `apply` creates or updates a named deployment profile, stores its manifest under `~/.headroom/deploy/<profile>/manifest.json`, applies reversible configuration changes, and starts the selected runtime.
+
+`status` distinguishes the default backend from the Anthropic and OpenAI protocol targets. When the health response includes a target's configuration, that target is shown as `configured` or `default`. If configuration is unavailable or omits a target, that target is shown as `unknown`; this does not mean it is unset. For example, a Docker bridge peer may not pass the loopback health-config gate. Target URLs and credentials are not printed. An OpenAI-compatible deployment can therefore have `Default backend: anthropic` and `OpenAI target: configured` at the same time.
 
 ## Presets and runtime kinds
 
@@ -104,6 +123,37 @@ Provider scope is intentionally conservative. The current direct adapters are:
 - Codex → managed block in `~/.codex/config.toml`
 - OpenClaw → existing `wrap openclaw` / `unwrap openclaw` flow
 - OpenCode → managed block in `~/.config/opencode/opencode.json`
+
+For OpenCode provider scope, reapplying the deployment, restarting it, or
+recovering a stopped proxy removes and reinjects only the managed `headroom`
+provider. Later edits to themes, other providers, and MCP configuration stay
+intact. JSONC input may contain comments and trailing commas.
+Active configuration is serialized as JSON; original formatting and comments
+are preserved in the snapshot. The original `<config filename>.headroom-backup`
+is kept across these transitions for both `.json` and `.jsonc` configurations.
+Final `headroom install remove` restores that original snapshot and deletes the
+backup, including after a stop and manifest reload.
+
+Existing JSONC snapshots using the older `<name>.json.headroom-backup` filename
+are migrated only when the canonical backup is absent. When a sibling `.json`
+config or a canonical snapshot already exists, Headroom preserves the ambiguous
+legacy backup in place and creates a `<name>.json.headroom-backup.jsonc-migration-blocked`
+marker. This marker survives removal and prevents later installs from claiming
+the legacy backup, even after the conflicting config or snapshot disappears.
+The legacy bytes remain available for manual recovery; copy them to the intended
+config only after inspecting them. Keep the marker to prevent automatic migration.
+If the marker cannot be created, the operation fails before changing the config
+or consuming its canonical snapshot.
+
+Backup ownership follows the config path recorded in the deployment, not a
+later `OPENCODE_CONFIG` value. A successful replacement restores snapshots for
+retired config paths and transfers any pending restoration to the new manifest.
+If restoration fails, the replacement remains active; resolve the filesystem
+error and retry `headroom install apply` to complete it.
+
+Failed replacement cleanup consumes snapshots newly created by that attempt,
+but preserves snapshots owned by the previous deployment for recovery.
+
 
 For Copilot, Aider, Cursor, and broader env-driven setups, prefer `--scope user` or `--scope system`.
 

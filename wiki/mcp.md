@@ -216,7 +216,7 @@ headroom proxy  # In another terminal
 ### "Entry not found or expired"
 
 - Content compressed via `headroom_compress`: stored for 1 hour (session TTL)
-- Content compressed by the proxy: stored for 5 minutes (proxy TTL)
+- Content compressed by the proxy: stored for 30 minutes by default (proxy CCR TTL, `HEADROOM_CCR_TTL_SECONDS`)
 - The proxy must be running for proxy-compressed content
 
 ### Claude doesn't see headroom tools

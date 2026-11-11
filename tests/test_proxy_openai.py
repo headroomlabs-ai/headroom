@@ -132,7 +132,10 @@ def test_native_responses_compressor_scopes_the_exclusion_per_call() -> None:
 
     asyncio.run(_run())
 
-    assert [{key: value for key, value in call.items() if key != "timing"} for call in seen] == [
+    assert [
+        {key: value for key, value in call.items() if key not in {"timing", "deadline_started_at"}}
+        for call in seen
+    ] == [
         {"client": "opencode"},
         {"client": None},
     ]
@@ -361,8 +364,9 @@ def _responses_body() -> dict[str, object]:
 @pytest.mark.parametrize(
     ("user_agent", "expected"),
     [
-        ("opencode/0.4.2", {"client": "opencode"}),
-        ("codex-cli/1.2.3", {"client": "codex"}),
+        # No conversation id in the body or headers: hooks get no conversation.
+        ("opencode/0.4.2", {"client": "opencode", "conversation": None}),
+        ("codex-cli/1.2.3", {"client": "codex", "conversation": None}),
     ],
 )
 def test_native_responses_route_carries_the_client_decision(
@@ -445,4 +449,8 @@ def test_websocket_route_carries_the_client_decision(
         asyncio.run(handler.handle_openai_responses_ws(client_ws))
 
     assert seen, "the Responses compressor was never reached on the WS path"
-    assert {k: v for k, v in seen[0].items() if k != "timing"} == expected
+    assert {
+        k: v
+        for k, v in seen[0].items()
+        if k not in {"timing", "deadline_started_at", "savings_tags"}
+    } == expected

@@ -5,24 +5,46 @@
   },
   "metadata": {
     "description": "Headroom marketplace for Claude Code and GitHub Copilot CLI plugins.",
-    "version": "0.37.0"
+    "version": "0.44.0"
   },
   "plugins": [
     {
       "name": "headroom",
       "source": "./plugins/headroom-agent-hooks",
       "description": "Headroom startup hooks for Claude Code and GitHub Copilot CLI.",
-      "version": "0.37.0",
+      "version": "0.44.0",
       "author": {
         "name": "Headroom Contributors",
-        "url": "https://github.com/chopratejas/headroom"
+        "url": "https://github.com/headroomlabs-ai/headroom"
       },
-      "homepage": "https://github.com/chopratejas/headroom",
-      "repository": "https://github.com/chopratejas/headroom",
+      "homepage": "https://github.com/headroomlabs-ai/headroom",
+      "repository": "https://github.com/headroomlabs-ai/headroom",
       "keywords": [
         "headroom",
         "hooks",
         "claude-code",
+        "copilot-cli"
+      ]
+    },
+    {
+      "name": "headroom-skill",
+      "source": "./plugins/headroom-skill",
+      "description": "Skill: add headroom-ai compress() to a Python or TypeScript app to cut LLM input tokens (tool outputs, logs, JSON, chat history). No API key.",
+      "version": "0.44.0",
+      "author": {
+        "name": "Headroom Contributors",
+        "url": "https://github.com/headroomlabs-ai/headroom"
+      },
+      "homepage": "https://github.com/headroomlabs-ai/headroom",
+      "repository": "https://github.com/headroomlabs-ai/headroom",
+      "keywords": [
+        "headroom",
+        "skill",
+        "token-cost",
+        "tool-outputs",
+        "context-window",
+        "claude-code",
+        "codex",
         "copilot-cli"
       ]
     }

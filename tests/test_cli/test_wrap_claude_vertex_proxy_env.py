@@ -1,7 +1,9 @@
-"""Claude wrap Vertex upstream handoff tests."""
+"""Claude wrap cloud-provider (Vertex, Foundry, Bedrock) handoff tests."""
 
 from __future__ import annotations
 
+import json
+import os
 from pathlib import Path
 from typing import Any
 
@@ -10,6 +12,7 @@ from click.testing import CliRunner
 
 from headroom.cli import wrap as wrap_mod
 from headroom.cli.main import main
+from headroom.providers.claude.runtime import claude_effective_env
 from headroom.providers.registry import DEFAULT_VERTEX_API_URL
 
 
@@ -38,6 +41,7 @@ def _clear_claude_mode_env(monkeypatch: pytest.MonkeyPatch) -> None:
         "ANTHROPIC_VERTEX_BASE_URL",
         "ANTHROPIC_FOUNDRY_BASE_URL",
         "ANTHROPIC_FOUNDRY_RESOURCE",
+        "HEADROOM_CLAUDE_PROJECT_SETTINGS",
         "CLAUDE_CODE_USE_VERTEX",
         "CLAUDE_CODE_USE_FOUNDRY",
         "VERTEX_TARGET_API_URL",
@@ -61,12 +65,16 @@ def _invoke_wrap_claude(
     *,
     env: dict[str, str],
     extra_args: tuple[str, ...] = (),
+    actual_port: int | None = None,
 ) -> tuple[dict[str, Any], str]:
     captured: dict[str, Any] = {}
 
     _clear_claude_mode_env(monkeypatch)
     monkeypatch.setattr(wrap_mod.shutil, "which", lambda _name: "/usr/bin/claude")
-    monkeypatch.setattr(wrap_mod, "_register_proxy_client", lambda _port: None)
+    monkeypatch.setattr(wrap_mod, "_register_proxy_client", lambda _port, session_token=None: None)
+    monkeypatch.setattr(
+        wrap_mod, "_unregister_proxy_client", lambda _port, session_token=None: None
+    )
     monkeypatch.setattr(wrap_mod, "_make_cleanup", lambda _holder, _port: lambda: None)
     monkeypatch.setattr(wrap_mod.signal, "signal", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(wrap_mod, "_push_runtime_env", lambda *_args, **_kwargs: None)
@@ -90,6 +98,9 @@ def _invoke_wrap_claude(
     def fake_ensure_proxy(*args: object, **kwargs: object) -> tuple[None, int]:
         captured["ensure_args"] = args
         captured["ensure_kwargs"] = kwargs
+        captured["proxy_environ"] = dict(os.environ)
+        if actual_port is not None:
+            return None, actual_port
         return None, args[0] if args else 8787
 
     def fake_run(cmd: list[str], *, env: dict[str, str]) -> _Completed:
@@ -104,18 +115,23 @@ def _invoke_wrap_claude(
     monkeypatch.setattr(wrap_mod, "detect_claude_code_version", lambda *_a, **_k: (2, 1, 196))
     monkeypatch.setattr(wrap_mod.subprocess, "run", fake_run)
 
-    result = runner.invoke(
-        main,
-        [
-            "wrap",
-            "claude",
-            "--no-mcp",
-            "--no-tokensave",
-            "--no-serena",
-            *extra_args,
-        ],
-        env=env,
-    )
+    # Isolate cwd: the wrap flow writes .claude/settings.local.json (selfheal
+    # hook, stale-marker check) relative to cwd, and with shutil.which patched
+    # above a run from the repo root would poison the real repo settings with a
+    # "/usr/bin/claude wrap selfheal" hook.
+    with runner.isolated_filesystem():
+        result = runner.invoke(
+            main,
+            [
+                "wrap",
+                "claude",
+                "--no-mcp",
+                "--no-tokensave",
+                "--no-serena",
+                *extra_args,
+            ],
+            env=env,
+        )
 
     assert result.exit_code == 0, result.output
     return captured, result.output
@@ -124,7 +140,8 @@ def _invoke_wrap_claude(
 def test_wrap_claude_plain_mode_warns_about_remote_control_gate(
     runner: CliRunner, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    captured, output = _invoke_wrap_claude(runner, monkeypatch, env={})
+    # -v restores the full #1779 explanation (#3426 made it opt-in).
+    captured, output = _invoke_wrap_claude(runner, monkeypatch, env={}, extra_args=("-v",))
 
     assert captured["child_cmd"] == ["/usr/bin/claude"]
     assert "Remote Control" in output
@@ -135,6 +152,15 @@ def test_wrap_claude_plain_mode_warns_about_remote_control_gate(
     assert "/rc" in output
     assert "may hide" not in output
     assert "#746" in output and "#1158" in output
+
+
+def test_wrap_claude_exports_actual_proxy_port(
+    runner: CliRunner, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    captured, _output = _invoke_wrap_claude(runner, monkeypatch, env={}, actual_port=8788)
+
+    assert captured["child_env"]["HEADROOM_PORT"] == "8788"
+    assert captured["child_env"]["ANTHROPIC_BASE_URL"].startswith("http://127.0.0.1:8788")
 
 
 def test_wrap_claude_plain_mode_api_key_auth_skips_remote_control_warning(
@@ -151,13 +177,18 @@ def test_wrap_claude_plain_mode_api_key_auth_skips_remote_control_warning(
 def test_wrap_claude_rejects_conflicting_auth_before_proxy_mutation(
     runner: CliRunner, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
+    _clear_claude_mode_env(monkeypatch)
     monkeypatch.chdir(tmp_path)
     user_settings = tmp_path / "user-settings.json"
     user_settings.write_text('{"env":{"ANTHROPIC_AUTH_TOKEN":"token-value"}}', encoding="utf-8")
     monkeypatch.setattr(wrap_mod, "claude_user_settings_path", lambda: user_settings)
     monkeypatch.setattr(wrap_mod.shutil, "which", lambda _name: "/usr/bin/claude")
     proxy_calls: list[int] = []
-    monkeypatch.setattr(wrap_mod, "_register_proxy_client", lambda port: proxy_calls.append(port))
+    monkeypatch.setattr(
+        wrap_mod,
+        "_register_proxy_client",
+        lambda port, session_token=None: proxy_calls.append(port),
+    )
 
     result = runner.invoke(
         main,
@@ -177,6 +208,7 @@ def test_wrap_claude_rejects_conflicting_auth_before_proxy_mutation(
 def test_wrap_claude_includes_shared_project_settings_in_auth_precedence(
     runner: CliRunner, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
+    _clear_claude_mode_env(monkeypatch)
     monkeypatch.chdir(tmp_path)
     user_settings = tmp_path / "user-settings.json"
     user_settings.write_text("{}", encoding="utf-8")
@@ -209,7 +241,7 @@ def test_wrap_claude_sibling_note_accurate_under_1m_and_tool_search_optouts(
         runner,
         monkeypatch,
         env={},
-        extra_args=("--1m", "--tool-search", "false"),
+        extra_args=("-v", "--1m", "--tool-search", "false"),
     )
     assert "already restored via --1m" in output
     assert "restore with `headroom wrap claude --1m`" not in output
@@ -262,15 +294,15 @@ def test_wrap_claude_tool_search_banner_line_still_accurate_when_active(
     runner: CliRunner, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     # Default session: deferral is on, and both the #746 banner line and the
-    # RC sibling note say so.
-    _captured, output = _invoke_wrap_claude(runner, monkeypatch, env={})
+    # RC sibling note say so (full wording under -v, #3426).
+    _captured, output = _invoke_wrap_claude(runner, monkeypatch, env={}, extra_args=("-v",))
     assert "on-demand tool loading kept on" in output
     assert "keeps it on for this session" in output
     assert "DISABLED per your setting" not in output
-    assert _captured["write_tool_search_value"] == "true"
+    assert "write_tool_search_value" not in _captured
 
 
-def test_wrap_claude_foundry_persists_disabled_tool_search_for_workers(
+def test_wrap_claude_foundry_keeps_disabled_tool_search_process_local_by_default(
     runner: CliRunner, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     captured, output = _invoke_wrap_claude(
@@ -283,8 +315,71 @@ def test_wrap_claude_foundry_persists_disabled_tool_search_for_workers(
     )
 
     assert captured["child_env"]["ENABLE_TOOL_SEARCH"] == "false"
+    assert "write_tool_search_value" not in captured
+    # Foundry's default turns deferral off without a --tool-search flag, so the
+    # compact line must not blame the user's setting (#3426).
+    assert "On-demand tool loading: off (this session)" in output
+    assert "kept on" not in output
+
+
+def test_wrap_claude_default_banner_is_compact(
+    runner: CliRunner, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Issue #3426: without -v the RC notice and the #746 line are one line each,
+    # and the long explanation / sibling note / env-var trailer are omitted.
+    _captured, output = _invoke_wrap_claude(runner, monkeypatch, env={})
+    assert (
+        "Remote Control (/rc) is disabled while routed through Headroom — run `claude` "
+        "directly (no wrap) for sessions that need it."
+    ) in output
+    assert "On-demand tool loading: kept on (this session)" in output
+    assert "Same base-URL gate" not in output
+    assert "ENABLE_TOOL_SEARCH=" not in output
+    assert "issue #746" not in output
+
+
+def test_wrap_claude_compact_tool_search_off_line(
+    runner: CliRunner, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _captured, output = _invoke_wrap_claude(
+        runner, monkeypatch, env={}, extra_args=("--tool-search", "false")
+    )
+    assert "On-demand tool loading: off (this session)" in output
+    assert "kept on" not in output
+
+
+def test_proxy_status_line_keeps_own_signature_and_names_port_once() -> None:
+    # The status helper must not inherit _ensure_proxy_unlocked's metadata via
+    # a stray @wraps; _ensure_proxy is the function that should carry it.
+    import inspect
+
+    assert wrap_mod._proxy_status_line.__name__ == "_proxy_status_line"
+    assert list(inspect.signature(wrap_mod._proxy_status_line).parameters) == [
+        "status",
+        "port",
+    ]
+    assert wrap_mod._ensure_proxy.__wrapped__ is wrap_mod._ensure_proxy_unlocked
+    assert "learn" in inspect.signature(wrap_mod._ensure_proxy).parameters
+
+    line = wrap_mod._proxy_status_line("Proxy ready", 8787)
+    assert line == "  Proxy ready — dashboard: http://127.0.0.1:8787/dashboard"
+    assert line.count("127.0.0.1:8787") == 1
+
+
+def test_wrap_claude_foundry_project_settings_opt_in_persists_disabled_tool_search(
+    runner: CliRunner, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    captured, _output = _invoke_wrap_claude(
+        runner,
+        monkeypatch,
+        env={
+            "CLAUDE_CODE_USE_FOUNDRY": "1",
+            "ANTHROPIC_FOUNDRY_BASE_URL": "https://tenant.services.ai.azure.com/anthropic",
+        },
+        extra_args=("--project-settings",),
+    )
+
     assert captured["write_tool_search_value"] == "false"
-    assert "on-demand tool loading DISABLED" in output
 
 
 def test_wrap_claude_vertex_passes_custom_base_url_to_proxy_before_child_redirect(
@@ -307,13 +402,11 @@ def test_wrap_claude_vertex_passes_custom_base_url_to_proxy_before_child_redirec
 
     ensure_kwargs = captured["ensure_kwargs"]
     child_env = captured["child_env"]
-    write_kwargs = captured["write_base_url_kwargs"]
     assert ensure_kwargs["vertex_api_url"] == custom_vertex_url
     assert ensure_kwargs["clear_vertex_api_url"] is False
     assert ensure_kwargs["anthropic_api_url"] is None
     assert child_env["ANTHROPIC_VERTEX_BASE_URL"] == "http://127.0.0.1:8787"
-    assert write_kwargs["vertex_mode"] is True
-    assert write_kwargs["foundry_mode"] is False
+    assert "write_base_url_kwargs" not in captured
 
 
 def test_wrap_claude_vertex_target_env_beats_anthropic_vertex_base_url(
@@ -366,7 +459,7 @@ def test_wrap_claude_vertex_default_or_absent_base_url_does_not_force_vertex_tar
     assert child_env["ANTHROPIC_VERTEX_BASE_URL"] == "http://127.0.0.1:8787"
 
 
-def test_wrap_claude_foundry_proxy_env_behavior_is_unchanged(
+def test_wrap_claude_foundry_proxy_env_uses_process_environment_only_by_default(
     runner: CliRunner, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     foundry_url = "https://my-resource.services.ai.azure.com/anthropic"
@@ -389,8 +482,7 @@ def test_wrap_claude_foundry_proxy_env_behavior_is_unchanged(
     assert ensure_kwargs["anthropic_api_url"] == foundry_url
     assert ensure_kwargs["vertex_api_url"] is None
     assert child_env["ANTHROPIC_FOUNDRY_BASE_URL"] == "http://127.0.0.1:8787/anthropic"
-    assert captured["write_base_url_kwargs"]["foundry_mode"] is True
-    assert captured["write_base_url_kwargs"]["vertex_mode"] is False
+    assert "write_base_url_kwargs" not in captured
 
 
 def test_write_vertex_mode_sets_vertex_key(tmp_path: Path) -> None:
@@ -434,7 +526,7 @@ def test_start_proxy_sets_vertex_target_env_for_proxy_subprocess(
     fake_proc = _FakeProxyProcess()
     captured: dict[str, Any] = {}
 
-    monkeypatch.setattr(wrap_mod, "_get_log_path", lambda: tmp_path / "proxy.log")
+    monkeypatch.setattr(wrap_mod, "_get_log_path", lambda port=None: tmp_path / "proxy.log")
     monkeypatch.setattr(wrap_mod, "_check_proxy", lambda _port: True)
     monkeypatch.setattr(wrap_mod.time, "sleep", lambda _seconds: None)
 
@@ -460,6 +552,29 @@ def test_start_proxy_sets_vertex_target_env_for_proxy_subprocess(
     assert proxy_env["VERTEX_TARGET_API_URL"] == "https://vertex-gateway.internal/custom"
 
 
+def test_start_proxy_marks_subprocess_as_wrap_owned(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Wrap-spawned proxies carry HEADROOM_WRAP_OWNED=1 for the orphan watchdog."""
+    fake_proc = _FakeProxyProcess()
+    captured: dict[str, Any] = {}
+
+    monkeypatch.setattr(wrap_mod, "_get_log_path", lambda port=None: tmp_path / "proxy.log")
+    monkeypatch.setattr(wrap_mod, "_check_proxy", lambda _port: True)
+    monkeypatch.setattr(wrap_mod.time, "sleep", lambda _seconds: None)
+
+    def fake_popen(cmd: list[str], **kwargs: object) -> _FakeProxyProcess:
+        captured["kwargs"] = kwargs
+        return fake_proc
+
+    monkeypatch.setattr(wrap_mod.subprocess, "Popen", fake_popen)
+
+    proc = wrap_mod._start_proxy(8787, agent_type="codex")
+
+    assert proc is fake_proc
+    assert captured["kwargs"]["env"]["HEADROOM_WRAP_OWNED"] == "1"
+
+
 def test_start_proxy_clears_inherited_vertex_target_env(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
@@ -467,7 +582,7 @@ def test_start_proxy_clears_inherited_vertex_target_env(
     captured: dict[str, Any] = {}
 
     monkeypatch.setenv("VERTEX_TARGET_API_URL", "http://127.0.0.1:8787")
-    monkeypatch.setattr(wrap_mod, "_get_log_path", lambda: tmp_path / "proxy.log")
+    monkeypatch.setattr(wrap_mod, "_get_log_path", lambda port=None: tmp_path / "proxy.log")
     monkeypatch.setattr(wrap_mod, "_check_proxy", lambda _port: True)
     monkeypatch.setattr(wrap_mod.time, "sleep", lambda _seconds: None)
 
@@ -497,7 +612,7 @@ def test_start_proxy_sets_pythonsafepath_to_avoid_cwd_shadow(
     fake_proc = _FakeProxyProcess()
     captured: dict[str, Any] = {}
 
-    monkeypatch.setattr(wrap_mod, "_get_log_path", lambda: tmp_path / "proxy.log")
+    monkeypatch.setattr(wrap_mod, "_get_log_path", lambda port=None: tmp_path / "proxy.log")
     monkeypatch.setattr(wrap_mod, "_check_proxy", lambda _port: True)
     monkeypatch.setattr(wrap_mod.time, "sleep", lambda _seconds: None)
 
@@ -601,3 +716,271 @@ def test_ensure_proxy_restarts_idle_proxy_to_clear_vertex_api_url(
     assert calls[1][0] == "start"
     assert calls[1][2]["vertex_api_url"] is None
     assert calls[1][2]["clear_vertex_api_url"] is True
+
+
+def _bedrock_settings(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    *,
+    user_env: dict[str, str] | None = None,
+    managed: str | None = None,
+) -> None:
+    """Point the user and managed settings at temp files, and undo AWS env lifts."""
+    user = tmp_path / "user-settings.json"
+    user.write_text(json.dumps({"env": user_env or {}}), encoding="utf-8")
+    managed_path = tmp_path / "managed-settings.json"
+    if managed is not None:
+        managed_path.write_text(managed, encoding="utf-8")
+    monkeypatch.setattr(wrap_mod, "claude_user_settings_path", lambda: user)
+    monkeypatch.setattr(wrap_mod, "_claude_managed_settings_path", lambda: managed_path)
+    for key in (*wrap_mod._CLAUDE_BEDROCK_AWS_KEYS, "HEADROOM_REGION", "HEADROOM_BACKEND"):
+        monkeypatch.setenv(key, "unset")  # record the original so the lift is undone
+        monkeypatch.delenv(key)
+
+
+def _session_override(child_cmd: list[str]) -> dict[str, str]:
+    """The env block of the --settings override wrap put first, or {}."""
+    if child_cmd[1:2] != ["--settings"]:
+        return {}
+    try:
+        return json.loads(child_cmd[2])["env"]
+    except (json.JSONDecodeError, KeyError):
+        return {}
+
+
+def _assert_routed_override(captured: dict, *, placeholder: bool) -> None:
+    override = _session_override(captured["child_cmd"])
+    expected = {
+        "CLAUDE_CODE_USE_BEDROCK": "0",
+        "CLAUDE_CODE_USE_VERTEX": "0",
+        "CLAUDE_CODE_USE_FOUNDRY": "0",
+        "ANTHROPIC_BASE_URL": captured["child_env"]["ANTHROPIC_BASE_URL"],
+    }
+    if placeholder:
+        expected["ANTHROPIC_AUTH_TOKEN"] = "headroom-bedrock"
+    assert override == expected
+    assert override["ANTHROPIC_BASE_URL"].startswith("http://127.0.0.1:")
+
+
+def _claude_sees(captured: dict, user_env: dict[str, str]) -> dict[str, str]:
+    """The env Claude Code resolves: child env < user settings < --settings override."""
+    effective = claude_effective_env(
+        ("shell", captured["child_env"]),
+        ("user", user_env),
+        ("--settings", _session_override(captured["child_cmd"])),
+    )
+    return {key: value for key, (value, _source) in effective.items()}
+
+
+def test_wrap_claude_bedrock_from_shell_routes_through_the_bedrock_backend(
+    runner: CliRunner, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    _bedrock_settings(monkeypatch, tmp_path)
+    captured, output = _invoke_wrap_claude(
+        runner, monkeypatch, env={"CLAUDE_CODE_USE_BEDROCK": "1", "AWS_REGION": "us-west-2"}
+    )
+
+    assert captured["ensure_kwargs"]["backend"] == "bedrock"
+    assert captured["ensure_kwargs"]["region"] == "us-west-2"
+    child = captured["child_env"]
+    assert child["CLAUDE_CODE_USE_BEDROCK"] == "0"
+    assert child["ANTHROPIC_BASE_URL"].startswith("http://127.0.0.1:")
+    assert child["ANTHROPIC_AUTH_TOKEN"]
+    _assert_routed_override(captured, placeholder=True)
+    assert len(captured["child_cmd"]) == 3
+    assert "Bedrock mode" in output
+
+
+def test_wrap_claude_bedrock_set_in_user_settings_is_overridden_for_the_session(
+    runner: CliRunner, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    # The flag and AWS settings live only in ~/.claude/settings.json, which
+    # Claude Code obeys over the shell.
+    _bedrock_settings(
+        monkeypatch,
+        tmp_path,
+        user_env={
+            "CLAUDE_CODE_USE_BEDROCK": "true",
+            "AWS_PROFILE": "bedrock-sso",
+            "AWS_REGION": "us-west-2",
+            "ANTHROPIC_API_KEY": "sk-ant-dummy",
+        },
+    )
+    captured, output = _invoke_wrap_claude(runner, monkeypatch, env={})
+
+    assert captured["ensure_kwargs"]["backend"] == "bedrock"
+    assert captured["ensure_kwargs"]["region"] == "us-west-2"
+    assert captured["proxy_environ"]["AWS_PROFILE"] == "bedrock-sso"
+    _assert_routed_override(captured, placeholder=False)
+    # A credential is already configured; adding another would conflict.
+    assert "ANTHROPIC_AUTH_TOKEN" not in captured["child_env"]
+    assert "CLAUDE_CODE_USE_BEDROCK=true from" in output
+
+
+def test_wrap_claude_bedrock_aws_key_cleared_in_settings_is_cleared_for_the_proxy(
+    runner: CliRunner, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    _bedrock_settings(
+        monkeypatch, tmp_path, user_env={"CLAUDE_CODE_USE_BEDROCK": "1", "AWS_PROFILE": ""}
+    )
+    captured, _output = _invoke_wrap_claude(
+        runner, monkeypatch, env={"AWS_PROFILE": "shell-profile"}
+    )
+
+    assert "AWS_PROFILE" not in captured["proxy_environ"]
+
+
+def test_wrap_claude_bedrock_region_flag_beats_aws_region(
+    runner: CliRunner, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    _bedrock_settings(monkeypatch, tmp_path)
+    captured, _output = _invoke_wrap_claude(
+        runner,
+        monkeypatch,
+        env={"CLAUDE_CODE_USE_BEDROCK": "1", "AWS_REGION": "us-west-2"},
+        extra_args=("--region", "eu-west-1"),
+    )
+
+    assert captured["ensure_kwargs"]["region"] == "eu-west-1"
+
+
+def test_wrap_claude_bedrock_wins_over_vertex_like_claude_code(
+    runner: CliRunner, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    _bedrock_settings(monkeypatch, tmp_path, user_env={"CLAUDE_CODE_USE_BEDROCK": "1"})
+    captured, output = _invoke_wrap_claude(runner, monkeypatch, env={"CLAUDE_CODE_USE_VERTEX": "1"})
+
+    assert captured["ensure_kwargs"]["backend"] == "bedrock"
+    assert "ANTHROPIC_VERTEX_BASE_URL" not in captured["child_env"]
+    assert "Bedrock mode" in output
+
+
+@pytest.mark.parametrize(
+    ("env", "extra_args", "managed", "reason"),
+    [
+        ({}, (), '{"env":{"CLAUDE_CODE_USE_BEDROCK":"1"}}', "ask your admin"),
+        ({"ANTHROPIC_BEDROCK_BASE_URL": "https://gw.example"}, (), None, "gateway"),
+        ({"CLAUDE_CODE_SKIP_BEDROCK_AUTH": "1"}, (), None, "gateway"),
+        ({}, ("--no-proxy",), None, "--no-proxy"),
+        ({}, ("--backend", "anthropic"), None, "'anthropic'"),
+        ({"HEADROOM_BACKEND": "anyllm"}, (), None, "'anyllm'"),
+        ({}, ("--", "--settings", "mine.json"), None, "your own --settings"),
+        ({}, (), '{"env":{"CLAUDE_CODE_USE_VERTEX":"1"}}', "CLAUDE_CODE_USE_VERTEX is set"),
+        ({}, (), '{"env":{"ANTHROPIC_BASE_URL":"https://x.test"}}', "ANTHROPIC_BASE_URL is set"),
+    ],
+)
+def test_wrap_claude_bedrock_it_cannot_route_is_left_alone_with_a_warning(
+    runner: CliRunner,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    env: dict[str, str],
+    extra_args: tuple[str, ...],
+    managed: str | None,
+    reason: str,
+) -> None:
+    managed_sets_bedrock = managed is not None and "CLAUDE_CODE_USE_BEDROCK" in managed
+    _bedrock_settings(
+        monkeypatch,
+        tmp_path,
+        user_env={} if managed_sets_bedrock else {"CLAUDE_CODE_USE_BEDROCK": "1"},
+        managed=managed,
+    )
+    captured, output = _invoke_wrap_claude(runner, monkeypatch, env=env, extra_args=extra_args)
+
+    assert _session_override(captured["child_cmd"]) == {}
+    assert "CLAUDE_CODE_USE_BEDROCK" not in captured["child_env"]
+    assert "Headroom will see none of its traffic" in output
+    assert reason in output
+
+
+def test_wrap_claude_unreadable_managed_settings_warns_instead_of_failing(
+    runner: CliRunner, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    _bedrock_settings(monkeypatch, tmp_path, managed="{not json")
+    captured, output = _invoke_wrap_claude(runner, monkeypatch, env={})
+
+    assert captured["child_cmd"] == ["/usr/bin/claude"]
+    assert "could not read" in output
+
+
+def test_wrap_claude_bedrock_skips_project_settings(
+    runner: CliRunner, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    _bedrock_settings(monkeypatch, tmp_path, user_env={"CLAUDE_CODE_USE_BEDROCK": "1"})
+    captured, output = _invoke_wrap_claude(
+        runner, monkeypatch, env={}, extra_args=("--project-settings",)
+    )
+
+    assert "write_base_url_args" not in captured
+    assert "Skipping project-local Claude settings in Bedrock mode" in output
+
+
+def test_wrap_claude_bedrock_flag_cleared_by_settings_is_not_bedrock(
+    runner: CliRunner, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    _bedrock_settings(monkeypatch, tmp_path, user_env={"CLAUDE_CODE_USE_BEDROCK": "0"})
+    captured, output = _invoke_wrap_claude(
+        runner, monkeypatch, env={"CLAUDE_CODE_USE_BEDROCK": "1"}
+    )
+
+    assert captured["ensure_kwargs"]["backend"] is None
+    assert captured["child_cmd"] == ["/usr/bin/claude"]
+    assert "Bedrock" not in output
+
+
+@pytest.mark.parametrize(
+    ("shell_env", "user_env"),
+    [
+        # Vertex or Foundry left on in any layer would win once Bedrock is off.
+        ({"CLAUDE_CODE_USE_VERTEX": "1"}, {"CLAUDE_CODE_USE_BEDROCK": "1"}),
+        ({}, {"CLAUDE_CODE_USE_BEDROCK": "1", "CLAUDE_CODE_USE_FOUNDRY": "1"}),
+        # A settings base URL outranks the shell's proxy URL.
+        ({}, {"CLAUDE_CODE_USE_BEDROCK": "1", "ANTHROPIC_BASE_URL": "https://x.invalid"}),
+    ],
+    ids=["shell_vertex", "settings_foundry", "settings_base_url"],
+)
+def test_wrap_claude_bedrock_session_override_beats_every_lower_layer(
+    runner: CliRunner,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    shell_env: dict[str, str],
+    user_env: dict[str, str],
+) -> None:
+    _bedrock_settings(monkeypatch, tmp_path, user_env=user_env)
+    captured, output = _invoke_wrap_claude(runner, monkeypatch, env=shell_env)
+
+    assert captured["ensure_kwargs"]["backend"] == "bedrock"
+    _assert_routed_override(captured, placeholder=True)
+    assert captured["child_env"]["CLAUDE_CODE_USE_VERTEX"] == "0"
+    assert captured["child_env"]["CLAUDE_CODE_USE_FOUNDRY"] == "0"
+    assert "Bedrock mode" in output
+
+
+@pytest.mark.parametrize(
+    ("shell_env", "cleared"),
+    [
+        ({"ANTHROPIC_API_KEY": "sk-ant-shell"}, {"ANTHROPIC_API_KEY": ""}),
+        ({"ANTHROPIC_AUTH_TOKEN": "shell-token"}, {"ANTHROPIC_AUTH_TOKEN": ""}),
+        (
+            {"ANTHROPIC_API_KEY": "sk-ant-shell"},
+            {"ANTHROPIC_API_KEY": "", "ANTHROPIC_AUTH_TOKEN": ""},
+        ),
+    ],
+    ids=["api_key_cleared", "auth_token_cleared", "both_keys_cleared"],
+)
+def test_wrap_claude_bedrock_credential_cleared_by_settings_still_gets_the_placeholder(
+    runner: CliRunner,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    shell_env: dict[str, str],
+    cleared: dict[str, str],
+) -> None:
+    user_env = {"CLAUDE_CODE_USE_BEDROCK": "1", **cleared}
+    _bedrock_settings(monkeypatch, tmp_path, user_env=user_env)
+    captured, _output = _invoke_wrap_claude(runner, monkeypatch, env=shell_env)
+
+    sees = _claude_sees(captured, user_env)
+    assert sees["ANTHROPIC_AUTH_TOKEN"] == "headroom-bedrock"
+    assert "ANTHROPIC_API_KEY" not in sees
+    assert "ANTHROPIC_API_KEY" not in captured["child_env"]
+    _assert_routed_override(captured, placeholder=True)

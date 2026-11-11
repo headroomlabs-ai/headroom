@@ -9,6 +9,7 @@ searched. Gated to gpt-5.4+ (older models 400 on the fields).
 from __future__ import annotations
 
 import copy
+import logging
 
 import pytest
 
@@ -53,6 +54,57 @@ def test_env_override_wins_then_falls_back(monkeypatch):
     # a malformed regex must not crash — fall back to the version gate.
     monkeypatch.setenv("HEADROOM_OPENAI_TOOL_SEARCH_MODELS", "[unclosed")
     assert _model_supports_openai_tool_search("gpt-5.4") is True
+
+
+class _Capture(logging.Handler):
+    def __init__(self) -> None:
+        super().__init__(logging.DEBUG)
+        self.records: list[logging.LogRecord] = []
+
+    def emit(self, record: logging.LogRecord) -> None:
+        self.records.append(record)
+
+
+def test_malformed_override_warns_once_not_per_request(monkeypatch):
+    """A bad regex used to be ignored on every request without a word."""
+    from headroom.proxy import helpers
+
+    monkeypatch.setattr(helpers, "_openai_tool_search_bad_pattern", None)
+    capture = _Capture()
+    proxy_logger = logging.getLogger("headroom.proxy")
+    proxy_logger.addHandler(capture)
+    try:
+        monkeypatch.setenv("HEADROOM_OPENAI_TOOL_SEARCH_MODELS", r"^gpt-5\.4")
+        assert _model_supports_openai_tool_search("gpt-5.4") is True
+        assert not capture.records  # a valid override is silent
+
+        monkeypatch.setenv("HEADROOM_OPENAI_TOOL_SEARCH_MODELS", "[unclosed")
+        for _ in range(5):
+            assert _model_supports_openai_tool_search("gpt-5.4") is True
+    finally:
+        proxy_logger.removeHandler(capture)
+
+    warnings = [r for r in capture.records if r.levelno == logging.WARNING]
+    assert len(warnings) == 1
+    assert "[unclosed" in warnings[0].getMessage()
+
+
+def test_valid_override_rearms_the_malformed_warning(monkeypatch):
+    """Bad A, valid B, bad A again: the second A is reported too."""
+    from headroom.proxy import helpers
+
+    monkeypatch.setattr(helpers, "_openai_tool_search_bad_pattern", None)
+    capture = _Capture()
+    proxy_logger = logging.getLogger("headroom.proxy")
+    proxy_logger.addHandler(capture)
+    try:
+        for pattern in ("[unclosed", r"^gpt-5\.4", "[unclosed"):
+            monkeypatch.setenv("HEADROOM_OPENAI_TOOL_SEARCH_MODELS", pattern)
+            assert _model_supports_openai_tool_search("gpt-5.4") is True
+    finally:
+        proxy_logger.removeHandler(capture)
+
+    assert [r.levelno for r in capture.records] == [logging.WARNING, logging.WARNING]
 
 
 # --- deferral behavior -------------------------------------------------------
@@ -114,6 +166,30 @@ def test_terminal_reserved_namespace_stays_resident():
     assert tools == snapshot
 
 
+@pytest.mark.parametrize(
+    "tool_name",
+    [
+        "file_search",
+        "web_search",
+        "code_interpreter",
+        "computer",
+        "image_generation",
+    ],
+)
+def test_reserved_openai_tools_stay_resident(tool_name: str) -> None:
+    tool = _fn(tool_name)
+    tools = [tool] + [_fn(f"peer_{i}") for i in range(11)]
+    snapshot = copy.deepcopy(tools)
+
+    out = inject_tool_search_deferral_openai(tools, "gpt-5.6-terra")
+
+    forwarded = next(t for t in out if t.get("name") == tool_name)
+    assert forwarded == tool
+    assert "defer_loading" not in forwarded
+    assert next(t for t in out if t.get("name") == "peer_0").get("defer_loading") is True
+    assert tools == snapshot
+
+
 def test_terminal_helper_remains_deferrable():
     tools = [_fn("terminal_helper")] + [_fn(f"peer_{i}") for i in range(11)]
 
@@ -123,9 +199,39 @@ def test_terminal_helper_remains_deferrable():
     assert helper.get("defer_loading") is True
 
 
+def test_reserved_helpers_remain_deferrable():
+    tools = [_fn("file_search_helper"), _fn("web_search_client")] + [
+        _fn(f"peer_{i}") for i in range(10)
+    ]
+
+    out = inject_tool_search_deferral_openai(tools, "gpt-5.6-terra")
+
+    for name in ("file_search_helper", "web_search_client"):
+        tool = next(t for t in out if t.get("name") == name)
+        assert tool.get("defer_loading") is True
+
+
 def test_prefixed_core_and_terminal_names_stay_resident():
-    resident = ["_bash", "_read", "_write", "_edit", "_glob", "_grep", "_terminal"]
-    noncore = ["_hub", "_todo", "_eval", "mcp__server__read", "terminal_helper"]
+    resident = [
+        "_bash",
+        "_read",
+        "_write",
+        "_edit",
+        "_glob",
+        "_grep",
+        "_terminal",
+        "_file_search",
+        "_web_search",
+        "_code_interpreter",
+    ]
+    noncore = [
+        "_hub",
+        "_todo",
+        "_eval",
+        "mcp__server__read",
+        "terminal_helper",
+        "file_search_helper",
+    ]
     tools = [_fn(name) for name in resident + noncore]
 
     out = inject_tool_search_deferral_openai(tools, "gpt-5.6-terra")

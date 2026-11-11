@@ -89,6 +89,29 @@ def test_proxy_policy_clamps_by_cache_count() -> None:
     assert prep.frozen_message_count == 3
 
 
+def test_proxy_policy_follows_the_tracker_past_a_tool_search_result() -> None:
+    """A ToolSearch result holds only tool_reference blocks. It used to stop
+    the cache count, so the freeze sat there for the whole session and the
+    pipeline re-ran everything after it on every turn."""
+    cache = CompressionCache()
+    search = {
+        "role": "user",
+        "content": [
+            {
+                "type": "tool_result",
+                "tool_use_id": "ts",
+                "content": [{"type": "tool_reference", "tool_name": "mcp__notes__search"}],
+            }
+        ],
+    }
+    messages = [{"role": "user", "content": "find the notes tool"}, search]
+    messages += [{"role": "assistant", "content": f"step {i}"} for i in range(6)]
+    messages.append({"role": "user", "content": "next"})
+
+    prep = prepare_turn(cache, messages, policy=FREEZE_POLICY_CONFIRMED_CLAMP, tracker_frozen=8)
+    assert prep.frozen_message_count == 8
+
+
 def test_proxy_policy_clamps_by_tracker() -> None:
     """Local state could replay 3, but the provider only confirmed 1: content
     past the confirmed prefix stays compressible (the #327 posture)."""
@@ -180,6 +203,36 @@ def test_finalize_count_hook_failure_falls_back() -> None:
     )
     assert turn.replayed
     assert turn.tokens is None
+
+
+def test_finalize_declines_inflating_replay_by_default() -> None:
+    prev_original, prev_returned = _prev_pair()
+    current = prev_original + [{"role": "user", "content": "next"}]
+    # The pipeline recompressed message 0 SMALLER than the returned form.
+    recompressed = [
+        {"role": "user", "content": "[t]"},
+        {"role": "assistant", "content": "ok"},
+        {"role": "user", "content": "next"},
+    ]
+    turn = finalize_turn(recompressed, current, prev_original, prev_returned)
+    assert not turn.replayed
+    assert turn.messages == recompressed
+
+
+def test_finalize_confirmed_floor_replays_confirmed_bytes() -> None:
+    prev_original, prev_returned = _prev_pair()
+    current = prev_original + [{"role": "user", "content": "next"}]
+    recompressed = [
+        {"role": "user", "content": "[t]"},
+        {"role": "assistant", "content": "ok"},
+        {"role": "user", "content": "next"},
+    ]
+    turn = finalize_turn(
+        recompressed, current, prev_original, prev_returned, confirmed_frozen_count=2
+    )
+    assert turn.replayed
+    assert turn.messages[0]["content"] == "[returned-form]"
+    assert turn.messages[-1]["content"] == "next"
 
 
 # --------------------------------------------------------------------------- #

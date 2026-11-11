@@ -13,6 +13,7 @@ Or via headroom extras:
 
 from __future__ import annotations
 
+import heapq
 import json
 from dataclasses import dataclass
 from datetime import datetime
@@ -22,6 +23,7 @@ from typing import TYPE_CHECKING, Any
 
 import numpy as np
 
+from ...fileperms import ensure_private_file, open_owner_only
 from ..models import Memory, ScopeLevel, normalize_entity_refs
 from ..ports import VectorFilter, VectorSearchResult
 
@@ -393,15 +395,19 @@ class HNSWVectorIndex:
         if not self._metadata:
             return 0
 
-        # Sort entries by importance (ascending), then by created_at (oldest first)
-        sorted_entries = sorted(
+        # Select the `count` lowest-importance (then oldest) entries. nsmallest
+        # is O(n log count); fully sorting all entries just to take the first
+        # `count` was O(n log n), and eviction runs on every insert once a
+        # bounded index is at capacity. The selection is identical.
+        lowest_entries = heapq.nsmallest(
+            count,
             self._metadata.items(),
             key=lambda x: (x[1].importance, x[1].created_at),
         )
 
         # Evict the lowest importance entries
         evicted = 0
-        for memory_id, _metadata in sorted_entries[:count]:
+        for memory_id, _metadata in lowest_entries:
             if memory_id not in self._memory_to_hnsw:
                 continue
 
@@ -488,11 +494,19 @@ class HNSWVectorIndex:
                     self._metadata[memory.id] = IndexedMemoryMetadata.from_memory(memory)
                     self._embeddings[memory.id] = embedding.copy()
 
-            # Handle updates (hnswlib doesn't support true updates, so we track separately)
+            # Updates: add_items with an existing label replaces its vector. A batch
+            # can name the same id more than once; keep only the last entry so the
+            # graph, the cached embedding and the metadata end on the same vector
+            # (hnswlib may apply rows for one label out of order across threads).
+            update_memories = list({m.id: (m, emb) for m, emb in update_memories}.values())
+            if update_memories:
+                self._index.add_items(
+                    np.vstack([emb for _, emb in update_memories]).astype(np.float32),
+                    np.array([self._memory_to_hnsw[m.id] for m, _ in update_memories]),
+                )
             for memory, embedding in update_memories:
                 self._metadata[memory.id] = IndexedMemoryMetadata.from_memory(memory)
                 self._embeddings[memory.id] = embedding.copy()
-                # Note: HNSW embedding stays unchanged unless we remove and re-add
 
         if self._auto_save and self._save_path:
             self.save_index(self._save_path)
@@ -742,9 +756,7 @@ class HNSWVectorIndex:
     async def update_embedding(self, memory_id: str, embedding: np.ndarray) -> bool:
         """Update the embedding for an indexed memory.
 
-        Note: hnswlib doesn't support in-place updates. This stores the new
-        embedding but the HNSW graph uses the original. For full update,
-        remove and re-index the memory.
+        The new vector replaces the old one in the HNSW graph, so search uses it.
 
         Args:
             memory_id: The unique identifier of the memory.
@@ -771,15 +783,15 @@ class HNSWVectorIndex:
     async def _update_embedding_internal(self, memory_id: str, embedding: np.ndarray) -> bool:
         """Internal embedding update without lock (caller must hold lock).
 
-        hnswlib doesn't support true in-place updates, so we:
-        1. Store the new embedding in our local cache
-        2. The HNSW index continues to use the old embedding for search
-
-        For a true update, the caller should remove and re-index.
+        hnswlib's ``add_items`` with an existing label replaces that element's
+        vector in place (``addPoint`` -> ``updatePoint``), so the label and the
+        id mappings stay as they are and search sees the new vector.
         """
-        if memory_id not in self._memory_to_hnsw:
+        hnsw_id = self._memory_to_hnsw.get(memory_id)
+        if hnsw_id is None:
             return False
 
+        self._index.add_items(embedding.reshape(1, -1), np.array([hnsw_id]))
         self._embeddings[memory_id] = embedding.copy()
         return True
 
@@ -807,8 +819,11 @@ class HNSWVectorIndex:
         path = Path(path)
 
         with self._lock:
-            # Save HNSW index
+            # Save HNSW index. hnswlib opens the path itself and would create
+            # it at the umask, so make it a private regular file first (refusing
+            # a symlink); its truncating write keeps the 0600 mode.
             hnsw_path = path.with_suffix(".hnsw")
+            ensure_private_file(hnsw_path, what="HNSW index")
             self._index.save_index(str(hnsw_path))
 
             # Save metadata, mappings, and embeddings
@@ -829,7 +844,9 @@ class HNSWVectorIndex:
                 "embeddings": {mid: emb.tolist() for mid, emb in self._embeddings.items()},
             }
 
-            with open(meta_path, "w") as f:
+            # Memory metadata and raw embeddings: owner-only, like every other
+            # memory store file.
+            with open_owner_only(meta_path, "w") as f:
                 json.dump(meta_data, f)
 
     def load_index(self, path: str | Path) -> None:

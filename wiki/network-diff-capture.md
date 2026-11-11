@@ -12,6 +12,7 @@ and JSON payload differences.
 cd docker/differential-network-capture
 mkdir -p captures
 export ANTHROPIC_API_KEY=...
+export HEADROOM_PROXY_TOKEN='capture-secret'
 export CLAUDE_PROMPT="Summarize this repository in one sentence."
 docker compose up --build mitm-direct mitm-headroom-upstream headroom-proxy mitm-headroom-client
 docker compose --profile run run --rm claude-direct
@@ -26,6 +27,16 @@ The primary captures are written to:
 The Headroom lane also writes
 `docker/differential-network-capture/captures/headroom-upstream.jsonl`, which is
 the request Headroom forwards to Anthropic after proxy processing.
+
+`HEADROOM_PROXY_TOKEN` is required for the Headroom lane. The capture addon
+adds it only to requests from `mitm-headroom-client`; direct and upstream
+captures never receive it. Keep this value private and use the same value when
+calling a deliberately public Headroom proxy.
+
+The direct and upstream mitmproxy ports are published on loopback for local
+inspection. The client capture stays on the internal Compose network because
+it is an internal hop, so `HEADROOM_CLIENT_MITM_PORT` is intentionally not a
+supported setting.
 
 By default only `api.anthropic.com` is logged. Override
 `CAPTURE_INCLUDE_HOSTS` with a comma-separated list to include other hosts.

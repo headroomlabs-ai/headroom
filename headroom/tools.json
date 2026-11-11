@@ -103,27 +103,45 @@
       "version": "v0.8.1",
       "binary": "codebase-memory-mcp",
       "source": "DeusData/codebase-memory-mcp",
-      "_comment": "No Windows build published for v0.8.1.",
+      "_comment": "Upstream names its assets arm64/amd64; the registry keys them by PlatformKey.key(), i.e. aarch64/x86_64.",
       "assets": {
-        "darwin-arm64": {
-          "url": "https://github.com/DeusData/codebase-memory-mcp/releases/download/v0.8.1/codebase-memory-mcp-darwin-arm64.tar.gz",
+        "linux-x86_64-gnu": {
+          "url": "https://github.com/DeusData/codebase-memory-mcp/releases/download/v0.8.1/codebase-memory-mcp-linux-amd64.tar.gz",
           "member": "codebase-memory-mcp",
-          "sha256": "fbd047509852021b5446a11141bcb0a3d1dcaebf6e5112460960f29f052c1c58"
+          "sha256": "dbd3b92ea870ef240b63059f26bda15015f76ef9978931bebc3a0f9d09470973"
         },
-        "darwin-amd64": {
-          "url": "https://github.com/DeusData/codebase-memory-mcp/releases/download/v0.8.1/codebase-memory-mcp-darwin-amd64.tar.gz",
+        "linux-x86_64-musl": {
+          "url": "https://github.com/DeusData/codebase-memory-mcp/releases/download/v0.8.1/codebase-memory-mcp-linux-amd64-portable.tar.gz",
           "member": "codebase-memory-mcp",
-          "sha256": "fb62da3016ea12b948351208759b5c083fb1446cf6e78d6db8b7cd28fe86fd54"
+          "sha256": "6ab87a6c05d049dde57700803ca0ab4199fcf25973a0606618af0fcee73f5abd",
+          "_comment": "upstream publishes a separate -portable build of this release; used for musl, where the standard (glibc-linked) linux asset is not expected to run. Not yet run on a musl host."
         },
-        "linux-arm64": {
+        "linux-aarch64-gnu": {
           "url": "https://github.com/DeusData/codebase-memory-mcp/releases/download/v0.8.1/codebase-memory-mcp-linux-arm64.tar.gz",
           "member": "codebase-memory-mcp",
           "sha256": "d2f842d1365da5c35d9c5796f57a821c9745267350994346735e1e6e04d46091"
         },
-        "linux-amd64": {
-          "url": "https://github.com/DeusData/codebase-memory-mcp/releases/download/v0.8.1/codebase-memory-mcp-linux-amd64.tar.gz",
+        "linux-aarch64-musl": {
+          "url": "https://github.com/DeusData/codebase-memory-mcp/releases/download/v0.8.1/codebase-memory-mcp-linux-arm64-portable.tar.gz",
           "member": "codebase-memory-mcp",
-          "sha256": "dbd3b92ea870ef240b63059f26bda15015f76ef9978931bebc3a0f9d09470973"
+          "sha256": "13526acc2a6a0697dff3c763fb443a416589bc10ad8b12015b63d87e515dd72b",
+          "_comment": "upstream publishes a separate -portable build of this release; used for musl, where the standard (glibc-linked) linux asset is not expected to run. Not yet run on a musl host."
+        },
+        "darwin-x86_64": {
+          "url": "https://github.com/DeusData/codebase-memory-mcp/releases/download/v0.8.1/codebase-memory-mcp-darwin-amd64.tar.gz",
+          "member": "codebase-memory-mcp",
+          "sha256": "fb62da3016ea12b948351208759b5c083fb1446cf6e78d6db8b7cd28fe86fd54"
+        },
+        "darwin-aarch64": {
+          "url": "https://github.com/DeusData/codebase-memory-mcp/releases/download/v0.8.1/codebase-memory-mcp-darwin-arm64.tar.gz",
+          "member": "codebase-memory-mcp",
+          "sha256": "fbd047509852021b5446a11141bcb0a3d1dcaebf6e5112460960f29f052c1c58"
+        },
+        "windows-x86_64": {
+          "url": "https://github.com/DeusData/codebase-memory-mcp/releases/download/v0.8.1/codebase-memory-mcp-windows-amd64.zip",
+          "member": "codebase-memory-mcp.exe",
+          "sha256": "a602ad090ed3f49d86c55472f73f27ad7055222806a82358f2e08513e027f00f",
+          "_comment": "member name follows the difft/scc convention for the windows zip; not yet extracted on a windows host."
         }
       }
     }

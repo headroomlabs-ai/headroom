@@ -5,28 +5,25 @@ for wrapping LangChain tools to automatically compress their outputs
 and track per-tool compression metrics.
 
 Example:
-    from langchain.agents import create_openai_tools_agent
-    from langchain.tools import Tool
+    from langchain_core.tools import tool
     from headroom.integrations import wrap_tools_with_headroom
 
-    # Define tools
-    tools = [
-        Tool(name="search", func=search_func, description="Search"),
-        Tool(name="database", func=db_func, description="Query DB"),
-    ]
+    @tool
+    def search(query: str) -> str:
+        # docstring becomes the tool description
+        return json.dumps(results)
 
-    # Wrap with Headroom compression
-    wrapped_tools = wrap_tools_with_headroom(tools)
+    # Wrap with Headroom compression; the argument schema is preserved,
+    # so the wrapped tool is a drop-in replacement.
+    wrapped_tools = wrap_tools_with_headroom([search])
 
-    # Use in agent - outputs are automatically compressed
-    agent = create_openai_tools_agent(llm, wrapped_tools, prompt)
+    # Use in any agent - outputs are compressed before re-entering context
+    agent = create_agent(llm, wrapped_tools)
 """
 
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass, field
-from datetime import datetime
 from typing import Any
 
 # LangChain imports - these are optional dependencies
@@ -40,6 +37,12 @@ except ImportError:
     StructuredTool = object  # type: ignore[misc,assignment]
     Tool = object  # type: ignore[misc,assignment]
 
+# Re-exported: callers import ToolCompressionMetrics from this module.
+from headroom.integrations._metrics import (  # noqa: F401
+    ToolCompressionMetrics,
+    ToolMetricsCollector,
+    _record_tool_metrics,
+)
 from headroom.integrations.mcp import compress_tool_result
 
 logger = logging.getLogger(__name__)
@@ -50,74 +53,9 @@ def _check_langchain_available() -> None:
     if not LANGCHAIN_AVAILABLE:
         raise ImportError(
             "LangChain is required for this integration. "
-            "Install with: pip install headroom[langchain] "
+            'Install with: pip install "headroom-ai[langchain]" '
             "or: pip install langchain-core"
         )
-
-
-@dataclass
-class ToolCompressionMetrics:
-    """Metrics from a single tool compression."""
-
-    tool_name: str
-    timestamp: datetime
-    chars_before: int
-    chars_after: int
-    chars_saved: int
-    compression_ratio: float
-    was_compressed: bool
-
-
-@dataclass
-class ToolMetricsCollector:
-    """Collects compression metrics across all tool invocations."""
-
-    metrics: list[ToolCompressionMetrics] = field(default_factory=list)
-
-    def add(self, metric: ToolCompressionMetrics) -> None:
-        """Add a metric entry."""
-        self.metrics.append(metric)
-        # Keep only last 1000
-        if len(self.metrics) > 1000:
-            self.metrics = self.metrics[-1000:]
-
-    def get_summary(self) -> dict[str, Any]:
-        """Get summary statistics."""
-        if not self.metrics:
-            return {
-                "total_invocations": 0,
-                "total_compressions": 0,
-                "total_chars_saved": 0,
-            }
-
-        compressed = [m for m in self.metrics if m.was_compressed]
-        return {
-            "total_invocations": len(self.metrics),
-            "total_compressions": len(compressed),
-            "total_chars_saved": sum(m.chars_saved for m in self.metrics),
-            "average_compression_ratio": (
-                sum(m.compression_ratio for m in compressed) / len(compressed) if compressed else 0
-            ),
-            "by_tool": self._get_by_tool_stats(),
-        }
-
-    def _get_by_tool_stats(self) -> dict[str, dict[str, Any]]:
-        """Get per-tool statistics."""
-        by_tool: dict[str, list[ToolCompressionMetrics]] = {}
-        for m in self.metrics:
-            if m.tool_name not in by_tool:
-                by_tool[m.tool_name] = []
-            by_tool[m.tool_name].append(m)
-
-        result = {}
-        for name, tool_metrics in by_tool.items():
-            compressed = [m for m in tool_metrics if m.was_compressed]
-            result[name] = {
-                "invocations": len(tool_metrics),
-                "compressions": len(compressed),
-                "chars_saved": sum(m.chars_saved for m in tool_metrics),
-            }
-        return result
 
 
 # Global metrics collector
@@ -143,7 +81,7 @@ class HeadroomToolWrapper:
     database queries, etc.).
 
     Example:
-        from langchain.tools import Tool
+        from langchain_core.tools import tool
         from headroom.integrations import HeadroomToolWrapper
 
         def search(query: str) -> str:
@@ -198,7 +136,7 @@ class HeadroomToolWrapper:
             Compressed tool output as string.
         """
         # Invoke underlying tool
-        result = self.tool.invoke(*args, **kwargs)
+        result = self.tool.invoke(self._as_tool_input(*args, **kwargs))
 
         # Convert to string if needed
         if not isinstance(result, str):
@@ -215,9 +153,48 @@ class HeadroomToolWrapper:
 
         return compressed
 
+    @staticmethod
+    def _as_tool_input(*args: Any, **kwargs: Any) -> Any:
+        """Rebuild the single input argument ``BaseTool.invoke`` expects.
+
+        ``StructuredTool`` calls its ``func`` with the parsed schema fields
+        unpacked (``func(query="x")``), while ``BaseTool.invoke`` takes one
+        positional ``input``. Passing the unpacked form straight through raises
+        ``TypeError: BaseTool.invoke() missing 1 required positional argument``.
+        """
+        if args and kwargs:
+            if len(args) == 1 and isinstance(args[0], dict):
+                return {**args[0], **kwargs}
+            raise TypeError(
+                "Cannot map mixed positional and keyword arguments onto a tool "
+                f"input: args={args!r}, kwargs={list(kwargs)!r}"
+            )
+        if kwargs:
+            return kwargs
+        if len(args) == 1:
+            return args[0]
+        if not args:
+            return {}
+        raise TypeError(f"Expected a single tool input, got {len(args)} positional arguments")
+
     def invoke(self, *args: Any, **kwargs: Any) -> str:
         """Invoke the tool (alias for __call__)."""
         return self(*args, **kwargs)
+
+    async def acall(self, *args: Any, **kwargs: Any) -> str:
+        """Async counterpart of ``__call__``, used for ``ainvoke``."""
+        result = await self.tool.ainvoke(self._as_tool_input(*args, **kwargs))
+
+        if not isinstance(result, str):
+            result = str(result)
+
+        if len(result) < self.min_chars_to_compress:
+            self._record_metrics(result, result, was_compressed=False)
+            return str(result)
+
+        compressed = self._compress_output(result)
+        self._record_metrics(result, compressed, was_compressed=True)
+        return compressed
 
     def _compress_output(self, output: str) -> str:
         """Apply compression to tool output.
@@ -245,41 +222,56 @@ class HeadroomToolWrapper:
             compressed: Compressed output.
             was_compressed: Whether compression was applied.
         """
-        chars_before = len(original)
-        chars_after = len(compressed)
-        chars_saved = chars_before - chars_after
+        _record_tool_metrics(self._metrics, self.name, original, compressed, was_compressed, logger)
 
-        metric = ToolCompressionMetrics(
-            tool_name=self.name,
-            timestamp=datetime.now(),
-            chars_before=chars_before,
-            chars_after=chars_after,
-            chars_saved=max(0, chars_saved),
-            compression_ratio=chars_after / chars_before if chars_before > 0 else 1.0,
-            was_compressed=was_compressed and chars_saved > 0,
+    @staticmethod
+    def _usable_args_schema(tool: Any) -> Any:
+        """Return the tool's args_schema only if LangChain will accept it.
+
+        StructuredTool requires a pydantic model class or a JSON-schema dict.
+        Tools built by hand (or test doubles) may carry something else, and
+        passing that through turns a working tool into a construction error, so
+        fall back to inferring the schema instead.
+        """
+        schema = getattr(tool, "args_schema", None)
+        if schema is None:
+            return None
+        if isinstance(schema, dict):
+            return schema
+        try:
+            from pydantic import BaseModel
+
+            if isinstance(schema, type) and issubclass(schema, BaseModel):
+                return schema
+        except Exception:  # pragma: no cover - pydantic always present with langchain
+            pass
+        logger.debug(
+            "Tool %r has an args_schema LangChain cannot use (%s); inferring instead",
+            getattr(tool, "name", tool),
+            type(schema).__name__,
         )
-
-        self._metrics.add(metric)
-
-        if was_compressed and chars_saved > 0:
-            logger.info(
-                f"HeadroomToolWrapper[{self.name}]: {chars_before} -> {chars_after} chars "
-                f"({chars_saved} saved, {metric.compression_ratio:.1%} of original)"
-            )
+        return None
 
     def as_langchain_tool(self) -> StructuredTool:
         """Convert wrapper back to a LangChain tool.
 
-        Useful when you need to pass the wrapped tool to APIs
-        that expect a LangChain tool type.
+        The wrapped tool keeps the original tool's argument schema, so a model
+        still sees the same typed parameters. Inferring the schema from
+        ``__call__`` instead would advertise ``(*args, **kwargs)`` and leave the
+        model with no parameters to fill in.
 
         Returns:
             StructuredTool that wraps this wrapper.
         """
+        args_schema = self._usable_args_schema(self.tool)
         return StructuredTool.from_function(
             func=self.__call__,
+            coroutine=self.acall,
             name=self.name,
             description=self.description,
+            args_schema=args_schema,
+            infer_schema=args_schema is None,
+            return_direct=getattr(self.tool, "return_direct", False),
         )
 
 
@@ -301,14 +293,14 @@ def wrap_tools_with_headroom(
         List of wrapped tools as StructuredTools.
 
     Example:
-        from langchain.tools import Tool
+        from langchain.agents import create_agent
         from headroom.integrations import wrap_tools_with_headroom
 
         tools = [search_tool, database_tool, api_tool]
         wrapped = wrap_tools_with_headroom(tools)
 
         # Use wrapped tools in agent
-        agent = create_openai_tools_agent(llm, wrapped, prompt)
+        agent = create_agent(llm, wrapped)
     """
     _check_langchain_available()
 

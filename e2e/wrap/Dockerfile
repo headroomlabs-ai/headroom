@@ -30,7 +30,7 @@ RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
 
 WORKDIR /build
 
-COPY pyproject.toml uv.lock README.md ./
+COPY pyproject.toml uv.lock README.md README-pypi.md ./
 COPY Cargo.toml Cargo.lock rust-toolchain.toml ./
 COPY crates/ crates/
 COPY headroom/ headroom/
@@ -62,27 +62,40 @@ FROM python:3.11-slim
 
 ENV DEBIAN_FRONTEND=noninteractive \
     AIDER_CHAT_VERSION=0.86.2 \
-    CODEX_VERSION=0.118.0 \
-    OPENCLAW_VERSION=2026.4.7 \
     OPENCODE_VERSION=1.17.8 \
-    PATH="/opt/headroom-venv/bin:/opt/aider-venv/bin:${PATH}" \
+    PATH="/opt/wrap-tools/node_modules/.bin:/opt/headroom-venv/bin:/opt/aider-venv/bin:${PATH}" \
     PIP_DISABLE_PIP_VERSION_CHECK=1 \
     PIP_NO_CACHE_DIR=1 \
     PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1
 
-# Install Node.js 22 from NodeSource (matches what node:22-trixie gives,
-# but layered onto python:3.11-slim so we get py3.11 + node22 + glibc 2.41
-# in one image). Also install git for any package that clones at install.
+# OpenClaw 2026.10.10 requires Node >=24.16.0 <25 (or >=26.1.0). Install the
+# Node 24 LTS line alongside Python 3.11. Also install git for packages
+# that clone at install time.
 RUN apt-get update && \
     apt-get install -y --no-install-recommends \
       ca-certificates \
       curl \
       git \
       gnupg && \
-    curl -fsSL https://deb.nodesource.com/setup_22.x | bash - && \
+    curl -fsSL https://deb.nodesource.com/setup_24.x | bash - && \
     apt-get install -y --no-install-recommends nodejs && \
     rm -rf /var/lib/apt/lists/*
+
+# npm 10.9.8 crashes in Arborist's peer-set resolver when installing the local
+# OpenClaw plugin (Cannot read properties of null, reading 'edgesOut'). Pin the
+# tested npm version so both wrap-e2e callers use the same working installer.
+RUN npm install -g --no-fund --no-audit npm@12.2.1
+
+# Freeze transitive CLI dependencies as well as the top-level versions.
+# Global npm install re-resolves ranges and can select partially published
+# dependency releases; npm ci consumes the reviewed lockfile instead.
+COPY e2e/wrap/tools/package.json e2e/wrap/tools/package-lock.json e2e/wrap/tools/.npmrc /opt/wrap-tools/
+RUN npm ci --prefix /opt/wrap-tools --no-fund --no-audit --strict-allow-scripts
+
+# Exercise the installed dependency fixes in both existing wrap-E2E CI callers.
+COPY e2e/wrap/tools/dependency-regression.test.cjs /opt/wrap-tools/
+RUN npm test --prefix /opt/wrap-tools
 
 WORKDIR /workspace
 
@@ -109,7 +122,6 @@ RUN python -m venv /opt/headroom-venv && \
     python -m venv /opt/aider-venv && \
     /opt/aider-venv/bin/python -m pip install --upgrade pip && \
     /opt/aider-venv/bin/python -m pip install "aider-chat==${AIDER_CHAT_VERSION}" && \
-    npm install -g --no-fund --no-audit "@openai/codex@${CODEX_VERSION}" "openclaw@${OPENCLAW_VERSION}" && \
     curl -fsSL https://opencode.ai/install | VERSION="${OPENCODE_VERSION}" bash
 
 # The opencode installer adds its bin dir to .bashrc. Non-login shells
