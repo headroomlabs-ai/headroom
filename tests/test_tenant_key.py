@@ -91,7 +91,7 @@ def test_header_path_with_no_allowed_chars_stays_isolated() -> None:
     tenant_key, source = resolve_tenant_key(req)
     assert source == SOURCE_HEADER
     assert tenant_key != GLOBAL_TENANT_KEY
-    assert tenant_key.startswith("tenant-")
+    assert tenant_key.startswith("tnt-tenant-")
 
 
 def test_header_path_falls_through_when_header_is_blank() -> None:
@@ -198,7 +198,7 @@ def test_sanitization_drops_control_chars() -> None:
     """Control chars (``\\x00`` / ``\\x1f``) get stripped, key stays unique."""
     req = _request(headers={"X-Headroom-Tenant-ID": "ten\x00ant\x1f1"})
     tenant_key, source = resolve_tenant_key(req)
-    assert tenant_key.startswith("tenant1-")
+    assert tenant_key.startswith("tnt-tenant1-")
     assert _is_valid_key(tenant_key)
     assert source == SOURCE_HEADER
 
@@ -207,7 +207,7 @@ def test_sanitization_drops_tab_and_newline() -> None:
     """Whitespace inside the value (``\\t`` / ``\\n``) gets stripped."""
     req = _request(headers={"X-Headroom-Tenant-ID": "tenant\t\n1"})
     tenant_key, source = resolve_tenant_key(req)
-    assert tenant_key.startswith("tenant1-")
+    assert tenant_key.startswith("tnt-tenant1-")
     assert _is_valid_key(tenant_key)
     assert source == SOURCE_HEADER
 
@@ -216,7 +216,7 @@ def test_sanitization_drops_punctuation() -> None:
     """`|`, `:`, `.`, `,`, `/` never reach the key (TOIN separator safety)."""
     req = _request(headers={"X-Headroom-Tenant-ID": "ten|ant:1.0/x"})
     tenant_key, source = resolve_tenant_key(req)
-    assert tenant_key.startswith("tenant10x-")
+    assert tenant_key.startswith("tnt-tenant10x-")
     assert _is_valid_key(tenant_key)
     assert source == SOURCE_HEADER
 
@@ -231,7 +231,7 @@ def test_sanitization_keeps_pure_unicode_tenant_isolated() -> None:
     req = _request(headers={"X-Headroom-Tenant-ID": "测试テスト"})
     tenant_key, source = resolve_tenant_key(req)
     assert source == SOURCE_HEADER
-    assert tenant_key.startswith("tenant-")
+    assert tenant_key.startswith("tnt-tenant-")
     assert _is_valid_key(tenant_key)
 
 
@@ -240,7 +240,7 @@ def test_sanitization_truncates_at_64_chars() -> None:
     req = _request(headers={"X-Headroom-Tenant-ID": "a" * 100})
     tenant_key, source = resolve_tenant_key(req)
     assert len(tenant_key) == 64
-    assert tenant_key.startswith("a" * 47 + "-")
+    assert tenant_key.startswith("tnt-" + "a" * 43 + "-")
     assert _is_valid_key(tenant_key)
     assert source == SOURCE_HEADER
 
@@ -263,7 +263,7 @@ def test_sanitization_mixed_unicode_and_ascii_preserves_ascii() -> None:
     """``cust_我_42`` keeps the ASCII prefix and digests the raw value."""
     req = _request(headers={"X-Headroom-Tenant-ID": "cust_我_42"})
     tenant_key, source = resolve_tenant_key(req)
-    assert tenant_key.startswith("cust__42-")
+    assert tenant_key.startswith("tnt-cust__42-")
     assert _is_valid_key(tenant_key)
     assert source == SOURCE_HEADER
 
@@ -322,6 +322,71 @@ def test_digested_keys_never_exceed_the_length_cap() -> None:
         assert source == SOURCE_HEADER
         assert 0 < len(key) <= 64
         assert _is_valid_key(key)
+
+
+# ── Verbatim / digested sub-spaces must stay disjoint ─────────────────
+
+
+def test_a_digested_key_is_not_itself_a_verbatim_key() -> None:
+    """Feeding a digested key back in must not return it unchanged.
+
+    The verbatim path is the identity function on conforming ids, and
+    every digested key is conforming, so without the reserved marker a
+    tenant could send another tenant's digested key as its own header and
+    be handed that tenant's TOIN pool.
+    """
+    derived = resolve_tenant_key(_request(headers={"X-Headroom-Tenant-ID": "acme.corp"}))[0]
+    replayed = resolve_tenant_key(_request(headers={"X-Headroom-Tenant-ID": derived}))[0]
+    assert replayed != derived
+
+
+@pytest.mark.parametrize(
+    "raw",
+    [
+        "acme.corp",
+        "alice@corp.com",
+        "a" * 100,
+        "東" * 20,
+        "global",
+        "tnt-acme-80a1d5cc623b165f",
+    ],
+)
+def test_no_raw_id_maps_to_another_raw_ids_key(raw: str) -> None:
+    """A key is never a landing spot for a *different* raw id.
+
+    Cross-checks a batch of raw ids against a batch of derived keys so a
+    future change to the marker or digest length cannot silently reopen
+    the overlap.
+    """
+    others = ["acme.corp", "alice@corp.com", "a" * 100, "東" * 20, "global", "cust_42"]
+    raw_key = resolve_tenant_key(_request(headers={"X-Headroom-Tenant-ID": raw}))[0]
+    for other in others:
+        if other == raw:
+            continue
+        other_key = resolve_tenant_key(_request(headers={"X-Headroom-Tenant-ID": other}))[0]
+        assert raw_key != other_key
+        # A *digested* key must not resolve to itself when sent as its own
+        # header, or the tenant it was derived for could be impersonated.
+        # Verbatim keys legitimately are their own raw id, so skip those.
+        if other_key.startswith("tnt-"):
+            replayed = resolve_tenant_key(_request(headers={"X-Headroom-Tenant-ID": other_key}))[0]
+            assert replayed != other_key
+
+
+def test_tenant_literally_named_global_does_not_join_the_global_pool() -> None:
+    """``global`` is a reserved namespace, not a claimable tenant id."""
+    key, source = resolve_tenant_key(_request(headers={"X-Headroom-Tenant-ID": "global"}))
+    assert source == SOURCE_HEADER
+    assert key != GLOBAL_TENANT_KEY
+
+
+def test_marker_prefixed_ids_without_a_digest_stay_verbatim() -> None:
+    """An ordinary id may start with the marker; only the digested shape reroutes.
+
+    Keeps the marker from rekeying ids that merely begin with ``tnt-``.
+    """
+    req = _request(headers={"X-Headroom-Tenant-ID": "tnt-billing"})
+    assert resolve_tenant_key(req)[0] == "tnt-billing"
 
 
 # ── ContextVar surface ────────────────────────────────────────────────

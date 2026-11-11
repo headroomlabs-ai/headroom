@@ -134,6 +134,20 @@ _TENANT_KEY_DIGEST_LEN: Final[int] = 16
 # digest; this just keeps the key readable in logs and stores.
 _OPAQUE_TENANT_KEY_PREFIX: Final[str] = "tenant"
 
+# Hex alphabet of the digest. Kept as a literal so ``_looks_digested``
+# needs no ``re`` (project memory: ``no regexes``).
+_HEX_DIGITS: Final[str] = "0123456789abcdef"
+
+# Marker that reserves one slice of the key space for digested keys.
+#
+# It exists because the two sanitization forms must not overlap: the
+# verbatim form returns conforming ids unchanged, and every digested key
+# is itself conforming, so without a reserved marker a tenant could send
+# a *digested* key as its own header and be handed the same pool — the
+# collision this marker removes. Digested keys always start with this
+# marker; verbatim keys never do (see :func:`_looks_digested`).
+_TENANT_KEY_MARKER: Final[str] = "tnt-"
+
 # Literal namespace name used when no tenant-id header is present.
 # This is a real namespace, not a sentinel —
 # pre-F3 patterns already live under it after migration, and the OSS
@@ -303,6 +317,16 @@ def _sanitize_tenant_key(raw: str) -> str:
       NFC-vs-NFD and full-width-vs-ASCII spellings distinct without us
       having to decide which of them are "the same" tenant.
 
+    The two forms must stay disjoint or the fix reintroduces the bug it
+    removes: a digested key is itself a legal identifier, so if it were
+    also accepted verbatim a tenant could simply send another tenant's
+    digested key and be handed that tenant's pool. Digested keys
+    therefore always carry :data:`_TENANT_KEY_MARKER`, and the verbatim
+    form refuses any value that already looks digested (see
+    :func:`_looks_digested`). The same rule keeps a tenant literally
+    named ``global`` out of the shared :data:`GLOBAL_TENANT_KEY`
+    namespace.
+
     The result is always ``[A-Za-z0-9_-]{1,64}``: it flows into the TOIN
     serialized store under a ``|`` separator and into structured log
     fields, so the charset is load-bearing in both.
@@ -350,12 +374,41 @@ def _sanitize_tenant_key(raw: str) -> str:
         # accepted set.
         _ = unicodedata.category(ch)
 
-    if not lossy and len(raw) <= _MAX_TENANT_KEY_LEN:
+    if not lossy and len(raw) <= _MAX_TENANT_KEY_LEN and not _looks_digested(raw):
         return raw
 
-    prefix = "".join(accepted)[: _MAX_TENANT_KEY_LEN - _TENANT_KEY_DIGEST_LEN - 1]
+    # Digested form: marker + readable prefix + digest. The marker keeps
+    # this sub-space disjoint from verbatim ids (see module docstring and
+    # ``_looks_digested``), so a tenant cannot claim another tenant's
+    # digested key by sending it as its own header.
+    budget = _MAX_TENANT_KEY_LEN - len(_TENANT_KEY_MARKER) - _TENANT_KEY_DIGEST_LEN - 1
+    prefix = "".join(accepted)[:budget]
     digest = hashlib.sha256(raw.encode("utf-8")).hexdigest()[:_TENANT_KEY_DIGEST_LEN]
-    return f"{prefix or _OPAQUE_TENANT_KEY_PREFIX}-{digest}"
+    return f"{_TENANT_KEY_MARKER}{prefix or _OPAQUE_TENANT_KEY_PREFIX}-{digest}"
+
+
+def _looks_digested(value: str) -> bool:
+    """True when ``value`` occupies the digested key sub-space.
+
+    The verbatim form is the identity function on conforming ids, and
+    every digested key is itself conforming, so without this check the
+    digest could be bypassed: a tenant sending ``acmecorp-80a1d5cc623b165f``
+    as its own header would be mapped to that string verbatim and share
+    the pool of the ``acme.corp`` tenant it was derived from.
+
+    A value counts as digested when it is the shared
+    :data:`GLOBAL_TENANT_KEY` literal (a tenant literally named
+    ``global`` must not join the OSS shared pool) or when it matches the
+    digested shape ``<marker><prefix>-<16 hex chars>``. Anything else,
+    including ids that merely start with the marker but carry no digest,
+    stays verbatim so ordinary ids are not rekeyed.
+    """
+    if value == GLOBAL_TENANT_KEY:
+        return True
+    if not value.startswith(_TENANT_KEY_MARKER):
+        return False
+    _, sep, tail = value.rpartition("-")
+    return bool(sep) and len(tail) == _TENANT_KEY_DIGEST_LEN and all(c in _HEX_DIGITS for c in tail)
 
 
 def _emit_resolution_log(
