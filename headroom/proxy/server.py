@@ -34,6 +34,7 @@ import json
 import logging
 import math
 import os
+import signal
 import sys
 import threading
 import time
@@ -599,6 +600,69 @@ class CompressionQuarantinedError(asyncio.TimeoutError):
 
 
 _MULTI_WORKER_CONFIG_ENV = "HEADROOM_PROXY_CONFIG_JSON"
+
+
+def _save_prefix_state_on_exit_signal(store: Any, path: str) -> Callable[[], None]:
+    """Save prefix-tracker state as soon as an exit signal arrives.
+
+    ``HeadroomProxy.shutdown`` saves it too, but uvicorn runs the lifespan
+    shutdown only after waiting up to ``timeout_graceful_shutdown`` for
+    in-flight requests, so a supervisor that SIGKILLs sooner (a desktop app's
+    short stop, systemd's ``TimeoutStopSec``) loses that save whenever a request
+    is open. This wraps the handler uvicorn installed (the lifespan runs inside
+    its ``capture_signals``), so uvicorn's shutdown is unchanged and the later
+    save still writes the newer state. The save runs on the event loop, never
+    inside the signal handler, so it cannot read a tracker that a paused
+    coroutine was midway through updating.
+
+    Returns the undo, for the lifespan's shutdown: it restores each handler
+    that is still this wrapper (one another owner installed since is left
+    alone) and turns the wrapper into a pass-through, so a wrapper that could
+    not be removed never schedules onto this lifespan's closed loop.
+    """
+    if threading.current_thread() is not threading.main_thread():
+        return lambda: None  # signals are only delivered to the main thread
+    loop = asyncio.get_running_loop()
+    active = True
+    saved = False
+
+    def save() -> None:
+        nonlocal saved
+        if not saved:
+            saved = True
+            store.save_state(path)
+
+    def chained(previous: Callable[[int, Any], Any]) -> Callable[[int, Any], None]:
+        def handler(signum: int, frame: Any) -> None:
+            if active:
+                with contextlib.suppress(RuntimeError):  # loop closed without a shutdown
+                    loop.call_soon_threadsafe(save)
+            previous(signum, frame)
+
+        return handler
+
+    installed: list[tuple[int, Any, Callable[[int, Any], None]]] = []
+    for sig in (signal.SIGINT, signal.SIGTERM, getattr(signal, "SIGBREAK", None)):
+        if sig is None:
+            continue
+        previous = signal.getsignal(sig)
+        if not callable(previous):
+            continue  # nobody installed a handler: keep the default exit
+        handler = chained(previous)
+        signal.signal(sig, handler)
+        installed.append((sig, previous, handler))
+
+    def undo() -> None:
+        nonlocal active
+        active = False
+        if threading.current_thread() is not threading.main_thread():
+            return
+        for sig, previous, handler in installed:
+            if signal.getsignal(sig) is handler:
+                signal.signal(sig, previous)
+
+    return undo
+
 
 # Env var that opts out of the Rust core deployment smoke test (Hotfix-A0).
 # Default behavior: hard-fail at startup if `headroom._core` is unimportable
@@ -1228,6 +1292,7 @@ class HeadroomProxy(
         self.shared_compress_sessions = open_shared_sessions()
         # Set by startup() when HEADROOM_PREFIX_STATE_FILE opts in.
         self._prefix_state_file: str | None = None
+        self._undo_exit_signal_save: Callable[[], None] | None = None
 
         # Compression cache store for token mode (session-scoped). The dict
         # itself is mutated under `_compression_caches_lock`; the per-session
@@ -2126,6 +2191,9 @@ class HeadroomProxy(
             self._prefix_state_file = None
         if self._prefix_state_file:
             self.session_tracker_store.load_state(self._prefix_state_file)
+            self._undo_exit_signal_save = _save_prefix_state_on_exit_signal(
+                self.session_tracker_store, self._prefix_state_file
+            )
         self.pipeline_extensions.emit(
             PipelineStage.PRE_START,
             operation="proxy.startup",
@@ -2476,6 +2544,9 @@ class HeadroomProxy(
         # First, before any await can hit the shutdown step timeout.
         if self._prefix_state_file:
             self.session_tracker_store.save_state(self._prefix_state_file)
+        if self._undo_exit_signal_save is not None:
+            self._undo_exit_signal_save()
+            self._undo_exit_signal_save = None
         if self.http_client_h1 and self.http_client_h1 is not self.http_client:
             await self.http_client_h1.aclose()
         self.http_client_h1 = None

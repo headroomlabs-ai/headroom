@@ -1363,6 +1363,87 @@ def test_openai_chat_memory_not_injected_into_older_user_turn() -> None:
     proxy.memory_handler.search_and_format_context.assert_not_awaited()
 
 
+def _responses_memory_client(captured: dict[str, object]) -> tuple[TestClient, object]:
+    config = ProxyConfig(
+        optimize=False,
+        cache_enabled=False,
+        rate_limit_enabled=False,
+        cost_tracking_enabled=False,
+        log_requests=False,
+        ccr_inject_tool=False,
+        ccr_handle_responses=False,
+        ccr_context_tracking=False,
+        image_optimize=False,
+    )
+    app = create_app(config)
+    proxy = app.state.proxy
+    proxy.memory_handler = SimpleNamespace(
+        config=SimpleNamespace(inject_context=True, inject_tools=False),
+        search_and_format_context=AsyncMock(return_value="MEMCTX_RESP"),
+        has_memory_tool_calls=lambda resp, provider: False,
+    )
+
+    async def _fake_retry(method, url, headers, body, stream=False, **kwargs):  # noqa: ANN001
+        captured["body"] = body
+        return httpx.Response(
+            200,
+            json={
+                "id": "resp_1",
+                "object": "response",
+                "model": "gpt-5.4",
+                "output": [],
+                "usage": {"input_tokens": 5, "output_tokens": 1, "total_tokens": 6},
+            },
+        )
+
+    proxy._retry_request = _fake_retry  # type: ignore[attr-defined]
+    return TestClient(app), proxy
+
+
+def test_openai_responses_memory_not_injected_into_older_user_item() -> None:
+    """A function-call-output tail skips the memory search and stays byte-equal."""
+    captured: dict[str, object] = {}
+    client, proxy = _responses_memory_client(captured)
+    input_items = [
+        {"role": "user", "content": [{"type": "input_text", "text": "list the files"}]},
+        {"type": "function_call", "call_id": "call_1", "name": "ls", "arguments": "{}"},
+        {"type": "function_call_output", "call_id": "call_1", "output": "a.py b.py"},
+    ]
+    resp = client.post(
+        "/v1/responses",
+        headers={"authorization": "Bearer sk-test", "x-headroom-user-id": "u1"},
+        json={"model": "gpt-5.4", "input": input_items},
+    )
+    assert resp.status_code == 200, resp.text
+    sent = captured.get("body")
+    assert isinstance(sent, dict), captured
+    assert sent["input"] == input_items
+    assert "MEMCTX_RESP" not in str(sent["input"])
+    proxy.memory_handler.search_and_format_context.assert_not_awaited()
+
+
+def test_openai_responses_memory_still_reaches_trailing_user_item() -> None:
+    """Control: an input list that ends with a user item still gets memory."""
+    captured: dict[str, object] = {}
+    client, proxy = _responses_memory_client(captured)
+    input_items = [
+        {"role": "user", "content": [{"type": "input_text", "text": "first"}]},
+        {"role": "assistant", "content": [{"type": "output_text", "text": "ok"}]},
+        {"role": "user", "content": [{"type": "input_text", "text": "latest"}]},
+    ]
+    resp = client.post(
+        "/v1/responses",
+        headers={"authorization": "Bearer sk-test", "x-headroom-user-id": "u1"},
+        json={"model": "gpt-5.4", "input": input_items},
+    )
+    assert resp.status_code == 200, resp.text
+    sent = captured.get("body")
+    assert isinstance(sent, dict), captured
+    assert sent["input"][:2] == input_items[:2]
+    assert sent["input"][2]["content"][0]["text"] == "latest\n\nMEMCTX_RESP"
+    proxy.memory_handler.search_and_format_context.assert_awaited_once()
+
+
 def test_openai_chat_memory_routes_to_user_tail_not_system() -> None:
     """A2 follow-up: Chat Completions memory injection lives in user tail."""
     config = ProxyConfig(

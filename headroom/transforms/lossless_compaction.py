@@ -386,8 +386,14 @@ def diff_strip_index(text: str) -> str:
 # A whole-line file path: optional ``./``/``../`` root, >=1 directory segment,
 # then a basename. No whitespace or ':' (so grep ``path:line:content`` rows —
 # handled by search_heading — are excluded). Directory-only lines (trailing '/')
-# don't match (empty basename), which keeps the fold unambiguous.
-_PATH_ROW_RE = re.compile(r"^(?P<dir>(?:\.{0,2}/)?(?:[^/\s:]+/)+)(?P<base>[^/\s:]+)$")
+# don't match (empty basename), which keeps the fold unambiguous. Markup is
+# not a path either: no '<', '>' or ';' (``</body>``, ``&lt;/body&gt;``), and
+# every directory segment holds a letter, digit or '_', so a template closer
+# such as ``{{/if}}`` is not dir ``{{`` + base ``if}}``. Folded, those still
+# round-trip, but the model reads broken markup and writes it back.
+_PATH_ROW_RE = re.compile(
+    r"^(?P<dir>(?:\.{0,2}/)?(?:(?=[^/]*\w)[^/\s:<>;]+/)+)(?P<base>[^/\s:<>;]+)$"
+)
 
 
 def path_heading(text: str) -> str:
@@ -395,20 +401,27 @@ def path_heading(text: str) -> str:
     into ripgrep-heading form: each parent directory printed once on its own
     line (ending in ``/``), then the bare basenames beneath it.
 
+    Every non-blank line must be a path row, and there must be >=2 of them.
+    Text that merely holds path-shaped lines (a template's ``{{/if}}``
+    closers, a ``N/A`` table column) passes through: folding it round-trips,
+    but the model only sees the folded side and reads fragments.
     Reversibility is not assumed here — ``compact_lossless`` verifies the exact
-    round-trip via :func:`path_unheading` and discards the fold on any mismatch
-    (e.g. a stray no-slash line mistaken for a basename), so mixed content is
-    always safe. Requires >=2 path rows or there is nothing to group.
+    round-trip via :func:`path_unheading` and discards the fold on any mismatch.
     Complements ``search_heading``, which only handles the ``path:line:content``
     grep shape, not plain path lists.
     """
     lines, had_trailing = _split_keep_trailing(text)
-    if sum(1 for ln in lines if _PATH_ROW_RE.match(ln)) < 2:
+    matches = []
+    for ln in lines:
+        m = _PATH_ROW_RE.match(ln)
+        if ln and not m:  # not a pure listing; stop at the first such line
+            return text
+        matches.append(m)
+    if sum(1 for m in matches if m) < 2:
         return text
     out: list[str] = []
     current: str | None = None
-    for line in lines:
-        m = _PATH_ROW_RE.match(line)
+    for line, m in zip(lines, matches):
         if m:
             d = m.group("dir")
             if d != current:
