@@ -567,9 +567,13 @@ def test_wrap_opencode_prepare_only_registers_serena_with_agent_context(
     monkeypatch.chdir(tmp_path)
     monkeypatch.delenv("HEADROOM_CONTEXT_TOOL", raising=False)
     _set_test_home(monkeypatch, tmp_path)
+    # The eager --code-memory callback writes os.environ; delenv restores it after.
+    monkeypatch.delenv("HEADROOM_CODE_MEMORY", raising=False)
 
     with patch.object(wrap_mod.shutil, "which", return_value="opencode"):
-        result = runner.invoke(main, ["wrap", "opencode", "--prepare-only"])
+        result = runner.invoke(
+            main, ["wrap", "opencode", "--prepare-only", "--code-memory", "serena"]
+        )
 
     assert result.exit_code == 0, result.output
     config_file = tmp_path / ".config" / "opencode" / "opencode.json"
