@@ -36,9 +36,9 @@ function normalizeProxyUrl(url: string): string {
 
 function resolveProxyUrl(options?: HeadroomOpenCodePluginOptions): string {
   return normalizeProxyUrl(
-    options?.proxyUrl ??
-      process.env.HEADROOM_PROXY_URL ??
-      process.env.HEADROOM_BASE_URL ??
+    options?.proxyUrl ||
+      process.env.HEADROOM_PROXY_URL ||
+      process.env.HEADROOM_BASE_URL ||
       getDefaultProxyUrl(),
   );
 }
