@@ -6563,6 +6563,14 @@ class ContentRouter(Transform):
             ),
             num_messages,
         )
+        last_assistant_index = max(
+            (
+                idx
+                for idx, msg in enumerate(messages)
+                if isinstance(msg, dict) and msg.get("role") == "assistant"
+            ),
+            default=-1,
+        )
         model_limit = kwargs.get("model_limit", 0)
 
         # Adaptive Read protection: protect a fraction of recent messages
@@ -6672,6 +6680,7 @@ class ContentRouter(Transform):
             analysis_intent = self._detect_analysis_intent(messages)
 
         frozen_message_count = kwargs.get("frozen_message_count", 0)
+        mutable_turn_start = max(frozen_message_count, last_assistant_index + 1)
 
         # ------------------------------------------------------------------
         # Two-pass parallel compression.
@@ -6827,6 +6836,7 @@ class ContentRouter(Transform):
                     compress_assistant_text_blocks=compress_assistant_text_blocks,
                     prefix_replay_guaranteed=prefix_replay_guaranteed,
                     protect_prompt_text=prompt_turn,
+                    in_mutable_window=(i >= mutable_turn_start),
                 )
                 result_slots[i] = transformed_message
                 route_counts["content_blocks"] += 1
@@ -7889,6 +7899,7 @@ class ContentRouter(Transform):
         compress_assistant_text_blocks: bool = False,
         prefix_replay_guaranteed: bool = False,
         protect_prompt_text: bool = False,
+        in_mutable_window: bool | None = None,
     ) -> dict[str, Any]:
         """Process content blocks (Anthropic format) for compression.
 
@@ -7991,14 +8002,13 @@ class ContentRouter(Transform):
         else:
             protect_text_blocks = True
 
-        # The final user/tool message is this turn's fresh content: not yet
-        # forwarded, so its cache_control marker names a key the provider has
-        # not written. Everything earlier may already be cached under its
-        # marker and stays byte-exact (contract 1). Only tool_result blocks
-        # are released; a marked text block is the user's prompt.
-        fresh_turn = (
-            prefix_replay_guaranteed and messages_from_end == 1 and role in ("user", "tool")
-        )
+        # User/tool messages in the mutable turn suffix are this turn's
+        # fresh content: not yet forwarded, so a cache_control marker names a key
+        # the provider has not written. Everything earlier may already be cached
+        # under its marker and stays byte-exact (contract 1). Only tool_result
+        # blocks are released; a marked text block is the user's prompt.
+        is_fresh = in_mutable_window if in_mutable_window is not None else (messages_from_end == 1)
+        fresh_turn = prefix_replay_guaranteed and is_fresh and role in ("user", "tool")
 
         for block in content_blocks:
             if not isinstance(block, dict):

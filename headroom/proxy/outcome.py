@@ -665,6 +665,14 @@ async def emit_request_outcome(handler: Any, outcome: RequestOutcome) -> None:
                     transforms_applied=tuple(str(t) for t in (outcome.transforms_applied or ())),
                     tokens_saved=outcome.tokens_saved,
                     novel_tokens_saved=novel_tokens_saved,
+                    attribution={
+                        dimension: label
+                        for dimension, label in (("project", project), ("client", outcome.client))
+                        if label
+                    },
+                    conversation_key=outcome.conversation_key,
+                    original_tokens=outcome.original_tokens,
+                    output_tokens_saved=output_tokens_saved_est,
                 ),
             )
         except Exception:  # noqa: BLE001 - telemetry must never break a response
