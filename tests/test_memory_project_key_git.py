@@ -10,6 +10,7 @@ to one shared key derived from the repository's common git dir, while
 
 from __future__ import annotations
 
+import os
 import subprocess
 from pathlib import Path
 
@@ -25,11 +26,20 @@ from tests.test_memory_storage_router import _ctx
 
 
 def _git(tmp_path: Path, *argv: str, cwd: Path | None = None) -> None:
+    # CI runners have no global git identity; commit would fail without these.
+    env = {
+        **os.environ,
+        "GIT_AUTHOR_NAME": "t",
+        "GIT_AUTHOR_EMAIL": "t@example.com",
+        "GIT_COMMITTER_NAME": "t",
+        "GIT_COMMITTER_EMAIL": "t@example.com",
+    }
     subprocess.run(
         ["git", *argv],
         cwd=str(cwd or tmp_path),
         check=True,
         capture_output=True,
+        env=env,
     )
 
 
