@@ -467,6 +467,11 @@ class ProxyConfig:
     # behaviour (existing memories remain reachable here).
     memory_storage_mode: Literal["project", "user", "global"] = "project"
     memory_project_root_override: str = ""
+    # GH #4712: how a resolved cwd becomes a project key. ``cwd`` (default)
+    # is today's per-directory key. ``git`` keys on the repository's common
+    # git dir so linked worktrees and subdirectories of one repo share one
+    # memory DB.
+    memory_project_key_strategy: Literal["cwd", "git"] = "cwd"
     memory_inject_tools: bool = True
     traffic_learning_enabled: bool = False
     traffic_learning_agent_type: str = "unknown"  # Which agent is being wrapped

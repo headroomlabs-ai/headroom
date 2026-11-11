@@ -40,6 +40,7 @@ from headroom.memory.storage_router import (
     BackendRouter,
     BackendRouterConfig,
     MemoryStorageMode,
+    ProjectKeyStrategy,
     RequestContext,
     ResolvedScope,
 )
@@ -140,6 +141,11 @@ class MemoryConfig:
     storage_mode: MemoryStorageMode = MemoryStorageMode.PROJECT
     storage_root: str = ""  # Defaults to dirname(db_path)/memories
     project_root_override: str = ""  # CLI ``--memory-project-root``
+    # GH #4712: ``cwd`` (default) keys a project on its directory — today's
+    # behaviour. ``git`` keys it on the repository's common git dir so
+    # linked worktrees and subdirectories of one repository share one
+    # memory DB. CLI ``--memory-project-key``.
+    project_key_strategy: ProjectKeyStrategy = field(default_factory=ProjectKeyStrategy)
     # PR-B6: Memory injection mode. AUTO_TAIL (default) auto-appends retrieved
     # memory to the latest user message tail. TOOL disables auto-injection;
     # the model must call ``memory_search`` to retrieve. Configurable per
@@ -195,6 +201,7 @@ class MemoryHandler:
                 mode=config.storage_mode,
                 root_dir=storage_root,
                 global_db_path=Path(config.db_path).resolve(),
+                project_key_strategy=config.project_key_strategy,
             )
         )
         self._initialized = False

@@ -1576,7 +1576,7 @@ class HeadroomProxy(
                     f"expected one of {[m.value for m in MemoryMode]}"
                 ) from exc
 
-            from headroom.memory.storage_router import MemoryStorageMode
+            from headroom.memory.storage_router import MemoryStorageMode, ProjectKeyStrategy
 
             try:
                 _storage_mode = MemoryStorageMode(config.memory_storage_mode)
@@ -1598,6 +1598,7 @@ class HeadroomProxy(
                 mode=_memory_mode,
                 storage_mode=_storage_mode,
                 project_root_override=config.memory_project_root_override,
+                project_key_strategy=ProjectKeyStrategy(mode=config.memory_project_key_strategy),
                 qdrant_url=config.memory_qdrant_url,
                 qdrant_host=config.memory_qdrant_host,
                 qdrant_port=config.memory_qdrant_port,
@@ -6677,6 +6678,7 @@ _SETTINGS_CONFIG_ALIASES: dict[str, str] = {
     "request_timeout": "request_timeout_seconds",
     "min_evidence": "traffic_learning_min_evidence",
     "memory_project_root": "memory_project_root_override",
+    "memory_project_key": "memory_project_key_strategy",
     "anthropic_base_url": "anthropic_api_url",
     "openai_base_url": "openai_api_url",
     "region": "bedrock_region",

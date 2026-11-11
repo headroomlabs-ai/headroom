@@ -27,6 +27,7 @@ from headroom.proxy.helpers import (
     COMPRESSION_TIMEOUT_SECONDS,
     extract_tags,
     invalid_request_body_message,
+    project_key_strategy_from_config,
     sanitize_forwarded_response_headers,
 )
 from headroom.proxy.identity import resolve_memory_identity
@@ -589,6 +590,7 @@ class GeminiHandlerMixin:
                 project_root_override=(
                     getattr(self.memory_handler.config, "project_root_override", "") or None
                 ),
+                key_strategy=project_key_strategy_from_config(getattr(self, "config", None)),
             )
 
         # Canonical memory-injection gate (parallels Anthropic + OpenAI).
