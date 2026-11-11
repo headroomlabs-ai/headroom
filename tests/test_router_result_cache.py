@@ -6,6 +6,8 @@ import subprocess
 import sys
 import threading
 
+import pytest
+
 from headroom.cache.result_store import ResultStore, open_result_store
 from headroom.transforms.content_router import (
     CompressionCache,
@@ -197,6 +199,74 @@ def test_a_cache_without_a_namespace_clears_only_its_own_rows(tmp_path):
     other.put("b", "result b", 0.5, "text")
     mine.clear()
     assert store.get("router-b:b") is not None
+
+
+@pytest.mark.parametrize("invalidate", ["clear", "move_to_skip"])
+@pytest.mark.parametrize("replacement", [False, True])
+def test_a_queued_disk_write_cannot_restore_an_invalidated_result(
+    tmp_path, invalidate, replacement
+):
+    store = ResultStore(tmp_path / "c.db", 1800)
+    cache = CompressionCache(store=store, namespace="router:")
+    waiting, release = threading.Event(), threading.Event()
+    real = cache._disk_lock
+
+    class PauseFirstWrite:
+        pending = True
+
+        def __enter__(self):
+            if self.pending:
+                self.pending = False
+                waiting.set()  # the old value is in memory but has not reached disk
+                assert release.wait(5)
+            return real.__enter__()
+
+        def __exit__(self, *exc):
+            return real.__exit__(*exc)
+
+    cache._disk_lock = PauseFirstWrite()
+    writer = threading.Thread(target=cache.put, args=("k", "old", 0.5, "text"))
+    writer.start()
+    try:
+        assert waiting.wait(5)
+        if invalidate == "clear":
+            cache.clear()
+        else:
+            cache.move_to_skip("k")
+        if replacement:
+            cache.put("k", "new", 0.25, "log")
+    finally:
+        release.set()
+        writer.join(5)
+    assert not writer.is_alive()
+
+    expected = ("new", 0.25, "log") if replacement else None
+    assert store.get("router:k") == expected
+    # Reopening the actual SQLite tier must not resurrect the old value.
+    reopened = CompressionCache(store=ResultStore(tmp_path / "c.db", 1800), namespace="router:")
+    assert reopened.get("k") == expected
+
+
+def test_newer_put_with_identical_text_keeps_its_disk_metadata(tmp_path):
+    store = ResultStore(tmp_path / "c.db", 1800)
+    cache = CompressionCache(store=store)
+    real = cache._disk_lock
+
+    class NewerPutRunsFirst:
+        pending = True
+
+        def __enter__(self):
+            if self.pending:
+                self.pending = False
+                cache.put("k", "same", 0.25, "log")
+            return real.__enter__()
+
+        def __exit__(self, *exc):
+            return real.__exit__(*exc)
+
+    cache._disk_lock = NewerPutRunsFirst()
+    cache.put("k", "same", 0.5, "text")
+    assert store.get(cache._namespace + "k") == ("same", 0.25, "log")
 
 
 def test_a_disk_read_in_flight_never_replaces_a_newer_put(tmp_path):
