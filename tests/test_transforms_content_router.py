@@ -512,6 +512,59 @@ def test_force_kompress_apply_lightweight_detection_protects_recent_code(
     assert result.transforms_applied == ["router:protected:recent_code"]
 
 
+def test_protect_recent_does_not_shield_non_code_tool_payloads(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``protect_recent`` guards recent CODE only (#4732).
+
+    JSON/log/text tool payloads stay eligible at any ``protect_recent`` value,
+    which is why the index-proof harness cannot show a difference between
+    ``protect_recent=4`` and ``protect_recent=0`` on its JSON scenarios.
+    """
+
+    class FakeTokenizer:
+        def count_text(self, text: str) -> int:
+            return len(text.split())
+
+    router = ContentRouter(ContentRouterConfig(protect_recent_code=4))
+    content = json.dumps([{"path": f"src/module_{i}.py", "score": i} for i in range(200)])
+
+    monkeypatch.setattr(
+        content_router_module,
+        "_detect_content",
+        lambda content: DetectionResult(ContentType.JSON_ARRAY, 1.0, {}),
+    )
+    monkeypatch.setattr(
+        router,
+        "compress",
+        lambda content, context="", bias=1.0, precomputed_detection=None: RouterCompressionResult(
+            # CCR marker -> the original was stored and is retrievable, so the
+            # #1307 reversibility gate accepts this lossy KOMPRESS tool result.
+            compressed="compressed <<ccr:tool>>",
+            original=content,
+            strategy_used=CompressionStrategy.KOMPRESS,
+            routing_log=[
+                RoutingDecision(
+                    content_type=ContentType.JSON_ARRAY,
+                    strategy=CompressionStrategy.KOMPRESS,
+                    original_tokens=len(content.split()),
+                    compressed_tokens=1,
+                )
+            ],
+        ),
+    )
+
+    result = router.apply(
+        [{"role": "tool", "content": content}],
+        FakeTokenizer(),
+        min_tokens_to_compress=10,
+        protect_recent=4,
+    )
+
+    assert result.messages[0]["content"] == "compressed <<ccr:tool>>"
+    assert "router:protected:recent_code" not in result.transforms_applied
+
+
 def test_diff_strategy_does_not_fallback_to_kompress_when_diff_is_noop(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
