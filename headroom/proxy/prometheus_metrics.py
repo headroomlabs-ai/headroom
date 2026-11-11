@@ -22,7 +22,7 @@ if TYPE_CHECKING:
 
 from headroom import savings_ledger
 from headroom.observability import get_otel_metrics
-from headroom.proxy.savings_attribution import event_count
+from headroom.proxy.savings_attribution import UNFOLDED_SOURCES, event_count
 from headroom.proxy.savings_tracker import SavingsTracker, estimate_request_savings_usd
 
 logger = logging.getLogger("headroom.proxy")
@@ -39,6 +39,15 @@ _OTHER_MODEL = "other"
 # without bound. The cap sits well above a proxy's real route count.
 MAX_DISTINCT_PATHS = 256
 _OTHER_PATH = "other"
+
+# Same idea for savings attribution rows (see record_request). Source names come
+# from extensions and turn hooks, so one that mints a name per request would grow
+# savings_by_source, and its three exported series, without bound. Past this many
+# rows, new sources are summed into ``_OTHER_SOURCE``: only the name is lost,
+# never a token or a dollar. As in the per-request ledger, ``UNFOLDED_SOURCES``
+# never fold: the documented headline query selects ``source="tool_search"``.
+MAX_DISTINCT_SAVINGS_ROWS = 256
+_OTHER_SOURCE = "other"
 
 # Closed label set for headroom_requests_rate_limited_total{source}. Two 429s
 # mean opposite things to an operator: "headroom" is OUR limiter refusing the
@@ -209,6 +218,7 @@ class PrometheusMetrics:
         self.extension_savings: dict[str, int] = defaultdict(int)
         # Named savings attribution; realized and projected rows stay separate.
         self.savings_by_source: dict[str, dict[str, str | int | float | bool]] = {}
+        self._savings_source_cardinality_warned = False
 
         # Fail-open compression failures, keyed by reason ("timeout",
         # "error"). The proxy fails open on any optimization error so the
@@ -449,6 +459,7 @@ class PrometheusMetrics:
             self.tokens_saved_by_strategy.clear()
             self.extension_savings.clear()
             self.savings_by_source.clear()
+            self._savings_source_cardinality_warned = False
             with self._obs_counter_lock:
                 self.compression_failed_by_reason.clear()
                 self.upstream_connection_errors_by_provider.clear()
@@ -984,6 +995,19 @@ class PrometheusMetrics:
                 source = str(item.get("source") or "other")[:64]
                 realized = bool(item.get("realized", True))
                 key = f"{source}:{int(realized)}"
+                if (
+                    key not in self.savings_by_source
+                    and source not in UNFOLDED_SOURCES
+                    and len(self.savings_by_source) >= MAX_DISTINCT_SAVINGS_ROWS
+                ):
+                    source, key = _OTHER_SOURCE, f"{_OTHER_SOURCE}:{int(realized)}"
+                    if not self._savings_source_cardinality_warned:
+                        self._savings_source_cardinality_warned = True
+                        logger.warning(
+                            "metrics.record: savings source cardinality cap (%d) reached; "
+                            'summing further sources into "other"',
+                            MAX_DISTINCT_SAVINGS_ROWS,
+                        )
                 row = self.savings_by_source.setdefault(
                     key,
                     {
@@ -1858,6 +1882,45 @@ class PrometheusMetrics:
                         f'headroom_stage_timing_ms_max{{path="{_escape_label_value(path_label)}",stage="{_escape_label_value(stage)}"}} {round(max_value, 2)}'
                     )
                 lines.append("")
+
+            # Shared Redis store availability (lazy import: module must not
+            # require the redis package at import time). ``headroom_redis_checked``
+            # is emitted for every configured feature so a store that has not
+            # been called yet (or not built yet) stays visible;
+            # ``headroom_redis_available`` is emitted only for observed ones (1
+            # when available, 0 during an outage or backoff), so an unknown
+            # store does not advertise connectivity.
+            from headroom.cache.redis_client import states as _redis_states
+
+            _states = _redis_states()
+            if _states:
+                lines.extend(
+                    [
+                        "# HELP headroom_redis_checked 1 when the shared Redis store has been called at least once, 0 when unobserved",
+                        "# TYPE headroom_redis_checked gauge",
+                    ]
+                )
+                for _label in sorted(_states):
+                    lines.append(
+                        f'headroom_redis_checked{{feature="{_escape_label_value(_label)}"}}'
+                        f" {int(_states[_label] != 'unknown')}"
+                    )
+                lines.append("")
+
+                _observed = [_label for _label in sorted(_states) if _states[_label] != "unknown"]
+                if _observed:
+                    lines.extend(
+                        [
+                            "# HELP headroom_redis_available 1 when the shared Redis store answered its last call, 0 during an outage or backoff",
+                            "# TYPE headroom_redis_available gauge",
+                        ]
+                    )
+                    for _label in _observed:
+                        lines.append(
+                            f'headroom_redis_available{{feature="{_escape_label_value(_label)}"}}'
+                            f" {int(_states[_label] == 'available')}"
+                        )
+                    lines.append("")
 
             # Unit 3: WS session lifecycle gauges + duration histogram.
             lines.extend(
