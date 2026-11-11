@@ -92,27 +92,31 @@ def record_cache_observation(*, provider: str, model: str, attribution: Any) -> 
 
 _learned_cache: dict[str, Any] | None = None
 _learned_mtime: float = -1.0
+_learned_cache_path: str | None = None
 
 
 def resolve_learned_ttl(provider: str, model: str) -> int | None:
     """Learned TTL (seconds) for ``(provider, model)``, or None if not learned yet.
 
     Reads ``cache_ttl_learned.json`` (written by the offline estimator), keyed by
-    ``"provider/model"`` first, then ``"provider"``. Cached by mtime so a hot-path
+    ``"provider/model"`` first, then ``"provider"``. Cached by path and mtime so a hot-path
     call is a dict lookup. Best-effort: returns None on any error, so the caller
     falls back to its own default (config TTL for CC, static default elsewhere).
     Invalid table shapes are ignored; invalid model values fall through to the
     provider fallback. Only positive, finite TTLs (not booleans) are accepted.
     """
-    global _learned_cache, _learned_mtime
-    path = _learned_path()
+    global _learned_cache, _learned_mtime, _learned_cache_path
     try:
+        # Relative overrides resolve against the current directory, so their
+        # spelling alone does not identify the file backing a cached table.
+        path = os.path.abspath(_learned_path())
         mt = os.path.getmtime(path)
-        if _learned_cache is None or mt != _learned_mtime:
+        if _learned_cache is None or path != _learned_cache_path or mt != _learned_mtime:
             with open(path, encoding="utf-8") as f:
                 loaded = json.load(f)
             _learned_cache = loaded if isinstance(loaded, dict) else {}
             _learned_mtime = mt
+            _learned_cache_path = path
     except Exception:
         return None
     table = _learned_cache or {}
