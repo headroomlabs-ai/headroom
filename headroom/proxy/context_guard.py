@@ -418,8 +418,23 @@ class StreamUsageGuard:
         return bytes(out)
 
     def flush(self) -> bytes:
-        """Return any held-back bytes; the guard goes inert."""
-        return self._finish()
+        """Return any held-back bytes; the guard goes inert.
+
+        The stream has ended, so an event whose blank line ends in a final CR
+        (held back by ``feed`` in case a LF followed) is complete and is
+        processed like any other before the rest is returned verbatim.
+        """
+        out = bytearray()
+        while not self._done:
+            terminator = find_sse_event_terminator(self._buf, at_eof=True)
+            if terminator is None:
+                break
+            end = terminator[0] + terminator[1]
+            event = bytes(self._buf[:end])
+            del self._buf[:end]
+            out += self._process_event(event)
+        out += self._finish()
+        return bytes(out)
 
     def _finish(self) -> bytes:
         self._done = True

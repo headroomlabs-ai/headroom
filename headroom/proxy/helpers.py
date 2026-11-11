@@ -1450,6 +1450,8 @@ def safe_decode_for_logging(raw: bytes, *, max_bytes: int | None = None) -> str:
 
 def parse_sse_events_from_byte_buffer(
     buf: bytearray,
+    *,
+    at_eof: bool = False,
 ) -> list[tuple[str | None, str]]:
     """Drain complete ``event:`` + ``data:`` events from a bytes buffer.
 
@@ -1463,8 +1465,11 @@ def parse_sse_events_from_byte_buffer(
     Per PR-A8 / P1-8: this is the canonical SSE event splitter. NEVER use
     ``decode("utf-8", errors="ignore")`` on a partial buffer; UTF-8
     multi-byte characters split across TCP reads will corrupt content.
+
+    Pass ``at_eof=True`` once the stream has ended, so an event whose blank
+    line ends in a final CR is drained as well.
     """
-    return sse_byte_buffer_policy.parse_sse_events_from_byte_buffer(buf)
+    return sse_byte_buffer_policy.parse_sse_events_from_byte_buffer(buf, at_eof=at_eof)
 
 
 # Maximum message array length (prevents DoS from deeply nested payloads)

@@ -357,6 +357,28 @@ class TestStreamUsageGuard:
         assert guard.feed(partial) == b""
         assert guard.flush() == partial
 
+    @pytest.mark.parametrize("bytewise", [False, True], ids=["full", "bytewise"])
+    @pytest.mark.parametrize("terminator", [b"\r\r", b"\n\r", b"\r\n\r"])
+    def test_flush_rewrites_an_event_ending_in_a_trailing_cr(self, terminator, bytewise):
+        # The last CR is held back by feed() in case it is the start of a CRLF;
+        # when the stream ends there, flush() must still read the event.
+        guard = StreamUsageGuard(believed_limit=1_000_000, effective_limit=200_000)
+        wire = _message_start_event(185_000).replace(b"\n\n", b"\n")[:-1] + terminator
+        chunks = [wire[i : i + 1] for i in range(len(wire))] if bytewise else [wire]
+        assert b"".join(guard.feed(chunk) for chunk in chunks) == b""
+        out = guard.flush()
+        assert out.endswith(terminator)
+        assert _parse_usage(out.replace(b"\r", b"\n"))["input_tokens"] == int(
+            1_000_000 * REPORT_FRACTION
+        )
+        assert guard.feed(b"more") == b"more"  # inert afterwards
+
+    def test_flush_keeps_a_partial_crlf_event_verbatim(self):
+        guard = StreamUsageGuard(believed_limit=1_000_000, effective_limit=200_000)
+        partial = b"event: message_start\r\ndata: {\r"
+        assert guard.feed(partial) == b""
+        assert guard.flush() == partial
+
     def test_unusable_limits_make_guard_inert(self):
         guard = StreamUsageGuard(believed_limit=0, effective_limit=200_000)
         event = _message_start_event(190_000)

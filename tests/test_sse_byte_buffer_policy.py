@@ -76,6 +76,43 @@ def test_find_sse_event_terminator_waits_for_the_byte_after_a_trailing_cr(raw: b
     assert find_sse_event_terminator(bytearray(raw + b"d")) == (9, len(raw) - 9)
 
 
+_TRAILING_CR_TERMINATORS = [b"\r\r", b"\n\r", b"\r\n\r"]
+
+
+@pytest.mark.parametrize("terminator", _TRAILING_CR_TERMINATORS)
+def test_find_sse_event_terminator_accepts_a_trailing_cr_at_eof(terminator: bytes) -> None:
+    # Once the stream has ended no LF can follow, so the final CR is the end.
+    raw = bytearray(b"data: one" + terminator)
+    assert find_sse_event_terminator(raw, at_eof=True) == (9, len(terminator))
+
+
+@pytest.mark.parametrize("bytewise", [False, True], ids=["full", "bytewise"])
+@pytest.mark.parametrize("terminator", _TRAILING_CR_TERMINATORS)
+def test_parse_sse_events_drains_a_trailing_cr_event_at_eof(
+    terminator: bytes, bytewise: bool
+) -> None:
+    wire = b"event: delta\rdata: one" + terminator
+    buf = bytearray()
+    events: list[tuple[str | None, str]] = []
+    for chunk in [wire[i : i + 1] for i in range(len(wire))] if bytewise else [wire]:
+        buf.extend(chunk)
+        events += parse_sse_events_from_byte_buffer(buf)
+    # Held back while a CRLF could still be completed ...
+    assert events == []
+    assert buf == wire
+    # ... and released once the stream has ended.
+    assert parse_sse_events_from_byte_buffer(buf, at_eof=True) == [("delta", "one")]
+    assert buf == bytearray()
+
+
+def test_parse_sse_events_at_eof_leaves_an_unterminated_tail() -> None:
+    # A last event without a blank line, or one cut inside a UTF-8 character,
+    # is still incomplete at EOF and stays in the buffer.
+    buf = bytearray(b"data: one\r\rdata: caf\xc3")
+    assert parse_sse_events_from_byte_buffer(buf, at_eof=True) == [(None, "one")]
+    assert buf == bytearray(b"data: caf\xc3")
+
+
 @pytest.mark.parametrize("separator", ["\u0085", "\u2028", "\u2029"])
 def test_parse_sse_events_preserves_unicode_line_separators_in_json(
     separator: str,

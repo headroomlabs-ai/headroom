@@ -26,23 +26,27 @@ def _field_value(line: str, prefix: str) -> str:
     return value[1:] if value.startswith(" ") else value
 
 
-def find_sse_event_terminator(buf: bytearray) -> tuple[int, int] | None:
+def find_sse_event_terminator(buf: bytearray, *, at_eof: bool = False) -> tuple[int, int] | None:
     """Return ``(index, length)`` of the earliest complete event terminator.
 
     Returns ``None`` when ``buf`` holds no blank line yet, or when the
     earliest one ends in a CR that is the last byte of ``buf``: the next byte
-    may be the LF of a CRLF, which belongs to the same terminator.
+    may be the LF of a CRLF, which belongs to the same terminator. Pass
+    ``at_eof=True`` once the stream has ended; no byte can follow then, so a
+    trailing CR completes the terminator.
     """
     match = _SSE_BLANK_LINE_RE.search(buf)
     if match is None:
         return None
-    if match.end() == len(buf) and buf[-1:] == b"\r":
+    if not at_eof and match.end() == len(buf) and buf[-1:] == b"\r":
         return None
     return match.start(), match.end() - match.start()
 
 
 def parse_sse_events_from_byte_buffer(
     buf: bytearray,
+    *,
+    at_eof: bool = False,
 ) -> list[tuple[str | None, str]]:
     """Drain complete ``event:`` + ``data:`` events from a bytes buffer.
 
@@ -51,10 +55,12 @@ def parse_sse_events_from_byte_buffer(
 
     Operates on bytes; only decodes complete events as UTF-8 (raises if a
     *complete* event has invalid UTF-8, which is an upstream protocol bug).
+    Pass ``at_eof=True`` when the stream has ended so an event whose blank
+    line ends in a final CR is drained too (see ``find_sse_event_terminator``).
     """
     events: list[tuple[str | None, str]] = []
     while True:
-        terminator_match = find_sse_event_terminator(buf)
+        terminator_match = find_sse_event_terminator(buf, at_eof=at_eof)
         if terminator_match is None:
             break
         idx, terminator_len = terminator_match
