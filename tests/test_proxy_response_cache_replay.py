@@ -104,6 +104,25 @@ class TestSanitizeForwardedResponseHeaders:
         )
         assert cleaned == {"Request-Id": "req_abc"}
 
+    def test_drops_headers_named_by_connection_and_hop_by_hop_fields(self):
+        """Connection-local headers must not leak past the ``Connection`` header (#4265)."""
+        headers = httpx.Headers(
+            [
+                ("Connection", "X-Upstream-Hop, upgrade"),
+                ("Connection", "X-Second-Hop, Keep-Alive"),
+                ("X-Upstream-Hop", "1"),
+                ("X-Second-Hop", "2"),
+                ("Upgrade", "h2c"),
+                ("TE", "trailers"),
+                ("Trailer", "Digest"),
+                ("X-Request-ID", "req_abc"),
+            ]
+        )
+        snapshot = list(headers.multi_items())
+
+        assert sanitize_forwarded_response_headers(headers) == {"x-request-id": "req_abc"}
+        assert list(headers.multi_items()) == snapshot
+
     def test_extra_names_are_dropped_too(self):
         cleaned = sanitize_forwarded_response_headers(
             {"content-type": "text/event-stream", "request-id": "req_abc"},
