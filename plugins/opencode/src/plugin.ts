@@ -15,6 +15,7 @@ import {
   PROJECT_HEADER,
   SESSION_TOKEN_HEADER,
   installHeadroomTransport,
+  projectHeaderValue,
   modelBaseRoutesThroughProxy,
   normalizeExcludeHosts,
   setHeadroomWireRoots,
@@ -217,7 +218,7 @@ function routeModelsThroughProxy(
         ...draft.headers,
         [BASE_URL_HEADER]: upstream.origin,
         [ORIGINAL_PATH_HEADER]: `${trimTrailingSlashes(upstream.pathname)}${suffix}`,
-        [PROJECT_HEADER]: project,
+        [PROJECT_HEADER]: projectHeaderValue(project),
         ...(sessionToken ? { [SESSION_TOKEN_HEADER]: sessionToken } : {}),
       };
     });

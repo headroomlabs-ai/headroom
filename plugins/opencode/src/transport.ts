@@ -11,6 +11,14 @@ export const BASE_URL_HEADER = "x-headroom-base-url";
 export const ORIGINAL_PATH_HEADER = "x-headroom-original-path";
 export const PROJECT_HEADER = "x-headroom-project";
 export const SESSION_TOKEN_HEADER = "x-headroom-session-token";
+
+// A header value must be a ByteString (code points up to U+00FF): Headers.set throws a
+// TypeError for any other character, so a Thai, Chinese or Cyrillic project name broke
+// every routed request. Percent-encode it as headroom/cli/wrap.py does; the proxy
+// decodes it in sanitize_project_name before storing it.
+export function projectHeaderValue(project: string): string {
+  return encodeURIComponent(project);
+}
 const PROXY_ENV = "HEADROOM_OPENCODE_TRANSPORT_PROXY_URL";
 export const EXCLUDE_HOSTS_ENV = "HEADROOM_OPENCODE_EXCLUDE_HOSTS";
 export const WIRE_ROOTS_ENV = "HEADROOM_OPENCODE_WIRE_ROOTS";
@@ -558,7 +566,7 @@ function mergeFetchHeaders(
     headers.set(ORIGINAL_PATH_HEADER, originalPath);
   }
   if (project) {
-    headers.set(PROJECT_HEADER, project);
+    headers.set(PROJECT_HEADER, projectHeaderValue(project));
   }
   if (sessionToken) {
     headers.set(SESSION_TOKEN_HEADER, sessionToken);
@@ -652,7 +660,7 @@ function headersForNodeRequest(
     headers.set(ORIGINAL_PATH_HEADER, originalPath);
   }
   if (project) {
-    headers.set(PROJECT_HEADER, project);
+    headers.set(PROJECT_HEADER, projectHeaderValue(project));
   }
   if (sessionToken) {
     headers.set(SESSION_TOKEN_HEADER, sessionToken);
