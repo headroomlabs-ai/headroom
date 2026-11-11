@@ -53,6 +53,67 @@ class TestSemanticCache:
         entry = cache.get("Unknown query", messages_hash="unknown")
         assert entry is None
 
+    @pytest.mark.parametrize("messages_hash", [None, ""])
+    @pytest.mark.parametrize("namespace", ["", "provider/model"])
+    def test_query_only_round_trip(self, messages_hash, namespace):
+        cache = SemanticCache()
+        cache.put("What failed?", "disk full", messages_hash, namespace)
+
+        entry = cache.get("What failed?", messages_hash, namespace)
+
+        assert entry is not None and entry.response == "disk full"
+        assert entry.access_count == 2
+        assert cache.get_stats()["hits"] == 1
+        assert cache.get("What failed?", namespace="other") is None
+        assert cache.get("What failed?", messages_hash="context", namespace=namespace) is None
+        assert cache.get("What else failed?", namespace=namespace) is None
+
+    def test_query_only_exact_hit_does_not_call_embedder_again(self):
+        def embed(text):
+            return [1.0, 0.0]
+
+        cache = SemanticCache(embedding_fn=embed)
+        cache.put("question", "answer")
+
+        def unavailable(text):
+            raise RuntimeError("embedding service offline")
+
+        cache._embedding_fn = unavailable
+        assert cache.get("question").response == "answer"
+
+    def test_query_only_hit_refreshes_lru(self):
+        cache = SemanticCache(SemanticCacheConfig(max_entries=2))
+        cache.put("first", "one")
+        cache.put("second", "two")
+        assert cache.get("first") is not None
+        cache.put("third", "three")
+        assert cache.get("first").response == "one"
+        assert cache.get("second") is None
+
+    def test_query_only_expiration_and_disabled_exact_matching(self, monkeypatch):
+        monkeypatch.setattr(time, "time", lambda: 1000.0)
+        cache = SemanticCache(SemanticCacheConfig(ttl_seconds=10))
+        cache.put("query", "answer")
+        assert cache.get("query") is not None
+        cache.config.use_exact_matching = False
+        assert cache.get("query") is None
+        cache.config.use_exact_matching = True
+        monkeypatch.setattr(time, "time", lambda: 1011.0)
+        assert cache.get("query") is None
+
+    @pytest.mark.parametrize("query", ["", " \n\t"])
+    def test_blank_query_without_context_never_hits(self, query):
+        cache = SemanticCache()
+        cache.put(query, "answer")
+        assert cache.get(query) is None
+
+    def test_query_hash_cannot_read_a_context_key(self):
+        query = "continue"
+        query_hash = hashlib.sha256(query.encode()).hexdigest()[:16]
+        cache = SemanticCache()
+        cache.put(query, "context answer", messages_hash=query_hash)
+        assert cache.get(query) is None
+
     @pytest.mark.parametrize("max_entries", [0, -1])
     def test_put_rejects_nonpositive_capacity(self, max_entries, monkeypatch):
         cache = SemanticCache(SemanticCacheConfig(max_entries=max_entries))
@@ -621,6 +682,29 @@ class TestSemanticCacheLayer:
 
         result = layer.process(messages, context)
         assert result.semantic_cache_hit is False
+
+    @pytest.fixture(params=["object", "set", "cycle"])
+    def unhashable_messages(self, request):
+        if request.param == "cycle":
+            opaque = []
+            opaque.append(opaque)
+        else:
+            opaque = object() if request.param == "object" else {"opaque"}
+        return [{"role": "user", "content": "Hello!", "opaque": opaque}]
+
+    def test_unhashable_messages_are_not_stored(self, layer, context, unhashable_messages):
+        assert layer.store_response(unhashable_messages, "private answer", context) == ""
+        assert layer.cache.get_stats()["entries"] == 0
+
+    def test_unhashable_messages_skip_query_only_entries(self, layer, context, unhashable_messages):
+        namespace = layer._compute_namespace(context)
+        layer.cache.put("Hello!", "another context's answer", namespace=namespace)
+
+        result = layer.process(unhashable_messages, context)
+
+        assert result.semantic_cache_hit is False
+        assert result.cached_response is None
+        assert result.messages[-1]["content"] == "Hello!"
 
 
 class TestSemanticCoverage:

@@ -123,7 +123,7 @@ else
 fi
 
 # Validate port number
-if ! [[ "${PORT}" =~ ^[0-9]+$ ]] || [[ "${PORT}" -lt 1024 ]] || [[ "${PORT}" -gt 65535 ]]; then
+if ! [[ "${PORT}" =~ ^[1-9][0-9]{3,4}$ ]] || [[ "${PORT}" -lt 1024 ]] || [[ "${PORT}" -gt 65535 ]]; then
   fatal "Invalid port number: ${PORT} (must be 1024-65535)"
 fi
 

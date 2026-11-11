@@ -194,4 +194,50 @@ describe("Gemini withHeadroom", () => {
 
     expect(mockModel.generateContent).toHaveBeenCalledWith({ contents });
   });
+
+  it("accepts a plain string and a part array as a single user turn", async () => {
+    const mockModel = { generateContent: vi.fn().mockResolvedValue({}) };
+    mockFetch.mockResolvedValue(mockCompressResponse([]));
+
+    const wrapped = withHeadroom(mockModel, { baseUrl: "http://test:8787" });
+
+    await wrapped.generateContent("text");
+    const firstBody = JSON.parse(mockFetch.mock.calls[0][1].body);
+    expect(firstBody.messages).toEqual([{ role: "user", content: "text" }]);
+
+    // A top-level array is the parts of one turn, not several turns: media in
+    // it must reach the proxy alongside the text.
+    await wrapped.generateContent([
+      "describe",
+      { inlineData: { mimeType: "image/png", data: "AAAA" } },
+    ]);
+    const secondBody = JSON.parse(mockFetch.mock.calls[1][1].body);
+    expect(secondBody.messages[0].content).toEqual([
+      { type: "text", text: "describe" },
+      { type: "image_url", image_url: { url: "data:image/png;base64,AAAA" } },
+    ]);
+  });
+
+  it("rebuilds a request object when a string prompt is compressed", async () => {
+    const mockModel = { generateContent: vi.fn().mockResolvedValue({}) };
+    mockFetch.mockResolvedValue(mockCompressResponse([]));
+
+    const wrapped = withHeadroom(mockModel, { baseUrl: "http://test:8787" });
+    await wrapped.generateContent("text");
+
+    // The SDK would read a bare Contents array as the parts of one turn.
+    expect(mockModel.generateContent).toHaveBeenCalledWith({
+      contents: [{ role: "user", parts: [{ text: "compressed content" }] }],
+    });
+  });
+
+  it("passes string params through when nothing was compressed", async () => {
+    const mockModel = { generateContent: vi.fn().mockResolvedValue({}) };
+    mockFetch.mockRejectedValue(new Error("connect ECONNREFUSED"));
+
+    const wrapped = withHeadroom(mockModel, { baseUrl: "http://test:8787" });
+    await wrapped.generateContent("text");
+
+    expect(mockModel.generateContent).toHaveBeenCalledWith("text");
+  });
 });
