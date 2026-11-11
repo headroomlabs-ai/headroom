@@ -941,6 +941,7 @@ def gateway_model_catalog(
             item.update(
                 type="model",
                 display_name=route.id,
+                lifecycle="active",
                 created_at=datetime.fromtimestamp(catalog.published_at, timezone.utc).isoformat(),
             )
             item["headroom"]["created_at_provenance"] = "gateway_catalog_publication"
