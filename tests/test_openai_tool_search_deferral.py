@@ -179,6 +179,31 @@ def test_terminal_reserved_namespace_stays_resident(monkeypatch):
     assert tools == snapshot
 
 
+@pytest.mark.parametrize(
+    "tool_name",
+    [
+        "file_search",
+        "web_search",
+        "code_interpreter",
+        "computer",
+        "image_generation",
+    ],
+)
+def test_reserved_openai_tools_stay_resident(monkeypatch, tool_name: str) -> None:
+    monkeypatch.setenv("HEADROOM_OPENAI_TOOL_SEARCH", "1")
+    tool = _fn(tool_name)
+    tools = [tool] + [_fn(f"peer_{i}") for i in range(11)]
+    snapshot = copy.deepcopy(tools)
+
+    out = inject_tool_search_deferral_openai(tools, "gpt-5.6-terra")
+
+    forwarded = next(t for t in out if t.get("name") == tool_name)
+    assert forwarded == tool
+    assert "defer_loading" not in forwarded
+    assert next(t for t in out if t.get("name") == "peer_0").get("defer_loading") is True
+    assert tools == snapshot
+
+
 def test_terminal_helper_remains_deferrable(monkeypatch):
     monkeypatch.setenv("HEADROOM_OPENAI_TOOL_SEARCH", "1")
     tools = [_fn("terminal_helper")] + [_fn(f"peer_{i}") for i in range(11)]
@@ -189,10 +214,41 @@ def test_terminal_helper_remains_deferrable(monkeypatch):
     assert helper.get("defer_loading") is True
 
 
+def test_reserved_helpers_remain_deferrable(monkeypatch):
+    monkeypatch.setenv("HEADROOM_OPENAI_TOOL_SEARCH", "1")
+    tools = [_fn("file_search_helper"), _fn("web_search_client")] + [
+        _fn(f"peer_{i}") for i in range(10)
+    ]
+
+    out = inject_tool_search_deferral_openai(tools, "gpt-5.6-terra")
+
+    for name in ("file_search_helper", "web_search_client"):
+        tool = next(t for t in out if t.get("name") == name)
+        assert tool.get("defer_loading") is True
+
+
 def test_prefixed_core_and_terminal_names_stay_resident(monkeypatch):
     monkeypatch.setenv("HEADROOM_OPENAI_TOOL_SEARCH", "1")
-    resident = ["_bash", "_read", "_write", "_edit", "_glob", "_grep", "_terminal"]
-    noncore = ["_hub", "_todo", "_eval", "mcp__server__read", "terminal_helper"]
+    resident = [
+        "_bash",
+        "_read",
+        "_write",
+        "_edit",
+        "_glob",
+        "_grep",
+        "_terminal",
+        "_file_search",
+        "_web_search",
+        "_code_interpreter",
+    ]
+    noncore = [
+        "_hub",
+        "_todo",
+        "_eval",
+        "mcp__server__read",
+        "terminal_helper",
+        "file_search_helper",
+    ]
     tools = [_fn(name) for name in resident + noncore]
 
     out = inject_tool_search_deferral_openai(tools, "gpt-5.6-terra")
