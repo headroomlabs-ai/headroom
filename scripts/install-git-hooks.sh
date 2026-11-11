@@ -51,19 +51,23 @@ cat > "$HOOK_PATH" <<'HOOK_EOF'
 
 set -euo pipefail
 
-# Skip the hook entirely when push goes to a ref that is not on the main
-# tracking branches we gate. Adjust the pattern below if more branches
-# need gating.
 remote="$1"
 url="$2"
 
+# git passes one line per ref on stdin. An all-zero local sha is a delete
+# (`git push --delete`): it sends no commits, so there is nothing to check.
+has_update=0
 while IFS=' ' read -r local_ref local_sha remote_ref remote_sha; do
-    # Empty local_sha means a delete; nothing to verify.
-    if [[ "$local_sha" == "0000000000000000000000000000000000000000" ]]; then
+    if [[ "$local_sha" =~ ^0+$ ]]; then
         continue
     fi
+    has_update=1
     echo "── pre-push: running 'make ci-precheck' before pushing $local_ref → $remote_ref"
 done
+
+if [[ "$has_update" -eq 0 ]]; then
+    exit 0
+fi
 
 if [[ -z "${VIRTUAL_ENV:-}" ]]; then
     if [[ -f .venv/bin/activate ]]; then
