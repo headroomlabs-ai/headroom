@@ -5385,7 +5385,7 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
         local_active_sessions = list_active_sessions(
             proxy.active_session_registry.local_sessions_dir,
             stale_after_seconds=proxy.active_session_registry.stale_after_seconds,
-            prune_stale=True,
+            prune_stale=proxy.active_session_registry.persistence_enabled,
         )
         cluster_active_sessions: list[dict[str, Any]] = []
         cluster_manifest_path = proxy.active_session_registry.cluster_manifest_path

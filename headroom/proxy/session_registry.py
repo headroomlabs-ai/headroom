@@ -89,12 +89,34 @@ def _aggregate_metrics(metrics: Any) -> dict[str, int | float]:
     }
 
 
+_UNSAFE_AGENT_CHARS = re.compile(r"[^A-Za-z0-9._ -]")
+
+
+def _sanitize_agent_type(value: Any) -> str:
+    """Normalize a free-form agent label (e.g. ``Claude Code``) for manifests.
+
+    The label is display metadata, never a path component, so spaces are kept;
+    anything else outside a conservative character set becomes ``-``.
+    """
+    cleaned = _UNSAFE_AGENT_CHARS.sub("-", str(value or "")).strip()[:_MAX_COMPONENT_LENGTH]
+    return cleaned or "unknown"
+
+
+def _remove_empty_dirs(*directories: Path) -> None:
+    # Directories are passed innermost first; a non-empty one stops the walk.
+    for directory in directories:
+        try:
+            directory.rmdir()
+        except OSError:
+            return
+
+
 def _atomic_write_json(path: Path, payload: dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     fd, tmp_name = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=str(path.parent))
     tmp_path = Path(tmp_name)
     try:
-        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+        with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as handle:
             json.dump(payload, handle, sort_keys=True)
             handle.write("\n")
             handle.flush()
@@ -153,7 +175,7 @@ class ActiveSessionRegistry:
         self.instance_id = _validate_path_component(
             instance_id or str(uuid.uuid4()), label="instance_id"
         )
-        self.agent_type = agent_type
+        self.agent_type = _sanitize_agent_type(agent_type)
         self.local_sessions_dir = local_sessions_dir or paths.sessions_dir()
         self.cluster = cluster or ClusterConfig.from_env()
         self.stale_after_seconds = max(int(stale_after_seconds), 1)
@@ -239,6 +261,7 @@ class ActiveSessionRegistry:
             return
         try:
             self.local_manifest_path.unlink(missing_ok=True)
+            _remove_empty_dirs(self.local_session_dir)
         except OSError as exc:
             logger.warning(
                 "event=active_session_manifest_cleanup_failed scope=local path=%s error=%s",
@@ -249,6 +272,7 @@ class ActiveSessionRegistry:
         if cluster_path is not None:
             try:
                 cluster_path.unlink(missing_ok=True)
+                _remove_empty_dirs(cluster_path.parent, cluster_path.parent.parent)
             except OSError as exc:
                 logger.warning(
                     "event=active_session_manifest_cleanup_failed scope=cluster path=%s error=%s",
@@ -276,11 +300,12 @@ def _read_manifest(path: Path, *, now: datetime, stale_after_seconds: int) -> di
         instance_id = _validate_path_component(
             str(payload.get("instance_id") or ""), label="instance_id"
         )
-        agent_type = _validate_path_component(
-            str(payload.get("agent_type") or "unknown"), label="agent_type"
-        )
     except ValueError:
         return None
+    raw_agent_type = str(payload.get("agent_type") or "unknown")
+    if len(raw_agent_type) > _MAX_COMPONENT_LENGTH or _UNSAFE_AGENT_CHARS.search(raw_agent_type):
+        return None
+    agent_type = raw_agent_type.strip() or "unknown"
     heartbeat = _parse_iso(payload.get("last_heartbeat_at"))
     if heartbeat is None:
         return None
@@ -337,6 +362,7 @@ def list_active_sessions(
             if prune_stale:
                 try:
                     manifest.unlink(missing_ok=True)
+                    _remove_empty_dirs(manifest.parent)
                 except OSError as exc:
                     logger.warning(
                         "event=active_session_manifest_cleanup_failed scope=stale path=%s error=%s",

@@ -40,7 +40,13 @@ def list_telemetry_surfaces() -> list[TelemetrySurface]:
     otel = OTelMetricsConfig.from_env(default_service_name="headroom-proxy")
     langfuse = LangfuseTracingConfig.from_env(default_service_name="headroom-proxy")
     toin_backend = (os.environ.get("HEADROOM_TOIN_BACKEND") or "filesystem").strip() or "filesystem"
-    toin_status = "off" if toin_backend.lower() == "none" else "on"
+    toin_persisted = toin_backend.lower() != "none"
+    log_full_messages = os.environ.get("HEADROOM_LOG_MESSAGES", "").strip().lower() in {
+        "true",
+        "1",
+        "yes",
+        "on",
+    }
 
     return [
         TelemetrySurface(
@@ -122,25 +128,28 @@ def list_telemetry_surfaces() -> list[TelemetrySurface]:
         ),
         TelemetrySurface(
             surface="toin",
-            status=toin_status,
+            status="on",
             emits="Compression outcome patterns and tool signatures",
             includes_prompt_content=False,
             leaves_host_by_default=toin_backend.lower() not in {"", "filesystem", "none"},
             observe=get_default_toin_storage_path(),
             export=f"HEADROOM_TOIN_BACKEND={toin_backend}",
-            retention="Backend controlled",
-            notes="Custom backends use HEADROOM_TOIN_URL and HEADROOM_TOIN_TENANT_PREFIX.",
+            retention="Backend controlled" if toin_persisted else "In-memory only; lost on restart",
+            notes="Patterns are always collected in memory; HEADROOM_TOIN_BACKEND=none only "
+            "disables persistence. Custom backends use HEADROOM_TOIN_URL and "
+            "HEADROOM_TOIN_TENANT_PREFIX.",
         ),
         TelemetrySurface(
             surface="proxy_log",
             status="on",
             emits="Startup, request metadata, errors, and operational events",
-            includes_prompt_content=False,
+            includes_prompt_content=log_full_messages,
             leaves_host_by_default=False,
             observe=str(paths.proxy_log_path()),
             export="Local log file",
             retention="Until log rotation or user cleanup",
-            notes="Prompt logging requires explicit log_full_messages configuration.",
+            notes="Request/response bodies are logged when HEADROOM_LOG_MESSAGES=true or "
+            "--log-messages is set with a log file; this inventory sees only the environment.",
         ),
         TelemetrySurface(
             surface="active_sessions",

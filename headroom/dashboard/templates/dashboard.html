@@ -2854,7 +2854,8 @@
                     const rows = [];
                     const addRows = (items, scope) => {
                         (items || []).forEach((item) => {
-                            const key = [scope, item.session_id, item.instance_id].join(':');
+                            // Clustered proxies mirror each session into both lists; local wins.
+                            const key = [item.session_id, item.instance_id].join(':');
                             if (seen.has(key)) return;
                             seen.add(key);
                             rows.push({...item, scope});

@@ -54,7 +54,7 @@ def test_telemetry_list_json_reflects_env_overrides(monkeypatch, tmp_path) -> No
     assert surfaces["otel_metrics"]["status"] == "on"
     assert surfaces["otel_metrics"]["export"] == "http://otel.local/v1/metrics"
     assert surfaces["langfuse_tracing"]["status"] == "on"
-    assert surfaces["toin"]["status"] == "off"
+    assert surfaces["toin"]["status"] == "on"
     assert surfaces["active_sessions"]["leaves_host_by_default"] is True
     assert "team-gamma" in surfaces["active_sessions"]["export"]
 
@@ -84,3 +84,18 @@ def test_telemetry_list_separates_upload_and_local_switches(
     surfaces = {item["surface"]: item for item in json.loads(result.output)}
     assert surfaces["anonymous_beacon"]["status"] == upload_status
     assert surfaces["local_telemetry"]["status"] == local_status
+
+
+def test_telemetry_list_reflects_in_memory_toin_and_prompt_logging(monkeypatch, tmp_path) -> None:
+    monkeypatch.setenv("HEADROOM_WORKSPACE_DIR", str(tmp_path / "workspace"))
+    monkeypatch.setenv("HEADROOM_CONFIG_DIR", str(tmp_path / "config"))
+    monkeypatch.setenv("HEADROOM_TOIN_BACKEND", "none")
+    monkeypatch.setenv("HEADROOM_LOG_MESSAGES", "true")
+
+    result = CliRunner().invoke(main, ["telemetry", "list", "--json"])
+
+    assert result.exit_code == 0, result.output
+    surfaces = {item["surface"]: item for item in json.loads(result.output)}
+    assert surfaces["toin"]["status"] == "on"
+    assert "In-memory" in surfaces["toin"]["retention"]
+    assert surfaces["proxy_log"]["includes_prompt_content"] is True

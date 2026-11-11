@@ -341,3 +341,93 @@ def test_aggregate_overflow_keeps_summary_json_safe(large: int | float) -> None:
     assert summary["totals"]["tokens_saved"] == 9
     assert summary["totals"]["requests"] == pytest.approx(float(large))
     json.dumps(summary, allow_nan=False)
+
+
+def test_close_removes_empty_session_and_instance_directories(tmp_path: Path) -> None:
+    registry = ActiveSessionRegistry(
+        session_id="sess-clean",
+        instance_id="inst-clean",
+        local_sessions_dir=tmp_path / "sessions",
+        cluster=ClusterConfig(enabled=True, cluster_id="team", cluster_dir=tmp_path / "cluster"),
+    )
+    registry.heartbeat({"requests": 1})
+
+    registry.close()
+
+    assert not (tmp_path / "sessions" / "sess-clean").exists()
+    assert not (tmp_path / "cluster" / "team" / "sessions" / "inst-clean").exists()
+
+
+def test_free_form_agent_label_stays_visible(tmp_path: Path) -> None:
+    registry = ActiveSessionRegistry(
+        agent_type="Claude Code",
+        session_id="sess-label",
+        instance_id="inst-label",
+        local_sessions_dir=tmp_path / "sessions",
+    )
+    registry.heartbeat({"requests": 1})
+
+    sessions = sr.list_active_sessions(tmp_path / "sessions")
+
+    assert [item["agent_type"] for item in sessions] == ["Claude Code"]
+
+
+@pytest.mark.windows_newline
+def test_manifest_writer_pins_lf_newlines(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    import os
+
+    seen: dict[str, object] = {}
+    real_fdopen = os.fdopen
+
+    def spy_fdopen(fd, mode="r", *args, **kwargs):
+        seen.update(kwargs)
+        return real_fdopen(fd, mode, *args, **kwargs)
+
+    monkeypatch.setattr(sr.os, "fdopen", spy_fdopen)
+    target = tmp_path / "session.json"
+
+    sr._atomic_write_json(target, {"a": 1})
+
+    assert seen.get("newline") == "\n"
+    assert target.read_bytes().endswith(b"}\n")
+    assert b"\r" not in target.read_bytes()
+
+
+def test_stateless_stats_does_not_prune_stale_manifests(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    pytest.importorskip("fastapi")
+    from fastapi.testclient import TestClient
+
+    from headroom.proxy.models import ProxyConfig
+    from headroom.proxy.server import create_app
+
+    monkeypatch.setenv("HEADROOM_WORKSPACE_DIR", str(tmp_path / "workspace"))
+    monkeypatch.setenv("HEADROOM_CONFIG_DIR", str(tmp_path / "config"))
+    monkeypatch.setenv("HEADROOM_REQUIRE_RUST_CORE", "false")
+    stale = ActiveSessionRegistry(
+        session_id="sess-stale",
+        instance_id="inst-stale",
+        local_sessions_dir=tmp_path / "workspace" / "sessions",
+        stale_after_seconds=1,
+    )
+    stale.heartbeat({"requests": 1})
+    manifest = json.loads(stale.local_manifest_path.read_text())
+    manifest["last_heartbeat_at"] = "2000-01-01T00:00:00Z"
+    stale.local_manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+    app = create_app(
+        ProxyConfig(
+            optimize=False,
+            cache_enabled=False,
+            rate_limit_enabled=False,
+            log_requests=False,
+            subscription_tracking_enabled=False,
+            stateless=True,
+        )
+    )
+    app.state.proxy.active_session_registry.local_sessions_dir = tmp_path / "workspace" / "sessions"
+    with TestClient(app) as client:
+        assert client.get("/stats").status_code == 200
+
+    assert stale.local_manifest_path.exists()
