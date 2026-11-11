@@ -234,3 +234,65 @@ class TestGitCommonDirHelper:
         deep = tmp_path / "no-repo" / "a" / "b" / "c"
         deep.mkdir(parents=True)
         assert _git_common_dir(str(deep)) is None
+
+    def test_git_file_without_gitdir_line_returns_none(self, tmp_path: Path) -> None:
+        # A malformed ``.git`` file (no ``gitdir:`` line) must fail closed
+        # to the cwd key, not raise or guess.
+        work = tmp_path / "broken-gitfile"
+        work.mkdir()
+        (work / ".git").write_text("garbage\n", encoding="utf-8")
+        assert _git_common_dir(str(work)) is None
+
+    def test_git_file_empty_gitdir_target_returns_none(self, tmp_path: Path) -> None:
+        work = tmp_path / "empty-gitdir"
+        work.mkdir()
+        (work / ".git").write_text("gitdir:\n", encoding="utf-8")
+        assert _git_common_dir(str(work)) is None
+
+    def test_git_file_pointing_at_missing_dir_returns_none(self, tmp_path: Path) -> None:
+        work = tmp_path / "dangling-gdir"
+        work.mkdir()
+        target = tmp_path / "does-not-exist"
+        (work / ".git").write_text(f"gitdir: {target}\n", encoding="utf-8")
+        assert _git_common_dir(str(work)) is None
+
+    def test_worktree_git_file_resolves_through_commondir(self, repo: dict[str, Path]) -> None:
+        # The linked worktree's ``.git`` *file* must resolve through the
+        # gitdir's ``commondir`` back to the main checkout's common dir.
+        main_common = _git_common_dir(str(repo["main"].resolve()))
+        assert main_common is not None
+        wt_common = _git_common_dir(str(repo["worktree"].resolve()))
+        assert wt_common == main_common
+
+    def test_gitdir_without_commondir_file_keys_on_gitdir(self, tmp_path: Path) -> None:
+        # A ``.git`` file pointing at a gitdir that has no ``commondir``
+        # (the shape a submodule checkout has) keys on that gitdir and
+        # labels with the parent directory of the gitdir's target.
+        gitdir = tmp_path / "sub-src" / ".git"
+        gitdir.mkdir(parents=True)
+        work = tmp_path / "sub-checkout"
+        work.mkdir()
+        (work / ".git").write_text(f"gitdir: {gitdir}\n", encoding="utf-8")
+        r = ProjectResolver(key_strategy=GIT_STRATEGY)
+        resolved = r.resolve(_ctx(headers={"x-headroom-cwd": str(work)}))  # type: ignore[misc]
+        assert resolved is not None
+        assert resolved[1] == "sub-src"
+
+    def test_missing_file_entries_fail_closed(self, tmp_path: Path) -> None:
+        # ``.git`` dir with an empty ``commondir`` file: fall through to
+        # the directory itself (it IS the common dir in that case).
+        work = tmp_path / "dirrepo"
+        dot_git = work / ".git"
+        dot_git.mkdir(parents=True)
+        (dot_git / "commondir").write_text("  \n", encoding="utf-8")
+        common = _git_common_dir(str(work))
+        assert common is not None
+        assert Path(common) == dot_git.resolve()
+
+    def test_main_worktree_basename_fallbacks(self, tmp_path: Path) -> None:
+        # ``modules/<name>`` labels as the module name; a bare-ish common dir
+        # without a ``.git`` basename labels as its parent directory.
+        from headroom.memory.storage_router import _main_worktree_basename
+
+        assert _main_worktree_basename(str(tmp_path / "r" / ".git" / "modules" / "mlib")) == "mlib"
+        assert _main_worktree_basename(str(tmp_path / "weird" / "odd")) == "weird"
