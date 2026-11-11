@@ -150,7 +150,13 @@ def _local_profile(cwd: Path | None = None) -> str:
     slug = "".join(
         ch if (ch.isascii() and ch.isalnum()) or ch in "-._" else "-" for ch in root.name.lower()
     ).strip("-")
-    digest = sha1(str(root).encode("utf-8")).hexdigest()[:8]
+    try:
+        raw = str(root).encode("utf-8")
+    except UnicodeEncodeError:
+        # A POSIX directory name that is not valid UTF-8 is carried by pathlib as
+        # surrogate escapes. Hash the native bytes; valid paths keep their IDs.
+        raw = os.fsencode(root)
+    digest = sha1(raw).hexdigest()[:8]
     return validate_profile_name(f"init-{slug or 'repo'}-{digest}")
 
 
