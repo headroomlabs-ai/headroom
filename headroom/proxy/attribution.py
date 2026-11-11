@@ -37,6 +37,7 @@ sends that way.
 from __future__ import annotations
 
 import functools
+import itertools
 import logging
 import os
 import threading
@@ -78,6 +79,9 @@ LABELS_ENV_VAR: Final[str] = "HEADROOM_LABELS"
 #: ``X-Headroom-Labels`` as its own dimension, not only the listed ones. Off by
 #: default: each new dimension is persisted state, so an operator opts in.
 OPEN_LABELS_TOKEN: Final[str] = "labels"
+
+#: Words with a meaning in ``HEADROOM_ATTRIBUTION_DIMENSIONS``; never dimension names.
+RESERVED_TOKENS: Final[frozenset[str]] = frozenset({"default", "none", OPEN_LABELS_TOKEN})
 
 _DIMENSION_NAME_CHARS = frozenset("abcdefghijklmnopqrstuvwxyz0123456789_-.")
 
@@ -141,9 +145,11 @@ Resolver = Callable[[AttributionRequest], Any]
 class _Registration:
     resolver: Resolver
     default: bool
+    client_settable: bool = False
 
 
 _registry: dict[str, _Registration] = {}
+_builtins: dict[str, _Registration] = {}
 _registry_lock = threading.Lock()
 _builtins_installed = False
 
@@ -162,8 +168,12 @@ def _ensure_builtins() -> None:
 
 def _register_if_absent(name: str, resolver: Resolver, *, default: bool = True) -> None:
     """Register a built-in without displacing a resolver an extension installed."""
+    # Built-ins read what the client reports about itself, so a client may
+    # also name them through the open ``labels`` token.
+    registration = _Registration(resolver=resolver, default=default, client_settable=True)
     with _registry_lock:
-        _registry.setdefault(name, _Registration(resolver=resolver, default=default))
+        _builtins[name] = registration
+        _registry.setdefault(name, registration)
 
 
 def register_dimension(
@@ -172,6 +182,7 @@ def register_dimension(
     *,
     default: bool = True,
     replace: bool = False,
+    client_settable: bool = False,
 ) -> str:
     """Register ``resolver`` as the source of dimension ``name``.
 
@@ -179,24 +190,42 @@ def register_dimension(
     without operator configuration. An extension that needs a dimension for its
     own report (a cost-per-branch table needs ``branch``) registers it this way.
     ``replace`` must be passed to override an existing resolver, so two
-    extensions cannot silently fight over one name.
+    extensions cannot silently fight over one name. Replacing a built-in
+    (``project``, ``client``) makes the new resolver the only source of that
+    label: what a handler knows about the harness or project no longer
+    overrides it.
+
+    ``client_settable`` decides what the open ``labels`` token does when the
+    operator has not listed this dimension. Off, the default, keeps the name
+    reserved: a client cannot supply it in ``X-Headroom-Labels``, which is what
+    a resolver backed by authenticated identity needs. On, a client may name it
+    there, as it may for the built-ins.
     """
     cleaned = sanitize_dimension_name(name)
-    if cleaned is None:
+    if cleaned is None or cleaned in RESERVED_TOKENS:
         raise ValueError(f"invalid attribution dimension name: {name!r}")
     _ensure_builtins()
     with _registry_lock:
         if cleaned in _registry and not replace:
             raise ValueError(f"attribution dimension {cleaned!r} is already registered")
-        _registry[cleaned] = _Registration(resolver=resolver, default=default)
+        _registry[cleaned] = _Registration(
+            resolver=resolver, default=default, client_settable=client_settable
+        )
     return cleaned
 
 
 def unregister_dimension(name: str) -> None:
-    """Remove a registered resolver (tests, extension teardown)."""
-    cleaned = sanitize_dimension_name(name)
+    """Remove a registered resolver (tests, extension teardown).
+
+    A built-in that was replaced gets its own resolver back.
+    """
+    cleaned = sanitize_dimension_name(name) or ""
     with _registry_lock:
-        _registry.pop(cleaned or "", None)
+        builtin = _builtins.get(cleaned)
+        if builtin is not None:
+            _registry[cleaned] = builtin
+        else:
+            _registry.pop(cleaned, None)
 
 
 def registered_dimensions() -> tuple[str, ...]:
@@ -211,15 +240,12 @@ def default_dimensions() -> tuple[str, ...]:
         return tuple(name for name, reg in _registry.items() if reg.default)
 
 
-def parse_dimension_spec(spec: str | None, defaults: Iterable[str]) -> tuple[str, ...]:
-    """Expand a ``HEADROOM_ATTRIBUTION_DIMENSIONS`` value into dimension names.
-
-    Unset or empty means ``default``. Order is preserved and duplicates dropped;
-    invalid names are skipped with a warning rather than failing startup.
-    """
-    defaults = tuple(defaults)
+def _parse_spec(
+    spec: str | None, defaults: tuple[str, ...]
+) -> tuple[tuple[str, ...], frozenset[str]]:
+    """The selected dimension names, and the names removed with ``-name``."""
     if spec is None or not spec.strip():
-        return defaults[:MAX_DIMENSIONS]
+        return defaults[:MAX_DIMENSIONS], frozenset()
     selected: list[str] = []
     removed: set[str] = set()
     for raw in spec.split(","):
@@ -249,31 +275,97 @@ def parse_dimension_spec(spec: str | None, defaults: Iterable[str]) -> tuple[str
             len(ordered),
             MAX_DIMENSIONS,
         )
-    return tuple(ordered[:MAX_DIMENSIONS])
+    return tuple(ordered[:MAX_DIMENSIONS]), frozenset(removed)
 
 
-def enabled_dimensions(environ: Mapping[str, str] | None = None) -> tuple[str, ...]:
-    """Dimensions resolved on each request, from the environment."""
+def parse_dimension_spec(spec: str | None, defaults: Iterable[str]) -> tuple[str, ...]:
+    """Expand a ``HEADROOM_ATTRIBUTION_DIMENSIONS`` value into dimension names.
+
+    Unset or empty means ``default``. Order is preserved and duplicates dropped;
+    invalid names are skipped with a warning rather than failing startup.
+    """
+    return _parse_spec(spec, tuple(defaults))[0]
+
+
+@functools.lru_cache(maxsize=16)
+def _parsed_spec(
+    spec: str | None, defaults: tuple[str, ...]
+) -> tuple[tuple[str, ...], frozenset[str]]:
+    # Called on every request: parse (and warn about) a given value once.
+    return _parse_spec(spec, defaults)
+
+
+def _current_spec(
+    environ: Mapping[str, str] | None,
+) -> tuple[tuple[str, ...], frozenset[str]]:
     env = os.environ if environ is None else environ
     return _parsed_spec(env.get(ATTRIBUTION_DIMENSIONS_ENV_VAR), default_dimensions())
 
 
-@functools.lru_cache(maxsize=16)
-def _parsed_spec(spec: str | None, defaults: tuple[str, ...]) -> tuple[str, ...]:
-    # Called on every request: parse (and warn about) a given value once.
-    return parse_dimension_spec(spec, defaults)
+def enabled_dimensions(environ: Mapping[str, str] | None = None) -> tuple[str, ...]:
+    """Dimensions resolved on each request, from the environment."""
+    return _current_spec(environ)[0]
+
+
+def excluded_dimensions(environ: Mapping[str, str] | None = None) -> frozenset[str]:
+    """Names removed with ``-name``.
+
+    Nothing re-admits them: not the open ``labels`` token, not a handler
+    binding the label.
+    """
+    return _current_spec(environ)[1]
 
 
 def dimension_enabled(name: str, environ: Mapping[str, str] | None = None) -> bool:
-    """Whether labels for ``name`` are recorded under the current configuration.
+    """Whether a label the proxy binds for ``name`` is recorded.
 
-    Listed in ``HEADROOM_ATTRIBUTION_DIMENSIONS``, or accepted through the open
-    ``labels`` token (which never admits a registered dimension).
+    Listed in ``HEADROOM_ATTRIBUTION_DIMENSIONS``, or an unregistered name
+    under the open ``labels`` token that was not removed with ``-name``. A
+    registered dimension that is not listed is not enabled: under ``labels``
+    only a client can name it, in ``X-Headroom-Labels``, and only when it is
+    client-settable (see :func:`resolve_attribution`).
     """
-    enabled = enabled_dimensions(environ)
+    enabled, excluded = _current_spec(environ)
     if name in enabled:
         return True
-    return OPEN_LABELS_TOKEN in enabled and name not in registered_dimensions()
+    if OPEN_LABELS_TOKEN not in enabled or name in excluded or name in RESERVED_TOKENS:
+        return False
+    return name not in registered_dimensions()
+
+
+def _builtin_label_applies(name: str, environ: Mapping[str, str] | None = None) -> bool:
+    """Whether a value the proxy itself derived for ``name`` is recorded.
+
+    Handlers know ``project`` and ``client`` independently of the resolvers (a
+    Codex project context, the harness of a WebSocket session). Those values
+    count while the dimension is enabled and still resolved by its built-in.
+    Once ``register_dimension(..., replace=True)`` hands the name to another
+    resolver, that resolver is the only source of the label.
+    """
+    if not dimension_enabled(name, environ):
+        return False
+    with _registry_lock:
+        registration = _registry.get(name)
+        builtin = _builtins.get(name)
+    if registration is None:
+        return True
+    return builtin is not None and registration.resolver is builtin.resolver
+
+
+def _label_pairs(value: Any) -> dict[str, str]:
+    """Every well-formed pair in a ``name=value; name=value`` string, sanitized."""
+    if not isinstance(value, str) or not value.strip():
+        return {}
+    pairs: dict[str, str] = {}
+    for chunk in value.replace(",", ";").split(";"):
+        raw_name, sep, raw_label = chunk.partition("=")
+        if not sep:
+            continue
+        name = sanitize_dimension_name(raw_name)
+        label = sanitize_label(raw_label.strip())
+        if name is not None and label is not None:
+            pairs[name] = label
+    return pairs
 
 
 def parse_labels(value: Any) -> dict[str, str]:
@@ -281,14 +373,7 @@ def parse_labels(value: Any) -> dict[str, str]:
 
     Malformed pairs are skipped; the result is sanitized and bounded.
     """
-    if not isinstance(value, str) or not value.strip():
-        return {}
-    pairs: dict[str, str] = {}
-    for chunk in value.replace(",", ";").split(";"):
-        name, sep, label = chunk.partition("=")
-        if sep:
-            pairs[name.strip()] = label.strip()
-    return normalize_attribution(pairs)
+    return dict(itertools.islice(_label_pairs(value).items(), MAX_DIMENSIONS))
 
 
 def format_labels(labels: Mapping[str, str]) -> str:
@@ -321,7 +406,7 @@ def _header_resolver(dimension: str) -> Resolver:
         direct = request.header(header)
         if direct:
             return direct
-        return parse_labels(request.header(LABELS_HEADER)).get(dimension)
+        return _label_pairs(request.header(LABELS_HEADER)).get(dimension)
 
     return resolve
 
@@ -342,9 +427,16 @@ def resolve_attribution(
     never present with an empty or placeholder label: "unattributed" is a
     reporting decision, not a value. A resolver that raises is logged and
     skipped so one broken extension cannot fail the request.
+
+    With the open ``labels`` token, ``X-Headroom-Labels`` may name any
+    dimension that was not resolved above. That includes a registered one that
+    is not selected, provided it is client-settable (the built-ins are; see
+    :func:`register_dimension`). A selected resolver keeps precedence, even
+    when it yields nothing, and a name removed with ``-name`` stays out.
     """
     _ensure_builtins()
     names = enabled_dimensions() if dimensions is None else tuple(dimensions)
+    excluded = excluded_dimensions() if dimensions is None else frozenset()
     with _registry_lock:
         registry = dict(_registry)
     labels: dict[str, str] = {}
@@ -369,11 +461,19 @@ def resolve_attribution(
         if label is not None:
             labels[name] = label
     if OPEN_LABELS_TOKEN in names:
-        for name, label in parse_labels(request.header(LABELS_HEADER)).items():
+        for name, label in _label_pairs(request.header(LABELS_HEADER)).items():
             if len(labels) >= MAX_DIMENSIONS:
                 break
-            if name not in labels and name not in registry and not _is_credential(name):
-                labels[name] = label
+            if name in labels or name in excluded or name in RESERVED_TOKENS:
+                continue
+            if _is_credential(name):
+                continue
+            registration = registry.get(name)
+            if registration is not None and (name in names or not registration.client_settable):
+                # A selected resolver has the last word; an unselected one
+                # that is not client-settable keeps its name reserved.
+                continue
+            labels[name] = label
     return labels
 
 
@@ -459,6 +559,15 @@ def bind_label(dimension: str, value: Any) -> None:
     set_current_attribution(labels)
 
 
+def bind_builtin_label(dimension: str, value: Any) -> None:
+    """:func:`bind_label` for a value a handler derived for a built-in dimension.
+
+    A no-op when the dimension is off or its resolver was replaced.
+    """
+    if _builtin_label_applies(dimension):
+        bind_label(dimension, value)
+
+
 def merge_attribution(*layers: Mapping[str, str] | None) -> dict[str, str]:
     """Merge label mappings; later layers win, empty labels are dropped."""
     merged: dict[str, str] = {}
@@ -541,14 +650,17 @@ __all__ = [
     "OTEL_ATTRIBUTE_PREFIX",
     "OTEL_ATTRIBUTION_ENV_VAR",
     "OPEN_LABELS_TOKEN",
+    "RESERVED_TOKENS",
     "Resolver",
     "CONVERSATION_HEADERS",
+    "bind_builtin_label",
     "bind_label",
     "conversation_hint",
     "get_current_conversation",
     "set_current_conversation",
     "default_dimensions",
     "enabled_dimensions",
+    "excluded_dimensions",
     "format_labels",
     "get_current_attribution",
     "header_name_for",

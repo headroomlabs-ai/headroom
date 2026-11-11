@@ -90,6 +90,66 @@ def test_open_labels_cannot_shadow_a_registered_dimension():
     assert resolve_attribution(request, ["host", "labels"]) == {"host": "real"}
 
 
+def test_open_labels_name_registered_dimensions_that_are_not_selected():
+    request = _req({"X-Headroom-Labels": "project=web; team=infra"})
+    assert resolve_attribution(request, ["labels"]) == {"project": "web", "team": "infra"}
+
+
+def test_a_selected_resolver_has_the_last_word_over_open_labels():
+    request = _req({"X-Headroom-Labels": "client=spoofed; tenant=spoofed", "User-Agent": CLI_UA})
+    # ``client`` resolves; ``tenant`` is selected and finds nothing, which stands.
+    assert resolve_attribution(request, ["client", "tenant", "labels"]) == {"client": "claude-code"}
+
+
+def test_open_labels_never_readmit_a_removed_dimension(monkeypatch):
+    monkeypatch.setenv(attribution.ATTRIBUTION_DIMENSIONS_ENV_VAR, "labels,-Project")
+    request = _req({"X-Headroom-Labels": "project=web; team=infra"})
+    assert resolve_attribution(request) == {"team": "infra"}
+    assert attribution.excluded_dimensions() == frozenset({"project"})
+
+
+def test_a_removed_dimension_is_not_bound_by_a_handler_either(monkeypatch):
+    monkeypatch.setenv(attribution.ATTRIBUTION_DIMENSIONS_ENV_VAR, "labels,-team")
+    bind_label("team", "infra")
+    bind_label("squad", "blue")
+    assert dict(get_current_attribution()) == {"squad": "blue"}
+
+
+def test_open_labels_keep_an_extension_dimension_reserved():
+    register_dimension("user", lambda r: "from-identity", default=False)
+    register_dimension("region", lambda r: None, default=False, client_settable=True)
+    try:
+        request = _req({"X-Headroom-Labels": "user=mallory; region=eu"})
+        # Not selected: only the client-settable name may come from the client.
+        assert resolve_attribution(request, ["labels"]) == {"region": "eu"}
+        # Selected: each resolver has the last word.
+        assert resolve_attribution(request, ["user", "region", "labels"]) == {
+            "user": "from-identity"
+        }
+    finally:
+        unregister_dimension("user")
+        unregister_dimension("region")
+
+
+def test_spec_words_are_never_dimension_names():
+    request = _req({"X-Headroom-Labels": "default=a; none=b; labels=c; team=infra"})
+    assert resolve_attribution(request, ["labels"]) == {"team": "infra"}
+    for word in ("default", "none", "labels"):
+        with pytest.raises(ValueError):
+            register_dimension(word, lambda r: "x")
+
+
+def test_labels_header_is_filtered_before_it_is_capped(monkeypatch):
+    filler = "; ".join(f"d{i}=x" for i in range(attribution.MAX_DIMENSIONS))
+    request = _req({"X-Headroom-Labels": f"{filler}; team=infra"})
+    # A listed dimension is found wherever it sits in the header.
+    assert resolve_attribution(request, ["team"]) == {"team": "infra"}
+    # Names that are filtered out do not use up the cap.
+    removed = ",".join(f"-d{i}" for i in range(attribution.MAX_DIMENSIONS))
+    monkeypatch.setenv(attribution.ATTRIBUTION_DIMENSIONS_ENV_VAR, f"labels,{removed}")
+    assert resolve_attribution(request) == {"team": "infra"}
+
+
 def test_credential_headers_never_become_labels():
     request = _req({"X-Headroom-Proxy-Token": "secret", "X-Headroom-Api-Key": "k"})
     assert resolve_attribution(request, ["proxy-token", "api-key", "labels"]) == {}
@@ -124,10 +184,23 @@ def test_extension_can_replace_a_builtin_resolver():
         assert resolve_attribution(_req({"X-Client": "codex"}), ["client"]) == {
             "client": "from-identity"
         }
+        # What a handler knows about the harness no longer overrides it.
+        set_current_attribution({"client": "from-identity"})
+        attribution.bind_builtin_label("client", "codex")
+        assert dict(get_current_attribution()) == {"client": "from-identity"}
     finally:
-        from headroom.proxy.attribution_builtins import resolve_client
+        unregister_dimension("client")
+    # Unregistering a replaced built-in restores it.
+    assert "client" in attribution.default_dimensions()
+    assert resolve_attribution(_req({"X-Client": "codex"}), ["client"]) == {"client": "codex"}
+    attribution.bind_builtin_label("client", "codex")
+    assert dict(get_current_attribution()) == {"client": "codex"}
 
-        register_dimension("client", resolve_client, replace=True)
+
+def test_a_handler_label_is_bound_only_for_an_enabled_dimension(monkeypatch):
+    monkeypatch.setenv(attribution.ATTRIBUTION_DIMENSIONS_ENV_VAR, "labels")
+    attribution.bind_builtin_label("project", "web")
+    assert dict(get_current_attribution()) == {}
 
 
 @pytest.mark.parametrize(

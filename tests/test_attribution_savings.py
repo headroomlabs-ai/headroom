@@ -18,7 +18,8 @@ from headroom.proxy.savings_tracker import (
 
 
 @pytest.fixture(autouse=True)
-def _clean_context():
+def _clean_context(monkeypatch):
+    monkeypatch.delenv("HEADROOM_ATTRIBUTION_DIMENSIONS", raising=False)
     set_current_attribution(None)
     yield
     set_current_attribution(None)
@@ -35,7 +36,7 @@ def test_tracker_books_each_dimension_and_persists(tmp_path):
         input_tokens=600,
         tokens_saved=400,
         project="web",
-        attribution={"host": "studio", "client": "claude-code", "project": "ignored"},
+        attribution={"host": "studio", "client": "claude-code", "project": "web-label"},
     )
     tracker.record_request(
         model="gpt-4o",
@@ -54,9 +55,11 @@ def test_tracker_books_each_dimension_and_persists(tmp_path):
     assert list(by_dim["host"]) == ["studio", "build01"]
     assert by_dim["host"]["studio"]["savings_percent"] == pytest.approx(500 / 1400 * 100, 0.01)
     assert set(by_dim["client"]) == {"claude-code", "codex"}
-    # project keeps its own legacy map and is surfaced from it, once.
-    assert by_dim["project"] == {"web": by_dim["project"]["web"]}
-    assert by_dim["project"]["web"]["tokens_saved"] == 400
+    # by_dimension.project is the attribution label, like any other dimension;
+    # the project argument feeds the older projects totals.
+    assert set(by_dim["project"]) == {"web-label"}
+    assert by_dim["project"]["web-label"]["tokens_saved"] == 400
+    assert set(SavingsTracker(path=path).snapshot()["projects"]) == {"web"}
 
 
 def test_unattributed_requests_change_only_the_aggregate(tmp_path):
@@ -99,7 +102,8 @@ def test_state_without_dimensions_loads_and_garbage_is_dropped(tmp_path):
     }
     path.write_text(json.dumps(raw))
     by_dim = SavingsTracker(path=path).snapshot()["by_dimension"]
-    assert by_dim == {"host": {"ok": by_dim["host"]["ok"]}}
+    assert set(by_dim) == {"host", "project"}
+    assert by_dim["host"] == {"ok": by_dim["host"]["ok"]}
     assert by_dim["host"]["ok"]["tokens_saved"] == 7
 
 
@@ -268,6 +272,106 @@ def test_a_dimension_turned_off_is_not_booked_from_the_legacy_field(tmp_path, mo
     event = json.loads((tmp_path / "events.jsonl").read_text().splitlines()[-1])
     # The ledger's own client key predates labels and is unchanged.
     assert event["client"] == "codex"
+
+
+def test_project_turned_off_leaves_only_the_older_projects_totals(tmp_path, monkeypatch):
+    from headroom.proxy import attribution
+
+    monkeypatch.setenv(attribution.ATTRIBUTION_DIMENSIONS_ENV_VAR, "default,-project")
+    with _proxy_client(tmp_path, monkeypatch) as client:
+        _emit(client.app.state.proxy, project="web", client="codex")
+        lifetime = client.get("/stats-lifetime").json()
+        assert "project" not in lifetime["by_dimension"]
+        assert set(lifetime["by_dimension"]["client"]) == {"codex"}
+        assert set(lifetime["projects"]) == {"web"}
+
+
+def _capture_middleware_labels(monkeypatch):
+    """Record what the request middleware binds, while still binding it."""
+    import headroom.proxy.server as server_module
+
+    captured = []
+    real = server_module.set_current_attribution
+
+    def capture(labels):
+        captured.append(dict(labels or {}))
+        real(labels)
+
+    monkeypatch.setattr(server_module, "set_current_attribution", capture)
+    return captured
+
+
+class _LogSink:
+    def __init__(self):
+        self.entries = []
+
+    def log(self, entry):
+        self.entries.append(entry)
+
+
+def test_a_replaced_resolver_is_not_overridden_by_the_legacy_field(tmp_path, monkeypatch):
+    from headroom.proxy import attribution
+
+    attribution.register_dimension("client", lambda request: "custom-client", replace=True)
+    attribution.register_dimension("project", lambda request: "custom-project", replace=True)
+    captured = _capture_middleware_labels(monkeypatch)
+    try:
+        with _proxy_client(tmp_path, monkeypatch) as client:
+            proxy = client.app.state.proxy
+            # The middleware resolves the labels on a real request ...
+            client.get("/health", headers={"X-Client": "codex", "X-Headroom-Project": "web"})
+            resolved = captured[-1]
+            assert resolved["client"] == "custom-client"
+            assert resolved["project"] == "custom-project"
+            # ... and a handler that identified the harness and the project
+            # itself does not undo them at the outcome funnel.
+            sink = _LogSink()
+            with monkeypatch.context() as patch:
+                patch.setattr(proxy, "logger", sink, raising=False)
+                set_current_attribution(resolved)
+                _emit(proxy, project="web", client="codex")
+                set_current_attribution(None)
+
+            lifetime = client.get("/stats-lifetime").json()
+            for by_dim in (
+                client.get("/stats").json()["savings"]["by_dimension"],
+                lifetime["by_dimension"],
+            ):
+                assert set(by_dim["client"]) == {"custom-client"}
+                assert set(by_dim["project"]) == {"custom-project"}
+            # The older projects totals still record what the proxy detected.
+            assert set(lifetime["projects"]) == {"web"}
+            tags = sink.entries[-1].tags
+            assert (tags["client"], tags["project"]) == ("custom-client", "custom-project")
+    finally:
+        attribution.unregister_dimension("client")
+        attribution.unregister_dimension("project")
+
+    event = json.loads((tmp_path / "events.jsonl").read_text().splitlines()[-1])
+    # So does the ledger's own client key; its dims carry the resolved project.
+    assert event["client"] == "codex"
+    assert event["dims"]["project"] == "custom-project"
+    assert "client" not in event["dims"]
+
+
+def test_open_labels_book_a_builtin_dimension_that_is_not_selected(tmp_path, monkeypatch):
+    from headroom.proxy import attribution
+
+    monkeypatch.setenv(attribution.ATTRIBUTION_DIMENSIONS_ENV_VAR, "labels")
+    captured = _capture_middleware_labels(monkeypatch)
+    with _proxy_client(tmp_path, monkeypatch) as client:
+        client.get("/health", headers={"X-Headroom-Labels": "project=web; team=infra"})
+        assert captured[-1] == {"project": "web", "team": "infra"}
+
+        set_current_attribution(captured[-1])
+        # ``client`` is not listed, so the harness the handler saw is not booked.
+        _emit(client.app.state.proxy, client="codex")
+        set_current_attribution(None)
+        by_dim = client.get("/stats").json()["savings"]["by_dimension"]
+        assert set(by_dim) == {"project", "team"}
+        assert set(by_dim["project"]) == {"web"}
+    event = json.loads((tmp_path / "events.jsonl").read_text().splitlines()[-1])
+    assert event["dims"] == {"project": "web", "team": "infra"}
 
 
 def test_snapshot_carries_labels_to_pipeline_extensions(tmp_path, monkeypatch):

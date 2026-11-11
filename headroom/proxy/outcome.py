@@ -228,7 +228,8 @@ class RequestOutcome:
     # Attribution labels (``{dimension: label}``) a handler knows beyond what
     # the request middleware bound (see :mod:`headroom.proxy.attribution`).
     # Merged over the context's labels; ``client`` / ``project`` above win
-    # their own dimensions so the two spellings can never disagree.
+    # their own dimensions so the two spellings can never disagree, unless an
+    # extension replaced that dimension's resolver.
     attribution: Mapping[str, str] | None = None
 
     # ── Derived (computed once, no caching needed — properties are cheap) ─
@@ -515,7 +516,7 @@ async def emit_request_outcome(handler: Any, outcome: RequestOutcome) -> None:
     """
     from headroom.copilot_auth import consume_request_routed_to_copilot
     from headroom.proxy.attribution import (
-        dimension_enabled,
+        _builtin_label_applies,
         get_current_attribution,
         get_current_conversation,
         merge_attribution,
@@ -631,13 +632,16 @@ async def emit_request_outcome(handler: Any, outcome: RequestOutcome) -> None:
     # then what the handler knew, then the two legacy fields, so a project the
     # handler identified late (Codex project context) wins over the header.
     # The legacy fields win because ``projects`` and the ledger's ``client``
-    # key book them too, and the two spellings must not disagree; a dimension
-    # the operator turned off (``-client``) is still left out.
+    # key book them too, and the two spellings must not disagree. A dimension
+    # the operator turned off (``-client``) is still left out, and one whose
+    # resolver an extension replaced keeps the label that resolver gave. The
+    # legacy ``projects`` map and ledger ``client`` key still book what the
+    # proxy detected.
     attribution = merge_attribution(
         get_current_attribution(),
         outcome.attribution,
-        {"project": project} if project and dimension_enabled("project") else None,
-        {"client": outcome.client} if outcome.client and dimension_enabled("client") else None,
+        {"project": project} if project and _builtin_label_applies("project") else None,
+        {"client": outcome.client} if outcome.client and _builtin_label_applies("client") else None,
     )
 
     # Savings that are new to this conversation. Per-request descriptions
@@ -798,10 +802,15 @@ async def emit_request_outcome(handler: Any, outcome: RequestOutcome) -> None:
     request_logger = getattr(handler, "logger", None)
     if request_logger is not None:
         log_tags = public_tags(outcome.tags)
-        if outcome.client:
-            log_tags["client"] = outcome.client
-        if project:
-            log_tags["project"] = project
+        # ``client`` / ``project`` tags follow the attribution label, so a
+        # replaced resolver shows here too; without one (dimension turned off)
+        # they keep what the handler detected.
+        client_tag = attribution.get("client") or outcome.client
+        if client_tag:
+            log_tags["client"] = client_tag
+        project_tag = attribution.get("project") or project
+        if project_tag:
+            log_tags["project"] = project_tag
         for dimension, label in attribution.items():
             log_tags.setdefault(dimension, label)
         request_logger.log(

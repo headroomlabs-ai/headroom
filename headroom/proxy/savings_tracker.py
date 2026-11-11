@@ -874,7 +874,7 @@ def _normalize_dimensions(raw: Any) -> dict[str, dict[str, dict[str, Any]]]:
     dimensions: dict[str, dict[str, dict[str, Any]]] = {}
     for dim_name, labels in raw.items():
         dim = sanitize_dimension_name(dim_name)
-        if dim is None or dim == "project" or not isinstance(labels, dict):
+        if dim is None or not isinstance(labels, dict):
             continue
         cleaned: dict[str, dict[str, Any]] = {}
         for label_name, entry in labels.items():
@@ -1223,8 +1223,9 @@ class SavingsTracker:
         provider: str | None = None,
         agent: str | None = None,
         project: str | None = None,
-        # ``{dimension: label}`` (headroom.proxy.attribution). ``project`` is
-        # booked through the argument above and ignored here.
+        # ``{dimension: label}`` (headroom.proxy.attribution), booked into
+        # ``by_dimension``. Its ``project`` is the attribution label; the
+        # argument above feeds the older ``projects`` totals.
         attribution: Mapping[str, str] | None = None,
         cache_read_tokens: int = 0,
         cache_write_tokens: int = 0,
@@ -1708,8 +1709,6 @@ class SavingsTracker:
 
         dimensions: dict[str, dict[str, dict[str, Any]]] = self._state.setdefault("dimensions", {})
         for dim, label in normalize_attribution(attribution).items():
-            if dim == "project":
-                continue
             if dim not in dimensions and len(dimensions) >= DEFAULT_MAX_DIMENSIONS:
                 continue
             labels = dimensions.setdefault(dim, {})
@@ -1737,11 +1736,8 @@ class SavingsTracker:
                 del labels[evict]
 
     def _dimensions_snapshot_locked(self) -> dict[str, dict[str, dict[str, Any]]]:
-        """Per-dimension stats, ``project`` included, each ranked by savings."""
+        """Per-dimension stats, each ranked by savings."""
         result: dict[str, dict[str, dict[str, Any]]] = {}
-        projects = self._projects_snapshot_locked()
-        if projects:
-            result["project"] = projects
         for dim, labels in self._state.get("dimensions", {}).items():
             ranked = sorted(labels.items(), key=lambda item: item[1]["tokens_saved"], reverse=True)
             view: dict[str, dict[str, Any]] = {}

@@ -48,6 +48,20 @@ in `X-Headroom-Labels`. That last one is off by default: each dimension is persi
 state, so the operator opts in. At most 16 dimensions and 50 labels per dimension are
 kept; the smallest, oldest label is evicted first.
 
+With `labels`, a client may also name a built-in dimension you did not list:
+`HEADROOM_ATTRIBUTION_DIMENSIONS=labels` with `X-Headroom-Labels: project=web` records
+`project=web`. Three rules bound that:
+
+- A listed dimension's resolver always has the last word, even when it finds nothing, so
+  a client cannot override it.
+- `-name` keeps a name out whoever sends it (`labels,-project`).
+- A dimension an extension registered stays reserved unless the extension marks it
+  `client_settable`, so a label taken from authenticated identity cannot be supplied by
+  a client.
+
+`labels` on its own replaces the default set, so the built-ins are then only what clients
+name. Write `default,labels` to keep resolving them.
+
 ## Seeing it
 
 ```bash
@@ -89,3 +103,12 @@ from headroom.proxy.attribution import register_dimension
 
 register_dimension("region", lambda request: request.header("x-region"))
 ```
+
+`replace=True` takes over a built-in. The new resolver is then the only source of that
+label in `by_dimension`, the ledger's `dims`, request-log tags and
+`OutcomeSnapshot.attribution`: the harness or project the proxy detects itself no longer
+overrides it. Two older records keep what the proxy detected: the `projects` totals, and
+the ledger's per-event `client` key, which `headroom savings --by client` reads.
+
+Pass `client_settable=True` for a dimension that is only ever self-reported and that
+clients may name through `labels`. Leave it off for anything derived from identity.
