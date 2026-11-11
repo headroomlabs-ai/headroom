@@ -1134,6 +1134,14 @@ def dashboard(port: int | None, no_open: bool) -> None:
     help=("Custom Vertex AI regional API URL for publisher endpoints (env: VERTEX_TARGET_API_URL)"),
 )
 @click.option(
+    "--omlx-api-url",
+    default=None,
+    help=(
+        "Custom local oMLX API URL for hybrid local/cloud routing "
+        "(env: HEADROOM_OMLX_BASE_URL or OMLX_TARGET_API_URL)"
+    ),
+)
+@click.option(
     "--region",
     default="us-west-2",
     envvar="HEADROOM_REGION",
@@ -1157,6 +1165,15 @@ def dashboard(port: int | None, no_open: bool) -> None:
         "passthrough routes. Point at a re-signing gateway (LiteLLM, "
         "LocalStack), NOT raw AWS — rewriting the body breaks SigV4. "
         "(env: BEDROCK_TARGET_API_URL)"
+    ),
+)
+@click.option(
+    "--factory-api-url",
+    default=None,
+    help=(
+        "Factory Droid upstream for /api/* (used by `headroom wrap droid`). "
+        "/api/llm/a/v1/messages is compressed; other /api/* paths pass "
+        "through verbatim. (env: FACTORY_TARGET_API_URL)"
     ),
 )
 @click.option(
@@ -1294,10 +1311,12 @@ def proxy(
     gemini_api_url: str | None,
     cloudcode_api_url: str | None,
     vertex_api_url: str | None,
+    omlx_api_url: str | None,
     region: str,
     bedrock_region: str | None,
     bedrock_profile: str | None,
     bedrock_api_url: str | None,
+    factory_api_url: str | None,
     telemetry: bool,
     no_telemetry: bool,
     stateless: bool,
@@ -1519,6 +1538,8 @@ def proxy(
     if memory_qdrant_api_key is not None:
         qdrant_overrides["memory_qdrant_api_key"] = memory_qdrant_api_key
 
+    from headroom.config import resolve_omlx_target_api_url
+
     config = ProxyConfig(
         host=host,
         port=port,
@@ -1532,6 +1553,7 @@ def proxy(
         gemini_api_url=provider_api_overrides.gemini,
         cloudcode_api_url=provider_api_overrides.cloudcode,
         vertex_api_url=provider_api_overrides.vertex,
+        omlx_target_api_url=resolve_omlx_target_api_url(omlx_api_url, os.environ),
         mode=effective_mode,
         optimize=not no_optimize,
         cache_enabled=not no_cache,
@@ -1679,6 +1701,7 @@ def proxy(
         # CLI flag > env > unset. Matches the BEDROCK_TARGET_API_URL naming of
         # the sibling *_TARGET_API_URL passthrough overrides.
         bedrock_api_url=bedrock_api_url or os.environ.get("BEDROCK_TARGET_API_URL"),
+        factory_api_url=factory_api_url or os.environ.get("FACTORY_TARGET_API_URL"),
         anyllm_provider=effective_anyllm_provider,
         # License / Usage Reporting (managed/enterprise)
         license_key=license_key,
@@ -1724,6 +1747,12 @@ def proxy(
     openai_url = provider_api_targets.openai
     cloudcode_url = provider_api_targets.cloudcode
     vertex_url = provider_api_targets.vertex
+    factory_route_line = (
+        f"\n  /api/*                          → {config.factory_api_url}  "
+        "(Factory Droid; /api/llm/a/v1/messages compressed)"
+        if config.factory_api_url
+        else ""
+    )
     backend_section = ""
 
     if config.backend == "anyllm" or config.backend.startswith("anyllm-"):
@@ -1929,7 +1958,7 @@ Routing:
   /v1/chat/completions            → {openai_url}
   /v1/responses                   → {openai_url}  (HTTP + WebSocket)
   /v1internal:streamGenerateContent → {cloudcode_url}
-  /v1/projects/.../publishers/... → {vertex_url}
+  /v1/projects/.../publishers/... → {vertex_url}{factory_route_line}
 
 Usage:
 {usage_section}
