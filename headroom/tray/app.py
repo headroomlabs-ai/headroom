@@ -13,7 +13,7 @@ from .icon import render_icon
 
 # Exit code the tray uses to ask its owning ``headroom proxy`` to shut down.
 QUIT_EXIT_CODE = 64
-RELEASES_URL = "https://github.com/chopratejas/headroom/releases/latest"
+RELEASES_URL = "https://github.com/headroomlabs-ai/headroom/releases/latest"
 POLL_SECONDS = 5.0
 
 
