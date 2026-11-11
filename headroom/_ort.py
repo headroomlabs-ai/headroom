@@ -45,6 +45,25 @@ from pathlib import Path
 
 logger = logging.getLogger(__name__)
 
+_TELEMETRY_ENV_VAR = "ORT_DISABLE_TELEMETRY"
+
+
+def disable_ort_telemetry_by_default() -> None:
+    """Opt ONNX Runtime out of Microsoft's usage telemetry unless the caller chose.
+
+    Since 1.31, ONNX Runtime's Linux and macOS builds upload 1DS telemetry to
+    ``mobile.events.data.microsoft.com`` by default: a hashed device id kept in
+    ``~/Library/Application Support/Microsoft/DeveloperTools`` (macOS) plus, per
+    session, the model file and graph names, model hashes, execution providers
+    and hardware ids. ORT reads ``ORT_DISABLE_TELEMETRY`` once, when each copy
+    of the runtime initializes (the Python package and the dylib the Rust core
+    loads are separate copies), so this has to run before either can start.
+
+    ``setdefault`` keeps an explicit caller value, including ``0`` to allow it.
+    """
+    os.environ.setdefault(_TELEMETRY_ENV_VAR, "1")
+
+
 _ENV_VAR = "ORT_DYLIB_PATH"
 _MIN_RUST_ORT_API_VERSION = (1, 24)
 
@@ -119,7 +138,10 @@ def _resolve_and_pin() -> str | None:
 
         installed = _installed_ort_version()
         if installed is not None and installed < _MIN_RUST_ORT_API_VERSION:
-            logger.warning(
+            # By design on Intel macOS, where the proxy extra pins onnxruntime
+            # <1.24 (no newer x86_64 wheels): Python detection is the supported
+            # path there, so this is information, not a warning.
+            logger.info(
                 "onnxruntime %d.%d exposes an older C API than Rust detection "
                 "requires (1.24+); leaving %s unset and using Python detection",
                 *installed,

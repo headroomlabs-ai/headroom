@@ -31,6 +31,12 @@ from ..cache.compression_store import get_compression_store
 
 logger = logging.getLogger(__name__)
 
+# Wrapper around injected proactive-expansion text. The proxy places this
+# block after the last cache breakpoint and strips it from the prefix-tracker
+# snapshot so a later overlay/restart never has to replay it (#4287).
+PROACTIVE_EXPANSION_OPEN_TAG = "<headroom_proactive_expansion>"
+PROACTIVE_EXPANSION_CLOSE_TAG = "</headroom_proactive_expansion>"
+
 
 def looks_like_claude_code_compact_summary(*texts: str | None) -> bool:
     """Return true for Claude Code `/compact` continuation summaries.
@@ -575,8 +581,8 @@ class ContextTracker:
         parts.append("[End Proactive Expansion]")
         body = "\n".join(parts)
         # Escape any stray close tag in payload to prevent wrapper boundary forgery
-        body = body.replace("</headroom_proactive_expansion>", "<\\/headroom_proactive_expansion>")
-        return f"<headroom_proactive_expansion>\n{body}\n</headroom_proactive_expansion>"
+        body = body.replace(PROACTIVE_EXPANSION_CLOSE_TAG, "<\\/headroom_proactive_expansion>")
+        return f"{PROACTIVE_EXPANSION_OPEN_TAG}\n{body}\n{PROACTIVE_EXPANSION_CLOSE_TAG}"
 
     def get_tracked_hashes(self) -> list[str]:
         """Get list of currently tracked hashes."""
