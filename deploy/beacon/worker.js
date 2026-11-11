@@ -9,8 +9,8 @@
  * Deployed at headroom-beacon.headroom-beacon.workers.dev (otlp.headroomlabs.ai
  * is planned but not yet routed; see wrangler.toml). Three jobs:
  *
- *   1. Allowlist. Drop every field not on ALLOWED_KEYS before anything is
- *      written. This is the only privacy control that works retroactively —
+ *   1. Allowlist. Drop every field not on ALLOWED_KEYS, and every nested
+ *      field not described by NESTED, before anything is written. This is the only privacy control that works retroactively —
  *      if a future client version ships a bug that leaks a field, we cannot
  *      patch the installs already in the wild, but we can stop storing it
  *      here in one deploy.
@@ -114,6 +114,131 @@ const ALLOWED_RESOURCE = [
   'host.arch',
 ];
 
+// What may sit UNDER each allowed key. Without this the allowlist stops at the
+// top level and a nested field a client bug adds is stored verbatim -- the very
+// leak the header says one deploy here can stop. Mirrors _Session.payload() and
+// _payload_v2() in headroom/telemetry/session.py. A nested key absent here is
+// dropped, so the ordering rule on ALLOWED_KEYS applies to it too: teach it
+// here before a client sends it.
+//
+// Leaves are 'num' (a finite number), 'bool', or 'str': a token of at most 128
+// characters with no whitespace, which is every string the client sends (slugs,
+// hex ids, public model ids, versions). Free text does not fit it. `[spec]` is
+// a list of spec; mapOf(spec) is an object whose KEYS are data (transform
+// names, skip reasons, status codes), each key itself held to 'str'.
+const MAP = Symbol('map');
+const mapOf = (spec) => ({ [MAP]: spec });
+const nums = (...keys) => Object.fromEntries(keys.map((k) => [k, 'num']));
+
+const NESTED = {
+  schema_version: 'num',
+  session: {
+    id: 'str', seq: 'num', duration_s: 'num', turns: 'num', ended: 'str', final: 'bool',
+  },
+  tokens: nums(
+    'original', 'attempted', 'input', 'output', 'saved', 'tool_saved',
+    'cache_read', 'cache_write', 'uncached'
+  ),
+  rates: nums(
+    'saved_pct', 'eligible_pct', 'yield_pct', 'all_layers_saved_pct',
+    'all_layers_yield_pct', 'cache_read_pct', 'overhead_pct'
+  ),
+  compression: {
+    transforms: mapOf('num'),
+    by_strategy: [{ strategy: 'str', ...nums('n', 'tokens_in', 'tokens_out') }],
+    ...nums(
+      'overhead_ms_total', 'latency_ms_total', 'overhead_ms_per_turn',
+      'latency_ms_per_turn', 'passthrough_turns', 'response_cache_hits'
+    ),
+  },
+  skips: mapOf('num'),
+  sources: mapOf('num'),
+  providers: ['str'],
+  models: ['str'],
+  failures: 'num',
+  failure_statuses: mapOf('num'),
+  // Emitted by an extension, not by session.py, so this repository does not
+  // define its shape. Bounded rather than described: numbers, booleans and
+  // tokens only, at most ROUTING_DEPTH levels deep. It gets a real schema here
+  // once the extension's payload is written down.
+  routing: 'any',
+  quality: {
+    ...nums('reread_tokens', 'reread_compressed_tokens', 'waste_turns'),
+    waste: [{ kind: 'str', tokens: 'num' }],
+  },
+  hist: mapOf({ edges: ['num'], counts: ['num'] }),
+  shapes: {
+    by_content: [{ content: 'str', strategy: 'str', ...nums('n', 'tokens_in', 'tokens_out') }],
+    by_tool: [{ shape: 'str', ...nums('n', 'tokens_in', 'tokens_out') }],
+    truncated: 'bool',
+  },
+  cache: {
+    gap_edges_s: ['num'], hits: ['num'], misses: ['num'],
+    ...nums('write_5m', 'write_1h', 'inferred_turns'),
+  },
+  trajectory: {
+    buckets: 'num', turns: ['num'], tokens: ['num'], saved: ['num'],
+    // Runs over the closed _TURN_KINDS alphabet, at most MAX_TRAJECTORY_RUNS.
+    kinds: /^(?:[cfepzso]\d{1,9}){0,64}$/,
+    kinds_truncated: 'bool',
+    msgs_max: 'num',
+  },
+  clients: [{ client: 'str', n: 'num' }],
+  errors: { count: 'num', by_status: mapOf('num') },
+  strata: [{ dim: 'str', value: 'str', n: 'num' }],
+  config: [{ key: 'str', value: 'str' }],
+};
+
+// A key allowed at the top but given no shape would be dropped in full. Fail
+// the deploy instead of shipping that.
+if ([...ALLOWED_KEYS].sort().join() !== Object.keys(NESTED).sort().join()) {
+  throw new Error('beacon: ALLOWED_KEYS and NESTED disagree');
+}
+
+const TOKEN = /^[\w.:/@+|-]{0,128}$/;
+// A slug-shaped string can still be a URL or a credential. Model ids and the
+// other slugs the client sends never carry a scheme or a well-known key prefix,
+// so those are dropped even though they pass TOKEN.
+const SECRETISH = /:\/\/|^(?:sk|pk|rk)[-_]|^(?:ghp|gho|ghu|ghs|ghr)_|^github_pat_|^glpat-|^xox[abposr]-|^(?:AKIA|ASIA)[A-Z0-9]{12}|^AIza|^hf_|^eyJ/i;
+const isToken = (s) => TOKEN.test(s) && !SECRETISH.test(s);
+const ROUTING_DEPTH = 4;
+
+/** `value` reduced to what `spec` allows, or undefined when none of it is. */
+function clean(spec, value, depth = 0) {
+  if (spec === 'any') {
+    if (depth > ROUTING_DEPTH) return undefined;
+    spec = Array.isArray(value) ? ['any']
+      : value && typeof value === 'object' ? mapOf('any')
+      : typeof value === 'string' ? 'str'
+      : typeof value === 'number' ? 'num' : 'bool';
+  }
+  if (spec === 'num') return Number.isFinite(value) ? value : undefined;
+  if (spec === 'bool') return typeof value === 'boolean' ? value : undefined;
+  if (spec === 'str') return typeof value === 'string' && isToken(value) ? value : undefined;
+  if (spec instanceof RegExp) {
+    return typeof value === 'string' && spec.test(value) ? value : undefined;
+  }
+  if (Array.isArray(spec)) {
+    if (!Array.isArray(value)) return undefined;
+    return value.map((v) => clean(spec[0], v, depth + 1)).filter((v) => v !== undefined);
+  }
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return undefined;
+  const out = {};
+  if (spec[MAP]) {
+    for (const [key, v] of Object.entries(value)) {
+      const kept = isToken(key) ? clean(spec[MAP], v, depth + 1) : undefined;
+      if (kept !== undefined) out[key] = kept;
+    }
+    return out;
+  }
+  for (const [key, s] of Object.entries(spec)) {
+    if (!Object.hasOwn(value, key)) continue;
+    const kept = clean(s, value[key], depth + 1);
+    if (kept !== undefined) out[key] = kept;
+  }
+  return out;
+}
+
 // Cap on what ARRIVES, compressed or not.
 //
 // Was 64KB, chosen when the comment above it read "a beacon event is ~2KB" --
@@ -183,11 +308,13 @@ function unwrap(value) {
   return null;
 }
 
-function pick(obj, allowed) {
+function pick(obj, allowed, specOf) {
   const out = {};
   if (!obj || typeof obj !== 'object') return out;
   for (const key of allowed) {
-    if (key in obj) out[key] = obj[key];
+    if (!(key in obj)) continue;
+    const kept = clean(specOf(key), obj[key]);
+    if (kept !== undefined) out[key] = kept;
   }
   return out;
 }
@@ -200,14 +327,15 @@ function extract(payload) {
     for (const attr of rl.resource?.attributes || []) {
       resource[attr.key] = unwrap(attr.value);
     }
-    const cleanResource = pick(resource, ALLOWED_RESOURCE);
+    // Every resource attribute the client sends is a plain string.
+    const cleanResource = pick(resource, ALLOWED_RESOURCE, () => 'str');
 
     for (const sl of rl.scopeLogs || []) {
       for (const rec of sl.logRecords || []) {
         const body = unwrap(rec.body);
         if (!body || typeof body !== 'object') continue;
         records.push({
-          ...pick(body, ALLOWED_KEYS),
+          ...pick(body, ALLOWED_KEYS, (key) => NESTED[key]),
           resource: cleanResource,
           // Server-stamped. A client clock can be wrong or forged; this is the
           // timestamp partitioning and retention actually rely on.
