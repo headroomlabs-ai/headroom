@@ -1723,6 +1723,9 @@ def _is_managed_copilot_seeded_bearer(token: str) -> bool:
     )
 
 
+_WEBSOCKET_SCHEME = {"https": "wss", "http": "ws"}
+
+
 def _is_trusted_copilot_origin(url: str) -> bool:
     """Return True when the operator's Copilot credential may be sent to *url*.
 
@@ -1743,11 +1746,16 @@ def _is_trusted_copilot_origin(url: str) -> bool:
         os.environ.get("GITHUB_COPILOT_PROXY_URL", "").strip(),
         copilot_completions_base_url(),
     )
-    origins = {
-        (urlparse(value).scheme.lower(), urlparse(value).netloc.lower())
-        for value in configured
-        if value
-    }
+    origins: set[tuple[str, str]] = set()
+    for value in configured:
+        if not value:
+            continue
+        configured_url = urlparse(value)
+        configured_scheme = configured_url.scheme.lower()
+        origins.add((configured_scheme, configured_url.netloc.lower()))
+        # The WebSocket handler derives wss:// from https:// and ws:// from http://.
+        if configured_scheme in _WEBSOCKET_SCHEME:
+            origins.add((_WEBSOCKET_SCHEME[configured_scheme], configured_url.netloc.lower()))
     if (scheme, parsed.netloc.lower()) in origins:
         return True
     try:
@@ -1839,6 +1847,10 @@ async def apply_copilot_api_auth(headers: dict[str, str], *, url: str) -> dict[s
             parsed_url.hostname,
         )
         _remove_headers(resolved, "x-api-key")
+        # A managed seeded bearer IS the operator's token (the wrapper seeds the
+        # client with it); it must not travel to an origin we would not mint for.
+        if raw_token and _is_managed_copilot_seeded_bearer(raw_token):
+            _remove_headers(resolved, "authorization")
         return resolved
 
     token = await get_copilot_token_provider().get_api_token(integration_id=integration_id)

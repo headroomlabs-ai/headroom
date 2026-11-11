@@ -72,3 +72,40 @@ def test_an_operator_configured_http_host_keeps_working(monkeypatch: pytest.Monk
     assert _apply("http://127.0.0.1:9999/v1/chat/completions")["Authorization"] == (
         "Bearer copilot-session"
     )
+
+
+@pytest.mark.parametrize(
+    ("configured", "websocket_url"),
+    [
+        ("https://api.githubcopilot.com:8443", "wss://api.githubcopilot.com:8443/responses"),
+        ("http://127.0.0.1:9999", "ws://127.0.0.1:9999/responses"),
+    ],
+)
+def test_the_websocket_form_of_a_configured_origin_is_trusted(
+    monkeypatch: pytest.MonkeyPatch, configured: str, websocket_url: str
+) -> None:
+    monkeypatch.setenv("GITHUB_COPILOT_API_URL", configured)
+    assert _apply(websocket_url)["Authorization"] == "Bearer copilot-session"
+
+
+def test_the_websocket_form_does_not_widen_the_configured_port(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("GITHUB_COPILOT_API_URL", "https://api.githubcopilot.com:8443")
+    headers = _apply("wss://api.githubcopilot.com:9000/responses")
+    assert "copilot-session" not in str(headers)
+
+
+def test_a_seeded_operator_token_is_not_forwarded_to_an_untrusted_origin(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("GITHUB_COPILOT_API_TOKEN", "tid_operator_seed")
+    monkeypatch.setenv("GITHUB_COPILOT_REFRESH_OAUTH_TOKEN", "gho-refresh")
+    headers = asyncio.run(
+        copilot_auth.apply_copilot_api_auth(
+            {"authorization": "Bearer tid_operator_seed"},
+            url="http://api.githubcopilot.com/v1/chat/completions",
+        )
+    )
+    assert "tid_operator_seed" not in str(headers)
+    assert "copilot-session" not in str(headers)
