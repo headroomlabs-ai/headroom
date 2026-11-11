@@ -889,6 +889,60 @@ describe("Gemini part fields survive the compress round trip (issue #4770)", () 
       { role: "user", parts: [{ text: "first", thoughtSignature: "sig-u1" }, { text: "second" }] },
     ]);
   });
+
+  it("pairs a functionResponse that omits its id with the call it answers", () => {
+    const contents = [
+      {
+        role: "model",
+        parts: [{ functionCall: { id: "call_abc123", name: "get_weather", args: { city: "Paris" } } }],
+      },
+      {
+        // Gemini omits the id here; the response still answers "call_abc123".
+        role: "user",
+        parts: [{ functionResponse: { name: "get_weather", response: { tempC: 21 } } }],
+      },
+    ];
+    const openai = geminiToOpenAI(contents);
+    expect(openai[0].tool_calls?.[0].id).toBe("call_abc123");
+    expect(openai[1].role === "tool" && openai[1].tool_call_id).toBe("call_abc123");
+
+    // Two calls of the same name are answered in order.
+    const twice = geminiToOpenAI([
+      {
+        role: "model",
+        parts: [
+          { functionCall: { id: "call_1", name: "read", args: { p: "a" } } },
+          { functionCall: { id: "call_2", name: "read", args: { p: "b" } } },
+        ],
+      },
+      {
+        role: "user",
+        parts: [
+          { functionResponse: { name: "read", response: { a: 1 } } },
+          { functionResponse: { name: "read", response: { b: 2 } } },
+        ],
+      },
+    ]);
+    expect(twice.filter((m) => m.role === "tool").map((m) => (m as any).tool_call_id)).toEqual([
+      "call_1",
+      "call_2",
+    ]);
+  });
+
+  it("restores a thoughtSignature carried on a functionResponse part", () => {
+    const contents = [
+      {
+        role: "user",
+        parts: [
+          {
+            functionResponse: { id: "call_abc123", name: "get_weather", response: { tempC: 21 } },
+            thoughtSignature: "sig-response-1",
+          },
+        ],
+      },
+    ];
+    expect(openAIToGemini(geminiToOpenAI(contents))).toEqual(contents);
+  });
 });
 describe("openAIToVercel tool names", () => {
   it("carries the tool name from the matching tool-call onto the tool-result part", () => {

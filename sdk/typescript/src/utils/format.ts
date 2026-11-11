@@ -880,6 +880,11 @@ function geminiMediaPart(imageUrl: { url: string; mime_type?: string }): any {
 export function geminiToOpenAI(messages: any[]): OpenAIMessage[] {
   const result: OpenAIMessage[] = [];
 
+  // A functionResponse usually echoes its functionCall's `id`, but the field is optional.
+  // When it is missing, pair the response with the call it answers by name, so the two
+  // OpenAI ids still match and the turn keeps whatever per-call handling the proxy applies.
+  const pendingCallIds = new Map<string, string[]>();
+
   for (const msg of messages) {
     const role = msg.role === "model" ? "assistant" : "user";
     const parts: any[] = msg.parts ?? [];
@@ -921,10 +926,13 @@ export function geminiToOpenAI(messages: any[]): OpenAIMessage[] {
       }
       for (const fr of funcResponses) {
         const call = fr.functionResponse;
+        // The response may omit its id; fall back to the call of the same name that is
+        // still unanswered, so both sides of the round trip agree on one id.
+        const id = call.id ?? pendingCallIds.get(call.name)?.shift() ?? `gemini_${call.name}`;
         result.push(withGeminiExtras({
           role: "tool",
           content: JSON.stringify(call.response),
-          tool_call_id: call.id ?? `gemini_${call.name}`,
+          tool_call_id: id,
         }, mergeGeminiExtras(geminiPartExtras(fr), geminiResponseExtras(call))));
       }
       continue;
@@ -962,15 +970,21 @@ export function geminiToOpenAI(messages: any[]): OpenAIMessage[] {
       const openaiMsg: AssistantMessage = { role: "assistant", content };
 
       if (funcCalls.length > 0) {
-        openaiMsg.tool_calls = funcCalls.map((p: any): ToolCall => withGeminiExtras({
-          id: p.functionCall.id ?? `gemini_${p.functionCall.name}`,
-          type: "function" as const,
-          function: {
-            name: p.functionCall.name,
-            // `args` is optional in the Gemini API; OpenAI requires an object.
-            arguments: JSON.stringify(p.functionCall.args ?? {}),
-          },
-        }, mergeGeminiExtras(geminiPartExtras(p), geminiIdExtras(p.functionCall))));
+        openaiMsg.tool_calls = funcCalls.map((p: any): ToolCall => {
+          const id = p.functionCall.id ?? `gemini_${p.functionCall.name}`;
+          const pending = pendingCallIds.get(p.functionCall.name) ?? [];
+          pending.push(id);
+          pendingCallIds.set(p.functionCall.name, pending);
+          return withGeminiExtras({
+            id,
+            type: "function" as const,
+            function: {
+              name: p.functionCall.name,
+              // `args` is optional in the Gemini API; OpenAI requires an object.
+              arguments: JSON.stringify(p.functionCall.args ?? {}),
+            },
+          }, mergeGeminiExtras(geminiPartExtras(p), geminiIdExtras(p.functionCall)));
+        });
       }
       result.push(openaiMsg);
       continue;
@@ -1055,7 +1069,11 @@ export function openAIToGemini(messages: OpenAIMessage[]): any[] {
         response,
       };
       if (extras.id !== undefined) call.id = extras.id;
-      result.push({ role: "user", parts: [{ functionResponse: call }] });
+      // A signed functionResponse keeps its `thought` / `thoughtSignature` on the part.
+      result.push({
+        role: "user",
+        parts: [withGeminiPartExtras({ functionResponse: call }, extras)],
+      });
       continue;
     }
   }
