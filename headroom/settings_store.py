@@ -151,6 +151,16 @@ SETTINGS: tuple[SettingField, ...] = (
         tier="basic",
     ),
     SettingField(
+        "HEADROOM_NO_CCR_RESPONSE_HANDLING",
+        "no_ccr_response_handling",
+        "Disable CCR response handling",
+        "Compression",
+        "bool",
+        default=False,
+        help="Disable CCR response buffering while preserving retrieval tool and marker settings.",
+        tier="advanced",
+    ),
+    SettingField(
         "HEADROOM_CCR_INLINE_RESOLVE",
         "ccr_inline_resolve",
         "Resolve CCR markers inline",
@@ -162,6 +172,19 @@ SETTINGS: tuple[SettingField, ...] = (
             "relying on headroom_retrieve tool calls. For callers with no "
             "tool-call round-trip (e.g. a LiteLLM guardrail/proxy hop). "
             "Non-streaming responses only."
+        ),
+        tier="advanced",
+    ),
+    SettingField(
+        "HEADROOM_CCR_BUFFERED_CHAT_STREAMING",
+        "ccr_buffered_chat_streaming",
+        "Buffered CCR for streaming chat",
+        "Compression",
+        "bool",
+        default=False,
+        help=(
+            "Answer retrieval calls on streaming Chat Completions by buffering "
+            "turns that carry CCR markers. Buffered text arrives all at once."
         ),
         tier="advanced",
     ),

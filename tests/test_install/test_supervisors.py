@@ -17,6 +17,7 @@ from headroom.install.supervisors import (
     _register_windows_task,
     _render_unix_runner,
     _render_windows_runner,
+    _render_windows_vbs_launcher,
     _windows_boot_trigger,
     _windows_health_trigger,
     _windows_task_xml,
@@ -55,6 +56,32 @@ def test_windows_task_xml_user_scope_supports_interactive_token() -> None:
     assert "<LogonType>InteractiveToken</LogonType>" in xml
     assert "<RunLevel>LeastPrivilege</RunLevel>" in xml
     assert "<Interval>PT5M</Interval>" in xml
+
+
+def test_windows_task_xml_vbs_uses_wscript() -> None:
+    xml = _windows_task_xml(
+        "C:\\tmp\\default\\ensure-headroom.vbs",
+        trigger_xml=_windows_health_trigger(),
+        scope="user",
+        logon_type="InteractiveToken",
+    )
+
+    assert "<Command>wscript.exe</Command>" in xml
+    assert '<Arguments>//B //Nologo "C:\\tmp\\default\\ensure-headroom.vbs"</Arguments>' in xml
+
+
+def test_render_windows_vbs_launcher(tmp_path: Path) -> None:
+    vbs_path = tmp_path / "ensure-headroom.vbs"
+    ps1_path = tmp_path / "ensure-headroom.ps1"
+    record = _render_windows_vbs_launcher(vbs_path, ps1_path)
+
+    assert record.path == str(vbs_path)
+    assert record.kind == "script"
+    assert vbs_path.exists()
+    content = vbs_path.read_text(encoding="utf-8")
+    assert "WScript.Shell" in content
+    assert "ensure-headroom.ps1" in content
+    assert ", 0, True" in content
 
 
 def test_windows_task_xml_system_scope_uses_localsystem() -> None:
@@ -118,6 +145,112 @@ def test_parse_windows_task_xml_accepts_valid_bytes() -> None:
     task = _parse_windows_task_xml(b"<Task><LogonType>S4U</LogonType></Task>")
 
     assert task.find("LogonType").text == "S4U"
+
+
+def test_parse_windows_task_xml_accepts_utf16_encoded_bytes() -> None:
+    xml = (
+        '<?xml version="1.0" encoding="UTF-16"?>\n'
+        '<Task xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">'
+        "<Principals><Principal><LogonType>S4U</LogonType></Principal></Principals>"
+        "</Task>"
+    )
+    task = _parse_windows_task_xml(xml.encode("utf-16"))
+    assert task is not None
+    assert task.find(".//{*}LogonType").text == "S4U"
+
+
+def test_parse_windows_task_xml_accepts_utf16be_without_bom() -> None:
+    xml = (
+        '<?xml version="1.0" encoding="UTF-16"?>\n'
+        '<Task xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">'
+        "<Principals><Principal><LogonType>S4U</LogonType></Principal></Principals>"
+        "</Task>"
+    )
+    task = _parse_windows_task_xml(xml.encode("utf-16-be"))
+    assert task is not None
+    assert task.find(".//{*}LogonType").text == "S4U"
+
+
+def test_parse_windows_task_xml_preserves_declared_windows_codepage() -> None:
+    xml = (
+        '<?xml version="1.0" encoding="windows-1252"?>\n'
+        '<Task xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">'
+        "<Name>Caf\xe9</Name>"
+        "<Principals><Principal><LogonType>S4U</LogonType></Principal></Principals>"
+        "</Task>"
+    )
+    task = _parse_windows_task_xml(xml.encode("windows-1252"))
+    assert task is not None
+    assert task.find(".//{*}Name").text == "Caf\xe9"
+    assert task.find(".//{*}LogonType").text == "S4U"
+
+
+def test_parse_windows_task_xml_accepts_declared_multibyte_encoding() -> None:
+    xml = (
+        '<?xml version="1.0" encoding="shift_jis"?>\n'
+        '<Task xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">'
+        "<Name>\u30c6\u30b9\u30c8</Name>"
+        "<Principals><Principal><LogonType>S4U</LogonType></Principal></Principals>"
+        "</Task>"
+    )
+    task = _parse_windows_task_xml(xml.encode("shift_jis"))
+    assert task is not None
+    assert task.find(".//{*}Name").text == "\u30c6\u30b9\u30c8"
+    assert task.find(".//{*}LogonType").text == "S4U"
+
+
+def test_parse_windows_task_xml_accepts_ansi_with_invalid_utf8() -> None:
+    xml = (
+        b'<Task xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">'
+        b"<Name>Caf\xe9</Name>"
+        b"<Principals><Principal><LogonType>S4U</LogonType></Principal></Principals>"
+        b"</Task>"
+    )
+    task = _parse_windows_task_xml(xml)
+    assert task is not None
+    assert task.find(".//{*}LogonType").text == "S4U"
+
+
+def test_register_windows_task_cleans_up_on_unparseable_xml(monkeypatch) -> None:
+    def fake_run(command: list[str], **kwargs):
+        if command[1] == "/Query":
+            return _LaunchctlResult(stdout=b"<<<not-xml>>>")
+        return _LaunchctlResult()
+
+    monkeypatch.setattr("headroom.install.supervisors.subprocess.run", fake_run)
+
+    with pytest.raises(_WindowsTaskRegistrationError) as exc_info:
+        _register_windows_task("headroom-test-task", "<Task />", expected_logon_type="S4U")
+
+    assert exc_info.value.task_created is True
+
+
+def test_register_windows_task_cleans_up_on_unsupported_multibyte_error(monkeypatch) -> None:
+    def fake_run(command: list[str], **kwargs):
+        if command[1] == "/Query":
+            return _LaunchctlResult(
+                stdout=b'<?xml version="1.0" encoding="unsupported-codec"?><Task>'
+            )
+        return _LaunchctlResult()
+
+    monkeypatch.setattr("headroom.install.supervisors.subprocess.run", fake_run)
+
+    with pytest.raises(_WindowsTaskRegistrationError) as exc_info:
+        _register_windows_task("headroom-test-task", "<Task />", expected_logon_type="S4U")
+
+    assert exc_info.value.task_created is True
+
+
+def test_parse_windows_task_xml_accepts_utf8_bom_bytes() -> None:
+    xml = (
+        '<?xml version="1.0" encoding="UTF-16"?>\n'
+        '<Task xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">'
+        "<Principals><Principal><LogonType>S4U</LogonType></Principal></Principals>"
+        "</Task>"
+    )
+    task = _parse_windows_task_xml(xml.encode("utf-8-sig"))
+    assert task is not None
+    assert task.find(".//{*}LogonType").text == "S4U"
 
 
 def test_parse_windows_task_xml_accepts_text() -> None:
@@ -558,6 +691,8 @@ def test_install_windows_user_task_failure_cleans_up_and_falls_back(
     assert "<LogonType>InteractiveToken</LogonType>" in fallback_xml
     assert "<RunLevel>LeastPrivilege</RunLevel>" in fallback_xml
     assert "<Interval>PT5M</Interval>" in fallback_xml
+    assert "<Command>wscript.exe</Command>" in fallback_xml
+    assert any(record.path.endswith(".vbs") for record in records)
     assert [record.path for record in records if record.kind == "windows-task"] == [
         "headroom-default-health"
     ]
@@ -1003,6 +1138,93 @@ def test_windows_stop_surfaces_access_denied(monkeypatch: pytest.MonkeyPatch) ->
     monkeypatch.setattr("headroom.install.supervisors.run", fake_run)
     with pytest.raises(click.ClickException, match="Access is denied"):
         stop_supervisor(_manifest(supervisor=SupervisorKind.SERVICE.value))
+
+
+@pytest.mark.parametrize(
+    "stderr",
+    [
+        "ERROR: The system cannot find the file specified.",
+        'ERROR: The specified task name "headroom-default-health" does not exist in the system.',
+    ],
+)
+def test_windows_start_tolerates_absent_tasks(monkeypatch: pytest.MonkeyPatch, stderr: str) -> None:
+    # Session-scoped fallback installs never create the `-startup` task, and
+    # the health task can be missing too, so start must not raise when
+    # schtasks reports the task as missing and should start detached agent if not ready.
+    monkeypatch.setattr("headroom.install.supervisors.sys.platform", "win32")
+    calls: list[list[str]] = []
+    started: list[str] = []
+
+    def fake_run(command: list[str], **kwargs: object) -> object:
+        calls.append(command)
+        return type(
+            "Result",
+            (),
+            {
+                "returncode": 1,
+                "stdout": "",
+                "stderr": stderr,
+            },
+        )()
+
+    monkeypatch.setattr("headroom.install.supervisors.run", fake_run)
+    monkeypatch.setattr("headroom.install.runtime.runtime_ready", lambda manifest: False)
+    monkeypatch.setattr(
+        "headroom.install.runtime.start_detached_agent",
+        lambda profile: started.append(profile),
+    )
+    start_supervisor(_manifest(supervisor=SupervisorKind.SERVICE.value))
+    assert calls == [
+        ["schtasks", "/Change", "/TN", "headroom-default-health", "/ENABLE"],
+        ["schtasks", "/Run", "/TN", "headroom-default-startup"],
+    ]
+    assert started == ["default"]
+
+
+def test_windows_start_skips_detached_agent_when_already_ready(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr("headroom.install.supervisors.sys.platform", "win32")
+    started: list[str] = []
+
+    def fake_run(command: list[str], **kwargs: object) -> object:
+        return type(
+            "Result",
+            (),
+            {
+                "returncode": 1,
+                "stdout": "",
+                "stderr": "ERROR: The system cannot find the file specified.",
+            },
+        )()
+
+    monkeypatch.setattr("headroom.install.supervisors.run", fake_run)
+    monkeypatch.setattr("headroom.install.runtime.runtime_ready", lambda manifest: True)
+    monkeypatch.setattr(
+        "headroom.install.runtime.start_detached_agent",
+        lambda profile: started.append(profile),
+    )
+    start_supervisor(_manifest(supervisor=SupervisorKind.SERVICE.value))
+    assert started == []
+
+
+def test_windows_start_surfaces_access_denied(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr("headroom.install.supervisors.sys.platform", "win32")
+
+    def fake_run(command: list[str], **kwargs: object) -> object:
+        return type(
+            "Result",
+            (),
+            {
+                "returncode": 1,
+                "stdout": "",
+                "stderr": "ERROR: Access is denied.",
+            },
+        )()
+
+    monkeypatch.setattr("headroom.install.supervisors.run", fake_run)
+    with pytest.raises(click.ClickException, match="Access is denied"):
+        start_supervisor(_manifest(supervisor=SupervisorKind.SERVICE.value))
 
 
 def test_macos_start_bootstraps_when_job_not_registered(monkeypatch, tmp_path: Path) -> None:

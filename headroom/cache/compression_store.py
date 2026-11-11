@@ -71,6 +71,8 @@ _SECRET_KEY_VALUE_RE = re.compile(
 )
 _AUTH_VALUE_RE = re.compile(r"(?i)\b(Bearer|Basic)\s+[A-Za-z0-9._~+/=-]{12,}")
 _API_KEY_VALUE_RE = re.compile(r"\bsk-[A-Za-z0-9_-]{12,}\b")
+# Exactly one CCR marker and nothing else (see ``store`` and #2694, #4266).
+_BARE_CCR_MARKER_RE = re.compile(r"<<ccr:[^>\n]+>>")
 
 
 def _get_env_default_ttl_seconds() -> int:
@@ -383,7 +385,9 @@ class CompressionStore:
         # loudly rather than silently converting "retrievable" into "gone".
         # Narrow by design: only a *bare* marker is rejected. Legitimate
         # originals may legally CONTAIN markers (nested offloads, a tool that
-        # echoed one), and refusing those would drop recoverable data.
+        # echoed one), and refusing those would drop recoverable data. That
+        # includes an original that starts with one marker and ends with
+        # another (#4266), so the check is a full match of a single marker.
         #
         # The rejected value is never echoed into the log. It is provably a
         # bare marker here, but `original` is the store's credential-bearing
@@ -391,7 +395,7 @@ class CompressionStore:
         # OAuth token), and an error path is exactly where that sort of leak
         # survives review. `hash_key` already identifies the entry.
         stripped = original.strip()
-        if stripped.startswith("<<ccr:") and stripped.endswith(">>") and "\n" not in stripped:
+        if _BARE_CCR_MARKER_RE.fullmatch(stripped):
             logger.error(
                 "CCR store: refusing to persist a bare retrieval marker as "
                 "original_content (hash=%s tool=%s strategy=%s len=%d) — the "
@@ -844,6 +848,21 @@ class CompressionStore:
             self._expiration_heap.clear()
             self._stale_heap_entries = 0  # CRITICAL FIX: Reset stale counter
             self._stale_expiration_heap_entries = 0
+
+    def close(self) -> None:
+        """Close the storage backend and release its resources.
+
+        A shared backend (Redis) registers its guard in the module-level
+        registry; closing the store unregisters it so availability reports
+        reflect the live store lifecycle instead of a detached one.
+        """
+        with self._lock:
+            backend = getattr(self, "_backend", None)
+            if backend is not None and hasattr(backend, "close"):
+                try:
+                    backend.close()
+                except Exception:
+                    pass
 
     def _evict_if_needed(self) -> None:
         """Evict expired, then oldest live entries until below capacity.
@@ -1352,11 +1371,15 @@ def detach_compression_store() -> None:
     entries are left as they are: nothing is deleted from its backend, so a
     SQLite file is neither written nor emptied. Used when the proxy switches to
     stateless mode at runtime. The old backend is not closed, because code
-    that already holds the old store may still be using it.
+    that already holds the old store may still be using it; only its Redis
+    guard is unregistered, so /health and /metrics stop reporting it.
     """
     global _compression_store
 
     with _store_lock:
+        guard = getattr(getattr(_compression_store, "_backend", None), "_guard", None)
+        if guard is not None:
+            guard.close()
         _compression_store = None
 
 
@@ -1367,4 +1390,9 @@ def reset_compression_store() -> None:
     with _store_lock:
         if _compression_store is not None:
             _compression_store.clear()
+            if hasattr(_compression_store, "close"):
+                try:
+                    _compression_store.close()
+                except Exception:
+                    pass
         _compression_store = None

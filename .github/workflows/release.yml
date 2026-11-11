@@ -87,7 +87,7 @@ jobs:
       bump: ${{ steps.ver.outputs.bump }}
       previous_tag: ${{ steps.ver.outputs.previous_tag }}
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
 
@@ -129,17 +129,17 @@ jobs:
     permissions:
       contents: read
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
 
       - name: Set up Python
-        uses: actions/setup-python@v7
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         with:
           python-version: "3.12"
 
       - name: Set up Node.js
-        uses: actions/setup-node@v7
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: ">=24.16.0 <25"
 
@@ -182,7 +182,7 @@ jobs:
         shell: bash
 
       - name: Upload changelog via action
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: changelog
           path: /tmp/changelog-backup.md
@@ -193,7 +193,7 @@ jobs:
           node scripts/build_npm_release_assets.mjs "${{ needs.detect-version.outputs.npm_version }}" release-assets
 
       - name: Upload release assets artifact
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: release-assets
           path: release-assets/
@@ -264,12 +264,12 @@ jobs:
             manylinux: ""
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
 
       - name: Set up Python
-        uses: actions/setup-python@v7
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         with:
           python-version: "3.11"
 
@@ -283,7 +283,7 @@ jobs:
           python scripts/verify-versions.py
 
       - name: Build wheels
-        uses: PyO3/maturin-action@v1
+        uses: PyO3/maturin-action@e83996d129638aa358a18fbd1dfb82f0b0fb5d3b # v1.51.0
         with:
           target: ${{ matrix.target }}
           args: --release --out dist --interpreter python3.10 python3.11 python3.12 python3.13
@@ -313,7 +313,7 @@ jobs:
       # build from any future `os` rename.
       - name: Build sdist (linux x86_64 only — sdist is platform-independent)
         if: matrix.target == 'x86_64-unknown-linux-gnu'
-        uses: PyO3/maturin-action@v1
+        uses: PyO3/maturin-action@e83996d129638aa358a18fbd1dfb82f0b0fb5d3b # v1.51.0
         with:
           command: sdist
           args: --out dist
@@ -396,7 +396,7 @@ jobs:
           done
 
       - name: Upload wheels artifact
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: wheels-${{ matrix.os }}-${{ matrix.target }}
           path: dist/*
@@ -410,14 +410,14 @@ jobs:
       contents: read
     steps:
       - name: Download all wheel artifacts
-        uses: actions/download-artifact@v8
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           pattern: wheels-*
           path: wheels-tmp/
           merge-multiple: true
 
       - name: Download release assets
-        uses: actions/download-artifact@v8
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: release-assets
           path: release-assets/
@@ -432,13 +432,13 @@ jobs:
           ls -la release-assets/
 
       - name: Upload merged dist artifact
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: dist
           path: dist/
 
       - name: Upload merged release-assets artifact
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: release-assets-merged
           path: release-assets/
@@ -512,7 +512,7 @@ jobs:
 
     steps:
       - name: Download wheels artifact for this target
-        uses: actions/download-artifact@v8
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: ${{ matrix.wheel_artifact }}
           path: dist/
@@ -524,7 +524,7 @@ jobs:
       # is on PATH as `python` for the smoke step below.
       - name: Set up Python (Windows host)
         if: matrix.image == '' && runner.os == 'Windows'
-        uses: actions/setup-python@v7
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         with:
           python-version: ${{ matrix.python }}
 
@@ -772,14 +772,14 @@ jobs:
       id-token: write  # Required for OIDC trusted publishing
     steps:
       - name: Download merged dist artifact (sdist + cross-platform wheels)
-        uses: actions/download-artifact@v8
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: dist
           path: dist/
 
       - name: Publish ${{ env.PYPI_PACKAGE }} to PyPI
         id: pypi-publish
-        uses: pypa/gh-action-pypi-publish@v1.14.3
+        uses: pypa/gh-action-pypi-publish@7245906fb61fa33a13554f9d5fb856fe61758086 # v1.14.3
         with:
           # Idempotent re-runs: when a wheel filename for the computed
           # version is already on PyPI (e.g. a previous push to main
@@ -803,12 +803,12 @@ jobs:
     permissions:
       contents: read
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
 
       - name: Set up Node.js
-        uses: actions/setup-node@v7
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: ">=24.16.0 <25"
           registry-url: ${{ env.NPM_REGISTRY_URL }}
@@ -827,30 +827,39 @@ jobs:
       # "Artifact not found" because publish-npm is not gated on
       # collect-dist. Removing the dead step is the right fix.
 
-      - name: Publish ${{ env.NPM_SDK_PACKAGE }} (TypeScript SDK) to npmjs.org
-        id: npm-sdk-publish
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+      # Install and build run in their own steps WITHOUT the publish token:
+      # `npm ci` executes dependency lifecycle scripts, which must not be able
+      # to read NPM_TOKEN. Only the `npm publish` steps below carry it.
+      - name: Prepare ${{ env.NPM_SDK_PACKAGE }} (TypeScript SDK) for npmjs.org
+        id: npm-sdk-prepare
         run: |
           version="${{ needs.detect-version.outputs.npm_version }}"
           if npm view "${NPM_SDK_PACKAGE}@${version}" version --registry "${NPM_REGISTRY_URL}" >/dev/null 2>&1; then
             echo "${NPM_SDK_PACKAGE}@${version} is already published; continuing."
+            echo "skip=true" >> "$GITHUB_OUTPUT"
             exit 0
           fi
           cd sdk/typescript
           npm ci
           npm run build
           npm version "$version" --no-git-tag-version --allow-same-version
-          npm publish --access public
 
-      - name: Publish ${{ env.NPM_OPENCLAW_PACKAGE }} to npmjs.org
-        id: npm-openclaw-publish
+      - name: Publish ${{ env.NPM_SDK_PACKAGE }} (TypeScript SDK) to npmjs.org
+        id: npm-sdk-publish
+        if: steps.npm-sdk-prepare.outputs.skip != 'true'
+        working-directory: sdk/typescript
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          npm publish --access public
+
+      - name: Prepare ${{ env.NPM_OPENCLAW_PACKAGE }} for npmjs.org
+        id: npm-openclaw-prepare
         run: |
           version="${{ needs.detect-version.outputs.npm_version }}"
           if npm view "${NPM_OPENCLAW_PACKAGE}@${version}" version --registry "${NPM_REGISTRY_URL}" >/dev/null 2>&1; then
             echo "${NPM_OPENCLAW_PACKAGE}@${version} is already published; continuing."
+            echo "skip=true" >> "$GITHUB_OUTPUT"
             exit 0
           fi
           cd plugins/openclaw
@@ -865,16 +874,23 @@ jobs:
           fs.writeFileSync("package.json", `${JSON.stringify(pkg, null, 2)}\n`);
           EOF
           node prepare-dist.mjs
-          npm publish --access public
 
-      - name: Publish ${{ env.NPM_OPENCODE_PACKAGE }} to npmjs.org
-        id: npm-opencode-publish
+      - name: Publish ${{ env.NPM_OPENCLAW_PACKAGE }} to npmjs.org
+        id: npm-openclaw-publish
+        if: steps.npm-openclaw-prepare.outputs.skip != 'true'
+        working-directory: plugins/openclaw
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          npm publish --access public
+
+      - name: Prepare ${{ env.NPM_OPENCODE_PACKAGE }} for npmjs.org
+        id: npm-opencode-prepare
         run: |
           version="${{ needs.detect-version.outputs.npm_version }}"
           if npm view "${NPM_OPENCODE_PACKAGE}@${version}" version --registry "${NPM_REGISTRY_URL}" >/dev/null 2>&1; then
             echo "${NPM_OPENCODE_PACKAGE}@${version} is already published; continuing."
+            echo "skip=true" >> "$GITHUB_OUTPUT"
             exit 0
           fi
           cd plugins/opencode
@@ -888,6 +904,14 @@ jobs:
           pkg.dependencies["headroom-ai"] = `^${process.env.HEADROOM_NPM_VERSION}`;
           fs.writeFileSync("package.json", `${JSON.stringify(pkg, null, 2)}\n`);
           EOF
+
+      - name: Publish ${{ env.NPM_OPENCODE_PACKAGE }} to npmjs.org
+        id: npm-opencode-publish
+        if: steps.npm-opencode-prepare.outputs.skip != 'true'
+        working-directory: plugins/opencode
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
           npm publish --access public
 
   publish-github-packages:
@@ -898,7 +922,7 @@ jobs:
       contents: read
       packages: write
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
 
@@ -909,7 +933,7 @@ jobs:
           printf 'scope=%s\n' "$scope" >> "$GITHUB_OUTPUT"
 
       - name: Set up Node.js for GitHub Package Registry
-        uses: actions/setup-node@v7
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: ">=24.16.0 <25"
           registry-url: ${{ env.GITHUB_PACKAGES_REGISTRY_URL }}
@@ -1030,18 +1054,18 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
 
       - name: Download changelog artifact
-        uses: actions/download-artifact@v8
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: changelog
           path: /tmp
 
       - name: Download merged release assets (npm tarballs + wheels + sdist)
-        uses: actions/download-artifact@v8
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: release-assets-merged
           path: release-assets
@@ -1123,7 +1147,7 @@ jobs:
     permissions:
       contents: read
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Announce completed GitHub Release assets
         uses: ./.github/actions/release-slack-notification
         with:
