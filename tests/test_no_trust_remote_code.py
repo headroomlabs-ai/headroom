@@ -22,12 +22,33 @@ ROOT = Path(__file__).resolve().parents[1]
 # token to its own scan.
 FLAG = "trust_remote" + "_code"
 
+# The value: a quoted string, or a name / number (``True``, ``1``, ``-1``, ``cfg.x``).
+# Anything but the exact name ``False`` is treated as enabling the flag.
+_VALUE = r"\"[^\"]*\"|'[^']*'|[-+]?[\w.]+"
+
 # Matches the kwarg form (``flag=True``), the mapping form (``"flag": True``)
 # and the subscript form (``kwargs["flag"] = True``), capturing whatever it is
-# set to. The optional quote and bracket matter: without them the mapping form
-# slips through, and ``from_pretrained(**{"flag": True})`` is exactly how this
-# would come back.
-ASSIGNMENT = re.compile(re.escape(FLAG) + r"[\"']?\s*\]?\s*[=:]\s*([A-Za-z_][\w.]*)")
+# set to up to the next delimiter. The optional quote and bracket matter:
+# without them the mapping form slips through, and
+# ``from_pretrained(**{"flag": True})`` is exactly how this would come back.
+# The value is NOT required to start with a letter: the library tests the flag
+# for truthiness, so ``=1``, ``=(True)`` and ``="yes"`` enable it just as
+# ``=True`` does. A value on the next line is still a value, because ``\s*``
+# spans the newline.
+ASSIGNMENT = re.compile(re.escape(FLAG) + r"[\"']?\s*\]?\s*[=:]\s*\(*\s*(" + _VALUE + ")")
+
+# ``setattr(cfg, "flag", True)`` and ``kwargs.setdefault("flag", True)``: the
+# name is a string literal followed by a comma, not by ``=`` or ``:``.
+NAMED_ARGUMENT = re.compile(r"[\"']" + re.escape(FLAG) + r"[\"']\s*,\s*\(*\s*(" + _VALUE + ")")
+
+
+def _values(text: str) -> list[tuple[int, str]]:
+    """Every ``(line number, value)`` the flag is set to in ``text``."""
+    found: list[tuple[int, str]] = []
+    for pattern in (ASSIGNMENT, NAMED_ARGUMENT):
+        for match in pattern.finditer(text):
+            found.append((text.count("\n", 0, match.start()) + 1, match.group(1)))
+    return found
 
 
 def _tracked_files() -> list[Path]:
@@ -35,6 +56,8 @@ def _tracked_files() -> list[Path]:
 
     git-tracked rather than a filesystem walk: the repository is commonly checked
     out alongside worktrees and virtualenvs that a naive rglob would sweep in.
+    Without git (an exported tarball) the package itself is still scanned, so the
+    guard does not silently stop running.
     """
     try:
         out = subprocess.run(
@@ -43,8 +66,8 @@ def _tracked_files() -> list[Path]:
             capture_output=True,
             check=True,
         ).stdout
-    except (OSError, subprocess.CalledProcessError) as exc:  # pragma: no cover
-        pytest.skip(f"git ls-files unavailable: {exc}")
+    except (OSError, subprocess.CalledProcessError):
+        return sorted((ROOT / "headroom").rglob("*.py"))
     return [ROOT / name for name in out.decode().split("\0") if name]
 
 
@@ -58,10 +81,10 @@ def test_remote_code_is_never_enabled_anywhere_in_the_tree() -> None:
             continue  # binary or vanished (submodule, symlink) — nothing to read
         if FLAG not in text:
             continue
-        for lineno, line in enumerate(text.splitlines(), start=1):
-            for value in ASSIGNMENT.findall(line):
-                if value != "False":
-                    offenders.append(f"{path.relative_to(ROOT)}:{lineno}: {line.strip()}")
+        lines = text.splitlines()
+        for lineno, value in _values(text):
+            if value != "False":
+                offenders.append(f"{path.relative_to(ROOT)}:{lineno}: {lines[lineno - 1].strip()}")
 
     assert not offenders, (
         f"{FLAG} must be False everywhere — it executes repository-supplied "
@@ -69,9 +92,46 @@ def test_remote_code_is_never_enabled_anywhere_in_the_tree() -> None:
     )
 
 
+@pytest.mark.parametrize(
+    "line",
+    [
+        f"model = load(x, {FLAG}=True)",
+        f"model = load(x, {FLAG}=1)",
+        f"model = load(x, {FLAG}=(True))",
+        f'model = load(x, {FLAG}="yes")',
+        f"model = load(x, {FLAG}=enabled)",
+        f'kwargs["{FLAG}"] = True',
+        f'load(**{{"{FLAG}": 1}})',
+        f'setattr(cfg, "{FLAG}", True)',
+        f'kwargs.setdefault("{FLAG}", True)',
+    ],
+)
+def test_the_scan_flags_every_truthy_way_to_enable_the_flag(line: str) -> None:
+    values = [value for _, value in _values(line)]
+    assert values and all(value != "False" for value in values), line
+
+
+def test_the_scan_flags_a_value_on_the_next_line() -> None:
+    text = f"load(\n    x,\n    {FLAG}=\n        True,\n)\n"
+    assert [value for _, value in _values(text)] == ["True"]
+
+
+@pytest.mark.parametrize(
+    "line",
+    [
+        f"model = load(x, {FLAG}=False)",
+        f"model = load(x, {FLAG}=(False))",
+        f'kwargs["{FLAG}"] = False',
+        f'setattr(cfg, "{FLAG}", False)',
+    ],
+)
+def test_the_scan_accepts_an_explicit_false(line: str) -> None:
+    assert [value for _, value in _values(line)] == ["False"]
+
+
 def test_the_tokenizer_loader_sets_the_flag_explicitly() -> None:
     """Explicit beats relying on the library default, which upstream can change."""
     source = (ROOT / "headroom" / "tokenizers" / "huggingface.py").read_text(encoding="utf-8")
-    values = ASSIGNMENT.findall(source)
+    values = [value for _, value in _values(source)]
     assert values, f"tokenizer loader no longer passes {FLAG} explicitly"
     assert set(values) == {"False"}
