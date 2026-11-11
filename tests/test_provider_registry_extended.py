@@ -36,6 +36,13 @@ def test_stream_parser_follows_wire_protocol(provider, endpoint, expected):
     assert stream_usage_provider(provider, endpoint_name=endpoint) == expected
 
 
+def test_stream_usage_provider_without_endpoint_maps_vertex_anthropic():
+    from headroom.providers.registry import stream_usage_provider
+
+    assert stream_usage_provider("vertex:anthropic") == "anthropic"
+    assert stream_usage_provider("vertex:google") == "gemini"
+
+
 @pytest.mark.parametrize(
     ("provider", "model", "expected"),
     [

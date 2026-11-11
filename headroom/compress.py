@@ -115,8 +115,10 @@ class CompressConfig:
     agents where tool definitions and instructions must not be altered."""
 
     protect_recent: int = 4
-    """Don't compress the last N messages (they're the active conversation).
-    Set 0 to compress everything."""
+    """Don't compress CODE in the last N messages (they're the active
+    conversation). Applies only to content detected as source code; JSON,
+    log and text tool payloads are not shielded by it. Set 0 to compress
+    everything."""
 
     protect_analysis_context: bool = True
     """Detect 'analyze'/'review' intent and protect code from compression."""

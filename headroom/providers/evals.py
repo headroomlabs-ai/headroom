@@ -87,10 +87,10 @@ def _anthropic_complete(
     max_tokens: int,
     temperature: float,
 ) -> str:
+    del temperature  # Newer Anthropic models reject an explicit temperature.
     response = client.messages.create(
         model=model,
         max_tokens=max_tokens,
-        temperature=temperature,
         messages=messages,
     )
     return str(response.content[0].text)

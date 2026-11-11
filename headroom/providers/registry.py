@@ -212,7 +212,7 @@ def stream_usage_provider(provider: str, *, endpoint_name: str | None = None) ->
         if endpoint_name in {"chat/completions", "responses"}:
             return "openai"
         return "anthropic"
-    return {"vertex:google": "gemini"}.get(provider, provider)
+    return {"vertex:google": "gemini", "vertex:anthropic": "anthropic"}.get(provider, provider)
 
 
 def supports_sticky_memory_tools(provider: str) -> bool:

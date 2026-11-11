@@ -120,13 +120,5 @@ def default_model_name(model: Any) -> str:
     if name:
         return name
 
-    class_name = model.__class__.__name__
-    class_name_lower = class_name.lower()
-    for provider_name, patterns in MODEL_NAME_PATTERNS.items():
-        if any(pattern in class_name_lower for pattern in patterns):
-            return DEFAULT_MODEL_BY_PROVIDER.get(provider_name, DEFAULT_MODEL_BY_PROVIDER["openai"])
-
-    if "openai" in class_name_lower:
-        return DEFAULT_MODEL_BY_PROVIDER["openai"]
-
-    return DEFAULT_MODEL_BY_PROVIDER["openai"]
+    provider_name = detect_provider(model)
+    return DEFAULT_MODEL_BY_PROVIDER.get(provider_name, DEFAULT_MODEL_BY_PROVIDER["openai"])

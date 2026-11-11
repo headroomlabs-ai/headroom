@@ -1116,8 +1116,8 @@ def test_publish_npm_regenerates_openclaw_dist_metadata_after_version_and_depend
     """The direct npm publish path must not ship stale OpenClaw dist metadata."""
     content = (ROOT / ".github" / "workflows" / "release.yml").read_text(encoding="utf-8")
 
-    start = content.index("name: Publish ${{ env.NPM_OPENCLAW_PACKAGE }} to npmjs.org")
-    end = content.index("name: Publish ${{ env.NPM_OPENCODE_PACKAGE }}", start)
+    start = content.index("name: Prepare ${{ env.NPM_OPENCLAW_PACKAGE }} for npmjs.org")
+    end = content.index("name: Prepare ${{ env.NPM_OPENCODE_PACKAGE }}", start)
     block = content[start:end]
 
     version = block.index('npm version "$version"')
@@ -1132,7 +1132,7 @@ def test_publish_npm_rewrites_opencode_dependency_after_version_and_before_publi
     """The direct npm publish path must version and retarget the Opencode dependency."""
     content = (ROOT / ".github" / "workflows" / "release.yml").read_text(encoding="utf-8")
 
-    start = content.index("name: Publish ${{ env.NPM_OPENCODE_PACKAGE }} to npmjs.org")
+    start = content.index("name: Prepare ${{ env.NPM_OPENCODE_PACKAGE }} for npmjs.org")
     end = content.index("\n  publish-github-packages:", start)
     block = content[start:end]
 
@@ -1174,6 +1174,23 @@ def test_publish_npm_is_rerunnable_after_a_partial_release() -> None:
         lookup_index = block.index(lookup)
         publish_index = block.index("npm publish --access public", lookup_index)
         assert lookup_index < publish_index
+
+
+def test_publish_npm_token_is_only_in_whoami_and_publish_steps() -> None:
+    """Install and build scripts must never see the npm publish token."""
+    workflow = yaml.safe_load((ROOT / ".github" / "workflows" / "release.yml").read_text())
+    job = workflow["jobs"]["publish-npm"]
+
+    assert "NODE_AUTH_TOKEN" not in job.get("env", {})
+    with_token = [step for step in job["steps"] if "NODE_AUTH_TOKEN" in step.get("env", {})]
+    assert len(with_token) == 4  # whoami + one publish per package
+    for step in with_token:
+        run = step["run"]
+        assert "npm whoami" in run or run.strip().endswith("npm publish --access public"), step
+        assert "npm ci" not in run and "npm run build" not in run, step
+    for step in job["steps"]:
+        if "npm ci" in step.get("run", ""):
+            assert "env" not in step or "NODE_AUTH_TOKEN" not in step["env"], step
 
 
 def test_sdist_license_is_packaged_and_verified_before_upload() -> None:

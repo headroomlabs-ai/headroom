@@ -69,6 +69,7 @@ def test_langchain_provider_instances() -> None:
 def test_langchain_default_model_name() -> None:
     assert langchain_default_model_name(ChatOpenAI()) == "gpt-4o"
     assert langchain_default_model_name(UnknownLangChainModel()) == "gpt-4o"
+    assert langchain_default_model_name(ChatGoogleGenerativeAI()) == "gemini-1.5-pro"
 
 
 def test_strands_provider_instances() -> None:

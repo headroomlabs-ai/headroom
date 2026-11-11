@@ -542,7 +542,16 @@ class ImageCompressor:
 
                 image_block = decode_image_block(item, provider)
                 if image_block is None:
-                    new_content.append(item)
+                    # Remote OpenAI image URLs can't be decoded, but detail="low"
+                    # needs no image bytes.
+                    if (
+                        provider == "openai"
+                        and item.get("type") == "image_url"
+                        and technique.value in ("full_low", "crop", "transcode")
+                    ):
+                        new_content.append(rewrite_low_detail_image_block(item, provider))
+                    else:
+                        new_content.append(item)
                     continue
                 image_bytes_for_ocr = image_block.image_bytes
 

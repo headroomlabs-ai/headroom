@@ -499,6 +499,34 @@ class TestProviderSpecificCompression:
                 if item.get("type") == "image_url":
                     assert item["image_url"]["detail"] == "low"
 
+    def test_openai_remote_url_gets_detail_low(
+        self, compressor, small_image_base64, mock_route_decision_full_low
+    ):
+        """OpenAI: remote URLs next to inline images still get detail='low'."""
+        messages = [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "What is this?"},
+                    {
+                        "type": "image_url",
+                        "image_url": {"url": f"data:image/png;base64,{small_image_base64}"},
+                    },
+                    {
+                        "type": "image_url",
+                        "image_url": {"url": "https://example.com/photo.jpg", "detail": "high"},
+                    },
+                ],
+            }
+        ]
+        mock_router = create_mock_router(mock_route_decision_full_low)
+
+        with patch.object(compressor, "_get_router", return_value=mock_router):
+            result = compressor.compress(messages, "openai")
+
+        image = result[0]["content"][2]
+        assert image["image_url"] == {"url": "https://example.com/photo.jpg", "detail": "low"}
+
     def test_openai_detail_preserved(
         self, compressor, small_image_base64, mock_route_decision_preserve
     ):
