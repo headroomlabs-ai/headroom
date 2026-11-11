@@ -206,6 +206,68 @@ describe("SharedContext eviction", () => {
     expect(ctx.keys()).toEqual(["second", "third"]);
     expect(ctx.get("first")).toBeNull();
   });
+
+  it("updates an existing key without evicting another entry", async () => {
+    mockFetch.mockResolvedValue(mockCompressResponse("data"));
+
+    const ctx = new SharedContext({
+      baseUrl: "http://test:8787",
+      maxEntries: 2,
+    });
+    await ctx.put("a", "first");
+    await ctx.put("b", "second");
+    await ctx.put("b", "updated");
+
+    expect(ctx.keys()).toHaveLength(2);
+    expect(ctx.get("a", { full: true })).toBe("first");
+    expect(ctx.get("b", { full: true })).toBe("updated");
+  });
+
+  it("evicts by timestamp after an existing key is updated", async () => {
+    mockFetch.mockResolvedValue(mockCompressResponse("data"));
+    vi.useFakeTimers();
+
+    try {
+      const ctx = new SharedContext({
+        baseUrl: "http://test:8787",
+        maxEntries: 3,
+      });
+      vi.setSystemTime(new Date("2026-01-01T00:00:00Z"));
+      await ctx.put("a", "first");
+      vi.setSystemTime(new Date("2026-01-01T00:00:01Z"));
+      await ctx.put("b", "second");
+      vi.setSystemTime(new Date("2026-01-01T00:00:02Z"));
+      await ctx.put("a", "updated");
+      vi.setSystemTime(new Date("2026-01-01T00:00:03Z"));
+      await ctx.put("c", "third");
+      vi.setSystemTime(new Date("2026-01-01T00:00:04Z"));
+      await ctx.put("d", "fourth");
+
+      expect(ctx.keys()).toEqual(["a", "c", "d"]);
+      expect(ctx.get("a", { full: true })).toBe("updated");
+      expect(ctx.get("b")).toBeNull();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("keeps maxEntries when puts finish concurrently", async () => {
+    mockFetch.mockImplementation(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 10));
+      return mockCompressResponse("data");
+    });
+
+    const ctx = new SharedContext({
+      baseUrl: "http://test:8787",
+      maxEntries: 2,
+    });
+    await Promise.all(
+      ["a", "b", "c", "d", "e"].map((key) => ctx.put(key, key)),
+    );
+
+    expect(ctx.stats().entries).toBe(2);
+    expect(ctx.keys()).toHaveLength(2);
+  });
 });
 
 describe("SharedContext maxEntries validation", () => {
