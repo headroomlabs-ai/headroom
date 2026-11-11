@@ -30,7 +30,7 @@ concurrency:
 
 jobs:
   contract-and-wire:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 20
     env:
       DOTNET_CLI_TELEMETRY_OPTOUT: "1"
