@@ -117,6 +117,37 @@ describe("compress()", () => {
     expect(body.messages).toHaveLength(5);
   });
 
+  it("round-trips a Gemini functionCall with no args", async () => {
+    const client = new HeadroomClient({ baseUrl: "http://127.0.0.1:9", fallback: true });
+    const messages = [
+      { role: "user", parts: [{ text: "call f" }] },
+      { role: "model", parts: [{ functionCall: { name: "f" } }] },
+      { role: "user", parts: [{ functionResponse: { name: "f", response: { ok: true } } }] },
+    ];
+
+    const result = await compress(messages, { client });
+
+    expect(result.compressed).toBe(false);
+    // The proxy sent an empty object for the missing args...
+    const body = JSON.parse(mockFetch.mock.calls[0][1].body);
+    expect(body.messages[1].tool_calls[0].function.arguments).toBe("{}");
+    // ...and it survives conversion back to Gemini.
+    expect(result.messages[1]).toEqual({
+      role: "model",
+      parts: [{ functionCall: { name: "f", args: {} } }],
+    });
+  });
+
+  it("leaves a non-object entry alone instead of dropping it", async () => {
+    const result = await compress(["Keep this instruction", { role: "user", content: "hi" }], {
+      model: "gpt-4o",
+    });
+
+    expect(result.compressed).toBe(false);
+    expect(result.messages).toEqual(["Keep this instruction", { role: "user", content: "hi" }]);
+    expect(mockFetch).not.toHaveBeenCalled();
+  });
+
   it("forwards a per-call config, overriding a provided client's config", async () => {
     mockFetch.mockResolvedValueOnce(okResponse());
     const client = new HeadroomClient({
