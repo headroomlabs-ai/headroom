@@ -17,8 +17,9 @@ Precedence (highest first):
 
   1. ``bypass_header``           — user's explicit opt-out
   2. ``image_optimize_disabled`` — operator ``config.image_optimize=False``
-  3. ``no_messages``             — empty / missing messages
-  4. otherwise → ``should_compress=True``
+  3. ``image_not_selected``      — a ``--compressor`` selection without ``image``
+  4. ``no_messages``             — empty / missing messages
+  5. otherwise → ``should_compress=True``
 
 Distinct from text :class:`CompressionDecision`'s
 ``compression_disabled`` reason: operators can enable text + disable
@@ -34,6 +35,7 @@ from typing import Any
 from headroom.proxy.image_compression_policy import (
     apply_image_skip_reason,
     decide_image_compression,
+    image_compressor_selected,
 )
 
 
@@ -55,6 +57,7 @@ class ImageCompressionDecision:
     # can slice image-skipped traffic by cause. One of:
     #   * "bypass_header"           — user set x-headroom-bypass/mode
     #   * "image_optimize_disabled" — operator config off
+    #   * "image_not_selected"      — compressor selection leaves out image
     #   * "no_messages"             — empty / missing messages
     # When ``should_compress`` is True, this is None.
     passthrough_reason: str | None
@@ -63,6 +66,7 @@ class ImageCompressionDecision:
     # answer "what did the decision see?" without re-running it.
     bypass_header_set: bool
     image_optimize_enabled: bool
+    image_selected: bool
     has_messages: bool
 
     @classmethod
@@ -83,7 +87,9 @@ class ImageCompressionDecision:
             Bypass detected via ``_headroom_bypass_enabled``.
         config
             ``HeadroomConfig``-shaped object; only ``image_optimize``
-            is read.
+            and ``compressors`` are read. The selection is read here rather
+            than folded into ``image_optimize`` so the operator's setting is
+            never overwritten (#4613).
         messages
             Request messages. ``None`` and ``[]`` are equivalent.
         """
@@ -91,6 +97,7 @@ class ImageCompressionDecision:
             headers=headers,
             image_optimize_enabled=bool(getattr(config, "image_optimize", False)),
             has_messages=bool(messages),
+            image_selected=image_compressor_selected(getattr(config, "compressors", None)),
         )
 
         return cls(
@@ -98,6 +105,7 @@ class ImageCompressionDecision:
             passthrough_reason=decision.passthrough_reason,
             bypass_header_set=decision.bypass_header_set,
             image_optimize_enabled=decision.image_optimize_enabled,
+            image_selected=decision.image_selected,
             has_messages=decision.has_messages,
         )
 
