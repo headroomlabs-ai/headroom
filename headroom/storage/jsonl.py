@@ -57,6 +57,13 @@ class JSONLStorage(Storage):
             "stable_prefix_hash": metrics.stable_prefix_hash,
             "cache_alignment_score": metrics.cache_alignment_score,
             "cached_tokens": metrics.cached_tokens,
+            "cache_optimizer_used": metrics.cache_optimizer_used,
+            "cache_optimizer_strategy": metrics.cache_optimizer_strategy,
+            "cacheable_tokens": metrics.cacheable_tokens,
+            "breakpoints_inserted": metrics.breakpoints_inserted,
+            "estimated_cache_hit": metrics.estimated_cache_hit,
+            "estimated_savings_percent": metrics.estimated_savings_percent,
+            "semantic_cache_hit": metrics.semantic_cache_hit,
             "transforms_applied": metrics.transforms_applied,
             "tool_units_dropped": metrics.tool_units_dropped,
             "turns_dropped": metrics.turns_dropped,
@@ -80,6 +87,13 @@ class JSONLStorage(Storage):
             stable_prefix_hash=data.get("stable_prefix_hash", ""),
             cache_alignment_score=data.get("cache_alignment_score", 0.0),
             cached_tokens=data.get("cached_tokens"),
+            cache_optimizer_used=data.get("cache_optimizer_used"),
+            cache_optimizer_strategy=data.get("cache_optimizer_strategy"),
+            cacheable_tokens=data.get("cacheable_tokens", 0),
+            breakpoints_inserted=data.get("breakpoints_inserted", 0),
+            estimated_cache_hit=data.get("estimated_cache_hit", False),
+            estimated_savings_percent=data.get("estimated_savings_percent", 0.0),
+            semantic_cache_hit=data.get("semantic_cache_hit", False),
             transforms_applied=data.get("transforms_applied", []),
             tool_units_dropped=data.get("tool_units_dropped", 0),
             turns_dropped=data.get("turns_dropped", 0),
@@ -94,11 +108,16 @@ class JSONLStorage(Storage):
             f.write(json.dumps(data) + "\n")
 
     def get(self, request_id: str) -> RequestMetrics | None:
-        """Get metrics by request ID."""
+        """Get metrics by request ID.
+
+        ``save`` appends, so a request saved twice has two rows; return the last
+        one, matching SQLiteStorage where a later save replaces the earlier row.
+        """
+        latest: RequestMetrics | None = None
         for metrics in self.iter_all():
             if metrics.request_id == request_id:
-                return metrics
-        return None
+                latest = metrics
+        return latest
 
     def query(
         self,
@@ -197,9 +216,17 @@ class JSONLStorage(Storage):
                     continue
                 try:
                     data = json.loads(line)
-                    yield self._dict_to_metrics(data)
                 except json.JSONDecodeError:
-                    # Skip malformed lines
+                    # Skip malformed lines. The journal is not rewritten.
+                    continue
+                if not isinstance(data, dict):
+                    continue
+                try:
+                    yield self._dict_to_metrics(data)
+                except (KeyError, TypeError, ValueError, AttributeError):
+                    # Skip syntactically valid rows that are not metric objects,
+                    # such as `{}` (no `id`). A later bad row must not hide an
+                    # earlier valid snapshot from get(), query(), or count().
                     continue
 
     def get_summary_stats(

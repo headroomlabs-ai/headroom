@@ -48,6 +48,85 @@ def test_extract_user_query_and_message_hashes() -> None:
     assert utils.extract_user_query([{"role": "assistant", "content": "skip"}]) == ""
 
 
+@pytest.mark.parametrize("latest_only", [False, True])
+def test_extract_user_query_combines_text_blocks(latest_only: bool) -> None:
+    messages = [
+        {
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "  Review incidents  "},
+                {"type": "image", "source": "example"},
+                {"type": "text", "text": " "},
+                {"type": "text", "text": "  Focus on Kafka replication  "},
+            ],
+        }
+    ]
+    assert utils.extract_user_query(messages, latest_user_turn_only=latest_only) == (
+        "Review incidents\nFocus on Kafka replication"
+    )
+
+
+def test_extract_user_query_skips_system_reminder_blocks() -> None:
+    messages = [
+        {"role": "user", "content": "older question"},
+        {
+            "role": "user",
+            "content": [
+                {
+                    "type": "text",
+                    "text": "<system-reminder>injected instructions</system-reminder>",
+                },
+                {"type": "text", "text": "real question"},
+                {"type": "text", "text": "<system-reminder>more instructions</system-reminder>"},
+            ],
+        },
+    ]
+    assert utils.extract_user_query(messages) == "real question"
+    assert utils.extract_user_query(messages, latest_user_turn_only=True) == "real question"
+
+    messages[-1]["content"] = [
+        {"type": "text", "text": "<system-reminder>injected</system-reminder>"}
+    ]
+    assert utils.extract_user_query(messages) == "older question"
+    assert utils.extract_user_query(messages, latest_user_turn_only=True) == ""
+
+
+@pytest.mark.parametrize("as_blocks", [False, True])
+@pytest.mark.parametrize(
+    ("content", "expected"),
+    [
+        ("<system-reminder>context</system-reminder>\nFind Kafka lag", "Find Kafka lag"),
+        ("Find <system-reminder>context</system-reminder> Kafka lag", "Find  Kafka lag"),
+        (
+            "<system-reminder id='1'>a</system-reminder>Find <system-reminder>b</system-reminder>Kafka",
+            "Find Kafka",
+        ),
+        ("<System-Reminder>context</System-Reminder>Find Kafka", "Find Kafka"),
+        ("İ<system-reminder>x</system-reminder>Kafka", "İ Kafka"),
+        ("Find <system-reminder>unfinished", "Find <system-reminder>unfinished"),
+        (
+            "Find <system-reminder-extra>example</system-reminder> Kafka",
+            "Find <system-reminder-extra>example</system-reminder> Kafka",
+        ),
+    ],
+)
+def test_extract_user_query_keeps_text_around_reminders(
+    content: str, expected: str, as_blocks: bool
+) -> None:
+    body = [{"type": "text", "text": content}] if as_blocks else content
+    messages = [{"role": "user", "content": body}]
+    assert utils.extract_user_query(messages, latest_user_turn_only=True) == expected
+
+
+@pytest.mark.parametrize("as_blocks", [False, True])
+def test_reminder_only_turn_keeps_user_query_fallback(as_blocks: bool) -> None:
+    reminder = "<system-reminder>context</system-reminder>"
+    content = [{"type": "text", "text": reminder}] if as_blocks else reminder
+    messages = [{"role": "user", "content": "older question"}, {"role": "user", "content": content}]
+    assert utils.extract_user_query(messages) == "older question"
+    assert utils.extract_user_query(messages, latest_user_turn_only=True) == ""
+
+
 def test_extract_user_query_latest_user_turn_only() -> None:
     """The flag stops at the newest user turn instead of resurrecting an older one."""
     # A tool_result continuation: the newest user turn carries no text at all.
@@ -61,6 +140,62 @@ def test_extract_user_query_latest_user_turn_only() -> None:
     assert utils.extract_user_query(messages) == "the original question"
     # Scoped to this turn, there is no question to score against.
     assert utils.extract_user_query(messages, latest_user_turn_only=True) == ""
+
+
+def test_extract_user_query_skips_tool_search_load_note() -> None:
+    """Claude Code answers a ToolSearch call with ``tool_reference`` blocks plus a
+    "Tool loaded." text block; that note is not the user's question."""
+    messages = [
+        {"role": "user", "content": "Who opened issue #4475?"},
+        {"role": "assistant", "content": [{"type": "tool_use", "id": "t1", "name": "ToolSearch"}]},
+        {
+            "role": "user",
+            "content": [
+                {
+                    "type": "tool_result",
+                    "tool_use_id": "t1",
+                    "content": [{"type": "tool_reference", "tool_name": "mcp__gh__list_issues"}],
+                },
+                {"type": "text", "text": "Tool loaded."},
+            ],
+        },
+        {"role": "assistant", "content": [{"type": "tool_use", "id": "t2", "name": "list"}]},
+        {
+            "role": "user",
+            "content": [{"type": "tool_result", "tool_use_id": "t2", "content": "[]"}],
+        },
+    ]
+
+    assert utils.extract_user_query(messages) == "Who opened issue #4475?"
+    assert utils.extract_user_query(messages, latest_user_turn_only=True) == ""
+
+
+def test_extract_user_query_keeps_user_text_beside_tool_search_load() -> None:
+    """Only the "Tool loaded." note is dropped; real text in that turn still counts."""
+    messages = [
+        {"role": "user", "content": "older question"},
+        {
+            "role": "user",
+            "content": [
+                {
+                    "type": "tool_result",
+                    "tool_use_id": "t1",
+                    "content": [{"type": "tool_reference", "tool_name": "mcp__gh__list_issues"}],
+                },
+                {"type": "text", "text": "Tool loaded."},
+                {"type": "text", "text": "only open issues please"},
+            ],
+        },
+    ]
+
+    assert utils.extract_user_query(messages) == "only open issues please"
+
+
+def test_extract_user_query_keeps_tool_loaded_text_without_tool_reference() -> None:
+    """Outside a ToolSearch turn, "Tool loaded." is ordinary user text."""
+    messages = [{"role": "user", "content": [{"type": "text", "text": "Tool loaded."}]}]
+
+    assert utils.extract_user_query(messages) == "Tool loaded."
 
 
 def test_extract_user_query_latest_turn_only_agrees_on_normal_turns() -> None:
