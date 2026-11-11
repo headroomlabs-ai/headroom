@@ -180,8 +180,8 @@ is the TypeScript SDK — a library you import
 ## Proof: measured token savings
 
 Four scenarios built from real MCP server output formats, measured with the
-provider tokenizer and the shipped `compress()`. Seeded and offline, so you get
-the same numbers we did:
+provider tokenizer and the shipped `compress()` at its default configuration.
+Seeded and offline, so you get the same numbers we did:
 
 ```bash
 uv run python benchmarks/index_proof_table.py --seed 20260902
