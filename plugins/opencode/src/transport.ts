@@ -219,6 +219,27 @@ function normalizeProxyUrl(proxyUrl: string): URL {
   return new URL(proxyUrl);
 }
 
+// A proxy URL that does not parse must not break traffic that is not LLM
+// traffic: the caller falls through to the original function. Reported once
+// per value, not once per request.
+const reportedProxyUrls = new Set<string>();
+
+function usableProxyUrl(proxyUrl: string): URL | undefined {
+  try {
+    const proxy = normalizeProxyUrl(proxyUrl);
+    // "user:pass@host:8787" parses with scheme "user:"; only http(s) can be routed to.
+    if (proxy.protocol !== "http:" && proxy.protocol !== "https:") throw new TypeError("unsupported scheme");
+    return proxy;
+  } catch {
+    if (!reportedProxyUrls.has(proxyUrl)) {
+      reportedProxyUrls.add(proxyUrl);
+      // The value is never logged: a malformed URL can still carry user:password@.
+      console.warn(`headroom: the configured proxy URL is ${proxyUrl === "" ? "empty" : "not a valid http(s) URL"}; requests are not routed`);
+    }
+    return undefined;
+  }
+}
+
 function isLoopback(hostname: string): boolean {
   const normalized = hostname.toLowerCase().replace(/^\[|\]$/g, "");
   return normalized === "localhost" || normalized === "127.0.0.1" || normalized === "::1";
@@ -280,8 +301,16 @@ function isRoutableUpstream(url: URL, proxy: URL, excludeHosts: string[]): boole
   return true;
 }
 
-function shouldRoute(url: URL, proxy: URL, excludeHosts: string[]): boolean {
-  return isRoutableUpstream(url, proxy, excludeHosts) && isLlmEndpointPath(url.pathname);
+// Every LLM endpoint matched above is a POST. A GET/DELETE/... to a path that
+// merely ends in /messages or /responses (chat APIs, form responses) is not an
+// LLM call and must reach its original URL (#4417). A missing method means
+// GET, matching fetch and node:http defaults.
+function isLlmMethod(method: unknown): boolean {
+  return typeof method === "string" && method.toUpperCase() === "POST";
+}
+
+function shouldRoute(url: URL, proxy: URL, excludeHosts: string[], method: unknown): boolean {
+  return isLlmMethod(method) && isRoutableUpstream(url, proxy, excludeHosts) && isLlmEndpointPath(url.pathname);
 }
 
 // OpenCode 2.x hands the plugin model base URLs (e.g.
@@ -377,7 +406,8 @@ function withRoutedFetchInput(
   sessionToken: string | undefined,
 ): FetchArgs {
   const upstream = requestUrl(input);
-  if (!shouldRoute(upstream, proxy, excludeHosts)) {
+  const method = init?.method ?? (input instanceof Request ? input.method : "GET");
+  if (!shouldRoute(upstream, proxy, excludeHosts, method)) {
     return [input, init];
   }
 
@@ -471,7 +501,7 @@ function routedNodeOptions(
   excludeHosts: string[],
   sessionToken: string | undefined,
 ): Record<string, unknown> | undefined {
-  if (!parts.url || !shouldRoute(parts.url, proxy, excludeHosts)) {
+  if (!parts.url || !shouldRoute(parts.url, proxy, excludeHosts, parts.options.method ?? "GET")) {
     return undefined;
   }
 
@@ -518,7 +548,10 @@ function wrapRequest(
       return Reflect.apply(originalRequest, this, args);
     }
 
-    const proxy = normalizeProxyUrl(state.proxyUrl);
+    const proxy = usableProxyUrl(state.proxyUrl);
+    if (!proxy) {
+      return Reflect.apply(originalRequest, this, args);
+    }
     const parts = splitNodeArgs(args);
     const nextOptions = routedNodeOptions(parts, proxy, state.project, state.excludeHosts, state.sessionToken);
     if (!nextOptions) {
@@ -590,7 +623,10 @@ export function installHeadroomTransport(options: InstallOptions): () => void {
     if (!current) {
       return state.originalFetch(...args);
     }
-    const proxy = normalizeProxyUrl(current.proxyUrl);
+    const proxy = usableProxyUrl(current.proxyUrl);
+    if (!proxy) {
+      return state.originalFetch(...args);
+    }
     const [nextInput, nextInit] = withRoutedFetchInput(args[0], args[1], proxy, current.project, current.excludeHosts, current.sessionToken);
     return state.originalFetch(nextInput, nextInit);
   };

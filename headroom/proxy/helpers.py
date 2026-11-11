@@ -338,6 +338,9 @@ FRAMING_RESPONSE_HEADERS: tuple[str, ...] = (
     "transfer-encoding",
     "connection",
     "keep-alive",
+    "te",
+    "trailer",
+    "upgrade",
     "server",
 )
 
@@ -351,11 +354,18 @@ def sanitize_forwarded_response_headers(
     Pass any additional header names to strip as ``extra_names`` (for
     example ``"content-type"`` when the caller sets its own media type).
 
+    Header names listed in the ``Connection`` value are connection-local
+    (RFC 9110 section 7.6.1) and are dropped too.
+
     Matching is case-insensitive, but the casing of the headers that
     survive is left untouched.
     """
+    items = dict(headers)
     drop = {name.lower() for name in (*FRAMING_RESPONSE_HEADERS, *extra_names)}
-    return {key: value for key, value in dict(headers).items() if key.lower() not in drop}
+    for key, value in items.items():
+        if key.lower() == "connection":
+            drop.update(token.strip().lower() for token in str(value).split(",") if token.strip())
+    return {key: value for key, value in items.items() if key.lower() not in drop}
 
 
 def _path_for_log(path: str) -> str:
@@ -1085,10 +1095,24 @@ def _system_message_to_blocks(message: dict[str, Any]) -> list[Any]:
     return []
 
 
+def is_third_party_model(model: str | None, *, third_party_upstream: bool) -> bool:
+    """Whether a request is for a non-Claude model on an upstream Headroom does not own.
+
+    Headroom has no wire contract for such a model (a vLLM or GLM endpoint
+    speaking the Anthropic Messages format), and the client already sends its
+    mid-conversation system sections there directly. A Claude-named model
+    behind a gateway may still reach a provider without that feature, so it is
+    not one.
+    """
+    return third_party_upstream and "claude" not in str(model or "").lower()
+
+
 def relocate_system_messages_to_top_level(
     messages: list[dict[str, Any]],
     system: Any,
     model: str | None = None,
+    *,
+    third_party_model: bool = False,
 ) -> tuple[list[dict[str, Any]], Any, bool]:
     """Relocate only system messages invalid for the selected Anthropic model.
 
@@ -1097,6 +1121,12 @@ def relocate_system_messages_to_top_level(
     placed at the end. Hoisting those changes semantics and invalidates the
     cached prefix. The initial/invalid forms are still moved to the top-level
     field as the issue-765 last-line wire-contract guard.
+
+    ``third_party_model`` (see :func:`is_third_party_model`) treats the model as
+    supported: the client's sections stay where it put them. Hoisting them
+    there would append to the top-level ``system`` whenever a turn adds a
+    section, so the upstream's prefix cache would miss the whole conversation
+    on every such turn.
 
     The relocated content is appended after any existing top-level ``system``
     so wire order (system prompt, then conversation) is preserved. Only
@@ -1111,7 +1141,7 @@ def relocate_system_messages_to_top_level(
     the common path is untouched.
     """
     model_id = str(model or "").lower()
-    supports_mid_conversation = any(
+    supports_mid_conversation = third_party_model or any(
         family in model_id
         for family in (
             "claude-fable-5",
@@ -1307,8 +1337,11 @@ def append_text_to_latest_user_input_item(
     return body_input, 0
 
 
-# Maximum request body size (100MB - increased to support image-heavy requests)
-MAX_REQUEST_BODY_SIZE = 100 * 1024 * 1024
+# Bound the entire history before JSON parsing or compression. Larger image-heavy
+# bodies can amplify far beyond their wire size during preprocessing (#4139).
+MAX_REQUEST_BODY_SIZE = request_limit_policy.resolve_request_body_max_bytes(
+    os.environ.get(request_limit_policy.REQUEST_BODY_MAX_BYTES_ENV)
+)
 
 # A *decompressed* body obeys the same ceiling as an uncompressed one. The
 # Content-Length gate at the handlers only ever saw the compressed wire size, so
@@ -3502,6 +3535,11 @@ async def read_request_json_with_bytes(request: Request) -> tuple[dict[str, Any]
             "Request body must be a JSON object, not " + type(result).__name__
         )
 
+    # Large histories are routed from their envelope only. Leave their content
+    # untouched for the soft-limit passthrough, before any normalization/copies.
+    if len(raw) > request_limit_policy.COMPRESSION_BODY_MAX_BYTES:
+        return result, raw
+
     # Drop output-only blocks (see ``strip_output_only_request_blocks``) before
     # any downstream deepcopy / compression / 400-retry path. This is the shared
     # reader for the Anthropic, OpenAI, and Bedrock handlers, so one guard here
@@ -4704,7 +4742,16 @@ def strip_unsupported_ccr_retrieve_blocks(messages: Any, tools: Any) -> tuple[An
 
 _OPENAI_TOOL_SEARCH_TYPE = _RESPONSES_TOOL_SEARCH_TYPE
 _OPENAI_TOOL_SEARCH_MIN_TOOLS = 12
-_OPENAI_TOOL_SEARCH_RESIDENT_NAMES = frozenset({"terminal"})
+_OPENAI_TOOL_SEARCH_RESIDENT_NAMES = frozenset(
+    {
+        "terminal",
+        "file_search",
+        "web_search",
+        "code_interpreter",
+        "computer",
+        "image_generation",
+    }
+)
 _OPENAI_TOOL_SEARCH_UNSUPPORTED_CLIENTS = frozenset({"codex", "opencode"})
 # gpt-5.4 is the first model with Responses tool_search (OpenAI docs). Version-
 # gated by default; overridable per deployment via a regex in
