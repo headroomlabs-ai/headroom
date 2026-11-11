@@ -170,6 +170,21 @@ class SemanticCache:
                     self._touch(key)
                     self._hits += 1
                     return entry
+        elif self.config.use_exact_matching and query.strip():
+            # put() uses a query-derived key when no context hash is supplied.
+            # Only read entries stored the same way; a context-keyed response
+            # must never become a query-only hit, even if the keys coincide.
+            key = self._combined_key(namespace, self._generate_key(query))
+            query_entry = self._cache.get(key)
+            if (
+                query_entry is not None
+                and not query_entry.messages_hash
+                and query_entry.namespace == namespace
+                and query_entry.query == query
+            ):
+                self._touch(key)
+                self._hits += 1
+                return query_entry
 
         # Try semantic similarity if we have embedding function.
         #
@@ -444,9 +459,9 @@ class SemanticCacheLayer:
         messages_hash = self._compute_messages_hash(messages)
         namespace = self._compute_namespace(context)
 
-        # Unserializable context: never share cached responses across contexts,
-        # so skip the cache and just delegate to the provider optimizer.
-        if namespace is None:
+        # Failed serialization is an unknown identity, not a query-only request.
+        # Skip both exact and semantic lookup when the full context cannot hash.
+        if namespace is None or not messages_hash:
             return self.provider_optimizer.optimize(messages, context, config)
 
         # Check semantic cache
@@ -495,9 +510,8 @@ class SemanticCacheLayer:
         messages_hash = self._compute_messages_hash(messages)
         namespace = self._compute_namespace(context)
 
-        # Unserializable context: don't store anything that could be replayed
-        # for a different provider/model/metadata.
-        if namespace is None:
+        # Refuse incomplete identities instead of creating a query-only entry.
+        if namespace is None or not messages_hash:
             return ""
 
         return self.cache.put(query, response, messages_hash, namespace)
