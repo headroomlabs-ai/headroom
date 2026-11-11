@@ -27,6 +27,8 @@ def _collect(*args: str) -> str:
         text=True,
         timeout=300,
     )
+    # A failed collection prints no test names, which would let the "not in" checks pass.
+    assert result.returncode == 0, result.stdout + result.stderr
     return result.stdout
 
 
