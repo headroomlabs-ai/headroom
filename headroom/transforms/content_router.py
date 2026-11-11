@@ -2047,8 +2047,10 @@ class CompressionCache:
                 self._disk_writes.pop(key, None)
                 self._drop_locked(key)
                 self._skip_locked(key)
-            if self._store is not None:
-                self._store.delete(self._namespace + key)
+                # As in clear(), no new disk reader may start until the row
+                # is gone, or it could re-admit the result after invalidation.
+                if self._store is not None:
+                    self._store.delete(self._namespace + key)
 
     def _admit_locked(self, key: str, compressed: str, ratio: float, strategy: str) -> bool:
         """Add a result, evicting least recently used ones over budget; returns

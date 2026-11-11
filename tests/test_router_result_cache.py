@@ -269,6 +269,36 @@ def test_newer_put_with_identical_text_keeps_its_disk_metadata(tmp_path):
     assert store.get(cache._namespace + "k") == ("same", 0.25, "log")
 
 
+def test_a_read_started_during_skip_cannot_restore_the_result(tmp_path):
+    store = ResultStore(tmp_path / "c.db", 1800)
+    cache = CompressionCache(store=store)
+    cache.put("k", "old", 0.5, "text")
+    real = cache._lock
+    reads = []
+
+    class ReadAfterUnlock:
+        pending = True
+
+        def __enter__(self):
+            return real.__enter__()
+
+        def __exit__(self, *exc):
+            real.__exit__(*exc)
+            if self.pending:
+                self.pending = False
+                # Schedule the read at the first opportunity after memory's
+                # critical section, before move_to_skip can do anything else.
+                reads.append(cache.get("k"))
+
+    cache._lock = ReadAfterUnlock()
+    cache.move_to_skip("k")
+
+    assert reads == [None]
+    assert cache.get("k") is None
+    assert cache.is_skipped("k")
+    assert store.get(cache._namespace + "k") is None
+
+
 def test_a_disk_read_in_flight_never_replaces_a_newer_put(tmp_path):
     store = ResultStore(tmp_path / "c.db", 1800)
     cache = CompressionCache(max_bytes=600, store=store)
