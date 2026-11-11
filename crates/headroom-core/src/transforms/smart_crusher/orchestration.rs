@@ -143,7 +143,10 @@ pub fn fill_remaining_slots(
 /// 3. **Already under budget?** Return as-is.
 /// 4. **Otherwise**: keep ALL critical items (errors + structural
 ///    outliers + numeric anomalies — non-negotiable per Python's
-///    "quality guarantee"). Then add first-3 + last-2 if room. Then
+///    "quality guarantee") and the items that exactly match a query
+///    anchor (`query_matches`: an ID, UUID, email, hostname or quoted
+///    string from the user's question), unless the anchors match more
+///    than `effective_max` items. Then add first-3 + last-2 if room. Then
 ///    fill remaining with non-critical kept indices in ascending order.
 ///
 /// May return MORE than `effective_max` items when critical items
@@ -156,6 +159,7 @@ pub fn prioritize_indices(
     n: usize,
     analysis: Option<&ArrayAnalysis>,
     effective_max: usize,
+    query_matches: &BTreeSet<usize>,
 ) -> BTreeSet<usize> {
     // Dedup pass.
     let mut current = if config.dedup_identical_items {
@@ -194,6 +198,15 @@ pub fn prioritize_indices(
     prioritized.extend(&outlier_indices);
     prioritized.extend(&anomaly_indices);
     prioritized.extend(&learned_indices);
+
+    // The rows the question names, kept unconditionally as `plan_top_n`
+    // already does. An anchor that matches more rows than the whole budget
+    // is not selective (a shared hostname, a common number) and pinning all
+    // of them would defeat the crush, so those rows compete as ordinary
+    // kept indices instead.
+    if query_matches.len() <= effective_max {
+        prioritized.extend(query_matches.intersection(&current));
+    }
 
     // First 3 / last 2 anchors if we have room.
     let mut remaining = effective_max.saturating_sub(prioritized.len());
@@ -411,11 +424,23 @@ mod tests {
 
     // ---------- prioritize_indices ----------
 
+    fn prioritize(kept: &BTreeSet<usize>, items: &[Value], max: usize) -> BTreeSet<usize> {
+        prioritize_indices(
+            &cfg(),
+            kept,
+            items,
+            items.len(),
+            None,
+            max,
+            &BTreeSet::new(),
+        )
+    }
+
     #[test]
     fn prioritize_under_budget_passthrough_after_dedup() {
         let items: Vec<Value> = (0..5).map(|i| json!({"id": i})).collect();
         let kept = idx_set(&[0, 1, 2]);
-        let result = prioritize_indices(&cfg(), &kept, &items, items.len(), None, 10);
+        let result = prioritize(&kept, &items, 10);
         // 3 items < max 10 → fill kicks in; we get 5 (all items).
         assert_eq!(result.len(), 5);
     }
@@ -428,7 +453,7 @@ mod tests {
             json!({"name": "bob"}),
         ];
         let kept = idx_set(&[0, 1, 2]);
-        let result = prioritize_indices(&cfg(), &kept, &items, items.len(), None, 10);
+        let result = prioritize(&kept, &items, 10);
         // Dedup collapses 0+1 to 0; fill stays put because n=3 already covered.
         assert_eq!(result, idx_set(&[0, 2]));
     }
@@ -441,7 +466,7 @@ mod tests {
             .collect();
         items.push(json!({"id": 30, "msg": "FATAL: out of memory"}));
         let kept: BTreeSet<usize> = (0..items.len()).collect();
-        let result = prioritize_indices(&cfg(), &kept, &items, items.len(), None, 10);
+        let result = prioritize(&kept, &items, 10);
         assert!(
             result.contains(&30),
             "error item must survive prioritization"
@@ -449,11 +474,69 @@ mod tests {
     }
 
     #[test]
+    fn prioritize_keeps_query_match_when_errors_fill_budget() {
+        // 39 error-keyword rows fill the budget of 10; the row the question
+        // names (index 25) has no error keyword and must still survive.
+        let items: Vec<Value> = (0..40)
+            .map(|i| {
+                let outcome = if i == 25 { "ok" } else { "failed" };
+                json!({"number": 4400 + i, "title": format!("parser {outcome} on case {i}")})
+            })
+            .collect();
+        let kept: BTreeSet<usize> = (0..items.len()).collect();
+        let result = prioritize_indices(
+            &cfg(),
+            &kept,
+            &items,
+            items.len(),
+            None,
+            10,
+            &idx_set(&[25]),
+        );
+        assert!(
+            result.contains(&25),
+            "query-matched row must survive prioritization"
+        );
+    }
+
+    #[test]
+    fn prioritize_keeps_query_match_without_error_rows() {
+        // No critical rows at all: the budget fills by position, and the
+        // matched row in the middle must still be kept.
+        let items: Vec<Value> = (0..40)
+            .map(|i| json!({"id": 9000 + i, "v": "ok"}))
+            .collect();
+        let kept: BTreeSet<usize> = (0..items.len()).collect();
+        let result = prioritize_indices(
+            &cfg(),
+            &kept,
+            &items,
+            items.len(),
+            None,
+            10,
+            &idx_set(&[20]),
+        );
+        assert!(result.contains(&20), "got {result:?}");
+        assert!(result.len() <= 10, "got {} items", result.len());
+    }
+
+    #[test]
+    fn prioritize_ignores_anchor_matching_more_than_budget() {
+        // An anchor that matches 20 rows against a budget of 10 isn't
+        // selective: it must not force all 20 into the result.
+        let items: Vec<Value> = (0..30).map(|i| json!({"id": i, "v": i})).collect();
+        let kept: BTreeSet<usize> = (0..items.len()).collect();
+        let matches: BTreeSet<usize> = (5..25).collect();
+        let result = prioritize_indices(&cfg(), &kept, &items, items.len(), None, 10, &matches);
+        assert!(result.len() <= 10, "got {} items", result.len());
+    }
+
+    #[test]
     fn prioritize_includes_first_3_and_last_2_when_room() {
         // No errors / outliers / anomalies → first 3 + last 2 anchors fill.
         let items: Vec<Value> = (0..30).map(|i| json!({"id": i, "v": i})).collect();
         let kept: BTreeSet<usize> = (5..15).collect();
-        let result = prioritize_indices(&cfg(), &kept, &items, items.len(), None, 10);
+        let result = prioritize(&kept, &items, 10);
         // With no critical items and budget 10, dedup is a no-op (all
         // distinct) and fill keeps us at <= 10. We should see at least
         // some of items 0..3 OR 28..30 covered through fill.
