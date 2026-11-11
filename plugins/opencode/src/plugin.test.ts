@@ -116,6 +116,38 @@ describe("HeadroomPlugin", () => {
     });
   });
 
+  it("treats an empty HEADROOM_PROXY_URL as unset and falls through to HEADROOM_BASE_URL", async () => {
+    vi.stubEnv("HEADROOM_PROXY_URL", "");
+    vi.stubEnv("HEADROOM_BASE_URL", "http://127.0.0.1:9999");
+    try {
+      const plugin = await HeadroomPlugin(pluginInput(), {});
+      const output = { env: {} as Record<string, string> };
+
+      await plugin["shell.env"]?.({ cwd: "/repo" }, output);
+      await plugin.dispose?.();
+
+      expect(output.env.HEADROOM_PROXY_URL).toBe("http://127.0.0.1:9999");
+    } finally {
+      vi.unstubAllEnvs();
+    }
+  });
+
+  it("treats an empty proxyUrl option as unset", async () => {
+    vi.stubEnv("HEADROOM_PROXY_URL", "");
+    vi.stubEnv("HEADROOM_BASE_URL", "");
+    try {
+      const plugin = await HeadroomPlugin(pluginInput(), { proxyUrl: "" });
+      const output = { env: {} as Record<string, string> };
+
+      await plugin["shell.env"]?.({ cwd: "/repo" }, output);
+      await plugin.dispose?.();
+
+      expect(output.env.HEADROOM_PROXY_URL).toBe("http://localhost:8787");
+    } finally {
+      vi.unstubAllEnvs();
+    }
+  });
+
   it("exposes a headroom_retrieve tool backed by the proxy", async () => {
     const fetchMock = vi.fn(async () => ({
       ok: true,
