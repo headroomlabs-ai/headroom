@@ -267,6 +267,169 @@ describe("Headroom OpenCode transport", () => {
     req2.destroy();
   });
 
+  it("passes a non-LLM POST whose path merely ends in an LLM endpoint through unchanged (#4747)", async () => {
+    const originalFetch = globalThis.fetch;
+    const fetchMock = vi.fn(async (..._args: FetchCall) => new Response("ok"));
+    globalThis.fetch = fetchMock as unknown as typeof fetch;
+
+    installHeadroomTransport({ proxyUrl: "http://127.0.0.1:8787/v1", sessionToken: "SESSION-TOKEN" });
+
+    const init = { method: "POST", headers: { authorization: "Bearer SECRET" }, body: "{}" };
+    await fetch("https://discord.com/api/v10/channels/123/messages", init);
+    await fetch("https://discord.com/api/v9/channels/123/messages", init);
+    await fetch("https://forms.example.com/forms/123/responses", init);
+    await fetch("https://chat.example.com/rooms/42/chat/completions", init);
+
+    expect(fetchMock).toHaveBeenCalledTimes(4);
+    for (const call of fetchMock.mock.calls as FetchCall[]) {
+      expect(typeof call[0]).toBe("string");
+      expect(call[1]).toBe(init);
+      const headers = new Headers(call[1]?.headers);
+      expect(headers.get("x-headroom-base-url")).toBeNull();
+      expect(headers.get("x-headroom-session-token")).toBeNull();
+    }
+
+    globalThis.fetch = originalFetch;
+  });
+
+  it("still routes provider-rooted wire paths, including a bare endpoint and other version prefixes (#4747)", async () => {
+    const originalFetch = globalThis.fetch;
+    const fetchMock = vi.fn(async (..._args: FetchCall) => new Response("ok"));
+    globalThis.fetch = fetchMock as unknown as typeof fetch;
+
+    installHeadroomTransport({ proxyUrl: "http://127.0.0.1:8787/v1" });
+
+    const init = { method: "POST" };
+    await fetch("https://api.example.com/messages", init);
+    await fetch("https://api.example.com/responses", init);
+    await fetch("https://gateway.example.com/api/chat/completions", init);
+    await fetch("https://gateway.example.com/api/v2/chat/completions", init);
+    await fetch("https://gateway.example.com/openai/deployments/x/chat/completions", init);
+    await fetch("https://opencode.ai/zen/v1/responses", init);
+    await fetch("https://cloud.example.com/backend-api/codex/responses", init);
+
+    expect(fetchMock).toHaveBeenCalledTimes(7);
+    for (const call of fetchMock.mock.calls as FetchCall[]) {
+      expect(call[0]).toBeInstanceOf(URL);
+      expect(new Headers(call[1]?.headers).get("x-headroom-base-url")).not.toBeNull();
+    }
+
+    globalThis.fetch = originalFetch;
+  });
+
+  it("keeps every loopback spelling and a trailing-dot excluded host off the proxy (#4747)", async () => {
+    const originalFetch = globalThis.fetch;
+    const fetchMock = vi.fn(async (..._args: FetchCall) => new Response("ok"));
+    globalThis.fetch = fetchMock as unknown as typeof fetch;
+
+    installHeadroomTransport({ proxyUrl: "http://127.0.0.1:8787/v1", excludeHosts: ["api.x.example"] });
+
+    const init = { method: "POST" };
+    await fetch("http://127.0.0.1:11434/v1/chat/completions", init);
+    await fetch("http://127.0.0.2:11434/v1/chat/completions", init);
+    await fetch("http://127.1.2.3:11434/v1/chat/completions", init);
+    await fetch("http://127.255.255.254:11434/v1/chat/completions", init);
+    await fetch("http://localhost./v1/chat/completions", init);
+    await fetch("http://[::1]:11434/v1/chat/completions", init);
+    await fetch("http://[::ffff:127.0.0.1]:11434/v1/chat/completions", init);
+    await fetch("http://[::ffff:127.1.2.3]:11434/v1/chat/completions", init);
+    await fetch("https://api.x.example./v1/chat/completions", init);
+
+    expect(fetchMock).toHaveBeenCalledTimes(9);
+    for (const call of fetchMock.mock.calls as FetchCall[]) {
+      expect(typeof call[0]).toBe("string");
+      expect(call[1]).toBe(init);
+      expect(new Headers(call[1]?.headers).get("x-headroom-base-url")).toBeNull();
+    }
+
+    globalThis.fetch = originalFetch;
+  });
+
+  it("routes a configured compatible base with no version or reserved prefix, in fetch and Node requests (#4747)", async () => {
+    const originalFetch = globalThis.fetch;
+    const fetchMock = vi.fn(async (..._args: FetchCall) => new Response("ok"));
+    globalThis.fetch = fetchMock as unknown as typeof fetch;
+
+    const fakeRequest = { on: vi.fn(), end: vi.fn(), destroy: vi.fn() };
+    const httpsSpy = vi.spyOn(https, "request").mockImplementation(() => fakeRequest as never);
+    const httpSpy = vi.spyOn(http, "request").mockImplementation(() => fakeRequest as never);
+
+    // The base the user configured for an OpenAI-compatible provider. Its path
+    // has no version segment and no reserved root name, so only knowing the
+    // configured base can route it.
+    installHeadroomTransport({
+      proxyUrl: "http://127.0.0.1:8787/v1",
+      wireRoots: ["https://gateway.invalid/tenant/acme"],
+    });
+    const init = { method: "POST" };
+
+    try {
+      await fetch("https://gateway.invalid/tenant/acme/chat/completions", init);
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+      expect(fetchMock.mock.calls[0][0]).toBeInstanceOf(URL);
+      expect(new Headers(fetchMock.mock.calls[0][1]?.headers).get("x-headroom-base-url")).toBe(
+        "https://gateway.invalid",
+      );
+      // The configured base is a root, not a blanket route for its host: an
+      // unrelated path on that host still passes through untouched.
+      await fetch("https://gateway.invalid/tenant/acme/files/1", init);
+      expect(fetchMock).toHaveBeenCalledTimes(2);
+      expect(fetchMock.mock.calls[1][0]).toBe("https://gateway.invalid/tenant/acme/files/1");
+
+      https.request("https://gateway.invalid/tenant/acme/chat/completions", init);
+      // The proxy is http://, so a routed request is re-issued through
+      // http.request; https.request keeps only the untouched pass-through.
+      expect(httpSpy).toHaveBeenCalledTimes(1);
+      const routed = httpSpy.mock.calls[0][0] as { headers?: Record<string, string>; hostname?: string; path?: string };
+      expect(routed).toMatchObject({
+        hostname: "127.0.0.1",
+        path: "/v1/chat/completions",
+      });
+      expect(new Headers(routed.headers).get("x-headroom-base-url")).toBe("https://gateway.invalid");
+      https.request("https://gateway.invalid/tenant/acme/files/1", init);
+      expect(httpSpy).toHaveBeenCalledTimes(1);
+      expect(httpsSpy).toHaveBeenCalledTimes(1);
+      expect(httpsSpy.mock.calls[0][0]).toBe("https://gateway.invalid/tenant/acme/files/1");
+
+      // A different origin that merely shares a path prefix must not match.
+      await fetch("https://other.invalid/tenant/acme/chat/completions", init);
+      expect(fetchMock).toHaveBeenCalledTimes(3);
+      expect(fetchMock.mock.calls[2][0]).toBe("https://other.invalid/tenant/acme/chat/completions");
+    } finally {
+      uninstallHeadroomTransport();
+      globalThis.fetch = originalFetch;
+      httpsSpy.mockRestore();
+      httpSpy.mockRestore();
+    }
+  });
+
+  it("keeps loopback spellings and a trailing-dot excluded host off the proxy for Node http/https.request (#4747)", () => {
+    const fakeRequest = { on: vi.fn(), end: vi.fn(), destroy: vi.fn() };
+    const httpsSpy = vi.spyOn(https, "request").mockImplementation(() => fakeRequest as never);
+    const httpSpy = vi.spyOn(http, "request").mockImplementation(() => fakeRequest as never);
+
+    installHeadroomTransport({ proxyUrl: "http://127.0.0.1:8787/v1", excludeHosts: ["api.x.example"] });
+    const options = { method: "POST" };
+
+    try {
+      // http:// goes through http.request: real https.request rejects that
+      // protocol, so asserting it against the https spy would prove nothing.
+      http.request("http://127.0.0.2:11434/v1/chat/completions", options);
+      http.request("http://[::ffff:127.0.0.2]:11434/v1/chat/completions", options);
+      https.request("https://api.x.example./v1/chat/completions", options);
+      https.request("https://discord.com/api/v10/channels/123/messages", options);
+
+      expect(httpSpy.mock.calls[0][0]).toBe("http://127.0.0.2:11434/v1/chat/completions");
+      expect(httpSpy.mock.calls[1][0]).toBe("http://[::ffff:127.0.0.2]:11434/v1/chat/completions");
+      expect(httpsSpy.mock.calls[0][0]).toBe("https://api.x.example./v1/chat/completions");
+      expect(httpsSpy.mock.calls[1][0]).toBe("https://discord.com/api/v10/channels/123/messages");
+    } finally {
+      uninstallHeadroomTransport();
+      httpsSpy.mockRestore();
+      httpSpy.mockRestore();
+    }
+  });
+
   it("routes Gemini native :generateContent and :streamGenerateContent through the proxy", async () => {
     const originalFetch = globalThis.fetch;
     const fetchMock = vi.fn(async (..._args: FetchCall) => new Response("ok"));
@@ -1109,5 +1272,59 @@ describe("Headroom OpenCode transport", () => {
 
     firstDispose();
     globalThis.fetch = originalFetch;
+  });
+
+  it.each(["", "127.0.0.1:8787"])("leaves all traffic alone when the proxy URL is unusable (%j)", async (proxyUrl) => {
+    const originalFetch = globalThis.fetch;
+    const fetchMock = vi.fn(async (..._args: FetchCall) => new Response("ok"));
+    globalThis.fetch = fetchMock as unknown as typeof fetch;
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+
+    try {
+      installHeadroomTransport({ proxyUrl });
+
+      // Neither an LLM endpoint nor a plain download may throw or be rewritten.
+      await fetch("https://api.anthropic.com/v1/messages", { method: "POST" });
+      await fetch("https://registry.npmjs.org/left-pad");
+      expect(fetchMock).toHaveBeenCalledTimes(2);
+      expect(fetchMock.mock.calls[0][0]).toBe("https://api.anthropic.com/v1/messages");
+      expect(fetchMock.mock.calls[1][0]).toBe("https://registry.npmjs.org/left-pad");
+      expect(new Headers(fetchMock.mock.calls[0][1]?.headers).get("x-headroom-base-url")).toBeNull();
+
+      for (const [request, scheme] of [[http.request, "http"], [https.request, "https"]] as const) {
+        const req = request(`${scheme}://registry.npmjs.org/left-pad`, { method: "POST" });
+        req.on("error", () => {});
+        expect(req.host).toBe("registry.npmjs.org");
+        req.destroy();
+      }
+
+      // The problem is reported once, not once per request.
+      expect(warn).toHaveBeenCalledTimes(1);
+      expect(warn).toHaveBeenCalledWith(
+        `headroom: the configured proxy URL is ${proxyUrl === "" ? "empty" : "not a valid http(s) URL"}; requests are not routed`,
+      );
+    } finally {
+      globalThis.fetch = originalFetch;
+      warn.mockRestore();
+    }
+  });
+
+  it("does not log any part of an unusable proxy URL that carries credentials", async () => {
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = vi.fn(async (..._args: FetchCall) => new Response("ok")) as unknown as typeof fetch;
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+
+    try {
+      installHeadroomTransport({ proxyUrl: "user:secretpass@host:8787" });
+      await fetch("https://api.anthropic.com/v1/messages", { method: "POST" });
+
+      expect(warn).toHaveBeenCalledTimes(1);
+      const logged = warn.mock.calls.flat().join(" ");
+      expect(logged).not.toContain("secretpass");
+      expect(logged).not.toContain("host:8787");
+    } finally {
+      globalThis.fetch = originalFetch;
+      warn.mockRestore();
+    }
   });
 });

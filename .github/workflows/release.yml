@@ -168,30 +168,39 @@ jobs:
       # "Artifact not found" because publish-npm is not gated on
       # collect-dist. Removing the dead step is the right fix.
 
-      - name: Publish ${{ env.NPM_SDK_PACKAGE }} (TypeScript SDK) to npmjs.org
-        id: npm-sdk-publish
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+      # Install and build run in their own steps WITHOUT the publish token:
+      # `npm ci` executes dependency lifecycle scripts, which must not be able
+      # to read NPM_TOKEN. Only the `npm publish` steps below carry it.
+      - name: Prepare ${{ env.NPM_SDK_PACKAGE }} (TypeScript SDK) for npmjs.org
+        id: npm-sdk-prepare
         run: |
           version="${{ needs.build-and-smoke.outputs.npm_version }}"
           if npm view "${NPM_SDK_PACKAGE}@${version}" version --registry "${NPM_REGISTRY_URL}" >/dev/null 2>&1; then
             echo "${NPM_SDK_PACKAGE}@${version} is already published; continuing."
+            echo "skip=true" >> "$GITHUB_OUTPUT"
             exit 0
           fi
           cd sdk/typescript
           npm ci
           npm run build
           npm version "$version" --no-git-tag-version --allow-same-version
-          npm publish --access public
 
-      - name: Publish ${{ env.NPM_OPENCLAW_PACKAGE }} to npmjs.org
-        id: npm-openclaw-publish
+      - name: Publish ${{ env.NPM_SDK_PACKAGE }} (TypeScript SDK) to npmjs.org
+        id: npm-sdk-publish
+        if: steps.npm-sdk-prepare.outputs.skip != 'true'
+        working-directory: sdk/typescript
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          npm publish --access public
+
+      - name: Prepare ${{ env.NPM_OPENCLAW_PACKAGE }} for npmjs.org
+        id: npm-openclaw-prepare
         run: |
           version="${{ needs.build-and-smoke.outputs.npm_version }}"
           if npm view "${NPM_OPENCLAW_PACKAGE}@${version}" version --registry "${NPM_REGISTRY_URL}" >/dev/null 2>&1; then
             echo "${NPM_OPENCLAW_PACKAGE}@${version} is already published; continuing."
+            echo "skip=true" >> "$GITHUB_OUTPUT"
             exit 0
           fi
           cd plugins/openclaw
@@ -206,16 +215,23 @@ jobs:
           fs.writeFileSync("package.json", `${JSON.stringify(pkg, null, 2)}\n`);
           EOF
           node prepare-dist.mjs
-          npm publish --access public
 
-      - name: Publish ${{ env.NPM_OPENCODE_PACKAGE }} to npmjs.org
-        id: npm-opencode-publish
+      - name: Publish ${{ env.NPM_OPENCLAW_PACKAGE }} to npmjs.org
+        id: npm-openclaw-publish
+        if: steps.npm-openclaw-prepare.outputs.skip != 'true'
+        working-directory: plugins/openclaw
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          npm publish --access public
+
+      - name: Prepare ${{ env.NPM_OPENCODE_PACKAGE }} for npmjs.org
+        id: npm-opencode-prepare
         run: |
           version="${{ needs.build-and-smoke.outputs.npm_version }}"
           if npm view "${NPM_OPENCODE_PACKAGE}@${version}" version --registry "${NPM_REGISTRY_URL}" >/dev/null 2>&1; then
             echo "${NPM_OPENCODE_PACKAGE}@${version} is already published; continuing."
+            echo "skip=true" >> "$GITHUB_OUTPUT"
             exit 0
           fi
           cd plugins/opencode
@@ -229,6 +245,14 @@ jobs:
           pkg.dependencies["headroom-ai"] = `^${process.env.HEADROOM_NPM_VERSION}`;
           fs.writeFileSync("package.json", `${JSON.stringify(pkg, null, 2)}\n`);
           EOF
+
+      - name: Publish ${{ env.NPM_OPENCODE_PACKAGE }} to npmjs.org
+        id: npm-opencode-publish
+        if: steps.npm-opencode-prepare.outputs.skip != 'true'
+        working-directory: plugins/opencode
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
           npm publish --access public
 
   publish-github-packages:
