@@ -23,16 +23,34 @@ docker build -f e2e/wrap/Dockerfile -t headroom-wrap-e2e .
 docker run --rm headroom-wrap-e2e
 ```
 
-`npm test` runs the Ajv URI, minimatch pattern-expansion and Express
-body-parser regression checks against the installed locked dependencies. The Dockerfile runs the same command from
-`/opt/wrap-tools` after `npm ci`, so failures stop the image build in both the
-existing Wrap E2E workflow and CI's Docker-native wrap E2E job. Their path
-filters include `e2e/**`, covering dependency and regression-test updates.
+`npm test` runs the Ajv URI, minimatch pattern-expansion, Express body-parser
+and npm bundled-copy regression checks against the installed locked
+dependencies. The Dockerfile runs the same command from `/opt/wrap-tools` after
+`npm ci`, so failures stop the image build in both the existing Wrap E2E
+workflow and CI's Docker-native wrap E2E job. Their path filters include
+`e2e/**`, covering dependency and regression-test updates.
 
 To intentionally refresh transitive versions without changing the pinned CLI
 versions, use `npm update --package-lock-only --no-fund --no-audit` in this
 directory instead of `npm install --package-lock-only`, then run the same
 installation and Docker checks above.
+
+Changing the `npm` override is a separate procedure. `npm install
+--package-lock-only` does not refresh npm's `inBundle` children, so the lock
+keeps the old bundled versions and the audit keeps reporting them. Bump the
+override, then run a real install in a scratch copy of this directory (with the
+`package.json`, `.npmrc` and old lock), and copy its `package-lock.json` back:
+
+```sh
+cp package.json .npmrc package-lock.json /tmp/npm-bump/
+cd /tmp/npm-bump && npm install --ignore-scripts --no-fund --no-audit
+cp package-lock.json /path/to/e2e/wrap/tools/
+```
+
+Review that diff: only the bundled copies npm changed between the two releases
+should move (`node_modules/npm/node_modules/*`), plus the npm entry itself. Then
+update the `npm@` pin in the Dockerfile, recheck `npm-audit-exceptions.json`
+against the new bundled versions, and run the checks above.
 
 Review the lockfile diff and justify dependency changes in the PR. A lockfile
 fixes resolution and checks package integrity; it cannot make the npm registry

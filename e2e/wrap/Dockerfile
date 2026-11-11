@@ -103,7 +103,9 @@ COPY e2e/wrap/tools/package.json e2e/wrap/tools/package-lock.json e2e/wrap/tools
 RUN npm ci --prefix /opt/wrap-tools --no-fund --no-audit --strict-allow-scripts
 
 # Exercise the installed dependency fixes in both existing wrap-E2E CI callers.
-COPY e2e/wrap/tools/dependency-regression.test.cjs /opt/wrap-tools/
+# The exceptions file is copied too: one check asserts it holds no advisory for a
+# bundled copy that now carries the fix.
+COPY e2e/wrap/tools/dependency-regression.test.cjs e2e/wrap/tools/npm-audit-exceptions.json /opt/wrap-tools/
 RUN npm test --prefix /opt/wrap-tools
 
 WORKDIR /workspace
