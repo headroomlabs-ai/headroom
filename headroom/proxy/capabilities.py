@@ -135,8 +135,29 @@ def _probe_local_state(config: ProxyConfig) -> tuple[bool, str]:
     return True, "workspace state is writable"
 
 
+def _has_ccr_plugin(name: str) -> bool:
+    from importlib.metadata import entry_points
+
+    return any(e.name == name for e in entry_points(group="headroom.ccr_backend"))
+
+
+def _ccr_backend_kind() -> str:
+    """Report the CCR backend, leaving a built-in lazy Redis store unconnected."""
+    import os
+
+    from headroom.cache import compression_store
+
+    if compression_store._compression_store is None:
+        backend_type = (os.environ.get("HEADROOM_CCR_BACKEND") or "").strip().lower()
+        session_store = os.environ.get("HEADROOM_COMPRESS_SESSION_STORE", "").strip()
+        url = os.environ.get("HEADROOM_REDIS_URL", "").strip() or session_store
+        if url and (backend_type == "redis" or not backend_type) and not _has_ccr_plugin("redis"):
+            return "custom"
+    return compression_store.get_compression_store().backend_kind
+
+
 def build_capability_report(config: ProxyConfig) -> CapabilityReport:
-    from headroom.cache.compression_store import detach_compression_store, get_compression_store
+    from headroom.cache.compression_store import detach_compression_store
     from headroom.telemetry.toin import TOINConfig, get_toin, reset_toin
 
     # Resolve the same process-wide store that request handling will use.
@@ -156,7 +177,7 @@ def build_capability_report(config: ProxyConfig) -> CapabilityReport:
     else:
         toin = get_toin()
     toin_backend = toin.backend_kind
-    ccr_backend = get_compression_store().backend_kind
+    ccr_backend = _ccr_backend_kind()
 
     def local_optional(
         *,
