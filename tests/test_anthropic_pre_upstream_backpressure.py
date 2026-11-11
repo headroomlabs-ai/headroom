@@ -201,7 +201,7 @@ class _DummyAnthropicHandler(AnthropicHandlerMixin):
         self.compression_max_workers = 4
         self._compression_in_flight = 0
         self._compression_in_flight_max = 0
-        self._compression_leaked_threads = 0
+        self._compression_timed_out_workers_total = 0
         self._compression_metrics_lock = _threading.Lock()
         self._upstream_delay_s = upstream_delay_s
         self._raise_during_critical = raise_during_critical
@@ -234,7 +234,7 @@ class _DummyAnthropicHandler(AnthropicHandlerMixin):
                 with self._compression_metrics_lock:
                     self._compression_in_flight -= 1
                     if elapsed > timeout:
-                        self._compression_leaked_threads += 1
+                        self._compression_timed_out_workers_total += 1
 
         future = loop.run_in_executor(self._compression_executor, _wrapped)
         return await asyncio.wait_for(future, timeout=timeout)
@@ -718,6 +718,52 @@ def test_memory_context_timeout_fails_open_and_releases_semaphore():
         handler = _DummyAnthropicHandler(anthropic_pre_upstream_sem=sem)
         handler.memory_handler = _MemoryHandler()
         handler.config.anthropic_pre_upstream_memory_context_timeout_seconds = 0.01
+        req = _build_request(
+            {
+                "model": "claude-3-5-sonnet-latest",
+                "messages": [{"role": "user", "content": "hello"}],
+            },
+            {
+                "authorization": "Bearer sk-ant-api-test",
+                "x-headroom-user-id": "user-1",
+            },
+        )
+        response = await handler.handle_anthropic_messages(req)
+        assert response.status_code == 200
+        assert sem._value == 1
+
+    with _tokenizer_patch():
+        anyio.run(_run)
+
+
+def test_memory_context_exception_fails_open_and_releases_semaphore():
+    class _MemoryHandler:
+        def __init__(self) -> None:
+            self.config = SimpleNamespace(inject_context=True, inject_tools=False)
+            self.initialized = False
+            self.backend = None
+
+        async def search_and_format_context(self, _user_id, _messages, **_kwargs):
+            import sqlite3
+
+            raise sqlite3.OperationalError("unable to open database file")
+
+        def inject_tools(self, tools, _provider):
+            return tools, False
+
+        def get_beta_headers(self) -> dict[str, str]:
+            return {}
+
+        def has_memory_tool_calls(self, _response, _provider) -> bool:
+            return False
+
+        async def handle_memory_tool_calls(self, _response, _user_id, _provider, **_kwargs):
+            return []
+
+    async def _run() -> None:
+        sem = asyncio.Semaphore(1)
+        handler = _DummyAnthropicHandler(anthropic_pre_upstream_sem=sem)
+        handler.memory_handler = _MemoryHandler()
         req = _build_request(
             {
                 "model": "claude-3-5-sonnet-latest",

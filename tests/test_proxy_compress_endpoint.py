@@ -514,6 +514,91 @@ class TestCompressEndpointLossyInlineMode:
         with TestClient(app, base_url="http://127.0.0.1", client=("127.0.0.1", 12345)) as c:
             yield c
 
+    def test_lossless_mode_folds_search_output_and_keeps_json_rows(self, client):
+        grep_output = "\n".join(
+            f"headroom/proxy/handlers/openai.py:{i}:    value_{i} = compute(value_{i})"
+            for i in range(1, 400)
+        )
+        messages = [
+            {"role": "user", "content": "Find the values."},
+            {
+                "role": "assistant",
+                "content": None,
+                "tool_calls": [
+                    {
+                        "id": "call_grep",
+                        "type": "function",
+                        "function": {"name": "Grep", "arguments": "{}"},
+                    }
+                ],
+            },
+            {"role": "tool", "tool_call_id": "call_grep", "content": grep_output},
+            *self._big_tool_message(),
+        ]
+        response = client.post(
+            "/v1/compress",
+            json={"messages": messages, "model": "gpt-4", "config": {"mode": "lossless"}},
+        )
+        assert response.status_code == 200
+        body = response.json()
+        assert not body.get("ccr_hashes")
+        folded = body["messages"][2]["content"]
+        assert len(folded) < len(grep_output)
+        assert all(f"value_{i} = compute(value_{i})" in folded for i in range(1, 400))
+        json_rows = json.loads(messages[4]["content"])
+        assert all(row["description"] in body["messages"][4]["content"] for row in json_rows)
+
+    @staticmethod
+    def _read_call(call_id, path, name="Read"):
+        return {
+            "role": "assistant",
+            "content": None,
+            "tool_calls": [
+                {
+                    "id": call_id,
+                    "type": "function",
+                    "function": {"name": name, "arguments": json.dumps({"file_path": path})},
+                }
+            ],
+        }
+
+    def test_lossless_mode_keeps_a_read_the_conversation_later_edited(self, client):
+        source = "\n".join(f"def function_{i}(): return {i}" for i in range(400))
+        messages = [
+            {"role": "user", "content": "Change a.py."},
+            self._read_call("call_read", "/x/a.py"),
+            {"role": "tool", "tool_call_id": "call_read", "content": source},
+            self._read_call("call_edit", "/x/a.py", name="Edit"),
+            {"role": "tool", "tool_call_id": "call_edit", "content": "Edited /x/a.py"},
+            {"role": "user", "content": "Now what?"},
+        ]
+        response = client.post(
+            "/v1/compress",
+            json={"messages": messages, "model": "gpt-4", "config": {"mode": "lossless"}},
+        )
+        assert response.status_code == 200
+        body = response.json()
+        assert not body.get("ccr_hashes")
+        assert body["messages"][2]["content"] == source
+
+    def test_lossless_mode_emits_no_dedup_pointer(self, client, monkeypatch):
+        monkeypatch.setenv("HEADROOM_DEDUPE", "1")
+        output = "\n".join(f"2026-01-01 worker-{i} finished job {i}" for i in range(400))
+        messages = [{"role": "user", "content": "Run it twice."}]
+        for call_id in ("call_1", "call_2"):
+            messages.append(self._read_call(call_id, "/x/run.sh", name="Bash"))
+            messages.append({"role": "tool", "tool_call_id": call_id, "content": output})
+        messages.append({"role": "user", "content": "Same?"})
+
+        response = client.post(
+            "/v1/compress",
+            json={"messages": messages, "model": "gpt-4", "config": {"mode": "lossless"}},
+        )
+        assert response.status_code == 200
+        second = response.json()["messages"][4]["content"]
+        assert "same as msg" not in second
+        assert "finished job 399" in second
+
     @pytest.mark.parametrize(
         ("repetitions", "strategy"), [(1, "json_minifier"), (20, "smart_crusher")]
     )
@@ -597,7 +682,7 @@ class TestCompressEndpointModeValidation:
 
     @pytest.mark.parametrize(
         "bad_mode",
-        ["lossless", "CCR", "ccr ", "no_ccr", "", 7, ["ccr"]],
+        ["LOSSLESS", "CCR", "ccr ", "no_ccr", "", 7, ["ccr"]],
     )
     def test_unknown_mode_returns_400(self, client, bad_mode):
         response = client.post(
@@ -613,7 +698,7 @@ class TestCompressEndpointModeValidation:
         assert data["error"]["type"] == "invalid_request"
         message = data["error"]["message"]
         # The message must tell the caller what IS valid.
-        for valid in ("ccr", "lossy_inline", "lossless_then_lossy"):
+        for valid in ("ccr", "lossy_inline", "lossless_then_lossy", "lossless"):
             assert valid in message
 
     @pytest.mark.parametrize(

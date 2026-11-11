@@ -54,14 +54,15 @@ use headroom_core::compression_policy::CompressionPolicy;
 pub struct AppState {
     pub config: Arc<Config>,
     pub client: reqwest::Client,
-    /// PR-D1: AWS credentials resolved at startup via the
-    /// `aws-config` default chain. `None` when the proxy boots
+    /// PR-D1: AWS credentials source (the `aws-config` default chain,
+    /// asked again before the cached credentials expire; see
+    /// `bedrock::credentials`). `None` when the proxy boots
     /// without AWS creds available (operator running locally
     /// against a non-Bedrock upstream); the Bedrock invoke handler
     /// returns 5xx with a structured `event=bedrock_credentials_missing`
     /// log so failures are LOUD — no silent fallback to unsigned
     /// requests.
-    pub bedrock_credentials: Option<Arc<aws_credential_types::Credentials>>,
+    pub bedrock_credentials: Option<Arc<crate::bedrock::BedrockCredentials>>,
     /// PR-E6: per-session structural-hash LRU for the cache-bust
     /// drift detector. Bounded to 1000 sessions in production. The
     /// detector is read-only — observing it never mutates the
@@ -164,8 +165,17 @@ impl AppState {
     /// modified state; intended to be chained off `AppState::new`.
     /// Tests that don't exercise the Bedrock route can leave
     /// credentials unset (the catch-all paths never read them).
-    pub fn with_bedrock_credentials(mut self, creds: aws_credential_types::Credentials) -> Self {
-        self.bedrock_credentials = Some(Arc::new(creds));
+    pub fn with_bedrock_credentials(self, creds: aws_credential_types::Credentials) -> Self {
+        self.with_bedrock_credentials_source(crate::bedrock::BedrockCredentials::new(creds))
+    }
+
+    /// Attach a credentials source that is asked again before the
+    /// cached credentials expire (temporary IMDS / ECS / SSO creds).
+    pub fn with_bedrock_credentials_source(
+        mut self,
+        source: crate::bedrock::BedrockCredentials,
+    ) -> Self {
+        self.bedrock_credentials = Some(Arc::new(source));
         self
     }
 
@@ -262,7 +272,9 @@ pub fn build_app(state: AppState) -> Router {
         // proxy for everything else.
         .route(
             "/v1/chat/completions",
-            post(crate::handlers::chat_completions::handle_chat_completions),
+            post(crate::handlers::chat_completions::handle_chat_completions)
+                // axum's `Bytes` extractor caps at 2 MiB unless a `DefaultBodyLimit` is set.
+                .layer(DefaultBodyLimit::max(state.config.max_body_bytes as usize)),
         )
         // PR-C3: explicit POST route for /v1/responses. Same forward
         // pattern as /v1/chat/completions — the handler buffers the
@@ -270,7 +282,8 @@ pub fn build_app(state: AppState) -> Router {
         // Responses live-zone walker via `compress_openai_responses_request`.
         .route(
             "/v1/responses",
-            post(crate::handlers::responses::handle_responses),
+            post(crate::handlers::responses::handle_responses)
+                .layer(DefaultBodyLimit::max(state.config.max_body_bytes as usize)),
         )
         // PR-D4: native Vertex publisher path. The Vertex AI Anthropic
         // publisher endpoints look like
