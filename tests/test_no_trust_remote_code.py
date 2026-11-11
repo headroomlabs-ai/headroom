@@ -39,7 +39,14 @@ ASSIGNMENT = re.compile(re.escape(FLAG) + r"[\"']?\s*\]?\s*[=:]\s*\(*\s*(" + _VA
 
 # ``setattr(cfg, "flag", True)`` and ``kwargs.setdefault("flag", True)``: the
 # name is a string literal followed by a comma, not by ``=`` or ``:``.
-NAMED_ARGUMENT = re.compile(r"[\"']" + re.escape(FLAG) + r"[\"']\s*,\s*\(*\s*(" + _VALUE + ")")
+# Only calls that set or default the flag count: ``log.info("flag", True)`` does not.
+NAMED_ARGUMENT = re.compile(
+    r"(?:\b(?:setattr|getattr)\s*\([^,()]*,|\b(?:setdefault|get|pop)\s*\()\s*[\"']"
+    + re.escape(FLAG)
+    + r"[\"']\s*,\s*\(*\s*("
+    + _VALUE
+    + ")"
+)
 
 
 def _values(text: str) -> list[tuple[int, str]]:
@@ -109,6 +116,18 @@ def test_remote_code_is_never_enabled_anywhere_in_the_tree() -> None:
 def test_the_scan_flags_every_truthy_way_to_enable_the_flag(line: str) -> None:
     values = [value for _, value in _values(line)]
     assert values and all(value != "False" for value in values), line
+
+
+@pytest.mark.parametrize(
+    "line",
+    [
+        f'log.info("{FLAG}", True)',
+        f'print("{FLAG}", 1)',
+        f'logger.debug("{FLAG}", enabled)',
+    ],
+)
+def test_the_scan_ignores_calls_that_do_not_set_the_flag(line: str) -> None:
+    assert _values(line) == []
 
 
 def test_the_scan_flags_a_value_on_the_next_line() -> None:
