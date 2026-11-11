@@ -9,7 +9,7 @@ This directory contains templates and scripts for running the headroom proxy ser
 ./install.sh
 
 # Add shell integration to ~/.bashrc or ~/.zshrc
-export HEADROOM_PORT=8787
+export HEADROOM_PROXY_PORT=8787
 source /path/to/shell-integration.sh
 ```
 
