@@ -235,7 +235,7 @@ pub async fn handle_invoke_streaming(
     };
 
     // 3. Resolve credentials. No silent fallback.
-    let creds = match state.bedrock_credentials.as_ref() {
+    let creds_source = match state.bedrock_credentials.as_ref() {
         Some(c) => c.clone(),
         None => {
             tracing::warn!(
@@ -252,6 +252,24 @@ pub async fn handle_invoke_streaming(
             );
         }
     };
+    let creds = match creds_source.get().await {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::error!(
+                event = "bedrock_credentials_refresh_failed",
+                request_id = %request_id,
+                model_id = %model_id,
+                error = %e,
+                "bedrock invoke-streaming: AWS credentials refresh failed; refusing to forward unsigned"
+            );
+            capture::finalize_rejected(pending_stats.take());
+            return error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "bedrock_credentials_refresh_failed",
+                &e.to_string(),
+            );
+        }
+    };
 
     // 4. Build the headers we sign + forward.
     let extra_signed: Vec<(String, String)> = collect_signed_headers(&headers, &upstream_url);
@@ -264,7 +282,7 @@ pub async fn handle_invoke_streaming(
         method: method.as_str(),
         url: &upstream_url,
         region: &state.config.bedrock_region,
-        credentials: creds.as_ref(),
+        credentials: &creds,
         body: &outbound_body,
         extra_signed_headers: &extra_signed_refs,
         time: SystemTime::now(),
