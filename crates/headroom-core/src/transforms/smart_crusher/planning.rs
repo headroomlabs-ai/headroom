@@ -217,13 +217,21 @@ impl<'a> SmartCrusherPlanner<'a> {
         }
 
         // 5/6. Query-anchor matches + relevance scores.
-        self.apply_query_signals(items, query_context, item_strings, &mut keep, false);
+        let query_matches =
+            self.apply_query_signals(items, query_context, item_strings, &mut keep, false);
 
         // TOIN preserve_fields.
         self.apply_preserve_field_matches(items, query_context, preserve_fields, &mut keep);
 
-        let final_keep =
-            prioritize_indices(self.config, &keep, items, n, Some(analysis), max_items);
+        let final_keep = prioritize_indices(
+            self.config,
+            &keep,
+            items,
+            n,
+            Some(analysis),
+            max_items,
+            &query_matches,
+        );
         plan.keep_indices = final_keep.into_iter().collect();
         plan
     }
@@ -406,13 +414,21 @@ impl<'a> SmartCrusherPlanner<'a> {
         }
 
         // 4/5. Query signals.
-        self.apply_query_signals(items, query_context, item_strings, &mut keep, false);
+        let query_matches =
+            self.apply_query_signals(items, query_context, item_strings, &mut keep, false);
 
         // TOIN preserve_fields.
         self.apply_preserve_field_matches(items, query_context, preserve_fields, &mut keep);
 
-        let final_keep =
-            prioritize_indices(self.config, &keep, items, n, Some(analysis), max_items);
+        let final_keep = prioritize_indices(
+            self.config,
+            &keep,
+            items,
+            n,
+            Some(analysis),
+            max_items,
+            &query_matches,
+        );
         plan.keep_indices = final_keep.into_iter().collect();
         plan
     }
@@ -458,13 +474,21 @@ impl<'a> SmartCrusherPlanner<'a> {
         self.apply_constraints(items, item_strings, &mut keep);
 
         // 4/5. Query signals.
-        self.apply_query_signals(items, query_context, item_strings, &mut keep, false);
+        let query_matches =
+            self.apply_query_signals(items, query_context, item_strings, &mut keep, false);
 
         // TOIN preserve_fields.
         self.apply_preserve_field_matches(items, query_context, preserve_fields, &mut keep);
 
-        let final_keep =
-            prioritize_indices(self.config, &keep, items, n, Some(analysis), max_items);
+        let final_keep = prioritize_indices(
+            self.config,
+            &keep,
+            items,
+            n,
+            Some(analysis),
+            max_items,
+            &query_matches,
+        );
         plan.keep_indices = final_keep.into_iter().collect();
         plan
     }
@@ -474,7 +498,8 @@ impl<'a> SmartCrusherPlanner<'a> {
     /// Apply query-anchor matches (deterministic) + relevance scoring
     /// (probabilistic). When `keep_existing_only` is true (top_n's
     /// "additive only" mode), only items not already in keep are added.
-    /// When false, all matches are added.
+    /// When false, all matches are added. Returns the indices added by the
+    /// deterministic anchor match, which `prioritize_indices` keeps.
     fn apply_query_signals(
         &self,
         items: &[Value],
@@ -482,9 +507,10 @@ impl<'a> SmartCrusherPlanner<'a> {
         item_strings: Option<&[String]>,
         keep: &mut BTreeSet<usize>,
         keep_existing_only: bool,
-    ) {
+    ) -> BTreeSet<usize> {
+        let mut anchor_matches = BTreeSet::new();
         if query_context.is_empty() {
-            return;
+            return anchor_matches;
         }
 
         // Deterministic anchor match.
@@ -495,6 +521,7 @@ impl<'a> SmartCrusherPlanner<'a> {
             }
             if item_matches_anchors(item, &anchors) {
                 keep.insert(i);
+                anchor_matches.insert(i);
             }
         }
 
@@ -519,6 +546,7 @@ impl<'a> SmartCrusherPlanner<'a> {
                 keep.insert(i);
             }
         }
+        anchor_matches
     }
 
     fn apply_preserve_field_matches(
