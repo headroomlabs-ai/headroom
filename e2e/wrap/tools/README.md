@@ -1,6 +1,6 @@
 # Wrap E2E CLI dependencies
 
-The Docker harness installs Codex and OpenClaw here using npm 12.2.1 and
+The Docker harness installs Codex and OpenClaw here using npm 12.2.2 and
 `npm ci`. Keep the manifest and lockfile together: pinning only the CLI versions
 still lets transitive dependency ranges change on every image build. That broke
 main during an AWS SDK publication on 2026-09-09 (ETARGET and tarball 404).
@@ -10,7 +10,7 @@ PATH. `npm ci` does not support global installs, so diagnostics must also use
 `npm list --prefix /opt/wrap-tools`.
 
 After editing a CLI version in `package.json`, regenerate the lockfile using
-Node 24.22.1+ within the Node 24 line and npm 12.2.1 on Linux (the pinned
+Node 24.22.1+ within the Node 24 line and npm 12.2.2 on Linux (the pinned
 OpenClaw version no longer supports Node 22):
 
 ```sh
@@ -45,10 +45,10 @@ maintainers. Their install surface includes registry downloads, native optional
 packages and lifecycle scripts, as before. OpenClaw 2026.10.10 and its fixed
 Undici override follow the upstream #4453 security repair.
 
-The raw audit still reports npm 12.2.1's bundled ip-address and Undici copies.
+The raw audit still reports npm 12.2.2's bundled glob and minimatch copies.
 `npm-audit-exceptions.json` records the upstream-approved E2E-only risk
 acceptance, restricted to exact advisory/path/version combinations and expiring
-on 2026-11-15. Security CI rejects other findings and expired or stale entries;
+on 2026-12-15. Security CI rejects other findings and expired or stale entries;
 these exceptions are not a claim that the contained packages are patched.
 
 The root `allowScripts` policy approves only the exact locked install-script

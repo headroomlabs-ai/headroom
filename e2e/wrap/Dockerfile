@@ -94,7 +94,7 @@ RUN ln -s ../lib/node_modules/npm/bin/npm-cli.js /usr/local/bin/npm && \
 # npm 10.9.8 crashes in Arborist's peer-set resolver when installing the local
 # OpenClaw plugin (Cannot read properties of null, reading 'edgesOut'). Pin the
 # tested npm version so both wrap-e2e callers use the same working installer.
-RUN npm install -g --no-fund --no-audit npm@12.2.1
+RUN npm install -g --no-fund --no-audit npm@12.2.2
 
 # Freeze transitive CLI dependencies as well as the top-level versions.
 # Global npm install re-resolves ranges and can select partially published
