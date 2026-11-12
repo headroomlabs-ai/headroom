@@ -22,6 +22,17 @@ MODEL = "fixture"
 PARTITION = "caller"
 RESPONSE = b'{"id":"first-response","choices":[{"message":{"content":"first"}}]}'
 
+# Fields whose value Headroom may legitimately receive as a decoded dict and
+# where ``cache_control`` is application data, not a transport directive. A JSON
+# *string* value (what OpenAI actually sends for ``arguments``) was never at risk:
+# the stripper leaves strings alone at any depth.
+LITERAL_DICT_LOCATIONS = (
+    "tool_input",  # Anthropic tool_use input
+    "tool_arguments_dict",  # OpenAI function.arguments, decoded to a dict
+    "tool_schema",  # Anthropic input_schema default
+    "response_schema",  # OpenAI response_format json_schema const
+)
+
 
 def _payloads(location: str) -> tuple[list[dict], dict]:
     """(messages, key_fields) holding a literal ``cache_control`` at ``location``."""
@@ -41,7 +52,12 @@ def _payloads(location: str) -> tuple[list[dict], dict]:
                 ],
             }
         ]
-    elif location == "tool_arguments":
+    elif location == "tool_arguments_dict":
+        # OpenAI sends ``arguments`` as a JSON *string*, which the old stripper
+        # left alone (see the string guard below). Headroom also tolerates a
+        # decoded dict there -- ``handlers/openai.py`` parses either shape -- and
+        # for that shape the old stripper did erase the field, so this is the
+        # shape that demonstrates the OpenAI-path regression.
         messages = [
             {
                 "role": "assistant",
@@ -85,7 +101,7 @@ def _with_changed_value(messages: list[dict], fields: dict, location: str) -> tu
     messages, fields = copy.deepcopy((messages, fields))
     if location == "tool_input":
         messages[0]["content"][0]["input"]["cache_control"] = "second"
-    elif location == "tool_arguments":
+    elif location == "tool_arguments_dict":
         messages[0]["tool_calls"][0]["function"]["arguments"]["cache_control"] = "second"
     elif location == "tool_schema":
         fields["tools"][0]["input_schema"]["properties"]["value"]["default"]["cache_control"] = (
@@ -96,9 +112,7 @@ def _with_changed_value(messages: list[dict], fields: dict, location: str) -> tu
     return messages, fields
 
 
-@pytest.mark.parametrize(
-    "location", ["tool_input", "tool_arguments", "tool_schema", "response_schema"]
-)
+@pytest.mark.parametrize("location", LITERAL_DICT_LOCATIONS)
 @pytest.mark.asyncio
 async def test_literal_cache_control_does_not_alias_cached_responses(location: str) -> None:
     messages, fields = _payloads(location)
@@ -114,13 +128,40 @@ async def test_literal_cache_control_does_not_alias_cached_responses(location: s
     assert original is not None and original.response_body == RESPONSE
 
 
-@pytest.mark.parametrize("location", ["tool_input", "tool_schema", "response_schema"])
+@pytest.mark.parametrize("location", LITERAL_DICT_LOCATIONS)
 def test_literal_cache_control_changes_the_key(location: str) -> None:
     messages, fields = _payloads(location)
     changed_messages, changed_fields = _with_changed_value(messages, fields, location)
     assert compute_semantic_cache_key(
         messages, MODEL, partition=PARTITION, **fields
     ) != compute_semantic_cache_key(changed_messages, MODEL, partition=PARTITION, **changed_fields)
+
+
+def test_openai_arguments_string_is_not_rewritten() -> None:
+    """OpenAI sends ``arguments`` as a JSON string; it must pass through verbatim.
+
+    This shape was never aliased by the old stripper (strings are returned
+    as-is at any depth), so it is a regression guard, not a bug demonstration.
+    """
+    first = '{"cache_control": "first"}'
+    second = '{"cache_control": "second"}'
+    payload = {"function": {"name": "configure", "arguments": first}}
+    assert strip_cache_control(payload) == payload
+    assert compute_semantic_cache_key(
+        [{"role": "assistant", "content": None, "tool_calls": [{"id": "c", **payload}]}],
+        MODEL,
+        partition=PARTITION,
+    ) != compute_semantic_cache_key(
+        [
+            {
+                "role": "assistant",
+                "content": None,
+                "tool_calls": [{"id": "c", "function": {"name": "configure", "arguments": second}}],
+            }
+        ],
+        MODEL,
+        partition=PARTITION,
+    )
 
 
 def test_transport_cache_control_is_still_ignored() -> None:
