@@ -73,6 +73,7 @@ The default export is `{ id: "headroom", server, setup }`. OpenCode 1.x calls `s
 - add `HEADROOM_ACTIVE`, `HEADROOM_PROXY_URL`, `HEADROOM_PROJECT` (and `HEADROOM_BACKEND` when set) to shell command environments.
 - default to `HEADROOM_PROXY_URL`, then `http://127.0.0.1:8787`, when no `proxyUrl` option is supplied.
 - skip routing for hosts listed in `excludeHosts` (or `HEADROOM_OPENCODE_EXCLUDE_HOSTS`); those requests go straight upstream with no compression or telemetry.
+- route the provider base URLs configured in OpenCode, so a compatible gateway with an arbitrary path prefix is still compressed. Only wire endpoints (`/chat/completions`, `/responses`, `/messages`) under a configured base route; other paths on that host pass through.
 
 On 2.x, setup returns a cleanup that releases the transport, so hot reloads do not stack interceptors.
 
@@ -140,6 +141,7 @@ The provider config exposes these as `headroom/<model>` and defaults to `headroo
 |---|---|---|
 | `HEADROOM_PROXY_URL` | Native plugin | Proxy URL used by `HeadroomPlugin` |
 | `HEADROOM_OPENCODE_EXCLUDE_HOSTS` | Native plugin | Comma-separated hosts (and their subdomains) that bypass the proxy; the `excludeHosts` plugin option takes precedence |
+| `HEADROOM_OPENCODE_WIRE_ROOTS` | Native plugin | Set from OpenCode's configured provider base URLs so spawned Node processes route the same bases; rarely set by hand |
 | `OPENCODE_CONFIG_CONTENT` | OpenCode wrapper | Generated OpenCode provider, model, and MCP config |
 
 ## License
