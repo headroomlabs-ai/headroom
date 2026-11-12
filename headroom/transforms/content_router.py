@@ -5479,10 +5479,13 @@ class ContentRouter(Transform):
                     self._code_compressor = CodeAwareCompressor(
                         CodeCompressorConfig(
                             enable_ccr=self.config.ccr_inject_marker,
-                            # The code compressor's Kompress fallback builds its
-                            # own KompressCompressor, so it must honour the same
-                            # switch as _get_kompress() (#4719).
-                            fallback_to_kompress=self.config.enable_kompress,
+                            # Never let the code compressor fall back to Kompress
+                            # internally (unknown language, Perl, no tree-sitter,
+                            # AST failure). Kompress is a prose model and drops
+                            # keywords from code (#4214). A block the code
+                            # compressor cannot handle stays unchanged, whether or
+                            # not Kompress is enabled for prose (#4719).
+                            fallback_to_kompress=False,
                         )
                     )
                 else:

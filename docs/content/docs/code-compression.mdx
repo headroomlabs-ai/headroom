@@ -109,7 +109,7 @@ result = compressor.compress(code)
 | `max_body_lines` | `5` | Max lines to keep per function body |
 | `min_tokens_for_compression` | `100` | Skip files smaller than this |
 | `language_hint` | `None` | Override language detection |
-| `fallback_to_kompress` | `True` | Use Kompress for unsupported languages |
+| `fallback_to_kompress` | `True` | Use Kompress for unsupported languages. `ContentRouter` (the proxy and `compress()`) always sets it to `False`, so code it routes is never sent to Kompress |
 
 ## Before and After
 
