@@ -89,6 +89,52 @@ def test_a_check_that_cannot_run_keeps_serving_the_cached_result(monkeypatch):
     assert cache.get("k") == ("head <<ccr:0123456789abcdef>>", 0.2, "x")
 
 
+def test_an_outage_is_not_an_eviction(ccr_store, monkeypatch):
+    """A store that cannot answer must not cost us a still-valid result.
+
+    Both shared backends report a failed read as "not found", so a liveness
+    check on the return value alone would evict a cached result during a
+    Redis or SQLite outage — and the original is still there afterwards.
+    """
+    hash_key = ccr_store.store("the original tool output", "the compressed view")
+    cache = CompressionCache()
+    cache.put("k", f"head <<ccr:{hash_key}>>", 0.2, "x")
+    assert cache.get("k") is not None
+
+    monkeypatch.setattr(ccr_store, "all_live", lambda hash_keys: None)
+    assert cache.get("k") is not None, "an unanswered check is not a miss"
+    assert cache.stats["cache_evictions"] == 0
+    assert ccr_store.exists(hash_key), "the original is untouched"
+
+    # The store recovers and the entry is genuinely gone: now it is a miss.
+    monkeypatch.undo()
+    ccr_store.store("an unrelated tool output", "its compressed view")
+    ccr_store.store("a third tool output", "its compressed view")
+    assert cache.get("k") is None
+    assert cache.stats["cache_evictions"] == 1
+
+
+def test_all_live_reports_a_backend_that_cannot_answer():
+    class Unavailable(InMemoryBackend):
+        def get(self, hash_key):
+            return None
+
+        def available(self):
+            return False
+
+    store = CompressionStore(max_entries=4, backend=Unavailable())
+    assert store.all_live({"abc"}) is None
+
+    class Reachable(InMemoryBackend):
+        def available(self):
+            return True
+
+    live = CompressionStore(max_entries=4, backend=Reachable())
+    assert live.all_live({"abc"}) is False
+    hash_key = live.store("an original", "a compressed view")
+    assert live.all_live({hash_key}) is True
+
+
 def test_every_marker_shape_is_read_for_its_hash():
     assert _ccr_marker_hashes(
         "a <<ccr:abcdef012345>> b <<ccr:1234567890ab,base64,2.0KB>> "
