@@ -907,12 +907,9 @@ class StreamingMixin:
         client: str | None = None,
         waste_signals: dict[str, int] | None = None,
         status_code: int = 200,
-        # Set only by paths whose ``tokens_saved`` is the CONVERSATION's
-        # running total rather than this turn's -- OpenAI ``/v1/responses``,
-        # which re-sends and recompresses the whole transcript every turn.
-        # See ``conversation_savings``.
+        # Set by paths that know the conversation (OpenAI ``/v1/responses``),
+        # for attribution only. See ``RequestOutcome.conversation_key``.
         conversation_key: str | None = None,
-        conversation_tokens_saved: int | None = None,
         savings_measure: ItemMeasure | None = None,
     ) -> None:
         from headroom.proxy.outcome import RequestOutcome
@@ -1141,7 +1138,6 @@ class StreamingMixin:
             original_messages=original_messages,
             waste_signals=waste_signals,
             conversation_key=conversation_key,
-            conversation_tokens_saved=conversation_tokens_saved,
             savings_measure=savings_measure,
         )
         await self._record_request_outcome(outcome)
@@ -1173,7 +1169,6 @@ class StreamingMixin:
         waste_signals: dict[str, int] | None = None,
         session_key: str | None = None,
         conversation_key: str | None = None,
-        conversation_tokens_saved: int | None = None,
         savings_measure: ItemMeasure | None = None,
         server_memory_tool_names: frozenset[str] | None = None,
         client_beta: str | None = None,
@@ -1222,7 +1217,6 @@ class StreamingMixin:
                 waste_signals=waste_signals,
                 session_key=session_key,
                 conversation_key=conversation_key,
-                conversation_tokens_saved=conversation_tokens_saved,
                 savings_measure=savings_measure,
                 server_memory_tool_names=server_memory_tool_names,
                 client_beta=client_beta,
@@ -1258,7 +1252,6 @@ class StreamingMixin:
         waste_signals: dict[str, int] | None,
         session_key: str,
         conversation_key: str | None = None,
-        conversation_tokens_saved: int | None = None,
         savings_measure: ItemMeasure | None = None,
         server_memory_tool_names: frozenset[str] | None = None,
         client_beta: str | None = None,
@@ -1698,7 +1691,6 @@ class StreamingMixin:
                 waste_signals=waste_signals,
                 status_code=upstream_response.status_code,
                 conversation_key=conversation_key,
-                conversation_tokens_saved=conversation_tokens_saved,
                 savings_measure=savings_measure,
             )
             self._cleanup_mid_turn_stream(session_key)
@@ -2161,7 +2153,6 @@ class StreamingMixin:
                         completed_normally or client_left_after_terminal,
                     ),
                     conversation_key=conversation_key,
-                    conversation_tokens_saved=conversation_tokens_saved,
                     savings_measure=savings_measure,
                 )
                 if supports_mid_turn_coalescing(client) and pending_messages:

@@ -989,7 +989,7 @@ def test_handle_openai_responses_ws_closes_unconfigured_origin(monkeypatch):
     assert websocket.accepted_subprotocol is None
 
 
-# --- conversation savings through the handler and the funnel ----------------
+# --- savings through the handler and the funnel ---------------------------
 
 _SHARED_INSTRUCTIONS = "You are Codex, a coding agent running in the user's terminal. " * 20
 
@@ -998,9 +998,6 @@ def _savings_handler(monkeypatch, saved: int) -> _DummyOpenAIHandler:
     """A responses handler whose compression removes ``saved`` tokens per
     request and whose metrics call is captured, so the funnel's booked
     ``tokens_saved`` can be read back."""
-    from headroom.proxy.conversation_savings import reset_conversation_savings
-
-    reset_conversation_savings()
     handler = _DummyOpenAIHandler()
     handler.config.optimize = True
     handler.metrics.record_request = AsyncMock()
@@ -1023,25 +1020,11 @@ def _booked(handler: _DummyOpenAIHandler) -> list[int]:
     return [c.kwargs["tokens_saved"] for c in handler.metrics.record_request.await_args_list]
 
 
-def test_responses_savings_keep_per_request_accounting_without_identity(monkeypatch):
-    # Two independent conversations: same model, same instructions, different
-    # input, no conversation id anywhere. Each books its own 100.
+def test_responses_savings_book_every_request_whatever_the_identity(monkeypatch):
+    # Each request books what was removed from it, as on the Anthropic path:
+    # a full-transcript replay re-books the removals it carries, and no
+    # conversation id, session header or cache key changes that.
     handler = _savings_handler(monkeypatch, saved=100)
-    _post_responses(
-        handler,
-        {"model": "gpt-5.4", "instructions": _SHARED_INSTRUCTIONS, "input": "fix the failing test"},
-    )
-    _post_responses(
-        handler,
-        {"model": "gpt-5.4", "instructions": _SHARED_INSTRUCTIONS, "input": "write the notes"},
-    )
-    assert _booked(handler) == [100, 100]
-
-
-def test_responses_savings_dedupe_full_transcripts_but_not_incremental_input(monkeypatch):
-    handler = _savings_handler(monkeypatch, saved=100)
-    # Full-transcript replay under an explicit conversation id: the second
-    # turn re-sends the first and its 100 is the same 100.
     turn1 = {
         "model": "gpt-5.4",
         "instructions": _SHARED_INSTRUCTIONS,
@@ -1051,49 +1034,18 @@ def test_responses_savings_dedupe_full_transcripts_but_not_incremental_input(mon
     turn2 = {**turn1, "input": [*turn1["input"], {"role": "user", "content": "and the lint"}]}
     _post_responses(handler, turn1)
     _post_responses(handler, turn2)
-    assert _booked(handler) == [100, 0]
-    # Same conversation id, but each request is fresh input against
-    # previous_response_id: the provider holds the history, so each 100 is
-    # its own removal.
-    inc1 = {
+    inc = {
         "model": "gpt-5.4",
         "metadata": {"conversation_id": "conv-1"},
         "previous_response_id": "resp_1",
         "input": [{"role": "user", "content": "more"}],
     }
-    _post_responses(handler, inc1)
-    _post_responses(handler, {**inc1, "previous_response_id": "resp_2"})
-    assert _booked(handler) == [100, 0, 100, 100]
-
-
-def test_responses_savings_ignore_a_shared_prompt_cache_key(monkeypatch):
-    # prompt_cache_key groups cache routing; OpenAI documents one key shared
-    # across a user's sessions and forks. Two conversations under one key,
-    # with and without distinct session headers, each keep their own 100.
-    handler = _savings_handler(monkeypatch, saved=100)
-    shared = {"model": "gpt-5.4", "prompt_cache_key": "shared-support-prefix"}
-    _post_responses(
-        handler, {**shared, "input": "fix the failing test"}, {"session_id": "session-0"}
-    )
-    _post_responses(handler, {**shared, "input": "write the notes"}, {"session_id": "session-1"})
-    assert _booked(handler) == [100, 100]
-    _post_responses(handler, {**shared, "input": "fix the failing test"})
-    _post_responses(handler, {**shared, "input": "write the notes"})
-    assert _booked(handler) == [100, 100, 100, 100]
-    # The session header, not the cache key, is what de-duplicates.
-    _post_responses(
-        handler, {**shared, "input": "fix the failing test"}, {"session_id": "session-0"}
-    )
-    assert _booked(handler) == [100, 100, 100, 100, 0]
-
-
-def test_responses_savings_accept_a_session_header_as_identity(monkeypatch):
-    handler = _savings_handler(monkeypatch, saved=100)
-    body = {"model": "gpt-5.4", "instructions": _SHARED_INSTRUCTIONS, "input": "fix it"}
+    _post_responses(handler, inc)
+    body = {"model": "gpt-5.4", "prompt_cache_key": "shared", "input": "fix it"}
     _post_responses(handler, body, {"session_id": "sess-1"})
     _post_responses(handler, body, {"session_id": "sess-1"})
-    _post_responses(handler, body, {"session_id": "sess-2"})
-    assert _booked(handler) == [100, 0, 100]
+    _post_responses(handler, {"model": "gpt-5.4", "input": "write the notes"})
+    assert _booked(handler) == [100] * 6
 
 
 def test_handle_openai_responses_memory_lookup_exception_fails_open_and_forwards_original_request(
