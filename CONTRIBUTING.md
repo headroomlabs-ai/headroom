@@ -88,27 +88,11 @@ A human maintainer reviews every dep change. PRs that add or bump a package must
 
 ## Posting PR/issue comments from scripts or agents
 
-Scripted replies can succeed (`gh api` exits 0) while posting garbage. Build the body from a single string, send it as JSON or a file, and read it back before reporting success. The example below replies to existing PR review comments; issue comments and top-level PR comments use the issue-comment endpoints.
+A successful API call (exit 0) only proves a comment was created, not that its body is right. Scripts must:
 
-```powershell
-# Wrong: passes the whole hashtable; the reply body becomes "System.Collections.Hashtable"
-foreach ($k in $m.Keys) { gh api "$r/$k/replies" -f body=$m }
-
-# Right: one string per call, sent via --input, then verified
-foreach ($k in $m.Keys) {
-  $tmp = New-TemporaryFile
-  @{ body = [string]$m[$k] } | ConvertTo-Json | Set-Content -Encoding utf8 $tmp
-  $reply = gh api "$r/$k/replies" --input $tmp | ConvertFrom-Json
-  Remove-Item $tmp
-  gh api "repos/<owner>/<repo>/pulls/comments/$($reply.id)" --jq .body   # confirm it reads as intended
-}
-```
-
-- Never pass a collection to `-f`/`-F`; index it (`$m[$k]`) first.
-- For `gh api`, use `--input <json-file>`. Commands such as `gh issue comment` and `gh pr comment` accept `--body-file`. Prefer these file inputs over inline multi-line strings; PowerShell has no `<<` heredocs.
-- After posting, re-fetch the comment and check the body. A successful POST only proves a comment was created.
-- A body that is a bare type name such as `System.Collections.Hashtable` means the script stringified an object. Delete a malformed PR review comment with `gh api -X DELETE repos/<owner>/<repo>/pulls/comments/<id>`, or an issue/top-level PR comment with `gh api -X DELETE repos/<owner>/<repo>/issues/comments/<id>`, then repost.
-
+- Pass the body as a single plain string via a file (`gh pr comment --body-file`, `gh issue comment --body-file`, or `gh api --input <json-file>`). Avoid inline multi-line strings, which differ across shells, and never pass a collection or object as a field value (`-f body=...`).
+- Re-fetch the posted comment and confirm the body reads as intended before reporting success.
+- If the body is a bare type name (e.g. `System.Collections.Hashtable`) or otherwise garbled, delete it and repost: `gh api -X DELETE repos/<owner>/<repo>/pulls/comments/<id>` for review comments, `.../issues/comments/<id>` for issue and top-level PR comments.
 ## Development setup
 
 ```bash
