@@ -2035,8 +2035,9 @@ class CompressionCache:
                     del self._disk_writes[key]
 
     def mark_skip(self, key: str) -> None:
-        """Replace any result with a non-compressible verdict (Tier 1)."""
-        self.move_to_skip(key)
+        """Mark content as non-compressible (Tier 1).  Thread-safe."""
+        with self._lock:
+            self._skip_locked(key)
 
     def move_to_skip(self, key: str) -> None:
         """Move a result to skip set (threshold tightened, no longer qualifies).
