@@ -226,6 +226,32 @@ def _test_core_integrity() -> bool:
         return False
 
 
+def _installed_version_after_upgrade() -> str | None:
+    """Read the installed headroom-ai version from a fresh interpreter.
+
+    A package manager can exit 0 without upgrading (a pip pin or constraint
+    keeps the old release), so the exit code alone does not prove the upgrade
+    landed (#4253). A new process sees the distribution metadata as it is on
+    disk now, not as this process cached it at import.
+
+    Returns None when the version cannot be read.
+    """
+    probe = f"from importlib.metadata import version; print(version({PACKAGE_NAME!r}))"
+    try:
+        result = _subprocess_run(
+            [sys.executable, "-c", probe],
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+    except Exception:
+        return None
+    if result.returncode != 0:
+        return None
+    version = (result.stdout or "").strip()
+    return version or None
+
+
 def safe_update(argv: list[str]) -> int:
     """Execute update with protection against .pyd corruption on Windows.
 
@@ -519,8 +545,28 @@ def update(check_only: bool, assume_yes: bool, allow_pre: bool, extras: str | No
     if returncode != 0:
         raise click.ClickException(f"Upgrade failed (exit {returncode}). Run manually: {cmd_str}")
 
+    installed = _installed_version_after_upgrade()
+    if installed is None:
+        click.echo("The upgrade command finished, but the installed version could not be read.")
+        click.echo("Run `headroom --version` to confirm it.")
+        click.echo("Restart any running `headroom proxy` to pick up the new version.")
+        return
+
+    from packaging.version import InvalidVersion, Version
+
+    try:
+        reached = Version(installed) >= Version(latest)
+    except InvalidVersion:
+        reached = installed == latest
+    if not reached:
+        raise click.ClickException(
+            f"The upgrade command exited 0, but {PACKAGE_NAME} {installed} is still "
+            f"installed (expected {latest}). A version pin or pip constraint may be "
+            f"holding it back. Run manually: {cmd_str}"
+        )
+
     # ASCII-only output — emoji can raise UnicodeEncodeError on some Windows consoles.
-    click.echo(f"Headroom upgraded to {latest}.")
+    click.echo(f"Headroom upgraded to {installed}.")
     click.echo("Restart any running `headroom proxy` to pick up the new version.")
 
 
