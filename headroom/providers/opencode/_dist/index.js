@@ -20140,7 +20140,7 @@ function withRoutedFetchInput(input2, init, proxy, project, excludeHosts, sessio
   }
   return [nextUrl, nextInit];
 }
-function splitNodeArgs(args) {
+function splitNodeArgs(args, defaultProtocol) {
   const callback = typeof args.at(-1) === "function" ? args.at(-1) : void 0;
   const withoutCallback = callback ? args.slice(0, -1) : args;
   const [first, second] = withoutCallback;
@@ -20157,12 +20157,12 @@ function splitNodeArgs(args) {
   }
   if (typeof first === "object" && first !== null) {
     const requestOptions = { ...first, ...options };
-    return { url: urlFromRequestOptions(requestOptions), options: requestOptions, callback };
+    return { url: urlFromRequestOptions(requestOptions, defaultProtocol), options: requestOptions, callback };
   }
   return { options, callback };
 }
-function urlFromRequestOptions(options) {
-  const protocol = String(options.protocol ?? "http:");
+function urlFromRequestOptions(options, defaultProtocol) {
+  const protocol = String(options.protocol ?? defaultProtocol);
   if (protocol !== "http:" && protocol !== "https:") {
     return void 0;
   }
@@ -20242,7 +20242,7 @@ function wrapRequest(originalHttpRequest, originalHttpsRequest, originalRequest)
     if (!proxy) {
       return Reflect.apply(originalRequest, this, args);
     }
-    const parts = splitNodeArgs(args);
+    const parts = splitNodeArgs(args, originalRequest === originalHttpsRequest ? "https:" : "http:");
     const nextOptions = routedNodeOptions(
       parts,
       proxy,

@@ -172,6 +172,141 @@ class TestSemanticCache:
         # A lookup for a hash that isn't stored is a miss, not a wrong hit.
         assert cache.get("continue", messages_hash="hB") is None
 
+    @pytest.mark.parametrize("context", [False, True])
+    @pytest.mark.parametrize("namespace", ["", "provider/model"])
+    def test_successful_update_refreshes_lru(self, context, namespace):
+        cache = SemanticCache(SemanticCacheConfig(max_entries=2))
+        first_hash, second_hash = ("first-context", "second-context") if context else (None, None)
+        cache.put("first", "old", first_hash, namespace)
+        cache.put("second", "two", second_hash, namespace)
+        cache.put("first", "updated", first_hash, namespace)
+        assert cache.get_stats()["evictions"] == 0
+
+        # Looking up first before this insertion would refresh it and hide the bug.
+        cache.put("third", "three", "third-context" if context else None, namespace)
+
+        first = cache.get("first", first_hash, namespace)
+        assert first is not None and first.response == "updated"
+        assert cache.get("second", second_hash, namespace) is None
+        assert cache.get_stats()["entries"] == 2
+        assert cache.get_stats()["evictions"] == 1
+
+    def test_failed_update_does_not_refresh_lru(self):
+        def embed(query):
+            return [1.0, 0.0]
+
+        cache = SemanticCache(SemanticCacheConfig(max_entries=2), embedding_fn=embed)
+        cache.put("first", "one", "first")
+        cache.put("second", "two", "second")
+
+        def unavailable(query):
+            raise RuntimeError("embedding service offline")
+
+        cache._embedding_fn = unavailable
+        with pytest.raises(RuntimeError, match="embedding service offline"):
+            cache.put("first", "replacement", "first")
+        cache._embedding_fn = None
+        cache.put("third", "three", "third")
+
+        assert cache.get("first", "first") is None
+        assert cache.get("second", "second").response == "two"
+
+    def test_concurrent_update_does_not_interrupt_similarity_scan(self, monkeypatch):
+        import threading
+
+        cache = SemanticCache(embedding_fn=lambda query: [1.0, 0.0])
+        cache.put("first", "old", "first")
+        cache.put("second", "two", "second")
+        scanning, release, writer_progress = threading.Event(), threading.Event(), threading.Event()
+        real_lock = threading.RLock()
+
+        class SignalsWriterLock:
+            def __enter__(self):
+                if threading.current_thread().name == "cache-update":
+                    writer_progress.set()
+                return real_lock.__enter__()
+
+            def __exit__(self, *exc):
+                return real_lock.__exit__(*exc)
+
+        # Also works on the old implementation, which does not use this lock.
+        cache._lock = SignalsWriterLock()
+        real_similarity = cache._cosine_similarity
+
+        def paused_similarity(a, b):
+            if not scanning.is_set():
+                scanning.set()
+                assert release.wait(5)
+            return real_similarity(a, b)
+
+        monkeypatch.setattr(cache, "_cosine_similarity", paused_similarity)
+        errors, results = [], []
+
+        def read():
+            try:
+                results.append(cache.get("third", "third"))
+            except Exception as exc:
+                errors.append(exc)
+
+        def update():
+            try:
+                cache.put("first", "updated", "first")
+            except Exception as exc:
+                errors.append(exc)
+            finally:
+                # Old code reaches here during the scan; synchronized code
+                # signals at lock acquisition and waits for the scan instead.
+                writer_progress.set()
+
+        reader = threading.Thread(target=read)
+        writer = threading.Thread(target=update, name="cache-update")
+        reader.start()
+        try:
+            assert scanning.wait(5)
+            writer.start()
+            assert writer_progress.wait(5)
+        finally:
+            release.set()
+            reader.join(5)
+            if writer.ident is not None:
+                writer.join(5)
+        assert not reader.is_alive() and not writer.is_alive()
+        assert errors == []
+        assert len(results) == 1 and results[0] is not None
+        assert results[0].response in ("old", "updated")
+        assert cache.get("first", "first").response == "updated"
+
+    def test_embedding_callback_does_not_block_exact_hits(self):
+        import threading
+
+        started, release = threading.Event(), threading.Event()
+
+        def embed(query):
+            if query == "slow":
+                started.set()
+                assert release.wait(5)
+            return [1.0, 0.0]
+
+        cache = SemanticCache(embedding_fn=embed)
+        cache.put("first", "one", "first")
+        errors = []
+
+        def lookup():
+            try:
+                cache.get("slow", "slow")
+            except Exception as exc:
+                errors.append(exc)
+
+        reader = threading.Thread(target=lookup)
+        reader.start()
+        try:
+            assert started.wait(5)
+            assert cache.get("first", "first").response == "one"
+        finally:
+            release.set()
+            reader.join(5)
+        assert not reader.is_alive() and errors == []
+
     def test_lru_eviction(self):
         """Test LRU eviction when at capacity."""
         config = SemanticCacheConfig(max_entries=3)
