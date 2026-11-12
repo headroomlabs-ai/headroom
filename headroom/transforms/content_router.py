@@ -160,6 +160,40 @@ def _is_already_compressed(text: str) -> bool:
     return any(marker in text for marker in _ALREADY_COMPRESSED_MARKERS)
 
 
+# The hash inside a retrieval marker, in every shape listed above. The lower
+# bound is 12 hex chars: the Rust row-drop path emits SHA-256[:12].
+_CCR_MARKER_HASH_RE = re.compile(
+    r"(?:Retrieve (?:more|original): hash=|<<ccr:)([0-9a-fA-F]{12,64})(?![0-9a-fA-F])"
+)
+
+
+def _ccr_marker_hashes(text: str) -> set[str]:
+    """Lowercased hashes referenced by the retrieval markers in ``text``."""
+    return {match.group(1).lower() for match in _CCR_MARKER_HASH_RE.finditer(text)}
+
+
+def _ccr_markers_live(text: str) -> bool:
+    """Whether every retrieval marker in ``text`` still resolves.
+
+    A marker is a pointer, so it is only as good as the CCR entry behind it.
+    Nothing to check (no marker) is live by definition. A store that is absent
+    or failing keeps the previous behaviour (serve the text): a liveness check
+    that cannot run must not turn cached output into a miss, and a miss only
+    costs a recompression anyway — the marker it would produce is no better.
+    """
+    hashes = _ccr_marker_hashes(text)
+    if not hashes:
+        return True
+    try:
+        from ..cache.compression_store import get_compression_store
+
+        store = get_compression_store()
+        return all(store.exists(hash_key) for hash_key in hashes)
+    except Exception:  # noqa: BLE001 - never break a request over a cache check
+        logger.debug("CCR marker liveness check failed", exc_info=True)
+        return True
+
+
 def _estimate_tokens(text: str) -> int:
     """Size-proportional token estimate for section ratio decisions.
 
@@ -1918,6 +1952,7 @@ class CompressionCache:
         Use is_skipped() first to check if content is known non-compressible.
         """
         t0 = time.perf_counter_ns()
+        self._drop_if_a_marker_died(key)
         with self._lock:
             hit = self._memory_hit_locked(key, t0)
             if hit is not None:
@@ -1957,6 +1992,34 @@ class CompressionCache:
                 self._misses += 1
             self._record_lookup(t0)
         return found
+
+    def _drop_if_a_marker_died(self, key: str) -> None:
+        """Forget a result whose CCR originals are gone (#4796).
+
+        The CCR entry behind a marker can disappear long before this result
+        does: the store evicts by capacity and expires by its own TTL, while a
+        re-compression of the same content hashes to the SAME key. So the
+        marker it hands back can never point at a live entry again, and only a
+        miss here restores that original. Serving it would answer the model
+        with a pointer that 404s on retrieve.
+
+        Runs outside ``_lock`` on purpose: the store can be remote (Redis).
+        Losing the race is harmless — the entry is re-read under the lock and a
+        stale one would have been expired by its marker ttl anyway.
+        """
+        with self._lock:
+            entry = self._results.get(key)
+            if entry is None or not entry[5]:
+                return
+            compressed = entry[0]
+        if _ccr_markers_live(compressed):
+            return
+        with self._lock:
+            entry = self._results.get(key)
+            if entry is None or entry[0] != compressed:
+                return  # replaced meanwhile; that text has its own markers
+            self._drop_locked(key)
+            self._evictions += 1
 
     def _memory_hit_locked(self, key: str, t0: int) -> tuple[str, float, str] | None:
         """Serve ``key`` from memory if present and unexpired; drop it if expired.

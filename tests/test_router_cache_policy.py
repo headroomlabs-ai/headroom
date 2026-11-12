@@ -17,6 +17,7 @@ from headroom.transforms.content_router import (
 )
 
 TEXT = "The service reports useful observations about the current deployment. " * 80
+MARKER_HASH = "0123456789abcdef"
 
 
 class Tokenizer:
@@ -72,7 +73,12 @@ def install_compressor(monkeypatch, router, *, skip_first=False, marked=False):
         skip = disabled or (skip_first and len(calls) == 1)
         compressed = content if skip else f"compressed under policy {len(calls)}"
         if marked and not skip:
-            compressed += " <<ccr:0123456789abcdef>>"
+            # The cache refuses to serve a result whose marker no longer
+            # resolves (#4796), so back the marker with a real entry.
+            from headroom.cache.compression_store import get_compression_store
+
+            get_compression_store().store(content, compressed, explicit_hash=MARKER_HASH)
+            compressed += f" <<ccr:{MARKER_HASH}>>"
         return SimpleNamespace(
             original=content,
             compressed=compressed,
