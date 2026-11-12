@@ -3952,6 +3952,9 @@ class OpenAIHandlerMixin:
             "reasoning_effort": body.get("reasoning_effort"),
             "verbosity": body.get("verbosity"),
             "modalities": body.get("modalities"),
+            # Voice and output format shape an audio reply as much as modalities
+            # does; without them a voice/format change replays other audio (#4276).
+            "audio": body.get("audio"),
         }
         # Snapshot the lookup messages too. `messages` is the primary cache
         # key component, but the pre_compress hook below reassigns it, so
