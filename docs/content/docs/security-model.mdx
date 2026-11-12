@@ -285,7 +285,7 @@ network callers, the same fields a dashboard CIDR peer sees:
 
 | Endpoint | Fields a token holder also sees |
 |---|---|
-| `/stats` (and `/stats?cached=1`) | `recent_requests` and `request_logs`: request ids, timestamps, providers, models, token counts, transforms applied, tags, error text. Never prompt or response content. Plus `config`: backend and savings profile, and `savings.by_dimension` ([attribution](/docs/attribution) labels). |
+| `/stats` (and `/stats?cached=1`) | `recent_requests` and `request_logs`: request ids, timestamps, providers, models, token counts, transforms applied, tags, error text. Never prompt or response content. Plus `config`: backend and savings profile. Plus `savings.by_dimension` and `persistent_savings.by_dimension`: savings per [attribution](/docs/attribution) label. |
 | `/stats-lifetime` | `projects` (per-project savings), `by_dimension` (savings per attribution label) and `persistence.error` |
 
 That is what a dashboard behind an authenticating reverse proxy needs. The reverse proxy

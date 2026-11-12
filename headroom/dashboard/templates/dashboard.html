@@ -1663,7 +1663,7 @@
                                     </tr>
                                 </thead>
                                 <tbody class="divide-y divide-border">
-                                    <template x-for="[label, info] in Object.entries((lifetimeStats.by_dimension || {})[dim] || {})" :key="dim + ':' + label">
+                                    <template x-for="[label, info] in Object.entries((lifetimeStats.by_dimension || {})[dim] || {}).sort((a, b) => (b[1].tokens_saved || 0) - (a[1].tokens_saved || 0))" :key="dim + ':' + label">
                                         <tr class="hover:bg-border/30 transition-colors">
                                             <td class="px-4 py-3 text-left truncate">
                                                 <span class="px-2 py-0.5 bg-border text-xs font-mono" x-text="label"></span>

@@ -865,6 +865,14 @@ def _empty_dimension_entry() -> dict[str, Any]:
     return entry
 
 
+def _dimension_rank(labels: dict[str, dict[str, Any]]) -> tuple[int, str]:
+    """Eviction order for a whole dimension: least saved, then least recent."""
+    return (
+        sum(entry["tokens_saved"] for entry in labels.values()),
+        max((entry["last_activity_at"] or "" for entry in labels.values()), default=""),
+    )
+
+
 def _normalize_dimensions(raw: Any) -> dict[str, dict[str, dict[str, Any]]]:
     """Validate persisted ``dimensions``: ``{dimension: {label: entry}}``."""
     from headroom.proxy.attribution import sanitize_dimension_name, sanitize_label
@@ -878,7 +886,7 @@ def _normalize_dimensions(raw: Any) -> dict[str, dict[str, dict[str, Any]]]:
             continue
         cleaned: dict[str, dict[str, Any]] = {}
         for label_name, entry in labels.items():
-            label = sanitize_label(label_name)
+            label = sanitize_label(label_name, decode=False)
             if label is None or not isinstance(entry, dict):
                 continue
             normalized = _empty_dimension_entry()
@@ -1708,9 +1716,15 @@ class SavingsTracker:
         from headroom.proxy.attribution import normalize_attribution
 
         dimensions: dict[str, dict[str, dict[str, Any]]] = self._state.setdefault("dimensions", {})
-        for dim, label in normalize_attribution(attribution).items():
+        labelled = normalize_attribution(attribution)
+        for dim, label in labelled.items():
             if dim not in dimensions and len(dimensions) >= DEFAULT_MAX_DIMENSIONS:
-                continue
+                # Same rule as labels: the smallest, oldest dimension makes
+                # room, so names seen once cannot hold the slots for good.
+                idle = [name for name in dimensions if name not in labelled]
+                if not idle:
+                    continue
+                del dimensions[min(idle, key=lambda name: _dimension_rank(dimensions[name]))]
             labels = dimensions.setdefault(dim, {})
             entry = labels.setdefault(label, _empty_dimension_entry())
             entry["requests"] += 1

@@ -85,6 +85,28 @@ def test_labels_per_dimension_are_capped_keeping_the_largest(tmp_path):
     assert "h000" not in hosts
 
 
+def test_a_new_dimension_evicts_the_smallest_idle_one(tmp_path):
+    from headroom.proxy.savings_tracker import DEFAULT_MAX_DIMENSIONS
+
+    tracker = SavingsTracker(path=tmp_path / "savings.json")
+    crowd = {f"junk{i}": "x" for i in range(DEFAULT_MAX_DIMENSIONS - 1)}
+    tracker.record_request(model="gpt-4o", input_tokens=10, tokens_saved=1, attribution=crowd)
+    tracker.record_request(
+        model="gpt-4o", input_tokens=600, tokens_saved=400, attribution={"team": "infra"}
+    )
+    assert len(tracker.snapshot()["by_dimension"]) == DEFAULT_MAX_DIMENSIONS
+    # Full. A dimension seen now takes the place of a small idle one, not of
+    # the one with real savings, and the cap holds.
+    tracker.record_request(
+        model="gpt-4o", input_tokens=300, tokens_saved=100, attribution={"client": "codex"}
+    )
+    by_dim = tracker.snapshot()["by_dimension"]
+    assert len(by_dim) == DEFAULT_MAX_DIMENSIONS
+    assert by_dim["client"]["codex"]["tokens_saved"] == 100
+    assert by_dim["team"]["infra"]["tokens_saved"] == 400
+    assert sum(name.startswith("junk") for name in by_dim) == DEFAULT_MAX_DIMENSIONS - 2
+
+
 def test_state_without_dimensions_loads_and_garbage_is_dropped(tmp_path):
     path = tmp_path / "savings.json"
     tracker = SavingsTracker(path=path)
@@ -157,6 +179,47 @@ def test_ledger_groups_and_filters_by_dimension(tmp_path):
     assert scoped.to_dict()["where"] == {"host": "studio"}
 
 
+def test_ledger_refuses_to_group_by_a_name_that_is_a_row_field(tmp_path):
+    path = tmp_path / "events.jsonl"
+    _event(path, 400, dims={"calls": "infra", "host": "studio"})
+    _event(path, 100, dims={"calls": "web"})
+    for name in sorted(savings_ledger.ROW_FIELDS):
+        with pytest.raises(ValueError, match=name):
+            savings_ledger.aggregate_savings(path, group_by=[name])
+    # The label is still recorded and still filters; nothing was merged away.
+    report = savings_ledger.aggregate_savings(path, group_by=["host"], where={"calls": "infra"})
+    assert report.lifetime["tokens_saved"] == 400
+    assert [(row["host"], row["calls"]) for row in report.by_dimension["host"]] == [("studio", 1)]
+    assert "calls" in report.dimensions
+
+
+def test_ledger_rejects_names_that_are_not_dimensions(tmp_path):
+    path = tmp_path / "events.jsonl"
+    _event(path, 400, dims={"team": "infra"})
+    with pytest.raises(ValueError, match="cost center"):
+        savings_ledger.aggregate_savings(path, where={"cost center": "42"})
+    with pytest.raises(ValueError, match="cost center"):
+        savings_ledger.aggregate_savings(path, group_by=["cost center"])
+    # A bare string is one name, not its characters.
+    report = savings_ledger.aggregate_savings(path, group_by="team")
+    assert [row["team"] for row in report.by_dimension["team"]] == ["infra"]
+
+
+def test_ledger_lists_every_dimension_whatever_the_filter(tmp_path):
+    path = tmp_path / "events.jsonl"
+    _event(path, 400, dims={"team": "infra"})
+    _event(path, 100, dims={"region": "eu"})
+    report = savings_ledger.aggregate_savings(path, where={"team": "infra"})
+    assert report.dimensions == ["client", "region", "team"]
+    assert report.lifetime["tokens_saved"] == 400
+    # Unlabelled events are the ``unknown`` group, and can be selected as such.
+    unknown = savings_ledger.aggregate_savings(path, where={"team": "unknown"})
+    assert unknown.lifetime["tokens_saved"] == 100
+    # ``client`` filters on the event's own key.
+    by_harness = savings_ledger.aggregate_savings(path, where={"client": "claude-code"})
+    assert by_harness.lifetime["tokens_saved"] == 500
+
+
 def test_ledger_windows_respect_the_filter(tmp_path):
     path = tmp_path / "events.jsonl"
     old = datetime.now(timezone.utc) - timedelta(days=10)
@@ -206,6 +269,44 @@ def test_savings_cli_by_and_where(tmp_path, monkeypatch):
     assert "host" in result.output
 
 
+def test_savings_cli_filter_edges(tmp_path, monkeypatch):
+    from headroom.cli import savings as savings_cli
+
+    path = tmp_path / "events.jsonl"
+    _event(path, 400, dims={"team": "infra"})
+    monkeypatch.setenv("HEADROOM_SAVINGS_EVENTS_PATH", str(path))
+    monkeypatch.setattr(savings_cli, "_proxy_routing", lambda: None)
+    runner = CliRunner()
+
+    # A name that is not a dimension is an error, not an unfiltered report.
+    for args in (["--where", "cost center=42"], ["--by", "cost center"]):
+        result = runner.invoke(savings_cli.savings, args)
+        assert result.exit_code == 2, result.output
+        assert "not a dimension name" in result.output
+    result = runner.invoke(savings_cli.savings, ["--where", "team=a", "--where", "team=b"])
+    assert result.exit_code == 2
+    assert "given twice" in result.output
+
+    # A filter that matches nothing says so, and names the filter.
+    result = runner.invoke(savings_cli.savings, ["--where", "team=Infra"])
+    assert result.exit_code == 0, result.output
+    assert "No savings recorded for team=Infra" in result.output
+    assert "No savings recorded yet" not in result.output
+
+    # ``--by client`` prints one client section, not two.
+    result = runner.invoke(savings_cli.savings, ["--by", "client"])
+    assert result.output.count("Savings by client:") == 1
+
+
+def test_savings_cli_rejects_by_a_row_field(tmp_path, monkeypatch):
+    from headroom.cli import savings as savings_cli
+
+    monkeypatch.setenv("HEADROOM_SAVINGS_EVENTS_PATH", str(tmp_path / "events.jsonl"))
+    result = CliRunner().invoke(savings_cli.savings, ["--by", "calls"])
+    assert result.exit_code == 2
+    assert "cannot group by calls" in result.output
+
+
 # ── Through the proxy ─────────────────────────────────────────────────
 
 
@@ -239,6 +340,7 @@ def _emit(proxy, **fields):
 
 
 def test_funnel_books_context_labels_and_outcome_fields_win(tmp_path, monkeypatch):
+    monkeypatch.setenv("HEADROOM_ATTRIBUTION_DIMENSIONS", "default,host,team")
     with _proxy_client(tmp_path, monkeypatch) as client:
         proxy = client.app.state.proxy
         set_current_attribution({"host": "studio", "project": "from-header", "team": "infra"})
@@ -272,6 +374,39 @@ def test_a_dimension_turned_off_is_not_booked_from_the_legacy_field(tmp_path, mo
     event = json.loads((tmp_path / "events.jsonl").read_text().splitlines()[-1])
     # The ledger's own client key predates labels and is unchanged.
     assert event["client"] == "codex"
+
+
+def test_a_handler_cannot_book_a_dimension_that_is_off(tmp_path, monkeypatch):
+    from headroom.proxy import attribution
+
+    monkeypatch.setenv(attribution.ATTRIBUTION_DIMENSIONS_ENV_VAR, "default,squad,-team")
+    with _proxy_client(tmp_path, monkeypatch) as client:
+        _emit(client.app.state.proxy, attribution={"team": "x", "squad": "blue", "other": "y"})
+        by_dim = client.get("/stats").json()["savings"]["by_dimension"]
+        assert set(by_dim) == {"squad"}
+    monkeypatch.setenv(attribution.ATTRIBUTION_DIMENSIONS_ENV_VAR, "none")
+    with _proxy_client(tmp_path, monkeypatch) as client:
+        _emit(client.app.state.proxy, project="web", client="codex", attribution={"team": "x"})
+        assert client.get("/stats").json()["savings"]["by_dimension"] == {"squad": by_dim["squad"]}
+
+
+def test_client_named_labels_do_not_change_the_request_log_tags(tmp_path, monkeypatch):
+    from headroom.proxy import attribution
+
+    monkeypatch.setenv(attribution.ATTRIBUTION_DIMENSIONS_ENV_VAR, "labels")
+    with _proxy_client(tmp_path, monkeypatch) as client:
+        proxy = client.app.state.proxy
+        sink = _LogSink()
+        with monkeypatch.context() as patch:
+            patch.setattr(proxy, "logger", sink, raising=False)
+            set_current_attribution({"project": "web", "client": "cursor"})
+            _emit(proxy, project="api", client="codex")
+            set_current_attribution(None)
+        tags = sink.entries[-1].tags
+        # by_dimension books what the client named; the tags stay what was detected.
+        assert (tags["client"], tags["project"]) == ("codex", "api")
+        by_dim = client.get("/stats").json()["savings"]["by_dimension"]
+        assert set(by_dim["client"]) == {"cursor"}
 
 
 def test_project_turned_off_leaves_only_the_older_projects_totals(tmp_path, monkeypatch):
@@ -312,10 +447,10 @@ class _LogSink:
 def test_a_replaced_resolver_is_not_overridden_by_the_legacy_field(tmp_path, monkeypatch):
     from headroom.proxy import attribution
 
-    attribution.register_dimension("client", lambda request: "custom-client", replace=True)
-    attribution.register_dimension("project", lambda request: "custom-project", replace=True)
     captured = _capture_middleware_labels(monkeypatch)
     try:
+        attribution.register_dimension("client", lambda request: "custom-client", replace=True)
+        attribution.register_dimension("project", lambda request: "custom-project", replace=True)
         with _proxy_client(tmp_path, monkeypatch) as client:
             proxy = client.app.state.proxy
             # The middleware resolves the labels on a real request ...
@@ -443,9 +578,13 @@ def test_network_callers_do_not_see_labels(tmp_path, monkeypatch):
         stats = remote.get("/stats")
         assert stats.status_code == 200
         assert "by_dimension" not in stats.json()["savings"]
+        assert "by_dimension" not in stats.json()["persistent_savings"]
         lifetime = remote.get("/stats-lifetime")
         assert lifetime.status_code == 200
         assert "by_dimension" not in lifetime.json()
+        # Whatever the key, the label itself is nowhere in either response.
+        assert "studio" not in stats.text
+        assert "studio" not in lifetime.text
 
 
 def test_proxy_token_holders_see_labels_like_recent_requests(tmp_path, monkeypatch):

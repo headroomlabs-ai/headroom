@@ -414,7 +414,7 @@ def record_savings_event(
         event["saved_tool_schema"] = split[1]
 
     # Attribution labels (headroom.proxy.attribution), so `headroom savings
-    # --by host` can split any window. `client` already has its own key and is
+    # --by host` can split the ledger. `client` already has its own key and is
     # not repeated; absent when the request carried no other label.
     dims = _event_dims(attribution)
     if dims:
@@ -636,7 +636,7 @@ class SavingsReport:
     top_model: str = UNKNOWN
     #: ``{dimension: ranked rows}`` for each ``group_by`` dimension requested.
     by_dimension: dict[str, list[dict[str, Any]]] = field(default_factory=dict)
-    #: Every attribution dimension any retained event carries.
+    #: Every attribution dimension any retained event carries, filtered or not.
     dimensions: list[str] = field(default_factory=list)
     #: The ``where`` filter applied, echoed so a JSON reader knows the scope.
     where: dict[str, str] = field(default_factory=dict)
@@ -657,6 +657,12 @@ class SavingsReport:
         if self.where:
             data["where"] = self.where
         return data
+
+
+#: Keys every report row carries. A row is ``{<dimension>: <label>, **figures}``,
+#: so a dimension with one of these names cannot be grouped by: its label and
+#: the figure would be the same key.
+ROW_FIELDS: frozenset[str] = frozenset(_Bucket().to_dict())
 
 
 def _ranked(buckets: dict[str, _Bucket], key_name: str) -> list[dict[str, Any]]:
@@ -687,23 +693,41 @@ def aggregate_savings(
 ) -> SavingsReport:
     """Aggregate the durable ledger into lifetime / windowed / per-dimension views.
 
-    ``group_by`` names attribution dimensions to break every total down by
-    (``host``, ``project``, ``client`` …). ``where`` is a ``{dimension: label}``
-    filter applied before anything is summed, so ``where={"host": "studio"}``
-    reports one machine's savings exactly as the unfiltered report would.
-    """
-    from headroom.proxy.attribution import sanitize_dimension_name
+    ``group_by`` names attribution dimensions (``host``, ``project``,
+    ``client`` …); each gets one ranked list of rows over the whole lookback
+    window. ``where`` is a ``{dimension: label}`` filter applied before anything
+    is summed, so ``where={"host": "studio"}`` reports one machine's savings,
+    in every window, exactly as the unfiltered report would.
 
-    group_dims = [
-        name
-        for name in dict.fromkeys(sanitize_dimension_name(g) for g in (group_by or ()))
-        if name is not None
-    ]
-    where_filter = {
-        name: str(label)
-        for key, label in dict(where or {}).items()
-        if (name := sanitize_dimension_name(key)) is not None
-    }
+    Raises :class:`ValueError` for a name that is not a usable dimension name
+    (a filter that silently matched everything would be worse), and for a
+    ``group_by`` name that is also a row field (:data:`ROW_FIELDS`, e.g.
+    ``calls``): the row could not hold both the label and the figure.
+    """
+    from headroom.proxy.attribution import sanitize_dimension_name, sanitize_label
+
+    if isinstance(group_by, str):
+        group_by = (group_by,)
+    group_dims = []
+    for raw in group_by or ():
+        name = sanitize_dimension_name(raw)
+        if name is None:
+            raise ValueError(f"not a dimension name: {raw!r}")
+        if name not in group_dims:
+            group_dims.append(name)
+    clashes = sorted(ROW_FIELDS.intersection(group_dims))
+    if clashes:
+        raise ValueError(
+            f"cannot group by {', '.join(clashes)}: the name is also a report field "
+            f"({', '.join(sorted(ROW_FIELDS))}); filter with where instead"
+        )
+    where_filter: dict[str, str] = {}
+    for key, raw_label in dict(where or {}).items():
+        name = sanitize_dimension_name(key)
+        if name is None:
+            raise ValueError(f"not a dimension name: {key!r}")
+        # Stored labels are sanitized; compare like with like.
+        where_filter[name] = sanitize_label(raw_label, decode=False) or str(raw_label)
 
     now = now or _utc_now()
     # Hard-cap the lookback at 30 days regardless of caller input (0/None means
@@ -728,11 +752,11 @@ def aggregate_savings(
     seen_dims: set[str] = set()
 
     for event in events:
-        if any(event_label(event, k) != v for k, v in where_filter.items()):
-            continue
         dims = event.get("dims")
         if isinstance(dims, dict):
             seen_dims.update(k for k in dims if isinstance(k, str))
+        if any(event_label(event, k) != v for k, v in where_filter.items()):
+            continue
         ts: datetime = event["_ts"]
         saved = max(int(event.get("saved", 0) or 0), 0)
         before = max(int(event.get("before", 0) or 0), 0)

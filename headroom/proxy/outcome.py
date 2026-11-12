@@ -227,9 +227,9 @@ class RequestOutcome:
     project: str | None = None
     # Attribution labels (``{dimension: label}``) a handler knows beyond what
     # the request middleware bound (see :mod:`headroom.proxy.attribution`).
-    # Merged over the context's labels; ``client`` / ``project`` above win
-    # their own dimensions so the two spellings can never disagree, unless an
-    # extension replaced that dimension's resolver.
+    # Merged over the context's labels, for dimensions the operator enabled.
+    # ``client`` / ``project`` above win their own dimensions while those are
+    # enabled and resolved by their built-ins (see ``emit_request_outcome``).
     attribution: Mapping[str, str] | None = None
 
     # ── Derived (computed once, no caching needed — properties are cheap) ─
@@ -517,9 +517,12 @@ async def emit_request_outcome(handler: Any, outcome: RequestOutcome) -> None:
     from headroom.copilot_auth import consume_request_routed_to_copilot
     from headroom.proxy.attribution import (
         _builtin_label_applies,
+        dimension_enabled,
+        enabled_dimensions,
         get_current_attribution,
         get_current_conversation,
         merge_attribution,
+        normalize_attribution,
     )
     from headroom.proxy.cost import _summarize_transforms
     from headroom.proxy.models import RequestLog
@@ -637,9 +640,16 @@ async def emit_request_outcome(handler: Any, outcome: RequestOutcome) -> None:
     # resolver an extension replaced keeps the label that resolver gave. The
     # legacy ``projects`` map and ledger ``client`` key still book what the
     # proxy detected.
+    # What a handler supplies obeys the same switches as what it binds: a
+    # dimension that is off, or removed with ``-name``, is not booked from it.
+    handler_labels = {
+        name: label
+        for name, label in normalize_attribution(outcome.attribution).items()
+        if dimension_enabled(name)
+    }
     attribution = merge_attribution(
         get_current_attribution(),
-        outcome.attribution,
+        handler_labels,
         {"project": project} if project and _builtin_label_applies("project") else None,
         {"client": outcome.client} if outcome.client and _builtin_label_applies("client") else None,
     )
@@ -802,13 +812,15 @@ async def emit_request_outcome(handler: Any, outcome: RequestOutcome) -> None:
     request_logger = getattr(handler, "logger", None)
     if request_logger is not None:
         log_tags = public_tags(outcome.tags)
-        # ``client`` / ``project`` tags follow the attribution label, so a
-        # replaced resolver shows here too; without one (dimension turned off)
-        # they keep what the handler detected.
-        client_tag = attribution.get("client") or outcome.client
+        # ``client`` / ``project`` tags are what the proxy detected, as they
+        # always were, except for a dimension the operator listed: there the
+        # tag is its resolver's label, so a replaced resolver shows here too.
+        # A label a client merely named through ``labels`` does not.
+        listed = enabled_dimensions()
+        client_tag = (attribution.get("client") if "client" in listed else None) or outcome.client
         if client_tag:
             log_tags["client"] = client_tag
-        project_tag = attribution.get("project") or project
+        project_tag = (attribution.get("project") if "project" in listed else None) or project
         if project_tag:
             log_tags["project"] = project_tag
         for dimension, label in attribution.items():

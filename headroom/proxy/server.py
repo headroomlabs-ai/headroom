@@ -5970,11 +5970,13 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
             # _build_stats_payload bakes these in; strip for network callers.
             payload.pop("recent_requests", None)
             payload.pop("request_logs", None)
-            savings_section = payload.get("savings")
-            if isinstance(savings_section, dict) and "by_dimension" in savings_section:
-                payload["savings"] = {
-                    k: v for k, v in savings_section.items() if k != "by_dimension"
-                }
+            # Labels can name machines and people; both sections carry them.
+            for section_name in ("savings", "persistent_savings"):
+                section = payload.get(section_name)
+                if isinstance(section, dict) and "by_dimension" in section:
+                    payload[section_name] = {
+                        k: v for k, v in section.items() if k != "by_dimension"
+                    }
         return payload
 
     @app.get("/stats-lifetime")

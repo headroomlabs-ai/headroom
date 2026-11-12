@@ -227,10 +227,11 @@ def test_spec_is_capped():
 
 def test_a_bad_spec_warns_once_not_per_request(monkeypatch, caplog):
     monkeypatch.setenv(attribution.ATTRIBUTION_DIMENSIONS_ENV_VAR, "team,not a name!")
+    attribution._parsed_spec.cache_clear()
     with caplog.at_level("WARNING", logger=attribution.__name__):
         for _ in range(3):
             assert attribution.enabled_dimensions() == ("team",)
-    assert len([r for r in caplog.records if "not a name!" in r.getMessage()]) <= 1
+    assert len([r for r in caplog.records if "not a name!" in r.getMessage()]) == 1
 
 
 def test_env_selects_dimensions(monkeypatch):
@@ -305,3 +306,50 @@ def test_otel_provider_exports_selected_dimensions(monkeypatch):
     finally:
         attribution.install_otel_attribution({})
     assert registered == []
+
+
+def test_a_header_label_is_percent_decoded_exactly_once(monkeypatch):
+    monkeypatch.setenv(attribution.ATTRIBUTION_DIMENSIONS_ENV_VAR, "team,squad")
+    request = _req({"X-Headroom-Team": "a%252541", "X-Headroom-Labels": "squad=b%252542"})
+    labels = resolve_attribution(request, ["team", "squad"])
+    assert labels == {"team": "a%2541", "squad": "b%2542"}
+    # Every later stage leaves the resolved label alone.
+    assert normalize_attribution(labels) == labels
+    assert merge_attribution(labels, labels) == labels
+    set_current_attribution({})
+    bind_label("team", labels["team"])
+    assert get_current_attribution()["team"] == "a%2541"
+
+
+def test_spec_words_cannot_be_bound_or_merged_as_dimensions(monkeypatch):
+    monkeypatch.setenv(attribution.ATTRIBUTION_DIMENSIONS_ENV_VAR, "labels")
+    for word in ("labels", "default", "none"):
+        bind_label(word, "x")
+    assert dict(get_current_attribution()) == {}
+    assert normalize_attribution({"labels": "x", "default": "y", "team": "infra"}) == {
+        "team": "infra"
+    }
+    assert resolve_attribution(_req({"X-Headroom-Default": "x"}), ["default", "none"]) == {}
+
+
+def test_merge_keeps_the_later_layers_when_over_the_cap():
+    crowd = {f"d{i}": "x" for i in range(attribution.MAX_DIMENSIONS)}
+    merged = merge_attribution(crowd, {"client": "codex", "project": "web"})
+    assert len(merged) == attribution.MAX_DIMENSIONS
+    assert (merged["client"], merged["project"]) == ("codex", "web")
+
+
+def test_bind_label_stops_at_the_cap(monkeypatch):
+    monkeypatch.setenv(attribution.ATTRIBUTION_DIMENSIONS_ENV_VAR, "labels")
+    set_current_attribution({f"d{i}": "x" for i in range(attribution.MAX_DIMENSIONS)})
+    bind_label("d0", "y")
+    bind_label("extra", "z")
+    labels = get_current_attribution()
+    assert len(labels) == attribution.MAX_DIMENSIONS
+    assert labels["d0"] == "y" and "extra" not in labels
+
+
+def test_only_the_start_of_the_labels_header_is_read():
+    padding = "x" * attribution.LABELS_HEADER_MAX_LENGTH
+    request = _req({"X-Headroom-Labels": f"team=infra; pad={padding}; late=1"})
+    assert resolve_attribution(request, ["team", "late"]) == {"team": "infra"}

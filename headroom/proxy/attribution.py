@@ -71,6 +71,10 @@ HEADER_PREFIX: Final[str] = "x-headroom-"
 #: variable. A dedicated ``X-Headroom-<name>`` header wins over this one.
 LABELS_HEADER: Final[str] = "x-headroom-labels"
 
+#: Only this much of ``X-Headroom-Labels`` is read. It is parsed on every
+#: request, so its cost must not be the client's to choose.
+LABELS_HEADER_MAX_LENGTH: Final[int] = 4096
+
 #: Environment variable ``headroom wrap`` reads labels from, in the same
 #: ``name=value; name=value`` form; also accepts commas as separators.
 LABELS_ENV_VAR: Final[str] = "HEADROOM_LABELS"
@@ -105,15 +109,25 @@ def sanitize_dimension_name(value: Any) -> str | None:
     return cleaned
 
 
-def sanitize_label(value: Any) -> str | None:
-    """Normalize a client-supplied label; ``None`` when unusable.
+def sanitize_label(value: Any, *, decode: bool = True) -> str | None:
+    """Normalize a label; ``None`` when unusable.
 
     Same rule as project names (:mod:`headroom.proxy.project_name_policy`):
     percent-decoded, printable characters only, trimmed, length-capped.
-    """
-    from headroom.proxy.project_name_policy import sanitize_project_name
 
-    cleaned = sanitize_project_name(value)
+    ``decode`` is for a value read straight from a header. A label that was
+    already resolved is cleaned with ``decode=False``: decoding is not
+    idempotent (``%2541`` becomes ``%41`` and then ``A``), so it happens once,
+    where the header is read, and never again on the way to storage.
+    """
+    if decode:
+        from headroom.proxy.project_name_policy import sanitize_project_name
+
+        cleaned = sanitize_project_name(value)
+    elif isinstance(value, str):
+        cleaned = "".join(ch for ch in value if ch.isprintable()).strip() or None
+    else:
+        cleaned = None
     if cleaned is None:
         return None
     return cleaned[:LABEL_MAX_LENGTH]
@@ -138,6 +152,8 @@ class AttributionRequest:
         return value if isinstance(value, str) else None
 
 
+#: Returns the label as it should be stored, or nothing. A resolver that reads
+#: a header itself decides whether to percent-decode it (:func:`sanitize_label`).
 Resolver = Callable[[AttributionRequest], Any]
 
 
@@ -152,6 +168,7 @@ _registry: dict[str, _Registration] = {}
 _builtins: dict[str, _Registration] = {}
 _registry_lock = threading.Lock()
 _builtins_installed = False
+_builtins_lock = threading.Lock()
 
 
 def _ensure_builtins() -> None:
@@ -160,10 +177,15 @@ def _ensure_builtins() -> None:
     global _builtins_installed
     if _builtins_installed:
         return
-    _builtins_installed = True
-    from headroom.proxy.attribution_builtins import install_builtin_dimensions
+    with _builtins_lock:
+        if _builtins_installed:
+            return
+        from headroom.proxy.attribution_builtins import install_builtin_dimensions
 
-    install_builtin_dimensions()
+        install_builtin_dimensions()
+        # Only once they are all there: a concurrent first caller waits on the
+        # lock instead of seeing a partial registry.
+        _builtins_installed = True
 
 
 def _register_if_absent(name: str, resolver: Resolver, *, default: bool = True) -> None:
@@ -325,10 +347,12 @@ def dimension_enabled(name: str, environ: Mapping[str, str] | None = None) -> bo
     only a client can name it, in ``X-Headroom-Labels``, and only when it is
     client-settable (see :func:`resolve_attribution`).
     """
+    if name in RESERVED_TOKENS:
+        return False
     enabled, excluded = _current_spec(environ)
     if name in enabled:
         return True
-    if OPEN_LABELS_TOKEN not in enabled or name in excluded or name in RESERVED_TOKENS:
+    if OPEN_LABELS_TOKEN not in enabled or name in excluded:
         return False
     return name not in registered_dimensions()
 
@@ -357,13 +381,13 @@ def _label_pairs(value: Any) -> dict[str, str]:
     if not isinstance(value, str) or not value.strip():
         return {}
     pairs: dict[str, str] = {}
-    for chunk in value.replace(",", ";").split(";"):
+    for chunk in value[:LABELS_HEADER_MAX_LENGTH].replace(",", ";").split(";"):
         raw_name, sep, raw_label = chunk.partition("=")
         if not sep:
             continue
         name = sanitize_dimension_name(raw_name)
         label = sanitize_label(raw_label.strip())
-        if name is not None and label is not None:
+        if name is not None and name not in RESERVED_TOKENS and label is not None:
             pairs[name] = label
     return pairs
 
@@ -405,7 +429,7 @@ def _header_resolver(dimension: str) -> Resolver:
     def resolve(request: AttributionRequest) -> str | None:
         direct = request.header(header)
         if direct:
-            return direct
+            return sanitize_label(direct)
         return _label_pairs(request.header(LABELS_HEADER)).get(dimension)
 
     return resolve
@@ -441,7 +465,7 @@ def resolve_attribution(
         registry = dict(_registry)
     labels: dict[str, str] = {}
     for name in names:
-        if name == OPEN_LABELS_TOKEN:
+        if name in RESERVED_TOKENS:
             continue
         registration = registry.get(name)
         if registration is not None:
@@ -457,16 +481,14 @@ def resolve_attribution(
         except Exception:  # noqa: BLE001 - attribution must never fail a request
             logger.debug("attribution resolver %r failed", name, exc_info=True)
             continue
-        label = sanitize_label(value)
+        label = sanitize_label(value, decode=False)
         if label is not None:
             labels[name] = label
     if OPEN_LABELS_TOKEN in names:
         for name, label in _label_pairs(request.header(LABELS_HEADER)).items():
             if len(labels) >= MAX_DIMENSIONS:
                 break
-            if name in labels or name in excluded or name in RESERVED_TOKENS:
-                continue
-            if _is_credential(name):
+            if name in labels or name in excluded or _is_credential(name):
                 continue
             registration = registry.get(name)
             if registration is not None and (name in names or not registration.client_settable):
@@ -484,8 +506,8 @@ def normalize_attribution(raw: Any) -> dict[str, str]:
     cleaned: dict[str, str] = {}
     for key, value in raw.items():
         name = sanitize_dimension_name(key)
-        label = sanitize_label(value)
-        if name is not None and label is not None:
+        label = sanitize_label(value, decode=False)
+        if name is not None and name not in RESERVED_TOKENS and label is not None:
             cleaned[name] = label
         if len(cleaned) >= MAX_DIMENSIONS:
             break
@@ -543,19 +565,22 @@ def bind_label(dimension: str, value: Any) -> None:
     """Add or replace one label on the current request.
 
     For values known only after the middleware ran, such as a client a handler
-    identified from the request body. ``None`` removes the label.
+    identified from the request body. ``None`` removes the label. Ignored for a
+    dimension that is not enabled, and for a new one past ``MAX_DIMENSIONS``.
     """
     name = sanitize_dimension_name(dimension)
     if name is None:
         return
     labels = dict(_current_attribution.get())
-    label = sanitize_label(value)
+    label = sanitize_label(value, decode=False)
     if label is not None and not dimension_enabled(name):
         return  # turned off by the operator: never added, still removable
     if label is None:
         labels.pop(name, None)
-    else:
+    elif name in labels or len(labels) < MAX_DIMENSIONS:
         labels[name] = label
+    else:
+        return
     set_current_attribution(labels)
 
 
@@ -569,12 +594,21 @@ def bind_builtin_label(dimension: str, value: Any) -> None:
 
 
 def merge_attribution(*layers: Mapping[str, str] | None) -> dict[str, str]:
-    """Merge label mappings; later layers win, empty labels are dropped."""
+    """Merge label mappings; later layers win, empty labels are dropped.
+
+    At most ``MAX_DIMENSIONS`` labels come back. Past that, later layers keep
+    their place as well as their value, so what a handler knows is not the
+    part that is cut.
+    """
+    cleaned = [normalize_attribution(layer) for layer in layers if layer]
     merged: dict[str, str] = {}
-    for layer in layers:
-        if layer:
-            merged.update(normalize_attribution(layer))
-    return merged
+    for layer in cleaned:
+        merged.update(layer)
+    if len(merged) <= MAX_DIMENSIONS:
+        return merged
+    keep = list(dict.fromkeys(name for layer in reversed(cleaned) for name in layer))
+    kept = frozenset(keep[:MAX_DIMENSIONS])
+    return {name: label for name, label in merged.items() if name in kept}
 
 
 # ── OpenTelemetry ─────────────────────────────────────────────────────
@@ -645,6 +679,7 @@ __all__ = [
     "EMPTY_ATTRIBUTION",
     "LABELS_ENV_VAR",
     "LABELS_HEADER",
+    "LABELS_HEADER_MAX_LENGTH",
     "LABEL_MAX_LENGTH",
     "MAX_DIMENSIONS",
     "OTEL_ATTRIBUTE_PREFIX",
