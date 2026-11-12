@@ -395,6 +395,15 @@ describe("shared HTTP transport", () => {
     expect(mockFetch.mock.calls[2][1].body).toBeUndefined();
   });
 
+  it("telemetry.getTool encodes the signature hash like feedback and toin do", async () => {
+    mockFetch.mockResolvedValue(jsonResponse({}));
+    const client = new HeadroomClient({ baseUrl: "http://test:8787" });
+    await client.telemetry.getTool("../../v1/feedback?x=1#f");
+    expect(mockFetch.mock.calls[0][0]).toBe(
+      "http://test:8787/v1/telemetry/tools/..%2F..%2Fv1%2Ffeedback%3Fx%3D1%23f",
+    );
+  });
+
   it("keeps proxy headers on requests without provider auth", async () => {
     mockFetch.mockResolvedValue(jsonResponse({ ok: true }));
     const client = new HeadroomClient({ baseUrl: "http://test:8787", apiKey: "hr_proxykey", stack: "cli" });
