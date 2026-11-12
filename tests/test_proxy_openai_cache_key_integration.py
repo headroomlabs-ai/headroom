@@ -175,6 +175,50 @@ def test_openai_differing_audio_config_not_served_from_cache(audio_b) -> None:
         assert len(calls) == 2
 
 
+def test_openai_request_without_audio_keeps_its_cache_key(monkeypatch) -> None:
+    """A request that sends no ``audio`` must not add an ``audio`` key field, so
+    cache keys for text-only requests are the same as before #4276."""
+    from headroom.proxy import semantic_cache
+
+    seen: list[dict] = []
+    real = semantic_cache.compute_semantic_cache_key
+
+    def _spy(messages, model, *, partition, **key_fields):  # noqa: ANN001
+        seen.append(key_fields)
+        return real(messages, model, partition=partition, **key_fields)
+
+    monkeypatch.setattr(semantic_cache, "compute_semantic_cache_key", _spy)
+
+    with _make_cached_proxy_client() as client:
+        proxy = client.app.state.proxy
+
+        async def _fake_retry(method, url, headers, body, stream=False, **kwargs):  # noqa: ANN001
+            return httpx.Response(
+                200,
+                json={
+                    "id": "chatcmpl_1",
+                    "object": "chat.completion",
+                    "choices": [
+                        {
+                            "index": 0,
+                            "message": {"role": "assistant", "content": "resp-1"},
+                            "finish_reason": "stop",
+                        }
+                    ],
+                    "usage": {"prompt_tokens": 10, "completion_tokens": 3, "total_tokens": 13},
+                },
+            )
+
+        proxy._retry_request = _fake_retry
+        r = client.post(
+            "/v1/chat/completions", headers={"authorization": "Bearer test-key"}, json=_body()
+        )
+        assert _content(r) == "resp-1"
+
+    assert seen, "cache key was never computed"
+    assert all("audio" not in fields for fields in seen)
+
+
 def test_openai_different_custom_upstream_not_served_from_cache(monkeypatch) -> None:
     """Two OpenAI-compatible gateways must not share a response entry (#3346)."""
     calls: list[str] = []
