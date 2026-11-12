@@ -4495,6 +4495,11 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
     # whose licence gate raises is absent, not fatal — the feature fails closed,
     # the process does not.
     #
+    # The exception is an extension that marks its install() `fail_closed`
+    # (e.g. one that mints the upstream credential): running without it would
+    # relay the client's own Authorization upstream, so `install_all` re-raises
+    # and create_app fails instead of serving mis-authenticated. See #4737.
+    #
     # Installed HERE, before the body limit and the security gate are
     # registered, so any middleware an extension adds sits INSIDE both (see the
     # ordering contract above). Routes an extension registers are unaffected
