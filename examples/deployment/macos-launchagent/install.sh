@@ -97,18 +97,18 @@ success "Proxy support verified"
 if [[ -f "${PLIST_DEST}" ]]; then
   warning "LaunchAgent already installed at: ${PLIST_DEST}"
 
-  # Check if service is running
-  if launchctl print "gui/${USER_UID}/${PLIST_LABEL}" >/dev/null 2>&1; then
-    info "Stopping existing service..."
-    launchctl bootout "gui/${USER_UID}/${PLIST_LABEL}" 2>/dev/null || true
-  fi
-
   if [[ "${UNATTENDED}" == false ]]; then
     read -rp "Reinstall? [y/N] " response
     if [[ ! "${response}" =~ ^[Yy]$ ]]; then
       echo "Installation cancelled."
       exit 0
     fi
+  fi
+
+  # Stop the service only after the user confirmed (or in unattended mode)
+  if launchctl print "gui/${USER_UID}/${PLIST_LABEL}" >/dev/null 2>&1; then
+    info "Stopping existing service..."
+    launchctl bootout "gui/${USER_UID}/${PLIST_LABEL}" 2>/dev/null || true
   fi
 fi
 
@@ -123,7 +123,7 @@ else
 fi
 
 # Validate port number
-if ! [[ "${PORT}" =~ ^[0-9]+$ ]] || [[ "${PORT}" -lt 1024 ]] || [[ "${PORT}" -gt 65535 ]]; then
+if ! [[ "${PORT}" =~ ^[1-9][0-9]{3,4}$ ]] || [[ "${PORT}" -lt 1024 ]] || [[ "${PORT}" -gt 65535 ]]; then
   fatal "Invalid port number: ${PORT} (must be 1024-65535)"
 fi
 
