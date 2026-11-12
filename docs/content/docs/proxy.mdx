@@ -531,6 +531,8 @@ Anthropic API format. The proxy compresses messages, forwards to Anthropic, and 
 
 OpenAI API format. The proxy compresses messages, forwards to OpenAI, and returns the response.
 
+On translated backends (`anyllm`, `litellm-<provider>`), streaming token accounting uses the latest provider usage snapshot. Providers may repeat a cumulative `usage` block on several content chunks before the terminal frame; the final counts win. A frame that omits a field leaves the earlier value alone, while an explicitly reported zero replaces it — so `/stats` and the cache-hit-rate metrics report what the provider last said, not the first nonzero count it sent.
+
 ### `POST /v1/responses`
 
 OpenAI Responses API format. The proxy compresses `input` payloads where applicable, forwards the request, and returns the response.
