@@ -83,7 +83,9 @@ _PREFIX_STATE_MAX_TRACKERS = 256
 _PREFIX_STATE_MAX_BYTES = 64 * 1024 * 1024
 # Any CCR reference in saved messages: ``hash=<hex>`` markers (Retrieve
 # more/original, compressed-item counts) and SmartCrusher's ``<<ccr:<hex>``.
-_CCR_HASH_RE = re.compile(r"(?:hash=|<<ccr:)([0-9a-f]{12,24})")
+# Keep the whole reference: explicit producer hashes can exceed the store's
+# default 24 hex characters, and exporting a prefix loses the real original.
+_CCR_HASH_RE = re.compile(r"(?:hash=|<<ccr:)([0-9a-f]{12,64})(?![0-9a-f])")
 
 
 def prefix_state_file() -> str | None:
