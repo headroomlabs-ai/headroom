@@ -3383,18 +3383,16 @@ class AnthropicHandlerMixin:
                 except Exception as e:
                     logger.debug(f"[{request_id}] Traffic learner: {e}")
 
-            # Memory: Inject context and tools — gated on MemoryDecision.
-            # ``inject`` is False under bypass, missing handler, missing
-            # user_id, or HEADROOM_MEMORY_INJECTION_MODE=disabled.
-            # Pre-PR-this the gate was a raw conjunction that silently
-            # ignored bypass; now bypass is honoured here on Anthropic
-            # /v1/messages just as on /v1/responses.
+            # Gate both context and tools on request policy and storage scope.
+            # Missing scope also blocks replay of previously injected definitions.
             memory_context_injected = False
             memory_tools_injected = False
             # Memory tools this proxy injected and must execute itself; the
             # streaming path withholds their calls from the client.
             server_memory_tool_names: frozenset[str] = frozenset()
-            if memory_decision.inject:
+            if memory_decision.inject and not self.memory_handler.is_project_unresolved(
+                memory_request_ctx
+            ):
                 if self.memory_handler.config.inject_context and is_cache_mode(self.config.mode):
                     # Cache mode never injects context, so the next-turn prefix
                     # bytes stay byte-equal to this turn's bytes. Skip the search
@@ -3486,14 +3484,8 @@ class AnthropicHandlerMixin:
                     except Exception as e:
                         logger.warning(f"[{request_id}] Memory: Context injection failed: {e!r}")
 
-                # Inject memory tools — PR-A7 (P0-6) routes through
-                # `apply_session_sticky_memory_tools` so tool list bytes
-                # stay byte-stable across turns: once a session injects,
-                # every subsequent turn replays the same canonical bytes.
-                # `inject_this_turn` is True iff memory is enabled this
-                # turn (i.e. memory_handler.config.inject_tools and we
-                # have a memory_user_id, which the outer guard at line
-                # 1192 already enforces).
+                # Within an available scope, keep memory tool bytes stable across
+                # turns. Missing scope skips this block even when golden bytes exist.
                 from headroom.proxy.helpers import (
                     apply_session_sticky_memory_tools,
                 )
