@@ -32,6 +32,9 @@ class _MemoryHandler:
         self.backend = None
         self.executed: list[str] = []
 
+    def is_project_unresolved(self, request_context: Any) -> bool:
+        return False
+
     def compute_memory_tool_definitions(self, provider: str) -> list[dict[str, Any]]:
         return [
             {"name": name, "description": name, "input_schema": {"type": "object"}}

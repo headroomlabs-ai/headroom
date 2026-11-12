@@ -292,6 +292,28 @@ def main() -> int:
     args = ap.parse_args()
 
     wt = Path(args.worktree).resolve()
+
+    # The per-run cleanup below is `git reset --hard` + `git clean -fd`: refuse a
+    # worktree that is not a clean git checkout so it cannot destroy user work.
+    # --untracked-files=all: `status.showUntrackedFiles=no` would hide the untracked
+    # files that `git clean -fd` deletes.
+    git = subprocess.run(
+        ["git", "status", "--porcelain", "--untracked-files=all"],
+        cwd=wt,
+        capture_output=True,
+        text=True,
+    )
+    if git.returncode != 0:
+        print(f"error: --worktree {wt} is not inside a git work tree", file=sys.stderr)
+        return 2
+    if git.stdout.strip():
+        print(
+            f"error: --worktree {wt} has uncommitted changes; the script runs "
+            "`git reset --hard` and `git clean -fd` there after each run. "
+            "Commit or stash first, or use a clean detached worktree.",
+            file=sys.stderr,
+        )
+        return 2
     pd = Path(args.plugin_dir).resolve()
     out = Path(args.out)
     out.parent.mkdir(parents=True, exist_ok=True)
