@@ -532,6 +532,41 @@ describe("Headroom OpenCode transport", () => {
     await proxy.close();
   });
 
+  it("uses the module's default protocol for options-form requests without a protocol", async () => {
+    const proxy = await proxyServer();
+    installHeadroomTransport({ proxyUrl: proxy.url });
+
+    const post = (
+      request: typeof https.request,
+      options: Record<string, unknown>,
+    ): Promise<void> =>
+      new Promise<void>((resolve, reject) => {
+        const req = request(
+          { hostname: "api.openai.com", path: "/v1/chat/completions", method: "POST", ...options },
+          (res) => {
+            res.resume();
+            res.on("end", resolve);
+          },
+        );
+        req.on("error", reject);
+        req.end("{}");
+      });
+
+    await post(https.request, {});
+    await post(https.request, { port: 443 });
+    await post(http.request, {});
+    await post(http.request, { port: 8080 });
+
+    expect(proxy.seen.map((seen) => seen.headers["x-headroom-base-url"])).toEqual([
+      "https://api.openai.com",
+      "https://api.openai.com",
+      "http://api.openai.com",
+      "http://api.openai.com:8080",
+    ]);
+
+    await proxy.close();
+  });
+
   it("normalizes Node HTTP(S) requests for /chat/completions and /responses", async () => {
     const proxy = await proxyServer("");
     installHeadroomTransport({ proxyUrl: proxy.url });

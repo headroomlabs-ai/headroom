@@ -459,7 +459,7 @@ export class HeadroomClient implements HeadroomClientInterface {
       return deepCamelCase(await resp.json());
     },
     getTool: async (signatureHash: string): Promise<any> => {
-      const resp = await this._fetch(`/v1/telemetry/tools/${signatureHash}`, { method: "GET" });
+      const resp = await this._fetch(`/v1/telemetry/tools/${encodeURIComponent(signatureHash)}`, { method: "GET" });
       return deepCamelCase(await resp.json());
     },
   };
