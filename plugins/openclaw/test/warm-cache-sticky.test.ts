@@ -173,6 +173,27 @@ describe("the compressed history stays put while the prompt cache is warm", () =
     expect(bytes(result.messages.slice(0, 3))).toBe(bytes(cold.messages));
   });
 
+  it("keeps the compressed messages, and counts a failure, when the proxy answers a warm turn with no token count", async () => {
+    mocked.compress.mockImplementation(compressing); // reports 2000 tokens before
+    const e = engine();
+    const t1 = turn(10 * MIN, "t1");
+    const cold = await e.assemble({ sessionId: "s", messages: t1 });
+
+    // Near the budget, so the warm turn asks the proxy, and it resolves without a count (it never answered).
+    mocked.compress.mockImplementation(async (messages: any[]) => ({
+      compressed: false,
+      tokensBefore: 0,
+      tokensAfter: 0,
+      tokensSaved: 0,
+      messages,
+    }));
+    const result = await e.assemble({ sessionId: "s", messages: [...t1, ...turn(60_000, "t2")], tokenBudget: 2500 });
+
+    expect(mocked.compress).toHaveBeenCalledTimes(2);
+    expect((e as any).circuit.errors).toBe(1);
+    expect(bytes(result.messages.slice(0, 3))).toBe(bytes(cold.messages));
+  });
+
   it("replaces the compressed messages when a warm history has to shrink to fit the budget", async () => {
     mocked.compress.mockImplementation(compressing); // reports 2000 tokens before
     const e = engine();
