@@ -427,7 +427,7 @@ jobs:
         # A shard with a failing test still writes its report; skipping the
         # upload drops every line only that shard covers from codecov/patch.
         if: ${{ !cancelled() }}
-        uses: codecov/codecov-action@0fb7174895f61a3b6b78fc075e0cd60383518dac # v5.5.5
+        uses: codecov/codecov-action@303a32d7a59b442fa8d48b6a1cc6825c09c847a5 # v7.1.1
         with:
           files: coverage-${{ matrix.shard }}.xml
           disable_search: true
