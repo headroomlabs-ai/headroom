@@ -2011,6 +2011,7 @@ class CompressionCache:
         """Store a compressed result (Tier 2).  Thread-safe."""
         with self._lock:
             self._disk_reads.pop(key, None)
+            self._skip.pop(key, None)
             has_marker = self._admit_locked(key, compressed, ratio, strategy)
             token = object()
             if self._store is not None:
@@ -2034,9 +2035,8 @@ class CompressionCache:
                     del self._disk_writes[key]
 
     def mark_skip(self, key: str) -> None:
-        """Mark content as non-compressible (Tier 1).  Thread-safe."""
-        with self._lock:
-            self._skip_locked(key)
+        """Replace any result with a non-compressible verdict (Tier 1)."""
+        self.move_to_skip(key)
 
     def move_to_skip(self, key: str) -> None:
         """Move a result to skip set (threshold tightened, no longer qualifies).

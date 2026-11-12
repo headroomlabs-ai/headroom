@@ -17,6 +17,31 @@ from headroom.transforms.content_router import (
 )
 
 
+@pytest.mark.parametrize("disk", [False, True])
+@pytest.mark.parametrize("skip_method", ["mark_skip", "move_to_skip"])
+def test_a_new_result_supersedes_an_older_skip(tmp_path, disk, skip_method):
+    store = ResultStore(tmp_path / "cache.db", 1800) if disk else None
+    cache = CompressionCache(store=store)
+    getattr(cache, skip_method)("same")
+    cache.put("same", "compressed", 0.4, "kompress")
+
+    assert not cache.is_skipped("same")
+    assert cache.get("same") == ("compressed", 0.4, "kompress")
+    assert cache.skip_size == 0
+
+
+def test_mark_skip_invalidates_the_old_result_on_disk_and_in_memory(tmp_path):
+    store = ResultStore(tmp_path / "cache.db", 1800)
+    cache = CompressionCache(store=store)
+    cache.put("same", "obsolete", 0.4, "kompress")
+    cache.mark_skip("same")
+
+    assert cache.is_skipped("same")
+    assert cache.get("same") is None
+    assert store.get(cache._namespace + "same") is None
+    assert CompressionCache(store=store).get("same") is None
+
+
 def test_results_stay_within_the_memory_budget_least_recently_used_first():
     cache = CompressionCache(max_bytes=10_000)
     for i in range(100):
@@ -201,7 +226,7 @@ def test_a_cache_without_a_namespace_clears_only_its_own_rows(tmp_path):
     assert store.get("router-b:b") is not None
 
 
-@pytest.mark.parametrize("invalidate", ["clear", "move_to_skip"])
+@pytest.mark.parametrize("invalidate", ["clear", "move_to_skip", "mark_skip"])
 @pytest.mark.parametrize("replacement", [False, True])
 def test_a_queued_disk_write_cannot_restore_an_invalidated_result(
     tmp_path, invalidate, replacement
@@ -232,7 +257,7 @@ def test_a_queued_disk_write_cannot_restore_an_invalidated_result(
         if invalidate == "clear":
             cache.clear()
         else:
-            cache.move_to_skip("k")
+            getattr(cache, invalidate)("k")
         if replacement:
             cache.put("k", "new", 0.25, "log")
     finally:
