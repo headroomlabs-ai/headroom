@@ -188,7 +188,10 @@ def _ccr_markers_live(text: str) -> bool:
         from ..cache.compression_store import get_compression_store
 
         store = get_compression_store()
-        return all(store.exists(hash_key) for hash_key in hashes)
+        # ``None`` means the store could not answer: an outage is not an
+        # eviction, and dropping the result would throw away data that is
+        # still retrievable once the store comes back.
+        return store.all_live(hashes) is not False
     except Exception:  # noqa: BLE001 - never break a request over a cache check
         logger.debug("CCR marker liveness check failed", exc_info=True)
         return True

@@ -367,6 +367,35 @@ class SQLiteBackend:
                 self._handle_db_error(e, f"delete {safe_id(hash_key)}")
                 return False
 
+    def available(self) -> bool:
+        """Whether reads can reach the database right now (False = unknown).
+
+        ``get``/``exists`` degrade a read failure to a miss, so a caller that
+        would delete data on a miss needs this to tell an outage from a real
+        absence. Mirrors ``_connection``: a held handle means reads work.
+        """
+        with self._lock:
+            return self._conn is not None
+
+    def live(self, hash_key: str) -> bool:
+        """Whether the entry is there and unexpired, without reading its blob.
+
+        ``get`` deserializes the whole original, which is megabytes for a large
+        tool output; the liveness check only needs the row and its TTL, both of
+        which are columns.
+        """
+        with self._lock:
+            try:
+                conn = self._connection()
+                row = conn.execute(
+                    "SELECT 1 FROM ccr_entries WHERE hash = ? AND created_at + ttl >= ?",
+                    (hash_key, time.time()),
+                ).fetchone()
+            except sqlite3.DatabaseError as e:
+                self._handle_db_error(e, f"live {safe_id(hash_key)}")
+                return False
+        return row is not None
+
     def exists(self, hash_key: str) -> bool:
         with self._lock:
             try:

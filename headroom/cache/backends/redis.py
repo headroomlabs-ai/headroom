@@ -72,6 +72,18 @@ class RedisBackend:
     def exists(self, hash_key: str) -> bool:
         return bool(self._guard.call("read", lambda: self._client.exists(self._key(hash_key)), 0))
 
+    def available(self) -> bool:
+        """Whether the last Redis call reached the server (False = unknown).
+
+        A read that fails is returned as a miss, so a caller that would delete
+        data on a miss needs this to tell an outage from a real absence.
+        """
+        return self._guard.available
+
+    def live(self, hash_key: str) -> bool:
+        """Whether the key is there; Redis expires each key with its own TTL."""
+        return self.exists(hash_key)
+
     def clear(self) -> None:
         keys = self._scan()
         if keys:

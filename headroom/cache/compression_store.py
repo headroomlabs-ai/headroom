@@ -39,6 +39,7 @@ import re
 import threading
 import time
 from collections import deque
+from collections.abc import Iterable
 from contextvars import ContextVar
 from dataclasses import asdict, dataclass, field, replace
 from typing import TYPE_CHECKING, Any
@@ -650,6 +651,36 @@ class CompressionStore:
                     self._mark_heap_entries_stale()
                 return False
             return True
+
+    def all_live(self, hash_keys: Iterable[str]) -> bool | None:
+        """Whether every one of ``hash_keys`` is present and unexpired.
+
+        ``None`` when the backend could not answer. That case has to be told
+        apart from a miss by a caller that would otherwise discard its own
+        data: a Redis or SQLite read failure degrades to "entry not found", so
+        an outage is indistinguishable from an eviction by the return value
+        alone. Availability is read *after* the lookups, so the state reflects
+        whether they actually reached the store.
+        """
+        with self._lock:
+            live = True
+            for hash_key in hash_keys:
+                # ``live`` is the key-only probe: the entry's original can be
+                # megabytes, and only its presence and TTL matter here.
+                probe = getattr(self._backend, "live", None)
+                if probe is None:
+                    entry = self._backend.get(hash_key)
+                    live = entry is not None and not entry.is_expired()
+                else:
+                    live = probe(hash_key)
+                if not live:
+                    break
+        if live:
+            return True
+        available = getattr(self._backend, "available", None)
+        if available is not None and available() is False:
+            return None
+        return False
 
     def get_entry_status(
         self,
