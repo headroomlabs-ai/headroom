@@ -88,9 +88,11 @@ def test_count_messages_still_includes_generation_prompt() -> None:
     assert counter.count_messages(messages) == 4
 
 
-def test_count_message_is_clamped_when_template_render_fails() -> None:
-    # A template that only renders with a generation prompt forces the base
-    # count-minus-reply-overhead path, which gives 2 - 3 for this message.
+@pytest.mark.parametrize("content", ["", "hello"])
+def test_count_message_estimates_when_template_render_fails(content: str) -> None:
+    # A template that only renders with a generation prompt must not be retried
+    # with one: that path subtracts the reply overhead and can reach 0 for a
+    # short nonempty message. The per-message estimate applies instead.
     template = (
         "{% if not add_generation_prompt %}"
         "{{ raise_exception('generation prompt required') }}"
@@ -98,7 +100,11 @@ def test_count_message_is_clamped_when_template_render_fails() -> None:
     )
     counter = _counter(template)
 
-    assert counter.count_message({"role": "user", "content": ""}) >= 0
+    assert counter.count_message({"role": "user", "content": content}) == (
+        HuggingFaceTokenizer.MESSAGE_OVERHEAD
+        + counter.count_text("user")
+        + counter.count_text(content)
+    )
 
 
 def test_count_message_without_chat_template_uses_base_estimate() -> None:

@@ -464,7 +464,10 @@ class HuggingFaceTokenizer(BaseTokenizer):
             templated = self._count_with_chat_template([message], add_generation_prompt=False)
             if templated is not None:
                 return templated
-        return max(0, super().count_message(message))
+        # Estimate without the template. ``super().count_message`` would go
+        # through ``self.count_messages``, which retries the template with a
+        # generation prompt and can still subtract a short message down to 0.
+        return max(0, BaseTokenizer.count_messages(self, [message]) - self.REPLY_OVERHEAD)
 
     def _count_with_chat_template(
         self, messages: list[dict[str, Any]], *, add_generation_prompt: bool
