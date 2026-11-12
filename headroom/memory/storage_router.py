@@ -128,14 +128,23 @@ def _main_worktree_basename(git_common_dir: str) -> str:
     parent's basename is the repository directory name; a linked
     worktree's gitdir (``<main>/.git/worktrees/<name>``) collapses to the
     same label via ``commondir`` already resolving to ``<main>/.git``.
-    Submodule common dirs (``<main>/.git/modules/<name>``) label as the
-    submodule name — matches what the user would call the project.
+    A submodule's gitdir lives under ``<main>/.git/modules/`` at a path
+    mirroring its work-tree location, so a submodule at ``vendor/lib``
+    has common dir ``<main>/.git/modules/vendor/lib``: the label is the
+    last segment (``lib``), not an intermediate one — matching what the
+    user would call the project.
     """
     path = Path(git_common_dir).resolve()
     if path.name == ".git":
         return path.parent.name or "git-project"
-    if path.parent.name == "modules":
-        return path.name or "git-project"
+    parts = path.parts
+    # ``<main>/.git/modules/<name>`` for a top-level submodule and
+    # ``<main>/.git/modules/vendor/lib`` for a nested one. Walk to the
+    # deepest ``modules`` segment so a repo that itself lives under a
+    # directory called ``.git`` still labels on the right submodule.
+    for index in range(len(parts) - 1, 0, -1):
+        if parts[index] == "modules" and parts[index - 1] == ".git":
+            return path.name or "git-project"
     return path.parent.name or "git-project"
 
 

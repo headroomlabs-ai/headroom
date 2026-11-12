@@ -296,3 +296,35 @@ class TestGitCommonDirHelper:
 
         assert _main_worktree_basename(str(tmp_path / "r" / ".git" / "modules" / "mlib")) == "mlib"
         assert _main_worktree_basename(str(tmp_path / "weird" / "odd")) == "weird"
+
+    def test_nested_submodule_labels_on_its_own_name(self, tmp_path: Path) -> None:
+        # Review feedback on #4795: a submodule at a nested work-tree path
+        # (``vendor/lib``) has common dir ``.git/modules/vendor/lib``. The
+        # label must be the submodule itself (``lib``), not ``vendor``.
+        from headroom.memory.storage_router import _main_worktree_basename
+
+        common = tmp_path / "r" / ".git" / "modules" / "vendor" / "lib"
+        assert _main_worktree_basename(str(common)) == "lib"
+        deep = tmp_path / "r" / ".git" / "modules" / "a" / "b" / "c"
+        assert _main_worktree_basename(str(deep)) == "c"
+
+    def test_nested_submodule_key_is_distinct_and_shared_with_checkout(
+        self, tmp_path: Path
+    ) -> None:
+        # The key comes from the common dir, so a submodule checkout and its
+        # nested gitdir address one project — and stay distinct from the
+        # outer repo that hosts the ``.git/modules`` tree.
+        outer = tmp_path / "r"
+        (outer / ".git").mkdir(parents=True)
+        nested_gitdir = outer / ".git" / "modules" / "vendor" / "lib"
+        nested_gitdir.mkdir(parents=True)
+        sub_worktree = outer / "vendor" / "lib"
+        sub_worktree.mkdir(parents=True)
+        (sub_worktree / ".git").write_text(f"gitdir: {nested_gitdir}\n", encoding="utf-8")
+
+        r = ProjectResolver(key_strategy=GIT_STRATEGY)
+        via_sub = r.resolve(_ctx(headers={"x-headroom-cwd": str(sub_worktree)}))  # type: ignore[misc]
+        via_outer = r.resolve(_ctx(headers={"x-headroom-cwd": str(outer)}))  # type: ignore[misc]
+        assert via_sub is not None and via_outer is not None
+        assert via_sub[1] == "lib"
+        assert via_sub[0] != via_outer[0], "a submodule keeps its own memory DB"
