@@ -411,3 +411,34 @@ def test_responses_turn_hook_message_fold_is_applied_and_counted() -> None:
     assert working["input"][0]["output"] == "folded"  # fold applied to the outbound payload
     assert tokens_saved > 0  # ...and the message-fold saving is counted
     assert payload["input"][0]["output"] != "folded"  # original untouched (deep-copied)
+
+
+def test_codex_tool_schemas_are_forwarded_byte_identical() -> None:
+    """Codex's instructions+tools prefix is the one OpenAI keeps cached across
+    sessions; a compacted schema forfeits that hit on every first request
+    (12,288 cached tokens direct vs 0 compacted, measured on gpt-6.1-sol)."""
+    verbose = " ".join(["Runs a shell command in the workspace.\n"] * 30)
+    tools = [
+        {
+            "type": "function",
+            "name": "shell",
+            "description": verbose,
+            "parameters": {"type": "object", "properties": {"cmd": {"type": "string"}}},
+        }
+    ]
+    payload: dict[str, Any] = {"model": "gpt-5.5", "tools": tools, "input": []}
+    handler = _HandlerHarness(ContentRouter(ContentRouterConfig()))
+
+    codex, _, codex_saved, codex_transforms, *_ = handler._compress_openai_responses_payload(
+        payload, model="gpt-5.5", request_id="hr_codex", client="codex"
+    )
+    other, _, _, other_transforms, *_ = handler._compress_openai_responses_payload(
+        payload, model="gpt-5.5", request_id="hr_other", client="opencode"
+    )
+
+    assert codex["tools"] == tools
+    assert "openai:responses:tool_schema_compaction" not in codex_transforms
+    assert codex_saved == 0
+    # Other clients keep the compaction.
+    assert other["tools"] != tools
+    assert "openai:responses:tool_schema_compaction" in other_transforms

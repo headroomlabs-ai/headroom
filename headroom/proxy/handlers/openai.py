@@ -3129,8 +3129,15 @@ class OpenAIHandlerMixin:
         reason: str | None = None
 
         tool_compaction_started = time.perf_counter()
+        # Codex sends one standard instructions+tools prefix that OpenAI keeps
+        # cached across sessions. Rewriting any byte of it costs that hit on
+        # every session's first request. Measured on gpt-6.1-sol, Codex 0.167.0,
+        # both over HTTP: 12,288 tokens cached direct, 0 through the proxy with
+        # only this compaction applied, which saves 360 tokens a request.
         compacted_payload, tools_modified, tools_before_bytes, tools_after_bytes = (
-            _compact_openai_responses_tools(working)
+            (working, False, 0, 0)
+            if client == "codex"
+            else _compact_openai_responses_tools(working)
         )
         _add_timing("compression_tool_schema_compaction", tool_compaction_started)
         if tools_modified:
