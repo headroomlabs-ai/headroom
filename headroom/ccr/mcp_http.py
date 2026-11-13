@@ -51,14 +51,18 @@ def transport_security_settings(host: str, port: int) -> TransportSecuritySettin
     the loopback names; any other bind accepts its own address. More names
     come from ``HEADROOM_MCP_ALLOWED_HOSTS``.
     """
-    if host in _WILDCARD_BINDS or is_loopback_host(host):
+    bare = host.strip("[]")
+    if bare in _WILDCARD_BINDS or is_loopback_host(bare):
         names = list(_LOOPBACK_NAMES)
     else:
-        names = [f"[{host}]" if ":" in host else host]
+        names = [f"[{bare}]" if ":" in bare else bare]
     allowed_hosts = [f"{name}:{port}" for name in names]
+    if port in (80, 443):
+        # Clients leave a scheme-default port out of Host and Origin.
+        allowed_hosts.extend(names)
     extra = [entry.strip() for entry in os.environ.get(ALLOWED_HOSTS_ENV, "").split(",")]
     allowed_hosts.extend(entry for entry in extra if entry)
-    if host in _WILDCARD_BINDS and not any(extra):
+    if bare in _WILDCARD_BINDS and not any(extra):
         logger.warning(
             "MCP HTTP server bound to %s accepts only loopback Host headers; "
             "set %s=<name:port,...> for the names remote clients use",

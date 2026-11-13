@@ -84,16 +84,16 @@ async def _post_initialize(app, base_url: str, headers: dict[str, str]) -> httpx
 
 
 @pytest.mark.parametrize(
-    ("base_url", "headers"),
+    ("base_url", "headers", "status"),
     [
         # A page whose hostname now resolves to 127.0.0.1: Host names that page.
-        ("http://page.example:8788", {"Origin": "http://page.example:8788"}),
+        ("http://page.example:8788", {"Origin": "http://page.example:8788"}, 421),
         # Right Host, but the request comes from another page's script.
-        ("http://127.0.0.1:8788", {"Origin": "https://page.example"}),
+        ("http://127.0.0.1:8788", {"Origin": "https://page.example"}, 403),
     ],
 )
 async def test_streamable_http_refuses_foreign_host_or_origin(
-    base_url: str, headers: dict[str, str]
+    base_url: str, headers: dict[str, str], status: int
 ) -> None:
     session_manager = create_streamable_http_session_manager(
         create_ccr_mcp_server(), host="127.0.0.1", port=8788
@@ -103,7 +103,7 @@ async def test_streamable_http_refuses_foreign_host_or_origin(
     async with session_manager.run():
         response = await _post_initialize(app, base_url, headers)
 
-    assert response.status_code in (403, 421)
+    assert response.status_code == status
     assert "mcp-session-id" not in response.headers
 
 
@@ -122,3 +122,17 @@ async def test_streamable_http_accepts_configured_host(monkeypatch: pytest.Monke
     assert configured.status_code == 200, configured.text
     assert loopback.status_code == 200, loopback.text
     assert other.status_code == 421
+
+
+@pytest.mark.parametrize(("host", "port"), [("127.0.0.1", 80), ("[::1]", 8788)])
+async def test_streamable_http_accepts_loopback_as_clients_address_it(host: str, port: int) -> None:
+    session_manager = create_streamable_http_session_manager(
+        create_ccr_mcp_server(), host=host, port=port
+    )
+    app = create_streamable_http_app(session_manager, path="/mcp")
+    base_url = "http://localhost" if port == 80 else f"http://[::1]:{port}"
+
+    async with session_manager.run():
+        response = await _post_initialize(app, base_url, {"Origin": base_url})
+
+    assert response.status_code == 200, response.text
