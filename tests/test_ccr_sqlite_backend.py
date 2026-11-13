@@ -42,6 +42,32 @@ def db_path(tmp_path):
 
 
 class TestSQLiteBackend:
+    def test_context_clock_and_retrieval_reopen_offline_connection(self, db_path):
+        backend = SQLiteBackend(db_path)
+        store = CompressionStore(backend=backend, enable_feedback=False)
+        key = store.store("clock payload", "sample")
+        entry = store.retrieve(key)
+        backend._conn.close()
+        backend._conn = None
+        backend._next_reopen_at = 0.0
+        snapshot = backend.observe_context_turn("conversation", [key])
+        assert snapshot is not None
+        assert snapshot.current_turn == 1
+        backend.record_retrieval(key, entry, "query")
+        assert backend.get(key).retrieval_count == 2
+
+    def test_fresh_event_write_failure_never_returns_marker(self, db_path, monkeypatch):
+        backend = SQLiteBackend(db_path)
+        store = CompressionStore(backend=backend, enable_feedback=False)
+
+        def unavailable():
+            raise sqlite3.OperationalError("store offline")
+
+        monkeypatch.setattr(backend, "_connection", unavailable)
+        with pytest.raises(StorageError):
+            store.store("must keep this original", "sample")
+        assert backend.observe_context_turn("conversation", ["a" * 24]) is None
+
     def test_crud_roundtrip(self, db_path):
         b = SQLiteBackend(db_path)
         entry = make_entry()
@@ -179,7 +205,11 @@ class TestSQLiteBackend:
                 "SELECT name FROM sqlite_master WHERE type = 'index' AND name LIKE 'idx_%'"
             )
         }
-        assert indexes == {"idx_ccr_expiry_deadline"}
+        assert indexes == {
+            "idx_ccr_expiry_deadline",
+            "idx_ccr_context_expiry",
+            "idx_ccr_context_namespace",
+        }
         entry = b.get("h1")
         assert entry is not None
         assert entry.original_content == make_entry("h1").original_content
