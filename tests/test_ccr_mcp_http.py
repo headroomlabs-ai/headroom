@@ -40,11 +40,11 @@ async def test_streamable_http_initialize_and_list_tools() -> None:
     async with session_manager.run():
         async with httpx2.AsyncClient(
             transport=transport,
-            base_url="http://testserver",
+            base_url="http://127.0.0.1:8788",
             event_hooks={"response": [record_session_id]},
         ) as http_client:
             async with streamable_http_client(
-                "http://testserver/mcp",
+                "http://127.0.0.1:8788/mcp",
                 http_client=http_client,
                 terminate_on_close=False,
             ) as (read_stream, write_stream):
@@ -58,3 +58,67 @@ async def test_streamable_http_initialize_and_list_tools() -> None:
     assert "headroom_compress" in tool_names
     assert "headroom_retrieve" in tool_names
     assert "headroom_stats" in tool_names
+
+
+_INITIALIZE = {
+    "jsonrpc": "2.0",
+    "id": 1,
+    "method": "initialize",
+    "params": {
+        "protocolVersion": "2025-06-18",
+        "capabilities": {},
+        "clientInfo": {"name": "test", "version": "0"},
+    },
+}
+
+
+async def _post_initialize(app, base_url: str, headers: dict[str, str]) -> httpx2.Response:
+    async with httpx2.AsyncClient(
+        transport=httpx2.ASGITransport(app=app), base_url=base_url
+    ) as http_client:
+        return await http_client.post(
+            "/mcp",
+            json=_INITIALIZE,
+            headers={"Accept": "application/json, text/event-stream", **headers},
+        )
+
+
+@pytest.mark.parametrize(
+    ("base_url", "headers"),
+    [
+        # A page whose hostname now resolves to 127.0.0.1: Host names that page.
+        ("http://page.example:8788", {"Origin": "http://page.example:8788"}),
+        # Right Host, but the request comes from another page's script.
+        ("http://127.0.0.1:8788", {"Origin": "https://page.example"}),
+    ],
+)
+async def test_streamable_http_refuses_foreign_host_or_origin(
+    base_url: str, headers: dict[str, str]
+) -> None:
+    session_manager = create_streamable_http_session_manager(
+        create_ccr_mcp_server(), host="127.0.0.1", port=8788
+    )
+    app = create_streamable_http_app(session_manager, path="/mcp")
+
+    async with session_manager.run():
+        response = await _post_initialize(app, base_url, headers)
+
+    assert response.status_code in (403, 421)
+    assert "mcp-session-id" not in response.headers
+
+
+async def test_streamable_http_accepts_configured_host(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("HEADROOM_MCP_ALLOWED_HOSTS", "mcp.internal:8788")
+    session_manager = create_streamable_http_session_manager(
+        create_ccr_mcp_server(), host="0.0.0.0", port=8788
+    )
+    app = create_streamable_http_app(session_manager, path="/mcp")
+
+    async with session_manager.run():
+        configured = await _post_initialize(app, "http://mcp.internal:8788", {})
+        loopback = await _post_initialize(app, "http://localhost:8788", {})
+        other = await _post_initialize(app, "http://other.internal:8788", {})
+
+    assert configured.status_code == 200, configured.text
+    assert loopback.status_code == 200, loopback.text
+    assert other.status_code == 421

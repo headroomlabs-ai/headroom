@@ -159,6 +159,8 @@ For multiple proxy instances, register one stdio MCP server per proxy URL:
 
 If you need Streamable HTTP instead of stdio, run `headroom mcp serve --transport http` and point your MCP host at that endpoint. The default path is `/mcp`, and the default port is `8788`.
 
+The HTTP transport only answers requests whose `Host` header names the address it is bound to (`127.0.0.1`, `localhost` or `[::1]` with the bound port for a loopback or `0.0.0.0` bind), and refuses browser requests from any other origin. If clients reach it through another name, such as a hostname or a reverse proxy, list those as `name:port` in `HEADROOM_MCP_ALLOWED_HOSTS` (comma-separated).
+
 Do not assume that a running proxy exposes an HTTP MCP endpoint at `/mcp`. The proxy serves its own API; it does not automatically provide the MCP HTTP transport.
 
 ### `command: "headroom"` fails to start
