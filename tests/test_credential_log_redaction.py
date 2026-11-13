@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import stat
 from unittest.mock import AsyncMock, patch
 
@@ -119,4 +120,15 @@ def test_upstream_error_dump_masks_credentials_and_is_owner_only(
     assert "FAKESECRET" not in text
     assert "sk-ant-FAKE" not in text and "Bearer sk-F" not in text
     assert "FAKE-OCP" not in text
-    assert stat.S_IMODE(dump.stat().st_mode) == 0o600
+    if os.name != "nt":  # POSIX permission bits
+        assert stat.S_IMODE(dump.stat().st_mode) == 0o600
+
+
+def test_query_names_cannot_split_the_log_line() -> None:
+    from headroom.proxy.query_log_policy import redact_query_string_for_log
+
+    rendered = redact_query_string_for_log("a%0D%0Aforged%20line=1&key=secret")
+
+    assert "\n" not in rendered and "\r" not in rendered
+    assert "secret" not in rendered
+    assert rendered == "a%0D%0Aforged%20line=<redacted>&key=<redacted>"
