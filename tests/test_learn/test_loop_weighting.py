@@ -585,6 +585,52 @@ class TestIdentityFallsBackWhenTheSchemaIsUnknown:
         assert _canonical_signature(call).startswith("bash::")
 
 
+class TestInputSummaryToleratesMalformedInput:
+    """``input_summary`` renders untrusted session fields during a scan.
+
+    ``learn`` reads transcripts written by other processes, so a tool input can
+    be malformed: a real opencode v2 session stored ``{"command": true}`` for a
+    Bash call. Both the loop sampler and the digest formatter read
+    ``input_summary``, so slicing that boolean aborted the entire run.
+    """
+
+    @pytest.mark.parametrize(
+        ("command", "expected"),
+        [
+            (True, "True"),
+            (7, "7"),
+            (None, ""),
+            (["pytest", "-q"], "['pytest', '-q']"),
+        ],
+    )
+    def test_a_non_string_command_renders_instead_of_raising(self, command, expected):
+        call = _call("Bash", "call_0", {"command": command}, msg_index=0)
+
+        assert call.input_summary == expected
+
+    def test_a_non_mapping_input_renders_instead_of_raising(self):
+        call = _call("Bash", "call_0", ["pytest", "-q"], msg_index=0)
+
+        assert call.input_summary == ""
+
+    def test_a_malformed_call_still_loops_and_reaches_the_digest(self):
+        sessions = [
+            SessionData(
+                session_id="s",
+                tool_calls=[
+                    _call("Bash", f"call_{i}", {"command": True}, msg_index=i) for i in range(3)
+                ],
+            )
+        ]
+
+        loops = detect_loops(sessions)
+        assert [lp.count for lp in loops] == [3]
+        assert loops[0].sample_input == "True"
+
+        digest = _build_digest(_project(), sessions)
+        assert "Bash: True" in digest
+
+
 class TestSearchIdentityIncludesPath:
     """The same pattern in different trees is three searches, not a loop.
 
