@@ -284,9 +284,18 @@ def compress_content(name: str, content: str, params: dict[str, Any] | None = No
         return extracted if extracted else content
     if name == "kompress":
         try:
-            return str(compressor.compress(content, context=query).compressed)
+            compressed = str(compressor.compress(content, context=query).compressed)
         except Exception as e:
             raise CompressorUnavailable(f"kompress model unavailable: {e}") from e
+        # compress() fail-safes to passthrough instead of raising when the
+        # model can't load (offline env, cold cache) or the canary/failure
+        # latch has degraded it. A passthrough here means the compressor
+        # backend never ran — report it as unavailable (skip) rather than a
+        # measured 0.0, which would masquerade as both "pass" and "drift".
+        if not compressor.is_ready() or compressor._degraded_reason is not None:
+            reason = compressor._degraded_reason or "model not loaded (cold cache / offline)"
+            raise CompressorUnavailable(f"kompress backend inactive: {reason}")
+        return compressed
     raise CompressorUnavailable(f"unknown compressor {name!r}")
 
 
