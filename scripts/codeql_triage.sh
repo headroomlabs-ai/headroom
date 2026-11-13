@@ -11,12 +11,15 @@
 # instead of opening another. A reused issue is never edited, reopened or
 # retitled, so its closure stands. Each issue body and update comment records
 # the counts in a hidden marker. A re-run comments with the new counts when
-# they differ from the last recorded ones (an alert closed or reopened) or when
-# an alert was created after that record; otherwise it does nothing. The
-# marker holds only the counts, and the time of the record is the public
-# timestamp of the issue or comment carrying it, so nothing in the issue
-# identifies an alert. Markers count only in the issue body and in comments
-# by TRIAGE_BOT_LOGIN, so a reader cannot silence an update by commenting.
+# they differ from the last recorded ones, or when an open alert changed after
+# that record (its updated_at moves when it is created, reopened or otherwise
+# changed, so one alert closing while another reopens is still reported);
+# otherwise it does nothing. The marker holds only the counts, and the time of
+# the record is the public timestamp of the issue or comment carrying it, so
+# nothing in the issue identifies an alert. The marker in the issue body is
+# trusted (the issue is found by its week marker and the security label, which
+# only collaborators can set); in comments only those by TRIAGE_BOT_LOGIN
+# count, so a reader cannot silence an update by commenting.
 #
 # Env: REPO (owner/name), TRIAGE_ASSIGNEE (login). TRIAGE_BOT_LOGIN (default
 # github-actions[bot], the GITHUB_TOKEN identity) is the author whose comments
@@ -44,16 +47,15 @@ marker="<!-- codeql-triage:${week_key} -->"
 # ShellCheck (SC2016) to misread.
 alert_rows_jq=$(cat <<'JQ'
 .[] | select(.rule.security_severity_level == "critical" or .rule.security_severity_level == "high")
-    | "\(.rule.security_severity_level) \(.created_at)"
+    | "\(.rule.security_severity_level) \(.updated_at // .created_at)"
 JQ
 )
 # Input: the issue object, then the comment pages. Output: "<state> <time>" of
 # the last marker in the issue body or a bot comment, or nothing.
 last_state_jq=$(cat <<'JQ'
 .[0] as $issue
-| ([$issue] + (.[1:] | add // []))
-| map(select(.user.login == $bot)
-      | {at: .created_at, s: ((.body // "") | capture("<!-- codeql-triage-state:(?<s>c[0-9]+-h[0-9]+) -->") | .s)})
+| ([$issue] + ((.[1:] | add // []) | map(select(.user.login == $bot))))
+| map({at: .created_at, s: ((.body // "") | capture("<!-- codeql-triage-state:(?<s>c[0-9]+-h[0-9]+) -->") | .s)})
 | last // empty
 | "\(.s) \(.at)"
 JQ
@@ -63,7 +65,7 @@ week_issue_jq=$(cat <<'JQ'
 JQ
 )
 
-# One "<severity> <created_at>" row per open critical/high alert. Kept local:
+# One "<severity> <updated_at>" row per open critical/high alert. Kept local:
 # only the counts are written to the issue.
 alerts="$(gh api --paginate -X GET "repos/$REPO/code-scanning/alerts" -f state=open -f per_page=100 \
   | jq -r "$alert_rows_jq")"
@@ -89,9 +91,9 @@ if [ -n "$existing" ]; then
   recorded_state="${recorded%% *}"
   recorded_at="${recorded#* }"
   # ISO-8601 UTC timestamps compare correctly as strings.
-  created_since="$(printf '%s\n' "$alerts" \
+  changed_since="$(printf '%s\n' "$alerts" \
     | awk -v at="$recorded_at" 'NF == 2 && $2 > at { n++ } END { print n + 0 }')"
-  if [ -n "$recorded" ] && [ "$recorded_state" = "$state" ] && [ "$created_since" -eq 0 ]; then
+  if [ -n "$recorded" ] && [ "$recorded_state" = "$state" ] && [ "$changed_since" -eq 0 ]; then
     echo "Week $week_key already has issue #$existing and the open critical/high alerts are unchanged. Nothing to do."
     exit 0
   fi

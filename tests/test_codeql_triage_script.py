@@ -82,13 +82,19 @@ else:
 '''
 
 
-def _alert(number: int, severity: str = "high", created_at: str = "2026-10-01T00:00:00Z") -> dict:
+def _alert(
+    number: int,
+    severity: str = "high",
+    created_at: str = "2026-10-01T00:00:00Z",
+    updated_at: str | None = None,
+) -> dict:
     return {
         "number": number,
         "html_url": f"https://github.com/o/r/security/code-scanning/{number}",
         "rule": {"id": f"py/rule-{number}", "security_severity_level": severity},
         "most_recent_instance": {"location": {"path": "headroom/x.py", "start_line": number}},
         "created_at": created_at,
+        "updated_at": updated_at or created_at,
     }
 
 
@@ -289,3 +295,28 @@ def test_a_failed_comment_read_stops_the_run(harness):
 
     assert result.returncode != 0
     assert state()["issues"][0]["comments"] == []
+
+
+def test_one_alert_closing_while_another_reopens_is_reported(harness):
+    set_alerts, state, _, run = harness
+    set_alerts(_alert(1))
+    run("2026-10-05")  # records c0-h1
+
+    # #1 fixed, older #2 reopened: same counts, nothing newly created.
+    set_alerts(_alert(2, created_at="2026-09-01T00:00:00Z", updated_at="2026-10-06T08:00:00Z"))
+    run("2026-10-06")
+
+    (comment,) = state()["issues"][0]["comments"]
+    assert "critical 0, high 1" in comment["body"]
+
+
+def test_body_marker_counts_whoever_authored_the_issue(harness):
+    set_alerts, state, edit_issue, run = harness
+    set_alerts(_alert(1))
+    run("2026-10-05")
+    edit_issue(1, user={"login": "previous-bot-identity"})
+
+    result = run("2026-10-06")  # unchanged alerts
+
+    assert state()["issues"][0]["comments"] == []
+    assert "Nothing to do" in result.stdout
