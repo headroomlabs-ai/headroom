@@ -351,25 +351,37 @@ def test_the_base_url_override_is_resolved_once_per_request(
         assert "changing.example" not in outbound.url, outbound.url
 
 
-def test_a_long_image_compression_does_not_leave_an_expired_pin(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """The guard's pin lasts 60 s; image compression may take longer.
+def _run_image_chat(monkeypatch: pytest.MonkeyPatch, *, expire_pins: bool) -> dict[str, list[Any]]:
+    """Send an image chat request to a client-chosen gateway; record guard activity.
 
-    The stub compression ages every pin in the request's scope past its
-    deadline. The connection must still find a current pin for the gateway the
-    request was checked against, or the connect layer refuses it.
+    The stub image compression optionally ages every pin in the request's scope
+    past its deadline, standing in for a compression that outlasts the pin.
     """
+    import asyncio
     import socket
 
     from headroom.proxy import upstream_guard
 
     monkeypatch.delenv("HEADROOM_ALLOWED_BASE_URLS", raising=False)
-    monkeypatch.setattr(
-        socket,
-        "getaddrinfo",
-        lambda *a, **k: [(None, None, None, None, ("93.184.216.34", 443))],
-    )
+    seen: dict[str, list[Any]] = {"lookups": [], "guard_on_loop": [], "pin_at_send": []}
+
+    def _public(host: str, *a: object, **k: object) -> list[object]:
+        seen["lookups"].append(host)
+        return [(None, None, None, None, ("93.184.216.34", 443))]
+
+    real_guard = upstream_guard.is_safe_upstream_url
+
+    def _recording_guard(url: str, **kwargs: Any) -> bool:
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError:
+            seen["guard_on_loop"].append(False)
+        else:
+            seen["guard_on_loop"].append(True)
+        return real_guard(url, **kwargs)
+
+    monkeypatch.setattr(socket, "getaddrinfo", _public)
+    monkeypatch.setattr(upstream_guard, "is_safe_upstream_url", _recording_guard)
     upstream_guard.clear_validated_addresses()
 
     class _Compressor:
@@ -379,22 +391,21 @@ def test_a_long_image_compression_does_not_leave_an_expired_pin(
         def close(self) -> None:
             return None
 
-    async def _slow_compression(messages: Any, **kwargs: Any) -> tuple[Any, None]:
-        scope = upstream_guard._PIN_SCOPE.get() or {}
-        for host, pin in list(scope.items()):
-            scope[host] = upstream_guard.UpstreamPin(pin.addresses, 0.0)
+    async def _compression(messages: Any, **kwargs: Any) -> tuple[Any, None]:
+        if expire_pins:
+            scope = upstream_guard._PIN_SCOPE.get() or {}
+            for host, pin in list(scope.items()):
+                scope[host] = upstream_guard.UpstreamPin(pin.addresses, 0.0)
         return messages, None
 
     monkeypatch.setattr("headroom.proxy.helpers._get_image_compressor", lambda: _Compressor())
     monkeypatch.setattr(
-        "headroom.proxy.handlers.openai.run_image_compression_isolated", _slow_compression
+        "headroom.proxy.handlers.openai.run_image_compression_isolated", _compression
     )
-
-    pin_at_send: list[upstream_guard.UpstreamPin | None] = []
 
     class _Handler(_ChatHandler):
         async def _retry_request(self, method: str, url: str, headers: dict, body: dict, **kwargs):  # noqa: ANN201
-            pin_at_send.append(upstream_guard.guarded_pin("gateway.example"))
+            seen["pin_at_send"].append(upstream_guard.guarded_pin("gateway.example"))
             return await super()._retry_request(method, url, headers, body, **kwargs)
 
     handler = _Handler()
@@ -416,7 +427,26 @@ def test_a_long_image_compression_does_not_leave_an_expired_pin(
         path="/v1/chat/completions",
     )
     anyio.run(handler.handle_openai_chat, request)
+    return seen
 
-    assert pin_at_send, "the request was not sent"
-    pin = pin_at_send[0]
+
+def test_a_long_image_compression_does_not_leave_an_expired_pin(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A pin that lapsed during image compression is renewed off the event loop."""
+    seen = _run_image_chat(monkeypatch, expire_pins=True)
+
+    assert seen["pin_at_send"], "the request was not sent"
+    pin = seen["pin_at_send"][0]
     assert pin is not None and not pin.is_expired(), "the connection would find an expired pin"
+    assert seen["guard_on_loop"][-1] is False, "the renewal ran on the event-loop thread"
+
+
+def test_a_still_valid_pin_is_not_checked_again_after_image_compression(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A second lookup is only needed once the pin lapsed; it could fail a valid request."""
+    seen = _run_image_chat(monkeypatch, expire_pins=False)
+
+    assert seen["pin_at_send"], "the request was not sent"
+    assert seen["lookups"] == ["gateway.example"], seen["lookups"]

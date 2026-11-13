@@ -60,7 +60,11 @@ from headroom.proxy.tool_schema_savings_policy import (
     without_deferral_flags,
 )
 from headroom.proxy.turn_hooks import conversation_from, run_responses_create_hooks
-from headroom.proxy.upstream_guard import is_safe_upstream_url
+from headroom.proxy.upstream_guard import (
+    guarded_pin,
+    is_safe_upstream_url,
+    is_safe_upstream_url_async,
+)
 from headroom.proxy.ws_headers import WS_HOP_BY_HOP_HEADERS
 from headroom.proxy.ws_session_registry import (
     TerminationCause,
@@ -519,6 +523,12 @@ def _resolve_openai_upstream_base(request_headers: dict[str, str]) -> str | None
         logger.warning("ignoring unsafe x-headroom-base-url override: %r", raw_base_url)
         return None
     return normalized
+
+
+def _upstream_pin_lapsed(url: str) -> bool:
+    """True when this request pinned ``url``'s host and that pin has expired."""
+    pin = guarded_pin(urlparse(url).hostname or "")
+    return pin is not None and pin.is_expired()
 
 
 def _resolve_openai_chat_handler_path(base_url: str, model: str | None) -> str:
@@ -3863,13 +3873,15 @@ class OpenAIHandlerMixin:
                 if compressor and hasattr(compressor, "close"):
                     compressor.close()
         # The guard's pin for a client-chosen upstream lasts 60 s and image
-        # compression can run longer. Check the same URL again so the connection
-        # has a current pin. The destination is not chosen again: if the host no
-        # longer passes, the request is refused.
+        # compression can run longer. If the pin lapsed, check the same URL again
+        # (off the event loop) so the connection has a current pin. The
+        # destination is not chosen again: if the host no longer passes, the
+        # request is refused.
         if (
             images_compressed
             and custom_upstream_base_url is not None
-            and not is_safe_upstream_url(custom_upstream_base_url)
+            and _upstream_pin_lapsed(custom_upstream_base_url)
+            and not await is_safe_upstream_url_async(custom_upstream_base_url)
         ):
             logger.warning(
                 "[%s] rejecting x-headroom-base-url that no longer passes the guard", request_id
