@@ -1,0 +1,60 @@
+# =============================================================================
+# Headroom as a shared proxy, served over HTTPS by Caddy
+# =============================================================================
+# Caddy is the only service on the network. It terminates HTTPS, gets and
+# renews the certificate, and forwards to Headroom over the compose network.
+# Headroom's own port is never published.
+#
+#   export HEADROOM_PROXY_TOKEN=$(openssl rand -hex 32)
+#   export HEADROOM_DOMAIN=headroom.example.com
+#   docker compose -f docker/docker-compose.https.yml up -d
+#
+# Clients use https://$HEADROOM_DOMAIN and send X-Headroom-Proxy-Token.
+#
+# Caddy runs in its own container on purpose. Headroom skips the proxy token
+# for callers on its own loopback, so a TLS sidecar that forwards to
+# 127.0.0.1 would let every remote caller in without one. From a separate
+# container, Caddy reaches Headroom from a network address and the token is
+# checked on every request.
+#
+# Certificates: a public HEADROOM_DOMAIN gets a Let's Encrypt certificate
+# (ports 80 and 443 must be reachable). For an internal name, see
+# docker/Caddyfile.
+# =============================================================================
+
+services:
+  headroom:
+    image: ${HEADROOM_IMAGE:-ghcr.io/headroomlabs-ai/headroom:latest}
+    command: ["--host", "0.0.0.0", "--port", "8787"]
+    restart: unless-stopped
+    environment:
+      HOME: /home/nonroot
+      HEADROOM_WORKSPACE_DIR: /home/nonroot/.headroom
+      HEADROOM_CONFIG_DIR: /home/nonroot/.headroom/config
+      # Required: callers reach Headroom through Caddy, from a network address.
+      HEADROOM_PROXY_TOKEN: ${HEADROOM_PROXY_TOKEN:?set HEADROOM_PROXY_TOKEN, e.g. openssl rand -hex 32}
+    # Reachable by Caddy on the compose network only; no host port.
+    expose: ["8787"]
+    volumes:
+      - headroom_workspace:/home/nonroot/.headroom
+
+  caddy:
+    image: caddy:2.10
+    restart: unless-stopped
+    environment:
+      HEADROOM_DOMAIN: ${HEADROOM_DOMAIN:?set HEADROOM_DOMAIN, the name clients use to reach the proxy}
+    ports:
+      - "80:80"    # certificate challenge and the redirect to HTTPS
+      - "443:443"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data      # certificates and keys, kept across restarts
+      - caddy_config:/config
+    depends_on:
+      headroom:
+        condition: service_healthy
+
+volumes:
+  headroom_workspace:
+  caddy_data:
+  caddy_config:
