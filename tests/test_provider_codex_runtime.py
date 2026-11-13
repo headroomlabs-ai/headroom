@@ -362,6 +362,9 @@ def test_provider_scope_codex_config_routes_messages_through_headroom(
     content = config_path.read_text(encoding="utf-8")
     assert 'env_key = "OPENAI_API_KEY"' not in content
     assert 'model_provider = "headroom"' in content
+    assert 'base_url = "http://127.0.0.1:' in content
+    assert 'experimental_realtime_ws_base_url = "https://api.openai.com/v1"' in content
+    assert 'experimental_realtime_webrtc_call_base_url = "https://api.openai.com/v1"' in content
 
     _assert_delivery(
         codex_proxy_stack,
