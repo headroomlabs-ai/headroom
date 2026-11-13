@@ -76,6 +76,28 @@ def test_multi_worker_config_keeps_secrets_out_of_the_environment(
     assert not Path(seen["secrets_file"]).exists()  # removed when the server stops
 
 
+def test_credential_free_restart_after_a_credentialed_run_still_starts(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from headroom.proxy import server
+
+    for name in ("HEADROOM_PROXY_CONFIG_JSON", "HEADROOM_PROXY_CONFIG_SECRETS_FILE"):
+        monkeypatch.setenv(name, "")
+        monkeypatch.delenv(name)
+    configs: list[ProxyConfig] = []
+
+    def fake_run_uvicorn(*_args: object) -> None:
+        configs.append(server._proxy_config_from_env())
+
+    with patch.object(server, "_run_uvicorn", side_effect=fake_run_uvicorn):
+        server.run_server(ProxyConfig(**SECRETS), workers=2, print_banner=False)
+        assert "HEADROOM_PROXY_CONFIG_SECRETS_FILE" not in os.environ
+        server.run_server(ProxyConfig(), workers=2, print_banner=False)
+
+    assert configs[0].proxy_token == "FAKE-PROXYTOKEN"
+    assert configs[1].proxy_token is None
+
+
 def test_worker_without_its_secrets_file_refuses_to_start(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:

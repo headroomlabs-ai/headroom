@@ -7078,6 +7078,8 @@ def run_server(
             )
         worker_config = _proxy_config_payload(config)
         worker_secrets_path = _write_worker_secrets(worker_config)
+        # A path left by an earlier run in this process names a deleted file.
+        os.environ.pop(_MULTI_WORKER_SECRETS_ENV, None)
         if worker_secrets_path is not None:
             os.environ[_MULTI_WORKER_SECRETS_ENV] = str(worker_secrets_path)
         os.environ[_MULTI_WORKER_CONFIG_ENV] = json.dumps(worker_config)
@@ -7122,6 +7124,7 @@ def run_server(
             remove_uds_path(uds_path)
         if worker_secrets_path is not None:
             worker_secrets_path.unlink(missing_ok=True)
+            os.environ.pop(_MULTI_WORKER_SECRETS_ENV, None)
 
 
 def _run_uvicorn(
