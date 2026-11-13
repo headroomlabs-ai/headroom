@@ -140,7 +140,9 @@ def test_free_form_queries_are_not_persisted() -> None:
     toin = ToolIntelligenceNetwork(TOINConfig(storage_path=""))
 
     assert toin._anonymize_query_pattern("show me the contents of /private/secret.txt") is None
-    assert toin._anonymize_query_pattern("status:error AND user:john") == "status:* user:*"
+    assert toin._anonymize_query_pattern("status:error AND user:john") == (
+        f"{toin._hash_field_name('status')}:* {toin._hash_field_name('user')}:*"
+    )
 
     toin.record_retrieval(
         "signature",
@@ -155,7 +157,9 @@ def test_free_form_queries_are_not_persisted() -> None:
 def test_query_pattern_length_is_bounded() -> None:
     toin = ToolIntelligenceNetwork(TOINConfig(storage_path=""))
 
-    assert toin._anonymize_query_pattern("field:" + "x" * 1000) == "field:*"
+    assert toin._anonymize_query_pattern("field:" + "x" * 1000) == (
+        f"{toin._hash_field_name('field')}:*"
+    )
     assert toin._anonymize_query_pattern(" ".join(f"field{i}:x" for i in range(200))) is None
 
 
@@ -188,11 +192,13 @@ def test_legacy_raw_query_keys_are_removed_on_load(tmp_path) -> None:
                 "tool_signature_hash": "abc",
                 "query_pattern_frequency": {
                     "raw prompt containing secret source code": 4,
-                    "status:* user:*": 2,
+                    "status:* user:*": 3,
+                    "1a2b3c4d:* 5e6f7a8b:*": 2,
                 },
                 "common_query_patterns": [
                     "raw prompt containing secret source code",
                     "status:* user:*",
+                    "1a2b3c4d:* 5e6f7a8b:*",
                 ],
             }
         },
@@ -202,8 +208,8 @@ def test_legacy_raw_query_keys_are_removed_on_load(tmp_path) -> None:
     toin = ToolIntelligenceNetwork(TOINConfig(storage_path=str(path)))
     pattern = next(iter(toin._patterns.values()))
 
-    assert pattern.query_pattern_frequency == {"status:* user:*": 2}
-    assert pattern.common_query_patterns == ["status:* user:*"]
+    assert pattern.query_pattern_frequency == {"1a2b3c4d:* 5e6f7a8b:*": 2}
+    assert pattern.common_query_patterns == ["1a2b3c4d:* 5e6f7a8b:*"]
 
 
 def _record(toin: ToolIntelligenceNetwork, index: int) -> None:
@@ -235,7 +241,7 @@ def _skip_warnings(caplog) -> list[logging.LogRecord]:
         lambda entry: {k: v for k, v in entry.items() if k != "tool_signature_hash"},
         lambda entry: {**entry, "field_semantics": {"field_1": "not a dict"}},
         lambda entry: {**entry, "query_pattern_frequency": "not a dict"},
-        lambda entry: {**entry, "query_pattern_frequency": {"status:*": "many"}},
+        lambda entry: {**entry, "query_pattern_frequency": {"1a2b3c4d:*": "many"}},
         lambda entry: {**entry, "seen_instance_hashes": "bad"},
         lambda entry: {**entry, "commonly_retrieved_fields": "abc"},
         lambda entry: {**entry, "sample_size": "x"},

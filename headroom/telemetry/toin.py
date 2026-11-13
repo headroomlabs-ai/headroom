@@ -951,10 +951,10 @@ class ToolIntelligenceNetwork:
         )
 
     def _sanitize_loaded_pattern(self, pattern: ToolPattern) -> bool:
-        """Remove legacy raw query keys from a loaded pattern."""
+        """Remove legacy query keys (raw text or unhashed field names) from a loaded pattern."""
         import re
 
-        safe_pattern = re.compile(r"(?:\w+:\*)(?:\s+\w+:\*)*")
+        safe_pattern = re.compile(r"[0-9a-f]{8}:\*(?:\s+[0-9a-f]{8}:\*)*")
         changed = False
         frequencies: dict[str, int] = {}
         for raw_key, count in pattern.query_pattern_frequency.items():
@@ -1249,8 +1249,10 @@ class ToolIntelligenceNetwork:
     def _anonymize_query_pattern(self, query: str) -> str | None:
         """Extract anonymized pattern from a query.
 
-        Keeps structural patterns, removes specific values.
-        E.g., "status:error AND user:john" -> "status:* AND user:*"
+        Keeps the shape of field/value predicates and drops the values. Field
+        names are hashed like every other TOIN field name: the text before a
+        ``:`` can itself be a credential (``<token>:x-oauth-basic``).
+        E.g., "status:error AND user:john" -> "<hash(status)>:* <hash(user)>:*"
         """
         if not query:
             return None
@@ -1267,7 +1269,7 @@ class ToolIntelligenceNetwork:
 
         # Preserve useful field shape while dropping operators, values, and
         # all unrelated text (which may contain arbitrary prompt data).
-        pattern = " ".join(f"{field}:*" for field in matches)
+        pattern = " ".join(f"{self._hash_field_name(field)}:*" for field in matches)
 
         # Remove if it's just generic
         if not pattern or len(pattern) > MAX_QUERY_PATTERN_LENGTH:

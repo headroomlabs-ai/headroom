@@ -36,6 +36,7 @@ import math
 import os
 import signal
 import sys
+import tempfile
 import threading
 import time
 from collections import OrderedDict
@@ -166,6 +167,7 @@ from headroom.proxy.memory_handler import MemoryConfig, MemoryHandler
 # Data models (extracted to headroom/proxy/models.py for maintainability)
 from headroom.proxy.model_router import ModelRouter, ModelRouterConfig
 from headroom.proxy.models import (
+    PROXY_CONFIG_SECRET_FIELDS,
     ProxyConfig,
     default_periodic_malloc_trim,
 )
@@ -600,6 +602,9 @@ class CompressionQuarantinedError(asyncio.TimeoutError):
 
 
 _MULTI_WORKER_CONFIG_ENV = "HEADROOM_PROXY_CONFIG_JSON"
+# The workers' copy of the config's credentials travels in an owner-only file,
+# not in the environment every child process inherits; this names the file.
+_MULTI_WORKER_SECRETS_ENV = "HEADROOM_PROXY_CONFIG_SECRETS_FILE"
 
 
 def _save_prefix_state_on_exit_signal(store: Any, path: str) -> Callable[[], None]:
@@ -6713,6 +6718,32 @@ def _settings_runtime_values(config: ProxyConfig) -> dict[str, Any]:
     return values
 
 
+def _write_worker_secrets(payload: dict[str, Any]) -> Path | None:
+    """Move the credential fields out of ``payload`` into an owner-only file.
+
+    Returns the file's path, or None when the config holds no credential.
+    """
+    secrets = {name: payload.pop(name) for name in PROXY_CONFIG_SECRET_FIELDS if payload.get(name)}
+    if not secrets:
+        return None
+    # mkstemp creates the file with mode 0600.
+    fd, raw_path = tempfile.mkstemp(prefix="headroom-proxy-config-", suffix=".json")
+    with os.fdopen(fd, "w", encoding="utf-8") as fh:
+        json.dump(secrets, fh)
+    return Path(raw_path)
+
+
+def _read_worker_secrets() -> dict[str, Any]:
+    path = os.environ.get(_MULTI_WORKER_SECRETS_ENV)
+    if not path:
+        return {}
+    with open(path, encoding="utf-8") as fh:
+        values = json.load(fh)
+    if not isinstance(values, dict):
+        raise TypeError("proxy config secrets file must hold a JSON object")
+    return values
+
+
 def _proxy_config_from_env() -> ProxyConfig:
     raw_config = os.environ.get(_MULTI_WORKER_CONFIG_ENV)
     if raw_config:
@@ -6720,6 +6751,7 @@ def _proxy_config_from_env() -> ProxyConfig:
             values = json.loads(raw_config)
             if not isinstance(values, dict):
                 raise TypeError("proxy config JSON must be an object")
+            values.update(_read_worker_secrets())
             if "_rollout_snapshot" in values:
                 rollout_value = values.pop("_rollout_snapshot")
                 from headroom.rollout import RolloutSnapshot
@@ -6728,9 +6760,11 @@ def _proxy_config_from_env() -> ProxyConfig:
             if "profile_seeded_env_keys" in values:
                 values["profile_seeded_env_keys"] = frozenset(values["profile_seeded_env_keys"])
             return ProxyConfig(**values)
-        except (KeyError, TypeError, ValueError, json.JSONDecodeError):
+        except (KeyError, TypeError, ValueError, OSError):
             logger.warning(
-                "Invalid %s; falling back to HEADROOM_* env vars", _MULTI_WORKER_CONFIG_ENV
+                "Invalid %s or %s; falling back to HEADROOM_* env vars",
+                _MULTI_WORKER_CONFIG_ENV,
+                _MULTI_WORKER_SECRETS_ENV,
             )
 
     from headroom.rollout import resolve_rollout
@@ -6993,6 +7027,7 @@ def run_server(
 
     app_target: Any
     uvicorn_kwargs: dict[str, Any] = {}
+    worker_secrets_path: Path | None = None
     if sys.platform == "win32":
         _configure_windows_uvicorn_loop(uvicorn_kwargs)
     if workers > 1:
@@ -7027,7 +7062,11 @@ def run_server(
                 "See RUST_DEV.md -> 'Multi-worker deployment -- CCR fragmentation'.",
                 workers,
             )
-        os.environ[_MULTI_WORKER_CONFIG_ENV] = json.dumps(_proxy_config_payload(config))
+        worker_config = _proxy_config_payload(config)
+        worker_secrets_path = _write_worker_secrets(worker_config)
+        if worker_secrets_path is not None:
+            os.environ[_MULTI_WORKER_SECRETS_ENV] = str(worker_secrets_path)
+        os.environ[_MULTI_WORKER_CONFIG_ENV] = json.dumps(worker_config)
         app_target = "headroom.proxy.server:create_app_from_env"
         uvicorn_kwargs["factory"] = True
     else:
@@ -7067,6 +7106,8 @@ def run_server(
             from headroom.proxy.uds import remove_uds_path
 
             remove_uds_path(uds_path)
+        if worker_secrets_path is not None:
+            worker_secrets_path.unlink(missing_ok=True)
 
 
 def _run_uvicorn(
