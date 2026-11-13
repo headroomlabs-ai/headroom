@@ -1882,6 +1882,9 @@ class CompressionCache:
         # the earlier ones, which may hold an older row (another worker can
         # write the shared store between them).
         self._disk_reads: dict[str, set[int]] = {}
+        # Only in-flight writes are tracked. A replacement or invalidation
+        # revokes the previous token even if its result left the memory budget.
+        self._disk_writes: dict[str, object] = {}
         self._read_seq = 0
         # Callbacks invoked (outside the lock) whenever ``clear()`` runs, so
         # sibling state keyed by the same content keys (e.g. the router's
@@ -1900,8 +1903,8 @@ class CompressionCache:
         self._total_lookup_ns = 0
         self._lookup_count = 0
         self._lock = threading.Lock()
-        # Orders put()'s disk writes, so an older result cannot overwrite or
-        # delete the disk row of a newer one for the same key.
+        # Orders disk writes and invalidations. Mutators release _lock before
+        # acquiring this lock; while holding both, the order is disk then memory.
         self._disk_lock = threading.Lock()
         # Serializes get()'s disk reads (only memory misses read the disk), so
         # a read numbered later also fetched later and saw a row at least as
@@ -2009,19 +2012,26 @@ class CompressionCache:
         with self._lock:
             self._disk_reads.pop(key, None)
             has_marker = self._admit_locked(key, compressed, ratio, strategy)
+            token = object()
+            if self._store is not None:
+                self._disk_writes[key] = token
         if self._store is None:
             return
-        with self._disk_lock:
+        try:
+            with self._disk_lock:
+                with self._lock:
+                    if self._disk_writes.get(key) is not token:
+                        return
+                if has_marker:
+                    # Never kept on disk; nor may an earlier marker-free result for
+                    # this key come back from there once this one leaves memory.
+                    self._store.delete(self._namespace + key)
+                else:
+                    self._store.put(self._namespace + key, compressed, ratio, strategy)
+        finally:
             with self._lock:
-                current = self._results.get(key)
-            if current is not None and current[0] != compressed:
-                return  # a later put() replaced it; its disk write wins
-            if has_marker:
-                # Never kept on disk; nor may an earlier marker-free result for
-                # this key come back from there once this one leaves memory.
-                self._store.delete(self._namespace + key)
-            else:
-                self._store.put(self._namespace + key, compressed, ratio, strategy)
+                if self._disk_writes.get(key) is token:
+                    del self._disk_writes[key]
 
     def mark_skip(self, key: str) -> None:
         """Mark content as non-compressible (Tier 1).  Thread-safe."""
@@ -2031,12 +2041,16 @@ class CompressionCache:
     def move_to_skip(self, key: str) -> None:
         """Move a result to skip set (threshold tightened, no longer qualifies).
         Thread-safe."""
-        with self._lock:
-            self._disk_reads.pop(key, None)
-            self._drop_locked(key)
-            self._skip_locked(key)
-        if self._store is not None:
-            self._store.delete(self._namespace + key)
+        with self._disk_lock:
+            with self._lock:
+                self._disk_reads.pop(key, None)
+                self._disk_writes.pop(key, None)
+                self._drop_locked(key)
+                self._skip_locked(key)
+                # As in clear(), no new disk reader may start until the row
+                # is gone, or it could re-admit the result after invalidation.
+                if self._store is not None:
+                    self._store.delete(self._namespace + key)
 
     def _admit_locked(self, key: str, compressed: str, ratio: float, strategy: str) -> bool:
         """Add a result, evicting least recently used ones over budget; returns
@@ -2107,15 +2121,17 @@ class CompressionCache:
     def clear(self) -> None:
         """Clear all entries, including this router's rows on disk (other
         workers with the same config share them).  Thread-safe."""
-        with self._lock:
-            self._results.clear()
-            self._bytes = 0
-            self._skip.clear()
-            self._disk_reads.clear()
-            # Under the lock, so no disk read can start before the rows are
-            # gone and bring a cleared result back into memory.
-            if self._store is not None:
-                self._store.clear_prefix(self._namespace)
+        with self._disk_lock:
+            with self._lock:
+                self._results.clear()
+                self._bytes = 0
+                self._skip.clear()
+                self._disk_reads.clear()
+                self._disk_writes.clear()
+                # Under the lock, so no disk read can start before the rows are
+                # gone and bring a cleared result back into memory.
+                if self._store is not None:
+                    self._store.clear_prefix(self._namespace)
         # Fire callbacks outside the lock to avoid cross-lock ordering issues.
         for callback in self._on_clear:
             callback()
@@ -5517,6 +5533,10 @@ class ContentRouter(Transform):
                     self._code_compressor = CodeAwareCompressor(
                         CodeCompressorConfig(
                             enable_ccr=self.config.ccr_inject_marker,
+                            # The code compressor's Kompress fallback builds its
+                            # own KompressCompressor, so it must honour the same
+                            # switch as _get_kompress() (#4719).
+                            fallback_to_kompress=self.config.enable_kompress,
                         )
                     )
                 else:

@@ -42,6 +42,12 @@ ignore it, so this extension is a no-op there (it logs a warning at startup).
 `HEADROOM_OAUTH2_ALLOW_INSECURE=1` to override). Tokens are minted with the standard library
 (`urllib`, system cert store), so a corporate-injected CA is trusted without bundling roots.
 
+**Startup:** with `HEADROOM_OAUTH2_TOKEN_URL` set but the rest of the config invalid (non-`https`
+token URL, missing client id/secret, unparseable `TIMEOUT`/`SKEW`), the proxy **refuses to
+start** rather than running without the middleware and relaying the client's own `Authorization`
+upstream. The extension marks its `install()` `fail_closed` for that; a core too old to honour
+the marker logs a warning and starts without it.
+
 ## What gets the upstream bearer
 
 The minted token is injected only on requests that **go upstream**. Routes the
