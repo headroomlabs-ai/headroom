@@ -134,9 +134,10 @@ def test_aggregate_ratio_within_band() -> None:
         if not ok:
             continue
         try:
-            measured.setdefault(name, []).append(measure_case(case).byte_ratio)
+            ratio = measure_case(case).byte_ratio
         except CompressorUnavailable:
             continue
+        measured.setdefault(name, []).append(ratio)
 
     for name, ratios in measured.items():
         expected = BASELINE["aggregates"].get(name)
