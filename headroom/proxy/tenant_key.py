@@ -138,6 +138,17 @@ _OPAQUE_TENANT_KEY_PREFIX: Final[str] = "tenant"
 # needs no ``re`` (project memory: ``no regexes``).
 _HEX_DIGITS: Final[str] = "0123456789abcdef"
 
+# ASCII whitespace, and ONLY ASCII whitespace, is trimmed from the raw
+# header before it is classified. ``str.strip()`` with no argument trims
+# every Unicode space character, which silently erased a disallowed
+# character instead of counting it: an NBSP-prefixed ``\u00a0acme``
+# stripped down to ``acme`` and shared that tenant's pool, and an
+# NBSP-only header stripped to empty and fell through to the shared
+# ``"global"`` pool. Trimming just this set keeps the blank-header
+# behaviour ASCII headers already had while letting Unicode whitespace
+# take the normal disallowed-character path (digest, hence isolation).
+_ASCII_WHITESPACE: Final[str] = " \t\n\r\v\f"
+
 # Marker that reserves one slice of the key space for digested keys.
 #
 # It exists because the two sanitization forms must not overlap: the
@@ -331,13 +342,17 @@ def _sanitize_tenant_key(raw: str) -> str:
     serialized store under a ``|`` separator and into structured log
     fields, so the charset is load-bearing in both.
 
+    Only ASCII whitespace is trimmed from the raw value first; Unicode
+    whitespace is a disallowed character like any other, so it triggers
+    the digest rather than vanishing (see :data:`_ASCII_WHITESPACE`).
+
     Per project memory (``no regexes``) we use string ops +
     :func:`unicodedata.category` instead of ``re``. The Unicode
     classification is the source of truth for "is this a control
     char", and we get correctness for free instead of authoring our
     own character class.
     """
-    raw = raw.strip()
+    raw = raw.strip(_ASCII_WHITESPACE)
     if not raw:
         return ""
 

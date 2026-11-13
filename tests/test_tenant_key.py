@@ -253,10 +253,44 @@ def test_sanitization_empty_header_falls_through() -> None:
 
 
 def test_sanitization_whitespace_only_falls_through() -> None:
-    """Whitespace-only header ⇒ sanitizes to empty ⇒ falls through."""
+    """ASCII whitespace-only header ⇒ sanitizes to empty ⇒ falls through."""
     req = _request(headers={"X-Headroom-Tenant-ID": "  \t\n  "})
     _, source = resolve_tenant_key(req)
     assert source == SOURCE_GLOBAL
+
+
+# ── Unicode whitespace (review finding, GH #4788) ─────────────────────
+
+
+@pytest.mark.parametrize("nb_ws", ["\u00a0", "\u2003", "\u3000"])
+def test_unicode_whitespace_is_not_stripped_away(nb_ws: str) -> None:
+    """Unicode whitespace must count as a disallowed char, not vanish.
+
+    ``str.strip()`` trims every Unicode space, so an NBSP-prefixed
+    ``\\u00a0acme`` used to strip to ``acme`` and share that tenant's pool,
+    while a header of NBSP alone stripped to empty and fell through to the
+    shared ``"global"`` pool. Both are cross-tenant leaks.
+    """
+    prefixed, source = resolve_tenant_key(
+        _request(headers={"X-Headroom-Tenant-ID": nb_ws + "acme"})
+    )
+    bare = resolve_tenant_key(_request(headers={"X-Headroom-Tenant-ID": "acme"}))[0]
+    assert prefixed != bare
+    assert source == SOURCE_HEADER
+    assert _is_valid_key(prefixed)
+
+
+def test_unicode_whitespace_only_stays_isolated() -> None:
+    """A single Unicode space is a tenant signal, not a blank header."""
+    tenant_key, source = resolve_tenant_key(_request(headers={"X-Headroom-Tenant-ID": "\u00a0"}))
+    assert source == SOURCE_HEADER
+    assert tenant_key != GLOBAL_TENANT_KEY
+    assert _is_valid_key(tenant_key)
+
+
+def test_ascii_padding_still_strips_before_classifying() -> None:
+    """ASCII surrounding whitespace is trimmed, so ids are not needlessly rekeyed."""
+    assert resolve_tenant_key(_request(headers={"X-Headroom-Tenant-ID": "  acme  "}))[0] == "acme"
 
 
 def test_sanitization_mixed_unicode_and_ascii_preserves_ascii() -> None:
