@@ -69,7 +69,7 @@ def _expected_headroom_mcp_calls(proxy_url: str) -> list[list[str]]:
     ]
     variants = [
         [*prefix, *resolve_headroom_command(), "mcp", "serve"],
-        [*prefix, sys.executable, "-m", "headroom.cli", "mcp", "serve"],
+        [*prefix, sys.executable, "-P", "-m", "headroom.cli", "mcp", "serve"],
     ]
     deduped: list[list[str]] = []
     for variant in variants:
