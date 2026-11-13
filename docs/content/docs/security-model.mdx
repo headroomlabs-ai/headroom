@@ -71,11 +71,12 @@ normalized origin. DNS resolution is bounded by `HEADROOM_UPSTREAM_RESOLVE_TIMEO
 credential-shaped maps in [the settings store](#the-settings-store) — travel only to a
 host the operator designated. Designated means one of the resolved provider API targets
 (`ANTHROPIC_TARGET_API_URL`, `OPENAI_TARGET_API_URL`, and the Gemini/Vertex/Bedrock/Cloud
-Code equivalents), the default `api.anthropic.com` / `api.openai.com`, or a host listed
-in `HEADROOM_UPSTREAM_ALLOWED_HOSTS`. Matching is exact equality on the *parsed*
-hostname, never the URL string, so neither
+Code equivalents), the default `https://api.anthropic.com` / `https://api.openai.com`,
+or an entry in `HEADROOM_UPSTREAM_ALLOWED_HOSTS` (a bare host means https on port 443;
+`host:port` and full URLs name exactly that origin). Matching is exact equality on the
+*parsed* origin (scheme, hostname, port), never the URL string, so neither
 `https://api.anthropic.com@evil.example` nor `https://api.anthropic.com.evil.example`
-matches. An undesignated destination is still proxied — it simply does not receive those
+matches, and `http://` or another port of a designated host does not either. An undesignated destination is still proxied — it simply does not receive those
 headers — and the drop is warned once per host rather than once per request.
 
 Read the pair for what it is: it stops a client redirecting the *operator's* stored
