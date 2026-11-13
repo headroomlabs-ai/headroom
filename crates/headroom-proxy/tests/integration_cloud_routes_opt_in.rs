@@ -73,13 +73,21 @@ async fn authorizations(upstream: &MockServer) -> Vec<String> {
 #[tokio::test]
 async fn default_config_does_not_sign_bedrock_requests() {
     let up = upstream().await;
-    for verb in ["invoke", "invoke-with-response-stream", "converse"] {
+    let verbs = [
+        "invoke",
+        "invoke-with-response-stream",
+        "converse",
+        "converse-stream",
+    ];
+    for verb in verbs {
         post(
             default_config(&up),
             &format!("/model/anthropic.claude-3-haiku-20240307-v1:0/{verb}"),
         )
         .await;
     }
+    // Every request reached the upstream, so the check below is not vacuous.
+    assert_eq!(up.received_requests().await.unwrap().len(), verbs.len());
     let auth = authorizations(&up).await;
     assert!(
         auth.iter().all(|a| !a.starts_with("AWS4-HMAC-SHA256")),

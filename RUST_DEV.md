@@ -94,7 +94,7 @@ curl -si http://127.0.0.1:8787/v1/models
 | `--graceful-shutdown-timeout` | | `30s` | wait for in-flight on SIGTERM/SIGINT |
 | `--stats` | `HEADROOM_PROXY_STATS` | `true` | native savings stats + `/dashboard` (below) |
 | `--stats-path` | `HEADROOM_PROXY_STATS_PATH` | `~/.headroom/native_stats.json` | ledger persistence (honours `HEADROOM_WORKSPACE_DIR`) |
-| `--enable-bedrock-native` | `HEADROOM_PROXY_ENABLE_BEDROCK_NATIVE` | `false` | mount `/model/{id}/invoke`, `/converse` and the streaming variants; they sign every request with this host's AWS credentials and do not authenticate the caller |
+| `--enable-bedrock-native` | `HEADROOM_PROXY_ENABLE_BEDROCK_NATIVE` | (unset: off) | `true` or `--features native_bedrock` mounts `/model/{id}/invoke`, `/converse` and the streaming variants; they sign every request with this host's AWS credentials and do not authenticate the caller |
 | `--enable-vertex-native` | `HEADROOM_PROXY_ENABLE_VERTEX_NATIVE` | `false` | mount Vertex `:rawPredict` / `:streamRawPredict`; replaces the caller's `Authorization` with this host's Google ADC bearer (scope `--vertex-adc-scope`) and does not authenticate the caller |
 | `--vertex-allow-non-google-upstream` | `HEADROOM_PROXY_VERTEX_ALLOW_NON_GOOGLE_UPSTREAM` | `false` | by default the Vertex route only sends the ADC bearer when `--upstream` is `https://*.googleapis.com`, and answers 502 otherwise |
 

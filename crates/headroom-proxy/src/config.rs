@@ -500,17 +500,18 @@ pub struct CliArgs {
     /// Default `false`: the route signs every request it receives with
     /// this host's AWS credentials and does not authenticate the caller,
     /// so only enable it where every caller that can reach `--listen`
-    /// may use those credentials.
+    /// may use those credentials. `--features native_bedrock` also
+    /// enables it; `false` here (or `--disable-features native_bedrock`)
+    /// forces it off.
     ///
     /// Source priority: CLI flag → `HEADROOM_PROXY_ENABLE_BEDROCK_NATIVE`
-    /// env var → default (`false`).
+    /// env var → rollout (`native_bedrock`, not on by default).
     #[arg(
         long = "enable-bedrock-native",
         env = "HEADROOM_PROXY_ENABLE_BEDROCK_NATIVE",
-        default_value_t = false,
         action = clap::ArgAction::Set,
     )]
-    pub enable_bedrock_native: bool,
+    pub enable_bedrock_native: Option<bool>,
 
     /// AWS region to use when signing Bedrock requests. Default
     /// `us-east-1`. The Bedrock endpoint URL derived from this
@@ -792,17 +793,17 @@ impl Config {
         if args.enable_responses_streaming {
             explicit_features.push(Feature::OpenAiResponsesStreaming);
         }
-        if args.enable_bedrock_native {
+        if args.enable_bedrock_native == Some(true) {
             explicit_features.push(Feature::NativeBedrock);
         }
-        // Preserve the pre-rollout rollback controls as legacy disables. Both
-        // features are stable defaults in the registry, so merely omitting a
-        // false flag from `explicit_features` would turn it straight back on.
+        // Preserve the pre-rollout rollback controls as legacy disables: a
+        // false flag must win over a default or a `--features` request.
+        // An omitted Bedrock flag leaves the decision to the rollout.
         let mut disabled_features = split_feature_names(&args.disable_features);
         if !args.enable_responses_streaming {
             disabled_features.push(Feature::OpenAiResponsesStreaming.spec().name.to_owned());
         }
-        if !args.enable_bedrock_native {
+        if args.enable_bedrock_native == Some(false) {
             disabled_features.push(Feature::NativeBedrock.spec().name.to_owned());
         }
         let rollout = RolloutSnapshot::from_parts_with_explicit(
@@ -843,8 +844,10 @@ impl Config {
                 args.enable_responses_streaming,
             ),
             enable_conversations_passthrough: args.enable_conversations_passthrough,
-            enable_bedrock_native: rollout
-                .is_enabled(Feature::NativeBedrock, args.enable_bedrock_native),
+            enable_bedrock_native: rollout.is_enabled(
+                Feature::NativeBedrock,
+                args.enable_bedrock_native == Some(true),
+            ),
             bedrock_region: args.bedrock_region,
             bedrock_endpoint: args.bedrock_endpoint,
             aws_profile: args.aws_profile,
@@ -1006,6 +1009,36 @@ mod rollout_input_tests {
         }
         assert!(!config.enable_responses_streaming);
         assert!(!config.enable_bedrock_native);
+    }
+
+    #[test]
+    fn native_bedrock_is_off_by_default_and_follows_rollout_requests() {
+        let parse = |extra: &[&str]| {
+            let mut argv = vec!["headroom-proxy", "--upstream", "http://127.0.0.1:9"];
+            argv.extend_from_slice(extra);
+            Config::from_cli(CliArgs::try_parse_from(argv).unwrap())
+        };
+        assert!(!parse(&[]).enable_bedrock_native);
+        assert!(parse(&["--features", "native_bedrock"]).enable_bedrock_native);
+        assert!(parse(&["--enable-bedrock-native", "true"]).enable_bedrock_native);
+        assert!(
+            !parse(&[
+                "--features",
+                "native_bedrock",
+                "--disable-features",
+                "native_bedrock"
+            ])
+            .enable_bedrock_native
+        );
+        assert!(
+            !parse(&[
+                "--features",
+                "native_bedrock",
+                "--enable-bedrock-native",
+                "false"
+            ])
+            .enable_bedrock_native
+        );
     }
 
     #[test]
