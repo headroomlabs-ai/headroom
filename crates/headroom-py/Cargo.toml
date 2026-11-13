@@ -11,6 +11,9 @@ description = "PyO3 bindings exposing headroom-core to Python as headroom._core.
 # Cargo skips it. See the script's header comment for rationale.
 build = "build.rs"
 
+[lints]
+workspace = true
+
 [build-dependencies]
 # Compile the C shim into a static library that links into _core.so.
 # `cc` is already transitively in our build graph (used by aws-lc-rs,

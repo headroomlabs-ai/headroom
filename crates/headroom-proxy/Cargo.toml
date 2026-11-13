@@ -7,6 +7,9 @@ license.workspace = true
 repository.workspace = true
 description = "Headroom transparent reverse proxy (Rust, axum). Phase 1: drop-in passthrough in front of the Python proxy."
 
+[lints]
+workspace = true
+
 [[bin]]
 name = "headroom-proxy"
 path = "src/main.rs"
