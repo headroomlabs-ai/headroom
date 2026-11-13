@@ -85,6 +85,22 @@ def header_first(value: str) -> str:
     return head.strip()
 
 
+def header_client(value: str, cidrs: tuple[Network, ...]) -> str:
+    """Return the client element of ``X-Forwarded-For``, resolved from the right.
+
+    A gateway that appends to the header leaves whatever the client wrote on
+    the left, so walk from the rightmost element and skip trusted gateways;
+    the first untrusted address is the one a trusted gateway actually saw.
+    If every element is a trusted gateway, fall back to the leftmost.
+    """
+    parts = [p.strip() for p in value.split(",")] if value else []
+    parts = [p for p in parts if p]
+    for part in reversed(parts):
+        if not peer_is_trusted_gateway(part, cidrs):
+            return part
+    return parts[0] if parts else ""
+
+
 def resolve_forwarded_headers(
     inputs: ForwardedHeaderInputs,
     cidrs: tuple[Network, ...],
@@ -92,7 +108,7 @@ def resolve_forwarded_headers(
     """Resolve client IP and sanitized forwarded headers from pure inputs."""
     trusted = peer_is_trusted_gateway(inputs.peer_host or None, cidrs)
     if trusted:
-        forwarded_for = header_first(inputs.forwarded_for)
+        forwarded_for = header_client(inputs.forwarded_for, cidrs)
         return ForwardedHeaderResolution(
             client_ip=forwarded_for or inputs.peer_host,
             forwarded={
