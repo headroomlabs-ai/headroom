@@ -26,7 +26,7 @@ from types import MappingProxyType
 from typing import TYPE_CHECKING, Any
 from urllib.parse import quote, unquote, urlparse
 
-from headroom.log_safety import describe_exception
+from headroom.log_safety import describe_exception, safe_id
 from headroom.proxy.conversation_savings import savings_conversation_key, turn_conversation_key
 from headroom.proxy.handlers._failure_logging import log_hook_failure, log_request_failure
 from headroom.proxy.helpers import (
@@ -4028,7 +4028,7 @@ class OpenAIHandlerMixin:
                 # timings. Log it, or a served-from-cache turn looks exactly
                 # like a turn that died silently (#3019).
                 logger.info(
-                    f"[{request_id}] RESPONSE-CACHE-HIT: model={model} "
+                    f"[{request_id}] RESPONSE-CACHE-HIT: model={safe_id(model)} "
                     f"bytes={len(cached.response_body)} "
                     f"age_s={(datetime.now() - cached.created_at).total_seconds():.0f} "
                     f"hits={cached.hit_count}"
@@ -5688,7 +5688,7 @@ class OpenAIHandlerMixin:
                         f"status={response.status_code} "
                         f"error_type={err_type} "
                         f"error_msg={err_msg!r} "
-                        f"model={model} "
+                        f"model={safe_id(model)} "
                         f"compressed={'yes' if transforms_applied else 'no'} "
                         f"transforms={transforms_applied} "
                         f"original_tokens={original_tokens} "
@@ -6965,7 +6965,7 @@ class OpenAIHandlerMixin:
                         _reason or "no_compression",
                         _bytes_before,
                         auth_mode.value,
-                        model or "unknown",
+                        safe_id(model or "unknown"),
                     )
             except Exception as _e:
                 _http_body_bytes = len(json.dumps(body).encode("utf-8", errors="replace"))
@@ -8317,7 +8317,7 @@ class OpenAIHandlerMixin:
                     raw_bytes,
                     frame_type or "unknown",
                     classify_auth_mode(ws_headers).value,
-                    model or "unknown",
+                    safe_id(model or "unknown"),
                 )
 
             # Resolved before the frame helpers below, which read it.
@@ -11651,7 +11651,7 @@ class OpenAIHandlerMixin:
                             "model %s (%s: %s); savings for this turn are "
                             "reported against the cache-swapped input",
                             session_id,
-                            model_name,
+                            safe_id(model_name),
                             type(e).__name__,
                             e,
                         )

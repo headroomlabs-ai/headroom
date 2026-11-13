@@ -40,7 +40,7 @@ from headroom.ccr.marker_resolution import resolve_markers_in_response
 from headroom.ccr.tool_calls import has_ccr_retrieve_tool
 from headroom.config import resolve_omlx_target_api_url
 from headroom.copilot_auth import apply_copilot_api_auth, is_copilot_upstream_url
-from headroom.log_safety import describe_exception
+from headroom.log_safety import describe_exception, safe_id
 from headroom.pipeline import PipelineStage, summarize_routing_markers
 from headroom.proxy import public_errors
 from headroom.proxy.anthropic_wire import (
@@ -2029,7 +2029,7 @@ class AnthropicHandlerMixin:
                     # cache turn is indistinguishable from a turn that died
                     # silently, which is exactly how #3019 stayed invisible.
                     logger.info(
-                        f"[{request_id}] RESPONSE-CACHE-HIT: model={model} "
+                        f"[{request_id}] RESPONSE-CACHE-HIT: model={safe_id(model)} "
                         f"bytes={len(cached.response_body)} "
                         f"age_s={(datetime.now() - cached.created_at).total_seconds():.0f} "
                         f"hits={cached.hit_count}"
@@ -2837,7 +2837,7 @@ class AnthropicHandlerMixin:
                                 "[%s] Compression skipped: reason=cache_mode_prefix_mismatch "
                                 "model=%s current_len=%d previous_len=%d",
                                 request_id,
-                                model,
+                                safe_id(model),
                                 len(original_client_messages),
                                 len(previous_original_messages),
                             )
@@ -4951,7 +4951,7 @@ class AnthropicHandlerMixin:
                                 f"status={response.status_code} "
                                 f"error_type={err_type} "
                                 f"error_msg={err_msg!r} "
-                                f"model={model} "
+                                f"model={safe_id(model)} "
                                 f"compressed={'yes' if transforms_applied else 'no'} "
                                 f"transforms={transforms_applied} "
                                 f"original_tokens={original_tokens} "
