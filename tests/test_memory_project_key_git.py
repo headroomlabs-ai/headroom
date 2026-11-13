@@ -17,10 +17,14 @@ from pathlib import Path
 import pytest
 
 from headroom.memory.storage_router import (
+    _GIT_COMMON_DIR_MAX_ENTRIES,
+    _GIT_COMMON_DIR_TTL_SECONDS,
     ProjectKeyStrategy,
     ProjectResolver,
     RequestContext,
     _git_common_dir,
+    _git_common_dir_cache_clear,
+    _git_common_dir_cache_info,
 )
 from tests.test_memory_storage_router import _ctx
 
@@ -64,7 +68,7 @@ def repo(tmp_path: Path) -> dict[str, Path]:
     nested.mkdir()
     _git(nested, "init", "-q", ".")
 
-    _git_common_dir.cache_clear()
+    _git_common_dir_cache_clear()
     return {"main": main, "worktree": worktree, "sub": main / "src", "nested": nested}
 
 
@@ -175,17 +179,17 @@ class TestGitKeyStrategy:
         assert resolved[0] == expected[0]
 
     def test_strategy_cache_reuses_git_lookup(self, repo: dict[str, Path]) -> None:
-        _git_common_dir.cache_clear()
+        _git_common_dir_cache_clear()
         ProjectResolver(key_strategy=GIT_STRATEGY).resolve(
             _ctx(headers={"x-headroom-cwd": str(repo["main"])})  # type: ignore[misc]
         )
-        info = _git_common_dir.cache_info()
-        assert info.hits >= 0  # cache is active
+        info = _git_common_dir_cache_info()
+        assert info["misses"] >= 1
         # Second resolution must hit the cache rather than re-walking the FS.
         ProjectResolver(key_strategy=GIT_STRATEGY).resolve(
             _ctx(headers={"x-headroom-cwd": str(repo["main"])})  # type: ignore[misc]
         )
-        assert _git_common_dir.cache_info().hits > info.hits
+        assert _git_common_dir_cache_info()["hits"] > info["hits"]
 
     def test_invalid_strategy_mode_rejected(self) -> None:
         with pytest.raises(ValueError):
@@ -328,3 +332,82 @@ class TestGitCommonDirHelper:
         assert via_sub is not None and via_outer is not None
         assert via_sub[1] == "lib"
         assert via_sub[0] != via_outer[0], "a submodule keeps its own memory DB"
+
+
+class TestGitCommonDirCache:
+    """Freshness policy for the memoised git lookup (GH #4712 review).
+
+    The original implementation was a bare ``lru_cache``, so a resolved
+    directory kept answering with the common dir it had the first time.
+    Review finding: run ``git init`` inside a parent checkout's
+    subdirectory and the new repository kept selecting the *parent*
+    memory store until eviction or restart. These tests pin the fix.
+    """
+
+    def test_new_nested_repo_gets_own_key_after_ttl(
+        self, repo: dict[str, Path], monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # Replay the reviewer's exact sequence under a controlled clock.
+        target = repo["main"] / "becomes-a-repo"
+        target.mkdir(parents=True, exist_ok=True)
+        _git_common_dir_cache_clear()
+        clock = {"now": 1_000.0}
+        monkeypatch.setattr("headroom.memory.storage_router.time.monotonic", lambda: clock["now"])
+        r = ProjectResolver(key_strategy=GIT_STRATEGY)
+
+        before = r.resolve(_ctx(headers={"x-headroom-cwd": str(target)}))  # type: ignore[misc]
+        assert before is not None
+        assert before[1] == "acme", "before git init the dir belongs to the parent repo"
+
+        # The directory becomes its own repository mid-session.
+        _git(target, "init", "-q", ".")
+
+        # Inside the freshness window the memoised answer is still the
+        # parent's: bounded staleness, not a permanent pin.
+        clock["now"] += 1.0
+        within = r.resolve(_ctx(headers={"x-headroom-cwd": str(target)}))  # type: ignore[misc]
+        assert within is not None and within[0] == before[0]
+
+        # Once the window lapses the directory keys on its own repository.
+        clock["now"] += _GIT_COMMON_DIR_TTL_SECONDS
+        after = r.resolve(_ctx(headers={"x-headroom-cwd": str(target)}))  # type: ignore[misc]
+        assert after is not None
+        assert after[0] != before[0], "the new repo must stop using the parent's key"
+        assert after[1] == "becomes-a-repo"
+        assert _git_common_dir(str(target.resolve())) == str((target / ".git").resolve())
+
+    def test_expired_entry_is_rewalked(
+        self, repo: dict[str, Path], monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        target = str(repo["main"].resolve())
+        _git_common_dir_cache_clear()
+        monkeypatch.setattr("headroom.memory.storage_router.time.monotonic", lambda: 500.0)
+        assert _git_common_dir(target) is not None
+        assert _git_common_dir_cache_info()["hits"] == 0
+
+        # Same instant: served from cache.
+        assert _git_common_dir(target) is not None
+        assert _git_common_dir_cache_info()["hits"] == 1
+
+        # Past the window: re-walked, not served stale.
+        monkeypatch.setattr(
+            "headroom.memory.storage_router.time.monotonic",
+            lambda: 500.0 + _GIT_COMMON_DIR_TTL_SECONDS + 1.0,
+        )
+        assert _git_common_dir(target) is not None
+        assert _git_common_dir_cache_info()["misses"] == 2
+
+    def test_cache_is_bounded(self, repo: dict[str, Path], monkeypatch: pytest.MonkeyPatch) -> None:
+        _git_common_dir_cache_clear()
+        monkeypatch.setattr("headroom.memory.storage_router.time.monotonic", lambda: 10.0)
+        for index in range(_GIT_COMMON_DIR_MAX_ENTRIES + 25):
+            _git_common_dir(str(repo["main"]) + f"-#{index}")
+        info = _git_common_dir_cache_info()
+        assert info["currsize"] <= _GIT_COMMON_DIR_MAX_ENTRIES
+
+    def test_cache_clear_resets_counters(self, repo: dict[str, Path]) -> None:
+        _git_common_dir(str(repo["main"].resolve()))
+        _git_common_dir_cache_clear()
+        info = _git_common_dir_cache_info()
+        assert info["currsize"] == 0
+        assert info["hits"] == 0 and info["misses"] == 0
