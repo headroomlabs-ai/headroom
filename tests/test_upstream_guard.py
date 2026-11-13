@@ -1048,3 +1048,34 @@ async def test_a_proxied_client_still_pins_its_direct_transport(
         assert isinstance(proxied, GuardedUpstreamRefusingTransport)
     finally:
         await client.aclose()
+
+
+@pytest.mark.parametrize("path", ["/v1/chat/completions", "/v1/responses"])
+def test_openai_routes_refuse_a_private_override_instead_of_using_the_default(
+    path: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A rejected ``x-headroom-base-url`` is a 400, like on the other routes.
+
+    Dropping the header and continuing sent the prompt and the client's
+    Authorization, meant for its own gateway, to the configured OpenAI target.
+    """
+    monkeypatch.delenv("HEADROOM_ALLOWED_BASE_URLS", raising=False)
+    with (
+        _InternalService() as configured,
+        TestClient(_app(openai_api_url=configured.url)) as client,
+    ):
+        response = client.post(
+            path,
+            headers={
+                "Authorization": "Bearer client-gateway-key",
+                "x-headroom-base-url": "http://192.168.1.50:8000/v1",
+            },
+            json={
+                "model": "gpt-4o",
+                "messages": [{"role": "user", "content": "hi"}],
+                "input": "hi",
+            },
+        )
+
+    assert response.status_code == 400, response.text
+    assert configured.hits == [], "the request went to the configured upstream instead"
