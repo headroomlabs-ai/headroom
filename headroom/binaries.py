@@ -548,6 +548,36 @@ def _in_registry(tool: str) -> bool:
     return tool in _registry().get("tools", {})
 
 
+def _which_outside_cwd(name: str) -> Path | None:
+    """``shutil.which(name)``, ignoring a hit in the current directory.
+
+    On Windows ``shutil.which`` looks in the current directory before PATH
+    unless ``NoDefaultCurrentDirectoryInExePath`` is set, and on any OS a
+    relative PATH entry (``.``, empty, ``bin``) resolves against the cwd. The
+    cwd is usually the project being worked on, so a same-named file there
+    would run instead of the real tool. Such hits are ignored; the caller then
+    falls back to the interpreter's Scripts dir or the verified cache.
+    """
+    found = shutil.which(name)
+    if not found:
+        return None
+    in_cwd = not os.path.isabs(found)
+    if not in_cwd:
+        try:
+            in_cwd = os.path.samefile(os.path.dirname(found), os.getcwd())
+        except OSError:
+            in_cwd = False
+    if in_cwd:
+        logger.warning(
+            "Ignoring %s found via the current directory (%s); using the "
+            "interpreter's Scripts dir or the Headroom cache instead",
+            name,
+            os.path.abspath(found),
+        )
+        return None
+    return Path(found)
+
+
 def _path_lookup(tool: str) -> Path | None:
     """Find `tool` on PATH or in this interpreter's Scripts/bin directory.
 
@@ -563,9 +593,9 @@ def _path_lookup(tool: str) -> Path | None:
             candidates.append(alias)
 
     for name in candidates:
-        found = shutil.which(name)
+        found = _which_outside_cwd(name)
         if found:
-            return Path(found)
+            return found
 
     scripts_dir = Path(sys.prefix) / ("Scripts" if sys.platform.startswith("win") else "bin")
     for name in candidates:
@@ -703,12 +733,12 @@ def status() -> list[dict[str, Any]]:
             "path": None,
             "state": "missing",
         }
-        # Honor PATH.
-        on_path = shutil.which(name) or (
-            shutil.which(entry["binary"]) if entry.get("binary") else None
+        # Honor PATH, but never the current directory (see _which_outside_cwd).
+        on_path = _which_outside_cwd(name) or (
+            _which_outside_cwd(entry["binary"]) if entry.get("binary") else None
         )
         if on_path:
-            row["path"] = on_path
+            row["path"] = str(on_path)
             row["state"] = "on-path"
             out.append(row)
             continue
