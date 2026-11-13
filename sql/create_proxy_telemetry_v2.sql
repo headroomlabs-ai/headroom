@@ -1,6 +1,8 @@
 -- Supabase SQL: Create proxy_telemetry_v2 table
+-- LEGACY: current releases no longer send to Supabase (removed in #1526); only
+-- older releases still insert rows here. Kept for reference and for the
+-- dashboard_summary refresh in create_dashboard_summary.sql.
 -- Run this in the Supabase SQL Editor (https://supabase.com/dashboard → SQL Editor)
--- This table matches every field the beacon code writes in headroom/telemetry/beacon.py
 
 CREATE TABLE IF NOT EXISTS proxy_telemetry_v2 (
     id uuid DEFAULT gen_random_uuid() PRIMARY KEY,
@@ -60,14 +62,16 @@ CREATE INDEX IF NOT EXISTS idx_ptv2_version ON proxy_telemetry_v2(headroom_versi
 -- Enable Row Level Security
 ALTER TABLE proxy_telemetry_v2 ENABLE ROW LEVEL SECURITY;
 
--- RLS policies: anon can INSERT (telemetry beacon) and SELECT (for debugging)
+-- RLS policy: anon can INSERT only (the beacon of older releases). anon has no
+-- SELECT: read raw rows with the service role. The public dashboard reads the
+-- aggregated dashboard_summary table (create_dashboard_summary.sql).
 CREATE POLICY "anon_insert" ON proxy_telemetry_v2
     FOR INSERT TO anon
     WITH CHECK (true);
 
-CREATE POLICY "anon_select" ON proxy_telemetry_v2
-    FOR SELECT TO anon
-    USING (true);
+GRANT INSERT ON proxy_telemetry_v2 TO anon;
 
--- Grant permissions to anon role
-GRANT INSERT, SELECT ON proxy_telemetry_v2 TO anon;
+-- A project set up with an earlier version of this script also let anon read
+-- every row. Remove that once in the SQL Editor:
+--   DROP POLICY IF EXISTS "anon_select" ON proxy_telemetry_v2;
+--   REVOKE SELECT ON proxy_telemetry_v2 FROM anon;
