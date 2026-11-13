@@ -425,7 +425,17 @@ pub fn build_app(state: AppState) -> Router {
         );
     }
 
-    router.fallback(any(catch_all)).with_state(state)
+    let mut router = router.fallback(any(catch_all));
+    // Inbound HEADROOM_PROXY_TOKEN gate. Applied last so it wraps every
+    // route and the fallback: the upstream Python proxy sees this process
+    // as a loopback caller and cannot authenticate the real peer itself.
+    if let Some(token) = state.config.proxy_token.clone() {
+        router = router.layer(axum::middleware::from_fn_with_state(
+            token,
+            crate::inbound_auth::require_proxy_token,
+        ));
+    }
+    router.with_state(state)
 }
 
 /// Catch-all handler. If the request is a WebSocket upgrade, hand off to the

@@ -54,9 +54,8 @@ at it; end users notice nothing.
 make build-proxy
 ./target/release/headroom-proxy --help
 
-# Run against a local upstream
+# Run against a local upstream (listens on 127.0.0.1:8787 by default)
 ./target/release/headroom-proxy \
-    --listen 0.0.0.0:8787 \
     --upstream http://127.0.0.1:8788
 
 # Health checks
@@ -70,7 +69,10 @@ curl -s http://127.0.0.1:8787/healthz/upstream   # => 200 if upstream reachable
 # 1. Move the Python proxy to a private port (e.g. 8788)
 HEADROOM_HOST=127.0.0.1 HEADROOM_PORT=8788 python -m headroom.proxy &  # or your existing launcher
 
-# 2. Run the Rust proxy on the previously-public port (8787) pointing at it
+# 2. Run the Rust proxy on the previously-public port (8787) pointing at it.
+#    The Python proxy sees every relayed request as coming from 127.0.0.1,
+#    so the Rust proxy enforces HEADROOM_PROXY_TOKEN itself (see below).
+export HEADROOM_PROXY_TOKEN="$(openssl rand -hex 32)"
 ./target/release/headroom-proxy --listen 0.0.0.0:8787 --upstream http://127.0.0.1:8788 &
 
 # 3. End users keep hitting :8787 unchanged.
@@ -83,7 +85,8 @@ curl -si http://127.0.0.1:8787/v1/models
 
 | Flag | Env var | Default | Notes |
 | --- | --- | --- | --- |
-| `--listen` | `HEADROOM_PROXY_LISTEN` | `0.0.0.0:8787` | bind address |
+| `--listen` | `HEADROOM_PROXY_LISTEN` | `127.0.0.1:8787` | bind address; a non-loopback address refuses to start without `HEADROOM_PROXY_TOKEN` unless `HEADROOM_ALLOW_UNAUTHENTICATED_BIND=1` |
+| `--proxy-token` | `HEADROOM_PROXY_TOKEN` | (unset) | inbound token required from non-loopback peers (below); prefer the env var |
 | `--metrics-require-loopback` | `HEADROOM_PROXY_METRICS_REQUIRE_LOOPBACK` | `false` | when set, `/metrics` is served only to loopback peers (403 otherwise); recommended on non-loopback binds |
 | `--upstream` | `HEADROOM_PROXY_UPSTREAM` | (required) | base URL the proxy forwards to |
 | `--upstream-timeout` |  | `600s` | end-to-end request timeout (long for streams) |
@@ -94,6 +97,25 @@ curl -si http://127.0.0.1:8787/v1/models
 | `--graceful-shutdown-timeout` | | `30s` | wait for in-flight on SIGTERM/SIGINT |
 | `--stats` | `HEADROOM_PROXY_STATS` | `true` | native savings stats + `/dashboard` (below) |
 | `--stats-path` | `HEADROOM_PROXY_STATS_PATH` | `~/.headroom/native_stats.json` | ledger persistence (honours `HEADROOM_WORKSPACE_DIR`) |
+
+### Inbound authentication
+
+The Rust proxy connects to the Python proxy from `127.0.0.1`, and the
+Python proxy trusts loopback callers (no token needed, and access to
+`/admin`, `/debug` and `/settings`). So the Rust proxy applies the same
+`HEADROOM_PROXY_TOKEN` rules itself, before anything is forwarded:
+
+- With a token set, a non-loopback peer must send it as
+  `X-Headroom-Proxy-Token: <token>` or `Authorization: Bearer <token>`,
+  or gets `401 {"error":"unauthorized"}`. Loopback peers are exempt, as
+  in the Python proxy. The token is removed from the request before it
+  is forwarded (`Authorization` only when it carries the token).
+- `GET /healthz`, `/healthz/upstream`, `/health`, `/livez` and `/readyz`
+  stay reachable without the token, and `GET`/`HEAD /api/hello` is
+  answered locally with an empty `200`.
+- A non-loopback `--listen` with no token refuses to start. Set
+  `HEADROOM_ALLOW_UNAUTHENTICATED_BIND=1` only when something else
+  already restricts who can reach the port.
 
 ### Savings stats & dashboard (native)
 
@@ -143,8 +165,8 @@ the hot path every 10 s and on shutdown.
 > the numbers start flowing on their own.
 
 > **No auth; exposure is split by tier.** These endpoints bind
-> wherever `--listen` points (default `0.0.0.0:8787`) and carry no
-> auth, so the payload is split the same way the Python proxy splits
+> wherever `--listen` points (default `127.0.0.1:8787`) and, for
+> loopback peers or with no `HEADROOM_PROXY_TOKEN`, carry no auth, so the payload is split the same way the Python proxy splits
 > its own `/stats`:
 >
 > - **Aggregates** — spend, tokens, per-model/provider rollups,

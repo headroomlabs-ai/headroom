@@ -1,5 +1,6 @@
 //! Configuration for the proxy: CLI flags + env vars.
 
+use crate::inbound_auth::ProxyToken;
 use clap::{Parser, ValueEnum};
 use headroom_core::rollout::{
     feature_names, split_feature_names, Feature, RolloutChannel, RolloutSnapshot,
@@ -272,8 +273,10 @@ pub struct CliArgs {
     )]
     pub unsafe_allow_unstable_features: bool,
 
-    /// Address the proxy listens on (e.g. 0.0.0.0:8787).
-    #[arg(long, env = "HEADROOM_PROXY_LISTEN", default_value = "0.0.0.0:8787")]
+    /// Address the proxy listens on. Loopback by default, like the Python
+    /// proxy; a non-loopback address needs `HEADROOM_PROXY_TOKEN` (or
+    /// `HEADROOM_ALLOW_UNAUTHENTICATED_BIND=1`) to start.
+    #[arg(long, env = "HEADROOM_PROXY_LISTEN", default_value = "127.0.0.1:8787")]
     pub listen: SocketAddr,
 
     /// Restrict the Prometheus `/metrics` scrape endpoint to loopback
@@ -294,6 +297,20 @@ pub struct CliArgs {
         action = clap::ArgAction::Set,
     )]
     pub metrics_require_loopback: bool,
+
+    /// Inbound proxy token. When set, every request from a non-loopback
+    /// peer must present it as `x-headroom-proxy-token` or
+    /// `Authorization: Bearer`, the same rules as the Python proxy, or it
+    /// gets 401 without reaching the upstream. Prefer the env var: a
+    /// command-line value is visible in the process list. A non-loopback
+    /// `--listen` refuses to start without it unless
+    /// `HEADROOM_ALLOW_UNAUTHENTICATED_BIND=1` acknowledges the open bind.
+    #[arg(
+        long = "proxy-token",
+        env = "HEADROOM_PROXY_TOKEN",
+        hide_env_values = true
+    )]
+    pub proxy_token: Option<String>,
 
     /// Upstream base URL the proxy forwards to (e.g. http://127.0.0.1:8788).
     /// REQUIRED — there is no default; we want operators to be explicit.
@@ -667,6 +684,8 @@ pub struct Config {
     /// Gate the Prometheus `/metrics` endpoint to loopback clients.
     /// Default `false`; recommend `true` when `listen` is non-loopback.
     pub metrics_require_loopback: bool,
+    /// Inbound token required from non-loopback peers (`None` = no gate).
+    pub proxy_token: Option<ProxyToken>,
     pub upstream: Url,
     pub upstream_timeout: Duration,
     pub upstream_connect_timeout: Duration,
@@ -781,6 +800,7 @@ impl Config {
             rollout: rollout.clone(),
             listen: args.listen,
             metrics_require_loopback: args.metrics_require_loopback,
+            proxy_token: args.proxy_token.as_deref().and_then(ProxyToken::new),
             upstream: args.upstream,
             upstream_timeout: args.upstream_timeout,
             upstream_connect_timeout: args.upstream_connect_timeout,
@@ -824,6 +844,7 @@ impl Config {
             // carry no `ConnectInfo`. Tests that exercise the gate set
             // this to `true` explicitly.
             metrics_require_loopback: false,
+            proxy_token: None,
             upstream,
             upstream_timeout: Duration::from_secs(60),
             upstream_connect_timeout: Duration::from_secs(5),
