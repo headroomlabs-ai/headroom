@@ -762,13 +762,13 @@ class LocalBackend:
     async def get_user_memories(
         self,
         user_id: str,
-        limit: int = 100,
+        limit: int | None = 100,
     ) -> list[Memory]:
         """Get all memories for a user.
 
         Args:
             user_id: User identifier.
-            limit: Maximum number of memories to return.
+            limit: Maximum number of memories to return, or None for all memories.
 
         Returns:
             List of memories for the user.
