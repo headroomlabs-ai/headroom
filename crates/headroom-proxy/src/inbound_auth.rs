@@ -150,17 +150,21 @@ fn is_hello_probe(method: &Method, path: &str) -> bool {
 #[derive(Clone, Copy, Debug)]
 pub struct NonLocalCaller;
 
-/// For a [`NonLocalCaller`]: the `Host` to send upstream instead, when the
-/// one that would be sent names loopback. That is the explicit outgoing
-/// `Host` (`--no-rewrite-host`), else the upstream URL's authority. The
-/// replacement is the caller's own `Host` when it is not a loopback name,
-/// else a reserved non-loopback name. Judged on the `Host` value rather
-/// than on whether the upstream address is loopback, so an upstream name
-/// that resolves to loopback cannot be paired with a loopback `Host`.
+/// `Host` sent upstream in place of one that may name loopback, for a
+/// [`NonLocalCaller`]. A reserved name (RFC 2606), never the caller's own
+/// value: the caller controls that, and the upstream's parser may accept
+/// loopback forms this one does not.
+pub const NON_LOCAL_HOST: &str = "headroom-remote.invalid";
+
+/// For a [`NonLocalCaller`]: [`NON_LOCAL_HOST`] when the `Host` that would
+/// be sent may name loopback, else `None` (keep it). That `Host` is the
+/// explicit outgoing one (`--no-rewrite-host`), else the upstream URL's
+/// authority. Judged on the value, not on the upstream address, so an
+/// upstream name that resolves to loopback cannot be paired with a
+/// loopback `Host`.
 pub(crate) fn host_override_for_non_local(
     outgoing: Option<&HeaderValue>,
     upstream: &url::Url,
-    client: &HeaderMap,
 ) -> Option<HeaderValue> {
     let effective = match outgoing {
         Some(h) => h.to_str().ok().map(str::to_owned),
@@ -169,17 +173,17 @@ pub(crate) fn host_override_for_non_local(
             None => h.to_owned(),
         }),
     };
-    // An unreadable outgoing Host is not provably non-loopback: replace it.
-    if outgoing.is_some() && effective.is_none() {
-        return Some(non_local_host(client));
-    }
-    is_loopback_host_header(effective.as_deref()).then(|| non_local_host(client))
+    may_name_loopback(effective.as_deref()).then(|| HeaderValue::from_static(NON_LOCAL_HOST))
 }
 
-fn non_local_host(client: &HeaderMap) -> HeaderValue {
-    match client.get(header::HOST) {
-        Some(h) if !is_loopback_host_header(h.to_str().ok()) => h.clone(),
-        _ => HeaderValue::from_static("headroom-remote.invalid"),
+/// Conservative superset of what the Python proxy treats as a loopback
+/// `Host`: anything [`is_loopback_host_header`] accepts, an unreadable
+/// value, and any value with an IPv6 zone (`%`), since Python's
+/// `ipaddress` accepts scoped literals such as `[::1%lo]`.
+fn may_name_loopback(value: Option<&str>) -> bool {
+    match value {
+        None => true,
+        Some(v) => v.contains('%') || is_loopback_host_header(Some(v)),
     }
 }
 
@@ -342,46 +346,31 @@ mod tests {
     #[test]
     fn non_local_caller_never_gets_a_loopback_host_upstream() {
         let up = |u: &str| url::Url::parse(u).unwrap();
-        let client = |h: &str| {
-            let mut m = HeaderMap::new();
-            m.insert(header::HOST, h.parse().unwrap());
-            m
-        };
-        let local: HeaderValue = "localhost".parse().unwrap();
-        // --no-rewrite-host with an upstream name that resolves to loopback.
+        let hv = |h: &str| HeaderValue::from_str(h).unwrap();
+        let alias = up("http://headroom-upstream.internal:8788");
+        let loopback = up("http://127.0.0.1:8788");
+        // --no-rewrite-host: the caller's Host is what would be sent.
+        for host in [
+            "localhost",
+            "127.0.0.1:8787",
+            "[::1]:8787",
+            "[::1%lo]:8787",
+            "::1%lo",
+        ] {
+            assert_eq!(
+                host_override_for_non_local(Some(&hv(host)), &alias).unwrap(),
+                NON_LOCAL_HOST,
+                "{host}"
+            );
+        }
+        // Rewritten Host on a loopback upstream: the reserved name.
         assert_eq!(
-            host_override_for_non_local(
-                Some(&local),
-                &up("http://headroom-upstream.internal:8788"),
-                &client("localhost")
-            )
-            .unwrap(),
-            "headroom-remote.invalid"
+            host_override_for_non_local(None, &loopback).unwrap(),
+            NON_LOCAL_HOST
         );
-        // Rewritten Host on a loopback upstream: the caller's own Host.
-        assert_eq!(
-            host_override_for_non_local(
-                None,
-                &up("http://127.0.0.1:8788"),
-                &client("proxy.example:8787")
-            )
-            .unwrap(),
-            "proxy.example:8787"
-        );
-        // Already non-loopback: left alone.
-        assert!(host_override_for_non_local(
-            None,
-            &up("http://headroom-upstream.internal:8788"),
-            &client("localhost")
-        )
-        .is_none());
-        let foreign: HeaderValue = "proxy.example".parse().unwrap();
-        assert!(host_override_for_non_local(
-            Some(&foreign),
-            &up("http://127.0.0.1:8788"),
-            &client("proxy.example")
-        )
-        .is_none());
+        // Not loopback: left alone.
+        assert!(host_override_for_non_local(None, &alias).is_none());
+        assert!(host_override_for_non_local(Some(&hv("proxy.example")), &loopback).is_none());
     }
 
     #[test]

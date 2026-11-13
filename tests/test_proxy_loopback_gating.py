@@ -1119,3 +1119,17 @@ def test_metrics_token_authenticated_network_caller_allowed(
     assert network.get("/metrics").status_code == 401
     ok = network.get("/metrics", headers={"Authorization": "Bearer s3cr3t-token"})
     assert ok.status_code == 200, ok.text
+
+
+@pytest.mark.parametrize("host", ["headroom-remote.invalid", "evil.example:8787"])
+def test_local_only_routes_refuse_the_hosts_the_rust_front_relays_for_remote_callers(
+    host: str,
+) -> None:
+    # The Rust front reaches this proxy from 127.0.0.1. For a caller that is
+    # not local on its side it sends a non-loopback Host (the reserved
+    # headroom-remote.invalid when the Host would otherwise name loopback),
+    # so these routes must refuse a loopback peer carrying such a Host.
+    client = TestClient(_make_app(), base_url=f"http://{host}", client=("127.0.0.1", 12345))
+    assert client.get("/admin/upstream").status_code == 404
+    assert client.get("/debug/tasks").status_code == 404
+    assert client.get("/transformations/feed").status_code == 404

@@ -270,12 +270,14 @@ async fn loopback_peer_with_a_foreign_host_is_not_relayed_as_local() {
         &[("host", "evil.example:8787")],
     )
     .await;
-    assert_eq!(host, "evil.example:8787");
+    assert_eq!(host, "headroom-remote.invalid");
 }
 
 #[tokio::test]
 async fn remote_token_holder_is_not_relayed_as_local() {
-    for client_host in ["proxy.example:8787", "localhost:8787"] {
+    // `[::1%lo]` is a scoped IPv6 literal the Python proxy accepts as
+    // loopback; it must not be passed through.
+    for client_host in ["proxy.example:8787", "localhost:8787", "[::1%lo]:8787"] {
         let host = upstream_host(
             Some(TOKEN),
             REMOTE,
@@ -283,6 +285,6 @@ async fn remote_token_holder_is_not_relayed_as_local() {
             &[("x-headroom-proxy-token", TOKEN), ("host", client_host)],
         )
         .await;
-        assert!(!is_loopback_name(&host), "{client_host} -> {host}");
+        assert_eq!(host, "headroom-remote.invalid", "{client_host}");
     }
 }
