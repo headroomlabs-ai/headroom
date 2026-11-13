@@ -80,7 +80,7 @@ def test_build_spec_falls_back_to_python_module_when_no_binary(monkeypatch) -> N
     spec = build_headroom_spec()
 
     assert spec.command == "/usr/bin/python"
-    assert spec.args == ("-m", "headroom.cli", "mcp", "serve")
+    assert spec.args == ("-P", "-m", "headroom.cli", "mcp", "serve")
     assert spec.env == {}
 
 

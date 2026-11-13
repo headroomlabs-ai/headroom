@@ -107,7 +107,8 @@ def resolve_headroom_command() -> list[str]:
     headroom_bin = shutil.which("headroom")
     if headroom_bin:
         return [headroom_bin]
-    return [sys.executable, "-m", "headroom.cli"]
+    # -P: never import a `headroom/` folder from the caller's working directory.
+    return [sys.executable, "-P", "-m", "headroom.cli"]
 
 
 def _runtime_env(manifest: DeploymentManifest) -> dict[str, str]:
@@ -139,7 +140,7 @@ def build_runtime_command(manifest: DeploymentManifest) -> list[str]:
     """Build the raw foreground command that runs the proxy."""
 
     if manifest.runtime_kind == RuntimeKind.PYTHON.value:
-        return [sys.executable, "-m", "headroom.cli", "proxy", *manifest.proxy_args]
+        return [sys.executable, "-P", "-m", "headroom.cli", "proxy", *manifest.proxy_args]
 
     _ensure_host_dirs()
     home = str(Path.home())

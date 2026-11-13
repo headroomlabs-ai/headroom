@@ -408,7 +408,7 @@ def test_resolve_headroom_command_prefers_headroom_binary(monkeypatch) -> None:
 def test_resolve_headroom_command_falls_back_to_python_module(monkeypatch) -> None:
     monkeypatch.setattr("shutil.which", lambda name: None)
     monkeypatch.setattr("headroom.install.runtime.sys.executable", "/usr/bin/python")
-    assert resolve_headroom_command() == ["/usr/bin/python", "-m", "headroom.cli"]
+    assert resolve_headroom_command() == ["/usr/bin/python", "-P", "-m", "headroom.cli"]
 
 
 def test_runtime_env_and_mount_source(monkeypatch) -> None:
@@ -461,6 +461,7 @@ def test_build_runtime_command_python_and_docker_user(monkeypatch, tmp_path: Pat
     )
     assert build_runtime_command(manifest) == [
         "/usr/bin/python",
+        "-P",
         "-m",
         "headroom.cli",
         "proxy",
