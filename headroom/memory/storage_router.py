@@ -84,7 +84,7 @@ def _git_common_dir_cache_clear() -> None:
         _git_common_dir_stats["misses"] = 0
 
 
-def _git_common_dir_cache_info() -> dict[str, int]:
+def _git_common_dir_cache_info() -> dict[str, int | float]:
     """Cache counters, mirroring ``functools.lru_cache``'s ``cache_info``."""
     with _git_common_dir_lock:
         return {
