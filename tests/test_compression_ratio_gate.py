@@ -68,6 +68,17 @@ def test_compression_ratio_within_baseline(case: dict) -> None:
     except CompressorUnavailable as e:
         pytest.skip(str(e))
 
+    # Passthrough drift: a compressor that silently degrades to returning the
+    # input unchanged (e.g. Kompress's failure latch / canary shutdown) can
+    # still land inside a loose tolerance band at ratio 0.0. The committed
+    # `modified` bit makes that regression a hard failure instead.
+    assert m.modified == entry["modified"], (
+        f"PASSTHROUGH DRIFT in {key}: baseline modified={entry['modified']} "
+        f"but measured modified={m.modified} — the compressor degraded to "
+        f"passthrough (or started transforming content it previously passed "
+        f"through). {REGEN_HINT}"
+    )
+
     tol = entry["tolerance"]
     for metric in ("byte_ratio", "token_ratio"):
         expected = entry[metric]
@@ -134,8 +145,12 @@ def test_aggregate_ratio_within_band() -> None:
         tol = BASELINE["cases"][
             f"{name}/{next(c['id'] for c in CASES if c['compressor'] == name)}"
         ]["tolerance"]
+        # Half band: a uniform shift smaller than the per-case tolerance is
+        # invisible to the per-case check but visible in the mean. Using the
+        # full tolerance would make this check mathematically unreachable.
+        agg_tol = tol / 2
         actual = sum(ratios) / len(ratios)
-        assert expected - tol <= actual <= expected + tol, (
+        assert expected - agg_tol <= actual <= expected + agg_tol, (
             f"AGGREGATE RATIO DRIFT in {name}: mean byte_ratio {actual:.4f} outside "
-            f"baseline band {expected:.4f} ± {tol}. {REGEN_HINT}"
+            f"baseline band {expected:.4f} ± {agg_tol}. {REGEN_HINT}"
         )
