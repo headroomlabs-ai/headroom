@@ -1797,6 +1797,13 @@ def content_cache_key(
     return h.hexdigest()
 
 
+# Bump when a routing change makes earlier cached output wrong for the same
+# version and config, so the disk tier starts a fresh namespace instead of
+# replaying it. "code-never-kompress": before #4214, code could reach Kompress
+# and lose keywords; a cache made then must not be served after the fix.
+_ROUTING_POLICY_REVISION = "code-never-kompress"
+
+
 def _config_namespace(config: Any) -> str:
     """A prefix for this router's keys in the shared disk tier: a digest of its
     config and the headroom version. The proxy may run routers configured
@@ -1822,7 +1829,9 @@ def _config_namespace(config: Any) -> str:
     # starts a fresh namespace rather than serving output made under another.
     settings = sorted((k, v) for k, v in os.environ.items() if k.startswith("HEADROOM_"))
     h = hashlib.blake2b(digest_size=8)
-    h.update(f"{__version__}|{stable(asdict(config))!r}|{settings!r}".encode())
+    h.update(
+        f"{__version__}|{_ROUTING_POLICY_REVISION}|{stable(asdict(config))!r}|{settings!r}".encode()
+    )
     return h.hexdigest() + ":"
 
 
@@ -4168,6 +4177,12 @@ class ContentRouter(Transform):
         """
         active = self._active_external_compressors
         if not active:
+            return None
+        # PASSTHROUGH is the router's explicit "leave this block unmangled"
+        # decision (source code with prefer_code_aware_for_code=False, whole or
+        # as a mixed-content section). Its strategy maps to text/plain below, so
+        # a prose-only external compressor would otherwise rewrite the code.
+        if strategy == CompressionStrategy.PASSTHROUGH:
             return None
         content_mime = _CONTENT_TYPE_TO_MIME.get(self._content_type_from_strategy(strategy))
         if content_mime is None:

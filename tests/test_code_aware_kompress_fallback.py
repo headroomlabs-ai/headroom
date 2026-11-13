@@ -149,3 +149,17 @@ def test_ast_failure_passes_through_without_kompress(
     available.assert_not_called()
     compressor.assert_not_called()
     assert out.content == PYTHON_CODE
+
+
+def test_disk_cache_namespace_includes_the_routing_policy_revision(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Output cached before #4214 (code sent to Kompress) must not be replayed
+    # after the fix by a restart with the same version and config.
+    import headroom.transforms.content_router as cr
+
+    config = ContentRouterConfig()
+    current = cr._config_namespace(config)
+    monkeypatch.setattr(cr, "_ROUTING_POLICY_REVISION", "earlier-policy")
+
+    assert cr._config_namespace(config) != current
