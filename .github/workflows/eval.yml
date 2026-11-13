@@ -73,6 +73,15 @@ jobs:
           assert result.passed, f'Schema compaction failures: {result.errors}'
           "
 
+      # Deterministic per-compressor ratio gate — pipes the committed corpus
+      # through every text compressor and fails when a measured percentage
+      # drifts outside its committed band. Runs in the [dev] shards too, but
+      # under [all] here the optional-backend compressors (code_aware via
+      # tree-sitter, html via trafilatura, kompress via its ONNX model) are
+      # measured for real instead of skipping.
+      - name: Compression ratio drift gate (all compressors, [all] extras)
+        run: pytest tests/test_compression_ratio_gate.py -v
+
       # OPENAI_API_KEY is intentionally not set in the public OSS repo
       # (the secret list is empty). The CCR round-trip step above is the
       # mandatory gate; this step only runs when an operator has wired
