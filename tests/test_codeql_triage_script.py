@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -31,6 +32,8 @@ import json, os, sys
 path = os.environ["FAKE_GH_STATE"]
 state = json.load(open(path))
 args = sys.argv[1:]
+now = os.environ["TRIAGE_TODAY"] + "T12:00:00Z"
+BOT = {"login": "github-actions[bot]"}
 
 def save():
     json.dump(state, open(path, "w"))
@@ -45,9 +48,11 @@ if args[0] == "api":
     elif "/issues?" in target:
         print(json.dumps(state["issues"]))
     elif target.endswith("/comments"):
+        if os.environ.get("FAKE_GH_FAIL_COMMENTS"):
+            sys.exit("fake gh: HTTP 502")
         number = int(target.split("/")[-2])
         issue = next(i for i in state["issues"] if i["number"] == number)
-        print(json.dumps([{"body": c} for c in issue["comments"]]))
+        print(json.dumps(issue["comments"]))
     else:
         number = int(target.rsplit("/", 1)[1])
         print(json.dumps(next(i for i in state["issues"] if i["number"] == number)))
@@ -59,6 +64,8 @@ elif args[:2] == ["issue", "create"]:
         "body": open(opt("--body-file")).read(),
         "state": "open",
         "labels": [opt("--label")],
+        "user": BOT,
+        "created_at": now,
         "comments": [],
     })
     save()
@@ -66,20 +73,22 @@ elif args[:2] == ["issue", "create"]:
 elif args[:2] == ["issue", "comment"]:
     number = int(args[2])
     issue = next(i for i in state["issues"] if i["number"] == number)
-    issue["comments"].append(open(opt("--body-file")).read())
+    issue["comments"].append(
+        {"body": open(opt("--body-file")).read(), "user": BOT, "created_at": now}
+    )
     save()
 else:
     sys.exit(f"fake gh: unsupported {args}")
 '''
 
 
-def _alert(number: int, severity: str = "high") -> dict:
+def _alert(number: int, severity: str = "high", created_at: str = "2026-10-01T00:00:00Z") -> dict:
     return {
         "number": number,
         "html_url": f"https://github.com/o/r/security/code-scanning/{number}",
         "rule": {"id": f"py/rule-{number}", "security_severity_level": severity},
         "most_recent_instance": {"location": {"path": "headroom/x.py", "start_line": number}},
-        "created_at": "2026-10-01T00:00:00Z",
+        "created_at": created_at,
     }
 
 
@@ -107,7 +116,9 @@ def harness(tmp_path):
         next(i for i in s["issues"] if i["number"] == number).update(changes)
         state_path.write_text(json.dumps(s))
 
-    def run(today: str) -> subprocess.CompletedProcess:
+    def run(
+        today: str, check: bool = True, fail_comments: bool = False
+    ) -> subprocess.CompletedProcess:
         env = {
             **os.environ,
             "PATH": f"{bindir}{os.pathsep}{os.environ['PATH']}",
@@ -116,10 +127,13 @@ def harness(tmp_path):
             "TRIAGE_ASSIGNEE": "owner",
             "TRIAGE_TODAY": today,
         }
+        if fail_comments:
+            env["FAKE_GH_FAIL_COMMENTS"] = "1"
         result = subprocess.run(
             ["bash", str(SCRIPT)], cwd=workdir, env=env, capture_output=True, text=True
         )
-        assert result.returncode == 0, result.stderr
+        if check:
+            assert result.returncode == 0, result.stderr
         return result
 
     set_alerts()
@@ -148,13 +162,16 @@ def test_public_issue_and_comments_carry_only_counts(harness):
 
     (issue,) = state()["issues"]
     (comment,) = issue["comments"]
-    public_text = issue["title"] + issue["body"] + comment
+    public_text = issue["title"] + issue["body"] + comment["body"]
     assert "py/rule-" not in public_text
     assert "headroom/x.py" not in public_text
     for number in (11, 12, 13):
         assert f"#{number}" not in public_text
         assert f"code-scanning/{number}" not in public_text
-    assert "critical 1, high 2" in comment
+    assert "critical 1, high 2" in comment["body"]
+    # The hidden state markers hold counts only, nothing derived from alert ids.
+    markers = re.findall(r"<!-- codeql-triage-state:(.*?) -->", public_text)
+    assert markers == ["c1-h1", "c1-h2"]
 
 
 def test_rerun_same_day_creates_nothing(harness):
@@ -175,7 +192,7 @@ def test_later_dispatch_reuses_a_closed_issue(harness):
 
     body = state()["issues"][0]["body"]
     edit_issue(1, state="closed")  # #1 fixed, issue closed
-    set_alerts(_alert(7))  # a new high alert midweek
+    set_alerts(_alert(7, created_at="2026-10-08T09:00:00Z"))  # new midweek, same counts
 
     run("2026-10-09")  # Friday's manual dispatch
 
@@ -183,7 +200,7 @@ def test_later_dispatch_reuses_a_closed_issue(harness):
     assert issue["state"] == "closed"
     assert issue["body"] == body
     (comment,) = issue["comments"]
-    assert "critical 0, high 1" in comment
+    assert "critical 0, high 1" in comment["body"]
 
     run("2026-10-11")  # Sunday: same ISO week, nothing new since the comment
     (issue,) = state()["issues"]
@@ -234,8 +251,41 @@ def test_an_alert_reopened_after_it_was_closed_is_reported_again(harness):
     run("2026-10-08")
     (issue,) = state()["issues"]
     assert len(issue["comments"]) == 2
-    assert "critical 0, high 1" in issue["comments"][-1]
+    assert "critical 0, high 1" in issue["comments"][-1]["body"]
     assert issue["state"] == "closed"
 
     run("2026-10-09")  # unchanged since that comment: not repeated
     assert len(state()["issues"][0]["comments"]) == 2
+
+
+def test_a_marker_in_someone_elses_comment_is_ignored(harness):
+    set_alerts, state, edit_issue, run = harness
+    set_alerts(_alert(1))
+    run("2026-10-05")
+    set_alerts()
+    run("2026-10-06")  # bot records c0-h0
+    issue = state()["issues"][0]
+    forged = {
+        "body": "<!-- codeql-triage-state:c0-h1 -->",
+        "user": {"login": "someone"},
+        "created_at": "2026-10-07T00:00:00Z",
+    }
+    edit_issue(1, comments=issue["comments"] + [forged])
+
+    set_alerts(_alert(1))  # reopened: matches only the forged marker
+    run("2026-10-08")
+    bodies = [c["body"] for c in state()["issues"][0]["comments"]]
+    assert len(bodies) == 3
+    assert "critical 0, high 1" in bodies[-1]
+
+
+def test_a_failed_comment_read_stops_the_run(harness):
+    set_alerts, state, _, run = harness
+    set_alerts(_alert(1))
+    run("2026-10-05")
+    set_alerts(_alert(1), _alert(2, created_at="2026-10-06T09:00:00Z"))
+
+    result = run("2026-10-06", check=False, fail_comments=True)
+
+    assert result.returncode != 0
+    assert state()["issues"][0]["comments"] == []
