@@ -548,6 +548,9 @@ def _in_registry(tool: str) -> bool:
     return tool in _registry().get("tools", {})
 
 
+_WARNED_CWD_HITS: set[str] = set()
+
+
 def _which_outside_cwd(name: str) -> Path | None:
     """``shutil.which(name)``, ignoring a hit in the current directory.
 
@@ -556,7 +559,8 @@ def _which_outside_cwd(name: str) -> Path | None:
     relative PATH entry (``.``, empty, ``bin``) resolves against the cwd. The
     cwd is usually the project being worked on, so a same-named file there
     would run instead of the real tool. Such hits are ignored; the caller then
-    falls back to the interpreter's Scripts dir or the verified cache.
+    falls back to the interpreter's Scripts dir or the verified cache. This also
+    applies when the cwd is itself an absolute PATH entry (e.g. ``~/.local/bin``).
     """
     found = shutil.which(name)
     if not found:
@@ -568,12 +572,16 @@ def _which_outside_cwd(name: str) -> Path | None:
         except OSError:
             in_cwd = False
     if in_cwd:
-        logger.warning(
-            "Ignoring %s found via the current directory (%s); using the "
-            "interpreter's Scripts dir or the Headroom cache instead",
-            name,
-            os.path.abspath(found),
-        )
+        ignored = os.path.abspath(found)
+        # resolve() runs per tool result in the proxy; say it once per file.
+        if ignored not in _WARNED_CWD_HITS:
+            _WARNED_CWD_HITS.add(ignored)
+            logger.warning(
+                "Ignoring %s found via the current directory (%s); using the "
+                "interpreter's Scripts dir or the Headroom cache instead",
+                name,
+                ignored,
+            )
         return None
     return Path(found)
 
