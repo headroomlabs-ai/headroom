@@ -400,22 +400,21 @@ def parse_labels(value: Any) -> dict[str, str]:
     return dict(itertools.islice(_label_pairs(value).items(), MAX_DIMENSIONS))
 
 
+_LABEL_ESCAPES = str.maketrans({"%": "%25", ",": "%2C", ";": "%3B"})
+
+
 def format_labels(labels: Mapping[str, str]) -> str:
     """Inverse of :func:`parse_labels`, for building ``X-Headroom-Labels``.
 
-    The header has no escaping, so a label containing ``,`` or ``;`` cannot
-    survive the round trip; it is left out (with a warning) rather than sent
-    truncated. Send such a label in its own ``X-Headroom-<name>`` header.
+    The parser splits on ``,`` and ``;`` and then percent-decodes each label
+    once, so ``%``, ``,`` and ``;`` in a label are percent-encoded here. Every
+    label that :func:`normalize_attribution` keeps comes back unchanged,
+    ``release%41`` and ``design, ops`` included.
     """
-    pairs = []
-    for name, label in normalize_attribution(labels).items():
-        if "," in label or ";" in label:
-            logger.warning(
-                "attribution: label for %r has a separator; not sent in %s", name, LABELS_HEADER
-            )
-            continue
-        pairs.append(f"{name}={label}")
-    return "; ".join(pairs)
+    return "; ".join(
+        f"{name}={label.translate(_LABEL_ESCAPES)}"
+        for name, label in normalize_attribution(labels).items()
+    )
 
 
 def header_name_for(dimension: str) -> str:

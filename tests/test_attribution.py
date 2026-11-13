@@ -262,8 +262,21 @@ def test_parse_and_format_labels_roundtrip():
     assert labels == {"team": "infra", "owner": "sam"}
     assert parse_labels(format_labels(labels)) == labels
     assert parse_labels(None) == {}
-    # No escaping in the header: a label with a separator is left out, not cut.
-    assert format_labels({"team": "design, ops", "owner": "sam"}) == "owner=sam"
+
+
+@pytest.mark.parametrize(
+    "label",
+    ["release%41", "100%", "%%", "%2541", "design, ops", "a;b", "k=v", "50% off; ,x"],
+)
+def test_format_labels_roundtrip_keeps_percent_and_separators(label):
+    labels = {"team": label, "owner": "sam"}
+    assert parse_labels(format_labels(labels)) == labels
+
+
+def test_format_labels_encodes_only_what_the_parser_reads():
+    assert format_labels({"team": "release%41"}) == "team=release%2541"
+    assert format_labels({"team": "design, ops"}) == "team=design%2C ops"
+    assert format_labels({"team": "a;b", "owner": "sam"}) == "team=a%3Bb; owner=sam"
 
 
 def test_bind_label_updates_context_copy_on_write():
