@@ -614,7 +614,8 @@ def _path_lookup(tool: str) -> Path | None:
     scripts_dir = Path(sys.prefix) / ("Scripts" if sys.platform.startswith("win") else "bin")
     for name in candidates:
         exe = scripts_dir / (name + (".exe" if sys.platform.startswith("win") else ""))
-        if exe.exists():
+        # Same test shutil.which applies: a regular file we may execute.
+        if exe.is_file() and os.access(exe, os.X_OK):
             return exe
     return None
 

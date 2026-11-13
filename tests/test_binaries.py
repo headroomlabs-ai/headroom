@@ -249,9 +249,24 @@ def test_status_reports_a_tool_in_the_interpreter_scripts_dir(monkeypatch, tmp_p
     scripts = tmp_path / "venv" / "bin"
     scripts.mkdir(parents=True)
     (scripts / "difft").write_text("#!/bin/sh\n")
+    (scripts / "difft").chmod(0o755)
     monkeypatch.setattr(binaries.sys, "prefix", str(tmp_path / "venv"))
     row = next(r for r in binaries.status() if r["tool"] == "difft")
     assert (row["state"], row["path"]) == ("on-path", str(scripts / "difft"))
+
+
+@pytest.mark.skipif(sys.platform.startswith("win"), reason="POSIX execute bit")
+def test_status_ignores_a_non_executable_file_in_the_scripts_dir(monkeypatch, tmp_path):
+    _set_platform(monkeypatch, sys_plat="darwin", machine="arm64")
+    monkeypatch.setenv("PATH", "/no-such-bin")
+    scripts = tmp_path / "venv" / "bin"
+    scripts.mkdir(parents=True)
+    (scripts / "difft").write_text("not a program\n")
+    (scripts / "difft").chmod(0o644)
+    monkeypatch.setattr(binaries.sys, "prefix", str(tmp_path / "venv"))
+    assert binaries.which("difft") is None
+    row = next(r for r in binaries.status() if r["tool"] == "difft")
+    assert (row["state"], row["path"]) == ("missing", None)
 
 
 def test_which_keeps_a_tool_on_path_outside_the_current_directory(monkeypatch, tmp_path):
