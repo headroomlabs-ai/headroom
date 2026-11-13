@@ -534,17 +534,20 @@ def _drop_stale_managed_models(
     prior_state: OpencodeManagedState | None,
     injected_models: dict[str, Any],
 ) -> dict[str, Any]:
-    """Drop models Headroom injected earlier but no longer advertises.
+    """Drop entries Headroom injected earlier but no longer advertises.
 
-    Only unmodified entries are dropped: a model the user edited after the
-    wrap is their content, not Headroom's.
+    That is an extra model dropped from the flags, and an extra that overrode
+    a built-in id and is dropped again: the id stays advertised, but what
+    Headroom writes for it differs, so the old override must not win the
+    merge. Only unmodified entries are dropped: a model the user edited after
+    the wrap is their content, not Headroom's.
     """
     if prior_state is None:
         return existing_models
     stale = {
         model_id
         for model_id, injected in prior_state.managed_models.items()
-        if model_id not in injected_models and existing_models.get(model_id) == injected
+        if existing_models.get(model_id) == injected and injected_models.get(model_id) != injected
     }
     if not stale:
         return existing_models

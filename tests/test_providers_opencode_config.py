@@ -10,6 +10,7 @@ import pytest
 
 from headroom.providers.opencode.config import (
     HEADROOM_OPENCODE_EXTRA_MODELS_ENV,
+    HEADROOM_OPENCODE_MODELS,
     HEADROOM_OPENCODE_PLUGIN,
     _inject_key_into_json,
     _parse_json_loose,
@@ -994,6 +995,26 @@ def test_reinject_prunes_a_dropped_extra_model(
     ]
     assert "my-model" not in models
     assert set(models) == {"gpt-4o", "gpt-4.1"}
+
+
+@pytest.mark.parametrize("keep_user_entries", [False, True])
+def test_reinject_prunes_a_dropped_override_of_a_builtin_id(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, keep_user_entries: bool
+) -> None:
+    """A dropped --extra-model override of a built-in restores the defaults."""
+    _set_test_home(monkeypatch, tmp_path)
+    config_file = tmp_path / ".config" / "opencode" / "opencode.json"
+    override = {"name": "Override", "limit": {"context": 8000, "output": 4000}}
+
+    inject_opencode_provider_config(
+        port=8787, extra_models={"gpt-4o": override}, keep_user_entries=keep_user_entries
+    )
+    inject_opencode_provider_config(port=8787, keep_user_entries=keep_user_entries)
+
+    models = _parse_json_loose(config_file.read_text(encoding="utf-8"))["provider"]["headroom"][
+        "models"
+    ]
+    assert models["gpt-4o"] == HEADROOM_OPENCODE_MODELS["gpt-4o"]
 
 
 def test_reinject_keeps_a_user_model_and_a_edited_extra(
