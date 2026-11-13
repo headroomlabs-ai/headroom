@@ -387,6 +387,20 @@ def _sanitize_tenant_key(raw: str) -> str:
     return f"{_TENANT_KEY_MARKER}{prefix or _OPAQUE_TENANT_KEY_PREFIX}-{digest}"
 
 
+def _in_digested_subspace(value: str) -> bool:
+    """True when ``value`` has the shape of a key :func:`_sanitize_tenant_key` derived.
+
+    Nothing else can produce this shape, so it is the test an upgrade uses to
+    find pools that an older release stored verbatim under a legal id which
+    now collides with another tenant's digest. ``global`` is deliberately NOT
+    included: it is a pre-existing shared namespace, not a derived key.
+    """
+    if not value.startswith(_TENANT_KEY_MARKER):
+        return False
+    _, sep, tail = value.rpartition("-")
+    return bool(sep) and len(tail) == _TENANT_KEY_DIGEST_LEN and all(c in _HEX_DIGITS for c in tail)
+
+
 def _looks_digested(value: str) -> bool:
     """True when ``value`` occupies the digested key sub-space.
 
@@ -403,12 +417,7 @@ def _looks_digested(value: str) -> bool:
     including ids that merely start with the marker but carry no digest,
     stays verbatim so ordinary ids are not rekeyed.
     """
-    if value == GLOBAL_TENANT_KEY:
-        return True
-    if not value.startswith(_TENANT_KEY_MARKER):
-        return False
-    _, sep, tail = value.rpartition("-")
-    return bool(sep) and len(tail) == _TENANT_KEY_DIGEST_LEN and all(c in _HEX_DIGITS for c in tail)
+    return value == GLOBAL_TENANT_KEY or _in_digested_subspace(value)
 
 
 def _emit_resolution_log(
@@ -448,6 +457,8 @@ __all__ = [
     "SOURCE_GLOBAL",
     "SOURCE_HEADER",
     "TENANT_KEY_HEADER_ENV_VAR",
+    "_in_digested_subspace",
+    "_looks_digested",
     "get_current_tenant_key",
     "resolve_tenant_key",
     "set_request_tenant_key",

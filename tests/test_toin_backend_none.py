@@ -84,7 +84,7 @@ def test_unset_backend_still_persists(tmp_path, monkeypatch):
     assert toin._backend is not None
     toin.save()
     assert path.exists()
-    assert json.loads(path.read_text())["version"] == "2.0"
+    assert json.loads(path.read_text())["version"] == "3.0"
 
 
 def test_filesystem_backend_still_persists(tmp_path, monkeypatch):
