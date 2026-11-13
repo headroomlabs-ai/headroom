@@ -80,7 +80,9 @@ jobs:
       # tree-sitter, html via trafilatura, kompress via its ONNX model) are
       # measured for real instead of skipping.
       - name: Compression ratio drift gate (all compressors, [all] extras)
-        run: pytest tests/test_compression_ratio_gate.py -v
+        run: |
+          pip install "pytest>=7.0.0"
+          pytest tests/test_compression_ratio_gate.py -v
 
       # OPENAI_API_KEY is intentionally not set in the public OSS repo
       # (the secret list is empty). The CCR round-trip step above is the
