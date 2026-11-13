@@ -551,39 +551,45 @@ def _in_registry(tool: str) -> bool:
 _WARNED_CWD_HITS: set[str] = set()
 
 
+def _in_cwd(found: str) -> bool:
+    """True if a ``shutil.which`` hit came from a relative PATH entry or the cwd."""
+    if not os.path.isabs(found):
+        return True
+    try:
+        return os.path.samefile(os.path.dirname(found), os.getcwd())
+    except OSError:
+        return False
+
+
 def _which_outside_cwd(name: str) -> Path | None:
-    """``shutil.which(name)``, ignoring a hit in the current directory.
+    """``shutil.which(name)``, skipping any hit in the current directory.
 
     On Windows ``shutil.which`` looks in the current directory before PATH
     unless ``NoDefaultCurrentDirectoryInExePath`` is set, and on any OS a
     relative PATH entry (``.``, empty, ``bin``) resolves against the cwd. The
     cwd is usually the project being worked on, so a same-named file there
-    would run instead of the real tool. Such hits are ignored; the caller then
+    would run instead of the real tool. Such a hit is skipped and the search
+    continues through the absolute PATH entries; with no other hit the caller
     falls back to the interpreter's Scripts dir or the verified cache. This also
     applies when the cwd is itself an absolute PATH entry (e.g. ``~/.local/bin``).
     """
     found = shutil.which(name)
     if not found:
         return None
-    in_cwd = not os.path.isabs(found)
-    if not in_cwd:
-        try:
-            in_cwd = os.path.samefile(os.path.dirname(found), os.getcwd())
-        except OSError:
-            in_cwd = False
-    if in_cwd:
-        ignored = os.path.abspath(found)
-        # resolve() runs per tool result in the proxy; say it once per file.
-        if ignored not in _WARNED_CWD_HITS:
-            _WARNED_CWD_HITS.add(ignored)
-            logger.warning(
-                "Ignoring %s found via the current directory (%s); using the "
-                "interpreter's Scripts dir or the Headroom cache instead",
-                name,
-                ignored,
-            )
-        return None
-    return Path(found)
+    if not _in_cwd(found):
+        return Path(found)
+    ignored = os.path.abspath(found)
+    # resolve() runs per tool result in the proxy; say it once per file.
+    if ignored not in _WARNED_CWD_HITS:
+        _WARNED_CWD_HITS.add(ignored)
+        logger.warning("Ignoring %s in the current directory (%s)", name, ignored)
+    for entry in os.environ.get("PATH", "").split(os.pathsep):
+        if not entry or not os.path.isabs(entry):
+            continue
+        hit = shutil.which(name, path=entry)
+        if hit and not _in_cwd(hit):
+            return Path(hit)
+    return None
 
 
 def _path_lookup(tool: str) -> Path | None:
@@ -741,10 +747,9 @@ def status() -> list[dict[str, Any]]:
             "path": None,
             "state": "missing",
         }
-        # Honor PATH, but never the current directory (see _which_outside_cwd).
-        on_path = _which_outside_cwd(name) or (
-            _which_outside_cwd(entry["binary"]) if entry.get("binary") else None
-        )
+        # Same lookup as which()/resolve(): PATH outside the cwd, then the
+        # interpreter's Scripts dir.
+        on_path = _path_lookup(name)
         if on_path:
             row["path"] = str(on_path)
             row["state"] = "on-path"

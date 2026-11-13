@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import hashlib
 import io
+import os
 import ssl
 import sys
 import tarfile
@@ -227,6 +228,30 @@ def test_status_does_not_report_a_cwd_tool_as_on_path(monkeypatch, tmp_path):
     row = next(r for r in binaries.status() if r["tool"] == "difft")
     assert row["state"] == "missing"
     assert row["path"] is None
+
+
+def test_which_skips_a_cwd_hit_and_finds_the_next_path_entry(monkeypatch, tmp_path):
+    _plant_in_cwd(monkeypatch, tmp_path, "difft")
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    tool = bin_dir / "difft"
+    tool.write_text("#!/bin/sh\n")
+    tool.chmod(0o755)
+    monkeypatch.setenv("PATH", os.pathsep.join([".", str(bin_dir)]))
+    assert binaries.which("difft") == tool
+    row = next(r for r in binaries.status() if r["tool"] == "difft")
+    assert (row["state"], row["path"]) == ("on-path", str(tool))
+
+
+def test_status_reports_a_tool_in_the_interpreter_scripts_dir(monkeypatch, tmp_path):
+    _set_platform(monkeypatch, sys_plat="darwin", machine="arm64")
+    monkeypatch.setenv("PATH", "/no-such-bin")
+    scripts = tmp_path / "venv" / "bin"
+    scripts.mkdir(parents=True)
+    (scripts / "difft").write_text("#!/bin/sh\n")
+    monkeypatch.setattr(binaries.sys, "prefix", str(tmp_path / "venv"))
+    row = next(r for r in binaries.status() if r["tool"] == "difft")
+    assert (row["state"], row["path"]) == ("on-path", str(scripts / "difft"))
 
 
 def test_which_keeps_a_tool_on_path_outside_the_current_directory(monkeypatch, tmp_path):
