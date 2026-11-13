@@ -51,11 +51,24 @@ def _canonicalize_url(raw: str) -> str:
     parts = urlsplit(raw)
     scheme = parts.scheme.lower()
     default_port = {"http": 80, "https": 443}.get(scheme)
-    hostname = (parts.hostname or "").lower()
-    port = parts.port
-    netloc = hostname
-    if port is not None and port != default_port:
-        netloc = f"{hostname}:{port}"
+    hostname = parts.hostname
+    if hostname is None:
+        # Unparseable authority (e.g. an unbracketed IPv6 literal): keep it
+        # verbatim so it never collides with a well-formed destination.
+        netloc = (parts.netloc or "").lower()
+    else:
+        hostname = hostname.lower()
+        # urlsplit strips the brackets off an IPv6 literal; put them back or
+        # ``[::1]:8080`` and ``[::1:8080]`` collapse to the same authority.
+        if ":" in hostname:
+            hostname = f"[{hostname}]"
+        try:
+            port = parts.port
+        except ValueError:
+            port = None
+        netloc = hostname
+        if port is not None and port != default_port:
+            netloc = f"{hostname}:{port}"
     if parts.username is not None:
         userinfo = parts.username
         if parts.password is not None:

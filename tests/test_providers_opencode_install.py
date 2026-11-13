@@ -12,6 +12,8 @@ import pytest
 from headroom.install.models import ConfigScope, DeploymentManifest
 from headroom.providers.opencode.config import HEADROOM_OPENCODE_MODELS
 from headroom.providers.opencode.install import (
+    _binding_matches,
+    _canonicalize_url,
     apply_provider_scope,
     build_install_env,
     revert_provider_scope,
@@ -1439,6 +1441,120 @@ def test_install_apply_drops_stored_v1_credential_from_mixed_case_path(
 
     assert "opencode" not in new.provider_options
     assert "apiKey" not in _headroom_options(config_file)
+
+
+def test_canonicalize_url_preserves_ipv6_brackets() -> None:
+    """An IPv6 authority keeps its brackets, so host:port stays distinguishable."""
+    assert _canonicalize_url("http://[::1]:8080/v1") == "http://[::1]:8080/v1"
+    assert _canonicalize_url("http://[::1:8080]/v1") == "http://[::1:8080]/v1"
+    # Default port for the scheme is dropped, brackets stay.
+    assert _canonicalize_url("https://[2001:DB8::1]:443/v1") == "https://[2001:db8::1]/v1"
+    # Unparseable authorities are kept verbatim instead of collapsing.
+    assert _canonicalize_url("http://::1:8080/v1") == "http://::1:8080/v1"
+
+
+def test_binding_rejects_distinct_ipv6_destination() -> None:
+    """A v2 binding to ``[::1]:8080`` must not match the host ``[::1:8080]``."""
+    stored = {"_upstream": "http://[::1]:8080/v1", "_upstream_v": 2}
+    other_host = _canonicalize_url("http://[::1:8080]/v1")
+    other_port = _canonicalize_url("http://[::1]:9090/v1")
+
+    assert _binding_matches(stored, _canonicalize_url("http://[::1]:8080/v1"))
+    assert not _binding_matches(stored, other_host)
+    assert not _binding_matches(stored, other_port)
+
+
+def test_binding_rejects_pre_fix_ambiguous_ipv6_identity() -> None:
+    """A v2 identity stored before the fix cannot be trusted for either host."""
+    ambiguous = {"_upstream": "http://::1:8080/v1", "_upstream_v": 2}
+
+    for url in ("http://[::1]:8080/v1", "http://[::1:8080]/v1"):
+        assert not _binding_matches(ambiguous, _canonicalize_url(url)), url
+
+
+def test_install_apply_drops_stored_credential_for_distinct_ipv6_host(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``[::1]:8080`` -> ``[::1:8080]`` is a different destination: drop the credential."""
+    config_file = _opencode_config_file(tmp_path, monkeypatch)
+    new = _apply_stored_only(
+        monkeypatch,
+        "http://[::1]:8080/v1",
+        "http://[::1:8080]/v1",
+        {"apiKey": "{env:LOCAL_KEY}", "_upstream": "http://[::1]:8080/v1", "_upstream_v": 2},
+    )
+
+    assert "opencode" not in new.provider_options
+    assert "apiKey" not in _headroom_options(config_file)
+
+
+def test_install_apply_drops_stored_ambiguous_ipv6_credential(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An ambiguous pre-fix v2 identity is dropped rather than re-blessed."""
+    config_file = _opencode_config_file(tmp_path, monkeypatch)
+    new = _apply_stored_only(
+        monkeypatch,
+        "http://[::1]:8080/v1",
+        "http://[::1:8080]/v1",
+        {"apiKey": "{env:LOCAL_KEY}", "_upstream": "http://::1:8080/v1", "_upstream_v": 2},
+    )
+
+    assert "opencode" not in new.provider_options
+    assert "apiKey" not in _headroom_options(config_file)
+
+
+def test_install_apply_keeps_stored_credential_for_same_ipv6_upstream(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The same bracketed IPv6 upstream still carries its credential."""
+    config_file = _opencode_config_file(tmp_path, monkeypatch)
+    new = _apply_stored_only(
+        monkeypatch,
+        "http://[::1]:8080/v1",
+        "http://[::1]:8080/v1",
+        {"apiKey": "{env:LOCAL_KEY}", "_upstream": "http://[::1]:8080/v1", "_upstream_v": 2},
+    )
+
+    assert new.provider_options["opencode"]["apiKey"] == "{env:LOCAL_KEY}"
+    assert _headroom_options(config_file)["apiKey"] == "{env:LOCAL_KEY}"
+
+
+def test_apply_provider_scope_restart_drops_distinct_ipv6_host(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Restart with a different IPv6 host drops the stored credential."""
+    config_file = _opencode_config_file(tmp_path, monkeypatch)
+    _write_credential_config(config_file, "{env:LOCAL_KEY}")
+    manifest = _manifest()
+    manifest.base_env = {"OPENAI_TARGET_API_URL": "http://[::1]:8080/v1"}
+
+    mutation = apply_provider_scope(manifest)
+    assert mutation is not None
+    revert_provider_scope(mutation, manifest, restore_backup=False)
+    assert manifest.provider_options["opencode"]["_upstream"] == "http://[::1]:8080/v1"
+
+    manifest.base_env = {"OPENAI_TARGET_API_URL": "http://[::1:8080]/v1"}
+    apply_provider_scope(manifest)
+
+    assert "apiKey" not in _headroom_options(config_file)
+
+
+def test_apply_provider_scope_restart_keeps_same_ipv6_upstream(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Restart with the same IPv6 upstream keeps the stored credential."""
+    config_file = _opencode_config_file(tmp_path, monkeypatch)
+    _write_credential_config(config_file, "{env:LOCAL_KEY}")
+    manifest = _manifest()
+    manifest.base_env = {"OPENAI_TARGET_API_URL": "http://[::1]:8080/v1"}
+
+    mutation = apply_provider_scope(manifest)
+    assert mutation is not None
+    revert_provider_scope(mutation, manifest, restore_backup=False)
+    apply_provider_scope(manifest)
+
+    assert _headroom_options(config_file)["apiKey"] == "{env:LOCAL_KEY}"
 
 
 def test_install_apply_migrates_stored_v1_credential_for_same_upstream(
