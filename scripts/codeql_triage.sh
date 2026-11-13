@@ -1,13 +1,18 @@
 #!/usr/bin/env bash
 # Weekly CodeQL triage issue, run by .github/workflows/codeql-triage.yml.
 #
+# The issue is public, so it carries only counts of open critical/high alerts
+# and a link to the code scanning page (visible to authorized roles only):
+# never an alert's rule, file, line or number.
+#
 # Idempotent per ISO week. The week key is the ISO week of "today" (UTC), so a
 # re-run of Monday's job and a manual dispatch later the same week both find
 # the issue already opened for that week, including a closed one, and reuse it
 # instead of opening another. A reused issue is never edited, reopened or
-# retitled, so ticked checkboxes and its closure stand. Open critical/high
-# alerts it does not list unticked (new ones, or ones reopened after being
-# ticked) are added as a comment; otherwise the run does nothing.
+# retitled, so its closure stands. When the set of open critical/high alerts
+# differs from the one the issue or its last comment recorded (a new alert, or
+# one reopened or closed), a comment with the new counts is added; otherwise
+# the run does nothing. The set is recorded as a hash in a hidden marker.
 #
 # Env: REPO (owner/name), TRIAGE_ASSIGNEE (login). TRIAGE_TODAY (YYYY-MM-DD)
 # overrides the date for tests. Needs gh, jq and python3.
@@ -30,9 +35,9 @@ marker="<!-- codeql-triage:${week_key} -->"
 # jq programs live in quoted heredocs: they are literal jq, not shell, so
 # nothing in them is expanded and no single-quoted '$' or backtick is left for
 # ShellCheck (SC2016) to misread.
-alert_lines_jq=$(cat <<'JQ'
+alert_rows_jq=$(cat <<'JQ'
 .[] | select(.rule.security_severity_level == "critical" or .rule.security_severity_level == "high")
-    | "- [ ] [#\(.number)](\(.html_url)) **\(.rule.security_severity_level)** `\(.rule.id)` in `\(.most_recent_instance.location.path):\(.most_recent_instance.location.start_line)` (open since \(.created_at[:10]))"
+    | "\(.number) \(.rule.security_severity_level)"
 JQ
 )
 week_issue_jq=$(cat <<'JQ'
@@ -40,8 +45,16 @@ week_issue_jq=$(cat <<'JQ'
 JQ
 )
 
+# One "<number> <severity>" row per open critical/high alert. Kept local: only
+# the counts and a hash of the sorted rows are written to the issue.
 alerts="$(gh api --paginate -X GET "repos/$REPO/code-scanning/alerts" -f state=open -f per_page=100 \
-  | jq -r "$alert_lines_jq")"
+  | jq -r "$alert_rows_jq" | sort -n)"
+critical="$(printf '%s' "$alerts" | grep -c ' critical$' || true)"
+high="$(printf '%s' "$alerts" | grep -c ' high$' || true)"
+count=$((critical + high))
+digest="$(printf '%s' "$alerts" | python3 -c 'import hashlib, sys; print(hashlib.sha256(sys.stdin.buffer.read()).hexdigest()[:16])')"
+state_marker="<!-- codeql-triage-state:${digest} -->"
+link="https://github.com/$REPO/security/code-scanning?query=is%3Aopen+severity%3Acritical%2Chigh"
 
 # Listing, not search: the search index lags, so an issue created seconds ago
 # by the previous run could be missed. state=all so a closed issue counts.
@@ -49,43 +62,41 @@ existing="$(gh api --paginate "repos/$REPO/issues?state=all&labels=security&per_
   | jq -r --arg marker "$marker" "$week_issue_jq" | head -n 1)"
 
 if [ -n "$existing" ]; then
-  # Alerts already listed, unticked, in the issue or an earlier re-run
-  # comment. A ticked alert that is open again (dismissed, then reopened) is
-  # reported again rather than hidden behind its old tick.
-  known="$(gh api "repos/$REPO/issues/$existing" | jq -r '.body // ""')"
-  known="$known"$'\n'"$(gh api --paginate "repos/$REPO/issues/$existing/comments" | jq -r '.[].body // ""')"
-  new=""
-  while IFS= read -r line; do
-    [ -n "$line" ] || continue
-    ref="${line#*\[#}"             # after "- [ ] [#"
-    ref="- [ ] [#${ref%%\]*}]("    # "- [ ] [#123]("
-    case "$known" in *"$ref"*) ;; *) new="${new}${line}"$'\n' ;; esac
-  done <<< "$alerts"
-  if [ -z "$new" ]; then
-    echo "Week $week_key already has issue #$existing and no new critical/high alerts. Nothing to do."
+  # The most recent state marker, from the last comment that has one, else
+  # the issue body.
+  recorded="$( {
+    gh api "repos/$REPO/issues/$existing" | jq -r '.body // ""'
+    gh api --paginate "repos/$REPO/issues/$existing/comments" | jq -r '.[].body // ""'
+  } | grep -o '<!-- codeql-triage-state:[0-9a-f]* -->' | tail -n 1 || true)"
+  if [ "$recorded" = "$state_marker" ]; then
+    echo "Week $week_key already has issue #$existing and the open critical/high alerts are unchanged. Nothing to do."
     exit 0
   fi
   {
-    echo "Re-run on $today: critical/high alerts that are open and not yet listed here (new, or reopened after being ticked):"
-    echo
-    printf '%s' "$new"
+    echo "$state_marker"
+    echo "Re-run on $today: the open critical/high alerts changed since the last update."
+    echo "Now open: critical $critical, high $high. Review them in code scanning: $link"
   } > comment.md
   gh issue comment "$existing" --repo "$REPO" --body-file comment.md
-  echo "Week $week_key: added $(printf '%s' "$new" | grep -c '^- ') new alert(s) to #$existing."
+  echo "Week $week_key: posted updated counts to #$existing."
   exit 0
 fi
 
-count="$(printf '%s' "$alerts" | grep -c '^- ' || true)"
 {
   echo "$marker"
+  echo "$state_marker"
   echo "Weekly code scanning triage for the week of **$week_start** ($week_key). Owner: @$TRIAGE_ASSIGNEE (tejas@headroomlabs.ai)."
   echo
-  echo "For each alert: fix it (link the PR) or dismiss it in code scanning with a reason. Close this issue when every box is ticked."
+  echo "For each open alert: fix it (link the PR in the alert) or dismiss it in code scanning with a reason. Close this issue when none is left open."
   echo "Target: critical and high fixed or dismissed within the vulnerability management SLA."
   echo
   echo "### Open critical/high alerts: $count"
   echo
-  if [ "$count" -eq 0 ]; then echo "None. Close this issue to record the review."; else printf '%s\n' "$alerts"; fi
+  if [ "$count" -eq 0 ]; then
+    echo "None. Close this issue to record the review."
+  else
+    echo "Critical: $critical, high: $high. Details are in code scanning (authorized roles only): $link"
+  fi
   echo
   echo "All open alerts: https://github.com/$REPO/security/code-scanning"
 } > body.md

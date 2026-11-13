@@ -135,8 +135,26 @@ def test_first_run_opens_one_issue_keyed_to_the_iso_week(harness):
     (issue,) = state()["issues"]
     assert issue["title"] == "CodeQL triage: week of 2026-10-05 (2 critical/high open)"
     assert "<!-- codeql-triage:2026-W41 -->" in issue["body"]
-    assert "[#1]" in issue["body"] and "[#2]" in issue["body"]
-    assert "[#3]" not in issue["body"]  # medium is out of scope
+    assert "Critical: 1, high: 1." in issue["body"]  # medium is out of scope
+    assert "https://github.com/o/r/security/code-scanning" in issue["body"]
+
+
+def test_public_issue_and_comments_carry_only_counts(harness):
+    set_alerts, state, _, run = harness
+    set_alerts(_alert(11, "critical"), _alert(12))
+    run("2026-10-05")
+    set_alerts(_alert(11, "critical"), _alert(12), _alert(13))
+    run("2026-10-06")  # a new alert midweek goes in a comment
+
+    (issue,) = state()["issues"]
+    (comment,) = issue["comments"]
+    public_text = issue["title"] + issue["body"] + comment
+    assert "py/rule-" not in public_text
+    assert "headroom/x.py" not in public_text
+    for number in (11, 12, 13):
+        assert f"#{number}" not in public_text
+        assert f"code-scanning/{number}" not in public_text
+    assert "critical 1, high 2" in comment
 
 
 def test_rerun_same_day_creates_nothing(harness):
@@ -150,26 +168,26 @@ def test_rerun_same_day_creates_nothing(harness):
     assert "Nothing to do" in result.stdout
 
 
-def test_later_dispatch_reuses_a_closed_issue_and_keeps_its_ticks(harness):
+def test_later_dispatch_reuses_a_closed_issue(harness):
     set_alerts, state, edit_issue, run = harness
     set_alerts(_alert(1))
     run("2026-10-05")  # Monday's scheduled run
 
-    ticked = state()["issues"][0]["body"].replace("- [ ]", "- [x]")
-    edit_issue(1, body=ticked, state="closed")  # #1 fixed, box ticked
+    body = state()["issues"][0]["body"]
+    edit_issue(1, state="closed")  # #1 fixed, issue closed
     set_alerts(_alert(7))  # a new high alert midweek
 
     run("2026-10-09")  # Friday's manual dispatch
 
     (issue,) = state()["issues"]
     assert issue["state"] == "closed"
-    assert issue["body"] == ticked
+    assert issue["body"] == body
     (comment,) = issue["comments"]
-    assert "[#7]" in comment and "[#1]" not in comment
+    assert "critical 0, high 1" in comment
 
     run("2026-10-11")  # Sunday: same ISO week, nothing new since the comment
     (issue,) = state()["issues"]
-    assert len(issue["comments"]) == 1  # #7 is not reported twice
+    assert len(issue["comments"]) == 1  # not reported twice
 
 
 def test_next_week_opens_a_new_issue(harness):
@@ -204,19 +222,20 @@ def test_no_alerts_still_records_the_review(harness):
     assert "None. Close this issue to record the review." in issue["body"]
 
 
-def test_an_alert_reopened_after_its_box_was_ticked_is_reported_again(harness):
+def test_an_alert_reopened_after_it_was_closed_is_reported_again(harness):
     set_alerts, state, edit_issue, run = harness
     set_alerts(_alert(1))
     run("2026-10-05")
-    ticked = state()["issues"][0]["body"].replace("- [ ]", "- [x]")
-    edit_issue(1, body=ticked, state="closed")  # dismissed and ticked
+    set_alerts()  # dismissed
+    run("2026-10-06")
+    edit_issue(1, state="closed")
 
-    # Reopened later the same week: open again, and its only mention is ticked.
+    set_alerts(_alert(1))  # reopened later the same week
     run("2026-10-08")
     (issue,) = state()["issues"]
-    (comment,) = issue["comments"]
-    assert "[#1]" in comment
-    assert issue["body"] == ticked and issue["state"] == "closed"
+    assert len(issue["comments"]) == 2
+    assert "critical 0, high 1" in issue["comments"][-1]
+    assert issue["state"] == "closed"
 
-    run("2026-10-09")  # listed unticked in that comment now: not repeated
-    assert len(state()["issues"][0]["comments"]) == 1
+    run("2026-10-09")  # unchanged since that comment: not repeated
+    assert len(state()["issues"][0]["comments"]) == 2
