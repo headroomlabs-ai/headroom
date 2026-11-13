@@ -65,13 +65,16 @@ ALTER TABLE proxy_telemetry_v2 ENABLE ROW LEVEL SECURITY;
 -- RLS policy: anon can INSERT only (the beacon of older releases). anon has no
 -- SELECT: read raw rows with the service role. The public dashboard reads the
 -- aggregated dashboard_summary table (create_dashboard_summary.sql).
+--
+-- Safe to re-run on an existing project, and re-running is how a project set
+-- up with an earlier version of this script (which also let anon read every
+-- row) is fixed: the old read policy and grant are removed here.
+DROP POLICY IF EXISTS "anon_select" ON proxy_telemetry_v2;
+REVOKE SELECT ON proxy_telemetry_v2 FROM anon;
+
+DROP POLICY IF EXISTS "anon_insert" ON proxy_telemetry_v2;
 CREATE POLICY "anon_insert" ON proxy_telemetry_v2
     FOR INSERT TO anon
     WITH CHECK (true);
 
 GRANT INSERT ON proxy_telemetry_v2 TO anon;
-
--- A project set up with an earlier version of this script also let anon read
--- every row. Remove that once in the SQL Editor:
---   DROP POLICY IF EXISTS "anon_select" ON proxy_telemetry_v2;
---   REVOKE SELECT ON proxy_telemetry_v2 FROM anon;

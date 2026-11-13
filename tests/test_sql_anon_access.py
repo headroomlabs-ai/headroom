@@ -24,6 +24,10 @@ def test_raw_telemetry_table_is_not_readable_by_anon() -> None:
         grant = re.match(r"GRANT (.*?) ON .* TO .*\banon\b", stmt, re.I)
         assert not (grant and re.search(r"\b(SELECT|ALL)\b", grant.group(1), re.I)), stmt
     assert any(re.match(r"GRANT INSERT ON proxy_telemetry_v2 TO anon", s) for s in statements)
+    # Re-running the script is how an existing project drops the old read access,
+    # so the cleanup must be live statements, not comments.
+    assert 'DROP POLICY IF EXISTS "anon_select" ON proxy_telemetry_v2' in statements
+    assert "REVOKE SELECT ON proxy_telemetry_v2 FROM anon" in statements
 
 
 def test_all_plugins_script_does_not_turn_off_licence_checks() -> None:
