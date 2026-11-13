@@ -519,3 +519,21 @@ def test_x_forwarded_for_all_trusted_falls_back_to_leftmost(
     monkeypatch.setenv(TRUSTED_GATEWAY_CIDRS_ENV, "10.0.0.0/8")
     req = _fake_request(peer_host="10.0.0.5", forwarded_for="10.1.1.1, 10.0.0.99")
     assert resolve_client_ip(req) == "10.1.1.1"
+
+
+@pytest.mark.parametrize(
+    ("forwarded_for", "expected"),
+    [
+        ("198.51.100.7, 10.0.0.99:50123", "198.51.100.7"),
+        ("198.51.100.7:4711, 10.0.0.99", "198.51.100.7"),
+        ("[2001:db8::7]:4711, 10.0.0.99:50123", "2001:db8::7"),
+        ("2001:db8::7, 10.0.0.99", "2001:db8::7"),
+    ],
+)
+def test_x_forwarded_for_hops_with_ports(
+    monkeypatch: pytest.MonkeyPatch, forwarded_for: str, expected: str
+) -> None:
+    """Gateways that append ``IP:port`` are still recognised and skipped."""
+    monkeypatch.setenv(TRUSTED_GATEWAY_CIDRS_ENV, "10.0.0.0/8")
+    req = _fake_request(peer_host="10.0.0.5", forwarded_for=forwarded_for)
+    assert resolve_client_ip(req) == expected

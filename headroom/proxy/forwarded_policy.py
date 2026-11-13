@@ -85,15 +85,27 @@ def header_first(value: str) -> str:
     return head.strip()
 
 
+def _hop_address(hop: str) -> str:
+    """Drop a port some gateways append to a hop (``1.2.3.4:5678``, ``[::1]:5678``)."""
+    if hop.startswith("["):
+        host, sep, _ = hop[1:].partition("]")
+        return host if sep else hop
+    host, sep, port = hop.partition(":")
+    if sep and ":" not in port and port.isdigit():
+        return host
+    return hop
+
+
 def header_client(value: str, cidrs: tuple[Network, ...]) -> str:
     """Return the client element of ``X-Forwarded-For``, resolved from the right.
 
     A gateway that appends to the header leaves whatever the client wrote on
     the left, so walk from the rightmost element and skip trusted gateways;
     the first untrusted address is the one a trusted gateway actually saw.
-    If every element is a trusted gateway, fall back to the leftmost.
+    If every element is a trusted gateway, fall back to the leftmost. A port
+    on a hop is dropped, so the result is an address.
     """
-    parts = [p.strip() for p in value.split(",")] if value else []
+    parts = [_hop_address(p.strip()) for p in value.split(",")] if value else []
     parts = [p for p in parts if p]
     for part in reversed(parts):
         if not peer_is_trusted_gateway(part, cidrs):
