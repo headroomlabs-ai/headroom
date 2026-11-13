@@ -151,15 +151,40 @@ def test_store_kompress_does_not_report_word_counts_as_item_counts() -> None:
     from headroom.transforms.kompress_compressor import store_kompress_in_ccr
 
     original = "unique kompress store fixture → " + "word " * 40
-    cache_key = store_kompress_in_ccr(original, "unique compressed → fixture", 44)
+    cache_key = store_kompress_in_ccr(original, "unique compressed → fixture")
     assert cache_key is not None
     entry = get_compression_store().retrieve(cache_key)
     assert entry is not None
     # Token counts carry the size story; the item-count fields no longer
     # masquerade word counts as structural item counts.
-    assert entry.original_tokens == 44
     assert entry.original_item_count == 0
     assert entry.compressed_item_count == 0
+
+
+@pytest.mark.parametrize(
+    ("original", "compressed"),
+    [
+        ("authentication_middleware_handler_" * 40, "authentication_middleware_handler"),
+        ("你好世界→✓ " * 40, "你好→✓"),
+    ],
+)
+def test_kompress_retrieval_reports_token_counts(original: str, compressed: str) -> None:
+    import tiktoken
+
+    from headroom.cache.compression_store import get_compression_store
+    from headroom.transforms.kompress_compressor import store_kompress_in_ccr
+
+    key = store_kompress_in_ccr(original, compressed)
+    assert key is not None
+    recovered = get_compression_store().retrieve(key)
+    assert recovered is not None
+    encoding = tiktoken.get_encoding("cl100k_base")
+
+    assert recovered.original_tokens == len(encoding.encode(original, disallowed_special=()))
+    assert recovered.compressed_tokens == len(encoding.encode(compressed, disallowed_special=()))
+    assert recovered.original_content == original
+    assert recovered.original_item_count == 0
+    assert recovered.compressed_item_count == 0
 
 
 # --------------------------------------------------------------------------- #
