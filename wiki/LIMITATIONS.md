@@ -20,7 +20,7 @@ See [LATENCY_BENCHMARKS.md](LATENCY_BENCHMARKS.md) for full data with per-scenar
 
 ## Code Compression
 
-Headroom includes an AST-aware CodeCompressor (tree-sitter, 8 languages) but it's gated behind safety protections that prevent it from firing in most real-world scenarios. This is intentional.
+Headroom includes an AST-aware CodeCompressor (tree-sitter, 11 languages) but it's gated behind safety protections that prevent it from firing in most real-world scenarios. This is intentional.
 
 **Why code mostly passes through:**
 
