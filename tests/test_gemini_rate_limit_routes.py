@@ -2,22 +2,37 @@
 
 from __future__ import annotations
 
+import json
 from types import SimpleNamespace
 
 import pytest
+from starlette.requests import Request
 
 from headroom.proxy.handlers.gemini import GeminiHandlerMixin
 from headroom.proxy.rate_limiter import TokenBucketRateLimiter
 
 
-class _FakeRequest:
-    def __init__(self, path: str) -> None:
-        self.headers: dict[str, str] = {}
-        self.query_params: dict[str, str] = {}
-        self.client = SimpleNamespace(host="127.0.0.1")
-        self.state = SimpleNamespace()
-        self.url = SimpleNamespace(path=path, query="")
-        self.scope: dict = {"type": "http", "method": "POST"}
+def _request(path: str, payload: dict) -> Request:
+    """Real Starlette Request whose JSON body arrives in two ASGI chunks."""
+    body = json.dumps(payload).encode()
+    chunks = [body[: len(body) // 2], body[len(body) // 2 :]]
+    scope = {
+        "type": "http",
+        "method": "POST",
+        "path": path,
+        "raw_path": path.encode(),
+        "query_string": b"",
+        "headers": [(b"content-type", b"application/json")],
+        "client": ("127.0.0.1", 50000),
+    }
+
+    async def receive() -> dict:
+        if chunks:
+            chunk = chunks.pop(0)
+            return {"type": "http.request", "body": chunk, "more_body": bool(chunks)}
+        return {"type": "http.disconnect"}
+
+    return Request(scope, receive)
 
 
 class _Response:
@@ -67,13 +82,6 @@ class _Handler(GeminiHandlerMixin):
         return SimpleNamespace(status_code=200)
 
 
-def _body(monkeypatch: pytest.MonkeyPatch, payload: dict) -> None:
-    async def read(request):  # noqa: ANN001, ANN201
-        return payload
-
-    monkeypatch.setattr("headroom.proxy.helpers._read_request_json", read)
-
-
 async def _statuses(call, n: int) -> list[int]:  # noqa: ANN001
     from fastapi import HTTPException
 
@@ -87,13 +95,17 @@ async def _statuses(call, n: int) -> list[int]:  # noqa: ANN001
 
 
 @pytest.mark.asyncio
-async def test_count_tokens_is_rate_limited(monkeypatch: pytest.MonkeyPatch) -> None:
+async def test_count_tokens_is_rate_limited() -> None:
     # inlineData-only body takes the early forward path (no tokenizer needed).
-    _body(monkeypatch, {"contents": [{"role": "user", "parts": [{"inlineData": {"data": "x"}}]}]})
+    payload = {"contents": [{"role": "user", "parts": [{"inlineData": {"data": "x"}}]}]}
     handler = _Handler()
-    request = _FakeRequest("/v1beta/models/gemini-pro:countTokens")
 
-    statuses = await _statuses(lambda: handler.handle_gemini_count_tokens(request, "gemini-pro"), 4)
+    statuses = await _statuses(
+        lambda: handler.handle_gemini_count_tokens(
+            _request("/v1beta/models/gemini-pro:countTokens", payload), "gemini-pro"
+        ),
+        4,
+    )
 
     assert statuses == [200, 429, 429, 429]
     assert handler.upstream_calls == 1
@@ -101,18 +113,19 @@ async def test_count_tokens_is_rate_limited(monkeypatch: pytest.MonkeyPatch) -> 
 
 
 @pytest.mark.asyncio
-async def test_cloudcode_stream_is_rate_limited(monkeypatch: pytest.MonkeyPatch) -> None:
-    _body(
-        monkeypatch,
-        {
-            "model": "gemini-pro",
-            "request": {"contents": [{"role": "user", "parts": [{"text": "hi"}]}]},
-        },
-    )
+async def test_cloudcode_stream_is_rate_limited() -> None:
+    payload = {
+        "model": "gemini-pro",
+        "request": {"contents": [{"role": "user", "parts": [{"text": "hi"}]}]},
+    }
     handler = _Handler()
-    request = _FakeRequest("/v1internal:streamGenerateContent")
 
-    statuses = await _statuses(lambda: handler.handle_google_cloudcode_stream(request), 4)
+    statuses = await _statuses(
+        lambda: handler.handle_google_cloudcode_stream(
+            _request("/v1internal:streamGenerateContent", payload)
+        ),
+        4,
+    )
 
     assert statuses == [200, 429, 429, 429]
     assert handler.streamed == 1
