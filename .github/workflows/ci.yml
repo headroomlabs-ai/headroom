@@ -34,6 +34,8 @@ concurrency:
 
 env:
   PY_VERSION: "3.12"
+  # Keep CI pricing tied to the installed LiteLLM wheel, not upstream main.
+  LITELLM_LOCAL_MODEL_COST_MAP: "true"
   # CPU-only torch — runners have no GPU; the default CUDA wheels pull ~2.5 GB.
   PIP_EXTRA_INDEX_URL: https://download.pytorch.org/whl/cpu
 
