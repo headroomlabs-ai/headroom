@@ -438,15 +438,6 @@ pub fn build_app(state: AppState) -> Router {
     router.with_state(state)
 }
 
-fn is_loopback_upstream(upstream: &url::Url) -> bool {
-    match upstream.host() {
-        Some(url::Host::Domain(d)) => d.eq_ignore_ascii_case("localhost"),
-        Some(url::Host::Ipv4(ip)) => ip.is_loopback(),
-        Some(url::Host::Ipv6(ip)) => ip.to_canonical().is_loopback(),
-        None => false,
-    }
-}
-
 /// Catch-all handler. If the request is a WebSocket upgrade, hand off to the
 /// ws module; otherwise forward as plain HTTP.
 async fn catch_all(
@@ -666,19 +657,21 @@ pub(crate) async fn forward_http(
             outgoing_headers.insert(http::header::HOST, h.clone());
         }
     }
-    // A loopback upstream (the Python proxy) sees this process as a local
-    // caller; a non-loopback Host keeps its local-only routes closed to a
-    // caller that is not local here.
+    // The upstream (the Python proxy) sees this process as a loopback
+    // peer; never also hand it a loopback Host for a caller that is not
+    // local here, or its local-only routes would treat that caller as local.
     if req
         .extensions()
         .get::<crate::inbound_auth::NonLocalCaller>()
         .is_some()
-        && is_loopback_upstream(&state.config.upstream)
     {
-        outgoing_headers.insert(
-            http::header::HOST,
-            crate::inbound_auth::non_local_upstream_host(req.headers()),
-        );
+        if let Some(host) = crate::inbound_auth::host_override_for_non_local(
+            outgoing_headers.get(http::header::HOST),
+            &state.config.upstream,
+            req.headers(),
+        ) {
+            outgoing_headers.insert(http::header::HOST, host);
+        }
     }
 
     // ─── COMPRESSION GATE ──────────────────────────────────────────────

@@ -142,19 +142,42 @@ fn is_hello_probe(method: &Method, path: &str) -> bool {
 }
 
 /// Request extension: the caller is not local (not a loopback peer with a
-/// loopback `Host`). `forward_http` then gives a loopback upstream a
-/// non-loopback `Host`, so the upstream's local-only routes (`/admin`,
+/// loopback `Host`). `forward_http` then never sends it upstream with a
+/// loopback `Host`, so the upstream's local-only routes (`/admin`,
 /// `/debug`, `/settings`, ...) do not treat a relayed caller as local.
 /// Without it this process's own loopback connection and rewritten `Host`
 /// would pass both checks those routes make.
 #[derive(Clone, Copy, Debug)]
 pub struct NonLocalCaller;
 
-/// `Host` sent to a loopback upstream for a [`NonLocalCaller`]: the
-/// caller's own `Host` when it is not a loopback name, else a reserved
-/// non-loopback name.
-pub(crate) fn non_local_upstream_host(headers: &HeaderMap) -> HeaderValue {
-    match headers.get(header::HOST) {
+/// For a [`NonLocalCaller`]: the `Host` to send upstream instead, when the
+/// one that would be sent names loopback. That is the explicit outgoing
+/// `Host` (`--no-rewrite-host`), else the upstream URL's authority. The
+/// replacement is the caller's own `Host` when it is not a loopback name,
+/// else a reserved non-loopback name. Judged on the `Host` value rather
+/// than on whether the upstream address is loopback, so an upstream name
+/// that resolves to loopback cannot be paired with a loopback `Host`.
+pub(crate) fn host_override_for_non_local(
+    outgoing: Option<&HeaderValue>,
+    upstream: &url::Url,
+    client: &HeaderMap,
+) -> Option<HeaderValue> {
+    let effective = match outgoing {
+        Some(h) => h.to_str().ok().map(str::to_owned),
+        None => upstream.host_str().map(|h| match upstream.port() {
+            Some(port) => format!("{h}:{port}"),
+            None => h.to_owned(),
+        }),
+    };
+    // An unreadable outgoing Host is not provably non-loopback: replace it.
+    if outgoing.is_some() && effective.is_none() {
+        return Some(non_local_host(client));
+    }
+    is_loopback_host_header(effective.as_deref()).then(|| non_local_host(client))
+}
+
+fn non_local_host(client: &HeaderMap) -> HeaderValue {
+    match client.get(header::HOST) {
         Some(h) if !is_loopback_host_header(h.to_str().ok()) => h.clone(),
         _ => HeaderValue::from_static("headroom-remote.invalid"),
     }
@@ -314,6 +337,51 @@ mod tests {
             assert!(!is_loopback_host_header(Some(bad)), "{bad}");
         }
         assert!(!is_loopback_host_header(None));
+    }
+
+    #[test]
+    fn non_local_caller_never_gets_a_loopback_host_upstream() {
+        let up = |u: &str| url::Url::parse(u).unwrap();
+        let client = |h: &str| {
+            let mut m = HeaderMap::new();
+            m.insert(header::HOST, h.parse().unwrap());
+            m
+        };
+        let local: HeaderValue = "localhost".parse().unwrap();
+        // --no-rewrite-host with an upstream name that resolves to loopback.
+        assert_eq!(
+            host_override_for_non_local(
+                Some(&local),
+                &up("http://headroom-upstream.internal:8788"),
+                &client("localhost")
+            )
+            .unwrap(),
+            "headroom-remote.invalid"
+        );
+        // Rewritten Host on a loopback upstream: the caller's own Host.
+        assert_eq!(
+            host_override_for_non_local(
+                None,
+                &up("http://127.0.0.1:8788"),
+                &client("proxy.example:8787")
+            )
+            .unwrap(),
+            "proxy.example:8787"
+        );
+        // Already non-loopback: left alone.
+        assert!(host_override_for_non_local(
+            None,
+            &up("http://headroom-upstream.internal:8788"),
+            &client("localhost")
+        )
+        .is_none());
+        let foreign: HeaderValue = "proxy.example".parse().unwrap();
+        assert!(host_override_for_non_local(
+            Some(&foreign),
+            &up("http://127.0.0.1:8788"),
+            &client("proxy.example")
+        )
+        .is_none());
     }
 
     #[test]

@@ -111,8 +111,9 @@ Python proxy trusts loopback callers (no token needed, and access to
   in the Python proxy. The token is removed from the request before it
   is forwarded (`Authorization` only when it carries the token).
 - A caller that is not local here (a non-loopback peer, or a loopback
-  peer whose `Host` is not a loopback name) is forwarded to a loopback
-  upstream with a non-loopback `Host` (its own, or
+  peer whose `Host` is not a loopback name) is never forwarded with a
+  loopback `Host`, whatever `--rewrite-host` is and whatever the upstream
+  name resolves to (its own `Host` is used, or
   `headroom-remote.invalid`), so the Python proxy's local-only routes
   (`/admin`, `/debug`, `/settings`, ...) stay closed to it, with or
   without a token.
