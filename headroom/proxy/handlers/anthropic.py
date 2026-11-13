@@ -721,25 +721,6 @@ class AnthropicHandlerMixin:
             canonical = str(tool)
         return (name, canonical)
 
-    @staticmethod
-    def _server_memory_tool_names(tools: Any, client_tools: Any) -> frozenset[str]:
-        """Memory tools in ``tools`` that the proxy injected and must run itself.
-
-        A memory tool the client declared stays the client's: its calls are
-        forwarded, not withheld.
-        """
-        from headroom.proxy.memory_handler import MEMORY_TOOL_NAMES, NATIVE_MEMORY_TOOL_NAME
-
-        client_tool_names = {t.get("name") for t in client_tools or [] if isinstance(t, dict)}
-        return frozenset(
-            name
-            for t in tools or []
-            if isinstance(t, dict)
-            and isinstance(name := t.get("name"), str)
-            and (name in MEMORY_TOOL_NAMES or name == NATIVE_MEMORY_TOOL_NAME)
-            and name not in client_tool_names
-        )
-
     def _can_salvage_buffered_upstream(self, resp_json: Any) -> bool:
         """May this upstream response be relayed when post-processing failed?
 
@@ -3502,9 +3483,11 @@ class AnthropicHandlerMixin:
                 )
                 if mem_tools_injected:
                     memory_tools_injected = True
-                    server_memory_tool_names = self._server_memory_tool_names(
-                        tools, _original_tools
+                    from headroom.proxy.memory_handler import (
+                        server_memory_tool_names as _server_memory_tool_names,
                     )
+
+                    server_memory_tool_names = _server_memory_tool_names(tools, _original_tools)
                     tool_names = [
                         t.get("name") or t.get("type", "")
                         for t in tools
@@ -5347,6 +5330,7 @@ class AnthropicHandlerMixin:
                                     memory_user_id,
                                     "anthropic",
                                     request_context=memory_request_ctx,
+                                    tool_names=server_memory_tool_names,
                                 )
 
                                 turn_content = resp_json.get("content") or []

@@ -632,6 +632,7 @@ class StreamingMixin:
                     memory_user_id,
                     "anthropic",
                     request_context=memory_request_ctx,
+                    tool_names=server_memory_tool_names,
                 )
                 logger.info(
                     f"[{request_id}] Memory: Executed {len(tool_results)}/"
@@ -1431,11 +1432,12 @@ class StreamingMixin:
             ),
         }
 
-        # Track if we need to handle memory tools
+        # Track if we need to handle memory tools: only those the proxy injected.
         memory_enabled = (
             memory_user_id is not None
             and self.memory_handler is not None
             and provider == "anthropic"
+            and bool(server_memory_tool_names)
         )
         # Withholding headroom_retrieve needs the Anthropic SSE shape the
         # filter and the continuation round are written for.
@@ -1973,30 +1975,6 @@ class StreamingMixin:
                         parsed_response = (
                             stream_state.pop("memory_client_message", None) or parsed_response
                         )
-                    elif (
-                        memory_enabled
-                        and parsed_response
-                        and self.memory_handler.has_memory_tool_calls(parsed_response, provider)
-                    ):
-                        logger.info(
-                            f"[{request_id}] Memory: Detected tool calls in streaming response"
-                        )
-
-                        # The client declared these memory tools itself, so the
-                        # tool_use already reached it and the client continues
-                        # the turn; only the server-side save happens here.
-                        tool_results = await self.memory_handler.handle_memory_tool_calls(
-                            parsed_response,
-                            memory_user_id,
-                            provider,
-                            request_context=memory_request_ctx,
-                        )
-                        if tool_results:
-                            logger.info(
-                                f"[{request_id}] Memory: Tool calls executed "
-                                f"({len(tool_results)} results saved, SSE streaming — "
-                                "continuation handled by client)"
-                            )
 
                 if memory_filter is not None:
                     # Memory detection was skipped (empty stream or buffer cap):

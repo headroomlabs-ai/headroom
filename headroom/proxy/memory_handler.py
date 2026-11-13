@@ -17,9 +17,12 @@ Usage:
     # Search and inject context
     context = await handler.search_and_format_context(user_id, messages)
 
-    # Handle tool calls in response
+    # Handle tool calls in response, only for the tools the proxy injected
+    names = server_memory_tool_names(request_tools, client_tools)
     if handler.has_memory_tool_calls(response, "anthropic"):
-        results = await handler.handle_memory_tool_calls(response, user_id, "anthropic")
+        results = await handler.handle_memory_tool_calls(
+            response, user_id, "anthropic", tool_names=names
+        )
 """
 
 from __future__ import annotations
@@ -44,6 +47,7 @@ from headroom.memory.storage_router import (
     ResolvedScope,
 )
 from headroom.proxy.public_errors import tool_result_error
+from headroom.proxy.tool_name_policy import extract_tool_name
 
 if TYPE_CHECKING:
     from headroom.memory.backends.local import LocalBackend
@@ -88,6 +92,25 @@ NATIVE_MEMORY_BETA_HEADER = "context-management-2025-06-27"
 
 # Native memory tool type
 NATIVE_MEMORY_TOOL_TYPE = "memory_20250818"
+
+
+def server_memory_tool_names(tools: Any, client_tools: Any) -> frozenset[str]:
+    """Memory tools in ``tools`` that the proxy injected and must run itself.
+
+    ``tools`` is the tool list sent upstream, ``client_tools`` the list the
+    client sent. A memory-named tool the client declared stays the client's:
+    its calls are forwarded, never withheld or executed by the proxy.
+    """
+    client_tool_names = {extract_tool_name(t) for t in client_tools or [] if isinstance(t, dict)}
+    return frozenset(
+        name
+        for t in tools or []
+        if isinstance(t, dict)
+        and isinstance(name := extract_tool_name(t), str)
+        and (name in MEMORY_TOOL_NAMES or name == NATIVE_MEMORY_TOOL_NAME)
+        and name not in client_tool_names
+    )
+
 
 # Maximum time to wait for a single backend initialization (one-shot).
 # Applies to MemoryHandler._ensure_initialized. On timeout, _initialized
@@ -1125,6 +1148,8 @@ your responses, not to drive new actions."""
         user_id: str,
         provider: str = "anthropic",
         request_context: RequestContext | None = None,
+        *,
+        tool_names: frozenset[str],
     ) -> list[dict[str, Any]]:
         """Execute memory tool calls and return results.
 
@@ -1136,6 +1161,9 @@ your responses, not to drive new actions."""
                 save/search/update/delete operations route to the per-
                 workspace DB so projects cannot read or overwrite each
                 other's memories (GH #462).
+            tool_names: The memory tools the proxy injected on this request
+                (see ``server_memory_tool_names``). Calls to any other tool,
+                memory-named or not, are the client's and are skipped.
 
         Returns:
             List of tool results in provider format.
@@ -1151,6 +1179,8 @@ your responses, not to drive new actions."""
             # the following `.get` would raise AttributeError on a malformed /
             # partial upstream tool call. Coalesce to {}.
             tool_name = tc.get("name") or (tc.get("function") or {}).get("name")
+            if tool_name not in tool_names:
+                continue
             tool_id = tc.get("id") or tc.get("call_id", "")
 
             # Parse input data

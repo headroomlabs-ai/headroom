@@ -4642,6 +4642,9 @@ class OpenAIHandlerMixin:
         # invariant I2. See REALIGNMENT/03-phase-A-lockdown.md PR-A3.
         memory_context_injected = False
         memory_tools_injected = False
+        # Memory tools this proxy injected and runs itself; every other call,
+        # memory-named or not, goes back to the client.
+        server_memory_tool_names: frozenset[str] = frozenset()
         if memory_decision.inject:
             # Memory-handler is guaranteed present when inject=True.
             # Timeout-wrap (matches Anthropic /v1/messages and
@@ -4760,7 +4763,12 @@ class OpenAIHandlerMixin:
                         client_declared_tools=bool(_original_tools),
                     )
                     if mem_tools_injected:
+                        from headroom.proxy.memory_handler import (
+                            server_memory_tool_names as _server_memory_tool_names,
+                        )
+
                         memory_tools_injected = True
+                        server_memory_tool_names = _server_memory_tool_names(tools, _original_tools)
                         logger.info(f"[{request_id}] Memory: Injected memory tools (openai)")
             except Exception as e:
                 logger.warning(f"[{request_id}] Memory injection failed: {e!r}")
@@ -5983,6 +5991,7 @@ class OpenAIHandlerMixin:
                     and memory_user_id
                     and resp_json
                     and response.status_code == 200
+                    and server_memory_tool_names
                     and self.memory_handler.has_memory_tool_calls(resp_json, "openai")
                 ):
                     try:
@@ -5991,6 +6000,7 @@ class OpenAIHandlerMixin:
                             memory_user_id,
                             "openai",
                             request_context=memory_request_ctx,
+                            tool_names=server_memory_tool_names,
                         )
                         if tool_results:
                             # Build continuation: original messages + assistant tool_calls + tool results
@@ -6544,6 +6554,8 @@ class OpenAIHandlerMixin:
         responses_memory_tools_allowed = (
             _allow_responses_memory_tools(is_chatgpt_auth) and not stream
         )
+        # Memory tools this proxy injected and runs itself (see chat above).
+        responses_server_memory_tool_names: frozenset[str] = frozenset()
 
         # PR-A6 (P5-50, preps P0-6): session-sticky `OpenAI-Beta` merge
         # for /v1/responses. Compute a session_id off the same store the
@@ -6835,17 +6847,22 @@ class OpenAIHandlerMixin:
                         memory_tool_defs_responses.append(t)
 
                 if responses_memory_tools_allowed:
-                    resp_tools = body.get("tools") or []
+                    client_resp_tools = body.get("tools") or []
                     resp_tools, mem_tools_injected = _apply_sticky_mem_tools_resp(
                         provider="openai",
                         session_id=_responses_session_id,
                         request_id=request_id,
-                        existing_tools=resp_tools,
+                        existing_tools=client_resp_tools,
                         memory_tools_to_inject=memory_tool_defs_responses,
                         inject_this_turn=bool(self.memory_handler.config.inject_tools),
                         client_declared_tools=client_declared_response_tools,
                     )
                     if mem_tools_injected:
+                        from headroom.proxy.memory_handler import server_memory_tool_names
+
+                        responses_server_memory_tool_names = server_memory_tool_names(
+                            resp_tools, client_resp_tools
+                        )
                         body["tools"] = resp_tools
                         include = body.get("include")
                         if isinstance(include, list):
@@ -7497,22 +7514,20 @@ class OpenAIHandlerMixin:
                     if (
                         self.memory_handler
                         and memory_user_id
-                        and responses_memory_tools_allowed
+                        and responses_server_memory_tool_names
                         and resp_json
                         and response.status_code == 200
                         and self.memory_handler.has_memory_tool_calls(resp_json, "openai")
                     ):
                         try:
-                            # Extract function_call items from output
-                            from headroom.proxy.memory_handler import MEMORY_TOOL_NAMES
-
+                            # Only the calls to tools this proxy injected.
                             output_items = resp_json.get("output", [])
                             memory_fc_items = [
                                 item
                                 for item in output_items
                                 if isinstance(item, dict)
                                 and item.get("type") == "function_call"
-                                and item.get("name") in MEMORY_TOOL_NAMES
+                                and item.get("name") in responses_server_memory_tool_names
                             ]
 
                             # Execute memory tool calls
@@ -8586,6 +8601,8 @@ class OpenAIHandlerMixin:
 
             memory_user_id: str | None = None
             memory_request_ctx = None
+            # Memory tools this proxy injected on the current response.create.
+            memory_tool_names: frozenset[str] = frozenset()
             ws_project_resolver = CodexProjectContextResolver()
             ws_pinned_project_cwd = None
             ws_turn_project_key = classify_project(ws_headers)
@@ -8613,7 +8630,7 @@ class OpenAIHandlerMixin:
             from headroom.proxy.memory_query import MemoryQuery
 
             async def _prepare_memory_frame(frame_body: dict[str, Any], frame_raw: str) -> str:
-                nonlocal memory_user_id, memory_request_ctx
+                nonlocal memory_user_id, memory_request_ctx, memory_tool_names
                 nonlocal ws_pinned_project_cwd, ws_turn_project_key
                 nonlocal ws_turn_project_features_allowed
                 nonlocal ws_turn_learning_allowed, ws_first_project_resolution
@@ -8628,6 +8645,7 @@ class OpenAIHandlerMixin:
                 ws_memory_generation += 1
                 memory_user_id = None
                 memory_request_ctx = None
+                memory_tool_names = frozenset()
                 first_project_resolution = ws_first_project_resolution
                 ws_first_project_resolution = False
 
@@ -8885,12 +8903,12 @@ class OpenAIHandlerMixin:
                         else:
                             ws_mem_defs_responses.append(t)
 
-                    ws_tools = ws_response_body.get("tools") or []
+                    client_ws_tools = ws_response_body.get("tools") or []
                     ws_tools, mem_injected = _apply_sticky_mem_tools_ws(
                         provider="openai",
                         session_id=session_id if ws_memory_tools_allowed else None,
                         request_id=request_id,
-                        existing_tools=ws_tools,
+                        existing_tools=client_ws_tools,
                         memory_tools_to_inject=ws_mem_defs_responses,
                         inject_this_turn=bool(
                             self.memory_handler.config.inject_tools and ws_memory_tools_allowed
@@ -8898,6 +8916,9 @@ class OpenAIHandlerMixin:
                         client_declared_tools=client_declared_ws_tools,
                     )
                     if mem_injected:
+                        from headroom.proxy.memory_handler import server_memory_tool_names
+
+                        memory_tool_names = server_memory_tool_names(ws_tools, client_ws_tools)
                         ws_response_body["tools"] = ws_tools
                         include = ws_response_body.get("include")
                         if isinstance(include, list):
@@ -9820,8 +9841,6 @@ class OpenAIHandlerMixin:
 
                         This prevents orphaned response.created events from confusing Codex.
                         """
-                        from headroom.proxy.memory_handler import MEMORY_TOOL_NAMES
-
                         # Unit 3: surface response.completed observation
                         # to the outer scope so the termination-cause
                         # classifier can prefer ``response_completed``
@@ -9852,6 +9871,7 @@ class OpenAIHandlerMixin:
                         response_memory_generation = ws_memory_generation
                         response_memory_user_id = memory_user_id
                         response_memory_request_ctx = memory_request_ctx
+                        response_memory_tool_names = memory_tool_names
                         response_input = list(current_response_input)
                         response_template = dict(current_response_template)
 
@@ -10103,6 +10123,7 @@ class OpenAIHandlerMixin:
                                     response_memory_generation = ws_memory_generation
                                     response_memory_user_id = memory_user_id
                                     response_memory_request_ctx = memory_request_ctx
+                                    response_memory_tool_names = memory_tool_names
                                     response_input = list(current_response_input)
                                     response_template = dict(current_response_template)
                                 if event_type in {
@@ -10159,7 +10180,7 @@ class OpenAIHandlerMixin:
                                         response_output_items.append(item)
                                         if (
                                             item.get("type") == "function_call"
-                                            and item.get("name") in MEMORY_TOOL_NAMES
+                                            and item.get("name") in response_memory_tool_names
                                         ):
                                             pending_fcs.append(item)
 
@@ -10171,7 +10192,7 @@ class OpenAIHandlerMixin:
                                         if (
                                             isinstance(item, dict)
                                             and item.get("type") == "function_call"
-                                            and item.get("name") in MEMORY_TOOL_NAMES
+                                            and item.get("name") in response_memory_tool_names
                                         ):
                                             suppress_response = True
                                             decided = True
