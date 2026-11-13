@@ -198,3 +198,16 @@ def test_loopback_peer_with_a_repointed_hostname_is_refused() -> None:
 
     assert resp.status_code == 403
     assert transport.requests == []
+
+
+def test_origin_listed_only_for_cors_still_forwards_when_both_lists_are_set(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("HEADROOM_WS_ORIGINS", "https://ws.example")
+    monkeypatch.setenv("HEADROOM_CORS_ORIGINS", "https://dash.example")
+    client, transport = _client()
+
+    resp = _simple_post(client, "/v1/messages", {"Origin": "https://dash.example"})
+
+    assert resp.status_code == 200, resp.text
+    assert len(transport.requests) == 1

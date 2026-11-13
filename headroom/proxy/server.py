@@ -866,7 +866,21 @@ from headroom.proxy.handlers import (  # noqa: E402
 from headroom.proxy.handlers.openai import (  # noqa: E402
     _is_allowed_websocket_origin,
     _is_loopback_ws_origin,
+    _normalize_origin,
 )
+
+
+def _is_cors_listed_origin(origin: str) -> bool:
+    """True when ``origin`` is listed in HEADROOM_CORS_ORIGINS (``*`` lists nothing)."""
+    normalized = _normalize_origin(origin)
+    if normalized is None:
+        return False
+    listed = (
+        _normalize_origin(entry.strip())
+        for entry in os.environ.get("HEADROOM_CORS_ORIGINS", "").split(",")
+        if entry.strip() and entry.strip() != "*"
+    )
+    return normalized in listed
 
 
 def _is_refused_browser_request(request: Request) -> bool:
@@ -890,7 +904,11 @@ def _is_refused_browser_request(request: Request) -> bool:
     headers = request.headers
     origin = headers.get("origin")
     if origin:
-        if _is_loopback_ws_origin(origin) or _is_allowed_websocket_origin(dict(headers)):
+        if (
+            _is_loopback_ws_origin(origin)
+            or _is_allowed_websocket_origin(dict(headers))
+            or _is_cors_listed_origin(origin)
+        ):
             return False
         client = getattr(request, "client", None)
         peer = getattr(client, "host", None) if client is not None else None
