@@ -863,6 +863,46 @@ from headroom.proxy.handlers import (  # noqa: E402
     OpenAIHandlerMixin,
     StreamingMixin,
 )
+from headroom.proxy.handlers.openai import (  # noqa: E402
+    _is_allowed_websocket_origin,
+    _is_loopback_ws_origin,
+)
+
+
+def _is_refused_browser_request(request: Request) -> bool:
+    """Return True for a browser request from a page the proxy does not trust.
+
+    The proxy adds operator credentials (extra headers, the Copilot token,
+    provider env keys) to what it forwards, and loopback callers skip the
+    proxy token, so a page open in the user's browser must not be able to
+    drive it with a "simple" request (``text/plain`` body, no preflight).
+
+    Requests without ``Origin`` (CLI tools, SDKs, coding agents) pass. With
+    ``Origin``, these pass: loopback pages (the dashboard), the origins the
+    WebSocket routes accept (``HEADROOM_WS_ORIGINS`` / ``HEADROOM_CORS_ORIGINS``),
+    and, for a non-loopback peer, a page served from this proxy's own address
+    (a remote dashboard). A loopback peer gets no same-origin pass: there a
+    non-loopback Host means a page's hostname was pointed at 127.0.0.1.
+    A cross-site subresource load (``<img>``, ``<script>``) carries no
+    ``Origin`` on GET, so ``Sec-Fetch-Site: cross-site`` is refused too, except
+    for a top-level navigation.
+    """
+    headers = request.headers
+    origin = headers.get("origin")
+    if origin:
+        if _is_loopback_ws_origin(origin) or _is_allowed_websocket_origin(dict(headers)):
+            return False
+        client = getattr(request, "client", None)
+        peer = getattr(client, "host", None) if client is not None else None
+        host_header = headers.get("host")
+        return (
+            is_loopback_host(peer)
+            or not host_header
+            or not _request_has_same_origin_or_no_provenance(request, host_header)
+        )
+    fetch_site = (headers.get("sec-fetch-site") or "").lower()
+    fetch_mode = (headers.get("sec-fetch-mode") or "").lower()
+    return fetch_site == "cross-site" and fetch_mode != "navigate"
 
 
 def _apply_stateless_persistence(config: ProxyConfig) -> None:
@@ -4521,6 +4561,21 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
 
     @app.middleware("http")
     async def _security_gate(request, call_next):
+        # 0) Browser provenance. Runs before the token check because loopback
+        #    callers skip that check, and a page in the user's browser reaches
+        #    the proxy as a loopback caller.
+        if _is_refused_browser_request(request):
+            logger.warning(
+                "event=proxy_browser_origin_rejected method=%s path=%s",
+                request.method,
+                _auth_rejection_path(request.url.path),
+            )
+            rejection = JSONResponse(
+                status_code=403, content={"error": "cross-origin request rejected"}
+            )
+            _apply_security_headers(rejection)
+            return rejection
+
         # 1) Optional inbound auth. When a token is configured, require it on
         #    non-loopback requests; loopback callers and health probes are
         #    exempt. Loopback is the same trust boundary the admin/debug

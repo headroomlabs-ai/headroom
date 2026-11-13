@@ -719,6 +719,10 @@ def test_dashboard_client_cidr_hides_stats_metadata_from_cross_origin_browser(
     response = client.get("/stats", params={"cached": int(cached)}, headers=headers)
     payload = response.json()
 
+    if "origin" in headers:
+        # The security gate refuses a foreign browser Origin outright.
+        assert response.status_code == 403
+        return
     assert response.status_code == 200
     assert "tokens" in payload
     assert "recent_requests" not in payload
@@ -1106,7 +1110,8 @@ def test_metrics_trusted_cidr_cross_origin_browser_rejected(
         client=("10.9.0.7", 40000),
     )
     resp = client.get("/metrics", headers={"Origin": "http://attacker.example"})
-    assert resp.status_code == 404
+    # Refused by the security gate (403) before the route's own guard (404).
+    assert resp.status_code == 403
 
 
 def test_metrics_token_authenticated_network_caller_allowed(

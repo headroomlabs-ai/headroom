@@ -259,6 +259,15 @@ still names the attacker's page, and that is what this gate rejects. Requests wi
 `Origin` at all (CLI tools, curl) pass, which is the intended behaviour for a
 locally-driven surface.
 
+The provider routes (`/v1/messages`, `/v1/chat/completions`, `/v1/responses`, the
+passthrough) add operator credentials to what they forward, so every HTTP request goes
+through the same browser check in the security gate before routing: a request whose
+`Origin` is not a loopback page, an origin listed in `HEADROOM_WS_ORIGINS` /
+`HEADROOM_CORS_ORIGINS`, or (for a non-loopback caller) the proxy's own address is
+refused with **403**. A cross-site subresource load, which carries no `Origin`, is
+refused by `Sec-Fetch-Site: cross-site` unless it is a top-level navigation. Requests
+with no `Origin` (SDKs, coding agents, curl) are unaffected.
+
 ### The two CIDR allowlists
 
 Two environment variables can extend this beyond loopback. Both default to empty, so the
