@@ -913,6 +913,7 @@ class StreamingMixin:
         # See ``conversation_savings``.
         conversation_key: str | None = None,
         conversation_tokens_saved: int | None = None,
+        subscription_tracking: bool = False,
         savings_measure: ItemMeasure | None = None,
     ) -> None:
         from headroom.proxy.outcome import RequestOutcome
@@ -1111,6 +1112,31 @@ class StreamingMixin:
         _stream_stop_reason = (
             parsed_response.get("stop_reason") if isinstance(parsed_response, dict) else None
         )
+        if subscription_tracking and provider == "anthropic" and status_code < 400:
+            from headroom.proxy.savings_tracker import estimate_request_savings_usd
+            from headroom.subscription.tracker import get_subscription_tracker
+
+            sub_tracker = get_subscription_tracker()
+            if sub_tracker is not None:
+                savings_usd = estimate_request_savings_usd(
+                    model,
+                    compression_tokens_saved=tokens_saved,
+                    cache_read_tokens=cache_read_tokens,
+                    cache_write_tokens=cache_write_tokens,
+                    cache_write_5m_tokens=cache_write_5m_tokens,
+                    cache_write_1h_tokens=cache_write_1h_tokens,
+                    uncached_input_tokens=uncached_input_tokens,
+                    local_input_tokens=optimized_tokens,
+                    provider=outcome_provider,
+                )
+                sub_tracker.update_contribution(
+                    tokens_submitted=optimized_tokens,
+                    tokens_saved_compression=tokens_saved,
+                    tokens_saved_cache_reads=cache_read_tokens,
+                    compression_savings_usd=savings_usd["compression"],
+                    cache_savings_usd=savings_usd["provider_cache"],
+                )
+
         outcome = RequestOutcome.from_stream(
             thinking_tokens=_stream_thinking.tokens,
             thinking_inferred=_stream_thinking.inferred,
@@ -1174,6 +1200,7 @@ class StreamingMixin:
         session_key: str | None = None,
         conversation_key: str | None = None,
         conversation_tokens_saved: int | None = None,
+        subscription_tracking: bool = False,
         savings_measure: ItemMeasure | None = None,
         server_memory_tool_names: frozenset[str] | None = None,
         client_beta: str | None = None,
@@ -1223,6 +1250,7 @@ class StreamingMixin:
                 session_key=session_key,
                 conversation_key=conversation_key,
                 conversation_tokens_saved=conversation_tokens_saved,
+                subscription_tracking=subscription_tracking,
                 savings_measure=savings_measure,
                 server_memory_tool_names=server_memory_tool_names,
                 client_beta=client_beta,
@@ -1259,6 +1287,7 @@ class StreamingMixin:
         session_key: str,
         conversation_key: str | None = None,
         conversation_tokens_saved: int | None = None,
+        subscription_tracking: bool = False,
         savings_measure: ItemMeasure | None = None,
         server_memory_tool_names: frozenset[str] | None = None,
         client_beta: str | None = None,
@@ -1699,6 +1728,7 @@ class StreamingMixin:
                 status_code=upstream_response.status_code,
                 conversation_key=conversation_key,
                 conversation_tokens_saved=conversation_tokens_saved,
+                subscription_tracking=subscription_tracking,
                 savings_measure=savings_measure,
             )
             self._cleanup_mid_turn_stream(session_key)
@@ -2162,6 +2192,7 @@ class StreamingMixin:
                     ),
                     conversation_key=conversation_key,
                     conversation_tokens_saved=conversation_tokens_saved,
+                    subscription_tracking=subscription_tracking,
                     savings_measure=savings_measure,
                 )
                 if supports_mid_turn_coalescing(client) and pending_messages:
