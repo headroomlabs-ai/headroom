@@ -124,13 +124,21 @@ async def test_streamable_http_accepts_configured_host(monkeypatch: pytest.Monke
     assert other.status_code == 421
 
 
-@pytest.mark.parametrize(("host", "port"), [("127.0.0.1", 80), ("[::1]", 8788)])
-async def test_streamable_http_accepts_loopback_as_clients_address_it(host: str, port: int) -> None:
+@pytest.mark.parametrize(
+    ("host", "port", "base_url"),
+    [
+        ("127.0.0.1", 80, "http://localhost"),
+        ("[::1]", 8788, "http://[::1]:8788"),
+        ("127.0.0.2", 8788, "http://127.0.0.2:8788"),
+    ],
+)
+async def test_streamable_http_accepts_loopback_as_clients_address_it(
+    host: str, port: int, base_url: str
+) -> None:
     session_manager = create_streamable_http_session_manager(
         create_ccr_mcp_server(), host=host, port=port
     )
     app = create_streamable_http_app(session_manager, path="/mcp")
-    base_url = "http://localhost" if port == 80 else f"http://[::1]:{port}"
 
     async with session_manager.run():
         response = await _post_initialize(app, base_url, {"Origin": base_url})

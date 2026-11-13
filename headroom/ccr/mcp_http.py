@@ -52,10 +52,13 @@ def transport_security_settings(host: str, port: int) -> TransportSecuritySettin
     come from ``HEADROOM_MCP_ALLOWED_HOSTS``.
     """
     bare = host.strip("[]")
+    bound = f"[{bare}]" if ":" in bare else bare
     if bare in _WILDCARD_BINDS or is_loopback_host(bare):
         names = list(_LOOPBACK_NAMES)
+        if bare not in _WILDCARD_BINDS and bound not in names:
+            names.append(bound)
     else:
-        names = [f"[{bare}]" if ":" in bare else bare]
+        names = [bound]
     allowed_hosts = [f"{name}:{port}" for name in names]
     if port in (80, 443):
         # Clients leave a scheme-default port out of Host and Origin.
