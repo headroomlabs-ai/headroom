@@ -9,11 +9,11 @@
 //! so operators configure one token model for both processes.
 
 use std::fmt;
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 
 use axum::body::Body;
 use axum::extract::{ConnectInfo, State};
-use axum::http::{header, HeaderMap, Method, Request, StatusCode};
+use axum::http::{header, HeaderMap, HeaderValue, Method, Request, StatusCode};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 use axum::Json;
@@ -141,47 +141,100 @@ fn is_hello_probe(method: &Method, path: &str) -> bool {
     (*method == Method::GET || *method == Method::HEAD) && hello
 }
 
-/// Router-wide middleware, installed only when a token is configured.
-/// A non-loopback (or unknown) peer must present the token or gets 401
-/// with no upstream contact. The credential is removed before forwarding.
-pub async fn require_proxy_token(
-    State(token): State<ProxyToken>,
+/// Request extension: the caller is not local (not a loopback peer with a
+/// loopback `Host`). `forward_http` then gives a loopback upstream a
+/// non-loopback `Host`, so the upstream's local-only routes (`/admin`,
+/// `/debug`, `/settings`, ...) do not treat a relayed caller as local.
+/// Without it this process's own loopback connection and rewritten `Host`
+/// would pass both checks those routes make.
+#[derive(Clone, Copy, Debug)]
+pub struct NonLocalCaller;
+
+/// `Host` sent to a loopback upstream for a [`NonLocalCaller`]: the
+/// caller's own `Host` when it is not a loopback name, else a reserved
+/// non-loopback name.
+pub(crate) fn non_local_upstream_host(headers: &HeaderMap) -> HeaderValue {
+    match headers.get(header::HOST) {
+        Some(h) if !is_loopback_host_header(h.to_str().ok()) => h.clone(),
+        _ => HeaderValue::from_static("headroom-remote.invalid"),
+    }
+}
+
+/// Same rules as Python's `loopback_guard.is_loopback_host_header`:
+/// `localhost`, or a loopback IP literal, with an optional port and
+/// brackets around IPv6. Missing or malformed is not loopback.
+fn is_loopback_host_header(value: Option<&str>) -> bool {
+    let Some(candidate) = value.map(str::trim).filter(|v| !v.is_empty()) else {
+        return false;
+    };
+    let host = if let Some(rest) = candidate.strip_prefix('[') {
+        match rest.split_once(']') {
+            Some((h, _)) => h,
+            None => return false,
+        }
+    } else if candidate.matches(':').count() == 1 {
+        candidate.rsplit_once(':').map_or(candidate, |(h, _)| h)
+    } else {
+        candidate
+    };
+    host.eq_ignore_ascii_case("localhost")
+        || host
+            .parse::<IpAddr>()
+            .is_ok_and(|ip| ip.to_canonical().is_loopback())
+}
+
+/// Router-wide middleware. Marks every caller that is not local with
+/// [`NonLocalCaller`]. When a token is configured, a non-loopback (or
+/// unknown) peer must also present it or gets 401 with no upstream
+/// contact, and the credential is removed before forwarding.
+pub async fn inbound_gate(
+    State(token): State<Option<ProxyToken>>,
     mut req: Request<Body>,
     next: Next,
 ) -> Response {
-    // Answered here and empty, never relayed upstream without a
-    // credential: the same answer the Python proxy gives it.
-    if is_hello_probe(req.method(), req.uri().path()) {
-        return StatusCode::OK.into_response();
-    }
     // No ConnectInfo is no evidence of a local caller: fail closed, as
     // Python's is_loopback_host(None) does.
     let peer = req
         .extensions()
         .get::<ConnectInfo<SocketAddr>>()
         .map(|c| c.0);
-    let local = peer.as_ref().is_some_and(is_loopback);
-    if !local && !is_health_probe(req.method(), req.uri().path()) {
-        let provided = read_proxy_token(req.headers());
-        if !provided.is_some_and(|p| token.matches(p)) {
-            tracing::warn!(
-                event = "proxy_auth_rejected",
-                method = %req.method(),
-                path = req.uri().path(),
-                peer = ?peer,
-                reason = if provided.is_none() { "missing_token" } else { "bad_token" },
-            );
-            return (
-                StatusCode::UNAUTHORIZED,
-                Json(json!({ "error": "unauthorized" })),
-            )
-                .into_response();
+    let loopback_peer = peer.as_ref().is_some_and(is_loopback);
+    if let Some(token) = &token {
+        // Answered here and empty, never relayed upstream without a
+        // credential: the same answer the Python proxy gives it.
+        if is_hello_probe(req.method(), req.uri().path()) {
+            return StatusCode::OK.into_response();
+        }
+        if !loopback_peer && !is_health_probe(req.method(), req.uri().path()) {
+            let provided = read_proxy_token(req.headers());
+            if !provided.is_some_and(|p| token.matches(p)) {
+                tracing::warn!(
+                    event = "proxy_auth_rejected",
+                    method = %req.method(),
+                    path = req.uri().path(),
+                    peer = ?peer,
+                    reason = if provided.is_none() { "missing_token" } else { "bad_token" },
+                );
+                return (
+                    StatusCode::UNAUTHORIZED,
+                    Json(json!({ "error": "unauthorized" })),
+                )
+                    .into_response();
+            }
+        }
+        let headers = req.headers_mut();
+        headers.remove(PROXY_TOKEN_HEADER);
+        if bearer(headers).is_some_and(|b| token.matches(b)) {
+            headers.remove(header::AUTHORIZATION);
         }
     }
-    let headers = req.headers_mut();
-    headers.remove(PROXY_TOKEN_HEADER);
-    if bearer(headers).is_some_and(|b| token.matches(b)) {
-        headers.remove(header::AUTHORIZATION);
+    let host = req
+        .headers()
+        .get(header::HOST)
+        .and_then(|h| h.to_str().ok())
+        .or_else(|| req.uri().authority().map(|a| a.as_str()));
+    if !(loopback_peer && is_loopback_host_header(host)) {
+        req.extensions_mut().insert(NonLocalCaller);
     }
     next.run(req).await
 }
@@ -236,6 +289,31 @@ mod tests {
         assert!(!constant_time_eq(b"abc", b"abd"));
         assert!(!constant_time_eq(b"abc", b"abcd"));
         assert!(format!("{:?}", ProxyToken::new("abc").unwrap()).contains("redacted"));
+    }
+
+    #[test]
+    fn loopback_host_header_matches_python() {
+        for ok in [
+            "127.0.0.1:8787",
+            "localhost",
+            "LOCALHOST:1",
+            "[::1]:8787",
+            "::1",
+            "127.1.2.3",
+        ] {
+            assert!(is_loopback_host_header(Some(ok)), "{ok}");
+        }
+        for bad in [
+            "",
+            "evil.example",
+            "evil.example:8787",
+            "10.0.0.1:8787",
+            "[::1",
+            "localhost.evil.example",
+        ] {
+            assert!(!is_loopback_host_header(Some(bad)), "{bad}");
+        }
+        assert!(!is_loopback_host_header(None));
     }
 
     #[test]

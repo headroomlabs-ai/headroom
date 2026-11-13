@@ -110,6 +110,12 @@ Python proxy trusts loopback callers (no token needed, and access to
   or gets `401 {"error":"unauthorized"}`. Loopback peers are exempt, as
   in the Python proxy. The token is removed from the request before it
   is forwarded (`Authorization` only when it carries the token).
+- A caller that is not local here (a non-loopback peer, or a loopback
+  peer whose `Host` is not a loopback name) is forwarded to a loopback
+  upstream with a non-loopback `Host` (its own, or
+  `headroom-remote.invalid`), so the Python proxy's local-only routes
+  (`/admin`, `/debug`, `/settings`, ...) stay closed to it, with or
+  without a token.
 - `GET /healthz`, `/healthz/upstream`, `/health`, `/livez` and `/readyz`
   stay reachable without the token, and `GET`/`HEAD /api/hello` is
   answered locally with an empty `200`.
@@ -170,8 +176,10 @@ the hot path every 10 s and on shutdown.
 > its own `/stats`:
 >
 > - **Aggregates** — spend, tokens, per-model/provider rollups,
->   history — are served to anyone, like the Prometheus `/metrics`
->   endpoint next door. Same data class, same stance.
+>   history — are served to any caller that gets past the inbound gate
+>   (above), like the Prometheus `/metrics` endpoint next door: with
+>   `HEADROOM_PROXY_TOKEN` set, remote callers need the token for these
+>   too; without it, they are open to anyone who can reach the port.
 > - **Per-request rows** — `recent_requests`, all of `/stats/events`
 >   — plus the ledger's filesystem path are served **only to local
 >   callers**: loopback peer *and* a loopback `Host` header (the

@@ -425,17 +425,26 @@ pub fn build_app(state: AppState) -> Router {
         );
     }
 
-    let mut router = router.fallback(any(catch_all));
-    // Inbound HEADROOM_PROXY_TOKEN gate. Applied last so it wraps every
-    // route and the fallback: the upstream Python proxy sees this process
-    // as a loopback caller and cannot authenticate the real peer itself.
-    if let Some(token) = state.config.proxy_token.clone() {
-        router = router.layer(axum::middleware::from_fn_with_state(
-            token,
-            crate::inbound_auth::require_proxy_token,
+    // Inbound gate (caller locality + optional HEADROOM_PROXY_TOKEN).
+    // Applied last so it wraps every route and the fallback: the upstream
+    // Python proxy sees this process as a loopback caller and cannot tell
+    // who the real peer is itself.
+    let router = router
+        .fallback(any(catch_all))
+        .layer(axum::middleware::from_fn_with_state(
+            state.config.proxy_token.clone(),
+            crate::inbound_auth::inbound_gate,
         ));
-    }
     router.with_state(state)
+}
+
+fn is_loopback_upstream(upstream: &url::Url) -> bool {
+    match upstream.host() {
+        Some(url::Host::Domain(d)) => d.eq_ignore_ascii_case("localhost"),
+        Some(url::Host::Ipv4(ip)) => ip.is_loopback(),
+        Some(url::Host::Ipv6(ip)) => ip.to_canonical().is_loopback(),
+        None => false,
+    }
 }
 
 /// Catch-all handler. If the request is a WebSocket upgrade, hand off to the
@@ -656,6 +665,20 @@ pub(crate) async fn forward_http(
         if let Some(h) = req.headers().get(http::header::HOST) {
             outgoing_headers.insert(http::header::HOST, h.clone());
         }
+    }
+    // A loopback upstream (the Python proxy) sees this process as a local
+    // caller; a non-loopback Host keeps its local-only routes closed to a
+    // caller that is not local here.
+    if req
+        .extensions()
+        .get::<crate::inbound_auth::NonLocalCaller>()
+        .is_some()
+        && is_loopback_upstream(&state.config.upstream)
+    {
+        outgoing_headers.insert(
+            http::header::HOST,
+            crate::inbound_auth::non_local_upstream_host(req.headers()),
+        );
     }
 
     // ─── COMPRESSION GATE ──────────────────────────────────────────────

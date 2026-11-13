@@ -222,3 +222,67 @@ async fn hello_probe_is_answered_locally_without_token() {
     }
     assert!(up.received_requests().await.unwrap().is_empty());
 }
+
+/// `Host` the upstream received for one request.
+async fn upstream_host(
+    token: Option<&str>,
+    peer: &str,
+    path: &str,
+    headers: &[(&str, &str)],
+) -> String {
+    let up = upstream().await;
+    let status = send(&up, token, Some(peer), "GET", path, headers).await;
+    assert_eq!(status, StatusCode::OK);
+    let seen = up.received_requests().await.unwrap();
+    seen[0]
+        .headers
+        .get("host")
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .to_owned()
+}
+
+fn is_loopback_name(host: &str) -> bool {
+    host.starts_with("127.") || host.starts_with("localhost") || host.starts_with("[::1]")
+}
+
+#[tokio::test]
+async fn local_caller_keeps_the_rewritten_upstream_host() {
+    let host = upstream_host(
+        None,
+        LOCAL,
+        "/admin/upstream",
+        &[("host", "127.0.0.1:8787")],
+    )
+    .await;
+    assert!(is_loopback_name(&host), "{host}");
+}
+
+#[tokio::test]
+async fn loopback_peer_with_a_foreign_host_is_not_relayed_as_local() {
+    // A browser reaching the port through a name that resolves to
+    // 127.0.0.1: loopback peer, foreign Host.
+    let host = upstream_host(
+        None,
+        LOCAL,
+        "/admin/upstream",
+        &[("host", "evil.example:8787")],
+    )
+    .await;
+    assert_eq!(host, "evil.example:8787");
+}
+
+#[tokio::test]
+async fn remote_token_holder_is_not_relayed_as_local() {
+    for client_host in ["proxy.example:8787", "localhost:8787"] {
+        let host = upstream_host(
+            Some(TOKEN),
+            REMOTE,
+            "/admin/upstream",
+            &[("x-headroom-proxy-token", TOKEN), ("host", client_host)],
+        )
+        .await;
+        assert!(!is_loopback_name(&host), "{client_host} -> {host}");
+    }
+}
