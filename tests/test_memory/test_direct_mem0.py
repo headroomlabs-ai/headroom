@@ -597,9 +597,12 @@ def _merged_relationship(session: MagicMock) -> str:
     [
         ("Works At", "`works_at`"),
         ("is-a", "`is_a`"),
-        ("reports to (since 2020)", "`reports_to_since_2020`"),
-        ("a`b]->(c)\nd", "`a_b_c_d`"),
-        ("a" * 100, "`" + "a" * 64 + "`"),
+        ("reports to (since 2020)", "`reports_to__since_2020_`"),
+        ("a`b]->(c)\nd", "`a_b____c__d`"),
+        ("_works_at", "`_works_at`"),
+        ("__", "`__`"),
+        ("foo  bar", "`foo__bar`"),
+        ("a" * 100, "`" + "a" * 100 + "`"),
     ],
 )
 async def test_write_graph_relationship_type_is_a_single_identifier(
@@ -615,9 +618,9 @@ async def test_write_graph_relationship_type_is_a_single_identifier(
 
 
 @pytest.mark.asyncio
-async def test_write_graph_skips_relationship_with_no_usable_type() -> None:
+async def test_write_graph_skips_relationship_with_empty_type() -> None:
     adapter, session = _graph_adapter()
-    rels = [{"source": "user", "relationship": " ]-> ", "destination": "x"}]
+    rels = [{"source": "user", "relationship": "", "destination": "x"}]
 
     await adapter._write_graph_to_neo4j([], rels, "u1")
 

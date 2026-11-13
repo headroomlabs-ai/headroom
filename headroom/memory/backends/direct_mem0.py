@@ -68,15 +68,15 @@ from headroom.offline import guard_egress
 logger = logging.getLogger(__name__)
 
 # Neo4j cannot bind a relationship type as a query parameter, so the type is
-# written into the Cypher text. Anything that is not a word character becomes
-# "_" so the value can only ever be a single identifier.
-_REL_TYPE_NON_WORD = re.compile(r"\W+")
-_REL_TYPE_MAX_LEN = 64
+# written into the Cypher text. Each non-word character becomes "_" (one for
+# one, matching the old space -> "_" mapping), so the value can only ever be a
+# single identifier and labels that were already valid keep their stored type.
+_REL_TYPE_NON_WORD = re.compile(r"\W")
 
 
 def _relationship_type(raw: str) -> str:
-    """Normalise a relationship label to a Cypher-safe identifier ("" if none)."""
-    return _REL_TYPE_NON_WORD.sub("_", raw.lower()).strip("_")[:_REL_TYPE_MAX_LEN].rstrip("_")
+    """Normalise a relationship label to a Cypher-safe identifier."""
+    return _REL_TYPE_NON_WORD.sub("_", raw.lower())
 
 
 def _utcnow() -> datetime:
@@ -541,7 +541,7 @@ class DirectMem0Adapter:
         for rel in relationships:
             rel_type = _relationship_type(rel["relationship"])
             if not rel_type:
-                logger.warning("Skipping relationship with an empty type after normalisation")
+                logger.warning("Skipping relationship with an empty type")
                 continue
             normalized_rels.append(
                 {
