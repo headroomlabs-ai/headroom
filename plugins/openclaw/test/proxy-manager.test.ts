@@ -5,6 +5,10 @@ import {
   isLocalProxyUrl,
   probeHeadroomProxy,
 } from "../src/proxy-manager.js";
+import { spawnSync } from "node:child_process";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 
 const retrieveStatsBody = JSON.stringify({ store: { entry_count: 0 }, recent_retrievals: [] });
 const proxyStatsBody = JSON.stringify({ proxy_inbound: { total: 1 } });
@@ -347,7 +351,7 @@ describe("ProxyManager launch internals", () => {
 
     expect(specs[0]?.label).toContain("Configured Python:");
     expect(specs[0]?.command).toBe("C:\\Python311\\python.exe");
-    expect(specs[0]?.args).toEqual(["-m", "headroom.cli", "proxy", "--host", "127.0.0.1", "--port", "8787"]);
+    expect(specs[0]?.args).toEqual(["-P", "-m", "headroom.cli", "proxy", "--host", "127.0.0.1", "--port", "8787"]);
   });
 
   it("uses lightweight PATH checks instead of booting the headroom CLI", () => {
@@ -407,9 +411,34 @@ describe("ProxyManager launch internals", () => {
 
     expect(pythonSpec).toBeDefined();
     expect(pythonSpec?.checkArgs).toEqual([
+      "-P",
       "-c",
       "import importlib.util, sys; sys.exit(0 if importlib.util.find_spec('headroom') else 1)",
     ]);
+  });
+
+  it("never resolves headroom from the working directory in python fallbacks", () => {
+    const manager = new ProxyManager({ pythonPath: "/opt/py/bin/python3" });
+    const specs = (manager as any).buildLaunchSpecs("127.0.0.1", "8787") as Array<Record<string, any>>;
+    const pythonSpecs = specs.filter((spec) => spec.args?.includes("headroom.cli"));
+    expect(pythonSpecs.length).toBeGreaterThan(1);
+
+    const probe = spawnSync("python3", ["-c", "import sys; sys.exit(sys.version_info < (3, 11))"]);
+    const project = mkdtempSync(join(tmpdir(), "openclaw-cwd-"));
+    try {
+      mkdirSync(join(project, "headroom"));
+      writeFileSync(join(project, "headroom", "__init__.py"), "");
+      for (const spec of pythonSpecs) {
+        if (probe.status === 0) {
+          // -S hides any installed headroom, so only the project folder could match.
+          const check = spawnSync("python3", ["-S", ...spec.checkArgs], { cwd: project });
+          expect(check.status).toBe(1);
+        }
+        expect(spec.args[0]).toBe("-P");
+      }
+    } finally {
+      rmSync(project, { recursive: true, force: true });
+    }
   });
 
   it("uses first available launcher from provided specs", async () => {
