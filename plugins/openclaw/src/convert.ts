@@ -314,7 +314,7 @@ export function restoreAgentMessages(
     } else if (sameWireMessage(before, message)) {
       result.push(normalizeAgentMessage(original));
     } else {
-      result.push(applyCompressedMessage(original, message));
+      result.push(applyCompressedMessage(original, before, message));
     }
   }
   return result;
@@ -341,12 +341,13 @@ function sameWireMessage(a: OpenAIMessage, b: OpenAIMessage): boolean {
   );
 }
 
-function applyCompressedMessage(original: any, compressed: OpenAIMessage): any {
+function applyCompressedMessage(original: any, sent: OpenAIMessage, compressed: OpenAIMessage): any {
   const base = normalizeAgentMessage(original);
   const text = typeof compressed.content === "string" ? compressed.content : "";
 
   if (base.role === "assistant") {
-    let content = replaceTextBlocks(base.content, text);
+    let content =
+      sent.content === compressed.content ? base.content : replaceTextBlocks(base.content, text);
     if (Array.isArray(compressed.tool_calls)) {
       content = content.map((block: any) => withCompressedArguments(block, compressed.tool_calls!));
     }
