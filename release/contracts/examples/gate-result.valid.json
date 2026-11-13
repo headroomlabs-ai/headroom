@@ -1,0 +1,30 @@
+{
+  "schema_version": 1,
+  "gate_id": "gate-a-3077ac81-policy-1.0.0",
+  "gate": "gate_a",
+  "evaluated_at": "2026-08-13T06:00:00Z",
+  "candidate_sha": "3077ac81e8ef3ddefebbe308ea37a4e9bb2100e6",
+  "policy_version": "1.0.0",
+  "risk_class": "R3",
+  "status": "pass",
+  "reasons": [],
+  "required_evidence": ["candidate", "deterministic", "tier1-integrations", "benchmark"],
+  "observed_evidence": [
+    {
+      "evidence_id": "candidate-3077ac81",
+      "kind": "candidate_manifest",
+      "schema_version": 1,
+      "status": "pass",
+      "uri": "https://github.com/headroomlabs-ai/headroom/actions/runs/123456789/artifacts/1",
+      "sha256": "sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+      "producer": {
+        "repository": "headroomlabs-ai/headroom",
+        "workflow": "candidate-artifact.yml",
+        "run_id": 123456789,
+        "run_attempt": 1,
+        "commit_sha": "3077ac81e8ef3ddefebbe308ea37a4e9bb2100e6"
+      }
+    }
+  ],
+  "overrides": []
+}
