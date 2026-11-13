@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import heapq
 import json
 import re
+from bisect import bisect_left
 from dataclasses import dataclass
 
 from .content_detector import ContentType, _is_search_result_line
@@ -94,45 +96,17 @@ def _any_nonblank(lines: list[str], start: int, stop: int) -> bool:
     return any(lines[i].strip() for i in range(start, stop))
 
 
-# Line steps all JSON-block candidates of one pass may spend, per line of
-# content, plus a floor. Every candidate that never balances walks to the end of
-# the content, so N such lines cost N^2/2 steps; this caps the total at O(N).
-# Balanced blocks spend only their own length, so real content never nears it.
-_JSON_SCAN_STEPS_PER_LINE = 32
-_JSON_SCAN_STEPS_FLOOR = 1000
-
-
-@dataclass
-class _ScanBudget:
-    """Line steps left for one pass over ``lines`` (see _extract_json_block)."""
-
-    remaining: int
-
-    @classmethod
-    def for_lines(cls, lines: list[str]) -> _ScanBudget:
-        return cls(_JSON_SCAN_STEPS_PER_LINE * len(lines) + _JSON_SCAN_STEPS_FLOOR)
-
-
 def _has_valid_json_block_with_text(content: str) -> bool:
     """Return true when prose or log text wraps a valid JSON block."""
     lines = content.split("\n")
-    # Built only after a scan has run to the end without balancing — see
-    # _extract_json_block. Content that balances promptly never allocates it and
-    # so pays nothing for it.
-    scan_cache: dict[tuple[int, bool, bool], tuple[int, int, bool, bool]] | None = None
-    reach: dict[tuple[int, bool, bool], tuple[int, int]] = {}
-    budget = _ScanBudget.for_lines(lines)
+    blocks = _JsonBlockScanner(lines)
 
     for index, line in enumerate(lines):
-        if not line.strip().startswith(("[", "{")):
+        if not _is_json_candidate(line):
             continue
 
-        json_content, end_index = _extract_json_block(
-            lines, index, cache=scan_cache, reach=reach, budget=budget
-        )
+        json_content, end_index = blocks.extract(index)
         if json_content is None:
-            if scan_cache is None:
-                scan_cache = {}
             continue
 
         try:
@@ -164,9 +138,7 @@ def split_into_sections(content: str, *, isolate: tuple[str, ...] = ()) -> list[
     def _carries_isolate(text: str) -> bool:
         return any(marker in text for marker in isolate)
 
-    scan_cache: dict[tuple[int, bool, bool], tuple[int, int, bool, bool]] | None = None
-    reach: dict[tuple[int, bool, bool], tuple[int, int]] = {}
-    scan_budget = _ScanBudget.for_lines(lines)
+    blocks = _JsonBlockScanner(lines)
 
     i = 0
     while i < len(lines):
@@ -208,14 +180,8 @@ def split_into_sections(content: str, *, isolate: tuple[str, ...] = ()) -> list[
             i += 1
             continue
 
-        if line.strip().startswith(("[", "{")):
-            json_content, end_i = _extract_json_block(
-                lines, i, cache=scan_cache, reach=reach, budget=scan_budget
-            )
-            if json_content is None and scan_cache is None:
-                # First scan that ran to the end without balancing: from here on
-                # every later candidate would re-walk the same tail.
-                scan_cache = {}
+        if _is_json_candidate(line):
+            json_content, end_i = blocks.extract(i)
             if json_content is not None:
                 # Bracket balance alone is not JSON: prose like a harness
                 # sanitizer banner ("[harness: ... you.]") balances on one
@@ -363,37 +329,129 @@ def _scan_line(line: str, in_string: bool, escaped: bool) -> tuple[int, int, boo
     return bracket, brace, in_string, escaped
 
 
-def _lowest_counts(
-    lines: list[str],
-    start: int,
-    cache: dict[tuple[int, bool, bool], tuple[int, int, bool, bool]],
-    reach: dict[tuple[int, bool, bool], tuple[int, int]],
-) -> tuple[int, int]:
-    """Lowest running (bracket, brace) counts of a block scan from ``start``.
+def _is_json_candidate(line: str) -> bool:
+    return line.strip().startswith(("[", "{"))
 
-    Walks forward only until it meets a line/state already in ``reach``, then
-    fills the walked entries backwards, so each entry is computed once per
-    pass however many candidates reach it.
+
+class _JsonBlockScanner:
+    """Answers :func:`_extract_json_block` for every candidate of one pass.
+
+    Each candidate walks forward until its running bracket and brace counts
+    are both <= 0. Walked one by one, N candidates that balance late or never
+    cost N^2/2 line steps. The scanner walks them directly until they have
+    walked as many lines as the content has, then answers the rest offline:
+    a walk from line ``s`` (parser state reset) follows one deterministic
+    path of (line, state) nodes, so the path is walked once and every
+    candidate on it is answered in one sweep. A candidate ends at the first
+    later node whose running counts are at or below the counts just before
+    it, which the sweep finds with a tree over pending candidates in
+    O(log n) each. Results are identical to walking each candidate.
+
+    Only a candidate whose start lies on no path built so far (it starts
+    outside a string while every earlier path is inside one) builds a new
+    path. Path building is charged to a line budget; once that is spent,
+    such candidates are reported as unbalanced.
     """
-    walked: list[tuple[tuple[int, bool, bool], int, int]] = []
-    key = (start, False, False)
-    while key[0] < len(lines) and key not in reach:
-        step = cache.get(key)
-        if step is None:
-            step = _scan_line(lines[key[0]], key[1], key[2])
-            cache[key] = step
-        d_bracket, d_brace, in_string, escaped = step
-        walked.append((key, d_bracket, d_brace))
-        key = (key[0] + 1, in_string, escaped)
-    # Past the last line there is nothing further to reach.
-    tail = reach.get(key)
-    for node, d_bracket, d_brace in reversed(walked):
-        if tail is None:
-            tail = (d_bracket, d_brace)
-        else:
-            tail = (min(d_bracket, d_bracket + tail[0]), min(d_brace, d_brace + tail[1]))
-        reach[node] = tail
-    return tail if tail is not None else (0, 0)
+
+    _BUDGET_STEPS_PER_LINE = 32
+    _BUDGET_FLOOR = 1000
+
+    def __init__(self, lines: list[str]) -> None:
+        self._lines = lines
+        self._direct_steps_left = len(lines)
+        self._budget = self._BUDGET_STEPS_PER_LINE * len(lines) + self._BUDGET_FLOOR
+        self._cache: dict[tuple[int, bool, bool], tuple[int, int, bool, bool]] = {}
+        # Candidate line -> last line of its block (None: never balances).
+        self._ends: dict[int, int | None] = {}
+
+    def extract(self, start: int) -> tuple[str | None, int]:
+        if self._direct_steps_left > 0:
+            json_content, end = _extract_json_block(self._lines, start)
+            walked = (end if json_content is not None else len(self._lines) - 1) - start + 1
+            self._direct_steps_left -= walked
+            return json_content, end
+        if start not in self._ends:
+            self._build_path(start)
+        end_line = self._ends.get(start)
+        if end_line is None:
+            return None, start
+        return "\n".join(self._lines[start : end_line + 1]), end_line
+
+    def _build_path(self, start: int) -> None:
+        """Walk the path from ``start`` and answer every candidate on it."""
+        lines = self._lines
+        nodes: list[tuple[int, bool, int, int]] = []  # line, starts-reset, counts after
+        key = (start, False, False)
+        bracket = brace = 0
+        while key[0] < len(lines):
+            if self._budget <= 0:
+                self._ends[start] = None
+                return
+            self._budget -= 1
+            step = self._cache.get(key)
+            if step is None:
+                step = _scan_line(lines[key[0]], key[1], key[2])
+                self._cache[key] = step
+            d_bracket, d_brace, in_string, escaped = step
+            bracket += d_bracket
+            brace += d_brace
+            nodes.append((key[0], not key[1] and not key[2], bracket, brace))
+            key = (key[0] + 1, in_string, escaped)
+        self._sweep(nodes)
+
+    def _sweep(self, nodes: list[tuple[int, bool, int, int]]) -> None:
+        lines = self._lines
+        # (node index, bracket, brace) just before each unanswered candidate.
+        queries: list[tuple[int, int, int]] = []
+        for k, (line, reset, _, _) in enumerate(nodes):
+            if reset and line not in self._ends and _is_json_candidate(lines[line]):
+                before = (nodes[k - 1][2], nodes[k - 1][3]) if k else (0, 0)
+                queries.append((k, *before))
+        if not queries:
+            return
+        keys = sorted({bracket for _, bracket, _ in queries})
+        size = 1
+        while size < len(keys):
+            size *= 2
+        lowest = float("-inf")
+        # tree[node] = highest brace threshold pending under it.
+        tree: list[float] = [lowest] * (2 * size)
+        pending: list[list[tuple[int, int]]] = [[] for _ in keys]
+
+        def refresh(leaf: int) -> None:
+            node = leaf + size
+            tree[node] = -pending[leaf][0][0] if pending[leaf] else lowest
+            node //= 2
+            while node:
+                tree[node] = max(tree[2 * node], tree[2 * node + 1])
+                node //= 2
+
+        def find(node: int, lo: int, hi: int, first: int, brace: int) -> int | None:
+            # Any leaf >= first whose highest brace threshold is >= brace.
+            if hi <= first or tree[node] < brace:
+                return None
+            if node >= size:
+                return node - size
+            mid = (lo + hi) // 2
+            left = find(2 * node, lo, mid, first, brace)
+            return left if left is not None else find(2 * node + 1, mid, hi, first, brace)
+
+        q = 0
+        for j, (line, _, bracket, brace) in enumerate(nodes):
+            while q < len(queries) and queries[q][0] == j:
+                _, need_bracket, need_brace = queries[q]
+                slot = bisect_left(keys, need_bracket)
+                heapq.heappush(pending[slot], (-need_brace, j))
+                refresh(slot)
+                q += 1
+            # Candidates whose thresholds are both >= the counts here end here.
+            first = bisect_left(keys, bracket)
+            while (leaf := find(1, 0, size, first, brace)) is not None:
+                _, k = heapq.heappop(pending[leaf])
+                self._ends[nodes[k][0]] = line
+                refresh(leaf)
+        for k, _, _ in queries:
+            self._ends.setdefault(nodes[k][0], None)
 
 
 def _extract_json_block(
@@ -401,8 +459,6 @@ def _extract_json_block(
     start: int,
     *,
     cache: dict[tuple[int, bool, bool], tuple[int, int, bool, bool]] | None = None,
-    reach: dict[tuple[int, bool, bool], tuple[int, int]] | None = None,
-    budget: _ScanBudget | None = None,
 ) -> tuple[str | None, int]:
     """Extract a complete JSON object or array block from line-oriented content.
 
@@ -425,34 +481,13 @@ def _extract_json_block(
     Keyed on the entry state as well as the line, so a cached entry is only
     reused where the parser is in the same string/escape state. Same deltas,
     same result: this is a memo, not a heuristic.
-
-    ``reach`` (used together with ``cache``) memoises, per line and entry
-    state, the lowest running bracket and brace counts the walk reaches from
-    there to the end. A block balances only where both counts are <= 0, so a
-    candidate whose lowest bracket or brace count stays above 0 cannot balance
-    and is rejected without walking. This is exact, and it is what keeps runs
-    of unclosed ``{`` lines from walking to the end once per line.
-
-    ``budget`` (shared by all candidates of one pass, ``None`` = unlimited) is
-    spent one per line walked. When it runs out the block is reported as
-    unbalanced. It only bounds shapes the ``reach`` check cannot rule out
-    (counts that each drop to 0 but never at the same line).
     """
-    if cache is not None and reach is not None:
-        lowest_bracket, lowest_brace = _lowest_counts(lines, start, cache, reach)
-        if lowest_bracket > 0 or lowest_brace > 0:
-            return None, start
-
     bracket_count = 0
     brace_count = 0
     in_string = False
     escaped = False
 
     for i in range(start, len(lines)):
-        if budget is not None:
-            if budget.remaining <= 0:
-                return None, start
-            budget.remaining -= 1
         key = (i, in_string, escaped)
         step = cache.get(key) if cache is not None else None
         if step is None:

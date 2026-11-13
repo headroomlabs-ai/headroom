@@ -18,7 +18,9 @@ from headroom.proxy.interceptors.astgrep import (
 )
 from headroom.transforms.mixed_content import (
     ContentType,
+    _extract_json_block,
     _has_valid_json_block_with_text,
+    _JsonBlockScanner,
     split_into_sections,
 )
 
@@ -93,3 +95,34 @@ def test_json_object_after_many_unclosed_braces_keeps_its_own_section(unclosed: 
         s for s in split_into_sections(content) if s.content_type is ContentType.JSON_ARRAY
     ]
     assert [s.content for s in json_sections] == [obj]
+
+
+@pytest.mark.parametrize("repeats", [1, 130])
+def test_json_object_after_crossed_count_prefix_keeps_its_own_section(repeats: int) -> None:
+    # Each count reaches zero on its own but never on the same line, so no
+    # early rejection applies; the object after it must still be found.
+    prefix = (["{"] * 150 + ["[" + "}" * 150]) * repeats
+    obj = '{"critical": "disk full"}'
+    content = "\n".join(prefix + ["some prose"] * 6 + [obj, "more prose"])
+    start = time.perf_counter()
+    assert _has_valid_json_block_with_text(content) is True
+    json_sections = [
+        s for s in split_into_sections(content) if s.content_type is ContentType.JSON_ARRAY
+    ]
+    assert time.perf_counter() - start < 10.0
+    assert [s.content for s in json_sections] == [obj]
+
+
+def test_block_scanner_matches_walking_each_candidate() -> None:
+    rng = random.Random(7)
+    parts = ["{", "}", "[", "]", '"', "\\\\", "a", " ", ",", "{}", "[]", '"x"', "}}", "]]", "{["]
+    for _ in range(3000):
+        lines = [
+            "".join(rng.choice(parts) for _ in range(rng.randint(0, 5)))
+            for _ in range(rng.randint(1, 25))
+        ]
+        scanner = _JsonBlockScanner(lines)
+        scanner._direct_steps_left = 0  # answer every candidate from the sweep
+        for i, line in enumerate(lines):
+            if line.strip().startswith(("[", "{")):
+                assert scanner.extract(i) == _extract_json_block(lines, i), (lines, i)
