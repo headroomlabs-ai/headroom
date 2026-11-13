@@ -182,7 +182,7 @@ The default port is 8787. To use a custom port:
 
 1. Uninstall: `./uninstall.sh`
 2. Reinstall with new port: `./install.sh --port 9000`
-3. Update shell integration: `export HEADROOM_PORT=9000`
+3. Update shell integration: `export HEADROOM_PROXY_PORT=9000`
 
 ### Log Location
 
@@ -206,7 +206,7 @@ Configure additional options in the plist `EnvironmentVariables` section:
 <key>EnvironmentVariables</key>
 <dict>
     <!-- Required: Proxy port -->
-    <key>HEADROOM_PORT</key>
+    <key>HEADROOM_PROXY_PORT</key>
     <string>8787</string>
 
     <!-- Optional: API key (or set in shell) -->
@@ -246,7 +246,7 @@ Add to `~/.bashrc` (bash) or `~/.zshrc` (zsh):
 
 ```bash
 # Configure port (optional, defaults to 8787)
-export HEADROOM_PORT=8787
+export HEADROOM_PROXY_PORT=8787
 
 # Source shell integration
 source /path/to/headroom/examples/deployment/macos-launchagent/shell-integration.sh
@@ -529,7 +529,7 @@ This will:
 
 # Remove shell integration from ~/.bashrc or ~/.zshrc
 # Delete or comment out:
-#   export HEADROOM_PORT=8787
+#   export HEADROOM_PROXY_PORT=8787
 #   source .../shell-integration.sh
 ```
 
