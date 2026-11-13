@@ -94,6 +94,25 @@ def _any_nonblank(lines: list[str], start: int, stop: int) -> bool:
     return any(lines[i].strip() for i in range(start, stop))
 
 
+# Line steps all JSON-block candidates of one pass may spend, per line of
+# content, plus a floor. Every candidate that never balances walks to the end of
+# the content, so N such lines cost N^2/2 steps; this caps the total at O(N).
+# Balanced blocks spend only their own length, so real content never nears it.
+_JSON_SCAN_STEPS_PER_LINE = 32
+_JSON_SCAN_STEPS_FLOOR = 1000
+
+
+@dataclass
+class _ScanBudget:
+    """Line steps left for one pass over ``lines`` (see _extract_json_block)."""
+
+    remaining: int
+
+    @classmethod
+    def for_lines(cls, lines: list[str]) -> _ScanBudget:
+        return cls(_JSON_SCAN_STEPS_PER_LINE * len(lines) + _JSON_SCAN_STEPS_FLOOR)
+
+
 def _has_valid_json_block_with_text(content: str) -> bool:
     """Return true when prose or log text wraps a valid JSON block."""
     lines = content.split("\n")
@@ -101,12 +120,13 @@ def _has_valid_json_block_with_text(content: str) -> bool:
     # _extract_json_block. Content that balances promptly never allocates it and
     # so pays nothing for it.
     scan_cache: dict[tuple[int, bool, bool], tuple[int, int, bool, bool]] | None = None
+    budget = _ScanBudget.for_lines(lines)
 
     for index, line in enumerate(lines):
         if not line.strip().startswith(("[", "{")):
             continue
 
-        json_content, end_index = _extract_json_block(lines, index, cache=scan_cache)
+        json_content, end_index = _extract_json_block(lines, index, cache=scan_cache, budget=budget)
         if json_content is None:
             if scan_cache is None:
                 scan_cache = {}
@@ -142,6 +162,7 @@ def split_into_sections(content: str, *, isolate: tuple[str, ...] = ()) -> list[
         return any(marker in text for marker in isolate)
 
     scan_cache: dict[tuple[int, bool, bool], tuple[int, int, bool, bool]] | None = None
+    scan_budget = _ScanBudget.for_lines(lines)
 
     i = 0
     while i < len(lines):
@@ -184,7 +205,9 @@ def split_into_sections(content: str, *, isolate: tuple[str, ...] = ()) -> list[
             continue
 
         if line.strip().startswith(("[", "{")):
-            json_content, end_i = _extract_json_block(lines, i, cache=scan_cache)
+            json_content, end_i = _extract_json_block(
+                lines, i, cache=scan_cache, budget=scan_budget
+            )
             if json_content is None and scan_cache is None:
                 # First scan that ran to the end without balancing: from here on
                 # every later candidate would re-walk the same tail.
@@ -341,6 +364,7 @@ def _extract_json_block(
     start: int,
     *,
     cache: dict[tuple[int, bool, bool], tuple[int, int, bool, bool]] | None = None,
+    budget: _ScanBudget | None = None,
 ) -> tuple[str | None, int]:
     """Extract a complete JSON object or array block from line-oriented content.
 
@@ -363,6 +387,11 @@ def _extract_json_block(
     Keyed on the entry state as well as the line, so a cached entry is only
     reused where the parser is in the same string/escape state. Same deltas,
     same result: this is a memo, not a heuristic.
+
+    ``budget`` (shared by all candidates of one pass, ``None`` = unlimited) is
+    spent one per line walked. When it runs out the block is reported as
+    unbalanced, which bounds the total work of many unclosed candidates (the
+    memo above does not: their counts differ at every line).
     """
     bracket_count = 0
     brace_count = 0
@@ -370,6 +399,10 @@ def _extract_json_block(
     escaped = False
 
     for i in range(start, len(lines)):
+        if budget is not None:
+            if budget.remaining <= 0:
+                return None, start
+            budget.remaining -= 1
         key = (i, in_string, escaped)
         step = cache.get(key) if cache is not None else None
         if step is None:
