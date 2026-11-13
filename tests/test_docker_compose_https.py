@@ -28,6 +28,13 @@ def test_headroom_requires_the_proxy_token_and_never_acknowledges_an_open_bind()
     assert "HEADROOM_ALLOW_UNAUTHENTICATED_BIND" not in env
 
 
+def test_compression_endpoints_accept_callers_relayed_by_caddy() -> None:
+    """Caddy reaches Headroom from a network address; without this the
+    compression endpoints answer 404 to every authenticated client."""
+    env = _services()["headroom"]["environment"]
+    assert env["HEADROOM_COMPRESS_ALLOW_REMOTE"] == "1"
+
+
 def test_caddy_forwards_to_the_headroom_service_not_loopback() -> None:
     """Headroom skips the token for loopback peers, so Caddy must reach it by
     service name from its own container, never through 127.0.0.1."""

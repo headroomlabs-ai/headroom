@@ -31,6 +31,10 @@ services:
       HOME: /home/nonroot
       HEADROOM_WORKSPACE_DIR: /home/nonroot/.headroom
       HEADROOM_CONFIG_DIR: /home/nonroot/.headroom/config
+      # Callers reach Headroom through Caddy, from a network address, so the
+      # compression endpoints (/v1/compress, /v1/usage) must accept non-local
+      # callers. The proxy token below still authenticates every request.
+      HEADROOM_COMPRESS_ALLOW_REMOTE: "1"
       # Required: callers reach Headroom through Caddy, from a network address.
       HEADROOM_PROXY_TOKEN: ${HEADROOM_PROXY_TOKEN:?set HEADROOM_PROXY_TOKEN, e.g. openssl rand -hex 32}
     # Reachable by Caddy on the compose network only; no host port.
