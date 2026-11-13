@@ -231,7 +231,7 @@ jobs:
         # ./tests: collecting ~10k modules on Windows took 91s and pulled in
         # unrelated import failures. Add a directory here if you mark a test
         # outside these paths.
-        run: pytest tests/test_learn tests/test_memory tests/test_memory_sync.py -m windows_newline --tb=short -q
+        run: pytest tests/test_learn tests/test_memory tests/test_memory_sync.py tests/test_proxy/test_cc_switch_reconciler.py -m windows_newline --tb=short -q
 
   python-314-wheels:
     # Partners on centrally managed machines cannot choose their Python, and

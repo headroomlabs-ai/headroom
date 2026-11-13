@@ -283,3 +283,24 @@ def test_enabled_flag(monkeypatch, val, expected):
 
     monkeypatch.setenv("HEADROOM_CC_SWITCH_RECONCILE", val)
     assert reconciler_enabled() is expected
+
+
+@pytest.mark.windows_newline
+def test_rewrite_pins_lf_newlines(tmp_path, monkeypatch):
+    import headroom.fsutil as fsutil
+
+    calls: list[dict] = []
+    real_fdopen = fsutil.os.fdopen
+
+    def fdopen(fd, *args, **kwargs):
+        calls.append(kwargs)
+        return real_fdopen(fd, *args, **kwargs)
+
+    monkeypatch.setattr(fsutil.os, "fdopen", fdopen)
+    r, sf, _ = _make(tmp_path)
+    _write(sf, _THIRD_PARTY)
+    assert r.tick() is True
+    assert [call.get("newline") for call in calls] == [""]
+    raw = sf.read_bytes()
+    assert b"\r" not in raw
+    assert raw.endswith(b"\n")
