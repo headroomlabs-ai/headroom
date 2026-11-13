@@ -536,6 +536,22 @@ class InMemoryGraphStore:
             entity_ids = self._entities_by_user.get(user_id, set())
             return [self._entities[eid] for eid in entity_ids if eid in self._entities]
 
+    async def get_relationships_for_user(self, user_id: str) -> list[Relationship]:
+        """Get all relationships for a user.
+
+        Args:
+            user_id: The user ID to get relationships for.
+
+        Returns:
+            List of all relationships belonging to the user.
+        """
+        with self._lock:
+            return [
+                relationship
+                for relationship in self._relationships.values()
+                if relationship.user_id == user_id
+            ]
+
     async def clear(self) -> None:
         """Clear all data from the store."""
         with self._lock:
