@@ -359,7 +359,7 @@ export class HeadroomContextEngine {
     if (!(this.cacheWindowMs() > 0)) return;
     try {
       this.compressedViews.set(params.sessionId, {
-        sourceKeys: params.messages.map(messageKey),
+        sourceKeys: this.sourceKeys(params),
         viewKeys: assembled.map(messageKey),
         messages: structuredClone(assembled),
         usedAt: Date.now(),
@@ -369,6 +369,21 @@ export class HeadroomContextEngine {
       this.compressedViews.delete(params.sessionId);
       this.logger.warn(`[headroom] Could not keep the compressed view: ${error}`);
     }
+  }
+
+  /**
+   * Fingerprints of the original messages behind `params.messages`. A caller may pass the previous view back in
+   * place of the originals it covers, but a transcript rebuilt later holds the originals, so a new view has to be
+   * matched against those: the previous view's sources, then the messages after the view.
+   */
+  private sourceKeys(params: { sessionId: string; messages: any[] }): string[] {
+    const keys = params.messages.map(messageKey);
+    const startsWith = (prefix: string[]) => prefix.length <= keys.length && prefix.every((key, i) => key === keys[i]);
+    const previous = this.compressedViews.get(params.sessionId);
+    if (previous && !startsWith(previous.sourceKeys) && startsWith(previous.viewKeys)) {
+      return [...previous.sourceKeys, ...keys.slice(previous.viewKeys.length)];
+    }
+    return keys;
   }
 
   /**

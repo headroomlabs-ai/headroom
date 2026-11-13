@@ -209,6 +209,41 @@ describe("the compressed history stays put while the prompt cache is warm", () =
     expect(bytes(next.messages.slice(0, 6))).toBe(bytes(shrunk.messages));
   });
 
+  it("maps a compression of passed-back compressed messages to the originals, for a transcript rebuilt later", async () => {
+    mocked.compress.mockImplementation(compressing); // reports 2000 tokens before
+    const e = engine();
+    const t1 = turn(10 * MIN, "t1");
+    const cold = await e.assemble({ sessionId: "s", messages: t1 });
+
+    // OpenClaw passes the compressed t1 back, and the history has to shrink to fit the budget.
+    const t2 = turn(MIN, "t2");
+    const shrunk = await e.assemble({ sessionId: "s", messages: [...structuredClone(cold.messages), ...t2], tokenBudget: 1500 });
+    expect(shrunk.messages[5].content).toEqual(COMPRESSED);
+
+    // A later turn rebuilt from the transcript (the originals) still gets the latest compressed messages.
+    const t3 = turn(10_000, "t3");
+    const rebuilt = await e.assemble({ sessionId: "s", messages: [...t1, ...t2, ...t3] });
+    expect(bytes(rebuilt.messages.slice(0, 6))).toBe(bytes(shrunk.messages));
+    expect(rebuilt.messages.slice(6)).toEqual(normalizeAgentMessages(t3));
+  });
+
+  it("keeps that mapping across successive compressions of passed-back messages", async () => {
+    mocked.compress.mockImplementation(compressing); // reports 2000 tokens before
+    const e = engine();
+    const t1 = turn(10 * MIN, "t1");
+    const cold = await e.assemble({ sessionId: "s", messages: t1 });
+
+    const t2 = turn(2 * MIN, "t2");
+    const second = await e.assemble({ sessionId: "s", messages: [...structuredClone(cold.messages), ...t2], tokenBudget: 1500 });
+    const t3 = turn(MIN, "t3");
+    const third = await e.assemble({ sessionId: "s", messages: [...structuredClone(second.messages), ...t3], tokenBudget: 1500 });
+    expect(mocked.compress).toHaveBeenCalledTimes(3);
+    expect(third.messages[8].content).toEqual(COMPRESSED);
+
+    const rebuilt = await e.assemble({ sessionId: "s", messages: [...t1, ...t2, ...t3, ...turn(10_000, "t4")] });
+    expect(bytes(rebuilt.messages.slice(0, 9))).toBe(bytes(third.messages));
+  });
+
   it("keeps the compressed messages when a warm history near the budget still fits", async () => {
     mocked.compress.mockImplementation(compressing); // reports 2000 tokens before
     const e = engine();
