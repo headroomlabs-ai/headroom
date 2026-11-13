@@ -574,3 +574,51 @@ async def test_direct_write_then_mem0_search_round_trip(tmp_path) -> None:
     native_hit = next(r for r in native if r.memory.content == "native mem0 fact")
     assert native_hit.memory.metadata == {}
     assert native_hit.memory.user_id == user_id
+
+
+def _graph_adapter() -> tuple[DirectMem0Adapter, MagicMock]:
+    adapter = _adapter()
+    session = MagicMock()
+    driver = MagicMock()
+    driver.session.return_value.__enter__.return_value = session
+    adapter._neo4j_driver = driver
+    adapter._embed = lambda text: [0.0]  # type: ignore[method-assign]
+    return adapter, session
+
+
+def _merged_relationship(session: MagicMock) -> str:
+    cypher = session.run.call_args.args[0]
+    return cypher.split("MERGE (source)-[r:", 1)[1].split("]->(dest)", 1)[0]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    [
+        ("Works At", "`works_at`"),
+        ("is-a", "`is_a`"),
+        ("reports to (since 2020)", "`reports_to_since_2020`"),
+        ("a`b]->(c)\nd", "`a_b_c_d`"),
+        ("a" * 100, "`" + "a" * 64 + "`"),
+    ],
+)
+async def test_write_graph_relationship_type_is_a_single_identifier(
+    raw: str, expected: str
+) -> None:
+    adapter, session = _graph_adapter()
+    rels = [{"source": "user", "relationship": raw, "destination": "x"}]
+
+    await adapter._write_graph_to_neo4j([], rels, "u1")
+
+    session.run.assert_called_once()
+    assert _merged_relationship(session) == expected
+
+
+@pytest.mark.asyncio
+async def test_write_graph_skips_relationship_with_no_usable_type() -> None:
+    adapter, session = _graph_adapter()
+    rels = [{"source": "user", "relationship": " ]-> ", "destination": "x"}]
+
+    await adapter._write_graph_to_neo4j([], rels, "u1")
+
+    session.run.assert_not_called()

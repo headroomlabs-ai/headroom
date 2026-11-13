@@ -52,6 +52,7 @@ import hashlib
 import inspect
 import logging
 import os
+import re
 import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -65,6 +66,17 @@ from headroom.memory.ports import MemorySearchResult
 from headroom.offline import guard_egress
 
 logger = logging.getLogger(__name__)
+
+# Neo4j cannot bind a relationship type as a query parameter, so the type is
+# written into the Cypher text. Anything that is not a word character becomes
+# "_" so the value can only ever be a single identifier.
+_REL_TYPE_NON_WORD = re.compile(r"\W+")
+_REL_TYPE_MAX_LEN = 64
+
+
+def _relationship_type(raw: str) -> str:
+    """Normalise a relationship label to a Cypher-safe identifier ("" if none)."""
+    return _REL_TYPE_NON_WORD.sub("_", raw.lower()).strip("_")[:_REL_TYPE_MAX_LEN]
 
 
 def _utcnow() -> datetime:
@@ -527,10 +539,14 @@ class DirectMem0Adapter:
         # Normalize relationships
         normalized_rels = []
         for rel in relationships:
+            rel_type = _relationship_type(rel["relationship"])
+            if not rel_type:
+                logger.warning("Skipping relationship with an empty type after normalisation")
+                continue
             normalized_rels.append(
                 {
                     "source": rel["source"].lower().replace(" ", "_"),
-                    "relationship": rel["relationship"].lower().replace(" ", "_"),
+                    "relationship": rel_type,
                     "destination": rel["destination"].lower().replace(" ", "_"),
                 }
             )
@@ -573,9 +589,9 @@ class DirectMem0Adapter:
                     WITH source, dest
                     CALL db.create.setNodeVectorProperty(dest, 'embedding', $dest_embedding)
                     WITH source, dest
-                    MERGE (source)-[r:"""
+                    MERGE (source)-[r:`"""
                         + relationship
-                        + """]->(dest)
+                        + """`]->(dest)
                     ON CREATE SET
                         r.created = timestamp(),
                         r.mentions = 1
