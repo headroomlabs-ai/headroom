@@ -1115,13 +1115,18 @@ def test_openai_chat_custom_base_reports_zai_as_outcome_provider(
     assert captured.get("outcome_provider") == "zai"
 
 
+async def _always_safe(url: str) -> bool:
+    """Stand-in for the async upstream guard the chat handler awaits."""
+    return True
+
+
 def test_openai_chat_outcome_provider_uses_the_fixed_taxonomy(
     monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path
 ) -> None:
     """Buffered chat labels each custom base from the fixed set, never the host."""
     # Keep the SSRF guard out of the way: these hosts are deliberately
     # unresolvable, and a DNS miss makes the handler ignore the override.
-    monkeypatch.setattr("headroom.proxy.handlers.openai.is_safe_upstream_url", lambda url: True)
+    monkeypatch.setattr("headroom.proxy.handlers.openai.is_safe_upstream_url_async", _always_safe)
     # Keep the lifetime savings store out of the user's real on-disk state.
     monkeypatch.setenv("HEADROOM_SAVINGS_PATH", str(tmp_path / "savings.json"))
     with _make_proxy_client() as client:
@@ -1196,7 +1201,7 @@ def test_openai_chat_custom_base_flood_cannot_grow_the_provider_set(
     limited_auth = "Bearer rate-limited"
     # The flood hosts are unresolvable on purpose; without this stub the SSRF
     # guard would drop the override and relabel the flood as "openai".
-    monkeypatch.setattr("headroom.proxy.handlers.openai.is_safe_upstream_url", lambda url: True)
+    monkeypatch.setattr("headroom.proxy.handlers.openai.is_safe_upstream_url_async", _always_safe)
     # Bucket by the raw credential so the stub limiter below can refuse just
     # ``limited_auth``; the identity rule itself is covered by its own tests.
     monkeypatch.setattr(
