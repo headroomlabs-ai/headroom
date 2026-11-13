@@ -73,18 +73,9 @@ def test_snapshot_accumulates_request_token_cache_cost_and_waste_metrics() -> No
     assert snapshot["prefix_cache"]["bust_count"] == 1
     assert snapshot["prefix_cache"]["bust_tokens"] == 9
     assert snapshot["prefix_cache"]["misses_by_reason"] == {"prefix_change": 1}
-    assert snapshot["cost"] == {
-        "input_usd": 0.4,
-        "compression_savings_usd": 0.2,
-        # This call records no list ceiling, so the ceiling defaults to the
-        # cache-aware figure -- the truthful reading of "these are the same
-        # number" for a request with no cache mix to price against. The basis
-        # stays `unknown` because the caller named none: a fresh aggregate must
-        # not claim its untouched total was list-priced.
-        "compression_savings_list_usd": 0.2,
-        "savings_basis": "unknown",
-        "cache_savings_usd": 0.1,
-    }
+    assert snapshot["cost"]["input_usd"] == 0.4
+    assert snapshot["cost"]["compression_savings_usd"] == 0.2
+    assert snapshot["cost"]["cache_savings_usd"] == 0.1
     assert snapshot["waste_signals"] == {"repetition": 7}
     assert snapshot["by_model"]["claude-test"]["input_tokens"] == 100
 

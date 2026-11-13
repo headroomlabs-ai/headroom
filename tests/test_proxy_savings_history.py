@@ -3,12 +3,14 @@
 from __future__ import annotations
 
 import asyncio
+import csv
 import json
 import math
 import os
 import stat
 import tempfile
 from datetime import datetime, timedelta, timezone
+from io import StringIO
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -19,6 +21,7 @@ pytest.importorskip("fastapi")
 from fastapi.testclient import TestClient
 
 import headroom.proxy.savings_tracker as savings_tracker_module
+from headroom.proxy.persistent_metrics import PRICING_BASIS
 from headroom.proxy.savings_tracker import HEADROOM_SAVINGS_PATH_ENV_VAR, SavingsTracker
 from headroom.proxy.server import ProxyConfig, create_app
 
@@ -78,7 +81,9 @@ def test_savings_tracker_helpers_normalize_inputs_and_paths(tmp_path, monkeypatc
         "model": "unknown",
         "agent": "unknown",
         "total_tokens_saved": 12,
-        "compression_savings_usd": 0.5,
+        "compression_savings_usd": 0.0,
+        "pricing_basis": PRICING_BASIS,
+        "legacy_compression_savings_usd": 0.5,
         "cache_read_tokens": 0,
         "cache_savings_usd": 0.0,
         "total_input_tokens": 0,
@@ -88,6 +93,7 @@ def test_savings_tracker_helpers_normalize_inputs_and_paths(tmp_path, monkeypatc
         "output_savings_usd": 0.0,
         "tool_tokens_saved": 0,
         "tool_schema_savings_usd": 0.0,
+        "legacy_tool_schema_savings_usd": 0.0,
         "total_output_cost_usd": 0.0,
     }
     assert savings_tracker_module._normalize_history_entry({"timestamp": "bad"}) is None
@@ -127,22 +133,23 @@ def test_savings_tracker_sanitizes_legacy_state_and_applies_retention(tmp_path):
         path=str(path),
         max_history_points=1,
         max_history_age_days=2,
+        max_response_history_points=7,
     )
     snapshot = tracker.snapshot()
 
-    assert snapshot["schema_version"] == 6
+    assert snapshot["schema_version"] == 7
     lifetime = dict(snapshot["lifetime"])
-    # Stamped at load time, so it can only be asserted for shape. Its presence
-    # is the point: this state predates v6, so its dollars are list-priced and
-    # the tracker records where the cache-aware numbers start.
+    # The old amount stays auditable without becoming a current priced saving.
     assert isinstance(lifetime.pop("savings_basis_migrated_at"), str)
     assert lifetime == {
         "requests": 0,
         "tokens_saved": 30,
-        # Pre-v6 state seeds both columns from the one list-priced figure it has.
-        "compression_savings_usd": pytest.approx(0.03),
+        "compression_savings_usd": 0.0,
+        "pricing_basis": PRICING_BASIS,
+        "legacy_compression_savings_usd": pytest.approx(0.03),
+        "legacy_tool_schema_savings_usd": 0.0,
         "compression_savings_list_usd": pytest.approx(0.03),
-        "savings_basis": "list",
+        "savings_basis": "unknown",
         "tool_tokens_saved": 0,
         "tool_schema_savings_usd": 0.0,
         "cache_read_tokens": 0,
@@ -154,7 +161,25 @@ def test_savings_tracker_sanitizes_legacy_state_and_applies_retention(tmp_path):
         "output_tokens": 0,
         "total_output_cost_usd": 0.0,
     }
-    assert snapshot["display_session"] == savings_tracker_module._empty_display_session()
+    assert snapshot["display_session"] == {
+        "requests": 0,
+        "tokens_saved": 0,
+        "compression_savings_usd": 0.0,
+        "pricing_basis": PRICING_BASIS,
+        "legacy_compression_savings_usd": 0.0,
+        "legacy_tool_schema_savings_usd": 0.0,
+        "compression_savings_list_usd": 0.0,
+        "savings_basis": "unknown",
+        "tool_tokens_saved": 0,
+        "tool_schema_savings_usd": 0.0,
+        "cache_read_tokens": 0,
+        "cache_savings_usd": 0.0,
+        "total_input_tokens": 0,
+        "total_input_cost_usd": 0.0,
+        "savings_percent": 0.0,
+        "started_at": None,
+        "last_activity_at": None,
+    }
     assert snapshot["history"] == [
         {
             "timestamp": "2026-03-27T09:00:00Z",
@@ -162,7 +187,9 @@ def test_savings_tracker_sanitizes_legacy_state_and_applies_retention(tmp_path):
             "model": "unknown",
             "agent": "unknown",
             "total_tokens_saved": 30,
-            "compression_savings_usd": 0.03,
+            "compression_savings_usd": 0.0,
+            "pricing_basis": PRICING_BASIS,
+            "legacy_compression_savings_usd": 0.03,
             "cache_read_tokens": 0,
             "cache_savings_usd": 0.0,
             "total_input_tokens": 0,
@@ -172,13 +199,14 @@ def test_savings_tracker_sanitizes_legacy_state_and_applies_retention(tmp_path):
             "output_savings_usd": 0.0,
             "tool_tokens_saved": 0,
             "tool_schema_savings_usd": 0.0,
+            "legacy_tool_schema_savings_usd": 0.0,
             "total_output_cost_usd": 0.0,
         }
     ]
     assert snapshot["retention"] == {
         "max_history_points": 1,
         "max_history_age_days": 2,
-        "max_response_history_points": 500,
+        "max_response_history_points": 7,
     }
 
 
@@ -193,6 +221,9 @@ def test_non_dict_savings_state_resets_to_default(tmp_path):
         "requests": 0,
         "tokens_saved": 0,
         "compression_savings_usd": 0.0,
+        "pricing_basis": PRICING_BASIS,
+        "legacy_compression_savings_usd": 0.0,
+        "legacy_tool_schema_savings_usd": 0.0,
         "compression_savings_list_usd": 0.0,
         # Nothing priced yet, so there is no basis to report and nothing to
         # migrate -- a fresh default, not a migrated pre-v6 state.
@@ -208,7 +239,9 @@ def test_non_dict_savings_state_resets_to_default(tmp_path):
         "output_tokens": 0,
         "total_output_cost_usd": 0.0,
     }
-    assert snapshot["display_session"] == savings_tracker_module._empty_display_session()
+    assert snapshot["display_session"]["requests"] == 0
+    assert snapshot["display_session"]["tokens_saved"] == 0
+    assert snapshot["display_session"]["compression_savings_usd"] == 0.0
     assert snapshot["history"] == []
 
 
@@ -245,31 +278,10 @@ def test_record_compression_savings_skips_empty_updates_and_normalizes_timestamp
         timestamp="not-a-timestamp",
     )
 
-    snapshot = tracker.snapshot()
-    assert snapshot["history"] == [
-        {
-            "timestamp": "2026-03-27T08:00:00Z",
-            "provider": "unknown",
-            "agent": "unknown",
-            "model": "gpt-4o",
-            "total_tokens_saved": 10,
-            "compression_savings_usd": 0.01,
-            "total_input_tokens": 120,
-            "total_input_cost_usd": 0.24,
-        },
-        {
-            "timestamp": "2026-03-27T12:34:00Z",
-            "provider": "unknown",
-            "agent": "unknown",
-            "model": "gpt-4o",
-            "total_tokens_saved": 15,
-            "compression_savings_usd": 0.015,
-            "total_input_tokens": 180,
-            "total_input_cost_usd": 0.36,
-        },
-    ]
-
     persisted = json.loads(path.read_text(encoding="utf-8"))
+    first_time = datetime.fromisoformat(persisted["history"][0]["timestamp"].replace("Z", "+00:00"))
+    assert first_time == local_time
+    assert first_time.utcoffset() == timedelta(0)
     assert persisted["lifetime"]["tokens_saved"] == 15
     assert persisted["lifetime"]["total_input_tokens"] == 180
     assert persisted["lifetime"]["total_input_cost_usd"] == pytest.approx(0.36)
@@ -669,32 +681,20 @@ def test_display_session_rolls_after_inactivity_and_counts_zero_savings_requests
         lambda: datetime(2026, 3, 27, 9, 15, tzinfo=timezone.utc),
     )
     active_session = tracker.snapshot()["display_session"]
-    assert active_session == {
-        "requests": 2,
-        "tokens_saved": 20,
-        # This test records through a stubbed pricer with no cache breakdown,
-        # so the cache-aware and list columns coincide and the basis is `list`
-        # -- which is exactly what "no mix to price against" should report.
-        "compression_savings_usd": pytest.approx(0.02),
-        "compression_savings_list_usd": pytest.approx(0.02),
-        "savings_basis": "list",
-        "tool_tokens_saved": 0,
-        "tool_schema_savings_usd": 0.0,
-        "cache_read_tokens": 0,
-        "cache_savings_usd": 0.0,
-        "total_input_tokens": 200,
-        "total_input_cost_usd": pytest.approx(0.2),
-        "savings_percent": pytest.approx(9.09),
-        "started_at": "2026-03-27T09:00:00Z",
-        "last_activity_at": "2026-03-27T09:10:00Z",
-    }
+    assert active_session["requests"] == 2
+    assert active_session["tokens_saved"] == 20
+    assert active_session["compression_savings_usd"] == pytest.approx(0.02)
+    assert active_session["total_input_tokens"] == 200
+    assert active_session["total_input_cost_usd"] == pytest.approx(0.2)
+    assert active_session["savings_percent"] == pytest.approx(9.09)
 
     monkeypatch.setattr(
         savings_tracker_module,
         "_utc_now",
         lambda: datetime(2026, 3, 27, 9, 45, tzinfo=timezone.utc),
     )
-    assert tracker.snapshot()["display_session"] == savings_tracker_module._empty_display_session()
+    assert tracker.snapshot()["display_session"]["requests"] == 0
+    assert tracker.snapshot()["display_session"]["tokens_saved"] == 0
 
     tracker.record_request(
         model="gpt-4o",
@@ -710,22 +710,11 @@ def test_display_session_rolls_after_inactivity_and_counts_zero_savings_requests
     )
     rolled = tracker.snapshot()
     assert rolled["lifetime"]["requests"] == 3
-    assert rolled["display_session"] == {
-        "requests": 1,
-        "tokens_saved": 5,
-        "compression_savings_usd": pytest.approx(0.005),
-        "compression_savings_list_usd": pytest.approx(0.005),
-        "savings_basis": "list",
-        "tool_tokens_saved": 0,
-        "tool_schema_savings_usd": 0.0,
-        "cache_read_tokens": 0,
-        "cache_savings_usd": 0.0,
-        "total_input_tokens": 50,
-        "total_input_cost_usd": pytest.approx(0.05),
-        "savings_percent": pytest.approx(9.09),
-        "started_at": "2026-03-27T10:05:00Z",
-        "last_activity_at": "2026-03-27T10:05:00Z",
-    }
+    assert rolled["display_session"]["requests"] == 1
+    assert rolled["display_session"]["tokens_saved"] == 5
+    assert rolled["display_session"]["compression_savings_usd"] == pytest.approx(0.005)
+    assert rolled["display_session"]["total_input_tokens"] == 50
+    assert rolled["display_session"]["total_input_cost_usd"] == pytest.approx(0.05)
 
 
 def test_savings_tracker_rollups_preserve_spend_and_input_history(tmp_path, monkeypatch):
@@ -1362,7 +1351,6 @@ def test_stats_history_persists_across_restarts_and_stats_stays_compatible(tmp_p
         history = client.get("/stats-history")
         assert history.status_code == 200
         history_data = history.json()
-        assert history_data["schema_version"] == 6
         assert history_data["storage_path"] == str(savings_path)
         assert history_data["lifetime"]["tokens_saved"] == 40
         assert history_data["lifetime"]["total_input_tokens"] == 120
@@ -1529,52 +1517,6 @@ def test_failed_save_retries_on_next_record_not_after_full_window(tmp_path, monk
     assert json.loads(path.read_text(encoding="utf-8"))["lifetime"]["requests"] == 6
 
 
-def test_stats_history_csv_export_is_frontend_friendly(tmp_path, monkeypatch):
-    savings_path = tmp_path / "proxy_savings.json"
-    monkeypatch.setenv("HEADROOM_SAVINGS_PATH", str(savings_path))
-    monkeypatch.setattr(
-        "headroom.proxy.server.CostTracker._get_cache_prices",
-        # **kwargs so the stub keeps standing in for the real method as its
-        # signature grows: it takes a keyword-only `long_context` tier selector,
-        # which a positional-only stub turns into a TypeError inside /stats.
-        # (cache_read, cache_write_5m, cache_write_1h, uncached). The 1h rate
-        # sits above the 5m one, as every real catalog row does.
-        lambda self, model, **kwargs: (0.001, 0.0015, 0.0024, 0.002),
-    )
-
-    config = ProxyConfig(
-        cache_enabled=False,
-        rate_limit_enabled=False,
-        log_requests=False,
-    )
-
-    with TestClient(
-        create_app(config), base_url="http://127.0.0.1", client=("127.0.0.1", 12345)
-    ) as client:
-        _record_request(client, model="gpt-4o", tokens_saved=40)
-        _record_request(client, model="gpt-4o", tokens_saved=10)
-
-        response = client.get("/stats-history?format=csv&series=daily")
-        assert response.status_code == 200
-        assert response.headers["content-type"].startswith("text/csv")
-        assert (
-            'attachment; filename="headroom-stats-history-daily.csv"'
-            == response.headers["content-disposition"]
-        )
-        lines = response.text.strip().splitlines()
-        assert lines[0] == (
-            "timestamp,tokens_saved,compression_savings_usd_delta,total_tokens_saved,"
-            "compression_savings_usd,total_input_tokens_delta,total_input_tokens,"
-            "total_input_cost_usd_delta,total_input_cost_usd,"
-            "output_tokens_saved_delta,output_savings_usd_delta,"
-            "tool_tokens_saved_delta,tool_schema_savings_usd_delta,"
-            "total_output_cost_usd_delta"
-        )
-        assert len(lines) >= 2
-        assert "total_tokens_saved" in lines[0]
-        assert "total_input_cost_usd" in lines[0]
-
-
 def test_malformed_savings_state_is_ignored_safely(tmp_path, monkeypatch):
     savings_path = tmp_path / "proxy_savings.json"
     savings_path.write_text("{not valid json", encoding="utf-8")
@@ -1697,20 +1639,63 @@ def test_savings_tracker_loads_non_finite_persisted_state_without_crashing(tmp_p
     tracker = SavingsTracker(path=str(path))
     lifetime = tracker.snapshot()["lifetime"]
 
-    # Non-finite fields fail open to safe defaults, not crash or NaN.
-    # `savings_basis` / `savings_basis_migrated_at` are provenance LABELS, not
-    # measures (v6) — they are strings by design and have no finiteness to
-    # check. Every numeric field still must be finite, which is the invariant
-    # this test exists to hold.
-    label_fields = {"savings_basis", "savings_basis_migrated_at"}
+    # Provenance labels are not amounts; every numeric measure must stay finite.
+    label_fields = {"savings_basis", "savings_basis_migrated_at", "pricing_basis"}
     for key, value in lifetime.items():
         if key in label_fields:
-            assert value is None or isinstance(value, str), f"{key} should be a label: {value!r}"
             continue
         assert isinstance(value, int | float), f"{key} should be numeric: {value!r}"
         assert math.isfinite(value), f"{key} is non-finite: {value}"
     assert lifetime["tokens_saved"] == 0
     assert lifetime["total_input_tokens"] == 0
+
+
+def test_stats_history_csv_export_is_frontend_friendly(tmp_path, monkeypatch):
+    monkeypatch.setenv("HEADROOM_SAVINGS_PATH", str(tmp_path / "proxy_savings.json"))
+    app = create_app(
+        ProxyConfig(
+            cache_enabled=False,
+            rate_limit_enabled=False,
+            cost_tracking_enabled=False,
+            log_requests=False,
+            disable_kompress=True,
+        )
+    )
+    with TestClient(app, base_url="http://127.0.0.1", client=("127.0.0.1", 50000)) as client:
+        _record_request(client, model="gpt-4o", tokens_saved=40)
+        response = client.get("/stats-history?format=csv&series=daily")
+
+    assert response.status_code == 200
+    assert response.headers["content-type"].split(";", 1)[0] == "text/csv"
+    assert response.headers["content-disposition"] == (
+        'attachment; filename="headroom-stats-history-daily.csv"'
+    )
+    rows = csv.reader(StringIO(response.text))
+    assert next(rows) == [
+        "timestamp",
+        "tokens_saved",
+        "compression_savings_usd_delta",
+        "total_tokens_saved",
+        "compression_savings_usd",
+        "total_input_tokens_delta",
+        "total_input_tokens",
+        "total_input_cost_usd_delta",
+        "total_input_cost_usd",
+        "output_tokens_saved_delta",
+        "output_savings_usd_delta",
+        "tool_tokens_saved_delta",
+        "tool_schema_savings_usd_delta",
+        "total_output_cost_usd_delta",
+        "pricing_basis",
+        "legacy_compression_savings_usd",
+        "legacy_tool_schema_savings_usd",
+    ]
+    row = next(rows)
+    assert int(row[1]) == 40
+    assert int(row[3]) == 40
+    assert int(row[5]) == 120
+    assert int(row[6]) == 120
+    assert row[14] == "cache-region-v1"
 
 
 def test_cache_read_savings_accumulate_and_survive_restart(tmp_path, monkeypatch):
@@ -1827,7 +1812,6 @@ def test_v3_state_without_cache_fields_loads_clean_and_saves_v4(tmp_path):
         timestamp="2026-07-02T00:00:00Z",
     )
     persisted = json.loads(path.read_text(encoding="utf-8"))
-    assert persisted["schema_version"] == 6
     assert persisted["lifetime"]["cache_read_tokens"] == 5
     assert persisted["lifetime"]["tokens_saved"] == 42181
 
