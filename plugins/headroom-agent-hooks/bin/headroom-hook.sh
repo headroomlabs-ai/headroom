@@ -33,8 +33,11 @@ try_python() {
     elif [ ! -x "$candidate" ]; then
         return
     fi
-    if "$candidate" -c 'import headroom' >/dev/null 2>&1; then
-        exec "$candidate" -m headroom.cli init hook ensure
+    # -P keeps the current directory (the user's project) off sys.path, so only
+    # an installed headroom is imported. Interpreters older than 3.11 reject -P
+    # and are skipped; headroom-ai needs 3.11+ anyway.
+    if "$candidate" -P -c 'import headroom' >/dev/null 2>&1; then
+        exec "$candidate" -P -m headroom.cli init hook ensure
     fi
 }
 
