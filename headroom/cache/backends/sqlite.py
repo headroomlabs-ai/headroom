@@ -372,17 +372,24 @@ class SQLiteBackend:
 
         ``get``/``exists`` degrade a read failure to a miss, so a caller that
         would delete data on a miss needs this to tell an outage from a real
-        absence. Mirrors ``_connection``: a held handle means reads work.
+        absence. A held handle is not proof: a read error that is not file
+        corruption keeps it open, so this can only disagree with
+        :meth:`live` returning ``None``, which is the authoritative signal.
         """
         with self._lock:
             return self._conn is not None
 
-    def live(self, hash_key: str) -> bool:
-        """Whether the entry is there and unexpired, without reading its blob.
+    def live(self, hash_key: str) -> bool | None:
+        """Whether the entry is there and unexpired; ``None`` when unknown.
 
         ``get`` deserializes the whole original, which is megabytes for a large
         tool output; the liveness check only needs the row and its TTL, both of
         which are columns.
+
+        A failed probe answers ``None``, never ``False``: a transient read error
+        keeps the handle (``_handle_db_error`` does not close it for anything
+        but corruption), so ``available()`` stays True and the caller could not
+        otherwise tell "gone" from "could not ask".
         """
         with self._lock:
             try:
@@ -393,7 +400,7 @@ class SQLiteBackend:
                 ).fetchone()
             except sqlite3.DatabaseError as e:
                 self._handle_db_error(e, f"live {safe_id(hash_key)}")
-                return False
+                return None
         return row is not None
 
     def exists(self, hash_key: str) -> bool:

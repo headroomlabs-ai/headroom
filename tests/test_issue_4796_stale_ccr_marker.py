@@ -135,6 +135,84 @@ def test_all_live_reports_a_backend_that_cannot_answer():
     assert live.all_live({hash_key}) is True
 
 
+def test_all_live_carries_a_probe_that_cannot_answer():
+    """A key-only probe that fails answers unknown, not a miss.
+
+    A backend may keep a usable handle while the probe itself fails, so
+    ``available()`` cannot be the only signal: the probe's own ``None`` has to
+    survive ``all_live`` even when the backend still looks reachable.
+    """
+
+    class FlakyProbe(InMemoryBackend):
+        def live(self, hash_key):
+            return None
+
+        def available(self):
+            return True
+
+    store = CompressionStore(max_entries=4, backend=FlakyProbe())
+    hash_key = store.store("an original", "a compressed view")
+    assert store.all_live({hash_key}) is None
+
+
+def test_sqlite_probe_failure_reads_as_unknown_not_evicted(tmp_path):
+    """A failed SQLite read must not cost the router its cached result.
+
+    Regression for the reproduced read failure: the authorizer denies the
+    probe's SELECT while the connection stays open, so ``available()`` is
+    still True. Reading that as an eviction dropped a result whose original was
+    readable again once the denial lifted.
+    """
+    sqlite3 = pytest.importorskip("sqlite3")
+    from headroom.cache.backends.sqlite import SQLiteBackend
+
+    backend = SQLiteBackend(tmp_path / "store.db")
+    store = CompressionStore(max_entries=4, backend=backend)
+    hash_key = store.store("the original tool output", "the compressed view")
+
+    assert store.all_live([hash_key]) is True
+    assert backend.available() is True
+
+    backend._conn.set_authorizer(lambda *args: sqlite3.SQLITE_DENY)
+    try:
+        result = store.all_live([hash_key])
+        still_open = backend.available()
+    finally:
+        backend._conn.set_authorizer(None)
+
+    assert still_open is True, "the handle survives a transient read failure"
+    assert store.exists(hash_key), "the original survived the failed probe"
+    assert result is None, "a failed probe is unknown, not an eviction"
+    assert store.all_live([hash_key]) is True, "and the store works again after recovery"
+
+
+def test_sqlite_probe_failure_keeps_a_cached_result(tmp_path):
+    """The router therefore still serves the cached result during the outage."""
+    sqlite3 = pytest.importorskip("sqlite3")
+    from headroom.cache.backends.sqlite import SQLiteBackend
+
+    backend = SQLiteBackend(tmp_path / "store.db")
+    store = CompressionStore(max_entries=4, backend=backend)
+    set_request_compression_store(store)
+    try:
+        hash_key = store.store("the original tool output", "the compressed view")
+        cache = CompressionCache()
+        cache.put("k", f"head <<ccr:{hash_key}>>", 0.2, "x")
+        assert cache.get("k") is not None
+
+        backend._conn.set_authorizer(lambda *args: sqlite3.SQLITE_DENY)
+        try:
+            result = cache.get("k")
+        finally:
+            backend._conn.set_authorizer(None)
+
+        assert result is not None, "an unanswered check is not a miss"
+        assert cache.stats["cache_evictions"] == 0
+        assert store.exists(hash_key), "the original is untouched"
+    finally:
+        clear_request_compression_store()
+
+
 def test_every_marker_shape_is_read_for_its_hash():
     assert _ccr_marker_hashes(
         "a <<ccr:abcdef012345>> b <<ccr:1234567890ab,base64,2.0KB>> "
