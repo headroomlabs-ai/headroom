@@ -18,6 +18,7 @@ from headroom.proxy.auth_mode import classify_client, supports_mid_turn_coalesci
 from headroom.proxy.handlers._debug_dump import write_upstream_error_dump
 from headroom.proxy.helpers import (
     RETRYABLE_OVERLOAD_STATUSES,
+    _path_for_log,
     jitter_delay_ms,
     overload_retry_is_futile,
     parse_sse_events_from_byte_buffer,
@@ -1584,7 +1585,7 @@ class StreamingMixin:
                 "[%s] Upstream provider returned an error; forwarding it to the client status=%s url=%s",
                 request_id,
                 upstream_response.status_code,
-                url,
+                _path_for_log(url),
             )
             # Diagnostic dump of the erroring request — parity with the
             # non-streaming handlers, which dump on >=400 but never fire for a
@@ -1620,7 +1621,7 @@ class StreamingMixin:
                     "[%s] Failed reading upstream error body status=%s url=%s error=%s",
                     request_id,
                     upstream_response.status_code,
-                    url,
+                    _path_for_log(url),
                     read_error,
                 )
                 error_content = json.dumps(

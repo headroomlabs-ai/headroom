@@ -190,6 +190,7 @@ from headroom.proxy.project_context import (
 )
 from headroom.proxy.project_policy import split_project_path
 from headroom.proxy.prometheus_metrics import PrometheusMetrics
+from headroom.proxy.query_log_policy import redact_query_string_for_log
 from headroom.proxy.rate_limiter import TokenBucketRateLimiter
 from headroom.proxy.request_body_limit import RequestBodyLimitMiddleware
 from headroom.proxy.request_logger import RequestLogger
@@ -4370,7 +4371,7 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
             inbound_id,
             method,
             path,
-            query,
+            redact_query_string_for_log(query),
             client_addr,
             request.headers.get("content-length", ""),
             json.dumps(safe_headers, ensure_ascii=False, default=str),
