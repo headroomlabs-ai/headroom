@@ -1048,8 +1048,45 @@ def test_remove_managed_opencode_provider_keeps_user_entries() -> None:
     headroom = data["provider"]["headroom"]
     assert headroom["models"] == {"user-model": {"name": "User"}}
     assert headroom["options"] == {"apiKey": "secret"}
+    assert headroom["npm"] == "@ai-sdk/openai-compatible"
+    assert headroom["name"] == "Headroom Proxy"
     assert data["provider"]["anthropic"] == {"options": {"timeout": 5}}
     assert data["theme"] == "dark"
+
+
+def test_remove_managed_opencode_provider_keeps_an_edited_provider_identity() -> None:
+    """An npm/name the user edited survives unwrap (#2364).
+
+    The reported case: wrap a config that did not exist, edit only
+    ``provider.headroom.npm`` and ``.name``, then unwrap. The edited values are
+    the user's own provider identity, so removing them emptied the config file
+    even though the user had made it theirs.
+    """
+    from headroom.providers.opencode.config import (
+        OpencodeManagedState,
+        remove_managed_opencode_provider,
+    )
+
+    state = OpencodeManagedState(
+        created_file=True,
+        managed_base_url="http://127.0.0.1:8787/v1",
+        managed_models={"gpt-4o": {"name": "GPT-4o"}},
+    )
+    data = {
+        "provider": {
+            "headroom": {
+                "npm": "@ai-sdk/my-fork",
+                "name": "My Local Gateway",
+                "options": {"baseURL": "http://127.0.0.1:8787/v1"},
+                "models": {"gpt-4o": {"name": "GPT-4o"}},
+            }
+        }
+    }
+
+    assert remove_managed_opencode_provider(data, state) is True
+    assert data == {
+        "provider": {"headroom": {"npm": "@ai-sdk/my-fork", "name": "My Local Gateway"}}
+    }
 
 
 def test_remove_managed_opencode_provider_drops_the_empty_provider() -> None:

@@ -60,6 +60,11 @@ HEADROOM_OPENCODE_MODELS: dict[str, Any] = {
 # contain a comma.
 HEADROOM_OPENCODE_EXTRA_MODELS_ENV = "HEADROOM_OPENCODE_EXTRA_MODELS"
 
+# The provider identity wrap writes. Kept as constants so unwrap can tell an
+# untouched descriptor from one the user edited.
+HEADROOM_OPENCODE_NPM = "@ai-sdk/openai-compatible"
+HEADROOM_OPENCODE_NAME = "Headroom Proxy"
+
 # Defaults for extra models when the spec omits limits. The output default is
 # also capped at the context window.
 _EXTRA_MODEL_DEFAULT_CONTEXT = 200000
@@ -123,8 +128,8 @@ def headroom_provider_entry(
 ) -> dict[str, Any]:
     """Return the `headroom` provider block pointed at the local proxy."""
     return {
-        "npm": "@ai-sdk/openai-compatible",
-        "name": "Headroom Proxy",
+        "npm": HEADROOM_OPENCODE_NPM,
+        "name": HEADROOM_OPENCODE_NAME,
         "options": {"baseURL": f"http://127.0.0.1:{port}/v1"},
         "models": {**HEADROOM_OPENCODE_MODELS, **(extra_models or {})},
     }
@@ -257,9 +262,10 @@ def remove_managed_opencode_provider(data: dict[str, Any], state: OpencodeManage
     """Remove Headroom-owned entries from parsed OpenCode config data.
 
     Drops the injected model ids and the baseURL Headroom pointed the
-    provider at, then the provider block itself when nothing else is left in
-    it. Entries the user added or edited are preserved. Returns whether
-    anything was removed.
+    provider at, then the npm/name it injected, then the provider block itself
+    when nothing else is left in it. Anything the user added or edited --
+    including an edited npm or name -- is preserved. Returns whether anything
+    was removed.
     """
     providers = data.get("provider")
     if not isinstance(providers, dict):
@@ -285,10 +291,14 @@ def remove_managed_opencode_provider(data: dict[str, Any], state: OpencodeManage
         if not options:
             entry.pop("options", None)
     if not entry.get("models") and not entry.get("options"):
-        # Headroom's npm/name describe a provider that no longer routes here.
-        if entry.pop("npm", None) is not None:
+        # Headroom's npm/name describe the proxy it injected. An edited value is
+        # the user's own now: dropping it would take their provider identity
+        # with it, so only the untouched, injected values go (#2364).
+        if entry.get("npm") == HEADROOM_OPENCODE_NPM:
+            entry.pop("npm")
             changed = True
-        if entry.pop("name", None) is not None:
+        if entry.get("name") == HEADROOM_OPENCODE_NAME:
+            entry.pop("name")
             changed = True
     if not entry:
         providers.pop("headroom", None)
