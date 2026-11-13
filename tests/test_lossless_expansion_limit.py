@@ -14,7 +14,12 @@ from collections.abc import Callable
 
 import pytest
 
-from headroom.transforms.lossless_compaction import compact_lossless
+from headroom.exceptions import CompressionError
+from headroom.transforms.lossless_compaction import (
+    compact_lossless,
+    expand_runs,
+    unfold_repeated_blocks,
+)
 
 MB = 1024 * 1024
 
@@ -58,3 +63,18 @@ def test_real_repeats_still_fold() -> None:
 
     config = "name: x\nvalue: 1\n" * 30
     assert len(compact_lossless(config, "config")) < len(config)
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "a\nb",  # no markers
+        "a\n... (repeated 2 times)",  # valid run marker
+        "a\n... (repeats 5 lines from 1 lines back)",  # invalid block marker, kept as a line
+    ],
+)
+def test_inverses_hold_max_lines_for_every_line(text: str) -> None:
+    for inverse in (expand_runs, unfold_repeated_blocks):
+        with pytest.raises(CompressionError):
+            inverse(text, max_lines=1)
+        assert inverse(text, max_lines=10) == inverse(text)

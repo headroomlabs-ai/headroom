@@ -158,8 +158,9 @@ def expand_runs(text: str, max_lines: int | None = None) -> str:
     """Exact inverse of :func:`collapse_runs`.
 
     Repeat counts are read from the text itself, so a marker line already in
-    the input can ask for any number of lines. With ``max_lines`` set, a
-    marker that would take the output past it raises before allocating.
+    the input can ask for any number of lines. With ``max_lines`` set, any
+    line or marker that would take the output past it raises before
+    allocating.
     """
     lines, had_trailing = _split_keep_trailing(text)
     if not lines:
@@ -177,6 +178,7 @@ def expand_runs(text: str, max_lines: int | None = None) -> str:
                 out.extend([line] * count)
                 i += 2
                 continue
+        _check_expansion(len(out), 1, max_lines)
         out.append(line)
         i += 1
     return _join(out, had_trailing)
@@ -264,6 +266,7 @@ def unfold_repeated_blocks(text: str, max_lines: int | None = None) -> str:
                 _check_expansion(len(out), length, max_lines)
                 out.extend(out[start : start + length])
                 continue
+        _check_expansion(len(out), 1, max_lines)
         out.append(line)
     return _join(out, had_trailing)
 
