@@ -3224,7 +3224,7 @@ def _zstd_bounded(raw: bytes) -> bytes:
 
 
 def _brotli_bounded(raw: bytes) -> bytes:
-    """Feed brotli input in slices, checking the cap after each one."""
+    """Feed brotli input in slices, pulling at most one chunk of output per step."""
     import brotli
 
     decompressor_cls = getattr(brotli, "Decompressor", None)
@@ -3237,16 +3237,36 @@ def _brotli_bounded(raw: bytes) -> bytes:
         )
 
     decompressor = decompressor_cls()
+    can_accept_more = getattr(decompressor, "can_accept_more_data", None)
+    if can_accept_more is None:
+        # Before brotli 1.2.0, process() has no output limit: one small input
+        # slice can expand without bound before the size check runs.
+        raise ValueError(
+            "Installed 'brotli' cannot bound decompressed output "
+            "(needs brotli>=1.2.0); upgrade it to accept br request bodies."
+        )
     out = bytearray()
-    for start in range(0, len(raw), _DECOMPRESS_CHUNK_SIZE):
-        out += decompressor.process(raw[start : start + _DECOMPRESS_CHUNK_SIZE])
+
+    def pull(data: bytes) -> bytes:
+        chunk: bytes = decompressor.process(data, output_buffer_limit=_DECOMPRESS_CHUNK_SIZE)
+        out.extend(chunk)
         if len(out) > MAX_DECOMPRESSED_BODY_SIZE:
             raise RequestBodyTooLarge(
                 f"Decompressed brotli request body exceeds "
                 f"{MAX_DECOMPRESSED_BODY_SIZE // (1024 * 1024)}MB"
             )
-    is_finished = getattr(decompressor, "is_finished", None)
-    if is_finished is not None and not is_finished():
+        return chunk
+
+    for start in range(0, len(raw), _DECOMPRESS_CHUNK_SIZE):
+        pull(raw[start : start + _DECOMPRESS_CHUNK_SIZE])
+        # While the decompressor holds unprocessed input it accepts only empty
+        # input; drain its output before feeding the next slice.
+        while not can_accept_more() and pull(b""):
+            pass
+    # All input is in, but output beyond the per-call limit is still pending.
+    while not decompressor.is_finished() and pull(b""):
+        pass
+    if not decompressor.is_finished():
         raise ValueError("Failed to decompress brotli request body: truncated stream")
     return bytes(out)
 

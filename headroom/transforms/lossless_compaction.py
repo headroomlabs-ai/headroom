@@ -33,6 +33,7 @@ __all__ = [
     "compact_lossless",
 ]
 
+from ..exceptions import CompressionError
 from ..log_safety import describe_exception, safe_id
 
 logger = logging.getLogger(__name__)
@@ -136,8 +137,30 @@ def collapse_runs(text: str) -> str:
     return _join(out, had_trailing)
 
 
-def expand_runs(text: str) -> str:
-    """Exact inverse of :func:`collapse_runs`."""
+class _ExpansionLimitExceeded(CompressionError):
+    """An inverse would produce more lines than its ``max_lines`` allows."""
+
+
+def _check_expansion(current: int, added: int, max_lines: int | None) -> None:
+    if max_lines is not None and current + added > max_lines:
+        raise _ExpansionLimitExceeded(
+            "Lossless inverse would exceed its line limit",
+            details={"max_lines": max_lines, "requested": current + added},
+        )
+
+
+def _round_trip_line_limit(text: str) -> int:
+    """Most lines an inverse may emit and still reproduce ``text``."""
+    return text.count("\n") + 1
+
+
+def expand_runs(text: str, max_lines: int | None = None) -> str:
+    """Exact inverse of :func:`collapse_runs`.
+
+    Repeat counts are read from the text itself, so a marker line already in
+    the input can ask for any number of lines. With ``max_lines`` set, a
+    marker that would take the output past it raises before allocating.
+    """
     lines, had_trailing = _split_keep_trailing(text)
     if not lines:
         return text
@@ -150,6 +173,7 @@ def expand_runs(text: str) -> str:
             m = _RUN_MARKER_RE.match(lines[i + 1])
             if m:
                 count = int(m.group(1))
+                _check_expansion(len(out), count, max_lines)
                 out.extend([line] * count)
                 i += 2
                 continue
@@ -221,8 +245,12 @@ def _remember(positions: dict[str, list[int]], line: str, index: int) -> None:
         del bucket[0]
 
 
-def unfold_repeated_blocks(text: str) -> str:
-    """Exact inverse of :func:`fold_repeated_blocks`."""
+def unfold_repeated_blocks(text: str, max_lines: int | None = None) -> str:
+    """Exact inverse of :func:`fold_repeated_blocks`.
+
+    ``max_lines`` bounds the output as in :func:`expand_runs`; without it,
+    chained markers can double the output once per marker line.
+    """
     lines, had_trailing = _split_keep_trailing(text)
     if not lines:
         return text
@@ -233,6 +261,7 @@ def unfold_repeated_blocks(text: str) -> str:
             length, dist = int(m.group(1)), int(m.group(2))
             start = len(out) - dist
             if start >= 0 and length <= dist:
+                _check_expansion(len(out), length, max_lines)
                 out.extend(out[start : start + length])
                 continue
         out.append(line)
@@ -506,7 +535,7 @@ def compact_lossless(content: str, kind: str) -> str:
             # exactly reversible against the de-ANSI'd baseline.
             baseline = strip_ansi(content)
             candidate = collapse_runs(baseline)
-            if expand_runs(candidate) != baseline:
+            if expand_runs(candidate, _round_trip_line_limit(baseline)) != baseline:
                 return content
             return candidate if _smaller(candidate, content) else content
 
@@ -540,7 +569,7 @@ def compact_lossless(content: str, kind: str) -> str:
         if kind == "text":
             # Collapse blank-line runs; reversible against itself.
             candidate = collapse_runs(content)
-            if expand_runs(candidate) != content:
+            if expand_runs(candidate, _round_trip_line_limit(content)) != content:
                 return content
             return candidate if _smaller(candidate, content) else content
 
@@ -548,9 +577,14 @@ def compact_lossless(content: str, kind: str) -> str:
             # Structured config (YAML/TOML/INI): single-line runs first, then
             # repeated multi-line stanzas. Inverse applies in reverse order.
             candidate = fold_repeated_blocks(collapse_runs(content))
-            if expand_runs(unfold_repeated_blocks(candidate)) != content:
+            limit = _round_trip_line_limit(content)
+            if expand_runs(unfold_repeated_blocks(candidate, limit), limit) != content:
                 return content
             return candidate if _smaller(candidate, content) else content
+    except _ExpansionLimitExceeded:
+        # The input itself carried marker lines asking for more lines than it
+        # has, so the fold cannot round-trip; leave the content as it is.
+        return content
     except Exception as e:
         # The exception text can quote the content, so no level logs it;
         # describe_exception keeps only types and code locations.
