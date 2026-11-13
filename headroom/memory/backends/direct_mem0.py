@@ -76,7 +76,7 @@ _REL_TYPE_MAX_LEN = 64
 
 def _relationship_type(raw: str) -> str:
     """Normalise a relationship label to a Cypher-safe identifier ("" if none)."""
-    return _REL_TYPE_NON_WORD.sub("_", raw.lower()).strip("_")[:_REL_TYPE_MAX_LEN]
+    return _REL_TYPE_NON_WORD.sub("_", raw.lower()).strip("_")[:_REL_TYPE_MAX_LEN].rstrip("_")
 
 
 def _utcnow() -> datetime:
