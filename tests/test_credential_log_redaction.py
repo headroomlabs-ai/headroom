@@ -132,3 +132,52 @@ def test_query_names_cannot_split_the_log_line() -> None:
     assert "\n" not in rendered and "\r" not in rendered
     assert "secret" not in rendered
     assert rendered == "a%0D%0Aforged%20line=<redacted>&key=<redacted>"
+
+
+def test_uvicorn_access_log_drops_query_values() -> None:
+    """Real uvicorn at info level, with no filter but headroom's own on the logger."""
+    import asyncio
+    import socket
+
+    import uvicorn
+
+    app = create_app(_config())
+    access = logging.getLogger("uvicorn.access")
+    others = [f for f in access.filters if not type(f).__module__.startswith("headroom.")]
+    for f in others:  # e.g. LiteLLM's, which is only present when litellm is imported
+        access.removeFilter(f)
+    lines: list[str] = []
+
+    class _Lines(logging.Handler):
+        def emit(self, record: logging.LogRecord) -> None:
+            lines.append(record.getMessage())
+
+    with socket.socket() as sock:
+        sock.bind(("127.0.0.1", 0))
+        port = sock.getsockname()[1]
+    server = uvicorn.Server(
+        uvicorn.Config(app, host="127.0.0.1", port=port, log_level="info", lifespan="off")
+    )
+
+    async def run() -> None:
+        task = asyncio.create_task(server.serve())
+        while not server.started:
+            await asyncio.sleep(0.02)
+        handler = _Lines()
+        access.addHandler(handler)
+        try:
+            async with httpx.AsyncClient(trust_env=False) as client:
+                await client.get(f"http://127.0.0.1:{port}/livez?key={FAKE_KEY}&alt=sse")
+        finally:
+            access.removeHandler(handler)
+            server.should_exit = True
+            await task
+
+    try:
+        asyncio.run(run())
+    finally:
+        for f in others:
+            access.addFilter(f)
+
+    assert any("/livez?" in line for line in lines)
+    assert not any(FAKE_KEY in line for line in lines)
