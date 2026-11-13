@@ -586,9 +586,28 @@ def _which_outside_cwd(name: str) -> Path | None:
     for entry in os.environ.get("PATH", "").split(os.pathsep):
         if not entry or not os.path.isabs(entry):
             continue
-        hit = shutil.which(name, path=entry)
+        hit = _executable_in(entry, name)
         if hit and not _in_cwd(hit):
             return Path(hit)
+    return None
+
+
+def _executable_in(directory: str, name: str) -> str | None:
+    """Look for `name` in one directory only, like ``shutil.which`` minus its cwd step.
+
+    ``shutil.which(name, path=directory)`` still searches the current directory
+    first on Windows, so it cannot be used to skip a hit there. PATHEXT is
+    honoured the same way ``shutil.which`` does.
+    """
+    names = [name]
+    if sys.platform.startswith("win"):
+        exts = [e for e in os.environ.get("PATHEXT", ".COM;.EXE;.BAT;.CMD").split(";") if e]
+        if not any(name.lower().endswith(ext.lower()) for ext in exts):
+            names = [name + ext for ext in exts]
+    for candidate in names:
+        path = os.path.join(directory, candidate)
+        if os.path.isfile(path) and os.access(path, os.X_OK):
+            return path
     return None
 
 

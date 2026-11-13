@@ -243,6 +243,27 @@ def test_which_skips_a_cwd_hit_and_finds_the_next_path_entry(monkeypatch, tmp_pa
     assert (row["state"], row["path"]) == ("on-path", str(tool))
 
 
+def test_which_skips_a_cwd_hit_with_windows_lookup_rules(monkeypatch, tmp_path):
+    """On Windows shutil.which() checks the cwd before every PATH it is given."""
+    project = tmp_path / "project"
+    project.mkdir()
+    (project / "difft.exe").write_text("")
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    installed = bin_dir / "difft.exe"
+    installed.write_text("")
+    installed.chmod(0o755)
+    monkeypatch.chdir(project)
+    monkeypatch.setattr(binaries.sys, "platform", "win32")
+    monkeypatch.setattr(binaries.sys, "prefix", str(tmp_path / "venv"))
+    monkeypatch.setenv("PATH", str(bin_dir))
+    monkeypatch.setenv("PATHEXT", ".exe")
+    monkeypatch.setattr(
+        binaries.shutil, "which", lambda name, path=None: os.path.join(".", f"{name}.exe")
+    )
+    assert binaries._which_outside_cwd("difft") == installed
+
+
 def test_status_reports_a_tool_in_the_interpreter_scripts_dir(monkeypatch, tmp_path):
     _set_platform(monkeypatch, sys_plat="darwin", machine="arm64")
     monkeypatch.setenv("PATH", "/no-such-bin")
