@@ -27,6 +27,7 @@ import hashlib
 import logging
 import os
 import threading
+import time
 from collections import OrderedDict
 from collections.abc import Mapping
 from dataclasses import dataclass, field
@@ -59,23 +60,47 @@ _BASENAME_ALLOWED: frozenset[str] = frozenset(
 )
 
 
-@lru_cache(maxsize=512)
-def _git_common_dir(resolved_dir: str) -> str | None:
-    """Common git dir of the repository containing ``resolved_dir``.
+# How long a resolved git common dir is trusted before it is re-walked, and
+# how many resolved directories are remembered. The walk itself is cheap
+# (one in-process ``.git`` probe per ancestor — no subprocess, no PATH), but
+# it is still worth memoising because one request resolves once and long-lived
+# sessions re-resolve the same directory every turn. Entries expire so that a
+# directory which *becomes* a repository mid-session (``git init`` inside a
+# parent checkout, adding a nested repo, checking out a submodule) starts
+# resolving to its own key within the TTL instead of keeping the parent's
+# project store for the life of the process (GH #4712 review).
+_GIT_COMMON_DIR_TTL_SECONDS = 30.0
+_GIT_COMMON_DIR_MAX_ENTRIES = 512
+_git_common_dir_cache: OrderedDict[str, tuple[float, str | None]] = OrderedDict()
+_git_common_dir_lock = threading.Lock()
+_git_common_dir_stats = {"hits": 0, "misses": 0}
 
-    Mirrors ``git rev-parse --path-format=absolute --git-common-dir``
-    without spawning git: walk up from ``resolved_dir`` for a ``.git``
-    entry. A ``.git`` *directory* (or its ``commondir`` file when the
-    directory is a linked-worktree gitdir) identifies the shared common
-    dir; a ``.git`` *file* (``gitdir: <path>``) re-points the search at
-    the worktree / submodule gitdir, where ``commondir`` splits it away
-    from the main checkout.
 
-    Returns ``None`` when ``resolved_dir`` is not inside a git work tree
-    on this host (or anything is unreadable / nested past ~40 levels) —
-    the caller falls back to the cwd key (GH #4712 fallback rule).
-    Cached per resolved directory so the proxy pays one filesystem walk
-    per distinct project, not one per request.
+def _git_common_dir_cache_clear() -> None:
+    """Drop every memoised common dir. Test/app hygiene, not a request path."""
+    with _git_common_dir_lock:
+        _git_common_dir_cache.clear()
+        _git_common_dir_stats["hits"] = 0
+        _git_common_dir_stats["misses"] = 0
+
+
+def _git_common_dir_cache_info() -> dict[str, int]:
+    """Cache counters, mirroring ``functools.lru_cache``'s ``cache_info``."""
+    with _git_common_dir_lock:
+        return {
+            **_git_common_dir_stats,
+            "currsize": len(_git_common_dir_cache),
+            "maxsize": _GIT_COMMON_DIR_MAX_ENTRIES,
+            "ttl_seconds": _GIT_COMMON_DIR_TTL_SECONDS,
+        }
+
+
+def _walk_git_common_dir(resolved_dir: str) -> str | None:
+    """Walk ``resolved_dir``'s ancestors for the repository's common git dir.
+
+    The uncached walk behind :func:`_git_common_dir`; see that function for
+    the semantics. Split out so the cache and the filesystem logic each stay
+    readable, and so tests can exercise the walk directly.
     """
     current = Path(resolved_dir)
     for _ in range(128):
@@ -118,6 +143,48 @@ def _git_common_dir(resolved_dir: str) -> str | None:
             break
         current = parent
     return None
+
+
+def _git_common_dir(resolved_dir: str) -> str | None:
+    """Common git dir of the repository containing ``resolved_dir``.
+
+    Mirrors ``git rev-parse --path-format=absolute --git-common-dir``
+    without spawning git: walk up from ``resolved_dir`` for a ``.git``
+    entry. A ``.git`` *directory* (or its ``commondir`` file when the
+    directory is a linked-worktree gitdir) identifies the shared common
+    dir; a ``.git`` *file* (``gitdir: <path>``) re-points the search at
+    the worktree / submodule gitdir, where ``commondir`` splits it away
+    from the main checkout.
+
+    Returns ``None`` when ``resolved_dir`` is not inside a git work tree
+    on this host (or anything is unreadable / nested past ~128 levels) —
+    the caller falls back to the cwd key (GH #4712 fallback rule).
+
+    Results are memoised per resolved directory with a
+    ``_GIT_COMMON_DIR_TTL_SECONDS`` freshness window, so the proxy pays
+    one filesystem walk per distinct project per window rather than one
+    per request, while a directory that becomes (or stops being) a
+    repository mid-session is picked up within that window instead of
+    being pinned to the old answer for the process lifetime. The walk has
+    no cheap exact validation — confirming the answer is still current
+    means re-walking the same ancestry — so the TTL is the invalidation
+    policy rather than an optimisation.
+    """
+    now = time.monotonic()
+    with _git_common_dir_lock:
+        entry = _git_common_dir_cache.get(resolved_dir)
+        if entry is not None and now - entry[0] < _GIT_COMMON_DIR_TTL_SECONDS:
+            _git_common_dir_cache.move_to_end(resolved_dir)
+            _git_common_dir_stats["hits"] += 1
+            return entry[1]
+    value = _walk_git_common_dir(resolved_dir)
+    with _git_common_dir_lock:
+        _git_common_dir_stats["misses"] += 1
+        _git_common_dir_cache[resolved_dir] = (now, value)
+        _git_common_dir_cache.move_to_end(resolved_dir)
+        while len(_git_common_dir_cache) > _GIT_COMMON_DIR_MAX_ENTRIES:
+            _git_common_dir_cache.popitem(last=False)
+    return value
 
 
 @lru_cache(maxsize=512)
