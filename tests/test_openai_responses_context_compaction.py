@@ -413,12 +413,9 @@ def test_responses_turn_hook_message_fold_is_applied_and_counted() -> None:
     assert payload["input"][0]["output"] != "folded"  # original untouched (deep-copied)
 
 
-def test_codex_tool_schemas_are_forwarded_byte_identical() -> None:
-    """Codex's instructions+tools prefix is the one OpenAI keeps cached across
-    sessions; a compacted schema forfeits that hit on every first request
-    (12,288 cached tokens direct vs 0 compacted, measured on gpt-6.1-sol)."""
+def _verbose_shell_tools() -> list[dict[str, Any]]:
     verbose = " ".join(["Runs a shell command in the workspace.\n"] * 30)
-    tools = [
+    return [
         {
             "type": "function",
             "name": "shell",
@@ -426,19 +423,52 @@ def test_codex_tool_schemas_are_forwarded_byte_identical() -> None:
             "parameters": {"type": "object", "properties": {"cmd": {"type": "string"}}},
         }
     ]
+
+
+def test_codex_tool_schemas_are_forwarded_byte_identical() -> None:
+    """Codex's instructions+tools prefix is the one OpenAI keeps cached across
+    sessions; a compacted schema forfeits that hit on every first request
+    (12,288 cached tokens direct vs 0 compacted, measured on gpt-6.1-sol)."""
+    tools = _verbose_shell_tools()
     payload: dict[str, Any] = {"model": "gpt-5.5", "tools": tools, "input": []}
     handler = _HandlerHarness(ContentRouter(ContentRouterConfig()))
 
     codex, _, codex_saved, codex_transforms, *_ = handler._compress_openai_responses_payload(
-        payload, model="gpt-5.5", request_id="hr_codex", client="codex"
+        payload, model="gpt-5.5", request_id="hr_codex", client="codex", keep_tool_schemas=True
     )
     other, _, _, other_transforms, *_ = handler._compress_openai_responses_payload(
-        payload, model="gpt-5.5", request_id="hr_other", client="opencode"
+        payload, model="gpt-5.5", request_id="hr_other", client="codex"
     )
 
     assert codex["tools"] == tools
     assert "openai:responses:tool_schema_compaction" not in codex_transforms
     assert codex_saved == 0
-    # Other clients keep the compaction.
+    # A caller only stamped codex (not identified) keeps the compaction.
     assert other["tools"] != tools
     assert "openai:responses:tool_schema_compaction" in other_transforms
+
+
+def test_tool_desc_max_chars_opt_in_still_truncates_codex_descriptions(monkeypatch) -> None:
+    """HEADROOM_TOOL_DESC_MAX_CHARS is an explicit operator opt-in, so it wins
+    over keeping Codex schemas; the default (0, off) leaves them byte-identical."""
+    from headroom.proxy import tool_schema_compaction
+
+    tools = _verbose_shell_tools()
+    payload: dict[str, Any] = {"model": "gpt-5.5", "tools": tools, "input": []}
+    handler = _HandlerHarness(ContentRouter(ContentRouterConfig()))
+
+    def _codex_tools() -> tuple[list[dict[str, Any]], list[str]]:
+        working, _, _, transforms, *_ = handler._compress_openai_responses_payload(
+            payload, model="gpt-5.5", request_id="hr_codex", client="codex", keep_tool_schemas=True
+        )
+        return working["tools"], transforms
+
+    monkeypatch.setattr(tool_schema_compaction, "_TOOL_DESC_MAX_CHARS", 0)
+    default_tools, default_transforms = _codex_tools()
+    assert default_tools == tools
+    assert "openai:responses:tool_desc_compaction" not in default_transforms
+
+    monkeypatch.setattr(tool_schema_compaction, "_TOOL_DESC_MAX_CHARS", 80)
+    capped_tools, capped_transforms = _codex_tools()
+    assert len(capped_tools[0]["description"]) < len(tools[0]["description"])
+    assert "openai:responses:tool_desc_compaction" in capped_transforms

@@ -106,6 +106,7 @@ from headroom.proxy import public_errors
 from headroom.proxy.auth_mode import (
     classify_auth_mode,
     classify_client,
+    is_identified_codex_client,
     should_stamp_codex_client,
 )
 from headroom.proxy.buffered_ccr_response import (
@@ -3103,6 +3104,7 @@ class OpenAIHandlerMixin:
         deadline_started_at: float | None = None,
         conversation: str | None = None,
         tool_names_by_call_id: dict[str, str] | None = None,
+        keep_tool_schemas: bool = False,
     ) -> tuple[dict[str, Any], bool, int, list[str], str | None, int, int, int]:
         """Compress an OpenAI Responses payload through the shared router.
 
@@ -3129,14 +3131,18 @@ class OpenAIHandlerMixin:
         reason: str | None = None
 
         tool_compaction_started = time.perf_counter()
-        # Codex sends one standard instructions+tools prefix that OpenAI keeps
-        # cached across sessions. Rewriting any byte of it costs that hit on
-        # every session's first request. Measured on gpt-6.1-sol, Codex 0.167.0,
-        # both over HTTP: 12,288 tokens cached direct, 0 through the proxy with
-        # only this compaction applied, which saves 360 tokens a request.
+        # Callers set keep_tool_schemas for a caller that identifies itself as
+        # Codex (is_identified_codex_client). Codex sends one standard
+        # instructions+tools prefix that OpenAI keeps cached across sessions.
+        # Rewriting any byte of it costs that hit on every session's first
+        # request. Measured on gpt-6.1-sol, Codex 0.167.0, both over HTTP:
+        # 12,288 tokens cached direct, 0 through the proxy with only this
+        # compaction applied, which saves 360 tokens a request. The opt-in
+        # HEADROOM_TOOL_DESC_MAX_CHARS truncation below still applies: an
+        # operator who sets it chose shorter descriptions over that hit.
         compacted_payload, tools_modified, tools_before_bytes, tools_after_bytes = (
             (working, False, 0, 0)
-            if client == "codex"
+            if keep_tool_schemas
             else _compact_openai_responses_tools(working)
         )
         _add_timing("compression_tool_schema_compaction", tool_compaction_started)
@@ -3414,6 +3420,7 @@ class OpenAIHandlerMixin:
         savings_tags: dict[str, Any] | None = None,
         conversation: str | None = None,
         tool_names_by_call_id: dict[str, str] | None = None,
+        keep_tool_schemas: bool = False,
     ) -> tuple[dict[str, Any], bool, int, list[str], str | None, int, int, int, dict[str, float]]:
         """``conversation`` is the caller's ``turn_conversation_key``,
         derived before compression rewrites the body; turn hooks see it as
@@ -3470,6 +3477,8 @@ class OpenAIHandlerMixin:
                 compression_kwargs["conversation"] = conversation
             if tool_names_by_call_id:
                 compression_kwargs["tool_names_by_call_id"] = tool_names_by_call_id
+            if keep_tool_schemas:
+                compression_kwargs["keep_tool_schemas"] = True
             while True:
                 try:
                     result = self._compress_openai_responses_payload(
@@ -3487,6 +3496,7 @@ class OpenAIHandlerMixin:
                                 "timing",
                                 "deadline_started_at",
                                 "conversation",
+                                "keep_tool_schemas",
                             )
                             if f"unexpected keyword argument '{name}'" in str(exc)
                             and name in compression_kwargs
@@ -6930,6 +6940,10 @@ class OpenAIHandlerMixin:
                     client=client,
                     savings_tags=tags,
                     conversation=_turn_conversation,
+                    keep_tool_schemas=is_identified_codex_client(
+                        request.headers,
+                        stamped=bool(request.scope.get("headroom_codex_client_stamped")),
+                    ),
                 )
                 attempted_input_tokens = int(_attempted_tokens)
                 if _transforms:
@@ -7867,6 +7881,7 @@ class OpenAIHandlerMixin:
         # Identify the WS harness before downstream auth/header rewrites.
         # Captured in closure so per-turn RequestOutcome can stamp it.
         client = classify_client(ws_headers)
+        codex_identified = is_identified_codex_client(ws_headers, stamped=codex_client_was_stamped)
         # WS sessions bypass the HTTP middleware, so bind the project here;
         # per-turn outcome emission inside this task inherits the context. An
         # explicit X-Headroom-Project header wins; otherwise fall back to the
@@ -9026,6 +9041,7 @@ class OpenAIHandlerMixin:
                                 if client == "codex"
                                 else COMPRESSION_TIMEOUT_SECONDS,
                                 client=client,
+                                keep_tool_schemas=codex_identified,
                                 savings_tags=_frame_savings,
                                 conversation=turn_conversation_key(
                                     _inner, session_id=_responses_session_header(ws_headers)
@@ -9433,6 +9449,7 @@ class OpenAIHandlerMixin:
                                     if client == "codex"
                                     else COMPRESSION_TIMEOUT_SECONDS,
                                     client=client,
+                                    keep_tool_schemas=codex_identified,
                                     savings_tags=frame_savings,
                                     conversation=turn_conversation_key(
                                         inner_payload,
