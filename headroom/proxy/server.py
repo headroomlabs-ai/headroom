@@ -5887,11 +5887,12 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
         snapshot to avoid rebuilding the full payload on every UI poll.
 
         ``recent_requests`` / ``request_logs`` (per-request ids, providers,
-        models, errors) and ``config`` (backend + savings profile) are embedded
-        only for callers :func:`_request_can_view_stats_metadata` admits:
-        loopback (the local dashboard), a trusted dashboard CIDR peer, or a
-        caller that passed the proxy token check. Other network callers still
-        get the aggregate counters but never the per-request metadata.
+        models, errors), ``config`` (backend + savings profile), per-project
+        savings and the provider quota sections are embedded only for callers
+        :func:`_request_can_view_stats_metadata` admits: loopback (the local
+        dashboard), a trusted dashboard CIDR peer, or a caller that passed the
+        proxy token check. Other network callers still get the aggregate
+        counters but never the per-request metadata.
         """
         include_sensitive = _request_can_view_stats_metadata(
             request,
@@ -5911,6 +5912,14 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
             # _build_stats_payload bakes these in; strip for network callers.
             payload.pop("recent_requests", None)
             payload.pop("request_logs", None)
+            # Same fields /stats-lifetime and /quota withhold from this caller.
+            # Rebuild the nested dicts: the cached snapshot is shared.
+            for tracker in get_quota_registry().trackers:
+                payload.pop(tracker.key, None)
+            for section, key in (("savings", "per_project"), ("persistent_savings", "projects")):
+                nested = payload.get(section)
+                if isinstance(nested, dict):
+                    payload[section] = {k: v for k, v in nested.items() if k != key}
         return payload
 
     @app.get("/stats-lifetime")
