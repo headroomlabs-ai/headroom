@@ -53,6 +53,104 @@ class TestSemanticCache:
         entry = cache.get("Unknown query", messages_hash="unknown")
         assert entry is None
 
+    @pytest.mark.parametrize("messages_hash", [None, ""])
+    @pytest.mark.parametrize("namespace", ["", "provider/model"])
+    def test_query_only_round_trip(self, messages_hash, namespace):
+        cache = SemanticCache()
+        cache.put("What failed?", "disk full", messages_hash, namespace)
+
+        entry = cache.get("What failed?", messages_hash, namespace)
+
+        assert entry is not None and entry.response == "disk full"
+        assert entry.access_count == 2
+        assert cache.get_stats()["hits"] == 1
+        assert cache.get("What failed?", namespace="other") is None
+        assert cache.get("What failed?", messages_hash="context", namespace=namespace) is None
+        assert cache.get("What else failed?", namespace=namespace) is None
+
+    def test_query_only_exact_hit_does_not_call_embedder_again(self):
+        def embed(text):
+            return [1.0, 0.0]
+
+        cache = SemanticCache(embedding_fn=embed)
+        cache.put("question", "answer")
+
+        def unavailable(text):
+            raise RuntimeError("embedding service offline")
+
+        cache._embedding_fn = unavailable
+        assert cache.get("question").response == "answer"
+
+    def test_query_only_hit_refreshes_lru(self):
+        cache = SemanticCache(SemanticCacheConfig(max_entries=2))
+        cache.put("first", "one")
+        cache.put("second", "two")
+        assert cache.get("first") is not None
+        cache.put("third", "three")
+        assert cache.get("first").response == "one"
+        assert cache.get("second") is None
+
+    def test_query_only_expiration_and_disabled_exact_matching(self, monkeypatch):
+        monkeypatch.setattr(time, "time", lambda: 1000.0)
+        cache = SemanticCache(SemanticCacheConfig(ttl_seconds=10))
+        cache.put("query", "answer")
+        assert cache.get("query") is not None
+        cache.config.use_exact_matching = False
+        assert cache.get("query") is None
+        cache.config.use_exact_matching = True
+        monkeypatch.setattr(time, "time", lambda: 1011.0)
+        assert cache.get("query") is None
+
+    @pytest.mark.parametrize("query", ["", " \n\t"])
+    def test_blank_query_without_context_never_hits(self, query):
+        cache = SemanticCache()
+        cache.put(query, "answer")
+        assert cache.get(query) is None
+
+    def test_query_hash_cannot_read_a_context_key(self):
+        query = "continue"
+        query_hash = hashlib.sha256(query.encode()).hexdigest()[:16]
+        cache = SemanticCache()
+        cache.put(query, "context answer", messages_hash=query_hash)
+        assert cache.get(query) is None
+
+    @pytest.mark.parametrize("max_entries", [0, -1])
+    def test_put_rejects_nonpositive_capacity(self, max_entries, monkeypatch):
+        cache = SemanticCache(SemanticCacheConfig(max_entries=max_entries))
+        # Fail promptly instead of hanging if the unguarded eviction loop returns.
+        monkeypatch.setattr(
+            cache, "_evict_oldest", lambda: pytest.fail("Invalid capacity must not evict entries")
+        )
+
+        with pytest.raises(ValueError, match="max_entries must be positive"):
+            cache.put("query", "response", messages_hash="request")
+
+        assert cache.get_stats()["entries"] == 0
+
+    @pytest.mark.parametrize("max_entries", [0, -1])
+    @pytest.mark.parametrize("messages_hash", ["existing", "new"])
+    def test_invalid_capacity_change_preserves_entries(
+        self, max_entries, messages_hash, monkeypatch
+    ):
+        cache = SemanticCache(SemanticCacheConfig(max_entries=1))
+        cache.put("query", "original", messages_hash="existing")
+        cache.config.max_entries = max_entries
+        stats = cache.get_stats()
+        monkeypatch.setattr(
+            cache, "_evict_oldest", lambda: pytest.fail("Invalid capacity must not evict entries")
+        )
+
+        with pytest.raises(ValueError, match="max_entries must be positive"):
+            cache.put("query", "replacement", messages_hash=messages_hash)
+
+        assert cache.get_stats() == stats
+        assert cache.get("query", messages_hash="existing").response == "original"
+        assert cache.get("query", messages_hash="new") is None
+
+        cache.config.max_entries = 1
+        cache.put("query", "updated", messages_hash="existing")
+        assert cache.get("query", messages_hash="existing").response == "updated"
+
     def test_same_query_different_context_does_not_collide(self, cache):
         """Two requests that share a trailing user message but differ in earlier
         context (distinct messages_hash) must not overwrite each other. Before the
@@ -73,6 +171,141 @@ class TestSemanticCache:
         cache.put("continue", {"text": "A"}, messages_hash="hA")
         # A lookup for a hash that isn't stored is a miss, not a wrong hit.
         assert cache.get("continue", messages_hash="hB") is None
+
+    @pytest.mark.parametrize("context", [False, True])
+    @pytest.mark.parametrize("namespace", ["", "provider/model"])
+    def test_successful_update_refreshes_lru(self, context, namespace):
+        cache = SemanticCache(SemanticCacheConfig(max_entries=2))
+        first_hash, second_hash = ("first-context", "second-context") if context else (None, None)
+        cache.put("first", "old", first_hash, namespace)
+        cache.put("second", "two", second_hash, namespace)
+        cache.put("first", "updated", first_hash, namespace)
+        assert cache.get_stats()["evictions"] == 0
+
+        # Looking up first before this insertion would refresh it and hide the bug.
+        cache.put("third", "three", "third-context" if context else None, namespace)
+
+        first = cache.get("first", first_hash, namespace)
+        assert first is not None and first.response == "updated"
+        assert cache.get("second", second_hash, namespace) is None
+        assert cache.get_stats()["entries"] == 2
+        assert cache.get_stats()["evictions"] == 1
+
+    def test_failed_update_does_not_refresh_lru(self):
+        def embed(query):
+            return [1.0, 0.0]
+
+        cache = SemanticCache(SemanticCacheConfig(max_entries=2), embedding_fn=embed)
+        cache.put("first", "one", "first")
+        cache.put("second", "two", "second")
+
+        def unavailable(query):
+            raise RuntimeError("embedding service offline")
+
+        cache._embedding_fn = unavailable
+        with pytest.raises(RuntimeError, match="embedding service offline"):
+            cache.put("first", "replacement", "first")
+        cache._embedding_fn = None
+        cache.put("third", "three", "third")
+
+        assert cache.get("first", "first") is None
+        assert cache.get("second", "second").response == "two"
+
+    def test_concurrent_update_does_not_interrupt_similarity_scan(self, monkeypatch):
+        import threading
+
+        cache = SemanticCache(embedding_fn=lambda query: [1.0, 0.0])
+        cache.put("first", "old", "first")
+        cache.put("second", "two", "second")
+        scanning, release, writer_progress = threading.Event(), threading.Event(), threading.Event()
+        real_lock = threading.RLock()
+
+        class SignalsWriterLock:
+            def __enter__(self):
+                if threading.current_thread().name == "cache-update":
+                    writer_progress.set()
+                return real_lock.__enter__()
+
+            def __exit__(self, *exc):
+                return real_lock.__exit__(*exc)
+
+        # Also works on the old implementation, which does not use this lock.
+        cache._lock = SignalsWriterLock()
+        real_similarity = cache._cosine_similarity
+
+        def paused_similarity(a, b):
+            if not scanning.is_set():
+                scanning.set()
+                assert release.wait(5)
+            return real_similarity(a, b)
+
+        monkeypatch.setattr(cache, "_cosine_similarity", paused_similarity)
+        errors, results = [], []
+
+        def read():
+            try:
+                results.append(cache.get("third", "third"))
+            except Exception as exc:
+                errors.append(exc)
+
+        def update():
+            try:
+                cache.put("first", "updated", "first")
+            except Exception as exc:
+                errors.append(exc)
+            finally:
+                # Old code reaches here during the scan; synchronized code
+                # signals at lock acquisition and waits for the scan instead.
+                writer_progress.set()
+
+        reader = threading.Thread(target=read)
+        writer = threading.Thread(target=update, name="cache-update")
+        reader.start()
+        try:
+            assert scanning.wait(5)
+            writer.start()
+            assert writer_progress.wait(5)
+        finally:
+            release.set()
+            reader.join(5)
+            if writer.ident is not None:
+                writer.join(5)
+        assert not reader.is_alive() and not writer.is_alive()
+        assert errors == []
+        assert len(results) == 1 and results[0] is not None
+        assert results[0].response in ("old", "updated")
+        assert cache.get("first", "first").response == "updated"
+
+    def test_embedding_callback_does_not_block_exact_hits(self):
+        import threading
+
+        started, release = threading.Event(), threading.Event()
+
+        def embed(query):
+            if query == "slow":
+                started.set()
+                assert release.wait(5)
+            return [1.0, 0.0]
+
+        cache = SemanticCache(embedding_fn=embed)
+        cache.put("first", "one", "first")
+        errors = []
+
+        def lookup():
+            try:
+                cache.get("slow", "slow")
+            except Exception as exc:
+                errors.append(exc)
+
+        reader = threading.Thread(target=lookup)
+        reader.start()
+        try:
+            assert started.wait(5)
+            assert cache.get("first", "first").response == "one"
+        finally:
+            release.set()
+            reader.join(5)
+        assert not reader.is_alive() and errors == []
 
     def test_lru_eviction(self):
         """Test LRU eviction when at capacity."""
@@ -122,6 +355,52 @@ class TestSemanticCache:
         # h2 reflects the update.
         got2 = cache.get("query2", messages_hash="h2")
         assert got2 is not None and got2.response == "response2b"
+
+    def test_put_failure_after_eviction_keeps_live_entry(self):
+        """A failed embedding must not silently drop an already-evicted entry.
+
+        The eviction loop used to run before the embedding call, so if the
+        embedding function raised, an old live entry was already evicted while
+        the new entry was never stored — a permanent data loss on a transient
+        error. The exception must still propagate.
+        """
+        config = SemanticCacheConfig(max_entries=1, similarity_threshold=0.9)
+        cache = SemanticCache(config)
+
+        call_count = {"n": 0}
+
+        def flaky_embedding(text: str) -> list[float]:
+            call_count["n"] += 1
+            if call_count["n"] == 1:
+                return [1.0, 0.0]
+            raise RuntimeError("embedding backend unavailable")
+
+        cache._embedding_fn = flaky_embedding
+
+        # First put succeeds and fills the cache to capacity.
+        cache.put("a", "response-a", messages_hash="ha")
+        assert cache.get("a", messages_hash="ha") is not None
+        assert len(cache._cache) == 1
+
+        # Second put raises, but the live entry must survive untouched.
+        with pytest.raises(RuntimeError, match="embedding backend unavailable"):
+            cache.put("b", "response-b", messages_hash="hb")
+
+        assert cache.get("a", messages_hash="ha") is not None
+        assert len(cache._cache) == 1
+
+        # With the embedding working again, a new put evicts "a" normally.
+        def stable_embedding(text: str) -> list[float]:
+            # Distinct vectors per query so "a" and "c" never false-hit.
+            if text == "a":
+                return [1.0, 0.0]
+            return [0.0, 1.0]
+
+        cache._embedding_fn = stable_embedding
+        cache.put("c", "response-c", messages_hash="hc")
+        assert cache.get("a", messages_hash="ha") is None
+        assert cache.get("c", messages_hash="hc") is not None
+        assert len(cache._cache) == 1
 
     def test_ttl_expiration(self):
         """Test TTL expiration."""
@@ -538,6 +817,29 @@ class TestSemanticCacheLayer:
 
         result = layer.process(messages, context)
         assert result.semantic_cache_hit is False
+
+    @pytest.fixture(params=["object", "set", "cycle"])
+    def unhashable_messages(self, request):
+        if request.param == "cycle":
+            opaque = []
+            opaque.append(opaque)
+        else:
+            opaque = object() if request.param == "object" else {"opaque"}
+        return [{"role": "user", "content": "Hello!", "opaque": opaque}]
+
+    def test_unhashable_messages_are_not_stored(self, layer, context, unhashable_messages):
+        assert layer.store_response(unhashable_messages, "private answer", context) == ""
+        assert layer.cache.get_stats()["entries"] == 0
+
+    def test_unhashable_messages_skip_query_only_entries(self, layer, context, unhashable_messages):
+        namespace = layer._compute_namespace(context)
+        layer.cache.put("Hello!", "another context's answer", namespace=namespace)
+
+        result = layer.process(unhashable_messages, context)
+
+        assert result.semantic_cache_hit is False
+        assert result.cached_response is None
+        assert result.messages[-1]["content"] == "Hello!"
 
 
 class TestSemanticCoverage:

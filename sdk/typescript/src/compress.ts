@@ -27,6 +27,7 @@ export async function compress(
     tokenBudget,
     hooks,
     config,
+    format,
     ...clientOptions
   } = options;
 
@@ -45,8 +46,24 @@ export async function compress(
     processedMessages = await hooks.preCompress(messages, ctx);
   }
 
-  // 2. Detect input format
-  const inputFormat = detectFormat(processedMessages);
+  // 2. Input format: declared by the caller, else detected
+  const inputFormat = format ?? detectFormat(processedMessages);
+
+  // Messages that aren't objects can't be converted to OpenAI without losing
+  // content, so leave the request alone rather than silently dropping it. The
+  // proxy is not called, so no compression event is emitted.
+  if (processedMessages.some((m) => !m || typeof m !== "object")) {
+    return {
+      messages: processedMessages,
+      tokensBefore: 0,
+      tokensAfter: 0,
+      tokensSaved: 0,
+      compressionRatio: 1.0,
+      transformsApplied: [],
+      ccrHashes: [],
+      compressed: false,
+    };
+  }
 
   // 3. Shape the messages for the proxy. Anthropic messages go as-is: /v1/compress
   //    compresses Anthropic content blocks natively, and converting them would drop
@@ -54,7 +71,7 @@ export async function compress(
   //    markers and server-tool blocks. Every other format is converted to OpenAI
   //    shape, the proxy's lingua franca.
   const native = inputFormat === "anthropic";
-  const proxyMessages = native ? processedMessages : toOpenAI(processedMessages);
+  const proxyMessages = native ? processedMessages : toOpenAI(processedMessages, inputFormat);
 
   // 4. Compute biases
   let biases: Record<number, number> = {};
