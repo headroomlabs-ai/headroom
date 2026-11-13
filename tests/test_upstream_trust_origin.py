@@ -75,3 +75,50 @@ def test_allowed_hosts_entries_designate_one_origin(
 )
 def test_malformed_destinations_are_not_trusted(url: str) -> None:
     assert not is_trusted_upstream(url)
+
+
+def test_each_provider_extras_stay_with_that_provider() -> None:
+    """OpenAI extras never go to Anthropic's API, and Anthropic extras never go to OpenAI's."""
+    openai_extra = {"x-operator-oai": "oai-secret"}
+    anthropic_extra = {"x-operator-ant": "ant-secret"}
+    cfg = SimpleNamespace(openai_api_url="https://gateway.example/v1")
+
+    def sent(extra: dict[str, str], url: str, provider: str) -> dict[str, str]:
+        return merge_extra_headers({}, extra, upstream_url=url, config=cfg, provider=provider)
+
+    assert sent(openai_extra, "https://api.openai.com/v1", "openai") == openai_extra
+    assert sent(openai_extra, "https://gateway.example/v1", "openai") == openai_extra
+    assert sent(openai_extra, "https://api.anthropic.com/v1", "openai") == {}
+    assert sent(anthropic_extra, "https://api.anthropic.com/v1", "anthropic") == anthropic_extra
+    assert sent(anthropic_extra, "https://api.openai.com/v1", "anthropic") == {}
+    assert sent(anthropic_extra, "https://gateway.example/v1", "anthropic") == {}
+
+
+def test_an_allowed_host_is_designated_for_both_providers(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv(ALLOWED_HOSTS_ENV, "shared-gateway.example")
+    for provider in ("openai", "anthropic"):
+        assert is_trusted_upstream("https://shared-gateway.example/v1", None, provider)
+
+
+def test_the_handlers_scope_extras_to_their_own_provider(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Wiring check: chat sends only OpenAI extras, messages only Anthropic extras."""
+    from headroom.proxy.handlers.anthropic import _build_outbound_anthropic_headers
+    from tests.test_grok_shared_proxy_call_sites import _OPENAI_CLIENT_HEADERS, _run_chat
+
+    monkeypatch.setenv("HEADROOM_ALLOWED_BASE_URLS", "api.anthropic.com")
+    outbound = _run_chat(
+        {**_OPENAI_CLIENT_HEADERS, "x-headroom-base-url": "https://api.anthropic.com"},
+        model="gpt-4o-mini",
+        extras={"X-Operator-Sentinel": "must-not-leak"},
+    )
+    assert outbound.url.startswith("https://api.anthropic.com")
+    assert "x-operator-sentinel" not in outbound.headers
+
+    headers = _build_outbound_anthropic_headers(
+        {},
+        {"x-operator-ant": "ant-secret"},
+        routed_to_omlx=False,
+        upstream_url="https://api.openai.com",
+        config=SimpleNamespace(),
+    )
+    assert "x-operator-ant" not in headers

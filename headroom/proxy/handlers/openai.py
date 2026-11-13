@@ -3681,6 +3681,7 @@ class OpenAIHandlerMixin:
             else self._openai_extra_headers_for_upstream(upstream_base_url),
             upstream_url=(None if self.anthropic_backend is not None else custom_upstream_base_url),
             config=self.config,
+            provider="openai",
         )
         log_outbound_headers(
             forwarder="openai_chat_completions",
@@ -6381,6 +6382,7 @@ class OpenAIHandlerMixin:
             self._openai_extra_headers_for_upstream(openai_upstream_base_url),
             upstream_url=custom_upstream_base_url,
             config=self.config,
+            provider="openai",
         )
         # Mirror the WS handler: never forward Codex's client-only lite header
         # upstream. OpenAI rejects newer Codex models when it leaks, and the HTTP

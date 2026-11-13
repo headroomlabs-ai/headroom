@@ -39,6 +39,7 @@ from __future__ import annotations
 
 import logging
 import os
+from collections.abc import Iterable
 from typing import Any
 from urllib.parse import urlparse
 
@@ -58,6 +59,17 @@ _API_URL_ATTRS = (
     "bedrock_api_url",
     "omlx_target_api_url",
 )
+
+#: Each provider's extra headers are scoped to that provider's own targets: the
+#: OpenAI extras are not for Anthropic's API, and the reverse.
+_PROVIDER_API_URL_ATTRS = {
+    "anthropic": ("anthropic_api_url", "omlx_target_api_url"),
+    "openai": ("openai_api_url",),
+}
+_PROVIDER_DEFAULT_HOSTS = {
+    "anthropic": "api.anthropic.com",
+    "openai": "api.openai.com",
+}
 
 # Hosts that are always operator-designated: they are what the provider targets
 # resolve to when nothing is overridden, so omitting them would refuse the
@@ -125,12 +137,24 @@ def _origin(value: str | None) -> Origin | None:
     return scheme, host.lower(), port if port is not None else _DEFAULT_PORTS.get(scheme, 0)
 
 
-def trusted_upstream_origins(config: Any = None) -> frozenset[Origin]:
-    """Origins (scheme, host, port) permitted to receive operator-configured secret headers."""
+def trusted_upstream_origins(config: Any = None, provider: str | None = None) -> frozenset[Origin]:
+    """Origins (scheme, host, port) permitted to receive operator-configured secret headers.
 
-    origins: set[Origin] = {("https", host, 443) for host in _DEFAULT_HOSTS}
-    candidates = [getattr(config, attr, None) for attr in _API_URL_ATTRS]
-    candidates.append(resolve_omlx_target_api_url(environ=os.environ))
+    With ``provider`` (``"openai"`` or ``"anthropic"``) only that provider's own
+    targets count, plus ``HEADROOM_UPSTREAM_ALLOWED_HOSTS``; without it, every
+    configured target does.
+    """
+
+    if provider is None:
+        hosts: Iterable[str] = _DEFAULT_HOSTS
+        attrs: Iterable[str] = _API_URL_ATTRS
+    else:
+        hosts = (_PROVIDER_DEFAULT_HOSTS[provider],)
+        attrs = _PROVIDER_API_URL_ATTRS[provider]
+    origins: set[Origin] = {("https", host, 443) for host in hosts}
+    candidates = [getattr(config, attr, None) for attr in attrs]
+    if provider in (None, "anthropic"):
+        candidates.append(resolve_omlx_target_api_url(environ=os.environ))
     candidates.extend(os.environ.get(ALLOWED_HOSTS_ENV, "").split(","))
     for candidate in candidates:
         origin = _origin(candidate) if isinstance(candidate, str) else None
@@ -139,7 +163,7 @@ def trusted_upstream_origins(config: Any = None) -> frozenset[Origin]:
     return frozenset(origins)
 
 
-def is_trusted_upstream(url: str | None, config: Any = None) -> bool:
+def is_trusted_upstream(url: str | None, config: Any = None, provider: str | None = None) -> bool:
     """True when ``url`` is on an origin the operator designated.
 
     ``None``/empty means "no per-request override" — the handler is going to the
@@ -153,7 +177,7 @@ def is_trusted_upstream(url: str | None, config: Any = None) -> bool:
     if not origin:
         # Unparseable destination: refuse rather than guess.
         return False
-    return origin in trusted_upstream_origins(config)
+    return origin in trusted_upstream_origins(config, provider)
 
 
 def warn_untrusted_once(url: str | None, *, request_id: str | None = None) -> None:

@@ -204,9 +204,11 @@ reads this header for routing and then strips it before forwarding upstream.
 secrets. Because `x-headroom-base-url` is chosen by the *client*, those headers
 are only attached when the destination is one the operator designated:
 
-- the origin (scheme, host and port) of a configured provider target
-  (`ANTHROPIC_TARGET_API_URL`, `OPENAI_TARGET_API_URL`, and the
-  Gemini/Vertex/Cloud Code equivalents), or
+- the origin (scheme, host and port) of that provider's own target: for
+  `OPENAI_TARGET_API_HEADERS`, `OPENAI_TARGET_API_URL` or `https://api.openai.com`;
+  for `ANTHROPIC_TARGET_API_HEADERS`, `ANTHROPIC_TARGET_API_URL`, the oMLX target
+  or `https://api.anthropic.com` (the OpenAI headers never go to Anthropic's API,
+  and the reverse), or
 - an entry in `HEADROOM_UPSTREAM_ALLOWED_HOSTS` (comma-separated). A bare host
   means `https` on port 443; write `host:port` for https on another port, or a
   full URL such as `http://gateway.internal:4000` for plain http.

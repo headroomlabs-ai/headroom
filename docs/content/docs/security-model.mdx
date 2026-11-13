@@ -69,10 +69,10 @@ normalized origin. DNS resolution is bounded by `HEADROOM_UPSTREAM_RESOLVE_TIMEO
 
 **What may ride along with it.** The operator's own `*_extra_headers` secrets — the two
 credential-shaped maps in [the settings store](#the-settings-store) — travel only to a
-host the operator designated. Designated means one of the resolved provider API targets
-(`ANTHROPIC_TARGET_API_URL`, `OPENAI_TARGET_API_URL`, and the Gemini/Vertex/Bedrock/Cloud
-Code equivalents), the default `https://api.anthropic.com` / `https://api.openai.com`,
-or an entry in `HEADROOM_UPSTREAM_ALLOWED_HOSTS` (a bare host means https on port 443;
+host the operator designated for that provider. Designated means that provider's own
+API target (`OPENAI_TARGET_API_URL` or the default `https://api.openai.com` for the OpenAI
+headers; `ANTHROPIC_TARGET_API_URL`, the oMLX target or the default
+`https://api.anthropic.com` for the Anthropic headers), or an entry in `HEADROOM_UPSTREAM_ALLOWED_HOSTS` (a bare host means https on port 443;
 `host:port` and full URLs name exactly that origin). Matching is exact equality on the
 *parsed* origin (scheme, hostname, port), never the URL string, so neither
 `https://api.anthropic.com@evil.example` nor `https://api.anthropic.com.evil.example`
