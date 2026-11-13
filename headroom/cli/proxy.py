@@ -1184,6 +1184,17 @@ def dashboard(port: int | None, no_open: bool) -> None:
     "(env: HEADROOM_STATELESS=true)",
 )
 @click.option(
+    "--detached-profile",
+    type=click.Choice(["strict", "lenient", "silent"], case_sensitive=False),
+    default=None,
+    envvar="HEADROOM_DETACHED_PROFILE",
+    help=(
+        "Detached-mode capability policy. strict refuses degraded explicitly "
+        "enabled local-state features; lenient logs degradations; silent only "
+        "exposes them through API/metrics. Env: HEADROOM_DETACHED_PROFILE."
+    ),
+)
+@click.option(
     "--embedding-server/--no-embedding-server",
     default=False,
     help="Run a dedicated embedding server sidecar (Option E). "
@@ -1309,6 +1320,7 @@ def proxy(
     telemetry: bool,
     no_telemetry: bool,
     stateless: bool,
+    detached_profile: str | None,
     embedding_server: bool,
     embedding_server_socket: str | None,
 ) -> None:
@@ -1666,8 +1678,9 @@ def proxy(
         read_maturation_min_size_bytes=read_maturation_min_size_bytes,
         # Memory System (Multi-Provider with auto-detection)
         # --learn implies --memory (need backend for storing patterns)
-        # Stateless mode disables memory (requires SQLite on disk)
-        memory_enabled=False if is_stateless else (memory or (learn and not no_learn)),
+        # Requested state is kept under --stateless so the strict detached profile
+        # can refuse it; the proxy itself never starts memory when stateless.
+        memory_enabled=memory or (learn and not no_learn),
         memory_db_path=memory_db_path,
         memory_storage_mode=cast(Literal["project", "user", "global"], memory_storage.lower()),
         memory_project_root_override=memory_project_root,
@@ -1676,8 +1689,8 @@ def proxy(
         memory_top_k=memory_top_k,
         **qdrant_overrides,
         # Traffic Learning: only with --learn, never with --no-learn
-        # Stateless mode disables learning (requires filesystem)
-        traffic_learning_enabled=False if is_stateless else (learn and not no_learn),
+        # Requested state is kept under --stateless (see memory_enabled above).
+        traffic_learning_enabled=learn and not no_learn,
         traffic_learning_agent_type=os.environ.get("HEADROOM_AGENT_TYPE", "unknown"),
         traffic_learning_min_evidence=min_evidence if min_evidence is not None else 5,
         # Backend (Anthropic direct, Bedrock, LiteLLM, or any-llm)
@@ -1694,6 +1707,10 @@ def proxy(
         usage_reporting=usage_reporting,
         # Stateless mode: disable all filesystem writes
         stateless=is_stateless,
+        detached_profile=cast(
+            Literal["strict", "lenient", "silent"],
+            (detached_profile or os.environ.get("HEADROOM_DETACHED_PROFILE") or "lenient").lower(),
+        ),
         # Unit 4: bounded pre-upstream concurrency on the Anthropic HTTP
         # path. ``None`` -> HeadroomProxy computes ``max(2, min(8,
         # os.cpu_count() or 4))``; ``<= 0`` -> disabled (unbounded).
@@ -1714,7 +1731,7 @@ def proxy(
     )
 
     memory_status = "DISABLED"
-    if config.memory_enabled:
+    if config.memory_enabled and not config.stateless:
         memory_status = "ENABLED (multi-provider)"
 
     license_status = "OSS (no licence)"
@@ -1770,7 +1787,7 @@ IMPORTANT for {provider_config.display_name} users:
 
     # Build memory section if enabled
     memory_section = ""
-    if config.memory_enabled:
+    if config.memory_enabled and not config.stateless:
         memory_section = f"""
 Memory (Multi-Provider):
   - Auto-detects provider from request (Anthropic, OpenAI, Gemini, etc.)
@@ -1953,6 +1970,7 @@ Endpoints:
   GET  /livez      Process liveness
   GET  /readyz     Traffic readiness
   GET  /health     Aggregate health
+  GET  /capabilities Detached-mode capability matrix
   GET  /stats      Detailed statistics
   GET  /stats-history Durable compression history + display session
   GET  /metrics    Prometheus metrics
