@@ -666,13 +666,17 @@ class CompressionStore:
             live = True
             for hash_key in hash_keys:
                 # ``live`` is the key-only probe: the entry's original can be
-                # megabytes, and only its presence and TTL matter here.
+                # megabytes, and only its presence and TTL matter here. A
+                # backend that can fail answers ``None`` there, which is
+                # carried out as-is: a failed probe must not read as a miss.
                 probe = getattr(self._backend, "live", None)
                 if probe is None:
                     entry = self._backend.get(hash_key)
                     live = entry is not None and not entry.is_expired()
                 else:
                     live = probe(hash_key)
+                    if live is None:
+                        return None
                 if not live:
                     break
         if live:
