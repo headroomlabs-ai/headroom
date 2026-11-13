@@ -449,6 +449,11 @@ class ProxyConfig:
     # #3079), so the default flips separately, with measurements (#3815).
     ccr_buffered_chat_streaming: bool = False
 
+    # Circuit breaker for runaway tool repetition loops
+    # "warn" (log warning & metric), "enforce" (return 429), "off" (disabled)
+    # CLI: --circuit-breaker [warn|enforce|off]; env: HEADROOM_CIRCUIT_BREAKER
+    circuit_breaker: str = "warn"
+
     # Connection pool
     max_connections: int = 500
     max_keepalive_connections: int = 100
@@ -623,6 +628,9 @@ class ProxyConfig:
             raise ValueError(
                 "rate_limit_requests_per_minute must be >= 1 when rate_limit_enabled=True"
             )
+        from headroom.proxy.circuit_breaker import resolve_circuit_breaker_mode
+
+        self.circuit_breaker = resolve_circuit_breaker_mode(self.circuit_breaker)
 
     @property
     def provider_api_overrides(self) -> ProviderApiOverrides:
