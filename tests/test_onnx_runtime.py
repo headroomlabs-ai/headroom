@@ -1,6 +1,8 @@
 import os
 import sys
 
+import pytest
+
 from headroom.onnx_runtime import (
     ONNX_ALLOW_SPINNING_ENV,
     ONNX_CPU_ARENA_ENV,
@@ -9,6 +11,18 @@ from headroom.onnx_runtime import (
     hf_entry_known_absent,
     onnx_thread_spinning_enabled,
 )
+
+_THREAD_ENV_VARS = (
+    "HEADROOM_ONNX_INTRA_OP_THREADS",
+    "HEADROOM_ONNX_INTER_OP_THREADS",
+)
+
+
+@pytest.fixture(autouse=True)
+def _clear_thread_env(monkeypatch):
+    """Keep thread-count tests independent of the ambient environment."""
+    for name in _THREAD_ENV_VARS:
+        monkeypatch.delenv(name, raising=False)
 
 
 class _FakeSessionOptions:
@@ -114,8 +128,48 @@ def test_create_cpu_session_options_handles_older_session_options(monkeypatch):
 
     options = create_cpu_session_options(_FakeOrtWithoutToggles)
 
-    assert options.intra_op_num_threads is None
-    assert options.inter_op_num_threads is None
+    # Older SessionOptions without the toggle attributes must not raise.
+    assert isinstance(options.intra_op_num_threads, int)
+    assert options.intra_op_num_threads > 0
+    assert options.inter_op_num_threads == 1
+
+
+def test_create_cpu_session_options_defaults_to_positive_cpuset():
+    """With no explicit values and no env override, intra is sized to the cpuset."""
+    options = create_cpu_session_options(_FakeOrt)
+
+    assert isinstance(options.intra_op_num_threads, int)
+    assert options.intra_op_num_threads > 0
+    assert options.inter_op_num_threads == 1
+
+
+def test_create_cpu_session_options_honors_thread_env_overrides(monkeypatch):
+    monkeypatch.setenv("HEADROOM_ONNX_INTRA_OP_THREADS", "3")
+    monkeypatch.setenv("HEADROOM_ONNX_INTER_OP_THREADS", "2")
+
+    options = create_cpu_session_options(_FakeOrt)
+
+    assert options.intra_op_num_threads == 3
+    assert options.inter_op_num_threads == 2
+
+
+def test_create_cpu_session_options_ignores_invalid_thread_env(monkeypatch):
+    monkeypatch.setenv("HEADROOM_ONNX_INTRA_OP_THREADS", "not-a-number")
+
+    options = create_cpu_session_options(_FakeOrt)
+
+    # Invalid override falls back to the cpuset-sized default.
+    assert isinstance(options.intra_op_num_threads, int)
+    assert options.intra_op_num_threads > 0
+
+
+def test_create_cpu_session_options_explicit_values_ignore_env(monkeypatch):
+    monkeypatch.setenv("HEADROOM_ONNX_INTRA_OP_THREADS", "9")
+
+    options = create_cpu_session_options(_FakeOrt, intra_op_num_threads=1)
+
+    # Explicit caller value wins over the env override.
+    assert options.intra_op_num_threads == 1
 
 
 def test_thread_spinning_disabled_by_default(monkeypatch):
