@@ -4566,12 +4566,17 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
         #    the proxy as a loopback caller.
         if _is_refused_browser_request(request):
             logger.warning(
-                "event=proxy_browser_origin_rejected method=%s path=%s",
+                "event=proxy_browser_origin_rejected method=%s path=%s origin=%s",
                 request.method,
                 _auth_rejection_path(request.url.path),
+                _auth_rejection_path(request.headers.get("origin") or "-"),
             )
             rejection = JSONResponse(
-                status_code=403, content={"error": "cross-origin request rejected"}
+                status_code=403,
+                content={
+                    "error": "cross-origin request rejected",
+                    "hint": "add this page's origin to HEADROOM_WS_ORIGINS to allow it",
+                },
             )
             _apply_security_headers(rejection)
             return rejection

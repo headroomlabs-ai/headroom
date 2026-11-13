@@ -698,10 +698,28 @@ def test_dashboard_client_cidr_grants_stats_metadata_to_same_origin_browser(
     assert "config" in payload
 
 
+@pytest.mark.parametrize("cached", [False, True])
+def test_dashboard_client_cidr_refuses_cross_origin_browser_stats(
+    monkeypatch: pytest.MonkeyPatch, cached: bool
+) -> None:
+    monkeypatch.setenv("HEADROOM_PROXY_TRUSTED_DASHBOARD_CLIENT_CIDRS", "100.90.0.5/32")
+    client = TestClient(
+        _make_app(),
+        base_url="http://100.82.0.2:8787",
+        client=("100.90.0.5", 12345),
+    )
+
+    response = client.get(
+        "/stats", params={"cached": int(cached)}, headers={"origin": "http://attacker.example"}
+    )
+
+    # The security gate refuses a foreign browser Origin before the route runs.
+    assert response.status_code == 403
+
+
 @pytest.mark.parametrize(
     "headers",
     [
-        {"origin": "http://attacker.example"},
         {"referer": "http://attacker.example/dashboard"},
     ],
 )
@@ -719,10 +737,6 @@ def test_dashboard_client_cidr_hides_stats_metadata_from_cross_origin_browser(
     response = client.get("/stats", params={"cached": int(cached)}, headers=headers)
     payload = response.json()
 
-    if "origin" in headers:
-        # The security gate refuses a foreign browser Origin outright.
-        assert response.status_code == 403
-        return
     assert response.status_code == 200
     assert "tokens" in payload
     assert "recent_requests" not in payload
