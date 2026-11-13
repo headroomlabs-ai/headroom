@@ -81,9 +81,17 @@ def redact_dump_headers(
 
 
 def write_owner_only_json(path: Path, payload: Any) -> None:
-    """Write ``payload`` as JSON readable by the owner only (dir 0700, file 0600)."""
+    """Write ``payload`` as JSON readable by the owner only (dir 0700, file 0600).
+
+    The modes passed to ``mkdir`` and ``os.open`` apply only when they create
+    the path, so an existing directory or file is tightened as well, before any
+    content is written.
+    """
     path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    os.chmod(path.parent, 0o700)
     fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    if hasattr(os, "fchmod"):  # POSIX; Windows has no owner-only mode bits
+        os.fchmod(fd, 0o600)
     with os.fdopen(fd, "w", encoding="utf-8") as fh:
         json.dump(payload, fh, indent=2, default=str)
 

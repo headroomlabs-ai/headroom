@@ -181,3 +181,21 @@ def test_uvicorn_access_log_drops_query_values() -> None:
 
     assert any("/livez?" in line for line in lines)
     assert not any(FAKE_KEY in line for line in lines)
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX permission bits")
+def test_owner_only_write_tightens_an_existing_directory_and_file(tmp_path) -> None:
+    from headroom.proxy.handlers._debug_dump import write_owner_only_json
+
+    dump_dir = tmp_path / "debug_400"
+    dump_dir.mkdir(mode=0o755)
+    os.chmod(dump_dir, 0o755)
+    dump = dump_dir / "dump.json"
+    dump.write_text("{}", encoding="utf-8")
+    os.chmod(dump, 0o644)
+
+    write_owner_only_json(dump, {"headers": {"authorization": "<redacted>"}})
+
+    assert stat.S_IMODE(dump_dir.stat().st_mode) == 0o700
+    assert stat.S_IMODE(dump.stat().st_mode) == 0o600
+    assert json.loads(dump.read_text(encoding="utf-8"))["headers"]["authorization"] == "<redacted>"
