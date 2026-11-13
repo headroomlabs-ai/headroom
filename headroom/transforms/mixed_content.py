@@ -120,13 +120,16 @@ def _has_valid_json_block_with_text(content: str) -> bool:
     # _extract_json_block. Content that balances promptly never allocates it and
     # so pays nothing for it.
     scan_cache: dict[tuple[int, bool, bool], tuple[int, int, bool, bool]] | None = None
+    reach: dict[tuple[int, bool, bool], tuple[int, int]] = {}
     budget = _ScanBudget.for_lines(lines)
 
     for index, line in enumerate(lines):
         if not line.strip().startswith(("[", "{")):
             continue
 
-        json_content, end_index = _extract_json_block(lines, index, cache=scan_cache, budget=budget)
+        json_content, end_index = _extract_json_block(
+            lines, index, cache=scan_cache, reach=reach, budget=budget
+        )
         if json_content is None:
             if scan_cache is None:
                 scan_cache = {}
@@ -162,6 +165,7 @@ def split_into_sections(content: str, *, isolate: tuple[str, ...] = ()) -> list[
         return any(marker in text for marker in isolate)
 
     scan_cache: dict[tuple[int, bool, bool], tuple[int, int, bool, bool]] | None = None
+    reach: dict[tuple[int, bool, bool], tuple[int, int]] = {}
     scan_budget = _ScanBudget.for_lines(lines)
 
     i = 0
@@ -206,7 +210,7 @@ def split_into_sections(content: str, *, isolate: tuple[str, ...] = ()) -> list[
 
         if line.strip().startswith(("[", "{")):
             json_content, end_i = _extract_json_block(
-                lines, i, cache=scan_cache, budget=scan_budget
+                lines, i, cache=scan_cache, reach=reach, budget=scan_budget
             )
             if json_content is None and scan_cache is None:
                 # First scan that ran to the end without balancing: from here on
@@ -359,11 +363,45 @@ def _scan_line(line: str, in_string: bool, escaped: bool) -> tuple[int, int, boo
     return bracket, brace, in_string, escaped
 
 
+def _lowest_counts(
+    lines: list[str],
+    start: int,
+    cache: dict[tuple[int, bool, bool], tuple[int, int, bool, bool]],
+    reach: dict[tuple[int, bool, bool], tuple[int, int]],
+) -> tuple[int, int]:
+    """Lowest running (bracket, brace) counts of a block scan from ``start``.
+
+    Walks forward only until it meets a line/state already in ``reach``, then
+    fills the walked entries backwards, so each entry is computed once per
+    pass however many candidates reach it.
+    """
+    walked: list[tuple[tuple[int, bool, bool], int, int]] = []
+    key = (start, False, False)
+    while key[0] < len(lines) and key not in reach:
+        step = cache.get(key)
+        if step is None:
+            step = _scan_line(lines[key[0]], key[1], key[2])
+            cache[key] = step
+        d_bracket, d_brace, in_string, escaped = step
+        walked.append((key, d_bracket, d_brace))
+        key = (key[0] + 1, in_string, escaped)
+    # Past the last line there is nothing further to reach.
+    tail = reach.get(key)
+    for node, d_bracket, d_brace in reversed(walked):
+        if tail is None:
+            tail = (d_bracket, d_brace)
+        else:
+            tail = (min(d_bracket, d_bracket + tail[0]), min(d_brace, d_brace + tail[1]))
+        reach[node] = tail
+    return tail if tail is not None else (0, 0)
+
+
 def _extract_json_block(
     lines: list[str],
     start: int,
     *,
     cache: dict[tuple[int, bool, bool], tuple[int, int, bool, bool]] | None = None,
+    reach: dict[tuple[int, bool, bool], tuple[int, int]] | None = None,
     budget: _ScanBudget | None = None,
 ) -> tuple[str | None, int]:
     """Extract a complete JSON object or array block from line-oriented content.
@@ -388,11 +426,23 @@ def _extract_json_block(
     reused where the parser is in the same string/escape state. Same deltas,
     same result: this is a memo, not a heuristic.
 
+    ``reach`` (used together with ``cache``) memoises, per line and entry
+    state, the lowest running bracket and brace counts the walk reaches from
+    there to the end. A block balances only where both counts are <= 0, so a
+    candidate whose lowest bracket or brace count stays above 0 cannot balance
+    and is rejected without walking. This is exact, and it is what keeps runs
+    of unclosed ``{`` lines from walking to the end once per line.
+
     ``budget`` (shared by all candidates of one pass, ``None`` = unlimited) is
     spent one per line walked. When it runs out the block is reported as
-    unbalanced, which bounds the total work of many unclosed candidates (the
-    memo above does not: their counts differ at every line).
+    unbalanced. It only bounds shapes the ``reach`` check cannot rule out
+    (counts that each drop to 0 but never at the same line).
     """
+    if cache is not None and reach is not None:
+        lowest_bracket, lowest_brace = _lowest_counts(lines, start, cache, reach)
+        if lowest_bracket > 0 or lowest_brace > 0:
+            return None, start
+
     bracket_count = 0
     brace_count = 0
     in_string = False

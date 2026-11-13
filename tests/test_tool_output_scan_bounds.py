@@ -10,6 +10,8 @@ import random
 import re
 import time
 
+import pytest
+
 from headroom.proxy.interceptors.astgrep import (
     _detect_truncation,
     _is_plausible_truncation_range,
@@ -80,3 +82,14 @@ def test_long_json_block_inside_text_still_found() -> None:
     assert _has_valid_json_block_with_text(content) is True
     types = [s.content_type for s in split_into_sections(content)]
     assert ContentType.JSON_ARRAY in types
+
+
+@pytest.mark.parametrize("unclosed", [150, 20000])
+def test_json_object_after_many_unclosed_braces_keeps_its_own_section(unclosed: int) -> None:
+    obj = '{"critical": "disk full"}'
+    content = "\n".join(["{"] * unclosed + ["some prose"] * 6 + [obj, "more prose"])
+    assert _has_valid_json_block_with_text(content) is True
+    json_sections = [
+        s for s in split_into_sections(content) if s.content_type is ContentType.JSON_ARRAY
+    ]
+    assert [s.content for s in json_sections] == [obj]
