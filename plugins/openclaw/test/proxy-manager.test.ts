@@ -430,8 +430,9 @@ describe("ProxyManager launch internals", () => {
       writeFileSync(join(project, "headroom", "__init__.py"), "");
       for (const spec of pythonSpecs) {
         if (probe.status === 0) {
-          // -S hides any installed headroom, so only the project folder could match.
-          const check = spawnSync("python3", ["-S", ...spec.checkArgs], { cwd: project });
+          // -S and -E hide any installed or PYTHONPATH headroom, so only the
+          // project folder could match.
+          const check = spawnSync("python3", ["-S", "-E", ...spec.checkArgs], { cwd: project });
           expect(check.status).toBe(1);
         }
         expect(spec.args[0]).toBe("-P");
