@@ -133,3 +133,19 @@ def test_anthropic_cache_hit_log_keeps_model_on_one_line(proxy_logs):
             )
 
     _assert_single_line(proxy_logs, "RESPONSE-CACHE-HIT")
+
+
+def test_unknown_anthropic_model_warning_logs_model_as_one_token() -> None:
+    from headroom.providers.anthropic import AnthropicProvider
+
+    target = logging.getLogger("headroom.providers.anthropic")
+    handler = _Capture()
+    target.addHandler(handler)
+    try:
+        AnthropicProvider().get_context_limit(MULTILINE_MODEL + " provider-warning")
+    finally:
+        target.removeHandler(handler)
+
+    [message] = [m for m in handler.messages if "Unknown Anthropic model" in m]
+    assert "\n" not in message
+    assert repr(MULTILINE_MODEL + " provider-warning") in message
