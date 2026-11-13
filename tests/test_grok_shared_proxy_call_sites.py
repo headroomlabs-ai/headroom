@@ -303,3 +303,74 @@ def test_configured_chat_backend_retains_its_operator_extras() -> None:
     assert headers["x-operator-sentinel"] == _SENTINEL_VALUE
     assert headers["authorization"] == _OPERATOR_KEY
     assert handler.captured_request is None
+
+
+def test_a_long_image_compression_does_not_leave_an_expired_pin(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The guard's pin lasts 60 s; image compression may take longer.
+
+    The stub compression ages every pin in the request's scope past its
+    deadline. The connection must still find a current pin for the gateway the
+    request was checked against, or the connect layer refuses it.
+    """
+    import socket
+
+    from headroom.proxy import upstream_guard
+
+    monkeypatch.delenv("HEADROOM_ALLOWED_BASE_URLS", raising=False)
+    monkeypatch.setattr(
+        socket,
+        "getaddrinfo",
+        lambda *a, **k: [(None, None, None, None, ("93.184.216.34", 443))],
+    )
+    upstream_guard.clear_validated_addresses()
+
+    class _Compressor:
+        def has_images(self, messages: object) -> bool:
+            return True
+
+        def close(self) -> None:
+            return None
+
+    async def _slow_compression(messages: Any, **kwargs: Any) -> tuple[Any, None]:
+        scope = upstream_guard._PIN_SCOPE.get() or {}
+        for host, pin in list(scope.items()):
+            scope[host] = upstream_guard.UpstreamPin(pin.addresses, 0.0)
+        return messages, None
+
+    monkeypatch.setattr("headroom.proxy.helpers._get_image_compressor", lambda: _Compressor())
+    monkeypatch.setattr(
+        "headroom.proxy.handlers.openai.run_image_compression_isolated", _slow_compression
+    )
+
+    pin_at_send: list[upstream_guard.UpstreamPin | None] = []
+
+    class _Handler(_ChatHandler):
+        async def _retry_request(self, method: str, url: str, headers: dict, body: dict, **kwargs):  # noqa: ANN201
+            pin_at_send.append(upstream_guard.guarded_pin("gateway.example"))
+            return await super()._retry_request(method, url, headers, body, **kwargs)
+
+    handler = _Handler()
+    handler.config.image_optimize = True
+    request = _build_request(
+        {
+            "model": "gpt-4o",
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": "what is this"},
+                        {"type": "image_url", "image_url": {"url": "data:image/png;base64,AAAA"}},
+                    ],
+                }
+            ],
+        },
+        {**_OPENAI_CLIENT_HEADERS, "x-headroom-base-url": "https://gateway.example/v1"},
+        path="/v1/chat/completions",
+    )
+    anyio.run(handler.handle_openai_chat, request)
+
+    assert pin_at_send, "the request was not sent"
+    pin = pin_at_send[0]
+    assert pin is not None and not pin.is_expired(), "the connection would find an expired pin"
