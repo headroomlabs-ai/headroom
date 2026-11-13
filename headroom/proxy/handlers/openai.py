@@ -2355,7 +2355,16 @@ class OpenAIHandlerMixin:
         Otherwise falls back to the configured ``OPENAI_API_URL``
         (``OPENAI_TARGET_API_URL``).
         """
-        custom = _resolve_openai_upstream_base(request.headers)
+        return self._openai_upstream_from(request, _resolve_openai_upstream_base(request.headers))
+
+    def _openai_upstream_from(self, request: Request, custom: str | None) -> str:
+        """Pick the upstream given this request's already-resolved override.
+
+        Handlers resolve ``x-headroom-base-url`` once and pass that one result
+        here and to ``merge_extra_headers``. Resolving it again could get a
+        different DNS answer, so the destination and the extra-header trust
+        check would be judging different upstreams.
+        """
         if custom is not None:
             return custom
         if route_grok_to_xai(request.headers, self.OPENAI_API_URL):
@@ -3617,7 +3626,7 @@ class OpenAIHandlerMixin:
         model = body.get("model", "unknown")
         messages = body.get("messages", [])
         custom_upstream_base_url = _resolve_openai_upstream_base(request.headers)
-        upstream_base_url = self._resolve_openai_upstream(request)
+        upstream_base_url = self._openai_upstream_from(request, custom_upstream_base_url)
         # Ghost text and next edits: CAPI does not serve these models. A
         # caller-chosen x-headroom-base-url is left alone, as in
         # select_passthrough_base_url.
@@ -3856,7 +3865,6 @@ class OpenAIHandlerMixin:
         # tags now that the tags dict exists. Same observability pattern
         # the funnel uses for passthrough_reason + memory_skip_reason.
         _image_decision.apply_to_tags(tags)
-        custom_upstream_base_url = _resolve_openai_upstream_base(request.headers)
         handler_path = _resolve_openai_chat_forward_path(request.headers, custom_upstream_base_url)
         _, custom_chat_provider = _custom_base_passthrough_telemetry(
             request.method,
@@ -6375,7 +6383,7 @@ class OpenAIHandlerMixin:
         # below sends the request to chatgpt.com.
         custom_upstream_base_url = _resolve_openai_upstream_base(request.headers)
         upstream_base_url = custom_upstream_base_url
-        openai_upstream_base_url = self._resolve_openai_upstream(request)
+        openai_upstream_base_url = self._openai_upstream_from(request, custom_upstream_base_url)
         headers = merge_extra_headers(
             headers,
             self._openai_extra_headers_for_upstream(openai_upstream_base_url),
