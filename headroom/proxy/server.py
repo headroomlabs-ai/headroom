@@ -7042,6 +7042,11 @@ def run_server(
     app_target: Any
     uvicorn_kwargs: dict[str, Any] = {}
     worker_secrets_path: Path | None = None
+    # Worker hand-off variables as they were before this run, restored on exit
+    # so a later run in the same process starts from the same state.
+    prior_worker_env = {
+        name: os.environ.get(name) for name in (_MULTI_WORKER_CONFIG_ENV, _MULTI_WORKER_SECRETS_ENV)
+    }
     if sys.platform == "win32":
         _configure_windows_uvicorn_loop(uvicorn_kwargs)
     if workers > 1:
@@ -7124,7 +7129,12 @@ def run_server(
             remove_uds_path(uds_path)
         if worker_secrets_path is not None:
             worker_secrets_path.unlink(missing_ok=True)
-            os.environ.pop(_MULTI_WORKER_SECRETS_ENV, None)
+        if workers > 1:
+            for name, value in prior_worker_env.items():
+                if value is None:
+                    os.environ.pop(name, None)
+                else:
+                    os.environ[name] = value
 
 
 def _run_uvicorn(

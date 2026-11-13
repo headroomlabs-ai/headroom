@@ -91,7 +91,9 @@ def test_credential_free_restart_after_a_credentialed_run_still_starts(
 
     with patch.object(server, "_run_uvicorn", side_effect=fake_run_uvicorn):
         server.run_server(ProxyConfig(**SECRETS), workers=2, print_banner=False)
+        # The worker hand-off variables are back to their pre-run state (unset).
         assert "HEADROOM_PROXY_CONFIG_SECRETS_FILE" not in os.environ
+        assert "HEADROOM_PROXY_CONFIG_JSON" not in os.environ
         server.run_server(ProxyConfig(), workers=2, print_banner=False)
 
     assert configs[0].proxy_token == "FAKE-PROXYTOKEN"
