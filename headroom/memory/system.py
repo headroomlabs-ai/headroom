@@ -493,15 +493,19 @@ class MemorySystem:
         }
 
     async def handle_memory_list(self, limit: int = 10) -> dict[str, Any]:
-        """List recent memories for this user without requiring a search query."""
-        list_memories = getattr(self._backend, "get_user_memories", None)
+        """List recent memories within this user's current scope."""
+        method = "get_user_memories" if self._session_id is None else "get_session_memories"
+        list_memories = getattr(self._backend, method, None)
         if not callable(list_memories):
             return {
                 "success": False,
-                "error": "This memory backend does not support listing memories",
+                "error": "This memory backend does not support listing memories for this scope",
             }
         limit = max(1, min(limit, 100))
-        memories = await list_memories(user_id=self._user_id, limit=limit)
+        kwargs: dict[str, Any] = {"user_id": self._user_id, "limit": limit}
+        if self._session_id is not None:
+            kwargs["session_id"] = self._session_id
+        memories = await list_memories(**kwargs)
         return {
             "success": True,
             "message": f"Found {len(memories)} memories",
