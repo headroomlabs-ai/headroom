@@ -210,6 +210,10 @@ def test_legacy_raw_query_keys_are_removed_on_load(tmp_path) -> None:
 
     assert pattern.query_pattern_frequency == {"1a2b3c4d:* 5e6f7a8b:*": 2}
     assert pattern.common_query_patterns == ["1a2b3c4d:* 5e6f7a8b:*"]
+    # Rewritten at load, not on the next observation.
+    on_disk = path.read_text(encoding="utf-8")
+    assert "raw prompt containing secret source code" not in on_disk
+    assert "status:* user:*" not in on_disk
 
 
 def _record(toin: ToolIntelligenceNetwork, index: int) -> None:

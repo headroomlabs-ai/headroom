@@ -89,6 +89,7 @@ from headroom.config import (
     resolve_omlx_target_api_url,
 )
 from headroom.dashboard import get_dashboard_html
+from headroom.exceptions import ConfigurationError
 from headroom.log_safety import describe_exception, safe_id
 from headroom.observability import (
     LangfuseTracingConfig,
@@ -6734,24 +6735,39 @@ def _write_worker_secrets(payload: dict[str, Any]) -> Path | None:
 
 
 def _read_worker_secrets() -> dict[str, Any]:
+    """Read the credentials the parent wrote for this worker.
+
+    Raises instead of returning nothing when the file is named but unreadable:
+    a worker that fell back to env defaults would come up without the proxy
+    token while still bound to the parent's host.
+    """
     path = os.environ.get(_MULTI_WORKER_SECRETS_ENV)
     if not path:
         return {}
-    with open(path, encoding="utf-8") as fh:
-        values = json.load(fh)
+    try:
+        with open(path, encoding="utf-8") as fh:
+            values = json.load(fh)
+    except (OSError, ValueError) as exc:
+        raise ConfigurationError(
+            f"Worker cannot read its credentials file {path!r} ({type(exc).__name__}). "
+            "The parent proxy writes it at startup and removes it on exit; restart the proxy."
+        ) from exc
     if not isinstance(values, dict):
-        raise TypeError("proxy config secrets file must hold a JSON object")
+        raise ConfigurationError(
+            f"Worker credentials file {path!r} does not hold a JSON object; restart the proxy."
+        )
     return values
 
 
 def _proxy_config_from_env() -> ProxyConfig:
     raw_config = os.environ.get(_MULTI_WORKER_CONFIG_ENV)
     if raw_config:
+        worker_secrets = _read_worker_secrets()
         try:
             values = json.loads(raw_config)
             if not isinstance(values, dict):
                 raise TypeError("proxy config JSON must be an object")
-            values.update(_read_worker_secrets())
+            values.update(worker_secrets)
             if "_rollout_snapshot" in values:
                 rollout_value = values.pop("_rollout_snapshot")
                 from headroom.rollout import RolloutSnapshot
@@ -6760,11 +6776,9 @@ def _proxy_config_from_env() -> ProxyConfig:
             if "profile_seeded_env_keys" in values:
                 values["profile_seeded_env_keys"] = frozenset(values["profile_seeded_env_keys"])
             return ProxyConfig(**values)
-        except (KeyError, TypeError, ValueError, OSError):
+        except (KeyError, TypeError, ValueError, json.JSONDecodeError):
             logger.warning(
-                "Invalid %s or %s; falling back to HEADROOM_* env vars",
-                _MULTI_WORKER_CONFIG_ENV,
-                _MULTI_WORKER_SECRETS_ENV,
+                "Invalid %s; falling back to HEADROOM_* env vars", _MULTI_WORKER_CONFIG_ENV
             )
 
     from headroom.rollout import resolve_rollout

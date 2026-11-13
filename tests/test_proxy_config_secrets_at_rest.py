@@ -76,6 +76,20 @@ def test_multi_worker_config_keeps_secrets_out_of_the_environment(
     assert not Path(seen["secrets_file"]).exists()  # removed when the server stops
 
 
+def test_worker_without_its_secrets_file_refuses_to_start(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    from headroom.exceptions import ConfigurationError
+    from headroom.proxy import server
+
+    # Falling back to env defaults here would drop the proxy token.
+    monkeypatch.setenv("HEADROOM_PROXY_CONFIG_JSON", json.dumps({"host": "0.0.0.0"}))
+    monkeypatch.setenv("HEADROOM_PROXY_CONFIG_SECRETS_FILE", str(tmp_path / "gone.json"))
+
+    with pytest.raises(ConfigurationError, match="restart the proxy"):
+        server._proxy_config_from_env()
+
+
 def test_toin_query_pattern_does_not_keep_the_text_before_a_colon() -> None:
     toin = ToolIntelligenceNetwork(TOINConfig(storage_path=""))
 
