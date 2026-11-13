@@ -1355,7 +1355,7 @@ impl PyLogCompressorConfig {
         enable_ccr = true,
         min_lines_for_ccr = 50,
         min_compression_ratio_for_ccr = 0.5,
-        collapse_runtime_frames = true,
+        collapse_runtime_frames = false,
         trace_head_frames = 3,
         trace_app_frames = 5,
     ))]

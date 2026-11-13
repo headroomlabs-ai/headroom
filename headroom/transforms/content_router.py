@@ -110,6 +110,11 @@ is_mixed_content = _mixed_content.is_mixed_content
 split_into_sections = _mixed_content.split_into_sections
 
 
+def _structured_config_compression_enabled() -> bool:
+    value = os.environ.get("HEADROOM_CONFIG_COMPRESSION", "")
+    return value.strip().lower() in {"1", "true", "yes", "on", "enabled"}
+
+
 _detect_backend_warned = False
 _detect_panic_warned = False
 _detect_native_unhealthy = False  # circuit breaker: native detect hung once (#575)
@@ -2377,7 +2382,9 @@ class ContentRouterConfig:
     enable_search_compressor: bool = True
     enable_log_compressor: bool = True
     enable_tabular_compressor: bool = True  # CSV/TSV/markdown tables via SmartCrusher
-    enable_config_compressor: bool = True  # YAML/TOML/INI structural compression
+    enable_config_compressor: bool = field(
+        default_factory=_structured_config_compression_enabled
+    )  # YAML/TOML/INI structural compression
     enable_html_extractor: bool = True  # HTML content extraction
     # Last-resort fallback for blocks no compressor could shrink: elide the
     # middle of long, whitespace-free lines (minified JS/CSS, base64, RSC
@@ -2850,7 +2857,7 @@ class ContentRouter(Transform):
         # clear (no LRU bookkeeping — this is a within-request hit, not a
         # long-lived cache; `_cache` is the cross-request one).
         self._lossless_first_memo: dict[
-            tuple[int, int, CompressionStrategy, int], tuple[str, str | None]
+            tuple[int, int, CompressionStrategy, int, bool], tuple[str, str | None]
         ] = {}
         # Companion memo for the third-party half of STAGE 0, keyed by content
         # (plus the provider generation) but NOT by strategy — the provider
@@ -3915,7 +3922,16 @@ class ContentRouter(Transform):
         # that DEPENDS on the registered provider, so a provider registered (or
         # cleared) after a block was first folded must not be served the old
         # answer forever.
-        memo_key = (hash(content), len(content), strategy, get_lossless_generation())
+        config_enabled = bool(
+            getattr(getattr(self, "config", None), "enable_config_compressor", False)
+        )
+        memo_key = (
+            hash(content),
+            len(content),
+            strategy,
+            get_lossless_generation(),
+            config_enabled,
+        )
         memoized = memo.get(memo_key)
         if memoized is not None:
             return memoized
@@ -3931,7 +3947,7 @@ class ContentRouter(Transform):
             CompressionStrategy.SEARCH: "search",
             CompressionStrategy.LOG: "log",
             CompressionStrategy.DIFF: "diff",
-            CompressionStrategy.CONFIG: "config",
+            CompressionStrategy.CONFIG: "config" if config_enabled else None,
         }.get(strategy)
         order = ([primary] if primary else []) + [
             k for k in ("search", "paths", "log", "diff", "text") if k != primary
