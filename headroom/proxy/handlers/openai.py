@@ -3834,6 +3834,7 @@ class OpenAIHandlerMixin:
         # tags is populated downstream at L1229 — defer apply_to_tags
         # to where the tags dict exists. The decision is captured here
         # so the conditional is uniform with the other gates.
+        images_compressed = False
         if _image_decision.should_compress:
             from headroom.proxy.helpers import _get_image_compressor
 
@@ -3841,6 +3842,7 @@ class OpenAIHandlerMixin:
             try:
                 compressor = _get_image_compressor()
                 if compressor and compressor.has_images(messages):
+                    images_compressed = True
                     messages, image_result = await run_image_compression_isolated(
                         messages,
                         provider="openai",
@@ -3860,6 +3862,19 @@ class OpenAIHandlerMixin:
             finally:
                 if compressor and hasattr(compressor, "close"):
                     compressor.close()
+        # The guard's pin for a client-chosen upstream lasts 60 s and image
+        # compression can run longer. Check the same URL again so the connection
+        # has a current pin. The destination is not chosen again: if the host no
+        # longer passes, the request is refused.
+        if (
+            images_compressed
+            and custom_upstream_base_url is not None
+            and not is_safe_upstream_url(custom_upstream_base_url)
+        ):
+            logger.warning(
+                "[%s] rejecting x-headroom-base-url that no longer passes the guard", request_id
+            )
+            raise HTTPException(status_code=400, detail="Rejected unsafe upstream base URL")
 
         # Surface the image-compression decision (computed earlier) into
         # tags now that the tags dict exists. Same observability pattern
