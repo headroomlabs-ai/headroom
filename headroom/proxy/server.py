@@ -911,11 +911,35 @@ def _apply_stateless_persistence(config: ProxyConfig) -> None:
     detach_compression_store()
 
 
+# Hop-by-hop fields (RFC 9110 7.6.1) describe the client's connection to the
+# proxy, not the proxy's connection to the provider. Handlers copy the inbound
+# headers, so a client's `Connection: close` reached the provider and made
+# every pooled upstream connection single-use: a fresh DNS lookup, TCP connect
+# and TLS handshake per request. Framing (content-length, transfer-encoding)
+# is httpx's own by the time the hook runs and is never touched.
+_HOP_BY_HOP_REQUEST_HEADERS = frozenset(
+    {"connection", "keep-alive", "proxy-connection", "te", "trailer", "upgrade"}
+)
+_FRAMING_REQUEST_HEADERS = frozenset({"host", "content-length", "transfer-encoding"})
+
+
+async def _drop_hop_by_hop_request_headers(request: httpx.Request) -> None:
+    named = {
+        token.strip().lower()
+        for token in request.headers.get_list("connection", split_commas=True)
+        if token.strip()
+    }
+    for name in (_HOP_BY_HOP_REQUEST_HEADERS | named) - _FRAMING_REQUEST_HEADERS:
+        if name in request.headers:
+            del request.headers[name]
+
+
 def _provider_httpx_client_options(
     config: ProxyConfig,
     verify: Any,
 ) -> tuple[bool, dict[str, Any]]:
     client_kwargs: dict[str, Any] = {
+        "event_hooks": {"request": [_drop_hop_by_hop_request_headers]},
         "timeout": httpx.Timeout(
             connect=config.connect_timeout_seconds,
             read=config.request_timeout_seconds,
@@ -4473,6 +4497,11 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
     # One bad plugin must not brick the proxy. Note the consequence: a plugin
     # whose licence gate raises is absent, not fatal — the feature fails closed,
     # the process does not.
+    #
+    # The exception is an extension that marks its install() `fail_closed`
+    # (e.g. one that mints the upstream credential): running without it would
+    # relay the client's own Authorization upstream, so `install_all` re-raises
+    # and create_app fails instead of serving mis-authenticated. See #4737.
     #
     # Installed HERE, before the body limit and the security gate are
     # registered, so any middleware an extension adds sits INSIDE both (see the
