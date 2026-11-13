@@ -268,11 +268,12 @@ refused with **403**. A cross-site subresource load, which carries no `Origin`, 
 refused by `Sec-Fetch-Site: cross-site` unless it is a top-level navigation. Requests
 with no `Origin` (SDKs, coding agents, curl) are unaffected.
 
-Two setups need the page's origin listed in `HEADROOM_WS_ORIGINS`: a reverse proxy on the
-same host that forwards a public hostname to `127.0.0.1` (the proxy sees a loopback peer
-with a non-loopback `Host`, which is indistinguishable from a re-pointed hostname), and
-desktop shells whose pages send an app scheme such as `tauri://localhost`. `Origin: null`
-(sandboxed iframes, `file://` pages) cannot be allowed.
+A reverse proxy on the same host that forwards a public hostname to `127.0.0.1` needs the
+page's origin (`https://name`) listed in `HEADROOM_WS_ORIGINS`: the proxy sees a loopback
+peer with a non-loopback `Host`, which is indistinguishable from a re-pointed hostname.
+Only `http`/`https` origins can be listed. Pages that send an app scheme (such as
+`tauri://localhost`) or `Origin: null` (sandboxed iframes, `file://` pages) are always
+refused; a desktop app should call the proxy from its native side, which sends no `Origin`.
 
 ### The two CIDR allowlists
 
