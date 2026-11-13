@@ -144,6 +144,7 @@ from headroom.proxy.helpers import (
     EAGER_PRELOAD_TIMEOUT_SECONDS,
     MAX_COMPRESSION_CACHE_SESSIONS,
     RETRYABLE_OVERLOAD_STATUSES,
+    RequestWriteTrace,
     _setup_file_logging,
     is_anthropic_auth,  # noqa: F401
     jitter_delay_ms,
@@ -2809,6 +2810,8 @@ class HeadroomProxy(
         )
 
         for attempt in range(self.config.retry_max_attempts):
+            request_trace = RequestWriteTrace()
+            post_kwargs["extensions"] = {"trace": request_trace}
             try:
                 if stream:
                     # For streaming, we return early - retry happens at higher level
@@ -2874,12 +2877,16 @@ class HeadroomProxy(
             # HTTP/2 `StreamReset`) that a poisoned shared h2 connection raises on
             # every in-flight request. Retrying drops the bad connection and
             # re-sends on a fresh one instead of collapsing to a 502. (#1639)
-            # ssl.SSLError: a corrupt TLS record on a reused keep-alive
-            # connection escapes httpx's TransportError mapping.
+            # A raw ssl.SSLError escapes httpx's TransportError mapping; it is
+            # retried only if the request write failed (RequestWriteTrace).
             except (httpx.TransportError, httpx.HTTPStatusError, ssl.SSLError) as e:
                 last_error = e
 
-                if not self.config.retry_enabled or attempt >= self.config.retry_max_attempts - 1:
+                if (
+                    not self.config.retry_enabled
+                    or attempt >= self.config.retry_max_attempts - 1
+                    or request_trace.forbids_retry(e)
+                ):
                     # On exhaustion, preserve the upstream 5xx status (e.g. 503
                     # Service Unavailable, 500, 502, 504) so the client can apply
                     # its own retry/backoff. Collapsing every exhausted 5xx into a

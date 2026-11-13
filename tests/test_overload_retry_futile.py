@@ -33,7 +33,7 @@ class _FakeClient:
         self._response = response
         self.calls = 0
 
-    async def post(self, url, content=None, headers=None):
+    async def post(self, url, content=None, headers=None, extensions=None):
         self.calls += 1
         if self._responses is not None:
             return self._responses[self.calls - 1]

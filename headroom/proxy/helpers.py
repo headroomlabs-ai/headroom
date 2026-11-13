@@ -16,6 +16,7 @@ import logging
 import os
 import random
 import re
+import ssl
 import threading
 import time
 import warnings
@@ -1765,6 +1766,30 @@ def overload_retry_is_futile(response: httpx.Response, max_ms: int, retries_left
 # problem with the request itself. Single source of truth so the streaming and
 # non-streaming forwarders agree on what is retriable.
 RETRYABLE_OVERLOAD_STATUSES: frozenset[int] = frozenset({429, 529})
+
+
+class RequestWriteTrace:
+    """httpcore ``trace`` extension that records a failed request write.
+
+    httpcore maps an ``ssl.SSLError`` to ``ConnectError`` only during the
+    handshake. Later, a corrupt TLS record surfaces as a raw ``ssl.SSLError``
+    that says nothing about whether upstream received the request. It is safe
+    to retry only when it was raised while the request was still being written
+    (``send_request_headers`` / ``send_request_body`` failed): upstream then
+    never had a complete request to run. Raised after the write, upstream may
+    already have accepted, and billed, the POST, so it is not replayed.
+    """
+
+    def __init__(self) -> None:
+        self.write_failed = False
+
+    async def __call__(self, event: str, info: dict[str, Any]) -> None:
+        if event.endswith((".send_request_headers.failed", ".send_request_body.failed")):
+            self.write_failed = True
+
+    def forbids_retry(self, exc: BaseException) -> bool:
+        """True for a raw TLS error raised after the request was fully written."""
+        return isinstance(exc, ssl.SSLError) and not self.write_failed
 
 
 async def request_with_transient_retry(

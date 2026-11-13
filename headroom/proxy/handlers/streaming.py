@@ -19,6 +19,7 @@ from headroom.proxy.auth_mode import classify_client, supports_mid_turn_coalesci
 from headroom.proxy.handlers._debug_dump import write_upstream_error_dump
 from headroom.proxy.helpers import (
     RETRYABLE_OVERLOAD_STATUSES,
+    RequestWriteTrace,
     jitter_delay_ms,
     overload_retry_is_futile,
     parse_sse_events_from_byte_buffer,
@@ -1452,10 +1453,12 @@ class StreamingMixin:
             last_connect_error = None
 
             for attempt in range(retry_attempts):
+                request_trace = RequestWriteTrace()
                 try:
                     _upstream_req = streaming_client.build_request(
                         "POST", url, content=outbound_bytes, headers=outbound_headers
                     )
+                    _upstream_req.extensions["trace"] = request_trace
                     upstream_response = await streaming_client.send(_upstream_req, stream=True)
                     if _codex_wire_debug:
                         capture_codex_wire_debug(
@@ -1503,12 +1506,11 @@ class StreamingMixin:
                 # `StreamReset`) from a poisoned shared h2 connection. This runs
                 # before any body byte is forwarded to the client, so re-sending
                 # on a fresh connection is safe and avoids a 502. (#1639)
-                # A corrupt TLS record on a reused keep-alive connection is a
-                # raw ssl.SSLError, not a TransportError: anyio re-raises it and
-                # httpcore maps SSL errors only during the handshake.
+                # A raw ssl.SSLError escapes httpx's TransportError mapping; it is
+                # retried only if the request write failed (RequestWriteTrace).
                 except (httpx.TransportError, ssl.SSLError) as e:
                     last_connect_error = e
-                    if attempt >= retry_attempts - 1:
+                    if attempt >= retry_attempts - 1 or request_trace.forbids_retry(e):
                         raise
 
                     delay_with_jitter = jitter_delay_ms(
