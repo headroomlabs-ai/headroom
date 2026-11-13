@@ -211,6 +211,40 @@ def test_official_routed_when_opted_in(tmp_path, monkeypatch):
     assert captured[-1] == DEFAULT
 
 
+_THIRD_PARTY = {
+    "env": {
+        "ANTHROPIC_BASE_URL": "https://api.deepseek.com/anthropic",
+        "ANTHROPIC_AUTH_TOKEN": "sk-x",
+    }
+}
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX mode bits")
+def test_rewrite_keeps_owner_only_mode(tmp_path):
+    old_umask = os.umask(0o022)
+    try:
+        r, sf, _ = _make(tmp_path)
+        _write(sf, _THIRD_PARTY)
+        sf.chmod(0o600)
+        assert r.tick() is True
+        assert json.loads(sf.read_text())["env"]["ANTHROPIC_BASE_URL"] == PROXY
+        assert (sf.stat().st_mode & 0o777) == 0o600
+    finally:
+        os.umask(old_umask)
+
+
+@pytest.mark.skipif(os.name == "nt", reason="symlinks need privileges on Windows")
+def test_rewrite_writes_through_a_symlinked_settings_file(tmp_path):
+    r, sf, _ = _make(tmp_path)
+    real = tmp_path / "dotfiles" / "settings.json"
+    real.parent.mkdir()
+    _write(real, _THIRD_PARTY)
+    sf.symlink_to(real)
+    assert r.tick() is True
+    assert sf.is_symlink()
+    assert json.loads(real.read_text())["env"]["ANTHROPIC_BASE_URL"] == PROXY
+
+
 def test_missing_file_is_noop(tmp_path):
     r, _, _ = _make(tmp_path)  # path does not exist yet
     assert r.tick() is False
