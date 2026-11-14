@@ -70,7 +70,7 @@
 //! #3). The PyO3 bridge releases the GIL during the walk because the
 //! algorithm is fully self-contained.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::OnceLock;
 
 /// HTML5 living-standard element names — the set of tags this module
@@ -312,7 +312,7 @@ enum TagParse {
 /// closing `>` (exclusive end of the tag) and the kind. Conservatively
 /// rejects malformed shapes — we'd rather emit a `<` verbatim than
 /// over-protect on bad input.
-fn parse_tag_at(bytes: &[u8], start: usize) -> TagParse {
+fn parse_tag_at(bytes: &[u8], start: usize, attrs: &mut AttrScanner) -> TagParse {
     debug_assert!(bytes[start] == b'<');
     let mut i = start + 1;
     let n = bytes.len();
@@ -358,48 +358,110 @@ fn parse_tag_at(bytes: &[u8], start: usize) -> TagParse {
         };
     }
 
-    // Opening tag: skip attributes until `>` (handle `/>` for
-    // self-closing). Quoted attribute values can contain `>`; a
-    // single-pass attribute lexer handles the common cases.
-    let mut self_closing = false;
-    while i < n {
-        match bytes[i] {
-            b'>' => {
-                return TagParse::Open {
-                    name_end,
-                    tag_end: i + 1,
-                    is_self_closing: self_closing,
-                };
-            }
-            b'/' => {
-                // Only the `/>` pair closes the tag. A `/` inside an
-                // unquoted attribute value (`path=/src/main.rs`) is an
-                // ordinary character and must not make the tag self-closing.
-                self_closing = bytes.get(i + 1) == Some(&b'>');
-                i += 1;
-            }
-            b'"' | b'\'' => {
-                let quote = bytes[i];
-                i += 1;
-                while i < n && bytes[i] != quote {
-                    i += 1;
+    // Opening tag: the tag ends at the first `>` outside a quoted
+    // attribute value. It is self-closing only when that `>` directly
+    // follows a `/`: a `/` inside an unquoted value
+    // (`path=/src/main.rs`) must not make the tag self-closing. The
+    // byte before `>` is never inside the name (`/` is not a name
+    // byte) nor a quote, so checking it alone is enough.
+    match attrs.tag_close(bytes, name_end) {
+        Some(gt) => TagParse::Open {
+            name_end,
+            tag_end: gt + 1,
+            is_self_closing: bytes[gt - 1] == b'/',
+        },
+        None => TagParse::NotTag,
+    }
+}
+
+/// Finds the `>` that closes an opening tag's attribute list.
+///
+/// Scanning byte by byte from every `<` is quadratic when the text holds
+/// many openers that never close (each scan runs to the end of the
+/// text). Instead, the walk outside quotes only stops at `>`, `"` and
+/// `'`, and its outcome from any such stop is the same whichever tag
+/// reached it. So the stops are indexed once (built on first use) and
+/// each stop's outcome is remembered, which makes all scans of one text
+/// linear overall (plus a binary search per step).
+#[derive(Default)]
+struct AttrScanner {
+    index: Option<AttrIndex>,
+}
+
+struct AttrIndex {
+    /// Offsets of every `>`, `"` and `'`, ascending.
+    stops: Vec<usize>,
+    /// Offsets of every `"`, ascending.
+    double_quotes: Vec<usize>,
+    /// Offsets of every `'`, ascending.
+    single_quotes: Vec<usize>,
+    /// Per stop, once known: the closing `>` reached when the walk is
+    /// outside quotes at that stop, or `None` when it reaches the end.
+    outcome: Vec<Option<Option<usize>>>,
+}
+
+impl AttrIndex {
+    fn new(bytes: &[u8]) -> Self {
+        let mut stops = Vec::new();
+        let mut double_quotes = Vec::new();
+        let mut single_quotes = Vec::new();
+        for (i, &b) in bytes.iter().enumerate() {
+            match b {
+                b'>' => stops.push(i),
+                b'"' => {
+                    stops.push(i);
+                    double_quotes.push(i);
                 }
-                if i >= n {
-                    return TagParse::NotTag;
+                b'\'' => {
+                    stops.push(i);
+                    single_quotes.push(i);
                 }
-                i += 1;
-                self_closing = false;
-            }
-            _ => {
-                if bytes[i].is_ascii_whitespace() {
-                    self_closing = false;
-                }
-                i += 1;
+                _ => {}
             }
         }
+        let outcome = vec![None; stops.len()];
+        Self {
+            stops,
+            double_quotes,
+            single_quotes,
+            outcome,
+        }
     }
+}
 
-    TagParse::NotTag
+impl AttrScanner {
+    /// Offset of the `>` ending a tag whose attributes start at `from`,
+    /// or `None` when the input ends first (including inside a quote).
+    fn tag_close(&mut self, bytes: &[u8], from: usize) -> Option<usize> {
+        let index = self.index.get_or_insert_with(|| AttrIndex::new(bytes));
+        let mut k = index.stops.partition_point(|&p| p < from);
+        let mut visited = Vec::new();
+        let result = loop {
+            let Some(&stop) = index.stops.get(k) else {
+                break None;
+            };
+            if let Some(known) = index.outcome[k] {
+                break known;
+            }
+            if bytes[stop] == b'>' {
+                break Some(stop);
+            }
+            visited.push(k);
+            let same = if bytes[stop] == b'"' {
+                &index.double_quotes
+            } else {
+                &index.single_quotes
+            };
+            let Some(&close) = same.get(same.partition_point(|&p| p <= stop)) else {
+                break None;
+            };
+            k = index.stops.partition_point(|&p| p <= close);
+        };
+        for k in visited {
+            index.outcome[k] = Some(result);
+        }
+        result
+    }
 }
 
 #[inline]
@@ -496,6 +558,10 @@ fn identify_spans(
     let n = bytes.len();
     let mut spans: Vec<Span> = Vec::new();
     let mut stack: Vec<OpenTag> = Vec::new();
+    // How many frames on `stack` carry each name, so a close with no
+    // open of its name is rejected without walking the whole stack.
+    let mut open_names: HashMap<String, usize> = HashMap::new();
+    let mut attrs = AttrScanner::default();
 
     let mut i = 0;
     while i < n {
@@ -508,7 +574,7 @@ fn identify_spans(
             continue;
         }
 
-        match parse_tag_at(bytes, i) {
+        match parse_tag_at(bytes, i, &mut attrs) {
             TagParse::NotTag => {
                 i += 1;
             }
@@ -545,8 +611,10 @@ fn identify_spans(
                     });
                 }
                 // Both modes push to the stack so close-matching works.
+                let name_lower = name.to_ascii_lowercase();
+                *open_names.entry(name_lower.clone()).or_insert(0) += 1;
                 stack.push(OpenTag {
-                    name_lower: name.to_ascii_lowercase(),
+                    name_lower,
                     open_start: i,
                 });
                 i = tag_end;
@@ -560,9 +628,13 @@ fn identify_spans(
                     continue;
                 }
                 let close_name_lower = close_name.to_ascii_lowercase();
-                let matching = stack
-                    .iter()
-                    .rposition(|open| open.name_lower == close_name_lower);
+                let matching = if open_names.get(&close_name_lower).copied().unwrap_or(0) > 0 {
+                    stack
+                        .iter()
+                        .rposition(|open| open.name_lower == close_name_lower)
+                } else {
+                    None
+                };
 
                 match matching {
                     Some(stack_idx) => {
@@ -574,7 +646,7 @@ fn identify_spans(
                             // `truncate` already removes the matched
                             // frame; popping again would drop the
                             // enclosing tag's frame and orphan its close.
-                            stack.truncate(stack_idx);
+                            pop_frames(&mut stack, &mut open_names, stack_idx);
                             spans.push(Span {
                                 start: i,
                                 end: tag_end,
@@ -589,8 +661,10 @@ fn identify_spans(
                             // outer block — that's how nested custom
                             // tags collapse to one placeholder.
                             let open_start = stack[stack_idx].open_start;
-                            stack.truncate(stack_idx);
-                            spans.retain(|s| s.start < open_start);
+                            pop_frames(&mut stack, &mut open_names, stack_idx);
+                            // `spans` is sorted by start, so the subsumed
+                            // spans are a suffix.
+                            spans.truncate(spans.partition_point(|s| s.start < open_start));
                             spans.push(Span {
                                 start: open_start,
                                 end: tag_end,
@@ -617,6 +691,15 @@ fn identify_spans(
     // were never collapsed. Spans are sorted by start ascending due to
     // the monotonic walk; phase 2 expects that.
     spans
+}
+
+/// Drop `stack[from..]`, keeping the per-name counts in step.
+fn pop_frames(stack: &mut Vec<OpenTag>, open_names: &mut HashMap<String, usize>, from: usize) {
+    for frame in stack.drain(from..) {
+        if let Some(count) = open_names.get_mut(&frame.name_lower) {
+            *count -= 1;
+        }
+    }
 }
 
 fn emit_output(
@@ -696,13 +779,11 @@ pub fn restore_tags_with_request_id(
         return text.to_string();
     }
 
-    let mut result = text.to_string();
-    let mut lost_count: usize = 0;
     let compressed_length = text.len();
-    for (placeholder, original) in blocks {
-        if result.contains(placeholder.as_str()) {
-            result = result.replace(placeholder.as_str(), original);
-        } else {
+    let (result, found) = splice_placeholders(text, blocks);
+    let mut lost_count: usize = 0;
+    for ((_, original), found) in blocks.iter().zip(found) {
+        if !found {
             lost_count += 1;
             tag_lost_error(original, compressed_length, request_id);
         }
@@ -714,6 +795,52 @@ pub fn restore_tags_with_request_id(
                         // counters live on the stats sidecar in
                         // callers that have one.
     result
+}
+
+/// Replace every occurrence of each block's placeholder in `text` with
+/// its original, in one left-to-right pass, and report which blocks
+/// were found.
+///
+/// Replacing block by block (`contains` + `replace` over the whole
+/// text each time) costs blocks x length. Every placeholder is
+/// `{{…}}` with no `}}` inside, so a placeholder occurrence is a `{{`
+/// followed by the first `}}` within the longest placeholder's length.
+/// Originals spliced in are not searched again; `protect_tags` picks a
+/// prefix the input does not contain, so originals hold no placeholders.
+fn splice_placeholders(text: &str, blocks: &[(String, String)]) -> (String, Vec<bool>) {
+    let mut by_placeholder: HashMap<&str, usize> = HashMap::with_capacity(blocks.len());
+    let mut max_len = 0;
+    for (idx, (placeholder, _)) in blocks.iter().enumerate() {
+        by_placeholder.entry(placeholder.as_str()).or_insert(idx);
+        max_len = max_len.max(placeholder.len());
+    }
+    let mut found = vec![false; blocks.len()];
+    let bytes = text.as_bytes();
+    let mut out = String::with_capacity(text.len());
+    let mut copied = 0;
+    let mut i = 0;
+    while let Some(off) = text[i..].find("{{") {
+        let start = i + off;
+        let window_end = (start + max_len).clamp(start + 2, bytes.len());
+        let hit = bytes[start + 2..window_end]
+            .windows(PLACEHOLDER_SUFFIX.len())
+            .position(|w| w == PLACEHOLDER_SUFFIX.as_bytes())
+            .map(|pos| start + 2 + pos + PLACEHOLDER_SUFFIX.len())
+            .and_then(|end| by_placeholder.get(&text[start..end]).map(|&idx| (end, idx)));
+        match hit {
+            Some((end, idx)) => {
+                out.push_str(&text[copied..start]);
+                out.push_str(&blocks[idx].1);
+                found[idx] = true;
+                copied = end;
+                i = end;
+            }
+            // `{` is ASCII, so `start + 1` is a char boundary.
+            None => i = start + 1,
+        }
+    }
+    out.push_str(&text[copied..]);
+    (out, found)
 }
 
 #[inline(never)]
@@ -1296,6 +1423,157 @@ mod tests {
                 restored.len() <= upper_bound,
                 "restored too long: restored.len={} upper_bound={} cleaned.len={}",
                 restored.len(), upper_bound, cleaned.len()
+            );
+        }
+    }
+
+    // ─── Linear time on adversarial shapes ────────────────────────────
+    //
+    // Each input below took seconds to minutes (debug build) when the
+    // walk rescanned to the end of the text per `<`, walked the whole
+    // tag stack per unmatched close, or restored block by block. The
+    // bound is loose on purpose: linear code runs these in milliseconds.
+
+    fn assert_fast(label: &str, f: impl FnOnce()) {
+        let t = std::time::Instant::now();
+        f();
+        let took = t.elapsed();
+        assert!(
+            took < std::time::Duration::from_secs(5),
+            "{label} took {took:?}"
+        );
+    }
+
+    #[test]
+    fn unclosed_openers_are_linear() {
+        for unit in ["<a ", "<x \"", "<x '"] {
+            let text = unit.repeat(40_000);
+            assert_fast(unit, || {
+                let (cleaned, blocks, _) = protect_tags(&text, false);
+                assert_eq!(cleaned, text);
+                assert!(blocks.is_empty());
+            });
+        }
+    }
+
+    #[test]
+    fn unmatched_closes_over_deep_stack_are_linear() {
+        let text = format!("{}{}", "<zz>".repeat(40_000), "</yy>".repeat(40_000));
+        assert_fast("deep stack", || {
+            let (_, blocks, stats) = protect_tags(&text, false);
+            assert!(blocks.is_empty());
+            assert_eq!(stats.orphan_closes, 40_000);
+        });
+    }
+
+    #[test]
+    fn many_blocks_protect_and_restore_are_linear() {
+        for unit in ["<zz></zz>", "<x/> filler "] {
+            let text = unit.repeat(40_000);
+            assert_fast(unit, || {
+                let (cleaned, blocks, _) = protect_tags(&text, false);
+                assert_eq!(blocks.len(), 40_000);
+                assert_eq!(restore_tags(&cleaned, &blocks), text);
+            });
+        }
+    }
+
+    #[test]
+    fn restore_matches_only_exact_placeholders() {
+        let (cleaned, blocks, _) = protect_tags("<a1/> {{not ours}} {{{{HEADROOM_TAG_", false);
+        assert_eq!(
+            restore_tags(&cleaned, &blocks),
+            "<a1/> {{not ours}} {{{{HEADROOM_TAG_"
+        );
+        // A placeholder the compressor duplicated is restored each time,
+        // also when glued to extra braces.
+        let dup = format!("{{{0}}} {0}", blocks[0].0);
+        assert_eq!(restore_tags(&dup, &blocks), "{<a1/>} <a1/>");
+    }
+
+    /// The byte-by-byte attribute scan `parse_tag_at` used before the
+    /// stop index; the indexed scan must agree with it everywhere.
+    fn open_tag_end_bytewise(bytes: &[u8], name_end: usize) -> Option<(usize, bool)> {
+        let mut i = name_end;
+        let mut self_closing = false;
+        while i < bytes.len() {
+            match bytes[i] {
+                b'>' => return Some((i + 1, self_closing)),
+                b'/' => {
+                    self_closing = bytes.get(i + 1) == Some(&b'>');
+                    i += 1;
+                }
+                b'"' | b'\'' => {
+                    let quote = bytes[i];
+                    i += 1;
+                    while i < bytes.len() && bytes[i] != quote {
+                        i += 1;
+                    }
+                    if i >= bytes.len() {
+                        return None;
+                    }
+                    i += 1;
+                    self_closing = false;
+                }
+                b => {
+                    if b.is_ascii_whitespace() {
+                        self_closing = false;
+                    }
+                    i += 1;
+                }
+            }
+        }
+        None
+    }
+
+    /// The block-by-block restore used before the single pass.
+    fn restore_blockwise(text: &str, blocks: &[(String, String)]) -> String {
+        let mut result = text.to_string();
+        for (placeholder, original) in blocks {
+            if result.contains(placeholder.as_str()) {
+                result = result.replace(placeholder.as_str(), original);
+            }
+        }
+        result
+    }
+
+    proptest::proptest! {
+        #[test]
+        fn indexed_attribute_scan_matches_bytewise(
+            content in "(<|>|/|\"|'| |a|x-y|=|\n){0,60}"
+        ) {
+            let bytes = content.as_bytes();
+            let mut attrs = AttrScanner::default();
+            for start in (0..bytes.len()).filter(|&i| bytes[i] == b'<') {
+                let mut name_end = start + 1;
+                if bytes.get(name_end).is_none_or(|b| !is_name_start(*b)) {
+                    continue;
+                }
+                while name_end < bytes.len() && is_name_cont(bytes[name_end]) {
+                    name_end += 1;
+                }
+                let expected = open_tag_end_bytewise(bytes, name_end);
+                let got = match parse_tag_at(bytes, start, &mut attrs) {
+                    TagParse::Open { tag_end, is_self_closing, .. } => Some((tag_end, is_self_closing)),
+                    _ => None,
+                };
+                proptest::prop_assert_eq!(got, expected, "at {} in {:?}", start, content);
+            }
+        }
+
+        #[test]
+        fn single_pass_restore_matches_blockwise(
+            content in "(<zz>|</zz>|<x/>|<p>|\\{\\{|\\}\\}|a| ){0,30}",
+            noise in "(\\{|\\}|b){0,6}",
+            at in 0usize..200,
+        ) {
+            let (cleaned, blocks, _) = protect_tags(&content, false);
+            let at = at.min(cleaned.len());
+            let mut compressed = cleaned.clone();
+            compressed.insert_str(at, &noise);
+            proptest::prop_assert_eq!(
+                restore_tags(&compressed, &blocks),
+                restore_blockwise(&compressed, &blocks)
             );
         }
     }
