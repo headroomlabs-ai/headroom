@@ -503,7 +503,8 @@ def _resolve_openai_handler_path(
     return parsed.path
 
 
-def _resolve_openai_upstream_base(request_headers: dict[str, str]) -> str | None:
+def _openai_base_url_candidate(request_headers: dict[str, str]) -> tuple[str, str] | None:
+    """Return ``(raw, normalized)`` for an ``x-headroom-base-url`` override, before the guard."""
     raw_base_url = _header_get(request_headers, _OPENAI_BASE_URL_HEADER)
     if raw_base_url is None:
         return None
@@ -521,11 +522,36 @@ def _resolve_openai_upstream_base(request_headers: dict[str, str]) -> str | None
 
     if urlparse(normalized).scheme not in {"http", "https"}:
         return None
+    return raw_base_url, normalized
+
+
+def _resolve_openai_upstream_base(request_headers: dict[str, str]) -> str | None:
+    candidate = _openai_base_url_candidate(request_headers)
+    if candidate is None:
+        return None
+    raw_base_url, normalized = candidate
     if not is_safe_upstream_url(normalized):
         # Client-supplied upstream resolves to a private/loopback/link-local or
         # cloud-metadata address (SSRF). Ignore the override and fall back to the
         # configured upstream; set HEADROOM_ALLOWED_BASE_URLS to permit specific
         # internal endpoints.
+        logger.warning("ignoring unsafe x-headroom-base-url override: %r", raw_base_url)
+        return None
+    return normalized
+
+
+async def _resolve_openai_upstream_base_async(request_headers: dict[str, str]) -> str | None:
+    """:func:`_resolve_openai_upstream_base` for the async request handlers.
+
+    The guard resolves the client-chosen host with a blocking wait; the async
+    form runs that lookup on a worker thread so a slow-resolving host does not
+    hold up every other request on the event loop.
+    """
+    candidate = _openai_base_url_candidate(request_headers)
+    if candidate is None:
+        return None
+    raw_base_url, normalized = candidate
+    if not await is_safe_upstream_url_async(normalized):
         logger.warning("ignoring unsafe x-headroom-base-url override: %r", raw_base_url)
         return None
     return normalized
@@ -3641,7 +3667,7 @@ class OpenAIHandlerMixin:
             )
         model = body.get("model", "unknown")
         messages = body.get("messages", [])
-        custom_upstream_base_url = _resolve_openai_upstream_base(request.headers)
+        custom_upstream_base_url = await _resolve_openai_upstream_base_async(request.headers)
         upstream_base_url = self._openai_upstream_from(request, custom_upstream_base_url)
         # Ghost text and next edits: CAPI does not serve these models. A
         # caller-chosen x-headroom-base-url is left alone, as in
@@ -6420,7 +6446,7 @@ class OpenAIHandlerMixin:
         # cannot ride a Grok request to api.x.ai. Mixed ChatGPT-auth plus
         # Grok signals still withhold extras, even though the ChatGPT branch
         # below sends the request to chatgpt.com.
-        custom_upstream_base_url = _resolve_openai_upstream_base(request.headers)
+        custom_upstream_base_url = await _resolve_openai_upstream_base_async(request.headers)
         upstream_base_url = custom_upstream_base_url
         openai_upstream_base_url = self._openai_upstream_from(request, custom_upstream_base_url)
         headers = merge_extra_headers(
