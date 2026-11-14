@@ -14,9 +14,46 @@
 
 mod common;
 
-use common::{body_with_tool_result, dispatch, kompress_available, python_module_source, sha256};
+use common::{
+    body_with_tool_result, dispatch, go_handlers_source, kompress_available, python_module_source,
+    sha256, tool_result_action,
+};
 use headroom_core::transforms::{BlockAction, LiveZoneOutcome};
 use serde_json::{json, Value};
+
+/// The script from #4214 (a fenced Python snippet whose keywords Kompress
+/// deleted). The reporter's own fence is not published; this reconstruction
+/// keeps the lines quoted in the issue and parses as Python.
+const ISSUE_4214_SCRIPT: &str = r#"import json, collections
+
+d = json.load(open('turns.json'))
+segs=[s for s in open('segs.txt').read().split() if s]
+def load(path):
+    try:
+        return json.load(open(path))
+    except Exception as e: return None
+for i,s in enumerate(segs):
+    t0=(d or {}).get('turns') or []
+    if not t0 or len(t0) < 2:
+        continue
+    else:
+        label = s if s else 'unknown'
+    counts = collections.Counter(x.get('role') for x in t0)
+    for role, n in counts.items():
+        if n > 1 or role == 'tool':
+            print(i, label, role, n)
+        else:
+            print(i, label, role)
+    total = sum(counts.values())
+    if total > 10 or label == 'big':
+        print('large session', label, total)
+    out = [k for k in counts if counts[k] > 0]
+    print(json.dumps(out))
+summary = {s: i for i, s in enumerate(segs)}
+for k, v in summary.items():
+    if v % 2 == 0 or k.startswith('a'):
+        print(k, v)
+print('done', len(segs))"#;
 
 // ─── Routing tests ─────────────────────────────────────────────────────
 
@@ -246,6 +283,70 @@ fn source_code_tool_result_routes_to_code_compressor() {
             );
         }
         other => panic!("expected BlockAction::Compressed, got {other:?}"),
+    }
+}
+
+#[test]
+fn source_code_declined_by_code_compressor_is_never_kompressed() {
+    // The code compressor leaves Go source untouched (exact passthrough).
+    // That must stay a NoOp: handing it to Kompress, a prose model, drops
+    // keywords such as `func`, `if` and `for` from the code (#4214). The
+    // warmup makes Kompress live when the model is cache-resident, so on
+    // such a host the old fallback would have rewritten this block.
+    let _ = kompress_available();
+    let code = go_handlers_source(30);
+    assert!(
+        code.len() > 2048,
+        "fixture must clear the SourceCode byte threshold (2048); got {} bytes",
+        code.len()
+    );
+    let (body, _) = body_with_tool_result(&code);
+
+    match dispatch(&body) {
+        LiveZoneOutcome::NoChange { manifest } => {
+            let action = manifest
+                .block_outcomes
+                .iter()
+                .find(|b| b.block_type == "tool_result")
+                .expect("tool_result block present")
+                .action
+                .clone();
+            assert!(
+                matches!(&action, BlockAction::NoCompressionApplied { content_type } if content_type == "source_code"),
+                "expected a source_code NoOp, got {action:?}"
+            );
+        }
+        LiveZoneOutcome::Modified { manifest, .. } => panic!(
+            "a declined source-code block must be forwarded unchanged, not rewritten. manifest: {manifest:?}"
+        ),
+    }
+}
+
+#[test]
+fn issue_4214_script_is_never_kompressed() {
+    // The Python script quoted in #4214, repeated until the block clears the
+    // SourceCode threshold. The code compressor may shrink it (it keeps the
+    // keywords) or leave it alone, but the prose model must never rewrite it.
+    // A guard rather than a discriminator: the code compressor already handles
+    // Python, so this passes before the fix too; the Go test above is the one
+    // that fails without it.
+    let _ = kompress_available();
+    let code = format!("{ISSUE_4214_SCRIPT}\n").repeat(3);
+    assert!(
+        code.len() > 2048,
+        "fixture must clear the SourceCode byte threshold"
+    );
+    let (body, _) = body_with_tool_result(&code);
+
+    match dispatch(&body) {
+        LiveZoneOutcome::NoChange { .. } => {}
+        LiveZoneOutcome::Modified { manifest, .. } => match tool_result_action(&manifest) {
+            BlockAction::Compressed { strategy, .. } => assert_eq!(
+                strategy, "code_compressor",
+                "only the code compressor may rewrite the #4214 script"
+            ),
+            other => panic!("unexpected action {other:?}"),
+        },
     }
 }
 

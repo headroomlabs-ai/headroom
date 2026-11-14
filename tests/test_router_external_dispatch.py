@@ -394,3 +394,49 @@ def test_wildcard_selection_activates_registered_external(_memory_ccr):
 
     assert comp.calls
     assert "external:ext_json" in result.strategy_chain
+
+
+# ───────────── explicit passthrough code never reaches an external ─────────────
+
+_PY_FENCE = "\n".join(
+    ["import json", ""]
+    + [
+        f"def handler_{i}(event):\n    if event.get('k{i}'):\n        return json.dumps(event)\n    return None\n"
+        for i in range(30)
+    ]
+)
+_PROSE = " ".join(
+    ["The nightly job failed after the deploy and the operator wants a short summary."] * 40
+)
+
+
+def test_passthrough_code_section_is_not_offered_to_a_text_external(_memory_ccr):
+    # With prefer_code_aware_for_code=False the router keeps source code
+    # unmangled (PASSTHROUGH). A selected prose-only external compressor must
+    # not receive that code: mixed content splits the fence into its own section.
+    comp = _RecordingExternal(name="ext_text", content_types=("text/plain",))
+    router = ContentRouter(
+        _cfg(active_external_compressors=["ext_text"], prefer_code_aware_for_code=False)
+    )
+    router.compressor_registry.register(comp, replace=True)
+    router._active_external_compressors = router._resolve_active_external_compressors()
+    content = f"{_PROSE}\n\n```python\n{_PY_FENCE}\n```\n\n{_PROSE}"
+
+    result = router.compress(content)
+
+    assert all("def handler_0" not in call.content for call in comp.calls)
+    assert f"```python\n{_PY_FENCE}\n```" in result.compressed
+
+
+def test_passthrough_whole_code_block_is_not_offered_to_a_text_external(_memory_ccr):
+    comp = _RecordingExternal(name="ext_text", content_types=("text/plain",))
+    router = ContentRouter(
+        _cfg(active_external_compressors=["ext_text"], prefer_code_aware_for_code=False)
+    )
+    router.compressor_registry.register(comp, replace=True)
+    router._active_external_compressors = router._resolve_active_external_compressors()
+
+    result = router.compress(_PY_FENCE)
+
+    assert not comp.calls
+    assert result.compressed == _PY_FENCE
