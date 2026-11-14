@@ -693,6 +693,12 @@ class BatchHandlerMixin:
 
         start_time = time.time()
 
+        # The route `/v1beta/batches/{batch_name}` captures only the id, but the
+        # upstream resource and the stored batch context both use the full
+        # `batches/<id>` name that batch create returned.
+        if not batch_name.startswith("batches/"):
+            batch_name = f"batches/{batch_name}"
+
         # Forward request to get batch status/results
         url = f"{self.GEMINI_API_URL}/v1beta/{batch_name}"
 
