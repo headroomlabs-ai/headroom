@@ -15,6 +15,7 @@ upstream as a synthetic Headroom field.
 
 from __future__ import annotations
 
+import codecs
 import copy
 import json
 import re
@@ -168,6 +169,22 @@ def _split_frames(raw: bytes) -> list[bytes]:
         start = end
     if raw[start:].strip():
         frames.append(raw[start:])
+    return frames
+
+
+def _decoded_frames(raw_sse_bytes: bytes) -> list[_SSEFrame]:
+    """Split closed SSE bytes into frames and decode each frame's payload.
+
+    A stream may open with one UTF-8 byte-order mark, which an SSE parser
+    skips (#4255). It is ignored only for decoding the first frame; the frame
+    keeps its original bytes so opaque replay stays byte-identical.
+    """
+
+    has_bom = raw_sse_bytes.startswith(codecs.BOM_UTF8)
+    frames: list[_SSEFrame] = []
+    for position, raw in enumerate(_split_frames(raw_sse_bytes)):
+        decodable = raw.removeprefix(codecs.BOM_UTF8) if has_bom and position == 0 else raw
+        frames.append(_SSEFrame(raw, *_json_payload(decodable)))
     return frames
 
 
@@ -486,7 +503,7 @@ class AnthropicSSEEnvelope:
             every original frame needed for loss-minimizing replay.
         """
 
-        frames = [_SSEFrame(raw, *_json_payload(raw)) for raw in _split_frames(raw_sse_bytes)]
+        frames = _decoded_frames(raw_sse_bytes)
         reconstruction = _response_from_events(frames)
 
         # Anything the reconstruction did not consume is replayed verbatim.
@@ -720,10 +737,9 @@ def fold_anthropic_stream(raw_sse_bytes: bytes) -> dict[str, Any] | None:
 
     envelope = AnthropicSSEEnvelope.parse(raw_sse_bytes)
     if envelope.saw_error:
-        for raw in _split_frames(raw_sse_bytes):
-            event_type, payload = _json_payload(raw)
-            if event_type == "error" and payload is not None:
-                return payload
+        for frame in _decoded_frames(raw_sse_bytes):
+            if frame.event_type == "error" and frame.payload is not None:
+                return frame.payload
     if not envelope.is_complete():
         return None
     if envelope.saw_unreconstructable_frame:

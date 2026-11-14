@@ -6,6 +6,7 @@ Contains all Anthropic Messages API handlers including batch operations.
 from __future__ import annotations
 
 import asyncio
+import codecs
 import copy
 import json
 import logging
@@ -433,7 +434,8 @@ def _looks_like_sse_response(response: httpx.Response) -> bool:
     content_type = (response.headers.get("content-type") or "").lower()
     if "text/event-stream" in content_type:
         return True
-    head = response.content[:64].lstrip()
+    # A stream may open with one UTF-8 BOM ahead of its first field (#4255).
+    head = response.content[:64].removeprefix(codecs.BOM_UTF8).lstrip()
     return head.startswith(b"event:") or head.startswith(b"data:")
 
 

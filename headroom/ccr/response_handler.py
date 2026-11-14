@@ -13,6 +13,7 @@ can't handle the LLM's tool calls.
 
 from __future__ import annotations
 
+import codecs
 import json
 import logging
 from collections.abc import Awaitable, Callable
@@ -846,8 +847,9 @@ class StreamingCCRHandler:
         # splitter. ``data`` is a closed payload here, so any partial
         # tail bytes left in ``buf`` indicate the upstream truncated
         # mid-event — log and ignore (already handled at the streaming
-        # layer above).
-        buf = bytearray(data)
+        # layer above). A stream may open with one UTF-8 BOM, which an SSE
+        # parser skips; left in place it hides the first ``data:`` field (#4255).
+        buf = bytearray(data.removeprefix(codecs.BOM_UTF8))
         events: list[dict[str, Any]] = []
         for _event_name, data_str in parse_sse_events_from_byte_buffer(buf):
             stripped = data_str.strip()
