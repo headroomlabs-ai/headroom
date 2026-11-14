@@ -42,6 +42,7 @@ from headroom.proxy.helpers import (
 from headroom.proxy.identity import resolve_memory_identity
 from headroom.proxy.loopback_guard import is_loopback_host
 from headroom.proxy.modes import is_cache_mode
+from headroom.proxy.output_verbosity_policy import STEERING_SENTINEL, STEERING_SUFFIX
 from headroom.proxy.provider_usage import (
     anthropic_cache_ttl_buckets,
     billed_input_for_provider,
@@ -56,11 +57,18 @@ from headroom.proxy.savings_attribution import from_tags as savings_from_tags
 from headroom.proxy.semantic_cache_key_policy import compute_request_cache_partition
 from headroom.proxy.stage_timer import StageTimer, emit_stage_timings_log
 from headroom.proxy.tool_schema_savings_policy import (
+    TURN_HOOK_SYSTEM_SAVED_TAG,
+    accumulate_tool_schema_saved,
+    hook_tool_counts,
     net_hook_tool_saving,
     tool_schema_saved_from_tags,
-    without_deferral_flags,
+    tools_before_hook,
 )
-from headroom.proxy.turn_hooks import conversation_from, run_responses_create_hooks
+from headroom.proxy.turn_hooks import (
+    conversation_from,
+    count_system_tokens,
+    run_responses_create_hooks,
+)
 from headroom.proxy.upstream_guard import (
     guarded_pin,
     is_safe_upstream_url,
@@ -169,6 +177,71 @@ _CCR_HASH_RE = re.compile(
     r"(?:Retrieve (?:more|original): hash=|<<ccr:)([a-fA-F0-9]{12,24})(?=[^a-fA-F0-9]|$)"
 )
 _BARE_CCR_HASH_RE = re.compile(r"[a-fA-F0-9]{12,24}")
+
+
+def _leading_system_item(items: Any) -> dict[str, Any] | None:
+    """A Responses ``input``'s leading system or developer item, if it has one."""
+    first = items[0] if isinstance(items, list) and items else None
+    if isinstance(first, dict) and first.get("role") in ("system", "developer"):
+        return first
+    return None
+
+
+def _is_steering_only(instructions: Any) -> bool:
+    """Do ``instructions`` hold only the block the output shaper created?"""
+    if not isinstance(instructions, str):
+        return False
+    text = instructions.strip()
+    return (
+        text.startswith(STEERING_SENTINEL)
+        and text.endswith(STEERING_SUFFIX)
+        and text.count(STEERING_SENTINEL) == 1
+    )
+
+
+def _write_responses_system(
+    body: dict[str, Any], item_key: str | None, item: dict[str, Any] | None, system: Any
+) -> bool:
+    """Put a turn hook's ``system`` back where it was read from, and say if it was.
+
+    With ``item``, into that item of ``body[item_key]``, found again because a hook
+    may have rebuilt or reordered the list; if it is gone nothing is written, so the
+    model never gets two prompts. Otherwise into ``instructions``, keeping the output
+    shaper's block. ``None`` removes it: an item without content is rejected upstream.
+    """
+    if item is not None:
+        items = body.get(item_key) if item_key else None
+        candidates = items if isinstance(items, list) else []
+        # The item itself first: a hook may also have added a copy of it.
+        index = next((i for i, c in enumerate(candidates) if c is item), None)
+        if index is None:
+            index = next(
+                (
+                    i
+                    for i, c in enumerate(candidates)
+                    if isinstance(c, dict)
+                    and c.get("role") == item.get("role")
+                    and c.get("content") == item.get("content")
+                ),
+                None,
+            )
+        if index is not None:
+            if system is None:
+                body[item_key] = items[:index] + items[index + 1 :]
+            else:
+                candidates[index]["content"] = system
+            return True
+        logger.warning("turn hook rewrote a system prompt whose input item is gone; not sent")
+        return False
+    instructions = body.get("instructions")
+    if _is_steering_only(instructions):
+        if system is not None:
+            body["instructions"] = f"{system}\n\n{instructions}"
+    elif system is None:
+        body.pop("instructions", None)
+    else:
+        body["instructions"] = system
+    return True
 
 
 def _response_ccr_hashes(messages: list[dict[str, Any]], markers: list[str]) -> list[str]:
@@ -3150,6 +3223,10 @@ class OpenAIHandlerMixin:
         working = payload
         modified = False
         tokens_saved = 0
+        # What the turn hooks added (system prompt, tool definitions) and the
+        # tool tokens they removed, netted at the single clamp below.
+        _hook_growth = 0
+        _hook_tool_saved = 0
         transforms: list[str] = []
         reason: str | None = None
 
@@ -3292,23 +3369,46 @@ class OpenAIHandlerMixin:
                     )
                 except Exception:
                     _mt_before = 0
+
+            def _count_responses_tools(value: Any) -> int:
+                if not value:
+                    return 0
+                return self.openai_provider.get_token_counter(model).count_text(
+                    _json_debug_dumps(value)
+                )
+
+            # Loading is unreadable on OpenAI: a tool a hook un-defers is charged
+            # as growth (hook_tool_counts), as the hook ledger does.
+            _tools_snapshot = tools_before_hook(
+                working.get("tools"), None, _count_responses_tools, savings_tags
+            )
+            # The Responses system prompt: `instructions`, or a leading system or
+            # developer input item. On a continuation that item is a turn-level
+            # note, and `instructions` holding only the output shaper's block is
+            # not the client's prompt. The hook gets a copy, so an in-place edit
+            # is not also a message delta, and is booked once, as a system delta.
+            _system_item = (
+                None if working.get("previous_response_id") else _leading_system_item(_msgs_before)
+            )
+            _instructions = working.get("instructions")
+            _steering_only = _is_steering_only(_instructions)
+            _system_in_item = _system_item is not None and (not _instructions or _steering_only)
+            if _system_in_item:
+                _system_before = _system_item.get("content")
+            else:
+                _system_before = None if _steering_only else _instructions
             _req_ctx = TurnContext(
                 provider="openai",
                 model=str(model),
                 messages=_msgs_before,
+                system=copy.deepcopy(_system_before),
                 tools=working.get("tools"),
                 config=getattr(self, "config", None),
                 tags=savings_tags if savings_tags is not None else {},
                 count_messages=lambda value: self.openai_provider.get_token_counter(
                     model
                 ).count_text(_json_debug_dumps(value)),
-                count_tools=lambda value: (
-                    self.openai_provider.get_token_counter(model).count_text(
-                        _json_debug_dumps(value)
-                    )
-                    if value
-                    else 0
-                ),
+                count_tools=_count_responses_tools,
                 conversation=conversation,
             )
             # Streaming turns get fold-only hooks, same rule as the
@@ -3336,14 +3436,41 @@ class OpenAIHandlerMixin:
                     _mt_after = self.openai_provider.get_token_counter(model).count_text(
                         _json_debug_dumps(working.get(_msg_key) or [])
                     )
-                    if _mt_after < _mt_before:
-                        tokens_saved += _mt_before - _mt_after
+                    # Signed: message text a hook added offsets its other savings.
+                    tokens_saved += _mt_before - _mt_after
                 except Exception as e:
                     logger.debug(
                         "[%s] turn-hook message fold token count failed; savings not counted: %s",
                         request_id,
                         describe_exception(e),
                     )
+            if _req_ctx.system != _system_before:
+                _written = _write_responses_system(
+                    working,
+                    _msg_key,
+                    _system_item if _system_in_item else None,
+                    _req_ctx.system,
+                )
+                _sys_before = count_system_tokens(_req_ctx.count_messages, _system_before)
+                _sys_after = count_system_tokens(_req_ctx.count_messages, _req_ctx.system)
+                if _written and _sys_before is not None and _sys_after is not None:
+                    if _sys_before > _sys_after and savings_tags is not None:
+                        savings_tags[TURN_HOOK_SYSTEM_SAVED_TAG] = (
+                            int(savings_tags.get(TURN_HOOK_SYSTEM_SAVED_TAG, 0) or 0)
+                            + _sys_before
+                            - _sys_after
+                        )
+                    elif _sys_after > _sys_before:
+                        _hook_growth += _sys_after - _sys_before
+            _tools_was, _tools_now = hook_tool_counts(
+                _tools_snapshot, working.get("tools"), None, _count_responses_tools
+            )
+            _hook_growth += max(0, _tools_now - _tools_was)
+            _hook_tool_saved = max(0, _tools_was - _tools_now)
+            if _hook_tool_saved and savings_tags is not None:
+                savings_tags["turn_hook_tools_saved_tokens"] = (
+                    int(savings_tags.get("turn_hook_tools_saved_tokens", 0) or 0) + _hook_tool_saved
+                )
             modified = True
             transforms.append("openai:responses:turn_hook")
 
@@ -3399,6 +3526,12 @@ class OpenAIHandlerMixin:
                     request_id,
                     describe_exception(e),
                 )
+
+        # Signed through every stage above, clamped once: a deficit comes off
+        # the hooks' tool and system-prompt tags, then the tool-search credit.
+        tokens_saved = net_hook_tool_saving(
+            tokens_saved - _hook_growth, savings_tags, _hook_tool_saved
+        )
 
         dedupe_started = time.perf_counter()
         deduped: list[str] = []
@@ -5033,13 +5166,13 @@ class OpenAIHandlerMixin:
         )
         if registered_turn_hooks():
             _th_tools_before = body.get("tools")
-            _th_tok_before = (
-                tokenizer.count_text(
-                    json.dumps(without_deferral_flags(_th_tools_before), default=str)
-                )
-                if _th_tools_before
-                else 0
-            )
+
+            def _th_count_tools(value: Any) -> int:
+                return tokenizer.count_text(json.dumps(value, default=str)) if value else 0
+
+            # Loading is unreadable here: a tool a hook un-defers is charged
+            # (hook_tool_counts), as the hook ledger does.
+            _th_tools_snapshot = tools_before_hook(_th_tools_before, None, _th_count_tools, tags)
             _th_ctx = TurnContext(
                 provider="openai",
                 model=str(model),
@@ -5048,9 +5181,7 @@ class OpenAIHandlerMixin:
                 config=self.config,
                 tags=tags,
                 count_messages=tokenizer.count_messages,
-                count_tools=lambda value: (
-                    tokenizer.count_text(json.dumps(value, default=str)) if value else 0
-                ),
+                count_tools=_th_count_tools,
                 conversation=_th_conversation,
             )
             # Snapshot messages BEFORE the hook (same tokenizer) so we can tell whether
@@ -5061,6 +5192,9 @@ class OpenAIHandlerMixin:
             except Exception:
                 _th_msg_before = None
             run_request_hooks(_th_ctx, stream_safe_only=stream)
+            _th_tok_before, _th_tok_after = hook_tool_counts(
+                _th_tools_snapshot, _th_ctx.tools, None, _th_count_tools
+            )
             # A hook may either replace ctx.messages/ctx.tools or mutate them in
             # place (the contract allows both). Use object identity only to decide
             # whether body needs reassignment; measure the saving from the FINAL
@@ -5080,14 +5214,7 @@ class OpenAIHandlerMixin:
                 if 0 < tool_tokens_after_compaction < tool_tokens_before_compaction:
                     optimized_tokens += tool_tokens_after_compaction
                 # A tool the hook added is sent too: it reduces the saving.
-                _th_tools_after_count = (
-                    tokenizer.count_text(
-                        json.dumps(without_deferral_flags(_th_ctx.tools), default=str)
-                    )
-                    if _th_ctx.tools
-                    else 0
-                )
-                optimized_tokens += max(0, _th_tools_after_count - _th_tok_before)
+                optimized_tokens += max(0, _th_tok_after - _th_tok_before)
                 _th_raw_saved: int | None = original_tokens - optimized_tokens
                 tokens_saved = max(0, _th_raw_saved)
                 # Attribute to the hook ONLY when the hook itself reduced tokens.
@@ -5095,11 +5222,6 @@ class OpenAIHandlerMixin:
                     transforms_applied.append("turn_hook")
             except Exception:
                 logger.debug("turn-hook token re-count skipped", exc_info=True)
-            _th_tok_after = (
-                tokenizer.count_text(json.dumps(without_deferral_flags(_th_ctx.tools), default=str))
-                if _th_ctx.tools
-                else 0
-            )
             _th_saved = max(0, _th_tok_before - _th_tok_after)
             if _th_saved > 0:
                 tags["turn_hook_tools_saved_tokens"] = (
@@ -7959,6 +8081,10 @@ class OpenAIHandlerMixin:
         # keeps running and must not book rows for a frame sent uncompressed.
         # Coalesced per source by ``accumulate_savings``, so it stays small.
         ws_turn_savings: list[dict[str, Any]] = []
+        # The same frames' additive prefix tags (a hook's system-prompt cut):
+        # booked on the outcome that claims the rows, so the headline counts them
+        # once, under the same gates.
+        ws_turn_prefix_saved: dict[str, int] = {}
 
         # Extract subprotocol from client — this is an application-level negotiation
         # that MUST be forwarded end-to-end (unlike sec-websocket-key which is per-connection).
@@ -9133,6 +9259,7 @@ class OpenAIHandlerMixin:
                                 accumulate_savings(
                                     ws_turn_savings, savings_from_tags(_frame_savings)
                                 )
+                                accumulate_tool_schema_saved(ws_turn_prefix_saved, _frame_savings)
                                 ws_conversation_tokens_saved = int(_ws_saved)
                                 ws_conversation_key = savings_conversation_key(
                                     _send_body, session_id=f"ws:{session_id}"
@@ -9641,6 +9768,7 @@ class OpenAIHandlerMixin:
                         _record_ws_compression_overhead(_rewrite_ms)
                         tokens_saved += int(frame_saved)
                         accumulate_savings(ws_turn_savings, savings_from_tags(frame_savings))
+                        accumulate_tool_schema_saved(ws_turn_prefix_saved, frame_savings)
                         ws_conversation_tokens_saved = int(frame_saved)
                         ws_conversation_key = savings_conversation_key(
                             new_inner, session_id=f"ws:{session_id}"
@@ -10003,12 +10131,12 @@ class OpenAIHandlerMixin:
                             # Same gate as ``saved_delta``: a usage-less turn
                             # leaves its rows pending for a usage-carrying one.
                             turn_tags = ws_tags
-                            if ws_turn_savings and input_delta > 0:
-                                turn_tags = {
-                                    **ws_tags,
-                                    SAVINGS_ATTRIBUTION_TAG: list(ws_turn_savings),
-                                }
+                            if input_delta > 0 and (ws_turn_savings or ws_turn_prefix_saved):
+                                turn_tags = {**ws_tags, **ws_turn_prefix_saved}
+                                if ws_turn_savings:
+                                    turn_tags[SAVINGS_ATTRIBUTION_TAG] = list(ws_turn_savings)
                                 ws_turn_savings.clear()
+                                ws_turn_prefix_saved.clear()
                             await self._record_request_outcome(
                                 RequestOutcome(
                                     # Per-emission ids keep dashboard request-log keys unique.
@@ -10657,10 +10785,13 @@ class OpenAIHandlerMixin:
                 "cache_write_tokens": str(ws_cache_write_tokens_total),
                 "uncached_input_tokens": str(ws_uncached_input_tokens_total),
             }
-            if ws_turn_savings and residual_input_tokens > 0:
-                # Rows no per-turn record claimed ride with the residual, under
-                # the same input-usage gate as ``residual_tokens_saved``.
-                ws_session_tags[SAVINGS_ATTRIBUTION_TAG] = list(ws_turn_savings)
+            if residual_input_tokens > 0:
+                # Rows and prefix tags no per-turn record claimed ride with the
+                # residual, under the same input-usage gate as
+                # ``residual_tokens_saved``.
+                ws_session_tags.update(ws_turn_prefix_saved)
+                if ws_turn_savings:
+                    ws_session_tags[SAVINGS_ATTRIBUTION_TAG] = list(ws_turn_savings)
             if (
                 residual_input_tokens > 0
                 or residual_output_tokens > 0
@@ -11762,6 +11893,17 @@ class OpenAIHandlerMixin:
                 if 0 < _compacted_after < _compacted_before:
                     tokens_before += _compacted_before
                     tokens_after += _compacted_after
+                # A hook's system-prompt rewrite (Anthropic): a cut is a
+                # prefix-priced tag, what it added reduces the saving.
+                _system_cut = int(getattr(_turn, "system_tokens_before", 0) or 0) - int(
+                    getattr(_turn, "system_tokens_after", 0) or 0
+                )
+                if _system_cut > 0:
+                    tags[TURN_HOOK_SYSTEM_SAVED_TAG] = (
+                        int(tags.get(TURN_HOOK_SYSTEM_SAVED_TAG, 0) or 0) + _system_cut
+                    )
+                else:
+                    tokens_after -= _system_cut
                 tokens_after += max(0, int(getattr(_turn, "tool_growth_tokens", 0) or 0))
                 # Only a count of pre-hook messages lacks the text a hook added;
                 # a recount of the final messages (stateless fold, session) has it.

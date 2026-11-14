@@ -120,6 +120,7 @@ from pathlib import Path
 from typing import Any
 
 from headroom.offline import pin_litellm_cost_map_local
+from headroom.proxy.tool_schema_savings_policy import tool_schema_saved_from_tags
 from headroom.utils import remember_bounded
 
 logger = logging.getLogger(__name__)
@@ -1348,11 +1349,7 @@ def _fold(sess: _Session, outcome: Any, now: float, source: str = "proxy") -> No
     if isinstance(tags, dict):
         # Tool-schema savings live only in tags — see the same arithmetic in
         # emit_request_outcome, which feeds the local dashboard.
-        for tag in ("tool_search_deferred_tokens", "turn_hook_tools_saved_tokens"):
-            try:
-                sess.tool_saved_tokens += int(tags.get(tag, 0) or 0)
-            except (TypeError, ValueError):
-                pass
+        sess.tool_saved_tokens += tool_schema_saved_from_tags(tags)
         for tag in _REASON_TAGS:
             if tag in tags:
                 key = f"{tag.removesuffix('_reason')}:{_safe_slug(tags[tag])}"

@@ -22,8 +22,12 @@ from urllib.parse import urlsplit
 from headroom.proxy.session_affinity import session_affinity_headers
 from headroom.proxy.stage_timer import StageTimer, emit_stage_timings_log
 from headroom.proxy.tool_schema_savings_policy import (
+    TURN_HOOK_SYSTEM_SAVED_TAG,
+    billed_tools,
+    hook_tool_counts,
     net_hook_tool_saving,
-    without_deferral_flags,
+    proxy_added_tools,
+    tools_before_hook,
 )
 
 if TYPE_CHECKING:
@@ -35,6 +39,7 @@ if TYPE_CHECKING:
 import httpx
 
 from headroom.agent_savings import proxy_pipeline_kwargs
+from headroom.ccr import CCR_TOOL_NAME
 from headroom.ccr.context_tracker import looks_like_claude_code_compact_summary
 from headroom.ccr.marker_resolution import resolve_markers_in_response
 from headroom.ccr.tool_calls import has_ccr_retrieve_tool
@@ -3612,6 +3617,8 @@ class AnthropicHandlerMixin:
             _tool_tokens_after = 0
 
             def _count_tool_tokens(value: object) -> int:
+                if not value:
+                    return 0
                 try:
                     return tokenizer.count_text(json.dumps(value, default=str))
                 except Exception as e:
@@ -3621,6 +3628,33 @@ class AnthropicHandlerMixin:
                         describe_exception(e),
                     )
                     return 0
+
+            # A translating backend drops ``defer_loading`` and bills every tool,
+            # so the history says nothing about what is billed. ``force_direct``
+            # never uses one, so the resolver is not consulted.
+            from headroom.proxy.route_advice import resolver_for
+
+            _deferred_billed_eagerly = (
+                not force_direct and resolver_for(self).for_request(request) is not None
+            )
+
+            def _billed_view(value: object) -> object:
+                if _deferred_billed_eagerly:
+                    return value
+                return billed_tools(value, optimized_messages)
+
+            def _compaction_counted(value: object) -> object:
+                """The tools whose compaction is a saving: billed ones the client
+                sent. The proxy's own retrieve tool is booked as a cost below, so
+                compacting it earns nothing."""
+                billed = _billed_view(value)
+                if not proxy_added_tools(billed, _original_tools, CCR_TOOL_NAME):
+                    return billed
+                return [
+                    t
+                    for t in billed
+                    if not (isinstance(t, dict) and t.get("name") == CCR_TOOL_NAME)
+                ]
 
             _tools_compaction_started = time.time()
             try:
@@ -3636,8 +3670,10 @@ class AnthropicHandlerMixin:
                 if _tools_modified:
                     tools = body["tools"]
                     transforms_applied.append("anthropic:tool_schema_compaction")
-                    _tool_tokens_before = _count_tool_tokens(_pre_compaction_tools)
-                    _tool_tokens_after = _count_tool_tokens(tools)
+                    _tool_tokens_before = _count_tool_tokens(
+                        _compaction_counted(_pre_compaction_tools)
+                    )
+                    _tool_tokens_after = _count_tool_tokens(_compaction_counted(tools))
                     _tools_compaction_ms = (time.time() - _tools_compaction_started) * 1000
                     logger.debug(
                         "[%s] tool schema compaction: %d -> %d bytes (%.0f%% saved) in %.1fms",
@@ -3674,8 +3710,10 @@ class AnthropicHandlerMixin:
                         # Runs after schema compaction, so only seed "before" when that
                         # pass didn't already; "after" always tracks the latest tools.
                         if not _tool_tokens_before:
-                            _tool_tokens_before = _count_tool_tokens(_pre_desc_tools)
-                        _tool_tokens_after = _count_tool_tokens(tools)
+                            _tool_tokens_before = _count_tool_tokens(
+                                _compaction_counted(_pre_desc_tools)
+                            )
+                        _tool_tokens_after = _count_tool_tokens(_compaction_counted(tools))
                         logger.debug(
                             "[%s] tool description compaction: %d -> %d bytes (%.0f%% saved, max_chars=%d)",
                             request_id,
@@ -3864,6 +3902,7 @@ class AnthropicHandlerMixin:
             from headroom.proxy.turn_hooks import (
                 TurnContext,
                 conversation_from,
+                count_system_tokens,
                 registered_turn_hooks,
                 run_request_hooks,
             )
@@ -3874,6 +3913,10 @@ class AnthropicHandlerMixin:
             # stays on the turn_hook_tools_saved_tokens tag.
             _th_tool_growth = 0
             _th_saved = 0
+            # System-prompt tokens a turn hook added, folded into the forwarded
+            # count below; shrinkage is on the turn_hook_system_saved_tokens tag
+            # (prefix-priced, like tool schemas).
+            _th_system_growth = 0
             _req_ctx: TurnContext | None = None
             if registered_turn_hooks():
                 _req_ctx = TurnContext(
@@ -3885,6 +3928,8 @@ class AnthropicHandlerMixin:
                     tags=tags,
                     count_messages=tokenizer.count_messages,
                     count_tools=_count_tool_tokens,
+                    deferred_tools_billed=_deferred_billed_eagerly,
+                    system=body.get("system"),
                     # Claude Code sends one session id on every request and
                     # retry of a session; other clients may send Headroom's.
                     conversation=conversation_from(
@@ -3894,6 +3939,7 @@ class AnthropicHandlerMixin:
                         "headroom-session", request.headers.get("x-headroom-session-id")
                     ),
                 )
+                _th_sys_before = count_system_tokens(tokenizer.count_messages, body.get("system"))
                 # Snapshot BEFORE the hook (same tokenizer) so we can tell whether the
                 # hook itself folded — comparing against the pipeline's optimized_tokens
                 # instead conflates a real fold with a cross-estimator delta (see below).
@@ -3901,11 +3947,15 @@ class AnthropicHandlerMixin:
                     _pre_hook_tokens = tokenizer.count_messages(optimized_messages)
                 except Exception:
                     _pre_hook_tokens = None
-                _th_tools_before = body.get("tools")
-                _th_tok_before = (
-                    _count_tool_tokens(without_deferral_flags(_th_tools_before))
-                    if _th_tools_before
-                    else 0
+                # Deferred tools no tool_reference has loaded are not billed, so
+                # a hook condensing one saves nothing (hook_tool_counts).
+                _th_loading = None if _deferred_billed_eagerly else optimized_messages
+                _th_tools_snapshot = tools_before_hook(
+                    body.get("tools"),
+                    _th_loading,
+                    _count_tool_tokens,
+                    tags,
+                    deferred_billed=_deferred_billed_eagerly,
                 )
                 run_request_hooks(_req_ctx, stream_safe_only=bool(stream))
                 if _req_ctx.messages is not optimized_messages:
@@ -3914,14 +3964,35 @@ class AnthropicHandlerMixin:
                 if _req_ctx.tools is not body.get("tools"):
                     tools = _req_ctx.tools
                     body["tools"] = tools
+                if _req_ctx.system is not body.get("system"):
+                    if _req_ctx.system is None:
+                        body.pop("system", None)
+                    else:
+                        body["system"] = _req_ctx.system
+                _th_sys_after = count_system_tokens(tokenizer.count_messages, _req_ctx.system)
+                if (
+                    _th_sys_before is not None
+                    and _th_sys_after is not None
+                    and _th_sys_before != _th_sys_after
+                ):
+                    _th_system_growth = max(0, _th_sys_after - _th_sys_before)
+                    if _th_sys_before > _th_sys_after:
+                        tags[TURN_HOOK_SYSTEM_SAVED_TAG] = (
+                            int(tags.get(TURN_HOOK_SYSTEM_SAVED_TAG, 0) or 0)
+                            + _th_sys_before
+                            - _th_sys_after
+                        )
+                    body_mutation_tracker.mark_mutated("turn_hook_system")
+                    transforms_applied.append("turn_hook:system")
                 # A hook may shrink the tool array either by replacing it or in place,
                 # so measure the FINAL tools object. Deferral-shaped (removes schemas
                 # count_messages never saw), hence a tag rather than a fold — mirrors
                 # the OpenAI chat path so a turn-hook extension is credited on both.
-                _th_tok_after = (
-                    _count_tool_tokens(without_deferral_flags(_req_ctx.tools))
-                    if _req_ctx.tools
-                    else 0
+                _th_tok_before, _th_tok_after = hook_tool_counts(
+                    _th_tools_snapshot,
+                    _req_ctx.tools,
+                    None if _deferred_billed_eagerly else optimized_messages,
+                    _count_tool_tokens,
                 )
                 _th_saved = max(0, _th_tok_before - _th_tok_after)
                 _th_tool_growth = max(0, _th_tok_after - _th_tok_before)
@@ -4052,6 +4123,16 @@ class AnthropicHandlerMixin:
                     optimized_tokens += _tool_tokens_after
                 # A tool a turn hook added is sent too: it reduces the saving.
                 optimized_tokens += _th_tool_growth
+                # So is system-prompt text a turn hook added.
+                optimized_tokens += _th_system_growth
+                # So is the CCR retrieve tool the proxy declared (the client
+                # never sent it), unless deferred and unloaded: its cost comes
+                # off this turn's saving.
+                optimized_tokens += _count_tool_tokens(
+                    proxy_added_tools(
+                        _billed_view(body.get("tools")), _original_tools, CCR_TOOL_NAME
+                    )
+                )
                 # First-appearance accounting for matured Reads. The client
                 # re-sends the raw conversation every turn, so this diff would
                 # otherwise re-book a matured Read's removal on every request
@@ -4104,6 +4185,7 @@ class AnthropicHandlerMixin:
                     resolve_verbosity_level,
                     shape_request,
                 )
+                from headroom.proxy.output_verbosity_policy import steering_text
 
                 _shaper_settings = OutputShaperSettings.from_env(
                     enabled=(shaper_enabled_for(getattr(self, "config", None))),
@@ -4137,6 +4219,24 @@ class AnthropicHandlerMixin:
                         _level, _src = resolve_verbosity_level(_shaper_settings)
                         shape_result = shape_request(body, _shaper_settings, level_override=_level)
                         if shape_result.changed:
+                            # The steering block is sent on every treatment turn:
+                            # book it as a cost against this turn's input saving,
+                            # debiting hook tool credit when the saving runs out.
+                            try:
+                                _steer_tokens = tokenizer.count_text(steering_text(_level) or "")
+                            except Exception:
+                                logger.debug(
+                                    "[%s] steering token count failed; cost not booked",
+                                    request_id,
+                                )
+                                _steer_tokens = 0
+                            if _steer_tokens:
+                                optimized_tokens += _steer_tokens
+                                tokens_saved = net_hook_tool_saving(
+                                    tokens_saved - _steer_tokens,
+                                    tags,
+                                    int(tags.get("turn_hook_tools_saved_tokens", 0) or 0),
+                                )
                             body_mutation_tracker.mark_mutated("output_shaper")
                             transforms_applied.extend(shape_result.labels or [])
                             logger.info(
