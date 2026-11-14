@@ -11621,7 +11621,10 @@ class OpenAIHandlerMixin:
                     from headroom.cache.prefix_tracker import normalize_message_cache_control
 
                     final = normalize_message_cache_control(
-                        turn.messages, prev_returned, client_messages=messages
+                        turn.messages,
+                        prev_returned,
+                        client_messages=messages,
+                        place_unmarked=False,
                     )
                     if _turn is not None:
                         # AFTER the replay overlay, BEFORE update_from_result /
