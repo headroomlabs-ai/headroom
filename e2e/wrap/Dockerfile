@@ -94,7 +94,7 @@ RUN ln -s ../lib/node_modules/npm/bin/npm-cli.js /usr/local/bin/npm && \
 # npm 10.9.8 crashes in Arborist's peer-set resolver when installing the local
 # OpenClaw plugin (Cannot read properties of null, reading 'edgesOut'). Pin the
 # tested npm version so both wrap-e2e callers use the same working installer.
-RUN npm install -g --no-fund --no-audit npm@12.2.1
+RUN npm install -g --no-fund --no-audit npm@12.2.2
 
 # Freeze transitive CLI dependencies as well as the top-level versions.
 # Global npm install re-resolves ranges and can select partially published
@@ -103,7 +103,9 @@ COPY e2e/wrap/tools/package.json e2e/wrap/tools/package-lock.json e2e/wrap/tools
 RUN npm ci --prefix /opt/wrap-tools --no-fund --no-audit --strict-allow-scripts
 
 # Exercise the installed dependency fixes in both existing wrap-E2E CI callers.
-COPY e2e/wrap/tools/dependency-regression.test.cjs /opt/wrap-tools/
+# The exceptions file is copied too: one check asserts it holds no advisory for a
+# bundled copy that now carries the fix.
+COPY e2e/wrap/tools/dependency-regression.test.cjs e2e/wrap/tools/npm-audit-exceptions.json /opt/wrap-tools/
 RUN npm test --prefix /opt/wrap-tools
 
 WORKDIR /workspace
