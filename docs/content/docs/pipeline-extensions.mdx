@@ -79,7 +79,7 @@ curl http://localhost:8787/v1/chat/completions \
 
 Internal `x-headroom-*` headers (including this one) are stripped before the request is forwarded upstream by default — see `HEADROOM_STRIP_INTERNAL_HEADERS` in [Configuration](/docs/configuration).
 
-Because this header is client-driven, operator-configured secret headers (`OPENAI_TARGET_API_HEADERS` / `ANTHROPIC_TARGET_API_HEADERS`) are only attached when the resolved upstream host is one you designated — a configured provider target, or a host in `HEADROOM_UPSTREAM_ALLOWED_HOSTS`. Other upstreams are still routed to, just without those headers. See [Configuration](/docs/configuration) for details.
+Because this header is client-driven, operator-configured secret headers (`OPENAI_TARGET_API_HEADERS` / `ANTHROPIC_TARGET_API_HEADERS`) are only attached when the resolved upstream origin (scheme, host and port) is one you designated — a configured provider target, or an entry in `HEADROOM_UPSTREAM_ALLOWED_HOSTS`. Other upstreams are still routed to, just without those headers. See [Configuration](/docs/configuration) for details.
 
 ## Per-request model routing with `request.state.headroom_route`
 

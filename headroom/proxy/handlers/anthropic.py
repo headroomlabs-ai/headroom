@@ -45,7 +45,7 @@ from headroom.ccr.marker_resolution import resolve_markers_in_response
 from headroom.ccr.tool_calls import has_ccr_retrieve_tool
 from headroom.config import resolve_omlx_target_api_url
 from headroom.copilot_auth import apply_copilot_api_auth, is_copilot_upstream_url
-from headroom.log_safety import describe_exception
+from headroom.log_safety import describe_exception, safe_id
 from headroom.pipeline import PipelineStage, summarize_routing_markers
 from headroom.proxy import public_errors
 from headroom.proxy.anthropic_wire import (
@@ -67,7 +67,12 @@ from headroom.proxy.buffered_ccr_response import (
     buffered_ccr_asgi_call,
 )
 from headroom.proxy.compression_decision import CompressionDecision
-from headroom.proxy.handlers._debug_dump import _debug_dump_mode, _redact_debug_value
+from headroom.proxy.handlers._debug_dump import (
+    _debug_dump_mode,
+    _redact_debug_value,
+    redact_dump_headers,
+    write_owner_only_json,
+)
 from headroom.proxy.handlers._failure_logging import log_hook_failure, log_request_failure
 from headroom.proxy.helpers import (
     extract_tags,
@@ -197,6 +202,7 @@ def _build_outbound_anthropic_headers(
         _select_extra_headers_for_destination(extra_headers, routed_to_omlx=routed_to_omlx),
         upstream_url=upstream_url,
         config=config,
+        provider="anthropic",
     )
 
 
@@ -725,25 +731,6 @@ class AnthropicHandlerMixin:
         except Exception:
             canonical = str(tool)
         return (name, canonical)
-
-    @staticmethod
-    def _server_memory_tool_names(tools: Any, client_tools: Any) -> frozenset[str]:
-        """Memory tools in ``tools`` that the proxy injected and must run itself.
-
-        A memory tool the client declared stays the client's: its calls are
-        forwarded, not withheld.
-        """
-        from headroom.proxy.memory_handler import MEMORY_TOOL_NAMES, NATIVE_MEMORY_TOOL_NAME
-
-        client_tool_names = {t.get("name") for t in client_tools or [] if isinstance(t, dict)}
-        return frozenset(
-            name
-            for t in tools or []
-            if isinstance(t, dict)
-            and isinstance(name := t.get("name"), str)
-            and (name in MEMORY_TOOL_NAMES or name == NATIVE_MEMORY_TOOL_NAME)
-            and name not in client_tool_names
-        )
 
     def _can_salvage_buffered_upstream(self, resp_json: Any) -> bool:
         """May this upstream response be relayed when post-processing failed?
@@ -2034,7 +2021,7 @@ class AnthropicHandlerMixin:
                     # cache turn is indistinguishable from a turn that died
                     # silently, which is exactly how #3019 stayed invisible.
                     logger.info(
-                        f"[{request_id}] RESPONSE-CACHE-HIT: model={model} "
+                        f"[{request_id}] RESPONSE-CACHE-HIT: model={safe_id(model)} "
                         f"bytes={len(cached.response_body)} "
                         f"age_s={(datetime.now() - cached.created_at).total_seconds():.0f} "
                         f"hits={cached.hit_count}"
@@ -2842,7 +2829,7 @@ class AnthropicHandlerMixin:
                                 "[%s] Compression skipped: reason=cache_mode_prefix_mismatch "
                                 "model=%s current_len=%d previous_len=%d",
                                 request_id,
-                                model,
+                                safe_id(model),
                                 len(original_client_messages),
                                 len(previous_original_messages),
                             )
@@ -3507,9 +3494,11 @@ class AnthropicHandlerMixin:
                 )
                 if mem_tools_injected:
                     memory_tools_injected = True
-                    server_memory_tool_names = self._server_memory_tool_names(
-                        tools, _original_tools
+                    from headroom.proxy.memory_handler import (
+                        server_memory_tool_names as _server_memory_tool_names,
                     )
+
+                    server_memory_tool_names = _server_memory_tool_names(tools, _original_tools)
                     tool_names = [
                         t.get("name") or t.get("type", "")
                         for t in tools
@@ -5047,7 +5036,7 @@ class AnthropicHandlerMixin:
                                 f"status={response.status_code} "
                                 f"error_type={err_type} "
                                 f"error_msg={err_msg!r} "
-                                f"model={model} "
+                                f"model={safe_id(model)} "
                                 f"compressed={'yes' if transforms_applied else 'no'} "
                                 f"transforms={transforms_applied} "
                                 f"original_tokens={original_tokens} "
@@ -5067,21 +5056,12 @@ class AnthropicHandlerMixin:
                                     from headroom import paths as _hr_paths
 
                                     debug_dir = _hr_paths.debug_400_dir()
-                                    debug_dir.mkdir(parents=True, exist_ok=True)
                                     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
                                     debug_file = debug_dir / f"{ts}_{request_id}.json"
 
-                                    # Sanitize headers (redact API keys)
-                                    safe_headers = {}
-                                    _sensitive_header_names = {"x-api-key", "authorization"} | {
-                                        k.lower()
-                                        for k in (self.config.anthropic_extra_headers or {})
-                                    }
-                                    for k, v in headers.items():
-                                        if k.lower() in _sensitive_header_names:
-                                            safe_headers[k] = v[:12] + "..." if v else ""
-                                        else:
-                                            safe_headers[k] = v
+                                    safe_headers = redact_dump_headers(
+                                        headers, self.config.anthropic_extra_headers or {}
+                                    )
 
                                     # In redacted mode, elide prompt/tool/system
                                     # content but keep structure, roles, and lengths.
@@ -5128,8 +5108,7 @@ class AnthropicHandlerMixin:
                                         "system_prompt": system_prompt,
                                     }
 
-                                    with open(debug_file, "w") as f:
-                                        json.dump(debug_payload, f, indent=2, default=str)
+                                    write_owner_only_json(debug_file, debug_payload)
 
                                     logger.warning(
                                         f"[{request_id}] Debug dump ({dump_mode}): {debug_file}"
@@ -5443,6 +5422,7 @@ class AnthropicHandlerMixin:
                                     memory_user_id,
                                     "anthropic",
                                     request_context=memory_request_ctx,
+                                    tool_names=server_memory_tool_names,
                                 )
 
                                 turn_content = resp_json.get("content") or []
