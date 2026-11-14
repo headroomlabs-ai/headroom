@@ -7,8 +7,8 @@
     "test": "node --test --test-concurrency=1 --test-reporter=tap dependency-regression.test.cjs"
   },
   "dependencies": {
-    "@openai/codex": "0.166.0",
-    "openclaw": "2026.10.10"
+    "@openai/codex": "0.167.0",
+    "openclaw": "2026.11.2"
   },
   "overrides": {
     "@modelcontextprotocol/sdk": "1.32.2",
@@ -23,6 +23,6 @@
     "@google/genai@2.27.0": true,
     "esbuild@0.28.2": true,
     "protobufjs@7.6.6": true,
-    "openclaw@2026.10.10": true
+    "openclaw@2026.11.2": true
   }
 }
