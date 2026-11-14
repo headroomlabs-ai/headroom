@@ -4,6 +4,8 @@ import copy
 from types import SimpleNamespace
 from typing import Any
 
+import pytest
+
 from headroom.proxy.handlers.openai import (
     OpenAIHandlerMixin,
     _compact_openai_responses_tools,
@@ -651,3 +653,112 @@ def test_a_client_prompt_that_only_looks_like_ours_reaches_hooks() -> None:
         {"model": "gpt-5.5", "instructions": prompt, "input": [{"role": "user", "content": "hi"}]},
     )
     assert seen == [prompt]
+
+
+def _responses_headline(hook: Any, payload: dict[str, Any]) -> tuple[int, int, dict[str, Any]]:
+    """Run ``hook`` on the Responses path: the headline, the hook's ledger total
+    and the outbound payload."""
+    from headroom.proxy.savings_attribution import from_tags
+    from headroom.proxy.tool_schema_savings_policy import headline_tokens_saved
+    from headroom.proxy.turn_hooks import clear_turn_hooks, register_turn_hook
+
+    class Hook:
+        name = savings_source = "system_hook"
+        on_request = staticmethod(hook)
+
+    handler = _HandlerHarness(ContentRouter(ContentRouterConfig()))
+    tags: dict[str, Any] = {}
+    clear_turn_hooks()
+    register_turn_hook(Hook())
+    try:
+        working, _modified, tokens_saved, *_ = handler._compress_openai_responses_payload(
+            payload, model="gpt-5.5", request_id="hr_test", savings_tags=tags
+        )
+    finally:
+        clear_turn_hooks()
+    ledger = sum(e["tokens"] for e in from_tags(tags) if e["source"] == "system_hook")
+    return headline_tokens_saved(tokens_saved, tags), ledger, working
+
+
+@pytest.mark.parametrize("added_words", [600, 5])
+def test_message_growth_is_netted_against_a_system_cut(added_words: int) -> None:
+    # The hook shortens `instructions` and appends message text. With more text
+    # added than cut the request grew, so nothing is booked; with less, the
+    # headline is the difference. Either way it agrees with the hook ledger.
+    def cut_and_grow(ctx: Any) -> None:
+        ctx.system = "short"
+        ctx.messages.append({"role": "user", "content": "added words " * added_words})
+
+    headline, ledger, working = _responses_headline(
+        cut_and_grow,
+        {
+            "model": "gpt-5.5",
+            "instructions": LONG_SYSTEM,
+            "input": [{"role": "user", "content": "hi"}],
+        },
+    )
+    assert working["instructions"] == "short"
+    assert (headline == 0) == (added_words == 600)
+    assert headline == ledger
+
+
+def _function_tool(name: str, words: int) -> dict[str, Any]:
+    return {
+        "type": "function",
+        "name": name,
+        # No trailing space: schema compaction would strip it and book that.
+        "description": ("Look things up in the index. " * words).strip(),
+        "parameters": {"type": "object", "properties": {}},
+    }
+
+
+@pytest.mark.parametrize("schema_words", [400, 5])
+def test_undeferring_a_client_deferred_tool_is_charged_on_responses(schema_words: int) -> None:
+    # Loading is unreadable on OpenAI, so a tool the client deferred is assumed
+    # unbilled until the hook un-defers it: its schema is growth, netted against
+    # the hook's fold. A large schema outweighs the fold; a small one does not.
+    def fold_and_undefer(ctx: Any) -> None:
+        ctx.messages[0]["output"] = "folded"
+        for tool in ctx.tools:
+            tool.pop("defer_loading", None)
+
+    headline, ledger, working = _responses_headline(
+        fold_and_undefer,
+        {
+            "model": "gpt-5.5",
+            "input": [{"type": "function_call_output", "call_id": "c1", "output": "data " * 300}],
+            "tools": [
+                {"type": "tool_search"},
+                {**_function_tool("later", schema_words), "defer_loading": True},
+            ],
+        },
+    )
+    assert "defer_loading" not in working["tools"][1]  # the hook did run
+    assert headline == ledger
+    assert (headline == 0) == (schema_words == 400)
+
+
+def test_undeferring_a_tool_nested_in_a_namespace_is_charged() -> None:
+    # Codex ships MCP servers as namespace groups; the deferred tool is nested.
+    def fold_and_undefer_nested(ctx: Any) -> None:
+        ctx.messages[0]["output"] = "folded"
+        for tool in ctx.tools[1]["tools"]:
+            tool.pop("defer_loading", None)
+
+    headline, ledger, working = _responses_headline(
+        fold_and_undefer_nested,
+        {
+            "model": "gpt-5.5",
+            "input": [{"type": "function_call_output", "call_id": "c1", "output": "data " * 300}],
+            "tools": [
+                {"type": "tool_search"},
+                {
+                    "type": "namespace",
+                    "name": "mcp__srv",
+                    "tools": [{**_function_tool("later", 400), "defer_loading": True}],
+                },
+            ],
+        },
+    )
+    assert "defer_loading" not in working["tools"][1]["tools"][0]  # the hook did run
+    assert headline == ledger == 0

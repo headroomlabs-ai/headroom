@@ -59,9 +59,10 @@ from headroom.proxy.stage_timer import StageTimer, emit_stage_timings_log
 from headroom.proxy.tool_schema_savings_policy import (
     TURN_HOOK_SYSTEM_SAVED_TAG,
     accumulate_tool_schema_saved,
+    hook_tool_counts,
     net_hook_tool_saving,
     tool_schema_saved_from_tags,
-    without_deferral_flags,
+    tools_before_hook,
 )
 from headroom.proxy.turn_hooks import (
     conversation_from,
@@ -3222,7 +3223,10 @@ class OpenAIHandlerMixin:
         working = payload
         modified = False
         tokens_saved = 0
-        _system_growth = 0
+        # What the turn hooks added (system prompt, tool definitions) and the
+        # tool tokens they removed, netted at the single clamp below.
+        _hook_growth = 0
+        _hook_tool_saved = 0
         transforms: list[str] = []
         reason: str | None = None
 
@@ -3365,6 +3369,19 @@ class OpenAIHandlerMixin:
                     )
                 except Exception:
                     _mt_before = 0
+
+            def _count_responses_tools(value: Any) -> int:
+                if not value:
+                    return 0
+                return self.openai_provider.get_token_counter(model).count_text(
+                    _json_debug_dumps(value)
+                )
+
+            # Loading is unreadable on OpenAI: a tool a hook un-defers is charged
+            # as growth (hook_tool_counts), as the hook ledger does.
+            _tools_snapshot = tools_before_hook(
+                working.get("tools"), None, _count_responses_tools, savings_tags
+            )
             # The Responses system prompt: `instructions`, or a leading system or
             # developer input item. On a continuation that item is a turn-level
             # note, and `instructions` holding only the output shaper's block is
@@ -3391,13 +3408,7 @@ class OpenAIHandlerMixin:
                 count_messages=lambda value: self.openai_provider.get_token_counter(
                     model
                 ).count_text(_json_debug_dumps(value)),
-                count_tools=lambda value: (
-                    self.openai_provider.get_token_counter(model).count_text(
-                        _json_debug_dumps(value)
-                    )
-                    if value
-                    else 0
-                ),
+                count_tools=_count_responses_tools,
                 conversation=conversation,
             )
             # Streaming turns get fold-only hooks, same rule as the
@@ -3425,8 +3436,8 @@ class OpenAIHandlerMixin:
                     _mt_after = self.openai_provider.get_token_counter(model).count_text(
                         _json_debug_dumps(working.get(_msg_key) or [])
                     )
-                    if _mt_after < _mt_before:
-                        tokens_saved += _mt_before - _mt_after
+                    # Signed: message text a hook added offsets its other savings.
+                    tokens_saved += _mt_before - _mt_after
                 except Exception as e:
                     logger.debug(
                         "[%s] turn-hook message fold token count failed; savings not counted: %s",
@@ -3450,7 +3461,16 @@ class OpenAIHandlerMixin:
                             - _sys_after
                         )
                     elif _sys_after > _sys_before:
-                        _system_growth = _sys_after - _sys_before
+                        _hook_growth += _sys_after - _sys_before
+            _tools_was, _tools_now = hook_tool_counts(
+                _tools_snapshot, working.get("tools"), None, _count_responses_tools
+            )
+            _hook_growth += max(0, _tools_now - _tools_was)
+            _hook_tool_saved = max(0, _tools_was - _tools_now)
+            if _hook_tool_saved and savings_tags is not None:
+                savings_tags["turn_hook_tools_saved_tokens"] = (
+                    int(savings_tags.get("turn_hook_tools_saved_tokens", 0) or 0) + _hook_tool_saved
+                )
             modified = True
             transforms.append("openai:responses:turn_hook")
 
@@ -3507,8 +3527,11 @@ class OpenAIHandlerMixin:
                     describe_exception(e),
                 )
 
-        # Signed through every stage above, clamped once.
-        tokens_saved = max(0, tokens_saved - _system_growth)
+        # Signed through every stage above, clamped once: a deficit comes off
+        # the hooks' tool and system-prompt tags, then the tool-search credit.
+        tokens_saved = net_hook_tool_saving(
+            tokens_saved - _hook_growth, savings_tags, _hook_tool_saved
+        )
 
         dedupe_started = time.perf_counter()
         deduped: list[str] = []
@@ -5143,13 +5166,13 @@ class OpenAIHandlerMixin:
         )
         if registered_turn_hooks():
             _th_tools_before = body.get("tools")
-            _th_tok_before = (
-                tokenizer.count_text(
-                    json.dumps(without_deferral_flags(_th_tools_before), default=str)
-                )
-                if _th_tools_before
-                else 0
-            )
+
+            def _th_count_tools(value: Any) -> int:
+                return tokenizer.count_text(json.dumps(value, default=str)) if value else 0
+
+            # Loading is unreadable here: a tool a hook un-defers is charged
+            # (hook_tool_counts), as the hook ledger does.
+            _th_tools_snapshot = tools_before_hook(_th_tools_before, None, _th_count_tools, tags)
             _th_ctx = TurnContext(
                 provider="openai",
                 model=str(model),
@@ -5158,9 +5181,7 @@ class OpenAIHandlerMixin:
                 config=self.config,
                 tags=tags,
                 count_messages=tokenizer.count_messages,
-                count_tools=lambda value: (
-                    tokenizer.count_text(json.dumps(value, default=str)) if value else 0
-                ),
+                count_tools=_th_count_tools,
                 conversation=_th_conversation,
             )
             # Snapshot messages BEFORE the hook (same tokenizer) so we can tell whether
@@ -5171,6 +5192,9 @@ class OpenAIHandlerMixin:
             except Exception:
                 _th_msg_before = None
             run_request_hooks(_th_ctx, stream_safe_only=stream)
+            _th_tok_before, _th_tok_after = hook_tool_counts(
+                _th_tools_snapshot, _th_ctx.tools, None, _th_count_tools
+            )
             # A hook may either replace ctx.messages/ctx.tools or mutate them in
             # place (the contract allows both). Use object identity only to decide
             # whether body needs reassignment; measure the saving from the FINAL
@@ -5190,14 +5214,7 @@ class OpenAIHandlerMixin:
                 if 0 < tool_tokens_after_compaction < tool_tokens_before_compaction:
                     optimized_tokens += tool_tokens_after_compaction
                 # A tool the hook added is sent too: it reduces the saving.
-                _th_tools_after_count = (
-                    tokenizer.count_text(
-                        json.dumps(without_deferral_flags(_th_ctx.tools), default=str)
-                    )
-                    if _th_ctx.tools
-                    else 0
-                )
-                optimized_tokens += max(0, _th_tools_after_count - _th_tok_before)
+                optimized_tokens += max(0, _th_tok_after - _th_tok_before)
                 _th_raw_saved: int | None = original_tokens - optimized_tokens
                 tokens_saved = max(0, _th_raw_saved)
                 # Attribute to the hook ONLY when the hook itself reduced tokens.
@@ -5205,11 +5222,6 @@ class OpenAIHandlerMixin:
                     transforms_applied.append("turn_hook")
             except Exception:
                 logger.debug("turn-hook token re-count skipped", exc_info=True)
-            _th_tok_after = (
-                tokenizer.count_text(json.dumps(without_deferral_flags(_th_ctx.tools), default=str))
-                if _th_ctx.tools
-                else 0
-            )
             _th_saved = max(0, _th_tok_before - _th_tok_after)
             if _th_saved > 0:
                 tags["turn_hook_tools_saved_tokens"] = (

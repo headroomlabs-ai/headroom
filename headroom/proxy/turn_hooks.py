@@ -331,7 +331,11 @@ def run_request_hooks(ctx: TurnContext, *, stream_safe_only: bool = False) -> No
                 before_system = count_system_tokens(count_messages, ctx.system)
             if ctx.count_tools is not None:
                 before_tools = tools_before_hook(
-                    ctx.tools, _tool_loading_history(ctx), ctx.count_tools
+                    ctx.tools,
+                    _tool_loading_history(ctx),
+                    ctx.count_tools,
+                    ctx.tags,
+                    deferred_billed=ctx.deferred_tools_billed,
                 )
             fn(ctx)
             # Signed deltas, netted: a hook that folds messages but ADDS a tool

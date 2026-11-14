@@ -64,6 +64,12 @@ class _CondenseDeferred:
 
 def _send(monkeypatch, body: dict, *, optimize: bool = False, backend=None) -> tuple[dict, dict]:
     """POST ``body`` through the proxy; return the outcome tags and the upstream body."""
+    outcome, upstream = _send_outcome(monkeypatch, body, optimize=optimize, backend=backend)
+    return outcome.tags, upstream
+
+
+def _send_outcome(monkeypatch, body: dict, *, optimize: bool = False, backend=None):  # noqa: ANN202
+    """POST ``body`` through the proxy; return the outcome and the upstream body."""
     from fastapi.testclient import TestClient
 
     from headroom.proxy.loopback_guard import require_loopback
@@ -109,7 +115,7 @@ def _send(monkeypatch, body: dict, *, optimize: bool = False, backend=None) -> t
                 headers={"x-api-key": "sk-ant-test", "anthropic-version": "2023-06-01"},
             )
     assert result.status_code == 200, result.text
-    return outcomes[-1].tags, json.loads(route.calls.last.request.content) if route.called else {}
+    return outcomes[-1], json.loads(route.calls.last.request.content) if route.called else {}
 
 
 def _count_tools(tools: list) -> int:
@@ -343,3 +349,96 @@ def test_a_reference_repair_removes_loads_nothing():
     assert unbilled_deferred_tool_names(tools, history) == {"lookup"}
     search = {"name": "tool_search_tool_regex", "type": "tool_search_tool_regex_20251119"}
     assert unbilled_deferred_tool_names([search, *tools], history) == frozenset()
+
+
+# ── un-deferring a client-deferred tool puts its schema on the bill ──────────
+
+
+class _FoldAndUndefer:
+    """Folds the conversation and un-defers every deferred tool, in place."""
+
+    name = savings_source = "fold"
+    stream_safe = True
+
+    def on_request(self, ctx: TurnContext) -> None:
+        ctx.messages = [{"role": "user", "content": "folded"}]
+        for tool in ctx.tools:
+            tool.pop("defer_loading", None)
+
+
+def _hook_ledger(tags: dict) -> int:
+    from headroom.proxy.savings_attribution import from_tags
+
+    return sum(e["tokens"] for e in from_tags(tags) if e["source"] == "fold")
+
+
+@pytest.mark.parametrize("schema_size", [16_000, 400])
+def test_undeferring_a_client_deferred_tool_is_netted_on_the_headline(
+    monkeypatch, schema_size: int
+) -> None:
+    # The client deferred `later` and no tool_reference loaded it, so it was not
+    # billed; the hook folds ~1,000 message tokens and un-defers it, which puts
+    # its schema on the bill. Booked: the fold less that schema, never below 0.
+    from headroom.proxy.tool_schema_savings_policy import headline_tokens_saved
+
+    register_turn_hook(_FoldAndUndefer())
+    outcome, upstream = _send_outcome(
+        monkeypatch,
+        {
+            "messages": [{"role": "user", "content": "word " * 1_000}],
+            "tools": [_tool("keep"), {**_tool("later", schema_size), "defer_loading": True}],
+        },
+    )
+    assert "defer_loading" not in upstream["tools"][1]  # the hook did run
+    assert "tool_search_deferred_tokens" not in outcome.tags
+    headline = headline_tokens_saved(outcome.tokens_saved, outcome.tags)
+    growth = _count_tools([_tool("keep"), _tool("later", schema_size)]) - _count_tools(
+        [_tool("keep")]
+    )
+    from headroom.tokenizers import get_tokenizer
+
+    count = get_tokenizer("claude-sonnet-4-5").count_messages
+    fold = count([{"role": "user", "content": "word " * 1_000}]) - count(
+        [{"role": "user", "content": "folded"}]
+    )
+    assert headline == max(0, fold - growth)
+    assert (headline == 0) == (schema_size > 1_000)
+    assert headline == _hook_ledger(outcome.tags)
+
+
+def test_undeferring_a_proxy_deferred_tool_is_debited_from_its_credit_once(monkeypatch) -> None:
+    # The built-in deferral booked 14 tools; the hook folds and un-defers one.
+    # That tool's share leaves the credit, and the fold is booked whole: its
+    # schema is not charged a second time against the fold.
+    from headroom.proxy.tool_schema_savings_policy import headline_tokens_saved
+
+    monkeypatch.setenv("HEADROOM_TOOL_SEARCH", "1")
+
+    class _FoldAndUndeferFirst(_FoldAndUndefer):
+        def on_request(self, ctx: TurnContext) -> None:
+            ctx.messages = [{"role": "user", "content": "folded"}]
+            for tool in ctx.tools:
+                if tool.get("name") == "mcp__srv__tool_0":
+                    tool.pop("defer_loading", None)
+
+    register_turn_hook(_FoldAndUndeferFirst())
+    tools = [
+        {
+            "name": f"mcp__srv__tool_{i}",
+            "description": "Look things up. " * 30,
+            "input_schema": {"type": "object"},
+        }
+        for i in range(14)
+    ]
+    outcome, _ = _send_outcome(
+        monkeypatch, {"messages": [{"role": "user", "content": "word " * 1_000}], "tools": tools}
+    )
+    tags = outcome.tags
+    assert tags.get("tool_search_mode") == "headroom"
+    still = [{**t, "defer_loading": True} for t in tools[1:]]
+    assert tags["tool_search_deferred_tokens"] == _count_tools(still)
+    assert outcome.tokens_saved == outcome.original_tokens - outcome.optimized_tokens > 0
+    assert _hook_ledger(tags) == outcome.tokens_saved
+    assert headline_tokens_saved(outcome.tokens_saved, tags) == (
+        outcome.tokens_saved + tags["tool_search_deferred_tokens"]
+    )

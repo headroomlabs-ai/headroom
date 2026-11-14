@@ -482,3 +482,101 @@ def test_the_gateway_turn_books_only_loaded_deferred_tools() -> None:
     full = [_tool("resident"), _tool("loaded")]
     short = [{**t, "description": "short"} for t in full]
     assert tags["turn_hook_tools_saved_tokens"] == count(full) - count(short)
+
+
+# ── un-deferring a client-deferred tool puts its schema on the bill ──────────
+
+_LONG = "word " * 800
+
+
+class _FoldAndUndefer:
+    """Folds the conversation and un-defers every deferred tool, in place."""
+
+    name = savings_source = "fold"
+    stream_safe = True
+
+    def on_request(self, ctx: TurnContext) -> None:
+        ctx.messages = [{"role": "user", "content": "folded"}]
+        for tool in ctx.tools:
+            tool.pop("defer_loading", None)
+
+
+class _DropResidentAndUndefer(_FoldAndUndefer):
+    name = savings_source = "tool_router"
+
+    def on_request(self, ctx: TurnContext) -> None:
+        ctx.tools = [t for t in ctx.tools if t["name"] != "resident"]
+        for tool in ctx.tools:
+            tool.pop("defer_loading", None)
+
+
+def _client_deferral(hook: object, size: int, **ctx_fields: object) -> list[dict]:
+    """A client-deferred, unloaded tool ``later``; no tool-search booking."""
+    register_turn_hook(hook)
+    ctx = TurnContext(
+        **{
+            "provider": "anthropic",
+            "model": "claude-sonnet-4-6",
+            "messages": [{"role": "user", "content": _LONG}],
+            "tools": [_tool("resident"), {**_tool("later", size), "defer_loading": True}],
+            "count_messages": _count,
+            "count_tools": _count,
+            **ctx_fields,
+        }
+    )
+    run_request_hooks(ctx)
+    assert "tool_search_deferred_tokens" not in ctx.tags
+    return from_tags(ctx.tags)
+
+
+def _fold() -> int:
+    return _count([{"role": "user", "content": _LONG}]) - _count(
+        [{"role": "user", "content": "folded"}]
+    )
+
+
+@pytest.mark.parametrize("provider", ["anthropic", "openai"])
+def test_undeferring_an_unbilled_client_tool_is_charged_against_a_fold(provider: str) -> None:
+    # Reviewer's reproduction: the fold saves ~400 tokens while the hook puts a
+    # ~1,000-token schema on the bill. The request grew, so nothing is booked.
+    # (OpenAI: loading is unreadable, so the tool is assumed unloaded.)
+    assert _client_deferral(_FoldAndUndefer(), 4_000, provider=provider) == []
+
+
+def test_a_fold_larger_than_the_undeferred_schema_books_the_difference() -> None:
+    (entry,) = _client_deferral(_FoldAndUndefer(), 400)
+    growth = _count([_tool("resident"), _tool("later", 400)]) - _count([_tool("resident")])
+    assert entry["details"]["tool_tokens_saved"] == -growth
+    assert entry["tokens"] == _fold() - growth
+
+
+def test_undeferring_offsets_a_tool_the_same_hook_removed() -> None:
+    # resident (~110 tokens) removed, later (~1,000) newly billed: a net loss.
+    assert _client_deferral(_DropResidentAndUndefer(), 4_000) == []
+
+
+def test_a_translating_backend_already_billed_the_deferred_tool() -> None:
+    # The backend drops defer_loading and bills every tool, so un-deferring
+    # changes nothing on the bill and the fold is booked whole.
+    (entry,) = _client_deferral(_FoldAndUndefer(), 4_000, deferred_tools_billed=True)
+    assert entry["tokens"] == _fold()
+
+
+def test_undeferring_a_proxy_booked_tool_is_debited_once() -> None:
+    # The deferral credit covers a, so reconcile takes a's share off it; the
+    # hook's fold is booked whole, with no second charge for a's schema.
+    class _FoldAndUndeferFirst(_FoldAndUndefer):
+        def on_request(self, ctx: TurnContext) -> None:
+            ctx.messages = [{"role": "user", "content": "folded"}]
+            ctx.tools[0].pop("defer_loading", None)
+
+    tags, (credit,) = _booked(
+        _BookDeferral(),
+        _FoldAndUndeferFirst(),
+        messages=[{"role": "user", "content": _LONG}],
+    )
+    assert tags["tool_search_deferred_tokens"] == _count([{**_tool("b"), "defer_loading": True}])
+    assert credit["tokens"] == tags["tool_search_deferred_tokens"]
+    (fold_entry,) = [e for e in from_tags(tags) if e["source"] == "fold"]
+    assert fold_entry["tokens"] == _fold()
+    assert fold_entry["details"]["tool_tokens_saved"] == 0

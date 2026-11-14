@@ -1017,7 +1017,11 @@ class RequestTransformer:
             system_before = count_system_tokens(count_messages, self.system)
             tools_snapshot = (
                 _safe_call(
-                    tools_before_hook, tools, loading_history(self.provider, messages), count_tools
+                    tools_before_hook,
+                    tools,
+                    loading_history(self.provider, messages),
+                    count_tools,
+                    self.tags,
                 )
                 if count_tools is not None
                 else None

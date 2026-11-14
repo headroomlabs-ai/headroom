@@ -64,17 +64,11 @@ def without_deferral_flags(tools: object) -> object:
     appear or disappear: un-deferring a tool would shorten the JSON by the
     flag text and be booked as a small saving although the bill goes UP, and
     deferring one would add a phantom cost. So the flag is ignored here, and a
-    hook's measured tool delta covers only real removals and rewrites. Never
-    mutates its input.
+    hook's measured tool delta covers only real removals and rewrites. Tools
+    nested in a Responses ``namespace`` group (Codex) are measured the same
+    way. Never mutates its input.
     """
-    if not isinstance(tools, list):
-        return tools
-    return [
-        {k: v for k, v in tool.items() if k != "defer_loading"}
-        if isinstance(tool, dict) and "defer_loading" in tool
-        else tool
-        for tool in tools
-    ]
+    return _measured_view(tools, frozenset())
 
 
 def unbilled_deferred_tool_names(tools: object, messages: object) -> frozenset[str]:
@@ -88,11 +82,7 @@ def unbilled_deferred_tool_names(tools: object, messages: object) -> frozenset[s
     """
     if messages is None or not isinstance(tools, list):
         return frozenset()
-    deferred = {
-        str(t["name"])
-        for t in tools
-        if isinstance(t, dict) and t.get("defer_loading") and t.get("name")
-    }
+    deferred = _deferred_names(tools)
     if not deferred:
         return frozenset()
     from headroom.proxy.helpers import (
@@ -107,22 +97,35 @@ def unbilled_deferred_tool_names(tools: object, messages: object) -> frozenset[s
 
 
 def _tool_names(tools: object) -> set[str]:
-    return {
-        str(t["name"])
-        for t in (tools if isinstance(tools, list) else [])
-        if isinstance(t, dict) and t.get("name")
-    }
+    from headroom.proxy.helpers import iter_tool_entries
+
+    return {str(t["name"]) for t in iter_tool_entries(tools) if t.get("name")}
+
+
+def _deferred_names(tools: object) -> frozenset[str]:
+    from headroom.proxy.helpers import iter_tool_entries
+
+    return frozenset(
+        str(t["name"]) for t in iter_tool_entries(tools) if t.get("defer_loading") and t.get("name")
+    )
 
 
 def _measured_view(tools: object, excluded: frozenset[str]) -> object:
-    view = without_deferral_flags(tools)
-    if not excluded or not isinstance(view, list):
-        return view
-    return [
-        t
-        for t in view
-        if not (isinstance(t, dict) and t.get("name") and str(t["name"]) in excluded)
-    ]
+    """``tools`` without ``defer_loading`` flags or the ``excluded`` tools, the
+    members of a ``namespace`` group included. Never mutates its input."""
+    if not isinstance(tools, list):
+        return tools
+    view: list[Any] = []
+    for tool in tools:
+        if isinstance(tool, dict):
+            if tool.get("name") and str(tool["name"]) in excluded:
+                continue
+            if "defer_loading" in tool:
+                tool = {k: v for k, v in tool.items() if k != "defer_loading"}
+            if tool.get("type") == "namespace" and isinstance(tool.get("tools"), list):
+                tool = {**tool, "tools": _measured_view(tool["tools"], excluded)}
+        view.append(tool)
+    return view
 
 
 @dataclass(frozen=True)
@@ -131,28 +134,51 @@ class ToolsBeforeHook:
 
     names: frozenset[str]
     unbilled: frozenset[str]
-    # A copy of the tools, kept only when some tool was unbilled: whether it
-    # is left out of the count depends on what the hook does to it.
+    # Tools whose schema is growth once the hook puts them on the bill: those
+    # not billed before it, less those the deferral credit covers.
+    chargeable: frozenset[str] = frozenset()
+    # A copy of the tools, kept only when some tool was unbilled or chargeable:
+    # whether it is left out of the count depends on what the hook does to it.
     tools: object = None
-    # Counted up front when no tool was unbilled (nothing to decide later).
+    # Counted up front otherwise (nothing to decide later).
     count: int | None = None
 
 
 def tools_before_hook(
-    tools: object, messages: object, count_tools: Callable[[Any], int]
+    tools: object,
+    messages: object,
+    count_tools: Callable[[Any], int],
+    tags: object = None,
+    *,
+    deferred_billed: bool = False,
 ) -> ToolsBeforeHook:
     """Snapshot ``tools`` for a hook's measured tool delta; see :func:`hook_tool_counts`.
 
-    ``messages`` as for :func:`unbilled_deferred_tool_names`. May raise
-    whatever ``count_tools`` raises.
+    ``messages`` as for :func:`unbilled_deferred_tool_names`; ``tags`` are the
+    request's tags, read for the deferral credit. ``deferred_billed``: a
+    translating backend bills every tool, deferred or not. May raise whatever
+    ``count_tools`` raises.
     """
     unbilled = unbilled_deferred_tool_names(tools, messages)
     names = frozenset(_tool_names(tools))
-    if not unbilled:
+    if deferred_billed:
+        chargeable: frozenset[str] = frozenset()
+    else:
+        # Where loading is unreadable (``messages`` is None, OpenAI tool
+        # search) a deferred tool the hook un-defers may have been unloaded:
+        # it is charged as if it were, which under-books at worst. (Condensing
+        # or removing one there is still booked as if billed, as before.)
+        # With a deferral credit, every deferred tool is left to
+        # reconcile_deferred_tokens: the proxy's deferrers stand down when the
+        # client already defers, so the credit's tools are all of them.
+        chargeable = unbilled if messages is not None else _deferred_names(tools)
+        if isinstance(tags, dict) and "tool_search_deferred_tokens" in tags:
+            chargeable -= _deferred_names(tools)
+    if not unbilled and not chargeable:
         return ToolsBeforeHook(
             names, unbilled, count=int(count_tools(without_deferral_flags(tools)))
         )
-    return ToolsBeforeHook(names, unbilled, tools=copy.deepcopy(tools))
+    return ToolsBeforeHook(names, unbilled, chargeable, tools=copy.deepcopy(tools))
 
 
 def hook_tool_counts(
@@ -167,9 +193,12 @@ def hook_tool_counts(
     every tool that is billed on neither side: deferred and not loaded before
     the hook (or absent), and deferred and not loaded after it (or absent).
     Condensing, adding or removing such a tool changes nothing on the bill, so
-    it books nothing. A tool the hook defers or un-defers stays in both
-    counts, as before: the flag itself is never booked, and the deferral
-    credit (``tool_search_deferred_tokens``, reconciled by
+    it books nothing. A chargeable tool (:class:`ToolsBeforeHook`) billed
+    after the hook, because it un-deferred or loaded it, is left out of the
+    ``before`` count only: its whole schema is growth, netted against the
+    hook's other savings. Any other tool the hook defers or un-defers stays in
+    both counts: the flag itself is never booked, and the deferral credit
+    (``tool_search_deferred_tokens``, reconciled by
     :func:`reconcile_deferred_tokens`) carries that change. May raise
     whatever ``count_tools`` raises.
     """
@@ -177,10 +206,14 @@ def hook_tool_counts(
     billed_before = before.names - before.unbilled
     billed_after = _tool_names(tools) - unbilled_after
     excluded = frozenset((before.unbilled | unbilled_after) - billed_before - billed_after)
+    if messages is None:
+        # Unreadable loading: only un-deferring is seen to bill a tool.
+        billed_after -= _deferred_names(tools)
+    newly_billed = before.chargeable & billed_after
     if before.count is not None:
         before_count = before.count
     else:
-        before_count = int(count_tools(_measured_view(before.tools, excluded)))
+        before_count = int(count_tools(_measured_view(before.tools, excluded | newly_billed)))
     return before_count, int(count_tools(_measured_view(tools, excluded)))
 
 

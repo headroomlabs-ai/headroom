@@ -3951,7 +3951,11 @@ class AnthropicHandlerMixin:
                 # a hook condensing one saves nothing (hook_tool_counts).
                 _th_loading = None if _deferred_billed_eagerly else optimized_messages
                 _th_tools_snapshot = tools_before_hook(
-                    body.get("tools"), _th_loading, _count_tool_tokens
+                    body.get("tools"),
+                    _th_loading,
+                    _count_tool_tokens,
+                    tags,
+                    deferred_billed=_deferred_billed_eagerly,
                 )
                 run_request_hooks(_req_ctx, stream_safe_only=bool(stream))
                 if _req_ctx.messages is not optimized_messages:
