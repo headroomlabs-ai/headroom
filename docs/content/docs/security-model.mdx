@@ -275,6 +275,13 @@ allowlist. Note the interaction — trusting a gateway for `X-Forwarded-For` mea
 dashboard CIDR check is applied to a client-supplied header, so the two must be configured
 together and pointed at infrastructure you control.
 
+`HEADROOM_PROXY_TRUSTED_DASHBOARD_HOSTS` additionally allows explicitly trusted DNS
+authorities for dashboard access. Entries are comma-separated `Host` values without a
+scheme; include the port when the browser sends one (for example,
+`dashboard.example:8443`). A bare `dashboard.example` does not authorize that port.
+The trusted-client CIDR and same-origin scheme, host, and port checks still apply.
+Only list names and web origins that you control.
+
 ### What the proxy token unlocks
 
 With `HEADROOM_PROXY_TOKEN` set, a non-loopback caller that presents the token
