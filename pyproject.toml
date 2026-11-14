@@ -68,7 +68,7 @@ dependencies = [
     "litellm>=1.96.2,<2.0",
     "click>=8.5.0",               # CLI framework; PYSEC-2026-2132 fix (command injection in click.edit())
     "rich>=13.0.0",               # Rich terminal output
-    "opentelemetry-api>=1.45.1",  # CVE-2026-114603: bounded, linear-time tracestate parsing
+    "opentelemetry-api>=1.45.2",  # CVE-2026-114603 tracestate parsing; CVE-2026-126360 traceparent ReDoS
     # AST-aware code slicing (CodeCompressor); binary wheel. 0.44.1 is excluded:
     # that PyPI release was a compromised supply-chain build shipping an
     # info-stealer `sg.exe` (Trojan:Win64/Lazy!MTB) alongside the real binary

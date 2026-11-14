@@ -1048,3 +1048,43 @@ async def test_a_proxied_client_still_pins_its_direct_transport(
         assert isinstance(proxied, GuardedUpstreamRefusingTransport)
     finally:
         await client.aclose()
+
+
+# ---------------------------------------------------------------------------
+# A non-ASCII host is checked and pinned under the name httpcore connects with
+# ---------------------------------------------------------------------------
+
+
+async def test_a_non_ascii_host_is_resolved_and_pinned_under_its_connect_name(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """httpx IDNA-encodes the host, so httpcore asks ``connect_tcp`` for the A-label.
+
+    The check used to resolve and pin the Unicode spelling. The connection's
+    lookup by A-label then found no pin, treated the host as never checked, and
+    resolved it again. ``ß`` also shows the check must resolve the A-label
+    itself: the resolver's own encoding would have looked up ``strasse.example``.
+    """
+    from headroom.proxy import upstream_guard
+
+    looked_up: list[str] = []
+
+    def public_answer(host: str, *args: object, **kwargs: object) -> list[object]:
+        looked_up.append(host)
+        return [(None, None, None, None, ("8.8.8.8", 443))]
+
+    monkeypatch.setattr(socket, "getaddrinfo", public_answer)
+    monkeypatch.delenv("HEADROOM_ALLOWED_BASE_URLS", raising=False)
+    upstream_guard.clear_validated_addresses()
+    url = "https://Straße.example/v1"
+    assert is_safe_upstream_url(url) is True
+
+    connect_name = httpx.URL(url).raw_host.decode("ascii")
+    assert connect_name == "xn--strae-oqa.example"
+    assert looked_up == [connect_name]
+    assert upstream_guard.guarded_pin(connect_name) is not None
+    assert upstream_guard.guarded_pin("straße.example") is not None
+
+    inner, stream, error = await _connect(connect_name)
+    assert error is None and stream is not None
+    assert inner.targets == ["8.8.8.8"], f"the name was resolved again: {inner.targets}"
