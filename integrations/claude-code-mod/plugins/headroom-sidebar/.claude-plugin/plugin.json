@@ -1,0 +1,9 @@
+{
+  "name": "headroom-sidebar",
+  "version": "0.1.3",
+  "description": "Conversation-scoped compression controls, time windows, visual metrics and message inspection in a live sidebar. Requires the opt-in local companion.",
+  "author": {
+    "name": "Headroom Labs"
+  },
+  "types": "./types/index.d.ts"
+}
