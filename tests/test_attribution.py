@@ -339,6 +339,26 @@ def test_format_labels_longest_output_is_read_whole():
     assert resolve_attribution(request, list(labels)) == labels
 
 
+@pytest.mark.parametrize("label", ["café", "東京", "a😀b", "naïve, ok; 100%"])
+def test_format_labels_encodes_non_ascii(label):
+    labels = {"team": label, "owner": "sam"}
+    header = format_labels(labels)
+    assert header.isascii()
+    # As an ASGI server hands the header over: latin-1 decoded bytes.
+    assert parse_labels(header.encode("ascii").decode("latin-1")) == labels
+
+
+def test_format_labels_refuses_a_header_the_parser_would_cut():
+    labels = {
+        f"d{i}": "😀" * attribution.LABEL_MAX_LENGTH for i in range(attribution.MAX_DIMENSIONS)
+    }
+    with pytest.raises(ValueError, match="only 6702"):
+        format_labels(labels)
+    # The same labels fit in fewer pairs, and come back whole.
+    few = dict(list(labels.items())[:4])
+    assert parse_labels(format_labels(few)) == few
+
+
 def test_format_labels_reported_overflow_case_roundtrips():
     labels = {f"d{i}": "%" * 128 for i in range(16)}
     assert parse_labels(format_labels(labels)) == labels

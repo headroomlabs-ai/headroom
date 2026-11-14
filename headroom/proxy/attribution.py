@@ -46,6 +46,7 @@ from contextvars import ContextVar
 from dataclasses import dataclass, field
 from types import MappingProxyType
 from typing import Any, Final
+from urllib.parse import quote
 
 logger = logging.getLogger(__name__)
 
@@ -73,8 +74,10 @@ LABELS_HEADER: Final[str] = "x-headroom-labels"
 
 #: Only this much of ``X-Headroom-Labels`` is read. It is parsed on every
 #: request, so its cost must not be the client's to choose. Sized to the
-#: longest header :func:`format_labels` can emit (every label at full length
-#: and every character percent-encoded), so whatever it builds is read whole.
+#: longest ASCII header :func:`format_labels` can emit (every label at full
+#: length, every character percent-encoded to three). A non-ASCII character
+#: encodes to up to twelve, so past this limit :func:`format_labels` raises
+#: instead of building a header the parser would cut.
 LABELS_HEADER_MAX_LENGTH: Final[int] = MAX_DIMENSIONS * (
     DIMENSION_NAME_MAX_LENGTH + len("=") + 3 * LABEL_MAX_LENGTH
 ) + (MAX_DIMENSIONS - 1) * len("; ")
@@ -422,21 +425,37 @@ def parse_labels(value: Any) -> dict[str, str]:
     return dict(itertools.islice(_label_pairs(value).items(), MAX_DIMENSIONS))
 
 
-_LABEL_ESCAPES = str.maketrans({"%": "%25", ",": "%2C", ";": "%3B"})
+def _encode_label(label: str) -> str:
+    # Printable ASCII passes through, except what the parser splits on or
+    # decodes; anything else is UTF-8 percent-encoded, which the parser's
+    # single decode turns back into the same text.
+    return "".join(
+        ch if " " <= ch <= "~" and ch not in "%,;" else quote(ch, safe="") for ch in label
+    )
 
 
 def format_labels(labels: Mapping[str, str]) -> str:
     """Inverse of :func:`parse_labels`, for building ``X-Headroom-Labels``.
 
     The parser splits on ``,`` and ``;`` and then percent-decodes each label
-    once, so ``%``, ``,`` and ``;`` in a label are percent-encoded here. Every
-    label that :func:`normalize_attribution` keeps comes back unchanged,
-    ``release%41`` and ``design, ops`` included.
+    once, so ``%``, ``,``, ``;`` and every non-ASCII character in a label are
+    percent-encoded here; the header is plain ASCII. Every label that
+    :func:`normalize_attribution` keeps comes back unchanged, ``release%41``,
+    ``design, ops`` and ``café`` included.
+
+    Raises :class:`ValueError` if the header would be longer than
+    :data:`LABELS_HEADER_MAX_LENGTH`, which only labels with many non-ASCII
+    characters can reach: the parser would read only part of it.
     """
-    return "; ".join(
-        f"{name}={label.translate(_LABEL_ESCAPES)}"
-        for name, label in normalize_attribution(labels).items()
+    header = "; ".join(
+        f"{name}={_encode_label(label)}" for name, label in normalize_attribution(labels).items()
     )
+    if len(header) > LABELS_HEADER_MAX_LENGTH:
+        raise ValueError(
+            f"{LABELS_HEADER} would be {len(header)} characters; "
+            f"only {LABELS_HEADER_MAX_LENGTH} are read"
+        )
+    return header
 
 
 def header_name_for(dimension: str) -> str:
