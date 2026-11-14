@@ -966,6 +966,8 @@ def normalize_message_cache_control(
     messages: list[dict[str, Any]],
     previous_forwarded_messages: list[dict[str, Any]] | None = None,
     client_messages: list[dict[str, Any]] | None = None,
+    *,
+    place_unmarked: bool = True,
 ) -> list[dict[str, Any]]:
     """Own message-level cache_control placement so breakpoints stay bounded.
 
@@ -1004,6 +1006,10 @@ def normalize_message_cache_control(
     with it), falls back to the legacy single-marker consolidation. Only
     block-style (list) content can carry cache_control; string content is left
     as-is. Returns the input unchanged when there is nothing to normalize.
+
+    ``place_unmarked=False`` is for callers that hand the body back to someone
+    else's client (``/v1/compress``): when that client marked no message, its
+    caching choice stands and every message marker is stripped, none added.
     """
     changed = False
     out: list[dict[str, Any]] = []
@@ -1074,8 +1080,8 @@ def normalize_message_cache_control(
     # prefix caches). The newest client marker keeps stable-run anchoring
     # when the client placed it on its message's final block (intent: "cache
     # through the end"); an explicit mid-message marker is honored verbatim.
+    positions = _client_marker_positions(client_messages) if client_messages is not None else []
     if client_messages is not None and len(client_messages) == len(messages):
-        positions = _client_marker_positions(client_messages)
         if positions:
             placed_any = False
             newest_mi, newest_bi, _ = positions[-1]
@@ -1094,6 +1100,9 @@ def normalize_message_cache_control(
             if placed_any or changed:
                 return out
             return messages
+
+    if not place_unmarked and client_messages is not None and not positions:
+        return out if changed else messages
 
     # Legacy: re-place exactly one breakpoint on the last block-style message.
     if last_block_idx >= 0:
