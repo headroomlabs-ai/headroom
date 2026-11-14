@@ -60,7 +60,11 @@ from headroom.proxy.tool_schema_savings_policy import (
     without_deferral_flags,
 )
 from headroom.proxy.turn_hooks import conversation_from, run_responses_create_hooks
-from headroom.proxy.upstream_guard import is_safe_upstream_url
+from headroom.proxy.upstream_guard import (
+    guarded_pin,
+    is_safe_upstream_url,
+    is_safe_upstream_url_async,
+)
 from headroom.proxy.ws_headers import WS_HOP_BY_HOP_HEADERS
 from headroom.proxy.ws_session_registry import (
     TerminationCause,
@@ -519,6 +523,12 @@ def _resolve_openai_upstream_base(request_headers: dict[str, str]) -> str | None
         logger.warning("ignoring unsafe x-headroom-base-url override: %r", raw_base_url)
         return None
     return normalized
+
+
+def _upstream_pin_lapsed(url: str) -> bool:
+    """True when this request pinned ``url``'s host and that pin has expired."""
+    pin = guarded_pin(urlparse(url).hostname or "")
+    return pin is not None and pin.is_expired()
 
 
 def _resolve_openai_chat_handler_path(base_url: str, model: str | None) -> str:
@@ -2355,7 +2365,16 @@ class OpenAIHandlerMixin:
         Otherwise falls back to the configured ``OPENAI_API_URL``
         (``OPENAI_TARGET_API_URL``).
         """
-        custom = _resolve_openai_upstream_base(request.headers)
+        return self._openai_upstream_from(request, _resolve_openai_upstream_base(request.headers))
+
+    def _openai_upstream_from(self, request: Request, custom: str | None) -> str:
+        """Pick the upstream given this request's already-resolved override.
+
+        Handlers resolve ``x-headroom-base-url`` once and pass that one result
+        here and to ``merge_extra_headers``. Resolving it again could get a
+        different DNS answer, so the destination and the extra-header trust
+        check would be judging different upstreams.
+        """
         if custom is not None:
             return custom
         if route_grok_to_xai(request.headers, self.OPENAI_API_URL):
@@ -3617,7 +3636,7 @@ class OpenAIHandlerMixin:
         model = body.get("model", "unknown")
         messages = body.get("messages", [])
         custom_upstream_base_url = _resolve_openai_upstream_base(request.headers)
-        upstream_base_url = self._resolve_openai_upstream(request)
+        upstream_base_url = self._openai_upstream_from(request, custom_upstream_base_url)
         # Ghost text and next edits: CAPI does not serve these models. A
         # caller-chosen x-headroom-base-url is left alone, as in
         # select_passthrough_base_url.
@@ -3825,6 +3844,7 @@ class OpenAIHandlerMixin:
         # tags is populated downstream at L1229 — defer apply_to_tags
         # to where the tags dict exists. The decision is captured here
         # so the conditional is uniform with the other gates.
+        images_compressed = False
         if _image_decision.should_compress:
             from headroom.proxy.helpers import _get_image_compressor
 
@@ -3832,6 +3852,7 @@ class OpenAIHandlerMixin:
             try:
                 compressor = _get_image_compressor()
                 if compressor and compressor.has_images(messages):
+                    images_compressed = True
                     messages, image_result = await run_image_compression_isolated(
                         messages,
                         provider="openai",
@@ -3851,12 +3872,26 @@ class OpenAIHandlerMixin:
             finally:
                 if compressor and hasattr(compressor, "close"):
                     compressor.close()
+        # The guard's pin for a client-chosen upstream lasts 60 s and image
+        # compression can run longer. If the pin lapsed, check the same URL again
+        # (off the event loop) so the connection has a current pin. The
+        # destination is not chosen again: if the host no longer passes, the
+        # request is refused.
+        if (
+            images_compressed
+            and custom_upstream_base_url is not None
+            and _upstream_pin_lapsed(custom_upstream_base_url)
+            and not await is_safe_upstream_url_async(custom_upstream_base_url)
+        ):
+            logger.warning(
+                "[%s] rejecting x-headroom-base-url that no longer passes the guard", request_id
+            )
+            raise HTTPException(status_code=400, detail="Rejected unsafe upstream base URL")
 
         # Surface the image-compression decision (computed earlier) into
         # tags now that the tags dict exists. Same observability pattern
         # the funnel uses for passthrough_reason + memory_skip_reason.
         _image_decision.apply_to_tags(tags)
-        custom_upstream_base_url = _resolve_openai_upstream_base(request.headers)
         handler_path = _resolve_openai_chat_forward_path(request.headers, custom_upstream_base_url)
         _, custom_chat_provider = _custom_base_passthrough_telemetry(
             request.method,
@@ -6375,7 +6410,7 @@ class OpenAIHandlerMixin:
         # below sends the request to chatgpt.com.
         custom_upstream_base_url = _resolve_openai_upstream_base(request.headers)
         upstream_base_url = custom_upstream_base_url
-        openai_upstream_base_url = self._resolve_openai_upstream(request)
+        openai_upstream_base_url = self._openai_upstream_from(request, custom_upstream_base_url)
         headers = merge_extra_headers(
             headers,
             self._openai_extra_headers_for_upstream(openai_upstream_base_url),
