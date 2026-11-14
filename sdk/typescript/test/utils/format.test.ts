@@ -809,6 +809,163 @@ describe("round-trip: geminiToOpenAI then openAIToGemini", () => {
     expect(openAIToGemini(geminiToOpenAI(original))).toEqual(original);
   });
 });
+
+// Issue #4770: the compress round trip is Gemini -> OpenAI -> proxy -> OpenAI -> Gemini, so
+// every Gemini-only part field has to ride on the OpenAI shape and come back.
+describe("Gemini part fields survive the compress round trip (issue #4770)", () => {
+  // A thinking-enabled function-call turn exactly as Gemini 3 returns it: the thought part
+  // and the functionCall part both carry a thoughtSignature, and the call carries an id.
+  const contents = [
+    { role: "user", parts: [{ text: "What is the weather in Paris?" }] },
+    {
+      role: "model",
+      parts: [
+        { text: "Let me look that up.", thought: true, thoughtSignature: "sig-thought-1" },
+        {
+          functionCall: { id: "call_abc123", name: "get_weather", args: { city: "Paris" } },
+          thoughtSignature: "sig-call-1",
+        },
+      ],
+    },
+    {
+      role: "user",
+      parts: [
+        {
+          functionResponse: { id: "call_abc123", name: "get_weather", response: { tempC: 21 } },
+        },
+      ],
+    },
+  ];
+
+  it("restores thought, thoughtSignature and functionCall.id on the model turn", () => {
+    const back = openAIToGemini(geminiToOpenAI(contents));
+    const model = back[1];
+    expect(model.role).toBe("model");
+    expect(model.parts[0]).toEqual({
+      text: "Let me look that up.",
+      thought: true,
+      thoughtSignature: "sig-thought-1",
+    });
+    expect(model.parts[1]).toEqual({
+      functionCall: { id: "call_abc123", name: "get_weather", args: { city: "Paris" } },
+      thoughtSignature: "sig-call-1",
+    });
+  });
+
+  it("restores the functionResponse id and name on the tool turn", () => {
+    const back = openAIToGemini(geminiToOpenAI(contents));
+    expect(back[2]).toEqual({
+      role: "user",
+      parts: [
+        { functionResponse: { id: "call_abc123", name: "get_weather", response: { tempC: 21 } } },
+      ],
+    });
+  });
+
+  it("keeps the real call id so a tool result addresses the call Gemini issued", () => {
+    const openai = geminiToOpenAI(contents);
+    const call = openai[1].tool_calls?.[0];
+    expect(call?.id).toBe("call_abc123");
+    expect(openai[2].role === "tool" && openai[2].tool_call_id).toBe("call_abc123");
+  });
+
+  it("still reproduces the whole conversation exactly through detection and conversion", () => {
+    expect(detectFormat(contents)).toBe("gemini");
+    expect(fromOpenAI(toOpenAI(contents), "gemini")).toEqual(contents);
+  });
+
+  it("leaves a plain turn with no extras byte-identical (no private key leaks)", () => {
+    const plain = [{ role: "model", parts: [{ text: "just text" }, { text: "and more" }] }];
+    const openai = geminiToOpenAI(plain);
+    expect(openai).toEqual([{ role: "assistant", content: "just text\nand more" }]);
+    expect(openAIToGemini(openai)).toEqual([{ role: "model", parts: [{ text: "just text\nand more" }] }]);
+  });
+
+  it("keeps a signature-bearing user text part as its own part", () => {
+    const signed = [
+      { role: "user", parts: [{ text: "first", thoughtSignature: "sig-u1" }, { text: "second" }] },
+    ];
+    expect(openAIToGemini(geminiToOpenAI(signed))).toEqual([
+      { role: "user", parts: [{ text: "first", thoughtSignature: "sig-u1" }, { text: "second" }] },
+    ]);
+  });
+
+  it("pairs a functionResponse that omits its id with the call it answers", () => {
+    const contents = [
+      {
+        role: "model",
+        parts: [{ functionCall: { id: "call_abc123", name: "get_weather", args: { city: "Paris" } } }],
+      },
+      {
+        // Gemini omits the id here; the response still answers "call_abc123".
+        role: "user",
+        parts: [{ functionResponse: { name: "get_weather", response: { tempC: 21 } } }],
+      },
+    ];
+    const openai = geminiToOpenAI(contents);
+    expect(openai[0].tool_calls?.[0].id).toBe("call_abc123");
+    expect(openai[1].role === "tool" && openai[1].tool_call_id).toBe("call_abc123");
+
+    // Two calls of the same name are answered in order.
+    const twice = geminiToOpenAI([
+      {
+        role: "model",
+        parts: [
+          { functionCall: { id: "call_1", name: "read", args: { p: "a" } } },
+          { functionCall: { id: "call_2", name: "read", args: { p: "b" } } },
+        ],
+      },
+      {
+        role: "user",
+        parts: [
+          { functionResponse: { name: "read", response: { a: 1 } } },
+          { functionResponse: { name: "read", response: { b: 2 } } },
+        ],
+      },
+    ]);
+    expect(twice.filter((m) => m.role === "tool").map((m) => (m as any).tool_call_id)).toEqual([
+      "call_1",
+      "call_2",
+    ]);
+
+    // An explicitly answered call is not reused by a later id-less response.
+    const outOfOrder = geminiToOpenAI([
+      {
+        role: "model",
+        parts: [
+          { functionCall: { id: "call_1", name: "read", args: { p: "a" } } },
+          { functionCall: { id: "call_2", name: "read", args: { p: "b" } } },
+        ],
+      },
+      {
+        role: "user",
+        parts: [
+          { functionResponse: { id: "call_2", name: "read", response: { b: 2 } } },
+          { functionResponse: { name: "read", response: { a: 1 } } },
+        ],
+      },
+    ]);
+    expect(outOfOrder.filter((m) => m.role === "tool").map((m) => (m as any).tool_call_id)).toEqual([
+      "call_2",
+      "call_1",
+    ]);
+  });
+
+  it("restores a thoughtSignature carried on a functionResponse part", () => {
+    const contents = [
+      {
+        role: "user",
+        parts: [
+          {
+            functionResponse: { id: "call_abc123", name: "get_weather", response: { tempC: 21 } },
+            thoughtSignature: "sig-response-1",
+          },
+        ],
+      },
+    ];
+    expect(openAIToGemini(geminiToOpenAI(contents))).toEqual(contents);
+  });
+});
 describe("openAIToVercel tool names", () => {
   it("carries the tool name from the matching tool-call onto the tool-result part", () => {
     const msgs: OpenAIMessage[] = [
