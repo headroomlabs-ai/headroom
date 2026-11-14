@@ -343,12 +343,15 @@ def test_the_base_url_override_is_resolved_once_per_request(
         {**_OPENAI_CLIENT_HEADERS, "x-headroom-base-url": "https://changing.example/v1"},
         path="/v1/chat/completions" if handle == "handle_openai_chat" else "/v1/responses",
     )
-    anyio.run(getattr(handler, handle), request)
+    from fastapi import HTTPException
 
+    # The single lookup answers with a private address, so the override is refused.
+    with pytest.raises(HTTPException) as refused:
+        anyio.run(getattr(handler, handle), request)
+
+    assert refused.value.status_code == 400
     assert calls == ["changing.example"], f"the override was resolved {len(calls)} times"
-    if handler.captured_request is not None:
-        outbound = _outbound(handler.captured_request)
-        assert "changing.example" not in outbound.url, outbound.url
+    assert handler.captured_request is None, "the request was sent somewhere"
 
 
 def _run_image_chat(monkeypatch: pytest.MonkeyPatch, *, expire_pins: bool) -> dict[str, list[Any]]:

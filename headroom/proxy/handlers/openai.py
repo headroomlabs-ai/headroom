@@ -523,11 +523,14 @@ def _resolve_openai_upstream_base(request_headers: dict[str, str]) -> str | None
         return None
     if not is_safe_upstream_url(normalized):
         # Client-supplied upstream resolves to a private/loopback/link-local or
-        # cloud-metadata address (SSRF). Ignore the override and fall back to the
-        # configured upstream; set HEADROOM_ALLOWED_BASE_URLS to permit specific
-        # internal endpoints.
-        logger.warning("ignoring unsafe x-headroom-base-url override: %r", raw_base_url)
-        return None
+        # cloud-metadata address. Refuse, as the other routes do: falling back to
+        # the configured upstream would send the prompt and the Authorization
+        # meant for the named gateway to a host the client did not choose. Set
+        # HEADROOM_ALLOWED_BASE_URLS to permit specific internal endpoints.
+        from fastapi import HTTPException
+
+        logger.warning("rejecting unsafe x-headroom-base-url: %r", raw_base_url)
+        raise HTTPException(status_code=400, detail="Rejected unsafe upstream base URL")
     return normalized
 
 
