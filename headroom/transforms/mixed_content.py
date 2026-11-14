@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import re
+from bisect import bisect_left, bisect_right
 from dataclasses import dataclass
 
 from .content_detector import ContentType, _is_search_result_line
@@ -97,19 +98,14 @@ def _any_nonblank(lines: list[str], start: int, stop: int) -> bool:
 def _has_valid_json_block_with_text(content: str) -> bool:
     """Return true when prose or log text wraps a valid JSON block."""
     lines = content.split("\n")
-    # Built only after a scan has run to the end without balancing — see
-    # _extract_json_block. Content that balances promptly never allocates it and
-    # so pays nothing for it.
-    scan_cache: dict[tuple[int, bool, bool], tuple[int, int, bool, bool]] | None = None
+    blocks = _JsonBlockScanner(lines)
 
     for index, line in enumerate(lines):
-        if not line.strip().startswith(("[", "{")):
+        if not _is_json_candidate(line):
             continue
 
-        json_content, end_index = _extract_json_block(lines, index, cache=scan_cache)
+        json_content, end_index = blocks.extract(index)
         if json_content is None:
-            if scan_cache is None:
-                scan_cache = {}
             continue
 
         try:
@@ -141,7 +137,7 @@ def split_into_sections(content: str, *, isolate: tuple[str, ...] = ()) -> list[
     def _carries_isolate(text: str) -> bool:
         return any(marker in text for marker in isolate)
 
-    scan_cache: dict[tuple[int, bool, bool], tuple[int, int, bool, bool]] | None = None
+    blocks = _JsonBlockScanner(lines)
 
     i = 0
     while i < len(lines):
@@ -183,12 +179,8 @@ def split_into_sections(content: str, *, isolate: tuple[str, ...] = ()) -> list[
             i += 1
             continue
 
-        if line.strip().startswith(("[", "{")):
-            json_content, end_i = _extract_json_block(lines, i, cache=scan_cache)
-            if json_content is None and scan_cache is None:
-                # First scan that ran to the end without balancing: from here on
-                # every later candidate would re-walk the same tail.
-                scan_cache = {}
+        if _is_json_candidate(line):
+            json_content, end_i = blocks.extract(i)
             if json_content is not None:
                 # Bracket balance alone is not JSON: prose like a harness
                 # sanitizer banner ("[harness: ... you.]") balances on one
@@ -334,6 +326,181 @@ def _scan_line(line: str, in_string: bool, escaped: bool) -> tuple[int, int, boo
         elif ch == "}":
             brace -= 1
     return bracket, brace, in_string, escaped
+
+
+def _is_json_candidate(line: str) -> bool:
+    return line.strip().startswith(("[", "{"))
+
+
+class _JsonBlockScanner:
+    """Answers :func:`_extract_json_block` for every candidate of one pass.
+
+    Each candidate walks forward until its running bracket and brace counts
+    are both <= 0. Walked one by one, N candidates that balance late or never
+    cost N^2/2 line steps. The scanner walks them directly until they have
+    walked as many lines as the content has, then answers all the rest at
+    once, with exactly the same results:
+
+    * A walk is a chain of (line, string state) nodes, and each node has one
+      successor, so the walks of all candidates form a forest whose roots are
+      past the last line. Every node is scanned once, however many walks
+      share it (walks that start in different string states and later fall
+      into the same state merge).
+    * With ``D(v)`` the counts summed from node ``v`` to the end of its
+      chain, a walk from ``u`` balances at ``w`` exactly when
+      ``D(next(w)) >= D(u)`` in both counts. So a candidate ends just before
+      its nearest ancestor ``z`` with ``D(z) >= D(u)``.
+    * One depth-first pass from the root keeps, over the ancestors of the
+      current node, a tree keyed by bracket sum whose nodes hold stacks of
+      (brace sum, depth); stacks are updated by overwrite-and-undo so leaving
+      a node restores them. Each query and each push costs O(log^2 n).
+    """
+
+    def __init__(self, lines: list[str]) -> None:
+        self._lines = lines
+        self._direct_steps_left = len(lines)
+        # Candidate line -> last line of its block (None: never balances).
+        self._ends: dict[int, int | None] | None = None
+
+    def extract(self, start: int) -> tuple[str | None, int]:
+        if self._direct_steps_left > 0:
+            json_content, end = _extract_json_block(self._lines, start)
+            walked = (end if json_content is not None else len(self._lines) - 1) - start + 1
+            self._direct_steps_left -= walked
+            return json_content, end
+        if self._ends is None:
+            self._ends = self._solve()
+        end_line = self._ends.get(start)
+        if end_line is None:
+            return None, start
+        return "\n".join(self._lines[start : end_line + 1]), end_line
+
+    def _solve(self) -> dict[int, int | None]:
+        lines = self._lines
+        n = len(lines)
+        candidates = [i for i, line in enumerate(lines) if _is_json_candidate(line)]
+
+        # Build the forest: node ids in creation order, one per (line, state).
+        node_of: dict[tuple[int, bool, bool], int] = {}
+        node_line: list[int] = []
+        d_bracket: list[int] = []
+        d_brace: list[int] = []
+        succ: list[int] = []  # -1: past the last line (the root)
+        start_node: dict[int, int] = {}
+        for s in candidates:
+            key = (s, False, False)
+            prev = -1
+            while key[0] < n:
+                found = node_of.get(key)
+                if found is not None:
+                    if prev >= 0:
+                        succ[prev] = found
+                    break
+                b, c, in_string, escaped = _scan_line(lines[key[0]], key[1], key[2])
+                v = len(node_line)
+                node_of[key] = v
+                node_line.append(key[0])
+                d_bracket.append(b)
+                d_brace.append(c)
+                succ.append(-1)
+                if prev >= 0:
+                    succ[prev] = v
+                prev = v
+                key = (key[0] + 1, in_string, escaped)
+            start_node[s] = node_of[(s, False, False)]
+
+        # Suffix sums D, children lists (successors have larger lines).
+        count = len(node_line)
+        sum_b = [0] * count
+        sum_c = [0] * count
+        children: list[list[int]] = [[] for _ in range(count)]
+        roots: list[int] = []
+        for v in sorted(range(count), key=node_line.__getitem__, reverse=True):
+            nxt = succ[v]
+            if nxt < 0:
+                sum_b[v], sum_c[v] = d_bracket[v], d_brace[v]
+                roots.append(v)
+            else:
+                sum_b[v], sum_c[v] = d_bracket[v] + sum_b[nxt], d_brace[v] + sum_c[nxt]
+                children[nxt].append(v)
+        is_query = {start_node[s] for s in candidates}
+
+        # Tree over bracket sums; each tree node stacks ancestors as
+        # (-brace sum, depth) with -brace increasing toward the top.
+        coords = sorted({0, *sum_b})
+        size = 1
+        while size < len(coords):
+            size *= 2
+        neg_c: list[list[int]] = [[] for _ in range(2 * size)]
+        depth_of: list[list[int]] = [[] for _ in range(2 * size)]
+        used = [0] * (2 * size)
+
+        def push(bracket: int, brace: int, depth: int) -> list[tuple[int, int, int, int, int]]:
+            undo = []
+            node = bisect_left(coords, bracket) + size
+            while node:
+                stack_c, stack_d, top = neg_c[node], depth_of[node], used[node]
+                # Entries with brace <= this one are shallower: drop them.
+                pos = bisect_left(stack_c, -brace, 0, top)
+                if pos < len(stack_c):
+                    undo.append((node, top, pos, stack_c[pos], stack_d[pos]))
+                    stack_c[pos], stack_d[pos] = -brace, depth
+                else:
+                    undo.append((node, top, pos, 0, -1))
+                    stack_c.append(-brace)
+                    stack_d.append(depth)
+                used[node] = pos + 1
+                node //= 2
+            return undo
+
+        def pop(undo: list[tuple[int, int, int, int, int]]) -> None:
+            for node, top, pos, old_c, old_d in reversed(undo):
+                if old_d < 0:
+                    neg_c[node].pop()
+                    depth_of[node].pop()
+                else:
+                    neg_c[node][pos], depth_of[node][pos] = old_c, old_d
+                used[node] = top
+
+        def deepest(bracket: int, brace: int) -> int:
+            # Deepest ancestor with bracket sum >= bracket and brace sum >= brace.
+            best = -1
+            lo, hi = bisect_left(coords, bracket) + size, 2 * size
+            while lo < hi:
+                for node in ((lo,) if lo & 1 else ()) + ((hi - 1,) if hi & 1 else ()):
+                    idx = bisect_right(neg_c[node], -brace, 0, used[node]) - 1
+                    if idx >= 0 and depth_of[node][idx] > best:
+                        best = depth_of[node][idx]
+                lo = (lo + 1) // 2
+                hi //= 2
+            return best
+
+        ends: dict[int, int | None] = {}
+        path: list[int] = [-1]  # path[d]: ancestor at depth d; depth 0 is the root
+        root_undo = push(0, 0, 0)
+        # Iterative DFS: (node, undo record or None when entering).
+        work: list[tuple[int, list[tuple[int, int, int, int, int]] | None]] = [
+            (v, None) for v in roots
+        ]
+        while work:
+            v, undo = work.pop()
+            if undo is not None:
+                pop(undo)
+                path.pop()
+                continue
+            depth = len(path)
+            if v in is_query:
+                z = deepest(sum_b[v], sum_c[v])
+                if z < 0:
+                    ends[node_line[v]] = None
+                else:
+                    w = path[z + 1] if z + 1 < depth else v
+                    ends[node_line[v]] = node_line[w]
+            path.append(v)
+            work.append((v, push(sum_b[v], sum_c[v], depth)))
+            work.extend((child, None) for child in children[v])
+        pop(root_undo)
+        return ends
 
 
 def _extract_json_block(
