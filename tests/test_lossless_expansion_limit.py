@@ -102,3 +102,28 @@ def test_wide_line_expansion_is_refused_before_allocating(text: str, kind: str) 
     result, peak = _peak_of(lambda: compact_lossless(text, kind))
     assert result == text
     assert peak < 16 * MB, f"peak {peak / MB:.1f}MB: the wide line was expanded"
+
+
+@pytest.mark.parametrize("trailing", ["", "\n"])
+def test_inverses_hold_max_chars_exactly(trailing: str) -> None:
+    text = "ab\ncd" + trailing
+    for inverse in (expand_runs, unfold_repeated_blocks):
+        assert inverse(text, max_chars=len(text)) == text
+        with pytest.raises(CompressionError):
+            inverse(text, max_chars=len(text) - 1)
+
+
+def test_config_fold_kept_when_run_collapse_lengthens_short_lines() -> None:
+    value = "x" * 40
+    stanza = f"name: {value}\nvalue: {value}\nother: {value}\n"
+    config = stanza * 2 + "\n\n"
+    folded = compact_lossless(config, "config")
+    assert len(folded) < len(config)
+    assert expand_runs(unfold_repeated_blocks(folded)) == config
+
+
+def test_block_inverse_without_markers_stays_lean() -> None:
+    text = "a\nb\n" * 100000
+    result, peak = _peak_of(lambda: unfold_repeated_blocks(text, len(text)))
+    assert result == text
+    assert peak < 6 * MB, f"peak {peak / MB:.1f}MB"

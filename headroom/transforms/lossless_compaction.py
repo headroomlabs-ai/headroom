@@ -149,16 +149,18 @@ class _OutputBudget:
     refused before it is allocated.
     """
 
-    def __init__(self, max_chars: int | None) -> None:
+    def __init__(self, max_chars: int | None, had_trailing: bool) -> None:
         self.max_chars = max_chars
         self.used = 0
+        # Without a trailing newline, the join drops the newline charged to
+        # the last line, so one more character fits.
+        self.slack = 0 if had_trailing else 1
 
     def take(self, chars: int) -> None:
         if self.max_chars is None:
             return
         self.used += chars
-        # +1: joining drops the separator after the last line.
-        if self.used > self.max_chars + 1:
+        if self.used > self.max_chars + self.slack:
             raise _ExpansionLimitExceeded(
                 "Lossless inverse would exceed its size limit",
                 details={"max_chars": self.max_chars, "requested": self.used},
@@ -175,7 +177,7 @@ def expand_runs(text: str, max_chars: int | None = None) -> str:
     lines, had_trailing = _split_keep_trailing(text)
     if not lines:
         return text
-    budget = _OutputBudget(max_chars)
+    budget = _OutputBudget(max_chars, had_trailing)
     out: list[str] = []
     i = 0
     n = len(lines)
@@ -267,24 +269,21 @@ def unfold_repeated_blocks(text: str, max_chars: int | None = None) -> str:
     lines, had_trailing = _split_keep_trailing(text)
     if not lines:
         return text
-    budget = _OutputBudget(max_chars)
+    budget = _OutputBudget(max_chars, had_trailing)
     out: list[str] = []
-    # ends[k]: characters (with newlines) in out[:k], to cost a copied block.
-    ends = [0]
     for line in lines:
         m = _BLOCK_MARKER_RE.match(line)
         if m:
             length, dist = int(m.group(1)), int(m.group(2))
             start = len(out) - dist
             if start >= 0 and length <= dist:
-                budget.take(ends[start + length] - ends[start])
-                for copied in out[start : start + length]:
-                    out.append(copied)
-                    ends.append(ends[-1] + len(copied) + 1)
+                # Cost the block before copying it; same order of work as
+                # the copy, no extra allocation.
+                budget.take(sum(len(out[k]) + 1 for k in range(start, start + length)))
+                out.extend(out[start : start + length])
                 continue
         budget.take(len(line) + 1)
         out.append(line)
-        ends.append(ends[-1] + len(line) + 1)
     return _join(out, had_trailing)
 
 
@@ -596,9 +595,13 @@ def compact_lossless(content: str, kind: str) -> str:
         if kind == "config":
             # Structured config (YAML/TOML/INI): single-line runs first, then
             # repeated multi-line stanzas. Inverse applies in reverse order.
-            candidate = fold_repeated_blocks(collapse_runs(content))
-            limit = len(content)
-            if expand_runs(unfold_repeated_blocks(candidate, limit), limit) != content:
+            # The block inverse must reproduce the run-collapsed text, which
+            # can be longer than the content (a run marker outgrows a short
+            # repeated line), so each inverse is bounded by its own target.
+            collapsed = collapse_runs(content)
+            candidate = fold_repeated_blocks(collapsed)
+            unfolded = unfold_repeated_blocks(candidate, len(collapsed))
+            if expand_runs(unfolded, len(content)) != content:
                 return content
             return candidate if _smaller(candidate, content) else content
     except _ExpansionLimitExceeded:
