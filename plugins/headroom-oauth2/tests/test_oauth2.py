@@ -350,6 +350,41 @@ def test_install_fail_closed_on_bad_timeout(monkeypatch):
         install(object(), _cfg("litellm-openai"))
 
 
+# --- install_all() (the real loader) -------------------------------------------
+# issue #4737: install() raising is only half the promise. The loader used to
+# swallow it, so the proxy started WITHOUT the middleware with `oauth2` enabled
+# and relayed the client's own Authorization upstream. These go through the real
+# install_all seam rather than calling install() directly.
+def test_install_all_aborts_startup_on_bad_config(monkeypatch):
+    headroom_extensions = pytest.importorskip("headroom.proxy.extensions")
+    monkeypatch.setenv("HEADROOM_OAUTH2_TOKEN_URL", "http://idp.example.com/token")  # plain http
+    monkeypatch.setenv("HEADROOM_OAUTH2_CLIENT_ID", "c")
+    monkeypatch.setenv("HEADROOM_OAUTH2_CLIENT_SECRET", "s")
+    monkeypatch.setattr(headroom_extensions, "discover", lambda: iter([("oauth2", install)]))
+
+    with pytest.raises(RuntimeError, match="fail_closed"):
+        headroom_extensions.install_all(object(), _cfg("litellm-openai"), enabled=["oauth2"])
+
+
+def test_install_all_installs_middleware_with_valid_config(monkeypatch):
+    headroom_extensions = pytest.importorskip("headroom.proxy.extensions")
+    monkeypatch.setenv("HEADROOM_OAUTH2_TOKEN_URL", "https://idp.example.com/token")
+    monkeypatch.setenv("HEADROOM_OAUTH2_CLIENT_ID", "c")
+    monkeypatch.setenv("HEADROOM_OAUTH2_CLIENT_SECRET", "s")
+    monkeypatch.delenv("HEADROOM_OAUTH2_HEADERS", raising=False)
+    monkeypatch.setattr(headroom_extensions, "discover", lambda: iter([("oauth2", install)]))
+    added = []
+
+    class App:
+        def add_middleware(self, *a, **k):
+            added.append(a[0])
+
+    installed = headroom_extensions.install_all(App(), _cfg("litellm-openai"), enabled=["oauth2"])
+
+    assert installed == ["oauth2"]
+    assert added == [OAuth2Middleware]
+
+
 def test_parse_headers_rejects_bad_keys():
     assert parse_headers("Bad Key=v,Ok=1") == {"Ok": "1"}  # space in key dropped
     assert parse_headers("X:Y=v,Ok=1") == {"Ok": "1"}  # colon in key dropped
