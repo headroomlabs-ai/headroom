@@ -246,14 +246,18 @@ fn cell_from_value(v: &Value, cfg: &CompactConfig, store: Option<&Arc<dyn CcrSto
             CellValue::Scalar(v.clone())
         }
         CellClass::StringifiedJson(parsed) => {
-            // If the parsed JSON is an array of objects, recurse; else
-            // store the parsed value as a Scalar (un-escapes for free).
+            // If the parsed JSON is an array of objects, recurse into a nested table.
             if let Value::Array(items) = &parsed {
                 if items.iter().all(|i| matches!(i, Value::Object(_))) && items.len() >= 2 {
                     return CellValue::Nested(Box::new(compact_inner(items, cfg, store)));
                 }
             }
-            CellValue::Scalar(parsed)
+            // Keep any other container-shaped string as a string. Un-escaping it would render it
+            // byte-identically to the value it spells (``"[]"`` vs ``[]``), so the csv-schema decoder
+            // could not restore the original type. The formatter JSON-quotes ambiguous strings in
+            // ``json`` columns, so the round-trip comes back as the original string (same rule as the
+            // scalar-looking case in #4053).
+            CellValue::Scalar(v.clone())
         }
         CellClass::Opaque(kind) => {
             let s = match v {
@@ -557,6 +561,38 @@ mod tests {
     use super::super::ir::OpaqueKind;
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn stringified_container_strings_keep_their_identity() {
+        // A string whose text is a JSON container must not render identically to
+        // the container itself: the csv-schema decoder cannot tell them apart
+        // afterwards (remainder of #4053, which covered scalar-looking strings).
+        use super::super::formatter::{CsvSchemaFormatter, Formatter};
+
+        let items = vec![
+            json!({"id": 0, "v": []}),
+            json!({"id": 1, "v": "[]"}),
+            json!({"id": 2, "v": [1, 2]}),
+            json!({"id": 3, "v": "[1,2]"}),
+            json!({"id": 4, "v": {}}),
+            json!({"id": 5, "v": "{}"}),
+        ];
+        let formatted = CsvSchemaFormatter::new().format(&compact(&items, &cfg()));
+        let cells: Vec<&str> = formatted
+            .lines()
+            .skip(1)
+            .map(|row| row.split_once(',').map(|(_, cell)| cell).unwrap_or(row))
+            .collect();
+        assert_eq!(cells.len(), 6, "unexpected table:\n{formatted}");
+        // Real values stay as their CSV-quoted JSON; the string is a JSON string literal
+        // (then CSV-quoted), which the decoder maps back to the string.
+        assert_eq!(cells[0], "\"[]\"");
+        assert_eq!(cells[1], "\"\"\"[]\"\"\"");
+        assert_eq!(cells[2], "\"[1,2]\"");
+        assert_eq!(cells[3], "\"\"\"[1,2]\"\"\"");
+        assert_eq!(cells[4], "\"{}\"");
+        assert_eq!(cells[5], "\"\"\"{}\"\"\"");
+    }
 
     fn cfg() -> CompactConfig {
         CompactConfig::default()
