@@ -586,6 +586,108 @@ class TestContinuationCalls:
         assert call_args.kwargs["json"]["model"] == "gpt-4"
 
     @pytest.mark.asyncio
+    async def test_anthropic_continuation_uses_configured_api_base_url(self):
+        """The continuation goes to the target recorded at submission, not api.anthropic.com."""
+        mock_response = MagicMock()
+        mock_response.json.return_value = {"content": [{"type": "text", "text": "Final answer"}]}
+        mock_response.raise_for_status = MagicMock()
+
+        http_client = AsyncMock(spec=httpx.AsyncClient)
+        http_client.post.return_value = mock_response
+
+        processor = BatchResultProcessor(http_client)
+
+        request_context = BatchRequestContext(
+            custom_id="req_1",
+            messages=[{"role": "user", "content": "Hello"}],
+            model="claude-3-opus-20240229",
+            extras={"max_tokens": 1000},
+        )
+        batch_context = BatchContext(
+            batch_id="batch_123",
+            provider="anthropic",
+            api_key="gateway-credential",
+            api_base_url="https://llm-gateway.example.test",
+        )
+
+        await processor._anthropic_continuation(
+            [{"role": "user", "content": "Hello"}], None, request_context, batch_context
+        )
+
+        call_args = http_client.post.call_args
+        assert call_args.args[0] == "https://llm-gateway.example.test/v1/messages"
+        assert call_args.kwargs["headers"]["x-api-key"] == "gateway-credential"
+
+    @pytest.mark.asyncio
+    async def test_openai_continuation_uses_configured_api_base_url(self):
+        """A trailing slash on the recorded target does not double the separator."""
+        mock_response = MagicMock()
+        mock_response.json.return_value = {"choices": [{"message": {"content": "Final answer"}}]}
+        mock_response.raise_for_status = MagicMock()
+
+        http_client = AsyncMock(spec=httpx.AsyncClient)
+        http_client.post.return_value = mock_response
+
+        processor = BatchResultProcessor(http_client)
+
+        request_context = BatchRequestContext(
+            custom_id="req_1",
+            messages=[{"role": "user", "content": "Hello"}],
+            model="gpt-4",
+        )
+        batch_context = BatchContext(
+            batch_id="batch_123",
+            provider="openai",
+            api_key="sk-test123",
+            api_base_url="https://llm-gateway.example.test/",
+        )
+
+        await processor._openai_continuation(
+            [{"role": "user", "content": "Hello"}], None, request_context, batch_context
+        )
+
+        call_args = http_client.post.call_args
+        assert call_args.args[0] == "https://llm-gateway.example.test/v1/chat/completions"
+        assert call_args.kwargs["headers"]["Authorization"] == "Bearer sk-test123"
+
+    @pytest.mark.asyncio
+    async def test_google_continuation_uses_configured_api_base_url_and_header_key(self):
+        """Gemini: the recorded target is used and the key travels in a header, not the URL."""
+        mock_response = MagicMock()
+        mock_response.json.return_value = {
+            "candidates": [{"content": {"role": "model", "parts": [{"text": "Final answer"}]}}]
+        }
+        mock_response.raise_for_status = MagicMock()
+
+        http_client = AsyncMock(spec=httpx.AsyncClient)
+        http_client.post.return_value = mock_response
+
+        processor = BatchResultProcessor(http_client)
+
+        request_context = BatchRequestContext(
+            custom_id="req_1",
+            messages=[{"role": "user", "content": "Hello"}],
+            model="gemini-2.5-flash",
+        )
+        batch_context = BatchContext(
+            batch_id="batch_123",
+            provider="google",
+            api_key="gemini-gateway-key",
+            api_base_url="https://gemini-gateway.example.test",
+        )
+
+        await processor._google_continuation(
+            [{"role": "user", "content": "Hello"}], None, request_context, batch_context
+        )
+
+        call_args = http_client.post.call_args
+        assert call_args.args[0] == (
+            "https://gemini-gateway.example.test/v1beta/models/gemini-2.5-flash:generateContent"
+        )
+        assert "gemini-gateway-key" not in call_args.args[0]
+        assert call_args.kwargs["headers"]["x-goog-api-key"] == "gemini-gateway-key"
+
+    @pytest.mark.asyncio
     @pytest.mark.parametrize("client_tools", ["functions", "siblings", "none"])
     async def test_google_batch_create_to_results_retains_injected_native_tools(
         self, monkeypatch, tmp_path, client_tools
