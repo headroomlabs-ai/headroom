@@ -484,6 +484,15 @@ def dashboard(port: int | None, no_open: bool) -> None:
         "Requires HEADROOM_ROLLOUT_CHANNEL=canary (or dev)."
     ),
 )
+@click.option(
+    "--tray/--no-tray",
+    "tray",
+    default=False,
+    help=(
+        "Show a system tray icon with savings, dashboard link and update alerts "
+        "(opt-in, Windows; needs headroom-ai[tray])"
+    ),
+)
 @click.option("--no-optimize", is_flag=True, help="Disable optimization (passthrough mode)")
 @click.option("--no-cache", is_flag=True, help="Disable semantic caching")
 @click.option("--no-rate-limit", is_flag=True, help="Disable rate limiting")
@@ -1230,6 +1239,7 @@ def proxy(
     http2: bool,
     http_proxy: str | None,
     intercept_tool_results: bool,
+    tray: bool,
     no_optimize: bool,
     no_cache: bool,
     no_rate_limit: bool,
@@ -2030,6 +2040,10 @@ Press Ctrl+C to stop.
         # a richer one above. Direct `python -m headroom.proxy.server` keeps
         # the legacy banner via run_server's default.
         run_kwargs["print_banner"] = False
+        if tray:
+            from headroom.tray.launcher import start_tray_for_proxy
+
+            start_tray_for_proxy(host, port)
         run_server(config, **run_kwargs)
     except KeyboardInterrupt:
         click.echo("\nShutting down...")
