@@ -181,7 +181,9 @@ function injectOptionsEnv(args: unknown[], optionIndex: number, state: Transport
     existing.windowsHide = true;
   }
 
-  if (isOptions(nextArgs[optionIndex])) {
+  // An explicit undefined/null in the options slot is replaced, not pushed
+  // right: inserting would move the callback past Node's last parameter.
+  if (isOptions(nextArgs[optionIndex]) || (nextArgs[optionIndex] == null && optionIndex < nextArgs.length)) {
     nextArgs[optionIndex] = existing;
   } else {
     nextArgs.splice(optionIndex, 0, existing);
@@ -193,13 +195,21 @@ function injectOptionsEnv(args: unknown[], optionIndex: number, state: Transport
   return nextArgs;
 }
 
+// Node takes (file, args?, options?, callback?) where args and options may each
+// be omitted, undefined or null, so `spawn(cmd, undefined, opts)` keeps its
+// options in the third slot.
+function optionsIndexAfterArgs(args: unknown[]): number {
+  const params = typeof args.at(-1) === "function" ? args.slice(0, -1) : args;
+  return Array.isArray(params[1]) || (params.length > 2 && params[1] == null) ? 2 : 1;
+}
+
 function wrapSpawn(originalSpawn: ChildSpawn): ChildSpawn {
   return function headroomSpawn(this: unknown, ...args: unknown[]) {
     const state = getState();
     if (!state) {
       return Reflect.apply(originalSpawn, this, args);
     }
-    const optionIndex = Array.isArray(args[1]) ? 2 : 1;
+    const optionIndex = optionsIndexAfterArgs(args);
     return Reflect.apply(originalSpawn, this, injectOptionsEnv(args, optionIndex, state));
   } as ChildSpawn;
 }
@@ -220,7 +230,7 @@ function wrapExecFile(originalExecFile: ChildExecFile): ChildExecFile {
     if (!state) {
       return Reflect.apply(originalExecFile, this, args);
     }
-    const optionIndex = Array.isArray(args[1]) ? 2 : 1;
+    const optionIndex = optionsIndexAfterArgs(args);
     return Reflect.apply(originalExecFile, this, injectOptionsEnv(args, optionIndex, state));
   } as ChildExecFile;
 }
@@ -231,7 +241,7 @@ function wrapFork(originalFork: ChildFork): ChildFork {
     if (!state) {
       return Reflect.apply(originalFork, this, args);
     }
-    const optionIndex = Array.isArray(args[1]) ? 2 : 1;
+    const optionIndex = optionsIndexAfterArgs(args);
     return Reflect.apply(originalFork, this, injectOptionsEnv(args, optionIndex, state));
   } as ChildFork;
 }
@@ -593,7 +603,7 @@ function withRoutedFetchInput(
   return [nextUrl, nextInit];
 }
 
-function splitNodeArgs(args: unknown[]): NodeRequestParts {
+function splitNodeArgs(args: unknown[], defaultProtocol: string): NodeRequestParts {
   const callback = typeof args.at(-1) === "function" ? (args.at(-1) as (...args: unknown[]) => unknown) : undefined;
   const withoutCallback = callback ? args.slice(0, -1) : args;
   const [first, second] = withoutCallback;
@@ -611,13 +621,15 @@ function splitNodeArgs(args: unknown[]): NodeRequestParts {
   }
   if (typeof first === "object" && first !== null) {
     const requestOptions = { ...(first as Record<string, unknown>), ...options };
-    return { url: urlFromRequestOptions(requestOptions), options: requestOptions, callback };
+    return { url: urlFromRequestOptions(requestOptions, defaultProtocol), options: requestOptions, callback };
   }
   return { options, callback };
 }
 
-function urlFromRequestOptions(options: Record<string, unknown>): URL | undefined {
-  const protocol = String(options.protocol ?? "http:");
+// An options object without `protocol` means the module's own default:
+// https.request({ hostname }) is https, http.request({ hostname }) is http.
+function urlFromRequestOptions(options: Record<string, unknown>, defaultProtocol: string): URL | undefined {
+  const protocol = String(options.protocol ?? defaultProtocol);
   if (protocol !== "http:" && protocol !== "https:") {
     return undefined;
   }
@@ -723,7 +735,7 @@ function wrapRequest(
     if (!proxy) {
       return Reflect.apply(originalRequest, this, args);
     }
-    const parts = splitNodeArgs(args);
+    const parts = splitNodeArgs(args, originalRequest === originalHttpsRequest ? "https:" : "http:");
     const nextOptions = routedNodeOptions(
       parts,
       proxy,
