@@ -651,7 +651,7 @@ Keep carrying both yourself and send them upstream unchanged. Two consequences w
 
 **`config.mode` values:**
 
-- **unset (default)** — marker-free. Emits no `<<ccr:…>>` retrieval markers and writes nothing to the CCR store, so you can forward the returned messages straight to a provider. This is the right mode for a gateway or guardrail that just swaps `messages` and forwards.
+- **unset (default)** — marker-free. Emits no `<<ccr:…>>` retrieval markers and writes nothing to the CCR store, so you can forward the returned messages straight to a provider. This is the right mode for a gateway or guardrail that just swaps `messages` and forwards. A file read that a later edit made stale is still replaced, with a note telling the model to re-read the file and no retrieval hash.
 - **`ccr`** — emits CCR markers and writes to the store. Only for callers that also inject the `headroom_retrieve` tool *and* can reach `/v1/retrieve` (itself loopback-only). Markers are a dangling pointer for the model otherwise.
 - **`lossy_inline`** (alias `lossless_then_lossy`) — runs the lossless byte/data fold first, then compresses the folded remainder. Marker-free.
 - **`lossless`** — format-native folds only, with no markers and no retrieval. For a sidecar with no retrieval loop; a registered lossless provider still applies. Keep the mode stable within a `session_id`, because session mode replays earlier turns byte-for-byte.
@@ -744,7 +744,7 @@ Also for multi-turn callers:
 
 #### Session mode
 
-Pass `config.session_id` and Headroom keeps the conversation's replay state itself — the same per-session compression cache and prefix tracker the proxy path uses — so a gateway that owns routing can resend the **raw** conversation every turn and still get a byte-identical prefix back. Whatever this endpoint previously returned for the session is treated as the provider's cache contract: every already-returned message comes back unchanged, even where recompressing it would do better, and only the new tail is compressed. An explicit `config.frozen_message_count` still wins when it is larger.
+Pass `config.session_id` and Headroom keeps the conversation's replay state itself — the same per-session compression cache and prefix tracker the proxy path uses — so a gateway that owns routing can resend the **raw** conversation every turn and still get a byte-identical prefix back. Whatever this endpoint previously returned for the session is treated as the provider's cache contract: every already-returned message comes back unchanged, even where recompressing it would do better, and only the new tail is compressed. Message `cache_control` markers stay where you put them. If you send none, none come back. An explicit `config.frozen_message_count` still wins when it is larger.
 
 ```json
 {

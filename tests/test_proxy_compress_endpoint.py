@@ -514,6 +514,44 @@ class TestCompressEndpointLossyInlineMode:
         with TestClient(app, base_url="http://127.0.0.1", client=("127.0.0.1", 12345)) as c:
             yield c
 
+    @staticmethod
+    def _read_then_edit():
+        def call(call_id, name):
+            return {
+                "role": "assistant",
+                "content": None,
+                "tool_calls": [
+                    {
+                        "id": call_id,
+                        "type": "function",
+                        "function": {"name": name, "arguments": '{"file_path": "/x/a.py"}'},
+                    }
+                ],
+            }
+
+        source = "\n".join(f"def function_{i}(): return {i}" for i in range(400))
+        return [
+            {"role": "user", "content": "Change a.py."},
+            call("call_read", "Read"),
+            {"role": "tool", "tool_call_id": "call_read", "content": source},
+            call("call_edit", "Edit"),
+            {"role": "tool", "tool_call_id": "call_edit", "content": "Edited /x/a.py"},
+            {"role": "user", "content": "Now what?"},
+        ]
+
+    @pytest.mark.parametrize("mode", [None, "lossy_inline"])
+    def test_marker_free_modes_mark_a_stale_read_without_a_retrieval_hash(self, client, mode):
+        payload = {"messages": self._read_then_edit(), "model": "gpt-4"}
+        if mode is not None:
+            payload["config"] = {"mode": mode}
+        response = client.post("/v1/compress", json=payload)
+        assert response.status_code == 200
+        body = response.json()
+        stale = body["messages"][2]["content"]
+        assert stale.startswith("[Read content stale: /x/a.py")
+        assert "hash=" not in stale
+        assert body["ccr_hashes"] == []
+
     def test_lossless_mode_folds_search_output_and_keeps_json_rows(self, client):
         grep_output = "\n".join(
             f"headroom/proxy/handlers/openai.py:{i}:    value_{i} = compute(value_{i})"
