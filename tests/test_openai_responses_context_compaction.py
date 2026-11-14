@@ -598,6 +598,9 @@ def test_a_reordered_prompt_is_rewritten_in_place_and_a_lost_one_is_not_added() 
     lost, tags = _run_system_hook(lose, {"model": "gpt-5.5", "input": [item, user]})
     assert "instructions" not in lost
     assert "turn_hook_system_saved_tokens" not in tags
+    # The prompt's removal is the message delta; the unsent rewrite books nothing.
+    headline, ledger, _ = _responses_headline(lose, {"model": "gpt-5.5", "input": [item, user]})
+    assert headline == ledger > 0
 
 
 def test_system_growth_offsets_savings_from_later_stages() -> None:

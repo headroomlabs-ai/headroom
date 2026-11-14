@@ -295,8 +295,18 @@ def count_system_tokens(
         return None
 
 
-def run_request_hooks(ctx: TurnContext, *, stream_safe_only: bool = False) -> None:
+def run_request_hooks(
+    ctx: TurnContext,
+    *,
+    stream_safe_only: bool = False,
+    system_forwarded: Callable[[TurnContext], bool] | None = None,
+) -> None:
     """Run each hook's ``on_request``. Inert when none registered; never raises.
+
+    ``system_forwarded``, asked once every hook has run, says whether the
+    handler will send ``ctx.system`` as the hooks left it. When it will not
+    (the Responses system item a hook removed), the system deltas are not
+    booked: what reaches the provider is the message delta alone.
 
     ``on_request`` mutates the outbound request before the upstream send, so it is
     safe on a streamed turn *as long as the hook needs no later re-drive*. A hook
@@ -315,7 +325,7 @@ def run_request_hooks(ctx: TurnContext, *, stream_safe_only: bool = False) -> No
     # request (adds a tool) offsets earlier savings, so the ledger never credits
     # more than the whole sequence actually removed.
     gains: list[tuple[str, int, dict[str, int]]] = []
-    sequence_net = 0
+    sequence_net = system_net = 0
     count_messages = ctx.count_messages
     for hook in registered_turn_hooks():
         if stream_safe_only and not getattr(hook, "stream_safe", False):
@@ -358,17 +368,17 @@ def run_request_hooks(ctx: TurnContext, *, stream_safe_only: bool = False) -> No
                 tool_saved = tools_was - tools_now
             net_saved = message_saved + system_saved + tool_saved
             sequence_net += net_saved
-            if net_saved > 0:
-                details = {"message_tokens_saved": message_saved, "tool_tokens_saved": tool_saved}
-                if system_saved:
-                    details["system_tokens_saved"] = system_saved
-                gains.append(
-                    (
-                        getattr(hook, "savings_source", getattr(hook, "name", type(hook).__name__)),
-                        net_saved,
-                        details,
-                    )
+            system_net += system_saved
+            details = {"message_tokens_saved": message_saved, "tool_tokens_saved": tool_saved}
+            if system_saved:
+                details["system_tokens_saved"] = system_saved
+            gains.append(
+                (
+                    getattr(hook, "savings_source", getattr(hook, "name", type(hook).__name__)),
+                    net_saved,
+                    details,
                 )
+            )
         except Exception:  # a hook must never break the proxy
             log.exception("turn hook %r on_request failed", getattr(hook, "name", hook))
         if ctx.tags.get("tool_search_deferred_tokens") != booked_tag:
@@ -377,6 +387,13 @@ def run_request_hooks(ctx: TurnContext, *, stream_safe_only: bool = False) -> No
     reconcile_deferred_tokens(
         ctx.tags, booking, ctx.tools, ctx.count_tools, _tool_loading_history(ctx)
     )
+    if system_net and system_forwarded is not None and not system_forwarded(ctx):
+        sequence_net -= system_net
+        gains = [
+            (source, net - details.pop("system_tokens_saved", 0), details)
+            for source, net, details in gains
+        ]
+    gains = [gain for gain in gains if gain[1] > 0]
     # Book gains in run order up to the sequence's net saving; a loss that
     # exceeds them all books nothing (never a negative entry).
     budget = max(0, sequence_net)

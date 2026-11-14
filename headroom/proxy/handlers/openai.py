@@ -199,6 +199,26 @@ def _is_steering_only(instructions: Any) -> bool:
     )
 
 
+def _system_item_index(items: Any, item: dict[str, Any]) -> int | None:
+    """Where ``item`` (the input's system or developer item) is in ``items``
+    now that hooks ran, or ``None`` if a hook removed it."""
+    candidates = items if isinstance(items, list) else []
+    # The item itself first: a hook may also have added a copy of it.
+    index = next((i for i, c in enumerate(candidates) if c is item), None)
+    if index is None:
+        index = next(
+            (
+                i
+                for i, c in enumerate(candidates)
+                if isinstance(c, dict)
+                and c.get("role") == item.get("role")
+                and c.get("content") == item.get("content")
+            ),
+            None,
+        )
+    return index
+
+
 def _write_responses_system(
     body: dict[str, Any], item_key: str | None, item: dict[str, Any] | None, system: Any
 ) -> bool:
@@ -212,19 +232,7 @@ def _write_responses_system(
     if item is not None:
         items = body.get(item_key) if item_key else None
         candidates = items if isinstance(items, list) else []
-        # The item itself first: a hook may also have added a copy of it.
-        index = next((i for i, c in enumerate(candidates) if c is item), None)
-        if index is None:
-            index = next(
-                (
-                    i
-                    for i, c in enumerate(candidates)
-                    if isinstance(c, dict)
-                    and c.get("role") == item.get("role")
-                    and c.get("content") == item.get("content")
-                ),
-                None,
-            )
+        index = _system_item_index(candidates, item)
         if index is not None:
             if system is None:
                 body[item_key] = items[:index] + items[index + 1 :]
@@ -3423,7 +3431,17 @@ class OpenAIHandlerMixin:
             # the client's request rather than the effective one — conservative
             # in the safe direction: at worst a buffered-by-CCR turn misses a
             # saving, never a stranded tool call.
-            run_request_hooks(_req_ctx, stream_safe_only=bool(payload.get("stream")))
+            run_request_hooks(
+                _req_ctx,
+                stream_safe_only=bool(payload.get("stream")),
+                # A rewrite of a system item the hooks removed is not sent
+                # (_write_responses_system), so the ledger must not book it.
+                system_forwarded=(
+                    (lambda ctx: _system_item_index(ctx.messages, _system_item) is not None)
+                    if _system_in_item and _system_item is not None
+                    else None
+                ),
+            )
             if _req_ctx.tools is not working.get("tools"):
                 working["tools"] = _req_ctx.tools
             # A hook may also fold the messages (replace or in-place). Write back a
