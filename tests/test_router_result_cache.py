@@ -642,16 +642,18 @@ def test_compress_over_capacity_batch_then_repeat_evicted_original():
             for msg in batch_result.messages
         ]
 
-        # Message 0 was evicted by message 2 within the same batch before caching ran.
-        assert store.retrieve(batch_keys[0]) is None
-        assert store.retrieve(batch_keys[2]) is not None
+        # Parallel tasks may finish in any thread order; with max_entries=2 and 3
+        # distinct entries, at least one entry is evicted before caching runs.
+        evicted_indices = [i for i, k in enumerate(batch_keys) if store.retrieve(k) is None]
+        assert evicted_indices, "expected at least one batch entry to be capacity-evicted"
 
-        # Repeating the evicted message alone must re-populate the store rather than
+        # Repeating an evicted message alone must re-populate the store rather than
         # reusing an unbacked marker.
-        repeat_0 = compress([copy.deepcopy(originals[0])], model="gpt-4o", config=config)
-        repeat_0_key = re.findall(r"hash=([0-9a-f]{16,64})", repeat_0.messages[-1]["content"])[-1]
-        retrieved_0 = store.retrieve(repeat_0_key)
-        assert retrieved_0 is not None
-        assert retrieved_0.original_content == originals[0]["content"]
+        evicted_idx = evicted_indices[0]
+        repeat = compress([copy.deepcopy(originals[evicted_idx])], model="gpt-4o", config=config)
+        repeat_key = re.findall(r"hash=([0-9a-f]{16,64})", repeat.messages[-1]["content"])[-1]
+        retrieved = store.retrieve(repeat_key)
+        assert retrieved is not None
+        assert retrieved.original_content == originals[evicted_idx]["content"]
     finally:
         reset_compression_store()
