@@ -9,6 +9,7 @@ embedding, indexing, caching, and memory bubbling.
 from __future__ import annotations
 
 import logging
+from dataclasses import replace
 from datetime import datetime
 from typing import TYPE_CHECKING, Any
 
@@ -188,6 +189,8 @@ class HierarchicalMemory:
             embedding = await self._embedder.embed(content)
             memory.embedding = embedding
 
+        self._validate_embedding(memory)
+
         # Save to store
         await self._store.save(memory)
 
@@ -255,6 +258,10 @@ class HierarchicalMemory:
             embeddings = await self._embedder.embed_batch(texts)
             for memory, embedding in zip(memories, embeddings):
                 memory.embedding = embedding
+
+        # Validate the whole batch before persisting any of its rows.
+        for memory in memories:
+            self._validate_embedding(memory)
 
         # Batch save
         await self._store.save_batch(memories)
@@ -476,6 +483,11 @@ class HierarchicalMemory:
         content_changed = False
 
         if content is not None and content != memory.content:
+            # Validate before mutating a possibly shared store/cache object.
+            if re_embed:
+                embedding = await self._embedder.embed(content)
+                self._validate_embedding(replace(memory, embedding=embedding))
+                memory.embedding = embedding
             memory.content = content
             content_changed = True
 
@@ -487,10 +499,6 @@ class HierarchicalMemory:
 
         if metadata is not None:
             memory.metadata.update(metadata)
-
-        # Re-embed if content changed
-        if content_changed and re_embed:
-            memory.embedding = await self._embedder.embed(memory.content)
 
         # Save updates
         await self._store.save(memory)
@@ -578,6 +586,8 @@ class HierarchicalMemory:
         # Embed new content
         if auto_embed:
             new_memory.embedding = await self._embedder.embed(new_content)
+
+        self._validate_embedding(new_memory)
 
         # Perform supersession in store
         new_memory = await self._store.supersede(old_memory_id, new_memory, supersede_time)
@@ -841,6 +851,17 @@ class HierarchicalMemory:
     # =========================================================================
     # Internal Methods
     # =========================================================================
+
+    def _validate_embedding(self, memory: Memory) -> None:
+        """Reject incompatible vectors before changing the primary store."""
+        if memory.embedding is not None and memory.embedding.shape != (
+            self._vector_index.dimension,
+        ):
+            raise ValueError(
+                f"Embedding shape {memory.embedding.shape} does not match "
+                f"index dimension {self._vector_index.dimension}; configure vector_dimension "
+                "to match the embedder"
+            )
 
     async def _index_for_text_search(self, memory: Memory) -> None:
         """Index a memory for full-text search.
