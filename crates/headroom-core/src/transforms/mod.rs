@@ -17,6 +17,7 @@
 
 pub mod adaptive_sizer;
 pub mod anchor_selector;
+#[cfg(feature = "code")]
 pub mod code_compressor;
 pub mod content_detector;
 pub mod detection;
@@ -36,6 +37,7 @@ pub mod tag_protector;
 pub mod text_crusher;
 pub mod unidiff_detector;
 
+#[cfg(feature = "code")]
 pub use code_compressor::{
     detect_language, CodeAwareCompressor, CodeCompressionResult, CodeCompressorConfig,
     CodeLanguage, DocstringMode,

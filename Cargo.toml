@@ -40,6 +40,12 @@ serde = { version = "1", features = ["derive"] }
 # does NOT lose precision through f64. Required by Realignment invariant
 # I1 (byte-faithful passthrough on unmutated bytes; see REALIGNMENT/02-
 # architecture.md §2.2) and PR-A4 (see REALIGNMENT/03-phase-A-lockdown.md).
+# It is deliberately NOT enabled here: Cargo features are additive, so a
+# workspace-level feature would force it on every consumer of the graph,
+# including ones whose own serde_json users break under it
+# (serde-rs/serde#2748). `headroom-core` exposes it as its default-on
+# `arbitrary-precision` feature instead, so a consumer can opt out with
+# `default-features = false`.
 #
 # `raw_value` exposes `serde_json::value::RawValue`, the unparsed JSON
 # fragment type. Phase B PR-B2 uses this to forward unmodified
@@ -47,7 +53,7 @@ serde = { version = "1", features = ["derive"] }
 # original byte slice, so byte-for-byte round-trips work even with
 # whitespace, key order, or escape preferences the producer chose.
 # Enabled here in Phase A so PR-B2 can land as a pure consumer change.
-serde_json = { version = "1", features = ["preserve_order", "arbitrary_precision", "raw_value"] }
+serde_json = { version = "1", features = ["preserve_order", "raw_value"] }
 bytes = "1"
 thiserror = "2"
 # `log` compat: when no tracing subscriber is active (the case inside the
