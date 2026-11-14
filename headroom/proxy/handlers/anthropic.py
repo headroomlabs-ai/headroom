@@ -192,6 +192,7 @@ def _build_outbound_anthropic_headers(
         _select_extra_headers_for_destination(extra_headers, routed_to_omlx=routed_to_omlx),
         upstream_url=upstream_url,
         config=config,
+        provider="anthropic",
     )
 
 

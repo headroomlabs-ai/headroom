@@ -2183,6 +2183,7 @@ def merge_extra_headers(
     *,
     upstream_url: str | None,
     config: Any = None,
+    provider: str | None = None,
 ) -> dict[str, str]:
     """Merge configured extra headers into ``headers``, overriding same-named keys.
 
@@ -2201,14 +2202,16 @@ def merge_extra_headers(
     Pass ``None`` when the caller is going to its configured target with no
     per-request override. Anything else is checked against
     ``upstream_trust.is_trusted_upstream``; an undesignated host still gets its
-    request proxied, just without these headers.
+    request proxied, just without these headers. ``provider`` (``"openai"`` or
+    ``"anthropic"``) limits the designated origins to that provider's own, so
+    one provider's extras never go to the other's API.
     """
     if not extra:
         return headers
     if upstream_url is not None:
         from headroom.proxy.upstream_trust import is_trusted_upstream, warn_untrusted_once
 
-        if not is_trusted_upstream(upstream_url, config):
+        if not is_trusted_upstream(upstream_url, config, provider):
             warn_untrusted_once(upstream_url)
             return headers
     # HTTP header names are case-insensitive: drop any existing key that
