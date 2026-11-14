@@ -242,10 +242,26 @@ def test_env_selects_dimensions(monkeypatch):
 
 @pytest.mark.parametrize(
     ("name", "expected"),
-    [("Host", "host"), ("tag.team", "tag.team"), ("a b", None), ("", None), ("x" * 33, None)],
+    [
+        ("Host", "host"),
+        ("tag.team", "tag.team"),
+        ("a-b", "a-b"),
+        ("a b", None),
+        ("", None),
+        ("x" * 33, None),
+        ("-project", None),
+        (".team", None),
+    ],
 )
 def test_sanitize_dimension_name(name, expected):
     assert sanitize_dimension_name(name) == expected
+
+
+def test_a_name_starting_with_a_dash_cannot_be_sent_as_a_label(monkeypatch):
+    monkeypatch.setenv(attribution.ATTRIBUTION_DIMENSIONS_ENV_VAR, "labels")
+    assert parse_labels("-project=web; team=infra") == {"team": "infra"}
+    request = _req({"X-Headroom-Labels": "-project=web; team=infra"})
+    assert resolve_attribution(request) == {"team": "infra"}
 
 
 def test_label_sanitizing_and_normalize():
@@ -255,6 +271,26 @@ def test_label_sanitizing_and_normalize():
     assert normalize_attribution("not a mapping") == {}
     long = normalize_attribution({"a": "y" * 500})
     assert len(long["a"]) == attribution.LABEL_MAX_LENGTH
+
+
+def test_a_label_cut_to_length_keeps_no_trailing_space(monkeypatch):
+    label = "a" * (attribution.LABEL_MAX_LENGTH - 1) + " b"
+    cleaned = normalize_attribution({"team": label})
+    assert cleaned == {"team": "a" * (attribution.LABEL_MAX_LENGTH - 1)}
+    assert normalize_attribution(cleaned) == cleaned
+    assert parse_labels(format_labels({"team": label})) == cleaned
+    assert parse_labels("team=" + label) == cleaned
+    monkeypatch.setenv(attribution.ATTRIBUTION_DIMENSIONS_ENV_VAR, "labels")
+    assert resolve_attribution(_req({"X-Headroom-Labels": "team=" + label})) == cleaned
+    monkeypatch.setenv(attribution.ATTRIBUTION_DIMENSIONS_ENV_VAR, "team")
+    assert resolve_attribution(_req({"X-Headroom-Team": label})) == cleaned
+
+
+def test_unknown_is_not_a_label():
+    # The ledger shows "unknown" for "no label"; a label must never read the same.
+    assert attribution.sanitize_label("unknown") is None
+    assert normalize_attribution({"host": "unknown", "team": "Unknown"}) == {"team": "Unknown"}
+    assert parse_labels("host=unknown; team=infra") == {"team": "infra"}
 
 
 def test_parse_and_format_labels_roundtrip():

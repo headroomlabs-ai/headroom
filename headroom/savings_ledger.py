@@ -150,6 +150,9 @@ def _event_dims(attribution: Any) -> dict[str, str]:
 def event_label(event: dict[str, Any], dimension: str) -> str:
     """An event's label for ``dimension``, or ``unknown`` when it has none.
 
+    ``unknown`` is never a label (see ``sanitize_label``), so a row reading
+    ``unknown`` always means "no label".
+
     ``client`` is read from its own key, which every event version carries.
     """
     if dimension == "client":

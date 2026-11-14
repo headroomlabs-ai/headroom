@@ -626,6 +626,15 @@ def test_snapshot_falls_back_to_the_client_named_conversation(tmp_path, monkeypa
         == "mine"
     )
     assert conversation_hint({}) is None
+    # Decoded once, where the header is read, and not again when bound.
+    assert conversation_hint({"x-headroom-session-id": "abc%2541"}) == "abc%41"
+    from headroom.proxy.attribution import get_current_conversation
+
+    set_current_conversation(conversation_hint({"x-headroom-session-id": "abc%2541"}))
+    try:
+        assert get_current_conversation() == "abc%41"
+    finally:
+        set_current_conversation(None)
 
     seen = []
 

@@ -91,6 +91,10 @@ OPEN_LABELS_TOKEN: Final[str] = "labels"
 #: Words with a meaning in ``HEADROOM_ATTRIBUTION_DIMENSIONS``; never dimension names.
 RESERVED_TOKENS: Final[frozenset[str]] = frozenset({"default", "none", OPEN_LABELS_TOKEN})
 
+#: What the savings ledger and ``headroom savings`` show for an event with no
+#: label in a dimension. Never a label itself, so the two cannot be confused.
+UNLABELED: Final[str] = "unknown"
+
 _DIMENSION_NAME_CHARS = frozenset("abcdefghijklmnopqrstuvwxyz0123456789_-.")
 
 EMPTY_ATTRIBUTION: Mapping[str, str] = MappingProxyType({})
@@ -101,12 +105,14 @@ def sanitize_dimension_name(value: Any) -> str | None:
 
     Lowercase ASCII letters, digits, ``_``, ``-`` and ``.`` only: the name is a
     JSON key, a CLI argument and a header suffix, and anything else would need
-    escaping in at least one of them.
+    escaping in at least one of them. It may not start with ``-`` (that reads
+    as "remove" in ``HEADROOM_ATTRIBUTION_DIMENSIONS`` and as a flag on the
+    command line) or ``.``.
     """
     if not isinstance(value, str):
         return None
     cleaned = value.strip().lower()
-    if not cleaned or len(cleaned) > DIMENSION_NAME_MAX_LENGTH:
+    if not cleaned or len(cleaned) > DIMENSION_NAME_MAX_LENGTH or cleaned[0] in "-.":
         return None
     if any(ch not in _DIMENSION_NAME_CHARS for ch in cleaned):
         return None
@@ -123,6 +129,10 @@ def sanitize_label(value: Any, *, decode: bool = True) -> str | None:
     already resolved is cleaned with ``decode=False``: decoding is not
     idempotent (``%2541`` becomes ``%41`` and then ``A``), so it happens once,
     where the header is read, and never again on the way to storage.
+
+    The label is cut to length before trailing space is trimmed, so cleaning a
+    clean label changes nothing. ``unknown`` is not a label: it is what the
+    ledger shows when there is none (:data:`UNLABELED`).
     """
     if decode:
         from headroom.proxy.project_name_policy import sanitize_project_name
@@ -134,7 +144,10 @@ def sanitize_label(value: Any, *, decode: bool = True) -> str | None:
         cleaned = None
     if cleaned is None:
         return None
-    return cleaned[:LABEL_MAX_LENGTH]
+    cleaned = cleaned[:LABEL_MAX_LENGTH].rstrip()
+    if not cleaned or cleaned == UNLABELED:
+        return None
+    return cleaned
 
 
 @dataclass(frozen=True)
@@ -562,7 +575,8 @@ def conversation_hint(headers: Mapping[str, str]) -> str | None:
 
 
 def set_current_conversation(value: str | None) -> None:
-    _current_conversation.set(sanitize_label(value))
+    """Bind the conversation key; ``value`` is already decoded (:func:`conversation_hint`)."""
+    _current_conversation.set(sanitize_label(value, decode=False))
 
 
 def get_current_conversation() -> str | None:
@@ -694,6 +708,7 @@ __all__ = [
     "OTEL_ATTRIBUTION_ENV_VAR",
     "OPEN_LABELS_TOKEN",
     "RESERVED_TOKENS",
+    "UNLABELED",
     "Resolver",
     "CONVERSATION_HEADERS",
     "bind_builtin_label",
