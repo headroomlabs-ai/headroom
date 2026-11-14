@@ -19,7 +19,18 @@ import httpx
 import pytest
 from fastapi.testclient import TestClient
 
+from headroom.proxy.helpers import _reset_session_tool_tracker_for_test
 from headroom.proxy.server import ProxyConfig, create_app
+
+
+@pytest.fixture(autouse=True)
+def _fresh_tool_tracker():
+    # Memory tools are sticky per session in a process-wide tracker: a test
+    # that injected them would make a later identical request replay them,
+    # and the proxy then correctly runs the calls it offered.
+    _reset_session_tool_tracker_for_test()
+    yield
+    _reset_session_tool_tracker_for_test()
 
 
 class _FakeBackend:
