@@ -304,9 +304,13 @@ jobs:
       - name: Install gitleaks
         run: |
           version=8.18.4
+          # SHA-256 of gitleaks_8.18.4_linux_x64.tar.gz from the release's
+          # gitleaks_8.18.4_checksums.txt. Update both lines together.
+          sha256=ba6dbb656933921c775ee5a2d1c13a91046e7952e9d919f9bac4cec61d628e7d
           curl -sSfL \
             "https://github.com/gitleaks/gitleaks/releases/download/v${version}/gitleaks_${version}_linux_x64.tar.gz" \
             -o /tmp/gitleaks.tar.gz
+          echo "${sha256}  /tmp/gitleaks.tar.gz" | sha256sum --check --strict
           tar -xzf /tmp/gitleaks.tar.gz -C /tmp gitleaks
           sudo install /tmp/gitleaks /usr/local/bin/gitleaks
           gitleaks version
