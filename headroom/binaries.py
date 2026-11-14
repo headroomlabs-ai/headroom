@@ -548,6 +548,69 @@ def _in_registry(tool: str) -> bool:
     return tool in _registry().get("tools", {})
 
 
+_WARNED_CWD_HITS: set[str] = set()
+
+
+def _in_cwd(found: str) -> bool:
+    """True if a ``shutil.which`` hit came from a relative PATH entry or the cwd."""
+    if not os.path.isabs(found):
+        return True
+    try:
+        return os.path.samefile(os.path.dirname(found), os.getcwd())
+    except OSError:
+        return False
+
+
+def _which_outside_cwd(name: str) -> Path | None:
+    """``shutil.which(name)``, skipping any hit in the current directory.
+
+    On Windows ``shutil.which`` looks in the current directory before PATH
+    unless ``NoDefaultCurrentDirectoryInExePath`` is set, and on any OS a
+    relative PATH entry (``.``, empty, ``bin``) resolves against the cwd. The
+    cwd is usually the project being worked on, so a same-named file there
+    would run instead of the real tool. Such a hit is skipped and the search
+    continues through the absolute PATH entries; with no other hit the caller
+    falls back to the interpreter's Scripts dir or the verified cache. This also
+    applies when the cwd is itself an absolute PATH entry (e.g. ``~/.local/bin``).
+    """
+    found = shutil.which(name)
+    if not found:
+        return None
+    if not _in_cwd(found):
+        return Path(found)
+    ignored = os.path.abspath(found)
+    # resolve() runs per tool result in the proxy; say it once per file.
+    if ignored not in _WARNED_CWD_HITS:
+        _WARNED_CWD_HITS.add(ignored)
+        logger.warning("Ignoring %s in the current directory (%s)", name, ignored)
+    for entry in os.environ.get("PATH", "").split(os.pathsep):
+        if not entry or not os.path.isabs(entry):
+            continue
+        hit = _executable_in(entry, name)
+        if hit and not _in_cwd(hit):
+            return Path(hit)
+    return None
+
+
+def _executable_in(directory: str, name: str) -> str | None:
+    """Look for `name` in one directory only, like ``shutil.which`` minus its cwd step.
+
+    ``shutil.which(name, path=directory)`` still searches the current directory
+    first on Windows, so it cannot be used to skip a hit there. PATHEXT is
+    honoured the same way ``shutil.which`` does.
+    """
+    names = [name]
+    if sys.platform.startswith("win"):
+        exts = [e for e in os.environ.get("PATHEXT", ".COM;.EXE;.BAT;.CMD").split(";") if e]
+        if not any(name.lower().endswith(ext.lower()) for ext in exts):
+            names = [name + ext for ext in exts]
+    for candidate in names:
+        path = os.path.join(directory, candidate)
+        if os.path.isfile(path) and os.access(path, os.X_OK):
+            return path
+    return None
+
+
 def _path_lookup(tool: str) -> Path | None:
     """Find `tool` on PATH or in this interpreter's Scripts/bin directory.
 
@@ -563,14 +626,15 @@ def _path_lookup(tool: str) -> Path | None:
             candidates.append(alias)
 
     for name in candidates:
-        found = shutil.which(name)
+        found = _which_outside_cwd(name)
         if found:
-            return Path(found)
+            return found
 
     scripts_dir = Path(sys.prefix) / ("Scripts" if sys.platform.startswith("win") else "bin")
     for name in candidates:
         exe = scripts_dir / (name + (".exe" if sys.platform.startswith("win") else ""))
-        if exe.exists():
+        # Same test shutil.which applies: a regular file we may execute.
+        if exe.is_file() and os.access(exe, os.X_OK):
             return exe
     return None
 
@@ -703,12 +767,11 @@ def status() -> list[dict[str, Any]]:
             "path": None,
             "state": "missing",
         }
-        # Honor PATH.
-        on_path = shutil.which(name) or (
-            shutil.which(entry["binary"]) if entry.get("binary") else None
-        )
+        # Same lookup as which()/resolve(): PATH outside the cwd, then the
+        # interpreter's Scripts dir.
+        on_path = _path_lookup(name)
         if on_path:
-            row["path"] = on_path
+            row["path"] = str(on_path)
             row["state"] = "on-path"
             out.append(row)
             continue
