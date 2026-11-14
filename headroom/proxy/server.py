@@ -36,6 +36,7 @@ import math
 import os
 import signal
 import sys
+import tempfile
 import threading
 import time
 from collections import OrderedDict
@@ -88,6 +89,7 @@ from headroom.config import (
     resolve_omlx_target_api_url,
 )
 from headroom.dashboard import get_dashboard_html
+from headroom.exceptions import ConfigurationError
 from headroom.log_safety import describe_exception, safe_id
 from headroom.observability import (
     LangfuseTracingConfig,
@@ -166,6 +168,7 @@ from headroom.proxy.memory_handler import MemoryConfig, MemoryHandler
 # Data models (extracted to headroom/proxy/models.py for maintainability)
 from headroom.proxy.model_router import ModelRouter, ModelRouterConfig
 from headroom.proxy.models import (
+    PROXY_CONFIG_SECRET_FIELDS,
     ProxyConfig,
     default_periodic_malloc_trim,
 )
@@ -604,6 +607,9 @@ class CompressionQuarantinedError(asyncio.TimeoutError):
 
 
 _MULTI_WORKER_CONFIG_ENV = "HEADROOM_PROXY_CONFIG_JSON"
+# The workers' copy of the config's credentials travels in an owner-only file,
+# not in the environment every child process inherits; this names the file.
+_MULTI_WORKER_SECRETS_ENV = "HEADROOM_PROXY_CONFIG_SECRETS_FILE"
 
 
 def _save_prefix_state_on_exit_signal(store: Any, path: str) -> Callable[[], None]:
@@ -6828,13 +6834,55 @@ def _settings_runtime_values(config: ProxyConfig) -> dict[str, Any]:
     return values
 
 
+def _write_worker_secrets(payload: dict[str, Any]) -> Path | None:
+    """Move the credential fields out of ``payload`` into an owner-only file.
+
+    Returns the file's path, or None when the config holds no credential.
+    """
+    secrets = {name: payload.pop(name) for name in PROXY_CONFIG_SECRET_FIELDS if payload.get(name)}
+    if not secrets:
+        return None
+    # mkstemp creates the file with mode 0600.
+    fd, raw_path = tempfile.mkstemp(prefix="headroom-proxy-config-", suffix=".json")
+    with os.fdopen(fd, "w", encoding="utf-8") as fh:
+        json.dump(secrets, fh)
+    return Path(raw_path)
+
+
+def _read_worker_secrets() -> dict[str, Any]:
+    """Read the credentials the parent wrote for this worker.
+
+    Raises instead of returning nothing when the file is named but unreadable:
+    a worker that fell back to env defaults would come up without the proxy
+    token while still bound to the parent's host.
+    """
+    path = os.environ.get(_MULTI_WORKER_SECRETS_ENV)
+    if not path:
+        return {}
+    try:
+        with open(path, encoding="utf-8") as fh:
+            values = json.load(fh)
+    except (OSError, ValueError) as exc:
+        raise ConfigurationError(
+            f"Worker cannot read its credentials file {path!r} ({type(exc).__name__}). "
+            "The parent proxy writes it at startup and removes it on exit; restart the proxy."
+        ) from exc
+    if not isinstance(values, dict):
+        raise ConfigurationError(
+            f"Worker credentials file {path!r} does not hold a JSON object; restart the proxy."
+        )
+    return values
+
+
 def _proxy_config_from_env() -> ProxyConfig:
     raw_config = os.environ.get(_MULTI_WORKER_CONFIG_ENV)
     if raw_config:
+        worker_secrets = _read_worker_secrets()
         try:
             values = json.loads(raw_config)
             if not isinstance(values, dict):
                 raise TypeError("proxy config JSON must be an object")
+            values.update(worker_secrets)
             if "_rollout_snapshot" in values:
                 rollout_value = values.pop("_rollout_snapshot")
                 from headroom.rollout import RolloutSnapshot
@@ -7108,67 +7156,82 @@ def run_server(
 
     app_target: Any
     uvicorn_kwargs: dict[str, Any] = {}
+    worker_secrets_path: Path | None = None
+    # Worker hand-off variables as they were before this run, restored on exit
+    # so a later run in the same process starts from the same state.
+    prior_worker_env = {
+        name: os.environ.get(name) for name in (_MULTI_WORKER_CONFIG_ENV, _MULTI_WORKER_SECRETS_ENV)
+    }
     if sys.platform == "win32":
         _configure_windows_uvicorn_loop(uvicorn_kwargs)
-    if workers > 1:
-        # CompressionCache and PrefixTracker are always per-worker instance vars.
-        # Python CompressionStore defaults to InMemoryBackend (per-process), so
-        # CCR markers written on worker A are invisible to worker B unless a
-        # cross-worker backend is configured via HEADROOM_CCR_BACKEND.
-        # See RUST_DEV.md -> "Multi-worker deployment -- CCR fragmentation".
-        if os.environ.get("HEADROOM_CCR_BACKEND", "").strip():
-            logger.warning(
-                "Headroom is running with workers=%d. Compression cache, "
-                "prefix tracker, TOIN state, and CostTracker are all per-process; "
-                "multi-worker deployments produce avoidable cache busts and an "
-                "unstable dashboard 'Proxy $ Saved' hero tile (each /stats poll "
-                "hits a different worker's partial total) when sessions land on "
-                "different workers. Run --workers 1 or place a sticky-session load "
-                "balancer in front of multiple --workers 1 processes. "
-                "See RUST_DEV.md -> 'Multi-worker deployment -- CCR fragmentation'.",
-                workers,
-            )
-        else:
-            logger.warning(
-                "Headroom is running with workers=%d. The in-memory CCR store, "
-                "compression cache (incl. off-path background compression), prefix "
-                "tracker, TOIN state, and CostTracker are all "
-                "per-process; multi-worker deployments produce silent CCR retrieval "
-                "failures, avoidable cache busts, and an unstable dashboard 'Proxy $ Saved' "
-                "hero tile (each /stats poll hits a different worker's partial total) when "
-                "sessions land on different workers. Set HEADROOM_CCR_BACKEND=sqlite for a "
-                "persistent cross-worker CCR store, run --workers 1, or place a "
-                "sticky-session load balancer in front of multiple --workers 1 processes. "
-                "See RUST_DEV.md -> 'Multi-worker deployment -- CCR fragmentation'.",
-                workers,
-            )
-        os.environ[_MULTI_WORKER_CONFIG_ENV] = json.dumps(_proxy_config_payload(config))
-        app_target = "headroom.proxy.server:create_app_from_env"
-        uvicorn_kwargs["factory"] = True
-    else:
-        app_target = create_app(config)
-
-    # "warning" keeps the default terminal quiet (uvicorn's access log is one line
-    # per request). It was previously hardcoded, which left deployed proxies with
-    # no way to turn request logging on: operators diagnosing a production
-    # incident could not see uvicorn's view of the traffic at all, with no env var
-    # and no CLI flag to change it. Overridable now; the default is unchanged.
-    uvicorn_log_level = _resolve_uvicorn_log_level()
-
-    # Bind target: a Unix socket when one is configured, otherwise host:port.
-    # uvicorn treats `uds` and `host`/`port` as alternatives, so they are built
-    # here rather than passed together.
-    bind_kwargs: dict[str, Any]
     uds_path: Path | None = None
-    if config.uds:
-        from headroom.proxy.uds import prepare_uds_path
-
-        uds_path = prepare_uds_path(config.uds)
-        bind_kwargs = {"uds": str(uds_path)}
-    else:
-        bind_kwargs = {"host": config.host, "port": config.port}
-
+    # Everything from here runs under the cleanup below: once the worker
+    # secrets file exists, any startup failure (a bad --uds path, for
+    # example) must still delete it and restore the hand-off variables.
     try:
+        if workers > 1:
+            # CompressionCache and PrefixTracker are always per-worker instance vars.
+            # Python CompressionStore defaults to InMemoryBackend (per-process), so
+            # CCR markers written on worker A are invisible to worker B unless a
+            # cross-worker backend is configured via HEADROOM_CCR_BACKEND.
+            # See RUST_DEV.md -> "Multi-worker deployment -- CCR fragmentation".
+            if os.environ.get("HEADROOM_CCR_BACKEND", "").strip():
+                logger.warning(
+                    "Headroom is running with workers=%d. Compression cache, "
+                    "prefix tracker, TOIN state, and CostTracker are all per-process; "
+                    "multi-worker deployments produce avoidable cache busts and an "
+                    "unstable dashboard 'Proxy $ Saved' hero tile (each /stats poll "
+                    "hits a different worker's partial total) when sessions land on "
+                    "different workers. Run --workers 1 or place a sticky-session load "
+                    "balancer in front of multiple --workers 1 processes. "
+                    "See RUST_DEV.md -> 'Multi-worker deployment -- CCR fragmentation'.",
+                    workers,
+                )
+            else:
+                logger.warning(
+                    "Headroom is running with workers=%d. The in-memory CCR store, "
+                    "compression cache (incl. off-path background compression), prefix "
+                    "tracker, TOIN state, and CostTracker are all "
+                    "per-process; multi-worker deployments produce silent CCR retrieval "
+                    "failures, avoidable cache busts, and an unstable dashboard 'Proxy $ Saved' "
+                    "hero tile (each /stats poll hits a different worker's partial total) when "
+                    "sessions land on different workers. Set HEADROOM_CCR_BACKEND=sqlite for a "
+                    "persistent cross-worker CCR store, run --workers 1, or place a "
+                    "sticky-session load balancer in front of multiple --workers 1 processes. "
+                    "See RUST_DEV.md -> 'Multi-worker deployment -- CCR fragmentation'.",
+                    workers,
+                )
+            worker_config = _proxy_config_payload(config)
+            worker_secrets_path = _write_worker_secrets(worker_config)
+            # A path left by an earlier run in this process names a deleted file.
+            os.environ.pop(_MULTI_WORKER_SECRETS_ENV, None)
+            if worker_secrets_path is not None:
+                os.environ[_MULTI_WORKER_SECRETS_ENV] = str(worker_secrets_path)
+            os.environ[_MULTI_WORKER_CONFIG_ENV] = json.dumps(worker_config)
+            app_target = "headroom.proxy.server:create_app_from_env"
+            uvicorn_kwargs["factory"] = True
+        else:
+            app_target = create_app(config)
+
+        # "warning" keeps the default terminal quiet (uvicorn's access log is one line
+        # per request). It was previously hardcoded, which left deployed proxies with
+        # no way to turn request logging on: operators diagnosing a production
+        # incident could not see uvicorn's view of the traffic at all, with no env var
+        # and no CLI flag to change it. Overridable now; the default is unchanged.
+        uvicorn_log_level = _resolve_uvicorn_log_level()
+
+        # Bind target: a Unix socket when one is configured, otherwise host:port.
+        # uvicorn treats `uds` and `host`/`port` as alternatives, so they are built
+        # here rather than passed together.
+        bind_kwargs: dict[str, Any]
+        if config.uds:
+            from headroom.proxy.uds import prepare_uds_path
+
+            uds_path = prepare_uds_path(config.uds)
+            bind_kwargs = {"uds": str(uds_path)}
+        else:
+            bind_kwargs = {"host": config.host, "port": config.port}
+
         _run_uvicorn(
             app_target,
             bind_kwargs,
@@ -7182,6 +7245,14 @@ def run_server(
             from headroom.proxy.uds import remove_uds_path
 
             remove_uds_path(uds_path)
+        if worker_secrets_path is not None:
+            worker_secrets_path.unlink(missing_ok=True)
+        if workers > 1:
+            for name, value in prior_worker_env.items():
+                if value is None:
+                    os.environ.pop(name, None)
+                else:
+                    os.environ[name] = value
 
 
 def _run_uvicorn(
