@@ -307,11 +307,11 @@ _OPENAI_OK_RESPONSE = {
 class _NativeCapturingTransport(httpx.AsyncBaseTransport):
     def __init__(self) -> None:
         self.call_count = 0
+        self.bodies: list[bytes] = []
 
     async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
         self.call_count += 1
-        async for _ in request.stream:
-            pass
+        self.bodies.append(b"".join([chunk async for chunk in request.stream]))
         return httpx.Response(200, json=_OPENAI_OK_RESPONSE)
 
 
@@ -365,8 +365,14 @@ def _responses_body() -> dict[str, object]:
     ("user_agent", "expected"),
     [
         # No conversation id in the body or headers: hooks get no conversation.
-        ("opencode/0.4.2", {"client": "opencode", "conversation": None}),
-        ("codex-cli/1.2.3", {"client": "codex", "conversation": None}),
+        (
+            "opencode/0.4.2",
+            {"client": "opencode", "conversation": None, "keep_tool_schemas": False},
+        ),
+        (
+            "codex-cli/1.2.3",
+            {"client": "codex", "conversation": None, "keep_tool_schemas": True},
+        ),
     ],
 )
 def test_native_responses_route_carries_the_client_decision(
@@ -401,7 +407,7 @@ def test_native_responses_route_carries_the_client_decision(
     ("user_agent", "expected"),
     [
         ("opencode/0.4.2", {"client": "opencode"}),
-        ("codex-cli/1.2.3", {"client": "codex"}),
+        ("codex-cli/1.2.3", {"client": "codex", "keep_tool_schemas": True}),
     ],
 )
 def test_websocket_route_carries_the_client_decision(
@@ -454,3 +460,110 @@ def test_websocket_route_carries_the_client_decision(
         for k, v in seen[0].items()
         if k not in {"timing", "deadline_started_at", "savings_tags"}
     } == expected
+
+
+# --- Codex tool schemas: identified Codex only, not every stamped caller ------
+
+_VERBOSE_TOOLS: list[dict[str, object]] = [
+    {
+        "type": "function",
+        "name": "shell",
+        "description": " ".join(["Runs a shell command in the workspace.\n"] * 30),
+        "parameters": {"type": "object", "properties": {"cmd": {"type": "string"}}},
+    }
+]
+
+# Headers captured from Codex CLI 0.167.0 (`codex exec`, the TUI, and the
+# CODEX_INTERNAL_ORIGINATOR_OVERRIDE value Codex Desktop runs it with). None of
+# these User-Agents is in CLIENT_UA_MAP, so the middleware stamps them all.
+_IDENTITY_CASES = [
+    # A generic SDK is stamped codex by path, but it is not Codex.
+    pytest.param({"user-agent": "OpenAI/Python 2.8.1"}, False, id="stamped-generic-sdk"),
+    pytest.param(
+        {
+            "user-agent": "codex_exec/0.167.0 (Mac OS 27.2.0; arm64) unknown (codex_exec; 0.167.0)",
+            "originator": "codex_exec",
+        },
+        True,
+        id="codex-exec",
+    ),
+    pytest.param(
+        {
+            "user-agent": "codex-tui/0.167.0 (Mac OS 27.2.0; arm64) unknown (codex-tui; 0.167.0)",
+            "originator": "codex-tui",
+        },
+        True,
+        id="codex-tui",
+    ),
+    pytest.param(
+        {
+            "user-agent": "Codex Desktop/0.167.0 (Mac OS 27.2.0; arm64) unknown",
+            "originator": "Codex Desktop",
+        },
+        True,
+        id="codex-desktop",
+    ),
+    pytest.param({"x-client": "codex"}, True, id="explicit-x-client"),
+]
+
+
+@pytest.mark.parametrize(("headers", "kept"), _IDENTITY_CASES)
+def test_native_responses_route_keeps_tool_schemas_only_for_identified_codex(
+    headers: dict[str, str], kept: bool
+) -> None:
+    """Through the real middleware stamp: what reaches upstream, not a kwarg."""
+    for client, _seen, transport in _native_responses_client():
+        response = client.post(
+            "/v1/responses",
+            headers={
+                "content-type": "application/json",
+                "authorization": "Bearer sk-test-0000000000000000000000000000000000000000000",
+                **headers,
+            },
+            json={"model": TOOL_SEARCH_MODEL, "input": "hello", "tools": _VERBOSE_TOOLS},
+        )
+
+        assert response.status_code == 200, response.text
+        forwarded = json.loads(transport.bodies[0])["tools"]
+        assert (forwarded == _VERBOSE_TOOLS) is kept
+
+
+@pytest.mark.parametrize(("headers", "kept"), _IDENTITY_CASES)
+def test_websocket_route_keeps_tool_schemas_only_for_identified_codex(
+    headers: dict[str, str], kept: bool
+) -> None:
+    """The WS handler applies the same stamp; check the frame sent upstream."""
+    import sys
+    from unittest.mock import patch
+
+    from headroom.transforms.content_router import ContentRouter, ContentRouterConfig
+    from tests.test_openai_codex_ws_lifecycle import (
+        _DummyOpenAIHandler,
+        _FakeUpstream,
+        _FakeWebSocket,
+        _make_fake_websockets_module,
+    )
+    from tests.test_openai_responses_context_compaction import _StubPipeline
+
+    upstream = _FakeUpstream(
+        [
+            json.dumps({"type": "response.created", "response": {"id": "r_1"}}),
+            json.dumps({"type": "response.completed", "response": {"id": "r_1"}}),
+        ]
+    )
+    frame = {
+        "type": "response.create",
+        "response": {"model": "gpt-5.4", "input": "hi", "tools": _VERBOSE_TOOLS},
+    }
+    client_ws = _FakeWebSocket(
+        frames=[json.dumps(frame)], headers={"authorization": "Bearer test", **headers}
+    )
+    handler = _DummyOpenAIHandler()
+    handler.config.optimize = True
+    handler.openai_pipeline = _StubPipeline(ContentRouter(ContentRouterConfig()))
+
+    with patch.dict(sys.modules, {"websockets": _make_fake_websockets_module(upstream)}):
+        asyncio.run(handler.handle_openai_responses_ws(client_ws))
+
+    forwarded = json.loads(upstream.sent[0])
+    assert (forwarded["response"]["tools"] == _VERBOSE_TOOLS) is kept
