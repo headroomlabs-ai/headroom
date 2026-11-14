@@ -36,6 +36,7 @@ from headroom.proxy.helpers import (
     extract_tags,
     invalid_request_body_message,
     jitter_delay_ms,
+    project_key_strategy_from_config,
     sanitize_forwarded_response_headers,
 )
 from headroom.proxy.identity import resolve_memory_identity
@@ -3895,6 +3896,7 @@ class OpenAIHandlerMixin:
                 project_root_override=(
                     getattr(self.memory_handler.config, "project_root_override", "") or None
                 ),
+                key_strategy=project_key_strategy_from_config(getattr(self, "config", None)),
             )
 
         await self._observe_openai_chat_traffic(
@@ -6497,6 +6499,7 @@ class OpenAIHandlerMixin:
                 headers=dict(request.headers),
                 body=body,
                 project_root_override=codex_project_root_override,
+                key_strategy=project_key_strategy_from_config(getattr(self, "config", None)),
             )
             tags["codex_project_context"] = codex_project.reason
             if codex_project.project_key and classify_project(request.headers) is None:
@@ -6602,6 +6605,7 @@ class OpenAIHandlerMixin:
                 system_prompt=_extract_sys_prompt(body),
                 base_user_id=memory_user_id,
                 project_root_override=resolved_project_root_override,
+                key_strategy=project_key_strategy_from_config(getattr(self, "config", None)),
             )
 
         # The shared learner cannot isolate project state. Scoped Codex turns
@@ -8669,6 +8673,9 @@ class OpenAIHandlerMixin:
                         body=frame_body,
                         pinned_cwd=ws_pinned_project_cwd,
                         project_root_override=ws_project_root_override,
+                        key_strategy=project_key_strategy_from_config(
+                            getattr(self, "config", None)
+                        ),
                     )
                     ws_tags["codex_project_context"] = resolved_project.reason
                     frame_project_scope_required = (
@@ -8712,6 +8719,9 @@ class OpenAIHandlerMixin:
                         system_prompt=str(ws_response_body.get("instructions") or ""),
                         base_user_id=memory_user_id_candidate,
                         project_root_override=resolved_project_root_override,
+                        key_strategy=project_key_strategy_from_config(
+                            getattr(self, "config", None)
+                        ),
                     )
 
                 if (

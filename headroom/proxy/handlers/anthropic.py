@@ -68,6 +68,7 @@ from headroom.proxy.helpers import (
     extract_tags,
     invalid_request_body_message,
     is_third_party_model,
+    project_key_strategy_from_config,
     relocate_system_messages_to_top_level,
     sanitize_forwarded_response_headers,
 )
@@ -690,6 +691,7 @@ class AnthropicHandlerMixin:
                 system_prompt=_extract_sys_prompt(body),
                 base_user_id=resolve_memory_identity(request, default=""),
                 project_root_override=(getattr(config, "memory_project_root_override", "") or None),
+                key_strategy=project_key_strategy_from_config(config),
             )
             ident = ProjectResolver().resolve(ctx)
         except Exception as exc:  # noqa: BLE001
@@ -1898,6 +1900,7 @@ class AnthropicHandlerMixin:
                     project_root_override=(
                         getattr(self.memory_handler.config, "project_root_override", "") or None
                     ),
+                    key_strategy=project_key_strategy_from_config(getattr(self, "config", None)),
                 )
 
             # Canonical memory-injection gate. Reads `request.headers`

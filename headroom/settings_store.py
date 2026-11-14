@@ -708,6 +708,20 @@ SETTINGS: tuple[SettingField, ...] = (
         tier="advanced",
     ),
     SettingField(
+        "HEADROOM_MEMORY_PROJECT_KEY",
+        "memory_project_key",
+        "Memory project key strategy",
+        "Memory",
+        "enum",
+        default="cwd",
+        choices=("cwd", "git"),
+        help=(
+            "cwd: one memory DB per directory (default). git: one DB per git "
+            "repository, shared across worktrees and subdirectories (GH #4712)."
+        ),
+        tier="advanced",
+    ),
+    SettingField(
         "HEADROOM_NO_MEMORY_TOOLS",
         "no_memory_tools",
         "Disable memory tools",

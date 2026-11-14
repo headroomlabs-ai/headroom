@@ -987,6 +987,22 @@ def dashboard(port: int | None, no_open: bool) -> None:
     ),
 )
 @click.option(
+    "--memory-project-key",
+    type=click.Choice(["cwd", "git"], case_sensitive=False),
+    default="cwd",
+    show_default=True,
+    envvar="HEADROOM_MEMORY_PROJECT_KEY",
+    help=(
+        "How a resolved cwd becomes the per-project memory key (GH #4712). "
+        "cwd (default): key on the directory itself — two sessions in different "
+        "directories of one repo get different DBs. git: key on the repository's "
+        "common git dir, so the main checkout, linked worktrees, and subdirectories "
+        "share one DB per repo; non-git and non-local paths fall back to the cwd key. "
+        "Shows a Git user per-worktree memory for a repo they have been working in."
+        "Env: HEADROOM_MEMORY_PROJECT_KEY."
+    ),
+)
+@click.option(
     "--no-memory-tools",
     is_flag=True,
     envvar="HEADROOM_NO_MEMORY_TOOLS",
@@ -1280,6 +1296,7 @@ def proxy(
     memory_db_path: str,
     memory_storage: str,
     memory_project_root: str,
+    memory_project_key: str,
     no_memory_tools: bool,
     no_memory_context: bool,
     memory_top_k: int,
@@ -1671,6 +1688,7 @@ def proxy(
         memory_db_path=memory_db_path,
         memory_storage_mode=cast(Literal["project", "user", "global"], memory_storage.lower()),
         memory_project_root_override=memory_project_root,
+        memory_project_key_strategy=cast(Literal["cwd", "git"], memory_project_key.lower()),
         memory_inject_tools=not no_memory_tools,
         memory_inject_context=not no_memory_context,
         memory_top_k=memory_top_k,
