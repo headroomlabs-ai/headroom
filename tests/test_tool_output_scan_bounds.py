@@ -116,6 +116,7 @@ def test_json_object_after_crossed_count_prefix_keeps_its_own_section(repeats: i
 def test_block_scanner_matches_walking_each_candidate() -> None:
     rng = random.Random(7)
     parts = ["{", "}", "[", "]", '"', "\\\\", "a", " ", ",", "{}", "[]", '"x"', "}}", "]]", "{["]
+    parts += ['{"' + chr(92), '"' + chr(92)]  # lines ending inside a string, escaped
     for _ in range(3000):
         lines = [
             "".join(rng.choice(parts) for _ in range(rng.randint(0, 5)))
@@ -126,3 +127,22 @@ def test_block_scanner_matches_walking_each_candidate() -> None:
         for i, line in enumerate(lines):
             if line.strip().startswith(("[", "{")):
                 assert scanner.extract(i) == _extract_json_block(lines, i), (lines, i)
+
+
+@pytest.mark.parametrize("pairs", [100, 10000])
+def test_json_object_after_escaped_string_lines_keeps_its_own_section(pairs: int) -> None:
+    # Lines ending inside a string with a trailing backslash put each walk in
+    # a different string state, so candidates start walks that only merge
+    # later; every one must still be answered.
+    obj = '{"critical": "disk full"}'
+    prefix_line = '{"' + chr(92)
+    content = "\n".join(
+        ["{"] + [prefix_line, '"'] * pairs + ["some prose"] * 6 + [obj, "more prose"]
+    )
+    start = time.perf_counter()
+    assert _has_valid_json_block_with_text(content) is True
+    json_sections = [
+        s.content for s in split_into_sections(content) if s.content_type is ContentType.JSON_ARRAY
+    ]
+    assert time.perf_counter() - start < 10.0
+    assert json_sections == [obj]
