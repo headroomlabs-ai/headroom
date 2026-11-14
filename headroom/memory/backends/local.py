@@ -781,6 +781,21 @@ class LocalBackend:
             limit=limit,
         )
 
+    async def get_session_memories(
+        self,
+        user_id: str,
+        session_id: str,
+        limit: int = 100,
+    ) -> list[Memory]:
+        """List recent memories filtered by both user and session before limiting."""
+        await self._ensure_initialized()
+        assert self._hierarchical_memory is not None
+        return await self._hierarchical_memory.get_session_memories(
+            user_id=user_id,
+            session_id=session_id,
+            limit=limit,
+        )
+
     async def clear_user(self, user_id: str) -> int:
         """Clear all memories and graph data for a user.
 

@@ -296,6 +296,7 @@ class MemorySystem:
         handlers = {
             "memory_save": self._handle_save,
             "memory_search": self._handle_search,
+            "memory_list": self._handle_list,
             "memory_update": self._handle_update,
             "memory_delete": self._handle_delete,
         }
@@ -491,6 +492,36 @@ class MemorySystem:
             "count": len(results),
         }
 
+    async def handle_memory_list(self, limit: int = 10) -> dict[str, Any]:
+        """List recent memories within this user's current scope."""
+        method = "get_user_memories" if self._session_id is None else "get_session_memories"
+        list_memories = getattr(self._backend, method, None)
+        if not callable(list_memories):
+            return {
+                "success": False,
+                "error": "This memory backend does not support listing memories for this scope",
+            }
+        limit = max(1, min(limit, 100))
+        kwargs: dict[str, Any] = {"user_id": self._user_id, "limit": limit}
+        if self._session_id is not None:
+            kwargs["session_id"] = self._session_id
+        memories = await list_memories(**kwargs)
+        return {
+            "success": True,
+            "message": f"Found {len(memories)} memories",
+            "count": len(memories),
+            "memories": [
+                {
+                    "memory_id": memory.id,
+                    "content": memory.content,
+                    "importance": memory.importance,
+                    "entities": memory.entity_refs,
+                    "created_at": memory.created_at.isoformat(),
+                }
+                for memory in memories
+            ],
+        }
+
     async def handle_memory_update(
         self,
         memory_id: str,
@@ -643,6 +674,10 @@ class MemorySystem:
             new_content=arguments["new_content"],
             reason=arguments.get("reason", "Updated by user"),
         )
+
+    async def _handle_list(self, arguments: dict[str, Any]) -> dict[str, Any]:
+        """Internal dispatcher for memory_list."""
+        return await self.handle_memory_list(limit=arguments.get("limit", 10))
 
     async def _handle_delete(self, arguments: dict[str, Any]) -> dict[str, Any]:
         """Internal dispatcher for memory_delete."""
