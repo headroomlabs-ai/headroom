@@ -529,10 +529,7 @@ class MemoryBridge:
         user_id = user_id or self._config.user_id
         stats = SyncStats()
 
-        # Phase 1: Import from markdown
-        stats.import_stats = await self.import_from_markdown(paths=paths, user_id=user_id)
-
-        # Phase 2: Export new organic memories to markdown
+        # Importing a changed file advances last_sync; retain the previous export watermark.
         last_sync_str = self._sync_state.get("last_sync")
         since = None
         if last_sync_str:
@@ -541,6 +538,10 @@ class MemoryBridge:
             except (ValueError, TypeError):
                 pass
 
+        # Phase 1: Import from markdown
+        stats.import_stats = await self.import_from_markdown(paths=paths, user_id=user_id)
+
+        # Phase 2: Export new organic memories to markdown
         new_memories = await self._get_new_organic_memories(user_id, since)
 
         if new_memories and paths:
