@@ -7,7 +7,7 @@ output tokens, so every lever here works by reshaping the request:
 1. Verbosity steering — a deterministic instruction block appended to the
    TAIL of the system prompt (after any ``cache_control`` breakpoint, so the
    provider prefix cache is preserved). Five levels, from "no ceremony" to
-   conclusions only with a fixed three-line final report.
+   full caveman.
 
 Safety rules (each prevents a concrete failure mode):
 - Never toggle ``thinking.type`` — disabling thinking while history carries
@@ -71,13 +71,14 @@ _replace_or_append_steering_block = replace_or_append_steering_block
 
 
 #: Level handed to an operator who turned the shaper on and said nothing else.
-#: Four: on paired SWE-bench Verified runs (Claude Code, Opus 5.5) it cut output
-#: tokens about 20% and cost about 16% with no measurable change in tasks
-#: solved. The price is shorter final replies: a blind reviewer judge wanted a
-#: follow-up on 28% of them (vanilla 9%), mostly for a missing root cause. See
-#: the table in ``output_verbosity_policy``. Set HEADROOM_VERBOSITY_LEVEL=3 for
-#: about half the saving at near-vanilla reply quality.
-DEFAULT_VERBOSITY_LEVEL = 4
+#: Three. Paired SWE-bench Verified runs (Claude Code 2.1.325, Opus 5.5, 49
+#: tasks x 2 attempts against unsteered Claude Code) put L3 at -11.7% output
+#: tokens (95% CI 7.3-16.1%) and -9.5% cost, solving the same tasks. A blind
+#: judge playing the reviewer who must merge the change wanted a follow-up on
+#: 14% of L3's final replies against 11% unsteered. L4 saved more (-21%) but
+#: the judge wanted a follow-up on 20% of its replies against 3%, mostly for
+#: dropped caveats, which is why it is not the default.
+DEFAULT_VERBOSITY_LEVEL = 3
 
 
 @dataclass(frozen=True)

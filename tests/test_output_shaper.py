@@ -421,7 +421,7 @@ class TestCacheModeSuppressesSteeringOnly:
         settings = OutputShaperSettings(enabled=True, verbosity_level=4, steering_enabled=False)
         assert resolve_verbosity_level(settings) == (4, "env_pinned")
 
-    def test_shaper_alone_steers_at_l4_in_cache_mode(self, monkeypatch):
+    def test_shaper_alone_steers_at_l3_in_cache_mode(self, monkeypatch):
         """``HEADROOM_OUTPUT_SHAPER=1`` must be sufficient on its own.
 
         The shaper is opt-in, so an enabled shaper is already an explicit
@@ -439,7 +439,7 @@ class TestCacheModeSuppressesSteeringOnly:
         settings = OutputShaperSettings.from_env(enabled=True, steering_enabled=False)
         assert settings.enabled is True
         assert resolve_verbosity_level(settings) == (DEFAULT_VERBOSITY_LEVEL, "cache_mode_default")
-        assert DEFAULT_VERBOSITY_LEVEL == 4
+        assert DEFAULT_VERBOSITY_LEVEL == 3
 
     def test_cache_mode_ignores_a_learned_level(self, tmp_path, monkeypatch):
         """``verbosity.json`` appears the moment someone runs ``learn``, so it

@@ -444,7 +444,7 @@ def recommend_level(sig: VerbositySignals) -> tuple[int, str, str]:
         confidence,
         (
             f"Very high push-back (interrupt {ir:.0%}, fast-skip {fsr:.0%}); capping "
-            "at L3: auto-applying L4 would also cap the final report at three lines."
+            "at L3 rather than auto-applying caveman L4."
         ),
     )
 

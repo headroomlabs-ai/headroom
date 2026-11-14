@@ -73,18 +73,18 @@ curl -s http://127.0.0.1:8787/v1/models \
 Output shaping makes the model's responses shorter — fewer tokens, lower cost:
 
 ```bash
-HEADROOM_OUTPUT_SHAPER=1 \
+HEADROOM_OUTPUT_SHAPER=1 HEADROOM_VERBOSITY_LEVEL=2 \
 headroom proxy --port 8787 --openai-api-url https://api.deepseek.com/v1
 ```
 
-Verbosity levels (set one with `HEADROOM_VERBOSITY_LEVEL`; unset means `4`):
+Verbosity levels:
 
 | Level | Behavior |
 |---|---|
 | `1` | Skip preambles/postambles |
-| `2` | + Don't restate code/file content already in context |
+| `2` | + Don't restate code/file content already in context (**recommended**) |
 | `3` | + Omit rationale unless asked |
-| `4` | `3` + a final report of at most three lines (what changed, how it was verified, risks). Default |
+| `4` | Maximum — fragments, zero fluff |
 
 ---
 
