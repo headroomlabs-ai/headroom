@@ -58,9 +58,7 @@ class TestLearnNoLearnConflict:
         )
         assert result.exit_code == 0, result.output
         # Warning must go to stderr via click.secho(err=True)
-        assert "both --learn and --no-learn" in result.output or (result.output is not None), (
-            result.output
-        )
+        assert "both --learn and --no-learn" in result.output, result.output
 
     def test_no_learn_wins_over_learn(self, runner: CliRunner, mock_run_server: dict) -> None:
         """When both are set, learning must be disabled (--no-learn takes precedence)."""
