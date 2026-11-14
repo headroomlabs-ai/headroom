@@ -9,6 +9,8 @@ from __future__ import annotations
 import copy
 from typing import Any
 
+import pytest
+
 from headroom.proxy.output_shaper import (
     DEFAULT_VERBOSITY_LEVEL,
     OutputShaperSettings,
@@ -552,3 +554,29 @@ class TestCacheModeSuppressesSteeringOnly:
         result = shape_request(body, settings, level_override=0)
         assert "system" not in body, "cache mode must not create a system block"
         assert result is not None
+
+
+def test_registered_default_level_applies_only_when_no_level_is_pinned(monkeypatch) -> None:
+    from headroom.proxy import output_shaper
+
+    monkeypatch.setattr(
+        output_shaper, "DEFAULT_VERBOSITY_LEVEL", output_shaper.DEFAULT_VERBOSITY_LEVEL
+    )
+    monkeypatch.delenv("HEADROOM_VERBOSITY_LEVEL", raising=False)
+    output_shaper.register_default_verbosity_level(4)
+    assert output_shaper.OutputShaperSettings.from_env(enabled=True).verbosity_level == 4
+
+    monkeypatch.setenv("HEADROOM_VERBOSITY_LEVEL", "2")
+    assert output_shaper.OutputShaperSettings.from_env(enabled=True).verbosity_level == 2
+
+
+@pytest.mark.parametrize("bad", [5, -1, True, "4"])
+def test_register_default_level_rejects_out_of_range(monkeypatch, bad) -> None:
+    from headroom.proxy import output_shaper
+
+    monkeypatch.setattr(
+        output_shaper, "DEFAULT_VERBOSITY_LEVEL", output_shaper.DEFAULT_VERBOSITY_LEVEL
+    )
+    with pytest.raises(ValueError):
+        output_shaper.register_default_verbosity_level(bad)
+    assert output_shaper.DEFAULT_VERBOSITY_LEVEL == 3

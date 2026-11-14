@@ -52,6 +52,7 @@ logger = logging.getLogger(__name__)
 
 __all__ = [
     "DEFAULT_VERBOSITY_LEVEL",
+    "register_default_verbosity_level",
     "OutputShaperSettings",
     "ShapeResult",
     "TurnKind",
@@ -79,6 +80,22 @@ _replace_or_append_steering_block = replace_or_append_steering_block
 #: the judge wanted a follow-up on 20% of its replies against 3%, mostly for
 #: dropped caveats, which is why it is not the default.
 DEFAULT_VERBOSITY_LEVEL = 3
+
+
+def register_default_verbosity_level(level: int) -> None:
+    """Set the level used when ``HEADROOM_VERBOSITY_LEVEL`` is not set.
+
+    Extension seam, alongside ``register_verbosity_text``: an extension that
+    installs its own benchmarked text for a level can make that level the
+    default. An operator's explicit ``HEADROOM_VERBOSITY_LEVEL`` still wins, and
+    a proxy without the extension keeps core's default. Call it at startup:
+    the level is read per request, and moving it mid-conversation rewrites
+    the system-prompt tail, busting the prefix cache once.
+    """
+    global DEFAULT_VERBOSITY_LEVEL
+    if isinstance(level, bool) or not isinstance(level, int) or not 0 <= level <= 4:
+        raise ValueError(f"default verbosity level must be an int in 0-4; got {level!r}")
+    DEFAULT_VERBOSITY_LEVEL = level
 
 
 @dataclass(frozen=True)
