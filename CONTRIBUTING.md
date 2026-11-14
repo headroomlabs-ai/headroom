@@ -86,6 +86,13 @@ A human maintainer reviews every dep change. PRs that add or bump a package must
 
 **Review:** CI green, one maintainer review, coverage held/improved.
 
+## Posting PR/issue comments from scripts or agents
+
+A successful API call (exit 0) only proves a comment was created, not that its body is right. Scripts must:
+
+- Pass the body as a single plain string via a file (`gh pr comment --body-file`, `gh issue comment --body-file`, or `gh api --input <json-file>`). Avoid inline multi-line strings, which differ across shells, and never pass a collection or object as a field value (`-f body=...`).
+- Re-fetch the posted comment and confirm the body reads as intended before reporting success.
+- If the body is a bare type name (e.g. `System.Collections.Hashtable`) or otherwise garbled, delete it and repost: `gh api -X DELETE repos/<owner>/<repo>/pulls/comments/<id>` for review comments, `.../issues/comments/<id>` for issue and top-level PR comments.
 ## Development setup
 
 ```bash
