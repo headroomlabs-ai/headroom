@@ -944,6 +944,51 @@ describe("Headroom OpenCode transport", () => {
     globalThis.fetch = originalFetch;
   });
 
+  it("percent-encodes a non-Latin-1 project name instead of throwing on routed fetch calls", async () => {
+    const originalFetch = globalThis.fetch;
+    const fetchMock = vi.fn(async (..._args: FetchCall) => new Response("ok"));
+    globalThis.fetch = fetchMock as unknown as typeof fetch;
+
+    // Thai, Chinese, Cyrillic and a Polish letter above U+00FF, plus a path separator.
+    const project = "/home/u/โลลิ/中文/Привет/ł";
+    installHeadroomTransport({ proxyUrl: "http://127.0.0.1:8787/v1", project });
+
+    await fetch("https://api.anthropic.com/v1/messages", { method: "POST" });
+
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    const value = new Headers(fetchMock.mock.calls[0][1]?.headers).get("x-headroom-project");
+    expect(value).toBe(encodeURIComponent(project));
+    expect(value).toMatch(/^[\x20-\x7e]*$/);
+    expect(decodeURIComponent(value ?? "")).toBe(project);
+
+    globalThis.fetch = originalFetch;
+  });
+
+  it("percent-encodes a non-Latin-1 project name on routed Node https.request calls", async () => {
+    const proxy = await proxyServer();
+    const project = "โลลิปืนดุ";
+    installHeadroomTransport({ proxyUrl: proxy.url, project });
+
+    await new Promise<void>((resolve, reject) => {
+      const req = https.request(
+        "https://api.anthropic.com/v1/messages",
+        { method: "POST" },
+        (res) => {
+          res.resume();
+          res.on("end", resolve);
+        },
+      );
+      req.on("error", reject);
+      req.end("{}");
+    });
+
+    const value = proxy.seen[0].headers["x-headroom-project"] as string;
+    expect(value).toBe(encodeURIComponent(project));
+    expect(decodeURIComponent(value)).toBe(project);
+
+    await proxy.close();
+  });
+
   it("omits x-headroom-project header when project is not set", async () => {
     const originalFetch = globalThis.fetch;
     const fetchMock = vi.fn(async (..._args: FetchCall) => new Response("ok"));

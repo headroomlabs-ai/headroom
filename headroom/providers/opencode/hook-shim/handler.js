@@ -10,6 +10,9 @@ var BASE_URL_HEADER = "x-headroom-base-url";
 var ORIGINAL_PATH_HEADER = "x-headroom-original-path";
 var PROJECT_HEADER = "x-headroom-project";
 var SESSION_TOKEN_HEADER = "x-headroom-session-token";
+function projectHeaderValue(project) {
+  return encodeURIComponent(project);
+}
 var PROXY_ENV = "HEADROOM_OPENCODE_TRANSPORT_PROXY_URL";
 var EXCLUDE_HOSTS_ENV = "HEADROOM_OPENCODE_EXCLUDE_HOSTS";
 var WIRE_ROOTS_ENV = "HEADROOM_OPENCODE_WIRE_ROOTS";
@@ -329,7 +332,7 @@ function mergeFetchHeaders(input, init, upstream, originalPath = void 0, project
     headers.set(ORIGINAL_PATH_HEADER, originalPath);
   }
   if (project) {
-    headers.set(PROJECT_HEADER, project);
+    headers.set(PROJECT_HEADER, projectHeaderValue(project));
   }
   if (sessionToken) {
     headers.set(SESSION_TOKEN_HEADER, sessionToken);
@@ -398,7 +401,7 @@ function headersForNodeRequest(options, upstream, originalPath, project, session
     headers.set(ORIGINAL_PATH_HEADER, originalPath);
   }
   if (project) {
-    headers.set(PROJECT_HEADER, project);
+    headers.set(PROJECT_HEADER, projectHeaderValue(project));
   }
   if (sessionToken) {
     headers.set(SESSION_TOKEN_HEADER, sessionToken);
