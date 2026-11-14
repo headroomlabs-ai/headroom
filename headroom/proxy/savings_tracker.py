@@ -90,6 +90,11 @@ DEFAULT_SAVINGS_FILE = "proxy_savings.json"
 SCHEMA_VERSION = 6
 DEFAULT_MAX_HISTORY_POINTS = 5000
 DEFAULT_MAX_PROJECTS = 50
+#: Labels kept per attribution dimension; same cap and eviction as projects.
+DEFAULT_MAX_LABELS_PER_DIMENSION = 50
+#: Dimensions persisted beyond ``project`` (which keeps its own ``projects``
+#: map for compatibility). Mirrors ``attribution.MAX_DIMENSIONS``.
+DEFAULT_MAX_DIMENSIONS = 16
 DEFAULT_MAX_HISTORY_AGE_DAYS = 365
 DEFAULT_MAX_RESPONSE_HISTORY_POINTS = 500
 DEFAULT_DISPLAY_SESSION_INACTIVITY_MINUTES = 60
@@ -853,6 +858,80 @@ def _empty_project_entry() -> dict[str, Any]:
     }
 
 
+def _empty_dimension_entry() -> dict[str, Any]:
+    entry = _empty_project_entry()
+    entry["tool_tokens_saved"] = 0
+    entry["cache_read_tokens"] = 0
+    entry["output_tokens_saved"] = 0
+    return entry
+
+
+def _label_saved(entry: dict[str, Any]) -> int:
+    """A label's tokens saved: compression plus deferred tool schemas, as in the ledger."""
+    return int(entry["tokens_saved"]) + int(entry.get("tool_tokens_saved", 0))
+
+
+def _label_rank(entry: dict[str, Any]) -> tuple[int, str]:
+    """Eviction order for a label: least saved, then least recent."""
+    return (_label_saved(entry), entry["last_activity_at"] or "")
+
+
+def _dimension_rank(labels: dict[str, dict[str, Any]]) -> tuple[int, str]:
+    """Eviction order for a whole dimension: least saved, then least recent."""
+    return (
+        sum(_label_saved(entry) for entry in labels.values()),
+        max((entry["last_activity_at"] or "" for entry in labels.values()), default=""),
+    )
+
+
+def _normalize_dimensions(raw: Any) -> dict[str, dict[str, dict[str, Any]]]:
+    """Validate persisted ``dimensions``: ``{dimension: {label: entry}}``."""
+    from headroom.proxy.attribution import sanitize_dimension_name, sanitize_label
+
+    if not isinstance(raw, dict):
+        return {}
+    dimensions: dict[str, dict[str, dict[str, Any]]] = {}
+    for dim_name, labels in raw.items():
+        dim = sanitize_dimension_name(dim_name)
+        if dim is None or not isinstance(labels, dict):
+            continue
+        cleaned: dict[str, dict[str, Any]] = {}
+        for label_name, entry in labels.items():
+            label = sanitize_label(label_name, decode=False)
+            if label is None or not isinstance(entry, dict):
+                continue
+            normalized = _empty_dimension_entry()
+            for key in (
+                "requests",
+                "tokens_saved",
+                "tool_tokens_saved",
+                "total_input_tokens",
+                "cache_read_tokens",
+                "output_tokens_saved",
+            ):
+                normalized[key] = _coerce_int(entry.get(key))
+            normalized["compression_savings_usd"] = round(
+                _coerce_signed_float(entry.get("compression_savings_usd")), 6
+            )
+            normalized["total_input_cost_usd"] = round(
+                _coerce_float(entry.get("total_input_cost_usd")), 6
+            )
+            last_activity = _parse_timestamp(entry.get("last_activity_at"))
+            normalized["last_activity_at"] = _to_utc_iso(last_activity) if last_activity else None
+            cleaned[label] = normalized
+        if len(cleaned) > DEFAULT_MAX_LABELS_PER_DIMENSION:
+            cleaned = dict(
+                sorted(cleaned.items(), key=lambda item: _label_rank(item[1]), reverse=True)[
+                    :DEFAULT_MAX_LABELS_PER_DIMENSION
+                ]
+            )
+        if cleaned:
+            dimensions[dim] = cleaned
+        if len(dimensions) >= DEFAULT_MAX_DIMENSIONS:
+            break
+    return dimensions
+
+
 def _normalize_projects(raw: Any) -> dict[str, dict[str, Any]]:
     if not isinstance(raw, dict):
         return {}
@@ -1162,6 +1241,10 @@ class SavingsTracker:
         provider: str | None = None,
         agent: str | None = None,
         project: str | None = None,
+        # ``{dimension: label}`` (headroom.proxy.attribution), booked into
+        # ``by_dimension``. Its ``project`` is the attribution label; the
+        # argument above feeds the older ``projects`` totals.
+        attribution: Mapping[str, str] | None = None,
         cache_read_tokens: int = 0,
         cache_write_tokens: int = 0,
         uncached_input_tokens: int = 0,
@@ -1424,6 +1507,17 @@ class SavingsTracker:
                 input_tokens_delta=delta_input_tokens,
                 input_cost_usd_delta=delta_input_cost_usd,
             )
+            self._record_dimensions_locked(
+                attribution,
+                timestamp_dt=timestamp_dt,
+                tokens_saved_delta=delta_tokens_saved,
+                tool_tokens_saved_delta=delta_tool_tokens_saved,
+                savings_usd_delta=delta_savings_usd,
+                input_tokens_delta=delta_input_tokens,
+                input_cost_usd_delta=delta_input_cost_usd,
+                cache_read_tokens_delta=delta_cache_read_tokens,
+                output_tokens_saved_delta=delta_output_tokens_saved,
+            )
 
             # In --mode cache, headroom's own compression (tokens_saved) is
             # near-always 0 by design — the frozen prefix is byte-replayed,
@@ -1610,6 +1704,82 @@ class SavingsTracker:
             )
             del projects[evict]
 
+    def _record_dimensions_locked(
+        self,
+        attribution: Mapping[str, str] | None,
+        *,
+        timestamp_dt: datetime,
+        tokens_saved_delta: int = 0,
+        tool_tokens_saved_delta: int = 0,
+        savings_usd_delta: float = 0.0,
+        input_tokens_delta: int = 0,
+        input_cost_usd_delta: float = 0.0,
+        cache_read_tokens_delta: int = 0,
+        output_tokens_saved_delta: int = 0,
+    ) -> None:
+        """Accumulate per-label savings for each attribution dimension.
+
+        Caller must hold ``self._lock``. Same accounting and eviction as
+        ``_record_project_locked``: one bounded map per dimension, the
+        smallest/oldest label evicted first, unattributed traffic skipped.
+        """
+        if not attribution:
+            return
+        from headroom.proxy.attribution import normalize_attribution
+
+        dimensions: dict[str, dict[str, dict[str, Any]]] = self._state.setdefault("dimensions", {})
+        labelled = normalize_attribution(attribution)
+        for dim, label in labelled.items():
+            if dim not in dimensions and len(dimensions) >= DEFAULT_MAX_DIMENSIONS:
+                # Same rule as labels: the smallest, oldest dimension makes
+                # room, so names seen once cannot hold the slots for good.
+                idle = [name for name in dimensions if name not in labelled]
+                if not idle:
+                    continue
+                del dimensions[min(idle, key=lambda name: _dimension_rank(dimensions[name]))]
+            labels = dimensions.setdefault(dim, {})
+            entry = labels.setdefault(label, _empty_dimension_entry())
+            entry["requests"] += 1
+            entry["tokens_saved"] += max(tokens_saved_delta, 0)
+            entry["tool_tokens_saved"] += max(tool_tokens_saved_delta, 0)
+            entry["compression_savings_usd"] = round(
+                entry["compression_savings_usd"] + savings_usd_delta, 6
+            )
+            entry["total_input_tokens"] += max(input_tokens_delta, 0)
+            entry["total_input_cost_usd"] = round(
+                entry["total_input_cost_usd"] + max(input_cost_usd_delta, 0.0), 6
+            )
+            entry["cache_read_tokens"] += max(cache_read_tokens_delta, 0)
+            entry["output_tokens_saved"] += max(output_tokens_saved_delta, 0)
+            entry["last_activity_at"] = _to_utc_iso(timestamp_dt)
+            if len(labels) > DEFAULT_MAX_LABELS_PER_DIMENSION:
+                evict = min(
+                    (key for key in labels if key != label),
+                    key=lambda key: _label_rank(labels[key]),
+                )
+                del labels[evict]
+
+    def _dimensions_snapshot_locked(self) -> dict[str, dict[str, dict[str, Any]]]:
+        """Per-dimension stats, each ranked by savings."""
+        result: dict[str, dict[str, dict[str, Any]]] = {}
+        for dim, labels in self._state.get("dimensions", {}).items():
+            ranked = sorted(labels.items(), key=lambda item: _label_saved(item[1]), reverse=True)
+            view: dict[str, dict[str, Any]] = {}
+            for label, entry in ranked:
+                row = dict(entry)
+                # As in ``by_model``: deferred schemas never reached the model,
+                # so they count in "saved" and in the pre-Headroom denominator.
+                saved = _label_saved(entry)
+                total_before = saved + entry["total_input_tokens"]
+                row["headline_tokens_saved"] = saved
+                row["savings_percent"] = round(
+                    (saved / total_before * 100) if total_before > 0 else 0.0,
+                    2,
+                )
+                view[label] = row
+            result[dim] = view
+        return result
+
     def _record_by_model_locked(
         self,
         model: str,
@@ -1706,6 +1876,7 @@ class SavingsTracker:
                 }
             )
             response["projects"] = self._projects_snapshot_locked()
+            response["by_dimension"] = self._dimensions_snapshot_locked()
             return response
 
     def stats_preview(self, recent_points: int = 20, model: str = "") -> dict[str, Any]:
@@ -1724,6 +1895,8 @@ class SavingsTracker:
             "retention": snapshot["retention"],
             "projects": snapshot["projects"],
             "projects_limit": DEFAULT_MAX_PROJECTS,
+            "by_dimension": snapshot["by_dimension"],
+            "by_dimension_limit": DEFAULT_MAX_LABELS_PER_DIMENSION,
             "by_model": snapshot["by_model"],
             "co2": {
                 "tokens_saved": tokens_saved,
@@ -1761,6 +1934,7 @@ class SavingsTracker:
             },
             "retention": snapshot["retention"],
             "projects": snapshot["projects"],
+            "by_dimension": snapshot["by_dimension"],
             "by_model": snapshot["by_model"],
             "history_summary": {
                 "mode": history_mode,
@@ -1831,6 +2005,7 @@ class SavingsTracker:
                     "max_response_history_points": self._max_response_history_points,
                 },
                 "projects": self._projects_snapshot_locked(),
+                "by_dimension": self._dimensions_snapshot_locked(),
                 "by_model": self._by_model_snapshot_locked(),
             }
 
@@ -1857,6 +2032,7 @@ class SavingsTracker:
             "display_session": _empty_display_session(),
             "history": [],
             "projects": {},
+            "dimensions": {},
             "by_model": {},
         }
 
@@ -2050,6 +2226,7 @@ class SavingsTracker:
             "display_session": _normalize_display_session(raw.get("display_session")),
             "history": normalized_history,
             "projects": _normalize_projects(raw.get("projects")),
+            "dimensions": _normalize_dimensions(raw.get("dimensions")),
             "by_model": _normalize_by_model(raw.get("by_model")),
         }
         raw_lifetime_metrics = raw.get("lifetime_metrics")
@@ -2218,6 +2395,7 @@ class SavingsTracker:
                 "display_session": self._state["display_session"],
                 "history": self._state["history"],
                 "projects": self._state.get("projects", {}),
+                "dimensions": self._state.get("dimensions", {}),
                 "by_model": self._state.get("by_model", {}),
                 "lifetime_metrics": lifetime_metrics,
             }

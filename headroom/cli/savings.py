@@ -156,8 +156,34 @@ def _echo_basis_note(basis: Any) -> None:
     show_default=True,
     help=f"Retention/lookback window for the ledger, in days (max {savings_ledger.MAX_RETENTION_DAYS}).",
 )
+@click.option(
+    "--by",
+    "group_by",
+    multiple=True,
+    metavar="DIMENSION",
+    help=(
+        "Break the lookback window down by an attribution dimension (project, "
+        "client, or any configured one). Repeatable."
+    ),
+)
+@click.option(
+    "--where",
+    "where",
+    multiple=True,
+    metavar="DIMENSION=LABEL",
+    help=(
+        "Only count requests with this label, e.g. --where project=web. "
+        "Repeatable, once per dimension; all must match."
+    ),
+)
 @click.option("--reset", is_flag=True, help="Delete the savings ledger and start fresh.")
-def savings(as_json: bool, days: int, reset: bool) -> None:
+def savings(
+    as_json: bool,
+    days: int,
+    reset: bool,
+    group_by: tuple[str, ...] = (),
+    where: tuple[str, ...] = (),
+) -> None:
     """Show durable compression savings over time."""
 
     if reset:
@@ -169,8 +195,16 @@ def savings(as_json: bool, days: int, reset: bool) -> None:
             click.echo("Nothing to reset — ledger does not exist.")
         return
 
-    report = savings_ledger.aggregate_savings(retention_days=days)
-    routing = _proxy_routing()
+    where_filter = _parse_where(where)
+    try:
+        report = savings_ledger.aggregate_savings(
+            retention_days=days, group_by=group_by, where=where_filter
+        )
+    except ValueError as exc:
+        raise click.BadParameter(str(exc), param_hint="--by") from exc
+    # The routing rollup is proxy-wide; next to a filtered report it would
+    # read as the filtered label's routing savings.
+    routing = None if where_filter else _proxy_routing()
 
     if as_json:
         data = report.to_dict()
@@ -183,6 +217,12 @@ def savings(as_json: bool, days: int, reset: bool) -> None:
     calls = int(lifetime.get("calls", 0) or 0)
     if calls == 0 and routing is not None:
         _echo_routing(routing)
+        return
+    if calls == 0 and report.where:
+        scope = ", ".join(f"{k}={v}" for k, v in report.where.items())
+        click.echo(f"No savings recorded for {scope}. Labels are case-sensitive.")
+        click.echo(f"Dimensions in the ledger: {', '.join(report.dimensions)}.")
+        click.echo(f"Ledger: {report.path}")
         return
     if calls == 0:
         click.echo("No savings recorded yet.")
@@ -212,7 +252,8 @@ def savings(as_json: bool, days: int, reset: bool) -> None:
 
     _echo_basis_note(report.lifetime.get("basis"))
 
-    if report.by_client:
+    # ``--by client`` prints the same split below, in the per-dimension format.
+    if report.by_client and "client" not in report.by_dimension:
         click.echo("")
         click.echo("Savings by client:")
         for row in report.by_client:
@@ -221,5 +262,64 @@ def savings(as_json: bool, days: int, reset: bool) -> None:
                 f"{_tokens(int(row['tokens_saved']))} tokens saved"
             )
 
+    unattributed: list[str] = []
+    for dimension, rows in report.by_dimension.items():
+        # A dimension no event carries is one "unknown" row; say so instead.
+        if all(str(row[dimension]) == savings_ledger.UNKNOWN for row in rows):
+            unattributed.append(dimension)
+            continue
+        _echo_dimension(dimension, rows)
+    if report.where:
+        scope = ", ".join(f"{k}={v}" for k, v in report.where.items())
+        click.echo("")
+        click.echo(f"Filtered to {scope}.")
+    if unattributed:
+        known = ", ".join(report.dimensions)
+        click.echo("")
+        click.echo(
+            f"No attributed events for {', '.join(unattributed)}. "
+            f"Dimensions in the ledger: {known}."
+        )
+
     if routing is not None:
         _echo_routing(routing)
+
+
+def _parse_where(pairs: tuple[str, ...]) -> dict[str, str]:
+    from headroom.proxy.attribution import sanitize_dimension_name
+
+    parsed: dict[str, str] = {}
+    for pair in pairs:
+        name, sep, label = pair.partition("=")
+        if not sep or not name.strip() or not label.strip():
+            raise click.BadParameter(
+                f"expected DIMENSION=LABEL, got {pair!r}", param_hint="--where"
+            )
+        dimension = sanitize_dimension_name(name)
+        if dimension is None:
+            raise click.BadParameter(
+                f"{name.strip()!r} is not a dimension name", param_hint="--where"
+            )
+        if dimension in parsed:
+            raise click.BadParameter(
+                f"{dimension} is given twice; a request has one label per dimension",
+                param_hint="--where",
+            )
+        parsed[dimension] = label.strip()
+    return parsed
+
+
+def _echo_dimension(dimension: str, rows: list[dict[str, Any]]) -> None:
+    if not rows:
+        return
+    click.echo("")
+    click.echo(f"Savings by {dimension}:")
+    width = max(12, min(32, max(len(str(row[dimension])) for row in rows)))
+    for row in rows:
+        effective = float(row.get("cost_effective_usd", row.get("cost_usd", 0.0)) or 0.0)
+        pct = float(row.get("savings_percent", 0.0) or 0.0)
+        click.echo(
+            f"  {str(row[dimension]):<{width}} {_money(effective)}  "
+            f"{int(row['calls']):,} calls · {_tokens(int(row['tokens_saved']))} tokens "
+            f"({pct:.1f}%)"
+        )

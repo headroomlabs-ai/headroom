@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any
@@ -224,6 +225,12 @@ class RequestOutcome:
     tags: dict[str, Any] = field(default_factory=dict)
     client: str | None = None
     project: str | None = None
+    # Attribution labels (``{dimension: label}``) a handler knows beyond what
+    # the request middleware bound (see :mod:`headroom.proxy.attribution`).
+    # Merged over the context's labels, for dimensions the operator enabled.
+    # ``client`` / ``project`` above win their own dimensions while those are
+    # enabled and resolved by their built-ins (see ``emit_request_outcome``).
+    attribution: Mapping[str, str] | None = None
 
     # ── Derived (computed once, no caching needed — properties are cheap) ─
 
@@ -508,6 +515,15 @@ async def emit_request_outcome(handler: Any, outcome: RequestOutcome) -> None:
     if/when another contract surface emerges, but YAGNI.
     """
     from headroom.copilot_auth import consume_request_routed_to_copilot
+    from headroom.proxy.attribution import (
+        _builtin_label_applies,
+        dimension_enabled,
+        enabled_dimensions,
+        get_current_attribution,
+        get_current_conversation,
+        merge_attribution,
+        normalize_attribution,
+    )
     from headroom.proxy.cost import _summarize_transforms
     from headroom.proxy.models import RequestLog
     from headroom.proxy.project_context import get_current_project
@@ -615,6 +631,29 @@ async def emit_request_outcome(handler: Any, outcome: RequestOutcome) -> None:
     # HTTP middleware / WS accept captured from ``X-Headroom-Project``.
     project = outcome.project or get_current_project()
 
+    # Every attribution label for this request: what the middleware resolved,
+    # then what the handler knew, then the two legacy fields, so a project the
+    # handler identified late (Codex project context) wins over the header.
+    # The legacy fields win because ``projects`` and the ledger's ``client``
+    # key book them too, and the two spellings must not disagree. A dimension
+    # the operator turned off (``-client``) is still left out, and one whose
+    # resolver an extension replaced keeps the label that resolver gave. The
+    # legacy ``projects`` map and ledger ``client`` key still book what the
+    # proxy detected.
+    # What a handler supplies obeys the same switches as what it binds: a
+    # dimension that is off, or removed with ``-name``, is not booked from it.
+    handler_labels = {
+        name: label
+        for name, label in normalize_attribution(outcome.attribution).items()
+        if dimension_enabled(name)
+    }
+    attribution = merge_attribution(
+        get_current_attribution(),
+        handler_labels,
+        {"project": project} if project and _builtin_label_applies("project") else None,
+        {"client": outcome.client} if outcome.client and _builtin_label_applies("client") else None,
+    )
+
     # Savings that are new to this conversation. Per-request descriptions
     # below keep ``outcome.tokens_saved`` -- the wire truth for THIS request --
     # while everything that accumulates across turns uses this, so a removed
@@ -665,12 +704,10 @@ async def emit_request_outcome(handler: Any, outcome: RequestOutcome) -> None:
                     transforms_applied=tuple(str(t) for t in (outcome.transforms_applied or ())),
                     tokens_saved=outcome.tokens_saved,
                     novel_tokens_saved=novel_tokens_saved,
-                    attribution={
-                        dimension: label
-                        for dimension, label in (("project", project), ("client", outcome.client))
-                        if label
-                    },
-                    conversation_key=outcome.conversation_key,
+                    attribution=attribution,
+                    # The handler's key when it derived one; else the conversation
+                    # the client named (Claude Code's session id), for reporting.
+                    conversation_key=outcome.conversation_key or get_current_conversation(),
                     original_tokens=outcome.original_tokens,
                     output_tokens_saved=output_tokens_saved_est,
                 ),
@@ -733,6 +770,7 @@ async def emit_request_outcome(handler: Any, outcome: RequestOutcome) -> None:
         output_tokens_saved=output_tokens_saved_est,
         project=project,
         client=outcome.client,
+        attribution=attribution,
         tool_search_saved=tool_search_saved,
         local_input_tokens=outcome.optimized_tokens,
         savings_attribution=savings_breakdown,
@@ -774,10 +812,19 @@ async def emit_request_outcome(handler: Any, outcome: RequestOutcome) -> None:
     request_logger = getattr(handler, "logger", None)
     if request_logger is not None:
         log_tags = public_tags(outcome.tags)
-        if outcome.client:
-            log_tags["client"] = outcome.client
-        if project:
-            log_tags["project"] = project
+        # ``client`` / ``project`` tags are what the proxy detected, as they
+        # always were, except for a dimension the operator listed: there the
+        # tag is its resolver's label, so a replaced resolver shows here too.
+        # A label a client merely named through ``labels`` does not.
+        listed = enabled_dimensions()
+        client_tag = (attribution.get("client") if "client" in listed else None) or outcome.client
+        if client_tag:
+            log_tags["client"] = client_tag
+        project_tag = (attribution.get("project") if "project" in listed else None) or project
+        if project_tag:
+            log_tags["project"] = project_tag
+        for dimension, label in attribution.items():
+            log_tags.setdefault(dimension, label)
         request_logger.log(
             RequestLog(
                 request_id=outcome.request_id,

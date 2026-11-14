@@ -43,7 +43,7 @@ from __future__ import annotations
 import json
 import logging
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
@@ -137,6 +137,32 @@ def _label(value: Any) -> str:
 
     cleaned = sanitize_project_name(value)
     return cleaned or UNKNOWN
+
+
+def _event_dims(attribution: Any) -> dict[str, str]:
+    from headroom.proxy.attribution import normalize_attribution
+
+    dims = normalize_attribution(attribution)
+    dims.pop("client", None)
+    return dims
+
+
+def event_label(event: dict[str, Any], dimension: str) -> str:
+    """An event's label for ``dimension``, or ``unknown`` when it has none.
+
+    ``unknown`` is never a label (see ``sanitize_label``), so a row reading
+    ``unknown`` always means "no label".
+
+    ``client`` is read from its own key, which every event version carries.
+    """
+    if dimension == "client":
+        return str(event.get("client") or UNKNOWN)
+    dims = event.get("dims")
+    if isinstance(dims, dict):
+        value = dims.get(dimension)
+        if isinstance(value, str) and value:
+            return value
+    return UNKNOWN
 
 
 def _resolve_path(path: str | os.PathLike[str] | None) -> Path:
@@ -307,6 +333,7 @@ def record_savings_event(
     provider: Any = None,
     new_input_tokens: int | None = None,
     deferred_tokens: int = 0,
+    attribution: Any = None,
 ) -> bool:
     """Append one savings event to the durable ledger. Never raises.
 
@@ -388,6 +415,13 @@ def record_savings_event(
     split = _coerce_split(saved, saved_compression, saved_tool_schema)
     if split is not None:
         event["saved_tool_schema"] = split[1]
+
+    # Attribution labels (headroom.proxy.attribution), so `headroom savings
+    # --by host` can split the ledger. `client` already has its own key and is
+    # not repeated; absent when the request carried no other label.
+    dims = _event_dims(attribution)
+    if dims:
+        event["dims"] = dims
 
     # Short keys, and zero-valued ones omitted entirely. This file gets one line
     # per request and is capped at 1 MB before compaction, so field names and
@@ -603,9 +637,15 @@ class SavingsReport:
     by_model: list[dict[str, Any]]
     by_client: list[dict[str, Any]]
     top_model: str = UNKNOWN
+    #: ``{dimension: ranked rows}`` for each ``group_by`` dimension requested.
+    by_dimension: dict[str, list[dict[str, Any]]] = field(default_factory=dict)
+    #: Every attribution dimension any retained event carries, filtered or not.
+    dimensions: list[str] = field(default_factory=list)
+    #: The ``where`` filter applied, echoed so a JSON reader knows the scope.
+    where: dict[str, str] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
-        return {
+        data: dict[str, Any] = {
             "schema_version": self.schema_version,
             "path": self.path,
             "top_model": self.top_model,
@@ -613,7 +653,19 @@ class SavingsReport:
             "windows": self.windows,
             "by_model": self.by_model,
             "by_client": self.by_client,
+            "dimensions": self.dimensions,
         }
+        if self.by_dimension:
+            data["by_dimension"] = self.by_dimension
+        if self.where:
+            data["where"] = self.where
+        return data
+
+
+#: Keys every report row carries. A row is ``{<dimension>: <label>, **figures}``,
+#: so a dimension with one of these names cannot be grouped by: its label and
+#: the figure would be the same key.
+ROW_FIELDS: frozenset[str] = frozenset(_Bucket().to_dict())
 
 
 def _ranked(buckets: dict[str, _Bucket], key_name: str) -> list[dict[str, Any]]:
@@ -639,8 +691,46 @@ def aggregate_savings(
     *,
     now: datetime | None = None,
     retention_days: int = DEFAULT_RETENTION_DAYS,
+    group_by: Any = (),
+    where: Any = None,
 ) -> SavingsReport:
-    """Aggregate the durable ledger into lifetime / windowed / per-dimension views."""
+    """Aggregate the durable ledger into lifetime / windowed / per-dimension views.
+
+    ``group_by`` names attribution dimensions (``host``, ``project``,
+    ``client`` …); each gets one ranked list of rows over the whole lookback
+    window. ``where`` is a ``{dimension: label}`` filter applied before anything
+    is summed, so ``where={"host": "studio"}`` reports one machine's savings,
+    in every window, exactly as the unfiltered report would.
+
+    Raises :class:`ValueError` for a name that is not a usable dimension name
+    (a filter that silently matched everything would be worse), and for a
+    ``group_by`` name that is also a row field (:data:`ROW_FIELDS`, e.g.
+    ``calls``): the row could not hold both the label and the figure.
+    """
+    from headroom.proxy.attribution import sanitize_dimension_name, sanitize_label
+
+    if isinstance(group_by, str):
+        group_by = (group_by,)
+    group_dims = []
+    for raw in group_by or ():
+        name = sanitize_dimension_name(raw)
+        if name is None:
+            raise ValueError(f"not a dimension name: {raw!r}")
+        if name not in group_dims:
+            group_dims.append(name)
+    clashes = sorted(ROW_FIELDS.intersection(group_dims))
+    if clashes:
+        raise ValueError(
+            f"cannot group by {', '.join(clashes)}: the name is also a report field "
+            f"({', '.join(sorted(ROW_FIELDS))}); filter with where instead"
+        )
+    where_filter: dict[str, str] = {}
+    for key, raw_label in dict(where or {}).items():
+        name = sanitize_dimension_name(key)
+        if name is None:
+            raise ValueError(f"not a dimension name: {key!r}")
+        # Stored labels are sanitized; compare like with like.
+        where_filter[name] = sanitize_label(raw_label, decode=False) or str(raw_label)
 
     now = now or _utc_now()
     # Hard-cap the lookback at 30 days regardless of caller input (0/None means
@@ -661,8 +751,15 @@ def aggregate_savings(
     last_7 = _Bucket()
     by_model: dict[str, _Bucket] = {}
     by_client: dict[str, _Bucket] = {}
+    by_dim: dict[str, dict[str, _Bucket]] = {name: {} for name in group_dims}
+    seen_dims: set[str] = set()
 
     for event in events:
+        dims = event.get("dims")
+        if isinstance(dims, dict):
+            seen_dims.update(k for k in dims if isinstance(k, str))
+        if any(event_label(event, k) != v for k, v in where_filter.items()):
+            continue
         ts: datetime = event["_ts"]
         saved = max(int(event.get("saved", 0) or 0), 0)
         before = max(int(event.get("before", 0) or 0), 0)
@@ -703,6 +800,8 @@ def aggregate_savings(
             targets.append(last_7)
         targets.append(by_model.setdefault(str(event.get("model") or UNKNOWN), _Bucket()))
         targets.append(by_client.setdefault(str(event.get("client") or UNKNOWN), _Bucket()))
+        for name, buckets in by_dim.items():
+            targets.append(buckets.setdefault(event_label(event, name), _Bucket()))
 
         for bucket in targets:
             bucket.add(
@@ -730,6 +829,9 @@ def aggregate_savings(
         by_model=model_rows,
         by_client=_ranked(by_client, "client"),
         top_model=top_model,
+        by_dimension={name: _ranked(buckets, name) for name, buckets in by_dim.items()},
+        dimensions=sorted(seen_dims | {"client"}),
+        where=where_filter,
     )
 
 
@@ -801,6 +903,7 @@ def _maybe_compact(target: Path) -> None:
 
 
 __all__ = [
+    "event_label",
     "SCHEMA_VERSION",
     "MAX_RETENTION_DAYS",
     "DEFAULT_RETENTION_DAYS",

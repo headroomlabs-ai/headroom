@@ -13,6 +13,7 @@ import asyncio
 import logging
 import threading
 from collections import defaultdict
+from collections.abc import Mapping
 from datetime import datetime
 from typing import TYPE_CHECKING, Any
 
@@ -886,6 +887,9 @@ class PrometheusMetrics:
         output_tokens_saved: int = 0,
         project: str | None = None,
         client: str | None = None,
+        # ``{dimension: label}`` for this request (headroom.proxy.attribution).
+        # Booked per dimension by the savings tracker and written to the ledger.
+        attribution: Mapping[str, str] | None = None,
         tool_search_saved: int = 0,
         local_input_tokens: int | None = None,
         savings_attribution: list[dict[str, Any]] | None = None,
@@ -1137,6 +1141,7 @@ class PrometheusMetrics:
                 provider=provider,
                 agent=client,
                 project=project,
+                attribution=attribution,
                 cache_read_tokens=cache_read_tokens,
                 cache_write_tokens=cache_write_tokens,
                 uncached_input_tokens=uncached_input_tokens,
@@ -1203,6 +1208,7 @@ class PrometheusMetrics:
                 model=model,
                 client=client or "proxy",
                 source="proxy",
+                attribution=attribution,
                 # The two layers, kept APART on disk. They price against
                 # different regions of the request (live zone vs cached prefix)
                 # and therefore at different rates, so a ledger that stores only
