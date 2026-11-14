@@ -62,7 +62,12 @@ from headroom.proxy.buffered_ccr_response import (
     buffered_ccr_asgi_call,
 )
 from headroom.proxy.compression_decision import CompressionDecision
-from headroom.proxy.handlers._debug_dump import _debug_dump_mode, _redact_debug_value
+from headroom.proxy.handlers._debug_dump import (
+    _debug_dump_mode,
+    _redact_debug_value,
+    redact_dump_headers,
+    write_owner_only_json,
+)
 from headroom.proxy.handlers._failure_logging import log_hook_failure, log_request_failure
 from headroom.proxy.helpers import (
     extract_tags,
@@ -4972,21 +4977,12 @@ class AnthropicHandlerMixin:
                                     from headroom import paths as _hr_paths
 
                                     debug_dir = _hr_paths.debug_400_dir()
-                                    debug_dir.mkdir(parents=True, exist_ok=True)
                                     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
                                     debug_file = debug_dir / f"{ts}_{request_id}.json"
 
-                                    # Sanitize headers (redact API keys)
-                                    safe_headers = {}
-                                    _sensitive_header_names = {"x-api-key", "authorization"} | {
-                                        k.lower()
-                                        for k in (self.config.anthropic_extra_headers or {})
-                                    }
-                                    for k, v in headers.items():
-                                        if k.lower() in _sensitive_header_names:
-                                            safe_headers[k] = v[:12] + "..." if v else ""
-                                        else:
-                                            safe_headers[k] = v
+                                    safe_headers = redact_dump_headers(
+                                        headers, self.config.anthropic_extra_headers or {}
+                                    )
 
                                     # In redacted mode, elide prompt/tool/system
                                     # content but keep structure, roles, and lengths.
@@ -5033,8 +5029,7 @@ class AnthropicHandlerMixin:
                                         "system_prompt": system_prompt,
                                     }
 
-                                    with open(debug_file, "w") as f:
-                                        json.dump(debug_payload, f, indent=2, default=str)
+                                    write_owner_only_json(debug_file, debug_payload)
 
                                     logger.warning(
                                         f"[{request_id}] Debug dump ({dump_mode}): {debug_file}"

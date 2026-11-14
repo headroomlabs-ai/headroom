@@ -33,6 +33,7 @@ from headroom.proxy.helpers import (
     COMPRESSION_TIMEOUT_SECONDS,
     RequestBodyTooLarge,
     _headroom_bypass_enabled,
+    _path_for_log,
     extract_tags,
     invalid_request_body_message,
     jitter_delay_ms,
@@ -119,7 +120,12 @@ from headroom.proxy.buffered_ccr_response import (
 )
 from headroom.proxy.compression_decision import CompressionDecision
 from headroom.proxy.cost import header_safe_transforms
-from headroom.proxy.handlers._debug_dump import _debug_dump_mode, _redact_debug_value
+from headroom.proxy.handlers._debug_dump import (
+    _debug_dump_mode,
+    _redact_debug_value,
+    redact_dump_headers,
+    write_owner_only_json,
+)
 from headroom.proxy.handlers.streaming import _stream_outcome_status
 from headroom.proxy.image_isolation import run_image_compression_isolated
 from headroom.proxy.outcome import RequestOutcome
@@ -5742,16 +5748,12 @@ class OpenAIHandlerMixin:
                             from headroom import paths as _hr_paths
 
                             debug_dir = _hr_paths.debug_400_dir()
-                            debug_dir.mkdir(parents=True, exist_ok=True)
                             ts = datetime.now().strftime("%Y%m%d_%H%M%S")
                             debug_file = debug_dir / f"{ts}_{request_id}.json"
 
-                            safe_headers = {}
-                            for k, v in headers.items():
-                                if k.lower() in ("x-api-key", "authorization"):
-                                    safe_headers[k] = v[:12] + "..." if v else ""
-                                else:
-                                    safe_headers[k] = v
+                            safe_headers = redact_dump_headers(
+                                headers, self.config.openai_extra_headers or {}
+                            )
 
                             redact = dump_mode == "redacted"
                             messages_sent = body.get("messages")
@@ -5796,8 +5798,7 @@ class OpenAIHandlerMixin:
                                 "system_prompt": system_prompt,
                             }
 
-                            with open(debug_file, "w") as f:
-                                json.dump(debug_payload, f, indent=2, default=str)
+                            write_owner_only_json(debug_file, debug_payload)
 
                             logger.warning(f"[{request_id}] Debug dump ({dump_mode}): {debug_file}")
                         except Exception as dump_err:
@@ -12513,7 +12514,7 @@ class OpenAIHandlerMixin:
                 "Passthrough request failed before upstream response: %s %s -> %s: %s",
                 request.method,
                 path,
-                url,
+                _path_for_log(url),
                 e,
             )
             from headroom.proxy.tls_diagnostics import describe_upstream_failure_async
@@ -12539,7 +12540,7 @@ class OpenAIHandlerMixin:
                 "response after retry: %s %s -> %s: %s",
                 request.method,
                 path,
-                url,
+                _path_for_log(url),
                 e,
             )
             return Response(
@@ -12726,7 +12727,7 @@ class OpenAIHandlerMixin:
                     "Streaming passthrough failed before upstream response: %s %s -> %s: %s",
                     request.method,
                     path,
-                    url,
+                    _path_for_log(url),
                     e,
                 )
                 from headroom.proxy.tls_diagnostics import describe_upstream_failure_async

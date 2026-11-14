@@ -190,6 +190,10 @@ from headroom.proxy.project_context import (
 )
 from headroom.proxy.project_policy import split_project_path
 from headroom.proxy.prometheus_metrics import PrometheusMetrics
+from headroom.proxy.query_log_policy import (
+    install_access_log_query_filter,
+    redact_query_string_for_log,
+)
 from headroom.proxy.rate_limiter import TokenBucketRateLimiter
 from headroom.proxy.request_body_limit import RequestBodyLimitMiddleware
 from headroom.proxy.request_logger import RequestLogger
@@ -3530,6 +3534,10 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
     # to 8787), so this is accepted.
     config = config or ProxyConfig()
 
+    # Every process that serves the app (each --workers N worker builds its
+    # own) keeps query values out of uvicorn's access log.
+    install_access_log_query_filter()
+
     # Always-on file logging to ~/.headroom/logs/ for `headroom perf` analysis.
     # Installed here (not at module import) so importing headroom.proxy.server
     # in tests or library contexts does not silently attach a RotatingFileHandler
@@ -4435,7 +4443,7 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
             inbound_id,
             method,
             path,
-            query,
+            redact_query_string_for_log(query),
             client_addr,
             request.headers.get("content-length", ""),
             json.dumps(safe_headers, ensure_ascii=False, default=str),
