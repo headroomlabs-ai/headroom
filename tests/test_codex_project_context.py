@@ -659,7 +659,11 @@ async def test_ws_memory_dispatch_uses_current_turn_project(
     monkeypatch.setenv("CODEX_HOME", str(codex_home))
 
     def frame(project: str | None) -> str:
-        response = {"model": "gpt-5.4", "input": "hello"}
+        response = {
+            "model": "gpt-5.4",
+            "input": "hello",
+            "tools": [{"type": "function", "name": "shell", "parameters": {}}],
+        }
         if project:
             response["client_metadata"] = {
                 "thread_id": f"thread-{project}",
@@ -749,6 +753,15 @@ async def test_ws_memory_dispatch_uses_current_turn_project(
             super().__init__()
             self.config.project_root_override = ""
             self.executed = []
+
+        def compute_memory_tool_definitions(self, provider):
+            # Offer the tool the model calls: the proxy only runs tools it injected.
+            return [
+                {
+                    "type": "function",
+                    "function": {"name": tool_name, "parameters": {"type": "object"}},
+                }
+            ]
 
         async def _execute_memory_tool(
             self, name, args, user_id, provider, *, request_context=None

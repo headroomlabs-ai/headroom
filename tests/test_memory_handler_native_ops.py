@@ -9,7 +9,14 @@ from types import SimpleNamespace
 import pytest
 
 from headroom.proxy import memory_handler as memory_handler_module
-from headroom.proxy.memory_handler import MemoryConfig, MemoryHandler
+from headroom.proxy.memory_handler import (
+    MEMORY_TOOL_NAMES,
+    NATIVE_MEMORY_TOOL_NAME,
+    MemoryConfig,
+    MemoryHandler,
+)
+
+ALL_MEMORY_TOOLS = frozenset(MEMORY_TOOL_NAMES | {NATIVE_MEMORY_TOOL_NAME})
 
 
 @pytest.fixture
@@ -52,7 +59,7 @@ class FakeBackend:
         self.updated.append(kwargs)
         return SimpleNamespace(id=kwargs["memory_id"])
 
-    async def delete_memory(self, memory_id: str):  # noqa: ANN201
+    async def delete_memory(self, memory_id: str, user_id: str | None = None):  # noqa: ANN201
         if self.raise_on == "delete":
             raise RuntimeError("delete failed")
         self.deleted.append(memory_id)
@@ -457,7 +464,7 @@ async def test_native_semantic_update_delete_rename_and_backend_errors(
         async def search_memories(self, **kwargs):  # noqa: ANN003
             return self.search_results
 
-        async def delete_memory(self, memory_id: str):  # noqa: ANN201
+        async def delete_memory(self, memory_id: str, user_id: str | None = None):  # noqa: ANN201
             self.deleted.append(memory_id)
             return True
 
@@ -873,7 +880,7 @@ async def test_execute_search_update_delete_and_handler_status(
             self.deleted: list[str] = []
             self.saved: list[dict[str, object]] = []
 
-        async def delete_memory(self, memory_id: str):  # noqa: ANN201
+        async def delete_memory(self, memory_id: str, user_id: str | None = None):  # noqa: ANN201
             self.deleted.append(memory_id)
             return True
 
@@ -1268,6 +1275,7 @@ async def test_search_and_format_context_and_handle_memory_tool_calls(
         },
         "u1",
         "anthropic",
+        tool_names=ALL_MEMORY_TOOLS,
     )
     assert anthropic_results == [
         {
@@ -1299,6 +1307,7 @@ async def test_search_and_format_context_and_handle_memory_tool_calls(
         },
         "u1",
         "openai",
+        tool_names=ALL_MEMORY_TOOLS,
     )
     assert openai_results == [
         {
@@ -1326,6 +1335,7 @@ async def test_search_and_format_context_and_handle_memory_tool_calls(
         },
         "u1",
         "openai",
+        tool_names=ALL_MEMORY_TOOLS,
     )
     assert skipped == []
 
@@ -1705,6 +1715,7 @@ async def test_extract_tool_calls_and_handle_tool_calls_parse_edges(
         },
         "u1",
         "openai",
+        tool_names=ALL_MEMORY_TOOLS,
     )
     assert results == [{"role": "tool", "tool_call_id": "fc1", "content": "ok:memory_search:{}"}]
 
