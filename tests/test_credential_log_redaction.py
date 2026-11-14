@@ -199,3 +199,25 @@ def test_owner_only_write_tightens_an_existing_directory_and_file(tmp_path) -> N
     assert stat.S_IMODE(dump_dir.stat().st_mode) == 0o700
     assert stat.S_IMODE(dump.stat().st_mode) == 0o600
     assert json.loads(dump.read_text(encoding="utf-8"))["headers"]["authorization"] == "<redacted>"
+
+
+@pytest.mark.skipif(not os.path.isdir("/dev/fd"), reason="needs /dev/fd to count descriptors")
+def test_owner_only_write_closes_and_keeps_the_file_when_chmod_fails(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from headroom.proxy.handlers import _debug_dump
+
+    dump = tmp_path / "dump.json"
+    dump.write_text('{"previous": true}', encoding="utf-8")
+
+    def refuse(fd: int, mode: int) -> None:  # e.g. a file owned by another user
+        raise PermissionError(1, "Operation not permitted")
+
+    monkeypatch.setattr(_debug_dump.os, "fchmod", refuse, raising=False)
+    open_before = len(os.listdir("/dev/fd"))
+
+    with pytest.raises(PermissionError):
+        _debug_dump.write_owner_only_json(dump, {"x": 1})
+
+    assert len(os.listdir("/dev/fd")) == open_before
+    assert dump.read_text(encoding="utf-8") == '{"previous": true}'

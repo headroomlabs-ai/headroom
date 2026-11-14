@@ -89,9 +89,15 @@ def write_owner_only_json(path: Path, payload: Any) -> None:
     """
     path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
     os.chmod(path.parent, 0o700)
-    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-    if hasattr(os, "fchmod"):  # POSIX; Windows has no owner-only mode bits
-        os.fchmod(fd, 0o600)
+    # No O_TRUNC: an existing file is emptied only once it is owner-only.
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT, 0o600)
+    try:
+        if hasattr(os, "fchmod"):  # POSIX; Windows has no owner-only mode bits
+            os.fchmod(fd, 0o600)
+        os.ftruncate(fd, 0)
+    except BaseException:
+        os.close(fd)
+        raise
     with os.fdopen(fd, "w", encoding="utf-8") as fh:
         json.dump(payload, fh, indent=2, default=str)
 
