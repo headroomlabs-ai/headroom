@@ -6874,17 +6874,15 @@ class OpenAIHandlerMixin:
             )
 
         # Responses re-sends the whole transcript every turn and the router
-        # recompresses all of it, so ``tokens_saved`` below is the running
-        # total for the CONVERSATION, not for this turn. Carrying the key and
-        # the total lets the funnel count each removed token once instead of
-        # once per remaining turn (see ``conversation_savings``). Derived
+        # recompresses all of it, so ``tokens_saved`` below covers the whole
+        # request, as on every other path, and the funnel books it per
+        # request. The key is attribution for pipeline extensions. Derived
         # before compression so a rewritten first user message cannot move the
-        # key mid-conversation. Left None when compression did not run: a
-        # bypassed turn saves nothing and must not reset the running total.
+        # key mid-conversation; left None when compression did not run.
         # ``savings_conversation_key`` is None without an explicit conversation
         # id (a body id, a session header) or when the body carries
         # ``previous_response_id``/``conversation`` (incremental input against
-        # server-side state); the funnel then books per request.
+        # server-side state).
         responses_conversation_key: str | None = None
         _pre_compression_conversation_key = savings_conversation_key(
             body, session_id=_responses_session_header(request.headers)
@@ -7162,7 +7160,6 @@ class OpenAIHandlerMixin:
                     mutation_reasons=body_mutation_tracker.reasons,
                     waste_signals=waste_signals_dict,
                     conversation_key=responses_conversation_key,
-                    conversation_tokens_saved=tokens_saved,
                     savings_measure=savings_measure,
                 )
             else:
@@ -7632,7 +7629,6 @@ class OpenAIHandlerMixin:
                             num_messages=len(messages) if isinstance(messages, list) else 0,
                             tags=_resp_log_tags,
                             conversation_key=responses_conversation_key,
-                            conversation_tokens_saved=tokens_saved,
                             savings_measure=savings_measure,
                             turn_id=compute_turn_id(model, body.get("instructions"), messages),
                             request_messages=messages
@@ -8421,13 +8417,11 @@ class OpenAIHandlerMixin:
             transforms_applied: list[str] = []
             ws_frames_compressed = 0
             # ``tokens_saved`` below SUMS each frame's figure, and each frame's
-            # figure is the whole transcript's removals as of that turn. The
-            # conversation's running total is therefore the LAST frame's
-            # figure, not the sum -- that is what the funnel differences to
-            # count a removed token once (see ``conversation_savings``).
+            # figure is the whole transcript's removals as of that turn. Each
+            # turn books its own frames' share, the per-request figure every
+            # path books.
 
             ws_conversation_key: str | None = None
-            ws_conversation_tokens_saved: int | None = None
             try:
                 body = json.loads(first_msg_raw)
             except json.JSONDecodeError:
@@ -9074,7 +9068,6 @@ class OpenAIHandlerMixin:
                                 accumulate_savings(
                                     ws_turn_savings, savings_from_tags(_frame_savings)
                                 )
-                                ws_conversation_tokens_saved = int(_ws_saved)
                                 ws_conversation_key = savings_conversation_key(
                                     _send_body, session_id=f"ws:{session_id}"
                                 )
@@ -9304,7 +9297,7 @@ class OpenAIHandlerMixin:
                         frames in the WS session.
                         """
                         nonlocal tokens_saved, transforms_applied, attempted_input_tokens_total
-                        nonlocal ws_conversation_key, ws_conversation_tokens_saved
+                        nonlocal ws_conversation_key
                         nonlocal ws_frames_compressed
                         _preflight_started = time.perf_counter()
                         try:
@@ -9582,7 +9575,6 @@ class OpenAIHandlerMixin:
                         _record_ws_compression_overhead(_rewrite_ms)
                         tokens_saved += int(frame_saved)
                         accumulate_savings(ws_turn_savings, savings_from_tags(frame_savings))
-                        ws_conversation_tokens_saved = int(frame_saved)
                         ws_conversation_key = savings_conversation_key(
                             new_inner, session_id=f"ws:{session_id}"
                         )
@@ -9983,7 +9975,6 @@ class OpenAIHandlerMixin:
                                     else 0,
                                     tags=turn_tags,
                                     conversation_key=ws_conversation_key,
-                                    conversation_tokens_saved=ws_conversation_tokens_saved,
                                     client=client,
                                     project=ws_turn_project_key,
                                 )
@@ -10658,7 +10649,6 @@ class OpenAIHandlerMixin:
                         transforms_applied=tuple(transforms_applied),
                         tags=ws_session_tags,
                         conversation_key=ws_conversation_key,
-                        conversation_tokens_saved=ws_conversation_tokens_saved,
                         client=client,
                         project=ws_turn_project_key,
                         request_messages=ws_messages_for_log

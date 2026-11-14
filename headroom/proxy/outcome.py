@@ -32,7 +32,6 @@ from datetime import datetime, timezone
 from typing import Any
 
 from headroom.log_safety import describe_exception
-from headroom.proxy.conversation_savings import get_conversation_savings
 from headroom.proxy.savings import ItemMeasure, get_item_ledger
 from headroom.proxy.tool_schema_savings_policy import (
     headline_tokens_saved,
@@ -191,20 +190,11 @@ class RequestOutcome:
     #     one-field-add that proves the refactor pays out: per-
     #     harness visibility appears across EVERY handler with zero
     #     new bookkeeping at the call sites.
-    # conversation_key: stable across every turn of one conversation, from
-    #     ``conversation_key_from_body``. Paired with
-    #     ``conversation_tokens_saved`` it lets the funnel tell a first-time
-    #     removal from a re-run of one already counted. Both stay ``None`` on
-    #     paths whose ``tokens_saved`` is already novel-only -- every provider
-    #     that freezes its cached prefix, which is all of them except OpenAI's
-    #     ``/v1/responses``. See ``conversation_savings``.
-    # conversation_tokens_saved: the conversation's RUNNING removed-token
-    #     total as of this request, which on ``/v1/responses`` is what the
-    #     compressor reports every turn because it recompresses the whole
-    #     transcript. Not the same quantity as ``tokens_saved`` on the WS
-    #     path, where the outcome carries a per-turn delta.
+    # conversation_key: stable across every turn of one conversation, when
+    #     the handler knows it (OpenAI ``/v1/responses``). Attribution only:
+    #     pipeline extensions read it from ``OutcomeSnapshot``. Savings are
+    #     booked per request on every path, so it does not change them.
     conversation_key: str | None = None
-    conversation_tokens_saved: int | None = None
     # savings_measure: the request's per-item original/sent counts against the
     #     conversation's previous request (``headroom.proxy.savings``), from
     #     which the per-request savings record is priced. None on paths that
@@ -343,7 +333,6 @@ class RequestOutcome:
         waste_signals: dict[str, int] | None = None,
         original_messages: list[dict] | None = None,
         conversation_key: str | None = None,
-        conversation_tokens_saved: int | None = None,
         provider_input_tokens: int = 0,
         savings_measure: ItemMeasure | None = None,
     ) -> RequestOutcome:
@@ -420,7 +409,6 @@ class RequestOutcome:
             output_tokens=output_tokens,
             tokens_saved=tokens_saved,
             conversation_key=conversation_key,
-            conversation_tokens_saved=conversation_tokens_saved,
             savings_measure=savings_measure,
             attempted_input_tokens=optimized_tokens + tokens_saved,
             status_code=status_code,
@@ -615,18 +603,6 @@ async def emit_request_outcome(handler: Any, outcome: RequestOutcome) -> None:
     # HTTP middleware / WS accept captured from ``X-Headroom-Project``.
     project = outcome.project or get_current_project()
 
-    # Savings that are new to this conversation. Per-request descriptions
-    # below keep ``outcome.tokens_saved`` -- the wire truth for THIS request --
-    # while everything that accumulates across turns uses this, so a removed
-    # token is counted once per conversation instead of once per turn. Falls
-    # back to ``tokens_saved`` on paths that do not distinguish, which is
-    # already the novel figure there. See ``conversation_savings``.
-    novel_tokens_saved = get_conversation_savings().novel(
-        outcome.conversation_key, outcome.conversation_tokens_saved
-    )
-    if novel_tokens_saved is None:
-        novel_tokens_saved = outcome.tokens_saved
-
     # Outcome stage: hand the meter's reading to any pipeline extension that
     # adapts to it — a ceiling that was hit, an effort setting that did or did
     # not pay off. The snapshot is frozen, so an extension can learn from the
@@ -634,8 +610,8 @@ async def emit_request_outcome(handler: Any, outcome: RequestOutcome) -> None:
     # they did, the core records what happened, and attribution is the core's
     # arithmetic over both.
     #
-    # Emitted after the novel share is known, so an extension reads the same
-    # per-request savings the running totals book instead of parsing PERF lines.
+    # The snapshot carries the same per-request savings the running totals
+    # book, so an extension does not have to parse PERF lines.
     #
     # Best-effort: a handler without a pipeline manager, or an extension that
     # raises, must not affect the response or the stats below.
@@ -664,7 +640,7 @@ async def emit_request_outcome(handler: Any, outcome: RequestOutcome) -> None:
                     turn_index=outcome.turn_index,
                     transforms_applied=tuple(str(t) for t in (outcome.transforms_applied or ())),
                     tokens_saved=outcome.tokens_saved,
-                    novel_tokens_saved=novel_tokens_saved,
+                    novel_tokens_saved=outcome.tokens_saved,
                     attribution={
                         dimension: label
                         for dimension, label in (("project", project), ("client", outcome.client))
@@ -717,7 +693,7 @@ async def emit_request_outcome(handler: Any, outcome: RequestOutcome) -> None:
         model=outcome.model,
         input_tokens=billed_input_tokens,
         output_tokens=outcome.output_tokens,
-        tokens_saved=novel_tokens_saved,
+        tokens_saved=outcome.tokens_saved,
         latency_ms=outcome.total_latency_ms,
         cached=outcome.cache_hit,
         overhead_ms=outcome.overhead_ms,
@@ -750,7 +726,7 @@ async def emit_request_outcome(handler: Any, outcome: RequestOutcome) -> None:
     if cost_tracker is not None:
         cost_tracker.record_tokens(
             outcome.model,
-            novel_tokens_saved,
+            outcome.tokens_saved,
             billed_input_tokens,
             cache_read_tokens=outcome.cache_read_tokens,
             cache_write_tokens=outcome.cache_write_tokens,
@@ -814,11 +790,6 @@ async def emit_request_outcome(handler: Any, outcome: RequestOutcome) -> None:
     #    line unchanged, and gives ``headroom perf --client X``
     #    parsers a clean key to filter on.
     client_part = f" client={outcome.client}" if outcome.client else ""
-    # Only when it differs: on every path that reports novel-only savings the
-    # two are equal and a second identical number is noise.
-    novel_part = (
-        f"tok_novel={novel_tokens_saved} " if novel_tokens_saved != outcome.tokens_saved else ""
-    )
     # ``cached=1`` marks a turn answered from Headroom's own response cache.
     # Such a turn never contacts the upstream, so it has no outbound_request
     # line, no upstream stage timings, and all-zero token counters — which
@@ -841,7 +812,6 @@ async def emit_request_outcome(handler: Any, outcome: RequestOutcome) -> None:
         f"model={outcome.model} msgs={outcome.num_messages} "
         f"tok_before={outcome.original_tokens} tok_after={outcome.optimized_tokens} "
         f"tok_saved={outcome.tokens_saved} "
-        f"{novel_part}"
         f"tok_inflated={outcome.tokens_inflated} "
         f"tool_saved={tool_saved} "
         f"total_saved={total_saved} "
