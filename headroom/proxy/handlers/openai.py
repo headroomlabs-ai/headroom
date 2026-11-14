@@ -605,7 +605,11 @@ def _allowed_ws_origins_from_env() -> list[str] | None:
         raw = os.environ.get(_CORS_ALLOWED_ORIGINS_ENV)
     if raw is None or not raw.strip():
         return None
-    return [origin.strip() for origin in raw.split(",") if origin.strip()]
+    # "*" is a CORS answer (which pages may read a response). It never waives
+    # the Origin check, which decides whether the proxy acts on the request at
+    # all, so it is dropped here; a list left empty means the loopback default.
+    origins = [origin.strip() for origin in raw.split(",") if origin.strip()]
+    return [origin for origin in origins if origin != "*"] or None
 
 
 def _is_loopback_ws_origin(origin: str) -> bool:
@@ -622,7 +626,7 @@ def _is_allowed_websocket_origin(headers: dict[str, str]) -> bool:
 
     Native clients commonly omit Origin, so absence is allowed. When Origin is
     present, default to loopback-only and allow explicit configured origins via
-    HEADROOM_WS_ORIGINS or HEADROOM_CORS_ORIGINS.
+    HEADROOM_WS_ORIGINS or HEADROOM_CORS_ORIGINS. A ``*`` entry matches nothing.
     """
     origin = _header_get(headers, "origin")
     if not origin:
@@ -631,8 +635,6 @@ def _is_allowed_websocket_origin(headers: dict[str, str]) -> bool:
     allowed_origins = _allowed_ws_origins_from_env()
     if allowed_origins is None:
         return _is_loopback_ws_origin(origin)
-    if "*" in allowed_origins:
-        return True
 
     normalized_origin = _normalize_origin(origin)
     if normalized_origin is None:

@@ -953,6 +953,46 @@ def test_websocket_origin_policy_can_be_pinned_with_env(monkeypatch):
     assert _is_allowed_websocket_origin({"origin": "http://localhost:3000"}) is False
 
 
+@pytest.mark.parametrize(
+    ("ws_origins", "cors_origins"),
+    [(None, "*"), ("*", None), (None, "*, https://dash.example.com")],
+)
+def test_websocket_origin_policy_ignores_wildcard(monkeypatch, ws_origins, cors_origins):
+    for name, value in (
+        ("HEADROOM_WS_ORIGINS", ws_origins),
+        ("HEADROOM_CORS_ORIGINS", cors_origins),
+    ):
+        if value is None:
+            monkeypatch.delenv(name, raising=False)
+        else:
+            monkeypatch.setenv(name, value)
+
+    assert _is_allowed_websocket_origin({"origin": "https://remote.example"}) is False
+    # A bare "*" leaves the loopback default in place.
+    if "dash.example.com" not in (cors_origins or ""):
+        assert _is_allowed_websocket_origin({"origin": "http://127.0.0.1:8787"}) is True
+    else:
+        assert _is_allowed_websocket_origin({"origin": "https://dash.example.com"}) is True
+
+
+def test_handle_openai_responses_ws_closes_foreign_origin_under_wildcard_cors(monkeypatch):
+    monkeypatch.delenv("HEADROOM_WS_ORIGINS", raising=False)
+    monkeypatch.setenv("HEADROOM_CORS_ORIGINS", "*")
+    handler = _DummyOpenAIHandler()
+    websocket = _DummyWebSocket({"origin": "https://remote.example"})
+
+    with patch.dict(sys.modules, {"websockets": MagicMock()}):
+        with patch(
+            "headroom.proxy.handlers.openai._resolve_codex_routing_headers",
+            side_effect=AssertionError("routing should not run"),
+        ):
+            anyio.run(handler.handle_openai_responses_ws, websocket)
+
+    assert websocket.closed is True
+    assert websocket.close_code == 1008
+    assert websocket.close_reason == "origin not allowed"
+
+
 def test_handle_openai_responses_ws_resolves_codex_routing_headers():
     class SentinelError(RuntimeError):
         pass
