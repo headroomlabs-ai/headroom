@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import subprocess
 import sys
 
 import pytest
@@ -140,9 +141,10 @@ def test_update_runs_upgrade_with_yes(monkeypatch):
 
     class _Result:
         returncode = 0
+        stdout = "0.27.0\n"  # what the post-upgrade version probe reads
 
     def _run(argv, *a, **k):
-        calls["argv"] = argv
+        calls.setdefault("argv", argv)
         return _Result()
 
     monkeypatch.setattr(up.subprocess, "run", _run)
@@ -220,6 +222,7 @@ def test_update_windows_non_pip_path_stays_synchronous(monkeypatch):
         raise AssertionError("pipx must stay on the synchronous path")
 
     monkeypatch.setattr(up, "safe_update", lambda argv: calls.setdefault("safe_update", argv) and 0)
+    monkeypatch.setattr(up, "_installed_version_after_upgrade", lambda: "0.27.0")
     monkeypatch.setattr(up.subprocess, "Popen", _popen)
     res = CliRunner().invoke(main, ["update", "--yes"])
     assert res.exit_code == 0
@@ -262,6 +265,68 @@ def test_update_upgrade_failure_surfaces_command(monkeypatch):
     res = CliRunner().invoke(main, ["update", "--yes"])
     assert res.exit_code != 0
     assert "Upgrade failed" in res.output
+
+
+class _UpgradeThenProbe:
+    """Fake ``subprocess.run``: the upgrade succeeds, then the post-upgrade
+    version probe (a fresh ``sys.executable -c`` process) reports
+    ``installed`` -- or fails when ``installed`` is None."""
+
+    def __init__(self, installed: str | None) -> None:
+        self.installed = installed
+        self.argvs: list[list[str]] = []
+
+    def __call__(self, argv, *a, **k):
+        self.argvs.append(list(argv))
+        is_probe = argv[:2] == [sys.executable, "-c"]
+        if is_probe and self.installed is None:
+            return subprocess.CompletedProcess(argv, 1, stdout="", stderr="boom")
+        stdout = f"{self.installed}\n" if is_probe else ""
+        return subprocess.CompletedProcess(argv, 0, stdout=stdout, stderr="")
+
+
+def _pip_update_env(monkeypatch, run) -> None:
+    monkeypatch.setattr(up, "installed_version", lambda: "0.26.0")
+    monkeypatch.setattr(up, "fetch_latest_version", lambda **k: "0.27.0")
+    monkeypatch.setattr(up, "_in_virtualenv", lambda: True)
+    monkeypatch.setattr(up.sys, "platform", "linux")
+    monkeypatch.setattr(up, "_find_core_pyd", lambda: None)  # Skip integrity checks
+    monkeypatch.setattr(up.subprocess, "run", run)
+
+
+def test_update_fails_when_pip_leaves_older_version_installed(monkeypatch):
+    """A pin or constraint can make pip exit 0 without upgrading (#4253)."""
+    run = _UpgradeThenProbe("0.26.0")
+    _pip_update_env(monkeypatch, run)
+
+    res = CliRunner().invoke(main, ["update", "--yes"])
+
+    assert res.exit_code != 0
+    assert "upgraded to" not in res.output
+    assert "0.26.0 is still installed" in res.output
+    assert run.argvs[0][:4] == [sys.executable, "-m", "pip", "install"]
+
+
+def test_update_reports_the_version_actually_installed(monkeypatch):
+    """A release newer than the one checked can land during the upgrade."""
+    run = _UpgradeThenProbe("0.28.0")
+    _pip_update_env(monkeypatch, run)
+
+    res = CliRunner().invoke(main, ["update", "--yes"])
+
+    assert res.exit_code == 0
+    assert "Headroom upgraded to 0.28.0." in res.output
+
+
+def test_update_does_not_claim_a_version_it_could_not_confirm(monkeypatch):
+    run = _UpgradeThenProbe(None)
+    _pip_update_env(monkeypatch, run)
+
+    res = CliRunner().invoke(main, ["update", "--yes"])
+
+    assert res.exit_code == 0
+    assert "upgraded to" not in res.output
+    assert "headroom --version" in res.output
 
 
 # --------------------------------------------------------------------------- #
