@@ -6762,6 +6762,13 @@ def _proxy_config_from_env() -> ProxyConfig:
             DEFAULT_BUFFERED_CCR_GRACE_SECONDS,
         ),
         ccr_buffered_chat_streaming=_get_env_bool("HEADROOM_CCR_BUFFERED_CHAT_STREAMING", False),
+        ccr_inject_system_instructions=(
+            False
+            if (
+                _get_env_bool("HEADROOM_NO_CCR", False) or _get_env_bool("HEADROOM_LOSSLESS", False)
+            )
+            else _get_env_bool("HEADROOM_CCR_INJECT_SYSTEM_INSTRUCTIONS", False)
+        ),
         vertex_api_url=os.environ.get("VERTEX_TARGET_API_URL"),
         omlx_target_api_url=resolve_omlx_target_api_url(environ=os.environ),
         backend=_get_env_str("HEADROOM_BACKEND", "anthropic"),

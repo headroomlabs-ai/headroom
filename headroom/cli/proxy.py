@@ -561,6 +561,16 @@ def dashboard(port: int | None, no_open: bool) -> None:
     ),
 )
 @click.option(
+    "--ccr-inject-system-instructions",
+    is_flag=True,
+    envvar="HEADROOM_CCR_INJECT_SYSTEM_INSTRUCTIONS",
+    help=(
+        "Append the Compressed Context Available instruction block to the system "
+        "message, listing active retrieval hashes. Off by default. "
+        "Env: HEADROOM_CCR_INJECT_SYSTEM_INSTRUCTIONS."
+    ),
+)
+@click.option(
     "--no-ccr-proactive-expansion",
     is_flag=True,
     envvar="HEADROOM_NO_CCR_PROACTIVE_EXPANSION",
@@ -1240,6 +1250,7 @@ def proxy(
     lossless: bool,
     ccr_inline_resolve: bool,
     ccr_buffered_chat_streaming: bool,
+    ccr_inject_system_instructions: bool,
     no_ccr_proactive_expansion: bool,
     no_ccr_response_handling: bool,
     proxy_extension: tuple[str, ...],
@@ -1587,6 +1598,9 @@ def proxy(
         ccr_handle_responses=not (no_ccr or no_ccr_response_handling),
         ccr_resolve_markers_inline=ccr_inline_resolve,
         ccr_buffered_chat_streaming=ccr_buffered_chat_streaming,
+        ccr_inject_system_instructions=(
+            False if (no_ccr or lossless) else ccr_inject_system_instructions
+        ),
         lossless=lossless,
         ccr_proactive_expansion=not no_ccr_proactive_expansion,
         # Flatten repeat-flag tuple AND any comma-separated values inside it.
