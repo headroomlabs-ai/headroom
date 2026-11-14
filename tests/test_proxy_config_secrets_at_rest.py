@@ -100,6 +100,35 @@ def test_credential_free_restart_after_a_credentialed_run_still_starts(
     assert configs[1].proxy_token is None
 
 
+@pytest.mark.skipif(os.name == "nt", reason="Unix sockets")
+def test_failed_startup_removes_the_secrets_file_and_restores_the_environment(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    import tempfile
+
+    from headroom.proxy import server
+    from headroom.proxy.uds import UdsError
+
+    secrets_dir = tmp_path / "tmp"
+    secrets_dir.mkdir()
+    monkeypatch.setattr(tempfile, "tempdir", str(secrets_dir))
+    monkeypatch.setenv("HEADROOM_PROXY_CONFIG_JSON", "prior-value")
+    monkeypatch.delenv("HEADROOM_PROXY_CONFIG_SECRETS_FILE", raising=False)
+    not_a_socket = tmp_path / "proxy.sock"
+    not_a_socket.write_text("regular file", encoding="utf-8")
+
+    with pytest.raises(UdsError):
+        server.run_server(
+            ProxyConfig(proxy_token="FAKE-PROXYTOKEN", uds=str(not_a_socket)),
+            workers=2,
+            print_banner=False,
+        )
+
+    assert list(secrets_dir.iterdir()) == []
+    assert os.environ["HEADROOM_PROXY_CONFIG_JSON"] == "prior-value"
+    assert "HEADROOM_PROXY_CONFIG_SECRETS_FILE" not in os.environ
+
+
 def test_worker_without_its_secrets_file_refuses_to_start(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:

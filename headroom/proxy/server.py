@@ -7049,71 +7049,74 @@ def run_server(
     }
     if sys.platform == "win32":
         _configure_windows_uvicorn_loop(uvicorn_kwargs)
-    if workers > 1:
-        # CompressionCache and PrefixTracker are always per-worker instance vars.
-        # Python CompressionStore defaults to InMemoryBackend (per-process), so
-        # CCR markers written on worker A are invisible to worker B unless a
-        # cross-worker backend is configured via HEADROOM_CCR_BACKEND.
-        # See RUST_DEV.md -> "Multi-worker deployment -- CCR fragmentation".
-        if os.environ.get("HEADROOM_CCR_BACKEND", "").strip():
-            logger.warning(
-                "Headroom is running with workers=%d. Compression cache, "
-                "prefix tracker, TOIN state, and CostTracker are all per-process; "
-                "multi-worker deployments produce avoidable cache busts and an "
-                "unstable dashboard 'Proxy $ Saved' hero tile (each /stats poll "
-                "hits a different worker's partial total) when sessions land on "
-                "different workers. Run --workers 1 or place a sticky-session load "
-                "balancer in front of multiple --workers 1 processes. "
-                "See RUST_DEV.md -> 'Multi-worker deployment -- CCR fragmentation'.",
-                workers,
-            )
-        else:
-            logger.warning(
-                "Headroom is running with workers=%d. The in-memory CCR store, "
-                "compression cache (incl. off-path background compression), prefix "
-                "tracker, TOIN state, and CostTracker are all "
-                "per-process; multi-worker deployments produce silent CCR retrieval "
-                "failures, avoidable cache busts, and an unstable dashboard 'Proxy $ Saved' "
-                "hero tile (each /stats poll hits a different worker's partial total) when "
-                "sessions land on different workers. Set HEADROOM_CCR_BACKEND=sqlite for a "
-                "persistent cross-worker CCR store, run --workers 1, or place a "
-                "sticky-session load balancer in front of multiple --workers 1 processes. "
-                "See RUST_DEV.md -> 'Multi-worker deployment -- CCR fragmentation'.",
-                workers,
-            )
-        worker_config = _proxy_config_payload(config)
-        worker_secrets_path = _write_worker_secrets(worker_config)
-        # A path left by an earlier run in this process names a deleted file.
-        os.environ.pop(_MULTI_WORKER_SECRETS_ENV, None)
-        if worker_secrets_path is not None:
-            os.environ[_MULTI_WORKER_SECRETS_ENV] = str(worker_secrets_path)
-        os.environ[_MULTI_WORKER_CONFIG_ENV] = json.dumps(worker_config)
-        app_target = "headroom.proxy.server:create_app_from_env"
-        uvicorn_kwargs["factory"] = True
-    else:
-        app_target = create_app(config)
-
-    # "warning" keeps the default terminal quiet (uvicorn's access log is one line
-    # per request). It was previously hardcoded, which left deployed proxies with
-    # no way to turn request logging on: operators diagnosing a production
-    # incident could not see uvicorn's view of the traffic at all, with no env var
-    # and no CLI flag to change it. Overridable now; the default is unchanged.
-    uvicorn_log_level = _resolve_uvicorn_log_level()
-
-    # Bind target: a Unix socket when one is configured, otherwise host:port.
-    # uvicorn treats `uds` and `host`/`port` as alternatives, so they are built
-    # here rather than passed together.
-    bind_kwargs: dict[str, Any]
     uds_path: Path | None = None
-    if config.uds:
-        from headroom.proxy.uds import prepare_uds_path
-
-        uds_path = prepare_uds_path(config.uds)
-        bind_kwargs = {"uds": str(uds_path)}
-    else:
-        bind_kwargs = {"host": config.host, "port": config.port}
-
+    # Everything from here runs under the cleanup below: once the worker
+    # secrets file exists, any startup failure (a bad --uds path, for
+    # example) must still delete it and restore the hand-off variables.
     try:
+        if workers > 1:
+            # CompressionCache and PrefixTracker are always per-worker instance vars.
+            # Python CompressionStore defaults to InMemoryBackend (per-process), so
+            # CCR markers written on worker A are invisible to worker B unless a
+            # cross-worker backend is configured via HEADROOM_CCR_BACKEND.
+            # See RUST_DEV.md -> "Multi-worker deployment -- CCR fragmentation".
+            if os.environ.get("HEADROOM_CCR_BACKEND", "").strip():
+                logger.warning(
+                    "Headroom is running with workers=%d. Compression cache, "
+                    "prefix tracker, TOIN state, and CostTracker are all per-process; "
+                    "multi-worker deployments produce avoidable cache busts and an "
+                    "unstable dashboard 'Proxy $ Saved' hero tile (each /stats poll "
+                    "hits a different worker's partial total) when sessions land on "
+                    "different workers. Run --workers 1 or place a sticky-session load "
+                    "balancer in front of multiple --workers 1 processes. "
+                    "See RUST_DEV.md -> 'Multi-worker deployment -- CCR fragmentation'.",
+                    workers,
+                )
+            else:
+                logger.warning(
+                    "Headroom is running with workers=%d. The in-memory CCR store, "
+                    "compression cache (incl. off-path background compression), prefix "
+                    "tracker, TOIN state, and CostTracker are all "
+                    "per-process; multi-worker deployments produce silent CCR retrieval "
+                    "failures, avoidable cache busts, and an unstable dashboard 'Proxy $ Saved' "
+                    "hero tile (each /stats poll hits a different worker's partial total) when "
+                    "sessions land on different workers. Set HEADROOM_CCR_BACKEND=sqlite for a "
+                    "persistent cross-worker CCR store, run --workers 1, or place a "
+                    "sticky-session load balancer in front of multiple --workers 1 processes. "
+                    "See RUST_DEV.md -> 'Multi-worker deployment -- CCR fragmentation'.",
+                    workers,
+                )
+            worker_config = _proxy_config_payload(config)
+            worker_secrets_path = _write_worker_secrets(worker_config)
+            # A path left by an earlier run in this process names a deleted file.
+            os.environ.pop(_MULTI_WORKER_SECRETS_ENV, None)
+            if worker_secrets_path is not None:
+                os.environ[_MULTI_WORKER_SECRETS_ENV] = str(worker_secrets_path)
+            os.environ[_MULTI_WORKER_CONFIG_ENV] = json.dumps(worker_config)
+            app_target = "headroom.proxy.server:create_app_from_env"
+            uvicorn_kwargs["factory"] = True
+        else:
+            app_target = create_app(config)
+
+        # "warning" keeps the default terminal quiet (uvicorn's access log is one line
+        # per request). It was previously hardcoded, which left deployed proxies with
+        # no way to turn request logging on: operators diagnosing a production
+        # incident could not see uvicorn's view of the traffic at all, with no env var
+        # and no CLI flag to change it. Overridable now; the default is unchanged.
+        uvicorn_log_level = _resolve_uvicorn_log_level()
+
+        # Bind target: a Unix socket when one is configured, otherwise host:port.
+        # uvicorn treats `uds` and `host`/`port` as alternatives, so they are built
+        # here rather than passed together.
+        bind_kwargs: dict[str, Any]
+        if config.uds:
+            from headroom.proxy.uds import prepare_uds_path
+
+            uds_path = prepare_uds_path(config.uds)
+            bind_kwargs = {"uds": str(uds_path)}
+        else:
+            bind_kwargs = {"host": config.host, "port": config.port}
+
         _run_uvicorn(
             app_target,
             bind_kwargs,
