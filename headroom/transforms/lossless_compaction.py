@@ -138,33 +138,44 @@ def collapse_runs(text: str) -> str:
 
 
 class _ExpansionLimitExceeded(CompressionError):
-    """An inverse would produce more lines than its ``max_lines`` allows."""
+    """An inverse would produce more text than its ``max_chars`` allows."""
 
 
-def _check_expansion(current: int, added: int, max_lines: int | None) -> None:
-    if max_lines is not None and current + added > max_lines:
-        raise _ExpansionLimitExceeded(
-            "Lossless inverse would exceed its line limit",
-            details={"max_lines": max_lines, "requested": current + added},
-        )
+class _OutputBudget:
+    """Characters an inverse may still emit (``None`` = unlimited).
+
+    A line costs its length plus its newline, so the budget also bounds the
+    line count. Checked before each append, so an oversized expansion is
+    refused before it is allocated.
+    """
+
+    def __init__(self, max_chars: int | None) -> None:
+        self.max_chars = max_chars
+        self.used = 0
+
+    def take(self, chars: int) -> None:
+        if self.max_chars is None:
+            return
+        self.used += chars
+        # +1: joining drops the separator after the last line.
+        if self.used > self.max_chars + 1:
+            raise _ExpansionLimitExceeded(
+                "Lossless inverse would exceed its size limit",
+                details={"max_chars": self.max_chars, "requested": self.used},
+            )
 
 
-def _round_trip_line_limit(text: str) -> int:
-    """Most lines an inverse may emit and still reproduce ``text``."""
-    return text.count("\n") + 1
-
-
-def expand_runs(text: str, max_lines: int | None = None) -> str:
+def expand_runs(text: str, max_chars: int | None = None) -> str:
     """Exact inverse of :func:`collapse_runs`.
 
     Repeat counts are read from the text itself, so a marker line already in
-    the input can ask for any number of lines. With ``max_lines`` set, any
-    line or marker that would take the output past it raises before
-    allocating.
+    the input can ask for any amount of output. With ``max_chars`` set, a line
+    or marker that would take the output past it raises before allocating.
     """
     lines, had_trailing = _split_keep_trailing(text)
     if not lines:
         return text
+    budget = _OutputBudget(max_chars)
     out: list[str] = []
     i = 0
     n = len(lines)
@@ -174,11 +185,11 @@ def expand_runs(text: str, max_lines: int | None = None) -> str:
             m = _RUN_MARKER_RE.match(lines[i + 1])
             if m:
                 count = int(m.group(1))
-                _check_expansion(len(out), count, max_lines)
+                budget.take(count * (len(line) + 1))
                 out.extend([line] * count)
                 i += 2
                 continue
-        _check_expansion(len(out), 1, max_lines)
+        budget.take(len(line) + 1)
         out.append(line)
         i += 1
     return _join(out, had_trailing)
@@ -247,27 +258,33 @@ def _remember(positions: dict[str, list[int]], line: str, index: int) -> None:
         del bucket[0]
 
 
-def unfold_repeated_blocks(text: str, max_lines: int | None = None) -> str:
+def unfold_repeated_blocks(text: str, max_chars: int | None = None) -> str:
     """Exact inverse of :func:`fold_repeated_blocks`.
 
-    ``max_lines`` bounds the output as in :func:`expand_runs`; without it,
+    ``max_chars`` bounds the output as in :func:`expand_runs`; without it,
     chained markers can double the output once per marker line.
     """
     lines, had_trailing = _split_keep_trailing(text)
     if not lines:
         return text
+    budget = _OutputBudget(max_chars)
     out: list[str] = []
+    # ends[k]: characters (with newlines) in out[:k], to cost a copied block.
+    ends = [0]
     for line in lines:
         m = _BLOCK_MARKER_RE.match(line)
         if m:
             length, dist = int(m.group(1)), int(m.group(2))
             start = len(out) - dist
             if start >= 0 and length <= dist:
-                _check_expansion(len(out), length, max_lines)
-                out.extend(out[start : start + length])
+                budget.take(ends[start + length] - ends[start])
+                for copied in out[start : start + length]:
+                    out.append(copied)
+                    ends.append(ends[-1] + len(copied) + 1)
                 continue
-        _check_expansion(len(out), 1, max_lines)
+        budget.take(len(line) + 1)
         out.append(line)
+        ends.append(ends[-1] + len(line) + 1)
     return _join(out, had_trailing)
 
 
@@ -538,7 +555,7 @@ def compact_lossless(content: str, kind: str) -> str:
             # exactly reversible against the de-ANSI'd baseline.
             baseline = strip_ansi(content)
             candidate = collapse_runs(baseline)
-            if expand_runs(candidate, _round_trip_line_limit(baseline)) != baseline:
+            if expand_runs(candidate, len(baseline)) != baseline:
                 return content
             return candidate if _smaller(candidate, content) else content
 
@@ -572,7 +589,7 @@ def compact_lossless(content: str, kind: str) -> str:
         if kind == "text":
             # Collapse blank-line runs; reversible against itself.
             candidate = collapse_runs(content)
-            if expand_runs(candidate, _round_trip_line_limit(content)) != content:
+            if expand_runs(candidate, len(content)) != content:
                 return content
             return candidate if _smaller(candidate, content) else content
 
@@ -580,7 +597,7 @@ def compact_lossless(content: str, kind: str) -> str:
             # Structured config (YAML/TOML/INI): single-line runs first, then
             # repeated multi-line stanzas. Inverse applies in reverse order.
             candidate = fold_repeated_blocks(collapse_runs(content))
-            limit = _round_trip_line_limit(content)
+            limit = len(content)
             if expand_runs(unfold_repeated_blocks(candidate, limit), limit) != content:
                 return content
             return candidate if _smaller(candidate, content) else content

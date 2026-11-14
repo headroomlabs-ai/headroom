@@ -73,8 +73,32 @@ def test_real_repeats_still_fold() -> None:
         "a\n... (repeats 5 lines from 1 lines back)",  # invalid block marker, kept as a line
     ],
 )
-def test_inverses_hold_max_lines_for_every_line(text: str) -> None:
+def test_inverses_hold_max_chars_for_every_line(text: str) -> None:
     for inverse in (expand_runs, unfold_repeated_blocks):
         with pytest.raises(CompressionError):
-            inverse(text, max_lines=1)
-        assert inverse(text, max_lines=10) == inverse(text)
+            inverse(text, max_chars=1)
+        assert inverse(text, max_chars=100) == inverse(text)
+
+
+# A long line expanded by a marker, offset by many markers that shrink the
+# line count back: the line count stays under the input's, the size does not.
+_WIDE_LINE_RUN = (
+    "X" * (1024 * 1024) + "\n... (repeated 1000 times)\n" + "a\n... (repeated 1 times)\n" * 1000
+)
+_WIDE_LINE_BLOCK = "X" * (1024 * 1024) + "\n" + "... (repeats 1 lines from 1 lines back)\n" * 1000
+
+
+@pytest.mark.parametrize(
+    ("text", "kind"),
+    [
+        (_WIDE_LINE_RUN, "text"),
+        (_WIDE_LINE_RUN, "log"),
+        (_WIDE_LINE_RUN, "config"),
+        (_WIDE_LINE_BLOCK, "config"),
+    ],
+    ids=["run-text", "run-log", "run-config", "block-config"],
+)
+def test_wide_line_expansion_is_refused_before_allocating(text: str, kind: str) -> None:
+    result, peak = _peak_of(lambda: compact_lossless(text, kind))
+    assert result == text
+    assert peak < 16 * MB, f"peak {peak / MB:.1f}MB: the wide line was expanded"
