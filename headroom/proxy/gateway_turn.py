@@ -36,6 +36,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import contextvars
 import copy
 import dataclasses
 import json
@@ -613,6 +614,10 @@ class PendingTurn:
     # A second response-half call while one is being driven would race the
     # parked coroutine; the handler answers 409 instead.
     in_flight: bool = False
+    # The request half's context. The draft is recorded later, from another
+    # request (the response half, or whichever one sweeps the expiry), so it
+    # is recorded in this copy: its labels and conversation are the turn's own.
+    context: contextvars.Context | None = None
     # config.mode="ccr" with markers inserted and re-drive allowed: the
     # response half answers headroom_retrieve calls itself (see arm_ccr_redrive).
     ccr_armed: bool = False
@@ -744,14 +749,14 @@ class PendingTurnRegistry:
             }
 
 
-def _spawn(coro: Any) -> asyncio.Task[Any] | None:
+def _spawn(coro: Any, context: contextvars.Context | None = None) -> asyncio.Task[Any] | None:
     """Schedule bookkeeping on the running loop; ``None`` when there is none."""
     try:
         loop = asyncio.get_running_loop()
     except RuntimeError:
         coro.close()
         return None
-    task = loop.create_task(coro)
+    task = loop.create_task(coro, context=context)
     _BACKGROUND_TASKS.add(task)
     task.add_done_callback(_BACKGROUND_TASKS.discard)
     return task
@@ -779,14 +784,16 @@ def on_turn_expired(proxy: Any, turn: PendingTurn) -> None:
 
     draft = turn.outcome_draft
     turn.outcome_draft = None
-    to_record: list[RequestOutcome] = []
+    # Never the sweeping request's context: an orphan's own is gone, so it is
+    # recorded with none (no labels beats someone else's).
+    to_record: list[tuple[RequestOutcome, contextvars.Context]] = []
     if orphans:
-        to_record.extend(orphans)
+        to_record.extend((orphan, contextvars.Context()) for orphan in orphans)
         orphans.clear()
     if draft is not None:
-        to_record.append(draft)
-    for outcome in to_record:
-        if _spawn(proxy._record_request_outcome(outcome)) is None:
+        to_record.append((draft, turn.context.copy() if turn.context else contextvars.Context()))
+    for outcome, context in to_record:
+        if _spawn(proxy._record_request_outcome(outcome), context=context) is None:
             if orphans is not None:
                 orphans.append(outcome)
             logger.warning(
@@ -1393,6 +1400,7 @@ def register_pending_turn(
         client=client,
         ccr_armed=ccr_armed,
         wire_shape=wire_shape,
+        context=contextvars.copy_context(),
     )
     registry.register(turn)
     return turn
@@ -1747,7 +1755,12 @@ async def handle_compress_response(proxy: Any, request: Any) -> Any:
                 latency_ms=latency_ms,
             )
             turn.outcome_draft = None
-            await proxy._record_request_outcome(outcome)
+            record = proxy._record_request_outcome(outcome)
+            if turn.context is None:
+                await record
+            else:
+                # This is the response half's request; book the turn's own labels.
+                await asyncio.get_running_loop().create_task(record, context=turn.context.copy())
         _emit_response_received(
             proxy, turn, final_response if final_response is not None else response, status
         )
