@@ -8,7 +8,7 @@ export function setDefaultProxyUrl(url: string): void {
 }
 
 export function getDefaultProxyUrl(): string {
-  return _proxyUrlCache ?? process.env.HEADROOM_BASE_URL ?? "http://localhost:8787";
+  return _proxyUrlCache || process.env.HEADROOM_BASE_URL || "http://localhost:8787";
 }
 
 export interface RetrieveToolConfig {

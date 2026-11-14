@@ -41,6 +41,7 @@ import dataclasses
 import json
 import logging
 import os
+import re
 import threading
 import time
 import uuid
@@ -229,6 +230,12 @@ _ANTHROPIC_ONLY_BLOCKS = frozenset(
 )
 
 
+# Anthropic's own tools (server tools such as ``web_search_20250305`` and
+# client tools such as ``bash_20250124``) carry a dated ``type`` and no
+# ``input_schema``; OpenAI chat tools are ``function`` or ``custom``.
+_ANTHROPIC_DATED_TOOL_TYPE = re.compile(r"_\d{8}$")
+
+
 def _wire_provider_from_shape(body: dict[str, Any]) -> str | None:
     """The provider a body's shape proves, or None when only the model can tell."""
     # A view (Responses, Gemini, Converse) is chat-shaped: the pipeline and
@@ -240,6 +247,9 @@ def _wire_provider_from_shape(body: dict[str, Any]) -> str | None:
     tools = body.get("tools")
     for tool in tools if isinstance(tools, list) else ():
         if isinstance(tool, dict) and "input_schema" in tool:
+            return "anthropic"
+        tool_type = tool.get("type") if isinstance(tool, dict) else None
+        if isinstance(tool_type, str) and _ANTHROPIC_DATED_TOOL_TYPE.search(tool_type):
             return "anthropic"
         if isinstance(tool, dict) and "function" in tool:
             return "openai"
@@ -931,6 +941,7 @@ class RequestTransformer:
         config: Any,
         tags: dict[str, Any],
         caps: GatewayCapabilities,
+        conversation: str | None = None,
     ) -> None:
         self.provider = provider
         self.model_name = model_name
@@ -938,6 +949,8 @@ class RequestTransformer:
         self.config = config
         self.tags = tags
         self.caps = caps
+        # ``TurnContext.conversation``: the gateway session, when one is named.
+        self.conversation = conversation
         self.result: RequestTransformResult | None = None
         # Tool-definition tokens the request hooks ADDED (e.g. a search tool).
         # The compress handler adds it to ``tokens_after``: it is sent too.
@@ -1013,6 +1026,7 @@ class RequestTransformer:
             tags=self.tags,
             count_messages=count_messages,
             count_tools=count_tools,
+            conversation=self.conversation,
         )
         if hooks:
             msg_before = _safe_count(count_messages, messages)

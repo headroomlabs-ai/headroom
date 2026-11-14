@@ -469,6 +469,32 @@ def test_turn_ids_are_unique_per_request(headroom_client) -> None:
     assert len(ids) == 5
 
 
+class _ConversationHook:
+    name = "conversation"
+    stream_safe = True
+
+    def __init__(self) -> None:
+        self.seen: list[str | None] = []
+
+    def on_request(self, ctx: Any) -> None:
+        self.seen.append(ctx.conversation)
+
+
+def test_hooks_see_the_gateway_session_as_the_conversation(headroom_client) -> None:
+    """Each gateway session is one conversation; no session, no conversation."""
+    hook = _ConversationHook()
+    register_turn_hook(hook)
+    for session in ("gw-c1", "gw-c1", "gw-c2"):
+        resp = compress(headroom_client, _body(config={"session_id": session}, gateway={}))
+        assert resp.status_code == 200, resp.text
+    resp = compress(headroom_client, _body(gateway={}))
+    assert resp.status_code == 200, resp.text
+    first, again, other, none = hook.seen
+    assert first == again and first is not None and first != "gw-c1"
+    assert other not in (None, first)
+    assert none is None
+
+
 @pytest.mark.parametrize(
     ("label", "shape", "model", "provider", "route_provider"),
     [
@@ -493,6 +519,16 @@ def test_turn_ids_are_unique_per_request(headroom_client) -> None:
                 "tools": [{"type": "web_search_20250305", "name": "web_search"}],
             },
             "gpt-5.5",
+            "anthropic",
+            "openai",
+        ),
+        (
+            "anthropic_first_turn_server_tool_only",
+            {
+                "messages": [{"role": "user", "content": "x"}],
+                "tools": [{"type": "web_search_20250305", "name": "web_search"}],
+            },
+            "gemini/gemini-2.5-pro",
             "anthropic",
             "openai",
         ),
