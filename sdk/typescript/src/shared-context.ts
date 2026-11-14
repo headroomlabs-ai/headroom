@@ -62,7 +62,6 @@ export class SharedContext {
     options?: { agent?: string },
   ): Promise<ContextEntry> {
     this.evictExpired();
-    this.evictIfFull();
 
     const messages = [{ role: "user" as const, content }];
     let result: CompressResult;
@@ -104,6 +103,9 @@ export class SharedContext {
           : 0,
     };
 
+    // Concurrent puts may change the map while compression is in flight.
+    this.evictExpired();
+    this.evictIfFull(key);
     this.entries.set(key, entry);
     return entry;
   }
@@ -185,11 +187,19 @@ export class SharedContext {
     }
   }
 
-  private evictIfFull(): void {
+  private evictIfFull(incomingKey?: string): void {
+    if (incomingKey !== undefined && this.entries.has(incomingKey)) return;
+
     while (this.entries.size >= this.maxEntries) {
-      const oldest = this.entries.keys().next().value;
+      let oldest: [string, ContextEntry] | undefined;
+      for (const [key, entry] of this.entries) {
+        if (key === incomingKey) continue;
+        if (oldest === undefined || entry.timestamp < oldest[1].timestamp) {
+          oldest = [key, entry];
+        }
+      }
       if (oldest === undefined) break; // nothing left to evict
-      this.entries.delete(oldest);
+      this.entries.delete(oldest[0]);
     }
   }
 }
