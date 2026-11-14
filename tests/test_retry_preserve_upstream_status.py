@@ -37,7 +37,7 @@ class _FakeClient:
         self._exc = exc
         self.calls = 0
 
-    async def post(self, url, content=None, headers=None):
+    async def post(self, url, content=None, headers=None, extensions=None):
         self.calls += 1
         if self._exc is not None:
             raise self._exc

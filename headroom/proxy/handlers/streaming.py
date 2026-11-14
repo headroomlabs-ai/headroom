@@ -9,6 +9,7 @@ import asyncio
 import contextlib
 import json
 import logging
+import ssl
 import time
 from collections.abc import AsyncIterator
 from typing import TYPE_CHECKING, Any
@@ -18,6 +19,7 @@ from headroom.proxy.auth_mode import classify_client, supports_mid_turn_coalesci
 from headroom.proxy.handlers._debug_dump import write_upstream_error_dump
 from headroom.proxy.helpers import (
     RETRYABLE_OVERLOAD_STATUSES,
+    RequestWriteTrace,
     jitter_delay_ms,
     overload_retry_is_futile,
     parse_sse_events_from_byte_buffer,
@@ -1451,10 +1453,12 @@ class StreamingMixin:
             last_connect_error = None
 
             for attempt in range(retry_attempts):
+                request_trace = RequestWriteTrace()
                 try:
                     _upstream_req = streaming_client.build_request(
                         "POST", url, content=outbound_bytes, headers=outbound_headers
                     )
+                    _upstream_req.extensions["trace"] = request_trace
                     upstream_response = await streaming_client.send(_upstream_req, stream=True)
                     if _codex_wire_debug:
                         capture_codex_wire_debug(
@@ -1502,9 +1506,11 @@ class StreamingMixin:
                 # `StreamReset`) from a poisoned shared h2 connection. This runs
                 # before any body byte is forwarded to the client, so re-sending
                 # on a fresh connection is safe and avoids a 502. (#1639)
-                except httpx.TransportError as e:
+                # A raw ssl.SSLError escapes httpx's TransportError mapping; it is
+                # retried only if the request write failed (RequestWriteTrace).
+                except (httpx.TransportError, ssl.SSLError) as e:
                     last_connect_error = e
-                    if attempt >= retry_attempts - 1:
+                    if attempt >= retry_attempts - 1 or request_trace.forbids_retry(e):
                         raise
 
                     delay_with_jitter = jitter_delay_ms(
@@ -1534,7 +1540,7 @@ class StreamingMixin:
         # 502 keeps the structured SSE body for clients that read it while
         # letting SDK retry logic treat a transient upstream transport failure
         # as what it is.
-        except httpx.TransportError as e:
+        except (httpx.TransportError, ssl.SSLError) as e:
             error_msg = str(e) or repr(e)
             logger.error(f"[{request_id}] Connection error to upstream API: {error_msg}")
             self.metrics.record_upstream_connection_error(provider)
