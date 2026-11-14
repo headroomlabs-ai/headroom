@@ -1919,3 +1919,111 @@ describe("Vercel tool-result output kinds survive the round trip", () => {
     expect(openAIToVercel(converted)[1].content[0].output).toEqual({ type: "text", value: "[rows: 4 items, 1-4]" });
   });
 });
+
+describe("Gemini parts the converter does not translate survive the round trip", () => {
+  // The Part reference lists kinds the OpenAI shape has no slot for — executableCode and
+  // codeExecutionResult (code execution), toolCall / toolResponse (server-side tools) — and
+  // per-part metadata beyond `thought` / `thoughtSignature`. All of it must come back as sent.
+  it("keeps a code-execution model turn exactly, including a signature on a code part", () => {
+    const contents = [
+      { role: "user", parts: [{ text: "What is the 50th prime?" }] },
+      {
+        role: "model",
+        parts: [
+          { text: "I'll compute it." },
+          {
+            executableCode: { language: "PYTHON", code: "print(primes[49])" },
+            thoughtSignature: "sig-code-1",
+          },
+          { codeExecutionResult: { outcome: "OUTCOME_OK", output: "229\n" } },
+          { text: "The 50th prime is 229." },
+        ],
+      },
+    ];
+    expect(openAIToGemini(geminiToOpenAI(contents))).toEqual(contents);
+  });
+
+  it("keeps a multimodal functionResponse with its parts, willContinue and scheduling", () => {
+    const contents = [
+      {
+        role: "model",
+        parts: [{ functionCall: { id: "call_1", name: "render_chart", args: { series: "cpu" } } }],
+      },
+      {
+        role: "user",
+        parts: [
+          {
+            functionResponse: {
+              id: "call_1",
+              name: "render_chart",
+              response: { status: "ok" },
+              parts: [{ inlineData: { mimeType: "image/png", data: "iVBORw0KGgo=", displayName: "chart.png" } }],
+              willContinue: true,
+              scheduling: "WHEN_IDLE",
+            },
+          },
+        ],
+      },
+    ];
+    expect(openAIToGemini(geminiToOpenAI(contents))).toEqual(contents);
+  });
+
+  it("keeps video metadata, media processing and display names on media parts", () => {
+    const contents = [
+      {
+        role: "user",
+        parts: [
+          { text: "What happens at the start?" },
+          {
+            fileData: { mimeType: "video/mp4", fileUri: "https://example.com/clip.mp4", displayName: "clip.mp4" },
+            videoMetadata: { startOffset: "0s", endOffset: "15s", fps: 2 },
+            mediaProcessing: "AGENTIC",
+          },
+          { inlineData: { mimeType: "image/png", data: "iVBORw0KGgo=", displayName: "frame.png" } },
+        ],
+      },
+    ];
+    expect(openAIToGemini(geminiToOpenAI(contents))).toEqual(contents);
+  });
+
+  it("keeps a server-side toolCall / toolResponse pair and part metadata", () => {
+    const contents = [
+      {
+        role: "model",
+        parts: [{ toolCall: { name: "google_search", args: { query: "headroom" } }, thoughtSignature: "sig-tool-1" }],
+      },
+      {
+        role: "user",
+        parts: [
+          { toolResponse: { name: "google_search", response: { results: [] } } },
+          { text: "Summarise.", partMetadata: { source: "ui" } },
+        ],
+      },
+    ];
+    expect(openAIToGemini(geminiToOpenAI(contents))).toEqual(contents);
+  });
+
+  it("carries a media part it cannot translate instead of dropping it", () => {
+    // Guard: an inlineData without data (or fileData without fileUri) is the caller's to fix;
+    // the SDK hands the conversation back as built rather than silently editing it.
+    const contents = [{ role: "user", parts: [{ text: "See attached." }, { inlineData: { mimeType: "image/png" } }] }];
+    expect(openAIToGemini(geminiToOpenAI(contents))).toEqual(contents);
+  });
+
+  it("sends an untranslated part as a gemini_part block beside the text blocks", () => {
+    // Wire-shape guard: the proxy compresses `text` blocks and passes every other block through,
+    // so the carried part must be its own block, not folded into a text.
+    const openai = geminiToOpenAI([
+      { role: "model", parts: [{ text: "Running." }, { executableCode: { language: "PYTHON", code: "1+1" } }] },
+    ]);
+    expect(openai).toEqual([
+      {
+        role: "assistant",
+        content: [
+          { type: "text", text: "Running." },
+          { type: "gemini_part", part: { executableCode: { language: "PYTHON", code: "1+1" } } },
+        ],
+      },
+    ]);
+  });
+});

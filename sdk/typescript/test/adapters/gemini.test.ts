@@ -301,3 +301,52 @@ describe("Gemini withHeadroom", () => {
     });
   });
 });
+
+describe("Gemini withHeadroom keeps untranslated parts", () => {
+  it("hands code execution parts and a multimodal functionResponse back as sent", async () => {
+    const mockModel = { generateContent: vi.fn().mockResolvedValue({}) };
+    // The proxy copies messages and their blocks; echo them after a JSON round trip.
+    mockFetch.mockImplementation(async (_url: string, opts: any) => ({
+      ok: true,
+      json: async () => ({
+        messages: JSON.parse(opts.body).messages,
+        tokens_before: 500,
+        tokens_after: 400,
+        tokens_saved: 100,
+        compression_ratio: 0.8,
+        transforms_applied: ["smart_crusher"],
+        ccr_hashes: [],
+      }),
+    }));
+    const contents = [
+      { role: "user", parts: [{ text: "Plot the CPU series and tell me the peak." }] },
+      {
+        role: "model",
+        parts: [
+          { text: "Computing the peak first.", thought: true, thoughtSignature: "sig-thought-1" },
+          { executableCode: { language: "PYTHON", code: "print(max(cpu))" }, thoughtSignature: "sig-code-1" },
+          { codeExecutionResult: { outcome: "OUTCOME_OK", output: "97.5\n" } },
+          { functionCall: { id: "call_1", name: "render_chart", args: { series: "cpu" } } },
+        ],
+      },
+      {
+        role: "user",
+        parts: [
+          {
+            functionResponse: {
+              id: "call_1",
+              name: "render_chart",
+              response: { status: "ok" },
+              parts: [{ inlineData: { mimeType: "image/png", data: "iVBORw0KGgo=", displayName: "cpu.png" } }],
+            },
+          },
+        ],
+      },
+    ];
+
+    const wrapped = withHeadroom(mockModel, { baseUrl: "http://test:8787" });
+    await wrapped.generateContent({ contents });
+
+    expect(mockModel.generateContent).toHaveBeenCalledWith({ contents });
+  });
+});
