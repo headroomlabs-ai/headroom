@@ -2426,7 +2426,9 @@ class CodeAwareCompressor(Transform):
                     # Kompress does NOT guarantee syntax validity
                     syntax_valid=False,
                 )
-        except ImportError:
+        except (ImportError, OSError):
+            # OSError: the ML stack is installed but its native library will
+            # not load (see _is_pytorch_available); degrade to passthrough.
             pass
 
         # No fallback available, return original

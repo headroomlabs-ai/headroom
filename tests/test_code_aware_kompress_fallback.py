@@ -81,3 +81,58 @@ def test_unknown_language_code_passes_through_without_kompress(
     available.assert_not_called()
     compressor.assert_not_called()
     assert out.content == UNKNOWN_CODE
+
+
+@pytest.fixture(autouse=True)
+def _clear_onnx_probe_cache():
+    kc._is_onnx_available.cache_clear()
+    yield
+    kc._is_onnx_available.cache_clear()
+
+
+def test_onnx_probe_does_not_import_transformers_or_torch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The availability probe stays lightweight: no torch, no transformers import."""
+    import builtins
+    import importlib.machinery
+    import sys
+    import types
+
+    # Stub the ML stack so the probe's imports succeed trivially; the probe must
+    # not even attempt them. __spec__ is set so importlib.util.find_spec returns
+    # a spec instead of raising ValueError for a spec-less sys.modules entry.
+    for name in ("onnxruntime", "transformers"):
+        stub = types.ModuleType(name)
+        stub.__spec__ = importlib.machinery.ModuleSpec(name, loader=None)
+        monkeypatch.setitem(sys.modules, name, stub)
+
+    attempted: list[str] = []
+    real_import = builtins.__import__
+
+    def _tracking_import(name, *args, **kwargs):
+        if name.split(".")[0] in ("transformers", "torch"):
+            attempted.append(name)
+        return real_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", _tracking_import)
+
+    kc._is_onnx_available()
+
+    assert attempted == [], f"probe imported the ML stack: {attempted}"
+
+
+def test_onnx_probe_result_unchanged_with_ml_stack_installed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Probe still reports availability when onnxruntime+transformers are importable."""
+    import importlib.machinery
+    import sys
+    import types
+
+    for name in ("onnxruntime", "transformers"):
+        stub = types.ModuleType(name)
+        stub.__spec__ = importlib.machinery.ModuleSpec(name, loader=None)
+        monkeypatch.setitem(sys.modules, name, stub)
+
+    assert kc._is_onnx_available() is True
