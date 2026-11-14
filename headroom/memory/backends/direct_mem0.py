@@ -953,12 +953,19 @@ class DirectMem0Adapter:
             memory_id: ID of the memory to update.
             new_content: New content to replace existing.
             reason: Reason for the update.
-            user_id: User ID for validation.
+            user_id: When given, only a memory owned by this user is updated;
+                any other id is treated as not found.
 
         Returns:
             Updated Memory object.
+
+        Raises:
+            ValueError: If the memory is not found or the update fails.
         """
         await self._ensure_initialized()
+
+        if user_id is not None and not await self._is_owned_by(memory_id, user_id):
+            raise ValueError(f"Memory {memory_id} not found")
 
         try:
             await asyncio.to_thread(
@@ -990,12 +997,16 @@ class DirectMem0Adapter:
         Args:
             memory_id: ID of the memory to delete.
             reason: Reason for deletion.
-            user_id: User ID for validation.
+            user_id: When given, only a memory owned by this user is deleted;
+                any other id is treated as not found.
 
         Returns:
             True if deleted, False if not found.
         """
         await self._ensure_initialized()
+
+        if user_id is not None and not await self._is_owned_by(memory_id, user_id):
+            return False
 
         try:
             await asyncio.to_thread(self._mem0_client.delete, memory_id=memory_id)
@@ -1024,6 +1035,11 @@ class DirectMem0Adapter:
                     describe_exception(e),
                 )
             return False
+
+    async def _is_owned_by(self, memory_id: str, user_id: str) -> bool:
+        """Whether ``memory_id`` exists and belongs to ``user_id`` (a failed lookup is not)."""
+        memory = await self.get_memory(memory_id)
+        return memory is not None and memory.user_id == user_id
 
     async def get_memory(self, memory_id: str) -> Memory | None:
         """Retrieve a specific memory by ID.

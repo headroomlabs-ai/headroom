@@ -396,6 +396,28 @@ class GeminiHandlerMixin:
 
         return contents, system_instruction
 
+    async def _enforce_request_rate_limit(
+        self, request: Request, headers: dict[str, str], provider_name: str
+    ) -> None:
+        """Raise HTTP 429 when the caller is over the request rate limit.
+
+        One identity rule for every provider
+        (headroom/proxy/rate_limit_identity.py).
+        """
+        if not self.rate_limiter:
+            return
+        from fastapi import HTTPException
+
+        allowed, wait_seconds = await self.rate_limiter.check_request(
+            rate_limit_identity(request, headers)
+        )
+        if not allowed:
+            await self.metrics.record_rate_limited(provider=provider_name, source="headroom")
+            raise HTTPException(
+                status_code=429,
+                detail=f"Rate limited. Retry after {wait_seconds:.1f}s",
+            )
+
     async def handle_gemini_generate_content(
         self,
         request: Request,
@@ -492,17 +514,7 @@ class GeminiHandlerMixin:
             stripped_count=_pre_strip_count_gem,
             request_id=request_id,
         )
-        # Rate limiting: one identity rule for every provider
-        # (headroom/proxy/rate_limit_identity.py).
-        if self.rate_limiter:
-            rate_key = rate_limit_identity(request, headers)
-            allowed, wait_seconds = await self.rate_limiter.check_request(rate_key)
-            if not allowed:
-                await self.metrics.record_rate_limited(provider=provider_name, source="headroom")
-                raise HTTPException(
-                    status_code=429,
-                    detail=f"Rate limited. Retry after {wait_seconds:.1f}s",
-                )
+        await self._enforce_request_rate_limit(request, headers, provider_name)
 
         # Budget check
         cost_tracker = self.cost_tracker
@@ -722,7 +734,9 @@ class GeminiHandlerMixin:
         tokenizer, original_tokens = await self._count_tokens_offloaded(model, messages)
 
         if self.rate_limiter:
-            allowed, wait_seconds = await self.rate_limiter.check_tokens(rate_key, original_tokens)
+            allowed, wait_seconds = await self.rate_limiter.check_tokens(
+                rate_limit_identity(request, headers), original_tokens
+            )
             if not allowed:
                 await self.metrics.record_rate_limited(provider=provider_name)
                 raise HTTPException(
@@ -1319,6 +1333,8 @@ class GeminiHandlerMixin:
             request_id=request_id,
         )
 
+        await self._enforce_request_rate_limit(request, headers, "gemini")
+
         # Budget check
         cost_tracker = self.cost_tracker
         if cost_tracker:
@@ -1527,6 +1543,8 @@ class GeminiHandlerMixin:
             stripped_count=_pre_strip_count_gem_count,
             request_id=request_id,
         )
+
+        await self._enforce_request_rate_limit(request, headers, provider_name)
 
         # Convert Gemini format to messages for optimization
         system_instruction = body.get("systemInstruction")
