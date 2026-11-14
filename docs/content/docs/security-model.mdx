@@ -259,6 +259,22 @@ still names the attacker's page, and that is what this gate rejects. Requests wi
 `Origin` at all (CLI tools, curl) pass, which is the intended behaviour for a
 locally-driven surface.
 
+The provider routes (`/v1/messages`, `/v1/chat/completions`, `/v1/responses`, the
+passthrough) add operator credentials to what they forward, so every HTTP request goes
+through the same browser check in the security gate before routing: a request whose
+`Origin` is not a loopback page, an origin listed in `HEADROOM_WS_ORIGINS` /
+`HEADROOM_CORS_ORIGINS`, or (for a non-loopback caller) the proxy's own address is
+refused with **403**. A cross-site subresource load, which carries no `Origin`, is
+refused by `Sec-Fetch-Site: cross-site` unless it is a top-level navigation. Requests
+with no `Origin` (SDKs, coding agents, curl) are unaffected.
+
+A reverse proxy on the same host that forwards a public hostname to `127.0.0.1` needs the
+page's origin (`https://name`) listed in `HEADROOM_WS_ORIGINS`: the proxy sees a loopback
+peer with a non-loopback `Host`, which is indistinguishable from a re-pointed hostname.
+Only `http`, `https`, `ws` and `wss` origins can be listed. Pages that send an app scheme (such as
+`tauri://localhost`) or `Origin: null` (sandboxed iframes, `file://` pages) are always
+refused; a desktop app should call the proxy from its native side, which sends no `Origin`.
+
 ### The two CIDR allowlists
 
 Two environment variables can extend this beyond loopback. Both default to empty, so the

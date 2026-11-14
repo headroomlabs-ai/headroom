@@ -698,10 +698,28 @@ def test_dashboard_client_cidr_grants_stats_metadata_to_same_origin_browser(
     assert "config" in payload
 
 
+@pytest.mark.parametrize("cached", [False, True])
+def test_dashboard_client_cidr_refuses_cross_origin_browser_stats(
+    monkeypatch: pytest.MonkeyPatch, cached: bool
+) -> None:
+    monkeypatch.setenv("HEADROOM_PROXY_TRUSTED_DASHBOARD_CLIENT_CIDRS", "100.90.0.5/32")
+    client = TestClient(
+        _make_app(),
+        base_url="http://100.82.0.2:8787",
+        client=("100.90.0.5", 12345),
+    )
+
+    response = client.get(
+        "/stats", params={"cached": int(cached)}, headers={"origin": "http://attacker.example"}
+    )
+
+    # The security gate refuses a foreign browser Origin before the route runs.
+    assert response.status_code == 403
+
+
 @pytest.mark.parametrize(
     "headers",
     [
-        {"origin": "http://attacker.example"},
         {"referer": "http://attacker.example/dashboard"},
     ],
 )
@@ -1106,7 +1124,8 @@ def test_metrics_trusted_cidr_cross_origin_browser_rejected(
         client=("10.9.0.7", 40000),
     )
     resp = client.get("/metrics", headers={"Origin": "http://attacker.example"})
-    assert resp.status_code == 404
+    # Refused by the security gate (403) before the route's own guard (404).
+    assert resp.status_code == 403
 
 
 def test_metrics_token_authenticated_network_caller_allowed(
