@@ -188,6 +188,22 @@ docker compose -f docker/docker-compose.native.yml run --rm cli learn
 docker compose -f docker/docker-compose.native.yml run --rm cli mcp install
 ```
 
+## Shared proxy over HTTPS
+
+To run one Headroom proxy for a team, use `docker/docker-compose.https.yml`. It puts [Caddy](https://caddyserver.com) in front of Headroom: Caddy serves HTTPS and renews its certificate, and Headroom's own port stays on the compose network.
+
+```bash
+export HEADROOM_PROXY_TOKEN=$(openssl rand -hex 32)
+export HEADROOM_DOMAIN=headroom.example.com
+docker compose -f docker/docker-compose.https.yml up -d
+```
+
+Clients use `https://headroom.example.com` and send the token as `X-Headroom-Proxy-Token`. Their provider credential stays in its usual header.
+
+- **Certificate.** A public `HEADROOM_DOMAIN` gets a Let's Encrypt certificate; ports 80 and 443 must be reachable. For an internal name, uncomment `tls internal` or your own `tls <cert> <key>` in `docker/Caddyfile`.
+- **Keep Caddy in its own container.** Headroom does not ask callers on its own loopback for the token. A TLS sidecar that forwards to `127.0.0.1` would let every remote caller in without one.
+- **Rate limits.** Headroom sees every request as coming from Caddy. Its limit of 60 requests a minute counts per caller address and provider key, so a team sharing one provider key shares one limit. Raise it with `--rpm` if needed.
+
 ## Environment passthrough
 
 The wrapper forwards Headroom and provider environment variables into the container, including common prefixes such as:
