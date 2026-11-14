@@ -1,95 +1,103 @@
-"""code_aware's unknown-language fallback must honour the Kompress switches.
+"""The code_aware Kompress fallback honours ``enable_kompress=False`` (#4719).
 
-Regression tests for #4719: ``CodeAwareCompressor._fallback_compress`` used to
-instantiate Kompress directly, ignoring ``ContentRouterConfig.enable_kompress``
-(HEADROOM_COMPRESSORS / HEADROOM_DISABLE_KOMPRESS), loading torch + the model
-(~1 GB RSS) even with Kompress disabled. ``_is_onnx_available`` also imported
-``transformers`` (which pulls in torch when installed) despite documenting
-itself as lightweight.
+``CodeAwareCompressor`` falls back to Kompress for code it cannot parse (unknown
+language, Perl, no tree-sitter, AST failure). That fallback instantiates its own
+``KompressCompressor``, so ``ContentRouter._get_kompress()`` returning ``None``
+was not enough: the router must also switch the code compressor's fallback off.
 """
 
 from __future__ import annotations
 
-import builtins
-import sys
-import types
+from types import SimpleNamespace
+from unittest.mock import MagicMock
 
 import pytest
+
+import headroom.transforms.code_compressor as cc
+import headroom.transforms.kompress_compressor as kc
+from headroom.transforms.code_compressor import CodeLanguage, detect_language
+from headroom.transforms.compressor_registry import CompressInput
+from headroom.transforms.content_router import ContentRouter, ContentRouterConfig
+
+# Pseudo-assembly that detect_language() cannot identify (the issue's repro).
+UNKNOWN_CODE = "\n".join(
+    f"step {i}: load register r{i % 8} <- mem[{i * 4}]; jump-if-zero r{i % 8} label_{i}"
+    for i in range(80)
+)
+
+
+@pytest.fixture(autouse=True)
+def _tree_sitter_present(monkeypatch: pytest.MonkeyPatch) -> None:
+    # The router only builds the code compressor when tree-sitter parses; the
+    # unknown-language fallback never reaches the parser, so stub the probe to
+    # exercise the router path in environments without the ``code`` extra.
+    monkeypatch.setattr(cc, "_check_tree_sitter_available", lambda: True)
+
+
+@pytest.fixture()
+def kompress_spies(monkeypatch: pytest.MonkeyPatch) -> tuple[MagicMock, MagicMock]:
+    available = MagicMock(return_value=True)
+    compressor = MagicMock()
+    compressor.return_value.compress.return_value = SimpleNamespace(
+        compressed="kompressed",
+        original_tokens=100,
+        compressed_tokens=1,
+        compression_ratio=0.01,
+    )
+    monkeypatch.setattr(kc, "is_kompress_available", available)
+    monkeypatch.setattr(kc, "KompressCompressor", compressor)
+    return available, compressor
+
+
+def test_disabled_kompress_turns_off_code_aware_fallback() -> None:
+    router = ContentRouter(ContentRouterConfig(enable_code_aware=True, enable_kompress=False))
+
+    compressor = router._get_code_compressor()
+
+    assert compressor is not None
+    assert compressor.config.fallback_to_kompress is False
+
+
+def test_enabled_kompress_keeps_code_aware_fallback() -> None:
+    router = ContentRouter(ContentRouterConfig(enable_code_aware=True))
+
+    compressor = router._get_code_compressor()
+
+    assert compressor is not None
+    assert compressor.config.fallback_to_kompress is True
+
+
+def test_unknown_language_code_passes_through_without_kompress(
+    kompress_spies: tuple[MagicMock, MagicMock],
+) -> None:
+    assert detect_language(UNKNOWN_CODE)[0] == CodeLanguage.UNKNOWN
+    router = ContentRouter(ContentRouterConfig(enable_code_aware=True, enable_kompress=False))
+    entry = router.compressor_registry.get("code_aware")
+    assert entry is not None
+
+    out = entry.compress(CompressInput(content=UNKNOWN_CODE, content_type="text/x-code"))
+
+    available, compressor = kompress_spies
+    available.assert_not_called()
+    compressor.assert_not_called()
+    assert out.content == UNKNOWN_CODE
 
 
 @pytest.fixture(autouse=True)
 def _clear_onnx_probe_cache():
-    from headroom.transforms import kompress_compressor
-
-    kompress_compressor._is_onnx_available.cache_clear()
+    kc._is_onnx_available.cache_clear()
     yield
-    kompress_compressor._is_onnx_available.cache_clear()
-
-
-def _unknown_language_code() -> str:
-    """Code ``detect_language`` cannot identify -> CodeLanguage.UNKNOWN."""
-    return "\n".join(
-        f"step {i}: load register r{i % 8} <- mem[{i * 4}]; jump-if-zero r{i % 8} label_{i}"
-        for i in range(80)
-    )
-
-
-def test_router_wires_enable_kompress_into_code_compressor(monkeypatch: pytest.MonkeyPatch) -> None:
-    """One switch covers both Kompress paths: router dispatch and code_aware fallback."""
-    from headroom.transforms import code_compressor
-    from headroom.transforms.content_router import ContentRouter, ContentRouterConfig
-
-    monkeypatch.setattr(code_compressor, "_check_tree_sitter_available", lambda: True)
-
-    router = ContentRouter(ContentRouterConfig(enable_kompress=False))
-    compressor = router._get_code_compressor()
-    assert compressor is not None, "expected a code compressor to be built"
-    assert compressor.config.fallback_to_kompress is False
-
-    # Positive control: the default keeps the fallback enabled.
-    router_on = ContentRouter(ContentRouterConfig(enable_kompress=True))
-    assert router_on._get_code_compressor().config.fallback_to_kompress is True
-
-
-def test_unknown_language_never_consults_kompress_when_fallback_disabled(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """fallback_to_kompress=False must pass unknown code through untouched."""
-    from headroom.transforms import code_compressor, kompress_compressor
-    from headroom.transforms.code_compressor import (
-        CodeAwareCompressor,
-        CodeCompressorConfig,
-    )
-
-    def _forbidden(*args, **kwargs):  # pragma: no cover - must never run
-        raise AssertionError("Kompress must not be consulted when the fallback is disabled")
-
-    monkeypatch.setattr(kompress_compressor, "is_kompress_available", _forbidden)
-    monkeypatch.setattr(
-        kompress_compressor,
-        "KompressCompressor",
-        lambda *a, **k: (_ for _ in ()).throw(_forbidden()),
-    )
-
-    compressor = CodeAwareCompressor(
-        CodeCompressorConfig(fallback_to_kompress=False, enable_ccr=False)
-    )
-    code = _unknown_language_code()
-    assert code_compressor.detect_language(code)[0] == code_compressor.CodeLanguage.UNKNOWN
-
-    result = compressor.compress(code)
-    assert result.compression_ratio == 1.0
-    assert result.compressed == code
-    assert result.language == code_compressor.CodeLanguage.UNKNOWN
+    kc._is_onnx_available.cache_clear()
 
 
 def test_onnx_probe_does_not_import_transformers_or_torch(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """The availability probe stays lightweight: no torch, no transformers import."""
+    import builtins
     import importlib.machinery
-
-    from headroom.transforms import kompress_compressor
+    import sys
+    import types
 
     # Stub the ML stack so the probe's imports succeed trivially; the probe must
     # not even attempt them. __spec__ is set so importlib.util.find_spec returns
@@ -109,7 +117,7 @@ def test_onnx_probe_does_not_import_transformers_or_torch(
 
     monkeypatch.setattr(builtins, "__import__", _tracking_import)
 
-    kompress_compressor._is_onnx_available()
+    kc._is_onnx_available()
 
     assert attempted == [], f"probe imported the ML stack: {attempted}"
 
@@ -119,12 +127,12 @@ def test_onnx_probe_result_unchanged_with_ml_stack_installed(
 ) -> None:
     """Probe still reports availability when onnxruntime+transformers are importable."""
     import importlib.machinery
-
-    from headroom.transforms import kompress_compressor
+    import sys
+    import types
 
     for name in ("onnxruntime", "transformers"):
         stub = types.ModuleType(name)
         stub.__spec__ = importlib.machinery.ModuleSpec(name, loader=None)
         monkeypatch.setitem(sys.modules, name, stub)
 
-    assert kompress_compressor._is_onnx_available() is True
+    assert kc._is_onnx_available() is True

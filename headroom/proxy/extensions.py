@@ -18,6 +18,30 @@ Each ``install`` callable is invoked with the FastAPI ``app`` and the
 OSS makes no assumptions about what extensions do. The interface is
 deliberately minimal; extensions own the complexity behind it.
 
+Failing closed
+--------------
+
+The default above is right when an extension is a *feature*: a broken optional
+plugin must not stop the proxy. It is wrong when an extension is the thing
+standing between the client and an upstream it is not allowed to reach
+unauthenticated — an extension that mints the upstream credential, for example.
+Skipping it there does not disable a feature, it changes who can call the
+upstream.
+
+Such an extension declares itself by setting ``fail_closed`` on its
+``install`` callable::
+
+    def install(app, config):
+        ...
+
+    install.fail_closed = True  # a failed install aborts proxy startup
+
+``install_all`` then lets the exception out instead of logging and continuing,
+so ``create_app`` fails and the process exits (uvicorn refuses to serve). The
+marker is read off the loaded callable, so it costs the extension one line and
+core no per-name allowlist. Everything not marked keeps the skip-and-continue
+behaviour.
+
 Where extension middleware sits
 -------------------------------
 
@@ -111,7 +135,19 @@ ENTRY_POINT_GROUP = "headroom.proxy_extension"
 ENV_VAR = "HEADROOM_PROXY_EXTENSIONS"
 
 ProxyExtension = Callable[[Any, Any], None]
-"""Signature: ``install(app: FastAPI, config: ProxyConfig) -> None``."""
+"""Signature: ``install(app: FastAPI, config: ProxyConfig) -> None``.
+
+Set ``install.fail_closed = True`` to make a failed install abort startup
+instead of disabling the extension (see "Failing closed" above).
+"""
+
+#: Attribute an ``install`` callable sets to opt into aborting startup on failure.
+FAIL_CLOSED_ATTR = "fail_closed"
+
+
+def _is_fail_closed(install: ProxyExtension) -> bool:
+    """True when ``install`` declares that its failure must abort startup."""
+    return bool(getattr(install, FAIL_CLOSED_ATTR, False))
 
 
 def discover() -> Iterator[tuple[str, ProxyExtension]]:
@@ -120,7 +156,8 @@ def discover() -> Iterator[tuple[str, ProxyExtension]]:
     Entry-point load failures are logged and skipped — a broken third-party
     package must not prevent the proxy from starting. An extension that fails
     its environment/auth check raises from ``install()``; ``install_all`` logs
-    and skips it, so it is disabled rather than aborting startup.
+    and skips it, so it is disabled rather than aborting startup — unless the
+    extension marks itself ``fail_closed`` (see the module docstring).
     """
     try:
         entries = importlib.metadata.entry_points(group=ENTRY_POINT_GROUP)
@@ -175,7 +212,11 @@ def install_all(
     Returns the names of successfully installed extensions. If an extension
     raises inside ``install()`` it is logged, skipped, and recorded as failed —
     a single broken extension is disabled rather than aborting proxy startup for
-    every other extension.
+    every other extension. The exception is an extension marked ``fail_closed``
+    (see the module docstring): its failure is re-raised, so startup stops.
+
+    Raises:
+        RuntimeError: when a ``fail_closed`` extension's ``install()`` raised.
     """
     enabled_set = _resolve_enabled(enabled)
     discovered = list(discover())
@@ -208,6 +249,14 @@ def install_all(
         try:
             install(app, config)
         except Exception as exc:  # noqa: BLE001 — one bad extension must not brick the proxy
+            if _is_fail_closed(install):
+                # The extension is the proxy's upstream auth (or equivalent):
+                # running without it would serve requests it was meant to
+                # refuse, so a skip is not a smaller failure than no start.
+                raise RuntimeError(
+                    f"proxy extension {name!r} failed to install and is marked "
+                    f"fail_closed, so the proxy will not start: {exc}"
+                ) from exc
             # A failing extension disables *itself* and the proxy keeps running
             # without it — covers environment/auth failures and compatibility
             # errors (e.g. a plugin built against a core API this version lacks).

@@ -32,4 +32,5 @@ Environment variables (no-op unless `HEADROOM_OAUTH2_TOKEN_URL` is set):
 
 - **Effective backends**: the injected bearer reaches the upstream only for OpenAI-compatible / passthrough litellm providers. `bedrock` / `vertex` / `sagemaker` authenticate from env and ignore it — the extension is a no-op there (it logs a warning at startup).
 - **Transport**: `token_url` must be `https` (loopback `http` allowed for tests; set `HEADROOM_OAUTH2_ALLOW_INSECURE=1` to override).
+- **Startup**: an invalid config makes the proxy refuse to start rather than run without the middleware and relay the client's own `Authorization` upstream.
 - **TLS**: tokens are minted with the standard library (`urllib`, system cert store), so a corporate-injected CA is trusted without bundling roots — this works behind corporate SSL-inspection where bundled-root TLS stacks fail.
