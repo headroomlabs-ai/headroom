@@ -16,10 +16,11 @@
 # changed, so one alert closing while another reopens is still reported);
 # otherwise it does nothing. The marker holds only the counts, and the time of
 # the record is the public timestamp of the issue or comment carrying it, so
-# nothing in the issue identifies an alert. The marker in the issue body is
-# trusted (the issue is found by its week marker and the security label, which
-# only collaborators can set); in comments only those by TRIAGE_BOT_LOGIN
-# count, so a reader cannot silence an update by commenting.
+# nothing in the issue identifies an alert. Only an issue opened by
+# TRIAGE_BOT_LOGIN counts as the week's issue, and only markers it wrote (the
+# issue body and its own comments) are read, so nobody else can silence an
+# update by opening an issue or commenting. If the bot identity changes, the
+# week gets a new issue rather than reusing one opened under the old identity.
 #
 # Env: REPO (owner/name), TRIAGE_ASSIGNEE (login). TRIAGE_BOT_LOGIN (default
 # github-actions[bot], the GITHUB_TOKEN identity) is the author whose comments
@@ -54,14 +55,15 @@ JQ
 # the last marker in the issue body or a bot comment, or nothing.
 last_state_jq=$(cat <<'JQ'
 .[0] as $issue
-| ([$issue] + ((.[1:] | add // []) | map(select(.user.login == $bot))))
-| map({at: .created_at, s: ((.body // "") | capture("<!-- codeql-triage-state:(?<s>c[0-9]+-h[0-9]+) -->") | .s)})
+| ([$issue] + (.[1:] | add // []))
+| map(select(.user.login == $bot) | {at: .created_at, s: ((.body // "") | capture("<!-- codeql-triage-state:(?<s>c[0-9]+-h[0-9]+) -->") | .s)})
 | last // empty
 | "\(.s) \(.at)"
 JQ
 )
 week_issue_jq=$(cat <<'JQ'
-.[] | select(.pull_request | not) | select((.body // "") | contains($marker)) | .number
+.[] | select(.pull_request | not) | select(.user.login == $bot)
+    | select((.body // "") | contains($marker)) | .number
 JQ
 )
 
@@ -79,7 +81,7 @@ link="https://github.com/$REPO/security/code-scanning?query=is%3Aopen+severity%3
 # Listing, not search: the search index lags, so an issue created seconds ago
 # by the previous run could be missed. state=all so a closed issue counts.
 existing="$(gh api --paginate "repos/$REPO/issues?state=all&labels=security&per_page=100" \
-  | jq -r --arg marker "$marker" "$week_issue_jq" | head -n 1)"
+  | jq -r --arg marker "$marker" --arg bot "$bot" "$week_issue_jq" | head -n 1)"
 
 if [ -n "$existing" ]; then
   # Read both before parsing, so a failed request stops the run instead of

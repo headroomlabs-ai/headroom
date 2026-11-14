@@ -310,13 +310,23 @@ def test_one_alert_closing_while_another_reopens_is_reported(harness):
     assert "critical 0, high 1" in comment["body"]
 
 
-def test_body_marker_counts_whoever_authored_the_issue(harness):
+def test_an_issue_opened_by_someone_else_is_not_trusted(harness):
     set_alerts, state, edit_issue, run = harness
     set_alerts(_alert(1))
-    run("2026-10-05")
-    edit_issue(1, user={"login": "previous-bot-identity"})
+    run("2026-09-28")  # issue 1, an earlier week
+    # Turn it into a lookalike for this week, written by someone else, whose
+    # recorded counts match the open alerts.
+    edit_issue(
+        1,
+        user={"login": "someone"},
+        body="<!-- codeql-triage:2026-W41 -->\n<!-- codeql-triage-state:c0-h1 -->",
+        created_at="2026-10-05T13:00:00Z",
+    )
 
-    result = run("2026-10-06")  # unchanged alerts
+    run("2026-10-06")
 
-    assert state()["issues"][0]["comments"] == []
-    assert "Nothing to do" in result.stdout
+    issues = state()["issues"]
+    assert issues[0]["comments"] == []
+    assert len(issues) == 2  # the bot opened its own issue for the week
+    assert issues[1]["user"]["login"] == "github-actions[bot]"
+    assert "<!-- codeql-triage:2026-W41 -->" in issues[1]["body"]
