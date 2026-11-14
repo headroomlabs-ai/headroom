@@ -791,14 +791,14 @@ class HierarchicalMemory:
     async def get_user_memories(
         self,
         user_id: str,
-        limit: int = 100,
+        limit: int | None = 100,
         include_sessions: bool = True,
     ) -> list[Memory]:
         """Get all memories for a user.
 
         Args:
             user_id: User identifier.
-            limit: Maximum memories to return.
+            limit: Maximum memories to return, or None for all matching memories.
             include_sessions: If True, include session-level memories.
                             If False, only return user-level memories.
 
