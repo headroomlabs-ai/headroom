@@ -71,13 +71,14 @@ source "$ENV_TXT"; set +a
 # ── 4. plugin license (Ed25519, offline, wildcard) ────────────────────────────
 # HEADROOM_LICENSE + HEADROOM_LICENSE_PUBKEY. Core and every plugin read the same
 # HEADROOM_LICENSE; the banner says "LICENSED (usage reporting off)" unless
-# HEADROOM_USAGE_REPORTING=1 is also set. Fallback: skip verification entirely.
+# HEADROOM_USAGE_REPORTING=1 is also set. Licence variables already exported in
+# the calling shell are kept.
 if [ -f "$PLUGINS_ENV" ]; then
   set -a; # shellcheck disable=SC1090
   source "$PLUGINS_ENV"; set +a
-else
-  echo "▶ $PLUGINS_ENV missing — using dev license bypass"
-  export HEADROOM_LICENSE_DEV=1
+elif [ -z "${HEADROOM_LICENSE:-}" ]; then
+  echo "!! $PLUGINS_ENV not found and HEADROOM_LICENSE is not set: the plugins need a licence"
+  exit 1
 fi
 
 # ── 5. Kompress ML offload → Modal ────────────────────────────────────────────
