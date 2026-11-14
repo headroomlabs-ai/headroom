@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.2.0
+
+- A misconfigured `install()` now stops the proxy instead of being skipped by
+  the extension loader. With `oauth2` enabled and a bad config, the proxy starts
+  without `OAuth2Middleware` -- so the client's own `Authorization` was relayed
+  upstream -- while `SPEC.md` promised it "fails closed". The extension now sets
+  `install.fail_closed = True`, which makes the loader abort startup (#4737).
+  Needs a headroom-ai core that honours the marker; older cores keep the
+  previous behaviour.
+- Tests cover the real `install_all` seam, not just `install()` raising.
+
 ## 0.1.1
 
 - Inject the upstream bearer only on requests that go upstream. Local routes
