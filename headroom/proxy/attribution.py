@@ -79,10 +79,6 @@ LABELS_HEADER_MAX_LENGTH: Final[int] = MAX_DIMENSIONS * (
     DIMENSION_NAME_MAX_LENGTH + len("=") + 3 * LABEL_MAX_LENGTH
 ) + (MAX_DIMENSIONS - 1) * len("; ")
 
-#: Environment variable ``headroom wrap`` reads labels from, in the same
-#: ``name=value; name=value`` form; also accepts commas as separators.
-LABELS_ENV_VAR: Final[str] = "HEADROOM_LABELS"
-
 #: In ``HEADROOM_ATTRIBUTION_DIMENSIONS``, accept every label a client sends in
 #: ``X-Headroom-Labels`` as its own dimension, not only the listed ones. Off by
 #: default: each new dimension is persisted state, so an operator opts in.
@@ -703,7 +699,6 @@ __all__ = [
     "AttributionRequest",
     "DIMENSION_NAME_MAX_LENGTH",
     "EMPTY_ATTRIBUTION",
-    "LABELS_ENV_VAR",
     "LABELS_HEADER",
     "LABELS_HEADER_MAX_LENGTH",
     "LABEL_MAX_LENGTH",
