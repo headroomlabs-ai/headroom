@@ -305,6 +305,52 @@ def test_configured_chat_backend_retains_its_operator_extras() -> None:
     assert handler.captured_request is None
 
 
+@pytest.mark.parametrize("handle", ["handle_openai_chat", "handle_openai_responses"])
+def test_the_base_url_override_is_resolved_once_per_request(
+    handle: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The destination and the extra-header trust check must come from one lookup.
+
+    The first lookup of the client's host answers with a private address and
+    every later one with a public address. When the handler resolved the header
+    more than once, the trust check saw "no override" while the destination was
+    the client's host, so operator extras were sent there.
+    """
+    import socket
+
+    from headroom.proxy import upstream_guard
+
+    monkeypatch.delenv("HEADROOM_ALLOWED_BASE_URLS", raising=False)
+    calls: list[str] = []
+
+    def changing_answer(host: str, *args: object, **kwargs: object) -> list[object]:
+        calls.append(host)
+        address = "10.0.0.5" if len(calls) == 1 else "93.184.216.34"
+        return [(None, None, None, None, (address, 443))]
+
+    monkeypatch.setattr(socket, "getaddrinfo", changing_answer)
+    upstream_guard.clear_validated_addresses()
+
+    handler = _ChatHandler()
+    handler.config.openai_extra_headers = dict(_SENTINEL_ONLY_EXTRAS)
+    body: dict[str, Any] = {"model": "gpt-4o-mini"}
+    if handle == "handle_openai_chat":
+        body["messages"] = [{"role": "user", "content": "hello"}]
+    else:
+        body["input"] = "hello"
+    request = _build_request(
+        body,
+        {**_OPENAI_CLIENT_HEADERS, "x-headroom-base-url": "https://changing.example/v1"},
+        path="/v1/chat/completions" if handle == "handle_openai_chat" else "/v1/responses",
+    )
+    anyio.run(getattr(handler, handle), request)
+
+    assert calls == ["changing.example"], f"the override was resolved {len(calls)} times"
+    if handler.captured_request is not None:
+        outbound = _outbound(handler.captured_request)
+        assert "changing.example" not in outbound.url, outbound.url
+
+
 def _run_image_chat(monkeypatch: pytest.MonkeyPatch, *, expire_pins: bool) -> dict[str, list[Any]]:
     """Send an image chat request to a client-chosen gateway; record guard activity.
 

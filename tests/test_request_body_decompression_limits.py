@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import gzip
 import io
+import sys
 import tracemalloc
 import zlib
 
@@ -409,3 +410,86 @@ async def test_reader_ignores_an_untrustworthy_content_length(small_raw_cap: int
     request = _Request(oversized, "", headers={"content-length": "not-a-number"})
     with pytest.raises(_helpers().RequestBodyTooLarge):
         await _helpers()._read_request_body_bytes(request)
+
+
+# ───────────────── brotli: output bounded per step, not per input slice ─────
+
+
+class _FakeBrotliDecompressor:
+    """Mimics brotli>=1.2.0 ``Decompressor`` output limiting without the package.
+
+    Each non-empty input slice "expands" to ``EXPANSION`` zero bytes. With
+    ``output_buffer_limit`` the surplus stays pending inside the decompressor
+    (``can_accept_more_data()`` is False until drained); without it the whole
+    expansion is returned at once, which is the bomb.
+    """
+
+    EXPANSION = 64 * MB
+
+    def __init__(self) -> None:
+        self.pending = 0
+
+    def process(self, data: bytes, output_buffer_limit: int | None = None) -> bytes:
+        self.pending += self.EXPANSION if data else 0
+        n = self.pending if output_buffer_limit is None else min(self.pending, output_buffer_limit)
+        self.pending -= n
+        return b"\x00" * n
+
+    def can_accept_more_data(self) -> bool:
+        return self.pending == 0
+
+    def is_finished(self) -> bool:
+        return self.pending == 0
+
+
+def test_brotli_step_output_is_bounded(monkeypatch, small_cap: int) -> None:
+    """One input slice that expands far past the cap must not be materialized."""
+    import types
+
+    monkeypatch.setitem(
+        sys.modules, "brotli", types.SimpleNamespace(Decompressor=_FakeBrotliDecompressor)
+    )
+    tracemalloc.start()
+    try:
+        tracemalloc.reset_peak()
+        with pytest.raises(_helpers().RequestBodyTooLarge):
+            _helpers()._brotli_bounded(b"x" * 100)
+        _, peak = tracemalloc.get_traced_memory()
+    finally:
+        tracemalloc.stop()
+    assert peak < 8 * MB, f"peak {peak / MB:.1f}MB suggests one slice was fully expanded"
+
+
+def test_brotli_without_output_limit_fails_closed(monkeypatch) -> None:
+    import types
+
+    class _Old:
+        def process(self, data: bytes) -> bytes:
+            return data
+
+    monkeypatch.setitem(sys.modules, "brotli", types.SimpleNamespace(Decompressor=_Old))
+    with pytest.raises(ValueError, match="brotli>=1.2.0"):
+        _helpers()._brotli_bounded(b"x")
+
+
+class _FakeBrotliAcceptingWhilePending(_FakeBrotliDecompressor):
+    """Real brotli 1.2 reports it can accept input once all input is consumed,
+    even while limited output is still pending; the rest comes from empty
+    ``process(b"")`` calls."""
+
+    EXPANSION = 3 * 1024 * 1024 + 123
+
+    def can_accept_more_data(self) -> bool:
+        return True
+
+
+def test_brotli_drains_output_pending_after_the_last_slice(monkeypatch) -> None:
+    import types
+
+    monkeypatch.setitem(
+        sys.modules,
+        "brotli",
+        types.SimpleNamespace(Decompressor=_FakeBrotliAcceptingWhilePending),
+    )
+    out = _helpers()._brotli_bounded(b"x")
+    assert len(out) == _FakeBrotliAcceptingWhilePending.EXPANSION
