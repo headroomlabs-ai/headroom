@@ -3,6 +3,8 @@ from __future__ import annotations
 import logging
 from typing import Any
 
+import pytest
+
 from headroom.proxy import extensions
 
 
@@ -44,6 +46,56 @@ def test_install_all_warns_for_missing_requested_extension(caplog, monkeypatch) 
 
     assert installed == []
     assert "proxy extensions requested but not found: missing_ext" in caplog.text
+
+
+def test_install_all_aborts_startup_when_fail_closed_extension_fails(
+    monkeypatch,
+) -> None:
+    """A ``fail_closed`` extension's failure must stop startup, not be skipped.
+
+    Skipping an extension that mints the upstream credential would leave the
+    proxy serving with the client's own ``Authorization`` relayed upstream
+    (issue #4737). Every other extension keeps the skip-and-continue default,
+    including the ones installed before the failing one.
+    """
+
+    def auth_ext(app: Any, config: Any) -> None:
+        raise RuntimeError("headroom-oauth2 misconfigured: token_url must be https")
+
+    auth_ext.fail_closed = True  # type: ignore[attr-defined]
+
+    def good(app: Any, config: Any) -> None:
+        raise AssertionError("must not install extensions after a fatal one")
+
+    monkeypatch.setattr(
+        extensions,
+        "discover",
+        lambda: iter([("oauth2", auth_ext), ("good_ext", good)]),
+    )
+
+    with pytest.raises(RuntimeError) as excinfo:
+        extensions.install_all(object(), object(), enabled=["oauth2", "good_ext"])
+
+    assert "'oauth2'" in str(excinfo.value)
+    assert "fail_closed" in str(excinfo.value)
+    # The plugin's own message survives as the cause, so the operator sees why.
+    assert "token_url must be https" in str(excinfo.value.__cause__)
+
+
+def test_install_all_skips_fail_closed_extension_when_it_succeeds(
+    monkeypatch,
+) -> None:
+    """The marker only changes the failure path — a healthy install is unaffected."""
+    calls: list[str] = []
+
+    def auth_ext(app: Any, config: Any) -> None:
+        calls.append("auth")
+
+    auth_ext.fail_closed = True  # type: ignore[attr-defined]
+    monkeypatch.setattr(extensions, "discover", lambda: iter([("oauth2", auth_ext)]))
+
+    assert extensions.install_all(object(), object(), enabled=["oauth2"]) == ["oauth2"]
+    assert calls == ["auth"]
 
 
 class _Capture(logging.Handler):
