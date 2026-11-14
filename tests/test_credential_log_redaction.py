@@ -161,8 +161,14 @@ def test_uvicorn_access_log_drops_query_values() -> None:
 
     async def run() -> None:
         task = asyncio.create_task(server.serve())
-        while not server.started:
-            await asyncio.sleep(0.02)
+
+        async def started() -> None:
+            while not server.started:
+                if task.done():  # e.g. the port could not be bound
+                    pytest.fail(f"uvicorn stopped before starting: {task.exception()!r}")
+                await asyncio.sleep(0.02)
+
+        await asyncio.wait_for(started(), timeout=10)
         handler = _Lines()
         access.addHandler(handler)
         try:
