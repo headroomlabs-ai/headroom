@@ -131,6 +131,15 @@ def test_open_labels_keep_an_extension_dimension_reserved():
         unregister_dimension("region")
 
 
+@pytest.mark.parametrize("where", ["first", "last"])
+def test_the_labels_switch_does_not_take_a_dimension_slot(where):
+    names = [f"d{i}" for i in range(attribution.MAX_DIMENSIONS)]
+    spec = ",".join(["labels", *names] if where == "first" else [*names, "labels"])
+    selected = parse_dimension_spec(spec, ())
+    assert attribution.OPEN_LABELS_TOKEN in selected
+    assert [n for n in selected if n != attribution.OPEN_LABELS_TOKEN] == names
+
+
 def test_spec_words_are_never_dimension_names():
     request = _req({"X-Headroom-Labels": "default=a; none=b; labels=c; team=infra"})
     assert resolve_attribution(request, ["labels"]) == {"team": "infra"}

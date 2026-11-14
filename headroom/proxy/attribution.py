@@ -308,13 +308,17 @@ def _parse_spec(
             continue
         selected.append(name)
     ordered = [name for name in dict.fromkeys(selected) if name not in removed]
-    if len(ordered) > MAX_DIMENSIONS:
+    # ``labels`` is a switch, not a dimension, so it never takes one of the slots.
+    names = [name for name in ordered if name != OPEN_LABELS_TOKEN]
+    if len(names) > MAX_DIMENSIONS:
         logger.warning(
             "attribution: %d dimensions configured, keeping the first %d",
-            len(ordered),
+            len(names),
             MAX_DIMENSIONS,
         )
-    return tuple(ordered[:MAX_DIMENSIONS]), frozenset(removed)
+        kept = set(names[:MAX_DIMENSIONS])
+        ordered = [name for name in ordered if name == OPEN_LABELS_TOKEN or name in kept]
+    return tuple(ordered), frozenset(removed)
 
 
 def parse_dimension_spec(spec: str | None, defaults: Iterable[str]) -> tuple[str, ...]:
