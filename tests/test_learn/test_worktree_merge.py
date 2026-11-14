@@ -24,6 +24,7 @@ def _repo_with_worktree(base: Path) -> tuple[Path, Path]:
     gitdir = main / ".git" / "worktrees" / "san-salvador"
     gitdir.mkdir(parents=True)
     (gitdir / "commondir").write_text("../..\n")
+    (gitdir / "gitdir").write_text(f"{worktree / '.git'}\n")
     worktree.mkdir(parents=True)
     (worktree / ".git").write_text(f"gitdir: {gitdir}\n")
     return main, worktree
@@ -149,3 +150,29 @@ def test_a_session_started_in_a_worktree_subfolder_records_the_checkout(tmp_path
 
     assert project.project_path == main
     assert project.worktree_paths == [worktree / "src", worktree]
+
+
+def test_main_worktree_root_ignores_pointers_outside_gits_worktree_layout(
+    tmp_path: Path,
+) -> None:
+    base = tmp_path.resolve()
+    elsewhere = base / "elsewhere" / ".git"
+    elsewhere.mkdir(parents=True)
+    (elsewhere / "commondir").write_text(".\n")
+    (elsewhere / "gitdir").write_text(f"{base / 'checkout' / '.git'}\n")
+    checkout = base / "checkout"
+    checkout.mkdir()
+    (checkout / ".git").write_text(f"gitdir: {elsewhere}\n")
+
+    assert _main_worktree_root(checkout) is None
+
+
+def test_main_worktree_root_needs_the_admin_dir_to_point_back(tmp_path: Path) -> None:
+    base = tmp_path.resolve()
+    main, worktree = _repo_with_worktree(base)
+    other = base / "other"
+    other.mkdir()
+    (other / ".git").write_text(f"gitdir: {main / '.git' / 'worktrees' / 'san-salvador'}\n")
+
+    assert _main_worktree_root(worktree) == main
+    assert _main_worktree_root(other) is None
