@@ -733,14 +733,14 @@ class TestContinuationFallbacks:
 
 class TestStreamingMemoryFallbacks:
     @pytest.mark.asyncio
-    async def test_client_handled_memory_calls_still_run_without_server_tools(self) -> None:
+    async def test_memory_calls_the_proxy_did_not_inject_are_left_to_the_client(self) -> None:
         raw = _sse([TEXT, SAVE], "tool_use")
         proxy = _proxy([raw], SAVE_RESULT)
         proxy.memory_handler.has_memory_tool_calls = MagicMock(return_value=True)
         events = await _client_view(proxy)
 
         assert events == _events(raw)
-        proxy.memory_handler.handle_memory_tool_calls.assert_awaited_once()
+        proxy.memory_handler.handle_memory_tool_calls.assert_not_awaited()
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize("server_tools", [MEMORY_TOOLS, frozenset()])
@@ -777,7 +777,7 @@ class TestStreamingMemoryFallbacks:
 
 class TestServerMemoryToolNames:
     def test_injected_memory_tools_are_server_side(self) -> None:
-        from headroom.proxy.handlers.anthropic import AnthropicHandlerMixin
+        from headroom.proxy.memory_handler import server_memory_tool_names
 
         tools = [
             {"name": "Bash"},
@@ -787,18 +787,16 @@ class TestServerMemoryToolNames:
             {"type": "web_search"},
             "not-a-tool",
         ]
-        names = AnthropicHandlerMixin._server_memory_tool_names(tools, [{"name": "Bash"}])
+        names = server_memory_tool_names(tools, [{"name": "Bash"}])
         assert names == frozenset({"memory_save", "memory_search", "memory"})
 
     def test_client_declared_memory_tool_stays_with_the_client(self) -> None:
-        from headroom.proxy.handlers.anthropic import AnthropicHandlerMixin
+        from headroom.proxy.memory_handler import server_memory_tool_names
 
         tools = [{"name": "memory_save"}, {"name": "memory_search"}]
-        names = AnthropicHandlerMixin._server_memory_tool_names(
-            tools, [{"name": "memory_save"}, "junk"]
-        )
+        names = server_memory_tool_names(tools, [{"name": "memory_save"}, "junk"])
         assert names == frozenset({"memory_search"})
-        assert AnthropicHandlerMixin._server_memory_tool_names(None, None) == frozenset()
+        assert server_memory_tool_names(None, None) == frozenset()
 
 
 class TestHandlerPassesServerMemoryTools:

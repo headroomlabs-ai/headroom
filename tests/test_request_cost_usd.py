@@ -238,7 +238,7 @@ def test_stats_recent_requests_includes_cost_usd(monkeypatch) -> None:
         monkeypatch.setattr(proxy.cost_tracker, "estimate_cost", lambda **_: 0.0135)
         # recent_requests is served only to loopback callers; TestClient's peer
         # host is "testclient", so force the loopback branch (not under test).
-        monkeypatch.setattr("headroom.proxy.server._request_is_loopback", lambda request: True)
+        monkeypatch.setattr("headroom.proxy.server._request_is_loopback", lambda request, **_: True)
         proxy.logger._logs.append(_sample_log())
 
         resp = client.get("/stats")
@@ -257,7 +257,7 @@ def test_stats_recent_requests_carry_turn_id_beyond_raw_log_tail(monkeypatch) ->
     with TestClient(app) as client:
         proxy = client.app.state.proxy
         monkeypatch.setattr(proxy.cost_tracker, "estimate_cost", lambda **_: 0.001)
-        monkeypatch.setattr("headroom.proxy.server._request_is_loopback", lambda request: True)
+        monkeypatch.setattr("headroom.proxy.server._request_is_loopback", lambda request, **_: True)
         for i in range(20):
             proxy.logger._logs.append(_sample_log(f"hr_test_{i:06d}", turn_id=f"turn_{i // 4}"))
 
