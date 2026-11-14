@@ -333,6 +333,19 @@ def register_modelled_factors(level: int, conservative: float, optimistic: float
     MODELLED_REDUCTION[level] = (conservative, optimistic)
 
 
+def _shaped_level(labels: Any) -> int | None:
+    """The verbosity level a request was shaped at, or ``None`` if it was not."""
+    for label in labels or ():
+        text = str(label)
+        if not text.startswith(_SHAPED_LABEL_PREFIX + "L"):
+            continue
+        try:
+            return int(text[len(_SHAPED_LABEL_PREFIX) + 1 :])
+        except ValueError:
+            continue
+    return None
+
+
 def modelled_request_savings(labels: Any, output_tokens: int) -> tuple[int, int]:
     """Output tokens one shaped request saved, from its level's benchmark factors.
 
@@ -341,22 +354,14 @@ def modelled_request_savings(labels: Any, output_tokens: int) -> tuple[int, int]
     already shaped, so ``saved = observed * r / (1 - r)``. ``(0, 0)`` when the
     request was not shaped or its level has no registered factors.
     """
-    if output_tokens <= 0:
+    level = _shaped_level(labels)
+    if output_tokens <= 0 or level is None:
         return 0, 0
-    for label in labels or ():
-        text = str(label)
-        if not text.startswith(_SHAPED_LABEL_PREFIX + "L"):
-            continue
-        try:
-            level = int(text[len(_SHAPED_LABEL_PREFIX) + 1 :])
-        except ValueError:
-            continue
-        factors = MODELLED_REDUCTION.get(level)
-        if factors is None:
-            return 0, 0
-        low, high = (int(round(output_tokens * r / (1.0 - r))) for r in factors)
-        return low, high
-    return 0, 0
+    factors = MODELLED_REDUCTION.get(level)
+    if factors is None:
+        return 0, 0
+    low, high = (int(round(output_tokens * r / (1.0 - r))) for r in factors)
+    return low, high
 
 
 @dataclass
@@ -862,16 +867,22 @@ class SavingsRecorder:
         ``output_shaper:verbosity:L<n>`` label is the proof, as in
         :meth:`record_from_labels`. A holdout (control) request saved nothing.
 
-        The tier follows :meth:`best_estimate`'s rule for the whole ledger:
-        benchmark factors are used ONLY while this deployment has neither a
-        learned baseline nor a running holdout. Otherwise a request books the
-        baseline point estimate for its stratum (both ends equal), or nothing
-        where its stratum has no baseline -- never a mix of baseline and
-        factor requests under one label. With no factors registered (plain
-        OSS) the factor path is ``(0, 0)``.
+        The tier is whatever :meth:`SavingsLedger.best_estimate` picks for the
+        request's level, so the lifetime dollars always come from the same
+        tier the dashboard's percentage does:
+
+        * measured -> the holdout reduction ``p`` applied to this request,
+          ``observed * p / (1 - p)``, low = high;
+        * estimated -> the learned baseline for this request's stratum,
+          low = high (0 where the stratum has no baseline);
+        * modelled -> the level's benchmark factors, a low-high band.
+
+        With no factors registered (plain OSS) the modelled tier never
+        appears, so nothing changes there.
         """
         label_strings = [str(label) for label in labels or ()]
-        if not any(text.startswith(_SHAPED_LABEL_PREFIX) for text in label_strings):
+        level = _shaped_level(label_strings)
+        if level is None:
             return 0, 0
         key = None
         for text in label_strings:
@@ -882,16 +893,20 @@ class SavingsRecorder:
             if arm != "treatment":
                 return 0, 0
             break
+        n = 0
+        mean = 0.0
         with self._lock:
-            has_counterfactual = self._ledger.baseline.total_samples > 0 or bool(
-                self._ledger.control
-            )
-            if has_counterfactual:
-                if key is None:
-                    return 0, 0
+            tier = self._ledger.best_estimate(level)
+            if tier.kind == "estimated" and key is not None:
                 mean, _var, n = self._ledger.baseline.lookup(key)
-        if not has_counterfactual:
+        if tier.kind == "modelled":
             return modelled_request_savings(label_strings, output_tokens)
+        if tier.kind == "measured":
+            reduction = tier.pct / 100.0
+            if not 0.0 < reduction < 1.0 or output_tokens <= 0:
+                return 0, 0
+            point = int(round(output_tokens * reduction / (1.0 - reduction)))
+            return point, point
         point = max(0, int(round(mean - output_tokens))) if n > 0 else 0
         return point, point
 

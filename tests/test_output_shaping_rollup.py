@@ -100,9 +100,40 @@ def l4_factors(monkeypatch):
 def test_shaped_request_without_a_baseline_is_priced_from_its_level_factors(tmp_path, l4_factors):
     rec = SavingsRecorder(str(tmp_path / "o.json"), flush_every=1)
     labels = [stratum_label("treatment", _key()), "output_shaper:verbosity:L4"]
+    rec.record_from_labels(labels, 800)  # the funnel records before it estimates
 
     # Observed output is already shaped: saved = 800 * r / (1 - r).
     assert rec.request_savings_range(labels, 800) == (200, 800)
+
+
+def test_a_holdout_too_small_to_report_keeps_the_factor_tier(tmp_path, l4_factors):
+    """Same tier as the dashboard: one control observation does not make the
+    holdout the headline, so the request stays on the modelled band."""
+    rec = SavingsRecorder(str(tmp_path / "o.json"), flush_every=1)
+    key = _key()
+    shaped = [stratum_label("treatment", key), "output_shaper:verbosity:L4"]
+    rec.record_from_labels(shaped, 800)
+    rec.record_from_labels([stratum_label("control", key)], 1000)
+
+    assert rec._ledger.best_estimate(4).kind == "modelled"
+    assert rec.request_savings_range(shaped, 800) == (200, 800)
+
+
+def test_a_measured_tier_books_its_own_reduction_per_request(tmp_path, l4_factors, monkeypatch):
+    rec = SavingsRecorder(str(tmp_path / "o.json"), flush_every=1)
+    measured = output_savings.SavingsEstimate(
+        tokens_saved=1.0,
+        baseline_tokens=5.0,
+        pct=20.0,
+        ci_low_pct=15.0,
+        ci_high_pct=25.0,
+        n_requests=100,
+        kind="measured",
+    )
+    monkeypatch.setattr(rec._ledger, "best_estimate", lambda level=None: measured)
+    shaped = [stratum_label("treatment", _key()), "output_shaper:verbosity:L4"]
+
+    assert rec.request_savings_range(shaped, 800) == (200, 200)
 
 
 def test_baseline_and_holdout_outrank_the_factors(tmp_path, l4_factors):
@@ -172,6 +203,7 @@ def test_factors_are_not_booked_once_the_deployment_has_a_baseline(tmp_path, l4_
         rec._ledger.baseline.observe(other, 1000)
 
     labels = [stratum_label("treatment", _key()), "output_shaper:verbosity:L4"]
+    rec.record_from_labels(labels, 800)
     low, high = rec.request_savings_range(labels, 800)
     assert low == high  # a baseline point estimate, never the factor band
 
