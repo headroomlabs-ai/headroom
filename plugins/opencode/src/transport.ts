@@ -189,7 +189,9 @@ function injectOptionsEnv(args: unknown[], optionIndex: number, state: Transport
     existing.windowsHide = true;
   }
 
-  if (isOptions(nextArgs[optionIndex])) {
+  // An explicit undefined/null in the options slot is replaced, not pushed
+  // right: inserting would move the callback past Node's last parameter.
+  if (isOptions(nextArgs[optionIndex]) || (nextArgs[optionIndex] == null && optionIndex < nextArgs.length)) {
     nextArgs[optionIndex] = existing;
   } else {
     nextArgs.splice(optionIndex, 0, existing);
@@ -201,13 +203,21 @@ function injectOptionsEnv(args: unknown[], optionIndex: number, state: Transport
   return nextArgs;
 }
 
+// Node takes (file, args?, options?, callback?) where args and options may each
+// be omitted, undefined or null, so `spawn(cmd, undefined, opts)` keeps its
+// options in the third slot.
+function optionsIndexAfterArgs(args: unknown[]): number {
+  const params = typeof args.at(-1) === "function" ? args.slice(0, -1) : args;
+  return Array.isArray(params[1]) || (params.length > 2 && params[1] == null) ? 2 : 1;
+}
+
 function wrapSpawn(originalSpawn: ChildSpawn): ChildSpawn {
   return function headroomSpawn(this: unknown, ...args: unknown[]) {
     const state = getState();
     if (!state) {
       return Reflect.apply(originalSpawn, this, args);
     }
-    const optionIndex = Array.isArray(args[1]) ? 2 : 1;
+    const optionIndex = optionsIndexAfterArgs(args);
     return Reflect.apply(originalSpawn, this, injectOptionsEnv(args, optionIndex, state));
   } as ChildSpawn;
 }
@@ -228,7 +238,7 @@ function wrapExecFile(originalExecFile: ChildExecFile): ChildExecFile {
     if (!state) {
       return Reflect.apply(originalExecFile, this, args);
     }
-    const optionIndex = Array.isArray(args[1]) ? 2 : 1;
+    const optionIndex = optionsIndexAfterArgs(args);
     return Reflect.apply(originalExecFile, this, injectOptionsEnv(args, optionIndex, state));
   } as ChildExecFile;
 }
@@ -239,7 +249,7 @@ function wrapFork(originalFork: ChildFork): ChildFork {
     if (!state) {
       return Reflect.apply(originalFork, this, args);
     }
-    const optionIndex = Array.isArray(args[1]) ? 2 : 1;
+    const optionIndex = optionsIndexAfterArgs(args);
     return Reflect.apply(originalFork, this, injectOptionsEnv(args, optionIndex, state));
   } as ChildFork;
 }

@@ -100,7 +100,7 @@ function injectOptionsEnv(args, optionIndex, state) {
   if (process.platform === "win32" && existing.windowsHide === void 0) {
     existing.windowsHide = true;
   }
-  if (isOptions(nextArgs[optionIndex])) {
+  if (isOptions(nextArgs[optionIndex]) || nextArgs[optionIndex] == null && optionIndex < nextArgs.length) {
     nextArgs[optionIndex] = existing;
   } else {
     nextArgs.splice(optionIndex, 0, existing);
@@ -110,13 +110,17 @@ function injectOptionsEnv(args, optionIndex, state) {
   }
   return nextArgs;
 }
+function optionsIndexAfterArgs(args) {
+  const params = typeof args.at(-1) === "function" ? args.slice(0, -1) : args;
+  return Array.isArray(params[1]) || params.length > 2 && params[1] == null ? 2 : 1;
+}
 function wrapSpawn(originalSpawn) {
   return function headroomSpawn(...args) {
     const state = getState();
     if (!state) {
       return Reflect.apply(originalSpawn, this, args);
     }
-    const optionIndex = Array.isArray(args[1]) ? 2 : 1;
+    const optionIndex = optionsIndexAfterArgs(args);
     return Reflect.apply(originalSpawn, this, injectOptionsEnv(args, optionIndex, state));
   };
 }
@@ -135,7 +139,7 @@ function wrapExecFile(originalExecFile) {
     if (!state) {
       return Reflect.apply(originalExecFile, this, args);
     }
-    const optionIndex = Array.isArray(args[1]) ? 2 : 1;
+    const optionIndex = optionsIndexAfterArgs(args);
     return Reflect.apply(originalExecFile, this, injectOptionsEnv(args, optionIndex, state));
   };
 }
@@ -145,7 +149,7 @@ function wrapFork(originalFork) {
     if (!state) {
       return Reflect.apply(originalFork, this, args);
     }
-    const optionIndex = Array.isArray(args[1]) ? 2 : 1;
+    const optionIndex = optionsIndexAfterArgs(args);
     return Reflect.apply(originalFork, this, injectOptionsEnv(args, optionIndex, state));
   };
 }
