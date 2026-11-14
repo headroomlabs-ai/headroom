@@ -303,3 +303,150 @@ def test_configured_chat_backend_retains_its_operator_extras() -> None:
     assert headers["x-operator-sentinel"] == _SENTINEL_VALUE
     assert headers["authorization"] == _OPERATOR_KEY
     assert handler.captured_request is None
+
+
+@pytest.mark.parametrize("handle", ["handle_openai_chat", "handle_openai_responses"])
+def test_the_base_url_override_is_resolved_once_per_request(
+    handle: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The destination and the extra-header trust check must come from one lookup.
+
+    The first lookup of the client's host answers with a private address and
+    every later one with a public address. When the handler resolved the header
+    more than once, the trust check saw "no override" while the destination was
+    the client's host, so operator extras were sent there.
+    """
+    import socket
+
+    from headroom.proxy import upstream_guard
+
+    monkeypatch.delenv("HEADROOM_ALLOWED_BASE_URLS", raising=False)
+    calls: list[str] = []
+
+    def changing_answer(host: str, *args: object, **kwargs: object) -> list[object]:
+        calls.append(host)
+        address = "10.0.0.5" if len(calls) == 1 else "93.184.216.34"
+        return [(None, None, None, None, (address, 443))]
+
+    monkeypatch.setattr(socket, "getaddrinfo", changing_answer)
+    upstream_guard.clear_validated_addresses()
+
+    handler = _ChatHandler()
+    handler.config.openai_extra_headers = dict(_SENTINEL_ONLY_EXTRAS)
+    body: dict[str, Any] = {"model": "gpt-4o-mini"}
+    if handle == "handle_openai_chat":
+        body["messages"] = [{"role": "user", "content": "hello"}]
+    else:
+        body["input"] = "hello"
+    request = _build_request(
+        body,
+        {**_OPENAI_CLIENT_HEADERS, "x-headroom-base-url": "https://changing.example/v1"},
+        path="/v1/chat/completions" if handle == "handle_openai_chat" else "/v1/responses",
+    )
+    anyio.run(getattr(handler, handle), request)
+
+    assert calls == ["changing.example"], f"the override was resolved {len(calls)} times"
+    if handler.captured_request is not None:
+        outbound = _outbound(handler.captured_request)
+        assert "changing.example" not in outbound.url, outbound.url
+
+
+def _run_image_chat(monkeypatch: pytest.MonkeyPatch, *, expire_pins: bool) -> dict[str, list[Any]]:
+    """Send an image chat request to a client-chosen gateway; record guard activity.
+
+    The stub image compression optionally ages every pin in the request's scope
+    past its deadline, standing in for a compression that outlasts the pin.
+    """
+    import asyncio
+    import socket
+
+    from headroom.proxy import upstream_guard
+
+    monkeypatch.delenv("HEADROOM_ALLOWED_BASE_URLS", raising=False)
+    seen: dict[str, list[Any]] = {"lookups": [], "guard_on_loop": [], "pin_at_send": []}
+
+    def _public(host: str, *a: object, **k: object) -> list[object]:
+        seen["lookups"].append(host)
+        return [(None, None, None, None, ("93.184.216.34", 443))]
+
+    real_guard = upstream_guard.is_safe_upstream_url
+
+    def _recording_guard(url: str, **kwargs: Any) -> bool:
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError:
+            seen["guard_on_loop"].append(False)
+        else:
+            seen["guard_on_loop"].append(True)
+        return real_guard(url, **kwargs)
+
+    monkeypatch.setattr(socket, "getaddrinfo", _public)
+    monkeypatch.setattr(upstream_guard, "is_safe_upstream_url", _recording_guard)
+    upstream_guard.clear_validated_addresses()
+
+    class _Compressor:
+        def has_images(self, messages: object) -> bool:
+            return True
+
+        def close(self) -> None:
+            return None
+
+    async def _compression(messages: Any, **kwargs: Any) -> tuple[Any, None]:
+        if expire_pins:
+            scope = upstream_guard._PIN_SCOPE.get() or {}
+            for host, pin in list(scope.items()):
+                scope[host] = upstream_guard.UpstreamPin(pin.addresses, 0.0)
+        return messages, None
+
+    monkeypatch.setattr("headroom.proxy.helpers._get_image_compressor", lambda: _Compressor())
+    monkeypatch.setattr(
+        "headroom.proxy.handlers.openai.run_image_compression_isolated", _compression
+    )
+
+    class _Handler(_ChatHandler):
+        async def _retry_request(self, method: str, url: str, headers: dict, body: dict, **kwargs):  # noqa: ANN201
+            seen["pin_at_send"].append(upstream_guard.guarded_pin("gateway.example"))
+            return await super()._retry_request(method, url, headers, body, **kwargs)
+
+    handler = _Handler()
+    handler.config.image_optimize = True
+    request = _build_request(
+        {
+            "model": "gpt-4o",
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": "what is this"},
+                        {"type": "image_url", "image_url": {"url": "data:image/png;base64,AAAA"}},
+                    ],
+                }
+            ],
+        },
+        {**_OPENAI_CLIENT_HEADERS, "x-headroom-base-url": "https://gateway.example/v1"},
+        path="/v1/chat/completions",
+    )
+    anyio.run(handler.handle_openai_chat, request)
+    return seen
+
+
+def test_a_long_image_compression_does_not_leave_an_expired_pin(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A pin that lapsed during image compression is renewed off the event loop."""
+    seen = _run_image_chat(monkeypatch, expire_pins=True)
+
+    assert seen["pin_at_send"], "the request was not sent"
+    pin = seen["pin_at_send"][0]
+    assert pin is not None and not pin.is_expired(), "the connection would find an expired pin"
+    assert seen["guard_on_loop"][-1] is False, "the renewal ran on the event-loop thread"
+
+
+def test_a_still_valid_pin_is_not_checked_again_after_image_compression(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A second lookup is only needed once the pin lapsed; it could fail a valid request."""
+    seen = _run_image_chat(monkeypatch, expire_pins=False)
+
+    assert seen["pin_at_send"], "the request was not sent"
+    assert seen["lookups"] == ["gateway.example"], seen["lookups"]
