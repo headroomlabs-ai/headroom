@@ -640,3 +640,23 @@ def test_session_turns_do_not_accumulate_cache_control_markers() -> None:
             assert _count_message_markers(returned) == 1, (turn, _count_message_markers(returned))
         # Precondition: compression rewrote tool results, so replay was live.
         assert saved > 0
+
+
+def test_session_turns_add_no_marker_the_caller_did_not_send() -> None:
+    # A caller that sends no breakpoint has chosen not to cache. The returned
+    # body is forwarded as-is, so a marker added here bills a cache write the
+    # caller never asked for.
+    with _make_client() as client:
+        for turn in range(1, 4):
+            messages = _anthropic_turns(turn)
+            del messages[-1]["content"][-1]["cache_control"]
+            resp = client.post(
+                "/v1/compress",
+                json={
+                    "model": "claude-sonnet-5",
+                    "messages": messages,
+                    "config": {"session_id": "markers-none"},
+                },
+            )
+            assert resp.status_code == 200, resp.text
+            assert _count_message_markers(resp.json()["messages"]) == 0, turn
