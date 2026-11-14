@@ -1155,6 +1155,10 @@ class SavingsTracker:
         # message-only while per-model dollars did not.
         tool_search_saved: int = 0,
         output_tokens_saved: int = 0,
+        # High end of a modelled output-savings range (benchmark factors give a
+        # band, not a point); ``None`` means the saving is a point estimate and
+        # the high end equals ``output_tokens_saved``. Lifetime-only.
+        output_tokens_saved_high: int | None = None,
         # Tokens the model actually emitted, DISJOINT from
         # ``output_tokens_saved`` (which counts the ones it did not). Priced
         # into ``lifetime["total_output_cost_usd"]``; see the delta below.
@@ -1188,6 +1192,11 @@ class SavingsTracker:
         delta_tool_tokens_saved = max(_coerce_int(tool_search_saved), 0)
         delta_input_tokens = _coerce_int(input_tokens)
         delta_output_tokens_saved = max(_coerce_int(output_tokens_saved), 0)
+        delta_output_tokens_saved_high = (
+            delta_output_tokens_saved
+            if output_tokens_saved_high is None
+            else max(_coerce_int(output_tokens_saved_high), delta_output_tokens_saved)
+        )
         delta_output_tokens = max(_coerce_int(output_tokens), 0)
         delta_cache_read_tokens = _coerce_int(cache_read_tokens)
         priced = estimated_savings_usd
@@ -1251,6 +1260,12 @@ class SavingsTracker:
             max(_coerce_float(priced.get("output_shaping")), 0.0)
             if priced is not None
             else _estimate_output_savings_usd(model, delta_output_tokens_saved)
+        )
+        # Same per-token rate as the low end, so the band is in tokens only.
+        delta_output_savings_usd_high = (
+            delta_output_savings_usd * delta_output_tokens_saved_high / delta_output_tokens_saved
+            if delta_output_tokens_saved > 0
+            else _estimate_output_savings_usd(model, delta_output_tokens_saved_high)
         )
         # Completion spend. ``total_input_cost_usd`` has never had an output
         # counterpart, so anything answering "what share of my bill did
@@ -1341,6 +1356,23 @@ class SavingsTracker:
             )
             lifetime["output_savings_usd"] = round(
                 lifetime.get("output_savings_usd", 0.0) + delta_output_savings_usd,
+                6,
+            )
+            # The high end of the output-savings range. Lazy keys: a lifetime
+            # written before ranges existed reads its high end as its low end.
+            lifetime["output_tokens_saved_high"] = (
+                lifetime.get(
+                    "output_tokens_saved_high",
+                    lifetime["output_tokens_saved"] - delta_output_tokens_saved,
+                )
+                + delta_output_tokens_saved_high
+            )
+            lifetime["output_savings_usd_high"] = round(
+                lifetime.get(
+                    "output_savings_usd_high",
+                    lifetime["output_savings_usd"] - delta_output_savings_usd,
+                )
+                + delta_output_savings_usd_high,
                 6,
             )
             lifetime["tool_tokens_saved"] += delta_tool_tokens_saved
@@ -1923,6 +1955,8 @@ class SavingsTracker:
         is_v6_lifetime = False
         lifetime_output_tokens_saved = 0
         lifetime_output_savings_usd = 0.0
+        lifetime_output_tokens_saved_high: int | None = None
+        lifetime_output_savings_usd_high: float | None = None
         lifetime_output_tokens = 0
         lifetime_output_cost_usd = 0.0
         if isinstance(lifetime_raw, dict):
@@ -1944,6 +1978,14 @@ class SavingsTracker:
                 lifetime_basis = str(lifetime_raw.get("savings_basis") or BASIS_UNKNOWN)
             lifetime_output_tokens_saved = _coerce_int(lifetime_raw.get("output_tokens_saved"))
             lifetime_output_savings_usd = _coerce_float(lifetime_raw.get("output_savings_usd"))
+            if "output_tokens_saved_high" in lifetime_raw:
+                lifetime_output_tokens_saved_high = _coerce_int(
+                    lifetime_raw.get("output_tokens_saved_high")
+                )
+            if "output_savings_usd_high" in lifetime_raw:
+                lifetime_output_savings_usd_high = _coerce_float(
+                    lifetime_raw.get("output_savings_usd_high")
+                )
             lifetime_output_tokens = _coerce_int(lifetime_raw.get("output_tokens"))
             lifetime_output_cost_usd = _coerce_float(lifetime_raw.get("total_output_cost_usd"))
 
@@ -2044,6 +2086,14 @@ class SavingsTracker:
                 "total_input_cost_usd": round(lifetime_input_cost_usd, 6),
                 "output_tokens_saved": lifetime_output_tokens_saved,
                 "output_savings_usd": round(lifetime_output_savings_usd, 6),
+                # A high end below the low end can only come from the history
+                # repair above raising the low end; never let the band invert.
+                "output_tokens_saved_high": max(
+                    lifetime_output_tokens_saved_high or 0, lifetime_output_tokens_saved
+                ),
+                "output_savings_usd_high": round(
+                    max(lifetime_output_savings_usd_high or 0.0, lifetime_output_savings_usd), 6
+                ),
                 "output_tokens": lifetime_output_tokens,
                 "total_output_cost_usd": round(lifetime_output_cost_usd, 6),
             },

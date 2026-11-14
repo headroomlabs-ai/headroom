@@ -333,6 +333,32 @@ def register_modelled_factors(level: int, conservative: float, optimistic: float
     MODELLED_REDUCTION[level] = (conservative, optimistic)
 
 
+def modelled_request_savings(labels: Any, output_tokens: int) -> tuple[int, int]:
+    """Output tokens one shaped request saved, from its level's benchmark factors.
+
+    ``(low, high)`` at the conservative and optimistic factor, using the same
+    inversion as :meth:`SavingsLedger.estimate_from_model`: observed output is
+    already shaped, so ``saved = observed * r / (1 - r)``. ``(0, 0)`` when the
+    request was not shaped or its level has no registered factors.
+    """
+    if output_tokens <= 0:
+        return 0, 0
+    for label in labels or ():
+        text = str(label)
+        if not text.startswith(_SHAPED_LABEL_PREFIX + "L"):
+            continue
+        try:
+            level = int(text[len(_SHAPED_LABEL_PREFIX) + 1 :])
+        except ValueError:
+            return 0, 0
+        factors = MODELLED_REDUCTION.get(level)
+        if factors is None:
+            return 0, 0
+        low, high = (int(round(output_tokens * r / (1.0 - r))) for r in factors)
+        return low, high
+    return 0, 0
+
+
 @dataclass
 class SavingsEstimate:
     """Result of an estimation pass."""
@@ -827,6 +853,32 @@ class SavingsRecorder:
                 mean, _var, n = self._ledger.baseline.lookup(key)
             return max(0, int(round(mean - output_tokens))) if n > 0 else 0
         return 0
+
+    def request_savings_range(self, labels: Any, output_tokens: int) -> tuple[int, int]:
+        """Per-request output tokens saved as ``(low, high)``, for the rollup.
+
+        The synthetic control wins where it exists: a treatment request whose
+        stratum has a learned baseline gets that point estimate at both ends,
+        and a holdout (control) request saved nothing. Only a shaped request
+        with no baseline of its own falls back to the benchmark factors
+        registered for its level -- the modelled tier, priced per request so
+        it reaches the dollar totals. With no factors registered (plain OSS)
+        that fallback is ``(0, 0)``, exactly as before.
+        """
+        for label in labels or ():
+            parsed = parse_stratum_label(str(label))
+            if parsed is None:
+                continue
+            arm, key = parsed
+            if arm != "treatment":
+                return 0, 0
+            with self._lock:
+                mean, _var, n = self._ledger.baseline.lookup(key)
+            if n > 0:
+                point = max(0, int(round(mean - output_tokens)))
+                return point, point
+            break
+        return modelled_request_savings(labels, output_tokens)
 
     def _reload_baseline_locked(self) -> None:
         """Adopt the on-disk baseline written by ``learn --verbosity --apply``.
