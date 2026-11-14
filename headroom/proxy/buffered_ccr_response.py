@@ -124,8 +124,17 @@ OPENAI_ERROR_FORMAT = BufferedCCRErrorFormat(
     json_body=lambda message: json.dumps(
         {"error": {"message": message, "type": "server_error", "code": "proxy_error"}}
     ).encode(),
+    # The Responses API addresses its stream events by a top-level ``type``
+    # discriminator, so an error frame has to carry one. Without it a client
+    # parsing the stream as Responses events cannot tell this frame from a
+    # malformed event and reports the parse failure instead of the error --
+    # Zed, for one, logs "missing field `type`" and fails the whole turn.
+    # ``event: error`` plus a top-level ``type`` matches the Anthropic twin
+    # below and the frame OpenAI itself documents.
     sse_event=lambda error_type, message: (
-        "data: " + json.dumps({"error": {"message": message, "type": error_type}}) + "\n\n"
+        "event: error\ndata: "
+        + json.dumps({"type": "error", "error": {"type": error_type, "message": message}})
+        + "\n\n"
     ).encode(),
     error_type_for_status=_openai_error_type,
     # OpenAI has no ping event; an SSE comment keeps the socket warm without
