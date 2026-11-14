@@ -9,7 +9,14 @@ from types import SimpleNamespace
 import pytest
 
 from headroom.proxy import memory_handler as memory_handler_module
-from headroom.proxy.memory_handler import MemoryConfig, MemoryHandler
+from headroom.proxy.memory_handler import (
+    MEMORY_TOOL_NAMES,
+    NATIVE_MEMORY_TOOL_NAME,
+    MemoryConfig,
+    MemoryHandler,
+)
+
+ALL_MEMORY_TOOLS = frozenset(MEMORY_TOOL_NAMES | {NATIVE_MEMORY_TOOL_NAME})
 
 
 @pytest.fixture
@@ -1268,6 +1275,7 @@ async def test_search_and_format_context_and_handle_memory_tool_calls(
         },
         "u1",
         "anthropic",
+        tool_names=ALL_MEMORY_TOOLS,
     )
     assert anthropic_results == [
         {
@@ -1299,6 +1307,7 @@ async def test_search_and_format_context_and_handle_memory_tool_calls(
         },
         "u1",
         "openai",
+        tool_names=ALL_MEMORY_TOOLS,
     )
     assert openai_results == [
         {
@@ -1326,6 +1335,7 @@ async def test_search_and_format_context_and_handle_memory_tool_calls(
         },
         "u1",
         "openai",
+        tool_names=ALL_MEMORY_TOOLS,
     )
     assert skipped == []
 
@@ -1705,6 +1715,7 @@ async def test_extract_tool_calls_and_handle_tool_calls_parse_edges(
         },
         "u1",
         "openai",
+        tool_names=ALL_MEMORY_TOOLS,
     )
     assert results == [{"role": "tool", "tool_call_id": "fc1", "content": "ok:memory_search:{}"}]
 
