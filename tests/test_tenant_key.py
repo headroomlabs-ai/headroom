@@ -39,6 +39,16 @@ def _request(
     return SimpleNamespace(headers=headers or {}, state=state)
 
 
+def _is_valid_key(key: str) -> bool:
+    """True when ``key`` matches the documented output charset and cap.
+
+    Keys flow into the TOIN store under a ``|`` separator, so any
+    character outside ``[A-Za-z0-9_-]`` (or a length over 64) would break
+    the store's key-splitting contract.
+    """
+    return 0 < len(key) <= 64 and all(ch.isascii() and (ch.isalnum() or ch in "-_") for ch in key)
+
+
 # ── Header path ───────────────────────────────────────────────────────
 
 
@@ -72,11 +82,21 @@ def test_header_path_default_name_is_x_headroom_tenant_id() -> None:
     assert DEFAULT_TENANT_KEY_HEADER == "X-Headroom-Tenant-ID"
 
 
-def test_header_path_falls_through_when_empty_after_sanitization() -> None:
-    """Pure-non-allowed header (e.g. all unicode) ⇒ fall through, NOT header source."""
-    # All-emoji header sanitizes to empty string — neither header
-    # so we drop to the global fallback.
+def test_header_path_with_no_allowed_chars_stays_isolated() -> None:
+    """Pure-non-ASCII header (e.g. all emoji) is digested, not pooled globally."""
+    # Falling through to "global" would merge this tenant with every other
+    # tenant that has no header at all, which is the cross-tenant leak this
+    # module exists to prevent.
     req = _request(headers={"X-Headroom-Tenant-ID": "🦀🚀"})
+    tenant_key, source = resolve_tenant_key(req)
+    assert source == SOURCE_HEADER
+    assert tenant_key != GLOBAL_TENANT_KEY
+    assert tenant_key.startswith("tnt-tenant-")
+
+
+def test_header_path_falls_through_when_header_is_blank() -> None:
+    """A blank header carries no tenant signal ⇒ global fallback."""
+    req = _request(headers={"X-Headroom-Tenant-ID": "   "})
     tenant_key, source = resolve_tenant_key(req)
     assert source == SOURCE_GLOBAL
     assert tenant_key == GLOBAL_TENANT_KEY
@@ -175,44 +195,53 @@ def test_sanitization_allows_hyphens_and_underscores() -> None:
 
 
 def test_sanitization_drops_control_chars() -> None:
-    """Control chars (``\\x00`` / ``\\x1f``) get stripped."""
+    """Control chars (``\\x00`` / ``\\x1f``) get stripped, key stays unique."""
     req = _request(headers={"X-Headroom-Tenant-ID": "ten\x00ant\x1f1"})
     tenant_key, source = resolve_tenant_key(req)
-    assert tenant_key == "tenant1"
+    assert tenant_key.startswith("tnt-tenant1-")
+    assert _is_valid_key(tenant_key)
     assert source == SOURCE_HEADER
 
 
 def test_sanitization_drops_tab_and_newline() -> None:
-    """Whitespace (``\\t`` / ``\\n``) gets stripped."""
+    """Whitespace inside the value (``\\t`` / ``\\n``) gets stripped."""
     req = _request(headers={"X-Headroom-Tenant-ID": "tenant\t\n1"})
     tenant_key, source = resolve_tenant_key(req)
-    assert tenant_key == "tenant1"
+    assert tenant_key.startswith("tnt-tenant1-")
+    assert _is_valid_key(tenant_key)
     assert source == SOURCE_HEADER
 
 
 def test_sanitization_drops_punctuation() -> None:
-    """`|`, `:`, `.`, `,`, `/` stripped (TOIN store-key separator safety)."""
+    """`|`, `:`, `.`, `,`, `/` never reach the key (TOIN separator safety)."""
     req = _request(headers={"X-Headroom-Tenant-ID": "ten|ant:1.0/x"})
     tenant_key, source = resolve_tenant_key(req)
-    assert tenant_key == "tenant10x"
+    assert tenant_key.startswith("tnt-tenant10x-")
+    assert _is_valid_key(tenant_key)
     assert source == SOURCE_HEADER
 
 
-def test_sanitization_drops_unicode_falls_through_when_pure_unicode() -> None:
-    """Pure-unicode header (CJK / emoji) sanitizes to empty ⇒ falls through."""
+def test_sanitization_keeps_pure_unicode_tenant_isolated() -> None:
+    """Pure-unicode header (CJK / emoji) is digested, NOT pooled into global.
+
+    Falling through to the shared ``"global"`` namespace would merge every
+    such tenant into one pool — the exact cross-tenant leak this module
+    prevents.
+    """
     req = _request(headers={"X-Headroom-Tenant-ID": "测试テスト"})
-    _, source = resolve_tenant_key(req)
-    # No header source — sanitized to empty, dropped to global.
-    assert source == SOURCE_GLOBAL
+    tenant_key, source = resolve_tenant_key(req)
+    assert source == SOURCE_HEADER
+    assert tenant_key.startswith("tnt-tenant-")
+    assert _is_valid_key(tenant_key)
 
 
 def test_sanitization_truncates_at_64_chars() -> None:
-    """Headers > 64 ASCII alphanum chars are TRUNCATED, not rejected."""
-    raw = "a" * 100
-    req = _request(headers={"X-Headroom-Tenant-ID": raw})
+    """Headers longer than 64 chars stay within the cap and stay unique."""
+    req = _request(headers={"X-Headroom-Tenant-ID": "a" * 100})
     tenant_key, source = resolve_tenant_key(req)
-    assert tenant_key == "a" * 64
     assert len(tenant_key) == 64
+    assert tenant_key.startswith("tnt-" + "a" * 43 + "-")
+    assert _is_valid_key(tenant_key)
     assert source == SOURCE_HEADER
 
 
@@ -224,18 +253,174 @@ def test_sanitization_empty_header_falls_through() -> None:
 
 
 def test_sanitization_whitespace_only_falls_through() -> None:
-    """Whitespace-only header ⇒ sanitizes to empty ⇒ falls through."""
+    """ASCII whitespace-only header ⇒ sanitizes to empty ⇒ falls through."""
     req = _request(headers={"X-Headroom-Tenant-ID": "  \t\n  "})
     _, source = resolve_tenant_key(req)
     assert source == SOURCE_GLOBAL
 
 
+# ── Unicode whitespace (review finding, GH #4788) ─────────────────────
+
+
+@pytest.mark.parametrize("nb_ws", ["\u00a0", "\u2003", "\u3000"])
+def test_unicode_whitespace_is_not_stripped_away(nb_ws: str) -> None:
+    """Unicode whitespace must count as a disallowed char, not vanish.
+
+    ``str.strip()`` trims every Unicode space, so an NBSP-prefixed
+    ``\\u00a0acme`` used to strip to ``acme`` and share that tenant's pool,
+    while a header of NBSP alone stripped to empty and fell through to the
+    shared ``"global"`` pool. Both are cross-tenant leaks.
+    """
+    prefixed, source = resolve_tenant_key(
+        _request(headers={"X-Headroom-Tenant-ID": nb_ws + "acme"})
+    )
+    bare = resolve_tenant_key(_request(headers={"X-Headroom-Tenant-ID": "acme"}))[0]
+    assert prefixed != bare
+    assert source == SOURCE_HEADER
+    assert _is_valid_key(prefixed)
+
+
+def test_unicode_whitespace_only_stays_isolated() -> None:
+    """A single Unicode space is a tenant signal, not a blank header."""
+    tenant_key, source = resolve_tenant_key(_request(headers={"X-Headroom-Tenant-ID": "\u00a0"}))
+    assert source == SOURCE_HEADER
+    assert tenant_key != GLOBAL_TENANT_KEY
+    assert _is_valid_key(tenant_key)
+
+
+def test_ascii_padding_still_strips_before_classifying() -> None:
+    """ASCII surrounding whitespace is trimmed, so ids are not needlessly rekeyed."""
+    assert resolve_tenant_key(_request(headers={"X-Headroom-Tenant-ID": "  acme  "}))[0] == "acme"
+
+
 def test_sanitization_mixed_unicode_and_ascii_preserves_ascii() -> None:
-    """``cust_我_42`` sanitizes to ``cust__42`` (ASCII chars survive)."""
+    """``cust_我_42`` keeps the ASCII prefix and digests the raw value."""
     req = _request(headers={"X-Headroom-Tenant-ID": "cust_我_42"})
     tenant_key, source = resolve_tenant_key(req)
-    assert tenant_key == "cust__42"
+    assert tenant_key.startswith("tnt-cust__42-")
+    assert _is_valid_key(tenant_key)
     assert source == SOURCE_HEADER
+
+
+# ── Collision resistance (GH #4782) ───────────────────────────────────
+
+
+def test_conforming_ids_keep_their_pre_digest_key() -> None:
+    """The fix must not rekey tenants that were already safe.
+
+    Rekeying them would split their stored TOIN data for no isolation
+    gain — they never collided.
+    """
+    for raw in ("cust_abc123", "Cust42TenantA", "cust_a-b_c-9", "a" * 64):
+        req = _request(headers={"X-Headroom-Tenant-ID": raw})
+        assert resolve_tenant_key(req)[0] == raw
+
+
+@pytest.mark.parametrize(
+    ("left", "right"),
+    [
+        # Punctuation-only differences.
+        ("acme.corp", "acmecorp"),
+        ("ten|ant:1.0/x", "tenant10x"),
+        ("alice@corp.com", "alicecorp.com"),
+        ("alice@corp.com", "alice.corp@com"),
+        ("alicecorp.com", "alice.corp@com"),
+        # Over-long ids that share a 64-char prefix.
+        ("a" * 64 + "X", "a" * 64 + "Y"),
+        ("a" * 64 + "X", "a" * 100),
+        # Non-ASCII ids that used to collapse to the shared global pool.
+        ("東京", "大阪"),
+        # Entities that differ only by stripped characters.
+        ("cust_我_42", "cust_42"),
+    ],
+)
+def test_distinct_raw_ids_never_share_a_key(left: str, right: str) -> None:
+    """Two distinct tenant ids must not land in one TOIN pool."""
+    left_key, left_source = resolve_tenant_key(_request(headers={"X-Headroom-Tenant-ID": left}))
+    right_key, right_source = resolve_tenant_key(_request(headers={"X-Headroom-Tenant-ID": right}))
+    assert left_key != right_key
+    assert left_source == right_source == SOURCE_HEADER
+    assert _is_valid_key(left_key) and _is_valid_key(right_key)
+
+
+def test_digested_keys_are_stable_across_calls() -> None:
+    """The same raw id resolves to the same key every time."""
+    req = _request(headers={"X-Headroom-Tenant-ID": "alice@corp.com"})
+    assert resolve_tenant_key(req)[0] == resolve_tenant_key(req)[0]
+
+
+def test_digested_keys_never_exceed_the_length_cap() -> None:
+    """Both sanitization forms respect ``_MAX_TENANT_KEY_LEN``."""
+    for raw in ("x" * 500, "a" * 100 + ".corp", "東" * 200):
+        key, source = resolve_tenant_key(_request(headers={"X-Headroom-Tenant-ID": raw}))
+        assert source == SOURCE_HEADER
+        assert 0 < len(key) <= 64
+        assert _is_valid_key(key)
+
+
+# ── Verbatim / digested sub-spaces must stay disjoint ─────────────────
+
+
+def test_a_digested_key_is_not_itself_a_verbatim_key() -> None:
+    """Feeding a digested key back in must not return it unchanged.
+
+    The verbatim path is the identity function on conforming ids, and
+    every digested key is conforming, so without the reserved marker a
+    tenant could send another tenant's digested key as its own header and
+    be handed that tenant's TOIN pool.
+    """
+    derived = resolve_tenant_key(_request(headers={"X-Headroom-Tenant-ID": "acme.corp"}))[0]
+    replayed = resolve_tenant_key(_request(headers={"X-Headroom-Tenant-ID": derived}))[0]
+    assert replayed != derived
+
+
+@pytest.mark.parametrize(
+    "raw",
+    [
+        "acme.corp",
+        "alice@corp.com",
+        "a" * 100,
+        "東" * 20,
+        "global",
+        "tnt-acme-80a1d5cc623b165f",
+    ],
+)
+def test_no_raw_id_maps_to_another_raw_ids_key(raw: str) -> None:
+    """A key is never a landing spot for a *different* raw id.
+
+    Cross-checks a batch of raw ids against a batch of derived keys so a
+    future change to the marker or digest length cannot silently reopen
+    the overlap.
+    """
+    others = ["acme.corp", "alice@corp.com", "a" * 100, "東" * 20, "global", "cust_42"]
+    raw_key = resolve_tenant_key(_request(headers={"X-Headroom-Tenant-ID": raw}))[0]
+    for other in others:
+        if other == raw:
+            continue
+        other_key = resolve_tenant_key(_request(headers={"X-Headroom-Tenant-ID": other}))[0]
+        assert raw_key != other_key
+        # A *digested* key must not resolve to itself when sent as its own
+        # header, or the tenant it was derived for could be impersonated.
+        # Verbatim keys legitimately are their own raw id, so skip those.
+        if other_key.startswith("tnt-"):
+            replayed = resolve_tenant_key(_request(headers={"X-Headroom-Tenant-ID": other_key}))[0]
+            assert replayed != other_key
+
+
+def test_tenant_literally_named_global_does_not_join_the_global_pool() -> None:
+    """``global`` is a reserved namespace, not a claimable tenant id."""
+    key, source = resolve_tenant_key(_request(headers={"X-Headroom-Tenant-ID": "global"}))
+    assert source == SOURCE_HEADER
+    assert key != GLOBAL_TENANT_KEY
+
+
+def test_marker_prefixed_ids_without_a_digest_stay_verbatim() -> None:
+    """An ordinary id may start with the marker; only the digested shape reroutes.
+
+    Keeps the marker from rekeying ids that merely begin with ``tnt-``.
+    """
+    req = _request(headers={"X-Headroom-Tenant-ID": "tnt-billing"})
+    assert resolve_tenant_key(req)[0] == "tnt-billing"
 
 
 # ── ContextVar surface ────────────────────────────────────────────────

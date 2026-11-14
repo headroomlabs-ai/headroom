@@ -110,6 +110,15 @@ MAX_QUERY_PATTERN_LENGTH: Final[int] = 512
 # name with no `|`; sig_hash is hex).
 _AGG_KEY_SEPARATOR: Final[str] = "|"
 
+# Storage layout version. ``2.0`` keyed every pool by the tenant key as it
+# arrived, so a legal id could own a key that the digested form of a
+# *different* id later produces (``tnt-<prefix>-<digest>``). ``3.0`` adds the
+# upgrade purge in :meth:`ToolIntelligenceNetwork.import_patterns`: pools
+# living in the digested sub-space of an older file are dropped instead of
+# being handed to whichever tenant now maps there.
+_TOIN_STORE_VERSION: Final[str] = "3.0"
+_LAST_VERSION_WITHOUT_DIGEST_SUBSPACE: Final[str] = "2.0"
+
 # ── Tenant-key default (PR-F3) ──────────────────────────────────────────
 # When callers haven't plumbed real tenant-id detection (CLI / batch
 # jobs / unauthenticated dev) we land in the literal `"global"` slice.
@@ -205,6 +214,21 @@ def get_default_toin_storage_path() -> str:
 # LOW FIX #22: Define callback types for metrics/monitoring hooks
 # These allow users to plug in their own metrics collection (Prometheus, StatsD, etc.)
 MetricsCallback = Callable[[str, dict[str, Any]], None]  # (event_name, event_data) -> None
+
+
+def _in_digested_tenant_subspace(tenant_key: str) -> bool:
+    """True when ``tenant_key`` is a shape only a digested tenant id produces.
+
+    Imported lazily for the same reason as
+    :func:`_get_current_tenant_key_or_default`: TOIN ships where the proxy
+    package does not exist. There, digested keys cannot be generated either,
+    so an unimportable module means "not a digested key".
+    """
+    try:
+        from headroom.proxy.tenant_key import _in_digested_subspace as _in_subspace
+    except ImportError:
+        return False
+    return _in_subspace(tenant_key)
 
 
 def _get_current_tenant_key_or_default() -> str:
@@ -1402,7 +1426,7 @@ class ToolIntelligenceNetwork:
         """
         with self._lock:
             return {
-                "version": "2.0",  # PR-B5: tuple aggregation key
+                "version": _TOIN_STORE_VERSION,
                 "export_timestamp": time.time(),
                 "instance_id": self._instance_id,
                 "patterns": {
@@ -1428,6 +1452,17 @@ class ToolIntelligenceNetwork:
 
         See ``_deserialize_pattern_key`` for the parsing tiers.
 
+        Upgrade isolation: a file written at or before
+        :data:`_LAST_VERSION_WITHOUT_DIGEST_SUBSPACE` stored the tenant
+        key exactly as it arrived, so a legal id could own a key that
+        :func:`headroom.proxy.tenant_key._sanitize_tenant_key` now derives
+        for a *different* id (``acme.corp`` and the literal id
+        ``tnt-acmecorp-80a1d5cc623b165f`` share one key). Loading that pool
+        would hand it to whichever tenant maps there now, so pools sitting
+        in the digested sub-space are dropped at the upgrade instead of
+        being reattributed. Everything else is imported unchanged, and the
+        purge runs once because the next save stamps the new version.
+
         Args:
             data: Exported pattern data.
         """
@@ -1436,8 +1471,13 @@ class ToolIntelligenceNetwork:
 
         patterns_data = data.get("patterns", {})
         source_instance = data.get("instance_id", "unknown")
+        pre_digest_store = data.get("version", "1.0") in (
+            "1.0",
+            _LAST_VERSION_WITHOUT_DIGEST_SUBSPACE,
+        )
 
         skipped = 0
+        purged = 0
         first_error: Exception | None = None
         with self._lock:
             for serialized_key, pattern_dict in patterns_data.items():
@@ -1447,6 +1487,12 @@ class ToolIntelligenceNetwork:
                 # the whole file) or leave a half-merged pattern behind.
                 try:
                     key = _deserialize_pattern_key(serialized_key)
+                    if pre_digest_store and _in_digested_tenant_subspace(key[0]):
+                        # Written before digested keys existed, so this pool
+                        # belongs to a literal id, not to the tenant whose
+                        # digest now produces that key.
+                        purged += 1
+                        continue
                     imported = ToolPattern.from_dict(pattern_dict)
                     self._sanitize_loaded_pattern(imported)
                     # Make sure dataclass fields agree with the dict key — pre-F3
@@ -1490,9 +1536,18 @@ class ToolIntelligenceNetwork:
                 extra={
                     "event": "toin_import_skipped",
                     "skipped": skipped,
-                    "imported": len(patterns_data) - skipped,
+                    "imported": len(patterns_data) - skipped - purged,
                     "error_type": type(first_error).__name__,
                     "error": str(first_error),
+                },
+            )
+
+        if purged:
+            logger.info(
+                "TOIN dropped pre-upgrade pools that now collide with digested tenant keys",
+                extra={
+                    "event": "toin_tenant_key_upgrade_purge",
+                    "purged": purged,
                 },
             )
 

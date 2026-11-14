@@ -350,6 +350,75 @@ def test_valid_store_loads_without_a_skip_warning(tmp_path, caplog) -> None:
     assert _skip_warnings(caplog) == []
 
 
+def test_pre_upgrade_pool_that_collides_with_a_digested_key_is_dropped(tmp_path, caplog) -> None:
+    """A v2 pool a legal id owned must not be handed to the tenant whose digest hits it.
+
+    Before the digested form existed, ``tnt-acmecorp-80a1d5cc623b165f`` was a
+    legitimate tenant id and owned that pool literally. ``acme.corp`` now
+    digests to exactly that key, so importing the old pool would merge one
+    tenant's learned patterns into another's.
+    """
+    path = tmp_path / "toin.json"
+    data = _saved_store(path, 1)
+    legacy_tenant = "tnt-acmecorp-80a1d5cc623b165f"
+    [entry] = data["patterns"].values()
+    [key] = data["patterns"]
+    _, auth_mode, model_family, sig_hash = key.split("|")
+    data["version"] = "2.0"
+    data["patterns"] = {f"{legacy_tenant}|{auth_mode}|{model_family}|{sig_hash}": entry}
+    path.write_text(json.dumps(data), encoding="utf-8")
+
+    with caplog.at_level(logging.INFO, logger="headroom.telemetry.toin"):
+        toin = ToolIntelligenceNetwork(TOINConfig(storage_path=str(path), auto_save_interval=0))
+
+    assert toin._patterns == {}
+    [purge] = [
+        r for r in caplog.records if getattr(r, "event", None) == "toin_tenant_key_upgrade_purge"
+    ]
+    assert purge.purged == 1
+
+    # Only the purged pool is gone when the next save rewrites the file.
+    toin.save()
+    assert json.loads(path.read_text(encoding="utf-8"))["version"] == "3.0"
+    assert json.loads(path.read_text(encoding="utf-8"))["patterns"] == {}
+
+
+def test_a_conforming_pool_survives_the_upgrade(tmp_path) -> None:
+    """The purge is scoped to the digested sub-space, not to v2 stores."""
+    path = tmp_path / "toin.json"
+    data = _saved_store(path, 3)
+    keys = list(data["patterns"])
+    assert all(key.startswith("global|") for key in keys)
+    data["version"] = "2.0"
+    path.write_text(json.dumps(data), encoding="utf-8")
+
+    toin = ToolIntelligenceNetwork(TOINConfig(storage_path=str(path), auto_save_interval=0))
+
+    assert len(toin._patterns) == 3
+
+
+def test_a_foreign_v3_store_keeps_its_digested_pools(caplog) -> None:
+    """A store already written at v3 wrote those keys deliberately."""
+    digest_key = "tnt-acmecorp-80a1d5cc623b165f"
+    toin = ToolIntelligenceNetwork(TOINConfig(storage_path="", auto_save_interval=0))
+    _record(toin, 0)
+    data = json.loads(json.dumps(toin.export_patterns()))
+    [entry] = data["patterns"].values()
+    [key] = data["patterns"]
+    _, auth_mode, model_family, sig_hash = key.split("|")
+    data["patterns"] = {f"{digest_key}|{auth_mode}|{model_family}|{sig_hash}": entry}
+    assert data["version"] == "3.0"
+
+    with caplog.at_level(logging.INFO, logger="headroom.telemetry.toin"):
+        fresh = ToolIntelligenceNetwork(TOINConfig(storage_path="", auto_save_interval=0))
+        fresh.import_patterns(data)
+
+    assert len(fresh._patterns) == 1
+    assert [
+        r for r in caplog.records if getattr(r, "event", None) == "toin_tenant_key_upgrade_purge"
+    ] == []
+
+
 def test_filesystem_backend_writes_compact_json(tmp_path) -> None:
     path = tmp_path / "toin.json"
     FileSystemTOINBackend(str(path)).save({"patterns": {"a": {"value": 1}}})

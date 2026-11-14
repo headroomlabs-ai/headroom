@@ -23,10 +23,9 @@ namespace grows by one component.
 The resolver uses an explicit tenant signal only:
 
 1. **Header** — when ``HEADROOM_TENANT_KEY_HEADER`` (default
-   ``X-Headroom-Tenant-ID``) is present and survives sanitization
-   (alphanumeric / ``-`` / ``_``, max 64 chars). Source: ``"header"``.
-   The customer's auth-proxy / sidecar is the canonical place to pin
-   tenancy — it knows the tenant best.
+   ``X-Headroom-Tenant-ID``) is present and survives sanitization.
+   Source: ``"header"``. The customer's auth-proxy / sidecar is the
+   canonical place to pin tenancy — it knows the tenant best.
 
 2. **Global** — the literal ``"global"`` namespace when no tenant-id
    header is present (the OSS single-process / dev / unauthenticated
@@ -41,17 +40,41 @@ mis-configured upstream auth.
 
 # Sanitization rules
 
-Tenant keys end up in the TOIN serialized store under a separator
-(``"|"``) that is illegal by construction in the value, so the
-sanitization is conservative on purpose:
+The key must be injective: two distinct tenant ids must never share a
+pool, because that is precisely the cross-tenant leak this module
+prevents. Since the accepted charset is narrow and the length is
+capped, a plain filter is lossy and cannot be injective on its own, so
+sanitization has two forms:
 
-- Allowed: ASCII alphanumeric, ``-`` (hyphen), ``_`` (underscore).
-- Length cap: 64 chars (prevents log-spam / OOM via giant headers).
-- Empty after sanitization: rejected (falls through to the next rule).
-- Unicode / control chars: stripped — we use ``unicodedata.category()``
-  rather than a regex (per project memory ``no regexes``) so the
-  classification is the OS Unicode tables, not a developer-authored
-  pattern.
+- **Verbatim** when the raw id already consists only of accepted code
+  points (ASCII alphanumeric, ``-``, ``_``) and is at most 64 chars.
+  Unchanged from earlier releases, so existing conforming tenants keep
+  their stored TOIN data.
+- **Digested** otherwise: the accepted characters become a readable
+  prefix (trimmed to leave room) and a 16-hex-char SHA-256 digest of
+  the raw id is appended, e.g. ``acme.corp`` →
+  ``acmecorp-<digest>``. Same shape as the project / user keys in
+  ``headroom.memory.storage_router``.
+
+Inputs with no accepted character at all (pure CJK, emoji) no longer
+fall through to the shared ``"global"`` pool — they get
+``tenant-<digest>``, so an affected tenant is isolated rather than
+silently pooled with every other tenant.
+
+- Allowed output: ASCII alphanumeric, ``-`` (hyphen), ``_`` (underscore).
+- Length cap: 64 chars, enforced on both forms (prevents log-spam /
+  OOM via giant headers).
+- Empty after stripping: rejected (falls through to the next rule).
+- Unicode / control chars: never appear in the output — we use
+  ``unicodedata.category()`` rather than a regex (per project memory
+  ``no regexes``) so the classification is the OS Unicode tables, not a
+  developer-authored pattern.
+
+**Cost of the digest form:** a tenant whose id is not already
+``[A-Za-z0-9_-]{1,64}`` gets a different key than earlier releases did,
+so its previously learned TOIN patterns stay behind under the old key.
+TOIN is a diagnostic learning store, not an archive — isolation wins
+over carrying the history forward, and no migration shim is provided.
 
 # Configuration
 
@@ -74,6 +97,7 @@ as the existing ``_request_ccr_store`` ContextVar in
 
 from __future__ import annotations
 
+import hashlib
 import logging
 import os
 import unicodedata
@@ -98,6 +122,42 @@ DEFAULT_TENANT_KEY_HEADER: Final[str] = "X-Headroom-Tenant-ID"
 # something else (a JWT payload, a session id) was wedged into the
 # header by mistake.
 _MAX_TENANT_KEY_LEN: Final[int] = 64
+
+# Length of the SHA-256 digest (hex chars) appended to keys that can't
+# round-trip through the accepted charset verbatim. 16 hex chars = 64
+# bits, matching what ``headroom.memory.storage_router`` uses for the
+# same purpose.
+_TENANT_KEY_DIGEST_LEN: Final[int] = 16
+
+# Prefix used when the raw id has no accepted character at all (a
+# pure-CJK or emoji id). Any constant works — uniqueness comes from the
+# digest; this just keeps the key readable in logs and stores.
+_OPAQUE_TENANT_KEY_PREFIX: Final[str] = "tenant"
+
+# Hex alphabet of the digest. Kept as a literal so ``_looks_digested``
+# needs no ``re`` (project memory: ``no regexes``).
+_HEX_DIGITS: Final[str] = "0123456789abcdef"
+
+# ASCII whitespace, and ONLY ASCII whitespace, is trimmed from the raw
+# header before it is classified. ``str.strip()`` with no argument trims
+# every Unicode space character, which silently erased a disallowed
+# character instead of counting it: an NBSP-prefixed ``\u00a0acme``
+# stripped down to ``acme`` and shared that tenant's pool, and an
+# NBSP-only header stripped to empty and fell through to the shared
+# ``"global"`` pool. Trimming just this set keeps the blank-header
+# behaviour ASCII headers already had while letting Unicode whitespace
+# take the normal disallowed-character path (digest, hence isolation).
+_ASCII_WHITESPACE: Final[str] = " \t\n\r\v\f"
+
+# Marker that reserves one slice of the key space for digested keys.
+#
+# It exists because the two sanitization forms must not overlap: the
+# verbatim form returns conforming ids unchanged, and every digested key
+# is itself conforming, so without a reserved marker a tenant could send
+# a *digested* key as its own header and be handed the same pool — the
+# collision this marker removes. Digested keys always start with this
+# marker; verbatim keys never do (see :func:`_looks_digested`).
+_TENANT_KEY_MARKER: Final[str] = "tnt-"
 
 # Literal namespace name used when no tenant-id header is present.
 # This is a real namespace, not a sentinel —
@@ -248,16 +308,43 @@ def _get_header(request: Any, name: str) -> str:
 def _sanitize_tenant_key(raw: str) -> str:
     """Sanitize a tenant_key candidate. Returns ``""`` on rejection.
 
-    Allowed code points: ASCII alphanumeric, ``-``, ``_``. Anything
-    else is dropped. This is intentionally narrower than what header
-    standards permit — tenant keys flow into the TOIN serialized
-    store under a ``|`` separator, and into structured log fields, so
-    we want a character set that's safe in both.
+    Two output forms, and the choice between them is load-bearing for
+    tenant isolation:
 
-    Length cap: :data:`_MAX_TENANT_KEY_LEN`. Headers longer than the
-    cap are TRUNCATED, not rejected — but if the caller is sending a
-    JWT-shaped header by mistake, we still record the truncated form
-    rather than swallowing the request.
+    - **verbatim** — when the raw value already consists only of
+      accepted code points (ASCII alphanumeric, ``-``, ``_``) and fits
+      in :data:`_MAX_TENANT_KEY_LEN`, it is returned unchanged. This is
+      the common SaaS case (``cust_42``, ``Cust42TenantA``) and keeping
+      it byte-identical means existing tenants keep their TOIN pool
+      across the upgrade.
+    - **digested** — otherwise the accepted characters become a
+      readable prefix and a SHA-256 digest of the raw value is appended,
+      exactly as ``headroom.memory.storage_router`` does for project and
+      user ids. Dropping disallowed characters is lossy (``acme.corp``
+      and ``acmecorp`` both sanitize to ``acmecorp``), and truncating
+      past the cap is lossy too, so the bare sanitized form would let
+      two distinct tenants train one pool — the cross-tenant pattern
+      leak this module exists to prevent. The digest also keeps
+      NFC-vs-NFD and full-width-vs-ASCII spellings distinct without us
+      having to decide which of them are "the same" tenant.
+
+    The two forms must stay disjoint or the fix reintroduces the bug it
+    removes: a digested key is itself a legal identifier, so if it were
+    also accepted verbatim a tenant could simply send another tenant's
+    digested key and be handed that tenant's pool. Digested keys
+    therefore always carry :data:`_TENANT_KEY_MARKER`, and the verbatim
+    form refuses any value that already looks digested (see
+    :func:`_looks_digested`). The same rule keeps a tenant literally
+    named ``global`` out of the shared :data:`GLOBAL_TENANT_KEY`
+    namespace.
+
+    The result is always ``[A-Za-z0-9_-]{1,64}``: it flows into the TOIN
+    serialized store under a ``|`` separator and into structured log
+    fields, so the charset is load-bearing in both.
+
+    Only ASCII whitespace is trimmed from the raw value first; Unicode
+    whitespace is a disallowed character like any other, so it triggers
+    the digest rather than vanishing (see :data:`_ASCII_WHITESPACE`).
 
     Per project memory (``no regexes``) we use string ops +
     :func:`unicodedata.category` instead of ``re``. The Unicode
@@ -265,17 +352,16 @@ def _sanitize_tenant_key(raw: str) -> str:
     char", and we get correctness for free instead of authoring our
     own character class.
     """
+    raw = raw.strip(_ASCII_WHITESPACE)
     if not raw:
         return ""
 
     # Walk character by character. Cheap (header values are short),
     # branchy in a way the JIT will inline, and avoids `re`.
     accepted: list[str] = []
+    lossy = False
     for ch in raw:
-        # Reject control / format / separator / surrogates / private-use.
-        # `unicodedata.category()` returns a 2-char major.minor code; we
-        # whitelist L (Letter), N (Number) — but only if ASCII — plus
-        # the two literal punctuation chars `-` and `_`.
+        # Keep the two literal punctuation chars `-` and `_`.
         if ch in ("-", "_"):
             accepted.append(ch)
             continue
@@ -289,22 +375,64 @@ def _sanitize_tenant_key(raw: str) -> str:
         ):
             accepted.append(ch)
             continue
-        # Anything non-ASCII or punctuation: drop. We do NOT call
-        # unicodedata for the Cyrillic/Greek/CJK case — those would
-        # round-trip into JSON fine, but they introduce normalization
-        # surprises (NFC vs NFD, full-width digits vs ASCII digits)
-        # that aren't worth the maintenance cost. SaaS tenant IDs are
-        # typically opaque ASCII strings.
+        # Anything non-ASCII or punctuation: drop, and remember that the
+        # mapping stopped being injective so we can add a digest below.
+        lossy = True
+        # We do NOT call unicodedata for the Cyrillic/Greek/CJK case to
+        # widen the set — those would round-trip into JSON fine, but
+        # they introduce normalization surprises (NFC vs NFD, full-width
+        # digits vs ASCII digits) that aren't worth the maintenance
+        # cost. SaaS tenant IDs are typically opaque ASCII strings.
         # Touch unicodedata.category() so static analysis can see we
         # use it — and also so a developer reading the code knows
         # this is the right place to extend if we ever broaden the
         # accepted set.
         _ = unicodedata.category(ch)
 
-    if not accepted:
-        return ""
-    sanitized = "".join(accepted)
-    return sanitized[:_MAX_TENANT_KEY_LEN]
+    if not lossy and len(raw) <= _MAX_TENANT_KEY_LEN and not _looks_digested(raw):
+        return raw
+
+    # Digested form: marker + readable prefix + digest. The marker keeps
+    # this sub-space disjoint from verbatim ids (see module docstring and
+    # ``_looks_digested``), so a tenant cannot claim another tenant's
+    # digested key by sending it as its own header.
+    budget = _MAX_TENANT_KEY_LEN - len(_TENANT_KEY_MARKER) - _TENANT_KEY_DIGEST_LEN - 1
+    prefix = "".join(accepted)[:budget]
+    digest = hashlib.sha256(raw.encode("utf-8")).hexdigest()[:_TENANT_KEY_DIGEST_LEN]
+    return f"{_TENANT_KEY_MARKER}{prefix or _OPAQUE_TENANT_KEY_PREFIX}-{digest}"
+
+
+def _in_digested_subspace(value: str) -> bool:
+    """True when ``value`` has the shape of a key :func:`_sanitize_tenant_key` derived.
+
+    Nothing else can produce this shape, so it is the test an upgrade uses to
+    find pools that an older release stored verbatim under a legal id which
+    now collides with another tenant's digest. ``global`` is deliberately NOT
+    included: it is a pre-existing shared namespace, not a derived key.
+    """
+    if not value.startswith(_TENANT_KEY_MARKER):
+        return False
+    _, sep, tail = value.rpartition("-")
+    return bool(sep) and len(tail) == _TENANT_KEY_DIGEST_LEN and all(c in _HEX_DIGITS for c in tail)
+
+
+def _looks_digested(value: str) -> bool:
+    """True when ``value`` occupies the digested key sub-space.
+
+    The verbatim form is the identity function on conforming ids, and
+    every digested key is itself conforming, so without this check the
+    digest could be bypassed: a tenant sending ``acmecorp-80a1d5cc623b165f``
+    as its own header would be mapped to that string verbatim and share
+    the pool of the ``acme.corp`` tenant it was derived from.
+
+    A value counts as digested when it is the shared
+    :data:`GLOBAL_TENANT_KEY` literal (a tenant literally named
+    ``global`` must not join the OSS shared pool) or when it matches the
+    digested shape ``<marker><prefix>-<16 hex chars>``. Anything else,
+    including ids that merely start with the marker but carry no digest,
+    stays verbatim so ordinary ids are not rekeyed.
+    """
+    return value == GLOBAL_TENANT_KEY or _in_digested_subspace(value)
 
 
 def _emit_resolution_log(
@@ -344,6 +472,8 @@ __all__ = [
     "SOURCE_GLOBAL",
     "SOURCE_HEADER",
     "TENANT_KEY_HEADER_ENV_VAR",
+    "_in_digested_subspace",
+    "_looks_digested",
     "get_current_tenant_key",
     "resolve_tenant_key",
     "set_request_tenant_key",
