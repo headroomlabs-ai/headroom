@@ -44,6 +44,26 @@ The `with_memory()` wrapper intercepts every chat completion call:
 
 Memory extraction happens **inline** as part of the LLM response. No extra API calls, no extra latency.
 
+## Proxy Project Scope
+
+With proxy memory enabled, local `project` mode gives each resolved workspace
+its own SQLite database at
+`<memory-db-parent>/memories/projects/<project-key>/memory.db`.
+Use `--memory-db-path` to choose the base database path.
+
+Resolution checks `x-headroom-project-id`, then `x-headroom-cwd`, then
+`--memory-project-root`, then the client's system-prompt working directory.
+Claude Code / Codex cwd lines and pi's `<cwd>...</cwd>` block are supported.
+The same directory produces the same project key across these formats;
+explicit request headers still win. A pi cwd block in ordinary user content
+does not select a project.
+
+With the default `empty` fallback, Anthropic requests with an unresolved project
+receive neither memory context nor Headroom memory tools, even when the session
+previously injected those tools. Client-owned tools are left alone. Once scope
+is restored, the session can replay its memory definitions. Explicit `user` /
+`global` storage and configured global fallback keep their existing behavior.
+
 ## Hierarchical Scoping
 
 Memories exist at four scope levels, from broadest to narrowest:

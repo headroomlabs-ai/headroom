@@ -142,10 +142,10 @@ impl ResponseState {
         match name {
             "response.created" => self.on_response_created(&v),
             "response.in_progress" => Ok(()),
-            "output_item.added" => self.on_output_item_added(&v),
-            "output_item.done" => self.on_output_item_done(&v),
-            "content_part.added" => self.on_content_part_added(&v),
-            "content_part.done" => self.on_content_part_done(&v),
+            "response.output_item.added" | "output_item.added" => self.on_output_item_added(&v),
+            "response.output_item.done" | "output_item.done" => self.on_output_item_done(&v),
+            "response.content_part.added" | "content_part.added" => self.on_content_part_added(&v),
+            "response.content_part.done" | "content_part.done" => self.on_content_part_done(&v),
             "response.output_text.delta" | "output_text.delta" => self.on_output_text_delta(&v),
             "response.output_text.done" | "output_text.done" => self.on_output_text_done(&v),
             "response.function_call_arguments.delta" | "function_call_arguments.delta" => {
