@@ -5,6 +5,7 @@ import os
 import re
 import shutil
 import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -185,7 +186,7 @@ def test_launcher_uses_importable_python_module(tmp_path: Path) -> None:
     interpreter = tmp_path / "python-fallback"
     interpreter.write_text(
         "#!/bin/sh\n"
-        'if [ "$1" = "-c" ]; then exit 0; fi\n'
+        'if [ "$2" = "-c" ]; then exit 0; fi\n'
         'printf \'%s\\n\' "$*" >"$HEADROOM_RECEIPT"\n',
         encoding="utf-8",
     )
@@ -194,7 +195,44 @@ def test_launcher_uses_importable_python_module(tmp_path: Path) -> None:
     result = _run_launcher(tmp_path, HEADROOM_PYTHON=_posix(interpreter))
 
     assert result.returncode == 0
-    assert _receipt(tmp_path) == ["-m headroom.cli init hook ensure"]
+    assert _receipt(tmp_path) == ["-P -m headroom.cli init hook ensure"]
+
+
+def test_launcher_python_fallback_does_not_import_from_the_working_directory(
+    tmp_path: Path,
+) -> None:
+    # A real interpreter with site-packages disabled, so the only `headroom`
+    # it could import is the package sitting in the project directory.
+    interpreter = tmp_path / "python-no-site"
+    interpreter.write_text(
+        f'#!/bin/sh\nexec "{_posix(Path(sys.executable))}" -S "$@"\n', encoding="utf-8"
+    )
+    interpreter.chmod(0o755)
+    project = tmp_path / "project"
+    (project / "headroom").mkdir(parents=True)
+    marker = tmp_path / "marker"
+    for module in ("__init__.py", "cli.py"):
+        (project / "headroom" / module).write_text(
+            f"open({_posix(marker)!r}, 'a').write({module!r})\n", encoding="utf-8"
+        )
+
+    result = subprocess.run(
+        [SHELL, _posix(LAUNCHER)],
+        cwd=project,
+        env={
+            "HOME": _posix(tmp_path / "home"),
+            "PATH": "/no-such-bin",
+            "HEADROOM_PYTHON": _posix(interpreter),
+        },
+        capture_output=True,
+        text=True,
+        timeout=30,
+        check=False,
+    )
+
+    assert result.returncode == 0
+    assert not marker.exists()
+    assert "CLI not found" in result.stderr
 
 
 def test_launcher_missing_cli_is_nonblocking(tmp_path: Path) -> None:
