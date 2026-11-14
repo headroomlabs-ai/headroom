@@ -91,11 +91,13 @@ Avoid setting process-wide variables such as `HTTP_PROXY`, `HTTPS_PROXY`, `ALL_P
 
 #### Code-memory MCP (Serena)
 
-`headroom wrap` registers **[Serena](https://github.com/oraios/serena)** as the code-memory MCP for semantic, symbol-level code navigation. Serena runs on demand via `uvx` — Headroom downloads and executes no binary of its own — and indexes the current project locally. Pass `--code-memory none` to register no code-memory MCP.
+`headroom wrap` registers no code-memory MCP by default. Pass `--code-memory serena` (or set `HEADROOM_CODE_MEMORY=serena`) to register **[Serena](https://github.com/oraios/serena)** for semantic, symbol-level code navigation. Serena runs on demand via `uvx` — Headroom downloads and executes no binary of its own — and indexes the current project locally. It is opt-in because its ~20 tool definitions add about 6K tokens to every request where the agent does not defer tools, and indexing runs at each launch.
 
-For Claude Code, the entry is written at `local` scope, which means it applies to the directory you wrapped and nothing else. That keeps a Serena that cannot start from breaking Claude Code sessions in unrelated projects. Pass `--code-memory-scope user` (or set `HEADROOM_CODE_MEMORY_SCOPE=user`) to register it machine-wide instead, which is how releases before this change behaved. If an earlier version already registered Serena machine-wide, the next `headroom wrap claude` moves it into the project scope for you — but only when Headroom installed that entry itself; a Serena you registered by hand is left alone.
+> **Upgrading?** Earlier releases registered Serena by default. On your next `headroom wrap`, Headroom removes the Serena entry it installed and says so; pass `--code-memory serena` to keep it. For Claude Code the entry is per project, so it is removed the next time you run `headroom wrap claude` (or `headroom unwrap claude`) in that directory. A Serena you registered yourself is left alone.
 
-> **Upgrading from tokensave?** Earlier releases registered a `tokensave` MCP server (a downloaded Rust binary). tokensave has been retired in favour of Serena. On your next `headroom wrap` / `headroom unwrap`, Headroom removes the `tokensave` MCP entry it installed and switches you to Serena — nothing to migrate, since both are just indexes rebuilt from your source. The leftover `tokensave` binary in `~/.local/bin` and any `.tokensave/` folders are unused and safe to delete.
+For Claude Code, the entry is written at `local` scope, which means it applies to the directory you wrapped and nothing else. That keeps a Serena that cannot start from breaking Claude Code sessions in unrelated projects. Pass `--code-memory-scope user` (or set `HEADROOM_CODE_MEMORY_SCOPE=user`) to register it machine-wide instead, which is how releases before #2787 behaved. If an earlier version already registered Serena machine-wide, the next `headroom wrap claude --code-memory serena` moves it into the project scope for you — but only when Headroom installed that entry itself; a Serena you registered by hand is left alone.
+
+> **Upgrading from tokensave?** Earlier releases registered a `tokensave` MCP server (a downloaded Rust binary). tokensave has been retired in favour of Serena. On your next `headroom wrap` / `headroom unwrap`, Headroom removes the `tokensave` MCP entry it installed — nothing to migrate, since it was just an index rebuilt from your source. The leftover `tokensave` binary in `~/.local/bin` and any `.tokensave/` folders are unused and safe to delete.
 
 By default, the proxy uses the shared **ContentRouter** pipeline. It routes text, logs, JSON, code, images, and tool outputs through the currently enabled compressors and preserves reversible CCR markers where applicable.
 
@@ -335,7 +337,7 @@ Fine-grained control over what gets compressed and how hard. Most users pick a [
 | `HEADROOM_COMPRESS_SYSTEM_MESSAGES` | unset | Compress system prompts. Off by default to keep the hottest cache prefix stable. |
 | `HEADROOM_PROTECT_RECENT` | profile | Never compress the N most recent turns. |
 | `--protect-tool-results` / `HEADROOM_PROTECT_TOOL_RESULTS` | empty | Comma-separated tool names whose output is never lossy-compressed. |
-| `--compressor` (repeatable) / `HEADROOM_COMPRESSORS` | all | Restrict to specific compressors: `smart_crusher,kompress,code_aware,search,log,tabular,config,html,image`. |
+| `--compressor` (repeatable) / `HEADROOM_COMPRESSORS` | all | Restrict to specific compressors: `smart_crusher,kompress,code_aware,search,log,tabular,config,html,image`. Leaving out `image` also turns off the proxy's image stage. |
 | `--code-aware` / `--no-code-aware` | off | AST-based [code compression](/docs/code-compression). Requires `headroom-ai[code]`. |
 
 ### Kompress (ML compression)
@@ -643,12 +645,12 @@ Keep carrying both yourself and send them upstream unchanged. Two consequences w
 | `session_id` | string | unset | Opt into [session mode](#session-mode): Headroom keeps this conversation's replay state itself, so you can resend the raw conversation every turn and get a byte-identical prefix back. Non-empty, at most 256 characters; anything else is a `400`. Cannot be combined with `compress_user_messages` (`400`). |
 | `compress_user_messages` | boolean | `false` | Also compress user-role messages. |
 | `target_ratio` | number | unset | Target compression ratio. |
-| `protect_recent` | integer | unset | Leave the last N messages uncompressed. |
+| `protect_recent` | integer | unset | Leave recent code uncompressed in the last N messages (non-code tool payloads are not shielded). |
 | `protect_analysis_context` | boolean | unset | Preserve analysis context blocks. |
 
 **`config.mode` values:**
 
-- **unset (default)** — marker-free. Emits no `<<ccr:…>>` retrieval markers and writes nothing to the CCR store, so you can forward the returned messages straight to a provider. This is the right mode for a gateway or guardrail that just swaps `messages` and forwards.
+- **unset (default)** — marker-free. Emits no `<<ccr:…>>` retrieval markers and writes nothing to the CCR store, so you can forward the returned messages straight to a provider. This is the right mode for a gateway or guardrail that just swaps `messages` and forwards. A file read that a later edit made stale is still replaced, with a note telling the model to re-read the file and no retrieval hash.
 - **`ccr`** — emits CCR markers and writes to the store. Only for callers that also inject the `headroom_retrieve` tool *and* can reach `/v1/retrieve` (itself loopback-only). Markers are a dangling pointer for the model otherwise.
 - **`lossy_inline`** (alias `lossless_then_lossy`) — runs the lossless byte/data fold first, then compresses the folded remainder. Marker-free.
 - **`lossless`** — format-native folds only, with no markers and no retrieval. For a sidecar with no retrieval loop; a registered lossless provider still applies. Keep the mode stable within a `session_id`, because session mode replays earlier turns byte-for-byte.
@@ -741,7 +743,7 @@ Also for multi-turn callers:
 
 #### Session mode
 
-Pass `config.session_id` and Headroom keeps the conversation's replay state itself — the same per-session compression cache and prefix tracker the proxy path uses — so a gateway that owns routing can resend the **raw** conversation every turn and still get a byte-identical prefix back. Whatever this endpoint previously returned for the session is treated as the provider's cache contract: every already-returned message comes back unchanged, even where recompressing it would do better, and only the new tail is compressed. An explicit `config.frozen_message_count` still wins when it is larger.
+Pass `config.session_id` and Headroom keeps the conversation's replay state itself — the same per-session compression cache and prefix tracker the proxy path uses — so a gateway that owns routing can resend the **raw** conversation every turn and still get a byte-identical prefix back. Whatever this endpoint previously returned for the session is treated as the provider's cache contract: every already-returned message comes back unchanged, even where recompressing it would do better, and only the new tail is compressed. Message `cache_control` markers stay where you put them. If you send none, none come back. An explicit `config.frozen_message_count` still wins when it is larger.
 
 ```json
 {

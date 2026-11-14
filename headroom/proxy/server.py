@@ -34,6 +34,7 @@ import json
 import logging
 import math
 import os
+import signal
 import sys
 import threading
 import time
@@ -600,6 +601,69 @@ class CompressionQuarantinedError(asyncio.TimeoutError):
 
 _MULTI_WORKER_CONFIG_ENV = "HEADROOM_PROXY_CONFIG_JSON"
 
+
+def _save_prefix_state_on_exit_signal(store: Any, path: str) -> Callable[[], None]:
+    """Save prefix-tracker state as soon as an exit signal arrives.
+
+    ``HeadroomProxy.shutdown`` saves it too, but uvicorn runs the lifespan
+    shutdown only after waiting up to ``timeout_graceful_shutdown`` for
+    in-flight requests, so a supervisor that SIGKILLs sooner (a desktop app's
+    short stop, systemd's ``TimeoutStopSec``) loses that save whenever a request
+    is open. This wraps the handler uvicorn installed (the lifespan runs inside
+    its ``capture_signals``), so uvicorn's shutdown is unchanged and the later
+    save still writes the newer state. The save runs on the event loop, never
+    inside the signal handler, so it cannot read a tracker that a paused
+    coroutine was midway through updating.
+
+    Returns the undo, for the lifespan's shutdown: it restores each handler
+    that is still this wrapper (one another owner installed since is left
+    alone) and turns the wrapper into a pass-through, so a wrapper that could
+    not be removed never schedules onto this lifespan's closed loop.
+    """
+    if threading.current_thread() is not threading.main_thread():
+        return lambda: None  # signals are only delivered to the main thread
+    loop = asyncio.get_running_loop()
+    active = True
+    saved = False
+
+    def save() -> None:
+        nonlocal saved
+        if not saved:
+            saved = True
+            store.save_state(path)
+
+    def chained(previous: Callable[[int, Any], Any]) -> Callable[[int, Any], None]:
+        def handler(signum: int, frame: Any) -> None:
+            if active:
+                with contextlib.suppress(RuntimeError):  # loop closed without a shutdown
+                    loop.call_soon_threadsafe(save)
+            previous(signum, frame)
+
+        return handler
+
+    installed: list[tuple[int, Any, Callable[[int, Any], None]]] = []
+    for sig in (signal.SIGINT, signal.SIGTERM, getattr(signal, "SIGBREAK", None)):
+        if sig is None:
+            continue
+        previous = signal.getsignal(sig)
+        if not callable(previous):
+            continue  # nobody installed a handler: keep the default exit
+        handler = chained(previous)
+        signal.signal(sig, handler)
+        installed.append((sig, previous, handler))
+
+    def undo() -> None:
+        nonlocal active
+        active = False
+        if threading.current_thread() is not threading.main_thread():
+            return
+        for sig, previous, handler in installed:
+            if signal.getsignal(sig) is handler:
+                signal.signal(sig, previous)
+
+    return undo
+
+
 # Env var that opts out of the Rust core deployment smoke test (Hotfix-A0).
 # Default behavior: hard-fail at startup if `headroom._core` is unimportable
 # (Finding #2 in HEADROOM_PROXY_LOG_FINDINGS_2026_05_03.md — production
@@ -846,11 +910,35 @@ def _apply_stateless_persistence(config: ProxyConfig) -> None:
     detach_compression_store()
 
 
+# Hop-by-hop fields (RFC 9110 7.6.1) describe the client's connection to the
+# proxy, not the proxy's connection to the provider. Handlers copy the inbound
+# headers, so a client's `Connection: close` reached the provider and made
+# every pooled upstream connection single-use: a fresh DNS lookup, TCP connect
+# and TLS handshake per request. Framing (content-length, transfer-encoding)
+# is httpx's own by the time the hook runs and is never touched.
+_HOP_BY_HOP_REQUEST_HEADERS = frozenset(
+    {"connection", "keep-alive", "proxy-connection", "te", "trailer", "upgrade"}
+)
+_FRAMING_REQUEST_HEADERS = frozenset({"host", "content-length", "transfer-encoding"})
+
+
+async def _drop_hop_by_hop_request_headers(request: httpx.Request) -> None:
+    named = {
+        token.strip().lower()
+        for token in request.headers.get_list("connection", split_commas=True)
+        if token.strip()
+    }
+    for name in (_HOP_BY_HOP_REQUEST_HEADERS | named) - _FRAMING_REQUEST_HEADERS:
+        if name in request.headers:
+            del request.headers[name]
+
+
 def _provider_httpx_client_options(
     config: ProxyConfig,
     verify: Any,
 ) -> tuple[bool, dict[str, Any]]:
     client_kwargs: dict[str, Any] = {
+        "event_hooks": {"request": [_drop_hop_by_hop_request_headers]},
         "timeout": httpx.Timeout(
             connect=config.connect_timeout_seconds,
             read=config.request_timeout_seconds,
@@ -1228,6 +1316,7 @@ class HeadroomProxy(
         self.shared_compress_sessions = open_shared_sessions()
         # Set by startup() when HEADROOM_PREFIX_STATE_FILE opts in.
         self._prefix_state_file: str | None = None
+        self._undo_exit_signal_save: Callable[[], None] | None = None
 
         # Compression cache store for token mode (session-scoped). The dict
         # itself is mutated under `_compression_caches_lock`; the per-session
@@ -2126,6 +2215,9 @@ class HeadroomProxy(
             self._prefix_state_file = None
         if self._prefix_state_file:
             self.session_tracker_store.load_state(self._prefix_state_file)
+            self._undo_exit_signal_save = _save_prefix_state_on_exit_signal(
+                self.session_tracker_store, self._prefix_state_file
+            )
         self.pipeline_extensions.emit(
             PipelineStage.PRE_START,
             operation="proxy.startup",
@@ -2476,6 +2568,9 @@ class HeadroomProxy(
         # First, before any await can hit the shutdown step timeout.
         if self._prefix_state_file:
             self.session_tracker_store.save_state(self._prefix_state_file)
+        if self._undo_exit_signal_save is not None:
+            self._undo_exit_signal_save()
+            self._undo_exit_signal_save = None
         if self.http_client_h1 and self.http_client_h1 is not self.http_client:
             await self.http_client_h1.aclose()
         self.http_client_h1 = None
@@ -4399,6 +4494,11 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
     # One bad plugin must not brick the proxy. Note the consequence: a plugin
     # whose licence gate raises is absent, not fatal — the feature fails closed,
     # the process does not.
+    #
+    # The exception is an extension that marks its install() `fail_closed`
+    # (e.g. one that mints the upstream credential): running without it would
+    # relay the client's own Authorization upstream, so `install_all` re-raises
+    # and create_app fails instead of serving mis-authenticated. See #4737.
     #
     # Installed HERE, before the body limit and the security gate are
     # registered, so any middleware an extension adds sits INSIDE both (see the

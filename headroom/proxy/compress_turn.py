@@ -102,6 +102,10 @@ class CompressTurn(Protocol):
     # And ``system_tokens_before``/``system_tokens_after``, the Anthropic
     # system prompt before and after the hooks when one changed it, folded
     # the same way.
+    # In the other direction: a turn with a writable ``conversation: str |
+    # None`` attribute has it set before ``prepare`` to an opaque key for the
+    # request's session (None without one), for its hooks'
+    # ``TurnContext.conversation``.
 
     def finish(
         self,

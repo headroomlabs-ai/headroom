@@ -129,6 +129,50 @@ mod tests {
         assert_eq!(calls.load(Ordering::SeqCst), 1);
     }
 
+    /// Fails until `ready` is set, then returns long-lived credentials.
+    #[derive(Debug)]
+    struct LateProvider {
+        ready: Arc<std::sync::atomic::AtomicBool>,
+        calls: Arc<AtomicUsize>,
+    }
+
+    impl ProvideCredentials for LateProvider {
+        fn provide_credentials<'a>(&'a self) -> future::ProvideCredentials<'a>
+        where
+            Self: 'a,
+        {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            if self.ready.load(Ordering::SeqCst) {
+                future::ProvideCredentials::ready(Ok(Credentials::new(
+                    "AKID_LATE",
+                    "secret",
+                    None,
+                    None,
+                    "late",
+                )))
+            } else {
+                future::ProvideCredentials::ready(Err(CredentialsError::not_loaded("not yet")))
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn failed_fetch_is_not_cached() {
+        // A startup resolution that fails must not stick: main.rs keeps
+        // the source either way and relies on the next get() asking again.
+        let ready = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let calls = Arc::new(AtomicUsize::new(0));
+        let src = BedrockCredentials::new(LateProvider {
+            ready: ready.clone(),
+            calls: calls.clone(),
+        });
+        assert!(src.get().await.is_err());
+        ready.store(true, Ordering::SeqCst);
+        assert_eq!(src.get().await.unwrap().access_key_id(), "AKID_LATE");
+        assert_eq!(src.get().await.unwrap().access_key_id(), "AKID_LATE");
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+    }
+
     #[tokio::test]
     async fn static_credentials_without_expiry_are_returned() {
         let src = BedrockCredentials::new(Credentials::new("AKID_STATIC", "s", None, None, "t"));

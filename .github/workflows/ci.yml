@@ -63,6 +63,7 @@ jobs:
               - 'tests/**'
               - 'scripts/**'
               - '.github/workflows/**'
+              - '.github/actions/**'
             # native = anything that can change the compiled wrapper, the native
             # install flow, or the docker image (drives the scarce macOS/Windows
             # runners + docker E2E). A pure-Python logic change hits none of these.
@@ -99,6 +100,7 @@ jobs:
               - '.github/workflows/**'
             workflows:
               - '.github/workflows/**'
+              - '.github/actions/**'
 
   lint:
     needs: changes
@@ -611,7 +613,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
-      - uses: wagoid/commitlint-github-action@b948419dd99f3fd78a6548d48f94e3df7f6bf3ed # v6.2.1
+      - uses: ./.github/actions/commitlint
         with:
           configFile: .commitlintrc.json
 
@@ -672,14 +674,30 @@ jobs:
       - name: Install actionlint
         if: steps.tools-cache.outputs.cache-hit != 'true'
         run: |
-          curl -fsSL https://raw.githubusercontent.com/rhysd/actionlint/main/scripts/download-actionlint.bash | bash
-          sudo mv ./actionlint /usr/local/bin/actionlint
+          archive="$RUNNER_TEMP/actionlint.tar.gz"
+          curl --proto '=https' --tlsv1.2 -fsSL \
+            https://github.com/rhysd/actionlint/releases/download/v1.7.12/actionlint_1.7.12_linux_amd64.tar.gz \
+            --output "$archive"
+          printf '%s  %s\n' '8aca8db96f1b94770f1b0d72b6dddcb1ebb8123cb3712530b08cc387b349a3d8' "$archive" | sha256sum --check --strict -
+          tar --extract --gzip --file "$archive" --directory "$RUNNER_TEMP" actionlint
+          sudo install -m 0755 -- "$RUNNER_TEMP/actionlint" /usr/local/bin/actionlint
 
       - name: Install act
         if: steps.tools-cache.outputs.cache-hit != 'true'
         run: |
-          curl -fsSL https://raw.githubusercontent.com/nektos/act/master/install.sh | sudo bash
-          sudo install ./bin/act /usr/local/bin/act
+          archive="$RUNNER_TEMP/act.tar.gz"
+          curl --proto '=https' --tlsv1.2 -fsSL \
+            https://github.com/nektos/act/releases/download/v0.2.97/act_Linux_x86_64.tar.gz \
+            --output "$archive"
+          printf '%s  %s\n' '67b4976a56f33ea7870b798912e738ec44eef38e7578ae7b532f2def1c73a5ad' "$archive" | sha256sum --check --strict -
+          tar --extract --gzip --file "$archive" --directory "$RUNNER_TEMP" act
+          sudo install -m 0755 -- "$RUNNER_TEMP/act" /usr/local/bin/act
+      - name: Verify installed workflow tools
+        run: |
+          printf '%s  %s\n' \
+            'c872d6db8c6bf83a8eaa704fc93999f027d55dffbc63b8a6abdccb47df5f4cd4' /usr/local/bin/actionlint \
+            'c4d4728b7375fad11980456249edeb3a4ca48ba4e785cb8100ad14bd53e77056' /usr/local/bin/act \
+            | sha256sum --check --strict -
       - name: Validate workflow files
         run: bash scripts/validate-workflows.sh
 
