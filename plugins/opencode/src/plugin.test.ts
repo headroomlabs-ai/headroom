@@ -1,3 +1,5 @@
+import http from "node:http";
+import https from "node:https";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import HeadroomOpenCodePlugin, { HeadroomPlugin, headroomSetup } from "./plugin.js";
@@ -85,6 +87,13 @@ function transportState(): { refs: number } | undefined {
   return (globalThis as Record<symbol, { refs: number } | undefined>)[TRANSPORT_STATE];
 }
 
+function transportWireRoots(): string[] {
+  const state = (globalThis as Record<symbol, { wireRoots?: Array<{ origin: string; path: string }> }>)[
+    TRANSPORT_STATE
+  ];
+  return (state?.wireRoots ?? []).map((root) => `${root.origin}${root.path}`);
+}
+
 afterEach(() => {
   vi.restoreAllMocks();
   vi.unstubAllGlobals();
@@ -114,6 +123,92 @@ describe("HeadroomPlugin", () => {
       OPENAI_BASE_URL: "https://deepseek.example/v1",
       ANTHROPIC_BASE_URL: "https://anthropic.example",
     });
+  });
+
+  it("widens transport routing to base URLs from OpenCode's config (#4747)", async () => {
+    const fetchMock = vi.fn(async (..._args: unknown[]) => new Response("ok"));
+    vi.stubGlobal("fetch", fetchMock);
+
+    const client = {
+      config: {
+        get: async () => ({
+          data: {
+            provider: {
+              acme: { options: { baseURL: "https://gateway.invalid/tenant/acme" } },
+            },
+          },
+        }),
+      },
+      provider: { list: async () => ({ data: { all: [] } }) },
+    };
+    const plugin = await HeadroomPlugin(
+      { ...(pluginInput() as Record<string, unknown>), client } as never,
+      { proxyUrl: "http://127.0.0.1:8787" },
+    );
+
+    try {
+      // The config read is deliberately not awaited by the plugin, so let it land.
+      await vi.waitFor(() => {
+        expect(transportWireRoots()).toContain("https://gateway.invalid/tenant/acme");
+      });
+
+      await fetch("https://gateway.invalid/tenant/acme/chat/completions", { method: "POST" });
+
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+      expect(String(fetchMock.mock.calls[0][0])).toBe("http://127.0.0.1:8787/v1/chat/completions");
+    } finally {
+      await plugin.dispose?.();
+    }
+  });
+
+  it("applies a config result without waiting for a pending provider listing (#4747)", async () => {
+    const fetchMock = vi.fn(async (..._args: unknown[]) => new Response("ok"));
+    vi.stubGlobal("fetch", fetchMock);
+    const fakeRequest = { on: vi.fn(), end: vi.fn(), destroy: vi.fn() };
+    const httpSpy = vi.spyOn(http, "request").mockImplementation(() => fakeRequest as never);
+    const httpsSpy = vi.spyOn(https, "request").mockImplementation(() => fakeRequest as never);
+
+    // The provider listing never settles: a stalled server must not hold back a
+    // base the config already reported.
+    const client = {
+      config: {
+        get: async () => ({
+          data: {
+            provider: {
+              acme: { options: { baseURL: "https://gateway.invalid/tenant/acme" } },
+            },
+          },
+        }),
+      },
+      provider: { list: () => new Promise<never>(() => {}) },
+    };
+    const plugin = await HeadroomPlugin(
+      { ...(pluginInput() as Record<string, unknown>), client } as never,
+      { proxyUrl: "http://127.0.0.1:8787" },
+    );
+
+    try {
+      // The read is still not awaited by the plugin, but nothing else blocks it.
+      await vi.waitFor(() => {
+        expect(transportWireRoots()).toContain("https://gateway.invalid/tenant/acme");
+      });
+
+      await fetch("https://gateway.invalid/tenant/acme/chat/completions", { method: "POST" });
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+      expect(String(fetchMock.mock.calls[0][0])).toBe("http://127.0.0.1:8787/v1/chat/completions");
+
+      https.request("https://gateway.invalid/tenant/acme/chat/completions", { method: "POST" });
+      expect(httpSpy).toHaveBeenCalledTimes(1);
+      expect(httpsSpy).not.toHaveBeenCalled();
+
+      // Still a root, not a blanket route for the host.
+      await fetch("https://gateway.invalid/tenant/acme/files/1", { method: "POST" });
+      expect(String(fetchMock.mock.calls[1][0])).toBe("https://gateway.invalid/tenant/acme/files/1");
+    } finally {
+      await plugin.dispose?.();
+      httpSpy.mockRestore();
+      httpsSpy.mockRestore();
+    }
   });
 
   it("treats an empty HEADROOM_PROXY_URL as unset and falls through to HEADROOM_BASE_URL", async () => {
