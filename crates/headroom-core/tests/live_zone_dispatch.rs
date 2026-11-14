@@ -201,6 +201,7 @@ fn diff_tool_result_routes_to_diff_compressor() {
     }
 }
 
+#[cfg(feature = "code")]
 #[test]
 fn source_code_tool_result_routes_to_code_compressor() {
     // Detector classifies this as SourceCode. PR-B4 wires the arm up to
@@ -246,6 +247,68 @@ fn source_code_tool_result_routes_to_code_compressor() {
             );
         }
         other => panic!("expected BlockAction::Compressed, got {other:?}"),
+    }
+}
+
+/// Without the `code` feature there is no AST compressor. In the minimal
+/// build (no `code`, no `ml`) source-code blocks must fall through to a
+/// deterministic no-op: the dispatcher reports `NoCompressionApplied`
+/// and the caller forwards the original bytes untouched.
+#[cfg(all(not(feature = "code"), not(feature = "ml")))]
+#[test]
+fn source_code_tool_result_no_op_without_code_or_ml() {
+    let code = python_module_source(10);
+    assert!(
+        code.len() > 2048,
+        "fixture must clear the SourceCode byte threshold (2048); got {} bytes",
+        code.len()
+    );
+
+    let (body, _) = body_with_tool_result(&code);
+    let out = dispatch(&body);
+    let manifest = match &out {
+        LiveZoneOutcome::NoChange { manifest } => manifest,
+        LiveZoneOutcome::Modified { manifest, .. } => panic!(
+            "no SourceCode compressor is compiled in (neither `code` nor `ml`); \
+             expected NoChange, got Modified. manifest: {manifest:?}"
+        ),
+    };
+    let action = manifest
+        .block_outcomes
+        .iter()
+        .find(|b| b.block_type == "tool_result")
+        .expect("tool_result block present")
+        .action
+        .clone();
+    match action {
+        BlockAction::NoCompressionApplied { content_type } => {
+            assert_eq!(content_type, "source_code");
+        }
+        other => panic!("expected NoCompressionApplied for source_code, got {other:?}"),
+    }
+}
+
+/// With `ml` enabled but `code` disabled, the SourceCode arm falls back to
+/// the Kompress/no-op path. It must never report the AST compressor.
+#[cfg(all(not(feature = "code"), feature = "ml"))]
+#[test]
+fn source_code_tool_result_never_reports_code_compressor_without_code() {
+    let code = python_module_source(10);
+    let (body, _) = body_with_tool_result(&code);
+    let out = dispatch(&body);
+    let manifest = match &out {
+        LiveZoneOutcome::Modified { manifest, .. } | LiveZoneOutcome::NoChange { manifest } => {
+            manifest
+        }
+    };
+    for block in &manifest.block_outcomes {
+        if let BlockAction::Compressed { strategy, .. } = &block.action {
+            assert_eq!(
+                *strategy, "kompress",
+                "without the `code` feature the only possible SourceCode compressor is the \
+                 Kompress fallback"
+            );
+        }
     }
 }
 
