@@ -72,8 +72,12 @@ HEADER_PREFIX: Final[str] = "x-headroom-"
 LABELS_HEADER: Final[str] = "x-headroom-labels"
 
 #: Only this much of ``X-Headroom-Labels`` is read. It is parsed on every
-#: request, so its cost must not be the client's to choose.
-LABELS_HEADER_MAX_LENGTH: Final[int] = 4096
+#: request, so its cost must not be the client's to choose. Sized to the
+#: longest header :func:`format_labels` can emit (every label at full length
+#: and every character percent-encoded), so whatever it builds is read whole.
+LABELS_HEADER_MAX_LENGTH: Final[int] = MAX_DIMENSIONS * (
+    DIMENSION_NAME_MAX_LENGTH + len("=") + 3 * LABEL_MAX_LENGTH
+) + (MAX_DIMENSIONS - 1) * len("; ")
 
 #: Environment variable ``headroom wrap`` reads labels from, in the same
 #: ``name=value; name=value`` form; also accepts commas as separators.
@@ -380,8 +384,13 @@ def _label_pairs(value: Any) -> dict[str, str]:
     """Every well-formed pair in a ``name=value; name=value`` string, sanitized."""
     if not isinstance(value, str) or not value.strip():
         return {}
+    if len(value) > LABELS_HEADER_MAX_LENGTH:
+        # Keep whole pairs only: a pair cut at the limit would be booked under
+        # a shortened label. A separator right at the limit ends a whole pair.
+        head = value[: LABELS_HEADER_MAX_LENGTH + 1]
+        value = head[: max(head.rfind(","), head.rfind(";"), 0)]
     pairs: dict[str, str] = {}
-    for chunk in value[:LABELS_HEADER_MAX_LENGTH].replace(",", ";").split(";"):
+    for chunk in value.replace(",", ";").split(";"):
         raw_name, sep, raw_label = chunk.partition("=")
         if not sep:
             continue

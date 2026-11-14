@@ -52,7 +52,9 @@ savings ledger keeps each event's labels (at most 16) for its retention window.
 
 `-name` removes a name from what the rest of the list selects, so write `default,-client`
 to keep the other built-ins; `-client` alone selects nothing. A header value is
-percent-decoded once, and only the first 4 KB of `X-Headroom-Labels` is read.
+percent-decoded once. Only the first 6,702 characters of `X-Headroom-Labels` are read,
+enough for 16 full-length labels with every character percent-encoded; a pair cut by
+that limit is dropped, not shortened.
 
 `none` stops labels being resolved and booked. Each ledger event still records the
 harness in its own `client` key, as it did before labels existed.

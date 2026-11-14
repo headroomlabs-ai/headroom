@@ -279,6 +279,26 @@ def test_format_labels_encodes_only_what_the_parser_reads():
     assert format_labels({"team": "a;b", "owner": "sam"}) == "team=a%3Bb; owner=sam"
 
 
+def test_format_labels_longest_output_is_read_whole():
+    # Every label at full length, every character encoded to three.
+    labels = {
+        f"{i:02d}".rjust(attribution.DIMENSION_NAME_MAX_LENGTH, "d"): "%"
+        * attribution.LABEL_MAX_LENGTH
+        for i in range(attribution.MAX_DIMENSIONS)
+    }
+    assert normalize_attribution(labels) == labels
+    header = format_labels(labels)
+    assert len(header) == attribution.LABELS_HEADER_MAX_LENGTH
+    assert parse_labels(header) == labels
+    request = _req({"X-Headroom-Labels": header})
+    assert resolve_attribution(request, list(labels)) == labels
+
+
+def test_format_labels_reported_overflow_case_roundtrips():
+    labels = {f"d{i}": "%" * 128 for i in range(16)}
+    assert parse_labels(format_labels(labels)) == labels
+
+
 def test_bind_label_updates_context_copy_on_write():
     set_current_attribution({"host": "a"})
     before = get_current_attribution()
@@ -366,3 +386,17 @@ def test_only_the_start_of_the_labels_header_is_read():
     padding = "x" * attribution.LABELS_HEADER_MAX_LENGTH
     request = _req({"X-Headroom-Labels": f"team=infra; pad={padding}; late=1"})
     assert resolve_attribution(request, ["team", "late"]) == {"team": "infra"}
+
+
+def test_a_pair_cut_by_the_header_limit_is_dropped_not_shortened():
+    limit = attribution.LABELS_HEADER_MAX_LENGTH
+    head = "team=infra; owner="
+    cut = head + "y" * (limit - len(head) + 10)
+    assert parse_labels(cut) == {"team": "infra"}
+    # A separator exactly at the limit means the pair before it is whole.
+    whole = head + "y" * (limit - len(head))
+    assert len(whole) == limit
+    assert parse_labels(whole + "; late=1")["owner"] == "y" * attribution.LABEL_MAX_LENGTH
+    assert "late" not in parse_labels(whole + "; late=1")
+    # One oversized pair with no separator before the limit yields nothing.
+    assert parse_labels("team=" + "y" * limit) == {}
