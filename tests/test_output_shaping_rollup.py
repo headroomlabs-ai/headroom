@@ -148,3 +148,35 @@ def test_lifetime_carries_the_output_savings_range_across_a_restart(tmp_path):
     low_usd, high_usd = lifetime["output_savings_usd"], lifetime["output_savings_usd_high"]
     assert low_usd > 0
     assert high_usd == pytest.approx(low_usd * 3, rel=1e-3)
+
+
+def test_treatment_request_that_was_not_shaped_saves_nothing(tmp_path, l4_factors):
+    """The stratum label is attached before shaping is attempted; only the
+    verbosity label proves the request was shaped."""
+    rec = SavingsRecorder(str(tmp_path / "o.json"), flush_every=1)
+    key = _key()
+    for _ in range(5):
+        rec._ledger.baseline.observe(key, 1000)
+
+    assert rec.request_savings_range([stratum_label("treatment", key)], 600) == (0, 0)
+
+
+def test_factors_are_not_booked_once_the_deployment_has_a_baseline(tmp_path, l4_factors):
+    """A baseline learned for other traffic must not leave this request on
+    benchmark factors while /stats reports the estimated tier."""
+    rec = SavingsRecorder(str(tmp_path / "o.json"), flush_every=1)
+    other = stratum_key(
+        turn_kind="chat", input_tokens=500, model="claude-opus-4-8", has_tools=False
+    )
+    for _ in range(5):
+        rec._ledger.baseline.observe(other, 1000)
+
+    labels = [stratum_label("treatment", _key()), "output_shaper:verbosity:L4"]
+    low, high = rec.request_savings_range(labels, 800)
+    assert low == high  # a baseline point estimate, never the factor band
+
+
+def test_fresh_tracker_lifetime_carries_the_range_keys(tmp_path):
+    lifetime = SavingsTracker(path=str(tmp_path / "s.json")).snapshot()["lifetime"]
+    assert lifetime["output_tokens_saved_high"] == 0
+    assert lifetime["output_savings_usd_high"] == 0.0

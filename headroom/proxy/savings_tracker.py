@@ -1261,11 +1261,9 @@ class SavingsTracker:
             if priced is not None
             else _estimate_output_savings_usd(model, delta_output_tokens_saved)
         )
-        # Same per-token rate as the low end, so the band is in tokens only.
-        delta_output_savings_usd_high = (
-            delta_output_savings_usd * delta_output_tokens_saved_high / delta_output_tokens_saved
-            if delta_output_tokens_saved > 0
-            else _estimate_output_savings_usd(model, delta_output_tokens_saved_high)
+        # Same per-token rate table that priced the low end.
+        delta_output_savings_usd_high = _estimate_output_savings_usd(
+            model, delta_output_tokens_saved_high
         )
         # Completion spend. ``total_input_cost_usd`` has never had an output
         # counterpart, so anything answering "what share of my bill did
@@ -1358,21 +1356,11 @@ class SavingsTracker:
                 lifetime.get("output_savings_usd", 0.0) + delta_output_savings_usd,
                 6,
             )
-            # The high end of the output-savings range. Lazy keys: a lifetime
-            # written before ranges existed reads its high end as its low end.
-            lifetime["output_tokens_saved_high"] = (
-                lifetime.get(
-                    "output_tokens_saved_high",
-                    lifetime["output_tokens_saved"] - delta_output_tokens_saved,
-                )
-                + delta_output_tokens_saved_high
-            )
+            # High end of the output-savings range; equals the low end for
+            # point estimates. Both state builders always write these keys.
+            lifetime["output_tokens_saved_high"] += delta_output_tokens_saved_high
             lifetime["output_savings_usd_high"] = round(
-                lifetime.get(
-                    "output_savings_usd_high",
-                    lifetime["output_savings_usd"] - delta_output_savings_usd,
-                )
-                + delta_output_savings_usd_high,
+                lifetime["output_savings_usd_high"] + delta_output_savings_usd_high,
                 6,
             )
             lifetime["tool_tokens_saved"] += delta_tool_tokens_saved
@@ -1883,6 +1871,8 @@ class SavingsTracker:
                 "total_input_cost_usd": 0.0,
                 "output_tokens_saved": 0,
                 "output_savings_usd": 0.0,
+                "output_tokens_saved_high": 0,
+                "output_savings_usd_high": 0.0,
                 "output_tokens": 0,
                 "total_output_cost_usd": 0.0,
             },

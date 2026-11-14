@@ -350,7 +350,7 @@ def modelled_request_savings(labels: Any, output_tokens: int) -> tuple[int, int]
         try:
             level = int(text[len(_SHAPED_LABEL_PREFIX) + 1 :])
         except ValueError:
-            return 0, 0
+            continue
         factors = MODELLED_REDUCTION.get(level)
         if factors is None:
             return 0, 0
@@ -857,28 +857,43 @@ class SavingsRecorder:
     def request_savings_range(self, labels: Any, output_tokens: int) -> tuple[int, int]:
         """Per-request output tokens saved as ``(low, high)``, for the rollup.
 
-        The synthetic control wins where it exists: a treatment request whose
-        stratum has a learned baseline gets that point estimate at both ends,
-        and a holdout (control) request saved nothing. Only a shaped request
-        with no baseline of its own falls back to the benchmark factors
-        registered for its level -- the modelled tier, priced per request so
-        it reaches the dollar totals. With no factors registered (plain OSS)
-        that fallback is ``(0, 0)``, exactly as before.
+        Only a request that was actually shaped saves anything: the treatment
+        stratum label is attached before shaping is attempted, so the
+        ``output_shaper:verbosity:L<n>`` label is the proof, as in
+        :meth:`record_from_labels`. A holdout (control) request saved nothing.
+
+        The tier follows :meth:`best_estimate`'s rule for the whole ledger:
+        benchmark factors are used ONLY while this deployment has neither a
+        learned baseline nor a running holdout. Otherwise a request books the
+        baseline point estimate for its stratum (both ends equal), or nothing
+        where its stratum has no baseline -- never a mix of baseline and
+        factor requests under one label. With no factors registered (plain
+        OSS) the factor path is ``(0, 0)``.
         """
-        for label in labels or ():
-            parsed = parse_stratum_label(str(label))
+        label_strings = [str(label) for label in labels or ()]
+        if not any(text.startswith(_SHAPED_LABEL_PREFIX) for text in label_strings):
+            return 0, 0
+        key = None
+        for text in label_strings:
+            parsed = parse_stratum_label(text)
             if parsed is None:
                 continue
             arm, key = parsed
             if arm != "treatment":
                 return 0, 0
-            with self._lock:
-                mean, _var, n = self._ledger.baseline.lookup(key)
-            if n > 0:
-                point = max(0, int(round(mean - output_tokens)))
-                return point, point
             break
-        return modelled_request_savings(labels, output_tokens)
+        with self._lock:
+            has_counterfactual = self._ledger.baseline.total_samples > 0 or bool(
+                self._ledger.control
+            )
+            if has_counterfactual:
+                if key is None:
+                    return 0, 0
+                mean, _var, n = self._ledger.baseline.lookup(key)
+        if not has_counterfactual:
+            return modelled_request_savings(label_strings, output_tokens)
+        point = max(0, int(round(mean - output_tokens))) if n > 0 else 0
+        return point, point
 
     def _reload_baseline_locked(self) -> None:
         """Adopt the on-disk baseline written by ``learn --verbosity --apply``.

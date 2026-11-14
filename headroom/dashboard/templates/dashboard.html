@@ -341,16 +341,15 @@
                                 <!-- Lifetime dollars at each request's model output rate. The
                                      high end exists only when savings were modelled from a
                                      benchmark band; a point estimate shows one number. -->
-                                <template x-if="(stats.persistent_savings?.lifetime?.output_savings_usd || 0) > 0">
+                                <template x-if="(lifetimeOutputSavings.output_savings_usd || 0) > 0">
                                     <div class="mt-1 text-xs text-gray-400 leading-relaxed"
-                                         x-data="{ get lt() { return stats.persistent_savings.lifetime } }"
-                                         x-text="'≈ $' + formatCurrency(lt.output_savings_usd)
-                                                 + ((lt.output_savings_usd_high || 0) > lt.output_savings_usd
-                                                     ? '–$' + formatCurrency(lt.output_savings_usd_high) : '')
+                                         x-text="'≈ $' + formatCurrency(lifetimeOutputSavings.output_savings_usd || 0)
+                                                 + ((lifetimeOutputSavings.output_savings_usd_high || 0) > (lifetimeOutputSavings.output_savings_usd || 0)
+                                                     ? '–$' + formatCurrency(lifetimeOutputSavings.output_savings_usd_high) : '')
                                                  + ' saved on output · '
-                                                 + formatNumber(lt.output_tokens_saved || 0)
-                                                 + ((lt.output_tokens_saved_high || 0) > (lt.output_tokens_saved || 0)
-                                                     ? '–' + formatNumber(lt.output_tokens_saved_high) : '')
+                                                 + formatNumber(lifetimeOutputSavings.output_tokens_saved || 0)
+                                                 + ((lifetimeOutputSavings.output_tokens_saved_high || 0) > (lifetimeOutputSavings.output_tokens_saved || 0)
+                                                     ? '–' + formatNumber(lifetimeOutputSavings.output_tokens_saved_high) : '')
                                                  + ' tokens, all time'">
                                     </div>
                                 </template>
@@ -2814,6 +2813,10 @@
 
                 get lifetimeCacheSavingsUsd() {
                     return this.stats.persistent_savings?.lifetime?.cache_savings_usd || 0;
+                },
+
+                get lifetimeOutputSavings() {
+                    return this.stats.persistent_savings?.lifetime || {};
                 },
 
                 get cacheCardAvailable() {
