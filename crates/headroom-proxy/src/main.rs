@@ -10,6 +10,7 @@ use std::net::SocketAddr;
 
 use clap::Parser;
 use headroom_proxy::config::CliArgs;
+use headroom_proxy::inbound_auth::{check_bind_policy, BindPolicy, OPEN_BIND_ACK_ENV};
 use headroom_proxy::{build_app, AppState, Config};
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
@@ -21,6 +22,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let config = Config::from_cli(args);
 
     init_tracing(&config.log_level);
+
+    // Same rule as the Python proxy's bind policy: no unauthenticated
+    // non-loopback listener unless the operator acknowledges it.
+    let ack = std::env::var(OPEN_BIND_ACK_ENV).ok();
+    match check_bind_policy(config.listen, config.proxy_token.is_some(), ack.as_deref()) {
+        Ok(BindPolicy::Ok) => {}
+        Ok(BindPolicy::OpenAcknowledged) => tracing::warn!(
+            event = "proxy_open_bind",
+            listen = %config.listen,
+            "non-loopback listen with no HEADROOM_PROXY_TOKEN; every peer that \
+             reaches this port is relayed upstream as a loopback caller. \
+             Acknowledged via HEADROOM_ALLOW_UNAUTHENTICATED_BIND"
+        ),
+        Err(msg) => {
+            eprintln!("headroom-proxy: {msg}");
+            std::process::exit(2);
+        }
+    }
 
     tracing::info!(
         listen = %config.listen,
