@@ -601,7 +601,10 @@ ignore_errors = true
 testpaths = ["tests"]
 python_files = ["test_*.py"]
 python_functions = ["test_*"]
-addopts = "-v --tb=short"
+# "-m 'not live'": tests marked live call real provider APIs with the developer's
+# keys, so they never run by default. Opt in with `pytest -m live <file>` (a later
+# -m replaces this one).
+addopts = "-v --tb=short -m 'not live'"
 asyncio_mode = "auto"
 filterwarnings = [
     # pyo3 Unsendable parsers emit an unraisable warning when GC drops them on a
