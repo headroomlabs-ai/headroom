@@ -190,7 +190,8 @@ class GatewayTurn:
             return FinishedTurn(fields={}, transforms=list(transforms_applied), messages=None)
         # mode="ccr" markers are only useful if the model can resolve them:
         # inject headroom_retrieve and let the response half answer it (a
-        # re-drive), or leave it to the caller otherwise.
+        # re-drive), or leave it to the caller otherwise. `handle_compress`
+        # rejects mode="ccr" for native shapes, which have no retrieval tool.
         self._ccr_armed = not self.native_shape and arm_ccr_redrive(
             result,
             provider=self.provider,

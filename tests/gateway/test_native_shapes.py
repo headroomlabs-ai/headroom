@@ -184,12 +184,124 @@ def test_counts_the_caller_sends_are_in_native_messages(headroom_client):
     assert data["session"]["frozen_message_count"] == 3
 
 
+REDRIVE_GATEWAY = {"can_redrive": True, "session_affinity": True, "can_relay_response": True}
+
+# Log output the CCR pipeline replaces with a retrieval marker (see
+# `test_ccr_still_works_on_a_chat_gateway_turn`), so a mode that lets markers
+# through would show one here.
+LOGS = "\n".join(
+    f"2026-01-01T00:00:{i % 60:02d} INFO worker-{i % 5} processed batch {i} in {i % 13}ms"
+    for i in range(3000)
+)
+
+
+def gemini_logs_body() -> dict:
+    body = gemini_body()
+    body["contents"][2]["parts"][0]["functionResponse"]["response"]["output"] = LOGS
+    return body
+
+
+def converse_logs_body() -> dict:
+    body = converse_body()
+    body["messages"][2]["content"][0]["toolResult"]["content"] = [{"text": LOGS}]
+    return body
+
+
+def _carries_ccr_marker(data: dict) -> bool:
+    blob = json.dumps(data["body"])
+    return bool(data["ccr_hashes"]) or "hash=" in blob or "<<ccr:" in blob
+
+
 def test_native_turns_are_never_asked_to_redrive(headroom_client):
-    gateway = {"can_redrive": True, "session_affinity": True, "can_relay_response": True}
-    data = _compress(headroom_client, converse_body(), gateway=gateway, mode="ccr")
+    data = _compress(headroom_client, converse_body(), gateway=REDRIVE_GATEWAY, mode=None)
 
     assert "redrive" not in data["obligations"]
     assert "relay_usage" in data["obligations"]
+
+
+@pytest.mark.parametrize(
+    ("make_body", "shape"),
+    [(gemini_logs_body, "gemini"), (converse_logs_body, "converse")],
+    ids=["gemini", "converse"],
+)
+def test_ccr_mode_is_rejected_for_native_bodies(headroom_client, make_body, shape):
+    sent = {**make_body(), "gateway": REDRIVE_GATEWAY, "config": {"mode": "ccr"}}
+
+    resp = headroom_client.post("/v1/compress", json=sent)
+
+    assert resp.status_code == 400, resp.text
+    error = resp.json()["error"]
+    assert error["type"] == "invalid_request"
+    assert f"config.mode='ccr' is not supported for {shape} bodies" in error["message"]
+    for supported in ("lossless", "lossy_inline", "lossless_then_lossy"):
+        assert supported in error["message"]
+
+
+@pytest.mark.parametrize("mode", [None, "lossless", "lossy_inline", "lossless_then_lossy"])
+@pytest.mark.parametrize(
+    ("make_body", "native"),
+    [(gemini_logs_body, "contents"), (converse_logs_body, "messages")],
+    ids=["gemini", "converse"],
+)
+def test_other_modes_forward_native_bodies_without_ccr_markers(
+    headroom_client, make_body, native, mode
+):
+    sent = make_body()
+    data = _compress(headroom_client, sent, gateway=REDRIVE_GATEWAY, mode=mode)
+    body = data["body"]
+
+    assert not _carries_ccr_marker(data)
+    assert data["wire_shape"] == ("gemini" if native == "contents" else "converse")
+    assert {k: v for k, v in body.items() if k != native} == {
+        k: v for k, v in sent.items() if k != native
+    }
+    assert body[native][:2] == sent[native][:2]
+    assert len(body[native]) == len(sent[native])
+
+
+def test_ccr_still_works_on_a_chat_gateway_turn(headroom_client):
+    sent = {
+        "model": "gpt-4o",
+        "messages": [
+            {"role": "user", "content": "Run it."},
+            {
+                "role": "assistant",
+                "content": None,
+                "tool_calls": [
+                    {
+                        "id": "c1",
+                        "type": "function",
+                        "function": {"name": "bash", "arguments": "{}"},
+                    }
+                ],
+            },
+            {"role": "tool", "tool_call_id": "c1", "content": LOGS},
+            {"role": "user", "content": "Summarize."},
+        ],
+    }
+    data = _compress(headroom_client, sent, gateway=REDRIVE_GATEWAY, mode="ccr")
+
+    assert data["wire_shape"] == "messages"
+    assert _carries_ccr_marker(data)
+
+
+def test_native_bodies_get_no_dedup_pointer_into_view_messages(make_headroom_client, monkeypatch):
+    # `[↑NL same as msg M]` counts Headroom's view messages, which are not the
+    # caller's native messages.
+    monkeypatch.setenv("HEADROOM_DEDUPE", "1")
+    client = make_headroom_client()
+    output = "\n".join(f"2026-01-01 worker-{i} finished job {i}" for i in range(400))
+    messages = [{"role": "user", "content": [{"text": "Run it twice."}]}]
+    for n in (1, 2):
+        use = {"toolUseId": f"tu_{n}", "name": "Bash", "input": {}}
+        result = {"toolUseId": f"tu_{n}", "content": [{"text": output}], "status": "success"}
+        messages.append({"role": "assistant", "content": [{"toolUse": use}]})
+        messages.append({"role": "user", "content": [{"toolResult": result}]})
+    sent = {**converse_body(), "messages": messages}
+
+    data = _compress(client, sent, mode=None)
+
+    assert "same as msg" not in json.dumps(data["body"])
 
 
 def test_a_converse_fail_open_answer_keeps_its_own_messages(headroom_client, monkeypatch):
