@@ -860,15 +860,26 @@ def _empty_project_entry() -> dict[str, Any]:
 
 def _empty_dimension_entry() -> dict[str, Any]:
     entry = _empty_project_entry()
+    entry["tool_tokens_saved"] = 0
     entry["cache_read_tokens"] = 0
     entry["output_tokens_saved"] = 0
     return entry
 
 
+def _label_saved(entry: dict[str, Any]) -> int:
+    """A label's tokens saved: compression plus deferred tool schemas, as in the ledger."""
+    return int(entry["tokens_saved"]) + int(entry.get("tool_tokens_saved", 0))
+
+
+def _label_rank(entry: dict[str, Any]) -> tuple[int, str]:
+    """Eviction order for a label: least saved, then least recent."""
+    return (_label_saved(entry), entry["last_activity_at"] or "")
+
+
 def _dimension_rank(labels: dict[str, dict[str, Any]]) -> tuple[int, str]:
     """Eviction order for a whole dimension: least saved, then least recent."""
     return (
-        sum(entry["tokens_saved"] for entry in labels.values()),
+        sum(_label_saved(entry) for entry in labels.values()),
         max((entry["last_activity_at"] or "" for entry in labels.values()), default=""),
     )
 
@@ -893,6 +904,7 @@ def _normalize_dimensions(raw: Any) -> dict[str, dict[str, dict[str, Any]]]:
             for key in (
                 "requests",
                 "tokens_saved",
+                "tool_tokens_saved",
                 "total_input_tokens",
                 "cache_read_tokens",
                 "output_tokens_saved",
@@ -909,11 +921,9 @@ def _normalize_dimensions(raw: Any) -> dict[str, dict[str, dict[str, Any]]]:
             cleaned[label] = normalized
         if len(cleaned) > DEFAULT_MAX_LABELS_PER_DIMENSION:
             cleaned = dict(
-                sorted(
-                    cleaned.items(),
-                    key=lambda item: (item[1]["tokens_saved"], item[1]["last_activity_at"] or ""),
-                    reverse=True,
-                )[:DEFAULT_MAX_LABELS_PER_DIMENSION]
+                sorted(cleaned.items(), key=lambda item: _label_rank(item[1]), reverse=True)[
+                    :DEFAULT_MAX_LABELS_PER_DIMENSION
+                ]
             )
         if cleaned:
             dimensions[dim] = cleaned
@@ -1501,6 +1511,7 @@ class SavingsTracker:
                 attribution,
                 timestamp_dt=timestamp_dt,
                 tokens_saved_delta=delta_tokens_saved,
+                tool_tokens_saved_delta=delta_tool_tokens_saved,
                 savings_usd_delta=delta_savings_usd,
                 input_tokens_delta=delta_input_tokens,
                 input_cost_usd_delta=delta_input_cost_usd,
@@ -1699,6 +1710,7 @@ class SavingsTracker:
         *,
         timestamp_dt: datetime,
         tokens_saved_delta: int = 0,
+        tool_tokens_saved_delta: int = 0,
         savings_usd_delta: float = 0.0,
         input_tokens_delta: int = 0,
         input_cost_usd_delta: float = 0.0,
@@ -1729,6 +1741,7 @@ class SavingsTracker:
             entry = labels.setdefault(label, _empty_dimension_entry())
             entry["requests"] += 1
             entry["tokens_saved"] += max(tokens_saved_delta, 0)
+            entry["tool_tokens_saved"] += max(tool_tokens_saved_delta, 0)
             entry["compression_savings_usd"] = round(
                 entry["compression_savings_usd"] + savings_usd_delta, 6
             )
@@ -1742,10 +1755,7 @@ class SavingsTracker:
             if len(labels) > DEFAULT_MAX_LABELS_PER_DIMENSION:
                 evict = min(
                     (key for key in labels if key != label),
-                    key=lambda key: (
-                        labels[key]["tokens_saved"],
-                        labels[key]["last_activity_at"] or "",
-                    ),
+                    key=lambda key: _label_rank(labels[key]),
                 )
                 del labels[evict]
 
@@ -1753,13 +1763,17 @@ class SavingsTracker:
         """Per-dimension stats, each ranked by savings."""
         result: dict[str, dict[str, dict[str, Any]]] = {}
         for dim, labels in self._state.get("dimensions", {}).items():
-            ranked = sorted(labels.items(), key=lambda item: item[1]["tokens_saved"], reverse=True)
+            ranked = sorted(labels.items(), key=lambda item: _label_saved(item[1]), reverse=True)
             view: dict[str, dict[str, Any]] = {}
             for label, entry in ranked:
                 row = dict(entry)
-                total_before = entry["tokens_saved"] + entry["total_input_tokens"]
+                # As in ``by_model``: deferred schemas never reached the model,
+                # so they count in "saved" and in the pre-Headroom denominator.
+                saved = _label_saved(entry)
+                total_before = saved + entry["total_input_tokens"]
+                row["headline_tokens_saved"] = saved
                 row["savings_percent"] = round(
-                    (entry["tokens_saved"] / total_before * 100) if total_before > 0 else 0.0,
+                    (saved / total_before * 100) if total_before > 0 else 0.0,
                     2,
                 )
                 view[label] = row

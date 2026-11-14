@@ -85,6 +85,39 @@ def test_labels_per_dimension_are_capped_keeping_the_largest(tmp_path):
     assert "h000" not in hosts
 
 
+def test_a_label_counts_deferred_tool_schemas_like_the_ledger(tmp_path):
+    tracker = SavingsTracker(path=tmp_path / "savings.json")
+    tracker.record_request(
+        model="gpt-4o",
+        input_tokens=1000,
+        tokens_saved=0,
+        tool_search_saved=20000,
+        attribution={"project": "web"},
+    )
+    tracker.record_request(
+        model="gpt-4o", input_tokens=1000, tokens_saved=50, attribution={"project": "api"}
+    )
+    projects = tracker.snapshot()["by_dimension"]["project"]
+    assert list(projects) == ["web", "api"]
+    web = projects["web"]
+    assert (web["tokens_saved"], web["tool_tokens_saved"]) == (0, 20000)
+    assert web["headline_tokens_saved"] == 20000
+    assert web["savings_percent"] == round(20000 / 21000 * 100, 2)
+
+    # The label that saved the most is never the one evicted.
+    for i in range(DEFAULT_MAX_LABELS_PER_DIMENSION):
+        tracker.record_request(
+            model="gpt-4o", input_tokens=10, tokens_saved=1, attribution={"project": f"p{i}"}
+        )
+    projects = tracker.snapshot()["by_dimension"]["project"]
+    assert len(projects) == DEFAULT_MAX_LABELS_PER_DIMENSION
+    assert "web" in projects and "api" in projects
+
+    # And it survives a reload.
+    reloaded = SavingsTracker(path=tmp_path / "savings.json")
+    assert reloaded.snapshot()["by_dimension"]["project"]["web"]["tool_tokens_saved"] == 20000
+
+
 def test_a_new_dimension_evicts_the_smallest_idle_one(tmp_path):
     from headroom.proxy.savings_tracker import DEFAULT_MAX_DIMENSIONS
 
