@@ -58,6 +58,13 @@ def _archive(path: Path, banner: str) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
+def _has_strict_sha256sum() -> bool:
+    if shutil.which("sha256sum") is None:
+        return False
+    probe = subprocess.run(["sha256sum", "--strict", "--help"], capture_output=True, check=False)
+    return probe.returncode == 0
+
+
 def _write_exe(path: Path, content: str) -> None:
     path.write_text(content)
     path.chmod(0o755)
@@ -73,7 +80,9 @@ def _run_install(
         directory.mkdir()
     _write_exe(stubs / "curl", CURL_STUB)
     _write_exe(stubs / "sudo", SUDO_STUB)
-    if subprocess.run(["sha256sum", "--strict", "--help"], capture_output=True).returncode != 0:
+    if not _has_strict_sha256sum():
+        if shutil.which("shasum") is None:
+            pytest.skip("needs sha256sum with --strict, or shasum")
         _write_exe(stubs / "sha256sum", SHA256SUM_SHIM)
 
     script = re.sub(r"(?m)^sha256=[0-9a-f]{64}$", f"sha256={pinned_sha256}", _install_script())
