@@ -1500,7 +1500,13 @@ def start_kompress_warmup_thread(model_id: str, warm: Callable[[], None]) -> thr
     return thread
 
 
-def start_kompress_background_warmup(pipelines: Any, *, cache_first: bool = False) -> bool:
+def start_kompress_background_warmup(
+    pipelines: Any,
+    *,
+    cache_first: bool = False,
+    warmup_slot: Any = None,
+    on_thread: Callable[[threading.Thread], None] | None = None,
+) -> bool:
     """Load the Kompress model of ``pipelines`` on a daemon thread; shared by proxy and MCP.
 
     Skipped when ``HEADROOM_KOMPRESS_WARMUP`` is ``0``/``false``/``no``/``off``,
@@ -1511,6 +1517,13 @@ def start_kompress_background_warmup(pipelines: Any, *, cache_first: bool = Fals
     requests. A remote compressor has no ``preload`` and is skipped. With
     ``cache_first`` the local cache is tried before any download. Returns
     ``True`` when a warm-up thread was started.
+
+    ``warmup_slot``, when given, is a ``WarmupRegistry``-style slot the warm-up
+    promotes on success (``mark_loaded``) and annotates with a bounded public
+    ``detail`` on failure — the proxy passes ``self.warmup.kompress`` so
+    ``/health`` keeps reporting the real state (GH #2730). ``on_thread`` is
+    invoked with the started warm-up thread so the caller can keep a handle on
+    it (the proxy records ``_kompress_warm_thread`` for the "warming" detail).
     """
     raw = os.environ.get("HEADROOM_KOMPRESS_WARMUP", "").strip().lower()
     if raw in ("0", "false", "no", "off"):
@@ -1558,6 +1571,13 @@ def start_kompress_background_warmup(pipelines: Any, *, cache_first: bool = Fals
         delay = 2.0
 
     def _warm() -> None:
+        # Imported lazily: the detail vocabulary lives in headroom.proxy while
+        # this module must stay importable without it (MCP-only installs).
+        from headroom.proxy.kompress_health_detail_policy import (
+            KOMPRESS_DETAIL_NOT_CACHED,
+            KOMPRESS_DETAIL_WARM_FAILED,
+        )
+
         time.sleep(max(0.0, delay))
         started = time.monotonic()
         try:
@@ -1568,9 +1588,27 @@ def start_kompress_background_warmup(pipelines: Any, *, cache_first: bool = Fals
                     backend = compressor.preload(allow_download=True)
             else:
                 backend = compressor.preload(allow_download=True)
+        except KompressModelNotCached:
+            # The local loader only raises this when downloads are off, so
+            # with allow_download=True a cold cache downloads instead. This
+            # covers compressors that report a cache miss on their own.
+            if warmup_slot is not None:
+                warmup_slot.info["detail"] = KOMPRESS_DETAIL_NOT_CACHED
+            logger.debug("Kompress background warm-up: model not cached")
+            return
         except Exception as exc:  # the lazy request path still loads on first use
+            # The detail lands on the auth-exempt /health payload, so it stays
+            # a bounded token; loader failures embed paths, model ids and
+            # URLs. The real cause goes to the log only.
+            if warmup_slot is not None:
+                warmup_slot.info["detail"] = KOMPRESS_DETAIL_WARM_FAILED
             logger.warning("Kompress background warm-up failed: %s", exc)
             return
+        if not backend:
+            return
+        if warmup_slot is not None:
+            warmup_slot.info.pop("detail", None)
+            warmup_slot.mark_loaded(handle=compressor, backend=backend, source_status="background")
         logger.info(
             "Kompress: warmed in the background in %.0f ms (backend %s)",
             (time.monotonic() - started) * 1000,
@@ -1579,7 +1617,9 @@ def start_kompress_background_warmup(pipelines: Any, *, cache_first: bool = Fals
 
     # Registered as the model's loader, so a request during the warm-up
     # doesn't start a second load thread.
-    start_kompress_warmup_thread(compressor.config.model_id, _warm)
+    thread = start_kompress_warmup_thread(compressor.config.model_id, _warm)
+    if on_thread is not None:
+        on_thread(thread)
     return True
 
 

@@ -143,6 +143,29 @@ class TestMemoryToolStreamFilter:
         assert forwarded[0]["type"] == "content_block_start"
         assert {e["index"] for e in forwarded if "index" in e} == {1}
 
+    @pytest.mark.parametrize("separator", ["\u0085", "\u2028", "\u2029"])
+    def test_continuation_reindexes_text_with_unicode_line_separator(self, separator: str) -> None:
+        flt = MemoryToolStreamFilter(MEMORY_TOOLS, index_offset=2, forward_message_start=False)
+        start = {
+            "type": "content_block_start",
+            "index": 0,
+            "content_block": {"type": "text", "text": ""},
+        }
+        delta = {
+            "type": "content_block_delta",
+            "index": 0,
+            "delta": {"type": "text_delta", "text": f"before{separator}after"},
+        }
+        raw = b"".join(
+            f"event: {payload['type']}\r\ndata: {json.dumps(payload, ensure_ascii=False)}\r\n\r\n".encode()
+            for payload in (start, delta)
+        )
+
+        forwarded = _events(b"".join(flt.feed(raw)))
+
+        assert [event["index"] for event in forwarded] == [2, 2]
+        assert forwarded[1]["delta"]["text"] == f"before{separator}after"
+
     def test_client_tool_alongside_memory_call_keeps_tool_use_stop(self) -> None:
         flt = MemoryToolStreamFilter(MEMORY_TOOLS)
         forwarded = _events(b"".join(flt.feed(_sse([SAVE, BASH], "tool_use"))))
@@ -816,6 +839,7 @@ class TestHandlerPassesServerMemoryTools:
             proxy = client.app.state.proxy
             proxy.memory_handler = SimpleNamespace(
                 config=SimpleNamespace(inject_context=False, inject_tools=True),
+                is_project_unresolved=lambda _ctx: False,
                 compute_memory_tool_definitions=lambda provider: memory_tools,
                 get_beta_headers=lambda: {},
                 has_memory_tool_calls=lambda resp, provider: False,

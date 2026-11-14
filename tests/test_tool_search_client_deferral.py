@@ -411,21 +411,35 @@ def test_nothing_to_strip_returns_the_same_list() -> None:
     assert out is tools
 
 
-def test_github_copilot_upstream_keeps_deferral() -> None:
-    """Copilot accepts the deferred shape and bills deferred schemas compactly."""
+@pytest.mark.parametrize(
+    "url",
+    [
+        "https://api.githubcopilot.com",
+        "https://api.business.githubcopilot.com",
+        "https://api.enterprise.githubcopilot.com",
+        "https://api.individual.githubcopilot.com/v1",
+        "https://api.business.githubcopilot.com:443",
+    ],
+)
+def test_copilot_hosts_keep_deferral(url: str) -> None:
+    """Copilot accepts the deferred shape and bills deferred schemas compactly,
+    on the generic host and on the plan hosts seats are sent to (#4155)."""
     tools = [ANTHROPIC_SEARCH_REGEX, {"name": "mcp__srv__a", "defer_loading": True}]
 
-    out = strip_first_party_tool_search_tools_for_third_party_upstream(
-        tools, "https://api.githubcopilot.com"
-    )
-
-    assert out is tools
-    assert anthropic_first_party_tool_search_supported("https://api.githubcopilot.com")
+    assert strip_first_party_tool_search_tools_for_third_party_upstream(tools, url) is tools
 
 
-def test_copilot_host_match_is_exact() -> None:
-    """A lookalike host must not inherit the exemption."""
-    assert not anthropic_first_party_tool_search_supported("https://api.githubcopilot.com.evil.com")
+@pytest.mark.parametrize(
+    "url",
+    [
+        "https://api.githubcopilot.com.evil.com",
+        "https://api.business.githubcopilot.com.evil.com",
+        "https://evilgithubcopilot.com",
+        "https://copilot-api.acme.ghe.com",
+    ],
+)
+def test_copilot_lookalike_hosts_still_downgrade(url: str) -> None:
+    assert not anthropic_first_party_tool_search_supported(url)
 
 
 def test_other_third_party_upstreams_still_downgrade() -> None:
@@ -727,3 +741,12 @@ def test_the_orphan_warning_is_throttled(caplog: pytest.LogCaptureFixture) -> No
 
     lines = [r for r in caplog.records if "tool_search_deferred_orphan" in r.getMessage()]
     assert len(lines) == 1
+
+
+def test_copilot_completions_hosts_do_not_keep_deferral() -> None:
+    tools = [ANTHROPIC_SEARCH_REGEX, {"name": "mcp__srv__a", "defer_loading": True}]
+
+    out = strip_first_party_tool_search_tools_for_third_party_upstream(
+        tools, "https://proxy.business.githubcopilot.com"
+    )
+    assert out is not tools

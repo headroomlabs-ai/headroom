@@ -91,7 +91,11 @@ sha2 = "0.11"
 # unbounded memory growth from a flood of unique session keys. `lru`
 # is the de-facto Rust LRU crate; minimal surface, no dependencies of
 # our own beyond `hashbrown` (which we already pull transitively).
-lru = "0.18"
+# 0.19 corrects the Send bound on shared iterators to require Sync: shared
+# references may cross threads only when their referents are Sync. Our caches
+# use String/Vec<String>/StructuralHash behind Arc<Mutex<_>> and do not
+# transfer iterators; retain the upstream soundness fix without API changes.
+lru = "0.19"
 # PR-D4: GCP Application Default Credentials → bearer token for
 # Vertex `:rawPredict` / `:streamRawPredict`. See workspace
 # Cargo.toml for rationale.

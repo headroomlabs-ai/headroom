@@ -9,6 +9,9 @@ on:
       - 'headroom/transforms/**'
       - 'headroom/evals/**'
       - 'headroom/compress.py'
+      - 'crates/**'          # Rust compressors are compiled into headroom._core
+      - 'Cargo.toml'         # and exercised by the eval smoke test (SmartCrusher
+      - 'Cargo.lock'         # import in the smoke-test job); Rust-only PRs currently skip it
 
 permissions:
   contents: read
@@ -20,13 +23,13 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v7
-      - uses: actions/setup-python@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         with:
           python-version: "3.11"
 
       - name: Cache pip
-        uses: actions/cache@v6
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ~/.cache/pip
           key: ${{ runner.os }}-pip-eval-${{ hashFiles('pyproject.toml') }}
@@ -35,18 +38,18 @@ jobs:
       # `pip install -e .` invokes maturin (declared in pyproject.toml's
       # build-system) which calls cargo to compile the Rust extension.
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
         with:
           toolchain: 1.95.0 # Keep in sync with rust-toolchain.toml.
 
       - name: Cache cargo registry + build
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           workspaces: ". -> target"
 
       - name: Install dependencies (builds Rust extension via maturin)
         run: |
-          pip install -e ".[all]"
+          pip install -e ".[all,evals]"
           python -c "from headroom._core import SmartCrusher; print('headroom._core OK:', SmartCrusher)"
 
       - name: Run CCR round-trip (zero cost)
@@ -92,31 +95,31 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 90
     steps:
-      - uses: actions/checkout@v7
-      - uses: actions/setup-python@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         with:
           python-version: "3.11"
 
       - name: Cache pip
-        uses: actions/cache@v6
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ~/.cache/pip
           key: ${{ runner.os }}-pip-eval-${{ hashFiles('pyproject.toml') }}
           restore-keys: ${{ runner.os }}-pip-eval-
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
         with:
           toolchain: 1.95.0 # Keep in sync with rust-toolchain.toml.
 
       - name: Cache cargo registry + build
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           workspaces: ". -> target"
 
       - name: Install dependencies (builds Rust extension via maturin)
         run: |
-          pip install -e ".[all]"
+          pip install -e ".[all,evals,ml]"
           python -c "from headroom._core import SmartCrusher; print('headroom._core OK')"
       - name: Run Tier 1 evaluation suite
         run: |
@@ -154,7 +157,7 @@ jobs:
       # Real-dataset recall on the prose path (HotpotQA): does the ground-truth
       # answer survive compressing the supporting context? Uses the production
       # routing path, so prose flows through Kompress (ModernBERT) — allowed here
-      # because the weekly job installs [all]. Non-blocking and defensive: a
+      # because the weekly job explicitly installs [ml]. Non-blocking and defensive: a
       # dataset download or model failure warns rather than fails the job.
       - name: Dataset recall report — HotpotQA (model-allowed, non-blocking)
         run: |
@@ -179,7 +182,7 @@ jobs:
 
       - name: Upload results
         if: always()
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: eval-results-${{ github.run_number }}
           path: eval_results/

@@ -16,10 +16,39 @@ if (process.argv[2] === '--serve') {
     if (message === 'stop') { server.close(() => process.exit(0)); server.closeAllConnections(); }
   });
 } else {
+  const fs = require('node:fs');
   const test = require('node:test');
   const assert = require('node:assert/strict');
   const http = require('node:http');
   const { fork } = require('node:child_process');
+
+  // Bundled copies npm does not let overrides reach, so the npm pin itself has
+  // to carry the fix. 12.2.2 is the first release that does.
+  const BUNDLED_FIXES = { undici: '6.29.1', 'ip-address': '10.7.5' };
+  const bundlePath = (name) => `node_modules/npm/node_modules/${name}`;
+  const parse = (version) => version.split('.').map(Number);
+  const atLeast = (version, floor) => {
+    const [a, b] = [parse(version), parse(floor)];
+    for (let i = 0; i < Math.max(a.length, b.length); i++) {
+      if ((a[i] ?? 0) !== (b[i] ?? 0)) return (a[i] ?? 0) > (b[i] ?? 0);
+    }
+    return true;
+  };
+
+  test('npm bundles the fixed undici and ip-address instead of excepting them', () => {
+    const exceptions = JSON.parse(
+      fs.readFileSync(path.join(process.cwd(), 'npm-audit-exceptions.json'), 'utf8'),
+    );
+    for (const [name, fixed] of Object.entries(BUNDLED_FIXES)) {
+      const manifest = path.join(process.cwd(), 'node_modules', 'npm', 'node_modules', name, 'package.json');
+      const { version } = JSON.parse(fs.readFileSync(manifest, 'utf8'));
+      assert.ok(atLeast(version, fixed), `npm bundles ${name} ${version}, below the fixed ${fixed}`);
+      const excepted = Object.keys(exceptions.advisories).filter(
+        (advisory) => bundlePath(name) in exceptions.advisories[advisory],
+      );
+      assert.deepEqual(excepted, [], `${bundlePath(name)} ${version} carries a fix: drop its exceptions`);
+    }
+  });
 
   test('Ajv rejects a percent-encoded scheme instead of aliasing an HTTPS schema', () => {
     const Ajv = fromTools('ajv');
@@ -32,6 +61,30 @@ if (process.argv[2] === '--serve') {
       () => ajv.compile({ $ref: '%68ttps://example.invalid/defs.json' }),
       { message: 'URI scheme is malformed.' },
     );
+  });
+
+  test('minimatch bounds the **/.. expansion instead of comparing every pair (GHSA-g3hv-75wg-m249)', () => {
+    // The copy OpenClaw resolves, which the openclaw override pins.
+    const fromOpenclaw = createRequire(
+      path.join(process.cwd(), 'node_modules', 'openclaw', 'package.json'),
+    );
+    const { Minimatch } = fromOpenclaw('minimatch');
+    const { partsMatch } = Minimatch.prototype;
+    assert.equal(typeof partsMatch, 'function', 'minimatch internals changed: rewrite this check');
+    let calls = 0;
+    Minimatch.prototype.partsMatch = function countedPartsMatch(...args) {
+      calls++;
+      return partsMatch.apply(this, args);
+    };
+    try {
+      // Each `**/../x/y` doubles the expanded pattern parts: 4096 here.
+      const mm = new Minimatch('**/../x/y/'.repeat(12) + 'z', { optimizationLevel: 2 });
+      assert.equal(mm.match('x/y/'.repeat(12) + 'z'), true);
+    } finally {
+      Minimatch.prototype.partsMatch = partsMatch;
+    }
+    // minimatch 10.2.6 compares every pair of parts: 8,386,560 calls.
+    assert.ok(calls < 100000, `${calls} pairwise part comparisons`);
   });
 
   test('unsupported charset with invalid gzip leaves the Express process healthy', async (t) => {

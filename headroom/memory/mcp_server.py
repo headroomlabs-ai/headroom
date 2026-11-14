@@ -36,7 +36,7 @@ from typing import Any
 
 from mcp.server import Server
 from mcp.server.stdio import stdio_server
-from mcp.types import TextContent, Tool
+from mcp.types import CallToolResult, ListToolsResult, TextContent, Tool
 
 from headroom.memory.backends.local import LocalBackend, LocalBackendConfig
 
@@ -55,7 +55,7 @@ _TOOLS = [
             "project context, user preferences, org info, codenames, debugging history, "
             "or anything that might have been discussed before."
         ),
-        inputSchema={
+        input_schema={
             "type": "object",
             "properties": {
                 "query": {
@@ -86,7 +86,7 @@ _TOOLS = [
             "Good:  facts: ['Repo owner is Tejas C.', 'User prefers dark mode']\n"
             "Bad:   facts: ['Repo owner is Tejas C. Prefers dark mode.']"
         ),
-        inputSchema={
+        input_schema={
             "type": "object",
             "properties": {
                 "facts": {
@@ -159,7 +159,8 @@ async def _warm_up_backend(backend: LocalBackend, user_id: str) -> None:
 def create_memory_server(db_path: str, user_id: str = "default") -> Server:
     """Create an MCP server backed by headroom's local memory."""
 
-    server = Server("headroom-memory")
+    # MCP 2.x takes handlers as constructor callbacks, so the ``Server`` is built
+    # at the end of this factory once the handler closures below exist.
     _backend: LocalBackend | None = None
     _init_task: asyncio.Task[LocalBackend] | None = None
     _close_lock = asyncio.Lock()
@@ -246,24 +247,33 @@ def create_memory_server(db_path: str, user_id: str = "default") -> Server:
                 except Exception as cleanup_error:
                     logger.warning("Memory MCP: failed backend cleanup: %s", cleanup_error)
 
-    @server.list_tools()
-    async def list_tools() -> list[Tool]:
+    async def on_list_tools(ctx: Any, params: Any = None) -> ListToolsResult:
         # Kick off background init on first list_tools (called at MCP handshake)
         if _backend is None:
             _start_backend_init()
-        return _TOOLS
+        return ListToolsResult(tools=list(_TOOLS))
 
-    @server.call_tool()
-    async def call_tool(name: str, arguments: dict) -> list[TextContent]:
+    async def on_call_tool(ctx: Any, params: Any) -> CallToolResult:
+        name = params.name
+        # 2.x types ``arguments`` as optional; the handlers below index into it.
+        arguments: dict[str, Any] = params.arguments or {}
         backend = await _get_backend()
 
+        content: list[TextContent]
         if name == "memory_search":
-            return await _handle_search(backend, arguments, user_id)
+            content = await _handle_search(backend, arguments, user_id)
         elif name == "memory_save":
-            return await _handle_save(backend, arguments, user_id)
+            content = await _handle_save(backend, arguments, user_id)
+        else:
+            content = [TextContent(type="text", text=f"Unknown tool: {name}")]
 
-        return [TextContent(type="text", text=f"Unknown tool: {name}")]
+        return CallToolResult(content=list(content))
 
+    server = Server(
+        "headroom-memory",
+        on_list_tools=on_list_tools,
+        on_call_tool=on_call_tool,
+    )
     server._headroom_close = _close_backend  # type: ignore[attr-defined]
     return server
 

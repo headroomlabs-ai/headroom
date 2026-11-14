@@ -157,7 +157,7 @@ def _github_host() -> str:
     configured_url = os.environ.get("GITHUB_COPILOT_API_URL", "").strip()
     if configured_url:
         hostname = _configured_url_hostname(configured_url)
-        if _is_public_copilot_api_host(hostname):
+        if is_public_copilot_api_host(hostname):
             return DEFAULT_GITHUB_HOST
         for prefix in ("copilot-api.", "api."):
             if hostname.startswith(prefix):
@@ -231,7 +231,7 @@ def _copilot_subdomain_enterprise_host(enterprise_url: str) -> str | None:
     if (
         not host
         or host in {"github.com", "www.github.com", "api.github.com"}
-        or _is_public_copilot_api_host(host)
+        or is_public_copilot_api_host(host)
     ):
         return None
     return host
@@ -361,7 +361,7 @@ def copilot_nes_base_url(model: Any, upstream_base_url: str) -> str | None:
 
     if not (isinstance(model, str) and model.startswith("copilot-nes-")):
         return None
-    if not _is_public_copilot_api_host(_url_host(upstream_base_url)):
+    if not is_public_copilot_api_host(_url_host(upstream_base_url)):
         return None
     if is_copilot_completions_host(upstream_base_url):
         return None
@@ -401,7 +401,7 @@ def copilot_completions_base_url() -> str:
     if _observed_completions_base_url:
         return _observed_completions_base_url
     configured = _configured_api_url_override()
-    if configured and not _is_public_copilot_api_host(_url_host(configured)):
+    if configured and not is_public_copilot_api_host(_url_host(configured)):
         return configured
     return DEFAULT_COMPLETIONS_PROXY_URL
 
@@ -1318,7 +1318,7 @@ def is_copilot_api_url(url: str | None) -> bool:
     if configured_host and host == configured_host:
         return True
     hostname = (parsed.hostname or host.split("/", 1)[0]).lower()
-    return _is_public_copilot_api_host(hostname) or _is_ghe_copilot_api_host(hostname)
+    return is_public_copilot_api_host(hostname) or _is_ghe_copilot_api_host(hostname)
 
 
 def is_copilot_upstream_url(url: str | None) -> bool:
@@ -1340,7 +1340,7 @@ def is_copilot_upstream_url(url: str | None) -> bool:
     return is_copilot_api_url(url) or is_copilot_completions_host(url)
 
 
-def _is_public_copilot_api_host(host: str) -> bool:
+def is_public_copilot_api_host(host: str) -> bool:
     """Return True for GitHub-hosted Copilot API domains."""
 
     return host == "githubcopilot.com" or host.endswith(".githubcopilot.com")
