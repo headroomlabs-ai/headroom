@@ -53,8 +53,9 @@ savings ledger keeps each event's labels (at most 16) for its retention window.
 `-name` removes a name from what the rest of the list selects, so write `default,-client`
 to keep the other built-ins; `-client` alone selects nothing. A header value is
 percent-decoded once. Only the first 6,702 characters of `X-Headroom-Labels` are read,
-enough for 16 full-length labels with every character percent-encoded; a pair cut by
-that limit is dropped, not shortened.
+enough for 16 full-length ASCII labels with every character percent-encoded; a pair cut
+by that limit is dropped, not shortened. A dimension name may not start with `-` or `.`,
+and `unknown` is not a label: it is what the ledger shows for an event with none.
 
 `none` stops labels being resolved and booked. Each ledger event still records the
 harness in its own `client` key, as it did before labels existed.
@@ -94,7 +95,10 @@ refused. `--where` still filters on it. Pick another name for a new dimension.
 
 `/stats` (`savings.by_dimension`) and `/stats-lifetime` (`by_dimension`) carry the
 lifetime totals, and the dashboard shows them in **Savings by Label** (`project` keeps
-its own Per-Project table, which reads the older `projects` totals). Because labels
+its own Per-Project table, which reads the older `projects` totals). Each label has
+`tokens_saved` (compression), `tool_tokens_saved` (deferred tool schemas) and their sum,
+`headline_tokens_saved`, the figure the ledger counts as saved; labels are ranked and
+evicted by that sum. Because labels
 can name machines and people, these fields are returned only to callers allowed
 to see per-request `/stats` metadata (loopback, a trusted dashboard client, or a
 caller holding `HEADROOM_PROXY_TOKEN`; see the
@@ -126,8 +130,9 @@ register_dimension("region", lambda request: request.header("x-region"))
 ```
 
 `replace=True` takes over a built-in. The new resolver is then the only source of that
-label in `by_dimension`, request-log tags and `OutcomeSnapshot.attribution`: the harness
-or project the proxy detects itself no longer overrides it.
+label in `by_dimension` and `OutcomeSnapshot.attribution`: the harness or project the
+proxy detects itself no longer overrides it. In request-log tags its label wins too, but
+when it finds nothing the tag still shows what the proxy detected.
 
 Two older records keep what the proxy detected. The `projects` totals are one. The
 ledger is the other, for `client` only: each event has a single `client` key, which is
