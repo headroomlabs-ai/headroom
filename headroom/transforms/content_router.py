@@ -6380,8 +6380,9 @@ class ContentRouter(Transform):
             )
         )
 
-        # Pre-process: Read lifecycle management (stale/superseded detection)
-        if self.config.read_lifecycle.enabled:
+        # Pre-process: Read lifecycle management (stale/superseded detection).
+        # Lossless mode keeps every Read: a stale notice drops the bytes.
+        if self.config.read_lifecycle.enabled and not self.config.lossless:
             from .read_lifecycle import ReadLifecycleManager
 
             # is None (not truthiness) so falsy test doubles are honored;
@@ -6395,9 +6396,11 @@ class ContentRouter(Transform):
                 except ImportError:
                     pass
 
+            # Marker-free modes get the notice without a hash nobody can redeem.
             lifecycle_mgr = ReadLifecycleManager(
                 self.config.read_lifecycle,
                 compression_store=injected_store,
+                retrieval_markers=self.config.ccr_inject_marker,
             )
             lifecycle_result = lifecycle_mgr.apply(
                 messages,
