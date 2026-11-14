@@ -23,6 +23,6 @@
     "@google/genai@2.27.0": true,
     "esbuild@0.28.2": true,
     "protobufjs@7.6.6": true,
-    "openclaw@2026.10.10": true
+    "openclaw@2026.11.2": true
   }
 }
