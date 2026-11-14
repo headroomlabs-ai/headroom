@@ -11234,6 +11234,8 @@ class OpenAIHandlerMixin:
         # outcome (`commit`). With none claiming it — legacy mode — nothing
         # below this comment changes behaviour.
         from headroom.proxy.compress_turn import CompressTurnError, begin_compress_turn
+        from headroom.proxy.gateway_native import attach_view as attach_native_view
+        from headroom.proxy.gateway_native import native_count, view_count, view_recent, view_shape
         from headroom.proxy.gateway_responses import build_view as build_responses_view
         from headroom.proxy.gateway_responses import is_responses_body
         from headroom.proxy.gateway_responses import mark_view as mark_responses_view
@@ -11305,9 +11307,13 @@ class OpenAIHandlerMixin:
         # `input` in place: `build_provider_body` rebuilds the same view to put
         # the compressed text back, so nothing outside these two points needs
         # to know which wire shape arrived. See `gateway_responses`.
+        # Gemini `contents` and Bedrock Converse get the same kind of view;
+        # see `gateway_native`.
         if is_responses_body(body):
             body["messages"] = build_responses_view(body).messages
             mark_responses_view(body)
+        elif isinstance(body, dict):
+            attach_native_view(body)
 
         messages = body.get("messages")
         model = body.get("model")
@@ -11500,6 +11506,27 @@ class OpenAIHandlerMixin:
                         }
                     },
                 )
+            # A Gemini or Converse body cannot carry `headroom_retrieve` (its
+            # tools are forwarded untouched) and gets no re-drive, so a CCR
+            # marker in it would point at content the model can never fetch.
+            native = view_shape(body)
+            if mode == "ccr" and native:
+                return JSONResponse(
+                    status_code=400,
+                    content={
+                        "error": {
+                            "type": "invalid_request",
+                            "message": (
+                                f"config.mode='ccr' is not supported for {native} bodies: "
+                                "Headroom cannot add its retrieval tool to a native Gemini "
+                                "or Bedrock Converse request, so the model could not "
+                                "resolve a CCR marker. Use lossless, lossy_inline or "
+                                "lossless_then_lossy, or omit config.mode for the default "
+                                "marker-free mode."
+                            ),
+                        }
+                    },
+                )
             if mode == "lossless":
                 pipeline = self._lossless_pipeline()
             elif mode in ("lossy_inline", "lossless_then_lossy"):
@@ -11519,17 +11546,22 @@ class OpenAIHandlerMixin:
                 "model_limit": context_limit,
                 **proxy_pipeline_kwargs(self.config),
             }
-            if mode == "lossless":
+            # A native body's pipeline numbers view messages, so a dedup
+            # pointer would name a message the model does not see.
+            if mode == "lossless" or native:
                 pipeline_kwargs["cross_turn_dedup_recoverable"] = False
             if compress_user_messages:
                 pipeline_kwargs["compress_user_messages"] = True
             if target_ratio is not None:
                 pipeline_kwargs["target_ratio"] = float(target_ratio)
+            # Both counts are in the caller's messages; a native body's
+            # pipeline sees view messages.
             if protect_recent is not None:
-                pipeline_kwargs["protect_recent"] = int(protect_recent)
+                pipeline_kwargs["protect_recent"] = view_recent(body, int(protect_recent))
             if protect_analysis_context is not None:
                 pipeline_kwargs["protect_analysis_context"] = bool(protect_analysis_context)
             if frozen_message_count is not None:
+                frozen_message_count = view_count(body, frozen_message_count)
                 pipeline_kwargs["frozen_message_count"] = frozen_message_count
 
             # Sidecar session pre-work: swap in previously-computed compressed
@@ -11726,7 +11758,7 @@ class OpenAIHandlerMixin:
                         shared.publish(self.session_tracker_store, _session_key, session_tracker)
                     info = {
                         "id": session_id,
-                        "frozen_message_count": session_frozen,
+                        "frozen_message_count": native_count(body, session_frozen),
                         "cached_prefix_replayed": turn.replayed,
                     }
                     return result, final, raw_tokens_before, final_tokens_after, info

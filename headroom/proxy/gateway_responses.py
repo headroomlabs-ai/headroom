@@ -267,7 +267,7 @@ def _json_safe(original: Any, replacement: str) -> bool:
     return True
 
 
-def _message_text(message: Any) -> str | None:
+def message_text(message: Any) -> str | None:
     """The text the pipeline left in a view message.
 
     It may hand back a bare string or a content list, depending on which
@@ -306,7 +306,7 @@ def apply_view(
     changed = False
 
     for message, slot in zip(messages, view.slots):
-        text = _message_text(message)
+        text = message_text(message)
         if text is None:
             continue
 
