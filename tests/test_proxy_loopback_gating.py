@@ -1119,3 +1119,40 @@ def test_metrics_token_authenticated_network_caller_allowed(
     assert network.get("/metrics").status_code == 401
     ok = network.get("/metrics", headers={"Authorization": "Bearer s3cr3t-token"})
     assert ok.status_code == 200, ok.text
+
+
+def _gateway_peer_client(monkeypatch: pytest.MonkeyPatch, **kwargs) -> TestClient:
+    monkeypatch.setenv("HEADROOM_PROXY_TRUSTED_GATEWAY_CIDRS", "172.17.0.0/16")
+    monkeypatch.delenv("HEADROOM_PROXY_TRUSTED_DASHBOARD_CLIENT_CIDRS", raising=False)
+    return TestClient(
+        _make_app(), base_url="http://localhost:8787", client=("172.17.0.9", 1), **kwargs
+    )
+
+
+def test_settings_read_still_served_to_trusted_gateway_peer(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The gateway-CIDR rule exists so a containerised dashboard can read."""
+    client = _gateway_peer_client(monkeypatch)
+    assert client.get("/settings").status_code == 200
+    assert client.get("/settings/schema").status_code == 200
+
+
+@pytest.mark.parametrize("path", ["/settings", "/settings/apply"])
+def test_settings_write_refused_for_trusted_gateway_peer(
+    monkeypatch: pytest.MonkeyPatch, path: str
+) -> None:
+    """A gateway-CIDR peer is loopback-equivalent for reads only, never writes."""
+    from headroom.install import runtime as install_runtime
+
+    # Safety net: if the guard regresses, /settings/apply must not restart anything.
+    monkeypatch.setattr(install_runtime, "restart_current_deployment", lambda: {"restarted": False})
+    monkeypatch.setattr(install_runtime, "detect_current_deployment", lambda: (None, "foreground"))
+    client = _gateway_peer_client(monkeypatch)
+    resp = client.post(path, json={"values": {}})
+    assert resp.status_code == 404, resp.text
+
+
+def test_settings_write_allowed_for_real_loopback() -> None:
+    resp = _loopback_client().post("/settings", json={"values": {}})
+    assert resp.status_code == 200, resp.text

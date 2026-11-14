@@ -2979,7 +2979,7 @@ def _register_memory_components(proxy: HeadroomProxy, tracker: MemoryTracker) ->
     # registered when the memory system is initialized with specific backends.
 
 
-def _request_is_loopback(request: Request) -> bool:
+def _request_is_loopback(request: Request, *, allow_gateway_peer: bool = True) -> bool:
     """Return True iff the caller is on loopback by *both* peer IP and Host header.
 
     Mirrors the two-gate check in :func:`loopback_guard.require_loopback`
@@ -2988,6 +2988,9 @@ def _request_is_loopback(request: Request) -> bool:
     payload — serving sensitive sub-blocks (upstream URLs, per-request logs)
     only to loopback callers — rather than 404ing network callers that still
     have a legitimate use for the non-sensitive aggregate fields.
+
+    ``allow_gateway_peer=False`` drops the trusted-gateway-CIDR equivalence
+    below, for callers (settings writes) that need a genuine loopback peer.
     """
     from headroom.proxy.loopback_guard import is_loopback_host, is_loopback_host_header
 
@@ -3005,6 +3008,8 @@ def _request_is_loopback(request: Request) -> bool:
     # Genuine loopback peer (native run, or curl inside the container).
     if is_loopback_host(client_host):
         return True
+    if not allow_gateway_peer:
+        return False
 
     # Containerized dashboards: when Headroom runs in a bridge-network
     # container, a browser on the host reaches it via the container's
@@ -3025,9 +3030,11 @@ def _request_is_loopback(request: Request) -> bool:
 def _request_can_view_dashboard_metadata(
     request: Request,
     trusted_dashboard_client_cidrs: tuple[ipaddress.IPv4Network | ipaddress.IPv6Network, ...],
+    *,
+    allow_gateway_peer: bool = True,
 ) -> bool:
     """Authorize sensitive ``/stats`` metadata without widening admin access."""
-    if _request_is_loopback(request):
+    if _request_is_loopback(request, allow_gateway_peer=allow_gateway_peer):
         return True
 
     from headroom.proxy.forwarded_headers import peer_is_trusted_gateway, resolve_client_ip
@@ -4661,6 +4668,17 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
         if not _request_can_view_dashboard_metadata(request, trusted_dashboard_client_cidrs):
             raise HTTPException(status_code=404)
 
+    def _require_loopback_or_trusted_dashboard_client_for_write(request: Request) -> None:
+        """Like the read guard, but a trusted-gateway peer is not loopback.
+
+        The gateway-CIDR equivalence exists for read-only dashboard views; it
+        must not confer settings writes (nor /settings/apply's restart).
+        """
+        if not _request_can_view_dashboard_metadata(
+            request, trusted_dashboard_client_cidrs, allow_gateway_peer=False
+        ):
+            raise HTTPException(status_code=404)
+
     def _authenticated_at_gate(request: Request) -> bool:
         """True when the security gate verified this request's proxy token.
 
@@ -4752,7 +4770,7 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
         already an IP-literal-Host, CIDR-trusted dashboard client. Loopback
         callers keep the stricter loopback-only origin check unchanged.
         """
-        if not _request_is_loopback(request):
+        if not _request_is_loopback(request, allow_gateway_peer=False):
             origin = request.headers.get("origin")
             host_header = request.headers.get("host")
             if (
@@ -4760,7 +4778,9 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
                 and origin != "null"
                 and host_header
                 and _request_has_same_origin_or_no_provenance(request, host_header)
-                and _request_can_view_dashboard_metadata(request, trusted_dashboard_client_cidrs)
+                and _request_can_view_dashboard_metadata(
+                    request, trusted_dashboard_client_cidrs, allow_gateway_peer=False
+                )
             ):
                 return
         _require_same_origin(request)
@@ -4979,7 +4999,7 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
     @app.post(
         "/settings",
         dependencies=[
-            Depends(_require_loopback_or_trusted_dashboard_client),
+            Depends(_require_loopback_or_trusted_dashboard_client_for_write),
             Depends(_require_same_origin_or_trusted_dashboard_client),
         ],
     )
@@ -5029,7 +5049,7 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
     @app.post(
         "/settings/apply",
         dependencies=[
-            Depends(_require_loopback_or_trusted_dashboard_client),
+            Depends(_require_loopback_or_trusted_dashboard_client_for_write),
             Depends(_require_same_origin_or_trusted_dashboard_client),
         ],
     )
