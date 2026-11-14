@@ -291,6 +291,13 @@ class CompressionStore:
         # started: [original tokens stored, compressed tokens stored, retrievals].
         self._own_totals = [0, 0, 0]
         self._backend_revision = self._read_backend_revision()
+        self._write_seq: int = 0
+
+    @property
+    def write_seq(self) -> int:
+        """Monotonic counter incremented on store/clear mutations."""
+        with self._lock:
+            return self._write_seq
 
     @property
     def default_ttl_seconds(self) -> int:
@@ -471,6 +478,7 @@ class CompressionStore:
                 raise StorageError(
                     f"CCR store did not keep hash={hash_key}; keep the original content"
                 )
+            self._write_seq += 1
             if self._backend_expires_entries:
                 if existing is None:
                     self._own_totals[0] += entry.original_tokens
@@ -848,6 +856,7 @@ class CompressionStore:
             self._expiration_heap.clear()
             self._stale_heap_entries = 0  # CRITICAL FIX: Reset stale counter
             self._stale_expiration_heap_entries = 0
+            self._write_seq += 1
 
     def close(self) -> None:
         """Close the storage backend and release its resources.

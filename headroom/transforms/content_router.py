@@ -7287,6 +7287,10 @@ class ContentRouter(Transform):
 
         # --- Pass 2: Parallel compression of all cache-miss messages ---
         if pending_tasks:
+            _ccr_store = self._resolve_ccr_store(kwargs.get("compression_store"))
+            _ccr_write_seq_before = (
+                getattr(_ccr_store, "write_seq", None) if _ccr_store is not None else None
+            )
             max_workers = min(len(pending_tasks), _compress_workers())
             t_parallel_start = time.perf_counter()
 
@@ -7448,16 +7452,27 @@ class ContentRouter(Transform):
                     # warmed when the net-cost gate blocks the slot: the
                     # gate's verdict is contextual (suffix size), the
                     # compression result is not.
-                    self._cache.put(
-                        content_key,
-                        result.compressed,
-                        accept_ratio,
-                        result.strategy_used.value,
-                        marker_hashes=self._collect_verified_marker_hashes(
-                            result.compressed,
-                            compression_store=kwargs.get("compression_store"),
-                        ),
+                    _ccr_store_wrote = (
+                        _ccr_write_seq_before is not None
+                        and _ccr_store is not None
+                        and getattr(_ccr_store, "write_seq", None) != _ccr_write_seq_before
                     )
+                    _marker_hashes = self._collect_verified_marker_hashes(
+                        result.compressed,
+                        compression_store=kwargs.get("compression_store"),
+                        store_wrote=_ccr_store_wrote,
+                    )
+                    if self._markers_currently_retrievable(
+                        _marker_hashes,
+                        compression_store=kwargs.get("compression_store"),
+                    ):
+                        self._cache.put(
+                            content_key,
+                            result.compressed,
+                            accept_ratio,
+                            result.strategy_used.value,
+                            marker_hashes=_marker_hashes,
+                        )
                     # Freeze "compress" so the cache-hit path above never
                     # re-applies a tighter min_ratio to this block.
                     if freeze_decision:
@@ -7954,31 +7969,44 @@ class ContentRouter(Transform):
         cls,
         compressed_text: str,
         compression_store: Any = None,
+        store_wrote: bool = False,
     ) -> tuple[str, ...]:
         if not _is_already_compressed(compressed_text):
             return ()
-        hashes = _CCR_MARKER_HASH_RE.findall(compressed_text)
+        hashes = tuple(dict.fromkeys(_CCR_MARKER_HASH_RE.findall(compressed_text)))
         if not hashes:
             return ()
+        if store_wrote:
+            return hashes
         store = cls._resolve_ccr_store(compression_store)
         exists_fn = getattr(store, "exists", None) if store is not None else None
         if exists_fn is None:
             return ()
-        return tuple(h for h in dict.fromkeys(hashes) if exists_fn(h))
+        return tuple(h for h in hashes if exists_fn(h))
+
+    @classmethod
+    def _markers_currently_retrievable(
+        cls,
+        marker_hashes: tuple[str, ...],
+        compression_store: Any = None,
+    ) -> bool:
+        if not marker_hashes:
+            return True
+        store = cls._resolve_ccr_store(compression_store)
+        exists_fn = getattr(store, "exists", None) if store is not None else None
+        if exists_fn is None:
+            return True
+        return all(bool(exists_fn(hash_key)) for hash_key in marker_hashes)
 
     def _cached_markers_retrievable(
         self,
         content_key: str,
         compression_store: Any = None,
     ) -> bool:
-        tracked = self._cache.get_marker_hashes(content_key)
-        if not tracked:
-            return True
-        store = self._resolve_ccr_store(compression_store)
-        exists_fn = getattr(store, "exists", None) if store is not None else None
-        if exists_fn is None:
-            return True
-        return all(bool(exists_fn(hash_key)) for hash_key in tracked)
+        return self._markers_currently_retrievable(
+            self._cache.get_marker_hashes(content_key),
+            compression_store=compression_store,
+        )
 
     def _process_content_blocks(
         self,
@@ -8598,8 +8626,17 @@ class ContentRouter(Transform):
         # Cache miss — run full compression
         if route_counts is not None:
             route_counts["cache_miss"] = route_counts.get("cache_miss", 0) + 1
+        _blk_ccr_store = self._resolve_ccr_store(compression_store)
+        _blk_write_seq_before = (
+            getattr(_blk_ccr_store, "write_seq", None) if _blk_ccr_store is not None else None
+        )
         t0 = time.perf_counter()
         result = self.compress(content, context=context, bias=bias)
+        _blk_store_wrote = (
+            _blk_write_seq_before is not None
+            and _blk_ccr_store is not None
+            and getattr(_blk_ccr_store, "write_seq", None) != _blk_write_seq_before
+        )
         compress_ms = (time.perf_counter() - t0) * 1000
         if compressor_timing is not None:
             key = f"compressor:{result.strategy_used.value}"
@@ -8628,16 +8665,22 @@ class ContentRouter(Transform):
         if _byte_accept and len(result.compressed) < len(content):
             _ll_ratio = len(result.compressed) / max(1, len(content))
             _ll_label = _chain[0] if _is_pure_lossless else "+".join(_chain)
-            self._cache.put(
-                content_key,
+            _blk_markers = self._collect_verified_marker_hashes(
                 result.compressed,
-                _ll_ratio,
-                _ll_label,
-                marker_hashes=self._collect_verified_marker_hashes(
-                    result.compressed,
-                    compression_store=compression_store,
-                ),
+                compression_store=compression_store,
+                store_wrote=_blk_store_wrote,
             )
+            if self._markers_currently_retrievable(
+                _blk_markers,
+                compression_store=compression_store,
+            ):
+                self._cache.put(
+                    content_key,
+                    result.compressed,
+                    _ll_ratio,
+                    _ll_label,
+                    marker_hashes=_blk_markers,
+                )
             transforms_applied.append(f"router:{strategy_label}:{_ll_label}")
             if compressed_details is not None:
                 compressed_details.append(f"{details_prefix}:{_ll_label}:{_ll_ratio:.2f}")
@@ -8680,16 +8723,22 @@ class ContentRouter(Transform):
                     )
                 return None, False
             # Compressed — store in result cache
-            self._cache.put(
-                content_key,
+            _blk_markers = self._collect_verified_marker_hashes(
                 result.compressed,
-                result.compression_ratio,
-                result.strategy_used.value,
-                marker_hashes=self._collect_verified_marker_hashes(
-                    result.compressed,
-                    compression_store=compression_store,
-                ),
+                compression_store=compression_store,
+                store_wrote=_blk_store_wrote,
             )
+            if self._markers_currently_retrievable(
+                _blk_markers,
+                compression_store=compression_store,
+            ):
+                self._cache.put(
+                    content_key,
+                    result.compressed,
+                    result.compression_ratio,
+                    result.strategy_used.value,
+                    marker_hashes=_blk_markers,
+                )
             # Freeze "compress" so the cache-hit path above never re-applies a
             # tighter min_ratio to this block.
             if freeze_decision and self._frozen_verdict_recoverable(

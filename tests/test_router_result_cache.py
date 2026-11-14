@@ -610,3 +610,48 @@ def test_router_invalidates_cached_marker_when_store_cleared():
     )
     assert second.transforms_applied
     assert router._cache.get(cache_key) is not None
+
+
+def test_compress_over_capacity_batch_then_repeat_evicted_original():
+    import copy
+    import re
+
+    from headroom import CompressConfig, compress
+    from headroom.cache.backends import InMemoryBackend
+    from headroom.cache.compression_store import get_compression_store, reset_compression_store
+
+    def make_msg(n: int) -> dict[str, str]:
+        text = "\n".join(
+            f"2026-01-01 12:00:{i % 60:02d} INFO batch{n} processed record {i}" for i in range(251)
+        )
+        return {"role": "tool", "tool_call_id": f"batch-{n}", "content": text}
+
+    reset_compression_store()
+    try:
+        store = get_compression_store(max_entries=2, backend=InMemoryBackend())
+        config = CompressConfig(
+            kompress_model="disabled",
+            protect_recent=0,
+            min_tokens_to_compress=10,
+            compress_system_messages=False,
+        )
+        originals = [make_msg(n) for n in range(3)]
+        batch_result = compress(copy.deepcopy(originals), model="gpt-4o", config=config)
+        batch_keys = [
+            re.findall(r"hash=([0-9a-f]{16,64})", msg["content"])[-1]
+            for msg in batch_result.messages
+        ]
+
+        # Message 0 was evicted by message 2 within the same batch before caching ran.
+        assert store.retrieve(batch_keys[0]) is None
+        assert store.retrieve(batch_keys[2]) is not None
+
+        # Repeating the evicted message alone must re-populate the store rather than
+        # reusing an unbacked marker.
+        repeat_0 = compress([copy.deepcopy(originals[0])], model="gpt-4o", config=config)
+        repeat_0_key = re.findall(r"hash=([0-9a-f]{16,64})", repeat_0.messages[-1]["content"])[-1]
+        retrieved_0 = store.retrieve(repeat_0_key)
+        assert retrieved_0 is not None
+        assert retrieved_0.original_content == originals[0]["content"]
+    finally:
+        reset_compression_store()
