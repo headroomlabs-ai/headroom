@@ -480,3 +480,133 @@ def test_a_result_that_expires_while_a_read_waits_is_not_returned(tmp_path, monk
     reader.join(5)
     assert results == [None]
     assert cache.get("k") is None
+
+
+def test_invalidate_drops_cached_result_without_marking_skipped():
+    cache = CompressionCache(max_bytes=10_000)
+    cache.put("k", "compressed <<ccr:0123456789abcdef>>", 0.2, "log")
+    assert cache.invalidate("k") is True
+    assert cache.invalidate("k") is False
+    assert cache.get("k") is None
+    assert cache.is_skipped("k") is False
+    assert cache.stats["cache_bytes"] == 0
+
+
+def test_compress_repopulates_ccr_store_after_capacity_eviction():
+    import copy
+    import re
+
+    from headroom import CompressConfig, compress
+    from headroom.cache.backends import InMemoryBackend
+    from headroom.cache.compression_store import get_compression_store, reset_compression_store
+
+    def messages(n: int) -> list[dict[str, str]]:
+        text = "\n".join(
+            f"2026-01-01 12:00:{i % 60:02d} INFO case{n} processed record {i}" for i in range(251)
+        )
+        return [{"role": "tool", "tool_call_id": f"case-{n}", "content": text}]
+
+    reset_compression_store()
+    try:
+        store = get_compression_store(max_entries=2, backend=InMemoryBackend())
+        config = CompressConfig(
+            kompress_model="disabled",
+            protect_recent=0,
+            min_tokens_to_compress=10,
+            compress_system_messages=False,
+        )
+        originals = [messages(n) for n in range(3)]
+        keys = []
+        for original in originals:
+            result = compress(copy.deepcopy(original), model="gpt-4o", config=config)
+            keys.append(re.findall(r"hash=([0-9a-f]{16,64})", result.messages[-1]["content"])[-1])
+
+        assert store.retrieve(keys[0]) is None
+
+        repeat = compress(copy.deepcopy(originals[0]), model="gpt-4o", config=config)
+        repeat_key = re.findall(r"hash=([0-9a-f]{16,64})", repeat.messages[-1]["content"])[-1]
+        retrieved = store.retrieve(repeat_key)
+        assert retrieved is not None
+        assert retrieved.original_content == originals[0][-1]["content"]
+    finally:
+        reset_compression_store()
+
+
+def test_compress_block_content_repopulates_ccr_store_after_capacity_eviction():
+    import copy
+    import re
+
+    from headroom import CompressConfig, compress
+    from headroom.cache.backends import InMemoryBackend
+    from headroom.cache.compression_store import get_compression_store, reset_compression_store
+
+    def messages(n: int) -> list[dict]:
+        text = "\n".join(
+            f"2026-01-01 12:00:{i % 60:02d} INFO block{n} processed record {i}" for i in range(251)
+        )
+        return [
+            {
+                "role": "user",
+                "content": [{"type": "tool_result", "tool_use_id": f"b-{n}", "content": text}],
+            }
+        ]
+
+    reset_compression_store()
+    try:
+        store = get_compression_store(max_entries=2, backend=InMemoryBackend())
+        config = CompressConfig(
+            kompress_model="disabled",
+            protect_recent=0,
+            min_tokens_to_compress=10,
+            compress_system_messages=False,
+        )
+        originals = [messages(n) for n in range(3)]
+        keys = []
+        for original in originals:
+            result = compress(copy.deepcopy(original), model="gpt-4o", config=config)
+            compressed_text = result.messages[-1]["content"][0]["content"]
+            keys.append(re.findall(r"hash=([0-9a-f]{16,64})", compressed_text)[-1])
+
+        assert store.retrieve(keys[0]) is None
+
+        repeat = compress(copy.deepcopy(originals[0]), model="gpt-4o", config=config)
+        repeat_text = repeat.messages[-1]["content"][0]["content"]
+        repeat_key = re.findall(r"hash=([0-9a-f]{16,64})", repeat_text)[-1]
+        retrieved = store.retrieve(repeat_key)
+        assert retrieved is not None
+        assert retrieved.original_content == originals[0][-1]["content"][0]["content"]
+    finally:
+        reset_compression_store()
+
+
+def test_router_invalidates_cached_marker_when_store_cleared():
+    from headroom.cache.backends import InMemoryBackend
+    from headroom.cache.compression_store import CompressionStore
+    from headroom.tokenizer import Tokenizer
+    from headroom.tokenizers.estimator import EstimatingTokenCounter
+
+    custom_store = CompressionStore(max_entries=4, backend=InMemoryBackend())
+    router = ContentRouter(ContentRouterConfig())
+    text = "\n".join(f"2026-01-01 12:00:{i % 60:02d} INFO custom {i}" for i in range(251))
+    msgs = [{"role": "tool", "tool_call_id": "t1", "content": text}]
+
+    stored_key = custom_store.store(text, "[compressed]")
+    cache_key = router._content_cache_key(text, bias=1.0, context="", gated=True)
+    router._cache.put(
+        cache_key,
+        f"[251 lines compressed. Retrieve more: hash={stored_key}]",
+        0.1,
+        "log",
+        marker_hashes=(stored_key,),
+    )
+    assert router._cached_markers_retrievable(cache_key, compression_store=custom_store)
+    custom_store.clear()
+    assert not router._cached_markers_retrievable(cache_key, compression_store=custom_store)
+    second = router.apply(
+        msgs,
+        Tokenizer(EstimatingTokenCounter()),
+        compression_store=custom_store,
+        min_tokens_to_compress=10,
+    )
+    assert second.transforms_applied
+    assert router._cache.get(cache_key) is not None
