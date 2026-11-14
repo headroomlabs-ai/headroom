@@ -205,6 +205,12 @@ jobs:
             cargo check -p headroom-core --no-default-features --tests \
               --features "${{ matrix.features }}"
           fi
+      - name: cargo test (minimal build runtime coverage)
+        # `cargo check` cannot execute assertions; the empty-feature
+        # configuration is the minimal build whose SourceCode fallback the
+        # runtime integration tests pin, so run the full suite there.
+        if: matrix.features == ''
+        run: cargo test -p headroom-core --no-default-features --tests
 
   simulator-e2e:
     name: simulator e2e (${{ matrix.os }})
