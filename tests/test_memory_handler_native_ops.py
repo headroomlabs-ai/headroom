@@ -52,7 +52,7 @@ class FakeBackend:
         self.updated.append(kwargs)
         return SimpleNamespace(id=kwargs["memory_id"])
 
-    async def delete_memory(self, memory_id: str):  # noqa: ANN201
+    async def delete_memory(self, memory_id: str, user_id: str | None = None):  # noqa: ANN201
         if self.raise_on == "delete":
             raise RuntimeError("delete failed")
         self.deleted.append(memory_id)
@@ -457,7 +457,7 @@ async def test_native_semantic_update_delete_rename_and_backend_errors(
         async def search_memories(self, **kwargs):  # noqa: ANN003
             return self.search_results
 
-        async def delete_memory(self, memory_id: str):  # noqa: ANN201
+        async def delete_memory(self, memory_id: str, user_id: str | None = None):  # noqa: ANN201
             self.deleted.append(memory_id)
             return True
 
@@ -873,7 +873,7 @@ async def test_execute_search_update_delete_and_handler_status(
             self.deleted: list[str] = []
             self.saved: list[dict[str, object]] = []
 
-        async def delete_memory(self, memory_id: str):  # noqa: ANN201
+        async def delete_memory(self, memory_id: str, user_id: str | None = None):  # noqa: ANN201
             self.deleted.append(memory_id)
             return True
 

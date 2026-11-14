@@ -1450,7 +1450,8 @@ your responses, not to drive new actions."""
             return json.dumps({"status": "updated", "memory_id": memory.id})
         else:
             # Fallback: delete old, save new
-            await backend.delete_memory(memory_id)
+            if not await backend.delete_memory(memory_id, user_id=effective_user_id):
+                return json.dumps({"status": "not_found", "memory_id": memory_id})
             memory = await backend.save_memory(
                 content=new_content,
                 user_id=effective_user_id,
@@ -1481,10 +1482,10 @@ your responses, not to drive new actions."""
         if not memory_id:
             return json.dumps({"status": "error", "error": "memory_id is required"})
 
-        backend, _scope, _effective = self._resolve_for_request(user_id, request_context)
+        backend, _scope, effective_user_id = self._resolve_for_request(user_id, request_context)
         if error := self._unresolved_project_error(_scope):
             return error
-        deleted = await backend.delete_memory(memory_id)
+        deleted = await backend.delete_memory(memory_id, user_id=effective_user_id)
 
         return json.dumps(
             {
