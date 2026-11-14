@@ -402,7 +402,7 @@ def _make_llm_judge(model: str) -> Any:
         prompt = (
             "You tune how terse an AI coding assistant should be for one user, "
             "from their behavioral signals. Levels: 1=light (skip ceremony), "
-            "2=no ceremony+no echo, 3=conclusions only, 4=caveman/fragments. "
+            "2=no ceremony+no echo, 3=conclusions only, 4=conclusions only plus a fixed three-line final report. "
             "Users who interrupt often and reply faster than an answer could be "
             "read (fast-skip) want LESS output.\n\n"
             f"Signals: {json.dumps(signals)}\n\n"

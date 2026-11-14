@@ -7,7 +7,7 @@ output tokens, so every lever here works by reshaping the request:
 1. Verbosity steering — a deterministic instruction block appended to the
    TAIL of the system prompt (after any ``cache_control`` breakpoint, so the
    provider prefix cache is preserved). Five levels, from "no ceremony" to
-   full caveman.
+   conclusions only with a fixed three-line final report.
 
 Safety rules (each prevents a concrete failure mode):
 - Never toggle ``thinking.type`` — disabling thinking while history carries
@@ -71,14 +71,13 @@ _replace_or_append_steering_block = replace_or_append_steering_block
 
 
 #: Level handed to an operator who turned the shaper on and said nothing else.
-#: Two, not three: L3 instructs the model to drop content ("give conclusions
-#: only; omit rationale"), which reads as the model getting worse to someone who
-#: did not ask for it -- the same reasoning the feature's own rollout spec gives
-#: for not defaulting the shaper on at all. L2 only forbids ceremony and
-#: restatement. Measured on a long explain-with-code turn (3 paired runs,
-#: non-overlapping ranges): 2375 -> 1663 output tokens, -30%, with no visible
-#: loss of content.
-DEFAULT_VERBOSITY_LEVEL = 2
+#: Four: on paired SWE-bench Verified runs (Claude Code, Opus 5.5) it cut output
+#: tokens about 20% and cost about 16% with no measurable change in tasks
+#: solved. The price is shorter final replies: a blind reviewer judge wanted a
+#: follow-up on 28% of them (vanilla 9%), mostly for a missing root cause. See
+#: the table in ``output_verbosity_policy``. Set HEADROOM_VERBOSITY_LEVEL=3 for
+#: about half the saving at near-vanilla reply quality.
+DEFAULT_VERBOSITY_LEVEL = 4
 
 
 @dataclass(frozen=True)
