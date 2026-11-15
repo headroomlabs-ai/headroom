@@ -12,7 +12,9 @@ from __future__ import annotations
 
 import gzip
 import json
+import os
 import re
+import time
 from pathlib import Path
 from typing import Any
 
@@ -84,6 +86,10 @@ V2_TOP = {
     "errors",
     "strata",
     "config",
+    "client_usage",
+    "model_usage",
+    "client_versions",
+    "install",
 }
 
 
@@ -135,11 +141,13 @@ def _clean_staging():
     S._staged_stacks.clear()
     S._staged_shapes.clear()
     S._staged_tool_shapes.clear()
+    S._staged_client_versions.clear()
     yield
     S._staged_strategies.clear()
     S._staged_stacks.clear()
     S._staged_shapes.clear()
     S._staged_tool_shapes.clear()
+    S._staged_client_versions.clear()
 
 
 @pytest.fixture
@@ -900,7 +908,215 @@ def test_the_worst_case_body_actually_sent_fits_the_oldest_receiver():
         for index in range(600)
     ]
     payload = emit(*outcomes)
+    # The usage tables and versions cannot be shed, so fill them to their caps
+    # with nine-digit counters: the body must still fit.
+    big = dict.fromkeys(S._USAGE_FIELDS, 987_654_321)
+    names = sorted(S._KNOWN_CLIENTS)
+    payload["client_usage"] = [{"client": names[i], **big} for i in range(S.MAX_USAGE_ROWS + 1)]
+    payload["model_usage"] = [
+        {"model": f"claude-opus-4-8-2026010{i}", **big} for i in range(S.MAX_USAGE_ROWS + 1)
+    ]
+    payload["client_versions"] = [
+        {"client": names[i % len(names)], "version": f"1234.1234.{1000 + i}", "n": 987_654_321}
+        for i in range(S.MAX_CLIENT_VERSIONS)
+    ]
     saved = payload["tokens"]["saved"]
     sent = S._fit_to_wire(payload, S.resource_attributes(), compress=False)
     assert len(sent) <= 64 * 1024, f"sent {len(sent):,} B, over the 64KB receiver cap"
     assert payload["tokens"]["saved"] == saved, "trimming cost a v1 counter"
+
+
+# ---------------------------------------------------------------------------
+# usage by harness and model, harness versions, install facts, daily rollover
+# ---------------------------------------------------------------------------
+
+
+def test_usage_tables_split_the_session_totals_without_residue():
+    """`client_usage` and `model_usage` exist to divide a mixed session, so each
+    must add back up to the session: every turn lands in exactly one row,
+    including the turns no harness claimed."""
+
+    class Codex(Outcome):
+        client = "codex"
+        model = "gpt-4o-mini"
+        tags = {"tool_search_deferred_tokens": 70}
+
+    class Gateway(Outcome):
+        client = None
+        provider = "compress"
+        model = "ft:gpt-4o:acme-corp:internal-bot:abc123"
+
+    class Anonymous(Outcome):
+        client = None
+
+    payload = emit(Outcome(), Outcome(), Codex(), Gateway(), Anonymous())
+    by_client = {r["client"]: r for r in payload["client_usage"]}
+    assert {name: r["n"] for name, r in by_client.items()} == {
+        "claude_code": 2,
+        "codex": 1,
+        "via_compress_api": 1,
+        "unidentified": 1,
+    }
+    assert by_client["codex"]["tool_saved"] == 70
+    for table in ("client_usage", "model_usage"):
+        rows = payload[table]
+        assert sum(r["n"] for r in rows) == payload["session"]["turns"], table
+        for column, total in (
+            ("original", "original"),
+            ("saved", "saved"),
+            ("tool_saved", "tool_saved"),
+            ("output", "output"),
+            ("cache_read", "cache_read"),
+            ("cache_write", "cache_write"),
+            ("uncached", "uncached"),
+        ):
+            assert sum(r[column] for r in rows) == payload["tokens"][total], (table, column)
+    # A fine-tune id carries an org name: pooled, never sent.
+    assert "acme" not in json.dumps(payload)
+    assert {r["model"] for r in payload["model_usage"]} == {"gpt-4o", "gpt-4o-mini", "other"}
+
+
+def test_an_mcp_turn_is_labelled_not_dropped():
+    payload = emit(
+        S._McpCompression(
+            original_tokens=800, attempted_input_tokens=800, optimized_tokens=200, tokens_saved=600
+        ),
+        source="mcp",
+    )
+    assert [(r["client"], r["n"], r["saved"]) for r in payload["client_usage"]] == [
+        ("via_mcp", 1, 600)
+    ]
+
+
+def test_usage_tables_pool_overflow_instead_of_losing_turns():
+    table: dict[str, list[int]] = {}
+    for index in range(S.MAX_USAGE_ROWS + 9):
+        S._add_usage(table, f"model{index}", (1, 10))
+    assert len(table) == S.MAX_USAGE_ROWS + 1
+    assert table["other"] == [9, 90]
+    assert sum(row[0] for row in table.values()) == S.MAX_USAGE_ROWS + 9
+
+
+def test_a_caller_supplied_client_name_never_reaches_the_usage_tables(beacon_on):
+    """`classify_client` returns the caller's `X-Client` header as typed, so the
+    name is checked against a closed list, not just for shape."""
+
+    class Named(Outcome):
+        client = "acme-corp-billing"
+
+    S.record_client_version("acme-corp-billing", "1.2.3")
+    payload = emit(Named(), Outcome())
+    assert [(r["client"], r["n"]) for r in payload["client_usage"]] == [
+        ("claude_code", 1),
+        ("other", 1),
+    ]
+    assert payload["client_versions"] == []
+
+
+def test_the_known_client_list_covers_every_harness_the_proxy_can_name():
+    from headroom.proxy.auth_policy import CLIENT_UA_MAP
+    from headroom.telemetry.context import _KNOWN_WRAP_AGENTS
+
+    named = {S._client_slug(name) for _, name in CLIENT_UA_MAP} | set(_KNOWN_WRAP_AGENTS)
+    assert named <= S._KNOWN_CLIENTS, sorted(named - S._KNOWN_CLIENTS)
+
+
+@pytest.mark.parametrize(
+    ("user_agent", "expected"),
+    [
+        ("claude-cli/2.1.311 (external, cli)", ("claude-code", "2.1.311")),
+        ("Corp-Wrapper/9 codex-cli/0.45.0-alpha.3", ("codex", "0.45.0")),
+        ("claude-cli/dev-build", None),
+        ("curl/8.4.0", None),
+        # Over-long or four-part numbers are not releases; never cut one down.
+        ("claude-cli/20261115", None),
+        ("claude-cli/1.2.3456789", None),
+        ("claude-cli/10.0.3.7", None),
+    ],
+)
+def test_user_agent_version_parser(user_agent, expected):
+    from headroom.proxy.auth_policy import client_version_from_user_agent
+
+    assert client_version_from_user_agent(user_agent) == expected
+
+
+def test_only_a_numeric_release_of_a_known_harness_is_staged(beacon_on):
+    S.record_client_version("claude-code", "2.1.311")
+    S.record_client_version("claude-code", "2.1.311")
+    S.record_client_version("claude-code", "2.1.311-internal.example.com")
+    payload = emit(Outcome())
+    assert payload["client_versions"] == [{"client": "claude_code", "version": "2.1.311", "n": 2}]
+
+
+def test_install_facts_report_age_and_ephemerality(tmp_path, monkeypatch):
+    id_file = tmp_path / "install_id"
+    id_file.write_text("a" * 32)
+    ten_days_ago = time.time() - 10 * 86400 - 60
+    os.utime(id_file, (ten_days_ago, ten_days_ago))
+    monkeypatch.setattr(S, "_install_id_path", lambda: id_file)
+    monkeypatch.delenv("HEADROOM_STATELESS", raising=False)
+    monkeypatch.setenv("CI", "true")
+    facts = emit(Outcome())["install"]
+    assert facts["age_days"] == 10 and facts["ci"] is True
+    assert set(facts) == {"age_days", "container", "ci"}
+
+    # Stateless: the id is random per process, so there is no age to report.
+    monkeypatch.setenv("HEADROOM_STATELESS", "1")
+    facts = emit(Outcome())["install"]
+    assert facts["age_days"] == 0
+
+
+def test_a_long_running_session_is_closed_at_the_utc_day_boundary():
+    """An always-on proxy never idles, so its session used to grow for weeks.
+    It now ends at the day boundary; a session that merely runs past midnight
+    is left whole."""
+    day = 86400.0
+    rows: list[dict[str, Any]] = []
+    agg = S.SessionAggregator(rows.append, idle_s=10 * day, flush_s=100 * day)
+    start = 20 * day + 3600.0  # 01:00 UTC
+    agg.record(Outcome(), now=start)
+    agg.record(Outcome(), now=start + 22 * 3600.0)  # 23:00, same day
+    assert rows == []
+    agg.record(Outcome(), now=21 * day + 5.0)  # just past midnight, 23h old
+    assert [(r["session"]["ended"], r["session"]["turns"]) for r in rows] == [("rollover", 2)]
+    agg.record(Outcome(), now=22 * day + 5.0)  # the next piece closes a day later
+    assert [r["session"]["ended"] for r in rows] == ["rollover", "rollover"]
+    assert rows[0]["session"]["id"] != rows[1]["session"]["id"]
+
+    # A clock that steps backwards must not close anything.
+    agg.record(Outcome(), now=21 * day + 5.0)
+    assert len(rows) == 2
+
+    # Started at 20:00 UTC and still going at 01:00: five hours old, untouched.
+    rows.clear()
+    evening = S.SessionAggregator(rows.append, idle_s=10 * day, flush_s=100 * day)
+    evening.record(Outcome(), now=30 * day + 20 * 3600.0)
+    evening.record(Outcome(), now=31 * day + 3600.0)
+    assert rows == []
+
+
+def test_the_proxy_reports_the_harness_release_it_was_called_by(beacon_on):
+    """The wiring, end to end: a real request's User-Agent reaches the payload
+    as a harness and a release, and nothing else from the header does."""
+    from tests.test_header_isolation import _make_anthropic_app
+
+    client, _ = _make_anthropic_app()
+    response = client.post(
+        "/v1/messages",
+        headers={
+            "x-api-key": "test-key",
+            "anthropic-version": "2023-06-01",
+            "user-agent": "claude-cli/2.1.311 (external, cli) host-a.internal",
+        },
+        json={
+            "model": "claude-sonnet-4-6",
+            "max_tokens": 16,
+            "messages": [{"role": "user", "content": "hi"}],
+        },
+    )
+    assert response.status_code == 200, response.text
+    rows: list[dict[str, Any]] = []
+    S.get_session_aggregator().flush_all(emit=rows.append)
+    assert rows[-1]["client_versions"] == [{"client": "claude_code", "version": "2.1.311", "n": 1}]
+    assert rows[-1]["client_usage"][0]["client"] == "claude_code"
+    assert "host-a" not in json.dumps(rows[-1])

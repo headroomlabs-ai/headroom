@@ -327,6 +327,11 @@ if (dir) {
   full.errors = { count: 1, by_status: { 429: 1 } };
   full.strata = [{ dim: 'arm', value: 'treatment', n: 2 }];
   full.config = [{ key: 'mode', value: 'token' }];
+  const usage = { n: 2, original: 9, saved: 3, tool_saved: 1, output: 2, cache_read: 4, cache_write: 1, uncached: 4 };
+  full.client_usage = [{ client: 'claude_code', ...usage }, { client: 'via_compress_api', ...usage }];
+  full.model_usage = [{ model: 'claude-haiku-4-5', ...usage }];
+  full.client_versions = [{ client: 'claude_code', version: '2.1.311', n: 2 }];
+  full.install = { age_days: 12, container: false, ci: false };
   full.routing = { decisions: 3, by_model: [{ model: 'claude-haiku-4-5', n: 3 }], min_prefix: 1024 };
 
   /** One OTLP record through fetch(); returns what would be written to R2. */
@@ -368,6 +373,11 @@ if (dir) {
   injected.session.ended = { nested: 'object where a slug belongs' };
   injected.routing.note = 'free text with spaces';
   injected.trajectory.kinds = 'see attached transcript';
+  injected.client_usage[0].prompt = 'x';                         // unknown key in a usage row
+  injected.client_usage[1].client = 'Acme Corp Billing';         // not a harness slug
+  injected.client_versions[0].version = '2.1.311-host.internal'; // not a release number
+  injected.install.hostname = 'build-7';
+  injected.install.age_days = 'twelve';
   const hostile = [...resourceAttrs.filter((a) => a.key !== 'headroom.stack'),
     { key: 'headroom.stack', value: any({ cwd: '/home/me' }) }];
   const { resource: badResource, ...dropped } = await store(injected, hostile);
@@ -375,6 +385,9 @@ if (dir) {
   const expected = structuredClone(full);
   delete expected.session.ended;
   delete expected.trajectory.kinds;
+  delete expected.client_usage[1].client;
+  delete expected.client_versions[0].version;
+  delete expected.install.age_days;
   expected.config.push({ key: 'endpoint' });
   expected.strata.push({ dim: 'arm', n: 1 });
   assert.deepEqual(dropped, expected, 'a nested field outside the allowlist was stored');
