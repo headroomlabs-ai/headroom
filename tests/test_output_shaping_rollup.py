@@ -212,3 +212,17 @@ def test_fresh_tracker_lifetime_carries_the_range_keys(tmp_path):
     lifetime = SavingsTracker(path=str(tmp_path / "s.json")).snapshot()["lifetime"]
     assert lifetime["output_tokens_saved_high"] == 0
     assert lifetime["output_savings_usd_high"] == 0.0
+
+
+def test_a_response_without_output_usage_books_nothing(tmp_path, l4_factors):
+    """A missing completion count arrives as 0; no tier may read that as
+    the whole baseline saved."""
+    rec = SavingsRecorder(str(tmp_path / "o.json"), flush_every=1)
+    a = "opus|a|s|tools"
+    for i in range(5):
+        rec._ledger.record("control", a, 1000, f"c{i}")
+        rec._ledger.record("treatment", a, 800, f"t{i}")
+        rec._ledger.baseline.observe(a, 1000)
+    shaped = [stratum_label("treatment", a), "output_shaper:verbosity:L4"]
+
+    assert rec.request_savings_range(shaped, 0) == (0, 0)

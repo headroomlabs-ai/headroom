@@ -908,6 +908,10 @@ class SavingsRecorder:
         With no factors registered (plain OSS) the modelled tier never
         appears, so nothing changes there.
         """
+        # Zero output means the provider reported no usage, not a silent
+        # reply: every tier would otherwise book the whole baseline as saved.
+        if output_tokens <= 0:
+            return 0, 0
         label_strings = [str(label) for label in labels or ()]
         level = _shaped_level(label_strings)
         if level is None:
