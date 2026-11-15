@@ -97,7 +97,8 @@ def register_verbosity_text(level: int, text: str) -> None:
     extension that has benchmarked its own wording installs it at startup,
     together with the factors measured for that wording. Call it before the
     proxy serves traffic. Changing a level's text mid-conversation rewrites the
-    system-prompt tail and so busts the provider prefix cache once.
+    system-prompt tail and so busts the provider prefix cache once. The text is
+    process-wide: every app in the process steers with it.
 
     Only levels core already defines can be replaced, so the 0-4 range every
     caller clamps to stays true. The text must be non-empty and must not

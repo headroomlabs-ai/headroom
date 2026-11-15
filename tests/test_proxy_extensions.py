@@ -134,3 +134,24 @@ def test_discover_warns_when_entry_point_enumeration_fails(monkeypatch) -> None:
 
 def test_discover_is_quiet_when_nothing_is_installed(monkeypatch) -> None:
     assert _discover_warnings(monkeypatch, lambda **_: []) == []
+
+
+def test_a_skipped_extension_leaves_no_steering_registrations(monkeypatch) -> None:
+    from headroom.proxy import output_shaper
+    from headroom.proxy.output_savings import register_modelled_factors
+    from headroom.proxy.output_verbosity_policy import register_verbosity_text
+
+    core = output_shaper.steering_registry_snapshot()
+
+    def install(app: Any, config: Any) -> None:
+        output_shaper.register_default_verbosity_level(4)
+        register_verbosity_text(4, "extension text")
+        register_modelled_factors(4, 0.2, 0.5)
+        raise RuntimeError("licence check failed")
+
+    monkeypatch.setattr(extensions, "discover", lambda: iter([("steer", install)]))
+    try:
+        assert extensions.install_all(object(), object(), enabled=["steer"]) == []
+        assert output_shaper.steering_registry_snapshot() == core
+    finally:
+        output_shaper.restore_steering_registry(core)

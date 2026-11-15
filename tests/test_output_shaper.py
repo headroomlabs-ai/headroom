@@ -570,6 +570,16 @@ def test_registered_default_level_applies_only_when_no_level_is_pinned(monkeypat
     assert output_shaper.OutputShaperSettings.from_env(enabled=True).verbosity_level == 2
 
 
+def test_direct_settings_use_the_registered_default_level(monkeypatch) -> None:
+    from headroom.proxy import output_shaper
+
+    monkeypatch.setattr(
+        output_shaper, "DEFAULT_VERBOSITY_LEVEL", output_shaper.DEFAULT_VERBOSITY_LEVEL
+    )
+    output_shaper.register_default_verbosity_level(4)
+    assert output_shaper.OutputShaperSettings(enabled=True).verbosity_level == 4
+
+
 @pytest.mark.parametrize("bad", [5, -1, True, "4"])
 def test_register_default_level_rejects_out_of_range(monkeypatch, bad) -> None:
     from headroom.proxy import output_shaper

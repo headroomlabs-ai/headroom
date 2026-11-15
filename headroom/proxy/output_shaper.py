@@ -30,10 +30,10 @@ from __future__ import annotations
 
 import json
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
-from headroom.proxy import runtime_env
+from headroom.proxy import output_savings, output_verbosity_policy, runtime_env
 from headroom.proxy.output_steering import (
     apply_openai_chat_verbosity_steering,
     apply_openai_responses_verbosity_steering,
@@ -53,6 +53,8 @@ logger = logging.getLogger(__name__)
 __all__ = [
     "DEFAULT_VERBOSITY_LEVEL",
     "register_default_verbosity_level",
+    "restore_steering_registry",
+    "steering_registry_snapshot",
     "OutputShaperSettings",
     "ShapeResult",
     "TurnKind",
@@ -90,7 +92,8 @@ def register_default_verbosity_level(level: int) -> None:
     default. An operator's explicit ``HEADROOM_VERBOSITY_LEVEL`` still wins, and
     a proxy without the extension keeps core's default. Call it at startup:
     the level is read per request, and moving it mid-conversation rewrites
-    the system-prompt tail, busting the prefix cache once.
+    the system-prompt tail, busting the prefix cache once. The setting is
+    process-wide: every app in the process steers at it.
     """
     global DEFAULT_VERBOSITY_LEVEL
     if isinstance(level, bool) or not isinstance(level, int) or not 0 <= level <= 4:
@@ -98,12 +101,45 @@ def register_default_verbosity_level(level: int) -> None:
     DEFAULT_VERBOSITY_LEVEL = level
 
 
+#: What the three extension seams have registered: the default level
+#: (:func:`register_default_verbosity_level`), each level's steering text
+#: (``output_verbosity_policy.register_verbosity_text``) and the modelled savings
+#: factors (``output_savings.register_modelled_factors``). A new seam belongs here.
+SteeringRegistry = tuple[int, dict[int, str], dict[int, tuple[float, float]]]
+
+
+def steering_registry_snapshot() -> SteeringRegistry:
+    """Copy of everything the steering and savings seams can change."""
+    return (
+        DEFAULT_VERBOSITY_LEVEL,
+        dict(output_verbosity_policy.VERBOSITY_LEVELS),
+        dict(output_savings.MODELLED_REDUCTION),
+    )
+
+
+def restore_steering_registry(snapshot: SteeringRegistry) -> None:
+    """Put the seams back as :func:`steering_registry_snapshot` found them.
+
+    ``install_all`` uses this so an extension that raises after registering
+    leaves nothing behind when it is skipped.
+    """
+    global DEFAULT_VERBOSITY_LEVEL
+    level, texts, factors = snapshot
+    DEFAULT_VERBOSITY_LEVEL = level
+    output_verbosity_policy.VERBOSITY_LEVELS.clear()
+    output_verbosity_policy.VERBOSITY_LEVELS.update(texts)
+    output_savings.MODELLED_REDUCTION.clear()
+    output_savings.MODELLED_REDUCTION.update(factors)
+
+
 @dataclass(frozen=True)
 class OutputShaperSettings:
     """Output-shaping settings with rollout enablement injected by the proxy."""
 
     enabled: bool = False
-    verbosity_level: int = DEFAULT_VERBOSITY_LEVEL
+    # Read at construction, not import, so a level registered by an extension
+    # applies to direct construction exactly as it does to from_env().
+    verbosity_level: int = field(default_factory=lambda: DEFAULT_VERBOSITY_LEVEL)
     # False in ``mode="cache"``. Steering is the one lever that writes into the
     # provider prefix-cache key (it appends to the system-prompt tail, and on a
     # body with no system field it creates one). See
