@@ -343,7 +343,15 @@ def factor_values(text: str) -> str:
         out_rows.append(",".join(rendered))
 
     factored = "\n".join([new_head, *legend_lines, *out_rows]) + "\n"
-    return json.dumps(factored, ensure_ascii=False) if wrapped else factored
+    candidate = json.dumps(factored, ensure_ascii=False) if wrapped else factored
+    # Include the shared header and any JSON wrapper escaping in the final cost.
+    if candidate.isascii() and text.isascii():
+        return candidate if len(candidate) < len(text) else text
+    return (
+        candidate
+        if len(candidate.encode(errors="surrogatepass")) < len(text.encode(errors="surrogatepass"))
+        else text
+    )
 
 
 def _assign(obj: dict[str, Any], path: list[str], val: Any) -> None:
