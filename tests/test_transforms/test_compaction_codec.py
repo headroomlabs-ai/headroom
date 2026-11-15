@@ -252,3 +252,13 @@ def test_dictionary_cells_still_decode_edge_values() -> None:
         {"tag": None},
         {},
     ]
+
+
+def test_value_factoring_round_trips_equals_in_column_names() -> None:
+    records = [
+        {"a": "first=value", "a=b": "second=[value]", "a=b=c": "third=value", "id": i}
+        for i in range(80)
+    ]
+    factored = factor_values(_crush(records))
+    assert "__dict:3" in factored
+    assert expand_compacted(factored) == records

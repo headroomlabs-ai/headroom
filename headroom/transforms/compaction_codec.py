@@ -378,18 +378,37 @@ def expand_compacted(text: str) -> list[dict[str, Any]] | None:
     # Value-factor legends: ``__dict:K`` declares K ``@col=[...]`` lines that
     # map a low-cardinality column's cells (integer indices) back to values.
     legends: dict[str, list[Any]] = {}
+    # Index by the part before the first equals sign for a cheap common path.
+    legend_names: dict[str, list[str]] = {}
+    if dict_count:
+        for col in cols:
+            prefix = col.name.partition("=")[0]
+            legend_names.setdefault(prefix, []).append(col.name)
     for _ in range(dict_count):
         legend_line, _, rest = rest.partition("\n")
-        name, eq, payload = legend_line.partition("=")
+        name, eq, _ = legend_line.partition("=")
         if not eq or not name.startswith("@"):
             return None
-        try:
-            result = json.loads(payload)
-        except (ValueError, TypeError):
+        key = name[1:]
+        # The legend is @<schema name>=<JSON array>. Try the complete schema
+        # names sharing this prefix and require one parseable array suffix.
+        match = None
+        for candidate in legend_names.get(key, []):
+            if not legend_line.startswith(f"@{candidate}="):
+                continue
+            payload = legend_line[len(candidate) + 2 :]
+            try:
+                result = json.loads(payload)
+            except ValueError:
+                continue
+            if isinstance(result, list):
+                if match is not None:
+                    return None  # Ambiguous legend cannot be reversed safely.
+                match = (candidate, result)
+        if match is None:
             return None
-        if not isinstance(result, list):
-            return None
-        legends[name[1:]] = result
+        column_name, values = match
+        legends[column_name] = values
 
     rows = _split_data_rows(rest, declared)
     if len(rows) != declared:
