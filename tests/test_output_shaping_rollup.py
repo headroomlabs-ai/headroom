@@ -119,21 +119,21 @@ def test_a_holdout_too_small_to_report_keeps_the_factor_tier(tmp_path, l4_factor
     assert rec.request_savings_range(shaped, 800) == (200, 800)
 
 
-def test_a_measured_tier_books_its_own_reduction_per_request(tmp_path, l4_factors, monkeypatch):
+def test_measured_tier_credits_only_strata_inside_the_measurement(tmp_path, l4_factors):
+    """Devin's case: stratum A carries the holdout, stratum B has no control.
+    A request in A books A's own control mean minus its output; a request in
+    B books nothing, exactly as the measured headline leaves B out."""
     rec = SavingsRecorder(str(tmp_path / "o.json"), flush_every=1)
-    measured = output_savings.SavingsEstimate(
-        tokens_saved=1.0,
-        baseline_tokens=5.0,
-        pct=20.0,
-        ci_low_pct=15.0,
-        ci_high_pct=25.0,
-        n_requests=100,
-        kind="measured",
-    )
-    monkeypatch.setattr(rec._ledger, "best_estimate", lambda level=None: measured)
-    shaped = [stratum_label("treatment", _key()), "output_shaper:verbosity:L4"]
+    a, b = "opus|a|s|tools", "opus|b|s|tools"
+    for i in range(5):
+        rec._ledger.record("control", a, 1000, f"c{i}")
+        rec._ledger.record("treatment", a, 800, f"t{i}")
+    rec._ledger.record("treatment", b, 1000, "tb")
+    assert rec._ledger.best_estimate(4).kind == "measured"
 
-    assert rec.request_savings_range(shaped, 800) == (200, 200)
+    shaped = "output_shaper:verbosity:L4"
+    assert rec.request_savings_range([stratum_label("treatment", a), shaped], 800) == (200, 200)
+    assert rec.request_savings_range([stratum_label("treatment", b), shaped], 1000) == (0, 0)
 
 
 def test_baseline_and_holdout_outrank_the_factors(tmp_path, l4_factors):
