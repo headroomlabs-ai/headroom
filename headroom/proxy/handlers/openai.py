@@ -23,7 +23,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import replace
 from datetime import datetime
 from types import MappingProxyType
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, NoReturn
 from urllib.parse import quote, unquote, urlparse
 
 from headroom.log_safety import describe_exception, safe_id
@@ -612,16 +612,23 @@ def _resolve_openai_upstream_base(request_headers: dict[str, str]) -> str | None
         return None
     raw_base_url, normalized = candidate
     if not is_safe_upstream_url(normalized):
-        # Client-supplied upstream resolves to a private/loopback/link-local or
-        # cloud-metadata address. Refuse, as the other routes do: falling back to
-        # the configured upstream would send the prompt and the Authorization
-        # meant for the named gateway to a host the client did not choose. Set
-        # HEADROOM_ALLOWED_BASE_URLS to permit specific internal endpoints.
-        from fastapi import HTTPException
-
-        logger.warning("rejecting unsafe x-headroom-base-url: %r", raw_base_url)
-        raise HTTPException(status_code=400, detail="Rejected unsafe upstream base URL")
+        _reject_unsafe_openai_override(raw_base_url)
     return normalized
+
+
+def _reject_unsafe_openai_override(raw_base_url: str) -> NoReturn:
+    """Refuse an ``x-headroom-base-url`` that resolves to a non-public address.
+
+    Client-supplied upstream resolves to a private/loopback/link-local or
+    cloud-metadata address. Refuse, as the other routes do: falling back to
+    the configured upstream would send the prompt and the Authorization
+    meant for the named gateway to a host the client did not choose. Set
+    HEADROOM_ALLOWED_BASE_URLS to permit specific internal endpoints.
+    """
+    from fastapi import HTTPException
+
+    logger.warning("rejecting unsafe x-headroom-base-url: %r", raw_base_url)
+    raise HTTPException(status_code=400, detail="Rejected unsafe upstream base URL")
 
 
 async def _resolve_openai_upstream_base_async(request_headers: dict[str, str]) -> str | None:
@@ -636,8 +643,7 @@ async def _resolve_openai_upstream_base_async(request_headers: dict[str, str]) -
         return None
     raw_base_url, normalized = candidate
     if not await is_safe_upstream_url_async(normalized):
-        logger.warning("ignoring unsafe x-headroom-base-url override: %r", raw_base_url)
-        return None
+        _reject_unsafe_openai_override(raw_base_url)
     return normalized
 
 
