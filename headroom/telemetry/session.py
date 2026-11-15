@@ -365,8 +365,16 @@ _STRATUM_TREATMENT = "output_shaper:stratum:"
 _STRATUM_CONTROL = "output_shaper:control:"
 
 # Per-turn token columns of `client_usage` and `model_usage`, in order. `n` is
-# turns. `uncached + cache_read + cache_write` is what the provider billed as
-# input, so with `output` a row can be priced without the session totals.
+# turns. Every column is the raw per-turn counter, so each sums to its session
+# total.
+#
+# To price a row, do what `CostTracker.record` does: where a provider reports
+# no write count, Headroom infers one as input minus cached, and those are the
+# same tokens as `uncached`, never billed as a write. `cache_write_inferred`
+# is that part, so billed input is
+#     uncached + cache_read + (cache_write - cache_write_inferred)
+# and `cache_write_5m` / `cache_write_1h` split the billed writes by TTL, which
+# changes their rate.
 _USAGE_FIELDS = (
     "n",
     "original",
@@ -375,10 +383,13 @@ _USAGE_FIELDS = (
     "output",
     "cache_read",
     "cache_write",
+    "cache_write_inferred",
+    "cache_write_5m",
+    "cache_write_1h",
     "uncached",
 )
 # Rows per usage table before the rest pool into "other". A session rarely
-# sees more than three harnesses or five models; every row is eight numbers on
+# sees more than three harnesses or five models; every row is eleven numbers on
 # a payload that is re-sent every five minutes, and `_fit_to_wire` cannot shed
 # these rows, so the cap is what bounds them.
 MAX_USAGE_ROWS = 8
@@ -1597,6 +1608,7 @@ def _fold_extra(
     # table sums back to them. First in this function for that reason: a fault
     # in a section below must not leave a turn counted in `tokens` and missing
     # here.
+    cache_write = int(get("cache_write_tokens") or 0)
     turn = (
         1,
         original,
@@ -1604,7 +1616,10 @@ def _fold_extra(
         tool_saved,
         int(get("output_tokens") or 0),
         int(get("cache_read_tokens") or 0),
-        int(get("cache_write_tokens") or 0),
+        cache_write,
+        cache_write if get("cache_inferred", False) else 0,
+        int(get("cache_write_5m_tokens") or 0),
+        int(get("cache_write_1h_tokens") or 0),
         int(get("uncached_input_tokens") or 0),
     )
     client = get("client", None)

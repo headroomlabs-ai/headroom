@@ -147,7 +147,8 @@ const SLUG = /^[a-z][a-z0-9_]{0,31}$/;
 // One turn-and-token row of `client_usage` / `model_usage`: _USAGE_FIELDS in
 // session.py.
 const USAGE = nums(
-  'n', 'original', 'saved', 'tool_saved', 'output', 'cache_read', 'cache_write', 'uncached'
+  'n', 'original', 'saved', 'tool_saved', 'output', 'cache_read', 'cache_write',
+  'cache_write_inferred', 'cache_write_5m', 'cache_write_1h', 'uncached'
 );
 
 const NESTED = {

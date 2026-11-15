@@ -971,9 +971,46 @@ def test_usage_tables_split_the_session_totals_without_residue():
             ("uncached", "uncached"),
         ):
             assert sum(r[column] for r in rows) == payload["tokens"][total], (table, column)
+        assert sum(r["cache_write_5m"] for r in rows) == payload["cache"]["write_5m"], table
+        assert sum(r["cache_write_1h"] for r in rows) == payload["cache"]["write_1h"], table
     # A fine-tune id carries an org name: pooled, never sent.
     assert "acme" not in json.dumps(payload)
     assert {r["model"] for r in payload["model_usage"]} == {"gpt-4o", "gpt-4o-mini", "other"}
+
+
+def test_a_usage_row_prices_inferred_cache_writes_the_way_the_cost_tracker_does():
+    """Where a provider reports no write count, Headroom infers one as input
+    minus cached. Those are the same tokens as `uncached` and are never billed
+    as a write, so a row has to say how much of its `cache_write` is inferred
+    or a reader double-counts them: 1000 billed tokens would price as 2000."""
+
+    class InferredWrite(Outcome):
+        provider = "openai"
+        model = "gpt-4o"
+        provider_input_tokens = 1000
+        cache_read_tokens = 0
+        cache_write_tokens = 1000
+        cache_write_5m_tokens = 0
+        cache_write_1h_tokens = 0
+        uncached_input_tokens = 1000
+        cache_inferred = True
+
+    class ReportedWrite(Outcome):
+        model = "gpt-4o-mini"  # cache_write 100 = 80 at 5m + 20 at 1h, all billed
+
+    def billed_input(row: dict[str, Any]) -> int:
+        return (
+            row["uncached"] + row["cache_read"] + row["cache_write"] - row["cache_write_inferred"]
+        )
+
+    rows = {r["model"]: r for r in emit(InferredWrite(), ReportedWrite())["model_usage"]}
+    assert billed_input(rows["gpt-4o"]) == 1000
+    assert rows["gpt-4o"]["cache_write_inferred"] == 1000
+    assert billed_input(rows["gpt-4o-mini"]) == 400 + 500 + 100
+    assert (rows["gpt-4o-mini"]["cache_write_5m"], rows["gpt-4o-mini"]["cache_write_1h"]) == (
+        80,
+        20,
+    )
 
 
 def test_an_mcp_turn_is_labelled_not_dropped():

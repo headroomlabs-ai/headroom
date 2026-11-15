@@ -327,7 +327,10 @@ if (dir) {
   full.errors = { count: 1, by_status: { 429: 1 } };
   full.strata = [{ dim: 'arm', value: 'treatment', n: 2 }];
   full.config = [{ key: 'mode', value: 'token' }];
-  const usage = { n: 2, original: 9, saved: 3, tool_saved: 1, output: 2, cache_read: 4, cache_write: 1, uncached: 4 };
+  const usage = {
+    n: 2, original: 9, saved: 3, tool_saved: 1, output: 2, cache_read: 4, cache_write: 1,
+    cache_write_inferred: 0, cache_write_5m: 1, cache_write_1h: 0, uncached: 4,
+  };
   full.client_usage = [{ client: 'claude_code', ...usage }, { client: 'via_compress_api', ...usage }];
   full.model_usage = [{ model: 'claude-haiku-4-5', ...usage }];
   full.client_versions = [{ client: 'claude_code', version: '2.1.311', n: 2 }];
