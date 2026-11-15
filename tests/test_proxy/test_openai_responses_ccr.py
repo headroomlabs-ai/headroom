@@ -24,7 +24,10 @@ from unittest.mock import AsyncMock, MagicMock, patch  # noqa: E402
 from fastapi.testclient import TestClient  # noqa: E402
 from starlette.requests import Request  # noqa: E402
 
-from headroom.cache.compression_store import reset_compression_store  # noqa: E402
+from headroom.cache.compression_store import (  # noqa: E402
+    get_compression_store,
+    reset_compression_store,
+)
 from headroom.ccr.tool_injection import CCR_TOOL_NAME  # noqa: E402
 from headroom.proxy.loopback_guard import require_loopback  # noqa: E402
 from headroom.proxy.server import ProxyConfig, create_app  # noqa: E402
@@ -37,6 +40,17 @@ _RETRIEVE_TOOL = {
         "type": "object",
         "properties": {"hash": {"type": "string"}},
         "required": ["hash"],
+    },
+}
+
+_CLIENT_TOOL = {
+    "type": "function",
+    "name": "client_tool",
+    "description": "Client-owned tool.",
+    "parameters": {
+        "type": "object",
+        "properties": {"value": {"type": "integer"}},
+        "required": ["value"],
     },
 }
 
@@ -74,6 +88,36 @@ def _tool_call_response(url: str, hash_key: str = "abc123def456abc123def456") ->
                     "call_id": "call_1",
                     "name": CCR_TOOL_NAME,
                     "arguments": json.dumps({"hash": hash_key}),
+                },
+            ],
+            "usage": {"input_tokens": 50, "output_tokens": 10},
+        },
+        request=httpx.Request("POST", url),
+    )
+
+
+def _mixed_tool_calls_response(url: str, hash_key: str) -> httpx.Response:
+    """A legal mixed turn: headroom_retrieve alongside a client-owned tool (#839)."""
+    return httpx.Response(
+        200,
+        json={
+            "id": "resp_mixed",
+            "object": "response",
+            "status": "completed",
+            "output": [
+                {
+                    "type": "function_call",
+                    "id": "fc_ccr",
+                    "call_id": "call_ccr",
+                    "name": CCR_TOOL_NAME,
+                    "arguments": json.dumps({"hash": hash_key}),
+                },
+                {
+                    "type": "function_call",
+                    "id": "fc_client",
+                    "call_id": "call_client",
+                    "name": "client_tool",
+                    "arguments": json.dumps({"value": 1}),
                 },
             ],
             "usage": {"input_tokens": 50, "output_tokens": 10},
@@ -230,6 +274,50 @@ def test_streaming_request_with_retrieve_tool_buffers_upstream_and_streams_final
     assert calls[1]["body"]["stream"] is False
     assert "response.completed" in resp.text
     assert "Resolved!" in resp.text
+
+
+def test_buffered_responses_mixed_ccr_and_client_tool_passes_through():
+    """A mixed headroom_retrieve + client-tool turn is a legal skip (#839).
+
+    Responses cannot drop the sibling function_call (#4034), so the buffered
+    streaming path must hand the turn back to the client — as the Anthropic
+    path does (#2089/#2117) — instead of failing closed with a 502.
+    """
+    app = _make_app()
+    with TestClient(app) as client:
+        server = app.state.proxy
+        hash_key = get_compression_store().store(
+            original=json.dumps({"secret": "retrieved answer"}),
+            compressed="{}",
+        )
+        calls: list[dict] = []
+
+        async def mixed_retry(method, url, headers, body, stream=False, **kwargs):  # noqa: ANN001
+            calls.append({"method": method, "url": url, "headers": dict(headers), "body": body})
+            assert stream is False
+            assert body["stream"] is False
+            return _mixed_tool_calls_response(url, hash_key)
+
+        server._retry_request = mixed_retry
+
+        resp = client.post(
+            "/v1/responses",
+            json={
+                "model": "gpt-5-codex",
+                "input": "use both tools",
+                "tools": [_RETRIEVE_TOOL, _CLIENT_TOOL],
+                "stream": True,
+            },
+            headers={"Authorization": "Bearer sk-test"},
+        )
+
+    assert resp.status_code == 200, resp.text
+    assert resp.headers["content-type"].startswith("text/event-stream")
+    assert "Unable to safely complete streamed CCR retrieval" not in resp.text
+    # Both calls are the model's turn; the client resolves them.
+    assert "call_ccr" in resp.text
+    assert "call_client" in resp.text
+    assert len(calls) == 1
 
 
 def test_streaming_request_without_retrieve_tool_uses_normal_stream_path():

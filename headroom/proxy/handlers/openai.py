@@ -7750,14 +7750,22 @@ class OpenAIHandlerMixin:
                             for k, v in response_headers.items()
                             if k.lower() not in ("content-length", "content-type")
                         }
-                        if _ccr_response_handler and _ccr_response_handler.has_ccr_tool_calls(
-                            resp_json, "openai_responses"
+                        from headroom.ccr.response_handler import RESIDUAL_CCR_ERROR
+
+                        if (
+                            _ccr_response_handler
+                            and _ccr_response_handler.residual_ccr_status(
+                                resp_json, "openai_responses"
+                            )
+                            == RESIDUAL_CCR_ERROR
                         ):
                             # Handling above didn't fully resolve the retrieve
-                            # call (e.g. max rounds hit, or it was mixed with a
-                            # non-CCR tool call). Fail closed rather than stream
-                            # a response the client can't act on — matches the
-                            # Anthropic buffered path's residual-CCR guard.
+                            # call (e.g. max rounds hit). Fail closed rather than
+                            # stream a response the client can't act on — matches
+                            # the Anthropic buffered path's residual-CCR guard.
+                            # A mixed retrieve + client-tool turn is an
+                            # intentional skip (#839) and must pass through, as
+                            # it does on Anthropic (#2089/#2117).
                             logger.warning(
                                 f"[{request_id}] CCR: Buffered streaming Responses "
                                 "reply still contains headroom_retrieve after "
