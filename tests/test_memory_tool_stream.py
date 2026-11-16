@@ -641,6 +641,36 @@ class TestNativeMemoryReceipts:
         assert text == "[headroom memory] memory_save done"
         assert "ok" not in text
 
+    @pytest.mark.parametrize(
+        ("payload", "expected"),
+        [
+            ({"status": "found", "count": 3}, "memory_search found 3"),
+            ({"status": "updated", "memory_id": "abcdef123456"}, "memory_update ok id=abcdef12"),
+            (
+                {"status": "deleted", "memory_id": "abcdef123456"},
+                "memory_delete deleted id=abcdef12",
+            ),
+            ({"status": "not_found"}, "memory_delete not_found"),
+            ({"status": "ok", "count": 2}, "memory_search ok 2"),
+            ({"status": "error", "error": "backend down"}, "memory_save error backend down"),
+            ({"status": "queued"}, "memory_save queued"),
+            ({"status": ""}, "memory_save done"),
+        ],
+    )
+    def test_json_status_maps_to_a_receipt_phrase(
+        self, payload: dict[str, object], expected: str
+    ) -> None:
+        from headroom.proxy.memory_tool_stream import format_receipt
+
+        name = expected.split()[0]
+        call = {"type": "tool_use", "id": "toolu_j", "name": name, "input": {}}
+        result = {
+            "type": "tool_result",
+            "tool_use_id": "toolu_j",
+            "content": json.dumps(payload),
+        }
+        assert format_receipt([call], [result]) == f"[headroom memory] {expected}"
+
 
 class TestStreamingMemoryContinuation:
     @pytest.mark.asyncio
