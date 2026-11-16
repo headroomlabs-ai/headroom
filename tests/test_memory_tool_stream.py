@@ -434,6 +434,105 @@ class TestMemoryReceipts:
         assert texts[-1] == "[headroom memory] memory_save ok id=7f58fdac"
 
 
+RETRIEVE = {
+    "type": "tool_use",
+    "id": "toolu_ccr",
+    "name": "headroom_retrieve",
+    "input": {"hash": "abc123"},
+}
+RETRIEVE_RESULT = {
+    "type": "tool_result",
+    "tool_use_id": "toolu_ccr",
+    "content": '{"status":"found","count":1}',
+}
+
+
+class _StubCCRHandler:
+    """Serves withheld ``headroom_retrieve`` calls, one result each."""
+
+    def __init__(self) -> None:
+        self.calls: list[dict[str, Any]] = []
+
+    def serve_withheld_retrievals(self, tool_calls: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        self.calls.append(tool_calls[0])
+        return [RETRIEVE_RESULT]
+
+
+class TestMemoryReceiptsWithRetrievalAndClientTool:
+    """A round that saves, retrieves and calls a client tool at once (GH #4888).
+
+    Main holds client tool calls during a retrieval and drops the unrun ones in
+    the continuation; the receipt must ride along without disturbing that, stay
+    the client's last block, and keep indices contiguous.
+    """
+
+    def _proxy(self, receipts: str) -> HeadroomProxy:
+        proxy = _proxy(
+            [
+                _sse([TEXT, SAVE, RETRIEVE, BASH], "tool_use"),
+                _sse([{"type": "text", "text": "Done."}], "end_turn"),
+            ],
+            SAVE_RESULT,
+        )
+        proxy._config.memory_tool_receipts = receipts
+        proxy.ccr_response_handler = _StubCCRHandler()
+        return proxy
+
+    @pytest.mark.asyncio
+    async def test_receipt_trails_a_mixed_round_and_the_client_call_is_dropped(
+        self,
+    ) -> None:
+        proxy = self._proxy("text")
+        events = await _client_view(
+            proxy, server_memory_tool_names=MEMORY_TOOLS, serve_ccr_retrieval=True
+        )
+
+        texts = [
+            e["delta"]["text"]
+            for e in events
+            if e["type"] == "content_block_delta" and "text" in e["delta"]
+        ]
+        assert texts == ["Saving that.", "Done.", "[headroom memory] memory_save ok id=7f58fdac"]
+        # The receipt is the client's last block; indices stay contiguous.
+        assert [e["index"] for e in events if e["type"] == "content_block_start"] == [0, 1, 2]
+        # The retrieval ran; the unrun client call did not reach the client.
+        assert proxy.ccr_response_handler.calls == [RETRIEVE]
+        assert not any(e.get("content_block", {}).get("name") == "Bash" for e in events)
+        assert not any(
+            e.get("content_block", {}).get("name") == "headroom_retrieve" for e in events
+        )
+        # The continuation carries both proxy results and drops the client call.
+        continuation = json.loads(
+            proxy.http_client.build_request.call_args_list[1].kwargs["content"]
+        )
+        assistant, tool_result = continuation["messages"][-2:]
+        assert [b["name"] for b in assistant["content"] if b["type"] == "tool_use"] == [
+            "memory_save",
+            "headroom_retrieve",
+        ]
+        assert [b["tool_use_id"] for b in tool_result["content"]] == [
+            "toolu_mem",
+            "toolu_ccr",
+        ]
+
+    @pytest.mark.asyncio
+    async def test_receipts_off_keeps_the_mixed_round_identical(self) -> None:
+        proxy = self._proxy("off")
+        events = await _client_view(
+            proxy, server_memory_tool_names=MEMORY_TOOLS, serve_ccr_retrieval=True
+        )
+
+        texts = [
+            e["delta"]["text"]
+            for e in events
+            if e["type"] == "content_block_delta" and "text" in e["delta"]
+        ]
+        assert texts == ["Saving that.", "Done."]
+        assert [e["index"] for e in events if e["type"] == "content_block_start"] == [0, 1]
+        assert proxy.ccr_response_handler.calls == [RETRIEVE]
+        assert not any(e.get("content_block", {}).get("name") == "Bash" for e in events)
+
+
 class TestStreamingMemoryContinuation:
     @pytest.mark.asyncio
     async def test_memory_call_runs_server_side_and_answer_streams_on(self) -> None:
