@@ -108,6 +108,32 @@ def _receipt_frames(index: int, text: str) -> list[bytes]:
     ]
 
 
+_RECEIPT_BOUND = 60
+
+
+def _bounded(text: str) -> str:
+    """One line, at most ``_RECEIPT_BOUND`` characters, for a receipt."""
+    collapsed = " ".join(text.split())
+    if len(collapsed) <= _RECEIPT_BOUND:
+        return collapsed
+    return collapsed[: _RECEIPT_BOUND - 1].rstrip() + "\u2026"
+
+
+def _native_outcome(content: str) -> str:
+    """One bounded phrase for a native memory tool's plain-text result.
+
+    Native handlers answer with prose, not JSON (``Error: ...`` or a sentence
+    like "File created successfully at: ..."), so a failed create and a
+    successful one are both strings here. The outcome is kept, bounded, rather
+    than reduced to a bare ``done`` that hides the failure.
+    """
+    if content.startswith("Error:"):
+        return "error: " + _bounded(content[len("Error:") :].strip())
+    if content.startswith("No replacement was performed"):
+        return "not applied"
+    return "ok"
+
+
 def _receipt_status(payload: Any) -> str:
     """One short phrase for a memory tool result's JSON body."""
     if not isinstance(payload, dict):
@@ -151,10 +177,19 @@ def format_receipt(calls: list[dict[str, Any]], results: list[dict[str, Any]]) -
             parts.append(f"{name} skipped")
             continue
         content = result.get("content")
-        try:
-            payload = json.loads(content) if isinstance(content, str) else content
-        except json.JSONDecodeError:
-            payload = None
+        payload = content
+        if isinstance(content, str):
+            try:
+                payload = json.loads(content)
+            except json.JSONDecodeError:
+                payload = None
+        if payload is None and isinstance(content, str):
+            # Native memory tools answer in prose, not JSON; keep the outcome.
+            command = call.get("input")
+            if name == "memory" and isinstance(command, dict) and command.get("command"):
+                name = f"memory {command['command']}"
+            parts.append(f"{name} {_native_outcome(content)}")
+            continue
         parts.append(f"{name} {_receipt_status(payload)}")
     return "[headroom memory] " + "; ".join(parts)
 
