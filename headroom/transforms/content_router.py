@@ -5397,6 +5397,14 @@ class ContentRouter(Transform):
                         # don't accept the kwarg are unaffected on the common path.
                         if protected:
                             compress_kwargs["ccr_original"] = content
+                        # F2.2: forward the request's TOIN read-only gate per
+                        # call, as _invoke_smart_crusher does for crush() —
+                        # the compressor is shared across concurrent requests,
+                        # and the kwarg is only sent when gating so
+                        # compressors without it keep working.
+                        _policy = self._runtime_compression_policy
+                        if _policy is not None and _policy.toin_read_only:
+                            compress_kwargs["record_toin"] = False
                         # One deadline for the whole request, not one per
                         # block. Without this a request with N compressible
                         # blocks gets N full deadlines and can run far past
