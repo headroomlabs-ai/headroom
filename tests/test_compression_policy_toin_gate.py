@@ -427,6 +427,24 @@ def test_kompress_compress_batch_record_toin_false_skips_write(fresh_toin, monke
     assert _toin_total(fresh_toin) == 0
 
 
+def test_kompress_compress_batch_forced_batched_record_toin_false_skips_write(
+    fresh_toin, monkeypatch
+):
+    """Forcing the batched path (no sequential fallback) still honours the
+    gate: its separate CCR store write records nothing when gated."""
+    compressor = _local_compressor(monkeypatch)
+    monkeypatch.setattr(compressor, "_should_use_sequential_fallback", lambda: False)
+    content = "line one\nline two\nline three " * 20
+
+    results = compressor.compress_batch([content], record_toin=False)
+    assert results[0].cache_key is not None
+    assert _toin_total(fresh_toin) == 0
+
+    results = compressor.compress_batch([content])
+    assert results[0].cache_key is not None
+    assert _toin_total(fresh_toin) == 1
+
+
 class _FakeResponse:
     def __init__(self, payload: dict) -> None:
         self._payload = payload
