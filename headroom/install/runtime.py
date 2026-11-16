@@ -420,7 +420,12 @@ def _process_is_exiting(pid: int) -> bool:
     try:
         import psutil  # type: ignore[import-untyped]  # optional dependency
 
-        return bool(psutil.Process(pid).status() == psutil.STATUS_ZOMBIE)
+        # Early return ONLY on a positive zombie match: a non-zombie psutil
+        # status must not short-circuit the native probes below — on macOS
+        # an exiting process reports ps state ``?E`` while psutil still sees
+        # it as running, and that is exactly the #4891 window.
+        if psutil.Process(pid).status() == psutil.STATUS_ZOMBIE:
+            return True
     except Exception:
         pass
     proc_stat = Path(f"/proc/{pid}/stat")
