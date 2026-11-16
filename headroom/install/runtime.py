@@ -408,6 +408,43 @@ def _process_identity(pid: int, manifest: DeploymentManifest) -> bool | None:
     )
 
 
+def _process_is_exiting(pid: int) -> bool:
+    """Return whether a process is exiting or already a zombie.
+
+    In that window the process image is torn down before the PID is reaped,
+    so the argv the identity check matches on is gone: ``ps`` reports a
+    placeholder such as ``(python3.13)`` or ``<defunct>`` instead, and psutil
+    raises ``ZombieProcess`` for the command line. The process is stopping,
+    not replaced by a different one (#4891).
+    """
+    try:
+        import psutil  # type: ignore[import-untyped]  # optional dependency
+
+        return bool(psutil.Process(pid).status() == psutil.STATUS_ZOMBIE)
+    except Exception:
+        pass
+    proc_stat = Path(f"/proc/{pid}/stat")
+    if proc_stat.exists():
+        try:
+            state = proc_stat.read_text(encoding="utf-8").rsplit(")", 1)[1].split()[0]
+        except (OSError, IndexError):
+            return False
+        return state in {"Z", "X"}
+    if sys.platform == "darwin":
+        try:
+            result = run(
+                ["ps", "-p", str(pid), "-o", "stat="],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+        except (OSError, subprocess.SubprocessError):
+            return False
+        state = result.stdout.strip()
+        return result.returncode == 0 and ("Z" in state or "E" in state)
+    return False
+
+
 def _clear_pid(profile: str, *, expected_pid: int | None = None) -> None:
     path = pid_path(profile)
     if expected_pid is not None and _read_pid(profile) != expected_pid:
@@ -606,7 +643,12 @@ def stop_runtime(manifest: DeploymentManifest) -> None:
         if not pid_alive(pid):
             _clear_pid(manifest.profile, expected_pid=pid)
             return
-        if _process_identity(pid, manifest) is False:
+        # After SIGTERM the exiting process briefly stops matching its own
+        # argv while the kernel tears it down (#4891); like the absent-task
+        # tolerance in stop_supervisor (#4468), that counts as stopping, not
+        # as a different process. A live process that is not exiting and does
+        # not match still means the PID was reused.
+        if _process_identity(pid, manifest) is False and not _process_is_exiting(pid):
             raise RuntimeError(
                 f"Cannot stop deployment '{manifest.profile}': runtime identity changed"
             )
