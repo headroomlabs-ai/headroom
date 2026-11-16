@@ -313,7 +313,12 @@ async def test_memory_call_the_proxy_injected_still_runs(tmp_path, monkeypatch, 
     assert response.status_code == 200
     assert backend.calls == ["list"]
     assert len(upstream_bodies) == 2
-    assert "memory_list" not in response.text
+    # The call stays hidden: the client gets no tool call it could itself run.
+    # On the Anthropic path the proxy now appends a receipt naming what it ran
+    # (GH #4888), so assert the serialised call and its id are absent rather
+    # than the bare name.
+    assert '"name": "memory_list"' not in response.text
+    assert ("toolu_1" if kind.startswith("anthropic") else "call_1") not in response.text
 
 
 # --- Responses over WebSocket ---------------------------------------------
