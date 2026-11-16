@@ -1503,20 +1503,29 @@ def test_text_block_cache_control_protected_with_assistant_optin(
     assert counts["cache_control_protected"] == 1
 
 
-def test_tool_result_cache_control_protected(monkeypatch: pytest.MonkeyPatch) -> None:
+def _marked_tool_result(text: str, nested: bool) -> dict[str, object]:
+    """A tool_result carrying a cache_control marker either on the block
+    itself or on the text sub-block of its list content (both shapes are
+    accepted by the Messages API)."""
+    if nested:
+        return {
+            "type": "tool_result",
+            "tool_use_id": "abc",
+            "content": [{"type": "text", "text": text, "cache_control": {"type": "ephemeral"}}],
+        }
+    return {
+        "type": "tool_result",
+        "tool_use_id": "abc",
+        "content": text,
+        "cache_control": {"type": "ephemeral"},
+    }
+
+
+@pytest.mark.parametrize("nested", [False, True], ids=["block_marker", "nested_marker"])
+def test_tool_result_cache_control_protected(monkeypatch: pytest.MonkeyPatch, nested: bool) -> None:
     router = _make_router_with_mock_compress(monkeypatch)
     long_text = "Z" * 1000
-    msg = {
-        "role": "user",
-        "content": [
-            {
-                "type": "tool_result",
-                "tool_use_id": "abc",
-                "content": long_text,
-                "cache_control": {"type": "ephemeral"},
-            }
-        ],
-    }
+    msg = {"role": "user", "content": [_marked_tool_result(long_text, nested)]}
     counts: dict[str, int] = {}
     result = router._process_content_blocks(
         msg,
@@ -1530,8 +1539,36 @@ def test_tool_result_cache_control_protected(monkeypatch: pytest.MonkeyPatch) ->
     )
     # cache_control hard-skip applies to tool_result too, on any message the
     # provider may already hold under that key (anything but the final one).
-    assert result["content"][0]["content"] == long_text
+    assert result["content"][0] == _marked_tool_result(long_text, nested)
     assert counts["cache_control_protected"] == 1
+
+
+@pytest.mark.parametrize("nested", [False, True], ids=["block_marker", "nested_marker"])
+def test_marked_tool_result_in_history_survives_apply(
+    monkeypatch: pytest.MonkeyPatch, nested: bool
+) -> None:
+    # End to end through apply() (the compress() / /v1/compress path): a
+    # marked tool_result in an earlier turn may already be cached upstream
+    # under its marker, so it comes back byte-identical, marker included.
+    router = _make_router_with_mock_compress(monkeypatch)
+    long_text = "tool output line " * 200
+    messages = [
+        {"role": "user", "content": "run the tests"},
+        {
+            "role": "assistant",
+            "content": [{"type": "tool_use", "id": "abc", "name": "bash", "input": {}}],
+        },
+        {"role": "user", "content": [_marked_tool_result(long_text, nested)]},
+        {"role": "assistant", "content": "done"},
+        {"role": "user", "content": "now fix the lint"},
+    ]
+
+    class FakeTokenizer:
+        def count_text(self, text: str) -> int:
+            return len(str(text).split())
+
+    out = router.apply(messages, FakeTokenizer(), model_limit=100_000)
+    assert out.messages[2]["content"][0] == _marked_tool_result(long_text, nested)
 
 
 def test_tool_result_cache_control_compressed_in_final_message(

@@ -607,6 +607,24 @@ def _external_compressor_matches(descriptor: CompressorDescriptor, content_mime:
     return any(d in ("*", "*/*") or d == type_wildcard for d in declared)
 
 
+def _carries_cache_control(block: dict[str, Any]) -> bool:
+    """True when ``block`` holds a client ``cache_control`` breakpoint.
+
+    The Messages API also accepts the marker on a sub-block of a
+    ``tool_result``'s list content. Rewriting that tool_result drops the
+    marker exactly like one on the block itself, so both count (the same
+    shapes ``count_cache_breakpoints`` counts).
+    """
+    if "cache_control" in block:
+        return True
+    if block.get("type") != "tool_result":
+        return False
+    inner = block.get("content")
+    return isinstance(inner, list) and any(
+        isinstance(sub, dict) and "cache_control" in sub for sub in inner
+    )
+
+
 def _malformed_tool_call_ids(messages: list[dict[str, Any]]) -> set[str]:
     """Ids of OpenAI tool calls whose ``function`` is not an object.
 
@@ -7807,7 +7825,7 @@ class ContentRouter(Transform):
                         tc = block.get("content")
                         protected = (
                             frozen
-                            or ("cache_control" in block)
+                            or _carries_cache_control(block)
                             or block.get("tool_use_id") in verbatim_tool_ids
                         )
                         if isinstance(tc, str) and tc:
@@ -7923,8 +7941,9 @@ class ContentRouter(Transform):
         """Process content blocks (Anthropic format) for compression.
 
         Cache-safety contract:
-          1. Any block carrying `cache_control` is the client's explicit
-             cache breakpoint. Modifying any byte of such a block changes
+          1. Any block carrying `cache_control` (on the block itself or on
+             a sub-block of a tool_result's list content) is the client's
+             explicit cache breakpoint. Modifying any byte of such a block changes
              the cache key the upstream provider matches against, turning
              a 90% read discount into a 25% write penalty (Anthropic).
              We never modify cache_control'd blocks, regardless of role
@@ -8038,7 +8057,9 @@ class ContentRouter(Transform):
             # cache breakpoint. Frozen-message-count is a coarse
             # message-level approximation; this is the per-block
             # guarantee that we never bust an explicit cache key.
-            if "cache_control" in block and not (fresh_turn and block.get("type") == "tool_result"):
+            if _carries_cache_control(block) and not (
+                fresh_turn and block.get("type") == "tool_result"
+            ):
                 new_blocks.append(block)
                 if route_counts is not None:
                     route_counts.setdefault("cache_control_protected", 0)
