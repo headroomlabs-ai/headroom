@@ -132,8 +132,11 @@ def test_mixed_turn_returns_client_tool_without_continuation() -> None:
     # No continuation: it could not answer the Bash call.
     assert len(sent) == 1
     assert handler.executed == ["memory_search"]
-    # The client gets its own tool call back, not the proxy's.
-    assert [block["name"] for block in response.json()["content"]] == ["Bash"]
+    # The client gets its own tool call back, not the proxy's, plus the
+    # receipt naming the memory call the proxy ran (GH #4888).
+    content = response.json()["content"]
+    assert [block.get("name") for block in content] == ["Bash", None]
+    assert content[-1] == {"type": "text", "text": "[headroom memory] memory_search done"}
 
 
 def test_memory_only_turn_continues_with_a_result_for_every_call() -> None:
@@ -146,7 +149,10 @@ def test_memory_only_turn_continues_with_a_result_for_every_call() -> None:
     assert assistant == {"role": "assistant", "content": [MEMORY_CALL]}
     assert [r["tool_use_id"] for r in user["content"]] == ["toolu_mem"]
     assert sent[1]["messages"][:-2] == sent[0]["messages"]
-    assert response.json()["content"] == [{"type": "text", "text": "us-east-1"}]
+    assert response.json()["content"] == [
+        {"type": "text", "text": "us-east-1"},
+        {"type": "text", "text": "[headroom memory] memory_search done"},
+    ]
 
 
 def test_failed_continuation_is_not_logged_as_complete(caplog: pytest.LogCaptureFixture) -> None:

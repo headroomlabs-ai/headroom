@@ -695,6 +695,22 @@ SETTINGS: tuple[SettingField, ...] = (
         tier="basic",
     ),
     SettingField(
+        "HEADROOM_MEMORY_TOOL_RECEIPTS",
+        "memory_tool_receipts",
+        "Memory tool receipts",
+        "Memory",
+        "str",
+        default="text",
+        choices=("off", "text"),
+        help=(
+            "How to record proxy-run memory tool calls in the client stream. The calls are "
+            "hidden from the client (GH #2195), so without a receipt later turns cannot tell "
+            "a save ran and save again (GH #4888). text (default) appends a short receipt "
+            "block; off leaves the stream clean."
+        ),
+        tier="basic",
+    ),
+    SettingField(
         "HEADROOM_NO_MEMORY_CONTEXT",
         "no_memory_context",
         "Disable memory context injection",

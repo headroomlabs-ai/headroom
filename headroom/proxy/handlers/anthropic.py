@@ -4856,6 +4856,11 @@ class AnthropicHandlerMixin:
                                 f"[{request_id}] Memory: Detected memory tool call, handling..."
                             )
 
+                            # Bound before the try: the receipt below reads
+                            # both, and a failed handling must not NameError.
+                            turn_content = resp_json.get("content") or []
+                            tool_results: list[dict[str, Any]] = []
+
                             try:
                                 # Execute memory tool calls
                                 tool_results = await self.memory_handler.handle_memory_tool_calls(
@@ -4865,7 +4870,6 @@ class AnthropicHandlerMixin:
                                     request_context=memory_request_ctx,
                                 )
 
-                                turn_content = resp_json.get("content") or []
                                 answered = {result.get("tool_use_id") for result in tool_results}
                                 unanswered = [
                                     block
@@ -4962,6 +4966,46 @@ class AnthropicHandlerMixin:
                                     f"[{request_id}] Memory: Tool call handling failed: {e}"
                                 )
                                 # Continue with original response
+
+                            # GH #4888: the client never sees the hidden call or
+                            # its result, so its history shows the model's text
+                            # with no tool call behind it and the model saves
+                            # again. Record what the proxy ran as a trailing
+                            # text block. Only proxy-owned calls: a memory-named
+                            # tool the client declared is the client's to run.
+                            receipt = None
+                            if (
+                                getattr(self.config, "memory_tool_receipts", "text") == "text"
+                                and response.status_code == 200
+                                and isinstance(resp_json.get("content"), list)
+                            ):
+                                from headroom.proxy.memory_tool_stream import format_receipt
+
+                                ran = [
+                                    block
+                                    for block in turn_content
+                                    if isinstance(block, dict)
+                                    and block.get("type") == "tool_use"
+                                    and block.get("name") in server_memory_tool_names
+                                ]
+                                receipt = format_receipt(ran, tool_results)
+                            if receipt:
+                                resp_json = {
+                                    **resp_json,
+                                    "content": [
+                                        *(resp_json.get("content") or []),
+                                        {"type": "text", "text": receipt},
+                                    ],
+                                }
+                                response = httpx.Response(
+                                    status_code=200,
+                                    content=json.dumps(resp_json).encode(),
+                                    headers={
+                                        key: value
+                                        for key, value in response.headers.items()
+                                        if key.lower() not in ("content-encoding", "content-length")
+                                    },
+                                )
 
                         # Buffered response hooks run for every successful turn,
                         # not only the CCR branch. Reuse the request context so
