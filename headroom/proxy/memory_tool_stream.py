@@ -183,10 +183,13 @@ def format_receipt(calls: list[dict[str, Any]], results: list[dict[str, Any]]) -
                 payload = json.loads(content)
             except json.JSONDecodeError:
                 payload = None
-        if payload is None and isinstance(content, str):
-            # Native memory tools answer in prose, not JSON; keep the outcome.
+        if payload is None and isinstance(content, str) and name == "memory":
+            # Anthropic's native memory tool answers in prose, not JSON; keep
+            # the outcome. A custom ``memory_*`` tool returns JSON, so a
+            # non-decoding body there stays the uninformative "done" rather
+            # than claiming "ok".
             command = call.get("input")
-            if name == "memory" and isinstance(command, dict) and command.get("command"):
+            if isinstance(command, dict) and command.get("command"):
                 name = f"memory {command['command']}"
             parts.append(f"{name} {_native_outcome(content)}")
             continue

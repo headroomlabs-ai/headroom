@@ -623,6 +623,24 @@ class TestNativeMemoryReceipts:
             "Error: path is required", "create"
         )
 
+    def test_custom_tool_with_a_non_json_body_does_not_claim_ok(self) -> None:
+        """Only the native ``memory`` tool answers in prose.
+
+        A custom ``memory_*`` tool returns JSON; an anomalous non-JSON body is
+        not evidence that the call succeeded, so the receipt must not say so.
+        """
+        from headroom.proxy.memory_tool_stream import format_receipt
+
+        call = {"type": "tool_use", "id": "toolu_custom", "name": "memory_save", "input": {}}
+        result = {
+            "type": "tool_result",
+            "tool_use_id": "toolu_custom",
+            "content": "<html>502</html>",
+        }
+        text = format_receipt([call], [result])
+        assert text == "[headroom memory] memory_save done"
+        assert "ok" not in text
+
 
 class TestStreamingMemoryContinuation:
     @pytest.mark.asyncio
