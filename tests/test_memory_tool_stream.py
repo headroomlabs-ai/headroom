@@ -532,6 +532,97 @@ class TestMemoryReceiptsWithRetrievalAndClientTool:
         assert proxy.ccr_response_handler.calls == [RETRIEVE]
         assert not any(e.get("content_block", {}).get("name") == "Bash" for e in events)
 
+    @pytest.mark.asyncio
+    async def test_held_client_tool_precedes_the_receipt_for_client_and_finalizer(
+        self,
+    ) -> None:
+        """Receipt ordering matches tracked history when a client tool is held.
+
+        With retrieval serving on, a round of memory_save + Bash and no
+        retrieval returns to the client without continuing, so the filter
+        releases Bash at close. The receipt must come after it: the client's
+        block order and the tracked history the prefix tracker compares against
+        must be identical, or the next turn's prefix match diverges.
+        """
+        proxy = _proxy([_sse([SAVE, BASH], "tool_use")], SAVE_RESULT)
+        proxy._config.memory_tool_receipts = "text"
+        proxy.ccr_response_handler = _StubCCRHandler()
+        proxy._finalize_stream_response = AsyncMock(return_value=None)
+        events = await _client_view(
+            proxy, server_memory_tool_names=MEMORY_TOOLS, serve_ccr_retrieval=True
+        )
+
+        # What the client saw, index by index: a tool name, or the text it
+        # accumulated for a text block (the receipt arrives as deltas).
+        started: dict[int, str] = {}
+        for e in events:
+            if e["type"] == "content_block_start":
+                block = e["content_block"]
+                started[e["index"]] = block.get("name") or ""
+            elif e["type"] == "content_block_delta" and "text" in e.get("delta", {}):
+                started[e["index"]] = started.get(e["index"], "") + e["delta"]["text"]
+        client_order = [started[i] for i in sorted(started)]
+
+        finalized = proxy._finalize_stream_response.await_args.kwargs["parsed_response"]
+        history_order = [
+            b["name"] if b["type"] == "tool_use" else b["text"] for b in finalized["content"]
+        ]
+
+        # The client received Bash before the receipt...
+        assert client_order == ["Bash", "[headroom memory] memory_save ok id=7f58fdac"]
+        # ...which is exactly the order tracked for the next turn's prefix match.
+        assert history_order == client_order
+        assert proxy.ccr_response_handler.calls == []
+
+
+class TestNativeMemoryReceipts:
+    """Native memory tools answer in prose; the receipt keeps the outcome."""
+
+    def _runs(self, content: str, command: str) -> str | None:
+        from headroom.proxy.memory_tool_stream import format_receipt
+
+        call = {
+            "type": "tool_use",
+            "id": "toolu_native",
+            "name": "memory",
+            "input": {"command": command, "path": "/memories/a.txt"},
+        }
+        result = {"type": "tool_result", "tool_use_id": "toolu_native", "content": content}
+        return format_receipt([call], [result])
+
+    def test_native_create_success_names_the_command(self) -> None:
+        assert (
+            self._runs("File created successfully at: /memories/a.txt", "create")
+            == "[headroom memory] memory create ok"
+        )
+
+    def test_native_validation_error_is_not_a_success_receipt(self) -> None:
+        text = self._runs("Error: file_text is required (the memory content)", "create")
+        assert (
+            text
+            == "[headroom memory] memory create error: file_text is required (the memory content)"
+        )
+        assert "ok" not in text
+
+    def test_native_backend_failure_is_bounded(self) -> None:
+        text = self._runs("Error: " + "x" * 300, "create")
+        assert text is not None
+        assert text.startswith("[headroom memory] memory create error: x")
+        assert len(text) <= len("[headroom memory] memory create error: ") + 60
+        assert "x" * 300 not in text
+
+    def test_native_unsuccessful_replacement_is_not_ok(self) -> None:
+        text = self._runs(
+            "No replacement was performed, old_str `foo` did not appear verbatim in memories.",
+            "str_replace",
+        )
+        assert text == "[headroom memory] memory str_replace not applied"
+
+    def test_native_success_and_failure_differ(self) -> None:
+        assert self._runs("File created successfully at: /memories/a.txt", "create") != self._runs(
+            "Error: path is required", "create"
+        )
+
 
 class TestStreamingMemoryContinuation:
     @pytest.mark.asyncio

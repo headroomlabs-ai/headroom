@@ -297,7 +297,6 @@ headroom proxy --mode cache
 | `--memory` | off | Enable persistent user memory |
 | `--memory-db-path` | `""` | Override memory DB path (help text: `{cwd}/.headroom/memory.db`) |
 | `--no-memory-tools` | off | Disable automatic memory tool injection |
-| `--memory-tool-receipts` | `text` | Record proxy-run memory calls in the client stream (`text` or `off`); without it a later turn cannot tell a save ran (GH #4888) |
 | `--no-memory-context` | off | Disable automatic memory context injection |
 | `--memory-top-k` | `10` | Number of memories to inject |
 | `--learn` | off | Enable live traffic learning |

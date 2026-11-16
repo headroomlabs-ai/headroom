@@ -619,8 +619,16 @@ class StreamingMixin:
             return format_receipt(ran_calls, ran_results)
 
         def _receipt_and_close() -> list[bytes]:
-            """Client-bound receipt block (when any) followed by the held tail."""
-            frames: list[bytes] = []
+            """Client-bound receipt block (when any) followed by the held tail.
+
+            Held blocks are released first: they are what the client saw
+            before the receipt, and the index the receipt takes must come
+            after theirs. The recorded client message already holds them (it
+            is built from the parsed round, not from what was streamed), so
+            releasing first keeps the client's block order identical to the
+            history the prefix tracker compares it against.
+            """
+            frames: list[bytes] = memory_filter.release_held()
             text = _receipt_text()
             if text:
                 frames.extend(memory_filter.receipt_frames(text))
