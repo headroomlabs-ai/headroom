@@ -66,6 +66,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from ..config import ReadMaturationConfig
+from .read_lifecycle import is_lifecycle_notice
 
 logger = logging.getLogger(__name__)
 
@@ -284,15 +285,21 @@ class ReadMaturationManager:
             for tc in msg.get("tool_calls", []) or []:
                 if not isinstance(tc, dict):
                     continue
-                func = tc.get("function", {})
+                func = tc.get("function")
+                if not isinstance(func, dict):  # "function": null / non-object
+                    continue
                 name = func.get("name", "")
                 if name not in _TOUCH_TOOLS:
                     continue
                 try:
                     args = json.loads(func.get("arguments", "{}"))
-                except (ValueError, TypeError):
-                    args = {}
+                except (ValueError, TypeError):  # not JSON: unknown file
+                    continue
+                if not isinstance(args, dict):  # list/str/number: unknown file
+                    continue
                 fp = args.get("file_path") or args.get("path") or ""
+                if not isinstance(fp, str):  # unknown file: never mature this call
+                    continue
                 if fp:
                     act.file_last_touch[fp] = turn
                 if name in _READ_TOOLS:
@@ -306,8 +313,12 @@ class ReadMaturationManager:
                     name = b.get("name", "")
                     if name not in _TOUCH_TOOLS:
                         continue
-                    inp = b.get("input") or {}
+                    inp = b.get("input")
+                    if not isinstance(inp, dict):  # unknown file: never mature this call
+                        continue
                     fp = inp.get("file_path") or inp.get("path") or ""
+                    if not isinstance(fp, str):  # unknown file: never mature this call
+                        continue
                     if fp:
                         act.file_last_touch[fp] = turn
                     if name in _READ_TOOLS:
@@ -388,7 +399,11 @@ class ReadMaturationManager:
             return None, False
         # Lifecycle markers (stale/superseded) are already compact — and
         # read_lifecycle runs first, so respect its replacement.
-        if "Retrieve original: hash=" in content or "Retrieve more: hash=" in content:
+        if (
+            is_lifecycle_notice(content)
+            or "Retrieve original: hash=" in content
+            or "Retrieve more: hash=" in content
+        ):
             return None, False
 
         file_path, read_turn = activity.read_calls[tc_id]
@@ -412,7 +427,10 @@ class ReadMaturationManager:
                     compression_strategy="read_maturation",
                 )
             except Exception as e:  # noqa: BLE001 - storage failure must not break the request
+                # Keep it verbatim (a marker would point at nothing); a later
+                # request matures it once the store takes it.
                 logger.warning("read_maturation: CCR store failed for %s: %s", tc_id, e)
+                return None, False
 
         file_display = file_path or "unknown"
         # NOTE: "Retrieve original: hash=" is load-bearing (marker-

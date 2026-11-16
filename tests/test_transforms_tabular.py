@@ -17,6 +17,7 @@ from headroom.transforms.content_detector import (
     ContentType,
     DetectionResult,
     _is_md_separator,
+    _is_whole_markdown_table,
     _looks_like_prose,
     _try_detect_delimited,
     _try_detect_markdown_table,
@@ -93,6 +94,143 @@ def test_detects_tabular(content: str, fmt: str) -> None:
 )
 def test_does_not_misroute_to_tabular(content: str, expected: ContentType) -> None:
     assert detect_content_type(content).content_type is expected
+
+
+# Detection: a markdown table inside other content (#4215) -------------------
+
+_PROSE = "\n".join(
+    f"Paragraph {i}: this sentence is ordinary prose that an agent needs to read verbatim."
+    for i in range(12)
+)
+_TABLE = (
+    "| Step | Owner | Command |\n"
+    "|------|-------|---------|\n"
+    "| Build | CI | `make build` |\n"
+    "| Test | CI | `make test` |\n"
+    "| Tag | Maintainer | `git tag vX.Y.Z` |\n"
+    "| Publish | Maintainer | `make publish` |"
+)
+_PIPE_BULLET = "- Create an issue: `tracker new --type=bug|feature|task --priority=2`"
+_PIPELESS_TABLE = (
+    "Step | Owner | Command\n--- | --- | ---\nBuild | CI | make build\nTest | CI | make test"
+)
+# `cat` of a doc with a table, plus another command's output in the same result.
+_DOC_WITH_TABLE = (
+    f"# Release checklist\n\n{_PROSE}\n\n{_TABLE}\n\n{_PIPE_BULLET}\n\n{_PROSE}\n"
+    "----\n412 other-command-output.txt\n"
+)
+
+
+@pytest.mark.parametrize(
+    "content",
+    [
+        _DOC_WITH_TABLE,
+        f"Results:\n{_TABLE}",
+        # A blank line ends the table; a later line with pipes is not a row.
+        f"{_TABLE}\n\n{_PIPE_BULLET}",
+        # A line with pipes above the table is not its header.
+        f"{_PIPE_BULLET}\n{_TABLE}",
+        # Nor is text sitting on top of a separator row.
+        f"Title\n|---|---|\n{_TABLE}",
+        # Past the 50 lines the detector samples.
+        f"{_verbose_markdown(60)}\n\nTotal: 60 users",
+        # Lines with as many pipe fields as the header, straight after the rows:
+        # a list item, a note in another style, a second separator.
+        f"{_TABLE}\n{_PIPE_BULLET}",
+        f"{_TABLE}\nNote: pick one of bug|feature|task",
+        f"{_PIPELESS_TABLE}\n- Next: bug|feature|task",
+        f"{_TABLE}\n|---|---|---|\n| Ship | CI | `make ship` |",
+    ],
+    ids=[
+        "doc_with_table",
+        "heading_line",
+        "pipe_line_after_table",
+        "pipe_line_before_table",
+        "text_above_a_separator_row",
+        "line_after_a_long_table",
+        "list_item_right_after_rows",
+        "note_without_leading_pipe",
+        "list_item_after_pipeless_rows",
+        "second_separator_row",
+    ],
+)
+def test_markdown_table_inside_other_content_is_not_tabular(content: str) -> None:
+    assert detect_content_type(content).content_type is not ContentType.TABULAR
+
+
+@pytest.mark.parametrize(
+    "content",
+    [f"{_TABLE}\n", f"\n\n{_TABLE}\n\n", _TABLE.replace("\n", "\r\n"), _PIPELESS_TABLE],
+    ids=["trailing_newline", "surrounding_blank_lines", "crlf", "pipeless"],
+)
+def test_whole_markdown_table_is_still_tabular(content: str) -> None:
+    result = detect_content_type(content)
+    assert result.content_type is ContentType.TABULAR
+    assert result.metadata.get("format") == "markdown"
+
+
+_LONG_ROWS = [(f"step_{i}", f"ok_{i}") for i in range(40)]
+
+
+@pytest.mark.parametrize(
+    "content",
+    [
+        "Name | Value\n--- | ---\n"
+        + "\n".join(f"{a} | {b}" for a, b in _LONG_ROWS)
+        + "\nImportant: use x | y | DO_NOT_DELETE",
+        "| Name | Value |\n| --- | --- |\n"
+        + "\n".join(f"| {a} | {b} |" for a, b in _LONG_ROWS)
+        + "\n| Important: use x | y | DO_NOT_DELETE |",
+        # Splitting on the escaped pipe gives the header's three cells, but the
+        # literal `|` would be lost.
+        "| Name | Value | Note |\n| --- | --- | --- |\n"
+        + "\n".join(f"| {a} | {b} | none |" for a, b in _LONG_ROWS)
+        + "\n| `a \\| b` | DO_NOT_DELETE |",
+    ],
+    ids=["over_width_row_pipeless", "over_width_row_piped", "escaped_pipe"],
+)
+def test_table_with_a_row_records_cannot_hold_is_kept_whole(content: str) -> None:
+    # Not claimed as markdown. Aligned rows may still read as fixed-width, which
+    # splits only on whitespace runs and passes ragged rows through.
+    assert detect_content_type(content).metadata.get("format") != "markdown"
+    result = TabularCompressor().compress(content)
+    assert not result.was_modified
+    assert result.compressed == content
+
+
+_KEEP_ROWS = range(40)
+
+
+@pytest.mark.parametrize(
+    "content",
+    [
+        "| Name | Name |\n| --- | --- |\n"
+        + "\n".join(f"| DO_NOT_DELETE_{i} | value_{i} |" for i in _KEEP_ROWS),
+        # Equal once the parser strips each cell.
+        "| Name |   Name   |\n| --- | --- |\n"
+        + "\n".join(f"| DO_NOT_DELETE_{i} | value_{i} |" for i in _KEEP_ROWS),
+        "name,name\n" + "\n".join(f"DO_NOT_DELETE_{i},value_{i}" for i in _KEEP_ROWS),
+        "name, name \n" + "\n".join(f"DO_NOT_DELETE_{i},value_{i}" for i in _KEEP_ROWS),
+    ],
+    ids=["markdown", "markdown_whitespace", "csv", "csv_whitespace"],
+)
+def test_table_with_repeated_headers_is_kept_whole(content: str) -> None:
+    # Records key cells by header, so the second column would overwrite the first.
+    assert parse_tabular(content) is None
+    result = TabularCompressor().compress(content)
+    assert not result.was_modified
+    assert result.compressed == content
+
+
+def test_csv_with_markdown_in_a_quoted_field_is_still_csv() -> None:
+    rows = "\n".join(f"{i},value_{i}" for i in range(1, 20))
+    csv = f'id,notes\n{rows}\n20,"| x | y |\n| --- | --- |\n| foo | bar |"\n21,value_21'
+    result = detect_content_type(csv)
+    assert result.content_type is ContentType.TABULAR
+    assert result.metadata.get("delimiter") == ","
+    headers, data, _fmt = parse_tabular(csv)
+    assert headers == ["id", "notes"]
+    assert len(data) == 21
 
 
 # Detection: fixed-width command output (#3652) ------------------------------
@@ -213,6 +351,13 @@ def test_is_md_separator_needs_two_columns() -> None:
     assert not _is_md_separator("| a | b |")  # cells must be dashes
 
 
+def test_whole_markdown_table_needs_a_piped_header_then_a_separator() -> None:
+    assert _is_whole_markdown_table("| a | b |\n|---|---|\n| 1 | 2 |")
+    assert not _is_whole_markdown_table("| a | b |\n| 1 | 2 |\n| 3 | 4 |")
+    assert not _is_whole_markdown_table("Title\n|---|---|\na | b")
+    assert not _is_whole_markdown_table("Title\n|---|---|\nfoo\nbar")
+
+
 def test_markdown_table_needs_multiple_columns() -> None:
     # Valid separator below, but the header is a single column -> not a table.
     assert _try_detect_markdown_table(["x|", "---|---", "y|"]) is None
@@ -258,11 +403,66 @@ def test_parse_csv_and_records() -> None:
     assert records[1] == {"name": "Bob", "age": "25", "city": "LA"}
 
 
+def test_parse_csv_keeps_interior_blank_rows_and_trims_the_ends() -> None:
+    headers, rows = parse_csv("a,b\n1,2\n,\n3,4\n,\n5,6\n,\n")
+    assert headers == ["a", "b"]
+    assert rows == [["1", "2"], ["", ""], ["3", "4"], ["", ""], ["5", "6"]]
+    # Empty and whitespace-only lines have no real cells and are still skipped.
+    assert parse_csv("a,b\n1,2\n\n3,4\n")[1] == [["1", "2"], ["3", "4"]]
+    assert parse_csv("a,b\n1,2\n  \n3,4\n")[1] == [["1", "2"], ["3", "4"]]
+
+
+def test_parse_csv_normalizes_whitespace_only_interior_rows() -> None:
+    headers, rows = parse_csv("a,b\n1,2\n  ,  \n3,4\n")
+    assert rows == [["1", "2"], ["", ""], ["3", "4"]]
+
+
+def test_parse_csv_trims_a_large_blank_prefix_in_linear_time() -> None:
+    import time
+
+    def run(n: int) -> float:
+        text = ",\n" * n + "a,b\n1,2\n"
+        t0 = time.perf_counter()
+        headers, rows = parse_csv(text)
+        elapsed = time.perf_counter() - t0
+        assert headers == ["a", "b"]
+        assert rows == [["1", "2"]]
+        return elapsed
+
+    small, large = run(25_000), run(200_000)
+    # 8x the rows: linear stays near 8x; the old pop(0) loop was ~57x.
+    assert large < max(small, 1e-3) * 25, (small, large)
+
+
 def test_parse_markdown_table_drops_separator() -> None:
     headers, rows = parse_markdown_table(MARKDOWN)
     assert headers == ["name", "age"]
     assert ["Alice", "30"] in rows
     assert all("---" not in cell for row in rows for cell in row)
+
+
+def test_parse_csv_keeps_empty_records() -> None:
+    headers, rows = parse_csv("a,b\n1,2\n,\n3,4")
+    assert headers == ["a", "b"]
+    assert rows == [["1", "2"], ["", ""], ["3", "4"]]
+
+
+def test_parse_csv_keeps_empty_records_tsv() -> None:
+    headers, rows = parse_csv("a\tb\n1\t2\n\t\n3\t4", delimiter="\t")
+    assert headers == ["a", "b"]
+    assert rows == [["1", "2"], ["", ""], ["3", "4"]]
+
+
+def test_parse_csv_keeps_quoted_empty_record() -> None:
+    headers, rows = parse_csv('a,b\n"",""\n1,2')
+    assert headers == ["a", "b"]
+    assert rows[0] == ["", ""]
+
+
+def test_parse_markdown_table_keeps_separator_like_body_row() -> None:
+    headers, rows = parse_markdown_table("| a | b |\n|---|---|\n| 1 | 2 |\n| --- | --- |")
+    assert headers == ["a", "b"]
+    assert rows == [["1", "2"], ["---", "---"]]
 
 
 def test_parse_tabular_rejects_ragged_fixed_width(monkeypatch) -> None:
@@ -313,6 +513,76 @@ def test_compress_passes_through_ragged_table(monkeypatch) -> None:
     assert result.compressed == ragged
 
 
+# Duplicate header names ------------------------------------------------------
+
+
+def _duplicate_header_csv() -> str:
+    # A SQL join result: the same column name appears twice (#4277).
+    return "id,name,id,name\n" + "".join(f"{i},user_{i},{100 + i},org_{i % 3}\n" for i in range(40))
+
+
+def test_parse_tabular_rejects_duplicate_headers() -> None:
+    # Two columns with the same name cannot be zipped into records without one
+    # overwriting the other, so the earlier column's values would be lost.
+    assert parse_tabular(_duplicate_header_csv()) is None
+
+
+def test_parse_tabular_rejects_duplicate_blank_markdown_headers(monkeypatch) -> None:
+    import headroom.transforms.tabular_ingest as ti
+
+    monkeypatch.setattr(
+        ti,
+        "detect_content_type",
+        lambda _c: DetectionResult(ContentType.TABULAR, 0.9, {"format": "markdown"}),
+    )
+    # Two blank header cells collapse to the same "" key.
+    blank = "|  |  |\n| --- | --- |\n| 1 | 2 |\n| 3 | 4 |"
+    assert ti.parse_tabular(blank) is None
+
+
+def test_compress_passes_through_a_table_with_duplicate_headers() -> None:
+    content = _duplicate_header_csv()
+
+    result = TabularCompressor().compress(content)
+
+    assert not result.was_modified
+    assert result.compressed == content
+
+
+_JOIN_CSV = "id,name,id,name\n1,alice,10,acme\n2,bob,20,globex\n3,carol,30,initech\n"
+_BLANK_HEADER_MARKDOWN = (
+    "| id | | |\n| --- | --- | --- |\n| 1 | alice | x |\n| 2 | bob | y |\n| 3 | carol | z |"
+)
+
+
+@pytest.mark.parametrize("content", [_JOIN_CSV, _BLANK_HEADER_MARKDOWN])
+def test_parse_tabular_rejects_duplicate_headers_upstream(content: str) -> None:
+    # Records are keyed by header, so a repeated name keeps only its last
+    # column: `alice` and `bob` would vanish from the compressed table.
+    assert parse_tabular(content) is None
+
+
+def test_compress_passes_through_duplicate_headers_upstream() -> None:
+    # Large enough that SmartCrusher would otherwise save bytes on it.
+    content = "id,name,id,name\n" + "".join(
+        f"{i},user_{i},{100 + i},org_{i % 3}\n" for i in range(40)
+    )
+    result = TabularCompressor().compress(content)
+    assert not result.was_modified
+    assert result.compressed == content
+
+
+def test_router_keeps_every_column_of_a_table_with_duplicate_headers() -> None:
+    content = _duplicate_header_csv()
+
+    result = ContentRouter().compress(content)
+
+    # No column may be dropped, and the remaining values must not be
+    # relabelled as if they came from the dropped columns.
+    for value in ("user_7", "org_1", "100", "107"):
+        assert value in result.compressed
+
+
 def _csv_with_an_oversized_cell() -> str:
     # csv.field_size_limit is 128 KB per cell; one pasted document, log excerpt
     # or base64 blob in a column goes past it.
@@ -343,6 +613,69 @@ def test_parse_fixed_width() -> None:
     headers, rows = parse_fixed_width("name    age   city\nAlice   30    NYC\nBob     25    LA")
     assert headers == ["name", "age", "city"]
     assert rows[0] == ["Alice", "30", "NYC"]
+
+
+def test_parse_fixed_width_never_splits_on_double_spaces_inside_a_cell() -> None:
+    # One-space gutter between USER and COMMAND on the 4444 row, and a double
+    # space inside that row's COMMAND cell. A 2+ space split returned
+    # ['4444', 'sysadmin1 sleep', '60'] (COMMAND=60), still three cells. A
+    # one-space gap cannot be told apart from a space inside a cell, so the
+    # table is not parsed and passes through verbatim.
+    table = (
+        "PID   USER      COMMAND\n"
+        "1     root      /sbin/init\n"
+        "22    www-data  nginx\n"
+        "4444  sysadmin1 sleep  60\n"
+        "5     root      cron"
+    )
+    assert parse_fixed_width(table) == ([], [])
+
+
+def test_parse_fixed_width_keeps_an_empty_cell_empty() -> None:
+    # An empty STATUS next to a NOTE with a double space used to read as
+    # STATUS='two', NOTE='words'. Here the other NOTE cells are longer, so the
+    # grid is unambiguous and the empty cell stays empty.
+    table = (
+        "NAME   STATUS  NOTE\n"
+        "alpha  ok      fine-and-dandy-things\n"
+        "beta           two  words\n"
+        "gamma  ok      fine-and-dandy-things"
+    )
+    headers, rows = parse_fixed_width(table)
+    assert headers == ["NAME", "STATUS", "NOTE"]
+    assert rows[1] == ["beta", "", "two  words"]
+
+
+def test_parse_fixed_width_never_shifts_a_value_when_the_grid_is_ambiguous() -> None:
+    # 'fine' covers one of the two spaces inside 'two  words', so no 2-wide
+    # gutter opens there and NOTE keeps the whole value. The one wrong answer
+    # is putting 'two' under STATUS.
+    table = (
+        "NAME   STATUS  NOTE\nalpha  ok      fine\nbeta           two  words\ngamma  ok      fine"
+    )
+    headers, rows = parse_fixed_width(table)
+    assert headers == ["NAME", "STATUS", "NOTE"]
+    assert rows[1] == ["beta", "", "two  words"]
+
+
+def test_parse_fixed_width_refuses_a_row_that_crosses_a_column_boundary() -> None:
+    table = "NAME  STATUS\nalphabetical  ok\nbeta  ok"
+    assert parse_fixed_width(table) == ([], [])
+
+
+def test_parse_tabular_fixed_width_control_matches_kubectl_columns(monkeypatch) -> None:
+    import headroom.transforms.tabular_ingest as ti
+
+    monkeypatch.setattr(
+        ti,
+        "detect_content_type",
+        lambda _c: DetectionResult(ContentType.TABULAR, 0.9, {"format": "fixed_width"}),
+    )
+    parsed = ti.parse_tabular(KUBECTL)
+    assert parsed is not None
+    headers, rows, _fmt = parsed
+    assert headers == ["NAME", "READY", "STATUS", "RESTARTS", "AGE"]
+    assert rows[2] == ["worker-5c8d7f9b8-lq2vx", "1/1", "Running", "2", "5h"]
 
 
 def test_to_records_empty_headers_returns_empty() -> None:
@@ -394,7 +727,7 @@ def test_parse_tabular_rejects_single_column_fixed_width(monkeypatch) -> None:
 def test_parse_tabular_none_when_no_data_rows_survive() -> None:
     # Detected as a markdown table, but it is header + separator rows only:
     # nothing survives as a data row, so parse_tabular bails to None.
-    assert parse_tabular("| a | b |\n| --- | --- |\n| --- | --- |") is None
+    assert parse_tabular("| a | b |\n| --- | --- |") is None
 
 
 def test_compression_ratio_zero_for_empty_original() -> None:
@@ -420,6 +753,14 @@ def test_compact_unique_csv_passes_through() -> None:
     result = TabularCompressor().compress(CSV)
     assert not result.was_modified
     assert result.compressed == CSV
+
+
+def test_compress_keeps_a_document_with_a_table_whole() -> None:
+    # Only the table's rows used to come back, as JSON, with the prose and the
+    # other command's output silently gone.
+    result = TabularCompressor().compress(_DOC_WITH_TABLE)
+    assert not result.was_modified
+    assert result.compressed == _DOC_WITH_TABLE
 
 
 def test_non_tabular_passes_through_unmodified() -> None:
@@ -489,6 +830,12 @@ def test_router_keeps_ls_output_verbatim(monkeypatch) -> None:
     assert result.compressed == payload
     assert calls == []
     assert result.strategy_used is CompressionStrategy.TABULAR
+
+
+def test_router_does_not_route_a_document_with_a_table_to_tabular(monkeypatch) -> None:
+    _record_kompress_calls(monkeypatch)
+    result = ContentRouter(ContentRouterConfig()).compress(_DOC_WITH_TABLE)
+    assert result.strategy_used is not CompressionStrategy.TABULAR
 
 
 def test_router_does_not_kompress_a_ragged_csv(monkeypatch) -> None:
@@ -842,3 +1189,30 @@ def test_load_spreadsheet_missing_file(tmp_path) -> None:
 
     with pytest.raises(FileNotFoundError):
         load_spreadsheet(tmp_path / "nope.xlsx")
+
+
+def test_parse_fixed_width_keeps_multiword_headers_and_values_whole():
+    text = (
+        "First Name      AGE  CITY\n"
+        "Alice Brown     30   LA\n"
+        "Carol Green     25   SF\n"
+        "David White     40   NY\n"
+        "Frank Young     32   TX"
+    )
+    headers, rows = parse_fixed_width(text)
+    assert headers == ["First Name", "AGE", "CITY"]
+    assert rows[0] == ["Alice Brown", "30", "LA"]
+
+
+def test_parse_fixed_width_cost_follows_input_length():
+    # Many short rows plus one very long cell: checking every row at every
+    # position of the longest row was ~20M checks for 33 KB of input.
+    import time
+
+    text = "KEY  FLAG  VALUE\n" + "a    b     c\n" * 1000 + "a    b     " + "z" * 20000
+    t0 = time.perf_counter()
+    headers, rows = parse_fixed_width(text)
+    elapsed = time.perf_counter() - t0
+    assert headers == ["KEY", "FLAG", "VALUE"]
+    assert rows[-1][2] == "z" * 20000
+    assert elapsed < 0.05, f"parse took {elapsed:.3f}s for {len(text)} chars"

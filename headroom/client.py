@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import logging
-from collections.abc import Iterator
+from collections.abc import Callable, Iterable, Iterator
 from datetime import datetime, timezone
 from typing import Any
 
@@ -36,6 +36,74 @@ from .utils import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+class _OwnedStream(Iterator[Any]):
+    """Iterator that owns and closes an upstream response stream."""
+
+    def __init__(self, stream: Iterable[Any], save_metrics: Callable[[], None]) -> None:
+        self._source: Iterable[Any] | None = stream
+        self._stream: Iterator[Any] | None = None
+        self._save_metrics: Callable[[], None] | None = save_metrics
+        self._finished = False
+
+    def __iter__(self) -> _OwnedStream:
+        return self
+
+    def __next__(self) -> Any:
+        if self._finished:
+            raise StopIteration
+        try:
+            if self._stream is None:
+                source = self._source
+                if source is None:
+                    raise StopIteration
+                self._stream = iter(source)
+            return next(self._stream)
+        except BaseException:
+            self.close()
+            raise
+
+    def close(self) -> None:
+        """Close the upstream stream and save metrics exactly once."""
+        if self._finished:
+            return
+        self._finished = True
+        source = self._source
+        stream = self._stream
+        save_metrics = self._save_metrics
+        try:
+            candidates = (source,) if source is stream else (source, stream)
+            for candidate in candidates:
+                if candidate is None:
+                    continue
+                close = getattr(candidate, "close", None)
+                if close is not None:
+                    try:
+                        close()
+                    except Exception:
+                        logger.warning("Failed to close upstream response stream", exc_info=True)
+        finally:
+            self._source = None
+            self._stream = None
+            self._save_metrics = None
+            if save_metrics is not None:
+                save_metrics()
+
+    def __enter__(self) -> _OwnedStream:
+        return self
+
+    def __exit__(self, exc_type: Any, exc_val: Any, exc_tb: Any) -> None:
+        self.close()
+
+    def __del__(self) -> None:
+        # The previous generator wrapper ran its finally block when abandoned
+        # after iteration started. Preserve that cleanup for callers that do
+        # not explicitly close a stream.
+        try:
+            self.close()
+        except Exception:
+            logger.debug("Failed to finalize abandoned response stream", exc_info=True)
 
 
 class ChatCompletions:
@@ -134,6 +202,7 @@ class Messages:
         model: str,
         messages: list[dict[str, Any]],
         max_tokens: int = 1024,
+        stream: bool = False,
         # Headroom-specific parameters
         headroom_mode: str | None = None,
         headroom_cache_prefix_tokens: int | None = None,
@@ -150,6 +219,7 @@ class Messages:
             model: Model name.
             messages: List of messages.
             max_tokens: Maximum tokens in response.
+            stream: Return an iterator of raw message events when True.
             headroom_mode: Override default mode ("audit" | "optimize").
             headroom_cache_prefix_tokens: Target cache-aligned prefix size.
             headroom_output_buffer_tokens: Reserve tokens for output.
@@ -163,13 +233,13 @@ class Messages:
         return self._client._create(
             model=model,
             messages=messages,
-            stream=False,
+            stream=stream,
             headroom_mode=headroom_mode,
             headroom_cache_prefix_tokens=headroom_cache_prefix_tokens,
             headroom_output_buffer_tokens=headroom_output_buffer_tokens,
             headroom_keep_turns=headroom_keep_turns,
             headroom_tool_profiles=headroom_tool_profiles,
-            api_style="anthropic",
+            api_style="anthropic_create",
             max_tokens=max_tokens,
             **kwargs,
         )
@@ -307,11 +377,11 @@ class HeadroomClient:
         # Use provided config or build from individual parameters
         if config is not None:
             self._config = config
-            # Override store_url and mode if explicitly provided in config
+            # Override store_url and mode if explicitly provided in config.
+            # The resolved URL is not written back: the caller may share this
+            # config with other clients, which would then read it as explicit.
             if config.store_url:
                 self._store_url = config.store_url
-            else:
-                self._config.store_url = store_url
             self._default_mode = config.default_mode
         else:
             # Build config from individual parameters
@@ -325,7 +395,7 @@ class HeadroomClient:
             self._config.model_context_limits.update(model_context_limits)
 
         # Initialize storage
-        self._storage = create_storage(store_url)
+        self._storage = create_storage(self._store_url)
 
         # Initialize transform pipeline
         self._pipeline = TransformPipeline(self._config, provider=self._provider)
@@ -338,7 +408,7 @@ class HeadroomClient:
         self._cache_optimizer: BaseCacheOptimizer | None = None
         self._semantic_cache_layer: SemanticCacheLayer | None = None
 
-        if enable_cache_optimizer:
+        if self._config.cache_optimizer.enabled:
             if cache_optimizer is not None:
                 self._cache_optimizer = cache_optimizer
             else:
@@ -372,7 +442,7 @@ class HeadroomClient:
             provider=self._provider.name.lower(),
             metadata={
                 "default_mode": self._default_mode.value,
-                "cache_optimizer_enabled": enable_cache_optimizer,
+                "cache_optimizer_enabled": self._config.cache_optimizer.enabled,
                 "semantic_cache_enabled": enable_semantic_cache,
             },
         )
@@ -406,6 +476,9 @@ class HeadroomClient:
         **kwargs: Any,
     ) -> Any:
         """Internal implementation of create."""
+        transport_style = api_style
+        if api_style == "anthropic_create":
+            api_style = "anthropic"
         request_id = generate_request_id()
         timestamp = datetime.now(timezone.utc).replace(tzinfo=None)
         mode = HeadroomMode(headroom_mode) if headroom_mode else self._default_mode
@@ -607,7 +680,7 @@ class HeadroomClient:
         # Call underlying client based on API style
         try:
             response = call_client_transport(
-                api_style,
+                transport_style,
                 self,
                 model=model,
                 messages=optimized_messages,
@@ -644,16 +717,11 @@ class HeadroomClient:
 
     def _wrap_stream(
         self,
-        stream: Iterator[Any],
+        stream: Iterable[Any],
         metrics: RequestMetrics,
     ) -> Iterator[Any]:
-        """Wrap stream to pass through chunks and save metrics at end."""
-        try:
-            yield from stream
-        finally:
-            # Save metrics when stream completes
-            # Note: output tokens unknown for streams
-            self._storage.save(metrics)
+        """Wrap stream, closing the upstream and saving metrics exactly once."""
+        return _OwnedStream(stream, lambda: self._storage.save(metrics))
 
     def _extract_query(self, messages: list[dict[str, Any]]) -> str:
         """Extract query from messages for semantic caching.

@@ -28,7 +28,7 @@ headroom unwrap opencode
 | Runtime env | Sets `OPENCODE_CONFIG_CONTENT` with provider, plugin, and optional local MCP config so OpenCode picks up Headroom at launch |
 | Provider compatibility | Leaves `OPENAI_BASE_URL` and `ANTHROPIC_BASE_URL` untouched so OpenCode `/connect` providers keep their own routing |
 | MCP setup | Registers the Headroom MCP server (`headroom_compress`, `headroom_retrieve`, `headroom_stats`) |
-| Serena MCP | Optionally registers Serena code graph tools (`--no-serena` to skip) |
+| Serena MCP | Off by default; `--code-memory serena` registers Serena code navigation tools |
 | Backup | Snapshots `opencode.json` to `opencode.json.headroom-backup` before making any changes |
 | Launch | Starts the `opencode` binary through the proxy |
 
@@ -38,7 +38,7 @@ headroom unwrap opencode
 headroom wrap opencode \
   --port 8787 \
   --no-mcp \
-  --no-serena \
+  --code-memory serena \
   --code-graph \
   --no-proxy \
   --openai-api-url https://api.deepseek.com/v1 \

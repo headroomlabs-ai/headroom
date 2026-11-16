@@ -609,6 +609,62 @@ def test_all_artifacts_failing_at_run_raises_rather_than_returning_a_dead_sessio
         kc._create_onnx_session("org/model", ["CPUExecutionProvider"])
 
 
+def test_no_loadable_artifact_message_carries_the_underlying_error(monkeypatch):
+    """Issue #4207: the ONNX loader reported only "No loadable ONNX artifact",
+    hiding the Permission denied behind it. The message must show the cause.
+    """
+
+    def fake_artifact(model_id, filename, *, allow_network):
+        raise PermissionError(13, "Permission denied")
+
+    monkeypatch.setattr(kc, "_hf_artifact", fake_artifact)
+
+    with pytest.raises(FileNotFoundError) as excinfo:
+        kc._create_onnx_session("org/model", ["CPUExecutionProvider"])
+
+    assert "No loadable ONNX artifact" in str(excinfo.value)
+    assert "Permission denied" in str(excinfo.value)
+
+
+def test_onnx_failure_while_onnxruntime_available_reports_the_real_error(monkeypatch):
+    """Issue #4207: when onnxruntime IS installed but loading failed, the
+    compressor must not claim a missing dependency (which points operators at
+    reinstalling extras that are already present). It must surface the real
+    failure.
+    """
+    monkeypatch.setattr(kc, "_is_onnx_available", lambda: True)
+    monkeypatch.setattr(kc, "_is_pytorch_available", lambda: False)
+
+    def boom(*args, **kwargs):
+        raise FileNotFoundError(
+            "No loadable ONNX artifact in org/model; tried ('a.onnx',): "
+            "Permission denied (os error 13)"
+        )
+
+    monkeypatch.setattr(kc, "_load_kompress_onnx", boom)
+    monkeypatch.setattr(kc, "_selected_backend", lambda: "auto")
+    kc._kompress_cache.pop("org/model", None)
+
+    with pytest.raises(RuntimeError) as excinfo:
+        kc._load_kompress("org/model")
+
+    message = str(excinfo.value)
+    assert "requires onnxruntime or torch" not in message
+    assert "Permission denied" in message
+    assert isinstance(excinfo.value.__cause__, FileNotFoundError)
+
+
+def test_missing_dependency_still_reports_install_hint(monkeypatch):
+    """The genuine no-backend case keeps the actionable install hint."""
+    monkeypatch.setattr(kc, "_is_onnx_available", lambda: False)
+    monkeypatch.setattr(kc, "_is_pytorch_available", lambda: False)
+    monkeypatch.setattr(kc, "_selected_backend", lambda: "auto")
+    kc._kompress_cache.pop("org/model", None)
+
+    with pytest.raises(ImportError, match="onnxruntime or torch"):
+        kc._load_kompress("org/model")
+
+
 # ── Load-stage timings: say where a slow warm-up spent its time ────────────────
 
 

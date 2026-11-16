@@ -5,7 +5,17 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any
 
+from headroom.proxy.tool_name_policy import extract_tool_name
+
 from .tool_injection import CCR_TOOL_NAME, parse_tool_call
+
+_CLIENT_CCR_TOOL_ALIASES = frozenset(
+    {
+        "headroom_headroom_retrieve",
+        "mcp__headroom__headroom_retrieve",
+        "mcp_headroom_headroom_retrieve",
+    }
+)
 
 
 @dataclass
@@ -126,6 +136,18 @@ def has_ccr_retrieve_tool(tools: Any) -> bool:
         if isinstance(function, dict) and function.get("name") == CCR_TOOL_NAME:
             return True
     return False
+
+
+def client_retrieval_tool_name(tools: list[dict[str, Any]] | None) -> str | None:
+    """Select the canonical retrieval tool, or a default Headroom MCP alias."""
+    alias = None
+    for tool in tools or ():
+        name = extract_tool_name(tool)
+        if name == CCR_TOOL_NAME:
+            return name
+        if alias is None and isinstance(name, str) and name.lower() in _CLIENT_CCR_TOOL_ALIASES:
+            alias = name
+    return alias
 
 
 def has_ccr_tool_calls(response: dict[str, Any], provider: str) -> bool:

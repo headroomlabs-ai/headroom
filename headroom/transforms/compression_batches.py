@@ -16,7 +16,9 @@ from .compression_units import (
     RoutedCompressionUnit,
     TokenCounterLike,
     UnitCompressionResult,
+    _categorize_reason,
     _is_structured_shell_output,
+    check_unit_protection,
 )
 from .content_router import RouterCompressionResult
 from .tag_protector import protect_tags, restore_tags
@@ -104,7 +106,12 @@ def build_compression_batches(
     for entry in entries:
         entry_bytes = _text_bytes(entry.routed.unit.text)
         entry_key = _compatibility_key(entry)
-        if entry_bytes >= min_batch_bytes or entry_bytes > max_batch_bytes:
+        protection_reason = check_unit_protection(entry.routed.unit)
+        if (
+            protection_reason is not None
+            or entry_bytes >= min_batch_bytes
+            or entry_bytes > max_batch_bytes
+        ):
             flush()
             skipped.append(entry)
             continue
@@ -197,7 +204,7 @@ def _passthrough_batch_results(
     batch: CompressionBatch,
     *,
     tokenizer: TokenCounterLike,
-    reason: str,
+    reason: str | None = None,
     router_result: RouterCompressionResult | None = None,
 ) -> list[tuple[object, UnitCompressionResult]]:
     strategy = (
@@ -217,11 +224,13 @@ def _passthrough_batch_results(
                 tokens_saved=0,
                 transforms_applied=[],
                 strategy=strategy,
-                reason=reason,
+                reason=reason or check_unit_protection(entry.routed.unit) or "batch_invalid",
                 router_result=router_result,
                 text_bytes=_text_bytes(entry.routed.unit.text),
                 min_bytes=entry.routed.unit.min_bytes,
-                reason_category=reason,
+                reason_category=_categorize_reason(
+                    reason or check_unit_protection(entry.routed.unit) or "batch_invalid"
+                ),
             ),
         )
         for entry in batch.entries
@@ -240,6 +249,9 @@ def compress_batch_with_router(
 
     ``deadline_started_at`` works as in ``compress_unit_with_router``.
     """
+
+    if any(check_unit_protection(entry.routed.unit) is not None for entry in batch.entries):
+        return _passthrough_batch_results(batch, tokenizer=tokenizer)
 
     if deadline_started_at is not None and not router.share_request_deadline(deadline_started_at):
         return _passthrough_batch_results(batch, tokenizer=tokenizer, reason="deadline_exceeded")

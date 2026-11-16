@@ -25,6 +25,7 @@ import logging
 import os
 from typing import Any
 
+from headroom.offline import pin_litellm_cost_map_local
 from headroom.pricing.litellm_pricing import estimate_cost_from_tokens
 from headroom.tokenizers import EstimatingTokenCounter
 
@@ -38,6 +39,7 @@ try:
     # module-level suppression flags below can be set.
     os.environ.setdefault("LITELLM_SUPPRESS_DEBUG_INFO", "True")
 
+    pin_litellm_cost_map_local()
     import litellm
 
     # Suppress litellm's startup banner ("Provider List: https://...") and

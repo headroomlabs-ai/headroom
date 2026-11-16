@@ -20,6 +20,7 @@ from datetime import datetime, timedelta
 from pathlib import Path
 
 from headroom import paths as _paths
+from headroom.offline import pin_litellm_cost_map_local
 from headroom.pricing.litellm_pricing import resolve_litellm_model
 
 log = logging.getLogger(__name__)
@@ -74,6 +75,7 @@ _STAGE_TIMINGS_RE = re.compile(
 # directly instead of maintaining our own pricing tables.
 
 try:
+    pin_litellm_cost_map_local()
     import litellm as _litellm
 
     _LITELLM_AVAILABLE = True
@@ -222,6 +224,7 @@ class PerfReport:
     oldest_kept_ts: str | None = None
     newest_kept_ts: str | None = None
     records_filtered_out: int = 0
+    records_malformed: int = 0
     # True when no time cutoff was applied (--hours 0, or a value so large it
     # overflows datetime arithmetic). The header says "all data" instead of a
     # misleading "last 0h".
@@ -384,9 +387,8 @@ def parse_log_files(last_n_hours: float = 168.0) -> PerfReport:
                         if not _within_window(ts):
                             report.records_filtered_out += 1
                             continue
-                        _track_window(ts)
-                        report.perf_records.append(
-                            PerfRecord(
+                        try:
+                            record = PerfRecord(
                                 timestamp=ts,
                                 request_id=m.group("rid"),
                                 model=kv.get("model", ""),
@@ -409,7 +411,13 @@ def parse_log_files(last_n_hours: float = 168.0) -> PerfReport:
                                 from_response_cache=kv.get("cached", "0") == "1",
                                 stages=stages_by_rid.get(m.group("rid"), {}),
                             )
-                        )
+                        except ValueError:
+                            # A non-numeric field is not a PERF line Headroom wrote
+                            # (e.g. text a client put into a logged model id).
+                            report.records_malformed += 1
+                            continue
+                        _track_window(ts)
+                        report.perf_records.append(record)
                         continue
 
                     # content_router summary lines
@@ -541,6 +549,11 @@ def format_report(report: PerfReport) -> str:
             lines.append(
                 f"Records outside window:  {report.records_filtered_out:,} "
                 "(filtered out — increase --hours to include them)"
+            )
+        if report.records_malformed > 0:
+            lines.append(
+                f"Malformed PERF lines:    {report.records_malformed:,} "
+                "(skipped — a numeric field did not parse)"
             )
     lines.append("")
 
@@ -1398,6 +1411,7 @@ def build_perf_summary(report: PerfReport) -> dict:
             "newest": report.newest_kept_ts,
         },
         "records_filtered_out": report.records_filtered_out,
+        "records_malformed": report.records_malformed,
         "total_requests": len(records),
         "total_tokens_before": total_before,
         "total_tokens_after": total_after,
