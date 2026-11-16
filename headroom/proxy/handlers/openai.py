@@ -3784,7 +3784,10 @@ class OpenAIHandlerMixin:
                 COMPRESSION_BODY_MAX_BYTES,
             )
             backend = resolver_for(self).for_request(
-                request, body=body, native_providers=("openai",)
+                request,
+                body=body,
+                native_providers=("openai",),
+                upstream_url=upstream_base_url,
             )
             passthrough_model = body.get("model", "unknown")
             if not isinstance(passthrough_model, str):
@@ -4572,7 +4575,7 @@ class OpenAIHandlerMixin:
         # Decided before injection: a turn that can buffer can answer the tool,
         # so it may carry it even though the client asked for a stream. Whether
         # it actually buffers is settled at dispatch, from the final body.
-        from headroom.proxy.route_advice import advice_from
+        from headroom.proxy.route_advice import resolver_for
 
         _ccr_handler = getattr(self, "ccr_response_handler", None)
         chat_stream_ccr_eligible = _is_openai_chat_stream_ccr_eligible(
@@ -4582,10 +4585,12 @@ class OpenAIHandlerMixin:
                 _ccr_handler and getattr(_ccr_handler.config, "enabled", True)
             ),
             ccr_inject_tool=self.config.ccr_inject_tool,
-            routed_to_backend=(
-                getattr(self, "anthropic_backend", None) is not None
-                or advice_from(request) is not None
-            ),
+            # Ask the resolver, not the advice: advice it ignores (a Copilot
+            # upstream) leaves this request on the direct path.
+            routed_to_backend=resolver_for(self).for_request(
+                request, native_providers=("openai",), upstream_url=upstream_base_url
+            )
+            is not None,
             upstream_base_url=upstream_base_url,
         )
         can_inject_ccr_tool = _should_inject_openai_chat_ccr_tool(
@@ -5162,7 +5167,7 @@ class OpenAIHandlerMixin:
         _normalize_openai_max_tokens(
             body,
             backend_owns_translation=resolver_for(self).for_request(
-                request, native_providers=("openai",)
+                request, native_providers=("openai",), upstream_url=upstream_base_url
             )
             is not None,
         )
@@ -5233,7 +5238,7 @@ class OpenAIHandlerMixin:
         # litellm backend; same-family (openai) advice still resolves to
         # `self.anthropic_backend`, unchanged.
         request_backend = resolver_for(self).for_request(
-            request, body=body, native_providers=("openai",)
+            request, body=body, native_providers=("openai",), upstream_url=upstream_base_url
         )
         if request_backend is not None:
             try:
