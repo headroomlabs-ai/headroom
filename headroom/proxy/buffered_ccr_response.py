@@ -42,7 +42,7 @@ import asyncio
 import json
 import logging
 from collections.abc import Awaitable, Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any
 
 logger = logging.getLogger("headroom.proxy")
@@ -104,6 +104,26 @@ def _openai_error_type(status: int) -> str:
     }.get(status, "server_error")
 
 
+def _openai_responses_error_type(status: int) -> str:
+    """Map a status onto the error-code vocabulary of the Responses API.
+
+    ``ResponseErrorEvent.code`` is a free-form string, but the values clients
+    and OpenAI's docs use are this set -- the same vocabulary as
+    ``headroom/backends/litellm.py``'s ``_OPENAI_ERROR_TYPES``. A 429 is
+    ``rate_limit_exceeded``, not Chat Completions' ``rate_limit_error``.
+    """
+
+    return {
+        400: "invalid_request_error",
+        401: "invalid_api_key",
+        403: "permission_error",
+        404: "model_not_found",
+        413: "invalid_request_error",
+        422: "invalid_request_error",
+        429: "rate_limit_exceeded",
+    }.get(status, "server_error")
+
+
 ANTHROPIC_ERROR_FORMAT = BufferedCCRErrorFormat(
     provider="anthropic",
     json_body=lambda message: json.dumps(
@@ -119,28 +139,66 @@ ANTHROPIC_ERROR_FORMAT = BufferedCCRErrorFormat(
     heartbeat=b'event: ping\ndata: {"type":"ping"}\n\n',
 )
 
+# Chat Completions' error envelope: the nested OpenAI ``error`` object and
+# nothing else. The Responses stream has its own, event-typed frame below.
 OPENAI_ERROR_FORMAT = BufferedCCRErrorFormat(
     provider="openai",
     json_body=lambda message: json.dumps(
         {"error": {"message": message, "type": "server_error", "code": "proxy_error"}}
     ).encode(),
-    # The Responses API addresses its stream events by a top-level ``type``
-    # discriminator, so an error frame has to carry one. Without it a client
-    # parsing the stream as Responses events cannot tell this frame from a
-    # malformed event and reports the parse failure instead of the error --
-    # Zed, for one, logs "missing field `type`" and fails the whole turn.
-    # ``event: error`` plus a top-level ``type`` matches the Anthropic twin
-    # below and the frame OpenAI itself documents.
     sse_event=lambda error_type, message: (
-        "event: error\ndata: "
-        + json.dumps({"type": "error", "error": {"type": error_type, "message": message}})
-        + "\n\n"
+        "data: " + json.dumps({"error": {"message": message, "type": error_type}}) + "\n\n"
     ).encode(),
     error_type_for_status=_openai_error_type,
     # OpenAI has no ping event; an SSE comment keeps the socket warm without
     # putting a frame the client would try to parse on the wire.
     heartbeat=b": ping\n\n",
 )
+
+# The Responses API is event-typed: every frame carries a top-level ``type``
+# discriminator, and an error frame without one is not a valid
+# ``ResponseErrorEvent``. Zed, for one, parses the stream through a
+# ``#[serde(tag = "type")]`` enum and fails the whole turn with
+# "missing field `type`" instead of surfacing the error.
+#
+# This is a separate format rather than a change to OPENAI_ERROR_FORMAT above:
+# the shared frame can only satisfy one endpoint, and Chat Completions still
+# expects the nested-only envelope.
+#
+# ``sequence_number`` is mandatory on ``ResponseErrorEvent``. It is synthetic
+# here because this frame is the first data event on a connection the proxy
+# has already committed as SSE: no upstream event was forwarded, so there is
+# no sequence to continue.
+#
+# The nested ``error`` object is kept alongside the flat fields because
+# openai-python only raises its typed ``APIError`` for a stream frame that
+# carries ``error`` (``openai/_streaming.py``); without it the frame is
+# delivered as a plain event, and callers that catch the exception never see
+# a failure.
+OPENAI_RESPONSES_ERROR_FORMAT = replace(
+    OPENAI_ERROR_FORMAT,
+    sse_event=lambda error_type, message: (
+        "event: error\ndata: "
+        + json.dumps(
+            {
+                "type": "error",
+                "code": error_type,
+                "message": message,
+                "param": None,
+                "sequence_number": 0,
+                "error": {
+                    "type": error_type,
+                    "code": error_type,
+                    "message": message,
+                    "param": None,
+                },
+            }
+        )
+        + "\n\n"
+    ).encode(),
+    error_type_for_status=_openai_responses_error_type,
+)
+
 
 _GENERIC_FAILURE_MESSAGE = "An error occurred while processing your request. Please try again."
 
