@@ -7,7 +7,7 @@ import os from "node:os";
 import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
-import { installHeadroomTransport, uninstallHeadroomTransport } from "./transport.js";
+import { installHeadroomTransport, setHeadroomWireRoots, uninstallHeadroomTransport } from "./transport.js";
 
 afterEach(() => {
   uninstallHeadroomTransport();
@@ -294,7 +294,7 @@ describe("Headroom OpenCode transport", () => {
     globalThis.fetch = originalFetch;
   });
 
-  it("still routes provider-rooted wire paths, including a bare endpoint and other version prefixes (#4747)", async () => {
+  it("still routes provider-rooted wire paths and other version prefixes (#4747)", async () => {
     const originalFetch = globalThis.fetch;
     const fetchMock = vi.fn(async (..._args: FetchCall) => new Response("ok"));
     globalThis.fetch = fetchMock as unknown as typeof fetch;
@@ -302,20 +302,57 @@ describe("Headroom OpenCode transport", () => {
     installHeadroomTransport({ proxyUrl: "http://127.0.0.1:8787/v1" });
 
     const init = { method: "POST" };
-    await fetch("https://api.example.com/messages", init);
-    await fetch("https://api.example.com/responses", init);
     await fetch("https://gateway.example.com/api/chat/completions", init);
     await fetch("https://gateway.example.com/api/v2/chat/completions", init);
     await fetch("https://gateway.example.com/openai/deployments/x/chat/completions", init);
     await fetch("https://opencode.ai/zen/v1/responses", init);
     await fetch("https://cloud.example.com/backend-api/codex/responses", init);
 
-    expect(fetchMock).toHaveBeenCalledTimes(7);
+    expect(fetchMock).toHaveBeenCalledTimes(5);
     for (const call of fetchMock.mock.calls as FetchCall[]) {
       expect(call[0]).toBeInstanceOf(URL);
       expect(new Headers(call[1]?.headers).get("x-headroom-base-url")).not.toBeNull();
     }
 
+    globalThis.fetch = originalFetch;
+  });
+
+  it("leaves a POST to a host's bare /messages or /responses alone unless that base is configured (#4781)", async () => {
+    const originalFetch = globalThis.fetch;
+    const fetchMock = vi.fn(async (..._args: FetchCall) => new Response("ok"));
+    globalThis.fetch = fetchMock as unknown as typeof fetch;
+
+    // MessageBird's legacy SMS API is POST https://rest.messagebird.com/messages
+    // with `Authorization: AccessKey ...`: a non-LLM credential that must not
+    // travel to the proxy. No base URL is configured for these origins.
+    installHeadroomTransport({ proxyUrl: "http://127.0.0.1:8787/v1" });
+
+    const init = { method: "POST", headers: { authorization: "AccessKey FAKE-TEST-VALUE" }, body: "{}" };
+    await fetch("https://rest.messagebird.com/messages", init);
+    await fetch("https://api.example.com/messages", init);
+    await fetch("https://api.example.com/responses", init);
+    await fetch("https://api.example.com/chat/completions", init);
+
+    expect(fetchMock).toHaveBeenCalledTimes(4);
+    for (const call of fetchMock.mock.calls as FetchCall[]) {
+      expect(typeof call[0]).toBe("string");
+      expect(call[1]).toBe(init);
+      const headers = new Headers(call[1]?.headers);
+      expect(headers.get("x-headroom-base-url")).toBeNull();
+      expect(headers.get("x-headroom-original-path")).toBeNull();
+    }
+
+    // A provider mounted at the origin root is still routed, because the base
+    // URL itself is the configured wire root.
+    setHeadroomWireRoots("https://rest.messagebird.com");
+    await fetch("https://rest.messagebird.com/messages", init);
+    expect(fetchMock).toHaveBeenCalledTimes(5);
+    expect(fetchMock.mock.calls[4][0]).toEqual(new URL("http://127.0.0.1:8787/messages"));
+    expect(new Headers(fetchMock.mock.calls[4][1]?.headers).get("x-headroom-base-url")).toBe(
+      "https://rest.messagebird.com",
+    );
+
+    uninstallHeadroomTransport();
     globalThis.fetch = originalFetch;
   });
 

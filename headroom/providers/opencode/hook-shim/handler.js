@@ -241,7 +241,7 @@ function isVersionSegment(segment) {
 function hasWireRootBefore(body) {
   const segments = body.split("/").filter(Boolean);
   const last = segments.at(-1);
-  return last === void 0 || isVersionSegment(last) || IMMEDIATE_WIRE_ROOTS.has(last) || segments.some((s) => NAMED_WIRE_ROOTS.has(s));
+  return last !== void 0 && (isVersionSegment(last) || IMMEDIATE_WIRE_ROOTS.has(last) || segments.some((s) => NAMED_WIRE_ROOTS.has(s)));
 }
 function isLlmEndpointPath(pathname, origin = "", wireRoots = []) {
   if (pathname.endsWith(":generateContent") || pathname.endsWith(":streamGenerateContent")) {
