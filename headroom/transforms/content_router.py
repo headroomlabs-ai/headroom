@@ -2011,6 +2011,7 @@ class CompressionCache:
         """Store a compressed result (Tier 2).  Thread-safe."""
         with self._lock:
             self._disk_reads.pop(key, None)
+            self._skip.pop(key, None)
             has_marker = self._admit_locked(key, compressed, ratio, strategy)
             token = object()
             if self._store is not None:

@@ -17,6 +17,30 @@ from headroom.transforms.content_router import (
 )
 
 
+@pytest.mark.parametrize("disk", [False, True])
+@pytest.mark.parametrize("skip_method", ["mark_skip", "move_to_skip"])
+def test_a_new_result_supersedes_an_older_skip(tmp_path, disk, skip_method):
+    store = ResultStore(tmp_path / "cache.db", 1800) if disk else None
+    cache = CompressionCache(store=store)
+    getattr(cache, skip_method)("same")
+    cache.put("same", "compressed", 0.4, "kompress")
+
+    assert not cache.is_skipped("same")
+    assert cache.get("same") == ("compressed", 0.4, "kompress")
+    assert cache.skip_size == 0
+
+
+def test_first_sight_skips_do_not_issue_sqlite_writes(tmp_path):
+    store = ResultStore(tmp_path / "cache.db", 1800)
+    cache = CompressionCache(store=store)
+    statements = []
+    store._db.set_trace_callback(statements.append)
+    for i in range(100):
+        cache.mark_skip(f"new-{i}")
+    assert cache.skip_size == 100
+    assert statements == []
+
+
 def test_results_stay_within_the_memory_budget_least_recently_used_first():
     cache = CompressionCache(max_bytes=10_000)
     for i in range(100):
