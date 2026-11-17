@@ -109,7 +109,7 @@ result = compressor.compress(code)
 | `max_body_lines` | `5` | Max lines to keep per function body |
 | `min_tokens_for_compression` | `100` | Skip files smaller than this |
 | `language_hint` | `None` | Override language detection |
-| `fallback_to_kompress` | `True` | Use Kompress for unsupported languages |
+| `fallback_to_kompress` | `True` | Use Kompress for unsupported languages. `ContentRouter` (the proxy and `compress()`) always sets it to `False`, so code it routes is never sent to Kompress |
 
 ## Before and After
 
@@ -169,5 +169,5 @@ unload_tree_sitter()
 | Syntax validity | Guaranteed |
 
 <Callout type="info" title="Routing differs between the proxy and the library API">
-  ContentRouter always *detects* source code automatically, but whether it routes that code to CodeAwareCompressor depends on the entry point. `headroom proxy` enables code-aware routing by default (`HEADROOM_CODE_AWARE_ENABLED` defaults to on; disable with `--no-code-aware` or `HEADROOM_CODE_AWARE_ENABLED=0`). The one-function `compress()` API and `HeadroomClient`, however, build `ContentRouterConfig` with its own default, `enable_code_aware=False` -- there, detected code falls back to Kompress unless you construct your own pipeline with `ContentRouterConfig(enable_code_aware=True)`. Direct usage of `CodeAwareCompressor`, as shown on this page, is unaffected either way. See [How Compression Works](/docs/how-compression-works#content-type-detection).
+  ContentRouter always *detects* source code automatically, but whether it routes that code to CodeAwareCompressor depends on the entry point. `headroom proxy` enables code-aware routing by default (`HEADROOM_CODE_AWARE_ENABLED` defaults to on; disable with `--no-code-aware` or `HEADROOM_CODE_AWARE_ENABLED=0`). The one-function `compress()` API and `HeadroomClient`, however, build `ContentRouterConfig` with its own default, `enable_code_aware=False` -- there, detected code is left unchanged (it is never handed to the prose model, Kompress, which drops keywords) unless you construct your own pipeline with `ContentRouterConfig(enable_code_aware=True)`. Direct usage of `CodeAwareCompressor`, as shown on this page, is unaffected either way. See [How Compression Works](/docs/how-compression-works#content-type-detection).
 </Callout>
