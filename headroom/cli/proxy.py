@@ -503,6 +503,15 @@ def dashboard(port: int | None, no_open: bool) -> None:
         "Requires HEADROOM_ROLLOUT_CHANNEL=canary (or dev)."
     ),
 )
+@click.option(
+    "--tray/--no-tray",
+    "tray",
+    default=False,
+    help=(
+        "Show a system tray icon with savings, dashboard link and update alerts "
+        "(opt-in, Windows; needs headroom-ai[tray])"
+    ),
+)
 @click.option("--no-optimize", is_flag=True, help="Disable optimization (passthrough mode)")
 @click.option("--no-cache", is_flag=True, help="Disable semantic caching")
 @click.option("--no-rate-limit", is_flag=True, help="Disable rate limiting")
@@ -577,6 +586,16 @@ def dashboard(port: int | None, no_open: bool) -> None:
         "carries a redeemable marker runs as stream:false upstream and is "
         "re-emitted as chat.completion.chunk frames, so that turn's text arrives "
         "all at once. Off by default. Env: HEADROOM_CCR_BUFFERED_CHAT_STREAMING."
+    ),
+)
+@click.option(
+    "--ccr-inject-system-instructions",
+    is_flag=True,
+    envvar="HEADROOM_CCR_INJECT_SYSTEM_INSTRUCTIONS",
+    help=(
+        "Append the Compressed Context Available instruction block to the system "
+        "message, listing active retrieval hashes. Off by default. "
+        "Env: HEADROOM_CCR_INJECT_SYSTEM_INSTRUCTIONS."
     ),
 )
 @click.option(
@@ -1261,6 +1280,7 @@ def proxy(
     http2: bool,
     http_proxy: str | None,
     intercept_tool_results: bool,
+    tray: bool,
     no_optimize: bool,
     no_cache: bool,
     no_rate_limit: bool,
@@ -1271,6 +1291,7 @@ def proxy(
     lossless: bool,
     ccr_inline_resolve: bool,
     ccr_buffered_chat_streaming: bool,
+    ccr_inject_system_instructions: bool,
     no_ccr_proactive_expansion: bool,
     no_ccr_response_handling: bool,
     proxy_extension: tuple[str, ...],
@@ -1621,6 +1642,9 @@ def proxy(
         ccr_handle_responses=not (no_ccr or no_ccr_response_handling),
         ccr_resolve_markers_inline=ccr_inline_resolve,
         ccr_buffered_chat_streaming=ccr_buffered_chat_streaming,
+        ccr_inject_system_instructions=(
+            False if (no_ccr or lossless) else ccr_inject_system_instructions
+        ),
         lossless=lossless,
         ccr_proactive_expansion=not no_ccr_proactive_expansion,
         # Flatten repeat-flag tuple AND any comma-separated values inside it.
@@ -2066,6 +2090,10 @@ Press Ctrl+C to stop.
         # a richer one above. Direct `python -m headroom.proxy.server` keeps
         # the legacy banner via run_server's default.
         run_kwargs["print_banner"] = False
+        if tray:
+            from headroom.tray.launcher import start_tray_for_proxy
+
+            start_tray_for_proxy(host, port)
         run_server(config, **run_kwargs)
     except KeyboardInterrupt:
         click.echo("\nShutting down...")

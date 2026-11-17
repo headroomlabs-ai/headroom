@@ -144,6 +144,26 @@ def begin_pin_scope() -> dict[str, UpstreamPin]:
     return scope
 
 
+def _connect_name(host: str) -> str | None:
+    """Return ``host`` as the connection will name it: lower-case IDNA A-label.
+
+    httpx IDNA-encodes a non-ASCII request host (IDNA 2008) and httpcore hands
+    that A-label to ``connect_tcp``, so the check has to resolve and pin the
+    same name. ``socket.getaddrinfo`` would encode a Unicode name itself, with
+    IDNA 2003, which spells some names differently (``faß.de`` vs
+    ``xn--fa-hia.de``). ``None`` when the host cannot be encoded at all.
+    """
+    key = (host or "").strip().lower()
+    if key.isascii():
+        return key
+    import httpx  # local: this module otherwise needs only the standard library
+
+    try:
+        return httpx.URL(scheme="https", host=key).raw_host.decode("ascii").lower()
+    except (httpx.InvalidURL, UnicodeError):
+        return None
+
+
 def _record_validated_addresses(
     host: str,
     addresses: tuple[str, ...],
@@ -181,7 +201,7 @@ def guarded_pin(host: str) -> UpstreamPin | None:
     scope = _PIN_SCOPE.get()
     if not scope:
         return None
-    key = (host or "").strip().lower()
+    key = _connect_name(host)
     if not key:
         return None
     return scope.get(key)
@@ -340,9 +360,15 @@ def is_safe_upstream_url(url: str, *, scope: dict[str, UpstreamPin] | None = Non
             port = -1  # matches no origin; a listed bare host still passes, as before
         return destination_listed(allow, parsed.scheme, host, port)
 
+    # Resolve and pin the name the connection will dial, not the spelling the
+    # client sent, or a non-ASCII host would be checked under one name and
+    # connected under another.
+    connect_host = _connect_name(host)
+    if not connect_host:
+        return False
     try:
         infos = _RESOLVER_POOL.submit(
-            socket.getaddrinfo, host, None, 0, 0, socket.IPPROTO_TCP
+            socket.getaddrinfo, connect_host, None, 0, 0, socket.IPPROTO_TCP
         ).result(timeout=_resolve_timeout_seconds())
     except (OSError, _FutureTimeout):
         # Resolution and connection are separate operations, so allowing a DNS
@@ -363,7 +389,7 @@ def is_safe_upstream_url(url: str, *, scope: dict[str, UpstreamPin] | None = Non
     # A destination that cannot be pinned is rejected rather than allowed
     # through unpinned: an unpinned client-supplied host is one the connection
     # would have to resolve for itself, which is the hole this closes.
-    return _record_validated_addresses(host.lower(), addresses, scope)
+    return _record_validated_addresses(connect_host, addresses, scope)
 
 
 async def is_safe_upstream_url_async(url: str) -> bool:

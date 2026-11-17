@@ -66,6 +66,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from ..config import ReadMaturationConfig
+from .read_lifecycle import is_lifecycle_notice
 
 logger = logging.getLogger(__name__)
 
@@ -398,7 +399,11 @@ class ReadMaturationManager:
             return None, False
         # Lifecycle markers (stale/superseded) are already compact — and
         # read_lifecycle runs first, so respect its replacement.
-        if "Retrieve original: hash=" in content or "Retrieve more: hash=" in content:
+        if (
+            is_lifecycle_notice(content)
+            or "Retrieve original: hash=" in content
+            or "Retrieve more: hash=" in content
+        ):
             return None, False
 
         file_path, read_turn = activity.read_calls[tc_id]
