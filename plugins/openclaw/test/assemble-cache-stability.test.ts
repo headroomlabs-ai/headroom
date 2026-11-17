@@ -162,7 +162,7 @@ describe("assemble() keeps the provider prompt cache", () => {
     expect(messages[0]).toMatchObject({ role: "user", content: "[3 earlier messages omitted]" });
   });
 
-  it("applies compressed tool-call arguments without dropping the assistant's thinking", async () => {
+  it("applies compressed tool-call arguments without moving unchanged text blocks", async () => {
     mocked.compress.mockImplementation(async (messages: any[]) => ({
       ...compressToolResults(messages),
       messages: messages.map((m) =>
@@ -172,10 +172,16 @@ describe("assemble() keeps the provider prompt cache", () => {
       ),
     }));
 
-    const { messages } = await engine().assemble({ sessionId: "s", messages: history() });
+    const input = history();
+    input[1].content.push({ type: "text", text: "Waiting for the result." });
+    const { messages } = await engine().assemble({ sessionId: "s", messages: input });
 
-    expect(messages[1].content.map((b: any) => b.type)).toEqual(["thinking", "text", "toolCall"]);
-    expect(messages[1].content[2].arguments).toEqual({ command: "kubectl get pods" });
+    expect(messages[1].content).toEqual([
+      { type: "thinking", thinking: "run kubectl", thinkingSignature: "sig-1" },
+      { type: "text", text: "Running it." },
+      { type: "toolCall", id: "t1", name: "exec", arguments: { command: "kubectl get pods" } },
+      { type: "text", text: "Waiting for the result." },
+    ]);
   });
 
   it("never leaks its bookkeeping into the messages it returns", async () => {
