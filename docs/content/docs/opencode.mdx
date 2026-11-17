@@ -114,10 +114,14 @@ a comma-separated list of specs. Names in the variable can't contain a comma.
 When both are set, `--extra-model` wins for the same id.
 
 With `--openai-api-url`, wrap also keeps the model ids already listed under the
-`headroom` provider in `opencode.json`, and it can't tell yours apart from ones
-an earlier `--extra-model` added. To drop an extra model there, delete its
-entry from `opencode.json`, or run `headroom unwrap opencode` before wrapping
-again.
+`headroom` provider in `opencode.json`. Wrap records the ids it added in
+`opencode.json.headroom-managed.json`, so the next wrap drops an extra model you
+no longer pass and keeps the ones you added yourself.
+
+`headroom unwrap opencode` uses the same record: it removes the model ids and
+the proxy base URL Headroom wrote, keeps everything else in the file, and
+deletes the config file when Headroom created it and nothing else is left in
+it.
 
 ## Environment Variables
 
@@ -230,7 +234,7 @@ const retrieve = createHeadroomRetrieveTool({
 2. **Runtime config**. `OPENCODE_CONFIG_CONTENT` is set as an env var containing provider, plugin, and optional local MCP JSON. OpenCode reads it at startup and merges it with on-disk config.
 3. **MCP tools**. Headroom registers `headroom_compress`, `headroom_retrieve`, and `headroom_stats` through `headroom mcp serve` unless `--no-mcp` is set.
 4. **Native plugin path**. `wrap` loads the transport plugin from a local directory (`plugins/opencode/dist/` in a checkout, `headroom/providers/opencode/_dist/` in the wheel), because OpenCode 2.x only accepts local plugins as directories. The plugin uses `HEADROOM_PROXY_URL` or `http://127.0.0.1:8787` to reach the proxy.
-5. **Unwrap**. `headroom unwrap opencode` restores `opencode.json` from the pre-wrap backup when present, strips Headroom marker blocks when no backup exists, and unregisters Headroom MCP servers.
+5. **Unwrap**. `headroom unwrap opencode` restores `opencode.json` from the pre-wrap backup when present, removes the provider entries Headroom recorded in `opencode.json.headroom-managed.json` when no backup exists, strips Headroom marker blocks for older configs, and unregisters Headroom MCP servers.
 
 ## Troubleshooting
 
@@ -252,7 +256,7 @@ Some gateways validate the client on the wire and reject the proxy hop. Exclude 
 
 **Provider not found after unwrap.**
 
-If unwrap left the provider configured, run `headroom unwrap opencode` again, or manually restore from `~/.config/opencode/opencode.json.headroom-backup`.
+If unwrap left the provider configured, run `headroom unwrap opencode` again, or manually restore from `~/.config/opencode/opencode.json.headroom-backup`. When there was no config file before the wrap, there is no backup to restore: unwrap removes the provider entries Headroom recorded in `~/.config/opencode/opencode.json.headroom-managed.json` instead.
 
 **Proxy port conflict.**
 

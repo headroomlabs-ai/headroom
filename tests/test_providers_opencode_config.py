@@ -10,6 +10,7 @@ import pytest
 
 from headroom.providers.opencode.config import (
     HEADROOM_OPENCODE_EXTRA_MODELS_ENV,
+    HEADROOM_OPENCODE_MODELS,
     HEADROOM_OPENCODE_PLUGIN,
     _inject_key_into_json,
     _parse_json_loose,
@@ -910,6 +911,263 @@ def test_jsonc_migration_treats_dangling_conflict_as_ambiguous(
 
 
 # ---------------------------------------------------------------------------
+# Managed state (what Headroom owns in the config file)
+# ---------------------------------------------------------------------------
+
+
+def _managed_state_path(config_file: Path) -> Path:
+    return config_file.with_name(config_file.name + ".headroom-managed.json")
+
+
+def test_inject_provider_config_records_managed_state(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The sidecar records the model ids and baseURL Headroom injected."""
+    _set_test_home(monkeypatch, tmp_path)
+    config_file = tmp_path / ".config" / "opencode" / "opencode.json"
+
+    inject_opencode_provider_config(port=8787, extra_models={"my-model": {"name": "My Model"}})
+
+    state = json.loads(_managed_state_path(config_file).read_text(encoding="utf-8"))
+    assert state["created_file"] is True
+    assert state["managed_base_url"] == "http://127.0.0.1:8787/v1"
+    assert set(state["managed_models"]) == {"gpt-4o", "gpt-4.1", "my-model"}
+
+
+def test_inject_provider_config_keeps_existing_file_out_of_created_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A config the user already had is not marked as Headroom-created."""
+    _set_test_home(monkeypatch, tmp_path)
+    config_file = tmp_path / ".config" / "opencode" / "opencode.json"
+    config_file.parent.mkdir(parents=True)
+    config_file.write_text('{"theme": "dark"}', encoding="utf-8")
+
+    inject_opencode_provider_config(port=8787)
+
+    state = json.loads(_managed_state_path(config_file).read_text(encoding="utf-8"))
+    assert state["created_file"] is False
+
+
+def test_snapshot_skips_a_config_headroom_wrote(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A re-wrap must not snapshot Headroom's own config as pre-wrap content."""
+    _set_test_home(monkeypatch, tmp_path)
+    config_file = tmp_path / ".config" / "opencode" / "opencode.json"
+
+    inject_opencode_provider_config(port=8787)
+    backup_file = config_file.with_name(config_file.name + ".headroom-backup")
+    assert not backup_file.exists()
+
+    inject_opencode_provider_config(port=8787)
+    assert not backup_file.exists()
+
+
+def test_snapshot_does_not_back_up_a_config_headroom_created(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A config Headroom created holds no pre-wrap content to restore."""
+    _set_test_home(monkeypatch, tmp_path)
+    config_file = tmp_path / ".config" / "opencode" / "opencode.json"
+
+    inject_opencode_provider_config(port=8787)
+    config_file.write_text('{"theme": "dark"}', encoding="utf-8")
+
+    inject_opencode_provider_config(port=8787)
+    backup_file = config_file.with_name(config_file.name + ".headroom-backup")
+    assert not backup_file.exists()
+
+
+def test_reinject_prunes_a_dropped_extra_model(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A model Headroom injected but no longer advertises is dropped."""
+    _set_test_home(monkeypatch, tmp_path)
+    config_file = tmp_path / ".config" / "opencode" / "opencode.json"
+    extra = {"name": "My Model", "limit": {"context": 200000, "output": 16384}}
+
+    inject_opencode_provider_config(port=8787, extra_models={"my-model": extra})
+    inject_opencode_provider_config(port=8787, keep_user_entries=True)
+
+    models = _parse_json_loose(config_file.read_text(encoding="utf-8"))["provider"]["headroom"][
+        "models"
+    ]
+    assert "my-model" not in models
+    assert set(models) == {"gpt-4o", "gpt-4.1"}
+
+
+@pytest.mark.parametrize("keep_user_entries", [False, True])
+def test_reinject_prunes_a_dropped_override_of_a_builtin_id(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, keep_user_entries: bool
+) -> None:
+    """A dropped --extra-model override of a built-in restores the defaults."""
+    _set_test_home(monkeypatch, tmp_path)
+    config_file = tmp_path / ".config" / "opencode" / "opencode.json"
+    override = {"name": "Override", "limit": {"context": 8000, "output": 4000}}
+
+    inject_opencode_provider_config(
+        port=8787, extra_models={"gpt-4o": override}, keep_user_entries=keep_user_entries
+    )
+    inject_opencode_provider_config(port=8787, keep_user_entries=keep_user_entries)
+
+    models = _parse_json_loose(config_file.read_text(encoding="utf-8"))["provider"]["headroom"][
+        "models"
+    ]
+    assert models["gpt-4o"] == HEADROOM_OPENCODE_MODELS["gpt-4o"]
+
+
+def test_reinject_keeps_a_user_model_and_a_edited_extra(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Models the user added or edited survive a re-wrap."""
+    _set_test_home(monkeypatch, tmp_path)
+    config_file = tmp_path / ".config" / "opencode" / "opencode.json"
+    extra = {"name": "My Model", "limit": {"context": 200000, "output": 16384}}
+
+    inject_opencode_provider_config(port=8787, extra_models={"my-model": extra})
+    data = _parse_json_loose(config_file.read_text(encoding="utf-8"))
+    data["provider"]["headroom"]["models"]["user-model"] = {"name": "User Model"}
+    data["provider"]["headroom"]["models"]["my-model"] = {"name": "Renamed by the user"}
+    config_file.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
+
+    inject_opencode_provider_config(port=8787, keep_user_entries=True)
+
+    models = _parse_json_loose(config_file.read_text(encoding="utf-8"))["provider"]["headroom"][
+        "models"
+    ]
+    assert models["user-model"] == {"name": "User Model"}
+    assert models["my-model"] == {"name": "Renamed by the user"}
+
+
+def test_remove_managed_opencode_provider_keeps_user_entries() -> None:
+    """Only the entries Headroom injected are removed."""
+    from headroom.providers.opencode.config import (
+        OpencodeManagedState,
+        remove_managed_opencode_provider,
+    )
+
+    state = OpencodeManagedState(
+        created_file=True,
+        managed_base_url="http://127.0.0.1:8787/v1",
+        managed_models={"gpt-4o": {"name": "GPT-4o"}},
+    )
+    data = {
+        "provider": {
+            "headroom": {
+                "npm": "@ai-sdk/openai-compatible",
+                "name": "Headroom Proxy",
+                "options": {"baseURL": "http://127.0.0.1:8787/v1", "apiKey": "secret"},
+                "models": {"gpt-4o": {"name": "GPT-4o"}, "user-model": {"name": "User"}},
+            },
+            "anthropic": {"options": {"timeout": 5}},
+        },
+        "theme": "dark",
+    }
+
+    assert remove_managed_opencode_provider(data, state) is True
+    headroom = data["provider"]["headroom"]
+    assert headroom["models"] == {"user-model": {"name": "User"}}
+    assert headroom["options"] == {"apiKey": "secret"}
+    assert headroom["npm"] == "@ai-sdk/openai-compatible"
+    assert headroom["name"] == "Headroom Proxy"
+    assert data["provider"]["anthropic"] == {"options": {"timeout": 5}}
+    assert data["theme"] == "dark"
+
+
+def test_remove_managed_opencode_provider_keeps_an_edited_provider_identity() -> None:
+    """An npm/name the user edited survives unwrap (#2364).
+
+    The reported case: wrap a config that did not exist, edit only
+    ``provider.headroom.npm`` and ``.name``, then unwrap. The edited values are
+    the user's own provider identity, so removing them emptied the config file
+    even though the user had made it theirs.
+    """
+    from headroom.providers.opencode.config import (
+        OpencodeManagedState,
+        remove_managed_opencode_provider,
+    )
+
+    state = OpencodeManagedState(
+        created_file=True,
+        managed_base_url="http://127.0.0.1:8787/v1",
+        managed_models={"gpt-4o": {"name": "GPT-4o"}},
+    )
+    data = {
+        "provider": {
+            "headroom": {
+                "npm": "@ai-sdk/my-fork",
+                "name": "My Local Gateway",
+                "options": {"baseURL": "http://127.0.0.1:8787/v1"},
+                "models": {"gpt-4o": {"name": "GPT-4o"}},
+            }
+        }
+    }
+
+    assert remove_managed_opencode_provider(data, state) is True
+    assert data == {
+        "provider": {"headroom": {"npm": "@ai-sdk/my-fork", "name": "My Local Gateway"}}
+    }
+
+
+def test_remove_managed_opencode_provider_drops_the_empty_provider() -> None:
+    """A provider block that only held Headroom's entries is removed."""
+    from headroom.providers.opencode.config import (
+        OpencodeManagedState,
+        remove_managed_opencode_provider,
+    )
+
+    state = OpencodeManagedState(
+        created_file=True,
+        managed_base_url="http://127.0.0.1:8787/v1",
+        managed_models={"gpt-4o": {"name": "GPT-4o"}},
+    )
+    data = {
+        "provider": {
+            "headroom": {
+                "npm": "@ai-sdk/openai-compatible",
+                "name": "Headroom Proxy",
+                "options": {"baseURL": "http://127.0.0.1:8787/v1"},
+                "models": {"gpt-4o": {"name": "GPT-4o"}},
+            }
+        }
+    }
+
+    assert remove_managed_opencode_provider(data, state) is True
+    assert data == {}
+
+
+def test_opencode_config_is_empty_only_for_empty_configs(tmp_path: Path) -> None:
+    """A config with content (or with unreadable content) is never empty."""
+    from headroom.providers.opencode.config import opencode_config_is_empty
+
+    config_file = tmp_path / "opencode.json"
+    config_file.write_text("{}", encoding="utf-8")
+    assert opencode_config_is_empty(config_file) is True
+
+    config_file.write_text('{"provider": {}}', encoding="utf-8")
+    assert opencode_config_is_empty(config_file) is True
+
+    config_file.write_text('{"provider": {"headroom": {}}}', encoding="utf-8")
+    assert opencode_config_is_empty(config_file) is True
+
+    config_file.write_text('{"theme": "dark"}', encoding="utf-8")
+    assert opencode_config_is_empty(config_file) is False
+
+    # A falsy user setting is content, not an empty section.
+    config_file.write_text('{"autoupdate": false}', encoding="utf-8")
+    assert opencode_config_is_empty(config_file) is False
+
+    config_file.write_text('{"retries": 0}', encoding="utf-8")
+    assert opencode_config_is_empty(config_file) is False
+
+    config_file.write_text('{"model": ""}', encoding="utf-8")
+    assert opencode_config_is_empty(config_file) is False
+
+    config_file.write_text("not json", encoding="utf-8")
+    assert opencode_config_is_empty(config_file) is False
+
+
 # Unparseable user config must not be rewritten
 # ---------------------------------------------------------------------------
 

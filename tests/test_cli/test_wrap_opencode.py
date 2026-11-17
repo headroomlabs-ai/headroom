@@ -8,7 +8,7 @@ from unittest.mock import patch
 
 import click
 import pytest
-from click.testing import CliRunner
+from click.testing import CliRunner, Result
 
 from headroom.cli import wrap as wrap_mod
 from headroom.cli.main import main
@@ -1950,3 +1950,187 @@ def test_wrap_opencode_session_token_matches_registration(
     # Assumes the plugin resolves (packaged bundle ships in this checkout);
     # see test_build_launch_env_omits_session_token_when_plugin_absent.
     assert env.get("HEADROOM_OPENCODE_SESSION_TOKEN") == registered_token
+
+
+# ---------------------------------------------------------------------------
+# Fresh wrap -> unwrap lifecycle (no pre-wrap config, no backup)
+# ---------------------------------------------------------------------------
+
+
+def _managed_state_path(config_file: Path) -> Path:
+    return config_file.with_name(config_file.name + ".headroom-managed.json")
+
+
+def _prepare_only_wrap(runner: CliRunner, extra_args: list[str] | None = None) -> Result:
+    return runner.invoke(
+        main,
+        ["wrap", "opencode", "--prepare-only", "--no-mcp", "--no-serena", *(extra_args or [])],
+    )
+
+
+def test_unwrap_opencode_removes_a_freshly_wrapped_config(
+    runner: CliRunner,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A config Headroom created is removed again, backup or not."""
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.delenv("HEADROOM_CONTEXT_TOOL", raising=False)
+    monkeypatch.delenv("HEADROOM_OPENCODE_EXTRA_MODELS", raising=False)
+    _set_test_home(monkeypatch, tmp_path)
+
+    config_file = tmp_path / ".config" / "opencode" / "opencode.json"
+
+    with patch.object(wrap_mod.shutil, "which", return_value="opencode"):
+        wrapped = _prepare_only_wrap(runner, ["--extra-model", "my-model=My Model"])
+    assert wrapped.exit_code == 0, wrapped.output
+    assert config_file.exists()
+    assert not (tmp_path / ".config" / "opencode" / "opencode.json.headroom-backup").exists()
+
+    with patch.object(wrap_mod, "_stop_local_proxy_for_unwrap", return_value="stopped"):
+        result = runner.invoke(main, ["unwrap", "opencode"])
+
+    assert result.exit_code == 0, result.output
+    assert not config_file.exists(), "the config Headroom created must be removed again"
+    assert not _managed_state_path(config_file).exists()
+
+
+def test_unwrap_opencode_removes_a_freshly_wrapped_config_with_mcp(
+    runner: CliRunner,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The MCP entry Headroom registered goes away with the config it created."""
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.delenv("HEADROOM_CONTEXT_TOOL", raising=False)
+    monkeypatch.delenv("HEADROOM_OPENCODE_EXTRA_MODELS", raising=False)
+    _set_test_home(monkeypatch, tmp_path)
+
+    config_file = tmp_path / ".config" / "opencode" / "opencode.json"
+
+    with patch.object(wrap_mod.shutil, "which", return_value="opencode"):
+        wrapped = runner.invoke(main, ["wrap", "opencode", "--prepare-only", "--no-serena"])
+    assert wrapped.exit_code == 0, wrapped.output
+    assert "headroom" in json.loads(config_file.read_text(encoding="utf-8"))["mcp"]
+
+    with patch.object(wrap_mod, "_stop_local_proxy_for_unwrap", return_value="stopped"):
+        result = runner.invoke(main, ["unwrap", "opencode"])
+
+    assert result.exit_code == 0, result.output
+    assert not config_file.exists()
+    assert not _managed_state_path(config_file).exists()
+
+
+def test_unwrap_opencode_removes_a_directly_injected_config(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Injecting the provider directly and then unwrapping leaves no config."""
+    from headroom.providers.opencode.config import inject_opencode_provider_config
+
+    monkeypatch.chdir(tmp_path)
+    _set_test_home(monkeypatch, tmp_path)
+
+    config_file = tmp_path / ".config" / "opencode" / "opencode.json"
+    inject_opencode_provider_config(
+        port=8787, extra_models={"my-model": {"name": "My Model", "limit": {}}}
+    )
+    assert "my-model" in config_file.read_text(encoding="utf-8")
+
+    with patch.object(wrap_mod, "_stop_local_proxy_for_unwrap", return_value="stopped"):
+        wrap_mod.unwrap_opencode.callback(port=8787, no_stop_proxy=True)
+
+    assert not config_file.exists()
+    assert not _managed_state_path(config_file).exists()
+
+
+def test_unwrap_opencode_keeps_a_falsy_user_setting(
+    runner: CliRunner,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A user setting that is false is content, not an empty section."""
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.delenv("HEADROOM_CONTEXT_TOOL", raising=False)
+    monkeypatch.delenv("HEADROOM_OPENCODE_EXTRA_MODELS", raising=False)
+    _set_test_home(monkeypatch, tmp_path)
+
+    config_file = tmp_path / ".config" / "opencode" / "opencode.json"
+
+    with patch.object(wrap_mod.shutil, "which", return_value="opencode"):
+        wrapped = _prepare_only_wrap(runner)
+    assert wrapped.exit_code == 0, wrapped.output
+
+    data = json.loads(config_file.read_text(encoding="utf-8"))
+    data["autoupdate"] = False
+    config_file.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
+
+    with patch.object(wrap_mod, "_stop_local_proxy_for_unwrap", return_value="stopped"):
+        result = runner.invoke(main, ["unwrap", "opencode"])
+
+    assert result.exit_code == 0, result.output
+    assert config_file.exists(), "the user setting must not cost the user the file"
+    assert json.loads(config_file.read_text(encoding="utf-8"))["autoupdate"] is False
+
+
+def test_unwrap_opencode_keeps_user_content_added_after_a_fresh_wrap(
+    runner: CliRunner,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Undoing Headroom's config keeps what the user added to it."""
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.delenv("HEADROOM_CONTEXT_TOOL", raising=False)
+    monkeypatch.delenv("HEADROOM_OPENCODE_EXTRA_MODELS", raising=False)
+    _set_test_home(monkeypatch, tmp_path)
+
+    config_file = tmp_path / ".config" / "opencode" / "opencode.json"
+
+    with patch.object(wrap_mod.shutil, "which", return_value="opencode"):
+        wrapped = _prepare_only_wrap(runner, ["--extra-model", "my-model=My Model"])
+    assert wrapped.exit_code == 0, wrapped.output
+
+    data = json.loads(config_file.read_text(encoding="utf-8"))
+    data["theme"] = "dark"
+    data["provider"]["headroom"]["models"]["user-model"] = {"name": "User Model"}
+    data["provider"]["headroom"]["options"]["apiKey"] = "{env:MY_KEY}"
+    config_file.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
+
+    with patch.object(wrap_mod, "_stop_local_proxy_for_unwrap", return_value="stopped"):
+        result = runner.invoke(main, ["unwrap", "opencode"])
+
+    assert result.exit_code == 0, result.output
+    remaining = json.loads(config_file.read_text(encoding="utf-8"))
+    assert remaining["theme"] == "dark"
+    headroom = remaining["provider"]["headroom"]
+    assert headroom["models"] == {"user-model": {"name": "User Model"}}
+    assert headroom["options"] == {"apiKey": "{env:MY_KEY}"}
+    assert "baseURL" not in headroom["options"]
+
+
+def test_rewrap_without_the_extra_model_drops_the_stale_extra(
+    runner: CliRunner,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A model Headroom injected but no longer requested does not linger."""
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.delenv("HEADROOM_CONTEXT_TOOL", raising=False)
+    monkeypatch.delenv("HEADROOM_OPENCODE_EXTRA_MODELS", raising=False)
+    _set_test_home(monkeypatch, tmp_path)
+
+    config_file = tmp_path / ".config" / "opencode" / "opencode.json"
+    upstream = ["--openai-api-url", "https://api.deepseek.com/v1"]
+
+    with patch.object(wrap_mod.shutil, "which", return_value="opencode"):
+        wrapped = _prepare_only_wrap(runner, [*upstream, "--extra-model", "my-model=My Model"])
+    assert wrapped.exit_code == 0, wrapped.output
+    models = json.loads(config_file.read_text(encoding="utf-8"))["provider"]["headroom"]["models"]
+    assert "my-model" in models
+
+    with patch.object(wrap_mod.shutil, "which", return_value="opencode"):
+        rewrapped = _prepare_only_wrap(runner, upstream)
+    assert rewrapped.exit_code == 0, rewrapped.output
+    models = json.loads(config_file.read_text(encoding="utf-8"))["provider"]["headroom"]["models"]
+    assert "my-model" not in models
+    assert set(models) == {"gpt-4o", "gpt-4.1"}

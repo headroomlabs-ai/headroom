@@ -212,11 +212,17 @@ from headroom.providers.opencode.config import (
     _MCP_MARKER_START,
     _PROVIDER_MARKER_END,  # noqa: F401
     _PROVIDER_MARKER_START,
+    _parse_json_loose,
+    clear_managed_state,
     extra_models_from_env,
     inject_opencode_provider_config,
     migrate_legacy_opencode_jsonc_backup,
+    opencode_config_is_empty,
     opencode_config_paths,
     parse_extra_model_spec,
+    read_managed_state,
+    record_opencode_config_origin,
+    remove_managed_opencode_provider,
     snapshot_opencode_config_if_unwrapped,
     strip_opencode_headroom_blocks,
 )
@@ -3129,10 +3135,9 @@ def _disable_serena_mcp(registrar: Any, *, verbose: bool = False, explicit: bool
         )
 
 
-# =============================================================================
-# tokensave — retired; Serena replaced it. The helpers below only clean up a
+# ======================================================================# tokensave — retired; Serena replaced it. The helpers below only clean up a
 # tokensave entry a prior release installed, so upgrading users stop launching it.
-# =============================================================================
+# ======================================================================
 
 
 def _remove_headroom_installed_tokensave_mcp(registrar: Any) -> str:
@@ -6259,10 +6264,8 @@ def wrap_selfheal(marker: str | None) -> None:
     _selfheal_dead_wrap_base_url()
 
 
-# =============================================================================
-# Claude Code
-# =============================================================================
-
+# ======================================================================# Claude Code
+# ======================================================================
 # Hostnames that mean "this machine" — used to avoid feeding the proxy its own
 # URL back as the upstream when the user already had ANTHROPIC_BASE_URL pointed
 # at a previous Headroom instance.
@@ -6857,9 +6860,8 @@ def claude(
         cleanup()
 
 
-# =============================================================================
-# Claude Code (unwrap)
-# =============================================================================
+# ======================================================================# Claude Code (unwrap)
+# ======================================================================
 
 
 def _warn_if_proxy_env_leaked(port: int) -> None:
@@ -6990,9 +6992,8 @@ def unwrap_claude(
     click.echo()
 
 
-# =============================================================================
-# GitHub Copilot CLI
-# =============================================================================
+# ======================================================================# GitHub Copilot CLI
+# ======================================================================
 
 
 def _require_copilot_subscription_resolution() -> CopilotSubscriptionTokenResolution:
@@ -7341,9 +7342,8 @@ def copilot(
     )
 
 
-# =============================================================================
-# GitHub Copilot CLI (unwrap)
-# =============================================================================
+# ======================================================================# GitHub Copilot CLI (unwrap)
+# ======================================================================
 
 
 @wrap.command("vscode")
@@ -7430,9 +7430,8 @@ def unwrap_vscode_copilot(settings_file: Path | None) -> None:
         click.echo(f"No Headroom Copilot proxy settings found in {target_settings}")
 
 
-# =============================================================================
-# Claude Code for VS Code
-# =============================================================================
+# ======================================================================# Claude Code for VS Code
+# ======================================================================
 
 
 @wrap.command("vscode-claude")
@@ -7535,9 +7534,8 @@ def unwrap_vscode_claude(settings_file: Path | None) -> None:
         click.echo(f"No Headroom VS Code Claude settings found for {target_settings}")
 
 
-# =============================================================================
-# GitHub Copilot CLI (unwrap)
-# =============================================================================
+# ======================================================================# GitHub Copilot CLI (unwrap)
+# ======================================================================
 
 
 @unwrap.command("copilot")
@@ -7551,9 +7549,8 @@ def unwrap_copilot(port: int, no_stop_proxy: bool) -> None:
         _echo_unwrap_proxy_stop_status(_stop_local_proxy_for_unwrap(port), port)
 
 
-# =============================================================================
-# OpenAI Codex CLI
-# =============================================================================
+# ======================================================================# OpenAI Codex CLI
+# ======================================================================
 
 
 def _prepare_codex_wrap_state(
@@ -7842,9 +7839,8 @@ def codex(
     )
 
 
-# =============================================================================
-# Aider
-# =============================================================================
+# ======================================================================# Aider
+# ======================================================================
 
 
 @wrap.command(context_settings={"ignore_unknown_options": True})
@@ -7918,9 +7914,8 @@ def aider(
     )
 
 
-# =============================================================================
-# Mistral Vibe
-# =============================================================================
+# ======================================================================# Mistral Vibe
+# ======================================================================
 
 
 @wrap.command(context_settings={"ignore_unknown_options": True})
@@ -7985,9 +7980,8 @@ def vibe(
     )
 
 
-# =============================================================================
-# Kimi CLI
-# =============================================================================
+# ======================================================================# Kimi CLI
+# ======================================================================
 
 
 @wrap.command(context_settings={"ignore_unknown_options": True})
@@ -8074,9 +8068,8 @@ def kimi(
     )
 
 
-# =============================================================================
-# Grok CLI
-# =============================================================================
+# ======================================================================# Grok CLI
+# ======================================================================
 
 
 @wrap.command(context_settings={"ignore_unknown_options": True})
@@ -8186,9 +8179,8 @@ def grok(
     )
 
 
-# =============================================================================
-# Cursor
-# =============================================================================
+# ======================================================================# Cursor
+# ======================================================================
 
 
 @wrap.command(context_settings={"ignore_unknown_options": True})
@@ -8243,9 +8235,8 @@ def cursor(
     )
 
 
-# =============================================================================
-# Antigravity IDE
-# =============================================================================
+# ======================================================================# Antigravity IDE
+# ======================================================================
 
 
 @wrap.command(context_settings={"ignore_unknown_options": True})
@@ -8297,9 +8288,8 @@ def antigravity(
     )
 
 
-# =============================================================================
-# Grok Build
-# =============================================================================
+# ======================================================================# Grok Build
+# ======================================================================
 
 
 @wrap.command("grok-build", context_settings={"ignore_unknown_options": True})
@@ -8365,9 +8355,8 @@ def grok_build(
     )
 
 
-# =============================================================================
-# Cline (VS Code extension)
-# =============================================================================
+# ======================================================================# Cline (VS Code extension)
+# ======================================================================
 
 
 @wrap.command(context_settings={"ignore_unknown_options": True})
@@ -8428,9 +8417,8 @@ def cline(
     )
 
 
-# =============================================================================
-# ZCode (zcode.z.ai desktop app)
-# =============================================================================
+# ======================================================================# ZCode (zcode.z.ai desktop app)
+# ======================================================================
 
 
 @wrap.command(context_settings={"ignore_unknown_options": True})
@@ -8500,9 +8488,8 @@ def zcode(
     )
 
 
-# =============================================================================
-# Continue (VS Code / JetBrains extension)
-# =============================================================================
+# ======================================================================# Continue (VS Code / JetBrains extension)
+# ======================================================================
 
 
 @wrap.command("continue", context_settings={"ignore_unknown_options": True})
@@ -8643,7 +8630,7 @@ def hermes(
 
 # =============================================================================
 # OpenClaw
-# =============================================================================
+# ======================================================================
 
 
 @wrap.command("openclaw")
@@ -8904,9 +8891,8 @@ def openclaw(
     click.echo()
 
 
-# =============================================================================
-# OpenCode
-# =============================================================================
+# ======================================================================# OpenCode
+# ======================================================================
 
 
 @wrap.command(context_settings={"ignore_unknown_options": True})
@@ -9067,6 +9053,9 @@ def opencode(
     # `headroom unwrap opencode` can restore the user's pre-wrap state.
     _opencode_config_file, _opencode_backup_file = opencode_config_paths()
     snapshot_opencode_config_if_unwrapped(_opencode_config_file, _opencode_backup_file)
+    # Without a pre-wrap file there is no backup to restore, so record that
+    # Headroom owns the file it is about to create.
+    record_opencode_config_origin(_opencode_config_file)
 
     # Register headroom MCP server in OpenCode config so OpenCode can
     # call headroom_retrieve on compression markers from the proxy.
@@ -9239,13 +9228,15 @@ def unwrap_opencode(port: int, no_stop_proxy: bool) -> None:
 
     * If a pre-wrap backup (``opencode.json.headroom-backup``) exists, the
       original file is restored byte-for-byte and the backup is removed.
+    * Otherwise, if Headroom recorded what it owns in the config (the
+      ``opencode.json.headroom-managed.json`` sidecar), the injected model
+      ids and baseURL are removed and the rest of the file is preserved.
     * Otherwise, if the config file still contains the Headroom-managed
       block, that block is stripped out and the rest of the file is
       preserved.
     * If the config only ever contained Headroom-written content, the file
       is removed entirely so OpenCode falls back to its defaults.
-    * If neither a backup nor a Headroom block is present, this is a safe
-      no-op.
+    * If none of the above applies, this is a safe no-op.
     """
     click.echo()
     click.echo("  ╔═══════════════════════════════════════════════╗")
@@ -9255,6 +9246,8 @@ def unwrap_opencode(port: int, no_stop_proxy: bool) -> None:
 
     config_file, backup_file = opencode_config_paths()
     migrate_legacy_opencode_jsonc_backup(config_file, backup_file)
+    managed_state = read_managed_state(config_file)
+    removed_managed = False
 
     if backup_file.exists():
         try:
@@ -9266,6 +9259,28 @@ def unwrap_opencode(port: int, no_stop_proxy: bool) -> None:
             raise click.ClickException(
                 f"could not restore OpenCode config from backup: {exc}"
             ) from exc
+        clear_managed_state(config_file)
+    elif config_file.exists() and managed_state is not None:
+        # Headroom wrote this file (or part of it) and recorded what it owns:
+        # undo exactly that, and keep everything the user added.
+        content = _read_text(config_file)
+        data = _parse_json_loose(content)
+        if not data and content.strip():
+            # Unparseable config: leave it alone rather than rewrite it.
+            click.echo(f"  Nothing to undo: {config_file} is not valid JSON.")
+            status = "noop"
+        elif remove_managed_opencode_provider(data, managed_state):
+            _write_text(config_file, json.dumps(data, indent=2) + "\n")
+            click.echo(
+                f"  Removed Headroom's provider entry from {config_file}; other content preserved."
+            )
+            status = "cleaned"
+            removed_managed = True
+            clear_managed_state(config_file)
+        else:
+            click.echo(f"  Nothing to undo: {config_file} has no Headroom-managed provider entry.")
+            status = "noop"
+            clear_managed_state(config_file)
     elif config_file.exists():
         content = _read_text(config_file)
         if _PROVIDER_MARKER_START in content or _MCP_MARKER_START in content:
@@ -9284,6 +9299,7 @@ def unwrap_opencode(port: int, no_stop_proxy: bool) -> None:
     else:
         click.echo(f"  Nothing to undo: {config_file} does not exist.")
         status = "noop"
+        clear_managed_state(config_file)
 
     # Remove Serena MCP if it was installed by Headroom.
     # Also remove the headroom MCP server itself.
@@ -9298,6 +9314,19 @@ def unwrap_opencode(port: int, no_stop_proxy: bool) -> None:
             click.echo("  Removed Headroom-installed Serena MCP server from OpenCode.")
         elif serena_status == "failed":
             click.echo("  Serena MCP server matched Headroom ledger but could not be removed.")
+
+    # A config Headroom created has no pre-wrap content to restore, so it is
+    # removed once the Headroom-owned entries are gone.
+    if (
+        removed_managed
+        and managed_state is not None
+        and managed_state.created_file
+        and config_file.exists()
+        and opencode_config_is_empty(config_file)
+    ):
+        config_file.unlink()
+        click.echo(f"  Removed {config_file} (contained only Headroom-written config).")
+        status = "removed"
 
     click.echo()
     click.echo("✓ OpenCode is no longer routed through the Headroom proxy.")
@@ -9382,9 +9411,8 @@ def unwrap_openclaw(
     click.echo()
 
 
-# =============================================================================
-# OpenAI Codex CLI (unwrap)
-# =============================================================================
+# ======================================================================# OpenAI Codex CLI (unwrap)
+# ======================================================================
 
 
 @unwrap.command("grok-build")
@@ -9511,9 +9539,8 @@ def unwrap_codex(port: int, no_stop_proxy: bool) -> None:
     click.echo()
 
 
-# =============================================================================
-# Oh My Pi (omp)
-# =============================================================================
+# ======================================================================# Oh My Pi (omp)
+# ======================================================================
 
 
 @wrap.command(context_settings={"ignore_unknown_options": True})
@@ -9710,7 +9737,6 @@ def droid(
 
 # =============================================================================
 # Grok CLI (unwrap)
-# =============================================================================
 
 
 @unwrap.command("grok")
@@ -9766,9 +9792,8 @@ def unwrap_grok(port: int, no_stop_proxy: bool) -> None:
     click.echo()
 
 
-# =============================================================================
-# ZCode (unwrap)
-# =============================================================================
+# ======================================================================# ZCode (unwrap)
+# ======================================================================
 
 
 @unwrap.command("zcode")
@@ -9855,10 +9880,8 @@ def _warn_proxy_mode_mismatch(running_config: dict[str, Any] | None) -> None:
         )
 
 
-# =============================================================================
-# Registry-generated wrap commands
-# =============================================================================
-# Env-var tools are described declaratively in headroom.providers.wrap_registry;
+# ======================================================================# Registry-generated wrap commands
+# ======================================================================# Env-var tools are described declaratively in headroom.providers.wrap_registry;
 # one click command per WrapTarget is generated here.
 
 
