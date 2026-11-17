@@ -576,22 +576,25 @@ async def emit_request_outcome(handler: Any, outcome: RequestOutcome) -> None:
     # observed output tokens to the recorder so it can produce an honest
     # reduction estimate. Best-effort: never let bookkeeping break a response.
     output_tokens_saved_est = 0
+    # High end of the range when the saving is modelled from benchmark factors;
+    # equal to the point estimate otherwise. Only the lifetime totals carry it.
+    output_tokens_saved_high_est = 0
     if any(str(t).startswith("output_shaper:") for t in outcome.transforms_applied):
         try:
             from headroom.proxy.output_savings import get_recorder
 
             _rec = get_recorder()
 
-            def _record_and_estimate() -> int:
+            def _record_and_estimate() -> tuple[int, int]:
                 _rec.record_from_labels(outcome.transforms_applied, outcome.output_tokens)
-                return _rec.estimate_request_savings(
-                    outcome.transforms_applied, outcome.output_tokens
-                )
+                return _rec.request_savings_range(outcome.transforms_applied, outcome.output_tokens)
 
             # Both calls take the recorder lock, and the every-Nth record also
             # does a full read-modify-write of the ledger file — run them
             # together off the event loop (#18) so a slow flush can't stall it.
-            output_tokens_saved_est = await asyncio.to_thread(_record_and_estimate)
+            output_tokens_saved_est, output_tokens_saved_high_est = await asyncio.to_thread(
+                _record_and_estimate
+            )
         except Exception as exc:  # pragma: no cover - defensive
             logger.debug(
                 "Output savings record/estimate failed for request %s; booking 0: %s",
@@ -707,6 +710,7 @@ async def emit_request_outcome(handler: Any, outcome: RequestOutcome) -> None:
         uncached_input_tokens=outcome.uncached_input_tokens,
         attempted_input_tokens=outcome.attempted_input_tokens,
         output_tokens_saved=output_tokens_saved_est,
+        output_tokens_saved_high=output_tokens_saved_high_est,
         project=project,
         client=outcome.client,
         tool_search_saved=tool_search_saved,
