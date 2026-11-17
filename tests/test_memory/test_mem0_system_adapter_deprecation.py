@@ -58,3 +58,40 @@ async def test_direct_adapter_skips_mem0_extraction_only_for_pre_extracted_args(
 
     assert mem0_client.add.called is runs_mem0_extraction
     assert write_facts.called is not runs_mem0_extraction
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "lookup",
+    [
+        ValueError("backend rejected the lookup"),
+        OSError("backend unreachable"),
+        None,
+        {"id": "m1", "memory": "x"},
+        {"id": "m1", "memory": "x", "user_id": "alice"},
+    ],
+    ids=["value-error", "os-error", "missing", "no-owner", "other-owner"],
+)
+async def test_delete_is_refused_unless_the_owner_is_confirmed(
+    monkeypatch: pytest.MonkeyPatch, lookup: object
+) -> None:
+    from unittest.mock import AsyncMock, MagicMock
+
+    client = MagicMock()
+    if isinstance(lookup, Exception):
+        client.get.side_effect = lookup
+    else:
+        client.get.return_value = lookup
+    backend = MagicMock()
+    backend._ensure_client = AsyncMock(return_value=client)
+    monkeypatch.setattr(mem0_system_adapter, "Mem0Backend", lambda config: backend)
+    with pytest.warns(DeprecationWarning):
+        adapter = mem0_system_adapter.Mem0SystemAdapter()
+
+    assert await adapter.delete_memory("m1", user_id="bob") is False
+    client.delete.assert_not_called()
+
+    client.get.side_effect = None
+    client.get.return_value = {"id": "m1", "memory": "x", "user_id": "bob"}
+    assert await adapter.delete_memory("m1", user_id="bob") is True
+    client.delete.assert_called_once_with(memory_id="m1")
