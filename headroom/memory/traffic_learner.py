@@ -743,7 +743,7 @@ class TrafficLearner:
         db_path = _resolve_backend_db_path(self._backend)
         if db_path is not None and db_path.exists():
             try:
-                persisted = _load_persisted_patterns_from_sqlite(db_path)
+                persisted = _load_persisted_patterns_from_sqlite(db_path, self._user_id)
             except Exception as e:
                 logger.debug("Reading persisted traffic patterns failed: %s", e)
                 persisted = []
@@ -1473,7 +1473,8 @@ class TrafficLearner:
             try:
                 rows = conn.execute(
                     "SELECT id, content, metadata FROM memories "
-                    "WHERE json_extract(metadata, '$.source') = 'traffic_learner' "
+                    "WHERE user_id = ? "
+                    "AND json_extract(metadata, '$.source') = 'traffic_learner' "
                     # Hydrate at most dedup_window rows so a large persisted
                     # history does not start the in-memory dedup maps oversized
                     # (they are trimmed to dedup_window in steady state). Keep the
@@ -1482,7 +1483,7 @@ class TrafficLearner:
                     # as a deterministic tie-break.
                     "ORDER BY json_extract(metadata, '$.last_seen_at') DESC, id DESC "
                     "LIMIT ?",
-                    (self._dedup_window,),
+                    (self._user_id, self._dedup_window),
                 ).fetchall()
             except sqlite3.DatabaseError as e:
                 logger.warning("Traffic learner hydrate: failed to read %s: %s", db_path, e)
@@ -1909,8 +1910,8 @@ def _resolve_backend_db_path(backend: Any) -> Path | None:
     return Path(db_path)
 
 
-def _load_persisted_patterns_from_sqlite(db_path: Path) -> list[ExtractedPattern]:
-    """Read traffic_learner rows from memory.db, dedupe, return patterns.
+def _load_persisted_patterns_from_sqlite(db_path: Path, user_id: str) -> list[ExtractedPattern]:
+    """Read ``user_id``'s traffic_learner rows from memory.db, dedupe, return patterns.
 
     Uses a direct read-only SQLite connection — we don't go through the
     backend's vector search because we want all rows, not semantically
@@ -1928,7 +1929,8 @@ def _load_persisted_patterns_from_sqlite(db_path: Path) -> list[ExtractedPattern
         rows = conn.execute(
             "SELECT content, metadata, entity_refs, importance, created_at "
             "FROM memories "
-            "WHERE json_extract(metadata, '$.source') = 'traffic_learner'"
+            "WHERE user_id = ? AND json_extract(metadata, '$.source') = 'traffic_learner'",
+            (user_id,),
         ).fetchall()
     except sqlite3.DatabaseError as e:
         logger.warning("Traffic learner: failed to read persisted patterns %s: %s", db_path, e)
