@@ -543,8 +543,8 @@ class TestSwapToolResultListContent:
         _swap_tool_result_content(msg, "compressed")
         assert msg["content"][0]["content"][0]["text"] == "original"
 
-    def test_swap_list_content_adds_text_block_when_missing(self):
-        """When list has no text block, collapses to a single text block."""
+    def test_swap_list_content_without_text_preserves_image(self):
+        """A text replacement must not erase an image-only result."""
         from headroom.cache.compression_cache import _swap_tool_result_content
 
         msg = {
@@ -558,8 +558,6 @@ class TestSwapToolResultListContent:
             ],
         }
         swapped = _swap_tool_result_content(msg, "compressed")
-        inner = swapped["content"][0]["content"]
-        assert isinstance(inner, list)
-        assert len(inner) == 1
-        assert inner[0]["type"] == "text"
-        assert inner[0]["text"] == "compressed"
+        assert swapped == msg
+        assert swapped is not msg
+        assert swapped["content"][0]["content"] is not msg["content"][0]["content"]
