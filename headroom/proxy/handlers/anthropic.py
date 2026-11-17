@@ -4134,11 +4134,12 @@ class AnthropicHandlerMixin:
                 # So is the CCR retrieve tool the proxy declared (the client
                 # never sent it), unless deferred and unloaded: its cost comes
                 # off this turn's saving.
-                optimized_tokens += _count_tool_tokens(
+                _retrieve_cost = _count_tool_tokens(
                     proxy_added_tools(
                         _billed_view(body.get("tools")), _original_tools, CCR_TOOL_NAME
                     )
                 )
+                optimized_tokens += _retrieve_cost
                 # First-appearance accounting for matured Reads. The client
                 # re-sends the raw conversation every turn, so this diff would
                 # otherwise re-book a matured Read's removal on every request
@@ -4162,7 +4163,10 @@ class AnthropicHandlerMixin:
                 # Signed, then clamped once: message text a hook added offsets
                 # the tool definitions it removed (booked on the tag above).
                 tokens_saved = net_hook_tool_saving(
-                    original_tokens - optimized_tokens - _replay_debt, tags, _th_saved
+                    original_tokens - optimized_tokens - _replay_debt,
+                    tags,
+                    _th_saved,
+                    proxy_cost=_retrieve_cost,
                 )
                 # Attribute the fold to the hook ONLY when the hook itself reduced
                 # tokens (same-tokenizer pre vs post) — not when the recount above
@@ -4242,6 +4246,7 @@ class AnthropicHandlerMixin:
                                     tokens_saved - _steer_tokens,
                                     tags,
                                     int(tags.get("turn_hook_tools_saved_tokens", 0) or 0),
+                                    proxy_cost=_steer_tokens,
                                 )
                             body_mutation_tracker.mark_mutated("output_shaper")
                             transforms_applied.extend(shape_result.labels or [])

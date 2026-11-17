@@ -442,3 +442,25 @@ def test_undeferring_a_proxy_deferred_tool_is_debited_from_its_credit_once(monke
     assert headline_tokens_saved(outcome.tokens_saved, tags) == (
         outcome.tokens_saved + tags["tool_search_deferred_tokens"]
     )
+
+
+def test_steering_comes_off_the_hook_ledger_row_with_its_tag(monkeypatch) -> None:
+    # The steering block is sent after the hooks booked their rows. Debiting
+    # only the tag left /stats by-source above the headline.
+    from headroom.proxy.savings_attribution import from_tags
+    from headroom.proxy.tool_schema_savings_policy import headline_tokens_saved
+
+    monkeypatch.setenv("HEADROOM_OUTPUT_SHAPER", "1")
+    monkeypatch.setenv("HEADROOM_OUTPUT_HOLDOUT", "0")
+    register_turn_hook(_DropResident())
+    outcome, _ = _send_outcome(
+        monkeypatch,
+        {
+            "system": "You are terse.",
+            "messages": [{"role": "user", "content": "hi"}],
+            "tools": [_tool("keep"), _tool("victim")],
+        },
+    )
+    headline = headline_tokens_saved(outcome.tokens_saved, outcome.tags)
+    assert 0 < headline < _resident_saving()  # steering cost was netted
+    assert sum(r["tokens"] for r in from_tags(outcome.tags) if r["realized"]) == headline

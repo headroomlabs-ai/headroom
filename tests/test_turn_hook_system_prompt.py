@@ -265,3 +265,42 @@ def test_steering_is_not_part_of_a_hooks_system_delta(monkeypatch) -> None:
     hook_delta = _system_count(_system_blocks()) - _system_count(upstream["system"][:-1])
     steer_tokens = get_tokenizer("claude-sonnet-4-5").count_text(steering)
     assert outcome.tags[TURN_HOOK_SYSTEM_SAVED_TAG] == hook_delta - steer_tokens > 0
+
+
+CANARY = "PRIVATE-PROMPT-CANARY-7f3a"
+
+
+def _leaky_counter(value: Any) -> int:
+    raise ValueError(f"cannot count {json.dumps(value)} {CANARY}")
+
+
+@pytest.mark.parametrize("site", ["system_count", "gateway_call"])
+def test_an_accounting_failure_keeps_its_input_out_of_debug_logs(monkeypatch, site: str) -> None:
+    import logging
+
+    from headroom.log_safety import CONTENT_OPT_IN_ENV
+    from headroom.proxy.gateway_turn import _safe_call
+    from headroom.proxy.turn_hooks import count_system_tokens
+
+    monkeypatch.delenv(CONTENT_OPT_IN_ENV, raising=False)
+    records: list[logging.LogRecord] = []
+    handler = logging.Handler(logging.DEBUG)
+    handler.emit = records.append  # type: ignore[method-assign]
+    logger = logging.getLogger("headroom.proxy")
+    old_level = logger.level
+    logger.addHandler(handler)
+    logger.setLevel(logging.DEBUG)
+    try:
+        if site == "system_count":
+            assert count_system_tokens(_leaky_counter, f"system {CANARY}") is None
+        else:
+            assert _safe_call(_leaky_counter, [{"name": CANARY}]) is None
+    finally:
+        logger.removeHandler(handler)
+        logger.setLevel(old_level)
+    assert records  # the failure is still logged
+    for record in records:
+        text = record.getMessage()
+        if record.exc_info:
+            text += "".join(logging.Formatter().formatException(record.exc_info))
+        assert CANARY not in text

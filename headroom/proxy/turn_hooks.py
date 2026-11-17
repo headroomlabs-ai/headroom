@@ -29,6 +29,7 @@ from dataclasses import dataclass, field
 from types import MappingProxyType
 from typing import Any, Literal, Protocol, runtime_checkable
 
+from headroom.log_safety import describe_exception
 from headroom.proxy.tool_schema_savings_policy import (
     deferred_booking,
     hook_tool_counts,
@@ -290,8 +291,12 @@ def count_system_tokens(
         return 0
     try:
         return int(count_messages([{"role": "system", "content": system}]))
-    except Exception:
-        log.debug("system prompt token count failed; its delta is not booked", exc_info=True)
+    except Exception as exc:
+        # The prompt may be in the exception's message: log only where it failed.
+        log.debug(
+            "system prompt token count failed; its delta is not booked: %s",
+            describe_exception(exc),
+        )
         return None
 
 

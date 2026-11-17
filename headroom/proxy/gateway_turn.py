@@ -50,6 +50,7 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any
 
+from headroom.log_safety import describe_exception
 from headroom.proxy.gateway_native import VIEW_MARKER as GATEWAY_NATIVE_VIEW_MARKER
 from headroom.proxy.gateway_native import native_shape, view_shape
 from headroom.proxy.gateway_responses import VIEW_MARKER as GATEWAY_RESPONSES_VIEW_MARKER
@@ -1143,8 +1144,13 @@ def _safe_call(fn: Callable[..., Any], *args: Any) -> Any:
     """``fn(*args)``, or ``None`` when it raises: accounting never fails a turn."""
     try:
         return fn(*args)
-    except Exception:
-        logger.debug("gateway turn: %s failed; savings uncounted", fn.__name__, exc_info=True)
+    except Exception as exc:
+        # The arguments are prompts and tool schemas: never their text in a log.
+        logger.debug(
+            "gateway turn: %s failed; savings uncounted: %s",
+            fn.__name__,
+            describe_exception(exc),
+        )
         return None
 
 

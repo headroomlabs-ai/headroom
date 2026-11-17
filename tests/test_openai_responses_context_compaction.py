@@ -765,3 +765,71 @@ def test_undeferring_a_tool_nested_in_a_namespace_is_charged() -> None:
     )
     assert "defer_loading" not in working["tools"][1]["tools"][0]  # the hook did run
     assert headline == ledger == 0
+
+
+def test_a_hook_editing_the_developer_item_through_messages_keeps_its_edit() -> None:
+    # The hook leaves ctx.system alone and edits the leading developer item in
+    # the message list. The system baseline must not move with that edit, or
+    # the unchanged ctx.system reads as a rewrite and puts the old prompt back.
+    def edit_through_messages(ctx: Any) -> None:
+        ctx.messages[0]["content"][0]["text"] = "short"
+
+    headline, ledger, working = _responses_headline(
+        edit_through_messages,
+        {
+            "model": "gpt-5.5",
+            "input": [
+                {"role": "developer", "content": [{"type": "input_text", "text": LONG_SYSTEM}]},
+                {"role": "user", "content": "hi"},
+            ],
+        },
+    )
+    assert working["input"][0]["content"][0]["text"] == "short"
+    assert headline == ledger > 0
+
+
+@pytest.mark.parametrize(
+    ("alpha_deferred", "alpha_words", "beta_words", "charged"),
+    [
+        # Both deferred; the hook loads alpha's large one. Beta's, still
+        # deferred, must not hide that alpha's is now billed.
+        (True, 400, 400, True),
+        # Alpha's is resident; the hook loads beta's small one. Only beta's is
+        # growth: alpha's was billed before and after.
+        (False, 400, 5, False),
+    ],
+)
+def test_namespaces_sharing_a_tool_name_are_charged_apart(
+    alpha_deferred: bool, alpha_words: int, beta_words: int, charged: bool
+) -> None:
+    loads = "alpha" if alpha_deferred else "beta"
+
+    def fold_and_load(ctx: Any) -> None:
+        ctx.messages[0]["output"] = "folded"
+        for group in ctx.tools[1:]:
+            if group["name"] == loads:
+                group["tools"][0].pop("defer_loading", None)
+
+    def group(name: str, words: int, deferred: bool) -> dict[str, Any]:
+        tool = _function_tool("search", words)
+        return {
+            "type": "namespace",
+            "name": name,
+            "tools": [{**tool, "defer_loading": True} if deferred else tool],
+        }
+
+    headline, ledger, working = _responses_headline(
+        fold_and_load,
+        {
+            "model": "gpt-5.5",
+            "input": [{"type": "function_call_output", "call_id": "c1", "output": "data " * 300}],
+            "tools": [
+                {"type": "tool_search"},
+                group("alpha", alpha_words, alpha_deferred),
+                group("beta", beta_words, True),
+            ],
+        },
+    )
+    assert working["input"][0]["output"] == "folded"  # the hook did run
+    assert headline == ledger
+    assert (headline == 0) == charged

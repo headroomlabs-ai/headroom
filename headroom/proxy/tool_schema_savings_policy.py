@@ -82,7 +82,7 @@ def unbilled_deferred_tool_names(tools: object, messages: object) -> frozenset[s
     """
     if messages is None or not isinstance(tools, list):
         return frozenset()
-    deferred = _deferred_names(tools)
+    deferred = _tool_ids(tools, deferred_only=True)
     if not deferred:
         return frozenset()
     from headroom.proxy.helpers import (
@@ -93,24 +93,37 @@ def unbilled_deferred_tool_names(tools: object, messages: object) -> frozenset[s
     # What the provider receives: repair drops a reference this request's tools
     # cannot support, and that one loads nothing.
     repaired, _ = strip_unsupported_tool_search_blocks(messages, tools)
-    return frozenset(deferred - referenced_tool_names(repaired))
+    referenced = referenced_tool_names(repaired)
+    return frozenset(i for i in deferred if i.rsplit(_NAMESPACE_SEP, 1)[-1] not in referenced)
 
 
-def _tool_names(tools: object) -> set[str]:
-    from headroom.proxy.helpers import iter_tool_entries
-
-    return {str(t["name"]) for t in iter_tool_entries(tools) if t.get("name")}
-
-
-def _deferred_names(tools: object) -> frozenset[str]:
-    from headroom.proxy.helpers import iter_tool_entries
-
-    return frozenset(
-        str(t["name"]) for t in iter_tool_entries(tools) if t.get("defer_loading") and t.get("name")
-    )
+# Joins a namespace and a member's name into the member's identity. Two
+# namespaces may each hold a ``search``; keyed by bare name, the one still
+# deferred would hide the one a hook put on the bill. A top-level tool keeps
+# its bare name, which is what a ``tool_reference`` names.
+_NAMESPACE_SEP = "\x1f"
 
 
-def _measured_view(tools: object, excluded: frozenset[str]) -> object:
+def _tool_ids(tools: object, *, deferred_only: bool = False) -> frozenset[str]:
+    """The identity of every named tool in ``tools``, ``namespace`` members
+    qualified by their group's name (see :data:`_NAMESPACE_SEP`)."""
+    ids: set[str] = set()
+    if not isinstance(tools, list):
+        return frozenset()
+    for tool in tools:
+        if not isinstance(tool, dict):
+            continue
+        members = [("", tool)]
+        if tool.get("type") == "namespace" and isinstance(tool.get("tools"), list):
+            prefix = f"{tool.get('name')}{_NAMESPACE_SEP}"
+            members += [(prefix, m) for m in tool["tools"] if isinstance(m, dict)]
+        for prefix, member in members:
+            if member.get("name") and (member.get("defer_loading") or not deferred_only):
+                ids.add(f"{prefix}{member['name']}")
+    return frozenset(ids)
+
+
+def _measured_view(tools: object, excluded: frozenset[str], prefix: str = "") -> object:
     """``tools`` without ``defer_loading`` flags or the ``excluded`` tools, the
     members of a ``namespace`` group included. Never mutates its input."""
     if not isinstance(tools, list):
@@ -118,12 +131,17 @@ def _measured_view(tools: object, excluded: frozenset[str]) -> object:
     view: list[Any] = []
     for tool in tools:
         if isinstance(tool, dict):
-            if tool.get("name") and str(tool["name"]) in excluded:
+            if tool.get("name") and f"{prefix}{tool['name']}" in excluded:
                 continue
             if "defer_loading" in tool:
                 tool = {k: v for k, v in tool.items() if k != "defer_loading"}
             if tool.get("type") == "namespace" and isinstance(tool.get("tools"), list):
-                tool = {**tool, "tools": _measured_view(tool["tools"], excluded)}
+                tool = {
+                    **tool,
+                    "tools": _measured_view(
+                        tool["tools"], excluded, f"{tool.get('name')}{_NAMESPACE_SEP}"
+                    ),
+                }
         view.append(tool)
     return view
 
@@ -160,7 +178,7 @@ def tools_before_hook(
     ``count_tools`` raises.
     """
     unbilled = unbilled_deferred_tool_names(tools, messages)
-    names = frozenset(_tool_names(tools))
+    names = _tool_ids(tools)
     if deferred_billed:
         chargeable: frozenset[str] = frozenset()
     else:
@@ -171,9 +189,9 @@ def tools_before_hook(
         # With a deferral credit, every deferred tool is left to
         # reconcile_deferred_tokens: the proxy's deferrers stand down when the
         # client already defers, so the credit's tools are all of them.
-        chargeable = unbilled if messages is not None else _deferred_names(tools)
+        chargeable = unbilled if messages is not None else _tool_ids(tools, deferred_only=True)
         if isinstance(tags, dict) and "tool_search_deferred_tokens" in tags:
-            chargeable -= _deferred_names(tools)
+            chargeable -= _tool_ids(tools, deferred_only=True)
     if not unbilled and not chargeable:
         return ToolsBeforeHook(
             names, unbilled, count=int(count_tools(without_deferral_flags(tools)))
@@ -204,11 +222,11 @@ def hook_tool_counts(
     """
     unbilled_after = unbilled_deferred_tool_names(tools, messages)
     billed_before = before.names - before.unbilled
-    billed_after = _tool_names(tools) - unbilled_after
+    billed_after = _tool_ids(tools) - unbilled_after
     excluded = frozenset((before.unbilled | unbilled_after) - billed_before - billed_after)
     if messages is None:
         # Unreadable loading: only un-deferring is seen to bill a tool.
-        billed_after -= _deferred_names(tools)
+        billed_after -= _tool_ids(tools, deferred_only=True)
     newly_billed = before.chargeable & billed_after
     if before.count is not None:
         before_count = before.count
@@ -251,7 +269,7 @@ def loading_history(provider: str, messages: object) -> object:
 def proxy_added_tools(tools: object, client_tools: object, name: str) -> list[Any]:
     """The tool named ``name`` in the outbound ``tools`` when the client did not
     declare it: a definition the proxy added and the request pays for."""
-    if name in _tool_names(client_tools):
+    if name in _tool_ids(client_tools):
         return []
     return [
         t
@@ -304,6 +322,32 @@ def _deferral_entry(tags: dict[str, Any]) -> dict[str, Any] | None:
         ),
         None,
     )
+
+
+def _debit_hook_rows(tags: dict[str, Any], amount: int) -> None:
+    """Lower the turn hooks' realized ledger rows by ``amount``, latest first.
+
+    A hook row is one :func:`~headroom.proxy.turn_hooks.run_request_hooks`
+    booked: its details split the saving into ``tool_tokens_saved`` and the rest.
+    That split stays as booked; ``proxy_cost_tokens`` says what came off it.
+    """
+    from headroom.proxy.savings_attribution import SAVINGS_ATTRIBUTION_TAG
+
+    ledger = tags.get(SAVINGS_ATTRIBUTION_TAG)
+    for row in reversed(ledger if isinstance(ledger, list) else []):
+        if amount <= 0:
+            return
+        details = row.get("details") if isinstance(row, dict) else None
+        if not (isinstance(details, dict) and "tool_tokens_saved" in details):
+            continue
+        if not row.get("realized") or row.get("estimated"):
+            continue
+        take = min(amount, max(0, int(row.get("tokens") or 0)))
+        if take <= 0:
+            continue
+        row["tokens"] = int(row.get("tokens") or 0) - take
+        details["proxy_cost_tokens"] = int(details.get("proxy_cost_tokens") or 0) + take
+        amount -= take
 
 
 def reconcile_deferred_tokens(
@@ -390,7 +434,9 @@ def tool_schema_saved_from_tags(tags: object) -> int:
     return total
 
 
-def net_hook_tool_saving(raw_saved: int, tags: object, hook_tool_saved: int) -> int:
+def net_hook_tool_saving(
+    raw_saved: int, tags: object, hook_tool_saved: int, *, proxy_cost: int = 0
+) -> int:
     """Net a request's message-side saving against the tool saving its turn
     hooks booked on ``turn_hook_tools_saved_tokens``; return it clamped at 0.
 
@@ -401,20 +447,30 @@ def net_hook_tool_saving(raw_saved: int, tags: object, hook_tool_saved: int) -> 
     this request), then from the system-prompt cut they booked, then from the
     tool-search credit and its ledger row, so headline == messages + tools + system,
     signed, clamped once.
+
+    ``proxy_cost`` is the part of the deficit the proxy added after the hooks
+    ran (steering, the retrieve tool). The hooks' ledger rows already net
+    their own growth, but not that: what it takes from the hooks' tags comes
+    off their rows too, so ``/stats`` by-source agrees with the headline.
     """
     raw = int(raw_saved)
     booked = max(0, int(hook_tool_saved or 0))
+    hook_debit = 0
     if raw < 0 and booked > 0 and isinstance(tags, dict):
         offset = min(-raw, booked)
         current = int(tags.get("turn_hook_tools_saved_tokens", 0) or 0)
         tags["turn_hook_tools_saved_tokens"] = max(0, current - offset)
         raw += offset
+        hook_debit += offset
     if raw < 0 and isinstance(tags, dict):
         system_cut = max(0, int(tags.get(TURN_HOOK_SYSTEM_SAVED_TAG, 0) or 0))
         offset = min(-raw, system_cut)
         if offset:
             tags[TURN_HOOK_SYSTEM_SAVED_TAG] = system_cut - offset
             raw += offset
+            hook_debit += offset
+    if isinstance(tags, dict):
+        _debit_hook_rows(tags, min(hook_debit, max(0, int(proxy_cost or 0))))
     if raw < 0 and isinstance(tags, dict):
         try:
             credit = max(0, int(tags.get("tool_search_deferred_tokens") or 0))

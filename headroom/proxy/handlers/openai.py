@@ -3432,6 +3432,9 @@ class OpenAIHandlerMixin:
             # note, and `instructions` holding only the output shaper's block is
             # not the client's prompt. The hook gets a copy, so an in-place edit
             # is not also a message delta, and is booked once, as a system delta.
+            # The baseline is a copy too: it must not share the item's content
+            # list, or a hook editing that item through ctx.messages would move
+            # the baseline with it and the unchanged ctx.system would undo the edit.
             _system_item = (
                 None if working.get("previous_response_id") else _leading_system_item(_msgs_before)
             )
@@ -3439,7 +3442,7 @@ class OpenAIHandlerMixin:
             _steering_only = _is_steering_only(_instructions)
             _system_in_item = _system_item is not None and (not _instructions or _steering_only)
             if _system_in_item:
-                _system_before = _system_item.get("content")
+                _system_before = copy.deepcopy(_system_item.get("content"))
             else:
                 _system_before = None if _steering_only else _instructions
             _req_ctx = TurnContext(
