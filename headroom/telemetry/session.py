@@ -567,19 +567,6 @@ def _bump(counter: dict[str, int], key: str, *, cap: int = MAX_SHAPES) -> None:
     counter[key] = counter.get(key, 0) + 1
 
 
-def _tool_saved(tags: Any) -> int:
-    """Tool-schema tokens saved on one turn. These live only in tags — see the
-    same arithmetic in emit_request_outcome, which feeds the local dashboard."""
-    total = 0
-    if isinstance(tags, dict):
-        for tag in ("tool_search_deferred_tokens", "turn_hook_tools_saved_tokens"):
-            try:
-                total += int(tags.get(tag, 0) or 0)
-            except (TypeError, ValueError):
-                pass
-    return total
-
-
 def _add_usage(table: dict[str, list[int]], key: str, values: tuple[int, ...]) -> None:
     """Add one turn to a usage table. Past the cap, new keys pool into "other".
 
@@ -1543,11 +1530,12 @@ def _fold(sess: _Session, outcome: Any, now: float, source: str = "proxy") -> No
     # problem, not a compression problem, and the two are indistinguishable
     # from the token counts alone.
     tags = get("tags", None) or {}
-    tool_saved = _tool_saved(tags)
+    # Tool-schema savings live only in tags — see the same arithmetic in
+    # emit_request_outcome, which feeds the local dashboard. One sum feeds both
+    # the session total and the usage tables, so the tables add back up to it.
+    tool_saved = tool_schema_saved_from_tags(tags)
+    sess.tool_saved_tokens += tool_saved
     if isinstance(tags, dict):
-        # Tool-schema savings live only in tags — see the same arithmetic in
-        # emit_request_outcome, which feeds the local dashboard.
-        sess.tool_saved_tokens += tool_schema_saved_from_tags(tags)
         for tag in _REASON_TAGS:
             if tag in tags:
                 key = f"{tag.removesuffix('_reason')}:{_safe_slug(tags[tag])}"

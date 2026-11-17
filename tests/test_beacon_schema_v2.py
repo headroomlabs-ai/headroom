@@ -949,15 +949,20 @@ def test_usage_tables_split_the_session_totals_without_residue():
     class Anonymous(Outcome):
         client = None
 
-    payload = emit(Outcome(), Outcome(), Codex(), Gateway(), Anonymous())
+    class Hooked(Outcome):
+        # A turn hook's system-prompt cut counts toward `tool_saved` too.
+        tags = {"turn_hook_system_saved_tokens": 100, "turn_hook_tools_saved_tokens": 40}
+
+    payload = emit(Outcome(), Outcome(), Codex(), Gateway(), Anonymous(), Hooked())
     by_client = {r["client"]: r for r in payload["client_usage"]}
     assert {name: r["n"] for name, r in by_client.items()} == {
-        "claude_code": 2,
+        "claude_code": 3,
         "codex": 1,
         "via_compress_api": 1,
         "unidentified": 1,
     }
     assert by_client["codex"]["tool_saved"] == 70
+    assert by_client["claude_code"]["tool_saved"] == 140
     for table in ("client_usage", "model_usage"):
         rows = payload[table]
         assert sum(r["n"] for r in rows) == payload["session"]["turns"], table
