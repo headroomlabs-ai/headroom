@@ -6,10 +6,11 @@
  * client sends AND exactly what happens to it on arrival. "Trust us" is not a
  * privacy policy.
  *
- * Deployed at otlp.headroomlabs.ai. Three jobs:
+ * Deployed at headroom-beacon.headroom-beacon.workers.dev (otlp.headroomlabs.ai
+ * is planned but not yet routed; see wrangler.toml). Three jobs:
  *
- *   1. Allowlist. Drop every field not on ALLOWED_KEYS before anything is
- *      written. This is the only privacy control that works retroactively —
+ *   1. Allowlist. Drop every field not on ALLOWED_KEYS, and every nested
+ *      field not described by NESTED, before anything is written. This is the only privacy control that works retroactively —
  *      if a future client version ships a bug that leaks a field, we cannot
  *      patch the installs already in the wild, but we can stop storing it
  *      here in one deploy.
@@ -25,7 +26,9 @@
  *
  * What this deliberately does NOT do: log, store, or forward the source IP.
  * Cloudflare offers it as cf-connecting-ip; it is the one field that would
- * deanonymise install_id, so it is never read.
+ * deanonymise install_id, so it is never read. Cloudflare's own per-request
+ * invocation logs would record it regardless of this code, which is why
+ * wrangler.toml turns them off (observability.logs.invocation_logs = false).
  */
 
 // Mostly mirrors the payload built by _Session.payload(); an extension may
@@ -53,6 +56,51 @@ const ALLOWED_KEYS = [
   // real minimum cacheable prefix, how long a cache actually survives, and how
   // far predicted cache hits are from the ones that happened.
   'routing',
+
+  // ---- schema v2 -----------------------------------------------------------
+  //
+  // Additive. Every v1 key above is untouched, so a v1 client keeps storing
+  // exactly what it stores today and rows from the two versions union cleanly
+  // (`schema_version` separates them, `union_by_name` handles the rest).
+  //
+  // Read the ordering rule at the top of this list literally: this deploy must
+  // go out BEFORE the client release that starts sending these, or the first
+  // weeks of the new signals are dropped on arrival and cannot be recovered.
+  // Removing one line here is also the rollback -- it reverts that signal for
+  // every install in the wild without a client release, which is the whole
+  // reason the allowlist is server-side.
+
+  // Regret. `reread_compressed_tokens` is the counter-pressure on `saved_pct`:
+  // tokens the agent had to fetch again because compression removed them.
+  // Without it a compression ratio is unfalsifiable.
+  'quality',
+  // Fixed-bucket distributions for quantities otherwise reported only as
+  // session sums. Ships its own bucket edges, so no reader needs to know which
+  // client version wrote a row.
+  'hist',
+  // (content_type x strategy x yield), and the same for JSON tool output keyed
+  // by structural shape. The input term the corpus has never had.
+  // Structural descriptors only -- never TOIN's structure_hash, which is a
+  // digest of field names.
+  'shapes',
+  // Prompt-cache survival by gap since the previous turn: the empirical TTL
+  // and minimum-prefix curve per provider.
+  'cache',
+  // Session shape over time -- log-spaced turn buckets plus a run-length
+  // encoded turn-kind string from a closed seven-letter alphabet.
+  'trajectory',
+  // Identified client harness, per turn. `headroom.stack` answers this by
+  // detection and resolves to a literal "proxy" for most of the fleet.
+  'clients',
+  // 4xx, kept strictly separate from the 5xx-only `failures` above so neither
+  // metric changes meaning. 429 rate is the routing signal here.
+  'errors',
+  // output_shaper A/B strata as validated enums. Model family is not among
+  // them -- see the note in session.py's payload().
+  'strata',
+  // Allowlisted, slug-validated configuration, so the corpus can tell
+  // "compression underperformed" from "compression was switched off".
+  'config',
 ];
 
 // Resource attributes we keep. Same rule: allowlist, not denylist.
@@ -66,8 +114,183 @@ const ALLOWED_RESOURCE = [
   'host.arch',
 ];
 
-// A beacon event is ~2KB. Anything far past that is a bug or an attack.
-const MAX_BODY_BYTES = 64 * 1024;
+// What may sit UNDER each allowed key. Without this the allowlist stops at the
+// top level and a nested field a client bug adds is stored verbatim -- the very
+// leak the header says one deploy here can stop. Mirrors _Session.payload() and
+// _payload_v2() in headroom/telemetry/session.py. A nested key absent here is
+// dropped, so the ordering rule on ALLOWED_KEYS applies to it too: teach it
+// here before a client sends it.
+//
+// Leaves are 'num' (a finite number), 'bool', or 'str': a token of at most 128
+// characters with no whitespace, which is every string the client sends (slugs,
+// hex ids, public model ids, versions). Free text does not fit it. `[spec]` is
+// a list of spec; mapOf(spec) is an object whose KEYS are data (transform
+// names, skip reasons, status codes), each key itself held to 'str'.
+const MAP = Symbol('map');
+const mapOf = (spec) => ({ [MAP]: spec });
+const nums = (...keys) => Object.fromEntries(keys.map((k) => [k, 'num']));
+
+const NESTED = {
+  schema_version: 'num',
+  session: {
+    id: 'str', seq: 'num', duration_s: 'num', turns: 'num', ended: 'str', final: 'bool',
+  },
+  tokens: nums(
+    'original', 'attempted', 'input', 'output', 'saved', 'tool_saved',
+    'cache_read', 'cache_write', 'uncached'
+  ),
+  rates: nums(
+    'saved_pct', 'eligible_pct', 'yield_pct', 'all_layers_saved_pct',
+    'all_layers_yield_pct', 'cache_read_pct', 'overhead_pct'
+  ),
+  compression: {
+    transforms: mapOf('num'),
+    by_strategy: [{ strategy: 'str', ...nums('n', 'tokens_in', 'tokens_out') }],
+    ...nums(
+      'overhead_ms_total', 'latency_ms_total', 'overhead_ms_per_turn',
+      'latency_ms_per_turn', 'passthrough_turns', 'response_cache_hits'
+    ),
+  },
+  skips: mapOf('num'),
+  sources: mapOf('num'),
+  providers: ['str'],
+  models: ['str'],
+  failures: 'num',
+  failure_statuses: mapOf('num'),
+  // Emitted by an extension, not by session.py, so this repository does not
+  // define its shape. Bounded rather than described: numbers, booleans and
+  // tokens only, at most ROUTING_DEPTH levels deep. It gets a real schema here
+  // once the extension's payload is written down.
+  routing: 'any',
+  quality: {
+    ...nums('reread_tokens', 'reread_compressed_tokens', 'waste_turns'),
+    waste: [{ kind: 'str', tokens: 'num' }],
+  },
+  hist: mapOf({ edges: ['num'], counts: ['num'] }),
+  shapes: {
+    by_content: [{ content: 'str', strategy: 'str', ...nums('n', 'tokens_in', 'tokens_out') }],
+    by_tool: [{ shape: 'str', ...nums('n', 'tokens_in', 'tokens_out') }],
+    truncated: 'bool',
+  },
+  cache: {
+    gap_edges_s: ['num'], hits: ['num'], misses: ['num'],
+    ...nums('write_5m', 'write_1h', 'inferred_turns'),
+  },
+  trajectory: {
+    buckets: 'num', turns: ['num'], tokens: ['num'], saved: ['num'],
+    // Runs over the closed _TURN_KINDS alphabet, at most MAX_TRAJECTORY_RUNS.
+    kinds: /^(?:[cfepzso]\d{1,9}){0,64}$/,
+    kinds_truncated: 'bool',
+    msgs_max: 'num',
+  },
+  clients: [{ client: 'str', n: 'num' }],
+  errors: { count: 'num', by_status: mapOf('num') },
+  strata: [{ dim: 'str', value: 'str', n: 'num' }],
+  config: [{ key: 'str', value: 'str' }],
+};
+
+// A key allowed at the top but given no shape would be dropped in full. Fail
+// the deploy instead of shipping that.
+if ([...ALLOWED_KEYS].sort().join() !== Object.keys(NESTED).sort().join()) {
+  throw new Error('beacon: ALLOWED_KEYS and NESTED disagree');
+}
+
+const TOKEN = /^[\w.:/@+|-]{0,128}$/;
+// A slug-shaped string can still be a URL or a credential. Model ids and the
+// other slugs the client sends never carry a scheme or a well-known key prefix,
+// so those are dropped even though they pass TOKEN.
+const SECRETISH = /:\/\/|^(?:sk|pk|rk)[-_]|^(?:ghp|gho|ghu|ghs|ghr)_|^github_pat_|^glpat-|^xox[abposr]-|^(?:AKIA|ASIA)[A-Z0-9]{12}|^AIza|^hf_|^eyJ/i;
+const isToken = (s) => TOKEN.test(s) && !SECRETISH.test(s);
+const ROUTING_DEPTH = 4;
+
+/** `value` reduced to what `spec` allows, or undefined when none of it is. */
+function clean(spec, value, depth = 0) {
+  if (spec === 'any') {
+    if (depth > ROUTING_DEPTH) return undefined;
+    spec = Array.isArray(value) ? ['any']
+      : value && typeof value === 'object' ? mapOf('any')
+      : typeof value === 'string' ? 'str'
+      : typeof value === 'number' ? 'num' : 'bool';
+  }
+  if (spec === 'num') return Number.isFinite(value) ? value : undefined;
+  if (spec === 'bool') return typeof value === 'boolean' ? value : undefined;
+  if (spec === 'str') return typeof value === 'string' && isToken(value) ? value : undefined;
+  if (spec instanceof RegExp) {
+    return typeof value === 'string' && spec.test(value) ? value : undefined;
+  }
+  if (Array.isArray(spec)) {
+    if (!Array.isArray(value)) return undefined;
+    return value.map((v) => clean(spec[0], v, depth + 1)).filter((v) => v !== undefined);
+  }
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return undefined;
+  const out = {};
+  if (spec[MAP]) {
+    for (const [key, v] of Object.entries(value)) {
+      const kept = isToken(key) ? clean(spec[MAP], v, depth + 1) : undefined;
+      if (kept !== undefined) out[key] = kept;
+    }
+    return out;
+  }
+  for (const [key, s] of Object.entries(spec)) {
+    if (!Object.hasOwn(value, key)) continue;
+    const kept = clean(s, value[key], depth + 1);
+    if (kept !== undefined) out[key] = kept;
+  }
+  return out;
+}
+
+// Cap on what ARRIVES, compressed or not.
+//
+// Was 64KB, chosen when the comment above it read "a beacon event is ~2KB" --
+// i.e. 32x the payload. Schema v2 made a typical event ~8KB uncompressed, and
+// a session that fills every table (the shape cross product is 10 content
+// types x 13 strategies) reaches ~82KB. That silently eroded the multiple to
+// under 1x: a busy session sending uncompressed -- the kill switch is set, or
+// the gzip fallback fired -- would have been answered 413 and, correctly, not
+// retried, so the event would simply be lost.
+//
+// Restored to ~3x the worst legitimate payload. This is not the abuse control
+// and never was: the endpoint is unauthenticated by design and the RATE_LIMIT
+// binding (see fetch() and wrangler.toml) is what bounds a bad actor.
+const MAX_BODY_BYTES = 256 * 1024;
+
+// Cap on what an arriving body EXPANDS to. `raw.byteLength` cannot see this:
+// a small gzip can expand to gigabytes, and a decompression bomb that is only
+// noticed after it has been decompressed has already won. Enforced while the
+// stream is read, not after. ~3x the worst legitimate payload, same as above.
+const MAX_DECOMPRESSED_BYTES = 256 * 1024;
+
+/**
+ * Decompress a gzip body, refusing anything that expands past `limit`.
+ *
+ * Counts bytes as chunks arrive and aborts mid-stream, so a bomb costs the
+ * limit rather than whatever it would have expanded to.
+ */
+export async function inflate(buffer, limit) {
+  const stream = new Response(buffer).body.pipeThrough(new DecompressionStream('gzip'));
+  const reader = stream.getReader();
+  const chunks = [];
+  let total = 0;
+  try {
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      total += value.byteLength;
+      if (total > limit) throw new Error('decompressed body too large');
+      chunks.push(value);
+    }
+  } finally {
+    // Releases the stream on the bomb path; a no-op once it has closed.
+    reader.cancel().catch(() => {});
+  }
+  const joined = new Uint8Array(total);
+  let offset = 0;
+  for (const chunk of chunks) {
+    joined.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+  return new TextDecoder().decode(joined);
+}
 
 /** OTLP AnyValue -> plain JS. The inverse of _any_value() in session.py. */
 function unwrap(value) {
@@ -85,11 +308,13 @@ function unwrap(value) {
   return null;
 }
 
-function pick(obj, allowed) {
+function pick(obj, allowed, specOf) {
   const out = {};
   if (!obj || typeof obj !== 'object') return out;
   for (const key of allowed) {
-    if (key in obj) out[key] = obj[key];
+    if (!(key in obj)) continue;
+    const kept = clean(specOf(key), obj[key]);
+    if (kept !== undefined) out[key] = kept;
   }
   return out;
 }
@@ -102,14 +327,15 @@ function extract(payload) {
     for (const attr of rl.resource?.attributes || []) {
       resource[attr.key] = unwrap(attr.value);
     }
-    const cleanResource = pick(resource, ALLOWED_RESOURCE);
+    // Every resource attribute the client sends is a plain string.
+    const cleanResource = pick(resource, ALLOWED_RESOURCE, () => 'str');
 
     for (const sl of rl.scopeLogs || []) {
       for (const rec of sl.logRecords || []) {
         const body = unwrap(rec.body);
         if (!body || typeof body !== 'object') continue;
         records.push({
-          ...pick(body, ALLOWED_KEYS),
+          ...pick(body, ALLOWED_KEYS, (key) => NESTED[key]),
           resource: cleanResource,
           // Server-stamped. A client clock can be wrong or forged; this is the
           // timestamp partitioning and retention actually rely on.
@@ -308,6 +534,31 @@ export default {
       return new Response('not found', { status: 404 });
     }
 
+    // Abuse bound, checked before the body is read so a flood costs neither
+    // the inflate nor an R2 write. Keyed on one constant rather than the
+    // sender: a per-IP limit would mean reading cf-connecting-ip, which this
+    // Worker never does (see the header). The price is that a flood also
+    // sheds real events until the window rolls over -- acceptable for
+    // fire-and-forget telemetry, and the cap sits ~10x above normal traffic.
+    //
+    // 429 is safe for old clients: only 400/415 make them drop gzip
+    // (_GZIP_REFUSED_STATUSES in headroom/telemetry/session.py).
+    //
+    // Fails open: with no binding (local tests, an old wrangler.toml) or when
+    // the rate-limit service itself errors, the upload proceeds. A limiter
+    // outage must not drop every legitimate beacon; the cost is that a flood
+    // during that outage is unbounded until the service recovers.
+    if (env.RATE_LIMIT) {
+      let limited = false;
+      try {
+        const { success } = await env.RATE_LIMIT.limit({ key: 'all' });
+        limited = !success;
+      } catch (err) {
+        console.error('beacon: rate limiter unavailable, failing open:', String(err));
+      }
+      if (limited) return new Response('rate limited', { status: 429 });
+    }
+
     const raw = await request.arrayBuffer();
     if (raw.byteLength > MAX_BODY_BYTES) {
       return new Response('payload too large', { status: 413 });
@@ -315,9 +566,31 @@ export default {
 
     let records;
     try {
-      records = extract(JSON.parse(new TextDecoder().decode(raw)));
+      // Sniff the gzip magic number rather than trusting Content-Encoding.
+      // Three things can each independently decide whether a body arrives
+      // compressed -- the client, Cloudflare's edge, and any proxy between
+      // them -- and only the bytes know which of them acted. Keying off the
+      // header instead means a body that something already decompressed gets
+      // fed to DecompressionStream, or vice versa, and every upload 400s.
+      //
+      // It also means an old client that never sets the header keeps working
+      // through the identical code path it uses today: no header, no magic
+      // number, straight to TextDecoder.
+      const bytes = new Uint8Array(raw);
+      const gzipped = bytes.length >= 2 && bytes[0] === 0x1f && bytes[1] === 0x8b;
+      const text = gzipped
+        ? await inflate(raw, MAX_DECOMPRESSED_BYTES)
+        : new TextDecoder().decode(raw);
+      records = extract(JSON.parse(text));
     } catch {
       // Malformed input is not worth a retry storm from clients.
+      //
+      // This 400 is also load-bearing in the other direction: it is what a
+      // client that gzipped against a Worker too old to inflate sees, and
+      // _post_blocking treats a 4xx on a compressed body as "this endpoint
+      // does not do gzip", falls back to sending it uncompressed, and stops
+      // compressing for the life of the process. So deploying the client
+      // before this Worker costs one retry per process, not the data.
       return new Response('bad request', { status: 400 });
     }
     if (records.length === 0) return new Response(null, { status: 204 });

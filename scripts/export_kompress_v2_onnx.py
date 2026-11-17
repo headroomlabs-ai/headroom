@@ -31,12 +31,22 @@ Usage
 
     # Convert, verify, and upload back to the HF repo (needs `huggingface-cli login`):
     python scripts/export_kompress_v2_onnx.py --model-id chopratejas/kompress-v2-base --upload
+
+Reproducibility
+---------------
+Every Hub load is pinned to an immutable commit: the checkpoint to
+``--revision`` and the ModernBERT encoder + tokenizer to ``--base-revision``.
+Both default to the production pins in ``headroom.onnx_runtime._PINNED_REVISIONS``
+(``HEADROOM_HF_PIN`` does not apply here), so the exported artifact is built
+from exactly what production loads. Upgrading a model is a reviewed pin bump
+plus a regenerated artifact, never ambient Hub state.
 """
 
 from __future__ import annotations
 
 import argparse
 import logging
+import re
 import sys
 from pathlib import Path
 
@@ -47,8 +57,24 @@ logger = logging.getLogger("export_kompress_v2_onnx")
 BASE_MODEL = "answerdotai/ModernBERT-base"
 DEFAULT_MODEL_ID = "chopratejas/kompress-v2-base"
 
+_COMMIT_SHA = re.compile(r"[0-9a-f]{40}")
 
-def _build_core(model_id: str):
+
+def _pinned_revision(repo_id: str, revision: str | None) -> str:
+    """Return an immutable commit for ``repo_id``: ``revision`` if given, else
+    the production pin. Branches, tags and unpinned repos are rejected."""
+    from headroom.onnx_runtime import _PINNED_REVISIONS
+
+    revision = revision or _PINNED_REVISIONS.get(repo_id)
+    if revision is None or not _COMMIT_SHA.fullmatch(revision):
+        raise SystemExit(
+            f"{repo_id}: need a 40-hex commit SHA (got {revision!r}). "
+            "Pass one explicitly or pin the repo in headroom.onnx_runtime._PINNED_REVISIONS."
+        )
+    return revision
+
+
+def _build_core(model_id: str, revision: str, base_revision: str):
     """Instantiate HeadroomCompressorModel and load the merged v2 weights.
 
     The v2 repo's ``model.safetensors`` is the *unmerged* PEFT structure
@@ -67,7 +93,7 @@ def _build_core(model_id: str):
 
     from headroom.transforms.kompress_compressor import _get_model_class
 
-    ckpt_path = hf_hub_download(model_id, "merged.pt")
+    ckpt_path = hf_hub_download(model_id, "merged.pt", revision=revision)
     ckpt = torch.load(ckpt_path, map_location="cpu")
     for key in ("encoder_state_dict", "token_head_state_dict", "span_conv_state_dict"):
         if key not in ckpt:
@@ -76,7 +102,7 @@ def _build_core(model_id: str):
                 "This script targets the v2 'merged' checkpoint format."
             )
 
-    core = _get_model_class()(model_name=BASE_MODEL)
+    core = _get_model_class()(model_name=BASE_MODEL, revision=base_revision)
 
     def _strict_load(module, sd, label: str) -> None:
         missing, unexpected = module.load_state_dict(sd, strict=False)
@@ -115,11 +141,18 @@ def _export_wrapper(core):
     return ExportWrapper(core).eval()
 
 
-def export(model_id: str, out_path: Path, opset: int, precision: str) -> None:
+def export(
+    model_id: str,
+    out_path: Path,
+    opset: int,
+    precision: str,
+    revision: str,
+    base_revision: str,
+) -> None:
     import numpy as np
     import torch
 
-    core = _build_core(model_id)
+    core = _build_core(model_id, revision, base_revision)
     wrapper = _export_wrapper(core)
 
     out_path.parent.mkdir(parents=True, exist_ok=True)
@@ -167,15 +200,15 @@ def export(model_id: str, out_path: Path, opset: int, precision: str) -> None:
         )
         trace_target.unlink(missing_ok=True)
 
-    _verify(model_id, core, out_path, np, torch)
+    _verify(core, out_path, base_revision, np, torch)
 
 
-def _verify(model_id: str, core, out_path: Path, np, torch) -> None:
+def _verify(core, out_path: Path, base_revision: str, np, torch) -> None:
     """Compare ONNX scores against PyTorch get_scores on a real tokenized sample."""
     import onnxruntime as ort
     from transformers import AutoTokenizer
 
-    tok = AutoTokenizer.from_pretrained(BASE_MODEL)
+    tok = AutoTokenizer.from_pretrained(BASE_MODEL, revision=base_revision)
     sample = (
         "The proxy compresses tool outputs before they reach the model. "
         "Errors and stack traces should survive; boilerplate should not. "
@@ -237,6 +270,16 @@ def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--model-id", default=DEFAULT_MODEL_ID)
     ap.add_argument(
+        "--revision",
+        default=None,
+        help="Checkpoint commit SHA. Defaults to the production pin for --model-id.",
+    )
+    ap.add_argument(
+        "--base-revision",
+        default=None,
+        help=f"{BASE_MODEL} commit SHA (encoder + tokenizer). Defaults to the production pin.",
+    )
+    ap.add_argument(
         "--precision",
         choices=["fp32", "int8"],
         default="fp32",
@@ -256,8 +299,12 @@ def main() -> int:
     )
     args = ap.parse_args()
 
+    revision = _pinned_revision(args.model_id, args.revision)
+    base_revision = _pinned_revision(BASE_MODEL, args.base_revision)
+    logger.info("Pins: %s@%s, %s@%s", args.model_id, revision, BASE_MODEL, base_revision)
+
     out_path = args.out or Path(f"onnx/kompress-{args.precision}.onnx")
-    export(args.model_id, out_path, args.opset, args.precision)
+    export(args.model_id, out_path, args.opset, args.precision, revision, base_revision)
     if args.upload:
         upload(args.model_id, out_path)
     return 0

@@ -12,7 +12,7 @@ The short version:
 - Pull requests are gated by PR governance, path-filtered CI, targeted e2e workflows, and human review.
 - Release publishing is not triggered by every merge to `main`. `release-please` maintains a release PR; merging that release PR creates the tag and GitHub Release that trigger publishing.
 - Docker images are built as multi-architecture digests first, then merged into tagged manifests.
-- Docs deploy only after docs changes land on `main`.
+- Docs are deployed by Vercel's own Git integration, not by a GitHub Actions job -- `.github/workflows/docs.yml` ("Validate Docs") only builds the Next.js/Fumadocs app on pull requests touching `docs/**` to catch a broken build before merge; it deploys nothing.
 
 ## PR Flow
 
@@ -115,13 +115,14 @@ flowchart TD
     L --> M[build: sync versions, verify versions, changelog, npm packs]
     M --> N[build-wheels matrix]
     N --> O[collect-dist]
-    O --> P[smoke-import wheels]
-    P --> Q{Smoke import green?}
+    N --> P[smoke-import wheels]
+    O --> Q{Smoke import green?}
+    P --> Q
     Q -- no --> R[Stop before publishing broken wheels]
     Q -- yes --> S[publish PyPI]
-    Q -- yes --> T[publish npm packages]
-    Q -- yes --> U[publish GitHub Package Registry packages]
-    Q -- yes --> V[publish Docker images through docker.yml]
+    M --> T[publish npm packages]
+    M --> U[publish GitHub Package Registry packages]
+    P --> V[publish Docker images through docker.yml]
     S --> W{PyPI published or PYPI_SKIP=true?}
     W -- no --> X[Do not update release assets]
     W -- yes --> Y[Create or update GitHub Release assets and notes]
@@ -169,17 +170,23 @@ flowchart TD
     J -- no --> L[Branch, PR, dev, or manual tags as configured]
 ```
 
-## Docs Deploy Flow
+## Docs Validate + Deploy Flow
+
+`.github/workflows/docs.yml` ("Validate Docs") only validates -- it has no
+deploy step. Deployment of the Next.js/Fumadocs site at
+`docs.headroomlabs.ai` is owned entirely by Vercel's own Git integration,
+outside GitHub Actions (`.github/workflows/docs.yml:1-9`).
 
 ```mermaid
 flowchart TD
-    A[Docs change in PR] --> B[PR review and normal checks]
-    B --> C[Merge to main]
-    C --> D{docs/**, mkdocs.yml, or docs workflow changed?}
-    D -- no --> E[No docs deploy]
-    D -- yes --> F[Deploy Documentation workflow]
-    F --> G[Build docs site]
-    G --> H[Deploy generated site]
+    A[Docs change in PR] --> B{docs/** or docs.yml changed?}
+    B -- no --> C[Validate Docs workflow does not run]
+    B -- yes --> D[Validate Docs workflow: npm ci and npm run build]
+    D --> E{Build green?}
+    E -- no --> F[Fix before merge]
+    E -- yes --> G[PR review and normal checks]
+    G --> H[Merge to main]
+    H --> I[Vercel Git integration builds and deploys, independent of GitHub Actions]
 ```
 
 ## Manual Validation Flow
@@ -220,7 +227,7 @@ act workflow_dispatch -W .github/workflows/release.yml -e .github/act/dry-run.js
 | E2E | CLI, install, wrap, Docker, package paths | Docker init/wrap, native init/wrap/install, platform smoke | Relevant lifecycle checks green |
 | Release dry-run | PRs touching release-critical paths | Version detection, wheel matrix, smoke imports | Publish path can build before merge |
 | Release publish | GitHub Release published by release-please | Version sync, changelog, wheels, smoke import, PyPI gate, npm, GPR, Docker | Public packages and GitHub Release assets are consistent |
-| Docs deploy | Push to `main` with docs paths | Docs build | Site deploy completes |
+| Docs validate | PR touching `docs/**`, manual | Next.js/Fumadocs build | Build succeeds; deploy itself is done by Vercel's Git integration, not this workflow |
 
 ## Workflow Ownership
 
@@ -238,5 +245,5 @@ act workflow_dispatch -W .github/workflows/release.yml -e .github/act/dry-run.js
 | `.github/workflows/release-please.yml` | Release PR aggregation from conventional commits |
 | `.github/workflows/release.yml` | Release build, wheel smoke-import gates, registry publishing, GitHub Release assets |
 | `.github/workflows/docker.yml` | GHCR multi-architecture image builds and manifests |
-| `.github/workflows/docs.yml` | Documentation deploy after docs changes merge |
+| `.github/workflows/docs.yml` | Validates the Next.js/Fumadocs build on docs PRs; deploys nothing -- Vercel's own Git integration owns the actual deploy |
 

@@ -12,18 +12,34 @@ from tests import _mcp_stub as mcp_stub
 def test_build_mcp_sdk_stub_exposes_minimum_sdk_contract() -> None:
     modules = mcp_stub._build_mcp_sdk_stub()
 
-    server = modules["mcp.server"].Server("headroom")
-    assert server.name == "headroom"
+    # MCP 2.x: handlers are constructor callbacks, not decorators.
+    async def on_list_tools(ctx, params=None):  # pragma: no cover - identity only
+        return None
 
-    sentinel = object()
-    assert server.list_tools()(sentinel) is sentinel
-    assert server.call_tool()(sentinel) is sentinel
+    async def on_call_tool(ctx, params):  # pragma: no cover - identity only
+        return None
+
+    server = modules["mcp.server"].Server(
+        "headroom", on_list_tools=on_list_tools, on_call_tool=on_call_tool
+    )
+    assert server.name == "headroom"
+    assert server.handlers == {"on_list_tools": on_list_tools, "on_call_tool": on_call_tool}
     assert server.create_initialization_options() == {}
+
+    # The 1.x decorator surface must be gone: keeping it would let a caller still
+    # on decorators pass its tests while the real 2.x SDK rejects it.
+    assert not hasattr(server, "list_tools")
+    assert not hasattr(server, "call_tool")
 
     tool = modules["mcp.types"].Tool(name="search")
     text = modules["mcp.types"].TextContent(text="payload")
     assert tool.kwargs == {"name": "search"}
     assert text.kwargs == {"text": "payload"}
+
+    tools_result = modules["mcp.types"].ListToolsResult(tools=[tool])
+    call_result = modules["mcp.types"].CallToolResult(content=[text])
+    assert tools_result.tools == [tool]
+    assert call_result.content == [text]
 
     with pytest.raises(RuntimeError, match="should not run"):
         asyncio.run(modules["mcp.server.stdio"].stdio_server())

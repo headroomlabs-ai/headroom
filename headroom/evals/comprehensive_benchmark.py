@@ -46,29 +46,6 @@ DEFAULT_TASKS = [
     "gsm8k",  # Math reasoning - generation-based, works with chat APIs
 ]
 
-# Tier 1 standard benchmarks for the suite runner
-TIER1_TASKS = [
-    "gsm8k",  # Math reasoning
-    "truthfulqa_gen",  # Factual accuracy
-    "mmlu",  # General knowledge (57 subjects)
-    "arc_challenge",  # Science reasoning
-]
-
-# Code tasks (need --confirm_run_unsafe_code)
-TIER1_CODE_TASKS = [
-    "humaneval",  # Code generation (pass@1)
-]
-
-EXTENDED_TASKS = [
-    "mmlu",  # 57 subjects - comprehensive but slow
-    "gsm8k",  # Math - requires multi-step reasoning
-    "arc_challenge",  # Harder science reasoning
-]
-
-TIER3_TASKS = [
-    "hellaswag",  # Commonsense reasoning
-]
-
 
 @dataclass
 class BenchmarkResult:
@@ -248,8 +225,7 @@ def run_lm_eval(
     if base_url:
         args_parts.append(f"base_url={base_url}")
 
-    if args_parts:
-        cmd.extend(["--model_args", ",".join(args_parts)])
+    model_args_value = ",".join(args_parts) if args_parts else None
 
     if num_fewshot is not None:
         cmd.extend(["--num_fewshot", str(num_fewshot)])
@@ -264,7 +240,13 @@ def run_lm_eval(
 
     cmd.extend(["--output_path", output_path])
 
-    logger.info(f"Running: {' '.join(cmd)}")
+    # --model_args can carry an API key, so it is appended after the command is
+    # logged and the log shows it redacted.
+    logger.info(
+        f"Running: {' '.join(cmd)}" + (" --model_args <redacted>" if model_args_value else "")
+    )
+    if model_args_value:
+        cmd.extend(["--model_args", model_args_value])
 
     # Run lm-eval
     start_time = time.time()

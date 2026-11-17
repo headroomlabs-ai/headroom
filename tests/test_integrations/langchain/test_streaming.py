@@ -356,6 +356,15 @@ class TestStreamingMetricsTrackerProperties:
         assert tokens == 2
         mock_provider.get_token_counter.assert_called_with("gpt-4o")
 
+    def test_output_tokens_with_default_provider(self):
+        """With no provider passed, the default provider's real counter is used."""
+        from headroom.integrations.langchain.streaming import StreamingMetricsTracker
+
+        tracker = StreamingMetricsTracker(model="gpt-4o")
+        tracker.add_chunk("Hello world, this is a test message.")
+
+        assert tracker.output_tokens > 0
+
     def test_chunk_count_property(self, mock_provider, sample_chunks):
         """chunk_count property returns number of chunks."""
         from headroom.integrations.langchain.streaming import StreamingMetricsTracker

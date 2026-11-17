@@ -1,0 +1,12 @@
+{
+  "expires": "2026-12-15",
+  "reason": "E2E harness only, never shipped in the wheel or SDK. npm 12.2.2 bundles glob 13.0.6 and minimatch 10.2.5; bundled copies ignore overrides. glob GHSA-3g3m-2fjr-6pw4 and minimatch GHSA-g3hv-75wg-m249 (both 2026-10-30) are fixed only in glob 14.0.2 and minimatch 11.0.1, majors npm 12.2.2 does not bundle. Undici and ip-address are no longer excepted: npm 12.2.2 bundles undici 6.29.1 and ip-address 10.7.5, which clear GHSA-4qv8-2p9j-2685, GHSA-xjj6-f33q-929c, GHSA-2m5v-pch6-74hx, GHSA-qrxm-fqhp-jwvm, GHSA-9fm3-97px-rjf6 and GHSA-rxp7-6hxx-x8q5. OpenClaw is updated to 2026.10.10 and uses fixed Undici 8.12.3 and minimatch 11.0.4, so no OpenClaw path is excepted. Recheck npm upstream and remove these exact-path exceptions by the existing expiry.",
+  "advisories": {
+    "GHSA-3g3m-2fjr-6pw4": {
+      "node_modules/npm/node_modules/glob": "13.0.6"
+    },
+    "GHSA-g3hv-75wg-m249": {
+      "node_modules/npm/node_modules/minimatch": "10.2.5"
+    }
+  }
+}

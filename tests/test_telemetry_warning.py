@@ -8,6 +8,7 @@ Covers:
 - /stats endpoint exposes anon_telemetry_shipping flag
 """
 
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import pytest
@@ -17,6 +18,7 @@ from click.testing import CliRunner  # noqa: E402
 
 from headroom.telemetry.beacon import (  # noqa: E402
     format_telemetry_notice,
+    is_beacon_enabled,
     is_telemetry_warn_enabled,
 )
 
@@ -41,6 +43,53 @@ class TestIsTelemetryWarnEnabled:
     def test_enabled_by_truthy_env_var(self, monkeypatch, value):
         monkeypatch.setenv("HEADROOM_TELEMETRY_WARN", value)
         assert is_telemetry_warn_enabled() is True
+
+
+@pytest.mark.parametrize("value", ["off", "OFF", "false", "0", "no", "disable", "disabled"])
+def test_telemetry_off_turns_the_beacon_off_and_says_so(monkeypatch, value):
+    """``HEADROOM_TELEMETRY=off`` means "send nothing": it used to leave the
+    upload beacon on, and only ``HEADROOM_BEACON=off`` stopped it."""
+    from headroom.cli.main import main
+
+    for var in ("HEADROOM_BEACON", "DO_NOT_TRACK", "HEADROOM_OFFLINE"):
+        monkeypatch.delenv(var, raising=False)
+    monkeypatch.setenv("HEADROOM_TELEMETRY", value)
+
+    assert is_beacon_enabled() is False
+    output = CliRunner().invoke(main, ["telemetry"]).output
+    assert f"Upload beacon:   OFF (HEADROOM_TELEMETRY={value.lower()})" in output
+
+
+def test_buffered_session_is_not_sent_after_telemetry_off(monkeypatch):
+    """A session recorded while the beacon was on must not upload once the
+    operator opts out, at heartbeat/idle close or at exit."""
+    from headroom.telemetry import session as S
+
+    for var in ("HEADROOM_BEACON", "DO_NOT_TRACK", "HEADROOM_OFFLINE"):
+        monkeypatch.delenv(var, raising=False)
+    sent: list[dict] = []
+    monkeypatch.setattr(S, "_post_blocking", lambda payload, **kwargs: sent.append(payload))
+    aggregator = S.SessionAggregator(S.post_session_event, idle_s=900.0, flush_s=100.0)
+    monkeypatch.setattr(S, "_aggregator", aggregator)
+    outcome = SimpleNamespace(provider="openai", model="gpt-5.4", tokens_saved=10, tags={})
+    aggregator.record(outcome, now=1_000.0)
+    monkeypatch.setenv("HEADROOM_TELEMETRY", "off")
+
+    aggregator.record(outcome, now=1_150.0)  # past flush_s: heartbeat
+    aggregator.record(outcome, now=3_000.0)  # past idle_s: idle close
+    S._flush_at_exit()
+
+    assert sent == []
+
+
+def test_beacon_on_overrides_telemetry_off(monkeypatch):
+    """HEADROOM_BEACON is the beacon's own switch and still wins."""
+    for var in ("DO_NOT_TRACK", "HEADROOM_OFFLINE"):
+        monkeypatch.delenv(var, raising=False)
+    monkeypatch.setenv("HEADROOM_TELEMETRY", "off")
+    monkeypatch.setenv("HEADROOM_BEACON", "on")
+
+    assert is_beacon_enabled() is True
 
 
 # ---------------------------------------------------------------------------
@@ -75,7 +124,11 @@ class TestFormatTelemetryNotice:
             monkeypatch.delenv(var, raising=False)
         monkeypatch.delenv("HEADROOM_TELEMETRY_WARN", raising=False)
         notice = format_telemetry_notice()
-        assert "compression stats" in notice
+        # Substance, not the exact phrasing: what is sent (counters), what is
+        # not (prompts), and how to turn it off. The wording widened at schema
+        # v2 — "compression stats" stopped describing a payload that also
+        # carries cache behaviour, session shape and configuration.
+        assert "usage counters" in notice
         assert "HEADROOM_BEACON=off" in notice
 
     def test_beacon_notice_names_what_is_not_sent(self, monkeypatch):
@@ -128,7 +181,19 @@ class TestFormatTelemetryNotice:
 
 
 class TestProxyCLITelemetryBanner:
-    """Proxy CLI startup banner must include telemetry status."""
+    """Proxy CLI startup banner must include telemetry status.
+
+    Every scenario below sets HEADROOM_BEACON=off explicitly, isolating the
+    local-telemetry-only wording (mirrors the convention already used by
+    TestFormatTelemetryNotice, e.g. test_returns_notice_when_telemetry_on).
+    Before the beacon-disclosure fix the banner never looked at the beacon
+    at all, so these tests would have passed unchanged whether the beacon
+    was on or off -- which is exactly the bug: an operator relying on this
+    banner had no way to tell the two apart. The two tests at the bottom of
+    this class (*_beacon_default_on_is_surfaced,
+    *_beacon_off_local_off_says_fully_off) cover the beacon-on-by-default
+    case the old banner never surfaced.
+    """
 
     @pytest.fixture
     def runner(self):
@@ -137,6 +202,7 @@ class TestProxyCLITelemetryBanner:
     def test_banner_shows_telemetry_enabled(self, runner, monkeypatch):
         # Telemetry is opt-in: it only shows ENABLED once explicitly turned on.
         monkeypatch.setenv("HEADROOM_TELEMETRY", "on")
+        monkeypatch.setenv("HEADROOM_BEACON", "off")
 
         from headroom.cli.main import main
 
@@ -147,9 +213,12 @@ class TestProxyCLITelemetryBanner:
         assert "ENABLED" in result.output
 
     def test_banner_disabled_by_default(self, runner, monkeypatch):
-        # The whole point of opt-in: unset env => telemetry off, banner says so
-        # and surfaces how to opt in.
+        # The whole point of opt-in: unset env => local telemetry off, banner
+        # says so and surfaces how to opt in. (Beacon pinned off here so this
+        # isolates the local-only wording; see the beacon-specific tests
+        # below for the on-by-default beacon case.)
         monkeypatch.delenv("HEADROOM_TELEMETRY", raising=False)
+        monkeypatch.setenv("HEADROOM_BEACON", "off")
 
         from headroom.cli.main import main
 
@@ -157,11 +226,12 @@ class TestProxyCLITelemetryBanner:
             result = runner.invoke(main, ["proxy"])
 
         assert "Telemetry:" in result.output
-        assert "DISABLED" in result.output
-        assert "HEADROOM_TELEMETRY=on" in result.output or "--telemetry" in result.output
+        assert "OFF" in result.output
+        assert "HEADROOM_TELEMETRY=on" in result.output
 
     def test_telemetry_flag_opts_in(self, runner, monkeypatch):
         monkeypatch.delenv("HEADROOM_TELEMETRY", raising=False)
+        monkeypatch.setenv("HEADROOM_BEACON", "off")
 
         from headroom.cli.main import main
 
@@ -173,6 +243,7 @@ class TestProxyCLITelemetryBanner:
 
     def test_banner_shows_telemetry_disabled(self, runner, monkeypatch):
         monkeypatch.setenv("HEADROOM_TELEMETRY", "off")
+        monkeypatch.setenv("HEADROOM_BEACON", "off")
 
         from headroom.cli.main import main
 
@@ -180,10 +251,11 @@ class TestProxyCLITelemetryBanner:
             result = runner.invoke(main, ["proxy"])
 
         assert "Telemetry:" in result.output
-        assert "DISABLED" in result.output
+        assert "OFF" in result.output
 
     def test_no_telemetry_flag_disables(self, runner, monkeypatch):
         monkeypatch.delenv("HEADROOM_TELEMETRY", raising=False)
+        monkeypatch.setenv("HEADROOM_BEACON", "off")
 
         from headroom.cli.main import main
 
@@ -191,10 +263,11 @@ class TestProxyCLITelemetryBanner:
             result = runner.invoke(main, ["proxy", "--no-telemetry"])
 
         assert "Telemetry:" in result.output
-        assert "DISABLED" in result.output
+        assert "OFF" in result.output
 
     def test_banner_shows_opt_out_instructions_when_enabled(self, runner, monkeypatch):
         monkeypatch.setenv("HEADROOM_TELEMETRY", "on")
+        monkeypatch.setenv("HEADROOM_BEACON", "off")
 
         from headroom.cli.main import main
 
@@ -202,6 +275,40 @@ class TestProxyCLITelemetryBanner:
             result = runner.invoke(main, ["proxy"])
 
         assert "HEADROOM_TELEMETRY=off" in result.output or "--no-telemetry" in result.output
+
+    def test_banner_beacon_default_on_is_surfaced(self, runner, monkeypatch):
+        """With no switch set the banner discloses the opt-out beacon rather than
+        printing a bare "Telemetry: DISABLED" for the local-stats switch alone."""
+        for var in ("HEADROOM_TELEMETRY", "HEADROOM_BEACON", "DO_NOT_TRACK"):
+            monkeypatch.delenv(var, raising=False)
+
+        from headroom.cli.main import main
+
+        with patch("headroom.proxy.server.run_server", side_effect=SystemExit(0)):
+            result = runner.invoke(main, ["proxy"])
+
+        assert "Telemetry:" in result.output
+        assert "usage counters" in result.output
+        assert "HEADROOM_BEACON=off" in result.output
+        telemetry_line = next(
+            line for line in result.output.splitlines() if line.strip().startswith("Telemetry:")
+        )
+        assert "DISABLED" not in telemetry_line
+
+    def test_banner_beacon_off_and_local_off_says_fully_off(self, runner, monkeypatch):
+        """Only when BOTH switches are off does the banner claim nothing is
+        happening -- the one case where a bare OFF claim is actually true."""
+        monkeypatch.setenv("HEADROOM_TELEMETRY", "off")
+        monkeypatch.setenv("HEADROOM_BEACON", "off")
+
+        from headroom.cli.main import main
+
+        with patch("headroom.proxy.server.run_server", side_effect=SystemExit(0)):
+            result = runner.invoke(main, ["proxy"])
+
+        assert "Telemetry:" in result.output
+        assert "OFF" in result.output
+        assert "compression stats" not in result.output
 
 
 # ---------------------------------------------------------------------------
@@ -233,7 +340,7 @@ class TestWrapCLITelemetryNotice:
 
         _print_telemetry_notice()
         captured = capsys.readouterr()
-        assert "compression stats" in captured.out
+        assert "usage counters" in captured.out
         assert "HEADROOM_BEACON=off" in captured.out
 
     def test_print_notice_silent_when_telemetry_off(self, monkeypatch, capsys):
@@ -264,14 +371,53 @@ class TestWrapCLITelemetryNotice:
 
 @pytest.mark.asyncio
 class TestStatsEndpointTelemetryFlag:
-    """The /stats endpoint must expose anon_telemetry_shipping."""
+    """The /stats endpoint's anon_telemetry_shipping field must reflect the
+    live HEADROOM_BEACON state, not a hardcoded constant.
+
+    Previously this field was hardcoded to False on the premise that "the
+    anonymous telemetry beacon was removed" -- it was not (telemetry/beacon.py
+    and telemetry/session.py fully implement and wire it via
+    record_outcome() -> SessionAggregator -> a POST to
+    headroom-beacon.headroom-beacon.workers.dev, gated on is_beacon_enabled(),
+    which is ON BY DEFAULT). An operator polling /stats to confirm nothing
+    ships externally got a false assurance regardless of their actual
+    HEADROOM_BEACON setting. These two tests previously asserted `False`
+    unconditionally, encoding the same incorrect premise as the field they
+    were testing.
+    """
 
     pytest.importorskip("fastapi")
 
-    async def test_stats_anon_telemetry_shipping_always_false(self, monkeypatch):
-        # The anonymous telemetry beacon was removed, so nothing is ever shipped
-        # externally — even with telemetry explicitly enabled.
+    async def test_stats_anon_telemetry_shipping_reflects_beacon_on(self, monkeypatch):
+        # HEADROOM_BEACON is on by default (BEACON_DEFAULT_ON = True) and
+        # HEADROOM_TELEMETRY does not touch it -- setting local telemetry on
+        # must not by itself make this field misreport False.
         monkeypatch.setenv("HEADROOM_TELEMETRY", "on")
+        monkeypatch.delenv("HEADROOM_BEACON", raising=False)
+        monkeypatch.delenv("DO_NOT_TRACK", raising=False)
+        from headroom.proxy.server import ProxyConfig, create_app
+
+        app = create_app(
+            ProxyConfig(
+                cache_enabled=False,
+                rate_limit_enabled=False,
+                cost_tracking_enabled=False,
+            )
+        )
+
+        from httpx import ASGITransport, AsyncClient
+
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+            resp = await client.get("/stats")
+
+        assert resp.status_code == 200
+        data = resp.json()
+        assert "anon_telemetry_shipping" in data
+        assert data["anon_telemetry_shipping"] is True
+
+    async def test_stats_anon_telemetry_shipping_false_when_beacon_off(self, monkeypatch):
+        monkeypatch.setenv("HEADROOM_TELEMETRY", "off")
+        monkeypatch.setenv("HEADROOM_BEACON", "off")
         from headroom.proxy.server import ProxyConfig, create_app
 
         app = create_app(
@@ -292,8 +438,10 @@ class TestStatsEndpointTelemetryFlag:
         assert "anon_telemetry_shipping" in data
         assert data["anon_telemetry_shipping"] is False
 
-    async def test_stats_includes_anon_telemetry_shipping_false(self, monkeypatch):
-        monkeypatch.setenv("HEADROOM_TELEMETRY", "off")
+    async def test_stats_anon_telemetry_shipping_false_when_do_not_track(self, monkeypatch):
+        # DO_NOT_TRACK silences the beacon regardless of HEADROOM_BEACON.
+        monkeypatch.setenv("DO_NOT_TRACK", "1")
+        monkeypatch.delenv("HEADROOM_BEACON", raising=False)
         from headroom.proxy.server import ProxyConfig, create_app
 
         app = create_app(
@@ -311,7 +459,6 @@ class TestStatsEndpointTelemetryFlag:
 
         assert resp.status_code == 200
         data = resp.json()
-        assert "anon_telemetry_shipping" in data
         assert data["anon_telemetry_shipping"] is False
 
 

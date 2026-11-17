@@ -11,8 +11,9 @@ just makes each call cheaper.
 
 ## What you get
 
-- **Fewer input tokens** on every Claude Code request to Azure AI Foundry (often
-  30–60% on agent workloads), so you pay for less.
+- **Fewer input tokens** on every Claude Code request to Azure AI Foundry —
+  large file reads, logs, and tool output are compressed before forwarding —
+  so you pay for less.
 - **Same answers** — compression is reversible and content-aware.
 - **No new secrets** — Headroom never holds your Azure credentials. Claude Code
   keeps authenticating to Azure AI Foundry with its own `api-key` or Entra Bearer
@@ -35,7 +36,7 @@ No `ANTHROPIC_API_KEY` is needed — Foundry mode uses your Azure credentials.
 ## Run it (one command)
 
 ```bash
-pip install headroom-ai
+pip install "headroom-ai[proxy]"
 headroom wrap claude
 ```
 

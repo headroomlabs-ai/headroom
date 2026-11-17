@@ -22,20 +22,17 @@ def consume_from_bucket(
     requested_tokens: float,
     rate_per_minute: float,
 ) -> tuple[bool, float, float]:
-    """Return ``(allowed, remaining_tokens, wait_seconds)`` for a token request."""
-    if available_tokens >= requested_tokens:
+    """Return ``(allowed, remaining_tokens, wait_seconds)`` for a token request.
+
+    The bucket never holds more than ``rate_per_minute``, so a request larger
+    than that could never be admitted and its ``wait_seconds`` would never come
+    true. Such a request waits for a full bucket instead, then is charged in
+    full: the balance goes negative and later requests wait it off, so the
+    configured average rate still holds.
+    """
+    required = min(requested_tokens, rate_per_minute)
+    if available_tokens >= required:
         return True, available_tokens - requested_tokens, 0.0
 
-    wait_seconds = (requested_tokens - available_tokens) * (60.0 / rate_per_minute)
+    wait_seconds = (required - available_tokens) * (60.0 / rate_per_minute)
     return False, available_tokens, wait_seconds
-
-
-def stale_bucket_keys(
-    last_updates: dict[str, float],
-    *,
-    now: float,
-    stale_after_seconds: float,
-) -> list[str]:
-    """Return bucket keys whose last update is older than the stale threshold."""
-    stale_before = now - stale_after_seconds
-    return [key for key, last_update in last_updates.items() if last_update < stale_before]

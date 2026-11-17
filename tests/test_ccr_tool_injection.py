@@ -98,6 +98,32 @@ class TestCCRToolInjector:
         assert ccr_hash in hashes
         assert injector.has_compressed_content
 
+    def test_scan_detects_code_compressor_marker(self):
+        """CodeCompressor emits `[N tokens compressed. ... Retrieve more:
+        hash=xxx. Expires in Nm.]` — it says 'tokens compressed' (not
+        'compressed to M') and puts '. Expires in Nm.' between the hash and the
+        closing ']'. The bracket patterns anchor the hash on a trailing ']', so
+        they all miss it and the retrieve tool is never offered for
+        code-compressed content — the same silent-data-loss failure as #1006.
+        The 'Retrieve more: hash=' phrase must be detected directly."""
+        ccr_hash = "abc123def456abc123def456"  # 24 hex chars (SHA-256[:24])
+        messages = [
+            {
+                "role": "tool",
+                "content": (
+                    "def process(items):\n    ...\n"
+                    "# [128 tokens compressed. 3 function bodies elided. "
+                    f"Retrieve more: hash={ccr_hash}. Expires in 30m.]"
+                ),
+            },
+        ]
+
+        injector = CCRToolInjector()
+        hashes = injector.scan_for_markers(messages)
+
+        assert ccr_hash in hashes
+        assert injector.has_compressed_content
+
     def test_scan_for_markers_multiple_hashes(self):
         """Scanner finds multiple distinct hashes."""
         messages = [

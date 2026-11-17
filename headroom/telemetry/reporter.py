@@ -29,6 +29,7 @@ from typing import TYPE_CHECKING, Any
 
 import httpx
 
+from headroom import fileperms as _fileperms
 from headroom import paths as _paths
 
 if TYPE_CHECKING:
@@ -117,6 +118,7 @@ class UsageReporter:
         self._last_tokens_saved_by_model: dict[str, int] = {}
         self._last_tokens_sent_by_model: dict[str, int] = {}
         self._last_requests_by_model: dict[str, int] = {}
+        self._last_provider_counters: dict[str, dict[str, int]] = {}
 
     async def validate_license(self) -> LicenseInfo:
         """Validate the license key against the cloud API.
@@ -300,6 +302,13 @@ class UsageReporter:
             self._last_report_time = now
             return
 
+        # Provenance of tokens_after: how much of it is the provider's own
+        # billed count versus Headroom's tokenizer estimate, plus the billed
+        # cache split. Lets the cloud side show a number that reconciles with
+        # the provider's console (input + cache read + cache write) and flag
+        # any remainder as an estimate instead of passing it off as the bill.
+        provider_deltas = self._provider_counter_deltas(cost_tracker)
+
         payload = {
             "license_key": self._license_key,
             "period_start": period_start.isoformat(),
@@ -309,6 +318,18 @@ class UsageReporter:
             "tokens_after": total_tokens_after,
             "tokens_saved": total_tokens_saved,
             "models": delta_reqs_by_model,
+            "tokens_after_provider_reported": provider_deltas["tokens_after_provider_reported"],
+            "tokens_after_estimated": max(
+                0, total_tokens_after - provider_deltas["tokens_after_provider_reported"]
+            ),
+            "requests_provider_reported": provider_deltas["requests_provider_reported"],
+            "cache_read_tokens": provider_deltas["cache_read_tokens"],
+            "cache_write_tokens": provider_deltas["cache_write_tokens"],
+            "uncached_input_tokens": provider_deltas["uncached_input_tokens"],
+            # Units, stated so no consumer has to guess: tokens_after is billed
+            # input where provider-reported; tokens_saved is Headroom's local
+            # tokenizer count of what compression removed.
+            "tokens_saved_basis": "headroom_tokenizer",
         }
 
         try:
@@ -347,6 +368,31 @@ class UsageReporter:
         except Exception:
             logger.warning("Failed to send usage report", exc_info=True)
 
+    _PROVIDER_COUNTERS = {
+        "tokens_after_provider_reported": "_provider_tokens_sent_by_model",
+        "requests_provider_reported": "_provider_requests_by_model",
+        "cache_read_tokens": "_api_cache_read_by_model",
+        "cache_write_tokens": "_api_cache_write_by_model",
+        "uncached_input_tokens": "_api_uncached_by_model",
+    }
+
+    def _current_provider_counters(self, cost_tracker: Any) -> dict[str, dict[str, int]]:
+        return {
+            name: dict(getattr(cost_tracker, attr, {}) or {})
+            for name, attr in self._PROVIDER_COUNTERS.items()
+        }
+
+    def _provider_counter_deltas(self, cost_tracker: Any) -> dict[str, int]:
+        """Totals of the provenance counters since the last successful report."""
+        current = self._current_provider_counters(cost_tracker)
+        deltas: dict[str, int] = {}
+        for name, by_model in current.items():
+            last = getattr(self, "_last_provider_counters", {}).get(name, {})
+            deltas[name] = sum(
+                max(0, int(value) - int(last.get(model, 0))) for model, value in by_model.items()
+            )
+        return deltas
+
     def _snapshot_metrics(self) -> None:
         """Take a snapshot of current proxy metrics for delta computation."""
         if self._proxy is None or self._proxy.cost_tracker is None:
@@ -355,17 +401,23 @@ class UsageReporter:
         self._last_tokens_saved_by_model = dict(ct._tokens_saved_by_model)
         self._last_tokens_sent_by_model = dict(ct._tokens_sent_by_model)
         self._last_requests_by_model = dict(ct._requests_by_model)
+        self._last_provider_counters = self._current_provider_counters(ct)
         self._last_report_time = datetime.now(timezone.utc)
 
     def _save_cache(self) -> None:
-        """Save license info to local cache file."""
+        """Save license info to local cache file (skipped in stateless mode)."""
         if self._license_info is None:
+            return
+        if not _paths.persistence_allowed("licence validation cache"):
             return
         try:
             self._cache_path.parent.mkdir(parents=True, exist_ok=True)
-            self._cache_path.write_text(
-                json.dumps(self._license_info.to_dict(), indent=2), encoding="utf-8"
-            )
+            # Owner-only: the envelope names the org and plan.
+            # newline pinned: state files are LF on every platform (#3698).
+            with _fileperms.open_owner_only(
+                self._cache_path, "w", encoding="utf-8", newline="\n"
+            ) as fh:
+                fh.write(json.dumps(self._license_info.to_dict(), indent=2))
         except OSError:
             logger.warning("Could not save license cache to %s", self._cache_path)
 

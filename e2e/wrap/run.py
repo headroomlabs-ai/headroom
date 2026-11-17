@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import secrets
 import shutil
 import signal
 import stat
@@ -172,6 +173,24 @@ class MockOpenAIHandler(BaseHTTPRequestHandler):
                         "completion_tokens": 5,
                         "total_tokens": 17,
                     },
+                },
+            )
+            return
+        if self.path in {"/responses", "/v1/responses"}:
+            self._write_json(
+                200,
+                {
+                    "id": "resp-e2e",
+                    "object": "response",
+                    "model": payload.get("model"),
+                    "output": [
+                        {
+                            "type": "message",
+                            "role": "assistant",
+                            "content": [{"type": "output_text", "text": "mock response"}],
+                        }
+                    ],
+                    "usage": {"input_tokens": 4, "output_tokens": 2, "total_tokens": 6},
                 },
             )
             return
@@ -476,7 +495,9 @@ def wait_for_command_success(
 def start_openclaw_gateway(env: dict[str, str], cwd: Path) -> subprocess.Popen[str]:
     log("Starting OpenClaw gateway for e2e verification")
     return subprocess.Popen(
-        ["openclaw", "gateway"],
+        # Container defaults now bind to all interfaces; this isolated harness
+        # only needs local clients and must not expose an unauthenticated port.
+        ["openclaw", "gateway", "--bind", "loopback"],
         env=env,
         cwd=str(cwd),
         stdout=subprocess.PIPE,
@@ -487,17 +508,15 @@ def start_openclaw_gateway(env: dict[str, str], cwd: Path) -> subprocess.Popen[s
     )
 
 
-def stop_openclaw_gateway(env: dict[str, str], cwd: Path) -> None:
-    log("Stopping OpenClaw gateway after e2e verification")
-    run(["openclaw", "gateway", "stop"], env=env, cwd=cwd, timeout=60)
-
-
 def verify_installs() -> None:
     log("Verifying installed packages and binaries")
     for tool in ("headroom", "codex", "aider", "openclaw"):
         assert_true(shutil.which(tool) is not None, f"Expected '{tool}' on PATH")
     run(["headroom", "--help"], timeout=30)
-    run(["npm", "list", "-g", "--depth=0", "@openai/codex", "openclaw"], timeout=60)
+    run(
+        ["npm", "list", "--prefix", "/opt/wrap-tools", "--depth=0", "@openai/codex", "openclaw"],
+        timeout=60,
+    )
     run(["/opt/aider-venv/bin/python", "-m", "pip", "show", "aider-chat"], timeout=60)
 
 
@@ -741,7 +760,9 @@ def verify_cursor_wrap(base_env: dict[str, str], project_dir: Path) -> None:
         stop_process(proc)
 
 
-def verify_vscode_wrap(base_env: dict[str, str], project_dir: Path) -> None:
+def verify_vscode_wrap(
+    base_env: dict[str, str], project_dir: Path, mock_server: MockOpenAIServer
+) -> None:
     """Exercise the Linux settings lifecycle without real Copilot credentials."""
     port = VSCODE_PORT
     settings_path = Path(base_env["HOME"]) / ".config" / "Code" / "User" / "settings.json"
@@ -813,6 +834,31 @@ def verify_vscode_wrap(base_env: dict[str, str], project_dir: Path) -> None:
             health.get("config", {}).get("openai_api_url")
             == f"http://127.0.0.1:{MOCK_UPSTREAM_PORT}/v1",
             "VS Code proxy should use the mocked Copilot upstream",
+        )
+        models = ["gpt-model-swap-a", "gpt-model-swap-b", "gpt-model-swap-a"]
+        start = len(mock_server.requests)
+        for model in models:
+            response = httpx.post(
+                f"http://127.0.0.1:{port}{project_prefix}/v1/responses",
+                json={"model": model, "input": "model swap probe", "stream": False},
+                timeout=10.0,
+            )
+            assert_true(
+                response.status_code == 200,
+                f"VS Code route failed for {model}: {response.status_code} {response.text}",
+            )
+            assert_true(
+                response.json().get("model") == model,
+                f"VS Code response did not reflect selected model {model}",
+            )
+        forwarded = [
+            item["body"].get("model")
+            for item in mock_server.requests[start:]
+            if item["path"].endswith("/responses") and isinstance(item["body"], dict)
+        ]
+        assert_true(
+            forwarded == models,
+            f"VS Code outbound model sequence changed: {forwarded!r}",
         )
     finally:
         stop_process(proc)
@@ -942,6 +988,9 @@ def verify_openclaw_wrap(
     project_dir: Path,
     plugin_dir: Path,
 ) -> None:
+    # Both gateway startup and health checks require credentials in current
+    # OpenClaw. Keep a per-run token in the child environment, out of argv/logs.
+    base_env = {**base_env, "OPENCLAW_GATEWAY_TOKEN": secrets.token_hex(32)}
     port = OPENCLAW_PROXY_PORT
     gateway_proc: subprocess.Popen[str] | None = None
     run(
@@ -956,6 +1005,9 @@ def verify_openclaw_wrap(
             "--startup-timeout-ms",
             # 5s is too tight for cold Python+pyo3 import on a busy CI runner.
             "30000",
+            # This harness owns a foreground gateway under an isolated HOME.
+            # OpenClaw refuses OS service management for noncanonical homes.
+            "--no-restart",
             "--verbose",
         ],
         env=base_env,
@@ -1002,6 +1054,7 @@ def verify_openclaw_wrap(
                     ["openclaw", "health"], env=base_env, cwd=project_dir, timeout=30
                 )
             except RuntimeError as exc:
+                stop_process(gateway_proc)
                 gateway_output = ""
                 if gateway_proc.stdout is not None:
                     gateway_output = gateway_proc.stdout.read()
@@ -1025,9 +1078,13 @@ def verify_openclaw_wrap(
     finally:
         if gateway_proc is not None:
             stop_process(gateway_proc)
-        stop_openclaw_gateway(base_env, project_dir)
 
-    run(["headroom", "unwrap", "openclaw"], env=base_env, cwd=project_dir, timeout=120)
+    run(
+        ["headroom", "unwrap", "openclaw", "--no-restart"],
+        env=base_env,
+        cwd=project_dir,
+        timeout=120,
+    )
     state = json.loads(config_path.read_text(encoding="utf-8"))
     assert_true(
         state["plugins"]["slots"]["contextEngine"] == "legacy",
@@ -1067,7 +1124,7 @@ def main() -> None:
             verify_codex_wrap(base_env, project_dir, log_dir, mock_server)
             verify_aider_wrap(base_env, project_dir, log_dir)
             verify_cursor_wrap(base_env, project_dir)
-            verify_vscode_wrap(base_env, project_dir)
+            verify_vscode_wrap(base_env, project_dir, mock_server)
             verify_vscode_claude_wrap(base_env, project_dir)
             verify_cline_wrap(base_env, project_dir)
             verify_continue_wrap(base_env, project_dir)

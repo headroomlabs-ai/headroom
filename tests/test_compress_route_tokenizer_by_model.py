@@ -121,7 +121,7 @@ def test_openai_shape_still_counted_for_every_model_family(client, model):
     assert body["tokens_saved"] > 0, f"{model} reported no savings: {body}"
 
 
-@pytest.mark.parametrize("mode", [None, "ccr", "lossy_inline", "lossless_then_lossy"])
+@pytest.mark.parametrize("mode", [None, "ccr", "lossy_inline", "lossless_then_lossy", "lossless"])
 def test_every_mode_counts_anthropic_shape(client, mode):
     """mode="ccr" used to share the request pipeline, which pinned the OpenAI counter."""
     payload: dict = {"messages": _anthropic_messages(), "model": "claude-sonnet-4-6"}

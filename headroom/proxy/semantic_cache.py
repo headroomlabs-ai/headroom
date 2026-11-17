@@ -8,6 +8,7 @@ Extracted from server.py for maintainability.
 from __future__ import annotations
 
 import asyncio
+import json
 import sys
 from collections import OrderedDict
 from datetime import datetime
@@ -20,6 +21,31 @@ from headroom.proxy.models import CacheEntry
 from headroom.proxy.semantic_cache_key_policy import compute_semantic_cache_key, strip_cache_control
 
 _strip_cache_control = strip_cache_control
+
+
+def _is_cacheable_reply(response_body: bytes) -> bool:
+    """Whether a 200 body is a reply the cache may replay.
+
+    The status code alone does not say so: an Anthropic- or OpenAI-compatible
+    gateway can answer 200 with an error object, or with nothing. Stored, that
+    body is replayed to every matching request for the full TTL and the
+    upstream is never asked again. Refuse an empty body, and JSON that is not a
+    non-empty object or that carries an error (Anthropic ``"type": "error"``,
+    OpenAI ``"error": {...}``). Bytes that are not JSON pass: the cache is
+    format-agnostic, and both handlers only store a reply they have decoded.
+    """
+    if not response_body:
+        return False
+    try:
+        reply = json.loads(response_body)
+    except ValueError:
+        return True
+    return (
+        isinstance(reply, dict)
+        and bool(reply)
+        and reply.get("type") != "error"
+        and reply.get("error") is None
+    )
 
 
 class SemanticCache:
@@ -35,7 +61,9 @@ class SemanticCache:
         self._cache: OrderedDict[str, CacheEntry] = OrderedDict()
         self._lock = asyncio.Lock()
 
-    def _compute_key(self, messages: list[dict], model: str, **key_fields: Any) -> str:
+    def _compute_key(
+        self, messages: list[dict], model: str, *, partition: str, **key_fields: Any
+    ) -> str:
         """Compute cache key from messages, model, and response-shaping fields.
 
         ``key_fields`` carries every request field that changes generation,
@@ -49,12 +77,19 @@ class SemanticCache:
         on ``system``/``tools`` does not fragment the key (scalars pass through
         untouched). Absent fields don't contribute, so truly-identical requests
         still hit.
-        """
-        return compute_semantic_cache_key(messages, model, **key_fields)
 
-    async def get(self, messages: list[dict], model: str, **key_fields: Any) -> CacheEntry | None:
+        ``partition`` is the caller's cache partition
+        (:func:`headroom.proxy.semantic_cache_key_policy.compute_request_cache_partition`)
+        and is required: on a shared proxy, a response is only ever replayed to a
+        caller presenting the same provider credentials and principal.
+        """
+        return compute_semantic_cache_key(messages, model, partition=partition, **key_fields)
+
+    async def get(
+        self, messages: list[dict], model: str, *, partition: str, **key_fields: Any
+    ) -> CacheEntry | None:
         """Get cached response if exists and not expired."""
-        key = self._compute_key(messages, model, **key_fields)
+        key = self._compute_key(messages, model, partition=partition, **key_fields)
         async with self._lock:
             entry = self._cache.get(key)
 
@@ -79,10 +114,15 @@ class SemanticCache:
         response_body: bytes,
         response_headers: dict[str, str],
         tokens_saved: int = 0,
+        *,
+        partition: str,
         **key_fields: Any,
     ):
         """Cache a response."""
-        key = self._compute_key(messages, model, **key_fields)
+        key = self._compute_key(messages, model, partition=partition, **key_fields)
+
+        if not _is_cacheable_reply(response_body):
+            return
 
         async with self._lock:
             # If key already exists, remove it first to update position
