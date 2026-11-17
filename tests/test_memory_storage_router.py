@@ -181,6 +181,65 @@ def test_resolver_ignores_incidental_cwd_prose() -> None:
     )
 
 
+@pytest.mark.parametrize(
+    ("cwd", "prompt"),
+    [
+        ("/Users/foo/code/pi", "<cwd>\n/Users/foo/code/pi\n</cwd>"),
+        ("/work/pi", "Before\n<cwd>/work/pi</cwd>\nAfter"),
+        ("/work/acme%2Fapi", "<cwd>\r\n/work/acme%2Fapi\r\n</cwd>"),
+        ("/work/cwd:repo", "<cwd>\n/work/cwd:repo\n</cwd>"),
+    ],
+)
+def test_resolver_pi_cwd_uses_the_same_project_as_explicit_header(cwd: str, prompt: str) -> None:
+    from urllib.parse import quote
+
+    resolver = ProjectResolver()
+    expected = resolver.resolve(_ctx(headers={"x-headroom-cwd": quote(cwd, safe="/")}))
+    assert resolver.resolve(_ctx(system_prompt=prompt)) == expected
+
+
+def test_pi_system_cwd_wins_over_user_cwd_fallback() -> None:
+    body = {
+        "system": "<cwd>\n/trusted/project\n</cwd>",
+        "messages": [{"role": "user", "content": "cwd: /different/project"}],
+    }
+    resolver = ProjectResolver()
+    expected = resolver.resolve(_ctx(headers={"x-headroom-cwd": "/trusted/project"}))
+    assert resolver.resolve(_ctx(system_prompt=extract_system_prompt(body))) == expected
+
+
+@pytest.mark.parametrize(
+    "content",
+    [
+        "<cwd>\n/untrusted/project\n</cwd>",
+        "cwd:\n<cwd>/untrusted/project</cwd>",
+        "<cwd>\n/untrusted/cwd:\n</cwd>",
+    ],
+)
+def test_pi_cwd_in_ordinary_user_content_does_not_resolve_a_project(content: str) -> None:
+    body = {"system": "You are helpful.", "messages": [{"role": "user", "content": content}]}
+    assert ProjectResolver().resolve(_ctx(system_prompt=extract_system_prompt(body))) is None
+
+
+@pytest.mark.parametrize(
+    "content",
+    [
+        "cwd: /legacy/project\n<cwd>/untrusted/project</cwd>",
+        "<cwd>/untrusted/project</cwd>\ncwd: /legacy/project",
+    ],
+)
+def test_pi_tags_do_not_override_legacy_user_cwd(content: str) -> None:
+    body = {"system": "You are helpful.", "messages": [{"role": "user", "content": content}]}
+    resolver = ProjectResolver()
+    expected = resolver.resolve(_ctx(headers={"x-headroom-cwd": "/legacy/project"}))
+    assert resolver.resolve(_ctx(system_prompt=extract_system_prompt(body))) == expected
+
+
+@pytest.mark.parametrize("prompt", ["<cwd>/work/pi", "<cwd>\n  \n</cwd>"])
+def test_incomplete_or_empty_pi_cwd_does_not_resolve_a_project(prompt: str) -> None:
+    assert ProjectResolver().resolve(_ctx(system_prompt=prompt)) is None
+
+
 def test_resolver_returns_none_when_nothing_resolves() -> None:
     r = ProjectResolver()
     out = r.resolve(_ctx(system_prompt="A generic system prompt with no env block."))
