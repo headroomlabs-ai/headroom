@@ -574,3 +574,20 @@ async def test_direct_write_then_mem0_search_round_trip(tmp_path) -> None:
     native_hit = next(r for r in native if r.memory.content == "native mem0 fact")
     assert native_hit.memory.metadata == {}
     assert native_hit.memory.user_id == user_id
+
+
+@pytest.mark.asyncio
+async def test_update_and_delete_leave_another_users_memory_alone() -> None:
+    adapter = _adapter()
+    adapter._ensure_initialized = AsyncMock()  # type: ignore[method-assign]
+    adapter._mem0_client = MagicMock()
+    adapter._mem0_client.get.return_value = {"id": "m1", "memory": "x", "user_id": "alice"}
+
+    assert await adapter.delete_memory("m1", user_id="bob") is False
+    with pytest.raises(ValueError, match="not found"):
+        await adapter.update_memory("m1", "overwritten", user_id="bob")
+    adapter._mem0_client.delete.assert_not_called()
+    adapter._mem0_client.update.assert_not_called()
+
+    assert await adapter.delete_memory("m1", user_id="alice") is True
+    adapter._mem0_client.delete.assert_called_once_with(memory_id="m1")
