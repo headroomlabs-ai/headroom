@@ -223,7 +223,7 @@ class _RetryThenSuccessClient:
     def __init__(self) -> None:
         self.attempts = 0
 
-    async def post(self, url, content, headers, timeout=None):  # noqa: ANN001, ANN201
+    async def post(self, url, content, headers, timeout=None, extensions=None):  # noqa: ANN001, ANN201
         self.attempts += 1
         if self.attempts == 1:
             raise httpx.ConnectTimeout("connect timed out")

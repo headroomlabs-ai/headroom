@@ -132,8 +132,9 @@ impl AppState {
         // PR-D4: lazy ADC token source. Provider resolution is
         // deferred to first `bearer()` call so proxy startup stays
         // cheap when no Vertex route is exercised.
-        let vertex_token_source: Arc<dyn crate::vertex::TokenSource> =
-            Arc::new(crate::vertex::adc::GcpAdcTokenSource::new());
+        let vertex_token_source: Arc<dyn crate::vertex::TokenSource> = Arc::new(
+            crate::vertex::adc::GcpAdcTokenSource::with_scope(config.vertex_adc_scope.clone()),
+        );
 
         let stats = if config.stats {
             match config.stats_path.clone() {
@@ -281,7 +282,13 @@ pub fn build_app(state: AppState) -> Router {
             "/v1/responses",
             post(crate::handlers::responses::handle_responses)
                 .layer(DefaultBodyLimit::max(state.config.max_body_bytes as usize)),
-        )
+        );
+
+    // Mounted only with `--enable-vertex-native`: the handler replaces
+    // the caller's Authorization with this host's ADC bearer. When off,
+    // Vertex paths reach the catch-all with the caller's own headers.
+    if state.config.enable_vertex_native {
+        router = router
         // PR-D4: native Vertex publisher path. The Vertex AI Anthropic
         // publisher endpoints look like
         // `POST /v1beta1/projects/{p}/locations/{l}/publishers/anthropic/models/{m}:rawPredict`
@@ -296,6 +303,7 @@ pub fn build_app(state: AppState) -> Router {
             "/v1beta1/projects/{project}/locations/{location}/publishers/anthropic/models/{model_action}",
             post(crate::vertex::handle_vertex_predict_dispatch),
         );
+    }
 
     // PR-D3: Prometheus scrape endpoint. Renders the global registry in
     // text format. The handler is stateless — no `AppState` needed — and
@@ -319,7 +327,7 @@ pub fn build_app(state: AppState) -> Router {
     router = router.merge(metrics_router);
 
     // PR-D1: native AWS Bedrock InvokeModel route. Mounts only when
-    // `enable_bedrock_native` is on (default). The handler runs the
+    // `enable_bedrock_native` is on (off by default). The handler runs the
     // live-zone compressor over Anthropic-shape bodies, signs with
     // SigV4, and forwards to the configured Bedrock endpoint. The
     // `/converse` route mounts the same handler — the wire shape is
@@ -377,11 +385,11 @@ pub fn build_app(state: AppState) -> Router {
             );
         }
     } else {
-        tracing::warn!(
+        tracing::info!(
             event = "bedrock_native_disabled",
-            "Bedrock native InvokeModel route disabled by \
-             --enable-bedrock-native=false; Bedrock requests will fall \
-             through to the catch-all (no SigV4 re-signing — fails closed)"
+            "Bedrock native InvokeModel route not mounted \
+             (--enable-bedrock-native=false, the default); Bedrock requests \
+             fall through to the catch-all (no SigV4 re-signing)"
         );
     }
 
@@ -425,7 +433,17 @@ pub fn build_app(state: AppState) -> Router {
         );
     }
 
-    router.fallback(any(catch_all)).with_state(state)
+    // Inbound gate (caller locality + optional HEADROOM_PROXY_TOKEN).
+    // Applied last so it wraps every route and the fallback: the upstream
+    // Python proxy sees this process as a loopback caller and cannot tell
+    // who the real peer is itself.
+    let router = router
+        .fallback(any(catch_all))
+        .layer(axum::middleware::from_fn_with_state(
+            state.config.proxy_token.clone(),
+            crate::inbound_auth::inbound_gate,
+        ));
+    router.with_state(state)
 }
 
 /// Catch-all handler. If the request is a WebSocket upgrade, hand off to the
@@ -645,6 +663,21 @@ pub(crate) async fn forward_http(
     if !state.config.rewrite_host {
         if let Some(h) = req.headers().get(http::header::HOST) {
             outgoing_headers.insert(http::header::HOST, h.clone());
+        }
+    }
+    // The upstream (the Python proxy) sees this process as a loopback
+    // peer; never also hand it a loopback Host for a caller that is not
+    // local here, or its local-only routes would treat that caller as local.
+    if req
+        .extensions()
+        .get::<crate::inbound_auth::NonLocalCaller>()
+        .is_some()
+    {
+        if let Some(host) = crate::inbound_auth::host_override_for_non_local(
+            outgoing_headers.get(http::header::HOST),
+            &state.config.upstream,
+        ) {
+            outgoing_headers.insert(http::header::HOST, host);
         }
     }
 
