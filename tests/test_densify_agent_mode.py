@@ -196,7 +196,7 @@ def test_tokens_after_counts_reverted_messages(monkeypatch) -> None:
 
     # `headroom.compress` the attribute is the function; fetch the module.
     compress_module = importlib.import_module("headroom.compress")
-    monkeypatch.setattr(compress_module, "_message_is_lossless", lambda orig, comp: False)
+    monkeypatch.setattr(compress_module, "_string_pair_is_lossless", lambda orig, comp: False)
     msgs = _tool_result_messages(_repeated_path_records())
     res = headroom.densify(msgs)
     assert res.reverted_messages == 1
@@ -216,3 +216,16 @@ def test_new_fields_do_not_shift_positional_arguments() -> None:
     assert config_names[-3:] == ["diagnostics", "mode", "verify_lossless"]
     result_names = [f.name for f in fields(CompressResult)]
     assert result_names[-3:] == ["diagnostics", "lossless", "reverted_messages"]
+
+
+def test_lossless_verifier_reverts_equal_valued_scalar_type_changes() -> None:
+    from headroom.compress import _verify_and_revert
+
+    original = {"input": {"enabled": True, "count": 1}, "content": '[{"id":1}]'}
+    for changed_input in ({"enabled": 1, "count": 1}, {"enabled": True, "count": 1.0}):
+        for content in (original["content"], "[1]{id:int}\n1\n"):
+            changed = dict(original, input=changed_input, content=content)
+            messages, reverted, lossless = _verify_and_revert([original], [changed])
+            assert reverted == 1
+            assert messages[0] is original
+            assert lossless
