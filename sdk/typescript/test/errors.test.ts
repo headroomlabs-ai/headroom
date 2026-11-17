@@ -166,4 +166,13 @@ describe("mapProxyError", () => {
     const err = mapProxyError(500, "unknown_error", "something broke");
     expect(err).toBeInstanceOf(HeadroomCompressError);
   });
+
+  it.each(["constructor", "toString", "__proto__", "hasOwnProperty"])(
+    "ignores inherited object keys such as %s",
+    (type) => {
+      const err = mapProxyError(400, type, "bad");
+      expect(err).toBeInstanceOf(HeadroomCompressError);
+      expect((err as HeadroomCompressError).errorType).toBe(type);
+    },
+  );
 });
