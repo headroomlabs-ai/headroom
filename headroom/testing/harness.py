@@ -27,7 +27,7 @@ from typing import Any, Literal, cast
 
 from headroom._subprocess import run as subprocess_run
 from headroom.config import HeadroomConfig, HeadroomMode
-from headroom.proxy.models import ProxyConfig
+from headroom.proxy.models import ProxyConfig, redact_proxy_config_secrets
 
 ConfigCallback = Callable[["Configurator"], None]
 ProxyCallback = Callable[[ProxyConfig], None]
@@ -380,10 +380,17 @@ class ProxyDeploymentPlan:
     config_env_var: str = "HEADROOM_PROXY_CONFIG_JSON"
 
     def to_dict(self) -> dict[str, Any]:
+        """Serialise for a manifest. Credentials stay in the live plan only."""
+        config_payload = redact_proxy_config_secrets(self.config_payload)
+        env = dict(self.env)
+        if self.config_env_var in env:
+            env[self.config_env_var] = json.dumps(
+                config_payload, sort_keys=True, separators=(",", ":")
+            )
         return {
             "command": list(self.command),
-            "env": dict(self.env),
-            "config_payload": dict(self.config_payload),
+            "env": env,
+            "config_payload": config_payload,
             "config_env_var": self.config_env_var,
         }
 
@@ -1206,7 +1213,7 @@ class HarnessScenario:
             provider=self.provider.value,
             platform=self.platform.value,
             arms=self.bench_arms(provider=provider),
-            proxy_config=_public_dataclass_dict(self.proxy_config),
+            proxy_config=redact_proxy_config_secrets(_public_dataclass_dict(self.proxy_config)),
             headroom_config=_public_dataclass_dict(self.headroom_config),
             env=self.env(),
             deployment_plan=deployment_plan.to_dict(),
