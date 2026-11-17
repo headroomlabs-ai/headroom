@@ -9,11 +9,13 @@ Google documents Gemini generation on Vertex with `generateContent` and
 shape. See Google Cloud's model inference reference:
 https://docs.cloud.google.com/vertex-ai/generative-ai/docs/model-reference/inference
 
-Google Cloud REST calls authenticate with a bearer access token. For local
-development, Google documents both `gcloud auth print-access-token` and
-`gcloud auth application-default print-access-token`; Application Default
-Credentials search `GOOGLE_APPLICATION_CREDENTIALS`, local ADC files, and
-attached service accounts in that order. See:
+Google Cloud REST calls authenticate with a bearer access token. Use
+**`gcloud auth application-default print-access-token`**: a plain
+`gcloud auth print-access-token` user token is rejected by
+`aiplatform.googleapis.com` with `401 ACCESS_TOKEN_TYPE_UNSUPPORTED` for many
+identities. Application Default Credentials search
+`GOOGLE_APPLICATION_CREDENTIALS`, local ADC files, and attached service accounts
+in that order. Tokens expire after ~1 hour. See:
 
 - https://docs.cloud.google.com/docs/authentication/rest
 - https://docs.cloud.google.com/docs/authentication/application-default-credentials
@@ -26,19 +28,46 @@ Set the Vertex regional host explicitly:
 headroom proxy --vertex-api-url https://us-central1-aiplatform.googleapis.com
 ```
 
-The same setting is available through `VERTEX_TARGET_API_URL`.
+The same setting is available through `VERTEX_TARGET_API_URL`. Left unset, the
+proxy derives the host from each request's `locations/{location}` segment, so
+one proxy serves every region plus `global`.
+
+### Picking a location
+
+Vertex serves each publisher model in only a subset of locations, and this is
+the most common source of a confusing `404` during onboarding:
+
+| Model | Where it serves |
+| --- | --- |
+| `gemini-flash-latest`, `gemini-flash-lite-latest` | `global` only |
+| `gemini-3.5-flash` | `global`, `europe-west2`, `asia-northeast1`, `asia-south1`, `asia-southeast1` |
+| `claude-sonnet-4-6` (and 4.6-or-older Claude) | `global`, `us-east5`, `europe-west1`, `asia-southeast1` |
+| Claude 4.7+ | `global` or the `us`/`eu` multi-region only -- no named regions |
+
+**Gemini 3.x has no US regional endpoint.** Start with `global` and only pin a
+region when you need Provisioned Throughput or data residency. Partner models
+(Claude, Llama, Mistral) also need a one-time per-project enable in Model
+Garden before they serve.
+
+When Vertex rejects a request with `401`, `403`, `404` or `429`, Headroom appends a `[headroom] hint: ...` note to
+`error.message` (also emitted as an `x-headroom-hint` header and a proxy WARNING)
+naming the likely fix. Hints are fixed text and never echo the request path,
+project, credentials or exception detail; raw provider errors stay in the proxy
+log.
 
 ## Gemini On Vertex
 
 Send Vertex publisher paths through the proxy unchanged:
 
 ```bash
-ACCESS_TOKEN="$(gcloud auth print-access-token)"
+LOCATION="global"
+MODEL="gemini-flash-latest"
+ACCESS_TOKEN="$(gcloud auth application-default print-access-token)"
 
 curl -sS \
   -H "Authorization: Bearer ${ACCESS_TOKEN}" \
   -H "Content-Type: application/json" \
-  http://127.0.0.1:8787/v1/projects/PROJECT_ID/locations/us-central1/publishers/google/models/gemini-2.0-flash:generateContent \
+  http://127.0.0.1:8787/v1/projects/PROJECT_ID/locations/${LOCATION}/publishers/google/models/${MODEL}:generateContent \
   -d '{
     "contents": [
       {
@@ -48,6 +77,17 @@ curl -sS \
     ]
   }'
 ```
+
+## Google Gen AI SDK (Proxy)
+
+Point the `google-genai` SDK at Headroom with
+`genai.Client(vertexai=True, project=..., location="global", http_options={"base_url": "http://127.0.0.1:8787"})`.
+`examples/vertex_genai_sdk_demo.py` runs this end to end: it starts the proxy,
+probes it (including a thinking config) and tears it down.
+
+Note the `google-genai` SDK only builds `publishers/google/...` paths, so it
+cannot reach Claude on Vertex; use the `publishers/anthropic/...:rawPredict`
+route below for that.
 
 Supported passthrough actions:
 
@@ -66,6 +106,32 @@ The Python proxy preserves caller-supplied Google bearer auth. The native Rust
 proxy path additionally resolves GCP ADC and injects the bearer token for the
 Anthropic publisher route.
 
+These native routes are a straight passthrough: they need **no** `--backend`
+flag and no extra beyond `[proxy]`.
+
+`--backend vertex` (aliases: `vertex_ai`, `litellm-vertex`, `google-vertex`) is a
+different mode. It routes Anthropic *Messages* traffic — `/v1/messages` — through
+LiteLLM, and needs the Vertex SDK:
+
+```bash
+pip install "headroom-ai[proxy,vertex]"
+```
+
+That extra is kept out of `[proxy]` because `google-cloud-aiplatform` and its
+transitive tree add roughly 175 MB, and only this backend uses it. Select the
+backend without it and the proxy refuses to start rather than failing on every
+request:
+
+```text
+Cannot start proxy: Vertex backend selected but the Vertex SDK is missing. ...
+```
+
+Do not combine the two. With `--backend vertex` set, Claude (`publishers/anthropic`) requests
+are re-routed through LiteLLM, which takes the project, region and model from
+its own configuration (`VERTEXAI_PROJECT` / `VERTEXAI_LOCATION`) and ignores the
+ones in your URL — so a request that works without the flag can come back `404`
+for a model you never named.
+
 ## Claude Code with Headroom compression (validated)
 
 To run **Claude Code** against Claude-on-Vertex **with Headroom compressing the
@@ -82,6 +148,7 @@ Short version: run Claude Code in **normal Anthropic mode** (`ANTHROPIC_BASE_URL
 > URL before sending a request ("model … not available on your vertex deployment"),
 > so the proxy is never reached. Use the Anthropic-mode runbook above instead.
 >
-> ⚠️ Two easy-to-miss requirements: `pip install "google-cloud-aiplatform>=1.38"`
-> (LiteLLM `vertex_ai` provider) and the `--code-aware` flag (code compression is
-> off by default). Without them you get a 500 or `tokens_saved: 0`.
+> ⚠️ Two easy-to-miss requirements: `pip install "headroom-ai[proxy,vertex]"`
+> (the LiteLLM `vertex_ai` provider needs the Vertex SDK) and the `--code-aware`
+> flag (code compression is off by default). Without the first the proxy refuses
+> to start; without the second you get `tokens_saved: 0`.

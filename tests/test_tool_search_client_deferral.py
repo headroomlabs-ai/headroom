@@ -38,6 +38,7 @@ import pytest
 
 from headroom.proxy.helpers import (
     _TOOL_SEARCH_MIN_TOOLS,
+    anthropic_first_party_tool_search_supported,
     claude_code_tool_search_inactive,
     inject_tool_search_deferral,
     inject_tool_search_deferral_openai,
@@ -410,6 +411,43 @@ def test_nothing_to_strip_returns_the_same_list() -> None:
     assert out is tools
 
 
+@pytest.mark.parametrize(
+    "url",
+    [
+        "https://api.githubcopilot.com",
+        "https://api.business.githubcopilot.com",
+        "https://api.enterprise.githubcopilot.com",
+        "https://api.individual.githubcopilot.com/v1",
+        "https://api.business.githubcopilot.com:443",
+    ],
+)
+def test_copilot_hosts_keep_deferral(url: str) -> None:
+    """Copilot accepts the deferred shape and bills deferred schemas compactly,
+    on the generic host and on the plan hosts seats are sent to (#4155)."""
+    tools = [ANTHROPIC_SEARCH_REGEX, {"name": "mcp__srv__a", "defer_loading": True}]
+
+    assert strip_first_party_tool_search_tools_for_third_party_upstream(tools, url) is tools
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "https://api.githubcopilot.com.evil.com",
+        "https://api.business.githubcopilot.com.evil.com",
+        "https://evilgithubcopilot.com",
+        "https://copilot-api.acme.ghe.com",
+    ],
+)
+def test_copilot_lookalike_hosts_still_downgrade(url: str) -> None:
+    assert not anthropic_first_party_tool_search_supported(url)
+
+
+def test_other_third_party_upstreams_still_downgrade() -> None:
+    """The exemption is host-scoped: Bedrock/Vertex/gateways are unchanged."""
+    for url in (THIRD_PARTY_URL, "https://bedrock-runtime.us-east-1.amazonaws.com"):
+        assert not anthropic_first_party_tool_search_supported(url)
+
+
 # --------------------------------------------------------------------------
 # OpenAI Responses path
 # --------------------------------------------------------------------------
@@ -703,3 +741,12 @@ def test_the_orphan_warning_is_throttled(caplog: pytest.LogCaptureFixture) -> No
 
     lines = [r for r in caplog.records if "tool_search_deferred_orphan" in r.getMessage()]
     assert len(lines) == 1
+
+
+def test_copilot_completions_hosts_do_not_keep_deferral() -> None:
+    tools = [ANTHROPIC_SEARCH_REGEX, {"name": "mcp__srv__a", "defer_loading": True}]
+
+    out = strip_first_party_tool_search_tools_for_third_party_upstream(
+        tools, "https://proxy.business.githubcopilot.com"
+    )
+    assert out is not tools

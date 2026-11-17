@@ -17,9 +17,12 @@ Usage:
     # Search and inject context
     context = await handler.search_and_format_context(user_id, messages)
 
-    # Handle tool calls in response
+    # Handle tool calls in response, only for the tools the proxy injected
+    names = server_memory_tool_names(request_tools, client_tools)
     if handler.has_memory_tool_calls(response, "anthropic"):
-        results = await handler.handle_memory_tool_calls(response, user_id, "anthropic")
+        results = await handler.handle_memory_tool_calls(
+            response, user_id, "anthropic", tool_names=names
+        )
 """
 
 from __future__ import annotations
@@ -44,6 +47,7 @@ from headroom.memory.storage_router import (
     ResolvedScope,
 )
 from headroom.proxy.public_errors import tool_result_error
+from headroom.proxy.tool_name_policy import extract_tool_name
 
 if TYPE_CHECKING:
     from headroom.memory.backends.local import LocalBackend
@@ -88,6 +92,25 @@ NATIVE_MEMORY_BETA_HEADER = "context-management-2025-06-27"
 
 # Native memory tool type
 NATIVE_MEMORY_TOOL_TYPE = "memory_20250818"
+
+
+def server_memory_tool_names(tools: Any, client_tools: Any) -> frozenset[str]:
+    """Memory tools in ``tools`` that the proxy injected and must run itself.
+
+    ``tools`` is the tool list sent upstream, ``client_tools`` the list the
+    client sent. A memory-named tool the client declared stays the client's:
+    its calls are forwarded, never withheld or executed by the proxy.
+    """
+    client_tool_names = {extract_tool_name(t) for t in client_tools or [] if isinstance(t, dict)}
+    return frozenset(
+        name
+        for t in tools or []
+        if isinstance(t, dict)
+        and isinstance(name := extract_tool_name(t), str)
+        and (name in MEMORY_TOOL_NAMES or name == NATIVE_MEMORY_TOOL_NAME)
+        and name not in client_tool_names
+    )
+
 
 # Maximum time to wait for a single backend initialization (one-shot).
 # Applies to MemoryHandler._ensure_initialized. On timeout, _initialized
@@ -194,14 +217,18 @@ class MemoryHandler:
         self.config = config
         self.agent_type = agent_type
         self._backend: LocalBackend | Any = None
-        # Per-project routing. Built during backend init so a single,
-        # shared resolver / LRU is kept on the handler. The local backend
-        # routes to per-project SQLite files; the cognee backend keeps one
-        # shared dataset and uses the router only to resolve the scope,
-        # composing a ``user::project_key`` user_id instead (see
-        # ``_resolve_for_request``). Qdrant deployments pre-date the router
-        # and keep it None (legacy single-bucket behaviour).
-        self._router: BackendRouter | None = None
+        storage_root = (
+            Path(config.storage_root)
+            if config.storage_root
+            else (Path(config.db_path).resolve().parent / "memories")
+        )
+        self._router = BackendRouter(
+            BackendRouterConfig(
+                mode=config.storage_mode,
+                root_dir=storage_root,
+                global_db_path=Path(config.db_path).resolve(),
+            )
+        )
         self._initialized = False
         # Async singleflight guard for backend init. Ensures concurrent first
         # callers land on one init (double-checked pattern inside
@@ -421,19 +448,8 @@ class MemoryHandler:
             # remains the GLOBAL-mode fallback / legacy compatibility
             # backend; callers that pass a ``RequestContext`` route
             # through ``self._router`` instead.
-            storage_root = (
-                Path(self.config.storage_root)
-                if self.config.storage_root
-                else (Path(self.config.db_path).resolve().parent / "memories")
-            )
             global_db_path = Path(self.config.db_path).resolve()
-            router_cfg = BackendRouterConfig(
-                mode=self.config.storage_mode,
-                root_dir=storage_root,
-                global_db_path=global_db_path,
-                backend_config_template=backend_config,
-            )
-            self._router = BackendRouter(router_cfg)
+            self._router._config.backend_config_template = backend_config
             # Seed the router's LRU with the already-initialized
             # legacy backend so GLOBAL-mode requests reuse it instead
             # of opening a second handle to the same file.
@@ -442,7 +458,7 @@ class MemoryHandler:
             logger.info(
                 "event=memory_router_initialized mode=%s root=%s global_db=%s",
                 self.config.storage_mode.value,
-                storage_root,
+                self._router._config.root_dir,
                 global_db_path,
             )
 
@@ -739,13 +755,27 @@ class MemoryHandler:
         # Non-local backends: derive scope but keep one shared backend
         # and compose the user_id so the partition lives in the user_id
         # column instead of in a separate file.
-        scope = self._router._resolve_scope(request_context)
+        scope = self._router.scope_for(request_context)
+        if scope.db_path is None:
+            return None, scope, base_user_id
         composed = (
             base_user_id
             if scope.project_key is None or scope.mode is MemoryStorageMode.GLOBAL
             else f"{base_user_id}::{scope.project_key}"
         )
         return self._backend, scope, composed
+
+    def is_project_unresolved(self, request_context: RequestContext | None) -> bool:
+        """Return whether fail-closed project routing has no usable target."""
+
+        if request_context is None or self._router is None:
+            return False
+        scope = self._router.scope_for(request_context)
+        return (
+            scope.mode is MemoryStorageMode.PROJECT
+            and scope.project_key is None
+            and scope.db_path is None
+        )
 
     @staticmethod
     def _unresolved_project_error(scope: ResolvedScope | None) -> str | None:
@@ -828,20 +858,33 @@ class MemoryHandler:
         if not self.config.inject_context:
             return None
 
+        from headroom.proxy.helpers import get_memory_injection_mode
+
         # PR-B6: Tool mode disables auto-injection. The model calls
-        # ``memory_search`` to retrieve when it wants to.
-        if self.config.mode == MemoryMode.TOOL:
+        # ``memory_search`` to retrieve when it wants to. Selected by the
+        # handler config or by HEADROOM_MEMORY_INJECTION_MODE=tool.
+        if self.config.mode == MemoryMode.TOOL or get_memory_injection_mode() == "tool":
             logger.info(
                 "event=memory_mode_skip mode=tool user_id=%s reason=tool_mode_no_auto_injection",
                 user_id,
             )
             return None
 
-        await self._ensure_initialized()
-        if not self._backend:
+        if self.is_project_unresolved(request_context):
             return None
+        try:
+            await self._ensure_initialized()
+            if not self._backend:
+                return None
 
-        backend, scope, effective_user_id = self._resolve_for_request(user_id, request_context)
+            backend, scope, effective_user_id = self._resolve_for_request(user_id, request_context)
+        except Exception as e:
+            logger.warning(
+                "Memory: Failed to initialize or resolve backend for user %s: %s",
+                user_id,
+                e,
+            )
+            return None
 
         # Fail-closed when the router was unable to resolve a project in
         # PROJECT mode and `unresolved_project_fallback="empty"` (the
@@ -866,18 +909,6 @@ class MemoryHandler:
             )
             return None
 
-        # Build the embedding query. When the handler provides a
-        # MemoryQuery, use its multi-source untruncated input; otherwise
-        # fall back to extracting from messages (kept for legacy callers
-        # / tests). Full fidelity in both paths.
-        if query is not None:
-            query_text = query.to_embedding_input()
-        else:
-            query_text = self._extract_user_query(messages)
-        if not query_text:
-            logger.debug("Memory: No query text for context search")
-            return None
-
         # Compose the budget: explicit per-call wins; otherwise derive
         # from self.config so existing top_k/min_similarity callers see
         # no behaviour change.
@@ -891,6 +922,22 @@ class MemoryHandler:
         )
 
         try:
+            if query is not None:
+                from headroom.proxy.memory_query_policy import bounded_embedding_parts
+
+                parts = bounded_embedding_parts(
+                    user_text=query.user_text,
+                    recent_tool_outputs=query.recent_tool_outputs,
+                    recent_assistant_turns=query.recent_assistant_turns,
+                )
+                prepare = getattr(backend, "prepare_search_query", None)
+                query_text = await prepare(*parts) if prepare is not None else "".join(parts)
+            else:
+                query_text = self._extract_user_query(messages)[-4096:]
+            if not query_text:
+                logger.debug("Memory: No query text for context search")
+                return None
+
             # Search memories on the per-request resolved backend.
             results = await backend.search_memories(
                 query=query_text,
@@ -937,7 +984,7 @@ class MemoryHandler:
                     memory_lines.append(f"   (Related: {entities_str})")
 
         except Exception as e:
-            logger.warning(f"Memory: Search failed for user {effective_user_id}: {e}")
+            logger.warning(f"Memory: Search failed for user {effective_user_id}: {e!r}")
             return None
 
         if not memory_lines:
@@ -970,10 +1017,8 @@ pass that ID directly to memory_update or memory_delete — you do not need \
 to call memory_search first to discover IDs. Use this context to inform \
 your responses, not to drive new actions."""
 
-        # Apply the token-budget cap on the formatted block. Pre-this-
-        # PR there was no cap — up to ~4000 tokens could be injected
-        # per request. The budget bounds the output without touching
-        # the input query (which stays full-fidelity per MemoryQuery).
+        # The formatted output budget is separate from the embedding-input
+        # budget above; the original MemoryQuery remains full-fidelity.
         context = effective_budget.apply_to_text(context)
 
         # Track only memories that survived ranking, entry limits, and the
@@ -1119,17 +1164,35 @@ your responses, not to drive new actions."""
         if provider == "anthropic":
             content = response.get("content", [])
             if isinstance(content, list):
-                return [block for block in content if block.get("type") == "tool_use"]
+                return [
+                    block
+                    for block in content
+                    if isinstance(block, dict) and block.get("type") == "tool_use"
+                ]
             return []
 
         elif provider == "openai":
-            # Chat Completions format: choices[0].message.tool_calls
-            choices = response.get("choices", [])
-            if choices:
-                message = choices[0].get("message", {})
-                tc_list = list(message.get("tool_calls", []) or [])
-                if tc_list:
-                    return tc_list
+            # Chat Completions format: choices[0].message.tool_calls. Guard the
+            # first choice for dict-ness the way the sibling
+            # CCRResponseHandler._extract_assistant_message already does: an
+            # OpenAI-compatible gateway can send `choices: [null]` on a
+            # content-filtered / usage-only response, and this runs from
+            # has_memory_tool_calls, which is called outside the try that wraps
+            # the rest of memory handling — so an unguarded `choices[0].get` here
+            # would surface AttributeError to the request handler.
+            choices = response.get("choices")
+            first = choices[0] if isinstance(choices, list) and choices else None
+            if isinstance(first, dict):
+                message = first.get("message")
+                if isinstance(message, dict):
+                    # Filter to dict entries: a null / string element inside
+                    # tool_calls (which downstream immediately calls `.get` on)
+                    # would otherwise still crash detection.
+                    tc_list = [
+                        tc for tc in (message.get("tool_calls") or []) if isinstance(tc, dict)
+                    ]
+                    if tc_list:
+                        return tc_list
 
             # Responses API format: output[] with type=function_call
             output = response.get("output", [])
@@ -1152,6 +1215,8 @@ your responses, not to drive new actions."""
         user_id: str,
         provider: str = "anthropic",
         request_context: RequestContext | None = None,
+        *,
+        tool_names: frozenset[str],
     ) -> list[dict[str, Any]]:
         """Execute memory tool calls and return results.
 
@@ -1163,12 +1228,17 @@ your responses, not to drive new actions."""
                 save/search/update/delete operations route to the per-
                 workspace DB so projects cannot read or overwrite each
                 other's memories (GH #462).
+            tool_names: The memory tools the proxy injected on this request
+                (see ``server_memory_tool_names``). Calls to any other tool,
+                memory-named or not, are the client's and are skipped.
 
         Returns:
             List of tool results in provider format.
         """
         tool_calls = self._extract_tool_calls(response, provider)
         results: list[dict[str, Any]] = []
+        project_unresolved = self.is_project_unresolved(request_context)
+        unresolved_result = json.dumps({"status": "skipped", "reason": "project_unresolved"})
 
         for tc in tool_calls:
             # `tc.get("function", {})` returns None for an explicit
@@ -1176,6 +1246,8 @@ your responses, not to drive new actions."""
             # the following `.get` would raise AttributeError on a malformed /
             # partial upstream tool call. Coalesce to {}.
             tool_name = tc.get("name") or (tc.get("function") or {}).get("name")
+            if tool_name not in tool_names:
+                continue
             tool_id = tc.get("id") or tc.get("call_id", "")
 
             # Parse input data
@@ -1193,8 +1265,14 @@ your responses, not to drive new actions."""
                     input_data = {}
 
             # Handle native memory tool
-            if tool_name == NATIVE_MEMORY_TOOL_NAME:
-                result_content = await self._execute_native_memory_tool(input_data, user_id)
+            if tool_name in ({NATIVE_MEMORY_TOOL_NAME} | MEMORY_TOOL_NAMES) and project_unresolved:
+                result_content = unresolved_result
+            elif tool_name == NATIVE_MEMORY_TOOL_NAME:
+                result_content = await self._execute_native_memory_tool(
+                    input_data,
+                    user_id,
+                    request_context=request_context,
+                )
             elif tool_name in MEMORY_TOOL_NAMES:
                 # Custom memory tools need backend
                 await self._ensure_initialized()
@@ -1242,7 +1320,12 @@ your responses, not to drive new actions."""
         request_context: RequestContext | None = None,
     ) -> str:
         """Execute a memory tool and return result string."""
+        if self.is_project_unresolved(request_context):
+            return json.dumps({"status": "skipped", "reason": "project_unresolved"})
         try:
+            await self._ensure_initialized()
+            if self._backend is None:
+                return json.dumps({"status": "error", "error": "Memory backend not initialized"})
             if tool_name == "memory_save":
                 return await self._execute_save(input_data, user_id, provider, request_context)
             elif tool_name == "memory_search":
@@ -1464,7 +1547,8 @@ your responses, not to drive new actions."""
             return json.dumps({"status": "updated", "memory_id": memory.id})
         else:
             # Fallback: delete old, save new
-            await backend.delete_memory(memory_id)
+            if not await backend.delete_memory(memory_id, user_id=effective_user_id):
+                return json.dumps({"status": "not_found", "memory_id": memory_id})
             memory = await backend.save_memory(
                 content=new_content,
                 user_id=effective_user_id,
@@ -1495,10 +1579,10 @@ your responses, not to drive new actions."""
         if not memory_id:
             return json.dumps({"status": "error", "error": "memory_id is required"})
 
-        backend, _scope, _effective = self._resolve_for_request(user_id, request_context)
+        backend, _scope, effective_user_id = self._resolve_for_request(user_id, request_context)
         if error := self._unresolved_project_error(_scope):
             return error
-        deleted = await backend.delete_memory(memory_id)
+        deleted = await backend.delete_memory(memory_id, user_id=effective_user_id)
 
         return json.dumps(
             {
@@ -1601,7 +1685,13 @@ your responses, not to drive new actions."""
     #   str_replace                 → Update memory content
     # =========================================================================
 
-    async def _execute_native_memory_tool(self, input_data: dict[str, Any], user_id: str) -> str:
+    async def _execute_native_memory_tool(
+        self,
+        input_data: dict[str, Any],
+        user_id: str,
+        *,
+        request_context: RequestContext | None = None,
+    ) -> str:
         """Execute Anthropic's native memory tool with semantic backend.
 
         This is a TRANSLATION LAYER: Claude thinks it's doing file operations,
@@ -1615,24 +1705,40 @@ your responses, not to drive new actions."""
         - delete: Remove from vector store
         - rename: Update memory tags/path
         """
+        if self.is_project_unresolved(request_context):
+            return json.dumps({"status": "skipped", "reason": "project_unresolved"})
+
         # Ensure our semantic backend is initialized
         await self._ensure_initialized()
 
         command = input_data.get("command", "")
 
         try:
+            backend, _scope, effective_user_id = self._resolve_for_request(user_id, request_context)
             if command == "view":
-                return await self._native_view_semantic(input_data, user_id)
+                return await self._native_view_semantic(
+                    input_data, effective_user_id, backend=backend
+                )
             elif command == "create":
-                return await self._native_create_semantic(input_data, user_id)
+                return await self._native_create_semantic(
+                    input_data, effective_user_id, backend=backend
+                )
             elif command == "str_replace":
-                return await self._native_update_semantic(input_data, user_id)
+                return await self._native_update_semantic(
+                    input_data, effective_user_id, backend=backend
+                )
             elif command == "insert":
-                return await self._native_append_semantic(input_data, user_id)
+                return await self._native_append_semantic(
+                    input_data, effective_user_id, backend=backend
+                )
             elif command == "delete":
-                return await self._native_delete_semantic(input_data, user_id)
+                return await self._native_delete_semantic(
+                    input_data, effective_user_id, backend=backend
+                )
             elif command == "rename":
-                return await self._native_rename_semantic(input_data, user_id)
+                return await self._native_rename_semantic(
+                    input_data, effective_user_id, backend=backend
+                )
             else:
                 return f"Error: Unknown command '{command}'"
         except Exception as e:
@@ -1643,7 +1749,9 @@ your responses, not to drive new actions."""
     # Semantic Translation Methods (Native Tool → Vector Store)
     # =========================================================================
 
-    async def _native_view_semantic(self, input_data: dict[str, Any], user_id: str) -> str:
+    async def _native_view_semantic(
+        self, input_data: dict[str, Any], user_id: str, *, backend: Any
+    ) -> str:
         """Handle VIEW command with semantic search capabilities.
 
         Path patterns:
@@ -1666,31 +1774,35 @@ your responses, not to drive new actions."""
             query = subpath[len("search/") :]
             if not query:
                 return "Error: Please provide a search query. Example: view /memories/search/food preferences"
-            return await self._semantic_search(query, user_id)
+            return await self._semantic_search(query, user_id, backend=backend)
 
         # CASE 2: /memories/recent → Recent memories
         if subpath == "recent":
-            return await self._get_recent_memories(user_id, limit=10)
+            return await self._get_recent_memories(user_id, limit=10, backend=backend)
 
         # CASE 3: /memories/all → List all (paginated)
         if subpath == "all":
-            return await self._list_all_memories(user_id, limit=20)
+            return await self._list_all_memories(user_id, limit=20, backend=backend)
 
         # CASE 4: /memories (root) → Overview with instructions
         if not subpath or subpath == "":
-            return await self._get_memory_overview(user_id)
+            return await self._get_memory_overview(user_id, backend=backend)
 
         # CASE 5: /memories/<something> → Search by topic
         # Treat the path as a search query
-        return await self._semantic_search(subpath.replace("/", " ").replace("_", " "), user_id)
+        return await self._semantic_search(
+            subpath.replace("/", " ").replace("_", " "), user_id, backend=backend
+        )
 
-    async def _semantic_search(self, query: str, user_id: str, top_k: int = 5) -> str:
+    async def _semantic_search(
+        self, query: str, user_id: str, top_k: int = 5, *, backend: Any
+    ) -> str:
         """Perform semantic search and format results."""
-        if not self._backend:
+        if not backend:
             return "Error: Memory backend not initialized"
 
         try:
-            results = await self._backend.search_memories(
+            results = await backend.search_memories(
                 query=query,
                 user_id=user_id,
                 top_k=top_k,
@@ -1721,15 +1833,15 @@ your responses, not to drive new actions."""
             logger.error(f"Memory: Semantic search failed: {e}")
             return f"Error searching memories: {e}"
 
-    async def _get_recent_memories(self, user_id: str, limit: int = 10) -> str:
+    async def _get_recent_memories(self, user_id: str, limit: int = 10, *, backend: Any) -> str:
         """Get most recent memories."""
-        if not self._backend:
+        if not backend:
             return "Error: Memory backend not initialized"
 
         try:
             # Use a generic query to get recent items
             # Most backends will return by recency when query is broad
-            results = await self._backend.search_memories(
+            results = await backend.search_memories(
                 query="recent memories",
                 user_id=user_id,
                 top_k=limit,
@@ -1756,14 +1868,14 @@ your responses, not to drive new actions."""
             logger.error(f"Memory: Get recent failed: {e}")
             return f"Error getting recent memories: {e}"
 
-    async def _list_all_memories(self, user_id: str, limit: int = 20) -> str:
+    async def _list_all_memories(self, user_id: str, limit: int = 20, *, backend: Any) -> str:
         """List all memories (paginated)."""
-        if not self._backend:
+        if not backend:
             return "Error: Memory backend not initialized"
 
         try:
             # Get all memories with a broad search
-            results = await self._backend.search_memories(
+            results = await backend.search_memories(
                 query="*",  # Broad query
                 user_id=user_id,
                 top_k=limit,
@@ -1788,14 +1900,14 @@ your responses, not to drive new actions."""
             logger.error(f"Memory: List all failed: {e}")
             return f"Error listing memories: {e}"
 
-    async def _get_memory_overview(self, user_id: str) -> str:
+    async def _get_memory_overview(self, user_id: str, *, backend: Any) -> str:
         """Get memory directory overview with search instructions."""
-        if not self._backend:
+        if not backend:
             return "Error: Memory backend not initialized"
 
         try:
             # Get count of memories
-            results = await self._backend.search_memories(
+            results = await backend.search_memories(
                 query="*",
                 user_id=user_id,
                 top_k=100,  # Just to get a count
@@ -1847,7 +1959,9 @@ To see RECENT: view /memories/recent
 To SAVE: create /memories/<topic>.txt "content"
 """
 
-    async def _native_create_semantic(self, input_data: dict[str, Any], user_id: str) -> str:
+    async def _native_create_semantic(
+        self, input_data: dict[str, Any], user_id: str, *, backend: Any
+    ) -> str:
         """Handle CREATE command - save to semantic vector store."""
         path = input_data.get("path", "")
         file_text = input_data.get("file_text", "")
@@ -1857,7 +1971,7 @@ To SAVE: create /memories/<topic>.txt "content"
         if not file_text:
             return "Error: file_text is required (the memory content)"
 
-        if not self._backend:
+        if not backend:
             return "Error: Memory backend not initialized"
 
         try:
@@ -1870,7 +1984,7 @@ To SAVE: create /memories/<topic>.txt "content"
             )
 
             # Save to our semantic backend
-            memory = await self._backend.save_memory(
+            memory = await backend.save_memory(
                 content=file_text,
                 user_id=user_id,
                 importance=0.5,
@@ -1884,7 +1998,9 @@ To SAVE: create /memories/<topic>.txt "content"
             logger.error(f"Memory: Semantic create failed: {e}")
             return f"Error: {e}"
 
-    async def _native_update_semantic(self, input_data: dict[str, Any], user_id: str) -> str:
+    async def _native_update_semantic(
+        self, input_data: dict[str, Any], user_id: str, *, backend: Any
+    ) -> str:
         """Handle STR_REPLACE command - update memory content."""
         path = input_data.get("path", "")
         old_str = input_data.get("old_str", "")
@@ -1895,12 +2011,12 @@ To SAVE: create /memories/<topic>.txt "content"
         if not old_str:
             return "Error: old_str is required"
 
-        if not self._backend:
+        if not backend:
             return "Error: Memory backend not initialized"
 
         try:
             # Search for memory containing old_str
-            results = await self._backend.search_memories(
+            results = await backend.search_memories(
                 query=old_str,
                 user_id=user_id,
                 top_k=5,
@@ -1924,15 +2040,15 @@ To SAVE: create /memories/<topic>.txt "content"
             new_content = matching_memory.content.replace(old_str, new_str, 1)
 
             # Update via delete + create (or update if backend supports it)
-            if hasattr(self._backend, "update_memory"):
-                await self._backend.update_memory(
+            if hasattr(backend, "update_memory"):
+                await backend.update_memory(
                     memory_id=matching_memory.id,
                     new_content=new_content,
                     user_id=user_id,
                 )
             else:
-                await self._backend.delete_memory(matching_memory.id)
-                await self._backend.save_memory(
+                await backend.delete_memory(matching_memory.id)
+                await backend.save_memory(
                     content=new_content,
                     user_id=user_id,
                     importance=0.5,
@@ -1949,7 +2065,9 @@ To SAVE: create /memories/<topic>.txt "content"
             logger.error(f"Memory: Semantic update failed: {e}")
             return f"Error: {e}"
 
-    async def _native_append_semantic(self, input_data: dict[str, Any], user_id: str) -> str:
+    async def _native_append_semantic(
+        self, input_data: dict[str, Any], user_id: str, *, backend: Any
+    ) -> str:
         """Handle INSERT command - append to memory or create new."""
         path = input_data.get("path", "")
         insert_text = input_data.get("insert_text", "")
@@ -1960,7 +2078,7 @@ To SAVE: create /memories/<topic>.txt "content"
         if not insert_text:
             return "Error: insert_text is required"
 
-        if not self._backend:
+        if not backend:
             return "Error: Memory backend not initialized"
 
         try:
@@ -1968,7 +2086,7 @@ To SAVE: create /memories/<topic>.txt "content"
             # with the additional context
             topic = path.replace("/memories/", "").replace("/", "_").replace(".txt", "")
 
-            await self._backend.save_memory(
+            await backend.save_memory(
                 content=insert_text,
                 user_id=user_id,
                 importance=0.5,
@@ -1982,14 +2100,16 @@ To SAVE: create /memories/<topic>.txt "content"
             logger.error(f"Memory: Semantic append failed: {e}")
             return f"Error: {e}"
 
-    async def _native_delete_semantic(self, input_data: dict[str, Any], user_id: str) -> str:
+    async def _native_delete_semantic(
+        self, input_data: dict[str, Any], user_id: str, *, backend: Any
+    ) -> str:
         """Handle DELETE command - remove from vector store."""
         path = input_data.get("path", "")
 
         if not path:
             return "Error: path is required"
 
-        if not self._backend:
+        if not backend:
             return "Error: Memory backend not initialized"
 
         try:
@@ -2001,7 +2121,7 @@ To SAVE: create /memories/<topic>.txt "content"
                 .replace(".txt", "")
             )
 
-            results = await self._backend.search_memories(
+            results = await backend.search_memories(
                 query=topic,
                 user_id=user_id,
                 top_k=10,
@@ -2016,7 +2136,7 @@ To SAVE: create /memories/<topic>.txt "content"
                 # Check if metadata matches path
                 metadata = getattr(r.memory, "metadata", {}) or {}
                 if metadata.get("virtual_path") == path or r.score > 0.8:
-                    await self._backend.delete_memory(r.memory.id)
+                    await backend.delete_memory(r.memory.id)
                     deleted_count += 1
 
             if deleted_count == 0:
@@ -2031,7 +2151,9 @@ To SAVE: create /memories/<topic>.txt "content"
             logger.error(f"Memory: Semantic delete failed: {e}")
             return f"Error: {e}"
 
-    async def _native_rename_semantic(self, input_data: dict[str, Any], user_id: str) -> str:
+    async def _native_rename_semantic(
+        self, input_data: dict[str, Any], user_id: str, *, backend: Any
+    ) -> str:
         """Handle RENAME command - update memory path/topic."""
         old_path = input_data.get("old_path", "")
         new_path = input_data.get("new_path", "")
@@ -2041,7 +2163,7 @@ To SAVE: create /memories/<topic>.txt "content"
         if not new_path:
             return "Error: new_path is required"
 
-        if not self._backend:
+        if not backend:
             return "Error: Memory backend not initialized"
 
         try:
@@ -2053,7 +2175,7 @@ To SAVE: create /memories/<topic>.txt "content"
                 .replace(".txt", "")
             )
 
-            results = await self._backend.search_memories(
+            results = await backend.search_memories(
                 query=old_topic,
                 user_id=user_id,
                 top_k=10,
@@ -2070,8 +2192,8 @@ To SAVE: create /memories/<topic>.txt "content"
                 metadata = getattr(r.memory, "metadata", {}) or {}
                 if metadata.get("virtual_path") == old_path or r.score > 0.8:
                     # Delete old and create with new path
-                    await self._backend.delete_memory(r.memory.id)
-                    await self._backend.save_memory(
+                    await backend.delete_memory(r.memory.id)
+                    await backend.save_memory(
                         content=r.memory.content,
                         user_id=user_id,
                         importance=getattr(r.memory, "importance", 0.5),

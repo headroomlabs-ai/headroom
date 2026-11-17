@@ -13,6 +13,7 @@ else:  # pragma: no cover - exercised only on Python 3.10
     import tomli as tomllib  # type: ignore[no-redef]
 
 from headroom.install.models import DeploymentManifest
+from headroom.providers.codex.config_toml import loads_codex_config
 from headroom.providers.codex.install import (
     CodexAuthConfigError,
     _codex_login_status,
@@ -120,6 +121,44 @@ def test_api_key_auth_is_persisted_as_a_codex_command(tmp_path: Path, monkeypatc
     revert_provider_scope(mutation, _manifest(tmp_path))
 
     assert not helper.exists()
+
+
+def test_provider_scope_preserves_multiline_inline_profile_overrides(
+    tmp_path: Path, monkeypatch
+) -> None:
+    config = tmp_path / "config.toml"
+    config.write_text(
+        'model_provider = "openai"\n'
+        "profiles = {\n"
+        "  work = {\n"
+        '    model_provider = "company",\n'
+        "  },\n"
+        "}\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr("headroom.providers.codex.install.codex_config_path", lambda: config)
+
+    apply_provider_scope(_manifest(tmp_path))
+
+    parsed = loads_codex_config(config.read_text(encoding="utf-8"))
+    assert parsed["model_provider"] == "headroom"
+    assert parsed["profiles"]["work"] == {"model_provider": "company"}
+
+
+@pytest.mark.parametrize("sep", [" ", "\x85"])
+def test_provider_scope_keeps_single_line_string_with_unicode_separator(
+    tmp_path: Path, monkeypatch, sep: str
+) -> None:
+    config = tmp_path / "config.toml"
+    notes = f'hello{sep}model_provider = "company"{sep}world'
+    config.write_text(f"notes = '{notes}'\n\n[features]\nhooks = true\n", encoding="utf-8")
+    monkeypatch.setattr("headroom.providers.codex.install.codex_config_path", lambda: config)
+
+    apply_provider_scope(_manifest(tmp_path))
+
+    parsed = loads_codex_config(config.read_text(encoding="utf-8"))
+    assert parsed["notes"] == notes
+    assert parsed["model_provider"] == "headroom"
 
 
 def test_persistent_install_helper_collision_preserves_config(tmp_path: Path, monkeypatch) -> None:

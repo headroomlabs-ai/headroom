@@ -113,7 +113,17 @@ class DiffCompressor:
             # call. Without this, every diff CCR marker emitted in
             # production is dangling — the regression fixed in the
             # audit-cleanup PR.
-            persist_rust_ccr_entry(content, r.compressed, cache_key, source="diff")
+            if not persist_rust_ccr_entry(content, r.compressed, cache_key, source="diff"):
+                return DiffCompressionResult(  # unstored original: no marker
+                    compressed=content,
+                    original_line_count=r.original_line_count,
+                    compressed_line_count=r.original_line_count,
+                    files_affected=r.files_affected,
+                    additions=r.additions,
+                    deletions=r.deletions,
+                    hunks_kept=r.hunks_kept + r.hunks_removed,
+                    hunks_removed=0,
+                )
         return DiffCompressionResult(
             compressed=r.compressed,
             original_line_count=r.original_line_count,

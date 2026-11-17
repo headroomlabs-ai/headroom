@@ -124,7 +124,7 @@ class RequestOutcome:
 
     # ── Output composition ────────────────────────────────────────────
     # ``output_tokens`` pools two quantities that different levers move in
-    # opposite directions: reasoning-effort routing cuts thinking, verbosity
+    # opposite directions: thinking-budget levers cut thinking, verbosity
     # steering cuts visible text. Summed, neither can be attributed — a turn
     # whose thinking dropped 4,000 tokens while its prose grew 200 is
     # indistinguishable from one where nothing happened.
@@ -250,7 +250,7 @@ class RequestOutcome:
         The quantity verbosity steering actually targets. Callers must handle
         ``None`` rather than defaulting it to ``output_tokens``: on a provider
         that reports no thinking count, treating the whole output as visible
-        would credit steering with reductions that reasoning-effort routing
+        would credit steering with reductions that a lower thinking budget
         produced.
 
         Clamped at zero because an inferred count comes from Headroom's
@@ -588,22 +588,25 @@ async def emit_request_outcome(handler: Any, outcome: RequestOutcome) -> None:
     # observed output tokens to the recorder so it can produce an honest
     # reduction estimate. Best-effort: never let bookkeeping break a response.
     output_tokens_saved_est = 0
+    # High end of the range when the saving is modelled from benchmark factors;
+    # equal to the point estimate otherwise. Only the lifetime totals carry it.
+    output_tokens_saved_high_est = 0
     if any(str(t).startswith("output_shaper:") for t in outcome.transforms_applied):
         try:
             from headroom.proxy.output_savings import get_recorder
 
             _rec = get_recorder()
 
-            def _record_and_estimate() -> int:
+            def _record_and_estimate() -> tuple[int, int]:
                 _rec.record_from_labels(outcome.transforms_applied, outcome.output_tokens)
-                return _rec.estimate_request_savings(
-                    outcome.transforms_applied, outcome.output_tokens
-                )
+                return _rec.request_savings_range(outcome.transforms_applied, outcome.output_tokens)
 
             # Both calls take the recorder lock, and the every-Nth record also
             # does a full read-modify-write of the ledger file — run them
             # together off the event loop (#18) so a slow flush can't stall it.
-            output_tokens_saved_est = await asyncio.to_thread(_record_and_estimate)
+            output_tokens_saved_est, output_tokens_saved_high_est = await asyncio.to_thread(
+                _record_and_estimate
+            )
         except Exception as exc:  # pragma: no cover - defensive
             logger.debug(
                 "Output savings record/estimate failed for request %s; booking 0: %s",
@@ -665,6 +668,14 @@ async def emit_request_outcome(handler: Any, outcome: RequestOutcome) -> None:
                     transforms_applied=tuple(str(t) for t in (outcome.transforms_applied or ())),
                     tokens_saved=outcome.tokens_saved,
                     novel_tokens_saved=novel_tokens_saved,
+                    attribution={
+                        dimension: label
+                        for dimension, label in (("project", project), ("client", outcome.client))
+                        if label
+                    },
+                    conversation_key=outcome.conversation_key,
+                    original_tokens=outcome.original_tokens,
+                    output_tokens_saved=output_tokens_saved_est,
                 ),
             )
         except Exception:  # noqa: BLE001 - telemetry must never break a response
@@ -723,6 +734,7 @@ async def emit_request_outcome(handler: Any, outcome: RequestOutcome) -> None:
         uncached_input_tokens=outcome.uncached_input_tokens,
         attempted_input_tokens=outcome.attempted_input_tokens,
         output_tokens_saved=output_tokens_saved_est,
+        output_tokens_saved_high=output_tokens_saved_high_est,
         project=project,
         client=outcome.client,
         tool_search_saved=tool_search_saved,
@@ -791,6 +803,7 @@ async def emit_request_outcome(handler: Any, outcome: RequestOutcome) -> None:
                 cache_read_tokens=outcome.cache_read_tokens,
                 cache_write_tokens=outcome.cache_write_tokens,
                 uncached_input_tokens=outcome.uncached_input_tokens,
+                provider_input_tokens=outcome.provider_input_tokens,
                 transforms_applied=list(outcome.transforms_applied),
                 savings_breakdown=savings_breakdown,
                 waste_signals=outcome.waste_signals,

@@ -12,12 +12,12 @@ FROM quay.io/pypa/manylinux_2_28_x86_64 AS builder
 ENV CARGO_HOME=/usr/local/cargo \
     RUSTUP_HOME=/usr/local/rustup \
     PATH=/usr/local/cargo/bin:/opt/python/cp311-cp311/bin:${PATH}
-RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
-      | sh -s -- -y --no-modify-path --profile minimal -c rustfmt -c clippy --default-toolchain 1.95.0
+COPY scripts/install-rustup.sh /tmp/install-rustup.sh
+RUN sh /tmp/install-rustup.sh -y --no-modify-path --profile minimal -c rustfmt -c clippy --default-toolchain 1.95.0
 
 WORKDIR /build
 
-COPY pyproject.toml uv.lock README.md ./
+COPY pyproject.toml uv.lock README.md README-pypi.md ./
 COPY Cargo.toml Cargo.lock rust-toolchain.toml ./
 COPY crates/ crates/
 COPY headroom/ headroom/

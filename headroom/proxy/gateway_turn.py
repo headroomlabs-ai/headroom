@@ -41,6 +41,7 @@ import dataclasses
 import json
 import logging
 import os
+import re
 import threading
 import time
 import uuid
@@ -49,7 +50,10 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any
 
+from headroom.proxy.gateway_native import VIEW_MARKER as GATEWAY_NATIVE_VIEW_MARKER
+from headroom.proxy.gateway_native import native_shape, view_shape
 from headroom.proxy.gateway_responses import VIEW_MARKER as GATEWAY_RESPONSES_VIEW_MARKER
+from headroom.proxy.gateway_responses import carries_view, is_responses_body
 from headroom.proxy.outcome import RequestOutcome
 from headroom.proxy.tool_schema_savings_policy import without_deferral_flags
 from headroom.proxy.turn_hooks import (
@@ -64,7 +68,13 @@ logger = logging.getLogger(__name__)
 
 # Keys that steer Headroom itself and must never reach the provider.
 BODY_CONTROL_KEYS: frozenset[str] = frozenset(
-    {"config", "gateway", "token_budget", GATEWAY_RESPONSES_VIEW_MARKER}
+    {
+        "config",
+        "gateway",
+        "token_budget",
+        GATEWAY_RESPONSES_VIEW_MARKER,
+        GATEWAY_NATIVE_VIEW_MARKER,
+    }
 )
 
 OBLIGATION_REDRIVE = "redrive"
@@ -208,9 +218,67 @@ def _parse_request_headers(raw: Any) -> dict[str, str]:
 
 
 def provider_for_model(model_name: str) -> str:
-    """The tracker-provider inference ``/v1/compress`` already uses."""
+    """The provider a model name implies, for routing advice and event pricing."""
     lowered = (model_name or "").lower()
     return "anthropic" if ("claude" in lowered or "anthropic" in lowered) else "openai"
+
+
+_OPENAI_ONLY_ROLES = frozenset({"system", "developer", "tool", "function"})
+_OPENAI_ONLY_BLOCKS = frozenset({"image_url", "input_audio", "input_text"})
+_ANTHROPIC_ONLY_BLOCKS = frozenset(
+    {"tool_use", "tool_result", "thinking", "redacted_thinking", "server_tool_use", "document"}
+)
+
+
+# Anthropic's own tools (server tools such as ``web_search_20250305`` and
+# client tools such as ``bash_20250124``) carry a dated ``type`` and no
+# ``input_schema``; OpenAI chat tools are ``function`` or ``custom``.
+_ANTHROPIC_DATED_TOOL_TYPE = re.compile(r"_\d{8}$")
+
+
+def _wire_provider_from_shape(body: dict[str, Any]) -> str | None:
+    """The provider a body's shape proves, or None when only the model can tell."""
+    # A view (Responses, Gemini, Converse) is chat-shaped: the pipeline and
+    # hooks see OpenAI chat messages, whatever the provider body looks like.
+    if carries_view(body) or is_responses_body(body) or view_shape(body) or native_shape(body):
+        return "openai"
+    if body.get("system") is not None:
+        return "anthropic"
+    tools = body.get("tools")
+    for tool in tools if isinstance(tools, list) else ():
+        if isinstance(tool, dict) and "input_schema" in tool:
+            return "anthropic"
+        tool_type = tool.get("type") if isinstance(tool, dict) else None
+        if isinstance(tool_type, str) and _ANTHROPIC_DATED_TOOL_TYPE.search(tool_type):
+            return "anthropic"
+        if isinstance(tool, dict) and "function" in tool:
+            return "openai"
+    messages = body.get("messages")
+    for message in messages if isinstance(messages, list) else ():
+        if not isinstance(message, dict):
+            continue
+        if message.get("role") in _OPENAI_ONLY_ROLES or message.get("tool_calls"):
+            return "openai"
+        content = message.get("content")
+        for block in content if isinstance(content, list) else ():
+            block_type = block.get("type") if isinstance(block, dict) else None
+            if not isinstance(block_type, str):
+                continue
+            if block_type in _ANTHROPIC_ONLY_BLOCKS or block_type.endswith("_tool_result"):
+                return "anthropic"
+            if block_type in _OPENAI_ONLY_BLOCKS:
+                return "openai"
+    return None
+
+
+def provider_for_body(body: dict[str, Any], model_name: str) -> str:
+    """The wire shape hooks and steering must treat a gateway body as.
+
+    A gateway can send any client's shape to any model: Claude Code's Anthropic
+    body to Gemini, an OpenAI chat body to Claude. The shape wins over the model
+    name; ``route.provider`` stays advice about the model.
+    """
+    return _wire_provider_from_shape(body) or provider_for_model(model_name)
 
 
 # --------------------------------------------------------------------------- #
@@ -257,6 +325,15 @@ class NormalizedUsage:
             return True
         return self.cache_read is not None and self.cache_write is not None
 
+    def _merged_includes_cache(self, other: NormalizedUsage) -> bool:
+        """Accounting dialect across rounds. A usage block without cache fields
+        carries no dialect (``normalize_usage`` defaults it to inclusive, which
+        is wrong for a cacheless Anthropic round), so the round that reported
+        cache fields decides; the latest such round wins."""
+        if other.has_cache_signal or not self.has_cache_signal:
+            return other.input_includes_cache
+        return self.input_includes_cache
+
     def merged_with(self, other: NormalizedUsage) -> NormalizedUsage:
         """Sum the billed counters across re-drive rounds; cache fields come
         from the latest round that carried them (the last provider call is the
@@ -272,6 +349,7 @@ class NormalizedUsage:
             output_tokens=_sum(self.output_tokens, other.output_tokens),
             cache_read=other.cache_read if other.has_cache_signal else self.cache_read,
             cache_write=other.cache_write if other.has_cache_signal else self.cache_write,
+            input_includes_cache=self._merged_includes_cache(other),
         )
 
     def summed_with(self, other: NormalizedUsage) -> NormalizedUsage:
@@ -290,6 +368,7 @@ class NormalizedUsage:
             output_tokens=_sum(self.output_tokens, other.output_tokens),
             cache_read=_sum(self.cache_read, other.cache_read),
             cache_write=_sum(self.cache_write, other.cache_write),
+            input_includes_cache=self._merged_includes_cache(other),
         )
 
     def as_anthropic(self) -> dict[str, int]:
@@ -319,22 +398,34 @@ def _usage_int(usage: dict[str, Any], name: str) -> int | None:
     return int(value)
 
 
-def normalize_usage(usage: dict[str, Any]) -> NormalizedUsage:
-    """Accept Anthropic, OpenAI chat, OpenAI Responses and Kong ``ai.proxy``
-    usage shapes; raise ``GatewayRequestError`` (a ``ValueError``) on booleans or negative counts.
+def _first_usage_int(usage: dict[str, Any], *names: str) -> int | None:
+    for name in names:
+        value = _usage_int(usage, name)
+        if value is not None:
+            return value
+    return None
 
-    Descends once into a nested ``usage`` key so a gateway can relay the whole
-    provider response body, or Kong's log ``ai.proxy`` block, unchanged.
+
+def normalize_usage(usage: dict[str, Any]) -> NormalizedUsage:
+    """Accept Anthropic, OpenAI chat, OpenAI Responses, Gemini ``usageMetadata``,
+    Bedrock Converse and Kong ``ai.proxy`` usage shapes; raise
+    ``GatewayRequestError`` (a ``ValueError``) on booleans or negative counts.
+
+    Descends once into a nested ``usage`` (or Gemini ``usageMetadata``) key so
+    a gateway can relay the whole provider response body, or Kong's log
+    ``ai.proxy`` block, unchanged.
     """
     if not isinstance(usage, dict):
         raise GatewayRequestError("usage must be an object.")
-    nested = usage.get("usage")
-    if isinstance(nested, dict):
-        usage = nested
+    for nested_key in ("usage", "usageMetadata"):
+        nested = usage.get(nested_key)
+        if isinstance(nested, dict):
+            usage = nested
+            break
 
-    input_tokens = _usage_int(usage, "input_tokens")
+    input_tokens = _first_usage_int(usage, "input_tokens", "prompt_tokens", "promptTokenCount")
     if input_tokens is None:
-        input_tokens = _usage_int(usage, "prompt_tokens")
+        input_tokens = _usage_int(usage, "inputTokens")
     # Anthropic alone reports the prompt split in two: ``input_tokens`` is the
     # uncached remainder and the cached part sits in its own two counters.
     # Everywhere else the reported prompt total already contains the cached
@@ -344,15 +435,26 @@ def normalize_usage(usage: dict[str, Any]) -> NormalizedUsage:
     # vocabularies, and then it errs towards not inflating the prompt.
     # Responses' ``input_tokens_details`` marks an inclusive total even when a
     # relay also flattened a top-level read beside it.
-    input_includes_cache = "input_tokens_details" in usage or not (
-        "cache_read_input_tokens" in usage or "cache_creation_input_tokens" in usage
+    # Bedrock Converse splits it the same way (``inputTokens`` beside
+    # ``cacheReadInputTokens``/``cacheWriteInputTokens``); Gemini's
+    # ``promptTokenCount`` includes ``cachedContentTokenCount``.
+    input_includes_cache = "input_tokens_details" in usage or not any(
+        key in usage
+        for key in (
+            "cache_read_input_tokens",
+            "cache_creation_input_tokens",
+            "cacheReadInputTokens",
+            "cacheWriteInputTokens",
+        )
     )
-    output_tokens = _usage_int(usage, "output_tokens")
-    if output_tokens is None:
-        output_tokens = _usage_int(usage, "completion_tokens")
+    output_tokens = _first_usage_int(
+        usage, "output_tokens", "completion_tokens", "candidatesTokenCount", "outputTokens"
+    )
 
-    cache_read = _usage_int(usage, "cache_read_input_tokens")
-    cache_write = _usage_int(usage, "cache_creation_input_tokens")
+    cache_read = _first_usage_int(
+        usage, "cache_read_input_tokens", "cacheReadInputTokens", "cachedContentTokenCount"
+    )
+    cache_write = _first_usage_int(usage, "cache_creation_input_tokens", "cacheWriteInputTokens")
     if cache_write is None:
         # Responses reports billed writes as input_tokens_details.cache_write_tokens;
         # chat reports none. Read whether or not a top-level read was relayed.
@@ -549,9 +651,9 @@ class PendingTurn:
     ccr_armed: bool = False
     # The wire shape this turn arrived in, when it is not the one `provider`
     # implies: "openai_responses" for a Codex body. Deliberately separate from
-    # `provider`, which picks pricing, tokenizer and the upstream the gateway
-    # is advised to call -- all three want "openai" for a Responses turn while
-    # the tool-call shape and the re-drive body want "openai_responses".
+    # `provider`, the chat-level wire shape (see `provider_for_body`), which
+    # wants "openai" for a Responses turn while the tool-call shape and the
+    # re-drive body want "openai_responses".
     wire_shape: str | None = None
 
     @property
@@ -839,6 +941,7 @@ class RequestTransformer:
         config: Any,
         tags: dict[str, Any],
         caps: GatewayCapabilities,
+        conversation: str | None = None,
     ) -> None:
         self.provider = provider
         self.model_name = model_name
@@ -846,6 +949,8 @@ class RequestTransformer:
         self.config = config
         self.tags = tags
         self.caps = caps
+        # ``TurnContext.conversation``: the gateway session, when one is named.
+        self.conversation = conversation
         self.result: RequestTransformResult | None = None
         # Tool-definition tokens the request hooks ADDED (e.g. a search tool).
         # The compress handler adds it to ``tokens_after``: it is sent too.
@@ -855,6 +960,11 @@ class RequestTransformer:
         # (booked on turn_hook_tools_saved_tokens), for signed netting.
         self.message_growth_tokens = 0
         self.hook_tool_saved_tokens = 0
+        # Tool-definition tokens before and after schema compaction, both 0 when
+        # it changed nothing or could not be counted. The compress handler folds
+        # them into ``tokens_before``/``tokens_after``, as the chat handlers do.
+        self.compaction_tokens_before = 0
+        self.compaction_tokens_after = 0
         self._tokenizer: Any = None
 
     def _get_tokenizer(self) -> Any:
@@ -895,6 +1005,15 @@ class RequestTransformer:
             count_tools = _count_tools_with(tokenizer)
         except Exception:
             logger.debug("gateway turn: tokenizer unavailable; hook savings uncounted")
+        if tool_transforms:
+            # Counted before any hook runs: a hook may edit the compacted list.
+            # Tools the client already deferred are not billed, so their
+            # compaction saves nothing.
+            compacted_before = _safe_count(count_tools, _billed_tools(self.tools))
+            compacted_after = _safe_count(count_tools, _billed_tools(tools))
+            if compacted_before is not None and compacted_after is not None:
+                self.compaction_tokens_before = compacted_before
+                self.compaction_tokens_after = compacted_after
 
         # Built even with no hook registered: the response half drives CCR
         # retrieval through the same context (messages + live tools).
@@ -907,6 +1026,7 @@ class RequestTransformer:
             tags=self.tags,
             count_messages=count_messages,
             count_tools=count_tools,
+            conversation=self.conversation,
         )
         if hooks:
             msg_before = _safe_count(count_messages, messages)
@@ -968,6 +1088,13 @@ class RequestTransformer:
             messages_rewritten=messages_rewritten,
         )
         return messages
+
+
+def _billed_tools(tools: Any) -> Any:
+    """The tools that enter the billed context: all but those flagged ``defer_loading``."""
+    if not isinstance(tools, list):
+        return tools
+    return [t for t in tools if not (isinstance(t, dict) and t.get("defer_loading"))]
 
 
 def _safe_count(counter: Callable[[Any], int] | None, value: Any) -> int | None:
@@ -1080,10 +1207,20 @@ def build_provider_body(
     forwarded uncompressed -- a smaller request is worth nothing next to a
     transcript the provider will reject.
     """
+    from headroom.proxy.gateway_native import apply_view as apply_native_view
     from headroom.proxy.gateway_responses import apply_view as apply_responses_view
-    from headroom.proxy.gateway_responses import carries_view, is_responses_body
 
     out = {k: v for k, v in body.items() if k not in BODY_CONTROL_KEYS}
+    if view_shape(body):
+        # Gemini and Converse: same contract as Responses, and their tools
+        # are not a chat `tools` list, so they are forwarded as sent.
+        out, aligned = apply_native_view(out, body[GATEWAY_NATIVE_VIEW_MARKER], messages)
+        if not aligned:
+            logger.warning(
+                "gateway turn: %s view did not map back; forwarding the original transcript",
+                view_shape(body),
+            )
+        return out
     if carries_view(body):
         out, applied = apply_responses_view(out, messages)
         out.pop("messages", None)
@@ -1094,7 +1231,7 @@ def build_provider_body(
             logger.warning(
                 "gateway turn: Responses view did not map back; forwarding the original input"
             )
-    elif is_responses_body(out):
+    elif is_responses_body(out) or native_shape(out):
         # A Responses body that never got a view: the bypass header returns
         # before one is built. Adding `messages` here is a guaranteed 400
         # ("Unsupported parameter: 'messages'"), so the safest path in the
@@ -1143,7 +1280,6 @@ def gateway_response_fields(
     request: Any,
     body: dict[str, Any],
     caps: GatewayCapabilities,
-    provider: str,
     messages: list[dict[str, Any]],
     tools: Any,
     obligations: list[str],
@@ -1156,11 +1292,25 @@ def gateway_response_fields(
     return {
         "body": provider_body,
         "turn_id": turn_id,
-        "route": build_route(request, provider_body, provider),
+        "route": build_route(
+            request, provider_body, provider_for_model(str(provider_body.get("model") or ""))
+        ),
         "obligations": list(obligations),
         "gateway": caps.echo(),
         "headers": dict(headers or {}),
+        "wire_shape": wire_shape(body),
     }
+
+
+def wire_shape(body: dict[str, Any]) -> str:
+    """The request shape this turn read: ``gemini``, ``converse``,
+    ``openai_responses``, or ``messages`` (Chat Completions or Anthropic).
+
+    Echoed so a caller can tell an answer in its own shape from one by an
+    older Headroom that read the body as something else."""
+    if carries_view(body):
+        return "openai_responses"
+    return view_shape(body) or "messages"
 
 
 # --------------------------------------------------------------------------- #
@@ -1436,7 +1586,7 @@ def _emit_response_received(proxy: Any, turn: PendingTurn, response: Any, status
             PipelineStage.RESPONSE_RECEIVED,
             operation="gateway.turn",
             request_id=(turn.outcome_draft.request_id if turn.outcome_draft else turn.turn_id),
-            provider=turn.provider,
+            provider=provider_for_model(turn.model),
             model=turn.model,
             response=response,
             metadata={

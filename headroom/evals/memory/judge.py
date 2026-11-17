@@ -17,7 +17,7 @@ from __future__ import annotations
 import logging
 from collections.abc import Callable
 
-from headroom.offline import guard_egress
+from headroom.offline import guard_egress, pin_litellm_cost_map_local
 
 logger = logging.getLogger(__name__)
 
@@ -169,11 +169,14 @@ def create_litellm_judge(
         score, reasoning = judge_fn(question, ground_truth, prediction)
     """
     try:
+        pin_litellm_cost_map_local()
         import litellm
     except ImportError as e:
         raise ImportError(
             "LiteLLM package required for LLM judge. Install with: pip install litellm"
         ) from e
+
+    guard_egress(f"{model} API for the memory eval LLM judge")
 
     def judge(question: str, ground_truth: str, prediction: str) -> tuple[float, str]:
         prompt = JUDGE_PROMPT.format(

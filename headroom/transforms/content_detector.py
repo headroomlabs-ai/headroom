@@ -770,9 +770,50 @@ def _try_detect_tabular(content: str) -> DetectionResult | None:
 
     md_result = _try_detect_markdown_table(lines)
     if md_result:
-        return md_result
+        # The tabular compressor replaces the whole payload with the table's
+        # rows, so a table with a heading, prose or other output around it is
+        # not tabular content: every line outside the table would be dropped.
+        if _is_whole_markdown_table(content):
+            return md_result
+        # It can still be CSV holding markdown in a quoted field. Its pipes
+        # belong to that markdown, so they are never the delimiter here.
+        delimited = _try_detect_delimited(lines)
+        if delimited and delimited.metadata.get("delimiter") != "|":
+            return delimited
+        return None
 
     return _try_detect_delimited(lines)
+
+
+def _is_whole_markdown_table(content: str) -> bool:
+    """True when ``content`` is one markdown table and nothing else.
+
+    A blank line ends a markdown table, so every line after the header and
+    separator has to be a row: written in the header's leading-pipe style,
+    and neither another separator nor a list item. A note or a second table
+    straight after the rows means the content is not just the table.
+
+    Every row must also split into exactly the header's cells, the way the
+    tabular parser splits it, or the records built from it would truncate or
+    pad the row. The parser does not unescape ``\\|``, so a table that uses it
+    is left alone too.
+    """
+    if "\\|" in content:
+        return False
+    rows = content.strip().split("\n")
+    if len(rows) < 3 or not _is_md_separator(rows[1]):
+        return False
+    cols = _md_cell_count(rows[0])
+    if cols < 2:
+        return False
+    leading_pipe = rows[0].lstrip().startswith("|")
+    return all(
+        _md_cell_count(row) == cols
+        and row.lstrip().startswith("|") == leading_pipe
+        and not _is_md_separator(row)
+        and not _FIXED_WIDTH_LIST_RE.match(row)
+        for row in rows[2:]
+    )
 
 
 # Fixed-width (space-aligned) command output: `ls -l`, `ps aux`, `df -h`,

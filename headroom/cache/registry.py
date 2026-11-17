@@ -31,7 +31,14 @@ class CacheOptimizerRegistry:
     """
 
     _optimizers: dict[str, type[BaseCacheOptimizer]] = {}
-    _instances: dict[str, BaseCacheOptimizer] = {}
+    _instances: dict[tuple[str, int | None], BaseCacheOptimizer] = {}
+
+    @classmethod
+    def _invalidate_instances(cls, name: str) -> None:
+        """Discard every configuration cached for this exact registration."""
+        for key in list(cls._instances):
+            if key[0] == name:
+                del cls._instances[key]
 
     @classmethod
     def register(
@@ -57,8 +64,8 @@ class CacheOptimizerRegistry:
                 f"Optimizer '{name}' already registered. Use override=True to replace."
             )
         cls._optimizers[name] = optimizer_class
-        # Clear cached instance if exists
-        cls._instances.pop(name, None)
+        # Configured instances must not outlive their registered implementation.
+        cls._invalidate_instances(name)
 
     @classmethod
     def unregister(cls, name: str) -> None:
@@ -69,7 +76,7 @@ class CacheOptimizerRegistry:
             name: Name to unregister
         """
         cls._optimizers.pop(name, None)
-        cls._instances.pop(name, None)
+        cls._invalidate_instances(name)
 
     @classmethod
     def get(
@@ -109,7 +116,7 @@ class CacheOptimizerRegistry:
             raise KeyError(f"No optimizer registered for '{key}'. Available: {available}")
 
         # Return cached instance if requested
-        cache_key = f"{key}:{id(config)}" if config else key
+        cache_key = (key, id(config) if config is not None else None)
         if cached and cache_key in cls._instances:
             return cls._instances[cache_key]
 

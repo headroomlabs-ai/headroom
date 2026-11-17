@@ -314,6 +314,31 @@ class TestCreateCompressToolMessagesNode:
 
         assert result_state["messages"][2].tool_call_id == "call_xyz"
 
+    def test_node_replaces_tool_message_in_graph_state(self):
+        """In a real graph the compressed result replaces the original, not joins it."""
+        from typing import Annotated, TypedDict
+
+        langgraph_graph = pytest.importorskip("langgraph.graph")
+        from langgraph.graph.message import add_messages
+
+        from headroom.integrations.langchain.langgraph import create_compress_tool_messages_node
+
+        class State(TypedDict):
+            messages: Annotated[list, add_messages]
+
+        large_output = _make_large_tool_output(200)
+        graph = langgraph_graph.StateGraph(State)
+        graph.add_node("compress", create_compress_tool_messages_node())
+        graph.add_edge(langgraph_graph.START, "compress")
+        graph.add_edge("compress", langgraph_graph.END)
+
+        out = graph.compile().invoke({"messages": _make_messages_with_tool_output(large_output)})
+
+        tool_messages = [m for m in out["messages"] if isinstance(m, ToolMessage)]
+        assert len(out["messages"]) == 3
+        assert len(tool_messages) == 1
+        assert len(tool_messages[0].content) < len(large_output)
+
     def test_node_handles_empty_state(self):
         """Node should handle empty messages gracefully."""
         from headroom.integrations.langchain.langgraph import create_compress_tool_messages_node

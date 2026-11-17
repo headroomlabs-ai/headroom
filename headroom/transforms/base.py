@@ -13,14 +13,15 @@ from ..tokenizer import Tokenizer
 logger = logging.getLogger(__name__)
 
 
-def persist_rust_ccr_entry(original: str, compressed: str, cache_key: str, *, source: str) -> None:
+def persist_rust_ccr_entry(original: str, compressed: str, cache_key: str, *, source: str) -> bool:
     """Store a Rust-emitted CCR entry in the production ``CompressionStore``.
 
     The Rust search/diff/log compressors emit a retrieval marker but keep the
     original only in their in-memory test store. This writes it through to the
     long-lived Python store so the marker resolves. Failures are logged at
     warning level with ``source`` (the compressor name): a store hiccup must not
-    break the response, just degrade retrieval.
+    break the response. Returns whether the store kept it; when it did not, the
+    caller returns the input unchanged rather than a marker that points nowhere.
     """
     try:
         from ..cache.compression_store import get_compression_store
@@ -32,13 +33,14 @@ def persist_rust_ccr_entry(original: str, compressed: str, cache_key: str, *, so
             safe_id(e),
         )
         logger.debug("CCR store import failure detail: %s", describe_exception(e))
-        return
+        return False
     try:
         store: Any = get_compression_store()
         # The Rust-emitted marker embeds MD5(original)[:24], but store() has
         # defaulted to SHA-256(original)[:24] since PR #395. Pass the marker's
         # key explicitly so retrieving the marker hash finds the entry (#816).
         store.store(original, compressed, explicit_hash=cache_key)
+        return True
     except Exception as e:
         # Store backends can echo the payload in errors. The WARNING names only
         # the exception type; the DEBUG record has types and code locations, or
@@ -50,6 +52,7 @@ def persist_rust_ccr_entry(original: str, compressed: str, cache_key: str, *, so
             cache_key,
         )
         logger.debug("CCR store write failure detail: %s", describe_exception(e))
+        return False
 
 
 class Transform(ABC):

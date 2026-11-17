@@ -81,6 +81,35 @@ def test_register_server_merges_into_commented_jsonc(
     assert data["mcp"]["headroom"]["command"] == ["headroom", "mcp"]
 
 
+@pytest.mark.parametrize(
+    "contents",
+    [
+        # trailing comment on the last key (no comma before the //)
+        '{\n  "theme": "dracula",\n  "model": "anthropic/claude-sonnet-4" // default model\n}\n',
+        # block comment
+        '{\n  /* user settings */\n  "theme": "dracula",\n  "model": "anthropic/claude-sonnet-4"\n}\n',
+        # trailing comma, which JSONC allows
+        '{\n  "theme": "dracula",\n  "model": "anthropic/claude-sonnet-4",\n}\n',
+    ],
+    ids=["trailing-line-comment", "block-comment", "trailing-comma"],
+)
+def test_register_server_accepts_other_jsonc_syntax(tmp_path: Path, contents: str) -> None:
+    """Every JSONC form OpenCode itself reads must merge, not fail as "not valid JSON"."""
+    config_path = tmp_path / "opencode.jsonc"
+    config_path.write_text(contents, encoding="utf-8")
+    registrar = OpencodeRegistrar(config_path=config_path)
+
+    spec = ServerSpec(name="headroom", command="headroom", args=("mcp",), env={})
+    result = registrar.register_server(spec)
+
+    assert result.status == RegisterStatus.REGISTERED, result.detail
+    data = json.loads(config_path.read_text(encoding="utf-8"))
+    assert data["theme"] == "dracula"
+    assert data["model"] == "anthropic/claude-sonnet-4"
+    assert data["mcp"]["headroom"]["command"] == ["headroom", "mcp"]
+    assert registrar.get_server("headroom") is not None
+
+
 def test_detect_when_binary_present(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """Detection succeeds when the opencode binary is in PATH."""
     monkeypatch.setenv("PATH", str(tmp_path))
@@ -150,7 +179,17 @@ def test_register_server_creates_config_when_missing(tmp_path: Path) -> None:
     }
 
 
-@pytest.mark.parametrize("contents", ["not json", "{", '{"theme": }', "[]"])
+@pytest.mark.parametrize(
+    "contents",
+    [
+        "not json",
+        "{",
+        '{"theme": }',
+        "[]",
+        # An unterminated block comment must not be read as "comment to EOF".
+        '{"theme": "dark"}\n/* unfinished notes\n"keep": "me"\n',
+    ],
+)
 def test_register_server_preserves_malformed_config(tmp_path: Path, contents: str) -> None:
     """Registering must NOT clobber an existing but unparseable opencode.json.
 
