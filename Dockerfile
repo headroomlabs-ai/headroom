@@ -1,14 +1,17 @@
+# Base images are written as literal tag@digest FROM lines so a re-pushed tag
+# cannot change what CI and release builds run, and Dependabot (which does not
+# expand ARGs) can refresh the digests. PYTHON_VERSION must match the python
+# base images; the builder stage fails if it does not.
 ARG PYTHON_VERSION=3.13
-# Base images are pinned by digest so a re-pushed tag cannot change what CI and
-# release builds run. PYTHON_IMAGE_DIGEST is the multi-arch index digest of
-# python:${PYTHON_VERSION}-slim; change both together.
-ARG PYTHON_IMAGE_DIGEST=sha256:e48f59cdba69a3cbd9ed2cf0f348d90d45a8d350d98134cf1070bc106ee9ed90
 ARG UV_VERSION=0.11.18
-ARG DISTROLESS_IMAGE=gcr.io/distroless/python3-debian13@sha256:60faad2efce94a847f32e2adbcaefeb2e4fd3e3a78075a3abb600904a5e010e9
 ARG PYTHON_SITE_PACKAGES=/usr/local/lib/python${PYTHON_VERSION}/site-packages
 
 # ---- Build stage: compile native extensions, build wheel ----
-FROM python:${PYTHON_VERSION}-slim@${PYTHON_IMAGE_DIGEST} AS builder
+FROM python:3.13-slim@sha256:e48f59cdba69a3cbd9ed2cf0f348d90d45a8d350d98134cf1070bc106ee9ed90 AS builder
+
+ARG PYTHON_VERSION
+RUN actual="$(python -c 'import sys; print("%d.%d" % sys.version_info[:2])')" && \
+    [ "$actual" = "${PYTHON_VERSION}" ] || { echo "PYTHON_VERSION=${PYTHON_VERSION} but the base image has Python $actual; update the FROM lines and PYTHON_VERSION together" >&2; exit 1; }
 
 ARG UV_VERSION
 ARG PYTHON_SITE_PACKAGES
@@ -175,7 +178,7 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
     cp target/release/headroom-proxy /usr/local/bin/headroom-proxy
 
 # ---- Runtime stage (python-slim): supports root/nonroot via build arg ----
-FROM python:${PYTHON_VERSION}-slim@${PYTHON_IMAGE_DIGEST} AS runtime-slim-base
+FROM python:3.13-slim@sha256:e48f59cdba69a3cbd9ed2cf0f348d90d45a8d350d98134cf1070bc106ee9ed90 AS runtime-slim-base
 
 ARG RUNTIME_USER=nonroot
 ARG RUNTIME_HOME=/home/nonroot
@@ -228,10 +231,10 @@ ENTRYPOINT ["headroom", "proxy"]
 
 # Distroless has no shell, so the ~/.headroom state directory cannot be made
 # with RUN there. Build it here and COPY it in with the right owner (#4443).
-FROM python:${PYTHON_VERSION}-slim@${PYTHON_IMAGE_DIGEST} AS runtime-slim-state
+FROM python:3.13-slim@sha256:e48f59cdba69a3cbd9ed2cf0f348d90d45a8d350d98134cf1070bc106ee9ed90 AS runtime-slim-state
 RUN mkdir -p /state/.headroom
 
-FROM ${DISTROLESS_IMAGE} AS runtime-slim
+FROM gcr.io/distroless/python3-debian13@sha256:60faad2efce94a847f32e2adbcaefeb2e4fd3e3a78075a3abb600904a5e010e9 AS runtime-slim
 
 ARG RUNTIME_USER=nonroot
 ARG RUNTIME_HOME=/home/nonroot

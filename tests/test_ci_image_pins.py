@@ -44,14 +44,39 @@ def test_every_external_base_image_is_pinned_by_digest(dockerfile: str) -> None:
         )
 
 
+CONSTRAINED_INSTALL = re.compile(r"pip install\b[^\n]*?(?:-c|--constraints) /tmp/constraints\.txt")
+MATURIN_SPEC = re.compile(r"maturin\s*([<>=!~]=?)")
+TOOL_VERSION = {
+    "maturin": re.compile(r"maturin==(\d[\w.]*)|ARG MATURIN_VERSION=(\d[\w.]*)"),
+    "uv": re.compile(r"\buv==(\d[\w.]*)|ARG UV_VERSION=(\d[\w.]*)"),
+}
+
+
+def _tool_versions(text: str, tool: str) -> set[str]:
+    return {a or b for a, b in TOOL_VERSION[tool].findall(text)}
+
+
 @pytest.mark.parametrize("dockerfile", CI_DOCKERFILES)
 def test_installs_use_exact_versions(dockerfile: str) -> None:
     text = (ROOT / dockerfile).read_text(encoding="utf-8")
     assert "--upgrade pip" not in text, f"{dockerfile}: pin pip instead of upgrading it"
-    assert "maturin>=" not in text, f"{dockerfile}: pin maturin to one version"
-    assert "--constraints /tmp/constraints.txt" in text or "-c /tmp/constraints.txt" in text, (
+    specs = MATURIN_SPEC.findall(text)
+    assert specs and set(specs) == {"=="}, (
+        f"{dockerfile}: maturin must be pinned with ==, got {specs}"
+    )
+    assert CONSTRAINED_INSTALL.search(text), (
         f"{dockerfile}: install the uv.lock dependency set as constraints"
     )
+
+
+def test_build_tools_are_the_same_version_in_every_ci_dockerfile() -> None:
+    for tool in TOOL_VERSION:
+        found = {
+            name: _tool_versions((ROOT / name).read_text(encoding="utf-8"), tool)
+            for name in CI_DOCKERFILES
+        }
+        assert all(len(versions) == 1 for versions in found.values()), (tool, found)
+        assert len(set().union(*found.values())) == 1, (tool, found)
 
 
 def test_bind_security_probe_image_is_pinned_by_digest() -> None:
