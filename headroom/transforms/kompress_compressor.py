@@ -1721,7 +1721,9 @@ def ccr_retrieval_marker(
     )
 
 
-def store_kompress_in_ccr(original: str, compressed: str, original_tokens: int) -> str | None:
+def store_kompress_in_ccr(
+    original: str, compressed: str, original_tokens: int, *, record_toin: bool = True
+) -> str | None:
     """Store an original->compressed mapping in the proxy-local CCR store and
     return its retrieval hash (or None on any failure).
 
@@ -1729,6 +1731,11 @@ def store_kompress_in_ccr(original: str, compressed: str, original_tokens: int) 
     (:mod:`headroom.transforms.kompress_remote`) share one CCR policy. Model-free
     — touches only the compression store + telemetry, never the ONNX model — so
     it works in a sandboxed proxy installed without the ``[ml]`` extra.
+
+    ``record_toin=False`` still stores in CCR (the compressed output stays
+    retrievable) but skips the TOIN observation for this call. Callers pass
+    it when the request's ``CompressionPolicy`` has ``toin_read_only=True``
+    (Subscription, F2.2), mirroring ``SmartCrusher.crush(record_toin=...)``.
     """
     try:
         from ..cache.compression_store import get_compression_store
@@ -1750,17 +1757,18 @@ def store_kompress_in_ccr(original: str, compressed: str, original_tokens: int) 
             tool_signature_hash=signature.structure_hash,
             compression_strategy="kompress",
         )
-        with contextlib.suppress(Exception):
-            from ..telemetry import get_toin
+        if record_toin:
+            with contextlib.suppress(Exception):
+                from ..telemetry import get_toin
 
-            get_toin().record_compression(
-                tool_signature=signature,
-                original_count=original_tokens,
-                compressed_count=compressed_tokens,
-                original_tokens=original_tokens,
-                compressed_tokens=compressed_tokens,
-                strategy="kompress",
-            )
+                get_toin().record_compression(
+                    tool_signature=signature,
+                    original_count=original_tokens,
+                    compressed_count=compressed_tokens,
+                    original_tokens=original_tokens,
+                    compressed_tokens=compressed_tokens,
+                    strategy="kompress",
+                )
         return cache_key
     except Exception as e:
         # Store backends can echo the payload in errors, so no level logs it;
@@ -1937,6 +1945,7 @@ class KompressCompressor(Transform):
         *,
         allow_download: bool = True,
         ccr_original: str | None = None,
+        record_toin: bool = True,
         _deadline_started_at: float | None = None,
         _time_budget_cap_seconds: float | None = None,
     ) -> KompressResult:
@@ -1959,6 +1968,10 @@ class KompressCompressor(Transform):
                 ``content`` is a tag-protected placeholder intermediate
                 ({{HEADROOM_TAG_N}}); passing the pre-protection original keeps a
                 later full retrieval lossless. Defaults to ``content``.
+            record_toin: When False, the CCR store still records the mapping
+                but no TOIN observation is written for this call. The router
+                passes it when the request policy is ``toin_read_only``
+                (Subscription, F2.2).
 
         Returns:
             KompressResult with compressed text.
@@ -2000,6 +2013,7 @@ class KompressCompressor(Transform):
                     target_ratio=[target_ratio],
                     batch_size=_batch_size(),
                     ccr_originals=[ccr_original],
+                    record_toin=record_toin,
                     _deadline_started_at=t_deadline,
                     _time_budget_cap_seconds=_time_budget_cap_seconds,
                 )
@@ -2203,7 +2217,8 @@ class KompressCompressor(Transform):
             if self.config.enable_ccr:
                 ccr_source = ccr_original if ccr_original is not None else content
                 ccr_source_tokens = len(ccr_source.split())
-                cache_key = self._store_in_ccr(ccr_source, compressed, ccr_source_tokens)
+                gate: dict[str, bool] = {} if record_toin else {"record_toin": False}
+                cache_key = self._store_in_ccr(ccr_source, compressed, ccr_source_tokens, **gate)
                 if cache_key:
                     # Report the source line span so a reader can tell content was
                     # compressed away rather than absent — "items" counts words, which
@@ -2298,6 +2313,7 @@ class KompressCompressor(Transform):
         batch_size: int = 32,
         *,
         ccr_originals: list[str | None] | None = None,
+        record_toin: bool = True,
         _deadline_started_at: float | None = None,
         _time_budget_cap_seconds: float | None = None,
     ) -> list[KompressResult]:
@@ -2408,6 +2424,7 @@ class KompressCompressor(Transform):
                     question=question,
                     target_ratio=r,
                     ccr_original=ccr_source,
+                    record_toin=record_toin,
                     _deadline_started_at=t_deadline,
                     _time_budget_cap_seconds=(
                         None if cap_ends_at is None else cap_ends_at - time.monotonic()
@@ -2643,7 +2660,8 @@ class KompressCompressor(Transform):
                 if ccr_source is None:
                     ccr_source = content
                 ccr_source_tokens = len(ccr_source.split())
-                cache_key = self._store_in_ccr(ccr_source, compressed, ccr_source_tokens)
+                gate: dict[str, bool] = {} if record_toin else {"record_toin": False}
+                cache_key = self._store_in_ccr(ccr_source, compressed, ccr_source_tokens, **gate)
                 if cache_key:
                     # Report the source line span so a reader can tell content was
                     # compressed away rather than absent — "items" counts words, which
@@ -2752,6 +2770,8 @@ class KompressCompressor(Transform):
         **kwargs: Any,
     ) -> TransformResult:
         """Apply Kompress compression to messages (Transform interface)."""
+        policy = kwargs.get("compression_policy")
+        record_toin = not (policy is not None and policy.toin_read_only)
         tokens_before = sum(tokenizer.count_text(str(m.get("content", ""))) for m in messages)
         transformed = []
         transforms_applied = []
@@ -2769,7 +2789,7 @@ class KompressCompressor(Transform):
             # Compress tool outputs and long assistant messages
             # Model decides how much — no hardcoded ratios
             if role in ("tool", "assistant"):
-                result = self.compress(content)
+                result = self.compress(content, record_toin=record_toin)
                 if result.compression_ratio < 0.9:
                     transformed.append({**message, "content": result.compressed})
                     transforms_applied.append(f"kompress:{role}:{result.compression_ratio:.2f}")
@@ -2787,5 +2807,7 @@ class KompressCompressor(Transform):
             transforms_applied=transforms_applied or ["kompress:noop"],
         )
 
-    def _store_in_ccr(self, original: str, compressed: str, original_tokens: int) -> str | None:
-        return store_kompress_in_ccr(original, compressed, original_tokens)
+    def _store_in_ccr(
+        self, original: str, compressed: str, original_tokens: int, *, record_toin: bool = True
+    ) -> str | None:
+        return store_kompress_in_ccr(original, compressed, original_tokens, record_toin=record_toin)
