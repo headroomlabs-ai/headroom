@@ -105,8 +105,14 @@ def test_all_extra_does_not_require_torch_on_macos_x86_64() -> None:
         }
     )
 
-    assert "ml" in optional_deps[ALL_EXTRA][0]
-    assert "voice" in optional_deps[ALL_EXTRA][0]
+    all_requirements = [Requirement(dep) for dep in optional_deps[ALL_EXTRA]]
+    all_nested_extras = {
+        extra
+        for requirement in all_requirements
+        if requirement.name == HEADROOM_PACKAGE_NAME
+        for extra in requirement.extras
+    }
+    assert not {"ml", "memory", "evals", "voice"} & all_nested_extras
 
     torch_deps = [
         dep
@@ -130,6 +136,20 @@ def test_all_extra_does_not_require_torch_on_macos_x86_64() -> None:
     assert locked_torch_transitive_dependency_names
     assert TORCH_PACKAGE_NAME not in selected_all_dependency_names
     assert selected_all_dependency_names.isdisjoint(locked_torch_transitive_dependency_names)
+
+    # Explicit opt-ins still honor the Intel macOS wheel guard independently
+    # of whether the default installation profile requests them.
+    for extra_name in ("ml", "voice"):
+        selected = _selected_dependency_names_for_extra(
+            optional_deps, extra_name, macos_x86_64_environment
+        )
+        assert TORCH_PACKAGE_NAME not in selected
+        assert selected.isdisjoint(locked_torch_transitive_dependency_names)
+
+        linux_environment = dict(macos_x86_64_environment, sys_platform="linux")
+        assert TORCH_PACKAGE_NAME in _selected_dependency_names_for_extra(
+            optional_deps, extra_name, linux_environment
+        )
 
 
 def test_proxy_extra_includes_orjson_for_litellm_backends() -> None:

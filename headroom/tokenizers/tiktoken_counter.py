@@ -187,6 +187,8 @@ def get_encoding_for_model(model: str) -> str:
     # o200k_base instead of cl100k_base for unknown gpt-4 snapshots.
     for prefix, encoding in (
         ("gpt-4o", "o200k_base"),
+        # chatgpt-4o-latest and dated chatgpt-4o-* aliases are GPT-4o.
+        ("chatgpt-4o-", "o200k_base"),
         # gpt-4.1 / gpt-4.5 use o200k_base and MUST precede the "gpt-4" prefix,
         # which they would otherwise match and be mis-encoded as cl100k_base.
         ("gpt-4.1", "o200k_base"),

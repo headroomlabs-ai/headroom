@@ -99,6 +99,10 @@ class CompressTurn(Protocol):
     # And ``compaction_tokens_before``/``compaction_tokens_after``, the tool
     # definitions before and after the schema compaction ``transform`` ran,
     # which the handler folds into both endpoints as the chat handlers do.
+    # In the other direction: a turn with a writable ``conversation: str |
+    # None`` attribute has it set before ``prepare`` to an opaque key for the
+    # request's session (None without one), for its hooks'
+    # ``TurnContext.conversation``.
 
     def finish(
         self,
