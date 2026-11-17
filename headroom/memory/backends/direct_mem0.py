@@ -335,7 +335,7 @@ class DirectMem0Adapter:
         return list(response.data[0].embedding)
 
     def _generate_id(self, content: str, user_id: str) -> str:
-        """Generate a deterministic ID for a memory."""
+        """Generate a unique (time-salted) ID for a memory."""
         hash_input = f"{user_id}:{content}:{_utcnow().isoformat()}"
         return hashlib.sha256(hash_input.encode()).hexdigest()[:32]
 
@@ -345,6 +345,7 @@ class DirectMem0Adapter:
         user_id: str,
         importance: float,
         metadata: dict[str, Any] | None = None,
+        memory_ids: list[str] | None = None,
     ) -> list[str]:
         """Write pre-extracted facts directly to Qdrant.
 
@@ -358,19 +359,21 @@ class DirectMem0Adapter:
             user_id: User identifier.
             importance: Importance score.
             metadata: Optional additional metadata.
+            memory_ids: Optional IDs to store the facts under, one per fact.
 
         Returns:
             List of memory IDs for the stored facts.
         """
         from qdrant_client.models import PointStruct
 
+        if memory_ids is None:
+            memory_ids = [self._generate_id(fact, user_id) for fact in facts]
+        elif len(memory_ids) != len(facts):
+            raise ValueError(f"Got {len(memory_ids)} memory IDs for {len(facts)} facts")
+
         points = []
-        memory_ids = []
 
-        for fact in facts:
-            memory_id = self._generate_id(fact, user_id)
-            memory_ids.append(memory_id)
-
+        for fact, memory_id in zip(facts, memory_ids):
             # Generate embedding
             embedding = await asyncio.to_thread(self._embed, fact)
 
@@ -656,6 +659,14 @@ class DirectMem0Adapter:
             task_id = self._generate_task_id()
             now = _utcnow()
 
+            # Snapshot facts so a caller mutating its list can't desync the IDs.
+            facts = list(facts) if facts is not None else None
+
+            # Pick the IDs now so the returned ID is the one actually stored.
+            fact_ids: list[str] | None = None
+            if facts or extracted_entities or extracted_relationships:
+                fact_ids = [self._generate_id(fact, user_id) for fact in (facts or [content])]
+
             # Create the background task
             task = asyncio.create_task(
                 self._save_memory_internal(
@@ -669,12 +680,20 @@ class DirectMem0Adapter:
                     facts=facts,
                     extracted_entities=extracted_entities,
                     extracted_relationships=extracted_relationships,
+                    fact_ids=fact_ids,
                 )
             )
             self._background_tasks[task_id] = task
 
             # Return immediately with task info
-            primary_id = self._generate_id(facts[0] if facts else content, user_id)
+            pending_metadata: dict[str, Any]
+            if fact_ids is not None:
+                primary_id = fact_ids[0]
+                pending_metadata = {"_all_memory_ids": list(fact_ids)}
+            else:
+                # Mem0 assigns the ID later; see get_task_status(task_id).
+                primary_id = task_id
+                pending_metadata = {"_id_pending": True}
             return Memory(
                 id=primary_id,
                 content=facts[0] if facts else content,
@@ -684,6 +703,7 @@ class DirectMem0Adapter:
                 entity_refs=entities or [],
                 metadata={
                     **(metadata or {}),
+                    **pending_metadata,
                     "_async": True,
                     "_task_id": task_id,
                     "_status": "processing",
@@ -718,6 +738,7 @@ class DirectMem0Adapter:
         facts: list[str] | None = None,
         extracted_entities: list[dict[str, str]] | None = None,
         extracted_relationships: list[dict[str, str]] | None = None,
+        fact_ids: list[str] | None = None,
     ) -> Memory:
         """Internal save implementation (can run in background)."""
         now = _utcnow()
@@ -730,31 +751,18 @@ class DirectMem0Adapter:
             memory_ids = []
 
             # Write facts to Qdrant (vector store)
-            if facts:
-                fact_ids = await self._write_facts_to_qdrant(
-                    facts=facts,
-                    user_id=user_id,
-                    importance=importance,
-                    metadata={
-                        "session_id": session_id,
-                        "entity_refs": entities or [],
-                        **(metadata or {}),
-                    },
-                )
-                memory_ids.extend(fact_ids)
-            else:
-                # If no facts, write content as single fact
-                fact_ids = await self._write_facts_to_qdrant(
-                    facts=[content],
-                    user_id=user_id,
-                    importance=importance,
-                    metadata={
-                        "session_id": session_id,
-                        "entity_refs": entities or [],
-                        **(metadata or {}),
-                    },
-                )
-                memory_ids.extend(fact_ids)
+            stored_ids = await self._write_facts_to_qdrant(
+                facts=facts or [content],
+                user_id=user_id,
+                importance=importance,
+                metadata={
+                    "session_id": session_id,
+                    "entity_refs": entities or [],
+                    **(metadata or {}),
+                },
+                memory_ids=fact_ids,
+            )
+            memory_ids.extend(stored_ids)
 
             # Write entities and relationships to Neo4j (graph store)
             if (extracted_entities or extracted_relationships) and self._config.enable_graph:
@@ -937,12 +945,19 @@ class DirectMem0Adapter:
             memory_id: ID of the memory to update.
             new_content: New content to replace existing.
             reason: Reason for the update.
-            user_id: User ID for validation.
+            user_id: When given, only a memory owned by this user is updated;
+                any other id is treated as not found.
 
         Returns:
             Updated Memory object.
+
+        Raises:
+            ValueError: If the memory is not found or the update fails.
         """
         await self._ensure_initialized()
+
+        if user_id is not None and not await self._is_owned_by(memory_id, user_id):
+            raise ValueError(f"Memory {memory_id} not found")
 
         try:
             await asyncio.to_thread(
@@ -974,12 +989,16 @@ class DirectMem0Adapter:
         Args:
             memory_id: ID of the memory to delete.
             reason: Reason for deletion.
-            user_id: User ID for validation.
+            user_id: When given, only a memory owned by this user is deleted;
+                any other id is treated as not found.
 
         Returns:
             True if deleted, False if not found.
         """
         await self._ensure_initialized()
+
+        if user_id is not None and not await self._is_owned_by(memory_id, user_id):
+            return False
 
         try:
             await asyncio.to_thread(self._mem0_client.delete, memory_id=memory_id)
@@ -1008,6 +1027,11 @@ class DirectMem0Adapter:
                     describe_exception(e),
                 )
             return False
+
+    async def _is_owned_by(self, memory_id: str, user_id: str) -> bool:
+        """Whether ``memory_id`` exists and belongs to ``user_id`` (a failed lookup is not)."""
+        memory = await self.get_memory(memory_id)
+        return memory is not None and memory.user_id == user_id
 
     async def get_memory(self, memory_id: str) -> Memory | None:
         """Retrieve a specific memory by ID.
