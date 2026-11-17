@@ -362,6 +362,7 @@ By default Headroom stores originals so the model can recover them via `headroom
 | `--no-ccr` / `HEADROOM_NO_CCR` | CCR on | Disable retrieval markers **and** the injected `headroom_retrieve` tool. |
 | `--lossless` / `HEADROOM_LOSSLESS` | `false` | Format-native lossless compaction only — no CCR marker, no retrieval tool. |
 | `--ccr-buffered-chat-streaming` / `HEADROOM_CCR_BUFFERED_CHAT_STREAMING` | `false` | Answer `headroom_retrieve` on streaming `/v1/chat/completions`. A turn carrying a redeemable marker runs as `stream: false` upstream and is re-emitted as `chat.completion.chunk` frames, so its text arrives all at once; other turns keep their real stream |
+| `--ccr-inject-system-instructions` / `HEADROOM_CCR_INJECT_SYSTEM_INSTRUCTIONS` | `false` | Append compressed context instructions to the system message listing active retrieval hashes (disabled under `--no-ccr`/`--lossless`; skipped in cache mode once prefix freezes). |
 | `--no-ccr-proactive-expansion` | expansion on | Stop proactively re-expanding compressed content when the model appears to need it. |
 
 ### File-read handling
@@ -530,6 +531,8 @@ Anthropic API format. The proxy compresses messages, forwards to Anthropic, and 
 ### `POST /v1/chat/completions`
 
 OpenAI API format. The proxy compresses messages, forwards to OpenAI, and returns the response.
+
+On translated backends (`anyllm`, `litellm-<provider>`), streaming token accounting uses the latest provider usage snapshot. Providers may repeat a cumulative `usage` block on several content chunks before the terminal frame; the final counts win. A frame that omits a field leaves the earlier value alone, while an explicitly reported zero replaces it — so `/stats` and the cache-hit-rate metrics report what the provider last said, not the first nonzero count it sent.
 
 ### `POST /v1/responses`
 
