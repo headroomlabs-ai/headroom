@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import pytest
+
 from headroom.proxy.semantic_cache_key_policy import (
     compute_semantic_cache_key,
     strip_cache_control,
@@ -73,3 +75,10 @@ def test_strip_cache_control_preserves_user_defined_schema_property() -> None:
     }
 
     assert strip_cache_control(schema) == schema
+
+
+def test_semantic_cache_key_requires_a_partition() -> None:
+    """The partition is mandatory, not defaulted: a shared proxy must never
+    answer one caller from another caller's cached response."""
+    with pytest.raises(ValueError, match="requires a caller partition"):
+        compute_semantic_cache_key(MESSAGES, MODEL, partition="")
