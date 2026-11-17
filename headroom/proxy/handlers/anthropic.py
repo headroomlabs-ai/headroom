@@ -1650,7 +1650,13 @@ class AnthropicHandlerMixin:
                     request, headers, routed_to_omlx=routed_to_omlx
                 )
                 backend = (
-                    None if routed_to_omlx else resolver_for(self).for_request(request, body=body)
+                    None
+                    if routed_to_omlx
+                    else resolver_for(self).for_request(
+                        request,
+                        body=body,
+                        upstream_url=upstream_base_url or self.ANTHROPIC_API_URL,
+                    )
                 )
                 if backend is not None:
                     if model_override and not body.get("model"):
@@ -4259,7 +4265,13 @@ class AnthropicHandlerMixin:
             from headroom.proxy.route_advice import resolver_for
 
             request_backend = (
-                None if force_direct else resolver_for(self).for_request(request, body=body)
+                None
+                if force_direct
+                else resolver_for(self).for_request(
+                    request,
+                    body=body,
+                    upstream_url=upstream_base_url or self.ANTHROPIC_API_URL,
+                )
             )
             if request_backend is not None:
                 # Route through Bedrock backend
